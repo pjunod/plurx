@@ -12,6 +12,7 @@ mod error;
 mod extract;
 mod images;
 mod libraries;
+mod stream;
 mod system;
 mod watch;
 
@@ -52,6 +53,10 @@ pub fn router(state: AppState) -> Router {
         .route("/items/{id}/progress", post(watch::progress))
         .route("/items/{id}/scrobble", post(watch::scrobble))
         .route("/items/{id}/unscrobble", post(watch::unscrobble))
+        // Playback
+        .route("/files/{id}/decision", get(stream::decision))
+        .route("/files/{id}/direct", get(stream::direct))
+        .route("/files/{id}/stream.mp4", get(stream::stream_mp4))
         // Images
         .route("/images/{filename}", get(images::serve));
 

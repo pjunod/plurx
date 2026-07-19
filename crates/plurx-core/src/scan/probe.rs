@@ -49,7 +49,15 @@ pub async fn probe(path: &Path) -> Result<ProbeResult, ProbeError> {
     }
     let json: Value = serde_json::from_slice(&output.stdout)
         .map_err(|e| ProbeError::Parse(format!("ffprobe json: {e}")))?;
-    Ok(parse_probe_json(&json))
+    let mut result = parse_probe_json(&json);
+    // Container comes from the extension — the decision engine keys on it
+    // ("mkv" → remux, "mp4" → direct) and it's more reliable than ffmpeg's
+    // comma-joined format_name.
+    result.container = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase());
+    Ok(result)
 }
 
 /// Pure parser over ffprobe JSON — unit-testable without spawning anything.

@@ -1,0 +1,22 @@
+# Device capability profiles — DATA, not code (REQ-PLAY-4). The decision engine
+# reads these to decide direct-play vs remux vs transcode. Editing/adding a
+# profile needs no code change. Each client reports which profile it wants (and
+# later, Phase 2, refines it with runtime-probed capabilities).
+
+[web-h264]
+# The safe baseline every modern browser can play via <video>/MSE.
+description = "Browsers (H.264/AAC baseline)"
+containers = ["mp4", "m4v", "webm", "mov"]
+video_codecs = ["h264", "vp8", "vp9", "av1"]
+audio_codecs = ["aac", "mp3", "opus", "vorbis", "flac"]
+max_height = 2160
+supports_hdr = false
+
+[directplay-any]
+# Permissive profile for native players that handle almost anything
+# (Media3/ExoPlayer, Infuse-class). Used by native clients in Phase 5.
+description = "Native players (direct play almost anything)"
+containers = ["mkv", "mp4", "m4v", "webm", "mov", "ts", "avi"]
+video_codecs = ["h264", "hevc", "vp8", "vp9", "av1", "mpeg4", "mpeg2video"]
+audio_codecs = ["aac", "mp3", "opus", "vorbis", "flac", "ac3", "eac3", "dts", "truehd"]
+supports_hdr = true
