@@ -7,8 +7,10 @@
 //! openraft + SQLite) behind the same trait. Nothing outside this crate may
 //! assume which backend is in play. See `docs/ARCHITECTURE.md` §2.
 
+pub mod auth;
 pub mod config;
 pub mod domain;
 pub mod error;
+pub mod metadata;
 pub mod scan;
 pub mod store;

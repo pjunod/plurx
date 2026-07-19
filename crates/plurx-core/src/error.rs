@@ -37,6 +37,16 @@ pub enum ProbeError {
     Parse(String),
 }
 
+/// Errors from password hashing / token generation.
+#[derive(Debug, Error)]
+pub enum AuthError {
+    #[error("random source failed: {0}")]
+    Rng(String),
+
+    #[error("hashing failed: {0}")]
+    Hash(String),
+}
+
 /// Errors from metadata providers.
 #[derive(Debug, Error)]
 pub enum MetadataError {
