@@ -15,6 +15,7 @@ mod libraries;
 mod stream;
 mod system;
 mod watch;
+mod web;
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -61,9 +62,11 @@ pub fn router(state: AppState) -> Router {
         .route("/images/{filename}", get(images::serve));
 
     Router::new()
+        .route("/", get(web::index))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .nest("/api/v1", api)
+        .fallback(web::fallback)
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)
 }

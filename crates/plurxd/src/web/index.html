@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>plurx</title>
+<style>
+  :root{
+    --bg:#0e0f13; --panel:#171922; --panel2:#1e2230; --line:#2a2f3e;
+    --text:#e8eaf0; --muted:#9aa2b4; --accent:#6ea8fe; --accent2:#8b7cf6;
+    --good:#4ade80; --bad:#f87171; --radius:12px;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{background:var(--bg);color:var(--text);font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+  a{color:var(--accent);text-decoration:none}
+  button{font:inherit;cursor:pointer;border:0;border-radius:8px;padding:9px 14px;background:var(--accent);color:#07101f;font-weight:600}
+  button.ghost{background:var(--panel2);color:var(--text);border:1px solid var(--line)}
+  button.sm{padding:5px 10px;font-size:13px}
+  button:disabled{opacity:.5;cursor:default}
+  input,select{font:inherit;background:var(--panel2);border:1px solid var(--line);color:var(--text);border-radius:8px;padding:9px 11px;width:100%}
+  label{display:block;font-size:13px;color:var(--muted);margin:12px 0 5px}
+  .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+  .muted{color:var(--muted)}
+  .pill{font-size:11px;padding:2px 8px;border-radius:999px;background:var(--panel2);border:1px solid var(--line);color:var(--muted)}
+
+  header.top{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:16px;
+    padding:12px 20px;background:rgba(14,15,19,.85);backdrop-filter:blur(10px);border-bottom:1px solid var(--line)}
+  .logo{font-weight:800;letter-spacing:.5px;font-size:20px;background:linear-gradient(90deg,var(--accent),var(--accent2));-webkit-background-clip:text;background-clip:text;color:transparent}
+  .top nav{display:flex;gap:4px;flex-wrap:wrap}
+  .top nav a{padding:7px 12px;border-radius:8px;color:var(--muted)}
+  .top nav a.active,.top nav a:hover{background:var(--panel2);color:var(--text)}
+  .top .spacer{flex:1}
+  .search{max-width:240px}
+  main{padding:22px 20px 60px;max-width:1400px;margin:0 auto}
+
+  .center{min-height:100dvh;display:grid;place-items:center;padding:20px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:24px}
+  .auth{width:100%;max-width:380px}
+  .auth h1{margin:.2em 0 .1em}
+
+  h2.section{font-size:15px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:26px 4px 12px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:16px}
+  .rowscroll{display:grid;grid-auto-flow:column;grid-auto-columns:200px;gap:16px;overflow-x:auto;padding-bottom:8px;scrollbar-width:thin}
+  .poster{background:var(--panel2);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;cursor:pointer;transition:transform .12s,border-color .12s;position:relative}
+  .poster:hover{transform:translateY(-3px);border-color:var(--accent)}
+  .poster .art{aspect-ratio:2/3;width:100%;object-fit:cover;display:block;background:linear-gradient(160deg,#232838,#171a24)}
+  .poster.wide .art{aspect-ratio:16/9}
+  .poster .meta{padding:8px 10px}
+  .poster .t{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .poster .s{font-size:12px;color:var(--muted)}
+  .poster .prog{position:absolute;left:0;right:0;bottom:0;height:4px;background:rgba(0,0,0,.5)}
+  .poster .prog>i{display:block;height:100%;background:var(--accent)}
+  .badge{position:absolute;top:8px;right:8px;background:rgba(0,0,0,.65);border-radius:6px;padding:2px 6px;font-size:11px}
+  .empty{color:var(--muted);padding:40px;text-align:center;border:1px dashed var(--line);border-radius:var(--radius)}
+
+  .detail{display:grid;grid-template-columns:260px 1fr;gap:28px}
+  .detail .poster{cursor:default}
+  .detail .poster:hover{transform:none;border-color:var(--line)}
+  .detail h1{margin:0 0 6px}
+  .overview{color:#cdd2df;max-width:70ch}
+  .filebox{margin-top:16px;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:14px}
+  .kv{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+
+  table{width:100%;border-collapse:collapse;margin-top:10px}
+  th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line);font-size:14px}
+  th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.05em}
+
+  .modal{position:fixed;inset:0;background:rgba(0,0,0,.85);z-index:50;display:none;place-items:center;padding:20px}
+  .modal.open{display:grid}
+  .player{width:min(1100px,96vw)}
+  .player video{width:100%;border-radius:12px;background:#000;max-height:80dvh}
+  .player .bar{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;gap:10px}
+  .toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:var(--panel2);border:1px solid var(--line);
+    padding:10px 16px;border-radius:10px;z-index:60;opacity:0;transition:opacity .2s;pointer-events:none}
+  .toast.show{opacity:1}
+  .err{color:var(--bad);font-size:13px;min-height:18px;margin-top:8px}
+  .adminwrap{display:grid;grid-template-columns:1fr;gap:22px;max-width:760px}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div class="modal" id="modal"><div class="player card"><div class="bar"><div id="playTitle" style="font-weight:600"></div><button class="ghost sm" onclick="closePlayer()">Close</button></div><video id="video" controls autoplay playsinline></video></div></div>
+<div class="toast" id="toast"></div>
+
+<script>
+"use strict";
+const API = "/api/v1";
+let TOKEN = localStorage.getItem("plurx_token") || null;
+let ME = null;
+
+// ---- api helpers ----------------------------------------------------------
+async function api(path, {method="GET", body=null, raw=false}={}){
+  const headers={};
+  if(TOKEN) headers["authorization"]="Bearer "+TOKEN;
+  if(body){ headers["content-type"]="application/json"; }
+  const res=await fetch(API+path,{method,headers,body:body?JSON.stringify(body):null});
+  if(res.status===401){ logout(); throw new Error("unauthorized"); }
+  if(!res.ok){ let m="request failed"; try{m=(await res.json()).error||m}catch(e){} throw new Error(m); }
+  return raw?res:res.json();
+}
+const tok = u => u + (u.includes("?")?"&":"?") + "token=" + encodeURIComponent(TOKEN||"");
+function toast(msg){ const t=document.getElementById("toast"); t.textContent=msg; t.classList.add("show"); setTimeout(()=>t.classList.remove("show"),2200); }
+function fmtDur(ms){ if(!ms) return ""; const s=Math.round(ms/1000),h=Math.floor(s/3600),m=Math.floor(s%3600/60); return h?`${h}h ${m}m`:`${m}m`; }
+function esc(s){ return (s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+
+// ---- auth flows -----------------------------------------------------------
+function logout(){ TOKEN=null; ME=null; localStorage.removeItem("plurx_token"); render(); }
+async function boot(){
+  let server;
+  try{ server=await api("/server"); }catch(e){ document.getElementById("app").innerHTML=`<div class="center"><div class="card">Server unreachable.</div></div>`; return; }
+  if(server.setup_required){ return renderSetup(server); }
+  if(!TOKEN){ return renderLogin(server); }
+  try{ ME=await api("/me"); }catch(e){ return renderLogin(server); }
+  location.hash=location.hash||"#/";
+  render();
+}
+function authShell(title, sub, fields, btn, onsubmit){
+  document.getElementById("app").innerHTML=`<div class="center"><form class="card auth" id="af">
+    <div class="logo" style="font-size:30px">plurx</div>
+    <h1>${title}</h1><p class="muted" style="margin-top:0">${sub}</p>
+    ${fields}<div class="err" id="aerr"></div>
+    <button style="width:100%;margin-top:16px" id="ab">${btn}</button></form></div>`;
+  document.getElementById("af").addEventListener("submit",async e=>{
+    e.preventDefault(); const b=document.getElementById("ab"); b.disabled=true;
+    try{ await onsubmit(); }catch(err){ document.getElementById("aerr").textContent=err.message; b.disabled=false; }
+  });
+}
+function renderSetup(){
+  authShell("Welcome","Create your admin account to get started.",
+    `<label>Username</label><input id="u" autocomplete="username" required>
+     <label>Password</label><input id="p" type="password" autocomplete="new-password" required placeholder="at least 8 characters">`,
+    "Create account", async()=>{
+      const r=await api("/setup",{method:"POST",body:{username:u.value.trim(),password:p.value}});
+      TOKEN=r.token; localStorage.setItem("plurx_token",TOKEN); ME=r.user; location.hash="#/"; render();
+    });
+}
+function renderLogin(){
+  authShell("Sign in","Welcome back.",
+    `<label>Username</label><input id="u" autocomplete="username" required>
+     <label>Password</label><input id="p" type="password" autocomplete="current-password" required>`,
+    "Sign in", async()=>{
+      const r=await api("/auth/login",{method:"POST",body:{username:u.value.trim(),password:p.value,device:"Web"}});
+      TOKEN=r.token; localStorage.setItem("plurx_token",TOKEN); ME=r.user; location.hash="#/"; render();
+    });
+}
+
+// ---- chrome ---------------------------------------------------------------
+function chrome(active, inner){
+  const admin = ME&&ME.is_admin ? `<a href="#/admin" class="${active==='admin'?'active':''}">Admin</a>`:"";
+  document.getElementById("app").innerHTML=`
+   <header class="top">
+     <a href="#/" class="logo">plurx</a>
+     <nav><a href="#/" class="${active==='home'?'active':''}">Home</a>${admin}</nav>
+     <span class="spacer"></span>
+     <input class="search" id="q" placeholder="Search…" value="${esc(getQ())}">
+     <span class="muted" style="font-size:13px">${esc(ME?ME.username:"")}</span>
+     <button class="ghost sm" onclick="logout()">Sign out</button>
+   </header><main id="main">${inner}</main>`;
+  const q=document.getElementById("q");
+  let t; q.addEventListener("input",()=>{ clearTimeout(t); t=setTimeout(()=>{ location.hash= q.value?("#/search/"+encodeURIComponent(q.value)):"#/"; },300); });
+}
+function getQ(){ const m=location.hash.match(/^#\/search\/(.*)$/); return m?decodeURIComponent(m[1]):""; }
+
+// ---- cards ----------------------------------------------------------------
+function progressPct(w){ if(!w||!w.duration_ms||!w.position_ms) return 0; return Math.min(100,100*w.position_ms/w.duration_ms); }
+function card(it, wide){
+  const art = it.poster||it.backdrop;
+  const img = art? `<img class="art" loading="lazy" src="${tok(art)}" alt="">` : `<div class="art"></div>`;
+  const sub = it.kind==='episode'
+      ? esc((it.show_title?it.show_title+" · ":"")+`S${it.season_number||0}E${it.episode_number||0}`)
+      : esc(it.year? String(it.year): (it.kind==='show'?'Series':''));
+  const pct = progressPct(it.watch);
+  const watched = it.watch&&it.watch.watched? `<span class="badge">✓</span>`:"";
+  const prog = pct>0&&pct<100? `<div class="prog"><i style="width:${pct}%"></i></div>`:"";
+  return `<div class="poster ${wide?'wide':''}" onclick="location.hash='#/item/${it.id}'">
+    ${img}${watched}<div class="meta"><div class="t">${esc(it.title)}</div><div class="s">${sub}</div></div>${prog}</div>`;
+}
+function grid(items){ return items.length? `<div class="grid">${items.map(i=>card(i)).join("")}</div>` : `<div class="empty">Nothing here yet.</div>`; }
+
+// ---- views ----------------------------------------------------------------
+async function viewHome(){
+  chrome("home", `<div id="hubs"><div class="empty">Loading…</div></div>`);
+  const [libs, hubs] = await Promise.all([api("/libraries"), api("/hubs")]);
+  let html="";
+  if(hubs.continue_watching.length){ html+=`<h2 class="section">Continue watching</h2><div class="rowscroll">${hubs.continue_watching.map(i=>card(i,true)).join("")}</div>`; }
+  if(hubs.recently_added.length){ html+=`<h2 class="section">Recently added</h2><div class="rowscroll">${hubs.recently_added.map(i=>card(i,i.kind==='episode')).join("")}</div>`; }
+  for(const lib of libs){
+    const page=await api(`/libraries/${lib.id}/items?limit=24&sort=added`);
+    html+=`<h2 class="section">${esc(lib.name)} <a class="muted" style="font-size:12px" href="#/library/${lib.id}">· view all (${page.total})</a></h2>${grid(page.items)}`;
+  }
+  if(!libs.length){ html=`<div class="empty">No libraries yet.${ME.is_admin?' Add one in <a href="#/admin">Admin</a>.':''}</div>`; }
+  document.getElementById("main").innerHTML=html||`<div class="empty">Nothing here yet.</div>`;
+}
+async function viewLibrary(id){
+  chrome("home",`<div class="empty">Loading…</div>`);
+  const lib=(await api("/libraries")).find(l=>l.id==id);
+  const page=await api(`/libraries/${id}/items?limit=200&sort=title`);
+  document.getElementById("main").innerHTML=`<h2 class="section">${esc(lib?lib.name:'Library')} · ${page.total}</h2>${grid(page.items)}`;
+}
+async function viewSearch(q){
+  chrome("home",`<div class="empty">Searching…</div>`);
+  const r=await api(`/search?q=${encodeURIComponent(q)}`);
+  document.getElementById("main").innerHTML=`<h2 class="section">Results for “${esc(q)}”</h2>${grid(r.results)}`;
+}
+async function viewItem(id){
+  chrome("home",`<div class="empty">Loading…</div>`);
+  const d=await api(`/items/${id}`); const it=d.item;
+  // Map this item's files → item id so the player can post progress.
+  d.files.forEach(f=>ITEM_FOR_FILE[f.id]=Number(id));
+  const art=it.poster||it.backdrop;
+  const imgTag = art?`<img class="art" src="${tok(art)}">`:`<div class="art"></div>`;
+  let right=`<h1>${esc(it.title)}</h1><div class="row muted">${[it.year,fmtDur(it.runtime_ms),it.kind].filter(Boolean).map(x=>`<span>${esc(String(x))}</span>`).join(" · ")}</div>`;
+  if(it.overview) right+=`<p class="overview">${esc(it.overview)}</p>`;
+
+  // Movie / episode: play button + file info. Show/season: children grid.
+  if(d.files.length){
+    const f=d.files[0];
+    const resume = it.watch&&it.watch.position_ms>3000&&!it.watch.watched? it.watch.position_ms:0;
+    right+=`<div class="row" style="margin-top:16px">
+      <button onclick='play(${f.id},${JSON.stringify(it.title)},${resume})'>▶ ${resume?`Resume (${fmtDur(resume)})`:'Play'}</button>
+      ${resume?`<button class="ghost" onclick='play(${f.id},${JSON.stringify(it.title)},0)'>Start over</button>`:''}
+      <button class="ghost sm" id="wb" onclick="toggleWatched(${it.id}, ${it.watch&&it.watch.watched?1:0})">${it.watch&&it.watch.watched?'Mark unwatched':'Mark watched'}</button>
+    </div>`;
+    const codecs=[f.video_codec,f.width&&`${f.width}×${f.height}`,f.hdr,(f.audio_streams[0]||{}).codec,f.container].filter(Boolean);
+    right+=`<div class="filebox"><div class="muted" style="font-size:13px">${esc(f.filename)}</div>
+      <div class="kv">${codecs.map(c=>`<span class="pill">${esc(String(c))}</span>`).join("")}</div></div>`;
+  }
+  if(d.children.length){
+    const kids=d.children;
+    right+=`<h2 class="section" style="margin-left:0">${kids[0].kind==='season'?'Seasons':'Episodes'}</h2>${grid(kids)}`;
+  }
+  document.getElementById("main").innerHTML=`<div class="detail"><div class="poster">${imgTag}</div><div>${right}</div></div>`;
+}
+
+async function toggleWatched(id, watched){
+  try{ await api(`/items/${id}/${watched?'unscrobble':'scrobble'}`,{method:"POST"}); toast(watched?"Marked unwatched":"Marked watched"); viewItem(id); }
+  catch(e){ toast(e.message); }
+}
+
+// ---- player ---------------------------------------------------------------
+let PLAYER={fileId:null,itemId:null,timer:null,duration:null};
+async function play(fileId, title, resumeMs){
+  const modal=document.getElementById("modal"), video=document.getElementById("video");
+  document.getElementById("playTitle").textContent=title;
+  modal.classList.add("open");
+  let decision; try{ decision=await api(`/files/${fileId}/decision?profile=web-h264`);}catch(e){ toast(e.message); return closePlayer(); }
+  const startSec=(resumeMs||0)/1000;
+  let url=tok(decision.play_url);
+  // Remux resume seeks server-side; direct play seeks client-side.
+  const isRemux = decision.method!=='direct_play';
+  if(isRemux && startSec>0) url+= "&start="+startSec.toFixed(1);
+  PLAYER={fileId, itemId:null, timer:null, duration:null, offset:isRemux?startSec:0};
+  video.src=url;
+  video.onloadedmetadata=()=>{ if(!isRemux && startSec>0){ try{video.currentTime=startSec}catch(e){} } };
+  video.play().catch(()=>{});
+  clearInterval(PLAYER.timer);
+  PLAYER.timer=setInterval(()=>reportProgress(fileId), 5000);
+  video.onended=()=>{ reportProgress(fileId,true); };
+  // resolve item id for progress (files map 1:1 to items in Phase 1 via detail)
+}
+async function reportProgress(fileId, ended){
+  const video=document.getElementById("video");
+  const posMs=Math.round(((PLAYER.offset||0)+ (video.currentTime||0))*1000);
+  const durMs=video.duration&&isFinite(video.duration)? Math.round(((PLAYER.offset||0)+video.duration)*1000):null;
+  if(!ITEM_FOR_FILE[fileId]) return;
+  try{ await api(`/items/${ITEM_FOR_FILE[fileId]}/progress`,{method:"POST",body:{position_ms:ended?(durMs||posMs):posMs,duration_ms:durMs}}); }catch(e){}
+}
+function closePlayer(){
+  const video=document.getElementById("video");
+  if(PLAYER.fileId) reportProgress(PLAYER.fileId);
+  clearInterval(PLAYER.timer); video.pause(); video.removeAttribute("src"); video.load();
+  document.getElementById("modal").classList.remove("open");
+  if(location.hash.startsWith("#/item/")) { const id=location.hash.split("/")[2]; setTimeout(()=>viewItem(id),100); }
+}
+// map fileId → itemId, filled by viewItem so progress posts to the right item
+const ITEM_FOR_FILE={};
+
+// ---- admin ----------------------------------------------------------------
+async function viewAdmin(){
+  if(!ME.is_admin){ location.hash="#/"; return; }
+  chrome("admin",`<div class="empty">Loading…</div>`);
+  const [libs,settings,status]=await Promise.all([api("/libraries"),api("/settings"),api("/scan/status")]);
+  const libRows=libs.map(l=>{
+    const st=status[l.id]||{}; const s= st.running?"scanning…": st.last_scan?`${st.last_scan.added} added, ${st.last_scan.unchanged} unchanged`:(st.error?("error: "+st.error):"idle");
+    return `<tr><td><b>${esc(l.name)}</b></td><td>${l.kind}</td><td class="muted">${esc(l.paths.join(", "))}</td><td class="muted">${esc(s)}</td>
+      <td class="row"><button class="ghost sm" onclick="scanLib(${l.id})">Scan</button><button class="ghost sm" onclick="delLib(${l.id})">Delete</button></td></tr>`;
+  }).join("");
+  document.getElementById("main").innerHTML=`<div class="adminwrap">
+    <div class="card"><h2 class="section" style="margin-top:0">Libraries</h2>
+      <table><thead><tr><th>Name</th><th>Kind</th><th>Paths</th><th>Status</th><th></th></tr></thead>
+      <tbody>${libRows||`<tr><td colspan="5" class="muted">No libraries yet.</td></tr>`}</tbody></table>
+      <h2 class="section">Add library</h2>
+      <div class="row"><input id="ln" placeholder="Name" style="max-width:180px">
+        <select id="lk" style="max-width:130px"><option value="movies">Movies</option><option value="shows">TV Shows</option></select>
+        <input id="lp" placeholder="/path/to/media (comma-separated)"></div>
+      <div class="err" id="lerr"></div>
+      <button style="margin-top:12px" onclick="addLib()">Add & scan</button>
+    </div>
+    <div class="card"><h2 class="section" style="margin-top:0">Metadata (TMDB)</h2>
+      <p class="muted" style="margin-top:0">${settings.tmdb_configured?"A TMDB API key is configured. Enter a new one to replace it.":"Add a TMDB API key to fetch posters, overviews, and episode data."}</p>
+      <input id="tk" placeholder="TMDB API key" type="password"><div class="err" id="terr"></div>
+      <button style="margin-top:12px" onclick="saveTmdb()">Save key</button></div>
+  </div>`;
+}
+async function addLib(){
+  const name=ln.value.trim(), kind=lk.value, paths=lp.value.split(",").map(s=>s.trim()).filter(Boolean);
+  const err=document.getElementById("lerr"); err.textContent="";
+  try{ await api("/libraries",{method:"POST",body:{name,kind,paths}}); toast("Library added — scanning"); viewAdmin(); }
+  catch(e){ err.textContent=e.message; }
+}
+async function scanLib(id){ try{ await api(`/libraries/${id}/scan`,{method:"POST"}); toast("Scan started"); setTimeout(viewAdmin,600);}catch(e){toast(e.message)} }
+async function delLib(id){ if(!confirm("Delete this library? Media files are not touched.")) return; try{ await api(`/libraries/${id}`,{method:"DELETE"}); toast("Deleted"); viewAdmin(); }catch(e){toast(e.message)} }
+async function saveTmdb(){ const err=document.getElementById("terr"); err.textContent=""; try{ await api("/settings",{method:"PUT",body:{tmdb_api_key:tk.value.trim()}}); toast("Saved"); viewAdmin(); }catch(e){err.textContent=e.message} }
+
+// ---- router ---------------------------------------------------------------
+async function render(){
+  if(!TOKEN||!ME) return boot();
+  const h=location.hash||"#/";
+  try{
+    if(h.startsWith("#/item/")) return await viewItem(h.split("/")[2]);
+    if(h.startsWith("#/library/")) return await viewLibrary(h.split("/")[2]);
+    if(h.startsWith("#/search/")) return await viewSearch(decodeURIComponent(h.split("/")[2]||""));
+    if(h==="#/admin") return await viewAdmin();
+    return await viewHome();
+  }catch(e){
+    if(e.message!=="unauthorized"){ const m=document.getElementById("main"); if(m) m.innerHTML=`<div class="empty">${esc(e.message)}</div>`; else toast(e.message); }
+  }
+}
+window.addEventListener("hashchange",render);
+
+boot();
+</script>
+</body>
+</html>
