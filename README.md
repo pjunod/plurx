@@ -43,7 +43,9 @@ cargo run -p plurxd            # serves http://localhost:32600 — open it in a 
 
 First launch walks you through creating an admin account and adding a library. Configuration: copy `plurx.example.toml` to `plurx.toml`, or use `PLURX_*` env vars (`PLURX_FFMPEG`/`PLURX_FFPROBE`, `PLURX_HWACCEL`, `PLURX_TONEMAP`).
 
-Deferred to a Phase 2.x fast-follow: TVDB agent (TMDB already covers TV), movie collections, playlists, and bitmap-subtitle burn-in. Next up is **Phase 3** — the cluster spike — then **Phase 4**: HA for real.
+Deferred to a Phase 2.x fast-follow: TVDB agent (TMDB already covers TV), movie collections, playlists, and bitmap-subtitle burn-in.
+
+**Phase 3 (cluster spike) is complete** — the decision gate for HA. Both risks were spiked with real experiments (see [docs/PHASE3-SPIKE.md](docs/PHASE3-SPIKE.md)): the replicated store backend is **hiqlite** (raft-replicated SQLite; its API maps onto plurx's existing `Store` mappers, verified with a live node), and the transcode-failover mechanic is a session restart-at-boundary that any node can serve (validated against sparse-keyframe and VFR sources, with byte-identical segments). Next: **Phase 4** — HA for real, adding `HiqliteStore` behind the unchanged `Store` trait.
 
 | Document | Contents |
 |---|---|

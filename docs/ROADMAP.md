@@ -29,11 +29,15 @@ Repo scaffolding: cargo workspace (`plurxd`, `plurx-core`, `plurx-compat-plex`),
 
 **Exit:** ✅ old Plex, honestly replaced for movies/TV/anime on LAN — verified: HEVC/HDR10 transcodes to tone-mapped SDR HLS and plays; python-plexapi browses + direct-plays + marks watched; anime scans with absolute numbering and AniList metadata; watch state (resume, continue-watching, next-up) is trustworthy. 84 tests, clippy clean.
 
-## Phase 3 — Cluster spike (decision gate)
+## Phase 3 — Cluster spike (decision gate) ✅ DONE
 
-Time-boxed spike, not a feature phase: hiqlite embedded vs openraft+redb+rusqlite behind the `Store` trait; 3-node testbed; kill-a-node drills for API reads/writes; deterministic-segment prototype — two nodes serving one HLS transcode session interchangeably (VFR and odd-keyframe sources included).
+Time-boxed spike, not a feature phase. Full findings in [PHASE3-SPIKE.md](PHASE3-SPIKE.md).
 
-**Exit:** written decision (this doc + ARCHITECTURE.md updated): chosen backend, measured failover behavior, sharp edges list. If deterministic segments prove unreliable for some source class, the fallback contract (restart-at-position) is scoped here.
+- ✅ **Store backend decided: hiqlite 0.14.** API (`execute`/`query_map`/`txn`) maps onto the existing rusqlite row mappers; compiles clean in the workspace; a live node ran migration + raft insert + typed read-back; upstream's suite proves 3-node replication + self-heal. openraft fallback not needed.
+- ✅ **Deterministic-segment behavior measured** against CFR, sparse-keyframe, and VFR sources: any node produces a valid segment N (accurate seek even with keyframes only at 0/10 s); independently-produced segments sequence to the correct 12.000 s via the playlist; same segment is byte-identical across runs (`threads=1`).
+- ✅ **Sharp edges + fallback scoped:** PTS resets and one audio-boundary discontinuity at a *failover* (not normal playback) → emit `EXT-X-DISCONTINUITY`. The "restart-at-position" contract turned out to be the clean primary design, not a fallback.
+
+**Exit:** ✅ written decision recorded (this doc + ARCHITECTURE §2 updated). Phase 4 adds `HiqliteStore: Store` behind the unchanged trait, replicated session recipes, and client-retry failover.
 
 ## Phase 4 — HA for real
 

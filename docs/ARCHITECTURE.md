@@ -47,7 +47,7 @@ Nobody in this space has HA: Jellyfin is architecturally single-instance (SQLite
 
 ### 2.1 Consensus & storage
 
-**Primary plan: embed [hiqlite](https://github.com/sebadob/hiqlite)** — raft-replicated SQLite built on openraft, purpose-built for the exact "1 node or 3+ nodes, no external infra" shape (production-proven as Rauthy's default store; SQL + replicated KV cache + distributed locks + listen/notify in ~65 MB RAM for an HA cluster). **Fallback plan** if hiqlite doesn't fit after a spike: hand-rolled [openraft 0.9.x](https://github.com/databendlabs/openraft) with a redb raft log and a rusqlite state machine — the same architecture, more plumbing owned by us. The spike in Phase 3 decides; nothing before Phase 3 depends on the choice because all cluster access goes through one internal `Store` trait.
+**Decided (Phase 3 spike): embed [hiqlite](https://github.com/sebadob/hiqlite) 0.14** — raft-replicated SQLite built on openraft, purpose-built for the exact "1 node or 3+ nodes, no external infra" shape (production-proven as Rauthy's default store; SQL + replicated KV cache + distributed locks + listen/notify in ~65 MB RAM for an HA cluster). The spike confirmed its `execute`/`query_map`/`txn` API maps directly onto the existing rusqlite row mappers, it compiles cleanly in the workspace, and a live node ran a migration + raft insert + typed read-back; its own suite proves 3-node replication and self-heal. See [PHASE3-SPIKE.md](PHASE3-SPIKE.md). **Fallback (not needed):** hand-rolled [openraft 0.9.x](https://github.com/databendlabs/openraft) with a redb raft log and a rusqlite state machine. Nothing before Phase 4 depends on the choice because all cluster access goes through one internal `Store` trait.
 
 Single-node mode is the same code path with a 1-voter raft (a supported openraft/hiqlite pattern) — no "cluster edition" divergence, and any single node can later grow into a cluster by adding voters.
 
@@ -62,15 +62,16 @@ Single-node mode is the same code path with a 1-voter raft (a supported openraft
 
 Write rates are safe for raft: watch-state progress ticks batch to ~1 write / 10 s / stream server-side regardless of client ping rate; session state updates on segment boundaries, not per-chunk.
 
-### 2.3 The failover mechanic
+### 2.3 The failover mechanic (refined by the Phase 3 spike)
 
-Deterministic segmentation makes active-active transcoding possible without shared scratch:
+The Phase 3 spike ([PHASE3-SPIKE.md](PHASE3-SPIKE.md)) measured the deterministic-segment idea against constant-frame-rate, **sparse-keyframe**, and VFR sources and refined the design. The load-bearing property — *any node can produce a valid segment N* — holds even in the sparse-keyframe worst case (accurate input-seek), and independently-produced segments sequence to the correct total via the HLS playlist. But per-segment-independent ffmpeg is *not* the primary path (it pays a decode-from-keyframe cost every segment and adds per-segment audio seams). Instead:
 
-1. Every transcode session pins its full recipe in replicated state: source file, ffmpeg arg hash, segment duration `d` (e.g. 4 s), forced keyframes at exact multiples of `d`.
-2. Segment `N` is therefore a pure function of (recipe, N) — **any node can regenerate any segment** by launching ffmpeg with a seek to `N·d`.
+1. Every transcode session pins its full recipe in replicated state: source file, ffmpeg arg set, segment duration `d` (4 s), forced keyframes at multiples of `d`. The **primary** path is one sequential ffmpeg session (Phase 2) — clean, no per-segment resets.
+2. **Failover:** a surviving node restarts the session seeked to the last-served segment boundary. Accurate input-seek guarantees a valid segment N from any node, so the client keeps its already-buffered segments and continues; an `EXT-X-DISCONTINUITY` is emitted at the failover boundary so the player remaps its timeline cleanly. This is the roadmap's "restart-at-position" — the spike showed it *is* the clean design, not a fallback.
 3. HLS playlists are generated (not stored), identical on every node.
-4. Client-side failover: clients hold the node list (REQ-HA-6); on request failure they retry the same URL against the next node. The new node finds the session in replicated state, spawns ffmpeg at the right offset, serves the segment. Cost: a few seconds of buffering. Direct play and remux failover are the same minus ffmpeg (stateless range requests / deterministic remux).
+4. Client-side failover: clients hold the node list (REQ-HA-6); on request failure they retry against the next node, which restarts the session from the replicated recipe. Cost: a few seconds of buffering, once. Direct play and remux failover are the same minus ffmpeg (stateless range requests / deterministic remux).
 5. ffmpeg always runs as a child process — a codec crash kills a session, never a raft voter (process isolation is load-bearing for HA).
+6. **Optional optimization:** x264 `threads=1` makes segments byte-identical across nodes (measured), so a replicated/shared segment cache serves re-requested segments for free.
 
 Scanner and metadata-refresh jobs are leader-scheduled singletons (distributed lock), so three nodes don't triple-hit TMDB or thrash shared storage.
 
