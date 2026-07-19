@@ -40,6 +40,9 @@ pub struct Library {
     pub name: String,
     pub kind: LibraryKind,
     pub paths: Vec<PathBuf>,
+    /// A shows library flagged as anime: absolute episode numbering + AniList
+    /// metadata (REQ-META-3). Always false for movie libraries.
+    pub anime: bool,
     pub created_at: i64,
 }
 
@@ -48,6 +51,7 @@ pub struct NewLibrary {
     pub name: String,
     pub kind: LibraryKind,
     pub paths: Vec<PathBuf>,
+    pub anime: bool,
 }
 
 // ---------------------------------------------------------------------------

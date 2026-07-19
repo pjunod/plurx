@@ -579,6 +579,7 @@ mod tests {
                 name: "Movies".into(),
                 kind: LibraryKind::Movies,
                 paths: vec![PathBuf::from("/media")],
+                anime: false,
             })
             .await
             .expect("lib");
@@ -634,6 +635,7 @@ mod tests {
                 name: "TV".into(),
                 kind: LibraryKind::Shows,
                 paths: vec![PathBuf::from("/tv")],
+                anime: false,
             })
             .await
             .expect("lib");
@@ -718,6 +720,7 @@ mod tests {
                 name: "Movies".into(),
                 kind: LibraryKind::Movies,
                 paths: vec![],
+                anime: false,
             })
             .await
             .expect("lib");

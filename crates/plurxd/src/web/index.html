@@ -308,7 +308,7 @@ async function viewAdmin(){
   const [libs,settings,status]=await Promise.all([api("/libraries"),api("/settings"),api("/scan/status")]);
   const libRows=libs.map(l=>{
     const st=status[l.id]||{}; const s= st.running?"scanning…": st.last_scan?`${st.last_scan.added} added, ${st.last_scan.unchanged} unchanged`:(st.error?("error: "+st.error):"idle");
-    return `<tr><td><b>${esc(l.name)}</b></td><td>${l.kind}</td><td class="muted">${esc(l.paths.join(", "))}</td><td class="muted">${esc(s)}</td>
+    return `<tr><td><b>${esc(l.name)}</b></td><td>${l.anime?'anime':l.kind}</td><td class="muted">${esc(l.paths.join(", "))}</td><td class="muted">${esc(s)}</td>
       <td class="row"><button class="ghost sm" onclick="scanLib(${l.id})">Scan</button><button class="ghost sm" onclick="delLib(${l.id})">Delete</button></td></tr>`;
   }).join("");
   document.getElementById("main").innerHTML=`<div class="adminwrap">
@@ -317,7 +317,7 @@ async function viewAdmin(){
       <tbody>${libRows||`<tr><td colspan="5" class="muted">No libraries yet.</td></tr>`}</tbody></table>
       <h2 class="section">Add library</h2>
       <div class="row"><input id="ln" placeholder="Name" style="max-width:180px">
-        <select id="lk" style="max-width:130px"><option value="movies">Movies</option><option value="shows">TV Shows</option></select>
+        <select id="lk" style="max-width:130px"><option value="movies">Movies</option><option value="shows">TV Shows</option><option value="anime">Anime</option></select>
         <input id="lp" placeholder="/path/to/media (comma-separated)"></div>
       <div class="err" id="lerr"></div>
       <button style="margin-top:12px" onclick="addLib()">Add & scan</button>
@@ -329,9 +329,12 @@ async function viewAdmin(){
   </div>`;
 }
 async function addLib(){
-  const name=ln.value.trim(), kind=lk.value, paths=lp.value.split(",").map(s=>s.trim()).filter(Boolean);
+  const name=ln.value.trim(), sel=lk.value, paths=lp.value.split(",").map(s=>s.trim()).filter(Boolean);
+  // "Anime" is a shows library flagged anime (absolute numbering + AniList).
+  const kind = sel==="anime" ? "shows" : sel;
+  const anime = sel==="anime";
   const err=document.getElementById("lerr"); err.textContent="";
-  try{ await api("/libraries",{method:"POST",body:{name,kind,paths}}); toast("Library added — scanning"); viewAdmin(); }
+  try{ await api("/libraries",{method:"POST",body:{name,kind,paths,anime}}); toast("Library added — scanning"); viewAdmin(); }
   catch(e){ err.textContent=e.message; }
 }
 async function scanLib(id){ try{ await api(`/libraries/${id}/scan`,{method:"POST"}); toast("Scan started"); setTimeout(viewAdmin,600);}catch(e){toast(e.message)} }

@@ -18,6 +18,9 @@ pub struct LibraryInput {
     pub name: String,
     pub kind: String,
     pub paths: Vec<String>,
+    /// Flag a shows library as anime (absolute numbering + AniList).
+    #[serde(default)]
+    pub anime: bool,
 }
 
 impl LibraryInput {
@@ -37,10 +40,13 @@ impl LibraryInput {
         if paths.is_empty() {
             return Err(ApiError::BadRequest("at least one path is required".into()));
         }
+        // Anime only applies to shows libraries.
+        let anime = self.anime && kind == LibraryKind::Shows;
         Ok(NewLibrary {
             name: self.name.trim().to_owned(),
             kind,
             paths,
+            anime,
         })
     }
 }

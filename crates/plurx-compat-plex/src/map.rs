@@ -260,6 +260,7 @@ mod tests {
             name: "Movies".into(),
             kind: LibraryKind::Movies,
             paths: vec![],
+            anime: false,
             created_at: 5,
         };
         let doc = section_directory(&lib).to_document();

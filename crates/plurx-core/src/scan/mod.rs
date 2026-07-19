@@ -180,7 +180,13 @@ async fn place_item(
             Ok(Some(id))
         }
         LibraryKind::Shows => {
-            let Some(parsed) = parse::parse_episode(path) else {
+            // Anime libraries use absolute numbering; regular shows use S/E.
+            let parsed = if library.anime {
+                parse::parse_anime_episode(path)
+            } else {
+                parse::parse_episode(path)
+            };
+            let Some(parsed) = parsed else {
                 return Ok(None);
             };
             let show = find_or_create_show(store, library, &parsed).await?;
@@ -289,6 +295,7 @@ mod tests {
                 name: "Movies".into(),
                 kind: LibraryKind::Movies,
                 paths: vec![dir.path().to_path_buf()],
+                anime: false,
             })
             .await
             .expect("lib");
@@ -341,6 +348,7 @@ mod tests {
                 name: "TV".into(),
                 kind: LibraryKind::Shows,
                 paths: vec![dir.path().to_path_buf()],
+                anime: false,
             })
             .await
             .expect("lib");

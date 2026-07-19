@@ -15,4 +15,5 @@ pub mod metadata;
 pub mod playback;
 pub mod scan;
 pub mod store;
+pub mod tracks;
 pub mod transcode;

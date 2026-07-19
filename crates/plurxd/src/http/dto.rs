@@ -153,6 +153,7 @@ pub struct LibraryDto {
     pub name: String,
     pub kind: String,
     pub paths: Vec<String>,
+    pub anime: bool,
     pub created_at: i64,
 }
 
@@ -167,6 +168,7 @@ impl From<Library> for LibraryDto {
                 .into_iter()
                 .map(|p| p.to_string_lossy().into_owned())
                 .collect(),
+            anime: l.anime,
             created_at: l.created_at,
         }
     }

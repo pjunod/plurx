@@ -88,6 +88,9 @@ static NX_NN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\b(\d{1,3})x(\d{1,4})\b").expect("valid"));
 static SEASON_DIR: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)^(?:season|series)[\s._-]*(\d{1,3})$").expect("valid"));
+// Anime absolute numbering: "Title - 01", "Title - 12v2", "Title - 100".
+static ANIME_EP: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\s-\s(\d{1,4})(?:v\d+)?(?:\s|\.|\[|\(|$)").expect("valid"));
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedMovie {
@@ -282,6 +285,53 @@ pub fn parse_episode(path: &Path) -> Option<ParsedEpisode> {
     })
 }
 
+/// Remove `[...]` and `{...}` bracket groups (release group, hashes).
+fn strip_brackets(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut depth = 0i32;
+    for c in s.chars() {
+        match c {
+            '[' | '{' => depth += 1,
+            ']' | '}' => depth = (depth - 1).max(0),
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Parse an anime episode using absolute numbering (`[Group] Title - NN`),
+/// falling back to standard `SxxEyy` when the release uses it. Returns `None`
+/// if no episode number is found. Anime episodes map to season 1 with the
+/// absolute number (REQ-META-3).
+pub fn parse_anime_episode(path: &Path) -> Option<ParsedEpisode> {
+    // Some anime use standard S/E — honor it first.
+    if let Some(std) = parse_episode(path) {
+        return Some(std);
+    }
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    let cleaned = strip_brackets(stem);
+
+    let caps = ANIME_EP.captures(&cleaned)?;
+    let episode: i32 = caps.get(1)?.as_str().parse().ok()?;
+    let marker = caps.get(0)?.start();
+    let show_title = title_before_cruft(&cleaned[..marker]);
+    Some(ParsedEpisode {
+        show_title: if show_title.is_empty() {
+            "Unknown".to_owned()
+        } else {
+            show_title
+        },
+        show_year: None,
+        season: 1,
+        episode,
+        episode_title: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,6 +449,39 @@ mod tests {
     fn non_episode_returns_none() {
         assert!(ep("/tv/Show/Season 1/poster.jpg").is_none());
         assert!(ep("/tv/random movie (2020).mkv").is_none());
+    }
+
+    fn anime(p: &str) -> Option<ParsedEpisode> {
+        parse_anime_episode(&PathBuf::from(p))
+    }
+
+    #[test]
+    fn anime_absolute_numbering() {
+        let e = anime("/a/[SubsPlease] Sousou no Frieren - 01 (1080p) [A1B2C3].mkv").expect("p");
+        assert_eq!(e.show_title, "Sousou no Frieren");
+        assert_eq!((e.season, e.episode), (1, 1));
+
+        // Version suffix and 3-digit numbers.
+        let e = anime("/a/[Group] One Piece - 1042v2 [720p].mkv").expect("p");
+        assert_eq!(e.show_title, "One Piece");
+        assert_eq!(e.episode, 1042);
+
+        // Plain "Title - NN.ext".
+        let e = anime("/a/Bocchi the Rock - 05.mkv").expect("p");
+        assert_eq!(e.show_title, "Bocchi the Rock");
+        assert_eq!(e.episode, 5);
+    }
+
+    #[test]
+    fn anime_honors_standard_se() {
+        // Anime that uses S/E still parses via the standard path.
+        let e = anime("/a/Attack on Titan/Season 4/Attack on Titan - S04E01.mkv").expect("p");
+        assert_eq!((e.season, e.episode), (4, 1));
+    }
+
+    #[test]
+    fn anime_without_number_is_none() {
+        assert!(anime("/a/[Group] Some Movie (2020) [1080p].mkv").is_none());
     }
 
     #[test]

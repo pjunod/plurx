@@ -181,6 +181,7 @@ mod tests {
                 name: "M".into(),
                 kind: LibraryKind::Movies,
                 paths: vec![],
+                anime: false,
             })
             .await
             .expect("lib");

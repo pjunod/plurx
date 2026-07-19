@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use plurx_core::metadata::{self, EnrichReport, TmdbClient};
+use plurx_core::metadata::{self, AniListClient, EnrichReport, TmdbClient};
 use plurx_core::scan::{self, ScanReport};
 use plurx_core::store::{keys, Store};
 use plurx_core::transcode::EncoderCaps;
@@ -142,21 +142,34 @@ impl JobManager {
             }
         }
 
-        // Enrich only if a TMDB key is configured; absence is not an error.
-        match self.store.get_setting(keys::TMDB_API_KEY).await {
-            Ok(Some(key)) if !key.is_empty() => {
-                let tmdb = TmdbClient::new(key);
-                let report = metadata::enrich_library(
-                    self.store.as_ref(),
-                    &tmdb,
-                    &self.artwork_dir,
-                    Some(library_id),
-                )
-                .await;
-                status.last_enrich = Some(report);
+        // Anime libraries enrich from AniList (no key needed); everything else
+        // from TMDB when a key is configured.
+        if library.anime {
+            let client = AniListClient::new();
+            let report = metadata::enrich_anime_library(
+                self.store.as_ref(),
+                &client,
+                &self.artwork_dir,
+                library_id,
+            )
+            .await;
+            status.last_enrich = Some(report);
+        } else {
+            match self.store.get_setting(keys::TMDB_API_KEY).await {
+                Ok(Some(key)) if !key.is_empty() => {
+                    let tmdb = TmdbClient::new(key);
+                    let report = metadata::enrich_library(
+                        self.store.as_ref(),
+                        &tmdb,
+                        &self.artwork_dir,
+                        Some(library_id),
+                    )
+                    .await;
+                    status.last_enrich = Some(report);
+                }
+                Ok(_) => tracing::info!("no TMDB key configured; skipping enrichment"),
+                Err(e) => tracing::warn!(error = %e, "reading TMDB key"),
             }
-            Ok(_) => tracing::info!("no TMDB key configured; skipping enrichment"),
-            Err(e) => tracing::warn!(error = %e, "reading TMDB key"),
         }
 
         status.running = false;

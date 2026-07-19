@@ -5,11 +5,13 @@
 //! back through the store. Provider responses and artwork are cached locally
 //! so a library keeps working offline once enriched (REQ-META-4).
 
+pub mod anilist;
 pub mod tmdb;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+pub use anilist::AniListClient;
 pub use tmdb::TmdbClient;
 
 use crate::domain::{ItemKind, MetadataPatch};
@@ -151,6 +153,105 @@ pub async fn enrich_library(
         "metadata enrichment complete"
     );
     report
+}
+
+/// Enrich anime shows in a library from AniList (REQ-META-3). Only show items
+/// are matched (episodes keep their absolute numbering); artwork is downloaded
+/// from AniList's absolute image URLs. All failures are non-fatal.
+pub async fn enrich_anime_library(
+    store: &dyn Store,
+    client: &AniListClient,
+    artwork_dir: &Path,
+    library_id: i64,
+) -> EnrichReport {
+    let mut report = EnrichReport::default();
+    if let Err(e) = tokio::fs::create_dir_all(artwork_dir).await {
+        tracing::error!(dir = %artwork_dir.display(), error = %e, "cannot create artwork dir");
+        report.errors += 1;
+        return report;
+    }
+    let items = match store.items_needing_metadata(Some(library_id)).await {
+        Ok(items) => items,
+        Err(e) => {
+            tracing::error!(error = %e, "listing anime needing metadata");
+            report.errors += 1;
+            return report;
+        }
+    };
+
+    for item in items {
+        if item.kind != ItemKind::Show {
+            continue;
+        }
+        match client.find_anime(&item.title).await {
+            Ok(Some(m)) => {
+                let poster = download_url(
+                    client,
+                    artwork_dir,
+                    item.id,
+                    "poster",
+                    m.cover_url.as_deref(),
+                )
+                .await;
+                let backdrop = download_url(
+                    client,
+                    artwork_dir,
+                    item.id,
+                    "backdrop",
+                    m.banner_url.as_deref(),
+                )
+                .await;
+                let patch = MetadataPatch {
+                    title: Some(m.title),
+                    year: m.year,
+                    overview: m.overview,
+                    poster_path: poster,
+                    backdrop_path: backdrop,
+                    ..Default::default()
+                };
+                if apply(store, item.id, patch, &mut report).await {
+                    report.matched += 1;
+                }
+            }
+            Ok(None) => report.unmatched += 1,
+            Err(e) => {
+                tracing::warn!(title = %item.title, error = %e, "anilist lookup failed");
+                report.errors += 1;
+            }
+        }
+    }
+    tracing::info!(
+        matched = report.matched,
+        unmatched = report.unmatched,
+        errors = report.errors,
+        "anime enrichment complete"
+    );
+    report
+}
+
+/// Download an image from an absolute URL (AniList) into the artwork cache.
+async fn download_url(
+    client: &AniListClient,
+    artwork_dir: &Path,
+    item_id: i64,
+    kind: &str,
+    url: Option<&str>,
+) -> Option<String> {
+    let url = url?;
+    let bytes = match client.download_image(url).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(item_id, kind, error = %e, "anime artwork download failed");
+            return None;
+        }
+    };
+    let filename = format!("{item_id}-{kind}.jpg");
+    let dest = artwork_dir.join(&filename);
+    if let Err(e) = tokio::fs::write(&dest, &bytes).await {
+        tracing::warn!(path = %dest.display(), error = %e, "writing anime artwork");
+        return None;
+    }
+    Some(filename)
 }
 
 /// Fetch each season once and patch this show's episodes by episode number.

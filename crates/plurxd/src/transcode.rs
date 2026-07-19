@@ -100,11 +100,41 @@ impl TranscodeManager {
             .await
             .map_err(|e| format!("creating session dir: {e}"))?;
 
+        // Default-track selection: prefer original (Japanese) audio + subs when
+        // the file is dual-audio anime-style (REQ-SUB-2). Burn the chosen text
+        // subtitle since HLS transcode delivers a single flat stream.
+        let prefer_original = file
+            .audio_streams
+            .iter()
+            .any(|a| matches!(a.language.as_deref(), Some("jpn" | "ja" | "jp")))
+            && file.audio_streams.len() > 1;
+        let selection = plurx_core::tracks::select_tracks(
+            &file.audio_streams,
+            &file.subtitle_streams,
+            prefer_original,
+        );
+        let subtitle_burn = selection.subtitle_index.and_then(|idx| {
+            let codec = file
+                .subtitle_streams
+                .get(idx as usize)
+                .map(|s| s.codec.clone());
+            // Only burn when we actively prefer original audio (dual-audio case).
+            prefer_original.then_some(plurx_core::transcode::SubtitleBurn {
+                subtitle_index: idx,
+                bitmap: codec
+                    .as_deref()
+                    .map(plurx_core::tracks::is_bitmap_subtitle)
+                    .unwrap_or(false),
+            })
+        });
+
         let opts = TranscodeOptions {
             target_height,
             video_bitrate_kbps: bitrate_for_height(target_height),
+            audio_index: selection.audio_index,
             start_seconds,
             tone_map: tone_map_pref(),
+            subtitle_burn,
             ..Default::default()
         };
         let args = transcode::hls_args(&file, encoder, &opts, &dir.to_string_lossy());

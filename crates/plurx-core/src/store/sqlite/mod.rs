@@ -132,6 +132,9 @@ const MIGRATIONS: &[&str] = &[
         INSERT INTO items_fts(rowid, title, overview)
         VALUES (new.id, new.title, new.overview);
     END;",
+    // v3: Phase 2 — mark a (shows) library as anime, so the scanner uses
+    // absolute episode numbering and enriches from AniList.
+    "ALTER TABLE libraries ADD COLUMN anime INTEGER NOT NULL DEFAULT 0;",
 ];
 
 /// Column list matching [`item_from_row`]. Prefix with a table alias via

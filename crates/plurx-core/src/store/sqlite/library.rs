@@ -10,7 +10,7 @@ use crate::domain::{Library, LibraryKind, NewLibrary};
 use crate::error::StoreError;
 use crate::store::LibraryStore;
 
-const LIB_COLS: &str = "id, name, kind, paths, created_at";
+const LIB_COLS: &str = "id, name, kind, paths, anime, created_at";
 
 fn library_from_row(row: &Row<'_>) -> rusqlite::Result<Library> {
     let kind_raw: String = row.get(2)?;
@@ -24,7 +24,8 @@ fn library_from_row(row: &Row<'_>) -> rusqlite::Result<Library> {
         name: row.get(1)?,
         kind,
         paths,
-        created_at: row.get(4)?,
+        anime: row.get::<_, i64>(4)? != 0,
+        created_at: row.get(5)?,
     })
 }
 
@@ -38,13 +39,14 @@ impl LibraryStore for SqliteStore {
         let name = library.name.clone();
         let kind = library.kind.as_str();
         let paths = paths_json(&library.paths)?;
+        let anime = library.anime as i64;
         self.with_conn(move |conn| {
             Ok(conn.query_row(
                 &format!(
-                    "INSERT INTO libraries (name, kind, paths)
-                     VALUES (?1, ?2, ?3) RETURNING {LIB_COLS}"
+                    "INSERT INTO libraries (name, kind, paths, anime)
+                     VALUES (?1, ?2, ?3, ?4) RETURNING {LIB_COLS}"
                 ),
-                params![name, kind, paths],
+                params![name, kind, paths, anime],
                 library_from_row,
             )?)
         })
@@ -59,14 +61,15 @@ impl LibraryStore for SqliteStore {
         let name = library.name.clone();
         let kind = library.kind.as_str();
         let paths = paths_json(&library.paths)?;
+        let anime = library.anime as i64;
         self.with_conn(move |conn| {
             Ok(conn
                 .query_row(
                     &format!(
-                        "UPDATE libraries SET name = ?2, kind = ?3, paths = ?4
+                        "UPDATE libraries SET name = ?2, kind = ?3, paths = ?4, anime = ?5
                          WHERE id = ?1 RETURNING {LIB_COLS}"
                     ),
-                    params![id, name, kind, paths],
+                    params![id, name, kind, paths, anime],
                     library_from_row,
                 )
                 .optional()?)
@@ -122,6 +125,7 @@ mod tests {
                 name: "Movies".into(),
                 kind: LibraryKind::Movies,
                 paths: vec![PathBuf::from("/media/movies")],
+                anime: false,
             })
             .await
             .expect("create");
@@ -135,6 +139,7 @@ mod tests {
                     name: "Films".into(),
                     kind: LibraryKind::Movies,
                     paths: vec![PathBuf::from("/media/movies"), PathBuf::from("/mnt/more")],
+                    anime: false,
                 },
             )
             .await
