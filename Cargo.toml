@@ -18,7 +18,7 @@ axum = "0.8"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
 # Async runtime
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "time", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "time", "sync", "process", "io-util", "fs"] }
 async-trait = "0.1"
 # Storage (single-node backend behind the Store trait; raft backend lands in Phase 4)
 rusqlite = { version = "0.37", features = ["bundled"] }
@@ -34,6 +34,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Scanner / metadata
 walkdir = "2"
 notify = "6"
+regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # Auth
 argon2 = "0.5"

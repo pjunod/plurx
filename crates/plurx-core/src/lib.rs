@@ -10,4 +10,5 @@
 pub mod config;
 pub mod domain;
 pub mod error;
+pub mod scan;
 pub mod store;

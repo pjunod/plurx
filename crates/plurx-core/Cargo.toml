@@ -16,6 +16,15 @@ tokio = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
+# Scanner
+walkdir = { workspace = true }
+regex = { workspace = true }
+# Metadata
+reqwest = { workspace = true }
+# Auth
+argon2 = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
