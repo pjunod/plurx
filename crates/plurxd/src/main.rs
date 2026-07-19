@@ -106,6 +106,17 @@ async fn run(config: Config) -> anyhow::Result<()> {
     );
     // Reap idle transcode sessions in the background.
     tokio::spawn(std::sync::Arc::clone(&state.transcode).reap_loop());
+
+    // GDM responder for Plex-client LAN discovery (best-effort).
+    let gdm_id = instance_id.clone();
+    let gdm_name = config.server.name.clone();
+    let gdm_port = config.server.bind.port();
+    tokio::spawn(async move {
+        if let Err(e) = gdm_responder(gdm_id, gdm_name, gdm_port).await {
+            tracing::warn!(error = %e, "GDM discovery responder unavailable");
+        }
+    });
+
     let app = http::router(state);
     let listener = tokio::net::TcpListener::bind(config.server.bind)
         .await
@@ -117,6 +128,40 @@ async fn run(config: Config) -> anyhow::Result<()> {
         .await?;
     tracing::info!("shutdown complete");
     Ok(())
+}
+
+/// GDM discovery responder: answers Plex clients' multicast `M-SEARCH` on the
+/// LAN (docs/CLIENTS.md §3). Multicast is TTL-scoped to the local network, so
+/// this never answers WAN queries (avoids GDM/SSDP reflection abuse).
+async fn gdm_responder(instance_id: String, name: String, port: u16) -> anyhow::Result<()> {
+    use std::net::Ipv4Addr;
+
+    let socket =
+        tokio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, plurx_compat_plex::gdm::GDM_PORT))
+            .await
+            .context("binding GDM port")?;
+    socket
+        .join_multicast_v4(
+            plurx_compat_plex::gdm::GDM_MULTICAST_ADDR.parse()?,
+            Ipv4Addr::UNSPECIFIED,
+        )
+        .context("joining GDM multicast group")?;
+    tracing::info!(
+        port = plurx_compat_plex::gdm::GDM_PORT,
+        "GDM discovery responder listening"
+    );
+
+    let version = env!("CARGO_PKG_VERSION");
+    let mut buf = [0u8; 1024];
+    loop {
+        let (n, addr) = socket.recv_from(&mut buf).await?;
+        if plurx_compat_plex::gdm::is_search(&buf[..n]) {
+            let resp = plurx_compat_plex::gdm::response(&instance_id, &name, version, port);
+            if let Err(e) = socket.send_to(&resp, addr).await {
+                tracing::warn!(error = %e, "GDM response send failed");
+            }
+        }
+    }
 }
 
 async fn shutdown_signal() {

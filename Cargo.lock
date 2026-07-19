@@ -908,6 +908,7 @@ version = "0.0.1"
 dependencies = [
  "axum",
  "http-body-util",
+ "plurx-core",
  "tokio",
  "tower",
 ]
@@ -946,6 +947,7 @@ dependencies = [
  "futures-util",
  "http-body-util",
  "mime_guess",
+ "plurx-compat-plex",
  "plurx-core",
  "serde",
  "serde_json",

@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 axum = { workspace = true }
+plurx-core = { path = "../plurx-core" }
 
 [dev-dependencies]
 http-body-util = { workspace = true }

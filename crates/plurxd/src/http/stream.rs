@@ -100,7 +100,7 @@ pub async fn direct(
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let file = load_file(&state, id).await?;
-    serve_range(&file.path, &headers).await
+    serve_file_range(&file.path, &headers).await
 }
 
 #[derive(Deserialize)]
@@ -159,7 +159,12 @@ fn parse_range(headers: &HeaderMap, len: u64) -> Option<(u64, u64)> {
     Some((start, end))
 }
 
-async fn serve_range(path: &Path, headers: &HeaderMap) -> Result<Response, ApiError> {
+/// HTTP range serving of a file (direct play). Shared by the native part
+/// endpoint and the Plex-compat `/library/parts/...` endpoint.
+pub(crate) async fn serve_file_range(
+    path: &Path,
+    headers: &HeaderMap,
+) -> Result<Response, ApiError> {
     let mut fh = tokio::fs::File::open(path)
         .await
         .map_err(|_| ApiError::NotFound("file on disk"))?;

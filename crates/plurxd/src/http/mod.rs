@@ -13,6 +13,7 @@ mod extract;
 mod hls;
 mod images;
 mod libraries;
+mod plex;
 mod stream;
 mod system;
 mod watch;
@@ -65,15 +66,56 @@ pub fn router(state: AppState) -> Router {
         // Images
         .route("/images/{filename}", get(images::serve));
 
+    // Plex-compat Tier 1 façade at Plex's absolute paths (docs/CLIENTS.md §3).
+    // Plex uses literal `:` path segments (`/:/timeline`, `/photo/:/transcode`)
+    // which axum 0.8 rejects by default — `without_v07_checks` matches them
+    // literally (we still use `{capture}` syntax for real captures).
+    let plex_routes = Router::new()
+        .without_v07_checks()
+        .route("/identity", get(plex::identity))
+        .route("/library", get(plex::library_root))
+        .route("/library/sections", get(plex::sections))
+        .route("/library/sections/{id}/all", get(plex::section_all))
+        .route("/library/metadata/{key}", get(plex::metadata))
+        .route("/library/metadata/{key}/children", get(plex::children))
+        .route("/library/metadata/{key}/{kind}", get(plex::image))
+        .route("/library/parts/{file_id}/{mtime}/{name}", get(plex::part))
+        .route("/photo/:/transcode", get(plex::photo_transcode))
+        .route("/:/timeline", get(plex::timeline))
+        .route("/:/scrobble", get(plex::scrobble))
+        .route("/:/unscrobble", get(plex::unscrobble))
+        .route("/search", get(plex::search))
+        .route("/hubs/search", get(plex::search));
+
     Router::new()
-        .route("/", get(web::index))
+        // Also opted out of the v0.7 checks so the merged Plex `:` routes pass.
+        .without_v07_checks()
+        // `/` serves the web app for browsers, Plex capabilities for Plex clients.
+        .route("/", get(root_dispatch))
         .route("/assets/hls.min.js", get(web::hls_js))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .nest("/api/v1", api)
+        .merge(plex_routes)
         .fallback(web::fallback)
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)
+}
+
+/// Root path: Plex clients get the capabilities container; browsers get the app.
+async fn root_dispatch(
+    state: State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if plex::looks_like_plex(&headers) {
+        match plex::root(state).await {
+            Ok(resp) => resp,
+            Err(e) => e.into_response(),
+        }
+    } else {
+        web::index().await.into_response()
+    }
 }
 
 /// Liveness: the process is up. Never touches storage.
