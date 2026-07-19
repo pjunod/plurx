@@ -1,0 +1,126 @@
+//! Server identity, first-run setup, settings, and scan status.
+
+use std::collections::HashMap;
+
+use axum::extract::State;
+use axum::Json;
+use plurx_core::auth;
+use plurx_core::store::keys;
+use serde::{Deserialize, Serialize};
+
+use super::auth::LoginResponse;
+use super::error::ApiError;
+use super::extract::AdminUser;
+use crate::state::{AppState, ScanStatus};
+
+#[derive(Serialize)]
+pub struct ServerInfo {
+    pub name: String,
+    pub version: &'static str,
+    pub instance_id: String,
+    pub uptime_seconds: u64,
+    /// True when no users exist yet — the web app shows first-run setup.
+    pub setup_required: bool,
+}
+
+/// GET /api/v1/server — public; drives the client's setup-vs-login decision.
+pub async fn server_info(State(state): State<AppState>) -> Result<Json<ServerInfo>, ApiError> {
+    let instance_id = state.store.instance_id().await?;
+    let setup_required = state.store.count_users().await? == 0;
+    Ok(Json(ServerInfo {
+        name: state.server_name.clone(),
+        version: env!("CARGO_PKG_VERSION"),
+        instance_id,
+        uptime_seconds: state.started_at.elapsed().as_secs(),
+        setup_required,
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct SetupRequest {
+    pub username: String,
+    pub password: String,
+}
+
+/// POST /api/v1/setup — create the first (admin) user. Allowed only while no
+/// users exist; auto-logs-in on success.
+pub async fn setup(
+    State(state): State<AppState>,
+    Json(req): Json<SetupRequest>,
+) -> Result<Json<LoginResponse>, ApiError> {
+    if state.store.count_users().await? > 0 {
+        return Err(ApiError::Conflict("setup already completed".into()));
+    }
+    if req.username.trim().is_empty() || req.password.len() < 8 {
+        return Err(ApiError::BadRequest(
+            "username required and password must be at least 8 characters".into(),
+        ));
+    }
+    let hash = auth::hash_password(&req.password).map_err(|e| ApiError::Internal(e.to_string()))?;
+    let user = state
+        .store
+        .create_user(req.username.trim(), &hash, true)
+        .await?;
+
+    let token = auth::generate_token().map_err(|e| ApiError::Internal(e.to_string()))?;
+    let token_hash = auth::hash_token(&token);
+    state
+        .store
+        .create_token(&token_hash, user.id, Some("setup"))
+        .await?;
+    Ok(Json(LoginResponse {
+        token,
+        user: user.into(),
+    }))
+}
+
+#[derive(Serialize)]
+pub struct SettingsDto {
+    pub tmdb_configured: bool,
+}
+
+/// GET /api/v1/settings (admin)
+pub async fn get_settings(
+    _admin: AdminUser,
+    State(state): State<AppState>,
+) -> Result<Json<SettingsDto>, ApiError> {
+    let tmdb_configured = state
+        .store
+        .get_setting(keys::TMDB_API_KEY)
+        .await?
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+    Ok(Json(SettingsDto { tmdb_configured }))
+}
+
+#[derive(Deserialize)]
+pub struct UpdateSettings {
+    /// Set the TMDB API key. Empty string clears it. Absent leaves it as-is.
+    pub tmdb_api_key: Option<String>,
+}
+
+/// PUT /api/v1/settings (admin)
+pub async fn update_settings(
+    _admin: AdminUser,
+    State(state): State<AppState>,
+    Json(req): Json<UpdateSettings>,
+) -> Result<Json<SettingsDto>, ApiError> {
+    if let Some(key) = req.tmdb_api_key {
+        state
+            .store
+            .put_setting(keys::TMDB_API_KEY, key.trim())
+            .await?;
+    }
+    let tmdb_configured = state
+        .store
+        .get_setting(keys::TMDB_API_KEY)
+        .await?
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+    Ok(Json(SettingsDto { tmdb_configured }))
+}
+
+/// GET /api/v1/scan/status — per-library scan status (keyed by library id).
+pub async fn scan_status(State(state): State<AppState>) -> Json<HashMap<i64, ScanStatus>> {
+    Json(state.jobs.all_statuses().await)
+}

@@ -1,4 +1,5 @@
 mod http;
+mod state;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -9,6 +10,8 @@ use clap::{Parser, Subcommand};
 use plurx_core::config::Config;
 use plurx_core::store::{SqliteStore, Store};
 use tracing_subscriber::EnvFilter;
+
+use crate::state::AppState;
 
 #[derive(Parser)]
 #[command(name = "plurxd", version, about = "plurx media server daemon")]
@@ -67,6 +70,11 @@ async fn run(config: Config) -> anyhow::Result<()> {
             .with_context(|| format!("opening database {}", db_path.display()))?,
     );
 
+    // Artwork cache lives under the data dir; the API serves it from here.
+    let artwork_dir = config.storage.data_dir.join("artwork");
+    std::fs::create_dir_all(&artwork_dir)
+        .with_context(|| format!("creating artwork directory {}", artwork_dir.display()))?;
+
     let instance_id = store.instance_id().await?;
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -76,7 +84,11 @@ async fn run(config: Config) -> anyhow::Result<()> {
         "plurxd starting"
     );
 
-    let app = http::router(http::AppState::new(config.server.name.clone(), store));
+    let app = http::router(AppState::new(
+        config.server.name.clone(),
+        store,
+        artwork_dir,
+    ));
     let listener = tokio::net::TcpListener::bind(config.server.bind)
         .await
         .with_context(|| format!("binding {}", config.server.bind))?;
