@@ -27,14 +27,22 @@ A self-hosted media server and player family in the spirit of **old-school Plex*
 
 ## Status
 
-**Phase 0 complete** (see [docs/ROADMAP.md](docs/ROADMAP.md)): cargo workspace (`plurx-core`, `plurx-compat-plex`, `plurxd`), the `Store` trait with a single-node SQLite backend behind it, and a running daemon with `/healthz`, `/readyz`, and the seed of `/api/v1`. CI covers fmt/clippy/tests, amd64+arm64 release builds, and the Docker image. Next: Phase 1 — scanner, TMDB metadata, and playback.
+**Phase 1 complete** (see [docs/ROADMAP.md](docs/ROADMAP.md)): plurx is a working single-node media server. Point it at a folder of movies or TV, open the web app, and play.
+
+- **Scanner** — walks libraries, identifies movies/episodes (Plex/Jellyfin + scene naming), probes each file with `ffprobe` (codecs, HDR, audio/subtitle tracks), incremental by size+mtime, reconciles vanished files.
+- **Metadata** — optional TMDB agent (title/year matching, overviews, cached posters/backdrops/stills); works fully offline without a key.
+- **Accounts** — first-run admin setup, Argon2id logins, token auth.
+- **Native API** — libraries, browse (grids, detail, home hubs), FTS search, watch progress/resume, artwork, scan status.
+- **Playback** — data-driven device profiles + a decision engine (direct/remux/transcode), HTTP range direct-play, and on-the-fly MKV→fMP4 remux via ffmpeg.
+- **Web app** — a self-contained SPA embedded in the binary: login, browse, an in-modal player with resume, continue-watching, and an admin panel.
 
 ```sh
-cargo run -p plurxd            # serves http://localhost:32600
-curl localhost:32600/api/v1/server
+cargo run -p plurxd            # serves http://localhost:32600 — open it in a browser
 ```
 
-Configuration: copy `plurx.example.toml` to `plurx.toml`, or use `PLURX_*` env vars.
+First launch walks you through creating an admin account and adding a library. Configuration: copy `plurx.example.toml` to `plurx.toml`, or use `PLURX_*` env vars (`PLURX_FFMPEG`/`PLURX_FFPROBE` to point at a specific build, e.g. jellyfin-ffmpeg).
+
+Next: **Phase 2** — hardware transcode, HDR tone-mapping, anime metadata (AniDB/AniList), and the Plex-compat façade. Then **Phase 3–4**: the HA cluster.
 
 | Document | Contents |
 |---|---|

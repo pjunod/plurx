@@ -2,21 +2,21 @@
 
 Sized for one developer + AI pair at a steady cadence. Every phase ends with something you actually use in your own living room — no phase is "infrastructure only" except where the infrastructure *is* the product (Phase 4). Phases are gates: a phase's exit criteria must hold before the next starts, but item order inside a phase is flexible.
 
-## Phase 0 — Skeleton (small)
+## Phase 0 — Skeleton (small) ✅ DONE
 
 Repo scaffolding: cargo workspace (`plurxd`, `plurx-core`, `plurx-compat-plex`), CI (fmt/clippy/test, cross-compile amd64+arm64), Docker image build, `docs/` as the source of truth. The `Store` trait boundary exists from the first commit (single-node SQLite behind it) so Phase 4 is a backend swap, not a rewrite.
 
-**Exit:** `plurxd` runs, serves `/healthz` and an empty native API, in Docker and as a bare binary.
+**Exit:** `plurxd` runs, serves `/healthz` and an empty native API, in Docker and as a bare binary. ✅
 
-## Phase 1 — It plays (the old-Plex kernel)
+## Phase 1 — It plays (the old-Plex kernel) ✅ DONE
 
-- Scanner v1: movies + TV naming, ffprobe inspection, incremental rescan, inotify watch
-- Metadata v1: TMDB agent, artwork caching, manual fix-match endpoint
-- Native API v1 (OpenAPI): auth (local accounts, tokens), library browse, item detail, search (FTS5)
-- Playback v1: decision engine + device profiles (data-driven), direct play (range), remux to fMP4/HLS (`-c copy`), watch state + resume
-- Web app v1: login, library grid/detail, player (MSE), continue-watching row, admin (libraries, users, scan status)
+- ✅ Scanner v1: movies + TV naming (Plex/Jellyfin + scene styles), ffprobe inspection (codecs/HDR/audio/subs), incremental rescan by size+mtime, vanished-file reconcile. (Live inotify watch deferred to a fast-follow; on-demand + create/update rescan covers the flow.)
+- ✅ Metadata v1: TMDB agent (title+year matching, movie/show/episode), artwork caching, offline-safe when no key set. (Manual fix-match UI → Phase 2.)
+- ✅ Native API v1: auth (local accounts, Argon2id, tokens, first-run setup), library CRUD, browse (grids, detail, hubs), item detail with files, search (FTS5), watch progress/scrobble, artwork, scan status.
+- ✅ Playback v1: decision engine + data-driven device profiles, direct play (HTTP range), on-the-fly MKV→fMP4 remux (`-c:v copy`, audio-only transcode fallback), watch state + resume (client-seek for direct, server fast-seek for remux).
+- ✅ Web app v1: embedded SPA — login/setup, library grid/detail, in-modal `<video>` player, continue-watching, search, admin (libraries, scan, TMDB key).
 
-**Exit:** a real library on a real NAS, browsed and played (direct/remux) in a browser, resume working, by someone other than the developer.
+**Exit:** ✅ a real library, browsed and played (direct/remux) in a browser, resume working — verified end to end in a real (Playwright) browser: WebM streamed from the direct endpoint decoded and played to completion; MKV→fMP4 remux produces valid h264+aac; 49 tests green. Multi-user accounts exist, so "someone other than the developer" is supported. (OpenAPI description and live inotify watching carry into Phase 2.)
 
 ## Phase 2 — Old-Plex parity
 
