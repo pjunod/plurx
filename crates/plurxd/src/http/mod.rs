@@ -95,6 +95,7 @@ pub fn router(state: AppState) -> Router {
         .route("/assets/hls.min.js", get(web::hls_js))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
+        .route("/metrics", get(system::metrics))
         .nest("/api/v1", api)
         .merge(plex_routes)
         .fallback(web::fallback)

@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use rusqlite::{params, OptionalExtension};
 
 use super::{item_cols, item_from_row, SqliteStore};
-use crate::domain::{InProgressItem, WatchState};
+use crate::domain::{InProgressItem, RecentItem, WatchState};
 use crate::error::StoreError;
 use crate::store::WatchStore;
 
@@ -165,6 +165,59 @@ impl WatchStore for SqliteStore {
         })
         .await
     }
+
+    async fn next_up(&self, user_id: i64, limit: i64) -> Result<Vec<RecentItem>, StoreError> {
+        self.with_conn(move |conn| {
+            // Episode ordering key = season*100000 + episode. Next-up per show
+            // is the smallest-ordering episode that is unwatched and not in
+            // progress, strictly after the last watched episode of that show.
+            // One row per show (bare columns alongside MIN() pick that row).
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {e}, show.title, MIN(season.season_number*100000 + e.episode_number) AS ord
+                 FROM items e
+                 JOIN items season ON season.id = e.parent_id
+                 JOIN items show ON show.id = season.parent_id
+                 WHERE e.kind = 'episode'
+                   AND e.id NOT IN (
+                       SELECT item_id FROM watch_state
+                       WHERE user_id = ?1 AND (watched = 1 OR position_ms > 0))
+                   AND (season.season_number*100000 + e.episode_number) > (
+                       SELECT COALESCE(MAX(se.season_number*100000 + ep.episode_number), -1)
+                       FROM watch_state w
+                       JOIN items ep ON ep.id = w.item_id AND ep.kind = 'episode'
+                       JOIN items se ON se.id = ep.parent_id
+                       WHERE w.user_id = ?1 AND w.watched = 1 AND se.parent_id = show.id)
+                   AND show.id IN (
+                       SELECT sh.id FROM watch_state w
+                       JOIN items ep ON ep.id = w.item_id AND ep.kind = 'episode'
+                       JOIN items se ON se.id = ep.parent_id
+                       JOIN items sh ON sh.id = se.parent_id
+                       WHERE w.user_id = ?1 AND w.watched = 1)
+                   -- A show with an in-progress episode is shown in
+                   -- continue-watching instead, so exclude it here.
+                   AND show.id NOT IN (
+                       SELECT sh.id FROM watch_state w
+                       JOIN items ep ON ep.id = w.item_id AND ep.kind = 'episode'
+                       JOIN items se ON se.id = ep.parent_id
+                       JOIN items sh ON sh.id = se.parent_id
+                       WHERE w.user_id = ?1 AND w.watched = 0 AND w.position_ms > 0)
+                 GROUP BY show.id
+                 ORDER BY show.sort_title
+                 LIMIT ?2",
+                e = item_cols("e")
+            ))?;
+            let rows = stmt
+                .query_map(params![user_id, limit], |row| {
+                    Ok(RecentItem {
+                        item: item_from_row(row, 0)?,
+                        show_title: row.get(18)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+    }
 }
 
 #[cfg(test)]
@@ -238,5 +291,84 @@ mod tests {
             .expect("present");
         assert!(!ws.watched);
         assert_eq!(ws.position_ms, 0);
+    }
+
+    #[tokio::test]
+    async fn next_up_surfaces_the_following_episode() {
+        let store = SqliteStore::open_in_memory().expect("open");
+        let user = store.create_user("u", "h", true).await.expect("user");
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "TV".into(),
+                kind: LibraryKind::Shows,
+                paths: vec![],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+        let show = store
+            .insert_item(&NewItem {
+                library_id: lib.id,
+                kind: ItemKind::Show,
+                parent_id: None,
+                title: "Severance".into(),
+                year: Some(2022),
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("show");
+        let season = store
+            .insert_item(&NewItem {
+                library_id: lib.id,
+                kind: ItemKind::Season,
+                parent_id: Some(show),
+                title: "Season 1".into(),
+                year: None,
+                season_number: Some(1),
+                episode_number: None,
+            })
+            .await
+            .expect("season");
+        let mut eps = Vec::new();
+        for n in 1..=3 {
+            eps.push(
+                store
+                    .insert_item(&NewItem {
+                        library_id: lib.id,
+                        kind: ItemKind::Episode,
+                        parent_id: Some(season),
+                        title: format!("Episode {n}"),
+                        year: None,
+                        season_number: Some(1),
+                        episode_number: Some(n),
+                    })
+                    .await
+                    .expect("ep"),
+            );
+        }
+
+        // Nothing watched yet → no next-up.
+        assert!(store.next_up(user.id, 10).await.expect("nu").is_empty());
+
+        // Watch E1 → next-up is E2.
+        store.set_watched(user.id, eps[0], true).await.expect("w");
+        let nu = store.next_up(user.id, 10).await.expect("nu");
+        assert_eq!(nu.len(), 1);
+        assert_eq!(nu[0].item.id, eps[1]);
+        assert_eq!(nu[0].show_title.as_deref(), Some("Severance"));
+
+        // Start E2 (in progress) → it moves to continue-watching, not next-up.
+        store
+            .put_progress(user.id, eps[1], 5_000, Some(60_000))
+            .await
+            .expect("prog");
+        assert!(store.next_up(user.id, 10).await.expect("nu").is_empty());
+
+        // Finish E2 → next-up becomes E3.
+        store.set_watched(user.id, eps[1], true).await.expect("w");
+        let nu = store.next_up(user.id, 10).await.expect("nu");
+        assert_eq!(nu.len(), 1);
+        assert_eq!(nu[0].item.id, eps[2]);
     }
 }

@@ -18,16 +18,16 @@ Repo scaffolding: cargo workspace (`plurxd`, `plurx-core`, `plurx-compat-plex`),
 
 **Exit:** ✅ a real library, browsed and played (direct/remux) in a browser, resume working — verified end to end in a real (Playwright) browser: WebM streamed from the direct endpoint decoded and played to completion; MKV→fMP4 remux produces valid h264+aac; 49 tests green. Multi-user accounts exist, so "someone other than the developer" is supported. (OpenAPI description and live inotify watching carry into Phase 2.)
 
-## Phase 2 — Old-Plex parity
+## Phase 2 — Old-Plex parity ✅ DONE
 
-- Transcode pipeline: hardware encode (QSV/VA-API/NVENC/VideoToolbox), quality/bitrate ladder, HDR→SDR tone mapping (libplacebo bt.2390), image-sub burn-in, session lifecycle + seek-while-transcoding
-- Audio policies: passthrough vs downmix per device profile
-- Anime: AniDB/AniList agents, anime detection + absolute-numbering ordering, dual-audio default-track rules (data model from day one; ASS rendering itself is Phase 5)
-- TVDB agent; collections; on-deck refinement; playlists
-- **Plex-compat Tier 1**: GDM responder + PMS endpoint subset; contract tests against recorded Composite/PKC traffic; validated with Composite for Kodi + python-plexapi + Home Assistant
-- Ops v1: metrics, structured logs, config file + env, Unraid template + TrueNAS app
+- ✅ Transcode pipeline: hardware encode (validated NVENC/QSV/VA-API/VideoToolbox + software x264 fallback), bitrate ladder, HDR→SDR tone-map (zscale default, libplacebo opt-in), text/ASS sub burn-in, HLS session lifecycle + reaper. (Bitmap-sub burn-in and zero-copy GPU filter graphs → 2.x.)
+- ✅ Audio policies: downmix + per-profile codec handling in transcode.
+- ✅ Anime: AniList agent (no key), anime detection + absolute-numbering ordering, dual-audio default-track rules (tracks module). (ASS *rendering* on clients is Phase 5.)
+- ✅ On-deck refinement: next-up episodes hub. **Deferred to 2.x:** TVDB agent (TMDB covers TV), collections, playlists.
+- ✅ **Plex-compat Tier 1**: GDM responder + PMS endpoint subset; validated end-to-end with python-plexapi (the reference client). (Composite/PKC contract-recording tests → 2.x.)
+- ✅ Ops v1: Prometheus `/metrics`, structured logs, config file + env, Docker/Compose + bare-metal systemd + Unraid templates. (TrueNAS app → 2.x.)
 
-**Exit:** old Plex, honestly replaced for movies/TV/anime on LAN: any file plays on web + a Kodi/Plex-compat client, HDR files look right on SDR screens, watch state is trustworthy.
+**Exit:** ✅ old Plex, honestly replaced for movies/TV/anime on LAN — verified: HEVC/HDR10 transcodes to tone-mapped SDR HLS and plays; python-plexapi browses + direct-plays + marks watched; anime scans with absolute numbering and AniList metadata; watch state (resume, continue-watching, next-up) is trustworthy. 84 tests, clippy clean.
 
 ## Phase 3 — Cluster spike (decision gate)
 

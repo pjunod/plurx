@@ -1,0 +1,45 @@
+# plurx single-node deployment.
+#
+# Bring up:  docker compose up -d
+# Then open http://<host>:32600 and create your admin account.
+#
+# Media is mounted read-only; plurx never writes to your library. The named
+# volume holds the database, artwork cache, and transcode scratch.
+
+services:
+  plurxd:
+    image: plurx/plurxd:latest
+    container_name: plurxd
+    restart: unless-stopped
+    ports:
+      - "32600:32600"      # HTTP API + web app
+      - "32414:32414/udp"  # GDM discovery for Plex clients (LAN)
+    environment:
+      PLURX_SERVER_NAME: "plurx"
+      PLURX_BIND: "0.0.0.0:32600"
+      PLURX_DATA_DIR: "/var/lib/plurx"
+      # Point at a specific ffmpeg build (e.g. jellyfin-ffmpeg) if desired:
+      # PLURX_FFMPEG: "/usr/lib/jellyfin-ffmpeg/ffmpeg"
+      # PLURX_FFPROBE: "/usr/lib/jellyfin-ffmpeg/ffprobe"
+      # Force an encoder, or leave unset for validated auto-detect:
+      # PLURX_HWACCEL: "vaapi"   # nvenc | qsv | vaapi | videotoolbox | software
+    volumes:
+      - plurx-data:/var/lib/plurx
+      - /path/to/your/media:/media:ro
+    # --- Hardware transcode passthrough (uncomment the block for your GPU) ---
+    #
+    # Intel QuickSync / VA-API (and AMD VA-API):
+    # devices:
+    #   - /dev/dri:/dev/dri
+    #
+    # NVIDIA (needs nvidia-container-toolkit on the host):
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+volumes:
+  plurx-data:

@@ -124,3 +124,42 @@ pub async fn update_settings(
 pub async fn scan_status(State(state): State<AppState>) -> Json<HashMap<i64, ScanStatus>> {
     Json(state.jobs.all_statuses().await)
 }
+
+/// GET /metrics — Prometheus text exposition (unauthenticated; counts only).
+pub async fn metrics(State(state): State<AppState>) -> impl axum::response::IntoResponse {
+    let uptime = state.started_at.elapsed().as_secs();
+    let sessions = state.transcode.active_sessions().await;
+    let libraries = state
+        .store
+        .list_libraries()
+        .await
+        .map(|l| l.len())
+        .unwrap_or(0);
+    let users = state.store.count_users().await.unwrap_or(0);
+
+    let body = format!(
+        "# HELP plurx_build_info Build information.\n\
+         # TYPE plurx_build_info gauge\n\
+         plurx_build_info{{version=\"{version}\"}} 1\n\
+         # HELP plurx_uptime_seconds Seconds since this node started.\n\
+         # TYPE plurx_uptime_seconds gauge\n\
+         plurx_uptime_seconds {uptime}\n\
+         # HELP plurx_transcode_sessions_active Live transcode sessions.\n\
+         # TYPE plurx_transcode_sessions_active gauge\n\
+         plurx_transcode_sessions_active {sessions}\n\
+         # HELP plurx_libraries_total Configured libraries.\n\
+         # TYPE plurx_libraries_total gauge\n\
+         plurx_libraries_total {libraries}\n\
+         # HELP plurx_users_total Registered users.\n\
+         # TYPE plurx_users_total gauge\n\
+         plurx_users_total {users}\n",
+        version = env!("CARGO_PKG_VERSION"),
+    );
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        body,
+    )
+}

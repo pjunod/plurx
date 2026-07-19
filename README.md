@@ -27,22 +27,23 @@ A self-hosted media server and player family in the spirit of **old-school Plex*
 
 ## Status
 
-**Phase 1 complete** (see [docs/ROADMAP.md](docs/ROADMAP.md)): plurx is a working single-node media server. Point it at a folder of movies or TV, open the web app, and play.
+**Phase 2 complete** (see [docs/ROADMAP.md](docs/ROADMAP.md)): plurx is old Plex, honestly replaced for movies, TV, and anime on the LAN — any file plays on the web app or a Kodi/Plex-compat client, HDR looks right on SDR screens, and watch state is trustworthy.
 
-- **Scanner** — walks libraries, identifies movies/episodes (Plex/Jellyfin + scene naming), probes each file with `ffprobe` (codecs, HDR, audio/subtitle tracks), incremental by size+mtime, reconciles vanished files.
-- **Metadata** — optional TMDB agent (title/year matching, overviews, cached posters/backdrops/stills); works fully offline without a key.
-- **Accounts** — first-run admin setup, Argon2id logins, token auth.
-- **Native API** — libraries, browse (grids, detail, home hubs), FTS search, watch progress/resume, artwork, scan status.
-- **Playback** — data-driven device profiles + a decision engine (direct/remux/transcode), HTTP range direct-play, and on-the-fly MKV→fMP4 remux via ffmpeg.
-- **Web app** — a self-contained SPA embedded in the binary: login, browse, an in-modal player with resume, continue-watching, and an admin panel.
+- **Scanner** — identifies movies/episodes (Plex/Jellyfin + scene naming, and anime absolute numbering), probes with `ffprobe` (codecs, HDR, audio/subtitle tracks), incremental, reconciles vanished files.
+- **Metadata** — TMDB for movies/TV (optional key) and **AniList for anime** (no key); cached artwork; fully offline once enriched.
+- **Playback** — data-driven device profiles + decision engine (direct / remux / transcode), HTTP-range direct play, MKV→fMP4 remux, and full **hardware transcode** (validated NVENC/QSV/VA-API/VideoToolbox with software fallback) delivering **HLS** with **HDR→SDR tone-mapping** and subtitle burn-in.
+- **Anime** — absolute episode numbering, AniList metadata, and dual-audio default-track selection (prefer original audio + subs).
+- **Plex-compat (Tier 1)** — a Plex Media Server API façade + GDM discovery, so Kodi (Composite/PKC), python-plexapi, and Home Assistant browse and play directly. Validated end-to-end with python-plexapi.
+- **Web app** — login, browse, an in-modal player (native + hls.js) with resume, continue-watching, **next-up**, search, and admin.
+- **Ops** — `/healthz`, `/readyz`, Prometheus `/metrics`; Docker/Compose, bare-metal systemd, and Unraid deploy templates in [`deploy/`](deploy/).
 
 ```sh
 cargo run -p plurxd            # serves http://localhost:32600 — open it in a browser
 ```
 
-First launch walks you through creating an admin account and adding a library. Configuration: copy `plurx.example.toml` to `plurx.toml`, or use `PLURX_*` env vars (`PLURX_FFMPEG`/`PLURX_FFPROBE` to point at a specific build, e.g. jellyfin-ffmpeg).
+First launch walks you through creating an admin account and adding a library. Configuration: copy `plurx.example.toml` to `plurx.toml`, or use `PLURX_*` env vars (`PLURX_FFMPEG`/`PLURX_FFPROBE`, `PLURX_HWACCEL`, `PLURX_TONEMAP`).
 
-Next: **Phase 2** — hardware transcode, HDR tone-mapping, anime metadata (AniDB/AniList), and the Plex-compat façade. Then **Phase 3–4**: the HA cluster.
+Deferred to a Phase 2.x fast-follow: TVDB agent (TMDB already covers TV), movie collections, playlists, and bitmap-subtitle burn-in. Next up is **Phase 3** — the cluster spike — then **Phase 4**: HA for real.
 
 | Document | Contents |
 |---|---|

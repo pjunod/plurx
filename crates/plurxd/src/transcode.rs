@@ -172,6 +172,11 @@ impl TranscodeManager {
         })
     }
 
+    /// Number of live transcode sessions (for /metrics).
+    pub async fn active_sessions(&self) -> usize {
+        self.sessions.lock().await.len()
+    }
+
     async fn touch(&self, session_id: &str) -> Option<Arc<Session>> {
         let session = self.sessions.lock().await.get(session_id).cloned()?;
         *session.last_access.lock().await = Instant::now();

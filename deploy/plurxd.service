@@ -1,0 +1,25 @@
+[Unit]
+Description=plurx media server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Create a dedicated user:  useradd --system --home /var/lib/plurx plurx
+User=plurx
+Group=plurx
+ExecStart=/usr/local/bin/plurxd run
+Environment=PLURX_DATA_DIR=/var/lib/plurx
+Environment=PLURX_BIND=0.0.0.0:32600
+# Point at a specific ffmpeg build if desired:
+# Environment=PLURX_FFMPEG=/usr/lib/jellyfin-ffmpeg/ffmpeg
+Restart=on-failure
+RestartSec=5
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/plurx
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

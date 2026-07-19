@@ -185,6 +185,7 @@ async function viewHome(){
   const [libs, hubs] = await Promise.all([api("/libraries"), api("/hubs")]);
   let html="";
   if(hubs.continue_watching.length){ html+=`<h2 class="section">Continue watching</h2><div class="rowscroll">${hubs.continue_watching.map(i=>card(i,true)).join("")}</div>`; }
+  if(hubs.next_up && hubs.next_up.length){ html+=`<h2 class="section">Next up</h2><div class="rowscroll">${hubs.next_up.map(i=>card(i,i.kind==='episode')).join("")}</div>`; }
   if(hubs.recently_added.length){ html+=`<h2 class="section">Recently added</h2><div class="rowscroll">${hubs.recently_added.map(i=>card(i,i.kind==='episode')).join("")}</div>`; }
   for(const lib of libs){
     const page=await api(`/libraries/${lib.id}/items?limit=24&sort=added`);

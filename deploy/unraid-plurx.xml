@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<!-- Unraid Community Applications template for plurx.
+     Place in /boot/config/plugins/dockerMan/templates-user/ or add via the
+     Unraid Docker UI ("Add Container" → paste this template). -->
+<Container version="2">
+  <Name>plurx</Name>
+  <Repository>plurx/plurxd:latest</Repository>
+  <Registry>https://hub.docker.com/r/plurx/plurxd</Registry>
+  <Network>bridge</Network>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Overview>Self-hosted media server in the spirit of old Plex: scan a folder, play on any screen. Hardware transcode, HDR tone-mapping, anime, and a Plex-compatible API for Kodi clients.</Overview>
+  <Category>MediaApp:Video</Category>
+  <WebUI>http://[IP]:[PORT:32600]/</WebUI>
+  <Icon>https://raw.githubusercontent.com/pjunod/plurx/main/docs/icon.png</Icon>
+  <ExtraParams>--restart unless-stopped</ExtraParams>
+
+  <Config Name="WebUI Port" Target="32600" Default="32600" Mode="tcp" Description="HTTP API + web app" Type="Port" Display="always" Required="true">32600</Config>
+  <Config Name="GDM Discovery" Target="32414" Default="32414" Mode="udp" Description="Plex-client LAN discovery" Type="Port" Display="advanced" Required="false">32414</Config>
+  <Config Name="Data" Target="/var/lib/plurx" Default="/mnt/user/appdata/plurx" Mode="rw" Description="Database, artwork cache, transcode scratch" Type="Path" Display="always" Required="true">/mnt/user/appdata/plurx</Config>
+  <Config Name="Media" Target="/media" Default="/mnt/user/media" Mode="ro" Description="Your media library (read-only)" Type="Path" Display="always" Required="true">/mnt/user/media</Config>
+  <Config Name="Intel/AMD GPU (VA-API)" Target="/dev/dri" Default="/dev/dri" Mode="" Description="Pass through /dev/dri for QuickSync/VA-API hardware transcode" Type="Device" Display="advanced" Required="false">/dev/dri</Config>
+  <Config Name="Server Name" Target="PLURX_SERVER_NAME" Default="plurx" Mode="" Description="Display name" Type="Variable" Display="advanced" Required="false">plurx</Config>
+</Container>

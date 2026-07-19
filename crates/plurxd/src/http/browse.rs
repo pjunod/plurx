@@ -133,6 +133,7 @@ pub struct HubsQuery {
 #[derive(Serialize)]
 pub struct Hubs {
     pub continue_watching: Vec<ItemDto>,
+    pub next_up: Vec<ItemDto>,
     pub recently_added: Vec<ItemDto>,
 }
 
@@ -144,6 +145,10 @@ pub async fn hubs(
 ) -> Result<Json<Hubs>, ApiError> {
     let in_progress = state.store.continue_watching(user.id, 20).await?;
     let continue_watching = in_progress.into_iter().map(in_progress_dto).collect();
+
+    // Next-up episodes (unwatched tracks per show); no per-item watch state.
+    let next = state.store.next_up(user.id, 20).await?;
+    let next_up = next.into_iter().map(|r| recent_dto(r, None)).collect();
 
     let recent = state.store.recently_added(q.library_id, 20).await?;
     let recent_items: Vec<Item> = recent.iter().map(|r| r.item.clone()).collect();
@@ -158,6 +163,7 @@ pub async fn hubs(
 
     Ok(Json(Hubs {
         continue_watching,
+        next_up,
         recently_added,
     }))
 }

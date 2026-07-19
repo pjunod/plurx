@@ -24,6 +24,7 @@ use crate::domain::{
     InProgressItem, Item, ItemPage, ItemSort, Library, MediaFile, MetadataPatch, NewItem,
     NewLibrary, ProbeResult, RecentItem, User, WatchState,
 };
+// RecentItem is reused for next-up (episode + show title).
 use crate::error::StoreError;
 
 /// Well-known settings keys. Keys are dotted, lowercase, and owned by the
@@ -194,6 +195,10 @@ pub trait WatchStore: Send + Sync + 'static {
         user_id: i64,
         limit: i64,
     ) -> Result<Vec<InProgressItem>, StoreError>;
+    /// Next-up episodes: for each show the user has watched into, the first
+    /// unwatched, not-in-progress episode after the last watched one. Pairs
+    /// with continue-watching (resume) — this is "start the next episode".
+    async fn next_up(&self, user_id: i64, limit: i64) -> Result<Vec<RecentItem>, StoreError>;
 }
 
 /// The full storage boundary — what plurxd holds as `Arc<dyn Store>`.
