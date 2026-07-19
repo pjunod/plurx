@@ -83,6 +83,7 @@
 <div class="modal" id="modal"><div class="player card"><div class="bar"><div id="playTitle" style="font-weight:600"></div><button class="ghost sm" onclick="closePlayer()">Close</button></div><video id="video" controls autoplay playsinline></video></div></div>
 <div class="toast" id="toast"></div>
 
+<script src="/assets/hls.min.js"></script>
 <script>
 "use strict";
 const API = "/api/v1";
@@ -239,26 +240,50 @@ async function toggleWatched(id, watched){
 }
 
 // ---- player ---------------------------------------------------------------
-let PLAYER={fileId:null,itemId:null,timer:null,duration:null};
+// Three playback methods (server /decision picks one):
+//  direct_play → native <video>, client-side seek/resume
+//  remux       → progressive fMP4 from ffmpeg, server fast-seek for resume
+//  transcode   → HLS via hls.js (ffmpeg tone-maps/re-encodes), offset resume
+let PLAYER={fileId:null,timer:null,offset:0,hls:null};
 async function play(fileId, title, resumeMs){
   const modal=document.getElementById("modal"), video=document.getElementById("video");
   document.getElementById("playTitle").textContent=title;
   modal.classList.add("open");
   let decision; try{ decision=await api(`/files/${fileId}/decision?profile=web-h264`);}catch(e){ toast(e.message); return closePlayer(); }
   const startSec=(resumeMs||0)/1000;
-  let url=tok(decision.play_url);
-  // Remux resume seeks server-side; direct play seeks client-side.
-  const isRemux = decision.method!=='direct_play';
-  if(isRemux && startSec>0) url+= "&start="+startSec.toFixed(1);
-  PLAYER={fileId, itemId:null, timer:null, duration:null, offset:isRemux?startSec:0};
-  video.src=url;
-  video.onloadedmetadata=()=>{ if(!isRemux && startSec>0){ try{video.currentTime=startSec}catch(e){} } };
-  video.play().catch(()=>{});
+  teardownHls();
+  PLAYER={fileId, timer:null, offset:0, hls:null};
+
+  if(decision.method==='transcode'){
+    // Transcode: start an HLS session (server re-encodes + tone-maps).
+    let info; try{ info=await api(`/files/${fileId}/hls/start?height=720&start=${startSec.toFixed(1)}`);}catch(e){ toast(e.message); return closePlayer(); }
+    PLAYER.offset = info.start_seconds||0;
+    if(window.Hls && Hls.isSupported()){
+      const hls=new Hls({xhrSetup:x=>{ if(TOKEN) x.setRequestHeader("authorization","Bearer "+TOKEN); }});
+      PLAYER.hls=hls;
+      hls.loadSource(info.playlist_url);
+      hls.attachMedia(video);
+      hls.on(Hls.Events.MANIFEST_PARSED,()=>video.play().catch(()=>{}));
+      hls.on(Hls.Events.ERROR,(_,d)=>{ if(d.fatal) toast("Playback error: "+d.details); });
+    } else {
+      // Safari: native HLS. Token via query since we can't set headers.
+      video.src=tok(info.playlist_url); video.play().catch(()=>{});
+    }
+  } else {
+    // Direct play or remux → native <video>.
+    const isRemux = decision.method!=='direct_play';
+    let url=tok(decision.play_url);
+    if(isRemux){ PLAYER.offset=startSec; if(startSec>0) url+="&start="+startSec.toFixed(1); }
+    video.src=url;
+    video.onloadedmetadata=()=>{ if(!isRemux && startSec>0){ try{video.currentTime=startSec}catch(e){} } };
+    video.play().catch(()=>{});
+  }
+
   clearInterval(PLAYER.timer);
   PLAYER.timer=setInterval(()=>reportProgress(fileId), 5000);
   video.onended=()=>{ reportProgress(fileId,true); };
-  // resolve item id for progress (files map 1:1 to items in Phase 1 via detail)
 }
+function teardownHls(){ if(PLAYER&&PLAYER.hls){ try{PLAYER.hls.destroy()}catch(e){} PLAYER.hls=null; } }
 async function reportProgress(fileId, ended){
   const video=document.getElementById("video");
   const posMs=Math.round(((PLAYER.offset||0)+ (video.currentTime||0))*1000);
@@ -269,7 +294,7 @@ async function reportProgress(fileId, ended){
 function closePlayer(){
   const video=document.getElementById("video");
   if(PLAYER.fileId) reportProgress(PLAYER.fileId);
-  clearInterval(PLAYER.timer); video.pause(); video.removeAttribute("src"); video.load();
+  clearInterval(PLAYER.timer); teardownHls(); video.pause(); video.removeAttribute("src"); video.load();
   document.getElementById("modal").classList.remove("open");
   if(location.hash.startsWith("#/item/")) { const id=location.hash.split("/")[2]; setTimeout(()=>viewItem(id),100); }
 }

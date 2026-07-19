@@ -1,5 +1,6 @@
 mod http;
 mod state;
+mod transcode;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -70,10 +71,22 @@ async fn run(config: Config) -> anyhow::Result<()> {
             .with_context(|| format!("opening database {}", db_path.display()))?,
     );
 
-    // Artwork cache lives under the data dir; the API serves it from here.
+    // Artwork cache and transcode scratch live under the data dir.
     let artwork_dir = config.storage.data_dir.join("artwork");
     std::fs::create_dir_all(&artwork_dir)
         .with_context(|| format!("creating artwork directory {}", artwork_dir.display()))?;
+    let transcode_dir = config.storage.data_dir.join("transcode");
+    // Clear any stale sessions from a previous run, then recreate.
+    let _ = std::fs::remove_dir_all(&transcode_dir);
+    std::fs::create_dir_all(&transcode_dir)
+        .with_context(|| format!("creating transcode directory {}", transcode_dir.display()))?;
+
+    // Detect available hardware encoders once at startup.
+    let ffmpeg = std::env::var("PLURX_FFMPEG")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "ffmpeg".to_owned());
+    let encoder_caps = plurx_core::transcode::detect_encoders(&ffmpeg).await;
 
     let instance_id = store.instance_id().await?;
     tracing::info!(
@@ -84,11 +97,16 @@ async fn run(config: Config) -> anyhow::Result<()> {
         "plurxd starting"
     );
 
-    let app = http::router(AppState::new(
+    let state = AppState::new(
         config.server.name.clone(),
         store,
         artwork_dir,
-    ));
+        transcode_dir,
+        encoder_caps,
+    );
+    // Reap idle transcode sessions in the background.
+    tokio::spawn(std::sync::Arc::clone(&state.transcode).reap_loop());
+    let app = http::router(state);
     let listener = tokio::net::TcpListener::bind(config.server.bind)
         .await
         .with_context(|| format!("binding {}", config.server.bind))?;

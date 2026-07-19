@@ -35,6 +35,9 @@ pub mod keys {
     pub const INSTANCE_ID: &str = "instance.id";
     /// TMDB API key (set by the admin; empty/absent disables the agent).
     pub const TMDB_API_KEY: &str = "tmdb.api_key";
+    /// Hardware-encoder preference for transcoding: "nvenc" | "qsv" | "vaapi"
+    /// | "videotoolbox" | "software" | "" (automatic).
+    pub const HWACCEL: &str = "transcode.hwaccel";
 }
 
 #[async_trait]

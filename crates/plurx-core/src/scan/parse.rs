@@ -143,13 +143,23 @@ fn title_before_cruft(raw: &str) -> String {
     for token in normalized.split_whitespace() {
         let lower = token.to_lowercase();
         let bare = lower.trim_matches(|c: char| !c.is_alphanumeric() && c != '+');
-        if STOP_TOKENS.contains(&bare) {
+        // Only cut at a release tag once we've kept at least one real title
+        // word — titles rarely *start* with a tag word (e.g. "HDR Nights",
+        // "Vision", "Extended Family" should keep their leading word).
+        if !kept.is_empty() && STOP_TOKENS.contains(&bare) {
             break;
         }
         kept.push(token);
     }
     let joined = kept.join(" ");
-    clean_title(&joined)
+    let cleaned = clean_title(&joined);
+    // Guard against a title that was entirely tag words → fall back to the
+    // whole cleaned string rather than losing the title.
+    if cleaned.is_empty() {
+        clean_title(&normalized)
+    } else {
+        cleaned
+    }
 }
 
 fn extract_year(s: &str) -> Option<(i32, usize)> {
@@ -316,6 +326,26 @@ mod tests {
             ParsedMovie {
                 title: "Heat".into(),
                 year: Some(1995)
+            }
+        );
+    }
+
+    #[test]
+    fn title_leading_with_a_tag_word_is_kept() {
+        // "HDR" is a release-tag stop word, but here it leads a real title.
+        assert_eq!(
+            movie("/m/HDR Nights (2024)/HDR Nights (2024).mkv"),
+            ParsedMovie {
+                title: "HDR Nights".into(),
+                year: Some(2024)
+            }
+        );
+        // Still strips trailing cruft after real words.
+        assert_eq!(
+            movie("/m/Vision.2020.1080p.BluRay.x264.mkv"),
+            ParsedMovie {
+                title: "Vision".into(),
+                year: Some(2020)
             }
         );
     }

@@ -8,10 +8,26 @@ use axum::http::{header, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 
 const INDEX_HTML: &str = include_str!("../web/index.html");
+/// hls.js (bundled for the transcode playback path; keeps the single-binary,
+/// works-offline promise instead of a CDN dependency).
+const HLS_JS: &str = include_str!("../web/hls.min.js");
 
 /// Serve the web app shell.
 pub async fn index() -> Html<&'static str> {
     Html(INDEX_HTML)
+}
+
+/// Serve the bundled hls.js.
+pub async fn hls_js() -> Response {
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/javascript"),
+            (header::CACHE_CONTROL, "public, max-age=604800"),
+        ],
+        HLS_JS,
+    )
+        .into_response()
 }
 
 /// Fallback for unmatched routes: serve the app for browser navigations,

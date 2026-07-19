@@ -15,3 +15,4 @@ pub mod metadata;
 pub mod playback;
 pub mod scan;
 pub mod store;
+pub mod transcode;

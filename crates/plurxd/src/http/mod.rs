@@ -10,6 +10,7 @@ mod browse;
 mod dto;
 mod error;
 mod extract;
+mod hls;
 mod images;
 mod libraries;
 mod stream;
@@ -58,11 +59,15 @@ pub fn router(state: AppState) -> Router {
         .route("/files/{id}/decision", get(stream::decision))
         .route("/files/{id}/direct", get(stream::direct))
         .route("/files/{id}/stream.mp4", get(stream::stream_mp4))
+        .route("/files/{id}/hls/start", get(hls::start))
+        .route("/hls/{session}/index.m3u8", get(hls::playlist))
+        .route("/hls/{session}/{segment}", get(hls::segment))
         // Images
         .route("/images/{filename}", get(images::serve));
 
     Router::new()
         .route("/", get(web::index))
+        .route("/assets/hls.min.js", get(web::hls_js))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .nest("/api/v1", api)
@@ -102,8 +107,14 @@ mod tests {
 
     fn test_app() -> Router {
         let store = SqliteStore::open_in_memory().expect("store");
-        let dir = std::env::temp_dir().join(format!("plurx-test-{}", uuid::Uuid::new_v4()));
-        let state = AppState::new("test".into(), Arc::new(store), dir);
+        let base = std::env::temp_dir().join(format!("plurx-test-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(
+            "test".into(),
+            Arc::new(store),
+            base.join("artwork"),
+            base.join("transcode"),
+            Default::default(),
+        );
         router(state)
     }
 

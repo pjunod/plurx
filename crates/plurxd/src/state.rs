@@ -8,8 +8,11 @@ use std::time::Instant;
 use plurx_core::metadata::{self, EnrichReport, TmdbClient};
 use plurx_core::scan::{self, ScanReport};
 use plurx_core::store::{keys, Store};
+use plurx_core::transcode::EncoderCaps;
 use serde::Serialize;
 use tokio::sync::Mutex;
+
+use crate::transcode::TranscodeManager;
 
 /// Everything a request handler needs. Cheap to clone (all shared via `Arc`).
 #[derive(Clone)]
@@ -18,17 +21,30 @@ pub struct AppState {
     pub server_name: String,
     pub artwork_dir: PathBuf,
     pub jobs: Arc<JobManager>,
+    pub transcode: Arc<TranscodeManager>,
     pub started_at: Instant,
 }
 
 impl AppState {
-    pub fn new(server_name: String, store: Arc<dyn Store>, artwork_dir: PathBuf) -> Self {
+    pub fn new(
+        server_name: String,
+        store: Arc<dyn Store>,
+        artwork_dir: PathBuf,
+        transcode_dir: PathBuf,
+        encoder_caps: EncoderCaps,
+    ) -> Self {
         let jobs = Arc::new(JobManager::new(Arc::clone(&store), artwork_dir.clone()));
+        let transcode = Arc::new(TranscodeManager::new(
+            Arc::clone(&store),
+            transcode_dir,
+            encoder_caps,
+        ));
         AppState {
             store,
             server_name,
             artwork_dir,
             jobs,
+            transcode,
             started_at: Instant::now(),
         }
     }
