@@ -1,0 +1,8 @@
+target/
+data/
+.git/
+.github/
+docs/
+_to_delete/
+*.db
+*.md

@@ -1,0 +1,18 @@
+[package]
+name = "plurx-compat-plex"
+description = "Plex Media Server API compatibility façade (Tier 1 direct-connect clients)"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+axum = { workspace = true }
+
+[dev-dependencies]
+http-body-util = { workspace = true }
+tokio = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+
+[lints]
+workspace = true

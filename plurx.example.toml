@@ -1,0 +1,13 @@
+# plurx configuration — copy to plurx.toml (or /etc/plurx/plurx.toml).
+# Every key is optional; these are the defaults. Env vars override the file:
+#   PLURX_SERVER_NAME, PLURX_BIND, PLURX_DATA_DIR, PLURX_CONFIG, PLURX_LOG
+
+[server]
+# Human-visible server name.
+name = "plurx"
+# Address:port the HTTP API binds to.
+bind = "0.0.0.0:32600"
+
+[storage]
+# Where the database and caches live. Created if missing.
+data_dir = "./data"
