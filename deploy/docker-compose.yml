@@ -1,13 +1,21 @@
 # plurx single-node deployment.
 #
-# Bring up:  docker compose up -d
+# Bring up (builds the image from source the first time):
+#   docker compose up -d --build
 # Then open http://<host>:32600 and create your admin account.
+#
+# There is no published image yet, so the service builds from the Dockerfile in
+# the repo root. Once a registry image exists, drop the `build:` block and just
+# `docker compose up -d` to pull `image:`.
 #
 # Media is mounted read-only; plurx never writes to your library. The named
 # volume holds the database, artwork cache, and transcode scratch.
 
 services:
   plurxd:
+    build:
+      context: ..            # repo root (where the Dockerfile + workspace live)
+      dockerfile: Dockerfile
     image: plurx/plurxd:latest
     container_name: plurxd
     restart: unless-stopped
