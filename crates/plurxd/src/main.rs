@@ -10,7 +10,7 @@ use std::time::Duration;
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use plurx_core::config::Config;
-use plurx_core::store::{keys, SqliteStore, Store};
+use plurx_core::store::{keys, SqliteStore, Store, UserStore};
 use tracing_subscriber::EnvFilter;
 
 use crate::state::{AppState, SystemInfo};
@@ -34,6 +34,18 @@ enum Command {
     /// Probe a running local server's /healthz and exit 0/1 (container
     /// health checks: no curl needed in the image).
     Healthcheck,
+    /// Reset a user's password directly in the database — the recovery path
+    /// when an admin password is forgotten (admins reset *other* users in
+    /// the web UI). Safe while the server runs (WAL); revokes the user's
+    /// sessions. In Docker: docker exec -it plurxd plurxd reset-password paul
+    ResetPassword {
+        /// Username whose password to reset.
+        username: String,
+        /// New password (min 8 chars). Omit to be prompted on stdin, which
+        /// keeps it out of your shell history.
+        #[arg(long)]
+        password: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -50,7 +62,46 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Command::ResetPassword { username, password } => {
+            reset_password(&config, &username, password).await
+        }
     }
+}
+
+/// Console recovery path: rewrite one user's password hash and revoke their
+/// sessions. WAL + busy_timeout make this safe beside a running server.
+async fn reset_password(
+    config: &Config,
+    username: &str,
+    password: Option<String>,
+) -> anyhow::Result<()> {
+    let password = match password {
+        Some(p) => p,
+        None => {
+            eprint!("New password for `{username}` (min 8 chars): ");
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line)?;
+            line.trim_end_matches(['\r', '\n']).to_owned()
+        }
+    };
+    anyhow::ensure!(
+        password.len() >= 8,
+        "password must be at least 8 characters"
+    );
+
+    let db_path = config.storage.data_dir.join("plurx.db");
+    let store =
+        SqliteStore::open(&db_path).with_context(|| format!("opening {}", db_path.display()))?;
+    let user = store
+        .get_user_by_username(username)
+        .await?
+        .with_context(|| format!("no user named `{username}`"))?;
+    let hash =
+        plurx_core::auth::hash_password(&password).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    store.set_password(user.id, &hash).await?;
+    let revoked = store.delete_tokens_for_user(user.id).await?;
+    println!("password reset for `{username}`; {revoked} session(s) revoked");
+    Ok(())
 }
 
 async fn run(config: Config) -> anyhow::Result<()> {

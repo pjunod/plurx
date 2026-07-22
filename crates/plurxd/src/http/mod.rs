@@ -16,6 +16,7 @@ mod libraries;
 mod plex;
 mod stream;
 mod system;
+mod users;
 mod watch;
 mod web;
 
@@ -43,6 +44,9 @@ pub fn router(state: AppState) -> Router {
         .route("/activity", get(system::activity))
         .route("/system", get(system::system_info))
         .route("/system/logs", get(system::logs))
+        // Users (admin)
+        .route("/users", get(users::list).post(users::create))
+        .route("/users/{id}", put(users::update).delete(users::delete))
         // Libraries
         .route("/libraries", get(libraries::list).post(libraries::create))
         .route(
@@ -320,6 +324,118 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    fn put(uri: &str, token: Option<&str>, body: Value) -> Request<Body> {
+        let mut b = Request::builder()
+            .method("PUT")
+            .uri(uri)
+            .header("content-type", "application/json");
+        if let Some(t) = token {
+            b = b.header("authorization", format!("Bearer {t}"));
+        }
+        b.body(Body::from(body.to_string())).expect("req")
+    }
+
+    fn delete(uri: &str, token: Option<&str>) -> Request<Body> {
+        let mut b = Request::builder().method("DELETE").uri(uri);
+        if let Some(t) = token {
+            b = b.header("authorization", format!("Bearer {t}"));
+        }
+        b.body(Body::empty()).expect("req")
+    }
+
+    #[tokio::test]
+    async fn user_management_lifecycle_and_lockout_guards() {
+        let app = test_app();
+        let admin = setup_admin(&app).await;
+
+        // Create a regular user.
+        let (status, u) = call(
+            &app,
+            post(
+                "/api/v1/users",
+                Some(&admin),
+                json!({ "username": "kid", "password": "longenough" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let kid_id = u["id"].as_i64().expect("id");
+        assert_eq!(u["is_admin"], false);
+
+        // The new user can log in; a non-admin cannot manage users.
+        let (status, login) = call(
+            &app,
+            post(
+                "/api/v1/auth/login",
+                None,
+                json!({ "username": "kid", "password": "longenough" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let kid_token = login["token"].as_str().expect("token").to_owned();
+        let (status, _) = call(&app, get("/api/v1/users", Some(&kid_token))).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // Admin resets the kid's password → kid's session is revoked.
+        let (status, _) = call(
+            &app,
+            put(
+                &format!("/api/v1/users/{kid_id}"),
+                Some(&admin),
+                json!({ "password": "evenlonger1" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = call(&app, get("/api/v1/me", Some(&kid_token))).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "old session must die");
+
+        // Lockout guards: the only admin can't be demoted…
+        let (_, users) = call(&app, get("/api/v1/users", Some(&admin))).await;
+        let admin_id = users
+            .as_array()
+            .expect("array")
+            .iter()
+            .find(|u| u["is_admin"] == true)
+            .and_then(|u| u["id"].as_i64())
+            .expect("admin id");
+        let (status, _) = call(
+            &app,
+            put(
+                &format!("/api/v1/users/{admin_id}"),
+                Some(&admin),
+                json!({ "is_admin": false }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        // …nor deleted (self-delete is refused first).
+        let (status, _) = call(
+            &app,
+            delete(&format!("/api/v1/users/{admin_id}"), Some(&admin)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // Promote the kid, then the original admin could be demoted; delete
+        // the kid instead and confirm they're gone.
+        let (status, _) = call(
+            &app,
+            put(
+                &format!("/api/v1/users/{kid_id}"),
+                Some(&admin),
+                json!({ "is_admin": true }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = call(&app, delete(&format!("/api/v1/users/{kid_id}"), Some(&admin))).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, users) = call(&app, get("/api/v1/users", Some(&admin))).await;
+        assert_eq!(users.as_array().expect("array").len(), 1);
     }
 
     #[tokio::test]

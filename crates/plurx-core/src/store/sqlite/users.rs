@@ -85,6 +85,45 @@ impl UserStore for SqliteStore {
         .await
     }
 
+    async fn count_admins(&self) -> Result<i64, StoreError> {
+        self.with_conn(|conn| {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM users WHERE is_admin = 1",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+    }
+
+    async fn set_password(&self, id: i64, password_hash: &str) -> Result<bool, StoreError> {
+        let password_hash = password_hash.to_owned();
+        self.with_conn(move |conn| {
+            Ok(conn.execute(
+                "UPDATE users SET password_hash = ?2 WHERE id = ?1",
+                params![id, password_hash],
+            )? > 0)
+        })
+        .await
+    }
+
+    async fn set_admin(&self, id: i64, is_admin: bool) -> Result<bool, StoreError> {
+        self.with_conn(move |conn| {
+            Ok(conn.execute(
+                "UPDATE users SET is_admin = ?2 WHERE id = ?1",
+                params![id, is_admin as i64],
+            )? > 0)
+        })
+        .await
+    }
+
+    async fn delete_tokens_for_user(&self, user_id: i64) -> Result<u64, StoreError> {
+        self.with_conn(move |conn| {
+            Ok(conn.execute("DELETE FROM tokens WHERE user_id = ?1", params![user_id])? as u64)
+        })
+        .await
+    }
+
     async fn create_token(
         &self,
         token_hash: &str,

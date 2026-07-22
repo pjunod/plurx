@@ -64,6 +64,13 @@ pub trait UserStore: Send + Sync + 'static {
     async fn get_user_by_username(&self, username: &str) -> Result<Option<User>, StoreError>;
     async fn list_users(&self) -> Result<Vec<User>, StoreError>;
     async fn delete_user(&self, id: i64) -> Result<bool, StoreError>;
+    async fn count_admins(&self) -> Result<i64, StoreError>;
+    /// Replace a user's password hash. Callers should also revoke the user's
+    /// tokens so old sessions die with the old password.
+    async fn set_password(&self, id: i64, password_hash: &str) -> Result<bool, StoreError>;
+    async fn set_admin(&self, id: i64, is_admin: bool) -> Result<bool, StoreError>;
+    /// Revoke every login token for one user; returns how many were dropped.
+    async fn delete_tokens_for_user(&self, user_id: i64) -> Result<u64, StoreError>;
 
     /// Register a login token. Only the SHA-256 hash of the token is stored.
     async fn create_token(
