@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -21,10 +22,17 @@ const SESSION_IDLE_SECS: u64 = 60;
 /// How long a segment request waits for ffmpeg to produce a not-yet-written
 /// segment before giving up.
 const SEGMENT_WAIT: Duration = Duration::from_secs(20);
-/// Grace period for a hardware transcode to emit its first segment before we
-/// assume it stalled (concurrent-session GPU contention) and fall back to
-/// software. Comfortably longer than a healthy hardware start (~1–3 s).
-const FIRST_SEGMENT_GRACE: Duration = Duration::from_secs(8);
+/// Grace period for a hardware transcode to list its first segment before we
+/// assume it stalled (GPU contention, or a decode the GPU can't do) and fall
+/// back to software. Longer than a healthy hardware start (~1–3 s), with slack
+/// for a 4K decode to ramp.
+const FIRST_SEGMENT_GRACE: Duration = Duration::from_secs(12);
+/// After falling back to software, how long to wait for real output before
+/// declaring the session failed. Software-decoding 4K is slow, so this is
+/// generous — but a session that can't produce a first segment in this window
+/// is unwatchable, and failing it gives the client a clear error instead of an
+/// endless gray screen (e.g. a Dolby Vision stream the build can't decode).
+const SOFTWARE_GRACE: Duration = Duration::from_secs(30);
 
 /// Spawn an ffmpeg HLS transcode, draining its stderr (at `-loglevel error`)
 /// into the logs so a failure is visible instead of a silently dead session.
@@ -54,16 +62,21 @@ fn spawn_ffmpeg(
     Ok(child)
 }
 
-/// True once at least one `seg*.ts` exists in the session dir.
-async fn session_has_segment(dir: &std::path::Path) -> bool {
-    if let Ok(mut rd) = tokio::fs::read_dir(dir).await {
-        while let Ok(Some(entry)) = rd.next_entry().await {
-            if entry.file_name().to_string_lossy().starts_with("seg") {
-                return true;
-            }
-        }
+/// True once the playlist actually lists a finished segment — i.e. real,
+/// playable output. This must NOT be "a `seg*` file exists": ffmpeg's HLS muxer
+/// opens the next segment as a `.tmp` before any frame is written, so a
+/// name-prefix check counts a stalled session as healthy and blinds the
+/// fallback watchdog (the exact bug behind a 4K-DV grey screen that spun ffmpeg
+/// for a minute and was never retried). A `.ts` line lands in the playlist only
+/// when a segment is complete.
+async fn session_producing(dir: &std::path::Path) -> bool {
+    match tokio::fs::read(dir.join("index.m3u8")).await {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).lines().any(|l| {
+            let l = l.trim();
+            !l.starts_with('#') && l.ends_with(".ts")
+        }),
+        Err(_) => false,
     }
-    false
 }
 
 /// Remove the (empty/partial) HLS output so a restarted ffmpeg starts clean.
@@ -93,6 +106,10 @@ struct Session {
     dir: PathBuf,
     child: Mutex<Child>,
     last_access: Mutex<Instant>,
+    /// Set when the session can never produce output (hardware and software
+    /// both failed to emit a first segment). Playlist/segment reads then fail
+    /// fast so the player shows an error instead of waiting on a gray screen.
+    failed: AtomicBool,
 }
 
 pub struct StartInfo {
@@ -205,49 +222,82 @@ impl TranscodeManager {
             dir: dir.clone(),
             child: Mutex::new(child),
             last_access: Mutex::new(Instant::now()),
+            failed: AtomicBool::new(false),
         });
         self.sessions
             .lock()
             .await
             .insert(session_id.clone(), Arc::clone(&session));
 
-        // Hardware encoders can init cleanly yet silently stall under
-        // concurrency — a second QuickSync/VA-API session that opens the device
-        // fine but never produces a segment, leaving the client gray. Watch for
-        // the first segment; if none appears in the grace window, restart this
-        // same session on software x264 so the stream plays (CPU cost beats a
-        // dead player). Software never needs this.
-        if encoder != Encoder::Software {
+        // A hardware path can init cleanly yet produce nothing — GPU contention
+        // under a second session, or a decode the GPU can't do (a 4K Dolby
+        // Vision HEVC stream is the classic case). Watch the *playlist* for a
+        // finished segment; if none lands in the grace window, restart on
+        // software. If software also can't produce a first segment in its
+        // (longer) window, mark the session failed so the client gets an error
+        // instead of a gray screen forever. Software-started sessions still get
+        // the fail-fast guard, just not the hardware→software step.
+        {
             let session = Arc::clone(&session);
             let file = file.clone();
             let opts = opts.clone();
             let dir = dir.clone();
             let sid = session_id.clone();
+            let started_on_hardware = encoder != Encoder::Software;
             tokio::spawn(async move {
-                tokio::time::sleep(FIRST_SEGMENT_GRACE).await;
-                if session_has_segment(&dir).await {
-                    return; // hardware is producing output — leave it be
-                }
-                tracing::warn!(
-                    session = %sid,
-                    "no segment from hardware encoder within {}s (likely concurrent-session \
-                     GPU contention); falling back to software x264",
-                    FIRST_SEGMENT_GRACE.as_secs()
-                );
-                {
-                    let mut child = session.child.lock().await;
-                    let _ = child.kill().await;
-                }
-                clear_session_dir(&dir).await;
-                let sw_args =
-                    transcode::hls_args(&file, Encoder::Software, &opts, &dir.to_string_lossy());
-                match spawn_ffmpeg(&sw_args, Encoder::Software.label(), &sid) {
-                    Ok(child) => {
-                        *session.child.lock().await = child;
-                        *session.last_access.lock().await = Instant::now();
-                        tracing::info!(session = %sid, "software fallback transcode started");
+                if started_on_hardware {
+                    tokio::time::sleep(FIRST_SEGMENT_GRACE).await;
+                    if session_producing(&dir).await {
+                        return; // hardware is producing real output — leave it be
                     }
-                    Err(e) => tracing::error!(session = %sid, "software fallback failed: {e}"),
+                    tracing::warn!(
+                        session = %sid,
+                        "no HLS segment from hardware within {}s (GPU contention, or a decode \
+                         the GPU can't do — e.g. Dolby Vision); retrying on software",
+                        FIRST_SEGMENT_GRACE.as_secs()
+                    );
+                    {
+                        let mut child = session.child.lock().await;
+                        let _ = child.kill().await;
+                    }
+                    clear_session_dir(&dir).await;
+                    let sw_args = transcode::hls_args(
+                        &file,
+                        Encoder::Software,
+                        &opts,
+                        &dir.to_string_lossy(),
+                    );
+                    match spawn_ffmpeg(&sw_args, Encoder::Software.label(), &sid) {
+                        Ok(child) => {
+                            *session.child.lock().await = child;
+                            *session.last_access.lock().await = Instant::now();
+                            tracing::info!(session = %sid, "software fallback transcode started");
+                        }
+                        Err(e) => {
+                            tracing::error!(session = %sid, "software fallback failed: {e}");
+                            session.failed.store(true, Relaxed);
+                            return;
+                        }
+                    }
+                }
+
+                // Fail-fast guard: whatever is running now (software, or a
+                // software-from-the-start session) must produce a first segment
+                // in the software window, or the session is declared dead.
+                tokio::time::sleep(SOFTWARE_GRACE).await;
+                if !session_producing(&dir).await {
+                    tracing::error!(
+                        session = %sid,
+                        "no HLS segment within {}s of software transcode; failing the session — \
+                         the source is likely undecodable by this ffmpeg build (e.g. a Dolby \
+                         Vision profile it can't handle)",
+                        SOFTWARE_GRACE.as_secs()
+                    );
+                    {
+                        let mut child = session.child.lock().await;
+                        let _ = child.kill().await;
+                    }
+                    session.failed.store(true, Relaxed);
                 }
             });
         }
@@ -276,8 +326,13 @@ impl TranscodeManager {
     pub async fn playlist(&self, session_id: &str) -> Option<Vec<u8>> {
         let session = self.touch(session_id).await?;
         let path = session.dir.join("index.m3u8");
-        // The playlist appears a beat after ffmpeg starts; wait briefly.
+        // The playlist appears a beat after ffmpeg starts; wait briefly. A failed
+        // session returns None → 404 → the player reports an error rather than
+        // polling a segment-less playlist on a gray screen forever.
         for _ in 0..100 {
+            if session.failed.load(Relaxed) {
+                return None;
+            }
             if let Ok(bytes) = tokio::fs::read(&path).await {
                 if !bytes.is_empty() {
                     return Some(bytes);
@@ -302,7 +357,11 @@ impl TranscodeManager {
             if let Ok(bytes) = tokio::fs::read(&path).await {
                 return Some(bytes);
             }
-            // If ffmpeg has exited and the file still isn't there, give up.
+            // Give up if the session was declared dead, or ffmpeg has exited and
+            // the file still isn't there.
+            if session.failed.load(Relaxed) {
+                return None;
+            }
             let exited = {
                 let mut child = session.child.lock().await;
                 matches!(child.try_wait(), Ok(Some(_)))
@@ -378,5 +437,34 @@ mod tests {
         assert_eq!(bitrate_for_height(1080), 8_000);
         assert_eq!(bitrate_for_height(720), 4_000);
         assert_eq!(bitrate_for_height(240), 1_200);
+    }
+
+    #[tokio::test]
+    async fn producing_requires_a_listed_segment() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // No playlist yet.
+        assert!(!session_producing(dir.path()).await);
+        // Header only, no segment listed (ffmpeg has started but nothing finished).
+        tokio::fs::write(
+            dir.path().join("index.m3u8"),
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:4\n",
+        )
+        .await
+        .expect("write playlist");
+        assert!(!session_producing(dir.path()).await);
+        // A bare `seg*.ts` FILE existing must NOT count (the old bug) — only a
+        // playlist entry does.
+        tokio::fs::write(dir.path().join("seg00000.ts.tmp"), b"partial")
+            .await
+            .expect("write temp seg");
+        assert!(!session_producing(dir.path()).await);
+        // A finished, listed segment: producing.
+        tokio::fs::write(
+            dir.path().join("index.m3u8"),
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:4.000,\nseg00000.ts\n",
+        )
+        .await
+        .expect("write playlist with segment");
+        assert!(session_producing(dir.path()).await);
     }
 }

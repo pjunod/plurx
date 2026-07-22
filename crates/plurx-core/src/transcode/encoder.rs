@@ -54,20 +54,6 @@ impl Encoder {
         }
     }
 
-    /// Decode-side hwaccel flags. Kept conservative: hardware decode where the
-    /// family supports feeding system-memory frames to software filters.
-    pub fn decode_args(self) -> Vec<String> {
-        match self {
-            // cuda decode; frames downloaded implicitly for sw filters.
-            Encoder::Nvenc => vec!["-hwaccel".into(), "cuda".into()],
-            // VideoToolbox decode on macOS.
-            Encoder::VideoToolbox => vec!["-hwaccel".into(), "videotoolbox".into()],
-            // Software decode for VAAPI/QSV in this filter model (sw filters →
-            // GPU upload just before the encoder; see filter_suffix).
-            Encoder::Software | Encoder::Vaapi | Encoder::Qsv => vec![],
-        }
-    }
-
     /// Filter-chain suffix appended after scale/tonemap/subs: uploads
     /// system-memory frames to the GPU for VAAPI/QSV encode. Empty otherwise.
     pub fn filter_suffix(self) -> Option<&'static str> {

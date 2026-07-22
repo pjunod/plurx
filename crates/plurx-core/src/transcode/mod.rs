@@ -123,6 +123,60 @@ fn escape_filter_path(path: &str) -> String {
         .replace('\'', "\\'")
 }
 
+/// Decode-side flags, plus an optional filter-chain prefix.
+///
+/// The heavy case — HEVC that is 4K and/or HDR/Dolby Vision — is hardware-decoded
+/// on Intel (QSV/VAAPI) as well, not just NVIDIA. Software-decoding a 4K 10-bit
+/// HEVC/DV stream pins the CPU near 100% per core (the "~1000% CPU" symptom) and
+/// is far too slow to finish even the first HLS segment, so the player sits on a
+/// gray screen until the idle reaper kills the session. GPU-decoded frames arrive
+/// as hardware surfaces, so a matching `hwdownload` (to the source's pixel format)
+/// leads the CPU scale/tonemap chain before the encoder re-uploads them.
+///
+/// Lighter sources keep software decode: it's the most compatible path and is
+/// already fast enough, so we don't risk the GPU decode/filter handoff where it
+/// isn't needed.
+fn decode_setup(encoder: Encoder, source: &MediaFile) -> (Vec<String>, Option<String>) {
+    let arg = |x: &str| x.to_owned();
+    let heavy = matches!(
+        source.video_codec.as_deref(),
+        Some("hevc" | "h265" | "hevc10")
+    ) && (source.hdr.is_some() || source.height.unwrap_or(0) >= 2160);
+    // 10-bit (HDR/DV) surfaces download as p010le; 8-bit as nv12.
+    let dl = if source.bit_depth.unwrap_or(8) >= 10 {
+        "p010le"
+    } else {
+        "nv12"
+    };
+    match encoder {
+        // These families decode into system memory implicitly — no hwdownload.
+        Encoder::Nvenc => (vec![arg("-hwaccel"), arg("cuda")], None),
+        Encoder::VideoToolbox => (vec![arg("-hwaccel"), arg("videotoolbox")], None),
+        // Intel: keep frames on the GPU through decode, then hwdownload for the
+        // CPU filters. Only for the heavy case that actually needs it.
+        Encoder::Qsv if heavy => (
+            vec![
+                arg("-hwaccel"),
+                arg("qsv"),
+                arg("-hwaccel_output_format"),
+                arg("qsv"),
+            ],
+            Some(format!("hwdownload,format={dl}")),
+        ),
+        Encoder::Vaapi if heavy => (
+            vec![
+                arg("-hwaccel"),
+                arg("vaapi"),
+                arg("-hwaccel_output_format"),
+                arg("vaapi"),
+            ],
+            Some(format!("hwdownload,format={dl}")),
+        ),
+        // Software, and the light QSV/VAAPI cases: software decode.
+        _ => (Vec::new(), None),
+    }
+}
+
 /// Build the full ffmpeg argument vector to transcode `source` into HLS in
 /// `out_dir` (which must exist). Produces `index.m3u8` + `seg%05d.ts`.
 pub fn hls_args(
@@ -143,8 +197,11 @@ pub fn hls_args(
         args.push(format!("{:.3}", opts.start_seconds));
     }
 
-    // Hardware-accelerated decode where the encoder family implies it.
-    args.extend(encoder.decode_args());
+    // Hardware-accelerated decode (GPU decode for the heavy HEVC/4K/HDR case on
+    // Intel too; see decode_setup). `hwdownload` leads the filter chain when the
+    // decoder hands back hardware surfaces.
+    let (decode_args, hwdownload) = decode_setup(encoder, source);
+    args.extend(decode_args);
 
     args.push("-i".into());
     args.push(source_path.clone());
@@ -158,8 +215,14 @@ pub fn hls_args(
         None => args.push("0:a:0?".into()),
     }
 
-    // Video filter chain (+ GPU upload suffix for VAAPI/QSV) + encoder.
-    let mut vf = video_filters(source, opts, &source_path);
+    // Video filter chain: [hwdownload for GPU-decoded frames →] scale / tonemap /
+    // subs [→ GPU upload suffix for VAAPI/QSV] → encoder.
+    let mut vf = String::new();
+    if let Some(prefix) = &hwdownload {
+        vf.push_str(prefix);
+        vf.push(',');
+    }
+    vf.push_str(&video_filters(source, opts, &source_path));
     if let Some(suffix) = encoder.filter_suffix() {
         vf.push(',');
         vf.push_str(suffix);
@@ -303,5 +366,39 @@ mod tests {
         let joined = args.join(" ");
         assert!(joined.contains("h264_nvenc"));
         assert!(joined.contains("cuda")); // hwaccel decode
+    }
+
+    #[test]
+    fn qsv_hardware_decodes_heavy_hevc() {
+        // 4K 10-bit Dolby Vision HEVC (the file() helper) → GPU decode so it
+        // isn't CPU-bound, with an hwdownload to feed the CPU tonemap filters.
+        let args = hls_args(
+            &file(Some("dolby_vision")),
+            Encoder::Qsv,
+            &TranscodeOptions::default(),
+            "/tmp/s",
+        );
+        let joined = args.join(" ");
+        assert!(joined.contains("-hwaccel qsv"));
+        assert!(joined.contains("-hwaccel_output_format qsv"));
+        assert!(joined.contains("hwdownload,format=p010le")); // 10-bit surface
+        assert!(joined.contains("h264_qsv")); // still hardware encode
+    }
+
+    #[test]
+    fn qsv_software_decodes_light_source() {
+        // 1080p 8-bit H.264 doesn't need GPU decode — keep the compatible
+        // software-decode path, but still hardware-encode.
+        let mut f = file(None);
+        f.video_codec = Some("h264".into());
+        f.width = Some(1920);
+        f.height = Some(1080);
+        f.bit_depth = Some(8);
+        f.hdr = None;
+        let args = hls_args(&f, Encoder::Qsv, &TranscodeOptions::default(), "/tmp/s");
+        let joined = args.join(" ");
+        assert!(!joined.contains("-hwaccel qsv")); // software decode
+        assert!(!joined.contains("hwdownload"));
+        assert!(joined.contains("h264_qsv")); // hardware encode
     }
 }

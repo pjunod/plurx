@@ -951,6 +951,7 @@ dependencies = [
  "plurx-core",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tower",

@@ -608,7 +608,7 @@ async function play(fileId, title, resumeMs, knownDurMs){
       hls.loadSource(info.playlist_url);
       hls.attachMedia(video);
       hls.on(Hls.Events.MANIFEST_PARSED,()=>video.play().catch(()=>{}));
-      hls.on(Hls.Events.ERROR,(_,d)=>{ if(d.fatal){ setLoading(false); toast("Playback error: "+d.details); } });
+      hls.on(Hls.Events.ERROR,(_,d)=>{ if(d.fatal){ setLoading(false); toast("Playback failed to start ("+d.details+"). The server couldn't transcode this file — see Settings → Logs."); } });
     } else {
       // Native HLS: the session id in the URL is the credential, so the
       // Apple TV can fetch segments itself when AirPlaying.
@@ -677,7 +677,7 @@ function wirePlayer(){
   v.addEventListener("canplay",()=>{ if(PLAYER.started) setLoading(false); });
   v.addEventListener("waiting",()=>{ if(PLAYER.started) setLoading(true,"Buffering…",""); });
   v.addEventListener("pause",()=>{ p.classList.remove("idle"); });
-  v.addEventListener("error",()=>{ setLoading(false); });
+  v.addEventListener("error",()=>{ setLoading(false); if(PLAYER&&!PLAYER.started) toast("Couldn't start playback — the server may not be able to transcode this file. See Settings → Logs."); });
   v.addEventListener("timeupdate",checkMarkers);
 }
 function markerNowMs(){ const v=document.getElementById("video"); return ((PLAYER.offset||0)+(v?v.currentTime||0:0))*1000; }
