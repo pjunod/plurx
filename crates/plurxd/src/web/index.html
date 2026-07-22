@@ -531,13 +531,15 @@ async function viewItem(id){
   const crumbs=`<div class="crumbs">${trail.join('<span class="sep">/</span>')}</div>`;
 
   const best=d.files[0];
+  const multi=d.files.length>1;
   const runtime=it.runtime_ms||(best&&best.duration_ms);
   const chips=[];
   if(it.year) chips.push(`<span>${it.year}</span>`);
   if(runtime) chips.push(`<span>${fmtDur(runtime)}</span>`);
   if(it.kind) chips.push(`<span>${esc(it.kind)}</span>`);
-  // Video type is shown as color-coded badges (below), not plain chips.
-  const heroBadges = best? specBadges(best) : "";
+  // Video badges show once: in the hero for a single version; per-version below
+  // when there are several (so nothing is duplicated).
+  const heroBadges = (best && !multi) ? specBadges(best) : "";
 
   let body="";
   if(d.files.length){
@@ -554,13 +556,15 @@ async function viewItem(id){
       const p=best.missing_path;
       body+=`<div class="filemissing">⚠ This file is missing on the server, so it can’t be played — its library path may be unmounted, moved, or renamed${ME.is_admin&&p?`:<br><code>${esc(p)}</code>`:'.'}</div><div class="actions">${watchBtn}</div>`;
     }
-    const multi=d.files.length>1;
     body+=d.files.map(v=>{
       const miss=!v.available;
-      const badges=specBadges(v)||`<span class="vt">${esc(v.filename)}</span>`;
-      return `<div class="version"><div class="vh"><span class="vbadges">${badges}${miss?'<span class="missbadge">missing</span>':''}</span>
-        ${(!miss&&multi)?`<button class="ghost sm" onclick='play(${v.id},${JSON.stringify(it.title)},${resume},${v.duration_ms||0})'>▶ Play</button>`:''}</div>
-        ${specBlock(v)}${miss&&ME.is_admin&&v.missing_path?`<div class="problem">${esc(v.missing_path)}</div>`:''}</div>`;
+      // Header (badges + per-version play) only when there are multiple versions
+      // to tell apart, or when a file is missing. A single version is already
+      // badged in the hero, so its block is just the spec detail.
+      const header=(multi||miss)
+        ? `<div class="vh"><span class="vbadges">${specBadges(v)||`<span class="vt">${esc(v.filename)}</span>`}${miss?'<span class="missbadge">missing</span>':''}</span>${(!miss&&multi)?`<button class="ghost sm" onclick='play(${v.id},${JSON.stringify(it.title)},${resume},${v.duration_ms||0})'>▶ Play</button>`:''}</div>`
+        : '';
+      return `<div class="version">${header}${specBlock(v)}${miss&&ME.is_admin&&v.missing_path?`<div class="problem">${esc(v.missing_path)}</div>`:''}</div>`;
     }).join("");
   } else if(d.children.length && d.children[0].kind==='episode'){
     // Season: episodes as a list.

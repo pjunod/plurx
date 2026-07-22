@@ -26,6 +26,10 @@ pub enum ToneMap {
     Zscale,
     /// libplacebo (Vulkan) — higher quality on a capable GPU; opt-in.
     Libplacebo,
+    /// No tone-mapping: pass HDR through to 8-bit (looks washed on an SDR
+    /// screen, but plays). An escape hatch + a diagnostic — if a file that
+    /// grayed out now plays, the tone-map was the culprit.
+    None,
 }
 
 /// What to burn into the video (image subs must be burned; text subs can be).
@@ -78,8 +82,9 @@ fn video_filters(source: &MediaFile, opts: &TranscodeOptions, source_path: &str)
     chain.push(format!("scale=-2:'min({h},ih)'", h = opts.target_height));
 
     // HDR → SDR tone-map when the source carries HDR.
-    if source.hdr.is_some() {
+    if source.hdr.is_some() && opts.tone_map != ToneMap::None {
         match opts.tone_map {
+            ToneMap::None => {} // guarded out above; format normalize happens below
             ToneMap::Libplacebo => chain.push(
                 "libplacebo=tonemapping=bt.2390:colorspace=bt709:color_primaries=bt709:\
                  color_trc=bt709:format=yuv420p"
@@ -150,6 +155,15 @@ fn escape_filter_path(path: &str) -> String {
 /// isn't needed.
 fn decode_setup(encoder: Encoder, source: &MediaFile) -> (Vec<String>, Option<String>) {
     let arg = |x: &str| x.to_owned();
+    // Escape hatch: force software decode (still hardware-encodes). Set when a
+    // GPU decodes a stream to garbage — some Dolby Vision profiles — so you can
+    // fall back without giving up the hardware encoder.
+    if matches!(
+        std::env::var("PLURX_HWDECODE").as_deref(),
+        Ok("off" | "0" | "false" | "no")
+    ) {
+        return (Vec::new(), None);
+    }
     let heavy = matches!(
         source.video_codec.as_deref(),
         Some("hevc" | "h265" | "hevc10")
@@ -339,6 +353,20 @@ mod tests {
         let joined = args.join(" ");
         assert!(joined.contains("tonemap=tonemap=hable"));
         assert!(joined.contains("zscale"));
+    }
+
+    #[test]
+    fn tonemap_none_passes_hdr_through() {
+        // PLURX_TONEMAP=off → no tone-map filter, HDR just normalized to yuv420p.
+        let opts = TranscodeOptions {
+            tone_map: ToneMap::None,
+            ..Default::default()
+        };
+        let args = hls_args(&file(Some("dolby_vision")), Encoder::Software, &opts, "/tmp/s");
+        let joined = args.join(" ");
+        assert!(!joined.contains("tonemap"));
+        assert!(!joined.contains("zscale"));
+        assert!(joined.contains("format=yuv420p"));
     }
 
     #[test]

@@ -53,7 +53,8 @@ path in `PLURX_CONFIG`). Every key has an env override:
 | `PLURX_FFPROBE` | — | `ffprobe` | ffprobe binary (inspection + chapter markers) |
 | `PLURX_HWACCEL` | — | `auto` | Preferred encoder: `auto` · `qsv` · `vaapi` · `nvenc` · `videotoolbox` |
 | `PLURX_VAAPI_DEVICE` | — | `/dev/dri/renderD128` | VA-API render node |
-| `PLURX_TONEMAP` | — | auto | HDR→SDR tone-map filter override |
+| `PLURX_TONEMAP` | — | zscale | HDR→SDR tone-map: `zscale` · `libplacebo` · `off` (no tone-map — plays HDR washed, but a useful test/escape hatch) |
+| `PLURX_HWDECODE` | — | on | Set `off` to force software decode (still hardware-encodes) — for a GPU that decodes a stream to garbage, e.g. some Dolby Vision |
 | `PLURX_GDM_PORT` | — | `32414` | Host UDP port for GDM discovery (move if Plex owns 32414) |
 | `PLURX_LOG` | — | `info` | Log filter (`tracing` EnvFilter syntax, e.g. `plurxd=debug`) |
 

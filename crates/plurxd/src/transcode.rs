@@ -107,6 +107,7 @@ fn ffmpeg_bin() -> String {
 fn tone_map_pref() -> ToneMap {
     match std::env::var("PLURX_TONEMAP").as_deref() {
         Ok("libplacebo") => ToneMap::Libplacebo,
+        Ok("off" | "none" | "passthrough") => ToneMap::None,
         _ => ToneMap::Zscale,
     }
 }
