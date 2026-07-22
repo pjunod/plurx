@@ -51,12 +51,21 @@ fn spawn_ffmpeg(
         .map_err(|e| format!("spawning ffmpeg: {e}"))?;
     if let Some(stderr) = child.stderr.take() {
         let sid = session_id.to_owned();
+        let started = Instant::now();
         tokio::spawn(async move {
             use tokio::io::{AsyncBufReadExt, BufReader};
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 tracing::warn!(session = %sid, encoder = encoder_label, "transcode ffmpeg: {line}");
             }
+            // Stderr closing means the process ended. Logging it (with how long
+            // it ran) distinguishes "ffmpeg died early" from "ffmpeg is still
+            // running but produced nothing".
+            tracing::warn!(
+                session = %sid, encoder = encoder_label,
+                elapsed_s = started.elapsed().as_secs(),
+                "transcode ffmpeg process ended"
+            );
         });
     }
     Ok(child)
@@ -211,6 +220,13 @@ impl TranscodeManager {
             ..Default::default()
         };
         let args = transcode::hls_args(&file, encoder, &opts, &dir.to_string_lossy());
+        // Log the exact command — the single most useful diagnostic. It reveals
+        // the decode/filter/encode pipeline actually used (e.g. whether heavy
+        // HEVC is being hardware-decoded), and confirms which build is running.
+        tracing::info!(
+            %session_id, encoder = encoder.label(),
+            "transcode ffmpeg args: {}", args.join(" ")
+        );
         let child = spawn_ffmpeg(&args, encoder.label(), &session_id)?;
 
         tracing::info!(
@@ -248,7 +264,15 @@ impl TranscodeManager {
                 if started_on_hardware {
                     tokio::time::sleep(FIRST_SEGMENT_GRACE).await;
                     if session_producing(&dir).await {
-                        return; // hardware is producing real output — leave it be
+                        // Producing real segments. If the picture is still gray,
+                        // the problem is the *output* (tone-map/color), not the
+                        // pipeline stalling — this line says which.
+                        tracing::info!(
+                            session = %sid,
+                            "transcode producing segments within {}s (hardware path healthy)",
+                            FIRST_SEGMENT_GRACE.as_secs()
+                        );
+                        return;
                     }
                     tracing::warn!(
                         session = %sid,
