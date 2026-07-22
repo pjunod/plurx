@@ -33,6 +33,27 @@ Install `ffmpeg`/`ffprobe` (or point `PLURX_FFMPEG`/`PLURX_FFPROBE` at a build
 such as jellyfin-ffmpeg for the best hardware/tone-mapping support). A sample
 systemd unit lives in [`plurxd.service`](plurxd.service).
 
+### Hardware transcode & recent Intel GPUs
+
+The Docker image defaults to **jellyfin-ffmpeg**, which bundles a current Intel
+media driver + libva + oneVPL. This matters for newer silicon: an Arc / Meteor
+Lake / **Arrow Lake** iGPU (on the kernel `xe` driver) is years newer than the
+VA driver Debian ships, so the distro ffmpeg fails VAAPI init with an I/O error
+while jellyfin-ffmpeg drives it fine. Pass the GPU through and add the render
+group in your compose override:
+
+```yaml
+    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      - "992"          # `stat -c '%g' /dev/dri/renderD128` on the host
+```
+
+On Intel **Arc**-class GPUs, QuickSync (oneVPL) is usually more reliable than
+VA-API — set `PLURX_HWACCEL: "qsv"` in the override to prefer it. Startup
+validation test-encodes each path and Settings → Logs shows why any hardware
+probe was rejected.
+
 ## Unraid
 
 Add [`unraid-plurx.xml`](unraid-plurx.xml) as a user template (or via the
