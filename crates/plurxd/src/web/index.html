@@ -90,7 +90,10 @@
   .log-DEBUG,.log-TRACE{color:var(--muted)}
   .verrow{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:9px 0}
   .verrow+.verrow{border-top:1px solid var(--line)}
-  .crumb{font-size:13px;display:inline-block;margin-bottom:8px}
+  .crumbs{font-size:13px;color:var(--muted);margin:0 0 16px;display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  .crumbs .sep{opacity:.45}
+  .crumbs .cur{color:var(--text)}
+  .art.ph{display:grid;place-items:center;font-size:30px;font-weight:800;letter-spacing:.5px;color:#39415a;user-select:none}
 </style>
 </head>
 <body>
@@ -124,6 +127,15 @@ function fmtTs(ms){ const d=new Date(ms); return d.toLocaleTimeString([], {hour1
 function fmtAgo(unix){ if(!unix) return ""; const s=Math.max(0,Math.floor(Date.now()/1000)-unix);
   if(s<60) return "just now"; if(s<3600) return Math.floor(s/60)+"m ago"; if(s<86400) return Math.floor(s/3600)+"h ago"; return Math.floor(s/86400)+"d ago"; }
 function esc(s){ return (s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+// Artwork with a graceful fallback: initials on a tinted card when there's
+// no poster (so a seasons grid never shows blank rectangles).
+function artHtml(it, cls){
+  const src=it.poster||it.backdrop;
+  if(src) return `<img class="art ${cls||''}" loading="lazy" src="${tok(src)}" alt="">`;
+  const label=(it.season_number!=null&&it.kind==='season')?("S"+it.season_number):
+    ((it.title||"?").split(/\s+/).slice(0,2).map(w=>w[0]||"").join("").toUpperCase()||"?");
+  return `<div class="art ph ${cls||''}">${esc(label)}</div>`;
+}
 
 // ---- auth flows -----------------------------------------------------------
 function logout(){ TOKEN=null; ME=null; localStorage.removeItem("plurx_token"); clearInterval(ACT_TIMER); ACT_TIMER=null; render(); }
@@ -169,7 +181,7 @@ function renderLogin(){
 // ---- chrome ---------------------------------------------------------------
 function chrome(active, inner){
   const admin = ME&&ME.is_admin ? `<a href="#/settings" class="${active==='settings'?'active':''}">Settings</a>`:"";
-  const back = (location.hash&&location.hash!=="#/") ? `<button class="ghost sm" onclick="history.back()" title="Back">‹</button>`:"";
+  const back = (location.hash&&location.hash!=="#/") ? `<button class="ghost sm" onclick="history.back()" title="Back">‹ Back</button>`:"";
   document.getElementById("app").innerHTML=`
    <header class="top">
      ${back}<a href="#/" class="logo">plurx</a>
@@ -210,8 +222,7 @@ async function pollActivity(){
 // ---- cards ----------------------------------------------------------------
 function progressPct(w){ if(!w||!w.duration_ms||!w.position_ms) return 0; return Math.min(100,100*w.position_ms/w.duration_ms); }
 function card(it, wide){
-  const art = it.poster||it.backdrop;
-  const img = art? `<img class="art" loading="lazy" src="${tok(art)}" alt="">` : `<div class="art"></div>`;
+  const img = artHtml(it);
   const sub = it.kind==='episode'
       ? esc((it.show_title?it.show_title+" · ":"")+`S${it.season_number||0}E${it.episode_number||0}`)
       : esc(it.year? String(it.year): (it.kind==='show'?'Series':''));
@@ -254,11 +265,12 @@ async function viewItem(id){
   const d=await api(`/items/${id}`); const it=d.item;
   // Map this item's files → item id so the player can post progress.
   d.files.forEach(f=>ITEM_FOR_FILE[f.id]=Number(id));
-  const art=it.poster||it.backdrop;
-  const imgTag = art?`<img class="art" src="${tok(art)}">`:`<div class="art"></div>`;
-  // In-app breadcrumb: an episode links up to its season, a season to its show.
-  let right="";
-  if(it.parent_id) right+=`<a class="crumb" href="#/item/${it.parent_id}">‹ ${it.kind==='episode'?'All episodes':'Show'}</a>`;
+  const imgTag = artHtml(it);
+  // In-app breadcrumb trail: Home / Show / Season / …, every level clickable.
+  const trail=[`<a href="#/">Home</a>`]
+    .concat((d.ancestors||[]).map(a=>`<a href="#/item/${a.id}">${esc(a.title)}</a>`))
+    .concat([`<span class="cur">${esc(it.title)}</span>`]);
+  let right=`<div class="crumbs">${trail.join('<span class="sep">/</span>')}</div>`;
   const runtime = it.runtime_ms || (d.files[0]&&d.files[0].duration_ms);
   right+=`<h1>${esc(it.title)}</h1><div class="row muted">${[it.year,fmtDur(runtime),it.kind].filter(Boolean).map(x=>`<span>${esc(String(x))}</span>`).join(" · ")}</div>`;
   if(it.overview) right+=`<p class="overview">${esc(it.overview)}</p>`;
@@ -397,7 +409,7 @@ function statusText(st){
 async function viewSettings(){
   if(!ME.is_admin){ location.hash="#/"; return; }
   chrome("settings",`<div class="empty">Loading…</div>`);
-  const [libs,settings,status,sys]=await Promise.all([api("/libraries"),api("/settings"),api("/scan/status"),api("/system")]);
+  const [libs,settings,status,sys,users]=await Promise.all([api("/libraries"),api("/settings"),api("/scan/status"),api("/system"),api("/users")]);
   const libRows=libs.map(l=>`<tr><td><b>${esc(l.name)}</b></td><td>${l.anime?'anime':l.kind}</td><td class="muted">${esc(l.paths.join(", "))}</td>
       <td class="muted" id="st-${l.id}">${statusText(status[l.id])}</td>
       <td class="row" style="flex-wrap:nowrap"><button class="ghost sm" onclick="scanLib(${l.id})">Scan</button><button class="ghost sm" onclick="delLib(${l.id})">Delete</button></td></tr>`).join("");
@@ -425,6 +437,15 @@ async function viewSettings(){
       <div class="err" id="lerr"></div>
       <button style="margin-top:12px" onclick="addLib()">Add & scan</button>
     </div>
+    <div class="card"><h2 class="section" style="margin-top:0">Users</h2>
+      <table><thead><tr><th>User</th><th>Role</th><th>Created</th><th></th></tr></thead>
+      <tbody>${users.map(u=>userRow(u)).join("")}</tbody></table>
+      <h2 class="section">Add user</h2>
+      <div class="row"><input id="un" placeholder="Username" style="max-width:180px" autocomplete="off">
+        <input id="up" placeholder="Password (min 8)" type="password" style="max-width:200px" autocomplete="new-password">
+        <label class="row" style="margin:0;font-size:13px;color:var(--muted)"><input type="checkbox" id="ua" style="width:auto"> admin</label></div>
+      <div class="err" id="uerr"></div>
+      <button style="margin-top:12px" onclick="addUser()">Add user</button></div>
     <div class="card"><h2 class="section" style="margin-top:0">Metadata (TMDB)</h2>
       <p class="muted" style="margin-top:0">${settings.tmdb_configured?"A TMDB API key is configured. Enter a new one to replace it.":"Add a TMDB API key to fetch posters, overviews, and episode data."}</p>
       <input id="tk" placeholder="TMDB API key" type="password"><div class="err" id="terr"></div>
@@ -476,6 +497,36 @@ async function addLib(){
 async function scanLib(id){ try{ await api(`/libraries/${id}/scan`,{method:"POST"}); toast("Scan started"); setTimeout(settingsTick,400);}catch(e){toast(e.message)} }
 async function delLib(id){ if(!confirm("Delete this library? Media files are not touched.")) return; try{ await api(`/libraries/${id}`,{method:"DELETE"}); toast("Deleted"); viewSettings(); }catch(e){toast(e.message)} }
 async function saveTmdb(){ const err=document.getElementById("terr"); err.textContent=""; try{ await api("/settings",{method:"PUT",body:{tmdb_api_key:tk.value.trim()}}); toast("Saved"); viewSettings(); }catch(e){err.textContent=e.message} }
+
+// ---- users (admin) --------------------------------------------------------
+function userRow(u){
+  const me = ME&&ME.id===u.id;
+  const created = new Date(u.created_at*1000).toLocaleDateString();
+  const role = u.is_admin?`<span class="pill" style="color:var(--accent);border-color:var(--accent)">admin</span>`:`<span class="muted">user</span>`;
+  const btns=[`<button class="ghost sm" onclick='resetPw(${u.id},${JSON.stringify(u.username)})'>Reset password</button>`];
+  btns.push(`<button class="ghost sm" onclick="setAdmin(${u.id},${u.is_admin?0:1})">${u.is_admin?'Revoke admin':'Make admin'}</button>`);
+  if(!me) btns.push(`<button class="ghost sm" onclick='delUser(${u.id},${JSON.stringify(u.username)})'>Delete</button>`);
+  return `<tr><td><b>${esc(u.username)}</b>${me?' <span class="muted">(you)</span>':''}</td><td>${role}</td><td class="muted">${created}</td>
+    <td class="row" style="flex-wrap:wrap;justify-content:flex-end">${btns.join("")}</td></tr>`;
+}
+async function addUser(){
+  const username=un.value.trim(), password=up.value, is_admin=ua.checked;
+  const err=document.getElementById("uerr"); err.textContent="";
+  try{ await api("/users",{method:"POST",body:{username,password,is_admin}}); toast("User added"); viewSettings(); }
+  catch(e){ err.textContent=e.message; }
+}
+async function resetPw(id, name){
+  const pw=prompt(`New password for ${name} (min 8 characters). Their current sessions will be signed out.`);
+  if(pw==null) return;
+  try{ await api(`/users/${id}`,{method:"PUT",body:{password:pw}}); toast("Password reset"); }catch(e){ toast(e.message); }
+}
+async function setAdmin(id, makeAdmin){
+  try{ await api(`/users/${id}`,{method:"PUT",body:{is_admin:!!makeAdmin}}); toast(makeAdmin?"Now an admin":"Admin revoked"); viewSettings(); }catch(e){ toast(e.message); }
+}
+async function delUser(id, name){
+  if(!confirm(`Delete ${name}? Their watch history is removed. Media files are untouched.`)) return;
+  try{ await api(`/users/${id}`,{method:"DELETE"}); toast("User deleted"); viewSettings(); }catch(e){ toast(e.message); }
+}
 
 // ---- router ---------------------------------------------------------------
 // One page-scoped poller at a time; routing away always clears it.
