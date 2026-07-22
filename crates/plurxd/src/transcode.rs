@@ -21,6 +21,59 @@ const SESSION_IDLE_SECS: u64 = 60;
 /// How long a segment request waits for ffmpeg to produce a not-yet-written
 /// segment before giving up.
 const SEGMENT_WAIT: Duration = Duration::from_secs(20);
+/// Grace period for a hardware transcode to emit its first segment before we
+/// assume it stalled (concurrent-session GPU contention) and fall back to
+/// software. Comfortably longer than a healthy hardware start (~1–3 s).
+const FIRST_SEGMENT_GRACE: Duration = Duration::from_secs(8);
+
+/// Spawn an ffmpeg HLS transcode, draining its stderr (at `-loglevel error`)
+/// into the logs so a failure is visible instead of a silently dead session.
+fn spawn_ffmpeg(
+    args: &[String],
+    encoder_label: &'static str,
+    session_id: &str,
+) -> Result<Child, String> {
+    let mut child = tokio::process::Command::new(ffmpeg_bin())
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("spawning ffmpeg: {e}"))?;
+    if let Some(stderr) = child.stderr.take() {
+        let sid = session_id.to_owned();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                tracing::warn!(session = %sid, encoder = encoder_label, "transcode ffmpeg: {line}");
+            }
+        });
+    }
+    Ok(child)
+}
+
+/// True once at least one `seg*.ts` exists in the session dir.
+async fn session_has_segment(dir: &std::path::Path) -> bool {
+    if let Ok(mut rd) = tokio::fs::read_dir(dir).await {
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            if entry.file_name().to_string_lossy().starts_with("seg") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Remove the (empty/partial) HLS output so a restarted ffmpeg starts clean.
+async fn clear_session_dir(dir: &std::path::Path) {
+    if let Ok(mut rd) = tokio::fs::read_dir(dir).await {
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let _ = tokio::fs::remove_file(entry.path()).await;
+        }
+    }
+}
 
 fn ffmpeg_bin() -> String {
     std::env::var("PLURX_FFMPEG")
@@ -141,31 +194,7 @@ impl TranscodeManager {
             ..Default::default()
         };
         let args = transcode::hls_args(&file, encoder, &opts, &dir.to_string_lossy());
-
-        let mut child = tokio::process::Command::new(ffmpeg_bin())
-            .args(&args)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| format!("spawning ffmpeg: {e}"))?;
-
-        // Drain ffmpeg's stderr into the logs. It runs at -loglevel error, so
-        // anything here is a real failure — e.g. a hardware encoder that
-        // validated but chokes on the actual filter graph. Without this the
-        // session just dies and the client shows a blank player.
-        if let Some(stderr) = child.stderr.take() {
-            let sid = session_id.clone();
-            let enc = encoder.label();
-            tokio::spawn(async move {
-                use tokio::io::{AsyncBufReadExt, BufReader};
-                let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    tracing::warn!(session = %sid, encoder = enc, "transcode ffmpeg: {line}");
-                }
-            });
-        }
+        let child = spawn_ffmpeg(&args, encoder.label(), &session_id)?;
 
         tracing::info!(
             %session_id, file_id, target_height, start_seconds,
@@ -173,7 +202,7 @@ impl TranscodeManager {
         );
 
         let session = Arc::new(Session {
-            dir,
+            dir: dir.clone(),
             child: Mutex::new(child),
             last_access: Mutex::new(Instant::now()),
         });
@@ -181,6 +210,47 @@ impl TranscodeManager {
             .lock()
             .await
             .insert(session_id.clone(), Arc::clone(&session));
+
+        // Hardware encoders can init cleanly yet silently stall under
+        // concurrency — a second QuickSync/VA-API session that opens the device
+        // fine but never produces a segment, leaving the client gray. Watch for
+        // the first segment; if none appears in the grace window, restart this
+        // same session on software x264 so the stream plays (CPU cost beats a
+        // dead player). Software never needs this.
+        if encoder != Encoder::Software {
+            let session = Arc::clone(&session);
+            let file = file.clone();
+            let opts = opts.clone();
+            let dir = dir.clone();
+            let sid = session_id.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(FIRST_SEGMENT_GRACE).await;
+                if session_has_segment(&dir).await {
+                    return; // hardware is producing output — leave it be
+                }
+                tracing::warn!(
+                    session = %sid,
+                    "no segment from hardware encoder within {}s (likely concurrent-session \
+                     GPU contention); falling back to software x264",
+                    FIRST_SEGMENT_GRACE.as_secs()
+                );
+                {
+                    let mut child = session.child.lock().await;
+                    let _ = child.kill().await;
+                }
+                clear_session_dir(&dir).await;
+                let sw_args =
+                    transcode::hls_args(&file, Encoder::Software, &opts, &dir.to_string_lossy());
+                match spawn_ffmpeg(&sw_args, Encoder::Software.label(), &sid) {
+                    Ok(child) => {
+                        *session.child.lock().await = child;
+                        *session.last_access.lock().await = Instant::now();
+                        tracing::info!(session = %sid, "software fallback transcode started");
+                    }
+                    Err(e) => tracing::error!(session = %sid, "software fallback failed: {e}"),
+                }
+            });
+        }
 
         Ok(StartInfo {
             playlist_url: format!("/api/v1/hls/{session_id}/index.m3u8"),
