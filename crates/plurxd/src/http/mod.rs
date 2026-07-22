@@ -40,6 +40,7 @@ pub fn router(state: AppState) -> Router {
             get(system::get_settings).put(system::update_settings),
         )
         .route("/scan/status", get(system::scan_status))
+        .route("/activity", get(system::activity))
         .route("/system", get(system::system_info))
         .route("/system/logs", get(system::logs))
         // Libraries
@@ -333,6 +334,18 @@ mod tests {
         assert!(body["version"].is_string());
         assert!(body["encoders"].is_object());
         assert_eq!(body["users"], 1);
+    }
+
+    #[tokio::test]
+    async fn activity_requires_auth_and_reports_idle() {
+        let app = test_app();
+        let (status, _) = call(&app, get("/api/v1/activity", None)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let admin = setup_admin(&app).await;
+        let (status, body) = call(&app, get("/api/v1/activity", Some(&admin))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.as_array().expect("array").is_empty(), "idle = empty");
     }
 
     #[tokio::test]

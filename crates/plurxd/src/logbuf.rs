@@ -163,7 +163,7 @@ mod tests {
         // Ring: a fourth entry evicts the oldest.
         buf.push(entry("INFO", "four"));
         let all = buf.tail("trace", 10);
-        assert_eq!(all.first().unwrap().message, "two");
+        assert_eq!(all.first().expect("entries").message, "two");
         assert_eq!(all.len(), 3);
 
         // Limit takes the most recent N, still oldest-first.

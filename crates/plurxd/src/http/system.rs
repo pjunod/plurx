@@ -187,6 +187,84 @@ pub async fn scan_status(
     Json(state.jobs.all_statuses().await)
 }
 
+/// One thing the server is doing right now. Deliberately generic — future
+/// task kinds (file moves, renames, backups) reuse the same shape and the
+/// same global indicator in every client.
+#[derive(Serialize)]
+pub struct Activity {
+    /// Machine-readable kind: "scan" | "enrich" | "stream" (more later).
+    pub kind: &'static str,
+    /// Short human label, e.g. "Scanning Movies".
+    pub label: String,
+    /// Optional detail, e.g. "412 of 3801 files".
+    pub detail: Option<String>,
+    /// 0–100 when a meaningful percentage exists.
+    pub percent: Option<u8>,
+}
+
+/// GET /api/v1/activity — everything in flight, for the always-visible
+/// indicator in the app header. Empty array = the server is idle.
+pub async fn activity(
+    _user: AuthUser,
+    State(state): State<AppState>,
+) -> Result<Json<Vec<Activity>>, ApiError> {
+    let mut activities = Vec::new();
+
+    let names: HashMap<i64, String> = state
+        .store
+        .list_libraries()
+        .await?
+        .into_iter()
+        .map(|l| (l.id, l.name))
+        .collect();
+    let mut statuses: Vec<_> = state
+        .jobs
+        .all_statuses()
+        .await
+        .into_iter()
+        .filter(|(_, s)| s.running)
+        .collect();
+    statuses.sort_by_key(|(id, _)| *id);
+    for (id, status) in statuses {
+        let name = names.get(&id).cloned().unwrap_or_else(|| format!("#{id}"));
+        let enriching = status.phase.as_deref() == Some("enriching");
+        let (kind, label) = if enriching {
+            ("enrich", format!("Fetching metadata for {name}"))
+        } else {
+            ("scan", format!("Scanning {name}"))
+        };
+        let (detail, percent) = match status.progress.filter(|_| !enriching) {
+            Some(p) if p.found > 0 => (
+                Some(format!("{} of {} files", p.processed, p.found)),
+                Some(((p.processed * 100 / p.found).min(100)) as u8),
+            ),
+            _ => (None, None),
+        };
+        activities.push(Activity {
+            kind,
+            label,
+            detail,
+            percent,
+        });
+    }
+
+    let streams = state.transcode.active_sessions().await;
+    if streams > 0 {
+        activities.push(Activity {
+            kind: "stream",
+            label: if streams == 1 {
+                "1 active stream".to_owned()
+            } else {
+                format!("{streams} active streams")
+            },
+            detail: None,
+            percent: None,
+        });
+    }
+
+    Ok(Json(activities))
+}
+
 /// GET /metrics — Prometheus text exposition (unauthenticated; counts only).
 pub async fn metrics(State(state): State<AppState>) -> impl axum::response::IntoResponse {
     let uptime = state.started_at.elapsed().as_secs();
