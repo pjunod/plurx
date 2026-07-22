@@ -26,6 +26,15 @@ pub struct Match {
     pub backdrop_path: Option<String>,
 }
 
+/// One season's metadata: its own presentation plus its episodes.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SeasonMeta {
+    pub poster_path: Option<String>,
+    pub overview: Option<String>,
+    pub air_date: Option<String>,
+    pub episodes: Vec<EpisodeMeta>,
+}
+
 /// One episode's metadata within a season.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct EpisodeMeta {
@@ -113,12 +122,12 @@ impl TmdbClient {
         Ok(Some(show_match(id, best)))
     }
 
-    /// Fetch all episodes of one season.
-    pub async fn season_episodes(
+    /// Fetch one season: its own artwork/overview plus all episodes.
+    pub async fn season_detail(
         &self,
         show_tmdb_id: i64,
         season_number: i32,
-    ) -> Result<Vec<EpisodeMeta>, MetadataError> {
+    ) -> Result<SeasonMeta, MetadataError> {
         let body = self
             .get(&format!("/tv/{show_tmdb_id}/season/{season_number}"), &[])
             .await?;
@@ -127,7 +136,12 @@ impl TmdbClient {
             .and_then(|v| v.as_array())
             .map(|arr| arr.iter().map(episode_meta).collect())
             .unwrap_or_default();
-        Ok(episodes)
+        Ok(SeasonMeta {
+            poster_path: str_opt(&body, "poster_path"),
+            overview: str_opt(&body, "overview"),
+            air_date: str_opt(&body, "air_date"),
+            episodes,
+        })
     }
 
     /// Download an image by TMDB-relative path at the given size, returning the

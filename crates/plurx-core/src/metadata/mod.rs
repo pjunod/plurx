@@ -279,18 +279,55 @@ async fn enrich_episodes(
             .or_default()
             .push(ep);
     }
+    // The season items themselves get the season's own poster + overview —
+    // a seasons grid of blank cards is what this prevents.
+    let season_items: std::collections::HashMap<i32, crate::domain::Item> = store
+        .get_item_children(show_id)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|s| s.kind == ItemKind::Season)
+        .filter_map(|s| s.season_number.map(|n| (n, s)))
+        .collect();
 
     for (season_number, locals) in by_season {
-        let remote = match tmdb.season_episodes(show_tmdb_id, season_number).await {
-            Ok(list) => list,
+        let remote = match tmdb.season_detail(show_tmdb_id, season_number).await {
+            Ok(detail) => detail,
             Err(e) => {
                 tracing::warn!(season = season_number, error = %e, "season fetch failed");
                 report.errors += 1;
                 continue;
             }
         };
+        if let Some(season_item) = season_items.get(&season_number) {
+            // Skip the artwork download when the season is already enriched.
+            let needs_art = season_item.poster_path.is_none() && remote.poster_path.is_some();
+            let poster = if needs_art {
+                cache_image(
+                    tmdb,
+                    artwork_dir,
+                    season_item.id,
+                    "poster",
+                    remote.poster_path.as_deref(),
+                    POSTER_SIZE,
+                )
+                .await
+            } else {
+                None
+            };
+            let patch = MetadataPatch {
+                overview: remote.overview.clone().filter(|_| season_item.overview.is_none()),
+                air_date: remote.air_date.clone(),
+                poster_path: poster,
+                ..Default::default()
+            };
+            if !patch.is_empty() {
+                apply(store, season_item.id, patch, report).await;
+            }
+        }
         for ep in locals {
             let Some(meta) = remote
+                .episodes
                 .iter()
                 .find(|r| Some(r.episode_number) == ep.episode_number)
             else {
