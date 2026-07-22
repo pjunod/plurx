@@ -176,8 +176,9 @@ function esc(s){ return (s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">
 function artHtml(it, cls){
   const src=it.poster||it.backdrop;
   if(src) return `<img class="art ${cls||''}" loading="lazy" src="${tok(src)}" alt="">`;
-  const label=(it.season_number!=null&&it.kind==='season')?("S"+it.season_number):
-    ((it.title||"?").split(/\s+/).slice(0,2).map(w=>w[0]||"").join("").toUpperCase()||"?");
+  if(it.kind==='season' && it.season_number!=null)
+    return `<div class="art ph season ${cls||''}"><div class="snum">${it.season_number}</div><div class="sl">Season</div></div>`;
+  const label=(it.title||"?").split(/\s+/).slice(0,2).map(w=>w[0]||"").join("").toUpperCase()||"?";
   return `<div class="art ph ${cls||''}">${esc(label)}</div>`;
 }
 
@@ -304,54 +305,110 @@ async function viewSearch(q){
   const r=await api(`/search?q=${encodeURIComponent(q)}`);
   document.getElementById("main").innerHTML=`<h2 class="section">Results for “${esc(q)}”</h2>${grid(r.results)}`;
 }
+// ---- detail helpers -------------------------------------------------------
+function fmtChannels(n){ return n===8?"7.1":n===7?"6.1":n===6?"5.1":n===2?"2.0":n===1?"Mono":(n?n+"ch":""); }
+function fmtMbps(bps){ return bps? (bps>=1000000? (bps/1000000).toFixed(bps>=10000000?0:1)+" Mb/s" : Math.round(bps/1000)+" kb/s") : ""; }
+function audioLabel(a){ return [a.codec&&a.codec.toUpperCase(), fmtChannels(a.channels), a.language].filter(Boolean).join(" · "); }
+function specBlock(f){
+  const vid=[f.video_codec&&f.video_codec.toUpperCase(),(f.width&&f.height)?`${f.width}×${f.height}`:null,f.hdr,f.bit_depth?`${f.bit_depth}-bit`:null,fmtMbps(f.bitrate)].filter(Boolean).join(" · ");
+  const aud=(f.audio_streams||[]).map(audioLabel).filter(Boolean).join("  /  ")||"—";
+  const file=[f.container&&f.container.toUpperCase(),fmtSize(f.size),fmtDur(f.duration_ms)].filter(Boolean).join(" · ");
+  return `<dl class="specs">
+    <dt>Video</dt><dd>${esc(vid||"—")}</dd>
+    <dt>Audio</dt><dd>${esc(aud)}</dd>
+    <dt>File</dt><dd class="fn">${esc(f.filename)}${file?" · "+esc(file):""}</dd></dl>`;
+}
+function epThumb(ep){
+  const art=ep.poster||ep.backdrop;
+  const pct=progressPct(ep.watch);
+  const prog=pct>0&&pct<100?`<span class="pbadge"><i style="width:${pct}%"></i></span>`:'';
+  if(art) return `<div class="epthumb" style="background-image:url(${tok(art)});background-size:cover;color:transparent">${prog}</div>`;
+  return `<div class="epthumb">${ep.episode_number!=null?ep.episode_number:"?"}${prog}</div>`;
+}
+function episodeRow(ep){
+  const bits=[ep.episode_number!=null?`Episode ${ep.episode_number}`:'',fmtDur(ep.runtime_ms)].filter(Boolean).map(m=>`<span>${esc(m)}</span>`);
+  if(ep.watch&&ep.watch.watched) bits.push('<span class="epwatched">✓ Watched</span>');
+  return `<div class="eprow" onclick="location.hash='#/item/${ep.id}'">
+    ${epThumb(ep)}
+    <div style="min-width:0">
+      <div class="eptitle">${ep.episode_number!=null?esc(ep.episode_number+". "):""}${esc(ep.title)}</div>
+      <div class="epmeta">${bits.join("")}</div>
+      ${ep.overview?`<div class="epov">${esc(ep.overview)}</div>`:""}
+    </div>
+    <button class="ghost sm epplay" title="Play" onclick="event.stopPropagation();AUTOPLAY=${ep.id};location.hash='#/item/${ep.id}'">▶</button>
+  </div>`;
+}
+// Set by an episode-row play button so the target item auto-plays on arrival.
+let AUTOPLAY=null;
+
 async function viewItem(id){
   chrome("home",`<div class="empty">Loading…</div>`);
   const d=await api(`/items/${id}`); const it=d.item;
-  // Map this item's files → item id so the player can post progress.
   d.files.forEach(f=>ITEM_FOR_FILE[f.id]=Number(id));
-  const imgTag = artHtml(it);
-  // In-app breadcrumb trail: Home / Show / Season / …, every level clickable.
+
+  // Breadcrumb trail: Home / Show / Season / …, every level clickable.
   const trail=[`<a href="#/">Home</a>`]
     .concat((d.ancestors||[]).map(a=>`<a href="#/item/${a.id}">${esc(a.title)}</a>`))
     .concat([`<span class="cur">${esc(it.title)}</span>`]);
-  let right=`<div class="crumbs">${trail.join('<span class="sep">/</span>')}</div>`;
-  const runtime = it.runtime_ms || (d.files[0]&&d.files[0].duration_ms);
-  right+=`<h1>${esc(it.title)}</h1><div class="row muted">${[it.year,fmtDur(runtime),it.kind].filter(Boolean).map(x=>`<span>${esc(String(x))}</span>`).join(" · ")}</div>`;
-  if(it.overview) right+=`<p class="overview">${esc(it.overview)}</p>`;
+  const crumbs=`<div class="crumbs">${trail.join('<span class="sep">/</span>')}</div>`;
 
-  // Movie / episode: play the best *available* version. Show/season: children.
+  const best=d.files[0];
+  const runtime=it.runtime_ms||(best&&best.duration_ms);
+  const chips=[];
+  if(it.year) chips.push(`<span>${it.year}</span>`);
+  if(runtime) chips.push(`<span>${fmtDur(runtime)}</span>`);
+  if(it.kind) chips.push(`<span>${esc(it.kind)}</span>`);
+  if(best&&best.height) chips.push(`<span class="chip res">${best.height}p</span>`);
+  if(best&&best.hdr) chips.push(`<span class="chip hdr">${esc(best.hdr)}</span>`);
+
+  let body="";
   if(d.files.length){
-    const resume = it.watch&&it.watch.position_ms>3000&&!it.watch.watched? it.watch.position_ms:0;
-    const watchBtn = `<button class="ghost sm" onclick="toggleWatched(${it.id}, ${it.watch&&it.watch.watched?1:0})">${it.watch&&it.watch.watched?'Mark unwatched':'Mark watched'}</button>`;
-    const playable = d.files.find(f=>f.available);   // best-first; skip missing
+    // Movie / episode: play the best *available* version + labeled specs.
+    const resume=it.watch&&it.watch.position_ms>3000&&!it.watch.watched?it.watch.position_ms:0;
+    const watchBtn=`<button class="ghost sm" onclick="toggleWatched(${it.id}, ${it.watch&&it.watch.watched?1:0})">${it.watch&&it.watch.watched?'Mark unwatched':'Mark watched'}</button>`;
+    const playable=d.files.find(f=>f.available);
     if(playable){
-      right+=`<div class="row" style="margin-top:16px">
-        <button onclick='play(${playable.id},${JSON.stringify(it.title)},${resume},${playable.duration_ms||0})'>▶ ${resume?`Resume (${fmtDur(resume)})`:'Play'}</button>
+      body+=`<div class="actions">
+        <button class="btnplay" onclick='play(${playable.id},${JSON.stringify(it.title)},${resume},${playable.duration_ms||0})'>▶ ${resume?`Resume · ${fmtDur(resume)}`:'Play'}</button>
         ${resume?`<button class="ghost" onclick='play(${playable.id},${JSON.stringify(it.title)},0,${playable.duration_ms||0})'>Start over</button>`:''}
-        ${watchBtn}
-      </div>`;
+        ${watchBtn}</div>`;
     } else {
-      // Nothing on disk — say so plainly and don't offer a dead Play button.
-      const p = d.files[0].missing_path;
-      right+=`<div class="filemissing">⚠ This file is missing on the server, so it can’t be played — its library path may be unmounted, moved, or renamed${ME.is_admin&&p?`:<br><code>${esc(p)}</code>`:'.'}</div>
-        <div class="row" style="margin-top:12px">${watchBtn}</div>`;
+      const p=best.missing_path;
+      body+=`<div class="filemissing">⚠ This file is missing on the server, so it can’t be played — its library path may be unmounted, moved, or renamed${ME.is_admin&&p?`:<br><code>${esc(p)}</code>`:'.'}</div><div class="actions">${watchBtn}</div>`;
     }
     const multi=d.files.length>1;
-    const rows=d.files.map(v=>{
-      const parts=[v.height&&`${v.height}p`,v.video_codec,v.hdr,(v.audio_streams[0]||{}).codec,v.container,fmtSize(v.size),fmtDur(v.duration_ms)].filter(Boolean);
+    body+=d.files.map(v=>{
       const miss=!v.available;
-      return `<div class="verrow"><div style="min-width:0"><div class="muted" style="font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(v.filename)}${miss?'<span class="missbadge">missing</span>':''}</div>
-        <div class="kv">${parts.map(c=>`<span class="pill">${esc(String(c))}</span>`).join("")}</div>
-        ${miss&&ME.is_admin&&v.missing_path?`<div class="problem">${esc(v.missing_path)}</div>`:''}</div>
-        ${miss?'':(multi?`<button class="ghost sm" style="flex:none" onclick='play(${v.id},${JSON.stringify(it.title)},${resume},${v.duration_ms||0})'>▶ Play</button>`:"")}</div>`;
+      const head=[v.height?`${v.height}p`:null,v.video_codec&&v.video_codec.toUpperCase()].filter(Boolean).join(" · ")||v.filename;
+      return `<div class="version"><div class="vh"><span class="vt">${esc(head)}${miss?'<span class="missbadge">missing</span>':''}</span>
+        ${(!miss&&multi)?`<button class="ghost sm" onclick='play(${v.id},${JSON.stringify(it.title)},${resume},${v.duration_ms||0})'>▶ Play</button>`:''}</div>
+        ${specBlock(v)}${miss&&ME.is_admin&&v.missing_path?`<div class="problem">${esc(v.missing_path)}</div>`:''}</div>`;
     }).join("");
-    right+=`<div class="filebox">${multi?`<div class="muted" style="font-size:12px;margin-bottom:2px">${d.files.length} versions</div>`:""}${rows}</div>`;
+  } else if(d.children.length && d.children[0].kind==='episode'){
+    // Season: episodes as a list.
+    body+=`<h2 class="section" style="margin:18px 0 0">${d.children.length} episode${d.children.length>1?'s':''}</h2>
+      <div class="eplist">${d.children.map(episodeRow).join("")}</div>`;
+  } else if(d.children.length){
+    // Show (or anything with children): seasons/children grid.
+    body+=`<h2 class="section" style="margin:18px 0 12px">${d.children[0].kind==='season'?'Seasons':'Episodes'}</h2>${grid(d.children)}`;
   }
-  if(d.children.length){
-    const kids=d.children;
-    right+=`<h2 class="section" style="margin-left:0">${kids[0].kind==='season'?'Seasons':'Episodes'}</h2>${grid(kids)}`;
+
+  const bg=it.backdrop?`<div class="herobg" style="background-image:url(${tok(it.backdrop)})"></div>`:'';
+  document.getElementById("main").innerHTML=`<div class="hero">${bg}
+    <div class="dwrap">
+      <div class="poster">${artHtml(it)}</div>
+      <div class="dhead">${crumbs}<h1>${esc(it.title)}</h1>
+        <div class="chips">${chips.join("")}</div>
+        ${it.overview?`<p class="overview">${esc(it.overview)}</p>`:''}
+        ${body}</div>
+    </div></div>`;
+
+  // One-click play from an episode list lands here and starts immediately.
+  if(AUTOPLAY===Number(id)){
+    AUTOPLAY=null;
+    const pf=d.files.find(f=>f.available);
+    if(pf){ const r=it.watch&&it.watch.position_ms>3000&&!it.watch.watched?it.watch.position_ms:0; play(pf.id, it.title, r, pf.duration_ms||0); }
   }
-  document.getElementById("main").innerHTML=`<div class="detail"><div class="poster">${imgTag}</div><div>${right}</div></div>`;
 }
 
 async function toggleWatched(id, watched){
