@@ -14,6 +14,23 @@ use tokio::sync::Mutex;
 
 use crate::transcode::TranscodeManager;
 
+/// Environment facts collected once at startup, shown on the settings page.
+/// Everything here is admin-facing diagnostics — paths, tool versions,
+/// detected hardware — not runtime state.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct SystemInfo {
+    pub data_dir: String,
+    pub ffmpeg: String,
+    pub ffprobe: String,
+    /// First line of `ffmpeg -version`, if ffmpeg ran at all.
+    pub ffmpeg_version: Option<String>,
+    /// PLURX_HWACCEL preference, or "auto".
+    pub hwaccel_pref: String,
+    pub encoders: EncoderCaps,
+    /// Human label of the encoder the transcoder will actually pick.
+    pub encoder_selected: String,
+}
+
 /// Everything a request handler needs. Cheap to clone (all shared via `Arc`).
 #[derive(Clone)]
 pub struct AppState {
@@ -22,6 +39,7 @@ pub struct AppState {
     pub artwork_dir: PathBuf,
     pub jobs: Arc<JobManager>,
     pub transcode: Arc<TranscodeManager>,
+    pub system: Arc<SystemInfo>,
     pub started_at: Instant,
 }
 
@@ -32,6 +50,7 @@ impl AppState {
         artwork_dir: PathBuf,
         transcode_dir: PathBuf,
         encoder_caps: EncoderCaps,
+        system: SystemInfo,
     ) -> Self {
         let jobs = Arc::new(JobManager::new(Arc::clone(&store), artwork_dir.clone()));
         let transcode = Arc::new(TranscodeManager::new(
@@ -45,6 +64,7 @@ impl AppState {
             artwork_dir,
             jobs,
             transcode,
+            system: Arc::new(system),
             started_at: Instant::now(),
         }
     }

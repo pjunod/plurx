@@ -9,10 +9,10 @@ use std::time::Duration;
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use plurx_core::config::Config;
-use plurx_core::store::{SqliteStore, Store};
+use plurx_core::store::{keys, SqliteStore, Store};
 use tracing_subscriber::EnvFilter;
 
-use crate::state::AppState;
+use crate::state::{AppState, SystemInfo};
 
 #[derive(Parser)]
 #[command(name = "plurxd", version, about = "plurx media server daemon")]
@@ -88,6 +88,42 @@ async fn run(config: Config) -> anyhow::Result<()> {
         .unwrap_or_else(|| "ffmpeg".to_owned());
     let encoder_caps = plurx_core::transcode::detect_encoders(&ffmpeg).await;
 
+    // PLURX_HWACCEL (documented since Phase 2, previously read by nothing)
+    // seeds the stored encoder preference at boot; env wins over the setting.
+    if let Ok(pref) = std::env::var("PLURX_HWACCEL") {
+        if !pref.is_empty() {
+            store
+                .put_setting(keys::HWACCEL, pref.to_lowercase().trim())
+                .await?;
+        }
+    }
+    let hwaccel_pref = store
+        .get_setting(keys::HWACCEL)
+        .await?
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "auto".to_owned());
+    let encoder_selected = encoder_caps
+        .choose(if hwaccel_pref == "auto" {
+            ""
+        } else {
+            hwaccel_pref.as_str()
+        })
+        .label()
+        .to_owned();
+    let ffprobe = std::env::var("PLURX_FFPROBE")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "ffprobe".to_owned());
+    let system = SystemInfo {
+        data_dir: config.storage.data_dir.display().to_string(),
+        ffmpeg_version: ffmpeg_version(&ffmpeg).await,
+        ffmpeg: ffmpeg.clone(),
+        ffprobe,
+        hwaccel_pref,
+        encoders: encoder_caps.clone(),
+        encoder_selected,
+    };
+
     let instance_id = store.instance_id().await?;
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -103,6 +139,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
         artwork_dir,
         transcode_dir,
         encoder_caps,
+        system,
     );
     // Reap idle transcode sessions in the background.
     tokio::spawn(std::sync::Arc::clone(&state.transcode).reap_loop());
@@ -128,6 +165,21 @@ async fn run(config: Config) -> anyhow::Result<()> {
         .await?;
     tracing::info!("shutdown complete");
     Ok(())
+}
+
+/// First line of `ffmpeg -version` (e.g. "ffmpeg version 6.1.1 …"), if the
+/// binary runs at all. Purely informational, for the settings page.
+async fn ffmpeg_version(bin: &str) -> Option<String> {
+    let out = tokio::process::Command::new(bin)
+        .arg("-version")
+        .output()
+        .await
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()
+        .map(|l| l.trim().to_owned())
+        .filter(|l| !l.is_empty())
 }
 
 /// GDM discovery responder: answers Plex clients' multicast `M-SEARCH` on the

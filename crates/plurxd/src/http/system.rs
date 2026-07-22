@@ -75,6 +75,37 @@ pub async fn setup(
 }
 
 #[derive(Serialize)]
+pub struct SystemDto {
+    pub name: String,
+    pub version: &'static str,
+    pub instance_id: String,
+    pub uptime_seconds: u64,
+    pub users: i64,
+    pub libraries: usize,
+    pub active_transcodes: usize,
+    #[serde(flatten)]
+    pub info: crate::state::SystemInfo,
+}
+
+/// GET /api/v1/system (admin) — environment diagnostics for the settings
+/// page: paths, ffmpeg, detected encoders, counts.
+pub async fn system_info(
+    _admin: AdminUser,
+    State(state): State<AppState>,
+) -> Result<Json<SystemDto>, ApiError> {
+    Ok(Json(SystemDto {
+        name: state.server_name.clone(),
+        version: env!("CARGO_PKG_VERSION"),
+        instance_id: state.store.instance_id().await?,
+        uptime_seconds: state.started_at.elapsed().as_secs(),
+        users: state.store.count_users().await?,
+        libraries: state.store.list_libraries().await?.len(),
+        active_transcodes: state.transcode.active_sessions().await,
+        info: (*state.system).clone(),
+    }))
+}
+
+#[derive(Serialize)]
 pub struct SettingsDto {
     pub tmdb_configured: bool,
 }

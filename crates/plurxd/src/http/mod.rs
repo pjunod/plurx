@@ -40,6 +40,7 @@ pub fn router(state: AppState) -> Router {
             get(system::get_settings).put(system::update_settings),
         )
         .route("/scan/status", get(system::scan_status))
+        .route("/system", get(system::system_info))
         // Libraries
         .route("/libraries", get(libraries::list).post(libraries::create))
         .route(
@@ -156,6 +157,7 @@ mod tests {
             Arc::new(store),
             base.join("artwork"),
             base.join("transcode"),
+            Default::default(),
             Default::default(),
         );
         router(state)
@@ -315,6 +317,20 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn system_info_is_admin_only() {
+        let app = test_app();
+        let (status, _) = call(&app, get("/api/v1/system", None)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let admin = setup_admin(&app).await;
+        let (status, body) = call(&app, get("/api/v1/system", Some(&admin))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["version"].is_string());
+        assert!(body["encoders"].is_object());
+        assert_eq!(body["users"], 1);
     }
 
     #[tokio::test]

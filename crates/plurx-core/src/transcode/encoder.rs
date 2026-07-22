@@ -128,7 +128,7 @@ fn vaapi_device() -> String {
 }
 
 /// Which encoders this ffmpeg build exposes.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct EncoderCaps {
     pub nvenc: bool,
     pub qsv: bool,
