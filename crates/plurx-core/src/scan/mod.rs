@@ -24,7 +24,7 @@ const VIDEO_EXTS: &[&str] = &[
     "ogv", "3gp",
 ];
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct ScanReport {
     pub added: usize,
     pub updated: usize,
@@ -33,7 +33,15 @@ pub struct ScanReport {
     pub pruned_items: usize,
     pub skipped: usize,
     pub errors: usize,
+    /// Human-readable problems worth showing the operator: missing roots,
+    /// unreadable directories, a scan that found no video files at all. A
+    /// non-empty list means the scan's counts don't tell the whole story.
+    pub problems: Vec<String>,
 }
+
+/// Cap on individual walk-error messages recorded per scan (the counts still
+/// include everything; this just keeps the report readable).
+const MAX_WALK_PROBLEMS: usize = 10;
 
 fn is_video(path: &Path) -> bool {
     path.extension()
@@ -62,19 +70,61 @@ pub async fn scan_library(store: &dyn Store, library: &Library) -> Result<ScanRe
     let mut seen: HashSet<String> = HashSet::new();
 
     // Collect candidate files first (cheap, synchronous), then process each.
+    // A root that is missing or unreadable is a loud, actionable problem — the
+    // most common cause is a container path mix-up (the library was configured
+    // with a host path that isn't mounted inside the container) or an
+    // unmounted NAS. Either way, silently scanning nothing is the worst
+    // possible answer.
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    let mut walk_errors = 0usize;
     for root in &library.paths {
-        for entry in WalkDir::new(root)
-            .follow_links(true)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
-            if entry.file_type().is_file() && is_video(entry.path()) {
-                candidates.push(entry.into_path());
+        if !root.is_dir() {
+            report.errors += 1;
+            walk_errors += 1;
+            report.problems.push(format!(
+                "library path `{}` does not exist on the server — if plurxd runs in a \
+                 container, use the path as mounted inside the container (e.g. `/media/…`), \
+                 and check the mount is present",
+                root.display()
+            ));
+            continue;
+        }
+        for entry in WalkDir::new(root).follow_links(true) {
+            match entry {
+                Ok(entry) => {
+                    if entry.file_type().is_file() && is_video(entry.path()) {
+                        candidates.push(entry.into_path());
+                    }
+                }
+                Err(e) => {
+                    report.errors += 1;
+                    walk_errors += 1;
+                    if report.problems.len() < MAX_WALK_PROBLEMS {
+                        let at = e
+                            .path()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| root.display().to_string());
+                        report.problems.push(format!("cannot read `{at}`: {e}"));
+                    }
+                }
             }
         }
     }
     candidates.sort();
+
+    if candidates.is_empty() && walk_errors == 0 {
+        report.problems.push(format!(
+            "no video files found under {} — the path exists but contains no recognized \
+             video containers ({})",
+            library
+                .paths
+                .iter()
+                .map(|p| format!("`{}`", p.display()))
+                .collect::<Vec<_>>()
+                .join(", "),
+            VIDEO_EXTS.join(", ")
+        ));
+    }
 
     for path in candidates {
         let path_str = path.to_string_lossy().into_owned();
@@ -125,17 +175,29 @@ pub async fn scan_library(store: &dyn Store, library: &Library) -> Result<ScanRe
         }
     }
 
-    // Reconcile: anything in the DB for this library but not seen on disk is gone.
-    let known = store.library_file_paths(library.id).await?;
-    let gone: Vec<i64> = known
-        .into_iter()
-        .filter(|(_, p)| !seen.contains(&p.to_string_lossy().into_owned()))
-        .map(|(id, _)| id)
-        .collect();
-    if !gone.is_empty() {
-        report.removed_files = store.delete_files(&gone).await? as usize;
+    // Reconcile: anything in the DB for this library but not seen on disk is
+    // gone. NEVER reconcile after a partial walk — if a root was missing or a
+    // directory unreadable (NAS unmounted, permissions), the files under it
+    // are invisible, not deleted, and removing them here would wipe the
+    // library's records over a transient mount problem.
+    if walk_errors == 0 {
+        let known = store.library_file_paths(library.id).await?;
+        let gone: Vec<i64> = known
+            .into_iter()
+            .filter(|(_, p)| !seen.contains(&p.to_string_lossy().into_owned()))
+            .map(|(id, _)| id)
+            .collect();
+        if !gone.is_empty() {
+            report.removed_files = store.delete_files(&gone).await? as usize;
+        }
+        report.pruned_items = store.prune_empty_items(library.id).await? as usize;
+    } else {
+        report.problems.push(
+            "vanished-file cleanup skipped: some library paths were missing or unreadable, \
+             so absent files were kept rather than removed"
+                .to_owned(),
+        );
     }
-    report.pruned_items = store.prune_empty_items(library.id).await? as usize;
 
     tracing::info!(
         library = %library.name,
@@ -147,6 +209,9 @@ pub async fn scan_library(store: &dyn Store, library: &Library) -> Result<ScanRe
         errors = report.errors,
         "scan complete"
     );
+    for problem in &report.problems {
+        tracing::warn!(library = %library.name, "scan problem: {problem}");
+    }
     Ok(report)
 }
 
@@ -324,6 +389,67 @@ mod tests {
             .expect("list");
         assert_eq!(page.total, 1);
         assert_eq!(page.items[0].title, "The Matrix");
+    }
+
+    #[tokio::test]
+    async fn missing_root_is_reported_and_preserves_files() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        let dir = tempfile::tempdir().expect("tmp");
+        write_fake_video(dir.path(), "Heat (1995).mkv").await;
+
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "Movies".into(),
+                kind: LibraryKind::Movies,
+                paths: vec![dir.path().to_path_buf()],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+        let r = scan_library(&store, &lib).await.expect("scan");
+        assert_eq!(r.added, 1);
+
+        // The root vanishes (unmounted NAS / wrong container path). The scan
+        // must say so loudly — and must NOT delete the known files.
+        drop(dir);
+        let r = scan_library(&store, &lib).await.expect("rescan");
+        assert_eq!(r.errors, 1);
+        assert!(
+            r.problems.iter().any(|p| p.contains("does not exist")),
+            "problems: {:?}",
+            r.problems
+        );
+        assert_eq!(r.removed_files, 0);
+        assert_eq!(r.pruned_items, 0);
+        let known = store.library_file_paths(lib.id).await.expect("paths");
+        assert_eq!(known.len(), 1, "files must survive a missing root");
+    }
+
+    #[tokio::test]
+    async fn empty_root_reports_no_videos_found() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        let dir = tempfile::tempdir().expect("tmp");
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "Movies".into(),
+                kind: LibraryKind::Movies,
+                paths: vec![dir.path().to_path_buf()],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+
+        // Path exists but holds no video files (the classic empty-volume /
+        // wrong-subfolder misconfiguration): counts are all zero, so the
+        // report must carry an explicit problem instead.
+        let r = scan_library(&store, &lib).await.expect("scan");
+        assert_eq!(r.added, 0);
+        assert_eq!(r.errors, 0);
+        assert!(
+            r.problems.iter().any(|p| p.contains("no video files found")),
+            "problems: {:?}",
+            r.problems
+        );
     }
 
     #[tokio::test]
