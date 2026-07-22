@@ -200,6 +200,58 @@
   .art.ph.season .sl{font-size:10px;letter-spacing:.18em;color:#8891ab;text-transform:uppercase;font-weight:700}
   @media(max-width:720px){ .dwrap{grid-template-columns:1fr} .dwrap .poster{max-width:200px} .eprow{grid-template-columns:110px 1fr} .eprow .epplay{display:none} }
   .art.ph{display:grid;place-items:center;font-size:30px;font-weight:800;letter-spacing:.5px;color:#39415a;user-select:none}
+
+  /* ================= Terminal theme: structural chrome =====================
+     A theme is more than a palette — Terminal gets tty structure: hard edges,
+     a status-bar header, a ~$ prompt with a blinking block cursor, bracketed
+     nav "commands", inverse-video actives, comment-style section headers, CRT
+     scanlines + phosphor glow (dark only; hidden while the player is open so
+     the movie stays clean). All scoped to [data-theme=terminal]. */
+  [data-theme=terminal] *{border-radius:0 !important;box-shadow:none !important}
+  [data-theme=terminal]{--radius:0}
+  [data-theme=terminal] header.top{background:var(--panel);backdrop-filter:none}
+  [data-theme=terminal] .logo{background:none;-webkit-background-clip:initial;background-clip:initial;
+    color:var(--accent);letter-spacing:0;font-size:18px;font-weight:700}
+  [data-theme=terminal] .logo::before{content:"~$ ";color:var(--muted)}
+  [data-theme=terminal] .logo::after{content:"▊";margin-left:3px;color:var(--accent);animation:tblink 1.1s steps(1,end) infinite}
+  @keyframes tblink{50%{opacity:0}}
+  [data-theme=terminal] .top nav a{padding:7px 7px;color:var(--muted)}
+  [data-theme=terminal] .top nav a::before{content:"["}
+  [data-theme=terminal] .top nav a::after{content:"]"}
+  [data-theme=terminal] .top nav a:hover{background:transparent;color:var(--accent)}
+  [data-theme=terminal] .top nav a.active{background:var(--accent);color:var(--btn-ink)}
+  [data-theme=terminal] button{background:transparent;color:var(--accent);border:1px solid var(--accent)}
+  [data-theme=terminal] button:hover{background:var(--accent);color:var(--btn-ink)}
+  [data-theme=terminal] button.ghost{color:var(--text);border-color:var(--line)}
+  [data-theme=terminal] button.ghost:hover{background:var(--panel2);color:var(--text)}
+  [data-theme=terminal] .amenu button,[data-theme=terminal] .pmenu button{border:0;background:transparent;color:var(--text)}
+  [data-theme=terminal] .amenu button:hover,[data-theme=terminal] .pmenu button:hover{background:var(--panel2);color:var(--text)}
+  [data-theme=terminal] .amenu button.sel,[data-theme=terminal] .pmenu button.sel{color:var(--accent)}
+  /* the player keeps its cinematic chrome — terminal styling stops at the modal */
+  [data-theme=terminal] .pbtn{background:rgba(18,20,26,.62);color:#fff;border:1px solid rgba(255,255,255,.15)}
+  [data-theme=terminal] .pbtn:hover{background:rgba(46,50,60,.85)}
+  [data-theme=terminal] .pbtn.on{background:var(--accent);border-color:var(--accent)}
+  [data-theme=terminal] .pskip button{background:rgba(18,20,26,.82);color:#fff;border:1px solid rgba(255,255,255,.22)}
+  [data-theme=terminal] .pskip button:hover{background:var(--accent);border-color:var(--accent)}
+  [data-theme=terminal] input,[data-theme=terminal] select{background:var(--bg);caret-color:var(--accent)}
+  [data-theme=terminal] input:focus,[data-theme=terminal] select:focus{outline:1px solid var(--accent);outline-offset:0}
+  [data-theme=terminal] h1::before{content:"> ";color:var(--accent)}
+  [data-theme=terminal] h2.section{color:var(--accent);letter-spacing:.14em}
+  [data-theme=terminal] h2.section::before{content:"## ";color:var(--muted)}
+  [data-theme=terminal] .poster:hover{transform:none;outline:1px solid var(--accent)}
+  [data-theme=terminal] th{border-bottom:3px double var(--line)}
+  [data-theme=terminal] ::selection{background:var(--accent);color:var(--btn-ink)}
+  [data-theme=terminal] main a:hover{text-decoration:underline dotted}
+  [data-theme=terminal] ::-webkit-scrollbar{width:10px;height:10px}
+  [data-theme=terminal] ::-webkit-scrollbar-track{background:var(--bg)}
+  [data-theme=terminal] ::-webkit-scrollbar-thumb{background:var(--line)}
+  [data-theme=terminal] ::-webkit-scrollbar-thumb:hover{background:var(--accent)}
+  [data-theme=terminal][data-mode=dark] body::before{content:"";position:fixed;inset:0;z-index:90;pointer-events:none;
+    background:repeating-linear-gradient(to bottom,rgba(0,0,0,.13) 0 1px,transparent 1px 3px)}
+  [data-theme=terminal][data-mode=dark] body:has(.modal.open)::before{display:none}
+  [data-theme=terminal][data-mode=dark] .logo,
+  [data-theme=terminal][data-mode=dark] h2.section{text-shadow:0 0 8px color-mix(in srgb,var(--accent) 40%,transparent)}
+  [data-theme=terminal][data-mode=dark] button:not(.ghost):hover{box-shadow:0 0 10px color-mix(in srgb,var(--accent) 45%,transparent) !important}
 </style>
 <script>
 // Theme engine. Runs in <head> before first paint so there's no flash of the
@@ -218,8 +270,8 @@ const THEMES={
     dark:{"--bg":"#0e0f13","--panel":"#171922","--panel2":"#1e2230","--line":"#2a2f3e","--text":"#e8eaf0","--muted":"#9aa2b4","--accent":"#6ea8fe","--accent2":"#8b7cf6","--good":"#4ade80","--bad":"#f87171","--radius":"12px","--btn-ink":"#07101f","--prose":"#cdd2df","--font":FONT_UI},
     light:{"--bg":"#f6f7f9","--panel":"#ffffff","--panel2":"#eef1f6","--line":"#dde2ea","--text":"#1a1d24","--muted":"#5b6472","--accent":"#2f6fe0","--accent2":"#6d5bd0","--good":"#1a9d5a","--bad":"#d64550","--radius":"12px","--btn-ink":"#ffffff","--prose":"#333a45","--font":FONT_UI}},
   terminal:{name:"Terminal",
-    dark:{"--bg":"#0a0d0b","--panel":"#0f1411","--panel2":"#151d17","--line":"#213021","--text":"#d6e6d4","--muted":"#7f9079","--accent":"#3ddc84","--accent2":"#2bb673","--good":"#3ddc84","--bad":"#ff6b6b","--radius":"4px","--btn-ink":"#06140c","--prose":"#b9ccb7","--font":FONT_MONO},
-    light:{"--bg":"#f2f4ef","--panel":"#ffffff","--panel2":"#e9ede4","--line":"#d5dccb","--text":"#16211a","--muted":"#57664f","--accent":"#1a7f4b","--accent2":"#136139","--good":"#1a7f4b","--bad":"#c0392b","--radius":"4px","--btn-ink":"#ffffff","--prose":"#2a352b","--font":FONT_MONO}},
+    dark:{"--bg":"#080b08","--panel":"#0d120e","--panel2":"#131b14","--line":"#1f2f20","--text":"#cfe6cc","--muted":"#79906f","--accent":"#3ddc84","--accent2":"#2bb673","--good":"#3ddc84","--bad":"#ff6b6b","--radius":"0px","--btn-ink":"#06140c","--prose":"#b4ccb0","--font":FONT_MONO},
+    light:{"--bg":"#f2f4ef","--panel":"#ffffff","--panel2":"#e9ede4","--line":"#c9d3ba","--text":"#16211a","--muted":"#57664f","--accent":"#1a7f4b","--accent2":"#136139","--good":"#1a7f4b","--bad":"#c0392b","--radius":"0px","--btn-ink":"#ffffff","--prose":"#2a352b","--font":FONT_MONO}},
   // noirr — the brand theme (kit tokens.css): midnight (dark) + matinee (light).
   // crimson cursor accent; warm paper in daylight. See docs brand kit.
   noirr:{name:"noirr",
@@ -479,8 +531,17 @@ function resLabel(w,h){ w=w||0; h=h||0;
   if(w>=600||h>=400) return '480p';
   return h?h+'p':null; }
 function codecLabel(c){ if(!c) return null; return ({hevc:'HEVC',h265:'HEVC',h264:'H.264',avc1:'H.264',av1:'AV1',vp9:'VP9',vc1:'VC-1',mpeg2video:'MPEG-2'})[c.toLowerCase()]||c.toUpperCase(); }
-function hdrChip(f){ if(f.hdr_format) return {cls:(f.hdr==='dolby_vision'?'dv':'hdr'),text:f.hdr_format};
-  if(f.hdr) return {cls:(f.hdr==='dolby_vision'?'dv':'hdr'),text:hdrLabel(f.hdr)}; return null; }
+// Badges stay terse: "Dolby Vision · Profile 7 (HDR10-compatible)" → "DV P7"
+// (the spelled-out string lives in the Video detail row and the hover title).
+function hdrChip(f){
+  const s=f.hdr_format||"", cls=(f.hdr==='dolby_vision'?'dv':'hdr');
+  if(f.hdr==='dolby_vision'||/dolby/i.test(s)){
+    const m=/profile\s*(\d+)/i.exec(s);
+    return {cls:'dv', text:m?('DV P'+m[1]):'DV', full:s||'Dolby Vision'};
+  }
+  if(s) return {cls, text:s, full:s};                    // HDR10+ / HDR10 / HLG are already short
+  if(f.hdr) return {cls, text:hdrLabel(f.hdr), full:hdrLabel(f.hdr)};
+  return null; }
 function premiumAudio(f){ const cs=(f.audio_streams||[]).map(a=>(a.codec||'').toLowerCase());
   if(cs.some(c=>c.includes('truehd'))) return 'TrueHD';
   if(cs.some(c=>c.includes('dts'))) return 'DTS';
@@ -491,7 +552,7 @@ function specBadges(f){
   const r=resLabel(f.width,f.height); if(r) b.push(`<span class="vbadge res">${r}</span>`);
   const c=codecLabel(f.video_codec); if(c) b.push(`<span class="vbadge codec">${esc(c)}</span>`);
   if(f.bit_depth>=10) b.push(`<span class="vbadge depth">${f.bit_depth}-bit</span>`);
-  const h=hdrChip(f); if(h) b.push(`<span class="vbadge ${h.cls}">${esc(h.text)}</span>`);
+  const h=hdrChip(f); if(h) b.push(`<span class="vbadge ${h.cls}" title="${esc(h.full||h.text)}">${esc(h.text)}</span>`);
   const au=premiumAudio(f); if(au) b.push(`<span class="vbadge audio">${esc(au)}</span>`);
   return b.join("");
 }
