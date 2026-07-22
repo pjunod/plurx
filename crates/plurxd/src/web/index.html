@@ -9,12 +9,14 @@
     --bg:#0e0f13; --panel:#171922; --panel2:#1e2230; --line:#2a2f3e;
     --text:#e8eaf0; --muted:#9aa2b4; --accent:#6ea8fe; --accent2:#8b7cf6;
     --good:#4ade80; --bad:#f87171; --radius:12px;
+    --btn-ink:#07101f; --prose:#cdd2df;
+    --font:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
   }
   *{box-sizing:border-box}
   html,body{margin:0;height:100%}
-  body{background:var(--bg);color:var(--text);font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+  body{background:var(--bg);color:var(--text);font:15px/1.5 var(--font)}
   a{color:var(--accent);text-decoration:none}
-  button{font:inherit;cursor:pointer;border:0;border-radius:8px;padding:9px 14px;background:var(--accent);color:#07101f;font-weight:600}
+  button{font:inherit;cursor:pointer;border:0;border-radius:8px;padding:9px 14px;background:var(--accent);color:var(--btn-ink);font-weight:600}
   button.ghost{background:var(--panel2);color:var(--text);border:1px solid var(--line)}
   button.sm{padding:5px 10px;font-size:13px}
   button:disabled{opacity:.5;cursor:default}
@@ -25,7 +27,7 @@
   .pill{font-size:11px;padding:2px 8px;border-radius:999px;background:var(--panel2);border:1px solid var(--line);color:var(--muted)}
 
   header.top{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:16px;
-    padding:12px 20px;background:rgba(14,15,19,.85);backdrop-filter:blur(10px);border-bottom:1px solid var(--line)}
+    padding:12px 20px;background:color-mix(in srgb, var(--bg) 82%, transparent);backdrop-filter:blur(10px);border-bottom:1px solid var(--line)}
   .logo{font-weight:800;letter-spacing:.5px;font-size:20px;background:linear-gradient(90deg,var(--accent),var(--accent2));-webkit-background-clip:text;background-clip:text;color:transparent}
   .top nav{display:flex;gap:4px;flex-wrap:wrap}
   .top nav a{padding:7px 12px;border-radius:8px;color:var(--muted)}
@@ -44,21 +46,30 @@
   .rowscroll{display:grid;grid-auto-flow:column;grid-auto-columns:200px;gap:16px;overflow-x:auto;padding-bottom:8px;scrollbar-width:thin}
   .poster{background:var(--panel2);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;cursor:pointer;transition:transform .12s,border-color .12s;position:relative}
   .poster:hover{transform:translateY(-3px);border-color:var(--accent)}
-  .poster .art{aspect-ratio:2/3;width:100%;object-fit:cover;display:block;background:linear-gradient(160deg,#232838,#171a24)}
+  .poster .art{aspect-ratio:2/3;width:100%;object-fit:cover;display:block;background:var(--panel2)}
   .poster.wide .art{aspect-ratio:16/9}
   .poster .meta{padding:8px 10px}
   .poster .t{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .poster .s{font-size:12px;color:var(--muted)}
-  .poster .prog{position:absolute;left:0;right:0;bottom:0;height:4px;background:rgba(0,0,0,.5)}
-  .poster .prog>i{display:block;height:100%;background:var(--accent)}
-  .badge{position:absolute;top:8px;right:8px;background:rgba(0,0,0,.65);border-radius:6px;padding:2px 6px;font-size:11px}
+  .poster .prog{position:absolute;left:0;right:0;bottom:0;height:5px;background:rgba(0,0,0,.55)}
+  .poster .prog>i{display:block;height:100%;background:var(--accent);box-shadow:0 0 8px var(--accent)}
+  .badge{position:absolute;top:8px;right:8px;width:24px;height:24px;display:grid;place-items:center;
+    background:var(--good);color:#04120a;border-radius:50%;font-size:14px;font-weight:800;box-shadow:0 2px 6px rgba(0,0,0,.5)}
+  .amenu{position:absolute;top:38px;right:0;min-width:180px;background:var(--panel);border:1px solid var(--line);
+    border-radius:10px;padding:6px;display:none;z-index:40;box-shadow:0 12px 34px rgba(0,0,0,.45)}
+  .amenu.on{display:block}
+  .amenu button{display:block;width:100%;text-align:left;background:transparent;color:var(--text);border:0;padding:8px 10px;border-radius:7px;font-size:13px;font-weight:400}
+  .amenu button:hover{background:var(--panel2)}
+  .amenu button.sel{color:var(--accent);font-weight:600}
+  .amenu button.sel::before{content:"✓ "}
+  .amsec{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);padding:8px 10px 3px}
   .empty{color:var(--muted);padding:40px;text-align:center;border:1px dashed var(--line);border-radius:var(--radius)}
 
   .detail{display:grid;grid-template-columns:260px 1fr;gap:28px}
   .detail .poster{cursor:default}
   .detail .poster:hover{transform:none;border-color:var(--line)}
   .detail h1{margin:0 0 6px}
-  .overview{color:#cdd2df;max-width:70ch}
+  .overview{color:var(--prose);max-width:70ch}
   .filebox{margin-top:16px;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:14px}
   .kv{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
 
@@ -124,7 +135,7 @@
   .chip.res{color:#8fd0ff;border-color:#254458;background:#0f1e29}
   .actions{display:flex;gap:10px;flex-wrap:wrap;margin:20px 0 6px}
   .btnplay{font-size:15px;padding:11px 22px}
-  .overview{color:#cdd2df;max-width:72ch;margin:14px 0 0}
+  .overview{color:var(--prose);max-width:72ch;margin:14px 0 0}
 
   .version{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px;margin-top:14px}
   .version .vh{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:4px}
@@ -138,7 +149,7 @@
   .eprow{display:grid;grid-template-columns:150px minmax(0,1fr) auto;gap:16px;align-items:center;padding:12px;cursor:pointer;background:var(--panel);transition:background .1s}
   .eprow+.eprow{border-top:1px solid var(--line)}
   .eprow:hover{background:var(--panel2)}
-  .epthumb{aspect-ratio:16/9;width:150px;border-radius:8px;object-fit:cover;background:linear-gradient(160deg,#232838,#171a24);display:grid;place-items:center;color:#39415a;font-weight:800;font-size:20px;position:relative}
+  .epthumb{aspect-ratio:16/9;width:150px;border-radius:8px;object-fit:cover;background:var(--panel2);display:grid;place-items:center;color:var(--muted);font-weight:800;font-size:20px;position:relative}
   .epthumb .pbadge{position:absolute;left:0;right:0;bottom:0;height:4px;background:rgba(0,0,0,.5)}
   .epthumb .pbadge>i{display:block;height:100%;background:var(--accent)}
   .eptitle{font-weight:600}
@@ -154,6 +165,39 @@
   @media(max-width:720px){ .dwrap{grid-template-columns:1fr} .dwrap .poster{max-width:200px} .eprow{grid-template-columns:110px 1fr} .eprow .epplay{display:none} }
   .art.ph{display:grid;place-items:center;font-size:30px;font-weight:800;letter-spacing:.5px;color:#39415a;user-select:none}
 </style>
+<script>
+// Theme engine. Runs in <head> before first paint so there's no flash of the
+// wrong theme. A theme is a palette of CSS variables with a dark and light
+// variant; appearance (auto/dark/light) picks the variant, auto following the
+// OS and falling back to dark. Persisted in localStorage.
+"use strict";
+const FONT_UI="system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif";
+const FONT_MONO="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace";
+const THEMES={
+  classic:{name:"Classic",
+    dark:{"--bg":"#0e0f13","--panel":"#171922","--panel2":"#1e2230","--line":"#2a2f3e","--text":"#e8eaf0","--muted":"#9aa2b4","--accent":"#6ea8fe","--accent2":"#8b7cf6","--good":"#4ade80","--bad":"#f87171","--radius":"12px","--btn-ink":"#07101f","--prose":"#cdd2df","--font":FONT_UI},
+    light:{"--bg":"#f6f7f9","--panel":"#ffffff","--panel2":"#eef1f6","--line":"#dde2ea","--text":"#1a1d24","--muted":"#5b6472","--accent":"#2f6fe0","--accent2":"#6d5bd0","--good":"#1a9d5a","--bad":"#d64550","--radius":"12px","--btn-ink":"#ffffff","--prose":"#333a45","--font":FONT_UI}},
+  terminal:{name:"Terminal",
+    dark:{"--bg":"#0a0d0b","--panel":"#0f1411","--panel2":"#151d17","--line":"#213021","--text":"#d6e6d4","--muted":"#7f9079","--accent":"#3ddc84","--accent2":"#2bb673","--good":"#3ddc84","--bad":"#ff6b6b","--radius":"4px","--btn-ink":"#06140c","--prose":"#b9ccb7","--font":FONT_MONO},
+    light:{"--bg":"#f2f4ef","--panel":"#ffffff","--panel2":"#e9ede4","--line":"#d5dccb","--text":"#16211a","--muted":"#57664f","--accent":"#1a7f4b","--accent2":"#136139","--good":"#1a7f4b","--bad":"#c0392b","--radius":"4px","--btn-ink":"#ffffff","--prose":"#2a352b","--font":FONT_MONO}},
+};
+function resolveMode(app){
+  if(app==="light"||app==="dark") return app;
+  return (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";
+}
+function applyTheme(){
+  let id=null, app=null;
+  try{ id=localStorage.getItem("plurx_theme"); app=localStorage.getItem("plurx_appearance"); }catch(e){}
+  const theme=THEMES[id]||THEMES.classic;
+  const mode=resolveMode(app||"auto");
+  const vars=theme[mode]||theme.dark;
+  const root=document.documentElement;
+  for(const k in vars) root.style.setProperty(k, vars[k]);
+  root.dataset.theme=id||"classic"; root.dataset.mode=mode;
+}
+applyTheme();
+if(window.matchMedia){ try{ window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change",()=>{ if((localStorage.getItem("plurx_appearance")||"auto")==="auto") applyTheme(); }); }catch(e){} }
+</script>
 </head>
 <body>
 <div id="app"></div>
@@ -250,6 +294,10 @@ function chrome(active, inner){
      <span class="activity" id="activity" onclick="${ME&&ME.is_admin?"location.hash='#/settings'":""}"></span>
      <input class="search" id="q" placeholder="Search…" value="${esc(getQ())}">
      <span class="muted" style="font-size:13px">${esc(ME?ME.username:"")}</span>
+     <div style="position:relative">
+       <button class="ghost sm" onclick="toggleAppearanceMenu(event)" title="Theme & appearance">◐</button>
+       <div class="amenu" id="appmenu"></div>
+     </div>
      <button class="ghost sm" onclick="logout()">Sign out</button>
    </header><main id="main">${inner}</main>`;
   const q=document.getElementById("q");
@@ -257,6 +305,20 @@ function chrome(active, inner){
   pollActivity();
 }
 function getQ(){ const m=location.hash.match(/^#\/search\/(.*)$/); return m?decodeURIComponent(m[1]):""; }
+
+// ---- theme + appearance menu (per-user, header) ---------------------------
+function appMenuHtml(){
+  let theme="classic", app="auto";
+  try{ theme=localStorage.getItem("plurx_theme")||"classic"; app=localStorage.getItem("plurx_appearance")||"auto"; }catch(e){}
+  const themes=Object.keys(THEMES).map(id=>`<button class="${theme===id?'sel':''}" onclick="setTheme('${id}')">${esc(THEMES[id].name)}</button>`).join("");
+  const modes=[["auto","Auto (system)"],["light","Light"],["dark","Dark"]].map(([v,l])=>`<button class="${app===v?'sel':''}" onclick="setAppearance('${v}')">${l}</button>`).join("");
+  return `<div class="amsec">Theme</div>${themes}<div class="amsec">Appearance</div>${modes}`;
+}
+function toggleAppearanceMenu(e){ if(e) e.stopPropagation(); const m=document.getElementById("appmenu"); if(!m) return;
+  const open=!m.classList.contains("on"); m.classList.toggle("on",open); if(open) m.innerHTML=appMenuHtml(); }
+function setTheme(id){ try{localStorage.setItem("plurx_theme",id)}catch(e){} applyTheme(); const m=document.getElementById("appmenu"); if(m) m.innerHTML=appMenuHtml(); }
+function setAppearance(v){ try{localStorage.setItem("plurx_appearance",v)}catch(e){} applyTheme(); const m=document.getElementById("appmenu"); if(m) m.innerHTML=appMenuHtml(); }
+document.addEventListener("click",()=>{ const m=document.getElementById("appmenu"); if(m) m.classList.remove("on"); });
 
 // ---- global activity indicator --------------------------------------------
 // Always-visible pill: whatever the server is doing right now (scans,
