@@ -447,8 +447,13 @@ impl MediaStore for SqliteStore {
 
     async fn files_for_item(&self, item_id: i64) -> Result<Vec<MediaFile>, StoreError> {
         self.with_conn(move |conn| {
+            // Best version first: an item can have several source files (a 4K
+            // and a 1080p rip of the same movie). Order by resolution, then
+            // bitrate, so clients default to the highest quality; SQLite
+            // sorts NULLs last under DESC.
             let mut stmt = conn.prepare(&format!(
-                "SELECT {FILE_COLS} FROM files WHERE item_id = ?1 ORDER BY path"
+                "SELECT {FILE_COLS} FROM files WHERE item_id = ?1
+                 ORDER BY height DESC, bitrate DESC, path"
             ))?;
             let files = stmt
                 .query_map(params![item_id], file_from_row)?
