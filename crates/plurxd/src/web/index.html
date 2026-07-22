@@ -130,6 +130,9 @@
   .epmeta{color:var(--muted);font-size:12px;margin-top:3px;display:flex;gap:8px;flex-wrap:wrap;align-items:center}
   .epov{color:var(--muted);font-size:12.5px;margin-top:6px;max-width:80ch;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
   .epwatched{color:var(--good)}
+  .filemissing{margin-top:16px;background:#2a1416;border:1px solid #5a2a2e;color:#f7b6ba;border-radius:10px;padding:12px 14px;font-size:13px}
+  .filemissing code{background:rgba(0,0,0,.3);padding:1px 5px;border-radius:4px;font-size:12px}
+  .missbadge{display:inline-block;background:#5a2a2e;color:#f7b6ba;font-size:10px;padding:1px 6px;border-radius:5px;vertical-align:middle;margin-left:6px;text-transform:uppercase;letter-spacing:.05em}
   .art.ph.season{background:linear-gradient(160deg,#2b3350,#141826);flex-direction:column;gap:1px}
   .art.ph.season .snum{font-size:38px;line-height:1}
   .art.ph.season .sl{font-size:10px;letter-spacing:.18em;color:#8891ab;text-transform:uppercase;font-weight:700}
@@ -316,21 +319,31 @@ async function viewItem(id){
   right+=`<h1>${esc(it.title)}</h1><div class="row muted">${[it.year,fmtDur(runtime),it.kind].filter(Boolean).map(x=>`<span>${esc(String(x))}</span>`).join(" · ")}</div>`;
   if(it.overview) right+=`<p class="overview">${esc(it.overview)}</p>`;
 
-  // Movie / episode: play button + versions. Show/season: children grid.
+  // Movie / episode: play the best *available* version. Show/season: children.
   if(d.files.length){
-    const f=d.files[0]; // best version first (server sorts by resolution)
     const resume = it.watch&&it.watch.position_ms>3000&&!it.watch.watched? it.watch.position_ms:0;
-    right+=`<div class="row" style="margin-top:16px">
-      <button onclick='play(${f.id},${JSON.stringify(it.title)},${resume},${f.duration_ms||0})'>▶ ${resume?`Resume (${fmtDur(resume)})`:'Play'}</button>
-      ${resume?`<button class="ghost" onclick='play(${f.id},${JSON.stringify(it.title)},0,${f.duration_ms||0})'>Start over</button>`:''}
-      <button class="ghost sm" id="wb" onclick="toggleWatched(${it.id}, ${it.watch&&it.watch.watched?1:0})">${it.watch&&it.watch.watched?'Mark unwatched':'Mark watched'}</button>
-    </div>`;
+    const watchBtn = `<button class="ghost sm" onclick="toggleWatched(${it.id}, ${it.watch&&it.watch.watched?1:0})">${it.watch&&it.watch.watched?'Mark unwatched':'Mark watched'}</button>`;
+    const playable = d.files.find(f=>f.available);   // best-first; skip missing
+    if(playable){
+      right+=`<div class="row" style="margin-top:16px">
+        <button onclick='play(${playable.id},${JSON.stringify(it.title)},${resume},${playable.duration_ms||0})'>▶ ${resume?`Resume (${fmtDur(resume)})`:'Play'}</button>
+        ${resume?`<button class="ghost" onclick='play(${playable.id},${JSON.stringify(it.title)},0,${playable.duration_ms||0})'>Start over</button>`:''}
+        ${watchBtn}
+      </div>`;
+    } else {
+      // Nothing on disk — say so plainly and don't offer a dead Play button.
+      const p = d.files[0].missing_path;
+      right+=`<div class="filemissing">⚠ This file is missing on the server, so it can’t be played — its library path may be unmounted, moved, or renamed${ME.is_admin&&p?`:<br><code>${esc(p)}</code>`:'.'}</div>
+        <div class="row" style="margin-top:12px">${watchBtn}</div>`;
+    }
     const multi=d.files.length>1;
     const rows=d.files.map(v=>{
       const parts=[v.height&&`${v.height}p`,v.video_codec,v.hdr,(v.audio_streams[0]||{}).codec,v.container,fmtSize(v.size),fmtDur(v.duration_ms)].filter(Boolean);
-      return `<div class="verrow"><div style="min-width:0"><div class="muted" style="font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(v.filename)}</div>
-        <div class="kv">${parts.map(c=>`<span class="pill">${esc(String(c))}</span>`).join("")}</div></div>
-        ${multi?`<button class="ghost sm" style="flex:none" onclick='play(${v.id},${JSON.stringify(it.title)},${resume},${v.duration_ms||0})'>▶ Play</button>`:""}</div>`;
+      const miss=!v.available;
+      return `<div class="verrow"><div style="min-width:0"><div class="muted" style="font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(v.filename)}${miss?'<span class="missbadge">missing</span>':''}</div>
+        <div class="kv">${parts.map(c=>`<span class="pill">${esc(String(c))}</span>`).join("")}</div>
+        ${miss&&ME.is_admin&&v.missing_path?`<div class="problem">${esc(v.missing_path)}</div>`:''}</div>
+        ${miss?'':(multi?`<button class="ghost sm" style="flex:none" onclick='play(${v.id},${JSON.stringify(it.title)},${resume},${v.duration_ms||0})'>▶ Play</button>`:"")}</div>`;
     }).join("");
     right+=`<div class="filebox">${multi?`<div class="muted" style="font-size:12px;margin-bottom:2px">${d.files.length} versions</div>`:""}${rows}</div>`;
   }

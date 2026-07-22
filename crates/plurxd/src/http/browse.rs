@@ -133,6 +133,23 @@ pub async fn item_detail(
         _ => Vec::new(),
     };
 
+    // Check each file actually resolves on disk right now, so the client can
+    // refuse to "play" a file that's missing (unmounted share, moved file,
+    // wrong container mount) instead of opening a dead player. One stat per
+    // file — cheap for the handful a movie/episode has. Admins also get the
+    // full path back so they can see what to fix.
+    let mut file_dtos: Vec<FileDto> = Vec::with_capacity(files.len());
+    for f in files {
+        let path = f.path.clone();
+        let available = tokio::fs::metadata(&path).await.is_ok();
+        let mut dto = FileDto::from(f);
+        dto.available = available;
+        if !available && user.is_admin {
+            dto.missing_path = Some(path.to_string_lossy().into_owned());
+        }
+        file_dtos.push(dto);
+    }
+
     // Annotate the item and its children with watch state in one lookup.
     let mut all = children.clone();
     all.push(item.clone());
@@ -143,7 +160,7 @@ pub async fn item_detail(
         item: item_dto,
         ancestors: ancestors.into_iter().map(Into::into).collect(),
         children: annotate(children, &watch),
-        files: files.into_iter().map(Into::into).collect(),
+        files: file_dtos,
     }))
 }
 

@@ -74,6 +74,15 @@ pub async fn decision(
     Query(q): Query<DecisionQuery>,
 ) -> Result<Json<DecisionResponse>, ApiError> {
     let file = load_file(&state, id).await?;
+    // Never hand back a play URL for a file that isn't on disk — the client
+    // would open a player that can never load (the unmounted-share case).
+    if tokio::fs::metadata(&file.path).await.is_err() {
+        return Err(ApiError::Conflict(
+            "this media file is missing on the server — its library path may be \
+             unmounted, moved, or renamed"
+                .into(),
+        ));
+    }
     let profile = q
         .profile
         .as_deref()

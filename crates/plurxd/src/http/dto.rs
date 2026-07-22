@@ -119,6 +119,15 @@ pub struct FileDto {
     pub bitrate: Option<i64>,
     pub audio_streams: Vec<AudioStream>,
     pub subtitle_streams: Vec<SubtitleStream>,
+    /// Whether the file is actually readable on the server right now. `false`
+    /// means the path no longer resolves (unmounted share, moved/deleted file,
+    /// wrong container mount) — the client shows this and refuses to "play"
+    /// something that isn't there. Set by the handler, not from the row.
+    pub available: bool,
+    /// Full server-side path, shown to admins when a file is missing so they
+    /// can fix the mount. Only populated for missing files.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub missing_path: Option<String>,
 }
 
 impl From<MediaFile> for FileDto {
@@ -143,6 +152,8 @@ impl From<MediaFile> for FileDto {
             bitrate: f.bitrate,
             audio_streams: f.audio_streams,
             subtitle_streams: f.subtitle_streams,
+            available: true,
+            missing_path: None,
         }
     }
 }
