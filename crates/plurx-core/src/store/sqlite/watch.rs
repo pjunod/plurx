@@ -78,10 +78,27 @@ impl WatchStore for SqliteStore {
         duration_ms: Option<i64>,
     ) -> Result<WatchState, StoreError> {
         self.with_conn(move |conn| {
+            // The client's idea of duration is untrustworthy: progressive
+            // remux and growing HLS playlists report a duration that climbs
+            // as data arrives, so position/duration would cross the watched
+            // threshold after five minutes of a two-hour film. The probe
+            // duration recorded at scan time is authoritative; the client's
+            // number is only a fallback for files ffprobe couldn't time.
+            let known: Option<i64> = conn
+                .query_row(
+                    "SELECT duration_ms FROM files
+                     WHERE item_id = ?1 AND duration_ms IS NOT NULL AND duration_ms > 0
+                     ORDER BY duration_ms DESC LIMIT 1",
+                    params![item_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let effective = known.or(duration_ms).filter(|d| *d > 0);
+
             // Auto-mark watched past the threshold; never un-watch here.
-            let watched = match duration_ms {
-                Some(d) if d > 0 => (position_ms as f64 / d as f64) >= WATCHED_THRESHOLD,
-                _ => false,
+            let watched = match effective {
+                Some(d) => (position_ms as f64 / d as f64) >= WATCHED_THRESHOLD,
+                None => false,
             };
             let state = conn.query_row(
                 "INSERT INTO watch_state (user_id, item_id, position_ms, duration_ms, watched, updated_at)
@@ -92,7 +109,7 @@ impl WatchStore for SqliteStore {
                      watched = watch_state.watched OR excluded.watched,
                      updated_at = unixepoch()
                  RETURNING position_ms, duration_ms, watched, updated_at",
-                params![user_id, item_id, position_ms, duration_ms, watched as i64],
+                params![user_id, item_id, position_ms, effective, watched as i64],
                 |row| watch_from_row(row, 0),
             )?;
             Ok(state)
@@ -291,6 +308,59 @@ mod tests {
             .expect("present");
         assert!(!ws.watched);
         assert_eq!(ws.position_ms, 0);
+    }
+
+    #[tokio::test]
+    async fn probe_duration_beats_client_duration() {
+        let store = SqliteStore::open_in_memory().expect("open");
+        let user = store.create_user("u", "h", true).await.expect("user");
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "M".into(),
+                kind: LibraryKind::Movies,
+                paths: vec![],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+        let movie = store
+            .insert_item(&NewItem {
+                library_id: lib.id,
+                kind: ItemKind::Movie,
+                parent_id: None,
+                title: "Heat".into(),
+                year: Some(1995),
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("movie");
+        // The scan recorded the real runtime: 100 minutes.
+        let probe = crate::domain::ProbeResult {
+            duration_ms: Some(6_000_000),
+            ..Default::default()
+        };
+        store
+            .upsert_file(movie, "/m/Heat (1995).mkv", 1, 1, &probe)
+            .await
+            .expect("file");
+
+        // A progressive remux reports a *growing* duration: five minutes in,
+        // the client says duration ≈ position. Trusting it would mark the
+        // film watched at 5/100 minutes. The probe duration must win.
+        let state = store
+            .put_progress(user.id, movie, 300_000, Some(301_000))
+            .await
+            .expect("progress");
+        assert!(!state.watched, "5 of 100 minutes is not watched");
+        assert_eq!(state.duration_ms, Some(6_000_000), "server duration wins");
+
+        // Real completion still auto-marks watched, client duration or not.
+        let state = store
+            .put_progress(user.id, movie, 5_800_000, None)
+            .await
+            .expect("progress");
+        assert!(state.watched);
     }
 
     #[tokio::test]
