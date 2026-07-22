@@ -555,7 +555,14 @@ async fn remux(
         cmd.args(["-c:a", "copy"]);
     }
     // Fragmented MP4 so it streams without a seekable output.
+    // `-avoid_negative_ts make_zero` normalizes the first timestamp to zero: a
+    // source container that starts at a non-zero (or negative) PTS — very common
+    // in MKV remuxes — otherwise yields a first fragment with a non-zero
+    // baseMediaDecodeTime that some browsers sit on forever (gray screen, no
+    // error). Harmless when the input already starts at zero.
     cmd.args([
+        "-avoid_negative_ts",
+        "make_zero",
         "-movflags",
         "frag_keyframe+empty_moov+default_base_moof",
         "-f",

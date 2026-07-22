@@ -469,7 +469,15 @@ function fmtMbps(bps){ return bps? (bps>=1000000? (bps/1000000).toFixed(bps>=100
 function audioLabel(a){ return [a.codec&&a.codec.toUpperCase(), fmtChannels(a.channels), a.language].filter(Boolean).join(" · "); }
 // Video-type badges from a file's probed specs. hdr_format carries the rich
 // label (Dolby Vision profile etc.); DV gets its own gold badge.
-function resLabel(h){ return !h?null:h>=2160?'4K':h>=1080?'1080p':h>=720?'720p':h>=480?'480p':h+'p'; }
+// Key off WIDTH primarily: scope/'Scope 4K is only ~1600–2076 tall (3840×2076),
+// so a height-only test wrongly calls it 1080p.
+function resLabel(w,h){ w=w||0; h=h||0;
+  if(w>=3000||h>=1700) return '4K';
+  if(w>=2000||h>=1300) return '1440p';
+  if(w>=1400||h>=900) return '1080p';
+  if(w>=1000||h>=650) return '720p';
+  if(w>=600||h>=400) return '480p';
+  return h?h+'p':null; }
 function codecLabel(c){ if(!c) return null; return ({hevc:'HEVC',h265:'HEVC',h264:'H.264',avc1:'H.264',av1:'AV1',vp9:'VP9',vc1:'VC-1',mpeg2video:'MPEG-2'})[c.toLowerCase()]||c.toUpperCase(); }
 function hdrChip(f){ if(f.hdr_format) return {cls:(f.hdr==='dolby_vision'?'dv':'hdr'),text:f.hdr_format};
   if(f.hdr) return {cls:(f.hdr==='dolby_vision'?'dv':'hdr'),text:hdrLabel(f.hdr)}; return null; }
@@ -480,7 +488,7 @@ function premiumAudio(f){ const cs=(f.audio_streams||[]).map(a=>(a.codec||'').to
   return null; }
 function specBadges(f){
   const b=[];
-  const r=resLabel(f.height); if(r) b.push(`<span class="vbadge res">${r}</span>`);
+  const r=resLabel(f.width,f.height); if(r) b.push(`<span class="vbadge res">${r}</span>`);
   const c=codecLabel(f.video_codec); if(c) b.push(`<span class="vbadge codec">${esc(c)}</span>`);
   if(f.bit_depth>=10) b.push(`<span class="vbadge depth">${f.bit_depth}-bit</span>`);
   const h=hdrChip(f); if(h) b.push(`<span class="vbadge ${h.cls}">${esc(h.text)}</span>`);
@@ -621,7 +629,7 @@ async function play(fileId, title, resumeMs, knownDurMs){
     audio:decision.audio||[], subs:(decision.subtitles||[]).filter(s=>s.text),
     curAudio:(decision.audio||[]).findIndex(a=>a.default), curSub:-1,
     markers:(decision.markers||[]).map(m=>({...m})), source:src, started:false,
-    idleTimer:null, autoskip:autoskipOn()};
+    idleTimer:null, autoskip:autoskipOn(), stallTimer:null, probeUrl:null};
   if(PLAYER.curAudio<0) PLAYER.curAudio=0;
   setupAirplay(video);
   setupTrackMenus();
@@ -638,8 +646,9 @@ async function play(fileId, title, resumeMs, knownDurMs){
     PLAYER.offset = info.start_seconds||0;
     PLAYER.encoder = info.encoder||null;
     setLoading(true,"Preparing the stream…",(PLAYER.encoder?("encoder: "+PLAYER.encoder+" — "):"")+"buffering the first segments");
+    PLAYER.probeUrl=info.playlist_url; armStall();
     if(!nativeHls && window.Hls && Hls.isSupported()){
-      const hls=new Hls({xhrSetup:x=>{ if(TOKEN) x.setRequestHeader("authorization","Bearer "+TOKEN); }});
+      const hls=new Hls({enableWorker:false,xhrSetup:x=>{ if(TOKEN) x.setRequestHeader("authorization","Bearer "+TOKEN); }});
       PLAYER.hls=hls;
       hls.loadSource(info.playlist_url);
       hls.attachMedia(video);
@@ -657,6 +666,7 @@ async function play(fileId, title, resumeMs, knownDurMs){
       isRemux?"remuxing to a browser-friendly container":"direct play — no conversion needed");
     let url=tok(decision.play_url);
     if(isRemux){ PLAYER.offset=startSec; if(startSec>0) url+="&start="+startSec.toFixed(1); }
+    if(isRemux){ PLAYER.probeUrl=decision.play_url; armStall(); }
     video.src=url;
     video.onloadedmetadata=()=>{ if(!isRemux && startSec>0){ try{video.currentTime=startSec}catch(e){} } };
     video.play().catch(()=>{});
@@ -682,6 +692,49 @@ function setupAirplay(video){
   } else { btn.style.display="none"; }
 }
 function teardownHls(){ if(PLAYER&&PLAYER.hls){ try{PLAYER.hls.destroy()}catch(e){} PLAYER.hls=null; } }
+
+// ---- stall self-diagnosis --------------------------------------------------
+// A remux/transcode that never fires `playing` used to sit on a mystery gray
+// screen forever. If nothing has started after a generous grace, probe the
+// actual stream URL and turn the blank overlay into a specific verdict:
+// blocked-by-extension vs server-error vs reaches-browser-but-won't-decode.
+function clearStall(){ if(PLAYER&&PLAYER.stallTimer){ clearTimeout(PLAYER.stallTimer); PLAYER.stallTimer=null; } }
+function armStall(){ clearStall(); if(!PLAYER) return; PLAYER.stallTimer=setTimeout(()=>stallDiagnose().catch(()=>{}), 40000); }
+async function stallDiagnose(){
+  const v=document.getElementById("video");
+  if(!PLAYER || PLAYER.started || (v&&v.currentTime>0.2)) return;   // it actually started — never mind
+  const hdrs={}; if(TOKEN) hdrs["authorization"]="Bearer "+TOKEN;
+  const url=PLAYER.probeUrl;
+  let verdict="Playback hasn't started.", detail="Open Settings → Logs and read the last plurxd::stream / transcode line.";
+  if(url){
+    try{
+      const ctl=new AbortController();
+      const res=await fetch(url,{headers:hdrs,signal:ctl.signal});
+      const status=res.status;
+      let segState=null;   // 'blocked' | number(status) | null(n/a)
+      if(PLAYER.method==='transcode'){
+        try{
+          const txt=await res.text();
+          const seg=(txt.split('\n').find(l=>l&&!l.startsWith('#')&&/\.ts(\?|$)/.test(l))||"").trim();
+          if(seg){ const segUrl=(seg[0]==='/'||/^https?:/.test(seg))?seg:url.replace(/[^/]*$/,seg);
+            const r2=await fetch(segUrl,{headers:hdrs}); segState=r2.status; try{r2.body&&r2.body.cancel&&r2.body.cancel();}catch(e){} }
+        }catch(e){ segState='blocked'; }
+      } else { try{ctl.abort();}catch(e){} }    // remux: don't drain the pipe, kill_on_drop stops ffmpeg
+      const serverErr = status>=500 || (typeof segState==='number'&&segState>=500);
+      const reached   = status>=200 && status<400 && segState!=='blocked' && !(typeof segState==='number'&&segState>=400);
+      if(serverErr){ verdict="The server couldn't build the stream."; detail="ffmpeg failed on this file — open Settings → Logs and read the last remux/transcode line, it names the real cause."; }
+      else if(reached){ verdict="The stream reaches the browser but won't play."; detail="Usually a codec this browser can't decode, or an extension interfering. Try a private window with extensions off; if it still fails, the ffmpeg line in Settings → Logs will say why."; }
+      else { verdict="The stream request looks blocked."; detail="A privacy/ad-blocker extension is the usual cause — it eats /stream.mp4 and /hls/*.ts requests. Open in a private window with extensions disabled, or allowlist this site, then play again."; }
+    }catch(e){
+      verdict="The stream request was blocked before it reached the server.";
+      detail="A browser privacy or ad-blocker extension is the usual cause (it silently drops /stream.mp4 and /hls/ requests). Open in a private window with extensions disabled, or allowlist this site.";
+    }
+  }
+  console.warn("[cinemarr] playback stall diagnosis",{method:PLAYER.method,url,networkState:v&&v.networkState,readyState:v&&v.readyState,error:v&&v.error&&v.error.code,verdict});
+  if(PLAYER.started) return;   // raced with a late start
+  setLoading(true, verdict, detail);
+  toast(verdict);
+}
 
 // ---- loading status, projection chrome, skip intro/credits ----------------
 // A staged loading overlay replaces the old mystery gray screen: the user sees
@@ -709,11 +762,11 @@ function wirePlayer(){
   const p=document.getElementById("player"), v=document.getElementById("video");
   if(!p||!v) return;
   ["mousemove","pointerdown","touchstart","keydown"].forEach(ev=>p.addEventListener(ev,playerActivity));
-  v.addEventListener("playing",()=>{ PLAYER.started=true; setLoading(false); playerActivity(); });
+  v.addEventListener("playing",()=>{ PLAYER.started=true; clearStall(); setLoading(false); playerActivity(); });
   v.addEventListener("canplay",()=>{ if(PLAYER.started) setLoading(false); });
   v.addEventListener("waiting",()=>{ if(PLAYER.started) setLoading(true,"Buffering…",""); });
   v.addEventListener("pause",()=>{ p.classList.remove("idle"); });
-  v.addEventListener("error",()=>{ setLoading(false); if(PLAYER&&!PLAYER.started) toast("Couldn't start playback — the server may not be able to transcode this file. See Settings → Logs."); });
+  v.addEventListener("error",()=>{ clearStall(); setLoading(false); if(PLAYER&&!PLAYER.started) toast("Couldn't start playback — the server may not be able to transcode this file. See Settings → Logs."); });
   v.addEventListener("timeupdate",checkMarkers);
 }
 function markerNowMs(){ const v=document.getElementById("video"); return ((PLAYER.offset||0)+(v?v.currentTime||0:0))*1000; }
@@ -762,7 +815,7 @@ async function seekTo(targetSec){
     let info; try{ info=await api(`/files/${PLAYER.fileId}/hls/start?height=720&start=${targetSec.toFixed(1)}&audio=${aidx}`);}catch(e){ setLoading(false); return toast(e.message); }
     PLAYER.offset=info.start_seconds||0; PLAYER.encoder=info.encoder||null;
     const nativeHls=v.canPlayType('application/vnd.apple.mpegurl');
-    if(!nativeHls && window.Hls && Hls.isSupported()){ const hls=new Hls({xhrSetup:x=>{if(TOKEN)x.setRequestHeader("authorization","Bearer "+TOKEN);}}); PLAYER.hls=hls; hls.loadSource(info.playlist_url); hls.attachMedia(v); hls.on(Hls.Events.MANIFEST_PARSED,()=>v.play().catch(()=>{})); }
+    if(!nativeHls && window.Hls && Hls.isSupported()){ const hls=new Hls({enableWorker:false,xhrSetup:x=>{if(TOKEN)x.setRequestHeader("authorization","Bearer "+TOKEN);}}); PLAYER.hls=hls; hls.loadSource(info.playlist_url); hls.attachMedia(v); hls.on(Hls.Events.MANIFEST_PARSED,()=>v.play().catch(()=>{})); }
     else { v.src=tok(info.playlist_url); v.play().catch(()=>{}); }
   } else {
     PLAYER.method='remux'; PLAYER.offset=targetSec;
@@ -834,7 +887,7 @@ async function switchAudio(idx){
     let info; try{ info=await api(`/files/${PLAYER.fileId}/hls/start?height=720&start=${pos.toFixed(1)}&audio=${aidx}`);}catch(e){ return toast(e.message); }
     PLAYER.offset=info.start_seconds||0; PLAYER.encoder=info.encoder||null;
     const nativeHls=v.canPlayType('application/vnd.apple.mpegurl');
-    if(!nativeHls && window.Hls && Hls.isSupported()){ const hls=new Hls({xhrSetup:x=>{if(TOKEN)x.setRequestHeader("authorization","Bearer "+TOKEN);}}); PLAYER.hls=hls; hls.loadSource(info.playlist_url); hls.attachMedia(v); hls.on(Hls.Events.MANIFEST_PARSED,()=>v.play().catch(()=>{})); }
+    if(!nativeHls && window.Hls && Hls.isSupported()){ const hls=new Hls({enableWorker:false,xhrSetup:x=>{if(TOKEN)x.setRequestHeader("authorization","Bearer "+TOKEN);}}); PLAYER.hls=hls; hls.loadSource(info.playlist_url); hls.attachMedia(v); hls.on(Hls.Events.MANIFEST_PARSED,()=>v.play().catch(()=>{})); }
     else { v.src=tok(info.playlist_url); v.play().catch(()=>{}); }
   } else {
     // Switching audio forces a remux so the chosen track is the one delivered.
@@ -915,7 +968,7 @@ function closePlayer(){
   const video=document.getElementById("video");
   if(PLAYER.fileId) reportProgress(PLAYER.fileId);
   clearInterval(PLAYER.timer); clearInterval(STATS_TIMER); STATS_TIMER=null; teardownHls();
-  clearTimeout(PLAYER.idleTimer); setLoading(false);
+  clearStall(); clearTimeout(PLAYER.idleTimer); setLoading(false);
   const ov=document.getElementById("statsov"); if(ov) ov.classList.remove("on");
   const pm=document.getElementById("pmenu"); if(pm) pm.classList.remove("on");
   const sk=document.getElementById("pskip"); if(sk){ sk.innerHTML=""; sk.dataset.k=""; }
