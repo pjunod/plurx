@@ -16,6 +16,7 @@ mod libraries;
 mod plex;
 mod stream;
 mod system;
+mod trakt;
 mod users;
 mod watch;
 mod web;
@@ -42,6 +43,17 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/scan/status", get(system::scan_status))
         .route("/activity", get(system::activity))
+        .route("/activity/detail", get(system::activity_detail))
+        .route(
+            "/activity/sessions/{id}",
+            axum::routing::delete(system::stop_session),
+        )
+        .route("/trakt/status", get(trakt::status))
+        .route(
+            "/trakt/link",
+            post(trakt::link).delete(trakt::unlink),
+        )
+        .route("/trakt/sync", post(trakt::sync_now))
         .route("/system", get(system::system_info))
         .route("/system/logs", get(system::logs))
         // Users (admin)
@@ -66,6 +78,7 @@ pub fn router(state: AppState) -> Router {
         .route("/items/{id}/unscrobble", post(watch::unscrobble))
         // Playback
         .route("/files/{id}/decision", get(stream::decision))
+        .route("/files/{id}/audio-offset", put(stream::set_audio_offset))
         .route("/files/{id}/direct", get(stream::direct))
         .route("/files/{id}/stream.mp4", get(stream::stream_mp4))
         .route("/files/{id}/subs/{index}", get(stream::subtitles_vtt))

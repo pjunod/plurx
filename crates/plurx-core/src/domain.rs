@@ -217,6 +217,10 @@ pub struct MediaFile {
     pub audio_streams: Vec<AudioStream>,
     pub subtitle_streams: Vec<SubtitleStream>,
     pub scanned_at: i64,
+    /// Manual A/V sync correction, milliseconds; positive delays audio.
+    /// Applied server-side at stream time (forces remux for direct-play
+    /// sources). Persisted per file — a bad mux stays fixed. 0 = none.
+    pub audio_offset_ms: i64,
 }
 
 /// Everything the prober learned about one file.
@@ -307,6 +311,23 @@ impl ItemSort {
 pub struct ItemPage {
     pub items: Vec<Item>,
     pub total: i64,
+}
+
+/// A user's linked Trakt account (tokens + sync bookkeeping).
+#[derive(Debug, Clone)]
+pub struct TraktAuth {
+    pub user_id: i64,
+    pub access_token: String,
+    pub refresh_token: String,
+    /// Unix seconds when the access token expires (refresh happens earlier).
+    pub expires_at: i64,
+    pub trakt_username: Option<String>,
+    pub connected_at: i64,
+    /// Unix seconds of the last completed sync run (0 = never).
+    pub last_sync_at: i64,
+    /// Raw `/sync/last_activities` JSON from the last run — an opaque change
+    /// gate: identical JSON and nothing local to push means the pull can skip.
+    pub last_activities: Option<String>,
 }
 
 #[cfg(test)]

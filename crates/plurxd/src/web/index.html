@@ -154,6 +154,10 @@
   .log-DEBUG,.log-TRACE{color:var(--muted)}
   .verrow{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:9px 0}
   .verrow+.verrow{border-top:1px solid var(--line)}
+  /* Trakt device-link code: big, mono, unmissable — you type it on another screen */
+  .traktcode{font-family:var(--font-mono);font-size:34px;font-weight:700;letter-spacing:.18em;color:var(--accent);margin:10px 0 2px;user-select:all}
+  .syncnow{padding:6px 10px 2px;font-size:13px;font-weight:600}
+  .syncnow .hint{margin-top:2px}
   .crumbs{font-size:13px;color:var(--muted);margin:0 0 16px;display:flex;gap:8px;flex-wrap:wrap;align-items:center}
   .crumbs .sep{opacity:.45}
   .crumbs .cur{color:var(--text)}
@@ -414,7 +418,7 @@ if(window.matchMedia){ try{ window.matchMedia("(prefers-color-scheme: dark)").ad
 </head>
 <body>
 <div id="app"></div>
-<div class="modal" id="modal"><div class="player" id="player"><video id="video" controls autoplay playsinline x-webkit-airplay="allow"></video><div class="pbar" id="pbar"><div class="ptitle" id="playTitle"></div><div class="row"><button class="pbtn" id="audiobtn" style="display:none" onclick="toggleMenu('audio')">🔊 Audio</button><button class="pbtn" id="subsbtn" style="display:none" onclick="toggleMenu('subs')">💬 Subtitles</button><button class="pbtn" id="statsbtn" title="Playback info (i)" onclick="toggleStats()">ⓘ Stats</button><button class="pbtn" id="skipbtn" title="Auto-skip intro & credits" onclick="togglePlayerAutoskip()">⏭ Auto-skip</button><button class="pbtn" id="apbtn" style="display:none" title="AirPlay">📺 AirPlay</button><button class="pbtn" title="Close (Esc)" onclick="closePlayer()">✕ Close</button></div></div><div class="pskip" id="pskip"></div><div class="ploading" id="ploading"><div class="pspin"></div><div class="ploadText" id="ploadText">Loading…</div><div class="ploadSub" id="ploadSub"></div></div><div class="statsov" id="statsov"></div><div class="pmenu" id="pmenu"></div></div></div>
+<div class="modal" id="modal"><div class="player" id="player"><video id="video" controls autoplay playsinline x-webkit-airplay="allow"></video><div class="pbar" id="pbar"><div class="ptitle" id="playTitle"></div><div class="row"><button class="pbtn" id="audiobtn" style="display:none" onclick="toggleMenu('audio')">🔊 Audio</button><button class="pbtn" id="subsbtn" style="display:none" onclick="toggleMenu('subs')">💬 Subtitles</button><button class="pbtn" id="syncbtn" title="Audio sync adjustment" onclick="toggleMenu('sync')">⇄ Sync</button><button class="pbtn" id="statsbtn" title="Playback info (i)" onclick="toggleStats()">ⓘ Stats</button><button class="pbtn" id="skipbtn" title="Auto-skip intro & credits" onclick="togglePlayerAutoskip()">⏭ Auto-skip</button><button class="pbtn" id="apbtn" style="display:none" title="AirPlay">📺 AirPlay</button><button class="pbtn" title="Close (Esc)" onclick="closePlayer()">✕ Close</button></div></div><div class="pskip" id="pskip"></div><div class="ploading" id="ploading"><div class="pspin"></div><div class="ploadText" id="ploadText">Loading…</div><div class="ploadSub" id="ploadSub"></div></div><div class="statsov" id="statsov"></div><div class="pmenu" id="pmenu"></div></div></div>
 <div class="toast" id="toast"></div>
 
 <script src="/assets/hls.min.js"></script>
@@ -502,9 +506,9 @@ function chrome(active, inner){
   document.getElementById("app").innerHTML=`
    <header class="top">
      ${back}<a href="#/" class="logo">${APP_NAME}</a>
-     <nav><a href="#/" class="${active==='home'?'active':''}">Home</a>${admin}</nav>
+     <nav><a href="#/" class="${active==='home'?'active':''}">Home</a><a href="#/activity" class="${active==='activity'?'active':''}">Activity</a>${admin}</nav>
      <span class="spacer"></span>
-     <span class="activity" id="activity" onclick="${ME&&ME.is_admin?"location.hash='#/settings'":""}"></span>
+     <span class="activity" id="activity" onclick="location.hash='#/activity'"></span>
      <input class="search" id="q" placeholder="Search…" value="${esc(getQ())}">
      <span class="muted" style="font-size:13px">${esc(ME?ME.username:"")}</span>
      <div style="position:relative">
@@ -838,12 +842,18 @@ async function play(fileId, title, resumeMs, knownDurMs){
     audio:decision.audio||[], subs:(decision.subtitles||[]).filter(s=>s.text),
     curAudio:(decision.audio||[]).findIndex(a=>a.default), curSub:-1,
     markers:(decision.markers||[]).map(m=>({...m})), source:src, started:false,
-    idleTimer:null, autoskip:autoskipOn(), stallTimer:null, probeUrl:null, triedFallback:false};
+    idleTimer:null, autoskip:autoskipOn(), stallTimer:null, probeUrl:null, triedFallback:false,
+    aoffset:decision.audio_offset_ms||0, declared:decision.declared_offset_ms||0,
+    title, };
   if(PLAYER.curAudio<0) PLAYER.curAudio=0;
   setupAirplay(video);
   setupTrackMenus();
   renderSkip(null);
   const sb=document.getElementById("skipbtn"); if(sb) sb.classList.toggle("on", PLAYER.autoskip);
+  // Server-chosen default subtitle (Settings → Playback defaults / anime rule).
+  // Native <track> subs ride direct/remux only; transcode burns them instead.
+  const defSub=PLAYER.subs.find(s=>s.default);
+  if(defSub && decision.method!=='transcode'){ setTimeout(()=>{ if(PLAYER.fileId===fileId) setSub(defSub.index); }, 400); }
 
   if(decision.method==='transcode'){
     // Transcode: start an HLS session (server re-encodes + tone-maps).
@@ -1076,11 +1086,49 @@ function toggleMenu(kind){
   m.dataset.kind=kind;
   if(kind==="audio"){
     m.innerHTML=PLAYER.audio.map((a,i)=>`<button class="${PLAYER.curAudio===i?'sel':''}" onclick="switchAudio(${i})">${esc(audioLabelMenu(a,i))}</button>`).join("");
+  } else if(kind==="sync"){
+    m.innerHTML=syncMenuHtml();
   } else {
     m.innerHTML=`<button class="${PLAYER.curSub<0?'sel':''}" onclick="setSub(-1)">Off</button>`+
       PLAYER.subs.map(s=>`<button class="${PLAYER.curSub===s.index?'sel':''}" onclick="setSub(${s.index})">${esc(subLabelMenu(s))}</button>`).join("");
   }
   m.classList.add("on");
+}
+
+// ---- audio sync (A/V offset) ----------------------------------------------
+// Persisted per file server-side; every nudge restarts the stream at the same
+// position with ffmpeg applying the shift, so it works for any method.
+function offsetLabel(ms){ return ms===0?"0 ms (no correction)":`${ms>0?"+":""}${ms} ms — audio plays ${ms>0?"later":"earlier"}`; }
+function syncMenuHtml(){
+  return `<div class="amsec">Audio sync</div>
+    <div class="syncnow">${esc(offsetLabel(PLAYER.aoffset||0))}
+      ${PLAYER.declared?`<div class="hint">container declares ${PLAYER.declared>0?"+":""}${PLAYER.declared} ms (already honored)</div>`:''}</div>
+    <button onclick="nudgeSync(-250)">−250 ms · audio earlier</button>
+    <button onclick="nudgeSync(-50)">−50 ms · audio earlier</button>
+    <button onclick="nudgeSync(50)">+50 ms · audio later</button>
+    <button onclick="nudgeSync(250)">+250 ms · audio later</button>
+    ${PLAYER.aoffset? `<button onclick="setSync(0)">reset to 0</button>`:''}`;
+}
+function nudgeSync(d){ setSync((PLAYER.aoffset||0)+d); }
+async function setSync(v){
+  const me=PLAYER; if(!me||!me.fileId) return;
+  let saved;
+  try{ saved=await api(`/files/${me.fileId}/audio-offset`,{method:"PUT",body:{offset_ms:v}}); }
+  catch(e){ return toast(e.message); }
+  if(PLAYER!==me) return;
+  PLAYER.aoffset=saved.audio_offset_ms;
+  const m=document.getElementById("pmenu");
+  if(m&&m.classList.contains("on")&&m.dataset.kind==="sync") m.innerHTML=syncMenuHtml();
+  toast("Audio sync: "+offsetLabel(PLAYER.aoffset));
+  const video=document.getElementById("video");
+  const pos=(PLAYER.offset||0)+((video&&video.currentTime)||0);
+  if(PLAYER.method==='direct_play'){
+    // Direct play can't carry a correction — re-decide (the server now forces
+    // a remux for this file) and resume where we were.
+    play(PLAYER.fileId, PLAYER.title||"", Math.round(pos*1000), PLAYER.knownDur||0);
+  } else {
+    seekTo(pos); // restarts the server stream; ffmpeg applies the new offset
+  }
 }
 function setSub(index){
   const m=document.getElementById("pmenu"); if(m) m.classList.remove("on");
@@ -1170,6 +1218,7 @@ function updateStats(){
     `<div><b>Bitrate</b>${srcBr}</div>`+
     `<div><b>Container</b>${esc(srcCont)}</div>`+
     `<div><b>Audio</b>${esc(aLine)}</div>`+
+    `<div><b>AV offset</b>${(PLAYER.aoffset||0)+" ms"}${PLAYER.declared?` <span style="opacity:.6">(container ${PLAYER.declared>0?"+":""}${PLAYER.declared} ms)</span>`:''}</div>`+
     `<div class="sechd">Now decoding</div>`+
     `<div><b>Resolution</b>${tgtRes}</div>`+
     `<div><b>Dropped</b>${dropped} frames</div>`+
@@ -1211,6 +1260,45 @@ window.addEventListener("keydown",e=>{
 // map fileId → itemId, filled by viewItem so progress posts to the right item
 const ITEM_FOR_FILE={};
 
+// ---- activity page --------------------------------------------------------
+// Where the header pill lands: live streams (with a stop for admins),
+// per-library scan state, and the Trakt story — refreshed every 3s.
+async function viewActivity(){
+  chrome("activity", `<div class="empty">Loading…</div>`);
+  await renderActivityBody();
+  setPageTimer(renderActivityBody, 3000);
+}
+async function renderActivityBody(){
+  if(location.hash!=="#/activity") return;
+  let d; try{ d=await api("/activity/detail"); }
+  catch(e){ const m=document.getElementById("main"); if(m) m.innerHTML=`<div class="empty">${esc(e.message)}</div>`; return; }
+  const rows=d.sessions.map(se=>`<tr>
+    <td><b><a href="#/item/${se.item_id}">${esc(se.item_title)}</a></b></td>
+    <td>${esc(se.user_name)}</td>
+    <td>transcode · ${se.target_height}p · ${esc(se.encoder)}</td>
+    <td class="muted">${fmtAgo(se.started_unix)}${se.idle_seconds>30?` · idle ${Math.round(se.idle_seconds)}s`:''}</td>
+    <td style="text-align:right">${ME&&ME.is_admin?`<button class="ghost sm" onclick="stopSession('${esc(se.id)}')">Stop</button>`:''}</td></tr>`).join("");
+  const scans=d.scans.map(sc=>`<tr><td style="width:200px"><b>${esc(sc.library)}</b></td><td class="muted">${statusText(sc.status)}</td></tr>`).join("");
+  const t=d.trakt||{};
+  const trakt = t.configured
+    ? `<p style="margin:0">${t.linked?`Linked as <b>${esc((t.linked.trakt_username)||"?")}</b>${t.linked.last_sync_at?` <span class="muted">· last sync ${fmtAgo(t.linked.last_sync_at)}</span>`:""}`:"Keys saved — not linked yet."}${t.syncing?' <span class="muted">· syncing now…</span>':''}</p>${t.note?`<p class="hint" style="margin:6px 0 0">${esc(t.note)}</p>`:''}`
+    : `<p class="muted" style="margin:0">Not set up${ME&&ME.is_admin?' — add it in <a href="#/settings">Settings</a>':''}.</p>`;
+  const m=document.getElementById("main"); if(!m) return;
+  m.innerHTML=`
+    <h2 class="section" style="margin-top:6px">Now playing</h2>
+    ${d.sessions.length
+      ? `<table><thead><tr><th>Title</th><th>User</th><th>Stream</th><th>Started</th><th></th></tr></thead><tbody>${rows}</tbody></table>`
+      : `<div class="empty">Nothing streaming right now. Only transcodes hold a server session — direct play and remux flow straight through.</div>`}
+    <h2 class="section">Library</h2>
+    ${d.scans.length? `<table><tbody>${scans}</tbody></table>` : `<div class="empty">No libraries yet.</div>`}
+    <h2 class="section">Trakt</h2>
+    <div class="card">${trakt}</div>`;
+}
+async function stopSession(id){
+  try{ await api(`/activity/sessions/${id}`,{method:"DELETE"}); toast("Stream stopped"); renderActivityBody(); }
+  catch(e){ toast(e.message); }
+}
+
 // ---- settings -------------------------------------------------------------
 function statusText(st){
   if(!st) return "idle";
@@ -1232,10 +1320,14 @@ function statusText(st){
   }
   return "idle";
 }
+let SETTINGS=null, TRAKT=null, TRAKT_EDIT=false;
 async function viewSettings(){
   if(!ME.is_admin){ location.hash="#/"; return; }
   chrome("settings",`<div class="empty">Loading…</div>`);
-  const [libs,settings,status,sys,users]=await Promise.all([api("/libraries"),api("/settings"),api("/scan/status"),api("/system"),api("/users")]);
+  const [libs,settings,status,sys,users,trakt]=await Promise.all([
+    api("/libraries"),api("/settings"),api("/scan/status"),api("/system"),api("/users"),
+    api("/trakt/status").catch(()=>null)]);
+  SETTINGS=settings; TRAKT=trakt; TRAKT_EDIT=false;
   const libRows=libs.map(l=>`<tr><td><b>${esc(l.name)}</b></td><td>${l.anime?'anime':l.kind}</td><td class="muted">${esc(l.paths.join(", "))}</td>
       <td class="muted" id="st-${l.id}">${statusText(status[l.id])}</td>
       <td class="row" style="flex-wrap:nowrap"><button class="ghost sm" onclick="scanLib(${l.id})">Scan</button><button class="ghost sm" onclick="refreshLib(${l.id})" title="Re-fetch all metadata & artwork (incl. season posters)">Refresh art</button><button class="ghost sm" onclick="delLib(${l.id})">Delete</button></td></tr>`).join("");
@@ -1284,6 +1376,19 @@ async function viewSettings(){
         value="${esc(settings.omdb_api_key||'')}"
         onfocus="this.type='text'" onblur="this.type='password'"><div class="err" id="oerr"></div>
       <button style="margin-top:12px" onclick="saveOmdb()">Save key</button></div>
+    <div class="card"><h2 class="section" style="margin-top:0">Playback defaults</h2>
+      <p class="muted" style="margin-top:0">Default audio and subtitle selection for every player. Anime dual-audio still prefers the original audio with subtitles.</p>
+      <div class="row" style="align-items:end">
+        <div><label>Audio language</label><select id="pal" style="width:auto;min-width:150px">${langOpts(settings.default_audio_lang)}</select></div>
+        <div><label>Subtitle language</label><select id="psl" style="width:auto;min-width:150px">${langOpts(settings.default_sub_lang)}</select></div>
+        <div><label>Subtitles</label><select id="psm" style="width:auto;min-width:230px">
+          <option value="auto" ${settings.sub_mode==='auto'?'selected':''}>Auto — only for foreign audio</option>
+          <option value="always" ${settings.sub_mode==='always'?'selected':''}>Always on</option>
+          <option value="off" ${settings.sub_mode==='off'?'selected':''}>Off</option></select></div>
+      </div>
+      <div class="err" id="perr"></div>
+      <button style="margin-top:12px" onclick="savePlayback()">Save defaults</button></div>
+    ${traktCardHtml(trakt)}
     <div class="card"><h2 class="section" style="margin-top:0">Logs</h2>
       <div class="row"><select id="loglvl" style="max-width:120px" onchange="refreshLogs()">
           <option value="info" selected>Info+</option><option value="warn">Warnings+</option>
@@ -1306,6 +1411,11 @@ async function settingsTick(){
     }
     const auto=document.getElementById("logauto");
     if(auto&&auto.checked) refreshLogs();
+    // Live Trakt card: the device-link poll and sync state resolve server-side.
+    if(!TRAKT_EDIT){
+      const t=await api("/trakt/status");
+      if(JSON.stringify(t)!==JSON.stringify(TRAKT)){ TRAKT=t; paintTrakt(); }
+    }
   }catch(e){}
 }
 async function refreshLogs(){
@@ -1333,6 +1443,70 @@ async function refreshLib(id){ try{ await api(`/libraries/${id}/refresh`,{method
 async function delLib(id){ if(!confirm("Delete this library? Media files are not touched.")) return; try{ await api(`/libraries/${id}`,{method:"DELETE"}); toast("Deleted"); viewSettings(); }catch(e){toast(e.message)} }
 async function saveTmdb(){ const err=document.getElementById("terr"); err.textContent=""; try{ await api("/settings",{method:"PUT",body:{tmdb_api_key:tk.value.trim()}}); toast("Saved"); viewSettings(); }catch(e){err.textContent=e.message} }
 async function saveOmdb(){ const err=document.getElementById("oerr"); err.textContent=""; try{ await api("/settings",{method:"PUT",body:{omdb_api_key:document.getElementById("ok").value.trim()}}); toast("Saved"); viewSettings(); }catch(e){err.textContent=e.message} }
+
+// ---- playback defaults + Trakt (settings page) -----------------------------
+const LANG_CHOICES=[["eng","English"],["jpn","Japanese"],["spa","Spanish"],["fre","French"],
+  ["ger","German"],["ita","Italian"],["por","Portuguese"],["rus","Russian"],["kor","Korean"],
+  ["chi","Chinese"],["hin","Hindi"],["ara","Arabic"],["nld","Dutch"],["swe","Swedish"],
+  ["pol","Polish"],["nor","Norwegian"],["dan","Danish"],["fin","Finnish"],["tur","Turkish"],
+  ["tha","Thai"],["vie","Vietnamese"],["ukr","Ukrainian"],["ces","Czech"],["ell","Greek"],
+  ["heb","Hebrew"],["hun","Hungarian"],["ron","Romanian"]];
+function langOpts(cur){ return LANG_CHOICES.map(([v,l])=>`<option value="${v}" ${cur===v?'selected':''}>${l}</option>`).join(""); }
+async function savePlayback(){
+  const err=document.getElementById("perr"); err.textContent="";
+  try{
+    SETTINGS=await api("/settings",{method:"PUT",body:{
+      default_audio_lang:document.getElementById("pal").value,
+      default_sub_lang:document.getElementById("psl").value,
+      sub_mode:document.getElementById("psm").value}});
+    toast("Playback defaults saved");
+  }catch(e){ err.textContent=e.message; }
+}
+function traktCardHtml(t){
+  if(t===null||t===undefined) return "";
+  let body="";
+  if(!t.configured||TRAKT_EDIT){
+    body=`<p class="muted" style="margin-top:0">Scrobble what you watch and sync watched history + resume points both ways.
+      Create an API app at <a href="https://trakt.tv/oauth/applications" target="_blank" rel="noopener">trakt.tv/oauth/applications</a>
+      (redirect URI <code>urn:ietf:wg:oauth:2.0:oob</code>), then paste its keys.</p>
+      <label>Client ID</label><input id="tcid" type="password" autocomplete="off" value="${esc((SETTINGS&&SETTINGS.trakt_client_id)||'')}" onfocus="this.type='text'" onblur="this.type='password'">
+      <label>Client secret</label><input id="tcs" type="password" autocomplete="off" value="${esc((SETTINGS&&SETTINGS.trakt_client_secret)||'')}" onfocus="this.type='text'" onblur="this.type='password'">
+      <div class="err" id="tkerr"></div>
+      <button style="margin-top:12px" onclick="saveTraktKeys()">Save keys</button>`;
+  } else if(t.pending && !t.pending.error){
+    body=`<p class="muted" style="margin-top:0">Go to <a href="${esc(t.pending.verification_url)}" target="_blank" rel="noopener">${esc(t.pending.verification_url)}</a> and enter:</p>
+      <div class="traktcode">${esc(t.pending.user_code)}</div>
+      <p class="hint">Waiting for approval — this updates by itself.</p>
+      <div class="row" style="margin-top:8px"><button class="ghost sm" onclick="traktUnlink()">Cancel</button></div>`;
+  } else if(t.linked){
+    body=`<p style="margin-top:0">Connected as <b>${esc(t.trakt_username||"?")}</b>${t.last_sync_at?` <span class="muted">· last sync ${fmtAgo(t.last_sync_at)}</span>`:""}${t.syncing?' <span class="muted">· syncing now…</span>':''}</p>
+      ${t.note?`<p class="hint">${esc(t.note)}</p>`:''}
+      <div class="row"><button class="ghost sm" onclick="traktSyncNow()">Sync now</button>
+        <button class="ghost sm" onclick="traktUnlink()">Disconnect</button></div>`;
+  } else {
+    body=`<p class="muted" style="margin-top:0">Keys saved. Link your Trakt account with a one-time code.</p>
+      ${t.pending&&t.pending.error?`<div class="err">${esc(t.pending.error)}</div>`:''}
+      ${t.note?`<p class="hint">${esc(t.note)}</p>`:''}
+      <div class="row"><button onclick="traktLink()">Connect Trakt</button>
+        <button class="ghost sm" onclick="TRAKT_EDIT=true;paintTrakt()">Change keys</button></div>`;
+  }
+  return `<div class="card" id="traktcard"><h2 class="section" style="margin-top:0">Trakt</h2>${body}</div>`;
+}
+function paintTrakt(){ const el=document.getElementById("traktcard"); if(el) el.outerHTML=traktCardHtml(TRAKT); }
+async function saveTraktKeys(){
+  const err=document.getElementById("tkerr"); err.textContent="";
+  try{
+    SETTINGS=await api("/settings",{method:"PUT",body:{
+      trakt_client_id:document.getElementById("tcid").value.trim(),
+      trakt_client_secret:document.getElementById("tcs").value.trim()}});
+    TRAKT_EDIT=false;
+    TRAKT=await api("/trakt/status");
+    paintTrakt(); toast("Trakt keys saved");
+  }catch(e){ err.textContent=e.message; }
+}
+async function traktLink(){ try{ TRAKT=await api("/trakt/link",{method:"POST"}); paintTrakt(); }catch(e){ toast(e.message); } }
+async function traktUnlink(){ try{ TRAKT=await api("/trakt/link",{method:"DELETE"}); paintTrakt(); toast("Trakt disconnected"); }catch(e){ toast(e.message); } }
+async function traktSyncNow(){ try{ TRAKT=await api("/trakt/sync",{method:"POST"}); paintTrakt(); toast("Sync started"); }catch(e){ toast(e.message); } }
 
 // ---- users (admin) --------------------------------------------------------
 function userRow(u){
@@ -1377,6 +1551,7 @@ async function render(){
     if(h.startsWith("#/item/")) return await viewItem(h.split("/")[2]);
     if(h.startsWith("#/library/")) return await viewLibrary(h.split("/")[2]);
     if(h.startsWith("#/search/")) return await viewSearch(decodeURIComponent(h.split("/")[2]||""));
+    if(h==="#/activity") return await viewActivity();
     if(h==="#/admin"||h==="#/settings") return await viewSettings();
     return await viewHome();
   }catch(e){

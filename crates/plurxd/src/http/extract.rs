@@ -14,9 +14,8 @@ use super::error::ApiError;
 use crate::state::AppState;
 
 pub struct AuthUser(pub User);
-/// Guard that requires the caller be an admin. Carries no data — handlers that
-/// need the admin's identity can also take [`AuthUser`].
-pub struct AdminUser;
+/// Guard that requires the caller be an admin; carries the admin's identity.
+pub struct AdminUser(pub User);
 /// The raw bearer token, for endpoints that operate on the token itself
 /// (e.g. logout). Does not validate the token against the store.
 pub struct RawToken(pub String);
@@ -118,7 +117,7 @@ impl FromRequestParts<AppState> for AdminUser {
     ) -> Result<Self, Self::Rejection> {
         let AuthUser(user) = AuthUser::from_request_parts(parts, state).await?;
         if user.is_admin {
-            Ok(AdminUser)
+            Ok(AdminUser(user))
         } else {
             Err(ApiError::Forbidden)
         }

@@ -450,6 +450,31 @@ impl MediaStore for SqliteStore {
         .await
     }
 
+    async fn set_file_audio_offset(&self, file_id: i64, offset_ms: i64) -> Result<(), StoreError> {
+        self.with_conn(move |conn| {
+            conn.execute(
+                "UPDATE files SET audio_offset_ms = ?2 WHERE id = ?1",
+                params![file_id, offset_ms],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn get_file_probe_json(&self, file_id: i64) -> Result<Option<String>, StoreError> {
+        self.with_conn(move |conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT probe_json FROM files WHERE id = ?1",
+                    params![file_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten())
+        })
+        .await
+    }
+
     async fn files_for_item(&self, item_id: i64) -> Result<Vec<MediaFile>, StoreError> {
         self.with_conn(move |conn| {
             // Best version first: an item can have several source files (a 4K

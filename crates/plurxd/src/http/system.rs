@@ -142,6 +142,15 @@ pub struct SettingsDto {
     /// The stored OMDb key (Rotten Tomatoes / Metacritic / IMDb ratings). Same
     /// admin-only, mask-until-clicked treatment as the TMDB key.
     pub omdb_api_key: String,
+    /// Trakt app credentials (the admin's own API app), same treatment.
+    pub trakt_configured: bool,
+    pub trakt_client_id: String,
+    pub trakt_client_secret: String,
+    /// Playback language defaults (docs/FEATURES.md §7): ISO 639 codes and the
+    /// subtitle mode "auto" | "always" | "off".
+    pub default_audio_lang: String,
+    pub default_sub_lang: String,
+    pub sub_mode: String,
 }
 
 async fn settings_dto(state: &AppState) -> Result<SettingsDto, ApiError> {
@@ -155,11 +164,28 @@ async fn settings_dto(state: &AppState) -> Result<SettingsDto, ApiError> {
         .get_setting(keys::OMDB_API_KEY)
         .await?
         .unwrap_or_default();
+    let trakt_client_id = state
+        .store
+        .get_setting(keys::TRAKT_CLIENT_ID)
+        .await?
+        .unwrap_or_default();
+    let trakt_client_secret = state
+        .store
+        .get_setting(keys::TRAKT_CLIENT_SECRET)
+        .await?
+        .unwrap_or_default();
+    let prefs = state.transcode.lang_prefs().await;
     Ok(SettingsDto {
         tmdb_configured: !tmdb_api_key.is_empty(),
         tmdb_api_key,
         omdb_configured: !omdb_api_key.is_empty(),
         omdb_api_key,
+        trakt_configured: !trakt_client_id.is_empty() && !trakt_client_secret.is_empty(),
+        trakt_client_id,
+        trakt_client_secret,
+        default_audio_lang: prefs.audio_lang,
+        default_sub_lang: prefs.sub_lang,
+        sub_mode: prefs.sub_mode.as_str().to_owned(),
     })
 }
 
@@ -177,6 +203,14 @@ pub struct UpdateSettings {
     pub tmdb_api_key: Option<String>,
     /// Set the OMDb API key. Empty string clears it. Absent leaves it as-is.
     pub omdb_api_key: Option<String>,
+    /// Trakt app credentials; same empty-clears semantics.
+    pub trakt_client_id: Option<String>,
+    pub trakt_client_secret: Option<String>,
+    /// Playback language defaults. ISO 639 codes ("eng"); mode is
+    /// "auto" | "always" | "off".
+    pub default_audio_lang: Option<String>,
+    pub default_sub_lang: Option<String>,
+    pub sub_mode: Option<String>,
 }
 
 /// PUT /api/v1/settings (admin)
@@ -185,17 +219,23 @@ pub async fn update_settings(
     State(state): State<AppState>,
     Json(req): Json<UpdateSettings>,
 ) -> Result<Json<SettingsDto>, ApiError> {
-    if let Some(key) = req.tmdb_api_key {
-        state
-            .store
-            .put_setting(keys::TMDB_API_KEY, key.trim())
-            .await?;
+    let pairs: [(&str, &Option<String>); 6] = [
+        (keys::TMDB_API_KEY, &req.tmdb_api_key),
+        (keys::OMDB_API_KEY, &req.omdb_api_key),
+        (keys::TRAKT_CLIENT_ID, &req.trakt_client_id),
+        (keys::TRAKT_CLIENT_SECRET, &req.trakt_client_secret),
+        (keys::AUDIO_LANG, &req.default_audio_lang),
+        (keys::SUB_LANG, &req.default_sub_lang),
+    ];
+    for (key, value) in pairs {
+        if let Some(value) = value {
+            state.store.put_setting(key, value.trim()).await?;
+        }
     }
-    if let Some(key) = req.omdb_api_key {
-        state
-            .store
-            .put_setting(keys::OMDB_API_KEY, key.trim())
-            .await?;
+    if let Some(mode) = &req.sub_mode {
+        // Normalize through the parser so only valid modes are stored.
+        let mode = plurx_core::tracks::SubMode::parse(mode.trim()).as_str();
+        state.store.put_setting(keys::SUB_MODE, mode).await?;
     }
     Ok(Json(settings_dto(&state).await?))
 }
@@ -285,7 +325,83 @@ pub async fn activity(
         });
     }
 
+    if let Some((label, detail)) = state.trakt.activity().await {
+        activities.push(Activity {
+            kind: "trakt",
+            label,
+            detail,
+            percent: None,
+        });
+    }
+
     Ok(Json(activities))
+}
+
+/// GET /api/v1/activity/detail — the activity page: live playback sessions,
+/// per-library scan state, and the Trakt sync story, all in one shape. Any
+/// authenticated user may look (it's their household server); the stop action
+/// below is admin-only.
+pub async fn activity_detail(
+    _user: AuthUser,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let sessions = state.transcode.list_sessions().await;
+    let names: HashMap<i64, String> = state
+        .store
+        .list_libraries()
+        .await?
+        .into_iter()
+        .map(|l| (l.id, l.name))
+        .collect();
+    let scans: Vec<serde_json::Value> = state
+        .jobs
+        .all_statuses()
+        .await
+        .into_iter()
+        .map(|(id, st)| {
+            serde_json::json!({
+                "library_id": id,
+                "library": names.get(&id).cloned().unwrap_or_else(|| format!("#{id}")),
+                "status": st,
+            })
+        })
+        .collect();
+    let trakt = state.trakt.status(0).await; // page shows server-wide state
+    let linked = state
+        .store
+        .list_trakt_auth()
+        .await?
+        .into_iter()
+        .next()
+        .map(|a| {
+            serde_json::json!({
+                "trakt_username": a.trakt_username,
+                "last_sync_at": (a.last_sync_at > 0).then_some(a.last_sync_at),
+            })
+        });
+    Ok(Json(serde_json::json!({
+        "sessions": sessions,
+        "scans": scans,
+        "trakt": {
+            "configured": trakt.configured,
+            "linked": linked,
+            "syncing": trakt.syncing,
+            "note": trakt.note,
+        },
+    })))
+}
+
+/// DELETE /api/v1/activity/sessions/:id (admin) — stop a transcode session.
+pub async fn stop_session(
+    _admin: AdminUser,
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let stopped = state.transcode.stop_session(&id).await;
+    if !stopped {
+        return Err(ApiError::NotFound("session"));
+    }
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 /// GET /metrics — Prometheus text exposition (unauthenticated; counts only).

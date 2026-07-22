@@ -13,6 +13,7 @@ use serde::Serialize;
 use tokio::sync::Mutex;
 
 use crate::logbuf::LogBuffer;
+use crate::trakt::TraktManager;
 use crate::transcode::TranscodeManager;
 
 /// Environment facts collected once at startup, shown on the settings page.
@@ -40,6 +41,7 @@ pub struct AppState {
     pub artwork_dir: PathBuf,
     pub jobs: Arc<JobManager>,
     pub transcode: Arc<TranscodeManager>,
+    pub trakt: Arc<TraktManager>,
     pub system: Arc<SystemInfo>,
     pub logs: Arc<LogBuffer>,
     pub started_at: Instant,
@@ -61,12 +63,19 @@ impl AppState {
             transcode_dir,
             encoder_caps,
         ));
+        // PLURX_TRAKT_BASE overrides the API base for tests/mocks.
+        let trakt_base = std::env::var("PLURX_TRAKT_BASE")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| plurx_core::trakt::DEFAULT_BASE.to_owned());
+        let trakt = Arc::new(TraktManager::new(Arc::clone(&store), trakt_base));
         AppState {
             store,
             server_name,
             artwork_dir,
             jobs,
             transcode,
+            trakt,
             system: Arc::new(system),
             logs,
             started_at: Instant::now(),

@@ -232,13 +232,31 @@ pub fn hls_args(
     args.push("-i".into());
     args.push(source_path.clone());
 
+    // A per-file A/V sync correction rides in on a second input of the same
+    // file, shifted with -itsoffset and used only for its audio (positive =
+    // audio later). Both inputs get the same fast input-seek so resume stays
+    // aligned; the video still comes from input 0 (with its hw decode).
+    let audio_input = if source.audio_offset_ms != 0 {
+        if opts.start_seconds > 0.0 {
+            args.push("-ss".into());
+            args.push(format!("{:.3}", opts.start_seconds));
+        }
+        args.push("-itsoffset".into());
+        args.push(format!("{:.3}", source.audio_offset_ms as f64 / 1000.0));
+        args.push("-i".into());
+        args.push(source_path.clone());
+        1
+    } else {
+        0
+    };
+
     // Map first video + chosen (or default) audio.
     args.push("-map".into());
     args.push("0:v:0".into());
     args.push("-map".into());
     match opts.audio_index {
-        Some(i) => args.push(format!("0:a:{i}?")),
-        None => args.push("0:a:0?".into()),
+        Some(i) => args.push(format!("{audio_input}:a:{i}?")),
+        None => args.push(format!("{audio_input}:a:0?")),
     }
 
     // Video filter chain: [hwdownload for GPU-decoded frames →] scale / tonemap /
@@ -319,6 +337,7 @@ mod tests {
             audio_streams: vec![],
             subtitle_streams: vec![],
             scanned_at: 1,
+            audio_offset_ms: 0,
         }
     }
 

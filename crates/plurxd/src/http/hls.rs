@@ -41,7 +41,7 @@ pub struct StartResponse {
 
 /// GET /api/v1/files/:id/hls/start
 pub async fn start(
-    _user: AuthUser,
+    AuthUser(user): AuthUser,
     State(state): State<AppState>,
     AxPath(id): AxPath<i64>,
     Query(q): Query<StartQuery>,
@@ -50,7 +50,7 @@ pub async fn start(
     let start = q.start.unwrap_or(0.0).max(0.0);
     let info = state
         .transcode
-        .start(id, height, start, q.audio.filter(|a| *a >= 0))
+        .start(id, height, start, q.audio.filter(|a| *a >= 0), &user.username)
         .await
         .map_err(ApiError::Internal)?;
     Ok(Json(StartResponse {

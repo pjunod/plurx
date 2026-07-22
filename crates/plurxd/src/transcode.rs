@@ -116,6 +116,14 @@ struct Session {
     dir: PathBuf,
     child: Mutex<Child>,
     last_access: Mutex<Instant>,
+    // -- metadata for the activity page --
+    file_id: i64,
+    item_id: i64,
+    item_title: String,
+    user_name: String,
+    target_height: i64,
+    encoder_label: &'static str,
+    started_unix: i64,
     /// Set when the session can never produce output (hardware and software
     /// both failed to emit a first segment). Playlist/segment reads then fail
     /// fast so the player shows an error instead of waiting on a gray screen.
@@ -128,6 +136,20 @@ pub struct StartInfo {
     pub duration_ms: Option<i64>,
     pub start_seconds: f64,
     pub encoder: &'static str,
+}
+
+/// A live session, as the activity page sees it.
+#[derive(Clone, serde::Serialize)]
+pub struct SessionInfo {
+    pub id: String,
+    pub file_id: i64,
+    pub item_id: i64,
+    pub item_title: String,
+    pub user_name: String,
+    pub target_height: i64,
+    pub encoder: &'static str,
+    pub started_unix: i64,
+    pub idle_seconds: u64,
 }
 
 pub struct TranscodeManager {
@@ -160,12 +182,33 @@ impl TranscodeManager {
     }
 
     /// Start (or return a matching) transcode session for a file.
+    /// The admin's playback language preferences (Settings → Playback
+    /// defaults), falling back to English/English/Auto.
+    pub async fn lang_prefs(&self) -> plurx_core::tracks::LangPrefs {
+        let mut prefs = plurx_core::tracks::LangPrefs::default();
+        if let Ok(Some(v)) = self.store.get_setting(keys::AUDIO_LANG).await {
+            if !v.trim().is_empty() {
+                prefs.audio_lang = v.trim().to_owned();
+            }
+        }
+        if let Ok(Some(v)) = self.store.get_setting(keys::SUB_LANG).await {
+            if !v.trim().is_empty() {
+                prefs.sub_lang = v.trim().to_owned();
+            }
+        }
+        if let Ok(Some(v)) = self.store.get_setting(keys::SUB_MODE).await {
+            prefs.sub_mode = plurx_core::tracks::SubMode::parse(v.trim());
+        }
+        prefs
+    }
+
     pub async fn start(
         &self,
         file_id: i64,
         target_height: i64,
         start_seconds: f64,
         audio_override: Option<i64>,
+        user_name: &str,
     ) -> Result<StartInfo, String> {
         let file = self
             .store
@@ -173,6 +216,14 @@ impl TranscodeManager {
             .await
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "file not found".to_owned())?;
+        let item_title = self
+            .store
+            .get_item(file.item_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|i| i.title)
+            .unwrap_or_else(|| "(unknown)".to_owned());
 
         let encoder = self.encoder().await;
         let session_id = uuid::Uuid::new_v4().to_string();
@@ -182,17 +233,20 @@ impl TranscodeManager {
             .map_err(|e| format!("creating session dir: {e}"))?;
 
         // Default-track selection: prefer original (Japanese) audio + subs when
-        // the file is dual-audio anime-style (REQ-SUB-2). Burn the chosen text
+        // the file is dual-audio anime-style (REQ-SUB-2), and honor the
+        // server-wide language preferences otherwise. Burn the chosen text
         // subtitle since HLS transcode delivers a single flat stream.
         let prefer_original = file
             .audio_streams
             .iter()
             .any(|a| matches!(a.language.as_deref(), Some("jpn" | "ja" | "jp")))
             && file.audio_streams.len() > 1;
+        let prefs = self.lang_prefs().await;
         let selection = plurx_core::tracks::select_tracks(
             &file.audio_streams,
             &file.subtitle_streams,
             prefer_original,
+            &prefs,
         );
         let subtitle_burn = selection.subtitle_index.and_then(|idx| {
             let codec = file
@@ -239,6 +293,16 @@ impl TranscodeManager {
             dir: dir.clone(),
             child: Mutex::new(child),
             last_access: Mutex::new(Instant::now()),
+            file_id,
+            item_id: file.item_id,
+            item_title,
+            user_name: user_name.to_owned(),
+            target_height,
+            encoder_label: encoder.label(),
+            started_unix: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
             failed: AtomicBool::new(false),
         });
         self.sessions
@@ -339,6 +403,39 @@ impl TranscodeManager {
     /// Number of live transcode sessions (for /metrics).
     pub async fn active_sessions(&self) -> usize {
         self.sessions.lock().await.len()
+    }
+
+    /// Everything the activity page shows about live sessions.
+    pub async fn list_sessions(&self) -> Vec<SessionInfo> {
+        let sessions = self.sessions.lock().await;
+        let mut out = Vec::with_capacity(sessions.len());
+        for (id, s) in sessions.iter() {
+            out.push(SessionInfo {
+                id: id.clone(),
+                file_id: s.file_id,
+                item_id: s.item_id,
+                item_title: s.item_title.clone(),
+                user_name: s.user_name.clone(),
+                target_height: s.target_height,
+                encoder: s.encoder_label,
+                started_unix: s.started_unix,
+                idle_seconds: s.last_access.lock().await.elapsed().as_secs(),
+            });
+        }
+        out.sort_by_key(|s| s.started_unix);
+        out
+    }
+
+    /// Kill one session now (the activity page's stop button). True if it
+    /// existed.
+    pub async fn stop_session(&self, session_id: &str) -> bool {
+        let Some(session) = self.sessions.lock().await.remove(session_id) else {
+            return false;
+        };
+        let _ = session.child.lock().await.kill().await;
+        let _ = tokio::fs::remove_dir_all(&session.dir).await;
+        tracing::info!(%session_id, "transcode session stopped by admin");
+        true
     }
 
     async fn touch(&self, session_id: &str) -> Option<Arc<Session>> {

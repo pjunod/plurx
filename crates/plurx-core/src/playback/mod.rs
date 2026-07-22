@@ -155,12 +155,20 @@ pub fn decide(file: &MediaFile, profile: &DeviceProfile) -> Decision {
         ));
     }
 
+    // A manual A/V sync correction can only be applied by ffmpeg, so direct
+    // play is off the table for that file — remux at minimum.
+    let has_av_offset = file.audio_offset_ms != 0;
+    if has_av_offset {
+        reasons.push(format!("audio-sync correction {:+} ms", file.audio_offset_ms));
+    }
+
     // Video/res/bitrate/HDR problems force a transcode; only a container or
-    // audio mismatch is remuxable (copy video, maybe re-encode audio).
+    // audio mismatch (or the A/V offset) is remuxable (copy video, maybe
+    // re-encode audio).
     let needs_transcode = !video_ok || !height_ok || !bitrate_ok || !hdr_ok;
     let method = if needs_transcode {
         PlaybackMethod::Transcode
-    } else if !container_ok || !audio_ok {
+    } else if !container_ok || !audio_ok || has_av_offset {
         PlaybackMethod::Remux
     } else {
         PlaybackMethod::DirectPlay
@@ -205,6 +213,7 @@ mod tests {
             }],
             subtitle_streams: vec![],
             scanned_at: 1,
+            audio_offset_ms: 0,
         }
     }
 

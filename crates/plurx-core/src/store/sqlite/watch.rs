@@ -117,6 +117,36 @@ impl WatchStore for SqliteStore {
         .await
     }
 
+    async fn apply_remote_watch(
+        &self,
+        user_id: i64,
+        item_id: i64,
+        watched: bool,
+        position_ms: i64,
+        duration_ms: Option<i64>,
+        updated_at: i64,
+    ) -> Result<(), StoreError> {
+        self.with_conn(move |conn| {
+            // The remote timestamp lands verbatim (never in the future of the
+            // local clock, so a remote clock skew can't freeze later edits).
+            let now = conn.query_row("SELECT unixepoch()", [], |r| r.get::<_, i64>(0))?;
+            let at = updated_at.clamp(0, now);
+            conn.execute(
+                "INSERT INTO watch_state
+                   (user_id, item_id, position_ms, duration_ms, watched, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(user_id, item_id) DO UPDATE SET
+                     position_ms = excluded.position_ms,
+                     duration_ms = COALESCE(excluded.duration_ms, watch_state.duration_ms),
+                     watched = excluded.watched,
+                     updated_at = excluded.updated_at",
+                params![user_id, item_id, position_ms, duration_ms, watched as i64, at],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     async fn set_watched(
         &self,
         user_id: i64,

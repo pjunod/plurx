@@ -10,6 +10,7 @@
 
 mod library;
 mod media;
+mod trakt;
 mod users;
 mod watch;
 
@@ -139,6 +140,20 @@ const MIGRATIONS: &[&str] = &[
     // Profile 7 (HDR10-compatible)", "HDR10+"). `hdr` stays the coarse type the
     // decision engine keys on; this is display detail. Backfilled on next scan.
     "ALTER TABLE files ADD COLUMN hdr_format TEXT;",
+    // v5: Trakt account links (per user — one row each) and the per-file
+    // manual A/V sync correction. Rescans never touch audio_offset_ms.
+    "ALTER TABLE files ADD COLUMN audio_offset_ms INTEGER NOT NULL DEFAULT 0;
+
+    CREATE TABLE trakt_auth (
+        user_id         INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        access_token    TEXT NOT NULL,
+        refresh_token   TEXT NOT NULL,
+        expires_at      INTEGER NOT NULL,
+        trakt_username  TEXT,
+        connected_at    INTEGER NOT NULL DEFAULT (unixepoch()),
+        last_sync_at    INTEGER NOT NULL DEFAULT 0,
+        last_activities TEXT
+    ) STRICT;",
 ];
 
 /// Column list matching [`item_from_row`]. Prefix with a table alias via
@@ -193,7 +208,7 @@ fn item_from_row(row: &Row<'_>, base: usize) -> rusqlite::Result<Item> {
 
 const FILE_COLS: &str = "id, item_id, path, size, mtime, duration_ms, container, video_codec, \
      video_profile, width, height, bit_depth, hdr, bitrate, audio_streams, \
-     subtitle_streams, scanned_at, hdr_format";
+     subtitle_streams, scanned_at, hdr_format, audio_offset_ms";
 
 fn file_from_row(row: &Row<'_>) -> rusqlite::Result<MediaFile> {
     let path: String = row.get(2)?;
@@ -220,6 +235,7 @@ fn file_from_row(row: &Row<'_>) -> rusqlite::Result<MediaFile> {
             .map_err(|e| conversion_err(15, format!("subtitle_streams: {e}")))?,
         scanned_at: row.get(16)?,
         hdr_format: row.get(17)?,
+        audio_offset_ms: row.get(18)?,
     })
 }
 

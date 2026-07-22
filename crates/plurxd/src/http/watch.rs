@@ -34,6 +34,13 @@ pub async fn progress(
         .store
         .put_progress(user.id, id, position, req.duration_ms)
         .await?;
+    // Feed the Trakt scrobbler (fire-and-forget; a beat every ~5s while the
+    // player is open, and the watched flip triggers the scrobble stop).
+    let pct = match watch.duration_ms.filter(|d| *d > 0) {
+        Some(dur) => (watch.position_ms as f64 / dur as f64 * 100.0).clamp(0.0, 100.0),
+        None => 0.0,
+    };
+    state.trakt.on_progress(user.id, id, pct, watch.watched);
     Ok(Json(watch.into()))
 }
 
@@ -47,6 +54,7 @@ pub async fn scrobble(
         return Err(ApiError::NotFound("item"));
     }
     state.store.set_watched(user.id, id, true).await?;
+    state.trakt.request_sync(); // propagate the manual mark promptly
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -60,5 +68,6 @@ pub async fn unscrobble(
         return Err(ApiError::NotFound("item"));
     }
     state.store.set_watched(user.id, id, false).await?;
+    state.trakt.request_sync(); // an explicit un-watch removes on Trakt too
     Ok(Json(serde_json::json!({ "ok": true })))
 }

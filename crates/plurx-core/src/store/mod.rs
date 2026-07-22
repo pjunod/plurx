@@ -22,7 +22,7 @@ use async_trait::async_trait;
 
 use crate::domain::{
     InProgressItem, Item, ItemPage, ItemSort, Library, MediaFile, MetadataPatch, NewItem,
-    NewLibrary, ProbeResult, RecentItem, User, WatchState,
+    NewLibrary, ProbeResult, RecentItem, TraktAuth, User, WatchState,
 };
 // RecentItem is reused for next-up (episode + show title).
 use crate::error::StoreError;
@@ -42,6 +42,17 @@ pub mod keys {
     /// Hardware-encoder preference for transcoding: "nvenc" | "qsv" | "vaapi"
     /// | "videotoolbox" | "software" | "" (automatic).
     pub const HWACCEL: &str = "transcode.hwaccel";
+    /// Trakt API application credentials (the admin creates the app at
+    /// trakt.tv/oauth/applications; empty/absent disables the integration).
+    pub const TRAKT_CLIENT_ID: &str = "trakt.client_id";
+    pub const TRAKT_CLIENT_SECRET: &str = "trakt.client_secret";
+    /// Preferred default audio language (ISO 639 code, e.g. "eng").
+    pub const AUDIO_LANG: &str = "playback.audio_lang";
+    /// Preferred default subtitle language (ISO 639 code, e.g. "eng").
+    pub const SUB_LANG: &str = "playback.sub_lang";
+    /// When subtitles auto-select: "auto" (only when the audio isn't the
+    /// preferred language) | "always" | "off".
+    pub const SUB_MODE: &str = "playback.sub_mode";
 }
 
 #[async_trait]
@@ -169,6 +180,11 @@ pub trait MediaStore: Send + Sync + 'static {
     ) -> Result<i64, StoreError>;
     async fn get_file(&self, id: i64) -> Result<Option<MediaFile>, StoreError>;
     async fn files_for_item(&self, item_id: i64) -> Result<Vec<MediaFile>, StoreError>;
+    /// Persist a manual A/V sync correction for one file (0 clears it).
+    async fn set_file_audio_offset(&self, file_id: i64, offset_ms: i64) -> Result<(), StoreError>;
+    /// The raw ffprobe JSON captured at scan time (for the declared per-stream
+    /// start-time readout in the player's sync menu).
+    async fn get_file_probe_json(&self, file_id: i64) -> Result<Option<String>, StoreError>;
     /// All known file paths in a library (for vanished-file detection).
     async fn library_file_paths(&self, library_id: i64) -> Result<Vec<(i64, PathBuf)>, StoreError>;
     async fn delete_files(&self, ids: &[i64]) -> Result<u64, StoreError>;
@@ -212,15 +228,73 @@ pub trait WatchStore: Send + Sync + 'static {
     /// unwatched, not-in-progress episode after the last watched one. Pairs
     /// with continue-watching (resume) — this is "start the next episode".
     async fn next_up(&self, user_id: i64, limit: i64) -> Result<Vec<RecentItem>, StoreError>;
+    /// Write a watch fact that arrived from an external source (Trakt sync):
+    /// unlike [`put_progress`] the caller controls `updated_at`, so remote
+    /// timestamps land verbatim and later merges compare correctly.
+    async fn apply_remote_watch(
+        &self,
+        user_id: i64,
+        item_id: i64,
+        watched: bool,
+        position_ms: i64,
+        duration_ms: Option<i64>,
+        updated_at: i64,
+    ) -> Result<(), StoreError>;
+}
+
+/// Trakt account links and the identity join sync needs.
+#[async_trait]
+pub trait TraktStore: Send + Sync + 'static {
+    async fn get_trakt_auth(&self, user_id: i64) -> Result<Option<TraktAuth>, StoreError>;
+    async fn list_trakt_auth(&self) -> Result<Vec<TraktAuth>, StoreError>;
+    async fn put_trakt_auth(&self, auth: &TraktAuth) -> Result<(), StoreError>;
+    async fn delete_trakt_auth(&self, user_id: i64) -> Result<(), StoreError>;
+    /// Refresh bookkeeping after a token rotation.
+    async fn update_trakt_tokens(
+        &self,
+        user_id: i64,
+        access_token: &str,
+        refresh_token: &str,
+        expires_at: i64,
+    ) -> Result<(), StoreError>;
+    /// Stamp a completed sync run (and the last_activities gate JSON).
+    async fn set_trakt_sync(
+        &self,
+        user_id: i64,
+        last_sync_at: i64,
+        last_activities: Option<&str>,
+    ) -> Result<(), StoreError>;
+    /// Every movie/episode with a Trakt-matchable identity, plus the user's
+    /// watch row and a fallback duration — the sync planner's input.
+    async fn trakt_sync_candidates(
+        &self,
+        user_id: i64,
+    ) -> Result<Vec<crate::trakt::SyncCandidate>, StoreError>;
 }
 
 /// The full storage boundary — what plurxd holds as `Arc<dyn Store>`.
 pub trait Store:
-    SettingsStore + UserStore + LibraryStore + MediaStore + WatchStore + Send + Sync + 'static
+    SettingsStore
+    + UserStore
+    + LibraryStore
+    + MediaStore
+    + WatchStore
+    + TraktStore
+    + Send
+    + Sync
+    + 'static
 {
 }
 
 impl<T> Store for T where
-    T: SettingsStore + UserStore + LibraryStore + MediaStore + WatchStore + Send + Sync + 'static
+    T: SettingsStore
+        + UserStore
+        + LibraryStore
+        + MediaStore
+        + WatchStore
+        + TraktStore
+        + Send
+        + Sync
+        + 'static
 {
 }

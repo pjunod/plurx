@@ -142,6 +142,12 @@ pub struct DecisionResponse {
     pub subtitles: Vec<SubTrackDto>,
     /// Skippable intro/credits regions (chapter-derived where possible).
     pub markers: Vec<Marker>,
+    /// Persisted manual A/V sync correction for this file (positive = audio
+    /// later). The player's sync menu edits this and restarts the stream.
+    pub audio_offset_ms: i64,
+    /// What the container itself declares (audio start − video start), when
+    /// nonzero. Diagnostic only — declared offsets are already honored.
+    pub declared_offset_ms: Option<i64>,
 }
 
 fn source_summary(file: &MediaFile) -> SourceSummary {
@@ -314,7 +320,7 @@ async fn markers_for(path: &Path, duration_ms: Option<i64>) -> Vec<Marker> {
 
 /// GET /api/v1/files/:id/decision?profile=web-h264
 pub async fn decision(
-    _user: AuthUser,
+    AuthUser(user): AuthUser,
     State(state): State<AppState>,
     AxPath(id): AxPath<i64>,
     Query(q): Query<DecisionQuery>,
@@ -341,15 +347,103 @@ pub async fn decision(
         _ => format!("/api/v1/files/{id}/stream.mp4"),
     };
     let markers = markers_for(&file.path, file.duration_ms).await;
+
+    // Default-track flags: the same selection rule the transcoder burns by —
+    // anime dual-audio prefers the original + subs, everything else honors the
+    // server's language preferences (Settings → Playback defaults).
+    let prefer_original = file
+        .audio_streams
+        .iter()
+        .any(|a| matches!(a.language.as_deref(), Some("jpn" | "ja" | "jp")))
+        && file.audio_streams.len() > 1;
+    let prefs = state.transcode.lang_prefs().await;
+    let selection = plurx_core::tracks::select_tracks(
+        &file.audio_streams,
+        &file.subtitle_streams,
+        prefer_original,
+        &prefs,
+    );
+    let mut audio = audio_tracks(&file);
+    if let Some(pick) = selection.audio_index {
+        for a in &mut audio {
+            a.default = a.index == pick;
+        }
+    }
+    let mut subtitles = sub_tracks(&file);
+    for s in &mut subtitles {
+        s.default = selection.subtitle_index == Some(s.index);
+    }
+
+    // Tell Trakt "watching now" (fire-and-forget), resuming at the known spot.
+    let start_pct = state
+        .store
+        .watch_state(user.id, file.item_id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|w| {
+            w.duration_ms
+                .filter(|d| *d > 0)
+                .map(|d| (w.position_ms as f64 / d as f64 * 100.0).clamp(0.0, 100.0))
+        })
+        .unwrap_or(0.0);
+    state.trakt.on_start(user.id, file.item_id, start_pct);
+
     Ok(Json(DecisionResponse {
         file_id: id,
         source: source_summary(&file),
         decision,
         play_url,
-        audio: audio_tracks(&file),
-        subtitles: sub_tracks(&file),
+        audio,
+        subtitles,
         markers,
+        audio_offset_ms: file.audio_offset_ms,
+        declared_offset_ms: declared_av_offset(&state, id).await,
     }))
+}
+
+/// The container's own per-stream start-time story: audio start minus video
+/// start, in ms, from the scan-time ffprobe JSON. Display-only — a *declared*
+/// offset is usually correct sync (ffmpeg honors it), so it's never
+/// auto-applied; it's shown in the player's sync menu as a diagnostic.
+async fn declared_av_offset(state: &AppState, file_id: i64) -> Option<i64> {
+    let raw = state.store.get_file_probe_json(file_id).await.ok().flatten()?;
+    let probe: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let streams = probe.get("streams")?.as_array()?;
+    let start_of = |kind: &str| -> Option<f64> {
+        streams
+            .iter()
+            .find(|s| s.get("codec_type").and_then(|v| v.as_str()) == Some(kind))
+            .and_then(|s| s.get("start_time"))
+            .and_then(|v| v.as_str())
+            .and_then(|v| v.parse::<f64>().ok())
+    };
+    let (v, a) = (start_of("video")?, start_of("audio")?);
+    let ms = ((a - v) * 1000.0).round() as i64;
+    (ms != 0).then_some(ms)
+}
+
+#[derive(Deserialize)]
+pub struct AudioOffsetRequest {
+    pub offset_ms: i64,
+}
+
+/// PUT /api/v1/files/:id/audio-offset — persist a manual A/V sync correction
+/// (positive = delay audio). Sticks to the file, so the fix survives across
+/// sessions and users; the player restarts its stream to apply it.
+pub async fn set_audio_offset(
+    _user: AuthUser,
+    State(state): State<AppState>,
+    AxPath(id): AxPath<i64>,
+    Json(req): Json<AudioOffsetRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if state.store.get_file(id).await?.is_none() {
+        return Err(ApiError::NotFound("file"));
+    }
+    // ±15s covers any real-world desync; beyond that it's a different problem.
+    let offset = req.offset_ms.clamp(-15_000, 15_000);
+    state.store.set_file_audio_offset(id, offset).await?;
+    Ok(Json(serde_json::json!({ "audio_offset_ms": offset })))
 }
 
 /// GET /api/v1/files/:id/subs/{index}.vtt — extract subtitle stream `index`
@@ -439,7 +533,14 @@ pub async fn stream_mp4(
         .unwrap_or_else(playback::default_profile);
     let decision = playback::decide(&file, profile);
     let audio = q.audio.unwrap_or(0).max(0);
-    remux(&file.path, q.start, decision.transcode_audio, audio).await
+    remux(
+        &file.path,
+        q.start,
+        decision.transcode_audio,
+        audio,
+        file.audio_offset_ms,
+    )
+    .await
 }
 
 // --- direct-play range serving ---------------------------------------------
@@ -532,6 +633,7 @@ async fn remux(
     start: Option<f64>,
     transcode_audio: bool,
     audio_index: i64,
+    audio_offset_ms: i64,
 ) -> Result<Response, ApiError> {
     let mut cmd = tokio::process::Command::new(ffmpeg_bin());
     cmd.arg("-hide_banner").arg("-loglevel").arg("error");
@@ -540,12 +642,27 @@ async fn remux(
         cmd.arg("-ss").arg(format!("{s:.3}"));
     }
     cmd.arg("-i").arg(path);
+    // A persisted A/V sync correction rides in on a second input of the same
+    // file, shifted with -itsoffset (positive = audio later) and used only for
+    // its audio. Same input-seek so resume stays aligned; make_zero below
+    // shifts all streams by one shared amount, preserving the correction.
+    let audio_input = if audio_offset_ms != 0 {
+        if let Some(s) = start.filter(|s| *s > 0.0) {
+            cmd.arg("-ss").arg(format!("{s:.3}"));
+        }
+        cmd.arg("-itsoffset")
+            .arg(format!("{:.3}", audio_offset_ms as f64 / 1000.0));
+        cmd.arg("-i").arg(path);
+        1
+    } else {
+        0
+    };
     // Video + the chosen audio track, no subtitles into the MP4.
     cmd.args([
         "-map",
         "0:v:0",
         "-map",
-        &format!("0:a:{audio_index}?"),
+        &format!("{audio_input}:a:{audio_index}?"),
         "-sn",
     ]);
     cmd.args(["-c:v", "copy"]);
