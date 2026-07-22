@@ -139,14 +139,30 @@ impl TranscodeManager {
         };
         let args = transcode::hls_args(&file, encoder, &opts, &dir.to_string_lossy());
 
-        let child = tokio::process::Command::new(ffmpeg_bin())
+        let mut child = tokio::process::Command::new(ffmpeg_bin())
             .args(&args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| format!("spawning ffmpeg: {e}"))?;
+
+        // Drain ffmpeg's stderr into the logs. It runs at -loglevel error, so
+        // anything here is a real failure — e.g. a hardware encoder that
+        // validated but chokes on the actual filter graph. Without this the
+        // session just dies and the client shows a blank player.
+        if let Some(stderr) = child.stderr.take() {
+            let sid = session_id.clone();
+            let enc = encoder.label();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncBufReadExt, BufReader};
+                let mut lines = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    tracing::warn!(session = %sid, encoder = enc, "transcode ffmpeg: {line}");
+                }
+            });
+        }
 
         tracing::info!(
             %session_id, file_id, target_height, start_seconds,

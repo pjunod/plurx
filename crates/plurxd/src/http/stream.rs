@@ -241,13 +241,27 @@ async fn remux(
         "pipe:1",
     ]);
     cmd.stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .stdin(Stdio::null())
         .kill_on_drop(true);
 
     let mut child = cmd
         .spawn()
         .map_err(|e| ApiError::Internal(format!("spawning ffmpeg: {e}")))?;
+
+    // Surface remux failures: ffmpeg runs at -loglevel error, so a codec/copy
+    // problem (e.g. jellyfin-ffmpeg refusing a stream the old build accepted)
+    // otherwise yields an empty pipe and a blank player with nothing logged.
+    if let Some(stderr) = child.stderr.take() {
+        tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                tracing::warn!("remux ffmpeg: {line}");
+            }
+        });
+    }
+
     let stdout = child
         .stdout
         .take()
