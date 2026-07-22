@@ -207,8 +207,12 @@ pub struct MediaFile {
     pub width: Option<i64>,
     pub height: Option<i64>,
     pub bit_depth: Option<i64>,
-    /// "hdr10" | "hlg" | "dolby_vision" | None (SDR/unknown).
+    /// "hdr10" | "hlg" | "dolby_vision" | None (SDR/unknown). Coarse type the
+    /// decision engine keys on.
     pub hdr: Option<String>,
+    /// Human HDR label with detail for display: "Dolby Vision · Profile 7
+    /// (HDR10-compatible)", "HDR10+", "HLG". None when `hdr` is None.
+    pub hdr_format: Option<String>,
     pub bitrate: Option<i64>,
     pub audio_streams: Vec<AudioStream>,
     pub subtitle_streams: Vec<SubtitleStream>,
@@ -226,6 +230,7 @@ pub struct ProbeResult {
     pub height: Option<i64>,
     pub bit_depth: Option<i64>,
     pub hdr: Option<String>,
+    pub hdr_format: Option<String>,
     pub bitrate: Option<i64>,
     pub audio_streams: Vec<AudioStream>,
     pub subtitle_streams: Vec<SubtitleStream>,

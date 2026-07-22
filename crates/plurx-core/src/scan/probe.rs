@@ -102,6 +102,7 @@ pub fn parse_probe_json(json: &Value) -> ProbeResult {
                 result.height = int_field(stream, "height");
                 result.bit_depth = video_bit_depth(stream);
                 result.hdr = detect_hdr(stream);
+                result.hdr_format = detect_hdr_format(stream);
             }
             Some("audio") => {
                 result.audio_streams.push(AudioStream {
@@ -217,6 +218,64 @@ fn detect_hdr(stream: &Value) -> Option<String> {
     }
 }
 
+/// A richer, human HDR label for display — the Dolby Vision profile number and
+/// compatibility, HDR10+ vs HDR10, HLG. Parallels [`detect_hdr`] (which stays
+/// coarse for the decision engine); returns None for SDR.
+fn detect_hdr_format(stream: &Value) -> Option<String> {
+    let side = stream.get("side_data_list").and_then(|v| v.as_array());
+
+    // Dolby Vision: pull the profile + base-layer compatibility from the DOVI
+    // configuration record. Compatibility id tells you what a non-DV client
+    // sees: 1 = HDR10, 6 = Blu-ray HDR10, 4 = HLG, 2 = SDR.
+    if let Some(list) = side {
+        for sd in list {
+            let t = sd
+                .get("side_data_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if t.contains("DOVI") || t.contains("Dolby Vision") {
+                let mut label = match sd.get("dv_profile").and_then(|v| v.as_i64()) {
+                    Some(p) => format!("Dolby Vision · Profile {p}"),
+                    None => "Dolby Vision".to_owned(),
+                };
+                match sd.get("dv_bl_signal_compatibility_id").and_then(|v| v.as_i64()) {
+                    Some(1) | Some(6) => label.push_str(" (HDR10-compatible)"),
+                    Some(4) => label.push_str(" (HLG-compatible)"),
+                    _ => {}
+                }
+                return Some(label);
+            }
+        }
+    }
+    // A DV codec tag with no config record: name it without a profile.
+    if stream
+        .get("codec_tag_string")
+        .and_then(|v| v.as_str())
+        .map(|t| matches!(t, "dvh1" | "dvhe" | "dav1" | "dvav"))
+        .unwrap_or(false)
+    {
+        return Some("Dolby Vision".to_owned());
+    }
+
+    // HDR10+ carries dynamic metadata (SMPTE 2094-40) as side data.
+    if let Some(list) = side {
+        if list.iter().any(|sd| {
+            sd.get("side_data_type")
+                .and_then(|v| v.as_str())
+                .map(|t| t.contains("Dynamic Metadata") || t.contains("SMPTE2094"))
+                .unwrap_or(false)
+        }) {
+            return Some("HDR10+".to_owned());
+        }
+    }
+
+    match stream.get("color_transfer").and_then(|v| v.as_str()) {
+        Some("smpte2084") => Some("HDR10".to_owned()),
+        Some("arib-std-b67") => Some("HLG".to_owned()),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,6 +312,34 @@ mod tests {
         assert_eq!(p.audio_streams[1].index, 1);
         assert_eq!(p.subtitle_streams.len(), 1);
         assert_eq!(p.subtitle_streams[0].language.as_deref(), Some("eng"));
+    }
+
+    #[test]
+    fn hdr_format_reports_dv_profile_and_compat() {
+        let j = json!({
+            "streams": [{
+                "codec_type": "video", "codec_name": "hevc",
+                "side_data_list": [{
+                    "side_data_type": "DOVI configuration record",
+                    "dv_profile": 7, "dv_bl_signal_compatibility_id": 6
+                }]
+            }]
+        });
+        let p = parse_probe_json(&j);
+        assert_eq!(p.hdr.as_deref(), Some("dolby_vision")); // coarse type unchanged
+        assert_eq!(
+            p.hdr_format.as_deref(),
+            Some("Dolby Vision · Profile 7 (HDR10-compatible)")
+        );
+    }
+
+    #[test]
+    fn hdr_format_plain_hdr10() {
+        let j = json!({
+            "streams": [{ "codec_type": "video", "codec_name": "hevc",
+                          "color_transfer": "smpte2084" }]
+        });
+        assert_eq!(parse_probe_json(&j).hdr_format.as_deref(), Some("HDR10"));
     }
 
     #[test]

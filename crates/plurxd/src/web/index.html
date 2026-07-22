@@ -158,6 +158,17 @@
   .chip{background:var(--panel2);border:1px solid var(--line);border-radius:7px;padding:3px 9px;font-size:12px;color:var(--text)}
   .chip.hdr{color:#ffd479;border-color:#5a4a1e;background:#241d0d}
   .chip.res{color:#8fd0ff;border-color:#254458;background:#0f1e29}
+  /* video-type badges (codec / resolution / HDR·DV / audio), color-coded and
+     theme-aware via color-mix so they read on light and dark */
+  .vbadges{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+  .vbadge{display:inline-flex;align-items:center;font-size:11px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;
+    padding:3px 8px;border-radius:6px;border:1px solid var(--line);background:var(--panel2);color:var(--text);white-space:nowrap}
+  .vbadge.res{color:var(--accent);border-color:color-mix(in srgb,var(--accent) 42%,transparent);background:color-mix(in srgb,var(--accent) 13%,transparent)}
+  .vbadge.codec{color:var(--muted)}
+  .vbadge.depth{color:var(--muted)}
+  .vbadge.hdr{color:#12b3a6;border-color:color-mix(in srgb,#12b3a6 48%,transparent);background:color-mix(in srgb,#12b3a6 14%,transparent)}
+  .vbadge.dv{color:#c99a2b;border-color:color-mix(in srgb,#c99a2b 52%,transparent);background:color-mix(in srgb,#c99a2b 15%,transparent)}
+  .vbadge.audio{color:#7f8fe0;border-color:color-mix(in srgb,#7f8fe0 46%,transparent);background:color-mix(in srgb,#7f8fe0 14%,transparent)}
   .actions{display:flex;gap:10px;flex-wrap:wrap;margin:20px 0 6px}
   .btnplay{font-size:15px;padding:11px 22px}
   .overview{color:var(--prose);max-width:72ch;margin:14px 0 0}
@@ -456,8 +467,28 @@ async function viewSearch(q){
 function fmtChannels(n){ return n===8?"7.1":n===7?"6.1":n===6?"5.1":n===2?"2.0":n===1?"Mono":(n?n+"ch":""); }
 function fmtMbps(bps){ return bps? (bps>=1000000? (bps/1000000).toFixed(bps>=10000000?0:1)+" Mb/s" : Math.round(bps/1000)+" kb/s") : ""; }
 function audioLabel(a){ return [a.codec&&a.codec.toUpperCase(), fmtChannels(a.channels), a.language].filter(Boolean).join(" · "); }
+// Video-type badges from a file's probed specs. hdr_format carries the rich
+// label (Dolby Vision profile etc.); DV gets its own gold badge.
+function resLabel(h){ return !h?null:h>=2160?'4K':h>=1080?'1080p':h>=720?'720p':h>=480?'480p':h+'p'; }
+function codecLabel(c){ if(!c) return null; return ({hevc:'HEVC',h265:'HEVC',h264:'H.264',avc1:'H.264',av1:'AV1',vp9:'VP9',vc1:'VC-1',mpeg2video:'MPEG-2'})[c.toLowerCase()]||c.toUpperCase(); }
+function hdrChip(f){ if(f.hdr_format) return {cls:(f.hdr==='dolby_vision'?'dv':'hdr'),text:f.hdr_format};
+  if(f.hdr) return {cls:(f.hdr==='dolby_vision'?'dv':'hdr'),text:hdrLabel(f.hdr)}; return null; }
+function premiumAudio(f){ const cs=(f.audio_streams||[]).map(a=>(a.codec||'').toLowerCase());
+  if(cs.some(c=>c.includes('truehd'))) return 'TrueHD';
+  if(cs.some(c=>c.includes('dts'))) return 'DTS';
+  if(cs.some(c=>c.includes('eac3'))) return 'DD+';
+  return null; }
+function specBadges(f){
+  const b=[];
+  const r=resLabel(f.height); if(r) b.push(`<span class="vbadge res">${r}</span>`);
+  const c=codecLabel(f.video_codec); if(c) b.push(`<span class="vbadge codec">${esc(c)}</span>`);
+  if(f.bit_depth>=10) b.push(`<span class="vbadge depth">${f.bit_depth}-bit</span>`);
+  const h=hdrChip(f); if(h) b.push(`<span class="vbadge ${h.cls}">${esc(h.text)}</span>`);
+  const au=premiumAudio(f); if(au) b.push(`<span class="vbadge audio">${esc(au)}</span>`);
+  return b.join("");
+}
 function specBlock(f){
-  const vid=[f.video_codec&&f.video_codec.toUpperCase(),(f.width&&f.height)?`${f.width}×${f.height}`:null,f.hdr,f.bit_depth?`${f.bit_depth}-bit`:null,fmtMbps(f.bitrate)].filter(Boolean).join(" · ");
+  const vid=[f.video_codec&&f.video_codec.toUpperCase(),(f.width&&f.height)?`${f.width}×${f.height}`:null,(f.hdr_format||f.hdr),f.bit_depth?`${f.bit_depth}-bit`:null,fmtMbps(f.bitrate)].filter(Boolean).join(" · ");
   const aud=(f.audio_streams||[]).map(audioLabel).filter(Boolean).join("  /  ")||"—";
   const file=[f.container&&f.container.toUpperCase(),fmtSize(f.size),fmtDur(f.duration_ms)].filter(Boolean).join(" · ");
   return `<dl class="specs">
@@ -505,8 +536,8 @@ async function viewItem(id){
   if(it.year) chips.push(`<span>${it.year}</span>`);
   if(runtime) chips.push(`<span>${fmtDur(runtime)}</span>`);
   if(it.kind) chips.push(`<span>${esc(it.kind)}</span>`);
-  if(best&&best.height) chips.push(`<span class="chip res">${best.height}p</span>`);
-  if(best&&best.hdr) chips.push(`<span class="chip hdr">${esc(best.hdr)}</span>`);
+  // Video type is shown as color-coded badges (below), not plain chips.
+  const heroBadges = best? specBadges(best) : "";
 
   let body="";
   if(d.files.length){
@@ -526,8 +557,8 @@ async function viewItem(id){
     const multi=d.files.length>1;
     body+=d.files.map(v=>{
       const miss=!v.available;
-      const head=[v.height?`${v.height}p`:null,v.video_codec&&v.video_codec.toUpperCase()].filter(Boolean).join(" · ")||v.filename;
-      return `<div class="version"><div class="vh"><span class="vt">${esc(head)}${miss?'<span class="missbadge">missing</span>':''}</span>
+      const badges=specBadges(v)||`<span class="vt">${esc(v.filename)}</span>`;
+      return `<div class="version"><div class="vh"><span class="vbadges">${badges}${miss?'<span class="missbadge">missing</span>':''}</span>
         ${(!miss&&multi)?`<button class="ghost sm" onclick='play(${v.id},${JSON.stringify(it.title)},${resume},${v.duration_ms||0})'>▶ Play</button>`:''}</div>
         ${specBlock(v)}${miss&&ME.is_admin&&v.missing_path?`<div class="problem">${esc(v.missing_path)}</div>`:''}</div>`;
     }).join("");
@@ -546,6 +577,7 @@ async function viewItem(id){
       <div class="poster">${artHtml(it)}</div>
       <div class="dhead">${crumbs}<h1>${esc(it.title)}</h1>
         <div class="chips">${chips.join("")}</div>
+        ${heroBadges?`<div class="vbadges" style="margin-top:10px">${heroBadges}</div>`:''}
         ${it.overview?`<p class="overview">${esc(it.overview)}</p>`:''}
         ${body}</div>
     </div></div>`;
@@ -828,7 +860,7 @@ function updateStats(){
   const method = PLAYER.method==='direct_play'?'Direct play'
     : PLAYER.method==='transcode'?('Transcode'+(PLAYER.encoder?` · ${PLAYER.encoder}`:'')) : 'Remux';
   // source (from the server probe — the browser never sees these numbers)
-  const srcVideo=[ (s.video_codec||'').toUpperCase(), s.bit_depth?`${s.bit_depth}-bit`:null, s.hdr?hdrLabel(s.hdr):null ].filter(Boolean).join(" · ")||'—';
+  const srcVideo=[ (s.video_codec||'').toUpperCase(), s.bit_depth?`${s.bit_depth}-bit`:null, (s.hdr_format||(s.hdr?hdrLabel(s.hdr):null)) ].filter(Boolean).join(" · ")||'—';
   const srcRes = s.width&&s.height? `${s.width}×${s.height}`:'—';
   const srcBr = s.bitrate? fmtMbps(s.bitrate):'—';
   const srcCont=(s.container||'—').toUpperCase();

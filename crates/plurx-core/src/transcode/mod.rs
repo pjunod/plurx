@@ -85,12 +85,24 @@ fn video_filters(source: &MediaFile, opts: &TranscodeOptions, source_path: &str)
                  color_trc=bt709:format=yuv420p"
                     .to_owned(),
             ),
-            ToneMap::Zscale => chain.push(
-                "zscale=t=linear:npl=100,format=gbrpf32le,\
-                 tonemap=tonemap=hable:desat=0,\
-                 zscale=p=bt709:t=bt709:m=bt709:r=tv,format=yuv420p"
-                    .to_owned(),
-            ),
+            ToneMap::Zscale => {
+                // Declare the input transfer/primaries/matrix explicitly instead
+                // of letting zscale read them off the frame. Hardware decode
+                // (QSV/VAAPI) frequently drops color metadata across the
+                // hwdownload, so an inferred `t=linear` mis-maps the PQ signal to
+                // a flat gray picture — the exact 4K-HDR/DV symptom. HDR is
+                // BT.2020; PQ (HDR10/HDR10+/DV) vs HLG differ only in transfer.
+                let tin = if source.hdr.as_deref() == Some("hlg") {
+                    "arib-std-b67"
+                } else {
+                    "smpte2084"
+                };
+                chain.push(format!(
+                    "zscale=tin={tin}:min=bt2020nc:pin=bt2020:t=linear:npl=100,format=gbrpf32le,\
+                     tonemap=tonemap=hable:desat=0,\
+                     zscale=p=bt709:t=bt709:m=bt709:r=tv,format=yuv420p"
+                ));
+            }
         }
     } else {
         // Normalize to a browser-safe pixel format.
@@ -288,6 +300,7 @@ mod tests {
             height: Some(2160),
             bit_depth: Some(10),
             hdr: hdr.map(str::to_owned),
+            hdr_format: None,
             bitrate: Some(60_000_000),
             audio_streams: vec![],
             subtitle_streams: vec![],

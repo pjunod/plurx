@@ -116,6 +116,8 @@ pub struct FileDto {
     pub height: Option<i64>,
     pub bit_depth: Option<i64>,
     pub hdr: Option<String>,
+    /// Rich HDR label for display ("Dolby Vision · Profile 7 (HDR10-compatible)").
+    pub hdr_format: Option<String>,
     pub bitrate: Option<i64>,
     pub audio_streams: Vec<AudioStream>,
     pub subtitle_streams: Vec<SubtitleStream>,
@@ -149,6 +151,7 @@ impl From<MediaFile> for FileDto {
             height: f.height,
             bit_depth: f.bit_depth,
             hdr: f.hdr,
+            hdr_format: f.hdr_format,
             bitrate: f.bitrate,
             audio_streams: f.audio_streams,
             subtitle_streams: f.subtitle_streams,

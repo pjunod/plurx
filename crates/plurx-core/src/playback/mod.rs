@@ -194,6 +194,7 @@ mod tests {
             height: Some(1080),
             bit_depth: Some(8),
             hdr: None,
+            hdr_format: None,
             bitrate: Some(8_000_000),
             audio_streams: vec![AudioStream {
                 index: 0,

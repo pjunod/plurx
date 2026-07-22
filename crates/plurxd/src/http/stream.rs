@@ -104,6 +104,8 @@ pub struct SourceSummary {
     pub bit_depth: Option<i64>,
     /// "hdr10" | "hlg" | "dolby_vision" | null (SDR/unknown).
     pub hdr: Option<String>,
+    /// Rich HDR label for display ("Dolby Vision · Profile 7 (HDR10-compatible)").
+    pub hdr_format: Option<String>,
     /// Overall bitrate in bits/sec, if the container reported one.
     pub bitrate: Option<i64>,
     pub duration_ms: Option<i64>,
@@ -151,6 +153,7 @@ fn source_summary(file: &MediaFile) -> SourceSummary {
         height: file.height,
         bit_depth: file.bit_depth,
         hdr: file.hdr.clone(),
+        hdr_format: file.hdr_format.clone(),
         bitrate: file.bitrate,
         duration_ms: file.duration_ms,
     }

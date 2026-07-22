@@ -389,9 +389,9 @@ impl MediaStore for SqliteStore {
                 "INSERT INTO files
                    (item_id, path, size, mtime, duration_ms, container, video_codec,
                     video_profile, width, height, bit_depth, hdr, bitrate,
-                    audio_streams, subtitle_streams, probe_json, scanned_at)
+                    audio_streams, subtitle_streams, probe_json, hdr_format, scanned_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                         ?14, ?15, ?16, unixepoch())
+                         ?14, ?15, ?16, ?17, unixepoch())
                  ON CONFLICT(path) DO UPDATE SET
                      item_id = excluded.item_id,
                      size = excluded.size,
@@ -408,6 +408,7 @@ impl MediaStore for SqliteStore {
                      audio_streams = excluded.audio_streams,
                      subtitle_streams = excluded.subtitle_streams,
                      probe_json = excluded.probe_json,
+                     hdr_format = excluded.hdr_format,
                      scanned_at = unixepoch()
                  RETURNING id",
                 params![
@@ -427,6 +428,7 @@ impl MediaStore for SqliteStore {
                     audio,
                     subs,
                     probe.raw_json,
+                    probe.hdr_format,
                 ],
                 |row| row.get(0),
             )?;

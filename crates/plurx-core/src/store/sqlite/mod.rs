@@ -135,6 +135,10 @@ const MIGRATIONS: &[&str] = &[
     // v3: Phase 2 — mark a (shows) library as anime, so the scanner uses
     // absolute episode numbering and enriches from AniList.
     "ALTER TABLE libraries ADD COLUMN anime INTEGER NOT NULL DEFAULT 0;",
+    // v4: a human HDR label incl. the Dolby Vision profile ("Dolby Vision ·
+    // Profile 7 (HDR10-compatible)", "HDR10+"). `hdr` stays the coarse type the
+    // decision engine keys on; this is display detail. Backfilled on next scan.
+    "ALTER TABLE files ADD COLUMN hdr_format TEXT;",
 ];
 
 /// Column list matching [`item_from_row`]. Prefix with a table alias via
@@ -189,7 +193,7 @@ fn item_from_row(row: &Row<'_>, base: usize) -> rusqlite::Result<Item> {
 
 const FILE_COLS: &str = "id, item_id, path, size, mtime, duration_ms, container, video_codec, \
      video_profile, width, height, bit_depth, hdr, bitrate, audio_streams, \
-     subtitle_streams, scanned_at";
+     subtitle_streams, scanned_at, hdr_format";
 
 fn file_from_row(row: &Row<'_>) -> rusqlite::Result<MediaFile> {
     let path: String = row.get(2)?;
@@ -215,6 +219,7 @@ fn file_from_row(row: &Row<'_>) -> rusqlite::Result<MediaFile> {
         subtitle_streams: serde_json::from_str(&subs_json)
             .map_err(|e| conversion_err(15, format!("subtitle_streams: {e}")))?,
         scanned_at: row.get(16)?,
+        hdr_format: row.get(17)?,
     })
 }
 
@@ -253,9 +258,58 @@ impl SqliteStore {
         conn.pragma_update(None, "busy_timeout", 5000)?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         Self::migrate(&conn)?;
+        Self::backfill_hdr_format(&conn)?;
         Ok(SqliteStore {
             conn: Arc::new(Mutex::new(conn)),
         })
+    }
+
+    /// One-time backfill of `hdr_format` from the probe JSON already stored for
+    /// each file. The incremental scanner skips unchanged files, so without this
+    /// an existing library would never show the new HDR/Dolby-Vision detail
+    /// short of a destructive re-add. Gated by a settings flag so it runs once.
+    fn backfill_hdr_format(conn: &Connection) -> Result<(), StoreError> {
+        const FLAG: &str = "hdr_format_backfilled_v1";
+        let done: Option<String> = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params![FLAG],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if done.is_some() {
+            return Ok(());
+        }
+        let rows: Vec<(i64, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT id, probe_json FROM files \
+                 WHERE hdr_format IS NULL AND probe_json IS NOT NULL",
+            )?;
+            let mapped = stmt.query_map([], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })?;
+            mapped.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut updated = 0usize;
+        for (id, json) in rows {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&json) {
+                if let Some(fmt) = crate::scan::probe::parse_probe_json(&value).hdr_format {
+                    conn.execute(
+                        "UPDATE files SET hdr_format = ?1 WHERE id = ?2",
+                        params![fmt, id],
+                    )?;
+                    updated += 1;
+                }
+            }
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, '1')",
+            params![FLAG],
+        )?;
+        if updated > 0 {
+            tracing::info!(updated, "backfilled HDR detail from stored probe data");
+        }
+        Ok(())
     }
 
     fn migrate(conn: &Connection) -> Result<(), StoreError> {
