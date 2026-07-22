@@ -1,0 +1,16 @@
+#!/bin/sh
+# plurx pre-commit hook — keeps main green by running the same gate as CI.
+# Install with `make hooks`. Bypass a single commit with `git commit --no-verify`.
+#
+# Runs against your working tree (what you're about to commit). Kept to the
+# fast path: fmt-check, clippy, and the test suite all finish in seconds on a
+# warm build; the first run after a pull may compile more.
+set -e
+
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "pre-commit: cargo not found on PATH — skipping checks." >&2
+    exit 0
+fi
+
+echo "pre-commit: make check (fmt-check + clippy + test)…"
+make check

@@ -1,5 +1,8 @@
 # plurx
 
+[![ci](https://github.com/pjunod/plurx/actions/workflows/ci.yml/badge.svg)](https://github.com/pjunod/plurx/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/pjunod/plurx/branch/main/graph/badge.svg)](https://codecov.io/gh/pjunod/plurx)
+
 A self-hosted media server and player family in the spirit of **old-school Plex** — before the streaming tiles, live TV, ads, and cloud accounts. Your media, your hardware, your network. One lean server binary, clients everywhere, and something no media server has ever shipped: **real high-availability clustering**.
 
 ## Principles
@@ -53,6 +56,34 @@ Deferred to a Phase 2.x fast-follow: TVDB agent (TMDB already covers TV), movie 
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Server design — components, cluster/replication model, streaming pipeline, tech stack |
 | [docs/CLIENTS.md](docs/CLIENTS.md) | Client strategy — platform matrix, Plex client compatibility tiers, per-platform constraints |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | Phased plan sized for a solo developer + AI pair, always-shippable increments |
+
+## Development
+
+All developer tasks go through the `Makefile` — CI runs the same targets, so
+"green locally" means "green in CI":
+
+```sh
+make            # list every target
+make run        # serve http://localhost:32600
+make check      # fmt-check + clippy + test (the CI gate)
+make test       # just the tests
+make coverage   # line coverage via cargo-llvm-cov → lcov.info
+make hooks      # install a pre-commit hook that runs `make check`
+```
+
+`make hooks` installs a git pre-commit hook so a commit can't land unless
+`make check` passes (bypass a single commit with `git commit --no-verify`).
+
+CI (`.github/workflows/ci.yml`) runs `make check`, uploads coverage, and
+cross-builds amd64 + arm64 on every push and PR. Pushing a version tag
+(`git tag v0.1.0 && git push --tags`) additionally builds and publishes a
+multi-arch image to `ghcr.io/pjunod/plurx`.
+
+The two badges above need one-time linking to render live: the **ci** badge
+works as soon as the workflow runs on GitHub; the **coverage** badge needs the
+repo added at [codecov.io](https://codecov.io) and its upload token stored as
+the `CODECOV_TOKEN` repository secret (CI is configured to not fail if it's
+absent).
 
 ## License
 
