@@ -198,19 +198,37 @@ fn validation_args(encoder: Encoder) -> Vec<String> {
 }
 
 async fn validate(ffmpeg_bin: &str, encoder: Encoder) -> bool {
-    let ok = tokio::process::Command::new(ffmpeg_bin)
+    let output = tokio::process::Command::new(ffmpeg_bin)
         .args(validation_args(encoder))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if ok {
-        tracing::info!(encoder = encoder.label(), "hardware encoder validated");
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await;
+    match output {
+        Ok(out) if out.status.success() => {
+            tracing::info!(encoder = encoder.label(), "hardware encoder validated");
+            true
+        }
+        Ok(out) => {
+            // Capturing stderr is the whole point: a bare "software x264" tells
+            // the operator nothing, but "vaapi failed: Permission denied" points
+            // straight at a missing render-group / device passthrough. Shown in
+            // the admin log viewer at WARN.
+            let why = String::from_utf8_lossy(&out.stderr);
+            let why = why.lines().last().map(str::trim).unwrap_or("").trim();
+            tracing::warn!(
+                encoder = encoder.label(),
+                reason = if why.is_empty() { "no error output" } else { why },
+                "hardware encoder present but failed validation — not using it"
+            );
+            false
+        }
+        Err(e) => {
+            tracing::warn!(encoder = encoder.label(), error = %e, "could not run encoder probe");
+            false
+        }
     }
-    ok
 }
 
 /// Detect *usable* encoders: parse the build's encoder list, then test-encode
