@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>plurx</title>
+<title>cinemarr</title>
 <style>
   :root{
     --bg:#0e0f13; --panel:#171922; --panel2:#1e2230; --line:#2a2f3e;
@@ -196,6 +196,10 @@
 // variant; appearance (auto/dark/light) picks the variant, auto following the
 // OS and falling back to dark. Persisted in localStorage.
 "use strict";
+// Display name only — the on-screen product brand. Internal names (crates,
+// binary, PLURX_* env, data paths) are unchanged. Change this one line to
+// rebrand the whole UI.
+const APP_NAME="cinemarr";
 const FONT_UI="system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif";
 const FONT_MONO="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace";
 const THEMES={
@@ -226,6 +230,7 @@ function applyTheme(){
   root.dataset.theme=id||"classic"; root.dataset.mode=mode;
 }
 applyTheme();
+try{ document.title=APP_NAME; }catch(e){}
 if(window.matchMedia){ try{ window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change",()=>{ if((localStorage.getItem("plurx_appearance")||"auto")==="auto") applyTheme(); }); }catch(e){} }
 </script>
 </head>
@@ -284,7 +289,7 @@ async function boot(){
 }
 function authShell(title, sub, fields, btn, onsubmit){
   document.getElementById("app").innerHTML=`<div class="center"><form class="card auth" id="af">
-    <div class="logo" style="font-size:30px">plurx</div>
+    <div class="logo" style="font-size:30px">${APP_NAME}</div>
     <h1>${title}</h1><p class="muted" style="margin-top:0">${sub}</p>
     ${fields}<div class="err" id="aerr"></div>
     <button style="width:100%;margin-top:16px" id="ab">${btn}</button></form></div>`;
@@ -318,7 +323,7 @@ function chrome(active, inner){
   const back = (location.hash&&location.hash!=="#/") ? `<button class="ghost sm" onclick="history.back()" title="Back">‹ Back</button>`:"";
   document.getElementById("app").innerHTML=`
    <header class="top">
-     ${back}<a href="#/" class="logo">plurx</a>
+     ${back}<a href="#/" class="logo">${APP_NAME}</a>
      <nav><a href="#/" class="${active==='home'?'active':''}">Home</a>${admin}</nav>
      <span class="spacer"></span>
      <span class="activity" id="activity" onclick="${ME&&ME.is_admin?"location.hash='#/settings'":""}"></span>
@@ -929,7 +934,7 @@ async function viewSettings(){
   document.getElementById("main").innerHTML=`<div class="adminwrap">
     <div class="card"><h2 class="section" style="margin-top:0">Server</h2>
       <dl class="kvgrid">
-        <dt>Server</dt><dd>${esc(sys.name)} · plurx ${esc(sys.version)} · up ${fmtUptime(sys.uptime_seconds)}</dd>
+        <dt>Server</dt><dd>${esc(sys.name)} · ${APP_NAME} ${esc(sys.version)} · up ${fmtUptime(sys.uptime_seconds)}</dd>
         <dt>Data dir</dt><dd>${esc(sys.data_dir)}</dd>
         <dt>ffmpeg</dt><dd>${sys.ffmpeg_version?esc(sys.ffmpeg_version):`<span style="color:var(--bad)">not found at \`${esc(sys.ffmpeg)}\` — scanning and transcoding will fail</span>`}</dd>
         <dt>Hardware</dt><dd>${pills}</dd>
