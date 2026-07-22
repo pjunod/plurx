@@ -1,0 +1,42 @@
+# Host-specific compose override — copy to docker-compose.override.yml (which
+# is gitignored) and edit for THIS machine. Compose merges it automatically.
+#
+#   cp docker-compose.override.example.yml docker-compose.override.yml
+#
+# Every volume line must be `host:container` — a line with no colon does NOT
+# bind your folder; it creates an empty anonymous volume at that path inside
+# the container, and scans of it will (loudly, now) find nothing.
+#
+# The paths you enter in the plurx web UI are the *container-side* paths:
+# mount /mnt/qnap/media at /media below, then add /media/movies in the UI.
+# Mounting shares at the same path as the host (second example) keeps UI
+# paths identical to host paths — pick whichever you find saner.
+
+services:
+  plurxd:
+    volumes:
+      - /mnt/qnap/media:/media:ro
+      # - /mnt/qnap/20t:/mnt/qnap/20t:ro
+      # - /mnt/qnap/8tb:/mnt/qnap/8tb:ro
+
+    # Point at a specific ffmpeg build (e.g. jellyfin-ffmpeg), force an
+    # encoder family, or leave unset for validated auto-detect:
+    # environment:
+    #   PLURX_FFMPEG: "/usr/lib/jellyfin-ffmpeg/ffmpeg"
+    #   PLURX_FFPROBE: "/usr/lib/jellyfin-ffmpeg/ffprobe"
+    #   PLURX_HWACCEL: "vaapi"   # nvenc | qsv | vaapi | videotoolbox | software
+
+    # --- Hardware transcode passthrough (uncomment for your GPU) ---
+    #
+    # Intel QuickSync / AMD VA-API:
+    # devices:
+    #   - /dev/dri:/dev/dri
+    #
+    # NVIDIA (needs nvidia-container-toolkit on the host):
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]

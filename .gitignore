@@ -5,3 +5,5 @@
 *.db-wal
 _to_delete/
 .DS_Store
+deploy/docker-compose.override.yml
+deploy/.env

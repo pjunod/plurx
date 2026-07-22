@@ -5,15 +5,22 @@ path that matches your setup.
 
 ## Docker / Compose (recommended for homelabs)
 
-Edit the media path in [`docker-compose.yml`](docker-compose.yml), then:
+Host-specific bits (media mounts, GPU, ports) live in an untracked override
+file, so pulling updates never conflicts with your local edits:
 
 ```sh
-docker compose up -d
+cd deploy
+cp docker-compose.override.example.yml docker-compose.override.yml
+$EDITOR docker-compose.override.yml   # your media mounts (host:container:ro), your GPU
+docker compose up -d --build          # builds the image from source the first time
 ```
 
-Open `http://<host>:32600` and create your admin account. For hardware
-transcode, uncomment the GPU block for your card (Intel/AMD via `/dev/dri`,
-NVIDIA via the container toolkit).
+Open `http://<host>:32600` and create your admin account. Library paths in
+the web UI are the *container-side* paths (e.g. `/media/movies`). For
+hardware transcode, uncomment the GPU block in your override (Intel/AMD via
+`/dev/dri`, NVIDIA via the container toolkit). If another service (a
+still-running Plex) owns UDP 32414, set `PLURX_GDM_PORT` in `.env`
+(see `.env.example`).
 
 ## Bare metal
 
@@ -44,7 +51,7 @@ single replica.
 | Port | Proto | Purpose |
 |---|---|---|
 | 32600 | TCP | HTTP API + web app (and the Plex-compat façade) |
-| 32414 | UDP | GDM discovery so Plex/Kodi clients find the server on the LAN |
+| 32414 | UDP | GDM discovery so Plex/Kodi clients find the server on the LAN (host port movable via `PLURX_GDM_PORT`, but discovery only works on 32414) |
 
 ## Observability
 

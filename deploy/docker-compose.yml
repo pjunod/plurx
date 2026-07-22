@@ -1,14 +1,21 @@
 # plurx single-node deployment.
 #
-# Bring up (builds the image from source the first time):
+# Host-specific configuration (your media mounts, GPU passthrough, alternate
+# ports) belongs in an override file, so this tracked file never needs local
+# edits and `git pull` always applies cleanly:
+#
+#   cp docker-compose.override.example.yml docker-compose.override.yml
+#   $EDITOR docker-compose.override.yml         # your mounts, your GPU
+#   cp .env.example .env                        # only if changing ports
 #   docker compose up -d --build
-# Then open http://<host>:32600 and create your admin account.
 #
-# There is no published image yet, so the service builds from the Dockerfile in
-# the repo root. Once a registry image exists, drop the `build:` block and just
-# `docker compose up -d` to pull `image:`.
+# Compose merges docker-compose.override.yml automatically; both it and .env
+# are gitignored. There is no published registry image yet, so the service
+# builds from the Dockerfile in the repo root ('up -d --build' the first time
+# and after pulling changes). Once a registry image exists, the `build:` block
+# goes away.
 #
-# Media is mounted read-only; plurx never writes to your library. The named
+# plurx never writes to your media; mount it read-only (`:ro`). The named
 # volume holds the database, artwork cache, and transcode scratch.
 
 services:
@@ -20,34 +27,18 @@ services:
     container_name: plurxd
     restart: unless-stopped
     ports:
-      - "32600:32600"      # HTTP API + web app
-      - "32414:32414/udp"  # GDM discovery for Plex clients (LAN)
+      - "32600:32600"                          # HTTP API + web app
+      # GDM discovery for Plex clients. Discovery only works on host port
+      # 32414; if something else owns it (a still-running Plex), set
+      # PLURX_GDM_PORT in .env to park it elsewhere until Plex retires.
+      - "${PLURX_GDM_PORT:-32414}:32414/udp"
     environment:
       PLURX_SERVER_NAME: "plurx"
       PLURX_BIND: "0.0.0.0:32600"
       PLURX_DATA_DIR: "/var/lib/plurx"
-      # Point at a specific ffmpeg build (e.g. jellyfin-ffmpeg) if desired:
-      # PLURX_FFMPEG: "/usr/lib/jellyfin-ffmpeg/ffmpeg"
-      # PLURX_FFPROBE: "/usr/lib/jellyfin-ffmpeg/ffprobe"
-      # Force an encoder, or leave unset for validated auto-detect:
-      # PLURX_HWACCEL: "vaapi"   # nvenc | qsv | vaapi | videotoolbox | software
     volumes:
       - plurx-data:/var/lib/plurx
-      - /path/to/your/media:/media:ro
-    # --- Hardware transcode passthrough (uncomment the block for your GPU) ---
-    #
-    # Intel QuickSync / VA-API (and AMD VA-API):
-    # devices:
-    #   - /dev/dri:/dev/dri
-    #
-    # NVIDIA (needs nvidia-container-toolkit on the host):
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: 1
-    #           capabilities: [gpu]
+      # Media mounts go in docker-compose.override.yml (see example file).
 
 volumes:
   plurx-data:
