@@ -90,11 +90,14 @@ pub async fn list_items(
 #[derive(Serialize)]
 pub struct ItemDetail {
     pub item: ItemDto,
+    /// Parent chain, outermost first (show, then season) — the breadcrumb.
+    pub ancestors: Vec<ItemDto>,
     pub children: Vec<ItemDto>,
     pub files: Vec<FileDto>,
 }
 
-/// GET /api/v1/items/:id — item plus its children (seasons/episodes) and files.
+/// GET /api/v1/items/:id — item plus its ancestors (for breadcrumbs),
+/// children (seasons/episodes), and files.
 pub async fn item_detail(
     AuthUser(user): AuthUser,
     State(state): State<AppState>,
@@ -105,6 +108,24 @@ pub async fn item_detail(
         .get_item(id)
         .await?
         .ok_or(ApiError::NotFound("item"))?;
+
+    // Walk up the parent chain (episode → season → show; ≤2 hops today, the
+    // guard is against a data cycle ever looping this forever).
+    let mut ancestors = Vec::new();
+    let mut cursor = item.parent_id;
+    while let Some(parent_id) = cursor {
+        match state.store.get_item(parent_id).await? {
+            Some(parent) => {
+                cursor = parent.parent_id;
+                ancestors.push(parent);
+                if ancestors.len() >= 8 {
+                    break;
+                }
+            }
+            None => break,
+        }
+    }
+    ancestors.reverse();
 
     let children = state.store.get_item_children(id).await?;
     let files = match item.kind {
@@ -120,6 +141,7 @@ pub async fn item_detail(
     let item_dto = ItemDto::from(item).with_watch(watch.get(&id).copied());
     Ok(Json(ItemDetail {
         item: item_dto,
+        ancestors: ancestors.into_iter().map(Into::into).collect(),
         children: annotate(children, &watch),
         files: files.into_iter().map(Into::into).collect(),
     }))
