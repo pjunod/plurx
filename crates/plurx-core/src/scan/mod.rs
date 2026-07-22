@@ -479,7 +479,9 @@ mod tests {
         assert_eq!(r.added, 0);
         assert_eq!(r.errors, 0);
         assert!(
-            r.problems.iter().any(|p| p.contains("no video files found")),
+            r.problems
+                .iter()
+                .any(|p| p.contains("no video files found")),
             "problems: {:?}",
             r.problems
         );
