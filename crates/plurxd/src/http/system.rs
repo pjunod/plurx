@@ -134,6 +134,22 @@ pub async fn logs(
 #[derive(Serialize)]
 pub struct SettingsDto {
     pub tmdb_configured: bool,
+    /// The stored TMDB key itself. This endpoint is admin-only and the key is
+    /// low-sensitivity (read-only metadata), so the admin who set it can see
+    /// and copy it back — the web UI masks it until clicked. Empty when unset.
+    pub tmdb_api_key: String,
+}
+
+async fn settings_dto(state: &AppState) -> Result<SettingsDto, ApiError> {
+    let tmdb_api_key = state
+        .store
+        .get_setting(keys::TMDB_API_KEY)
+        .await?
+        .unwrap_or_default();
+    Ok(SettingsDto {
+        tmdb_configured: !tmdb_api_key.is_empty(),
+        tmdb_api_key,
+    })
 }
 
 /// GET /api/v1/settings (admin)
@@ -141,13 +157,7 @@ pub async fn get_settings(
     _admin: AdminUser,
     State(state): State<AppState>,
 ) -> Result<Json<SettingsDto>, ApiError> {
-    let tmdb_configured = state
-        .store
-        .get_setting(keys::TMDB_API_KEY)
-        .await?
-        .map(|v| !v.is_empty())
-        .unwrap_or(false);
-    Ok(Json(SettingsDto { tmdb_configured }))
+    Ok(Json(settings_dto(&state).await?))
 }
 
 #[derive(Deserialize)]
@@ -168,13 +178,7 @@ pub async fn update_settings(
             .put_setting(keys::TMDB_API_KEY, key.trim())
             .await?;
     }
-    let tmdb_configured = state
-        .store
-        .get_setting(keys::TMDB_API_KEY)
-        .await?
-        .map(|v| !v.is_empty())
-        .unwrap_or(false);
-    Ok(Json(SettingsDto { tmdb_configured }))
+    Ok(Json(settings_dto(&state).await?))
 }
 
 /// GET /api/v1/scan/status — per-library scan status (keyed by library id).

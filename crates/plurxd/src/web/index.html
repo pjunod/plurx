@@ -488,8 +488,10 @@ async function viewSettings(){
       <div class="err" id="uerr"></div>
       <button style="margin-top:12px" onclick="addUser()">Add user</button></div>
     <div class="card"><h2 class="section" style="margin-top:0">Metadata (TMDB)</h2>
-      <p class="muted" style="margin-top:0">${settings.tmdb_configured?"A TMDB API key is configured. Enter a new one to replace it.":"Add a TMDB API key to fetch posters, overviews, and episode data."}</p>
-      <input id="tk" placeholder="TMDB API key" type="password"><div class="err" id="terr"></div>
+      <p class="muted" style="margin-top:0">${settings.tmdb_configured?"A TMDB API key is configured. Click the field to reveal it, or type a new one to replace it.":"Add a TMDB API key to fetch posters, overviews, and episode data."}</p>
+      <input id="tk" placeholder="TMDB API key" type="password" autocomplete="off"
+        value="${esc(settings.tmdb_api_key||'')}"
+        onfocus="this.type='text'" onblur="this.type='password'"><div class="err" id="terr"></div>
       <button style="margin-top:12px" onclick="saveTmdb()">Save key</button></div>
     <div class="card"><h2 class="section" style="margin-top:0">Logs</h2>
       <div class="row"><select id="loglvl" style="max-width:120px" onchange="refreshLogs()">
