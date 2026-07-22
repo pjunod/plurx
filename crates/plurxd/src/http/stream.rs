@@ -29,6 +29,14 @@ fn ffmpeg_bin() -> String {
         .unwrap_or_else(|| "ffmpeg".to_owned())
 }
 
+/// ffprobe binary, overridable via `PLURX_FFPROBE` (jellyfin-ffmpeg / pinned).
+fn ffprobe_bin() -> String {
+    std::env::var("PLURX_FFPROBE")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "ffprobe".to_owned())
+}
+
 async fn load_file(state: &AppState, id: i64) -> Result<MediaFile, ApiError> {
     state
         .store
@@ -83,6 +91,40 @@ pub struct SubTrackDto {
     pub text: bool,
 }
 
+/// A compact description of the source file's video, for the stats overlay's
+/// "source → target" line. Numbers the player already has no cheap way to learn
+/// (the browser only sees the transcoded output).
+#[derive(Serialize)]
+pub struct SourceSummary {
+    pub container: Option<String>,
+    pub video_codec: Option<String>,
+    pub video_profile: Option<String>,
+    pub width: Option<i64>,
+    pub height: Option<i64>,
+    pub bit_depth: Option<i64>,
+    /// "hdr10" | "hlg" | "dolby_vision" | null (SDR/unknown).
+    pub hdr: Option<String>,
+    /// Overall bitrate in bits/sec, if the container reported one.
+    pub bitrate: Option<i64>,
+    pub duration_ms: Option<i64>,
+}
+
+/// A skippable region of the timeline (opening titles, end credits). Derived
+/// from real chapter markers when the file has them, otherwise a conservative
+/// heuristic for end credits only (`chapter: false`).
+#[derive(Serialize)]
+pub struct Marker {
+    /// "intro" | "credits".
+    pub kind: String,
+    /// Button label, e.g. "Skip Intro".
+    pub label: String,
+    pub start_ms: i64,
+    pub end_ms: i64,
+    /// True when this came from an actual chapter title; false for the
+    /// duration-based credits guess (so the UI can hedge the wording).
+    pub chapter: bool,
+}
+
 #[derive(Serialize)]
 pub struct DecisionResponse {
     pub file_id: i64,
@@ -90,10 +132,28 @@ pub struct DecisionResponse {
     pub decision: Decision,
     /// The URL the client should use to play, given the verdict.
     pub play_url: String,
+    /// Source video/container facts for the stats overlay.
+    pub source: SourceSummary,
     /// Selectable audio tracks (for the player's audio-language menu).
     pub audio: Vec<AudioTrackDto>,
     /// Selectable text subtitle tracks (served as WebVTT sidecars).
     pub subtitles: Vec<SubTrackDto>,
+    /// Skippable intro/credits regions (chapter-derived where possible).
+    pub markers: Vec<Marker>,
+}
+
+fn source_summary(file: &MediaFile) -> SourceSummary {
+    SourceSummary {
+        container: file.container.clone(),
+        video_codec: file.video_codec.clone(),
+        video_profile: file.video_profile.clone(),
+        width: file.width,
+        height: file.height,
+        bit_depth: file.bit_depth,
+        hdr: file.hdr.clone(),
+        bitrate: file.bitrate,
+        duration_ms: file.duration_ms,
+    }
 }
 
 fn audio_tracks(file: &MediaFile) -> Vec<AudioTrackDto> {
@@ -127,6 +187,128 @@ fn sub_tracks(file: &MediaFile) -> Vec<SubTrackDto> {
         .collect()
 }
 
+/// Classify a chapter title as an intro or end-credits marker. Case-insensitive
+/// substring match against the conventions used by MakeMKV, anime releases, and
+/// hand-authored chapters. Returns the marker kind + button label, or `None`.
+fn classify_chapter(title: &str) -> Option<(&'static str, &'static str)> {
+    let t = title.trim().to_lowercase();
+    // Exact single-token anime conventions (OP/ED, non-credit variants).
+    if matches!(t.as_str(), "op" | "ncop") {
+        return Some(("intro", "Skip Intro"));
+    }
+    if matches!(t.as_str(), "ed" | "nced") {
+        return Some(("credits", "Skip Credits"));
+    }
+    let intro_kw = [
+        "intro",
+        "opening",
+        "cold open",
+        "previously on",
+        "recap",
+        "title sequence",
+        "main titles",
+    ];
+    let credit_kw = [
+        "end credit",
+        "credits",
+        "ending",
+        "outro",
+        "closing",
+        "next episode",
+        "preview",
+    ];
+    // "Opening Credits" is the front titles, not the tail — intro wins.
+    let is_opening_titles = t.contains("opening") && t.contains("credits");
+    if is_opening_titles || (intro_kw.iter().any(|k| t.contains(k)) && !t.contains("credit")) {
+        return Some(("intro", "Skip Intro"));
+    }
+    if credit_kw.iter().any(|k| t.contains(k)) {
+        return Some(("credits", "Skip Credits"));
+    }
+    None
+}
+
+/// Probe the file's chapters (one `ffprobe` call) and derive skippable
+/// intro/credits markers. Falls back to a single duration-based end-credits
+/// guess when the file has no usable chapter markers, so the "Skip Credits"
+/// affordance still exists on the common case of a chapterless episode.
+async fn markers_for(path: &Path, duration_ms: Option<i64>) -> Vec<Marker> {
+    let mut out = Vec::new();
+    let probe = tokio::process::Command::new(ffprobe_bin())
+        .args([
+            "-v",
+            "error",
+            "-print_format",
+            "json",
+            "-show_chapters",
+            "-i",
+        ])
+        .arg(path)
+        .stdin(Stdio::null())
+        .output()
+        .await;
+
+    if let Ok(o) = probe {
+        if o.status.success() {
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&o.stdout) {
+                if let Some(chapters) = v.get("chapters").and_then(|c| c.as_array()) {
+                    for ch in chapters {
+                        let title = ch
+                            .get("tags")
+                            .and_then(|t| t.get("title"))
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("");
+                        let Some((kind, label)) = classify_chapter(title) else {
+                            continue;
+                        };
+                        let start_ms = ch
+                            .get("start_time")
+                            .and_then(|s| s.as_str())
+                            .and_then(|s| s.parse::<f64>().ok())
+                            .map(|s| (s * 1000.0) as i64);
+                        let end_ms = ch
+                            .get("end_time")
+                            .and_then(|s| s.as_str())
+                            .and_then(|s| s.parse::<f64>().ok())
+                            .map(|s| (s * 1000.0) as i64);
+                        if let (Some(start_ms), Some(end_ms)) = (start_ms, end_ms) {
+                            if end_ms > start_ms {
+                                out.push(Marker {
+                                    kind: kind.to_owned(),
+                                    label: label.to_owned(),
+                                    start_ms,
+                                    end_ms,
+                                    chapter: true,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Heuristic end-credits fallback: only when chapters gave us nothing and we
+    // know the runtime. Conservative window (last 60s, or 8% for long films),
+    // marked chapter:false so the UI can label it as an estimate.
+    let has_credits = out.iter().any(|m| m.kind == "credits");
+    if !has_credits {
+        if let Some(dur) = duration_ms.filter(|d| *d > 5 * 60_000) {
+            let tail = (dur / 12).clamp(45_000, 150_000);
+            out.push(Marker {
+                kind: "credits".to_owned(),
+                label: "Skip Credits".to_owned(),
+                start_ms: dur - tail,
+                end_ms: dur,
+                chapter: false,
+            });
+        }
+    }
+
+    out.sort_by_key(|m| m.start_ms);
+    out
+}
+
 /// GET /api/v1/files/:id/decision?profile=web-h264
 pub async fn decision(
     _user: AuthUser,
@@ -155,12 +337,15 @@ pub async fn decision(
         playback::PlaybackMethod::DirectPlay => format!("/api/v1/files/{id}/direct"),
         _ => format!("/api/v1/files/{id}/stream.mp4"),
     };
+    let markers = markers_for(&file.path, file.duration_ms).await;
     Ok(Json(DecisionResponse {
         file_id: id,
+        source: source_summary(&file),
         decision,
         play_url,
         audio: audio_tracks(&file),
         subtitles: sub_tracks(&file),
+        markers,
     }))
 }
 
@@ -474,5 +659,30 @@ mod tests {
         assert_eq!(content_type(Path::new("a.mp4")), "video/mp4");
         assert_eq!(content_type(Path::new("a.mkv")), "video/x-matroska");
         assert_eq!(content_type(Path::new("a.webm")), "video/webm");
+    }
+
+    #[test]
+    fn chapter_classification() {
+        assert_eq!(classify_chapter("Intro").map(|m| m.0), Some("intro"));
+        assert_eq!(classify_chapter("Opening").map(|m| m.0), Some("intro"));
+        assert_eq!(classify_chapter("OP").map(|m| m.0), Some("intro"));
+        assert_eq!(
+            classify_chapter("Previously On").map(|m| m.0),
+            Some("intro")
+        );
+        assert_eq!(
+            classify_chapter("End Credits").map(|m| m.0),
+            Some("credits")
+        );
+        assert_eq!(classify_chapter("Ending").map(|m| m.0), Some("credits"));
+        assert_eq!(classify_chapter("ED").map(|m| m.0), Some("credits"));
+        // "Opening Credits" is the intro, not the end credits.
+        assert_eq!(
+            classify_chapter("Opening Credits").map(|m| m.0),
+            Some("intro")
+        );
+        // Ordinary content chapters are not markers.
+        assert_eq!(classify_chapter("Chapter 1"), None);
+        assert_eq!(classify_chapter("The Heist"), None);
     }
 }

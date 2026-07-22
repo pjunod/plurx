@@ -77,23 +77,44 @@
   th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line);font-size:14px}
   th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.05em}
 
-  .modal{position:fixed;inset:0;background:rgba(0,0,0,.85);z-index:50;display:none;place-items:center;padding:20px}
+  .modal{position:fixed;inset:0;background:#000;z-index:50;display:none;place-items:center;padding:0}
   .modal.open{display:grid}
-  .player{width:min(1100px,96vw);position:relative}
-  .player video{width:100%;border-radius:12px;background:#000;max-height:80dvh}
-  .statsov{position:absolute;top:58px;left:14px;max-width:340px;background:rgba(8,10,15,.86);border:1px solid var(--line);
-    border-radius:10px;padding:10px 12px;font:12px/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--text);
-    display:none;pointer-events:none;backdrop-filter:blur(4px);z-index:2}
+  /* borderless "projection" player: true black, title + option buttons
+     overlay the top and auto-hide during playback (.idle) */
+  .player{width:100vw;height:100dvh;position:relative;background:#000;display:flex;align-items:center;justify-content:center;cursor:default}
+  .player.idle{cursor:none}
+  .player video{width:100%;height:100%;max-height:100dvh;background:#000;object-fit:contain}
+  .pbar{position:absolute;left:0;right:0;top:0;z-index:4;display:flex;justify-content:space-between;align-items:center;gap:10px;
+    padding:16px 20px;background:linear-gradient(to bottom,rgba(0,0,0,.74),rgba(0,0,0,0));transition:opacity .2s ease-out}
+  .player.idle .pbar{opacity:0;pointer-events:none}
+  .ptitle{font-weight:600;color:#fff;font-size:15px;text-shadow:0 1px 4px rgba(0,0,0,.7);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:56vw}
+  .pbtn{background:rgba(18,20,26,.62);color:#fff;border:1px solid rgba(255,255,255,.15);border-radius:8px;
+    padding:6px 11px;font-size:13px;font-weight:500;cursor:pointer;backdrop-filter:blur(6px);white-space:nowrap}
+  .pbtn:hover{background:rgba(46,50,60,.85)}
+  .ploading{position:absolute;inset:0;z-index:6;display:none;flex-direction:column;align-items:center;justify-content:center;gap:16px;
+    background:radial-gradient(ellipse at center,rgba(8,8,12,.5),rgba(0,0,0,.8));color:#fff;text-align:center;padding:24px}
+  .ploading.on{display:flex}
+  .pspin{width:44px;height:44px;border:3px solid rgba(255,255,255,.16);border-top-color:var(--accent);border-radius:50%;animation:spin .9s linear infinite}
+  .ploadText{font-weight:600;font-size:17px;letter-spacing:.01em}
+  .ploadSub{font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:rgba(255,255,255,.6);max-width:460px}
+  .pskip{position:absolute;right:24px;bottom:96px;z-index:5;display:flex;flex-direction:column;gap:8px;align-items:flex-end}
+  .pskip button{background:rgba(18,20,26,.82);color:#fff;border:1px solid rgba(255,255,255,.22);border-radius:10px;
+    padding:11px 18px;font-size:14px;font-weight:600;cursor:pointer;backdrop-filter:blur(6px);box-shadow:0 8px 26px rgba(0,0,0,.45);transition:background .12s,border-color .12s}
+  .pskip button:hover{background:var(--accent);border-color:var(--accent)}
+  .statsov{position:absolute;top:64px;left:20px;max-width:360px;background:rgba(8,10,15,.84);border:1px solid rgba(255,255,255,.12);
+    border-radius:10px;padding:11px 13px;font:12px/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#e8e8ea;
+    display:none;pointer-events:none;backdrop-filter:blur(5px);z-index:5}
   .statsov.on{display:block}
-  .statsov b{color:var(--muted);font-weight:600;display:inline-block;min-width:92px}
-  .pmenu{position:absolute;top:52px;right:14px;min-width:180px;max-width:280px;background:rgba(14,16,22,.97);border:1px solid var(--line);
-    border-radius:10px;padding:6px;display:none;z-index:3;box-shadow:0 10px 30px rgba(0,0,0,.5)}
+  .statsov b{color:rgba(255,255,255,.5);font-weight:600;display:inline-block;min-width:104px}
+  .statsov .sechd{color:var(--accent);font-weight:700;margin-top:8px;text-transform:uppercase;letter-spacing:.05em;font-size:10.5px}
+  .statsov .sechd:first-child{margin-top:0}
+  .pmenu{position:absolute;top:60px;right:20px;min-width:190px;max-width:300px;background:rgba(14,16,22,.97);border:1px solid rgba(255,255,255,.14);
+    border-radius:10px;padding:6px;display:none;z-index:6;box-shadow:0 10px 30px rgba(0,0,0,.5)}
   .pmenu.on{display:block}
-  .pmenu button{display:block;width:100%;text-align:left;background:transparent;color:var(--text);border:0;padding:8px 10px;border-radius:7px;font-size:13px;font-weight:400}
-  .pmenu button:hover{background:var(--panel2)}
+  .pmenu button{display:block;width:100%;text-align:left;background:transparent;color:#e8e8ea;border:0;padding:8px 10px;border-radius:7px;font-size:13px;font-weight:400;cursor:pointer}
+  .pmenu button:hover{background:rgba(255,255,255,.08)}
   .pmenu button.sel{color:var(--accent);font-weight:600}
   .pmenu button.sel::before{content:"✓ "}
-  .player .bar{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;gap:10px}
   .toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:var(--panel2);border:1px solid var(--line);
     padding:10px 16px;border-radius:10px;z-index:60;opacity:0;transition:opacity .2s;pointer-events:none}
   .toast.show{opacity:1}
@@ -201,7 +222,7 @@ if(window.matchMedia){ try{ window.matchMedia("(prefers-color-scheme: dark)").ad
 </head>
 <body>
 <div id="app"></div>
-<div class="modal" id="modal"><div class="player card"><div class="bar"><div id="playTitle" style="font-weight:600"></div><div class="row"><button class="ghost sm" id="audiobtn" style="display:none" onclick="toggleMenu('audio')">🔊 Audio</button><button class="ghost sm" id="subsbtn" style="display:none" onclick="toggleMenu('subs')">💬 Subtitles</button><button class="ghost sm" id="statsbtn" title="Playback info (i)" onclick="toggleStats()">ⓘ Stats</button><button class="ghost sm" id="apbtn" style="display:none" title="AirPlay">📺 AirPlay</button><button class="ghost sm" onclick="closePlayer()">Close</button></div></div><video id="video" controls autoplay playsinline x-webkit-airplay="allow"></video><div class="statsov" id="statsov"></div><div class="pmenu" id="pmenu"></div></div></div>
+<div class="modal" id="modal"><div class="player" id="player"><video id="video" controls autoplay playsinline x-webkit-airplay="allow"></video><div class="pbar" id="pbar"><div class="ptitle" id="playTitle"></div><div class="row"><button class="pbtn" id="audiobtn" style="display:none" onclick="toggleMenu('audio')">🔊 Audio</button><button class="pbtn" id="subsbtn" style="display:none" onclick="toggleMenu('subs')">💬 Subtitles</button><button class="pbtn" id="statsbtn" title="Playback info (i)" onclick="toggleStats()">ⓘ Stats</button><button class="pbtn" id="apbtn" style="display:none" title="AirPlay">📺 AirPlay</button><button class="pbtn" title="Close (Esc)" onclick="closePlayer()">✕ Close</button></div></div><div class="pskip" id="pskip"></div><div class="ploading" id="ploading"><div class="pspin"></div><div class="ploadText" id="ploadText">Loading…</div><div class="ploadSub" id="ploadSub"></div></div><div class="statsov" id="statsov"></div><div class="pmenu" id="pmenu"></div></div></div>
 <div class="toast" id="toast"></div>
 
 <script src="/assets/hls.min.js"></script>
@@ -312,7 +333,9 @@ function appMenuHtml(){
   try{ theme=localStorage.getItem("plurx_theme")||"classic"; app=localStorage.getItem("plurx_appearance")||"auto"; }catch(e){}
   const themes=Object.keys(THEMES).map(id=>`<button class="${theme===id?'sel':''}" onclick="setTheme('${id}')">${esc(THEMES[id].name)}</button>`).join("");
   const modes=[["auto","Auto (system)"],["light","Light"],["dark","Dark"]].map(([v,l])=>`<button class="${app===v?'sel':''}" onclick="setAppearance('${v}')">${l}</button>`).join("");
-  return `<div class="amsec">Theme</div>${themes}<div class="amsec">Appearance</div>${modes}`;
+  const auto=autoskipOn();
+  const autobtn=`<button class="${auto?'sel':''}" onclick="setAutoskip(${auto?'false':'true'})">Auto-skip intro &amp; credits</button>`;
+  return `<div class="amsec">Theme</div>${themes}<div class="amsec">Appearance</div>${modes}<div class="amsec">Playback</div>${autobtn}`;
 }
 function toggleAppearanceMenu(e){ if(e) e.stopPropagation(); const m=document.getElementById("appmenu"); if(!m) return;
   const open=!m.classList.contains("on"); m.classList.toggle("on",open); if(open) m.innerHTML=appMenuHtml(); }
@@ -521,36 +544,46 @@ async function toggleWatched(id, watched){
 //  direct_play → native <video>, client-side seek/resume
 //  remux       → progressive fMP4 from ffmpeg, server fast-seek for resume
 //  transcode   → HLS via hls.js (ffmpeg tone-maps/re-encodes), offset resume
-let PLAYER={fileId:null,timer:null,offset:0,hls:null,knownDur:0};
+let PLAYER={fileId:null,timer:null,offset:0,hls:null,knownDur:0,durMs:0,markers:[],source:null,started:false,idleTimer:null,autoskip:false};
+let PLAYER_WIRED=false;
 async function play(fileId, title, resumeMs, knownDurMs){
   const modal=document.getElementById("modal"), video=document.getElementById("video");
+  wirePlayer();
   document.getElementById("playTitle").textContent=title;
   modal.classList.add("open");
-  let decision; try{ decision=await api(`/files/${fileId}/decision?profile=web-h264`);}catch(e){ toast(e.message); return closePlayer(); }
+  setLoading(true,"Reading media…","checking the file on the server");
+  let decision; try{ decision=await api(`/files/${fileId}/decision?profile=web-h264`);}catch(e){ setLoading(false); toast(e.message); return closePlayer(); }
   const startSec=(resumeMs||0)/1000;
   teardownHls();
-  PLAYER={fileId, timer:null, offset:0, hls:null, knownDur:knownDurMs||0, method:decision.method, encoder:null,
+  const src=decision.source||{};
+  PLAYER={fileId, timer:null, offset:0, hls:null, knownDur:knownDurMs||0,
+    durMs:(src.duration_ms||knownDurMs||0), method:decision.method, encoder:null,
     audio:decision.audio||[], subs:(decision.subtitles||[]).filter(s=>s.text),
-    curAudio:(decision.audio||[]).findIndex(a=>a.default), curSub:-1};
+    curAudio:(decision.audio||[]).findIndex(a=>a.default), curSub:-1,
+    markers:(decision.markers||[]).map(m=>({...m})), source:src, started:false,
+    idleTimer:null, autoskip:autoskipOn()};
   if(PLAYER.curAudio<0) PLAYER.curAudio=0;
   setupAirplay(video);
   setupTrackMenus();
+  renderSkip(null);
 
   // Safari/iOS play HLS natively (required for AirPlay — MSE streams can't be
   // sent to an Apple TV as video); everything else uses hls.js.
   const nativeHls = video.canPlayType('application/vnd.apple.mpegurl');
   if(decision.method==='transcode'){
     // Transcode: start an HLS session (server re-encodes + tone-maps).
-    let info; try{ info=await api(`/files/${fileId}/hls/start?height=720&start=${startSec.toFixed(1)}`);}catch(e){ toast(e.message); return closePlayer(); }
+    setLoading(true,"Starting the transcoder…",transcodeReason(decision));
+    let info; try{ info=await api(`/files/${fileId}/hls/start?height=720&start=${startSec.toFixed(1)}`);}catch(e){ setLoading(false); toast(e.message); return closePlayer(); }
     PLAYER.offset = info.start_seconds||0;
     PLAYER.encoder = info.encoder||null;
+    setLoading(true,"Preparing the stream…",(PLAYER.encoder?("encoder: "+PLAYER.encoder+" — "):"")+"buffering the first segments");
     if(!nativeHls && window.Hls && Hls.isSupported()){
       const hls=new Hls({xhrSetup:x=>{ if(TOKEN) x.setRequestHeader("authorization","Bearer "+TOKEN); }});
       PLAYER.hls=hls;
       hls.loadSource(info.playlist_url);
       hls.attachMedia(video);
       hls.on(Hls.Events.MANIFEST_PARSED,()=>video.play().catch(()=>{}));
-      hls.on(Hls.Events.ERROR,(_,d)=>{ if(d.fatal) toast("Playback error: "+d.details); });
+      hls.on(Hls.Events.ERROR,(_,d)=>{ if(d.fatal){ setLoading(false); toast("Playback error: "+d.details); } });
     } else {
       // Native HLS: the session id in the URL is the credential, so the
       // Apple TV can fetch segments itself when AirPlaying.
@@ -559,6 +592,8 @@ async function play(fileId, title, resumeMs, knownDurMs){
   } else {
     // Direct play or remux → native <video> (token in URL: AirPlay-safe).
     const isRemux = decision.method!=='direct_play';
+    setLoading(true,isRemux?"Preparing the stream…":"Loading…",
+      isRemux?"remuxing to a browser-friendly container":"direct play — no conversion needed");
     let url=tok(decision.play_url);
     if(isRemux){ PLAYER.offset=startSec; if(startSec>0) url+="&start="+startSec.toFixed(1); }
     video.src=url;
@@ -569,6 +604,11 @@ async function play(fileId, title, resumeMs, knownDurMs){
   clearInterval(PLAYER.timer);
   PLAYER.timer=setInterval(()=>reportProgress(fileId), 5000);
   video.onended=()=>{ reportProgress(fileId,true); };
+  playerActivity();
+}
+function transcodeReason(d){
+  const r=(d.reasons||[]).filter(Boolean);
+  return r.length? r.join(" · ") : "building a compatible stream — this can take a few seconds";
 }
 function setupAirplay(video){
   const btn=document.getElementById("apbtn");
@@ -581,6 +621,98 @@ function setupAirplay(video){
   } else { btn.style.display="none"; }
 }
 function teardownHls(){ if(PLAYER&&PLAYER.hls){ try{PLAYER.hls.destroy()}catch(e){} PLAYER.hls=null; } }
+
+// ---- loading status, projection chrome, skip intro/credits ----------------
+// A staged loading overlay replaces the old mystery gray screen: the user sees
+// "reading media → starting transcoder → buffering" instead of a blank spinner.
+function setLoading(on,text,sub){
+  const l=document.getElementById("ploading"); if(!l) return;
+  if(on){
+    const t=document.getElementById("ploadText"), s=document.getElementById("ploadSub");
+    if(t&&text!=null) t.textContent=text;
+    if(s) s.textContent=sub||"";
+    l.classList.add("on");
+  } else l.classList.remove("on");
+}
+// Reveal the title bar / cursor on activity; hide them after a quiet spell
+// while the video is actually playing (projection feel).
+function playerActivity(){
+  const p=document.getElementById("player"); if(!p) return;
+  p.classList.remove("idle");
+  clearTimeout(PLAYER.idleTimer);
+  PLAYER.idleTimer=setTimeout(()=>{ const v=document.getElementById("video"); if(v&&!v.paused&&!v.ended) p.classList.add("idle"); },2600);
+}
+// Attach the persistent listeners once; they read live PLAYER state each fire.
+function wirePlayer(){
+  if(PLAYER_WIRED) return; PLAYER_WIRED=true;
+  const p=document.getElementById("player"), v=document.getElementById("video");
+  if(!p||!v) return;
+  ["mousemove","pointerdown","touchstart","keydown"].forEach(ev=>p.addEventListener(ev,playerActivity));
+  v.addEventListener("playing",()=>{ PLAYER.started=true; setLoading(false); playerActivity(); });
+  v.addEventListener("canplay",()=>{ if(PLAYER.started) setLoading(false); });
+  v.addEventListener("waiting",()=>{ if(PLAYER.started) setLoading(true,"Buffering…",""); });
+  v.addEventListener("pause",()=>{ p.classList.remove("idle"); });
+  v.addEventListener("error",()=>{ setLoading(false); });
+  v.addEventListener("timeupdate",checkMarkers);
+}
+function markerNowMs(){ const v=document.getElementById("video"); return ((PLAYER.offset||0)+(v?v.currentTime||0:0))*1000; }
+function checkMarkers(){
+  if(!PLAYER.markers||!PLAYER.markers.length) return;
+  const pos=markerNowMs();
+  const m=PLAYER.markers.find(mk=> pos>=mk.start_ms && pos < mk.end_ms-400);
+  renderSkip(m||null);
+  if(m && PLAYER.autoskip && !m._auto){ m._auto=true; skipMarker(m); }
+}
+function renderSkip(m){
+  const c=document.getElementById("pskip"); if(!c) return;
+  if(!m){ if(c.dataset.k){ c.innerHTML=""; c.dataset.k=""; } return; }
+  const key=m.kind+m.start_ms;
+  if(c.dataset.k===key) return; // avoid rebuilding every timeupdate tick
+  c.dataset.k=key;
+  const label=m.label||(m.kind==="intro"?"Skip Intro":"Skip Credits");
+  c.innerHTML=`<button onclick="skipCurrent()">${esc(label)} ›</button>`;
+}
+function skipCurrent(){
+  const pos=markerNowMs();
+  const m=(PLAYER.markers||[]).find(mk=> pos>=mk.start_ms && pos<mk.end_ms);
+  if(m) skipMarker(m);
+}
+function skipMarker(m){
+  const c=document.getElementById("pskip"); if(c){ c.innerHTML=""; c.dataset.k=""; }
+  // Credits that run to the very end → treat "skip" as "finished".
+  if(m.kind==="credits" && PLAYER.durMs && m.end_ms>=PLAYER.durMs-2500){
+    reportProgress(PLAYER.fileId,true); return closePlayer();
+  }
+  seekTo(m.end_ms/1000);
+}
+// Seek that works for every method: direct play seeks natively; remux/transcode
+// restart the server-side stream at the new offset (the stream is one-directional).
+async function seekTo(targetSec){
+  const v=document.getElementById("video"); if(!v) return;
+  targetSec=Math.max(0,targetSec);
+  if(PLAYER.method==='direct_play'){ try{ v.currentTime=targetSec; }catch(e){} playerActivity(); return; }
+  const track=PLAYER.audio[PLAYER.curAudio]; const aidx=track?track.index:(PLAYER.curAudio||0);
+  const curSub=PLAYER.curSub;
+  setLoading(true, PLAYER.method==='transcode'?"Skipping ahead…":"Seeking…",
+    PLAYER.method==='transcode'?"the transcoder is re-seeking":"");
+  teardownHls();
+  [...v.querySelectorAll("track")].forEach(t=>t.remove());
+  if(PLAYER.method==='transcode'){
+    let info; try{ info=await api(`/files/${PLAYER.fileId}/hls/start?height=720&start=${targetSec.toFixed(1)}&audio=${aidx}`);}catch(e){ setLoading(false); return toast(e.message); }
+    PLAYER.offset=info.start_seconds||0; PLAYER.encoder=info.encoder||null;
+    const nativeHls=v.canPlayType('application/vnd.apple.mpegurl');
+    if(!nativeHls && window.Hls && Hls.isSupported()){ const hls=new Hls({xhrSetup:x=>{if(TOKEN)x.setRequestHeader("authorization","Bearer "+TOKEN);}}); PLAYER.hls=hls; hls.loadSource(info.playlist_url); hls.attachMedia(v); hls.on(Hls.Events.MANIFEST_PARSED,()=>v.play().catch(()=>{})); }
+    else { v.src=tok(info.playlist_url); v.play().catch(()=>{}); }
+  } else {
+    PLAYER.method='remux'; PLAYER.offset=targetSec;
+    v.src=tok(`/api/v1/files/${PLAYER.fileId}/stream.mp4`)+`&audio=${aidx}&start=${targetSec.toFixed(1)}`;
+    v.play().catch(()=>{});
+  }
+  if(curSub>=0) setTimeout(()=>setSub(curSub),400);
+}
+function autoskipOn(){ try{ return localStorage.getItem("plurx_autoskip")==="1"; }catch(e){ return false; } }
+function setAutoskip(on){ try{ localStorage.setItem("plurx_autoskip", on?"1":"0"); }catch(e){}
+  if(PLAYER) PLAYER.autoskip=on; const m=document.getElementById("appmenu"); if(m) m.innerHTML=appMenuHtml(); }
 
 // ---- audio-language + subtitle menus --------------------------------------
 const LANGS={eng:"English",en:"English",jpn:"Japanese",ja:"Japanese",spa:"Spanish",es:"Spanish",
@@ -661,28 +793,50 @@ function toggleStats(){
 }
 function clockFromSec(s){ s=Math.max(0,Math.round(s)); const h=Math.floor(s/3600),m=Math.floor(s%3600/60),ss=s%60;
   return (h?h+":":"")+String(m).padStart(h?2:1,"0")+":"+String(ss).padStart(2,"0"); }
+function hdrLabel(h){ return ({hdr10:"HDR10",hlg:"HLG",dolby_vision:"Dolby Vision"})[h]||(h?h.toUpperCase():""); }
 function updateStats(){
   const ov=document.getElementById("statsov"); if(!ov||!ov.classList.contains("on")) return;
   const v=document.getElementById("video");
+  const s=PLAYER.source||{};
   const method = PLAYER.method==='direct_play'?'Direct play'
     : PLAYER.method==='transcode'?('Transcode'+(PLAYER.encoder?` · ${PLAYER.encoder}`:'')) : 'Remux';
-  const res = v.videoWidth? `${v.videoWidth}×${v.videoHeight}` : '—';
+  // source (from the server probe — the browser never sees these numbers)
+  const srcVideo=[ (s.video_codec||'').toUpperCase(), s.bit_depth?`${s.bit_depth}-bit`:null, s.hdr?hdrLabel(s.hdr):null ].filter(Boolean).join(" · ")||'—';
+  const srcRes = s.width&&s.height? `${s.width}×${s.height}`:'—';
+  const srcBr = s.bitrate? fmtMbps(s.bitrate):'—';
+  const srcCont=(s.container||'—').toUpperCase();
+  const a=PLAYER.audio&&PLAYER.audio[PLAYER.curAudio];
+  const aLine=a? ([ (a.codec||'').toUpperCase(), a.channels?fmtChannels(a.channels):null, a.language?(langName(a.language)||a.language):null ].filter(Boolean).join(" · ")||'—') : '—';
+  // now decoding (what the <video> element actually reports)
+  const tgtRes = v.videoWidth? `${v.videoWidth}×${v.videoHeight}` : '—';
   let dropped='—';
   try{ const q=v.getVideoPlaybackQuality&&v.getVideoPlaybackQuality(); if(q) dropped=`${q.droppedVideoFrames} / ${q.totalVideoFrames}`; }catch(e){}
   let buf='—';
   try{ if(v.buffered&&v.buffered.length){ buf=Math.max(0,v.buffered.end(v.buffered.length-1)-v.currentTime).toFixed(1)+' s'; } }catch(e){}
-  let extra='';
+  // network (transcode/HLS rate info)
+  let net='';
   if(PLAYER.hls){
-    if(PLAYER.hls.bandwidthEstimate) extra+=`<div><b>Est. bandwidth</b>${fmtMbps(PLAYER.hls.bandwidthEstimate)}</div>`;
+    if(PLAYER.hls.bandwidthEstimate) net+=`<div><b>Est. bandwidth</b>${fmtMbps(PLAYER.hls.bandwidthEstimate)}</div>`;
     const lv=PLAYER.hls.levels&&PLAYER.hls.levels[PLAYER.hls.currentLevel];
-    if(lv&&lv.bitrate) extra+=`<div><b>Stream</b>${fmtMbps(lv.bitrate)}</div>`;
+    if(lv&&lv.bitrate) net+=`<div><b>Stream rate</b>${fmtMbps(lv.bitrate)}</div>`;
   }
   const rate = v.playbackRate&&v.playbackRate!==1? ` · ${v.playbackRate}×`:'';
-  ov.innerHTML=`<div><b>Playback</b>${esc(method)}</div>
-    <div><b>Resolution</b>${res}</div>
-    <div><b>Dropped</b>${dropped} frames</div>
-    <div><b>Buffer</b>${buf}</div>
-    <div><b>Position</b>${clockFromSec((PLAYER.offset||0)+(v.currentTime||0))}${rate}</div>${extra}`;
+  const durTxt = PLAYER.durMs? ' / '+clockFromSec(PLAYER.durMs/1000):'';
+  ov.innerHTML=
+    `<div class="sechd">Playback</div>`+
+    `<div><b>Method</b>${esc(method)}</div>`+
+    `<div><b>Position</b>${clockFromSec((PLAYER.offset||0)+(v.currentTime||0))}${durTxt}${rate}</div>`+
+    `<div class="sechd">Source</div>`+
+    `<div><b>Video</b>${esc(srcVideo)}</div>`+
+    `<div><b>Resolution</b>${srcRes}</div>`+
+    `<div><b>Bitrate</b>${srcBr}</div>`+
+    `<div><b>Container</b>${esc(srcCont)}</div>`+
+    `<div><b>Audio</b>${esc(aLine)}</div>`+
+    `<div class="sechd">Now decoding</div>`+
+    `<div><b>Resolution</b>${tgtRes}</div>`+
+    `<div><b>Dropped</b>${dropped} frames</div>`+
+    `<div><b>Buffer</b>${buf}</div>`+
+    (net? `<div class="sechd">Network</div>`+net : '');
 }
 async function reportProgress(fileId, ended){
   const video=document.getElementById("video");
@@ -698,17 +852,23 @@ function closePlayer(){
   const video=document.getElementById("video");
   if(PLAYER.fileId) reportProgress(PLAYER.fileId);
   clearInterval(PLAYER.timer); clearInterval(STATS_TIMER); STATS_TIMER=null; teardownHls();
+  clearTimeout(PLAYER.idleTimer); setLoading(false);
   const ov=document.getElementById("statsov"); if(ov) ov.classList.remove("on");
   const pm=document.getElementById("pmenu"); if(pm) pm.classList.remove("on");
+  const sk=document.getElementById("pskip"); if(sk){ sk.innerHTML=""; sk.dataset.k=""; }
+  const pl=document.getElementById("player"); if(pl) pl.classList.remove("idle");
   [...video.querySelectorAll("track")].forEach(t=>t.remove());
   video.pause(); video.removeAttribute("src"); video.load();
   document.getElementById("modal").classList.remove("open");
   if(location.hash.startsWith("#/item/")) { const id=location.hash.split("/")[2]; setTimeout(()=>viewItem(id),100); }
 }
-// 'i' toggles the stats overlay while the player is open.
+// Keyboard while the player is open: 'i' toggles stats, Esc closes (unless the
+// native fullscreen is up — then Esc belongs to the browser's exit-fullscreen).
 window.addEventListener("keydown",e=>{
-  if((e.key==='i'||e.key==='I') && document.getElementById("modal").classList.contains("open")
-     && !/^(INPUT|TEXTAREA|SELECT)$/.test((e.target.tagName||""))){ e.preventDefault(); toggleStats(); }
+  if(!document.getElementById("modal").classList.contains("open")) return;
+  const typing=/^(INPUT|TEXTAREA|SELECT)$/.test((e.target.tagName||""));
+  if((e.key==='i'||e.key==='I') && !typing){ e.preventDefault(); toggleStats(); }
+  else if(e.key==='Escape' && !document.fullscreenElement){ closePlayer(); }
 });
 // map fileId → itemId, filled by viewItem so progress posts to the right item
 const ITEM_FOR_FILE={};
