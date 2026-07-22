@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::Json;
 use plurx_core::auth;
 use plurx_core::store::keys;
@@ -103,6 +103,32 @@ pub async fn system_info(
         active_transcodes: state.transcode.active_sessions().await,
         info: (*state.system).clone(),
     }))
+}
+
+#[derive(Deserialize)]
+pub struct LogsQuery {
+    /// Minimum severity to include ("error" … "trace"). Default: everything
+    /// the server's log filter captured.
+    #[serde(default = "default_log_level")]
+    pub level: String,
+    #[serde(default = "default_log_limit")]
+    pub limit: usize,
+}
+
+fn default_log_level() -> String {
+    "trace".to_owned()
+}
+fn default_log_limit() -> usize {
+    500
+}
+
+/// GET /api/v1/system/logs (admin) — recent log lines, oldest first.
+pub async fn logs(
+    _admin: AdminUser,
+    State(state): State<AppState>,
+    Query(q): Query<LogsQuery>,
+) -> Json<Vec<crate::logbuf::LogEntry>> {
+    Json(state.logs.tail(&q.level, q.limit.min(2000)))
 }
 
 #[derive(Serialize)]

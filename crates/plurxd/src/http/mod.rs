@@ -41,6 +41,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/scan/status", get(system::scan_status))
         .route("/system", get(system::system_info))
+        .route("/system/logs", get(system::logs))
         // Libraries
         .route("/libraries", get(libraries::list).post(libraries::create))
         .route(
@@ -159,6 +160,7 @@ mod tests {
             base.join("transcode"),
             Default::default(),
             Default::default(),
+            Arc::new(crate::logbuf::LogBuffer::new(64)),
         );
         router(state)
     }
@@ -331,6 +333,22 @@ mod tests {
         assert!(body["version"].is_string());
         assert!(body["encoders"].is_object());
         assert_eq!(body["users"], 1);
+    }
+
+    #[tokio::test]
+    async fn logs_endpoint_is_admin_only() {
+        let app = test_app();
+        let (status, _) = call(&app, get("/api/v1/system/logs", None)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let admin = setup_admin(&app).await;
+        let (status, body) = call(
+            &app,
+            get("/api/v1/system/logs?level=info&limit=50", Some(&admin)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.is_array());
     }
 
     #[tokio::test]

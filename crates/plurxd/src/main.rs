@@ -1,4 +1,5 @@
 mod http;
+mod logbuf;
 mod state;
 mod transcode;
 
@@ -53,10 +54,15 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run(config: Config) -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_env("PLURX_LOG").unwrap_or_else(|_| EnvFilter::new("info")),
-        )
+    // Console logging plus a bounded in-memory ring the admin UI can read.
+    // The EnvFilter is global, so both sinks see the same events.
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    let logs = Arc::new(logbuf::LogBuffer::default());
+    tracing_subscriber::registry()
+        .with(EnvFilter::try_from_env("PLURX_LOG").unwrap_or_else(|_| EnvFilter::new("info")))
+        .with(tracing_subscriber::fmt::layer())
+        .with(logbuf::BufferLayer(Arc::clone(&logs)))
         .init();
 
     std::fs::create_dir_all(&config.storage.data_dir).with_context(|| {
@@ -140,6 +146,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
         transcode_dir,
         encoder_caps,
         system,
+        logs,
     );
     // Reap idle transcode sessions in the background.
     tokio::spawn(std::sync::Arc::clone(&state.transcode).reap_loop());

@@ -12,6 +12,7 @@ use plurx_core::transcode::EncoderCaps;
 use serde::Serialize;
 use tokio::sync::Mutex;
 
+use crate::logbuf::LogBuffer;
 use crate::transcode::TranscodeManager;
 
 /// Environment facts collected once at startup, shown on the settings page.
@@ -40,6 +41,7 @@ pub struct AppState {
     pub jobs: Arc<JobManager>,
     pub transcode: Arc<TranscodeManager>,
     pub system: Arc<SystemInfo>,
+    pub logs: Arc<LogBuffer>,
     pub started_at: Instant,
 }
 
@@ -51,6 +53,7 @@ impl AppState {
         transcode_dir: PathBuf,
         encoder_caps: EncoderCaps,
         system: SystemInfo,
+        logs: Arc<LogBuffer>,
     ) -> Self {
         let jobs = Arc::new(JobManager::new(Arc::clone(&store), artwork_dir.clone()));
         let transcode = Arc::new(TranscodeManager::new(
@@ -65,6 +68,7 @@ impl AppState {
             jobs,
             transcode,
             system: Arc::new(system),
+            logs,
             started_at: Instant::now(),
         }
     }
