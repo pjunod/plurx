@@ -138,6 +138,10 @@ pub struct SettingsDto {
     /// low-sensitivity (read-only metadata), so the admin who set it can see
     /// and copy it back — the web UI masks it until clicked. Empty when unset.
     pub tmdb_api_key: String,
+    pub omdb_configured: bool,
+    /// The stored OMDb key (Rotten Tomatoes / Metacritic / IMDb ratings). Same
+    /// admin-only, mask-until-clicked treatment as the TMDB key.
+    pub omdb_api_key: String,
 }
 
 async fn settings_dto(state: &AppState) -> Result<SettingsDto, ApiError> {
@@ -146,9 +150,16 @@ async fn settings_dto(state: &AppState) -> Result<SettingsDto, ApiError> {
         .get_setting(keys::TMDB_API_KEY)
         .await?
         .unwrap_or_default();
+    let omdb_api_key = state
+        .store
+        .get_setting(keys::OMDB_API_KEY)
+        .await?
+        .unwrap_or_default();
     Ok(SettingsDto {
         tmdb_configured: !tmdb_api_key.is_empty(),
         tmdb_api_key,
+        omdb_configured: !omdb_api_key.is_empty(),
+        omdb_api_key,
     })
 }
 
@@ -164,6 +175,8 @@ pub async fn get_settings(
 pub struct UpdateSettings {
     /// Set the TMDB API key. Empty string clears it. Absent leaves it as-is.
     pub tmdb_api_key: Option<String>,
+    /// Set the OMDb API key. Empty string clears it. Absent leaves it as-is.
+    pub omdb_api_key: Option<String>,
 }
 
 /// PUT /api/v1/settings (admin)
@@ -176,6 +189,12 @@ pub async fn update_settings(
         state
             .store
             .put_setting(keys::TMDB_API_KEY, key.trim())
+            .await?;
+    }
+    if let Some(key) = req.omdb_api_key {
+        state
+            .store
+            .put_setting(keys::OMDB_API_KEY, key.trim())
             .await?;
     }
     Ok(Json(settings_dto(&state).await?))

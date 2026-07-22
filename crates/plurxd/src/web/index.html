@@ -999,6 +999,12 @@ async function viewSettings(){
         value="${esc(settings.tmdb_api_key||'')}"
         onfocus="this.type='text'" onblur="this.type='password'"><div class="err" id="terr"></div>
       <button style="margin-top:12px" onclick="saveTmdb()">Save key</button></div>
+    <div class="card"><h2 class="section" style="margin-top:0">Ratings (OMDb)</h2>
+      <p class="muted" style="margin-top:0">${settings.omdb_configured?"An OMDb API key is configured — Rotten Tomatoes, Metacritic, and IMDb ratings can be fetched.":`Add a free OMDb key (<a href="https://www.omdbapi.com/apikey.aspx" target="_blank" rel="noopener">omdbapi.com</a>) to show Rotten Tomatoes, Metacritic, and IMDb ratings on the item page — TMDB doesn't carry these.`}</p>
+      <input id="ok" placeholder="OMDb API key" type="password" autocomplete="off"
+        value="${esc(settings.omdb_api_key||'')}"
+        onfocus="this.type='text'" onblur="this.type='password'"><div class="err" id="oerr"></div>
+      <button style="margin-top:12px" onclick="saveOmdb()">Save key</button></div>
     <div class="card"><h2 class="section" style="margin-top:0">Logs</h2>
       <div class="row"><select id="loglvl" style="max-width:120px" onchange="refreshLogs()">
           <option value="info" selected>Info+</option><option value="warn">Warnings+</option>
@@ -1047,6 +1053,7 @@ async function scanLib(id){ try{ await api(`/libraries/${id}/scan`,{method:"POST
 async function refreshLib(id){ try{ await api(`/libraries/${id}/refresh`,{method:"POST"}); toast("Refreshing metadata & artwork…"); setTimeout(settingsTick,400);}catch(e){toast(e.message)} }
 async function delLib(id){ if(!confirm("Delete this library? Media files are not touched.")) return; try{ await api(`/libraries/${id}`,{method:"DELETE"}); toast("Deleted"); viewSettings(); }catch(e){toast(e.message)} }
 async function saveTmdb(){ const err=document.getElementById("terr"); err.textContent=""; try{ await api("/settings",{method:"PUT",body:{tmdb_api_key:tk.value.trim()}}); toast("Saved"); viewSettings(); }catch(e){err.textContent=e.message} }
+async function saveOmdb(){ const err=document.getElementById("oerr"); err.textContent=""; try{ await api("/settings",{method:"PUT",body:{omdb_api_key:document.getElementById("ok").value.trim()}}); toast("Saved"); viewSettings(); }catch(e){err.textContent=e.message} }
 
 // ---- users (admin) --------------------------------------------------------
 function userRow(u){
