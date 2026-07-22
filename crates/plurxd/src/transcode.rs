@@ -85,6 +85,7 @@ impl TranscodeManager {
         file_id: i64,
         target_height: i64,
         start_seconds: f64,
+        audio_override: Option<i64>,
     ) -> Result<StartInfo, String> {
         let file = self
             .store
@@ -131,7 +132,9 @@ impl TranscodeManager {
         let opts = TranscodeOptions {
             target_height,
             video_bitrate_kbps: bitrate_for_height(target_height),
-            audio_index: selection.audio_index,
+            // An explicit client choice (audio-language menu) wins over the
+            // automatic dual-audio default.
+            audio_index: audio_override.or(selection.audio_index),
             start_seconds,
             tone_map: tone_map_pref(),
             subtitle_burn,

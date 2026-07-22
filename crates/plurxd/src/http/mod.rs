@@ -68,6 +68,7 @@ pub fn router(state: AppState) -> Router {
         .route("/files/{id}/decision", get(stream::decision))
         .route("/files/{id}/direct", get(stream::direct))
         .route("/files/{id}/stream.mp4", get(stream::stream_mp4))
+        .route("/files/{id}/subs/{index}", get(stream::subtitles_vtt))
         .route("/files/{id}/hls/start", get(hls::start))
         .route("/hls/{session}/index.m3u8", get(hls::playlist))
         .route("/hls/{session}/{segment}", get(hls::segment))

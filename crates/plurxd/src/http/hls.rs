@@ -26,6 +26,8 @@ pub struct StartQuery {
     pub height: Option<i64>,
     /// Start offset in seconds (resume / seek).
     pub start: Option<f64>,
+    /// Audio stream to use (`a:{audio}`); overrides the automatic pick.
+    pub audio: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -48,7 +50,7 @@ pub async fn start(
     let start = q.start.unwrap_or(0.0).max(0.0);
     let info = state
         .transcode
-        .start(id, height, start)
+        .start(id, height, start, q.audio.filter(|a| *a >= 0))
         .await
         .map_err(ApiError::Internal)?;
     Ok(Json(StartResponse {

@@ -13,7 +13,8 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use plurx_core::domain::MediaFile;
 use plurx_core::playback::{self, Decision};
-use serde::Deserialize;
+use plurx_core::tracks::is_bitmap_subtitle;
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use super::error::ApiError;
@@ -57,13 +58,73 @@ pub struct DecisionQuery {
     pub profile: Option<String>,
 }
 
-#[derive(serde::Serialize)]
+#[derive(Serialize)]
+pub struct AudioTrackDto {
+    /// Position among audio streams (`a:{index}` for ffmpeg mapping).
+    pub index: i64,
+    pub codec: String,
+    pub channels: Option<i64>,
+    pub language: Option<String>,
+    pub title: Option<String>,
+    pub default: bool,
+}
+
+#[derive(Serialize)]
+pub struct SubTrackDto {
+    /// Position among subtitle streams (`s:{index}`).
+    pub index: i64,
+    pub codec: String,
+    pub language: Option<String>,
+    pub title: Option<String>,
+    pub default: bool,
+    pub forced: bool,
+    /// Text subs convert to WebVTT for a selectable `<track>`; bitmap subs
+    /// (PGS/VobSub) can't and are only burnable via transcode.
+    pub text: bool,
+}
+
+#[derive(Serialize)]
 pub struct DecisionResponse {
     pub file_id: i64,
     #[serde(flatten)]
     pub decision: Decision,
     /// The URL the client should use to play, given the verdict.
     pub play_url: String,
+    /// Selectable audio tracks (for the player's audio-language menu).
+    pub audio: Vec<AudioTrackDto>,
+    /// Selectable text subtitle tracks (served as WebVTT sidecars).
+    pub subtitles: Vec<SubTrackDto>,
+}
+
+fn audio_tracks(file: &MediaFile) -> Vec<AudioTrackDto> {
+    file.audio_streams
+        .iter()
+        .enumerate()
+        .map(|(i, a)| AudioTrackDto {
+            index: i as i64,
+            codec: a.codec.clone(),
+            channels: a.channels,
+            language: a.language.clone(),
+            title: a.title.clone(),
+            default: a.default,
+        })
+        .collect()
+}
+
+fn sub_tracks(file: &MediaFile) -> Vec<SubTrackDto> {
+    file.subtitle_streams
+        .iter()
+        .enumerate()
+        .map(|(i, s)| SubTrackDto {
+            index: i as i64,
+            codec: s.codec.clone(),
+            language: s.language.clone(),
+            title: s.title.clone(),
+            default: s.default,
+            forced: s.forced,
+            text: !is_bitmap_subtitle(&s.codec),
+        })
+        .collect()
 }
 
 /// GET /api/v1/files/:id/decision?profile=web-h264
@@ -98,7 +159,59 @@ pub async fn decision(
         file_id: id,
         decision,
         play_url,
+        audio: audio_tracks(&file),
+        subtitles: sub_tracks(&file),
     }))
+}
+
+/// GET /api/v1/files/:id/subs/{index}.vtt — extract subtitle stream `index`
+/// and convert it to WebVTT on the fly, for a native `<track>`. Auth is by
+/// `?token=` (a `<track>` element can't set headers). Text subs only; a bitmap
+/// sub (PGS/VobSub) can't become VTT and returns 415.
+pub async fn subtitles_vtt(
+    _user: AuthUser,
+    State(state): State<AppState>,
+    AxPath((id, index)): AxPath<(i64, i64)>,
+) -> Result<Response, ApiError> {
+    let file = load_file(&state, id).await?;
+    let stream = file
+        .subtitle_streams
+        .get(index as usize)
+        .ok_or(ApiError::NotFound("subtitle track"))?;
+    if is_bitmap_subtitle(&stream.codec) {
+        return Err(ApiError::BadRequest(
+            "this is a bitmap subtitle (PGS/VobSub) and can't be shown as text; \
+             it can only be burned in during transcode"
+                .into(),
+        ));
+    }
+    let out = tokio::process::Command::new(ffmpeg_bin())
+        .args(["-hide_banner", "-loglevel", "error", "-i"])
+        .arg(&file.path)
+        .args(["-map", &format!("0:s:{index}"), "-f", "webvtt", "pipe:1"])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .map_err(|e| ApiError::Internal(format!("spawning ffmpeg: {e}")))?;
+    if !out.status.success() {
+        let why = String::from_utf8_lossy(&out.stderr);
+        tracing::warn!(
+            file_id = id,
+            index,
+            "subtitle extraction failed: {}",
+            why.trim()
+        );
+        return Err(ApiError::Internal("subtitle extraction failed".into()));
+    }
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/vtt; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        out.stdout,
+    )
+        .into_response())
 }
 
 /// GET /api/v1/files/:id/direct — raw file with HTTP range support.
@@ -117,6 +230,10 @@ pub struct StreamQuery {
     /// Start offset in seconds (used for resume; remux fast-seeks the input).
     pub start: Option<f64>,
     pub profile: Option<String>,
+    /// Which audio stream to map (`a:{audio}`); default 0. Lets the client
+    /// switch audio language — a non-default pick forces a remux so the chosen
+    /// track is the one in the MP4.
+    pub audio: Option<i64>,
 }
 
 /// GET /api/v1/files/:id/stream.mp4 — fragmented-MP4 remux, optional start.
@@ -133,7 +250,8 @@ pub async fn stream_mp4(
         .and_then(playback::profile)
         .unwrap_or_else(playback::default_profile);
     let decision = playback::decide(&file, profile);
-    remux(&file.path, q.start, decision.transcode_audio).await
+    let audio = q.audio.unwrap_or(0).max(0);
+    remux(&file.path, q.start, decision.transcode_audio, audio).await
 }
 
 // --- direct-play range serving ---------------------------------------------
@@ -225,6 +343,7 @@ async fn remux(
     path: &Path,
     start: Option<f64>,
     transcode_audio: bool,
+    audio_index: i64,
 ) -> Result<Response, ApiError> {
     let mut cmd = tokio::process::Command::new(ffmpeg_bin());
     cmd.arg("-hide_banner").arg("-loglevel").arg("error");
@@ -233,8 +352,14 @@ async fn remux(
         cmd.arg("-ss").arg(format!("{s:.3}"));
     }
     cmd.arg("-i").arg(path);
-    // First video + first audio, no subtitles into the MP4.
-    cmd.args(["-map", "0:v:0", "-map", "0:a:0?", "-sn"]);
+    // Video + the chosen audio track, no subtitles into the MP4.
+    cmd.args([
+        "-map",
+        "0:v:0",
+        "-map",
+        &format!("0:a:{audio_index}?"),
+        "-sn",
+    ]);
     cmd.args(["-c:v", "copy"]);
     if transcode_audio {
         cmd.args(["-c:a", "aac", "-ac", "2", "-b:a", "256k"]);
