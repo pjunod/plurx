@@ -177,7 +177,7 @@ Phases are gates — each ends with something you actually use. Full detail in
 
 Deliberate, with reasons — the full list and rationale is in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#8-non-goals-what-the-architecture-deliberately-refuses)
-and [docs/FEATURES.md](docs/FEATURES.md#9-what-plurx-does-not-do):
+and [docs/FEATURES.md](docs/FEATURES.md#11-what-plurx-does-not-do):
 
 - **No cloud, no phone-home.** There is no plurx.tv and there never needs to be.
 - **plurx never writes your media.** Read-only mounts; no organizing, renaming, or

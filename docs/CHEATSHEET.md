@@ -94,6 +94,7 @@ Full symptom→cause table: [OPERATIONS.md](OPERATIONS.md#common-problems--cause
 | `PLURX_VAAPI_DEVICE` | `/dev/dri/renderD128` | VA-API render node |
 | `PLURX_TONEMAP` | auto | HDR→SDR filter override |
 | `PLURX_GDM_PORT` | `32414` | GDM host port |
+| `PLURX_TRAKT_BASE` | `https://api.trakt.tv` | Trakt API base (tests/mocks) |
 | `PLURX_LOG` | `info` | `tracing` filter (e.g. `plurxd=debug`) |
 
 ## Reference — health & API surfaces

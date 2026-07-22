@@ -113,6 +113,20 @@ and delivers it. Full decision logic is [ARCHITECTURE.md](ARCHITECTURE.md) §3.
 - **Multi-track audio:** pick any audio track from the player; a non-default pick
   forces a remux so the chosen track is the one delivered. Anime dual-audio
   defaults to original audio + subtitles.
+- **Language defaults (global):** Settings → Playback defaults sets a preferred
+  audio language, subtitle language, and a subtitle mode — *Auto* (subs appear
+  only when the audio isn't the preferred language), *Always*, or *Off*.
+  English/English/Auto out of the box. The same rule flags default tracks at
+  `/decision` and picks the transcode burn-in, so every path agrees; 2- and
+  3-letter language tags match each other (`de` = `ger` = `deu`).
+- **Audio-sync correction (per file):** the player's **⇄ Sync** menu nudges
+  audio ±50/±250 ms and persists the offset to the file (`PUT
+  /files/{id}/audio-offset`), so a badly-muxed release stays fixed for
+  everyone. ffmpeg applies it with a second `-itsoffset` input on both remux
+  and transcode; a nonzero offset forces at least a remux for direct-play
+  sources. The menu also shows the container's own declared audio/video
+  start-time delta as a diagnostic (declared offsets are already honored and
+  never double-applied).
 - **Subtitles:** text tracks (SRT/ASS) extracted to WebVTT on the fly and shown
   as a selectable native track for direct/remux. Bitmap subs (PGS/VobSub) are
   identified and can only be burned in during transcode (that burn-in is
@@ -228,7 +242,57 @@ node; the cluster is the next phase. Detail: [ARCHITECTURE.md](ARCHITECTURE.md)
 
 ---
 
-## 9. What plurx does NOT do
+## 9. Trakt — "your history, everywhere"
+
+**What it does:** an optional, admin-linked [Trakt.tv](https://trakt.tv)
+integration: live scrobbling plus two-way watched-history and resume-point
+sync. Off until keys are entered; plurx works fully without it.
+
+- **Bring your own API app.** The admin creates an app at
+  trakt.tv/oauth/applications (redirect URI `urn:ietf:wg:oauth:2.0:oob`) and
+  pastes its client id + secret into Settings → Trakt — same pattern as the
+  TMDB key, no shared/central credentials.
+- **Device-code linking:** Connect shows an 8-character code to enter at
+  trakt.tv/activate; the server polls in the background and the card flips to
+  connected by itself. Tokens refresh automatically; a dead refresh token
+  unlinks cleanly and says so.
+- **Live scrobbling:** play → `scrobble/start`, crossing plurx's 95% watched
+  threshold → `scrobble/stop` (Trakt records the play), abandoning a session →
+  `scrobble/pause` after ~2½ quiet minutes. Your profile shows "watching now."
+- **Two-way sync**, hourly and on demand (Sync now, or any manual
+  watched/unwatched mark): watches from other Trakt apps mark items watched
+  here with their original timestamps; local watches push to Trakt history;
+  in-progress positions land both ways, so pausing in another Trakt-connected
+  app resumes here. Movies match by TMDB id, episodes by show TMDB id +
+  season/episode — items without ids are skipped, never guessed.
+- **Conservative conflict rules:** a local un-watch that's newer than the
+  remote watch wins (and removes on Trakt); Trakt-side history *deletions*
+  don't propagate (a matching failure can never erase local history); a
+  `last_activities` gate skips the heavy pulls when nothing changed.
+- **First link = full import:** your entire Trakt history lands immediately,
+  then plurx-only watches push back.
+- **2026 Trakt limits, respected by design:** history (100k) and scrobbling
+  are the safe surface; collection/"offline library" sync (100-item cap for
+  third-party apps) is deliberately not implemented.
+
+---
+
+## 10. Activity — "what is the server doing right now"
+
+**What it does:** the header's activity pill now lands on `#/activity`, a live
+page (3-second refresh) instead of dumping you into Settings.
+
+- **Now playing:** every transcode session with who's watching, what, the
+  encoder and target height, and when it started; admins get a **Stop** button
+  (`DELETE /activity/sessions/{id}`). Direct play and remux flow straight
+  through without a server session and say so.
+- **Library:** per-library scan/enrich state with the same live counters as
+  Settings.
+- **Trakt:** link state, last sync, and the last sync summary or error.
+
+---
+
+## 11. What plurx does NOT do
 
 Listed so the inventory above is unambiguous — these are deliberate, with reasons:
 
