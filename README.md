@@ -34,7 +34,7 @@ A self-hosted media server and player family in the spirit of **old-school Plex*
 - **Playback** — data-driven device profiles + decision engine (direct / remux / transcode), HTTP-range direct play, MKV→fMP4 remux, and full **hardware transcode** (validated NVENC/QSV/VA-API/VideoToolbox with software fallback) delivering **HLS** with **HDR→SDR tone-mapping** and subtitle burn-in.
 - **Anime** — absolute episode numbering, AniList metadata, and dual-audio default-track selection (prefer original audio + subs).
 - **Plex-compat (Tier 1)** — a Plex Media Server API façade + GDM discovery, so Kodi (Composite/PKC), python-plexapi, and Home Assistant browse and play directly. Validated end-to-end with python-plexapi.
-- **Web app** — login, browse, an in-modal player (native + hls.js) with resume, continue-watching, **next-up**, search, and admin.
+- **Web app** — login, browse, an in-modal player (native + hls.js, **AirPlay** from Safari/iOS) with resume, continue-watching, **next-up**, search, multiple versions per item, and a **Settings** area: server diagnostics, libraries with live scan status + loud scan problems, TMDB key, and a live log viewer. A global activity pill shows what the server is doing on every page.
 - **Ops** — `/healthz`, `/readyz`, Prometheus `/metrics`; Docker/Compose, bare-metal systemd, and Unraid deploy templates in [`deploy/`](deploy/).
 
 ```sh

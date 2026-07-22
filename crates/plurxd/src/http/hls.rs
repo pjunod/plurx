@@ -1,7 +1,14 @@
-//! HLS transcode endpoints. `start` creates a session and returns the playlist
-//! URL; the playlist and segments are then fetched by the client's HLS player
-//! (hls.js on the web). Auth is by bearer header (hls.js sets it on every XHR)
-//! or `?token=` on the start call.
+//! HLS transcode endpoints. `start` creates a session (authenticated) and
+//! returns the playlist URL; the playlist and segments are then fetched by
+//! whatever HLS player the session ends up in.
+//!
+//! Playlist/segment requests authenticate by *capability*: the session id is
+//! a v4 UUID (122 random bits) minted for an authenticated user, unguessable,
+//! and short-lived (reaped on idle). No header requirement means dumb
+//! fetchers can play the stream — Safari's native HLS, and crucially an
+//! Apple TV during AirPlay, which fetches the URL itself with no way to
+//! attach our bearer token. Same model Plex uses; also what Phase 4 wants,
+//! since any cluster node can serve a session id without seeing the login.
 
 use axum::extract::{Path as AxPath, Query, State};
 use axum::http::{header, StatusCode};
@@ -53,9 +60,8 @@ pub async fn start(
     }))
 }
 
-/// GET /api/v1/hls/:session/index.m3u8
+/// GET /api/v1/hls/:session/index.m3u8 — capability auth (see module docs).
 pub async fn playlist(
-    _user: AuthUser,
     State(state): State<AppState>,
     AxPath(session): AxPath<String>,
 ) -> Result<Response, ApiError> {
@@ -78,9 +84,8 @@ pub async fn playlist(
         .into_response())
 }
 
-/// GET /api/v1/hls/:session/:segment
+/// GET /api/v1/hls/:session/:segment — capability auth (see module docs).
 pub async fn segment(
-    _user: AuthUser,
     State(state): State<AppState>,
     AxPath((session, seg)): AxPath<(String, String)>,
 ) -> Result<Response, ApiError> {

@@ -75,12 +75,27 @@
     padding:10px 16px;border-radius:10px;z-index:60;opacity:0;transition:opacity .2s;pointer-events:none}
   .toast.show{opacity:1}
   .err{color:var(--bad);font-size:13px;min-height:18px;margin-top:8px}
-  .adminwrap{display:grid;grid-template-columns:1fr;gap:22px;max-width:760px}
+  .adminwrap{display:grid;grid-template-columns:1fr;gap:22px;max-width:960px}
+  .problem{color:var(--bad);font-size:12px;margin-top:3px;font-weight:400}
+  .hint{color:var(--muted);font-size:12px;margin-top:6px}
+  .activity{display:none;align-items:center;gap:8px;font-size:12px;color:var(--muted);
+    background:var(--panel2);border:1px solid var(--line);padding:5px 12px;border-radius:999px;cursor:pointer;white-space:nowrap}
+  .activity .spin{width:10px;height:10px;flex:none;border:2px solid var(--accent);border-top-color:transparent;border-radius:50%;animation:spin .9s linear infinite}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .kvgrid{display:grid;grid-template-columns:auto 1fr;gap:6px 16px;font-size:13px;margin:0}
+  .kvgrid dt{color:var(--muted)} .kvgrid dd{margin:0;word-break:break-all}
+  .logbox{background:#0a0b0f;border:1px solid var(--line);border-radius:8px;padding:10px;margin-top:10px;
+    max-height:380px;overflow:auto;font:12px/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre-wrap}
+  .log-ERROR{color:var(--bad)} .log-WARN{color:#fbbf24} .log-INFO{color:var(--text)}
+  .log-DEBUG,.log-TRACE{color:var(--muted)}
+  .verrow{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:9px 0}
+  .verrow+.verrow{border-top:1px solid var(--line)}
+  .crumb{font-size:13px;display:inline-block;margin-bottom:8px}
 </style>
 </head>
 <body>
 <div id="app"></div>
-<div class="modal" id="modal"><div class="player card"><div class="bar"><div id="playTitle" style="font-weight:600"></div><button class="ghost sm" onclick="closePlayer()">Close</button></div><video id="video" controls autoplay playsinline></video></div></div>
+<div class="modal" id="modal"><div class="player card"><div class="bar"><div id="playTitle" style="font-weight:600"></div><div class="row"><button class="ghost sm" id="apbtn" style="display:none" title="AirPlay">📺 AirPlay</button><button class="ghost sm" onclick="closePlayer()">Close</button></div></div><video id="video" controls autoplay playsinline x-webkit-airplay="allow"></video></div></div>
 <div class="toast" id="toast"></div>
 
 <script src="/assets/hls.min.js"></script>
@@ -103,10 +118,15 @@ async function api(path, {method="GET", body=null, raw=false}={}){
 const tok = u => u + (u.includes("?")?"&":"?") + "token=" + encodeURIComponent(TOKEN||"");
 function toast(msg){ const t=document.getElementById("toast"); t.textContent=msg; t.classList.add("show"); setTimeout(()=>t.classList.remove("show"),2200); }
 function fmtDur(ms){ if(!ms) return ""; const s=Math.round(ms/1000),h=Math.floor(s/3600),m=Math.floor(s%3600/60); return h?`${h}h ${m}m`:`${m}m`; }
+function fmtSize(b){ if(!b) return ""; const g=b/(1024**3); return g>=1?g.toFixed(1)+" GB":Math.round(b/(1024**2))+" MB"; }
+function fmtUptime(s){ const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60); return d?`${d}d ${h}h`:(h?`${h}h ${m}m`:`${m}m`); }
+function fmtTs(ms){ const d=new Date(ms); return d.toLocaleTimeString([], {hour12:false})+"."+String(ms%1000).padStart(3,"0"); }
+function fmtAgo(unix){ if(!unix) return ""; const s=Math.max(0,Math.floor(Date.now()/1000)-unix);
+  if(s<60) return "just now"; if(s<3600) return Math.floor(s/60)+"m ago"; if(s<86400) return Math.floor(s/3600)+"h ago"; return Math.floor(s/86400)+"d ago"; }
 function esc(s){ return (s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
 
 // ---- auth flows -----------------------------------------------------------
-function logout(){ TOKEN=null; ME=null; localStorage.removeItem("plurx_token"); render(); }
+function logout(){ TOKEN=null; ME=null; localStorage.removeItem("plurx_token"); clearInterval(ACT_TIMER); ACT_TIMER=null; render(); }
 async function boot(){
   let server;
   try{ server=await api("/server"); }catch(e){ document.getElementById("app").innerHTML=`<div class="center"><div class="card">Server unreachable.</div></div>`; return; }
@@ -148,20 +168,44 @@ function renderLogin(){
 
 // ---- chrome ---------------------------------------------------------------
 function chrome(active, inner){
-  const admin = ME&&ME.is_admin ? `<a href="#/admin" class="${active==='admin'?'active':''}">Admin</a>`:"";
+  const admin = ME&&ME.is_admin ? `<a href="#/settings" class="${active==='settings'?'active':''}">Settings</a>`:"";
+  const back = (location.hash&&location.hash!=="#/") ? `<button class="ghost sm" onclick="history.back()" title="Back">‹</button>`:"";
   document.getElementById("app").innerHTML=`
    <header class="top">
-     <a href="#/" class="logo">plurx</a>
+     ${back}<a href="#/" class="logo">plurx</a>
      <nav><a href="#/" class="${active==='home'?'active':''}">Home</a>${admin}</nav>
      <span class="spacer"></span>
+     <span class="activity" id="activity" onclick="${ME&&ME.is_admin?"location.hash='#/settings'":""}"></span>
      <input class="search" id="q" placeholder="Search…" value="${esc(getQ())}">
      <span class="muted" style="font-size:13px">${esc(ME?ME.username:"")}</span>
      <button class="ghost sm" onclick="logout()">Sign out</button>
    </header><main id="main">${inner}</main>`;
   const q=document.getElementById("q");
   let t; q.addEventListener("input",()=>{ clearTimeout(t); t=setTimeout(()=>{ location.hash= q.value?("#/search/"+encodeURIComponent(q.value)):"#/"; },300); });
+  pollActivity();
 }
 function getQ(){ const m=location.hash.match(/^#\/search\/(.*)$/); return m?decodeURIComponent(m[1]):""; }
+
+// ---- global activity indicator --------------------------------------------
+// Always-visible pill: whatever the server is doing right now (scans,
+// metadata, streams — later: moves, backups). Empty response = hidden.
+let ACT_TIMER=null;
+async function pollActivity(){
+  if(!TOKEN||!ME) return;
+  const el=document.getElementById("activity");
+  if(!el) return;
+  try{
+    const acts=await api("/activity");
+    if(!acts.length){ el.style.display="none"; el.innerHTML=""; return; }
+    const a=acts[0];
+    const bits=[esc(a.label)];
+    if(a.detail) bits.push(esc(a.detail));
+    if(a.percent!=null) bits.push(a.percent+"%");
+    const extra=acts.length>1?` &nbsp;+${acts.length-1}`:"";
+    el.innerHTML=`<span class="spin"></span><span>${bits.join(" · ")}${extra}</span>`;
+    el.style.display="flex";
+  }catch(e){}
+}
 
 // ---- cards ----------------------------------------------------------------
 function progressPct(w){ if(!w||!w.duration_ms||!w.position_ms) return 0; return Math.min(100,100*w.position_ms/w.duration_ms); }
@@ -191,7 +235,7 @@ async function viewHome(){
     const page=await api(`/libraries/${lib.id}/items?limit=24&sort=added`);
     html+=`<h2 class="section">${esc(lib.name)} <a class="muted" style="font-size:12px" href="#/library/${lib.id}">· view all (${page.total})</a></h2>${grid(page.items)}`;
   }
-  if(!libs.length){ html=`<div class="empty">No libraries yet.${ME.is_admin?' Add one in <a href="#/admin">Admin</a>.':''}</div>`; }
+  if(!libs.length){ html=`<div class="empty">No libraries yet.${ME.is_admin?' Add one in <a href="#/settings">Settings</a>.':''}</div>`; }
   document.getElementById("main").innerHTML=html||`<div class="empty">Nothing here yet.</div>`;
 }
 async function viewLibrary(id){
@@ -212,21 +256,30 @@ async function viewItem(id){
   d.files.forEach(f=>ITEM_FOR_FILE[f.id]=Number(id));
   const art=it.poster||it.backdrop;
   const imgTag = art?`<img class="art" src="${tok(art)}">`:`<div class="art"></div>`;
-  let right=`<h1>${esc(it.title)}</h1><div class="row muted">${[it.year,fmtDur(it.runtime_ms),it.kind].filter(Boolean).map(x=>`<span>${esc(String(x))}</span>`).join(" · ")}</div>`;
+  // In-app breadcrumb: an episode links up to its season, a season to its show.
+  let right="";
+  if(it.parent_id) right+=`<a class="crumb" href="#/item/${it.parent_id}">‹ ${it.kind==='episode'?'All episodes':'Show'}</a>`;
+  const runtime = it.runtime_ms || (d.files[0]&&d.files[0].duration_ms);
+  right+=`<h1>${esc(it.title)}</h1><div class="row muted">${[it.year,fmtDur(runtime),it.kind].filter(Boolean).map(x=>`<span>${esc(String(x))}</span>`).join(" · ")}</div>`;
   if(it.overview) right+=`<p class="overview">${esc(it.overview)}</p>`;
 
-  // Movie / episode: play button + file info. Show/season: children grid.
+  // Movie / episode: play button + versions. Show/season: children grid.
   if(d.files.length){
-    const f=d.files[0];
+    const f=d.files[0]; // best version first (server sorts by resolution)
     const resume = it.watch&&it.watch.position_ms>3000&&!it.watch.watched? it.watch.position_ms:0;
     right+=`<div class="row" style="margin-top:16px">
-      <button onclick='play(${f.id},${JSON.stringify(it.title)},${resume})'>▶ ${resume?`Resume (${fmtDur(resume)})`:'Play'}</button>
-      ${resume?`<button class="ghost" onclick='play(${f.id},${JSON.stringify(it.title)},0)'>Start over</button>`:''}
+      <button onclick='play(${f.id},${JSON.stringify(it.title)},${resume},${f.duration_ms||0})'>▶ ${resume?`Resume (${fmtDur(resume)})`:'Play'}</button>
+      ${resume?`<button class="ghost" onclick='play(${f.id},${JSON.stringify(it.title)},0,${f.duration_ms||0})'>Start over</button>`:''}
       <button class="ghost sm" id="wb" onclick="toggleWatched(${it.id}, ${it.watch&&it.watch.watched?1:0})">${it.watch&&it.watch.watched?'Mark unwatched':'Mark watched'}</button>
     </div>`;
-    const codecs=[f.video_codec,f.width&&`${f.width}×${f.height}`,f.hdr,(f.audio_streams[0]||{}).codec,f.container].filter(Boolean);
-    right+=`<div class="filebox"><div class="muted" style="font-size:13px">${esc(f.filename)}</div>
-      <div class="kv">${codecs.map(c=>`<span class="pill">${esc(String(c))}</span>`).join("")}</div></div>`;
+    const multi=d.files.length>1;
+    const rows=d.files.map(v=>{
+      const parts=[v.height&&`${v.height}p`,v.video_codec,v.hdr,(v.audio_streams[0]||{}).codec,v.container,fmtSize(v.size),fmtDur(v.duration_ms)].filter(Boolean);
+      return `<div class="verrow"><div style="min-width:0"><div class="muted" style="font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(v.filename)}</div>
+        <div class="kv">${parts.map(c=>`<span class="pill">${esc(String(c))}</span>`).join("")}</div></div>
+        ${multi?`<button class="ghost sm" style="flex:none" onclick='play(${v.id},${JSON.stringify(it.title)},${resume},${v.duration_ms||0})'>▶ Play</button>`:""}</div>`;
+    }).join("");
+    right+=`<div class="filebox">${multi?`<div class="muted" style="font-size:12px;margin-bottom:2px">${d.files.length} versions</div>`:""}${rows}</div>`;
   }
   if(d.children.length){
     const kids=d.children;
@@ -245,21 +298,25 @@ async function toggleWatched(id, watched){
 //  direct_play → native <video>, client-side seek/resume
 //  remux       → progressive fMP4 from ffmpeg, server fast-seek for resume
 //  transcode   → HLS via hls.js (ffmpeg tone-maps/re-encodes), offset resume
-let PLAYER={fileId:null,timer:null,offset:0,hls:null};
-async function play(fileId, title, resumeMs){
+let PLAYER={fileId:null,timer:null,offset:0,hls:null,knownDur:0};
+async function play(fileId, title, resumeMs, knownDurMs){
   const modal=document.getElementById("modal"), video=document.getElementById("video");
   document.getElementById("playTitle").textContent=title;
   modal.classList.add("open");
   let decision; try{ decision=await api(`/files/${fileId}/decision?profile=web-h264`);}catch(e){ toast(e.message); return closePlayer(); }
   const startSec=(resumeMs||0)/1000;
   teardownHls();
-  PLAYER={fileId, timer:null, offset:0, hls:null};
+  PLAYER={fileId, timer:null, offset:0, hls:null, knownDur:knownDurMs||0};
+  setupAirplay(video);
 
+  // Safari/iOS play HLS natively (required for AirPlay — MSE streams can't be
+  // sent to an Apple TV as video); everything else uses hls.js.
+  const nativeHls = video.canPlayType('application/vnd.apple.mpegurl');
   if(decision.method==='transcode'){
     // Transcode: start an HLS session (server re-encodes + tone-maps).
     let info; try{ info=await api(`/files/${fileId}/hls/start?height=720&start=${startSec.toFixed(1)}`);}catch(e){ toast(e.message); return closePlayer(); }
     PLAYER.offset = info.start_seconds||0;
-    if(window.Hls && Hls.isSupported()){
+    if(!nativeHls && window.Hls && Hls.isSupported()){
       const hls=new Hls({xhrSetup:x=>{ if(TOKEN) x.setRequestHeader("authorization","Bearer "+TOKEN); }});
       PLAYER.hls=hls;
       hls.loadSource(info.playlist_url);
@@ -267,11 +324,12 @@ async function play(fileId, title, resumeMs){
       hls.on(Hls.Events.MANIFEST_PARSED,()=>video.play().catch(()=>{}));
       hls.on(Hls.Events.ERROR,(_,d)=>{ if(d.fatal) toast("Playback error: "+d.details); });
     } else {
-      // Safari: native HLS. Token via query since we can't set headers.
+      // Native HLS: the session id in the URL is the credential, so the
+      // Apple TV can fetch segments itself when AirPlaying.
       video.src=tok(info.playlist_url); video.play().catch(()=>{});
     }
   } else {
-    // Direct play or remux → native <video>.
+    // Direct play or remux → native <video> (token in URL: AirPlay-safe).
     const isRemux = decision.method!=='direct_play';
     let url=tok(decision.play_url);
     if(isRemux){ PLAYER.offset=startSec; if(startSec>0) url+="&start="+startSec.toFixed(1); }
@@ -284,11 +342,24 @@ async function play(fileId, title, resumeMs){
   PLAYER.timer=setInterval(()=>reportProgress(fileId), 5000);
   video.onended=()=>{ reportProgress(fileId,true); };
 }
+function setupAirplay(video){
+  const btn=document.getElementById("apbtn");
+  if(!btn) return;
+  if(window.WebKitPlaybackTargetAvailabilityEvent){
+    video.addEventListener("webkitplaybacktargetavailabilitychanged",e=>{
+      btn.style.display = e.availability==="available"?"":"none";
+    });
+    btn.onclick=()=>{ try{ video.webkitShowPlaybackTargetPicker(); }catch(e){} };
+  } else { btn.style.display="none"; }
+}
 function teardownHls(){ if(PLAYER&&PLAYER.hls){ try{PLAYER.hls.destroy()}catch(e){} PLAYER.hls=null; } }
 async function reportProgress(fileId, ended){
   const video=document.getElementById("video");
   const posMs=Math.round(((PLAYER.offset||0)+ (video.currentTime||0))*1000);
-  const durMs=video.duration&&isFinite(video.duration)? Math.round(((PLAYER.offset||0)+video.duration)*1000):null;
+  // The file's probed duration is the truth; a progressive stream's
+  // video.duration grows as it buffers and must not be reported.
+  const durMs = PLAYER.knownDur
+    || (video.duration&&isFinite(video.duration)? Math.round(((PLAYER.offset||0)+video.duration)*1000):null);
   if(!ITEM_FOR_FILE[fileId]) return;
   try{ await api(`/items/${ITEM_FOR_FILE[fileId]}/progress`,{method:"POST",body:{position_ms:ended?(durMs||posMs):posMs,duration_ms:durMs}}); }catch(e){}
 }
@@ -302,17 +373,47 @@ function closePlayer(){
 // map fileId → itemId, filled by viewItem so progress posts to the right item
 const ITEM_FOR_FILE={};
 
-// ---- admin ----------------------------------------------------------------
-async function viewAdmin(){
+// ---- settings -------------------------------------------------------------
+function statusText(st){
+  if(!st) return "idle";
+  if(st.running){
+    if(st.phase==="enriching") return "fetching metadata…";
+    const p=st.progress;
+    return "scanning…"+(p&&p.found?` ${p.processed} / ${p.found} files`:"");
+  }
+  if(st.error) return `<span style="color:var(--bad)">error: ${esc(st.error)}</span>`;
+  if(st.last_scan){
+    const r=st.last_scan;
+    let s=`${r.added} added, ${r.updated} updated, ${r.unchanged} unchanged`;
+    if(r.removed_files) s+=`, ${r.removed_files} removed`;
+    if(r.skipped) s+=`, ${r.skipped} skipped`;
+    if(r.errors) s+=`, <span style="color:var(--bad)">${r.errors} error${r.errors>1?'s':''}</span>`;
+    if(st.finished_at) s+=` <span style="opacity:.7">· ${fmtAgo(st.finished_at)}</span>`;
+    s+=(r.problems||[]).map(p=>`<div class="problem">⚠ ${esc(p)}</div>`).join("");
+    return s;
+  }
+  return "idle";
+}
+async function viewSettings(){
   if(!ME.is_admin){ location.hash="#/"; return; }
-  chrome("admin",`<div class="empty">Loading…</div>`);
-  const [libs,settings,status]=await Promise.all([api("/libraries"),api("/settings"),api("/scan/status")]);
-  const libRows=libs.map(l=>{
-    const st=status[l.id]||{}; const s= st.running?"scanning…": st.last_scan?`${st.last_scan.added} added, ${st.last_scan.unchanged} unchanged`:(st.error?("error: "+st.error):"idle");
-    return `<tr><td><b>${esc(l.name)}</b></td><td>${l.anime?'anime':l.kind}</td><td class="muted">${esc(l.paths.join(", "))}</td><td class="muted">${esc(s)}</td>
-      <td class="row"><button class="ghost sm" onclick="scanLib(${l.id})">Scan</button><button class="ghost sm" onclick="delLib(${l.id})">Delete</button></td></tr>`;
-  }).join("");
+  chrome("settings",`<div class="empty">Loading…</div>`);
+  const [libs,settings,status,sys]=await Promise.all([api("/libraries"),api("/settings"),api("/scan/status"),api("/system")]);
+  const libRows=libs.map(l=>`<tr><td><b>${esc(l.name)}</b></td><td>${l.anime?'anime':l.kind}</td><td class="muted">${esc(l.paths.join(", "))}</td>
+      <td class="muted" id="st-${l.id}">${statusText(status[l.id])}</td>
+      <td class="row" style="flex-wrap:nowrap"><button class="ghost sm" onclick="scanLib(${l.id})">Scan</button><button class="ghost sm" onclick="delLib(${l.id})">Delete</button></td></tr>`).join("");
+  const enc=sys.encoders||{};
+  const pills=[["NVENC",enc.nvenc],["QuickSync",enc.qsv],["VA-API",enc.vaapi],["VideoToolbox",enc.videotoolbox]]
+    .map(([n,ok])=>`<span class="pill" style="${ok?'color:var(--good);border-color:var(--good)':''}">${n} ${ok?'✓':'—'}</span>`).join(" ");
   document.getElementById("main").innerHTML=`<div class="adminwrap">
+    <div class="card"><h2 class="section" style="margin-top:0">Server</h2>
+      <dl class="kvgrid">
+        <dt>Server</dt><dd>${esc(sys.name)} · plurx ${esc(sys.version)} · up ${fmtUptime(sys.uptime_seconds)}</dd>
+        <dt>Data dir</dt><dd>${esc(sys.data_dir)}</dd>
+        <dt>ffmpeg</dt><dd>${sys.ffmpeg_version?esc(sys.ffmpeg_version):`<span style="color:var(--bad)">not found at \`${esc(sys.ffmpeg)}\` — scanning and transcoding will fail</span>`}</dd>
+        <dt>Hardware</dt><dd>${pills}</dd>
+        <dt>Transcoder</dt><dd>${esc(sys.encoder_selected)} <span class="muted">(preference: ${esc(sys.hwaccel_pref)})</span></dd>
+        <dt>Right now</dt><dd>${sys.active_transcodes} active stream${sys.active_transcodes===1?'':'s'} · ${sys.libraries} librar${sys.libraries===1?'y':'ies'} · ${sys.users} user${sys.users===1?'':'s'}</dd>
+      </dl></div>
     <div class="card"><h2 class="section" style="margin-top:0">Libraries</h2>
       <table><thead><tr><th>Name</th><th>Kind</th><th>Paths</th><th>Status</th><th></th></tr></thead>
       <tbody>${libRows||`<tr><td colspan="5" class="muted">No libraries yet.</td></tr>`}</tbody></table>
@@ -320,6 +421,7 @@ async function viewAdmin(){
       <div class="row"><input id="ln" placeholder="Name" style="max-width:180px">
         <select id="lk" style="max-width:130px"><option value="movies">Movies</option><option value="shows">TV Shows</option><option value="anime">Anime</option></select>
         <input id="lp" placeholder="/path/to/media (comma-separated)"></div>
+      <div class="hint">Paths are as the <b>server process</b> sees them — running in Docker, that's the path inside the container (e.g. <code>/media/movies</code>), which must be mounted in your compose file.</div>
       <div class="err" id="lerr"></div>
       <button style="margin-top:12px" onclick="addLib()">Add & scan</button>
     </div>
@@ -327,7 +429,40 @@ async function viewAdmin(){
       <p class="muted" style="margin-top:0">${settings.tmdb_configured?"A TMDB API key is configured. Enter a new one to replace it.":"Add a TMDB API key to fetch posters, overviews, and episode data."}</p>
       <input id="tk" placeholder="TMDB API key" type="password"><div class="err" id="terr"></div>
       <button style="margin-top:12px" onclick="saveTmdb()">Save key</button></div>
+    <div class="card"><h2 class="section" style="margin-top:0">Logs</h2>
+      <div class="row"><select id="loglvl" style="max-width:120px" onchange="refreshLogs()">
+          <option value="info" selected>Info+</option><option value="warn">Warnings+</option>
+          <option value="error">Errors</option><option value="debug">Debug+</option></select>
+        <label class="row" style="margin:0;font-size:13px;color:var(--muted)"><input type="checkbox" id="logauto" checked style="width:auto"> auto-refresh</label>
+        <button class="ghost sm" onclick="refreshLogs()">Refresh</button></div>
+      <div class="logbox" id="logbox">Loading…</div></div>
   </div>`;
+  refreshLogs();
+  setPageTimer(settingsTick, 2000);
+}
+async function settingsTick(){
+  const h=location.hash;
+  if(h!=="#/settings"&&h!=="#/admin") return;
+  try{
+    const status=await api("/scan/status");
+    for(const [id,st] of Object.entries(status)){
+      const el=document.getElementById("st-"+id);
+      if(el) el.innerHTML=statusText(st);
+    }
+    const auto=document.getElementById("logauto");
+    if(auto&&auto.checked) refreshLogs();
+  }catch(e){}
+}
+async function refreshLogs(){
+  const box=document.getElementById("logbox"); if(!box) return;
+  const sel=document.getElementById("loglvl");
+  try{
+    const lines=await api(`/system/logs?level=${sel?sel.value:"info"}&limit=300`);
+    const stick = box.scrollHeight-box.scrollTop-box.clientHeight < 40;
+    box.innerHTML=lines.map(l=>`<div class="log-${esc(l.level)}">${fmtTs(l.ts_ms)} <b>${esc(l.level)}</b> ${esc(l.target)} — ${esc(l.message)}</div>`).join("")
+      ||'<span class="muted">Nothing at this level yet.</span>';
+    if(stick) box.scrollTop=box.scrollHeight;
+  }catch(e){ box.textContent="Failed to load logs: "+e.message; }
 }
 async function addLib(){
   const name=ln.value.trim(), sel=lk.value, paths=lp.value.split(",").map(s=>s.trim()).filter(Boolean);
@@ -335,22 +470,27 @@ async function addLib(){
   const kind = sel==="anime" ? "shows" : sel;
   const anime = sel==="anime";
   const err=document.getElementById("lerr"); err.textContent="";
-  try{ await api("/libraries",{method:"POST",body:{name,kind,paths,anime}}); toast("Library added — scanning"); viewAdmin(); }
+  try{ await api("/libraries",{method:"POST",body:{name,kind,paths,anime}}); toast("Library added — scanning"); viewSettings(); }
   catch(e){ err.textContent=e.message; }
 }
-async function scanLib(id){ try{ await api(`/libraries/${id}/scan`,{method:"POST"}); toast("Scan started"); setTimeout(viewAdmin,600);}catch(e){toast(e.message)} }
-async function delLib(id){ if(!confirm("Delete this library? Media files are not touched.")) return; try{ await api(`/libraries/${id}`,{method:"DELETE"}); toast("Deleted"); viewAdmin(); }catch(e){toast(e.message)} }
-async function saveTmdb(){ const err=document.getElementById("terr"); err.textContent=""; try{ await api("/settings",{method:"PUT",body:{tmdb_api_key:tk.value.trim()}}); toast("Saved"); viewAdmin(); }catch(e){err.textContent=e.message} }
+async function scanLib(id){ try{ await api(`/libraries/${id}/scan`,{method:"POST"}); toast("Scan started"); setTimeout(settingsTick,400);}catch(e){toast(e.message)} }
+async function delLib(id){ if(!confirm("Delete this library? Media files are not touched.")) return; try{ await api(`/libraries/${id}`,{method:"DELETE"}); toast("Deleted"); viewSettings(); }catch(e){toast(e.message)} }
+async function saveTmdb(){ const err=document.getElementById("terr"); err.textContent=""; try{ await api("/settings",{method:"PUT",body:{tmdb_api_key:tk.value.trim()}}); toast("Saved"); viewSettings(); }catch(e){err.textContent=e.message} }
 
 // ---- router ---------------------------------------------------------------
+// One page-scoped poller at a time; routing away always clears it.
+let PAGE_TIMER=null;
+function setPageTimer(fn,ms){ clearInterval(PAGE_TIMER); PAGE_TIMER=setInterval(fn,ms); }
 async function render(){
   if(!TOKEN||!ME) return boot();
+  clearInterval(PAGE_TIMER);
+  if(!ACT_TIMER) ACT_TIMER=setInterval(pollActivity,4000);
   const h=location.hash||"#/";
   try{
     if(h.startsWith("#/item/")) return await viewItem(h.split("/")[2]);
     if(h.startsWith("#/library/")) return await viewLibrary(h.split("/")[2]);
     if(h.startsWith("#/search/")) return await viewSearch(decodeURIComponent(h.split("/")[2]||""));
-    if(h==="#/admin") return await viewAdmin();
+    if(h==="#/admin"||h==="#/settings") return await viewSettings();
     return await viewHome();
   }catch(e){
     if(e.message!=="unauthorized"){ const m=document.getElementById("main"); if(m) m.innerHTML=`<div class="empty">${esc(e.message)}</div>`; else toast(e.message); }
