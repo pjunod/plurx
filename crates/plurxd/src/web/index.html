@@ -75,6 +75,13 @@
     display:none;pointer-events:none;backdrop-filter:blur(4px);z-index:2}
   .statsov.on{display:block}
   .statsov b{color:var(--muted);font-weight:600;display:inline-block;min-width:92px}
+  .pmenu{position:absolute;top:52px;right:14px;min-width:180px;max-width:280px;background:rgba(14,16,22,.97);border:1px solid var(--line);
+    border-radius:10px;padding:6px;display:none;z-index:3;box-shadow:0 10px 30px rgba(0,0,0,.5)}
+  .pmenu.on{display:block}
+  .pmenu button{display:block;width:100%;text-align:left;background:transparent;color:var(--text);border:0;padding:8px 10px;border-radius:7px;font-size:13px;font-weight:400}
+  .pmenu button:hover{background:var(--panel2)}
+  .pmenu button.sel{color:var(--accent);font-weight:600}
+  .pmenu button.sel::before{content:"✓ "}
   .player .bar{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;gap:10px}
   .toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:var(--panel2);border:1px solid var(--line);
     padding:10px 16px;border-radius:10px;z-index:60;opacity:0;transition:opacity .2s;pointer-events:none}
@@ -98,6 +105,9 @@
   .crumbs{font-size:13px;color:var(--muted);margin:0 0 16px;display:flex;gap:8px;flex-wrap:wrap;align-items:center}
   .crumbs .sep{opacity:.45}
   .crumbs .cur{color:var(--text)}
+  .libbar{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin:0 4px 16px}
+  .libbar select{width:auto;min-width:130px;padding:6px 9px}
+  .libbar .lbl{display:inline;margin:0 2px 0 0;font-size:12px;color:var(--muted)}
 
   /* ---- detail pages (movie / show / season / episode) ---- */
   .hero{position:relative;margin:-22px -20px 22px}
@@ -147,7 +157,7 @@
 </head>
 <body>
 <div id="app"></div>
-<div class="modal" id="modal"><div class="player card"><div class="bar"><div id="playTitle" style="font-weight:600"></div><div class="row"><button class="ghost sm" id="statsbtn" title="Playback info (i)" onclick="toggleStats()">ⓘ Stats</button><button class="ghost sm" id="apbtn" style="display:none" title="AirPlay">📺 AirPlay</button><button class="ghost sm" onclick="closePlayer()">Close</button></div></div><video id="video" controls autoplay playsinline x-webkit-airplay="allow"></video><div class="statsov" id="statsov"></div></div></div>
+<div class="modal" id="modal"><div class="player card"><div class="bar"><div id="playTitle" style="font-weight:600"></div><div class="row"><button class="ghost sm" id="audiobtn" style="display:none" onclick="toggleMenu('audio')">🔊 Audio</button><button class="ghost sm" id="subsbtn" style="display:none" onclick="toggleMenu('subs')">💬 Subtitles</button><button class="ghost sm" id="statsbtn" title="Playback info (i)" onclick="toggleStats()">ⓘ Stats</button><button class="ghost sm" id="apbtn" style="display:none" title="AirPlay">📺 AirPlay</button><button class="ghost sm" onclick="closePlayer()">Close</button></div></div><video id="video" controls autoplay playsinline x-webkit-airplay="allow"></video><div class="statsov" id="statsov"></div><div class="pmenu" id="pmenu"></div></div></div>
 <div class="toast" id="toast"></div>
 
 <script src="/assets/hls.min.js"></script>
@@ -299,11 +309,34 @@ async function viewHome(){
   if(!libs.length){ html=`<div class="empty">No libraries yet.${ME.is_admin?' Add one in <a href="#/settings">Settings</a>.':''}</div>`; }
   document.getElementById("main").innerHTML=html||`<div class="empty">Nothing here yet.</div>`;
 }
+let LIB_SORT="title", LIB_FILTER="all";
+function libOpt(v,label,cur){ return `<option value="${v}" ${cur===v?'selected':''}>${esc(label)}</option>`; }
+function matchWatch(it,f){
+  const w=it.watch, watched=w&&w.watched;
+  const prog=w&&w.position_ms>3000&&!watched;
+  if(f==="watched") return !!watched;
+  if(f==="unwatched") return !watched && !prog;
+  if(f==="inprogress") return !!prog;
+  return true;
+}
 async function viewLibrary(id){
   chrome("home",`<div class="empty">Loading…</div>`);
   const lib=(await api("/libraries")).find(l=>l.id==id);
-  const page=await api(`/libraries/${id}/items?limit=200&sort=title`);
-  document.getElementById("main").innerHTML=`<h2 class="section">${esc(lib?lib.name:'Library')} · ${page.total}</h2>${grid(page.items)}`;
+  const page=await api(`/libraries/${id}/items?limit=200&sort=${LIB_SORT}`);
+  const items=LIB_FILTER==="all"?page.items:page.items.filter(it=>matchWatch(it,LIB_FILTER));
+  const capNote = page.total>page.items.length? ` <span class="muted">(first ${page.items.length} of ${page.total})</span>`:"";
+  const bar=`<div class="libbar">
+    <div class="row">
+      <span class="lbl">Sort</span>
+      <select onchange="LIB_SORT=this.value;viewLibrary(${id})">
+        ${libOpt("title","Title (A–Z)",LIB_SORT)}${libOpt("added","Recently added",LIB_SORT)}${libOpt("year","Year",LIB_SORT)}</select>
+      <span class="lbl" style="margin-left:8px">Show</span>
+      <select onchange="LIB_FILTER=this.value;viewLibrary(${id})">
+        ${libOpt("all","Everything",LIB_FILTER)}${libOpt("unwatched","Unwatched",LIB_FILTER)}${libOpt("inprogress","In progress",LIB_FILTER)}${libOpt("watched","Watched",LIB_FILTER)}</select>
+    </div>
+    <span class="muted" style="font-size:13px">${items.length} item${items.length===1?'':'s'}${capNote}</span></div>`;
+  const body = items.length? grid(items) : `<div class="empty">Nothing matches this filter.</div>`;
+  document.getElementById("main").innerHTML=`<h2 class="section" style="margin-bottom:10px">${esc(lib?lib.name:'Library')}</h2>${bar}${body}`;
 }
 async function viewSearch(q){
   chrome("home",`<div class="empty">Searching…</div>`);
@@ -434,8 +467,12 @@ async function play(fileId, title, resumeMs, knownDurMs){
   let decision; try{ decision=await api(`/files/${fileId}/decision?profile=web-h264`);}catch(e){ toast(e.message); return closePlayer(); }
   const startSec=(resumeMs||0)/1000;
   teardownHls();
-  PLAYER={fileId, timer:null, offset:0, hls:null, knownDur:knownDurMs||0, method:decision.method, encoder:null};
+  PLAYER={fileId, timer:null, offset:0, hls:null, knownDur:knownDurMs||0, method:decision.method, encoder:null,
+    audio:decision.audio||[], subs:(decision.subtitles||[]).filter(s=>s.text),
+    curAudio:(decision.audio||[]).findIndex(a=>a.default), curSub:-1};
+  if(PLAYER.curAudio<0) PLAYER.curAudio=0;
   setupAirplay(video);
+  setupTrackMenus();
 
   // Safari/iOS play HLS natively (required for AirPlay — MSE streams can't be
   // sent to an Apple TV as video); everything else uses hls.js.
@@ -482,6 +519,75 @@ function setupAirplay(video){
   } else { btn.style.display="none"; }
 }
 function teardownHls(){ if(PLAYER&&PLAYER.hls){ try{PLAYER.hls.destroy()}catch(e){} PLAYER.hls=null; } }
+
+// ---- audio-language + subtitle menus --------------------------------------
+const LANGS={eng:"English",en:"English",jpn:"Japanese",ja:"Japanese",spa:"Spanish",es:"Spanish",
+  fre:"French",fra:"French",fr:"French",ger:"German",deu:"German",de:"German",ita:"Italian",it:"Italian",
+  por:"Portuguese",pt:"Portuguese",rus:"Russian",ru:"Russian",kor:"Korean",ko:"Korean",
+  chi:"Chinese",zho:"Chinese",zh:"Chinese",hin:"Hindi",ara:"Arabic",nld:"Dutch",swe:"Swedish",pol:"Polish",und:"Unknown"};
+function langName(c){ return c?(LANGS[c.toLowerCase()]||c.toUpperCase()):null; }
+function audioLabelMenu(a,i){ return (langName(a.language)||("Track "+(i+1)))+(a.channels?" · "+fmtChannels(a.channels):"")+(a.title?" · "+a.title:""); }
+function subLabelMenu(s){ return (langName(s.language)||("Subtitle "+(s.index+1)))+(s.forced?" (forced)":"")+(s.title?" · "+s.title:""); }
+function setupTrackMenus(){
+  const ab=document.getElementById("audiobtn"), sb=document.getElementById("subsbtn"), m=document.getElementById("pmenu");
+  if(m){ m.classList.remove("on"); m.innerHTML=""; }
+  if(ab) ab.style.display=(PLAYER.audio&&PLAYER.audio.length>1)?"":"none";
+  // Native <track> subtitles ride the full-file timeline, so offer them for
+  // direct/remux; a transcode from an offset would misalign them.
+  if(sb) sb.style.display=(PLAYER.subs&&PLAYER.subs.length&&PLAYER.method!=='transcode')?"":"none";
+}
+function toggleMenu(kind){
+  const m=document.getElementById("pmenu"); if(!m) return;
+  if(m.classList.contains("on") && m.dataset.kind===kind){ m.classList.remove("on"); return; }
+  m.dataset.kind=kind;
+  if(kind==="audio"){
+    m.innerHTML=PLAYER.audio.map((a,i)=>`<button class="${PLAYER.curAudio===i?'sel':''}" onclick="switchAudio(${i})">${esc(audioLabelMenu(a,i))}</button>`).join("");
+  } else {
+    m.innerHTML=`<button class="${PLAYER.curSub<0?'sel':''}" onclick="setSub(-1)">Off</button>`+
+      PLAYER.subs.map(s=>`<button class="${PLAYER.curSub===s.index?'sel':''}" onclick="setSub(${s.index})">${esc(subLabelMenu(s))}</button>`).join("");
+  }
+  m.classList.add("on");
+}
+function setSub(index){
+  const m=document.getElementById("pmenu"); if(m) m.classList.remove("on");
+  PLAYER.curSub=index;
+  const v=document.getElementById("video");
+  [...v.querySelectorAll("track")].forEach(tr=>{ if(tr.track) tr.track.mode=(+tr.dataset.idx===index?"showing":"disabled"); });
+  if(index>=0 && ![...v.querySelectorAll("track")].some(tr=>+tr.dataset.idx===index)){
+    const s=PLAYER.subs.find(x=>x.index===index);
+    const tr=document.createElement("track");
+    tr.kind="subtitles"; tr.dataset.idx=index; tr.label=subLabelMenu(s); tr.srclang=s.language||"und";
+    tr.src=tok(`/api/v1/files/${PLAYER.fileId}/subs/${index}`);
+    v.appendChild(tr);
+    // Setting mode triggers the fetch; do it after the element registers.
+    setTimeout(()=>{ if(tr.track) tr.track.mode="showing"; },30);
+  }
+}
+async function switchAudio(idx){
+  const m=document.getElementById("pmenu"); if(m) m.classList.remove("on");
+  if(idx===PLAYER.curAudio) return;
+  PLAYER.curAudio=idx;
+  const v=document.getElementById("video");
+  const pos=(PLAYER.offset||0)+(v.currentTime||0);
+  const track=PLAYER.audio[idx]; const aidx=track?track.index:idx;
+  teardownHls();
+  const curSub=PLAYER.curSub;
+  [...v.querySelectorAll("track")].forEach(t=>t.remove()); // re-added below if a sub was on
+  if(PLAYER.method==='transcode'){
+    let info; try{ info=await api(`/files/${PLAYER.fileId}/hls/start?height=720&start=${pos.toFixed(1)}&audio=${aidx}`);}catch(e){ return toast(e.message); }
+    PLAYER.offset=info.start_seconds||0; PLAYER.encoder=info.encoder||null;
+    const nativeHls=v.canPlayType('application/vnd.apple.mpegurl');
+    if(!nativeHls && window.Hls && Hls.isSupported()){ const hls=new Hls({xhrSetup:x=>{if(TOKEN)x.setRequestHeader("authorization","Bearer "+TOKEN);}}); PLAYER.hls=hls; hls.loadSource(info.playlist_url); hls.attachMedia(v); hls.on(Hls.Events.MANIFEST_PARSED,()=>v.play().catch(()=>{})); }
+    else { v.src=tok(info.playlist_url); v.play().catch(()=>{}); }
+  } else {
+    // Switching audio forces a remux so the chosen track is the one delivered.
+    PLAYER.method='remux'; PLAYER.offset=pos;
+    v.src=tok(`/api/v1/files/${PLAYER.fileId}/stream.mp4`)+`&audio=${aidx}&start=${pos.toFixed(1)}`;
+    v.play().catch(()=>{});
+  }
+  toast("Audio: "+(langName(track&&track.language)||("Track "+(idx+1))));
+  if(curSub>=0) setTimeout(()=>setSub(curSub),400); // re-apply subtitle after reload
+}
 
 // ---- playback stats overlay (press i, or the Stats button) ----------------
 let STATS_TIMER=null;
@@ -531,6 +637,8 @@ function closePlayer(){
   if(PLAYER.fileId) reportProgress(PLAYER.fileId);
   clearInterval(PLAYER.timer); clearInterval(STATS_TIMER); STATS_TIMER=null; teardownHls();
   const ov=document.getElementById("statsov"); if(ov) ov.classList.remove("on");
+  const pm=document.getElementById("pmenu"); if(pm) pm.classList.remove("on");
+  [...video.querySelectorAll("track")].forEach(t=>t.remove());
   video.pause(); video.removeAttribute("src"); video.load();
   document.getElementById("modal").classList.remove("open");
   if(location.hash.startsWith("#/item/")) { const id=location.hash.split("/")[2]; setTimeout(()=>viewItem(id),100); }
