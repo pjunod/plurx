@@ -54,6 +54,7 @@ pub fn router(state: AppState) -> Router {
             put(libraries::update).delete(libraries::delete),
         )
         .route("/libraries/{id}/scan", post(libraries::scan))
+        .route("/libraries/{id}/refresh", post(libraries::refresh))
         .route("/libraries/{id}/items", get(browse::list_items))
         // Browse
         .route("/items/{id}", get(browse::item_detail))

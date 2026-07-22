@@ -320,16 +320,19 @@ impl MediaStore for SqliteStore {
     async fn items_needing_metadata(
         &self,
         library_id: Option<i64>,
+        force: bool,
     ) -> Result<Vec<Item>, StoreError> {
         self.with_conn(move |conn| {
             let mut stmt = conn.prepare(&format!(
                 "SELECT {ITEM_COLS} FROM items
-                 WHERE kind IN ('movie','show') AND tmdb_id IS NULL
+                 WHERE kind IN ('movie','show') AND (?2 = 1 OR tmdb_id IS NULL)
                    AND (?1 IS NULL OR library_id = ?1)
                  ORDER BY id"
             ))?;
             let items = stmt
-                .query_map(params![library_id], |row| item_from_row(row, 0))?
+                .query_map(params![library_id, force as i64], |row| {
+                    item_from_row(row, 0)
+                })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(items)
         })
@@ -733,7 +736,7 @@ mod tests {
 
         assert_eq!(
             store
-                .items_needing_metadata(None)
+                .items_needing_metadata(None, false)
                 .await
                 .expect("needing")
                 .len(),
@@ -752,10 +755,21 @@ mod tests {
             .await
             .expect("patch");
         assert!(store
-            .items_needing_metadata(None)
+            .items_needing_metadata(None, false)
             .await
             .expect("needing")
             .is_empty());
+
+        // A forced refresh returns the already-matched item anyway (backfills
+        // season posters onto shows enriched before that existed).
+        assert_eq!(
+            store
+                .items_needing_metadata(None, true)
+                .await
+                .expect("forced")
+                .len(),
+            1
+        );
 
         // FTS picks up the corrected title (trigger-synced), prefix search works.
         let hits = store.search_items("blade run", 10).await.expect("search");

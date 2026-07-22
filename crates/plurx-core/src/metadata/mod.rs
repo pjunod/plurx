@@ -38,6 +38,7 @@ pub async fn enrich_library(
     tmdb: &TmdbClient,
     artwork_dir: &Path,
     library_id: Option<i64>,
+    force: bool,
 ) -> EnrichReport {
     let mut report = EnrichReport::default();
     if let Err(e) = tokio::fs::create_dir_all(artwork_dir).await {
@@ -46,7 +47,7 @@ pub async fn enrich_library(
         return report;
     }
 
-    let items = match store.items_needing_metadata(library_id).await {
+    let items = match store.items_needing_metadata(library_id, force).await {
         Ok(items) => items,
         Err(e) => {
             tracing::error!(error = %e, "listing items needing metadata");
@@ -163,6 +164,7 @@ pub async fn enrich_anime_library(
     client: &AniListClient,
     artwork_dir: &Path,
     library_id: i64,
+    force: bool,
 ) -> EnrichReport {
     let mut report = EnrichReport::default();
     if let Err(e) = tokio::fs::create_dir_all(artwork_dir).await {
@@ -170,7 +172,7 @@ pub async fn enrich_anime_library(
         report.errors += 1;
         return report;
     }
-    let items = match store.items_needing_metadata(Some(library_id)).await {
+    let items = match store.items_needing_metadata(Some(library_id), force).await {
         Ok(items) => items,
         Err(e) => {
             tracing::error!(error = %e, "listing anime needing metadata");

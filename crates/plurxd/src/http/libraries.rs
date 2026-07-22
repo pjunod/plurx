@@ -126,3 +126,17 @@ pub async fn scan(
     let started = state.jobs.trigger_scan(id).await;
     Ok(Json(ScanTriggered { started }))
 }
+
+/// POST /api/v1/libraries/:id/refresh (admin) — rescan + force a full metadata
+/// refresh (re-fetches even already-matched items, e.g. to backfill season art).
+pub async fn refresh(
+    _admin: AdminUser,
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<ScanTriggered>, ApiError> {
+    if state.store.get_library(id).await?.is_none() {
+        return Err(ApiError::NotFound("library"));
+    }
+    let started = state.jobs.trigger_refresh(id).await;
+    Ok(Json(ScanTriggered { started }))
+}

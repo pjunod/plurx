@@ -154,6 +154,16 @@ impl JobManager {
     /// Kick off a scan for `library_id` unless one is already running. Returns
     /// `true` if a scan was started, `false` if one was already in flight.
     pub async fn trigger_scan(self: &Arc<Self>, library_id: i64) -> bool {
+        self.trigger(library_id, false).await
+    }
+
+    /// Like [`trigger_scan`], but forces a full metadata refresh — re-enriches
+    /// even already-matched items (backfills season posters onto older shows).
+    pub async fn trigger_refresh(self: &Arc<Self>, library_id: i64) -> bool {
+        self.trigger(library_id, true).await
+    }
+
+    async fn trigger(self: &Arc<Self>, library_id: i64, force_metadata: bool) -> bool {
         {
             let mut statuses = self.statuses.lock().await;
             let entry = statuses.entry(library_id).or_default();
@@ -175,12 +185,12 @@ impl JobManager {
 
         let manager = Arc::clone(self);
         tokio::spawn(async move {
-            manager.run_scan(library_id, progress).await;
+            manager.run_scan(library_id, progress, force_metadata).await;
         });
         true
     }
 
-    async fn run_scan(&self, library_id: i64, progress: Arc<ScanProgress>) {
+    async fn run_scan(&self, library_id: i64, progress: Arc<ScanProgress>, force_metadata: bool) {
         let mut status = ScanStatus {
             running: true,
             started_at: Some(now()),
@@ -228,6 +238,7 @@ impl JobManager {
                 &client,
                 &self.artwork_dir,
                 library_id,
+                force_metadata,
             )
             .await;
             status.last_enrich = Some(report);
@@ -240,6 +251,7 @@ impl JobManager {
                         &tmdb,
                         &self.artwork_dir,
                         Some(library_id),
+                        force_metadata,
                     )
                     .await;
                     status.last_enrich = Some(report);
