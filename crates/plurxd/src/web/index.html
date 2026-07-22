@@ -614,6 +614,37 @@ async function toggleWatched(id, watched){
 //  transcode   → HLS via hls.js (ffmpeg tone-maps/re-encodes), offset resume
 let PLAYER={fileId:null,timer:null,offset:0,hls:null,knownDur:0,durMs:0,markers:[],source:null,started:false,idleTimer:null,autoskip:false};
 let PLAYER_WIRED=false;
+// Native HLS (`video.src = playlist.m3u8`) is for real Safari ONLY — it's what
+// makes AirPlay work (an MSE stream can't be flung to an Apple TV). The trap:
+// modern Chrome answers "maybe" to canPlayType('application/vnd.apple.mpegurl')
+// because it grew a half-working built-in HLS player — which downloads the
+// playlist and first segment and then silently never plays (the gray-screen
+// bug). So the gate is the WebKit AirPlay API, which only Safari has, never
+// canPlayType alone. Everyone else gets hls.js (MSE), which is the tested path.
+function useNativeHls(video){
+  if(!video.canPlayType('application/vnd.apple.mpegurl')) return false;
+  if(window.WebKitPlaybackTargetAvailabilityEvent !== undefined) return true;   // real Safari/iOS
+  return !(window.Hls && Hls.isSupported());   // non-Safari: native only if hls.js can't run
+}
+// One place that attaches an HLS playlist to the video element (used by start,
+// seek-restart, and audio-switch). Worker off: a wallet extension's injected
+// CSP can silently kill a blob worker; main-thread demux of one 720p stream
+// is nothing.
+function attachHls(video, playlistUrl){
+  if(!useNativeHls(video) && window.Hls && Hls.isSupported()){
+    const hls=new Hls({enableWorker:false,xhrSetup:x=>{ if(TOKEN) x.setRequestHeader("authorization","Bearer "+TOKEN); }});
+    PLAYER.hls=hls;
+    hls.loadSource(playlistUrl);
+    hls.attachMedia(video);
+    hls.on(Hls.Events.MANIFEST_PARSED,()=>video.play().catch(()=>{}));
+    hls.on(Hls.Events.ERROR,(_,d)=>{ if(d.fatal){ console.warn("[cinemarr] hls.js fatal",d.type,d.details); setLoading(true,"Playback failed to start ("+d.details+").","the server couldn't build this stream — see Settings → Logs"); toast("Playback failed ("+d.details+")"); } });
+  } else {
+    // Native HLS: the session id in the URL is the credential, so the
+    // Apple TV can fetch segments itself when AirPlaying.
+    video.src=tok(playlistUrl); video.play().catch(()=>{});
+  }
+}
+
 async function play(fileId, title, resumeMs, knownDurMs){
   const modal=document.getElementById("modal"), video=document.getElementById("video");
   wirePlayer();
@@ -629,16 +660,13 @@ async function play(fileId, title, resumeMs, knownDurMs){
     audio:decision.audio||[], subs:(decision.subtitles||[]).filter(s=>s.text),
     curAudio:(decision.audio||[]).findIndex(a=>a.default), curSub:-1,
     markers:(decision.markers||[]).map(m=>({...m})), source:src, started:false,
-    idleTimer:null, autoskip:autoskipOn(), stallTimer:null, probeUrl:null};
+    idleTimer:null, autoskip:autoskipOn(), stallTimer:null, probeUrl:null, triedFallback:false};
   if(PLAYER.curAudio<0) PLAYER.curAudio=0;
   setupAirplay(video);
   setupTrackMenus();
   renderSkip(null);
   const sb=document.getElementById("skipbtn"); if(sb) sb.classList.toggle("on", PLAYER.autoskip);
 
-  // Safari/iOS play HLS natively (required for AirPlay — MSE streams can't be
-  // sent to an Apple TV as video); everything else uses hls.js.
-  const nativeHls = video.canPlayType('application/vnd.apple.mpegurl');
   if(decision.method==='transcode'){
     // Transcode: start an HLS session (server re-encodes + tone-maps).
     setLoading(true,"Starting the transcoder…",transcodeReason(decision));
@@ -647,18 +675,7 @@ async function play(fileId, title, resumeMs, knownDurMs){
     PLAYER.encoder = info.encoder||null;
     setLoading(true,"Preparing the stream…",(PLAYER.encoder?("encoder: "+PLAYER.encoder+" — "):"")+"buffering the first segments");
     PLAYER.probeUrl=info.playlist_url; armStall();
-    if(!nativeHls && window.Hls && Hls.isSupported()){
-      const hls=new Hls({enableWorker:false,xhrSetup:x=>{ if(TOKEN) x.setRequestHeader("authorization","Bearer "+TOKEN); }});
-      PLAYER.hls=hls;
-      hls.loadSource(info.playlist_url);
-      hls.attachMedia(video);
-      hls.on(Hls.Events.MANIFEST_PARSED,()=>video.play().catch(()=>{}));
-      hls.on(Hls.Events.ERROR,(_,d)=>{ if(d.fatal){ setLoading(false); toast("Playback failed to start ("+d.details+"). The server couldn't transcode this file — see Settings → Logs."); } });
-    } else {
-      // Native HLS: the session id in the URL is the credential, so the
-      // Apple TV can fetch segments itself when AirPlaying.
-      video.src=tok(info.playlist_url); video.play().catch(()=>{});
-    }
+    attachHls(video, info.playlist_url);
   } else {
     // Direct play or remux → native <video> (token in URL: AirPlay-safe).
     const isRemux = decision.method!=='direct_play';
@@ -699,6 +716,20 @@ function teardownHls(){ if(PLAYER&&PLAYER.hls){ try{PLAYER.hls.destroy()}catch(e
 // actual stream URL and turn the blank overlay into a specific verdict:
 // blocked-by-extension vs server-error vs reaches-browser-but-won't-decode.
 function clearStall(){ if(PLAYER&&PLAYER.stallTimer){ clearTimeout(PLAYER.stallTimer); PLAYER.stallTimer=null; } }
+// Rescue path: the browser rejected a remux/direct stream outright, so restart
+// this playback as a server transcode (guaranteed-compatible H.264/AAC HLS).
+async function startTranscodeFallback(){
+  const me=PLAYER, v=document.getElementById("video");
+  if(!me || !me.fileId || !v) return;
+  const startSec=(me.offset||0)+(v.currentTime||0);
+  teardownHls();
+  let info; try{ info=await api(`/files/${me.fileId}/hls/start?height=720&start=${startSec.toFixed(1)}`);}catch(e){ if(PLAYER===me){ setLoading(false); toast(e.message); } return; }
+  if(PLAYER!==me) return;   // the user closed the player / started something else
+  me.method='transcode'; me.offset=info.start_seconds||0; me.encoder=info.encoder||null;
+  me.probeUrl=info.playlist_url; armStall();
+  setLoading(true,"Preparing the stream…",(me.encoder?("encoder: "+me.encoder+" — "):"")+"transcoding instead of remuxing");
+  attachHls(v, info.playlist_url);
+}
 function armStall(){ clearStall(); if(!PLAYER) return; PLAYER.stallTimer=setTimeout(()=>stallDiagnose().catch(()=>{}), 40000); }
 async function stallDiagnose(){
   const v=document.getElementById("video");
@@ -766,7 +797,24 @@ function wirePlayer(){
   v.addEventListener("canplay",()=>{ if(PLAYER.started) setLoading(false); });
   v.addEventListener("waiting",()=>{ if(PLAYER.started) setLoading(true,"Buffering…",""); });
   v.addEventListener("pause",()=>{ p.classList.remove("idle"); });
-  v.addEventListener("error",()=>{ clearStall(); setLoading(false); if(PLAYER&&!PLAYER.started) toast("Couldn't start playback — the server may not be able to transcode this file. See Settings → Logs."); });
+  // A media error never reaches the console on its own — surface it, always.
+  // And a remux/direct stream the browser rejects gets one automatic rescue:
+  // restart as a transcode session (the server re-encodes to plain H.264/AAC).
+  v.addEventListener("error",()=>{
+    clearStall();
+    const err=v.error, code=err?err.code:0, msg=(err&&err.message)||"";
+    console.warn("[cinemarr] video error",{code,msg,method:PLAYER&&PLAYER.method,src:(v.currentSrc||"").split("?")[0]});
+    if(!PLAYER || PLAYER.started){ setLoading(false); return; }
+    if((PLAYER.method==='remux'||PLAYER.method==='direct_play') && !PLAYER.triedFallback){
+      PLAYER.triedFallback=true;
+      setLoading(true,"Stream rejected — switching to transcode…","the browser refused the "+PLAYER.method.replace('_',' ')+" stream (code "+code+"); re-encoding instead");
+      startTranscodeFallback();
+      return;
+    }
+    const names={1:"aborted",2:"network error",3:"the browser's decoder failed",4:"format not supported by this browser"};
+    setLoading(true,"Playback failed: "+(names[code]||("error "+code))+".",(msg?msg+" — ":"")+"see Settings → Logs for the server side");
+    toast("Playback failed — "+(names[code]||("error "+code)));
+  });
   v.addEventListener("timeupdate",checkMarkers);
 }
 function markerNowMs(){ const v=document.getElementById("video"); return ((PLAYER.offset||0)+(v?v.currentTime||0:0))*1000; }
@@ -814,9 +862,7 @@ async function seekTo(targetSec){
   if(PLAYER.method==='transcode'){
     let info; try{ info=await api(`/files/${PLAYER.fileId}/hls/start?height=720&start=${targetSec.toFixed(1)}&audio=${aidx}`);}catch(e){ setLoading(false); return toast(e.message); }
     PLAYER.offset=info.start_seconds||0; PLAYER.encoder=info.encoder||null;
-    const nativeHls=v.canPlayType('application/vnd.apple.mpegurl');
-    if(!nativeHls && window.Hls && Hls.isSupported()){ const hls=new Hls({enableWorker:false,xhrSetup:x=>{if(TOKEN)x.setRequestHeader("authorization","Bearer "+TOKEN);}}); PLAYER.hls=hls; hls.loadSource(info.playlist_url); hls.attachMedia(v); hls.on(Hls.Events.MANIFEST_PARSED,()=>v.play().catch(()=>{})); }
-    else { v.src=tok(info.playlist_url); v.play().catch(()=>{}); }
+    attachHls(v, info.playlist_url);
   } else {
     PLAYER.method='remux'; PLAYER.offset=targetSec;
     v.src=tok(`/api/v1/files/${PLAYER.fileId}/stream.mp4`)+`&audio=${aidx}&start=${targetSec.toFixed(1)}`;
@@ -886,9 +932,7 @@ async function switchAudio(idx){
   if(PLAYER.method==='transcode'){
     let info; try{ info=await api(`/files/${PLAYER.fileId}/hls/start?height=720&start=${pos.toFixed(1)}&audio=${aidx}`);}catch(e){ return toast(e.message); }
     PLAYER.offset=info.start_seconds||0; PLAYER.encoder=info.encoder||null;
-    const nativeHls=v.canPlayType('application/vnd.apple.mpegurl');
-    if(!nativeHls && window.Hls && Hls.isSupported()){ const hls=new Hls({enableWorker:false,xhrSetup:x=>{if(TOKEN)x.setRequestHeader("authorization","Bearer "+TOKEN);}}); PLAYER.hls=hls; hls.loadSource(info.playlist_url); hls.attachMedia(v); hls.on(Hls.Events.MANIFEST_PARSED,()=>v.play().catch(()=>{})); }
-    else { v.src=tok(info.playlist_url); v.play().catch(()=>{}); }
+    attachHls(v, info.playlist_url);
   } else {
     // Switching audio forces a remux so the chosen track is the one delivered.
     PLAYER.method='remux'; PLAYER.offset=pos;
