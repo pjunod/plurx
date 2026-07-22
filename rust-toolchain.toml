@@ -1,3 +1,7 @@
+# Pinned so local and CI use the exact same rustc/clippy — a floating "stable"
+# means a new Rust release can introduce lints that fail CI without any code
+# change. Bump this (and the matching version in .github/workflows/ci.yml)
+# deliberately when adopting a newer toolchain.
 [toolchain]
-channel = "stable"
+channel = "1.97.1"
 components = ["rustfmt", "clippy"]

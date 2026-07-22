@@ -219,23 +219,14 @@ pub fn parse_episode(path: &Path) -> Option<ParsedEpisode> {
         .and_then(|s| s.to_str())
         .unwrap_or_default();
 
-    let (season, episode, marker_start) = if let Some(c) = SXXEYY.captures(stem) {
-        let whole = c.get(0)?;
-        (
-            c.get(1)?.as_str().parse().ok()?,
-            c.get(2)?.as_str().parse().ok()?,
-            whole.start(),
-        )
-    } else if let Some(c) = NX_NN.captures(stem) {
-        let whole = c.get(0)?;
-        (
-            c.get(1)?.as_str().parse().ok()?,
-            c.get(2)?.as_str().parse().ok()?,
-            whole.start(),
-        )
-    } else {
-        return None;
-    };
+    // Both the SxxEyy and the NxNN forms yield (season, episode, marker start).
+    let captures = SXXEYY.captures(stem).or_else(|| NX_NN.captures(stem))?;
+    let whole = captures.get(0)?;
+    let (season, episode, marker_start) = (
+        captures.get(1)?.as_str().parse().ok()?,
+        captures.get(2)?.as_str().parse().ok()?,
+        whole.start(),
+    );
 
     // Show title: prefer a clean show folder (grandparent when inside a
     // "Season NN" dir), else the text before the S/E marker in the filename.
