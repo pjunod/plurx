@@ -63,6 +63,8 @@
   .amenu button.sel{color:var(--accent);font-weight:600}
   .amenu button.sel::before{content:"✓ "}
   .amsec{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);padding:8px 10px 3px}
+  /* theme-picker button shows the current accent as a live swatch */
+  .tsw{display:inline-block;width:12px;height:12px;border-radius:50%;background:var(--accent);vertical-align:middle;box-shadow:0 0 0 2px var(--panel),0 0 7px var(--accent)}
   .empty{color:var(--muted);padding:40px;text-align:center;border:1px dashed var(--line);border-radius:var(--radius)}
 
   .detail{display:grid;grid-template-columns:260px 1fr;gap:28px}
@@ -91,6 +93,8 @@
   .pbtn{background:rgba(18,20,26,.62);color:#fff;border:1px solid rgba(255,255,255,.15);border-radius:8px;
     padding:6px 11px;font-size:13px;font-weight:500;cursor:pointer;backdrop-filter:blur(6px);white-space:nowrap}
   .pbtn:hover{background:rgba(46,50,60,.85)}
+  .pbtn.on{background:var(--accent);border-color:var(--accent);color:#fff}
+  .pbtn.on:hover{background:var(--accent)}
   .ploading{position:absolute;inset:0;z-index:6;display:none;flex-direction:column;align-items:center;justify-content:center;gap:16px;
     background:radial-gradient(ellipse at center,rgba(8,8,12,.5),rgba(0,0,0,.8));color:#fff;text-align:center;padding:24px}
   .ploading.on{display:flex}
@@ -201,6 +205,11 @@ const THEMES={
   terminal:{name:"Terminal",
     dark:{"--bg":"#0a0d0b","--panel":"#0f1411","--panel2":"#151d17","--line":"#213021","--text":"#d6e6d4","--muted":"#7f9079","--accent":"#3ddc84","--accent2":"#2bb673","--good":"#3ddc84","--bad":"#ff6b6b","--radius":"4px","--btn-ink":"#06140c","--prose":"#b9ccb7","--font":FONT_MONO},
     light:{"--bg":"#f2f4ef","--panel":"#ffffff","--panel2":"#e9ede4","--line":"#d5dccb","--text":"#16211a","--muted":"#57664f","--accent":"#1a7f4b","--accent2":"#136139","--good":"#1a7f4b","--bad":"#c0392b","--radius":"4px","--btn-ink":"#ffffff","--prose":"#2a352b","--font":FONT_MONO}},
+  // noirr — the brand theme (kit tokens.css): midnight (dark) + matinee (light).
+  // crimson cursor accent; warm paper in daylight. See docs brand kit.
+  noirr:{name:"noirr",
+    dark:{"--bg":"#0a0a0c","--panel":"#101014","--panel2":"#16161b","--line":"#23232b","--text":"#ededef","--muted":"#9a9aa3","--accent":"#e5484d","--accent2":"#8e1c22","--good":"#5fb582","--bad":"#ff7a66","--radius":"10px","--btn-ink":"#ffffff","--prose":"#cdced2","--font":FONT_UI},
+    light:{"--bg":"#f2efe8","--panel":"#faf8f2","--panel2":"#eae6dc","--line":"#e0dccf","--text":"#1a1a1e","--muted":"#5d5c63","--accent":"#c2343a","--accent2":"#8e1c22","--good":"#35855c","--bad":"#c96442","--radius":"10px","--btn-ink":"#ffffff","--prose":"#33312e","--font":FONT_UI}},
 };
 function resolveMode(app){
   if(app==="light"||app==="dark") return app;
@@ -222,7 +231,7 @@ if(window.matchMedia){ try{ window.matchMedia("(prefers-color-scheme: dark)").ad
 </head>
 <body>
 <div id="app"></div>
-<div class="modal" id="modal"><div class="player" id="player"><video id="video" controls autoplay playsinline x-webkit-airplay="allow"></video><div class="pbar" id="pbar"><div class="ptitle" id="playTitle"></div><div class="row"><button class="pbtn" id="audiobtn" style="display:none" onclick="toggleMenu('audio')">🔊 Audio</button><button class="pbtn" id="subsbtn" style="display:none" onclick="toggleMenu('subs')">💬 Subtitles</button><button class="pbtn" id="statsbtn" title="Playback info (i)" onclick="toggleStats()">ⓘ Stats</button><button class="pbtn" id="apbtn" style="display:none" title="AirPlay">📺 AirPlay</button><button class="pbtn" title="Close (Esc)" onclick="closePlayer()">✕ Close</button></div></div><div class="pskip" id="pskip"></div><div class="ploading" id="ploading"><div class="pspin"></div><div class="ploadText" id="ploadText">Loading…</div><div class="ploadSub" id="ploadSub"></div></div><div class="statsov" id="statsov"></div><div class="pmenu" id="pmenu"></div></div></div>
+<div class="modal" id="modal"><div class="player" id="player"><video id="video" controls autoplay playsinline x-webkit-airplay="allow"></video><div class="pbar" id="pbar"><div class="ptitle" id="playTitle"></div><div class="row"><button class="pbtn" id="audiobtn" style="display:none" onclick="toggleMenu('audio')">🔊 Audio</button><button class="pbtn" id="subsbtn" style="display:none" onclick="toggleMenu('subs')">💬 Subtitles</button><button class="pbtn" id="statsbtn" title="Playback info (i)" onclick="toggleStats()">ⓘ Stats</button><button class="pbtn" id="skipbtn" title="Auto-skip intro & credits" onclick="togglePlayerAutoskip()">⏭ Auto-skip</button><button class="pbtn" id="apbtn" style="display:none" title="AirPlay">📺 AirPlay</button><button class="pbtn" title="Close (Esc)" onclick="closePlayer()">✕ Close</button></div></div><div class="pskip" id="pskip"></div><div class="ploading" id="ploading"><div class="pspin"></div><div class="ploadText" id="ploadText">Loading…</div><div class="ploadSub" id="ploadSub"></div></div><div class="statsov" id="statsov"></div><div class="pmenu" id="pmenu"></div></div></div>
 <div class="toast" id="toast"></div>
 
 <script src="/assets/hls.min.js"></script>
@@ -316,7 +325,11 @@ function chrome(active, inner){
      <input class="search" id="q" placeholder="Search…" value="${esc(getQ())}">
      <span class="muted" style="font-size:13px">${esc(ME?ME.username:"")}</span>
      <div style="position:relative">
-       <button class="ghost sm" onclick="toggleAppearanceMenu(event)" title="Theme & appearance">◐</button>
+       <button class="ghost sm" onclick="toggleThemeMenu(event)" title="Theme"><span class="tsw"></span></button>
+       <div class="amenu" id="thememenu"></div>
+     </div>
+     <div style="position:relative">
+       <button class="ghost sm" onclick="toggleAppearanceMenu(event)" title="Light / dark">◐</button>
        <div class="amenu" id="appmenu"></div>
      </div>
      <button class="ghost sm" onclick="logout()">Sign out</button>
@@ -328,20 +341,26 @@ function chrome(active, inner){
 function getQ(){ const m=location.hash.match(/^#\/search\/(.*)$/); return m?decodeURIComponent(m[1]):""; }
 
 // ---- theme + appearance menu (per-user, header) ---------------------------
-function appMenuHtml(){
-  let theme="classic", app="auto";
-  try{ theme=localStorage.getItem("plurx_theme")||"classic"; app=localStorage.getItem("plurx_appearance")||"auto"; }catch(e){}
+// Two independent header menus: theme (the palette) and appearance (light/dark).
+// Auto-skip is a playback preference and lives on the player, not here.
+function themeMenuHtml(){
+  let theme="classic"; try{ theme=localStorage.getItem("plurx_theme")||"classic"; }catch(e){}
   const themes=Object.keys(THEMES).map(id=>`<button class="${theme===id?'sel':''}" onclick="setTheme('${id}')">${esc(THEMES[id].name)}</button>`).join("");
-  const modes=[["auto","Auto (system)"],["light","Light"],["dark","Dark"]].map(([v,l])=>`<button class="${app===v?'sel':''}" onclick="setAppearance('${v}')">${l}</button>`).join("");
-  const auto=autoskipOn();
-  const autobtn=`<button class="${auto?'sel':''}" onclick="setAutoskip(${auto?'false':'true'})">Auto-skip intro &amp; credits</button>`;
-  return `<div class="amsec">Theme</div>${themes}<div class="amsec">Appearance</div>${modes}<div class="amsec">Playback</div>${autobtn}`;
+  return `<div class="amsec">Theme</div>${themes}`;
 }
-function toggleAppearanceMenu(e){ if(e) e.stopPropagation(); const m=document.getElementById("appmenu"); if(!m) return;
+function appMenuHtml(){
+  let app="auto"; try{ app=localStorage.getItem("plurx_appearance")||"auto"; }catch(e){}
+  const modes=[["auto","Auto (system)"],["light","Light"],["dark","Dark"]].map(([v,l])=>`<button class="${app===v?'sel':''}" onclick="setAppearance('${v}')">${l}</button>`).join("");
+  return `<div class="amsec">Appearance</div>${modes}`;
+}
+function closeMenus(except){ ["thememenu","appmenu"].forEach(idn=>{ if(idn!==except){ const m=document.getElementById(idn); if(m) m.classList.remove("on"); } }); }
+function toggleThemeMenu(e){ if(e) e.stopPropagation(); closeMenus("thememenu"); const m=document.getElementById("thememenu"); if(!m) return;
+  const open=!m.classList.contains("on"); m.classList.toggle("on",open); if(open) m.innerHTML=themeMenuHtml(); }
+function toggleAppearanceMenu(e){ if(e) e.stopPropagation(); closeMenus("appmenu"); const m=document.getElementById("appmenu"); if(!m) return;
   const open=!m.classList.contains("on"); m.classList.toggle("on",open); if(open) m.innerHTML=appMenuHtml(); }
-function setTheme(id){ try{localStorage.setItem("plurx_theme",id)}catch(e){} applyTheme(); const m=document.getElementById("appmenu"); if(m) m.innerHTML=appMenuHtml(); }
+function setTheme(id){ try{localStorage.setItem("plurx_theme",id)}catch(e){} applyTheme(); const m=document.getElementById("thememenu"); if(m) m.innerHTML=themeMenuHtml(); }
 function setAppearance(v){ try{localStorage.setItem("plurx_appearance",v)}catch(e){} applyTheme(); const m=document.getElementById("appmenu"); if(m) m.innerHTML=appMenuHtml(); }
-document.addEventListener("click",()=>{ const m=document.getElementById("appmenu"); if(m) m.classList.remove("on"); });
+document.addEventListener("click",()=>{ closeMenus(); });
 
 // ---- global activity indicator --------------------------------------------
 // Always-visible pill: whatever the server is doing right now (scans,
@@ -566,6 +585,7 @@ async function play(fileId, title, resumeMs, knownDurMs){
   setupAirplay(video);
   setupTrackMenus();
   renderSkip(null);
+  const sb=document.getElementById("skipbtn"); if(sb) sb.classList.toggle("on", PLAYER.autoskip);
 
   // Safari/iOS play HLS natively (required for AirPlay — MSE streams can't be
   // sent to an Apple TV as video); everything else uses hls.js.
@@ -712,7 +732,9 @@ async function seekTo(targetSec){
 }
 function autoskipOn(){ try{ return localStorage.getItem("plurx_autoskip")==="1"; }catch(e){ return false; } }
 function setAutoskip(on){ try{ localStorage.setItem("plurx_autoskip", on?"1":"0"); }catch(e){}
-  if(PLAYER) PLAYER.autoskip=on; const m=document.getElementById("appmenu"); if(m) m.innerHTML=appMenuHtml(); }
+  if(PLAYER) PLAYER.autoskip=on;
+  const b=document.getElementById("skipbtn"); if(b){ b.classList.toggle("on", on); b.title=(on?"Auto-skip on — ":"Auto-skip off — ")+"intro & credits"; } }
+function togglePlayerAutoskip(){ setAutoskip(!autoskipOn()); toast(autoskipOn()?"Auto-skip on":"Auto-skip off"); }
 
 // ---- audio-language + subtitle menus --------------------------------------
 const LANGS={eng:"English",en:"English",jpn:"Japanese",ja:"Japanese",spa:"Spanish",es:"Spanish",
