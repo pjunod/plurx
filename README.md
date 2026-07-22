@@ -3,87 +3,189 @@
 [![ci](https://github.com/pjunod/plurx/actions/workflows/ci.yml/badge.svg)](https://github.com/pjunod/plurx/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/pjunod/plurx/branch/main/graph/badge.svg)](https://codecov.io/gh/pjunod/plurx)
 
-A self-hosted media server and player family in the spirit of **old-school Plex** — before the streaming tiles, live TV, ads, and cloud accounts. Your media, your hardware, your network. One lean server binary, clients everywhere, and something no media server has ever shipped: **real high-availability clustering**.
+A self-hosted media server and player in the spirit of **old-school Plex** —
+before the streaming tiles, live TV, ads, and cloud accounts. Your media, your
+hardware, your network: one lean Rust binary, a web app that doubles as the admin
+UI, a Plex-compatible API so existing clients just work, and the thing no media
+server has ever shipped — **real high-availability clustering**. Music, photos,
+and live TV are out of scope on purpose (see [non-goals](#non-goals)).
+
+> **Self-hosted and pre-1.0.** plurx runs on your LAN with no cloud dependency and
+> never phones home. It mounts your media **read-only** and never writes, renames,
+> or deletes a file. Today it runs as a **single node** — the HA cluster is
+> decided and validated (Phase 3 spike) but not yet wired up (Phase 4). Treat it
+> as a capable daily driver, not a backup of your only copy.
+
+![The plurx home screen — continue watching, next up, and recently added](docs/img/home.png)
+
+## Start here
+
+New to the project? Read in this order. [docs/FEATURES.md](docs/FEATURES.md) is
+the shortest answer to *what does this actually do* — the exhaustive inventory,
+including what it deliberately doesn't. Then [docs/OPERATIONS.md](docs/OPERATIONS.md)
+for running it day to day and reading every status and log line it shows you, with
+[docs/CHEATSHEET.md](docs/CHEATSHEET.md) as the copy-paste quickstart beside it.
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) has the diagrams and the founding
+decisions (why one binary clusters without external infra). Scope and the phased
+plan live in [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) and
+[docs/ROADMAP.md](docs/ROADMAP.md); client strategy in
+[docs/CLIENTS.md](docs/CLIENTS.md); deploy recipes in
+[deploy/README.md](deploy/README.md).
+
+## What it looks like
+
+A borderless, projection-style player: the title and controls auto-hide during
+playback, a staged loading overlay replaces the mystery gray screen, and an ⓘ
+stats overlay shows source → what your browser is actually decoding — plus Skip
+Intro / Skip Credits from real chapter markers.
+
+![The player with the stats overlay open](docs/img/player-stats.png)
+
+Every item shows its versions with labeled specs — a 2160p Dolby Vision remux and
+a 1080p encode on one title, each with full video/audio/file detail:
+
+![Movie detail with multiple versions and labeled specs](docs/img/item-detail.png)
+
+<details>
+<summary>More screenshots — Skip Intro, Settings, and a second theme</summary>
+
+The Skip Intro button appears when playback enters a marked region (chapters, or a
+conservative end-credits estimate); auto-skip is an opt-in preference:
+
+![Borderless player showing the Skip Intro button](docs/img/player-skip-intro.png)
+
+The admin Settings page: server + hardware at a glance (green pills are encoders
+that passed a real startup probe), libraries with **live** scan status, users,
+metadata key, and a live log viewer:
+
+![Settings — server diagnostics, hardware pills, and live library scan status](docs/img/settings.png)
+
+Theming follows the system light/dark and offers named themes — here the **Terminal**
+theme (true-black, monospace):
+
+![The Terminal theme — true black, monospace, green accents](docs/img/theme-terminal.png)
+
+</details>
 
 ## Principles
 
-1. **Your media, your rules.** No cloud dependency, no phone-home, no accounts hosted by anyone else. Everything works on a LAN that never touches the internet.
-2. **Direct play first.** The server's job is to get out of the way. Every client uses hardware decoding; the server only remuxes or transcodes when a device truly can't handle the file — and when it must, it uses hardware encoders.
-3. **Lean and boring to operate.** One static Rust binary. No external database, no message broker, no sidecar services. Run one node, or run three identical binaries and they form an HA cluster.
-4. **HA is a feature, not an ops project.** Active-active nodes over shared storage. Settings, users, watch state, and playback sessions replicate across the cluster; a node dying mid-movie costs seconds, not your evening.
-5. **Meet clients where they are.** A native API for our own apps, plus a Plex Media Server-compatible API so existing third-party Plex clients can point at plurx and just work.
+1. **Your media, your rules.** No cloud dependency, no phone-home, no externally
+   hosted accounts. Everything works on a LAN that never touches the internet.
+2. **Direct play first.** The server's job is to get out of the way — every
+   client uses hardware decoding, and plurx only remuxes or transcodes when a
+   device truly can't handle the file, using hardware encoders when it must.
+3. **Lean and boring to operate.** One static binary. No external database,
+   message broker, or sidecar. Run one node, or run three identical binaries and
+   they form an HA cluster.
+4. **HA is a feature, not an ops project.** Active-active nodes over shared
+   storage; settings, users, watch state, and playback sessions replicate — a
+   node dying mid-movie costs seconds, not your evening.
+5. **Meet clients where they are.** A native API for our own apps, plus a Plex
+   Media Server-compatible API so existing third-party Plex clients point at
+   plurx and just work.
 
-## What it is (v1 scope)
+## Install
 
-- Movies, TV shows, and anime (with anime-correct metadata and episode ordering)
-- 4K HDR10 / Dolby Vision and lossless audio (TrueHD/Atmos, DTS-HD MA) as first-class citizens
-- Local user accounts and profiles, optional Google/Apple OIDC sign-in, bring-your-own remote access
-- Clusters of 1 or 3+ nodes (active-active, shared media storage, embedded raft — no external infra)
-- Clients: web app first (doubles as the admin UI), then Samsung Tizen / LG webOS (shared web core), Apple TV (native Swift), Android/Google TV (Kotlin, covers Sony), Roku (SceneGraph)
-- Plex-compat API so Kodi-family Plex clients and plexapi-based tooling work out of the box
+```bash
+# Docker / Compose — recommended for homelabs; builds from source the first time
+cd deploy
+cp docker-compose.override.example.yml docker-compose.override.yml  # your media mounts + GPU
+docker compose up -d --build                                        # then open http://<host>:32600
 
-## What it is not
+# Bare metal — one binary; needs ffmpeg/ffprobe (or point PLURX_FFMPEG/PLURX_FFPROBE at them)
+plurxd run                                                          # serves :32600
 
-- Not a streaming aggregator. No ad-supported movies, no live TV, no "discover" feeds, no rentals.
-- Not a cloud service. There is no plurx.tv and there never needs to be.
-- Not an everything-server. Music and photos are explicitly out of scope for v1 (the data model won't preclude them later).
-
-## Status
-
-**Phase 2 complete** (see [docs/ROADMAP.md](docs/ROADMAP.md)): plurx is old Plex, honestly replaced for movies, TV, and anime on the LAN — any file plays on the web app or a Kodi/Plex-compat client, HDR looks right on SDR screens, and watch state is trustworthy.
-
-- **Scanner** — identifies movies/episodes (Plex/Jellyfin + scene naming, and anime absolute numbering), probes with `ffprobe` (codecs, HDR, audio/subtitle tracks), incremental, reconciles vanished files.
-- **Metadata** — TMDB for movies/TV (optional key) and **AniList for anime** (no key); cached artwork; fully offline once enriched.
-- **Playback** — data-driven device profiles + decision engine (direct / remux / transcode), HTTP-range direct play, MKV→fMP4 remux, and full **hardware transcode** (validated NVENC/QSV/VA-API/VideoToolbox with software fallback) delivering **HLS** with **HDR→SDR tone-mapping** and subtitle burn-in.
-- **Anime** — absolute episode numbering, AniList metadata, and dual-audio default-track selection (prefer original audio + subs).
-- **Plex-compat (Tier 1)** — a Plex Media Server API façade + GDM discovery, so Kodi (Composite/PKC), python-plexapi, and Home Assistant browse and play directly. Validated end-to-end with python-plexapi.
-- **Web app** — login, browse, an in-modal player (native + hls.js, **AirPlay** from Safari/iOS) with resume, continue-watching, **next-up**, search, multiple versions per item, and a **Settings** area: server diagnostics, libraries with live scan status + loud scan problems, TMDB key, and a live log viewer. A global activity pill shows what the server is doing on every page.
-- **Ops** — `/healthz`, `/readyz`, Prometheus `/metrics`; Docker/Compose, bare-metal systemd, and Unraid deploy templates in [`deploy/`](deploy/).
-
-```sh
-cargo run -p plurxd            # serves http://localhost:32600 — open it in a browser
+# From source (development)
+cargo run -p plurxd                                                 # or: make run
 ```
 
-First launch walks you through creating an admin account and adding a library. Configuration: copy `plurx.example.toml` to `plurx.toml`, or use `PLURX_*` env vars (`PLURX_FFMPEG`/`PLURX_FFPROBE`, `PLURX_HWACCEL`, `PLURX_TONEMAP`).
+First launch walks you through creating an admin account and adding a library.
+Library paths are what the **server process** sees — under Docker, the
+container-side mount path. Configuration is defaults → `plurx.toml` → `PLURX_*`
+env (full table in [docs/OPERATIONS.md](docs/OPERATIONS.md#configuration-surface)).
 
-Deferred to a Phase 2.x fast-follow: TVDB agent (TMDB already covers TV), movie collections, playlists, and bitmap-subtitle burn-in.
+Developer commands (CI runs the same targets, so green locally means green in CI):
 
-**Phase 3 (cluster spike) is complete** — the decision gate for HA. Both risks were spiked with real experiments (see [docs/PHASE3-SPIKE.md](docs/PHASE3-SPIKE.md)): the replicated store backend is **hiqlite** (raft-replicated SQLite; its API maps onto plurx's existing `Store` mappers, verified with a live node), and the transcode-failover mechanic is a session restart-at-boundary that any node can serve (validated against sparse-keyframe and VFR sources, with byte-identical segments). Next: **Phase 4** — HA for real, adding `HiqliteStore` behind the unchanged `Store` trait.
-
-| Document | Contents |
-|---|---|
-| [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) | Product requirements — scope, playback contract, HA contract, users, metadata, deployment |
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Server design — components, cluster/replication model, streaming pipeline, tech stack |
-| [docs/CLIENTS.md](docs/CLIENTS.md) | Client strategy — platform matrix, Plex client compatibility tiers, per-platform constraints |
-| [docs/ROADMAP.md](docs/ROADMAP.md) | Phased plan sized for a solo developer + AI pair, always-shippable increments |
-
-## Development
-
-All developer tasks go through the `Makefile` — CI runs the same targets, so
-"green locally" means "green in CI":
-
-```sh
+```bash
 make            # list every target
 make run        # serve http://localhost:32600
-make check      # fmt-check + clippy + test (the CI gate)
-make test       # just the tests
+make check      # fmt-check + clippy + test  (the CI gate — the single quality bar)
 make coverage   # line coverage via cargo-llvm-cov → lcov.info
 make hooks      # install a pre-commit hook that runs `make check`
 ```
 
-`make hooks` installs a git pre-commit hook so a commit can't land unless
-`make check` passes (bypass a single commit with `git commit --no-verify`).
+## Usage
 
-CI (`.github/workflows/ci.yml`) runs `make check`, uploads coverage, and
-cross-builds amd64 + arm64 on every push and PR. Pushing a version tag
-(`git tag v0.1.0 && git push --tags`) additionally builds and publishes a
-multi-arch image to `ghcr.io/pjunod/plurx`.
+**Add a library.** Settings → Libraries → *Add & scan*. Pick Movies, TV Shows, or
+Anime; give it one or more paths. The scanner identifies files, probes them with
+`ffprobe`, and enriches from TMDB (movies/TV, optional key) or AniList (anime, no
+key). Watch the live status: `scanning… N / M files` → `fetching metadata…` →
+`idle`. A scan that finds nothing almost always means the path isn't what the
+server sees — see [OPERATIONS.md](docs/OPERATIONS.md#reading-library-scan-status).
 
-The two badges above need one-time linking to render live: the **ci** badge
-works as soon as the workflow runs on GitHub; the **coverage** badge needs the
-repo added at [codecov.io](https://codecov.io) and its upload token stored as
-the `CODECOV_TOKEN` repository secret (CI is configured to not fail if it's
-absent).
+**Play something.** Press play; plurx decides direct-play / remux / transcode for
+your device and reports it. Open the **Stats** overlay (ⓘ or press `i`) to see the
+method, source, and what your browser is actually decoding. *Direct play* is
+ideal, *Remux* is cheap, *Transcode · QuickSync* means the GPU is working,
+*Transcode · software* means it fell back to CPU (the logs say why).
+
+**Point a Plex client at it.** Kodi-family Plex clients (Composite, PKC),
+`python-plexapi`, and Home Assistant work against the Plex-compat façade + GDM
+discovery — no plex.tv contact. See [docs/CLIENTS.md](docs/CLIENTS.md).
+
+**Operate it.** `/healthz`, `/readyz`, and Prometheus `/metrics`; a global
+activity pill shows what the server is doing on every page; Settings → Logs is a
+live, filterable log viewer. Full guide: [docs/OPERATIONS.md](docs/OPERATIONS.md).
+
+## Layout
+
+| Path | What's inside |
+|---|---|
+| [`crates/plurx-core`](crates/plurx-core) | Domain model · the `Store` trait · scanner · metadata agents · playback decision engine |
+| [`crates/plurxd`](crates/plurxd) | The HTTP daemon (axum) · transcode orchestrator · the embedded single-file web app |
+| [`crates/plurx-compat-plex`](crates/plurx-compat-plex) | Plex Media Server API façade + GDM discovery responder |
+| [`docs/`](docs) | Architecture · features · operations · cheat sheet · requirements · roadmap · clients |
+| [`deploy/`](deploy) | Docker/Compose, systemd, and Unraid templates |
+
+## Status
+
+Phases are gates — each ends with something you actually use. Full detail in
+[docs/ROADMAP.md](docs/ROADMAP.md).
+
+- [x] **Phase 0 — Skeleton.** Workspace, CI (fmt/clippy/test, cross-build), Docker
+  image, `Store` trait boundary from commit one.
+- [x] **Phase 1 — It plays.** Scanner, TMDB metadata, native API, direct play +
+  remux, resume, embedded web app.
+- [x] **Phase 2 — Old-Plex parity.** Hardware transcode (NVENC/QSV/VA-API/
+  VideoToolbox + software fallback) with HDR→SDR tone-mapping and HLS; anime
+  (AniList, absolute numbering, dual-audio); multi-version items; subtitles;
+  Plex-compat Tier 1 (validated with `python-plexapi`); ops (metrics, logs,
+  deploy templates).
+- [x] **Phase 3 — Cluster spike.** The HA decision gate: store backend (hiqlite)
+  and transcode-failover mechanic decided and validated against real sources. See
+  [docs/PHASE3-SPIKE.md](docs/PHASE3-SPIKE.md).
+- [~] **Playback experience.** Borderless player, staged loading, rich stats, skip
+  intro/credits with auto-skip — shipped. Public ratings and multi-server
+  dashboard still to come.
+- [ ] **Phase 4 — HA for real.** `HiqliteStore` behind the unchanged `Store`
+  trait, replicated sessions, client-retry failover, Helm chart, failure-drill
+  tests.
+- [ ] **Phase 5 — Native clients.** Android/Google TV → Apple TV → Tizen/webOS →
+  Roku, each with a device profile and the shared correctness corpus.
+
+## Non-goals
+
+Deliberate, with reasons — the full list and rationale is in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#8-non-goals-what-the-architecture-deliberately-refuses)
+and [docs/FEATURES.md](docs/FEATURES.md#9-what-plurx-does-not-do):
+
+- **No cloud, no phone-home.** There is no plurx.tv and there never needs to be.
+- **plurx never writes your media.** Read-only mounts; no organizing, renaming, or
+  deleting.
+- **Not a streaming aggregator.** No ads, no live TV, no rentals, no "discover"
+  feeds.
+- **No music or photos** in v1 (the data model won't preclude them later).
+- **No transcode-by-default.** On demand only, when a device forces it.
 
 ## License
 
