@@ -219,7 +219,11 @@ async fn validate(ffmpeg_bin: &str, encoder: Encoder) -> bool {
             let why = why.lines().last().map(str::trim).unwrap_or("").trim();
             tracing::warn!(
                 encoder = encoder.label(),
-                reason = if why.is_empty() { "no error output" } else { why },
+                reason = if why.is_empty() {
+                    "no error output"
+                } else {
+                    why
+                },
                 "hardware encoder present but failed validation — not using it"
             );
             false

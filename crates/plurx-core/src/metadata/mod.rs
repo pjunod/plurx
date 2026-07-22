@@ -316,7 +316,10 @@ async fn enrich_episodes(
                 None
             };
             let patch = MetadataPatch {
-                overview: remote.overview.clone().filter(|_| season_item.overview.is_none()),
+                overview: remote
+                    .overview
+                    .clone()
+                    .filter(|_| season_item.overview.is_none()),
                 air_date: remote.air_date.clone(),
                 poster_path: poster,
                 ..Default::default()

@@ -49,7 +49,10 @@ pub async fn create(
         )));
     }
     let hash = auth::hash_password(&req.password).map_err(|e| ApiError::Internal(e.to_string()))?;
-    let user = state.store.create_user(username, &hash, req.is_admin).await?;
+    let user = state
+        .store
+        .create_user(username, &hash, req.is_admin)
+        .await?;
     Ok(Json(user.into()))
 }
 

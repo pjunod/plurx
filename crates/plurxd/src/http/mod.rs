@@ -432,7 +432,11 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        let (status, _) = call(&app, delete(&format!("/api/v1/users/{kid_id}"), Some(&admin))).await;
+        let (status, _) = call(
+            &app,
+            delete(&format!("/api/v1/users/{kid_id}"), Some(&admin)),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         let (_, users) = call(&app, get("/api/v1/users", Some(&admin))).await;
         assert_eq!(users.as_array().expect("array").len(), 1);

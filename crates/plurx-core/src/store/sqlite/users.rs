@@ -87,11 +87,11 @@ impl UserStore for SqliteStore {
 
     async fn count_admins(&self) -> Result<i64, StoreError> {
         self.with_conn(|conn| {
-            Ok(conn.query_row(
-                "SELECT COUNT(*) FROM users WHERE is_admin = 1",
-                [],
-                |row| row.get(0),
-            )?)
+            Ok(
+                conn.query_row("SELECT COUNT(*) FROM users WHERE is_admin = 1", [], |row| {
+                    row.get(0)
+                })?,
+            )
         })
         .await
     }
