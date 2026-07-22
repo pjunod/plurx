@@ -11,6 +11,7 @@ pub mod probe;
 
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use walkdir::WalkDir;
 
@@ -43,6 +44,20 @@ pub struct ScanReport {
 /// include everything; this just keeps the report readable).
 const MAX_WALK_PROBLEMS: usize = 10;
 
+/// Live counters a running scan updates as it goes. Shared with whoever wants
+/// to display progress (the HTTP status endpoint samples these atomics without
+/// touching the scan itself). Probing a big library over a NAS takes minutes;
+/// "processing 412 of 3801" is the difference between progress and a hang.
+#[derive(Debug, Default)]
+pub struct ScanProgress {
+    /// Candidate video files discovered by the directory walk.
+    pub found: AtomicUsize,
+    /// Files handled so far (unchanged, added, updated, skipped, or errored).
+    pub processed: AtomicUsize,
+    /// Files added or updated so far.
+    pub changed: AtomicUsize,
+}
+
 fn is_video(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
@@ -66,6 +81,15 @@ fn file_stat(path: &Path) -> Option<(i64, i64)> {
 /// Scan one library end to end. `store` is the full store; only media methods
 /// are used. Returns a tally of what changed.
 pub async fn scan_library(store: &dyn Store, library: &Library) -> Result<ScanReport, StoreError> {
+    scan_library_with_progress(store, library, None).await
+}
+
+/// Like [`scan_library`], updating `progress` (when given) as the scan runs.
+pub async fn scan_library_with_progress(
+    store: &dyn Store,
+    library: &Library,
+    progress: Option<&ScanProgress>,
+) -> Result<ScanReport, StoreError> {
     let mut report = ScanReport::default();
     let mut seen: HashSet<String> = HashSet::new();
 
@@ -111,6 +135,9 @@ pub async fn scan_library(store: &dyn Store, library: &Library) -> Result<ScanRe
         }
     }
     candidates.sort();
+    if let Some(p) = progress {
+        p.found.store(candidates.len(), Ordering::Relaxed);
+    }
 
     if candidates.is_empty() && walk_errors == 0 {
         report.problems.push(format!(
@@ -127,6 +154,9 @@ pub async fn scan_library(store: &dyn Store, library: &Library) -> Result<ScanRe
     }
 
     for path in candidates {
+        if let Some(p) = progress {
+            p.processed.fetch_add(1, Ordering::Relaxed);
+        }
         let path_str = path.to_string_lossy().into_owned();
         seen.insert(path_str.clone());
 
@@ -172,6 +202,9 @@ pub async fn scan_library(store: &dyn Store, library: &Library) -> Result<ScanRe
             report.added += 1;
         } else {
             report.updated += 1;
+        }
+        if let Some(p) = progress {
+            p.changed.fetch_add(1, Ordering::Relaxed);
         }
     }
 

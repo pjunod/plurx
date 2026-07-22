@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use plurx_core::metadata::{self, AniListClient, EnrichReport, TmdbClient};
-use plurx_core::scan::{self, ScanReport};
+use plurx_core::scan::{self, ScanProgress, ScanReport};
 use plurx_core::store::{keys, Store};
 use plurx_core::transcode::EncoderCaps;
 use serde::Serialize;
@@ -54,11 +54,34 @@ impl AppState {
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct ScanStatus {
     pub running: bool,
+    /// What the job is doing right now: "scanning" or "enriching".
+    pub phase: Option<String>,
+    /// Live counters while running (sampled from the scan's atomics).
+    pub progress: Option<ProgressSnapshot>,
     pub last_scan: Option<ScanReport>,
     pub last_enrich: Option<EnrichReport>,
     pub started_at: Option<i64>,
     pub finished_at: Option<i64>,
     pub error: Option<String>,
+}
+
+/// Point-in-time view of a running scan's counters.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct ProgressSnapshot {
+    pub found: usize,
+    pub processed: usize,
+    pub changed: usize,
+}
+
+impl ProgressSnapshot {
+    fn sample(p: &ScanProgress) -> Self {
+        use std::sync::atomic::Ordering::Relaxed;
+        ProgressSnapshot {
+            found: p.found.load(Relaxed),
+            processed: p.processed.load(Relaxed),
+            changed: p.changed.load(Relaxed),
+        }
+    }
 }
 
 fn now() -> i64 {
@@ -75,6 +98,8 @@ pub struct JobManager {
     store: Arc<dyn Store>,
     artwork_dir: PathBuf,
     statuses: Mutex<HashMap<i64, ScanStatus>>,
+    /// Live counters for in-flight scans, sampled by `all_statuses`.
+    live: Mutex<HashMap<i64, Arc<ScanProgress>>>,
 }
 
 impl JobManager {
@@ -83,12 +108,23 @@ impl JobManager {
             store,
             artwork_dir,
             statuses: Mutex::new(HashMap::new()),
+            live: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Snapshot of all libraries' scan statuses.
+    /// Snapshot of all libraries' scan statuses, with live progress attached
+    /// to any scan currently running.
     pub async fn all_statuses(&self) -> HashMap<i64, ScanStatus> {
-        self.statuses.lock().await.clone()
+        let mut map = self.statuses.lock().await.clone();
+        let live = self.live.lock().await;
+        for (id, progress) in live.iter() {
+            if let Some(status) = map.get_mut(id) {
+                if status.running {
+                    status.progress = Some(ProgressSnapshot::sample(progress));
+                }
+            }
+        }
+        map
     }
 
     /// Kick off a scan for `library_id` unless one is already running. Returns
@@ -102,19 +138,25 @@ impl JobManager {
             }
             *entry = ScanStatus {
                 running: true,
+                phase: Some("scanning".to_owned()),
                 started_at: Some(now()),
                 ..Default::default()
             };
         }
+        let progress = Arc::new(ScanProgress::default());
+        self.live
+            .lock()
+            .await
+            .insert(library_id, Arc::clone(&progress));
 
         let manager = Arc::clone(self);
         tokio::spawn(async move {
-            manager.run_scan(library_id).await;
+            manager.run_scan(library_id, progress).await;
         });
         true
     }
 
-    async fn run_scan(&self, library_id: i64) {
+    async fn run_scan(&self, library_id: i64, progress: Arc<ScanProgress>) {
         let mut status = ScanStatus {
             running: true,
             started_at: Some(now()),
@@ -134,11 +176,22 @@ impl JobManager {
             }
         };
 
-        match scan::scan_library(self.store.as_ref(), &library).await {
+        match scan::scan_library_with_progress(self.store.as_ref(), &library, Some(&progress)).await
+        {
             Ok(report) => status.last_scan = Some(report),
             Err(e) => {
                 self.finish(library_id, error_status(&e.to_string())).await;
                 return;
+            }
+        }
+
+        // Publish the scan result before enrichment starts, so the UI shows
+        // real counts (and any problems) while metadata is still fetching.
+        {
+            let mut statuses = self.statuses.lock().await;
+            if let Some(entry) = statuses.get_mut(&library_id) {
+                entry.last_scan = status.last_scan.clone();
+                entry.phase = Some("enriching".to_owned());
             }
         }
 
@@ -179,9 +232,12 @@ impl JobManager {
 
     async fn finish(&self, library_id: i64, mut status: ScanStatus) {
         status.running = false;
+        status.phase = None;
+        status.progress = None;
         if status.finished_at.is_none() {
             status.finished_at = Some(now());
         }
+        self.live.lock().await.remove(&library_id);
         self.statuses.lock().await.insert(library_id, status);
     }
 }

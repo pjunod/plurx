@@ -318,6 +318,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scan_status_requires_auth_and_reports_problems() {
+        let app = test_app();
+        // Unauthenticated → 401.
+        let (status, _) = call(&app, get("/api/v1/scan/status", None)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let admin = setup_admin(&app).await;
+        // Create a library pointing at a path that does not exist — the auto
+        // scan must finish with a visible problem, not a silent all-zero.
+        let (status, lib) = call(
+            &app,
+            post(
+                "/api/v1/libraries",
+                Some(&admin),
+                json!({ "name": "Movies", "kind": "movies", "paths": ["/definitely/not/here"] }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let lib_id = lib["id"].as_i64().expect("lib id").to_string();
+
+        // Poll until the background scan finishes (missing path → instant).
+        let mut last = Value::Null;
+        for _ in 0..100 {
+            let (status, body) = call(&app, get("/api/v1/scan/status", Some(&admin))).await;
+            assert_eq!(status, StatusCode::OK);
+            last = body[&lib_id].clone();
+            if !last["running"].as_bool().unwrap_or(true) && !last.is_null() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(last["running"], false, "scan never finished: {last}");
+        let problems = last["last_scan"]["problems"]
+            .as_array()
+            .expect("problems array")
+            .clone();
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.as_str().unwrap_or("").contains("does not exist")),
+            "expected a missing-path problem, got: {problems:?}"
+        );
+        assert_eq!(last["last_scan"]["errors"], 1);
+    }
+
+    #[tokio::test]
     async fn browse_and_watch_progress() {
         let app = test_app();
         let token = setup_admin(&app).await;

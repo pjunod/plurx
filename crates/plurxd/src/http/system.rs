@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use super::auth::LoginResponse;
 use super::error::ApiError;
-use super::extract::AdminUser;
+use super::extract::{AdminUser, AuthUser};
 use crate::state::{AppState, ScanStatus};
 
 #[derive(Serialize)]
@@ -121,7 +121,12 @@ pub async fn update_settings(
 }
 
 /// GET /api/v1/scan/status — per-library scan status (keyed by library id).
-pub async fn scan_status(State(state): State<AppState>) -> Json<HashMap<i64, ScanStatus>> {
+/// Any authenticated user may look; scans aren't a secret, but strangers
+/// shouldn't see filesystem paths in problem messages.
+pub async fn scan_status(
+    _user: AuthUser,
+    State(state): State<AppState>,
+) -> Json<HashMap<i64, ScanStatus>> {
     Json(state.jobs.all_statuses().await)
 }
 
