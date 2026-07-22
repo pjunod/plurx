@@ -186,7 +186,7 @@ knows it. Chapter-derived buttons are exact.
 - **Light/dark that follows the system** by default, falling back to dark when the
   OS expresses no preference — with a manual override that wins.
 - **Three named themes** with a selector, each with a light and dark variant:
-  **Classic** (the original look); **Terminal** (a real unix box — `user@plurx:~$`
+  **Classic** (the original look); **Terminal** (a real unix box — a `:~$ `
   prompt with a blinking block cursor, man-page section headers, getty-style
   login labels, `$ ls` empty states, syslog-tagged toasts, CRT scanlines; green
   phosphor in the dark, Solarized in the light); and **noirr** (the brand theme,
