@@ -541,6 +541,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn plex_facade_requires_a_valid_token() {
+        let app = test_app();
+        let admin = setup_admin(&app).await;
+        let bare = |uri: &str| {
+            app.clone().oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("req"),
+            )
+        };
+
+        // Discovery stays public — clients must find the server before auth.
+        let resp = bare("/identity").await.expect("resp");
+        assert_eq!(resp.status(), StatusCode::OK, "identity must stay public");
+
+        // A protected route with no token is rejected (previously served as admin):
+        // metadata enumeration…
+        let resp = bare("/library/sections").await.expect("resp");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        // …and raw media bytes — the auth-bypass that motivated this.
+        let resp = bare("/library/parts/1/0/x").await.expect("resp");
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "no token must not stream files"
+        );
+
+        // A valid plurx token supplied as X-Plex-Token is accepted.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/library/sections")
+                    .header("x-plex-token", &admin)
+                    .body(Body::empty())
+                    .expect("req"),
+            )
+            .await
+            .expect("resp");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a valid token must be accepted"
+        );
+    }
+
+    #[tokio::test]
     async fn scan_status_requires_auth_and_reports_problems() {
         let app = test_app();
         // Unauthenticated → 401.

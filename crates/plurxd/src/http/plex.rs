@@ -3,8 +3,9 @@
 //! A translation façade over plurx-core services for direct-connect clients
 //! (Kodi Composite/PKC, python-plexapi, Home Assistant). Responses are XML
 //! `MediaContainer` documents — the Plex default these clients use. Auth is by
-//! `X-Plex-Token` (a plurx token); a tokenless request falls back to the admin
-//! user so "unclaimed server" LAN clients work. Never contacts plex.tv.
+//! `X-Plex-Token` (a plurx token); a request without a valid token is rejected
+//! (401), the same bar as the native API. Server discovery (`identity`, root)
+//! stays public. Never contacts plex.tv.
 
 use axum::extract::{FromRequestParts, Path, Query, RawQuery, State};
 use axum::http::header::{ACCEPT, CONTENT_TYPE};
@@ -20,8 +21,9 @@ use std::collections::HashMap;
 use super::error::ApiError;
 use crate::state::AppState;
 
-/// The requesting Plex user: a valid `X-Plex-Token` maps to its plurx user;
-/// no token falls back to the admin (unclaimed-LAN convenience).
+/// The requesting Plex user, resolved from a valid `X-Plex-Token` (a plurx
+/// token). A missing or unknown token is rejected (401) — the same bar as the
+/// native API, so the Plex mirror can't be used to bypass auth.
 pub struct PlexUser(pub User);
 
 fn plex_token(parts: &Parts) -> Option<String> {
@@ -47,18 +49,17 @@ impl FromRequestParts<AppState> for PlexUser {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        if let Some(token) = plex_token(parts) {
-            let hash = auth::hash_token(&token);
-            if let Some(user) = state.store.user_for_token(&hash).await? {
-                return Ok(PlexUser(user));
-            }
-            return Err(ApiError::Unauthorized);
-        }
-        // No token: fall back to the admin user (unclaimed LAN server).
-        let users = state.store.list_users().await?;
-        users
-            .into_iter()
-            .find(|u| u.is_admin)
+        // Require a valid token — no anonymous fallback. Serving a tokenless
+        // request as the admin turned the Plex mirror into an auth bypass:
+        // `/library/parts/...` streamed any file and `/:/timeline` wrote watch
+        // state, both unauthenticated. Discovery (`identity`, root) takes no
+        // PlexUser, so clients still find the server before authenticating.
+        let token = plex_token(parts).ok_or(ApiError::Unauthorized)?;
+        let hash = auth::hash_token(&token);
+        state
+            .store
+            .user_for_token(&hash)
+            .await?
             .map(PlexUser)
             .ok_or(ApiError::Unauthorized)
     }
