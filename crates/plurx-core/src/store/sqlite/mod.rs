@@ -301,9 +301,8 @@ impl SqliteStore {
                 "SELECT id, probe_json FROM files \
                  WHERE hdr_format IS NULL AND probe_json IS NOT NULL",
             )?;
-            let mapped = stmt.query_map([], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-            })?;
+            let mapped =
+                stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
             mapped.collect::<rusqlite::Result<Vec<_>>>()?
         };
         let mut updated = 0usize;

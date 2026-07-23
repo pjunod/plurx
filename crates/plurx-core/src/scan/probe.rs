@@ -238,7 +238,10 @@ fn detect_hdr_format(stream: &Value) -> Option<String> {
                     Some(p) => format!("Dolby Vision · Profile {p}"),
                     None => "Dolby Vision".to_owned(),
                 };
-                match sd.get("dv_bl_signal_compatibility_id").and_then(|v| v.as_i64()) {
+                match sd
+                    .get("dv_bl_signal_compatibility_id")
+                    .and_then(|v| v.as_i64())
+                {
                     Some(1) | Some(6) => label.push_str(" (HDR10-compatible)"),
                     Some(4) => label.push_str(" (HLG-compatible)"),
                     _ => {}

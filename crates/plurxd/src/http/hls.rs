@@ -50,7 +50,13 @@ pub async fn start(
     let start = q.start.unwrap_or(0.0).max(0.0);
     let info = state
         .transcode
-        .start(id, height, start, q.audio.filter(|a| *a >= 0), &user.username)
+        .start(
+            id,
+            height,
+            start,
+            q.audio.filter(|a| *a >= 0),
+            &user.username,
+        )
         .await
         .map_err(ApiError::Internal)?;
     Ok(Json(StartResponse {

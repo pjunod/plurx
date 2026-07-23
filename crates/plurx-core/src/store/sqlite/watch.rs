@@ -140,7 +140,14 @@ impl WatchStore for SqliteStore {
                      duration_ms = COALESCE(excluded.duration_ms, watch_state.duration_ms),
                      watched = excluded.watched,
                      updated_at = excluded.updated_at",
-                params![user_id, item_id, position_ms, duration_ms, watched as i64, at],
+                params![
+                    user_id,
+                    item_id,
+                    position_ms,
+                    duration_ms,
+                    watched as i64,
+                    at
+                ],
             )?;
             Ok(())
         })

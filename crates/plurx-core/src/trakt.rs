@@ -97,8 +97,14 @@ pub struct Ids {
 /// movies by TMDB id, episodes by show TMDB id + season/episode numbers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Ident {
-    Movie { tmdb: i64 },
-    Episode { show_tmdb: i64, season: i32, episode: i32 },
+    Movie {
+        tmdb: i64,
+    },
+    Episode {
+        show_tmdb: i64,
+        season: i32,
+        episode: i32,
+    },
 }
 
 /// A remote "watched" fact: the newest watch timestamp Trakt has.
@@ -183,7 +189,10 @@ pub fn plan_sync(
 
         // Resume points: only for items that aren't (about to be) watched.
         let watched_now = matches!(local, Some(l) if l.watched)
-            || plan.mark_watched.last().is_some_and(|(id, _)| *id == cand.item_id);
+            || plan
+                .mark_watched
+                .last()
+                .is_some_and(|(id, _)| *id == cand.item_id);
         if watched_now {
             continue;
         }
@@ -326,7 +335,9 @@ impl TraktClient {
         }
     }
 
-    async fn parse<T: serde::de::DeserializeOwned>(res: reqwest::Response) -> Result<T, TraktError> {
+    async fn parse<T: serde::de::DeserializeOwned>(
+        res: reqwest::Response,
+    ) -> Result<T, TraktError> {
         let status = res.status().as_u16();
         if status == 401 || status == 403 {
             return Err(TraktError::AuthExpired);
@@ -334,7 +345,9 @@ impl TraktClient {
         if !(200..300).contains(&status) {
             return Err(TraktError::Status(status));
         }
-        res.json::<T>().await.map_err(|e| TraktError::Parse(e.to_string()))
+        res.json::<T>()
+            .await
+            .map_err(|e| TraktError::Parse(e.to_string()))
     }
 
     // -- OAuth --------------------------------------------------------------
@@ -362,7 +375,9 @@ impl TraktClient {
             .map_err(|e| TraktError::Http(e.to_string()))?;
         match res.status().as_u16() {
             200 => Ok(DevicePoll::Ready(
-                res.json().await.map_err(|e| TraktError::Parse(e.to_string()))?,
+                res.json()
+                    .await
+                    .map_err(|e| TraktError::Parse(e.to_string()))?,
             )),
             400 => Ok(DevicePoll::Pending),
             429 => Ok(DevicePoll::SlowDown),
@@ -418,7 +433,11 @@ impl TraktClient {
     ) -> Result<(), TraktError> {
         let mut body = match ident {
             Ident::Movie { tmdb } => json!({ "movie": { "ids": { "tmdb": tmdb } } }),
-            Ident::Episode { show_tmdb, season, episode } => json!({
+            Ident::Episode {
+                show_tmdb,
+                season,
+                episode,
+            } => json!({
                 "show": { "ids": { "tmdb": show_tmdb } },
                 "episode": { "season": season, "number": episode },
             }),
@@ -442,7 +461,10 @@ impl TraktClient {
     /// Raw `/sync/last_activities` JSON — compared as an opaque change gate.
     pub async fn last_activities(&self, access: &str) -> Result<String, TraktError> {
         let res = self
-            .api(self.http.get(self.url("/sync/last_activities")), Some(access))
+            .api(
+                self.http.get(self.url("/sync/last_activities")),
+                Some(access),
+            )
             .send()
             .await
             .map_err(|e| TraktError::Http(e.to_string()))?;
@@ -454,7 +476,10 @@ impl TraktClient {
         let mut map = RemoteWatched::new();
 
         let res = self
-            .api(self.http.get(self.url("/sync/watched/movies")), Some(access))
+            .api(
+                self.http.get(self.url("/sync/watched/movies")),
+                Some(access),
+            )
             .send()
             .await
             .map_err(|e| TraktError::Http(e.to_string()))?;
@@ -481,10 +506,24 @@ impl TraktClient {
             let Some(show_tmdb) = s.pointer("/show/ids/tmdb").and_then(Value::as_i64) else {
                 continue;
             };
-            for season in s.get("seasons").and_then(Value::as_array).into_iter().flatten() {
-                let Some(sn) = season.get("number").and_then(Value::as_i64) else { continue };
-                for ep in season.get("episodes").and_then(Value::as_array).into_iter().flatten() {
-                    let Some(en) = ep.get("number").and_then(Value::as_i64) else { continue };
+            for season in s
+                .get("seasons")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let Some(sn) = season.get("number").and_then(Value::as_i64) else {
+                    continue;
+                };
+                for ep in season
+                    .get("episodes")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    let Some(en) = ep.get("number").and_then(Value::as_i64) else {
+                        continue;
+                    };
                     let at = ep
                         .get("last_watched_at")
                         .and_then(Value::as_str)
@@ -566,7 +605,11 @@ impl TraktClient {
                     }
                     movies.push(m);
                 }
-                Ident::Episode { show_tmdb, season, episode } => {
+                Ident::Episode {
+                    show_tmdb,
+                    season,
+                    episode,
+                } => {
                     shows
                         .entry(*show_tmdb)
                         .or_default()
@@ -630,7 +673,10 @@ impl TraktClient {
         }
         let tagged: Vec<_> = items.iter().map(|i| (*i, None)).collect();
         let res = self
-            .api(self.http.post(self.url("/sync/history/remove")), Some(access))
+            .api(
+                self.http.post(self.url("/sync/history/remove")),
+                Some(access),
+            )
             .json(&Self::history_body(&tagged))
             .send()
             .await
@@ -650,24 +696,50 @@ mod tests {
     }
 
     fn cand(item_id: i64, ident: Ident, watch: Option<LocalWatch>) -> SyncCandidate {
-        SyncCandidate { item_id, ident, watch, file_duration_ms: Some(6_000_000) }
+        SyncCandidate {
+            item_id,
+            ident,
+            watch,
+            file_duration_ms: Some(6_000_000),
+        }
     }
 
     fn watched_at(updated_at: i64) -> LocalWatch {
-        LocalWatch { watched: true, position_ms: 0, duration_ms: Some(6_000_000), updated_at }
+        LocalWatch {
+            watched: true,
+            position_ms: 0,
+            duration_ms: Some(6_000_000),
+            updated_at,
+        }
     }
 
     fn unwatched_at(updated_at: i64) -> LocalWatch {
-        LocalWatch { watched: false, position_ms: 0, duration_ms: Some(6_000_000), updated_at }
+        LocalWatch {
+            watched: false,
+            position_ms: 0,
+            duration_ms: Some(6_000_000),
+            updated_at,
+        }
     }
 
     #[test]
     fn iso8601_roundtrip() {
-        for ts in [0, 1, 86_399, 86_400, 951_827_696, 1_784_755_419, 4_102_444_800] {
+        for ts in [
+            0,
+            1,
+            86_399,
+            86_400,
+            951_827_696,
+            1_784_755_419,
+            4_102_444_800,
+        ] {
             assert_eq!(parse_iso8601(&iso8601(ts)), Some(ts), "ts {ts}");
         }
         assert_eq!(iso8601(0), "1970-01-01T00:00:00.000Z");
-        assert_eq!(parse_iso8601("2026-07-22T12:00:00.500Z"), parse_iso8601("2026-07-22T12:00:00Z"));
+        assert_eq!(
+            parse_iso8601("2026-07-22T12:00:00.500Z"),
+            parse_iso8601("2026-07-22T12:00:00Z")
+        );
         assert_eq!(parse_iso8601("garbage"), None);
     }
 
@@ -742,9 +814,30 @@ mod tests {
     #[test]
     fn episode_history_groups_by_show_and_season() {
         let items = [
-            (Ident::Episode { show_tmdb: 7, season: 2, episode: 4 }, Some(100)),
-            (Ident::Episode { show_tmdb: 7, season: 2, episode: 5 }, Some(200)),
-            (Ident::Episode { show_tmdb: 7, season: 1, episode: 1 }, Some(50)),
+            (
+                Ident::Episode {
+                    show_tmdb: 7,
+                    season: 2,
+                    episode: 4,
+                },
+                Some(100),
+            ),
+            (
+                Ident::Episode {
+                    show_tmdb: 7,
+                    season: 2,
+                    episode: 5,
+                },
+                Some(200),
+            ),
+            (
+                Ident::Episode {
+                    show_tmdb: 7,
+                    season: 1,
+                    episode: 1,
+                },
+                Some(50),
+            ),
             (movie(9), Some(300)),
         ];
         let body = TraktClient::history_body(&items);

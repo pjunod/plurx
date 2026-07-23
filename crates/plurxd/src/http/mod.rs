@@ -49,10 +49,7 @@ pub fn router(state: AppState) -> Router {
             axum::routing::delete(system::stop_session),
         )
         .route("/trakt/status", get(trakt::status))
-        .route(
-            "/trakt/link",
-            post(trakt::link).delete(trakt::unlink),
-        )
+        .route("/trakt/link", post(trakt::link).delete(trakt::unlink))
         .route("/trakt/sync", post(trakt::sync_now))
         .route("/system", get(system::system_info))
         .route("/system/logs", get(system::logs))

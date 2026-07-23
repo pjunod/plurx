@@ -42,8 +42,9 @@ impl TraktStore for SqliteStore {
 
     async fn list_trakt_auth(&self) -> Result<Vec<TraktAuth>, StoreError> {
         self.with_conn(move |conn| {
-            let mut stmt =
-                conn.prepare(&format!("SELECT {AUTH_COLS} FROM trakt_auth ORDER BY user_id"))?;
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {AUTH_COLS} FROM trakt_auth ORDER BY user_id"
+            ))?;
             let rows = stmt
                 .query_map([], auth_from_row)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -86,7 +87,10 @@ impl TraktStore for SqliteStore {
 
     async fn delete_trakt_auth(&self, user_id: i64) -> Result<(), StoreError> {
         self.with_conn(move |conn| {
-            conn.execute("DELETE FROM trakt_auth WHERE user_id = ?1", params![user_id])?;
+            conn.execute(
+                "DELETE FROM trakt_auth WHERE user_id = ?1",
+                params![user_id],
+            )?;
             Ok(())
         })
         .await
@@ -129,10 +133,7 @@ impl TraktStore for SqliteStore {
         .await
     }
 
-    async fn trakt_sync_candidates(
-        &self,
-        user_id: i64,
-    ) -> Result<Vec<SyncCandidate>, StoreError> {
+    async fn trakt_sync_candidates(&self, user_id: i64) -> Result<Vec<SyncCandidate>, StoreError> {
         self.with_conn(move |conn| {
             // Movies key on their own TMDB id; episodes on the show's TMDB id
             // plus season/episode numbers (episode → season → show walk).

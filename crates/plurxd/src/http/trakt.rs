@@ -87,7 +87,11 @@ pub async fn unlink(
     AdminUser(user): AdminUser,
     State(state): State<AppState>,
 ) -> Result<Json<TraktStatusDto>, ApiError> {
-    state.trakt.unlink(user.id).await.map_err(ApiError::Internal)?;
+    state
+        .trakt
+        .unlink(user.id)
+        .await
+        .map_err(ApiError::Internal)?;
     Ok(Json(status_dto(&state, user.id).await))
 }
 

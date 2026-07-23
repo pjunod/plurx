@@ -381,7 +381,12 @@ mod tests {
             tone_map: ToneMap::None,
             ..Default::default()
         };
-        let args = hls_args(&file(Some("dolby_vision")), Encoder::Software, &opts, "/tmp/s");
+        let args = hls_args(
+            &file(Some("dolby_vision")),
+            Encoder::Software,
+            &opts,
+            "/tmp/s",
+        );
         let joined = args.join(" ");
         assert!(!joined.contains("tonemap"));
         assert!(!joined.contains("zscale"));

@@ -159,7 +159,10 @@ pub fn decide(file: &MediaFile, profile: &DeviceProfile) -> Decision {
     // play is off the table for that file — remux at minimum.
     let has_av_offset = file.audio_offset_ms != 0;
     if has_av_offset {
-        reasons.push(format!("audio-sync correction {:+} ms", file.audio_offset_ms));
+        reasons.push(format!(
+            "audio-sync correction {:+} ms",
+            file.audio_offset_ms
+        ));
     }
 
     // Video/res/bitrate/HDR problems force a transcode; only a container or

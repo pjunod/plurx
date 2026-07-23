@@ -407,7 +407,12 @@ pub async fn decision(
 /// offset is usually correct sync (ffmpeg honors it), so it's never
 /// auto-applied; it's shown in the player's sync menu as a diagnostic.
 async fn declared_av_offset(state: &AppState, file_id: i64) -> Option<i64> {
-    let raw = state.store.get_file_probe_json(file_id).await.ok().flatten()?;
+    let raw = state
+        .store
+        .get_file_probe_json(file_id)
+        .await
+        .ok()
+        .flatten()?;
     let probe: serde_json::Value = serde_json::from_str(&raw).ok()?;
     let streams = probe.get("streams")?.as_array()?;
     let start_of = |kind: &str| -> Option<f64> {

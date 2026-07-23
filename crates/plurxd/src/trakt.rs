@@ -86,7 +86,12 @@ impl TraktManager {
 
     /// A client built from the admin's app credentials, if configured.
     pub async fn client(&self) -> Option<TraktClient> {
-        let id = self.store.get_setting(keys::TRAKT_CLIENT_ID).await.ok().flatten()?;
+        let id = self
+            .store
+            .get_setting(keys::TRAKT_CLIENT_ID)
+            .await
+            .ok()
+            .flatten()?;
         let secret = self
             .store
             .get_setting(keys::TRAKT_CLIENT_SECRET)
@@ -110,15 +115,19 @@ impl TraktManager {
             Ok(tok) => {
                 let _ = self
                     .store
-                    .update_trakt_tokens(user_id, &tok.access_token, &tok.refresh_token, tok.expires_at())
+                    .update_trakt_tokens(
+                        user_id,
+                        &tok.access_token,
+                        &tok.refresh_token,
+                        tok.expires_at(),
+                    )
                     .await;
                 Some(tok.access_token)
             }
             Err(TraktError::AuthExpired) => {
                 tracing::warn!("trakt: refresh token rejected — unlinking user {user_id}");
                 let _ = self.store.delete_trakt_auth(user_id).await;
-                *self.note.lock().await =
-                    Some("Trakt link expired — connect again".to_owned());
+                *self.note.lock().await = Some("Trakt link expired — connect again".to_owned());
                 None
             }
             Err(e) => {
@@ -139,7 +148,12 @@ impl TraktManager {
             ItemKind::Episode => {
                 let season = item.parent_id?;
                 let season = self.store.get_item(season).await.ok().flatten()?;
-                let show = self.store.get_item(season.parent_id?).await.ok().flatten()?;
+                let show = self
+                    .store
+                    .get_item(season.parent_id?)
+                    .await
+                    .ok()
+                    .flatten()?;
                 Some(Ident::Episode {
                     show_tmdb: show.tmdb_id?,
                     season: item.season_number?,
@@ -156,14 +170,28 @@ impl TraktManager {
     pub fn on_start(self: &Arc<Self>, user_id: i64, item_id: i64, pct: f64) {
         let mgr = Arc::clone(self);
         tokio::spawn(async move {
-            let Some(client) = mgr.client().await else { return };
-            let Some(access) = mgr.access(&client, user_id).await else { return };
-            let Some(ident) = mgr.ident_for(item_id).await else { return };
+            let Some(client) = mgr.client().await else {
+                return;
+            };
+            let Some(access) = mgr.access(&client, user_id).await else {
+                return;
+            };
+            let Some(ident) = mgr.ident_for(item_id).await else {
+                return;
+            };
             mgr.sessions.lock().await.insert(
                 (user_id, item_id),
-                ScrobbleSession { ident, pct, last_beat: Instant::now(), stopped: false },
+                ScrobbleSession {
+                    ident,
+                    pct,
+                    last_beat: Instant::now(),
+                    stopped: false,
+                },
             );
-            if let Err(e) = client.scrobble(&access, ScrobbleAction::Start, ident, pct).await {
+            if let Err(e) = client
+                .scrobble(&access, ScrobbleAction::Start, ident, pct)
+                .await
+            {
                 tracing::warn!("trakt: scrobble start failed: {e}");
             }
         });
@@ -186,12 +214,19 @@ impl TraktManager {
             sess.stopped = true;
             let ident = sess.ident;
             drop(sessions);
-            let Some(client) = mgr.client().await else { return };
-            let Some(access) = mgr.access(&client, user_id).await else { return };
+            let Some(client) = mgr.client().await else {
+                return;
+            };
+            let Some(access) = mgr.access(&client, user_id).await else {
+                return;
+            };
             // ≥80% is what Trakt counts as a watch; we cross at plurx's own
             // 95% threshold so the two agree and the next sync is a no-op.
             let send = pct.max(95.0);
-            if let Err(e) = client.scrobble(&access, ScrobbleAction::Stop, ident, send).await {
+            if let Err(e) = client
+                .scrobble(&access, ScrobbleAction::Stop, ident, send)
+                .await
+            {
                 tracing::warn!("trakt: scrobble stop failed: {e}");
             }
         });
@@ -220,10 +255,17 @@ impl TraktManager {
             if idle.is_empty() {
                 continue;
             }
-            let Some(client) = self.client().await else { continue };
+            let Some(client) = self.client().await else {
+                continue;
+            };
             for (user_id, ident, pct) in idle {
-                let Some(access) = self.access(&client, user_id).await else { continue };
-                if let Err(e) = client.scrobble(&access, ScrobbleAction::Pause, ident, pct).await {
+                let Some(access) = self.access(&client, user_id).await else {
+                    continue;
+                };
+                if let Err(e) = client
+                    .scrobble(&access, ScrobbleAction::Pause, ident, pct)
+                    .await
+                {
                     tracing::warn!("trakt: scrobble pause failed: {e}");
                 }
             }
@@ -235,7 +277,10 @@ impl TraktManager {
     /// Begin a device-code link for a user. Returns the pending state to show;
     /// a background task polls until approval/denial/expiry.
     pub async fn link_start(self: &Arc<Self>, user_id: i64) -> Result<PendingLink, String> {
-        let client = self.client().await.ok_or("add the Trakt client id + secret first")?;
+        let client = self
+            .client()
+            .await
+            .ok_or("add the Trakt client id + secret first")?;
         let code = client.device_code().await.map_err(|e| e.to_string())?;
         let pending = PendingLink {
             user_id,
@@ -253,7 +298,8 @@ impl TraktManager {
             loop {
                 tokio::time::sleep(Duration::from_secs(interval)).await;
                 if Instant::now() > deadline {
-                    mgr.fail_pending("the code expired before it was entered").await;
+                    mgr.fail_pending("the code expired before it was entered")
+                        .await;
                     return;
                 }
                 match client.poll_device(&code.device_code).await {
@@ -270,7 +316,8 @@ impl TraktManager {
                             last_activities: None,
                         };
                         if let Err(e) = mgr.store.put_trakt_auth(&auth).await {
-                            mgr.fail_pending(&format!("saving the link failed: {e}")).await;
+                            mgr.fail_pending(&format!("saving the link failed: {e}"))
+                                .await;
                             return;
                         }
                         *mgr.pending.lock().await = None;
@@ -311,7 +358,10 @@ impl TraktManager {
     }
 
     pub async fn unlink(&self, user_id: i64) -> Result<(), String> {
-        self.store.delete_trakt_auth(user_id).await.map_err(|e| e.to_string())?;
+        self.store
+            .delete_trakt_auth(user_id)
+            .await
+            .map_err(|e| e.to_string())?;
         *self.pending.lock().await = None;
         *self.note.lock().await = None;
         self.sessions.lock().await.retain(|(u, _), _| *u != user_id);
@@ -409,7 +459,10 @@ impl TraktManager {
 
         // Change gate: if Trakt reports the same last_activities as the
         // previous run AND nothing local moved since, skip the heavy pulls.
-        let activities = client.last_activities(&access).await.map_err(|e| e.to_string())?;
+        let activities = client
+            .last_activities(&access)
+            .await
+            .map_err(|e| e.to_string())?;
         let local_dirty = candidates.iter().any(|c| {
             c.watch
                 .map(|w| w.updated_at > auth.last_sync_at)
@@ -425,7 +478,12 @@ impl TraktManager {
 
         let remote_watched = client.watched(&access).await.map_err(|e| e.to_string())?;
         let remote_playback = client.playback(&access).await.map_err(|e| e.to_string())?;
-        let plan = plan_sync(&candidates, &remote_watched, &remote_playback, auth.last_sync_at);
+        let plan = plan_sync(
+            &candidates,
+            &remote_watched,
+            &remote_playback,
+            auth.last_sync_at,
+        );
 
         // Pull side: mark watched with the remote timestamp; land resume points.
         for (item_id, watched_at) in &plan.mark_watched {
@@ -448,7 +506,10 @@ impl TraktManager {
         // Push side: batched, additions in chunks (Trakt is fine with large
         // bodies but chunking keeps any one failure small).
         for chunk in plan.push_add.chunks(500) {
-            client.history_add(&access, chunk).await.map_err(|e| e.to_string())?;
+            client
+                .history_add(&access, chunk)
+                .await
+                .map_err(|e| e.to_string())?;
         }
         if !plan.push_remove.is_empty() {
             client

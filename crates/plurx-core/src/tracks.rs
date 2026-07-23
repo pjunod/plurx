@@ -191,7 +191,11 @@ pub fn select_tracks(
     let audio_index = audio
         .iter()
         .find(|a| lang_matches(&a.language, &prefs.audio_lang) && a.default)
-        .or_else(|| audio.iter().find(|a| lang_matches(&a.language, &prefs.audio_lang)))
+        .or_else(|| {
+            audio
+                .iter()
+                .find(|a| lang_matches(&a.language, &prefs.audio_lang))
+        })
         .map(|a| a.index)
         .or_else(|| default_or_first(audio));
     let audio_lang = audio_index
