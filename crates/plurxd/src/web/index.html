@@ -935,12 +935,29 @@ function useNativeHls(video){
   if(window.WebKitPlaybackTargetAvailabilityEvent !== undefined) return true;   // real Safari/iOS
   return !(window.Hls && Hls.isSupported());   // non-Safari: native only if hls.js can't run
 }
+// Which HLS transport to actually use. hls.js (MSE) plays inline so OUR controls
+// + scrubber sit on top (the Chrome experience); Safari's native HLS instead
+// hands the stream to its own player — "Live Broadcast", no scrubber, and our
+// overlay is gone. So on Safari prefer hls.js and reserve native HLS for the one
+// case that needs it: HEVC, which Safari won't decode through MSE. Trade-off:
+// AirPlay of a *stream* needs native HLS (MSE can't be flung to an Apple TV), so
+// AirPlaying a transcode/remux from Safari is sacrificed — direct-play files
+// (played from a plain video.src) still AirPlay.
+function streamIsHevc(){
+  if(!PLAYER || PLAYER.method==='transcode') return false;   // transcode output is always H.264
+  if(PLAYER.copyHls){
+    const c=((PLAYER.source&&PLAYER.source.video_codec)||"").toLowerCase();
+    return c==='hevc'||c==='h265'||c==='hevc10';
+  }
+  return false;
+}
+function preferNativeHls(video){ return useNativeHls(video) && streamIsHevc(); }
 // One place that attaches an HLS playlist to the video element (used by start,
 // seek-restart, and audio-switch). Worker off: a wallet extension's injected
 // CSP can silently kill a blob worker; main-thread demux of one 720p stream
 // is nothing.
 function attachHls(video, playlistUrl){
-  if(!useNativeHls(video) && window.Hls && Hls.isSupported()){
+  if(!preferNativeHls(video) && window.Hls && Hls.isSupported()){
     const hls=new Hls({enableWorker:false,xhrSetup:x=>{ if(TOKEN) x.setRequestHeader("authorization","Bearer "+TOKEN); }});
     PLAYER.hls=hls;
     hls.loadSource(playlistUrl);
@@ -1098,7 +1115,7 @@ async function startTranscodeFallback(){
   teardownHls();
   let info; try{ info=await api(`/files/${me.fileId}/hls/start?height=${transcodeHeight()}&start=${startSec.toFixed(1)}`);}catch(e){ if(PLAYER===me){ setLoading(false); toast(e.message); } return; }
   if(PLAYER!==me) return;   // the user closed the player / started something else
-  me.method='transcode'; me.offset=info.start_seconds||0; me.encoder=info.encoder||null;
+  me.method='transcode'; me.copyHls=false; me.offset=info.start_seconds||0; me.encoder=info.encoder||null;
   me.probeUrl=info.playlist_url; armStall();
   setLoading(true,"Preparing the stream…",(me.encoder?("encoder: "+me.encoder+" — "):"")+"transcoding instead of remuxing");
   attachHls(v, info.playlist_url);
