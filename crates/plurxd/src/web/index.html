@@ -81,6 +81,17 @@
   .amenu button.sel{color:var(--accent);font-weight:600}
   .amenu button.sel::before{content:"✓ "}
   .amsec{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);padding:8px 10px 3px}
+  /* account menu: the signed-in user, anchored to the far right of the header */
+  .profile{display:inline-flex;align-items:center;gap:8px}
+  .profile .caret{color:var(--muted);font-size:10px}
+  .pavatar{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border-radius:50%;
+    background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;font-size:11px;font-weight:700;flex:none}
+  .pname{font-size:13px;max-width:130px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .pident{display:flex;align-items:center;gap:10px;padding:4px 10px 9px;margin-bottom:4px;border-bottom:1px solid var(--line)}
+  .pident .pavatar{width:32px;height:32px;font-size:14px}
+  .pident b{display:block;font-size:14px;line-height:1.25}
+  .pident small{color:var(--muted);font-size:12px}
+  @media(max-width:640px){.pname{display:none}}
   /* theme-picker button shows the current accent as a live swatch */
   .tsw{display:inline-block;width:12px;height:12px;border-radius:50%;background:var(--accent);vertical-align:middle;box-shadow:0 0 0 2px var(--panel),0 0 7px var(--accent)}
   .empty{color:var(--muted);padding:40px;text-align:center;border:1px dashed var(--line);border-radius:var(--radius)}
@@ -557,7 +568,6 @@ function chrome(active, inner){
      <span class="spacer"></span>
      <span class="activity" id="activity" onclick="location.hash='#/activity'"></span>
      <input class="search" id="q" placeholder="Search…" value="${esc(getQ())}">
-     <span class="muted" style="font-size:13px">${esc(ME?ME.username:"")}</span>
      <div style="position:relative">
        <button class="ghost sm" onclick="toggleThemeMenu(event)" title="Theme"><span class="tsw"></span></button>
        <div class="amenu" id="thememenu"></div>
@@ -567,7 +577,12 @@ function chrome(active, inner){
        <div class="amenu" id="appmenu"></div>
      </div>
      ${getapp}
-     <button class="ghost sm" onclick="logout()">Sign out</button>
+     <div style="position:relative">
+       <button class="ghost sm profile" onclick="toggleProfileMenu(event)" title="Account">
+         <span class="pavatar">${esc((ME&&ME.username?ME.username[0]:"?").toUpperCase())}</span><span class="pname">${esc(ME?ME.username:"")}</span><span class="caret">▾</span>
+       </button>
+       <div class="amenu" id="profilemenu"></div>
+     </div>
    </header><main id="main">${inner}</main>`;
   const q=document.getElementById("q");
   let t; q.addEventListener("input",()=>{ clearTimeout(t); t=setTimeout(()=>{ location.hash= q.value?("#/search/"+encodeURIComponent(q.value)):"#/"; },300); });
@@ -588,13 +603,25 @@ function appMenuHtml(){
   const modes=[["auto","Auto (system)"],["light","Light"],["dark","Dark"]].map(([v,l])=>`<button class="${app===v?'sel':''}" onclick="setAppearance('${v}')">${l}</button>`).join("");
   return `<div class="amsec">Appearance</div>${modes}`;
 }
-function closeMenus(except){ ["thememenu","appmenu"].forEach(idn=>{ if(idn!==except){ const m=document.getElementById(idn); if(m) m.classList.remove("on"); } }); }
+function closeMenus(except){ ["thememenu","appmenu","profilemenu"].forEach(idn=>{ if(idn!==except){ const m=document.getElementById(idn); if(m) m.classList.remove("on"); } }); }
 function toggleThemeMenu(e){ if(e) e.stopPropagation(); closeMenus("thememenu"); const m=document.getElementById("thememenu"); if(!m) return;
   const open=!m.classList.contains("on"); m.classList.toggle("on",open); if(open) m.innerHTML=themeMenuHtml(); }
 function toggleAppearanceMenu(e){ if(e) e.stopPropagation(); closeMenus("appmenu"); const m=document.getElementById("appmenu"); if(!m) return;
   const open=!m.classList.contains("on"); m.classList.toggle("on",open); if(open) m.innerHTML=appMenuHtml(); }
 function setTheme(id){ try{localStorage.setItem("plurx_theme",id)}catch(e){} applyTheme(); const m=document.getElementById("thememenu"); if(m) m.innerHTML=themeMenuHtml(); }
 function setAppearance(v){ try{localStorage.setItem("plurx_appearance",v)}catch(e){} applyTheme(); const m=document.getElementById("appmenu"); if(m) m.innerHTML=appMenuHtml(); }
+// Account menu, anchored far-right: shows who you're signed in as, plus the
+// per-account actions (admins also get a Settings shortcut) and Sign out.
+function profileMenuHtml(){
+  const name=ME?ME.username:"", role=ME&&ME.is_admin?"Administrator":"Signed in";
+  const settings = ME&&ME.is_admin ? `<button onclick="location.hash='#/settings';closeMenus()">Settings</button>`:"";
+  return `<div class="pident"><span class="pavatar">${esc((name[0]||"?").toUpperCase())}</span>`
+    +`<span><b>${esc(name||"—")}</b><small>${role}</small></span></div>`
+    +settings
+    +`<button onclick="logout()">Sign out</button>`;
+}
+function toggleProfileMenu(e){ if(e) e.stopPropagation(); closeMenus("profilemenu"); const m=document.getElementById("profilemenu"); if(!m) return;
+  const open=!m.classList.contains("on"); m.classList.toggle("on",open); if(open) m.innerHTML=profileMenuHtml(); }
 document.addEventListener("click",()=>{ closeMenus(); });
 
 // ---- global activity indicator --------------------------------------------
