@@ -184,6 +184,19 @@
   .toast.show{opacity:1}
   .err{color:var(--bad);font-size:13px;min-height:18px;margin-top:8px}
   .adminwrap{display:grid;grid-template-columns:1fr;gap:22px;max-width:960px}
+  /* Settings tab bar — one group visible at a time (persisted per browser). */
+  .settabs{display:flex;gap:2px;flex-wrap:wrap;margin:0 0 20px;border-bottom:1px solid var(--line)}
+  .settab{background:transparent;border:0;border-bottom:2px solid transparent;color:var(--muted);
+    padding:9px 15px;font-size:14px;font-weight:600;cursor:pointer;margin-bottom:-1px;border-radius:8px 8px 0 0}
+  .settab:hover{color:var(--text);background:var(--panel2)}
+  .settab.active{color:var(--text);border-bottom-color:var(--accent)}
+  /* Library paths shown as distinct chips instead of a comma-run. */
+  .paths{display:flex;flex-wrap:wrap;gap:5px}
+  .pathchip{display:inline-block;font-family:ui-monospace,"JetBrains Mono",Menlo,Consolas,monospace;
+    font-size:12px;background:var(--panel2);border:1px solid var(--line);color:var(--text);
+    padding:2px 8px;border-radius:6px;white-space:nowrap}
+  .libedit{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+  .libedit input,.libedit select{width:auto}
   .problem{color:var(--bad);font-size:12px;margin-top:3px;font-weight:400}
   .hint{color:var(--muted);font-size:12px;margin-top:6px}
   .activity{display:none;align-items:center;gap:8px;font-size:12px;color:var(--muted);
@@ -1711,25 +1724,50 @@ async function viewSettings(){
     api("/libraries"),api("/settings"),api("/scan/status"),api("/system"),api("/users"),
     api("/trakt/status").catch(()=>null)]);
   SETTINGS=settings; TRAKT=trakt; TRAKT_EDIT=false;
-  const libRows=libs.map(l=>`<tr><td><b>${esc(l.name)}</b></td><td>${esc(l.anime?'anime':l.kind)}</td><td class="muted">${esc(l.paths.join(", "))}</td>
+  SETTINGS_DATA={libs,settings,status,sys,users,trakt};
+  renderSettings();
+  setPageTimer(settingsTick, 2000);
+}
+// ---- settings tabs (grouped so the page isn't one long scroll) ------------
+let SETTINGS_DATA=null;
+const SET_TABS=[["libraries","Libraries"],["metadata","Metadata"],["playback","Playback"],["users","Users"],["system","System"]];
+function settingsTab(){ let t="libraries"; try{ t=localStorage.getItem("plurx_settings_tab")||"libraries"; }catch(e){} return SET_TABS.some(x=>x[0]===t)?t:"libraries"; }
+function setSettingsTab(t){ try{ localStorage.setItem("plurx_settings_tab",t); }catch(e){} renderSettings(); }
+function renderSettings(){
+  const d=SETTINGS_DATA; if(!d) return;
+  const tab=settingsTab();
+  const bar=SET_TABS.map(([id,label])=>`<button class="settab${tab===id?' active':''}" onclick="setSettingsTab('${id}')">${label}</button>`).join("");
+  document.getElementById("main").innerHTML=`<div class="settabs">${bar}</div><div class="adminwrap" id="setbody">${settingsPanel(tab,d)}</div>`;
+  if(tab==="system") refreshLogs();     // the log box only exists on the System tab
+}
+function settingsPanel(tab,d){
+  if(tab==="metadata") return metadataPanel(d.settings,d.trakt);
+  if(tab==="playback") return playbackPanel(d.settings);
+  if(tab==="users")    return usersPanel(d.users);
+  if(tab==="system")   return systemPanel(d.sys);
+  return librariesPanel(d.libs,d.status);
+}
+function libRow(l,status){
+  const paths=(l.paths||[]).map(p=>`<span class="pathchip">${esc(p)}</span>`).join(" ")||'<span class="muted">—</span>';
+  return `<tr id="librow-${l.id}"><td><b>${esc(l.name)}</b></td><td>${esc(l.anime?'anime':l.kind)}</td>
+      <td><div class="paths">${paths}</div></td>
       <td class="muted" id="st-${l.id}">${statusText(status[l.id])}</td>
-      <td class="row" style="flex-wrap:nowrap"><button class="ghost sm" onclick="scanLib(${l.id})">Scan</button><button class="ghost sm" onclick="refreshLib(${l.id})" title="Re-fetch all metadata & artwork (incl. season posters)">Refresh art</button><button class="ghost sm" onclick="delLib(${l.id})">Delete</button></td></tr>`).join("");
-  const enc=sys.encoders||{};
-  const pills=[["NVENC",enc.nvenc],["QuickSync",enc.qsv],["VA-API",enc.vaapi],["VideoToolbox",enc.videotoolbox]]
-    .map(([n,ok])=>`<span class="pill" style="${ok?'color:var(--good);border-color:var(--good)':''}">${n} ${ok?'✓':'—'}</span>`).join(" ");
-  document.getElementById("main").innerHTML=`<div class="adminwrap">
-    <div class="card"><h2 class="section" style="margin-top:0">Server</h2>
-      <dl class="kvgrid">
-        <dt>Server</dt><dd>${esc(sys.name)} · ${APP_NAME} ${esc(sys.version)} · up ${fmtUptime(sys.uptime_seconds)}</dd>
-        <dt>Data dir</dt><dd>${esc(sys.data_dir)}</dd>
-        <dt>ffmpeg</dt><dd>${sys.ffmpeg_version?esc(sys.ffmpeg_version):`<span style="color:var(--bad)">not found at \`${esc(sys.ffmpeg)}\` — scanning and transcoding will fail</span>`}</dd>
-        <dt>Hardware</dt><dd>${pills}</dd>
-        <dt>Transcoder</dt><dd>${esc(sys.encoder_selected)} <span class="muted">(preference: ${esc(sys.hwaccel_pref)})</span></dd>
-        <dt>Right now</dt><dd>${sys.active_transcodes} active stream${sys.active_transcodes===1?'':'s'} · ${sys.libraries} librar${sys.libraries===1?'y':'ies'} · ${sys.users} user${sys.users===1?'':'s'}</dd>
-      </dl></div>
-    <div class="card"><h2 class="section" style="margin-top:0">Libraries</h2>
+      <td class="row" style="flex-wrap:wrap;justify-content:flex-end;gap:5px">
+        <button class="ghost sm" onclick="scanLib(${l.id})">Scan</button>
+        <button class="ghost sm" onclick="refreshLib(${l.id})" title="Re-fetch all metadata & artwork (incl. season posters)">Refresh art</button>
+        <button class="ghost sm" onclick="editLib(${l.id})">Edit</button>
+        <button class="ghost sm" onclick="delLib(${l.id})">Delete</button></td></tr>`;
+}
+function librariesPanel(libs,status){
+  const rows=libs.map(l=>libRow(l,status)).join("")||`<tr><td colspan="5" class="muted">No libraries yet.</td></tr>`;
+  const bulk=libs.length?`<div class="row" style="margin:0 0 14px;gap:8px;align-items:center">
+        <button class="ghost sm" onclick="scanAll()" title="Scan every library for new & changed files">Scan all</button>
+        <button class="ghost sm" onclick="refreshAll()" title="Re-fetch metadata & artwork for every library">Refresh all art</button>
+        <span class="muted" style="font-size:12px">${libs.length} librar${libs.length===1?'y':'ies'}</span></div>`:"";
+  return `<div class="card"><h2 class="section" style="margin-top:0">Libraries</h2>
+      ${bulk}
       <table><thead><tr><th>Name</th><th>Kind</th><th>Paths</th><th>Status</th><th></th></tr></thead>
-      <tbody>${libRows||`<tr><td colspan="5" class="muted">No libraries yet.</td></tr>`}</tbody></table>
+      <tbody>${rows}</tbody></table>
       <h2 class="section">Add library</h2>
       <div class="row"><input id="ln" placeholder="Name" style="max-width:180px">
         <select id="lk" style="max-width:130px"><option value="movies">Movies</option><option value="shows">TV Shows</option><option value="anime">Anime</option></select>
@@ -1737,29 +1775,24 @@ async function viewSettings(){
       <div class="hint">Paths are as the <b>server process</b> sees them — running in Docker, that's the path inside the container (e.g. <code>/media/movies</code>), which must be mounted in your compose file.</div>
       <div class="err" id="lerr"></div>
       <button style="margin-top:12px" onclick="addLib()">Add & scan</button>
-    </div>
-    <div class="card"><h2 class="section" style="margin-top:0">Users</h2>
-      <table><thead><tr><th>User</th><th>Role</th><th>Created</th><th></th></tr></thead>
-      <tbody>${users.map(u=>userRow(u)).join("")}</tbody></table>
-      <h2 class="section">Add user</h2>
-      <div class="row"><input id="un" placeholder="Username" style="max-width:180px" autocomplete="off">
-        <input id="up" placeholder="Password (min 8)" type="password" style="max-width:200px" autocomplete="new-password">
-        <label class="row" style="margin:0;font-size:13px;color:var(--muted)"><input type="checkbox" id="ua" style="width:auto"> admin</label></div>
-      <div class="err" id="uerr"></div>
-      <button style="margin-top:12px" onclick="addUser()">Add user</button></div>
-    <div class="card"><h2 class="section" style="margin-top:0">Metadata (TMDB)</h2>
-      <p class="muted" style="margin-top:0">${settings.tmdb_configured?"A TMDB API key is configured. Click the field to reveal it, or type a new one to replace it.":"Add a TMDB API key to fetch posters, overviews, and episode data."}</p>
-      <input id="tk" placeholder="TMDB API key" type="password" autocomplete="off"
-        value="${esc(settings.tmdb_api_key||'')}"
-        onfocus="this.type='text'" onblur="this.type='password'"><div class="err" id="terr"></div>
-      <button style="margin-top:12px" onclick="saveTmdb()">Save key</button></div>
-    <div class="card"><h2 class="section" style="margin-top:0">Ratings (OMDb)</h2>
-      <p class="muted" style="margin-top:0">${settings.omdb_configured?"An OMDb API key is configured — Rotten Tomatoes, Metacritic, and IMDb ratings can be fetched.":`Add a free OMDb key (<a href="https://www.omdbapi.com/apikey.aspx" target="_blank" rel="noopener">omdbapi.com</a>) to show Rotten Tomatoes, Metacritic, and IMDb ratings on the item page — TMDB doesn't carry these.`}</p>
-      <input id="ok" placeholder="OMDb API key" type="password" autocomplete="off"
-        value="${esc(settings.omdb_api_key||'')}"
-        onfocus="this.type='text'" onblur="this.type='password'"><div class="err" id="oerr"></div>
-      <button style="margin-top:12px" onclick="saveOmdb()">Save key</button></div>
-    <div class="card"><h2 class="section" style="margin-top:0">Playback defaults</h2>
+    </div>`;
+}
+function metadataPanel(settings,trakt){
+  return `<div class="card"><h2 class="section" style="margin-top:0">API keys</h2>
+      <label>TMDB — posters, overviews, episode data</label>
+      <p class="muted" style="margin:2px 0 6px">${settings.tmdb_configured?"Configured. Click the field to reveal it, or type a new key to replace it.":"Add a TMDB API key to fetch posters, overviews, and episode data."}</p>
+      <input id="tk" placeholder="TMDB API key" type="password" autocomplete="off" value="${esc(settings.tmdb_api_key||'')}" onfocus="this.type='text'" onblur="this.type='password'">
+      <div class="err" id="terr"></div>
+      <button class="sm" style="margin:10px 0 22px" onclick="saveTmdb()">Save TMDB key</button>
+      <label>OMDb — Rotten Tomatoes / Metacritic / IMDb ratings</label>
+      <p class="muted" style="margin:2px 0 6px">${settings.omdb_configured?"Configured — Rotten Tomatoes, Metacritic, and IMDb ratings can be fetched.":`Add a free key (<a href="https://www.omdbapi.com/apikey.aspx" target="_blank" rel="noopener">omdbapi.com</a>) to show Rotten Tomatoes, Metacritic, and IMDb ratings on the item page — TMDB doesn't carry these.`}</p>
+      <input id="ok" placeholder="OMDb API key" type="password" autocomplete="off" value="${esc(settings.omdb_api_key||'')}" onfocus="this.type='text'" onblur="this.type='password'">
+      <div class="err" id="oerr"></div>
+      <button class="sm" style="margin-top:10px" onclick="saveOmdb()">Save OMDb key</button></div>
+    ${traktCardHtml(trakt)}`;
+}
+function playbackPanel(settings){
+  return `<div class="card"><h2 class="section" style="margin-top:0">Playback defaults</h2>
       <p class="muted" style="margin-top:0">Default audio and subtitle selection for every player. Anime dual-audio still prefers the original audio with subtitles.</p>
       <div class="row" style="align-items:end">
         <div><label>Audio language</label><select id="pal" style="width:auto;min-width:150px">${langOpts(settings.default_audio_lang)}</select></div>
@@ -1770,18 +1803,77 @@ async function viewSettings(){
           <option value="off" ${settings.sub_mode==='off'?'selected':''}>Off</option></select></div>
       </div>
       <div class="err" id="perr"></div>
-      <button style="margin-top:12px" onclick="savePlayback()">Save defaults</button></div>
-    ${traktCardHtml(trakt)}
+      <button style="margin-top:12px" onclick="savePlayback()">Save defaults</button></div>`;
+}
+function usersPanel(users){
+  return `<div class="card"><h2 class="section" style="margin-top:0">Users</h2>
+      <table><thead><tr><th>User</th><th>Role</th><th>Created</th><th></th></tr></thead>
+      <tbody>${users.map(u=>userRow(u)).join("")}</tbody></table>
+      <h2 class="section">Add user</h2>
+      <div class="row"><input id="un" placeholder="Username" style="max-width:180px" autocomplete="off">
+        <input id="up" placeholder="Password (min 8)" type="password" style="max-width:200px" autocomplete="new-password">
+        <label class="row" style="margin:0;font-size:13px;color:var(--muted)"><input type="checkbox" id="ua" style="width:auto"> admin</label></div>
+      <div class="err" id="uerr"></div>
+      <button style="margin-top:12px" onclick="addUser()">Add user</button></div>`;
+}
+function systemPanel(sys){
+  const enc=sys.encoders||{};
+  const pills=[["NVENC",enc.nvenc],["QuickSync",enc.qsv],["VA-API",enc.vaapi],["VideoToolbox",enc.videotoolbox]]
+    .map(([n,ok])=>`<span class="pill" style="${ok?'color:var(--good);border-color:var(--good)':''}">${n} ${ok?'✓':'—'}</span>`).join(" ");
+  return `<div class="card"><h2 class="section" style="margin-top:0">Server</h2>
+      <dl class="kvgrid">
+        <dt>Server</dt><dd>${esc(sys.name)} · ${APP_NAME} ${esc(sys.version)} · up ${fmtUptime(sys.uptime_seconds)}</dd>
+        <dt>Data dir</dt><dd>${esc(sys.data_dir)}</dd>
+        <dt>ffmpeg</dt><dd>${sys.ffmpeg_version?esc(sys.ffmpeg_version):`<span style="color:var(--bad)">not found at \`${esc(sys.ffmpeg)}\` — scanning and transcoding will fail</span>`}</dd>
+        <dt>Hardware</dt><dd>${pills}</dd>
+        <dt>Transcoder</dt><dd>${esc(sys.encoder_selected)} <span class="muted">(preference: ${esc(sys.hwaccel_pref)})</span></dd>
+        <dt>Right now</dt><dd>${sys.active_transcodes} active stream${sys.active_transcodes===1?'':'s'} · ${sys.libraries} librar${sys.libraries===1?'y':'ies'} · ${sys.users} user${sys.users===1?'':'s'}</dd>
+      </dl></div>
     <div class="card"><h2 class="section" style="margin-top:0">Logs</h2>
       <div class="row"><select id="loglvl" style="max-width:120px" onchange="refreshLogs()">
           <option value="info" selected>Info+</option><option value="warn">Warnings+</option>
           <option value="error">Errors</option><option value="debug">Debug+</option></select>
         <label class="row" style="margin:0;font-size:13px;color:var(--muted)"><input type="checkbox" id="logauto" checked style="width:auto"> auto-refresh</label>
         <button class="ghost sm" onclick="refreshLogs()">Refresh</button></div>
-      <div class="logbox" id="logbox">Loading…</div></div>
-  </div>`;
-  refreshLogs();
-  setPageTimer(settingsTick, 2000);
+      <div class="logbox" id="logbox">Loading…</div></div>`;
+}
+// Inline library editor: the row becomes an editable form (name · kind · paths).
+function editLib(id){
+  const l=SETTINGS_DATA&&SETTINGS_DATA.libs.find(x=>x.id===id); if(!l) return;
+  const row=document.getElementById("librow-"+id); if(!row) return;
+  const sel=l.anime?"anime":(l.kind==="movies"?"movies":"shows");
+  row.innerHTML=`<td colspan="5"><div class="libedit">
+      <input id="eln-${id}" value="${esc(l.name)}" placeholder="Name" style="max-width:200px">
+      <select id="elk-${id}" style="max-width:130px">
+        <option value="movies"${sel==="movies"?" selected":""}>Movies</option>
+        <option value="shows"${sel==="shows"?" selected":""}>TV Shows</option>
+        <option value="anime"${sel==="anime"?" selected":""}>Anime</option></select>
+      <input id="elp-${id}" value="${esc((l.paths||[]).join(", "))}" placeholder="/path (comma-separated)" style="flex:1;min-width:240px">
+      <button class="sm" onclick="saveLib(${id})">Save</button>
+      <button class="ghost sm" onclick="renderSettings()">Cancel</button>
+      <span class="err" id="ele-${id}" style="flex-basis:100%"></span>
+    </div></td>`;
+  const n=document.getElementById("eln-"+id); if(n) n.focus();
+}
+async function saveLib(id){
+  const name=(document.getElementById("eln-"+id).value||"").trim();
+  const s=document.getElementById("elk-"+id).value;
+  const paths=(document.getElementById("elp-"+id).value||"").split(",").map(x=>x.trim()).filter(Boolean);
+  const kind=s==="anime"?"shows":s, anime=s==="anime";
+  const err=document.getElementById("ele-"+id); if(err) err.textContent="";
+  try{ await api(`/libraries/${id}`,{method:"PUT",body:{name,kind,paths,anime}}); toast("Library updated"); viewSettings(); }
+  catch(e){ if(err) err.textContent=e.message; }
+}
+async function scanAll(){
+  const libs=(SETTINGS_DATA&&SETTINGS_DATA.libs)||[]; if(!libs.length) return;
+  await Promise.all(libs.map(l=>api(`/libraries/${l.id}/scan`,{method:"POST"}).catch(()=>{})));
+  toast(`Scanning ${libs.length} librar${libs.length===1?'y':'ies'}…`); setTimeout(settingsTick,400);
+}
+async function refreshAll(){
+  const libs=(SETTINGS_DATA&&SETTINGS_DATA.libs)||[]; if(!libs.length) return;
+  if(!confirm(`Re-fetch metadata & artwork for all ${libs.length} libraries? This can take a while.`)) return;
+  await Promise.all(libs.map(l=>api(`/libraries/${l.id}/refresh`,{method:"POST"}).catch(()=>{})));
+  toast("Refreshing all libraries…"); setTimeout(settingsTick,400);
 }
 async function settingsTick(){
   const h=location.hash;
