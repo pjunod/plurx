@@ -84,35 +84,84 @@ theme (true-black, monospace):
    Media Server-compatible API so existing third-party Plex clients point at
    plurx and just work.
 
+## Quickstart
+
+The fast path with Docker/Compose — from nothing to playing in four steps:
+
+```bash
+# 1. Point it at your media and bring it up (builds from source the first time)
+cd deploy
+cp docker-compose.override.example.yml docker-compose.override.yml
+$EDITOR docker-compose.override.yml     # media mounts as host:container:ro, + optional GPU
+docker compose up -d --build
+
+# 2. Open the web app — the first launch is the admin-account setup screen
+open http://<host>:32600                # :32600 is the default port
+
+# 3. Add a library: Settings → Libraries → Add & scan
+#    Kind: Movies | TV Shows | Anime · Path: what the SERVER sees (the container mount)
+
+# 4. Press play. Open ⓘ Stats (or press i) to see how it's being served.
+```
+
+Movies and TV want a free TMDB key for posters and metadata (Settings →
+Metadata); anime enriches from AniList with no key. Everything runtime — users,
+libraries, keys — is edited in Settings, never a config file. A scan that finds
+nothing almost always means the path isn't what the server sees; the fix is in
+[docs/OPERATIONS.md](docs/OPERATIONS.md#reading-library-scan-status).
+
 ## Install
 
-```bash
-# Docker / Compose — recommended for homelabs; builds from source the first time
-cd deploy
-cp docker-compose.override.example.yml docker-compose.override.yml  # your media mounts + GPU
-docker compose up -d --build                                        # then open http://<host>:32600
+Three ways to run it; all serve the web app + API on `:32600`.
 
-# Bare metal — one binary; needs ffmpeg/ffprobe (or point PLURX_FFMPEG/PLURX_FFPROBE at them)
-plurxd run                                                          # serves :32600
+```bash
+# Docker / Compose — recommended for homelabs; bundles ffmpeg, builds from source first run
+cd deploy && docker compose up -d --build
+
+# Bare metal — one static binary; needs ffmpeg/ffprobe on PATH
+#   (jellyfin-ffmpeg recommended, or point PLURX_FFMPEG / PLURX_FFPROBE at them)
+plurxd run
 
 # From source (development)
-cargo run -p plurxd                                                 # or: make run
+cargo run -p plurxd                     # or: make run
 ```
 
-First launch walks you through creating an admin account and adding a library.
-Library paths are what the **server process** sees — under Docker, the
-container-side mount path. Configuration is defaults → `plurx.toml` → `PLURX_*`
-env (full table in [docs/OPERATIONS.md](docs/OPERATIONS.md#configuration-surface)).
+**Prerequisites.** Just `ffmpeg`/`ffprobe`, for scanning and remux/transcode —
+the Docker image already bundles them. Hardware transcoding additionally needs
+the GPU exposed to the process (NVENC / QuickSync / VA-API / VideoToolbox) and
+its driver; the software x264 path is always there as a fallback. Configuration
+layers defaults → `plurx.toml` → `PLURX_*` env (full table in
+[docs/OPERATIONS.md](docs/OPERATIONS.md#configuration-surface)).
 
-Developer commands (CI runs the same targets, so green locally means green in CI):
+**Full guides.** [deploy/README.md](deploy/README.md) is the complete
+**install & setup** reference — every target (Compose, bare metal, Unraid,
+TrueNAS/Kubernetes, systemd), GPU passthrough, and ports.
+[docs/OPERATIONS.md](docs/OPERATIONS.md) is **operations** — running it day to
+day and reading every status, log, and stats line it shows you.
+[docs/CHEATSHEET.md](docs/CHEATSHEET.md) is the **cheat sheet** — the
+copy-paste commands, in order, plus a table of where everything lives.
+
+## Development
+
+Rust is the only toolchain to install — the repo pins the exact rustc, clippy,
+and rustfmt in [`rust-toolchain.toml`](rust-toolchain.toml), so `rustup` fetches
+the right versions on your first build. Local and CI stay identical, which is
+why a green `make check` locally means green in CI. Keep `ffmpeg`/`ffprobe` on
+`PATH` for anything that scans or plays.
 
 ```bash
-make            # list every target
-make run        # serve http://localhost:32600
-make check      # fmt-check + clippy + test  (the CI gate — the single quality bar)
-make coverage   # line coverage via cargo-llvm-cov → lcov.info
-make hooks      # install a pre-commit hook that runs `make check`
+git clone https://github.com/pjunod/plurx && cd plurx
+make run          # build + serve http://localhost:32600  (cargo run -p plurxd)
+make check        # fmt-check + clippy + test — the CI gate, the single quality bar
+make hooks        # install a pre-commit hook that runs `make check` before each commit
 ```
+
+Everything goes through the `Makefile`; `make` with no target lists them all
+(`make test`, `make coverage` → `lcov.info`, `make docker`). One gotcha worth
+knowing up front: the web app is a single file embedded into the binary at build
+time ([`crates/plurxd/src/web/index.html`](crates/plurxd/src/web/index.html)),
+so a UI change only shows up after a rebuild. How the pieces fit and *why* is
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md); the crate map is [below](#layout).
 
 ## Usage
 
