@@ -21,7 +21,7 @@
   :root{
     --bg:#0e0f13; --panel:#171922; --panel2:#1e2230; --line:#2a2f3e;
     --text:#e8eaf0; --muted:#9aa2b4; --accent:#6ea8fe; --accent2:#8b7cf6;
-    --good:#4ade80; --bad:#f87171; --warn:#fbbf24; --radius:12px;
+    --good:#4ade80; --bad:#f87171; --warn:#fbbf24; --radius:12px; --poster:150px;
     --btn-ink:#07101f; --prose:#cdd2df;
     --font:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
     --font-mono:ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace;
@@ -60,7 +60,7 @@
   .card h2.section{border-top:0;padding-top:0}   /* cards separate their own sections */
   .getapp{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;margin:16px 20px 2px;padding:13px 16px;background:rgba(229,72,77,.08);border:1px solid var(--accent);border-radius:12px}
   .getapp a.btn{display:inline-block;background:var(--accent);color:#fff;padding:8px 15px;border-radius:8px;text-decoration:none;font-weight:600;font-size:14px;white-space:nowrap}
-  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:16px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(var(--poster,150px),1fr));gap:16px}
   .rowscroll{display:grid;grid-auto-flow:column;grid-auto-columns:200px;gap:16px;overflow-x:auto;padding-bottom:8px;scrollbar-width:thin}
   .poster{background:var(--panel2);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;cursor:pointer;transition:transform .12s,border-color .12s;position:relative}
   .poster:hover{transform:translateY(-3px);border-color:var(--accent)}
@@ -438,6 +438,7 @@ function applyTheme(){
   if(fav) fav.href=FAVICONS[id]||FAVICONS.default;
 }
 applyTheme();
+applyPosterSize();
 try{ document.title=APP_NAME; }catch(e){}
 if(window.matchMedia){ try{ window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change",()=>{ if((localStorage.getItem("plurx_appearance")||"auto")==="auto") applyTheme(); }); }catch(e){} }
 </script>
@@ -576,6 +577,10 @@ function chrome(active, inner){
        <button class="ghost sm" onclick="toggleAppearanceMenu(event)" title="Light / dark">◐</button>
        <div class="amenu" id="appmenu"></div>
      </div>
+     <div style="position:relative">
+       <button class="ghost sm" onclick="toggleSizeMenu(event)" title="Icon size">▦</button>
+       <div class="amenu" id="sizemenu"></div>
+     </div>
      ${getapp}
      <div style="position:relative">
        <button class="ghost sm profile" onclick="toggleProfileMenu(event)" title="Account">
@@ -603,13 +608,23 @@ function appMenuHtml(){
   const modes=[["auto","Auto (system)"],["light","Light"],["dark","Dark"]].map(([v,l])=>`<button class="${app===v?'sel':''}" onclick="setAppearance('${v}')">${l}</button>`).join("");
   return `<div class="amsec">Appearance</div>${modes}`;
 }
-function closeMenus(except){ ["thememenu","appmenu","profilemenu"].forEach(idn=>{ if(idn!==except){ const m=document.getElementById(idn); if(m) m.classList.remove("on"); } }); }
+function closeMenus(except){ ["thememenu","appmenu","sizemenu","profilemenu"].forEach(idn=>{ if(idn!==except){ const m=document.getElementById(idn); if(m) m.classList.remove("on"); } }); }
 function toggleThemeMenu(e){ if(e) e.stopPropagation(); closeMenus("thememenu"); const m=document.getElementById("thememenu"); if(!m) return;
   const open=!m.classList.contains("on"); m.classList.toggle("on",open); if(open) m.innerHTML=themeMenuHtml(); }
 function toggleAppearanceMenu(e){ if(e) e.stopPropagation(); closeMenus("appmenu"); const m=document.getElementById("appmenu"); if(!m) return;
   const open=!m.classList.contains("on"); m.classList.toggle("on",open); if(open) m.innerHTML=appMenuHtml(); }
 function setTheme(id){ try{localStorage.setItem("plurx_theme",id)}catch(e){} applyTheme(); const m=document.getElementById("thememenu"); if(m) m.innerHTML=themeMenuHtml(); }
 function setAppearance(v){ try{localStorage.setItem("plurx_appearance",v)}catch(e){} applyTheme(); const m=document.getElementById("appmenu"); if(m) m.innerHTML=appMenuHtml(); }
+// Poster/icon size for the browse grids (per browser). 150px is the middle
+// default the layout shipped with; the selector just adds smaller & larger
+// steps. Applied as a CSS var so every `.grid` reflows live — no re-render.
+const POSTER_SIZES=[["s","Small","120px"],["m","Medium","150px"],["l","Large","186px"],["xl","Extra large","226px"]];
+function posterSize(){ let v="m"; try{ v=localStorage.getItem("plurx_iconsize")||"m"; }catch(e){} return POSTER_SIZES.some(s=>s[0]===v)?v:"m"; }
+function applyPosterSize(){ const s=POSTER_SIZES.find(x=>x[0]===posterSize()); document.documentElement.style.setProperty("--poster", s?s[2]:"150px"); }
+function sizeMenuHtml(){ const v=posterSize(); return `<div class="amsec">Icon size</div>`+POSTER_SIZES.map(s=>`<button class="${v===s[0]?'sel':''}" onclick="setIconSize('${s[0]}')">${s[1]}</button>`).join(""); }
+function toggleSizeMenu(e){ if(e) e.stopPropagation(); closeMenus("sizemenu"); const m=document.getElementById("sizemenu"); if(!m) return;
+  const open=!m.classList.contains("on"); m.classList.toggle("on",open); if(open) m.innerHTML=sizeMenuHtml(); }
+function setIconSize(v){ try{localStorage.setItem("plurx_iconsize",v)}catch(e){} applyPosterSize(); const m=document.getElementById("sizemenu"); if(m) m.innerHTML=sizeMenuHtml(); }
 // Account menu, anchored far-right: shows who you're signed in as, plus the
 // per-account actions (admins also get a Settings shortcut) and Sign out.
 function profileMenuHtml(){
