@@ -507,12 +507,17 @@ function fmtUptime(s){ const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=
 function fmtTs(ms){ const d=new Date(ms); return d.toLocaleTimeString([], {hour12:false})+"."+String(ms%1000).padStart(3,"0"); }
 function fmtAgo(unix){ if(!unix) return ""; const s=Math.max(0,Math.floor(Date.now()/1000)-unix);
   if(s<60) return "just now"; if(s<3600) return Math.floor(s/60)+"m ago"; if(s<86400) return Math.floor(s/3600)+"h ago"; return Math.floor(s/86400)+"d ago"; }
-function esc(s){ return (s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+// HTML-escape for text and attribute values. Escapes BOTH quote characters:
+// `'` matters because inline on* handlers are single-quoted, and an unescaped
+// apostrophe in interpolated data (e.g. a title like "Can't") closes the
+// attribute early and silently breaks the handler. Compose with JSON.stringify
+// for a JS string inside an attribute: esc(JSON.stringify(value)).
+function esc(s){ return (s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
 // Artwork with a graceful fallback: initials on a tinted card when there's
 // no poster (so a seasons grid never shows blank rectangles).
 function artHtml(it, cls){
   const src=it.poster||it.backdrop;
-  if(src) return `<img class="art ${cls||''}" loading="lazy" src="${tok(src)}" alt="">`;
+  if(src) return `<img class="art ${cls||''}" loading="lazy" src="${esc(tok(src))}" alt="">`;
   if(it.kind==='season' && it.season_number!=null)
     return `<div class="art ph season ${cls||''}"><div class="snum">${it.season_number}</div><div class="sl">Season</div></div>`;
   const label=(it.title||"?").split(/\s+/).slice(0,2).map(w=>w[0]||"").join("").toUpperCase()||"?";
@@ -798,10 +803,10 @@ async function viewLibrary(id){
   const bar=`<div class="libbar">
     <div class="row">
       <span class="lbl">Sort</span>
-      <select onchange="LIB_SORT=this.value;viewLibrary(${id})">
+      <select onchange="LIB_SORT=this.value;viewLibrary(${Number(id)})">
         ${libOpt("title","Title (A–Z)",LIB_SORT)}${libOpt("added","Recently added",LIB_SORT)}${libOpt("year","Year",LIB_SORT)}</select>
       <span class="lbl" style="margin-left:8px">Show</span>
-      <select onchange="LIB_FILTER=this.value;viewLibrary(${id})">
+      <select onchange="LIB_FILTER=this.value;viewLibrary(${Number(id)})">
         ${libOpt("all","Everything",LIB_FILTER)}${libOpt("unwatched","Unwatched",LIB_FILTER)}${libOpt("inprogress","In progress",LIB_FILTER)}${libOpt("watched","Watched",LIB_FILTER)}</select>
     </div>
     <span class="muted" style="font-size:13px">${items.length} item${items.length===1?'':'s'}${capNote}</span></div>`;
@@ -826,10 +831,10 @@ async function viewCategory(key){
   const bar=`<div class="libbar">
     <div class="row">
       <span class="lbl">Sort</span>
-      <select onchange="LIB_SORT=this.value;viewCategory('${key}')">
+      <select onchange="LIB_SORT=this.value;viewCategory(${esc(JSON.stringify(key))})">
         ${libOpt("title","Title (A–Z)",LIB_SORT)}${libOpt("added","Recently added",LIB_SORT)}${libOpt("year","Year",LIB_SORT)}</select>
       <span class="lbl" style="margin-left:8px">Show</span>
-      <select onchange="LIB_FILTER=this.value;viewCategory('${key}')">
+      <select onchange="LIB_FILTER=this.value;viewCategory(${esc(JSON.stringify(key))})">
         ${libOpt("all","Everything",LIB_FILTER)}${libOpt("unwatched","Unwatched",LIB_FILTER)}${libOpt("inprogress","In progress",LIB_FILTER)}${libOpt("watched","Watched",LIB_FILTER)}</select>
     </div>
     <span class="muted" style="font-size:13px">${items.length} item${items.length===1?'':'s'}${capNote}</span></div>`;
@@ -895,7 +900,7 @@ function epThumb(ep){
   const art=ep.poster||ep.backdrop;
   const pct=progressPct(ep.watch);
   const prog=pct>0&&pct<100?`<span class="pbadge"><i style="width:${pct}%"></i></span>`:'';
-  if(art) return `<div class="epthumb" style="background-image:url(${tok(art)});background-size:cover;color:transparent">${prog}</div>`;
+  if(art) return `<div class="epthumb" style="background-image:url(${esc(tok(art))});background-size:cover;color:transparent">${prog}</div>`;
   return `<div class="epthumb">${ep.episode_number!=null?ep.episode_number:"?"}${prog}</div>`;
 }
 function episodeRow(ep){
@@ -944,8 +949,8 @@ async function viewItem(id){
     const playable=d.files.find(f=>f.available);
     if(playable){
       body+=`<div class="actions">
-        <button class="btnplay" onclick='play(${playable.id},${JSON.stringify(it.title)},${resume},${playable.duration_ms||0})'>▶ ${resume?`Resume · ${fmtDur(resume)}`:'Play'}</button>
-        ${resume?`<button class="ghost" onclick='play(${playable.id},${JSON.stringify(it.title)},0,${playable.duration_ms||0})'>Start over</button>`:''}
+        <button class="btnplay" onclick='play(${playable.id},${esc(JSON.stringify(it.title))},${resume},${playable.duration_ms||0})'>▶ ${resume?`Resume · ${fmtDur(resume)}`:'Play'}</button>
+        ${resume?`<button class="ghost" onclick='play(${playable.id},${esc(JSON.stringify(it.title))},0,${playable.duration_ms||0})'>Start over</button>`:''}
         ${watchBtn}</div>`;
     } else {
       const p=best.missing_path;
@@ -957,7 +962,7 @@ async function viewItem(id){
       // to tell apart, or when a file is missing. A single version is already
       // badged in the hero, so its block is just the spec detail.
       const header=(multi||miss)
-        ? `<div class="vh"><span class="vbadges">${specBadges(v)||`<span class="vt">${esc(v.filename)}</span>`}${miss?'<span class="missbadge">missing</span>':''}</span>${(!miss&&multi)?`<button class="ghost sm" onclick='play(${v.id},${JSON.stringify(it.title)},${resume},${v.duration_ms||0})'>▶ Play</button>`:''}</div>`
+        ? `<div class="vh"><span class="vbadges">${specBadges(v)||`<span class="vt">${esc(v.filename)}</span>`}${miss?'<span class="missbadge">missing</span>':''}</span>${(!miss&&multi)?`<button class="ghost sm" onclick='play(${v.id},${esc(JSON.stringify(it.title))},${resume},${v.duration_ms||0})'>▶ Play</button>`:''}</div>`
         : '';
       return `<div class="version">${header}${specBlock(v)}${miss&&ME.is_admin&&v.missing_path?`<div class="problem">${esc(v.missing_path)}</div>`:''}</div>`;
     }).join("");
@@ -970,7 +975,7 @@ async function viewItem(id){
     body+=`<h2 class="section" style="margin:18px 0 12px">${d.children[0].kind==='season'?'Seasons':'Episodes'}</h2>${grid(d.children)}`;
   }
 
-  const bg=it.backdrop?`<div class="herobg" style="background-image:url(${tok(it.backdrop)})"></div>`:'';
+  const bg=it.backdrop?`<div class="herobg" style="background-image:url(${esc(tok(it.backdrop))})"></div>`:'';
   document.getElementById("main").innerHTML=`<div class="hero">${bg}
     <div class="dwrap">
       <div class="poster">${artHtml(it)}</div>
@@ -1596,7 +1601,7 @@ async function renderActivityBody(){
     <td>${esc(se.user_name)}</td>
     <td>transcode · ${se.target_height}p · ${esc(se.encoder)}</td>
     <td class="muted">${fmtAgo(se.started_unix)}${se.idle_seconds>30?` · idle ${Math.round(se.idle_seconds)}s`:''}</td>
-    <td style="text-align:right">${ME&&ME.is_admin?`<button class="ghost sm" onclick="stopSession('${esc(se.id)}')">Stop</button>`:''}</td></tr>`).join("");
+    <td style="text-align:right">${ME&&ME.is_admin?`<button class="ghost sm" onclick="stopSession(${esc(JSON.stringify(se.id))})">Stop</button>`:''}</td></tr>`).join("");
   const scans=d.scans.map(sc=>`<tr><td style="width:200px"><b>${esc(sc.library)}</b></td><td class="muted">${statusText(sc.status)}</td></tr>`).join("");
   const t=d.trakt||{};
   const trakt = t.configured
@@ -1647,7 +1652,7 @@ async function viewSettings(){
     api("/libraries"),api("/settings"),api("/scan/status"),api("/system"),api("/users"),
     api("/trakt/status").catch(()=>null)]);
   SETTINGS=settings; TRAKT=trakt; TRAKT_EDIT=false;
-  const libRows=libs.map(l=>`<tr><td><b>${esc(l.name)}</b></td><td>${l.anime?'anime':l.kind}</td><td class="muted">${esc(l.paths.join(", "))}</td>
+  const libRows=libs.map(l=>`<tr><td><b>${esc(l.name)}</b></td><td>${esc(l.anime?'anime':l.kind)}</td><td class="muted">${esc(l.paths.join(", "))}</td>
       <td class="muted" id="st-${l.id}">${statusText(status[l.id])}</td>
       <td class="row" style="flex-wrap:nowrap"><button class="ghost sm" onclick="scanLib(${l.id})">Scan</button><button class="ghost sm" onclick="refreshLib(${l.id})" title="Re-fetch all metadata & artwork (incl. season posters)">Refresh art</button><button class="ghost sm" onclick="delLib(${l.id})">Delete</button></td></tr>`).join("");
   const enc=sys.encoders||{};
@@ -1832,9 +1837,9 @@ function userRow(u){
   const me = ME&&ME.id===u.id;
   const created = new Date(u.created_at*1000).toLocaleDateString();
   const role = u.is_admin?`<span class="pill" style="color:var(--accent);border-color:var(--accent)">admin</span>`:`<span class="muted">user</span>`;
-  const btns=[`<button class="ghost sm" onclick='resetPw(${u.id},${JSON.stringify(u.username)})'>Reset password</button>`];
+  const btns=[`<button class="ghost sm" onclick='resetPw(${u.id},${esc(JSON.stringify(u.username))})'>Reset password</button>`];
   btns.push(`<button class="ghost sm" onclick="setAdmin(${u.id},${u.is_admin?0:1})">${u.is_admin?'Revoke admin':'Make admin'}</button>`);
-  if(!me) btns.push(`<button class="ghost sm" onclick='delUser(${u.id},${JSON.stringify(u.username)})'>Delete</button>`);
+  if(!me) btns.push(`<button class="ghost sm" onclick='delUser(${u.id},${esc(JSON.stringify(u.username))})'>Delete</button>`);
   return `<tr><td><b>${esc(u.username)}</b>${me?' <span class="muted">(you)</span>':''}</td><td>${role}</td><td class="muted">${created}</td>
     <td class="row" style="flex-wrap:wrap;justify-content:flex-end">${btns.join("")}</td></tr>`;
 }
