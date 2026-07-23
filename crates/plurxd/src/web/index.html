@@ -21,7 +21,7 @@
   :root{
     --bg:#0e0f13; --panel:#171922; --panel2:#1e2230; --line:#2a2f3e;
     --text:#e8eaf0; --muted:#9aa2b4; --accent:#6ea8fe; --accent2:#8b7cf6;
-    --good:#4ade80; --bad:#f87171; --warn:#fbbf24; --radius:12px; --poster:150px;
+    --good:#4ade80; --bad:#f87171; --warn:#fbbf24; --radius:12px; --poster:120px;
     --btn-ink:#07101f; --prose:#cdd2df;
     --font:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
     --font-mono:ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace;
@@ -60,8 +60,12 @@
   .card h2.section{border-top:0;padding-top:0}   /* cards separate their own sections */
   .getapp{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;margin:16px 20px 2px;padding:13px 16px;background:rgba(229,72,77,.08);border:1px solid var(--accent);border-radius:12px}
   .getapp a.btn{display:inline-block;background:var(--accent);color:#fff;padding:8px 15px;border-radius:8px;text-decoration:none;font-weight:600;font-size:14px;white-space:nowrap}
-  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(var(--poster,150px),1fr));gap:16px}
-  .rowscroll{display:grid;grid-auto-flow:column;grid-auto-columns:200px;gap:16px;overflow-x:auto;padding-bottom:8px;scrollbar-width:thin}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(var(--poster,120px),1fr));gap:16px}
+  /* Horizontal hub rails (Continue watching / Next up / Recently added) track the
+     same icon-size setting as the grids. ×4/3 preserves the original rail:poster
+     ratio (the shipped 200:150), so rails stay proportionally larger and scale
+     with the selection instead of staying pinned at one width. */
+  .rowscroll{display:grid;grid-auto-flow:column;grid-auto-columns:calc(var(--poster,120px) * 4 / 3);gap:16px;overflow-x:auto;padding-bottom:8px;scrollbar-width:thin}
   .poster{background:var(--panel2);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;cursor:pointer;transition:transform .12s,border-color .12s;position:relative}
   .poster:hover{transform:translateY(-3px);border-color:var(--accent)}
   .poster .art{aspect-ratio:2/3;width:100%;object-fit:cover;display:block;background:var(--panel2)}
@@ -578,7 +582,9 @@ function chrome(active, inner){
        <div class="amenu" id="appmenu"></div>
      </div>
      <div style="position:relative">
-       <button class="ghost sm" onclick="toggleSizeMenu(event)" title="Icon size">▦</button>
+       <button class="ghost sm" onclick="toggleSizeMenu(event)" title="Icon size" style="display:inline-flex;align-items:center;gap:6px">
+         <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor" aria-hidden="true"><rect x="0" y="0" width="5" height="5" rx="1"/><rect x="7" y="0" width="5" height="5" rx="1"/><rect x="0" y="7" width="5" height="5" rx="1"/><rect x="7" y="7" width="5" height="5" rx="1"/></svg><span>Size</span>
+       </button>
        <div class="amenu" id="sizemenu"></div>
      </div>
      ${getapp}
@@ -619,7 +625,7 @@ function setAppearance(v){ try{localStorage.setItem("plurx_appearance",v)}catch(
 // default the layout shipped with; the selector just adds smaller & larger
 // steps. Applied as a CSS var so every `.grid` reflows live — no re-render.
 const POSTER_SIZES=[["s","Small","120px"],["m","Medium","150px"],["l","Large","186px"],["xl","Extra large","226px"]];
-function posterSize(){ let v="m"; try{ v=localStorage.getItem("plurx_iconsize")||"m"; }catch(e){} return POSTER_SIZES.some(s=>s[0]===v)?v:"m"; }
+function posterSize(){ let v="s"; try{ v=localStorage.getItem("plurx_iconsize")||"s"; }catch(e){} return POSTER_SIZES.some(s=>s[0]===v)?v:"s"; }
 function applyPosterSize(){ const s=POSTER_SIZES.find(x=>x[0]===posterSize()); document.documentElement.style.setProperty("--poster", s?s[2]:"150px"); }
 function sizeMenuHtml(){ const v=posterSize(); return `<div class="amsec">Icon size</div>`+POSTER_SIZES.map(s=>`<button class="${v===s[0]?'sel':''}" onclick="setIconSize('${s[0]}')">${s[1]}</button>`).join(""); }
 function toggleSizeMenu(e){ if(e) e.stopPropagation(); closeMenus("sizemenu"); const m=document.getElementById("sizemenu"); if(!m) return;
