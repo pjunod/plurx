@@ -105,6 +105,10 @@
     .pskip{bottom:calc(env(safe-area-inset-bottom,0px) + 120px)}
   }
   .player.idle .pbar{opacity:0;pointer-events:none}
+  /* a dropdown menu tracks the bar: if the chrome ever hides, the menu goes
+     with it instead of floating alone (the JS also keeps the bar up while a
+     menu is open, so this is a safety net) */
+  .player.idle .pmenu{opacity:0;pointer-events:none}
   .ptitle{font-weight:600;color:#fff;font-size:15px;text-shadow:0 1px 4px rgba(0,0,0,.7);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:56vw}
   .pbtn{background:rgba(18,20,26,.62);color:#fff;border:1px solid rgba(255,255,255,.15);border-radius:8px;
     padding:6px 11px;font-size:13px;font-weight:500;cursor:pointer;backdrop-filter:blur(6px);white-space:nowrap}
@@ -1010,7 +1014,14 @@ function playerActivity(){
   const p=document.getElementById("player"); if(!p) return;
   p.classList.remove("idle");
   clearTimeout(PLAYER.idleTimer);
-  PLAYER.idleTimer=setTimeout(()=>{ const v=document.getElementById("video"); if(v&&!v.paused&&!v.ended) p.classList.add("idle"); },2600);
+  PLAYER.idleTimer=setTimeout(function idle(){
+    const v=document.getElementById("video");
+    // Never idle while a track/quality/sync menu is open — the bar would fade
+    // out from under the dropdown, leaving it floating. Re-arm and wait.
+    const m=document.getElementById("pmenu");
+    if(m&&m.classList.contains("on")){ PLAYER.idleTimer=setTimeout(idle,2600); return; }
+    if(v&&!v.paused&&!v.ended) p.classList.add("idle");
+  },2600);
 }
 // Attach the persistent listeners once; they read live PLAYER state each fire.
 function wirePlayer(){
