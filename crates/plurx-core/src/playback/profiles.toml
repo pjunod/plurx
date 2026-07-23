@@ -1,7 +1,9 @@
 # Device capability profiles — DATA, not code (REQ-PLAY-4). The decision engine
 # reads these to decide direct-play vs remux vs transcode. Editing/adding a
-# profile needs no code change. Each client reports which profile it wants (and
-# later, Phase 2, refines it with runtime-probed capabilities).
+# profile needs no code change. A client names one of these as a fallback; the
+# web player also reports runtime-probed capabilities (see playback::caps_profile)
+# that override the named profile so it only transcodes what the actual browser
+# can't decode. web-h264 stays the conservative baseline for when nothing is probed.
 
 [web-h264]
 # The safe baseline every modern browser can play via <video>/MSE.

@@ -61,9 +61,102 @@ fn content_type(path: &Path) -> &'static str {
     }
 }
 
-#[derive(Deserialize)]
-pub struct DecisionQuery {
+/// Runtime browser capabilities + a manual quality override, sent by the web
+/// player so the server only transcodes what this specific browser can't play.
+/// All optional and back-compatible: absent caps fall back to the named
+/// `profile` (default `web-h264`). CSV fields are lowercase codec/container
+/// short names.
+#[derive(Deserialize, Default, Clone)]
+pub struct Caps {
+    /// Named fallback profile when no caps are reported (e.g. `web-h264`).
     pub profile: Option<String>,
+    /// Video codecs the browser can decode, e.g. `h264,hevc,av1`.
+    pub vcodec: Option<String>,
+    /// Audio codecs, e.g. `aac,ac3,eac3,opus,flac`.
+    pub acodec: Option<String>,
+    /// Containers playable via `<video src>` (never mkv), e.g. `mp4,webm`.
+    pub container: Option<String>,
+    /// Max height to direct-play (omit = uncapped; a decodable 4K stream
+    /// direct-plays and the browser downscales).
+    pub maxheight: Option<i64>,
+    /// 1 when HDR may be shown directly (browser decodes it AND display is HDR).
+    pub hdr: Option<u8>,
+    /// Manual override: `auto` (default) | `original` | `transcode`.
+    pub force: Option<String>,
+}
+
+fn csv(s: &Option<String>) -> Vec<String> {
+    s.as_deref()
+        .map(|v| {
+            v.split(',')
+                .map(|t| t.trim().to_lowercase())
+                .filter(|t| !t.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+impl Caps {
+    /// True when the client reported real capabilities (vs. only a named profile).
+    fn has_caps(&self) -> bool {
+        self.vcodec.is_some() || self.acodec.is_some() || self.container.is_some()
+    }
+
+    /// The effective device profile: a runtime-probed one when caps were sent,
+    /// else the named/default profile (cloned to a single owned type).
+    fn profile(&self) -> playback::DeviceProfile {
+        if self.has_caps() {
+            let containers = {
+                let c = csv(&self.container);
+                if c.is_empty() {
+                    vec!["mp4".into(), "webm".into(), "mov".into()]
+                } else {
+                    c
+                }
+            };
+            let vcodec = {
+                let v = csv(&self.vcodec);
+                if v.is_empty() {
+                    vec!["h264".into()]
+                } else {
+                    v
+                }
+            };
+            let acodec = {
+                let a = csv(&self.acodec);
+                if a.is_empty() {
+                    vec!["aac".into(), "mp3".into()]
+                } else {
+                    a
+                }
+            };
+            playback::caps_profile(
+                containers,
+                vcodec,
+                acodec,
+                self.maxheight,
+                self.hdr == Some(1),
+            )
+        } else {
+            self.profile
+                .as_deref()
+                .and_then(playback::profile)
+                .unwrap_or_else(playback::default_profile)
+                .clone()
+        }
+    }
+
+    fn force(&self) -> playback::Force {
+        self.force
+            .as_deref()
+            .map(playback::Force::parse)
+            .unwrap_or(playback::Force::Auto)
+    }
+
+    /// The decision this client should get for `file`.
+    fn decide(&self, file: &MediaFile) -> Decision {
+        playback::decide_forced(file, &self.profile(), self.force())
+    }
 }
 
 #[derive(Serialize)]
@@ -318,12 +411,14 @@ async fn markers_for(path: &Path, duration_ms: Option<i64>) -> Vec<Marker> {
     out
 }
 
-/// GET /api/v1/files/:id/decision?profile=web-h264
+/// GET /api/v1/files/:id/decision — the web player sends `?vcodec=…&acodec=…&
+/// container=…&hdr=…&force=…` (runtime browser capabilities + quality override);
+/// native clients still pass `?profile=`.
 pub async fn decision(
     AuthUser(user): AuthUser,
     State(state): State<AppState>,
     AxPath(id): AxPath<i64>,
-    Query(q): Query<DecisionQuery>,
+    Query(q): Query<Caps>,
 ) -> Result<Json<DecisionResponse>, ApiError> {
     let file = load_file(&state, id).await?;
     // Never hand back a play URL for a file that isn't on disk — the client
@@ -335,12 +430,7 @@ pub async fn decision(
                 .into(),
         ));
     }
-    let profile = q
-        .profile
-        .as_deref()
-        .and_then(playback::profile)
-        .unwrap_or_else(playback::default_profile);
-    let decision = playback::decide(&file, profile);
+    let decision = q.decide(&file);
 
     let play_url = match decision.method {
         playback::PlaybackMethod::DirectPlay => format!("/api/v1/files/{id}/direct"),
@@ -512,15 +602,39 @@ pub async fn direct(
     serve_file_range(&file.path, &headers).await
 }
 
+// The caps fields are inlined (not `#[serde(flatten)]`ed) because axum's
+// urlencoded Query decoder doesn't support flatten.
 #[derive(Deserialize)]
 pub struct StreamQuery {
     /// Start offset in seconds (used for resume; remux fast-seeks the input).
     pub start: Option<f64>,
-    pub profile: Option<String>,
     /// Which audio stream to map (`a:{audio}`); default 0. Lets the client
     /// switch audio language — a non-default pick forces a remux so the chosen
     /// track is the one in the MP4.
     pub audio: Option<i64>,
+    // Same runtime-caps fields as `/decision`, so the remux copies the audio
+    // when the browser can play it (vs. re-encoding to AAC needlessly).
+    pub profile: Option<String>,
+    pub vcodec: Option<String>,
+    pub acodec: Option<String>,
+    pub container: Option<String>,
+    pub maxheight: Option<i64>,
+    pub hdr: Option<u8>,
+    pub force: Option<String>,
+}
+
+impl StreamQuery {
+    fn caps(&self) -> Caps {
+        Caps {
+            profile: self.profile.clone(),
+            vcodec: self.vcodec.clone(),
+            acodec: self.acodec.clone(),
+            container: self.container.clone(),
+            maxheight: self.maxheight,
+            hdr: self.hdr,
+            force: self.force.clone(),
+        }
+    }
 }
 
 /// GET /api/v1/files/:id/stream.mp4 — fragmented-MP4 remux, optional start.
@@ -531,19 +645,18 @@ pub async fn stream_mp4(
     Query(q): Query<StreamQuery>,
 ) -> Result<Response, ApiError> {
     let file = load_file(&state, id).await?;
-    let profile = q
-        .profile
-        .as_deref()
-        .and_then(playback::profile)
-        .unwrap_or_else(playback::default_profile);
-    let decision = playback::decide(&file, profile);
+    let decision = q.caps().decide(&file);
     let audio = q.audio.unwrap_or(0).max(0);
+    // Copy HEVC gets an `hvc1` tag so Safari's <video> accepts the fMP4 (an
+    // `hev1`-tagged MKV copy otherwise plays audio-only / black in Safari).
+    let hevc = matches!(file.video_codec.as_deref(), Some("hevc" | "h265"));
     remux(
         &file.path,
         q.start,
         decision.transcode_audio,
         audio,
         file.audio_offset_ms,
+        hevc,
     )
     .await
 }
@@ -639,6 +752,7 @@ async fn remux(
     transcode_audio: bool,
     audio_index: i64,
     audio_offset_ms: i64,
+    hevc: bool,
 ) -> Result<Response, ApiError> {
     let mut cmd = tokio::process::Command::new(ffmpeg_bin());
     cmd.arg("-hide_banner").arg("-loglevel").arg("error");
@@ -671,6 +785,12 @@ async fn remux(
         "-sn",
     ]);
     cmd.args(["-c:v", "copy"]);
+    // Safari only decodes HEVC in MP4 when the sample entry is tagged `hvc1`;
+    // MKV HEVC is commonly `hev1`, which Safari renders black. Harmless for a
+    // stream that's already hvc1. Video-stream-scoped so H.264 is untouched.
+    if hevc {
+        cmd.args(["-tag:v", "hvc1"]);
+    }
     if transcode_audio {
         cmd.args(["-c:a", "aac", "-ac", "2", "-b:a", "256k"]);
     } else {
@@ -682,11 +802,15 @@ async fn remux(
     // in MKV remuxes — otherwise yields a first fragment with a non-zero
     // baseMediaDecodeTime that some browsers sit on forever (gray screen, no
     // error). Harmless when the input already starts at zero.
+    // `delay_moov` holds the init moov until the first packet, so codecs whose
+    // sample entry needs a packet peek — AC-3/E-AC-3 copy especially — don't
+    // fail with "cannot write moov atom before AC3 packets". Harmless for
+    // AAC/H.264 (verified: ftyp+moov still lead the stream).
     cmd.args([
         "-avoid_negative_ts",
         "make_zero",
         "-movflags",
-        "frag_keyframe+empty_moov+default_base_moof",
+        "frag_keyframe+empty_moov+default_base_moof+delay_moov",
         "-f",
         "mp4",
         "pipe:1",

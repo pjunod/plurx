@@ -418,7 +418,7 @@ if(window.matchMedia){ try{ window.matchMedia("(prefers-color-scheme: dark)").ad
 </head>
 <body>
 <div id="app"></div>
-<div class="modal" id="modal"><div class="player" id="player"><video id="video" controls autoplay playsinline x-webkit-airplay="allow"></video><div class="pbar" id="pbar"><div class="ptitle" id="playTitle"></div><div class="row"><button class="pbtn" id="audiobtn" style="display:none" onclick="toggleMenu('audio')">🔊 Audio</button><button class="pbtn" id="subsbtn" style="display:none" onclick="toggleMenu('subs')">💬 Subtitles</button><button class="pbtn" id="syncbtn" title="Audio sync adjustment" onclick="toggleMenu('sync')">⇄ Sync</button><button class="pbtn" id="statsbtn" title="Playback info (i)" onclick="toggleStats()">ⓘ Stats</button><button class="pbtn" id="skipbtn" title="Auto-skip intro & credits" onclick="togglePlayerAutoskip()">⏭ Auto-skip</button><button class="pbtn" id="apbtn" style="display:none" title="AirPlay">📺 AirPlay</button><button class="pbtn" title="Close (Esc)" onclick="closePlayer()">✕ Close</button></div></div><div class="pskip" id="pskip"></div><div class="ploading" id="ploading"><div class="pspin"></div><div class="ploadText" id="ploadText">Loading…</div><div class="ploadSub" id="ploadSub"></div></div><div class="statsov" id="statsov"></div><div class="pmenu" id="pmenu"></div></div></div>
+<div class="modal" id="modal"><div class="player" id="player"><video id="video" controls autoplay playsinline x-webkit-airplay="allow"></video><div class="pbar" id="pbar"><div class="ptitle" id="playTitle"></div><div class="row"><button class="pbtn" id="audiobtn" style="display:none" onclick="toggleMenu('audio')">🔊 Audio</button><button class="pbtn" id="subsbtn" style="display:none" onclick="toggleMenu('subs')">💬 Subtitles</button><button class="pbtn" id="qualbtn" title="Playback quality" onclick="toggleMenu('quality')">◆ Quality</button><button class="pbtn" id="syncbtn" title="Audio sync adjustment" onclick="toggleMenu('sync')">⇄ Sync</button><button class="pbtn" id="statsbtn" title="Playback info (i)" onclick="toggleStats()">ⓘ Stats</button><button class="pbtn" id="skipbtn" title="Auto-skip intro & credits" onclick="togglePlayerAutoskip()">⏭ Auto-skip</button><button class="pbtn" id="apbtn" style="display:none" title="AirPlay">📺 AirPlay</button><button class="pbtn" title="Close (Esc)" onclick="closePlayer()">✕ Close</button></div></div><div class="pskip" id="pskip"></div><div class="ploading" id="ploading"><div class="pspin"></div><div class="ploadText" id="ploadText">Loading…</div><div class="ploadSub" id="ploadSub"></div></div><div class="statsov" id="statsov"></div><div class="pmenu" id="pmenu"></div></div></div>
 <div class="toast" id="toast"></div>
 
 <script src="/assets/hls.min.js"></script>
@@ -827,13 +827,48 @@ function attachHls(video, playlistUrl){
   }
 }
 
+// ---- runtime playback capabilities ----------------------------------------
+// What THIS browser can actually decode, probed once. Sent on every decision so
+// the server direct-plays/remuxes whatever the browser supports and only
+// transcodes what it genuinely can't — Safari keeps HEVC, everyone keeps their
+// own audio codecs, etc. HDR is claimed only on an HDR display (else the server
+// tone-maps, since HDR-on-SDR looks washed-out).
+const PLAY_CAPS=(function(){
+  let v=null; try{ v=document.createElement("video"); }catch(e){}
+  const can=t=>{ try{ return !!v && v.canPlayType(t)!==""; }catch(e){ return false; } };
+  const mse=t=>{ try{ return !!(window.MediaSource && MediaSource.isTypeSupported(t)); }catch(e){ return false; } };
+  const vc=["h264"];
+  if(can('video/mp4; codecs="hvc1.1.6.L93.B0"')||mse('video/mp4; codecs="hvc1.1.6.L93.B0"')) vc.push("hevc");
+  if(can('video/mp4; codecs="av01.0.05M.08"')||mse('video/mp4; codecs="av01.0.05M.08"')) vc.push("av1");
+  if(can('video/webm; codecs="vp9"')||mse('video/webm; codecs="vp9"')) vc.push("vp9");
+  if(can('video/webm; codecs="vp8"')) vc.push("vp8");
+  const ac=["aac","mp3"];
+  if(can('audio/mp4; codecs="opus"')||mse('audio/webm; codecs="opus"')) ac.push("opus");
+  if(can('audio/flac')||mse('audio/mp4; codecs="flac"')) ac.push("flac");
+  if(can('audio/mp4; codecs="ac-3"')) ac.push("ac3");    // Safari: "maybe"; most others ""
+  if(can('audio/mp4; codecs="ec-3"')) ac.push("eac3");
+  const hdrDisplay=!!(window.matchMedia && window.matchMedia("(dynamic-range: high)").matches);
+  const hdr=hdrDisplay && (vc.includes("hevc")||vc.includes("av1"));
+  return {vcodec:vc.join(","), acodec:ac.join(","), container:"mp4,webm,mov", hdr:hdr?1:0};
+})();
+const CAPS_Q=`vcodec=${PLAY_CAPS.vcodec}&acodec=${PLAY_CAPS.acodec}&container=${PLAY_CAPS.container}&hdr=${PLAY_CAPS.hdr}`;
+
+// Manual quality override (player menu), persisted per browser. Auto runs the
+// automatic ladder; Original never transcodes video (direct/remux only); a
+// height forces a transcode at that size.
+const QUALITIES=[["auto","Auto"],["original","Original"],["1080","1080p"],["720","720p"],["480","480p"]];
+function playQuality(){ try{ return localStorage.getItem("plurx_quality")||"auto"; }catch(e){ return "auto"; } }
+function qualityForce(){ const q=playQuality(); return q==="auto"?"auto":(q==="original"?"original":"transcode"); }
+function transcodeHeight(){ const q=playQuality(); return (q==="1080"||q==="720"||q==="480")?parseInt(q,10):720; }
+function qualityLabel(){ const q=playQuality(); const f=QUALITIES.find(x=>x[0]===q); return f?f[1]:"Auto"; }
+
 async function play(fileId, title, resumeMs, knownDurMs){
   const modal=document.getElementById("modal"), video=document.getElementById("video");
   wirePlayer();
   document.getElementById("playTitle").textContent=title;
   modal.classList.add("open");
   setLoading(true,"Reading media…","checking the file on the server");
-  let decision; try{ decision=await api(`/files/${fileId}/decision?profile=web-h264`);}catch(e){ setLoading(false); toast(e.message); return closePlayer(); }
+  let decision; try{ decision=await api(`/files/${fileId}/decision?${CAPS_Q}&force=${qualityForce()}`);}catch(e){ setLoading(false); toast(e.message); return closePlayer(); }
   const startSec=(resumeMs||0)/1000;
   teardownHls();
   const src=decision.source||{};
@@ -844,7 +879,7 @@ async function play(fileId, title, resumeMs, knownDurMs){
     markers:(decision.markers||[]).map(m=>({...m})), source:src, started:false,
     idleTimer:null, autoskip:autoskipOn(), stallTimer:null, probeUrl:null, triedFallback:false,
     aoffset:decision.audio_offset_ms||0, declared:decision.declared_offset_ms||0,
-    title, };
+    reasons:(decision.reasons||[]), title, };
   if(PLAYER.curAudio<0) PLAYER.curAudio=0;
   setupAirplay(video);
   setupTrackMenus();
@@ -858,7 +893,7 @@ async function play(fileId, title, resumeMs, knownDurMs){
   if(decision.method==='transcode'){
     // Transcode: start an HLS session (server re-encodes + tone-maps).
     setLoading(true,"Starting the transcoder…",transcodeReason(decision));
-    let info; try{ info=await api(`/files/${fileId}/hls/start?height=720&start=${startSec.toFixed(1)}`);}catch(e){ setLoading(false); toast(e.message); return closePlayer(); }
+    let info; try{ info=await api(`/files/${fileId}/hls/start?height=${transcodeHeight()}&start=${startSec.toFixed(1)}`);}catch(e){ setLoading(false); toast(e.message); return closePlayer(); }
     PLAYER.offset = info.start_seconds||0;
     PLAYER.encoder = info.encoder||null;
     setLoading(true,"Preparing the stream…",(PLAYER.encoder?("encoder: "+PLAYER.encoder+" — "):"")+"buffering the first segments");
@@ -870,7 +905,9 @@ async function play(fileId, title, resumeMs, knownDurMs){
     setLoading(true,isRemux?"Preparing the stream…":"Loading…",
       isRemux?"remuxing to a browser-friendly container":"direct play — no conversion needed");
     let url=tok(decision.play_url);
-    if(isRemux){ PLAYER.offset=startSec; if(startSec>0) url+="&start="+startSec.toFixed(1); }
+    // Remux carries the same caps so the server copies the audio when the
+    // browser can play it (Safari + AC-3) instead of re-encoding to AAC.
+    if(isRemux){ url+="&"+CAPS_Q; PLAYER.offset=startSec; if(startSec>0) url+="&start="+startSec.toFixed(1); }
     if(isRemux){ PLAYER.probeUrl=decision.play_url; armStall(); }
     video.src=url;
     video.onloadedmetadata=()=>{ if(!isRemux && startSec>0){ try{video.currentTime=startSec}catch(e){} } };
@@ -911,7 +948,7 @@ async function startTranscodeFallback(){
   if(!me || !me.fileId || !v) return;
   const startSec=(me.offset||0)+(v.currentTime||0);
   teardownHls();
-  let info; try{ info=await api(`/files/${me.fileId}/hls/start?height=720&start=${startSec.toFixed(1)}`);}catch(e){ if(PLAYER===me){ setLoading(false); toast(e.message); } return; }
+  let info; try{ info=await api(`/files/${me.fileId}/hls/start?height=${transcodeHeight()}&start=${startSec.toFixed(1)}`);}catch(e){ if(PLAYER===me){ setLoading(false); toast(e.message); } return; }
   if(PLAYER!==me) return;   // the user closed the player / started something else
   me.method='transcode'; me.offset=info.start_seconds||0; me.encoder=info.encoder||null;
   me.probeUrl=info.playlist_url; armStall();
@@ -1048,12 +1085,12 @@ async function seekTo(targetSec){
   teardownHls();
   [...v.querySelectorAll("track")].forEach(t=>t.remove());
   if(PLAYER.method==='transcode'){
-    let info; try{ info=await api(`/files/${PLAYER.fileId}/hls/start?height=720&start=${targetSec.toFixed(1)}&audio=${aidx}`);}catch(e){ setLoading(false); return toast(e.message); }
+    let info; try{ info=await api(`/files/${PLAYER.fileId}/hls/start?height=${transcodeHeight()}&start=${targetSec.toFixed(1)}&audio=${aidx}`);}catch(e){ setLoading(false); return toast(e.message); }
     PLAYER.offset=info.start_seconds||0; PLAYER.encoder=info.encoder||null;
     attachHls(v, info.playlist_url);
   } else {
     PLAYER.method='remux'; PLAYER.offset=targetSec;
-    v.src=tok(`/api/v1/files/${PLAYER.fileId}/stream.mp4`)+`&audio=${aidx}&start=${targetSec.toFixed(1)}`;
+    v.src=tok(`/api/v1/files/${PLAYER.fileId}/stream.mp4`)+`&${CAPS_Q}&audio=${aidx}&start=${targetSec.toFixed(1)}`;
     v.play().catch(()=>{});
   }
   if(curSub>=0) setTimeout(()=>setSub(curSub),400);
@@ -1088,11 +1125,30 @@ function toggleMenu(kind){
     m.innerHTML=PLAYER.audio.map((a,i)=>`<button class="${PLAYER.curAudio===i?'sel':''}" onclick="switchAudio(${i})">${esc(audioLabelMenu(a,i))}</button>`).join("");
   } else if(kind==="sync"){
     m.innerHTML=syncMenuHtml();
+  } else if(kind==="quality"){
+    m.innerHTML=`<div class="amsec">Quality</div>`+QUALITIES.map(([v,l])=>{
+      const note=v==="auto"?" — automatic":v==="original"?" — max, no transcode":"";
+      return `<button class="${playQuality()===v?'sel':''}" onclick="setQuality('${v}')">${l}${note}</button>`;
+    }).join("");
   } else {
     m.innerHTML=`<button class="${PLAYER.curSub<0?'sel':''}" onclick="setSub(-1)">Off</button>`+
       PLAYER.subs.map(s=>`<button class="${PLAYER.curSub===s.index?'sel':''}" onclick="setSub(${s.index})">${esc(subLabelMenu(s))}</button>`).join("");
   }
   m.classList.add("on");
+}
+
+// ---- quality override -----------------------------------------------------
+// Auto follows the automatic ladder; Original forces direct/remux (no video
+// transcode); a height forces a transcode. Changing it restarts at position.
+function setQuality(q){
+  try{ localStorage.setItem("plurx_quality", q); }catch(e){}
+  const m=document.getElementById("pmenu"); if(m) m.classList.remove("on");
+  toast("Quality: "+qualityLabel());
+  if(PLAYER && PLAYER.fileId){
+    const v=document.getElementById("video");
+    const pos=(PLAYER.offset||0)+((v&&v.currentTime)||0);
+    play(PLAYER.fileId, PLAYER.title||"", Math.round(pos*1000), PLAYER.knownDur||0);
+  }
 }
 
 // ---- audio sync (A/V offset) ----------------------------------------------
@@ -1156,13 +1212,13 @@ async function switchAudio(idx){
   const curSub=PLAYER.curSub;
   [...v.querySelectorAll("track")].forEach(t=>t.remove()); // re-added below if a sub was on
   if(PLAYER.method==='transcode'){
-    let info; try{ info=await api(`/files/${PLAYER.fileId}/hls/start?height=720&start=${pos.toFixed(1)}&audio=${aidx}`);}catch(e){ return toast(e.message); }
+    let info; try{ info=await api(`/files/${PLAYER.fileId}/hls/start?height=${transcodeHeight()}&start=${pos.toFixed(1)}&audio=${aidx}`);}catch(e){ return toast(e.message); }
     PLAYER.offset=info.start_seconds||0; PLAYER.encoder=info.encoder||null;
     attachHls(v, info.playlist_url);
   } else {
     // Switching audio forces a remux so the chosen track is the one delivered.
     PLAYER.method='remux'; PLAYER.offset=pos;
-    v.src=tok(`/api/v1/files/${PLAYER.fileId}/stream.mp4`)+`&audio=${aidx}&start=${pos.toFixed(1)}`;
+    v.src=tok(`/api/v1/files/${PLAYER.fileId}/stream.mp4`)+`&${CAPS_Q}&audio=${aidx}&start=${pos.toFixed(1)}`;
     v.play().catch(()=>{});
   }
   toast("Audio: "+(langName(track&&track.language)||("Track "+(idx+1))));
@@ -1211,6 +1267,7 @@ function updateStats(){
   ov.innerHTML=
     `<div class="sechd">Playback</div>`+
     `<div><b>Method</b>${esc(method)}</div>`+
+    ((PLAYER.reasons&&PLAYER.reasons.length)?`<div><b>Reason</b>${esc(PLAYER.reasons.join("; "))}</div>`:"")+
     `<div><b>Position</b>${clockFromSec((PLAYER.offset||0)+(v.currentTime||0))}${durTxt}${rate}</div>`+
     `<div class="sechd">Source</div>`+
     `<div><b>Video</b>${esc(srcVideo)}</div>`+

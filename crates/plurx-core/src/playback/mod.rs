@@ -36,6 +36,58 @@ pub fn default_profile() -> &'static DeviceProfile {
     profile("web-h264").expect("web-h264 profile exists")
 }
 
+/// Build an ad-hoc profile from a client's runtime-probed capabilities. The web
+/// player detects what the *actual* browser can decode (`canPlayType` /
+/// `MediaSource.isTypeSupported`) and reports it, so a file only transcodes when
+/// this specific browser genuinely can't play it — this is the runtime-probe
+/// refinement the fixed named profiles were always a placeholder for.
+///
+/// `supports_hdr` must fold in the display: HDR is only claimed when the screen
+/// is HDR-capable, so HDR-on-SDR still tone-maps (grey/washed-out otherwise).
+/// Resolution is intentionally *not* capped to the display — a decodable 4K
+/// stream direct-plays and the browser downscales, per "direct play when it
+/// works."
+pub fn caps_profile(
+    containers: Vec<String>,
+    video_codecs: Vec<String>,
+    audio_codecs: Vec<String>,
+    max_height: Option<i64>,
+    supports_hdr: bool,
+) -> DeviceProfile {
+    DeviceProfile {
+        name: "client-caps".to_owned(),
+        description: "runtime-probed browser capabilities".to_owned(),
+        containers,
+        video_codecs,
+        audio_codecs,
+        max_height,
+        max_bitrate: None,
+        supports_hdr,
+    }
+}
+
+/// A manual override from the player's quality menu. `Auto` runs the normal
+/// ladder; `Original` never transcodes video (direct/remux only — the caller's
+/// error-fallback rescues an undecodable pick); `Transcode` forces a re-encode
+/// at a client-chosen height (the height rides on the HLS start request, not
+/// the verdict).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Force {
+    Auto,
+    Original,
+    Transcode,
+}
+
+impl Force {
+    pub fn parse(s: &str) -> Force {
+        match s {
+            "original" => Force::Original,
+            "transcode" => Force::Transcode,
+            _ => Force::Auto,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeviceProfile {
     #[serde(default)]
@@ -93,8 +145,28 @@ pub struct Decision {
     pub container: &'static str,
 }
 
-/// Decide how to play `file` on a device described by `profile`.
-pub fn decide(file: &MediaFile, profile: &DeviceProfile) -> Decision {
+/// The per-dimension compatibility verdicts, shared by [`decide`] and
+/// [`decide_forced`] so the two never drift.
+struct Checks {
+    video_ok: bool,
+    height_ok: bool,
+    bitrate_ok: bool,
+    hdr_ok: bool,
+    container_ok: bool,
+    audio_ok: bool,
+}
+
+impl Checks {
+    /// True when only the container and/or audio codec differ — copy-video
+    /// remux territory (nothing needs a video re-encode).
+    fn needs_transcode(&self) -> bool {
+        !self.video_ok || !self.height_ok || !self.bitrate_ok || !self.hdr_ok
+    }
+}
+
+/// Run every compatibility check, collecting human reasons for the ones that
+/// fail (empty ⇒ direct-playable, profile-wise).
+fn evaluate(file: &MediaFile, profile: &DeviceProfile) -> (Checks, Vec<String>) {
     let mut reasons = Vec::new();
 
     let video_ok = file.video_codec.is_none() || profile.allows_video(&file.video_codec);
@@ -124,7 +196,7 @@ pub fn decide(file: &MediaFile, profile: &DeviceProfile) -> Decision {
     let hdr_ok = file.hdr.is_none() || profile.supports_hdr;
     if !hdr_ok {
         reasons.push(format!(
-            "HDR ({}) unsupported; tone-map required",
+            "HDR ({}) needs tone-mapping for this display",
             file.hdr.as_deref().unwrap_or("hdr")
         ));
     }
@@ -132,7 +204,7 @@ pub fn decide(file: &MediaFile, profile: &DeviceProfile) -> Decision {
     let container_ok = profile.allows_container(&file.container);
     if !container_ok {
         reasons.push(format!(
-            "container {} unsupported",
+            "container {} not browser-native",
             file.container.as_deref().unwrap_or("unknown")
         ));
     }
@@ -155,6 +227,26 @@ pub fn decide(file: &MediaFile, profile: &DeviceProfile) -> Decision {
         ));
     }
 
+    (
+        Checks {
+            video_ok,
+            height_ok,
+            bitrate_ok,
+            hdr_ok,
+            container_ok,
+            audio_ok,
+        },
+        reasons,
+    )
+}
+
+/// Decide how to play `file` on a device described by `profile` — the automatic
+/// ladder: direct play when everything matches, remux for a container/audio
+/// mismatch (copy video, maybe re-encode audio), transcode only when the video
+/// itself won't decode (codec/resolution/bitrate/HDR).
+pub fn decide(file: &MediaFile, profile: &DeviceProfile) -> Decision {
+    let (c, mut reasons) = evaluate(file, profile);
+
     // A manual A/V sync correction can only be applied by ffmpeg, so direct
     // play is off the table for that file — remux at minimum.
     let has_av_offset = file.audio_offset_ms != 0;
@@ -165,13 +257,9 @@ pub fn decide(file: &MediaFile, profile: &DeviceProfile) -> Decision {
         ));
     }
 
-    // Video/res/bitrate/HDR problems force a transcode; only a container or
-    // audio mismatch (or the A/V offset) is remuxable (copy video, maybe
-    // re-encode audio).
-    let needs_transcode = !video_ok || !height_ok || !bitrate_ok || !hdr_ok;
-    let method = if needs_transcode {
+    let method = if c.needs_transcode() {
         PlaybackMethod::Transcode
-    } else if !container_ok || !audio_ok || has_av_offset {
+    } else if !c.container_ok || !c.audio_ok || has_av_offset {
         PlaybackMethod::Remux
     } else {
         PlaybackMethod::DirectPlay
@@ -180,8 +268,43 @@ pub fn decide(file: &MediaFile, profile: &DeviceProfile) -> Decision {
     Decision {
         method,
         reasons,
-        transcode_audio: !audio_ok,
+        transcode_audio: !c.audio_ok,
         container: "mp4",
+    }
+}
+
+/// Like [`decide`], but honoring a manual quality override from the player.
+pub fn decide_forced(file: &MediaFile, profile: &DeviceProfile, force: Force) -> Decision {
+    match force {
+        Force::Auto => decide(file, profile),
+        Force::Transcode => {
+            let (_, mut reasons) = evaluate(file, profile);
+            reasons.insert(0, "forced transcode (manual quality)".to_owned());
+            Decision {
+                method: PlaybackMethod::Transcode,
+                reasons,
+                transcode_audio: true,
+                container: "mp4",
+            }
+        }
+        Force::Original => {
+            // Never re-encode video: direct-play when the browser can take the
+            // container + audio, else a copy-video remux. If the pick turns out
+            // undecodable, the client's error path falls back to transcode.
+            let (c, _) = evaluate(file, profile);
+            let has_av_offset = file.audio_offset_ms != 0;
+            let method = if c.container_ok && c.audio_ok && !has_av_offset {
+                PlaybackMethod::DirectPlay
+            } else {
+                PlaybackMethod::Remux
+            };
+            Decision {
+                method,
+                reasons: vec!["forced original quality (no video transcode)".to_owned()],
+                transcode_audio: !c.audio_ok,
+                container: "mp4",
+            }
+        }
     }
 }
 
@@ -270,5 +393,91 @@ mod tests {
         let d = decide(&f, default_profile());
         assert_eq!(d.method, PlaybackMethod::Transcode);
         assert!(d.reasons.iter().any(|r| r.contains("HDR")));
+    }
+
+    // A browser that reports HEVC (e.g. Safari) turns a would-be transcode into
+    // a copy-video remux — the whole point of runtime capability probing.
+    #[test]
+    fn hevc_direct_or_remuxes_when_browser_reports_it() {
+        let hevc_mp4 = file("mp4", "hevc", "aac");
+        let caps = caps_profile(
+            vec!["mp4".into(), "webm".into()],
+            vec!["h264".into(), "hevc".into()],
+            vec!["aac".into(), "opus".into()],
+            None,
+            false,
+        );
+        assert_eq!(decide(&hevc_mp4, &caps).method, PlaybackMethod::DirectPlay);
+        // Same codecs, MKV container → remux (copy video), not transcode.
+        let hevc_mkv = file("mkv", "hevc", "aac");
+        assert_eq!(decide(&hevc_mkv, &caps).method, PlaybackMethod::Remux);
+    }
+
+    #[test]
+    fn caps_hdr_flag_gates_tone_mapping() {
+        let mut f = file("mp4", "hevc", "aac");
+        f.hdr = Some("hdr10".to_owned());
+        let sdr = caps_profile(
+            vec!["mp4".into()],
+            vec!["hevc".into()],
+            vec!["aac".into()],
+            None,
+            false,
+        );
+        assert_eq!(decide(&f, &sdr).method, PlaybackMethod::Transcode); // SDR display → tone-map
+        let hdr = caps_profile(
+            vec!["mp4".into()],
+            vec!["hevc".into()],
+            vec!["aac".into()],
+            None,
+            true,
+        );
+        assert_eq!(decide(&f, &hdr).method, PlaybackMethod::DirectPlay); // HDR display → direct
+    }
+
+    #[test]
+    fn four_k_direct_plays_when_uncapped() {
+        let mut f = file("mp4", "h264", "aac");
+        f.height = Some(2160);
+        // No max_height in caps → a decodable 4K stream direct-plays (browser
+        // downscales on a smaller screen).
+        let caps = caps_profile(
+            vec!["mp4".into()],
+            vec!["h264".into()],
+            vec!["aac".into()],
+            None,
+            false,
+        );
+        assert_eq!(decide(&f, &caps).method, PlaybackMethod::DirectPlay);
+    }
+
+    #[test]
+    fn forced_original_never_transcodes_video() {
+        // HEVC the browser can't take would auto-transcode; Original forces a
+        // copy-video remux instead (client rescues if it truly won't decode).
+        let hevc = file("mkv", "hevc", "aac");
+        let d = decide_forced(&hevc, default_profile(), Force::Original);
+        assert_eq!(d.method, PlaybackMethod::Remux);
+        assert!(decide(&hevc, default_profile()).method == PlaybackMethod::Transcode);
+    }
+
+    #[test]
+    fn forced_transcode_overrides_a_direct_playable_file() {
+        let mp4 = file("mp4", "h264", "aac");
+        assert_eq!(
+            decide(&mp4, default_profile()).method,
+            PlaybackMethod::DirectPlay
+        );
+        let d = decide_forced(&mp4, default_profile(), Force::Transcode);
+        assert_eq!(d.method, PlaybackMethod::Transcode);
+    }
+
+    #[test]
+    fn forced_auto_matches_plain_decide() {
+        let mkv = file("mkv", "h264", "ac3");
+        assert_eq!(
+            decide_forced(&mkv, default_profile(), Force::Auto).method,
+            decide(&mkv, default_profile()).method
+        );
     }
 }

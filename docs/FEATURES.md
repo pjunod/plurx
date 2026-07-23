@@ -103,11 +103,29 @@ and delivers it. Full decision logic is [ARCHITECTURE.md](ARCHITECTURE.md) §3.
   - **Direct play** — HTTP range serving of the untouched file; zero transcode
     CPU. The goal state.
   - **Remux** — MKV → fragmented-MP4 with `-c:v copy`; audio re-encoded only when
-    the target can't take it. Fixes "right codecs, wrong container."
+    the target can't take it. Fixes "right codecs, wrong container." (HEVC copy
+    is tagged `hvc1` so Safari accepts it; `delay_moov` lets AC-3/E-AC-3 copy
+    through the fragmented muxer.)
   - **Transcode** — hardware-first (NVENC / QSV / VA-API / VideoToolbox) with a
     software x264 fallback, delivered as **HLS**.
+- **Runtime capability probing — direct-play whenever the browser can.** The web
+  player detects what *this* browser actually decodes (`canPlayType` /
+  `MediaSource.isTypeSupported` — HEVC, AV1, VP9, AC-3/E-AC-3, Opus, FLAC) and
+  sends it with the decision request, so a file only transcodes when this
+  browser genuinely can't play it. Safari keeps HEVC (direct for HEVC MP4, a
+  copy-remux for HEVC MKV); every browser keeps its own audio codecs instead of
+  a needless AAC re-encode. Native/`?profile=` clients still use the named
+  profiles — the caps are an override, fully back-compatible.
 - **HDR → SDR tone-mapping** on transcode so 4K HDR looks right on an SDR screen
-  (zscale default, libplacebo opt-in).
+  (zscale default, libplacebo opt-in). HDR direct-plays *only* on an HDR display
+  (probed via `matchMedia('(dynamic-range: high)')`); on an SDR screen it
+  tone-maps rather than showing washed-out grey. A decodable 4K stream
+  direct-plays on a smaller screen (the browser downscales) — resolution isn't
+  capped to the display.
+- **Manual quality override:** the player's **◆ Quality** menu — *Auto*
+  (the automatic ladder), *Original* (never transcode video: direct/remux, with
+  the error-path rescuing an undecodable pick), or a forced *1080p / 720p / 480p*
+  transcode. Persists per browser; switching restarts at the current position.
 - **Resume everywhere:** client-seek for direct play, server fast-seek for remux,
   offset-based session for transcode.
 - **Multi-track audio:** pick any audio track from the player; a non-default pick
