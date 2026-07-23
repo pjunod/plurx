@@ -32,8 +32,9 @@ become a stream — every direct/remux/transcode fork and the per-browser
 transport choice behind it. Scope and the phased
 plan live in [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) and
 [docs/ROADMAP.md](docs/ROADMAP.md); client strategy in
-[docs/CLIENTS.md](docs/CLIENTS.md); deploy recipes in
-[deploy/README.md](deploy/README.md).
+[docs/CLIENTS.md](docs/CLIENTS.md); the trust model — who can reach what, and
+what plurx leaves to the reverse proxy — in [docs/SECURITY.md](docs/SECURITY.md);
+deploy recipes in [deploy/README.md](deploy/README.md).
 
 ## What it looks like
 
