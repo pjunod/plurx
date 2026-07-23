@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- noirr midnight palette (brand/tokens.css). -->
+    <color name="plurx_bg">#0A0A0C</color>
+    <color name="plurx_accent">#E5484D</color>
+    <color name="ic_launcher_background">#0A0A0C</color>
+</resources>

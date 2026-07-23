@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Compose owns the real theming (see ui/theme/Theme.kt). This is just the
+         launch/window backdrop so the app opens on midnight black, not white. -->
+    <style name="Theme.Plurx" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/plurx_bg</item>
+        <item name="android:statusBarColor">@color/plurx_bg</item>
+        <item name="android:navigationBarColor">@color/plurx_bg</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>
