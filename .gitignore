@@ -5,5 +5,7 @@
 *.db-wal
 _to_delete/
 .DS_Store
+# Git bundles are a delivery/transfer artifact, not source — never commit them.
+*.bundle
 deploy/docker-compose.override.yml
 deploy/.env
