@@ -78,7 +78,7 @@ Full symptom→cause table: [OPERATIONS.md](OPERATIONS.md#common-problems--cause
 | Data (db, artwork, transcode cache) | `PLURX_DATA_DIR` (default `./data`; Docker volume `plurx-data` → `/var/lib/plurx`) |
 | Config file | `./plurx.toml` → `/etc/plurx/plurx.toml` (or `PLURX_CONFIG`) |
 | Runtime settings (TMDB key, libraries, users) | In the database, edited in Settings — not the config file |
-| Deploy templates | [`deploy/`](../deploy) — Compose, systemd, Unraid |
+| Deploy templates | [`deploy/`](../deploy) — Compose, systemd, launchd (macOS), Unraid |
 | Crates | `plurx-core` (domain + Store) · `plurxd` (HTTP daemon + web app) · `plurx-compat-plex` (Plex façade) |
 
 ## Reference — env vars

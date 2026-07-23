@@ -134,8 +134,9 @@ layers defaults → `plurx.toml` → `PLURX_*` env (full table in
 [docs/OPERATIONS.md](docs/OPERATIONS.md#configuration-surface)).
 
 **Full guides.** [deploy/README.md](deploy/README.md) is the complete
-**install & setup** reference — every target (Compose, bare metal, Unraid,
-TrueNAS/Kubernetes, systemd), GPU passthrough, and ports.
+**install & setup** reference — every target (Compose, bare metal, a systemd
+service on Linux, a launchd agent on macOS, Unraid, TrueNAS/Kubernetes), GPU
+passthrough, and ports.
 [docs/OPERATIONS.md](docs/OPERATIONS.md) is **operations** — running it day to
 day and reading every status, log, and stats line it shows you.
 [docs/CHEATSHEET.md](docs/CHEATSHEET.md) is the **cheat sheet** — the
@@ -194,7 +195,7 @@ live, filterable log viewer. Full guide: [docs/OPERATIONS.md](docs/OPERATIONS.md
 | [`crates/plurxd`](crates/plurxd) | The HTTP daemon (axum) · transcode orchestrator · the embedded single-file web app |
 | [`crates/plurx-compat-plex`](crates/plurx-compat-plex) | Plex Media Server API façade + GDM discovery responder |
 | [`docs/`](docs) | Architecture · features · operations · cheat sheet · requirements · roadmap · clients |
-| [`deploy/`](deploy) | Docker/Compose, systemd, and Unraid templates |
+| [`deploy/`](deploy) | Docker/Compose, systemd unit, macOS launchd agent, and Unraid templates |
 
 ## Status
 

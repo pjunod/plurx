@@ -15,11 +15,17 @@ Environment=PLURX_BIND=0.0.0.0:32600
 # Environment=PLURX_FFMPEG=/usr/lib/jellyfin-ffmpeg/ffmpeg
 Restart=on-failure
 RestartSec=5
+# Hardware transcode: give the service user the GPU render node. Uncomment and
+# match your host's group (`stat -c '%G' /dev/dri/renderD128`, often `render`).
+# SupplementaryGroups=render
 # Hardening
 NoNewPrivileges=true
 ProtectSystem=strict
 ReadWritePaths=/var/lib/plurx
 ProtectHome=true
+# Media usually lives under /home or /mnt; ProtectHome=true hides /home, so if
+# your library is there, either move ReadOnlyPaths in or set ProtectHome=read-only.
+# ReadOnlyPaths=/mnt/media
 
 [Install]
 WantedBy=multi-user.target

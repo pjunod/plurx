@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  plurx as a macOS launchd service (a LaunchAgent — it runs in your login
+  session, which is what keeps VideoToolbox hardware transcoding available;
+  a boot-time LaunchDaemon has no GUI session and falls back to software).
+
+  launchd does NOT expand ~ or $HOME, so every path below is absolute. Don't
+  hand-edit YOUR_USERNAME — the install command in deploy/README.md substitutes
+  your real username + the real plurxd/ffmpeg paths with sed.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.plurx.plurxd</string>
+
+    <!-- The binary + subcommand. `run` is the default, but naming it is clear.
+         Apple Silicon Homebrew installs to /opt/homebrew/bin. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/plurxd</string>
+        <string>run</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PLURX_DATA_DIR</key>
+        <string>/Users/YOUR_USERNAME/Library/Application Support/plurx</string>
+        <!-- 0.0.0.0 = reachable from other devices on your LAN; 127.0.0.1 to
+             keep it to this Mac only. macOS may prompt to allow incoming
+             connections the first time. -->
+        <key>PLURX_BIND</key>
+        <string>0.0.0.0:32600</string>
+        <!-- ffmpeg/ffprobe for scanning + remux/transcode. `brew install ffmpeg`
+             satisfies this; point these at jellyfin-ffmpeg for the best
+             tone-mapping if you prefer. -->
+        <key>PLURX_FFMPEG</key>
+        <string>/usr/local/bin/ffmpeg</string>
+        <key>PLURX_FFPROBE</key>
+        <string>/usr/local/bin/ffprobe</string>
+    </dict>
+
+    <!-- Start at login, and restart if it crashes — but stay down when you
+         stop it on purpose. Mirrors the systemd unit's Restart=on-failure. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <!-- Normal scheduling priority — do NOT set ProcessType=Background here, it
+         throttles CPU/IO and would choke a transcode. -->
+    <key>ProcessType</key>
+    <string>Standard</string>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/YOUR_USERNAME/Library/Application Support/plurx</string>
+
+    <!-- Combined stdout+stderr; `tail -f` this to watch startup + transcode. -->
+    <key>StandardOutPath</key>
+    <string>/Users/YOUR_USERNAME/Library/Logs/plurxd.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/YOUR_USERNAME/Library/Logs/plurxd.log</string>
+</dict>
+</plist>
