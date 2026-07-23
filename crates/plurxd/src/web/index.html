@@ -592,6 +592,24 @@ function card(it, wide){
 function grid(items){ return items.length? `<div class="grid">${items.map(i=>card(i)).join("")}</div>` : `<div class="empty">Nothing here yet.</div>`; }
 
 // ---- views ----------------------------------------------------------------
+// Home library grouping: "share" (one section per library, the default) or
+// "category" (Movies / TV Shows, merging shares of the same kind). Persisted
+// in localStorage like the other viewing prefs.
+function homeGroup(){ try{ return localStorage.getItem("plurx_home_group")||"share"; }catch(e){ return "share"; } }
+function setHomeGroup(v){ try{ localStorage.setItem("plurx_home_group",v); }catch(e){} viewHome(); }
+function libCategory(lib){
+  if(lib.kind==="movie") return {key:"movie", name:"Movies"};
+  if(lib.kind==="show")  return {key:"show",  name:"TV Shows"};
+  const k=lib.kind||"other";
+  return {key:k, name:k.charAt(0).toUpperCase()+k.slice(1)};
+}
+function catOrder(key){ return key==="movie"?0:key==="show"?1:2; }
+function groupToggleHtml(group){
+  return `<div class="libbar" style="margin-top:22px"><div class="row">
+    <span class="lbl">Group by</span>
+    <select onchange="setHomeGroup(this.value)">${libOpt("share","Share name",group)}${libOpt("category","Category",group)}</select>
+  </div></div>`;
+}
 async function viewHome(){
   chrome("home", `<div id="hubs"><div class="empty">Loading…</div></div>`);
   const [libs, hubs] = await Promise.all([api("/libraries"), api("/hubs")]);
@@ -599,11 +617,32 @@ async function viewHome(){
   if(hubs.continue_watching.length){ html+=`<h2 class="section">Continue watching</h2><div class="rowscroll">${hubs.continue_watching.map(i=>card(i,true)).join("")}</div>`; }
   if(hubs.next_up && hubs.next_up.length){ html+=`<h2 class="section">Next up</h2><div class="rowscroll">${hubs.next_up.map(i=>card(i,i.kind==='episode')).join("")}</div>`; }
   if(hubs.recently_added.length){ html+=`<h2 class="section">Recently added</h2><div class="rowscroll">${hubs.recently_added.map(i=>card(i,i.kind==='episode')).join("")}</div>`; }
-  for(const lib of libs){
-    const page=await api(`/libraries/${lib.id}/items?limit=24&sort=added`);
-    html+=`<h2 class="section">${esc(lib.name)} <a class="muted" style="font-size:12px" href="#/library/${lib.id}">· view all (${page.total})</a></h2>${grid(page.items)}`;
+  if(libs.length){
+    const group=homeGroup();
+    html+=groupToggleHtml(group);
+    if(group==="category"){
+      // Bucket libraries by category, keeping Movies before TV before others.
+      const order=[], byKey={};
+      for(const lib of libs){ const c=libCategory(lib); if(!byKey[c.key]){ byKey[c.key]={cat:c,libs:[]}; order.push(c.key); } byKey[c.key].libs.push(lib); }
+      order.sort((a,b)=>catOrder(a)-catOrder(b)||a.localeCompare(b));
+      for(const key of order){
+        const g=byKey[key];
+        const pages=await Promise.all(g.libs.map(l=>api(`/libraries/${l.id}/items?limit=24&sort=added`)));
+        const items=[].concat(...pages.map(p=>p.items)).slice(0,24);
+        const total=pages.reduce((n,p)=>n+(p.total||0),0);
+        // One share in this category → link straight to it; several → merged category page.
+        const href = g.libs.length===1 ? `#/library/${g.libs[0].id}` : `#/category/${encodeURIComponent(key)}`;
+        html+=`<h2 class="section">${esc(g.cat.name)} <a class="muted" style="font-size:12px" href="${href}">· view all (${total})</a></h2>${grid(items)}`;
+      }
+    } else {
+      for(const lib of libs){
+        const page=await api(`/libraries/${lib.id}/items?limit=24&sort=added`);
+        html+=`<h2 class="section">${esc(lib.name)} <a class="muted" style="font-size:12px" href="#/library/${lib.id}">· view all (${page.total})</a></h2>${grid(page.items)}`;
+      }
+    }
+  } else {
+    html+=`<div class="empty">No libraries yet.${ME.is_admin?' Add one in <a href="#/settings">Settings</a>.':''}</div>`;
   }
-  if(!libs.length){ html=`<div class="empty">No libraries yet.${ME.is_admin?' Add one in <a href="#/settings">Settings</a>.':''}</div>`; }
   document.getElementById("main").innerHTML=html||`<div class="empty">Nothing here yet.</div>`;
 }
 let LIB_SORT="title", LIB_FILTER="all";
@@ -634,6 +673,34 @@ async function viewLibrary(id){
     <span class="muted" style="font-size:13px">${items.length} item${items.length===1?'':'s'}${capNote}</span></div>`;
   const body = items.length? grid(items) : `<div class="empty">Nothing matches this filter.</div>`;
   document.getElementById("main").innerHTML=`<h2 class="section" style="margin-bottom:10px">${esc(lib?lib.name:'Library')}</h2>${bar}${body}`;
+}
+// "View all" for a category that spans more than one share: merge their items,
+// then apply the same client-side sort/filter as a single library.
+async function viewCategory(key){
+  chrome("home",`<div class="empty">Loading…</div>`);
+  const libs=(await api("/libraries")).filter(l=>libCategory(l).key===key);
+  if(!libs.length){ document.getElementById("main").innerHTML=`<div class="empty">No libraries in this category.</div>`; return; }
+  const cat=libCategory(libs[0]);
+  const pages=await Promise.all(libs.map(l=>api(`/libraries/${l.id}/items?limit=200&sort=${LIB_SORT}`)));
+  let items=[].concat(...pages.map(p=>p.items));
+  // Each share is server-sorted; re-sort the merged set for fields we hold locally.
+  if(LIB_SORT==="title") items.sort((a,b)=>a.title.localeCompare(b.title));
+  else if(LIB_SORT==="year") items.sort((a,b)=>(b.year||0)-(a.year||0));
+  if(LIB_FILTER!=="all") items=items.filter(it=>matchWatch(it,LIB_FILTER));
+  const total=pages.reduce((n,p)=>n+(p.total||0),0);
+  const capNote = total>items.length? ` <span class="muted">(first ${items.length} of ${total})</span>`:"";
+  const bar=`<div class="libbar">
+    <div class="row">
+      <span class="lbl">Sort</span>
+      <select onchange="LIB_SORT=this.value;viewCategory('${key}')">
+        ${libOpt("title","Title (A–Z)",LIB_SORT)}${libOpt("added","Recently added",LIB_SORT)}${libOpt("year","Year",LIB_SORT)}</select>
+      <span class="lbl" style="margin-left:8px">Show</span>
+      <select onchange="LIB_FILTER=this.value;viewCategory('${key}')">
+        ${libOpt("all","Everything",LIB_FILTER)}${libOpt("unwatched","Unwatched",LIB_FILTER)}${libOpt("inprogress","In progress",LIB_FILTER)}${libOpt("watched","Watched",LIB_FILTER)}</select>
+    </div>
+    <span class="muted" style="font-size:13px">${items.length} item${items.length===1?'':'s'}${capNote}</span></div>`;
+  const body = items.length? grid(items) : `<div class="empty">Nothing matches this filter.</div>`;
+  document.getElementById("main").innerHTML=`<h2 class="section" style="margin-bottom:10px">${esc(cat.name)}</h2>${bar}${body}`;
 }
 async function viewSearch(q){
   chrome("home",`<div class="empty">Searching…</div>`);
@@ -1618,6 +1685,7 @@ async function render(){
   try{
     if(h.startsWith("#/item/")) return await viewItem(h.split("/")[2]);
     if(h.startsWith("#/library/")) return await viewLibrary(h.split("/")[2]);
+    if(h.startsWith("#/category/")) return await viewCategory(decodeURIComponent(h.split("/")[2]||""));
     if(h.startsWith("#/search/")) return await viewSearch(decodeURIComponent(h.split("/")[2]||""));
     if(h==="#/activity") return await viewActivity();
     if(h==="#/admin"||h==="#/settings") return await viewSettings();
