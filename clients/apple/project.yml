@@ -1,0 +1,64 @@
+# XcodeGen spec — generates plurx.xcodeproj with an iOS app and a tvOS app that
+# share every Swift file under Sources/. Build:
+#   brew install xcodegen        # once
+#   cd clients/apple && xcodegen generate && open plurx.xcodeproj
+# then set your Signing Team on both targets and Run.
+name: plurx
+options:
+  bundleIdPrefix: tv.plurx
+  createIntermediateGroups: true
+  deploymentTarget:
+    iOS: "17.0"
+    tvOS: "17.0"
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    # Set your Apple Developer team here (or per-target in Xcode's Signing tab).
+    DEVELOPMENT_TEAM: ""
+    CODE_SIGN_STYLE: Automatic
+
+targets:
+  plurx-iOS:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+      - path: Resources        # iOS app icon lives here
+    settings:
+      base:
+        PRODUCT_NAME: plurx
+        PRODUCT_BUNDLE_IDENTIFIER: tv.plurx.app
+        TARGETED_DEVICE_FAMILY: "1,2"          # iPhone + iPad
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
+        INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents: YES
+    info:
+      path: Support/iOS-Info.plist
+      properties:
+        CFBundleDisplayName: plurx
+        # Home servers are usually plain http on the LAN — permit it.
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+
+  plurx-tvOS:
+    type: application
+    platform: tvOS
+    sources:
+      - path: Sources
+    settings:
+      base:
+        PRODUCT_NAME: plurx
+        PRODUCT_BUNDLE_IDENTIFIER: tv.plurx.app
+        # No AppIcon reference: builds/runs in the tvOS Simulator without Brand
+        # Assets. Add an "App Icon & Top Shelf" asset before installing on a
+        # physical Apple TV (see README).
+    info:
+      path: Support/tvOS-Info.plist
+      properties:
+        CFBundleDisplayName: plurx
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
