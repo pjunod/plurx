@@ -82,7 +82,8 @@ async fn session_producing(dir: &std::path::Path) -> bool {
     match tokio::fs::read(dir.join("index.m3u8")).await {
         Ok(bytes) => String::from_utf8_lossy(&bytes).lines().any(|l| {
             let l = l.trim();
-            !l.starts_with('#') && l.ends_with(".ts")
+            // A listed segment: `.ts` (transcode) or `.m4s` (copy fMP4).
+            !l.starts_with('#') && (l.ends_with(".ts") || l.ends_with(".m4s"))
         }),
         Err(_) => false,
     }
@@ -400,6 +401,109 @@ impl TranscodeManager {
         })
     }
 
+    /// Start a **copy-video** HLS session: the source video is repackaged into
+    /// HLS (fMP4 segments) untouched, and only the audio is transcoded when the
+    /// client can't take it. This is the remux path for players whose `<video>`
+    /// won't accept a progressive fragmented MP4 (Safari) but decode HEVC/HDR
+    /// natively via HLS — so the original 4K stream is preserved instead of the
+    /// error-fallback re-encoding it down to 720p. No hardware/software encoder
+    /// ladder (nothing is encoded), just a fail-fast guard.
+    pub async fn start_copy(
+        &self,
+        file_id: i64,
+        start_seconds: f64,
+        audio_override: Option<i64>,
+        transcode_audio: bool,
+        user_name: &str,
+    ) -> Result<StartInfo, String> {
+        let file = self
+            .store
+            .get_file(file_id)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "file not found".to_owned())?;
+        let item_title = self
+            .store
+            .get_item(file.item_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|i| i.title)
+            .unwrap_or_else(|| "(unknown)".to_owned());
+
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let dir = self.work_dir.join(&session_id);
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .map_err(|e| format!("creating session dir: {e}"))?;
+
+        let args = transcode::hls_copy_args(
+            &file,
+            start_seconds,
+            audio_override,
+            transcode_audio,
+            &dir.to_string_lossy(),
+        );
+        tracing::info!(
+            %session_id, file_id, start_seconds,
+            "copy-video HLS ffmpeg args: {}", args.join(" ")
+        );
+        let child = spawn_ffmpeg(&args, "copy", &session_id)?;
+
+        let session = Arc::new(Session {
+            dir: dir.clone(),
+            child: Mutex::new(child),
+            last_access: Mutex::new(Instant::now()),
+            file_id,
+            item_id: file.item_id,
+            item_title,
+            user_name: user_name.to_owned(),
+            target_height: file.height.unwrap_or(0),
+            encoder_label: "copy",
+            started_unix: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
+            failed: AtomicBool::new(false),
+        });
+        self.sessions
+            .lock()
+            .await
+            .insert(session_id.clone(), Arc::clone(&session));
+
+        // Fail-fast guard: copy has no encoder ladder, but if the first segment
+        // never lands (undecodable source, ffmpeg refusal) mark the session
+        // failed so the player errors instead of waiting on a gray screen.
+        {
+            let session = Arc::clone(&session);
+            let dir = dir.clone();
+            let sid = session_id.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(SOFTWARE_GRACE).await;
+                if !session_producing(&dir).await {
+                    tracing::error!(
+                        session = %sid,
+                        "no HLS segment within {}s of copy-video session; failing it",
+                        SOFTWARE_GRACE.as_secs()
+                    );
+                    {
+                        let mut child = session.child.lock().await;
+                        let _ = child.kill().await;
+                    }
+                    session.failed.store(true, Relaxed);
+                }
+            });
+        }
+
+        Ok(StartInfo {
+            playlist_url: format!("/api/v1/hls/{session_id}/index.m3u8"),
+            session_id,
+            duration_ms: file.duration_ms,
+            start_seconds,
+            encoder: "copy",
+        })
+    }
+
     /// Number of live transcode sessions (for /metrics).
     pub async fn active_sessions(&self) -> usize {
         self.sessions.lock().await.len()
@@ -522,8 +626,16 @@ impl TranscodeManager {
 
 /// Only `segNNNNN.ts` names are valid segment requests.
 fn is_safe_segment(name: &str) -> bool {
+    // fMP4 (copy-video) HLS: a single shared init segment.
+    if name == "init.mp4" {
+        return true;
+    }
+    // `segNNNNN.ts` (transcode) or `segNNNNN.m4s` (copy fMP4).
     name.strip_prefix("seg")
-        .and_then(|rest| rest.strip_suffix(".ts"))
+        .and_then(|rest| {
+            rest.strip_suffix(".ts")
+                .or_else(|| rest.strip_suffix(".m4s"))
+        })
         .map(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
         .unwrap_or(false)
 }
@@ -547,9 +659,13 @@ mod tests {
     fn safe_segment_names() {
         assert!(is_safe_segment("seg00000.ts"));
         assert!(is_safe_segment("seg12345.ts"));
+        assert!(is_safe_segment("seg00000.m4s")); // copy fMP4 segment
+        assert!(is_safe_segment("init.mp4")); // copy fMP4 init
         assert!(!is_safe_segment("seg.ts"));
+        assert!(!is_safe_segment("seg.m4s"));
         assert!(!is_safe_segment("../seg00000.ts"));
         assert!(!is_safe_segment("index.m3u8"));
+        assert!(!is_safe_segment("other.mp4"));
         assert!(!is_safe_segment("seg0/../../etc.ts"));
     }
 

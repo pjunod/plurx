@@ -950,7 +950,8 @@ async function play(fileId, title, resumeMs, knownDurMs){
     markers:(decision.markers||[]).map(m=>({...m})), source:src, started:false,
     idleTimer:null, autoskip:autoskipOn(), stallTimer:null, probeUrl:null, triedFallback:false,
     aoffset:decision.audio_offset_ms||0, declared:decision.declared_offset_ms||0,
-    reasons:(decision.reasons||[]), title, };
+    reasons:(decision.reasons||[]), title,
+    transcodeAudio:!!decision.transcode_audio, copyHls:false, };
   if(PLAYER.curAudio<0) PLAYER.curAudio=0;
   setupAirplay(video);
   setupTrackMenus();
@@ -970,8 +971,16 @@ async function play(fileId, title, resumeMs, knownDurMs){
     setLoading(true,"Preparing the stream…",(PLAYER.encoder?("encoder: "+PLAYER.encoder+" — "):"")+"buffering the first segments");
     PLAYER.probeUrl=info.playlist_url; armStall();
     attachHls(video, info.playlist_url);
+  } else if(decision.method!=='direct_play' && useNativeHls(video)){
+    // Safari can't play a progressive fragmented-MP4 remux, but it plays the
+    // same copy-video stream (source video kept, audio transcoded only) via
+    // native HLS. Route it there so it keeps the original resolution instead of
+    // the error-fallback re-encoding to 720p.
+    setLoading(true,"Preparing the stream…","remuxing to HLS — keeping the original video");
+    try{ await startCopyHls(video, startSec); }
+    catch(e){ setLoading(false); toast(e.message); return closePlayer(); }
   } else {
-    // Direct play or remux → native <video> (token in URL: AirPlay-safe).
+    // Direct play, or remux for a browser that plays progressive fMP4 (Chrome).
     const isRemux = decision.method!=='direct_play';
     setLoading(true,isRemux?"Preparing the stream…":"Loading…",
       isRemux?"remuxing to a browser-friendly container":"direct play — no conversion needed");
@@ -989,6 +998,18 @@ async function play(fileId, title, resumeMs, knownDurMs){
   PLAYER.timer=setInterval(()=>reportProgress(fileId), 5000);
   video.onended=()=>{ reportProgress(fileId,true); };
   playerActivity();
+}
+// Open (or re-open) a copy-video HLS session for the current file and attach it
+// as native HLS. The video stream is the server's untouched original; only the
+// audio is transcoded when the browser can't take it. Keeps method === 'remux'
+// (honest: no video re-encode) and flags copyHls so seek / audio-switch re-open
+// the HLS session instead of the progressive /stream.mp4 Safari can't play.
+async function startCopyHls(v, startSec){
+  const track=PLAYER.audio[PLAYER.curAudio]; const aidx=track?track.index:0;
+  const info=await api(`/files/${PLAYER.fileId}/hls/start?copy=1&aac=${PLAYER.transcodeAudio?1:0}&start=${(startSec||0).toFixed(1)}&audio=${aidx}`);
+  PLAYER.offset=info.start_seconds||0; PLAYER.method='remux'; PLAYER.copyHls=true; PLAYER.encoder=info.encoder||null;
+  PLAYER.probeUrl=info.playlist_url; armStall();
+  attachHls(v, info.playlist_url);
 }
 function transcodeReason(d){
   const r=(d.reasons||[]).filter(Boolean);
@@ -1166,6 +1187,9 @@ async function seekTo(targetSec){
     let info; try{ info=await api(`/files/${PLAYER.fileId}/hls/start?height=${transcodeHeight()}&start=${targetSec.toFixed(1)}&audio=${aidx}`);}catch(e){ setLoading(false); return toast(e.message); }
     PLAYER.offset=info.start_seconds||0; PLAYER.encoder=info.encoder||null;
     attachHls(v, info.playlist_url);
+  } else if(PLAYER.copyHls){
+    // Copy-video HLS (Safari): re-open the session at the target position.
+    try{ await startCopyHls(v, targetSec); }catch(e){ setLoading(false); return toast(e.message); }
   } else {
     PLAYER.method='remux'; PLAYER.offset=targetSec;
     v.src=tok(`/api/v1/files/${PLAYER.fileId}/stream.mp4`)+`&${CAPS_Q}&audio=${aidx}&start=${targetSec.toFixed(1)}`;
@@ -1293,6 +1317,9 @@ async function switchAudio(idx){
     let info; try{ info=await api(`/files/${PLAYER.fileId}/hls/start?height=${transcodeHeight()}&start=${pos.toFixed(1)}&audio=${aidx}`);}catch(e){ return toast(e.message); }
     PLAYER.offset=info.start_seconds||0; PLAYER.encoder=info.encoder||null;
     attachHls(v, info.playlist_url);
+  } else if(PLAYER.copyHls){
+    // Copy-video HLS (Safari): re-open with the chosen audio track.
+    try{ await startCopyHls(v, pos); }catch(e){ return toast(e.message); }
   } else {
     // Switching audio forces a remux so the chosen track is the one delivered.
     PLAYER.method='remux'; PLAYER.offset=pos;

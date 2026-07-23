@@ -312,6 +312,114 @@ pub fn hls_args(
     args
 }
 
+/// Build ffmpeg args to *copy* the source video into HLS (fMP4 segments),
+/// transcoding only the audio when the client can't take the source codec.
+///
+/// This is "remux, packaged as HLS". Safari's `<video>` will not play a
+/// progressive fragmented MP4 (the `/stream.mp4` remux) — it only accepts
+/// fragmented content via HLS — but it decodes HEVC/HDR natively through HLS.
+/// So for those clients we keep the original 4K video stream untouched and
+/// repackage it as HLS, instead of letting the player's error-fallback re-encode
+/// the whole thing down to 720p. fMP4 segments (not MPEG-TS) are required: Apple
+/// does not support HEVC in a TS container.
+pub fn hls_copy_args(
+    source: &MediaFile,
+    start_seconds: f64,
+    audio_index: Option<i64>,
+    transcode_audio: bool,
+    out_dir: &str,
+) -> Vec<String> {
+    let source_path = source.path.to_string_lossy().into_owned();
+    let mut args: Vec<String> = vec!["-hide_banner".into(), "-loglevel".into(), "error".into()];
+
+    // Fast input seek for resume/session start.
+    if start_seconds > 0.0 {
+        args.push("-ss".into());
+        args.push(format!("{start_seconds:.3}"));
+    }
+    // Copy runs as fast as the disk allows; `-re` paces it to ~1x real time so a
+    // 4K session doesn't dump the whole file to the session dir at once (and a
+    // seek/abandon is reaped before much lands).
+    args.push("-re".into());
+    args.push("-i".into());
+    args.push(source_path.clone());
+
+    // A per-file A/V sync correction rides in on a second, `-itsoffset`'d input
+    // of the same file, used only for its audio (positive = audio later).
+    let audio_input = if source.audio_offset_ms != 0 {
+        if start_seconds > 0.0 {
+            args.push("-ss".into());
+            args.push(format!("{start_seconds:.3}"));
+        }
+        args.push("-re".into());
+        args.push("-itsoffset".into());
+        args.push(format!("{:.3}", source.audio_offset_ms as f64 / 1000.0));
+        args.push("-i".into());
+        args.push(source_path.clone());
+        1
+    } else {
+        0
+    };
+
+    // Copy the video untouched; map the chosen (or first) audio; drop subs.
+    args.push("-map".into());
+    args.push("0:v:0".into());
+    args.push("-map".into());
+    match audio_index {
+        Some(i) => args.push(format!("{audio_input}:a:{i}?")),
+        None => args.push(format!("{audio_input}:a:0?")),
+    }
+    args.push("-sn".into());
+
+    args.push("-c:v".into());
+    args.push("copy".into());
+    // Safari only decodes HEVC when the sample entry is tagged `hvc1`; MKV HEVC
+    // is commonly `hev1`, which renders black. Harmless if already hvc1.
+    if matches!(source.video_codec.as_deref(), Some("hevc" | "h265")) {
+        args.push("-tag:v".into());
+        args.push("hvc1".into());
+    }
+
+    if transcode_audio {
+        // e.g. DTS/TrueHD → AAC. Keep the source channel layout (5.1 stays 5.1);
+        // a copy-video session implies a player that can take multichannel AAC.
+        args.push("-c:a".into());
+        args.push("aac".into());
+        args.push("-b:a".into());
+        args.push("256k".into());
+    } else {
+        args.push("-c:a".into());
+        args.push("copy".into());
+    }
+
+    // fMP4 HLS. Segments split at existing keyframes (copy can't force them), so
+    // a normally-GOP'd source segments cleanly; the init segment is `init.mp4`.
+    args.extend(
+        [
+            "-f",
+            "hls",
+            "-hls_time",
+            &SEGMENT_SECONDS.to_string(),
+            "-hls_playlist_type",
+            "event",
+            "-hls_flags",
+            "independent_segments+temp_file",
+            "-hls_segment_type",
+            "fmp4",
+            "-hls_fmp4_init_filename",
+            "init.mp4",
+            "-hls_segment_filename",
+            &format!("{out_dir}/seg%05d.m4s"),
+            "-start_number",
+            "0",
+        ]
+        .iter()
+        .map(|s| s.to_string()),
+    );
+    args.push(format!("{out_dir}/index.m3u8"));
+    args
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,6 +526,36 @@ mod tests {
         };
         let args = hls_args(&file(None), Encoder::Software, &opts, "/tmp/s");
         assert!(args.join(" ").contains("subtitles='/media/movie.mkv':si=2"));
+    }
+
+    #[test]
+    fn copy_args_keep_video_and_package_fmp4_hls() {
+        // DTS → AAC, HEVC video copied, delivered as fMP4 HLS (the Safari path).
+        let args = hls_copy_args(&file(Some("hdr10")), 0.0, None, true, "/tmp/sess");
+        let joined = args.join(" ");
+        assert!(joined.contains("-c:v copy"));
+        assert!(joined.contains("-tag:v hvc1")); // HEVC needs hvc1 for Safari
+        assert!(joined.contains("-c:a aac")); // audio transcoded when asked
+        assert!(joined.contains("-hls_segment_type fmp4")); // not mpegts
+        assert!(joined.contains("-hls_fmp4_init_filename init.mp4"));
+        assert!(joined.contains("/tmp/sess/seg%05d.m4s"));
+        assert!(joined.contains("/tmp/sess/index.m3u8"));
+        // No re-encode: none of the transcode machinery leaks in.
+        assert!(!joined.contains("libx264"));
+        assert!(!joined.contains("scale="));
+        assert!(!joined.contains("tonemap"));
+    }
+
+    #[test]
+    fn copy_args_copy_audio_when_supported() {
+        let args = hls_copy_args(&file(None), 30.0, Some(1), false, "/tmp/s");
+        let joined = args.join(" ");
+        assert!(joined.contains("-c:a copy")); // transcode_audio = false
+        assert!(joined.contains("0:a:1?") || joined.contains("a:1?")); // chosen track
+                                                                       // -ss before -i for fast input seek.
+        let ss = args.iter().position(|a| a == "-ss").expect("has -ss");
+        let i = args.iter().position(|a| a == "-i").expect("has -i");
+        assert!(ss < i);
     }
 
     #[test]

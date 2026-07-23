@@ -22,12 +22,19 @@ use crate::state::AppState;
 
 #[derive(Deserialize)]
 pub struct StartQuery {
-    /// Target height (e.g. 1080, 720). Defaults to 1080.
+    /// Target height (e.g. 1080, 720). Defaults to 1080. Ignored when `copy=1`.
     pub height: Option<i64>,
     /// Start offset in seconds (resume / seek).
     pub start: Option<f64>,
     /// Audio stream to use (`a:{audio}`); overrides the automatic pick.
     pub audio: Option<i64>,
+    /// `copy=1` → a copy-video HLS session (repackage the source video into
+    /// fMP4 HLS untouched, transcode audio only). For players that can't take a
+    /// progressive fMP4 remux but decode HEVC/HDR natively via HLS (Safari).
+    pub copy: Option<u8>,
+    /// With `copy`: `aac=1` transcodes the audio to AAC (the codec the client
+    /// can't take), `aac=0` copies it. The client knows which from `/decision`.
+    pub aac: Option<u8>,
 }
 
 #[derive(Serialize)]
@@ -46,19 +53,22 @@ pub async fn start(
     AxPath(id): AxPath<i64>,
     Query(q): Query<StartQuery>,
 ) -> Result<Json<StartResponse>, ApiError> {
-    let height = q.height.unwrap_or(1080).clamp(144, 2160);
     let start = q.start.unwrap_or(0.0).max(0.0);
-    let info = state
-        .transcode
-        .start(
-            id,
-            height,
-            start,
-            q.audio.filter(|a| *a >= 0),
-            &user.username,
-        )
-        .await
-        .map_err(ApiError::Internal)?;
+    let audio = q.audio.filter(|a| *a >= 0);
+    let info = if q.copy == Some(1) {
+        // Copy-video HLS: keep the source video, transcode audio only.
+        state
+            .transcode
+            .start_copy(id, start, audio, q.aac == Some(1), &user.username)
+            .await
+    } else {
+        let height = q.height.unwrap_or(1080).clamp(144, 2160);
+        state
+            .transcode
+            .start(id, height, start, audio, &user.username)
+            .await
+    }
+    .map_err(ApiError::Internal)?;
     Ok(Json(StartResponse {
         session_id: info.session_id,
         playlist_url: info.playlist_url,
@@ -102,10 +112,16 @@ pub async fn segment(
         .segment(&session, &seg)
         .await
         .ok_or(ApiError::NotFound("segment"))?;
+    // MPEG-TS segments (transcode) vs fMP4 init/segments (copy-video path).
+    let content_type = if seg.ends_with(".ts") {
+        "video/mp2t"
+    } else {
+        "video/mp4"
+    };
     Ok((
         StatusCode::OK,
         [
-            (header::CONTENT_TYPE, "video/mp2t".to_owned()),
+            (header::CONTENT_TYPE, content_type.to_owned()),
             (header::CACHE_CONTROL, "no-store".to_owned()),
         ],
         bytes,
