@@ -55,7 +55,9 @@
   .auth{width:100%;max-width:380px}
   .auth h1{margin:.2em 0 .1em}
 
-  h2.section{font-size:15px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:26px 4px 12px}
+  h2.section{font-size:16px;font-weight:600;text-transform:uppercase;letter-spacing:.07em;color:var(--text);margin:26px 4px 14px;padding-top:24px;border-top:1px solid var(--line)}
+  h2.section:first-child{border-top:0;padding-top:4px}
+  .card h2.section{border-top:0;padding-top:0}   /* cards separate their own sections */
   .getapp{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;margin:16px 20px 2px;padding:13px 16px;background:rgba(229,72,77,.08);border:1px solid var(--accent);border-radius:12px}
   .getapp a.btn{display:inline-block;background:var(--accent);color:#fff;padding:8px 15px;border-radius:8px;text-decoration:none;font-weight:600;font-size:14px;white-space:nowrap}
   .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:16px}
