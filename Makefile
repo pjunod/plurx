@@ -3,6 +3,7 @@
 # "green in CI" — there is no second, hidden set of commands.
 
 CARGO ?= cargo
+ANDROID_IMAGE ?= plurx-android-build
 
 .DEFAULT_GOAL := help
 
@@ -60,6 +61,21 @@ hooks: ## Install the git pre-commit hook (runs `make check`)
 	@mkdir -p .git/hooks
 	@install -m 0755 scripts/pre-commit .git/hooks/pre-commit
 	@echo "Installed .git/hooks/pre-commit — bypass a run with 'git commit --no-verify'."
+
+## ---- android client ----------------------------------------------------
+
+.PHONY: android-image
+android-image: ## Build the pinned Android build-env image (JDK 17 + SDK)
+	docker build -t $(ANDROID_IMAGE) clients/android
+
+.PHONY: android
+android: android-image ## Build the Android debug APK in Docker (no host JDK/SDK)
+	docker run --rm \
+	  -u $$(id -u):$$(id -g) -e HOME=/tmp \
+	  -e GRADLE_USER_HOME=/workspace/clients/android/.gradle-docker \
+	  -v "$(CURDIR)":/workspace -w /workspace/clients/android \
+	  $(ANDROID_IMAGE) ./gradlew --no-daemon :app:assembleDebug
+	@echo "→ clients/android/app/build/outputs/apk/debug/app-debug.apk"
 
 .PHONY: clean
 clean: ## Remove build artifacts and coverage output

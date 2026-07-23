@@ -1,0 +1,9 @@
+# The image is toolchain-only (it doesn't COPY the source), but the build
+# context is still sent to the daemon — keep it tiny.
+app/build/
+build/
+.gradle/
+.gradle-docker/
+*.apk
+.idea/
+local.properties

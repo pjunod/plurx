@@ -42,19 +42,63 @@ hardware genuinely can't play — everything else streams the original file unto
 
 ## Build
 
-Everything is a standard Gradle Android project. From this directory:
+Three ways, in order of least host setup — all produce the same
+`app/build/outputs/apk/debug/app-debug.apk`.
+
+### In Docker — recommended for a server (no host JDK or SDK)
+
+A pinned image ([`Dockerfile`](Dockerfile): JDK 17 + the exact Android SDK) is
+the whole toolchain, so a headless box needs only Docker. From the **repo
+root**:
 
 ```bash
-# Debug APK (what you sideload)
-./gradlew :app:assembleDebug
+make android          # builds the image once, then the debug APK in it
+```
+
+The APK lands in `clients/android/app/build/outputs/apk/debug/`, owned by you —
+the container runs as your UID (`-u $(id -u)`), so nothing is left root-owned.
+First run pulls the base image + SDK and downloads the Gradle deps; later runs
+reuse the cached image and a `clients/android/.gradle-docker` cache.
+`make android-image` rebuilds just the image (e.g. after bumping the SDK). Needs
+the Docker daemon running and outbound internet on the first build.
+
+### Manually — host JDK 17 + Android SDK
+
+On a headless Ubuntu/Debian server:
+
+```bash
+# 1. JDK 17 (AGP 8.7 needs it; 21 also works, avoid 23/24)
+sudo apt update && sudo apt install -y openjdk-17-jdk unzip
+export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+
+# 2. Android command-line tools — must end up at cmdline-tools/latest/
+mkdir -p ~/android-sdk/cmdline-tools && cd ~/android-sdk/cmdline-tools
+curl -fsSL https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -o clt.zip
+unzip -q clt.zip && mv cmdline-tools latest && rm clt.zip
+export ANDROID_HOME=$HOME/android-sdk
+export PATH=$ANDROID_HOME/cmdline-tools/latest/bin:$PATH
+
+# 3. the exact packages this app pins (compileSdk 35 / build-tools 35.0.0)
+yes | sdkmanager --licenses
+sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+
+# 4. build (from clients/android/)
+cd ~/plurx/clients/android && ./gradlew :app:assembleDebug
 # → app/build/outputs/apk/debug/app-debug.apk
 ```
 
-Or open `clients/android/` in **Android Studio** (Ladybug / 2024.2+) and hit Run.
+Persist `JAVA_HOME`, `ANDROID_HOME`, and the `PATH` line in `~/.bashrc` so new
+shells find them. If the `commandlinetools` URL 404s, grab the current link from
+the "Command line tools only" box at <https://developer.android.com/studio>.
 
-Toolchain the project is pinned to: **AGP 8.7.2**, **Gradle 8.14.3**, **Kotlin 2.0.21**,
-**JDK 17**, **Media3 1.5.1**, `compileSdk`/`targetSdk` 35, `minSdk` 23. The Android SDK
-location is read from `local.properties` (`sdk.dir=…`) or the `ANDROID_HOME` env var.
+### In Android Studio
+
+Open `clients/android/` in **Android Studio** (Ladybug / 2024.2+) and Run — it
+provisions the SDK for you.
+
+**Toolchain** (pinned): AGP 8.7.2, Gradle 8.14.3, Kotlin 2.0.21, JDK 17, Media3
+1.5.1, `compileSdk`/`targetSdk` 35, `minSdk` 23. Outside Docker the SDK location
+comes from `local.properties` (`sdk.dir=…`) or `ANDROID_HOME`.
 
 ## Install
 
