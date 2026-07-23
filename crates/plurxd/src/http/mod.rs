@@ -53,6 +53,10 @@ pub fn router(state: AppState) -> Router {
         .route("/trakt/sync", post(trakt::sync_now))
         .route("/system", get(system::system_info))
         .route("/system/logs", get(system::logs))
+        // Any signed-in user can post a client-side playback error here so it
+        // lands in the admin log (browsers that reject a stream produce no
+        // server log on their own).
+        .route("/client-log", post(system::client_log))
         // Users (admin)
         .route("/users", get(users::list).post(users::create))
         .route("/users/{id}", put(users::update).delete(users::delete))
@@ -498,6 +502,42 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.is_array());
+    }
+
+    #[tokio::test]
+    async fn client_log_requires_auth_and_accepts_reports() {
+        let app = test_app();
+        // Unauthenticated → 401 (rejected before the body is read).
+        let (status, _) = call(
+            &app,
+            post("/api/v1/client-log", None, json!({ "event": "x" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // A signed-in user's playback error is accepted (204, empty body).
+        let admin = setup_admin(&app).await;
+        let (status, _) = call(
+            &app,
+            post(
+                "/api/v1/client-log",
+                Some(&admin),
+                json!({
+                    "level": "error",
+                    "event": "playback_failed",
+                    "message": "format not supported by this browser",
+                    "method": "remux",
+                    "code": 4,
+                    "ua": "Safari"
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        // A near-empty body is tolerated too (all fields optional).
+        let (status, _) = call(&app, post("/api/v1/client-log", Some(&admin), json!({}))).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
     }
 
     #[tokio::test]

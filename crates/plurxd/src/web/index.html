@@ -455,6 +455,36 @@ async function api(path, {method="GET", body=null, raw=false}={}){
 }
 const tok = u => u + (u.includes("?")?"&":"?") + "token=" + encodeURIComponent(TOKEN||"");
 function toast(msg){ const t=document.getElementById("toast"); t.textContent=msg; t.classList.add("show"); setTimeout(()=>t.classList.remove("show"),2200); }
+// Short browser label for diagnostics. Order matters: Edge's UA contains
+// "Chrome"+"Safari"; Chrome's contains "Safari" — so test most-specific first.
+function browserLabel(){
+  const ua=navigator.userAgent||"";
+  if(/\bedg(a|ios|)\//i.test(ua)) return "Edge";
+  if(/(firefox|fxios)\//i.test(ua)) return "Firefox";
+  if(/(chrome|crios|chromium)\//i.test(ua)) return "Chrome";
+  if(/safari\//i.test(ua) && /version\//i.test(ua)) return "Safari";
+  return "browser";
+}
+// Forward a client-side playback problem to the server so it lands in
+// Settings → Logs. Fire-and-forget: a browser that rejects a stream produces no
+// server log on its own (nothing ran server-side to fail), so without this the
+// failures a user hits in Safari are invisible unless they open dev tools. Never
+// throws, never blocks playback; auto-fills context from the active PLAYER.
+function clientLog(ev){
+  try{
+    const p=PLAYER||{}, s=p.source||{};
+    const body=Object.assign({
+      ua:browserLabel(),
+      method:p.method||null,
+      title:p.title||null,
+      file_id:p.fileId||null,
+      vcodec:s.video_codec||null,
+    }, ev||{});
+    fetch(API+"/client-log",{method:"POST",keepalive:true,
+      headers:Object.assign({"content-type":"application/json"},TOKEN?{"authorization":"Bearer "+TOKEN}:{}),
+      body:JSON.stringify(body)}).catch(()=>{});
+  }catch(e){}
+}
 function fmtDur(ms){ if(!ms) return ""; const s=Math.round(ms/1000),h=Math.floor(s/3600),m=Math.floor(s%3600/60); return h?`${h}h ${m}m`:`${m}m`; }
 function fmtSize(b){ if(!b) return ""; const g=b/(1024**3); return g>=1?g.toFixed(1)+" GB":Math.round(b/(1024**2))+" MB"; }
 function fmtUptime(s){ const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60); return d?`${d}d ${h}h`:(h?`${h}h ${m}m`:`${m}m`); }
@@ -963,7 +993,7 @@ function attachHls(video, playlistUrl){
     hls.loadSource(playlistUrl);
     hls.attachMedia(video);
     hls.on(Hls.Events.MANIFEST_PARSED,()=>video.play().catch(()=>{}));
-    hls.on(Hls.Events.ERROR,(_,d)=>{ if(d.fatal){ console.warn("[cinemarr] hls.js fatal",d.type,d.details); setLoading(true,"Playback failed to start ("+d.details+").","the server couldn't build this stream — see Settings → Logs"); toast("Playback failed ("+d.details+")"); } });
+    hls.on(Hls.Events.ERROR,(_,d)=>{ if(d.fatal){ console.warn("[cinemarr] hls.js fatal",d.type,d.details); clientLog({level:"error",event:"hls_fatal",detail:d.type,message:d.details}); setLoading(true,"Playback failed to start ("+d.details+").","the server couldn't build this stream — see Settings → Logs"); toast("Playback failed ("+d.details+")"); } });
   } else {
     // Native HLS: the session id in the URL is the credential, so the
     // Apple TV can fetch segments itself when AirPlaying.
@@ -1153,6 +1183,7 @@ async function stallDiagnose(){
   }
   console.warn("[cinemarr] playback stall diagnosis",{method:PLAYER.method,url,networkState:v&&v.networkState,readyState:v&&v.readyState,error:v&&v.error&&v.error.code,verdict});
   if(PLAYER.started) return;   // raced with a late start
+  clientLog({level:"warn",event:"stall",src:(url||"").split("?")[0],message:verdict,detail:detail});
   setLoading(true, verdict, detail);
   toast(verdict);
 }
@@ -1200,15 +1231,20 @@ function wirePlayer(){
   v.addEventListener("error",()=>{
     clearStall();
     const err=v.error, code=err?err.code:0, msg=(err&&err.message)||"";
-    console.warn("[cinemarr] video error",{code,msg,method:PLAYER&&PLAYER.method,src:(v.currentSrc||"").split("?")[0]});
+    const src=(v.currentSrc||"").split("?")[0];
+    console.warn("[cinemarr] video error",{code,msg,method:PLAYER&&PLAYER.method,src});
     if(!PLAYER || PLAYER.started){ setLoading(false); return; }
+    const names={1:"aborted",2:"network error",3:"the browser's decoder failed",4:"format not supported by this browser"};
     if((PLAYER.method==='remux'||PLAYER.method==='direct_play') && !PLAYER.triedFallback){
       PLAYER.triedFallback=true;
+      clientLog({level:"warn",event:"stream_rejected",code,src,
+        message:"browser refused the "+PLAYER.method.replace('_',' ')+" stream — re-encoding"});
       setLoading(true,"Stream rejected — switching to transcode…","the browser refused the "+PLAYER.method.replace('_',' ')+" stream (code "+code+"); re-encoding instead");
       startTranscodeFallback();
       return;
     }
-    const names={1:"aborted",2:"network error",3:"the browser's decoder failed",4:"format not supported by this browser"};
+    clientLog({level:"error",event:"playback_failed",code,src,
+      message:(names[code]||("error "+code))+(msg?" ("+msg+")":"")});
     setLoading(true,"Playback failed: "+(names[code]||("error "+code))+".",(msg?msg+" — ":"")+"see Settings → Logs for the server side");
     toast("Playback failed — "+(names[code]||("error "+code)));
   });

@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 
 use axum::extract::{Query, State};
+use axum::http::StatusCode;
 use axum::Json;
 use plurx_core::auth;
 use plurx_core::store::keys;
@@ -134,6 +135,109 @@ pub async fn logs(
     Query(q): Query<LogsQuery>,
 ) -> Json<Vec<crate::logbuf::LogEntry>> {
     Json(state.logs.tail(&q.level, q.limit.min(2000)))
+}
+
+/// A client-side playback problem the browser reports back to the server.
+///
+/// Why this exists: when a browser refuses a stream — Safari rejecting a codec,
+/// or a direct-play file it won't progressive-play — *nothing runs server-side
+/// to fail*, so `Settings → Logs` stays empty and the failure is invisible
+/// unless the user opens dev tools. Forwarding the browser's own error here puts
+/// it in the same log the admin already reads. All fields optional so the client
+/// can send only what's relevant; everything is length-clipped before logging.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+pub struct ClientLog {
+    /// "error" | "warn" — anything but "error" logs at WARN.
+    pub level: String,
+    /// Short machine tag: "playback_failed" | "stream_rejected" | "hls_fatal" | "stall".
+    pub event: String,
+    /// Human-readable summary (e.g. "format not supported by this browser").
+    pub message: String,
+    /// Delivery path in play at the time: "direct_play" | "remux" | "transcode".
+    pub method: Option<String>,
+    /// `HTMLMediaElement.error.code` (1..=4), when the failure is a media error.
+    pub code: Option<i64>,
+    /// Title being played, for cross-referencing with the library.
+    pub title: Option<String>,
+    /// File id being played.
+    pub file_id: Option<i64>,
+    /// Source video codec the decision picked, e.g. "hevc" — the usual Safari culprit.
+    pub vcodec: Option<String>,
+    /// Stream URL (query/token stripped by the client).
+    pub src: Option<String>,
+    /// Extra detail (hls.js error type, stall verdict, …).
+    pub detail: Option<String>,
+    /// Browser label the client computed ("Safari" | "Chrome" | …).
+    pub ua: Option<String>,
+}
+
+/// POST /api/v1/client-log — any signed-in user. Records one browser playback
+/// error into the server log ring so it surfaces in `Settings → Logs`. Bounded
+/// by per-field clipping (this is diagnostics, not an audit trail), and tagged
+/// with the `plurxd::client` target so it's visibly a client report.
+pub async fn client_log(_user: AuthUser, Json(ev): Json<ClientLog>) -> StatusCode {
+    /// Trim and cap one field so a client can't spam oversized log lines.
+    fn clip(s: &str, n: usize) -> String {
+        let s = s.trim();
+        match s.char_indices().nth(n) {
+            Some((i, _)) => format!("{}…", &s[..i]),
+            None => s.to_owned(),
+        }
+    }
+    fn field(v: &Option<String>, n: usize) -> Option<String> {
+        v.as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| clip(s, n))
+    }
+
+    let event = {
+        let e = clip(&ev.event, 40);
+        if e.is_empty() {
+            "event".to_owned()
+        } else {
+            e
+        }
+    };
+    let mut line = match field(&ev.ua, 24) {
+        Some(ua) => format!("client[{ua}] {event}"),
+        None => format!("client {event}"),
+    };
+    if let Some(m) = field(&ev.method, 16) {
+        line.push_str(&format!(" method={m}"));
+    }
+    if let Some(v) = field(&ev.vcodec, 16) {
+        line.push_str(&format!(" vcodec={v}"));
+    }
+    if let Some(c) = ev.code {
+        line.push_str(&format!(" code={c}"));
+    }
+    let msg = clip(&ev.message, 200);
+    if !msg.is_empty() {
+        line.push_str(&format!(": {msg}"));
+    }
+    if let Some(t) = field(&ev.title, 120) {
+        line.push_str(&format!(" — {t}"));
+    }
+    if let Some(id) = ev.file_id {
+        line.push_str(&format!(" file={id}"));
+    }
+    if let Some(s) = field(&ev.src, 160) {
+        line.push_str(&format!(" src={s}"));
+    }
+    if let Some(d) = field(&ev.detail, 200) {
+        line.push_str(&format!(" [{d}]"));
+    }
+
+    // Both WARN and ERROR clear the default `info` filter, so either shows in
+    // the admin log without the operator touching PLURX_LOG.
+    if ev.level.eq_ignore_ascii_case("error") {
+        tracing::error!(target: "plurxd::client", "{line}");
+    } else {
+        tracing::warn!(target: "plurxd::client", "{line}");
+    }
+    StatusCode::NO_CONTENT
 }
 
 #[derive(Serialize)]
