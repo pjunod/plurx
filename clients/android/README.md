@@ -119,6 +119,30 @@ adb install -r app-debug.apk
 
 The app then shows up in the TV launcher's Apps row.
 
+## Serving it from the web UI
+
+Instead of passing the APK around, the server can hand it out — and the **web
+app shows a "Download APK" prompt automatically when opened on Android**.
+Publish the APK into the server's `data_dir`:
+
+```bash
+# from the repo root, on any machine with Docker
+make android-publish ANDROID_DATA_DIR=/path/to/plurx/data
+# → copies the built APK to <data_dir>/plurx-android.apk
+```
+
+Or by hand: drop the file at `<data_dir>/plurx-android.apk`, or point
+`PLURX_ANDROID_APK=/some/plurx.apk` at it. It's then served (unauthenticated —
+it's the client app, not user data) at `GET /download/plurx-android.apk`, no
+restart needed, and `/server` reports `android_app: true` so the web UI reveals
+the link. The APK is deliberately kept out of git, so rebuild + re-publish when
+the app changes.
+
+**iOS** has no sideload equivalent, so the web app is an installable **PWA**:
+open it in Safari and use **Share → Add to Home Screen** for a full-screen,
+icon'd app. For a native iOS / Apple TV build, see
+[../apple/README.md](../apple/README.md) (Xcode).
+
 ## First run
 
 1. Launch **plurx**. On the connect screen enter your server address — host and port are

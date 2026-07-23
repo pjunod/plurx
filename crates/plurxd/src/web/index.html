@@ -3,6 +3,13 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0a0a0c">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="plurx">
 <title>cinemarr</title>
 <link rel="icon" id="favicon" href="data:image/svg+xml,%3Csvg%20xmlns=%27http://www.w3.org/2000/svg%27%20viewBox=%270%200%2064%2064%27%3E%3Cdefs%3E%3ClinearGradient%20id=%27g%27%20x1=%270%27%20y1=%270%27%20x2=%271%27%20y2=%271%27%3E%3Cstop%20offset=%270%27%20stop-color=%27%236ea8fe%27/%3E%3Cstop%20offset=%271%27%20stop-color=%27%238b7cf6%27/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect%20width=%2764%27%20height=%2764%27%20rx=%2714%27%20fill=%27%230e0f13%27/%3E%3Cpath%20d=%27M25%2020%20L47%2032%20L25%2044%20Z%27%20fill=%27url(%23g)%27/%3E%3C/svg%3E">
 <style>
@@ -49,6 +56,8 @@
   .auth h1{margin:.2em 0 .1em}
 
   h2.section{font-size:15px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:26px 4px 12px}
+  .getapp{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;margin:16px 20px 2px;padding:13px 16px;background:rgba(229,72,77,.08);border:1px solid var(--accent);border-radius:12px}
+  .getapp a.btn{display:inline-block;background:var(--accent);color:#fff;padding:8px 15px;border-radius:8px;text-decoration:none;font-weight:600;font-size:14px;white-space:nowrap}
   .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:16px}
   .rowscroll{display:grid;grid-auto-flow:column;grid-auto-columns:200px;gap:16px;overflow-x:auto;padding-bottom:8px;scrollbar-width:thin}
   .poster{background:var(--panel2);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;cursor:pointer;transition:transform .12s,border-color .12s;position:relative}
@@ -464,9 +473,10 @@ function artHtml(it, cls){
 
 // ---- auth flows -----------------------------------------------------------
 function logout(){ TOKEN=null; ME=null; localStorage.removeItem("plurx_token"); clearInterval(ACT_TIMER); ACT_TIMER=null; document.documentElement.classList.remove("working"); render(); }
+let SERVER=null;   // last /server response (name, version, android_app, …)
 async function boot(){
   let server;
-  try{ server=await api("/server"); }catch(e){ document.getElementById("app").innerHTML=`<div class="center"><div class="card">Server unreachable.</div></div>`; return; }
+  try{ server=await api("/server"); SERVER=server; }catch(e){ document.getElementById("app").innerHTML=`<div class="center"><div class="card">Server unreachable.</div></div>`; return; }
   if(server.setup_required){ return renderSetup(server); }
   if(!TOKEN){ return renderLogin(server); }
   try{ ME=await api("/me"); }catch(e){ return renderLogin(server); }
@@ -507,6 +517,7 @@ function renderLogin(){
 function chrome(active, inner){
   const admin = ME&&ME.is_admin ? `<a href="#/settings" class="${active==='settings'?'active':''}">Settings</a>`:"";
   const back = (location.hash&&location.hash!=="#/") ? `<button class="ghost sm" onclick="history.back()" title="Back">‹ Back</button>`:"";
+  const getapp = installAvailable() ? `<button class="ghost sm" onclick="showInstall()" title="Install the plurx app">Get app</button>` : "";
   document.getElementById("app").innerHTML=`
    <header class="top">
      ${back}<a href="#/" class="logo">${APP_NAME}</a>
@@ -523,6 +534,7 @@ function chrome(active, inner){
        <button class="ghost sm" onclick="toggleAppearanceMenu(event)" title="Light / dark">◐</button>
        <div class="amenu" id="appmenu"></div>
      </div>
+     ${getapp}
      <button class="ghost sm" onclick="logout()">Sign out</button>
    </header><main id="main">${inner}</main>`;
   const q=document.getElementById("q");
@@ -592,6 +604,48 @@ function card(it, wide){
 function grid(items){ return items.length? `<div class="grid">${items.map(i=>card(i)).join("")}</div>` : `<div class="empty">Nothing here yet.</div>`; }
 
 // ---- views ----------------------------------------------------------------
+// ---- get-the-app install prompt -------------------------------------------
+// Android can sideload the native APK (served by this server when published);
+// iOS can't, so it gets "Add to Home Screen" (PWA) + a pointer to the Xcode
+// source. Shown as a dismissible home banner and a header button.
+function appPlatform(){
+  const ua=navigator.userAgent||"";
+  if(/android/i.test(ua)) return /(\btv\b|bravia|shield|aft[a-z]|googletv|chromecast)/i.test(ua)?"androidtv":"android";
+  if(/iphone|ipad|ipod/i.test(ua) || (/Macintosh/.test(ua)&&navigator.maxTouchPoints>1)) return "ios";
+  return "other";
+}
+function appStandalone(){
+  try{ return (window.matchMedia&&window.matchMedia("(display-mode: standalone)").matches)||window.navigator.standalone===true; }catch(e){ return false; }
+}
+function installAvailable(){
+  if(appStandalone()) return false;
+  const p=appPlatform();
+  if(p==="ios") return true;                                   // Add to Home Screen
+  if(p==="android"||p==="androidtv") return !!(SERVER&&SERVER.android_app);
+  return false;
+}
+function installDismissed(){ try{ return localStorage.getItem("plurx_getapp_dismissed")==="1"; }catch(e){ return false; } }
+function dismissInstall(){ try{ localStorage.setItem("plurx_getapp_dismissed","1"); }catch(e){} const b=document.getElementById("getapp"); if(b) b.remove(); }
+function showInstall(){ try{ localStorage.removeItem("plurx_getapp_dismissed"); }catch(e){} location.hash="#/"; render(); }
+function installBannerHtml(){
+  if(!installAvailable()||installDismissed()) return "";
+  const p=appPlatform();
+  if(p==="android"||p==="androidtv"){
+    const tvNote = p==="androidtv"
+      ? `On Android TV, sideload it with the <b>Downloader</b> app (enter this server's address) or <code>adb install</code>.`
+      : `Open the downloaded file to install — allow installs from your browser if prompted.`;
+    return `<div class="getapp" id="getapp">
+      <div><b>Get the plurx Android app</b><div class="muted" style="font-size:13px">Native playback — direct-plays MKV · HEVC · 4K that a browser can't. ${tvNote}</div></div>
+      <div class="row" style="gap:8px">
+        <a class="btn" href="/download/plurx-android.apk">Download APK</a>
+        <button class="ghost sm" onclick="dismissInstall()">Dismiss</button>
+      </div></div>`;
+  }
+  return `<div class="getapp" id="getapp">
+      <div><b>Install plurx</b><div class="muted" style="font-size:13px">Tap <b>Share</b> → <b>Add to Home&nbsp;Screen</b> for a full-screen app. A native iOS / Apple&nbsp;TV app can be built from <code>clients/apple</code> in the source (Xcode).</div></div>
+      <button class="ghost sm" onclick="dismissInstall()">Dismiss</button></div>`;
+}
+
 // Home library grouping: "share" (one section per library, the default) or
 // "category" (Movies / TV Shows, merging shares of the same kind). Persisted
 // in localStorage like the other viewing prefs.
@@ -613,7 +667,7 @@ function groupToggleHtml(group){
 async function viewHome(){
   chrome("home", `<div id="hubs"><div class="empty">Loading…</div></div>`);
   const [libs, hubs] = await Promise.all([api("/libraries"), api("/hubs")]);
-  let html="";
+  let html=installBannerHtml();
   if(hubs.continue_watching.length){ html+=`<h2 class="section">Continue watching</h2><div class="rowscroll">${hubs.continue_watching.map(i=>card(i,true)).join("")}</div>`; }
   if(hubs.next_up && hubs.next_up.length){ html+=`<h2 class="section">Next up</h2><div class="rowscroll">${hubs.next_up.map(i=>card(i,i.kind==='episode')).join("")}</div>`; }
   if(hubs.recently_added.length){ html+=`<h2 class="section">Recently added</h2><div class="rowscroll">${hubs.recently_added.map(i=>card(i,i.kind==='episode')).join("")}</div>`; }

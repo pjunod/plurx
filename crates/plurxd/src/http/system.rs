@@ -21,18 +21,23 @@ pub struct ServerInfo {
     pub uptime_seconds: u64,
     /// True when no users exist yet — the web app shows first-run setup.
     pub setup_required: bool,
+    /// True when an Android APK is published (so the web UI shows the download
+    /// link on Android). See `web::android_apk_path`.
+    pub android_app: bool,
 }
 
 /// GET /api/v1/server — public; drives the client's setup-vs-login decision.
 pub async fn server_info(State(state): State<AppState>) -> Result<Json<ServerInfo>, ApiError> {
     let instance_id = state.store.instance_id().await?;
     let setup_required = state.store.count_users().await? == 0;
+    let android_app = super::web::android_apk_path(&state.system.data_dir).is_some();
     Ok(Json(ServerInfo {
         name: state.server_name.clone(),
         version: env!("CARGO_PKG_VERSION"),
         instance_id,
         uptime_seconds: state.started_at.elapsed().as_secs(),
         setup_required,
+        android_app,
     }))
 }
 

@@ -4,6 +4,7 @@
 
 CARGO ?= cargo
 ANDROID_IMAGE ?= plurx-android-build
+ANDROID_DATA_DIR ?=
 
 .DEFAULT_GOAL := help
 
@@ -76,6 +77,12 @@ android: android-image ## Build the Android debug APK in Docker (no host JDK/SDK
 	  -v "$(CURDIR)":/workspace -w /workspace/clients/android \
 	  $(ANDROID_IMAGE) ./gradlew --no-daemon :app:assembleDebug
 	@echo "→ clients/android/app/build/outputs/apk/debug/app-debug.apk"
+
+.PHONY: android-publish
+android-publish: android ## Build the APK + serve it from the web UI (ANDROID_DATA_DIR=/path/to/data)
+	@test -n "$(ANDROID_DATA_DIR)" || { echo "set ANDROID_DATA_DIR to the server's data_dir, e.g. make android-publish ANDROID_DATA_DIR=~/.local/share/plurx"; exit 1; }
+	cp clients/android/app/build/outputs/apk/debug/app-debug.apk "$(ANDROID_DATA_DIR)/plurx-android.apk"
+	@echo "Published -> $(ANDROID_DATA_DIR)/plurx-android.apk (served at /download/plurx-android.apk, no restart needed)"
 
 .PHONY: clean
 clean: ## Remove build artifacts and coverage output
