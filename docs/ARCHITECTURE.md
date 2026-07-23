@@ -206,6 +206,11 @@ ffmpeg build — **jellyfin-ffmpeg explicitly supported** and recommended for it
 extra hwaccel/tone-mapping patches (and required for GPUs newer than the distro's
 VA driver, e.g. Intel Arrow Lake on the `xe` kernel driver).
 
+This section is the *server's* verdict. The client half — which transport each
+browser actually uses to play a verdict, why Safari and Chromium diverge on
+remux, and the copy-video HLS path that keeps Safari at source resolution — is
+[PLAYBACK.md](PLAYBACK.md).
+
 ## 4. Scanner & metadata — ffprobe is ground truth
 
 ```

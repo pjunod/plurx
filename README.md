@@ -26,7 +26,10 @@ including what it deliberately doesn't. Then [docs/OPERATIONS.md](docs/OPERATION
 for running it day to day and reading every status and log line it shows you, with
 [docs/CHEATSHEET.md](docs/CHEATSHEET.md) as the copy-paste quickstart beside it.
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) has the diagrams and the founding
-decisions (why one binary clusters without external infra). Scope and the phased
+decisions (why one binary clusters without external infra), and
+[docs/PLAYBACK.md](docs/PLAYBACK.md) traces the end-to-end path a file takes to
+become a stream — every direct/remux/transcode fork and the per-browser
+transport choice behind it. Scope and the phased
 plan live in [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) and
 [docs/ROADMAP.md](docs/ROADMAP.md); client strategy in
 [docs/CLIENTS.md](docs/CLIENTS.md); deploy recipes in
@@ -194,7 +197,7 @@ live, filterable log viewer. Full guide: [docs/OPERATIONS.md](docs/OPERATIONS.md
 | [`crates/plurx-core`](crates/plurx-core) | Domain model · the `Store` trait · scanner · metadata agents · playback decision engine |
 | [`crates/plurxd`](crates/plurxd) | The HTTP daemon (axum) · transcode orchestrator · the embedded single-file web app |
 | [`crates/plurx-compat-plex`](crates/plurx-compat-plex) | Plex Media Server API façade + GDM discovery responder |
-| [`docs/`](docs) | Architecture · features · operations · cheat sheet · requirements · roadmap · clients |
+| [`docs/`](docs) | Architecture · playback · features · operations · cheat sheet · requirements · roadmap · clients |
 | [`deploy/`](deploy) | Docker/Compose, systemd unit, macOS launchd agent, and Unraid templates |
 
 ## Status
