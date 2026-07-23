@@ -196,6 +196,10 @@ impl MediaStore for SqliteStore {
                 ItemSort::Title => "sort_title ASC",
                 ItemSort::Added => "added_at DESC, id DESC",
                 ItemSort::Year => "year IS NULL, year DESC, sort_title ASC",
+                // Best (max) file height per item, highest first; no-height items last.
+                ItemSort::Resolution => {
+                    "COALESCE((SELECT MAX(f.height) FROM files f WHERE f.item_id = items.id), -1) DESC, sort_title ASC"
+                }
             };
             let total: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM items
@@ -604,6 +608,64 @@ mod tests {
             .await
             .expect("file");
         id
+    }
+
+    async fn seed_movie_h(store: &SqliteStore, lib: i64, title: &str, height: i64) -> i64 {
+        let id = store
+            .insert_item(&NewItem {
+                library_id: lib,
+                kind: ItemKind::Movie,
+                parent_id: None,
+                title: title.into(),
+                year: Some(2000),
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("insert");
+        store
+            .upsert_file(
+                id,
+                &format!("/media/{title}.mkv"),
+                1000,
+                1,
+                &ProbeResult {
+                    container: Some("mkv".into()),
+                    video_codec: Some("h264".into()),
+                    width: Some(height * 16 / 9),
+                    height: Some(height),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("file");
+        id
+    }
+
+    #[tokio::test]
+    async fn resolution_sort_orders_by_height_desc() {
+        let store = SqliteStore::open_in_memory().expect("open");
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "Movies".into(),
+                kind: LibraryKind::Movies,
+                paths: vec![PathBuf::from("/media")],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+        seed_movie_h(&store, lib.id, "SD", 480).await;
+        seed_movie_h(&store, lib.id, "UHD", 2160).await;
+        seed_movie_h(&store, lib.id, "HD", 1080).await;
+        // A movie whose file has no probed height sorts last (COALESCE -1).
+        seed_movie(&store, lib.id, "Unknown", 2001).await;
+
+        let page = store
+            .list_top_items(lib.id, ItemSort::Resolution, 0, 10)
+            .await
+            .expect("list");
+        let order: Vec<&str> = page.items.iter().map(|i| i.title.as_str()).collect();
+        assert_eq!(order, vec!["UHD", "HD", "SD", "Unknown"]);
     }
 
     #[tokio::test]

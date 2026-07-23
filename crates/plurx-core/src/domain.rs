@@ -294,6 +294,9 @@ pub enum ItemSort {
     Title,
     Added,
     Year,
+    /// Highest video resolution first (by the item's best file); items with no
+    /// probed height sort last.
+    Resolution,
 }
 
 impl ItemSort {
@@ -302,6 +305,7 @@ impl ItemSort {
             "title" => Some(ItemSort::Title),
             "added" => Some(ItemSort::Added),
             "year" => Some(ItemSort::Year),
+            "resolution" => Some(ItemSort::Resolution),
             _ => None,
         }
     }
