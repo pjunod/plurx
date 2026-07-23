@@ -218,6 +218,11 @@
   .crumbs{font-size:13px;color:var(--muted);margin:0 0 16px;display:flex;gap:8px;flex-wrap:wrap;align-items:center}
   .crumbs .sep{opacity:.45}
   .crumbs .cur{color:var(--text)}
+  /* Contextual back link — sits at the top of the content it applies to, not in
+     the header (where it shifted the logo when it appeared and read as detached
+     from the page below it). */
+  .backlink{display:inline-flex;align-items:center;gap:5px;font-size:13px;color:var(--muted);margin:0 0 14px;cursor:pointer;text-decoration:none}
+  .backlink:hover{color:var(--text)}
   .libbar{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin:0 4px 16px}
   .libbar select{width:auto;min-width:130px;padding:6px 9px}
   .libbar .lbl{display:inline;margin:0 2px 0 0;font-size:12px;color:var(--muted)}
@@ -596,11 +601,10 @@ function renderLogin(){
 // ---- chrome ---------------------------------------------------------------
 function chrome(active, inner){
   const admin = ME&&ME.is_admin ? `<a href="#/settings" class="${active==='settings'?'active':''}">Settings</a>`:"";
-  const back = (location.hash&&location.hash!=="#/") ? `<button class="ghost sm" onclick="history.back()" title="Back">‹ Back</button>`:"";
   const getapp = installAvailable() ? `<button class="ghost sm" onclick="showInstall()" title="Install the plurx app">Get app</button>` : "";
   document.getElementById("app").innerHTML=`
    <header class="top">
-     ${back}<a href="#/" class="logo">${APP_NAME}</a>
+     <a href="#/" class="logo">${APP_NAME}</a>
      <nav><a href="#/" class="${active==='home'?'active':''}">Home</a><a href="#/activity" class="${active==='activity'?'active':''}">Activity</a>${admin}</nav>
      <span class="spacer"></span>
      <span class="activity" id="activity" onclick="location.hash='#/activity'"></span>
@@ -2023,16 +2027,26 @@ async function render(){
   if(!ACT_TIMER) ACT_TIMER=setInterval(pollActivity,4000);
   const h=location.hash||"#/";
   try{
-    if(h.startsWith("#/item/")) return await viewItem(h.split("/")[2]);
-    if(h.startsWith("#/library/")) return await viewLibrary(h.split("/")[2]);
-    if(h.startsWith("#/category/")) return await viewCategory(decodeURIComponent(h.split("/")[2]||""));
-    if(h.startsWith("#/search/")) return await viewSearch(decodeURIComponent(h.split("/")[2]||""));
-    if(h==="#/activity") return await viewActivity();
-    if(h==="#/admin"||h==="#/settings") return await viewSettings();
-    return await viewHome();
+    if(h.startsWith("#/item/")) await viewItem(h.split("/")[2]);
+    else if(h.startsWith("#/library/")) await viewLibrary(h.split("/")[2]);
+    else if(h.startsWith("#/category/")) await viewCategory(decodeURIComponent(h.split("/")[2]||""));
+    else if(h.startsWith("#/search/")) await viewSearch(decodeURIComponent(h.split("/")[2]||""));
+    else if(h==="#/activity") await viewActivity();
+    else if(h==="#/admin"||h==="#/settings") await viewSettings();
+    else await viewHome();
+    injectBack(h);
   }catch(e){
     if(e.message!=="unauthorized"){ const m=document.getElementById("main"); if(m) m.innerHTML=`<div class="empty">${esc(e.message)}</div>`; else toast(e.message); }
   }
+}
+// Put a "‹ Back" at the top of drill-in page content, in context with what it
+// acts on. Item pages already carry a breadcrumb (Home / Title), so skip those;
+// Home and the top-level nav destinations (Activity, Settings) don't need one.
+function injectBack(h){
+  const main=document.getElementById("main"); if(!main) return;
+  const sub = h.startsWith("#/item/")||h.startsWith("#/library/")||h.startsWith("#/category/")||h.startsWith("#/search/");
+  if(!sub || main.querySelector(".crumbs") || main.querySelector(".backlink")) return;
+  main.insertAdjacentHTML("afterbegin", `<a class="backlink" href="#" onclick="history.back();return false">‹ Back</a>`);
 }
 window.addEventListener("hashchange",render);
 
