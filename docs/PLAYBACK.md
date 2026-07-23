@@ -230,11 +230,17 @@ verdict, a red flag if the reason is only container/audio.
 
 ## Non-goals & known limits
 
-- **Copy-HLS disk use.** A copy session keeps every segment for the session's
-  life (like the transcode path), but at source bitrate — a full 4K watch can
-  accumulate ~10× a 720p transcode's segments before the idle reaper clears it.
-  `-re` bounds the *rate*, not the total. A sliding-window / cleanup pass would
-  apply to both HLS paths and is unbuilt.
+- **HLS session disk.** An HLS session's playlist grows for its whole life, so
+  the reaper prunes segments more than ~60 s behind the playhead — on both the
+  transcode and copy paths — keyed off the highest segment the client has
+  fetched. A 4K copy session is bounded to a rolling window instead of hoarding
+  the ~17 GB a full watch would otherwise accumulate. Two residuals remain: a
+  fast transcode can still race *ahead* of the playhead and write future
+  segments up to the transcoded file's size (bounded by the pre-existing
+  behavior, and at the lower transcode bitrate); and the prune is disk-only —
+  the playlist keeps listing pruned entries, which is safe precisely because
+  every seek starts a fresh session rather than scrubbing back into a deleted
+  window.
 - **No client-side bitrate adaptation yet.** One encode runs at a time; the
   rung is chosen at start, not adapted per segment. The design for that is
   [ADAPTIVE-QUALITY.md](ADAPTIVE-QUALITY.md).

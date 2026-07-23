@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering::Relaxed};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -33,6 +33,13 @@ const FIRST_SEGMENT_GRACE: Duration = Duration::from_secs(12);
 /// is unwatchable, and failing it gives the client a clear error instead of an
 /// endless gray screen (e.g. a Dolby Vision stream the build can't decode).
 const SOFTWARE_GRACE: Duration = Duration::from_secs(30);
+/// How many segments behind the furthest-served one to keep on disk. An HLS
+/// session's playlist grows for its whole life (event type), so without pruning
+/// a full watch accumulates every segment — cheap at 720p, but a 4K copy-video
+/// session at ~45 Mb/s would hoard ~17 GB. We delete segments well behind the
+/// playhead; ~60 s (15 × 4 s) covers a player's back-buffer, and a seek restarts
+/// the session anyway, so a played-past segment is never re-requested.
+const KEEP_BEHIND_SEGMENTS: i64 = 15;
 
 /// Spawn an ffmpeg HLS transcode, draining its stderr (at `-loglevel error`)
 /// into the logs so a failure is visible instead of a silently dead session.
@@ -129,6 +136,9 @@ struct Session {
     /// both failed to emit a first segment). Playlist/segment reads then fail
     /// fast so the player shows an error instead of waiting on a gray screen.
     failed: AtomicBool,
+    /// Highest segment index the client has fetched (-1 before the first). The
+    /// reaper prunes segments far enough behind this to bound disk use.
+    high_segment: AtomicI64,
 }
 
 pub struct StartInfo {
@@ -305,6 +315,7 @@ impl TranscodeManager {
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0),
             failed: AtomicBool::new(false),
+            high_segment: AtomicI64::new(-1),
         });
         self.sessions
             .lock()
@@ -465,6 +476,7 @@ impl TranscodeManager {
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0),
             failed: AtomicBool::new(false),
+            high_segment: AtomicI64::new(-1),
         });
         self.sessions
             .lock()
@@ -577,10 +589,15 @@ impl TranscodeManager {
         }
         let session = self.touch(session_id).await?;
         let path = session.dir.join(name);
+        let idx = segment_index(name);
 
         let deadline = Instant::now() + SEGMENT_WAIT;
         loop {
             if let Ok(bytes) = tokio::fs::read(&path).await {
+                // Track the playhead so the reaper can prune segments behind it.
+                if let Some(i) = idx {
+                    session.high_segment.fetch_max(i, Relaxed);
+                }
                 return Some(bytes);
             }
             // Give up if the session was declared dead, or ffmpeg has exited and
@@ -606,11 +623,14 @@ impl TranscodeManager {
             ticker.tick().await;
             let idle = Duration::from_secs(SESSION_IDLE_SECS);
             let mut expired = Vec::new();
+            let mut live = Vec::new(); // (dir, high_segment) for behind-playhead GC
             {
                 let sessions = self.sessions.lock().await;
                 for (id, s) in sessions.iter() {
                     if s.last_access.lock().await.elapsed() > idle {
                         expired.push((id.clone(), Arc::clone(s)));
+                    } else {
+                        live.push((s.dir.clone(), s.high_segment.load(Relaxed)));
                     }
                 }
             }
@@ -619,6 +639,12 @@ impl TranscodeManager {
                 let _ = session.child.lock().await.kill().await;
                 let _ = tokio::fs::remove_dir_all(&session.dir).await;
                 tracing::info!(session_id = %id, "reaped idle transcode session");
+            }
+            // Bound disk on active sessions: an HLS playlist grows for the whole
+            // session, so prune segments well behind the playhead (a 4K copy
+            // session would otherwise hoard tens of GB).
+            for (dir, high) in live {
+                gc_old_segments(&dir, high).await;
             }
         }
     }
@@ -638,6 +664,37 @@ fn is_safe_segment(name: &str) -> bool {
         })
         .map(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
         .unwrap_or(false)
+}
+
+/// The numeric index of a segment filename (`segNNNNN.ts`/`.m4s`), or None for
+/// the init segment, the playlist, or anything else.
+fn segment_index(name: &str) -> Option<i64> {
+    name.strip_prefix("seg")
+        .and_then(|rest| {
+            rest.strip_suffix(".ts")
+                .or_else(|| rest.strip_suffix(".m4s"))
+        })
+        .filter(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|d| d.parse::<i64>().ok())
+}
+
+/// Delete segments far enough behind the furthest-served one to be safe. The
+/// client restarts the session on any seek, so a played-past segment is never
+/// re-requested; `init.mp4` and the playlist are always kept.
+async fn gc_old_segments(dir: &std::path::Path, high: i64) {
+    if high < KEEP_BEHIND_SEGMENTS {
+        return; // not enough played yet to prune anything
+    }
+    let cutoff = high - KEEP_BEHIND_SEGMENTS;
+    if let Ok(mut rd) = tokio::fs::read_dir(dir).await {
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            if let Some(i) = segment_index(&entry.file_name().to_string_lossy()) {
+                if i < cutoff {
+                    let _ = tokio::fs::remove_file(entry.path()).await;
+                }
+            }
+        }
+    }
 }
 
 /// A sensible video bitrate (kbps) for a target height.
@@ -675,6 +732,50 @@ mod tests {
         assert_eq!(bitrate_for_height(1080), 8_000);
         assert_eq!(bitrate_for_height(720), 4_000);
         assert_eq!(bitrate_for_height(240), 1_200);
+    }
+
+    #[test]
+    fn segment_index_parsing() {
+        assert_eq!(segment_index("seg00000.ts"), Some(0));
+        assert_eq!(segment_index("seg00042.m4s"), Some(42));
+        assert_eq!(segment_index("seg12345.ts"), Some(12345));
+        assert_eq!(segment_index("init.mp4"), None);
+        assert_eq!(segment_index("index.m3u8"), None);
+        assert_eq!(segment_index("seg.ts"), None);
+    }
+
+    #[tokio::test]
+    async fn gc_prunes_segments_behind_playhead() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path();
+        tokio::fs::write(p.join("init.mp4"), b"i")
+            .await
+            .expect("write init");
+        for i in 0..=30 {
+            tokio::fs::write(p.join(format!("seg{i:05}.m4s")), b"x")
+                .await
+                .expect("write seg");
+        }
+        // Playhead at 30 → cutoff = 30 - KEEP_BEHIND_SEGMENTS (15) = 15.
+        gc_old_segments(p, 30).await;
+        assert!(!p.join("seg00000.m4s").exists()); // behind → pruned
+        assert!(!p.join("seg00014.m4s").exists()); // < cutoff → pruned
+        assert!(p.join("seg00015.m4s").exists()); // == cutoff → kept
+        assert!(p.join("seg00030.m4s").exists()); // playhead → kept
+        assert!(p.join("init.mp4").exists()); // init always kept
+    }
+
+    #[tokio::test]
+    async fn gc_keeps_everything_before_the_window_fills() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path();
+        for i in 0..5 {
+            tokio::fs::write(p.join(format!("seg{i:05}.ts")), b"x")
+                .await
+                .expect("write seg");
+        }
+        gc_old_segments(p, 4).await; // high < KEEP_BEHIND → nothing pruned
+        assert!(p.join("seg00000.ts").exists());
     }
 
     #[tokio::test]
