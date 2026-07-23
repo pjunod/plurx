@@ -85,7 +85,8 @@
   .azbar button,.azbar .off{width:17px;height:15px;display:flex;align-items:center;justify-content:center;
     font-size:10px;font-weight:700;line-height:1;border:0;border-radius:4px;background:transparent}
   .azbar button{color:var(--muted);cursor:pointer}
-  .azbar button:hover{color:#fff;background:var(--accent)}
+  .azbar button:hover{color:var(--text);background:var(--panel2)}
+  .azbar button.active{color:#fff;background:var(--accent);box-shadow:0 0 8px color-mix(in srgb,var(--accent) 55%,transparent)}
   .azbar .off{color:var(--line)}
   @media(max-width:520px){ .azbar{gap:0;padding:5px 2px} .azbar button,.azbar .off{height:13px;width:15px} }
   .badge{position:absolute;top:8px;right:8px;width:24px;height:24px;display:grid;place-items:center;
@@ -818,7 +819,7 @@ function alphaRailHtml(items){
   if(present.size<2) return "";                              // pointless with one bucket
   const letters=["#"].concat("ABCDEFGHIJKLMNOPQRSTUVWXYZ".split(""));
   return `<div class="azbar" aria-label="Jump to letter">`+letters.map(L=>
-    present.has(L)?`<button onclick="alphaJump('${L}')" title="Jump to ${L==='#'?'0–9':L}">${L}</button>`
+    present.has(L)?`<button data-l="${L}" onclick="alphaJump('${L}')" title="Jump to ${L==='#'?'0–9':L}">${L}</button>`
                  :`<span class="off">${L}</span>`).join("")+`</div>`;
 }
 function tagAlpha(items){
@@ -826,8 +827,30 @@ function tagAlpha(items){
   const g=document.querySelector("#main .grid"); if(!g) return;
   const cards=g.children;                                    // grid renders items[i] 1:1
   for(let i=0;i<cards.length&&i<items.length;i++) cards[i].dataset.alpha=alphaBucket(items[i]);
+  updateAzActive();                                         // set the initial highlight
 }
 function alphaJump(L){ const t=document.querySelector('#main .grid [data-alpha="'+L+'"]'); if(t) t.scrollIntoView({behavior:"smooth",block:"start"}); }
+// Scroll-spy: highlight the letter whose posters sit at the top of the viewport
+// as you scroll. One persistent, rAF-throttled window listener drives whatever
+// rail is on screen (no-op when none), so it survives view swaps replacing #main.
+function azCurrentBucket(){
+  const g=document.querySelector("#main .grid"); if(!g) return null;
+  const h=document.querySelector("header.top");
+  const line=(h?h.getBoundingClientRect().bottom:56)+6;     // just under the sticky header
+  const cards=g.children;
+  for(let i=0;i<cards.length;i++){ if(cards[i].getBoundingClientRect().bottom>line) return cards[i].dataset.alpha||null; }
+  return null;
+}
+let AZ_RAF=0;
+function updateAzActive(){
+  AZ_RAF=0;
+  const bar=document.querySelector(".azbar"); if(!bar) return;
+  const cur=azCurrentBucket();
+  bar.querySelectorAll("button").forEach(b=>b.classList.toggle("active", b.dataset.l===cur));
+}
+function azOnScroll(){ if(!AZ_RAF) AZ_RAF=requestAnimationFrame(updateAzActive); }
+window.addEventListener("scroll",azOnScroll,{passive:true});
+window.addEventListener("resize",azOnScroll,{passive:true});
 async function viewLibrary(id){
   chrome("home",`<div class="empty">Loading…</div>`);
   const lib=(await api("/libraries")).find(l=>l.id==id);
@@ -838,7 +861,7 @@ async function viewLibrary(id){
     <div class="row">
       <span class="lbl">Sort</span>
       <select onchange="LIB_SORT=this.value;viewLibrary(${Number(id)})">
-        ${libOpt("title","Title (A–Z)",LIB_SORT)}${libOpt("added","Recently added",LIB_SORT)}${libOpt("year","Year",LIB_SORT)}</select>
+        ${libOpt("title","Title (A–Z)",LIB_SORT)}${libOpt("added","Recently added",LIB_SORT)}${libOpt("year","Year",LIB_SORT)}${libOpt("resolution","Resolution",LIB_SORT)}</select>
       <span class="lbl" style="margin-left:8px">Show</span>
       <select onchange="LIB_FILTER=this.value;viewLibrary(${Number(id)})">
         ${libOpt("all","Everything",LIB_FILTER)}${libOpt("unwatched","Unwatched",LIB_FILTER)}${libOpt("inprogress","In progress",LIB_FILTER)}${libOpt("watched","Watched",LIB_FILTER)}</select>
@@ -867,7 +890,7 @@ async function viewCategory(key){
     <div class="row">
       <span class="lbl">Sort</span>
       <select onchange="LIB_SORT=this.value;viewCategory(${esc(JSON.stringify(key))})">
-        ${libOpt("title","Title (A–Z)",LIB_SORT)}${libOpt("added","Recently added",LIB_SORT)}${libOpt("year","Year",LIB_SORT)}</select>
+        ${libOpt("title","Title (A–Z)",LIB_SORT)}${libOpt("added","Recently added",LIB_SORT)}${libOpt("year","Year",LIB_SORT)}${libOpt("resolution","Resolution",LIB_SORT)}</select>
       <span class="lbl" style="margin-left:8px">Show</span>
       <select onchange="LIB_FILTER=this.value;viewCategory(${esc(JSON.stringify(key))})">
         ${libOpt("all","Everything",LIB_FILTER)}${libOpt("unwatched","Unwatched",LIB_FILTER)}${libOpt("inprogress","In progress",LIB_FILTER)}${libOpt("watched","Watched",LIB_FILTER)}</select>
