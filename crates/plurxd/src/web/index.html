@@ -73,6 +73,9 @@
   .poster .meta{padding:8px 10px}
   .poster .t{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .poster .s{font-size:12px;color:var(--muted)}
+  .poster .cleft{font-size:11px;color:var(--muted);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .playinfo{color:var(--muted);font-size:13px;margin:10px 0 0}
+  .epmeta .epleft{color:var(--accent)}
   .poster .prog{position:absolute;left:0;right:0;bottom:0;height:5px;background:rgba(0,0,0,.55)}
   .poster .prog>i{display:block;height:100%;background:var(--accent);box-shadow:0 0 8px var(--accent)}
   /* A–Z jump rail: pinned to the right edge on alphabetically-sorted media
@@ -481,7 +484,7 @@ if(window.matchMedia){ try{ window.matchMedia("(prefers-color-scheme: dark)").ad
 </head>
 <body>
 <div id="app"></div>
-<div class="modal" id="modal"><div class="player" id="player"><video id="video" controls autoplay playsinline x-webkit-airplay="allow"></video><div class="pbar" id="pbar"><div class="ptitle" id="playTitle"></div><div class="row"><button class="pbtn" id="audiobtn" style="display:none" onclick="toggleMenu('audio')">🔊 Audio</button><button class="pbtn" id="subsbtn" style="display:none" onclick="toggleMenu('subs')">💬 Subtitles</button><button class="pbtn" id="qualbtn" title="Playback quality" onclick="toggleMenu('quality')">◆ Quality</button><button class="pbtn" id="syncbtn" title="Audio sync adjustment" onclick="toggleMenu('sync')">⇄ Sync</button><button class="pbtn" id="statsbtn" title="Playback info (i)" onclick="toggleStats()">ⓘ Stats</button><button class="pbtn" id="skipbtn" title="Auto-skip intro & credits" onclick="togglePlayerAutoskip()">⏭ Auto-skip</button><button class="pbtn" id="apbtn" style="display:none" title="AirPlay">📺 AirPlay</button><button class="pbtn" title="Close (Esc)" onclick="closePlayer()">✕ Close</button></div></div><div class="pskip" id="pskip"></div><div class="ploading" id="ploading"><div class="pspin"></div><div class="ploadText" id="ploadText">Loading…</div><div class="ploadSub" id="ploadSub"></div></div><div class="statsov" id="statsov"></div><div class="pmenu" id="pmenu"></div></div></div>
+<div class="modal" id="modal"><div class="player" id="player"><video id="video" controls autoplay playsinline x-webkit-airplay="allow"></video><div class="pbar" id="pbar"><div class="ptitle" id="playTitle"></div><div class="row"><button class="pbtn" id="audiobtn" style="display:none" onclick="toggleMenu('audio')">🔊 Audio</button><button class="pbtn" id="subsbtn" style="display:none" onclick="toggleMenu('subs')">💬 Subtitles</button><button class="pbtn" id="qualbtn" title="Playback quality" onclick="toggleMenu('quality')">◆ Quality</button><button class="pbtn" id="syncbtn" title="Audio sync adjustment" onclick="toggleMenu('sync')">⇄ Sync</button><button class="pbtn" id="statsbtn" title="Playback info (i)" onclick="toggleStats()">ⓘ Stats</button><button class="pbtn" id="skipbtn" title="Auto-skip intro & credits" onclick="togglePlayerAutoskip()">⏭ Auto-skip</button><button class="pbtn" id="autonextbtn" title="Auto-play the next episode when one finishes" onclick="togglePlayerAutonext()">▶ Autoplay</button><button class="pbtn" id="apbtn" style="display:none" title="AirPlay">📺 AirPlay</button><button class="pbtn" title="Close (Esc)" onclick="closePlayer()">✕ Close</button></div></div><div class="pskip" id="pskip"></div><div class="ploading" id="ploading"><div class="pspin"></div><div class="ploadText" id="ploadText">Loading…</div><div class="ploadSub" id="ploadSub"></div></div><div class="statsov" id="statsov"></div><div class="pmenu" id="pmenu"></div></div></div>
 <div class="toast" id="toast"></div>
 
 <script src="/assets/hls.min.js"></script>
@@ -706,7 +709,24 @@ async function pollActivity(){
 
 // ---- cards ----------------------------------------------------------------
 function progressPct(w){ if(!w||!w.duration_ms||!w.position_ms) return 0; return Math.min(100,100*w.position_ms/w.duration_ms); }
-function card(it, wide){
+// Time-left + projected finish clock ("ends ~10:45 PM"), in the browser's local
+// time. new Date()/Date.now() are fine here — this is browser JS, not a workflow.
+function itemDurMs(it){ return (it&&it.watch&&it.watch.duration_ms) || (it&&it.runtime_ms) || 0; }
+function fmtClock(d){ try{ return d.toLocaleTimeString([], {hour:"numeric",minute:"2-digit"}); }catch(e){ return ""; } }
+function endsAt(remMs){ if(!remMs||remMs<0) return ""; return fmtClock(new Date(Date.now()+remMs)); }
+// One meta line for a card in a watch-oriented row (Continue watching / Next up):
+// time left on a partial item (or full runtime), plus when it would finish now.
+function watchLine(it, watchCtx){
+  if(!watchCtx) return "";
+  const dur=itemDurMs(it); if(!dur) return "";
+  const w=it.watch;
+  if(w && w.watched) return "";
+  const partial = w && w.position_ms>3000;
+  const rem = partial ? Math.max(0, dur - w.position_ms) : dur;
+  const end = endsAt(rem);
+  return `<div class="cleft">${partial?fmtDur(rem)+" left":fmtDur(rem)}${end?" · ends ~"+end:""}</div>`;
+}
+function card(it, wide, watchCtx){
   const img = artHtml(it);
   const sub = it.kind==='episode'
       ? esc((it.show_title?it.show_title+" · ":"")+`S${it.season_number||0}E${it.episode_number||0}`)
@@ -715,7 +735,7 @@ function card(it, wide){
   const watched = it.watch&&it.watch.watched? `<span class="badge">✓</span>`:"";
   const prog = pct>0&&pct<100? `<div class="prog"><i style="width:${pct}%"></i></div>`:"";
   return `<div class="poster ${wide?'wide':''}" onclick="location.hash='#/item/${it.id}'">
-    ${img}${watched}<div class="meta"><div class="t">${esc(it.title)}</div><div class="s">${sub}</div></div>${prog}</div>`;
+    ${img}${watched}<div class="meta"><div class="t">${esc(it.title)}</div><div class="s">${sub}</div>${watchLine(it,watchCtx)}</div>${prog}</div>`;
 }
 function grid(items){ return items.length? `<div class="grid">${items.map(i=>card(i)).join("")}</div>` : `<div class="empty">Nothing here yet.</div>`; }
 
@@ -784,8 +804,8 @@ async function viewHome(){
   chrome("home", `<div id="hubs"><div class="empty">Loading…</div></div>`);
   const [libs, hubs] = await Promise.all([api("/libraries"), api("/hubs")]);
   let html=installBannerHtml();
-  if(hubs.continue_watching.length){ html+=`<h2 class="section">Continue watching</h2><div class="rowscroll">${hubs.continue_watching.map(i=>card(i,true)).join("")}</div>`; }
-  if(hubs.next_up && hubs.next_up.length){ html+=`<h2 class="section">Next up</h2><div class="rowscroll">${hubs.next_up.map(i=>card(i,i.kind==='episode')).join("")}</div>`; }
+  if(hubs.continue_watching.length){ html+=`<h2 class="section">Continue watching</h2><div class="rowscroll">${hubs.continue_watching.map(i=>card(i,true,true)).join("")}</div>`; }
+  if(hubs.next_up && hubs.next_up.length){ html+=`<h2 class="section">Next up</h2><div class="rowscroll">${hubs.next_up.map(i=>card(i,i.kind==='episode',true)).join("")}</div>`; }
   if(hubs.recently_added.length){ html+=`<h2 class="section">Recently added</h2><div class="rowscroll">${hubs.recently_added.map(i=>card(i,i.kind==='episode')).join("")}</div>`; }
   if(libs.length){
     const group=homeGroup();
@@ -981,6 +1001,8 @@ function epThumb(ep){
 }
 function episodeRow(ep){
   const bits=[ep.episode_number!=null?`Episode ${ep.episode_number}`:'',fmtDur(ep.runtime_ms)].filter(Boolean).map(m=>`<span>${esc(m)}</span>`);
+  const epw=ep.watch, epdur=itemDurMs(ep);
+  if(epw && !epw.watched && epw.position_ms>3000 && epdur) bits.push(`<span class="epleft">${esc(fmtDur(Math.max(0,epdur-epw.position_ms))+" left")}</span>`);
   if(ep.watch&&ep.watch.watched) bits.push('<span class="epwatched">✓ Watched</span>');
   return `<div class="eprow" onclick="location.hash='#/item/${ep.id}'">
     ${epThumb(ep)}
@@ -1028,6 +1050,8 @@ async function viewItem(id){
         <button class="btnplay" onclick='play(${playable.id},${esc(JSON.stringify(it.title))},${resume},${playable.duration_ms||0})'>▶ ${resume?`Resume · ${fmtDur(resume)}`:'Play'}</button>
         ${resume?`<button class="ghost" onclick='play(${playable.id},${esc(JSON.stringify(it.title))},0,${playable.duration_ms||0})'>Start over</button>`:''}
         ${watchBtn}</div>`;
+      const pdur=playable.duration_ms||runtime||0, prem=resume?Math.max(0,pdur-resume):pdur, pend=endsAt(prem);
+      if(prem) body+=`<div class="playinfo">${resume?fmtDur(prem)+" left":fmtDur(prem)}${pend?" · ends ~"+pend:""}</div>`;
     } else {
       const p=best.missing_path;
       body+=`<div class="filemissing">⚠ This file is missing on the server, so it can’t be played — its library path may be unmounted, moved, or renamed${ME.is_admin&&p?`:<br><code>${esc(p)}</code>`:'.'}</div><div class="actions">${watchBtn}</div>`;
@@ -1189,6 +1213,7 @@ async function play(fileId, title, resumeMs, knownDurMs){
   setupTrackMenus();
   renderSkip(null);
   const sb=document.getElementById("skipbtn"); if(sb) sb.classList.toggle("on", PLAYER.autoskip);
+  const ab=document.getElementById("autonextbtn"); if(ab) ab.classList.toggle("on", autoNextOn());
   // Server-chosen default subtitle (Settings → Playback defaults / anime rule).
   // Native <track> subs ride direct/remux only; transcode burns them instead.
   const defSub=PLAYER.subs.find(s=>s.default);
@@ -1228,7 +1253,7 @@ async function play(fileId, title, resumeMs, knownDurMs){
 
   clearInterval(PLAYER.timer);
   PLAYER.timer=setInterval(()=>reportProgress(fileId), 5000);
-  video.onended=()=>{ reportProgress(fileId,true); };
+  video.onended=()=>{ reportProgress(fileId,true); finishPlayback(false); };
   playerActivity();
 }
 // Open (or re-open) a copy-video HLS session for the current file and attach it
@@ -1405,7 +1430,7 @@ function skipMarker(m){
   const c=document.getElementById("pskip"); if(c){ c.innerHTML=""; c.dataset.k=""; }
   // Credits that run to the very end → treat "skip" as "finished".
   if(m.kind==="credits" && PLAYER.durMs && m.end_ms>=PLAYER.durMs-2500){
-    reportProgress(PLAYER.fileId,true); return closePlayer();
+    reportProgress(PLAYER.fileId,true); return finishPlayback(true);
   }
   seekTo(m.end_ms/1000);
 }
@@ -1440,6 +1465,55 @@ function setAutoskip(on){ try{ localStorage.setItem("plurx_autoskip", on?"1":"0"
   if(PLAYER) PLAYER.autoskip=on;
   const b=document.getElementById("skipbtn"); if(b){ b.classList.toggle("on", on); b.title=(on?"Auto-skip on — ":"Auto-skip off — ")+"intro & credits"; } }
 function togglePlayerAutoskip(){ setAutoskip(!autoskipOn()); toast(autoskipOn()?"Auto-skip on":"Auto-skip off"); }
+// ---- autoplay next episode (per browser, default on) ----------------------
+function autoNextOn(){ try{ return localStorage.getItem("plurx_autonext")!=="0"; }catch(e){ return true; } }
+function setAutoNext(on){ try{ localStorage.setItem("plurx_autonext", on?"1":"0"); }catch(e){}
+  const b=document.getElementById("autonextbtn"); if(b) b.classList.toggle("on", on);
+  const c=document.getElementById("autonext"); if(c) c.checked=on; }
+function togglePlayerAutonext(){ setAutoNext(!autoNextOn()); toast(autoNextOn()?"Autoplay next: on":"Autoplay next: off"); }
+// Find and play the episode after the one that just finished — next in the
+// season, else the first episode of the next season. Reuses AUTOPLAY-on-navigate
+// so the page behind the player follows along. Returns true if it started one.
+async function playNextEpisode(){
+  const itemId=ITEM_FOR_FILE[PLAYER&&PLAYER.fileId]; if(!itemId) return false;
+  let cur; try{ cur=await api(`/items/${itemId}`); }catch(e){ return false; }
+  if(!cur.item || cur.item.kind!=='episode') return false;   // movies don't chain
+  const anc=cur.ancestors||[], season=anc[anc.length-1], show=anc[anc.length-2];
+  if(!season) return false;
+  let next=null;
+  const sd=await api(`/items/${season.id}`).catch(()=>null);
+  if(sd){
+    const eps=(sd.children||[]).filter(c=>c.kind==='episode');
+    const i=eps.findIndex(e=>e.id===itemId);
+    if(i>=0 && eps[i+1]) next=eps[i+1];
+  }
+  if(!next && show){                                         // roll over to next season
+    const shd=await api(`/items/${show.id}`).catch(()=>null);
+    if(shd){
+      const seasons=(shd.children||[]).filter(c=>c.kind==='season');
+      const si=seasons.findIndex(s=>s.id===season.id);
+      if(si>=0 && seasons[si+1]){
+        const nsd=await api(`/items/${seasons[si+1].id}`).catch(()=>null);
+        if(nsd) next=(nsd.children||[]).filter(c=>c.kind==='episode')[0]||null;
+      }
+    }
+  }
+  if(!next) return false;                                    // end of the series
+  AUTOPLAY=next.id;
+  toast("▶ Up next: "+next.title);
+  location.hash="#/item/"+next.id;
+  return true;
+}
+// Video reached its natural end (or auto-skipped credits hit the end): play the
+// next episode if autoplay is on, otherwise fall back to prior behavior.
+async function finishPlayback(closeIfNoNext){
+  if(autoNextOn()){
+    setLoading(true,"Up next…","finding the next episode");
+    if(await playNextEpisode()) return;                      // navigation + play take over
+    setLoading(false);
+  }
+  if(closeIfNoNext) closePlayer();
+}
 
 // ---- audio-language + subtitle menus --------------------------------------
 const LANGS={eng:"English",en:"English",jpn:"Japanese",ja:"Japanese",spa:"Spanish",es:"Spanish",
@@ -1806,6 +1880,7 @@ function playbackPanel(settings){
           <option value="always" ${settings.sub_mode==='always'?'selected':''}>Always on</option>
           <option value="off" ${settings.sub_mode==='off'?'selected':''}>Off</option></select></div>
       </div>
+      <label class="row" style="margin:16px 0 0;font-size:14px;color:var(--text)"><input type="checkbox" id="autonext" ${autoNextOn()?'checked':''} onchange="setAutoNext(this.checked)" style="width:auto;margin-right:9px"> Auto-play the next episode when one finishes <span class="muted" style="font-size:12px;margin-left:6px">· saved on this browser</span></label>
       <div class="err" id="perr"></div>
       <button style="margin-top:12px" onclick="savePlayback()">Save defaults</button></div>`;
 }
