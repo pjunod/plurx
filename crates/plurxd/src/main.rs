@@ -3,6 +3,7 @@ mod logbuf;
 mod state;
 mod trakt;
 mod transcode;
+mod version;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -17,7 +18,14 @@ use tracing_subscriber::EnvFilter;
 use crate::state::{AppState, SystemInfo};
 
 #[derive(Parser)]
-#[command(name = "plurxd", version, about = "plurx media server daemon")]
+// `--version` carries the build stamp too: "0.1.0 (v0.1.0-14-gc0ffee)". The
+// bare number is what a release *is*; the git description is what someone
+// filing a bug is actually running.
+#[command(
+    name = "plurxd",
+    version = crate::version::LONG,
+    about = "plurx media server daemon"
+)]
 struct Cli {
     /// Path to a TOML config file (default: ./plurx.toml or
     /// /etc/plurx/plurx.toml if present).
@@ -184,7 +192,8 @@ async fn run(config: Config) -> anyhow::Result<()> {
 
     let instance_id = store.instance_id().await?;
     tracing::info!(
-        version = env!("CARGO_PKG_VERSION"),
+        version = crate::version::SEMVER,
+        build = crate::version::BUILD,
         server_name = %config.server.name,
         %instance_id,
         data_dir = %config.storage.data_dir.display(),
@@ -266,7 +275,9 @@ async fn gdm_responder(instance_id: String, name: String, port: u16) -> anyhow::
         "GDM discovery responder listening"
     );
 
-    let version = env!("CARGO_PKG_VERSION");
+    // Plex clients parse what GDM advertises, so this stays bare semver — the
+    // git build stamp would not survive their version comparisons.
+    let version = crate::version::SEMVER;
     let mut buf = [0u8; 1024];
     loop {
         let (n, addr) = socket.recv_from(&mut buf).await?;

@@ -35,7 +35,10 @@ plan live in [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) and
 [docs/ROADMAP.md](docs/ROADMAP.md); client strategy in
 [docs/CLIENTS.md](docs/CLIENTS.md); the trust model — who can reach what, and
 what plurx leaves to the reverse proxy — in [docs/SECURITY.md](docs/SECURITY.md);
-deploy recipes in [deploy/README.md](deploy/README.md).
+deploy recipes in [deploy/README.md](deploy/README.md). What the version numbers
+promise, and how a release is cut, is in
+[docs/RELEASING.md](docs/RELEASING.md); what changed between them is in
+[CHANGELOG.md](CHANGELOG.md).
 
 ## What it looks like
 

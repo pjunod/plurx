@@ -17,7 +17,10 @@ use crate::state::{AppState, ScanStatus};
 #[derive(Serialize)]
 pub struct ServerInfo {
     pub name: String,
+    /// Bare semver — clients compare this.
     pub version: &'static str,
+    /// Git description of the exact build ("v0.1.0-14-gc0ffee"), for support.
+    pub build: &'static str,
     pub instance_id: String,
     pub uptime_seconds: u64,
     /// True when no users exist yet — the web app shows first-run setup.
@@ -34,7 +37,8 @@ pub async fn server_info(State(state): State<AppState>) -> Result<Json<ServerInf
     let android_app = super::web::android_apk_path(&state.system.data_dir).is_some();
     Ok(Json(ServerInfo {
         name: state.server_name.clone(),
-        version: env!("CARGO_PKG_VERSION"),
+        version: crate::version::SEMVER,
+        build: crate::version::BUILD,
         instance_id,
         uptime_seconds: state.started_at.elapsed().as_secs(),
         setup_required,
@@ -84,6 +88,7 @@ pub async fn setup(
 pub struct SystemDto {
     pub name: String,
     pub version: &'static str,
+    pub build: &'static str,
     pub instance_id: String,
     pub uptime_seconds: u64,
     pub users: i64,
@@ -101,7 +106,8 @@ pub async fn system_info(
 ) -> Result<Json<SystemDto>, ApiError> {
     Ok(Json(SystemDto {
         name: state.server_name.clone(),
-        version: env!("CARGO_PKG_VERSION"),
+        version: crate::version::SEMVER,
+        build: crate::version::BUILD,
         instance_id: state.store.instance_id().await?,
         uptime_seconds: state.started_at.elapsed().as_secs(),
         users: state.store.count_users().await?,
@@ -528,7 +534,7 @@ pub async fn metrics(State(state): State<AppState>) -> impl axum::response::Into
     let body = format!(
         "# HELP plurx_build_info Build information.\n\
          # TYPE plurx_build_info gauge\n\
-         plurx_build_info{{version=\"{version}\"}} 1\n\
+         plurx_build_info{{version=\"{version}\",build=\"{build}\"}} 1\n\
          # HELP plurx_uptime_seconds Seconds since this node started.\n\
          # TYPE plurx_uptime_seconds gauge\n\
          plurx_uptime_seconds {uptime}\n\
@@ -541,7 +547,8 @@ pub async fn metrics(State(state): State<AppState>) -> impl axum::response::Into
          # HELP plurx_users_total Registered users.\n\
          # TYPE plurx_users_total gauge\n\
          plurx_users_total {users}\n",
-        version = env!("CARGO_PKG_VERSION"),
+        version = crate::version::SEMVER,
+        build = crate::version::BUILD,
     );
     (
         [(

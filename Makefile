@@ -53,9 +53,28 @@ coverage: ## Line coverage (installs cargo-llvm-cov on first run); writes lcov.i
 
 ## ---- packaging & setup -------------------------------------------------
 
+# What a build from this tree stamps into the binary. Keep in step with
+# crates/plurxd/build.rs — see docs/RELEASING.md.
+VERSION := $(shell sed -n '/^\[workspace.package\]/,/^\[/p' Cargo.toml | sed -n 's/^version = "\(.*\)"/\1/p' | head -1)
+BUILD_REF := $(shell git describe --tags --always --dirty 2>/dev/null || echo unknown)
+
+.PHONY: version
+version: ## Print the version and git build stamp a build would report
+	@echo "$(VERSION) ($(BUILD_REF))"
+
 .PHONY: docker
 docker: ## Build the container image
-	docker build -t plurx/plurxd:latest .
+	docker build --build-arg PLURX_BUILD_REF="$(BUILD_REF)" -t plurx/plurxd:latest .
+
+.PHONY: release-check
+release-check: ## Verify the tree is ready to tag the current version
+	@test -z "$$(git status --porcelain)" || { echo "working tree is dirty — commit first"; exit 1; }
+	@git rev-parse -q --verify "refs/tags/v$(VERSION)" >/dev/null \
+	  && { echo "tag v$(VERSION) already exists — bump the version in Cargo.toml"; exit 1; } || true
+	@grep -q '^## \[$(VERSION)\]' CHANGELOG.md \
+	  || { echo "CHANGELOG.md has no '## [$(VERSION)]' section"; exit 1; }
+	@$(MAKE) --no-print-directory check
+	@echo "Ready: git tag -a v$(VERSION) -m 'v$(VERSION)' && git push && git push --tags"
 
 .PHONY: hooks
 hooks: ## Install the git pre-commit hook (runs `make check`)

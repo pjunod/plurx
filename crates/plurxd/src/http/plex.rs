@@ -389,8 +389,11 @@ pub async fn search(
     Ok(xml(plex::container(elements)))
 }
 
+/// What we advertise to Plex clients. Bare semver on purpose: several clients
+/// gate features on a numeric comparison of this string, and a git build stamp
+/// would not parse.
 fn version() -> &'static str {
-    env!("CARGO_PKG_VERSION")
+    crate::version::SEMVER
 }
 
 /// Parse a Plex `key` like `/library/metadata/42` into a rating key.

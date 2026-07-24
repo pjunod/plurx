@@ -1,6 +1,13 @@
 # syntax=docker/dockerfile:1
 
 FROM rust:1-bookworm AS build
+# `.git` is not in the build context (see .dockerignore), so the build script
+# can't derive the commit itself — CI passes it in, e.g.
+#   docker build --build-arg PLURX_BUILD_REF="$(git describe --tags --always --dirty)"
+# Left empty, the binary reports its version with build "unknown", which is
+# honest about a context that genuinely has no commit in it.
+ARG PLURX_BUILD_REF=""
+ENV PLURX_BUILD_REF=${PLURX_BUILD_REF}
 WORKDIR /src
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
