@@ -178,11 +178,68 @@ pub struct ClientLog {
     pub ua: Option<String>,
 }
 
+/// Sustained rate and burst allowance for `/client-log`, in reports per minute.
+///
+/// The log ring holds 2000 lines, so a browser that hits an error in a loop can
+/// erase every other line in it in seconds — destroying precisely the history an
+/// operator opened the page to read. That is not hypothetical: a stranded
+/// hls.js instance polling a playlist that never ends fires a fatal error on a
+/// timer, and there was no bound on how many of those could pile up.
+const CLIENT_LOG_PER_MIN: u32 = 30;
+
+/// Token bucket guarding the log ring. Global rather than per-user: the ring is
+/// global, so it's the total rate that has to be bounded.
+struct LogBucket {
+    tokens: f64,
+    /// `None` until the first report — `Instant` has no const constructor.
+    last: Option<std::time::Instant>,
+    /// Reports dropped since the last admitted one, so the gap is reported
+    /// rather than silently swallowed.
+    suppressed: u64,
+}
+
+impl LogBucket {
+    /// Take a token. `Some(n)` means record this report and mention that `n`
+    /// were dropped before it; `None` means drop it.
+    fn admit(&mut self, now: std::time::Instant) -> Option<u64> {
+        let elapsed = self
+            .last
+            .map(|t| now.saturating_duration_since(t).as_secs_f64())
+            .unwrap_or(0.0);
+        self.last = Some(now);
+        self.tokens = (self.tokens + elapsed * (CLIENT_LOG_PER_MIN as f64 / 60.0))
+            .min(CLIENT_LOG_PER_MIN as f64);
+        if self.tokens < 1.0 {
+            self.suppressed += 1;
+            return None;
+        }
+        self.tokens -= 1.0;
+        Some(std::mem::take(&mut self.suppressed))
+    }
+}
+
+static CLIENT_LOG_BUCKET: std::sync::Mutex<LogBucket> = std::sync::Mutex::new(LogBucket {
+    tokens: CLIENT_LOG_PER_MIN as f64,
+    last: None,
+    suppressed: 0,
+});
+
 /// POST /api/v1/client-log — any signed-in user. Records one browser playback
 /// error into the server log ring so it surfaces in `Settings → Logs`. Bounded
-/// by per-field clipping (this is diagnostics, not an audit trail), and tagged
-/// with the `plurxd::client` target so it's visibly a client report.
+/// by per-field clipping and by a global rate limit (this is diagnostics, not an
+/// audit trail), and tagged with the `plurxd::client` target so it's visibly a
+/// client report.
 pub async fn client_log(_user: AuthUser, Json(ev): Json<ClientLog>) -> StatusCode {
+    let suppressed = match CLIENT_LOG_BUCKET.lock() {
+        Ok(mut b) => b.admit(std::time::Instant::now()),
+        // Fail open: a poisoned lock must not silence diagnostics.
+        Err(_) => Some(0),
+    };
+    // Still 204 when dropped. The client is reporting, not asking, and an error
+    // response would only give it something new to report about.
+    let Some(suppressed) = suppressed else {
+        return StatusCode::NO_CONTENT;
+    };
     /// Trim and cap one field so a client can't spam oversized log lines.
     fn clip(s: &str, n: usize) -> String {
         let s = s.trim();
@@ -234,6 +291,9 @@ pub async fn client_log(_user: AuthUser, Json(ev): Json<ClientLog>) -> StatusCod
     }
     if let Some(d) = field(&ev.detail, 200) {
         line.push_str(&format!(" [{d}]"));
+    }
+    if suppressed > 0 {
+        line.push_str(&format!(" (+{suppressed} suppressed)"));
     }
 
     // Both WARN and ERROR clear the default `info` filter, so either shows in
@@ -594,4 +654,65 @@ pub async fn metrics(State(state): State<AppState>) -> impl axum::response::Into
         )],
         body,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// The log ring must survive a client stuck in an error loop: the burst gets
+    /// through, the flood does not, and the gap is accounted for rather than
+    /// silently dropped.
+    #[test]
+    fn client_log_bucket_bounds_a_flood_and_counts_the_gap() {
+        let t0 = Instant::now();
+        let mut b = LogBucket {
+            tokens: CLIENT_LOG_PER_MIN as f64,
+            last: None,
+            suppressed: 0,
+        };
+
+        // The full burst is admitted, nothing suppressed yet.
+        for _ in 0..CLIENT_LOG_PER_MIN {
+            assert_eq!(b.admit(t0), Some(0));
+        }
+        // The next 500 in the same instant are dropped.
+        for _ in 0..500 {
+            assert_eq!(b.admit(t0), None);
+        }
+
+        // Two seconds later one token has refilled (30/min), and the report that
+        // spends it carries the count of everything dropped meanwhile.
+        let t1 = t0 + Duration::from_secs(2);
+        assert_eq!(b.admit(t1), Some(500));
+        // That count resets once reported.
+        let t2 = t1 + Duration::from_secs(2);
+        assert_eq!(b.admit(t2), Some(0));
+
+        // A long quiet period refills to the burst cap and no further: an idle
+        // client can't bank hours of credit and then dump it.
+        let t3 = t2 + Duration::from_secs(3600);
+        for _ in 0..CLIENT_LOG_PER_MIN {
+            assert_eq!(b.admit(t3), Some(0));
+        }
+        assert_eq!(b.admit(t3), None);
+    }
+
+    /// A steady trickle below the limit is never throttled — normal playback
+    /// errors keep flowing.
+    #[test]
+    fn client_log_bucket_passes_a_normal_trickle() {
+        let mut now = Instant::now();
+        let mut b = LogBucket {
+            tokens: CLIENT_LOG_PER_MIN as f64,
+            last: None,
+            suppressed: 0,
+        };
+        // One report every 5s for an hour: well under 30/min.
+        for _ in 0..720 {
+            assert_eq!(b.admit(now), Some(0));
+            now += Duration::from_secs(5);
+        }
+    }
 }

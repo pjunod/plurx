@@ -30,6 +30,10 @@ bump may break compatibility and a **patch** bump never does.
 - Fixed a progress-timer leak on auto-next: each episode transition left the
   previous episode's 5-second progress poster running, so after N episodes N+1
   reported concurrently.
+- `POST /api/v1/client-log` is rate-limited to 30 reports/minute. A browser
+  looping on an error could otherwise flush the entire 2000-line log ring in
+  seconds, erasing the history an operator opens the page to read. Suppressed
+  reports are counted and reported rather than silently dropped.
 
 ## [0.1.0] — 2026-07-22
 
