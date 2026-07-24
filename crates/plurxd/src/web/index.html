@@ -84,7 +84,17 @@
      same icon-size setting as the grids. ×4/3 preserves the original rail:poster
      ratio (the shipped 200:150), so rails stay proportionally larger and scale
      with the selection instead of staying pinned at one width. */
-  .rowscroll{display:grid;grid-auto-flow:column;grid-auto-columns:calc(var(--poster,120px) * 4 / 3);gap:16px;overflow-x:auto;padding-bottom:8px;scrollbar-width:thin;align-items:start}
+  /* Rails scroll horizontally, but the scrollbar is hidden until you hover the
+     row (desktop) — cleaner at rest; on touch it never shows (swipe is the
+     gesture). The padding-bottom holds the space so nothing shifts on reveal. */
+  .rowscroll{display:grid;grid-auto-flow:column;grid-auto-columns:calc(var(--poster,120px) * 4 / 3);gap:16px;overflow-x:auto;padding-bottom:8px;align-items:start;scrollbar-width:none}
+  .rowscroll::-webkit-scrollbar{height:0}
+  .rowscroll::-webkit-scrollbar-thumb{border-radius:8px;background:transparent}
+  @media(hover:hover){
+    .rowscroll:hover{scrollbar-width:thin;scrollbar-color:color-mix(in srgb,var(--text) 26%,transparent) transparent}
+    .rowscroll:hover::-webkit-scrollbar{height:8px}
+    .rowscroll:hover::-webkit-scrollbar-thumb{background:color-mix(in srgb,var(--text) 22%,transparent)}
+  }
   .poster{background:var(--panel2);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;cursor:pointer;transition:transform .12s,border-color .12s;position:relative}
   .poster:hover{transform:translateY(-3px);border-color:var(--accent)}
   .poster .art{aspect-ratio:2/3;width:100%;object-fit:cover;display:block;background:var(--panel2)}
@@ -191,6 +201,25 @@
   .pskip button{background:rgba(18,20,26,.82);color:#fff;border:1px solid rgba(255,255,255,.22);border-radius:10px;
     padding:11px 18px;font-size:14px;font-weight:600;cursor:pointer;backdrop-filter:blur(6px);box-shadow:0 8px 26px rgba(0,0,0,.45);transition:background .12s,border-color .12s}
   .pskip button:hover{background:var(--accent);border-color:var(--accent)}
+  /* Custom bottom transport: our own scrubber + times, driven by the known
+     duration (PLAYER.durMs) and the true position (offset + currentTime). The
+     native <video> bar can't show either for a progressive remux (its duration
+     grows) or an offset HLS stream, so we own the control. Auto-hides with the
+     rest of the chrome; the seek fires on release, not on every drag tick. */
+  .ptransport{position:absolute;left:0;right:0;bottom:0;z-index:5;display:flex;align-items:center;gap:10px;
+    padding:12px 20px calc(12px + env(safe-area-inset-bottom,0px));
+    background:linear-gradient(to top,rgba(0,0,0,.8),rgba(0,0,0,0));transition:opacity .2s ease-out}
+  .player.idle .ptransport{opacity:0;pointer-events:none}
+  .picon{background:transparent;border:0;color:#fff;font-size:17px;line-height:1;cursor:pointer;padding:4px;opacity:.92;text-shadow:0 1px 4px rgba(0,0,0,.6)}
+  .picon:hover{opacity:1;color:var(--accent)}
+  .ptime{color:#fff;font:12px/1 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;text-shadow:0 1px 4px rgba(0,0,0,.7);min-width:46px;text-align:center;flex:0 0 auto}
+  .pseek{position:relative;flex:1 1 auto;height:16px;display:flex;align-items:center;cursor:pointer;touch-action:none}
+  .pseek::before{content:"";position:absolute;left:0;right:0;height:5px;border-radius:3px;background:rgba(255,255,255,.26)}
+  .pseek-buf,.pseek-fill{position:absolute;left:0;height:5px;border-radius:3px;width:0}
+  .pseek-buf{background:rgba(255,255,255,.4)}
+  .pseek-fill{background:var(--accent)}
+  .pseek-thumb{position:absolute;left:0;width:13px;height:13px;border-radius:50%;background:#fff;box-shadow:0 1px 4px rgba(0,0,0,.5);transform:translateX(-50%);pointer-events:none}
+  @media(max-width:520px){ .ptransport .nudge{display:none} }   /* tight phones: drop ±10s, keep the scrubber */
   .statsov{position:absolute;top:64px;left:20px;max-width:360px;background:rgba(8,10,15,.84);border:1px solid rgba(255,255,255,.12);
     border-radius:10px;padding:11px 13px;font:12px/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#e8e8ea;
     display:none;pointer-events:none;backdrop-filter:blur(5px);z-index:5}
@@ -522,7 +551,7 @@ if(window.matchMedia){ try{ window.matchMedia("(prefers-color-scheme: dark)").ad
 </head>
 <body>
 <div id="app"></div>
-<div class="modal" id="modal"><div class="player" id="player"><video id="video" controls autoplay playsinline x-webkit-airplay="allow"></video><div class="pbar" id="pbar"><div class="ptitle" id="playTitle"></div><div class="row"><button class="pbtn" id="audiobtn" style="display:none" onclick="toggleMenu('audio')">🔊 Audio</button><button class="pbtn" id="subsbtn" style="display:none" onclick="toggleMenu('subs')">💬 Subtitles</button><button class="pbtn" id="qualbtn" title="Playback quality" onclick="toggleMenu('quality')">◆ Quality</button><button class="pbtn" id="syncbtn" title="Audio sync adjustment" onclick="toggleMenu('sync')">⇄ Sync</button><button class="pbtn" id="statsbtn" title="Playback info (i)" onclick="toggleStats()">ⓘ Stats</button><button class="pbtn" id="skipbtn" title="Auto-skip intro & credits" onclick="togglePlayerAutoskip()">⏭ Auto-skip</button><button class="pbtn" id="autonextbtn" title="Auto-play the next episode when one finishes" onclick="togglePlayerAutonext()">▶ Autoplay</button><button class="pbtn" id="apbtn" style="display:none" title="AirPlay">📺 AirPlay</button><button class="pbtn" title="Close (Esc)" onclick="closePlayer()">✕ Close</button></div></div><div class="pskip" id="pskip"></div><div class="ploading" id="ploading"><div class="pspin"></div><div class="ploadText" id="ploadText">Loading…</div><div class="ploadSub" id="ploadSub"></div></div><div class="statsov" id="statsov"></div><div class="pmenu" id="pmenu"></div></div></div>
+<div class="modal" id="modal"><div class="player" id="player"><video id="video" autoplay playsinline x-webkit-airplay="allow"></video><div class="pbar" id="pbar"><div class="ptitle" id="playTitle"></div><div class="row"><button class="pbtn" id="audiobtn" style="display:none" onclick="toggleMenu('audio')">🔊 Audio</button><button class="pbtn" id="subsbtn" style="display:none" onclick="toggleMenu('subs')">💬 Subtitles</button><button class="pbtn" id="qualbtn" title="Playback quality" onclick="toggleMenu('quality')">◆ Quality</button><button class="pbtn" id="syncbtn" title="Audio sync adjustment" onclick="toggleMenu('sync')">⇄ Sync</button><button class="pbtn" id="statsbtn" title="Playback info (i)" onclick="toggleStats()">ⓘ Stats</button><button class="pbtn" id="skipbtn" title="Auto-skip intro & credits" onclick="togglePlayerAutoskip()">⏭ Auto-skip</button><button class="pbtn" id="autonextbtn" title="Auto-play the next episode when one finishes" onclick="togglePlayerAutonext()">▶ Autoplay</button><button class="pbtn" id="apbtn" style="display:none" title="AirPlay">📺 AirPlay</button><button class="pbtn" title="Close (Esc)" onclick="closePlayer()">✕ Close</button></div></div><div class="ptransport" id="ptransport"><button class="picon" id="pbplay" title="Play / Pause (space)" onclick="togglePlay()">▶</button><button class="picon nudge" title="Back 10s (←)" onclick="nudge(-10)">↺</button><button class="picon nudge" title="Forward 10s (→)" onclick="nudge(10)">↻</button><span class="ptime" id="ptcur">0:00</span><div class="pseek" id="pseek"><div class="pseek-buf" id="pseekbuf"></div><div class="pseek-fill" id="pseekfill"></div><div class="pseek-thumb" id="pseekthumb"></div></div><span class="ptime" id="ptdur">0:00</span><button class="picon" id="pbpip" title="Picture-in-picture" style="display:none" onclick="togglePip()">◲</button><button class="picon" id="pbfs" title="Fullscreen (f)" onclick="toggleFullscreen()">⛶</button></div><div class="pskip" id="pskip"></div><div class="ploading" id="ploading"><div class="pspin"></div><div class="ploadText" id="ploadText">Loading…</div><div class="ploadSub" id="ploadSub"></div></div><div class="statsov" id="statsov"></div><div class="pmenu" id="pmenu"></div></div></div>
 <div class="toast" id="toast"></div>
 
 <script src="/assets/hls.min.js"></script>
@@ -1332,6 +1361,7 @@ async function play(fileId, title, resumeMs, knownDurMs){
   clearInterval(PLAYER.timer);
   PLAYER.timer=setInterval(()=>reportProgress(fileId), 5000);
   video.onended=()=>{ reportProgress(fileId,true); finishPlayback(false); };
+  pbTick(); pbSyncPlayIcon();   // seed the transport (total time, play icon) at once
   playerActivity();
 }
 // Open (or re-open) a copy-video HLS session for the current file and attach it
@@ -1447,13 +1477,72 @@ function playerActivity(){
     if(v&&!v.paused&&!v.ended) p.classList.add("idle");
   },2600);
 }
+// ---- custom transport (scrubber + times) ----------------------------------
+// Total from the known duration (PLAYER.durMs), position from offset+currentTime
+// — the values the native <video> bar gets wrong on a growing remux / offset HLS
+// stream. Seeking routes through the method-aware seekTo().
+function pbTotalSec(){ const v=document.getElementById("video");
+  if(PLAYER&&PLAYER.durMs) return PLAYER.durMs/1000;
+  return (v&&isFinite(v.duration)&&v.duration>0)?((PLAYER&&PLAYER.offset)||0)+v.duration:0; }
+function pbPosSec(){ const v=document.getElementById("video"); return ((PLAYER&&PLAYER.offset)||0)+((v&&v.currentTime)||0); }
+function pbTick(){
+  if(!PLAYER) return;
+  const v=document.getElementById("video");
+  const tot=pbTotalSec();
+  const pos=PLAYER._seekPreview!=null?PLAYER._seekPreview:pbPosSec();
+  const f=tot>0?Math.min(1,Math.max(0,pos/tot)):0;
+  const fill=document.getElementById("pseekfill"), thumb=document.getElementById("pseekthumb"), buf=document.getElementById("pseekbuf");
+  if(fill) fill.style.width=(f*100)+"%";
+  if(thumb) thumb.style.left=(f*100)+"%";
+  const cur=document.getElementById("ptcur"); if(cur) cur.textContent=clockFromSec(pos);
+  const dur=document.getElementById("ptdur"); if(dur) dur.textContent=tot>0?clockFromSec(tot):"--:--";
+  if(buf){ let bf=0; try{ if(v&&v.buffered&&v.buffered.length){ const be=((PLAYER.offset)||0)+v.buffered.end(v.buffered.length-1); bf=tot>0?Math.min(1,be/tot):0; } }catch(e){} buf.style.width=(bf*100)+"%"; }
+}
+function pbSyncPlayIcon(){ const v=document.getElementById("video"), b=document.getElementById("pbplay"); if(b&&v) b.textContent=(v.paused||v.ended)?"▶":"❚❚"; }
+function togglePlay(){ const v=document.getElementById("video"); if(!v) return; if(v.paused||v.ended) v.play().catch(()=>{}); else v.pause(); playerActivity(); }
+// ±10s nudges coalesce: accumulate against a frozen base, preview live on the
+// scrubber, and fire ONE seekTo after a short quiet — so mashing the button (or
+// holding an arrow) doesn't restart the transcode stream over and over.
+let NUDGE_T=null;
+function nudge(d){
+  const me=PLAYER; if(!me) return;
+  me._nudgeAcc=(me._nudgeAcc||0)+d;
+  if(me._nudgeBase==null) me._nudgeBase=pbPosSec();
+  me._seekPreview=Math.max(0, me._nudgeBase+me._nudgeAcc); pbTick(); playerActivity();
+  clearTimeout(NUDGE_T);
+  NUDGE_T=setTimeout(()=>{ if(PLAYER!==me) return;
+    const t=Math.max(0, me._nudgeBase+me._nudgeAcc);
+    me._nudgeAcc=0; me._nudgeBase=null; me._seekPreview=null; seekTo(t); }, 350);
+}
+async function togglePip(){ const v=document.getElementById("video"); try{ if(document.pictureInPictureElement) await document.exitPictureInPicture(); else if(v) await v.requestPictureInPicture(); }catch(e){} }
+function toggleFullscreen(){ const p=document.getElementById("player"), v=document.getElementById("video");
+  try{
+    if(document.fullscreenElement||document.webkitFullscreenElement){ (document.exitFullscreen||document.webkitExitFullscreen).call(document); return; }
+    if(p&&p.requestFullscreen) p.requestFullscreen();
+    else if(p&&p.webkitRequestFullscreen) p.webkitRequestFullscreen();
+    else if(v&&v.webkitEnterFullscreen) v.webkitEnterFullscreen();   // iOS iPhone: video-only fullscreen
+  }catch(e){}
+}
+// Drag the scrubber (pointer events cover mouse + touch). Dragging previews the
+// time without touching the stream; the actual seek fires on release.
+function pbWireSeek(){
+  const seek=document.getElementById("pseek"); if(!seek||seek._wired) return; seek._wired=true;
+  const frac=e=>{ const r=seek.getBoundingClientRect(); return r.width?Math.min(1,Math.max(0,((e.clientX||0)-r.left)/r.width)):0; };
+  let drag=false;
+  seek.addEventListener("pointerdown",e=>{ drag=true; try{seek.setPointerCapture(e.pointerId);}catch(_){}
+    PLAYER._seekPreview=frac(e)*pbTotalSec(); pbTick(); playerActivity(); e.preventDefault(); });
+  seek.addEventListener("pointermove",e=>{ if(!drag)return; PLAYER._seekPreview=frac(e)*pbTotalSec(); pbTick(); playerActivity(); });
+  const done=e=>{ if(!drag)return; drag=false; const t=frac(e)*pbTotalSec(); PLAYER._seekPreview=null; seekTo(t); };
+  seek.addEventListener("pointerup",done);
+  seek.addEventListener("pointercancel",()=>{ if(!drag)return; drag=false; const t=PLAYER._seekPreview; PLAYER._seekPreview=null; if(t!=null) seekTo(t); else pbTick(); });
+}
 // Attach the persistent listeners once; they read live PLAYER state each fire.
 function wirePlayer(){
   if(PLAYER_WIRED) return; PLAYER_WIRED=true;
   const p=document.getElementById("player"), v=document.getElementById("video");
   if(!p||!v) return;
   ["mousemove","pointerdown","touchstart","keydown"].forEach(ev=>p.addEventListener(ev,playerActivity));
-  v.addEventListener("playing",()=>{ PLAYER.started=true; clearStall(); setLoading(false); playerActivity(); });
+  v.addEventListener("playing",()=>{ PLAYER.started=true; clearStall(); setLoading(false); playerActivity(); pbTick(); pbSyncPlayIcon(); });
   v.addEventListener("canplay",()=>{ if(PLAYER.started) setLoading(false); });
   v.addEventListener("waiting",()=>{ if(PLAYER.started) setLoading(true,"Buffering…",""); });
   v.addEventListener("pause",()=>{ p.classList.remove("idle"); });
@@ -1481,6 +1570,12 @@ function wirePlayer(){
     toast("Playback failed — "+(names[code]||("error "+code)));
   });
   v.addEventListener("timeupdate",checkMarkers);
+  // Custom transport: keep the scrubber, times, buffered bar, and play icon in
+  // sync; enable the drag handler and the PiP button where supported.
+  pbWireSeek();
+  ["timeupdate","progress","durationchange","loadedmetadata"].forEach(ev=>v.addEventListener(ev,pbTick));
+  ["play","pause","playing","ended","emptied"].forEach(ev=>v.addEventListener(ev,pbSyncPlayIcon));
+  if(document.pictureInPictureEnabled){ const pip=document.getElementById("pbpip"); if(pip) pip.style.display=""; }
 }
 function markerNowMs(){ const v=document.getElementById("video"); return ((PLAYER.offset||0)+(v?v.currentTime||0:0))*1000; }
 function checkMarkers(){
@@ -1518,6 +1613,11 @@ async function seekTo(targetSec){
   const v=document.getElementById("video"); if(!v) return;
   targetSec=Math.max(0,targetSec);
   if(PLAYER.method==='direct_play'){ try{ v.currentTime=targetSec; }catch(e){} playerActivity(); return; }
+  // Every non-direct seek restarts the server stream, so overlapping seeks (a
+  // double-clicked ±10, or a drag landing near a keyboard nudge) would tear down
+  // and re-attach hls.js twice. Token the call and bail any superseded one after
+  // its await, so only the last seek attaches.
+  const me=PLAYER; const token=(me._seekToken=(me._seekToken||0)+1);
   const track=PLAYER.audio[PLAYER.curAudio]; const aidx=track?track.index:(PLAYER.curAudio||0);
   const curSub=PLAYER.curSub;
   setLoading(true, PLAYER.method==='transcode'?"Skipping ahead…":"Seeking…",
@@ -1525,12 +1625,14 @@ async function seekTo(targetSec){
   teardownHls();
   [...v.querySelectorAll("track")].forEach(t=>t.remove());
   if(PLAYER.method==='transcode'){
-    let info; try{ info=await api(`/files/${PLAYER.fileId}/hls/start?height=${transcodeHeight()}&start=${targetSec.toFixed(1)}&audio=${aidx}`);}catch(e){ setLoading(false); return toast(e.message); }
+    let info; try{ info=await api(`/files/${PLAYER.fileId}/hls/start?height=${transcodeHeight()}&start=${targetSec.toFixed(1)}&audio=${aidx}`);}catch(e){ if(PLAYER===me) setLoading(false); return toast(e.message); }
+    if(PLAYER!==me || me._seekToken!==token) return;   // a newer seek superseded this one
     PLAYER.offset=info.start_seconds||0; PLAYER.encoder=info.encoder||null;
     attachHls(v, info.playlist_url);
   } else if(PLAYER.copyHls){
     // Copy-video HLS (Safari): re-open the session at the target position.
-    try{ await startCopyHls(v, targetSec); }catch(e){ setLoading(false); return toast(e.message); }
+    try{ await startCopyHls(v, targetSec); }catch(e){ if(PLAYER===me) setLoading(false); return toast(e.message); }
+    if(PLAYER!==me || me._seekToken!==token) return;
   } else {
     PLAYER.method='remux'; PLAYER.offset=targetSec;
     v.src=tok(`/api/v1/files/${PLAYER.fileId}/stream.mp4`)+`&${CAPS_Q}&audio=${aidx}&start=${targetSec.toFixed(1)}`;
@@ -1806,8 +1908,15 @@ function closePlayer(){
 window.addEventListener("keydown",e=>{
   if(!document.getElementById("modal").classList.contains("open")) return;
   const typing=/^(INPUT|TEXTAREA|SELECT)$/.test((e.target.tagName||""));
+  // A focused control (or key auto-repeat) shouldn't also drive the hotkeys —
+  // otherwise Space both activates the button and toggles play, etc.
+  const onBtn=/^BUTTON$/.test((e.target.tagName||""));
   if((e.key==='i'||e.key==='I') && !typing){ e.preventDefault(); toggleStats(); }
   else if(e.key==='Escape' && !document.fullscreenElement){ closePlayer(); }
+  else if(!typing && !onBtn && !e.repeat && (e.key===' '||e.key==='k'||e.key==='K')){ e.preventDefault(); togglePlay(); }
+  else if(!typing && !onBtn && !e.repeat && e.key==='ArrowLeft'){ e.preventDefault(); nudge(-10); }
+  else if(!typing && !onBtn && !e.repeat && e.key==='ArrowRight'){ e.preventDefault(); nudge(10); }
+  else if(!typing && !onBtn && (e.key==='f'||e.key==='F')){ e.preventDefault(); toggleFullscreen(); }
 });
 // map fileId → itemId, filled by viewItem so progress posts to the right item
 const ITEM_FOR_FILE={};
