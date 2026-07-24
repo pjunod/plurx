@@ -48,7 +48,23 @@
   .top nav a.active,.top nav a:hover{background:var(--panel2);color:var(--text)}
   .top .spacer{flex:1}
   .search{max-width:240px}
+  .topctl{display:flex;align-items:center;gap:16px}
   main{padding:22px 20px 60px;max-width:1400px;margin:0 auto}
+  /* Phone header: one non-wrapping row overflowed and clipped the profile chip.
+     Stack it — logo + controls on row 1, then the nav and search full-width. */
+  @media(max-width:640px){
+    header.top{flex-wrap:wrap;gap:8px;padding:10px 14px}
+    .top .spacer{display:none}
+    .logo{order:1;font-size:19px}
+    .topctl{order:2;margin-left:auto;gap:6px}
+    .top nav{order:3;flex-basis:100%;justify-content:space-between;flex-wrap:nowrap;gap:2px}
+    .top nav a{flex:1;text-align:center;padding:8px 6px}
+    .search{order:4;flex-basis:100%;max-width:none;width:100%}
+    .activity{order:5;flex-basis:100%}
+    .getappbtn{display:none}          /* the install banner already covers this on phones */
+    .sizebtn span{display:none}       /* icon-only to save width */
+    main{padding:16px 14px 60px}
+  }
 
   .center{min-height:100dvh;display:grid;place-items:center;padding:20px}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:24px}
@@ -65,7 +81,7 @@
      same icon-size setting as the grids. ×4/3 preserves the original rail:poster
      ratio (the shipped 200:150), so rails stay proportionally larger and scale
      with the selection instead of staying pinned at one width. */
-  .rowscroll{display:grid;grid-auto-flow:column;grid-auto-columns:calc(var(--poster,120px) * 4 / 3);gap:16px;overflow-x:auto;padding-bottom:8px;scrollbar-width:thin}
+  .rowscroll{display:grid;grid-auto-flow:column;grid-auto-columns:calc(var(--poster,120px) * 4 / 3);gap:16px;overflow-x:auto;padding-bottom:8px;scrollbar-width:thin;align-items:start}
   .poster{background:var(--panel2);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;cursor:pointer;transition:transform .12s,border-color .12s;position:relative}
   .poster:hover{transform:translateY(-3px);border-color:var(--accent)}
   .poster .art{aspect-ratio:2/3;width:100%;object-fit:cover;display:block;background:var(--panel2)}
@@ -604,7 +620,7 @@ function renderLogin(){
 // ---- chrome ---------------------------------------------------------------
 function chrome(active, inner){
   const admin = ME&&ME.is_admin ? `<a href="#/settings" class="${active==='settings'?'active':''}">Settings</a>`:"";
-  const getapp = installAvailable() ? `<button class="ghost sm" onclick="showInstall()" title="Install the plurx app">Get app</button>` : "";
+  const getapp = installAvailable() ? `<button class="ghost sm getappbtn" onclick="showInstall()" title="Install the plurx app">Get app</button>` : "";
   document.getElementById("app").innerHTML=`
    <header class="top">
      <a href="#/" class="logo">${APP_NAME}</a>
@@ -612,26 +628,28 @@ function chrome(active, inner){
      <span class="spacer"></span>
      <span class="activity" id="activity" onclick="location.hash='#/activity'"></span>
      <input class="search" id="q" placeholder="Search…" value="${esc(getQ())}">
-     <div style="position:relative">
-       <button class="ghost sm" onclick="toggleThemeMenu(event)" title="Theme"><span class="tsw"></span></button>
-       <div class="amenu" id="thememenu"></div>
-     </div>
-     <div style="position:relative">
-       <button class="ghost sm" onclick="toggleAppearanceMenu(event)" title="Light / dark">◐</button>
-       <div class="amenu" id="appmenu"></div>
-     </div>
-     <div style="position:relative">
-       <button class="ghost sm" onclick="toggleSizeMenu(event)" title="Icon size" style="display:inline-flex;align-items:center;gap:6px">
-         <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor" aria-hidden="true"><rect x="0" y="0" width="5" height="5" rx="1"/><rect x="7" y="0" width="5" height="5" rx="1"/><rect x="0" y="7" width="5" height="5" rx="1"/><rect x="7" y="7" width="5" height="5" rx="1"/></svg><span>Size</span>
-       </button>
-       <div class="amenu" id="sizemenu"></div>
-     </div>
-     ${getapp}
-     <div style="position:relative">
-       <button class="ghost sm profile" onclick="toggleProfileMenu(event)" title="Account">
-         <span class="pavatar">${esc((ME&&ME.username?ME.username[0]:"?").toUpperCase())}</span><span class="pname">${esc(ME?ME.username:"")}</span><span class="caret">▾</span>
-       </button>
-       <div class="amenu" id="profilemenu"></div>
+     <div class="topctl">
+       <div style="position:relative">
+         <button class="ghost sm" onclick="toggleThemeMenu(event)" title="Theme"><span class="tsw"></span></button>
+         <div class="amenu" id="thememenu"></div>
+       </div>
+       <div style="position:relative">
+         <button class="ghost sm" onclick="toggleAppearanceMenu(event)" title="Light / dark">◐</button>
+         <div class="amenu" id="appmenu"></div>
+       </div>
+       <div style="position:relative">
+         <button class="ghost sm sizebtn" onclick="toggleSizeMenu(event)" title="Icon size" style="display:inline-flex;align-items:center;gap:6px">
+           <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor" aria-hidden="true"><rect x="0" y="0" width="5" height="5" rx="1"/><rect x="7" y="0" width="5" height="5" rx="1"/><rect x="0" y="7" width="5" height="5" rx="1"/><rect x="7" y="7" width="5" height="5" rx="1"/></svg><span>Size</span>
+         </button>
+         <div class="amenu" id="sizemenu"></div>
+       </div>
+       ${getapp}
+       <div style="position:relative">
+         <button class="ghost sm profile" onclick="toggleProfileMenu(event)" title="Account">
+           <span class="pavatar">${esc((ME&&ME.username?ME.username[0]:"?").toUpperCase())}</span><span class="pname">${esc(ME?ME.username:"")}</span><span class="caret">▾</span>
+         </button>
+         <div class="amenu" id="profilemenu"></div>
+       </div>
      </div>
    </header><main id="main">${inner}</main>`;
   const q=document.getElementById("q");
