@@ -276,10 +276,21 @@
   .pseek:focus-visible{outline:2px solid var(--accent);outline-offset:5px;border-radius:3px}
   .picon:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:6px}
   @media(max-width:520px){ .ptransport .nudge{display:none} }   /* tight phones: drop ±10s, keep the scrubber */
-  .statsov{position:absolute;top:64px;left:20px;max-width:360px;background:rgba(8,10,15,.84);border:1px solid rgba(255,255,255,.12);
-    border-radius:10px;padding:11px 13px;font:12px/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#e8e8ea;
-    display:none;pointer-events:none;backdrop-filter:blur(5px);z-index:5}
-  .statsov.on{display:block}
+  /* Playback info panel. It owns its own taps (there's a close button — touch
+     has no "i" key to press), so it's bounded: never taller than the space
+     between the two control bars, and the readout scrolls inside it rather
+     than growing over them. */
+  .statsov{position:absolute;top:64px;left:20px;width:min(360px,calc(100vw - 40px));max-height:calc(100dvh - 190px);
+    background:rgba(8,10,15,.84);border:1px solid rgba(255,255,255,.12);border-radius:10px;
+    font:12px/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#e8e8ea;
+    display:none;flex-direction:column;overflow:hidden;backdrop-filter:blur(5px);z-index:5}
+  .statsov.on{display:flex}
+  .statshd{flex:0 0 auto;display:flex;align-items:center;justify-content:space-between;gap:10px;
+    padding:7px 7px 7px 13px;border-bottom:1px solid rgba(255,255,255,.1);
+    font:600 10.5px/1 ui-sans-serif,system-ui,sans-serif;text-transform:uppercase;letter-spacing:.06em;color:rgba(255,255,255,.55)}
+  .statsx{background:transparent;border:0;color:rgba(255,255,255,.6);font-size:13px;line-height:1;cursor:pointer;padding:6px 8px;border-radius:6px}
+  .statsx:hover{background:rgba(255,255,255,.1);color:#fff}
+  .statsbody{overflow-y:auto;overscroll-behavior:contain;-webkit-overflow-scrolling:touch;padding:10px 13px 11px}
   .statsov b{color:rgba(255,255,255,.5);font-weight:600;display:inline-block;min-width:104px}
   .statsov .sechd{color:var(--accent);font-weight:700;margin-top:8px;text-transform:uppercase;letter-spacing:.05em;font-size:10.5px}
   .statsov .sechd:first-child{margin-top:0}
@@ -293,6 +304,20 @@
   .pmenu button:hover{background:rgba(255,255,255,.08)}
   .pmenu button.sel{color:var(--accent);font-weight:600}
   .pmenu button.sel::before{content:"✓ "}
+  /* Touch: a phone viewport is narrower than either panel wants to be, so both
+     get pinned into the band between the top bar and the transport instead of
+     free-floating over them. The controls stay reachable with a panel open —
+     on a phone there is no keyboard shortcut to escape one. */
+  @media(pointer:coarse){
+    .statsov{top:calc(env(safe-area-inset-top,0px) + 96px);bottom:calc(env(safe-area-inset-bottom,0px) + 86px);
+      left:12px;right:12px;width:auto;max-height:none}
+    .pmenu{top:calc(env(safe-area-inset-top,0px) + 92px);right:12px;max-width:min(300px,calc(100vw - 24px));
+      max-height:calc(100dvh - env(safe-area-inset-top,0px) - env(safe-area-inset-bottom,0px) - 190px);overflow-y:auto;overscroll-behavior:contain}
+    .pmenu.low{top:auto;bottom:calc(env(safe-area-inset-bottom,0px) + 76px)}
+    /* the synopsis strip and the stats panel both want the lower half — the
+       one you just asked for wins */
+    .player.statson .pinfo{display:none}
+  }
   .toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:var(--panel2);border:1px solid var(--line);
     padding:10px 16px;border-radius:10px;z-index:60;opacity:0;transition:opacity .2s;pointer-events:none}
   .toast.show{opacity:1}
@@ -351,14 +376,30 @@
   .traktcode{font-family:var(--font-mono);font-size:34px;font-weight:700;letter-spacing:.18em;color:var(--accent);margin:10px 0 2px;user-select:all}
   .syncnow{padding:6px 10px 2px;font-size:13px;font-weight:600}
   .syncnow .hint{margin-top:2px}
-  .crumbs{font-size:13px;color:var(--muted);margin:0 0 16px;display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  /* One header for every drill-in page — item, library, category, search. The
+     back control shares a line with the trail rather than floating above it on
+     its own, so the two read as a single navigation unit and the page title sits
+     tight underneath instead of across a band of dead space. */
+  .pagehead{margin:0 0 18px}
+  .phnav{display:flex;align-items:center;gap:10px;min-width:0}
+  .pgback{flex:0 0 auto;display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;
+    border:1px solid var(--line);border-radius:9px;background:var(--panel);color:var(--muted);
+    font-size:15px;line-height:1;text-decoration:none;transition:background .12s,color .12s,border-color .12s}
+  .pgback:hover{background:var(--panel2);color:var(--text);border-color:var(--muted)}
+  .pgback:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  .phtitle{margin:13px 0 0;font-size:23px;font-weight:650;letter-spacing:-.01em;line-height:1.25}
+  .crumbs{font-size:13px;color:var(--muted);margin:0;display:flex;gap:8px;flex-wrap:wrap;align-items:center;min-width:0}
   .crumbs .sep{opacity:.45}
   .crumbs .cur{color:var(--text)}
-  /* Contextual back link — sits at the top of the content it applies to, not in
-     the header (where it shifted the logo when it appeared and read as detached
-     from the page below it). */
-  .backlink{display:inline-flex;align-items:center;gap:5px;font-size:13px;color:var(--muted);margin:0 0 14px;cursor:pointer;text-decoration:none}
-  .backlink:hover{color:var(--text)}
+  /* Phones: the trail is the one thing that must not wrap into three lines, so
+     it scrolls sideways under the back button instead. */
+  @media(max-width:640px){
+    .pagehead{margin-bottom:14px}
+    .phtitle{font-size:20px;margin-top:11px}
+    .crumbs{flex-wrap:nowrap;overflow-x:auto;scrollbar-width:none;-webkit-overflow-scrolling:touch}
+    .crumbs::-webkit-scrollbar{display:none}
+    .crumbs a,.crumbs .cur{white-space:nowrap}
+  }
   .libbar{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin:0 4px 16px}
   .libbar select{width:auto;min-width:130px;padding:6px 9px}
   .libbar .lbl{display:inline;margin:0 2px 0 0;font-size:12px;color:var(--muted)}
@@ -625,7 +666,7 @@ if(window.matchMedia){ try{ window.matchMedia("(prefers-color-scheme: dark)").ad
 </head>
 <body>
 <div id="app"></div>
-<div class="modal" id="modal"><div class="player" id="player"><video id="video" autoplay playsinline x-webkit-airplay="allow"></video><div class="pbar" id="pbar"><div class="ptitle" id="playTitle"></div><div class="row"><button class="pbtn" id="audiobtn" style="display:none" onclick="toggleMenu('audio')">🔊 Audio</button><button class="pbtn" id="subsbtn" style="display:none" onclick="toggleMenu('subs')">💬 Subtitles</button><button class="pbtn" id="qualbtn" title="Playback quality" onclick="toggleMenu('quality')">◆ Quality</button><button class="pbtn" id="syncbtn" title="Audio sync adjustment" onclick="toggleMenu('sync')">⇄ Sync</button><button class="pbtn" id="statsbtn" title="Playback info (i)" onclick="toggleStats()">ⓘ Stats</button><button class="pbtn" id="skipbtn" title="Auto-skip intro & credits" onclick="togglePlayerAutoskip()">⏭ Auto-skip</button><button class="pbtn" id="autonextbtn" title="Auto-play the next episode when one finishes" onclick="togglePlayerAutonext()">▶ Autoplay</button><button class="pbtn" id="apbtn" style="display:none" title="AirPlay">📺 AirPlay</button><button class="pbtn" title="Close (Esc)" onclick="closePlayer()">✕ Close</button></div></div><div class="ptransport" id="ptransport"><button class="picon" id="pbplay" aria-label="Play" title="Play / Pause (space)" onclick="togglePlay()">▶</button><button class="picon nudge" aria-label="Back 10 seconds" title="Back 10s (←)" onclick="nudge(-10)">↺</button><button class="picon nudge" aria-label="Forward 10 seconds" title="Forward 10s (→)" onclick="nudge(10)">↻</button><span class="ptime" id="ptcur" aria-hidden="true">0:00</span><div class="pseek" id="pseek" role="slider" tabindex="0" aria-label="Seek" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-valuetext="0:00"><div class="pseek-buf" id="pseekbuf" aria-hidden="true"></div><div class="pseek-fill" id="pseekfill" aria-hidden="true"></div><div class="pseek-thumb" id="pseekthumb" aria-hidden="true"></div></div><span class="ptime" id="ptdur" aria-hidden="true">0:00</span><button class="picon paud" id="pbaudio" aria-label="Audio track" title="Audio track (a)" style="display:none" onclick="toggleMenu('audio',1)">🔊</button><button class="picon pcc" id="pbsubs" aria-label="Subtitles" title="Subtitles (c)" style="display:none" onclick="toggleMenu('subs',1)">CC</button><button class="picon" id="pbinfo" aria-label="Title info" title="Show title, synopsis & release info" onclick="togglePlayerInfo()">ⓘ</button><button class="picon" id="pbpip" aria-label="Picture in picture" title="Picture-in-picture" style="display:none" onclick="togglePip()">◲</button><button class="picon" id="pbfs" aria-label="Fullscreen" title="Fullscreen (f)" onclick="toggleFullscreen()">⛶</button></div><div class="pinfo" id="pinfo"></div><div class="pskip" id="pskip"></div><div class="ploading" id="ploading"><div class="pspin"></div><div class="ploadText" id="ploadText">Loading…</div><div class="ploadSub" id="ploadSub"></div><div class="ploadAct" id="ploadAct"></div></div><div class="statsov" id="statsov"></div><div class="pmenu" id="pmenu"></div></div></div>
+<div class="modal" id="modal"><div class="player" id="player"><video id="video" autoplay playsinline x-webkit-airplay="allow"></video><div class="pbar" id="pbar"><div class="ptitle" id="playTitle"></div><div class="row"><button class="pbtn" id="audiobtn" style="display:none" onclick="toggleMenu('audio')">🔊 Audio</button><button class="pbtn" id="subsbtn" style="display:none" onclick="toggleMenu('subs')">💬 Subtitles</button><button class="pbtn" id="qualbtn" title="Playback quality" onclick="toggleMenu('quality')">◆ Quality</button><button class="pbtn" id="syncbtn" title="Audio sync adjustment" onclick="toggleMenu('sync')">⇄ Sync</button><button class="pbtn" id="statsbtn" title="Playback info (i)" onclick="toggleStats()">ⓘ Stats</button><button class="pbtn" id="skipbtn" title="Auto-skip intro & credits" onclick="togglePlayerAutoskip()">⏭ Auto-skip</button><button class="pbtn" id="autonextbtn" title="Auto-play the next episode when one finishes" onclick="togglePlayerAutonext()">▶ Autoplay</button><button class="pbtn" id="apbtn" style="display:none" title="AirPlay">📺 AirPlay</button><button class="pbtn" title="Close (Esc)" onclick="closePlayer()">✕ Close</button></div></div><div class="ptransport" id="ptransport"><button class="picon" id="pbplay" aria-label="Play" title="Play / Pause (space)" onclick="togglePlay()">▶</button><button class="picon nudge" aria-label="Back 10 seconds" title="Back 10s (←)" onclick="nudge(-10)">↺</button><button class="picon nudge" aria-label="Forward 10 seconds" title="Forward 10s (→)" onclick="nudge(10)">↻</button><span class="ptime" id="ptcur" aria-hidden="true">0:00</span><div class="pseek" id="pseek" role="slider" tabindex="0" aria-label="Seek" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-valuetext="0:00"><div class="pseek-buf" id="pseekbuf" aria-hidden="true"></div><div class="pseek-fill" id="pseekfill" aria-hidden="true"></div><div class="pseek-thumb" id="pseekthumb" aria-hidden="true"></div></div><span class="ptime" id="ptdur" aria-hidden="true">0:00</span><button class="picon paud" id="pbaudio" aria-label="Audio track" title="Audio track (a)" style="display:none" onclick="toggleMenu('audio',1)">🔊</button><button class="picon pcc" id="pbsubs" aria-label="Subtitles" title="Subtitles (c)" style="display:none" onclick="toggleMenu('subs',1)">CC</button><button class="picon" id="pbinfo" aria-label="Title info" title="Show title, synopsis & release info" onclick="togglePlayerInfo()">ⓘ</button><button class="picon" id="pbpip" aria-label="Picture in picture" title="Picture-in-picture" style="display:none" onclick="togglePip()">◲</button><button class="picon" id="pbfs" aria-label="Fullscreen" title="Fullscreen (f)" onclick="toggleFullscreen()">⛶</button></div><div class="pinfo" id="pinfo"></div><div class="pskip" id="pskip"></div><div class="ploading" id="ploading"><div class="pspin"></div><div class="ploadText" id="ploadText">Loading…</div><div class="ploadSub" id="ploadSub"></div><div class="ploadAct" id="ploadAct"></div></div><div class="statsov" id="statsov"><div class="statshd"><span>Playback info</span><button class="statsx" aria-label="Close playback info" title="Close (i)" onclick="toggleStats()">✕</button></div><div class="statsbody" id="statsbody"></div></div><div class="pmenu" id="pmenu"></div></div></div>
 <div class="toast" id="toast"></div>
 
 <script src="/assets/hls.min.js"></script>
@@ -1064,6 +1105,26 @@ function updateAzActive(){
 function azOnScroll(){ if(!AZ_RAF) AZ_RAF=requestAnimationFrame(updateAzActive); }
 window.addEventListener("scroll",azOnScroll,{passive:true});
 window.addEventListener("resize",azOnScroll,{passive:true});
+// ---- page header: back control + breadcrumb trail -------------------------
+// The list page you came from is not derivable from an item's own data (an item
+// belongs to a library, but you may have reached it from a category or a
+// search), so the router remembers it. Item→item hops keep it, which is what
+// makes Movies → Show → Season → Episode still offer "Movies"; anything that
+// leaves the drill-in (home, activity, settings) clears it.
+let NAV_ORIGIN=null;
+function setOrigin(href,label){ NAV_ORIGIN={href,label}; }
+// Build one header for every drill-in page. `trail` is [{href,label},…] ending
+// with the current page; back points at the level above it, so the button and
+// the trail can never disagree about where "up" is.
+function pageHead(trail,title){
+  const parent=trail.length>1? trail[trail.length-2] : {href:"#/",label:"Home"};
+  const back=`<a class="pgback" href="${parent.href}" aria-label="Back to ${esc(parent.label)}" title="Back to ${esc(parent.label)}">←</a>`;
+  const crumbs=trail.map((c,i)=> (i===trail.length-1||!c.href)
+    ? `<span class="cur">${esc(c.label)}</span>`
+    : `<a href="${c.href}">${esc(c.label)}</a>`).join('<span class="sep">/</span>');
+  return `<div class="pagehead"><div class="phnav">${back}<div class="crumbs">${crumbs}</div></div>`+
+    (title?`<h2 class="phtitle">${esc(title)}</h2>`:``)+`</div>`;
+}
 async function viewLibrary(id){
   chrome("home",`<div class="empty">Loading…</div>`);
   const lib=(await api("/libraries")).find(l=>l.id==id);
@@ -1081,7 +1142,10 @@ async function viewLibrary(id){
     </div>
     <span class="muted" style="font-size:13px">${items.length} item${items.length===1?'':'s'}${capNote}</span></div>`;
   const body = items.length? (LIB_SORT==="resolution"? resSections(items) : grid(items)) : `<div class="empty">Nothing matches this filter.</div>`;
-  document.getElementById("main").innerHTML=`<h2 class="section" style="margin-bottom:10px">${esc(lib?lib.name:'Library')}</h2>${bar}${body}${alphaRailHtml(items)}`;
+  const name=lib?lib.name:'Library';
+  setOrigin(`#/library/${id}`,name);
+  const head=pageHead([{href:"#/",label:"Home"},{label:name}],name);
+  document.getElementById("main").innerHTML=`${head}${bar}${body}${alphaRailHtml(items)}`;
   tagAlpha(items);
 }
 // "View all" for a category that spans more than one share: merge their items,
@@ -1111,13 +1175,17 @@ async function viewCategory(key){
     </div>
     <span class="muted" style="font-size:13px">${items.length} item${items.length===1?'':'s'}${capNote}</span></div>`;
   const body = items.length? (LIB_SORT==="resolution"? resSections(items) : grid(items)) : `<div class="empty">Nothing matches this filter.</div>`;
-  document.getElementById("main").innerHTML=`<h2 class="section" style="margin-bottom:10px">${esc(cat.name)}</h2>${bar}${body}${alphaRailHtml(items)}`;
+  setOrigin(`#/category/${encodeURIComponent(key)}`,cat.name);
+  const head=pageHead([{href:"#/",label:"Home"},{label:cat.name}],cat.name);
+  document.getElementById("main").innerHTML=`${head}${bar}${body}${alphaRailHtml(items)}`;
   tagAlpha(items);
 }
 async function viewSearch(q){
   chrome("home",`<div class="empty">Searching…</div>`);
   const r=await api(`/search?q=${encodeURIComponent(q)}`);
-  document.getElementById("main").innerHTML=`<h2 class="section">Results for “${esc(q)}”</h2>${grid(r.results)}`;
+  setOrigin(`#/search/${encodeURIComponent(q)}`,`Search “${q}”`);
+  const head=pageHead([{href:"#/",label:"Home"},{label:`Search “${q}”`}],`Results for “${q}”`);
+  document.getElementById("main").innerHTML=`${head}${grid(r.results)}`;
 }
 // ---- detail helpers -------------------------------------------------------
 function fmtChannels(n){ return n===8?"7.1":n===7?"6.1":n===6?"5.1":n===2?"2.0":n===1?"Mono":(n?n+"ch":""); }
@@ -1128,7 +1196,7 @@ function audioLabel(a){ return [a.codec&&a.codec.toUpperCase(), fmtChannels(a.ch
 // Key off WIDTH primarily: scope/'Scope 4K is only ~1600–2076 tall (3840×2076),
 // so a height-only test wrongly calls it 1080p.
 function resLabel(w,h){ w=w||0; h=h||0;
-  if(w>=3000||h>=1700) return '4K';
+  if(w>=3000||h>=1700) return '2160p';
   if(w>=2000||h>=1300) return '1440p';
   if(w>=1400||h>=900) return '1080p';
   if(w>=1000||h>=650) return '720p';
@@ -1199,11 +1267,14 @@ async function viewItem(id){
   const d=await api(`/items/${id}`); const it=d.item;
   d.files.forEach(f=>ITEM_FOR_FILE[f.id]=Number(id));
 
-  // Breadcrumb trail: Home / Show / Season / …, every level clickable.
-  const trail=[`<a href="#/">Home</a>`]
-    .concat((d.ancestors||[]).map(a=>`<a href="#/item/${a.id}">${esc(a.title)}</a>`))
-    .concat([`<span class="cur">${esc(it.title)}</span>`]);
-  const crumbs=`<div class="crumbs">${trail.join('<span class="sep">/</span>')}</div>`;
+  // Breadcrumb trail: Home / <list you came from> / Show / Season / …, every
+  // level clickable. The middle entry is what makes "back" return to the full
+  // Movies page rather than dumping you at Home.
+  const trail=[{href:"#/",label:"Home"}]
+    .concat(NAV_ORIGIN?[{href:NAV_ORIGIN.href,label:NAV_ORIGIN.label}]:[])
+    .concat((d.ancestors||[]).map(a=>({href:`#/item/${a.id}`,label:a.title})))
+    .concat([{label:it.title}]);
+  const crumbs=pageHead(trail);
 
   const best=d.files[0];
   const multi=d.files.length>1;
@@ -1985,6 +2056,10 @@ function pbSyncSubIcon(){ const cc=document.getElementById("pbsubs");
 function toggleMenu(kind,low){
   const m=document.getElementById("pmenu"); if(!m) return;
   if(m.classList.contains("on") && m.dataset.kind===kind){ m.classList.remove("on"); return; }
+  // Opening a menu retires the stats panel — on a phone they'd cover each
+  // other and both cover the controls.
+  const sov=document.getElementById("statsov");
+  if(sov&&sov.classList.contains("on")) toggleStats();
   m.dataset.kind=kind; m.classList.toggle("low",!!low);
   if(kind==="audio"){
     m.innerHTML=PLAYER.audio.map((a,i)=>`<button class="${PLAYER.curAudio===i?'sel':''}" onclick="switchAudio(${i})">${esc(audioLabelMenu(a,i))}</button>`).join("");
@@ -2179,15 +2254,35 @@ async function switchAudio(idx){
 let STATS_TIMER=null;
 function toggleStats(){
   const ov=document.getElementById("statsov"); if(!ov) return;
-  ov.classList.toggle("on");
+  const on=!ov.classList.contains("on");
+  ov.classList.toggle("on",on);
+  // On a phone these two panels each need most of the screen, so they take
+  // turns rather than stacking (which left neither one dismissible).
+  if(on){ const m=document.getElementById("pmenu"); if(m) m.classList.remove("on"); }
+  const pl=document.getElementById("player"); if(pl) pl.classList.toggle("statson",on);
+  const sb=document.getElementById("statsbtn"); if(sb) sb.classList.toggle("on",on);
   clearInterval(STATS_TIMER); STATS_TIMER=null;
-  if(ov.classList.contains("on")){ updateStats(); STATS_TIMER=setInterval(updateStats,1000); }
+  if(on){ updateStats(); positionStats(); STATS_TIMER=setInterval(updateStats,1000); }
+  else ov.style.top="";
 }
+// The top button row wraps to two or three lines on a phone, so the panel's
+// ceiling isn't a constant — measure it, or the readout parks itself over the
+// player's own Close button. Desktop keeps the stylesheet's fixed offset.
+function positionStats(){
+  const ov=document.getElementById("statsov"); if(!ov||!ov.classList.contains("on")) return;
+  if(!matchMedia("(pointer:coarse)").matches){ ov.style.top=""; return; }
+  const bar=document.getElementById("pbar");
+  const y=bar? Math.round(bar.getBoundingClientRect().bottom)+8 : 0;
+  ov.style.top = y>0? y+"px" : "";
+}
+window.addEventListener("resize",positionStats,{passive:true});
+window.addEventListener("orientationchange",()=>setTimeout(positionStats,150));
 function clockFromSec(s){ s=Math.max(0,Math.round(s)); const h=Math.floor(s/3600),m=Math.floor(s%3600/60),ss=s%60;
   return (h?h+":":"")+String(m).padStart(h?2:1,"0")+":"+String(ss).padStart(2,"0"); }
 function hdrLabel(h){ return ({hdr10:"HDR10",hlg:"HLG",dolby_vision:"Dolby Vision"})[h]||(h?h.toUpperCase():""); }
 function updateStats(){
   const ov=document.getElementById("statsov"); if(!ov||!ov.classList.contains("on")) return;
+  const body=document.getElementById("statsbody"); if(!body) return;
   const v=document.getElementById("video");
   const s=PLAYER.source||{};
   const method = PLAYER.method==='direct_play'?'Direct play'
@@ -2214,7 +2309,7 @@ function updateStats(){
   }
   const rate = v.playbackRate&&v.playbackRate!==1? ` · ${v.playbackRate}×`:'';
   const durTxt = PLAYER.durMs? ' / '+clockFromSec(PLAYER.durMs/1000):'';
-  ov.innerHTML=
+  body.innerHTML=
     `<div class="sechd">Playback</div>`+
     `<div><b>Method</b>${esc(method)}</div>`+
     ((PLAYER.reasons&&PLAYER.reasons.length)?`<div><b>Reason</b>${esc(PLAYER.reasons.join("; "))}</div>`:"")+
@@ -2253,10 +2348,11 @@ function closePlayer(){
   stopPlayerTimers();
   clearInterval(STATS_TIMER); STATS_TIMER=null; teardownHls();
   setLoading(false);
-  const ov=document.getElementById("statsov"); if(ov) ov.classList.remove("on");
+  const ov=document.getElementById("statsov"); if(ov){ ov.classList.remove("on"); ov.style.top=""; }
   const pm=document.getElementById("pmenu"); if(pm) pm.classList.remove("on");
+  const sb=document.getElementById("statsbtn"); if(sb) sb.classList.remove("on");
   const sk=document.getElementById("pskip"); if(sk){ sk.innerHTML=""; sk.dataset.k=""; }
-  const pl=document.getElementById("player"); if(pl) pl.classList.remove("idle");
+  const pl=document.getElementById("player"); if(pl) pl.classList.remove("idle","statson");
   [...video.querySelectorAll("track")].forEach(t=>t.remove());
   video.pause(); video.removeAttribute("src"); video.load();
   document.getElementById("modal").classList.remove("open");
@@ -2669,6 +2765,9 @@ async function render(){
   clearInterval(PAGE_TIMER);
   if(!ACT_TIMER) ACT_TIMER=setInterval(pollActivity,4000);
   const h=location.hash||"#/";
+  // Item pages inherit the list you arrived from; everything else replaces it
+  // (the list views re-set it as they render) or drops it.
+  if(!h.startsWith("#/item/")) NAV_ORIGIN=null;
   try{
     if(h.startsWith("#/item/")) await viewItem(h.split("/")[2]);
     else if(h.startsWith("#/library/")) await viewLibrary(h.split("/")[2]);
@@ -2677,19 +2776,9 @@ async function render(){
     else if(h==="#/activity") await viewActivity();
     else if(h==="#/admin"||h==="#/settings") await viewSettings();
     else await viewHome();
-    injectBack(h);
   }catch(e){
     if(e.message!=="unauthorized"){ const m=document.getElementById("main"); if(m) m.innerHTML=`<div class="empty">${esc(e.message)}</div>`; else toast(e.message); }
   }
-}
-// Put a "‹ Back" at the top of drill-in page content, in context with what it
-// acts on. Item pages already carry a breadcrumb (Home / Title), so skip those;
-// Home and the top-level nav destinations (Activity, Settings) don't need one.
-function injectBack(h){
-  const main=document.getElementById("main"); if(!main) return;
-  const sub = h.startsWith("#/item/")||h.startsWith("#/library/")||h.startsWith("#/category/")||h.startsWith("#/search/");
-  if(!sub || main.querySelector(".crumbs") || main.querySelector(".backlink")) return;
-  main.insertAdjacentHTML("afterbegin", `<a class="backlink" href="#" onclick="history.back();return false">‹ Back</a>`);
 }
 window.addEventListener("hashchange",render);
 

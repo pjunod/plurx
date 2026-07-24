@@ -8,8 +8,30 @@ bump may break compatibility and a **patch** bump never does.
 
 ## [Unreleased]
 
+### Changed
+
+- Every drill-in page — item, library, category, search — now shares one header.
+  The back control sits on the same line as the breadcrumb trail instead of
+  floating above it on its own, and always points at the crumb one level up, so
+  the button and the trail can no longer disagree about where "up" is.
+- The breadcrumb trail records the list you arrived from. Opening a movie from
+  the full Movies page now reads **Home / Movies / The Menu** rather than
+  **Home / The Menu**, and the middle crumb returns you to the list — including
+  for categories and search results. Show → season → episode hops keep it, so
+  the trail stays complete all the way down. A deep link with no such history
+  still degrades to **Home / Title**.
+- 2160p content is labelled `2160p` rather than `4K`, matching every other
+  resolution chip in the app.
+
 ### Fixed
 
+- On a phone, the playback-info panel no longer buries the player controls. It
+  had no size limit and no close affordance — touch has no `i` key to press —
+  so opening it covered both control bars with no way back. It is now bounded
+  to the band between the two bars, scrolls internally, carries a close button,
+  is measured at open time against the top bar's real height (it wraps to three
+  rows on a narrow screen), and repositions on rotate. The quality menu is
+  bounded the same way, and the two panels take turns rather than stacking.
 - Remux streams are no longer delivered as fast as the link allows. A `-c copy`
   remux was a disk-to-socket pipe braked only by the browser's buffer, measured
   here at over 200× real time; because every seek opens a fresh stream, seeking
