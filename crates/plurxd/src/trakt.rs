@@ -542,3 +542,289 @@ impl TraktManager {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use plurx_core::domain::{LibraryKind, MetadataPatch, NewItem, NewLibrary, ProbeResult};
+    use plurx_core::store::SqliteStore;
+    use serde_json::{json, Value};
+
+    async fn serve(app: axum::Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    fn fixed(status: u16, body: Value) -> axum::Router {
+        use axum::http::StatusCode;
+        use axum::Json;
+        axum::Router::new().fallback(move || {
+            let body = body.clone();
+            async move { (StatusCode::from_u16(status).expect("status"), Json(body)) }
+        })
+    }
+
+    async fn store_with_creds() -> (Arc<dyn Store>, i64) {
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let user = store.create_user("u", "h", true).await.expect("user");
+        store
+            .put_setting(keys::TRAKT_CLIENT_ID, "cid")
+            .await
+            .expect("id");
+        store
+            .put_setting(keys::TRAKT_CLIENT_SECRET, "sec")
+            .await
+            .expect("secret");
+        (store, user.id)
+    }
+
+    fn linked_auth(user_id: i64, expires_at: i64) -> TraktAuth {
+        TraktAuth {
+            user_id,
+            access_token: "acc".into(),
+            refresh_token: "ref".into(),
+            expires_at,
+            trakt_username: Some("neo".into()),
+            connected_at: now_unix(),
+            last_sync_at: 0,
+            last_activities: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn client_present_only_when_configured() {
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let mgr = TraktManager::new(Arc::clone(&store), "http://unused".into());
+        assert!(mgr.client().await.is_none());
+        store
+            .put_setting(keys::TRAKT_CLIENT_ID, "cid")
+            .await
+            .expect("id");
+        store
+            .put_setting(keys::TRAKT_CLIENT_SECRET, "sec")
+            .await
+            .expect("secret");
+        assert!(mgr.client().await.is_some());
+        // Blank credentials do not count as configured.
+        store
+            .put_setting(keys::TRAKT_CLIENT_SECRET, "   ")
+            .await
+            .expect("secret");
+        assert!(mgr.client().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn status_unlink_and_ident() {
+        let (store, user) = store_with_creds().await;
+        // Seed a movie so ident_for has something to resolve.
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "L".into(),
+                kind: LibraryKind::Movies,
+                paths: vec![],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+        let movie = store
+            .insert_item(&NewItem {
+                library_id: lib.id,
+                kind: ItemKind::Movie,
+                parent_id: None,
+                title: "Heat".into(),
+                year: Some(1995),
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("movie");
+        store
+            .apply_metadata(
+                movie,
+                &MetadataPatch {
+                    tmdb_id: Some(603),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("meta");
+        store
+            .put_trakt_auth(&linked_auth(user, now_unix() + 999_999))
+            .await
+            .expect("auth");
+
+        let mgr = TraktManager::new(Arc::clone(&store), "http://unused".into());
+        let st = mgr.status(user).await;
+        assert!(st.configured);
+        assert!(st.auth.is_some());
+        assert!(!st.syncing);
+
+        assert_eq!(mgr.ident_for(movie).await, Some(Ident::Movie { tmdb: 603 }));
+
+        mgr.unlink(user).await.expect("unlink");
+        assert!(store.get_trakt_auth(user).await.expect("get").is_none());
+        assert!(mgr.status(user).await.auth.is_none());
+    }
+
+    #[tokio::test]
+    async fn access_refreshes_a_near_expiry_token() {
+        let (store, user) = store_with_creds().await;
+        store
+            .put_trakt_auth(&linked_auth(user, now_unix() + 100))
+            .await
+            .expect("auth");
+        let base = serve(fixed(
+            200,
+            json!({
+                "access_token": "fresh", "refresh_token": "nr",
+                "expires_in": 7200, "created_at": now_unix()
+            }),
+        ))
+        .await;
+        let mgr = TraktManager::new(Arc::clone(&store), base);
+        let client = mgr.client().await.expect("client");
+        assert_eq!(mgr.access(&client, user).await.as_deref(), Some("fresh"));
+        // The refreshed token is persisted.
+        let auth = store
+            .get_trakt_auth(user)
+            .await
+            .expect("get")
+            .expect("some");
+        assert_eq!(auth.access_token, "fresh");
+    }
+
+    #[tokio::test]
+    async fn access_unlinks_on_dead_refresh_token() {
+        let (store, user) = store_with_creds().await;
+        store
+            .put_trakt_auth(&linked_auth(user, now_unix() + 100))
+            .await
+            .expect("auth");
+        // 400 on /oauth/token → AuthExpired → the link is dropped.
+        let base = serve(fixed(400, json!({}))).await;
+        let mgr = TraktManager::new(Arc::clone(&store), base);
+        let client = mgr.client().await.expect("client");
+        assert!(mgr.access(&client, user).await.is_none());
+        assert!(store.get_trakt_auth(user).await.expect("get").is_none());
+    }
+
+    #[tokio::test]
+    async fn link_start_returns_pending_code() {
+        let (store, user) = store_with_creds().await;
+        let base = serve(fixed(
+            200,
+            json!({
+                "device_code": "dc", "user_code": "WXYZ",
+                "verification_url": "https://trakt.tv/activate",
+                "expires_in": 600, "interval": 5
+            }),
+        ))
+        .await;
+        let mgr = Arc::new(TraktManager::new(Arc::clone(&store), base));
+        let pending = mgr.link_start(user).await.expect("link");
+        assert_eq!(pending.user_code, "WXYZ");
+        // The pending attempt shows up in status + activity.
+        assert!(mgr.status(user).await.pending.is_some());
+        assert!(mgr.activity().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn sync_user_pulls_a_remote_watch_into_the_store() {
+        let (store, user) = store_with_creds().await;
+        store
+            .put_trakt_auth(&linked_auth(user, now_unix() + 999_999))
+            .await
+            .expect("auth");
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "L".into(),
+                kind: LibraryKind::Movies,
+                paths: vec![],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+        let movie = store
+            .insert_item(&NewItem {
+                library_id: lib.id,
+                kind: ItemKind::Movie,
+                parent_id: None,
+                title: "Heat".into(),
+                year: Some(1995),
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("movie");
+        store
+            .apply_metadata(
+                movie,
+                &MetadataPatch {
+                    tmdb_id: Some(603),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("meta");
+        store
+            .upsert_file(
+                movie,
+                "/m/Heat.mkv",
+                1,
+                1,
+                &ProbeResult {
+                    duration_ms: Some(6_000_000),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("file");
+
+        use axum::routing::{get, post};
+        use axum::Json;
+        let app = axum::Router::new()
+            .route(
+                "/sync/last_activities",
+                get(|| async {
+                    Json(json!({ "movies": { "watched_at": "2026-01-01T00:00:00Z" } }))
+                }),
+            )
+            .route(
+                "/sync/watched/movies",
+                get(|| async {
+                    Json(json!([{
+                        "last_watched_at": "2026-01-01T00:00:00.000Z",
+                        "movie": { "ids": { "tmdb": 603 } }
+                    }]))
+                }),
+            )
+            .route("/sync/watched/shows", get(|| async { Json(json!([])) }))
+            .route("/sync/playback", get(|| async { Json(json!([])) }))
+            .route("/sync/history", post(|| async { Json(json!({})) }))
+            .route("/sync/history/remove", post(|| async { Json(json!({})) }));
+        let base = serve(app).await;
+        let mgr = TraktManager::new(Arc::clone(&store), base);
+
+        mgr.sync_user(user).await.expect("sync");
+        // The remote watch landed locally.
+        let ws = store
+            .watch_state(user, movie)
+            .await
+            .expect("ws")
+            .expect("row");
+        assert!(ws.watched);
+        // Sync bookkeeping advanced.
+        let auth = store
+            .get_trakt_auth(user)
+            .await
+            .expect("get")
+            .expect("some");
+        assert!(auth.last_sync_at > 0);
+    }
+}

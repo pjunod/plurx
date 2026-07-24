@@ -1078,4 +1078,377 @@ mod tests {
             assert!(status.is_success(), "plex GET {uri} -> {status}");
         }
     }
+
+    /// A GET whose auth rides in the query string (`?token=`), as `<video>`,
+    /// `<img>`, and `<track>` elements must.
+    fn get_q(uri: &str) -> Request<Body> {
+        Request::builder()
+            .uri(uri)
+            .body(Body::empty())
+            .expect("req")
+    }
+
+    async fn status_of(app: &Router, req: Request<Body>) -> StatusCode {
+        app.clone().oneshot(req).await.expect("resp").status()
+    }
+
+    #[tokio::test]
+    async fn stream_delivery_paths() {
+        let (app, state) = test_state();
+        let admin = setup_admin(&app).await;
+        let s = seed_content(&state).await;
+
+        // Remux to fragmented MP4 (ffmpeg fails on the placeholder bytes, but the
+        // handler + remux pipeline run and return a 200 streaming body).
+        assert_eq!(
+            status_of(
+                &app,
+                get_q(&format!(
+                    "/api/v1/files/{}/stream.mp4?token={admin}",
+                    s.file
+                )),
+            )
+            .await,
+            StatusCode::OK
+        );
+        // Force an audio transcode (source aac not in the reported codec set).
+        assert_eq!(
+            status_of(
+                &app,
+                get_q(&format!(
+                    "/api/v1/files/{}/stream.mp4?token={admin}&acodec=opus&vcodec=h264&container=mp4",
+                    s.file
+                )),
+            )
+            .await,
+            StatusCode::OK
+        );
+        // Subtitle extraction: the text track exists in metadata but not in the
+        // placeholder file, so ffmpeg fails → 500; an out-of-range index → 404.
+        assert_eq!(
+            status_of(
+                &app,
+                get_q(&format!("/api/v1/files/{}/subs/0?token={admin}", s.file)),
+            )
+            .await,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            status_of(
+                &app,
+                get_q(&format!("/api/v1/files/{}/subs/99?token={admin}", s.file)),
+            )
+            .await,
+            StatusCode::NOT_FOUND
+        );
+        // Direct-play a missing file id → 404.
+        assert_eq!(
+            status_of(&app, get("/api/v1/files/424242/direct", Some(&admin))).await,
+            StatusCode::NOT_FOUND
+        );
+
+        // A file whose path isn't on disk → decision refuses with 409 Conflict.
+        use plurx_core::domain::{ItemKind, NewItem, ProbeResult};
+        let ghost_item = state
+            .store
+            .insert_item(&NewItem {
+                library_id: s.lib,
+                kind: ItemKind::Movie,
+                parent_id: None,
+                title: "Ghost".into(),
+                year: None,
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("item");
+        let ghost_file = state
+            .store
+            .upsert_file(
+                ghost_item,
+                "/definitely/not/here.mp4",
+                1,
+                1,
+                &ProbeResult {
+                    duration_ms: Some(1000),
+                    container: Some("mp4".into()),
+                    video_codec: Some("h264".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("file");
+        assert_eq!(
+            status_of(
+                &app,
+                get(
+                    &format!("/api/v1/files/{ghost_file}/decision"),
+                    Some(&admin)
+                ),
+            )
+            .await,
+            StatusCode::CONFLICT
+        );
+    }
+
+    #[tokio::test]
+    async fn hls_http_endpoints() {
+        let (app, state) = test_state();
+        let admin = setup_admin(&app).await;
+        let s = seed_content(&state).await;
+
+        // Unknown session → 404 for both playlist and segment.
+        assert_eq!(
+            status_of(&app, get_q("/api/v1/hls/nosuchsession/index.m3u8")).await,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            status_of(&app, get_q("/api/v1/hls/nosuchsession/seg00000.ts")).await,
+            StatusCode::NOT_FOUND
+        );
+        // Start a session (spawns ffmpeg; returns the playlist URL immediately).
+        let (st, body) = call(
+            &app,
+            get_q(&format!("/api/v1/files/{}/hls/start?token={admin}", s.file)),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(body["session_id"].is_string());
+    }
+
+    #[tokio::test]
+    async fn plex_write_image_and_part_paths() {
+        let (app, state) = test_state();
+        let admin = setup_admin(&app).await;
+        let s = seed_content(&state).await;
+
+        let plex = |uri: String| {
+            Request::builder()
+                .uri(uri)
+                .header("x-plex-token", &admin)
+                .body(Body::empty())
+                .expect("req")
+        };
+
+        // timeline writes progress; scrobble / unscrobble flip watched.
+        for uri in [
+            format!(
+                "/:/timeline?ratingKey={}&time=1000&duration=9000000",
+                s.movie
+            ),
+            format!("/:/scrobble?key={}", s.movie),
+            format!("/:/unscrobble?key={}", s.movie),
+        ] {
+            assert!(
+                status_of(&app, plex(uri.clone())).await.is_success(),
+                "{uri}"
+            );
+        }
+        // Direct-play part on the real seeded file.
+        assert!(
+            status_of(&app, plex(format!("/library/parts/{}/0/Heat.mp4", s.file)),)
+                .await
+                .is_success()
+        );
+
+        // Image with no artwork set → 404.
+        assert_eq!(
+            status_of(&app, plex(format!("/library/metadata/{}/thumb", s.movie))).await,
+            StatusCode::NOT_FOUND
+        );
+
+        // Give the movie a poster on disk, then thumb + photo transcode serve it.
+        tokio::fs::create_dir_all(&state.artwork_dir)
+            .await
+            .expect("mkart");
+        tokio::fs::write(state.artwork_dir.join("poster.jpg"), b"\xff\xd8\xff jpeg")
+            .await
+            .expect("art");
+        state
+            .store
+            .apply_metadata(
+                s.movie,
+                &plurx_core::domain::MetadataPatch {
+                    poster_path: Some("poster.jpg".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("meta");
+        assert!(
+            status_of(&app, plex(format!("/library/metadata/{}/thumb", s.movie)))
+                .await
+                .is_success()
+        );
+        assert!(status_of(
+            &app,
+            plex(format!(
+                "/photo/:/transcode?url=/library/metadata/{}/thumb",
+                s.movie
+            )),
+        )
+        .await
+        .is_success());
+        // A malformed photo url → 404.
+        assert_eq!(
+            status_of(&app, plex("/photo/:/transcode?url=/bogus".into())).await,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn images_web_and_auth_paths() {
+        let (app, state) = test_state();
+        let admin = setup_admin(&app).await;
+
+        // Native artwork endpoint: a real file, a traversal name, a miss.
+        tokio::fs::create_dir_all(&state.artwork_dir)
+            .await
+            .expect("mkart");
+        tokio::fs::write(state.artwork_dir.join("a.jpg"), b"\xff\xd8\xff")
+            .await
+            .expect("art");
+        assert_eq!(
+            status_of(&app, get_q(&format!("/api/v1/images/a.jpg?token={admin}"))).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status_of(&app, get_q(&format!("/api/v1/images/..?token={admin}"))).await,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            status_of(
+                &app,
+                get_q(&format!("/api/v1/images/missing.jpg?token={admin}"))
+            )
+            .await,
+            StatusCode::NOT_FOUND
+        );
+
+        // No APK published → 404; SPA fallback serves the app for non-API paths
+        // but a clean JSON 404 under /api.
+        assert_eq!(
+            status_of(&app, get_q("/download/plurx-android.apk")).await,
+            StatusCode::NOT_FOUND
+        );
+        assert!(status_of(&app, get_q("/some/app/route")).await.is_success());
+        assert_eq!(
+            status_of(&app, get("/api/v1/nope", Some(&admin))).await,
+            StatusCode::NOT_FOUND
+        );
+
+        // /me and logout for the signed-in admin; a bad login is rejected.
+        assert_eq!(
+            status_of(&app, get("/api/v1/me", Some(&admin))).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            call(&app, post("/api/v1/auth/logout", Some(&admin), json!({})))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            call(
+                &app,
+                post(
+                    "/api/v1/auth/login",
+                    None,
+                    json!({ "username": "paul", "password": "wrong" }),
+                ),
+            )
+            .await
+            .0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_activity_library_and_trakt_paths() {
+        let (app, state) = test_state();
+        let admin = setup_admin(&app).await;
+        let s = seed_content(&state).await;
+
+        // Activity detail (any user) + stopping an unknown session (admin).
+        assert_eq!(
+            status_of(&app, get("/api/v1/activity/detail", Some(&admin))).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status_of(&app, delete("/api/v1/activity/sessions/nope", Some(&admin))).await,
+            StatusCode::NOT_FOUND
+        );
+
+        // Library validation rejects unknown kind, empty name, no paths.
+        for bad in [
+            json!({ "name": "X", "kind": "bogus", "paths": ["/x"] }),
+            json!({ "name": "   ", "kind": "movies", "paths": ["/x"] }),
+            json!({ "name": "X", "kind": "movies", "paths": [] }),
+        ] {
+            assert_eq!(
+                call(&app, post("/api/v1/libraries", Some(&admin), bad))
+                    .await
+                    .0,
+                StatusCode::BAD_REQUEST
+            );
+        }
+        // Scan + refresh the seeded library; a missing library → 404.
+        assert!(status_of(
+            &app,
+            post(
+                &format!("/api/v1/libraries/{}/scan", s.lib),
+                Some(&admin),
+                json!({})
+            ),
+        )
+        .await
+        .is_success());
+        assert!(status_of(
+            &app,
+            post(
+                &format!("/api/v1/libraries/{}/refresh", s.lib),
+                Some(&admin),
+                json!({})
+            ),
+        )
+        .await
+        .is_success());
+        assert_eq!(
+            status_of(
+                &app,
+                post("/api/v1/libraries/999999/scan", Some(&admin), json!({})),
+            )
+            .await,
+            StatusCode::NOT_FOUND
+        );
+
+        // Trakt sync (notify only) + unlink (no-op when unlinked) are safe here.
+        assert!(
+            status_of(&app, post("/api/v1/trakt/sync", Some(&admin), json!({})))
+                .await
+                .is_success()
+        );
+        assert!(status_of(&app, delete("/api/v1/trakt/link", Some(&admin)))
+            .await
+            .is_success());
+    }
+
+    #[tokio::test]
+    async fn setup_rejects_a_weak_password() {
+        // Fresh server, no admin yet: the password-length rule applies.
+        let app = test_app();
+        assert_eq!(
+            call(
+                &app,
+                post(
+                    "/api/v1/setup",
+                    None,
+                    json!({ "username": "paul", "password": "short" }),
+                ),
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+    }
 }

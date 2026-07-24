@@ -778,6 +778,107 @@ mod tests {
         assert!(p.join("seg00000.ts").exists());
     }
 
+    async fn seed_file(store: &Arc<dyn Store>) -> i64 {
+        use plurx_core::domain::{ItemKind, LibraryKind, NewItem, NewLibrary, ProbeResult};
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "L".into(),
+                kind: LibraryKind::Movies,
+                paths: vec![],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+        let movie = store
+            .insert_item(&NewItem {
+                library_id: lib.id,
+                kind: ItemKind::Movie,
+                parent_id: None,
+                title: "Heat".into(),
+                year: Some(1995),
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("movie");
+        store
+            .upsert_file(
+                movie,
+                "/media/Heat.mkv",
+                1,
+                1,
+                &ProbeResult {
+                    duration_ms: Some(6_000_000),
+                    container: Some("mkv".into()),
+                    video_codec: Some("hevc".into()),
+                    width: Some(3840),
+                    height: Some(2160),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("file")
+    }
+
+    #[tokio::test]
+    async fn manager_reads_prefs_and_runs_session_lifecycle() {
+        use plurx_core::store::SqliteStore;
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let file_id = seed_file(&store).await;
+        let work = tempfile::tempdir().expect("work");
+        let mgr = TranscodeManager::new(
+            Arc::clone(&store),
+            work.path().to_path_buf(),
+            EncoderCaps::default(),
+        );
+
+        // Defaults with an empty store.
+        let prefs = mgr.lang_prefs().await;
+        assert_eq!(prefs.audio_lang, "eng");
+        // No hardware caps → software encoder.
+        assert_eq!(mgr.encoder().await, Encoder::Software);
+        assert_eq!(mgr.active_sessions().await, 0);
+        assert!(mgr.list_sessions().await.is_empty());
+
+        // Settings feed the language prefs.
+        store.put_setting(keys::AUDIO_LANG, "jpn").await.expect("s");
+        store.put_setting(keys::SUB_LANG, "eng").await.expect("s");
+        store
+            .put_setting(keys::SUB_MODE, "always")
+            .await
+            .expect("s");
+        let prefs = mgr.lang_prefs().await;
+        assert_eq!(prefs.audio_lang, "jpn");
+
+        // Unknown session lookups fail fast (no waiting).
+        assert!(mgr.playlist("missing").await.is_none());
+        assert!(mgr.segment("missing", "seg00000.ts").await.is_none());
+        assert!(mgr.segment("missing", "../evil").await.is_none());
+        assert!(!mgr.stop_session("missing").await);
+
+        // A real start spawns ffmpeg (it fails async on the fake path, but the
+        // session is created and tracked). Then the admin stop kills it.
+        let info = mgr
+            .start(file_id, 720, 0.0, None, "paul")
+            .await
+            .expect("start");
+        assert_eq!(info.encoder, "software (x264)");
+        assert_eq!(mgr.active_sessions().await, 1);
+        let sessions = mgr.list_sessions().await;
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].user_name, "paul");
+        assert!(mgr.stop_session(&info.session_id).await);
+        assert_eq!(mgr.active_sessions().await, 0);
+
+        // The copy-video path likewise creates and tears down a session.
+        let info = mgr
+            .start_copy(file_id, 5.0, Some(1), true, "paul")
+            .await
+            .expect("start_copy");
+        assert_eq!(info.encoder, "copy");
+        assert!(mgr.stop_session(&info.session_id).await);
+    }
+
     #[tokio::test]
     async fn producing_requires_a_listed_segment() {
         let dir = tempfile::tempdir().expect("tempdir");
