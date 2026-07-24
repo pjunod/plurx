@@ -219,6 +219,8 @@
   .pseek-buf{background:rgba(255,255,255,.4)}
   .pseek-fill{background:var(--accent)}
   .pseek-thumb{position:absolute;left:0;width:13px;height:13px;border-radius:50%;background:#fff;box-shadow:0 1px 4px rgba(0,0,0,.5);transform:translateX(-50%);pointer-events:none}
+  .pseek:focus-visible{outline:2px solid var(--accent);outline-offset:5px;border-radius:3px}
+  .picon:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:6px}
   @media(max-width:520px){ .ptransport .nudge{display:none} }   /* tight phones: drop ±10s, keep the scrubber */
   .statsov{position:absolute;top:64px;left:20px;max-width:360px;background:rgba(8,10,15,.84);border:1px solid rgba(255,255,255,.12);
     border-radius:10px;padding:11px 13px;font:12px/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#e8e8ea;
@@ -244,15 +246,22 @@
      which left the sticky header narrower than the body. minmax(0,…) lets the
      track shrink so the table scrolls inside its card instead. */
   .adminwrap{display:grid;grid-template-columns:minmax(0,1fr);gap:22px;max-width:960px}
-  /* Phones: a wide settings table (libraries/users, with their path chips and
-     action buttons) has a min-content width past a phone's, so at width:100% it
-     overflowed the *page*. That horizontal page scroll left the sticky header
-     narrower than the body ("pulled ~1/3 over"). Scroll the table inside its
-     own card instead — the page stays exactly viewport-width and the header
-     lines back up. (Can't fix it with overflow-x on a header ancestor: that
-     would create a scroll container and break the header's position:sticky.) */
+  /* No-key warning banner (e.g. TMDB not configured → no artwork). */
+  .setwarn{background:color-mix(in srgb,#e8a33d 15%,var(--panel));border:1px solid color-mix(in srgb,#e8a33d 45%,var(--line));
+    border-radius:10px;padding:11px 14px;margin:0 0 16px;font-size:13.5px;line-height:1.55}
+  .setwarn a{color:var(--accent);cursor:pointer;text-decoration:underline}
+  /* Phones: a wide settings table (libraries/users) overflows the viewport,
+     which used to push the sticky header out of alignment. Reflow each row into
+     a self-contained card — name as a heading, labeled cells, action buttons
+     wrapping underneath — so nothing scrolls sideways. Desktop keeps the table. */
   @media(max-width:640px){
-    .adminwrap table{display:block;overflow-x:auto;-webkit-overflow-scrolling:touch;max-width:100%}
+    .adminwrap table,.adminwrap tbody,.adminwrap tr,.adminwrap td{display:block;width:auto}
+    .adminwrap thead{display:none}
+    .adminwrap tr{border:1px solid var(--line);border-radius:10px;padding:10px 13px;margin:0 0 10px;background:var(--panel)}
+    .adminwrap td{padding:3px 0;border:0}
+    .adminwrap td[data-label]::before{content:attr(data-label);display:block;color:var(--muted);font-size:10.5px;text-transform:uppercase;letter-spacing:.05em;margin-bottom:1px}
+    .adminwrap td.libname{font-size:16px;font-weight:700;padding-bottom:3px}
+    .adminwrap td.rowactions{justify-content:flex-start;padding-top:9px}
   }
   /* Settings tab bar — one group visible at a time (persisted per browser). */
   .settabs{display:flex;gap:2px;flex-wrap:wrap;margin:0 0 20px;border-bottom:1px solid var(--line)}
@@ -551,7 +560,7 @@ if(window.matchMedia){ try{ window.matchMedia("(prefers-color-scheme: dark)").ad
 </head>
 <body>
 <div id="app"></div>
-<div class="modal" id="modal"><div class="player" id="player"><video id="video" autoplay playsinline x-webkit-airplay="allow"></video><div class="pbar" id="pbar"><div class="ptitle" id="playTitle"></div><div class="row"><button class="pbtn" id="audiobtn" style="display:none" onclick="toggleMenu('audio')">🔊 Audio</button><button class="pbtn" id="subsbtn" style="display:none" onclick="toggleMenu('subs')">💬 Subtitles</button><button class="pbtn" id="qualbtn" title="Playback quality" onclick="toggleMenu('quality')">◆ Quality</button><button class="pbtn" id="syncbtn" title="Audio sync adjustment" onclick="toggleMenu('sync')">⇄ Sync</button><button class="pbtn" id="statsbtn" title="Playback info (i)" onclick="toggleStats()">ⓘ Stats</button><button class="pbtn" id="skipbtn" title="Auto-skip intro & credits" onclick="togglePlayerAutoskip()">⏭ Auto-skip</button><button class="pbtn" id="autonextbtn" title="Auto-play the next episode when one finishes" onclick="togglePlayerAutonext()">▶ Autoplay</button><button class="pbtn" id="apbtn" style="display:none" title="AirPlay">📺 AirPlay</button><button class="pbtn" title="Close (Esc)" onclick="closePlayer()">✕ Close</button></div></div><div class="ptransport" id="ptransport"><button class="picon" id="pbplay" title="Play / Pause (space)" onclick="togglePlay()">▶</button><button class="picon nudge" title="Back 10s (←)" onclick="nudge(-10)">↺</button><button class="picon nudge" title="Forward 10s (→)" onclick="nudge(10)">↻</button><span class="ptime" id="ptcur">0:00</span><div class="pseek" id="pseek"><div class="pseek-buf" id="pseekbuf"></div><div class="pseek-fill" id="pseekfill"></div><div class="pseek-thumb" id="pseekthumb"></div></div><span class="ptime" id="ptdur">0:00</span><button class="picon" id="pbpip" title="Picture-in-picture" style="display:none" onclick="togglePip()">◲</button><button class="picon" id="pbfs" title="Fullscreen (f)" onclick="toggleFullscreen()">⛶</button></div><div class="pskip" id="pskip"></div><div class="ploading" id="ploading"><div class="pspin"></div><div class="ploadText" id="ploadText">Loading…</div><div class="ploadSub" id="ploadSub"></div></div><div class="statsov" id="statsov"></div><div class="pmenu" id="pmenu"></div></div></div>
+<div class="modal" id="modal"><div class="player" id="player"><video id="video" autoplay playsinline x-webkit-airplay="allow"></video><div class="pbar" id="pbar"><div class="ptitle" id="playTitle"></div><div class="row"><button class="pbtn" id="audiobtn" style="display:none" onclick="toggleMenu('audio')">🔊 Audio</button><button class="pbtn" id="subsbtn" style="display:none" onclick="toggleMenu('subs')">💬 Subtitles</button><button class="pbtn" id="qualbtn" title="Playback quality" onclick="toggleMenu('quality')">◆ Quality</button><button class="pbtn" id="syncbtn" title="Audio sync adjustment" onclick="toggleMenu('sync')">⇄ Sync</button><button class="pbtn" id="statsbtn" title="Playback info (i)" onclick="toggleStats()">ⓘ Stats</button><button class="pbtn" id="skipbtn" title="Auto-skip intro & credits" onclick="togglePlayerAutoskip()">⏭ Auto-skip</button><button class="pbtn" id="autonextbtn" title="Auto-play the next episode when one finishes" onclick="togglePlayerAutonext()">▶ Autoplay</button><button class="pbtn" id="apbtn" style="display:none" title="AirPlay">📺 AirPlay</button><button class="pbtn" title="Close (Esc)" onclick="closePlayer()">✕ Close</button></div></div><div class="ptransport" id="ptransport"><button class="picon" id="pbplay" aria-label="Play" title="Play / Pause (space)" onclick="togglePlay()">▶</button><button class="picon nudge" aria-label="Back 10 seconds" title="Back 10s (←)" onclick="nudge(-10)">↺</button><button class="picon nudge" aria-label="Forward 10 seconds" title="Forward 10s (→)" onclick="nudge(10)">↻</button><span class="ptime" id="ptcur" aria-hidden="true">0:00</span><div class="pseek" id="pseek" role="slider" tabindex="0" aria-label="Seek" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-valuetext="0:00"><div class="pseek-buf" id="pseekbuf" aria-hidden="true"></div><div class="pseek-fill" id="pseekfill" aria-hidden="true"></div><div class="pseek-thumb" id="pseekthumb" aria-hidden="true"></div></div><span class="ptime" id="ptdur" aria-hidden="true">0:00</span><button class="picon" id="pbpip" aria-label="Picture in picture" title="Picture-in-picture" style="display:none" onclick="togglePip()">◲</button><button class="picon" id="pbfs" aria-label="Fullscreen" title="Fullscreen (f)" onclick="toggleFullscreen()">⛶</button></div><div class="pskip" id="pskip"></div><div class="ploading" id="ploading"><div class="pspin"></div><div class="ploadText" id="ploadText">Loading…</div><div class="ploadSub" id="ploadSub"></div></div><div class="statsov" id="statsov"></div><div class="pmenu" id="pmenu"></div></div></div>
 <div class="toast" id="toast"></div>
 
 <script src="/assets/hls.min.js"></script>
@@ -1497,8 +1506,11 @@ function pbTick(){
   const cur=document.getElementById("ptcur"); if(cur) cur.textContent=clockFromSec(pos);
   const dur=document.getElementById("ptdur"); if(dur) dur.textContent=tot>0?clockFromSec(tot):"--:--";
   if(buf){ let bf=0; try{ if(v&&v.buffered&&v.buffered.length){ const be=((PLAYER.offset)||0)+v.buffered.end(v.buffered.length-1); bf=tot>0?Math.min(1,be/tot):0; } }catch(e){} buf.style.width=(bf*100)+"%"; }
+  const sk=document.getElementById("pseek");
+  if(sk){ sk.setAttribute("aria-valuenow", Math.round(f*100)); sk.setAttribute("aria-valuetext", clockFromSec(pos)+(tot>0?" of "+clockFromSec(tot):"")); }
 }
-function pbSyncPlayIcon(){ const v=document.getElementById("video"), b=document.getElementById("pbplay"); if(b&&v) b.textContent=(v.paused||v.ended)?"▶":"❚❚"; }
+function pbSyncPlayIcon(){ const v=document.getElementById("video"), b=document.getElementById("pbplay");
+  if(b&&v){ const paused=(v.paused||v.ended); b.textContent=paused?"▶":"❚❚"; b.setAttribute("aria-label", paused?"Play":"Pause"); } }
 function togglePlay(){ const v=document.getElementById("video"); if(!v) return; if(v.paused||v.ended) v.play().catch(()=>{}); else v.pause(); playerActivity(); }
 // ±10s nudges coalesce: accumulate against a frozen base, preview live on the
 // scrubber, and fire ONE seekTo after a short quiet — so mashing the button (or
@@ -1535,6 +1547,12 @@ function pbWireSeek(){
   const done=e=>{ if(!drag)return; drag=false; const t=frac(e)*pbTotalSec(); PLAYER._seekPreview=null; seekTo(t); };
   seek.addEventListener("pointerup",done);
   seek.addEventListener("pointercancel",()=>{ if(!drag)return; drag=false; const t=PLAYER._seekPreview; PLAYER._seekPreview=null; if(t!=null) seekTo(t); else pbTick(); });
+  // Keyboard on the focused slider: Home/End jump to start/end (arrows ±10s are
+  // handled by the global player key handler).
+  seek.addEventListener("keydown",e=>{
+    if(e.key==='Home'){ e.preventDefault(); seekTo(0); }
+    else if(e.key==='End'){ e.preventDefault(); const t=pbTotalSec(); if(t>0) seekTo(Math.max(0,t-1)); }
+  });
 }
 // Attach the persistent listeners once; they read live PLAYER state each fire.
 function wirePlayer(){
@@ -2010,27 +2028,31 @@ function settingsPanel(tab,d){
   if(tab==="playback") return playbackPanel(d.settings);
   if(tab==="users")    return usersPanel(d.users);
   if(tab==="system")   return systemPanel(d.sys);
-  return librariesPanel(d.libs,d.status);
+  return librariesPanel(d.libs,d.status,d.settings);
 }
 function libRow(l,status){
   const paths=(l.paths||[]).map(p=>`<span class="pathchip">${esc(p)}</span>`).join(" ")||'<span class="muted">—</span>';
-  return `<tr id="librow-${l.id}"><td><b>${esc(l.name)}</b></td><td>${esc(l.anime?'anime':l.kind)}</td>
-      <td><div class="paths">${paths}</div></td>
-      <td class="muted" id="st-${l.id}">${statusText(status[l.id])}</td>
-      <td class="row" style="flex-wrap:wrap;justify-content:flex-end;gap:5px">
+  return `<tr id="librow-${l.id}"><td class="libname"><b>${esc(l.name)}</b></td><td data-label="Kind">${esc(l.anime?'anime':l.kind)}</td>
+      <td data-label="Paths"><div class="paths">${paths}</div></td>
+      <td class="muted" data-label="Status" id="st-${l.id}">${statusText(status[l.id])}</td>
+      <td class="row rowactions" style="flex-wrap:wrap;justify-content:flex-end;gap:5px">
         <button class="ghost sm" onclick="scanLib(${l.id})">Scan</button>
         <button class="ghost sm" onclick="refreshLib(${l.id})" title="Re-fetch all metadata & artwork (incl. season posters)">Refresh art</button>
         <button class="ghost sm" onclick="editLib(${l.id})">Edit</button>
         <button class="ghost sm" onclick="delLib(${l.id})">Delete</button></td></tr>`;
 }
-function librariesPanel(libs,status){
+function librariesPanel(libs,status,settings){
   const rows=libs.map(l=>libRow(l,status)).join("")||`<tr><td colspan="5" class="muted">No libraries yet.</td></tr>`;
   const bulk=libs.length?`<div class="row" style="margin:0 0 14px;gap:8px;align-items:center">
         <button class="ghost sm" onclick="scanAll()" title="Scan every library for new & changed files">Scan all</button>
         <button class="ghost sm" onclick="refreshAll()" title="Re-fetch metadata & artwork for every library">Refresh all art</button>
         <span class="muted" style="font-size:12px">${libs.length} librar${libs.length===1?'y':'ies'}</span></div>`:"";
+  // Movies/TV need a TMDB key for artwork; without one the scan finds files but
+  // downloads nothing. Surface that right here, where libraries are managed.
+  const needTmdb = settings && !settings.tmdb_configured && libs.some(l=>!l.anime);
+  const warn = needTmdb ? `<div class="setwarn">⚠ <b>No TMDB API key set.</b> Your Movies/TV libraries scan fine, but posters, overviews, and episode data won't download without one. <a onclick="setSettingsTab('metadata')">Add a free key in Metadata</a>, then use <b>Refresh all art</b>. (Anime libraries use AniList and need no key.)</div>` : "";
   return `<div class="card"><h2 class="section" style="margin-top:0">Libraries</h2>
-      ${bulk}
+      ${warn}${bulk}
       <table><thead><tr><th>Name</th><th>Kind</th><th>Paths</th><th>Status</th><th></th></tr></thead>
       <tbody>${rows}</tbody></table>
       <h2 class="section">Add library</h2>
@@ -2045,7 +2067,7 @@ function librariesPanel(libs,status){
 function metadataPanel(settings,trakt){
   return `<div class="card"><h2 class="section" style="margin-top:0">API keys</h2>
       <label>TMDB — posters, overviews, episode data</label>
-      <p class="muted" style="margin:2px 0 6px">${settings.tmdb_configured?"Configured. Click the field to reveal it, or type a new key to replace it.":"Add a TMDB API key to fetch posters, overviews, and episode data."}</p>
+      <p class="muted" style="margin:2px 0 6px">${settings.tmdb_configured?"Configured. Click the field to reveal it, or type a new key to replace it.":"Add a free key (<a href='https://www.themoviedb.org/settings/api' target='_blank' rel='noopener'>themoviedb.org</a>) to fetch posters, overviews, and episode data."}</p>
       <input id="tk" placeholder="TMDB API key" type="password" autocomplete="off" value="${esc(settings.tmdb_api_key||'')}" onfocus="this.type='text'" onblur="this.type='password'">
       <div class="err" id="terr"></div>
       <button class="sm" style="margin:10px 0 22px" onclick="saveTmdb()">Save TMDB key</button>
@@ -2257,8 +2279,8 @@ function userRow(u){
   const btns=[`<button class="ghost sm" onclick='resetPw(${u.id},${esc(JSON.stringify(u.username))})'>Reset password</button>`];
   btns.push(`<button class="ghost sm" onclick="setAdmin(${u.id},${u.is_admin?0:1})">${u.is_admin?'Revoke admin':'Make admin'}</button>`);
   if(!me) btns.push(`<button class="ghost sm" onclick='delUser(${u.id},${esc(JSON.stringify(u.username))})'>Delete</button>`);
-  return `<tr><td><b>${esc(u.username)}</b>${me?' <span class="muted">(you)</span>':''}</td><td>${role}</td><td class="muted">${created}</td>
-    <td class="row" style="flex-wrap:wrap;justify-content:flex-end">${btns.join("")}</td></tr>`;
+  return `<tr><td class="libname"><b>${esc(u.username)}</b>${me?' <span class="muted">(you)</span>':''}</td><td data-label="Role">${role}</td><td class="muted" data-label="Created">${created}</td>
+    <td class="row rowactions" style="flex-wrap:wrap;justify-content:flex-end">${btns.join("")}</td></tr>`;
 }
 async function addUser(){
   const username=un.value.trim(), password=up.value, is_admin=ua.checked;
