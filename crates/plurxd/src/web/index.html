@@ -44,8 +44,11 @@
     padding:12px 20px;background:color-mix(in srgb, var(--bg) 82%, transparent);backdrop-filter:blur(10px);border-bottom:1px solid var(--line)}
   .logo{font-weight:800;letter-spacing:.5px;font-size:20px;background:linear-gradient(90deg,var(--accent),var(--accent2));-webkit-background-clip:text;background-clip:text;color:transparent}
   .top nav{display:flex;gap:4px;flex-wrap:wrap}
-  .top nav a{padding:7px 12px;border-radius:8px;color:var(--muted)}
-  .top nav a.active,.top nav a:hover{background:var(--panel2);color:var(--text)}
+  /* Top nav mirrors the Settings tab bar: muted labels, an accent underline on
+     the current page, and an accent-tinted gradient wash on hover. */
+  .top nav a{padding:8px 12px;border-radius:8px 8px 0 0;color:var(--muted);border-bottom:2px solid transparent}
+  .top nav a:hover{color:var(--text);background:linear-gradient(180deg,transparent,color-mix(in srgb,var(--accent) 18%,transparent))}
+  .top nav a.active{color:var(--text);border-bottom-color:var(--accent)}
   .top .spacer{flex:1}
   .search{max-width:240px}
   .topctl{display:flex;align-items:center;gap:16px}
@@ -207,7 +210,7 @@
   .settabs{display:flex;gap:2px;flex-wrap:wrap;margin:0 0 20px;border-bottom:1px solid var(--line)}
   .settab{background:transparent;border:0;border-bottom:2px solid transparent;color:var(--muted);
     padding:9px 15px;font-size:14px;font-weight:600;cursor:pointer;margin-bottom:-1px;border-radius:8px 8px 0 0}
-  .settab:hover{color:var(--text);background:var(--panel2)}
+  .settab:hover{color:var(--text);background:linear-gradient(180deg,transparent,color-mix(in srgb,var(--accent) 18%,transparent))}
   .settab.active{color:var(--text);border-bottom-color:var(--accent)}
   /* Library paths shown as distinct chips instead of a comma-run. */
   .paths{display:flex;flex-wrap:wrap;gap:5px}
