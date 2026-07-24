@@ -682,4 +682,400 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
+
+    // ---- seeded integration surface -----------------------------------------
+    // A router plus the AppState behind it, so a test can seed items/files
+    // straight through the store and then drive the real handlers end to end.
+    fn test_state() -> (Router, AppState) {
+        let store = SqliteStore::open_in_memory().expect("store");
+        let base = std::env::temp_dir().join(format!("plurx-it-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(
+            "test".into(),
+            Arc::new(store),
+            base.join("artwork"),
+            base.join("transcode"),
+            Default::default(),
+            Default::default(),
+            Arc::new(crate::logbuf::LogBuffer::new(64)),
+        );
+        (router(state.clone()), state)
+    }
+
+    struct Seed {
+        lib: i64,
+        movie: i64,
+        file: i64,
+        show: i64,
+        season: i64,
+        ep: i64,
+    }
+
+    async fn seed_content(state: &AppState) -> Seed {
+        use plurx_core::domain::{
+            AudioStream, ItemKind, LibraryKind, NewItem, NewLibrary, ProbeResult, SubtitleStream,
+        };
+
+        let lib = state
+            .store
+            .create_library(&NewLibrary {
+                name: "Movies".into(),
+                kind: LibraryKind::Movies,
+                paths: vec![std::path::PathBuf::from("/media")],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+        let movie = state
+            .store
+            .insert_item(&NewItem {
+                library_id: lib.id,
+                kind: ItemKind::Movie,
+                parent_id: None,
+                title: "Heat".into(),
+                year: Some(1995),
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("movie");
+        // A real (tiny) file on disk so decision/direct/detail treat it as present.
+        let dir = std::env::temp_dir().join(format!("plurx-media-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("mediadir");
+        let mpath = dir.join("Heat.mp4");
+        std::fs::write(&mpath, b"\x00\x00\x00\x18ftypmp42 tiny placeholder bytes").expect("write");
+        let probe = ProbeResult {
+            duration_ms: Some(9_000_000),
+            container: Some("mp4".into()),
+            video_codec: Some("h264".into()),
+            width: Some(1920),
+            height: Some(1080),
+            bit_depth: Some(8),
+            bitrate: Some(8_000_000),
+            audio_streams: vec![AudioStream {
+                index: 0,
+                codec: "aac".into(),
+                channels: Some(2),
+                language: Some("eng".into()),
+                default: true,
+                ..Default::default()
+            }],
+            subtitle_streams: vec![SubtitleStream {
+                index: 0,
+                codec: "subrip".into(),
+                language: Some("eng".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let file = state
+            .store
+            .upsert_file(movie, &mpath.to_string_lossy(), 42, 1, &probe)
+            .await
+            .expect("file");
+        let show = state
+            .store
+            .insert_item(&NewItem {
+                library_id: lib.id,
+                kind: ItemKind::Show,
+                parent_id: None,
+                title: "The Wire".into(),
+                year: Some(2002),
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("show");
+        let season = state
+            .store
+            .insert_item(&NewItem {
+                library_id: lib.id,
+                kind: ItemKind::Season,
+                parent_id: Some(show),
+                title: "Season 1".into(),
+                year: None,
+                season_number: Some(1),
+                episode_number: None,
+            })
+            .await
+            .expect("season");
+        let ep = state
+            .store
+            .insert_item(&NewItem {
+                library_id: lib.id,
+                kind: ItemKind::Episode,
+                parent_id: Some(season),
+                title: "The Target".into(),
+                year: None,
+                season_number: Some(1),
+                episode_number: Some(1),
+            })
+            .await
+            .expect("ep");
+        state
+            .store
+            .upsert_file(ep, &mpath.to_string_lossy(), 42, 1, &probe)
+            .await
+            .expect("epfile");
+        Seed {
+            lib: lib.id,
+            movie,
+            file,
+            show,
+            season,
+            ep,
+        }
+    }
+
+    #[tokio::test]
+    async fn seeded_read_surface() {
+        let (app, state) = test_state();
+        let admin = setup_admin(&app).await;
+        let s = seed_content(&state).await;
+
+        let authed: Vec<String> = vec![
+            "/api/v1/hubs".into(),
+            "/api/v1/search?q=Heat".into(),
+            format!("/api/v1/items/{}", s.movie),
+            format!("/api/v1/items/{}", s.show),
+            format!("/api/v1/items/{}", s.season),
+            format!("/api/v1/items/{}", s.ep),
+            format!("/api/v1/libraries/{}/items", s.lib),
+            format!("/api/v1/libraries/{}/items?sort=title&limit=5&offset=0", s.lib),
+            format!("/api/v1/libraries/{}/items?sort=added", s.lib),
+            format!("/api/v1/libraries/{}/items?sort=year", s.lib),
+            format!("/api/v1/libraries/{}/items?sort=resolution", s.lib),
+            format!(
+                "/api/v1/files/{}/decision?vcodec=h264,hevc&acodec=aac&container=mp4&hdr=0",
+                s.file
+            ),
+            format!(
+                "/api/v1/files/{}/decision?vcodec=vp9&acodec=opus&container=webm&hdr=0&force=transcode",
+                s.file
+            ),
+            "/api/v1/system".into(),
+            "/api/v1/system/logs?level=trace&limit=10".into(),
+            "/api/v1/scan/status".into(),
+            "/api/v1/settings".into(),
+            "/api/v1/users".into(),
+            "/api/v1/trakt/status".into(),
+        ];
+        for uri in &authed {
+            let status = call(&app, get(uri, Some(&admin))).await.0;
+            assert!(status.is_success(), "GET {uri} -> {status}");
+        }
+
+        // Public / static, no token.
+        for uri in [
+            "/",
+            "/manifest.webmanifest",
+            "/icons/icon-192.png",
+            "/icons/apple-touch-icon.png",
+            "/assets/hls.min.js",
+            "/healthz",
+            "/readyz",
+            "/metrics",
+            "/api/v1/server",
+        ] {
+            let status = app
+                .clone()
+                .oneshot(get(uri, None))
+                .await
+                .expect("r")
+                .status();
+            assert!(status.is_success(), "GET {uri} -> {status}");
+        }
+        // Unknown icon → 404.
+        let status = app
+            .clone()
+            .oneshot(get("/icons/nope.png", None))
+            .await
+            .expect("r")
+            .status();
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Direct play the real file (whole, then a range).
+        let status = app
+            .clone()
+            .oneshot(get(
+                &format!("/api/v1/files/{}/direct", s.file),
+                Some(&admin),
+            ))
+            .await
+            .expect("r")
+            .status();
+        assert!(
+            status == StatusCode::OK || status == StatusCode::PARTIAL_CONTENT,
+            "direct -> {status}"
+        );
+        let ranged = Request::builder()
+            .uri(format!("/api/v1/files/{}/direct?token={admin}", s.file))
+            .header("range", "bytes=0-3")
+            .body(Body::empty())
+            .expect("req");
+        let status = app.clone().oneshot(ranged).await.expect("r").status();
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT, "ranged -> {status}");
+    }
+
+    #[tokio::test]
+    async fn seeded_write_surface() {
+        let (app, state) = test_state();
+        let admin = setup_admin(&app).await;
+        let s = seed_content(&state).await;
+
+        // Progress returns the updated watch state.
+        let (st, w) = call(
+            &app,
+            post(
+                &format!("/api/v1/items/{}/progress", s.movie),
+                Some(&admin),
+                json!({ "position_ms": 1000, "duration_ms": 9_000_000 }),
+            ),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(w["position_ms"], 1000);
+
+        // Mark watched / unwatched.
+        assert_eq!(
+            call(
+                &app,
+                post(
+                    &format!("/api/v1/items/{}/scrobble", s.movie),
+                    Some(&admin),
+                    json!({})
+                )
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            call(
+                &app,
+                post(
+                    &format!("/api/v1/items/{}/unscrobble", s.movie),
+                    Some(&admin),
+                    json!({})
+                )
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        // Manual A/V offset.
+        assert_eq!(
+            call(
+                &app,
+                put(
+                    &format!("/api/v1/files/{}/audio-offset", s.file),
+                    Some(&admin),
+                    json!({ "offset_ms": 250 })
+                )
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        // Progress on a missing item → 404.
+        assert_eq!(
+            call(
+                &app,
+                post(
+                    "/api/v1/items/424242/progress",
+                    Some(&admin),
+                    json!({ "position_ms": 1 })
+                )
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+
+        // Settings round-trip.
+        assert_eq!(
+            call(
+                &app,
+                put(
+                    "/api/v1/settings",
+                    Some(&admin),
+                    json!({
+                        "tmdb_api_key": "key",
+                        "omdb_api_key": "",
+                        "default_audio_lang": "eng",
+                        "default_sub_lang": "eng",
+                        "sub_mode": "always"
+                    })
+                )
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+
+        // Update the seeded library, then create + delete a second one.
+        assert_eq!(
+            call(
+                &app,
+                put(
+                    &format!("/api/v1/libraries/{}", s.lib),
+                    Some(&admin),
+                    json!({ "name": "Films", "kind": "movies", "paths": ["/media"] })
+                )
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        let (_, made) = call(
+            &app,
+            post(
+                "/api/v1/libraries",
+                Some(&admin),
+                json!({ "name": "TV", "kind": "shows", "paths": ["/tv"] }),
+            ),
+        )
+        .await;
+        let made_id = made["id"].as_i64().expect("id");
+        assert_eq!(
+            call(
+                &app,
+                delete(&format!("/api/v1/libraries/{made_id}"), Some(&admin))
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn plex_facade_serves_seeded_content() {
+        let (app, state) = test_state();
+        let admin = setup_admin(&app).await;
+        let s = seed_content(&state).await;
+        let tok = |uri: String| {
+            Request::builder()
+                .uri(uri)
+                .header("x-plex-token", &admin)
+                .body(Body::empty())
+                .expect("req")
+        };
+        for uri in [
+            "/identity".to_string(),
+            "/library".to_string(),
+            "/library/sections".to_string(),
+            format!("/library/sections/{}/all", s.lib),
+            format!("/library/metadata/{}", s.movie),
+            format!("/library/metadata/{}", s.show),
+            format!("/library/metadata/{}/children", s.show),
+            "/search?query=Heat".to_string(),
+        ] {
+            let status = app
+                .clone()
+                .oneshot(tok(uri.clone()))
+                .await
+                .expect("r")
+                .status();
+            assert!(status.is_success(), "plex GET {uri} -> {status}");
+        }
+    }
 }
