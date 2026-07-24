@@ -37,6 +37,117 @@ fn ffprobe_bin() -> String {
         .unwrap_or_else(|| "ffprobe".to_owned())
 }
 
+/// How fast a remux is allowed to run, as a multiple of real time, and how much
+/// it may deliver flat-out before that limit engages.
+///
+/// An unpaced `-c copy` remux is a disk-to-socket pipe: it will push a two-hour
+/// film into the client's buffer as fast as TCP will carry it — measured at
+/// ~200x real time on a local link. The client's own buffering is the only
+/// brake, so every play and every seek becomes a line-rate burst. On wired
+/// gigabit that is merely rude. Over Wi-Fi it monopolises airtime for the whole
+/// burst, and a client whose DHCP lease happens to need renewing during one can
+/// lose the lease and then fail to get it back, because DISCOVER is broadcast at
+/// the lowest basic rate and is the first thing an air-starved AP drops.
+///
+/// So: burst enough to fill a comfortable buffer immediately (seeks stay
+/// instant), then settle to a few times real time — fast enough to absorb the
+/// peaks of a variable-bitrate film and to keep building reserve, slow enough to
+/// leave the link usable for everything else on it.
+pub(crate) const READRATE_DEFAULT: f64 = 4.0;
+/// Seconds of content delivered flat-out before the rate limit engages.
+const READRATE_BURST_SECS: f64 = 30.0;
+
+/// Which pacing flags this ffmpeg understands. `-readrate` landed in 5.1 and
+/// `-readrate_initial_burst` in 6.1; passing either to an older build is a hard
+/// exit, not a warning, so probe rather than assume. Probed once per process.
+#[derive(Debug, Clone, Copy, Default)]
+struct PacingCaps {
+    readrate: bool,
+    initial_burst: bool,
+}
+
+static PACING: tokio::sync::OnceCell<PacingCaps> = tokio::sync::OnceCell::const_new();
+
+/// Scan `ffmpeg -h full` for the pacing options.
+///
+/// Matches the *declaration* — an indented line whose first token is the option
+/// — not any mention of the name. A plain substring search reports `-readrate`
+/// on an ffmpeg 4.x that has no such option, because `-re`'s own help line reads
+/// "…equivalent to -readrate 1". Getting that wrong is not cosmetic: an
+/// unrecognised option makes ffmpeg exit rather than warn, so every stream on
+/// that build would fail to start.
+fn parse_pacing_caps(help: &str) -> PacingCaps {
+    let declared = |name: &str| {
+        help.lines().any(|l| {
+            // split_whitespace already skips the leading indent.
+            l.split_whitespace().next().is_some_and(|tok| tok == name)
+        })
+    };
+    PacingCaps {
+        readrate: declared("-readrate"),
+        initial_burst: declared("-readrate_initial_burst"),
+    }
+}
+
+async fn pacing_caps() -> PacingCaps {
+    *PACING
+        .get_or_init(|| async {
+            let out = tokio::process::Command::new(ffmpeg_bin())
+                .args(["-hide_banner", "-h", "full"])
+                .output()
+                .await;
+            let caps = match out {
+                Ok(o) => {
+                    // Help goes to stdout, but older builds split it; check both.
+                    let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
+                    text.push_str(&String::from_utf8_lossy(&o.stderr));
+                    parse_pacing_caps(&text)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "could not probe ffmpeg for pacing support");
+                    PacingCaps::default()
+                }
+            };
+            if !caps.readrate {
+                tracing::warn!(
+                    "this ffmpeg has no -readrate; remux streams will run unpaced and can \
+                     saturate a client's link. ffmpeg 5.1+ is recommended."
+                );
+            }
+            caps
+        })
+        .await
+}
+
+/// The configured remux pace, in multiples of real time. `0` disables pacing.
+/// Admin-settable because the right answer depends on the link: a 10GbE lab
+/// wants it off, a marginal Wi-Fi bridge wants it lower.
+async fn readrate_setting(state: &AppState) -> f64 {
+    match state
+        .store
+        .get_setting(plurx_core::store::keys::STREAM_READRATE)
+        .await
+    {
+        Ok(Some(v)) => v.trim().parse::<f64>().ok().filter(|r| *r >= 0.0),
+        _ => None,
+    }
+    .unwrap_or(READRATE_DEFAULT)
+}
+
+/// Push `-readrate`/`-readrate_initial_burst` for one input, if this build
+/// supports them and pacing is enabled. Must be called before that input's
+/// `-i`, like `-ss`: these are input options.
+fn push_pacing(cmd: &mut tokio::process::Command, caps: PacingCaps, rate: f64) {
+    if rate <= 0.0 || !caps.readrate {
+        return;
+    }
+    if caps.initial_burst {
+        cmd.arg("-readrate_initial_burst")
+            .arg(format!("{READRATE_BURST_SECS:.1}"));
+    }
+    cmd.arg("-readrate").arg(format!("{rate:.2}"));
+}
+
 async fn load_file(state: &AppState, id: i64) -> Result<MediaFile, ApiError> {
     state
         .store
@@ -650,6 +761,7 @@ pub async fn stream_mp4(
     // Copy HEVC gets an `hvc1` tag so Safari's <video> accepts the fMP4 (an
     // `hev1`-tagged MKV copy otherwise plays audio-only / black in Safari).
     let hevc = matches!(file.video_codec.as_deref(), Some("hevc" | "h265"));
+    let readrate = readrate_setting(&state).await;
     remux(
         &file.path,
         q.start,
@@ -657,6 +769,7 @@ pub async fn stream_mp4(
         audio,
         file.audio_offset_ms,
         hevc,
+        readrate,
     )
     .await
 }
@@ -753,13 +866,19 @@ async fn remux(
     audio_index: i64,
     audio_offset_ms: i64,
     hevc: bool,
+    readrate: f64,
 ) -> Result<Response, ApiError> {
+    let pacing = pacing_caps().await;
     let mut cmd = tokio::process::Command::new(ffmpeg_bin());
     cmd.arg("-hide_banner").arg("-loglevel").arg("error");
     // Input-side seek (fast) for resume.
     if let Some(s) = start.filter(|s| *s > 0.0) {
         cmd.arg("-ss").arg(format!("{s:.3}"));
     }
+    // Pace this input (see READRATE_DEFAULT). Every input gets the same
+    // treatment, as with -ss: the muxer interleaves them, so an unpaced second
+    // input would drag the whole pipeline back to flat-out.
+    push_pacing(&mut cmd, pacing, readrate);
     cmd.arg("-i").arg(path);
     // A persisted A/V sync correction rides in on a second input of the same
     // file, shifted with -itsoffset (positive = audio later) and used only for
@@ -769,6 +888,7 @@ async fn remux(
         if let Some(s) = start.filter(|s| *s > 0.0) {
             cmd.arg("-ss").arg(format!("{s:.3}"));
         }
+        push_pacing(&mut cmd, pacing, readrate);
         cmd.arg("-itsoffset")
             .arg(format!("{:.3}", audio_offset_ms as f64 / 1000.0));
         cmd.arg("-i").arg(path);
@@ -940,5 +1060,58 @@ mod tests {
         // Ordinary content chapters are not markers.
         assert_eq!(classify_chapter("Chapter 1"), None);
         assert_eq!(classify_chapter("The Heist"), None);
+    }
+
+    #[test]
+    fn pacing_caps_come_from_the_help_text() {
+        // ffmpeg 6.1+: both flags.
+        let modern = "  -re                 read input at native frame rate\n  \
+                      -readrate speed     read input at specified rate\n  \
+                      -readrate_initial_burst seconds  initial burst\n";
+        let caps = parse_pacing_caps(modern);
+        assert!(caps.readrate);
+        assert!(caps.initial_burst);
+
+        // ffmpeg 5.1–6.0: rate limiting but no burst.
+        let caps = parse_pacing_caps("  -readrate speed     read input at specified rate\n");
+        assert!(caps.readrate);
+        assert!(!caps.initial_burst);
+
+        // Older: neither. Must not be fooled by the substring in -re's help.
+        let caps = parse_pacing_caps(
+            "  -re                 read input at native frame rate; equivalent to -readrate 1\n",
+        );
+        assert!(!caps.readrate);
+        assert!(!caps.initial_burst);
+    }
+
+    #[test]
+    fn pacing_flags_are_input_options_and_respect_support() {
+        let args = |caps: PacingCaps, rate: f64| {
+            let mut cmd = tokio::process::Command::new("ffmpeg");
+            push_pacing(&mut cmd, caps, rate);
+            cmd.as_std()
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        let both = PacingCaps {
+            readrate: true,
+            initial_burst: true,
+        };
+        assert_eq!(
+            args(both, 4.0),
+            vec!["-readrate_initial_burst", "30.0", "-readrate", "4.00"]
+        );
+        // Rate 0 means "unpaced" — emit nothing at all.
+        assert!(args(both, 0.0).is_empty());
+        // An ffmpeg without the flags gets none of them, whatever the setting.
+        assert!(args(PacingCaps::default(), 4.0).is_empty());
+        // Burst is omitted when unsupported, but the rate limit still applies.
+        let rate_only = PacingCaps {
+            readrate: true,
+            initial_burst: false,
+        };
+        assert_eq!(args(rate_only, 2.5), vec!["-readrate", "2.50"]);
     }
 }

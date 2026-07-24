@@ -53,6 +53,11 @@ pub mod keys {
     /// When subtitles auto-select: "auto" (only when the audio isn't the
     /// preferred language) | "always" | "off".
     pub const SUB_MODE: &str = "playback.sub_mode";
+    /// How fast a remux may run, as a multiple of real time; "0" disables the
+    /// limit. An unpaced remux delivers at line rate and can starve everything
+    /// else sharing the link — including, over Wi-Fi, the client's own DHCP.
+    /// Absent means the built-in default.
+    pub const STREAM_READRATE: &str = "playback.stream_readrate";
 }
 
 #[async_trait]

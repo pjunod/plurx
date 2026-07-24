@@ -8,6 +8,18 @@ bump may break compatibility and a **patch** bump never does.
 
 ## [Unreleased]
 
+### Fixed
+
+- Remux streams are no longer delivered as fast as the link allows. A `-c copy`
+  remux was a disk-to-socket pipe braked only by the browser's buffer, measured
+  here at over 200× real time; because every seek opens a fresh stream, seeking
+  meant repeated line-rate bursts. On Wi-Fi that monopolises airtime for the
+  duration, and a client whose DHCP lease came up for renewal during one could
+  lose the lease and then fail to reacquire it — the broadcast `DISCOVER` is the
+  first thing an air-starved AP drops. Streams now burst 30 seconds flat-out
+  (so starting and seeking stay instant) and then settle to 4× real time,
+  configurable in **Settings → Playback → Delivery speed**.
+
 ## [0.1.0] — 2026-07-22
 
 First numbered release. Everything before this point was developed under the

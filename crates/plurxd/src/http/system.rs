@@ -266,6 +266,9 @@ pub struct SettingsDto {
     pub default_audio_lang: String,
     pub default_sub_lang: String,
     pub sub_mode: String,
+    /// How fast a remux may be delivered, as a multiple of real time. "0" means
+    /// unpaced — which lets a single stream take the whole link.
+    pub stream_readrate: String,
 }
 
 async fn settings_dto(state: &AppState) -> Result<SettingsDto, ApiError> {
@@ -290,6 +293,11 @@ async fn settings_dto(state: &AppState) -> Result<SettingsDto, ApiError> {
         .await?
         .unwrap_or_default();
     let prefs = state.transcode.lang_prefs().await;
+    let stream_readrate = state
+        .store
+        .get_setting(keys::STREAM_READRATE)
+        .await?
+        .unwrap_or_else(|| crate::http::stream::READRATE_DEFAULT.to_string());
     Ok(SettingsDto {
         tmdb_configured: !tmdb_api_key.is_empty(),
         tmdb_api_key,
@@ -301,6 +309,7 @@ async fn settings_dto(state: &AppState) -> Result<SettingsDto, ApiError> {
         default_audio_lang: prefs.audio_lang,
         default_sub_lang: prefs.sub_lang,
         sub_mode: prefs.sub_mode.as_str().to_owned(),
+        stream_readrate,
     })
 }
 
@@ -326,6 +335,8 @@ pub struct UpdateSettings {
     pub default_audio_lang: Option<String>,
     pub default_sub_lang: Option<String>,
     pub sub_mode: Option<String>,
+    /// Remux delivery pace, a multiple of real time; "0" disables the limit.
+    pub stream_readrate: Option<String>,
 }
 
 /// PUT /api/v1/settings (admin)
@@ -351,6 +362,32 @@ pub async fn update_settings(
         // Normalize through the parser so only valid modes are stored.
         let mode = plurx_core::tracks::SubMode::parse(mode.trim()).as_str();
         state.store.put_setting(keys::SUB_MODE, mode).await?;
+    }
+    if let Some(rate) = &req.stream_readrate {
+        // Store only something the streamer can act on. A garbled value would
+        // otherwise fall back to the default silently and leave the settings
+        // page showing a number that isn't in force.
+        let parsed: f64 = rate
+            .trim()
+            .parse()
+            .map_err(|_| ApiError::BadRequest("stream_readrate must be a number".into()))?;
+        if !(0.0..=1000.0).contains(&parsed) {
+            return Err(ApiError::BadRequest(
+                "stream_readrate must be between 0 and 1000".into(),
+            ));
+        }
+        // Below real time the client can never buffer and playback stalls by
+        // construction; refuse rather than let someone quietly break streaming.
+        if parsed > 0.0 && parsed < 1.0 {
+            return Err(ApiError::BadRequest(
+                "stream_readrate below 1.0 cannot keep up with playback; use 0 to disable pacing"
+                    .into(),
+            ));
+        }
+        state
+            .store
+            .put_setting(keys::STREAM_READRATE, &parsed.to_string())
+            .await?;
     }
     Ok(Json(settings_dto(&state).await?))
 }

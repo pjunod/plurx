@@ -14,7 +14,7 @@ mod hls;
 mod images;
 mod libraries;
 mod plex;
-mod stream;
+pub(crate) mod stream;
 mod system;
 mod trakt;
 mod users;

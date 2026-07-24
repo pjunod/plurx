@@ -2382,6 +2382,13 @@ function playbackPanel(settings){
           <option value="off" ${settings.sub_mode==='off'?'selected':''}>Off</option></select></div>
       </div>
       <label class="row" style="margin:16px 0 0;font-size:14px;color:var(--text)"><input type="checkbox" id="autonext" ${autoNextOn()?'checked':''} onchange="setAutoNext(this.checked)" style="width:auto;margin-right:9px"> Auto-play the next episode when one finishes <span class="muted" style="font-size:12px;margin-left:6px">· saved on this browser</span></label>
+      <h2 class="section">Delivery speed</h2>
+      <p class="muted" style="margin-top:0">How fast a stream is sent, relative to how fast it plays. The first 30 seconds always arrive at full speed so starting and seeking stay instant; the limit applies after that. Unlimited lets one stream take the entire link, which on Wi-Fi can crowd out everything else on the network.</p>
+      <div><label>Stream pace</label><select id="prr" style="width:auto;min-width:230px">
+        <option value="2" ${settings.stream_readrate==='2'?'selected':''}>2× — gentlest</option>
+        <option value="4" ${settings.stream_readrate==='4'?'selected':''}>4× — recommended</option>
+        <option value="8" ${settings.stream_readrate==='8'?'selected':''}>8×</option>
+        <option value="0" ${settings.stream_readrate==='0'?'selected':''}>Unlimited — wired networks only</option></select></div>
       <div class="err" id="perr"></div>
       <button style="margin-top:12px" onclick="savePlayback()">Save defaults</button></div>`;
 }
@@ -2522,7 +2529,8 @@ async function savePlayback(){
     SETTINGS=await api("/settings",{method:"PUT",body:{
       default_audio_lang:document.getElementById("pal").value,
       default_sub_lang:document.getElementById("psl").value,
-      sub_mode:document.getElementById("psm").value}});
+      sub_mode:document.getElementById("psm").value,
+      stream_readrate:document.getElementById("prr").value}});
     toast("Playback defaults saved");
   }catch(e){ err.textContent=e.message; }
 }

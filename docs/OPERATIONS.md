@@ -129,6 +129,36 @@ Source is what the file is (from the server's probe); Now decoding is what your
 browser is actually rendering. A 3840×2160 source showing 1920×1080 now-decoding
 is a working downscale transcode.
 
+### Delivery speed
+
+A remux is a copy: ffmpeg can read it off disk and push it into the socket far
+faster than it plays — over 200× real time on a local link. Left alone it will
+take the whole link for as long as the burst lasts, and since every seek opens a
+fresh stream, scrubbing means doing that repeatedly. On wired gigabit that is
+merely impolite. Over Wi-Fi it monopolises airtime, and a client that happens to
+need its DHCP lease renewed mid-burst can lose the lease and then fail to get it
+back, because the broadcast `DISCOVER` goes out at the lowest basic rate and is
+the first thing a saturated AP drops.
+
+**Settings → Playback → Delivery speed** bounds it. The first 30 seconds of any
+stream always arrive flat-out, so starting and seeking stay instant; the limit
+applies after that.
+
+| Setting | Use when |
+|---|---|
+| 2× | Marginal Wi-Fi, a powerline/MoCA bridge, or a link shared with anything latency-sensitive |
+| 4× (default) | Anything normal. Absorbs the peaks of a variable-bitrate film and keeps building buffer |
+| 8× | Fast wired LAN where you want a deeper buffer sooner |
+| Unlimited | Wired-only, and only if you actively want the old behaviour |
+
+Below 1× is refused: a stream delivered slower than it plays can never buffer,
+so playback would stall by construction.
+
+The limit needs ffmpeg 5.1 or newer (`-readrate`), and the initial burst needs
+6.1 (`-readrate_initial_burst`). plurx probes for both at startup and logs a
+warning if the ffmpeg it found has neither, in which case streams run unpaced
+whatever this is set to.
+
 ## Logs
 
 Structured `tracing` logs go to stdout/journald, and the same buffer is exposed
@@ -181,3 +211,4 @@ the loading overlay a few seconds longer, then playback).
 | 4K HDR / Dolby Vision won't play | Heavy HEVC is hardware-decoded (Intel too); if the GPU can't decode it and software can't either, the session now fails fast with a clear log line instead of hanging gray | Read `plurxd::transcode` — the last ffmpeg line names the real cause (decode vs tone-map). DV profile 5 is the hardest case |
 | Playback is software when you set `qsv` | The QSV probe was rejected at startup | Read `plurxd::transcode` logs; usually a driver/`/dev/dri` gap |
 | No posters, just filenames | No TMDB key (movies/TV) | Add a key in Settings → Metadata (anime needs none) |
+| Playing or seeking knocks a Wi-Fi client off the network (loses its IP and can't get another) | An unpaced stream is taking the whole link, starving the client's DHCP renewal of airtime | Lower **Settings → Playback → Delivery speed** to 2×; confirm with a `ping` to the gateway during a seek |
