@@ -87,7 +87,9 @@
   /* Rails scroll horizontally, but the scrollbar is hidden until you hover the
      row (desktop) — cleaner at rest; on touch it never shows (swipe is the
      gesture). The padding-bottom holds the space so nothing shifts on reveal. */
-  .rowscroll{display:grid;grid-auto-flow:column;grid-auto-columns:calc(var(--poster,120px) * 4 / 3);gap:16px;overflow-x:auto;padding-bottom:8px;align-items:start;scrollbar-width:none}
+  /* align-items:stretch (the default) is deliberate: every card in a rail gets
+     the height of the tallest, so a two-line title can't leave the row ragged. */
+  .rowscroll{display:grid;grid-auto-flow:column;grid-auto-columns:var(--poster,120px);gap:16px;overflow-x:auto;padding-bottom:8px;align-items:stretch;scrollbar-width:none}
   .rowscroll::-webkit-scrollbar{height:0}
   .rowscroll::-webkit-scrollbar-thumb{border-radius:8px;background:transparent}
   @media(hover:hover){
@@ -97,19 +99,41 @@
   }
   .poster{background:var(--panel2);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;cursor:pointer;transition:transform .12s,border-color .12s;position:relative}
   .poster:hover{transform:translateY(-3px);border-color:var(--accent)}
+  /* The artwork gets its own positioning box so the corner badges anchor to the
+     picture, not to the card (whose height varies with the caption). */
+  .poster .artbox{position:relative;display:block}
+  /* One shape everywhere. Rails used to render episodes 16/9, which made a row
+     of mixed episodes and movies ragged — and since episodes now wear their
+     season's poster, a 16/9 crop sliced a thin band out of a portrait image. */
   .poster .art{aspect-ratio:2/3;width:100%;object-fit:cover;display:block;background:var(--panel2)}
-  .poster.wide .art{aspect-ratio:16/9}
   .poster .meta{padding:8px 10px}
+  /* Every caption line is one line, clipped: a long episode name wrapping to
+     three lines is what used to make a rail look ragged. */
   .poster .t{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  .poster .s{font-size:12px;color:var(--muted)}
+  .poster .s{font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .poster .cleft{font-size:11px;color:var(--muted);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .playinfo{color:var(--muted);font-size:13px;margin:10px 0 0}
   .epmeta .epleft{color:var(--accent)}
   .poster .prog{position:absolute;left:0;right:0;bottom:0;height:5px;background:rgba(0,0,0,.55)}
-  /* Resolution badge (movies): a small, legible tag in the poster corner. */
-  .poster .resbadge{position:absolute;top:8px;left:8px;background:rgba(8,10,15,.82);color:#fff;
-    font-size:10.5px;font-weight:700;letter-spacing:.3px;padding:2px 6px;border-radius:6px;backdrop-filter:blur(4px)}
-  .ressection{display:flex;align-items:baseline;gap:8px}
+  /* Resolution badge (movies): bottom-right of the artwork, where it sits over
+     the quiet part of most posters and away from the ✓ in the top corner. Each
+     tier gets its own colour ramp — cool violet at 4K down through blue and
+     green to amber for SD — so a grid reads at a glance without parsing text.
+     Colours are fixed rather than themed: the point is that 1080p is always the
+     same blue no matter which theme is on. */
+  .resgrad{background:linear-gradient(135deg,#64748b,#475569)}
+  .resgrad.r4k{background:linear-gradient(135deg,#a855f7,#c026d3)}
+  .resgrad.r1440{background:linear-gradient(135deg,#6366f1,#3b82f6)}
+  .resgrad.r1080{background:linear-gradient(135deg,#0ea5e9,#06b6d4)}
+  .resgrad.r720{background:linear-gradient(135deg,#14b8a6,#22c55e)}
+  .resgrad.r480{background:linear-gradient(135deg,#f59e0b,#f97316)}
+  .poster .resbadge{position:absolute;right:6px;bottom:6px;color:#fff;
+    font-size:10.5px;font-weight:700;letter-spacing:.3px;line-height:1.35;padding:2px 7px;border-radius:999px;
+    box-shadow:0 1px 6px rgba(0,0,0,.55),inset 0 0 0 1px rgba(255,255,255,.22);text-shadow:0 1px 2px rgba(0,0,0,.35)}
+  /* Section headers on the resolution-sorted grid wear the matching swatch. */
+  .ressection{display:flex;align-items:center;gap:8px}
+  .ressection .resdot{width:11px;height:11px;border-radius:50%;flex:0 0 auto;
+    box-shadow:inset 0 0 0 1px rgba(255,255,255,.25)}
   .poster .prog>i{display:block;height:100%;background:var(--accent);box-shadow:0 0 8px var(--accent)}
   /* A–Z jump rail: pinned to the right edge on alphabetically-sorted media
      grids (library/category), like a phone contact index. scroll-margin keeps
@@ -212,6 +236,10 @@
   .player.idle .ptransport{opacity:0;pointer-events:none}
   .picon{background:transparent;border:0;color:#fff;font-size:17px;line-height:1;cursor:pointer;padding:4px;opacity:.92;text-shadow:0 1px 4px rgba(0,0,0,.6)}
   .picon:hover{opacity:1;color:var(--accent)}
+  /* CC sits in the transport (where people look for subtitles) and lights up
+     while a track is on; it opens the same menu as the top bar's button. */
+  .picon.pcc{font:700 11px/1 ui-sans-serif,system-ui,sans-serif;border:1.5px solid currentColor;border-radius:4px;padding:2px 3px;text-shadow:none}
+  .picon.on{color:var(--accent);opacity:1}
   .ptime{color:#fff;font:12px/1 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;text-shadow:0 1px 4px rgba(0,0,0,.7);min-width:46px;text-align:center;flex:0 0 auto}
   .pseek{position:relative;flex:1 1 auto;height:16px;display:flex;align-items:center;cursor:pointer;touch-action:none}
   .pseek::before{content:"";position:absolute;left:0;right:0;height:5px;border-radius:3px;background:rgba(255,255,255,.26)}
@@ -560,7 +588,7 @@ if(window.matchMedia){ try{ window.matchMedia("(prefers-color-scheme: dark)").ad
 </head>
 <body>
 <div id="app"></div>
-<div class="modal" id="modal"><div class="player" id="player"><video id="video" autoplay playsinline x-webkit-airplay="allow"></video><div class="pbar" id="pbar"><div class="ptitle" id="playTitle"></div><div class="row"><button class="pbtn" id="audiobtn" style="display:none" onclick="toggleMenu('audio')">🔊 Audio</button><button class="pbtn" id="subsbtn" style="display:none" onclick="toggleMenu('subs')">💬 Subtitles</button><button class="pbtn" id="qualbtn" title="Playback quality" onclick="toggleMenu('quality')">◆ Quality</button><button class="pbtn" id="syncbtn" title="Audio sync adjustment" onclick="toggleMenu('sync')">⇄ Sync</button><button class="pbtn" id="statsbtn" title="Playback info (i)" onclick="toggleStats()">ⓘ Stats</button><button class="pbtn" id="skipbtn" title="Auto-skip intro & credits" onclick="togglePlayerAutoskip()">⏭ Auto-skip</button><button class="pbtn" id="autonextbtn" title="Auto-play the next episode when one finishes" onclick="togglePlayerAutonext()">▶ Autoplay</button><button class="pbtn" id="apbtn" style="display:none" title="AirPlay">📺 AirPlay</button><button class="pbtn" title="Close (Esc)" onclick="closePlayer()">✕ Close</button></div></div><div class="ptransport" id="ptransport"><button class="picon" id="pbplay" aria-label="Play" title="Play / Pause (space)" onclick="togglePlay()">▶</button><button class="picon nudge" aria-label="Back 10 seconds" title="Back 10s (←)" onclick="nudge(-10)">↺</button><button class="picon nudge" aria-label="Forward 10 seconds" title="Forward 10s (→)" onclick="nudge(10)">↻</button><span class="ptime" id="ptcur" aria-hidden="true">0:00</span><div class="pseek" id="pseek" role="slider" tabindex="0" aria-label="Seek" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-valuetext="0:00"><div class="pseek-buf" id="pseekbuf" aria-hidden="true"></div><div class="pseek-fill" id="pseekfill" aria-hidden="true"></div><div class="pseek-thumb" id="pseekthumb" aria-hidden="true"></div></div><span class="ptime" id="ptdur" aria-hidden="true">0:00</span><button class="picon" id="pbpip" aria-label="Picture in picture" title="Picture-in-picture" style="display:none" onclick="togglePip()">◲</button><button class="picon" id="pbfs" aria-label="Fullscreen" title="Fullscreen (f)" onclick="toggleFullscreen()">⛶</button></div><div class="pskip" id="pskip"></div><div class="ploading" id="ploading"><div class="pspin"></div><div class="ploadText" id="ploadText">Loading…</div><div class="ploadSub" id="ploadSub"></div></div><div class="statsov" id="statsov"></div><div class="pmenu" id="pmenu"></div></div></div>
+<div class="modal" id="modal"><div class="player" id="player"><video id="video" autoplay playsinline x-webkit-airplay="allow"></video><div class="pbar" id="pbar"><div class="ptitle" id="playTitle"></div><div class="row"><button class="pbtn" id="audiobtn" style="display:none" onclick="toggleMenu('audio')">🔊 Audio</button><button class="pbtn" id="subsbtn" style="display:none" onclick="toggleMenu('subs')">💬 Subtitles</button><button class="pbtn" id="qualbtn" title="Playback quality" onclick="toggleMenu('quality')">◆ Quality</button><button class="pbtn" id="syncbtn" title="Audio sync adjustment" onclick="toggleMenu('sync')">⇄ Sync</button><button class="pbtn" id="statsbtn" title="Playback info (i)" onclick="toggleStats()">ⓘ Stats</button><button class="pbtn" id="skipbtn" title="Auto-skip intro & credits" onclick="togglePlayerAutoskip()">⏭ Auto-skip</button><button class="pbtn" id="autonextbtn" title="Auto-play the next episode when one finishes" onclick="togglePlayerAutonext()">▶ Autoplay</button><button class="pbtn" id="apbtn" style="display:none" title="AirPlay">📺 AirPlay</button><button class="pbtn" title="Close (Esc)" onclick="closePlayer()">✕ Close</button></div></div><div class="ptransport" id="ptransport"><button class="picon" id="pbplay" aria-label="Play" title="Play / Pause (space)" onclick="togglePlay()">▶</button><button class="picon nudge" aria-label="Back 10 seconds" title="Back 10s (←)" onclick="nudge(-10)">↺</button><button class="picon nudge" aria-label="Forward 10 seconds" title="Forward 10s (→)" onclick="nudge(10)">↻</button><span class="ptime" id="ptcur" aria-hidden="true">0:00</span><div class="pseek" id="pseek" role="slider" tabindex="0" aria-label="Seek" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-valuetext="0:00"><div class="pseek-buf" id="pseekbuf" aria-hidden="true"></div><div class="pseek-fill" id="pseekfill" aria-hidden="true"></div><div class="pseek-thumb" id="pseekthumb" aria-hidden="true"></div></div><span class="ptime" id="ptdur" aria-hidden="true">0:00</span><button class="picon pcc" id="pbsubs" aria-label="Subtitles" title="Subtitles (c)" style="display:none" onclick="toggleMenu('subs')">CC</button><button class="picon" id="pbpip" aria-label="Picture in picture" title="Picture-in-picture" style="display:none" onclick="togglePip()">◲</button><button class="picon" id="pbfs" aria-label="Fullscreen" title="Fullscreen (f)" onclick="toggleFullscreen()">⛶</button></div><div class="pskip" id="pskip"></div><div class="ploading" id="ploading"><div class="pspin"></div><div class="ploadText" id="ploadText">Loading…</div><div class="ploadSub" id="ploadSub"></div></div><div class="statsov" id="statsov"></div><div class="pmenu" id="pmenu"></div></div></div>
 <div class="toast" id="toast"></div>
 
 <script src="/assets/hls.min.js"></script>
@@ -813,20 +841,25 @@ function watchLine(it, watchCtx){
 // Resolution helpers. `resolution` is the item's best file height (movies only,
 // on the library grid). Labels reuse resLabel() (height-only here) so a card's
 // badge and its section header read the same as the video spec badges.
+// Tier class for the badge/dot colour ramp. Thresholds match resLabel() exactly
+// so the colour and the text can never disagree.
+function resClass(h){ h=h||0;
+  return h>=1700?"r4k" : h>=1300?"r1440" : h>=900?"r1080" : h>=650?"r720" : h>=400?"r480" : ""; }
 function resBucket(it){ const h=it.resolution||0;
   const r = h>=1700?0 : h>=1300?1 : h>=900?2 : h>=650?3 : h>=400?4 : h>0?5 : 6;
-  return { r, l: h?resLabel(0,h):"Unknown resolution" }; }
+  return { r, l: h?resLabel(0,h):"Unknown resolution", c: resClass(h) }; }
 // Group items (already server-sorted height-desc) into resolution sections.
 function resSections(items){
   const groups=new Map();
-  for(const it of items){ const b=resBucket(it); if(!groups.has(b.r)) groups.set(b.r,{l:b.l,items:[]}); groups.get(b.r).items.push(it); }
+  for(const it of items){ const b=resBucket(it); if(!groups.has(b.r)) groups.set(b.r,{l:b.l,c:b.c,items:[]}); groups.get(b.r).items.push(it); }
   return [...groups.keys()].sort((a,b)=>a-b).map(r=>{ const g=groups.get(r);
-    return `<h2 class="section ressection">${esc(g.l)}<span class="muted" style="font-size:12px">${g.items.length}</span></h2>${grid(g.items)}`;
+    return `<h2 class="section ressection"><span class="resdot resgrad ${g.c}"></span>${esc(g.l)}<span class="muted" style="font-size:12px">${g.items.length}</span></h2>${grid(g.items)}`;
   }).join("");
 }
-function card(it, wide, watchCtx){
+function card(it, watchCtx){
   const img = artHtml(it);
-  const resb = it.resolution ? `<span class="resbadge">${esc(resLabel(0,it.resolution))}</span>` : "";
+  const resb = it.resolution
+      ? `<span class="resbadge resgrad ${resClass(it.resolution)}">${esc(resLabel(0,it.resolution))}</span>` : "";
   // On rail cards the series is the headline and the episode (SxEy · name) is
   // the secondary line — a show's name matters more than which episode this is.
   // `show_title` is only set on rail rows; the season page renders episodes via
@@ -840,8 +873,8 @@ function card(it, wide, watchCtx){
   const pct = progressPct(it.watch);
   const watched = it.watch&&it.watch.watched? `<span class="badge">✓</span>`:"";
   const prog = pct>0&&pct<100? `<div class="prog"><i style="width:${pct}%"></i></div>`:"";
-  return `<div class="poster ${wide?'wide':''}" onclick="location.hash='#/item/${it.id}'">
-    ${img}${resb}${watched}<div class="meta"><div class="t">${esc(main)}</div><div class="s">${sub}</div>${watchLine(it,watchCtx)}</div>${prog}</div>`;
+  return `<div class="poster" onclick="location.hash='#/item/${it.id}'">
+    <div class="artbox">${img}${resb}${watched}</div><div class="meta"><div class="t">${esc(main)}</div><div class="s">${sub}</div>${watchLine(it,watchCtx)}</div>${prog}</div>`;
 }
 function grid(items){ return items.length? `<div class="grid">${items.map(i=>card(i)).join("")}</div>` : `<div class="empty">Nothing here yet.</div>`; }
 
@@ -910,9 +943,11 @@ async function viewHome(){
   chrome("home", `<div id="hubs"><div class="empty">Loading…</div></div>`);
   const [libs, hubs] = await Promise.all([api("/libraries"), api("/hubs")]);
   let html=installBannerHtml();
-  if(hubs.continue_watching.length){ html+=`<h2 class="section">Continue watching</h2><div class="rowscroll">${hubs.continue_watching.map(i=>card(i,true,true)).join("")}</div>`; }
-  if(hubs.next_up && hubs.next_up.length){ html+=`<h2 class="section">Next up</h2><div class="rowscroll">${hubs.next_up.map(i=>card(i,i.kind==='episode',true)).join("")}</div>`; }
-  if(hubs.recently_added.length){ html+=`<h2 class="section">Recently added</h2><div class="rowscroll">${hubs.recently_added.map(i=>card(i,i.kind==='episode')).join("")}</div>`; }
+  // The first two rails pass watchCtx: those rows are about where you are in
+  // something, so the card carries "23m left" / "watched Tuesday".
+  if(hubs.continue_watching.length){ html+=`<h2 class="section">Continue watching</h2><div class="rowscroll">${hubs.continue_watching.map(i=>card(i,true)).join("")}</div>`; }
+  if(hubs.next_up && hubs.next_up.length){ html+=`<h2 class="section">Next up</h2><div class="rowscroll">${hubs.next_up.map(i=>card(i,true)).join("")}</div>`; }
+  if(hubs.recently_added.length){ html+=`<h2 class="section">Recently added</h2><div class="rowscroll">${hubs.recently_added.map(i=>card(i)).join("")}</div>`; }
   if(libs.length){
     const group=homeGroup();
     html+=groupToggleHtml(group);
@@ -1314,6 +1349,7 @@ async function play(fileId, title, resumeMs, knownDurMs){
   let decision; try{ decision=await api(`/files/${fileId}/decision?${CAPS_Q}&force=${qualityForce()}`);}catch(e){ setLoading(false); toast(e.message); return closePlayer(); }
   const startSec=(resumeMs||0)/1000;
   teardownHls();
+  clearSubs(video);   // drop whatever the last item left showing
   const src=decision.source||{};
   PLAYER={fileId, timer:null, offset:0, hls:null, knownDur:knownDurMs||0,
     durMs:(src.duration_ms||knownDurMs||0), method:decision.method, encoder:null,
@@ -1508,6 +1544,9 @@ function pbTick(){
   if(buf){ let bf=0; try{ if(v&&v.buffered&&v.buffered.length){ const be=((PLAYER.offset)||0)+v.buffered.end(v.buffered.length-1); bf=tot>0?Math.min(1,be/tot):0; } }catch(e){} buf.style.width=(bf*100)+"%"; }
   const sk=document.getElementById("pseek");
   if(sk){ sk.setAttribute("aria-valuenow", Math.round(f*100)); sk.setAttribute("aria-valuetext", clockFromSec(pos)+(tot>0?" of "+clockFromSec(tot):"")); }
+  // Seeking a transcode restarts the session at a new offset, which moves the
+  // whole subtitle timeline — re-shift the cues whenever that happens.
+  if(PLAYER.curSub>=0 && PLAYER._subOff!=null && PLAYER._subOff!==(PLAYER.offset||0)) setSub(PLAYER.curSub);
 }
 function pbSyncPlayIcon(){ const v=document.getElementById("video"), b=document.getElementById("pbplay");
   if(b&&v){ const paused=(v.paused||v.ended); b.textContent=paused?"▶":"❚❚"; b.setAttribute("aria-label", paused?"Play":"Pause"); } }
@@ -1588,6 +1627,15 @@ function wirePlayer(){
     toast("Playback failed — "+(names[code]||("error "+code)));
   });
   v.addEventListener("timeupdate",checkMarkers);
+  // Click the picture to play/pause and double-click for fullscreen — the
+  // behaviour the native controls used to give us, gone now that we draw our
+  // own transport. (Two clicks toggle play twice, so a double-click only
+  // changes the fullscreen state.) On touch, a tap that wakes hidden chrome
+  // just wakes it: reaching for the controls shouldn't pause the film.
+  let ptrKind="mouse", ptrWoke=false;
+  v.addEventListener("pointerdown",e=>{ ptrKind=e.pointerType||"mouse"; ptrWoke=p.classList.contains("idle"); });
+  v.addEventListener("click",()=>{ if(ptrKind==="touch"&&ptrWoke){ playerActivity(); return; } togglePlay(); });
+  v.addEventListener("dblclick",e=>{ e.preventDefault(); toggleFullscreen(); });
   // Custom transport: keep the scrubber, times, buffered bar, and play icon in
   // sync; enable the drag handler and the PiP button where supported.
   pbWireSeek();
@@ -1725,10 +1773,17 @@ function setupTrackMenus(){
   const ab=document.getElementById("audiobtn"), sb=document.getElementById("subsbtn"), m=document.getElementById("pmenu");
   if(m){ m.classList.remove("on"); m.innerHTML=""; }
   if(ab) ab.style.display=(PLAYER.audio&&PLAYER.audio.length>1)?"":"none";
-  // Native <track> subtitles ride the full-file timeline, so offer them for
-  // direct/remux; a transcode from an offset would misalign them.
-  if(sb) sb.style.display=(PLAYER.subs&&PLAYER.subs.length&&PLAYER.method!=='transcode')?"":"none";
+  // Subtitles are offered in every playback mode. A stream that starts at an
+  // offset (transcode, copy-HLS, a resumed remux) shifts the cues to match —
+  // see setSub() — so the track lines up wherever playback actually began.
+  const has=!!(PLAYER.subs&&PLAYER.subs.length);
+  if(sb) sb.style.display=has?"":"none";
+  const cc=document.getElementById("pbsubs"); if(cc) cc.style.display=has?"":"none";
+  pbSyncSubIcon();
 }
+// Light the CC button while a subtitle track is showing.
+function pbSyncSubIcon(){ const cc=document.getElementById("pbsubs");
+  if(cc) cc.classList.toggle("on", !!(PLAYER&&PLAYER.curSub>=0)); }
 function toggleMenu(kind){
   const m=document.getElementById("pmenu"); if(!m) return;
   if(m.classList.contains("on") && m.dataset.kind===kind){ m.classList.remove("on"); return; }
@@ -1798,20 +1853,97 @@ async function setSync(v){
     seekTo(pos); // restarts the server stream; ffmpeg applies the new offset
   }
 }
-function setSub(index){
+// Subtitles. The VTT the server extracts carries the file's own timestamps. A
+// stream that starts at an offset (a transcode, a copy-HLS session, a resumed
+// remux) reports currentTime from that offset, so a plain <track> would run
+// ahead by exactly the offset. Two paths: no offset → hand the <track> to the
+// browser; offset → fetch the VTT once and re-add the cues shifted back, into
+// one script-created track we keep reusing. pbTick() re-applies when the offset
+// moves, since seeking a transcode restarts the session at a new position.
+function subUrl(index){ return tok(`/api/v1/files/${PLAYER.fileId}/subs/${index}`); }
+function subLabelFor(s, index){ return s?subLabelMenu(s):("Subtitle "+(index+1)); }
+function clearSubs(v){
+  [...v.querySelectorAll("track")].forEach(t=>t.remove());
+  try{ for(const t of v.textTracks) t.mode="disabled"; }catch(e){}
+}
+function vttTime(s){
+  const m=/^(?:(\d+):)?(\d{1,2}):(\d{2})(?:[.,](\d{1,3}))?$/.exec(String(s).trim());
+  return m ? (+(m[1]||0))*3600+(+m[2])*60+(+m[3])+(+((m[4]||"0").padEnd(3,"0")))/1000 : null;
+}
+// Minimal WebVTT reader — enough for what ffmpeg emits: a WEBVTT header, blank
+// -line-separated blocks, an optional cue id line, "start --> end [settings]",
+// then the payload. Inline tags stay in the text for the browser to render.
+function vttParse(text){
+  const out=[];
+  for(const b of String(text).replace(/\r\n?/g,"\n").split(/\n{2,}/)){
+    const lines=b.split("\n").filter(l=>l.trim()!=="");
+    const i=lines.findIndex(l=>l.includes("-->"));
+    if(i<0) continue;                                   // WEBVTT header, NOTE, STYLE, REGION
+    const parts=lines[i].split("-->");
+    const st=vttTime(parts[0]);
+    const rest=(parts[1]||"").trim().split(/\s+/);
+    const en=vttTime(rest.shift()||"");
+    const body=lines.slice(i+1).join("\n");
+    if(st==null||en==null||en<=st||!body) continue;
+    out.push({start:st,end:en,text:body});
+  }
+  return out;
+}
+async function setSub(index){
   const m=document.getElementById("pmenu"); if(m) m.classList.remove("on");
-  PLAYER.curSub=index;
-  const v=document.getElementById("video");
-  [...v.querySelectorAll("track")].forEach(tr=>{ if(tr.track) tr.track.mode=(+tr.dataset.idx===index?"showing":"disabled"); });
-  if(index>=0 && ![...v.querySelectorAll("track")].some(tr=>+tr.dataset.idx===index)){
-    const s=PLAYER.subs.find(x=>x.index===index);
+  const me=PLAYER; if(!me) return;
+  me.curSub=index;
+  const v=document.getElementById("video"); if(!v) return;
+  pbSyncSubIcon();
+  clearSubs(v);
+  if(index<0){ me._subOff=null; return; }
+  const off=me.offset||0;
+  me._subOff=off;                       // set before awaiting: stops pbTick re-firing
+  const s=(me.subs||[]).find(x=>x.index===index);
+  if(!off){
     const tr=document.createElement("track");
-    tr.kind="subtitles"; tr.dataset.idx=index; tr.label=subLabelMenu(s); tr.srclang=s.language||"und";
-    tr.src=tok(`/api/v1/files/${PLAYER.fileId}/subs/${index}`);
+    tr.kind="subtitles"; tr.dataset.idx=index; tr.label=subLabelFor(s,index); tr.srclang=(s&&s.language)||"und";
+    tr.src=subUrl(index);
     v.appendChild(tr);
     // Setting mode triggers the fetch; do it after the element registers.
-    setTimeout(()=>{ if(tr.track) tr.track.mode="showing"; },30);
+    setTimeout(()=>{ if(PLAYER===me && me.curSub===index && tr.track) tr.track.mode="showing"; },30);
+    return;
   }
+  let text;
+  try{
+    const r=await fetch(subUrl(index));
+    if(!r.ok) throw new Error("HTTP "+r.status);
+    text=await r.text();
+  }catch(err){
+    if(PLAYER===me && me.curSub===index) toast("Couldn't load that subtitle track");
+    return;
+  }
+  if(PLAYER!==me || me.curSub!==index || (me.offset||0)!==off) return;  // switched away mid-fetch
+  // One script track per <video>, reused: a script-created track can't be
+  // removed, so re-adding one per seek would pile them up over a session.
+  if(!v._vsubs) v._vsubs=v.addTextTrack("subtitles","Subtitles");
+  const track=v._vsubs;
+  // A disabled track reports `cues` as null, so the old cues would survive the
+  // clear and stack up behind the new ones — wake it before emptying it.
+  if(track.mode==="disabled") track.mode="hidden";
+  try{ while(track.cues && track.cues.length) track.removeCue(track.cues[0]); }catch(err){}
+  const Cue=window.VTTCue||window.TextTrackCue;
+  for(const c of vttParse(text)){
+    const en=c.end-off;
+    if(en<=0) continue;                                 // cue ends before playback began
+    try{ track.addCue(new Cue(Math.max(0,c.start-off), en, c.text)); }catch(err){}
+  }
+  track.mode="showing";
+}
+// Cycle Off → each track → Off (the 'c' hotkey and the CC button's long game).
+function cycleSub(){
+  if(!PLAYER||!PLAYER.subs||!PLAYER.subs.length) return;
+  const idxs=PLAYER.subs.map(s=>s.index);
+  const at=idxs.indexOf(PLAYER.curSub);
+  const next=at<0?idxs[0]:(at+1>=idxs.length?-1:idxs[at+1]);
+  setSub(next);
+  const s=PLAYER.subs.find(x=>x.index===next);
+  toast("Subtitles: "+(next<0?"off":subLabelFor(s,next)));
 }
 async function switchAudio(idx){
   const m=document.getElementById("pmenu"); if(m) m.classList.remove("on");
@@ -1935,6 +2067,7 @@ window.addEventListener("keydown",e=>{
   else if(!typing && !onBtn && !e.repeat && e.key==='ArrowLeft'){ e.preventDefault(); nudge(-10); }
   else if(!typing && !onBtn && !e.repeat && e.key==='ArrowRight'){ e.preventDefault(); nudge(10); }
   else if(!typing && !onBtn && (e.key==='f'||e.key==='F')){ e.preventDefault(); toggleFullscreen(); }
+  else if(!typing && !onBtn && !e.repeat && (e.key==='c'||e.key==='C')){ e.preventDefault(); cycleSub(); }
 });
 // map fileId → itemId, filled by viewItem so progress posts to the right item
 const ITEM_FOR_FILE={};
