@@ -180,6 +180,12 @@ pub trait MediaStore: Send + Sync + 'static {
     ) -> Result<i64, StoreError>;
     async fn get_file(&self, id: i64) -> Result<Option<MediaFile>, StoreError>;
     async fn files_for_item(&self, item_id: i64) -> Result<Vec<MediaFile>, StoreError>;
+    /// Best (max) probed file height per item, for the given item ids. Used to
+    /// badge/section the library grid by resolution without loading every file.
+    async fn item_max_heights(
+        &self,
+        ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, i64>, StoreError>;
     /// Persist a manual A/V sync correction for one file (0 clears it).
     async fn set_file_audio_offset(&self, file_id: i64, offset_ms: i64) -> Result<(), StoreError>;
     /// The raw ffprobe JSON captured at scan time (for the declared per-stream

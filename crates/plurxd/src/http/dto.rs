@@ -49,6 +49,11 @@ pub struct ItemDto {
     pub imdb_id: Option<String>,
     pub poster: Option<String>,
     pub backdrop: Option<String>,
+    /// Best (max) file height for the item, e.g. 2160 / 1080 / 720. Only
+    /// populated on the library grid so cards can show a resolution badge and
+    /// group into resolution sections. `None` for shows and where unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub show_title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -73,6 +78,7 @@ impl From<Item> for ItemDto {
             imdb_id: item.imdb_id,
             poster: image_url(&item.poster_path),
             backdrop: image_url(&item.backdrop_path),
+            resolution: None,
             show_title: None,
             watch: None,
         }
@@ -89,17 +95,35 @@ impl ItemDto {
         self.show_title = show_title;
         self
     }
+
+    /// On rail cards, an episode should wear its season's poster rather than a
+    /// per-episode still (which is often an arbitrary frame). Only overrides
+    /// when a season poster exists; the per-episode still stays the fallback
+    /// and is still used on the season page (which builds DTOs without this).
+    pub fn with_season_poster(mut self, season_poster: Option<String>) -> Self {
+        if season_poster.is_some() {
+            self.poster = image_url(&season_poster);
+        }
+        self
+    }
+
+    pub fn with_resolution(mut self, resolution: Option<i64>) -> Self {
+        self.resolution = resolution;
+        self
+    }
 }
 
 pub fn recent_dto(recent: RecentItem, watch: Option<WatchState>) -> ItemDto {
     ItemDto::from(recent.item)
         .with_show_title(recent.show_title)
+        .with_season_poster(recent.season_poster)
         .with_watch(watch)
 }
 
 pub fn in_progress_dto(item: InProgressItem) -> ItemDto {
     ItemDto::from(item.item)
         .with_show_title(item.show_title)
+        .with_season_poster(item.season_poster)
         .with_watch(Some(item.state))
 }
 

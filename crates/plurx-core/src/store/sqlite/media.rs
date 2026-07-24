@@ -1,5 +1,6 @@
 //! Items (movie/show/season/episode), media files, search.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use async_trait::async_trait;
@@ -231,7 +232,7 @@ impl MediaStore for SqliteStore {
             // One card per movie or per show (latest episode represents the
             // show). SQLite's bare-column-with-MAX picks that latest row.
             let mut stmt = conn.prepare(&format!(
-                "SELECT {i}, show.title, MAX(i.added_at) AS latest
+                "SELECT {i}, show.title, season.poster_path, MAX(i.added_at) AS latest
                  FROM items i
                  LEFT JOIN items season ON season.id = i.parent_id
                  LEFT JOIN items show ON show.id = season.parent_id
@@ -247,6 +248,7 @@ impl MediaStore for SqliteStore {
                     Ok(RecentItem {
                         item: item_from_row(row, 0)?,
                         show_title: row.get(18)?,
+                        season_poster: row.get(19)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -261,7 +263,7 @@ impl MediaStore for SqliteStore {
         };
         self.with_conn(move |conn| {
             let mut stmt = conn.prepare(&format!(
-                "SELECT {i}, show.title
+                "SELECT {i}, show.title, season.poster_path
                  FROM items_fts f
                  JOIN items i ON i.id = f.rowid
                  LEFT JOIN items season
@@ -276,6 +278,7 @@ impl MediaStore for SqliteStore {
                     Ok(RecentItem {
                         item: item_from_row(row, 0)?,
                         show_title: row.get(18)?,
+                        season_poster: row.get(19)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -493,6 +496,27 @@ impl MediaStore for SqliteStore {
                 .query_map(params![item_id], file_from_row)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(files)
+        })
+        .await
+    }
+
+    async fn item_max_heights(&self, ids: &[i64]) -> Result<HashMap<i64, i64>, StoreError> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        // ids come from our own item rows (trusted i64s), so an inline IN-list
+        // is safe and avoids a variadic-params dance.
+        let list = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT item_id, MAX(height) FROM files
+                 WHERE height IS NOT NULL AND item_id IN ({list})
+                 GROUP BY item_id"
+            ))?;
+            let rows = stmt
+                .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows.into_iter().collect())
         })
         .await
     }

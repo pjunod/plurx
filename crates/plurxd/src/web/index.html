@@ -96,6 +96,10 @@
   .playinfo{color:var(--muted);font-size:13px;margin:10px 0 0}
   .epmeta .epleft{color:var(--accent)}
   .poster .prog{position:absolute;left:0;right:0;bottom:0;height:5px;background:rgba(0,0,0,.55)}
+  /* Resolution badge (movies): a small, legible tag in the poster corner. */
+  .poster .resbadge{position:absolute;top:8px;left:8px;background:rgba(8,10,15,.82);color:#fff;
+    font-size:10.5px;font-weight:700;letter-spacing:.3px;padding:2px 6px;border-radius:6px;backdrop-filter:blur(4px)}
+  .ressection{display:flex;align-items:baseline;gap:8px}
   .poster .prog>i{display:block;height:100%;background:var(--accent);box-shadow:0 0 8px var(--accent)}
   /* A–Z jump rail: pinned to the right edge on alphabetically-sorted media
      grids (library/category), like a phone contact index. scroll-margin keeps
@@ -205,7 +209,22 @@
     padding:10px 16px;border-radius:10px;z-index:60;opacity:0;transition:opacity .2s;pointer-events:none}
   .toast.show{opacity:1}
   .err{color:var(--bad);font-size:13px;min-height:18px;margin-top:8px}
-  .adminwrap{display:grid;grid-template-columns:1fr;gap:22px;max-width:960px}
+  /* minmax(0,1fr), not 1fr: a plain 1fr track has an implicit min-content
+     minimum, so a wide child (the libraries table with its path chips + action
+     buttons) stretches the track — and the whole page — past the viewport,
+     which left the sticky header narrower than the body. minmax(0,…) lets the
+     track shrink so the table scrolls inside its card instead. */
+  .adminwrap{display:grid;grid-template-columns:minmax(0,1fr);gap:22px;max-width:960px}
+  /* Phones: a wide settings table (libraries/users, with their path chips and
+     action buttons) has a min-content width past a phone's, so at width:100% it
+     overflowed the *page*. That horizontal page scroll left the sticky header
+     narrower than the body ("pulled ~1/3 over"). Scroll the table inside its
+     own card instead — the page stays exactly viewport-width and the header
+     lines back up. (Can't fix it with overflow-x on a header ancestor: that
+     would create a scroll container and break the header's position:sticky.) */
+  @media(max-width:640px){
+    .adminwrap table{display:block;overflow-x:auto;-webkit-overflow-scrolling:touch;max-width:100%}
+  }
   /* Settings tab bar — one group visible at a time (persisted per browser). */
   .settabs{display:flex;gap:2px;flex-wrap:wrap;margin:0 0 20px;border-bottom:1px solid var(--line)}
   .settab{background:transparent;border:0;border-bottom:2px solid transparent;color:var(--muted);
@@ -735,6 +754,12 @@ function progressPct(w){ if(!w||!w.duration_ms||!w.position_ms) return 0; return
 function itemDurMs(it){ return (it&&it.watch&&it.watch.duration_ms) || (it&&it.runtime_ms) || 0; }
 function fmtClock(d){ try{ return d.toLocaleTimeString([], {hour:"numeric",minute:"2-digit"}); }catch(e){ return ""; } }
 function endsAt(remMs){ if(!remMs||remMs<0) return ""; return fmtClock(new Date(Date.now()+remMs)); }
+// "2022-02-18" → "Feb 18, 2022" (plain text; callers escape). Falls back to the
+// raw string for anything that isn't an ISO date.
+function fmtDate(s){ const m=/^(\d{4})-(\d{2})-(\d{2})/.exec(s||""); if(!m) return s||"";
+  const mo=["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][(+m[2])-1]||""; return `${mo} ${+m[3]}, ${m[1]}`; }
+// The 4-digit year from an ISO date/timestamp, or null.
+function airYear(s){ const m=/^(\d{4})/.exec(s||""); return m?+m[1]:null; }
 // One meta line for a card in a watch-oriented row (Continue watching / Next up):
 // time left on a partial item (or full runtime), plus when it would finish now.
 function watchLine(it, watchCtx){
@@ -747,16 +772,38 @@ function watchLine(it, watchCtx){
   const end = endsAt(rem);
   return `<div class="cleft">${partial?fmtDur(rem)+" left":fmtDur(rem)}${end?" · ends ~"+end:""}</div>`;
 }
+// Resolution helpers. `resolution` is the item's best file height (movies only,
+// on the library grid). Labels reuse resLabel() (height-only here) so a card's
+// badge and its section header read the same as the video spec badges.
+function resBucket(it){ const h=it.resolution||0;
+  const r = h>=1700?0 : h>=1300?1 : h>=900?2 : h>=650?3 : h>=400?4 : h>0?5 : 6;
+  return { r, l: h?resLabel(0,h):"Unknown resolution" }; }
+// Group items (already server-sorted height-desc) into resolution sections.
+function resSections(items){
+  const groups=new Map();
+  for(const it of items){ const b=resBucket(it); if(!groups.has(b.r)) groups.set(b.r,{l:b.l,items:[]}); groups.get(b.r).items.push(it); }
+  return [...groups.keys()].sort((a,b)=>a-b).map(r=>{ const g=groups.get(r);
+    return `<h2 class="section ressection">${esc(g.l)}<span class="muted" style="font-size:12px">${g.items.length}</span></h2>${grid(g.items)}`;
+  }).join("");
+}
 function card(it, wide, watchCtx){
   const img = artHtml(it);
-  const sub = it.kind==='episode'
-      ? esc((it.show_title?it.show_title+" · ":"")+`S${it.season_number||0}E${it.episode_number||0}`)
+  const resb = it.resolution ? `<span class="resbadge">${esc(resLabel(0,it.resolution))}</span>` : "";
+  // On rail cards the series is the headline and the episode (SxEy · name) is
+  // the secondary line — a show's name matters more than which episode this is.
+  // `show_title` is only set on rail rows; the season page renders episodes via
+  // episodeRow() (no show_title), so those keep the episode name as the title.
+  const isEp = it.kind==='episode';
+  const ep = isEp ? `S${it.season_number||0}E${it.episode_number||0}` : '';
+  const main = isEp && it.show_title ? it.show_title : it.title;
+  const sub = isEp
+      ? esc(it.show_title ? (it.title ? `${ep} · ${it.title}` : ep) : ep)
       : esc(it.year? String(it.year): (it.kind==='show'?'Series':''));
   const pct = progressPct(it.watch);
   const watched = it.watch&&it.watch.watched? `<span class="badge">✓</span>`:"";
   const prog = pct>0&&pct<100? `<div class="prog"><i style="width:${pct}%"></i></div>`:"";
   return `<div class="poster ${wide?'wide':''}" onclick="location.hash='#/item/${it.id}'">
-    ${img}${watched}<div class="meta"><div class="t">${esc(it.title)}</div><div class="s">${sub}</div>${watchLine(it,watchCtx)}</div>${prog}</div>`;
+    ${img}${resb}${watched}<div class="meta"><div class="t">${esc(main)}</div><div class="s">${sub}</div>${watchLine(it,watchCtx)}</div>${prog}</div>`;
 }
 function grid(items){ return items.length? `<div class="grid">${items.map(i=>card(i)).join("")}</div>` : `<div class="empty">Nothing here yet.</div>`; }
 
@@ -925,7 +972,7 @@ async function viewLibrary(id){
         ${libOpt("all","Everything",LIB_FILTER)}${libOpt("unwatched","Unwatched",LIB_FILTER)}${libOpt("inprogress","In progress",LIB_FILTER)}${libOpt("watched","Watched",LIB_FILTER)}</select>
     </div>
     <span class="muted" style="font-size:13px">${items.length} item${items.length===1?'':'s'}${capNote}</span></div>`;
-  const body = items.length? grid(items) : `<div class="empty">Nothing matches this filter.</div>`;
+  const body = items.length? (LIB_SORT==="resolution"? resSections(items) : grid(items)) : `<div class="empty">Nothing matches this filter.</div>`;
   document.getElementById("main").innerHTML=`<h2 class="section" style="margin-bottom:10px">${esc(lib?lib.name:'Library')}</h2>${bar}${body}${alphaRailHtml(items)}`;
   tagAlpha(items);
 }
@@ -941,6 +988,7 @@ async function viewCategory(key){
   // Each share is server-sorted; re-sort the merged set for fields we hold locally.
   if(LIB_SORT==="title") items.sort((a,b)=>sortKey(a.title).localeCompare(sortKey(b.title)));
   else if(LIB_SORT==="year") items.sort((a,b)=>(b.year||0)-(a.year||0));
+  else if(LIB_SORT==="resolution") items.sort((a,b)=>(b.resolution||0)-(a.resolution||0));
   if(LIB_FILTER!=="all") items=items.filter(it=>matchWatch(it,LIB_FILTER));
   const total=pages.reduce((n,p)=>n+(p.total||0),0);
   const capNote = total>items.length? ` <span class="muted">(first ${items.length} of ${total})</span>`:"";
@@ -954,7 +1002,7 @@ async function viewCategory(key){
         ${libOpt("all","Everything",LIB_FILTER)}${libOpt("unwatched","Unwatched",LIB_FILTER)}${libOpt("inprogress","In progress",LIB_FILTER)}${libOpt("watched","Watched",LIB_FILTER)}</select>
     </div>
     <span class="muted" style="font-size:13px">${items.length} item${items.length===1?'':'s'}${capNote}</span></div>`;
-  const body = items.length? grid(items) : `<div class="empty">Nothing matches this filter.</div>`;
+  const body = items.length? (LIB_SORT==="resolution"? resSections(items) : grid(items)) : `<div class="empty">Nothing matches this filter.</div>`;
   document.getElementById("main").innerHTML=`<h2 class="section" style="margin-bottom:10px">${esc(cat.name)}</h2>${bar}${body}${alphaRailHtml(items)}`;
   tagAlpha(items);
 }
@@ -1021,7 +1069,7 @@ function epThumb(ep){
   return `<div class="epthumb">${ep.episode_number!=null?ep.episode_number:"?"}${prog}</div>`;
 }
 function episodeRow(ep){
-  const bits=[ep.episode_number!=null?`Episode ${ep.episode_number}`:'',fmtDur(ep.runtime_ms)].filter(Boolean).map(m=>`<span>${esc(m)}</span>`);
+  const bits=[ep.episode_number!=null?`Episode ${ep.episode_number}`:'',ep.air_date?fmtDate(ep.air_date):'',fmtDur(ep.runtime_ms)].filter(Boolean).map(m=>`<span>${esc(m)}</span>`);
   const epw=ep.watch, epdur=itemDurMs(ep);
   if(epw && !epw.watched && epw.position_ms>3000 && epdur) bits.push(`<span class="epleft">${esc(fmtDur(Math.max(0,epdur-epw.position_ms))+" left")}</span>`);
   if(ep.watch&&ep.watch.watched) bits.push('<span class="epwatched">✓ Watched</span>');
@@ -1053,7 +1101,16 @@ async function viewItem(id){
   const multi=d.files.length>1;
   const runtime=it.runtime_ms||(best&&best.duration_ms);
   const chips=[];
-  if(it.year) chips.push(`<span>${it.year}</span>`);
+  if(it.kind==='show'){
+    // A show wears the span of years it aired, gathered from its seasons'
+    // air dates (plus its own first-air year).
+    const ys=(d.children||[]).map(c=>airYear(c.air_date)).filter(Boolean);
+    if(it.year) ys.push(it.year);
+    const y0=airYear(it.air_date); if(y0) ys.push(y0);
+    if(ys.length){ const lo=Math.min(...ys), hi=Math.max(...ys); chips.push(`<span>${lo}${hi>lo?'–'+hi:''}</span>`); }
+  } else if(it.kind==='season'){
+    const y=it.year||airYear(it.air_date); if(y) chips.push(`<span>${y}</span>`);
+  } else if(it.year){ chips.push(`<span>${it.year}</span>`); }
   if(runtime) chips.push(`<span>${fmtDur(runtime)}</span>`);
   if(it.kind) chips.push(`<span>${esc(it.kind)}</span>`);
   // Video badges show once: in the hero for a single version; per-version below

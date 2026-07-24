@@ -79,8 +79,25 @@ pub async fn list_items(
         .list_top_items(library_id, sort, offset, limit)
         .await?;
     let watch = watch_lookup(&state, user.id, &page.items).await?;
+    // Per-item resolution (movies only) so the grid can badge/section it.
+    let movie_ids: Vec<i64> = page
+        .items
+        .iter()
+        .filter(|i| i.kind == ItemKind::Movie)
+        .map(|i| i.id)
+        .collect();
+    let heights = state.store.item_max_heights(&movie_ids).await?;
+    let items = page
+        .items
+        .into_iter()
+        .map(|item| {
+            let w = watch.get(&item.id).copied();
+            let res = heights.get(&item.id).copied();
+            ItemDto::from(item).with_watch(w).with_resolution(res)
+        })
+        .collect();
     Ok(Json(ItemListResponse {
-        items: annotate(page.items, &watch),
+        items,
         total: page.total,
         offset,
         limit,

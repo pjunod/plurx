@@ -195,7 +195,8 @@ impl WatchStore for SqliteStore {
             // show's title so a card can read "Severance · S1E3".
             let mut stmt = conn.prepare(&format!(
                 "SELECT {i}, show.title,
-                        w.position_ms, w.duration_ms, w.watched, w.updated_at
+                        w.position_ms, w.duration_ms, w.watched, w.updated_at,
+                        season.poster_path
                  FROM watch_state w
                  JOIN items i ON i.id = w.item_id
                  LEFT JOIN items season
@@ -212,6 +213,7 @@ impl WatchStore for SqliteStore {
                         item: item_from_row(row, 0)?,
                         show_title: row.get(18)?,
                         state: watch_from_row(row, 19)?,
+                        season_poster: row.get(23)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -227,7 +229,8 @@ impl WatchStore for SqliteStore {
             // progress, strictly after the last watched episode of that show.
             // One row per show (bare columns alongside MIN() pick that row).
             let mut stmt = conn.prepare(&format!(
-                "SELECT {e}, show.title, MIN(season.season_number*100000 + e.episode_number) AS ord
+                "SELECT {e}, show.title, season.poster_path,
+                        MIN(season.season_number*100000 + e.episode_number) AS ord
                  FROM items e
                  JOIN items season ON season.id = e.parent_id
                  JOIN items show ON show.id = season.parent_id
@@ -265,6 +268,7 @@ impl WatchStore for SqliteStore {
                     Ok(RecentItem {
                         item: item_from_row(row, 0)?,
                         show_title: row.get(18)?,
+                        season_poster: row.get(19)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;

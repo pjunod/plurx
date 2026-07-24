@@ -274,6 +274,9 @@ pub struct InProgressItem {
     pub item: Item,
     /// For episodes: the show title, so clients can label the card.
     pub show_title: Option<String>,
+    /// For episodes: the season's poster, so rail cards can show the season
+    /// artwork instead of a (often arbitrary) per-episode still.
+    pub season_poster: Option<String>,
     pub state: WatchState,
 }
 
@@ -282,6 +285,8 @@ pub struct InProgressItem {
 pub struct RecentItem {
     pub item: Item,
     pub show_title: Option<String>,
+    /// For episodes: the season's poster (see [`InProgressItem::season_poster`]).
+    pub season_poster: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
