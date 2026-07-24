@@ -19,6 +19,17 @@ bump may break compatibility and a **patch** bump never does.
   first thing an air-starved AP drops. Streams now burst 30 seconds flat-out
   (so starting and seeking stay instant) and then settle to 4× real time,
   configurable in **Settings → Playback → Delivery speed**.
+- Seeking no longer stacks transcode sessions. Each seek started a new session
+  and left the old one for the idle reaper, so up to ~75 seconds of a second
+  ffmpeg kept encoding after every seek, without bound. A new session now
+  supersedes that viewer's previous session on the same file immediately.
+- The web player no longer strands hls.js instances. Overwriting the live
+  instance on seek, audio switch, or fallback left the old one polling a
+  playlist that never ends, forever; each one also re-fetched segments from the
+  session it was supposed to have left behind.
+- Fixed a progress-timer leak on auto-next: each episode transition left the
+  previous episode's 5-second progress poster running, so after N episodes N+1
+  reported concurrently.
 
 ## [0.1.0] — 2026-07-22
 

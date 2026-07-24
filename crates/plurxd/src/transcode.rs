@@ -192,7 +192,6 @@ impl TranscodeManager {
         self.caps.choose(&prefer)
     }
 
-    /// Start (or return a matching) transcode session for a file.
     /// The admin's playback language preferences (Settings → Playback
     /// defaults), falling back to English/English/Auto.
     pub async fn lang_prefs(&self) -> plurx_core::tracks::LangPrefs {
@@ -213,6 +212,49 @@ impl TranscodeManager {
         prefs
     }
 
+    /// Kill any session this same viewer already has open on this same file,
+    /// because the one they're about to start replaces it.
+    ///
+    /// A seek is a *new* session: the client asks for a playlist starting at the
+    /// new position and abandons the old one without telling anyone. Nothing in
+    /// the protocol says the old session is finished, so it was left to the idle
+    /// reaper — 60s idle, noticed by a 15s ticker, so up to ~75 seconds of a
+    /// second ffmpeg still writing segments nobody will fetch. Scrub along a
+    /// timeline and those stack: ten seeks in a minute is ten encoders (or ten
+    /// remuxes reading the source flat-out), all competing for the same CPU,
+    /// GPU, disk and link. That is enough on its own to starve a Wi-Fi client
+    /// badly enough to cost it its DHCP lease.
+    ///
+    /// Scoped to (viewer, file) rather than just viewer: one person legitimately
+    /// watching two different things on two devices keeps both, while the seek
+    /// case — same person, same file, moments apart — is always a replacement.
+    /// Two devices on the same file under one account is the rare loser here,
+    /// and it degrades to "the other device rebuffers and starts its own
+    /// session", not to an error.
+    async fn reap_superseded(&self, user_name: &str, file_id: i64) {
+        let doomed: Vec<(String, Arc<Session>)> = {
+            let mut sessions = self.sessions.lock().await;
+            let ids: Vec<String> = sessions
+                .iter()
+                .filter(|(_, s)| s.file_id == file_id && s.user_name == user_name)
+                .map(|(id, _)| id.clone())
+                .collect();
+            ids.into_iter()
+                .filter_map(|id| sessions.remove(&id).map(|s| (id, s)))
+                .collect()
+        };
+        for (session_id, session) in doomed {
+            let _ = session.child.lock().await.kill().await;
+            let _ = tokio::fs::remove_dir_all(&session.dir).await;
+            tracing::info!(
+                %session_id, file_id, user = user_name,
+                "reaped superseded transcode session (client started a new one)"
+            );
+        }
+    }
+
+    /// Start a transcode session for a file, superseding this viewer's previous
+    /// session on the same file (see [`Self::reap_superseded`]).
     pub async fn start(
         &self,
         file_id: i64,
@@ -221,6 +263,11 @@ impl TranscodeManager {
         audio_override: Option<i64>,
         user_name: &str,
     ) -> Result<StartInfo, String> {
+        // Before spawning, not after: the point is to never have two encoders
+        // for one viewer running at once, and reaping first also frees the GPU
+        // slot the new session is about to want.
+        self.reap_superseded(user_name, file_id).await;
+
         let file = self
             .store
             .get_file(file_id)
@@ -427,6 +474,10 @@ impl TranscodeManager {
         transcode_audio: bool,
         user_name: &str,
     ) -> Result<StartInfo, String> {
+        // Same reasoning as `start`; the copy path matters more if anything,
+        // since an abandoned remux reads the source as fast as the disk allows.
+        self.reap_superseded(user_name, file_id).await;
+
         let file = self
             .store
             .get_file(file_id)
@@ -877,6 +928,69 @@ mod tests {
             .expect("start_copy");
         assert_eq!(info.encoder, "copy");
         assert!(mgr.stop_session(&info.session_id).await);
+    }
+
+    /// Seeking must not leave the old session running. Before this, every seek
+    /// stacked another ffmpeg for up to ~75s (idle timeout + reaper tick).
+    #[tokio::test]
+    async fn a_new_session_supersedes_the_same_viewers_old_one() {
+        use plurx_core::store::SqliteStore;
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let file_id = seed_file(&store).await;
+        let work = tempfile::tempdir().expect("work");
+        let mgr = TranscodeManager::new(
+            Arc::clone(&store),
+            work.path().to_path_buf(),
+            EncoderCaps::default(),
+        );
+
+        // Play, then "seek" three times. Only the newest survives.
+        let first = mgr
+            .start(file_id, 720, 0.0, None, "paul")
+            .await
+            .expect("start");
+        let second = mgr
+            .start(file_id, 720, 600.0, None, "paul")
+            .await
+            .expect("seek");
+        let third = mgr
+            .start(file_id, 720, 1200.0, None, "paul")
+            .await
+            .expect("seek again");
+        assert_eq!(mgr.active_sessions().await, 1);
+        assert!(mgr.playlist(&first.session_id).await.is_none());
+        assert!(!mgr.stop_session(&second.session_id).await);
+        assert!(mgr.stop_session(&third.session_id).await);
+
+        // The copy path supersedes too, and across paths: a transcode fallback
+        // after a copy attempt must not leave the copy remux reading the disk.
+        let copy = mgr
+            .start_copy(file_id, 0.0, None, false, "paul")
+            .await
+            .expect("copy");
+        let fallback = mgr
+            .start(file_id, 720, 0.0, None, "paul")
+            .await
+            .expect("fallback");
+        assert_eq!(mgr.active_sessions().await, 1);
+        assert!(!mgr.stop_session(&copy.session_id).await);
+
+        // Another viewer on the same file is untouched, and so is the same
+        // viewer on a different file — only (viewer, file) is superseded.
+        let other_viewer = mgr
+            .start(file_id, 720, 0.0, None, "sam")
+            .await
+            .expect("other viewer");
+        assert_eq!(mgr.active_sessions().await, 2);
+        let reseek = mgr
+            .start(file_id, 720, 30.0, None, "paul")
+            .await
+            .expect("paul seeks");
+        assert_eq!(mgr.active_sessions().await, 2);
+        assert!(!mgr.stop_session(&fallback.session_id).await);
+        assert!(mgr.stop_session(&other_viewer.session_id).await);
+        assert!(mgr.stop_session(&reseek.session_id).await);
+        assert_eq!(mgr.active_sessions().await, 0);
     }
 
     #[tokio::test]

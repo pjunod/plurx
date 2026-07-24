@@ -1330,6 +1330,13 @@ function preferNativeHls(video){ return useNativeHls(video) && streamIsHevc(); }
 // CSP can silently kill a blob worker; main-thread demux of one 720p stream
 // is nothing.
 function attachHls(video, playlistUrl){
+  // Always tear the incumbent down first. Overwriting PLAYER.hls used to strand
+  // the old instance: nothing else held a reference, but hls.js keeps polling a
+  // media playlist that never gets #EXT-X-ENDLIST, so it lived on invisibly,
+  // re-fetching every few seconds forever. Each seek and audio switch added
+  // another. Also cancels the previous session's segment fetches, which is the
+  // client half of the server's supersede.
+  teardownHls();
   if(!preferNativeHls(video) && window.Hls && Hls.isSupported()){
     const hls=new Hls({enableWorker:false,xhrSetup:x=>{ if(TOKEN) x.setRequestHeader("authorization","Bearer "+TOKEN); }});
     PLAYER.hls=hls;
@@ -1387,6 +1394,12 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
   setLoading(true,"Reading media…","checking the file on the server");
   let decision; try{ decision=await api(`/files/${fileId}/decision?${CAPS_Q}&force=${qualityForce()}`);}catch(e){ setLoading(false); toast(e.message); return closePlayer(); }
   const startSec=(resumeMs||0)/1000;
+  // Stop the outgoing playback's timers *before* PLAYER is replaced below. The
+  // clearInterval further down runs after the reassignment, so it only ever
+  // cleared the new object's null timer — on auto-next each episode left its
+  // 5-second progress poster running, and after N episodes N+1 of them were
+  // POSTing at once. Same trap for the idle and stall timers.
+  stopPlayerTimers();
   teardownHls();
   clearSubs(video);   // drop whatever the last item left showing
   const src=decision.source||{};
@@ -1454,12 +1467,25 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
 // audio is transcoded when the browser can't take it. Keeps method === 'remux'
 // (honest: no video re-encode) and flags copyHls so seek / audio-switch re-open
 // the HLS session instead of the progressive /stream.mp4 Safari can't play.
-async function startCopyHls(v, startSec){
+// `live` (optional) is re-checked after the await: a seek or audio switch that
+// has since been superseded must not attach, or two hls.js instances end up
+// pulling two server sessions at once. Returns false when it bailed.
+async function startCopyHls(v, startSec, live){
   const track=PLAYER.audio[PLAYER.curAudio]; const aidx=track?track.index:0;
   const info=await api(`/files/${PLAYER.fileId}/hls/start?copy=1&aac=${PLAYER.transcodeAudio?1:0}&start=${(startSec||0).toFixed(1)}&audio=${aidx}`);
+  if(live && !live()) return false;
   PLAYER.offset=info.start_seconds||0; PLAYER.method='remux'; PLAYER.copyHls=true; PLAYER.encoder=info.encoder||null;
   PLAYER.probeUrl=info.playlist_url; armStall();
   attachHls(v, info.playlist_url);
+  return true;
+}
+// One generation counter for "restart the server-side stream". Seek and audio
+// switch both bump it, so they supersede each other as well as themselves —
+// they are the same operation (re-open at position X with track Y) and only the
+// last one asked for should end up attached.
+function streamGeneration(){
+  const me=PLAYER; const token=(me._seekToken=(me._seekToken||0)+1);
+  return {me, live:()=>PLAYER===me && me._seekToken===token};
 }
 function transcodeReason(d){
   const r=(d.reasons||[]).filter(Boolean);
@@ -1476,6 +1502,15 @@ function setupAirplay(video){
   } else { btn.style.display="none"; }
 }
 function teardownHls(){ if(PLAYER&&PLAYER.hls){ try{PLAYER.hls.destroy()}catch(e){} PLAYER.hls=null; } }
+// Every timer hanging off PLAYER, stopped. Anything that replaces or discards
+// PLAYER must call this first: once the object is gone the handles are gone
+// with it and the callbacks run forever.
+function stopPlayerTimers(){
+  if(!PLAYER) return;
+  clearInterval(PLAYER.timer); PLAYER.timer=null;
+  clearTimeout(PLAYER.idleTimer); PLAYER.idleTimer=null;
+  clearTimeout(PLAYER.stallTimer); PLAYER.stallTimer=null;
+}
 
 // ---- stall self-diagnosis --------------------------------------------------
 // A remux/transcode that never fires `playing` used to sit on a mystery gray
@@ -1486,12 +1521,16 @@ function clearStall(){ if(PLAYER&&PLAYER.stallTimer){ clearTimeout(PLAYER.stallT
 // Rescue path: the browser rejected a remux/direct stream outright, so restart
 // this playback as a server transcode (guaranteed-compatible H.264/AAC HLS).
 async function startTranscodeFallback(){
-  const me=PLAYER, v=document.getElementById("video");
-  if(!me || !me.fileId || !v) return;
-  const startSec=(me.offset||0)+(v.currentTime||0);
+  const v=document.getElementById("video");
+  if(!PLAYER || !PLAYER.fileId || !v) return;
+  const startSec=(PLAYER.offset||0)+(v.currentTime||0);
+  // Bump the generation: this is a restart like any other. `PLAYER===me` alone
+  // was not enough — a seek mutates PLAYER in place rather than replacing it, so
+  // an identity check still passed and both streams attached.
+  const {me, live}=streamGeneration();
   teardownHls();
-  let info; try{ info=await api(`/files/${me.fileId}/hls/start?height=${transcodeHeight()}&start=${startSec.toFixed(1)}`);}catch(e){ if(PLAYER===me){ setLoading(false); toast(e.message); } return; }
-  if(PLAYER!==me) return;   // the user closed the player / started something else
+  let info; try{ info=await api(`/files/${me.fileId}/hls/start?height=${transcodeHeight()}&start=${startSec.toFixed(1)}`);}catch(e){ if(live()){ setLoading(false); toast(e.message); } return; }
+  if(!live()) return;   // closed the player, or seeked / switched audio meanwhile
   me.method='transcode'; me.copyHls=false; me.offset=info.start_seconds||0; me.encoder=info.encoder||null;
   me.probeUrl=info.playlist_url; armStall(me.offset);
   setLoading(true,"Preparing the stream…",(me.encoder?("encoder: "+me.encoder+" — "):"")+"transcoding instead of remuxing");
@@ -1820,8 +1859,7 @@ async function seekTo(targetSec){
   // double-clicked ±10, or a drag landing near a keyboard nudge) would tear down
   // and re-attach hls.js twice. Token the call and bail any superseded one after
   // its await, so only the last seek attaches.
-  const me=PLAYER; const token=(me._seekToken=(me._seekToken||0)+1);
-  const live=()=>PLAYER===me && me._seekToken===token;
+  const {me, live}=streamGeneration();
   const track=PLAYER.audio[PLAYER.curAudio]; const aidx=track?track.index:(PLAYER.curAudio||0);
   const curSub=PLAYER.curSub;
   // The stream we are about to build has NOT started. Saying so is what stops a
@@ -1842,8 +1880,9 @@ async function seekTo(targetSec){
     attachHls(v, info.playlist_url);
   } else if(PLAYER.copyHls){
     // Copy-video HLS (Safari): re-open the session at the target position.
-    try{ await startCopyHls(v, targetSec); }catch(e){ return failed(e); }
-    if(!live()) return;
+    // The guard goes *into* startCopyHls: checking after it returned would be
+    // too late, it has already attached.
+    try{ if(!await startCopyHls(v, targetSec, live)) return; }catch(e){ return failed(e); }
     armStall(PLAYER.offset,20000);
   } else {
     PLAYER.method='remux'; PLAYER.offset=targetSec;
@@ -2111,16 +2150,21 @@ async function switchAudio(idx){
   const v=document.getElementById("video");
   const pos=(PLAYER.offset||0)+(v.currentTime||0);
   const track=PLAYER.audio[idx]; const aidx=track?track.index:idx;
+  // Same generation counter as seekTo: this also restarts the server stream, so
+  // a seek landing mid-switch (or a second switch) must win outright instead of
+  // both attaching.
+  const {live}=streamGeneration();
   teardownHls();
   const curSub=PLAYER.curSub;
   [...v.querySelectorAll("track")].forEach(t=>t.remove()); // re-added below if a sub was on
   if(PLAYER.method==='transcode'){
     let info; try{ info=await api(`/files/${PLAYER.fileId}/hls/start?height=${transcodeHeight()}&start=${pos.toFixed(1)}&audio=${aidx}`);}catch(e){ return toast(e.message); }
+    if(!live()) return;
     PLAYER.offset=info.start_seconds||0; PLAYER.encoder=info.encoder||null;
     attachHls(v, info.playlist_url);
   } else if(PLAYER.copyHls){
     // Copy-video HLS (Safari): re-open with the chosen audio track.
-    try{ await startCopyHls(v, pos); }catch(e){ return toast(e.message); }
+    try{ if(!await startCopyHls(v, pos, live)) return; }catch(e){ return toast(e.message); }
   } else {
     // Switching audio forces a remux so the chosen track is the one delivered.
     PLAYER.method='remux'; PLAYER.offset=pos;
@@ -2201,8 +2245,14 @@ async function reportProgress(fileId, ended){
 function closePlayer(){
   const video=document.getElementById("video");
   if(PLAYER.fileId) reportProgress(PLAYER.fileId);
-  clearInterval(PLAYER.timer); clearInterval(STATS_TIMER); STATS_TIMER=null; teardownHls();
-  clearStall(); clearTimeout(PLAYER.idleTimer); setLoading(false);
+  // Bump the generation so a seek or audio switch still awaiting its
+  // hls/start finds itself superseded and doesn't attach a stream to a player
+  // the user has already closed. Closing doesn't replace PLAYER, so the
+  // identity check alone would have let it through.
+  if(PLAYER) PLAYER._seekToken=(PLAYER._seekToken||0)+1;
+  stopPlayerTimers();
+  clearInterval(STATS_TIMER); STATS_TIMER=null; teardownHls();
+  setLoading(false);
   const ov=document.getElementById("statsov"); if(ov) ov.classList.remove("on");
   const pm=document.getElementById("pmenu"); if(pm) pm.classList.remove("on");
   const sk=document.getElementById("pskip"); if(sk){ sk.innerHTML=""; sk.dataset.k=""; }
