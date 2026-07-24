@@ -1,6 +1,7 @@
 # plurx
 
 [![ci](https://github.com/pjunod/plurx/actions/workflows/ci.yml/badge.svg)](https://github.com/pjunod/plurx/actions/workflows/ci.yml)
+[![lint](https://github.com/pjunod/plurx/actions/workflows/lint.yml/badge.svg)](https://github.com/pjunod/plurx/actions/workflows/lint.yml)
 [![codecov](https://codecov.io/gh/pjunod/plurx/branch/main/graph/badge.svg)](https://codecov.io/gh/pjunod/plurx)
 
 A self-hosted media server and player in the spirit of **old-school Plex** —
