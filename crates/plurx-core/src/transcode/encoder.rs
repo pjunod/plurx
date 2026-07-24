@@ -289,4 +289,117 @@ mod tests {
         assert_eq!(Encoder::Software.video_codec(), "libx264");
         assert_eq!(Encoder::Vaapi.video_codec(), "h264_vaapi");
     }
+
+    const ALL: [Encoder; 5] = [
+        Encoder::Software,
+        Encoder::Nvenc,
+        Encoder::Qsv,
+        Encoder::Vaapi,
+        Encoder::VideoToolbox,
+    ];
+
+    fn has(v: &[String], needle: &str) -> bool {
+        v.iter().any(|s| s == needle)
+    }
+
+    #[test]
+    fn codecs_and_labels_for_every_variant() {
+        // Every arm returns a distinct, non-empty codec + label.
+        let codecs: Vec<_> = ALL.iter().map(|e| e.video_codec()).collect();
+        assert_eq!(
+            codecs,
+            [
+                "libx264",
+                "h264_nvenc",
+                "h264_qsv",
+                "h264_vaapi",
+                "h264_videotoolbox"
+            ]
+        );
+        for e in ALL {
+            assert!(!e.label().is_empty());
+        }
+        assert_eq!(Encoder::Nvenc.label(), "NVIDIA NVENC");
+        assert_eq!(Encoder::VideoToolbox.label(), "Apple VideoToolbox");
+    }
+
+    #[test]
+    fn init_and_filter_flags_per_family() {
+        // VAAPI needs a device before the input; QSV a named hw device.
+        let vaapi = Encoder::Vaapi.init_args();
+        assert_eq!(vaapi.len(), 2);
+        assert_eq!(vaapi[0], "-vaapi_device");
+        assert_eq!(
+            Encoder::Qsv.init_args(),
+            vec!["-init_hw_device", "qsv=hw", "-filter_hw_device", "hw"]
+        );
+        // System-memory encoders need no device init.
+        for e in [Encoder::Software, Encoder::Nvenc, Encoder::VideoToolbox] {
+            assert!(e.init_args().is_empty(), "{e:?} should not init a device");
+        }
+
+        // Only VAAPI/QSV upload frames to the GPU via a filter suffix.
+        assert_eq!(Encoder::Vaapi.filter_suffix(), Some("format=nv12,hwupload"));
+        assert_eq!(
+            Encoder::Qsv.filter_suffix(),
+            Some("hwupload=extra_hw_frames=64,format=qsv")
+        );
+        for e in [Encoder::Software, Encoder::Nvenc, Encoder::VideoToolbox] {
+            assert_eq!(e.filter_suffix(), None);
+        }
+    }
+
+    #[test]
+    fn encode_args_carry_rate_control() {
+        // 4000k → maxrate 1.5x, bufsize 2x.
+        let sw = Encoder::Software.encode_args(4000);
+        assert!(has(&sw, "libx264") && has(&sw, "veryfast") && has(&sw, "high"));
+        assert!(has(&sw, "4000k") && has(&sw, "6000k") && has(&sw, "8000k"));
+
+        let nv = Encoder::Nvenc.encode_args(4000);
+        assert!(has(&nv, "h264_nvenc") && has(&nv, "p4"));
+        assert!(has(&nv, "6000k") && has(&nv, "8000k"));
+
+        // VideoToolbox/VAAPI/QSV carry just the codec + target bitrate.
+        assert_eq!(
+            Encoder::VideoToolbox.encode_args(4000),
+            vec!["-c:v", "h264_videotoolbox", "-b:v", "4000k"]
+        );
+        assert_eq!(
+            Encoder::Vaapi.encode_args(4000),
+            vec!["-c:v", "h264_vaapi", "-b:v", "4000k"]
+        );
+        assert_eq!(
+            Encoder::Qsv.encode_args(4000),
+            vec!["-c:v", "h264_qsv", "-b:v", "4000k"]
+        );
+    }
+
+    #[test]
+    fn validation_args_probe_shape() {
+        // Software: a bare testsrc encode to null with the right codec.
+        let sw = validation_args(Encoder::Software);
+        assert!(has(&sw, "-hide_banner") && has(&sw, "lavfi"));
+        assert!(sw.iter().any(|s| s.starts_with("testsrc=")));
+        assert!(has(&sw, "libx264"));
+        assert_eq!(&sw[sw.len() - 3..], &["-f", "null", "-"]);
+
+        // VAAPI additionally injects the hwupload filter and the device.
+        let va = validation_args(Encoder::Vaapi);
+        assert!(has(&va, "-vf") && has(&va, "format=nv12,hwupload"));
+        assert!(has(&va, "-vaapi_device") && has(&va, "h264_vaapi"));
+    }
+
+    #[test]
+    fn vaapi_device_defaults_and_honors_env() {
+        // Clean env → documented default render node.
+        std::env::remove_var("PLURX_VAAPI_DEVICE");
+        assert_eq!(vaapi_device(), "/dev/dri/renderD128");
+        // Explicit override wins; empty is ignored (falls back to default).
+        std::env::set_var("PLURX_VAAPI_DEVICE", "/dev/dri/renderD129");
+        assert_eq!(vaapi_device(), "/dev/dri/renderD129");
+        std::env::set_var("PLURX_VAAPI_DEVICE", "");
+        assert_eq!(vaapi_device(), "/dev/dri/renderD128");
+        std::env::remove_var("PLURX_VAAPI_DEVICE");
+    }
 }

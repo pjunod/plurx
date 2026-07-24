@@ -39,6 +39,8 @@ pub struct AniMatch {
 
 pub struct AniListClient {
     http: reqwest::Client,
+    /// GraphQL endpoint (defaults to [`API`]); overridable for tests.
+    base: String,
 }
 
 impl AniListClient {
@@ -48,7 +50,14 @@ impl AniListClient {
                 .user_agent(concat!("plurx/", env!("CARGO_PKG_VERSION")))
                 .build()
                 .unwrap_or_default(),
+            base: API.to_owned(),
         }
+    }
+
+    /// Point the GraphQL endpoint elsewhere (mock server in tests).
+    pub fn with_base(mut self, base: impl Into<String>) -> Self {
+        self.base = base.into();
+        self
     }
 
     /// Search anime by title and return the best (first) match.
@@ -59,7 +68,7 @@ impl AniListClient {
         });
         let resp = self
             .http
-            .post(API)
+            .post(&self.base)
             .json(&body)
             .send()
             .await
@@ -209,5 +218,63 @@ mod tests {
             parse_media(Some(&media)).expect("m").title,
             "Bocchi the Rock!"
         );
+    }
+
+    async fn serve(app: axum::Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn find_anime_hits_graphql_and_downloads() {
+        use axum::routing::{get, post};
+        use axum::Json;
+        let app = axum::Router::new()
+            .route(
+                "/",
+                post(|| async {
+                    Json(json!({ "data": { "Media": {
+                        "id": 21, "title": { "english": "One Piece", "romaji": "One Piece" },
+                        "description": "Pirates.", "seasonYear": 1999,
+                        "coverImage": { "extraLarge": "https://img/op.jpg" },
+                        "bannerImage": "https://img/op-banner.jpg"
+                    }}}))
+                }),
+            )
+            .route("/img.jpg", get(|| async { vec![9u8, 8, 7] }));
+        let base = serve(app).await;
+        let c = AniListClient::new().with_base(&base);
+        let m = c.find_anime("One Piece").await.expect("ok").expect("match");
+        assert_eq!(m.anilist_id, 21);
+        assert_eq!(m.title, "One Piece");
+        assert_eq!(m.year, Some(1999));
+
+        let bytes = c
+            .download_image(&format!("{base}/img.jpg"))
+            .await
+            .expect("image");
+        assert_eq!(bytes, vec![9, 8, 7]);
+    }
+
+    #[tokio::test]
+    async fn not_found_is_none_and_error_status_propagates() {
+        use axum::http::StatusCode;
+        // AniList answers 404 when nothing matches.
+        let nf = serve(axum::Router::new().fallback(|| async { StatusCode::NOT_FOUND })).await;
+        let c = AniListClient::new().with_base(&nf);
+        assert!(c.find_anime("nothing").await.expect("ok").is_none());
+
+        // A 500 is a hard error.
+        let boom =
+            serve(axum::Router::new().fallback(|| async { StatusCode::INTERNAL_SERVER_ERROR }))
+                .await;
+        let c = AniListClient::new().with_base(&boom);
+        assert!(c.find_anime("x").await.is_err());
     }
 }

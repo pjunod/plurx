@@ -49,6 +49,11 @@ pub struct EpisodeMeta {
 pub struct TmdbClient {
     api_key: String,
     http: reqwest::Client,
+    /// API base (defaults to [`API_BASE`]); overridable for a self-hosted
+    /// proxy or a mock server in tests.
+    base: String,
+    /// Image CDN base (defaults to [`IMAGE_BASE`]).
+    image_base: String,
 }
 
 impl TmdbClient {
@@ -59,13 +64,23 @@ impl TmdbClient {
                 .user_agent(concat!("plurx/", env!("CARGO_PKG_VERSION")))
                 .build()
                 .unwrap_or_default(),
+            base: API_BASE.to_owned(),
+            image_base: IMAGE_BASE.to_owned(),
         }
+    }
+
+    /// Point the API and image bases elsewhere (self-hosted TMDB proxy, tests).
+    /// Trailing slashes are trimmed so `{base}{path}` composes cleanly.
+    pub fn with_base(mut self, base: impl Into<String>, image_base: impl Into<String>) -> Self {
+        self.base = base.into().trim_end_matches('/').to_owned();
+        self.image_base = image_base.into().trim_end_matches('/').to_owned();
+        self
     }
 
     async fn get(&self, path: &str, query: &[(&str, String)]) -> Result<Value, MetadataError> {
         let mut req = self
             .http
-            .get(format!("{API_BASE}{path}"))
+            .get(format!("{}{path}", self.base))
             .query(&[("api_key", self.api_key.as_str())]);
         for (k, v) in query {
             req = req.query(&[(*k, v.as_str())]);
@@ -151,7 +166,7 @@ impl TmdbClient {
         tmdb_path: &str,
         size: &str,
     ) -> Result<Vec<u8>, MetadataError> {
-        let url = image_url(tmdb_path, size);
+        let url = format!("{}/{size}{tmdb_path}", self.image_base);
         let resp = self
             .http
             .get(url)
@@ -340,5 +355,111 @@ mod tests {
         assert_eq!(e.episode_number, 3);
         assert_eq!(e.title.as_deref(), Some("In Perpetuity"));
         assert_eq!(e.runtime_ms, Some(48 * 60_000));
+    }
+
+    async fn serve(app: axum::Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn client_walks_search_details_season_and_images() {
+        use axum::routing::get;
+        use axum::Json;
+        let app = axum::Router::new()
+            .route(
+                "/search/movie",
+                get(|| async {
+                    Json(json!({ "results": [
+                        { "id": 603, "title": "The Matrix", "release_date": "1999-03-30",
+                          "overview": "A hacker learns the truth.",
+                          "poster_path": "/p.jpg", "backdrop_path": "/b.jpg" }
+                    ]}))
+                }),
+            )
+            .route(
+                "/movie/603",
+                get(|| async { Json(json!({ "runtime": 136, "imdb_id": "tt0133093" })) }),
+            )
+            .route(
+                "/search/tv",
+                get(|| async {
+                    Json(json!({ "results": [
+                        { "id": 42, "name": "Severance", "first_air_date": "2022-02-18",
+                          "poster_path": "/s.jpg" }
+                    ]}))
+                }),
+            )
+            .route(
+                "/tv/42/season/1",
+                get(|| async {
+                    Json(json!({
+                        "poster_path": "/sp.jpg", "overview": "Season one", "air_date": "2022-02-18",
+                        "episodes": [
+                            { "episode_number": 1, "name": "Good News", "runtime": 57,
+                              "air_date": "2022-02-18", "still_path": "/e1.jpg" }
+                        ]
+                    }))
+                }),
+            )
+            .route("/w500/p.jpg", get(|| async { vec![1u8, 2, 3, 4] }))
+            .route("/search/movie/empty", get(|| async { Json(json!({})) }));
+        let base = serve(app).await;
+        let c = TmdbClient::new("k").with_base(&base, &base);
+
+        let m = c
+            .find_movie("The Matrix", Some(1999))
+            .await
+            .expect("ok")
+            .expect("match");
+        assert_eq!(m.tmdb_id, 603);
+        assert_eq!(m.runtime_ms, Some(136 * 60_000));
+        assert_eq!(m.imdb_id.as_deref(), Some("tt0133093"));
+
+        let s = c
+            .find_show("Severance", None)
+            .await
+            .expect("ok")
+            .expect("m");
+        assert_eq!(s.tmdb_id, 42);
+        assert_eq!(s.title, "Severance");
+
+        let sd = c.season_detail(42, 1).await.expect("season");
+        assert_eq!(sd.episodes.len(), 1);
+        assert_eq!(sd.episodes[0].runtime_ms, Some(57 * 60_000));
+        assert_eq!(sd.overview.as_deref(), Some("Season one"));
+
+        let bytes = c.download_image("/p.jpg", "w500").await.expect("image");
+        assert_eq!(bytes, vec![1, 2, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn no_results_is_none_and_bad_status_errors() {
+        use axum::http::StatusCode;
+        use axum::Json;
+        // Empty results → Ok(None) for both movie and show.
+        let empty =
+            serve(axum::Router::new().fallback(|| async { Json(json!({ "results": [] })) })).await;
+        let c = TmdbClient::new("k").with_base(&empty, &empty);
+        assert!(c.find_movie("Nope", None).await.expect("ok").is_none());
+        assert!(c.find_show("Nope", None).await.expect("ok").is_none());
+
+        // Non-2xx surfaces as a Status error.
+        let bad = serve(
+            axum::Router::new().fallback(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "boom") }),
+        )
+        .await;
+        let c = TmdbClient::new("k").with_base(&bad, &bad);
+        assert!(matches!(
+            c.find_movie("x", None).await,
+            Err(crate::error::MetadataError::Status(500))
+        ));
+        assert!(c.download_image("/x.jpg", "w500").await.is_err());
     }
 }

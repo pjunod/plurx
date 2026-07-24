@@ -404,3 +404,195 @@ async fn cache_image(
     }
     Some(filename)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{ItemKind, LibraryKind, NewItem, NewLibrary};
+    use crate::store::{LibraryStore, MediaStore, SqliteStore};
+    use serde_json::json;
+
+    async fn serve(app: axum::Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    /// A TMDB mock covering the movie + show + season calls, with any image
+    /// path answered by a few bytes so the artwork cache exercises its writes.
+    fn tmdb_mock() -> axum::Router {
+        use axum::routing::get;
+        use axum::Json;
+        axum::Router::new()
+            .route(
+                "/search/movie",
+                get(|| async {
+                    Json(json!({ "results": [
+                        { "id": 603, "title": "The Matrix", "release_date": "1999-03-30",
+                          "overview": "Truth.", "poster_path": "/mp.jpg", "backdrop_path": "/mb.jpg" }
+                    ]}))
+                }),
+            )
+            .route(
+                "/movie/603",
+                get(|| async { Json(json!({ "runtime": 136, "imdb_id": "tt0133093" })) }),
+            )
+            .route(
+                "/search/tv",
+                get(|| async {
+                    Json(json!({ "results": [
+                        { "id": 42, "name": "Severance", "first_air_date": "2022-02-18",
+                          "poster_path": "/sp.jpg" }
+                    ]}))
+                }),
+            )
+            .route(
+                "/tv/42/season/1",
+                get(|| async {
+                    Json(json!({
+                        "poster_path": "/season.jpg", "overview": "S1", "air_date": "2022-02-18",
+                        "episodes": [
+                            { "episode_number": 1, "name": "Good News", "runtime": 57,
+                              "still_path": "/e1.jpg" }
+                        ]
+                    }))
+                }),
+            )
+            .fallback(get(|| async { vec![0u8, 1, 2, 3] }))
+    }
+
+    #[tokio::test]
+    async fn enrich_library_matches_movie_show_and_episode() {
+        let store = SqliteStore::open_in_memory().expect("open");
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "L".into(),
+                kind: LibraryKind::Movies,
+                paths: vec![],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+        let movie = store
+            .insert_item(&NewItem {
+                library_id: lib.id,
+                kind: ItemKind::Movie,
+                parent_id: None,
+                title: "matrix".into(),
+                year: Some(1999),
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("movie");
+        let show = store
+            .insert_item(&NewItem {
+                library_id: lib.id,
+                kind: ItemKind::Show,
+                parent_id: None,
+                title: "severance".into(),
+                year: None,
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("show");
+        let season = store
+            .insert_item(&NewItem {
+                library_id: lib.id,
+                kind: ItemKind::Season,
+                parent_id: Some(show),
+                title: "S1".into(),
+                year: None,
+                season_number: Some(1),
+                episode_number: None,
+            })
+            .await
+            .expect("season");
+        store
+            .insert_item(&NewItem {
+                library_id: lib.id,
+                kind: ItemKind::Episode,
+                parent_id: Some(season),
+                title: "e1".into(),
+                year: None,
+                season_number: Some(1),
+                episode_number: Some(1),
+            })
+            .await
+            .expect("ep");
+
+        let base = serve(tmdb_mock()).await;
+        let tmdb = TmdbClient::new("k").with_base(&base, &base);
+        let art = tempfile::tempdir().expect("tmp");
+
+        let report = enrich_library(&store, &tmdb, art.path(), Some(lib.id), false).await;
+        assert_eq!(report.matched, 2, "movie + show");
+        assert_eq!(report.episodes_matched, 1);
+        assert_eq!(report.errors, 0);
+
+        // The store actually took the patch.
+        let m = store.get_item(movie).await.expect("get").expect("item");
+        assert_eq!(m.tmdb_id, Some(603));
+        assert_eq!(m.title, "The Matrix");
+        assert!(m.poster_path.is_some());
+        let s = store.get_item(show).await.expect("get").expect("item");
+        assert_eq!(s.tmdb_id, Some(42));
+
+        // A second run has nothing left needing metadata.
+        let again = enrich_library(&store, &tmdb, art.path(), Some(lib.id), false).await;
+        assert_eq!(again.matched, 0);
+    }
+
+    #[tokio::test]
+    async fn enrich_anime_library_matches_shows() {
+        use axum::routing::post;
+        use axum::Json;
+        let store = SqliteStore::open_in_memory().expect("open");
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "Anime".into(),
+                kind: LibraryKind::Shows,
+                paths: vec![],
+                anime: true,
+            })
+            .await
+            .expect("lib");
+        let show = store
+            .insert_item(&NewItem {
+                library_id: lib.id,
+                kind: ItemKind::Show,
+                parent_id: None,
+                title: "frieren".into(),
+                year: None,
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("show");
+
+        // No cover/banner → artwork download is skipped, match still lands.
+        let app = axum::Router::new().route(
+            "/",
+            post(|| async {
+                Json(json!({ "data": { "Media": {
+                    "id": 154587, "title": { "english": "Frieren" }, "seasonYear": 2023
+                }}}))
+            }),
+        );
+        let base = serve(app).await;
+        let client = AniListClient::new().with_base(&base);
+        let art = tempfile::tempdir().expect("tmp");
+
+        let report = enrich_anime_library(&store, &client, art.path(), lib.id, false).await;
+        assert_eq!(report.matched, 1);
+        let s = store.get_item(show).await.expect("get").expect("item");
+        assert_eq!(s.title, "Frieren");
+        assert_eq!(s.year, Some(2023));
+    }
+}

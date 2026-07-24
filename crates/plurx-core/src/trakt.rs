@@ -811,6 +811,236 @@ mod tests {
         assert!(plan.set_progress.is_empty());
     }
 
+    // -- HTTP client, driven against a local mock server ---------------------
+
+    /// Bind an ephemeral server for `app` and return its base URL.
+    async fn serve(app: axum::Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    /// A server that answers every path with one fixed status + JSON body.
+    fn fixed(status: u16, body: Value) -> axum::Router {
+        use axum::http::StatusCode;
+        use axum::Json;
+        axum::Router::new().fallback(move || {
+            let body = body.clone();
+            async move { (StatusCode::from_u16(status).expect("status"), Json(body)) }
+        })
+    }
+
+    fn client(base: &str) -> TraktClient {
+        TraktClient::new("cid", "secret", base)
+    }
+
+    #[tokio::test]
+    async fn device_code_parses() {
+        let base = serve(fixed(
+            200,
+            json!({
+                "device_code": "dc", "user_code": "ABCD",
+                "verification_url": "https://trakt.tv/activate",
+                "expires_in": 600, "interval": 5
+            }),
+        ))
+        .await;
+        let dc = client(&base).device_code().await.expect("device code");
+        assert_eq!(dc.user_code, "ABCD");
+        assert_eq!(dc.interval, 5);
+    }
+
+    #[tokio::test]
+    async fn poll_device_maps_every_status() {
+        let token = json!({
+            "access_token": "a", "refresh_token": "r",
+            "expires_in": 7200, "created_at": 1000
+        });
+        let base = serve(fixed(200, token)).await;
+        assert!(matches!(
+            client(&base).poll_device("dc").await,
+            Ok(DevicePoll::Ready(_))
+        ));
+        for (status, want) in [
+            (400u16, "pending"),
+            (429, "slowdown"),
+            (418, "denied"),
+            (410, "expired"),
+            (404, "expired"),
+        ] {
+            let base = serve(fixed(status, json!({}))).await;
+            let got = client(&base).poll_device("dc").await.expect("poll");
+            let label = match got {
+                DevicePoll::Pending => "pending",
+                DevicePoll::SlowDown => "slowdown",
+                DevicePoll::Denied => "denied",
+                DevicePoll::Expired => "expired",
+                DevicePoll::Ready(_) => "ready",
+            };
+            assert_eq!(label, want, "status {status}");
+        }
+        // Any other status is a hard error.
+        let base = serve(fixed(500, json!({}))).await;
+        assert!(matches!(
+            client(&base).poll_device("dc").await,
+            Err(TraktError::Status(500))
+        ));
+    }
+
+    #[tokio::test]
+    async fn refresh_success_and_dead_token() {
+        let base = serve(fixed(
+            200,
+            json!({"access_token":"a2","refresh_token":"r2","expires_in":7200,"created_at":2000}),
+        ))
+        .await;
+        let tok = client(&base).refresh("old").await.expect("refresh");
+        assert_eq!(tok.access_token, "a2");
+        assert_eq!(tok.expires_at(), 2000 + 7200);
+        for status in [400u16, 401] {
+            let base = serve(fixed(status, json!({}))).await;
+            assert!(matches!(
+                client(&base).refresh("old").await,
+                Err(TraktError::AuthExpired)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn username_reads_pointer_or_falls_back() {
+        let base = serve(fixed(200, json!({ "user": { "username": "neo" } }))).await;
+        assert_eq!(client(&base).username("a").await.expect("name"), "neo");
+        // Missing field → sentinel, not an error.
+        let base = serve(fixed(200, json!({}))).await;
+        assert_eq!(
+            client(&base).username("a").await.expect("name"),
+            "(unknown)"
+        );
+        // 401/403 surfaces as an expired link.
+        let base = serve(fixed(403, json!({}))).await;
+        assert!(matches!(
+            client(&base).username("a").await,
+            Err(TraktError::AuthExpired)
+        ));
+    }
+
+    #[tokio::test]
+    async fn scrobble_tolerates_conflict_for_both_idents() {
+        let movie = Ident::Movie { tmdb: 5 };
+        let ep = Ident::Episode {
+            show_tmdb: 9,
+            season: 1,
+            episode: 3,
+        };
+        for action in [
+            ScrobbleAction::Start,
+            ScrobbleAction::Pause,
+            ScrobbleAction::Stop,
+        ] {
+            let base = serve(fixed(201, json!({ "action": "ok" }))).await;
+            client(&base)
+                .scrobble("a", action, movie, 12.5)
+                .await
+                .expect("scrobble movie");
+            client(&base)
+                .scrobble("a", action, ep, 120.0)
+                .await
+                .expect("scrobble episode clamps progress");
+        }
+        // 409 (already recorded) is not an error.
+        let base = serve(fixed(409, json!({}))).await;
+        client(&base)
+            .scrobble("a", ScrobbleAction::Stop, movie, 100.0)
+            .await
+            .expect("409 ok");
+    }
+
+    #[tokio::test]
+    async fn watched_parses_movies_and_shows() {
+        use axum::routing::get;
+        use axum::Json;
+        let app = axum::Router::new()
+            .route(
+                "/sync/watched/movies",
+                get(|| async {
+                    Json(json!([{
+                        "last_watched_at": "2026-01-02T03:04:05.000Z",
+                        "movie": { "ids": { "tmdb": 603 } }
+                    }]))
+                }),
+            )
+            .route(
+                "/sync/watched/shows",
+                get(|| async {
+                    Json(json!([{
+                        "show": { "ids": { "tmdb": 42 } },
+                        "seasons": [{ "number": 1, "episodes": [
+                            { "number": 2, "last_watched_at": "2026-01-02T00:00:00.000Z" }
+                        ]}]
+                    }]))
+                }),
+            );
+        let base = serve(app).await;
+        let map = client(&base).watched("a").await.expect("watched");
+        assert_eq!(
+            map.get(&Ident::Movie { tmdb: 603 }).copied(),
+            parse_iso8601("2026-01-02T03:04:05.000Z")
+        );
+        assert!(map.contains_key(&Ident::Episode {
+            show_tmdb: 42,
+            season: 1,
+            episode: 2
+        }));
+    }
+
+    #[tokio::test]
+    async fn playback_parses_movie_and_episode() {
+        let base = serve(fixed(
+            200,
+            json!([
+                { "type": "movie", "progress": 40.0, "paused_at": "2026-01-01T00:00:00.000Z",
+                  "movie": { "ids": { "tmdb": 7 } } },
+                { "type": "episode", "progress": 10.0, "paused_at": "2026-01-01T00:00:00.000Z",
+                  "show": { "ids": { "tmdb": 9 } }, "episode": { "season": 2, "number": 4 } },
+                { "type": "other" }
+            ]),
+        ))
+        .await;
+        let map = client(&base).playback("a").await.expect("playback");
+        assert_eq!(map.len(), 2);
+        assert_eq!(
+            map.get(&Ident::Movie { tmdb: 7 }).map(|(p, _)| *p),
+            Some(40.0)
+        );
+    }
+
+    #[tokio::test]
+    async fn last_activities_returns_json_string() {
+        let base = serve(fixed(200, json!({ "all": "2026" }))).await;
+        let s = client(&base).last_activities("a").await.expect("acts");
+        assert!(s.contains("2026"));
+    }
+
+    #[tokio::test]
+    async fn history_add_remove_and_empty_shortcut() {
+        let base = serve(fixed(201, json!({ "added": { "movies": 1 } }))).await;
+        let c = client(&base);
+        c.history_add("a", &[(Ident::Movie { tmdb: 1 }, 100)])
+            .await
+            .expect("add");
+        c.history_remove("a", &[Ident::Movie { tmdb: 1 }])
+            .await
+            .expect("remove");
+        // Empty inputs never touch the network (would 404 on this server).
+        c.history_add("a", &[]).await.expect("empty add");
+        c.history_remove("a", &[]).await.expect("empty remove");
+    }
+
     #[test]
     fn episode_history_groups_by_show_and_season() {
         let items = [

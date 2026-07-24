@@ -919,6 +919,7 @@ version = "0.0.1"
 dependencies = [
  "argon2",
  "async-trait",
+ "axum",
  "getrandom 0.2.17",
  "hex",
  "regex",
