@@ -176,4 +176,28 @@ mod tests {
             vec!["three", "four"]
         );
     }
+
+    #[test]
+    fn layer_captures_events_with_fields() {
+        use tracing_subscriber::prelude::*;
+        let buf = Arc::new(LogBuffer::new(10));
+        let subscriber = tracing_subscriber::registry().with(BufferLayer(Arc::clone(&buf)));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::error!(code = 42, "boom happened");
+            tracing::info!("just fyi");
+        });
+        let all = buf.tail("trace", 10);
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].level, "ERROR");
+        // Both the message and the structured field are captured.
+        assert!(
+            all[0].message.contains("boom happened"),
+            "{}",
+            all[0].message
+        );
+        assert!(all[0].message.contains("code=42"), "{}", all[0].message);
+        assert!(all[0].ts_ms >= 0);
+        // The default buffer is a large, empty ring.
+        assert!(LogBuffer::default().tail("trace", 1).is_empty());
+    }
 }

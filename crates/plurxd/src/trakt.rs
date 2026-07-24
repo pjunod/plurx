@@ -827,4 +827,115 @@ mod tests {
             .expect("some");
         assert!(auth.last_sync_at > 0);
     }
+
+    #[tokio::test]
+    async fn sync_pushes_a_local_only_watch() {
+        use std::sync::atomic::AtomicUsize;
+        let (store, user) = store_with_creds().await;
+        store
+            .put_trakt_auth(&linked_auth(user, now_unix() + 999_999))
+            .await
+            .expect("auth");
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "L".into(),
+                kind: LibraryKind::Movies,
+                paths: vec![],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+        let movie = store
+            .insert_item(&NewItem {
+                library_id: lib.id,
+                kind: ItemKind::Movie,
+                parent_id: None,
+                title: "Local".into(),
+                year: Some(2001),
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("movie");
+        store
+            .apply_metadata(
+                movie,
+                &MetadataPatch {
+                    tmdb_id: Some(604),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("meta");
+        // Watched locally, absent remotely → must be pushed to Trakt history.
+        store.set_watched(user, movie, true).await.expect("watch");
+
+        let history_hits = Arc::new(AtomicUsize::new(0));
+        let hits = Arc::clone(&history_hits);
+        use axum::routing::{get, post};
+        use axum::Json;
+        let app = axum::Router::new()
+            .route(
+                "/sync/last_activities",
+                get(|| async { Json(json!({ "episodes": "x" })) }),
+            )
+            .route("/sync/watched/movies", get(|| async { Json(json!([])) }))
+            .route("/sync/watched/shows", get(|| async { Json(json!([])) }))
+            .route("/sync/playback", get(|| async { Json(json!([])) }))
+            .route(
+                "/sync/history",
+                post(move || {
+                    let hits = Arc::clone(&hits);
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({ "added": { "movies": 1 } }))
+                    }
+                }),
+            );
+        let base = serve(app).await;
+        let mgr = TraktManager::new(Arc::clone(&store), base);
+        mgr.sync_user(user).await.expect("sync");
+        assert_eq!(
+            history_hits.load(Ordering::SeqCst),
+            1,
+            "history push happened"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_skips_when_nothing_changed() {
+        use std::sync::atomic::AtomicUsize;
+        let (store, user) = store_with_creds().await;
+        // Gate value the mock will echo back, and a prior successful sync.
+        let gate = json!({ "all": "same" }).to_string();
+        let mut auth = linked_auth(user, now_unix() + 999_999);
+        auth.last_sync_at = now_unix();
+        auth.last_activities = Some(gate);
+        store.put_trakt_auth(&auth).await.expect("auth");
+
+        let watched_hits = Arc::new(AtomicUsize::new(0));
+        let hits = Arc::clone(&watched_hits);
+        use axum::routing::get;
+        use axum::Json;
+        let app = axum::Router::new()
+            .route(
+                "/sync/last_activities",
+                get(|| async { Json(json!({ "all": "same" })) }),
+            )
+            .route(
+                "/sync/watched/movies",
+                get(move || {
+                    let hits = Arc::clone(&hits);
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        Json(json!([]))
+                    }
+                }),
+            );
+        let base = serve(app).await;
+        let mgr = TraktManager::new(Arc::clone(&store), base);
+        mgr.sync_user(user).await.expect("sync");
+        // The change gate short-circuits before any heavy pull.
+        assert_eq!(watched_hits.load(Ordering::SeqCst), 0, "pull was skipped");
+    }
 }
