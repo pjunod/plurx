@@ -200,22 +200,46 @@ pub async fn hubs(
     Query(q): Query<HubsQuery>,
 ) -> Result<Json<Hubs>, ApiError> {
     let in_progress = state.store.continue_watching(user.id, 20).await?;
-    let continue_watching = in_progress.into_iter().map(in_progress_dto).collect();
+    let mut continue_watching: Vec<ItemDto> =
+        in_progress.into_iter().map(in_progress_dto).collect();
 
     // Next-up episodes (unwatched tracks per show); no per-item watch state.
     let next = state.store.next_up(user.id, 20).await?;
-    let next_up = next.into_iter().map(|r| recent_dto(r, None)).collect();
+    let mut next_up: Vec<ItemDto> = next.into_iter().map(|r| recent_dto(r, None)).collect();
 
     let recent = state.store.recently_added(q.library_id, 20).await?;
     let recent_items: Vec<Item> = recent.iter().map(|r| r.item.clone()).collect();
     let watch = watch_lookup(&state, user.id, &recent_items).await?;
-    let recently_added = recent
+    let mut recently_added: Vec<ItemDto> = recent
         .into_iter()
         .map(|r| {
             let w = watch.get(&r.item.id).copied();
             recent_dto(r, w)
         })
         .collect();
+
+    // Resolution badges, same as the library grid gets. Home is where most
+    // people actually browse, so a movie card that carries a 4K chip in the
+    // library should carry it here too — one lookup covers all three rows.
+    let movie_ids: Vec<i64> = continue_watching
+        .iter()
+        .chain(next_up.iter())
+        .chain(recently_added.iter())
+        .filter(|d| d.kind == ItemKind::Movie)
+        .map(|d| d.id)
+        .collect();
+    if !movie_ids.is_empty() {
+        let heights = state.store.item_max_heights(&movie_ids).await?;
+        for d in continue_watching
+            .iter_mut()
+            .chain(next_up.iter_mut())
+            .chain(recently_added.iter_mut())
+        {
+            if d.kind == ItemKind::Movie {
+                d.resolution = heights.get(&d.id).copied();
+            }
+        }
+    }
 
     Ok(Json(Hubs {
         continue_watching,

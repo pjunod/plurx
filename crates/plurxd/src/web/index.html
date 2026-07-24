@@ -110,26 +110,31 @@
   /* Every caption line is one line, clipped: a long episode name wrapping to
      three lines is what used to make a rail look ragged. */
   .poster .t{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  .poster .s{font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  /* Subtitle row: year/episode on the left, resolution chip pinned right. Flex
+     rather than absolute positioning so a long subtitle ellipsises against the
+     chip instead of running under it, and the row keeps its height whether or
+     not the item has a resolution (cards stay the same height across a grid). */
+  .poster .s{font-size:12px;color:var(--muted);display:flex;align-items:center;gap:6px;min-height:17px}
+  .poster .s>.stxt{flex:1 1 auto;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .poster .cleft{font-size:11px;color:var(--muted);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .playinfo{color:var(--muted);font-size:13px;margin:10px 0 0}
   .epmeta .epleft{color:var(--accent)}
   .poster .prog{position:absolute;left:0;right:0;bottom:0;height:5px;background:rgba(0,0,0,.55)}
-  /* Resolution badge (movies): bottom-right of the artwork, where it sits over
-     the quiet part of most posters and away from the ✓ in the top corner. Each
-     tier gets its own colour ramp — cool violet at 4K down through blue and
-     green to amber for SD — so a grid reads at a glance without parsing text.
-     Colours are fixed rather than themed: the point is that 1080p is always the
-     same blue no matter which theme is on. */
+  /* Resolution badge (movies): sits in the info strip under the artwork, on the
+     subtitle line, so it never covers the poster art. Each tier gets its own
+     colour ramp — cool violet at 4K down through blue and green to amber for SD
+     — so a grid reads at a glance without parsing text. Colours are fixed
+     rather than themed: the point is that 1080p is always the same blue no
+     matter which theme is on. */
   .resgrad{background:linear-gradient(135deg,#64748b,#475569)}
   .resgrad.r4k{background:linear-gradient(135deg,#a855f7,#c026d3)}
   .resgrad.r1440{background:linear-gradient(135deg,#6366f1,#3b82f6)}
   .resgrad.r1080{background:linear-gradient(135deg,#0ea5e9,#06b6d4)}
   .resgrad.r720{background:linear-gradient(135deg,#14b8a6,#22c55e)}
   .resgrad.r480{background:linear-gradient(135deg,#f59e0b,#f97316)}
-  .poster .resbadge{position:absolute;right:6px;bottom:6px;color:#fff;
-    font-size:10.5px;font-weight:700;letter-spacing:.3px;line-height:1.35;padding:2px 7px;border-radius:999px;
-    box-shadow:0 1px 6px rgba(0,0,0,.55),inset 0 0 0 1px rgba(255,255,255,.22);text-shadow:0 1px 2px rgba(0,0,0,.35)}
+  .poster .resbadge{flex:0 0 auto;color:#fff;
+    font-size:9.5px;font-weight:700;letter-spacing:.3px;line-height:1.6;padding:0 6px;border-radius:999px;
+    box-shadow:inset 0 0 0 1px rgba(255,255,255,.18)}
   /* Section headers on the resolution-sorted grid wear the matching swatch. */
   .ressection{display:flex;align-items:center;gap:8px}
   .ressection .resdot{width:11px;height:11px;border-radius:50%;flex:0 0 auto;
@@ -240,6 +245,27 @@
      while a track is on; it opens the same menu as the top bar's button. */
   .picon.pcc{font:700 11px/1 ui-sans-serif,system-ui,sans-serif;border:1.5px solid currentColor;border-radius:4px;padding:2px 3px;text-shadow:none}
   .picon.on{color:var(--accent);opacity:1}
+  /* Info strip above the transport: what you're watching and what it's about —
+     for the moment you come back to a paused film and can't place the scene.
+     Rides the same auto-hide as the rest of the chrome, so it never sits over
+     the picture while you're actually watching. */
+  .pinfo{position:absolute;left:0;bottom:82px;z-index:4;padding:0 20px;max-width:min(760px,62vw);
+    color:#fff;pointer-events:none;transition:opacity .2s ease-out;text-shadow:0 1px 5px rgba(0,0,0,.85)}
+  .player.idle .pinfo{opacity:0}
+  .pinfo.off,.pinfo:empty{display:none}
+  .pinfo h3{margin:0 0 5px;font-size:21px;font-weight:650;letter-spacing:.01em;line-height:1.2}
+  .pinfo .pimeta{font-size:12.5px;opacity:.82;margin-bottom:6px}
+  .pinfo .pimeta i{font-style:normal;opacity:.45;padding:0 7px}
+  .pinfo p{margin:0;font-size:13.5px;line-height:1.5;opacity:.88;
+    display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+  @media(max-width:700px){ .pinfo{max-width:none;bottom:78px} .pinfo h3{font-size:17px} .pinfo p{-webkit-line-clamp:2} }
+  /* Recovery buttons inside the loading overlay: a diagnosed stall gets an
+     action, not just a verdict. */
+  .ploadAct{display:flex;gap:10px;flex-wrap:wrap;justify-content:center}
+  .ploadAct:empty{display:none}
+  .ploadAct button{background:rgba(255,255,255,.1);color:#fff;border:1px solid rgba(255,255,255,.24);border-radius:9px;
+    padding:9px 16px;font-size:13.5px;font-weight:600;cursor:pointer}
+  .ploadAct button:hover{background:var(--accent);border-color:var(--accent)}
   .ptime{color:#fff;font:12px/1 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;text-shadow:0 1px 4px rgba(0,0,0,.7);min-width:46px;text-align:center;flex:0 0 auto}
   .pseek{position:relative;flex:1 1 auto;height:16px;display:flex;align-items:center;cursor:pointer;touch-action:none}
   .pseek::before{content:"";position:absolute;left:0;right:0;height:5px;border-radius:3px;background:rgba(255,255,255,.26)}
@@ -259,6 +285,9 @@
   .statsov .sechd:first-child{margin-top:0}
   .pmenu{position:absolute;top:60px;right:20px;min-width:190px;max-width:300px;background:rgba(14,16,22,.97);border:1px solid rgba(255,255,255,.14);
     border-radius:10px;padding:6px;display:none;z-index:6;box-shadow:0 10px 30px rgba(0,0,0,.5)}
+  /* Opened from the transport rather than the top bar: sit above the button
+     that opened it instead of flying to the far corner of the screen. */
+  .pmenu.low{top:auto;bottom:76px}
   .pmenu.on{display:block}
   .pmenu button{display:block;width:100%;text-align:left;background:transparent;color:#e8e8ea;border:0;padding:8px 10px;border-radius:7px;font-size:13px;font-weight:400;cursor:pointer}
   .pmenu button:hover{background:rgba(255,255,255,.08)}
@@ -581,6 +610,14 @@ function applyTheme(){
   if(fav) fav.href=FAVICONS[id]||FAVICONS.default;
 }
 applyTheme();
+// Poster/icon size for the browse grids (per browser). Applied as a CSS var so
+// every `.grid` reflows live — no re-render. Defined here, in the <head>, so the
+// size is on the root element before first paint: a definition in the body
+// script would not exist yet when this line runs, and the ReferenceError would
+// take the rest of this script (title, theme-follows-system) down with it.
+const POSTER_SIZES=[["s","Small","120px"],["m","Medium","150px"],["l","Large","186px"],["xl","Extra large","226px"]];
+function posterSize(){ let v="s"; try{ v=localStorage.getItem("plurx_iconsize")||"s"; }catch(e){} return POSTER_SIZES.some(s=>s[0]===v)?v:"s"; }
+function applyPosterSize(){ const s=POSTER_SIZES.find(x=>x[0]===posterSize()); document.documentElement.style.setProperty("--poster", s?s[2]:"150px"); }
 applyPosterSize();
 try{ document.title=APP_NAME; }catch(e){}
 if(window.matchMedia){ try{ window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change",()=>{ if((localStorage.getItem("plurx_appearance")||"auto")==="auto") applyTheme(); }); }catch(e){} }
@@ -588,7 +625,7 @@ if(window.matchMedia){ try{ window.matchMedia("(prefers-color-scheme: dark)").ad
 </head>
 <body>
 <div id="app"></div>
-<div class="modal" id="modal"><div class="player" id="player"><video id="video" autoplay playsinline x-webkit-airplay="allow"></video><div class="pbar" id="pbar"><div class="ptitle" id="playTitle"></div><div class="row"><button class="pbtn" id="audiobtn" style="display:none" onclick="toggleMenu('audio')">🔊 Audio</button><button class="pbtn" id="subsbtn" style="display:none" onclick="toggleMenu('subs')">💬 Subtitles</button><button class="pbtn" id="qualbtn" title="Playback quality" onclick="toggleMenu('quality')">◆ Quality</button><button class="pbtn" id="syncbtn" title="Audio sync adjustment" onclick="toggleMenu('sync')">⇄ Sync</button><button class="pbtn" id="statsbtn" title="Playback info (i)" onclick="toggleStats()">ⓘ Stats</button><button class="pbtn" id="skipbtn" title="Auto-skip intro & credits" onclick="togglePlayerAutoskip()">⏭ Auto-skip</button><button class="pbtn" id="autonextbtn" title="Auto-play the next episode when one finishes" onclick="togglePlayerAutonext()">▶ Autoplay</button><button class="pbtn" id="apbtn" style="display:none" title="AirPlay">📺 AirPlay</button><button class="pbtn" title="Close (Esc)" onclick="closePlayer()">✕ Close</button></div></div><div class="ptransport" id="ptransport"><button class="picon" id="pbplay" aria-label="Play" title="Play / Pause (space)" onclick="togglePlay()">▶</button><button class="picon nudge" aria-label="Back 10 seconds" title="Back 10s (←)" onclick="nudge(-10)">↺</button><button class="picon nudge" aria-label="Forward 10 seconds" title="Forward 10s (→)" onclick="nudge(10)">↻</button><span class="ptime" id="ptcur" aria-hidden="true">0:00</span><div class="pseek" id="pseek" role="slider" tabindex="0" aria-label="Seek" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-valuetext="0:00"><div class="pseek-buf" id="pseekbuf" aria-hidden="true"></div><div class="pseek-fill" id="pseekfill" aria-hidden="true"></div><div class="pseek-thumb" id="pseekthumb" aria-hidden="true"></div></div><span class="ptime" id="ptdur" aria-hidden="true">0:00</span><button class="picon pcc" id="pbsubs" aria-label="Subtitles" title="Subtitles (c)" style="display:none" onclick="toggleMenu('subs')">CC</button><button class="picon" id="pbpip" aria-label="Picture in picture" title="Picture-in-picture" style="display:none" onclick="togglePip()">◲</button><button class="picon" id="pbfs" aria-label="Fullscreen" title="Fullscreen (f)" onclick="toggleFullscreen()">⛶</button></div><div class="pskip" id="pskip"></div><div class="ploading" id="ploading"><div class="pspin"></div><div class="ploadText" id="ploadText">Loading…</div><div class="ploadSub" id="ploadSub"></div></div><div class="statsov" id="statsov"></div><div class="pmenu" id="pmenu"></div></div></div>
+<div class="modal" id="modal"><div class="player" id="player"><video id="video" autoplay playsinline x-webkit-airplay="allow"></video><div class="pbar" id="pbar"><div class="ptitle" id="playTitle"></div><div class="row"><button class="pbtn" id="audiobtn" style="display:none" onclick="toggleMenu('audio')">🔊 Audio</button><button class="pbtn" id="subsbtn" style="display:none" onclick="toggleMenu('subs')">💬 Subtitles</button><button class="pbtn" id="qualbtn" title="Playback quality" onclick="toggleMenu('quality')">◆ Quality</button><button class="pbtn" id="syncbtn" title="Audio sync adjustment" onclick="toggleMenu('sync')">⇄ Sync</button><button class="pbtn" id="statsbtn" title="Playback info (i)" onclick="toggleStats()">ⓘ Stats</button><button class="pbtn" id="skipbtn" title="Auto-skip intro & credits" onclick="togglePlayerAutoskip()">⏭ Auto-skip</button><button class="pbtn" id="autonextbtn" title="Auto-play the next episode when one finishes" onclick="togglePlayerAutonext()">▶ Autoplay</button><button class="pbtn" id="apbtn" style="display:none" title="AirPlay">📺 AirPlay</button><button class="pbtn" title="Close (Esc)" onclick="closePlayer()">✕ Close</button></div></div><div class="ptransport" id="ptransport"><button class="picon" id="pbplay" aria-label="Play" title="Play / Pause (space)" onclick="togglePlay()">▶</button><button class="picon nudge" aria-label="Back 10 seconds" title="Back 10s (←)" onclick="nudge(-10)">↺</button><button class="picon nudge" aria-label="Forward 10 seconds" title="Forward 10s (→)" onclick="nudge(10)">↻</button><span class="ptime" id="ptcur" aria-hidden="true">0:00</span><div class="pseek" id="pseek" role="slider" tabindex="0" aria-label="Seek" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-valuetext="0:00"><div class="pseek-buf" id="pseekbuf" aria-hidden="true"></div><div class="pseek-fill" id="pseekfill" aria-hidden="true"></div><div class="pseek-thumb" id="pseekthumb" aria-hidden="true"></div></div><span class="ptime" id="ptdur" aria-hidden="true">0:00</span><button class="picon paud" id="pbaudio" aria-label="Audio track" title="Audio track (a)" style="display:none" onclick="toggleMenu('audio',1)">🔊</button><button class="picon pcc" id="pbsubs" aria-label="Subtitles" title="Subtitles (c)" style="display:none" onclick="toggleMenu('subs',1)">CC</button><button class="picon" id="pbinfo" aria-label="Title info" title="Show title, synopsis & release info" onclick="togglePlayerInfo()">ⓘ</button><button class="picon" id="pbpip" aria-label="Picture in picture" title="Picture-in-picture" style="display:none" onclick="togglePip()">◲</button><button class="picon" id="pbfs" aria-label="Fullscreen" title="Fullscreen (f)" onclick="toggleFullscreen()">⛶</button></div><div class="pinfo" id="pinfo"></div><div class="pskip" id="pskip"></div><div class="ploading" id="ploading"><div class="pspin"></div><div class="ploadText" id="ploadText">Loading…</div><div class="ploadSub" id="ploadSub"></div><div class="ploadAct" id="ploadAct"></div></div><div class="statsov" id="statsov"></div><div class="pmenu" id="pmenu"></div></div></div>
 <div class="toast" id="toast"></div>
 
 <script src="/assets/hls.min.js"></script>
@@ -766,12 +803,9 @@ function toggleAppearanceMenu(e){ if(e) e.stopPropagation(); closeMenus("appmenu
   const open=!m.classList.contains("on"); m.classList.toggle("on",open); if(open) m.innerHTML=appMenuHtml(); }
 function setTheme(id){ try{localStorage.setItem("plurx_theme",id)}catch(e){} applyTheme(); const m=document.getElementById("thememenu"); if(m) m.innerHTML=themeMenuHtml(); }
 function setAppearance(v){ try{localStorage.setItem("plurx_appearance",v)}catch(e){} applyTheme(); const m=document.getElementById("appmenu"); if(m) m.innerHTML=appMenuHtml(); }
-// Poster/icon size for the browse grids (per browser). 150px is the middle
-// default the layout shipped with; the selector just adds smaller & larger
-// steps. Applied as a CSS var so every `.grid` reflows live — no re-render.
-const POSTER_SIZES=[["s","Small","120px"],["m","Medium","150px"],["l","Large","186px"],["xl","Extra large","226px"]];
-function posterSize(){ let v="s"; try{ v=localStorage.getItem("plurx_iconsize")||"s"; }catch(e){} return POSTER_SIZES.some(s=>s[0]===v)?v:"s"; }
-function applyPosterSize(){ const s=POSTER_SIZES.find(x=>x[0]===posterSize()); document.documentElement.style.setProperty("--poster", s?s[2]:"150px"); }
+// POSTER_SIZES / posterSize / applyPosterSize live in the <head> script — the
+// size has to be on the root element before first paint, and a definition down
+// here would not exist yet when that script runs.
 function sizeMenuHtml(){ const v=posterSize(); return `<div class="amsec">Icon size</div>`+POSTER_SIZES.map(s=>`<button class="${v===s[0]?'sel':''}" onclick="setIconSize('${s[0]}')">${s[1]}</button>`).join(""); }
 function toggleSizeMenu(e){ if(e) e.stopPropagation(); closeMenus("sizemenu"); const m=document.getElementById("sizemenu"); if(!m) return;
   const open=!m.classList.contains("on"); m.classList.toggle("on",open); if(open) m.innerHTML=sizeMenuHtml(); }
@@ -874,7 +908,7 @@ function card(it, watchCtx){
   const watched = it.watch&&it.watch.watched? `<span class="badge">✓</span>`:"";
   const prog = pct>0&&pct<100? `<div class="prog"><i style="width:${pct}%"></i></div>`:"";
   return `<div class="poster" onclick="location.hash='#/item/${it.id}'">
-    <div class="artbox">${img}${resb}${watched}</div><div class="meta"><div class="t">${esc(main)}</div><div class="s">${sub}</div>${watchLine(it,watchCtx)}</div>${prog}</div>`;
+    <div class="artbox">${img}${watched}</div><div class="meta"><div class="t">${esc(main)}</div><div class="s"><span class="stxt">${sub}</span>${resb}</div>${watchLine(it,watchCtx)}</div>${prog}</div>`;
 }
 function grid(items){ return items.length? `<div class="grid">${items.map(i=>card(i)).join("")}</div>` : `<div class="empty">Nothing here yet.</div>`; }
 
@@ -921,10 +955,11 @@ function installBannerHtml(){
       <button class="ghost sm" onclick="dismissInstall()">Dismiss</button></div>`;
 }
 
-// Home library grouping: "share" (one section per library, the default) or
-// "category" (Movies / TV Shows, merging shares of the same kind). Persisted
-// in localStorage like the other viewing prefs.
-function homeGroup(){ try{ return localStorage.getItem("plurx_home_group")||"share"; }catch(e){ return "share"; } }
+// Home library grouping: "category" (Movies / TV Shows, merging shares of the
+// same kind — the default, since what you want to watch is a kind of thing, not
+// a share name) or "share" (one section per library). Persisted in localStorage
+// like the other viewing prefs.
+function homeGroup(){ try{ return localStorage.getItem("plurx_home_group")||"category"; }catch(e){ return "category"; } }
 function setHomeGroup(v){ try{ localStorage.setItem("plurx_home_group",v); }catch(e){} viewHome(); }
 function libCategory(lib){
   if(lib.kind==="movie") return {key:"movie", name:"Movies"};
@@ -936,7 +971,7 @@ function catOrder(key){ return key==="movie"?0:key==="show"?1:2; }
 function groupToggleHtml(group){
   return `<div class="libbar" style="margin-top:22px"><div class="row">
     <span class="lbl">Group by</span>
-    <select onchange="setHomeGroup(this.value)">${libOpt("share","Share name",group)}${libOpt("category","Category",group)}</select>
+    <select onchange="setHomeGroup(this.value)">${libOpt("category","Category",group)}${libOpt("share","Share name",group)}</select>
   </div></div>`;
 }
 async function viewHome(){
@@ -1193,13 +1228,16 @@ async function viewItem(id){
   let body="";
   if(d.files.length){
     // Movie / episode: play the best *available* version + labeled specs.
+    // The player's info panel is fed from here — the detail response is the only
+    // place that carries the synopsis and the show/season ancestry together.
+    const pmeta=playerMeta(it, d.ancestors);
     const resume=it.watch&&it.watch.position_ms>3000&&!it.watch.watched?it.watch.position_ms:0;
     const watchBtn=`<button class="ghost sm" onclick="toggleWatched(${it.id}, ${it.watch&&it.watch.watched?1:0})">${it.watch&&it.watch.watched?'Mark unwatched':'Mark watched'}</button>`;
     const playable=d.files.find(f=>f.available);
     if(playable){
       body+=`<div class="actions">
-        <button class="btnplay" onclick='play(${playable.id},${esc(JSON.stringify(it.title))},${resume},${playable.duration_ms||0})'>▶ ${resume?`Resume · ${fmtDur(resume)}`:'Play'}</button>
-        ${resume?`<button class="ghost" onclick='play(${playable.id},${esc(JSON.stringify(it.title))},0,${playable.duration_ms||0})'>Start over</button>`:''}
+        <button class="btnplay" onclick='play(${playable.id},${esc(JSON.stringify(it.title))},${resume},${playable.duration_ms||0},${esc(JSON.stringify(pmeta))})'>▶ ${resume?`Resume · ${fmtDur(resume)}`:'Play'}</button>
+        ${resume?`<button class="ghost" onclick='play(${playable.id},${esc(JSON.stringify(it.title))},0,${playable.duration_ms||0},${esc(JSON.stringify(pmeta))})'>Start over</button>`:''}
         ${watchBtn}</div>`;
       const pdur=playable.duration_ms||runtime||0, prem=resume?Math.max(0,pdur-resume):pdur, pend=endsAt(prem);
       if(prem) body+=`<div class="playinfo">${resume?fmtDur(prem)+" left":fmtDur(prem)}${pend?" · ends ~"+pend:""}</div>`;
@@ -1213,7 +1251,7 @@ async function viewItem(id){
       // to tell apart, or when a file is missing. A single version is already
       // badged in the hero, so its block is just the spec detail.
       const header=(multi||miss)
-        ? `<div class="vh"><span class="vbadges">${specBadges(v)||`<span class="vt">${esc(v.filename)}</span>`}${miss?'<span class="missbadge">missing</span>':''}</span>${(!miss&&multi)?`<button class="ghost sm" onclick='play(${v.id},${esc(JSON.stringify(it.title))},${resume},${v.duration_ms||0})'>▶ Play</button>`:''}</div>`
+        ? `<div class="vh"><span class="vbadges">${specBadges(v)||`<span class="vt">${esc(v.filename)}</span>`}${miss?'<span class="missbadge">missing</span>':''}</span>${(!miss&&multi)?`<button class="ghost sm" onclick='play(${v.id},${esc(JSON.stringify(it.title))},${resume},${v.duration_ms||0},${esc(JSON.stringify(pmeta))})'>▶ Play</button>`:''}</div>`
         : '';
       return `<div class="version">${header}${specBlock(v)}${miss&&ME.is_admin&&v.missing_path?`<div class="problem">${esc(v.missing_path)}</div>`:''}</div>`;
     }).join("");
@@ -1241,7 +1279,8 @@ async function viewItem(id){
   if(AUTOPLAY===Number(id)){
     AUTOPLAY=null;
     const pf=d.files.find(f=>f.available);
-    if(pf){ const r=it.watch&&it.watch.position_ms>3000&&!it.watch.watched?it.watch.position_ms:0; play(pf.id, it.title, r, pf.duration_ms||0); }
+    if(pf){ const r=it.watch&&it.watch.position_ms>3000&&!it.watch.watched?it.watch.position_ms:0;
+      play(pf.id, it.title, r, pf.duration_ms||0, playerMeta(it, d.ancestors)); }
   }
 }
 
@@ -1340,7 +1379,7 @@ function qualityForce(){ const q=playQuality(); return q==="auto"?"auto":(q==="o
 function transcodeHeight(){ const q=playQuality(); return (q==="1080"||q==="720"||q==="480")?parseInt(q,10):720; }
 function qualityLabel(){ const q=playQuality(); const f=QUALITIES.find(x=>x[0]===q); return f?f[1]:"Auto"; }
 
-async function play(fileId, title, resumeMs, knownDurMs){
+async function play(fileId, title, resumeMs, knownDurMs, meta){
   const modal=document.getElementById("modal"), video=document.getElementById("video");
   wirePlayer();
   document.getElementById("playTitle").textContent=title;
@@ -1358,11 +1397,12 @@ async function play(fileId, title, resumeMs, knownDurMs){
     markers:(decision.markers||[]).map(m=>({...m})), source:src, started:false,
     idleTimer:null, autoskip:autoskipOn(), stallTimer:null, probeUrl:null, triedFallback:false,
     aoffset:decision.audio_offset_ms||0, declared:decision.declared_offset_ms||0,
-    reasons:(decision.reasons||[]), title,
+    reasons:(decision.reasons||[]), title, meta:meta||null,
     transcodeAudio:!!decision.transcode_audio, copyHls:false, };
   if(PLAYER.curAudio<0) PLAYER.curAudio=0;
   setupAirplay(video);
   setupTrackMenus();
+  renderPlayerInfo();
   renderSkip(null);
   const sb=document.getElementById("skipbtn"); if(sb) sb.classList.toggle("on", PLAYER.autoskip);
   const ab=document.getElementById("autonextbtn"); if(ab) ab.classList.toggle("on", autoNextOn());
@@ -1378,7 +1418,7 @@ async function play(fileId, title, resumeMs, knownDurMs){
     PLAYER.offset = info.start_seconds||0;
     PLAYER.encoder = info.encoder||null;
     setLoading(true,"Preparing the stream…",(PLAYER.encoder?("encoder: "+PLAYER.encoder+" — "):"")+"buffering the first segments");
-    PLAYER.probeUrl=info.playlist_url; armStall();
+    PLAYER.probeUrl=info.playlist_url; armStall(PLAYER.offset);
     attachHls(video, info.playlist_url);
   } else if(decision.method!=='direct_play' && useNativeHls(video)){
     // Safari can't play a progressive fragmented-MP4 remux, but it plays the
@@ -1397,7 +1437,7 @@ async function play(fileId, title, resumeMs, knownDurMs){
     // Remux carries the same caps so the server copies the audio when the
     // browser can play it (Safari + AC-3) instead of re-encoding to AAC.
     if(isRemux){ url+="&"+CAPS_Q; PLAYER.offset=startSec; if(startSec>0) url+="&start="+startSec.toFixed(1); }
-    if(isRemux){ PLAYER.probeUrl=decision.play_url; armStall(); }
+    if(isRemux){ PLAYER.probeUrl=decision.play_url; armStall(startSec); }
     video.src=url;
     video.onloadedmetadata=()=>{ if(!isRemux && startSec>0){ try{video.currentTime=startSec}catch(e){} } };
     video.play().catch(()=>{});
@@ -1453,14 +1493,34 @@ async function startTranscodeFallback(){
   let info; try{ info=await api(`/files/${me.fileId}/hls/start?height=${transcodeHeight()}&start=${startSec.toFixed(1)}`);}catch(e){ if(PLAYER===me){ setLoading(false); toast(e.message); } return; }
   if(PLAYER!==me) return;   // the user closed the player / started something else
   me.method='transcode'; me.copyHls=false; me.offset=info.start_seconds||0; me.encoder=info.encoder||null;
-  me.probeUrl=info.playlist_url; armStall();
+  me.probeUrl=info.playlist_url; armStall(me.offset);
   setLoading(true,"Preparing the stream…",(me.encoder?("encoder: "+me.encoder+" — "):"")+"transcoding instead of remuxing");
   attachHls(v, info.playlist_url);
 }
-function armStall(){ clearStall(); if(!PLAYER) return; PLAYER.stallTimer=setTimeout(()=>stallDiagnose().catch(()=>{}), 40000); }
+// Arm the watchdog for a stream we have just (re)started at `fromSec`. Recording
+// the intended position is what makes this work after a *seek*: the old check
+// ("has currentTime moved off zero?") is always true on a seeked stream, so a
+// seek that never resumed silently disarmed its own watchdog and the overlay sat
+// on "Buffering…" forever. A seek gets a shorter grace than a cold start: the
+// file is already open on the server, so 20s of nothing is already wrong.
+function armStall(fromSec, graceMs){
+  clearStall(); if(!PLAYER) return;
+  PLAYER.stallFrom=(fromSec!=null)?fromSec:pbPosSec();
+  PLAYER.stallTimer=setTimeout(()=>stallDiagnose().catch(()=>{}), graceMs||40000);
+}
+// Recovery offered by a diagnosed stall: restart the stream at the position we
+// were trying to reach, rather than making the user close and re-open the item.
+function retryPlayback(){
+  if(!PLAYER) return;
+  const t=(PLAYER.stallFrom!=null)?PLAYER.stallFrom:pbPosSec();
+  setLoading(true,"Retrying…","");
+  seekTo(t);
+}
 async function stallDiagnose(){
   const v=document.getElementById("video");
-  if(!PLAYER || PLAYER.started || (v&&v.currentTime>0.2)) return;   // it actually started — never mind
+  if(!PLAYER || PLAYER.started) return;
+  const from=(PLAYER.stallFrom!=null)?PLAYER.stallFrom:0;
+  if(pbPosSec()>from+0.35) return;   // it actually started moving — never mind
   const hdrs={}; if(TOKEN) hdrs["authorization"]="Bearer "+TOKEN;
   const url=PLAYER.probeUrl;
   let verdict="Playback hasn't started.", detail="Open Settings → Logs and read the last plurxd::stream / transcode line.";
@@ -1491,21 +1551,28 @@ async function stallDiagnose(){
   console.warn("[cinemarr] playback stall diagnosis",{method:PLAYER.method,url,networkState:v&&v.networkState,readyState:v&&v.readyState,error:v&&v.error&&v.error.code,verdict});
   if(PLAYER.started) return;   // raced with a late start
   clientLog({level:"warn",event:"stall",src:(url||"").split("?")[0],message:verdict,detail:detail});
-  setLoading(true, verdict, detail);
+  setLoading(true, verdict, detail,
+    `<button onclick="retryPlayback()">Try again</button>`+
+    (PLAYER.method!=='transcode'?`<button onclick="startTranscodeFallback()">Force transcode</button>`:``)+
+    `<button onclick="closePlayer()">Close</button>`);
   toast(verdict);
 }
 
 // ---- loading status, projection chrome, skip intro/credits ----------------
 // A staged loading overlay replaces the old mystery gray screen: the user sees
 // "reading media → starting transcoder → buffering" instead of a blank spinner.
-function setLoading(on,text,sub){
+function setLoading(on,text,sub,actionHtml){
   const l=document.getElementById("ploading"); if(!l) return;
+  const a=document.getElementById("ploadAct");
   if(on){
     const t=document.getElementById("ploadText"), s=document.getElementById("ploadSub");
     if(t&&text!=null) t.textContent=text;
     if(s) s.textContent=sub||"";
+    // Actions are opt-in per call: an ordinary "Seeking…" must clear whatever
+    // recovery buttons a previous stall left behind.
+    if(a) a.innerHTML=actionHtml||"";
     l.classList.add("on");
-  } else l.classList.remove("on");
+  } else { l.classList.remove("on"); if(a) a.innerHTML=""; }
 }
 // Reveal the title bar / cursor on activity; hide them after a quiet spell
 // while the video is actually playing (projection feel).
@@ -1522,19 +1589,74 @@ function playerActivity(){
     if(v&&!v.paused&&!v.ended) p.classList.add("idle");
   },2600);
 }
+// ---- title info panel -----------------------------------------------------
+// What you're watching, sat above the transport: title (series + SxEyy for an
+// episode), release year or air date, runtime, and the synopsis. It rides the
+// same auto-hide as the rest of the chrome, so it's there when you reach for the
+// controls and gone while you're actually watching. Toggle with the ⓘ button;
+// the choice sticks per browser.
+function playerInfoOn(){ try{ return localStorage.getItem("plurx_playerinfo")!=="0"; }catch(e){ return true; } }
+function togglePlayerInfo(){
+  const on=!playerInfoOn();
+  try{ localStorage.setItem("plurx_playerinfo", on?"1":"0"); }catch(e){}
+  renderPlayerInfo(); playerActivity();
+  toast(on?"Title info shown":"Title info hidden");
+}
+function renderPlayerInfo(){
+  const c=document.getElementById("pinfo"); if(!c) return;
+  const b=document.getElementById("pbinfo"); if(b) b.classList.toggle("on", playerInfoOn());
+  const m=(PLAYER&&PLAYER.meta)||null;
+  if(!m || !playerInfoOn()){ c.innerHTML=""; return; }
+  // An episode reads "Show · S02E05 · Episode title"; a movie is just its title.
+  const se=(m.season!=null&&m.episode!=null)
+    ? `S${String(m.season).padStart(2,"0")}E${String(m.episode).padStart(2,"0")}` : "";
+  const head=[m.show?esc(m.show):"", se, esc(m.title||"")].filter(Boolean);
+  const bits=[];
+  // Episodes are placed by air date; a movie by its release year.
+  if(m.air_date) bits.push(esc(fmtDate(m.air_date)));
+  else if(m.year) bits.push(String(m.year));
+  if(m.runtime_ms) bits.push(fmtDur(m.runtime_ms));
+  c.innerHTML=`<h3>${head.join(' <i>·</i> ')}</h3>`
+    +(bits.length?`<div class="pimeta">${bits.join(' <i>·</i> ')}</div>`:``)
+    +(m.overview?`<p>${esc(m.overview)}</p>`:``);
+}
+// Build the panel's payload from an item (plus its ancestors, so an episode can
+// name its show). Kept next to the renderer so the two stay in step.
+function playerMeta(it, ancestors){
+  if(!it) return null;
+  const show=(ancestors||[]).find(a=>a.kind==='show');
+  return { title:it.title||"", overview:it.overview||"", year:it.year||null,
+    air_date:it.air_date||null, runtime_ms:it.runtime_ms||0, kind:it.kind||"",
+    show:(it.kind==='episode'&&show)?show.title:(it.show_title||null),
+    season:(it.season_number!=null)?it.season_number:null,
+    episode:(it.episode_number!=null)?it.episode_number:null };
+}
 // ---- custom transport (scrubber + times) ----------------------------------
 // Total from the known duration (PLAYER.durMs), position from offset+currentTime
 // — the values the native <video> bar gets wrong on a growing remux / offset HLS
 // stream. Seeking routes through the method-aware seekTo().
 function pbTotalSec(){ const v=document.getElementById("video");
   if(PLAYER&&PLAYER.durMs) return PLAYER.durMs/1000;
+  if(PLAYER&&PLAYER.knownDur) return PLAYER.knownDur/1000;
+  // A remux/transcode stream's `duration` is only what has arrived so far — it
+  // grows as ffmpeg writes. Scaling the scrubber by it would put the thumb near
+  // the end at all times and map a drag to a target that moves under the finger
+  // (dragging "forward" would seek backwards). With no trustworthy total, report
+  // none: pbTick draws an indeterminate bar and seekTo refuses fraction seeks.
+  if(PLAYER&&PLAYER.method&&PLAYER.method!=='direct_play') return 0;
   return (v&&isFinite(v.duration)&&v.duration>0)?((PLAYER&&PLAYER.offset)||0)+v.duration:0; }
 function pbPosSec(){ const v=document.getElementById("video"); return ((PLAYER&&PLAYER.offset)||0)+((v&&v.currentTime)||0); }
+// Same number, clamped to the runtime, for anything the viewer reads. A remux
+// seek to N starts ffmpeg at the keyframe *at or before* N while we count from
+// N, so the sum drifts a second or two long and the clock ends up reading past
+// the end of the film. Clamp the display; leave pbPosSec itself honest, since
+// resume points and seeks want the raw figure.
+function pbShownSec(){ const p=pbPosSec(), t=pbTotalSec(); return t>0?Math.min(p,t):p; }
 function pbTick(){
   if(!PLAYER) return;
   const v=document.getElementById("video");
   const tot=pbTotalSec();
-  const pos=PLAYER._seekPreview!=null?PLAYER._seekPreview:pbPosSec();
+  const pos=PLAYER._seekPreview!=null?PLAYER._seekPreview:pbShownSec();
   const f=tot>0?Math.min(1,Math.max(0,pos/tot)):0;
   const fill=document.getElementById("pseekfill"), thumb=document.getElementById("pseekthumb"), buf=document.getElementById("pseekbuf");
   if(fill) fill.style.width=(f*100)+"%";
@@ -1583,7 +1705,10 @@ function pbWireSeek(){
   seek.addEventListener("pointerdown",e=>{ drag=true; try{seek.setPointerCapture(e.pointerId);}catch(_){}
     PLAYER._seekPreview=frac(e)*pbTotalSec(); pbTick(); playerActivity(); e.preventDefault(); });
   seek.addEventListener("pointermove",e=>{ if(!drag)return; PLAYER._seekPreview=frac(e)*pbTotalSec(); pbTick(); playerActivity(); });
-  const done=e=>{ if(!drag)return; drag=false; const t=frac(e)*pbTotalSec(); PLAYER._seekPreview=null; seekTo(t); };
+  // With no trustworthy total (see pbTotalSec) a fraction means nothing — drop
+  // the drag rather than seeking to a number we made up.
+  const done=e=>{ if(!drag)return; drag=false; const tot=pbTotalSec(); const t=frac(e)*tot;
+    PLAYER._seekPreview=null; if(tot>0) seekTo(t); else pbTick(); };
   seek.addEventListener("pointerup",done);
   seek.addEventListener("pointercancel",()=>{ if(!drag)return; drag=false; const t=PLAYER._seekPreview; PLAYER._seekPreview=null; if(t!=null) seekTo(t); else pbTick(); });
   // Keyboard on the focused slider: Home/End jump to start/end (arrows ±10s are
@@ -1601,12 +1726,20 @@ function wirePlayer(){
   ["mousemove","pointerdown","touchstart","keydown"].forEach(ev=>p.addEventListener(ev,playerActivity));
   v.addEventListener("playing",()=>{ PLAYER.started=true; clearStall(); setLoading(false); playerActivity(); pbTick(); pbSyncPlayIcon(); });
   v.addEventListener("canplay",()=>{ if(PLAYER.started) setLoading(false); });
-  v.addEventListener("waiting",()=>{ if(PLAYER.started) setLoading(true,"Buffering…",""); });
+  // Only a stream that HAS started can "buffer". Before that, the loading
+  // overlay owns the message (and a watchdog owns the deadline), so a stalled
+  // start or seek reports what actually went wrong instead of showing a
+  // spinner that never resolves.
+  v.addEventListener("waiting",()=>{ if(PLAYER&&PLAYER.started) setLoading(true,"Buffering…",""); });
   v.addEventListener("pause",()=>{ p.classList.remove("idle"); });
   // A media error never reaches the console on its own — surface it, always.
   // And a remux/direct stream the browser rejects gets one automatic rescue:
   // restart as a transcode session (the server re-encodes to plain H.264/AAC).
   v.addEventListener("error",()=>{
+    // Detaching the source on purpose (the reset a remux seek does before
+    // handing over the next stream) can raise an error event with no source
+    // attached. That is us, not a broken file — never rescue-transcode on it.
+    if(!v.getAttribute("src")&&!v.currentSrc) return;
     clearStall();
     const err=v.error, code=err?err.code:0, msg=(err&&err.message)||"";
     const src=(v.currentSrc||"").split("?")[0];
@@ -1676,35 +1809,54 @@ function skipMarker(m){
 // Seek that works for every method: direct play seeks natively; remux/transcode
 // restart the server-side stream at the new offset (the stream is one-directional).
 async function seekTo(targetSec){
-  const v=document.getElementById("video"); if(!v) return;
+  const v=document.getElementById("video"); if(!v||!PLAYER) return;
   targetSec=Math.max(0,targetSec);
+  // Never aim past the end: a stream started beyond the last frame produces no
+  // packets, so it would "buffer" forever with nothing wrong on either side.
+  const total=pbTotalSec();
+  if(total>0) targetSec=Math.min(targetSec, Math.max(0,total-2));
   if(PLAYER.method==='direct_play'){ try{ v.currentTime=targetSec; }catch(e){} playerActivity(); return; }
   // Every non-direct seek restarts the server stream, so overlapping seeks (a
   // double-clicked ±10, or a drag landing near a keyboard nudge) would tear down
   // and re-attach hls.js twice. Token the call and bail any superseded one after
   // its await, so only the last seek attaches.
   const me=PLAYER; const token=(me._seekToken=(me._seekToken||0)+1);
+  const live=()=>PLAYER===me && me._seekToken===token;
   const track=PLAYER.audio[PLAYER.curAudio]; const aidx=track?track.index:(PLAYER.curAudio||0);
   const curSub=PLAYER.curSub;
+  // The stream we are about to build has NOT started. Saying so is what stops a
+  // failed seek from hanging: `started` gates the `waiting` handler (which would
+  // otherwise paint "Buffering…" over the overlay with no diagnosis and no way
+  // out) and it gates the stall watchdog's own early-out.
+  me.started=false;
+  const failed=e=>{ if(live()){ me.started=true; setLoading(false); } toast(e.message); };
   setLoading(true, PLAYER.method==='transcode'?"Skipping ahead…":"Seeking…",
     PLAYER.method==='transcode'?"the transcoder is re-seeking":"");
   teardownHls();
   [...v.querySelectorAll("track")].forEach(t=>t.remove());
   if(PLAYER.method==='transcode'){
-    let info; try{ info=await api(`/files/${PLAYER.fileId}/hls/start?height=${transcodeHeight()}&start=${targetSec.toFixed(1)}&audio=${aidx}`);}catch(e){ if(PLAYER===me) setLoading(false); return toast(e.message); }
-    if(PLAYER!==me || me._seekToken!==token) return;   // a newer seek superseded this one
+    let info; try{ info=await api(`/files/${PLAYER.fileId}/hls/start?height=${transcodeHeight()}&start=${targetSec.toFixed(1)}&audio=${aidx}`);}catch(e){ return failed(e); }
+    if(!live()) return;   // a newer seek superseded this one
     PLAYER.offset=info.start_seconds||0; PLAYER.encoder=info.encoder||null;
+    PLAYER.probeUrl=info.playlist_url; armStall(PLAYER.offset,20000);
     attachHls(v, info.playlist_url);
   } else if(PLAYER.copyHls){
     // Copy-video HLS (Safari): re-open the session at the target position.
-    try{ await startCopyHls(v, targetSec); }catch(e){ if(PLAYER===me) setLoading(false); return toast(e.message); }
-    if(PLAYER!==me || me._seekToken!==token) return;
+    try{ await startCopyHls(v, targetSec); }catch(e){ return failed(e); }
+    if(!live()) return;
+    armStall(PLAYER.offset,20000);
   } else {
     PLAYER.method='remux'; PLAYER.offset=targetSec;
-    v.src=tok(`/api/v1/files/${PLAYER.fileId}/stream.mp4`)+`&${CAPS_Q}&audio=${aidx}&start=${targetSec.toFixed(1)}`;
-    v.play().catch(()=>{});
+    const url=tok(`/api/v1/files/${PLAYER.fileId}/stream.mp4`)+`&${CAPS_Q}&audio=${aidx}&start=${targetSec.toFixed(1)}`;
+    // Hand the element a clean slate first. Assigning .src straight over a live
+    // progressive stream leaves the aborted fetch and its buffered range
+    // attached, and the replacement can then sit at readyState 0 forever.
+    try{ v.pause(); v.removeAttribute("src"); v.load(); }catch(e){}
+    if(!live()) return;
+    PLAYER.probeUrl=`/api/v1/files/${PLAYER.fileId}/stream.mp4`;
+    v.src=url; armStall(targetSec,20000); v.play().catch(()=>{});
   }
-  if(curSub>=0) setTimeout(()=>setSub(curSub),400);
+  if(curSub>=0) setTimeout(()=>{ if(live()) setSub(curSub); },400);
 }
 function autoskipOn(){ try{ return localStorage.getItem("plurx_autoskip")==="1"; }catch(e){ return false; } }
 function setAutoskip(on){ try{ localStorage.setItem("plurx_autoskip", on?"1":"0"); }catch(e){}
@@ -1772,7 +1924,12 @@ function subLabelMenu(s){ return (langName(s.language)||("Subtitle "+(s.index+1)
 function setupTrackMenus(){
   const ab=document.getElementById("audiobtn"), sb=document.getElementById("subsbtn"), m=document.getElementById("pmenu");
   if(m){ m.classList.remove("on"); m.innerHTML=""; }
-  if(ab) ab.style.display=(PLAYER.audio&&PLAYER.audio.length>1)?"":"none";
+  // Audio track selection now sits in the transport next to CC — that is where
+  // people look for it, and the top bar fades out from under the cursor during
+  // playback. The top-bar button stays as a second door to the same menu.
+  const multi=!!(PLAYER.audio&&PLAYER.audio.length>1);
+  if(ab) ab.style.display=multi?"":"none";
+  const pa=document.getElementById("pbaudio"); if(pa) pa.style.display=multi?"":"none";
   // Subtitles are offered in every playback mode. A stream that starts at an
   // offset (transcode, copy-HLS, a resumed remux) shifts the cues to match —
   // see setSub() — so the track lines up wherever playback actually began.
@@ -1784,10 +1941,12 @@ function setupTrackMenus(){
 // Light the CC button while a subtitle track is showing.
 function pbSyncSubIcon(){ const cc=document.getElementById("pbsubs");
   if(cc) cc.classList.toggle("on", !!(PLAYER&&PLAYER.curSub>=0)); }
-function toggleMenu(kind){
+// `low` = opened from the bottom transport, so the menu anchors above that
+// button instead of jumping to the top-right corner of the screen.
+function toggleMenu(kind,low){
   const m=document.getElementById("pmenu"); if(!m) return;
   if(m.classList.contains("on") && m.dataset.kind===kind){ m.classList.remove("on"); return; }
-  m.dataset.kind=kind;
+  m.dataset.kind=kind; m.classList.toggle("low",!!low);
   if(kind==="audio"){
     m.innerHTML=PLAYER.audio.map((a,i)=>`<button class="${PLAYER.curAudio===i?'sel':''}" onclick="switchAudio(${i})">${esc(audioLabelMenu(a,i))}</button>`).join("");
   } else if(kind==="sync"){
@@ -1814,7 +1973,7 @@ function setQuality(q){
   if(PLAYER && PLAYER.fileId){
     const v=document.getElementById("video");
     const pos=(PLAYER.offset||0)+((v&&v.currentTime)||0);
-    play(PLAYER.fileId, PLAYER.title||"", Math.round(pos*1000), PLAYER.knownDur||0);
+    play(PLAYER.fileId, PLAYER.title||"", Math.round(pos*1000), PLAYER.knownDur||0, PLAYER.meta);
   }
 }
 
@@ -1848,7 +2007,7 @@ async function setSync(v){
   if(PLAYER.method==='direct_play'){
     // Direct play can't carry a correction — re-decide (the server now forces
     // a remux for this file) and resume where we were.
-    play(PLAYER.fileId, PLAYER.title||"", Math.round(pos*1000), PLAYER.knownDur||0);
+    play(PLAYER.fileId, PLAYER.title||"", Math.round(pos*1000), PLAYER.knownDur||0, PLAYER.meta);
   } else {
     seekTo(pos); // restarts the server stream; ffmpeg applies the new offset
   }
@@ -2237,13 +2396,22 @@ function usersPanel(users){
       <div class="err" id="uerr"></div>
       <button style="margin-top:12px" onclick="addUser()">Add user</button></div>`;
 }
+// The git build stamp, shown only when it adds something the version number
+// doesn't: on a tagged release `build` is just "v" + the version, and repeating
+// it is noise. Between releases it's the one string that says which commit is
+// actually running, which is what a bug report needs.
+function buildTag(sys){
+  const b=sys.build;
+  if(!b || b==="unknown" || b==="v"+sys.version || b===sys.version) return "";
+  return ` <span class="muted" style="font-size:12px">(${esc(b)})</span>`;
+}
 function systemPanel(sys){
   const enc=sys.encoders||{};
   const pills=[["NVENC",enc.nvenc],["QuickSync",enc.qsv],["VA-API",enc.vaapi],["VideoToolbox",enc.videotoolbox]]
     .map(([n,ok])=>`<span class="pill" style="${ok?'color:var(--good);border-color:var(--good)':''}">${n} ${ok?'✓':'—'}</span>`).join(" ");
   return `<div class="card"><h2 class="section" style="margin-top:0">Server</h2>
       <dl class="kvgrid">
-        <dt>Server</dt><dd>${esc(sys.name)} · ${APP_NAME} ${esc(sys.version)} · up ${fmtUptime(sys.uptime_seconds)}</dd>
+        <dt>Server</dt><dd>${esc(sys.name)} · ${APP_NAME} ${esc(sys.version)}${buildTag(sys)} · up ${fmtUptime(sys.uptime_seconds)}</dd>
         <dt>Data dir</dt><dd>${esc(sys.data_dir)}</dd>
         <dt>ffmpeg</dt><dd>${sys.ffmpeg_version?esc(sys.ffmpeg_version):`<span style="color:var(--bad)">not found at \`${esc(sys.ffmpeg)}\` — scanning and transcoding will fail</span>`}</dd>
         <dt>Hardware</dt><dd>${pills}</dd>
