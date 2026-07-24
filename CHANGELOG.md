@@ -37,8 +37,12 @@ bump may break compatibility and a **patch** bump never does.
   here at over 200× real time; because every seek opens a fresh stream, seeking
   meant repeated line-rate bursts. On Wi-Fi that monopolises airtime for the
   duration, and a client whose DHCP lease came up for renewal during one could
-  lose the lease and then fail to reacquire it — the broadcast `DISCOVER` is the
-  first thing an air-starved AP drops. Streams now burst 30 seconds flat-out
+  lose the lease and then struggle to reacquire it: the client's own requests
+  are 802.11 unicast to the AP and so are ACKed and retried by the MAC layer,
+  but the server's reply has to cross a downlink queue that the burst is busy
+  filling, and if it is group-addressed it gets no ACK, no retry, the lowest
+  basic rate, and a wait for the next DTIM. Streams now burst 30 seconds
+  flat-out
   (so starting and seeking stay instant) and then settle to 4× real time,
   configurable in **Settings → Playback → Delivery speed**.
 - Seeking no longer stacks transcode sessions. Each seek started a new session
