@@ -26,6 +26,11 @@ jobs:
     name: coverage
     runs-on: ubuntu-latest
     needs: check
+    # Self-hosted coverage badge — no codecov.io account or token. Measure line
+    # coverage, write a shields.io endpoint JSON, and (on main only) force-push it
+    # to an orphan `badges` branch that shields renders from raw.githubusercontent.
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.1
@@ -33,14 +38,34 @@ jobs:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-llvm-cov
-      - run: cargo llvm-cov --workspace --lcov --output-path lcov.info
-      - name: Upload to Codecov
-        uses: codecov/codecov-action@v4
-        with:
-          files: lcov.info
-          token: ${{ secrets.CODECOV_TOKEN }}
-          # Don't red-X the build before Codecov is linked (see README).
-          fail_ci_if_error: false
+      - name: Measure line coverage
+        run: cargo llvm-cov --workspace --summary-only --json --output-path cov.json
+      - name: Build the shields.io badge JSON
+        run: |
+          pct=$(jq -r '.data[0].totals.lines.percent' cov.json)
+          msg=$(printf '%.1f' "$pct"); int=${msg%.*}
+          if   [ "$int" -ge 90 ]; then color=brightgreen
+          elif [ "$int" -ge 75 ]; then color=green
+          elif [ "$int" -ge 55 ]; then color=yellowgreen
+          elif [ "$int" -ge 40 ]; then color=yellow
+          elif [ "$int" -ge 20 ]; then color=orange
+          else color=red; fi
+          mkdir -p badge
+          printf '{"schemaVersion":1,"label":"coverage","message":"%s%%","color":"%s"}\n' "$msg" "$color" | tee badge/coverage.json
+      - name: Publish badge to the `badges` branch
+        if: github.ref == 'refs/heads/main'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd badge
+          git init -q
+          git checkout -q -b badges
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add coverage.json
+          git commit -q -m "coverage badge"
+          git push -f "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" badges
 
   build:
     name: release build (${{ matrix.target }})
