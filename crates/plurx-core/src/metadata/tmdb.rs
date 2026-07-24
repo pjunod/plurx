@@ -137,6 +137,66 @@ impl TmdbClient {
         Ok(Some(show_match(id, best)))
     }
 
+    /// Search movies and return the candidates in TMDB's own relevance order,
+    /// capped at `limit`. Unlike [`find_movie`](Self::find_movie) this makes no
+    /// per-result detail call — a picker needs a title, a year and a poster,
+    /// and paying an HTTP round-trip per candidate for runtime/imdb that nobody
+    /// reads would be wasteful. The chosen one gets its details on apply.
+    pub async fn search_movies(
+        &self,
+        title: &str,
+        year: Option<i32>,
+        limit: usize,
+    ) -> Result<Vec<Match>, MetadataError> {
+        let mut query = vec![("query", title.to_owned())];
+        if let Some(y) = year {
+            query.push(("year", y.to_string()));
+        }
+        let body = self.get("/search/movie", &query).await?;
+        Ok(candidates(&body, limit, |id, v| {
+            movie_match(id, v, &Value::Null)
+        }))
+    }
+
+    /// Search shows and return the candidates, as
+    /// [`search_movies`](Self::search_movies) does.
+    pub async fn search_shows(
+        &self,
+        title: &str,
+        year: Option<i32>,
+        limit: usize,
+    ) -> Result<Vec<Match>, MetadataError> {
+        let mut query = vec![("query", title.to_owned())];
+        if let Some(y) = year {
+            query.push(("first_air_date_year", y.to_string()));
+        }
+        let body = self.get("/search/tv", &query).await?;
+        Ok(candidates(&body, limit, show_match))
+    }
+
+    /// Fetch one movie by TMDB id. This is the authoritative path — a manual
+    /// match names an id outright, and a refresh of an already-matched item
+    /// re-reads that same id instead of guessing from the title again.
+    pub async fn movie_by_id(&self, tmdb_id: i64) -> Result<Match, MetadataError> {
+        let details = self.get(&format!("/movie/{tmdb_id}"), &[]).await?;
+        // A detail response carries the search fields too, so it can play both
+        // parts of `movie_match`.
+        Ok(movie_match(tmdb_id, &details, &details))
+    }
+
+    /// Fetch one show by TMDB id.
+    pub async fn show_by_id(&self, tmdb_id: i64) -> Result<Match, MetadataError> {
+        let details = self.get(&format!("/tv/{tmdb_id}"), &[]).await?;
+        Ok(show_match(tmdb_id, &details))
+    }
+
+    /// Full image URL for a TMDB-relative path, honouring *this* client's image
+    /// base so a self-hosted proxy — or a test mock — is respected. The free
+    /// [`image_url`] always points at the public CDN.
+    pub fn image_url(&self, tmdb_path: &str, size: &str) -> String {
+        format!("{}/{size}{tmdb_path}", self.image_base)
+    }
+
     /// Fetch one season: its own artwork/overview plus all episodes.
     pub async fn season_detail(
         &self,
@@ -233,6 +293,20 @@ fn pick_best<'a>(
         .enumerate()
         .max_by_key(|(i, c)| (score(c), -(*i as i32)))
         .map(|(_, c)| c)
+}
+
+/// Map a search response's `results` array into matches, keeping TMDB's own
+/// relevance order and stopping at `limit`. Unlike [`pick_best`] this ranks
+/// nothing: a human is about to look at the list and decide for themselves.
+fn candidates(body: &Value, limit: usize, map: impl Fn(i64, &Value) -> Match) -> Vec<Match> {
+    let Some(results) = body.get("results").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    results
+        .iter()
+        .filter_map(|v| v.get("id").and_then(|x| x.as_i64()).map(|id| map(id, v)))
+        .take(limit)
+        .collect()
 }
 
 fn str_opt(v: &Value, key: &str) -> Option<String> {
