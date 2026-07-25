@@ -79,14 +79,16 @@ pub async fn list_items(
         .list_top_items(library_id, sort, offset, limit)
         .await?;
     let watch = watch_lookup(&state, user.id, &page.items).await?;
-    // Per-item resolution (movies only) so the grid can badge/section it.
-    let movie_ids: Vec<i64> = page
+    // Per-item resolution so the grid can badge/section it. Home videos carry
+    // a badge for the same reason movies do — phone footage ranges from 480p
+    // to 4K in the same folder.
+    let badged: Vec<i64> = page
         .items
         .iter()
-        .filter(|i| i.kind == ItemKind::Movie)
+        .filter(|i| matches!(i.kind, ItemKind::Movie | ItemKind::Video))
         .map(|i| i.id)
         .collect();
-    let heights = state.store.item_max_heights(&movie_ids).await?;
+    let heights = state.store.item_max_heights(&badged).await?;
     let items = page
         .items
         .into_iter()
@@ -126,8 +128,9 @@ pub async fn item_detail(
         .await?
         .ok_or(ApiError::NotFound("item"))?;
 
-    // Walk up the parent chain (episode → season → show; ≤2 hops today, the
-    // guard is against a data cycle ever looping this forever).
+    // Walk up the parent chain (episode → season → show; home libraries mirror
+    // whatever folder depth is on disk, which is legitimately deep). The guard
+    // is only an anti-cycle backstop.
     let mut ancestors = Vec::new();
     let mut cursor = item.parent_id;
     while let Some(parent_id) = cursor {
@@ -135,7 +138,7 @@ pub async fn item_detail(
             Some(parent) => {
                 cursor = parent.parent_id;
                 ancestors.push(parent);
-                if ancestors.len() >= 8 {
+                if ancestors.len() >= 16 {
                     break;
                 }
             }
@@ -225,21 +228,21 @@ pub async fn hubs(
     // Resolution badges, same as the library grid gets. Home is where most
     // people actually browse, so a movie card that carries a 4K chip in the
     // library should carry it here too — one lookup covers all three rows.
-    let movie_ids: Vec<i64> = continue_watching
+    let badged: Vec<i64> = continue_watching
         .iter()
         .chain(next_up.iter())
         .chain(recently_added.iter())
-        .filter(|d| d.kind == ItemKind::Movie)
+        .filter(|d| matches!(d.kind, ItemKind::Movie | ItemKind::Video))
         .map(|d| d.id)
         .collect();
-    if !movie_ids.is_empty() {
-        let heights = state.store.item_max_heights(&movie_ids).await?;
+    if !badged.is_empty() {
+        let heights = state.store.item_max_heights(&badged).await?;
         for d in continue_watching
             .iter_mut()
             .chain(next_up.iter_mut())
             .chain(recently_added.iter_mut())
         {
-            if d.kind == ItemKind::Movie {
+            if matches!(d.kind, ItemKind::Movie | ItemKind::Video) {
                 d.resolution = heights.get(&d.id).copied();
             }
         }

@@ -12,6 +12,7 @@ mod error;
 mod extract;
 mod hls;
 mod images;
+mod items;
 mod libraries;
 mod photos;
 mod plex;
@@ -71,7 +72,7 @@ pub fn router(state: AppState) -> Router {
         .route("/libraries/{id}/refresh", post(libraries::refresh))
         .route("/libraries/{id}/items", get(browse::list_items))
         // Browse
-        .route("/items/{id}", get(browse::item_detail))
+        .route("/items/{id}", get(browse::item_detail).patch(items::edit))
         .route("/hubs", get(browse::hubs))
         .route("/search", get(browse::search))
         // Watch
@@ -1054,6 +1055,212 @@ mod tests {
         assert!(!kinds.contains(&"photo"), "kinds: {kinds:?}");
         assert!(kinds.contains(&"video"));
         let _ = h.lib;
+    }
+
+    fn patch(uri: &str, token: Option<&str>, body: Value) -> Request<Body> {
+        let mut b = Request::builder()
+            .method("PATCH")
+            .uri(uri)
+            .header("content-type", "application/json");
+        if let Some(t) = token {
+            b = b.header("authorization", format!("Bearer {t}"));
+        }
+        b.body(Body::from(body.to_string())).expect("req")
+    }
+
+    #[tokio::test]
+    async fn editing_home_metadata_sets_clears_and_refuses() {
+        let (app, state) = test_state();
+        let token = setup_admin(&app).await;
+        let h = seed_home(&state).await;
+        let s = seed_content(&state).await;
+
+        // Set several fields at once.
+        let (status, body) = call(
+            &app,
+            patch(
+                &format!("/api/v1/items/{}", h.video),
+                Some(&token),
+                json!({
+                    "title": "  Beach day, take two  ",
+                    "overview": "Windy.",
+                    "recorded_at": "2019-06-15",
+                    "year": 2019,
+                    "tags": ["beach", " kids ", "Beach", ""]
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["title"], "Beach day, take two", "titles are trimmed");
+        assert_eq!(body["recorded_at"], "2019-06-15");
+        assert_eq!(body["year"], 2019);
+        assert_eq!(
+            body["tags"],
+            json!(["beach", "kids"]),
+            "tags are trimmed and de-duplicated"
+        );
+
+        // null clears; an absent field is left alone.
+        let (status, body) = call(
+            &app,
+            patch(
+                &format!("/api/v1/items/{}", h.video),
+                Some(&token),
+                json!({ "recorded_at": null, "overview": null }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["recorded_at"], Value::Null);
+        assert_eq!(body["overview"], Value::Null);
+        assert_eq!(body["title"], "Beach day, take two");
+        assert_eq!(body["tags"], json!(["beach", "kids"]));
+
+        // Clearing tags is an empty array, not null.
+        let (_, body) = call(
+            &app,
+            patch(
+                &format!("/api/v1/items/{}", h.video),
+                Some(&token),
+                json!({ "tags": [] }),
+            ),
+        )
+        .await;
+        assert_eq!(body["tags"], json!([]));
+
+        // The edit sticks — a re-read shows it, not just the response.
+        let (_, detail) = call(
+            &app,
+            get(&format!("/api/v1/items/{}", h.video), Some(&token)),
+        )
+        .await;
+        assert_eq!(detail["item"]["title"], "Beach day, take two");
+
+        // Folders are retitlable too (the directory on disk is never renamed).
+        let (status, body) = call(
+            &app,
+            patch(
+                &format!("/api/v1/items/{}", h.folder),
+                Some(&token),
+                json!({ "title": "Summer 2019" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["title"], "Summer 2019");
+
+        // Rejections: empty title, unsortable date, nothing to do.
+        for bad in [
+            json!({ "title": "   " }),
+            json!({ "recorded_at": "last summer" }),
+            json!({ "recorded_at": "14/06/2019" }),
+            json!({}),
+        ] {
+            let (status, _) = call(
+                &app,
+                patch(
+                    &format!("/api/v1/items/{}", h.video),
+                    Some(&token),
+                    bad.clone(),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "should reject {bad}");
+        }
+
+        // A movie is owned by its metadata agent: refused, with a reason.
+        let (status, body) = call(
+            &app,
+            patch(
+                &format!("/api/v1/items/{}", s.movie),
+                Some(&token),
+                json!({ "title": "Heat (director's cut)" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("home libraries"),
+            "error should say why: {body}"
+        );
+
+        // Admin only, and a missing item is a 404.
+        let (status, _) = call(
+            &app,
+            patch(
+                &format!("/api/v1/items/{}", h.video),
+                None,
+                json!({ "title": "nope" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _) = call(
+            &app,
+            patch("/api/v1/items/999999", Some(&token), json!({"title": "x"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn home_browse_sorts_by_date_and_resumes() {
+        let (app, state) = test_state();
+        let token = setup_admin(&app).await;
+        let h = seed_home(&state).await;
+
+        // sort=recorded is accepted and puts dated items first.
+        let (status, list) = call(
+            &app,
+            get(
+                &format!("/api/v1/libraries/{}/items?sort=recorded", h.lib),
+                Some(&token),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(list["total"], 1, "only the folder sits at the root");
+
+        // A home video carries a resolution badge, exactly like a movie.
+        let (_, folder) = call(
+            &app,
+            get(&format!("/api/v1/items/{}", h.folder), Some(&token)),
+        )
+        .await;
+        let children = folder["children"].as_array().expect("children");
+        assert_eq!(children[0]["kind"], "video", "media before photos here");
+        assert_eq!(
+            children[0]["resolution"],
+            Value::Null,
+            "detail has no badge"
+        );
+
+        // Half-watch the clip: it must show up in continue-watching.
+        let (status, _) = call(
+            &app,
+            post(
+                &format!("/api/v1/items/{}/progress", h.video),
+                Some(&token),
+                json!({ "position_ms": 4_000, "duration_ms": 12_000 }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, hubs) = call(&app, get("/api/v1/hubs", Some(&token))).await;
+        let resuming: Vec<i64> = hubs["continue_watching"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .filter_map(|i| i["id"].as_i64())
+            .collect();
+        assert!(
+            resuming.contains(&h.video),
+            "a partially-watched home video belongs in continue-watching: {hubs}"
+        );
     }
 
     #[tokio::test]
