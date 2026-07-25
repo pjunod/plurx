@@ -19,6 +19,14 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      # plurxd shells out to ffmpeg, and the transcode and stream tests drive
+      # that far enough to spawn it — they don't need it to succeed on the
+      # placeholder fixtures, they need a child process to exist so there is a
+      # session to make assertions about. The runner image doesn't ship ffmpeg,
+      # so without this those tests fail on `No such file or directory`, which
+      # is an absent dependency rather than anything wrong with the tree.
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
       # Same gate a developer runs locally (Makefile), so CI never diverges.
       - run: make check
 
@@ -38,6 +46,10 @@ jobs:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-llvm-cov
+      # Instrumented or not, this runs the same suite as the check job, so it
+      # needs the same ffmpeg.
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - name: Measure line coverage
         run: cargo llvm-cov --workspace --summary-only --json --output-path cov.json
       - name: Build the shields.io badge JSON
