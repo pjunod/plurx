@@ -125,7 +125,9 @@ pub async fn scan_library_with_progress(
                     // Photos count only in home libraries: a poster JPEG next
                     // to a movie must stay as invisible as it is today.
                     let wanted = is_video(entry.path())
-                        || (library.kind == LibraryKind::Home && home::is_photo(entry.path()));
+                        || (library.kind == LibraryKind::Home
+                            && home::is_photo(entry.path())
+                            && !home::is_artwork_sidecar(entry.path()));
                     if entry.file_type().is_file() && wanted {
                         candidates.push(entry.into_path());
                     }

@@ -6,6 +6,7 @@
 //! so a library keeps working offline once enriched (REQ-META-4).
 
 pub mod anilist;
+pub mod local;
 pub mod tmdb;
 
 use std::collections::BTreeMap;

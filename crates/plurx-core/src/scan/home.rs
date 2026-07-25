@@ -27,6 +27,20 @@ pub fn is_photo(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Images that are *artwork for something else*, not pictures in their own
+/// right: the Kodi-style `poster.jpg` / `folder.jpg` for a directory, and the
+/// `<stem>-thumb.jpg` / `<stem>-poster.jpg` beside a clip. Local enrichment
+/// adopts these (metadata::local); browsing must not show them as photos.
+pub fn is_artwork_sidecar(path: &Path) -> bool {
+    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    let stem = stem.to_lowercase();
+    matches!(stem.as_str(), "poster" | "folder" | "fanart" | "banner")
+        || stem.ends_with("-thumb")
+        || stem.ends_with("-poster")
+}
+
 /// Where a scanned file landed, and whether this scan is what created it.
 /// Only a freshly created item gets the date ladder applied — a rescan must
 /// never overwrite a date the owner edited by hand.
@@ -269,6 +283,21 @@ mod tests {
         assert!(is_photo(Path::new("/h/a.heic")));
         assert!(!is_photo(Path::new("/h/clip.mp4")));
         assert!(!is_photo(Path::new("/h/notes.txt")));
+    }
+
+    #[test]
+    fn artwork_sidecars_are_not_photos() {
+        for art in [
+            "/h/poster.jpg",
+            "/h/Folder.PNG",
+            "/h/Beach-thumb.jpg",
+            "/h/Beach-poster.jpeg",
+        ] {
+            assert!(is_artwork_sidecar(Path::new(art)), "{art}");
+        }
+        for photo in ["/h/IMG_4021.jpg", "/h/poster shop.jpg", "/h/thumb.jpg"] {
+            assert!(!is_artwork_sidecar(Path::new(photo)), "{photo}");
+        }
     }
 
     #[test]

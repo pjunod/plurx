@@ -5,6 +5,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+use plurx_core::domain::LibraryKind;
+use plurx_core::metadata::local::LocalArtReport;
 use plurx_core::metadata::{self, AniListClient, EnrichReport, TmdbClient};
 use plurx_core::scan::{self, ScanProgress, ScanReport};
 use plurx_core::store::{keys, Store};
@@ -93,6 +95,9 @@ pub struct ScanStatus {
     pub progress: Option<ProgressSnapshot>,
     pub last_scan: Option<ScanReport>,
     pub last_enrich: Option<EnrichReport>,
+    /// Home libraries only: the local-artwork pass (frame grabs, adopted
+    /// sidecar images, inherited folder posters) that stands in for a provider.
+    pub last_local_art: Option<LocalArtReport>,
     pub started_at: Option<i64>,
     pub finished_at: Option<i64>,
     pub error: Option<String>,
@@ -238,9 +243,20 @@ impl JobManager {
             }
         }
 
-        // Anime libraries enrich from AniList (no key needed); everything else
-        // from TMDB when a key is configured.
-        if library.anime {
+        // Home libraries have no provider at all: their enrichment is local
+        // artwork (frame grabs and adopted sidecar images). Anime libraries
+        // enrich from AniList (no key needed); everything else from TMDB when
+        // a key is configured.
+        if library.kind == LibraryKind::Home {
+            let report = metadata::local::enrich_home_library(
+                self.store.as_ref(),
+                &self.artwork_dir,
+                library_id,
+                force_metadata,
+            )
+            .await;
+            status.last_local_art = Some(report);
+        } else if library.anime {
             let client = AniListClient::new();
             let report = metadata::enrich_anime_library(
                 self.store.as_ref(),
