@@ -309,8 +309,15 @@
      free-floating over them. The controls stay reachable with a panel open —
      on a phone there is no keyboard shortcut to escape one. */
   @media(pointer:coarse){
-    .statsov{top:calc(env(safe-area-inset-top,0px) + 96px);bottom:calc(env(safe-area-inset-bottom,0px) + 86px);
-      left:12px;right:12px;width:auto;max-height:none}
+    /* A tablet is coarse-pointer too, so stretching the panel corner to corner
+       buried the picture under a readout on anything bigger than a phone. It
+       keeps the desktop card, just inset for the safe area and allowed to fill
+       the width on a screen too narrow for 360px. Height is capped, not pinned
+       to both edges — pinned made it as tall as the gap no matter how little it
+       held; positionStats() caps it against the real bars instead. */
+    .statsov{top:calc(env(safe-area-inset-top,0px) + 96px);left:12px;right:auto;
+      width:min(360px,calc(100vw - 24px));
+      max-height:calc(100dvh - env(safe-area-inset-top,0px) - env(safe-area-inset-bottom,0px) - 190px)}
     .pmenu{top:calc(env(safe-area-inset-top,0px) + 92px);right:12px;max-width:min(300px,calc(100vw - 24px));
       max-height:calc(100dvh - env(safe-area-inset-top,0px) - env(safe-area-inset-bottom,0px) - 190px);overflow-y:auto;overscroll-behavior:contain}
     .pmenu.low{top:auto;bottom:calc(env(safe-area-inset-bottom,0px) + 76px)}
@@ -2263,17 +2270,23 @@ function toggleStats(){
   const sb=document.getElementById("statsbtn"); if(sb) sb.classList.toggle("on",on);
   clearInterval(STATS_TIMER); STATS_TIMER=null;
   if(on){ updateStats(); positionStats(); STATS_TIMER=setInterval(updateStats,1000); }
-  else ov.style.top="";
+  else { ov.style.top=""; ov.style.maxHeight=""; }
 }
 // The top button row wraps to two or three lines on a phone, so the panel's
 // ceiling isn't a constant — measure it, or the readout parks itself over the
 // player's own Close button. Desktop keeps the stylesheet's fixed offset.
 function positionStats(){
   const ov=document.getElementById("statsov"); if(!ov||!ov.classList.contains("on")) return;
-  if(!matchMedia("(pointer:coarse)").matches){ ov.style.top=""; return; }
+  if(!matchMedia("(pointer:coarse)").matches){ ov.style.top=""; ov.style.maxHeight=""; return; }
   const bar=document.getElementById("pbar");
   const y=bar? Math.round(bar.getBoundingClientRect().bottom)+8 : 0;
   ov.style.top = y>0? y+"px" : "";
+  // Cap the height against the transport's real top rather than pinning the
+  // panel's bottom edge there: a short readout should be a short panel, which
+  // on a tablet is the difference between a card and a wall.
+  const tr=document.getElementById("ptransport");
+  const floor=tr? Math.round(tr.getBoundingClientRect().top)-10 : 0;
+  ov.style.maxHeight = (y>0&&floor>y)? (floor-y)+"px" : "";
 }
 window.addEventListener("resize",positionStats,{passive:true});
 window.addEventListener("orientationchange",()=>setTimeout(positionStats,150));

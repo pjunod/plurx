@@ -25,13 +25,16 @@ bump may break compatibility and a **patch** bump never does.
 
 ### Fixed
 
-- On a phone, the playback-info panel no longer buries the player controls. It
-  had no size limit and no close affordance — touch has no `i` key to press —
-  so opening it covered both control bars with no way back. It is now bounded
-  to the band between the two bars, scrolls internally, carries a close button,
-  is measured at open time against the top bar's real height (it wraps to three
-  rows on a narrow screen), and repositions on rotate. The quality menu is
-  bounded the same way, and the two panels take turns rather than stacking.
+- On a touchscreen, the playback-info panel no longer buries the player
+  controls. It had no size limit and no close affordance — touch has no `i` key
+  to press — so opening it covered both control bars with no way back. It now
+  carries a close button, scrolls internally, and is capped against the top
+  bar's real height (it wraps to three rows on a narrow screen), remeasured on
+  rotate. It stays a card rather than stretching corner to corner, and is only
+  as tall as what it holds, so on a tablet it covers about a sixth of the screen
+  instead of most of it; it fills the width only where the screen is too narrow
+  for the card. The quality menu is bounded the same way, and the two panels
+  take turns rather than stacking.
 - Remux streams are no longer delivered as fast as the link allows. A `-c copy`
   remux was a disk-to-socket pipe braked only by the browser's buffer, measured
   here at over 200× real time; because every seek opens a fresh stream, seeking
