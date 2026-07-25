@@ -25,6 +25,23 @@ bump may break compatibility and a **patch** bump never does.
 
 ### Fixed
 
+- The Docker deployment no longer shares a Compose project with anything else
+  on the host that happens to live in a directory called `deploy`. Compose
+  names a project after the directory holding its file, so plurx's was
+  `deploy` — and two stacks that resolve to the same project name *are* one
+  project: `docker compose ps` in either lists the other's containers, and `up
+  --remove-orphans` or `down` in either **deletes** the other's, on the
+  reasoning that they aren't in the compose file it just read. The container
+  disappears rather than exiting, so there is no exit code, no restart, and no
+  log left to read; `restart: unless-stopped` cannot help something that no
+  longer exists. `container_name: plurxd` hid the collision rather than causing
+  it, by keeping the service off the `<project>-<service>-1` naming that would
+  have made it obvious. The project is now pinned to `plurx`, and the data
+  volume to `plurx-data` rather than `<project>_plurx-data`. Read **Renaming
+  the data volume** in `deploy/README.md` before upgrading: pointing plurxd at
+  a volume that doesn't exist yet is not an error — Docker creates an empty one
+  and plurxd initialises a fresh database in it, which looks exactly like
+  losing your library.
 - Items are no longer marked watched minutes in. The web player treated the
   `ended` event as "the film finished", but `ended` fires at the end of the
   media the browser *has*, which is not the same thing: a remux is a

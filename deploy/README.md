@@ -22,6 +22,46 @@ hardware transcode, uncomment the GPU block in your override (Intel/AMD via
 still-running Plex) owns UDP 32414, set `PLURX_GDM_PORT` in `.env`
 (see `.env.example`).
 
+### Project name
+
+The compose file pins `name: plurx`. Left to itself, Compose names the project
+after the directory holding the file — which here would be `deploy`, a name a
+great many other self-hosted stacks also use. Two stacks that resolve to the
+same project name *are* the same project as far as Compose is concerned:
+`docker compose ps` in one lists the other's containers, and `up
+--remove-orphans` or `down` in one **deletes** the other's, on the reasoning
+that they aren't in the compose file it just read. The container disappears
+outright rather than exiting, so there is no exit code and no log left to read.
+
+Don't remove the `name:` line, and if you run several stacks from directories
+called `deploy`, give each of them one too.
+
+### Renaming the data volume
+
+The data volume is pinned to `plurx-data` for the same reason. Older revisions
+left it unqualified, so it was created as `<project>_plurx-data` — usually
+`deploy_plurx-data`. Pointing plurxd at a volume that doesn't exist yet is not
+an error; Docker creates an empty one, plurxd initialises a fresh database in
+it, and it looks exactly like losing your library. So check before you bring
+the stack up on a version that pins the name:
+
+```sh
+docker volume ls | grep plurx-data
+```
+
+If that shows something other than a bare `plurx-data`, copy it across once:
+
+```sh
+docker compose down                       # stop first; don't copy a live database
+docker volume create plurx-data
+docker run --rm -v deploy_plurx-data:/from -v plurx-data:/to \
+    alpine sh -c 'cd /from && cp -a . /to'
+docker compose up -d
+```
+
+Keep the old volume until you've confirmed your library is intact, then
+`docker volume rm deploy_plurx-data`.
+
 ## Bare metal
 
 ```sh

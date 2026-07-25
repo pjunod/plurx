@@ -18,6 +18,16 @@
 # plurx never writes to your media; mount it read-only (`:ro`). The named
 # volume holds the database, artwork cache, and transcode scratch.
 
+# Pin the Compose project name. Left unset, Compose derives it from the
+# directory holding this file — which is `deploy`, a name half the self-hosted
+# world also uses. Two stacks that resolve to the same project are the same
+# project: `docker compose ps` in one lists the other's containers, and
+# `up --remove-orphans` or `down` in one DELETES the other's, because from
+# there they are containers the compose file doesn't mention. `container_name`
+# below hides the collision rather than causing it, by keeping this service off
+# the `<project>-<service>-1` naming that would otherwise make it obvious.
+name: plurx
+
 services:
   plurxd:
     build:
@@ -42,3 +52,11 @@ services:
 
 volumes:
   plurx-data:
+    # Pinned for the same reason the project is: an unqualified volume is
+    # created as `<project>_plurx-data`, so the database's identity would
+    # depend on what the deployment directory happens to be called, and
+    # changing that would silently present plurxd with an empty volume rather
+    # than an error. If you are moving from a version that didn't pin this,
+    # `docker volume ls | grep plurx-data` will show the old name — see
+    # "Renaming the data volume" in README.md before bringing the stack up.
+    name: plurx-data
