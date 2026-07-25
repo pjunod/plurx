@@ -155,8 +155,10 @@ copy-paste commands, in order, plus a table of where everything lives.
 Rust is the only toolchain to install — the repo pins the exact rustc, clippy,
 and rustfmt in [`rust-toolchain.toml`](rust-toolchain.toml), so `rustup` fetches
 the right versions on your first build. Local and CI stay identical, which is
-why a green `make check` locally means green in CI. Keep `ffmpeg`/`ffprobe` on
-`PATH` for anything that scans or plays.
+why a green `make check` locally means green in CI. The one thing `rustup`
+can't supply is `ffmpeg`/`ffprobe` — keep them on `PATH`, not only for anything
+that scans or plays but for `make check` itself, whose transcode and stream
+tests spawn ffmpeg for real. CI installs them for the same reason.
 
 ```bash
 git clone https://github.com/pjunod/plurx && cd plurx

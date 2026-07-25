@@ -1094,6 +1094,7 @@ mod tests {
 
     #[tokio::test]
     async fn stream_delivery_paths() {
+        crate::transcode::require_ffmpeg();
         let (app, state) = test_state();
         let admin = setup_admin(&app).await;
         let s = seed_content(&state).await;
@@ -1193,6 +1194,7 @@ mod tests {
 
     #[tokio::test]
     async fn hls_http_endpoints() {
+        crate::transcode::require_ffmpeg();
         let (app, state) = test_state();
         let admin = setup_admin(&app).await;
         let s = seed_content(&state).await;
