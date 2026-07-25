@@ -19,6 +19,7 @@ uuid = { workspace = true }
 # Scanner
 walkdir = { workspace = true }
 regex = { workspace = true }
+quick-xml = { workspace = true }
 # Metadata
 reqwest = { workspace = true }
 # Auth

@@ -6,6 +6,7 @@
 //! cheap and easy on shared storage. Probing runs sequentially for the same
 //! reason — a scan should not thrash a NAS.
 
+pub mod nfo;
 pub mod parse;
 pub mod probe;
 

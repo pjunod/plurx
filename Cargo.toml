@@ -36,6 +36,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Scanner / metadata
 walkdir = "2"
+# XML: NFO sidecar parsing (home libraries). plurx-compat-plex hand-rolls a
+# *writer*; this is the reader, and real-world NFOs are too filthy to hand-roll.
+quick-xml = "0.38"
 notify = "6"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
