@@ -7,7 +7,8 @@ last section lists what it deliberately does *not* do, so an absence is never
 ambiguous.
 
 Everything below is implemented and shipping as of Phase 2 (movies, TV, anime,
-playback, Plex-compat) with the Phase 3 cluster spike complete. Anything still
+playback, Plex-compat), plus the home video & photos slice, with the Phase 3
+cluster spike complete. Anything still
 on the roadmap is called out inline as *planned* with its phase, or lives in the
 [not-yet](#9-what-plurx-does-not-do) section — it is never listed as if it
 works. Scope and phase gates live in [REQUIREMENTS.md](REQUIREMENTS.md) and
@@ -20,9 +21,9 @@ works. Scope and phase gates live in [REQUIREMENTS.md](REQUIREMENTS.md) and
 **What it does:** turns folders of files into browsable movies, shows, and
 anime.
 
-- Three library kinds: **Movies**, **TV Shows**, and **Anime** (a shows library
-  flagged for anime rules). One library spans multiple root paths
-  (comma-separated).
+- Four library kinds: **Movies**, **TV Shows**, **Anime** (a shows library
+  flagged for anime rules), and **Home videos & photos** (§1a). One library
+  spans multiple root paths (comma-separated).
 - **Identification** from filename and folder structure: Plex/Jellyfin layouts
   and scene naming for movies and `S01E02` episodes; anime **absolute
   numbering** (episode 137, no season) routed by anime detection rather than
@@ -51,6 +52,61 @@ means the path isn't visible to the **server process** (the usual cause is a
 Docker mount that doesn't match the path you typed). `idle` with a low item
 count after a scan that reported many files means enrichment matched little —
 check the TMDB key.
+
+---
+
+## 1a. Home video & photos — "the shoebox, browsable"
+
+**What it does:** turns a folder tree of camera files — phone clips, camcorder
+dumps, scanned photos — into a library you can browse, play, and curate. There
+is no metadata provider for home video, so everything here comes from the disk.
+
+- **Folders are the organization.** The directory tree is mirrored as folder
+  items: `2019/Beach Trip/clip.mp4` becomes **2019** ▸ **Beach Trip** ▸ the
+  clip. Loose files at a root stand alone; multiple roots merge by folder name
+  at the top level. Deleting a subtree prunes the whole empty chain above it.
+- **Titles are the filename, verbatim.** "Christmas 2019.mp4" stays *Christmas
+  2019* — the movie parser's year/codec stripping is deliberately not used
+  here. The one exception: a leading `2019-06-14 - ` (or `20190614_`) moves
+  into the capture date and off the title. Camera names (`IMG_4021`) are left
+  alone; the edit UI is the fix, not a guess.
+- **Photos** (jpg, jpeg, png, gif, webp, heic, heif) are first-class items —
+  scanned, dated, thumbnailed, and viewable in a full-screen lightbox with
+  ←/→, Esc, and swipe. They are invisible in movie/TV libraries, exactly as
+  before, and `poster.jpg`/`folder.jpg`/`*-thumb.jpg` are treated as artwork
+  rather than pictures to browse.
+- **Capture date drives everything.** `recorded_at` is filled from the first
+  source that has it: NFO `<premiered>`/`<aired>` → the container's
+  `creation_time` (EXIF `DateTimeOriginal` for photos) → a date on the filename
+  → the file's mtime. "Date recorded" is the default sort for home libraries.
+- **Artwork is local only.** Art beside the file wins (`<stem>-thumb.jpg`,
+  `poster.jpg` in a folder); otherwise ffmpeg grabs a frame 20% in. Folders
+  inherit their first child's poster. Everything lands in the artwork cache —
+  never beside your media.
+- **Editing** (admin, home libraries only): title, date recorded, description,
+  and tags, straight to the database. Tags are searchable. Folders are
+  retitlable — the DB title changes, the directory on disk never does.
+- **Playback is the ordinary pipeline:** a home video direct-plays, remuxes, or
+  transcodes exactly like a movie, with resume, the ◆ Quality menu, and
+  continue-watching.
+- Photos are excluded from *Recently added* on purpose: a 2,000-photo import
+  would otherwise bury the home screen. Its videos and folders still surface it.
+
+**Seed-once semantics — why editing an `.nfo` "does nothing":**
+
+| Situation | What plurx does |
+|---|---|
+| Clip scanned, sidecar present | Reads `<basename>.nfo` once, applies title/plot/date/tags, marks the item seeded |
+| Sidecar added *after* the clip was scanned | Seeds on the next rescan (the check is on the item, not the file's size+mtime) |
+| Sidecar edited after seeding | **Nothing.** The DB owns the metadata now — edit in the UI |
+| Sidecar is junk (a bare URL, malformed XML) | One scan problem naming the file; item keeps its filename metadata and is marked seeded, so it complains once, not forever |
+| Metadata edited in the UI | DB only. plurx never writes an `.nfo`, ever |
+| Database rebuilt from scratch | Re-seeds from the sidecars; post-seed edits are gone (that's what backups are for) |
+
+**How to read it:** a home library that scanned files but shows blank cards
+means the local-artwork pass failed — check that ffmpeg is present in Settings
+→ System. A clip whose date looks wrong is usually mtime (priority 4): the file
+was copied, which resets it. Fix it with ✎ Edit; nothing will overwrite it.
 
 ---
 
@@ -319,8 +375,18 @@ Listed so the inventory above is unambiguous — these are deliberate, with reas
   them.
 - **Does not phone home or need the cloud.** No accounts hosted elsewhere, no
   plex.tv contact, no telemetry. It runs on a LAN with no internet.
-- **Does not do music or photos** (v1 scope). The data model won't preclude them;
-  they are not bolted on speculatively.
+- **Does not do music** (v1 scope). The data model won't preclude it; it is not
+  bolted on speculatively. Photos *are* supported, in home libraries (§1a).
+- **Does not expose home libraries through the Plex façade.** Plex has no
+  honest section type for a folder tree of camera files, and a half-mapped
+  section breaks Kodi clients harder than an absent one.
+- **Does not write, export, or re-read `.nfo` sidecars.** One read, at first
+  ingest, and never again (§1a).
+- **Does not edit photos** — no rotation, cropping, favorites, or face/object
+  detection. Browsers honor EXIF orientation on their own.
+- **Does not allow metadata edits outside home libraries** — a provider agent
+  owns those fields and would overwrite them on the next refresh. Manual
+  fix-match is a separate, planned feature.
 - **Does not fingerprint or ML-guess intros.** Skip markers come from chapters
   (plus one honest duration-based credits estimate). A wrong "Skip Intro" that
   jumps into a scene is worse than none.

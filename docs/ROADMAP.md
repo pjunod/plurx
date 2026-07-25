@@ -39,6 +39,22 @@ Time-boxed spike, not a feature phase. Full findings in [PHASE3-SPIKE.md](PHASE3
 
 **Exit:** ✅ written decision recorded (this doc + ARCHITECTURE §2 updated). Phase 4 adds `HiqliteStore: Store` behind the unchanged trait, replicated session recipes, and client-retry failover.
 
+## Home video & photos ✅ DONE
+
+Its own shippable slice, between Phase 3 and Phase 4 — HA-neutral (no new
+replication classes; scan and local artwork ride the already-planned
+leader-scheduled singleton). Design record: [HOMEVIDEO-PLAN.md](HOMEVIDEO-PLAN.md),
+scope in [REQUIREMENTS.md](REQUIREMENTS.md) §5a.
+
+- ✅ **Migration v6:** `libraries`/`items` rebuilt to drop the kind CHECKs (SQLite can't alter one); `recorded_at`, `tags`, `nfo_seeded_at`; FTS recreated over tags. The migration runner now disables FKs around each migration and runs `foreign_key_check` after.
+- ✅ **Scanner `home` arm:** folder mirroring, photo candidates, filename-verbatim titles, the recorded-date ladder, folder-chain pruning.
+- ✅ **NFO as a one-time seed:** Kodi `<movie>` dialect, lenient parser, seeded at most once per item — never re-read, never written.
+- ✅ **Photos:** EXIF dates, thumbnails, range-served originals, a lightbox; excluded from *Recently added*.
+- ✅ **Local artwork:** art beside the file wins, else an ffmpeg frame grab; folders inherit a child's poster.
+- ✅ **Editing:** `PATCH /api/v1/items/:id` (admin, home libraries only) + the edit modal.
+
+**Exit:** ✅ browse folders, play clips, view photos, edit metadata, thumbnails everywhere.
+
 ## Phase 4 — HA for real
 
 - Cluster membership: join tokens, node add/remove, health, single logical server identity

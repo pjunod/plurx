@@ -16,7 +16,7 @@ A media server + client family that recreates what old Plex got right — scan a
 | TV shows | Yes | Series → season → episode; on-deck / continue watching |
 | Anime | Yes | First-class, not "TV with weird numbering" — see §6 |
 | Music | No | Data model must not preclude adding later |
-| Photos / home video | No | Same |
+| Photos / home video | Yes | `home` libraries, added 2026-07 — see §5a |
 
 Anime note: the owner's library contains none *yet*; support is a deliberate bet on a popular use case. Practical consequence: anime metadata matching (§6) and the subtitle/audio data model (§3) are designed in from day one, while full styled-subtitle rendering may land as a fast-follow (see REQ-SUB-2).
 
@@ -49,12 +49,42 @@ The defining requirement: **the server gets out of the way**.
 - **REQ-LIB-3 —** Watch folders for changes (inotify + periodic rescan); incremental, resumable scans that don't hammer shared storage.
 - **REQ-LIB-4 —** Multiple versions per item (4K + 1080p editions), multi-part files, extras/trailers.
 
+## 5a. Home video & photos (`home` libraries)
+
+Added 2026-07. Camera files — phone clips, camcorder dumps, scanned photos —
+have no metadata provider to match against, so this library kind trusts what
+is on disk and nothing else. Full design record: [HOMEVIDEO-PLAN.md](HOMEVIDEO-PLAN.md).
+
+- **REQ-HOME-1 — Folders are the organization.** The directory tree is mirrored
+  as browsable folder items (`2019/Beach Trip` → nested groups); loose files at
+  a root stand alone. No albums, no playlists-as-events, no configuration —
+  how the owner arranged the files *is* the answer.
+- **REQ-HOME-2 — The NFO is a one-time seed, not a data backend.** A
+  Kodi-dialect `<basename>.nfo` is read the first time a clip is ingested and
+  never again; after that the DB owns the metadata. plurx never writes an
+  `.nfo` (or anything else) into a library path. A sidecar added later still
+  seeds, because the check is on the item, not on the file's size and mtime.
+- **REQ-HOME-3 — No provider ever runs against a home library.** There is
+  nothing to match "Christmas 2019.mp4" against, and a false match would be
+  worse than nothing. Artwork is local: art beside the file wins, otherwise a
+  frame grab, cached like any other poster.
+- **REQ-HOME-4 — Capture date is the organizing fact.** `recorded_at` comes
+  from the NFO, then the container's `creation_time` (EXIF for photos), then a
+  date on the filename, then mtime — and "date recorded" is the default sort.
+- **REQ-HOME-5 — In-UI editing, scoped to home libraries.** Admins edit title,
+  date, description, and tags; the endpoint refuses items elsewhere, since a
+  provider-owned field would be overwritten by the next refresh (that case is
+  REQ-META-5's fix-match UI, not this).
+- **REQ-HOME-6 — Photos are scanned, dated, thumbnailed, and viewed.** Nothing
+  else in v1: no editing, no rotation, no favorites, no face or object
+  detection. Home libraries are not exposed through the Plex façade.
+
 ## 6. Metadata
 
 - **REQ-META-1 — TMDB** primary for movies and TV (artwork, cast, ratings).
 - **REQ-META-2 — TVDB** supported for TV, especially libraries organized around TVDB IDs/ordering.
 - **REQ-META-3 — AniDB/AniList** for anime: absolute episode numbering, cours/split-seasons, romaji/English/native titles, correct specials handling. An item matched as anime uses anime-correct ordering rules, not forced TVDB season shapes.
-- **REQ-META-4 —** Local artwork respected (poster.jpg, fanart, theme). Provider metadata cached locally so a scanned library keeps working offline indefinitely. (.nfo sidecar support: nice-to-have, not v1.)
+- **REQ-META-4 —** Local artwork respected (poster.jpg, fanart, theme). Provider metadata cached locally so a scanned library keeps working offline indefinitely. (.nfo sidecar support: for `home` libraries only, as a one-time seed — REQ-HOME-2.)
 - **REQ-META-5 —** Manual match/fix-match UI in the web app; ID badges (tmdb/tvdb/anidb) stored per item.
 
 ## 7. High availability — the cluster contract

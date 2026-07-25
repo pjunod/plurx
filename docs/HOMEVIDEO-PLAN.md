@@ -1,8 +1,27 @@
 # Home video & photos — implementation plan (`home` libraries)
 
-**Status:** ready to build · **Decided:** 2026-07-25 (founding Q&A with Paul)
-· **Verified against:** the 2026-07-23 tree (HEAD ebcb8a2) — re-verify every
-file/function claim at build time in case something moved.
+**Status:** ✅ **built** (2026-07-25, M1–M8) · **Decided:** 2026-07-25 (founding
+Q&A with Paul) · **Verified against:** the 2026-07-23 tree (HEAD ebcb8a2).
+
+This is now the *record of why home video works the way it does*, not a
+work order. What shipped matches the plan; the deltas worth knowing:
+
+- **Kind CHECKs were dropped, not extended** (§3.2 flagged the choice; Paul
+  chose drop). Migration v6 landed with the FK-off runner change and the FTS
+  rebuild exactly as designed.
+- **Artwork sidecars are excluded from the scan** — `poster.jpg`,
+  `folder.jpg`, `<stem>-thumb.jpg` are artwork for something else, not photos
+  to browse. The plan didn't say so; local enrichment adopting a file that had
+  also become an item made it obvious.
+- **`ScanReport` gained `seeded`** so a late-arriving NFO shows up in the scan
+  tally instead of hiding inside `updated`.
+- **Home videos carry `runtime_ms`** from their own probe, so a clip card can
+  wear a duration badge without loading its files.
+- **Durations under a minute read in seconds** app-wide; "0m" on a six-second
+  clip was worse than nothing.
+- **Doc screenshots were not regenerated:** the docs carry no home-library
+  shot, and a page of ffmpeg test-pattern tiles would be worse than none. A
+  real screenshot wants a real (or fictional but plausible) library.
 
 Read [REQUIREMENTS.md](REQUIREMENTS.md) §2 and [ARCHITECTURE.md](ARCHITECTURE.md)
 §4 + §8 before starting — this plan amends both, and the amendments are part

@@ -8,6 +8,39 @@ bump may break compatibility and a **patch** bump never does.
 
 ## [Unreleased]
 
+### Added
+
+- **Home video & photos.** A fourth library kind, `home`, turns a folder tree of
+  camera files — phone clips, camcorder dumps, scanned photos — into a library
+  you can browse, play, and curate. The directory tree *is* the organization:
+  `2019/Beach Trip/clip.mp4` becomes **2019** ▸ **Beach Trip** ▸ the clip, and
+  titles are the filename verbatim, so "Christmas 2019.mp4" stays *Christmas
+  2019* rather than being tidied into *Christmas* by the movie parser. Photos
+  are first-class items with a full-screen lightbox (←/→, Esc, swipe), and are
+  kept out of *Recently added* so a 2,000-photo import can't bury the home
+  screen. Clips play through the ordinary pipeline — direct play, resume,
+  quality menu, continue-watching — because a home video is just a video.
+- **Capture dates.** Home items carry `recorded_at`, filled from the first
+  source that has one: a Kodi `.nfo`, then the container's `creation_time`
+  (EXIF `DateTimeOriginal` for photos), then a date on the filename, then the
+  file's mtime. "Date recorded" is the default sort for home libraries.
+- **`.nfo` sidecars, read exactly once.** A `<basename>.nfo` seeds an item the
+  first time it is scanned and is then dead to plurx: never re-read, never
+  written. Add a sidecar later and it still seeds on the next rescan; edit one
+  after seeding and nothing happens, because the database owns the metadata by
+  then and your own edits can never be clobbered by a file on disk. A junk
+  sidecar complains once, by name, instead of on every scan.
+- **Metadata editing** for home libraries (admin): title, date recorded,
+  description, and tags, from a pencil on the item page. Tags are searchable.
+  Movies and shows are still owned by their metadata agent and refuse the edit,
+  with a message saying why — a hand edit there would vanish on the next
+  refresh.
+- **Local artwork for home libraries.** No provider is ever called for a camera
+  file; art you put beside the media wins (`<stem>-thumb.jpg`, `poster.jpg` in
+  a folder), otherwise ffmpeg grabs a frame 20% in, and folders inherit their
+  first child's poster. Generated art lives in the artwork cache — plurx still
+  never writes anything into your media folders.
+
 ### Changed
 
 - Every drill-in page — item, library, category, search — now shares one header.
@@ -22,6 +55,16 @@ bump may break compatibility and a **patch** bump never does.
   still degrades to **Home / Title**.
 - 2160p content is labelled `2160p` rather than `4K`, matching every other
   resolution chip in the app.
+- Durations under a minute now read in seconds. A six-second phone clip
+  labelled "0m" was worse than saying nothing.
+- Schema v6 rebuilds the `libraries` and `items` tables to drop their
+  kind CHECK constraints — SQLite cannot alter one, and every future media type
+  would otherwise repeat the same dance. Kind validation already lives in one
+  place per enum. The migration runner now disables foreign keys around each
+  migration and runs `PRAGMA foreign_key_check` afterwards, failing loudly
+  rather than quietly leaving dangling rows. Existing databases upgrade in
+  place; the upgrade is covered by a fixture test that builds a v5 database and
+  asserts every row survives.
 
 ### Fixed
 

@@ -20,10 +20,12 @@ open http://localhost:32600                  # first launch = setup screen
 
 # 3. Add a library (Settings → Libraries → Add & scan)
 #    Name: Movies   Kind: Movies   Path: /media/movies
+#    Kinds: Movies · TV Shows · Anime · Home videos & photos
 #    Paths are what the SERVER sees — under Docker that's the CONTAINER path.
 
 # 4. (Optional) add a TMDB key for movie/TV posters
-#    Settings → Metadata.  Anime needs no key (AniList).
+#    Settings → Metadata.  Anime needs no key (AniList), and home libraries
+#    use no provider at all — their thumbnails are ffmpeg frame grabs.
 
 # 5. Press play. Open the Stats overlay (ⓘ or press i) to see how it's serving.
 ```

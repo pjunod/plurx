@@ -230,6 +230,24 @@ remux, and the copy-video HLS path that keeps Safari at source resolution — is
               a scanned library works offline forever
 ```
 
+The `home` branch (home video & photos) skips the provider entirely — there is
+nothing to match a camera file against:
+
+```
+ home root
+     │  same walk, plus still images (jpg/png/heic…)
+     ▼
+ mirror   ──▶ directory tree becomes folder items ("2019" ▸ "Beach Trip")
+     │        titles are the filename verbatim (NOT the movie parser, which
+     │        would turn "Christmas 2019.mp4" into "Christmas")
+     ▼
+ seed     ──▶ <basename>.nfo read ONCE per item, then never again
+     │        date ladder: NFO ▸ container creation_time / EXIF ▸ filename ▸ mtime
+     ▼
+ art      ──▶ local art beside the file, else an ffmpeg frame grab
+              → artwork cache, never next to the media
+```
+
 The scan result is published *before* metadata enrichment starts, so the UI
 shows real file counts and any problems while posters are still fetching — a scan
 that found nothing tells you immediately, instead of looking like it's still
@@ -306,7 +324,15 @@ against the API it talks to.
    button that jumps into the middle of a scene is worse than no button. A
    duration-based end-credits estimate is the one exception, and the API marks it
    `chapter:false` so the UI can hedge.
-7. **Watch state is judged on the probed duration, not the stream's.** A
+7. **The NFO is a seed, not a store.** A Kodi `<basename>.nfo` in a home
+   library is read once, at first ingest, to build the item — and after that
+   the DB owns the metadata: plurx never re-reads the sidecar and never writes
+   one. This is what lets home video exist without an exception to "plurx never
+   writes to media storage" (§8), and it means a hand edit can never be
+   clobbered by a file on disk. Accepted trade-off: a DB rebuilt from scratch
+   re-seeds from the NFOs and loses post-seed edits — that is what backups are
+   for.
+8. **Watch state is judged on the probed duration, not the stream's.** A
    progressive stream's `video.duration` grows as it buffers; trusting it marked
    partially-watched items as fully watched. The file's `ffprobe` duration is the
    authority. Scar: this bug shipped once and is why the rule is now explicit.
@@ -321,12 +347,16 @@ one of these is a door we're keeping shut on purpose:
   raft store is the whole point.
 - **plurx never writes to media storage.** Media is operator-owned and mounted
   read-only. No "organize my files," no renaming, no deleting — a media server
-  that edits your files is one bug away from eating them.
+  that edits your files is one bug away from eating them. This stands unchanged
+  after home video: that feature was designed *around* it (decision 7), which
+  is why NFO seeding is one-way and generated thumbnails go to the artwork
+  cache. Renaming a folder in the UI changes the DB title, never the directory.
 - **No cloud dependency, no phone-home.** Everything works on a LAN that never
   touches the internet. There is no plurx.tv and there never needs to be.
 - **No linking GPL/ffmpeg into the process.** See decision 3.
-- **Not an everything-server (yet).** Music and photos are out of scope for v1;
-  the data model won't preclude them, but they are not bolted on speculatively.
+- **Not an everything-server (yet).** Music is out of scope (photos: supported
+  in `home` libraries since 2026-07); the data model won't preclude music, but
+  it is not bolted on speculatively.
 - **No transcode-by-default.** The server will not "optimize" a library into
   pre-baked renditions; it transcodes on demand, only when a client forces it.
 

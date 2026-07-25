@@ -107,13 +107,15 @@ docker compose up -d --build
 open http://<host>:32600                # :32600 is the default port
 
 # 3. Add a library: Settings → Libraries → Add & scan
-#    Kind: Movies | TV Shows | Anime · Path: what the SERVER sees (the container mount)
+#    Kind: Movies | TV Shows | Anime | Home videos & photos
+#    Path: what the SERVER sees (the container mount)
 
 # 4. Press play. Open ⓘ Stats (or press i) to see how it's being served.
 ```
 
 Movies and TV want a free TMDB key for posters and metadata (Settings →
-Metadata); anime enriches from AniList with no key. Everything runtime — users,
+Metadata); anime enriches from AniList with no key, and home videos use no
+provider at all — their thumbnails are frame grabs. Everything runtime — users,
 libraries, keys — is edited in Settings, never a config file. A scan that finds
 nothing almost always means the path isn't what the server sees; the fix is in
 [docs/OPERATIONS.md](docs/OPERATIONS.md#reading-library-scan-status).
@@ -176,10 +178,14 @@ so a UI change only shows up after a rebuild. How the pieces fit and *why* is
 
 ## Usage
 
-**Add a library.** Settings → Libraries → *Add & scan*. Pick Movies, TV Shows, or
-Anime; give it one or more paths. The scanner identifies files, probes them with
-`ffprobe`, and enriches from TMDB (movies/TV, optional key) or AniList (anime, no
-key). Watch the live status: `scanning… N / M files` → `fetching metadata…` →
+**Add a library.** Settings → Libraries → *Add & scan*. Pick Movies, TV Shows,
+Anime, or Home videos & photos; give it one or more paths. The scanner
+identifies files, probes them with `ffprobe`, and enriches from TMDB
+(movies/TV, optional key) or AniList (anime, no key). A home library is
+different by design: its folder tree *is* the organization, its titles are your
+filenames untouched, and its metadata comes from the disk — an optional Kodi
+`.nfo` read exactly once, plus capture dates and frame-grab thumbnails. See
+[docs/FEATURES.md](docs/FEATURES.md#1a-home-video--photos--the-shoebox-browsable). Watch the live status: `scanning… N / M files` → `fetching metadata…` →
 `idle`. A scan that finds nothing almost always means the path isn't what the
 server sees — see [OPERATIONS.md](docs/OPERATIONS.md#reading-library-scan-status).
 
@@ -224,6 +230,9 @@ Phases are gates — each ends with something you actually use. Full detail in
 - [x] **Phase 3 — Cluster spike.** The HA decision gate: store backend (hiqlite)
   and transcode-failover mechanic decided and validated against real sources. See
   [docs/PHASE3-SPIKE.md](docs/PHASE3-SPIKE.md).
+- [x] **Home video & photos.** A `home` library kind: mirrored folder trees,
+  filename-verbatim titles, capture dates, seed-once `.nfo` sidecars, photo
+  lightbox, local frame-grab artwork, and in-UI metadata editing.
 - [~] **Playback experience.** Borderless player, staged loading, rich stats, skip
   intro/credits with auto-skip — shipped. Public ratings and multi-server
   dashboard still to come.
@@ -244,7 +253,8 @@ and [docs/FEATURES.md](docs/FEATURES.md#11-what-plurx-does-not-do):
   deleting.
 - **Not a streaming aggregator.** No ads, no live TV, no rentals, no "discover"
   feeds.
-- **No music or photos** in v1 (the data model won't preclude them later).
+- **No music** in v1 (the data model won't preclude it later). Photos are
+  supported, in home libraries.
 - **No transcode-by-default.** On demand only, when a device forces it.
 
 ## License
