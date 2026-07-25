@@ -45,6 +45,11 @@ pub struct ItemDto {
     pub episode_number: Option<i32>,
     pub air_date: Option<String>,
     pub runtime_ms: Option<i64>,
+    /// When the footage/photo was captured (home libraries). ISO-8601 date or
+    /// datetime; sorts lexicographically.
+    pub recorded_at: Option<String>,
+    /// Free-form labels (home libraries).
+    pub tags: Vec<String>,
     pub tmdb_id: Option<i64>,
     pub imdb_id: Option<String>,
     pub poster: Option<String>,
@@ -74,6 +79,8 @@ impl From<Item> for ItemDto {
             episode_number: item.episode_number,
             air_date: item.air_date,
             runtime_ms: item.runtime_ms,
+            recorded_at: item.recorded_at,
+            tags: item.tags,
             tmdb_id: item.tmdb_id,
             imdb_id: item.imdb_id,
             poster: image_url(&item.poster_path),

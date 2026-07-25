@@ -168,6 +168,15 @@ fn content_type(path: &Path) -> &'static str {
         Some("mkv") => "video/x-matroska",
         Some("ts") | Some("m2ts") => "video/mp2t",
         Some("avi") => "video/x-msvideo",
+        // Home libraries serve stills through the same range-capable helper.
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("png") => "image/png",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        // Safari renders HEIC natively; everyone else falls back to the
+        // generated JPEG thumbnail (see http/photos.rs).
+        Some("heic") => "image/heic",
+        Some("heif") => "image/heif",
         _ => "application/octet-stream",
     }
 }

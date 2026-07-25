@@ -11,7 +11,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::{nfo, parse};
+use super::{exif, nfo, parse};
 use crate::domain::{Item, ItemKind, Library, MetadataPatch, NewItem, ProbeResult};
 use crate::error::StoreError;
 use crate::store::Store;
@@ -174,10 +174,15 @@ pub async fn seed_from_nfo(
 }
 
 /// The recorded-date ladder below the NFO (which is applied separately):
-/// container `creation_time` → a date lifted off the filename → file mtime.
-/// mtime lies after a copy, but it beats nothing, and the edit UI is the fix.
+/// EXIF for photos, the container's `creation_time` for videos, then a date
+/// lifted off the filename, then the file's mtime. mtime lies after a copy,
+/// but it beats nothing, and the edit UI is the fix.
 fn ladder_date(path: &Path, probe: &ProbeResult, mtime: i64) -> Option<String> {
-    if let Some(created) = probe.creation_time.clone() {
+    if is_photo(path) {
+        if let Some(shot) = exif::date_for(path) {
+            return Some(shot);
+        }
+    } else if let Some(created) = probe.creation_time.clone() {
         return Some(created);
     }
     if let Some(date) = parse::parse_home_media(path).date {

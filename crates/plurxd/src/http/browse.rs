@@ -146,7 +146,11 @@ pub async fn item_detail(
 
     let children = state.store.get_item_children(id).await?;
     let files = match item.kind {
-        ItemKind::Movie | ItemKind::Episode => state.store.files_for_item(id).await?,
+        // Home videos and photos have files exactly like movies do; folders
+        // (and shows/seasons) have children instead.
+        ItemKind::Movie | ItemKind::Episode | ItemKind::Video | ItemKind::Photo => {
+            state.store.files_for_item(id).await?
+        }
         _ => Vec::new(),
     };
 

@@ -13,6 +13,7 @@ mod extract;
 mod hls;
 mod images;
 mod libraries;
+mod photos;
 mod plex;
 pub(crate) mod stream;
 mod system;
@@ -74,6 +75,7 @@ pub fn router(state: AppState) -> Router {
         .route("/hubs", get(browse::hubs))
         .route("/search", get(browse::search))
         // Watch
+        .route("/items/{id}/photo", get(photos::serve))
         .route("/items/{id}/progress", post(watch::progress))
         .route("/items/{id}/scrobble", post(watch::scrobble))
         .route("/items/{id}/unscrobble", post(watch::unscrobble))
@@ -824,6 +826,234 @@ mod tests {
             season,
             ep,
         }
+    }
+
+    struct HomeSeed {
+        lib: i64,
+        folder: i64,
+        video: i64,
+        photo: i64,
+        photo_bytes: Vec<u8>,
+    }
+
+    /// A home library on disk: one folder holding a clip and a still.
+    async fn seed_home(state: &AppState) -> HomeSeed {
+        use plurx_core::domain::{ItemKind, LibraryKind, NewItem, NewLibrary, ProbeResult};
+
+        let dir = std::env::temp_dir().join(format!("plurx-home-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("2019")).expect("mediadir");
+        let lib = state
+            .store
+            .create_library(&NewLibrary {
+                name: "Home videos".into(),
+                kind: LibraryKind::Home,
+                paths: vec![dir.clone()],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+        let new_item = |kind, parent, title: &str| NewItem {
+            library_id: lib.id,
+            kind,
+            parent_id: parent,
+            title: title.to_owned(),
+            year: None,
+            season_number: None,
+            episode_number: None,
+        };
+        let folder = state
+            .store
+            .insert_item(&new_item(ItemKind::Folder, None, "2019"))
+            .await
+            .expect("folder");
+        let video = state
+            .store
+            .insert_item(&new_item(ItemKind::Video, Some(folder), "Beach day"))
+            .await
+            .expect("video");
+        let photo = state
+            .store
+            .insert_item(&new_item(ItemKind::Photo, Some(folder), "IMG_4021"))
+            .await
+            .expect("photo");
+
+        let vpath = dir.join("2019/Beach day.mp4");
+        std::fs::write(&vpath, b"\x00\x00\x00\x18ftypmp42 tiny placeholder").expect("write video");
+        state
+            .store
+            .upsert_file(
+                video,
+                &vpath.to_string_lossy(),
+                42,
+                1,
+                &ProbeResult {
+                    duration_ms: Some(12_000),
+                    container: Some("mp4".into()),
+                    video_codec: Some("h264".into()),
+                    width: Some(1920),
+                    height: Some(1080),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("video file");
+
+        let photo_bytes = b"\xff\xd8\xff\xe0 pretend this is a jpeg \xff\xd9".to_vec();
+        let ppath = dir.join("2019/IMG_4021.jpg");
+        std::fs::write(&ppath, &photo_bytes).expect("write photo");
+        state
+            .store
+            .upsert_file(
+                photo,
+                &ppath.to_string_lossy(),
+                photo_bytes.len() as i64,
+                1,
+                &ProbeResult {
+                    container: Some("jpg".into()),
+                    width: Some(4032),
+                    height: Some(3024),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("photo file");
+
+        state
+            .store
+            .apply_metadata(
+                video,
+                &plurx_core::domain::MetadataPatch {
+                    recorded_at: Some("2019-06-14".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("video date");
+        HomeSeed {
+            lib: lib.id,
+            folder,
+            video,
+            photo,
+            photo_bytes,
+        }
+    }
+
+    #[tokio::test]
+    async fn photos_serve_as_bytes_with_ranges() {
+        let (app, state) = test_state();
+        let token = setup_admin(&app).await;
+        let h = seed_home(&state).await;
+
+        // The original: real bytes, right type, and range-capable — a photo
+        // never touches the playback pipeline.
+        let resp = app
+            .clone()
+            .oneshot(get(
+                &format!("/api/v1/items/{}/photo", h.photo),
+                Some(&token),
+            ))
+            .await
+            .expect("resp");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("image/jpeg")
+        );
+        assert_eq!(
+            resp.headers()
+                .get("accept-ranges")
+                .and_then(|v| v.to_str().ok()),
+            Some("bytes")
+        );
+        let body = resp.into_body().collect().await.expect("body").to_bytes();
+        assert_eq!(body.as_ref(), h.photo_bytes.as_slice());
+
+        // A range request is honored.
+        let req = Request::builder()
+            .uri(format!("/api/v1/items/{}/photo", h.photo))
+            .header("authorization", format!("Bearer {token}"))
+            .header("range", "bytes=0-3")
+            .body(Body::empty())
+            .expect("req");
+        let resp = app.clone().oneshot(req).await.expect("resp");
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        let body = resp.into_body().collect().await.expect("body").to_bytes();
+        assert_eq!(body.len(), 4);
+
+        // No thumbnail generated yet → the original, not a broken image.
+        let resp = app
+            .clone()
+            .oneshot(get(
+                &format!("/api/v1/items/{}/photo?size=thumb", h.photo),
+                Some(&token),
+            ))
+            .await
+            .expect("resp");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Only photos have a photo endpoint.
+        let (status, _) = call(
+            &app,
+            get(&format!("/api/v1/items/{}/photo", h.video), Some(&token)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = call(
+            &app,
+            get(&format!("/api/v1/items/{}/photo", h.folder), Some(&token)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Unauthenticated is refused, like every other media route.
+        let (status, _) = call(&app, get(&format!("/api/v1/items/{}/photo", h.photo), None)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn home_items_carry_dates_and_tags_on_the_wire() {
+        let (app, state) = test_state();
+        let token = setup_admin(&app).await;
+        let h = seed_home(&state).await;
+
+        let (status, detail) = call(
+            &app,
+            get(&format!("/api/v1/items/{}", h.video), Some(&token)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(detail["item"]["kind"], "video");
+        assert_eq!(detail["item"]["recorded_at"], "2019-06-14");
+        assert_eq!(detail["item"]["tags"], json!([]));
+        assert_eq!(detail["ancestors"][0]["title"], "2019", "breadcrumb");
+        assert_eq!(
+            detail["files"].as_array().map(Vec::len),
+            Some(1),
+            "a home video has files exactly like a movie does"
+        );
+
+        // The folder's detail lists its children, and has no files of its own.
+        let (_, folder) = call(
+            &app,
+            get(&format!("/api/v1/items/{}", h.folder), Some(&token)),
+        )
+        .await;
+        assert_eq!(folder["children"].as_array().map(Vec::len), Some(2));
+        assert_eq!(folder["files"].as_array().map(Vec::len), Some(0));
+
+        // Photos stay out of the home screen's recently-added row.
+        let (_, hubs) = call(&app, get("/api/v1/hubs", Some(&token))).await;
+        let kinds: Vec<&str> = hubs["recently_added"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .filter_map(|i| i["kind"].as_str())
+            .collect();
+        assert!(!kinds.contains(&"photo"), "kinds: {kinds:?}");
+        assert!(kinds.contains(&"video"));
+        let _ = h.lib;
     }
 
     #[tokio::test]

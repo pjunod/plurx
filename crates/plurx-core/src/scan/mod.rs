@@ -6,6 +6,7 @@
 //! cheap and easy on shared storage. Probing runs sequentially for the same
 //! reason — a scan should not thrash a NAS.
 
+pub mod exif;
 pub mod home;
 pub mod nfo;
 pub mod parse;
@@ -679,6 +680,122 @@ mod tests {
         );
         let r = scan_library(&store, &lib).await.expect("rescan4");
         assert_eq!(r.seeded, 0, "and never again");
+    }
+
+    /// A minimal JPEG carrying one EXIF field: `DateTimeOriginal`. Hand-built
+    /// because the point is the metadata, not the pixels — a real camera file
+    /// would be megabytes of test fixture for the same assertion.
+    fn write_exif_jpeg(path: &Path, taken: &str) {
+        fn le16(v: u16) -> [u8; 2] {
+            v.to_le_bytes()
+        }
+        fn le32(v: u32) -> [u8; 4] {
+            v.to_le_bytes()
+        }
+        let mut ascii = taken.as_bytes().to_vec();
+        ascii.push(0);
+
+        // TIFF: header → IFD0 (one pointer to the Exif IFD) → Exif IFD (one
+        // DateTimeOriginal) → the string itself. Offsets are from the header.
+        const IFD0: u32 = 8;
+        const EXIF_IFD: u32 = 26;
+        const ASCII_AT: u32 = 44;
+        let mut tiff = Vec::new();
+        tiff.extend_from_slice(b"II*\0");
+        tiff.extend_from_slice(&le32(IFD0));
+        tiff.extend_from_slice(&le16(1));
+        tiff.extend_from_slice(&le16(0x8769)); // ExifIFDPointer
+        tiff.extend_from_slice(&le16(4)); // LONG
+        tiff.extend_from_slice(&le32(1));
+        tiff.extend_from_slice(&le32(EXIF_IFD));
+        tiff.extend_from_slice(&le32(0));
+        tiff.extend_from_slice(&le16(1));
+        tiff.extend_from_slice(&le16(0x9003)); // DateTimeOriginal
+        tiff.extend_from_slice(&le16(2)); // ASCII
+        tiff.extend_from_slice(&le32(ascii.len() as u32));
+        tiff.extend_from_slice(&le32(ASCII_AT));
+        tiff.extend_from_slice(&le32(0));
+        tiff.extend_from_slice(&ascii);
+
+        let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE1];
+        jpeg.extend_from_slice(&((2 + 6 + tiff.len()) as u16).to_be_bytes());
+        jpeg.extend_from_slice(b"Exif\0\0");
+        jpeg.extend_from_slice(&tiff);
+        jpeg.extend_from_slice(&[0xFF, 0xD9]);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("mkdir");
+        }
+        std::fs::write(path, jpeg).expect("write jpeg");
+    }
+
+    #[tokio::test]
+    async fn photos_take_their_date_from_exif() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        let dir = tempfile::tempdir().expect("tmp");
+        write_exif_jpeg(&dir.path().join("IMG_4021.jpg"), "2019:06:14 12:34:56");
+        // No EXIF: the ladder falls through to the filename.
+        std::fs::write(dir.path().join("2011-08-09 Picnic.jpg"), b"not a jpeg").expect("write");
+
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "Home".into(),
+                kind: LibraryKind::Home,
+                paths: vec![dir.path().to_path_buf()],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+        assert_eq!(scan_library(&store, &lib).await.expect("scan").added, 2);
+
+        let page = store
+            .list_top_items(lib.id, ItemSort::Recorded, 0, 10)
+            .await
+            .expect("list");
+        let dates: Vec<(&str, Option<&str>)> = page
+            .items
+            .iter()
+            .map(|i| (i.title.as_str(), i.recorded_at.as_deref()))
+            .collect();
+        assert_eq!(
+            dates,
+            vec![
+                ("IMG_4021", Some("2019-06-14T12:34:56")),
+                ("Picnic", Some("2011-08-09")),
+            ],
+            "EXIF beats the filename, and newest sorts first"
+        );
+        assert!(page.items.iter().all(|i| i.kind == ItemKind::Photo));
+    }
+
+    #[tokio::test]
+    async fn photos_stay_out_of_recently_added() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        let dir = tempfile::tempdir().expect("tmp");
+        write_fake_video(dir.path(), "Trip/clip.mp4").await;
+        for n in 0..5 {
+            std::fs::write(dir.path().join(format!("Trip/IMG_{n}.jpg")), b"x").expect("photo");
+        }
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "Home".into(),
+                kind: LibraryKind::Home,
+                paths: vec![dir.path().to_path_buf()],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+        scan_library(&store, &lib).await.expect("scan");
+
+        // A photo import must not flood the home screen; its video and folder
+        // still surface that something arrived.
+        let recent = store
+            .recently_added(Some(lib.id), 20)
+            .await
+            .expect("recent");
+        let kinds: Vec<ItemKind> = recent.iter().map(|r| r.item.kind).collect();
+        assert!(!kinds.contains(&ItemKind::Photo), "kinds: {kinds:?}");
+        assert!(kinds.contains(&ItemKind::Video));
+        assert!(kinds.contains(&ItemKind::Folder));
     }
 
     #[tokio::test]
