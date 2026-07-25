@@ -152,10 +152,8 @@ pub fn parse(text: &str) -> Option<Nfo> {
                     "premiered" if looks_like_date(&value) => premiered = Some(value),
                     "aired" if looks_like_date(&value) => aired = Some(value),
                     "year" => nfo.year = value.parse().ok(),
-                    "tag" | "genre" => {
-                        if !nfo.tags.iter().any(|t| t.eq_ignore_ascii_case(&value)) {
-                            nfo.tags.push(value);
-                        }
+                    "tag" | "genre" if !nfo.tags.iter().any(|t| t.eq_ignore_ascii_case(&value)) => {
+                        nfo.tags.push(value);
                     }
                     _ => {}
                 }
@@ -254,8 +252,9 @@ mod tests {
         assert_eq!(nfo.year, Some(2004), "year derives from the date");
 
         // <premiered> wins when both are present, whatever the order.
-        let nfo = parse("<movie><aired>2004-08-02</aired><premiered>2004-07-01</premiered></movie>")
-            .expect("parses");
+        let nfo =
+            parse("<movie><aired>2004-08-02</aired><premiered>2004-07-01</premiered></movie>")
+                .expect("parses");
         assert_eq!(nfo.recorded_at.as_deref(), Some("2004-07-01"));
     }
 

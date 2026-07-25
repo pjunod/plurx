@@ -6,6 +6,7 @@
 //! cheap and easy on shared storage. Probing runs sequentially for the same
 //! reason — a scan should not thrash a NAS.
 
+pub mod home;
 pub mod nfo;
 pub mod parse;
 pub mod probe;
@@ -35,6 +36,9 @@ pub struct ScanReport {
     pub pruned_items: usize,
     pub skipped: usize,
     pub errors: usize,
+    /// Home libraries only: items whose metadata was seeded from an `.nfo`
+    /// sidecar on this run. Seeding happens at most once per item, ever.
+    pub seeded: usize,
     /// Human-readable problems worth showing the operator: missing roots,
     /// unreadable directories, a scan that found no video files at all. A
     /// non-empty list means the scan's counts don't tell the whole story.
@@ -117,7 +121,11 @@ pub async fn scan_library_with_progress(
         for entry in WalkDir::new(root).follow_links(true) {
             match entry {
                 Ok(entry) => {
-                    if entry.file_type().is_file() && is_video(entry.path()) {
+                    // Photos count only in home libraries: a poster JPEG next
+                    // to a movie must stay as invisible as it is today.
+                    let wanted = is_video(entry.path())
+                        || (library.kind == LibraryKind::Home && home::is_photo(entry.path()));
+                    if entry.file_type().is_file() && wanted {
                         candidates.push(entry.into_path());
                     }
                 }
@@ -141,16 +149,22 @@ pub async fn scan_library_with_progress(
     }
 
     if candidates.is_empty() && walk_errors == 0 {
+        let (what, exts) = match library.kind {
+            LibraryKind::Home => (
+                "video or photo files",
+                format!("{}, {}", VIDEO_EXTS.join(", "), home::PHOTO_EXTS.join(", ")),
+            ),
+            _ => ("video files", VIDEO_EXTS.join(", ")),
+        };
         report.problems.push(format!(
-            "no video files found under {} — the path exists but contains no recognized \
-             video containers ({})",
+            "no {what} found under {} — the path exists but contains no recognized \
+             media files ({exts})",
             library
                 .paths
                 .iter()
                 .map(|p| format!("`{}`", p.display()))
                 .collect::<Vec<_>>()
                 .join(", "),
-            VIDEO_EXTS.join(", ")
         ));
     }
 
@@ -171,19 +185,30 @@ pub async fn scan_library_with_progress(
         if let Some(ref ex) = existing {
             if ex.size == size && ex.mtime == mtime {
                 report.unchanged += 1;
+                // An NFO written *after* the file was scanned still seeds: the
+                // check is on the item, not on the file's size+mtime. Costs
+                // one stat per unseeded home video, and no probe.
+                if library.kind == LibraryKind::Home {
+                    if let Some(item) = store.get_item(ex.item_id).await? {
+                        if item.nfo_seeded_at.is_none()
+                            && home::seed_from_nfo(store, &item, &path, &mut report.problems)
+                                .await?
+                        {
+                            report.seeded += 1;
+                        }
+                    }
+                }
                 continue;
             }
         }
         let is_new = existing.is_none();
 
-        let item_id = match place_item(store, library, &path).await? {
-            Some(id) => id,
-            None => {
-                // Couldn't place it (e.g. a Shows file with no S/E marker).
-                report.skipped += 1;
-                continue;
-            }
+        let Some(placed) = place_item(store, library, &path).await? else {
+            // Couldn't place it (e.g. a Shows file with no S/E marker).
+            report.skipped += 1;
+            continue;
         };
+        let item_id = placed.id;
 
         // Probe is best-effort — a weird file still records with null media
         // details rather than failing the whole scan.
@@ -199,6 +224,11 @@ pub async fn scan_library_with_progress(
         store
             .upsert_file(item_id, &path_str, size, mtime, &probe)
             .await?;
+        if library.kind == LibraryKind::Home
+            && home::after_record(store, placed, &path, &probe, mtime, &mut report.problems).await?
+        {
+            report.seeded += 1;
+        }
         if is_new {
             report.added += 1;
         } else {
@@ -239,6 +269,7 @@ pub async fn scan_library_with_progress(
         unchanged = report.unchanged,
         removed = report.removed_files,
         pruned = report.pruned_items,
+        seeded = report.seeded,
         skipped = report.skipped,
         errors = report.errors,
         "scan complete"
@@ -249,13 +280,13 @@ pub async fn scan_library_with_progress(
     Ok(report)
 }
 
-/// Find-or-create the item a file belongs to, returning its id. `None` means
-/// the file couldn't be identified for this library kind.
+/// Find-or-create the item a file belongs to. `None` means the file couldn't
+/// be identified for this library kind.
 async fn place_item(
     store: &dyn Store,
     library: &Library,
     path: &Path,
-) -> Result<Option<i64>, StoreError> {
+) -> Result<Option<home::Placed>, StoreError> {
     match library.kind {
         LibraryKind::Movies => {
             let parsed = parse::parse_movie(path);
@@ -263,7 +294,10 @@ async fn place_item(
                 .find_movie(library.id, &parsed.title, parsed.year)
                 .await?
             {
-                return Ok(Some(existing.id));
+                return Ok(Some(home::Placed {
+                    id: existing.id,
+                    created: false,
+                }));
             }
             let id = store
                 .insert_item(&NewItem {
@@ -276,12 +310,12 @@ async fn place_item(
                     episode_number: None,
                 })
                 .await?;
-            Ok(Some(id))
+            Ok(Some(home::Placed { id, created: true }))
         }
-        // The home arm (folder mirroring, NFO seeding, the date ladder) lands
-        // with the rest of the home scanner; until then a home library places
-        // nothing.
-        LibraryKind::Home => Ok(None),
+        // Folders are the organization: the directory tree is mirrored as
+        // browsable folder items, and the file itself becomes a video or a
+        // photo under it.
+        LibraryKind::Home => home::place(store, library, path).await,
         LibraryKind::Shows => {
             // Anime libraries use absolute numbering; regular shows use S/E.
             let parsed = if library.anime {
@@ -295,7 +329,10 @@ async fn place_item(
             let show = find_or_create_show(store, library, &parsed).await?;
             let season = find_or_create_season(store, library, show.id, parsed.season).await?;
             if let Some(existing) = store.find_episode(season, parsed.episode).await? {
-                return Ok(Some(existing.id));
+                return Ok(Some(home::Placed {
+                    id: existing.id,
+                    created: false,
+                }));
             }
             let title = parsed
                 .episode_title
@@ -312,7 +349,7 @@ async fn place_item(
                     episode_number: Some(parsed.episode),
                 })
                 .await?;
-            Ok(Some(id))
+            Ok(Some(home::Placed { id, created: true }))
         }
     }
 }
@@ -372,7 +409,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::domain::{ItemSort, NewLibrary};
+    use crate::domain::{ItemEdit, ItemSort, NewLibrary};
     use crate::store::{LibraryStore, MediaStore, SqliteStore};
 
     async fn write_fake_video(dir: &Path, rel: &str) -> PathBuf {
@@ -490,6 +527,231 @@ mod tests {
             "problems: {:?}",
             r.problems
         );
+    }
+
+    /// The home arm end to end: folder mirroring, titles kept verbatim, the
+    /// date ladder, seed-once NFO handling, and a junk sidecar that complains
+    /// exactly once.
+    #[tokio::test]
+    async fn scans_home_tree_with_folders_dates_and_nfos() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        let dir = tempfile::tempdir().expect("tmp");
+        write_fake_video(dir.path(), "2019/Beach Trip/Christmas 2019.mp4").await;
+        write_fake_video(dir.path(), "2019/Beach Trip/2019-06-14 - Sandcastle.mp4").await;
+        write_fake_video(dir.path(), "Loose clip.mov").await;
+        // A photo — invisible in movie/show libraries, a first-class item here.
+        std::fs::write(dir.path().join("2019/IMG_4021.jpg"), b"jpeg-ish").expect("photo");
+        // One good sidecar, one that is just a URL someone saved.
+        std::fs::write(
+            dir.path().join("2019/Beach Trip/Christmas 2019.nfo"),
+            "<movie><title>Christmas morning</title><premiered>2019-12-25</premiered>\
+             <tag>kids</tag></movie>",
+        )
+        .expect("nfo");
+        std::fs::write(
+            dir.path().join("Loose clip.nfo"),
+            "https://www.imdb.com/title/tt0133093/",
+        )
+        .expect("junk nfo");
+
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "Home".into(),
+                kind: LibraryKind::Home,
+                paths: vec![dir.path().to_path_buf()],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+
+        let r = scan_library(&store, &lib).await.expect("scan");
+        assert_eq!(r.added, 4, "three videos and one photo");
+        assert_eq!(r.seeded, 2, "both sidecars are consumed exactly once");
+        assert!(
+            r.problems.iter().any(|p| p.contains("Loose clip.nfo")),
+            "a junk sidecar complains by name: {:?}",
+            r.problems
+        );
+
+        // Top level: the mirrored "2019" folder and the loose clip.
+        let top = store
+            .list_top_items(lib.id, ItemSort::Title, 0, 10)
+            .await
+            .expect("list");
+        assert_eq!(top.total, 2);
+        let folder = top
+            .items
+            .iter()
+            .find(|i| i.kind == ItemKind::Folder)
+            .expect("2019 folder");
+        assert_eq!(folder.title, "2019");
+        let loose = top
+            .items
+            .iter()
+            .find(|i| i.kind == ItemKind::Video)
+            .expect("loose video");
+        assert_eq!(loose.title, "Loose clip");
+
+        // "2019" holds the photo and the nested "Beach Trip" folder —
+        // subfolders sort first.
+        let kids = store.get_item_children(folder.id).await.expect("children");
+        assert_eq!(kids.len(), 2);
+        assert_eq!(kids[0].kind, ItemKind::Folder);
+        assert_eq!(kids[0].title, "Beach Trip");
+        assert_eq!(kids[1].kind, ItemKind::Photo);
+        assert_eq!(kids[1].title, "IMG_4021", "camera junk names stay honest");
+
+        let clips = store.get_item_children(kids[0].id).await.expect("clips");
+        assert_eq!(clips.len(), 2);
+        let by_title = |t: &str| {
+            clips
+                .iter()
+                .find(|i| i.title == t)
+                .unwrap_or_else(|| panic!("missing {t}: {clips:?}"))
+                .clone()
+        };
+        // NFO seeding renamed this one and set its date and tags.
+        let christmas = by_title("Christmas morning");
+        assert_eq!(christmas.recorded_at.as_deref(), Some("2019-12-25"));
+        assert_eq!(christmas.tags, vec!["kids".to_owned()]);
+        assert!(christmas.nfo_seeded_at.is_some());
+        // No sidecar: the title survives the year (the movie parser would have
+        // eaten it) and the date came off the filename.
+        let sandcastle = by_title("Sandcastle");
+        assert_eq!(sandcastle.recorded_at.as_deref(), Some("2019-06-14"));
+        assert!(sandcastle.nfo_seeded_at.is_none());
+
+        // Rescan: nothing changed, and nothing re-seeds.
+        let r = scan_library(&store, &lib).await.expect("rescan");
+        assert_eq!(r.added, 0);
+        assert_eq!(r.unchanged, 4);
+        assert_eq!(r.seeded, 0);
+
+        // (a) A hand edit survives a rewritten NFO — the sidecar is dead to
+        // plurx once consumed. This is the whole seed-once contract.
+        store
+            .update_item_fields(
+                christmas.id,
+                &ItemEdit {
+                    title: Some("Christmas at the beach".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("edit");
+        std::fs::write(
+            dir.path().join("2019/Beach Trip/Christmas 2019.nfo"),
+            "<movie><title>OVERWRITTEN</title></movie>",
+        )
+        .expect("rewrite nfo");
+        let r = scan_library(&store, &lib).await.expect("rescan2");
+        assert_eq!(r.seeded, 0);
+        assert_eq!(
+            store
+                .get_item(christmas.id)
+                .await
+                .expect("get")
+                .expect("present")
+                .title,
+            "Christmas at the beach"
+        );
+
+        // (b) A sidecar written *after* the file was scanned seeds on the next
+        // rescan — the file is unchanged, but the item is unseeded.
+        std::fs::write(
+            dir.path()
+                .join("2019/Beach Trip/2019-06-14 - Sandcastle.nfo"),
+            "<movie><title>Sandcastle contest</title></movie>",
+        )
+        .expect("late nfo");
+        let r = scan_library(&store, &lib).await.expect("rescan3");
+        assert_eq!(r.seeded, 1, "a late sidecar seeds exactly once");
+        let seeded = store
+            .get_item(sandcastle.id)
+            .await
+            .expect("get")
+            .expect("present");
+        assert_eq!(seeded.title, "Sandcastle contest");
+        assert_eq!(
+            seeded.recorded_at.as_deref(),
+            Some("2019-06-14"),
+            "an NFO without a date leaves the ladder's date alone"
+        );
+        let r = scan_library(&store, &lib).await.expect("rescan4");
+        assert_eq!(r.seeded, 0, "and never again");
+    }
+
+    #[tokio::test]
+    async fn empty_home_root_names_photos_too() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        let dir = tempfile::tempdir().expect("tmp");
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "Home".into(),
+                kind: LibraryKind::Home,
+                paths: vec![dir.path().to_path_buf()],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+        let r = scan_library(&store, &lib).await.expect("scan");
+        assert!(
+            r.problems
+                .iter()
+                .any(|p| p.contains("no video or photo files found")),
+            "problems: {:?}",
+            r.problems
+        );
+    }
+
+    #[tokio::test]
+    async fn photos_are_invisible_outside_home_libraries() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        let dir = tempfile::tempdir().expect("tmp");
+        write_fake_video(dir.path(), "Heat (1995).mkv").await;
+        std::fs::write(dir.path().join("poster.jpg"), b"jpeg-ish").expect("poster");
+
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "Movies".into(),
+                kind: LibraryKind::Movies,
+                paths: vec![dir.path().to_path_buf()],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+        let r = scan_library(&store, &lib).await.expect("scan");
+        assert_eq!(r.added, 1, "the poster next to a movie stays invisible");
+    }
+
+    #[tokio::test]
+    async fn deleted_home_files_prune_their_folder_chain() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        let dir = tempfile::tempdir().expect("tmp");
+        write_fake_video(dir.path(), "2019/Summer/Beach Trip/clip.mp4").await;
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "Home".into(),
+                kind: LibraryKind::Home,
+                paths: vec![dir.path().to_path_buf()],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+        assert_eq!(scan_library(&store, &lib).await.expect("scan").added, 1);
+
+        std::fs::remove_file(dir.path().join("2019/Summer/Beach Trip/clip.mp4")).expect("rm");
+        let r = scan_library(&store, &lib).await.expect("rescan");
+        assert_eq!(r.removed_files, 1);
+        assert_eq!(
+            r.pruned_items, 4,
+            "the video and all three empty folders above it"
+        );
+        let top = store
+            .list_top_items(lib.id, ItemSort::Title, 0, 10)
+            .await
+            .expect("list");
+        assert_eq!(top.total, 0);
     }
 
     #[tokio::test]

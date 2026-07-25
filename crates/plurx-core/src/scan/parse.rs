@@ -211,6 +211,62 @@ pub fn parse_movie(path: &Path) -> ParsedMovie {
     }
 }
 
+/// A home-video or photo file's identity: what to call it, and the date its
+/// filename gave away (if any).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedHomeMedia {
+    pub title: String,
+    /// `YYYY-MM-DD` lifted off the front of the filename. Priority 3 in the
+    /// recorded-date ladder (docs/HOMEVIDEO-PLAN.md §4.4).
+    pub date: Option<String>,
+}
+
+// A date at the *start* of the stem: "2019-06-14 - Beach", "20190614_Beach".
+// Anchored on purpose — a date in the middle ("IMG_20190614_120000") is
+// camera boilerplate, and photos get their dates from EXIF anyway.
+static LEADING_DATE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(19\d{2}|20\d{2})[-_.]?(\d{2})[-_.]?(\d{2})(?:[\s._-]+(.*))?$").expect("valid")
+});
+
+/// Parse a home-video/photo file. **Deliberately not [`parse_movie`]:** that
+/// one strips years and codec tokens ("Movie H264 (2024).mp4" → "Movie"),
+/// which is right for scene-named movies and destructive here — "Christmas
+/// 2019.mp4" must stay "Christmas 2019". So the stem is kept verbatim, with
+/// exactly one exception: a leading ISO-ish date moves into the date ladder.
+/// Camera junk names (IMG_4021, MVI_0033, DSC01234) stay as they are — they
+/// are honest, and the fix for them is the edit UI, not a guess.
+pub fn parse_home_media(path: &Path) -> ParsedHomeMedia {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .trim();
+
+    if let Some(caps) = LEADING_DATE.captures(stem) {
+        let (year, month, day) = (&caps[1], &caps[2], &caps[3]);
+        let (m, d): (u32, u32) = (month.parse().unwrap_or(0), day.parse().unwrap_or(0));
+        if (1..=12).contains(&m) && (1..=31).contains(&d) {
+            let date = format!("{year}-{month}-{day}");
+            let rest = caps.get(4).map(|m| m.as_str().trim()).unwrap_or_default();
+            return ParsedHomeMedia {
+                // Stripping the date off "2019-06-14.mp4" would leave nothing
+                // to click on, so a bare date keeps the whole stem as a title.
+                title: if rest.is_empty() {
+                    stem.to_owned()
+                } else {
+                    rest.to_owned()
+                },
+                date: Some(date),
+            };
+        }
+    }
+
+    ParsedHomeMedia {
+        title: stem.to_owned(),
+        date: None,
+    }
+}
+
 /// Parse a TV episode from its path, or `None` if no S/E marker is present
 /// anywhere in the filename.
 pub fn parse_episode(path: &Path) -> Option<ParsedEpisode> {
@@ -333,6 +389,73 @@ mod tests {
     }
     fn ep(p: &str) -> Option<ParsedEpisode> {
         parse_episode(&PathBuf::from(p))
+    }
+    fn home(p: &str) -> ParsedHomeMedia {
+        parse_home_media(&PathBuf::from(p))
+    }
+
+    #[test]
+    fn home_titles_are_the_filename_verbatim() {
+        // The movie parser would make these "Christmas", "Beach" and "Dad".
+        assert_eq!(
+            home("/h/2019/Christmas 2019.mp4"),
+            ParsedHomeMedia {
+                title: "Christmas 2019".into(),
+                date: None
+            }
+        );
+        assert_eq!(
+            home("/h/Beach 4k HDR.mov"),
+            ParsedHomeMedia {
+                title: "Beach 4k HDR".into(),
+                date: None
+            }
+        );
+        // Camera junk stays honest rather than becoming a guess.
+        for junk in ["IMG_4021", "MVI_0033", "DSC01234"] {
+            assert_eq!(home(&format!("/h/{junk}.mp4")).title, junk);
+        }
+    }
+
+    #[test]
+    fn a_leading_date_moves_into_the_date_field() {
+        assert_eq!(
+            home("/h/2019-06-14 - Beach.mp4"),
+            ParsedHomeMedia {
+                title: "Beach".into(),
+                date: Some("2019-06-14".into())
+            }
+        );
+        assert_eq!(
+            home("/h/20190614_Beach day.mp4"),
+            ParsedHomeMedia {
+                title: "Beach day".into(),
+                date: Some("2019-06-14".into())
+            }
+        );
+        // Nothing left after stripping → keep the stem, still take the date.
+        assert_eq!(
+            home("/h/2019-06-14.mp4"),
+            ParsedHomeMedia {
+                title: "2019-06-14".into(),
+                date: Some("2019-06-14".into())
+            }
+        );
+    }
+
+    #[test]
+    fn only_a_real_leading_date_counts() {
+        // Impossible month/day: not a date, so the name stays whole.
+        assert_eq!(home("/h/2019-13-40 party.mp4").date, None);
+        assert_eq!(home("/h/2019-13-40 party.mp4").title, "2019-13-40 party");
+        // Mid-name dates are camera boilerplate (and photos use EXIF anyway).
+        assert_eq!(home("/h/IMG_20190614_120000.jpg").date, None);
+        assert_eq!(
+            home("/h/IMG_20190614_120000.jpg").title,
+            "IMG_20190614_120000"
+        );
+        // A number that isn't a date at all.
+        assert_eq!(home("/h/12345678.mp4").date, None);
     }
 
     #[test]

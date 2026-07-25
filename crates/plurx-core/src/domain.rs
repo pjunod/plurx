@@ -304,6 +304,11 @@ pub struct ProbeResult {
     pub subtitle_streams: Vec<SubtitleStream>,
     /// Raw ffprobe JSON, kept verbatim for future decision-engine needs.
     pub raw_json: Option<String>,
+    /// Container capture time (`format.tags.creation_time`), normalized to a
+    /// local-naive ISO-8601 string. Phones and camcorders set it, which makes
+    /// it the best home-video date short of an NFO — see
+    /// docs/HOMEVIDEO-PLAN.md §4.4.
+    pub creation_time: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

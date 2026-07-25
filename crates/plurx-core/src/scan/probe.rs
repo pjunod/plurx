@@ -77,6 +77,7 @@ pub fn parse_probe_json(json: &Value) -> ProbeResult {
             .get("bit_rate")
             .and_then(|v| v.as_str())
             .and_then(|s| s.parse::<i64>().ok());
+        result.creation_time = tag(format, "creation_time").and_then(|s| normalize_timestamp(&s));
     }
 
     let empty = Vec::new();
@@ -130,6 +131,35 @@ pub fn parse_probe_json(json: &Value) -> ProbeResult {
         }
     }
     result
+}
+
+/// Normalize a container timestamp ("2019-06-14T18:22:03.000000Z",
+/// "2019-06-14 18:22:03") to local-naive ISO 8601: `YYYY-MM-DDTHH:MM:SS`.
+/// Sorting is all this field is for, so the zone marker and sub-second part
+/// are dropped rather than converted — and a value that doesn't start with a
+/// plausible date is discarded, since cameras write some remarkable garbage
+/// (`0000-00-00T00:00:00Z` being the classic).
+fn normalize_timestamp(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    let date = raw.get(..10)?;
+    let bytes = date.as_bytes();
+    let shaped = bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(i, b)| i == 4 || i == 7 || b.is_ascii_digit());
+    if !shaped || date.starts_with("0000") {
+        return None;
+    }
+    let time = raw
+        .get(11..19)
+        .filter(|t| t.len() == 8 && t.as_bytes()[2] == b':' && t.as_bytes()[5] == b':');
+    Some(match time {
+        Some(time) => format!("{date}T{time}"),
+        None => date.to_owned(),
+    })
 }
 
 fn str_field(stream: &Value, key: &str) -> Option<String> {
