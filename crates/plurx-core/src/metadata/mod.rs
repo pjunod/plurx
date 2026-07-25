@@ -88,6 +88,7 @@ pub async fn enrich_library(
                         runtime_ms: m.runtime_ms,
                         poster_path: poster,
                         backdrop_path: backdrop,
+                        ..Default::default()
                     };
                     if apply(store, item.id, patch, &mut report).await {
                         report.matched += 1;

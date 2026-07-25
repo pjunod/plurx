@@ -6,10 +6,12 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use rusqlite::{params, Connection, OptionalExtension};
 
-use super::{file_from_row, item_cols, item_from_row, SqliteStore, FILE_COLS, ITEM_COLS};
+use super::{
+    file_from_row, item_cols, item_from_row, SqliteStore, FILE_COLS, ITEM_COLS, ITEM_COL_COUNT,
+};
 use crate::domain::{
-    sort_title_for, Item, ItemPage, ItemSort, MediaFile, MetadataPatch, NewItem, ProbeResult,
-    RecentItem,
+    sort_title_for, Item, ItemEdit, ItemKind, ItemPage, ItemSort, MediaFile, MetadataPatch,
+    NewItem, ProbeResult, RecentItem,
 };
 use crate::error::StoreError;
 use crate::store::MediaStore;
@@ -135,10 +137,40 @@ impl MediaStore for SqliteStore {
         .await
     }
 
+    async fn find_child_item(
+        &self,
+        library_id: i64,
+        parent_id: Option<i64>,
+        kind: ItemKind,
+        title: &str,
+    ) -> Result<Option<Item>, StoreError> {
+        let title = title.to_owned();
+        let kind = kind.as_str();
+        self.with_conn(move |conn| {
+            Ok(find_by(
+                conn,
+                &format!(
+                    "SELECT {ITEM_COLS} FROM items
+                     WHERE library_id = ?1 AND kind = ?3 AND title = ?4 COLLATE NOCASE
+                       AND parent_id IS ?2"
+                ),
+                params![library_id, parent_id, kind, title],
+            )?)
+        })
+        .await
+    }
+
     async fn insert_item(&self, item: &NewItem) -> Result<i64, StoreError> {
         let item = item.clone();
         self.with_conn(move |conn| {
-            let sort_title = sort_title_for(&item.title);
+            // Folder titles are directory names, not work titles: "The Lake
+            // House 2021" is a place. Stripping the article would file it
+            // under L, so folders sort on the raw name.
+            let sort_title = if item.kind == ItemKind::Folder {
+                item.title.to_lowercase()
+            } else {
+                sort_title_for(&item.title)
+            };
             conn.execute(
                 "INSERT INTO items
                    (library_id, kind, parent_id, title, sort_title, year,
@@ -173,9 +205,13 @@ impl MediaStore for SqliteStore {
 
     async fn get_item_children(&self, parent_id: i64) -> Result<Vec<Item>, StoreError> {
         self.with_conn(move |conn| {
+            // Shows order by season/episode; home folders want subfolders
+            // first, then their media chronologically. The extra keys are
+            // inert for movie/show libraries (recorded_at is NULL there).
             let mut stmt = conn.prepare(&format!(
                 "SELECT {ITEM_COLS} FROM items WHERE parent_id = ?1
-                 ORDER BY season_number, episode_number, sort_title"
+                 ORDER BY (kind = 'folder') DESC, season_number, episode_number,
+                          (recorded_at IS NULL), recorded_at, sort_title"
             ))?;
             let items = stmt
                 .query_map(params![parent_id], |row| item_from_row(row, 0))?
@@ -201,16 +237,20 @@ impl MediaStore for SqliteStore {
                 ItemSort::Resolution => {
                     "COALESCE((SELECT MAX(f.height) FROM files f WHERE f.item_id = items.id), -1) DESC, sort_title ASC"
                 }
+                ItemSort::Recorded => "(recorded_at IS NULL), recorded_at DESC, sort_title ASC",
             };
+            // Top level = what a library's grid shows: movies and shows, plus
+            // (home libraries) whatever sits directly under a root.
+            const TOP: &str = "(kind IN ('movie','show') \
+                 OR (kind IN ('folder','video','photo') AND parent_id IS NULL))";
             let total: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM items
-                 WHERE library_id = ?1 AND kind IN ('movie','show')",
+                &format!("SELECT COUNT(*) FROM items WHERE library_id = ?1 AND {TOP}"),
                 params![library_id],
                 |row| row.get(0),
             )?;
             let mut stmt = conn.prepare(&format!(
                 "SELECT {ITEM_COLS} FROM items
-                 WHERE library_id = ?1 AND kind IN ('movie','show')
+                 WHERE library_id = ?1 AND {TOP}
                  ORDER BY {order} LIMIT ?3 OFFSET ?2"
             ))?;
             let items = stmt
@@ -229,14 +269,18 @@ impl MediaStore for SqliteStore {
         limit: i64,
     ) -> Result<Vec<RecentItem>, StoreError> {
         self.with_conn(move |conn| {
-            // One card per movie or per show (latest episode represents the
-            // show). SQLite's bare-column-with-MAX picks that latest row.
+            // One card per movie, per show (latest episode represents the
+            // show), and — in home libraries — per video or folder. SQLite's
+            // bare-column-with-MAX picks that latest row. Photos are excluded
+            // on purpose: a 2,000-photo import would otherwise flood the home
+            // screen, and its videos and folders still surface it.
             let mut stmt = conn.prepare(&format!(
                 "SELECT {i}, show.title, season.poster_path, MAX(i.added_at) AS latest
                  FROM items i
-                 LEFT JOIN items season ON season.id = i.parent_id
+                 LEFT JOIN items season
+                        ON season.id = i.parent_id AND i.kind = 'episode'
                  LEFT JOIN items show ON show.id = season.parent_id
-                 WHERE i.kind IN ('movie','episode')
+                 WHERE i.kind IN ('movie','episode','video','folder')
                    AND (?1 IS NULL OR i.library_id = ?1)
                  GROUP BY CASE WHEN i.kind = 'episode' THEN 'show:' || show.id
                                ELSE 'item:' || i.id END
@@ -247,8 +291,8 @@ impl MediaStore for SqliteStore {
                 .query_map(params![library_id, limit], |row| {
                     Ok(RecentItem {
                         item: item_from_row(row, 0)?,
-                        show_title: row.get(18)?,
-                        season_poster: row.get(19)?,
+                        show_title: row.get(ITEM_COL_COUNT)?,
+                        season_poster: row.get(ITEM_COL_COUNT + 1)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -269,7 +313,8 @@ impl MediaStore for SqliteStore {
                  LEFT JOIN items season
                         ON season.id = i.parent_id AND i.kind = 'episode'
                  LEFT JOIN items show ON show.id = season.parent_id
-                 WHERE items_fts MATCH ?1 AND i.kind IN ('movie','show','episode')
+                 WHERE items_fts MATCH ?1
+                   AND i.kind IN ('movie','show','episode','folder','video','photo')
                  ORDER BY rank LIMIT ?2",
                 i = item_cols("i")
             ))?;
@@ -277,8 +322,8 @@ impl MediaStore for SqliteStore {
                 .query_map(params![match_expr, limit], |row| {
                     Ok(RecentItem {
                         item: item_from_row(row, 0)?,
-                        show_title: row.get(18)?,
-                        season_poster: row.get(19)?,
+                        show_title: row.get(ITEM_COL_COUNT)?,
+                        season_poster: row.get(ITEM_COL_COUNT + 1)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -291,6 +336,12 @@ impl MediaStore for SqliteStore {
         let patch = patch.clone();
         self.with_conn(move |conn| {
             let sort_title = patch.title.as_deref().map(sort_title_for);
+            let tags = patch
+                .tags
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|e| StoreError::Database(e.to_string()))?;
             conn.execute(
                 "UPDATE items SET
                      title = COALESCE(?2, title),
@@ -303,6 +354,8 @@ impl MediaStore for SqliteStore {
                      runtime_ms = COALESCE(?9, runtime_ms),
                      poster_path = COALESCE(?10, poster_path),
                      backdrop_path = COALESCE(?11, backdrop_path),
+                     recorded_at = COALESCE(?12, recorded_at),
+                     tags = COALESCE(?13, tags),
                      updated_at = unixepoch()
                  WHERE id = ?1",
                 params![
@@ -317,9 +370,97 @@ impl MediaStore for SqliteStore {
                     patch.runtime_ms,
                     patch.poster_path,
                     patch.backdrop_path,
+                    patch.recorded_at,
+                    tags,
                 ],
             )?;
             Ok(())
+        })
+        .await
+    }
+
+    async fn update_item_fields(
+        &self,
+        item_id: i64,
+        edit: &ItemEdit,
+    ) -> Result<Option<Item>, StoreError> {
+        let edit = edit.clone();
+        self.with_conn(move |conn| {
+            // Distinct from apply_metadata: an edit must be able to CLEAR a
+            // field, so each column is guarded by a "was it in the request?"
+            // flag rather than by the value being non-NULL.
+            let sort_title = edit.title.as_deref().map(sort_title_for);
+            let tags = edit
+                .tags
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|e| StoreError::Database(e.to_string()))?;
+            conn.execute(
+                "UPDATE items SET
+                     title      = CASE WHEN ?2 THEN ?3 ELSE title END,
+                     sort_title = CASE WHEN ?2 THEN ?4 ELSE sort_title END,
+                     overview   = CASE WHEN ?5 THEN ?6 ELSE overview END,
+                     recorded_at = CASE WHEN ?7 THEN ?8 ELSE recorded_at END,
+                     year       = CASE WHEN ?9 THEN ?10 ELSE year END,
+                     tags       = CASE WHEN ?11 THEN ?12 ELSE tags END,
+                     updated_at = unixepoch()
+                 WHERE id = ?1",
+                params![
+                    item_id,
+                    edit.title.is_some(),
+                    edit.title,
+                    sort_title,
+                    edit.overview.is_some(),
+                    edit.overview.flatten(),
+                    edit.recorded_at.is_some(),
+                    edit.recorded_at.flatten(),
+                    edit.year.is_some(),
+                    edit.year.flatten(),
+                    tags.is_some(),
+                    tags,
+                ],
+            )?;
+            Ok(find_by(
+                conn,
+                &format!("SELECT {ITEM_COLS} FROM items WHERE id = ?1"),
+                params![item_id],
+            )?)
+        })
+        .await
+    }
+
+    async fn set_nfo_seeded(&self, item_id: i64) -> Result<(), StoreError> {
+        self.with_conn(move |conn| {
+            conn.execute(
+                "UPDATE items SET nfo_seeded_at = unixepoch() WHERE id = ?1",
+                params![item_id],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn items_needing_artwork(
+        &self,
+        library_id: i64,
+        force: bool,
+    ) -> Result<Vec<Item>, StoreError> {
+        self.with_conn(move |conn| {
+            // Folders last: a folder inherits its first child's poster, so the
+            // children have to be thumbed first.
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {ITEM_COLS} FROM items
+                 WHERE library_id = ?1 AND kind IN ('folder','video','photo')
+                   AND (?2 = 1 OR poster_path IS NULL)
+                 ORDER BY (kind = 'folder'), id"
+            ))?;
+            let items = stmt
+                .query_map(params![library_id, force as i64], |row| {
+                    item_from_row(row, 0)
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(items)
         })
         .await
     }
@@ -330,11 +471,16 @@ impl MediaStore for SqliteStore {
         force: bool,
     ) -> Result<Vec<Item>, StoreError> {
         self.with_conn(move |conn| {
+            // Home libraries never see a provider: there is nothing to match
+            // "Christmas 2019.mp4" against, and a false match would be worse
+            // than nothing. Guarded here so no enrichment loop can reach them.
             let mut stmt = conn.prepare(&format!(
-                "SELECT {ITEM_COLS} FROM items
-                 WHERE kind IN ('movie','show') AND (?2 = 1 OR tmdb_id IS NULL)
-                   AND (?1 IS NULL OR library_id = ?1)
-                 ORDER BY id"
+                "SELECT {i} FROM items i
+                 JOIN libraries l ON l.id = i.library_id AND l.kind != 'home'
+                 WHERE i.kind IN ('movie','show') AND (?2 = 1 OR i.tmdb_id IS NULL)
+                   AND (?1 IS NULL OR i.library_id = ?1)
+                 ORDER BY i.id",
+                i = item_cols("i")
             ))?;
             let items = stmt
                 .query_map(params![library_id, force as i64], |row| {
@@ -564,8 +710,9 @@ impl MediaStore for SqliteStore {
             let mut removed = 0u64;
             // Bottom-up: file-less leaves, then empty seasons, then empty shows.
             removed += tx.execute(
-                "DELETE FROM items WHERE library_id = ?1 AND kind IN ('movie','episode')
-                 AND id NOT IN (SELECT item_id FROM files)",
+                "DELETE FROM items
+                 WHERE library_id = ?1 AND kind IN ('movie','episode','video','photo')
+                   AND id NOT IN (SELECT item_id FROM files)",
                 params![library_id],
             )? as u64;
             removed += tx.execute(
@@ -580,6 +727,21 @@ impl MediaStore for SqliteStore {
                                 WHERE kind = 'season' AND parent_id IS NOT NULL)",
                 params![library_id],
             )? as u64;
+            // Folders nest arbitrarily deep, so one pass only strips the
+            // innermost layer: delete a whole subtree of files and the empty
+            // chain above it has to go too. Loop until a pass removes nothing.
+            loop {
+                let pass = tx.execute(
+                    "DELETE FROM items WHERE library_id = ?1 AND kind = 'folder'
+                     AND id NOT IN (SELECT parent_id FROM items
+                                    WHERE parent_id IS NOT NULL)",
+                    params![library_id],
+                )? as u64;
+                removed += pass;
+                if pass == 0 {
+                    break;
+                }
+            }
             tx.commit()?;
             Ok(removed)
         })
@@ -831,6 +993,198 @@ mod tests {
             .expect("delete files");
         assert_eq!(store.prune_empty_items(lib.id).await.expect("prune"), 3);
         assert!(store.get_item(show).await.expect("get").is_none());
+    }
+
+    #[tokio::test]
+    async fn home_library_items_round_trip() {
+        use crate::domain::ItemEdit;
+
+        let store = SqliteStore::open_in_memory().expect("open");
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "Home".into(),
+                kind: LibraryKind::Home,
+                paths: vec![PathBuf::from("/media/home")],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+        assert_eq!(lib.kind, LibraryKind::Home);
+
+        let new_item = |kind, parent, title: &str| NewItem {
+            library_id: lib.id,
+            kind,
+            parent_id: parent,
+            title: title.to_owned(),
+            year: None,
+            season_number: None,
+            episode_number: None,
+        };
+        let folder = store
+            .insert_item(&new_item(ItemKind::Folder, None, "The Lake House 2021"))
+            .await
+            .expect("folder");
+        let video = store
+            .insert_item(&new_item(ItemKind::Video, Some(folder), "Christmas 2019"))
+            .await
+            .expect("video");
+        let photo = store
+            .insert_item(&new_item(ItemKind::Photo, Some(folder), "IMG_4021"))
+            .await
+            .expect("photo");
+
+        // Folder titles keep their leading article — a folder is a place, not
+        // a work, so "The Lake House 2021" must not file under L.
+        let stored = store.get_item(folder).await.expect("get").expect("present");
+        assert_eq!(stored.sort_title, "the lake house 2021");
+        assert_eq!(stored.tags, Vec::<String>::new());
+        assert_eq!(stored.nfo_seeded_at, None);
+
+        // Folder identity is (library, parent, kind, title).
+        let found = store
+            .find_child_item(lib.id, None, ItemKind::Folder, "the lake house 2021")
+            .await
+            .expect("find")
+            .expect("present");
+        assert_eq!(found.id, folder);
+        assert!(store
+            .find_child_item(
+                lib.id,
+                Some(folder),
+                ItemKind::Folder,
+                "The Lake House 2021"
+            )
+            .await
+            .expect("find")
+            .is_none());
+
+        // Seeding from an NFO goes through the ordinary metadata path.
+        store
+            .apply_metadata(
+                video,
+                &MetadataPatch {
+                    title: Some("Beach day".into()),
+                    recorded_at: Some("2019-06-14".into()),
+                    tags: Some(vec!["beach".into(), "kids".into()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("seed");
+        store.set_nfo_seeded(video).await.expect("mark seeded");
+        let seeded = store.get_item(video).await.expect("get").expect("present");
+        assert_eq!(seeded.recorded_at.as_deref(), Some("2019-06-14"));
+        assert_eq!(seeded.tags, vec!["beach".to_owned(), "kids".to_owned()]);
+        assert!(seeded.nfo_seeded_at.is_some());
+        // Tags are searchable (they ride the rebuilt FTS index).
+        let hits = store.search_items("kids", 10).await.expect("search");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].item.id, video);
+
+        // An edit can clear a field; a patch cannot.
+        let edited = store
+            .update_item_fields(
+                video,
+                &ItemEdit {
+                    recorded_at: Some(None),
+                    overview: Some(Some("Windy.".into())),
+                    tags: Some(Vec::new()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("edit")
+            .expect("present");
+        assert_eq!(edited.recorded_at, None);
+        assert_eq!(edited.overview.as_deref(), Some("Windy."));
+        assert!(edited.tags.is_empty());
+        assert_eq!(edited.title, "Beach day", "an absent field is untouched");
+
+        // Top level = what sits under a root; children hang off the folder.
+        let page = store
+            .list_top_items(lib.id, ItemSort::Recorded, 0, 10)
+            .await
+            .expect("list");
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items[0].id, folder);
+        let kids = store.get_item_children(folder).await.expect("children");
+        assert_eq!(kids.len(), 2);
+
+        // Recorded sort: dated items first (newest first), undated last.
+        store
+            .apply_metadata(
+                photo,
+                &MetadataPatch {
+                    recorded_at: Some("2019-06-15".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("date photo");
+        let dated = store
+            .list_top_items(lib.id, ItemSort::Recorded, 0, 10)
+            .await
+            .expect("list");
+        assert_eq!(dated.items[0].id, folder);
+        assert_eq!(dated.items[0].recorded_at, None);
+    }
+
+    #[tokio::test]
+    async fn empty_folder_chains_prune_all_the_way_up() {
+        let store = SqliteStore::open_in_memory().expect("open");
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "Home".into(),
+                kind: LibraryKind::Home,
+                paths: vec![PathBuf::from("/media/home")],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+        let mut parent = None;
+        for name in ["2019", "Summer", "Beach Trip"] {
+            parent = Some(
+                store
+                    .insert_item(&NewItem {
+                        library_id: lib.id,
+                        kind: ItemKind::Folder,
+                        parent_id: parent,
+                        title: name.into(),
+                        year: None,
+                        season_number: None,
+                        episode_number: None,
+                    })
+                    .await
+                    .expect("folder"),
+            );
+        }
+        let video = store
+            .insert_item(&NewItem {
+                library_id: lib.id,
+                kind: ItemKind::Video,
+                parent_id: parent,
+                title: "clip".into(),
+                year: None,
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("video");
+        store
+            .upsert_file(video, "/media/home/clip.mp4", 1, 1, &ProbeResult::default())
+            .await
+            .expect("file");
+
+        assert_eq!(store.prune_empty_items(lib.id).await.expect("prune"), 0);
+
+        // Delete the only file: the video and all three folders above it go.
+        let paths = store.library_file_paths(lib.id).await.expect("paths");
+        store.delete_files(&[paths[0].0]).await.expect("delete");
+        assert_eq!(
+            store.prune_empty_items(lib.id).await.expect("prune"),
+            4,
+            "a nested empty chain must prune in full, not one layer per scan"
+        );
     }
 
     #[tokio::test]

@@ -154,13 +154,103 @@ const MIGRATIONS: &[&str] = &[
         last_sync_at    INTEGER NOT NULL DEFAULT 0,
         last_activities TEXT
     ) STRICT;",
+    // v6: home video & photos. The v2 schema baked the allowed kinds into
+    // CHECK constraints, and SQLite cannot alter a CHECK — so both tables are
+    // rebuilt. The CHECKs are dropped rather than extended: kind validation
+    // already lives in `LibraryKind::parse` / `ItemKind::parse` (and
+    // `item_from_row` fails loudly on an unknown kind), so the constraint was
+    // redundant with app-level validation that has to exist anyway — and
+    // every future media type would otherwise repeat this dance. STRICT
+    // typing stays. Three traps, all handled here:
+    //   1. `ALTER TABLE … RENAME` rewrites child FK references, so this is
+    //      create-new → copy → drop-old → rename-new, never rename-old-first.
+    //   2. FK enforcement must be OFF (the runner does that — `PRAGMA
+    //      foreign_keys` is a no-op inside the transaction this runs in), or
+    //      `DROP TABLE libraries` fails against its children.
+    //   3. `items_fts` is contentless-external over `items`; rebuilding
+    //      `items` orphans it, so the triggers and table are recreated and the
+    //      index is rebuilt from scratch (now including tags).
+    "DROP TRIGGER items_fts_ai;
+    DROP TRIGGER items_fts_ad;
+    DROP TRIGGER items_fts_au;
+
+    CREATE TABLE libraries_new (
+        id         INTEGER PRIMARY KEY,
+        name       TEXT NOT NULL UNIQUE,
+        kind       TEXT NOT NULL,
+        paths      TEXT NOT NULL,
+        created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+        anime      INTEGER NOT NULL DEFAULT 0
+    ) STRICT;
+    INSERT INTO libraries_new (id, name, kind, paths, created_at, anime)
+        SELECT id, name, kind, paths, created_at, anime FROM libraries;
+    DROP TABLE libraries;
+    ALTER TABLE libraries_new RENAME TO libraries;
+
+    CREATE TABLE items_new (
+        id             INTEGER PRIMARY KEY,
+        library_id     INTEGER NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
+        kind           TEXT NOT NULL,
+        parent_id      INTEGER REFERENCES items(id) ON DELETE CASCADE,
+        title          TEXT NOT NULL,
+        sort_title     TEXT NOT NULL,
+        year           INTEGER,
+        overview       TEXT,
+        tmdb_id        INTEGER,
+        imdb_id        TEXT,
+        season_number  INTEGER,
+        episode_number INTEGER,
+        air_date       TEXT,
+        runtime_ms     INTEGER,
+        poster_path    TEXT,
+        backdrop_path  TEXT,
+        added_at       INTEGER NOT NULL DEFAULT (unixepoch()),
+        updated_at     INTEGER NOT NULL DEFAULT (unixepoch()),
+        recorded_at    TEXT,
+        tags           TEXT NOT NULL DEFAULT '[]',
+        nfo_seeded_at  INTEGER
+    ) STRICT;
+    INSERT INTO items_new
+        SELECT id, library_id, kind, parent_id, title, sort_title, year, overview,
+               tmdb_id, imdb_id, season_number, episode_number, air_date, runtime_ms,
+               poster_path, backdrop_path, added_at, updated_at, NULL, '[]', NULL
+        FROM items;
+    DROP TABLE items;
+    ALTER TABLE items_new RENAME TO items;
+    CREATE INDEX idx_items_library_kind ON items(library_id, kind);
+    CREATE INDEX idx_items_parent ON items(parent_id);
+    CREATE INDEX idx_items_added ON items(added_at DESC);
+
+    DROP TABLE items_fts;
+    CREATE VIRTUAL TABLE items_fts USING fts5(
+        title, overview, tags, content='items', content_rowid='id'
+    );
+    CREATE TRIGGER items_fts_ai AFTER INSERT ON items BEGIN
+        INSERT INTO items_fts(rowid, title, overview, tags)
+        VALUES (new.id, new.title, new.overview, new.tags);
+    END;
+    CREATE TRIGGER items_fts_ad AFTER DELETE ON items BEGIN
+        INSERT INTO items_fts(items_fts, rowid, title, overview, tags)
+        VALUES ('delete', old.id, old.title, old.overview, old.tags);
+    END;
+    CREATE TRIGGER items_fts_au AFTER UPDATE OF title, overview, tags ON items BEGIN
+        INSERT INTO items_fts(items_fts, rowid, title, overview, tags)
+        VALUES ('delete', old.id, old.title, old.overview, old.tags);
+        INSERT INTO items_fts(rowid, title, overview, tags)
+        VALUES (new.id, new.title, new.overview, new.tags);
+    END;
+    INSERT INTO items_fts(items_fts) VALUES('rebuild');",
 ];
 
 /// Column list matching [`item_from_row`]. Prefix with a table alias via
 /// [`item_cols`].
 const ITEM_COLS: &str = "id, library_id, kind, parent_id, title, sort_title, year, overview, \
      tmdb_id, imdb_id, season_number, episode_number, air_date, runtime_ms, \
-     poster_path, backdrop_path, added_at, updated_at";
+     poster_path, backdrop_path, added_at, updated_at, recorded_at, tags, nfo_seeded_at";
+
+/// How many columns [`ITEM_COLS`] selects — the offset of the first column a
+/// query appends after it. Keep in step with [`ITEM_COLS`].
+const ITEM_COL_COUNT: usize = 21;
 
 /// `ITEM_COLS` qualified with a table alias (e.g. `i.id, i.library_id, ...`).
 fn item_cols(alias: &str) -> String {
@@ -184,6 +274,7 @@ fn item_from_row(row: &Row<'_>, base: usize) -> rusqlite::Result<Item> {
     let kind_raw: String = row.get(base + 2)?;
     let kind = ItemKind::parse(&kind_raw)
         .ok_or_else(|| conversion_err(base + 2, format!("unknown item kind `{kind_raw}`")))?;
+    let tags_json: String = row.get(base + 19)?;
     Ok(Item {
         id: row.get(base)?,
         library_id: row.get(base + 1)?,
@@ -203,6 +294,10 @@ fn item_from_row(row: &Row<'_>, base: usize) -> rusqlite::Result<Item> {
         backdrop_path: row.get(base + 15)?,
         added_at: row.get(base + 16)?,
         updated_at: row.get(base + 17)?,
+        recorded_at: row.get(base + 18)?,
+        tags: serde_json::from_str(&tags_json)
+            .map_err(|e| conversion_err(base + 19, format!("tags: {e}")))?,
+        nfo_seeded_at: row.get(base + 20)?,
     })
 }
 
@@ -338,8 +433,28 @@ impl SqliteStore {
         }
         for (index, sql) in MIGRATIONS.iter().enumerate().skip(current as usize) {
             let version = index as i64 + 1;
-            conn.execute_batch(&format!("BEGIN;\n{sql}\nCOMMIT;"))
-                .map_err(|e| StoreError::Migration(format!("migrating to v{version}: {e}")))?;
+            // Foreign keys are off for the duration of a migration. A table
+            // rebuild (v6) has to DROP a table its children reference, and
+            // `PRAGMA foreign_keys` is a no-op *inside* a transaction — which
+            // is where the migration itself runs — so the toggle has to happen
+            // out here. Integrity is re-checked below instead of enforced
+            // statement by statement.
+            conn.pragma_update(None, "foreign_keys", "OFF")?;
+            let applied = conn
+                .execute_batch(&format!("BEGIN;\n{sql}\nCOMMIT;"))
+                .map_err(|e| StoreError::Migration(format!("migrating to v{version}: {e}")));
+            conn.pragma_update(None, "foreign_keys", "ON")?;
+            applied?;
+            let dangling: i64 =
+                conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                    row.get(0)
+                })?;
+            if dangling > 0 {
+                return Err(StoreError::Migration(format!(
+                    "migrating to v{version} left {dangling} dangling foreign key \
+                     reference(s) — refusing to continue"
+                )));
+            }
             conn.pragma_update(None, "user_version", version)?;
             tracing::info!(version, "applied schema migration");
         }
@@ -430,7 +545,7 @@ impl SettingsStore for SqliteStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::SettingsStore;
+    use crate::store::{MediaStore, SettingsStore};
 
     #[tokio::test]
     async fn settings_roundtrip_and_upsert() {
@@ -461,6 +576,160 @@ mod tests {
             first, second,
             "instance id must be immutable across restarts"
         );
+    }
+
+    /// Build a database at the pre-home-video schema (v5) and fill it with one
+    /// row of every shape v6's table rebuild has to carry across.
+    fn seed_v5(db: &Path) {
+        let conn = Connection::open(db).expect("raw open");
+        conn.pragma_update(None, "foreign_keys", "ON").expect("fk");
+        for (index, sql) in MIGRATIONS.iter().enumerate().take(5) {
+            conn.execute_batch(&format!("BEGIN;\n{sql}\nCOMMIT;"))
+                .unwrap_or_else(|e| panic!("v{}: {e}", index + 1));
+        }
+        conn.pragma_update(None, "user_version", 5)
+            .expect("version");
+        conn.execute_batch(
+            "INSERT INTO settings (key, value) VALUES ('instance.id', 'fixture-instance');
+             INSERT INTO users (id, username, password_hash, is_admin)
+                 VALUES (1, 'paul', 'hash', 1);
+             INSERT INTO libraries (id, name, kind, paths, anime)
+                 VALUES (1, 'Movies', 'movies', '[\"/media/movies\"]', 0),
+                        (2, 'TV', 'shows', '[\"/media/tv\"]', 0);
+             INSERT INTO items (id, library_id, kind, parent_id, title, sort_title, year, overview)
+                 VALUES (10, 1, 'movie', NULL, 'Blade Runner', 'blade runner', 1982, 'Replicants.'),
+                        (20, 2, 'show', NULL, 'Severance', 'severance', 2022, NULL),
+                        (21, 2, 'season', 20, 'Season 1', 'season 1', NULL, NULL),
+                        (22, 2, 'episode', 21, 'Good News', 'good news', NULL, NULL);
+             INSERT INTO files (id, item_id, path, size, mtime, container, audio_offset_ms)
+                 VALUES (100, 10, '/media/movies/blade-runner.mkv', 42, 7, 'mkv', -250);
+             INSERT INTO watch_state (user_id, item_id, position_ms, watched)
+                 VALUES (1, 10, 61000, 0);",
+        )
+        .expect("seed");
+    }
+
+    /// The single most important test in the home-video feature: v6 rebuilds
+    /// both `libraries` and `items` (SQLite can't alter a CHECK), and a
+    /// mistake there eats a real library.
+    #[tokio::test]
+    async fn v6_rebuild_preserves_everything() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("plurx.db");
+        seed_v5(&db);
+
+        // Open through the real binary path — this applies v6.
+        let store = SqliteStore::open(&db).expect("migrate");
+        assert_eq!(
+            store.instance_id().await.expect("instance id"),
+            "fixture-instance",
+            "the instance id must survive the rebuild"
+        );
+
+        let conn = Connection::open(&db).expect("raw reopen");
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .expect("version");
+        assert_eq!(version, MIGRATIONS.len() as i64);
+        assert_eq!(version, 6);
+
+        // Every row survives, values identical.
+        let dangling: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
+            .expect("fk check");
+        assert_eq!(dangling, 0, "migration left dangling foreign keys");
+
+        let (name, kind, anime): (String, String, i64) = conn
+            .query_row(
+                "SELECT name, kind, anime FROM libraries WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("library");
+        assert_eq!(
+            (name.as_str(), kind.as_str(), anime),
+            ("Movies", "movies", 0)
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM libraries", [], |r| r.get::<_, i64>(0))
+                .expect("count"),
+            2
+        );
+
+        let (title, year, overview, parent): (String, i64, String, Option<i64>) = conn
+            .query_row(
+                "SELECT title, year, overview, parent_id FROM items WHERE id = 10",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .expect("item");
+        assert_eq!(
+            (title.as_str(), year, overview.as_str(), parent),
+            ("Blade Runner", 1982, "Replicants.", None)
+        );
+        assert_eq!(
+            conn.query_row("SELECT parent_id FROM items WHERE id = 22", [], |r| r
+                .get::<_, i64>(0))
+                .expect("episode parent"),
+            21,
+            "the show hierarchy must survive"
+        );
+        // New columns get their defaults, not NULL-vs-missing surprises.
+        let (recorded, tags, seeded): (Option<String>, String, Option<i64>) = conn
+            .query_row(
+                "SELECT recorded_at, tags, nfo_seeded_at FROM items WHERE id = 10",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("new columns");
+        assert_eq!((recorded, tags.as_str(), seeded), (None, "[]", None));
+
+        // Files and watch state are untouched (audio_offset_ms included).
+        let (path, offset): (String, i64) = conn
+            .query_row(
+                "SELECT path, audio_offset_ms FROM files WHERE id = 100",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("file");
+        assert_eq!(
+            (path.as_str(), offset),
+            ("/media/movies/blade-runner.mkv", -250)
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT position_ms FROM watch_state WHERE user_id = 1 AND item_id = 10",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .expect("watch state"),
+            61000
+        );
+
+        // The FTS index was recreated and rebuilt: a pre-migration title is
+        // still findable, and searching it doesn't error on the new column.
+        let hits = store.search_items("blade", 10).await.expect("search");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].item.title, "Blade Runner");
+
+        // And the whole point: the new kinds insert cleanly now that the
+        // CHECK constraints are gone.
+        conn.execute(
+            "INSERT INTO libraries (id, name, kind, paths, anime)
+             VALUES (3, 'Home', 'home', '[\"/media/home\"]', 0)",
+            [],
+        )
+        .expect("home library");
+        conn.execute(
+            "INSERT INTO items (id, library_id, kind, parent_id, title, sort_title)
+             VALUES (30, 3, 'folder', NULL, '2019', '2019'),
+                    (31, 3, 'video', 30, 'Beach', 'beach'),
+                    (32, 3, 'photo', 30, 'IMG_4021', 'img_4021')",
+            [],
+        )
+        .expect("home items");
     }
 
     #[tokio::test]

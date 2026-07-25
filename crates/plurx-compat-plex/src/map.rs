@@ -27,20 +27,33 @@ impl From<Option<WatchState>> for View {
     }
 }
 
-fn section_type(kind: LibraryKind) -> &'static str {
+/// The Plex section type for a library, or `None` for library kinds the
+/// façade doesn't expose. Home libraries are deliberately absent: Plex has no
+/// section type for a folder tree of camera files, and a half-mapped section
+/// breaks Kodi clients harder than an absent one.
+fn section_type(kind: LibraryKind) -> Option<&'static str> {
     match kind {
-        LibraryKind::Movies => "movie",
-        LibraryKind::Shows => "show",
+        LibraryKind::Movies => Some("movie"),
+        LibraryKind::Shows => Some("show"),
+        LibraryKind::Home => None,
     }
 }
 
-fn item_type(kind: ItemKind) -> &'static str {
+/// The Plex item type, or `None` for kinds the façade doesn't expose (the
+/// home-library kinds — see [`section_type`]).
+fn item_type(kind: ItemKind) -> Option<&'static str> {
     match kind {
-        ItemKind::Movie => "movie",
-        ItemKind::Show => "show",
-        ItemKind::Season => "season",
-        ItemKind::Episode => "episode",
+        ItemKind::Movie => Some("movie"),
+        ItemKind::Show => Some("show"),
+        ItemKind::Season => Some("season"),
+        ItemKind::Episode => Some("episode"),
+        ItemKind::Folder | ItemKind::Video | ItemKind::Photo => None,
     }
+}
+
+/// Whether the Plex façade exposes this library at all.
+pub fn is_plex_visible(kind: LibraryKind) -> bool {
+    section_type(kind).is_some()
 }
 
 fn resolution(height: Option<i64>) -> Option<&'static str> {
@@ -53,17 +66,20 @@ fn resolution(height: Option<i64>) -> Option<&'static str> {
     })
 }
 
-/// A `<Directory>` for `/library/sections`.
-pub fn section_directory(lib: &Library) -> Element {
-    Element::new("Directory")
-        .attr_i("key", lib.id)
-        .attr("title", lib.name.clone())
-        .attr("type", section_type(lib.kind))
-        .attr("agent", "com.plexapp.agents.none")
-        .attr("scanner", "plurx")
-        .attr("language", "en")
-        .attr("uuid", format!("plurx-section-{}", lib.id))
-        .attr_i("updatedAt", lib.created_at)
+/// A `<Directory>` for `/library/sections`, or `None` for a library the
+/// façade doesn't expose (see [`section_type`]).
+pub fn section_directory(lib: &Library) -> Option<Element> {
+    Some(
+        Element::new("Directory")
+            .attr_i("key", lib.id)
+            .attr("title", lib.name.clone())
+            .attr("type", section_type(lib.kind)?)
+            .attr("agent", "com.plexapp.agents.none")
+            .attr("scanner", "plurx")
+            .attr("language", "en")
+            .attr("uuid", format!("plurx-section-{}", lib.id))
+            .attr_i("updatedAt", lib.created_at),
+    )
 }
 
 /// Common metadata attributes shared by Video and Directory items.
@@ -71,7 +87,9 @@ fn base_meta(mut el: Element, item: &Item, view: View) -> Element {
     el = el
         .attr_i("ratingKey", item.id)
         .attr("key", format!("/library/metadata/{}", item.id))
-        .attr("type", item_type(item.kind))
+        // Unexposed kinds never reach the façade (the handlers 404 them), so
+        // the fallback only guards against a future caller forgetting.
+        .attr("type", item_type(item.kind).unwrap_or("unknown"))
         .attr("title", item.title.clone())
         .attr("titleSort", item.sort_title.clone())
         .attr_opt("summary", item.overview.clone())
@@ -189,6 +207,9 @@ mod tests {
             backdrop_path: None,
             added_at: 100,
             updated_at: 200,
+            recorded_at: None,
+            tags: Vec::new(),
+            nfo_seeded_at: None,
         }
     }
 
@@ -265,9 +286,31 @@ mod tests {
             anime: false,
             created_at: 5,
         };
-        let doc = section_directory(&lib).to_document();
+        let doc = section_directory(&lib)
+            .expect("movies are exposed")
+            .to_document();
         assert!(doc.contains("key=\"3\""));
         assert!(doc.contains("type=\"movie\""));
         assert!(doc.contains("title=\"Movies\""));
+    }
+
+    #[test]
+    fn home_libraries_are_not_exposed() {
+        // A half-mapped section type breaks Kodi clients harder than an absent
+        // one, so the façade skips home libraries outright.
+        let lib = Library {
+            id: 4,
+            name: "Home videos".into(),
+            kind: LibraryKind::Home,
+            paths: vec![],
+            anime: false,
+            created_at: 5,
+        };
+        assert!(section_directory(&lib).is_none());
+        assert!(!is_plex_visible(LibraryKind::Home));
+        assert!(is_plex_visible(LibraryKind::Movies));
+        assert!(item_type(ItemKind::Video).is_none());
+        assert!(item_type(ItemKind::Photo).is_none());
+        assert!(item_type(ItemKind::Folder).is_none());
     }
 }

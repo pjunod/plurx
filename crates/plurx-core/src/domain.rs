@@ -15,6 +15,10 @@ use serde::{Deserialize, Serialize};
 pub enum LibraryKind {
     Movies,
     Shows,
+    /// Home video & photos: a folder tree of camera files. No metadata
+    /// provider — the source of truth is the disk (folder layout, optional
+    /// Kodi-style `.nfo` sidecars, embedded dates). See docs/HOMEVIDEO-PLAN.md.
+    Home,
 }
 
 impl LibraryKind {
@@ -22,6 +26,7 @@ impl LibraryKind {
         match self {
             LibraryKind::Movies => "movies",
             LibraryKind::Shows => "shows",
+            LibraryKind::Home => "home",
         }
     }
 
@@ -29,6 +34,7 @@ impl LibraryKind {
         match s {
             "movies" => Some(LibraryKind::Movies),
             "shows" => Some(LibraryKind::Shows),
+            "home" => Some(LibraryKind::Home),
             _ => None,
         }
     }
@@ -55,7 +61,7 @@ pub struct NewLibrary {
 }
 
 // ---------------------------------------------------------------------------
-// Items (movie | show | season | episode)
+// Items (movie | show | season | episode | folder | video | photo)
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,6 +71,14 @@ pub enum ItemKind {
     Show,
     Season,
     Episode,
+    /// A mirrored directory in a `home` library ("2019", "Beach Trip").
+    /// Folders have no files of their own — they group other items.
+    Folder,
+    /// A home-video clip: plays exactly like a movie, but is titled from the
+    /// filename and never matched against a provider.
+    Video,
+    /// A still image in a `home` library. Served as bytes, never transcoded.
+    Photo,
 }
 
 impl ItemKind {
@@ -74,6 +88,9 @@ impl ItemKind {
             ItemKind::Show => "show",
             ItemKind::Season => "season",
             ItemKind::Episode => "episode",
+            ItemKind::Folder => "folder",
+            ItemKind::Video => "video",
+            ItemKind::Photo => "photo",
         }
     }
 
@@ -83,6 +100,9 @@ impl ItemKind {
             "show" => Some(ItemKind::Show),
             "season" => Some(ItemKind::Season),
             "episode" => Some(ItemKind::Episode),
+            "folder" => Some(ItemKind::Folder),
+            "video" => Some(ItemKind::Video),
+            "photo" => Some(ItemKind::Photo),
             _ => None,
         }
     }
@@ -109,6 +129,18 @@ pub struct Item {
     pub backdrop_path: Option<String>,
     pub added_at: i64,
     pub updated_at: i64,
+    /// ISO-8601 date or datetime ("2019-06-14" / "2019-06-14T18:22:03") of
+    /// when the footage/photo was captured. TEXT so it sorts
+    /// lexicographically; filled by the home scanner's precedence ladder
+    /// (NFO date → container creation_time / EXIF → filename → mtime).
+    pub recorded_at: Option<String>,
+    /// Free-form labels ("beach", "kids"). JSON array in SQLite, like
+    /// `audio_streams`. Seeded from NFO `<tag>`/`<genre>`, edited in the UI.
+    pub tags: Vec<String>,
+    /// Unix seconds when an NFO sidecar was consumed for this item.
+    /// `None` = never seeded (and eligible for seeding if a sidecar appears).
+    /// Once set, the sidecar is dead to plurx — see docs/HOMEVIDEO-PLAN.md §4.3.
+    pub nfo_seeded_at: Option<i64>,
 }
 
 /// What the scanner knows when it first sees a file — enough to place the
@@ -138,6 +170,12 @@ pub struct MetadataPatch {
     pub runtime_ms: Option<i64>,
     pub poster_path: Option<String>,
     pub backdrop_path: Option<String>,
+    /// Capture date (home libraries). Same add-or-replace semantics as the
+    /// rest: `None` leaves the stored value alone.
+    pub recorded_at: Option<String>,
+    /// Labels to set (home libraries). `None` leaves them alone; an empty
+    /// vector is not a clear — use [`ItemEdit`] for that.
+    pub tags: Option<Vec<String>>,
 }
 
 impl MetadataPatch {
@@ -151,6 +189,32 @@ impl MetadataPatch {
             && self.runtime_ms.is_none()
             && self.poster_path.is_none()
             && self.backdrop_path.is_none()
+            && self.recorded_at.is_none()
+            && self.tags.is_none()
+    }
+}
+
+/// A hand edit of one item's metadata (home libraries only — see
+/// docs/HOMEVIDEO-PLAN.md §2). Unlike [`MetadataPatch`], which agents use to
+/// add or replace, an edit must be able to *clear* a field: the outer
+/// `Option` is "present in the request", the inner one is the new value.
+#[derive(Debug, Clone, Default)]
+pub struct ItemEdit {
+    /// Never empty when present — an empty title is rejected by the caller.
+    pub title: Option<String>,
+    pub overview: Option<Option<String>>,
+    pub recorded_at: Option<Option<String>>,
+    pub year: Option<Option<i32>>,
+    pub tags: Option<Vec<String>>,
+}
+
+impl ItemEdit {
+    pub fn is_empty(&self) -> bool {
+        self.title.is_none()
+            && self.overview.is_none()
+            && self.recorded_at.is_none()
+            && self.year.is_none()
+            && self.tags.is_none()
     }
 }
 
@@ -302,6 +366,9 @@ pub enum ItemSort {
     /// Highest video resolution first (by the item's best file); items with no
     /// probed height sort last.
     Resolution,
+    /// Capture date, newest first; items with no `recorded_at` sort last.
+    /// The natural default for home libraries.
+    Recorded,
 }
 
 impl ItemSort {
@@ -311,6 +378,7 @@ impl ItemSort {
             "added" => Some(ItemSort::Added),
             "year" => Some(ItemSort::Year),
             "resolution" => Some(ItemSort::Resolution),
+            "recorded" => Some(ItemSort::Recorded),
             _ => None,
         }
     }

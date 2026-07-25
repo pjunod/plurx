@@ -129,7 +129,9 @@ pub async fn sections(
     State(state): State<AppState>,
 ) -> Result<Response, ApiError> {
     let libs = state.store.list_libraries().await?;
-    let dirs = libs.iter().map(map::section_directory).collect();
+    // Home libraries are skipped: the façade has no honest Plex section type
+    // for a folder tree of camera files (see docs/HOMEVIDEO-PLAN.md §2).
+    let dirs = libs.iter().filter_map(map::section_directory).collect();
     Ok(xml(plex::container(dirs)))
 }
 
@@ -148,6 +150,24 @@ async fn views(
         .collect())
 }
 
+/// Fetch an item, 404ing if it lives in a library the façade doesn't expose.
+async fn visible_item(state: &AppState, id: i64, what: &'static str) -> Result<Item, ApiError> {
+    let item = state
+        .store
+        .get_item(id)
+        .await?
+        .ok_or(ApiError::NotFound(what))?;
+    let visible = match state.store.get_library(item.library_id).await? {
+        Some(lib) => map::is_plex_visible(lib.kind),
+        None => false,
+    };
+    if visible {
+        Ok(item)
+    } else {
+        Err(ApiError::NotFound(what))
+    }
+}
+
 /// Build the right element for an item (Video with media, or Directory).
 async fn element_for(state: &AppState, item: &Item, view: View) -> Result<plex::Element, ApiError> {
     match item.kind {
@@ -163,6 +183,9 @@ async fn element_for(state: &AppState, item: &Item, view: View) -> Result<plex::
                 view,
             ))
         }
+        // Home-library kinds are not exposed through the façade; the handlers
+        // above filter them out before we get here.
+        ItemKind::Folder | ItemKind::Video | ItemKind::Photo => Err(ApiError::NotFound("metadata")),
     }
 }
 
@@ -172,8 +195,10 @@ pub async fn section_all(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Response, ApiError> {
-    if state.store.get_library(id).await?.is_none() {
-        return Err(ApiError::NotFound("section"));
+    match state.store.get_library(id).await? {
+        Some(lib) if map::is_plex_visible(lib.kind) => {}
+        // Absent, or a library the façade doesn't expose — same answer.
+        _ => return Err(ApiError::NotFound("section")),
     }
     let page = state
         .store
@@ -194,11 +219,7 @@ pub async fn metadata(
     State(state): State<AppState>,
     Path(key): Path<i64>,
 ) -> Result<Response, ApiError> {
-    let item = state
-        .store
-        .get_item(key)
-        .await?
-        .ok_or(ApiError::NotFound("metadata"))?;
+    let item = visible_item(&state, key, "metadata").await?;
     let view = View::from(state.store.watch_state(user.id, key).await?);
     Ok(xml(plex::container(vec![
         element_for(&state, &item, view).await?,
@@ -211,9 +232,7 @@ pub async fn children(
     State(state): State<AppState>,
     Path(key): Path<i64>,
 ) -> Result<Response, ApiError> {
-    if state.store.get_item(key).await?.is_none() {
-        return Err(ApiError::NotFound("metadata"));
-    }
+    visible_item(&state, key, "metadata").await?;
     let kids = state.store.get_item_children(key).await?;
     let views = views(&state, user.id, &kids).await?;
     let mut elements = Vec::with_capacity(kids.len());
@@ -245,11 +264,7 @@ pub async fn image(
     State(state): State<AppState>,
     Path((key, kind)): Path<(i64, String)>,
 ) -> Result<Response, ApiError> {
-    let item = state
-        .store
-        .get_item(key)
-        .await?
-        .ok_or(ApiError::NotFound("image"))?;
+    let item = visible_item(&state, key, "image").await?;
     let filename = match kind.as_str() {
         "art" => item.backdrop_path,
         _ => item.poster_path,

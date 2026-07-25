@@ -21,8 +21,8 @@ pub use sqlite::SqliteStore;
 use async_trait::async_trait;
 
 use crate::domain::{
-    InProgressItem, Item, ItemPage, ItemSort, Library, MediaFile, MetadataPatch, NewItem,
-    NewLibrary, ProbeResult, RecentItem, TraktAuth, User, WatchState,
+    InProgressItem, Item, ItemEdit, ItemKind, ItemPage, ItemSort, Library, MediaFile,
+    MetadataPatch, NewItem, NewLibrary, ProbeResult, RecentItem, TraktAuth, User, WatchState,
 };
 // RecentItem is reused for next-up (episode + show title).
 use crate::error::StoreError;
@@ -141,6 +141,16 @@ pub trait MediaStore: Send + Sync + 'static {
         season_id: i64,
         episode_number: i32,
     ) -> Result<Option<Item>, StoreError>;
+    /// Find a child by (library, parent, kind, title) — how the home
+    /// scanner's mirrored folder tree keeps its identity. `parent_id: None`
+    /// matches items directly under a library root.
+    async fn find_child_item(
+        &self,
+        library_id: i64,
+        parent_id: Option<i64>,
+        kind: ItemKind,
+        title: &str,
+    ) -> Result<Option<Item>, StoreError>;
     async fn insert_item(&self, item: &NewItem) -> Result<i64, StoreError>;
 
     // --- browse ---
@@ -172,6 +182,26 @@ pub trait MediaStore: Send + Sync + 'static {
     ) -> Result<Vec<Item>, StoreError>;
     /// All episodes of a show (across seasons), for bulk episode enrichment.
     async fn episodes_for_show(&self, show_id: i64) -> Result<Vec<Item>, StoreError>;
+    /// Home-library items whose artwork the local enricher should generate:
+    /// folders, videos, and photos with no poster yet (`force` = all of them).
+    /// Folders come last so they can inherit a child's finished poster.
+    async fn items_needing_artwork(
+        &self,
+        library_id: i64,
+        force: bool,
+    ) -> Result<Vec<Item>, StoreError>;
+    /// Apply a hand edit — distinct from [`apply_metadata`](Self::apply_metadata)
+    /// because an edit must be able to *clear* a field. Returns the updated
+    /// item, or `None` if the id doesn't exist.
+    async fn update_item_fields(
+        &self,
+        item_id: i64,
+        edit: &ItemEdit,
+    ) -> Result<Option<Item>, StoreError>;
+    /// Record that an NFO sidecar has been consumed for this item. Seeding
+    /// happens at most once, ever (docs/HOMEVIDEO-PLAN.md §4.3) — after this
+    /// the sidecar is dead to plurx, so a user's edits can never be clobbered.
+    async fn set_nfo_seeded(&self, item_id: i64) -> Result<(), StoreError>;
 
     // --- files ---
     async fn get_file_by_path(&self, path: &str) -> Result<Option<MediaFile>, StoreError>;

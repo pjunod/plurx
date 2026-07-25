@@ -277,6 +277,10 @@ async fn place_item(
                 .await?;
             Ok(Some(id))
         }
+        // The home arm (folder mirroring, NFO seeding, the date ladder) lands
+        // with the rest of the home scanner; until then a home library places
+        // nothing.
+        LibraryKind::Home => Ok(None),
         LibraryKind::Shows => {
             // Anime libraries use absolute numbering; regular shows use S/E.
             let parsed = if library.anime {

@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use rusqlite::{params, OptionalExtension};
 
-use super::{item_cols, item_from_row, SqliteStore};
+use super::{item_cols, item_from_row, SqliteStore, ITEM_COL_COUNT};
 use crate::domain::{InProgressItem, RecentItem, WatchState};
 use crate::error::StoreError;
 use crate::store::WatchStore;
@@ -213,7 +213,7 @@ impl WatchStore for SqliteStore {
                         ON season.id = i.parent_id AND i.kind = 'episode'
                  LEFT JOIN items show ON show.id = season.parent_id
                  WHERE w.user_id = ?1 AND w.watched = 0 AND w.position_ms > 0
-                   AND i.kind IN ('movie','episode')
+                   AND i.kind IN ('movie','episode','video')
                  ORDER BY w.updated_at DESC LIMIT ?2",
                 i = item_cols("i")
             ))?;
@@ -221,9 +221,9 @@ impl WatchStore for SqliteStore {
                 .query_map(params![user_id, limit], |row| {
                     Ok(InProgressItem {
                         item: item_from_row(row, 0)?,
-                        show_title: row.get(18)?,
-                        state: watch_from_row(row, 19)?,
-                        season_poster: row.get(23)?,
+                        show_title: row.get(ITEM_COL_COUNT)?,
+                        state: watch_from_row(row, ITEM_COL_COUNT + 1)?,
+                        season_poster: row.get(ITEM_COL_COUNT + 5)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -277,8 +277,8 @@ impl WatchStore for SqliteStore {
                 .query_map(params![user_id, limit], |row| {
                     Ok(RecentItem {
                         item: item_from_row(row, 0)?,
-                        show_title: row.get(18)?,
-                        season_poster: row.get(19)?,
+                        show_title: row.get(ITEM_COL_COUNT)?,
+                        season_poster: row.get(ITEM_COL_COUNT + 1)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
