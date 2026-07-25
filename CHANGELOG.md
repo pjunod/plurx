@@ -25,6 +25,22 @@ bump may break compatibility and a **patch** bump never does.
 
 ### Fixed
 
+- Items are no longer marked watched minutes in. The web player treated the
+  `ended` event as "the film finished", but `ended` fires at the end of the
+  media the browser *has*, which is not the same thing: a remux is a
+  one-directional pipe that stops early whenever its session is reaped or
+  ffmpeg exits, and an HLS playlist that stops growing reads as complete. On
+  that signal the player posted the full runtime as the position, which cleared
+  the server's 95% threshold — and since the watched flag is deliberately
+  sticky, one truncated stream marked a film watched for good and told Trakt so.
+  `ended` now only counts as completion when the playhead really is at the end;
+  short of that the true position is recorded and playback resumes from there,
+  giving up after three failures at the same spot rather than looping. The
+  player also no longer offers a growing stream's `duration` as the runtime —
+  only direct play's own duration is the whole file — and the server clamps a
+  reported position to the runtime so a resume point can't land past the last
+  frame. Anything already mis-marked can be cleared with **Mark unwatched** on
+  the item.
 - On a touchscreen, the playback-info panel no longer buries the player
   controls. It had no size limit and no close affordance — touch has no `i` key
   to press — so opening it covered both control bars with no way back. It now
@@ -45,8 +61,8 @@ bump may break compatibility and a **patch** bump never does.
   but the server's reply has to cross a downlink queue that the burst is busy
   filling, and if it is group-addressed it gets no ACK, no retry, the lowest
   basic rate, and a wait for the next DTIM. Streams now burst 30 seconds
-  flat-out
-  (so starting and seeking stay instant) and then settle to 4× real time,
+  flat-out (so starting and seeking stay instant) and then settle to 4× real
+  time,
   configurable in **Settings → Playback → Delivery speed**.
 - Seeking no longer stacks transcode sessions. Each seek started a new session
   and left the old one for the idle reaper, so up to ~75 seconds of a second

@@ -95,6 +95,16 @@ impl WatchStore for SqliteStore {
                 .optional()?;
             let effective = known.or(duration_ms).filter(|d| *d > 0);
 
+            // A position past the end is either a client bug or a stream whose
+            // own duration outgrew the probe. Storing it verbatim would leave a
+            // resume point beyond the last frame, so clamp to the runtime; the
+            // item still counts as finished, it just no longer claims to be
+            // finished somewhere that doesn't exist.
+            let position_ms = match effective {
+                Some(d) => position_ms.clamp(0, d),
+                None => position_ms.max(0),
+            };
+
             // Auto-mark watched past the threshold; never un-watch here.
             let watched = match effective {
                 Some(d) => (position_ms as f64 / d as f64) >= WATCHED_THRESHOLD,
@@ -402,6 +412,57 @@ mod tests {
             .await
             .expect("progress");
         assert!(state.watched);
+    }
+
+    #[tokio::test]
+    async fn position_is_clamped_to_the_runtime() {
+        let store = SqliteStore::open_in_memory().expect("open");
+        let user = store.create_user("u", "h", true).await.expect("user");
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "M".into(),
+                kind: LibraryKind::Movies,
+                paths: vec![],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+        let movie = store
+            .insert_item(&NewItem {
+                library_id: lib.id,
+                kind: ItemKind::Movie,
+                parent_id: None,
+                title: "Ronin".into(),
+                year: Some(1998),
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("movie");
+        let probe = crate::domain::ProbeResult {
+            duration_ms: Some(7_320_000),
+            ..Default::default()
+        };
+        store
+            .upsert_file(movie, "/m/Ronin (1998).mkv", 1, 1, &probe)
+            .await
+            .expect("file");
+
+        // A stream whose container padding runs past the probed runtime would
+        // otherwise leave a resume point beyond the last frame.
+        let state = store
+            .put_progress(user.id, movie, 9_000_000, None)
+            .await
+            .expect("progress");
+        assert_eq!(state.position_ms, 7_320_000, "clamped to the runtime");
+        assert!(state.watched, "still counts as finished");
+
+        // And a negative position never reaches the database.
+        let state = store
+            .put_progress(user.id, movie, -5_000, None)
+            .await
+            .expect("progress");
+        assert_eq!(state.position_ms, 0);
     }
 
     #[tokio::test]

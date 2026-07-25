@@ -1536,7 +1536,7 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
 
   clearInterval(PLAYER.timer);
   PLAYER.timer=setInterval(()=>reportProgress(fileId), 5000);
-  video.onended=()=>{ reportProgress(fileId,true); finishPlayback(false); };
+  video.onended=()=>{ handleEnded(fileId).catch(()=>{}); };
   pbTick(); pbSyncPlayIcon();   // seed the transport (total time, play icon) at once
   playerActivity();
 }
@@ -2029,6 +2029,51 @@ async function finishPlayback(closeIfNoNext){
   }
   if(closeIfNoNext) closePlayer();
 }
+// How far short of the runtime still counts as "they watched it". A remux
+// seek lands on the keyframe at or before the target, containers pad their
+// last fragment, and a transcode's final segment is rounded to a segment
+// boundary, so the honest end of playback sits a few seconds shy of the
+// probed duration even on a clean finish.
+const ENDED_SLACK_SEC=15;
+// `ended` fires at the end of the media the browser HAS, which is not the end
+// of the film. A progressive remux is a one-directional pipe that can stop
+// early — the session gets reaped, ffmpeg dies, a paced connection drops — and
+// an HLS playlist that stops growing reads as complete to hls.js because the
+// server never writes #EXT-X-ENDLIST. Taking `ended` at its word posted the
+// full runtime as the position, which cleared the server's 95% watched
+// threshold from a few seconds in; the flag is sticky, so a single truncated
+// stream marked a film watched permanently and told Trakt so.
+async function handleEnded(fileId){
+  const total=pbTotalSec(), pos=pbPosSec();
+  // total===0 means no runtime is known for this file (nothing probed, and a
+  // growing stream's own duration is not a substitute). There is nothing
+  // better to judge by, so `ended` stands.
+  if(!(total>0) || pos>=total-ENDED_SLACK_SEC){
+    await reportProgress(fileId,true); return finishPlayback(false);
+  }
+  // Truncated. Record where playback actually reached — never the runtime —
+  // so resume lands here rather than at the end.
+  await reportProgress(fileId,false);
+  const prev=PLAYER.endedAt; PLAYER.endedAt=pos;
+  // Dying at the same spot means retrying will die there again. Count only
+  // repeats at the same position, so a stream that gets further each time is
+  // making progress and keeps its budget.
+  PLAYER.endedTries=(prev!=null&&Math.abs(pos-prev)<1)?(PLAYER.endedTries||0)+1:1;
+  const hopeless = PLAYER.method==='direct_play' || PLAYER.endedTries>3;
+  clientLog({level:"warn",event:"truncated_stream",
+    message:`stream ended at ${Math.round(pos)}s of ${Math.round(total)}s`,
+    detail:`method=${PLAYER.method} attempt=${PLAYER.endedTries}${hopeless?" giving-up":" resuming"}`});
+  if(hopeless){
+    return setLoading(true,"The stream stopped before the end.",
+      "It ended "+clockFromSec(total-pos)+" short of the runtime. Your place is saved, so resuming picks up here.",
+      `<button onclick="retryPlayback()">Try again</button>`+
+      (PLAYER.method!=='transcode'?`<button onclick="startTranscodeFallback()">Force transcode</button>`:``)+
+      `<button onclick="closePlayer()">Close</button>`);
+  }
+  setLoading(true,"Reconnecting…","the stream ended early — resuming from "+clockFromSec(pos));
+  PLAYER.stallFrom=pos;   // so "Try again" from a later stall aims here too
+  seekTo(pos);
+}
 
 // ---- audio-language + subtitle menus --------------------------------------
 const LANGS={eng:"English",en:"English",jpn:"Japanese",ja:"Japanese",spa:"Spanish",es:"Spanish",
@@ -2343,10 +2388,15 @@ function updateStats(){
 async function reportProgress(fileId, ended){
   const video=document.getElementById("video");
   const posMs=Math.round(((PLAYER.offset||0)+ (video.currentTime||0))*1000);
-  // The file's probed duration is the truth; a progressive stream's
-  // video.duration grows as it buffers and must not be reported.
+  // The file's probed duration is the truth. Only direct play's own
+  // video.duration is the whole file: a progressive remux's grows as ffmpeg
+  // writes, and an offset HLS stream's covers the tail alone. Reporting either
+  // as the runtime marked films watched minutes in. With nothing trustworthy,
+  // send none — the server then keeps the duration it probed at scan time, and
+  // declines to auto-mark if it has none either.
   const durMs = PLAYER.knownDur
-    || (video.duration&&isFinite(video.duration)? Math.round(((PLAYER.offset||0)+video.duration)*1000):null);
+    || ((PLAYER.method==='direct_play' && video.duration && isFinite(video.duration))
+        ? Math.round(video.duration*1000) : null);
   if(!ITEM_FOR_FILE[fileId]) return;
   try{ await api(`/items/${ITEM_FOR_FILE[fileId]}/progress`,{method:"POST",body:{position_ms:ended?(durMs||posMs):posMs,duration_ms:durMs}}); }catch(e){}
 }
