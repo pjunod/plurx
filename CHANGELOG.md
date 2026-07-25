@@ -42,6 +42,15 @@ bump may break compatibility and a **patch** bump never does.
   a volume that doesn't exist yet is not an error — Docker creates an empty one
   and plurxd initialises a fresh database in it, which looks exactly like
   losing your library.
+- A `docker stop` no longer becomes a SIGKILL. plurxd drained in-flight
+  requests without a deadline, and a playback response is a stream: a paced
+  remux holds its connection open for a quarter of the film's runtime, and an
+  HLS playlist poll is only ever moments from the next one. Waiting for all of
+  them to finish meant never finishing, so Docker spent its ten-second grace
+  period achieving nothing and then killed the process — which surfaces as exit
+  137, indistinguishable at a glance from an out-of-memory kill. The drain is
+  now capped at five seconds, comfortably inside that grace period, and logs
+  what was still open when it gave up.
 - Items are no longer marked watched minutes in. The web player treated the
   `ended` event as "the film finished", but `ended` fires at the end of the
   media the browser *has*, which is not the same thing: a remux is a

@@ -5,6 +5,7 @@ mod trakt;
 mod transcode;
 mod version;
 
+use std::future::IntoFuture;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -232,12 +233,49 @@ async fn run(config: Config) -> anyhow::Result<()> {
         .with_context(|| format!("binding {}", config.server.bind))?;
     tracing::info!(addr = %listener.local_addr()?, "listening");
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
-    tracing::info!("shutdown complete");
+    // Drain in-flight requests on SIGTERM, but not forever. A playback
+    // response is a stream: a paced remux holds its connection open for a
+    // quarter of the film's runtime, and an HLS playlist poll is only ever
+    // moments from the next one. Waiting for all of them to finish means
+    // never finishing, so `docker stop` spends its ten-second grace period
+    // achieving nothing and then SIGKILLs us — which surfaces as exit 137,
+    // indistinguishable at a glance from an out-of-memory kill. Bounding the
+    // drain turns that into an orderly exit 0 with a line in the log saying
+    // what was still open.
+    let (drain_started, drain_signal) = tokio::sync::oneshot::channel();
+    // `WithGracefulShutdown` is IntoFuture rather than Future, and select!
+    // needs the future itself to poll it more than once.
+    let server = axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            let _ = drain_started.send(());
+        })
+        .into_future();
+    tokio::pin!(server);
+    tokio::select! {
+        result = &mut server => {
+            result?;
+            tracing::info!("shutdown complete");
+        }
+        // Only starts counting once the signal has actually arrived: if the
+        // channel never fires, this branch stays pending and the server runs.
+        _ = async {
+            let _ = drain_signal.await;
+            tokio::time::sleep(SHUTDOWN_DRAIN_TIMEOUT).await;
+        } => {
+            tracing::warn!(
+                after = ?SHUTDOWN_DRAIN_TIMEOUT,
+                "drain timed out with connections still open; exiting anyway"
+            );
+        }
+    }
     Ok(())
 }
+
+/// How long to wait for open connections to finish after a shutdown signal.
+/// Comfortably inside Docker's default ten-second stop grace period, so the
+/// process gets to choose its own exit rather than being killed mid-drain.
+const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// First line of `ffmpeg -version` (e.g. "ffmpeg version 6.1.1 …"), if the
 /// binary runs at all. Purely informational, for the settings page.
