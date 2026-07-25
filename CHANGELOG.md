@@ -25,6 +25,19 @@ bump may break compatibility and a **patch** bump never does.
 
 ### Fixed
 
+- Closing the player while it is fullscreen now hands the screen back. Fullscreen
+  belongs to the browser rather than to the page, so hiding the player's own UI
+  did not end it: `#player` stayed the fullscreen element and the tab kept the
+  whole display with nothing drawn on it. On a desktop that reads as a black
+  screen you press Esc on out of reflex; an iPad has no Esc, only Safari's own ✕
+  in the top-left corner, so until you find it the browser is unreachable and
+  the app looks hung. Every exit runs through this path, including the automatic
+  one when a film ends with nothing queued behind it. A picture-in-picture window
+  is closed on the same occasion and for the same reason — it is the browser's
+  window, and emptying the video element leaves it open, playing nothing. The
+  fullscreen button can also now turn *off* iPhone-style video fullscreen, which
+  it was able to enter but not see: `document.fullscreenElement` never reports
+  that mode, so pressing the button a second time did nothing.
 - The Docker deployment no longer shares a Compose project with anything else
   on the host that happens to live in a directory called `deploy`. Compose
   names a project after the directory holding its file, so plurx's was

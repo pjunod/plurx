@@ -1805,9 +1805,41 @@ function nudge(d){
     me._nudgeAcc=0; me._nudgeBase=null; me._seekPreview=null; seekTo(t); }, 350);
 }
 async function togglePip(){ const v=document.getElementById("video"); try{ if(document.pictureInPictureElement) await document.exitPictureInPicture(); else if(v) await v.requestPictureInPicture(); }catch(e){} }
+// Is the player fullscreen by any of the three routes into it? The document
+// API doesn't know about the iOS one: `webkitEnterFullscreen` on the video
+// element opens a separate mode that `document.fullscreenElement` never
+// reports, so asking only the document would answer "no" while the screen is
+// plainly full of video.
+function isFullscreenAnywhere(){
+  const v=document.getElementById("video");
+  return !!(document.fullscreenElement||document.webkitFullscreenElement||(v&&v.webkitDisplayingFullscreen));
+}
+// Hand the screen back. Fullscreen belongs to the browser rather than to the
+// modal, so hiding `#modal` does not release it — and each of the three ways in
+// has its own way out.
+function exitFullscreenAnywhere(){
+  const v=document.getElementById("video");
+  try{
+    if(document.fullscreenElement&&document.exitFullscreen){ const r=document.exitFullscreen(); if(r&&r.catch) r.catch(()=>{}); }
+    else if(document.webkitFullscreenElement&&document.webkitExitFullscreen) document.webkitExitFullscreen();
+  }catch(e){}
+  try{ if(v&&v.webkitDisplayingFullscreen&&v.webkitExitFullscreen) v.webkitExitFullscreen(); }catch(e){}
+}
+// Everything the player can still be occupying once its own UI is gone.
+// Closing has to undo these explicitly: a picture-in-picture window is the
+// browser's, not the page's, and outlives having its media emptied, so it would
+// otherwise sit there playing nothing.
+function exitPresentationModes(){
+  const v=document.getElementById("video");
+  exitFullscreenAnywhere();
+  try{
+    if(document.pictureInPictureElement&&document.exitPictureInPicture){ const r=document.exitPictureInPicture(); if(r&&r.catch) r.catch(()=>{}); }
+    else if(v&&v.webkitPresentationMode==='picture-in-picture'&&v.webkitSetPresentationMode) v.webkitSetPresentationMode('inline');
+  }catch(e){}
+}
 function toggleFullscreen(){ const p=document.getElementById("player"), v=document.getElementById("video");
   try{
-    if(document.fullscreenElement||document.webkitFullscreenElement){ (document.exitFullscreen||document.webkitExitFullscreen).call(document); return; }
+    if(isFullscreenAnywhere()){ exitFullscreenAnywhere(); return; }
     if(p&&p.requestFullscreen) p.requestFullscreen();
     else if(p&&p.webkitRequestFullscreen) p.webkitRequestFullscreen();
     else if(v&&v.webkitEnterFullscreen) v.webkitEnterFullscreen();   // iOS iPhone: video-only fullscreen
@@ -2402,6 +2434,14 @@ async function reportProgress(fileId, ended){
 }
 function closePlayer(){
   const video=document.getElementById("video");
+  // First, before anything is torn down: give the screen back. Hiding `#modal`
+  // sets `display:none` on an ancestor, which draws nothing but does not end
+  // the browser's fullscreen — `#player` stays the fullscreen element, so the
+  // page keeps the whole display with an empty box on it. A desktop has Esc and
+  // the habit of pressing it; an iPad has neither, only Safari's own ✕ in the
+  // corner, and it reads as the app having hung. Every exit runs through here,
+  // including the automatic one when a film ends with nothing queued after it.
+  exitPresentationModes();
   if(PLAYER.fileId) reportProgress(PLAYER.fileId);
   // Bump the generation so a seek or audio switch still awaiting its
   // hls/start finds itself superseded and doesn't attach a stream to a player
