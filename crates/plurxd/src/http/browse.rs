@@ -31,12 +31,19 @@ async fn watch_lookup(
     Ok(map.into_iter().collect())
 }
 
-fn annotate(items: Vec<Item>, watch: &HashMap<i64, WatchState>) -> Vec<ItemDto> {
+/// Map items to DTOs with per-user watch state, and (for folders) how many
+/// children each holds.
+fn annotate_with_counts(
+    items: Vec<Item>,
+    watch: &HashMap<i64, WatchState>,
+    counts: &HashMap<i64, i64>,
+) -> Vec<ItemDto> {
     items
         .into_iter()
         .map(|item| {
             let w = watch.get(&item.id).copied();
-            ItemDto::from(item).with_watch(w)
+            let count = counts.get(&item.id).copied();
+            ItemDto::from(item).with_watch(w).with_child_count(count)
         })
         .collect()
 }
@@ -89,13 +96,25 @@ pub async fn list_items(
         .map(|i| i.id)
         .collect();
     let heights = state.store.item_max_heights(&badged).await?;
+    // Folder cards say how much is inside them.
+    let folder_ids: Vec<i64> = page
+        .items
+        .iter()
+        .filter(|i| i.kind == ItemKind::Folder)
+        .map(|i| i.id)
+        .collect();
+    let counts = state.store.child_counts(&folder_ids).await?;
     let items = page
         .items
         .into_iter()
         .map(|item| {
             let w = watch.get(&item.id).copied();
             let res = heights.get(&item.id).copied();
-            ItemDto::from(item).with_watch(w).with_resolution(res)
+            let count = counts.get(&item.id).copied();
+            ItemDto::from(item)
+                .with_watch(w)
+                .with_resolution(res)
+                .with_child_count(count)
         })
         .collect();
     Ok(Json(ItemListResponse {
@@ -148,6 +167,16 @@ pub async fn item_detail(
     ancestors.reverse();
 
     let children = state.store.get_item_children(id).await?;
+    let child_counts = state
+        .store
+        .child_counts(
+            &children
+                .iter()
+                .filter(|c| c.kind == ItemKind::Folder)
+                .map(|c| c.id)
+                .collect::<Vec<_>>(),
+        )
+        .await?;
     let files = match item.kind {
         // Home videos and photos have files exactly like movies do; folders
         // (and shows/seasons) have children instead.
@@ -183,7 +212,7 @@ pub async fn item_detail(
     Ok(Json(ItemDetail {
         item: item_dto,
         ancestors: ancestors.into_iter().map(Into::into).collect(),
-        children: annotate(children, &watch),
+        children: annotate_with_counts(children, &watch, &child_counts),
         files: file_dtos,
     }))
 }
@@ -217,11 +246,19 @@ pub async fn hubs(
     let recent = state.store.recently_added(q.library_id, 20).await?;
     let recent_items: Vec<Item> = recent.iter().map(|r| r.item.clone()).collect();
     let watch = watch_lookup(&state, user.id, &recent_items).await?;
+    // Folder cards say "12 items" here too, not just on the library grid.
+    let folder_ids: Vec<i64> = recent_items
+        .iter()
+        .filter(|i| i.kind == ItemKind::Folder)
+        .map(|i| i.id)
+        .collect();
+    let counts = state.store.child_counts(&folder_ids).await?;
     let mut recently_added: Vec<ItemDto> = recent
         .into_iter()
         .map(|r| {
             let w = watch.get(&r.item.id).copied();
-            recent_dto(r, w)
+            let count = counts.get(&r.item.id).copied();
+            recent_dto(r, w).with_child_count(count)
         })
         .collect();
 

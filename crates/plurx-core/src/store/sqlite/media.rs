@@ -646,6 +646,25 @@ impl MediaStore for SqliteStore {
         .await
     }
 
+    async fn child_counts(&self, ids: &[i64]) -> Result<HashMap<i64, i64>, StoreError> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        // ids are our own row ids (trusted i64s), so an inline IN-list is safe.
+        let list = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT parent_id, COUNT(*) FROM items
+                 WHERE parent_id IN ({list}) GROUP BY parent_id"
+            ))?;
+            let rows = stmt
+                .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows.into_iter().collect())
+        })
+        .await
+    }
+
     async fn item_max_heights(&self, ids: &[i64]) -> Result<HashMap<i64, i64>, StoreError> {
         if ids.is_empty() {
             return Ok(HashMap::new());

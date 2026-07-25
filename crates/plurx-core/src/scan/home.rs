@@ -123,16 +123,15 @@ pub async fn after_record(
     if current.and_then(|i| i.recorded_at).is_some() {
         return Ok(seeded);
     }
-    if let Some(date) = ladder_date(path, probe, mtime) {
-        store
-            .apply_metadata(
-                placed.id,
-                &MetadataPatch {
-                    recorded_at: Some(date),
-                    ..Default::default()
-                },
-            )
-            .await?;
+    // Runtime comes from the file itself here (no provider to ask), so the
+    // grid can put a duration badge on a home-video card.
+    let patch = MetadataPatch {
+        recorded_at: ladder_date(path, probe, mtime),
+        runtime_ms: probe.duration_ms,
+        ..Default::default()
+    };
+    if !patch.is_empty() {
+        store.apply_metadata(placed.id, &patch).await?;
     }
     Ok(seeded)
 }

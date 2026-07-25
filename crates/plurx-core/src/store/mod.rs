@@ -215,6 +215,13 @@ pub trait MediaStore: Send + Sync + 'static {
     ) -> Result<i64, StoreError>;
     async fn get_file(&self, id: i64) -> Result<Option<MediaFile>, StoreError>;
     async fn files_for_item(&self, item_id: i64) -> Result<Vec<MediaFile>, StoreError>;
+    /// How many children each of the given items has. Folder cards say "12
+    /// items"; doing that with one query per card would be an N+1 on every
+    /// grid render.
+    async fn child_counts(
+        &self,
+        ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, i64>, StoreError>;
     /// Best (max) probed file height per item, for the given item ids. Used to
     /// badge/section the library grid by resolution without loading every file.
     async fn item_max_heights(

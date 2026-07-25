@@ -59,6 +59,10 @@ pub struct ItemDto {
     /// group into resolution sections. `None` for shows and where unknown.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolution: Option<i64>,
+    /// How many items a folder holds — the "12 items" line on a folder card.
+    /// Only populated on grids, and only for folders.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub child_count: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub show_title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -86,6 +90,7 @@ impl From<Item> for ItemDto {
             poster: image_url(&item.poster_path),
             backdrop: image_url(&item.backdrop_path),
             resolution: None,
+            child_count: None,
             show_title: None,
             watch: None,
         }
@@ -116,6 +121,11 @@ impl ItemDto {
 
     pub fn with_resolution(mut self, resolution: Option<i64>) -> Self {
         self.resolution = resolution;
+        self
+    }
+
+    pub fn with_child_count(mut self, count: Option<i64>) -> Self {
+        self.child_count = count;
         self
     }
 }

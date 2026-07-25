@@ -144,6 +144,33 @@
      grids (library/category), like a phone contact index. scroll-margin keeps
      the jumped-to poster clear of the sticky header. */
   .grid .poster{scroll-margin-top:72px}
+  /* Home libraries. A photo is a square-ish tile (a 2/3 crop of a landscape
+     snapshot throws most of the picture away), and a folder card leads with
+     how much is inside it. */
+  .poster .art.sq{aspect-ratio:1/1}
+  .durbadge{position:absolute;right:6px;bottom:6px;padding:1px 6px;border-radius:6px;font-size:11px;
+    font-weight:700;background:#000a;color:#fff;backdrop-filter:blur(3px)}
+  .lightbox{position:fixed;inset:0;z-index:60;background:#000e;display:flex;align-items:center;justify-content:center}
+  .lightbox img{max-width:100vw;max-height:100vh;object-fit:contain;user-select:none;-webkit-user-drag:none}
+  .lightbox .lbcap{position:absolute;left:0;right:0;bottom:0;padding:14px 18px;color:#fff;
+    background:linear-gradient(transparent,#000b);font-size:14px}
+  .lightbox button{position:absolute;border:0;border-radius:999px;background:#0009;color:#fff;
+    width:44px;height:44px;font-size:20px;cursor:pointer;backdrop-filter:blur(4px)}
+  .lightbox button:hover{background:#000d}
+  .lightbox .lbx{top:14px;right:14px}
+  .lightbox .lbprev{left:14px;top:50%;transform:translateY(-50%)}
+  .lightbox .lbnext{right:14px;top:50%;transform:translateY(-50%)}
+  .editwrap{position:fixed;inset:0;z-index:55;background:#000a;display:flex;align-items:center;justify-content:center;padding:16px}
+  .editcard{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+    padding:18px;width:min(520px,100%);max-height:88vh;overflow:auto}
+  .editcard label{display:block;font-size:12px;color:var(--muted);margin:12px 0 4px}
+  .editcard input,.editcard textarea{width:100%}
+  .chips-in{display:flex;flex-wrap:wrap;gap:6px;align-items:center;border:1px solid var(--line);
+    border-radius:8px;padding:6px;background:var(--panel2)}
+  .chips-in .chip{display:inline-flex;align-items:center;gap:5px;padding:2px 8px;border-radius:999px;
+    background:var(--panel);border:1px solid var(--line);font-size:12px}
+  .chips-in .chip b{cursor:pointer;color:var(--muted);font-weight:700}
+  .chips-in input{flex:1;min-width:110px;border:0;background:transparent;padding:4px}
   .azbar{position:fixed;right:5px;top:50%;transform:translateY(-50%);z-index:15;display:flex;flex-direction:column;
     align-items:center;gap:1px;padding:7px 3px;border-radius:13px;border:1px solid var(--line);
     background:color-mix(in srgb,var(--panel) 72%,transparent);backdrop-filter:blur(6px)}
@@ -694,6 +721,12 @@ async function api(path, {method="GET", body=null, raw=false}={}){
   return raw?res:res.json();
 }
 const tok = u => u + (u.includes("?")?"&":"?") + "token=" + encodeURIComponent(TOKEN||"");
+// The library list is small, changes only from Settings, and is needed on
+// pages that otherwise wouldn't fetch it (an item page has to know whether its
+// library is a home library before it offers an edit button).
+let LIBS_CACHE=null;
+async function libsCached(){ if(!LIBS_CACHE) LIBS_CACHE=await api("/libraries"); return LIBS_CACHE; }
+function invalidateLibs(){ LIBS_CACHE=null; }
 function toast(msg){ const t=document.getElementById("toast"); t.textContent=msg; t.classList.add("show"); setTimeout(()=>t.classList.remove("show"),2200); }
 // Short browser label for diagnostics. Order matters: Edge's UA contains
 // "Chrome"+"Safari"; Chrome's contains "Safari" — so test most-specific first.
@@ -725,7 +758,11 @@ function clientLog(ev){
       body:JSON.stringify(body)}).catch(()=>{});
   }catch(e){}
 }
-function fmtDur(ms){ if(!ms) return ""; const s=Math.round(ms/1000),h=Math.floor(s/3600),m=Math.floor(s%3600/60); return h?`${h}h ${m}m`:`${m}m`; }
+// Durations. Home video made this care about seconds: a 6-second phone clip
+// reading "0m" is worse than saying nothing.
+function fmtDur(ms){ if(!ms) return ""; const s=Math.round(ms/1000),h=Math.floor(s/3600),m=Math.floor(s%3600/60);
+  if(s<60) return `${Math.max(1,s)}s`;
+  return h?`${h}h ${m}m`:`${m}m`; }
 function fmtSize(b){ if(!b) return ""; const g=b/(1024**3); return g>=1?g.toFixed(1)+" GB":Math.round(b/(1024**2))+" MB"; }
 function fmtUptime(s){ const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60); return d?`${d}d ${h}h`:(h?`${h}h ${m}m`:`${m}m`); }
 function fmtTs(ms){ const d=new Date(ms); return d.toLocaleTimeString([], {hour12:false})+"."+String(ms%1000).padStart(3,"0"); }
@@ -737,10 +774,21 @@ function fmtAgo(unix){ if(!unix) return ""; const s=Math.max(0,Math.floor(Date.n
 // attribute early and silently breaks the handler. Compose with JSON.stringify
 // for a JS string inside an attribute: esc(JSON.stringify(value)).
 function esc(s){ return (s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+// A recorded/EXIF date for display. Parsed by hand rather than through
+// `new Date("2019-06-14")`, which is UTC midnight and shows the day before in
+// every western timezone.
+function fmtDate(s){
+  const m=/^(\d{4})-(\d{2})-(\d{2})/.exec(s||"");
+  if(!m) return "";
+  return new Date(Number(m[1]),Number(m[2])-1,Number(m[3]))
+    .toLocaleDateString([], {year:"numeric",month:"short",day:"numeric"});
+}
 // Artwork with a graceful fallback: initials on a tinted card when there's
 // no poster (so a seasons grid never shows blank rectangles).
 function artHtml(it, cls){
-  const src=it.poster||it.backdrop;
+  // A photo whose thumbnail hasn't been generated yet still has itself to
+  // show — the endpoint falls back to the original.
+  const src=it.poster||it.backdrop||(it.kind==='photo'?`/api/v1/items/${it.id}/photo?size=thumb`:null);
   if(src) return `<img class="art ${cls||''}" loading="lazy" src="${esc(tok(src))}" alt="">`;
   if(it.kind==='season' && it.season_number!=null)
     return `<div class="art ph season ${cls||''}"><div class="snum">${it.season_number}</div><div class="sl">Season</div></div>`;
@@ -939,6 +987,10 @@ function resSections(items){
   }).join("");
 }
 function card(it, watchCtx){
+  // Home-library cards: a folder leads with what's inside, a clip with when it
+  // was taken and how long it runs, a photo with a square thumb you click to
+  // open full-screen.
+  if(it.kind==='folder'||it.kind==='photo') return homeCard(it);
   const img = artHtml(it);
   const resb = it.resolution
       ? `<span class="resbadge resgrad ${resClass(it.resolution)}">${esc(resLabel(0,it.resolution))}</span>` : "";
@@ -951,14 +1003,92 @@ function card(it, watchCtx){
   const main = isEp && it.show_title ? it.show_title : it.title;
   const sub = isEp
       ? esc(it.show_title ? (it.title ? `${ep} · ${it.title}` : ep) : ep)
-      : esc(it.year? String(it.year): (it.kind==='show'?'Series':''));
+      : it.kind==='video'
+        ? esc(fmtDate(it.recorded_at))
+        : esc(it.year? String(it.year): (it.kind==='show'?'Series':''));
+  const dur = it.kind==='video'&&it.runtime_ms? `<span class="durbadge">${esc(fmtDur(it.runtime_ms))}</span>`:"";
   const pct = progressPct(it.watch);
   const watched = it.watch&&it.watch.watched? `<span class="badge">✓</span>`:"";
   const prog = pct>0&&pct<100? `<div class="prog"><i style="width:${pct}%"></i></div>`:"";
   return `<div class="poster" onclick="location.hash='#/item/${it.id}'">
-    <div class="artbox">${img}${watched}</div><div class="meta"><div class="t">${esc(main)}</div><div class="s"><span class="stxt">${sub}</span>${resb}</div>${watchLine(it,watchCtx)}</div>${prog}</div>`;
+    <div class="artbox">${img}${dur}${watched}</div><div class="meta"><div class="t">${esc(main)}</div><div class="s"><span class="stxt">${sub}</span>${resb}</div>${watchLine(it,watchCtx)}</div>${prog}</div>`;
 }
-function grid(items){ return items.length? `<div class="grid">${items.map(i=>card(i)).join("")}</div>` : `<div class="empty">Nothing here yet.</div>`; }
+// Folder and photo cards. A folder opens its page; a photo opens the lightbox
+// in place, because paging through a shoebox of stills via a detail page each
+// time is nobody's idea of looking at photos.
+function homeCard(it){
+  if(it.kind==='folder'){
+    const n=it.child_count;
+    const sub=n==null? "Folder" : `${n} item${n===1?'':'s'}`;
+    return `<div class="poster" onclick="location.hash='#/item/${it.id}'">
+      <div class="artbox">${artHtml(it)}</div>
+      <div class="meta"><div class="t">${esc(it.title)}</div><div class="s"><span class="stxt">${esc(sub)}</span></div></div></div>`;
+  }
+  return `<div class="poster" onclick="openLightbox(${it.id})">
+    <div class="artbox">${artHtml(it,'sq')}</div>
+    <div class="meta"><div class="t">${esc(it.title)}</div><div class="s"><span class="stxt">${esc(fmtDate(it.recorded_at))}</span></div></div></div>`;
+}
+function grid(items){
+  // Remember this grid's photos so the lightbox can walk them with ←/→.
+  PHOTO_SET=(items||[]).filter(i=>i.kind==='photo').map(i=>({id:i.id,title:i.title,recorded_at:i.recorded_at}));
+  return items.length? `<div class="grid">${items.map(i=>card(i)).join("")}</div>` : `<div class="empty">Nothing here yet.</div>`;
+}
+
+// ---- photo lightbox -------------------------------------------------------
+// Full-screen original, ←/→ through the photos of whatever grid you opened it
+// from (videos are skipped — they belong to the player, not here), Esc closes,
+// swipe on touch. Neighbours are preloaded so paging doesn't flash.
+let PHOTO_SET=[], LB_AT=-1;
+function photoUrl(id,size){ return tok(`/api/v1/items/${id}/photo${size?`?size=${size}`:""}`); }
+function openLightbox(id){
+  if(!PHOTO_SET.some(p=>p.id===id)) PHOTO_SET=[{id,title:"",recorded_at:null}];
+  LB_AT=PHOTO_SET.findIndex(p=>p.id===id);
+  let box=document.getElementById("lightbox");
+  if(!box){
+    box=document.createElement("div");
+    box.id="lightbox"; box.className="lightbox";
+    box.innerHTML=`<img id="lbimg" alt="">
+      <button class="lbx" aria-label="Close (Esc)" title="Close (Esc)" onclick="closeLightbox()">✕</button>
+      <button class="lbprev" aria-label="Previous photo" onclick="lbStep(-1)">‹</button>
+      <button class="lbnext" aria-label="Next photo" onclick="lbStep(1)">›</button>
+      <div class="lbcap" id="lbcap"></div>`;
+    box.addEventListener("click",e=>{ if(e.target===box) closeLightbox(); });
+    box.addEventListener("touchstart",e=>{ LB_TOUCH=e.changedTouches[0].clientX; },{passive:true});
+    box.addEventListener("touchend",e=>{
+      const dx=e.changedTouches[0].clientX-LB_TOUCH;
+      if(Math.abs(dx)>50) lbStep(dx<0?1:-1);
+    },{passive:true});
+    document.body.appendChild(box);
+  }
+  document.body.style.overflow="hidden";
+  paintLightbox();
+}
+let LB_TOUCH=0;
+function paintLightbox(){
+  const p=PHOTO_SET[LB_AT]; if(!p) return closeLightbox();
+  const img=document.getElementById("lbimg"); if(img) img.src=photoUrl(p.id);
+  const cap=document.getElementById("lbcap");
+  const many=PHOTO_SET.length>1? ` · ${LB_AT+1} of ${PHOTO_SET.length}`:"";
+  if(cap) cap.innerHTML=`<b>${esc(p.title||"")}</b> ${esc(fmtDate(p.recorded_at))}${esc(many)}`;
+  for(const n of [LB_AT-1,LB_AT+1]){
+    const q=PHOTO_SET[n]; if(q){ const pre=new Image(); pre.src=photoUrl(q.id); }
+  }
+  const one=PHOTO_SET.length<2;
+  for(const c of ["lbprev","lbnext"]){
+    const b=document.querySelector(`.lightbox .${c}`); if(b) b.style.display=one?"none":"";
+  }
+}
+function lbStep(d){
+  if(!PHOTO_SET.length) return;
+  LB_AT=(LB_AT+d+PHOTO_SET.length)%PHOTO_SET.length;
+  paintLightbox();
+}
+function closeLightbox(){
+  const box=document.getElementById("lightbox"); if(box) box.remove();
+  document.body.style.overflow="";
+  LB_AT=-1;
+}
+function lightboxOpen(){ return !!document.getElementById("lightbox"); }
 
 // ---- views ----------------------------------------------------------------
 // ---- get-the-app install prompt -------------------------------------------
@@ -1012,10 +1142,11 @@ function setHomeGroup(v){ try{ localStorage.setItem("plurx_home_group",v); }catc
 function libCategory(lib){
   if(lib.kind==="movie") return {key:"movie", name:"Movies"};
   if(lib.kind==="show")  return {key:"show",  name:"TV Shows"};
+  if(lib.kind==="home")  return {key:"home",  name:"Home videos"};
   const k=lib.kind||"other";
   return {key:k, name:k.charAt(0).toUpperCase()+k.slice(1)};
 }
-function catOrder(key){ return key==="movie"?0:key==="show"?1:2; }
+function catOrder(key){ return key==="movie"?0:key==="show"?1:key==="home"?2:3; }
 function groupToggleHtml(group){
   return `<div class="libbar" style="margin-top:22px"><div class="row">
     <span class="lbl">Group by</span>
@@ -1059,7 +1190,11 @@ async function viewHome(){
   }
   document.getElementById("main").innerHTML=html||`<div class="empty">Nothing here yet.</div>`;
 }
-let LIB_SORT="title", LIB_FILTER="all";
+// "" means "whatever suits this library" — home libraries are about when
+// something happened, everything else about what it is called. An explicit
+// pick from the dropdown wins from then on.
+let LIB_SORT="", LIB_FILTER="all";
+function sortFor(lib){ return LIB_SORT || ((lib&&lib.kind==="home")?"recorded":"title"); }
 function libOpt(v,label,cur){ return `<option value="${v}" ${cur===v?'selected':''}>${esc(label)}</option>`; }
 function matchWatch(it,f){
   const w=it.watch, watched=w&&w.watched;
@@ -1134,21 +1269,22 @@ function pageHead(trail,title){
 }
 async function viewLibrary(id){
   chrome("home",`<div class="empty">Loading…</div>`);
-  const lib=(await api("/libraries")).find(l=>l.id==id);
-  const page=await api(`/libraries/${id}/items?limit=200&sort=${LIB_SORT}`);
+  const lib=(await libsCached()).find(l=>l.id==id);
+  const sort=sortFor(lib);
+  const page=await api(`/libraries/${id}/items?limit=200&sort=${sort}`);
   const items=LIB_FILTER==="all"?page.items:page.items.filter(it=>matchWatch(it,LIB_FILTER));
   const capNote = page.total>page.items.length? ` <span class="muted">(first ${page.items.length} of ${page.total})</span>`:"";
   const bar=`<div class="libbar">
     <div class="row">
       <span class="lbl">Sort</span>
       <select onchange="LIB_SORT=this.value;viewLibrary(${Number(id)})">
-        ${libOpt("title","Title (A–Z)",LIB_SORT)}${libOpt("added","Recently added",LIB_SORT)}${libOpt("year","Year",LIB_SORT)}${libOpt("resolution","Resolution",LIB_SORT)}</select>
+        ${libOpt("title","Title (A–Z)",sort)}${libOpt("added","Recently added",sort)}${libOpt("recorded","Date recorded",sort)}${libOpt("year","Year",sort)}${libOpt("resolution","Resolution",sort)}</select>
       <span class="lbl" style="margin-left:8px">Show</span>
       <select onchange="LIB_FILTER=this.value;viewLibrary(${Number(id)})">
         ${libOpt("all","Everything",LIB_FILTER)}${libOpt("unwatched","Unwatched",LIB_FILTER)}${libOpt("inprogress","In progress",LIB_FILTER)}${libOpt("watched","Watched",LIB_FILTER)}</select>
     </div>
     <span class="muted" style="font-size:13px">${items.length} item${items.length===1?'':'s'}${capNote}</span></div>`;
-  const body = items.length? (LIB_SORT==="resolution"? resSections(items) : grid(items)) : `<div class="empty">Nothing matches this filter.</div>`;
+  const body = items.length? (sort==="resolution"? resSections(items) : grid(items)) : `<div class="empty">Nothing matches this filter.</div>`;
   const name=lib?lib.name:'Library';
   setOrigin(`#/library/${id}`,name);
   const head=pageHead([{href:"#/",label:"Home"},{label:name}],name);
@@ -1159,15 +1295,17 @@ async function viewLibrary(id){
 // then apply the same client-side sort/filter as a single library.
 async function viewCategory(key){
   chrome("home",`<div class="empty">Loading…</div>`);
-  const libs=(await api("/libraries")).filter(l=>libCategory(l).key===key);
+  const libs=(await libsCached()).filter(l=>libCategory(l).key===key);
   if(!libs.length){ document.getElementById("main").innerHTML=`<div class="empty">No libraries in this category.</div>`; return; }
   const cat=libCategory(libs[0]);
-  const pages=await Promise.all(libs.map(l=>api(`/libraries/${l.id}/items?limit=200&sort=${LIB_SORT}`)));
+  const sort=sortFor(libs[0]);
+  const pages=await Promise.all(libs.map(l=>api(`/libraries/${l.id}/items?limit=200&sort=${sort}`)));
   let items=[].concat(...pages.map(p=>p.items));
   // Each share is server-sorted; re-sort the merged set for fields we hold locally.
-  if(LIB_SORT==="title") items.sort((a,b)=>sortKey(a.title).localeCompare(sortKey(b.title)));
-  else if(LIB_SORT==="year") items.sort((a,b)=>(b.year||0)-(a.year||0));
-  else if(LIB_SORT==="resolution") items.sort((a,b)=>(b.resolution||0)-(a.resolution||0));
+  if(sort==="title") items.sort((a,b)=>sortKey(a.title).localeCompare(sortKey(b.title)));
+  else if(sort==="year") items.sort((a,b)=>(b.year||0)-(a.year||0));
+  else if(sort==="resolution") items.sort((a,b)=>(b.resolution||0)-(a.resolution||0));
+  else if(sort==="recorded") items.sort((a,b)=>(b.recorded_at||"").localeCompare(a.recorded_at||""));
   if(LIB_FILTER!=="all") items=items.filter(it=>matchWatch(it,LIB_FILTER));
   const total=pages.reduce((n,p)=>n+(p.total||0),0);
   const capNote = total>items.length? ` <span class="muted">(first ${items.length} of ${total})</span>`:"";
@@ -1175,13 +1313,13 @@ async function viewCategory(key){
     <div class="row">
       <span class="lbl">Sort</span>
       <select onchange="LIB_SORT=this.value;viewCategory(${esc(JSON.stringify(key))})">
-        ${libOpt("title","Title (A–Z)",LIB_SORT)}${libOpt("added","Recently added",LIB_SORT)}${libOpt("year","Year",LIB_SORT)}${libOpt("resolution","Resolution",LIB_SORT)}</select>
+        ${libOpt("title","Title (A–Z)",sort)}${libOpt("added","Recently added",sort)}${libOpt("recorded","Date recorded",sort)}${libOpt("year","Year",sort)}${libOpt("resolution","Resolution",sort)}</select>
       <span class="lbl" style="margin-left:8px">Show</span>
       <select onchange="LIB_FILTER=this.value;viewCategory(${esc(JSON.stringify(key))})">
         ${libOpt("all","Everything",LIB_FILTER)}${libOpt("unwatched","Unwatched",LIB_FILTER)}${libOpt("inprogress","In progress",LIB_FILTER)}${libOpt("watched","Watched",LIB_FILTER)}</select>
     </div>
     <span class="muted" style="font-size:13px">${items.length} item${items.length===1?'':'s'}${capNote}</span></div>`;
-  const body = items.length? (LIB_SORT==="resolution"? resSections(items) : grid(items)) : `<div class="empty">Nothing matches this filter.</div>`;
+  const body = items.length? (sort==="resolution"? resSections(items) : grid(items)) : `<div class="empty">Nothing matches this filter.</div>`;
   setOrigin(`#/category/${encodeURIComponent(key)}`,cat.name);
   const head=pageHead([{href:"#/",label:"Home"},{label:cat.name}],cat.name);
   document.getElementById("main").innerHTML=`${head}${bar}${body}${alphaRailHtml(items)}`;
@@ -1271,7 +1409,12 @@ let AUTOPLAY=null;
 
 async function viewItem(id){
   chrome("home",`<div class="empty">Loading…</div>`);
-  const d=await api(`/items/${id}`); const it=d.item;
+  const [d, libs]=await Promise.all([api(`/items/${id}`), libsCached()]);
+  const it=d.item;
+  const lib=libs.find(l=>l.id===it.library_id);
+  // Metadata editing is a home-library affair: elsewhere the provider agent
+  // owns the fields and would overwrite a hand edit on the next refresh.
+  const editable = ME&&ME.is_admin&&lib&&lib.kind==="home";
   d.files.forEach(f=>ITEM_FOR_FILE[f.id]=Number(id));
 
   // Breadcrumb trail: Home / <list you came from> / Show / Season / …, every
@@ -1287,6 +1430,7 @@ async function viewItem(id){
   const multi=d.files.length>1;
   const runtime=it.runtime_ms||(best&&best.duration_ms);
   const chips=[];
+  if(it.recorded_at){ chips.push(`<span>${esc(fmtDate(it.recorded_at))}</span>`); }
   if(it.kind==='show'){
     // A show wears the span of years it aired, gathered from its seasons'
     // air dates (plus its own first-air year).
@@ -1304,7 +1448,14 @@ async function viewItem(id){
   const heroBadges = (best && !multi) ? specBadges(best) : "";
 
   let body="";
-  if(d.files.length){
+  if(it.kind==='photo'){
+    // A photo is a picture, not a playback session: show it, and let a click
+    // open the same full-screen view the grid uses.
+    PHOTO_SET=[{id:it.id,title:it.title,recorded_at:it.recorded_at}];
+    body+=`<div class="actions"><button class="btnplay" onclick="openLightbox(${it.id})">View full size</button></div>
+      <img class="art" style="aspect-ratio:auto;max-height:60vh;width:auto;border-radius:var(--radius);cursor:zoom-in"
+           src="${esc(photoUrl(it.id,'thumb'))}" alt="" onclick="openLightbox(${it.id})">`;
+  } else if(d.files.length){
     // Movie / episode: play the best *available* version + labeled specs.
     // The player's info panel is fed from here — the detail response is the only
     // place that carries the synopsis and the show/season ancestry together.
@@ -1338,16 +1489,21 @@ async function viewItem(id){
     body+=`<h2 class="section" style="margin:18px 0 0">${d.children.length} episode${d.children.length>1?'s':''}</h2>
       <div class="eplist">${d.children.map(episodeRow).join("")}</div>`;
   } else if(d.children.length){
-    // Show (or anything with children): seasons/children grid.
-    body+=`<h2 class="section" style="margin:18px 0 12px">${d.children[0].kind==='season'?'Seasons':'Episodes'}</h2>${grid(d.children)}`;
+    // Show, season, or a mirrored folder: children as a grid.
+    const label = it.kind==='folder'? 'Contents'
+                : d.children[0].kind==='season'? 'Seasons' : 'Episodes';
+    body+=`<h2 class="section" style="margin:18px 0 12px">${label}</h2>${grid(d.children)}`;
+  } else if(it.kind==='folder'){
+    body+=`<div class="empty">This folder is empty.</div>`;
   }
 
   const bg=it.backdrop?`<div class="herobg" style="background-image:url(${esc(tok(it.backdrop))})"></div>`:'';
   document.getElementById("main").innerHTML=`<div class="hero">${bg}
     <div class="dwrap">
       <div class="poster">${artHtml(it)}</div>
-      <div class="dhead">${crumbs}<h1>${esc(it.title)}</h1>
+      <div class="dhead">${crumbs}<h1>${esc(it.title)}${editable?` <button class="ghost sm" title="Edit details" aria-label="Edit details" onclick='openEdit(${esc(JSON.stringify(it))})'>✎ Edit</button>`:''}</h1>
         <div class="chips">${chips.join("")}</div>
+        ${(it.tags&&it.tags.length)?`<div class="chips">${it.tags.map(t=>`<span>${esc(t)}</span>`).join("")}</div>`:''}
         ${heroBadges?`<div class="vbadges" style="margin-top:10px">${heroBadges}</div>`:''}
         ${it.overview?`<p class="overview">${esc(it.overview)}</p>`:''}
         ${body}</div>
@@ -1360,6 +1516,71 @@ async function viewItem(id){
     if(pf){ const r=it.watch&&it.watch.position_ms>3000&&!it.watch.watched?it.watch.position_ms:0;
       play(pf.id, it.title, r, pf.duration_ms||0, playerMeta(it, d.ancestors)); }
   }
+}
+
+// ---- edit details (home libraries, admin) ---------------------------------
+// The DB is the only truth for home items — there is no agent to overwrite
+// what you type here, and plurx never writes back to the .nfo (or anything
+// else) in your media folder.
+let EDIT_TAGS=[];
+function openEdit(it){
+  EDIT_TAGS=(it.tags||[]).slice();
+  const wrap=document.createElement("div");
+  wrap.className="editwrap"; wrap.id="editwrap";
+  wrap.innerHTML=`<div class="editcard">
+    <h2 class="section" style="margin-top:0">Edit details</h2>
+    <label for="ed-title">Title</label>
+    <input id="ed-title" value="${esc(it.title||"")}">
+    <label for="ed-date">Date recorded</label>
+    <input id="ed-date" type="date" value="${esc((it.recorded_at||"").slice(0,10))}">
+    <label for="ed-over">Description</label>
+    <textarea id="ed-over" rows="3">${esc(it.overview||"")}</textarea>
+    <label for="ed-tag">Tags</label>
+    <div class="chips-in" id="ed-chips" onclick="document.getElementById(\'ed-tag\').focus()"></div>
+    <div class="hint">Enter or comma adds a tag; tags are searchable.</div>
+    <div class="err" id="ed-err"></div>
+    <div class="row" style="margin-top:14px;justify-content:flex-end">
+      <button class="ghost" onclick="closeEdit()">Cancel</button>
+      <button onclick="saveEdit(${it.id})">Save</button>
+    </div></div>`;
+  wrap.addEventListener("click",e=>{ if(e.target===wrap) closeEdit(); });
+  document.body.appendChild(wrap);
+  paintTagChips();
+  const t=document.getElementById("ed-title"); if(t) t.focus();
+}
+function paintTagChips(){
+  const box=document.getElementById("ed-chips"); if(!box) return;
+  box.innerHTML=EDIT_TAGS.map((t,i)=>`<span class="chip">${esc(t)}<b onclick="dropTag(${i})" title="Remove">×</b></span>`).join("")
+    +`<input id="ed-tag" placeholder="${EDIT_TAGS.length?"":"beach, kids"}" onkeydown="tagKey(event)">`;
+}
+function dropTag(i){ EDIT_TAGS.splice(i,1); paintTagChips(); document.getElementById("ed-tag").focus(); }
+function tagKey(e){
+  const el=e.target;
+  if(e.key==="Enter"||e.key===","){
+    e.preventDefault();
+    const v=(el.value||"").trim();
+    if(v && !EDIT_TAGS.some(t=>t.toLowerCase()===v.toLowerCase())) EDIT_TAGS.push(v);
+    el.value=""; paintTagChips(); document.getElementById("ed-tag").focus();
+  } else if(e.key==="Backspace" && !el.value && EDIT_TAGS.length){
+    EDIT_TAGS.pop(); paintTagChips(); document.getElementById("ed-tag").focus();
+  }
+}
+function closeEdit(){ const w=document.getElementById("editwrap"); if(w) w.remove(); }
+async function saveEdit(id){
+  const title=(document.getElementById("ed-title").value||"").trim();
+  const date=(document.getElementById("ed-date").value||"").trim();
+  const over=(document.getElementById("ed-over").value||"").trim();
+  const pending=(document.getElementById("ed-tag").value||"").trim();
+  const tags=EDIT_TAGS.slice();
+  // Don't lose a tag someone typed but didn't commit with Enter.
+  if(pending && !tags.some(t=>t.toLowerCase()===pending.toLowerCase())) tags.push(pending);
+  const err=document.getElementById("ed-err"); if(err) err.textContent="";
+  // null clears a field; an empty date/description means "clear it".
+  const body={ title, recorded_at: date||null, overview: over||null, tags };
+  try{
+    await api(`/items/${id}`,{method:"PATCH",body});
+    closeEdit(); toast("Saved"); viewItem(id);
+  }catch(e){ if(err) err.textContent=e.message; }
 }
 
 async function toggleWatched(id, watched){
@@ -2463,6 +2684,14 @@ function closePlayer(){
 }
 // Keyboard while the player is open: 'i' toggles stats, Esc closes (unless the
 // native fullscreen is up — then Esc belongs to the browser's exit-fullscreen).
+// The lightbox owns the keyboard while it's up (the player modal can't be open
+// at the same time — a photo never opens the player).
+window.addEventListener("keydown",e=>{
+  if(!lightboxOpen()) return;
+  if(e.key==="Escape"){ e.preventDefault(); closeLightbox(); }
+  else if(e.key==="ArrowLeft"){ e.preventDefault(); lbStep(-1); }
+  else if(e.key==="ArrowRight"){ e.preventDefault(); lbStep(1); }
+});
 window.addEventListener("keydown",e=>{
   if(!document.getElementById("modal").classList.contains("open")) return;
   const typing=/^(INPUT|TEXTAREA|SELECT)$/.test((e.target.tagName||""));
@@ -2590,15 +2819,17 @@ function librariesPanel(libs,status,settings){
         <span class="muted" style="font-size:12px">${libs.length} librar${libs.length===1?'y':'ies'}</span></div>`:"";
   // Movies/TV need a TMDB key for artwork; without one the scan finds files but
   // downloads nothing. Surface that right here, where libraries are managed.
-  const needTmdb = settings && !settings.tmdb_configured && libs.some(l=>!l.anime);
-  const warn = needTmdb ? `<div class="setwarn">⚠ <b>No TMDB API key set.</b> Your Movies/TV libraries scan fine, but posters, overviews, and episode data won't download without one. <a onclick="setSettingsTab('metadata')">Add a free key in Metadata</a>, then use <b>Refresh all art</b>. (Anime libraries use AniList and need no key.)</div>` : "";
+  // Home libraries have no provider at all, so they don't want a key either.
+  const needTmdb = settings && !settings.tmdb_configured
+      && libs.some(l=>!l.anime && l.kind!=="home");
+  const warn = needTmdb ? `<div class="setwarn">⚠ <b>No TMDB API key set.</b> Your Movies/TV libraries scan fine, but posters, overviews, and episode data won't download without one. <a onclick="setSettingsTab('metadata')">Add a free key in Metadata</a>, then use <b>Refresh all art</b>. (Anime libraries use AniList, and home libraries use no provider at all — neither needs a key.)</div>` : "";
   return `<div class="card"><h2 class="section" style="margin-top:0">Libraries</h2>
       ${warn}${bulk}
       <table><thead><tr><th>Name</th><th>Kind</th><th>Paths</th><th>Status</th><th></th></tr></thead>
       <tbody>${rows}</tbody></table>
       <h2 class="section">Add library</h2>
       <div class="row"><input id="ln" placeholder="Name" style="max-width:180px">
-        <select id="lk" style="max-width:130px"><option value="movies">Movies</option><option value="shows">TV Shows</option><option value="anime">Anime</option></select>
+        <select id="lk" style="max-width:170px"><option value="movies">Movies</option><option value="shows">TV Shows</option><option value="anime">Anime</option><option value="home">Home videos &amp; photos</option></select>
         <input id="lp" placeholder="/path/to/media (comma-separated)"></div>
       <div class="hint">Paths are as the <b>server process</b> sees them — running in Docker, that's the path inside the container (e.g. <code>/media/movies</code>), which must be mounted in your compose file.</div>
       <div class="err" id="lerr"></div>
@@ -2686,13 +2917,14 @@ function systemPanel(sys){
 function editLib(id){
   const l=SETTINGS_DATA&&SETTINGS_DATA.libs.find(x=>x.id===id); if(!l) return;
   const row=document.getElementById("librow-"+id); if(!row) return;
-  const sel=l.anime?"anime":(l.kind==="movies"?"movies":"shows");
+  const sel=l.anime?"anime":l.kind;
   row.innerHTML=`<td colspan="5"><div class="libedit">
       <input id="eln-${id}" value="${esc(l.name)}" placeholder="Name" style="max-width:200px">
-      <select id="elk-${id}" style="max-width:130px">
+      <select id="elk-${id}" style="max-width:170px">
         <option value="movies"${sel==="movies"?" selected":""}>Movies</option>
         <option value="shows"${sel==="shows"?" selected":""}>TV Shows</option>
-        <option value="anime"${sel==="anime"?" selected":""}>Anime</option></select>
+        <option value="anime"${sel==="anime"?" selected":""}>Anime</option>
+        <option value="home"${sel==="home"?" selected":""}>Home videos &amp; photos</option></select>
       <input id="elp-${id}" value="${esc((l.paths||[]).join(", "))}" placeholder="/path (comma-separated)" style="flex:1;min-width:240px">
       <button class="sm" onclick="saveLib(${id})">Save</button>
       <button class="ghost sm" onclick="renderSettings()">Cancel</button>
@@ -2706,7 +2938,7 @@ async function saveLib(id){
   const paths=(document.getElementById("elp-"+id).value||"").split(",").map(x=>x.trim()).filter(Boolean);
   const kind=s==="anime"?"shows":s, anime=s==="anime";
   const err=document.getElementById("ele-"+id); if(err) err.textContent="";
-  try{ await api(`/libraries/${id}`,{method:"PUT",body:{name,kind,paths,anime}}); toast("Library updated"); viewSettings(); }
+  try{ await api(`/libraries/${id}`,{method:"PUT",body:{name,kind,paths,anime}}); invalidateLibs(); toast("Library updated"); viewSettings(); }
   catch(e){ if(err) err.textContent=e.message; }
 }
 async function scanAll(){
@@ -2755,12 +2987,12 @@ async function addLib(){
   const kind = sel==="anime" ? "shows" : sel;
   const anime = sel==="anime";
   const err=document.getElementById("lerr"); err.textContent="";
-  try{ await api("/libraries",{method:"POST",body:{name,kind,paths,anime}}); toast("Library added — scanning"); viewSettings(); }
+  try{ await api("/libraries",{method:"POST",body:{name,kind,paths,anime}}); invalidateLibs(); toast("Library added — scanning"); viewSettings(); }
   catch(e){ err.textContent=e.message; }
 }
 async function scanLib(id){ try{ await api(`/libraries/${id}/scan`,{method:"POST"}); toast("Scan started"); setTimeout(settingsTick,400);}catch(e){toast(e.message)} }
 async function refreshLib(id){ try{ await api(`/libraries/${id}/refresh`,{method:"POST"}); toast("Refreshing metadata & artwork…"); setTimeout(settingsTick,400);}catch(e){toast(e.message)} }
-async function delLib(id){ if(!confirm("Delete this library? Media files are not touched.")) return; try{ await api(`/libraries/${id}`,{method:"DELETE"}); toast("Deleted"); viewSettings(); }catch(e){toast(e.message)} }
+async function delLib(id){ if(!confirm("Delete this library? Media files are not touched.")) return; try{ await api(`/libraries/${id}`,{method:"DELETE"}); invalidateLibs(); toast("Deleted"); viewSettings(); }catch(e){toast(e.message)} }
 async function saveTmdb(){ const err=document.getElementById("terr"); err.textContent=""; try{ await api("/settings",{method:"PUT",body:{tmdb_api_key:tk.value.trim()}}); toast("Saved"); viewSettings(); }catch(e){err.textContent=e.message} }
 async function saveOmdb(){ const err=document.getElementById("oerr"); err.textContent=""; try{ await api("/settings",{method:"PUT",body:{omdb_api_key:document.getElementById("ok").value.trim()}}); toast("Saved"); viewSettings(); }catch(e){err.textContent=e.message} }
 
