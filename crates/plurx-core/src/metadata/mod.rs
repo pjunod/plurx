@@ -58,8 +58,14 @@ pub async fn enrich_library(
     };
 
     for item in items {
+        // An id, if one is already known, before any search. This is the
+        // whole point: `"Heat (1995) Directors Cut Remux"` is a title a
+        // search can get wrong, and a wrong match does not stay local — it
+        // propagates into Trakt sync, which matches on TMDB id. When the
+        // caller told us the id, guessing is strictly worse than obeying.
+        let known = known_id(tmdb, &item).await;
         match item.kind {
-            ItemKind::Movie => match tmdb.find_movie(&item.title, item.year).await {
+            ItemKind::Movie => match movie_lookup(tmdb, &item, known).await {
                 Ok(Some(m)) => {
                     let poster = cache_image(
                         tmdb,
@@ -89,6 +95,7 @@ pub async fn enrich_library(
                         runtime_ms: m.runtime_ms,
                         poster_path: poster,
                         backdrop_path: backdrop,
+                        enriched: true,
                         ..Default::default()
                     };
                     if apply(store, item.id, patch, &mut report).await {
@@ -101,7 +108,7 @@ pub async fn enrich_library(
                     report.errors += 1;
                 }
             },
-            ItemKind::Show => match tmdb.find_show(&item.title, item.year).await {
+            ItemKind::Show => match show_lookup(tmdb, &item, known).await {
                 Ok(Some(m)) => {
                     let show_tmdb_id = m.tmdb_id;
                     let poster = cache_image(
@@ -130,6 +137,7 @@ pub async fn enrich_library(
                         air_date: m.air_date,
                         poster_path: poster,
                         backdrop_path: backdrop,
+                        enriched: true,
                         ..Default::default()
                     };
                     if apply(store, item.id, patch, &mut report).await {
@@ -156,6 +164,54 @@ pub async fn enrich_library(
         "metadata enrichment complete"
     );
     report
+}
+
+/// The TMDB id already attached to this item, directly or via its IMDb id.
+///
+/// `None` means nobody has told us what this is, so a title search is the
+/// only thing left to try. An IMDb lookup that *fails* also lands here — a
+/// dead network is not a reason to leave the item unenriched forever, and
+/// the search path is exactly the fallback it should get.
+async fn known_id(tmdb: &TmdbClient, item: &crate::domain::Item) -> Option<i64> {
+    if let Some(id) = item.tmdb_id {
+        return Some(id);
+    }
+    let imdb = item.imdb_id.as_deref()?;
+    match tmdb.id_for_imdb(imdb, item.kind == ItemKind::Show).await {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::warn!(imdb, error = %e, "imdb → tmdb lookup failed; falling back to search");
+            None
+        }
+    }
+}
+
+/// Resolve a movie: by id when one is known, by title otherwise.
+///
+/// A by-id fetch never returns `Ok(None)` — an id either resolves or errors,
+/// and "TMDB does not have id 999999" is an error worth seeing rather than a
+/// silent unmatched.
+async fn movie_lookup(
+    tmdb: &TmdbClient,
+    item: &crate::domain::Item,
+    known: Option<i64>,
+) -> Result<Option<tmdb::Match>, crate::error::MetadataError> {
+    match known {
+        Some(id) => tmdb.movie_by_id(id).await.map(Some),
+        None => tmdb.find_movie(&item.title, item.year).await,
+    }
+}
+
+/// Resolve a show, as [`movie_lookup`] does for movies.
+async fn show_lookup(
+    tmdb: &TmdbClient,
+    item: &crate::domain::Item,
+    known: Option<i64>,
+) -> Result<Option<tmdb::Match>, crate::error::MetadataError> {
+    match known {
+        Some(id) => tmdb.show_by_id(id).await.map(Some),
+        None => tmdb.find_show(&item.title, item.year).await,
+    }
 }
 
 /// Enrich anime shows in a library from AniList (REQ-META-3). Only show items
@@ -211,6 +267,10 @@ pub async fn enrich_anime_library(
                     overview: m.overview,
                     poster_path: poster,
                     backdrop_path: backdrop,
+                    // AniList never yields a TMDB id, so before `metadata_at`
+                    // existed an anime show was re-matched on every single
+                    // scan — the id-is-the-marker rule had no id to read.
+                    enriched: true,
                     ..Default::default()
                 };
                 if apply(store, item.id, patch, &mut report).await {
@@ -410,9 +470,11 @@ async fn cache_image(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{ItemKind, LibraryKind, NewItem, NewLibrary};
+    use crate::domain::{ItemKind, LibraryKind, MetadataPatch, NewItem, NewLibrary};
     use crate::store::{LibraryStore, MediaStore, SqliteStore};
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     async fn serve(app: axum::Router) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -549,6 +611,208 @@ mod tests {
         // A second run has nothing left needing metadata.
         let again = enrich_library(&store, &tmdb, art.path(), Some(lib.id), false).await;
         assert_eq!(again.matched, 0);
+    }
+
+    /// A movie library with one movie in it, titled however you like.
+    async fn one_movie(title: &str) -> (SqliteStore, i64, i64) {
+        let store = SqliteStore::open_in_memory().expect("open");
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "L".into(),
+                kind: LibraryKind::Movies,
+                paths: vec![],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+        let movie = store
+            .insert_item(&NewItem {
+                library_id: lib.id,
+                kind: ItemKind::Movie,
+                parent_id: None,
+                title: title.into(),
+                year: None,
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("movie");
+        (store, lib.id, movie)
+    }
+
+    /// TMDB with `/movie/949` answering as Heat, and both search endpoints
+    /// counting their callers so a test can assert they were never used.
+    fn counting_mock(searches: Arc<AtomicUsize>) -> axum::Router {
+        use axum::routing::get;
+        use axum::Json;
+        let movie_hits = searches.clone();
+        let tv_hits = searches.clone();
+        axum::Router::new()
+            .route(
+                "/movie/949",
+                get(|| async {
+                    Json(json!({
+                        "id": 949, "title": "Heat", "release_date": "1995-12-15",
+                        "overview": "A crew of professionals.", "imdb_id": "tt0113277",
+                        "runtime": 170, "poster_path": "/heat.jpg"
+                    }))
+                }),
+            )
+            .route(
+                "/find/tt0113277",
+                get(|| async { Json(json!({ "movie_results": [{ "id": 949 }] })) }),
+            )
+            .route(
+                "/search/movie",
+                get(move || {
+                    let hits = movie_hits.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({ "results": [] }))
+                    }
+                }),
+            )
+            .route(
+                "/search/tv",
+                get(move || {
+                    let hits = tv_hits.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({ "results": [] }))
+                    }
+                }),
+            )
+            .fallback(get(|| async { vec![0u8, 1, 2, 3] }))
+    }
+
+    /// The P4 acceptance case: a title a search would plausibly get wrong,
+    /// plus the id the caller already knew. The id must win outright.
+    #[tokio::test]
+    async fn a_known_tmdb_id_is_used_directly_and_the_search_is_never_called() {
+        let (store, lib, movie) = one_movie("Heat (1995) Directors Cut Remux").await;
+        // Exactly what a monarr scan request leaves behind: an id, nothing else.
+        store
+            .apply_metadata(
+                movie,
+                &MetadataPatch {
+                    tmdb_id: Some(949),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("ids");
+
+        let searches = Arc::new(AtomicUsize::new(0));
+        let base = serve(counting_mock(searches.clone())).await;
+        let tmdb = TmdbClient::new("k").with_base(&base, &base);
+        let art = tempfile::tempdir().expect("tmp");
+
+        let report = enrich_library(&store, &tmdb, art.path(), Some(lib), false).await;
+        assert_eq!(report.matched, 1, "the id-carrying item was enriched");
+        assert_eq!(report.errors, 0);
+        assert_eq!(
+            searches.load(Ordering::SeqCst),
+            0,
+            "an item that names its own id must never be searched for"
+        );
+
+        let m = store.get_item(movie).await.expect("get").expect("item");
+        assert_eq!(
+            m.title, "Heat",
+            "the id's canonical title, not the filename"
+        );
+        assert_eq!(m.year, Some(1995));
+        assert_eq!(m.imdb_id.as_deref(), Some("tt0113277"));
+        assert!(m.poster_path.is_some());
+
+        // And now it is done: a second pass has nothing to do.
+        let again = enrich_library(&store, &tmdb, art.path(), Some(lib), false).await;
+        assert_eq!(again.matched, 0);
+        assert_eq!(searches.load(Ordering::SeqCst), 0);
+    }
+
+    /// IMDb-only is the other half of the same case — monarr's movie side
+    /// tracks IMDb ids, and one lookup beats a title search.
+    #[tokio::test]
+    async fn an_imdb_id_is_resolved_to_a_tmdb_id_rather_than_searched() {
+        let (store, lib, movie) = one_movie("Heat.1995.Directors.Cut.2160p").await;
+        store
+            .apply_metadata(
+                movie,
+                &MetadataPatch {
+                    imdb_id: Some("tt0113277".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("ids");
+
+        let searches = Arc::new(AtomicUsize::new(0));
+        let base = serve(counting_mock(searches.clone())).await;
+        let tmdb = TmdbClient::new("k").with_base(&base, &base);
+        let art = tempfile::tempdir().expect("tmp");
+
+        let report = enrich_library(&store, &tmdb, art.path(), Some(lib), false).await;
+        assert_eq!(report.matched, 1);
+        assert_eq!(searches.load(Ordering::SeqCst), 0);
+        let m = store.get_item(movie).await.expect("get").expect("item");
+        assert_eq!(m.title, "Heat");
+        assert_eq!(m.tmdb_id, Some(949));
+    }
+
+    /// A forced refresh re-reads the stored id. It must not fall back to
+    /// matching on the title again — `force` means "fetch it again", not
+    /// "start over and possibly land somewhere else".
+    #[tokio::test]
+    async fn a_forced_refresh_refreshes_by_id_not_by_title() {
+        let (store, lib, movie) = one_movie("Heat (1995) Directors Cut Remux").await;
+        store
+            .apply_metadata(
+                movie,
+                &MetadataPatch {
+                    tmdb_id: Some(949),
+                    enriched: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("ids");
+
+        let searches = Arc::new(AtomicUsize::new(0));
+        let base = serve(counting_mock(searches.clone())).await;
+        let tmdb = TmdbClient::new("k").with_base(&base, &base);
+        let art = tempfile::tempdir().expect("tmp");
+
+        // Not due normally — already enriched.
+        assert_eq!(
+            enrich_library(&store, &tmdb, art.path(), Some(lib), false)
+                .await
+                .matched,
+            0
+        );
+        // Forced: fetched again, still by id.
+        let report = enrich_library(&store, &tmdb, art.path(), Some(lib), true).await;
+        assert_eq!(report.matched, 1);
+        assert_eq!(searches.load(Ordering::SeqCst), 0);
+    }
+
+    /// No id anywhere is still the ordinary case: search, as before.
+    #[tokio::test]
+    async fn an_item_with_no_id_at_all_still_falls_back_to_searching() {
+        let (store, lib, movie) = one_movie("matrix").await;
+        let searches = Arc::new(AtomicUsize::new(0));
+        // The counting mock answers searches with nothing, so this also
+        // pins down that an unmatched item is not counted as an error.
+        let base = serve(counting_mock(searches.clone())).await;
+        let tmdb = TmdbClient::new("k").with_base(&base, &base);
+        let art = tempfile::tempdir().expect("tmp");
+
+        let report = enrich_library(&store, &tmdb, art.path(), Some(lib), false).await;
+        assert_eq!(searches.load(Ordering::SeqCst), 1, "the search ran");
+        assert_eq!(report.unmatched, 1);
+        assert_eq!(report.errors, 0);
+        let m = store.get_item(movie).await.expect("get").expect("item");
+        assert_eq!(m.title, "matrix", "left alone when nothing matched");
     }
 
     #[tokio::test]

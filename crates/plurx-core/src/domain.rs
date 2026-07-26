@@ -189,6 +189,14 @@ pub struct MetadataPatch {
     /// Labels to set (home libraries). `None` leaves them alone; an empty
     /// vector is not a clear — use [`ItemEdit`] for that.
     pub tags: Option<Vec<String>>,
+    /// "A provider answered for this item" — stamps `metadata_at`, which is
+    /// what takes the item out of the enrichment queue.
+    ///
+    /// Deliberately explicit rather than inferred from the patch's contents.
+    /// A caller-supplied id (a monarr scan request) is a patch carrying only
+    /// `tmdb_id`, and inferring "enriched" from that would mark the item done
+    /// *because* it named an id — the exact opposite of what the id is for.
+    pub enriched: bool,
 }
 
 impl MetadataPatch {
@@ -204,6 +212,7 @@ impl MetadataPatch {
             && self.backdrop_path.is_none()
             && self.recorded_at.is_none()
             && self.tags.is_none()
+            && !self.enriched
     }
 }
 

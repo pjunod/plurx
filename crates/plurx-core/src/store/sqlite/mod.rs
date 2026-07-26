@@ -273,6 +273,20 @@ const MIGRATIONS: &[&str] = &[
         disabled     INTEGER NOT NULL DEFAULT 0
     ) STRICT;
     CREATE INDEX api_keys_hash ON api_keys(key_hash);",
+    // v9: "has the provider been consulted for this item yet?" as its own
+    // fact, instead of inferring it from `tmdb_id IS NULL`.
+    //
+    // That inference was safe only while plurx itself was the only thing that
+    // ever wrote a tmdb id. Now another application can hand one over on the
+    // scan request (§3 of the integration plan), and under the old rule such
+    // an item was treated as already enriched — id set, and therefore never
+    // given a title, overview or poster. The id it arrived with is the reason
+    // to enrich it, not a reason to skip it.
+    //
+    // Backfilled from `updated_at` for everything that already has an id, so
+    // an upgrade does not re-fetch a library's worth of metadata from TMDB.
+    "ALTER TABLE items ADD COLUMN metadata_at INTEGER;
+    UPDATE items SET metadata_at = updated_at WHERE tmdb_id IS NOT NULL;",
 ];
 
 /// Column list matching [`item_from_row`]. Prefix with a table alias via
@@ -648,6 +662,53 @@ mod tests {
         .expect("seed");
     }
 
+    /// v9 turns "has an id" into "a provider has answered". The upgrade must
+    /// carry the old meaning across for everything already matched — the
+    /// failure mode is silent and expensive: every library in the world
+    /// re-fetching itself from TMDB the first time it starts on the new
+    /// version, one HTTP call per item, into a rate limit.
+    #[tokio::test]
+    async fn v9_backfills_already_matched_items_so_no_library_re_enriches() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("plurx.db");
+        {
+            let conn = Connection::open(&db).expect("raw open");
+            for (index, sql) in MIGRATIONS.iter().enumerate().take(8) {
+                conn.execute_batch(&format!("BEGIN;\n{sql}\nCOMMIT;"))
+                    .unwrap_or_else(|e| panic!("v{}: {e}", index + 1));
+            }
+            conn.pragma_update(None, "user_version", 8)
+                .expect("version");
+            conn.execute_batch(
+                "INSERT INTO libraries (id, name, kind, paths, anime)
+                     VALUES (1, 'Movies', 'movies', '[\"/media/movies\"]', 0);
+                 INSERT INTO items (id, library_id, kind, title, sort_title, tmdb_id, updated_at)
+                     VALUES (10, 1, 'movie', 'Blade Runner', 'blade runner', 78, 1700000000),
+                            (11, 1, 'movie', 'Unmatched', 'unmatched', NULL, 1700000000);",
+            )
+            .expect("seed v8");
+        }
+
+        let store = SqliteStore::open(&db).expect("migrate");
+        let needing = store
+            .items_needing_metadata(None, false)
+            .await
+            .expect("needing");
+        assert_eq!(
+            needing.iter().map(|i| i.id).collect::<Vec<_>>(),
+            vec![11],
+            "the matched item is left alone; only the unmatched one is queued"
+        );
+
+        let conn = Connection::open(&db).expect("raw reopen");
+        let stamp: Option<i64> = conn
+            .query_row("SELECT metadata_at FROM items WHERE id = 10", [], |r| {
+                r.get(0)
+            })
+            .expect("stamp");
+        assert_eq!(stamp, Some(1700000000), "backfilled from updated_at");
+    }
+
     /// The single most important test in the home-video feature: v6 rebuilds
     /// both `libraries` and `items` (SQLite can't alter a CHECK), and a
     /// mistake there eats a real library.
@@ -670,7 +731,7 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .expect("version");
         assert_eq!(version, MIGRATIONS.len() as i64);
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
 
         // Every row survives, values identical.
         let dangling: i64 = conn

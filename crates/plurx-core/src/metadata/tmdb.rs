@@ -190,6 +190,32 @@ impl TmdbClient {
         Ok(show_match(tmdb_id, &details))
     }
 
+    /// The TMDB id behind an IMDb id, or `None` if TMDB does not know it.
+    ///
+    /// An item can reach plurx carrying only an IMDb id — monarr's movie side
+    /// tracks IMDb, and a hand-written NFO usually does too. Spending one
+    /// lookup to turn it into a TMDB id is worth it: the alternative is a
+    /// title search, and a title search is the thing that gets it wrong.
+    pub async fn id_for_imdb(
+        &self,
+        imdb_id: &str,
+        show: bool,
+    ) -> Result<Option<i64>, MetadataError> {
+        let body = self
+            .get(
+                &format!("/find/{imdb_id}"),
+                &[("external_source", "imdb_id".to_owned())],
+            )
+            .await?;
+        let field = if show { "tv_results" } else { "movie_results" };
+        Ok(body
+            .get(field)
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+            .and_then(|v| v.get("id"))
+            .and_then(|v| v.as_i64()))
+    }
+
     /// Full image URL for a TMDB-relative path, honouring *this* client's image
     /// base so a self-hosted proxy — or a test mock — is respected. The free
     /// [`image_url`] always points at the public CDN.

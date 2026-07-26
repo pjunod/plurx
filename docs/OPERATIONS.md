@@ -228,6 +228,21 @@ folder — pruning against that view would delete the rest of the library. The
 scheduled scan (per library, Settings → interval) remains the thing that
 notices files that vanished.
 
+**What the `ids` do.** They are not decoration. An item that arrives carrying
+a `tmdb` (or `imdb`) id is enriched **by that id** — plurx fetches the detail
+record directly and never runs a title search. That matters because the title
+search is the step that can be wrong: `Heat (1995) Directors Cut Remux` is a
+folder name, and a search for it can land on a different film. A wrong match
+does not stay local either — Trakt sync matches on TMDB id, so it propagates.
+If the sending application knows the id, sending it is strictly better than
+not. Items sent without ids are matched by title, exactly as a manual scan
+would do.
+
+An item can also arrive with an id *before* it has any metadata, and that is
+normal: the id says what it is, and enrichment then fills in title, overview
+and artwork on the same pass. An item that keeps its filename as its title
+means enrichment has no TMDB key configured — the scan itself succeeded.
+
 ## Logs
 
 Structured `tracing` logs go to stdout/journald, and the same buffer is exposed

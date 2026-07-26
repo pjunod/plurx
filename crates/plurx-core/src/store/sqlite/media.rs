@@ -356,6 +356,10 @@ impl MediaStore for SqliteStore {
                      backdrop_path = COALESCE(?11, backdrop_path),
                      recorded_at = COALESCE(?12, recorded_at),
                      tags = COALESCE(?13, tags),
+                     -- Sticky: once a provider has answered, a later patch
+                     -- that does not claim to be enrichment (caller-supplied
+                     -- ids, a Trakt backfill) must not un-mark the item.
+                     metadata_at = CASE WHEN ?14 = 1 THEN unixepoch() ELSE metadata_at END,
                      updated_at = unixepoch()
                  WHERE id = ?1",
                 params![
@@ -372,6 +376,7 @@ impl MediaStore for SqliteStore {
                     patch.backdrop_path,
                     patch.recorded_at,
                     tags,
+                    patch.enriched as i64,
                 ],
             )?;
             Ok(())
@@ -477,7 +482,7 @@ impl MediaStore for SqliteStore {
             let mut stmt = conn.prepare(&format!(
                 "SELECT {i} FROM items i
                  JOIN libraries l ON l.id = i.library_id AND l.kind != 'home'
-                 WHERE i.kind IN ('movie','show') AND (?2 = 1 OR i.tmdb_id IS NULL)
+                 WHERE i.kind IN ('movie','show') AND (?2 = 1 OR i.metadata_at IS NULL)
                    AND (?1 IS NULL OR i.library_id = ?1)
                  ORDER BY i.id",
                 i = item_cols("i")
@@ -1252,6 +1257,30 @@ mod tests {
                 .len(),
             1
         );
+        // An id on its own does NOT mean "enriched". This is the shape of
+        // patch another application's scan request produces: it names what
+        // the item is, which is a reason to go and fetch its metadata, not a
+        // reason to consider it fetched.
+        store
+            .apply_metadata(
+                id,
+                &MetadataPatch {
+                    tmdb_id: Some(78),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("ids only");
+        assert_eq!(
+            store
+                .items_needing_metadata(None, false)
+                .await
+                .expect("needing")
+                .len(),
+            1,
+            "an item that arrived with an id still needs everything else"
+        );
+
         store
             .apply_metadata(
                 id,
@@ -1259,11 +1288,30 @@ mod tests {
                     title: Some("Blade Runner".into()),
                     overview: Some("A blade runner must pursue replicants.".into()),
                     tmdb_id: Some(78),
+                    enriched: true,
                     ..Default::default()
                 },
             )
             .await
             .expect("patch");
+        assert!(store
+            .items_needing_metadata(None, false)
+            .await
+            .expect("needing")
+            .is_empty());
+
+        // And the mark is sticky: a later id-only patch (a Trakt backfill,
+        // a re-announced import) must not push the item back into the queue.
+        store
+            .apply_metadata(
+                id,
+                &MetadataPatch {
+                    imdb_id: Some("tt0083658".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("later patch");
         assert!(store
             .items_needing_metadata(None, false)
             .await

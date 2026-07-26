@@ -201,9 +201,12 @@ pub trait MediaStore: Send + Sync + 'static {
 
     // --- metadata enrichment ---
     async fn apply_metadata(&self, item_id: i64, patch: &MetadataPatch) -> Result<(), StoreError>;
-    /// Movies and shows to enrich. Normally only those with no TMDB match yet;
-    /// `force` includes already-matched items too (a metadata refresh, e.g. to
-    /// backfill season posters onto shows enriched before that existed).
+    /// Movies and shows to enrich: normally those no provider has answered
+    /// for yet, which is *not* the same as "those with no TMDB id" — an item
+    /// can arrive carrying an id from another application (a monarr scan
+    /// request) and still need every other field. `force` includes
+    /// already-enriched items too (a metadata refresh, e.g. to backfill
+    /// season posters onto shows enriched before that existed).
     async fn items_needing_metadata(
         &self,
         library_id: Option<i64>,

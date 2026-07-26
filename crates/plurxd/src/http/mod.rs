@@ -690,6 +690,60 @@ mod tests {
         assert_eq!(rec["source"], "monarr");
     }
 
+    /// The seam between "another app told us the id" and "go and enrich it".
+    ///
+    /// These two features can each be right and still combine into an item
+    /// that is permanently blank: enrichment used to read "has a TMDB id" as
+    /// "already enriched", so an item that ARRIVED with an id would never be
+    /// given a title, an overview or a poster. Nothing errors; the item just
+    /// sits there looking like a filename forever. Asserted end to end
+    /// because neither half's own tests can see it.
+    #[tokio::test]
+    async fn an_item_that_arrives_with_an_id_is_still_queued_for_enrichment() {
+        let (app, state) = test_state();
+        let admin = setup_admin(&app).await;
+        let key = scan_key(&app, &admin, json!(["scan:trigger", "status:read"])).await;
+
+        let dir = tempfile::tempdir().expect("tmp");
+        let movie = dir.path().join("Heat (1995)");
+        std::fs::create_dir_all(&movie).expect("mkdir");
+        std::fs::write(movie.join("Heat (1995).mkv"), b"x").expect("write");
+        call(
+            &app,
+            post(
+                "/api/v1/libraries",
+                Some(&admin),
+                json!({ "name": "Movies", "kind": "movies", "paths": [dir.path()] }),
+            ),
+        )
+        .await;
+
+        let body = scan_and_settle(
+            &app,
+            &key,
+            json!({ "path": movie, "ids": { "tmdb": 949 }, "hint": "movie", "source": "monarr" }),
+        )
+        .await;
+        let item_id = body["items"][0]["item_id"].as_i64().expect("item id");
+
+        let queued = state
+            .store
+            .items_needing_metadata(None, false)
+            .await
+            .expect("needing");
+        let mine = queued.iter().find(|i| i.id == item_id);
+        assert!(
+            mine.is_some(),
+            "the id-carrying item was dropped from the enrichment queue — it \
+             would stay titled after its own filename forever"
+        );
+        assert_eq!(
+            mine.and_then(|i| i.tmdb_id),
+            Some(949),
+            "and it must carry the id INTO enrichment, so the search is skipped"
+        );
+    }
+
     /// A scan of one folder must not disturb the rest of the library. This is
     /// the no-prune property, asserted through the HTTP surface as well as in
     /// the core, because it is the one that would destroy data.
