@@ -409,6 +409,18 @@
   .problem{color:var(--bad);font-size:12px;margin-top:4px;font-weight:400;
     line-height:1.45;overflow-wrap:anywhere}
   .problem:first-child{margin-top:0}
+  /* A skipped-file group: one row per folder, expandable to a few filenames.
+     The summary holds text only — a <summary> is exposed as a button, and
+     nesting a control inside one is invalid and unclickable in WebKit. */
+  .skipgroup{color:var(--muted);font-size:12px;margin-top:4px;line-height:1.45}
+  .skipgroup:first-child{margin-top:0}
+  .skipgroup>summary{cursor:pointer;overflow-wrap:anywhere;list-style:none}
+  .skipgroup>summary::-webkit-details-marker{display:none}
+  .skipgroup>summary::before{content:"▸ ";color:var(--muted)}
+  .skipgroup[open]>summary::before{content:"▾ "}
+  .skipgroup>summary:hover{color:var(--text)}
+  .skipgroup .count{color:var(--text);font-weight:600}
+  .skipsamples{margin:3px 0 5px 14px;opacity:.85;overflow-wrap:anywhere}
   /* Skips and truncation notices are informational, not failures — same list,
      quieter ink, so the red lines stay the ones that need attention. */
   .problem.info{color:var(--muted)}
@@ -2794,15 +2806,32 @@ function statusText(st){
     // so this list is where a red count becomes actionable. Skips and the
     // "…and N more" truncation notice are informational, and read as such.
     const probs=r.problems||[];
-    if(probs.length){
+    // Skips arrive grouped by folder (scan/mod.rs): one mis-named show is one
+    // row, not one row per episode. Twenty-four lines differing only in the
+    // episode number were never twenty-four problems.
+    const groups=r.skip_groups||[];
+    if(probs.length||groups.length){
       const isInfo=p=>/^(skipped |…and )/.test(p);
       const lines=probs.map(p=>{
         const info=isInfo(p);
         return `<div class="problem${info?" info":""}">${info?"·":"⚠"} ${esc(p)}</div>`;
       }).join("");
-      // Real failures are already ordered ahead of skips by the scanner, so the
-      // box opens on them — the operator sees what to act on without scrolling.
-      s+=`<div class="problems${probs.every(isInfo)?" info-only":""}">${lines}</div>`;
+      const grouped=groups.map(g=>{
+        const n=g.count||0;
+        const files=n===1?"file":"files";
+        // The samples are a taste of the shape, not the list this replaces —
+        // so they are behind a disclosure rather than printed by default.
+        const samples=(g.samples||[]).length
+          ? `<div class="skipsamples">${(g.samples||[]).map(esc).join("<br>")}${
+              n>(g.samples||[]).length?`<br>…and ${n-(g.samples||[]).length} more`:""}</div>`
+          : "";
+        return `<details class="skipgroup"><summary>· skipped <span class="count">${n}</span> `+
+          `${files} in <code>${esc(g.folder)}</code> — ${esc(g.reason)}</summary>${samples}</details>`;
+      }).join("");
+      // Real failures first: the operator sees what to act on without
+      // scrolling, and skips are informational by definition.
+      const infoOnly=probs.every(isInfo);
+      s+=`<div class="problems${infoOnly?" info-only":""}">${lines}${grouped}</div>`;
     }
     return s;
   }

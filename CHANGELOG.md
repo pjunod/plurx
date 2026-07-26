@@ -115,6 +115,16 @@ bump may break compatibility and a **patch** bump never does.
   Moving those files out of *added* was the other option and would have been
   worse: the scan would report nothing added while two new items sat in the
   library, so the overlap is kept and simply stated.
+- Skipped files are grouped by show instead of listed one per file. A show
+  whose files carry no `S01E02` skips *every episode*, so one mis-named series
+  produced two dozen near-identical lines and a real library produced 187 —
+  which the ten-line cap then truncated into "…and 177 more", the least useful
+  possible summary of a problem with exactly three causes. The report now says
+  `skipped 168 files in /8tb/tv/Drawn Together — no season/episode marker`, one
+  row per folder, worst first, expandable to a few of the filenames. Grouping is
+  by the folder directly under the library root, because that is the unit the
+  operator acts on: grouping any deeper reproduces the per-file list one level
+  up. Counts still cover every file; only the samples are capped.
 - Scan problems are boxed and scroll in place instead of printing into the
   libraries table. A TV scan reporting 187 skips pushed every other library off
   the screen and turned the settings page into a log dump; the list is now a

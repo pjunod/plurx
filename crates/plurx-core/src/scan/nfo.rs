@@ -121,15 +121,15 @@ pub fn parse(text: &str) -> Option<Nfo> {
                 }
                 depth = depth.saturating_sub(1);
             }
-            Ok(Event::Empty(e)) => {
-                // <movie/> is a valid, if useless, sidecar.
-                if depth == 0 {
-                    seen_root = true;
-                    if String::from_utf8_lossy(e.local_name().as_ref()).to_lowercase() != "movie" {
-                        return None;
-                    }
-                    in_movie = true;
+            // <movie/> is a valid, if useless, sidecar. An empty element at
+            // any other depth is a childless field we have no text for, and
+            // falls through to the catch-all below.
+            Ok(Event::Empty(e)) if depth == 0 => {
+                seen_root = true;
+                if String::from_utf8_lossy(e.local_name().as_ref()).to_lowercase() != "movie" {
+                    return None;
                 }
+                in_movie = true;
             }
             Ok(Event::Text(_)) | Ok(Event::CData(_)) if field.is_none() => {}
             Ok(event @ (Event::Text(_) | Event::CData(_))) => {

@@ -12,7 +12,7 @@ pub mod nfo;
 pub mod parse;
 pub mod probe;
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -81,11 +81,40 @@ pub struct ScanReport {
     /// filter the log view down to *only* these and still find them after a
     /// noisy enrichment pass has rolled through the ring buffer.
     pub problems: Vec<String>,
+    /// Skipped files, collapsed to one entry per folder.
+    ///
+    /// Skips are the one problem that arrives in bulk: a show whose files carry
+    /// no `S01E02` skips *every episode*, so a single mis-named series produced
+    /// two dozen near-identical lines and a real library produced hundreds. The
+    /// per-file list was technically complete and practically unreadable — the
+    /// operator had to infer "oh, it's Drawn Together" from twenty-four paths
+    /// that differed only in the episode number.
+    ///
+    /// One row per folder with a count says the same thing in one line, and
+    /// says the thing the operator actually acts on: which SHOW needs renaming.
+    pub skip_groups: Vec<SkipGroup>,
     /// Problems that occurred but aren't listed above, because `problems` hit
     /// [`MAX_PROBLEMS`]. Rendered as a trailing "…and N more" line rather than
     /// serialized, so the operator knows the list is truncated, not complete.
     #[serde(skip)]
     suppressed: usize,
+}
+
+/// One folder's skipped files, collapsed into a single reportable row.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct SkipGroup {
+    /// The folder the files sit under — the show directory, not the release
+    /// subfolder. Grouping any deeper reproduces the per-file list one level
+    /// up: `Season 1/Drawn.Together.S01E02.DVDRip.XviD-MEDiEVAL/` is still one
+    /// row per episode.
+    pub folder: String,
+    /// How many files were skipped there. Never capped — the samples are.
+    pub count: usize,
+    /// Why, in the same words the per-file line used.
+    pub reason: String,
+    /// A few of the filenames, so the shape of the problem is visible without
+    /// opening the server log.
+    pub samples: Vec<String>,
 }
 
 impl ScanReport {
@@ -120,10 +149,15 @@ impl ScanReport {
 /// that a handful of bad files in a big library all get named.
 const MAX_PROBLEMS: usize = 25;
 
-/// Cap on *skipped*-file notes, which are informational rather than errors and
-/// so must never crowd real errors out of [`MAX_PROBLEMS`]. Held in a separate
-/// list during the scan and appended last.
-const MAX_SKIP_PROBLEMS: usize = 10;
+/// Cap on skipped-file *groups* reported. Skips are grouped by folder, so this
+/// is a cap on distinct mis-named shows rather than on files — a library where
+/// more than this many folders are broken has a bigger problem than the report
+/// can usefully enumerate, and the counts still cover everything.
+const MAX_SKIP_GROUPS: usize = 20;
+
+/// Filenames kept per group, to show the shape of the problem without
+/// reprinting the list this grouping exists to collapse.
+const SKIP_SAMPLES: usize = 3;
 
 /// Live counters a running scan updates as it goes. Shared with whoever wants
 /// to display progress (the HTTP status endpoint samples these atomics without
@@ -250,8 +284,9 @@ pub async fn scan_library_with_progress(
 
     // Skips are informational, not errors — kept apart so a library full of
     // unparseable filenames can't push real errors past MAX_PROBLEMS.
-    let mut skip_notes: Vec<String> = Vec::new();
-    let mut skips_over_cap = 0usize;
+    // Skips accumulate per folder rather than per file: one mis-named show is
+    // one problem, however many episodes it has.
+    let mut skips: BTreeMap<String, SkipGroup> = BTreeMap::new();
 
     for path in candidates {
         if let Some(p) = progress {
@@ -318,11 +353,20 @@ pub async fn scan_library_with_progress(
                 }
                 _ => "the filename couldn't be identified for this library kind",
             };
+            // Still logged per file: the log is where completeness belongs,
+            // and the report line points at it.
             tracing::warn!(path = %path_str, "skipped: {why}");
-            if skip_notes.len() < MAX_SKIP_PROBLEMS {
-                skip_notes.push(format!("skipped `{path_str}`: {why}"));
-            } else {
-                skips_over_cap += 1;
+            let folder = skip_group_folder(library, &path);
+            let group = skips.entry(folder.clone()).or_insert_with(|| SkipGroup {
+                folder,
+                reason: why.to_owned(),
+                ..SkipGroup::default()
+            });
+            group.count += 1;
+            if group.samples.len() < SKIP_SAMPLES {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    group.samples.push(name.to_owned());
+                }
             }
             continue;
         };
@@ -390,16 +434,23 @@ pub async fn scan_library_with_progress(
         );
     }
 
-    // Skip notes go last, after every error has had its shot at the cap.
-    for note in std::mem::take(&mut skip_notes) {
-        report.note(note);
-    }
-    if skips_over_cap > 0 {
+    // Worst first: the folder costing the most files is the one to rename.
+    let mut groups: Vec<SkipGroup> = skips.into_values().collect();
+    groups.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.folder.cmp(&b.folder)));
+    if groups.len() > MAX_SKIP_GROUPS {
+        let dropped: usize = groups[MAX_SKIP_GROUPS..].iter().map(|g| g.count).sum();
+        let folders = groups.len() - MAX_SKIP_GROUPS;
+        groups.truncate(MAX_SKIP_GROUPS);
+        // Silent truncation reads as "that was all of them", so say what was
+        // dropped and where the rest lives.
         report.note(format!(
-            "…and {skips_over_cap} more skipped file{} — see the server log for the full list",
-            if skips_over_cap == 1 { "" } else { "s" }
+            "…and {dropped} more skipped file{} across {folders} more folder{} — \
+             see the server log for every one",
+            if dropped == 1 { "" } else { "s" },
+            if folders == 1 { "" } else { "s" }
         ));
     }
+    report.skip_groups = groups;
     report.seal_problems();
 
     tracing::info!(
@@ -541,6 +592,37 @@ async fn find_or_create_season(
             episode_number: None,
         })
         .await
+}
+
+/// The folder a skipped file should be reported under: the directory directly
+/// beneath the library root that contains it — the show, not the season and
+/// not the release folder.
+///
+/// Grouping deeper defeats the point. `Drawn Together/Season 1/` is one row per
+/// season, and `Season 1/Drawn.Together.S01E02.DVDRip.XviD-MEDiEVAL/` is one
+/// row per episode again, which is the list this replaces.
+fn skip_group_folder(library: &Library, path: &Path) -> String {
+    for root in &library.paths {
+        let Ok(rel) = path.strip_prefix(root) else {
+            continue;
+        };
+        // A file sitting loose in the root has no show folder of its own; the
+        // root IS its group, and joining the first component would name the
+        // file rather than a directory.
+        return match rel.components().count() {
+            0 | 1 => root.display().to_string(),
+            _ => rel
+                .components()
+                .next()
+                .map(|c| root.join(c).display().to_string())
+                .unwrap_or_else(|| root.display().to_string()),
+        };
+    }
+    // Not under any configured root, which the walk should make impossible.
+    // Fall back to the parent rather than losing the file from the report.
+    path.parent()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 #[cfg(test)]
@@ -1059,12 +1141,81 @@ mod tests {
         // Two probe failures (the fake episodes); the skipped stray never
         // reaches probe, so it is not an error.
         assert_eq!(r.errors, 2);
+        assert_eq!(r.skip_groups.len(), 1, "groups: {:?}", r.skip_groups);
+        let g = &r.skip_groups[0];
+        assert_eq!(g.count, 1);
         assert!(
-            r.problems.iter().any(|p| p.contains("skipped")
-                && p.contains("trailer.mkv")
-                && p.contains("S01E02")),
-            "expected a skip note naming the file and the expected marker, got: {:?}",
-            r.problems
+            g.folder.ends_with("Severance (2022)"),
+            "a skip is reported under its SHOW folder, not its season or \
+             release folder; got {:?}",
+            g.folder
+        );
+        assert!(
+            g.reason.contains("S01E02"),
+            "the reason must still say what was expected, got {:?}",
+            g.reason
+        );
+        assert_eq!(
+            g.samples,
+            vec!["trailer.mkv".to_owned()],
+            "a group names some of its files, or there is nothing to act on"
+        );
+    }
+
+    /// THE BUG THIS GUARDS: a show whose files carry no `S01E02` skips EVERY
+    /// episode, and the report printed one line per file. Twenty-four lines
+    /// that differ only in the episode number are not twenty-four problems —
+    /// they are one mis-named show — and a real library produced hundreds,
+    /// which the ten-line cap then truncated into uselessness.
+    #[tokio::test]
+    async fn skips_are_grouped_by_show_not_listed_per_file() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        let dir = tempfile::tempdir().expect("tmp");
+        // A show with no S/E marker anywhere reachable: not in the filename,
+        // and not in the parent either — the parent is a "Season NN" folder,
+        // which names a season and so refuses to lend an episode number.
+        for ep in 1..=6 {
+            write_fake_video(
+                dir.path(),
+                &format!("Drawn Together/Season 1/drawn.together.10{ep}-med.avi"),
+            )
+            .await;
+        }
+        // A second broken show, so grouping is doing more than one bucket.
+        for ep in 1..=2 {
+            write_fake_video(dir.path(), &format!("Other Show/Season 1/clip-{ep}.mkv")).await;
+        }
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "TV".into(),
+                kind: LibraryKind::Shows,
+                paths: vec![dir.path().to_path_buf()],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+
+        let r = scan_library(&store, &lib).await.expect("scan");
+
+        assert_eq!(r.skipped, 8, "every file still counts");
+        assert_eq!(
+            r.skip_groups.len(),
+            2,
+            "eight skipped files across two shows is TWO rows, got: {:?}",
+            r.skip_groups
+        );
+        // Worst first: the folder costing the most files is the one to rename.
+        assert_eq!(r.skip_groups[0].count, 6);
+        assert!(r.skip_groups[0].folder.ends_with("Drawn Together"));
+        assert_eq!(r.skip_groups[1].count, 2);
+        assert!(r.skip_groups[1].folder.ends_with("Other Show"));
+        // Samples are a taste, not the list this replaces.
+        assert_eq!(r.skip_groups[0].samples.len(), SKIP_SAMPLES);
+        // And the counts still add up to the partition.
+        assert_eq!(
+            r.added + r.updated + r.unchanged + r.skipped + r.unreadable,
+            8,
+            "the buckets must still partition every candidate file"
         );
     }
 
