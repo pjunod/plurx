@@ -105,6 +105,17 @@ pub struct ScanReport {
     suppressed: usize,
 }
 
+/// One file a scan placed: what it became, and where it is.
+///
+/// Returned by the targeted scan so the caller can act on the result instead
+/// of polling to find out what happened.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PlacedFile {
+    pub item_id: i64,
+    pub file_id: i64,
+    pub path: String,
+}
+
 /// One folder's skipped files, collapsed into a single reportable row.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct SkipGroup {
@@ -310,13 +321,7 @@ pub async fn scan_library_with_progress(
         for entry in WalkDir::new(root).follow_links(true) {
             match entry {
                 Ok(entry) => {
-                    // Photos count only in home libraries: a poster JPEG next
-                    // to a movie must stay as invisible as it is today.
-                    let wanted = is_video(entry.path())
-                        || (library.kind == LibraryKind::Home
-                            && home::is_photo(entry.path())
-                            && !home::is_artwork_sidecar(entry.path()));
-                    if entry.file_type().is_file() && wanted {
+                    if entry.file_type().is_file() && wanted_file(library, entry.path()) {
                         candidates.push(entry.into_path());
                     }
                 }
@@ -358,6 +363,276 @@ pub async fn scan_library_with_progress(
         ));
     }
 
+    let mut placed: Vec<PlacedFile> = Vec::new();
+    let skips = record_candidates(
+        store,
+        library,
+        candidates,
+        progress,
+        &mut report,
+        &mut seen,
+        Some(&mut placed),
+    )
+    .await?;
+
+    // Reconcile: anything in the DB for this library but not seen on disk is
+    // gone. NEVER reconcile after a partial walk — if a root was missing or a
+    // directory unreadable (NAS unmounted, permissions), the files under it
+    // are invisible, not deleted, and removing them here would wipe the
+    // library's records over a transient mount problem.
+    if walk_errors == 0 {
+        let known = store.library_file_paths(library.id).await?;
+        let gone: Vec<i64> = known
+            .into_iter()
+            .filter(|(_, p)| !seen.contains(&p.to_string_lossy().into_owned()))
+            .map(|(id, _)| id)
+            .collect();
+        if !gone.is_empty() {
+            report.removed_files = store.delete_files(&gone).await? as usize;
+        }
+        report.pruned_items = store.prune_empty_items(library.id).await? as usize;
+    } else {
+        report.note(
+            "vanished-file cleanup skipped: some library paths were missing or unreadable, \
+             so absent files were kept rather than removed"
+                .to_owned(),
+        );
+    }
+
+    // Worst first: the folder costing the most files is the one to rename.
+    let mut groups: Vec<SkipGroup> = skips.into_values().collect();
+    groups.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.folder.cmp(&b.folder)));
+    if groups.len() > MAX_SKIP_GROUPS {
+        let dropped: usize = groups[MAX_SKIP_GROUPS..].iter().map(|g| g.count).sum();
+        let folders = groups.len() - MAX_SKIP_GROUPS;
+        groups.truncate(MAX_SKIP_GROUPS);
+        // Silent truncation reads as "that was all of them", so say what was
+        // dropped and where the rest lives.
+        report.note(format!(
+            "…and {dropped} more skipped file{} across {folders} more folder{} — \
+             see the server log for every one",
+            if dropped == 1 { "" } else { "s" },
+            if folders == 1 { "" } else { "s" }
+        ));
+    }
+    report.skip_groups = groups;
+    report.seal_problems();
+
+    tracing::info!(
+        library = %library.name,
+        added = report.added,
+        unchanged = report.unchanged,
+        removed = report.removed_files,
+        pruned = report.pruned_items,
+        seeded = report.seeded,
+        skipped = report.skipped,
+        errors = report.errors,
+        "scan complete"
+    );
+    for problem in &report.problems {
+        tracing::warn!(library = %library.name, "scan problem: {problem}");
+    }
+    Ok(report)
+}
+
+/// What a targeted scan produced.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TargetedScan {
+    pub report: ScanReport,
+    pub items: Vec<PlacedFile>,
+}
+
+/// Why a path could not be scanned. Both variants name the path and, for the
+/// common mistake, the roots it should have been under — a path-mapping slip
+/// between two applications is the single most likely cause, and an error
+/// that just says "invalid path" makes the operator go hunting.
+#[derive(Debug)]
+pub enum TargetError {
+    /// The path is not under any of this library's roots (or escapes them
+    /// via a symlink).
+    OutsideRoots {
+        path: String,
+        roots: Vec<String>,
+    },
+    Store(StoreError),
+}
+
+impl std::fmt::Display for TargetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TargetError::OutsideRoots { path, roots } => write!(
+                f,
+                "`{path}` is not under any root of this library ({})",
+                roots.join(", ")
+            ),
+            TargetError::Store(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl From<StoreError> for TargetError {
+    fn from(e: StoreError) -> Self {
+        TargetError::Store(e)
+    }
+}
+
+/// Scan exactly one path — a directory subtree or a single file — and record
+/// what is there.
+///
+/// This is the fast path for "something just landed at X". A full scan walks
+/// every root, which on a large NAS is minutes of stat calls to discover one
+/// new folder; this walks only what the caller names.
+///
+/// **It never reconciles, and that is not an oversight.** The full scan
+/// deletes rows for files it did not see, which is only safe because it saw
+/// everything. A targeted scan sees one subtree by construction, so pruning
+/// against it would delete the entire rest of the library — the same reasoning
+/// as the existing `walk_errors > 0` guard, which already refuses to reconcile
+/// after a partial walk. A targeted scan upserts what it finds and touches
+/// nothing else, ever.
+pub async fn scan_path(
+    store: &dyn Store,
+    library: &Library,
+    target: &Path,
+) -> Result<TargetedScan, TargetError> {
+    let roots: Vec<String> = library
+        .paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
+
+    // Canonicalize before comparing. Without it `/media/movies/../etc` and a
+    // symlink pointing outside the library both pass a string prefix test,
+    // which would turn "scan this path" into "read any directory on the
+    // host" for anyone holding a scan key.
+    let canonical = match target.canonicalize() {
+        Ok(p) => p,
+        Err(_) => {
+            return Err(TargetError::OutsideRoots {
+                path: target.display().to_string(),
+                roots,
+            })
+        }
+    };
+    let under_root = library.paths.iter().any(|root| {
+        // Compare canonicalized roots too: a library configured through a
+        // symlinked mount would otherwise never match its own files.
+        let root = root.canonicalize().unwrap_or_else(|_| root.clone());
+        // Component-wise, so `/data` does not match `/database`.
+        canonical == root || canonical.starts_with(&root)
+    });
+    if !under_root {
+        return Err(TargetError::OutsideRoots {
+            path: canonical.display().to_string(),
+            roots,
+        });
+    }
+
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    let mut report = ScanReport::default();
+    if canonical.is_file() {
+        if wanted_file(library, &canonical) {
+            candidates.push(canonical.clone());
+        }
+    } else {
+        for entry in WalkDir::new(&canonical).follow_links(true) {
+            match entry {
+                Ok(entry) => {
+                    if entry.file_type().is_file() && wanted_file(library, entry.path()) {
+                        candidates.push(entry.into_path());
+                    }
+                }
+                Err(e) => {
+                    // A walk error is reported but never fatal, and — unlike
+                    // the full scan — it changes nothing about reconcile,
+                    // because there is no reconcile to change.
+                    report.errors += 1;
+                    let at = e
+                        .path()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| canonical.display().to_string());
+                    tracing::error!(target: "plurxd::integrate", path = %at, error = %e,
+                        "cannot read directory entry during targeted scan");
+                    report.note(format!("cannot read `{at}`: {e}"));
+                }
+            }
+        }
+    }
+    candidates.sort();
+
+    if candidates.is_empty() {
+        report.note(format!(
+            "no media files found under `{}` — the path exists but holds nothing \
+             recognized ({})",
+            canonical.display(),
+            VIDEO_EXTS.join(", ")
+        ));
+    }
+
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut items: Vec<PlacedFile> = Vec::new();
+    let skips = record_candidates(
+        store,
+        library,
+        candidates,
+        None,
+        &mut report,
+        &mut seen,
+        Some(&mut items),
+    )
+    .await?;
+    report.skip_groups = skips.into_values().collect();
+    report.seal_problems();
+
+    tracing::info!(
+        target: "plurxd::integrate",
+        library = library.id,
+        path = %canonical.display(),
+        added = report.added,
+        updated = report.updated,
+        unchanged = report.unchanged,
+        skipped = report.skipped,
+        errors = report.errors,
+        items = items.len(),
+        "targeted scan complete"
+    );
+    Ok(TargetedScan { report, items })
+}
+
+/// Whether this file is one the library cares about. Same rule the full scan
+/// applies, in one place so the two cannot drift: photos count only in home
+/// libraries, and a poster JPEG beside a movie stays as invisible as it is
+/// today.
+fn wanted_file(library: &Library, path: &Path) -> bool {
+    is_video(path)
+        || (library.kind == LibraryKind::Home
+            && home::is_photo(path)
+            && !home::is_artwork_sidecar(path))
+}
+
+/// Records one batch of candidate files into the library.
+///
+/// Split out of [`scan_library_with_progress`] so the targeted scan can run
+/// the *same* per-file logic rather than a second copy of it. Everything
+/// delicate lives here — the size+mtime unchanged short-circuit, the
+/// probe-failure repair, placement, the home-video NFO seeding — and a
+/// divergence between the full scan and the targeted one would show up as
+/// "the same file behaves differently depending on who asked", which is the
+/// worst kind of bug to chase.
+///
+/// Fills `seen` with every path it looked at, which the caller needs for
+/// reconcile. Deliberately does NOT reconcile: only the caller knows whether
+/// it saw the whole library.
+async fn record_candidates(
+    store: &dyn Store,
+    library: &Library,
+    candidates: Vec<std::path::PathBuf>,
+    progress: Option<&ScanProgress>,
+    report: &mut ScanReport,
+    seen: &mut HashSet<String>,
+    placed_out: Option<&mut Vec<PlacedFile>>,
+) -> Result<BTreeMap<String, SkipGroup>, StoreError> {
+    let mut placed_sink = placed_out;
     // Skips are informational, not errors — kept apart so a library full of
     // unparseable filenames can't push real errors past MAX_PROBLEMS.
     // Skips accumulate per folder rather than per file: one mis-named show is
@@ -488,9 +763,20 @@ pub async fn scan_library_with_progress(
             }
         };
 
-        store
+        let file_id = store
             .upsert_file(item_id, &path_str, size, mtime, &probe)
             .await?;
+        if let Some(sink) = placed_sink.as_deref_mut() {
+            // The caller of a targeted scan is owed an answer, not a shrug:
+            // "which item did my file become" is the whole question monarr
+            // asks, and reconstructing it from a path afterwards would race
+            // with the next scan.
+            sink.push(PlacedFile {
+                item_id,
+                file_id,
+                path: path_str.clone(),
+            });
+        }
         if library.kind == LibraryKind::Home {
             let mut nfo_notes = Vec::new();
             if home::after_record(store, placed, &path, &probe, mtime, &mut nfo_notes).await? {
@@ -510,64 +796,7 @@ pub async fn scan_library_with_progress(
         }
     }
 
-    // Reconcile: anything in the DB for this library but not seen on disk is
-    // gone. NEVER reconcile after a partial walk — if a root was missing or a
-    // directory unreadable (NAS unmounted, permissions), the files under it
-    // are invisible, not deleted, and removing them here would wipe the
-    // library's records over a transient mount problem.
-    if walk_errors == 0 {
-        let known = store.library_file_paths(library.id).await?;
-        let gone: Vec<i64> = known
-            .into_iter()
-            .filter(|(_, p)| !seen.contains(&p.to_string_lossy().into_owned()))
-            .map(|(id, _)| id)
-            .collect();
-        if !gone.is_empty() {
-            report.removed_files = store.delete_files(&gone).await? as usize;
-        }
-        report.pruned_items = store.prune_empty_items(library.id).await? as usize;
-    } else {
-        report.note(
-            "vanished-file cleanup skipped: some library paths were missing or unreadable, \
-             so absent files were kept rather than removed"
-                .to_owned(),
-        );
-    }
-
-    // Worst first: the folder costing the most files is the one to rename.
-    let mut groups: Vec<SkipGroup> = skips.into_values().collect();
-    groups.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.folder.cmp(&b.folder)));
-    if groups.len() > MAX_SKIP_GROUPS {
-        let dropped: usize = groups[MAX_SKIP_GROUPS..].iter().map(|g| g.count).sum();
-        let folders = groups.len() - MAX_SKIP_GROUPS;
-        groups.truncate(MAX_SKIP_GROUPS);
-        // Silent truncation reads as "that was all of them", so say what was
-        // dropped and where the rest lives.
-        report.note(format!(
-            "…and {dropped} more skipped file{} across {folders} more folder{} — \
-             see the server log for every one",
-            if dropped == 1 { "" } else { "s" },
-            if folders == 1 { "" } else { "s" }
-        ));
-    }
-    report.skip_groups = groups;
-    report.seal_problems();
-
-    tracing::info!(
-        library = %library.name,
-        added = report.added,
-        unchanged = report.unchanged,
-        removed = report.removed_files,
-        pruned = report.pruned_items,
-        seeded = report.seeded,
-        skipped = report.skipped,
-        errors = report.errors,
-        "scan complete"
-    );
-    for problem in &report.problems {
-        tracing::warn!(library = %library.name, "scan problem: {problem}");
-    }
-    Ok(report)
+    Ok(skips)
 }
 
 /// The outcome of trying to identify a file. A skip carries the sentence the
@@ -775,6 +1004,194 @@ mod tests {
         // still records the file and builds the hierarchy.
         std::fs::write(&path, b"not really video").expect("write");
         path
+    }
+
+    // ---- targeted scan (integration plan P2) ---------------------------
+
+    async fn movie_library(store: &SqliteStore, dir: &Path) -> Library {
+        store
+            .create_library(&NewLibrary {
+                name: "Movies".into(),
+                kind: LibraryKind::Movies,
+                paths: vec![dir.to_path_buf()],
+                anime: false,
+            })
+            .await
+            .expect("lib")
+    }
+
+    /// THE property. A targeted scan sees one subtree by construction, so if
+    /// it ever reconciled it would delete the rest of the library — every
+    /// item, on the first import after a folder landed. Asserted by row
+    /// count, because that is what would go to zero.
+    #[tokio::test]
+    async fn a_targeted_scan_never_prunes_what_it_did_not_look_at() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        let dir = tempfile::tempdir().expect("tmp");
+        write_fake_video(dir.path(), "Heat (1995)/Heat (1995).mkv").await;
+        write_fake_video(dir.path(), "The Matrix (1999)/The Matrix (1999).mkv").await;
+        let lib = movie_library(&store, dir.path()).await;
+        scan_library(&store, &lib).await.expect("full scan");
+
+        let before = store
+            .list_top_items(lib.id, ItemSort::Title, 0, 50)
+            .await
+            .expect("list")
+            .items
+            .len();
+        assert_eq!(before, 2);
+
+        // A new folder arrives and only IT is scanned.
+        write_fake_video(dir.path(), "Alien (1979)/Alien (1979).mkv").await;
+        let out = scan_path(&store, &lib, &dir.path().join("Alien (1979)"))
+            .await
+            .expect("targeted");
+        assert_eq!(out.report.added, 1, "the new file was recorded");
+        assert_eq!(
+            out.report.removed_files, 0,
+            "a targeted scan must never remove a file record"
+        );
+        assert_eq!(out.report.pruned_items, 0, "…or an item");
+
+        let after = store
+            .list_top_items(lib.id, ItemSort::Title, 0, 50)
+            .await
+            .expect("list")
+            .items
+            .len();
+        assert_eq!(
+            after, 3,
+            "the two untouched movies must still be there — pruning against a \
+             partial view would empty the library"
+        );
+    }
+
+    /// The caller is owed an answer, not a shrug: "which item did my file
+    /// become" is the question the whole endpoint exists to answer.
+    #[tokio::test]
+    async fn a_targeted_scan_reports_what_it_placed() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        let dir = tempfile::tempdir().expect("tmp");
+        let file = write_fake_video(dir.path(), "Heat (1995)/Heat (1995).mkv").await;
+        let lib = movie_library(&store, dir.path()).await;
+
+        let out = scan_path(&store, &lib, &dir.path().join("Heat (1995)"))
+            .await
+            .expect("targeted");
+        assert_eq!(out.items.len(), 1, "one file, one placement");
+        assert_eq!(out.items[0].path, file.to_string_lossy());
+        assert!(out.items[0].item_id > 0 && out.items[0].file_id > 0);
+        let item = store
+            .get_item(out.items[0].item_id)
+            .await
+            .expect("get")
+            .expect("some");
+        assert_eq!(item.title, "Heat");
+    }
+
+    /// A single file is a legitimate target — monarr imports one episode at a
+    /// time as often as it imports a folder.
+    #[tokio::test]
+    async fn a_single_file_is_a_valid_target() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        let dir = tempfile::tempdir().expect("tmp");
+        let file = write_fake_video(dir.path(), "Heat (1995)/Heat (1995).mkv").await;
+        let lib = movie_library(&store, dir.path()).await;
+
+        let out = scan_path(&store, &lib, &file).await.expect("targeted");
+        assert_eq!(out.report.added, 1);
+        assert_eq!(out.items.len(), 1);
+    }
+
+    /// Without canonicalization, `roots[0]/../../etc` passes a string prefix
+    /// test — which would make "scan this path" mean "read any directory on
+    /// the host" for anyone holding a scan key.
+    #[tokio::test]
+    async fn a_path_outside_the_roots_is_refused_and_says_which_roots() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        let dir = tempfile::tempdir().expect("tmp");
+        let outside = tempfile::tempdir().expect("tmp2");
+        write_fake_video(outside.path(), "Elsewhere (2020)/Elsewhere (2020).mkv").await;
+        let lib = movie_library(&store, dir.path()).await;
+
+        for bad in [
+            outside.path().to_path_buf(),
+            dir.path().join("..").join(".."),
+            PathBuf::from("/etc"),
+        ] {
+            match scan_path(&store, &lib, &bad).await {
+                Err(TargetError::OutsideRoots { roots, .. }) => {
+                    assert!(
+                        roots.iter().any(|r| r == &dir.path().display().to_string()),
+                        "the error must name the roots — a path-mapping slip between two \
+                         applications is the likeliest cause and should diagnose itself"
+                    );
+                }
+                other => panic!("{} was not refused: {other:?}", bad.display()),
+            }
+        }
+    }
+
+    /// A symlink that escapes the root is the same attack wearing a hat.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlink_escaping_the_root_is_refused() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        let dir = tempfile::tempdir().expect("tmp");
+        let outside = tempfile::tempdir().expect("tmp2");
+        write_fake_video(outside.path(), "Secret (2020)/Secret (2020).mkv").await;
+        let lib = movie_library(&store, dir.path()).await;
+
+        let link = dir.path().join("escape");
+        std::os::unix::fs::symlink(outside.path(), &link).expect("symlink");
+        assert!(
+            matches!(
+                scan_path(&store, &lib, &link).await,
+                Err(TargetError::OutsideRoots { .. })
+            ),
+            "a symlink pointing out of the library must not be scannable"
+        );
+    }
+
+    /// A path that does not exist is refused rather than silently scanning
+    /// nothing — monarr sending a path plurx cannot see (the classic
+    /// container path-mapping mistake) must hear about it.
+    #[tokio::test]
+    async fn a_missing_path_is_refused() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        let dir = tempfile::tempdir().expect("tmp");
+        let lib = movie_library(&store, dir.path()).await;
+        assert!(matches!(
+            scan_path(&store, &lib, &dir.path().join("nope")).await,
+            Err(TargetError::OutsideRoots { .. })
+        ));
+    }
+
+    /// Re-scanning the same path is cheap and idempotent: unchanged files
+    /// short-circuit before probe, and nothing is added twice.
+    #[tokio::test]
+    async fn re_scanning_the_same_path_changes_nothing() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        let dir = tempfile::tempdir().expect("tmp");
+        write_fake_video(dir.path(), "Heat (1995)/Heat (1995).mkv").await;
+        let lib = movie_library(&store, dir.path()).await;
+        let target = dir.path().join("Heat (1995)");
+
+        let first = scan_path(&store, &lib, &target).await.expect("first");
+        assert_eq!(first.report.added, 1);
+        let second = scan_path(&store, &lib, &target).await.expect("second");
+        assert_eq!(second.report.added, 0);
+        assert_eq!(second.report.unchanged, 1);
+        assert_eq!(
+            store
+                .list_top_items(lib.id, ItemSort::Title, 0, 50)
+                .await
+                .expect("list")
+                .items
+                .len(),
+            1,
+            "a second scan must not duplicate the item"
+        );
     }
 
     #[tokio::test]
