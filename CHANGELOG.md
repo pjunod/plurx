@@ -68,6 +68,44 @@ bump may break compatibility and a **patch** bump never does.
 
 ### Fixed
 
+- A scan that reports errors now says which files and why. The scan report has
+  always carried two things — a count and a list of human-readable problems —
+  but only the two library-wide failures (a missing root, an unreadable
+  directory) ever filled the list. The two *per-file* failures did not, so a
+  scan that hit a bad file showed a red **2 errors** in Settings with nothing
+  underneath it and no way to find out which two of three hundred files were
+  meant. Worse, one of the two logged nothing either, so the server log couldn't
+  answer the question the UI had raised. Both now name the path and the cause:
+  a file the walk listed but couldn't stat says whether it's permissions, a
+  broken symlink or a file moved out from under the scan, and notes that the
+  existing record was kept; a file ffprobe refuses says it was added without
+  codec or duration, which is what makes its later playback decisions guesses.
+  The rule is now an invariant on the report — no error is counted without a
+  line describing it *and* a log line at ERROR level — and it is what the new
+  tests check. ERROR rather than WARN so that setting the log view to **Errors**
+  narrows it to exactly the files a scan complained about, which also means they
+  are still findable after a few hundred lines of metadata fetching have rolled
+  through the log's ring buffer.
+- The scan counts no longer read as more events than there were files. A file
+  ffprobe refused was counted as both *added* and an *error*, so two bad new
+  files produced "2 added … 2 errors" — four numbers for two files, with nothing
+  saying they were the same two. The counts are now explicitly two different
+  kinds of thing. What happened to a file's record — added, updated, unchanged,
+  skipped, or the new *unreadable* — is a partition: every file the walk found
+  lands in exactly one, and they sum to the total, which a test now asserts.
+  Whether it came through cleanly is a flag on top: the new *degraded* count is
+  a subset of added and updated, and is displayed attached to them — "2 added
+  (2 incomplete)" — rather than as an unrelated number further down the line.
+  Moving those files out of *added* was the other option and would have been
+  worse: the scan would report nothing added while two new items sat in the
+  library, so the overlap is kept and simply stated.
+- Skipped files say which ones. "1 skipped" meant a file the library kind
+  couldn't identify, most often an episode with no `S01E02` in the name sitting
+  in a Shows library, and the only way to find it was to guess. Skips are listed
+  by name, with what was expected, in quieter ink than the errors they sit
+  beside — they are usually a stray trailer, not a problem. Both lists are
+  capped so a pathological library can't produce a page-long status line, with
+  a trailing count of what was left out; errors claim the cap before skips do.
 - Closing the player while it is fullscreen now hands the screen back. Fullscreen
   belongs to the browser rather than to the page, so hiding the player's own UI
   did not end it: `#player` stayed the fullscreen element and the tab kept the

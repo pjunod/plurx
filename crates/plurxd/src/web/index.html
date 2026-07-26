@@ -393,6 +393,9 @@
   .libedit{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
   .libedit input,.libedit select{width:auto}
   .problem{color:var(--bad);font-size:12px;margin-top:3px;font-weight:400}
+  /* Skips and truncation notices are informational, not failures — same list,
+     quieter ink, so the red lines stay the ones that need attention. */
+  .problem.info{color:var(--muted)}
   .hint{color:var(--muted);font-size:12px;margin-top:6px}
   .activity{display:none;align-items:center;gap:8px;font-size:12px;color:var(--muted);
     background:var(--panel2);border:1px solid var(--line);padding:5px 12px;border-radius:999px;cursor:pointer;white-space:nowrap}
@@ -2759,12 +2762,25 @@ function statusText(st){
   if(st.error) return `<span style="color:var(--bad)">error: ${esc(st.error)}</span>`;
   if(st.last_scan){
     const r=st.last_scan;
-    let s=`${r.added} added, ${r.updated} updated, ${r.unchanged} unchanged`;
+    // added/updated/unchanged/skipped/unreadable partition the files found;
+    // `degraded` is a subset of added+updated, so it is rendered *attached* to
+    // them rather than as a sibling number — "2 added (2 incomplete)" says what
+    // "2 added … 2 errors" left the reader to guess.
+    let s=`${r.added} added`;
+    if(r.degraded) s+=` <span style="color:var(--bad)">(${r.degraded} incomplete)</span>`;
+    s+=`, ${r.updated} updated, ${r.unchanged} unchanged`;
     if(r.removed_files) s+=`, ${r.removed_files} removed`;
     if(r.skipped) s+=`, ${r.skipped} skipped`;
+    if(r.unreadable) s+=`, <span style="color:var(--bad)">${r.unreadable} unreadable</span>`;
     if(r.errors) s+=`, <span style="color:var(--bad)">${r.errors} error${r.errors>1?'s':''}</span>`;
     if(st.finished_at) s+=` <span style="opacity:.7">· ${fmtAgo(st.finished_at)}</span>`;
-    s+=(r.problems||[]).map(p=>`<div class="problem">⚠ ${esc(p)}</div>`).join("");
+    // Every error carries a problem line (scan/mod.rs keeps that invariant),
+    // so this list is where a red count becomes actionable. Skips and the
+    // "…and N more" truncation notice are informational, and read as such.
+    s+=(r.problems||[]).map(p=>{
+      const info=/^(skipped |…and )/.test(p);
+      return `<div class="problem${info?" info":""}">${info?"·":"⚠"} ${esc(p)}</div>`;
+    }).join("");
     return s;
   }
   return "idle";

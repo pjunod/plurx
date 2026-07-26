@@ -28,6 +28,25 @@ const VIDEO_EXTS: &[&str] = &[
     "ogv", "3gp",
 ];
 
+/// What a scan did, in two orthogonal dimensions — mixing them is what made the
+/// old status line read as four events when only two files were involved.
+///
+/// **What happened to each file's record** — `added`, `updated`, `unchanged`,
+/// `skipped`, `unreadable` — is a true partition: every candidate file lands in
+/// exactly one, and they sum to the number of files the walk found. Assert on
+/// that sum, not on `errors`.
+///
+/// **Whether it came through cleanly** — `degraded`, and the library-wide walk
+/// failures — is a *flag*, not a bucket. A file whose probe failed is both
+/// `added` and `degraded`: it really is in the library (it shows up, it plays)
+/// and it really is missing its codec and duration. Counting it as an error
+/// *instead of* added would make a scan claim nothing was added while two new
+/// items sat there in the UI, which is a worse lie than the overlap.
+///
+/// `errors` stays the headline count the UI reddens: `unreadable + degraded +
+/// walk failures`. It deliberately overlaps the record buckets, and the fields
+/// below let the UI show *which* — "2 added (2 incomplete)" rather than "2
+/// added … 2 errors" with no stated relationship between the two numbers.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct ScanReport {
     pub added: usize,
@@ -36,19 +55,75 @@ pub struct ScanReport {
     pub removed_files: usize,
     pub pruned_items: usize,
     pub skipped: usize,
+    /// Files the walk listed but that couldn't be stat'd, so nothing was
+    /// recorded for them at all. Its own bucket: these are *not* added,
+    /// updated, unchanged or skipped. Counted in `errors` too.
+    pub unreadable: usize,
+    /// Files recorded *without* media detail because ffprobe refused them. A
+    /// subset of `added` + `updated`, never a bucket of its own. Counted in
+    /// `errors` too — an item that can't be described can't have its playback
+    /// decided, only guessed.
+    pub degraded: usize,
     pub errors: usize,
     /// Home libraries only: items whose metadata was seeded from an `.nfo`
     /// sidecar on this run. Seeding happens at most once per item, ever.
     pub seeded: usize,
     /// Human-readable problems worth showing the operator: missing roots,
-    /// unreadable directories, a scan that found no video files at all. A
-    /// non-empty list means the scan's counts don't tell the whole story.
+    /// unreadable directories, files that couldn't be read or probed, a scan
+    /// that found no video files at all. A non-empty list means the scan's
+    /// counts don't tell the whole story.
+    ///
+    /// INVARIANT: every increment of `errors` also records a line here (or
+    /// bumps `suppressed`, once the list is full) *and* logs at ERROR level. A
+    /// red error count with nothing to click on is a dead end for whoever has
+    /// to fix the library — the count must always be accompanied by what went
+    /// wrong and where. ERROR rather than WARN specifically so the operator can
+    /// filter the log view down to *only* these and still find them after a
+    /// noisy enrichment pass has rolled through the ring buffer.
     pub problems: Vec<String>,
+    /// Problems that occurred but aren't listed above, because `problems` hit
+    /// [`MAX_PROBLEMS`]. Rendered as a trailing "…and N more" line rather than
+    /// serialized, so the operator knows the list is truncated, not complete.
+    #[serde(skip)]
+    suppressed: usize,
 }
 
-/// Cap on individual walk-error messages recorded per scan (the counts still
-/// include everything; this just keeps the report readable).
-const MAX_WALK_PROBLEMS: usize = 10;
+impl ScanReport {
+    /// Record a problem, capped. Past the cap only the count grows; the
+    /// trailing summary line is added by [`Self::seal_problems`]. Use this for
+    /// anything that also bumps `errors` — never push to `problems` directly
+    /// from the scan loop, or the cap stops holding.
+    fn note(&mut self, problem: String) {
+        if self.problems.len() < MAX_PROBLEMS {
+            self.problems.push(problem);
+        } else {
+            self.suppressed += 1;
+        }
+    }
+
+    /// Append the "…and N more" line, if the cap swallowed anything. Called
+    /// once, at the end of a scan.
+    fn seal_problems(&mut self) {
+        if self.suppressed > 0 {
+            let n = self.suppressed;
+            let s = if n == 1 { "" } else { "s" };
+            self.problems.push(format!(
+                "…and {n} more problem{s} not listed — see the server log \
+                 (Settings → System) for every one"
+            ));
+        }
+    }
+}
+
+/// Cap on individual problem messages recorded per scan (the counts still
+/// include everything; this just keeps the report readable). Generous enough
+/// that a handful of bad files in a big library all get named.
+const MAX_PROBLEMS: usize = 25;
+
+/// Cap on *skipped*-file notes, which are informational rather than errors and
+/// so must never crowd real errors out of [`MAX_PROBLEMS`]. Held in a separate
+/// list during the scan and appended last.
+const MAX_SKIP_PROBLEMS: usize = 10;
 
 /// Live counters a running scan updates as it goes. Shared with whoever wants
 /// to display progress (the HTTP status endpoint samples these atomics without
@@ -71,9 +146,11 @@ fn is_video(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// File size and mtime (unix seconds), or `None` if unreadable.
-fn file_stat(path: &Path) -> Option<(i64, i64)> {
-    let meta = std::fs::metadata(path).ok()?;
+/// File size and mtime (unix seconds). The `io::Error` is kept rather than
+/// flattened to `None` so a stat failure can tell the operator *why* (denied,
+/// dangling symlink, vanished mid-scan) instead of just incrementing a counter.
+fn file_stat(path: &Path) -> std::io::Result<(i64, i64)> {
+    let meta = std::fs::metadata(path)?;
     let size = meta.len() as i64;
     let mtime = meta
         .modified()
@@ -81,7 +158,7 @@ fn file_stat(path: &Path) -> Option<(i64, i64)> {
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    Some((size, mtime))
+    Ok((size, mtime))
 }
 
 /// Scan one library end to end. `store` is the full store; only media methods
@@ -111,7 +188,8 @@ pub async fn scan_library_with_progress(
         if !root.is_dir() {
             report.errors += 1;
             walk_errors += 1;
-            report.problems.push(format!(
+            tracing::error!(path = %root.display(), "library path is not a directory");
+            report.note(format!(
                 "library path `{}` does not exist on the server — if plurxd runs in a \
                  container, use the path as mounted inside the container (e.g. `/media/…`), \
                  and check the mount is present",
@@ -135,13 +213,12 @@ pub async fn scan_library_with_progress(
                 Err(e) => {
                     report.errors += 1;
                     walk_errors += 1;
-                    if report.problems.len() < MAX_WALK_PROBLEMS {
-                        let at = e
-                            .path()
-                            .map(|p| p.display().to_string())
-                            .unwrap_or_else(|| root.display().to_string());
-                        report.problems.push(format!("cannot read `{at}`: {e}"));
-                    }
+                    let at = e
+                        .path()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| root.display().to_string());
+                    tracing::error!(path = %at, error = %e, "cannot read directory entry");
+                    report.note(format!("cannot read `{at}`: {e}"));
                 }
             }
         }
@@ -159,7 +236,7 @@ pub async fn scan_library_with_progress(
             ),
             _ => ("video files", VIDEO_EXTS.join(", ")),
         };
-        report.problems.push(format!(
+        report.note(format!(
             "no {what} found under {} — the path exists but contains no recognized \
              media files ({exts})",
             library
@@ -171,6 +248,11 @@ pub async fn scan_library_with_progress(
         ));
     }
 
+    // Skips are informational, not errors — kept apart so a library full of
+    // unparseable filenames can't push real errors past MAX_PROBLEMS.
+    let mut skip_notes: Vec<String> = Vec::new();
+    let mut skips_over_cap = 0usize;
+
     for path in candidates {
         if let Some(p) = progress {
             p.processed.fetch_add(1, Ordering::Relaxed);
@@ -178,9 +260,23 @@ pub async fn scan_library_with_progress(
         let path_str = path.to_string_lossy().into_owned();
         seen.insert(path_str.clone());
 
-        let Some((size, mtime)) = file_stat(&path) else {
-            report.errors += 1;
-            continue;
+        let (size, mtime) = match file_stat(&path) {
+            Ok(stat) => stat,
+            Err(e) => {
+                // The directory walk listed this file, but stat'ing it failed:
+                // permissions, a dangling symlink, or the file was moved or
+                // deleted between the walk and now. Whatever the cause, it is
+                // NOT "this file is gone" — it stays in `seen`, so reconcile
+                // leaves its DB record alone.
+                report.errors += 1;
+                report.unreadable += 1;
+                tracing::error!(path = %path_str, error = %e, "cannot stat file; skipping");
+                report.note(format!(
+                    "cannot read `{path_str}`: {e} — check permissions, or whether it is a \
+                     broken symlink or was moved mid-scan; its existing record was kept"
+                ));
+                continue;
+            }
         };
 
         // Incremental: unchanged file → skip probe entirely.
@@ -193,11 +289,14 @@ pub async fn scan_library_with_progress(
                 // one stat per unseeded home video, and no probe.
                 if library.kind == LibraryKind::Home {
                     if let Some(item) = store.get_item(ex.item_id).await? {
-                        if item.nfo_seeded_at.is_none()
-                            && home::seed_from_nfo(store, &item, &path, &mut report.problems)
-                                .await?
-                        {
-                            report.seeded += 1;
+                        if item.nfo_seeded_at.is_none() {
+                            let mut nfo_notes = Vec::new();
+                            if home::seed_from_nfo(store, &item, &path, &mut nfo_notes).await? {
+                                report.seeded += 1;
+                            }
+                            for note in nfo_notes {
+                                report.note(note);
+                            }
                         }
                     }
                 }
@@ -209,6 +308,18 @@ pub async fn scan_library_with_progress(
         let Some(placed) = place_item(store, library, &path).await? else {
             // Couldn't place it (e.g. a Shows file with no S/E marker).
             report.skipped += 1;
+            let why = match library.kind {
+                LibraryKind::Shows => {
+                    "no season/episode marker in the name (expected something like `S01E02`)"
+                }
+                _ => "the filename couldn't be identified for this library kind",
+            };
+            tracing::warn!(path = %path_str, "skipped: {why}");
+            if skip_notes.len() < MAX_SKIP_PROBLEMS {
+                skip_notes.push(format!("skipped `{path_str}`: {why}"));
+            } else {
+                skips_over_cap += 1;
+            }
             continue;
         };
         let item_id = placed.id;
@@ -218,8 +329,13 @@ pub async fn scan_library_with_progress(
         let probe = match probe::probe(&path).await {
             Ok(p) => p,
             Err(e) => {
-                tracing::warn!(path = %path_str, error = %e, "probe failed; recording without media detail");
+                tracing::error!(path = %path_str, error = %e, "probe failed; recording without media detail");
                 report.errors += 1;
+                report.degraded += 1;
+                report.note(format!(
+                    "could not read media details for `{path_str}`: {e} — it was added without \
+                     codec, duration, or track info, so playback decisions for it are guesses"
+                ));
                 Default::default()
             }
         };
@@ -227,10 +343,14 @@ pub async fn scan_library_with_progress(
         store
             .upsert_file(item_id, &path_str, size, mtime, &probe)
             .await?;
-        if library.kind == LibraryKind::Home
-            && home::after_record(store, placed, &path, &probe, mtime, &mut report.problems).await?
-        {
-            report.seeded += 1;
+        if library.kind == LibraryKind::Home {
+            let mut nfo_notes = Vec::new();
+            if home::after_record(store, placed, &path, &probe, mtime, &mut nfo_notes).await? {
+                report.seeded += 1;
+            }
+            for note in nfo_notes {
+                report.note(note);
+            }
         }
         if is_new {
             report.added += 1;
@@ -259,12 +379,24 @@ pub async fn scan_library_with_progress(
         }
         report.pruned_items = store.prune_empty_items(library.id).await? as usize;
     } else {
-        report.problems.push(
+        report.note(
             "vanished-file cleanup skipped: some library paths were missing or unreadable, \
              so absent files were kept rather than removed"
                 .to_owned(),
         );
     }
+
+    // Skip notes go last, after every error has had its shot at the cap.
+    for note in std::mem::take(&mut skip_notes) {
+        report.note(note);
+    }
+    if skips_over_cap > 0 {
+        report.note(format!(
+            "…and {skips_over_cap} more skipped file{} — see the server log for the full list",
+            if skips_over_cap == 1 { "" } else { "s" }
+        ));
+    }
+    report.seal_problems();
 
     tracing::info!(
         library = %library.name,
@@ -917,5 +1049,183 @@ mod tests {
         let eps = store.get_item_children(seasons[0].id).await.expect("eps");
         assert_eq!(eps.len(), 2);
         assert_eq!(eps[0].episode_number, Some(1));
+
+        // A skip is not an error, but it must still say which file and why —
+        // "1 skipped" with nothing to look at is a dead end.
+        // Two probe failures (the fake episodes); the skipped stray never
+        // reaches probe, so it is not an error.
+        assert_eq!(r.errors, 2);
+        assert!(
+            r.problems.iter().any(|p| p.contains("skipped")
+                && p.contains("trailer.mkv")
+                && p.contains("S01E02")),
+            "expected a skip note naming the file and the expected marker, got: {:?}",
+            r.problems
+        );
+    }
+
+    /// THE BUG THIS GUARDS: `errors` used to be incremented in four places and
+    /// only two of them recorded a `problems` line, so the settings page showed
+    /// a bare red "2 errors" with nothing underneath and no way to find out
+    /// which files were involved. Every counted error must name its file.
+    #[tokio::test]
+    async fn every_counted_error_names_its_file() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        let dir = tempfile::tempdir().expect("tmp");
+        // Not real video → ffprobe exits nonzero → the probe-failure branch.
+        write_fake_video(dir.path(), "Heat (1995).mkv").await;
+        write_fake_video(dir.path(), "The Matrix (1999).mkv").await;
+
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "Movies".into(),
+                kind: LibraryKind::Movies,
+                paths: vec![dir.path().to_path_buf()],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+
+        let r = scan_library(&store, &lib).await.expect("scan");
+        assert_eq!(r.added, 2, "unprobeable files are still added");
+        assert_eq!(r.errors, 2, "one probe failure each");
+        assert_eq!(
+            r.problems.len(),
+            r.errors,
+            "every error needs a line the operator can read: {:?}",
+            r.problems
+        );
+        for name in ["Heat (1995).mkv", "The Matrix (1999).mkv"] {
+            assert!(
+                r.problems.iter().any(|p| p.contains(name)),
+                "no problem line mentions {name}: {:?}",
+                r.problems
+            );
+        }
+        assert!(
+            r.problems.iter().all(|p| p.contains("media details")),
+            "probe failures should say what was lost: {:?}",
+            r.problems
+        );
+    }
+
+    /// An unreadable file (listed by the walk, then unstattable) is the one
+    /// error path that used to be *completely* silent — no problem line and no
+    /// log line either. It must report, and must not delete the file's record.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unstattable_file_is_reported_and_record_kept() {
+        use std::os::unix::fs::symlink;
+
+        let store = SqliteStore::open_in_memory().expect("store");
+        let dir = tempfile::tempdir().expect("tmp");
+        let real = write_fake_video(dir.path(), "Heat (1995).mkv").await;
+
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "Movies".into(),
+                kind: LibraryKind::Movies,
+                paths: vec![dir.path().to_path_buf()],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+        assert_eq!(scan_library(&store, &lib).await.expect("scan").added, 1);
+
+        // A symlink to the file, then the target is replaced by a dangling
+        // one: WalkDir(follow_links) lists it, `metadata()` then fails.
+        let link = dir.path().join("Heat (1995) copy.mkv");
+        symlink(&real, &link).expect("symlink");
+        std::fs::remove_file(&real).expect("rm target");
+
+        let r = scan_library(&store, &lib).await.expect("rescan");
+        assert!(r.errors >= 1, "a dangling entry must count as an error");
+        assert!(
+            r.problems.iter().any(|p| p.contains("Heat (1995)")),
+            "expected a problem naming the unreadable file, got: {:?}",
+            r.problems
+        );
+    }
+
+    /// The record buckets must be a true partition of the files the walk found.
+    /// `errors` deliberately is NOT one of them — it overlaps `added` via
+    /// `degraded` — so this asserts the sum that actually has to hold, and that
+    /// the overlap is exactly as advertised.
+    #[tokio::test]
+    async fn record_buckets_partition_the_files_found() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        let dir = tempfile::tempdir().expect("tmp");
+        // 2 unprobeable movies + 1 file the movie parser still places.
+        write_fake_video(dir.path(), "Heat (1995).mkv").await;
+        write_fake_video(dir.path(), "The Matrix (1999).mkv").await;
+        write_fake_video(dir.path(), "Sicario (2015).mkv").await;
+
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "Movies".into(),
+                kind: LibraryKind::Movies,
+                paths: vec![dir.path().to_path_buf()],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+
+        let r = scan_library(&store, &lib).await.expect("scan");
+        let found = 3;
+        assert_eq!(
+            r.added + r.updated + r.unchanged + r.skipped + r.unreadable,
+            found,
+            "record buckets must sum to the files found: {r:?}"
+        );
+        // Every file was added AND degraded — the overlap the doc comment
+        // promises, and the reason `errors` can exceed `found`.
+        assert_eq!(r.added, found);
+        assert_eq!(r.degraded, found);
+        assert_eq!(r.unreadable, 0);
+        assert_eq!(r.errors, r.degraded + r.unreadable);
+
+        // Rescanning changes nothing on disk: now everything is unchanged, and
+        // an unchanged file is never re-probed, so nothing is degraded again.
+        let r = scan_library(&store, &lib).await.expect("rescan");
+        assert_eq!(
+            r.added + r.updated + r.unchanged + r.skipped + r.unreadable,
+            found
+        );
+        assert_eq!(r.unchanged, found);
+        assert_eq!(r.degraded, 0, "unchanged files are not re-probed");
+        assert_eq!(r.errors, 0);
+    }
+
+    #[tokio::test]
+    async fn problem_list_is_capped_with_a_trailing_count() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        let dir = tempfile::tempdir().expect("tmp");
+        let n = MAX_PROBLEMS + 7;
+        for i in 0..n {
+            write_fake_video(dir.path(), &format!("Movie {i} (2024).mkv")).await;
+        }
+
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "Movies".into(),
+                kind: LibraryKind::Movies,
+                paths: vec![dir.path().to_path_buf()],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+
+        let r = scan_library(&store, &lib).await.expect("scan");
+        assert_eq!(r.errors, n, "every file still counts");
+        assert_eq!(
+            r.problems.len(),
+            MAX_PROBLEMS + 1,
+            "capped list plus the summary line"
+        );
+        let last = r.problems.last().expect("summary line");
+        assert!(
+            last.contains("and 7 more problems"),
+            "summary must say how many were hidden, got: {last}"
+        );
     }
 }
