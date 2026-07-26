@@ -91,6 +91,11 @@ static SEASON_DIR: LazyLock<Regex> =
 // Anime absolute numbering: "Title - 01", "Title - 12v2", "Title - 100".
 static ANIME_EP: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\s-\s(\d{1,4})(?:v\d+)?(?:\s|\.|\[|\(|$)").expect("valid"));
+// The crammed DVD-era form: "Drawn.Together.102" is S01E02. Exactly three
+// digits standing alone — the boundaries keep it out of "1080p", "x264" and
+// "480p", where the digits touch another word character on one side.
+static SEE_CRAMMED: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b([1-9])(\d{2})\b").expect("valid"));
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedMovie {
@@ -274,34 +279,139 @@ struct Marker {
     season: i32,
     episode: i32,
     start: usize,
+    /// Matched the crammed `102` form, where what follows the digits is the
+    /// release group (`-med`), never an episode title.
+    crammed: bool,
 }
+
+/// Three-digit tokens that are release metadata, never `SEE`. `x264`, `h265`
+/// and `480p` can't match the crammed pattern at all (no word boundary inside
+/// them), but the same numbers do turn up bare — `Show.H.264.avi` would
+/// otherwise become season 2, episode 64.
+const NOT_A_CRAMMED_MARKER: &[&str] = &[
+    "240", "360", "480", "540", "576", "720", // resolutions
+    "264", "265", "266", // codecs
+];
 
 /// Find the first `SxxEyy` (or `1x02`) marker in a single name — a filename
 /// stem or a directory name.
-fn find_marker(name: &str) -> Option<Marker> {
-    let captures = SXXEYY.captures(name).or_else(|| NX_NN.captures(name))?;
-    Some(Marker {
-        season: captures.get(1)?.as_str().parse().ok()?,
-        episode: captures.get(2)?.as_str().parse().ok()?,
-        start: captures.get(0)?.start(),
-    })
+///
+/// `allow_crammed` enables the last-resort `SEE` form (`Drawn.Together.102` →
+/// season 1, episode 2), which DVD-era rips use constantly. It is off for anime
+/// because absolute numbering owns that shape: `One Piece - 102` is episode
+/// 102, not season 1 episode 2, and reading it as `SEE` would silently file
+/// three digits of every long-running series under the wrong episode.
+fn find_marker(name: &str, allow_crammed: bool) -> Option<Marker> {
+    if let Some(captures) = SXXEYY.captures(name).or_else(|| NX_NN.captures(name)) {
+        return Some(Marker {
+            season: captures.get(1)?.as_str().parse().ok()?,
+            episode: captures.get(2)?.as_str().parse().ok()?,
+            start: captures.get(0)?.start(),
+            crammed: false,
+        });
+    }
+    if !allow_crammed {
+        return None;
+    }
+    // Seasons 1–9 only: a four-digit run is far more often a year or a
+    // resolution than season 10, and guessing wrong invents an episode.
+    for captures in SEE_CRAMMED.captures_iter(name) {
+        let whole = captures.get(0)?;
+        if NOT_A_CRAMMED_MARKER.contains(&whole.as_str()) {
+            continue;
+        }
+        let episode: i32 = captures.get(2)?.as_str().parse().ok()?;
+        // `100` is a round number in a title far more often than it is
+        // episode zero, and specials are written `S01E00` when they are meant.
+        if episode == 0 {
+            continue;
+        }
+        return Some(Marker {
+            season: captures.get(1)?.as_str().parse().ok()?,
+            episode,
+            start: whole.start(),
+            crammed: true,
+        });
+    }
+    None
 }
 
-/// Filenames that describe the *file's* role rather than its content. These
-/// never inherit their folder's episode marker: a 30-second sample sitting
-/// beside the episode would otherwise become a second file on that episode and
-/// could out-sort the real one (`files_for_item` ties on height, then path).
-const NON_EPISODE_STEMS: &[&str] = &["sample", "trailer", "proof", "screens", "rarbg"];
+/// The Plex/Jellyfin local-extras convention: the kind of extra is a hyphen
+/// suffix on the stem (`Show.S01E02-trailer.mkv`). Matched on the last
+/// hyphen-separated word only, so a release group can't trip it.
+const EXTRA_SUFFIXES: &[&str] = &[
+    "sample",
+    "trailer",
+    "proof",
+    "behindthescenes",
+    "deleted",
+    "featurette",
+    "short",
+    "scene",
+    "clip",
+    "interview",
+    "other",
+];
 
-fn is_non_episode_stem(stem: &str) -> bool {
-    stem.to_lowercase()
-        .split(['.', '-', '_', ' '])
-        .any(|token| NON_EPISODE_STEMS.contains(&token))
+/// Words that mean "this file is not the episode" when they appear in the part
+/// of the name that can't be an episode title — before the marker, or anywhere
+/// at all when the marker came from the folder. Kept out of the title region
+/// because *Show.S01E02.The.Trailer.Park* is an episode, not a trailer.
+const EXTRA_TOKENS: &[&str] = &["sample", "trailer", "proof", "screens"];
+
+/// Does this filename declare itself an extra rather than the episode?
+///
+/// `title_starts_at` is where the episode title begins in `stem` — the marker
+/// position when the file carries its own marker, `None` when the marker came
+/// off the folder and the whole stem is fair game. This matters because plurx
+/// has no notion of extras: an unrecognized sample attaches to the episode as a
+/// second version and, tying on height, can sort ahead of the real file
+/// (`files_for_item` orders by height, then bitrate, then path).
+fn names_itself_an_extra(stem: &str, title_starts_at: Option<usize>) -> bool {
+    let lower = stem.to_lowercase();
+    if let Some((_, suffix)) = lower.rsplit_once('-') {
+        if EXTRA_SUFFIXES.contains(&suffix.trim()) {
+            return true;
+        }
+    }
+    let tokens = |s: &str| -> Vec<String> {
+        s.split(['.', '-', '_', ' '])
+            .map(|t| t.trim().to_owned())
+            .collect()
+    };
+    // "sample" is not a word that appears in real episode titles, so it counts
+    // wherever it sits — including `Show.S01E02.sample.avi`.
+    if tokens(&lower).iter().any(|t| t == "sample") {
+        return true;
+    }
+    let outside_title = match title_starts_at {
+        Some(at) => &lower[..at],
+        None => &lower[..],
+    };
+    tokens(outside_title)
+        .iter()
+        .any(|t| EXTRA_TOKENS.contains(&t.as_str()))
 }
 
-/// Parse a TV episode from its path, or `None` if no S/E marker is present in
-/// the filename or on the folder holding it.
-pub fn parse_episode(path: &Path) -> Option<ParsedEpisode> {
+/// Why a file in a Shows library couldn't be read as an episode. The scanner
+/// prints the whole path when it reports a skip, so the reason it prints has to
+/// be the reason that actually fired — "no marker in the name or the folder"
+/// under a path whose folder plainly reads `S01E02` is worse than no message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpisodeSkip {
+    /// Neither the filename nor the folder holding it carries a marker.
+    NoMarker,
+    /// The folder has a marker, but this file says it is not the episode —
+    /// a sample, a trailer, a proof clip.
+    Extra,
+}
+
+/// Parse a TV episode from its path.
+pub fn parse_episode(path: &Path) -> Result<ParsedEpisode, EpisodeSkip> {
+    parse_episode_inner(path, true)
+}
+
+fn parse_episode_inner(path: &Path, allow_crammed: bool) -> Result<ParsedEpisode, EpisodeSkip> {
     let stem = path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -321,16 +431,30 @@ pub fn parse_episode(path: &Path) -> Option<ParsedEpisode> {
     // immediate parent — the same directory the show title already comes from.
     // `depth` is how far up the name we ended up using lives, so the show-title
     // search below starts above it rather than re-reading it.
-    let (source, marker, depth) = match find_marker(stem) {
+    let (source, marker, depth) = match find_marker(stem, allow_crammed) {
+        // The file carries its own marker — but a sample carries one too, and
+        // plurx would file it as a second version of the episode.
+        Some(m) if names_itself_an_extra(stem, Some(m.start)) => {
+            return Err(EpisodeSkip::Extra);
+        }
         Some(m) => (stem, m, 0usize),
         None => {
-            let dir = *dirs.first()?;
-            // A "Season 02" dir carries a season but no episode, and a sample
-            // is not the episode — neither may borrow the folder's marker.
-            if SEASON_DIR.is_match(dir) || is_non_episode_stem(stem) {
-                return None;
+            let dir = *dirs.first().ok_or(EpisodeSkip::NoMarker)?;
+            // A "Season 02" dir carries a season but no episode, so there is
+            // nothing to inherit from it either way.
+            if SEASON_DIR.is_match(dir) {
+                return Err(EpisodeSkip::NoMarker);
             }
-            (dir, find_marker(dir)?, 1usize)
+            let Some(m) = find_marker(dir, allow_crammed) else {
+                return Err(EpisodeSkip::NoMarker);
+            };
+            // The folder does say which episode it is — but this file says it
+            // isn't the episode, and that distinction is what gets reported.
+            // Nothing in the stem is a title here, so all of it is checked.
+            if names_itself_an_extra(stem, None) {
+                return Err(EpisodeSkip::Extra);
+            }
+            (dir, m, 1usize)
         }
     };
     let (season, episode, marker_start) = (marker.season, marker.episode, marker.start);
@@ -355,14 +479,20 @@ pub fn parse_episode(path: &Path) -> Option<ParsedEpisode> {
         None => (title_before_cruft(show_source), None),
     };
 
-    // Episode title: text after the marker, minus cruft. Empty → None.
+    // Episode title: text after the marker, minus cruft. Empty → None. The
+    // crammed form gets none at all — `102-med` is followed by the release
+    // group, and "med" as an episode title is worse than "Episode 2".
     let after = &source[marker_start..];
-    let episode_title = after
-        .split_once([' ', '.', '-', '_'])
-        .map(|(_, rest)| title_before_cruft(rest))
+    let episode_title = (!marker.crammed)
+        .then(|| {
+            after
+                .split_once([' ', '.', '-', '_'])
+                .map(|(_, rest)| title_before_cruft(rest))
+        })
+        .flatten()
         .filter(|t| !t.is_empty());
 
-    Some(ParsedEpisode {
+    Ok(ParsedEpisode {
         show_title: if show_title.is_empty() {
             "Unknown".to_owned()
         } else {
@@ -391,25 +521,36 @@ fn strip_brackets(s: &str) -> String {
 }
 
 /// Parse an anime episode using absolute numbering (`[Group] Title - NN`),
-/// falling back to standard `SxxEyy` when the release uses it. Returns `None`
-/// if no episode number is found. Anime episodes map to season 1 with the
-/// absolute number (REQ-META-3).
-pub fn parse_anime_episode(path: &Path) -> Option<ParsedEpisode> {
-    // Some anime use standard S/E — honor it first.
-    if let Some(std) = parse_episode(path) {
-        return Some(std);
+/// falling back to standard `SxxEyy` when the release uses it. Anime episodes
+/// map to season 1 with the absolute number (REQ-META-3).
+pub fn parse_anime_episode(path: &Path) -> Result<ParsedEpisode, EpisodeSkip> {
+    // Some anime use standard S/E — honor it first, but never the crammed
+    // `SEE` form: in anime, three digits after a dash are the absolute episode.
+    match parse_episode_inner(path, false) {
+        Ok(std) => return Ok(std),
+        Err(EpisodeSkip::Extra) => return Err(EpisodeSkip::Extra),
+        Err(EpisodeSkip::NoMarker) => {}
     }
     let stem = path
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or_default();
+    // Only the unambiguous half of the rule here: an anime episode title in the
+    // filename could contain "trailer", but never "sample", and the `-trailer`
+    // suffix convention means what it says.
+    if names_itself_an_extra(stem, Some(0)) {
+        return Err(EpisodeSkip::Extra);
+    }
     let cleaned = strip_brackets(stem);
 
-    let caps = ANIME_EP.captures(&cleaned)?;
-    let episode: i32 = caps.get(1)?.as_str().parse().ok()?;
-    let marker = caps.get(0)?.start();
+    let caps = ANIME_EP.captures(&cleaned).ok_or(EpisodeSkip::NoMarker)?;
+    let episode: i32 = caps
+        .get(1)
+        .and_then(|m| m.as_str().parse().ok())
+        .ok_or(EpisodeSkip::NoMarker)?;
+    let marker = caps.get(0).ok_or(EpisodeSkip::NoMarker)?.start();
     let show_title = title_before_cruft(&cleaned[..marker]);
-    Some(ParsedEpisode {
+    Ok(ParsedEpisode {
         show_title: if show_title.is_empty() {
             "Unknown".to_owned()
         } else {
@@ -431,7 +572,10 @@ mod tests {
         parse_movie(&PathBuf::from(p))
     }
     fn ep(p: &str) -> Option<ParsedEpisode> {
-        parse_episode(&PathBuf::from(p))
+        parse_episode(&PathBuf::from(p)).ok()
+    }
+    fn skip(p: &str) -> EpisodeSkip {
+        parse_episode(&PathBuf::from(p)).expect_err("expected a skip")
     }
     fn home(p: &str) -> ParsedHomeMedia {
         parse_home_media(&PathBuf::from(p))
@@ -652,8 +796,64 @@ mod tests {
         assert!(ep("/tv/Drawn Together/956a4a82d3e71a92e95bc3658e6978d7.mkv").is_none());
     }
 
+    /// The skip reason is what the scan report prints next to the full path, so
+    /// "no marker anywhere" must not be said about a path whose folder has one.
+    #[test]
+    fn a_skipped_file_reports_the_reason_that_fired() {
+        assert_eq!(
+            skip(
+                "/8tb/tv/Drawn Together/Season 1/Drawn.Together.S01E02.DVDRip.XviD-MEDiEVAL/\
+                 sample.drawn.together.102-med.avi"
+            ),
+            EpisodeSkip::Extra,
+        );
+        // No marker on the folder either → the extras rule never came up.
+        assert_eq!(
+            skip("/tv/Drawn Together/Season 1/sample.avi"),
+            EpisodeSkip::NoMarker,
+        );
+        assert_eq!(skip("/tv/Show/Season 1/poster.jpg"), EpisodeSkip::NoMarker);
+    }
+
+    #[test]
+    fn crammed_see_numbering() {
+        let e = ep("/tv/Drawn Together/Season 1/drawn.together.102-med.avi").expect("parsed");
+        assert_eq!(e.show_title, "Drawn Together");
+        assert_eq!((e.season, e.episode), (1, 2));
+        // "-med" is the release group; no episode title is better than that one.
+        assert_eq!(e.episode_title, None);
+
+        // Also usable as the folder fallback, and past season 9's little
+        // brother: 9x99 is the ceiling of the form.
+        let e = ep("/tv/Show.512.DVDRip.XviD-GRP/abc123.avi").expect("parsed");
+        assert_eq!((e.season, e.episode), (5, 12));
+        assert_eq!(e.show_title, "Show");
+        assert_eq!(ep("/tv/Show/Season 9/show.999.avi").expect("p").episode, 99);
+    }
+
+    #[test]
+    fn crammed_numbering_ignores_release_cruft() {
+        // Codec and resolution tokens are the whole reason for the deny-list:
+        // "264" would otherwise be season 2, episode 64.
+        assert!(ep("/tv/Show/Season 1/show.H.264.avi").is_none());
+        assert!(ep("/tv/Show/Season 1/show.720.avi").is_none());
+        // Digits touching a word character on either side aren't the form.
+        assert!(ep("/tv/Show/Season 1/show.1080p.x264.avi").is_none());
+        assert!(ep("/tv/Show/Season 1/show.2004.remux.avi").is_none());
+        // Episode 0 is written S01E00 when it is meant; "100" in a title isn't.
+        assert!(ep("/tv/Show/Season 1/The 100 pilot.avi").is_none());
+    }
+
+    #[test]
+    fn anime_absolute_numbering_beats_the_crammed_form() {
+        // The regression the `allow_crammed` flag exists to prevent: this is
+        // episode 102, not season 1 episode 2.
+        let e = anime("/a/[Group] One Piece - 102 [1080p].mkv").expect("parsed");
+        assert_eq!((e.season, e.episode), (1, 102));
+    }
+
     fn anime(p: &str) -> Option<ParsedEpisode> {
-        parse_anime_episode(&PathBuf::from(p))
+        parse_anime_episode(&PathBuf::from(p)).ok()
     }
 
     #[test]

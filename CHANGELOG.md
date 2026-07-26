@@ -68,6 +68,35 @@ bump may break compatibility and a **patch** bump never does.
 
 ### Fixed
 
+- The crammed `102` form is understood. DVD-era rips write season and episode
+  as three digits — `drawn.together.102-med.avi` is S01E02 — and plurx skipped
+  every one of them. It is tried only after `S01E02` and `1x02` fail, on a
+  standalone three-digit token, seasons 1–9 only: four digits are a year or a
+  resolution far more often than they are season 10, and inventing an episode is
+  worse than skipping one. Resolution and codec numbers are excluded by name
+  (`264` would otherwise be season 2, episode 64), and `x264`, `1080p` and
+  `480p` can't match at all because their digits touch a letter. No episode
+  title is taken from this form — what follows the digits is the release group,
+  and *Episode 2* beats *med*. Anime is deliberately exempt: there, three digits
+  after a dash are the absolute episode number, so `One Piece - 102` stays
+  episode 102 rather than becoming season 1, episode 2.
+- Samples and other extras say that's what they are, instead of claiming the
+  episode couldn't be identified. A skip note prints the whole path, so
+  "no season/episode marker … in the file name or on the folder holding it"
+  under `Drawn.Together.S01E02.DVDRip-MEDiEVAL/sample.drawn.together.102-med.avi`
+  was the same self-contradiction as before, one layer down: the file was
+  excluded on purpose and the message described a different rule. Skip reasons
+  are now produced where the decision is made rather than reconstructed after
+  the fact, so they cannot drift again. Extras are recognized two ways: the
+  Plex/Jellyfin `-trailer` / `-featurette` / `-sample` suffix convention, and
+  the words *sample*, *trailer*, *proof*, *screens* where an episode title
+  cannot be — before the marker, or anywhere in a hash-named file that borrowed
+  its folder's marker. *sample* counts anywhere, since no real episode title
+  contains it; the others are left alone inside a title, so
+  `Show.S01E02.The.Trailer.Park` is still an episode. This also catches extras
+  that carry a perfectly good marker of their own (`Show.S01E02.sample.avi`),
+  which previously attached to the episode as a second version and, tying on
+  resolution, could be picked ahead of the real file.
 - Episodes whose filename is a hash are found by their release folder. A common
   torrent shape puts every identifying token on the directory —
   `Drawn.Together.2004.S01E06.Dirty.Pranking.Number.2.480p.DVD.x265.Panda/` —

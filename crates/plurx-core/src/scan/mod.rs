@@ -305,26 +305,20 @@ pub async fn scan_library_with_progress(
         }
         let is_new = existing.is_none();
 
-        let Some(placed) = place_item(store, library, &path).await? else {
-            // Couldn't place it (e.g. a Shows file with no S/E marker).
-            report.skipped += 1;
-            // Name the two places that were actually looked at. The note prints
-            // a whole path, so "no marker in the name" reads as a flat
-            // contradiction when a *higher* folder in that path does show one.
-            let why = match library.kind {
-                LibraryKind::Shows => {
-                    "no season/episode marker (expected something like `S01E02`) in the file name \
-                     or on the folder directly holding it"
+        // Couldn't place it: `place_item` hands back the reason that actually
+        // fired, not a summary of everything that could have.
+        let placed = match place_item(store, library, &path).await? {
+            Placement::Placed(placed) => placed,
+            Placement::Skipped(why) => {
+                report.skipped += 1;
+                tracing::warn!(path = %path_str, "skipped: {why}");
+                if skip_notes.len() < MAX_SKIP_PROBLEMS {
+                    skip_notes.push(format!("skipped `{path_str}`: {why}"));
+                } else {
+                    skips_over_cap += 1;
                 }
-                _ => "the filename couldn't be identified for this library kind",
-            };
-            tracing::warn!(path = %path_str, "skipped: {why}");
-            if skip_notes.len() < MAX_SKIP_PROBLEMS {
-                skip_notes.push(format!("skipped `{path_str}`: {why}"));
-            } else {
-                skips_over_cap += 1;
+                continue;
             }
-            continue;
         };
         let item_id = placed.id;
 
@@ -419,13 +413,20 @@ pub async fn scan_library_with_progress(
     Ok(report)
 }
 
-/// Find-or-create the item a file belongs to. `None` means the file couldn't
-/// be identified for this library kind.
+/// The outcome of trying to identify a file. A skip carries the sentence the
+/// scan report will print, written where the decision is actually made — a
+/// reason reconstructed later by the caller drifts from the code that skipped.
+enum Placement {
+    Placed(home::Placed),
+    Skipped(&'static str),
+}
+
+/// Find-or-create the item a file belongs to.
 async fn place_item(
     store: &dyn Store,
     library: &Library,
     path: &Path,
-) -> Result<Option<home::Placed>, StoreError> {
+) -> Result<Placement, StoreError> {
     match library.kind {
         LibraryKind::Movies => {
             let parsed = parse::parse_movie(path);
@@ -433,7 +434,7 @@ async fn place_item(
                 .find_movie(library.id, &parsed.title, parsed.year)
                 .await?
             {
-                return Ok(Some(home::Placed {
+                return Ok(Placement::Placed(home::Placed {
                     id: existing.id,
                     created: false,
                 }));
@@ -449,12 +450,15 @@ async fn place_item(
                     episode_number: None,
                 })
                 .await?;
-            Ok(Some(home::Placed { id, created: true }))
+            Ok(Placement::Placed(home::Placed { id, created: true }))
         }
         // Folders are the organization: the directory tree is mirrored as
         // browsable folder items, and the file itself becomes a video or a
         // photo under it.
-        LibraryKind::Home => home::place(store, library, path).await,
+        LibraryKind::Home => Ok(match home::place(store, library, path).await? {
+            Some(placed) => Placement::Placed(placed),
+            None => Placement::Skipped("it isn't a video or a photo this library can hold"),
+        }),
         LibraryKind::Shows => {
             // Anime libraries use absolute numbering; regular shows use S/E.
             let parsed = if library.anime {
@@ -462,13 +466,36 @@ async fn place_item(
             } else {
                 parse::parse_episode(path)
             };
-            let Some(parsed) = parsed else {
-                return Ok(None);
+            let parsed = match parsed {
+                Ok(parsed) => parsed,
+                // Each sentence names what was actually inspected. The report
+                // prints the whole path beside it, so a vaguer reason reads as
+                // a contradiction the moment the path itself shows a marker.
+                Err(parse::EpisodeSkip::Extra) => {
+                    return Ok(Placement::Skipped(
+                        "the file names itself an extra (`sample`, `trailer`, a `-featurette` \
+                         suffix) rather than the episode — it was left out instead of attaching \
+                         to the episode as a second version, where a 30-second clip can sort \
+                         ahead of the real file",
+                    ));
+                }
+                Err(parse::EpisodeSkip::NoMarker) if library.anime => {
+                    return Ok(Placement::Skipped(
+                        "no episode number in the file name (expected `S01E02` or an absolute \
+                         number like `- 137`)",
+                    ));
+                }
+                Err(parse::EpisodeSkip::NoMarker) => {
+                    return Ok(Placement::Skipped(
+                        "no season/episode marker (expected `S01E02`, `1x02`, or the crammed \
+                         `102` form) in the file name or on the folder directly holding it",
+                    ));
+                }
             };
             let show = find_or_create_show(store, library, &parsed).await?;
             let season = find_or_create_season(store, library, show.id, parsed.season).await?;
             if let Some(existing) = store.find_episode(season, parsed.episode).await? {
-                return Ok(Some(home::Placed {
+                return Ok(Placement::Placed(home::Placed {
                     id: existing.id,
                     created: false,
                 }));
@@ -488,7 +515,7 @@ async fn place_item(
                     episode_number: Some(parsed.episode),
                 })
                 .await?;
-            Ok(Some(home::Placed { id, created: true }))
+            Ok(Placement::Placed(home::Placed { id, created: true }))
         }
     }
 }

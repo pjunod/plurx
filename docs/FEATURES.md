@@ -29,10 +29,17 @@ anime.
   numbering** (episode 137, no season) routed by anime detection rather than
   forced into TVDB season shapes. An episode whose filename carries nothing —
   a hash-named `.mkv` inside `Show.S01E06.480p.x265-GROUP/` — takes its marker
-  from the folder holding it, since that is where such releases put it. A
-  `Season NN` directory and self-declared extras (`sample`, `trailer`, `proof`,
-  `screens`, `rarbg`) never inherit one: the first has no episode number, and
-  the second would attach a 30-second clip to the episode as a second version.
+  from the folder holding it, since that is where such releases put it. The
+  crammed DVD-era form is read too (`drawn.together.102` → S01E02): standalone
+  three-digit token, seasons 1–9, with resolution and codec numbers excluded —
+  and never for anime, where `- 102` is absolute episode 102.
+- **Extras are left out, by name.** A `Season NN` directory has no episode to
+  inherit, and a file that declares itself an extra — the `-trailer` /
+  `-featurette` / `-sample` suffix convention, or *sample* / *trailer* /
+  *proof* / *screens* where an episode title can't be — is skipped rather than
+  attached to the episode as a second version, where a 30-second clip tying on
+  resolution can be served ahead of the real file. Every skip says which of
+  these rules fired.
 - **Inspection** with `ffprobe` as ground truth: container, video codec/profile,
   width/height, bit depth, HDR type (HDR10 / HDR10+ / HLG / Dolby Vision +
   profile/level), overall bitrate, every audio track (codec, channels,
