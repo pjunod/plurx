@@ -64,14 +64,22 @@ anime.
   problems appear immediately.
 - **Refresh art:** re-fetch all metadata and artwork for a library, including
   backfilling season posters onto shows scanned before a poster existed.
-- *Planned (fast-follow):* live inotify watching (today: on-demand + create/
-  update rescan); manual fix-match UI.
+- **Scheduled jobs**, all off by default. Per library: a **scan** interval and a
+  **refresh art** interval (Settings → Libraries). Server-wide: **retry
+  unreadable files** and **clean transcode cache**. Intervals are minutes with a
+  floor of 15 · a refresh beats a scan when both fall due · runs are stamped on
+  completion, on the library row, so neither a slow scan nor a nightly reboot can
+  put the schedule into a spin.
+- *Planned (fast-follow):* live inotify watching (today: on-demand, scheduled,
+  and create/update rescan); manual fix-match UI.
 
 **How to read it:** a library stuck at `scanning… 0 / 0 files` with an error
 means the path isn't visible to the **server process** (the usual cause is a
 Docker mount that doesn't match the path you typed). `idle` with a low item
 count after a scan that reported many files means enrichment matched little —
-check the TMDB key.
+check the TMDB key. A scheduled scan that never seems to fire: the clock starts
+when the last run *finished*, and `last …` next to the schedule says when that
+was; a library still scanning simply skips its turn and takes the next one.
 
 ---
 

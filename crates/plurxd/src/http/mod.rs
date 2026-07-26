@@ -68,6 +68,7 @@ pub fn router(state: AppState) -> Router {
             "/libraries/{id}",
             put(libraries::update).delete(libraries::delete),
         )
+        .route("/libraries/{id}/schedule", put(libraries::set_schedule))
         .route("/libraries/{id}/scan", post(libraries::scan))
         .route("/libraries/{id}/refresh", post(libraries::refresh))
         .route("/libraries/{id}/items", get(browse::list_items))
@@ -1490,6 +1491,49 @@ mod tests {
                 .is_some_and(|p| p.contains("Heat.mp4")),
             "the file that failed is named: {report:?}"
         );
+
+        // Schedules: minutes, 0 = off, and a floor under anything non-zero so a
+        // dropdown can't turn a NAS into a treadmill.
+        assert_eq!(
+            call(
+                &app,
+                put(
+                    &format!("/api/v1/libraries/{}/schedule", s.lib),
+                    Some(&admin),
+                    json!({ "scan_interval_mins": 5 })
+                )
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+        let (st, lib) = call(
+            &app,
+            put(
+                &format!("/api/v1/libraries/{}/schedule", s.lib),
+                Some(&admin),
+                json!({ "scan_interval_mins": 360, "refresh_interval_mins": 10080 }),
+            ),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(lib["scan_interval_mins"], 360);
+        assert_eq!(lib["refresh_interval_mins"], 10080);
+        // Readable back through the library list, which is where the settings
+        // page gets the value it renders.
+        let (_, libs) = call(&app, get("/api/v1/libraries", Some(&admin))).await;
+        assert_eq!(libs[0]["scan_interval_mins"], 360);
+        // Turning it off is an ordinary update, not a special case.
+        let (_, lib) = call(
+            &app,
+            put(
+                &format!("/api/v1/libraries/{}/schedule", s.lib),
+                Some(&admin),
+                json!({ "scan_interval_mins": 0, "refresh_interval_mins": 0 }),
+            ),
+        )
+        .await;
+        assert_eq!(lib["scan_interval_mins"], 0);
 
         // Settings round-trip.
         assert_eq!(

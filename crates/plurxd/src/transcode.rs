@@ -697,6 +697,45 @@ impl TranscodeManager {
         }
     }
 
+    /// Delete working directories under the transcode root that no live session
+    /// owns. Returns how many were removed.
+    ///
+    /// The reaper cleans up after sessions it knows about, which covers the
+    /// normal case. It cannot cover the abnormal one: a SIGKILL, an OOM, or a
+    /// host reboot leaves the directories on disk and the session map empty on
+    /// the way back up, so nothing ever claims them. On a 4K library those
+    /// leftovers are measured in gigabytes, and the only symptom is a disk
+    /// filling for no visible reason.
+    pub async fn sweep_orphan_dirs(&self) -> usize {
+        let live: std::collections::HashSet<PathBuf> = self
+            .sessions
+            .lock()
+            .await
+            .values()
+            .map(|s| s.dir.clone())
+            .collect();
+        // No root yet just means nothing has been transcoded.
+        let Ok(mut entries) = tokio::fs::read_dir(&self.work_dir).await else {
+            return 0;
+        };
+        let mut removed = 0usize;
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            if live.contains(&path) || !entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false)
+            {
+                continue;
+            }
+            match tokio::fs::remove_dir_all(&path).await {
+                Ok(()) => {
+                    removed += 1;
+                    tracing::info!(dir = %path.display(), "removed orphaned transcode directory");
+                }
+                Err(e) => tracing::warn!(dir = %path.display(), error = %e, "orphan sweep failed"),
+            }
+        }
+        removed
+    }
+
     /// Background loop: kill and remove sessions idle beyond the timeout.
     pub async fn reap_loop(self: Arc<Self>) {
         let mut ticker = tokio::time::interval(Duration::from_secs(15));

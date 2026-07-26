@@ -240,6 +240,16 @@ const MIGRATIONS: &[&str] = &[
         VALUES (new.id, new.title, new.overview, new.tags);
     END;
     INSERT INTO items_fts(items_fts) VALUES('rebuild');",
+    // v7: scheduled jobs. Intervals are per library and in minutes, `0` = off
+    // (the default, so an upgrade changes nobody's behavior). The last-run
+    // stamps live on the row rather than in memory so a restart can't reset the
+    // clock — a server that reboots nightly would otherwise either scan on
+    // every boot or never scan at all, depending on which way that was fudged.
+    // Plain ALTERs: no CHECK to fight, so no table rebuild.
+    "ALTER TABLE libraries ADD COLUMN scan_interval_mins INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE libraries ADD COLUMN refresh_interval_mins INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE libraries ADD COLUMN last_scan_at INTEGER;
+    ALTER TABLE libraries ADD COLUMN last_refresh_at INTEGER;",
 ];
 
 /// Column list matching [`item_from_row`]. Prefix with a table alias via
@@ -637,7 +647,7 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .expect("version");
         assert_eq!(version, MIGRATIONS.len() as i64);
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
 
         // Every row survives, values identical.
         let dangling: i64 = conn

@@ -510,6 +510,9 @@
      what we know about it. */
   .unprobed{margin-top:10px;background:#2a2413;border:1px solid #5a4d22;color:#f0d79a;
     border-radius:10px;padding:10px 12px;font-size:12.5px;line-height:1.5}
+  /* The per-library schedule, under its status: quiet until you look at it. */
+  .sched{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-top:8px;font-size:11.5px;
+    color:var(--muted);text-transform:none;letter-spacing:0}
   .missbadge{display:inline-block;background:#5a2a2e;color:#f7b6ba;font-size:10px;padding:1px 6px;border-radius:5px;vertical-align:middle;margin-left:6px;text-transform:uppercase;letter-spacing:.05em}
   .art.ph.season{background:linear-gradient(160deg,#2b3350,#141826);flex-direction:column;gap:1px}
   .art.ph.season .snum{font-size:38px;line-height:1}
@@ -2866,11 +2869,75 @@ function settingsPanel(tab,d){
   if(tab==="system")   return systemPanel(d.sys);
   return librariesPanel(d.libs,d.status,d.settings);
 }
+// Intervals in minutes. Nothing under 15 — the server refuses it, because a
+// real library scanned every minute is a NAS denial-of-service on a timer.
+const SCAN_EVERY=[[0,"Never"],[15,"15 min"],[30,"30 min"],[60,"1 hour"],[180,"3 hours"],[360,"6 hours"],[720,"12 hours"],[1440,"Daily"]];
+const REFRESH_EVERY=[[0,"Never"],[1440,"Daily"],[10080,"Weekly"],[43200,"Monthly"]];
+function everySelect(id,options,value,title){
+  return `<select id="${id}" title="${esc(title)}" style="max-width:120px;font-size:12px;padding:3px 6px">${
+    options.map(([v,label])=>`<option value="${v}"${Number(value)===v?' selected':''}>${esc(label)}</option>`).join("")}</select>`;
+}
+// The schedule sits under the status because that is where someone looks when
+// wondering whether a scan is going to happen on its own.
+function schedRow(l){
+  if(!ME||!ME.is_admin) return '';
+  const last=l.last_scan_at?` · last ${esc(agoLabel(l.last_scan_at))}`:'';
+  return `<div class="sched">
+    <span>Scan</span>${everySelect(`sched-scan-${l.id}`,SCAN_EVERY,l.scan_interval_mins,"How often to look for new & changed files")}
+    <span>Refresh art</span>${everySelect(`sched-ref-${l.id}`,REFRESH_EVERY,l.refresh_interval_mins,"How often to re-fetch metadata for everything — heavy; days, not hours")}
+    <button class="ghost sm" onclick="saveSchedule(${l.id},this)">Save</button><span class="muted">${last}</span></div>`;
+}
+function agoLabel(ts){
+  const s=Math.max(0,Math.floor(Date.now()/1000)-ts);
+  if(s<90) return "just now";
+  if(s<5400) return `${Math.round(s/60)} min ago`;
+  if(s<172800) return `${Math.round(s/3600)}h ago`;
+  return `${Math.round(s/86400)}d ago`;
+}
+async function saveSchedule(id,btn){
+  const scan=Number(document.getElementById(`sched-scan-${id}`).value);
+  const ref=Number(document.getElementById(`sched-ref-${id}`).value);
+  btn.disabled=true;
+  try{
+    await api(`/libraries/${id}/schedule`,{method:"PUT",body:{scan_interval_mins:scan,refresh_interval_mins:ref}});
+    toast(scan||ref?"Schedule saved":"Automatic runs turned off");
+    render();
+  }catch(e){ toast(e.message||"Couldn't save the schedule"); }
+  finally{ btn.disabled=false; }
+}
+// Server-wide scheduled maintenance. Per-library scanning lives in the table
+// above; these two are global because they aren't about any one library.
+const RETRY_EVERY=[[0,"Never"],[360,"6 hours"],[720,"12 hours"],[1440,"Daily"],[10080,"Weekly"]];
+const CLEAN_EVERY=[[0,"Never"],[60,"Hourly"],[360,"6 hours"],[1440,"Daily"]];
+function maintenancePanel(settings){
+  if(!ME||!ME.is_admin||!settings) return '';
+  return `<h2 class="section">Scheduled maintenance</h2>
+    <div class="row" style="gap:10px;align-items:center;flex-wrap:wrap">
+      <span class="muted" style="font-size:12px">Retry unreadable files</span>
+      ${everySelect("job-probe",RETRY_EVERY,settings.probe_retry_mins,"Re-run ffprobe on files whose media details were never read")}
+      <span class="muted" style="font-size:12px">Clean transcode cache</span>
+      ${everySelect("job-clean",CLEAN_EVERY,settings.transcode_cleanup_mins,"Delete leftover transcode working directories no session owns")}
+      <button class="ghost sm" onclick="saveMaintenance(this)">Save</button></div>
+    <div class="hint">Everything here is off by default. <b>Retry unreadable files</b> re-probes anything
+      scanned without codec or duration — the fix for those (permissions, a remounted share) leaves no
+      trace a normal scan would notice. <b>Clean transcode cache</b> removes working directories left
+      behind by a crash or a host reboot, which no live session will ever claim.</div>`;
+}
+async function saveMaintenance(btn){
+  btn.disabled=true;
+  try{
+    await api("/settings",{method:"PUT",body:{
+      probe_retry_mins:Number(document.getElementById("job-probe").value),
+      transcode_cleanup_mins:Number(document.getElementById("job-clean").value)}});
+    toast("Maintenance schedule saved"); render();
+  }catch(e){ toast(e.message||"Couldn't save"); }
+  finally{ btn.disabled=false; }
+}
 function libRow(l,status){
   const paths=(l.paths||[]).map(p=>`<span class="pathchip">${esc(p)}</span>`).join(" ")||'<span class="muted">—</span>';
   return `<tr id="librow-${l.id}"><td class="libname"><b>${esc(l.name)}</b></td><td data-label="Kind">${esc(l.anime?'anime':l.kind)}</td>
       <td data-label="Paths"><div class="paths">${paths}</div></td>
-      <td class="muted" data-label="Status" id="st-${l.id}">${statusText(status[l.id])}</td>
+      <td class="muted" data-label="Status"><div id="st-${l.id}">${statusText(status[l.id])}</div>${schedRow(l)}</td>
       <td class="row rowactions" style="flex-wrap:wrap;justify-content:flex-end;gap:5px">
         <button class="ghost sm" onclick="scanLib(${l.id})">Scan</button>
         <button class="ghost sm" onclick="refreshLib(${l.id})" title="Re-fetch all metadata & artwork (incl. season posters)">Refresh art</button>
@@ -2893,6 +2960,7 @@ function librariesPanel(libs,status,settings){
       ${warn}${bulk}
       <table><thead><tr><th>Name</th><th>Kind</th><th>Paths</th><th>Status</th><th></th></tr></thead>
       <tbody>${rows}</tbody></table>
+      ${maintenancePanel(settings)}
       <h2 class="section">Add library</h2>
       <div class="row"><input id="ln" placeholder="Name" style="max-width:180px">
         <select id="lk" style="max-width:170px"><option value="movies">Movies</option><option value="shows">TV Shows</option><option value="anime">Anime</option><option value="home">Home videos &amp; photos</option></select>

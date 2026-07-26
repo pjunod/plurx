@@ -15,6 +15,7 @@ use serde::Serialize;
 use tokio::sync::Mutex;
 
 use crate::logbuf::LogBuffer;
+use crate::schedule::{due_jobs, DueJob, GlobalSchedule};
 use crate::trakt::TraktManager;
 use crate::transcode::TranscodeManager;
 
@@ -288,7 +289,116 @@ impl JobManager {
 
         status.running = false;
         status.finished_at = Some(now());
+        // Stamp the schedule from the *end* of the run, not the start: a scan
+        // that takes 40 minutes on a 1-hour interval would otherwise be due
+        // again 20 minutes later, and a library slower than its own interval
+        // would scan without pause.
+        if let Err(e) = self
+            .store
+            .mark_library_scanned(library_id, force_metadata)
+            .await
+        {
+            tracing::warn!(error = %e, library = library_id, "recording the run time failed");
+        }
         self.finish(library_id, status).await;
+    }
+
+    /// The scheduler: ask [`crate::schedule::due_jobs`] once a minute, dispatch
+    /// what it says, stamp what it ran.
+    ///
+    /// A minute is the resolution because the intervals are minutes and nothing
+    /// here is urgent; the cost is one small query per tick. Scheduled and
+    /// manual runs go through the same `trigger_*` methods, so a scheduled scan
+    /// can't stack on top of a running one — `trigger` refuses, and the next
+    /// tick tries again.
+    pub async fn schedule_loop(self: Arc<Self>, transcode: Arc<TranscodeManager>) {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            ticker.tick().await;
+            if let Err(e) = self.run_due_jobs(&transcode).await {
+                tracing::warn!(error = %e, "scheduler tick failed");
+            }
+        }
+    }
+
+    async fn run_due_jobs(
+        self: &Arc<Self>,
+        transcode: &Arc<TranscodeManager>,
+    ) -> Result<(), plurx_core::error::StoreError> {
+        let libraries = self.store.list_libraries().await?;
+        let global = GlobalSchedule {
+            probe_retry_mins: self.job_interval(keys::JOB_PROBE_RETRY_MINS).await,
+            last_probe_retry: self.job_stamp(keys::JOB_LAST_PROBE_RETRY).await,
+            transcode_cleanup_mins: self.job_interval(keys::JOB_TRANSCODE_CLEANUP_MINS).await,
+            last_transcode_cleanup: self.job_stamp(keys::JOB_LAST_TRANSCODE_CLEANUP).await,
+        };
+        for job in due_jobs(now(), &libraries, global) {
+            match job {
+                DueJob::Scan(id) => {
+                    if self.trigger_scan(id).await {
+                        tracing::info!(library = id, "scheduled scan started");
+                    }
+                }
+                DueJob::Refresh(id) => {
+                    if self.trigger_refresh(id).await {
+                        tracing::info!(library = id, "scheduled metadata refresh started");
+                    }
+                }
+                // The server-wide jobs are stamped *before* they run and run
+                // inline on this task: both are short, and stamping first means
+                // one that fails can't retry at a job per minute forever.
+                DueJob::RetryProbes => {
+                    self.stamp(keys::JOB_LAST_PROBE_RETRY).await;
+                    let files = self.store.files_missing_probe(None).await?;
+                    if !files.is_empty() {
+                        let report = scan::reprobe_files(self.store.as_ref(), &files).await?;
+                        tracing::info!(
+                            attempted = report.attempted,
+                            repaired = report.repaired,
+                            still_failing = report.still_failing,
+                            "scheduled re-probe finished"
+                        );
+                    }
+                }
+                DueJob::CleanupTranscode => {
+                    self.stamp(keys::JOB_LAST_TRANSCODE_CLEANUP).await;
+                    let removed = transcode.sweep_orphan_dirs().await;
+                    if removed > 0 {
+                        tracing::info!(removed, "swept orphaned transcode directories");
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A minutes-interval setting; absent, blank or unparseable reads as off.
+    /// Deliberately not an error: a hand-edited settings row should stop one
+    /// job, not the server.
+    async fn job_interval(&self, key: &str) -> i64 {
+        self.store
+            .get_setting(key)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .unwrap_or(0)
+            .max(0)
+    }
+
+    async fn job_stamp(&self, key: &str) -> Option<i64> {
+        self.store
+            .get_setting(key)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+    }
+
+    async fn stamp(&self, key: &str) {
+        if let Err(e) = self.store.put_setting(key, &now().to_string()).await {
+            tracing::warn!(error = %e, key, "recording a job run time failed");
+        }
     }
 
     async fn finish(&self, library_id: i64, mut status: ScanStatus) {

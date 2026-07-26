@@ -216,6 +216,13 @@ pub struct LibraryDto {
     pub paths: Vec<String>,
     pub anime: bool,
     pub created_at: i64,
+    /// Automatic job intervals in minutes; `0` is off, which is the default.
+    pub scan_interval_mins: i64,
+    pub refresh_interval_mins: i64,
+    /// When each last finished (unix seconds), so the UI can say "last scanned
+    /// 40 minutes ago" rather than only promising a future.
+    pub last_scan_at: Option<i64>,
+    pub last_refresh_at: Option<i64>,
 }
 
 impl From<Library> for LibraryDto {
@@ -231,6 +238,10 @@ impl From<Library> for LibraryDto {
                 .collect(),
             anime: l.anime,
             created_at: l.created_at,
+            scan_interval_mins: l.scan_interval_mins,
+            refresh_interval_mins: l.refresh_interval_mins,
+            last_scan_at: l.last_scan_at,
+            last_refresh_at: l.last_refresh_at,
         }
     }
 }

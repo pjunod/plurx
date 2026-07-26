@@ -1,5 +1,6 @@
 mod http;
 mod logbuf;
+mod schedule;
 mod state;
 mod trakt;
 mod transcode;
@@ -212,6 +213,13 @@ async fn run(config: Config) -> anyhow::Result<()> {
     );
     // Reap idle transcode sessions in the background.
     tokio::spawn(std::sync::Arc::clone(&state.transcode).reap_loop());
+
+    // Scheduled jobs: library scans, metadata refreshes, probe retries, and
+    // transcode-cache cleanup. Every interval defaults to off, so this loop
+    // does nothing until someone sets one in Settings.
+    tokio::spawn(
+        std::sync::Arc::clone(&state.jobs).schedule_loop(std::sync::Arc::clone(&state.transcode)),
+    );
 
     // Trakt: hourly (and on-demand) two-way sync + the scrobble-pause sweep.
     tokio::spawn(std::sync::Arc::clone(&state.trakt).sync_loop());

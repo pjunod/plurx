@@ -101,6 +101,57 @@ pub async fn update(
     Ok(Json(library.into()))
 }
 
+/// The automatic schedule for one library, in minutes. `0` turns a job off.
+#[derive(Deserialize)]
+pub struct ScheduleInput {
+    #[serde(default)]
+    pub scan_interval_mins: i64,
+    #[serde(default)]
+    pub refresh_interval_mins: i64,
+}
+
+/// PUT /api/v1/libraries/:id/schedule (admin) — set the automatic intervals.
+///
+/// Separate from the library update because that one rescans on save: changing
+/// "scan every 6 hours" to "every 12" should not itself start a scan, or the
+/// settings page becomes a way to hammer a NAS by fiddling with a dropdown.
+pub async fn set_schedule(
+    _admin: AdminUser,
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(input): Json<ScheduleInput>,
+) -> Result<Json<LibraryDto>, ApiError> {
+    // A floor rather than a free-for-all: scanning a real library every minute
+    // is a NAS denial-of-service with a schedule attached, and the loop only
+    // ticks once a minute anyway. 0 (off) stays exactly 0.
+    const MIN_INTERVAL_MINS: i64 = 15;
+    for (label, value) in [
+        ("scan_interval_mins", input.scan_interval_mins),
+        ("refresh_interval_mins", input.refresh_interval_mins),
+    ] {
+        if value < 0 {
+            return Err(ApiError::BadRequest(format!("{label} cannot be negative")));
+        }
+        if value > 0 && value < MIN_INTERVAL_MINS {
+            return Err(ApiError::BadRequest(format!(
+                "{label} must be 0 (off) or at least {MIN_INTERVAL_MINS} minutes"
+            )));
+        }
+    }
+    let library = state
+        .store
+        .set_library_schedule(id, input.scan_interval_mins, input.refresh_interval_mins)
+        .await?
+        .ok_or(ApiError::NotFound("library"))?;
+    tracing::info!(
+        library = id,
+        scan_interval_mins = library.scan_interval_mins,
+        refresh_interval_mins = library.refresh_interval_mins,
+        "library schedule updated"
+    );
+    Ok(Json(library.into()))
+}
+
 /// DELETE /api/v1/libraries/:id (admin)
 pub async fn delete(
     _admin: AdminUser,

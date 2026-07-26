@@ -68,6 +68,31 @@ bump may break compatibility and a **patch** bump never does.
 
 ### Added
 
+- **Scheduled jobs.** plurx can now do its own housekeeping: each library has a
+  **scan** interval and a **refresh art** interval (Settings → Libraries, under
+  the library's status), and the server has two maintenance jobs — *retry
+  unreadable files* and *clean transcode cache*. Everything is **off by
+  default**: upgrading a server must not silently give it new habits at 3am.
+  Intervals are minutes with a floor of 15, since the scheduler ticks once a
+  minute and a real library scanned continuously is a NAS denial-of-service on a
+  timer. Per library rather than server-wide because a download folder and a
+  finished archive deserve different cadences. When a scan and a refresh come
+  due together the refresh wins — it already does everything the scan does, and
+  running both walks the library twice for one due moment. Runs are stamped when
+  they **finish**, on the library row: stamping the start would make a 40-minute
+  scan on an hourly schedule due again 20 minutes later, and keeping the stamp in
+  memory would mean a server that reboots nightly either scans every boot or
+  never scans at all. Scheduled runs go through the same trigger as the buttons,
+  so one can't stack on a scan already in progress; it simply waits for the next
+  tick. The decision of what is due is a pure function with its own tests
+  (`crates/plurxd/src/schedule.rs`), including the clock jumping backwards —
+  which would otherwise park a schedule for as long as the jump.
+- **Transcode cache cleanup.** The reaper has always cleaned up after sessions
+  it knows about; it can't clean up after a SIGKILL, an OOM or a host reboot,
+  which leave working directories on disk that nothing will ever claim. On a 4K
+  library those are gigabytes, and the only symptom is a disk filling for no
+  visible reason. The new job sweeps any directory under the transcode root that
+  no live session owns.
 - **A file whose probe failed can be read again.** A movie added while its
   permissions were wrong showed `Video —  Audio —` forever: the scan is
   incremental on size and mtime, and `chmod` moves neither, so every later scan

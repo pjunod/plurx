@@ -53,6 +53,17 @@ pub mod keys {
     /// When subtitles auto-select: "auto" (only when the audio isn't the
     /// preferred language) | "always" | "off".
     pub const SUB_MODE: &str = "playback.sub_mode";
+    /// Scheduled-job intervals, in minutes; "0" or absent means off, which is
+    /// the default for every one of them — upgrading a server must not
+    /// silently give it new nightly habits. Per-library scan and refresh
+    /// intervals live on the library row instead, since they differ per
+    /// library; only the server-wide jobs are settings.
+    pub const JOB_PROBE_RETRY_MINS: &str = "jobs.probe_retry_mins";
+    pub const JOB_TRANSCODE_CLEANUP_MINS: &str = "jobs.transcode_cleanup_mins";
+    /// When those last ran, unix seconds. Persisted rather than kept in memory
+    /// so restarting the server doesn't restart the clock.
+    pub const JOB_LAST_PROBE_RETRY: &str = "jobs.last_probe_retry";
+    pub const JOB_LAST_TRANSCODE_CLEANUP: &str = "jobs.last_transcode_cleanup";
     /// How fast a remux may run, as a multiple of real time; "0" disables the
     /// limit. An unpaced remux delivers at line rate and can starve everything
     /// else sharing the link — including, over Wi-Fi, the client's own DHCP.
@@ -112,6 +123,19 @@ pub trait LibraryStore: Send + Sync + 'static {
         library: &NewLibrary,
     ) -> Result<Option<Library>, StoreError>;
     async fn delete_library(&self, id: i64) -> Result<bool, StoreError>;
+    /// Set the automatic scan/refresh intervals (minutes; `0` = off). Separate
+    /// from `update_library` because the schedule is not part of a library's
+    /// identity — the settings UI edits one without touching the other, and a
+    /// path edit must never silently reset a schedule.
+    async fn set_library_schedule(
+        &self,
+        id: i64,
+        scan_interval_mins: i64,
+        refresh_interval_mins: i64,
+    ) -> Result<Option<Library>, StoreError>;
+    /// Stamp a completed run. `refreshed` also stamps the refresh clock, since
+    /// a refresh does everything a scan does.
+    async fn mark_library_scanned(&self, id: i64, refreshed: bool) -> Result<(), StoreError>;
     async fn get_library(&self, id: i64) -> Result<Option<Library>, StoreError>;
     async fn list_libraries(&self) -> Result<Vec<Library>, StoreError>;
 }
