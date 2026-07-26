@@ -1,14 +1,14 @@
 //! Shared application state and the background job manager.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use plurx_core::domain::LibraryKind;
+use plurx_core::domain::{LibraryKind, MetadataPatch};
 use plurx_core::metadata::local::LocalArtReport;
 use plurx_core::metadata::{self, AniListClient, EnrichReport, TmdbClient};
-use plurx_core::scan::{self, ScanProgress, ScanReport};
+use plurx_core::scan::{self, PlacedFile, ScanProgress, ScanReport, TargetError, TargetedScan};
 use plurx_core::store::{keys, Store};
 use plurx_core::transcode::EncoderCaps;
 use serde::Serialize;
@@ -139,7 +139,77 @@ pub struct JobManager {
     statuses: Mutex<HashMap<i64, ScanStatus>>,
     /// Live counters for in-flight scans, sampled by `all_statuses`.
     live: Mutex<HashMap<i64, Arc<ScanProgress>>>,
+    /// Targeted scans waiting for a library's running scan to finish,
+    /// per library. See [`JobManager::request_scan`].
+    pending: Mutex<HashMap<i64, Vec<ScanRequest>>>,
+    /// Recent targeted-scan requests and their outcomes, newest last.
+    requests: Mutex<VecDeque<ScanRequestRecord>>,
 }
+
+/// Ids the caller already knows, so plurx does not have to guess.
+///
+/// Without these, matching is title+year parsed off a filename — the step
+/// that puts the wrong poster on a remake. The caller grabbed a specific
+/// TMDB id; telling plurx costs nothing and ends the ambiguity.
+#[derive(Clone, Debug, Default)]
+pub struct IdHints {
+    pub tmdb: Option<i64>,
+    pub imdb: Option<String>,
+    /// For an episode, the SHOW's id — an episode's own id is not what
+    /// identifies the series it belongs to.
+    pub series_tmdb: Option<i64>,
+    /// The ids belong to an ancestor (a show), not to the placed item.
+    pub episodeish: bool,
+}
+
+impl IdHints {
+    fn is_empty(&self) -> bool {
+        self.tmdb.is_none() && self.imdb.is_none() && self.series_tmdb.is_none()
+    }
+}
+
+/// One "scan exactly this" ask.
+#[derive(Clone, Debug)]
+pub struct ScanRequest {
+    pub id: String,
+    pub library_id: i64,
+    pub path: PathBuf,
+    /// Applied by the JOB, not by the endpoint — a request served from the
+    /// pending queue must apply its ids too, and an endpoint that applied
+    /// them itself would silently drop them for every request that arrived
+    /// while a scan was running. Which is most of them.
+    pub ids: Option<IdHints>,
+    pub correlation_id: Option<String>,
+    pub source: Option<String>,
+}
+
+/// What happened to a request, for the operator and for the caller polling
+/// its status.
+#[derive(Clone, Debug, Serialize)]
+pub struct ScanRequestRecord {
+    pub request_id: String,
+    pub at: i64,
+    pub library_id: i64,
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// queued | running | done | failed
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub report: Option<ScanReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub items: Option<Vec<PlacedFile>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// How many request records are kept. A debugging surface — "what happened
+/// last night" — not an audit log, and deliberately in memory: persisting it
+/// would mean a schema, a retention policy and a growth problem, for data
+/// whose value expires in hours.
+const MAX_REQUESTS: usize = 256;
 
 impl JobManager {
     fn new(store: Arc<dyn Store>, artwork_dir: PathBuf) -> Self {
@@ -148,6 +218,8 @@ impl JobManager {
             artwork_dir,
             statuses: Mutex::new(HashMap::new()),
             live: Mutex::new(HashMap::new()),
+            pending: Mutex::new(HashMap::new()),
+            requests: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -201,8 +273,226 @@ impl JobManager {
         let manager = Arc::clone(self);
         tokio::spawn(async move {
             manager.run_scan(library_id, progress, force_metadata).await;
+            // Whatever queued up while this ran is work someone was
+            // promised. A full scan covers the same files a targeted one
+            // would have, but the CALLER is still owed its answer — the
+            // item ids it asked for — so the queue drains rather than
+            // being discarded as redundant.
+            manager.drain_pending(library_id).await;
         });
         true
+    }
+
+    /// Ask for a targeted scan of one path.
+    ///
+    /// Returns `Ok(Some(scan))` when it ran now, or `Ok(None)` when the
+    /// library was already scanning and the request was queued — the caller
+    /// polls `scan_request` for the outcome.
+    ///
+    /// **Requests are coalesced, never dropped.** `trigger` returns false
+    /// while a scan runs, which is right for "the user pressed Scan twice"
+    /// and wrong here: importing a season fires one request per episode
+    /// within seconds, and dropping N−1 of them would leave most of the
+    /// season unindexed with nothing anywhere saying so. Duplicates by path
+    /// collapse (scanning the same folder twice is the same work), and the
+    /// rest are drained when the running scan finishes.
+    pub async fn request_scan(
+        self: &Arc<Self>,
+        req: ScanRequest,
+    ) -> Result<Option<TargetedScan>, TargetError> {
+        self.record_request(&req, "running", None, None).await;
+
+        let busy = {
+            let statuses = self.statuses.lock().await;
+            statuses.get(&req.library_id).is_some_and(|s| s.running)
+        };
+        if busy {
+            let mut pending = self.pending.lock().await;
+            let queue = pending.entry(req.library_id).or_default();
+            if queue.iter().any(|q| q.path == req.path) {
+                // The same folder is already waiting. Scanning it twice
+                // would produce the same rows and the same answer.
+                tracing::debug!(target: "plurxd::integrate",
+                    path = %req.path.display(), "targeted scan already pending; coalesced");
+            } else {
+                queue.push(req.clone());
+            }
+            drop(pending);
+            self.set_request_status(&req.id, "queued").await;
+            return Ok(None);
+        }
+
+        let out = self.run_targeted(&req).await;
+        match &out {
+            Ok(scan) => {
+                self.record_request(&req, "done", Some(scan), None).await;
+            }
+            Err(e) => {
+                self.record_request(&req, "failed", None, Some(e.to_string()))
+                    .await;
+            }
+        }
+        out.map(Some)
+    }
+
+    async fn run_targeted(&self, req: &ScanRequest) -> Result<TargetedScan, TargetError> {
+        let library = self
+            .store
+            .get_library(req.library_id)
+            .await
+            .map_err(TargetError::Store)?
+            .ok_or_else(|| TargetError::OutsideRoots {
+                path: req.path.display().to_string(),
+                roots: Vec::new(),
+            })?;
+        tracing::info!(
+            target: "plurxd::integrate",
+            library = req.library_id,
+            path = %req.path.display(),
+            correlation_id = req.correlation_id.as_deref().unwrap_or("-"),
+            source = req.source.as_deref().unwrap_or("-"),
+            request = %req.id,
+            "targeted scan requested"
+        );
+        let out = scan::scan_path(self.store.as_ref(), &library, &req.path).await?;
+        self.apply_ids(req, &out.items).await;
+        Ok(out)
+    }
+
+    /// Apply caller-supplied ids to what the scan placed.
+    ///
+    /// Best-effort by design: a failure here must not fail the scan. The
+    /// files are indexed and playable either way, and a missing id degrades
+    /// to the fuzzy title match plurx would have done anyway.
+    async fn apply_ids(&self, req: &ScanRequest, items: &[PlacedFile]) {
+        let Some(ids) = req.ids.as_ref().filter(|i| !i.is_empty()) else {
+            return;
+        };
+        for placed in items {
+            let target = if ids.episodeish {
+                match self.show_root(placed.item_id).await {
+                    Some(id) => id,
+                    None => continue,
+                }
+            } else {
+                placed.item_id
+            };
+            let patch = MetadataPatch {
+                tmdb_id: ids.series_tmdb.or(ids.tmdb),
+                imdb_id: if ids.episodeish {
+                    None
+                } else {
+                    ids.imdb.clone()
+                },
+                ..Default::default()
+            };
+            match self.store.apply_metadata(target, &patch).await {
+                Ok(_) => tracing::info!(
+                    target: "plurxd::integrate",
+                    item = target,
+                    tmdb = patch.tmdb_id.unwrap_or(0),
+                    correlation_id = req.correlation_id.as_deref().unwrap_or("-"),
+                    "applied caller-supplied ids"
+                ),
+                Err(e) => tracing::warn!(
+                    target: "plurxd::integrate",
+                    item = target, error = %e,
+                    correlation_id = req.correlation_id.as_deref().unwrap_or("-"),
+                    "could not apply caller-supplied ids; falling back to title matching"
+                ),
+            }
+        }
+    }
+
+    /// Walk up to the item that carries a show's identity: an episode's ids
+    /// belong to its series, not to the episode row.
+    async fn show_root(&self, item_id: i64) -> Option<i64> {
+        let mut current = self.store.get_item(item_id).await.ok()??;
+        for _ in 0..4 {
+            match current.parent_id {
+                Some(parent) => current = self.store.get_item(parent).await.ok()??,
+                None => break,
+            }
+        }
+        Some(current.id)
+    }
+
+    /// Run whatever queued up while a library was scanning. Called once a
+    /// scan finishes; the work a caller was promised must not be forgotten
+    /// just because it arrived at a busy moment.
+    async fn drain_pending(self: &Arc<Self>, library_id: i64) {
+        let queued = {
+            let mut pending = self.pending.lock().await;
+            pending.remove(&library_id).unwrap_or_default()
+        };
+        for req in queued {
+            let out = self.run_targeted(&req).await;
+            match &out {
+                Ok(scan) => self.record_request(&req, "done", Some(scan), None).await,
+                Err(e) => {
+                    self.record_request(&req, "failed", None, Some(e.to_string()))
+                        .await
+                }
+            }
+        }
+    }
+
+    /// The recent request ring, newest last.
+    pub async fn scan_requests(&self) -> Vec<ScanRequestRecord> {
+        self.requests.lock().await.iter().cloned().collect()
+    }
+
+    pub async fn scan_request(&self, id: &str) -> Option<ScanRequestRecord> {
+        self.requests
+            .lock()
+            .await
+            .iter()
+            .find(|r| r.request_id == id)
+            .cloned()
+    }
+
+    async fn record_request(
+        &self,
+        req: &ScanRequest,
+        status: &str,
+        scan: Option<&TargetedScan>,
+        error: Option<String>,
+    ) {
+        let mut ring = self.requests.lock().await;
+        if let Some(existing) = ring.iter_mut().find(|r| r.request_id == req.id) {
+            existing.status = status.to_owned();
+            existing.report = scan.map(|s| s.report.clone());
+            existing.items = scan.map(|s| s.items.clone());
+            existing.error = error;
+            return;
+        }
+        if ring.len() == MAX_REQUESTS {
+            ring.pop_front();
+        }
+        ring.push_back(ScanRequestRecord {
+            request_id: req.id.clone(),
+            at: now(),
+            library_id: req.library_id,
+            path: req.path.display().to_string(),
+            correlation_id: req.correlation_id.clone(),
+            source: req.source.clone(),
+            status: status.to_owned(),
+            report: scan.map(|s| s.report.clone()),
+            items: scan.map(|s| s.items.clone()),
+            error,
+        });
+    }
+
+    async fn set_request_status(&self, id: &str, status: &str) {
+        if let Some(r) = self
+            .requests
+            .lock()
+            .await
+            .iter_mut()
+            .find(|r| r.request_id == id)
+        {
+            r.status = status.to_owned();
+        }
     }
 
     async fn run_scan(&self, library_id: i64, progress: Arc<ScanProgress>, force_metadata: bool) {

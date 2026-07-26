@@ -17,6 +17,7 @@ mod keys;
 mod libraries;
 mod photos;
 mod plex;
+mod scan;
 pub(crate) mod stream;
 mod system;
 mod trakt;
@@ -67,6 +68,12 @@ pub fn router(state: AppState) -> Router {
         // user action; USING one is not, and those routes take ScopedKey.
         .route("/keys", get(keys::list).post(keys::create))
         .route("/keys/{id}", delete(keys::delete))
+        // Targeted scan — key-scoped, for other applications. Not under
+        // /libraries/{id} on purpose: the caller knows a path, not a plurx
+        // library id, and plurx resolving it is one less thing for two
+        // applications to keep in sync.
+        .route("/scan", post(scan::scan))
+        .route("/scan/requests/{id}", get(scan::request_status))
         // Libraries
         .route("/libraries", get(libraries::list).post(libraries::create))
         .route(
@@ -432,6 +439,321 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND, "revoking twice should 404");
+    }
+
+    // ---- targeted scan endpoint (integration plan P3) -------------------
+
+    async fn scan_key(app: &Router, admin: &str, scopes: Value) -> String {
+        let (status, created) = call(
+            app,
+            post(
+                "/api/v1/keys",
+                Some(admin),
+                json!({ "name": "monarr", "scopes": scopes }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "key create: {created}");
+        created["key_secret"].as_str().expect("secret").to_owned()
+    }
+
+    /// The route exists for machines. A user token opening it would mean the
+    /// scoped key bought nothing — you could still just hand over an admin
+    /// token and be done.
+    #[tokio::test]
+    async fn the_scan_route_takes_a_key_and_only_a_key() {
+        let app = test_app();
+        let admin = setup_admin(&app).await;
+        let body = json!({ "path": "/tmp" });
+
+        let (status, _) = call(&app, post("/api/v1/scan", Some(&admin), body.clone())).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "an admin TOKEN opened a key-scoped route"
+        );
+        let (status, _) = call(&app, post("/api/v1/scan", None, body.clone())).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // A real key without scan:trigger is Forbidden, not Unauthorized —
+        // the credential is valid, the answer is about permission.
+        let status_only = scan_key(&app, &admin, json!(["status:read"])).await;
+        let (status, _) = call(&app, post("/api/v1/scan", Some(&status_only), body)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    /// A path-mapping mistake between two containers is the likeliest failure
+    /// of this whole integration. The error has to diagnose itself.
+    #[tokio::test]
+    async fn a_path_outside_every_library_names_the_roots() {
+        let app = test_app();
+        let admin = setup_admin(&app).await;
+        let key = scan_key(&app, &admin, json!(["scan:trigger"])).await;
+        let dir = tempfile::tempdir().expect("tmp");
+        let (status, _) = call(
+            &app,
+            post(
+                "/api/v1/libraries",
+                Some(&admin),
+                json!({ "name": "Movies", "kind": "movies", "paths": [dir.path()] }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let elsewhere = tempfile::tempdir().expect("tmp2");
+        let (status, body) = call(
+            &app,
+            post(
+                "/api/v1/scan",
+                Some(&key),
+                json!({ "path": elsewhere.path(), "correlation_id": "t-42-a3f9c1" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["error"], "path is not under any library root");
+        assert!(
+            body["roots"]
+                .as_array()
+                .expect("roots")
+                .iter()
+                .any(|r| r.as_str() == Some(&dir.path().display().to_string())),
+            "the roots plurx checked must be in the body: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_relative_path_is_refused_with_a_reason() {
+        let app = test_app();
+        let admin = setup_admin(&app).await;
+        let key = scan_key(&app, &admin, json!(["scan:trigger"])).await;
+        let (status, body) = call(
+            &app,
+            post("/api/v1/scan", Some(&key), json!({ "path": "movies/Heat" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("absolute"),
+            "{body}"
+        );
+    }
+
+    /// Ask for a scan and get the finished answer, whichever path it took.
+    ///
+    /// Both outcomes are contract: 200 when the library is idle, 202 + a
+    /// request id when a scan is already running (creating a library starts
+    /// one, so this is the common case, not an edge). The point of the queue
+    /// is that a 202 still ends in the same answer — so the helper follows it
+    /// and the assertions are about the RESULT, not about which door it came
+    /// through.
+    async fn scan_and_settle(app: &Router, key: &str, body: Value) -> Value {
+        let (status, first) = call(app, post("/api/v1/scan", Some(key), body)).await;
+        if status == StatusCode::OK {
+            return first;
+        }
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "unexpected scan response: {first}"
+        );
+        let id = first["request_id"].as_str().expect("request id").to_owned();
+        for _ in 0..200 {
+            let (status, rec) =
+                call(app, get(&format!("/api/v1/scan/requests/{id}"), Some(key))).await;
+            assert_eq!(status, StatusCode::OK, "{rec}");
+            match rec["status"].as_str() {
+                Some("done") => return rec,
+                Some("failed") => panic!("queued scan failed: {rec}"),
+                _ => tokio::time::sleep(std::time::Duration::from_millis(25)).await,
+            }
+        }
+        panic!("queued scan never completed — the pending queue was dropped, not drained");
+    }
+
+    /// A request that arrives while the library is scanning must be QUEUED,
+    /// not dropped. Importing a season fires one per episode within seconds,
+    /// and `trigger` returning false for all but the first would leave most
+    /// of the season unindexed with nothing anywhere saying so.
+    #[tokio::test]
+    async fn a_request_during_a_running_scan_is_queued_and_still_answered() {
+        let app = test_app();
+        let admin = setup_admin(&app).await;
+        let key = scan_key(&app, &admin, json!(["scan:trigger", "status:read"])).await;
+
+        let dir = tempfile::tempdir().expect("tmp");
+        let movie = dir.path().join("Heat (1995)");
+        std::fs::create_dir_all(&movie).expect("mkdir");
+        std::fs::write(movie.join("Heat (1995).mkv"), b"x").expect("write");
+        // Creating the library starts a scan, so the next request lands busy.
+        call(
+            &app,
+            post(
+                "/api/v1/libraries",
+                Some(&admin),
+                json!({ "name": "Movies", "kind": "movies", "paths": [dir.path()] }),
+            ),
+        )
+        .await;
+
+        let rec = scan_and_settle(
+            &app,
+            &key,
+            json!({ "path": movie, "correlation_id": "t-7-bbb" }),
+        )
+        .await;
+        assert!(
+            rec["report"].is_object(),
+            "a queued request must end with a real report: {rec}"
+        );
+        assert_eq!(rec["correlation_id"], "t-7-bbb");
+    }
+
+    /// The happy path: a real folder under a real library, scanned now, with
+    /// the answer in the response rather than a promise to look later.
+    #[tokio::test]
+    async fn a_scan_returns_the_report_and_what_it_placed() {
+        let app = test_app();
+        let admin = setup_admin(&app).await;
+        let key = scan_key(&app, &admin, json!(["scan:trigger", "status:read"])).await;
+
+        let dir = tempfile::tempdir().expect("tmp");
+        let movie = dir.path().join("Heat (1995)");
+        std::fs::create_dir_all(&movie).expect("mkdir");
+        std::fs::write(movie.join("Heat (1995).mkv"), b"x").expect("write");
+        call(
+            &app,
+            post(
+                "/api/v1/libraries",
+                Some(&admin),
+                json!({ "name": "Movies", "kind": "movies", "paths": [dir.path()] }),
+            ),
+        )
+        .await;
+
+        let body = scan_and_settle(
+            &app,
+            &key,
+            json!({
+                "path": movie,
+                "ids": { "tmdb": 949 },
+                "hint": "movie",
+                "correlation_id": "t-42-a3f9c1",
+                "source": "monarr"
+            }),
+        )
+        .await;
+        // `added` when this request indexed it; `unchanged` when the
+        // library's own start-up scan got there first. Either way the file
+        // is in the library and the caller was told which item it became —
+        // asserting `added` specifically would be asserting a race.
+        assert!(
+            body["report"]["added"].as_i64().unwrap_or(0)
+                + body["report"]["unchanged"].as_i64().unwrap_or(0)
+                >= 1,
+            "nothing was recorded: {body}"
+        );
+        assert_eq!(
+            body["correlation_id"], "t-42-a3f9c1",
+            "the id must come back, or a caller cannot tie the answer to its question"
+        );
+        let items = body["items"].as_array().expect("items");
+        assert_eq!(items.len(), 1);
+        let item_id = items[0]["item_id"].as_i64().expect("item id");
+        assert!(items[0]["file_id"].as_i64().expect("file id") > 0);
+
+        // The ids the caller supplied were applied — this is what lets plurx
+        // skip title+year guessing, which is the step that puts the wrong
+        // poster on a remake.
+        let (status, item) =
+            call(&app, get(&format!("/api/v1/items/{item_id}"), Some(&admin))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            item["item"]["tmdb_id"], 949,
+            "caller-supplied id not applied: {item}"
+        );
+
+        // And the request is inspectable afterwards, by the key that made it.
+        let request_id = body["request_id"].as_str().expect("request id");
+        let (status, rec) = call(
+            &app,
+            get(&format!("/api/v1/scan/requests/{request_id}"), Some(&key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{rec}");
+        assert_eq!(rec["status"], "done");
+        assert_eq!(rec["correlation_id"], "t-42-a3f9c1");
+        assert_eq!(rec["source"], "monarr");
+    }
+
+    /// A scan of one folder must not disturb the rest of the library. This is
+    /// the no-prune property, asserted through the HTTP surface as well as in
+    /// the core, because it is the one that would destroy data.
+    #[tokio::test]
+    async fn a_targeted_scan_leaves_the_rest_of_the_library_alone() {
+        let app = test_app();
+        let admin = setup_admin(&app).await;
+        let key = scan_key(&app, &admin, json!(["scan:trigger", "status:read"])).await;
+
+        let dir = tempfile::tempdir().expect("tmp");
+        for name in ["Heat (1995)", "Alien (1979)"] {
+            let d = dir.path().join(name);
+            std::fs::create_dir_all(&d).expect("mkdir");
+            std::fs::write(d.join(format!("{name}.mkv")), b"x").expect("write");
+        }
+        let (_, lib) = call(
+            &app,
+            post(
+                "/api/v1/libraries",
+                Some(&admin),
+                json!({ "name": "Movies", "kind": "movies", "paths": [dir.path()] }),
+            ),
+        )
+        .await;
+        let lib_id = lib["id"].as_i64().expect("library id");
+
+        // Index both, the normal way.
+        for name in ["Heat (1995)", "Alien (1979)"] {
+            scan_and_settle(&app, &key, json!({ "path": dir.path().join(name) })).await;
+        }
+        let (_, before) = call(
+            &app,
+            get(&format!("/api/v1/libraries/{lib_id}/items"), Some(&admin)),
+        )
+        .await;
+        assert_eq!(before["items"].as_array().expect("items").len(), 2);
+
+        // Re-scan just one of them.
+        scan_and_settle(
+            &app,
+            &key,
+            json!({ "path": dir.path().join("Heat (1995)") }),
+        )
+        .await;
+
+        let (_, after) = call(
+            &app,
+            get(&format!("/api/v1/libraries/{lib_id}/items"), Some(&admin)),
+        )
+        .await;
+        assert_eq!(
+            after["items"].as_array().expect("items").len(),
+            2,
+            "scanning one folder removed the other — a targeted scan must never prune"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_request_id_is_a_404() {
+        let app = test_app();
+        let admin = setup_admin(&app).await;
+        let key = scan_key(&app, &admin, json!(["status:read"])).await;
+        let (status, _) = call(&app, get("/api/v1/scan/requests/sr-nope", Some(&key))).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

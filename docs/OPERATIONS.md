@@ -159,6 +159,75 @@ The limit needs ffmpeg 5.1 or newer (`-readrate`), and the initial burst needs
 warning if the ffmpeg it found has neither, in which case streams run unpaced
 whatever this is set to.
 
+## Pairing another application (monarr) — the runbook
+
+Another application can ask plurx to index exactly the folder it just wrote,
+instead of plurx finding it on the next scheduled sweep. Three steps.
+
+**1. Issue a key.** Settings has no keys screen yet (it lands with the rest
+of this work), so today it is one call with your admin token:
+
+```bash
+curl -sX POST http://plurx:32600/api/v1/keys \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"name":"monarr","scopes":["scan:trigger","status:read"]}'
+```
+
+The response carries `key_secret` — `plx_…` — **once**. Copy it now; it is
+not stored in a form anyone can read back, including you. Losing it means
+issuing a new key, which is the correct cost of never storing it.
+
+**2. Check what it can do.** `scan:trigger` asks for scans; `status:read`
+reads the result of one. A key holds exactly what you gave it: it cannot read
+`/api/v1/settings` (where the TMDB and Trakt secrets live), manage users,
+stream media, or mint another key. That is the entire reason keys exist
+rather than "give it an admin account" — see [SECURITY.md](SECURITY.md).
+
+**3. Point the other application at it** — plurx's URL and the `plx_` secret.
+
+### What a scan request looks like
+
+```bash
+curl -sX POST http://plurx:32600/api/v1/scan \
+  -H "Authorization: Bearer plx_…" -H 'content-type: application/json' \
+  -d '{"path":"/media/movies/Heat (1995)","ids":{"tmdb":949},
+       "correlation_id":"t-42-a3f9c1","source":"monarr"}'
+```
+
+**How to read the answer:**
+
+- `200 {"status":"scanned", "report":…, "items":[{item_id,file_id,path}]}` —
+  it ran now. `items` is what the path became; `report` counts what changed.
+- `202 {"status":"queued","request_id":"sr-…"}` — that library was already
+  scanning, so the request is queued rather than dropped. Poll
+  `GET /api/v1/scan/requests/sr-…`. This is normal, not a warning: a season
+  import fires one request per episode within seconds.
+- `422 {"error":"path is not under any library root","roots":[…]}` — **the
+  common one.** The path plurx was handed is not inside any library it knows
+  about, and the body lists the roots it checked. Nearly always a container
+  path-mapping mismatch: the other application says `/data/media/...` and
+  plurx has that same folder mounted at `/media/...`. Fix the mapping on the
+  sending side; nothing is wrong on plurx's.
+- `401` — no key, an unknown key, a revoked key, or a *user token* (user
+  tokens do not open this route by design). `403` — a real key without the
+  scope.
+
+`correlation_id` is echoed back, recorded on the request, and logged under
+the `plurxd::integrate` target, so one `grep t-42-a3f9c1` across both
+applications' logs reconstructs the whole transfer.
+
+**Where to look afterwards.** Settings → the Server card carries
+`scan_requests`: the recent asks, what they were for, and what came of them.
+If it is empty, the other application has never successfully reached plurx —
+check its URL and key before looking at anything else.
+
+**What a targeted scan will never do:** remove anything. It indexes what it
+finds under the path and touches nothing else, because it only saw one
+folder — pruning against that view would delete the rest of the library. The
+scheduled scan (per library, Settings → interval) remains the thing that
+notices files that vanished.
+
 ## Logs
 
 Structured `tracing` logs go to stdout/journald, and the same buffer is exposed

@@ -14,6 +14,11 @@ pub enum ApiError {
     Unauthorized,
     Forbidden,
     Conflict(String),
+    /// A 422 whose body carries more than a sentence — the caller needs the
+    /// data to fix the request, not just to read about it. Used for "path is
+    /// not under any library root", which lists the roots so a path-mapping
+    /// mistake between two applications diagnoses itself.
+    Unprocessable(serde_json::Value),
     Internal(String),
 }
 
@@ -25,6 +30,8 @@ impl ApiError {
             ApiError::Unauthorized => (StatusCode::UNAUTHORIZED, "authentication required".into()),
             ApiError::Forbidden => (StatusCode::FORBIDDEN, "admin privileges required".into()),
             ApiError::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
+            // Handled in `into_response`, which needs the whole body.
+            ApiError::Unprocessable(v) => (StatusCode::UNPROCESSABLE_ENTITY, v.to_string()),
             ApiError::Internal(msg) => {
                 // Detail is logged, not leaked to the client.
                 tracing::error!(error = %msg, "internal error");
@@ -39,8 +46,17 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        if let ApiError::Unprocessable(body) = self {
+            return (StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response();
+        }
         let (status, message) = self.parts();
         (status, Json(json!({ "error": message }))).into_response()
+    }
+}
+
+impl From<serde_json::Error> for ApiError {
+    fn from(err: serde_json::Error) -> Self {
+        ApiError::Internal(err.to_string())
     }
 }
 

@@ -94,6 +94,10 @@ pub struct SystemDto {
     pub users: i64,
     pub libraries: usize,
     pub active_transcodes: usize,
+    /// Recent targeted-scan requests from other applications, newest last.
+    /// The one place an operator can see that monarr is actually talking to
+    /// plurx — and what it asked for — without reading the log.
+    pub scan_requests: Vec<crate::state::ScanRequestRecord>,
     #[serde(flatten)]
     pub info: crate::state::SystemInfo,
 }
@@ -113,6 +117,7 @@ pub async fn system_info(
         users: state.store.count_users().await?,
         libraries: state.store.list_libraries().await?.len(),
         active_transcodes: state.transcode.active_sessions().await,
+        scan_requests: state.jobs.scan_requests().await,
         info: (*state.system).clone(),
     }))
 }

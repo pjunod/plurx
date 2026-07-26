@@ -670,6 +670,18 @@ async fn record_candidates(
         if let Some(ref ex) = existing {
             if ex.size == size && ex.mtime == mtime {
                 report.unchanged += 1;
+                // Unchanged is still an ANSWER. A caller that asks "what did
+                // you make of this path" gets the item either way — a file
+                // that was already indexed (because a scheduled scan beat the
+                // notification, or the same import was retried) is not a file
+                // the caller should be told nothing about.
+                if let Some(sink) = placed_sink.as_deref_mut() {
+                    sink.push(PlacedFile {
+                        item_id: ex.item_id,
+                        file_id: ex.id,
+                        path: path_str.clone(),
+                    });
+                }
                 // An NFO written *after* the file was scanned still seeds: the
                 // check is on the item, not on the file's size+mtime. Costs
                 // one stat per unseeded home video, and no probe.
