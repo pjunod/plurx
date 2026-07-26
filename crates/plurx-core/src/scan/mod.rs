@@ -64,6 +64,11 @@ pub struct ScanReport {
     /// `errors` too — an item that can't be described can't have its playback
     /// decided, only guessed.
     pub degraded: usize,
+    /// Files whose media details were recovered on this run after an earlier
+    /// probe failed — the permissions were fixed, the disk came back. Counted
+    /// inside `unchanged` (nothing about the file itself changed), and reported
+    /// separately because it is the visible half of a repair.
+    pub repaired: usize,
     pub errors: usize,
     /// Home libraries only: items whose metadata was seeded from an `.nfo`
     /// sidecar on this run. Seeding happens at most once per item, ever.
@@ -113,6 +118,77 @@ impl ScanReport {
             ));
         }
     }
+}
+
+/// What a re-probe pass did. Its own type rather than a [`ScanReport`] because
+/// nothing here walks the disk: no file is added, removed or reconciled, and
+/// saying so with empty scan counters would invite reading them as real.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct ReprobeReport {
+    /// Files that had no media details when the pass started.
+    pub attempted: usize,
+    /// Files that have them now.
+    pub repaired: usize,
+    /// Files that failed again — same reason or a new one; see `problems`.
+    pub still_failing: usize,
+    /// Files whose record had vanished (or whose path had) by the time the pass
+    /// reached them. Not an error: a rescan removed them, which is correct.
+    pub gone: usize,
+    pub problems: Vec<String>,
+}
+
+/// Re-run ffprobe over files whose probe never succeeded, and record whatever
+/// it says now.
+///
+/// This exists because the incremental scan is keyed on size and mtime, and the
+/// usual fixes for a failed probe — `chmod`, remounting a share, replacing a
+/// truncated download with the same bytes — change neither. Without a way to
+/// ask again, a file that failed once is a permanent placeholder in the
+/// library: no codec, no duration, and playback decisions made by guessing.
+///
+/// `files` are the records to retry; pass [`Store::files_missing_probe`] to
+/// sweep a library, or one item's files for a single "reanalyze". Sequential on
+/// purpose, like the scan: a repair pass must not thrash a NAS either.
+pub async fn reprobe_files(
+    store: &dyn Store,
+    files: &[crate::domain::MediaFile],
+) -> Result<ReprobeReport, StoreError> {
+    let mut report = ReprobeReport::default();
+    for file in files {
+        report.attempted += 1;
+        let path_str = file.path.to_string_lossy().into_owned();
+        // Re-stat rather than trusting the stored size/mtime: if the file has
+        // changed since, the fresh values are what belong in the record.
+        let (size, mtime) = match file_stat(&file.path) {
+            Ok(stat) => stat,
+            Err(e) => {
+                report.gone += 1;
+                tracing::warn!(path = %path_str, error = %e, "cannot stat file during re-probe");
+                report.problems.push(format!(
+                    "`{path_str}` could not be read at all: {e} — check that the path still \
+                     exists and is readable by the plurx user"
+                ));
+                continue;
+            }
+        };
+        match probe::probe(&file.path).await {
+            Ok(probe) => {
+                store
+                    .upsert_file(file.item_id, &path_str, size, mtime, &probe)
+                    .await?;
+                report.repaired += 1;
+                tracing::info!(path = %path_str, "media details recovered");
+            }
+            Err(e) => {
+                report.still_failing += 1;
+                tracing::error!(path = %path_str, error = %e, "re-probe failed");
+                report
+                    .problems
+                    .push(format!("`{path_str}` still has no media details: {e}"));
+            }
+        }
+    }
+    Ok(report)
 }
 
 /// Cap on individual problem messages recorded per scan (the counts still
@@ -297,6 +373,36 @@ pub async fn scan_library_with_progress(
                             for note in nfo_notes {
                                 report.note(note);
                             }
+                        }
+                    }
+                }
+                // One exception to "unchanged means untouched": a file whose
+                // probe never succeeded. Size and mtime don't move when the
+                // reason it failed is fixed — a `chmod` leaves both alone — so
+                // nothing else would ever mark it worth another look, and it
+                // would sit in the library forever with no codec and no
+                // duration. Retried *in place*, against the item it already
+                // belongs to: re-running placement here would re-derive the
+                // item from the filename and orphan a home video that had been
+                // renamed by an NFO or by hand.
+                if !ex.probed {
+                    match probe::probe(&path).await {
+                        Ok(probe) => {
+                            store
+                                .upsert_file(ex.item_id, &path_str, size, mtime, &probe)
+                                .await?;
+                            report.repaired += 1;
+                            tracing::info!(path = %path_str, "media details recovered on rescan");
+                        }
+                        Err(e) => {
+                            tracing::error!(path = %path_str, error = %e, "probe still failing");
+                            report.errors += 1;
+                            report.degraded += 1;
+                            report.note(format!(
+                                "still no media details for `{path_str}`: {e} — it plays, but \
+                                 without codec, duration or track info its playback decisions \
+                                 are guesses"
+                            ));
                         }
                     }
                 }
@@ -787,11 +893,20 @@ mod tests {
         assert_eq!(sandcastle.recorded_at.as_deref(), Some("2019-06-14"));
         assert!(sandcastle.nfo_seeded_at.is_none());
 
-        // Rescan: nothing changed, and nothing re-seeds.
+        // Rescan: nothing changed, and nothing re-seeds. (These fixtures are
+        // garbage bytes, so each one's probe is retried and fails again — the
+        // repair path — which leaves them `unchanged` and `degraded`.)
         let r = scan_library(&store, &lib).await.expect("rescan");
         assert_eq!(r.added, 0);
         assert_eq!(r.unchanged, 4);
         assert_eq!(r.seeded, 0);
+        assert_eq!(r.repaired, 0);
+        // The repair retries the probe **in place**. Re-running placement here
+        // would re-derive "Christmas 2019" from the filename, miss the item the
+        // NFO renamed to "Christmas morning", create a second one, and prune the
+        // first — losing every hand edit on it. This assert is that bug's tomb.
+        assert_eq!(r.pruned_items, 0, "a repair must not re-place items");
+        assert_eq!(r.updated, 0);
 
         // (a) A hand edit survives a rewritten NFO — the sidecar is dead to
         // plurx once consumed. This is the whole seed-once contract.
@@ -1215,16 +1330,63 @@ mod tests {
         assert_eq!(r.unreadable, 0);
         assert_eq!(r.errors, r.degraded + r.unreadable);
 
-        // Rescanning changes nothing on disk: now everything is unchanged, and
-        // an unchanged file is never re-probed, so nothing is degraded again.
+        // Rescanning changes nothing on disk, so every file is unchanged — but
+        // these fixtures are garbage bytes, so their probe failed, and a file
+        // with no media details IS re-probed on every scan (that is the whole
+        // repair path: a chmod doesn't move size or mtime). It stays in the
+        // `unchanged` bucket while failing again, which is what keeps the
+        // partition true.
         let r = scan_library(&store, &lib).await.expect("rescan");
         assert_eq!(
             r.added + r.updated + r.unchanged + r.skipped + r.unreadable,
             found
         );
         assert_eq!(r.unchanged, found);
-        assert_eq!(r.degraded, 0, "unchanged files are not re-probed");
-        assert_eq!(r.errors, 0);
+        assert_eq!(r.updated, 0, "a repair attempt is not an edit");
+        assert_eq!(r.degraded, found, "still no media details");
+        assert_eq!(r.repaired, 0, "and nothing was recovered");
+        assert_eq!(r.errors, r.degraded);
+    }
+
+    /// The retry path itself: a file whose probe failed is picked up by
+    /// `files_missing_probe` and re-probed on demand, without a scan.
+    #[tokio::test]
+    async fn failed_probes_are_retryable_without_a_rescan() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        let dir = tempfile::tempdir().expect("tmp");
+        write_fake_video(dir.path(), "Movie (2024).mkv").await;
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "Movies".into(),
+                kind: LibraryKind::Movies,
+                paths: vec![dir.path().to_path_buf()],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+        scan_library(&store, &lib).await.expect("scan");
+
+        let broken = store
+            .files_missing_probe(Some(lib.id))
+            .await
+            .expect("missing");
+        assert_eq!(broken.len(), 1, "the garbage fixture never probed");
+        assert!(!broken[0].probed);
+
+        // ffprobe still refuses it, so the pass reports it as still failing —
+        // with the file named, per the report's contract.
+        let report = reprobe_files(&store, &broken).await.expect("reprobe");
+        assert_eq!(report.attempted, 1);
+        assert_eq!(report.repaired, 0);
+        assert_eq!(report.still_failing, 1);
+        assert_eq!(report.problems.len(), 1);
+        assert!(report.problems[0].contains("Movie (2024).mkv"));
+
+        // A file that vanished between scan and retry is `gone`, not an error.
+        std::fs::remove_file(dir.path().join("Movie (2024).mkv")).expect("rm");
+        let report = reprobe_files(&store, &broken).await.expect("reprobe");
+        assert_eq!(report.gone, 1);
+        assert_eq!(report.still_failing, 0);
     }
 
     #[tokio::test]

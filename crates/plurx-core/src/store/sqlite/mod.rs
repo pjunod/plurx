@@ -301,9 +301,14 @@ fn item_from_row(row: &Row<'_>, base: usize) -> rusqlite::Result<Item> {
     })
 }
 
+// `probe_json IS NOT NULL` is the fingerprint of a probe that succeeded: a
+// failure records the file with `ProbeResult::default()`, leaving the raw JSON
+// null and every media column empty. Selected as a column so callers can tell
+// "we have no details" from "the details say nothing".
 const FILE_COLS: &str = "id, item_id, path, size, mtime, duration_ms, container, video_codec, \
      video_profile, width, height, bit_depth, hdr, bitrate, audio_streams, \
-     subtitle_streams, scanned_at, hdr_format, audio_offset_ms";
+     subtitle_streams, scanned_at, hdr_format, audio_offset_ms, \
+     (probe_json IS NOT NULL)";
 
 fn file_from_row(row: &Row<'_>) -> rusqlite::Result<MediaFile> {
     let path: String = row.get(2)?;
@@ -331,6 +336,7 @@ fn file_from_row(row: &Row<'_>) -> rusqlite::Result<MediaFile> {
         scanned_at: row.get(16)?,
         hdr_format: row.get(17)?,
         audio_offset_ms: row.get(18)?,
+        probed: row.get::<_, i64>(19)? != 0,
     })
 }
 

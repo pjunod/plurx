@@ -73,6 +73,7 @@ pub fn router(state: AppState) -> Router {
         .route("/libraries/{id}/items", get(browse::list_items))
         // Browse
         .route("/items/{id}", get(browse::item_detail).patch(items::edit))
+        .route("/items/{id}/reanalyze", post(items::reanalyze))
         .route("/hubs", get(browse::hubs))
         .route("/search", get(browse::search))
         // Watch
@@ -1426,6 +1427,68 @@ mod tests {
             .await
             .0,
             StatusCode::NOT_FOUND
+        );
+
+        // Reanalyze: admin-only, 404 for an item that isn't there, and for a
+        // real item it reports per-file rather than pretending to succeed. The
+        // seeded file is 31 placeholder bytes, so ffprobe refuses it — which is
+        // exactly the shape this endpoint exists to report honestly.
+        assert_eq!(
+            call(
+                &app,
+                post(
+                    &format!("/api/v1/items/{}/reanalyze", s.movie),
+                    None,
+                    json!({})
+                )
+            )
+            .await
+            .0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            call(
+                &app,
+                post("/api/v1/items/999999/reanalyze", Some(&admin), json!({}))
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+        // Nothing to analyze is a 400 that says so, not a cheerful empty report.
+        // (The seed hangs its one file off the episode — same path, so the
+        // upsert moved it — which makes the movie the natural case here.)
+        assert_eq!(
+            call(
+                &app,
+                post(
+                    &format!("/api/v1/items/{}/reanalyze", s.movie),
+                    Some(&admin),
+                    json!({})
+                )
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+        let (st, report) = call(
+            &app,
+            post(
+                &format!("/api/v1/items/{}/reanalyze", s.ep),
+                Some(&admin),
+                json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "body: {report:?}");
+        assert_eq!(report["attempted"], 1);
+        assert_eq!(report["repaired"], 0, "placeholder bytes are not media");
+        assert_eq!(report["still_failing"], 1);
+        assert!(
+            report["problems"][0]
+                .as_str()
+                .is_some_and(|p| p.contains("Heat.mp4")),
+            "the file that failed is named: {report:?}"
         );
 
         // Settings round-trip.

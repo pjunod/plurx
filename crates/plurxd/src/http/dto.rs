@@ -167,6 +167,11 @@ pub struct FileDto {
     /// wrong container mount) — the client shows this and refuses to "play"
     /// something that isn't there. Set by the handler, not from the row.
     pub available: bool,
+    /// Did ffprobe ever succeed on this file? `false` means every media field
+    /// above is empty because nothing was ever read — not because the file has
+    /// no video. The item page says so and offers a re-analyze, since the usual
+    /// cause (permissions) is fixed outside plurx and leaves no other trace.
+    pub probed: bool,
     /// Full server-side path, shown to admins when a file is missing so they
     /// can fix the mount. Only populated for missing files.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -197,6 +202,7 @@ impl From<MediaFile> for FileDto {
             audio_streams: f.audio_streams,
             subtitle_streams: f.subtitle_streams,
             available: true,
+            probed: f.probed,
             missing_path: None,
         }
     }

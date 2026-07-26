@@ -646,6 +646,30 @@ impl MediaStore for SqliteStore {
         .await
     }
 
+    async fn files_missing_probe(
+        &self,
+        library_id: Option<i64>,
+    ) -> Result<Vec<MediaFile>, StoreError> {
+        self.with_conn(move |conn| {
+            // Narrowed through a subquery rather than a join: `FILE_COLS` is
+            // unqualified, and joining `items` would make `id` ambiguous.
+            // Oldest scan first, so a capped retry pass works through the
+            // backlog instead of re-trying the same few files forever.
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {FILE_COLS} FROM files
+                 WHERE probe_json IS NULL
+                   AND (?1 IS NULL
+                        OR item_id IN (SELECT id FROM items WHERE library_id = ?1))
+                 ORDER BY scanned_at ASC, id ASC"
+            ))?;
+            let files = stmt
+                .query_map(params![library_id], file_from_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(files)
+        })
+        .await
+    }
+
     async fn child_counts(&self, ids: &[i64]) -> Result<HashMap<i64, i64>, StoreError> {
         if ids.is_empty() {
             return Ok(HashMap::new());

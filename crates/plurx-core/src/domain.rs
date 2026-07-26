@@ -285,6 +285,12 @@ pub struct MediaFile {
     /// Applied server-side at stream time (forces remux for direct-play
     /// sources). Persisted per file — a bad mux stays fixed. 0 = none.
     pub audio_offset_ms: i64,
+    /// Did ffprobe ever succeed on this file? `false` means the record is a
+    /// placeholder — no codec, no duration, no tracks — and playback decisions
+    /// for it are guesses. It is also the retry signal: a file that failed on
+    /// permissions keeps its size and mtime when the permissions are fixed, so
+    /// nothing else would ever mark it as worth looking at again.
+    pub probed: bool,
 }
 
 /// Everything the prober learned about one file.

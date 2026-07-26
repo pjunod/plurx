@@ -48,6 +48,14 @@ anime.
 - **Incremental rescan:** unchanged files are skipped by size + mtime, so a
   rescan of a large library is cheap. Vanished files are reconciled (the item
   reflects what's actually on disk).
+- **Repairable inspection.** A file whose probe failed — bad permissions, an
+  unmounted share, a half-copied download — is retried on every scan, because
+  the fixes for all three leave size and mtime untouched and it would otherwise
+  sit in the library forever with no codec and no duration. The item page says
+  so in as many words and gives admins a **⟳ Reanalyze** button
+  (`POST /api/v1/items/:id/reanalyze`); ffprobe's own reason for refusing is
+  carried into the scan report and the log, since *Permission denied* and
+  *Invalid data* need opposite fixes.
 - **Multiple versions per item:** two files of the same movie (a 2160p remux and
   a 1080p encode) attach to one item, ordered best-first (height, then bitrate).
 - **Live scan status** per library: `scanning… N / M files`, then `fetching

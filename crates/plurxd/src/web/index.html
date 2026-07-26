@@ -506,6 +506,10 @@
   .epwatched{color:var(--good)}
   .filemissing{margin-top:16px;background:#2a1416;border:1px solid #5a2a2e;color:#f7b6ba;border-radius:10px;padding:12px 14px;font-size:13px}
   .filemissing code{background:rgba(0,0,0,.3);padding:1px 5px;border-radius:4px;font-size:12px}
+  /* Amber, not red: the file is in the library and it plays — what's missing is
+     what we know about it. */
+  .unprobed{margin-top:10px;background:#2a2413;border:1px solid #5a4d22;color:#f0d79a;
+    border-radius:10px;padding:10px 12px;font-size:12.5px;line-height:1.5}
   .missbadge{display:inline-block;background:#5a2a2e;color:#f7b6ba;font-size:10px;padding:1px 6px;border-radius:5px;vertical-align:middle;margin-left:6px;text-transform:uppercase;letter-spacing:.05em}
   .art.ph.season{background:linear-gradient(160deg,#2b3350,#141826);flex-direction:column;gap:1px}
   .art.ph.season .snum{font-size:38px;line-height:1}
@@ -1401,6 +1405,29 @@ function specBlock(f){
     <dt>Audio</dt><dd>${esc(aud)}</dd>
     <dt>File</dt><dd class="fn">${esc(f.filename)}${file?" · "+esc(file):""}</dd></dl>`;
 }
+// A file whose probe never succeeded shows "Video —  Audio —" and no reason.
+// Say why the dashes are there, and — for an admin — offer the way out: the
+// scan is keyed on size+mtime, so a `chmod` that fixes the cause changes
+// nothing a rescan would notice.
+function unprobedNote(f,itemId){
+  if(f.probed!==false || !f.available) return '';
+  const act = ME&&ME.is_admin
+    ? `<button class="ghost sm" style="margin-top:8px" onclick="reanalyze(${itemId},this)">⟳ Reanalyze</button>`
+    : '';
+  return `<div class="unprobed">⚠ plurx couldn’t read this file’s media details — usually file
+    permissions, a half-copied download, or an unmounted share at the time it was scanned. It
+    still plays, but every playback decision for it is a guess.${act}</div>`;
+}
+async function reanalyze(itemId,btn){
+  const label=btn.textContent; btn.disabled=true; btn.textContent="Analyzing…";
+  try{
+    const r=await api(`/items/${itemId}/reanalyze`,{method:"POST"});
+    if(r.repaired){ toast(`Read ${r.repaired} file${r.repaired>1?"s":""} — details updated`); render(); }
+    else if(r.gone) toast("The file isn’t readable at that path any more");
+    else toast((r.problems&&r.problems[0])||"ffprobe still can’t read it");
+  }catch(e){ toast(e.message||"Reanalyze failed"); }
+  finally{ btn.disabled=false; btn.textContent=label; }
+}
 function epThumb(ep){
   const art=ep.poster||ep.backdrop;
   const pct=progressPct(ep.watch);
@@ -1501,7 +1528,7 @@ async function viewItem(id){
       const header=(multi||miss)
         ? `<div class="vh"><span class="vbadges">${specBadges(v)||`<span class="vt">${esc(v.filename)}</span>`}${miss?'<span class="missbadge">missing</span>':''}</span>${(!miss&&multi)?`<button class="ghost sm" onclick='play(${v.id},${esc(JSON.stringify(it.title))},${resume},${v.duration_ms||0},${esc(JSON.stringify(pmeta))})'>▶ Play</button>`:''}</div>`
         : '';
-      return `<div class="version">${header}${specBlock(v)}${miss&&ME.is_admin&&v.missing_path?`<div class="problem">${esc(v.missing_path)}</div>`:''}</div>`;
+      return `<div class="version">${header}${specBlock(v)}${miss&&ME.is_admin&&v.missing_path?`<div class="problem">${esc(v.missing_path)}</div>`:''}${unprobedNote(v,it.id)}</div>`;
     }).join("");
   } else if(d.children.length && d.children[0].kind==='episode'){
     // Season: episodes as a list.

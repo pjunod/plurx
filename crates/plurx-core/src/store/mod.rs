@@ -233,6 +233,14 @@ pub trait MediaStore: Send + Sync + 'static {
     /// The raw ffprobe JSON captured at scan time (for the declared per-stream
     /// start-time readout in the player's sync menu).
     async fn get_file_probe_json(&self, file_id: i64) -> Result<Option<String>, StoreError>;
+    /// Files whose probe never succeeded (`probe_json IS NULL`), oldest scan
+    /// first. `library_id` narrows to one library; `None` is server-wide. These
+    /// are the records the retry job and the scan's repair pass exist for —
+    /// nothing about them changes on disk when the reason they failed is fixed.
+    async fn files_missing_probe(
+        &self,
+        library_id: Option<i64>,
+    ) -> Result<Vec<MediaFile>, StoreError>;
     /// All known file paths in a library (for vanished-file detection).
     async fn library_file_paths(&self, library_id: i64) -> Result<Vec<(i64, PathBuf)>, StoreError>;
     async fn delete_files(&self, ids: &[i64]) -> Result<u64, StoreError>;

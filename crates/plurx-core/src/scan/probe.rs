@@ -22,15 +22,40 @@ fn ffprobe_bin() -> String {
         .unwrap_or_else(|| "ffprobe".to_owned())
 }
 
+/// Distill ffprobe's stderr into one line for the scan report. ffprobe prefixes
+/// most complaints with the input path, which the report already prints, so the
+/// last non-empty line's text after the final `: ` is the useful part.
+fn probe_failure_reason(stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let last = text
+        .lines()
+        .map(str::trim)
+        .rfind(|l| !l.is_empty())
+        .unwrap_or_default();
+    if last.is_empty() {
+        return "ffprobe gave no reason".to_owned();
+    }
+    // "…/file.mkv: Permission denied" → "Permission denied", but a line with no
+    // path prefix is kept whole.
+    match last.rsplit_once(": ") {
+        Some((_, reason)) if !reason.is_empty() => reason.to_owned(),
+        _ => last.to_owned(),
+    }
+}
+
 /// Probe a file. Returns a best-effort [`ProbeResult`]; unreadable/duration-less
 /// files still yield a result (with `None` fields) rather than an error, so a
 /// weird file doesn't abort a scan. Errors are reserved for ffprobe being
 /// missing or emitting unparseable output.
 pub async fn probe(path: &Path) -> Result<ProbeResult, ProbeError> {
+    // `-v error` rather than `-v quiet`: on success stderr stays empty, and on
+    // failure it holds the one thing worth reporting — *why* ffprobe refused.
+    // "Permission denied" and "Invalid data found" are opposite problems with
+    // opposite fixes, and an exit code alone tells them apart for nobody.
     let output = tokio::process::Command::new(ffprobe_bin())
         .args([
             "-v",
-            "quiet",
+            "error",
             "-print_format",
             "json",
             "-show_format",
@@ -45,6 +70,7 @@ pub async fn probe(path: &Path) -> Result<ProbeResult, ProbeError> {
         return Err(ProbeError::Failed {
             path: path.display().to_string(),
             code: output.status.code(),
+            reason: probe_failure_reason(&output.stderr),
         });
     }
     let json: Value = serde_json::from_slice(&output.stdout)

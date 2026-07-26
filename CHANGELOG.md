@@ -66,6 +66,26 @@ bump may break compatibility and a **patch** bump never does.
   place; the upgrade is covered by a fixture test that builds a v5 database and
   asserts every row survives.
 
+### Added
+
+- **A file whose probe failed can be read again.** A movie added while its
+  permissions were wrong showed `Video —  Audio —` forever: the scan is
+  incremental on size and mtime, and `chmod` moves neither, so every later scan
+  skipped the file and nothing in the UI offered a way to ask again. Three
+  things now close that: the scan retries any file with no media details (in
+  place, against the item it already belongs to — re-deriving the item from the
+  filename would orphan a home video renamed by an NFO or by hand); a
+  **⟳ Reanalyze** button appears on the item page for admins, next to a plain
+  explanation of why the dashes are there; and `POST /api/v1/items/:id/reanalyze`
+  does the same over the API, reporting per file whether it was repaired, still
+  failing, or gone. A scan that fixes something says so — *repaired* is its own
+  count, inside `unchanged`, because nothing about the file changed on disk.
+- **ffprobe now says why it refused.** It ran under `-v quiet`, so a failure
+  produced an exit code and nothing else, and "Permission denied" was
+  indistinguishable from "Invalid data found when processing input" — a
+  permissions problem and a corrupt file, which have opposite fixes. Failures
+  now carry ffprobe's own last line of stderr into the scan report and the log.
+
 ### Fixed
 
 - The crammed `102` form is understood. DVD-era rips write season and episode
