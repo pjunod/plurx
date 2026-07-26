@@ -267,44 +267,87 @@ pub fn parse_home_media(path: &Path) -> ParsedHomeMedia {
     }
 }
 
-/// Parse a TV episode from its path, or `None` if no S/E marker is present
-/// anywhere in the filename.
+/// A season/episode marker found in some name, and where in that name it
+/// started (everything before it is the show title, everything after is the
+/// episode title).
+struct Marker {
+    season: i32,
+    episode: i32,
+    start: usize,
+}
+
+/// Find the first `SxxEyy` (or `1x02`) marker in a single name — a filename
+/// stem or a directory name.
+fn find_marker(name: &str) -> Option<Marker> {
+    let captures = SXXEYY.captures(name).or_else(|| NX_NN.captures(name))?;
+    Some(Marker {
+        season: captures.get(1)?.as_str().parse().ok()?,
+        episode: captures.get(2)?.as_str().parse().ok()?,
+        start: captures.get(0)?.start(),
+    })
+}
+
+/// Filenames that describe the *file's* role rather than its content. These
+/// never inherit their folder's episode marker: a 30-second sample sitting
+/// beside the episode would otherwise become a second file on that episode and
+/// could out-sort the real one (`files_for_item` ties on height, then path).
+const NON_EPISODE_STEMS: &[&str] = &["sample", "trailer", "proof", "screens", "rarbg"];
+
+fn is_non_episode_stem(stem: &str) -> bool {
+    stem.to_lowercase()
+        .split(['.', '-', '_', ' '])
+        .any(|token| NON_EPISODE_STEMS.contains(&token))
+}
+
+/// Parse a TV episode from its path, or `None` if no S/E marker is present in
+/// the filename or on the folder holding it.
 pub fn parse_episode(path: &Path) -> Option<ParsedEpisode> {
     let stem = path
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or_default();
 
-    // Both the SxxEyy and the NxNN forms yield (season, episode, marker start).
-    let captures = SXXEYY.captures(stem).or_else(|| NX_NN.captures(stem))?;
-    let whole = captures.get(0)?;
-    let (season, episode, marker_start) = (
-        captures.get(1)?.as_str().parse().ok()?,
-        captures.get(2)?.as_str().parse().ok()?,
-        whole.start(),
-    );
+    // Directory names, nearest first: [parent, grandparent, ...].
+    let dirs: Vec<&str> = path
+        .ancestors()
+        .skip(1)
+        .filter_map(|p| p.file_name())
+        .filter_map(|s| s.to_str())
+        .collect();
 
-    // Show title: prefer a clean show folder (grandparent when inside a
-    // "Season NN" dir), else the text before the S/E marker in the filename.
-    let parent = path.parent();
-    let parent_name = parent
-        .and_then(|p| p.file_name())
-        .and_then(|s| s.to_str())
-        .unwrap_or_default();
-    let grandparent_name = parent
-        .and_then(|p| p.parent())
-        .and_then(|p| p.file_name())
-        .and_then(|s| s.to_str())
-        .unwrap_or_default();
+    // The marker normally lives in the filename. Plenty of releases put it on
+    // the *folder* instead and name the file after a hash
+    // (`Show.S01E06.480p.DVD.x265/956a4a82….mkv`), so fall back to the
+    // immediate parent — the same directory the show title already comes from.
+    // `depth` is how far up the name we ended up using lives, so the show-title
+    // search below starts above it rather than re-reading it.
+    let (source, marker, depth) = match find_marker(stem) {
+        Some(m) => (stem, m, 0usize),
+        None => {
+            let dir = *dirs.first()?;
+            // A "Season 02" dir carries a season but no episode, and a sample
+            // is not the episode — neither may borrow the folder's marker.
+            if SEASON_DIR.is_match(dir) || is_non_episode_stem(stem) {
+                return None;
+            }
+            (dir, find_marker(dir)?, 1usize)
+        }
+    };
+    let (season, episode, marker_start) = (marker.season, marker.episode, marker.start);
+
+    // Show title: prefer a clean show folder (the one above a "Season NN"
+    // dir), else the text before the S/E marker in the name that carried it.
+    let parent_name = dirs.get(depth).copied().unwrap_or_default();
+    let grandparent_name = dirs.get(depth + 1).copied().unwrap_or_default();
 
     let show_source = if SEASON_DIR.is_match(parent_name) && !grandparent_name.is_empty() {
         grandparent_name
     } else if marker_start > 0 {
-        &stem[..marker_start]
+        &source[..marker_start]
     } else if !parent_name.is_empty() && !SEASON_DIR.is_match(parent_name) {
         parent_name
     } else {
-        stem
+        source
     };
 
     let (show_title, show_year) = match extract_year(show_source) {
@@ -313,7 +356,7 @@ pub fn parse_episode(path: &Path) -> Option<ParsedEpisode> {
     };
 
     // Episode title: text after the marker, minus cruft. Empty → None.
-    let after = &stem[marker_start..];
+    let after = &source[marker_start..];
     let episode_title = after
         .split_once([' ', '.', '-', '_'])
         .map(|(_, rest)| title_before_cruft(rest))
@@ -563,6 +606,50 @@ mod tests {
     fn non_episode_returns_none() {
         assert!(ep("/tv/Show/Season 1/poster.jpg").is_none());
         assert!(ep("/tv/random movie (2020).mkv").is_none());
+    }
+
+    /// Torrent packaging: the release *folder* carries the marker and the file
+    /// inside is an MD5 hash. The old parser only read the file stem, so these
+    /// were skipped with a message that printed a path containing `S01E06`
+    /// while claiming there was no marker in it.
+    #[test]
+    fn hash_named_file_inherits_its_release_folder() {
+        let e = ep(
+            "/8tb/tv/Drawn Together/Season 1/Drawn.Together.2004.S01E06.Dirty.Pranking.Number.2.\
+             480p.DVD.x265.Panda/956a4a82d3e71a92e95bc3658e6978d7.mkv",
+        )
+        .expect("parsed from the folder name");
+        // "Season 1"'s parent is the clean show folder, so it wins the title.
+        assert_eq!(e.show_title, "Drawn Together");
+        assert_eq!((e.season, e.episode), (1, 6));
+        assert_eq!(e.episode_title.as_deref(), Some("Dirty Pranking Number 2"));
+    }
+
+    #[test]
+    fn release_folder_supplies_title_and_year_with_no_show_dir() {
+        let e = ep("/tv/The.Bear.2022.S02E05.1080p.WEB.h264-GROUP/a1b2c3d4.mkv").expect("parsed");
+        assert_eq!(e.show_title, "The Bear");
+        assert_eq!(e.show_year, Some(2022));
+        assert_eq!((e.season, e.episode), (2, 5));
+    }
+
+    #[test]
+    fn folder_fallback_only_applies_when_the_file_has_no_marker() {
+        // The file's own marker still wins over a mismatched folder.
+        let e = ep("/tv/Show.S01E06.1080p/Show.S01E07.mkv").expect("parsed");
+        assert_eq!((e.season, e.episode), (1, 7));
+    }
+
+    #[test]
+    fn folder_fallback_skips_samples_and_season_dirs() {
+        // A sample beside the episode must not become a second file on it.
+        assert!(ep("/tv/Show.S01E06.1080p.WEB/sample.mkv").is_none());
+        assert!(ep("/tv/Show.S01E06.1080p.WEB/show-sample.mkv").is_none());
+        // A season dir has a season but no episode — nothing to inherit.
+        assert!(ep("/tv/Show/Season 1/1x.mkv").is_none());
+        assert!(ep("/tv/Show/Season 01/00000000000000000000000000000000.mkv").is_none());
+        // And a plain show folder still yields nothing.
+        assert!(ep("/tv/Drawn Together/956a4a82d3e71a92e95bc3658e6978d7.mkv").is_none());
     }
 
     fn anime(p: &str) -> Option<ParsedEpisode> {

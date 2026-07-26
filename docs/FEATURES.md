@@ -27,7 +27,12 @@ anime.
 - **Identification** from filename and folder structure: Plex/Jellyfin layouts
   and scene naming for movies and `S01E02` episodes; anime **absolute
   numbering** (episode 137, no season) routed by anime detection rather than
-  forced into TVDB season shapes.
+  forced into TVDB season shapes. An episode whose filename carries nothing —
+  a hash-named `.mkv` inside `Show.S01E06.480p.x265-GROUP/` — takes its marker
+  from the folder holding it, since that is where such releases put it. A
+  `Season NN` directory and self-declared extras (`sample`, `trailer`, `proof`,
+  `screens`, `rarbg`) never inherit one: the first has no episode number, and
+  the second would attach a 30-second clip to the episode as a second version.
 - **Inspection** with `ffprobe` as ground truth: container, video codec/profile,
   width/height, bit depth, HDR type (HDR10 / HDR10+ / HLG / Dolby Vision +
   profile/level), overall bitrate, every audio track (codec, channels,

@@ -308,9 +308,13 @@ pub async fn scan_library_with_progress(
         let Some(placed) = place_item(store, library, &path).await? else {
             // Couldn't place it (e.g. a Shows file with no S/E marker).
             report.skipped += 1;
+            // Name the two places that were actually looked at. The note prints
+            // a whole path, so "no marker in the name" reads as a flat
+            // contradiction when a *higher* folder in that path does show one.
             let why = match library.kind {
                 LibraryKind::Shows => {
-                    "no season/episode marker in the name (expected something like `S01E02`)"
+                    "no season/episode marker (expected something like `S01E02`) in the file name \
+                     or on the folder directly holding it"
                 }
                 _ => "the filename couldn't be identified for this library kind",
             };

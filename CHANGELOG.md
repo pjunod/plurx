@@ -68,6 +68,22 @@ bump may break compatibility and a **patch** bump never does.
 
 ### Fixed
 
+- Episodes whose filename is a hash are found by their release folder. A common
+  torrent shape puts every identifying token on the directory —
+  `Drawn.Together.2004.S01E06.Dirty.Pranking.Number.2.480p.DVD.x265.Panda/` —
+  and names the file inside `956a4a82d3e71a92e95bc3658e6978d7.mkv`. The parser
+  only ever regexed the *filename*, so every one of these was skipped, and the
+  skip note printed the full path while claiming there was no `S01E06` in it —
+  a message that contradicted itself on screen. The marker is now read from the
+  immediate parent directory when the filename hasn't got one, which is where
+  the show title has always been read from anyway; the folder above the release
+  still wins the show name, so a file under `Drawn Together/Season 1/` is still
+  *Drawn Together* and not *Drawn.Together.2004*. Two things deliberately do not
+  inherit a folder's marker: a `Season 02` directory, which carries a season but
+  no episode, and a file whose own name says it isn't the episode (`sample`,
+  `trailer`, `proof`, `screens`, `rarbg`) — a 30-second sample beside the real
+  file would otherwise attach to the same episode and, on a resolution tie, sort
+  ahead of it. The skip message now names both places that were checked.
 - A scan that reports errors now says which files and why. The scan report has
   always carried two things — a count and a list of human-readable problems —
   but only the two library-wide failures (a missing root, an unreadable
