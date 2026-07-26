@@ -53,6 +53,22 @@ pub mod keys {
     /// When subtitles auto-select: "auto" (only when the audio isn't the
     /// preferred language) | "always" | "off".
     pub const SUB_MODE: &str = "playback.sub_mode";
+    /// Scheduled-job intervals, in minutes; "0" or absent means off, which is
+    /// the default for every one of them — upgrading a server must not
+    /// silently give it new nightly habits. Per-library scan and refresh
+    /// intervals live on the library row instead, since they differ per
+    /// library; only the server-wide jobs are settings.
+    pub const JOB_PROBE_RETRY_MINS: &str = "jobs.probe_retry_mins";
+    pub const JOB_TRANSCODE_CLEANUP_MINS: &str = "jobs.transcode_cleanup_mins";
+    /// When those last ran, unix seconds. Persisted rather than kept in memory
+    /// so restarting the server doesn't restart the clock.
+    pub const JOB_LAST_PROBE_RETRY: &str = "jobs.last_probe_retry";
+    pub const JOB_LAST_TRANSCODE_CLEANUP: &str = "jobs.last_transcode_cleanup";
+    /// Scan every library once, shortly after the server starts. "1" enables
+    /// it; absent or anything else is off. For a server that was powered down
+    /// while files landed — otherwise it waits out a whole interval (or, with
+    /// no interval set, until someone presses a button) before noticing them.
+    pub const JOB_SCAN_ON_STARTUP: &str = "jobs.scan_on_startup";
     /// How fast a remux may run, as a multiple of real time; "0" disables the
     /// limit. An unpaced remux delivers at line rate and can starve everything
     /// else sharing the link — including, over Wi-Fi, the client's own DHCP.
@@ -112,6 +128,19 @@ pub trait LibraryStore: Send + Sync + 'static {
         library: &NewLibrary,
     ) -> Result<Option<Library>, StoreError>;
     async fn delete_library(&self, id: i64) -> Result<bool, StoreError>;
+    /// Set the automatic scan/refresh intervals (minutes; `0` = off). Separate
+    /// from `update_library` because the schedule is not part of a library's
+    /// identity — the settings UI edits one without touching the other, and a
+    /// path edit must never silently reset a schedule.
+    async fn set_library_schedule(
+        &self,
+        id: i64,
+        scan_interval_mins: i64,
+        refresh_interval_mins: i64,
+    ) -> Result<Option<Library>, StoreError>;
+    /// Stamp a completed run. `refreshed` also stamps the refresh clock, since
+    /// a refresh does everything a scan does.
+    async fn mark_library_scanned(&self, id: i64, refreshed: bool) -> Result<(), StoreError>;
     async fn get_library(&self, id: i64) -> Result<Option<Library>, StoreError>;
     async fn list_libraries(&self) -> Result<Vec<Library>, StoreError>;
 }
@@ -233,6 +262,14 @@ pub trait MediaStore: Send + Sync + 'static {
     /// The raw ffprobe JSON captured at scan time (for the declared per-stream
     /// start-time readout in the player's sync menu).
     async fn get_file_probe_json(&self, file_id: i64) -> Result<Option<String>, StoreError>;
+    /// Files whose probe never succeeded (`probe_json IS NULL`), oldest scan
+    /// first. `library_id` narrows to one library; `None` is server-wide. These
+    /// are the records the retry job and the scan's repair pass exist for —
+    /// nothing about them changes on disk when the reason they failed is fixed.
+    async fn files_missing_probe(
+        &self,
+        library_id: Option<i64>,
+    ) -> Result<Vec<MediaFile>, StoreError>;
     /// All known file paths in a library (for vanished-file detection).
     async fn library_file_paths(&self, library_id: i64) -> Result<Vec<(i64, PathBuf)>, StoreError>;
     async fn delete_files(&self, ids: &[i64]) -> Result<u64, StoreError>;

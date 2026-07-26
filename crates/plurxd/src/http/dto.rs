@@ -167,6 +167,11 @@ pub struct FileDto {
     /// wrong container mount) — the client shows this and refuses to "play"
     /// something that isn't there. Set by the handler, not from the row.
     pub available: bool,
+    /// Did ffprobe ever succeed on this file? `false` means every media field
+    /// above is empty because nothing was ever read — not because the file has
+    /// no video. The item page says so and offers a re-analyze, since the usual
+    /// cause (permissions) is fixed outside plurx and leaves no other trace.
+    pub probed: bool,
     /// Full server-side path, shown to admins when a file is missing so they
     /// can fix the mount. Only populated for missing files.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -197,6 +202,7 @@ impl From<MediaFile> for FileDto {
             audio_streams: f.audio_streams,
             subtitle_streams: f.subtitle_streams,
             available: true,
+            probed: f.probed,
             missing_path: None,
         }
     }
@@ -210,6 +216,13 @@ pub struct LibraryDto {
     pub paths: Vec<String>,
     pub anime: bool,
     pub created_at: i64,
+    /// Automatic job intervals in minutes; `0` is off, which is the default.
+    pub scan_interval_mins: i64,
+    pub refresh_interval_mins: i64,
+    /// When each last finished (unix seconds), so the UI can say "last scanned
+    /// 40 minutes ago" rather than only promising a future.
+    pub last_scan_at: Option<i64>,
+    pub last_refresh_at: Option<i64>,
 }
 
 impl From<Library> for LibraryDto {
@@ -225,6 +238,10 @@ impl From<Library> for LibraryDto {
                 .collect(),
             anime: l.anime,
             created_at: l.created_at,
+            scan_interval_mins: l.scan_interval_mins,
+            refresh_interval_mins: l.refresh_interval_mins,
+            last_scan_at: l.last_scan_at,
+            last_refresh_at: l.last_refresh_at,
         }
     }
 }

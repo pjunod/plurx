@@ -144,6 +144,41 @@ pub async fn edit(
     Ok(Json(ItemDto::from(updated)))
 }
 
+/// POST /api/v1/items/:id/reanalyze (admin) — re-run ffprobe over this item's
+/// files and record what it says now.
+///
+/// The scan is incremental on size + mtime, and the fixes for a failed probe
+/// (`chmod`, remounting a share) move neither, so a file that failed once has no
+/// other way back: rescanning skips it, and re-adding the library is a
+/// sledgehammer that loses watch state. This is that way back. It re-probes
+/// every file on the item, not only the failed ones — an admin pressing
+/// "reanalyze" is saying the details on screen are wrong, and refreshing half of
+/// them is a worse answer than doing what was asked.
+pub async fn reanalyze(
+    _admin: AdminUser,
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<plurx_core::scan::ReprobeReport>, ApiError> {
+    if state.store.get_item(id).await?.is_none() {
+        return Err(ApiError::NotFound("item"));
+    }
+    let files = state.store.files_for_item(id).await?;
+    if files.is_empty() {
+        return Err(ApiError::BadRequest(
+            "this item has no files to analyze".into(),
+        ));
+    }
+    let report = plurx_core::scan::reprobe_files(state.store.as_ref(), &files).await?;
+    tracing::info!(
+        item = id,
+        repaired = report.repaired,
+        still_failing = report.still_failing,
+        gone = report.gone,
+        "reanalyze requested"
+    );
+    Ok(Json(report))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

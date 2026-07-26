@@ -240,6 +240,16 @@ const MIGRATIONS: &[&str] = &[
         VALUES (new.id, new.title, new.overview, new.tags);
     END;
     INSERT INTO items_fts(items_fts) VALUES('rebuild');",
+    // v7: scheduled jobs. Intervals are per library and in minutes, `0` = off
+    // (the default, so an upgrade changes nobody's behavior). The last-run
+    // stamps live on the row rather than in memory so a restart can't reset the
+    // clock — a server that reboots nightly would otherwise either scan on
+    // every boot or never scan at all, depending on which way that was fudged.
+    // Plain ALTERs: no CHECK to fight, so no table rebuild.
+    "ALTER TABLE libraries ADD COLUMN scan_interval_mins INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE libraries ADD COLUMN refresh_interval_mins INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE libraries ADD COLUMN last_scan_at INTEGER;
+    ALTER TABLE libraries ADD COLUMN last_refresh_at INTEGER;",
 ];
 
 /// Column list matching [`item_from_row`]. Prefix with a table alias via
@@ -301,9 +311,14 @@ fn item_from_row(row: &Row<'_>, base: usize) -> rusqlite::Result<Item> {
     })
 }
 
+// `probe_json IS NOT NULL` is the fingerprint of a probe that succeeded: a
+// failure records the file with `ProbeResult::default()`, leaving the raw JSON
+// null and every media column empty. Selected as a column so callers can tell
+// "we have no details" from "the details say nothing".
 const FILE_COLS: &str = "id, item_id, path, size, mtime, duration_ms, container, video_codec, \
      video_profile, width, height, bit_depth, hdr, bitrate, audio_streams, \
-     subtitle_streams, scanned_at, hdr_format, audio_offset_ms";
+     subtitle_streams, scanned_at, hdr_format, audio_offset_ms, \
+     (probe_json IS NOT NULL)";
 
 fn file_from_row(row: &Row<'_>) -> rusqlite::Result<MediaFile> {
     let path: String = row.get(2)?;
@@ -331,6 +346,7 @@ fn file_from_row(row: &Row<'_>) -> rusqlite::Result<MediaFile> {
         scanned_at: row.get(16)?,
         hdr_format: row.get(17)?,
         audio_offset_ms: row.get(18)?,
+        probed: row.get::<_, i64>(19)? != 0,
     })
 }
 
@@ -631,7 +647,7 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .expect("version");
         assert_eq!(version, MIGRATIONS.len() as i64);
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
 
         // Every row survives, values identical.
         let dangling: i64 = conn

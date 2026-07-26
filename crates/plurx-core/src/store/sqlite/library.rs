@@ -10,7 +10,8 @@ use crate::domain::{Library, LibraryKind, NewLibrary};
 use crate::error::StoreError;
 use crate::store::LibraryStore;
 
-const LIB_COLS: &str = "id, name, kind, paths, anime, created_at";
+const LIB_COLS: &str = "id, name, kind, paths, anime, created_at, scan_interval_mins, \
+     refresh_interval_mins, last_scan_at, last_refresh_at";
 
 fn library_from_row(row: &Row<'_>) -> rusqlite::Result<Library> {
     let kind_raw: String = row.get(2)?;
@@ -26,6 +27,10 @@ fn library_from_row(row: &Row<'_>) -> rusqlite::Result<Library> {
         paths,
         anime: row.get::<_, i64>(4)? != 0,
         created_at: row.get(5)?,
+        scan_interval_mins: row.get(6)?,
+        refresh_interval_mins: row.get(7)?,
+        last_scan_at: row.get(8)?,
+        last_refresh_at: row.get(9)?,
     })
 }
 
@@ -73,6 +78,45 @@ impl LibraryStore for SqliteStore {
                     library_from_row,
                 )
                 .optional()?)
+        })
+        .await
+    }
+
+    async fn set_library_schedule(
+        &self,
+        id: i64,
+        scan_interval_mins: i64,
+        refresh_interval_mins: i64,
+    ) -> Result<Option<Library>, StoreError> {
+        self.with_conn(move |conn| {
+            Ok(conn
+                .query_row(
+                    &format!(
+                        "UPDATE libraries
+                         SET scan_interval_mins = ?2, refresh_interval_mins = ?3
+                         WHERE id = ?1 RETURNING {LIB_COLS}"
+                    ),
+                    params![id, scan_interval_mins.max(0), refresh_interval_mins.max(0)],
+                    library_from_row,
+                )
+                .optional()?)
+        })
+        .await
+    }
+
+    async fn mark_library_scanned(&self, id: i64, refreshed: bool) -> Result<(), StoreError> {
+        self.with_conn(move |conn| {
+            // A refresh includes a scan, so it stamps both — otherwise a
+            // library on both schedules would run a scan the minute after every
+            // refresh, having just done the scan's work twice over.
+            conn.execute(
+                "UPDATE libraries
+                 SET last_scan_at = unixepoch(),
+                     last_refresh_at = CASE WHEN ?2 THEN unixepoch() ELSE last_refresh_at END
+                 WHERE id = ?1",
+                params![id, refreshed],
+            )?;
+            Ok(())
         })
         .await
     }

@@ -29,10 +29,17 @@ anime.
   numbering** (episode 137, no season) routed by anime detection rather than
   forced into TVDB season shapes. An episode whose filename carries nothing —
   a hash-named `.mkv` inside `Show.S01E06.480p.x265-GROUP/` — takes its marker
-  from the folder holding it, since that is where such releases put it. A
-  `Season NN` directory and self-declared extras (`sample`, `trailer`, `proof`,
-  `screens`, `rarbg`) never inherit one: the first has no episode number, and
-  the second would attach a 30-second clip to the episode as a second version.
+  from the folder holding it, since that is where such releases put it. The
+  crammed DVD-era form is read too (`drawn.together.102` → S01E02): standalone
+  three-digit token, seasons 1–9, with resolution and codec numbers excluded —
+  and never for anime, where `- 102` is absolute episode 102.
+- **Extras are left out, by name.** A `Season NN` directory has no episode to
+  inherit, and a file that declares itself an extra — the `-trailer` /
+  `-featurette` / `-sample` suffix convention, or *sample* / *trailer* /
+  *proof* / *screens* where an episode title can't be — is skipped rather than
+  attached to the episode as a second version, where a 30-second clip tying on
+  resolution can be served ahead of the real file. Every skip says which of
+  these rules fired.
 - **Inspection** with `ffprobe` as ground truth: container, video codec/profile,
   width/height, bit depth, HDR type (HDR10 / HDR10+ / HLG / Dolby Vision +
   profile/level), overall bitrate, every audio track (codec, channels,
@@ -41,6 +48,14 @@ anime.
 - **Incremental rescan:** unchanged files are skipped by size + mtime, so a
   rescan of a large library is cheap. Vanished files are reconciled (the item
   reflects what's actually on disk).
+- **Repairable inspection.** A file whose probe failed — bad permissions, an
+  unmounted share, a half-copied download — is retried on every scan, because
+  the fixes for all three leave size and mtime untouched and it would otherwise
+  sit in the library forever with no codec and no duration. The item page says
+  so in as many words and gives admins a **⟳ Reanalyze** button
+  (`POST /api/v1/items/:id/reanalyze`); ffprobe's own reason for refusing is
+  carried into the scan report and the log, since *Permission denied* and
+  *Invalid data* need opposite fixes.
 - **Multiple versions per item:** two files of the same movie (a 2160p remux and
   a 1080p encode) attach to one item, ordered best-first (height, then bitrate).
 - **Live scan status** per library: `scanning… N / M files`, then `fetching
@@ -49,14 +64,23 @@ anime.
   problems appear immediately.
 - **Refresh art:** re-fetch all metadata and artwork for a library, including
   backfilling season posters onto shows scanned before a poster existed.
-- *Planned (fast-follow):* live inotify watching (today: on-demand + create/
-  update rescan); manual fix-match UI.
+- **Scheduled jobs**, all off by default. Per library: a **scan** interval and a
+  **refresh art** interval (Settings → Libraries). Server-wide: **retry
+  unreadable files** and **clean transcode cache**. Intervals are minutes with a
+  floor of 15 · a refresh beats a scan when both fall due · runs are stamped on
+  completion, on the library row, so neither a slow scan nor a nightly reboot can
+  put the schedule into a spin. **Scan at startup** covers what an interval
+  can't: files that landed while the server was switched off.
+- *Planned (fast-follow):* live inotify watching (today: on-demand, scheduled,
+  and create/update rescan); manual fix-match UI.
 
 **How to read it:** a library stuck at `scanning… 0 / 0 files` with an error
 means the path isn't visible to the **server process** (the usual cause is a
 Docker mount that doesn't match the path you typed). `idle` with a low item
 count after a scan that reported many files means enrichment matched little —
-check the TMDB key.
+check the TMDB key. A scheduled scan that never seems to fire: the clock starts
+when the last run *finished*, and `last …` next to the schedule says when that
+was; a library still scanning simply skips its turn and takes the next one.
 
 ---
 

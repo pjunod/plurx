@@ -66,8 +66,89 @@ bump may break compatibility and a **patch** bump never does.
   place; the upgrade is covered by a fixture test that builds a v5 database and
   asserts every row survives.
 
+### Added
+
+- **Scheduled jobs.** plurx can now do its own housekeeping: each library has a
+  **scan** interval and a **refresh art** interval (Settings → Libraries, under
+  the library's status), and the server has two maintenance jobs — *retry
+  unreadable files* and *clean transcode cache*. Everything is **off by
+  default**: upgrading a server must not silently give it new habits at 3am.
+  Intervals are minutes with a floor of 15, since the scheduler ticks once a
+  minute and a real library scanned continuously is a NAS denial-of-service on a
+  timer. Per library rather than server-wide because a download folder and a
+  finished archive deserve different cadences. When a scan and a refresh come
+  due together the refresh wins — it already does everything the scan does, and
+  running both walks the library twice for one due moment. Runs are stamped when
+  they **finish**, on the library row: stamping the start would make a 40-minute
+  scan on an hourly schedule due again 20 minutes later, and keeping the stamp in
+  memory would mean a server that reboots nightly either scans every boot or
+  never scans at all. Scheduled runs go through the same trigger as the buttons,
+  so one can't stack on a scan already in progress; it simply waits for the next
+  tick. The decision of what is due is a pure function with its own tests
+  (`crates/plurxd/src/schedule.rs`), including the clock jumping backwards —
+  which would otherwise park a schedule for as long as the jump.
+- **Scan at startup** (off by default, Settings → Libraries). An interval
+  schedule can only measure from when the process is running, so a server that
+  was switched off overnight ignores everything that landed until its next
+  scheduled run — or, with no interval set, until someone presses a button. This
+  scans every library once, about 30 seconds after boot: late enough not to race
+  the first plays of the morning for the same disks, and enough of a pause that a
+  crash-loop can't become a scan-loop against the media volume.
+- **Transcode cache cleanup.** The reaper has always cleaned up after sessions
+  it knows about; it can't clean up after a SIGKILL, an OOM or a host reboot,
+  which leave working directories on disk that nothing will ever claim. On a 4K
+  library those are gigabytes, and the only symptom is a disk filling for no
+  visible reason. The new job sweeps any directory under the transcode root that
+  no live session owns.
+- **A file whose probe failed can be read again.** A movie added while its
+  permissions were wrong showed `Video —  Audio —` forever: the scan is
+  incremental on size and mtime, and `chmod` moves neither, so every later scan
+  skipped the file and nothing in the UI offered a way to ask again. Three
+  things now close that: the scan retries any file with no media details (in
+  place, against the item it already belongs to — re-deriving the item from the
+  filename would orphan a home video renamed by an NFO or by hand); a
+  **⟳ Reanalyze** button appears on the item page for admins, next to a plain
+  explanation of why the dashes are there; and `POST /api/v1/items/:id/reanalyze`
+  does the same over the API, reporting per file whether it was repaired, still
+  failing, or gone. A scan that fixes something says so — *repaired* is its own
+  count, inside `unchanged`, because nothing about the file changed on disk.
+- **ffprobe now says why it refused.** It ran under `-v quiet`, so a failure
+  produced an exit code and nothing else, and "Permission denied" was
+  indistinguishable from "Invalid data found when processing input" — a
+  permissions problem and a corrupt file, which have opposite fixes. Failures
+  now carry ffprobe's own last line of stderr into the scan report and the log.
+
 ### Fixed
 
+- The crammed `102` form is understood. DVD-era rips write season and episode
+  as three digits — `drawn.together.102-med.avi` is S01E02 — and plurx skipped
+  every one of them. It is tried only after `S01E02` and `1x02` fail, on a
+  standalone three-digit token, seasons 1–9 only: four digits are a year or a
+  resolution far more often than they are season 10, and inventing an episode is
+  worse than skipping one. Resolution and codec numbers are excluded by name
+  (`264` would otherwise be season 2, episode 64), and `x264`, `1080p` and
+  `480p` can't match at all because their digits touch a letter. No episode
+  title is taken from this form — what follows the digits is the release group,
+  and *Episode 2* beats *med*. Anime is deliberately exempt: there, three digits
+  after a dash are the absolute episode number, so `One Piece - 102` stays
+  episode 102 rather than becoming season 1, episode 2.
+- Samples and other extras say that's what they are, instead of claiming the
+  episode couldn't be identified. A skip note prints the whole path, so
+  "no season/episode marker … in the file name or on the folder holding it"
+  under `Drawn.Together.S01E02.DVDRip-MEDiEVAL/sample.drawn.together.102-med.avi`
+  was the same self-contradiction as before, one layer down: the file was
+  excluded on purpose and the message described a different rule. Skip reasons
+  are now produced where the decision is made rather than reconstructed after
+  the fact, so they cannot drift again. Extras are recognized two ways: the
+  Plex/Jellyfin `-trailer` / `-featurette` / `-sample` suffix convention, and
+  the words *sample*, *trailer*, *proof*, *screens* where an episode title
+  cannot be — before the marker, or anywhere in a hash-named file that borrowed
+  its folder's marker. *sample* counts anywhere, since no real episode title
+  contains it; the others are left alone inside a title, so
+  `Show.S01E02.The.Trailer.Park` is still an episode. This also catches extras
+  that carry a perfectly good marker of their own (`Show.S01E02.sample.avi`),
+  which previously attached to the episode as a second version and, tying on
+  resolution, could be picked ahead of the real file.
 - Episodes whose filename is a hash are found by their release folder. A common
   torrent shape puts every identifying token on the directory —
   `Drawn.Together.2004.S01E06.Dirty.Pranking.Number.2.480p.DVD.x265.Panda/` —

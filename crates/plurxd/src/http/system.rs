@@ -329,6 +329,12 @@ pub struct SettingsDto {
     /// How fast a remux may be delivered, as a multiple of real time. "0" means
     /// unpaced — which lets a single stream take the whole link.
     pub stream_readrate: String,
+    /// Server-wide scheduled maintenance, in minutes; 0 is off (the default).
+    /// Per-library scan/refresh intervals are on the library, not here.
+    pub probe_retry_mins: i64,
+    pub transcode_cleanup_mins: i64,
+    /// Scan every library once, ~30s after the server starts.
+    pub scan_on_startup: bool,
 }
 
 async fn settings_dto(state: &AppState) -> Result<SettingsDto, ApiError> {
@@ -358,6 +364,23 @@ async fn settings_dto(state: &AppState) -> Result<SettingsDto, ApiError> {
         .get_setting(keys::STREAM_READRATE)
         .await?
         .unwrap_or_else(|| crate::http::stream::READRATE_DEFAULT.to_string());
+    let mins = |v: Option<String>| -> i64 {
+        v.and_then(|v| v.trim().parse::<i64>().ok())
+            .unwrap_or(0)
+            .max(0)
+    };
+    let probe_retry_mins = mins(state.store.get_setting(keys::JOB_PROBE_RETRY_MINS).await?);
+    let transcode_cleanup_mins = mins(
+        state
+            .store
+            .get_setting(keys::JOB_TRANSCODE_CLEANUP_MINS)
+            .await?,
+    );
+    let scan_on_startup = state
+        .store
+        .get_setting(keys::JOB_SCAN_ON_STARTUP)
+        .await?
+        .is_some_and(|v| v.trim() == "1");
     Ok(SettingsDto {
         tmdb_configured: !tmdb_api_key.is_empty(),
         tmdb_api_key,
@@ -370,6 +393,9 @@ async fn settings_dto(state: &AppState) -> Result<SettingsDto, ApiError> {
         default_sub_lang: prefs.sub_lang,
         sub_mode: prefs.sub_mode.as_str().to_owned(),
         stream_readrate,
+        probe_retry_mins,
+        transcode_cleanup_mins,
+        scan_on_startup,
     })
 }
 
@@ -397,6 +423,10 @@ pub struct UpdateSettings {
     pub sub_mode: Option<String>,
     /// Remux delivery pace, a multiple of real time; "0" disables the limit.
     pub stream_readrate: Option<String>,
+    /// Server-wide job intervals in minutes; 0 turns one off.
+    pub probe_retry_mins: Option<i64>,
+    pub transcode_cleanup_mins: Option<i64>,
+    pub scan_on_startup: Option<bool>,
 }
 
 /// PUT /api/v1/settings (admin)
@@ -447,6 +477,36 @@ pub async fn update_settings(
         state
             .store
             .put_setting(keys::STREAM_READRATE, &parsed.to_string())
+            .await?;
+    }
+    // Job intervals: 0 = off, otherwise a floor of 15 minutes, matching the
+    // per-library schedule. The scheduler ticks once a minute, so anything
+    // shorter would be a lie dressed as a setting.
+    for (key, label, value) in [
+        (
+            keys::JOB_PROBE_RETRY_MINS,
+            "probe_retry_mins",
+            req.probe_retry_mins,
+        ),
+        (
+            keys::JOB_TRANSCODE_CLEANUP_MINS,
+            "transcode_cleanup_mins",
+            req.transcode_cleanup_mins,
+        ),
+    ] {
+        if let Some(value) = value {
+            if value < 0 || (value > 0 && value < 15) {
+                return Err(ApiError::BadRequest(format!(
+                    "{label} must be 0 (off) or at least 15 minutes"
+                )));
+            }
+            state.store.put_setting(key, &value.to_string()).await?;
+        }
+    }
+    if let Some(on) = req.scan_on_startup {
+        state
+            .store
+            .put_setting(keys::JOB_SCAN_ON_STARTUP, if on { "1" } else { "0" })
             .await?;
     }
     Ok(Json(settings_dto(&state).await?))

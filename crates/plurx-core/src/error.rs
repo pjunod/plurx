@@ -30,8 +30,16 @@ pub enum ProbeError {
     #[error("could not run ffprobe: {0}")]
     Spawn(String),
 
-    #[error("ffprobe failed for {path} (exit {code:?})")]
-    Failed { path: String, code: Option<i32> },
+    /// `reason` is ffprobe's own stderr — "Permission denied", "Invalid data
+    /// found when processing input". Without it the operator gets an exit code
+    /// and has to rerun the command by hand to learn whether the file is
+    /// corrupt or merely unreadable, which have opposite fixes.
+    #[error("ffprobe failed for {path}: {reason} (exit {code:?})")]
+    Failed {
+        path: String,
+        code: Option<i32>,
+        reason: String,
+    },
 
     #[error("could not parse ffprobe output: {0}")]
     Parse(String),

@@ -50,6 +50,19 @@ pub struct Library {
     /// metadata (REQ-META-3). Always false for movie libraries.
     pub anime: bool,
     pub created_at: i64,
+    /// Minutes between automatic scans; `0` is off, which is the default. Kept
+    /// per library because a download folder and a finished archive deserve
+    /// wildly different cadences.
+    pub scan_interval_mins: i64,
+    /// Minutes between automatic *full metadata refreshes* (the heavy job that
+    /// re-fetches even matched items). `0` is off. Measured in the same unit as
+    /// the scan interval, but sane values are days, not hours — it hits the
+    /// provider for every item in the library.
+    pub refresh_interval_mins: i64,
+    /// When the last scan/refresh *finished*, unix seconds. Persisted rather
+    /// than held in memory so a restart doesn't reset the schedule.
+    pub last_scan_at: Option<i64>,
+    pub last_refresh_at: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -285,6 +298,12 @@ pub struct MediaFile {
     /// Applied server-side at stream time (forces remux for direct-play
     /// sources). Persisted per file — a bad mux stays fixed. 0 = none.
     pub audio_offset_ms: i64,
+    /// Did ffprobe ever succeed on this file? `false` means the record is a
+    /// placeholder — no codec, no duration, no tracks — and playback decisions
+    /// for it are guesses. It is also the retry signal: a file that failed on
+    /// permissions keeps its size and mtime when the permissions are fixed, so
+    /// nothing else would ever mark it as worth looking at again.
+    pub probed: bool,
 }
 
 /// Everything the prober learned about one file.

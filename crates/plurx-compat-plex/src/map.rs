@@ -240,6 +240,7 @@ mod tests {
             subtitle_streams: vec![],
             scanned_at: 1,
             audio_offset_ms: 0,
+            probed: true,
         }
     }
 
@@ -285,6 +286,10 @@ mod tests {
             paths: vec![],
             anime: false,
             created_at: 5,
+            scan_interval_mins: 0,
+            refresh_interval_mins: 0,
+            last_scan_at: None,
+            last_refresh_at: None,
         };
         let doc = section_directory(&lib)
             .expect("movies are exposed")
@@ -305,6 +310,10 @@ mod tests {
             paths: vec![],
             anime: false,
             created_at: 5,
+            scan_interval_mins: 0,
+            refresh_interval_mins: 0,
+            last_scan_at: None,
+            last_refresh_at: None,
         };
         assert!(section_directory(&lib).is_none());
         assert!(!is_plex_visible(LibraryKind::Home));

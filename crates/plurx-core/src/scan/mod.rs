@@ -64,6 +64,11 @@ pub struct ScanReport {
     /// `errors` too — an item that can't be described can't have its playback
     /// decided, only guessed.
     pub degraded: usize,
+    /// Files whose media details were recovered on this run after an earlier
+    /// probe failed — the permissions were fixed, the disk came back. Counted
+    /// inside `unchanged` (nothing about the file itself changed), and reported
+    /// separately because it is the visible half of a repair.
+    pub repaired: usize,
     pub errors: usize,
     /// Home libraries only: items whose metadata was seeded from an `.nfo`
     /// sidecar on this run. Seeding happens at most once per item, ever.
@@ -142,6 +147,77 @@ impl ScanReport {
             ));
         }
     }
+}
+
+/// What a re-probe pass did. Its own type rather than a [`ScanReport`] because
+/// nothing here walks the disk: no file is added, removed or reconciled, and
+/// saying so with empty scan counters would invite reading them as real.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct ReprobeReport {
+    /// Files that had no media details when the pass started.
+    pub attempted: usize,
+    /// Files that have them now.
+    pub repaired: usize,
+    /// Files that failed again — same reason or a new one; see `problems`.
+    pub still_failing: usize,
+    /// Files whose record had vanished (or whose path had) by the time the pass
+    /// reached them. Not an error: a rescan removed them, which is correct.
+    pub gone: usize,
+    pub problems: Vec<String>,
+}
+
+/// Re-run ffprobe over files whose probe never succeeded, and record whatever
+/// it says now.
+///
+/// This exists because the incremental scan is keyed on size and mtime, and the
+/// usual fixes for a failed probe — `chmod`, remounting a share, replacing a
+/// truncated download with the same bytes — change neither. Without a way to
+/// ask again, a file that failed once is a permanent placeholder in the
+/// library: no codec, no duration, and playback decisions made by guessing.
+///
+/// `files` are the records to retry; pass [`Store::files_missing_probe`] to
+/// sweep a library, or one item's files for a single "reanalyze". Sequential on
+/// purpose, like the scan: a repair pass must not thrash a NAS either.
+pub async fn reprobe_files(
+    store: &dyn Store,
+    files: &[crate::domain::MediaFile],
+) -> Result<ReprobeReport, StoreError> {
+    let mut report = ReprobeReport::default();
+    for file in files {
+        report.attempted += 1;
+        let path_str = file.path.to_string_lossy().into_owned();
+        // Re-stat rather than trusting the stored size/mtime: if the file has
+        // changed since, the fresh values are what belong in the record.
+        let (size, mtime) = match file_stat(&file.path) {
+            Ok(stat) => stat,
+            Err(e) => {
+                report.gone += 1;
+                tracing::warn!(path = %path_str, error = %e, "cannot stat file during re-probe");
+                report.problems.push(format!(
+                    "`{path_str}` could not be read at all: {e} — check that the path still \
+                     exists and is readable by the plurx user"
+                ));
+                continue;
+            }
+        };
+        match probe::probe(&file.path).await {
+            Ok(probe) => {
+                store
+                    .upsert_file(file.item_id, &path_str, size, mtime, &probe)
+                    .await?;
+                report.repaired += 1;
+                tracing::info!(path = %path_str, "media details recovered");
+            }
+            Err(e) => {
+                report.still_failing += 1;
+                tracing::error!(path = %path_str, error = %e, "re-probe failed");
+                report
+                    .problems
+                    .push(format!("`{path_str}` still has no media details: {e}"));
+            }
+        }
+    }
+    Ok(report)
 }
 
 /// Cap on individual problem messages recorded per scan (the counts still
@@ -335,40 +411,64 @@ pub async fn scan_library_with_progress(
                         }
                     }
                 }
+                // One exception to "unchanged means untouched": a file whose
+                // probe never succeeded. Size and mtime don't move when the
+                // reason it failed is fixed — a `chmod` leaves both alone — so
+                // nothing else would ever mark it worth another look, and it
+                // would sit in the library forever with no codec and no
+                // duration. Retried *in place*, against the item it already
+                // belongs to: re-running placement here would re-derive the
+                // item from the filename and orphan a home video that had been
+                // renamed by an NFO or by hand.
+                if !ex.probed {
+                    match probe::probe(&path).await {
+                        Ok(probe) => {
+                            store
+                                .upsert_file(ex.item_id, &path_str, size, mtime, &probe)
+                                .await?;
+                            report.repaired += 1;
+                            tracing::info!(path = %path_str, "media details recovered on rescan");
+                        }
+                        Err(e) => {
+                            tracing::error!(path = %path_str, error = %e, "probe still failing");
+                            report.errors += 1;
+                            report.degraded += 1;
+                            report.note(format!(
+                                "still no media details for `{path_str}`: {e} — it plays, but \
+                                 without codec, duration or track info its playback decisions \
+                                 are guesses"
+                            ));
+                        }
+                    }
+                }
                 continue;
             }
         }
         let is_new = existing.is_none();
 
-        let Some(placed) = place_item(store, library, &path).await? else {
-            // Couldn't place it (e.g. a Shows file with no S/E marker).
-            report.skipped += 1;
-            // Name the two places that were actually looked at. The note prints
-            // a whole path, so "no marker in the name" reads as a flat
-            // contradiction when a *higher* folder in that path does show one.
-            let why = match library.kind {
-                LibraryKind::Shows => {
-                    "no season/episode marker (expected something like `S01E02`) in the file name \
-                     or on the folder directly holding it"
+        // Couldn't place it: `place_item` hands back the reason that actually
+        // fired, not a summary of everything that could have.
+        let placed = match place_item(store, library, &path).await? {
+            Placement::Placed(placed) => placed,
+            Placement::Skipped(why) => {
+                report.skipped += 1;
+                // Still logged per file: the log is where completeness belongs,
+                // and the report line points at it.
+                tracing::warn!(path = %path_str, "skipped: {why}");
+                let folder = skip_group_folder(library, &path);
+                let group = skips.entry(folder.clone()).or_insert_with(|| SkipGroup {
+                    folder,
+                    reason: why.to_owned(),
+                    ..SkipGroup::default()
+                });
+                group.count += 1;
+                if group.samples.len() < SKIP_SAMPLES {
+                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                        group.samples.push(name.to_owned());
+                    }
                 }
-                _ => "the filename couldn't be identified for this library kind",
-            };
-            // Still logged per file: the log is where completeness belongs,
-            // and the report line points at it.
-            tracing::warn!(path = %path_str, "skipped: {why}");
-            let folder = skip_group_folder(library, &path);
-            let group = skips.entry(folder.clone()).or_insert_with(|| SkipGroup {
-                folder,
-                reason: why.to_owned(),
-                ..SkipGroup::default()
-            });
-            group.count += 1;
-            if group.samples.len() < SKIP_SAMPLES {
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    group.samples.push(name.to_owned());
-                }
+                continue;
             }
-            continue;
         };
         let item_id = placed.id;
 
@@ -470,13 +570,20 @@ pub async fn scan_library_with_progress(
     Ok(report)
 }
 
-/// Find-or-create the item a file belongs to. `None` means the file couldn't
-/// be identified for this library kind.
+/// The outcome of trying to identify a file. A skip carries the sentence the
+/// scan report will print, written where the decision is actually made — a
+/// reason reconstructed later by the caller drifts from the code that skipped.
+enum Placement {
+    Placed(home::Placed),
+    Skipped(&'static str),
+}
+
+/// Find-or-create the item a file belongs to.
 async fn place_item(
     store: &dyn Store,
     library: &Library,
     path: &Path,
-) -> Result<Option<home::Placed>, StoreError> {
+) -> Result<Placement, StoreError> {
     match library.kind {
         LibraryKind::Movies => {
             let parsed = parse::parse_movie(path);
@@ -484,7 +591,7 @@ async fn place_item(
                 .find_movie(library.id, &parsed.title, parsed.year)
                 .await?
             {
-                return Ok(Some(home::Placed {
+                return Ok(Placement::Placed(home::Placed {
                     id: existing.id,
                     created: false,
                 }));
@@ -500,12 +607,15 @@ async fn place_item(
                     episode_number: None,
                 })
                 .await?;
-            Ok(Some(home::Placed { id, created: true }))
+            Ok(Placement::Placed(home::Placed { id, created: true }))
         }
         // Folders are the organization: the directory tree is mirrored as
         // browsable folder items, and the file itself becomes a video or a
         // photo under it.
-        LibraryKind::Home => home::place(store, library, path).await,
+        LibraryKind::Home => Ok(match home::place(store, library, path).await? {
+            Some(placed) => Placement::Placed(placed),
+            None => Placement::Skipped("it isn't a video or a photo this library can hold"),
+        }),
         LibraryKind::Shows => {
             // Anime libraries use absolute numbering; regular shows use S/E.
             let parsed = if library.anime {
@@ -513,13 +623,36 @@ async fn place_item(
             } else {
                 parse::parse_episode(path)
             };
-            let Some(parsed) = parsed else {
-                return Ok(None);
+            let parsed = match parsed {
+                Ok(parsed) => parsed,
+                // Each sentence names what was actually inspected. The report
+                // prints the whole path beside it, so a vaguer reason reads as
+                // a contradiction the moment the path itself shows a marker.
+                Err(parse::EpisodeSkip::Extra) => {
+                    return Ok(Placement::Skipped(
+                        "the file names itself an extra (`sample`, `trailer`, a `-featurette` \
+                         suffix) rather than the episode — it was left out instead of attaching \
+                         to the episode as a second version, where a 30-second clip can sort \
+                         ahead of the real file",
+                    ));
+                }
+                Err(parse::EpisodeSkip::NoMarker) if library.anime => {
+                    return Ok(Placement::Skipped(
+                        "no episode number in the file name (expected `S01E02` or an absolute \
+                         number like `- 137`)",
+                    ));
+                }
+                Err(parse::EpisodeSkip::NoMarker) => {
+                    return Ok(Placement::Skipped(
+                        "no season/episode marker (expected `S01E02`, `1x02`, or the crammed \
+                         `102` form) in the file name or on the folder directly holding it",
+                    ));
+                }
             };
             let show = find_or_create_show(store, library, &parsed).await?;
             let season = find_or_create_season(store, library, show.id, parsed.season).await?;
             if let Some(existing) = store.find_episode(season, parsed.episode).await? {
-                return Ok(Some(home::Placed {
+                return Ok(Placement::Placed(home::Placed {
                     id: existing.id,
                     created: false,
                 }));
@@ -539,7 +672,7 @@ async fn place_item(
                     episode_number: Some(parsed.episode),
                 })
                 .await?;
-            Ok(Some(home::Placed { id, created: true }))
+            Ok(Placement::Placed(home::Placed { id, created: true }))
         }
     }
 }
@@ -842,11 +975,20 @@ mod tests {
         assert_eq!(sandcastle.recorded_at.as_deref(), Some("2019-06-14"));
         assert!(sandcastle.nfo_seeded_at.is_none());
 
-        // Rescan: nothing changed, and nothing re-seeds.
+        // Rescan: nothing changed, and nothing re-seeds. (These fixtures are
+        // garbage bytes, so each one's probe is retried and fails again — the
+        // repair path — which leaves them `unchanged` and `degraded`.)
         let r = scan_library(&store, &lib).await.expect("rescan");
         assert_eq!(r.added, 0);
         assert_eq!(r.unchanged, 4);
         assert_eq!(r.seeded, 0);
+        assert_eq!(r.repaired, 0);
+        // The repair retries the probe **in place**. Re-running placement here
+        // would re-derive "Christmas 2019" from the filename, miss the item the
+        // NFO renamed to "Christmas morning", create a second one, and prune the
+        // first — losing every hand edit on it. This assert is that bug's tomb.
+        assert_eq!(r.pruned_items, 0, "a repair must not re-place items");
+        assert_eq!(r.updated, 0);
 
         // (a) A hand edit survives a rewritten NFO — the sidecar is dead to
         // plurx once consumed. This is the whole seed-once contract.
@@ -1174,10 +1316,13 @@ mod tests {
         // A show with no S/E marker anywhere reachable: not in the filename,
         // and not in the parent either — the parent is a "Season NN" folder,
         // which names a season and so refuses to lend an episode number.
+        // NOT the crammed `101` form: that IS a marker, and `SEE_CRAMMED`
+        // reads it now, so a fixture built on it would be placed, not skipped,
+        // and this test would guard nothing.
         for ep in 1..=6 {
             write_fake_video(
                 dir.path(),
-                &format!("Drawn Together/Season 1/drawn.together.10{ep}-med.avi"),
+                &format!("Drawn Together/Season 1/drawn.together-med-{ep}.avi"),
             )
             .await;
         }
@@ -1339,16 +1484,63 @@ mod tests {
         assert_eq!(r.unreadable, 0);
         assert_eq!(r.errors, r.degraded + r.unreadable);
 
-        // Rescanning changes nothing on disk: now everything is unchanged, and
-        // an unchanged file is never re-probed, so nothing is degraded again.
+        // Rescanning changes nothing on disk, so every file is unchanged — but
+        // these fixtures are garbage bytes, so their probe failed, and a file
+        // with no media details IS re-probed on every scan (that is the whole
+        // repair path: a chmod doesn't move size or mtime). It stays in the
+        // `unchanged` bucket while failing again, which is what keeps the
+        // partition true.
         let r = scan_library(&store, &lib).await.expect("rescan");
         assert_eq!(
             r.added + r.updated + r.unchanged + r.skipped + r.unreadable,
             found
         );
         assert_eq!(r.unchanged, found);
-        assert_eq!(r.degraded, 0, "unchanged files are not re-probed");
-        assert_eq!(r.errors, 0);
+        assert_eq!(r.updated, 0, "a repair attempt is not an edit");
+        assert_eq!(r.degraded, found, "still no media details");
+        assert_eq!(r.repaired, 0, "and nothing was recovered");
+        assert_eq!(r.errors, r.degraded);
+    }
+
+    /// The retry path itself: a file whose probe failed is picked up by
+    /// `files_missing_probe` and re-probed on demand, without a scan.
+    #[tokio::test]
+    async fn failed_probes_are_retryable_without_a_rescan() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        let dir = tempfile::tempdir().expect("tmp");
+        write_fake_video(dir.path(), "Movie (2024).mkv").await;
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "Movies".into(),
+                kind: LibraryKind::Movies,
+                paths: vec![dir.path().to_path_buf()],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+        scan_library(&store, &lib).await.expect("scan");
+
+        let broken = store
+            .files_missing_probe(Some(lib.id))
+            .await
+            .expect("missing");
+        assert_eq!(broken.len(), 1, "the garbage fixture never probed");
+        assert!(!broken[0].probed);
+
+        // ffprobe still refuses it, so the pass reports it as still failing —
+        // with the file named, per the report's contract.
+        let report = reprobe_files(&store, &broken).await.expect("reprobe");
+        assert_eq!(report.attempted, 1);
+        assert_eq!(report.repaired, 0);
+        assert_eq!(report.still_failing, 1);
+        assert_eq!(report.problems.len(), 1);
+        assert!(report.problems[0].contains("Movie (2024).mkv"));
+
+        // A file that vanished between scan and retry is `gone`, not an error.
+        std::fs::remove_file(dir.path().join("Movie (2024).mkv")).expect("rm");
+        let report = reprobe_files(&store, &broken).await.expect("reprobe");
+        assert_eq!(report.gone, 1);
+        assert_eq!(report.still_failing, 0);
     }
 
     #[tokio::test]

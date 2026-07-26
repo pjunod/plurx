@@ -68,11 +68,13 @@ pub fn router(state: AppState) -> Router {
             "/libraries/{id}",
             put(libraries::update).delete(libraries::delete),
         )
+        .route("/libraries/{id}/schedule", put(libraries::set_schedule))
         .route("/libraries/{id}/scan", post(libraries::scan))
         .route("/libraries/{id}/refresh", post(libraries::refresh))
         .route("/libraries/{id}/items", get(browse::list_items))
         // Browse
         .route("/items/{id}", get(browse::item_detail).patch(items::edit))
+        .route("/items/{id}/reanalyze", post(items::reanalyze))
         .route("/hubs", get(browse::hubs))
         .route("/search", get(browse::search))
         // Watch
@@ -1427,6 +1429,128 @@ mod tests {
             .0,
             StatusCode::NOT_FOUND
         );
+
+        // Reanalyze: admin-only, 404 for an item that isn't there, and for a
+        // real item it reports per-file rather than pretending to succeed. The
+        // seeded file is 31 placeholder bytes, so ffprobe refuses it — which is
+        // exactly the shape this endpoint exists to report honestly.
+        assert_eq!(
+            call(
+                &app,
+                post(
+                    &format!("/api/v1/items/{}/reanalyze", s.movie),
+                    None,
+                    json!({})
+                )
+            )
+            .await
+            .0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            call(
+                &app,
+                post("/api/v1/items/999999/reanalyze", Some(&admin), json!({}))
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+        // Nothing to analyze is a 400 that says so, not a cheerful empty report.
+        // (The seed hangs its one file off the episode — same path, so the
+        // upsert moved it — which makes the movie the natural case here.)
+        assert_eq!(
+            call(
+                &app,
+                post(
+                    &format!("/api/v1/items/{}/reanalyze", s.movie),
+                    Some(&admin),
+                    json!({})
+                )
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+        let (st, report) = call(
+            &app,
+            post(
+                &format!("/api/v1/items/{}/reanalyze", s.ep),
+                Some(&admin),
+                json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "body: {report:?}");
+        assert_eq!(report["attempted"], 1);
+        assert_eq!(report["repaired"], 0, "placeholder bytes are not media");
+        assert_eq!(report["still_failing"], 1);
+        assert!(
+            report["problems"][0]
+                .as_str()
+                .is_some_and(|p| p.contains("Heat.mp4")),
+            "the file that failed is named: {report:?}"
+        );
+
+        // Schedules: minutes, 0 = off, and a floor under anything non-zero so a
+        // dropdown can't turn a NAS into a treadmill.
+        assert_eq!(
+            call(
+                &app,
+                put(
+                    &format!("/api/v1/libraries/{}/schedule", s.lib),
+                    Some(&admin),
+                    json!({ "scan_interval_mins": 5 })
+                )
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+        let (st, lib) = call(
+            &app,
+            put(
+                &format!("/api/v1/libraries/{}/schedule", s.lib),
+                Some(&admin),
+                json!({ "scan_interval_mins": 360, "refresh_interval_mins": 10080 }),
+            ),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(lib["scan_interval_mins"], 360);
+        assert_eq!(lib["refresh_interval_mins"], 10080);
+        // Readable back through the library list, which is where the settings
+        // page gets the value it renders.
+        let (_, libs) = call(&app, get("/api/v1/libraries", Some(&admin))).await;
+        assert_eq!(libs[0]["scan_interval_mins"], 360);
+        // Turning it off is an ordinary update, not a special case.
+        let (_, lib) = call(
+            &app,
+            put(
+                &format!("/api/v1/libraries/{}/schedule", s.lib),
+                Some(&admin),
+                json!({ "scan_interval_mins": 0, "refresh_interval_mins": 0 }),
+            ),
+        )
+        .await;
+        assert_eq!(lib["scan_interval_mins"], 0);
+
+        // Scan-at-startup is a plain boolean round-trip through the same
+        // settings endpoint, off unless asked for.
+        let (_, before) = call(&app, get("/api/v1/settings", Some(&admin))).await;
+        assert_eq!(before["scan_on_startup"], false);
+        let (st, after) = call(
+            &app,
+            put(
+                "/api/v1/settings",
+                Some(&admin),
+                json!({ "scan_on_startup": true, "probe_retry_mins": 1440 }),
+            ),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(after["scan_on_startup"], true);
+        assert_eq!(after["probe_retry_mins"], 1440);
 
         // Settings round-trip.
         assert_eq!(
