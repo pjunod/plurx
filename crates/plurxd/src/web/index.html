@@ -507,12 +507,19 @@
   .filemissing{margin-top:16px;background:#2a1416;border:1px solid #5a2a2e;color:#f7b6ba;border-radius:10px;padding:12px 14px;font-size:13px}
   .filemissing code{background:rgba(0,0,0,.3);padding:1px 5px;border-radius:4px;font-size:12px}
   /* Amber, not red: the file is in the library and it plays — what's missing is
-     what we know about it. */
-  .unprobed{margin-top:10px;background:#2a2413;border:1px solid #5a4d22;color:#f0d79a;
-    border-radius:10px;padding:10px 12px;font-size:12.5px;line-height:1.5}
+     what plurx knows about it. Mixed against the panel colour the way `.setwarn`
+     is, so it reads right in both themes instead of being a dark box in a light
+     UI. The button goes on its own line; inline it collides with the text. */
+  .unprobed{margin-top:10px;background:color-mix(in srgb,#e8a33d 15%,var(--panel));
+    border:1px solid color-mix(in srgb,#e8a33d 45%,var(--line));border-radius:10px;
+    padding:11px 13px;font-size:12.5px;line-height:1.6}
+  .unprobed button{display:block;margin-top:9px}
   /* The per-library schedule, under its status: quiet until you look at it. */
-  .sched{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-top:8px;font-size:11.5px;
+  .sched{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;margin-top:8px;font-size:11.5px;
     color:var(--muted);text-transform:none;letter-spacing:0}
+  /* Each label+dropdown stays one unit: wrapping a select away from the word
+     that names it turns a narrow column into a puzzle. */
+  .schedpair{display:inline-flex;align-items:center;gap:5px;white-space:nowrap}
   .missbadge{display:inline-block;background:#5a2a2e;color:#f7b6ba;font-size:10px;padding:1px 6px;border-radius:5px;vertical-align:middle;margin-left:6px;text-transform:uppercase;letter-spacing:.05em}
   .art.ph.season{background:linear-gradient(160deg,#2b3350,#141826);flex-direction:column;gap:1px}
   .art.ph.season .snum{font-size:38px;line-height:1}
@@ -1415,9 +1422,9 @@ function specBlock(f){
 function unprobedNote(f,itemId){
   if(f.probed!==false || !f.available) return '';
   const act = ME&&ME.is_admin
-    ? `<button class="ghost sm" style="margin-top:8px" onclick="reanalyze(${itemId},this)">⟳ Reanalyze</button>`
+    ? `<button class="ghost sm" onclick="reanalyze(${itemId},this)">⟳ Reanalyze</button>`
     : '';
-  return `<div class="unprobed">⚠ plurx couldn’t read this file’s media details — usually file
+  return `<div class="unprobed">⚠ ${APP_NAME} couldn’t read this file’s media details — usually file
     permissions, a half-copied download, or an unmounted share at the time it was scanned. It
     still plays, but every playback decision for it is a guess.${act}</div>`;
 }
@@ -2883,9 +2890,9 @@ function schedRow(l){
   if(!ME||!ME.is_admin) return '';
   const last=l.last_scan_at?` · last ${esc(agoLabel(l.last_scan_at))}`:'';
   return `<div class="sched">
-    <span>Scan</span>${everySelect(`sched-scan-${l.id}`,SCAN_EVERY,l.scan_interval_mins,"How often to look for new & changed files")}
-    <span>Refresh art</span>${everySelect(`sched-ref-${l.id}`,REFRESH_EVERY,l.refresh_interval_mins,"How often to re-fetch metadata for everything — heavy; days, not hours")}
-    <button class="ghost sm" onclick="saveSchedule(${l.id},this)">Save</button><span class="muted">${last}</span></div>`;
+    <span class="schedpair">Scan ${everySelect(`sched-scan-${l.id}`,SCAN_EVERY,l.scan_interval_mins,"How often to look for new & changed files")}</span>
+    <span class="schedpair">Refresh art ${everySelect(`sched-ref-${l.id}`,REFRESH_EVERY,l.refresh_interval_mins,"How often to re-fetch metadata for everything — heavy; days, not hours")}</span>
+    <span class="schedpair"><button class="ghost sm" onclick="saveSchedule(${l.id},this)">Save</button>${last}</span></div>`;
 }
 function agoLabel(ts){
   const s=Math.max(0,Math.floor(Date.now()/1000)-ts);
