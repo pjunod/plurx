@@ -71,6 +71,38 @@ stat -c '%g' /dev/dri/renderD128           # the render group id for group_add
 
 Full symptom→cause table: [OPERATIONS.md](OPERATIONS.md#common-problems--cause).
 
+## 4. Pairing another application (monarr)
+
+Two commands. The first is run once by an admin; the second is what the other
+application does on every import.
+
+```bash
+# 1. Mint a scoped key (with an ADMIN token — not the key you are creating).
+#    The secret comes back exactly once; there is no way to read it again.
+curl -s localhost:32600/api/v1/keys \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"name":"monarr","scopes":["scan:trigger","status:read"]}'
+# → {"id":1,"name":"monarr",…,"key_secret":"plx_…"}   ← paste into monarr
+
+# 2. Tell plurx a file landed. The path is what the PLURX process sees.
+curl -s localhost:32600/api/v1/scan \
+  -H "Authorization: Bearer plx_…" -H 'Content-Type: application/json' \
+  -d '{"path":"/media/movies/Heat (1995)","ids":{"tmdb":949},"hint":"movie",
+       "correlation_id":"t-42-a3f9c1","source":"monarr"}'
+# → 200 {"status":"scanned","report":{…},"items":[{"item_id":7,…}]}
+# → 202 {"status":"queued","request_id":"sr-…"} when that library is busy;
+#       poll GET /api/v1/scan/requests/sr-… until "done".
+```
+
+| If… | Then… |
+|---|---|
+| `403` | The key is valid but lacks the scope — mint it with `scan:trigger` |
+| `422` listing roots | The path exists for the caller but not for plurx — compare the roots in the response against the two containers' mounts |
+| `202` every time | That library is scanning; the request is queued, not lost — poll the `request_id` |
+| Item appears, stays named after the file | Enrichment has no TMDB key (Settings → Metadata); the scan itself worked |
+
+Runbook, with monarr's side too: [OPERATIONS.md](OPERATIONS.md).
+
 ## Reference — where everything lives
 
 | Thing | Where |
@@ -108,6 +140,8 @@ Full symptom→cause table: [OPERATIONS.md](OPERATIONS.md#common-problems--cause
 | `GET /metrics` | Prometheus metrics |
 | `/api/v1/...` | Native JSON API (bearer token) |
 | `/api/v1/files/{id}/decision` | How a file will be served (direct / remux / transcode) + markers |
+| `/api/v1/scan` | "Index exactly this path" for another application (scoped key, `scan:trigger`) |
+| `/api/v1/keys` | Mint/list/revoke scoped API keys (admin token) |
 | Plex-compat façade | `/identity`, `/library/...`, `/:/timeline`, GDM — for Kodi-family Plex clients |
 
 ## Reference — player keyboard & controls

@@ -55,6 +55,29 @@ scope in [REQUIREMENTS.md](REQUIREMENTS.md) §5a.
 
 **Exit:** ✅ browse folders, play clips, view photos, edit metadata, thumbnails everywhere.
 
+## Integrations — plurx's side of the monarr pipeline ✅ DONE
+
+Another shippable slice, HA-neutral (targeted scans ride the same
+leader-scheduled scanner singleton as full scans). Design record:
+[INTEGRATION-PLAN.md](INTEGRATION-PLAN.md); the master plan lives in monarr's
+repo. Behaviour in [FEATURES.md](FEATURES.md) §11.
+
+- ✅ **Migration v8 — scoped API keys:** `plx_…`, SHA-256 at rest, shown once, scope list, admin CRUD. A second credential kind, so another application never needs a token that IS a user.
+- ✅ **Targeted scan:** `scan_path` indexes one path and **never prunes** — the property that separates it from a full scan, and the one whose absence would eat a library.
+- ✅ **`POST /api/v1/scan`:** path → library resolution (longest root wins), 200 with report + placed items, 202 + `request_id` when busy (queued, not dropped), `GET /api/v1/scan/requests/{id}` to poll, `correlation_id` echoed and logged on `plurxd::integrate`.
+- ✅ **Scheduled reconcile scan:** per-library intervals with completion-stamped clocks — the slow sweep underneath the fast path, catching what nobody announced.
+- ✅ **Migration v9 — enrich by id:** an id the caller supplied is used directly (movie/show detail; an IMDb id resolved in one lookup) and the title search is skipped, because the search is the step that can be wrong and a wrong TMDB id does not stay local — Trakt sync matches on it too. `metadata_at` replaces "has an id" as the enrichment marker: an item that *arrives* carrying an id needs enriching, not skipping.
+
+**Exit:** ✅ monarr finishes an import and the file is in the library seconds
+later, carrying the ids monarr already knew, with one `correlation_id`
+traceable across both applications.
+
+**Live inotify watching remains future work**, and is off the critical path
+now. What shipped instead — scheduled scans plus targeted scans — covers both
+"something changed and said so" and "something changed and didn't". A watcher
+would improve only the case where a human moves files by hand *and* wants it
+noticed sooner than the reconcile interval.
+
 ## Phase 4 — HA for real
 
 - Cluster membership: join tokens, node add/remove, health, single logical server identity

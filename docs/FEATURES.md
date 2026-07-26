@@ -10,7 +10,7 @@ Everything below is implemented and shipping as of Phase 2 (movies, TV, anime,
 playback, Plex-compat), plus the home video & photos slice, with the Phase 3
 cluster spike complete. Anything still
 on the roadmap is called out inline as *planned* with its phase, or lives in the
-[not-yet](#9-what-plurx-does-not-do) section — it is never listed as if it
+[not-yet](#12-what-plurx-does-not-do) section — it is never listed as if it
 works. Scope and phase gates live in [REQUIREMENTS.md](REQUIREMENTS.md) and
 [ROADMAP.md](ROADMAP.md).
 
@@ -395,7 +395,58 @@ page (3-second refresh) instead of dumping you into Settings.
 
 ---
 
-## 11. What plurx does NOT do
+## 11. Integrations — "something else fills the library; plurx notices at once"
+
+**What it does:** lets another application on the same box — monarr, today —
+tell plurx that a file has landed, instead of plurx finding out on its next
+sweep. Nothing here is required: plurx with no integration configured behaves
+exactly as it did before, on scheduled and manual scans alone.
+
+- **Scoped API keys** (Settings → an admin creates one). A key is what another
+  application holds *instead of* a login token, and the distinction is the
+  point: a token IS a user, so an admin token handed to a neighbouring app
+  also hands over every secret in `GET /api/v1/settings`. A key carries a
+  scope list — `scan:trigger`, `status:read` — and cannot widen itself. Stored
+  as a SHA-256 hash; the secret (`plx_…`) is shown **once**, at creation, and
+  is unrecoverable afterwards. Revoking one is a single delete and takes
+  effect on the next request.
+- **`POST /api/v1/scan`** — "index exactly this path", scope `scan:trigger`.
+  The caller sends an absolute path (a file or a folder) and plurx works out
+  which library owns it, so the caller never has to know plurx's library ids;
+  a library nested inside another resolves to the more specific one. Answers
+  **200** with the scan report and the items it placed when it can run now,
+  **202** with a `request_id` when that library is mid-scan — queued, never
+  dropped, because importing a season fires one request per episode and losing
+  most of them would leave it half-indexed. `GET /api/v1/scan/requests/{id}`
+  (scope `status:read`) reports how a queued one finished.
+- **A targeted scan never prunes.** A full scan reconciles: files it did not
+  see are gone. A targeted scan looked at one folder, so applying that rule
+  would delete the rest of the library. It adds and updates only.
+- **Ids from the caller are used, not guessed at.** A request may carry
+  `tmdb` / `imdb` (and `series` for an episode, since an episode's own id is
+  not what identifies its series). plurx stamps them on the item and
+  enrichment then fetches **by id**, skipping the title search entirely — the
+  search is the step that puts the 2015 remake's poster on the 1995 film, and
+  a wrong id does not stay local: Trakt sync matches on TMDB id too. An IMDb
+  id with no TMDB id is resolved with one lookup rather than a search. Items
+  with no ids at all are matched by title exactly as before.
+- **`correlation_id` is echoed and logged** on every request, so one grep
+  reconstructs a single transfer across every application it passed through.
+  Integration logging is on its own target (`plurxd::integrate`).
+- Pairing runbook and the two curl lines: [OPERATIONS.md](OPERATIONS.md) and
+  [CHEATSHEET.md](CHEATSHEET.md); the credential model in
+  [SECURITY.md](SECURITY.md).
+
+**How to read it:** a 422 naming plurx's library roots means the path exists
+for the caller but not for plurx — two containers with different mounts, which
+is the likeliest cause by a wide margin; compare the roots in the response
+with the path the caller sent. A 403 means the key lacks the scope, not that
+it is invalid. Items that arrive but stay titled after their filenames mean
+enrichment has no TMDB key, not that the scan failed.
+
+---
+
+## 12. What plurx does NOT do
 
 Listed so the inventory above is unambiguous — these are deliberate, with reasons:
 
@@ -404,6 +455,11 @@ Listed so the inventory above is unambiguous — these are deliberate, with reas
   them.
 - **Does not phone home or need the cloud.** No accounts hosted elsewhere, no
   plex.tv contact, no telemetry. It runs on a LAN with no internet.
+- **Does not call other applications.** The integration in §11 is entirely
+  inbound: other apps talk to plurx, plurx answers, and that is the whole of
+  it. plurx makes no outbound request except to its metadata providers and
+  Trakt, both of which you configured yourself. Pushing watch state back to
+  monarr is on the roadmap and is not built.
 - **Does not do music** (v1 scope). The data model won't preclude it; it is not
   bolted on speculatively. Photos *are* supported, in home libraries (§1a).
 - **Does not expose home libraries through the Plex façade.** Plex has no
