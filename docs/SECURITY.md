@@ -60,6 +60,38 @@ and is checked identically; it exists only because browsers won't attach
 headers to `<img>`/`<video>` requests. Treat a URL with `?token=` as a
 credential — it grants exactly what the bearer does.
 
+## API keys — a credential for machines, not a token for robots
+
+A login token **is a user**: it carries that user's privileges wholesale, and
+an admin's token can read the TMDB, OMDb and Trakt secrets straight out of
+`GET /api/v1/settings`. So the obvious way to let a neighbouring application
+trigger a scan — "make it an admin account and give it a token" — also hands
+that application every secret plurx holds. That is the hole API keys close.
+
+A key is deliberately **not** a user. It has no account, no `is_admin`, no
+identity to attribute a watch state to; it has a list of scopes and nothing
+else, and it cannot widen itself.
+
+| Property | How |
+|---|---|
+| Presentation | `Authorization: Bearer plx_<32 hex>` — the `plx_` prefix routes verification to the key table instead of the token table, so a key and a token are never tried against each other's store |
+| At rest | SHA-256 of the secret, same discipline as login tokens (`api_keys.key_hash`); the plaintext is shown **once**, in the create response, and is unrecoverable afterwards |
+| Scopes | `scan:trigger` · `status:read`. A key holds exactly the scopes it was created with. Unknown scopes are rejected at creation rather than stored, so a typo cannot produce a key that looks right and authorizes nothing |
+| Revocation | `disabled` (or delete) takes away every scope at once, checked in one place — a revocation that depends on each call site remembering to check is not a revocation |
+| Audit | `last_used_at` is bumped on every successful check; a key nobody can tell is unused is a key nobody revokes |
+| Management | admin only — `POST/GET/DELETE /api/v1/keys`. A key cannot mint another key, or the narrow credential would be one request away from a wide one |
+
+**Two credential kinds, two doors**, and the wall runs in both directions. A
+login token does not open a key-scoped route: if it did, "monarr can trigger
+scans" would still be satisfiable by handing over an admin token, and the
+narrow credential would buy nothing. A key does not open a user route: there
+is no "who" behind it, and inventing one would be worse than refusing.
+
+Kept honest by
+`plurxd http::tests::a_key_cannot_read_the_settings_that_hold_every_secret`,
+which asserts a scan key gets 401/403 from `/settings`, `/users` and `/me` —
+and by `only_an_admin_manages_keys`, which asserts a key cannot mint another.
+
 ## Who can reach what
 
 Every route sits in one of three tiers. The public tier is small and holds no
@@ -76,6 +108,7 @@ user; management and diagnostics require admin.
 | Plex `/identity`, root capabilities | none | server discovery, so a Plex/Kodi/HA client can find plurx *before* it authenticates |
 | Browse · playback (`/files/{id}/*`) · images · watch progress · `/client-log` | signed-in user | your library, your streams, your progress — a valid token maps to a user |
 | Users · library & settings mutations · `/system` · `/system/logs` · Trakt link · stop-session | admin | management and diagnostics — `AdminUser` is a token whose user carries `is_admin` |
+| API key management (`/keys`) | admin | issuing a credential is a management action; using one is not (above) |
 | Plex façade (`/library/*`, `/:/timeline`, …) | signed-in user | media bytes, metadata, and watch-state writes — requires a valid `X-Plex-Token` (a plurx token) since 2026-07-23 |
 
 **The Plex façade is a full mirror, not a side door.** It once served a

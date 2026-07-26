@@ -42,6 +42,29 @@ pub fn generate_token() -> Result<String, AuthError> {
     Ok(hex::encode(bytes))
 }
 
+/// Prefix that marks a secret as an API key rather than a login token. The
+/// extractor routes on it, so a key and a token can share one header without
+/// either being tried against the other's table.
+pub const API_KEY_PREFIX: &str = "plx_";
+
+/// Generate a fresh API key secret: `plx_` + 32 hex (16 random bytes).
+///
+/// Shorter than a login token by design — it is pasted between machines by a
+/// human, and 128 bits is far past any brute-force concern for a credential
+/// that only exists on a home network. Store only [`hash_token`] of it.
+pub fn generate_api_key() -> Result<String, AuthError> {
+    let mut bytes = [0u8; 16];
+    getrandom::getrandom(&mut bytes).map_err(|e| AuthError::Rng(e.to_string()))?;
+    Ok(format!("{API_KEY_PREFIX}{}", hex::encode(bytes)))
+}
+
+/// Whether a presented secret looks like an API key rather than a login
+/// token. Prefix only — it says which table to look in, never whether the
+/// credential is valid.
+pub fn is_api_key(secret: &str) -> bool {
+    secret.starts_with(API_KEY_PREFIX)
+}
+
 /// SHA-256 of a token, hex-encoded — the form stored in the database and
 /// looked up on each request.
 pub fn hash_token(token: &str) -> String {

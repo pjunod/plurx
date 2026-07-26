@@ -344,6 +344,50 @@ pub struct User {
     pub created_at: i64,
 }
 
+/// A machine credential: scopes, no user, no admin flag.
+///
+/// Deliberately not a `User`. A login token IS a user and carries that
+/// user's privileges wholesale — which is how "let monarr trigger scans"
+/// would otherwise become "let monarr read every secret plurx holds". A key
+/// can do exactly what its scopes say and cannot widen itself.
+#[derive(Debug, Clone, Serialize)]
+pub struct ApiKey {
+    pub id: i64,
+    pub name: String,
+    /// SHA-256 of the secret. Never serialized: the plaintext is shown once,
+    /// at creation, and the hash is not something an API should hand back.
+    #[serde(skip_serializing)]
+    pub key_hash: String,
+    pub scopes: Vec<String>,
+    pub created_at: i64,
+    pub last_used_at: Option<i64>,
+    pub disabled: bool,
+}
+
+impl ApiKey {
+    /// Whether this key may do `scope`. A disabled key may do nothing —
+    /// checked here rather than at each call site, because a revocation that
+    /// depends on every caller remembering to check is not a revocation.
+    pub fn allows(&self, scope: &str) -> bool {
+        !self.disabled && self.scopes.iter().any(|s| s == scope)
+    }
+}
+
+/// Scopes a key can hold. Small and closed on purpose: every scope is a
+/// promise about what a stolen key can do, so they are added one considered
+/// grant at a time rather than invented at call sites.
+pub mod scopes {
+    /// Ask for a scan of a path. The whole point of the monarr integration.
+    pub const SCAN_TRIGGER: &str = "scan:trigger";
+    /// Read the progress/result of a scan this key asked for.
+    pub const STATUS_READ: &str = "status:read";
+
+    /// Every scope that exists, for validation at creation time — a key
+    /// created with a typo'd scope would otherwise look fine and silently
+    /// authorize nothing.
+    pub const ALL: &[&str] = &[SCAN_TRIGGER, STATUS_READ];
+}
+
 // ---------------------------------------------------------------------------
 // Watch state
 // ---------------------------------------------------------------------------

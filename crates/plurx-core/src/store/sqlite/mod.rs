@@ -8,6 +8,7 @@
 //! Implementation is split by domain area: `users`, `library`, `media`,
 //! `watch` — this file owns open/migrate, shared row mappers, and settings.
 
+mod apikeys;
 mod library;
 mod media;
 mod trakt;
@@ -250,6 +251,28 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE libraries ADD COLUMN refresh_interval_mins INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE libraries ADD COLUMN last_scan_at INTEGER;
     ALTER TABLE libraries ADD COLUMN last_refresh_at INTEGER;",
+    // v8: scoped API keys — a second kind of credential, for machines.
+    //
+    // A login token IS a user: it carries that user's privileges wholesale,
+    // and an admin's token can read the TMDB/Trakt secrets straight out of
+    // GET /api/v1/settings. So handing another application "a token so it can
+    // trigger scans" hands it every secret plurx holds. A key carries a scope
+    // list and nothing else — no user, no admin flag, no way to widen itself.
+    //
+    // Stored like tokens: SHA-256 of the secret, never the secret. The
+    // plaintext is shown exactly once, at creation, and is unrecoverable
+    // afterwards — losing it means issuing a new key, which is the correct
+    // cost and keeps "the database leaked" from meaning "the keys leaked".
+    "CREATE TABLE api_keys (
+        id           INTEGER PRIMARY KEY,
+        name         TEXT NOT NULL,
+        key_hash     TEXT NOT NULL UNIQUE,
+        scopes       TEXT NOT NULL DEFAULT '[]',
+        created_at   INTEGER NOT NULL DEFAULT (unixepoch()),
+        last_used_at INTEGER,
+        disabled     INTEGER NOT NULL DEFAULT 0
+    ) STRICT;
+    CREATE INDEX api_keys_hash ON api_keys(key_hash);",
 ];
 
 /// Column list matching [`item_from_row`]. Prefix with a table alias via
@@ -647,7 +670,7 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .expect("version");
         assert_eq!(version, MIGRATIONS.len() as i64);
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
 
         // Every row survives, values identical.
         let dangling: i64 = conn

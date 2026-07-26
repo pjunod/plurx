@@ -13,6 +13,7 @@ mod extract;
 mod hls;
 mod images;
 mod items;
+mod keys;
 mod libraries;
 mod photos;
 mod plex;
@@ -26,7 +27,7 @@ mod web;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use axum::Router;
 
 use crate::state::AppState;
@@ -62,6 +63,10 @@ pub fn router(state: AppState) -> Router {
         // Users (admin)
         .route("/users", get(users::list).post(users::create))
         .route("/users/{id}", put(users::update).delete(users::delete))
+        // API keys (admin) — the machine credential. Managing keys is a
+        // user action; USING one is not, and those routes take ScopedKey.
+        .route("/keys", get(keys::list).post(keys::create))
+        .route("/keys/{id}", delete(keys::delete))
         // Libraries
         .route("/libraries", get(libraries::list).post(libraries::create))
         .route(
@@ -251,6 +256,182 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let resp = app.oneshot(get("/readyz", None)).await.expect("resp");
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    fn delete_req(uri: &str, token: Option<&str>) -> Request<Body> {
+        let mut b = Request::builder().method("DELETE").uri(uri);
+        if let Some(t) = token {
+            b = b.header("authorization", format!("Bearer {t}"));
+        }
+        b.body(Body::empty()).expect("req")
+    }
+
+    // ---- scoped API keys (integration plan P1) --------------------------
+    //
+    // The security claim is the entire reason keys exist, so it is asserted
+    // here rather than trusted: a key can do what its scopes say and NOTHING
+    // else — above all it cannot read the settings blob, which holds the
+    // TMDB/Trakt secrets an admin token would hand over wholesale.
+
+    #[tokio::test]
+    async fn a_key_is_shown_once_and_never_again() {
+        let app = test_app();
+        let admin = setup_admin(&app).await;
+
+        let (status, created) = call(
+            &app,
+            post(
+                "/api/v1/keys",
+                Some(&admin),
+                json!({ "name": "monarr", "scopes": ["scan:trigger"] }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "create failed: {created}");
+        let secret = created["key_secret"].as_str().expect("secret");
+        assert!(secret.starts_with("plx_"), "secret = {secret}");
+
+        let (status, listed) = call(&app, get("/api/v1/keys", Some(&admin))).await;
+        assert_eq!(status, StatusCode::OK);
+        let text = listed.to_string();
+        assert!(
+            !text.contains(secret),
+            "the list handed the secret back — it must be unrecoverable: {text}"
+        );
+        assert!(
+            !text.contains("key_hash"),
+            "the stored hash has no business on a settings screen: {text}"
+        );
+        assert_eq!(listed[0]["name"], "monarr");
+        assert_eq!(listed[0]["scopes"][0], "scan:trigger");
+    }
+
+    #[tokio::test]
+    async fn only_an_admin_manages_keys() {
+        let app = test_app();
+        let admin = setup_admin(&app).await;
+        // A key is not a user and must not be able to mint more keys —
+        // otherwise the narrow credential is one request away from being a
+        // wide one.
+        let (_, created) = call(
+            &app,
+            post(
+                "/api/v1/keys",
+                Some(&admin),
+                json!({ "name": "monarr", "scopes": ["scan:trigger"] }),
+            ),
+        )
+        .await;
+        let secret = created["key_secret"].as_str().expect("secret").to_owned();
+
+        let (status, _) = call(&app, get("/api/v1/keys", Some(&secret))).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a key was accepted on a user route"
+        );
+        let (status, _) = call(
+            &app,
+            post(
+                "/api/v1/keys",
+                Some(&secret),
+                json!({"name":"x","scopes":["scan:trigger"]}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "a key minted another key");
+
+        let (status, _) = call(&app, get("/api/v1/keys", None)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    // The reason the whole concept exists. If this ever passes with a 200,
+    // handing monarr a key is handing it the TMDB and Trakt secrets.
+    #[tokio::test]
+    async fn a_key_cannot_read_the_settings_that_hold_every_secret() {
+        let app = test_app();
+        let admin = setup_admin(&app).await;
+        let (_, created) = call(
+            &app,
+            post(
+                "/api/v1/keys",
+                Some(&admin),
+                json!({ "name": "monarr", "scopes": ["scan:trigger", "status:read"] }),
+            ),
+        )
+        .await;
+        let secret = created["key_secret"].as_str().expect("secret").to_owned();
+
+        for uri in ["/api/v1/settings", "/api/v1/users", "/api/v1/me"] {
+            let (status, body) = call(&app, get(uri, Some(&secret))).await;
+            assert!(
+                status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN,
+                "a scan key reached {uri} with {status}: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn keys_are_created_with_real_scopes_or_not_at_all() {
+        let app = test_app();
+        let admin = setup_admin(&app).await;
+
+        // A typo'd scope would otherwise store fine and authorize nothing —
+        // failing hours later, in another application, as a 403.
+        let (status, body) = call(
+            &app,
+            post(
+                "/api/v1/keys",
+                Some(&admin),
+                json!({ "name": "typo", "scopes": ["scan:triggr"] }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body.to_string().contains("scan:trigger"),
+            "the error should name the valid scopes: {body}"
+        );
+
+        for bad in [
+            json!({ "name": "", "scopes": ["scan:trigger"] }),
+            json!({ "name": "no scopes", "scopes": [] }),
+        ] {
+            let (status, _) = call(&app, post("/api/v1/keys", Some(&admin), bad)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[tokio::test]
+    async fn revoking_a_key_stops_it() {
+        let app = test_app();
+        let admin = setup_admin(&app).await;
+        let (_, created) = call(
+            &app,
+            post(
+                "/api/v1/keys",
+                Some(&admin),
+                json!({ "name": "monarr", "scopes": ["scan:trigger"] }),
+            ),
+        )
+        .await;
+        let id = created["id"].as_i64().expect("id");
+
+        let (status, _) = call(
+            &app,
+            delete_req(&format!("/api/v1/keys/{id}"), Some(&admin)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, listed) = call(&app, get("/api/v1/keys", Some(&admin))).await;
+        assert_eq!(listed.as_array().expect("array").len(), 0);
+
+        let (status, _) = call(
+            &app,
+            delete_req(&format!("/api/v1/keys/{id}"), Some(&admin)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "revoking twice should 404");
     }
 
     #[tokio::test]

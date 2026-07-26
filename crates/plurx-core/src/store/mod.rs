@@ -357,10 +357,36 @@ pub trait TraktStore: Send + Sync + 'static {
     ) -> Result<Vec<crate::trakt::SyncCandidate>, StoreError>;
 }
 
+/// Scoped API keys — the machine credential, kept deliberately separate
+/// from [`UserStore`] because a key is not a user and must never be able to
+/// become one.
+#[async_trait]
+pub trait ApiKeyStore: Send + Sync + 'static {
+    /// Store a key. Only the SHA-256 hash of the secret is persisted; the
+    /// caller shows the plaintext once and then forgets it.
+    async fn create_api_key(
+        &self,
+        name: &str,
+        key_hash: &str,
+        scopes: &[String],
+    ) -> Result<crate::domain::ApiKey, StoreError>;
+    async fn list_api_keys(&self) -> Result<Vec<crate::domain::ApiKey>, StoreError>;
+    async fn api_key_for_hash(
+        &self,
+        key_hash: &str,
+    ) -> Result<Option<crate::domain::ApiKey>, StoreError>;
+    /// Record that a key was just used — the only way an operator can tell a
+    /// forgotten key from a working one.
+    async fn touch_api_key(&self, id: i64) -> Result<(), StoreError>;
+    async fn delete_api_key(&self, id: i64) -> Result<bool, StoreError>;
+    async fn set_api_key_disabled(&self, id: i64, disabled: bool) -> Result<bool, StoreError>;
+}
+
 /// The full storage boundary — what plurxd holds as `Arc<dyn Store>`.
 pub trait Store:
     SettingsStore
     + UserStore
+    + ApiKeyStore
     + LibraryStore
     + MediaStore
     + WatchStore
@@ -374,6 +400,7 @@ pub trait Store:
 impl<T> Store for T where
     T: SettingsStore
         + UserStore
+        + ApiKeyStore
         + LibraryStore
         + MediaStore
         + WatchStore
