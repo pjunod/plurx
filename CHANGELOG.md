@@ -99,6 +99,14 @@ bump may break compatibility and a **patch** bump never does.
   Moving those files out of *added* was the other option and would have been
   worse: the scan would report nothing added while two new items sat in the
   library, so the overlap is kept and simply stated.
+- Scan problems are boxed and scroll in place instead of printing into the
+  libraries table. A TV scan reporting 187 skips pushed every other library off
+  the screen and turned the settings page into a log dump; the list is now a
+  fixed-height panel that scrolls, so a row is the same size whether its scan
+  found one problem or a thousand. Long release-group paths wrap inside the box
+  rather than stretching the column, and a panel holding real failures gets a
+  red left spine that a skips-only panel doesn't — bad scans stay spottable at a
+  glance now that the text itself is contained.
 - Skipped files say which ones. "1 skipped" meant a file the library kind
   couldn't identify, most often an episode with no `S01E02` in the name sitting
   in a Shows library, and the only way to find it was to guess. Skips are listed

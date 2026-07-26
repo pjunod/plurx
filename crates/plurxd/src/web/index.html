@@ -392,7 +392,23 @@
     padding:2px 8px;border-radius:6px;white-space:nowrap}
   .libedit{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
   .libedit input,.libedit select{width:auto}
-  .problem{color:var(--bad);font-size:12px;margin-top:3px;font-weight:400}
+  /* A scan of a big library can report hundreds of skips. Printed straight into
+     the row they push every other library off the screen and turn the settings
+     page into a log dump, so the list is capped and scrolls in place: the row
+     is the same height whether the scan found one problem or a thousand. The
+     red left spine is what makes a bad scan visible at a glance once the
+     content is boxed; a list holding only informational lines doesn't get one. */
+  .problems{margin-top:5px;max-height:152px;overflow-y:auto;overscroll-behavior:contain;
+    background:var(--panel2);border:1px solid var(--line);border-left:2px solid var(--bad);
+    border-radius:6px;padding:5px 9px}
+  .problems.info-only{border-left-color:var(--line)}
+  .problems::-webkit-scrollbar{width:8px}
+  .problems::-webkit-scrollbar-thumb{background:var(--line);border-radius:4px}
+  /* Release-group paths run long and have no spaces to break on; without this
+     they either overflow the column or force the table wide. */
+  .problem{color:var(--bad);font-size:12px;margin-top:4px;font-weight:400;
+    line-height:1.45;overflow-wrap:anywhere}
+  .problem:first-child{margin-top:0}
   /* Skips and truncation notices are informational, not failures — same list,
      quieter ink, so the red lines stay the ones that need attention. */
   .problem.info{color:var(--muted)}
@@ -2777,10 +2793,17 @@ function statusText(st){
     // Every error carries a problem line (scan/mod.rs keeps that invariant),
     // so this list is where a red count becomes actionable. Skips and the
     // "…and N more" truncation notice are informational, and read as such.
-    s+=(r.problems||[]).map(p=>{
-      const info=/^(skipped |…and )/.test(p);
-      return `<div class="problem${info?" info":""}">${info?"·":"⚠"} ${esc(p)}</div>`;
-    }).join("");
+    const probs=r.problems||[];
+    if(probs.length){
+      const isInfo=p=>/^(skipped |…and )/.test(p);
+      const lines=probs.map(p=>{
+        const info=isInfo(p);
+        return `<div class="problem${info?" info":""}">${info?"·":"⚠"} ${esc(p)}</div>`;
+      }).join("");
+      // Real failures are already ordered ahead of skips by the scanner, so the
+      // box opens on them — the operator sees what to act on without scrolling.
+      s+=`<div class="problems${probs.every(isInfo)?" info-only":""}">${lines}</div>`;
+    }
     return s;
   }
   return "idle";
