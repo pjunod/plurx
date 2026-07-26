@@ -2924,18 +2924,23 @@ function maintenancePanel(settings){
       ${everySelect("job-probe",RETRY_EVERY,settings.probe_retry_mins,"Re-run ffprobe on files whose media details were never read")}
       <span class="muted" style="font-size:12px">Clean transcode cache</span>
       ${everySelect("job-clean",CLEAN_EVERY,settings.transcode_cleanup_mins,"Delete leftover transcode working directories no session owns")}
+      <label class="schedpair" title="Scan every library once, about 30 seconds after the server starts">
+        <input type="checkbox" id="job-boot"${settings.scan_on_startup?' checked':''}> Scan at startup</label>
       <button class="ghost sm" onclick="saveMaintenance(this)">Save</button></div>
     <div class="hint">Everything here is off by default. <b>Retry unreadable files</b> re-probes anything
       scanned without codec or duration — the fix for those (permissions, a remounted share) leaves no
       trace a normal scan would notice. <b>Clean transcode cache</b> removes working directories left
-      behind by a crash or a host reboot, which no live session will ever claim.</div>`;
+      behind by a crash or a host reboot, which no live session will ever claim. <b>Scan at startup</b> covers
+      the gap an interval can't: a server that was switched off while files landed doesn't notice them until
+      its next scheduled run.</div>`;
 }
 async function saveMaintenance(btn){
   btn.disabled=true;
   try{
     await api("/settings",{method:"PUT",body:{
       probe_retry_mins:Number(document.getElementById("job-probe").value),
-      transcode_cleanup_mins:Number(document.getElementById("job-clean").value)}});
+      transcode_cleanup_mins:Number(document.getElementById("job-clean").value),
+      scan_on_startup:document.getElementById("job-boot").checked}});
     toast("Maintenance schedule saved"); render();
   }catch(e){ toast(e.message||"Couldn't save"); }
   finally{ btn.disabled=false; }

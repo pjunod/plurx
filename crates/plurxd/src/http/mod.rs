@@ -1535,6 +1535,23 @@ mod tests {
         .await;
         assert_eq!(lib["scan_interval_mins"], 0);
 
+        // Scan-at-startup is a plain boolean round-trip through the same
+        // settings endpoint, off unless asked for.
+        let (_, before) = call(&app, get("/api/v1/settings", Some(&admin))).await;
+        assert_eq!(before["scan_on_startup"], false);
+        let (st, after) = call(
+            &app,
+            put(
+                "/api/v1/settings",
+                Some(&admin),
+                json!({ "scan_on_startup": true, "probe_retry_mins": 1440 }),
+            ),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(after["scan_on_startup"], true);
+        assert_eq!(after["probe_retry_mins"], 1440);
+
         // Settings round-trip.
         assert_eq!(
             call(

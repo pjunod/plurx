@@ -69,7 +69,8 @@ anime.
   unreadable files** and **clean transcode cache**. Intervals are minutes with a
   floor of 15 · a refresh beats a scan when both fall due · runs are stamped on
   completion, on the library row, so neither a slow scan nor a nightly reboot can
-  put the schedule into a spin.
+  put the schedule into a spin. **Scan at startup** covers what an interval
+  can't: files that landed while the server was switched off.
 - *Planned (fast-follow):* live inotify watching (today: on-demand, scheduled,
   and create/update rescan); manual fix-match UI.
 

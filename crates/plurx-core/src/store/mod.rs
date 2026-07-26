@@ -64,6 +64,11 @@ pub mod keys {
     /// so restarting the server doesn't restart the clock.
     pub const JOB_LAST_PROBE_RETRY: &str = "jobs.last_probe_retry";
     pub const JOB_LAST_TRANSCODE_CLEANUP: &str = "jobs.last_transcode_cleanup";
+    /// Scan every library once, shortly after the server starts. "1" enables
+    /// it; absent or anything else is off. For a server that was powered down
+    /// while files landed — otherwise it waits out a whole interval (or, with
+    /// no interval set, until someone presses a button) before noticing them.
+    pub const JOB_SCAN_ON_STARTUP: &str = "jobs.scan_on_startup";
     /// How fast a remux may run, as a multiple of real time; "0" disables the
     /// limit. An unpaced remux delivers at line rate and can starve everything
     /// else sharing the link — including, over Wi-Fi, the client's own DHCP.

@@ -312,11 +312,43 @@ impl JobManager {
     /// can't stack on top of a running one — `trigger` refuses, and the next
     /// tick tries again.
     pub async fn schedule_loop(self: Arc<Self>, transcode: Arc<TranscodeManager>) {
+        self.scan_on_startup().await;
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
             ticker.tick().await;
             if let Err(e) = self.run_due_jobs(&transcode).await {
                 tracing::warn!(error = %e, "scheduler tick failed");
+            }
+        }
+    }
+
+    /// Scan every library once at boot, if the operator asked for it.
+    ///
+    /// The interval schedule alone can't cover a server that was *off* while
+    /// files landed: its clock only starts when the process does, so a machine
+    /// powered up at noon on a daily schedule ignores everything added
+    /// overnight until midnight. Off by default, like every other job.
+    ///
+    /// The delay is not politeness — a scan competes with the first plays of
+    /// the morning for the same disks — and it is also what keeps a crash-loop
+    /// from turning into a scan-loop against the media volume.
+    async fn scan_on_startup(self: &Arc<Self>) {
+        const SETTLE: std::time::Duration = std::time::Duration::from_secs(30);
+        match self.store.get_setting(keys::JOB_SCAN_ON_STARTUP).await {
+            Ok(Some(v)) if v.trim() == "1" => {}
+            _ => return,
+        }
+        tokio::time::sleep(SETTLE).await;
+        let libraries = match self.store.list_libraries().await {
+            Ok(libraries) => libraries,
+            Err(e) => {
+                tracing::warn!(error = %e, "startup scan skipped: cannot list libraries");
+                return;
+            }
+        };
+        for library in libraries {
+            if self.trigger_scan(library.id).await {
+                tracing::info!(library = library.id, name = %library.name, "startup scan started");
             }
         }
     }

@@ -333,6 +333,8 @@ pub struct SettingsDto {
     /// Per-library scan/refresh intervals are on the library, not here.
     pub probe_retry_mins: i64,
     pub transcode_cleanup_mins: i64,
+    /// Scan every library once, ~30s after the server starts.
+    pub scan_on_startup: bool,
 }
 
 async fn settings_dto(state: &AppState) -> Result<SettingsDto, ApiError> {
@@ -374,6 +376,11 @@ async fn settings_dto(state: &AppState) -> Result<SettingsDto, ApiError> {
             .get_setting(keys::JOB_TRANSCODE_CLEANUP_MINS)
             .await?,
     );
+    let scan_on_startup = state
+        .store
+        .get_setting(keys::JOB_SCAN_ON_STARTUP)
+        .await?
+        .is_some_and(|v| v.trim() == "1");
     Ok(SettingsDto {
         tmdb_configured: !tmdb_api_key.is_empty(),
         tmdb_api_key,
@@ -388,6 +395,7 @@ async fn settings_dto(state: &AppState) -> Result<SettingsDto, ApiError> {
         stream_readrate,
         probe_retry_mins,
         transcode_cleanup_mins,
+        scan_on_startup,
     })
 }
 
@@ -418,6 +426,7 @@ pub struct UpdateSettings {
     /// Server-wide job intervals in minutes; 0 turns one off.
     pub probe_retry_mins: Option<i64>,
     pub transcode_cleanup_mins: Option<i64>,
+    pub scan_on_startup: Option<bool>,
 }
 
 /// PUT /api/v1/settings (admin)
@@ -493,6 +502,12 @@ pub async fn update_settings(
             }
             state.store.put_setting(key, &value.to_string()).await?;
         }
+    }
+    if let Some(on) = req.scan_on_startup {
+        state
+            .store
+            .put_setting(keys::JOB_SCAN_ON_STARTUP, if on { "1" } else { "0" })
+            .await?;
     }
     Ok(Json(settings_dto(&state).await?))
 }

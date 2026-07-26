@@ -87,6 +87,13 @@ bump may break compatibility and a **patch** bump never does.
   tick. The decision of what is due is a pure function with its own tests
   (`crates/plurxd/src/schedule.rs`), including the clock jumping backwards —
   which would otherwise park a schedule for as long as the jump.
+- **Scan at startup** (off by default, Settings → Libraries). An interval
+  schedule can only measure from when the process is running, so a server that
+  was switched off overnight ignores everything that landed until its next
+  scheduled run — or, with no interval set, until someone presses a button. This
+  scans every library once, about 30 seconds after boot: late enough not to race
+  the first plays of the morning for the same disks, and enough of a pause that a
+  crash-loop can't become a scan-loop against the media volume.
 - **Transcode cache cleanup.** The reaper has always cleaned up after sessions
   it knows about; it can't clean up after a SIGKILL, an OOM or a host reboot,
   which leave working directories on disk that nothing will ever claim. On a 4K
