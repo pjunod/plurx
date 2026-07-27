@@ -31,7 +31,7 @@ after the import, when the files are actually in place.
    └──────────────┘
 ```
 
-Default ports: nzbd 6789 · monarr 7676 · **plurx 32600**.
+Default ports: nzbd 6789 · monarr 7676 · **plurx 32400**.
 
 ## Wiring the two together in Docker
 
@@ -64,12 +64,37 @@ networks:
 `docker compose up -d` in each directory, then set the monarr URL to
 `http://monarr:7676`.
 
-Three things that trip people up, each with its reason:
+**Get the names from Docker, not from memory.** This is the single command
+that answers "what do I put in the URL", and it answers the network question
+in the same line:
+
+```bash
+docker ps --format '{{.Names}}\t{{.Networks}}'
+```
+
+```
+plurxd	media
+nzbd	media
+monarr	media
+```
+
+Column 1 is the hostname to use. Column 2 must contain the shared network for
+every container that has to talk to the others — anything listed as `bridge`
+or `host` cannot be reached by name from the others.
+
+Read it literally. A container called `plurxd` is **not** reachable as
+`plurx`, and the failure looks like a network problem rather than a spelling
+one: monarr reports
+`lookup plurx on 127.0.0.11:53: server misbehaving` — Docker's embedded
+resolver saying the name does not exist, which is easy to misread as "the
+other side is down". It is not; nothing was ever dialled.
+
+Three more things that trip people up, each with its reason:
 
 **The hostname is the `container_name`, or the service key if you did not set
-one.** Not the image, and not the directory.
+one.** Not the image, not the directory, and not the product's name.
 
-**Published ports are irrelevant on this path.** `ports: - "32600:32600"` maps
+**Published ports are irrelevant on this path.** `ports: - "32400:32400"` maps
 host→container; container→container traffic goes straight to the *internal*
 port and works even with no published port at all. Keep the published ones for
 your own browser, and stop reasoning about them when debugging a seam.
@@ -163,7 +188,7 @@ Settings → **System → Logs** at `Info+`, target `plurxd::integrate`.
 **How to verify.**
 
 ```bash
-PLURX=http://127.0.0.1:32600
+PLURX=http://127.0.0.1:32400
 PLXKEY=plx_…                        # from §2
 
 curl -sS -X POST "$PLURX/api/v1/scan" \
@@ -392,7 +417,7 @@ that is not this plurx.
 ## Verify the whole chain in five minutes
 
 ```bash
-PLURX=http://127.0.0.1:32600;  MONARR=http://127.0.0.1:7676
+PLURX=http://127.0.0.1:32400;  MONARR=http://127.0.0.1:7676
 PLXKEY=plx_…                   # §2
 MKEY=<monarr Settings → Security → Reveal>
 ```

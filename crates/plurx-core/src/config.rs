@@ -11,7 +11,7 @@ use crate::error::ConfigError;
 
 /// Default HTTP port. Deliberately near — but never colliding with — the
 /// 32400-era ports ex-Plex users already have muscle memory for.
-pub const DEFAULT_PORT: u16 = 32600;
+pub const DEFAULT_PORT: u16 = 32400;
 
 const DEFAULT_CONFIG_PATHS: &[&str] = &["plurx.toml", "/etc/plurx/plurx.toml"];
 

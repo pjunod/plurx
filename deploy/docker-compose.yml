@@ -37,14 +37,14 @@ services:
     container_name: plurxd
     restart: unless-stopped
     ports:
-      - "32600:32600"                          # HTTP API + web app
+      - "32400:32400"                          # HTTP API + web app
       # GDM discovery for Plex clients. Discovery only works on host port
       # 32414; if something else owns it (a still-running Plex), set
       # PLURX_GDM_PORT in .env to park it elsewhere until Plex retires.
       - "${PLURX_GDM_PORT:-32414}:32414/udp"
     environment:
       PLURX_SERVER_NAME: "plurx"
-      PLURX_BIND: "0.0.0.0:32600"
+      PLURX_BIND: "0.0.0.0:32400"
       PLURX_DATA_DIR: "/var/lib/plurx"
     volumes:
       - plurx-data:/var/lib/plurx

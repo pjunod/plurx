@@ -6,7 +6,7 @@
 # Human-visible server name.
 name = "plurx"
 # Address:port the HTTP API binds to.
-bind = "0.0.0.0:32600"
+bind = "0.0.0.0:32400"
 
 [storage]
 # Where the database and caches live. Created if missing.

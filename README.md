@@ -107,7 +107,7 @@ $EDITOR docker-compose.override.yml     # media mounts as host:container:ro, + o
 docker compose up -d --build
 
 # 2. Open the web app — the first launch is the admin-account setup screen
-open http://<host>:32600                # :32600 is the default port
+open http://<host>:32400                # :32400 is the default port
 
 # 3. Add a library: Settings → Libraries → Add & scan
 #    Kind: Movies | TV Shows | Anime | Home videos & photos
@@ -125,7 +125,7 @@ nothing almost always means the path isn't what the server sees; the fix is in
 
 ## Install
 
-Three ways to run it; all serve the web app + API on `:32600`.
+Three ways to run it; all serve the web app + API on `:32400`.
 
 ```bash
 # Docker / Compose — recommended for homelabs; bundles ffmpeg, builds from source first run
@@ -167,7 +167,7 @@ tests spawn ffmpeg for real. CI installs them for the same reason.
 
 ```bash
 git clone https://github.com/pjunod/plurx && cd plurx
-make run          # build + serve http://localhost:32600  (cargo run -p plurxd)
+make run          # build + serve http://localhost:32400  (cargo run -p plurxd)
 make check        # fmt-check + clippy + test — the CI gate, the single quality bar
 make hooks        # install a pre-commit hook that runs `make check` before each commit
 ```

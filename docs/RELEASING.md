@@ -97,5 +97,5 @@ CI passes the tag name automatically when it publishes an image.
 ```sh
 make version          # what a build from this tree would stamp
 plurxd --version      # what an existing binary reports
-curl -s localhost:32600/api/v1/server | jq '{version, build}'
+curl -s localhost:32400/api/v1/server | jq '{version, build}'
 ```

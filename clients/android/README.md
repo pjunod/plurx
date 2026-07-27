@@ -15,7 +15,7 @@ hardware genuinely can't play — everything else streams the original file unto
 
 ## What works
 
-- **Connect & sign in** to any plurx server by address (`http://192.168.1.10:32600`); the
+- **Connect & sign in** to any plurx server by address (`http://192.168.1.10:32400`); the
   session is remembered so the app reconnects silently on next launch.
 - **Home** with Continue Watching, Next Up, and Recently Added hubs, plus your libraries.
 - **Browse** libraries as a poster grid; open shows → seasons → episodes.
@@ -37,7 +37,7 @@ hardware genuinely can't play — everything else streams the original file unto
 
 - **Android 6.0 (API 23)** or newer — covers phones and the vast majority of Android
   TV / Google TV boxes.
-- A reachable plurx server (default port `32600`). Because home servers are usually plain
+- A reachable plurx server (default port `32400`). Because home servers are usually plain
   `http` on the LAN, the app sets `usesCleartextTraffic="true"`.
 
 ## Build
@@ -146,7 +146,7 @@ icon'd app. For a native iOS / Apple TV build, see
 ## First run
 
 1. Launch **plurx**. On the connect screen enter your server address — host and port are
-   enough (`192.168.1.10:32600`); `http://` is assumed if you leave the scheme off.
+   enough (`192.168.1.10:32400`); `http://` is assumed if you leave the scheme off.
 2. Sign in with your plurx username and password.
 3. That's it — the token is stored (DataStore) and reused until it stops working or you sign
    out from Settings.

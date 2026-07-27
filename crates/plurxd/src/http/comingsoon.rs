@@ -156,35 +156,85 @@ pub async fn monarr_status(
     Ok(Json(out))
 }
 
-/// Normalize what a person typed into something reqwest can actually send to.
+/// The completed form of what a person typed, or their input unchanged when
+/// it cannot be completed honestly.
 ///
 /// A bare `host.docker.internal` is what an operator reaches for, and it is
 /// not a URL: reqwest rejects it as a relative address and reports "builder
-/// error", which tells you nothing about what to change. Rather than refuse
-/// it, fill in what is missing and let the settings screen show the result —
-/// a normalization you can see is a normalization you can correct.
+/// error", which says nothing about what to change. So fill in what is
+/// missing and let the settings screen show the result — a normalization you
+/// can see is a normalization you can correct.
 ///
-/// A scheme the person supplied is respected in full, port and all. Only a
-/// bare host is completed, and then with monarr's own default port, because
-/// there is nothing else it could sensibly mean.
+/// The rule that matters is the second half. A first version of this
+/// string-matched on `://`, so `http:/monarr:7676` — one mistyped slash —
+/// did not look like it had a scheme, was treated as a bare hostname, and
+/// came back as `http://http:/monarr:7676:7676`. Turning a typo into nonsense
+/// is worse than refusing it, because the person can no longer see what they
+/// typed. Everything below is arranged so that cannot happen: repair only
+/// what is unambiguous, parse to prove the result is real, and otherwise hand
+/// the input straight back so the failure names *their* string.
 pub fn normalize_monarr_url(raw: &str) -> String {
-    const MONARR_DEFAULT_PORT: &str = "7676";
-    let s = raw.trim().trim_end_matches('/');
-    if s.is_empty() || s.contains("://") {
-        return s.to_owned();
+    const MONARR_DEFAULT_PORT: u16 = 7676;
+    let typed = raw.trim();
+    if typed.is_empty() {
+        return String::new();
     }
-    // No scheme. If they gave a port, they know what they want; if not, the
-    // only port monarr listens on by default is the one to assume.
-    let host_has_port = s
-        .split('/')
-        .next()
-        .and_then(|authority| authority.rsplit_once(':'))
-        .is_some_and(|(_, port)| !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()));
-    if host_has_port {
-        format!("http://{s}")
+
+    // `http:/host` — one slash. Unambiguous: a scheme followed by a single
+    // slash has no other meaningful reading, and it is the commonest way to
+    // mistype a URL. Note this runs on the untrimmed string, so `http://`
+    // (scheme, nothing else) is NOT reshaped into something parseable —
+    // trimming its slashes first would leave `http:` and invite exactly the
+    // guesswork this function exists to avoid.
+    let repaired = match typed.split_once(':') {
+        Some((scheme, rest))
+            if is_scheme(scheme) && rest.starts_with('/') && !rest.starts_with("//") =>
+        {
+            format!("{scheme}://{}", rest.trim_start_matches('/'))
+        }
+        _ => typed.to_owned(),
+    };
+
+    let had_scheme = repaired.contains("://");
+    let candidate = if had_scheme {
+        repaired
+    } else if typed
+        .split_once(':')
+        .is_some_and(|(head, rest)| is_scheme(head) && (rest.is_empty() || rest.starts_with('/')))
+    {
+        // Looks like a scheme, and is followed by nothing that could be an
+        // authority. Not ours to guess at. The `rest` test is what keeps
+        // `monarr:9000` on the bare-host path — a colon followed by digits
+        // is a port, not a scheme, however scheme-shaped the word before it.
+        return typed.to_owned();
     } else {
-        format!("http://{s}:{MONARR_DEFAULT_PORT}")
+        // A bare host, which is what an operator reaches for. Assume http,
+        // and monarr's own default port when none was given — there is
+        // nothing else it could sensibly mean.
+        format!("http://{repaired}")
+    };
+
+    let Ok(mut url) = reqwest::Url::parse(&candidate) else {
+        return typed.to_owned();
+    };
+    if url.host_str().unwrap_or_default().is_empty() {
+        return typed.to_owned();
     }
+    // Only fill in a port we invented, never one they chose, and never onto a
+    // scheme they supplied — guessing :7676 onto an https URL behind a
+    // reverse proxy would break a setup that was already correct.
+    if url.port().is_none() && !had_scheme {
+        let _ = url.set_port(Some(MONARR_DEFAULT_PORT));
+    }
+    url.as_str().trim_end_matches('/').to_owned()
+}
+
+/// RFC 3986 scheme shape: alpha, then alphanumerics and `+-.`.
+fn is_scheme(s: &str) -> bool {
+    !s.is_empty()
+        && s.starts_with(|c: char| c.is_ascii_alphabetic())
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
 }
 
 /// The real reason a request failed, not the outermost wrapper.

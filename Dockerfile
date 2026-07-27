@@ -54,12 +54,12 @@ COPY --from=build /plurxd /usr/local/bin/plurxd
 # Default to jellyfin-ffmpeg (recent GPUs need its driver stack); override
 # either var to point elsewhere. It's a superset of system ffmpeg, so this is
 # safe on hardware that the distro build would also handle.
-ENV PLURX_BIND=0.0.0.0:32600 \
+ENV PLURX_BIND=0.0.0.0:32400 \
     PLURX_DATA_DIR=/var/lib/plurx \
     PLURX_FFMPEG=/usr/lib/jellyfin-ffmpeg/ffmpeg \
     PLURX_FFPROBE=/usr/lib/jellyfin-ffmpeg/ffprobe
 
-EXPOSE 32600
+EXPOSE 32400
 VOLUME ["/var/lib/plurx"]
 USER plurx
 

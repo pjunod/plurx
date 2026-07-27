@@ -23,13 +23,13 @@ cp docker-compose.override.example.yml docker-compose.override.yml   # your moun
 docker compose up -d --build
 
 # Bare metal — one binary, needs ffmpeg/ffprobe on PATH (or PLURX_FFMPEG/PLURX_FFPROBE)
-plurxd run            # serves :32600
+plurxd run            # serves :32400
 
 # From source (development)
 cargo run -p plurxd   # or: make run
 ```
 
-Open `http://<host>:32600`, create the admin account, add a library. Library
+Open `http://<host>:32400`, create the admin account, add a library. Library
 paths you type in the UI are **container-side** paths under Docker (e.g.
 `/media/movies`), which must be mounted in your override file. Full deploy matrix
 (Unraid, TrueNAS/k8s, ports, GPU passthrough): [`deploy/README.md`](../deploy/README.md).
@@ -45,7 +45,7 @@ path in `PLURX_CONFIG`). Every key has an env override:
 
 | Env var | TOML | Default | What it does |
 |---|---|---|---|
-| `PLURX_BIND` | `server.bind` | `0.0.0.0:32600` | Address the HTTP API binds to |
+| `PLURX_BIND` | `server.bind` | `0.0.0.0:32400` | Address the HTTP API binds to |
 | `PLURX_SERVER_NAME` | `server.name` | `plurx` | Human-visible server name |
 | `PLURX_DATA_DIR` | `storage.data_dir` | `./data` | Database, artwork, transcode cache (created if missing) |
 | `PLURX_CONFIG` | — | — | Explicit config-file path (must exist if set) |
@@ -62,7 +62,7 @@ path in `PLURX_CONFIG`). Every key has an env override:
 
 | Port | Proto | Purpose |
 |---|---|---|
-| 32600 | TCP | HTTP API + web app (and the Plex-compat façade) |
+| 32400 | TCP | HTTP API + web app (and the Plex-compat façade) |
 | 32414 | UDP | GDM discovery so Plex/Kodi clients find the server on the LAN |
 
 GDM discovery only works on 32414 (the protocol hard-codes it), but the *host*
@@ -168,7 +168,7 @@ instead of plurx finding it on the next scheduled sweep. Three steps.
 of this work), so today it is one call with your admin token:
 
 ```bash
-curl -sX POST http://plurx:32600/api/v1/keys \
+curl -sX POST http://plurx:32400/api/v1/keys \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H 'content-type: application/json' \
   -d '{"name":"monarr","scopes":["scan:trigger","status:read"]}'
@@ -189,7 +189,7 @@ rather than "give it an admin account" — see [SECURITY.md](SECURITY.md).
 ### What a scan request looks like
 
 ```bash
-curl -sX POST http://plurx:32600/api/v1/scan \
+curl -sX POST http://plurx:32400/api/v1/scan \
   -H "Authorization: Bearer plx_…" -H 'content-type: application/json' \
   -d '{"path":"/media/movies/Heat (1995)","ids":{"tmdb":949},
        "correlation_id":"t-42-a3f9c1","source":"monarr"}'

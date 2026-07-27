@@ -45,12 +45,12 @@ mod tests {
 
     #[test]
     fn response_carries_identity_and_port() {
-        let r = response("abc123", "den", "0.0.2", 32600);
+        let r = response("abc123", "den", "0.0.2", 32400);
         let text = String::from_utf8(r).expect("utf8");
         assert!(text.starts_with("HTTP/1.0 200 OK"));
         assert!(text.contains("Content-Type: plex/media-server"));
         assert!(text.contains("Resource-Identifier: abc123"));
         assert!(text.contains("Name: den"));
-        assert!(text.contains("Port: 32600"));
+        assert!(text.contains("Port: 32400"));
     }
 }

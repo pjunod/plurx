@@ -13,10 +13,10 @@ cd deploy && cp docker-compose.override.example.yml docker-compose.override.yml
 $EDITOR docker-compose.override.yml         # set your media mounts (host:container:ro) + GPU
 docker compose up -d --build                # builds from source the first time
 # ...or bare metal / dev:
-cargo run -p plurxd                          # serves http://localhost:32600
+cargo run -p plurxd                          # serves http://localhost:32400
 
 # 2. Open the web app and create the admin account
-open http://localhost:32600                  # first launch = setup screen
+open http://localhost:32400                  # first launch = setup screen
 
 # 3. Add a library (Settings → Libraries → Add & scan)
 #    Name: Movies   Kind: Movies   Path: /media/movies
@@ -37,7 +37,7 @@ All developer tasks go through the `Makefile` — CI runs the same targets, so
 
 ```bash
 make            # list every target
-make run        # serve http://localhost:32600
+make run        # serve http://localhost:32400
 make check      # fmt-check + clippy + test  (the CI gate — the single quality bar)
 make test       # just the tests
 make coverage   # line coverage via cargo-llvm-cov → lcov.info
@@ -53,9 +53,9 @@ pre-commit hook so a commit can't land unless it passes (bypass one commit with
 ## 3. When something's off (quick triage)
 
 ```bash
-curl -s localhost:32600/healthz            # process alive?
-curl -s localhost:32600/readyz             # storage reachable?
-curl -s localhost:32600/metrics            # uptime, active transcodes, counts
+curl -s localhost:32400/healthz            # process alive?
+curl -s localhost:32400/readyz             # storage reachable?
+curl -s localhost:32400/metrics            # uptime, active transcodes, counts
 docker compose logs -f plurxd              # or: journalctl -u plurxd -f
 PLURX_LOG=plurxd::transcode=debug plurxd run   # loud logs for one subsystem
 stat -c '%g' /dev/dri/renderD128           # the render group id for group_add
@@ -79,13 +79,13 @@ application does on every import.
 ```bash
 # 1. Mint a scoped key (with an ADMIN token — not the key you are creating).
 #    The secret comes back exactly once; there is no way to read it again.
-curl -s localhost:32600/api/v1/keys \
+curl -s localhost:32400/api/v1/keys \
   -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
   -d '{"name":"monarr","scopes":["scan:trigger","status:read"]}'
 # → {"id":1,"name":"monarr",…,"key_secret":"plx_…"}   ← paste into monarr
 
 # 2. Tell plurx a file landed. The path is what the PLURX process sees.
-curl -s localhost:32600/api/v1/scan \
+curl -s localhost:32400/api/v1/scan \
   -H "Authorization: Bearer plx_…" -H 'Content-Type: application/json' \
   -d '{"path":"/media/movies/Heat (1995)","ids":{"tmdb":949},"hint":"movie",
        "correlation_id":"t-42-a3f9c1","source":"monarr"}'
@@ -107,7 +107,7 @@ Runbook, with monarr's side too: [OPERATIONS.md](OPERATIONS.md).
 
 | Thing | Where |
 |---|---|
-| Web app + API | `http://<host>:32600` |
+| Web app + API | `http://<host>:32400` |
 | GDM discovery | UDP `32414` (movable host-side via `PLURX_GDM_PORT`) |
 | Data (db, artwork, transcode cache) | `PLURX_DATA_DIR` (default `./data`; Docker volume `plurx-data` → `/var/lib/plurx`) |
 | Config file | `./plurx.toml` → `/etc/plurx/plurx.toml` (or `PLURX_CONFIG`) |
@@ -119,7 +119,7 @@ Runbook, with monarr's side too: [OPERATIONS.md](OPERATIONS.md).
 
 | Var | Default | Purpose |
 |---|---|---|
-| `PLURX_BIND` | `0.0.0.0:32600` | HTTP bind address |
+| `PLURX_BIND` | `0.0.0.0:32400` | HTTP bind address |
 | `PLURX_DATA_DIR` | `./data` | Database + caches |
 | `PLURX_SERVER_NAME` | `plurx` | Server display name |
 | `PLURX_CONFIG` | — | Explicit config path |

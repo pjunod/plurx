@@ -15,7 +15,7 @@ $EDITOR docker-compose.override.yml   # your media mounts (host:container:ro), y
 docker compose up -d --build          # builds the image from source the first time
 ```
 
-Open `http://<host>:32600` and create your admin account. Library paths in
+Open `http://<host>:32400` and create your admin account. Library paths in
 the web UI are the *container-side* paths (e.g. `/media/movies`). For
 hardware transcode, uncomment the GPU block in your override (Intel/AMD via
 `/dev/dri`, NVIDIA via the container toolkit). If another service (a
@@ -66,7 +66,7 @@ Keep the old volume until you've confirmed your library is intact, then
 
 ```sh
 # Linux amd64/arm64, macOS, Windows — one binary, no runtime deps but ffmpeg.
-plurxd run          # serves :32600; config via ./plurx.toml or PLURX_* env
+plurxd run          # serves :32400; config via ./plurx.toml or PLURX_* env
 ```
 
 Install `ffmpeg`/`ffprobe` (or point `PLURX_FFMPEG`/`PLURX_FFPROBE` at a build
@@ -118,7 +118,7 @@ systemctl status plurxd
 journalctl -u plurxd -f            # live logs; Ctrl-C to stop tailing
 ```
 
-Open `http://<host>:32600` and create your admin account. To update later,
+Open `http://<host>:32400` and create your admin account. To update later,
 replace the binary and `sudo systemctl restart plurxd`.
 
 - **Hardware transcode:** uncomment `SupplementaryGroups=render` in the unit
@@ -159,11 +159,11 @@ launchctl kickstart -k gui/$(id -u)/com.plurx.plurxd
 # 4. Check it, then open the app
 launchctl print gui/$(id -u)/com.plurx.plurxd | grep -E 'state|pid'
 tail -f ~/Library/Logs/plurxd.log
-open http://localhost:32600
+open http://localhost:32400
 ```
 
 macOS prompts once to allow incoming connections (needed for other devices to
-reach `:32600`). To update later, replace the binary and re-run the `kickstart`
+reach `:32400`). To update later, replace the binary and re-run the `kickstart`
 line. To stop and remove it:
 
 ```sh
@@ -194,7 +194,7 @@ single replica.
 
 | Port | Proto | Purpose |
 |---|---|---|
-| 32600 | TCP | HTTP API + web app (and the Plex-compat façade) |
+| 32400 | TCP | HTTP API + web app (and the Plex-compat façade) |
 | 32414 | UDP | GDM discovery so Plex/Kodi clients find the server on the LAN (host port movable via `PLURX_GDM_PORT`, but discovery only works on 32414) |
 
 ## Observability

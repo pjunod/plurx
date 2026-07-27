@@ -183,7 +183,7 @@ rule above: a string in an inline handler needs both layers, always.
 plurx listens on **plain HTTP**. It bundles no TLS (the one `rustls` dependency
 is for *outbound* calls to TMDB/Trakt, not the listener), because on a home LAN
 the certificate story is pure friction and the design target is "works on
-`http://192.168.x.x:32600` out of the box." The Android client even sets
+`http://192.168.x.x:32400` out of the box." The Android client even sets
 `usesCleartextTraffic` for the same reason.
 
 The consequence is explicit: **anything past a network you fully trust belongs

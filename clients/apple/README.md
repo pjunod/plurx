@@ -42,7 +42,7 @@ only what this hardware genuinely can't play.
   `brew install xcodegen`.
 - An Apple Developer account for signing (free personal team is fine for
   sideloading to your own devices).
-- A reachable plurx server (default port `32600`). Because home servers are
+- A reachable plurx server (default port `32400`). Because home servers are
   usually plain `http` on the LAN, both targets set
   `NSAppTransportSecurity → NSAllowsArbitraryLoads`.
 

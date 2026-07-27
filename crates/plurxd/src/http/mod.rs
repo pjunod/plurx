@@ -929,6 +929,56 @@ mod tests {
         assert_eq!(norm("   "), "");
     }
 
+    /// A typo must come back as a typo, never as nonsense.
+    ///
+    /// The first version of this matched on the literal `://`, so one
+    /// mistyped slash did not look like a scheme, was treated as a bare
+    /// hostname, and came back as `http://http:/monarr:7676:7676`. The
+    /// person then cannot see what they typed, and the error is about our
+    /// guess rather than their input.
+    #[test]
+    fn a_mistyped_url_is_repaired_or_returned_untouched_never_mangled() {
+        use super::comingsoon::normalize_monarr_url as norm;
+
+        // One slash is unambiguous: nothing else could be meant.
+        assert_eq!(norm("http:/monarr:7676"), "http://monarr:7676");
+        assert_eq!(
+            norm("https:/monarr.example.com"),
+            "https://monarr.example.com"
+        );
+        // ...and it must not then also acquire a second port.
+        assert!(!norm("http:/monarr:7676").contains(":7676:7676"));
+
+        // Anything that cannot be turned into a real URL comes straight
+        // back (bar the trailing-slash trim), so the failure message names
+        // their string rather than our guess at it.
+        for bad in ["http://", "http:", "://monarr", ":7676", "http://:7676"] {
+            let out = norm(bad);
+            assert_eq!(
+                out, bad,
+                "unrepairable input must come back exactly as typed, got {out:?}"
+            );
+        }
+
+        // Nothing this function produces may fail to parse. That is the
+        // property the original bug violated.
+        for input in [
+            "monarr",
+            "monarr:7676",
+            "http:/monarr:7676",
+            "http://monarr:7676",
+            "https://monarr.example.com/",
+            "10.0.0.4",
+            "[::1]:7676",
+        ] {
+            let out = norm(input);
+            assert!(
+                reqwest::Url::parse(&out).is_ok(),
+                "norm({input:?}) produced {out:?}, which is not a URL"
+            );
+        }
+    }
+
     /// Nothing is sent until an admin turns it on. This is the guard on a
     /// decision with a cost: per-user watch state is viewing history, and
     /// this ships it to an application that has no other reason to hold it.
