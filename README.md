@@ -30,7 +30,10 @@ for running it day to day and reading every status and log line it shows you, wi
 decisions (why one binary clusters without external infra), and
 [docs/PLAYBACK.md](docs/PLAYBACK.md) traces the end-to-end path a file takes to
 become a stream — every direct/remux/transcode fork and the per-browser
-transport choice behind it. Scope and the phased
+transport choice behind it. If you run plurx beside monarr,
+[docs/INTEGRATION.md](docs/INTEGRATION.md) documents every seam between them —
+what each does, where you watch it, and the command that proves it works.
+Scope and the phased
 plan live in [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) and
 [docs/ROADMAP.md](docs/ROADMAP.md); client strategy in
 [docs/CLIENTS.md](docs/CLIENTS.md); the trust model — who can reach what, and
