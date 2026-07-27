@@ -156,21 +156,70 @@ pub async fn monarr_status(
     Ok(Json(out))
 }
 
+/// Normalize what a person typed into something reqwest can actually send to.
+///
+/// A bare `host.docker.internal` is what an operator reaches for, and it is
+/// not a URL: reqwest rejects it as a relative address and reports "builder
+/// error", which tells you nothing about what to change. Rather than refuse
+/// it, fill in what is missing and let the settings screen show the result —
+/// a normalization you can see is a normalization you can correct.
+///
+/// A scheme the person supplied is respected in full, port and all. Only a
+/// bare host is completed, and then with monarr's own default port, because
+/// there is nothing else it could sensibly mean.
+pub fn normalize_monarr_url(raw: &str) -> String {
+    const MONARR_DEFAULT_PORT: &str = "7676";
+    let s = raw.trim().trim_end_matches('/');
+    if s.is_empty() || s.contains("://") {
+        return s.to_owned();
+    }
+    // No scheme. If they gave a port, they know what they want; if not, the
+    // only port monarr listens on by default is the one to assume.
+    let host_has_port = s
+        .split('/')
+        .next()
+        .and_then(|authority| authority.rsplit_once(':'))
+        .is_some_and(|(_, port)| !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()));
+    if host_has_port {
+        format!("http://{s}")
+    } else {
+        format!("http://{s}:{MONARR_DEFAULT_PORT}")
+    }
+}
+
+/// The real reason a request failed, not the outermost wrapper.
+///
+/// reqwest's own Display for a send failure is "error sending request for url
+/// (…)" — it names the URL you already know and drops the cause you don't.
+/// Whether this was a DNS failure or a refused connection is the entire
+/// diagnosis, and it lives one or more levels down the source chain. In a
+/// two-container setup those two answers mean completely different things:
+/// DNS means the other container is not resolvable from this one (a missing
+/// `extra_hosts` or a network they do not share), refused means the name
+/// resolved and nothing was listening.
+fn root_cause(e: &dyn std::error::Error) -> String {
+    let mut cause: &dyn std::error::Error = e;
+    let mut deepest = cause.to_string();
+    while let Some(next) = cause.source() {
+        deepest = next.to_string();
+        cause = next;
+    }
+    deepest
+}
+
 async fn probe_monarr(url: &str, key: &str) -> Result<Option<String>, String> {
+    let url = normalize_monarr_url(url);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .user_agent(concat!("plurx/", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(|e| e.to_string())?;
     let resp = client
-        .get(format!(
-            "{}/api/v1/system/status",
-            url.trim_end_matches('/')
-        ))
+        .get(format!("{url}/api/v1/system/status"))
         .header("X-Api-Key", key)
         .send()
         .await
-        .map_err(|e| format!("cannot reach monarr at {url}: {e}"))?;
+        .map_err(|e| format!("cannot reach monarr at {url}: {}", root_cause(&e)))?;
     let status = resp.status();
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
         return Err("monarr rejected the API key".to_owned());
@@ -237,12 +286,8 @@ async fn fetch(url: &str, key: &str) -> Result<Vec<ComingSoon>, String> {
         .unwrap_or(0);
     let today = plurx_core::scan::home::date_from_unix(now);
     let end = plurx_core::scan::home::date_from_unix(now + HORIZON_DAYS * 86_400);
-    let target = format!(
-        "{}/api/v1/calendar?start={}&end={}",
-        url.trim_end_matches('/'),
-        today,
-        end
-    );
+    let url = normalize_monarr_url(url);
+    let target = format!("{url}/api/v1/calendar?start={today}&end={end}");
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .user_agent(concat!("plurx/", env!("CARGO_PKG_VERSION")))
@@ -253,7 +298,7 @@ async fn fetch(url: &str, key: &str) -> Result<Vec<ComingSoon>, String> {
         .header("X-Api-Key", key)
         .send()
         .await
-        .map_err(|e| format!("cannot reach monarr at {url}: {e}"))?;
+        .map_err(|e| format!("cannot reach monarr at {url}: {}", root_cause(&e)))?;
     if !resp.status().is_success() {
         return Err(format!("monarr returned {}", resp.status()));
     }

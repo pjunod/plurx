@@ -525,7 +525,19 @@ pub async fn update_settings(
     ];
     for (key, value) in pairs {
         if let Some(value) = value {
-            state.store.put_setting(key, value.trim()).await?;
+            // The monarr URL is canonicalized on the way in, not at each use
+            // site: a bare `monarr:7676` or `host.docker.internal` is what a
+            // person types, and reqwest answers a schemeless address with
+            // "builder error" — a message about our HTTP client rather than
+            // about their setting. Storing the completed form means every
+            // consumer agrees on it and the settings screen shows back
+            // exactly what plurx will dial.
+            let value = if key == keys::MONARR_URL {
+                super::comingsoon::normalize_monarr_url(value)
+            } else {
+                value.trim().to_owned()
+            };
+            state.store.put_setting(key, &value).await?;
         }
     }
     if let Some(on) = req.monarr_watched_sync {

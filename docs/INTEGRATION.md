@@ -180,6 +180,21 @@ horizon **28 days**.
 monarr's Settings → Security → Reveal), and the `Send watch state to monarr`
 checkbox (§5).
 
+**The URL is completed on save.** A bare host — `monarr`,
+`host.docker.internal` — becomes `http://<host>:7676`, monarr's own default
+port, and the field shows the completed form back so the change is visible
+rather than magic. A scheme you supply is respected in full, port and all:
+guessing `:7676` onto an `https://` URL behind a reverse proxy would break a
+setup that was already correct.
+
+**In Docker, the URL is only half the problem.** plurx is the process making
+this call, so plurx's container is the one that has to be able to resolve the
+name. An `extra_hosts: ["host.docker.internal:host-gateway"]` on monarr's
+compose does nothing for plurx. Either add the same line to plurx's service,
+or — cleaner — put both on one user-defined network and use the service name:
+`http://monarr:7676`. Container-to-container traffic reaches the *internal*
+port, so a published `ports:` mapping is irrelevant on this path.
+
 **Where you see it.** Home → the **Coming soon** rail.
 
 **How to verify.**
@@ -224,6 +239,13 @@ reached it and the key was rejected, reached it and it works.
 | `✗ monarr rejected the API key` | 401/403 — wrong key |
 | `✗ monarr returned <status>` | reached something, but not monarr |
 | `✗ cannot reach monarr at <url>: <err>` | DNS, port, or firewall |
+
+`<err>` is the **root cause**, not reqwest's outer wrapper — the difference
+between `dns error: failed to lookup address information` and
+`Connection refused` is the entire diagnosis, and the outer message throws it
+away. DNS means the other container is not resolvable from this one (a missing
+`extra_hosts`, or a network they do not share); refused means the name
+resolved and nothing was listening on that port.
 
 Saving the card runs the test automatically. Beneath it, the queue line —
 `Watch notifications — N sent, N waiting, N failed` — appears when any counter

@@ -7,7 +7,7 @@
 
 mod auth;
 mod browse;
-mod comingsoon;
+pub mod comingsoon;
 pub use comingsoon::ComingSoonCache;
 mod dto;
 mod error;
@@ -877,6 +877,56 @@ mod tests {
         let (_, body) = call(&app, get("/api/v1/monarr/status", Some(&admin))).await;
         assert_eq!(body["reachable"], true, "{body}");
         assert_eq!(body["version"], "0.9.0");
+
+        // A bare host is what a person types, and it used to produce
+        // "builder error" — a message about our HTTP client rather than
+        // about their setting. It is completed on save, and the settings
+        // response shows the completed form so the fix is visible rather
+        // than magic.
+        let bare = base.trim_start_matches("http://").to_owned();
+        let (_, body) = call(
+            &app,
+            put(
+                "/api/v1/settings",
+                Some(&admin),
+                json!({ "monarr_url": bare, "monarr_api_key": "right" }),
+            ),
+        )
+        .await;
+        assert_eq!(
+            body["monarr_url"], base,
+            "a schemeless host must be completed on save, and shown back: {body}"
+        );
+        let (_, body) = call(&app, get("/api/v1/monarr/status", Some(&admin))).await;
+        assert_eq!(
+            body["reachable"], true,
+            "a bare host must still work: {body}"
+        );
+    }
+
+    /// The URL people actually type, and what plurx dials for it.
+    #[test]
+    fn a_bare_host_is_completed_with_monarrs_own_default_port() {
+        use super::comingsoon::normalize_monarr_url as norm;
+        // Nothing but a host: assume http and monarr's default port, because
+        // there is nothing else it could mean.
+        assert_eq!(
+            norm("host.docker.internal"),
+            "http://host.docker.internal:7676"
+        );
+        assert_eq!(norm("  monarr/ "), "http://monarr:7676");
+        // A port given without a scheme is a port they chose: keep it.
+        assert_eq!(norm("monarr:9000"), "http://monarr:9000");
+        // A scheme given is a decision made — respected in full, including
+        // the implied port. Guessing 7676 onto an https URL behind a reverse
+        // proxy would break a setup that was already correct.
+        assert_eq!(
+            norm("https://monarr.example.com"),
+            "https://monarr.example.com"
+        );
+        assert_eq!(norm("http://10.0.0.4:7676/"), "http://10.0.0.4:7676");
+        // Empty stays empty: "not configured" is a state, not a bad URL.
+        assert_eq!(norm("   "), "");
     }
 
     /// Nothing is sent until an admin turns it on. This is the guard on a

@@ -263,7 +263,8 @@ impl WatchedNotifier {
 /// POST one event. `Err((message, permanent))` — permanent means retrying
 /// cannot help, so the queue should stop rather than spend its schedule.
 async fn post(url: &str, key: &str, payload: &str) -> Result<(), (String, bool)> {
-    let target = format!("{}/api/v1/webhooks/plurx", url.trim_end_matches('/'));
+    let url = crate::http::comingsoon::normalize_monarr_url(url);
+    let target = format!("{url}/api/v1/webhooks/plurx");
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .user_agent(concat!("plurx/", env!("CARGO_PKG_VERSION")))
@@ -276,7 +277,15 @@ async fn post(url: &str, key: &str, payload: &str) -> Result<(), (String, bool)>
         .body(payload.to_owned())
         .send()
         .await
-        .map_err(|e| (format!("cannot reach monarr: {e}"), false))?;
+        .map_err(|e| {
+            let mut cause: &dyn std::error::Error = &e;
+            let mut deepest = cause.to_string();
+            while let Some(next) = cause.source() {
+                deepest = next.to_string();
+                cause = next;
+            }
+            (format!("cannot reach monarr at {url}: {deepest}"), false)
+        })?;
     let status = resp.status();
     if status.is_success() {
         return Ok(());
