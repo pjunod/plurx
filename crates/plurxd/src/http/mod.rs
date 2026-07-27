@@ -486,6 +486,61 @@ mod tests {
         assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
+    /// The same key, in either header.
+    ///
+    /// `X-Api-Key` is what every *arr application sends, and plurx read only
+    /// `Authorization: Bearer`. A perfectly good key therefore came back 401 —
+    /// which reads as "your key is wrong" and sends you off to re-mint a
+    /// credential that was never the problem. The `plx_` prefix is what
+    /// separates a key from a login token, and it does that identically
+    /// whichever header carried the secret, so being fussy bought nothing.
+    #[tokio::test]
+    async fn a_key_works_in_either_header() {
+        let app = test_app();
+        let admin = setup_admin(&app).await;
+        let key = scan_key(&app, &admin, json!(["scan:trigger"])).await;
+        let body = json!({ "path": "/definitely/not/a/library/root" });
+
+        // Authorization: Bearer — reaches the handler, which then rejects the
+        // path rather than the credential.
+        let (bearer, _) = call(&app, post("/api/v1/scan", Some(&key), body.clone())).await;
+
+        // X-Api-Key must reach exactly the same place.
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/scan")
+            .header("content-type", "application/json")
+            .header("x-api-key", &key)
+            .body(axum::body::Body::from(body.to_string()))
+            .expect("request");
+        let (header, _) = call(&app, req).await;
+        assert_eq!(
+            header, bearer,
+            "X-Api-Key must authenticate the same key Authorization does"
+        );
+        assert_ne!(
+            header,
+            StatusCode::UNAUTHORIZED,
+            "a valid key must not read as a bad one"
+        );
+
+        // And it still routes on the prefix: a login token in that header is
+        // the wrong KIND of credential, not a permission problem.
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/scan")
+            .header("content-type", "application/json")
+            .header("x-api-key", &admin)
+            .body(axum::body::Body::from(body.to_string()))
+            .expect("request");
+        let (status, _) = call(&app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a user token in X-Api-Key must not open a key-scoped route"
+        );
+    }
+
     /// A path-mapping mistake between two containers is the likeliest failure
     /// of this whole integration. The error has to diagnose itself.
     #[tokio::test]

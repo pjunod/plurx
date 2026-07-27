@@ -93,6 +93,22 @@ fn token_from_parts(parts: &Parts) -> Option<String> {
             }
         }
     }
+    // X-Api-Key: <key>
+    //
+    // The header every *arr application already uses for exactly this. There
+    // is no reason to be fussy about which one carries the same secret: the
+    // `plx_` prefix is what decides whether a credential is a key or a login
+    // token, and it decides that identically whichever header it arrived in.
+    // Accepting only one of the two conventions turns a valid key into a 401
+    // that reads as "your key is wrong".
+    if let Some(value) = parts.headers.get("x-api-key") {
+        if let Ok(s) = value.to_str() {
+            let s = s.trim();
+            if !s.is_empty() {
+                return Some(s.to_owned());
+            }
+        }
+    }
     // ?token=<token>
     parts
         .uri

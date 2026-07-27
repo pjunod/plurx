@@ -134,8 +134,11 @@ instead of leaving plurx to find it on the next scheduled sweep. One request
 per directory; a season pack that lands ten episodes in one folder is one
 thing that changed.
 
-**Wire.** `POST /api/v1/scan`, header `X-Api-Key: plx_…` with scope
-`scan:trigger`:
+**Wire.** `POST /api/v1/scan`, carrying a key with scope `scan:trigger` as
+`Authorization: Bearer plx_…` — or `X-Api-Key: plx_…`, which plurx also
+accepts because it is the header every *arr application already uses. The
+`plx_` prefix is what separates a key from a login token, and it does that
+whichever header the secret arrived in.
 
 ```json
 // an episode: the SHOW's id, under `series`
@@ -192,7 +195,7 @@ PLURX=http://127.0.0.1:32400
 PLXKEY=plx_…                        # from §2
 
 curl -sS -X POST "$PLURX/api/v1/scan" \
-  -H "X-Api-Key: $PLXKEY" -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $PLXKEY" -H "Content-Type: application/json" \
   -d '{"path":"/media/movies/Some Film (1999)","source":"manual-test",
        "correlation_id":"t-0-verify"}'
 ```
@@ -221,9 +224,14 @@ in a list and authorizes nothing.
 **Where you mint one.** There is **no UI for keys yet** — it is a curl.
 
 ```bash
-# admin session cookie required
+# Log in for an admin token — there is no cookie to copy out of a browser.
+TOKEN=$(curl -sS -X POST "$PLURX/api/v1/auth/login" \
+  -H "Content-Type: application/json" \
+  -d '{"username":"<admin>","password":"<password>"}' \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])')
+
 curl -sS -X POST "$PLURX/api/v1/keys" \
-  -H "Content-Type: application/json" -b <admin session> \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -d '{"name":"monarr","scopes":["scan:trigger"]}'
 ```
 
@@ -232,9 +240,24 @@ retrievable afterwards, which is the correct cost of never storing it. Lose it
 and you issue a new key.
 
 ```bash
-curl -sS "$PLURX/api/v1/keys"    -b <admin session>   # list; shows last_used_at
-curl -sS -X DELETE "$PLURX/api/v1/keys/<id>" -b <admin session>   # revoke
+curl -sS -H "Authorization: Bearer $TOKEN" "$PLURX/api/v1/keys"   # shows last_used_at
+curl -sS -X DELETE -H "Authorization: Bearer $TOKEN" "$PLURX/api/v1/keys/<id>"
 ```
+
+**When the list comes back empty.** The keys live in plurx's database, so an
+empty `/api/v1/keys` on a system that had a working key means the database is
+gone — and users, libraries and watch state went with it. The shipped compose
+pins `plurx-data:/var/lib/plurx` for exactly this reason: an unqualified volume
+is created as `<project>_plurx-data`, so renaming the deployment directory
+presents plurxd with an empty volume rather than an error. Check what is
+actually mounted before minting a replacement:
+
+```bash
+docker inspect -f '{{range .Mounts}}{{.Type}} {{.Source}} -> {{.Destination}}{{"\n"}}{{end}}' <container>
+```
+
+Nothing mapping to `/var/lib/plurx` means the next rebuild will lose the new
+key too. The other tell is the first-run setup screen reappearing.
 
 **How to read it.** `last_used_at` on the listing is the cheapest proof that
 monarr is really using the key you think it is. A key that has never been used
@@ -277,7 +300,7 @@ below — in a container setup, the URL is only half the problem.
 **How to verify.**
 
 ```bash
-curl -sS -b <session> "$PLURX/api/v1/coming-soon" | python3 -m json.tool
+curl -sS -H "Authorization: Bearer $TOKEN" "$PLURX/api/v1/coming-soon" | python3 -m json.tool
 ```
 
 **How to read it.** This is the seam with the sharpest edge in the whole
@@ -335,7 +358,7 @@ the probe.
 **How to verify.**
 
 ```bash
-curl -sS -b <admin session> "$PLURX/api/v1/monarr/status" | python3 -m json.tool
+curl -sS -H "Authorization: Bearer $TOKEN" "$PLURX/api/v1/monarr/status" | python3 -m json.tool
 ```
 
 **How to read it.** `✓ connected · monarr 0.9.0` proves URL + key + reachable,
@@ -381,7 +404,7 @@ failed`. And on the monarr side, System → **Connections** lists `plurx` as
 **How to verify.**
 
 ```bash
-curl -sS -b <admin session> "$PLURX/api/v1/monarr/status" \
+curl -sS -H "Authorization: Bearer $TOKEN" "$PLURX/api/v1/monarr/status" \
   | python3 -m json.tool | grep watched_
 ```
 
@@ -425,7 +448,7 @@ MKEY=<monarr Settings → Security → Reveal>
 1. **plurx can reach monarr** — Settings → Metadata → monarr →
    **Test connection** → `✓ connected · monarr <version>`.
 2. **The calendar half works too** (Test does not cover it) —
-   `curl -sS -b <session> "$PLURX/api/v1/coming-soon"` returns entries, and the
+   `curl -sS -H "Authorization: Bearer $TOKEN" "$PLURX/api/v1/coming-soon"` returns entries, and the
    home screen shows a **Coming soon** rail.
 3. **monarr can reach plurx** — on monarr: Settings → Notifications → the
    plurx notifier's Test → a rejection naming *"under any library root"* is a
