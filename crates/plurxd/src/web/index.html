@@ -145,16 +145,25 @@
      the series they follow. Titles that are not in the library yet have no
      local artwork and fall back to the same initials tile the grids use, so
      the rail never shows a blank rectangle. */
-  .soondate{ font-size:11px; text-transform:uppercase; letter-spacing:.04em;
-             color:var(--muted); white-space:nowrap; overflow:hidden;
-             text-overflow:ellipsis; }
   .soondetail{ font-size:12px; }
-  /* The date sits ON the art, so the meta block below stays the same height
-     as every other card in the rail and the row does not go ragged. */
-  .poster .soonwhen{ position:absolute; left:0; right:0; bottom:0;
-    padding:4px 8px; font-size:11px; text-transform:uppercase;
-    letter-spacing:.04em; color:#fff; background:linear-gradient(transparent,rgba(0,0,0,.8));
+  /* The date sits ON the art so the meta block stays the same height as every
+     other card in the rail. A gradient scrim was not enough: posters put their
+     own logo across the bottom (a Star Trek wordmark, an OUTER BANKS title),
+     so the one line that has to be readable was competing with artwork
+     designed to be read. A solid chip at the TOP wins on every poster instead
+     of most of them — opaque, not a wash, because legibility that depends on
+     what the image happens to look like is not legibility. */
+  .poster .soonwhen{ position:absolute; top:6px; left:6px; max-width:calc(100% - 12px);
+    padding:3px 7px; border-radius:999px;
+    font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:.05em;
+    color:#fff; background:rgba(9,11,16,.82);
+    border:1px solid rgba(255,255,255,.16);
+    -webkit-backdrop-filter:blur(6px); backdrop-filter:blur(6px);
     white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  /* Already here is good news, and reads as a different KIND of fact from a
+     date — so it gets the accent rather than another grey pill. */
+  .poster .soonwhen.here{ background:rgba(9,11,16,.86); color:var(--accent);
+    border-color:color-mix(in srgb, var(--accent) 55%, transparent); }
 
   /* A–Z jump rail: pinned to the right edge on alphabetically-sorted media
      grids (library/category), like a phone contact index. scroll-margin keeps
@@ -1210,16 +1219,26 @@ function installBannerHtml(){
 // not: a card that navigates nowhere is worse than one that plainly cannot.
 function comingCard(e){
   const when = e.has_file ? "Arrived early" : expectedOn(e.date);
+  const chip = e.has_file ? "Here" : shortWhen(e.date);
   const art = artHtml({poster:e.poster, title:e.title, kind:"soon"});
   const go = e.item_id ? ` onclick="location.hash='#/item/${e.item_id}'" style="cursor:pointer"`
                        : ' style="cursor:default"';
   return `<div class="poster"${go}>
-    <div class="artbox">${art}<div class="soonwhen">${esc(when)}</div></div>
+    <div class="artbox">${art}<div class="soonwhen${e.has_file?" here":""}" title="${esc(when)}">${esc(chip)}</div></div>
     <div class="meta">
       <div class="t" title="${esc(e.title||"")}">${esc(e.title||"")}</div>
       <div class="cleft soondetail">${esc(e.detail||"")}</div>
     </div>
   </div>`;
+}
+
+// The chip form: just the when, because the rail above it already says
+// "Coming soon" and a badge 120px wide cannot spend 60 of them on the word
+// "Expected" without truncating the part that carries the information. The
+// full sentence stays in the tooltip.
+function shortWhen(date){
+  const full = expectedOn(date);
+  return full.replace(/^Expected /, "").replace(/^expected /, "") || full;
 }
 
 // "Expected Friday" beats "expected 2026-08-01" for anything inside a week —
