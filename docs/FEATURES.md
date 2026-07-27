@@ -433,6 +433,14 @@ exactly as it did before, on scheduled and manual scans alone.
 - **`correlation_id` is echoed and logged** on every request, so one grep
   reconstructs a single transfer across every application it passed through.
   Integration logging is on its own target (`plurxd::integrate`).
+- **Counted, so a silent stop is visible.** `plurx_scan_total{trigger}` on
+  `/metrics` splits scans into manual, scheduled, startup and targeted, and
+  `plurx_notify_received_total` counts every inbound request — including the
+  ones plurx rejects, because a rejected request still proves the caller
+  reached it. Every trigger is listed even at zero: a counter that appears
+  only once it fires cannot say "this has never happened", which is the most
+  useful thing `trigger="targeted"` has to tell you. The same figures, plus
+  who called last and when, are on `GET /api/v1/system` under `integration`.
 - Pairing runbook and the two curl lines: [OPERATIONS.md](OPERATIONS.md) and
   [CHEATSHEET.md](CHEATSHEET.md); the credential model in
   [SECURITY.md](SECURITY.md).

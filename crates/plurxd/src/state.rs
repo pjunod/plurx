@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -133,6 +134,90 @@ fn now() -> i64 {
 /// Runs library scans (and metadata enrichment) off the request path, one at a
 /// time per library. In Phase 4 this becomes a leader-scheduled cluster
 /// singleton (ARCHITECTURE §2.2); the API surface here stays the same.
+/// What asked for a scan. It is a label on a counter, but the distinction is
+/// the point of having the counter: "plurx scanned 400 times today" says
+/// nothing, while "398 of them were scheduled and 2 were targeted" says the
+/// fast path is not being used and something upstream is not calling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScanTrigger {
+    /// A person pressed a button, or created or edited a library.
+    Manual,
+    /// The reconcile interval came round (P5).
+    Scheduled,
+    /// Scan-at-startup, covering what landed while the server was off.
+    Startup,
+    /// Another application said "index exactly this path".
+    Targeted,
+}
+
+impl ScanTrigger {
+    pub fn label(self) -> &'static str {
+        match self {
+            ScanTrigger::Manual => "manual",
+            ScanTrigger::Scheduled => "scheduled",
+            ScanTrigger::Startup => "startup",
+            ScanTrigger::Targeted => "targeted",
+        }
+    }
+}
+
+/// Counters for the integration, exposed on `/metrics`.
+///
+/// Deliberately counters and not gauges: the question these answer is "is
+/// the other application actually talking to us, and has it stopped?", and
+/// only a monotonic count can distinguish "never" from "not since the last
+/// restart" once it is graphed.
+#[derive(Default, Debug)]
+pub struct IntegrationMetrics {
+    manual: AtomicU64,
+    scheduled: AtomicU64,
+    startup: AtomicU64,
+    targeted: AtomicU64,
+    notify_received: AtomicU64,
+}
+
+impl IntegrationMetrics {
+    fn count_scan(&self, trigger: ScanTrigger) {
+        self.count_for(trigger).fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Every inbound scan request that reached the handler, counted before
+    /// the path is resolved — a request rejected for a path-mapping mistake
+    /// still proves the other application reached plurx, which is the first
+    /// thing anyone debugging this needs to know.
+    pub fn count_notification(&self) {
+        self.notify_received.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `(trigger label, count)` pairs, plus notifications received.
+    ///
+    /// Every trigger is listed even at zero. A counter that only appears
+    /// once it fires cannot express "this has never happened", which is the
+    /// single most useful thing `plurx_scan_total{trigger="targeted"}` has
+    /// to say.
+    pub fn snapshot(&self) -> (Vec<(&'static str, u64)>, u64) {
+        let counts = [
+            ScanTrigger::Manual,
+            ScanTrigger::Scheduled,
+            ScanTrigger::Startup,
+            ScanTrigger::Targeted,
+        ]
+        .into_iter()
+        .map(|t| (t.label(), self.count_for(t).load(Ordering::Relaxed)))
+        .collect();
+        (counts, self.notify_received.load(Ordering::Relaxed))
+    }
+
+    fn count_for(&self, trigger: ScanTrigger) -> &AtomicU64 {
+        match trigger {
+            ScanTrigger::Manual => &self.manual,
+            ScanTrigger::Scheduled => &self.scheduled,
+            ScanTrigger::Startup => &self.startup,
+            ScanTrigger::Targeted => &self.targeted,
+        }
+    }
+}
+
 pub struct JobManager {
     store: Arc<dyn Store>,
     artwork_dir: PathBuf,
@@ -144,6 +229,7 @@ pub struct JobManager {
     pending: Mutex<HashMap<i64, Vec<ScanRequest>>>,
     /// Recent targeted-scan requests and their outcomes, newest last.
     requests: Mutex<VecDeque<ScanRequestRecord>>,
+    metrics: IntegrationMetrics,
 }
 
 /// Ids the caller already knows, so plurx does not have to guess.
@@ -220,6 +306,7 @@ impl JobManager {
             live: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             requests: Mutex::new(VecDeque::new()),
+            metrics: IntegrationMetrics::default(),
         }
     }
 
@@ -241,22 +328,43 @@ impl JobManager {
     /// Kick off a scan for `library_id` unless one is already running. Returns
     /// `true` if a scan was started, `false` if one was already in flight.
     pub async fn trigger_scan(self: &Arc<Self>, library_id: i64) -> bool {
-        self.trigger(library_id, false).await
+        self.trigger_scan_as(library_id, ScanTrigger::Manual).await
+    }
+
+    /// [`trigger_scan`], saying what asked for it.
+    pub async fn trigger_scan_as(self: &Arc<Self>, library_id: i64, why: ScanTrigger) -> bool {
+        self.trigger(library_id, false, why).await
+    }
+
+    /// Counters for `/metrics` and the system page.
+    pub fn metrics(&self) -> &IntegrationMetrics {
+        &self.metrics
     }
 
     /// Like [`trigger_scan`], but forces a full metadata refresh — re-enriches
     /// even already-matched items (backfills season posters onto older shows).
     pub async fn trigger_refresh(self: &Arc<Self>, library_id: i64) -> bool {
-        self.trigger(library_id, true).await
+        self.trigger(library_id, true, ScanTrigger::Manual).await
     }
 
-    async fn trigger(self: &Arc<Self>, library_id: i64, force_metadata: bool) -> bool {
+    /// [`trigger_refresh`], saying what asked for it.
+    pub async fn trigger_refresh_as(self: &Arc<Self>, library_id: i64, why: ScanTrigger) -> bool {
+        self.trigger(library_id, true, why).await
+    }
+
+    async fn trigger(
+        self: &Arc<Self>,
+        library_id: i64,
+        force_metadata: bool,
+        why: ScanTrigger,
+    ) -> bool {
         {
             let mut statuses = self.statuses.lock().await;
             let entry = statuses.entry(library_id).or_default();
             if entry.running {
                 return false;
             }
+            self.metrics.count_scan(why);
             *entry = ScanStatus {
                 running: true,
                 phase: Some("scanning".to_owned()),
@@ -336,6 +444,7 @@ impl JobManager {
     }
 
     async fn run_targeted(&self, req: &ScanRequest) -> Result<TargetedScan, TargetError> {
+        self.metrics.count_scan(ScanTrigger::Targeted);
         let library = self
             .store
             .get_library(req.library_id)
@@ -637,7 +746,7 @@ impl JobManager {
             }
         };
         for library in libraries {
-            if self.trigger_scan(library.id).await {
+            if self.trigger_scan_as(library.id, ScanTrigger::Startup).await {
                 tracing::info!(library = library.id, name = %library.name, "startup scan started");
             }
         }
@@ -657,12 +766,12 @@ impl JobManager {
         for job in due_jobs(now(), &libraries, global) {
             match job {
                 DueJob::Scan(id) => {
-                    if self.trigger_scan(id).await {
+                    if self.trigger_scan_as(id, ScanTrigger::Scheduled).await {
                         tracing::info!(library = id, "scheduled scan started");
                     }
                 }
                 DueJob::Refresh(id) => {
-                    if self.trigger_refresh(id).await {
+                    if self.trigger_refresh_as(id, ScanTrigger::Scheduled).await {
                         tracing::info!(library = id, "scheduled metadata refresh started");
                     }
                 }

@@ -65,6 +65,11 @@ pub async fn scan(
 ) -> Result<(axum::http::StatusCode, Json<serde_json::Value>), ApiError> {
     let mut parts = parts;
     let _key = ScopedKey::require(&mut parts, &state, scopes::SCAN_TRIGGER).await?;
+    // Counted here, before the path is resolved: a request rejected for a
+    // path-mapping mistake still proves the other application reached plurx
+    // with a working key, and that is the first thing anyone debugging this
+    // needs to rule in or out.
+    state.jobs.metrics().count_notification();
 
     let path = PathBuf::from(&body.path);
     if !path.is_absolute() {

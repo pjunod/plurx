@@ -98,8 +98,34 @@ pub struct SystemDto {
     /// The one place an operator can see that monarr is actually talking to
     /// plurx — and what it asked for — without reading the log.
     pub scan_requests: Vec<crate::state::ScanRequestRecord>,
+    /// The integration at a glance: has another application ever reached
+    /// plurx, and when did it last.
+    ///
+    /// `scan_requests` above only holds requests that got as far as a
+    /// library — a path-mapping mistake is rejected before one exists, so a
+    /// server being called constantly and rejecting everything looks
+    /// identical there to one nobody is calling. These counters tell those
+    /// two apart, which is the difference between "fix monarr's path
+    /// mapping" and "check monarr's URL and key".
+    pub integration: IntegrationDto,
     #[serde(flatten)]
     pub info: crate::state::SystemInfo,
+}
+
+#[derive(Serialize)]
+pub struct IntegrationDto {
+    /// Scan requests received from other applications, ever (this process).
+    pub notifications_received: u64,
+    /// Scans started, by what asked for one.
+    pub scans_by_trigger: std::collections::BTreeMap<String, u64>,
+    /// When the last targeted scan request arrived, and who said it was
+    /// from. `None` means none has, this run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_notification_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_notification_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_correlation_id: Option<String>,
 }
 
 /// GET /api/v1/system (admin) — environment diagnostics for the settings
@@ -108,6 +134,9 @@ pub async fn system_info(
     _admin: AdminUser,
     State(state): State<AppState>,
 ) -> Result<Json<SystemDto>, ApiError> {
+    let requests = state.jobs.scan_requests().await;
+    let last = requests.last();
+    let (by_trigger, notifications) = state.jobs.metrics().snapshot();
     Ok(Json(SystemDto {
         name: state.server_name.clone(),
         version: crate::version::SEMVER,
@@ -117,7 +146,17 @@ pub async fn system_info(
         users: state.store.count_users().await?,
         libraries: state.store.list_libraries().await?.len(),
         active_transcodes: state.transcode.active_sessions().await,
-        scan_requests: state.jobs.scan_requests().await,
+        scan_requests: requests.clone(),
+        integration: IntegrationDto {
+            notifications_received: notifications,
+            scans_by_trigger: by_trigger
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), v))
+                .collect(),
+            last_notification_at: last.map(|r| r.at),
+            last_notification_source: last.and_then(|r| r.source.clone()),
+            last_correlation_id: last.and_then(|r| r.correlation_id.clone()),
+        },
         info: (*state.system).clone(),
     }))
 }
@@ -693,6 +732,26 @@ pub async fn metrics(State(state): State<AppState>) -> impl axum::response::Into
         .unwrap_or(0);
     let users = state.store.count_users().await.unwrap_or(0);
 
+    // Integration counters (plan P6). Scans by what asked for them, and how
+    // many times another application has called in at all — the pair that
+    // answers "is the fast path actually being used, or is the scheduled
+    // sweep quietly carrying everything?".
+    let (by_trigger, notifications) = state.jobs.metrics().snapshot();
+    let mut scans = String::from(
+        "# HELP plurx_scan_total Library scans started, by what asked for one.\n\
+         # TYPE plurx_scan_total counter\n",
+    );
+    for (trigger, count) in by_trigger {
+        scans.push_str(&format!(
+            "plurx_scan_total{{trigger=\"{trigger}\"}} {count}\n"
+        ));
+    }
+    scans.push_str(&format!(
+        "# HELP plurx_notify_received_total Scan requests received from other applications.\n\
+         # TYPE plurx_notify_received_total counter\n\
+         plurx_notify_received_total {notifications}\n"
+    ));
+
     let body = format!(
         "# HELP plurx_build_info Build information.\n\
          # TYPE plurx_build_info gauge\n\
@@ -708,7 +767,8 @@ pub async fn metrics(State(state): State<AppState>) -> impl axum::response::Into
          plurx_libraries_total {libraries}\n\
          # HELP plurx_users_total Registered users.\n\
          # TYPE plurx_users_total gauge\n\
-         plurx_users_total {users}\n",
+         plurx_users_total {users}\n\
+         {scans}",
         version = crate::version::SEMVER,
         build = crate::version::BUILD,
     );

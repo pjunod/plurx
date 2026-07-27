@@ -231,7 +231,31 @@ path, a slow full reconcile underneath catches everything else
 scan on schedule; setting `0` stops the loop; next-run visible via the
 API.
 
-### P6 — docs
+### P6 — integration visibility (and docs)
+
+> **Note added on building it.** This file called P6 "docs"; the master
+> plan's §6 table calls it *integration visibility* — the `plurxd::integrate`
+> target, a last-notification record in `/api/v1/system`, and the
+> `plurx_scan_total{trigger}` / `plurx_notify_received_total` metrics. The
+> master wins on conflict, so both were built: the docs below, and the
+> counters.
+
+**Counters, and why these two.** A plurx that scanned 400 times today tells
+you nothing. `plurx_scan_total{trigger="scheduled"} 398` beside
+`{trigger="targeted"} 2` tells you the integration has quietly stopped and
+the slow sweep is carrying everything — which looks entirely fine from the
+library, just slower, for as long as nobody looks.
+`plurx_notify_received_total` counts every inbound scan request **before**
+the path is resolved, so a request rejected for a container path-mapping
+mistake still proves the caller reached plurx with a working key. That is
+what separates "fix monarr's path mapping" from "check monarr's URL and
+key", and `scan_requests` alone cannot: a rejected request never gets as far
+as having one.
+
+The same facts are on `GET /api/v1/system` under `integration`, for anyone
+without Prometheus.
+
+#### Docs
 
 Same-commit rule: `docs/SECURITY.md` (keys — done in P1),
 `docs/FEATURES.md` (integrations section: what arrives from monarr and

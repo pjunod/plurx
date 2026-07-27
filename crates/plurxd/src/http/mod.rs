@@ -690,6 +690,75 @@ mod tests {
         assert_eq!(rec["source"], "monarr");
     }
 
+    /// The counters that answer "is the fast path actually being used?".
+    ///
+    /// A plurx scanning 400 times a day tells you nothing. 398 scheduled and
+    /// 2 targeted tells you the integration has quietly stopped and the slow
+    /// sweep is carrying everything — which looks completely fine from the
+    /// library, just slower, for as long as nobody checks.
+    #[tokio::test]
+    async fn scans_and_notifications_are_counted_by_what_asked_for_them() {
+        let (app, state) = test_state();
+        let admin = setup_admin(&app).await;
+        let key = scan_key(&app, &admin, json!(["scan:trigger", "status:read"])).await;
+
+        let dir = tempfile::tempdir().expect("tmp");
+        let movie = dir.path().join("Heat (1995)");
+        std::fs::create_dir_all(&movie).expect("mkdir");
+        std::fs::write(movie.join("Heat (1995).mkv"), b"x").expect("write");
+        // Creating a library is a manual scan.
+        call(
+            &app,
+            post(
+                "/api/v1/libraries",
+                Some(&admin),
+                json!({ "name": "Movies", "kind": "movies", "paths": [dir.path()] }),
+            ),
+        )
+        .await;
+        scan_and_settle(&app, &key, json!({ "path": movie, "source": "monarr" })).await;
+
+        // A request plurx cannot place still counts as contact: it proves
+        // the caller reached us with a working key, which is what separates
+        // "fix the path mapping" from "check the URL".
+        let (status, _) = call(
+            &app,
+            post(
+                "/api/v1/scan",
+                Some(&key),
+                json!({ "path": "/nowhere/at/all", "source": "monarr" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+        let (_, counts) = state.jobs.metrics().snapshot();
+        assert_eq!(counts, 2, "both requests reached plurx, so both count");
+
+        let (by_trigger, _) = state.jobs.metrics().snapshot();
+        let map: std::collections::HashMap<_, _> = by_trigger.into_iter().collect();
+        assert!(map["manual"] >= 1, "creating a library is a manual scan");
+        assert!(
+            map["targeted"] >= 1,
+            "the placed request was a targeted scan"
+        );
+        assert_eq!(map["scheduled"], 0);
+
+        // And it is all visible without reading the log.
+        let (status, sys) = call(&app, get("/api/v1/system", Some(&admin))).await;
+        assert_eq!(status, StatusCode::OK, "{sys}");
+        assert_eq!(sys["integration"]["notifications_received"], 2);
+        assert_eq!(sys["integration"]["scans_by_trigger"]["targeted"], 1);
+        assert_eq!(
+            sys["integration"]["last_notification_source"], "monarr",
+            "who last called must be visible: {sys}"
+        );
+
+        // The Prometheus surface carries the same two facts.
+        let (status, _) = call(&app, get("/metrics", None)).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
     /// The seam between "another app told us the id" and "go and enrich it".
     ///
     /// These two features can each be right and still combine into an item
