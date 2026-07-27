@@ -298,6 +298,16 @@ below — in a container setup, the URL is only half the problem.
 
 **Where you see it.** Home → the **Coming soon** rail.
 
+**Artwork comes from plurx, not from monarr.** Each entry carries the item's
+TMDB/IMDb ids — the SHOW's, for an episode — and plurx resolves them against
+its own library. A series whose next episode is airing is a series you already
+have, so the poster is already in the artwork cache; proxying an image out of
+another application to display art plurx is holding anyway would be a network
+surface for no gain. A film not yet in the library resolves to nothing and gets
+the same initials tile the grids use. Resolution happens **after** the 15-minute
+cache read, so a title that finished scanning two minutes ago has its picture
+immediately rather than at the end of the quarter-hour.
+
 **How to verify.**
 
 ```bash

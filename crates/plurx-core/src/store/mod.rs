@@ -157,6 +157,23 @@ pub trait LibraryStore: Send + Sync + 'static {
 
 #[async_trait]
 pub trait MediaStore: Send + Sync + 'static {
+    /// The item carrying these external ids, across every library.
+    ///
+    /// For resolving something another application named. Matching on ids and
+    /// never on titles is the rule this whole integration is built on — an
+    /// application guessing which item you meant is the failure it exists to
+    /// remove, and a title match here would reintroduce it from the other
+    /// side.
+    ///
+    /// `kind` is required rather than inferred: a film and a show can hold the
+    /// same TMDB id, because the two id spaces are separate.
+    async fn item_by_external_id(
+        &self,
+        kind: ItemKind,
+        tmdb_id: Option<i64>,
+        imdb_id: Option<&str>,
+    ) -> Result<Option<Item>, StoreError>;
+
     // --- item placement (scanner) ---
     async fn find_movie(
         &self,

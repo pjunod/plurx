@@ -140,14 +140,21 @@
   .ressection .resdot{width:11px;height:11px;border-radius:50%;flex:0 0 auto;
     box-shadow:inset 0 0 0 1px rgba(255,255,255,.25)}
   .poster .prog>i{display:block;height:100%;background:var(--accent);box-shadow:0 0 8px var(--accent)}
-  /* A coming-soon card has no artwork — there is no file yet. It borrows the
-     card's box so the rail lines up with the ones above it, and fills the
-     poster area with the three facts there are. */
-  .card.soon{ display:flex; align-items:center; justify-content:center; }
-  .soonbody{ padding:14px; text-align:center; }
-  .soondate{ font-size:12px; text-transform:uppercase; letter-spacing:.04em; opacity:.75; }
-  .soontitle{ font-weight:600; margin-top:6px; }
-  .soondetail{ font-size:12px; margin-top:4px; }
+  /* A coming-soon card is a poster card whose art is the SHOW's, not the
+     unreleased episode's — the picture a person expects beside "S04E02" is
+     the series they follow. Titles that are not in the library yet have no
+     local artwork and fall back to the same initials tile the grids use, so
+     the rail never shows a blank rectangle. */
+  .soondate{ font-size:11px; text-transform:uppercase; letter-spacing:.04em;
+             color:var(--muted); white-space:nowrap; overflow:hidden;
+             text-overflow:ellipsis; }
+  .soondetail{ font-size:12px; }
+  /* The date sits ON the art, so the meta block below stays the same height
+     as every other card in the rail and the row does not go ragged. */
+  .poster .soonwhen{ position:absolute; left:0; right:0; bottom:0;
+    padding:4px 8px; font-size:11px; text-transform:uppercase;
+    letter-spacing:.04em; color:#fff; background:linear-gradient(transparent,rgba(0,0,0,.8));
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 
   /* A–Z jump rail: pinned to the right edge on alphabetically-sorted media
      grids (library/category), like a phone contact index. scroll-margin keeps
@@ -1191,15 +1198,28 @@ function installBannerHtml(){
 // same kind — the default, since what you want to watch is a kind of thing, not
 // a share name) or "share" (one section per library). Persisted in localStorage
 // like the other viewing prefs.
-// A coming-soon card. Not a media card: there is nothing to play, no poster
-// to show, and pretending otherwise invites a click that does nothing.
+// A coming-soon card.
+//
+// There is still nothing to PLAY — the file does not exist yet — but there is
+// something to show: plurx already holds the poster for any series whose next
+// episode is airing, resolved server-side by TMDB/IMDb id rather than fetched
+// from monarr. A title not in the library gets the same initials tile the
+// grids use.
+//
+// It clicks through to the item when there is one, and is inert when there is
+// not: a card that navigates nowhere is worse than one that plainly cannot.
 function comingCard(e){
   const when = e.has_file ? "Arrived early" : expectedOn(e.date);
-  return `<div class="card soon"><div class="soonbody">
-    <div class="soondate">${esc(when)}</div>
-    <div class="soontitle">${esc(e.title||"")}</div>
-    <div class="soondetail muted">${esc(e.detail||"")}</div>
-  </div></div>`;
+  const art = artHtml({poster:e.poster, title:e.title, kind:"soon"});
+  const go = e.item_id ? ` onclick="location.hash='#/item/${e.item_id}'" style="cursor:pointer"`
+                       : ' style="cursor:default"';
+  return `<div class="poster"${go}>
+    <div class="artbox">${art}<div class="soonwhen">${esc(when)}</div></div>
+    <div class="meta">
+      <div class="t" title="${esc(e.title||"")}">${esc(e.title||"")}</div>
+      <div class="cleft soondetail">${esc(e.detail||"")}</div>
+    </div>
+  </div>`;
 }
 
 // "Expected Friday" beats "expected 2026-08-01" for anything inside a week —

@@ -55,6 +55,42 @@ fn find_by(
 
 #[async_trait]
 impl MediaStore for SqliteStore {
+    async fn item_by_external_id(
+        &self,
+        kind: ItemKind,
+        tmdb_id: Option<i64>,
+        imdb_id: Option<&str>,
+    ) -> Result<Option<Item>, StoreError> {
+        // Neither id means nothing to match on. Falling through would compare
+        // NULL against NULL and return the first row of that kind — a wrong
+        // answer delivered confidently, which is the failure this whole
+        // ids-only rule exists to prevent.
+        let imdb_id = imdb_id.filter(|s| !s.is_empty()).map(str::to_owned);
+        if tmdb_id.is_none() && imdb_id.is_none() {
+            return Ok(None);
+        }
+        let kind = kind.as_str().to_owned();
+        self.with_conn(move |conn| {
+            // Each arm is guarded by its own `IS NOT NULL`, so an id we do not
+            // have can never match a row whose id is also NULL. TMDB wins ties
+            // because it is what plurx stores for everything it enriched; the
+            // IMDb arm is the fallback for items adopted from an NFO.
+            Ok(find_by(
+                conn,
+                &format!(
+                    "SELECT {ITEM_COLS} FROM items
+                     WHERE kind = ?1
+                       AND ((?2 IS NOT NULL AND tmdb_id = ?2)
+                         OR (?3 IS NOT NULL AND imdb_id = ?3 COLLATE NOCASE))
+                     ORDER BY (?2 IS NOT NULL AND tmdb_id = ?2) DESC, id
+                     LIMIT 1"
+                ),
+                params![kind, tmdb_id, imdb_id],
+            )?)
+        })
+        .await
+    }
+
     async fn find_movie(
         &self,
         library_id: i64,

@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use axum::extract::State;
 use axum::Json;
+use plurx_core::domain::ItemKind;
 use plurx_core::store::keys;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -51,6 +52,25 @@ pub struct ComingSoon {
     /// True when monarr already has the file. Kept because "expected
     /// tomorrow" and "arrived early" are different things to look at.
     pub has_file: bool,
+    /// monarr's ids for the item — the SHOW's, for an episode. Not rendered;
+    /// they are how the entry is resolved against plurx's own library.
+    #[serde(skip_serializing)]
+    pub tmdb_id: Option<i64>,
+    #[serde(skip_serializing)]
+    pub imdb_id: Option<String>,
+    /// plurx's own artwork for this title, when it is already in the library.
+    ///
+    /// Resolved by id against the local library rather than fetched from
+    /// monarr: for a show whose next episode is airing, plurx already has the
+    /// poster cached, and proxying an image out of another application to
+    /// display art we are holding anyway would be a new network surface for
+    /// no gain. A film not yet in the library has no local artwork, and the
+    /// card falls back to initials rather than pretending.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub poster: Option<String>,
+    /// The local item, so the card can be clicked through.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -62,6 +82,10 @@ struct MonarrEntry {
     detail: String,
     #[serde(default, rename = "hasFile")]
     has_file: bool,
+    #[serde(default, rename = "tmdbId")]
+    tmdb_id: Option<i64>,
+    #[serde(default, rename = "imdbId")]
+    imdb_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -309,7 +333,7 @@ pub async fn coming_soon(
     if let Some(entries) = state.coming_soon.get().await {
         return Ok(Json(ComingSoonResponse {
             configured: true,
-            entries,
+            entries: with_local_artwork(&state, entries).await,
         }));
     }
 
@@ -323,8 +347,55 @@ pub async fn coming_soon(
     state.coming_soon.put(entries.clone()).await;
     Ok(Json(ComingSoonResponse {
         configured: true,
-        entries,
+        entries: with_local_artwork(&state, entries).await,
     }))
+}
+
+/// Attach plurx's own poster to every entry it can resolve by id.
+///
+/// Done AFTER the cache read, not before it: the cache holds monarr's answer
+/// for fifteen minutes, and artwork resolved into it would be frozen there
+/// too — so a show that finished scanning two minutes ago would stay
+/// pictureless for the rest of the quarter-hour. A handful of indexed lookups
+/// per request is the cheaper mistake.
+async fn with_local_artwork(state: &AppState, entries: Vec<ComingSoon>) -> Vec<ComingSoon> {
+    let mut out = Vec::with_capacity(entries.len());
+    for mut e in entries {
+        // An episode's artwork is its SHOW's — an episode's own id is not what
+        // identifies the series, and the poster a person expects beside
+        // "S04E02" is the show's.
+        let kind = match e.kind.as_str() {
+            "episode" => ItemKind::Show,
+            "movie" => ItemKind::Movie,
+            // Books are not a thing plurx has (guardrail §10.7), so there is
+            // nothing local to find and nothing to look up.
+            _ => {
+                out.push(e);
+                continue;
+            }
+        };
+        match state
+            .store
+            .item_by_external_id(kind, e.tmdb_id, e.imdb_id.as_deref())
+            .await
+        {
+            Ok(Some(item)) => {
+                e.poster = item
+                    .poster_path
+                    .as_ref()
+                    .map(|f| format!("/api/v1/images/{f}"));
+                e.item_id = Some(item.id);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                // A lookup failure costs a picture, never the rail.
+                tracing::warn!(target: "plurxd::integrate", error = %err,
+                    "coming-soon artwork lookup failed");
+            }
+        }
+        out.push(e);
+    }
+    out
 }
 
 async fn fetch(url: &str, key: &str) -> Result<Vec<ComingSoon>, String> {
@@ -361,6 +432,10 @@ async fn fetch(url: &str, key: &str) -> Result<Vec<ComingSoon>, String> {
             title: e.title,
             detail: e.detail,
             has_file: e.has_file,
+            tmdb_id: e.tmdb_id,
+            imdb_id: e.imdb_id,
+            poster: None,
+            item_id: None,
         })
         .collect())
 }

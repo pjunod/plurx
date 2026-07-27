@@ -848,6 +848,146 @@ mod tests {
         );
     }
 
+    /// The rail shows the show's poster plurx already has.
+    ///
+    /// The entries used to be text-only, because the calendar carries no
+    /// artwork and plurx made no attempt to find any. It does not need to
+    /// fetch one: a series whose next episode is airing is a series you
+    /// already have, so the poster is sitting in the artwork cache — and it
+    /// is resolved by TMDB id, never by title, for the same reason every
+    /// other seam in this integration is.
+    #[tokio::test]
+    async fn the_rail_wears_the_artwork_plurx_already_has() {
+        use axum::routing::get as axget;
+        let monarr = axum::Router::new().route(
+            "/api/v1/calendar",
+            axget(|| async {
+                axum::Json(json!([
+                    // In the library: TMDB 1399, and the id is the SHOW's.
+                    { "date": "2026-08-01", "kind": "episode", "mediaItemId": 7,
+                      "title": "The Show", "detail": "S04E02 — Griffin Incident",
+                      "hasFile": false, "tmdbId": 1399 },
+                    // Not in the library: nothing local to wear.
+                    { "date": "2026-08-02", "kind": "movie", "mediaItemId": 8,
+                      "title": "Some Film", "detail": "", "hasFile": false,
+                      "tmdbId": 999999 },
+                    // No ids at all: must not match the first row of its kind.
+                    { "date": "2026-08-03", "kind": "movie", "mediaItemId": 9,
+                      "title": "Nameless", "detail": "", "hasFile": false }
+                ]))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, monarr).await;
+        });
+
+        let (app, state) = test_state();
+        let admin = setup_admin(&app).await;
+        let lib = state
+            .store
+            .create_library(&plurx_core::domain::NewLibrary {
+                name: "TV".into(),
+                kind: plurx_core::domain::LibraryKind::Shows,
+                paths: vec![],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+        let show = state
+            .store
+            .insert_item(&plurx_core::domain::NewItem {
+                library_id: lib.id,
+                kind: plurx_core::domain::ItemKind::Show,
+                parent_id: None,
+                title: "The Show".into(),
+                year: Some(2022),
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("show");
+        state
+            .store
+            .apply_metadata(
+                show,
+                &plurx_core::domain::MetadataPatch {
+                    tmdb_id: Some(1399),
+                    poster_path: Some("show.jpg".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("patch");
+        // A movie that also holds TMDB 1399. The id spaces are separate, so
+        // this must NOT be picked for the episode row.
+        let decoy = state
+            .store
+            .insert_item(&plurx_core::domain::NewItem {
+                library_id: lib.id,
+                kind: plurx_core::domain::ItemKind::Movie,
+                parent_id: None,
+                title: "Decoy".into(),
+                year: Some(2001),
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("decoy");
+        state
+            .store
+            .apply_metadata(
+                decoy,
+                &plurx_core::domain::MetadataPatch {
+                    tmdb_id: Some(1399),
+                    poster_path: Some("decoy.jpg".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("patch");
+
+        call(
+            &app,
+            put(
+                "/api/v1/settings",
+                Some(&admin),
+                json!({ "monarr_url": base, "monarr_api_key": "k" }),
+            ),
+        )
+        .await;
+
+        let (status, body) = call(&app, get("/api/v1/coming-soon", Some(&admin))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let e = body["entries"].as_array().expect("entries");
+        assert_eq!(e.len(), 3, "{body}");
+
+        assert_eq!(
+            e[0]["poster"], "/api/v1/images/show.jpg",
+            "an airing episode must wear its SHOW's poster: {body}"
+        );
+        assert_eq!(e[0]["item_id"], show, "and click through to the show");
+
+        assert!(
+            e[1].get("poster").is_none(),
+            "a film that is not in the library has no local artwork to wear: {body}"
+        );
+        assert!(e[1].get("item_id").is_none());
+
+        assert!(
+            e[2].get("poster").is_none(),
+            "an entry with no ids must match nothing — matching the first row \
+             of its kind would put the wrong picture on the wrong title: {body}"
+        );
+
+        // monarr's ids are for resolving, not for publishing.
+        assert!(e[0].get("tmdb_id").is_none(), "{body}");
+        assert!(e[0].get("imdb_id").is_none(), "{body}");
+    }
+
     /// A settings page that only repeats what you typed cannot answer "did
     /// it work". This one says whether monarr actually answered.
     #[tokio::test]
