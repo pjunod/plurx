@@ -467,6 +467,16 @@ exactly as it did before, on scheduled and manual scans alone.
   a title would only make it guess. **Nothing is ever deleted as a result** —
   there is no delete path on either side.
 
+- **The pairing says whether it works.** Settings → monarr has a **Test
+  connection** button that asks monarr directly and reports what came back:
+  connected with monarr's version, "cannot reach", or "rejected the API key"
+  — three different problems with three different fixes, which a single
+  "failed" would hide. Saving also tests, because saving without checking is
+  how a typo survives a week. The watch-notification queue is shown beside
+  it (sent / waiting / failed): a reachable monarr with a hundred waiting
+  notifications is a different problem from an unreachable one, and both look
+  identical without it.
+
 **How to read it:** a 422 naming plurx's library roots means the path exists
 for the caller but not for plurx — two containers with different mounts, which
 is the likeliest cause by a wide margin; compare the roots in the response

@@ -95,6 +95,96 @@ impl ComingSoonCache {
     }
 }
 
+/// The state of the monarr pairing, for the settings page.
+#[derive(Serialize)]
+pub struct MonarrStatus {
+    pub configured: bool,
+    /// True once monarr has answered a real request.
+    pub reachable: bool,
+    /// monarr's version, when it said.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Watch notifications waiting, delivered, and given up on.
+    pub watched_pending: i64,
+    pub watched_sent: i64,
+    pub watched_failed: i64,
+}
+
+/// GET /api/v1/monarr/status (admin) — is the pairing actually working?
+///
+/// Deliberately an active probe rather than a cached flag. Somebody opening
+/// this page has just typed a URL and a key and wants to know whether they
+/// typed them right; an answer from fifteen minutes ago cannot tell them.
+/// It reads monarr's own status endpoint, which changes nothing.
+pub async fn monarr_status(
+    _admin: super::extract::AdminUser,
+    State(state): State<AppState>,
+) -> Result<Json<MonarrStatus>, ApiError> {
+    let url = state
+        .store
+        .get_setting(keys::MONARR_URL)
+        .await?
+        .unwrap_or_default();
+    let key = state
+        .store
+        .get_setting(keys::MONARR_API_KEY)
+        .await?
+        .unwrap_or_default();
+    let (pending, sent, failed) = state.store.watched_outbox_counts().await?;
+
+    let mut out = MonarrStatus {
+        configured: !url.is_empty() && !key.is_empty(),
+        reachable: false,
+        version: None,
+        error: None,
+        watched_pending: pending,
+        watched_sent: sent,
+        watched_failed: failed,
+    };
+    if !out.configured {
+        return Ok(Json(out));
+    }
+    match probe_monarr(&url, &key).await {
+        Ok(version) => {
+            out.reachable = true;
+            out.version = version;
+        }
+        Err(e) => out.error = Some(e),
+    }
+    Ok(Json(out))
+}
+
+async fn probe_monarr(url: &str, key: &str) -> Result<Option<String>, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .user_agent(concat!("plurx/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .get(format!(
+            "{}/api/v1/system/status",
+            url.trim_end_matches('/')
+        ))
+        .header("X-Api-Key", key)
+        .send()
+        .await
+        .map_err(|e| format!("cannot reach monarr at {url}: {e}"))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Err("monarr rejected the API key".to_owned());
+    }
+    if !status.is_success() {
+        return Err(format!("monarr returned {status}"));
+    }
+    let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    Ok(body
+        .get("version")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_owned()))
+}
+
 /// GET /api/v1/coming-soon (any logged-in user)
 pub async fn coming_soon(
     _user: AuthUser,

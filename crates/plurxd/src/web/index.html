@@ -3259,7 +3259,34 @@ function monarrCardHtml(){
         Nothing is ever deleted as a result.</span></span>
     </label>
     <div class="err" id="mnerr"></div>
-    <button style="margin-top:12px" onclick="saveMonarr()">Save</button></div>`;
+    <div class="row" style="margin-top:12px">
+      <button onclick="saveMonarr()">Save</button>
+      <button class="ghost sm" onclick="testMonarr()">Test connection</button>
+      <span id="mnstat" class="muted"></span>
+    </div>
+    <div id="mnqueue" class="hint"></div></div>`;
+}
+
+// "I set it up and I see no status" is a fair complaint about a settings
+// page that only ever says what you typed. This says whether monarr answered.
+async function testMonarr(){
+  const el=document.getElementById("mnstat"), q=document.getElementById("mnqueue");
+  el.textContent="checking…"; if(q) q.textContent="";
+  try{
+    const st=await api("/monarr/status");
+    if(!st.configured){ el.textContent="✗ not configured"; return; }
+    el.textContent = st.reachable
+      ? `✓ connected${st.version?` · monarr ${st.version}`:""}`
+      : `✗ ${st.error||"no answer"}`;
+    // The outbox is the other half of "is it working": a reachable monarr
+    // with a hundred pending notifications is a different problem from an
+    // unreachable one, and both look identical without this.
+    if(q && (st.watched_pending||st.watched_sent||st.watched_failed)){
+      q.textContent = `Watch notifications — ${st.watched_sent} sent`
+        + (st.watched_pending?`, ${st.watched_pending} waiting`:"")
+        + (st.watched_failed?`, ${st.watched_failed} failed`:"");
+    }
+  }catch(e){ el.textContent="✗ "+(e.message||String(e)); }
 }
 async function saveMonarr(){
   const err=document.getElementById("mnerr"); err.textContent="";
@@ -3269,6 +3296,8 @@ async function saveMonarr(){
       monarr_api_key:document.getElementById("mnkey").value.trim(),
       monarr_watched_sync:document.getElementById("mnsync").checked}});
     toast("monarr settings saved");
+    testMonarr(); // saving without checking is how a typo survives a week
+
   }catch(e){ err.textContent=e.message||String(e); }
 }
 

@@ -75,6 +75,7 @@ pub fn router(state: AppState) -> Router {
         // library id, and plurx resolving it is one less thing for two
         // applications to keep in sync.
         .route("/coming-soon", get(comingsoon::coming_soon))
+        .route("/monarr/status", get(comingsoon::monarr_status))
         .route("/scan", post(scan::scan))
         .route("/scan/requests/{id}", get(scan::request_status))
         // Libraries
@@ -790,6 +791,92 @@ mod tests {
             !raw.contains("monarr-secret"),
             "the key reached the browser: {raw}"
         );
+    }
+
+    /// A settings page that only repeats what you typed cannot answer "did
+    /// it work". This one says whether monarr actually answered.
+    #[tokio::test]
+    async fn the_monarr_card_says_whether_the_pairing_actually_works() {
+        let app = test_app();
+        let admin = setup_admin(&app).await;
+
+        let (status, body) = call(&app, get("/api/v1/monarr/status", Some(&admin))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["configured"], false, "nothing paired yet: {body}");
+        assert_eq!(body["reachable"], false);
+
+        // Paired but pointing at nothing: configured, and honest about it.
+        call(
+            &app,
+            put(
+                "/api/v1/settings",
+                Some(&admin),
+                json!({ "monarr_url": "http://127.0.0.1:1", "monarr_api_key": "k" }),
+            ),
+        )
+        .await;
+        let (_, body) = call(&app, get("/api/v1/monarr/status", Some(&admin))).await;
+        assert_eq!(body["configured"], true);
+        assert_eq!(body["reachable"], false, "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("cannot reach"),
+            "the reason must be readable, got {body}"
+        );
+
+        // A monarr that answers, and one that rejects the key: different
+        // problems, different fixes, so they must not read the same.
+        use axum::routing::get as axget;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            let monarr = axum::Router::new().route(
+                "/api/v1/system/status",
+                axget(|headers: axum::http::HeaderMap| async move {
+                    if headers.get("x-api-key").and_then(|v| v.to_str().ok()) != Some("right") {
+                        return axum::http::StatusCode::UNAUTHORIZED.into_response();
+                    }
+                    axum::Json(json!({ "version": "0.9.0" })).into_response()
+                }),
+            );
+            let _ = axum::serve(listener, monarr).await;
+        });
+
+        call(
+            &app,
+            put(
+                "/api/v1/settings",
+                Some(&admin),
+                json!({ "monarr_url": base.clone(), "monarr_api_key": "wrong" }),
+            ),
+        )
+        .await;
+        let (_, body) = call(&app, get("/api/v1/monarr/status", Some(&admin))).await;
+        assert_eq!(body["reachable"], false);
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("rejected the API key"),
+            "a bad key must not read as an unreachable server: {body}"
+        );
+
+        call(
+            &app,
+            put(
+                "/api/v1/settings",
+                Some(&admin),
+                json!({ "monarr_url": base, "monarr_api_key": "right" }),
+            ),
+        )
+        .await;
+        let (_, body) = call(&app, get("/api/v1/monarr/status", Some(&admin))).await;
+        assert_eq!(body["reachable"], true, "{body}");
+        assert_eq!(body["version"], "0.9.0");
     }
 
     /// Nothing is sent until an admin turns it on. This is the guard on a
