@@ -967,6 +967,7 @@ dependencies = [
  "mime_guess",
  "plurx-compat-plex",
  "plurx-core",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",

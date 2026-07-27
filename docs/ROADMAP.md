@@ -72,6 +72,13 @@ repo. Behaviour in [FEATURES.md](FEATURES.md) §11.
 later, carrying the ids monarr already knew, with one `correlation_id`
 traceable across both applications.
 
+- ✅ **Coming-soon rail (master plan §11.2):** `GET /api/v1/coming-soon` proxies monarr's calendar server-side with a monarr API key from DB settings, cached 15 minutes, rendered as a home rail. Read-only, one endpoint, no monarr changes. The proxying *is* the feature: that key can edit monarr's library, so it never reaches a browser.
+
+**Still to come from the master plan §11.1:** plurx pushing watch state back
+to monarr. Deliberately not started — the plan lists three open questions
+(per-profile policy shape, multi-user semantics, and whether "watched" should
+ever gate deletion automatically) that are decisions, not implementation.
+
 **Live inotify watching remains future work**, and is off the critical path
 now. What shipped instead — scheduled scans plus targeted scans — covers both
 "something changed and said so" and "something changed and didn't". A watcher

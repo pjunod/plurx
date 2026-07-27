@@ -7,6 +7,8 @@
 
 mod auth;
 mod browse;
+mod comingsoon;
+pub use comingsoon::ComingSoonCache;
 mod dto;
 mod error;
 mod extract;
@@ -72,6 +74,7 @@ pub fn router(state: AppState) -> Router {
         // /libraries/{id} on purpose: the caller knows a path, not a plurx
         // library id, and plurx resolving it is one less thing for two
         // applications to keep in sync.
+        .route("/coming-soon", get(comingsoon::coming_soon))
         .route("/scan", post(scan::scan))
         .route("/scan/requests/{id}", get(scan::request_status))
         // Libraries
@@ -688,6 +691,105 @@ mod tests {
         assert_eq!(rec["status"], "done");
         assert_eq!(rec["correlation_id"], "t-42-a3f9c1");
         assert_eq!(rec["source"], "monarr");
+    }
+
+    /// The rail is absent, not broken, when no monarr is paired — and a
+    /// paired monarr that is down must not take the home screen with it.
+    #[tokio::test]
+    async fn the_coming_soon_rail_is_absent_unpaired_and_empty_when_monarr_is_down() {
+        let app = test_app();
+        let admin = setup_admin(&app).await;
+
+        let (status, body) = call(&app, get("/api/v1/coming-soon", Some(&admin))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["configured"], false, "nothing paired: {body}");
+        assert_eq!(body["entries"].as_array().expect("entries").len(), 0);
+
+        // Point it at a port with nothing on it.
+        let (status, _) = call(
+            &app,
+            put(
+                "/api/v1/settings",
+                Some(&admin),
+                json!({ "monarr_url": "http://127.0.0.1:1", "monarr_api_key": "k" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = call(&app, get("/api/v1/coming-soon", Some(&admin))).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a monarr that is down must not fail the home screen: {body}"
+        );
+        assert_eq!(body["configured"], true);
+        assert_eq!(body["entries"].as_array().expect("entries").len(), 0);
+    }
+
+    /// The whole point of proxying: the monarr key stays on the server. A
+    /// browser holding it would hold a credential that can edit the library.
+    #[tokio::test]
+    async fn the_rail_forwards_the_calendar_without_handing_out_the_key() {
+        use axum::routing::get as axget;
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = seen.clone();
+        let monarr = axum::Router::new().route(
+            "/api/v1/calendar",
+            axget(move |headers: axum::http::HeaderMap| {
+                let sink = sink.clone();
+                async move {
+                    if let Some(k) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
+                        sink.lock().expect("lock").push(k.to_owned());
+                    }
+                    axum::Json(json!([
+                        { "date": "2026-08-01", "kind": "episode", "mediaItemId": 7,
+                          "title": "Severance", "detail": "S02E01 — Hello", "hasFile": false }
+                    ]))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, monarr).await;
+        });
+
+        let app = test_app();
+        let admin = setup_admin(&app).await;
+        call(
+            &app,
+            put(
+                "/api/v1/settings",
+                Some(&admin),
+                json!({ "monarr_url": base, "monarr_api_key": "monarr-secret" }),
+            ),
+        )
+        .await;
+
+        let (status, body) = call(&app, get("/api/v1/coming-soon", Some(&admin))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let entries = body["entries"].as_array().expect("entries");
+        assert_eq!(entries.len(), 1, "{body}");
+        assert_eq!(entries[0]["title"], "Severance");
+        assert_eq!(entries[0]["detail"], "S02E01 — Hello");
+        assert_eq!(entries[0]["has_file"], false);
+        // monarr's own item id is not forwarded: it means nothing here, and
+        // publishing it invites somebody to build on it.
+        assert!(entries[0].get("mediaItemId").is_none(), "{body}");
+
+        assert_eq!(
+            seen.lock().expect("lock").as_slice(),
+            ["monarr-secret"],
+            "plurxd must present the key itself"
+        );
+        let raw = serde_json::to_string(&body).expect("json");
+        assert!(
+            !raw.contains("monarr-secret"),
+            "the key reached the browser: {raw}"
+        );
     }
 
     /// The counters that answer "is the fast path actually being used?".

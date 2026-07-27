@@ -48,6 +48,8 @@ pub struct AppState {
     pub trakt: Arc<TraktManager>,
     pub system: Arc<SystemInfo>,
     pub logs: Arc<LogBuffer>,
+    /// The coming-soon rail's cached answer from monarr (plan §11.2).
+    pub coming_soon: Arc<crate::http::ComingSoonCache>,
     pub started_at: Instant,
 }
 
@@ -62,6 +64,7 @@ impl AppState {
         logs: Arc<LogBuffer>,
     ) -> Self {
         let jobs = Arc::new(JobManager::new(Arc::clone(&store), artwork_dir.clone()));
+        let coming_soon = crate::http::ComingSoonCache::new();
         let transcode = Arc::new(TranscodeManager::new(
             Arc::clone(&store),
             transcode_dir,
@@ -82,6 +85,7 @@ impl AppState {
             trakt,
             system: Arc::new(system),
             logs,
+            coming_soon,
             started_at: Instant::now(),
         }
     }

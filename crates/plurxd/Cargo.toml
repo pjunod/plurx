@@ -24,6 +24,7 @@ bytes = { workspace = true }
 futures-util = { workspace = true }
 mime_guess = { workspace = true }
 uuid = { workspace = true }
+reqwest = { workspace = true }
 
 [dev-dependencies]
 http-body-util = { workspace = true }

@@ -365,6 +365,13 @@ pub struct SettingsDto {
     pub trakt_configured: bool,
     pub trakt_client_id: String,
     pub trakt_client_secret: String,
+    /// Where monarr lives, and the key plurxd reads its calendar with — the
+    /// coming-soon rail (plan §11.2). Server-side only: plurxd proxies the
+    /// call, so this key never reaches a browser. Same admin-only,
+    /// mask-until-clicked treatment as the others.
+    pub monarr_configured: bool,
+    pub monarr_url: String,
+    pub monarr_api_key: String,
     /// Playback language defaults (docs/FEATURES.md §7): ISO 639 codes and the
     /// subtitle mode "auto" | "always" | "off".
     pub default_audio_lang: String,
@@ -390,6 +397,16 @@ async fn settings_dto(state: &AppState) -> Result<SettingsDto, ApiError> {
     let omdb_api_key = state
         .store
         .get_setting(keys::OMDB_API_KEY)
+        .await?
+        .unwrap_or_default();
+    let monarr_url = state
+        .store
+        .get_setting(keys::MONARR_URL)
+        .await?
+        .unwrap_or_default();
+    let monarr_api_key = state
+        .store
+        .get_setting(keys::MONARR_API_KEY)
         .await?
         .unwrap_or_default();
     let trakt_client_id = state
@@ -430,6 +447,9 @@ async fn settings_dto(state: &AppState) -> Result<SettingsDto, ApiError> {
         tmdb_api_key,
         omdb_configured: !omdb_api_key.is_empty(),
         omdb_api_key,
+        monarr_configured: !monarr_url.is_empty() && !monarr_api_key.is_empty(),
+        monarr_url,
+        monarr_api_key,
         trakt_configured: !trakt_client_id.is_empty() && !trakt_client_secret.is_empty(),
         trakt_client_id,
         trakt_client_secret,
@@ -460,6 +480,9 @@ pub struct UpdateSettings {
     /// Trakt app credentials; same empty-clears semantics.
     pub trakt_client_id: Option<String>,
     pub trakt_client_secret: Option<String>,
+    /// monarr pairing for the coming-soon rail; same empty-clears semantics.
+    pub monarr_url: Option<String>,
+    pub monarr_api_key: Option<String>,
     /// Playback language defaults. ISO 639 codes ("eng"); mode is
     /// "auto" | "always" | "off".
     pub default_audio_lang: Option<String>,
@@ -479,11 +502,13 @@ pub async fn update_settings(
     State(state): State<AppState>,
     Json(req): Json<UpdateSettings>,
 ) -> Result<Json<SettingsDto>, ApiError> {
-    let pairs: [(&str, &Option<String>); 6] = [
+    let pairs: [(&str, &Option<String>); 8] = [
         (keys::TMDB_API_KEY, &req.tmdb_api_key),
         (keys::OMDB_API_KEY, &req.omdb_api_key),
         (keys::TRAKT_CLIENT_ID, &req.trakt_client_id),
         (keys::TRAKT_CLIENT_SECRET, &req.trakt_client_secret),
+        (keys::MONARR_URL, &req.monarr_url),
+        (keys::MONARR_API_KEY, &req.monarr_api_key),
         (keys::AUDIO_LANG, &req.default_audio_lang),
         (keys::SUB_LANG, &req.default_sub_lang),
     ];

@@ -445,6 +445,16 @@ exactly as it did before, on scheduled and manual scans alone.
   [CHEATSHEET.md](CHEATSHEET.md); the credential model in
   [SECURITY.md](SECURITY.md).
 
+- **Coming soon rail** — the one thing plurx asks monarr for. Settings →
+  monarr takes a URL and a monarr API key; the home screen then carries a
+  **Coming soon** rail of what monarr expects in the next four weeks
+  ("Expected Friday", "Expected Aug 1"). plurxd makes the call and caches it
+  for 15 minutes, so the key never reaches a browser — it can edit monarr's
+  whole library, which is exactly why it stays on the server. Unpaired, the
+  rail is absent rather than empty; a monarr that is down leaves it absent
+  too, because the home screen must not depend on another application being
+  up.
+
 **How to read it:** a 422 naming plurx's library roots means the path exists
 for the caller but not for plurx — two containers with different mounts, which
 is the likeliest cause by a wide margin; compare the roots in the response
@@ -463,11 +473,11 @@ Listed so the inventory above is unambiguous — these are deliberate, with reas
   them.
 - **Does not phone home or need the cloud.** No accounts hosted elsewhere, no
   plex.tv contact, no telemetry. It runs on a LAN with no internet.
-- **Does not call other applications.** The integration in §11 is entirely
-  inbound: other apps talk to plurx, plurx answers, and that is the whole of
-  it. plurx makes no outbound request except to its metadata providers and
-  Trakt, both of which you configured yourself. Pushing watch state back to
-  monarr is on the roadmap and is not built.
+- **Does not push anything to other applications.** The integration in §11 is
+  inbound, plus one read: other apps tell plurx to index, and plurx *asks*
+  monarr for its calendar if you paired one. plurx never tells another
+  application to do something. Pushing watch state back to monarr is on the
+  roadmap and is not built.
 - **Does not do music** (v1 scope). The data model won't preclude it; it is not
   bolted on speculatively. Photos *are* supported, in home libraries (§1a).
 - **Does not expose home libraries through the Plex façade.** Plex has no

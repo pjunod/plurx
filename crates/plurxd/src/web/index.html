@@ -140,6 +140,15 @@
   .ressection .resdot{width:11px;height:11px;border-radius:50%;flex:0 0 auto;
     box-shadow:inset 0 0 0 1px rgba(255,255,255,.25)}
   .poster .prog>i{display:block;height:100%;background:var(--accent);box-shadow:0 0 8px var(--accent)}
+  /* A coming-soon card has no artwork — there is no file yet. It borrows the
+     card's box so the rail lines up with the ones above it, and fills the
+     poster area with the three facts there are. */
+  .card.soon{ display:flex; align-items:center; justify-content:center; }
+  .soonbody{ padding:14px; text-align:center; }
+  .soondate{ font-size:12px; text-transform:uppercase; letter-spacing:.04em; opacity:.75; }
+  .soontitle{ font-weight:600; margin-top:6px; }
+  .soondetail{ font-size:12px; margin-top:4px; }
+
   /* A–Z jump rail: pinned to the right edge on alphabetically-sorted media
      grids (library/category), like a phone contact index. scroll-margin keeps
      the jumped-to poster clear of the sticky header. */
@@ -1182,6 +1191,30 @@ function installBannerHtml(){
 // same kind — the default, since what you want to watch is a kind of thing, not
 // a share name) or "share" (one section per library). Persisted in localStorage
 // like the other viewing prefs.
+// A coming-soon card. Not a media card: there is nothing to play, no poster
+// to show, and pretending otherwise invites a click that does nothing.
+function comingCard(e){
+  const when = e.has_file ? "Arrived early" : expectedOn(e.date);
+  return `<div class="card soon"><div class="soonbody">
+    <div class="soondate">${esc(when)}</div>
+    <div class="soontitle">${esc(e.title||"")}</div>
+    <div class="soondetail muted">${esc(e.detail||"")}</div>
+  </div></div>`;
+}
+
+// "Expected Friday" beats "expected 2026-08-01" for anything inside a week —
+// that is the horizon a person actually holds in their head.
+function expectedOn(date){
+  if(!date) return "Expected";
+  const d = new Date(date+"T00:00:00");
+  if(isNaN(d)) return "Expected "+date;
+  const days = Math.round((d - new Date(new Date().toDateString()))/86400000);
+  if(days<=0) return "Expected today";
+  if(days===1) return "Expected tomorrow";
+  if(days<7) return "Expected "+d.toLocaleDateString(undefined,{weekday:"long"});
+  return "Expected "+d.toLocaleDateString(undefined,{month:"short",day:"numeric"});
+}
+
 function homeGroup(){ try{ return localStorage.getItem("plurx_home_group")||"category"; }catch(e){ return "category"; } }
 function setHomeGroup(v){ try{ localStorage.setItem("plurx_home_group",v); }catch(e){} viewHome(); }
 function libCategory(lib){
@@ -1200,13 +1233,23 @@ function groupToggleHtml(group){
 }
 async function viewHome(){
   chrome("home", `<div id="hubs"><div class="empty">Loading…</div></div>`);
-  const [libs, hubs] = await Promise.all([api("/libraries"), api("/hubs")]);
+  // coming-soon is fetched with the rest but never allowed to fail the page:
+  // it depends on another application, and the home screen must not.
+  const [libs, hubs, soon] = await Promise.all([
+    api("/libraries"), api("/hubs"),
+    api("/coming-soon").catch(()=>({configured:false,entries:[]})),
+  ]);
   let html=installBannerHtml();
   // The first two rails pass watchCtx: those rows are about where you are in
   // something, so the card carries "23m left" / "watched Tuesday".
   if(hubs.continue_watching.length){ html+=`<h2 class="section">Continue watching</h2><div class="rowscroll">${hubs.continue_watching.map(i=>card(i,true)).join("")}</div>`; }
   if(hubs.next_up && hubs.next_up.length){ html+=`<h2 class="section">Next up</h2><div class="rowscroll">${hubs.next_up.map(i=>card(i,true)).join("")}</div>`; }
   if(hubs.recently_added.length){ html+=`<h2 class="section">Recently added</h2><div class="rowscroll">${hubs.recently_added.map(i=>card(i)).join("")}</div>`; }
+  // Coming soon: what monarr expects. Absent entirely when nothing is paired
+  // or monarr had nothing to say — an empty rail is worse than no rail.
+  if(soon && soon.entries && soon.entries.length){
+    html+=`<h2 class="section">Coming soon</h2><div class="rowscroll">${soon.entries.map(comingCard).join("")}</div>`;
+  }
   if(libs.length){
     const group=homeGroup();
     html+=groupToggleHtml(group);
@@ -3023,7 +3066,8 @@ function metadataPanel(settings,trakt){
       <input id="ok" placeholder="OMDb API key" type="password" autocomplete="off" value="${esc(settings.omdb_api_key||'')}" onfocus="this.type='text'" onblur="this.type='password'">
       <div class="err" id="oerr"></div>
       <button class="sm" style="margin-top:10px" onclick="saveOmdb()">Save OMDb key</button></div>
-    ${traktCardHtml(trakt)}`;
+    ${traktCardHtml(trakt)}
+    ${monarrCardHtml()}`;
 }
 function playbackPanel(settings){
   return `<div class="card"><h2 class="section" style="margin-top:0">Playback defaults</h2>
@@ -3190,6 +3234,35 @@ async function savePlayback(){
     toast("Playback defaults saved");
   }catch(e){ err.textContent=e.message; }
 }
+// Pairing with monarr, for the Coming soon rail. The key is stored on the
+// server and used by the server: plurxd makes the call to monarr, so this
+// credential never travels to a browser. It can edit monarr's whole library,
+// which is why that matters.
+function monarrCardHtml(){
+  const url=(SETTINGS&&SETTINGS.monarr_url)||"";
+  const key=(SETTINGS&&SETTINGS.monarr_api_key)||"";
+  const on=(SETTINGS&&SETTINGS.monarr_configured);
+  return `<div class="card" id="monarrcard"><h2 class="section" style="margin-top:0">monarr</h2>
+    <p class="muted" style="margin-top:0">Show a <b>Coming soon</b> rail on the home screen from monarr's calendar —
+      episodes airing and films due in the next four weeks.
+      ${on?'Paired.':'Optional; leave empty for no rail.'}</p>
+    <label>monarr URL</label><input id="mnurl" placeholder="http://monarr:7676" value="${esc(url)}">
+    <label>monarr API key</label><input id="mnkey" type="password" autocomplete="off" value="${esc(key)}" onfocus="this.type='text'" onblur="this.type='password'">
+    <p class="hint">Settings → Security in monarr. plurx keeps it server-side and calls monarr for you,
+      so it is never sent to a browser.</p>
+    <div class="err" id="mnerr"></div>
+    <button style="margin-top:12px" onclick="saveMonarr()">Save</button></div>`;
+}
+async function saveMonarr(){
+  const err=document.getElementById("mnerr"); err.textContent="";
+  try{
+    SETTINGS=await api("/settings",{method:"PUT",body:{
+      monarr_url:document.getElementById("mnurl").value.trim(),
+      monarr_api_key:document.getElementById("mnkey").value.trim()}});
+    toast("monarr settings saved");
+  }catch(e){ err.textContent=e.message||String(e); }
+}
+
 function traktCardHtml(t){
   if(t===null||t===undefined) return "";
   let body="";

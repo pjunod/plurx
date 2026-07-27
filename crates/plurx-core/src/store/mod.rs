@@ -46,6 +46,12 @@ pub mod keys {
     /// trakt.tv/oauth/applications; empty/absent disables the integration).
     pub const TRAKT_CLIENT_ID: &str = "trakt.client_id";
     pub const TRAKT_CLIENT_SECRET: &str = "trakt.client_secret";
+    /// Where monarr lives, and the key to read its calendar with. Both are
+    /// server-side only: plurxd proxies the call so the key never reaches a
+    /// browser (plan §11.2). Unset = no coming-soon rail, which is the
+    /// default and changes nothing.
+    pub const MONARR_URL: &str = "monarr.url";
+    pub const MONARR_API_KEY: &str = "monarr.api_key";
     /// Preferred default audio language (ISO 639 code, e.g. "eng").
     pub const AUDIO_LANG: &str = "playback.audio_lang";
     /// Preferred default subtitle language (ISO 639 code, e.g. "eng").
