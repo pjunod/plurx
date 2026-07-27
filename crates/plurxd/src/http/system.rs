@@ -372,6 +372,10 @@ pub struct SettingsDto {
     pub monarr_configured: bool,
     pub monarr_url: String,
     pub monarr_api_key: String,
+    /// Push watch state to monarr. Off by default, and separate from the
+    /// pair above on purpose: reading monarr's calendar and sending it your
+    /// household's viewing history are very different consents.
+    pub monarr_watched_sync: bool,
     /// Playback language defaults (docs/FEATURES.md §7): ISO 639 codes and the
     /// subtitle mode "auto" | "always" | "off".
     pub default_audio_lang: String,
@@ -450,6 +454,12 @@ async fn settings_dto(state: &AppState) -> Result<SettingsDto, ApiError> {
         monarr_configured: !monarr_url.is_empty() && !monarr_api_key.is_empty(),
         monarr_url,
         monarr_api_key,
+        monarr_watched_sync: state
+            .store
+            .get_setting(keys::MONARR_WATCHED_SYNC)
+            .await?
+            .unwrap_or_default()
+            == "1",
         trakt_configured: !trakt_client_id.is_empty() && !trakt_client_secret.is_empty(),
         trakt_client_id,
         trakt_client_secret,
@@ -483,6 +493,7 @@ pub struct UpdateSettings {
     /// monarr pairing for the coming-soon rail; same empty-clears semantics.
     pub monarr_url: Option<String>,
     pub monarr_api_key: Option<String>,
+    pub monarr_watched_sync: Option<bool>,
     /// Playback language defaults. ISO 639 codes ("eng"); mode is
     /// "auto" | "always" | "off".
     pub default_audio_lang: Option<String>,
@@ -516,6 +527,12 @@ pub async fn update_settings(
         if let Some(value) = value {
             state.store.put_setting(key, value.trim()).await?;
         }
+    }
+    if let Some(on) = req.monarr_watched_sync {
+        state
+            .store
+            .put_setting(keys::MONARR_WATCHED_SYNC, if on { "1" } else { "0" })
+            .await?;
     }
     if let Some(mode) = &req.sub_mode {
         // Normalize through the parser so only valid modes are stored.
@@ -771,6 +788,18 @@ pub async fn metrics(State(state): State<AppState>) -> impl axum::response::Into
             "plurx_scan_total{{trigger=\"{trigger}\"}} {count}\n"
         ));
     }
+    let (pending, ok, failed) = state
+        .store
+        .watched_outbox_counts()
+        .await
+        .unwrap_or((0, 0, 0));
+    scans.push_str(&format!(
+        "# HELP plurx_watched_outbox Watched notifications queued for monarr, by state.\n\
+         # TYPE plurx_watched_outbox gauge\n\
+         plurx_watched_outbox{{status=\"pending\"}} {pending}\n\
+         plurx_watched_outbox{{status=\"ok\"}} {ok}\n\
+         plurx_watched_outbox{{status=\"failed\"}} {failed}\n"
+    ));
     scans.push_str(&format!(
         "# HELP plurx_notify_received_total Scan requests received from other applications.\n\
          # TYPE plurx_notify_received_total counter\n\

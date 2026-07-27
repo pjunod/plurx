@@ -3250,6 +3250,14 @@ function monarrCardHtml(){
     <label>monarr API key</label><input id="mnkey" type="password" autocomplete="off" value="${esc(key)}" onfocus="this.type='text'" onblur="this.type='password'">
     <p class="hint">Settings → Security in monarr. plurx keeps it server-side and calls monarr for you,
       so it is never sent to a browser.</p>
+    <label style="display:flex;align-items:flex-start;gap:8px;margin-top:14px">
+      <input id="mnsync" type="checkbox" ${(SETTINGS&&SETTINGS.monarr_watched_sync)?"checked":""}>
+      <span>Send watch state to monarr
+        <span class="hint" style="display:block">Off by default. When on, plurx tells monarr what was watched
+        <b>and by which plurx user</b>, so monarr can prefer upgrades for shows someone is following.
+        That is viewing history leaving plurx — turn it on only if you want monarr to have it.
+        Nothing is ever deleted as a result.</span></span>
+    </label>
     <div class="err" id="mnerr"></div>
     <button style="margin-top:12px" onclick="saveMonarr()">Save</button></div>`;
 }
@@ -3258,7 +3266,8 @@ async function saveMonarr(){
   try{
     SETTINGS=await api("/settings",{method:"PUT",body:{
       monarr_url:document.getElementById("mnurl").value.trim(),
-      monarr_api_key:document.getElementById("mnkey").value.trim()}});
+      monarr_api_key:document.getElementById("mnkey").value.trim(),
+      monarr_watched_sync:document.getElementById("mnsync").checked}});
     toast("monarr settings saved");
   }catch(e){ err.textContent=e.message||String(e); }
 }

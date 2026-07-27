@@ -30,6 +30,15 @@ pub async fn progress(
         return Err(ApiError::NotFound("item"));
     }
     let position = req.position_ms.max(0);
+    // Read before writing, so "already watched" and "just became watched"
+    // are distinguishable — otherwise every beat after the crossing would
+    // re-notify.
+    let was_watched = state
+        .store
+        .watch_state(user.id, id)
+        .await?
+        .map(|w| w.watched)
+        .unwrap_or(false);
     let watch = state
         .store
         .put_progress(user.id, id, position, req.duration_ms)
@@ -41,6 +50,13 @@ pub async fn progress(
         None => 0.0,
     };
     state.trakt.on_progress(user.id, id, pct, watch.watched);
+    // The 95% crossing is what makes this the interesting hook: it is the
+    // moment somebody finished something, without them pressing anything.
+    // `put_progress` only flips `watched` on the crossing, so this fires
+    // once per item rather than on every 5-second beat.
+    if watch.watched && !was_watched {
+        state.watched.on_watched(user.id, id).await;
+    }
     Ok(Json(watch.into()))
 }
 
@@ -54,6 +70,7 @@ pub async fn scrobble(
         return Err(ApiError::NotFound("item"));
     }
     state.store.set_watched(user.id, id, true).await?;
+    state.watched.on_watched(user.id, id).await;
     state.trakt.request_sync(); // propagate the manual mark promptly
     Ok(Json(serde_json::json!({ "ok": true })))
 }

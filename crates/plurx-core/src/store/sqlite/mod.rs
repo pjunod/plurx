@@ -11,6 +11,7 @@
 mod apikeys;
 mod library;
 mod media;
+mod outbox;
 mod trakt;
 mod users;
 mod watch;
@@ -287,6 +288,35 @@ const MIGRATIONS: &[&str] = &[
     // an upgrade does not re-fetch a library's worth of metadata from TMDB.
     "ALTER TABLE items ADD COLUMN metadata_at INTEGER;
     UPDATE items SET metadata_at = updated_at WHERE tmdb_id IS NOT NULL;",
+    // v10: an outbox for watched notifications (master plan §11.1).
+    //
+    // plurx's FIRST outbound push. Everything before this was inbound — other
+    // applications called plurx and plurx answered — and answering needs no
+    // durability, because the caller is still there to be told. Pushing is the
+    // opposite: the moment that matters is one where the far side may be
+    // restarting, and nobody is waiting to retry on our behalf.
+    //
+    // So it is a table, not a channel. `next_at` makes the backoff survive a
+    // restart, which is the whole reason to have rows at all: the common
+    // failure is a host reboot, and an in-memory retry dies with the process
+    // that owns it.
+    //
+    // `username` is here because of a decision recorded in the master plan:
+    // the signal is per-user rather than aggregate. That is viewing history
+    // leaving the application that has a reason to hold it, so the feature is
+    // off by default and nothing is enqueued unless an admin turned it on.
+    "CREATE TABLE watched_outbox (
+        id          INTEGER PRIMARY KEY,
+        payload     TEXT NOT NULL,
+        attempts    INTEGER NOT NULL DEFAULT 0,
+        last_error  TEXT NOT NULL DEFAULT '',
+        status      TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending', 'ok', 'failed')),
+        next_at     INTEGER NOT NULL DEFAULT 0,
+        created_at  INTEGER NOT NULL DEFAULT (unixepoch()),
+        updated_at  INTEGER NOT NULL DEFAULT (unixepoch())
+    ) STRICT;
+    CREATE INDEX watched_outbox_due ON watched_outbox(status, next_at);",
 ];
 
 /// Column list matching [`item_from_row`]. Prefix with a table alias via
@@ -731,7 +761,7 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .expect("version");
         assert_eq!(version, MIGRATIONS.len() as i64);
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
 
         // Every row survives, values identical.
         let dangling: i64 = conn

@@ -5,6 +5,7 @@ mod state;
 mod trakt;
 mod transcode;
 mod version;
+mod watched;
 
 use std::future::IntoFuture;
 use std::path::PathBuf;
@@ -224,6 +225,10 @@ async fn run(config: Config) -> anyhow::Result<()> {
     // Trakt: hourly (and on-demand) two-way sync + the scrobble-pause sweep.
     tokio::spawn(std::sync::Arc::clone(&state.trakt).sync_loop());
     tokio::spawn(std::sync::Arc::clone(&state.trakt).sweep_loop());
+    // The watched outbox. Its own loop because a retry scheduled two minutes
+    // out has no request to wake it, and a monarr that is down must not stall
+    // anything a viewer is waiting on.
+    tokio::spawn(std::sync::Arc::clone(&state.watched).run());
 
     // GDM responder for Plex-client LAN discovery (best-effort).
     let gdm_id = instance_id.clone();

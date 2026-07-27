@@ -52,6 +52,10 @@ pub mod keys {
     /// default and changes nothing.
     pub const MONARR_URL: &str = "monarr.url";
     pub const MONARR_API_KEY: &str = "monarr.api_key";
+    /// Push watch state to monarr ("1" = on). Off by default and separate
+    /// from the URL/key pair, because reading monarr's calendar and sending
+    /// it your household's viewing history are very different consents.
+    pub const MONARR_WATCHED_SYNC: &str = "monarr.watched_sync";
     /// Preferred default audio language (ISO 639 code, e.g. "eng").
     pub const AUDIO_LANG: &str = "playback.audio_lang";
     /// Preferred default subtitle language (ISO 639 code, e.g. "eng").
@@ -391,6 +395,33 @@ pub trait ApiKeyStore: Send + Sync + 'static {
     async fn set_api_key_disabled(&self, id: i64, disabled: bool) -> Result<bool, StoreError>;
 }
 
+/// One queued outbound notification.
+#[derive(Clone, Debug)]
+pub struct OutboxEntry {
+    pub id: i64,
+    pub payload: String,
+    pub attempts: i64,
+    pub last_error: String,
+    /// pending | ok | failed
+    pub status: String,
+    pub next_at: i64,
+}
+
+/// The outbox for watched notifications (master plan §11.1).
+///
+/// A table rather than a channel, because this is plurx's first *outbound*
+/// push. Answering a request needs no durability — the caller is still there
+/// to be told. Pushing is the opposite: the moment that matters is one where
+/// the far side may be restarting, and nobody is waiting to retry for us.
+#[async_trait]
+pub trait WatchedOutboxStore: Send + Sync + 'static {
+    async fn enqueue_watched(&self, payload: &str) -> Result<i64, StoreError>;
+    async fn due_watched(&self, limit: i64) -> Result<Vec<OutboxEntry>, StoreError>;
+    async fn settle_watched(&self, entry: &OutboxEntry) -> Result<(), StoreError>;
+    /// `(pending, ok, failed)` — for the settings page and `/metrics`.
+    async fn watched_outbox_counts(&self) -> Result<(i64, i64, i64), StoreError>;
+}
+
 /// The full storage boundary — what plurxd holds as `Arc<dyn Store>`.
 pub trait Store:
     SettingsStore
@@ -400,6 +431,7 @@ pub trait Store:
     + MediaStore
     + WatchStore
     + TraktStore
+    + WatchedOutboxStore
     + Send
     + Sync
     + 'static
@@ -414,6 +446,7 @@ impl<T> Store for T where
         + MediaStore
         + WatchStore
         + TraktStore
+        + WatchedOutboxStore
         + Send
         + Sync
         + 'static

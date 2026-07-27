@@ -50,6 +50,8 @@ pub struct AppState {
     pub logs: Arc<LogBuffer>,
     /// The coming-soon rail's cached answer from monarr (plan §11.2).
     pub coming_soon: Arc<crate::http::ComingSoonCache>,
+    /// Pushes watch state to monarr when enabled (plan §11.1).
+    pub watched: Arc<crate::watched::WatchedNotifier>,
     pub started_at: Instant,
 }
 
@@ -65,6 +67,7 @@ impl AppState {
     ) -> Self {
         let jobs = Arc::new(JobManager::new(Arc::clone(&store), artwork_dir.clone()));
         let coming_soon = crate::http::ComingSoonCache::new();
+        let watched = crate::watched::WatchedNotifier::new(Arc::clone(&store));
         let transcode = Arc::new(TranscodeManager::new(
             Arc::clone(&store),
             transcode_dir,
@@ -86,6 +89,7 @@ impl AppState {
             system: Arc::new(system),
             logs,
             coming_soon,
+            watched,
             started_at: Instant::now(),
         }
     }

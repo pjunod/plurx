@@ -792,6 +792,164 @@ mod tests {
         );
     }
 
+    /// Nothing is sent until an admin turns it on. This is the guard on a
+    /// decision with a cost: per-user watch state is viewing history, and
+    /// this ships it to an application that has no other reason to hold it.
+    #[tokio::test]
+    async fn watch_state_goes_nowhere_until_someone_turns_it_on() {
+        let (app, state) = test_state();
+        let admin = setup_admin(&app).await;
+        let lib = state
+            .store
+            .create_library(&plurx_core::domain::NewLibrary {
+                name: "Movies".into(),
+                kind: plurx_core::domain::LibraryKind::Movies,
+                paths: vec![],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+        let movie = state
+            .store
+            .insert_item(&plurx_core::domain::NewItem {
+                library_id: lib.id,
+                kind: plurx_core::domain::ItemKind::Movie,
+                parent_id: None,
+                title: "Heat".into(),
+                year: Some(1995),
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("movie");
+        state
+            .store
+            .apply_metadata(
+                movie,
+                &plurx_core::domain::MetadataPatch {
+                    tmdb_id: Some(949),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("ids");
+
+        // Off (the default): marking watched queues nothing.
+        let (status, _) = call(
+            &app,
+            post(
+                &format!("/api/v1/items/{movie}/scrobble"),
+                Some(&admin),
+                json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        settle().await;
+        assert!(
+            state.store.due_watched(10).await.expect("due").is_empty(),
+            "watch state left plurx without anyone enabling it"
+        );
+
+        // On: the same action queues one, addressed by id.
+        let (status, _) = call(
+            &app,
+            put(
+                "/api/v1/settings",
+                Some(&admin),
+                json!({ "monarr_url": "http://monarr:7676", "monarr_api_key": "k",
+                        "monarr_watched_sync": true }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = call(
+            &app,
+            post(
+                &format!("/api/v1/items/{movie}/scrobble"),
+                Some(&admin),
+                json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        settle().await;
+
+        let queued = state.store.due_watched(10).await.expect("due");
+        assert_eq!(queued.len(), 1, "nothing queued once enabled");
+        let ev: serde_json::Value = serde_json::from_str(&queued[0].payload).expect("payload json");
+        assert_eq!(ev["event"], "watched");
+        assert_eq!(ev["kind"], "movie");
+        assert_eq!(ev["tmdb"], 949);
+        assert_eq!(ev["user"], "paul", "per-user by decision: {ev}");
+        assert!(ev["watched_at"].as_i64().unwrap_or(0) > 0);
+    }
+
+    /// An item monarr could not match is not worth sending. Sending a title
+    /// and letting monarr guess is the exact mistake the rest of this
+    /// integration exists to remove, just pointed the other way.
+    #[tokio::test]
+    async fn an_item_with_no_ids_is_not_announced() {
+        let (app, state) = test_state();
+        let admin = setup_admin(&app).await;
+        let lib = state
+            .store
+            .create_library(&plurx_core::domain::NewLibrary {
+                name: "Movies".into(),
+                kind: plurx_core::domain::LibraryKind::Movies,
+                paths: vec![],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+        let movie = state
+            .store
+            .insert_item(&plurx_core::domain::NewItem {
+                library_id: lib.id,
+                kind: plurx_core::domain::ItemKind::Movie,
+                parent_id: None,
+                title: "Some Home Movie".into(),
+                year: None,
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("movie");
+        call(
+            &app,
+            put(
+                "/api/v1/settings",
+                Some(&admin),
+                json!({ "monarr_url": "http://monarr:7676", "monarr_api_key": "k",
+                        "monarr_watched_sync": true }),
+            ),
+        )
+        .await;
+
+        call(
+            &app,
+            post(
+                &format!("/api/v1/items/{movie}/scrobble"),
+                Some(&admin),
+                json!({}),
+            ),
+        )
+        .await;
+        settle().await;
+        assert!(
+            state.store.due_watched(10).await.expect("due").is_empty(),
+            "an unidentifiable item was announced anyway"
+        );
+    }
+
+    /// `on_watched` spawns, so a test has to let the runtime get to it.
+    async fn settle() {
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
     /// The counters that answer "is the fast path actually being used?".
     ///
     /// A plurx scanning 400 times a day tells you nothing. 398 scheduled and

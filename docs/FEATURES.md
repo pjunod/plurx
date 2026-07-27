@@ -455,6 +455,18 @@ exactly as it did before, on scheduled and manual scans alone.
   too, because the home screen must not depend on another application being
   up.
 
+- **Watch state → monarr**, *off by default*. When enabled (Settings →
+  monarr), finishing something — the 95% crossing or an explicit mark —
+  queues a note to monarr saying what was watched, by id, **and which plurx
+  user watched it**. monarr uses it to prefer upgrades for shows somebody is
+  actually following. The per-user part is why this is opt-in and says so on
+  the settings page: viewing history is personal, and this copies it into an
+  application with no other reason to hold it. Queued in a table with
+  5s/30s/2m retries, so a monarr that was restarting still hears; an item
+  with no TMDB/IMDb id is not sent at all, because monarr matches on ids and
+  a title would only make it guess. **Nothing is ever deleted as a result** —
+  there is no delete path on either side.
+
 **How to read it:** a 422 naming plurx's library roots means the path exists
 for the caller but not for plurx — two containers with different mounts, which
 is the likeliest cause by a wide margin; compare the roots in the response
