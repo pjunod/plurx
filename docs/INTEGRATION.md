@@ -33,6 +33,63 @@ after the import, when the files are actually in place.
 
 Default ports: nzbd 6789 · monarr 7676 · **plurx 32600**.
 
+## Wiring the two together in Docker
+
+Do this first. Most "cannot reach monarr" is a container that cannot resolve a
+name, not a wrong key or a wrong port.
+
+**One shared user-defined network, and address everything by container name.**
+That is the recommended setup, not merely one that works.
+
+```bash
+docker network create media          # once, on the host
+```
+
+Then in **each** compose file — plurx's, monarr's, nzbd's — attach the service
+and declare the network as external:
+
+```yaml
+services:
+  plurx:
+    container_name: plurx            # this name IS the hostname
+    # ...the rest of your service...
+    networks:
+      - media
+
+networks:
+  media:
+    external: true                   # created above; compose must not own it
+```
+
+`docker compose up -d` in each directory, then set the monarr URL to
+`http://monarr:7676`.
+
+Three things that trip people up, each with its reason:
+
+**The hostname is the `container_name`, or the service key if you did not set
+one.** Not the image, and not the directory.
+
+**Published ports are irrelevant on this path.** `ports: - "32600:32600"` maps
+host→container; container→container traffic goes straight to the *internal*
+port and works even with no published port at all. Keep the published ones for
+your own browser, and stop reasoning about them when debugging a seam.
+
+**`host.docker.internal` is a per-container setting, and it is the wrong tool
+here.** It only exists in a container whose compose declares
+`extra_hosts: ["host.docker.internal:host-gateway"]`. plurx is the process
+making this call, so that line has to be on *plurx's* service — putting it on
+monarr's does nothing, which is exactly the trap: monarr→nzbd works, plurx→
+monarr does not, and the two look symmetric from the settings screen. It also
+routes container→host→container for traffic that never needed to leave the
+bridge. A valid fallback when you cannot edit every compose file; not the good
+answer.
+
+**How to tell which one you are hitting.** Test connection reports the root
+cause, not the wrapper: `dns error: failed to lookup address information`
+means the name is not resolvable from this container — wrong network, or a
+missing `extra_hosts`. `Connection refused` means the name resolved and
+nothing was listening on that port.
+
 ## The seams plurx has
 
 | # | Seam | Direction | Transport | Who starts it |
@@ -187,13 +244,8 @@ rather than magic. A scheme you supply is respected in full, port and all:
 guessing `:7676` onto an `https://` URL behind a reverse proxy would break a
 setup that was already correct.
 
-**In Docker, the URL is only half the problem.** plurx is the process making
-this call, so plurx's container is the one that has to be able to resolve the
-name. An `extra_hosts: ["host.docker.internal:host-gateway"]` on monarr's
-compose does nothing for plurx. Either add the same line to plurx's service,
-or — cleaner — put both on one user-defined network and use the service name:
-`http://monarr:7676`. Container-to-container traffic reaches the *internal*
-port, so a published `ports:` mapping is irrelevant on this path.
+See [Wiring the two together in Docker](#wiring-the-two-together-in-docker)
+below — in a container setup, the URL is only half the problem.
 
 **Where you see it.** Home → the **Coming soon** rail.
 
