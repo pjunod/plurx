@@ -6,7 +6,7 @@
 #
 #   cp docker-compose.override.example.yml docker-compose.override.yml
 #   $EDITOR docker-compose.override.yml         # your mounts, your GPU
-#   cp .env.example .env                        # only if changing ports
+#   cp .env.example .env                        # data dir, uid, ports
 #   docker compose up -d --build
 #
 # Compose merges docker-compose.override.yml automatically; both it and .env
@@ -15,8 +15,17 @@
 # and after pulling changes). Once a registry image exists, the `build:` block
 # goes away.
 #
-# plurx never writes to your media; mount it read-only (`:ro`). The named
-# volume holds the database, artwork cache, and transcode scratch.
+# plurx never writes to your media; mount it read-only (`:ro`). The data
+# directory holds the database, artwork cache, and transcode scratch — every
+# user, library, watch position and API key you have.
+#
+# That directory is a BIND MOUNT to a path you chose, not a named volume, and
+# the difference is the point. A named volume lives at a path Docker picks and
+# is easy to orphan: rename the deployment directory, recreate the stack in a
+# way that drops the volume, and plurxd is handed an empty directory rather
+# than an error — it starts, shows the first-run setup screen, and every key
+# and user is silently gone. A path you can `ls` cannot disappear without you
+# noticing. Set PLURX_DATA in .env to move it.
 
 # Pin the Compose project name. Left unset, Compose derives it from the
 # directory holding this file — which is `deploy`, a name half the self-hosted
@@ -36,6 +45,10 @@ services:
     image: plurx/plurxd:latest
     container_name: plurxd
     restart: unless-stopped
+    # Run as you, not as the image's internal `plurx` user, so the files under
+    # PLURX_DATA are readable and removable without sudo. Set PUID/PGID in
+    # .env if your uid is not 1000; `id -u` and `id -g` say what to use.
+    user: "${PUID:-1000}:${PGID:-1000}"
     ports:
       - "32400:32400"                          # HTTP API + web app
       # GDM discovery for Plex clients. Discovery only works on host port
@@ -47,16 +60,8 @@ services:
       PLURX_BIND: "0.0.0.0:32400"
       PLURX_DATA_DIR: "/var/lib/plurx"
     volumes:
-      - plurx-data:/var/lib/plurx
+      # The database and everything else that must survive a rebuild. Create
+      # it first, owned by the same uid the container runs as:
+      #   sudo install -d -o $(id -u) -g $(id -g) /srv/plurx
+      - ${PLURX_DATA:-/srv/plurx}:/var/lib/plurx
       # Media mounts go in docker-compose.override.yml (see example file).
-
-volumes:
-  plurx-data:
-    # Pinned for the same reason the project is: an unqualified volume is
-    # created as `<project>_plurx-data`, so the database's identity would
-    # depend on what the deployment directory happens to be called, and
-    # changing that would silently present plurxd with an empty volume rather
-    # than an error. If you are moving from a version that didn't pin this,
-    # `docker volume ls | grep plurx-data` will show the old name — see
-    # "Renaming the data volume" in README.md before bringing the stack up.
-    name: plurx-data

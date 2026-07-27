@@ -247,10 +247,11 @@ curl -sS -X DELETE -H "Authorization: Bearer $TOKEN" "$PLURX/api/v1/keys/<id>"
 **When the list comes back empty.** The keys live in plurx's database, so an
 empty `/api/v1/keys` on a system that had a working key means the database is
 gone — and users, libraries and watch state went with it. The shipped compose
-pins `plurx-data:/var/lib/plurx` for exactly this reason: an unqualified volume
-is created as `<project>_plurx-data`, so renaming the deployment directory
-presents plurxd with an empty volume rather than an error. Check what is
-actually mounted before minting a replacement:
+bind-mounts `${PLURX_DATA:-/srv/plurx}` to `/var/lib/plurx` for exactly this
+reason: a named volume lives at a path Docker chose, and pointing a container
+at one that does not exist is not an error — Docker makes an empty one, plurxd
+initialises a fresh database, and the first-run setup screen appears. Check
+what is really mounted before minting a replacement:
 
 ```bash
 docker inspect -f '{{range .Mounts}}{{.Type}} {{.Source}} -> {{.Destination}}{{"\n"}}{{end}}' <container>

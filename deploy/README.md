@@ -36,31 +36,56 @@ outright rather than exiting, so there is no exit code and no log left to read.
 Don't remove the `name:` line, and if you run several stacks from directories
 called `deploy`, give each of them one too.
 
-### Renaming the data volume
+### The data directory
 
-The data volume is pinned to `plurx-data` for the same reason. Older revisions
-left it unqualified, so it was created as `<project>_plurx-data` — usually
-`deploy_plurx-data`. Pointing plurxd at a volume that doesn't exist yet is not
-an error; Docker creates an empty one, plurxd initialises a fresh database in
-it, and it looks exactly like losing your library. So check before you bring
-the stack up on a version that pins the name:
+Everything that must survive a rebuild — the database, artwork cache and
+transcode scratch, which is to say every user, library, watch position and API
+key — lives in one directory, bind-mounted from the host:
 
-```sh
-docker volume ls | grep plurx-data
+```yaml
+- ${PLURX_DATA:-/srv/plurx}:/var/lib/plurx
 ```
 
-If that shows something other than a bare `plurx-data`, copy it across once:
+Create it before the first run, owned by the uid the container runs as:
 
 ```sh
-docker compose down                       # stop first; don't copy a live database
-docker volume create plurx-data
-docker run --rm -v deploy_plurx-data:/from -v plurx-data:/to \
+sudo install -d -o $(id -u) -g $(id -g) /srv/plurx
+```
+
+**Why a bind mount and not a named volume.** A named volume lives at a path
+Docker chose, and pointing a container at one that does not exist yet is not an
+error — Docker creates an empty one, plurxd initialises a fresh database in it,
+and the first-run setup screen appears. That is indistinguishable from losing
+your library, and it happens for undramatic reasons: renaming the deployment
+directory, recreating the stack in a way that drops the volume, a `down -v`
+typed in the wrong terminal. A path you can `ls` cannot go missing quietly.
+
+**Moving from the old named volume.** Revisions before this used
+`plurx-data:/var/lib/plurx` (and older ones `<project>_plurx-data`, usually
+`deploy_plurx-data`). Copy it across once, with the stack down so you are not
+copying a live database:
+
+```sh
+docker compose down
+docker volume ls | grep plurx-data                  # confirm the source name
+sudo install -d -o $(id -u) -g $(id -g) /srv/plurx
+docker run --rm -v plurx-data:/from -v /srv/plurx:/to \
     alpine sh -c 'cd /from && cp -a . /to'
+sudo chown -R $(id -u):$(id -g) /srv/plurx
 docker compose up -d
 ```
 
-Keep the old volume until you've confirmed your library is intact, then
-`docker volume rm deploy_plurx-data`.
+Keep the old volume until you have confirmed your users and libraries are
+intact, then `docker volume rm plurx-data`.
+
+**Checking what is actually mounted.** One command, worth running whenever
+something that should have persisted did not:
+
+```sh
+docker inspect -f '{{range .Mounts}}{{.Type}} {{.Source}} -> {{.Destination}}{{"\n"}}{{end}}' plurxd
+```
+
+Nothing mapping to `/var/lib/plurx` means the next rebuild loses everything.
 
 ## Bare metal
 

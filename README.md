@@ -97,23 +97,27 @@ theme (true-black, monospace):
 
 ## Quickstart
 
-The fast path with Docker/Compose — from nothing to playing in four steps:
+The fast path with Docker/Compose — from nothing to playing in five steps:
 
 ```bash
-# 1. Point it at your media and bring it up (builds from source the first time)
+# 1. Make the data directory — the db, artwork and every user/key live here,
+#    at a path you chose so it cannot go missing quietly (see deploy/README.md)
+sudo install -d -o $(id -u) -g $(id -g) /srv/plurx
+
+# 2. Point it at your media and bring it up (builds from source the first time)
 cd deploy
 cp docker-compose.override.example.yml docker-compose.override.yml
 $EDITOR docker-compose.override.yml     # media mounts as host:container:ro, + optional GPU
 docker compose up -d --build
 
-# 2. Open the web app — the first launch is the admin-account setup screen
+# 3. Open the web app — the first launch is the admin-account setup screen
 open http://<host>:32400                # :32400 is the default port
 
-# 3. Add a library: Settings → Libraries → Add & scan
+# 4. Add a library: Settings → Libraries → Add & scan
 #    Kind: Movies | TV Shows | Anime | Home videos & photos
 #    Path: what the SERVER sees (the container mount)
 
-# 4. Press play. Open ⓘ Stats (or press i) to see how it's being served.
+# 5. Press play. Open ⓘ Stats (or press i) to see how it's being served.
 ```
 
 Movies and TV want a free TMDB key for posters and metadata (Settings →

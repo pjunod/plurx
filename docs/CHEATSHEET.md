@@ -109,7 +109,7 @@ Runbook, with monarr's side too: [OPERATIONS.md](OPERATIONS.md).
 |---|---|
 | Web app + API | `http://<host>:32400` |
 | GDM discovery | UDP `32414` (movable host-side via `PLURX_GDM_PORT`) |
-| Data (db, artwork, transcode cache) | `PLURX_DATA_DIR` (default `./data`; Docker volume `plurx-data` → `/var/lib/plurx`) |
+| Data (db, artwork, transcode cache) | `PLURX_DATA_DIR` (default `./data`; Docker bind mount `${PLURX_DATA:-/srv/plurx}` → `/var/lib/plurx`) |
 | Config file | `./plurx.toml` → `/etc/plurx/plurx.toml` (or `PLURX_CONFIG`) |
 | Runtime settings (TMDB key, libraries, users) | In the database, edited in Settings — not the config file |
 | Deploy templates | [`deploy/`](../deploy) — Compose, systemd, launchd (macOS), Unraid |
