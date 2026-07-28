@@ -887,12 +887,47 @@ function reportTtff(){
   clientLog(Object.assign({level:"info",event:"ttff",ms,
     message:`first frame after ${(ms/1000).toFixed(1)}s`}, playbackContext()));
 }
-function reportStall(){
-  const p=PLAYER; if(!p) return;
+// A `waiting` event is not yet a stall, and a stall is not one kind of thing.
+//
+// Safari fires `waiting` at fMP4 segment boundaries and whenever its decoder
+// hitches on a high-bitrate stream — an 83 Mb/s 4K HEVC remux produces them
+// during entirely healthy playback. Counting each one made a session holding
+// forty-four seconds of buffer report itself as stalling, which is both wrong
+// and the opposite of useful: it buries the real ones.
+//
+// Two things fix it. A wait only counts once it has LASTED — the video going
+// hungry for 80ms between segments is not an interruption anyone saw. And a
+// wait is classified by how much was buffered when it began, because that
+// single number separates two unrelated faults: nothing left to play (supply —
+// the server or the link ran out) versus plenty left and still not playing
+// (decode — the browser could not keep up with what it already had). Only the
+// first is a delivery problem, and only the first should ever send anyone
+// looking at pacing.
+const STALL_MIN_MS=350;      // shorter than this and playback did not visibly pause
+const SUPPLY_RUNWAY_SECS=1.5; // less buffered than this when it began: we ran dry
+function beginWait(v){
+  const p=PLAYER;
+  if(!p||!p.started||v.seeking||v.paused) return;
+  if(p.waitAt) return;                       // already hungry; not a second one
+  p.waitAt=performance.now();
+  p.waitRunway=bufferRunway(v);
+}
+// Called when playback resumes (or is abandoned). Decides, in retrospect,
+// whether that gap was worth anyone's attention.
+function endWait(resumed){
+  const p=PLAYER; if(!p||!p.waitAt) return;
+  const ms=Math.round(performance.now()-p.waitAt);
+  const runway=p.waitRunway;
+  p.waitAt=null; p.waitRunway=null;
+  if(!resumed || ms<STALL_MIN_MS) return;    // a hitch, not a stall
+  const kind=(runway!=null && runway<SUPPLY_RUNWAY_SECS)?"supply":"decode";
   p.stalls=(p.stalls||0)+1;
+  p.stallsByKind=p.stallsByKind||{supply:0,decode:0};
+  p.stallsByKind[kind]++;
   const ctx=playbackContext();
-  clientLog(Object.assign({level:"warn",event:"stall",detail:String(p.stalls),
-    message:`stalled with ${ctx.runway}s buffered`}, ctx));
+  clientLog(Object.assign({level:"warn",event:"stall",detail:kind,ms,
+    message:`${kind} stall, ${(ms/1000).toFixed(1)}s, ${runway==null?"?":runway}s buffered`},
+    ctx, {runway}));
 }
 // The buffer stopped growing, and this says why. `quota` is the interesting
 // one: it is the browser refusing more data, which is the actual ceiling on a
@@ -2025,7 +2060,8 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
     reasons:(decision.reasons||[]), title, meta:meta||null,
     transcodeAudio:!!decision.transcode_audio, copyHls:false,
     playStartedAt:clickedAt, ttffMs:null, stalls:0, sessionId:null, health:null,
-    attemptId:null, attemptReason:null, bufferLimits:null, };
+    attemptId:null, attemptReason:null, bufferLimits:null,
+    waitAt:null, waitRunway:null, stallsByKind:null, };
   newAttempt(PENDING_ATTEMPT_REASON || (startSec>0?"resume":"cold-start"));
   PENDING_ATTEMPT_REASON=null;
   if(PLAYER.curAudio<0) PLAYER.curAudio=0;
@@ -2412,23 +2448,24 @@ function wirePlayer(){
   const p=document.getElementById("player"), v=document.getElementById("video");
   if(!p||!v) return;
   ["mousemove","pointerdown","touchstart","keydown"].forEach(ev=>p.addEventListener(ev,playerActivity));
-  v.addEventListener("playing",()=>{ const first=!PLAYER.started; PLAYER.started=true; clearStall(); setLoading(false); playerActivity(); pbTick(); pbSyncPlayIcon(); if(first) reportTtff(); });
+  v.addEventListener("playing",()=>{ const first=!PLAYER.started; endWait(true); PLAYER.started=true; clearStall(); setLoading(false); playerActivity(); pbTick(); pbSyncPlayIcon(); if(first) reportTtff(); });
   v.addEventListener("canplay",()=>{ if(PLAYER.started) setLoading(false); });
   // Only a stream that HAS started can "buffer". Before that, the loading
   // overlay owns the message (and a watchdog owns the deadline), so a stalled
   // start or seek reports what actually went wrong instead of showing a
   // spinner that never resolves.
-  // A `waiting` that follows a deliberate action is not a stall. Seeking into
-  // un-buffered video and resuming from a pause both fire it, and counting
-  // those would make the stall rate a measure of how much the viewer touched
-  // the scrubber. Only an unasked-for interruption during playback counts.
+  //
+  // The wait is only NOTED here. Whether it was a stall — and which kind — is
+  // decided when playback resumes, because that is the first moment its
+  // duration is known. See beginWait/endWait.
   v.addEventListener("waiting",()=>{
     if(!PLAYER||!PLAYER.started) return;
     setLoading(true,"Buffering…","");
-    if(v.seeking||v.paused) return;
-    reportStall();
+    beginWait(v);
   });
-  v.addEventListener("pause",()=>{ p.classList.remove("idle"); });
+  // Pausing during a wait means the viewer stopped it, not the stream.
+  v.addEventListener("pause",()=>{ p.classList.remove("idle"); endWait(false); });
+  v.addEventListener("seeking",()=>{ endWait(false); });
   // A media error never reaches the console on its own — surface it, always.
   // And a remux/direct stream the browser rejects gets one automatic rescue:
   // restart as a transcode session (the server re-encodes to plain H.264/AAC).
@@ -2970,7 +3007,18 @@ function updateStats(){
     if(h.ahead_seconds!=null) srv+=`<div><b>Server ahead</b>${Math.max(0,h.ahead_seconds)} s${h.suspended?' · held':''}</div>`;
   }
   if(PLAYER.ttffMs!=null) srv+=`<div><b>Started in</b>${(PLAYER.ttffMs/1000).toFixed(1)} s</div>`;
-  if(PLAYER.stalls) srv+=`<div><b>Stalls</b>${PLAYER.stalls}</div>`;
+  // Named by kind, because the two mean opposite things and the raw count sent
+  // people to look at the wrong half of the system. `supply` ran out of
+  // buffered video — a server or link problem. `decode` had video in hand and
+  // still could not play it, which is the browser, and which no amount of
+  // pacing or buffering will improve.
+  if(PLAYER.stalls){
+    const k=PLAYER.stallsByKind||{};
+    const parts=[];
+    if(k.supply) parts.push(`${k.supply} supply`);
+    if(k.decode) parts.push(`${k.decode} decode`);
+    srv+=`<div><b>Stalls</b>${PLAYER.stalls}${parts.length?` <span style="opacity:.7">(${parts.join(" · ")})</span>`:''}</div>`;
+  }
   const rate = v.playbackRate&&v.playbackRate!==1? ` · ${v.playbackRate}×`:'';
   const durTxt = PLAYER.durMs? ' / '+clockFromSec(PLAYER.durMs/1000):'';
   body.innerHTML=
