@@ -3888,6 +3888,41 @@ function buildTag(sys){
   if(!b || b==="unknown" || b==="v"+sys.version || b===sys.version) return "";
   return ` <span class="muted" style="font-size:12px">(${esc(b)})</span>`;
 }
+// What the boot probe found out about tone-mapping HDR on this machine.
+//
+// Worth a line of its own because falling back to the CPU chain is *silent*:
+// everything still plays, 4K just stays slow, and there is nothing on screen to
+// distinguish "this box has no GPU tone-map" from "the driver refused the
+// graph" — which are the difference between shrugging and installing a package.
+// Each rejected candidate says what it failed on, so the answer is here rather
+// than in a log line from startup.
+function toneMapHtml(tm){
+  if(!tm) return `<span class="muted">—</span>`;
+  const gpu = tm.selected && tm.selected!=="cpu";
+  // Everything the probe rejected. The CPU chain is the reference the others
+  // are measured against rather than a candidate, so it never appears as one —
+  // "CPU tone-map: 1.0× — not selected" is a line that tells nobody anything.
+  const rejected=(tm.verdicts||[]).filter(v=>!v.passed && v.pipeline!==tm.selected);
+  const head = gpu
+    ? `<span style="color:var(--good)">${esc(tm.selected_label)}</span>`
+    : esc(tm.selected_label||"CPU tone-map");
+  if(!tm.ran){
+    // Not probed is not the same as everything failing, and the reason says
+    // which — usually "software encoder", where a GPU graph would have to
+    // download every frame anyway and there is nothing to gain.
+    const why=(tm.verdicts||[])[0];
+    return `${head} <span class="muted">(${esc(why&&why.rejected||"not probed")})</span>`;
+  }
+  // A CPU selection after a real probe is a *fallback*, and saying so is the
+  // whole point of this line: everything still plays, 4K just stays slow, and
+  // without this there is nothing on screen to distinguish a box with no GPU
+  // tone-map from one whose driver refused the graph.
+  const note = !gpu && rejected.length ? ` <span class="muted">— fell back</span>` : "";
+  const rows=rejected.map(v=>
+    `<div class="muted" style="font-size:12px">${esc(v.label)}: ${esc(v.rejected||"rejected")}</div>`
+  ).join("");
+  return `${head}${note}${rows}`;
+}
 function systemPanel(sys){
   const enc=sys.encoders||{};
   const pills=[["NVENC",enc.nvenc],["QuickSync",enc.qsv],["VA-API",enc.vaapi],["VideoToolbox",enc.videotoolbox]]
@@ -3899,6 +3934,7 @@ function systemPanel(sys){
         <dt>ffmpeg</dt><dd>${sys.ffmpeg_version?esc(sys.ffmpeg_version):`<span style="color:var(--bad)">not found at \`${esc(sys.ffmpeg)}\` — scanning and transcoding will fail</span>`}</dd>
         <dt>Hardware</dt><dd>${pills}</dd>
         <dt>Transcoder</dt><dd>${esc(sys.encoder_selected)} <span class="muted">(preference: ${esc(sys.hwaccel_pref)})</span></dd>
+        <dt>HDR tone-map</dt><dd>${toneMapHtml(sys.tone_map)}</dd>
         <dt>Right now</dt><dd>${sys.active_transcodes} active stream${sys.active_transcodes===1?'':'s'} · ${sys.libraries} librar${sys.libraries===1?'y':'ies'} · ${sys.users} user${sys.users===1?'':'s'}</dd>
       </dl></div>
     <div class="card"><h2 class="section" style="margin-top:0">Logs</h2>
