@@ -1,10 +1,13 @@
 # Performance — where the seconds go, and the plan to get them back
 
-**Status:** M1 complete; **M2 code-complete** (2026-07-28) — pipeline
-abstraction, boot probe, per-session routing, runtime downgrade, and
-hardware-session admission are all shipped and tested. What remains is the
-acceptance run, which needs nynuc: no GPU in CI means no candidate can pass
-its probe there, only fail correctly · **Diagnosed against:** `e7a12cf`
+**Status:** M1 complete; **M2 code-complete**; **M3 complete** (2026-07-28)
+— the pre-transcode cache produces, serves, resumes across process death,
+and stays inside a disk budget. What remains needs hardware rather than
+code: M2's acceptance run and §4.6's grain-heavy bitrate measurement.
+Neither can happen in CI — with no GPU there, a candidate can only fail its
+probe, never pass. The probe's verdicts now render on Settings → System, so
+the M2 run is a look rather than a `curl`. M4 waits on Phase 4's plumbing,
+which does not exist yet · **Diagnosed against:** `e7a12cf`
 · **Review record:** [PERF-PLAN-REVIEW.md](PERF-PLAN-REVIEW.md) →
 [PERF-REVIEW-RESPONSE.md](PERF-REVIEW-RESPONSE.md) →
 [PERF-REVIEW-ASSESSMENT.md](PERF-REVIEW-ASSESSMENT.md) ·
@@ -824,6 +827,9 @@ validation window.
 
 ## 6. M3 — the pre-transcode cache
 
+**Status:** shipped 2026-07-28. Everything in §6.1–§6.3 is built and
+tested; the deviations from what is written below are recorded in §6.4.
+
 **Objective:** the transcodes that were going to happen anyway happen
 before anyone presses Play. A cache hit starts in ≤1.5 s **and seeks like
 direct play**, because a completed HLS asset is a VOD playlist whose every
@@ -956,6 +962,63 @@ playback: the producer yields its slot within a bounded interval, live
 TTFF stays inside its SLO, and the producer later resumes from its
 checkpoint; slot release survives fallback, suspension, and process
 death without leaking.
+
+### 6.4 What was built, and where it differs from the above
+
+Shipped 2026-07-28 across seven commits. The design above survived
+contact; these are the places the code says something the plan did not.
+
+**Track selection is part of the recipe, and the producer has to run it.**
+Not stated in §6.1's field list, and the omission cost a full debugging
+cycle: the producer named its output for a session with no audio track
+chosen while every real playback picked track 0, so the cache filled and
+never hit. From outside that is indistinguishable from a cold cache, and
+every unit test in the suite was happy with it. One `select_tracks`
+function now serves both paths, beside `options_for`.
+
+**The claim is a bookmark as well as a lock.** §6.2 says a preempted
+producer resumes "from that boundary" without saying what carries the
+boundary across a process restart. It is the claim row plus the staged
+parts, read back off disk — which keeps the bookmark and the bytes the
+same fact, so a crash between writing one and the other cannot leave them
+disagreeing. Resuming therefore rests on one producer per node at a time;
+`JobManager::produce_pass` enforces it and `TranscodeManager::produce`
+documents it. A `kill -9` mid-encode is tested: the next process picks up
+at the boundary and publishes a gapless asset.
+
+**Staging needs its own lifecycle rule.** Putting the temp directory under
+the cache root (so publication is a rename on one filesystem) puts it at
+exactly the depth of a fanout prefix, and the orphan sweep treated it as
+one — deleting a producer's work mid-encode, from the maintenance job
+running beside it. What keeps a staging directory alive is the *claim on
+its recipe*, not a published location, because a producer part-way through
+a two-hour film has the former and cannot have the latter.
+
+**A software producer needs the same standing-down as a hardware one.**
+§6.2 describes yielding in terms of the slot machinery, which software
+sessions never touch. Without an explicit check, the loop spawned ffmpeg
+and killed it microseconds later on the first poll, hundreds of times a
+second, for as long as anybody was queuing to play something.
+
+**Candidate selection under-selects on purpose.** §6.2 says candidates are
+filtered by whether their decision "would be a transcode or copy against
+the caps the user last played with". Those caps are not persisted yet, so
+the filter is the source instead: 4K, HDR, or HEVC — what nothing plays
+natively, and therefore what almost any client will transcode. A missed
+candidate costs a viewer the ordinary two-second live start; a wrong one
+costs gigabytes and an hour of GPU on a transcode nobody asks for.
+
+**Resume is within a producer run and across passes, but a run that
+exhausts its six-hour window still discards its progress.** The parts are
+named and numbered on disk and the claim row is where a longer-lived
+checkpoint would live, so lifting this is contained — it has simply not
+been needed, because a pass that gets any hardware at all finishes a film
+well inside the window.
+
+**Not measured yet:** the TTFF and seek numbers in the acceptance list.
+The mechanism is verified end to end — a hit starts with no ffmpeg spawned
+and seeks by `currentTime` — but ≤1.5 s and ≤0.5 s are claims about a
+machine, and belong with M2's acceptance run on nynuc.
 
 ## 7. M4 — cluster transcode (rides Phase 4)
 
@@ -1232,7 +1295,7 @@ chosen-by-probe (§5) · [ROADMAP.md](ROADMAP.md) — this plan's slice line.
 | Correction pass ✅ | §2.8: R1 client config · three-frontier accounting + retention + byte budgets · attempt generations + live labels · §8.5 lifecycle · R11 cheap wins | shipped code now matches the reviewed contracts |
 | Weekend 2 | §4.4 + §4.6 (+§4.7 decision) | starts ~2–3 s; Wi-Fi-stable rungs; validation exercises the production flags |
 | Focused week | §5 (M2) — real-HDR probe matrix on nynuc + one AMD node first | 4K HDR fully hardware; the 30 s stutter class gone; Auto=1080p viable; admission by measured speed |
-| Next | §6 (M3) — slot arbiter v1 lands with it | predicted plays start ≤1.5 s and seek like direct play; producers yield to viewers |
+| Weekend 3 ✅ | §6 (M3) — slot arbiter v1 landed with it | predicted plays start with no encoder and seek like direct play; producers yield to viewers |
 | With Phase 4 | §7 (M4) — fencing + takeover protocol per §7.3 | pool of nodes; failover inside the measured budget; overnight cluster pre-caching |
 
 Every slice leaves the tree releasable; nothing in a later slice is
@@ -1240,7 +1303,15 @@ load-bearing for an earlier one. The correction pass went first because
 building §4.4 onward on accounting the review cycle disproved would have
 compounded the debt; with it landed, the remaining uncertainty is
 measurement uncertainty owned by M0 — which is where uncertainty belongs.
-The next thing that should happen is not code: it is running the fixture
-matrix on nynuc, because §4.4's segment-length trade-off and §5's whole
-premise are both claims about numbers nobody has measured on the hardware
-this runs on.
+
+M3 shipped ahead of M2's acceptance run, which was the right order for a
+reason worth writing down: the cache is the only milestone whose value does
+not depend on which encoder wins, so it could be built and proved on a box
+with no GPU at all. M2's remaining work cannot be.
+
+**The next thing that should happen is still not code.** It is running the
+fixture matrix on nynuc, because §4.4's segment-length trade-off and §5's
+whole premise are both claims about numbers nobody has measured on the
+hardware this runs on — and M3's own TTFF and seek targets (§6.4) now wait
+in the same queue, for the same reason. Everything that could be settled
+without that hardware has been.
