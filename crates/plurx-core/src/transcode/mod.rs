@@ -14,9 +14,11 @@
 
 mod encoder;
 mod pipeline;
+mod recipe;
 
 pub use encoder::{detect_encoders, Encoder, EncoderCaps};
 pub use pipeline::{Pipeline, CANDIDATES as PIPELINE_CANDIDATES};
+pub use recipe::{PipelineDigest, Recipe};
 
 use crate::domain::MediaFile;
 

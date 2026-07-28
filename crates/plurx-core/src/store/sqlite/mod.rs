@@ -317,6 +317,47 @@ const MIGRATIONS: &[&str] = &[
         updated_at  INTEGER NOT NULL DEFAULT (unixepoch())
     ) STRICT;
     CREATE INDEX watched_outbox_due ON watched_outbox(status, next_at);",
+    // v11: the pre-transcode cache (PERF-PLAN §6.1).
+    //
+    // Two tables, not one, and the split is the whole design. A recipe is
+    // *what* a transcode is — the content-addressed name of some bytes. A
+    // location is *where a copy of it happens to be*, which is a different
+    // fact with a different lifetime: on a cluster the same recipe exists on
+    // several nodes, any of which may evict its copy without that saying
+    // anything about the others. One row with one `dir` cannot express "A has
+    // it, B had it and dropped it", and the day it has to, the migration is
+    // far more expensive than the extra table is now.
+    //
+    // Directories are RELATIVE to the configured cache root. An absolute path
+    // is a fact about one machine's mounts, and the point of the location
+    // table is that the row travels while the mount does not.
+    //
+    // Deliberately not under `data_dir/transcode`, which is wiped at every
+    // boot: a cache that empties on restart is a warm-up cost with none of the
+    // benefit.
+    "CREATE TABLE transcode_cache_recipes (
+        recipe_hash    TEXT PRIMARY KEY,
+        file_id        INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+        recipe_version INTEGER NOT NULL,
+        created_at     INTEGER NOT NULL DEFAULT (unixepoch())
+    ) STRICT;
+    CREATE INDEX transcode_cache_recipes_file ON transcode_cache_recipes(file_id);
+
+    CREATE TABLE transcode_cache_locations (
+        recipe_hash   TEXT NOT NULL REFERENCES transcode_cache_recipes(recipe_hash)
+                                    ON DELETE CASCADE,
+        node_id       TEXT NOT NULL,
+        storage_class TEXT NOT NULL CHECK (storage_class IN ('local', 'shared')),
+        relative_dir  TEXT NOT NULL,
+        bytes         INTEGER NOT NULL DEFAULT 0,
+        complete      INTEGER NOT NULL DEFAULT 0,
+        last_used_at  INTEGER NOT NULL DEFAULT (unixepoch()),
+        last_seen_at  INTEGER NOT NULL DEFAULT (unixepoch()),
+        PRIMARY KEY (recipe_hash, node_id, storage_class)
+    ) STRICT;
+    -- Eviction reads this: complete copies on this node, coldest first.
+    CREATE INDEX transcode_cache_lru
+        ON transcode_cache_locations(node_id, complete, last_used_at);",
 ];
 
 /// Column list matching [`item_from_row`]. Prefix with a table alias via
@@ -761,7 +802,11 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .expect("version");
         assert_eq!(version, MIGRATIONS.len() as i64);
-        assert_eq!(version, 10);
+        assert_eq!(
+            version, 11,
+            "a new migration must be a deliberate bump, not a surprise — \
+             the list is append-only and every entry is one somebody shipped"
+        );
 
         // Every row survives, values identical.
         let dangling: i64 = conn
