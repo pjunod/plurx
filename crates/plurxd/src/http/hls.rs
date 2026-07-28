@@ -46,6 +46,10 @@ pub struct StartResponse {
     pub duration_ms: Option<i64>,
     pub start_seconds: f64,
     pub encoder: String,
+    /// The whole stream already exists on disk (a pre-transcode cache hit).
+    /// The player treats it like direct play: seek by `currentTime`, and don't
+    /// arm the stall watchdog's restart — see `StartInfo::vod`.
+    pub vod: bool,
 }
 
 /// Everything a client must say to open a stream.
@@ -152,6 +156,7 @@ pub async fn create(
         duration_ms: info.duration_ms,
         start_seconds: info.start_seconds,
         encoder: info.encoder.to_owned(),
+        vod: info.vod,
     }))
 }
 

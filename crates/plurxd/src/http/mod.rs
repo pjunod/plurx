@@ -209,14 +209,22 @@ mod tests {
 
     use super::*;
 
+    fn test_dirs(base: &std::path::Path) -> crate::state::Dirs {
+        crate::state::Dirs {
+            artwork: base.join("artwork"),
+            transcode: base.join("transcode"),
+            cache: base.join("cache"),
+        }
+    }
+
     fn test_app() -> Router {
         let store = SqliteStore::open_in_memory().expect("store");
         let base = std::env::temp_dir().join(format!("plurx-test-{}", uuid::Uuid::new_v4()));
         let state = AppState::new(
             "test".into(),
             Arc::new(store),
-            base.join("artwork"),
-            base.join("transcode"),
+            test_dirs(&base),
+            "test-node".into(),
             Default::default(),
             Default::default(),
             Arc::new(crate::logbuf::LogBuffer::new(64)),
@@ -2001,8 +2009,8 @@ mod tests {
         let state = AppState::new(
             "test".into(),
             Arc::new(store),
-            base.join("artwork"),
-            base.join("transcode"),
+            test_dirs(&base),
+            "test-node".into(),
             Default::default(),
             Default::default(),
             Arc::new(crate::logbuf::LogBuffer::new(64)),

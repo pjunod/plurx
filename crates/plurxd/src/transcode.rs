@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use plurx_core::store::{keys, Store};
 use plurx_core::transcode::{
-    self, Encoder, EncoderCaps, Pacing, Pipeline, ToneMap, TranscodeOptions,
+    self, Encoder, EncoderCaps, Pacing, Pipeline, PipelineDigest, Recipe, ToneMap, TranscodeOptions,
 };
 use tokio::process::Child;
 use tokio::sync::Mutex;
@@ -544,7 +544,9 @@ async fn watch_for_stall(session: Arc<Session>, dir: PathBuf, sid: String) {
         }
         let exited = {
             let mut child = session.child.lock().await;
-            matches!(child.try_wait(), Ok(Some(_)))
+            child
+                .as_mut()
+                .is_some_and(|c| matches!(c.try_wait(), Ok(Some(_))))
         };
         if exited {
             return;
@@ -559,10 +561,7 @@ async fn watch_for_stall(session: Arc<Session>, dir: PathBuf, sid: String) {
                  failing the session — the source is likely undecodable by this ffmpeg build \
                  (e.g. a Dolby Vision profile it can't handle)"
             );
-            {
-                let mut child = session.child.lock().await;
-                let _ = child.kill().await;
-            }
+            session.kill_child().await;
             session.failed.store(true, Relaxed);
             return;
         }
@@ -619,7 +618,19 @@ fn tone_map_pref() -> ToneMap {
 
 struct Session {
     dir: PathBuf,
-    child: Mutex<Child>,
+    /// The ffmpeg producing this session's segments — `None` for a cache hit,
+    /// where the segments already exist and there is nothing to run, watch,
+    /// suspend or kill.
+    child: Mutex<Option<Child>>,
+    /// Served from the pre-transcode cache.
+    ///
+    /// Two things follow, and the second is the dangerous one. A cached
+    /// session has no process, so every watchdog, stall check and flow-control
+    /// decision is about nothing. And its directory is a finished asset this
+    /// session did not produce and other viewers will want — deleting it on
+    /// the way out, which is what every other session does, would destroy the
+    /// cache one playback at a time.
+    cached: bool,
     last_access: Mutex<Instant>,
     // -- metadata for the activity page --
     file_id: i64,
@@ -701,6 +712,28 @@ fn ahead_of(index: &SegmentIndex, fetched_end_ms: i64) -> Option<Ahead> {
 }
 
 impl Session {
+    /// Stop the encoder, if there is one. A cache hit has no process; a
+    /// session whose ffmpeg already exited has one that is already reaped.
+    async fn kill_child(&self) {
+        if let Some(child) = self.child.lock().await.as_mut() {
+            let _ = child.kill().await;
+        }
+    }
+
+    /// Remove this session's scratch — unless it is a cache entry, which this
+    /// session did not produce and the next viewer still wants.
+    ///
+    /// The guard is the whole reason this is a method. Every other place a
+    /// session ends removes its directory, correctly, and a cached session
+    /// reaching one of those paths without this check would delete the cache
+    /// one playback at a time — each hit destroying the entry that made it.
+    async fn discard_dir(&self) {
+        if self.cached {
+            return;
+        }
+        let _ = tokio::fs::remove_dir_all(&self.dir).await;
+    }
+
     /// Hand the hardware slot back now rather than whenever the last reference
     /// to this session happens to go. Idempotent, because the reaper and an
     /// explicit stop can both reach a session and neither should have to know
@@ -745,8 +778,16 @@ impl Session {
                 self.fetched_end_ms.fetch_max(end, Relaxed);
             }
         }
-        if let Some(ahead) = ahead_of(&index, self.fetched_end_ms.load(Relaxed).max(0)) {
-            self.ahead_bytes.store(ahead.bytes, Relaxed);
+        // A cached asset's bytes are not scratch, and must not be counted as
+        // any. The global budget is a sum over every session, and it decides
+        // whether *live* encoders get suspended — so a 6 GB cached 4K title
+        // reported here would blow the budget the moment somebody pressed
+        // play and hold every real encoder on the box. Those bytes are already
+        // accounted for, by the cache's own size budget.
+        if !self.cached {
+            if let Some(ahead) = ahead_of(&index, self.fetched_end_ms.load(Relaxed).max(0)) {
+                self.ahead_bytes.store(ahead.bytes, Relaxed);
+            }
         }
         *self.segments.lock().await = index;
     }
@@ -796,6 +837,15 @@ pub struct StartInfo {
     pub duration_ms: Option<i64>,
     pub start_seconds: f64,
     pub encoder: &'static str,
+    /// Served from the cache: every segment already exists, so this is a VOD
+    /// asset rather than a stream being written.
+    ///
+    /// The player needs to know, because the difference is visible. A live
+    /// session seeks by restarting the encoder somewhere else; a finished one
+    /// seeks by moving `currentTime`, like direct play, in well under a second.
+    /// And the stall watchdog's restart arm has nothing to fix here — a
+    /// segment that is late was never going to be produced faster.
+    pub vod: bool,
 }
 
 /// A live session, as the activity page sees it.
@@ -895,6 +945,17 @@ impl SessionRequest {
     }
 }
 
+/// Where this node keeps finished transcodes, and what identifies its output.
+#[derive(Debug, Clone)]
+struct CacheConfig {
+    /// Root the location rows are relative to. Deliberately *not* under the
+    /// session scratch dir, which is wiped at every boot: a cache that empties
+    /// on restart is a warm-up cost with none of the benefit.
+    dir: PathBuf,
+    ffmpeg_build: String,
+    node_id: String,
+}
+
 pub struct TranscodeManager {
     store: Arc<dyn Store>,
     work_dir: PathBuf,
@@ -906,6 +967,11 @@ pub struct TranscodeManager {
     pipeline: Pipeline,
     /// The hardware budget, and what this box has learned about its own speed.
     admissions: Admissions,
+    /// Where finished transcodes live, and what identifies them here. `None`
+    /// until configured, which is a real state rather than a placeholder: a
+    /// node with no cache root simply always misses, and every path below is
+    /// written so that a miss is the ordinary case.
+    cache: Option<CacheConfig>,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     /// Answered creation requests: `request_id` -> (session id, fingerprint).
     /// Small by construction — an entry is dropped as soon as its session is
@@ -931,9 +997,183 @@ impl TranscodeManager {
             caps,
             pipeline,
             admissions: Admissions::new(),
+            cache: None,
             sessions: Mutex::new(HashMap::new()),
             requests: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Point the manager at a cache root, and tell it what this node's output
+    /// is identified by.
+    ///
+    /// Separate from the constructor because both pieces come from elsewhere:
+    /// the ffmpeg build from the startup probe, the node id from the store.
+    /// Chaining keeps every existing call site — and every test that does not
+    /// care about caching — unchanged.
+    pub fn with_cache(mut self, cache_dir: PathBuf, ffmpeg_build: String, node_id: String) -> Self {
+        self.cache = Some(CacheConfig {
+            dir: cache_dir,
+            ffmpeg_build,
+            node_id,
+        });
+        self
+    }
+
+    /// This node's output identity, for naming a transcode.
+    fn digest(&self) -> Option<PipelineDigest> {
+        let cache = self.cache.as_ref()?;
+        Some(PipelineDigest {
+            ffmpeg_build: cache.ffmpeg_build.clone(),
+            encoder: Encoder::Software, // replaced per lookup
+            pipeline: self.pipeline,
+        })
+    }
+
+    /// The options a session with this shape would run with.
+    ///
+    /// One builder, because the cache asks the question twice — once to name
+    /// what it is looking for, once to name what it is about to produce — and
+    /// two spellings of "what this session is" would eventually disagree,
+    /// which is a cache that never hits or, worse, one that hits wrongly.
+    fn options_for(
+        &self,
+        encoder: Encoder,
+        file: &plurx_core::domain::MediaFile,
+        target_height: i64,
+        start_seconds: f64,
+        audio_index: Option<i64>,
+        subtitle_burn: Option<plurx_core::transcode::SubtitleBurn>,
+    ) -> TranscodeOptions {
+        TranscodeOptions {
+            target_height,
+            video_bitrate_kbps: bitrate_for_height(target_height),
+            audio_index,
+            start_seconds,
+            tone_map: tone_map_pref(),
+            // The node proved a graph; this session may still not be entitled
+            // to it (HLG, Dolby Vision, a burned subtitle of either kind, a
+            // light source, an encoder it cannot feed). Deciding once, here,
+            // is what keeps the log line honest — `pipeline=` is what actually
+            // ran, not what the box is capable of.
+            pipeline: Pipeline::for_session(
+                self.pipeline,
+                encoder,
+                file.hdr.as_deref(),
+                transcode::heavy_source(file),
+                subtitle_burn.is_some(),
+            ),
+            subtitle_burn,
+            ..Default::default()
+        }
+    }
+
+    /// Serve a finished transcode, if this exact one has already been made.
+    ///
+    /// Registers a session with no child process. That is the whole shape of a
+    /// hit: there is nothing to run, nothing to watch, nothing to pace, and
+    /// nothing to suspend — only a directory of segments that already exist
+    /// and a viewer to point at them. It is still a session because the
+    /// activity page should show somebody watching, and because the idle
+    /// reaper is what eventually forgets them.
+    async fn serve_cached(
+        &self,
+        file: &plurx_core::domain::MediaFile,
+        opts: &TranscodeOptions,
+        encoder: Encoder,
+        item_title: &str,
+        user_name: &str,
+        playback_id: &str,
+    ) -> Option<StartInfo> {
+        let cache = self.cache.as_ref()?;
+        let mut digest = self.digest()?;
+        digest.encoder = encoder;
+        let hash = Recipe {
+            digest: &digest,
+            file,
+            opts,
+            audio_copied: false,
+        }
+        .hash();
+
+        let hit = match self.store.cache_hit(&hash, &cache.node_id).await {
+            Ok(Some(hit)) => hit,
+            other => {
+                // The name is logged on a miss because "why is this not
+                // hitting?" is otherwise unanswerable from outside: the hash
+                // is a pure function of a dozen inputs, and a producer and a
+                // player disagreeing about any one of them looks identical to
+                // an empty cache. With the name in both logs the disagreement
+                // is one `grep` rather than a bisect.
+                if let Err(e) = other {
+                    tracing::warn!(recipe = %hash, error = %e, "cache lookup failed");
+                }
+                tracing::debug!(recipe = %hash, file = file.id, "transcode cache miss");
+                return None;
+            }
+        };
+        let dir = cache.dir.join(&hit.relative_dir);
+        // The row says the bytes are there; the disk is what actually has to
+        // have them. A cache root on a mount that did not come back after a
+        // reboot would otherwise serve a playlist for an empty directory —
+        // the row survives what the filesystem does not.
+        if tokio::fs::metadata(dir.join("index.m3u8")).await.is_err() {
+            tracing::warn!(
+                recipe = %hash, dir = %dir.display(),
+                "cache row points at a directory with no playlist — treating as a miss"
+            );
+            return None;
+        }
+        let _ = self.store.touch_cache_entry(&hash, &cache.node_id).await;
+
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let session = Arc::new(Session {
+            dir,
+            child: Mutex::new(None),
+            cached: true,
+            last_access: Mutex::new(Instant::now()),
+            file_id: file.id,
+            item_id: file.item_id,
+            item_title: item_title.to_owned(),
+            user_name: user_name.to_owned(),
+            playback_id: playback_id.to_owned(),
+            start_seconds: 0.0,
+            target_height: opts.target_height,
+            encoder_label: Mutex::new("cached"),
+            started_unix: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
+            failed: AtomicBool::new(false),
+            high_segment: AtomicI64::new(-1),
+            fetched_end_ms: AtomicI64::new(0),
+            segments: Mutex::new(SegmentIndex::default()),
+            ahead_bytes: AtomicI64::new(0),
+            progress: Arc::new(Progress::new()),
+            class: String::new(),
+            hw_slot: std::sync::Mutex::new(None),
+            delivery: Meter::new(),
+            suspended: AtomicBool::new(false),
+        });
+        self.sessions
+            .lock()
+            .await
+            .insert(session_id.clone(), Arc::clone(&session));
+        tracing::info!(
+            %session_id, recipe = %hash, file = file.id,
+            "serving a cached transcode — no encoder started"
+        );
+        Some(StartInfo {
+            playlist_url: format!("/api/v1/hls/{session_id}/index.m3u8"),
+            session_id,
+            duration_ms: file.duration_ms,
+            // A cached asset is the whole title, so playback starts at zero and
+            // the player seeks into it. `start_seconds` on a live session
+            // exists because the encoder had to be told where to begin; here
+            // there is no encoder and nothing to tell.
+            start_seconds: 0.0,
+            encoder: "cached",
+            vod: true,
+        })
     }
 
     /// Create a session, or hand back the one an identical request already
@@ -1027,6 +1267,7 @@ impl TranscodeManager {
             duration_ms,
             start_seconds: session.start_seconds,
             encoder,
+            vod: session.cached,
         })
     }
 
@@ -1170,8 +1411,8 @@ impl TranscodeManager {
             // of its own: a player replacing its own session must not have to
             // queue behind the session it just replaced.
             session.release_hardware();
-            let _ = session.child.lock().await.kill().await;
-            let _ = tokio::fs::remove_dir_all(&session.dir).await;
+            session.kill_child().await;
+            session.discard_dir().await;
             tracing::info!(
                 %session_id, playback_id,
                 "reaped superseded transcode session (this player started a new one)"
@@ -1212,6 +1453,69 @@ impl TranscodeManager {
             .map(|i| i.title)
             .unwrap_or_else(|| "(unknown)".to_owned());
 
+        // Default-track selection: prefer original (Japanese) audio + subs when
+        // the file is dual-audio anime-style (REQ-SUB-2), and honor the
+        // server-wide language preferences otherwise. Burn the chosen text
+        // subtitle since HLS transcode delivers a single flat stream.
+        //
+        // Before the hardware slot, because the cache lookup below needs to
+        // know which tracks this session would carry — two sessions differing
+        // only in audio track are different bytes, and a cache that ignored
+        // that would serve the wrong language.
+        let prefer_original = file
+            .audio_streams
+            .iter()
+            .any(|a| matches!(a.language.as_deref(), Some("jpn" | "ja" | "jp")))
+            && file.audio_streams.len() > 1;
+        let prefs = self.lang_prefs().await;
+        let selection = plurx_core::tracks::select_tracks(
+            &file.audio_streams,
+            &file.subtitle_streams,
+            prefer_original,
+            &prefs,
+        );
+        // A viewer's explicit choice wins over the automatic one, and is the
+        // only way a bitmap subtitle is ever burned: the automatic rule exists
+        // for dual-audio anime, where burning is a guess at what somebody
+        // wants. Burning a subtitle nobody asked for is a picture they cannot
+        // turn off.
+        let burn_index = subtitle_override.filter(|i| *i >= 0).or_else(|| {
+            prefer_original
+                .then_some(selection.subtitle_index)
+                .flatten()
+        });
+        let subtitle_burn = burn_index.and_then(|idx| {
+            let codec = file
+                .subtitle_streams
+                .get(idx as usize)
+                .map(|s| s.codec.clone())?;
+            Some(plurx_core::transcode::SubtitleBurn {
+                subtitle_index: idx,
+                bitmap: plurx_core::tracks::is_bitmap_subtitle(&codec),
+            })
+        });
+        let audio_index = audio_override.or(selection.audio_index);
+
+        // The cache, before anything is claimed. A hit needs no encoder, no
+        // hardware slot and no place in the queue — the work is already done,
+        // and making a viewer wait behind a busy GPU for bytes that exist is
+        // the one thing this cache exists to prevent.
+        let mut encoder = self.encoder().await;
+        let opts = self.options_for(
+            encoder,
+            &file,
+            target_height,
+            start_seconds,
+            audio_index,
+            subtitle_burn.clone(),
+        );
+        if let Some(info) = self
+            .serve_cached(&file, &opts, encoder, &item_title, user_name, playback_id)
+            .await
+        {
+            return Ok(info);
+        }
+
         // Claim a hardware slot before spawning anything. An iGPU has one
         // video-processing block, and a third 4K session on it does not run a
         // third as fast — it drags the other two under realtime with it, so one
@@ -1220,7 +1524,6 @@ impl TranscodeManager {
         // The wait is short and deliberate: a slot usually frees within seconds
         // (a superseded session, a closed tab), and someone who has pressed
         // play will forgive five seconds far sooner than a hang.
-        let mut encoder = self.encoder().await;
         let work = Workload::of(&file, target_height);
         let mut hw_slot = None;
         if encoder != Encoder::Software {
@@ -1263,66 +1566,17 @@ impl TranscodeManager {
             .await
             .map_err(|e| format!("creating session dir: {e}"))?;
 
-        // Default-track selection: prefer original (Japanese) audio + subs when
-        // the file is dual-audio anime-style (REQ-SUB-2), and honor the
-        // server-wide language preferences otherwise. Burn the chosen text
-        // subtitle since HLS transcode delivers a single flat stream.
-        let prefer_original = file
-            .audio_streams
-            .iter()
-            .any(|a| matches!(a.language.as_deref(), Some("jpn" | "ja" | "jp")))
-            && file.audio_streams.len() > 1;
-        let prefs = self.lang_prefs().await;
-        let selection = plurx_core::tracks::select_tracks(
-            &file.audio_streams,
-            &file.subtitle_streams,
-            prefer_original,
-            &prefs,
-        );
-        // A viewer's explicit choice wins over the automatic one, and is the
-        // only way a bitmap subtitle is ever burned: the automatic rule below
-        // exists for dual-audio anime, where burning is a guess at what
-        // somebody wants. Burning a subtitle nobody asked for is a picture
-        // they cannot turn off.
-        let burn_index = subtitle_override.filter(|i| *i >= 0).or_else(|| {
-            prefer_original
-                .then_some(selection.subtitle_index)
-                .flatten()
-        });
-        let subtitle_burn = burn_index.and_then(|idx| {
-            let codec = file
-                .subtitle_streams
-                .get(idx as usize)
-                .map(|s| s.codec.clone())?;
-            Some(plurx_core::transcode::SubtitleBurn {
-                subtitle_index: idx,
-                bitmap: plurx_core::tracks::is_bitmap_subtitle(&codec),
-            })
-        });
-
-        let opts = TranscodeOptions {
+        // Admission may have moved this session to software, which changes the
+        // pipeline it is entitled to — so the options are rebuilt rather than
+        // patched. Same builder, so the two cannot describe different sessions.
+        let opts = self.options_for(
+            encoder,
+            &file,
             target_height,
-            video_bitrate_kbps: bitrate_for_height(target_height),
-            // An explicit client choice (audio-language menu) wins over the
-            // automatic dual-audio default.
-            audio_index: audio_override.or(selection.audio_index),
             start_seconds,
-            tone_map: tone_map_pref(),
-            // The node proved a graph; this session may still not be entitled
-            // to it (HLG, Dolby Vision, a burned subtitle of either kind, a light
-            // source, an encoder it cannot feed). Deciding once, here, is what
-            // keeps the log line honest — `pipeline=` below is what actually
-            // ran, not what the box is capable of.
-            pipeline: Pipeline::for_session(
-                self.pipeline,
-                encoder,
-                file.hdr.as_deref(),
-                transcode::heavy_source(&file),
-                subtitle_burn.is_some(),
-            ),
+            audio_index,
             subtitle_burn,
-            ..Default::default()
-        };
+        );
         let pacing = self.pacing(false).await;
         let args = transcode::hls_args(&file, encoder, &opts, pacing, &dir.to_string_lossy());
         // Log the exact command — the single most useful diagnostic. It reveals
@@ -1349,7 +1603,8 @@ impl TranscodeManager {
 
         let session = Arc::new(Session {
             dir: dir.clone(),
-            child: Mutex::new(child),
+            child: Mutex::new(Some(child)),
+            cached: false,
             last_access: Mutex::new(Instant::now()),
             file_id,
             item_id: file.item_id,
@@ -1474,10 +1729,7 @@ impl TranscodeManager {
                             "retrying on software"
                         }
                     );
-                    {
-                        let mut child = session.child.lock().await;
-                        let _ = child.kill().await;
-                    }
+                    session.kill_child().await;
                     clear_session_dir(&dir).await;
                     let sw_args = transcode::hls_args(
                         &file,
@@ -1500,7 +1752,7 @@ impl TranscodeManager {
                         generation,
                     ) {
                         Ok(child) => {
-                            *session.child.lock().await = child;
+                            *session.child.lock().await = Some(child);
                             *session.last_access.lock().await = Instant::now();
                             // The activity page must stop naming the hardware
                             // encoder the moment it is no longer the one running.
@@ -1530,6 +1782,7 @@ impl TranscodeManager {
             duration_ms: file.duration_ms,
             start_seconds,
             encoder: encoder.label(),
+            vod: false,
         })
     }
 
@@ -1598,7 +1851,8 @@ impl TranscodeManager {
 
         let session = Arc::new(Session {
             dir: dir.clone(),
-            child: Mutex::new(child),
+            child: Mutex::new(Some(child)),
+            cached: false,
             last_access: Mutex::new(Instant::now()),
             file_id,
             item_id: file.item_id,
@@ -1644,6 +1898,7 @@ impl TranscodeManager {
             duration_ms: file.duration_ms,
             start_seconds,
             encoder: "copy",
+            vod: false,
         })
     }
 
@@ -1683,8 +1938,8 @@ impl TranscodeManager {
             return false;
         };
         session.release_hardware();
-        let _ = session.child.lock().await.kill().await;
-        let _ = tokio::fs::remove_dir_all(&session.dir).await;
+        session.kill_child().await;
+        session.discard_dir().await;
         tracing::info!(%session_id, reason, "transcode session ended");
         true
     }
@@ -1771,7 +2026,9 @@ impl TranscodeManager {
             }
             let exited = {
                 let mut child = session.child.lock().await;
-                matches!(child.try_wait(), Ok(Some(_)))
+                child
+                    .as_mut()
+                    .is_some_and(|c| matches!(c.try_wait(), Ok(Some(_))))
             };
             if exited || Instant::now() >= deadline {
                 return None;
@@ -1859,7 +2116,7 @@ impl TranscodeManager {
         };
         let sent = {
             let child = session.child.lock().await;
-            match child.id() {
+            match child.as_ref().and_then(|c| c.id()) {
                 // SAFETY: `kill(2)` with a pid this process owns and a signal
                 // constant. The child is alive as far as we know; a race with
                 // its exit yields ESRCH, which the return check handles.
@@ -1954,8 +2211,8 @@ impl TranscodeManager {
                 session.release_hardware();
                 // Kills a suspended child too — SIGKILL is not blockable and
                 // does not need the process scheduled to take effect.
-                let _ = session.child.lock().await.kill().await;
-                let _ = tokio::fs::remove_dir_all(&session.dir).await;
+                session.kill_child().await;
+                session.discard_dir().await;
                 tracing::info!(session_id = %id, "reaped idle transcode session");
             }
             // What this box actually achieves, remembered per class of work.
@@ -2028,6 +2285,14 @@ fn segment_index(name: &str) -> Option<i64> {
 /// `init.mp4` and the playlist are never candidates — neither carries an
 /// EXTINF, so neither appears in the index.
 async fn gc_expired_segments(session: &Session) {
+    // Never against a cache entry. Retention exists to bound the scratch a
+    // live encoder is producing; a cached asset is a finished artifact that
+    // other viewers will want whole. Pruning one would eat it from the front
+    // as somebody watched — and leave the row still saying `complete`, so the
+    // next viewer gets a playlist whose opening segments 404.
+    if session.cached {
+        return;
+    }
     let frontier = session.fetched_end_ms.load(Relaxed);
     let keep_from = frontier - RETENTION_SECS * 1000;
     if keep_from <= 0 {
@@ -2509,7 +2774,8 @@ mod tests {
             .expect("spawn placeholder child");
         Session {
             dir,
-            child: Mutex::new(child),
+            child: Mutex::new(Some(child)),
+            cached: false,
             last_access: Mutex::new(Instant::now()),
             file_id: 1,
             item_id: 1,
@@ -2894,6 +3160,229 @@ mod tests {
             assert!(mgr.stop_session(&id, "test").await);
         }
         assert_eq!(mgr.admissions.in_use(), 0, "slots come back");
+    }
+
+    // ---- the pre-transcode cache, serving side (PERF-PLAN §6.3) -------------
+
+    const NODE: &str = "node-under-test";
+
+    /// A manager with a cache root, and the cache root's temp dir (which has to
+    /// outlive the manager or the directory goes out from under it).
+    fn cached_manager(
+        store: &Arc<dyn Store>,
+    ) -> (TranscodeManager, tempfile::TempDir, tempfile::TempDir) {
+        let work = tempfile::tempdir().expect("work");
+        let cache = tempfile::tempdir().expect("cache");
+        let mgr = TranscodeManager::new(
+            Arc::clone(store),
+            work.path().to_path_buf(),
+            EncoderCaps::default(),
+            Pipeline::Cpu,
+        )
+        .with_cache(
+            cache.path().to_path_buf(),
+            "ffmpeg version 6.1.1-test".into(),
+            NODE.into(),
+        );
+        (mgr, work, cache)
+    }
+
+    /// The name `start()` would look this session up under. Computed through
+    /// the manager's own builders, because a test that spelled the recipe out
+    /// by hand would keep passing after the two spellings diverged — which is
+    /// the failure the single builder exists to prevent.
+    async fn recipe_hash_for(
+        mgr: &TranscodeManager,
+        file: &plurx_core::domain::MediaFile,
+        height: i64,
+    ) -> String {
+        let encoder = mgr.encoder().await;
+        let opts = mgr.options_for(encoder, file, height, 0.0, None, None);
+        let mut digest = mgr.digest().expect("cache configured");
+        digest.encoder = encoder;
+        Recipe {
+            digest: &digest,
+            file,
+            opts: &opts,
+            audio_copied: false,
+        }
+        .hash()
+    }
+
+    /// Write what a finished transcode looks like on disk.
+    async fn seed_cache_dir(root: &std::path::Path, rel: &str) -> PathBuf {
+        let dir = root.join(rel);
+        tokio::fs::create_dir_all(&dir).await.expect("mkdir");
+        seeded_session_dir(&dir, 3, 2.0).await;
+        dir
+    }
+
+    /// The three ways a lookup can go, and only one of them is a hit.
+    ///
+    /// The middle case is the one worth writing down: a row that says the bytes
+    /// are there is not the bytes being there. A cache root on a mount that did
+    /// not come back after a reboot leaves every row intact and every directory
+    /// gone, and a lookup that trusted the row would hand out a playlist for an
+    /// empty directory — an error the viewer sees as a film that will not play,
+    /// with nothing in the log to say why.
+    #[tokio::test]
+    async fn a_lookup_hits_only_on_a_finished_entry_whose_bytes_are_really_there() {
+        use plurx_core::store::SqliteStore;
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let file_id = seed_file(&store).await;
+        let (mgr, _work, cache) = cached_manager(&store);
+        let file = store.get_file(file_id).await.expect("get").expect("file");
+        let hash = recipe_hash_for(&mgr, &file, 1080).await;
+        let encoder = mgr.encoder().await;
+        let opts = mgr.options_for(encoder, &file, 1080, 0.0, None, None);
+        let look = || mgr.serve_cached(&file, &opts, encoder, "Heat", "paul", "pb-1");
+
+        // Nothing claimed yet.
+        assert!(look().await.is_none(), "an unknown recipe is a miss");
+
+        // Claimed but unfinished: a directory a producer is still writing into.
+        let dir = seed_cache_dir(cache.path(), "ab/entry").await;
+        store
+            .claim_cache_entry(&hash, file_id, 1, NODE, "ab/entry")
+            .await
+            .expect("claim");
+        assert!(
+            look().await.is_none(),
+            "a claim is not a hit — that playlist stops in the middle of the film"
+        );
+
+        store
+            .complete_cache_entry(&hash, NODE, 1_234)
+            .await
+            .expect("complete");
+        let hit = look().await.expect("a finished entry serves");
+        assert!(
+            hit.vod,
+            "the whole stream exists; the player may seek freely"
+        );
+        assert_eq!(hit.encoder, "cached");
+        assert_eq!(
+            hit.start_seconds, 0.0,
+            "a cached asset is the whole title — where a viewer joins is a seek"
+        );
+        assert_eq!(mgr.active_sessions().await, 1);
+        assert!(mgr.stop_session(&hit.session_id, "test").await);
+
+        // The row survives what the filesystem does not.
+        tokio::fs::remove_file(dir.join("index.m3u8"))
+            .await
+            .expect("rm playlist");
+        assert!(
+            look().await.is_none(),
+            "a row pointing at a directory with no playlist is a miss, not a 404 for the viewer"
+        );
+    }
+
+    /// The whole point, end to end: a hit plays with no encoder, no hardware
+    /// slot and no queue — and, the part that would destroy the cache, the
+    /// bytes are still there afterwards.
+    ///
+    /// Every other way a session ends removes its directory, correctly. A
+    /// cached session reaching one of those paths unguarded would delete the
+    /// entry that served it, so each hit would cost the next viewer a full
+    /// re-encode and the cache would sit permanently empty while looking like
+    /// it was working.
+    #[tokio::test]
+    async fn a_hit_starts_no_encoder_and_outlives_the_session_that_played_it() {
+        use plurx_core::store::SqliteStore;
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let file_id = seed_file(&store).await;
+        let (mgr, _work, cache) = cached_manager(&store);
+        let file = store.get_file(file_id).await.expect("get").expect("file");
+        let hash = recipe_hash_for(&mgr, &file, 1080).await;
+        let dir = seed_cache_dir(cache.path(), "cd/entry").await;
+        store
+            .claim_cache_entry(&hash, file_id, 1, NODE, "cd/entry")
+            .await
+            .expect("claim");
+        store
+            .complete_cache_entry(&hash, NODE, 1_234)
+            .await
+            .expect("complete");
+
+        // No `require_ffmpeg` here on purpose: if this ever spawns one, the
+        // test should fail rather than quietly start passing on a box that has
+        // ffmpeg installed.
+        let info = mgr
+            .start(file_id, 1080, 0.0, None, None, "paul", "pb-1")
+            .await
+            .expect("start");
+        assert!(info.vod);
+        assert_eq!(info.encoder, "cached");
+        let session = mgr
+            .sessions
+            .lock()
+            .await
+            .get(&info.session_id)
+            .cloned()
+            .expect("registered");
+        assert!(
+            session.child.lock().await.is_none(),
+            "a hit has nothing to run"
+        );
+        assert_eq!(
+            mgr.admissions.in_use(),
+            0,
+            "and nothing to wait behind — the work is already done"
+        );
+        assert!(mgr.playlist(&info.session_id).await.is_some());
+
+        // Retention must not treat a finished asset as this session's scratch.
+        // Pretend the viewer has watched well past the window and let the
+        // pruner have its pass.
+        session.refresh_segments().await;
+        session
+            .fetched_end_ms
+            .store((RETENTION_SECS + 600) * 1000, Relaxed);
+        gc_expired_segments(&session).await;
+        assert_eq!(
+            session.ahead_bytes.load(Relaxed),
+            0,
+            "a cache entry is not scratch, and must not push live encoders over the global budget"
+        );
+
+        assert!(mgr.stop_session(&info.session_id, "test").await);
+        assert!(
+            tokio::fs::metadata(dir.join("index.m3u8")).await.is_ok(),
+            "the cache entry outlives the session that played it"
+        );
+        assert!(
+            tokio::fs::metadata(dir.join("seg00000.ts")).await.is_ok(),
+            "and so do its segments — the pruner does not eat a cached asset"
+        );
+        assert!(
+            store.cache_hit(&hash, NODE).await.expect("hit").is_some(),
+            "so the next viewer hits it too"
+        );
+    }
+
+    /// A node with no cache root is not a broken node — it is the ordinary
+    /// case, and every path has to read as a plain miss.
+    #[tokio::test]
+    async fn a_manager_without_a_cache_root_simply_always_misses() {
+        use plurx_core::store::SqliteStore;
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let file_id = seed_file(&store).await;
+        let work = tempfile::tempdir().expect("work");
+        let mgr = TranscodeManager::new(
+            Arc::clone(&store),
+            work.path().to_path_buf(),
+            EncoderCaps::default(),
+            Pipeline::Cpu,
+        );
+        assert!(mgr.digest().is_none());
+        let file = store.get_file(file_id).await.expect("get").expect("file");
+        let encoder = mgr.encoder().await;
+        let opts = mgr.options_for(encoder, &file, 1080, 0.0, None, None);
+        assert!(mgr
+            .serve_cached(&file, &opts, encoder, "Heat", "paul", "pb-1")
+            .await
+            .is_none());
     }
 
     #[tokio::test]

@@ -150,6 +150,13 @@ async fn run(config: Config) -> anyhow::Result<()> {
     let artwork_dir = config.storage.data_dir.join("artwork");
     std::fs::create_dir_all(&artwork_dir)
         .with_context(|| format!("creating artwork directory {}", artwork_dir.display()))?;
+    // Finished transcodes, kept across restarts. Deliberately a sibling of the
+    // session scratch below rather than a child: that one is cleared at every
+    // boot, and a cache that empties on restart is a warm-up cost with none of
+    // the benefit.
+    let cache_dir = config.storage.data_dir.join("cache").join("transcode");
+    std::fs::create_dir_all(&cache_dir)
+        .with_context(|| format!("creating cache directory {}", cache_dir.display()))?;
     let transcode_dir = config.storage.data_dir.join("transcode");
     // Clear any stale sessions from a previous run, then recreate.
     let _ = std::fs::remove_dir_all(&transcode_dir);
@@ -216,8 +223,12 @@ async fn run(config: Config) -> anyhow::Result<()> {
     let state = AppState::new(
         config.server.name.clone(),
         store,
-        artwork_dir,
-        transcode_dir,
+        crate::state::Dirs {
+            artwork: artwork_dir,
+            transcode: transcode_dir,
+            cache: cache_dir,
+        },
+        instance_id.clone(),
         encoder_caps,
         system,
         logs,

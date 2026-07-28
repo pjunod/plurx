@@ -48,6 +48,20 @@ pub struct SystemInfo {
     pub tone_map: crate::pipeprobe::PipelineReport,
 }
 
+/// The daemon's directories, all under the configured data dir.
+///
+/// Grouped rather than passed loose because the distinction between them
+/// matters and is easy to get backwards positionally: `transcode` is scratch
+/// and is wiped at every boot, while `cache` holds finished pre-transcodes
+/// and must survive restarts — swapping the two would erase the cache on
+/// startup and leave stale segments behind forever.
+#[derive(Clone, Debug, Default)]
+pub struct Dirs {
+    pub artwork: PathBuf,
+    pub transcode: PathBuf,
+    pub cache: PathBuf,
+}
+
 /// Everything a request handler needs. Cheap to clone (all shared via `Arc`).
 #[derive(Clone)]
 pub struct AppState {
@@ -74,24 +88,38 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// `node_id` is this server's stable id — the `node_id` a cache location
+    /// is recorded against, so a cluster can tell whose copy is whose.
     pub fn new(
         server_name: String,
         store: Arc<dyn Store>,
-        artwork_dir: PathBuf,
-        transcode_dir: PathBuf,
+        dirs: Dirs,
+        node_id: String,
         encoder_caps: EncoderCaps,
         system: SystemInfo,
         logs: Arc<LogBuffer>,
     ) -> Self {
+        let Dirs {
+            artwork: artwork_dir,
+            transcode: transcode_dir,
+            cache: cache_dir,
+        } = dirs;
         let jobs = Arc::new(JobManager::new(Arc::clone(&store), artwork_dir.clone()));
         let coming_soon = crate::http::ComingSoonCache::new();
         let watched = crate::watched::WatchedNotifier::new(Arc::clone(&store));
-        let transcode = Arc::new(TranscodeManager::new(
-            Arc::clone(&store),
-            transcode_dir,
-            encoder_caps,
-            system.tone_map.selected(),
-        ));
+        let transcode = Arc::new(
+            TranscodeManager::new(
+                Arc::clone(&store),
+                transcode_dir,
+                encoder_caps,
+                system.tone_map.selected(),
+            )
+            .with_cache(
+                cache_dir,
+                system.ffmpeg_version.clone().unwrap_or_default(),
+                node_id,
+            ),
+        );
         // PLURX_TRAKT_BASE overrides the API base for tests/mocks.
         let trakt_base = std::env::var("PLURX_TRAKT_BASE")
             .ok()
