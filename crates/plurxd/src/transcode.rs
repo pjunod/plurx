@@ -853,6 +853,15 @@ pub struct SessionRequest {
     pub kind: SessionKind,
     pub start_seconds: f64,
     pub audio_index: Option<i64>,
+    /// Subtitle stream to burn into the picture, chosen by the viewer.
+    ///
+    /// Only ever a *burn*: a text subtitle the client can render itself never
+    /// comes through here — it fetches the VTT and shows it locally, which
+    /// costs the server nothing and can be toggled without restarting a
+    /// stream. This is for the ones that have no other way in, above all the
+    /// PGS tracks a UHD Blu-ray remux carries and which plurx simply had no
+    /// answer for before.
+    pub subtitle_burn: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -877,10 +886,11 @@ impl SessionRequest {
             SessionKind::Copy { aac } => format!("c{}", u8::from(aac)),
         };
         format!(
-            "{}:{kind}:{:.3}:{}",
+            "{}:{kind}:{:.3}:{}:{}",
             self.file_id,
             self.start_seconds,
-            self.audio_index.unwrap_or(-1)
+            self.audio_index.unwrap_or(-1),
+            self.subtitle_burn.unwrap_or(-1)
         )
     }
 }
@@ -967,6 +977,7 @@ impl TranscodeManager {
                     height,
                     req.start_seconds,
                     req.audio_index,
+                    req.subtitle_burn,
                     user_name,
                     &req.playback_id,
                 )
@@ -1170,12 +1181,14 @@ impl TranscodeManager {
 
     /// Start a transcode session for a file, superseding this viewer's previous
     /// session on the same file (see [`Self::reap_superseded`]).
+    #[allow(clippy::too_many_arguments)] // one stream's worth of knobs
     pub async fn start(
         &self,
         file_id: i64,
         target_height: i64,
         start_seconds: f64,
         audio_override: Option<i64>,
+        subtitle_override: Option<i64>,
         user_name: &str,
         playback_id: &str,
     ) -> Result<StartInfo, String> {
@@ -1266,18 +1279,24 @@ impl TranscodeManager {
             prefer_original,
             &prefs,
         );
-        let subtitle_burn = selection.subtitle_index.and_then(|idx| {
+        // A viewer's explicit choice wins over the automatic one, and is the
+        // only way a bitmap subtitle is ever burned: the automatic rule below
+        // exists for dual-audio anime, where burning is a guess at what
+        // somebody wants. Burning a subtitle nobody asked for is a picture
+        // they cannot turn off.
+        let burn_index = subtitle_override.filter(|i| *i >= 0).or_else(|| {
+            prefer_original
+                .then_some(selection.subtitle_index)
+                .flatten()
+        });
+        let subtitle_burn = burn_index.and_then(|idx| {
             let codec = file
                 .subtitle_streams
                 .get(idx as usize)
-                .map(|s| s.codec.clone());
-            // Only burn when we actively prefer original audio (dual-audio case).
-            prefer_original.then_some(plurx_core::transcode::SubtitleBurn {
+                .map(|s| s.codec.clone())?;
+            Some(plurx_core::transcode::SubtitleBurn {
                 subtitle_index: idx,
-                bitmap: codec
-                    .as_deref()
-                    .map(plurx_core::tracks::is_bitmap_subtitle)
-                    .unwrap_or(false),
+                bitmap: plurx_core::tracks::is_bitmap_subtitle(&codec),
             })
         });
 
@@ -1290,7 +1309,7 @@ impl TranscodeManager {
             start_seconds,
             tone_map: tone_map_pref(),
             // The node proved a graph; this session may still not be entitled
-            // to it (HLG, Dolby Vision, a burned text subtitle, a light
+            // to it (HLG, Dolby Vision, a burned subtitle of either kind, a light
             // source, an encoder it cannot feed). Deciding once, here, is what
             // keeps the log line honest — `pipeline=` below is what actually
             // ran, not what the box is capable of.
@@ -1299,7 +1318,7 @@ impl TranscodeManager {
                 encoder,
                 file.hdr.as_deref(),
                 transcode::heavy_source(&file),
-                subtitle_burn.as_ref().is_some_and(|b| !b.bitmap),
+                subtitle_burn.is_some(),
             ),
             subtitle_burn,
             ..Default::default()
@@ -2302,7 +2321,7 @@ mod tests {
             Pipeline::Cpu,
         );
         let info = mgr
-            .start(file_id, 720, 0.0, None, "paul", "pb-paul")
+            .start(file_id, 720, 0.0, None, None, "paul", "pb-paul")
             .await
             .expect("start");
 
@@ -2846,7 +2865,7 @@ mod tests {
         for n in 0..5 {
             let mgr = Arc::clone(&mgr);
             starts.push(tokio::spawn(async move {
-                mgr.start(file_id, 1080, 0.0, None, "paul", &format!("pb-{n}"))
+                mgr.start(file_id, 1080, 0.0, None, None, "paul", &format!("pb-{n}"))
                     .await
             }));
         }
@@ -2918,7 +2937,7 @@ mod tests {
         // A real start spawns ffmpeg (it fails async on the fake path, but the
         // session is created and tracked). Then the admin stop kills it.
         let info = mgr
-            .start(file_id, 720, 0.0, None, "paul", "pb-paul")
+            .start(file_id, 720, 0.0, None, None, "paul", "pb-paul")
             .await
             .expect("start");
         assert_eq!(info.encoder, "software (x264)");
@@ -2956,15 +2975,15 @@ mod tests {
 
         // Play, then "seek" three times. Only the newest survives.
         let first = mgr
-            .start(file_id, 720, 0.0, None, "paul", "pb-paul")
+            .start(file_id, 720, 0.0, None, None, "paul", "pb-paul")
             .await
             .expect("start");
         let second = mgr
-            .start(file_id, 720, 600.0, None, "paul", "pb-paul")
+            .start(file_id, 720, 600.0, None, None, "paul", "pb-paul")
             .await
             .expect("seek");
         let third = mgr
-            .start(file_id, 720, 1200.0, None, "paul", "pb-paul")
+            .start(file_id, 720, 1200.0, None, None, "paul", "pb-paul")
             .await
             .expect("seek again");
         assert_eq!(mgr.active_sessions().await, 1);
@@ -2979,7 +2998,7 @@ mod tests {
             .await
             .expect("copy");
         let fallback = mgr
-            .start(file_id, 720, 0.0, None, "paul", "pb-paul")
+            .start(file_id, 720, 0.0, None, None, "paul", "pb-paul")
             .await
             .expect("fallback");
         assert_eq!(mgr.active_sessions().await, 1);
@@ -2991,12 +3010,12 @@ mod tests {
         // other's stream on every seek. Two player instances now coexist even
         // as the same person, on the same file, from the same account.
         let laptop = mgr
-            .start(file_id, 720, 0.0, None, "paul", "pb-laptop")
+            .start(file_id, 720, 0.0, None, None, "paul", "pb-laptop")
             .await
             .expect("second device");
         assert_eq!(mgr.active_sessions().await, 2);
         let reseek = mgr
-            .start(file_id, 720, 30.0, None, "paul", "pb-paul")
+            .start(file_id, 720, 30.0, None, None, "paul", "pb-paul")
             .await
             .expect("the first player seeks");
         assert_eq!(
@@ -3033,6 +3052,7 @@ mod tests {
             kind: SessionKind::Transcode { height: 720 },
             start_seconds: 0.0,
             audio_index: None,
+            subtitle_burn: None,
         };
 
         let first = mgr.create_session(&request, "paul").await.expect("create");

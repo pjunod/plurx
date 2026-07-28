@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+"""Write a minimal but valid PGS (.sup) subtitle stream.
+
+Real PGS is what a UHD Blu-ray remux carries, and it is the thing plurx has
+never been able to show. ffmpeg cannot *encode* it (text-to-bitmap conversion
+is refused), so a fixture has to be authored directly — which is fine, because
+the format is small: a run of segments, each `PG` + PTS + DTS + type + length.
+"""
+import struct
+import sys
+
+MAGIC = b"PG"
+PDS, ODS, PCS, WDS, END = 0x14, 0x15, 0x16, 0x17, 0x80
+
+
+def seg(pts_ms, kind, payload):
+    pts = int(pts_ms * 90)  # 90 kHz
+    return MAGIC + struct.pack(">IIBH", pts, 0, kind, len(payload)) + payload
+
+
+def rle(width, height, bar):
+    """One object: `bar` = (x0, x1) run of colour 1 on a transparent field."""
+    out = bytearray()
+    x0, x1 = bar
+    for _ in range(height):
+        for start, end, colour in ((0, x0, 0), (x0, x1, 1), (x1, width, 0)):
+            n = end - start
+            while n > 0:
+                take = min(n, 16383)
+                if colour == 0:
+                    # 00 11LLLLLL LLLLLLLL is the long form; use it uniformly
+                    out += bytes([0x00, 0x40 | (take >> 8), take & 0xFF])
+                else:
+                    out += bytes([0x00, 0xC0 | (take >> 8), take & 0xFF, colour])
+                n -= take
+        out += bytes([0x00, 0x00])  # end of line
+    return bytes(out)
+
+
+def palette(pid=0):
+    # entry 1: opaque white-ish; entry 0 left fully transparent by omission.
+    return bytes([pid, 0]) + bytes([1, 235, 128, 128, 255])
+
+
+def object_seg(obj_id, width, height, data):
+    # first-in-sequence(0x80) | last(0x40) = 0xC0, single fragment
+    body = struct.pack(">HB", obj_id, 0) + bytes([0xC0])
+    body += struct.pack(">I", len(data) + 4)[1:]  # 3-byte length incl. w/h
+    body += struct.pack(">HH", width, height) + data
+    return body
+
+
+def pcs(vid_w, vid_h, state, comp_num, objects):
+    """state: 0x80 epoch start, 0x00 normal."""
+    body = struct.pack(">HHB", vid_w, vid_h, 0x10)  # 24fps marker
+    body += struct.pack(">HBBB", comp_num, state, 0, 0)  # no palette update
+    body += bytes([len(objects)])
+    for obj_id, win_id, x, y in objects:
+        body += struct.pack(">HBBHH", obj_id, win_id, 0, x, y)
+    return body
+
+
+def wds(win_id, x, y, w, h):
+    return bytes([1, win_id]) + struct.pack(">HHHH", x, y, w, h)
+
+
+def cue(start_ms, end_ms, vid_w, vid_h, obj_id, comp):
+    """One shown-then-cleared subtitle."""
+    ow, oh = 1200, 90
+    x, y = (vid_w - ow) // 2, int(vid_h * 0.82)
+    data = rle(ow, oh, (80, ow - 80))
+    out = b""
+    out += seg(start_ms, PCS, pcs(vid_w, vid_h, 0x80, comp, [(obj_id, 0, x, y)]))
+    out += seg(start_ms, WDS, wds(0, x, y, ow, oh))
+    out += seg(start_ms, PDS, palette())
+    out += seg(start_ms, ODS, object_seg(obj_id, ow, oh, data))
+    out += seg(start_ms, END, b"")
+    # clear
+    out += seg(end_ms, PCS, pcs(vid_w, vid_h, 0x00, comp + 1, []))
+    out += seg(end_ms, WDS, wds(0, x, y, ow, oh))
+    out += seg(end_ms, END, b"")
+    return out
+
+
+def main():
+    vid_w, vid_h = int(sys.argv[1]), int(sys.argv[2])
+    path = sys.argv[3]
+    blob = b""
+    comp = 0
+    for i, (a, b) in enumerate([(1000, 7000), (9000, 15000)]):
+        blob += cue(a, b, vid_w, vid_h, i, comp)
+        comp += 2
+    with open(path, "wb") as f:
+        f.write(blob)
+    print(f"wrote {path}: {len(blob)} bytes, canvas {vid_w}x{vid_h}")
+
+
+if __name__ == "__main__":
+    main()

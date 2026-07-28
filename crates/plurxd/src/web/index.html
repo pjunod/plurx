@@ -2122,7 +2122,7 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
   const src=decision.source||{};
   PLAYER={fileId, timer:null, offset:0, hls:null, knownDur:knownDurMs||0,
     durMs:(src.duration_ms||knownDurMs||0), method:decision.method, encoder:null,
-    audio:decision.audio||[], subs:(decision.subtitles||[]).filter(s=>s.text),
+    audio:decision.audio||[], subs:(decision.subtitles||[]),
     curAudio:(decision.audio||[]).findIndex(a=>a.default), curSub:-1,
     markers:(decision.markers||[]).map(m=>({...m})), source:src, started:false,
     idleTimer:null, autoskip:autoskipOn(), stallTimer:null, probeUrl:null, triedFallback:false,
@@ -2131,7 +2131,7 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
     transcodeAudio:!!decision.transcode_audio, copyHls:false,
     playStartedAt:clickedAt, ttffMs:null, stalls:0, sessionId:null, streamId:null, health:null,
     attemptId:null, attemptReason:null, bufferLimits:null,
-    waitAt:null, waitRunway:null, stallsByKind:null, };
+    waitAt:null, waitRunway:null, stallsByKind:null, burnedSub:null, };
   newAttempt(PENDING_ATTEMPT_REASON || (startSec>0?"resume":"cold-start"));
   PENDING_ATTEMPT_REASON=null;
   if(PLAYER.curAudio<0) PLAYER.curAudio=0;
@@ -2776,7 +2776,16 @@ const LANGS={eng:"English",en:"English",jpn:"Japanese",ja:"Japanese",spa:"Spanis
   chi:"Chinese",zho:"Chinese",zh:"Chinese",hin:"Hindi",ara:"Arabic",nld:"Dutch",swe:"Swedish",pol:"Polish",und:"Unknown"};
 function langName(c){ return c?(LANGS[c.toLowerCase()]||c.toUpperCase()):null; }
 function audioLabelMenu(a,i){ return (langName(a.language)||("Track "+(i+1)))+(a.channels?" · "+fmtChannels(a.channels):"")+(a.title?" · "+a.title:""); }
-function subLabelMenu(s){ return (langName(s.language)||("Subtitle "+(s.index+1)))+(s.forced?" (forced)":"")+(s.title?" · "+s.title:""); }
+// A bitmap track is labelled as one. Selecting it restarts the stream as a
+// transcode, and somebody choosing between two English tracks deserves to know
+// which one costs that — the alternative is an unexplained pause and a picture
+// they cannot switch off without another one.
+function subLabelMenu(s){
+  return (langName(s.language)||("Subtitle "+(s.index+1)))
+    +(s.forced?" (forced)":"")
+    +(s.title?" · "+s.title:"")
+    +(s.text===false?" · burned in":"");
+}
 function setupTrackMenus(){
   const ab=document.getElementById("audiobtn"), sb=document.getElementById("subsbtn"), m=document.getElementById("pmenu");
   if(m){ m.classList.remove("on"); m.innerHTML=""; }
@@ -2912,6 +2921,18 @@ function vttParse(text){
 async function setSub(index){
   const m=document.getElementById("pmenu"); if(m) m.classList.remove("on");
   const me=PLAYER; if(!me) return;
+  // A bitmap subtitle (PGS on a Blu-ray remux, VobSub on a DVD one) is a
+  // picture, not text. There is nothing to hand a <track>, so the only way to
+  // show it is to have the server draw it into the frames — which means a
+  // transcode, and a new one, because the burn is baked in. Everything else
+  // here is the text path, which stays local and free.
+  const want=(me.subs||[]).find(x=>x.index===index);
+  if(index>=0 && want && want.text===false) return burnSub(index);
+  if(me.burnedSub!=null){
+    // Leaving a burned track behind: the picture still has it drawn on, so
+    // "off" also has to be a restart.
+    return burnSub(index>=0?index:null);
+  }
   me.curSub=index;
   const v=document.getElementById("video"); if(!v) return;
   pbSyncSubIcon();
@@ -2954,6 +2975,43 @@ async function setSub(index){
     try{ track.addCue(new Cue(Math.max(0,c.start-off), en, c.text)); }catch(err){}
   }
   track.mode="showing";
+}
+// Re-open the stream as a transcode with `index` burned into the picture, or
+// with nothing burned when `index` is null.
+//
+// This is the one subtitle action that costs a stream restart, and it is
+// unavoidable: a burned subtitle is part of the frames, so changing it means
+// changing the frames. It also forces a transcode even on a file that was
+// direct-playing happily — you cannot draw on a stream you are copying.
+async function burnSub(index){
+  const v=document.getElementById("video"); if(!v||!PLAYER) return;
+  const me=PLAYER;
+  const pos=(me.offset||0)+(v.currentTime||0);
+  const track=me.audio&&me.audio[me.curAudio];
+  const aidx=track?track.index:(me.curAudio||0);
+  const {live}=streamGeneration();
+  newAttempt("subtitle-burn");
+  teardownHls();
+  clearSubs(v);
+  me.curSub=index==null?-1:index;
+  me.burnedSub=index;
+  pbSyncSubIcon();
+  const s=(me.subs||[]).find(x=>x.index===index);
+  setLoading(true, index==null?"Removing subtitles…":"Burning in subtitles…",
+    index==null?"restarting the stream without them"
+              :`${subLabelFor(s,index)} — this format is a picture, so the server draws it in`);
+  let info;
+  try{
+    info=await openSession(me.fileId,{height:transcodeHeight(),start:pos,audio:aidx,
+      subtitle_burn:index==null?undefined:index});
+  }catch(e){ if(live()){ setLoading(false); toast(e.message); } return; }
+  if(!live()) return;
+  me.method='transcode'; me.copyHls=false;
+  me.offset=info.start_seconds||0; me.encoder=info.encoder||null;
+  me.sessionId=info.session_id||null; me.streamId=null;
+  me.probeUrl=info.playlist_url; armStall(me.offset,20000);
+  attachHls(v, info.playlist_url);
+  toast(index==null?"Subtitles off":"Subtitles: "+subLabelFor(s,index));
 }
 // Cycle Off → each track → Off (the 'c' hotkey and the CC button's long game).
 function cycleSub(){

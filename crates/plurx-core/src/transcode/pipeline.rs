@@ -259,9 +259,11 @@ impl Pipeline {
     /// - **The encoder it can't feed.** A graph and an encoder from different
     ///   families produce surfaces the other cannot read (see
     ///   [`Pipeline::pairs_with`]).
-    /// - **Burned text subtitles.** The `subtitles` filter is CPU-only, so a
-    ///   GPU graph would have to download for it and upload after — the round
-    ///   trip this whole milestone exists to delete, plus a second one. Those
+    /// - **Any burned subtitle.** Text goes through the CPU-only `subtitles`
+    ///   filter; a bitmap is composited by `overlay` against a scaled
+    ///   subtitle plane, which is also system memory here. Either way a GPU
+    ///   graph would have to come down for it and go back up — the round trip
+    ///   this whole milestone exists to delete, plus a second one. Those
     ///   sessions take the CPU chain and the log says why (PERF-PLAN §5).
     ///
     /// And one more that is about worth rather than correctness: `heavy` (see
@@ -275,13 +277,9 @@ impl Pipeline {
         encoder: Encoder,
         hdr_format: Option<&str>,
         heavy: bool,
-        burns_text_subtitles: bool,
+        burns_subtitles: bool,
     ) -> Pipeline {
-        if !heavy
-            || burns_text_subtitles
-            || !proven.handles(hdr_format)
-            || !proven.pairs_with(encoder)
-        {
+        if !heavy || burns_subtitles || !proven.handles(hdr_format) || !proven.pairs_with(encoder) {
             return Pipeline::Cpu;
         }
         proven

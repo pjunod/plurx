@@ -232,8 +232,10 @@ and delivers it. Full decision logic is [ARCHITECTURE.md](ARCHITECTURE.md) §3.
   never double-applied).
 - **Subtitles:** text tracks (SRT/ASS) extracted to WebVTT on the fly and shown
   as a selectable native track for direct/remux. Bitmap subs (PGS/VobSub) are
-  identified and can only be burned in during transcode (that burn-in is
-  *planned*, 2.x).
+  a picture rather than text, so there is nothing to hand a `<track>` — picking
+  one restarts the stream as a transcode with the subtitle drawn into the
+  frames. The menu says `burned in` on those, because that restart is a cost
+  worth knowing about before you choose between two English tracks.
 - **A stalled hardware session self-repairs:** if no HLS segment lands within 8 s,
   the session is killed and respawned on software x264 (the concurrent-QSV-stall
   fix). The user sees the loading overlay a little longer, not a gray screen.
@@ -534,6 +536,4 @@ Listed so the inventory above is unambiguous — these are deliberate, with reas
 - **Does not ship native TV apps yet.** Web app first (Tizen/webOS/tvOS/Android
   TV/Roku are Phase 5); Kodi-family Plex clients work today via the compat
   façade.
-- **Does not burn in bitmap subtitles yet** (PGS/VobSub) — identified, but
-  burn-in is 2.x. Text subs (SRT/ASS) work today.
 - **Does not emulate plex.tv** for Infuse/official Plex apps (Tier 2, deferred).

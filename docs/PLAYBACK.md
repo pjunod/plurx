@@ -260,9 +260,11 @@ verdict, a red flag if the reason is only container/audio.
 - **No client-side bitrate adaptation yet.** One encode runs at a time; the
   rung is chosen at start, not adapted per segment. The design for that is
   [ADAPTIVE-QUALITY.md](ADAPTIVE-QUALITY.md).
-- **Bitmap subs (PGS/VobSub) can't be copied or `<track>`'d.** They only appear
-  via a transcode that burns them in; direct/remux/copy carry text subs as
-  selectable `<track>`s only.
+- **Bitmap subs (PGS/VobSub) cost a stream restart.** They can't be copied or
+  `<track>`'d — a picture has no text to send — so selecting one re-opens the
+  stream as a transcode with the subtitle composited into the frames, and
+  turning it off restarts again. Direct/remux/copy carry text subs as
+  selectable `<track>`s, which toggle for free.
 - **DTS/TrueHD never passthrough to a browser.** No browser decodes them, so a
   remux/copy always transcodes that audio to AAC. Passthrough is a
   native-client concern (see [CLIENTS.md](CLIENTS.md)).

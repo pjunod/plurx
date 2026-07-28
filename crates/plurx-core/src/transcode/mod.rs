@@ -166,6 +166,50 @@ impl Default for TranscodeOptions {
     }
 }
 
+/// Label the burned video carries out of `-filter_complex`.
+const BURNED_VIDEO_LABEL: &str = "[vout]";
+
+/// The exact frame size a session will produce: the target height, never above
+/// the source's, with an even width at the source's aspect.
+///
+/// Worth computing rather than leaving to `scale=-2:...` because a bitmap
+/// subtitle has to be scaled to *match* it, and "whatever the scaler decided"
+/// is not something a second filter can be told. `None` when the source was
+/// never probed — an unprobed file has no aspect to preserve, and guessing one
+/// would misshape the picture rather than the subtitle.
+pub fn output_size(source: &MediaFile, target_height: i64) -> Option<(i64, i64)> {
+    let (sw, sh) = (source.width?, source.height?);
+    if sw <= 0 || sh <= 0 {
+        return None;
+    }
+    let h = target_height.min(sh).max(2);
+    // Even dimensions: yuv420p has half-resolution chroma, so an odd side is
+    // not representable and every encoder rejects it.
+    let w = ((sw * h + sh / 2) / sh).max(2);
+    Some((w & !1, h & !1))
+}
+
+/// The `-filter_complex` fragment that renders a bitmap subtitle to the size
+/// of the output frame, ready to composite. `None` when nothing is burned, the
+/// burn is text (which the chain handles inline), or the source was never
+/// probed.
+///
+/// The scaling is the whole subtlety, and getting it wrong is not subtle at
+/// all. A PGS stream carries its own canvas size and positions its bitmaps
+/// against that canvas — and on a UHD Blu-ray the canvas is very often 1920×1080
+/// while the video is 3840×2160. Composited as-is, every subtitle lands at
+/// quarter size in the upper-left quadrant. Scaling the subtitle plane to the
+/// output frame first puts it back where it was authored, whichever way the
+/// two sizes differ.
+fn bitmap_overlay(source: &MediaFile, opts: &TranscodeOptions) -> Option<String> {
+    let burn = opts.subtitle_burn.as_ref().filter(|b| b.bitmap)?;
+    let (w, h) = output_size(source, opts.target_height)?;
+    Some(format!(
+        "[0:s:{idx}]scale={w}:{h}[sburn]",
+        idx = burn.subtitle_index
+    ))
+}
+
 /// Build the video filter chain: scale (never upscale) → tone-map (if the
 /// source is HDR) → subtitle burn-in. Returns `None` when no filtering is
 /// needed (rare for transcode, but keeps the caller simple).
@@ -226,15 +270,17 @@ fn video_filters(source: &MediaFile, opts: &TranscodeOptions, source_path: &str)
 
 /// Subtitle burn-in, last, so subs render at output resolution in the output
 /// color space. Text/ASS is rendered with libass (covers the styled
-/// anime-subtitle case, REQ-SUB-2). Bitmap subs (PGS/VobSub) need an overlay
-/// filtergraph and are a documented fast-follow — requesting a bitmap burn
-/// here simply skips it rather than producing a broken graph.
+/// anime-subtitle case, REQ-SUB-2). Bitmap subs are not here at all: they are
+/// a second stream composited over this chain's output by [`bitmap_overlay`],
+/// which `-vf` cannot express.
 ///
 /// Shared by both branches above because it is genuinely the same step: the
 /// `subtitles` filter is CPU-only either way, which is why a session that
 /// burns text subtitles is routed to the CPU pipeline in the first place.
 fn with_subtitles(mut chain: Vec<String>, opts: &TranscodeOptions, source_path: &str) -> String {
     if let Some(burn) = &opts.subtitle_burn {
+        // A bitmap burn is not part of this chain: it is a second stream
+        // composited over the chain's output, built by `bitmap_overlay`.
         if !burn.bitmap {
             let escaped = escape_filter_path(source_path);
             chain.push(format!(
@@ -402,15 +448,6 @@ pub fn hls_args(
         0
     };
 
-    // Map first video + chosen (or default) audio.
-    args.push("-map".into());
-    args.push("0:v:0".into());
-    args.push("-map".into());
-    match opts.audio_index {
-        Some(i) => args.push(format!("{audio_input}:a:{i}?")),
-        None => args.push(format!("{audio_input}:a:0?")),
-    }
-
     // Video filter chain: [hwdownload for GPU-decoded frames →] scale / tonemap /
     // subs [→ GPU upload suffix for VAAPI/QSV] → encoder.
     //
@@ -430,8 +467,37 @@ pub fn hls_args(
         vf.push(',');
         vf.push_str(suffix);
     }
-    args.push("-vf".into());
-    args.push(vf);
+
+    // A bitmap subtitle is a picture, so burning one is a *composite* — two
+    // streams into one filter — and that needs `-filter_complex` and a mapped
+    // output label rather than the single-stream `-vf`. Everything above stays
+    // the chain it was; this only wraps it.
+    let overlay = bitmap_overlay(source, opts);
+    // Map the chosen (or default) audio, and video from wherever it now comes.
+    args.push("-map".into());
+    args.push(match &overlay {
+        Some(_) => BURNED_VIDEO_LABEL.to_owned(),
+        None => "0:v:0".to_owned(),
+    });
+    args.push("-map".into());
+    match opts.audio_index {
+        Some(i) => args.push(format!("{audio_input}:a:{i}?")),
+        None => args.push(format!("{audio_input}:a:0?")),
+    }
+
+    match overlay {
+        Some(sub) => {
+            args.push("-filter_complex".into());
+            args.push(format!(
+                "[0:v]{vf}[vburn];{sub};\
+                 [vburn][sburn]overlay=eof_action=pass{BURNED_VIDEO_LABEL}"
+            ));
+        }
+        None => {
+            args.push("-vf".into());
+            args.push(vf);
+        }
+    }
     args.extend(encoder.encode_args(opts.video_bitrate_kbps));
 
     // Segment-aligned keyframes so each segment is independently decodable.
@@ -645,6 +711,95 @@ mod tests {
         // SDR source → no tonemap, just pixel-format normalize.
         assert!(joined.contains("format=yuv420p"));
         assert!(!joined.contains("tonemap"));
+    }
+
+    /// The geometry that a naive overlay gets wrong, and gets wrong invisibly
+    /// to anything but an eye: a UHD Blu-ray very often carries a 1920×1080
+    /// PGS canvas over 3840×2160 video, and compositing that as-is puts every
+    /// subtitle at quarter size in the upper-left quadrant. Scaling the
+    /// subtitle plane to the *output* frame is what puts it back.
+    #[test]
+    fn a_bitmap_burn_scales_the_subtitle_to_the_output_frame() {
+        let mut f = file(None);
+        f.width = Some(3840);
+        f.height = Some(2160);
+        let opts = TranscodeOptions {
+            target_height: 1080,
+            subtitle_burn: Some(SubtitleBurn {
+                subtitle_index: 2,
+                bitmap: true,
+            }),
+            ..Default::default()
+        };
+        let args = hls_args(&f, Encoder::Software, &opts, Pacing::unpaced(), "/tmp/s");
+        let joined = args.join(" ");
+
+        // Two streams into one filter needs -filter_complex and a mapped label;
+        // -vf cannot express it at all.
+        assert!(joined.contains("-filter_complex"), "{joined}");
+        assert!(!joined.contains("-vf "), "a burn must not also use -vf");
+        assert!(
+            joined.contains("-map [vout]"),
+            "the burned video is what plays"
+        );
+        assert!(
+            !joined.contains("-map 0:v:0"),
+            "mapping the raw video skips the burn"
+        );
+
+        // The subtitle is scaled to the frame the viewer will see, not to the
+        // source and not to its own canvas.
+        assert!(joined.contains("[0:s:2]scale=1920:1080[sburn]"), "{joined}");
+        // `eof_action=pass` rather than the default `repeat`: a subtitle
+        // stream ends before the film does, and repeating its last frame both
+        // freezes a subtitle on screen for the rest of the runtime and makes
+        // the encoder log an alarming duplication error about a gap that is
+        // not a problem. Verified against a real PGS stream.
+        assert!(
+            joined.contains("[vburn][sburn]overlay=eof_action=pass[vout]"),
+            "{joined}"
+        );
+
+        // A text burn is a filter in the chain, not a composite — it must not
+        // take this path.
+        let text = TranscodeOptions {
+            subtitle_burn: Some(SubtitleBurn {
+                subtitle_index: 0,
+                bitmap: false,
+            }),
+            ..opts.clone()
+        };
+        let joined = hls_args(&f, Encoder::Software, &text, Pacing::unpaced(), "/tmp/s").join(" ");
+        assert!(joined.contains("-vf "), "text burn stays a simple chain");
+        assert!(joined.contains("subtitles="));
+        assert!(!joined.contains("overlay"));
+    }
+
+    /// The output frame is what a bitmap subtitle is scaled against, so its
+    /// arithmetic has to be exactly the scaler's: never upscale, keep the
+    /// aspect, and land on even sides.
+    #[test]
+    fn the_output_frame_matches_what_the_scaler_would_produce() {
+        let mut f = file(None);
+        f.width = Some(3840);
+        f.height = Some(2160);
+        assert_eq!(output_size(&f, 1080), Some((1920, 1080)));
+        assert_eq!(output_size(&f, 720), Some((1280, 720)));
+        // Never upscales: asking for more than the source has yields the source.
+        assert_eq!(output_size(&f, 2160), Some((3840, 2160)));
+        assert_eq!(output_size(&f, 4320), Some((3840, 2160)));
+
+        // Odd arithmetic rounds to even — yuv420p cannot represent an odd side,
+        // and every encoder refuses one.
+        f.width = Some(1919);
+        f.height = Some(1079);
+        let (w, h) = output_size(&f, 720).expect("size");
+        assert_eq!((w % 2, h % 2), (0, 0), "got {w}x{h}");
+
+        // A file the probe never read has no aspect to preserve. Guessing one
+        // would misshape the picture, so nothing is claimed.
+        f.width = None;
+        assert_eq!(output_size(&f, 1080), None);
     }
 
     #[test]

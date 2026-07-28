@@ -731,14 +731,16 @@ until they pass this probe on the deployed jellyfin-ffmpeg build.
 **Scope guards:** Dolby Vision profiles that hardware-decode to garbage
 stay on the existing `PLURX_HWDECODE=off` escape hatch; HLG routes to the
 CPU chain (or a probe-passed libplacebo) regardless, and the
-graph-selection log line says so. **Text** subtitle burn-in selects the
-compatible CPU/hybrid graph (the `subtitles` filter is CPU-only) — accept
-the download/upload for those sessions. **Bitmap** subtitles are not
-burned at all today (`video_filters` skips them); per decision 10 (§8.6)
-that stays true, and it is *disclosed*: the decision/start response says
-the selected subtitles can't be shown on this path, the player tells the
-viewer, and nothing downstream (cache identity included) may claim a burn
-that didn't happen.
+graph-selection log line says so. Subtitle burn-in of **either** kind selects the
+compatible CPU/hybrid graph — the `subtitles` filter is CPU-only, and a
+bitmap composite is system memory here too — so accept the download/upload
+for those sessions. **Bitmap** subtitles are burned as of 2026-07-28
+(decision 10, reversed): `[0:s:N]scale=W:H[sburn]` against the *output*
+frame, composited with `overlay=eof_action=pass`. The scale is the whole
+trick — a UHD Blu-ray's PGS canvas is usually 1920×1080 over 3840×2160
+video, and compositing that as-is puts every subtitle at quarter size in
+the upper-left quadrant. Verified against a real PGS stream, which is also
+now the thing the corpus should carry.
 
 **Capacity and admission, while in here** (review R6/assessment §8): the
 docs already warn two QSV sessions can stall an iGPU. Add
@@ -845,7 +847,9 @@ VA-API, NVENC, VideoToolbox, and software are demonstrated to satisfy one
 declared output contract (decision 6, §8.6). A build upgrade that changes
 tone-map output therefore misses the old entries instead of serving them.
 `subtitle_burn.applied` records whether the burn actually happened —
-a bitmap request that was skipped hashes as burn-omitted, honestly.
+`applied` is now always true for a requested burn — the skip it
+recorded no longer exists — but the field stays: a future path that cannot
+burn must not be able to hash as though it did.
 
 Identity and physical copies are **separate tables** — M4 needs "this
 recipe exists on nodes A and B, and B may evict its copy without lying to
@@ -1114,8 +1118,9 @@ or 0, windows sane, floors enforced server-side.
 - `GET /api/v1/hls/:session/status` (§3) — capability auth, no-store,
   never touches the idle clock.
 - Session-creation responses gain `vod: bool` and (informational)
-  `cached: bool` (§6.3), plus `subtitle_unavailable: bool` when the
-  selected subtitles can't ride this delivery path (§5, decision 10).
+  `cached: bool` (§6.3). `subtitle_unavailable` is no longer needed —
+  decision 10 reversed, and a bitmap subtitle is burned rather than
+  disclosed as missing.
   Additive; existing clients ignore them.
 
 ### 8.5 Session lifecycle (review R10, as tightened by the assessment)
@@ -1163,7 +1168,7 @@ Playlist/segment capability-URL auth is untouched — AirPlay depends on it.
 | 7 | Background preemption | Checkpoint-and-terminate — SIGSTOP does not release hardware sessions (§6.2); resume from last published boundary; discard unpublished temp |
 | 8 | Failover prefix | Hybrid: one regenerated overlap segment covers served-but-unacknowledged; client-buffer reliance for everything earlier (§7.3) |
 | 9 | Owner fencing | 6 s lease / 2 s renewal; epoch on every publication; resume SLO is a measured ≤10 s budget (§7.3) |
-| 10 | Bitmap subtitles | Remain unsupported; **disclosed, not rejected** — the server picks the burn track today, so there is no client request to refuse, and blocking a film over subtitles is worse than a labeled omission the UI announces. Cache identity records `applied=false`. (Deviates from the assessment's reject-or-negotiate wording; this is the negotiation, shaped for a living-room player.) |
+| 10 | Bitmap subtitles | ~~Remain unsupported; disclosed, not rejected~~ — **reversed 2026-07-28 at the operator's call: they are burned.** The decision assumed disclosure was the cheap answer and burn-in the expensive one, which held only while nobody had written the overlay graph. Written, it is one composite and a scale, and the disclosure it replaced would have been a label explaining why a film's subtitles are missing — worse than the thing it was standing in for. Selecting a bitmap track re-opens the stream as a transcode with the subtitle drawn in; cache identity records `applied=true` for a burn that happened. |
 
 ### 8.7 Docs this plan's commits must update (same-commit rule)
 

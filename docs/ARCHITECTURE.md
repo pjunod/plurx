@@ -193,9 +193,10 @@ never depends on runtime state.
   a picture matching the CPU reference, and meaningfully faster than it. The
   CPU zscale chain is the floor and the fallback. Version sniffing would not
   do: a graph that parses can still produce clipped gray, and a driver that
-  accepts the filter can still be slower than what it replaced. Image subs and
-  ASS burn-in happen here — and a burned text subtitle sends the session back
-  to the CPU chain, because `subtitles` is CPU-only.
+  accepts the filter can still be slower than what it replaced. Image subs and ASS burn-in
+  happen here: text through libass, bitmap (PGS/VobSub) as an `overlay`
+  composite against a subtitle plane scaled to the output frame. Either sends
+  the session back to the CPU chain, since both filters are system-memory.
 - **Audio** — passthrough per device profile (TrueHD/DTS-HD where the chain
   allows), else transcode to EAC3/AC3/AAC with correct downmix.
 

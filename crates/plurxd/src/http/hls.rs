@@ -67,6 +67,10 @@ pub struct CreateSession {
     /// which encoder wins, and the player only learns that from the response
     /// to this request (see `TranscodeManager::auto_height`).
     pub height: Option<i64>,
+    /// Subtitle stream to burn into the picture. Only for the ones a client
+    /// cannot render itself — a bitmap track (PGS/VobSub) has no text to send,
+    /// so the only way to show it is to draw it into the frames.
+    pub subtitle_burn: Option<i64>,
     pub start: Option<f64>,
     pub audio: Option<i64>,
     /// Copy the source video into HLS rather than re-encoding it.
@@ -101,6 +105,7 @@ impl CreateSession {
             kind,
             start_seconds: self.start.unwrap_or(0.0).max(0.0),
             audio_index: self.audio.filter(|a| *a >= 0),
+            subtitle_burn: self.subtitle_burn.filter(|s| *s >= 0),
         }
     }
 }
@@ -185,6 +190,7 @@ pub async fn start(
         playback_id: format!("legacy:{}:{id}", user.username),
         request_id: None,
         height: q.height,
+        subtitle_burn: None, // the deprecated GET bridge never offered a burn
         start: q.start,
         audio: q.audio,
         copy: Some(q.copy == Some(1)),
