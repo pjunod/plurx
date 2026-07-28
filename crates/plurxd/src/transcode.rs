@@ -22,6 +22,15 @@ use crate::meter::Meter;
 
 /// Idle timeout after which a session's ffmpeg is killed and its dir removed.
 const SESSION_IDLE_SECS: u64 = 60;
+/// What "Auto" resolves to — see [`TranscodeManager::auto_height`].
+const AUTO_SOFTWARE_HEIGHT: i64 = 720;
+const AUTO_HARDWARE_MAX_HEIGHT: i64 = 1080;
+/// Floor for any requested rung. Below this there is no picture worth the
+/// session, and the ladder's lowest step is 480p anyway.
+pub const MIN_HEIGHT: i64 = 144;
+/// Ceiling for an explicitly requested rung. Auto never reaches it; the
+/// quality menu can.
+pub const MAX_HEIGHT: i64 = 2160;
 /// How long a segment request waits for ffmpeg to produce a not-yet-written
 /// segment before giving up.
 const SEGMENT_WAIT: Duration = Duration::from_secs(20);
@@ -1004,6 +1013,35 @@ impl TranscodeManager {
         self.caps.choose(&prefer)
     }
 
+    /// The rung "Auto" means, given what this server can actually encode with.
+    ///
+    /// Auto was 720p for everything, which was the right answer when every
+    /// transcode was software: 1080p on x264 is a session that cannot hold
+    /// realtime on a NUC, and a stream that stutters at 1080p is worse than one
+    /// that plays at 720p. A hardware encoder changes the arithmetic, not the
+    /// reasoning — it clears realtime at 1080p comfortably — so Auto follows
+    /// the source up to 1080p when there is one and keeps the conservative
+    /// answer when there is not.
+    ///
+    /// Capped at 1080 on purpose rather than at the source: a 4K rung is a
+    /// bandwidth decision as much as a CPU one, and Auto should not put 20 Mb/s
+    /// on somebody's Wi-Fi without being asked. 4K stays a menu choice, and
+    /// direct play and remux still deliver the source untouched. Never
+    /// upscales: a 480p source transcodes at 480p.
+    ///
+    /// The server decides this, not the player, because only the server knows
+    /// which encoder won — the player learns that from the response it gets
+    /// back *after* the height has been chosen (PERF-PLAN §4.7).
+    pub async fn auto_height(&self, source_height: Option<i64>) -> i64 {
+        if self.encoder().await == Encoder::Software {
+            return AUTO_SOFTWARE_HEIGHT;
+        }
+        source_height
+            .filter(|h| *h > 0)
+            .unwrap_or(AUTO_HARDWARE_MAX_HEIGHT)
+            .clamp(MIN_HEIGHT, AUTO_HARDWARE_MAX_HEIGHT)
+    }
+
     /// The admin's playback language preferences (Settings → Playback
     /// defaults), falling back to English/English/Auto.
     pub async fn lang_prefs(&self) -> plurx_core::tracks::LangPrefs {
@@ -1848,6 +1886,49 @@ mod tests {
         assert_eq!(bitrate_for_height(1080), 8_000);
         assert_eq!(bitrate_for_height(720), 4_000);
         assert_eq!(bitrate_for_height(240), 1_200);
+    }
+
+    /// Auto is a policy about the encoder, not about the file.
+    #[tokio::test]
+    async fn auto_follows_the_source_only_when_hardware_can_carry_it() {
+        use plurx_core::store::SqliteStore;
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let work = tempfile::tempdir().expect("work");
+        let hardware = TranscodeManager::new(
+            Arc::clone(&store),
+            work.path().to_path_buf(),
+            EncoderCaps {
+                nvenc: true,
+                ..Default::default()
+            },
+        );
+        let software = TranscodeManager::new(
+            Arc::clone(&store),
+            work.path().to_path_buf(),
+            EncoderCaps::default(),
+        );
+
+        // Software keeps the conservative answer whatever the source is: a
+        // 1080p x264 session on a NUC cannot hold realtime, and a stream that
+        // stutters at 1080p is worse than one that plays at 720p.
+        for source in [Some(2160), Some(1080), Some(480), None] {
+            assert_eq!(software.auto_height(source).await, 720, "source {source:?}");
+        }
+
+        // Hardware follows the source, capped at 1080 — 4K is a bandwidth
+        // decision as well as a CPU one, and Auto should not put 20 Mb/s on
+        // somebody's Wi-Fi without being asked.
+        assert_eq!(hardware.auto_height(Some(2160)).await, 1080, "4K is capped");
+        assert_eq!(hardware.auto_height(Some(1080)).await, 1080);
+        assert_eq!(hardware.auto_height(Some(480)).await, 480, "never upscales");
+        // An unprobed file has no height to follow; 1080 is the useful guess,
+        // and the encoder being asked is the one that can carry it.
+        assert_eq!(hardware.auto_height(None).await, 1080);
+        assert_eq!(
+            hardware.auto_height(Some(0)).await,
+            1080,
+            "0 is not a height"
+        );
     }
 
     /// The progress stream is the only thing that can tell slow from stuck, so

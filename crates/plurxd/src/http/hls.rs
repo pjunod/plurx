@@ -23,7 +23,8 @@ use crate::state::AppState;
 
 #[derive(Deserialize)]
 pub struct StartQuery {
-    /// Target height (e.g. 1080, 720). Defaults to 1080. Ignored when `copy=1`.
+    /// Target height (e.g. 1080, 720). Omitted means Auto (server-chosen).
+    /// Ignored when `copy=1`.
     pub height: Option<i64>,
     /// Start offset in seconds (resume / seek).
     pub start: Option<f64>,
@@ -61,7 +62,10 @@ pub struct CreateSession {
     pub playback_id: String,
     /// Optional idempotency key for this one attempt.
     pub request_id: Option<String>,
-    /// Target height for a transcode. Ignored when `copy` is set.
+    /// Target height for a transcode. Ignored when `copy` is set. Omitted
+    /// means Auto, and Auto is the SERVER's decision: the rung depends on
+    /// which encoder wins, and the player only learns that from the response
+    /// to this request (see `TranscodeManager::auto_height`).
     pub height: Option<i64>,
     pub start: Option<f64>,
     pub audio: Option<i64>,
@@ -72,7 +76,11 @@ pub struct CreateSession {
 }
 
 impl CreateSession {
-    fn into_request(self, file_id: i64) -> crate::transcode::SessionRequest {
+    /// `auto_height` is resolved by the caller and passed in, because it needs
+    /// the store and the encoder choice — and because it must be settled
+    /// before the request is fingerprinted, or two identical Auto requests
+    /// could not recognise each other.
+    fn into_request(self, file_id: i64, auto_height: i64) -> crate::transcode::SessionRequest {
         use crate::transcode::SessionKind;
         let kind = if self.copy == Some(true) {
             SessionKind::Copy {
@@ -80,7 +88,10 @@ impl CreateSession {
             }
         } else {
             SessionKind::Transcode {
-                height: self.height.unwrap_or(1080).clamp(144, 2160),
+                height: self
+                    .height
+                    .unwrap_or(auto_height)
+                    .clamp(crate::transcode::MIN_HEIGHT, crate::transcode::MAX_HEIGHT),
             }
         };
         crate::transcode::SessionRequest {
@@ -105,7 +116,15 @@ pub async fn create(
     if req.playback_id.trim().is_empty() {
         return Err(ApiError::BadRequest("playback_id is required".into()));
     }
-    let request = req.into_request(id);
+    // Only pay for the lookup when Auto is actually in play — an explicit rung
+    // from the quality menu needs nothing from the file.
+    let auto_height = if req.height.is_none() && req.copy != Some(true) {
+        let source = state.store.get_file(id).await?.and_then(|f| f.height);
+        state.transcode.auto_height(source).await
+    } else {
+        0
+    };
+    let request = req.into_request(id, auto_height);
     // A session being created is playback beginning — the honest moment for
     // the scrobble that used to fire from `/decision`.
     crate::playstart::note_playback_started(&state, user.id, id);

@@ -868,7 +868,11 @@ function newAttempt(reason){
 function playbackContext(){
   const v=document.getElementById("video"), p=PLAYER||{};
   return {
-    height:p.method==='transcode'?transcodeHeight():((p.source&&p.source.height)||null),
+    // What is on screen, not what was asked for — under Auto the request
+    // carries no height at all, and a beacon that reported null would lose the
+    // one field that separates a 4K session's numbers from a 720p one's.
+    height:(v&&v.videoHeight)||(p.method==='transcode'?transcodeHeight():null)
+           ||((p.source&&p.source.height)||null),
     encoder:p.encoder||null,
     runway:v?bufferRunway(v):null,
     attempt:p.attemptId||null,
@@ -2032,8 +2036,11 @@ function remuxUrl(base, audioIndex, startSec){
 // previous one, and a GET that does that can be replayed by anything that
 // believes GETs are safe.
 async function openSession(fileId, opts){
-  return api(`/files/${fileId}/hls/sessions`,{method:"POST",body:Object.assign({
-    playback_id:PLAYBACK_ID, request_id:newRequestId()}, opts||{})});
+  const body=Object.assign({playback_id:PLAYBACK_ID, request_id:newRequestId()}, opts||{});
+  // A null height is the *absence* of a request, not a request for nothing:
+  // sending the key would have the server clamp null to its floor.
+  if(body.height==null) delete body.height;
+  return api(`/files/${fileId}/hls/sessions`,{method:"POST",body});
 }
 // Tell the server we are finished with a stream. Without this the encoder
 // lives on for the idle timeout plus a reaper tick — over a minute of a
@@ -2080,7 +2087,12 @@ const CAPS_Q=`vcodec=${PLAY_CAPS.vcodec}&acodec=${PLAY_CAPS.acodec}&container=${
 const QUALITIES=[["auto","Auto"],["original","Original"],["1080","1080p"],["720","720p"],["480","480p"]];
 function playQuality(){ try{ return localStorage.getItem("plurx_quality")||"auto"; }catch(e){ return "auto"; } }
 function qualityForce(){ const q=playQuality(); return q==="auto"?"auto":(q==="original"?"original":"transcode"); }
-function transcodeHeight(){ const q=playQuality(); return (q==="1080"||q==="720"||q==="480")?parseInt(q,10):720; }
+// The rung a transcode should run at, or null for Auto — which is not a
+// number this side can compute. Auto depends on which encoder the server ends
+// up using, and the player only finds that out in the response to the request
+// it is about to make. So it asks for nothing and lets the server answer
+// (PERF-PLAN §4.7); the menu's explicit rungs still mean exactly themselves.
+function transcodeHeight(){ const q=playQuality(); return (q==="1080"||q==="720"||q==="480")?parseInt(q,10):null; }
 function qualityLabel(){ const q=playQuality(); const f=QUALITIES.find(x=>x[0]===q); return f?f[1]:"Auto"; }
 
 async function play(fileId, title, resumeMs, knownDurMs, meta){
