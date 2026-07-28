@@ -6,6 +6,7 @@ mod logbuf;
 mod meter;
 mod pipeprobe;
 mod playstart;
+mod produce;
 mod progressive;
 mod schedule;
 mod state;

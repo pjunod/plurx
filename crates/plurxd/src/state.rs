@@ -288,7 +288,36 @@ pub struct JobManager {
     /// Recent targeted-scan requests and their outcomes, newest last.
     requests: Mutex<VecDeque<ScanRequestRecord>>,
     metrics: IntegrationMetrics,
+    /// A pre-transcode pass is running. Not a mutex, because the answer wanted
+    /// is "is one going" rather than "wait for it": a second pass would fight
+    /// the first for the same slots, and queuing one behind an encode that
+    /// takes hours is worse than skipping it.
+    producing: std::sync::atomic::AtomicBool,
 }
+
+/// Clears [`JobManager::producing`] however the pass ends — including the ways
+/// a `?` or a panic would leave it set forever, which would silently stop the
+/// producer for the life of the process.
+struct ProducingGuard(Arc<JobManager>);
+
+impl Drop for ProducingGuard {
+    fn drop(&mut self) {
+        self.0.producing.store(false, Ordering::Relaxed);
+    }
+}
+
+/// How many rows to take off each rail, per user. A rail is a prediction and
+/// the tail of one is a weak prediction; the head is where the value is.
+const PRODUCE_RAIL: i64 = 5;
+
+/// Ceiling on what one pass will attempt, across every user and rail.
+const PRODUCE_MAX_PER_PASS: usize = 12;
+
+/// How long one pass may spend. A bound rather than "until the list is done"
+/// because the list is never done: it is regenerated every interval from what
+/// people are actually watching, and a pass that ran for a day would be
+/// producing yesterday's predictions.
+const PRODUCE_WINDOW: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
 
 /// Ids the caller already knows, so plurx does not have to guess.
 ///
@@ -365,6 +394,7 @@ impl JobManager {
             pending: Mutex::new(HashMap::new()),
             requests: Mutex::new(VecDeque::new()),
             metrics: IntegrationMetrics::default(),
+            producing: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -820,6 +850,8 @@ impl JobManager {
             last_probe_retry: self.job_stamp(keys::JOB_LAST_PROBE_RETRY).await,
             transcode_cleanup_mins: self.job_interval(keys::JOB_TRANSCODE_CLEANUP_MINS).await,
             last_transcode_cleanup: self.job_stamp(keys::JOB_LAST_TRANSCODE_CLEANUP).await,
+            cache_produce_mins: self.job_interval(keys::JOB_CACHE_PRODUCE_MINS).await,
+            last_cache_produce: self.job_stamp(keys::JOB_LAST_CACHE_PRODUCE).await,
         };
         for job in due_jobs(now(), &libraries, global) {
             match job {
@@ -864,9 +896,148 @@ impl JobManager {
                         crate::cachekeep::sweep(&self.store, root, node, now()).await;
                     }
                 }
+                DueJob::ProduceCache => {
+                    self.stamp(keys::JOB_LAST_CACHE_PRODUCE).await;
+                    // Spawned rather than run inline: this one takes hours, and
+                    // the scheduler tick it is on is also what starts scans and
+                    // sweeps. `run_due_jobs` is stamped-before-run, so a
+                    // producer still going when the next tick arrives simply
+                    // finds itself already stamped and does not double up —
+                    // and `produce_pass` refuses a second concurrent run
+                    // outright.
+                    let state = Arc::clone(self);
+                    let transcode = Arc::clone(transcode);
+                    tokio::spawn(async move { state.produce_pass(transcode).await });
+                }
             }
         }
         Ok(())
+    }
+
+    /// One producer pass: sweep the cache back under budget, work out what
+    /// somebody is likely to play next, and pre-transcode as much of it as the
+    /// window allows (PERF-PLAN §6.2).
+    ///
+    /// Everything here is best-effort by construction. A candidate that fails
+    /// is logged and skipped rather than ending the pass: the list is a
+    /// prediction, and one bad prediction is not a reason to stop making them.
+    async fn produce_pass(self: Arc<Self>, transcode: Arc<TranscodeManager>) {
+        use crate::produce;
+        let Some((root, node)) = transcode.cache_location() else {
+            return;
+        };
+        // One at a time. Two passes would fight for the same slots and the
+        // same claims — the claims would sort it out correctly, but only after
+        // both had spawned encoders.
+        if self.producing.swap(true, Ordering::Relaxed) {
+            tracing::debug!("a producer pass is already running; skipping this one");
+            return;
+        }
+        let _running = ProducingGuard(Arc::clone(&self));
+
+        // Under budget BEFORE producing, not after. Producing first would push
+        // the cache over its ceiling and then evict — and the eviction is LRU,
+        // so what it takes could easily be the entry just made.
+        crate::cachekeep::sweep(&self.store, root, node, now()).await;
+        if crate::cachekeep::budget_bytes(&self.store).await.is_none() {
+            tracing::debug!("cache is switched off; nothing to produce");
+            return;
+        }
+
+        let users = match self.store.list_users().await {
+            Ok(users) => users,
+            Err(e) => {
+                tracing::warn!(error = %e, "producer: cannot list users");
+                return;
+            }
+        };
+        let mut rails: Vec<Vec<produce::Candidate>> = Vec::new();
+        let mut in_progress = Vec::new();
+        let mut next_up = Vec::new();
+        for user in &users {
+            if let Ok(rows) = self.store.continue_watching(user.id, PRODUCE_RAIL).await {
+                in_progress.extend(rows.into_iter().map(|r| (r.item.id, r.item.title)));
+            }
+            if let Ok(rows) = self.store.next_up(user.id, PRODUCE_RAIL).await {
+                next_up.extend(rows.into_iter().map(|r| (r.item.id, r.item.title)));
+            }
+        }
+        // The fallback rail, and the only one a brand-new server has: nobody
+        // has watch history on day one, but a 4K film that landed yesterday is
+        // still the most likely thing to be played tonight.
+        let recent: Vec<(i64, String)> = self
+            .store
+            .recently_added(None, PRODUCE_RAIL)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| (r.item.id, r.item.title))
+            .collect();
+
+        // Resolve items to their files here rather than in `rank`, so the
+        // ranking stays a pure list operation and an item with no playable
+        // file simply never enters it.
+        for (reason, items) in [
+            (produce::REASON_IN_PROGRESS, in_progress),
+            (produce::REASON_NEXT_UP, next_up),
+            (produce::REASON_RECENT, recent),
+        ] {
+            let mut rail = Vec::new();
+            for (item_id, title) in items {
+                if let Ok(files) = self.store.files_for_item(item_id).await {
+                    if let Some(f) = files.first() {
+                        rail.push(produce::Candidate {
+                            file_id: f.id,
+                            item_id,
+                            title,
+                            reason,
+                        });
+                    }
+                }
+            }
+            rails.push(rail);
+        }
+
+        let candidates = produce::rank(&rails, PRODUCE_MAX_PER_PASS);
+        if candidates.is_empty() {
+            return;
+        }
+        let deadline = std::time::Instant::now() + PRODUCE_WINDOW;
+        tracing::info!(
+            candidates = candidates.len(),
+            window_mins = PRODUCE_WINDOW.as_secs() / 60,
+            "pre-transcode pass starting"
+        );
+        for c in candidates {
+            if std::time::Instant::now() >= deadline {
+                tracing::info!("pre-transcode pass out of time");
+                break;
+            }
+            let Ok(Some(file)) = self.store.get_file(c.file_id).await else {
+                continue;
+            };
+            if !produce::worth_producing(&file) {
+                continue;
+            }
+            // The rung a viewer would actually be given, so the entry matches
+            // what a real playback looks up. Asking the manager rather than
+            // assuming is what keeps the two in step when Auto's policy moves.
+            let height = transcode.auto_height(file.height).await;
+            match transcode.produce(&file, height, deadline).await {
+                Ok(Some(made)) => {
+                    tracing::info!(
+                        recipe = %made.recipe, title = %c.title, reason = c.reason, height,
+                        minutes = made.duration_ms / 60_000, segments = made.segments,
+                        mb = made.bytes / 1_048_576, parts = made.parts,
+                        "pre-transcoded"
+                    );
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(title = %c.title, error = %e, "pre-transcode failed");
+                }
+            }
+        }
     }
 
     /// A minutes-interval setting; absent, blank or unparseable reads as off.

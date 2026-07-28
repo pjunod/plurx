@@ -539,9 +539,15 @@ pub trait TranscodeCacheStore: Send + Sync + 'static {
         node_id: &str,
     ) -> Result<Option<CachedTranscode>, StoreError>;
 
-    /// Claim a directory for a recipe about to be produced. Idempotent: a
-    /// second producer for the same recipe finds the claim and can stand down
-    /// rather than racing it.
+    /// Claim a directory for a recipe about to be produced.
+    ///
+    /// Returns whether THIS caller took the claim. `false` means somebody got
+    /// there first and is either producing it now or has already finished, and
+    /// the answer matters: without it a second producer cannot tell "I own
+    /// this" from "somebody else does", so it either duplicates hours of encode
+    /// or — worse — publishes over a directory another process is writing.
+    /// Idempotent in the sense that matters: repeated claims never move the
+    /// first one's directory.
     async fn claim_cache_entry(
         &self,
         recipe_hash: &str,
@@ -549,7 +555,7 @@ pub trait TranscodeCacheStore: Send + Sync + 'static {
         recipe_version: i64,
         node_id: &str,
         relative_dir: &str,
-    ) -> Result<(), StoreError>;
+    ) -> Result<bool, StoreError>;
 
     /// Mark a claim finished and serveable, with its measured size. Until this
     /// runs the entry is invisible to [`TranscodeCacheStore::cache_hit`].

@@ -24,6 +24,8 @@ pub enum DueJob {
     RetryProbes,
     /// Delete transcode working directories no live session owns.
     CleanupTranscode,
+    /// Pre-transcode what somebody is likely to play next (PERF-PLAN §6.2).
+    ProduceCache,
 }
 
 /// Server-wide job intervals and their last-run stamps, in minutes and unix
@@ -34,6 +36,8 @@ pub struct GlobalSchedule {
     pub last_probe_retry: Option<i64>,
     pub transcode_cleanup_mins: i64,
     pub last_transcode_cleanup: Option<i64>,
+    pub cache_produce_mins: i64,
+    pub last_cache_produce: Option<i64>,
 }
 
 /// Is a job with this interval due, given when it last ran?
@@ -77,6 +81,12 @@ pub fn due_jobs(now: i64, libraries: &[Library], global: GlobalSchedule) -> Vec<
         global.transcode_cleanup_mins,
     ) {
         jobs.push(DueJob::CleanupTranscode);
+    }
+    // Last, and that is deliberate rather than incidental. This is the only
+    // job that competes with live playback for the hardware, so it goes behind
+    // everything else a due moment asked for.
+    if due(now, global.last_cache_produce, global.cache_produce_mins) {
+        jobs.push(DueJob::ProduceCache);
     }
     jobs
 }
@@ -172,6 +182,7 @@ mod tests {
             last_probe_retry: Some(NOW - 23 * HOUR),
             transcode_cleanup_mins: 360,
             last_transcode_cleanup: Some(NOW - 7 * HOUR),
+            ..Default::default()
         };
         assert_eq!(due_jobs(NOW, &[], global), [DueJob::CleanupTranscode]);
 
@@ -180,8 +191,32 @@ mod tests {
             last_probe_retry: None,
             transcode_cleanup_mins: 0,
             last_transcode_cleanup: None,
+            ..Default::default()
         };
         assert_eq!(due_jobs(NOW, &[], global), [DueJob::RetryProbes]);
+    }
+
+    /// The producer competes with live playback for the hardware, so when a
+    /// tick has other work it goes behind that work. It is also off by default
+    /// like every other job — an upgraded server must not start encoding
+    /// overnight because somebody installed a new build.
+    #[test]
+    fn the_producer_is_off_by_default_and_goes_last_when_it_is_not() {
+        assert!(
+            !due_jobs(NOW, &[], GlobalSchedule::default()).contains(&DueJob::ProduceCache),
+            "an unconfigured server does not pre-transcode"
+        );
+        let global = GlobalSchedule {
+            probe_retry_mins: 1440,
+            last_probe_retry: None,
+            cache_produce_mins: 360,
+            last_cache_produce: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            due_jobs(NOW, &[lib(1, 60, None, 0, None)], global),
+            [DueJob::Scan(1), DueJob::RetryProbes, DueJob::ProduceCache]
+        );
     }
 
     #[test]

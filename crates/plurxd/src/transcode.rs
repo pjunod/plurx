@@ -20,7 +20,7 @@ use tokio::process::Child;
 use tokio::sync::Mutex;
 
 use crate::admission::{
-    Admission, Admissions, HwSlot, Workload, DEFAULT_MAX_HW_SESSIONS, QUEUE_WAIT,
+    Admission, Admissions, HwSlot, Priority, Workload, DEFAULT_MAX_HW_SESSIONS, QUEUE_WAIT,
 };
 use crate::ffmpeg::{ffmpeg_bin, pacing_caps};
 use crate::meter::Meter;
@@ -945,6 +945,136 @@ impl SessionRequest {
     }
 }
 
+/// How often a running producer checks whether a viewer wants its slot.
+///
+/// Short, because this interval *is* the latency a viewer pays to preempt it:
+/// a quarter-second of polling plus a kill is well inside the five seconds a
+/// live start is willing to queue, and the poll itself costs nothing.
+const PRODUCER_POLL: Duration = Duration::from_millis(250);
+
+/// How long a producer waits before asking for a slot again after being
+/// refused one. Longer than the poll: it has already been told a viewer is
+/// there, and retrying eagerly would just spin.
+const PRODUCER_RETRY: Duration = Duration::from_secs(5);
+
+/// How many times one run will resume after being preempted before giving up
+/// until the next producer pass.
+///
+/// A bound rather than a timeout because the failure it guards against is not
+/// slowness but *thrash*: a busy evening where every part is killed within
+/// seconds would otherwise spend the whole night starting encoders and
+/// throwing them away. Progress is kept either way — the next pass resumes
+/// from the same boundary.
+const PRODUCER_MAX_PARTS: usize = 64;
+
+/// The recipe format this build writes into new claims. Stored per row so a
+/// future change to what a recipe *means* can be recognised rather than
+/// guessed at.
+const CACHE_RECIPE_VERSION: i64 = 1;
+
+/// Why a producer part stopped.
+#[derive(Debug)]
+enum PartEnd {
+    /// ffmpeg reached the end of the file.
+    Finished,
+    /// A viewer wants the hardware.
+    Preempted,
+    /// This producer run is out of time.
+    Deadline,
+    Failed(String),
+}
+
+/// Which tracks a session carries. Part of its recipe, which is why it is a
+/// named thing rather than two loose values.
+#[derive(Debug, Clone, Default)]
+struct Tracks {
+    audio_index: Option<i64>,
+    subtitle_burn: Option<plurx_core::transcode::SubtitleBurn>,
+}
+
+/// A published cache entry, as measured on disk.
+#[derive(Debug, Clone, Copy)]
+struct Published {
+    bytes: i64,
+    duration_ms: i64,
+    segments: usize,
+    /// How many separate encoder runs it took — one, plus one per preemption.
+    ///
+    /// Worth reporting rather than inferring: it is the only number that says
+    /// how contended the box was while this was made, and it is the thing a
+    /// test of the resume path has to assert on, or that test passes on a
+    /// fixture small enough to finish before it is ever interrupted.
+    parts: usize,
+}
+
+/// What one `produce` call achieved.
+#[derive(Debug, Clone)]
+pub struct Produced {
+    pub recipe: String,
+    pub bytes: i64,
+    pub duration_ms: i64,
+    pub segments: usize,
+    pub parts: usize,
+}
+
+/// Read what one part actually produced, from the playlist ffmpeg wrote.
+///
+/// The playlist rather than a directory listing, because a directory contains
+/// the segment that was being written when the process was killed and the
+/// playlist does not — an unlisted `.ts` file is a truncated one, and treating
+/// it as content puts a corrupt two seconds into the middle of a film.
+async fn read_part(part_dir: &std::path::Path) -> crate::produce::Part {
+    match tokio::fs::read_to_string(part_dir.join("index.m3u8")).await {
+        Ok(text) => crate::produce::Part::from_playlist(&text),
+        Err(_) => crate::produce::Part {
+            segments: Vec::new(),
+            durations_ms: Vec::new(),
+        },
+    }
+}
+
+/// Move every part's segments into one flat directory, write the VOD playlist,
+/// and clear the part directories away.
+///
+/// Renames rather than copies: everything is inside one temp directory on one
+/// filesystem, so this costs nothing however large the asset.
+async fn publish_from(
+    temp: &std::path::Path,
+    parts: &[crate::produce::Part],
+) -> Result<Option<Published>, String> {
+    let assembled = crate::produce::assemble(parts);
+    if assembled.placements.is_empty() {
+        return Ok(None);
+    }
+    let mut bytes = 0i64;
+    for p in &assembled.placements {
+        let from = temp.join(&p.from);
+        let to = temp.join(&p.to);
+        bytes += tokio::fs::metadata(&from)
+            .await
+            .map(|m| m.len() as i64)
+            .unwrap_or(0);
+        tokio::fs::rename(&from, &to)
+            .await
+            .map_err(|e| format!("placing {}: {e}", p.to))?;
+    }
+    tokio::fs::write(temp.join("index.m3u8"), assembled.playlist.as_bytes())
+        .await
+        .map_err(|e| format!("writing the playlist: {e}"))?;
+    bytes += assembled.playlist.len() as i64;
+    // The part directories are empty now; what is left in them is ffmpeg's own
+    // playlist and any segment it never listed.
+    for i in 0..parts.len() {
+        let _ = tokio::fs::remove_dir_all(temp.join(crate::produce::part_dir(i))).await;
+    }
+    Ok(Some(Published {
+        bytes,
+        duration_ms: assembled.duration_ms,
+        segments: assembled.placements.len(),
+        parts: parts.len(),
+    }))
+}
+
 /// Where this node keeps finished transcodes, and what identifies its output.
 #[derive(Debug, Clone)]
 struct CacheConfig {
@@ -1040,6 +1170,62 @@ impl TranscodeManager {
             encoder: Encoder::Software, // replaced per lookup
             pipeline: self.pipeline,
         })
+    }
+
+    /// Which audio track a session carries, and which subtitle it burns.
+    ///
+    /// One function, called by the live path and by the producer, because the
+    /// answer is part of the recipe: two sessions differing only in audio track
+    /// are different bytes. A producer that skipped this and a playback that
+    /// did it would compute two different names for the same film, and the
+    /// symptom is a cache that fills forever and never hits — which looks
+    /// exactly like a cache that is merely cold. It was, in fact, the first
+    /// thing that went wrong when the producer was wired up.
+    async fn select_tracks(
+        &self,
+        file: &plurx_core::domain::MediaFile,
+        audio_override: Option<i64>,
+        subtitle_override: Option<i64>,
+    ) -> Tracks {
+        // Prefer original (Japanese) audio + subs when the file is dual-audio
+        // anime-style (REQ-SUB-2), and honour the server-wide language
+        // preferences otherwise. Burn the chosen text subtitle, since an HLS
+        // transcode delivers a single flat stream.
+        let prefer_original = file
+            .audio_streams
+            .iter()
+            .any(|a| matches!(a.language.as_deref(), Some("jpn" | "ja" | "jp")))
+            && file.audio_streams.len() > 1;
+        let prefs = self.lang_prefs().await;
+        let selection = plurx_core::tracks::select_tracks(
+            &file.audio_streams,
+            &file.subtitle_streams,
+            prefer_original,
+            &prefs,
+        );
+        // A viewer's explicit choice wins over the automatic one, and is the
+        // only way a bitmap subtitle is ever burned: the automatic rule exists
+        // for dual-audio anime, where burning is a guess at what somebody
+        // wants. Burning a subtitle nobody asked for is a picture they cannot
+        // turn off.
+        let burn_index = subtitle_override.filter(|i| *i >= 0).or_else(|| {
+            prefer_original
+                .then_some(selection.subtitle_index)
+                .flatten()
+        });
+        Tracks {
+            audio_index: audio_override.or(selection.audio_index),
+            subtitle_burn: burn_index.and_then(|idx| {
+                let codec = file
+                    .subtitle_streams
+                    .get(idx as usize)
+                    .map(|s| s.codec.clone())?;
+                Some(plurx_core::transcode::SubtitleBurn {
+                    subtitle_index: idx,
+                    bitmap: plurx_core::tracks::is_bitmap_subtitle(&codec),
+                })
+            }),
+        }
     }
 
     /// The options a session with this shape would run with.
@@ -1187,6 +1373,290 @@ impl TranscodeManager {
             encoder: "cached",
             vod: true,
         })
+    }
+
+    // ---- the pre-transcode producer (PERF-PLAN §6.2) -----------------------
+
+    /// Pre-transcode one file at one rung, so the next viewer gets a cache hit.
+    ///
+    /// Runs at background priority and is expected to be interrupted: an encode
+    /// of a two-hour 4K film will normally be preempted several times by people
+    /// pressing play, and picks up from its last published segment boundary
+    /// each time. Preemption is by *termination* — see [`crate::admission`] for
+    /// why suspending would not release anything that matters.
+    ///
+    /// Returns the recipe hash on success, `None` when there was nothing to do
+    /// (already cached, already claimed by another producer, no cache
+    /// configured) — neither of which is a failure.
+    pub async fn produce(
+        &self,
+        file: &plurx_core::domain::MediaFile,
+        target_height: i64,
+        deadline: Instant,
+    ) -> Result<Option<Produced>, String> {
+        let Some(cache) = self.cache.as_ref() else {
+            return Ok(None);
+        };
+        let encoder = self.encoder().await;
+        // Through the same track selection a real playback uses. Not an
+        // optimisation — the tracks are part of the recipe, so producing with
+        // "no audio track chosen" makes an entry named for a session that will
+        // never be requested.
+        let Tracks {
+            audio_index,
+            subtitle_burn,
+        } = self.select_tracks(file, None, None).await;
+        let opts = self.options_for(
+            encoder,
+            file,
+            target_height,
+            0.0,
+            audio_index,
+            subtitle_burn,
+        );
+        let mut digest = self.digest().ok_or("no cache digest")?;
+        digest.encoder = encoder;
+        let hash = Recipe {
+            digest: &digest,
+            file,
+            opts: &opts,
+            audio_copied: false,
+        }
+        .hash();
+
+        // Already there. Not an error and not worth a log line — the candidate
+        // list is a *prediction*, and predicting something that is already true
+        // is the system working.
+        if matches!(
+            self.store.cache_hit(&hash, &cache.node_id).await,
+            Ok(Some(_))
+        ) {
+            return Ok(None);
+        }
+        let relative = format!("{}/{hash}", &hash[..2]);
+        let claimed = self
+            .store
+            .claim_cache_entry(
+                &hash,
+                file.id,
+                CACHE_RECIPE_VERSION,
+                &cache.node_id,
+                &relative,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        if !claimed {
+            // Somebody else owns this recipe. Standing down is the whole point
+            // of the claim: two producers on one film is an hour of GPU spent
+            // twice, and the loser would publish over the winner's directory.
+            tracing::debug!(recipe = %hash, file = file.id, "cache entry already claimed; standing down");
+            return Ok(None);
+        }
+
+        // Everything is built in a temp directory beside the final one, so the
+        // publish is a rename within one filesystem — which is atomic, and is
+        // the only way a half-written asset cannot be observed as a whole one.
+        let temp = cache
+            .dir
+            .join("tmp")
+            .join(format!("{hash}.{}", uuid::Uuid::new_v4()));
+        let outcome = self
+            .produce_into(&temp, file, &opts, encoder, &hash, deadline)
+            .await;
+        let published = match outcome {
+            Ok(Some(assembled)) => assembled,
+            other => {
+                // Nothing to publish: preempted with no complete segment, out
+                // of time, or failed. The claim goes with the bytes so the next
+                // run can start over — leaving it would make this recipe
+                // permanently un-producible until the stale-claim sweep, a day
+                // later, noticed.
+                let _ = tokio::fs::remove_dir_all(&temp).await;
+                let _ = self.store.forget_cache_entry(&hash, &cache.node_id).await;
+                return other.map(|_| None);
+            }
+        };
+
+        let final_dir = cache.dir.join(&relative);
+        if let Some(parent) = final_dir.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        tokio::fs::rename(&temp, &final_dir)
+            .await
+            .map_err(|e| format!("publishing {}: {e}", final_dir.display()))?;
+        self.store
+            .complete_cache_entry(&hash, &cache.node_id, published.bytes)
+            .await
+            .map_err(|e| e.to_string())?;
+        tracing::info!(
+            recipe = %hash, file = file.id, height = target_height,
+            bytes = published.bytes, duration_s = published.duration_ms / 1000,
+            segments = published.segments, parts = published.parts,
+            "pre-transcode published"
+        );
+        Ok(Some(Produced {
+            recipe: hash,
+            bytes: published.bytes,
+            duration_ms: published.duration_ms,
+            segments: published.segments,
+            parts: published.parts,
+        }))
+    }
+
+    /// Encode into `temp` until finished, out of time, or out of patience with
+    /// being preempted. `Ok(None)` means nothing publishable was produced.
+    async fn produce_into(
+        &self,
+        temp: &std::path::Path,
+        file: &plurx_core::domain::MediaFile,
+        opts: &TranscodeOptions,
+        encoder: Encoder,
+        hash: &str,
+        deadline: Instant,
+    ) -> Result<Option<Published>, String> {
+        tokio::fs::create_dir_all(temp)
+            .await
+            .map_err(|e| format!("creating {}: {e}", temp.display()))?;
+        let max = self.max_hw_sessions().await;
+        let mut parts: Vec<crate::produce::Part> = Vec::new();
+        // Counted separately from `parts` because a part that was killed
+        // before its first segment produced nothing and so is not one — but it
+        // did start an encoder, which is the thing worth bounding.
+        let mut spawned = 0usize;
+
+        while spawned < PRODUCER_MAX_PARTS {
+            if Instant::now() >= deadline {
+                tracing::debug!(recipe = %hash, "producer out of time for this run");
+                return Ok(None);
+            }
+            // Do not even start while a viewer is queuing.
+            //
+            // For a hardware encoder the slot request answers this, since
+            // background acquisition is refused outright while anyone is in the
+            // queue. Software has no slot to ask for, and without the explicit
+            // check this loop span: spawn ffmpeg, kill it on the first poll
+            // microseconds later, spawn another — hundreds of processes a
+            // second, for as long as somebody was waiting to play something.
+            let slot = if encoder == Encoder::Software {
+                if self.admissions.live_is_waiting() {
+                    tokio::time::sleep(PRODUCER_RETRY).await;
+                    continue;
+                }
+                None
+            } else {
+                match self.admissions.try_acquire(max, Priority::Background) {
+                    Some(slot) => Some(slot),
+                    None => {
+                        tokio::time::sleep(PRODUCER_RETRY).await;
+                        continue;
+                    }
+                }
+            };
+            spawned += 1;
+
+            let part_dir = temp.join(crate::produce::part_dir(parts.len()));
+            tokio::fs::create_dir_all(&part_dir)
+                .await
+                .map_err(|e| format!("creating {}: {e}", part_dir.display()))?;
+            let resume_ms = crate::produce::resume_at_ms(&parts);
+            let part_opts = TranscodeOptions {
+                start_seconds: resume_ms as f64 / 1000.0,
+                ..opts.clone()
+            };
+            // Unpaced, deliberately. Pacing exists so a live session does not
+            // write a film ahead of a playhead that will never reach it; a
+            // producer has no playhead and every second it spends holding the
+            // hardware is a second a viewer might want it.
+            let args = transcode::hls_args(
+                file,
+                encoder,
+                &part_opts,
+                Pacing::unpaced(),
+                &part_dir.to_string_lossy(),
+            );
+            tracing::info!(
+                recipe = %hash, part = parts.len(), from_s = part_opts.start_seconds,
+                encoder = encoder.label(), "pre-transcode part starting"
+            );
+            let progress = Arc::new(Progress::new());
+            let generation = progress.begin_attempt();
+            let mut child = spawn_ffmpeg(
+                &args,
+                encoder.label(),
+                hash,
+                Arc::clone(&progress),
+                generation,
+            )?;
+
+            let ended = self.run_part(&mut child, deadline).await;
+            drop(slot); // before anything else: a viewer is probably waiting on it
+            let part = read_part(&part_dir).await;
+            let produced = !part.is_empty();
+            if produced {
+                parts.push(part);
+            }
+
+            match ended {
+                PartEnd::Finished => return publish_from(temp, &parts).await,
+                PartEnd::Preempted | PartEnd::Deadline => {
+                    tracing::info!(
+                        recipe = %hash, spawned,
+                        produced_s = crate::produce::resume_at_ms(&parts) / 1000,
+                        "pre-transcode yielded"
+                    );
+                    // A part that produced nothing leaves an empty directory
+                    // that the next part must not reuse a number with.
+                    if !produced {
+                        let _ = tokio::fs::remove_dir_all(&part_dir).await;
+                    }
+                    if matches!(ended, PartEnd::Deadline) {
+                        // Out of budget for this pass. What was produced is
+                        // discarded, because a partial asset must never be
+                        // serveable and there is nowhere to record a
+                        // checkpoint that outlives this call — resume is
+                        // within a run, not across them. A film that cannot
+                        // finish inside one six-hour window therefore never
+                        // gets cached, which is a real limitation and a
+                        // straightforward one to lift later: the parts are
+                        // already named and numbered on disk, and the claim
+                        // row is already the place a checkpoint would live.
+                        return Ok(None);
+                    }
+                }
+                PartEnd::Failed(why) => return Err(why),
+            }
+        }
+        tracing::warn!(
+            recipe = %hash, parts = parts.len(),
+            "pre-transcode preempted too many times; giving up on this run"
+        );
+        Ok(None)
+    }
+
+    /// Run one part to completion, or until a viewer wants the hardware.
+    async fn run_part(&self, child: &mut Child, deadline: Instant) -> PartEnd {
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) if status.success() => return PartEnd::Finished,
+                Ok(Some(status)) => {
+                    return PartEnd::Failed(format!("producer ffmpeg exited with {status}"))
+                }
+                Ok(None) => {}
+                Err(e) => return PartEnd::Failed(format!("waiting on producer ffmpeg: {e}")),
+            }
+            // Checkpoint and terminate. Not SIGSTOP: a stopped ffmpeg still
+            // holds the hardware codec session, so the viewer this is yielding
+            // to would be blocked by a process that is doing nothing.
+            if self.admissions.live_is_waiting() {
+                let _ = child.kill().await;
+                return PartEnd::Preempted;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill().await;
+                return PartEnd::Deadline;
+            }
+            tokio::time::sleep(PRODUCER_POLL).await;
+        }
     }
 
     /// Create a session, or hand back the one an identical request already
@@ -1466,48 +1936,16 @@ impl TranscodeManager {
             .map(|i| i.title)
             .unwrap_or_else(|| "(unknown)".to_owned());
 
-        // Default-track selection: prefer original (Japanese) audio + subs when
-        // the file is dual-audio anime-style (REQ-SUB-2), and honor the
-        // server-wide language preferences otherwise. Burn the chosen text
-        // subtitle since HLS transcode delivers a single flat stream.
-        //
-        // Before the hardware slot, because the cache lookup below needs to
-        // know which tracks this session would carry — two sessions differing
-        // only in audio track are different bytes, and a cache that ignored
-        // that would serve the wrong language.
-        let prefer_original = file
-            .audio_streams
-            .iter()
-            .any(|a| matches!(a.language.as_deref(), Some("jpn" | "ja" | "jp")))
-            && file.audio_streams.len() > 1;
-        let prefs = self.lang_prefs().await;
-        let selection = plurx_core::tracks::select_tracks(
-            &file.audio_streams,
-            &file.subtitle_streams,
-            prefer_original,
-            &prefs,
-        );
-        // A viewer's explicit choice wins over the automatic one, and is the
-        // only way a bitmap subtitle is ever burned: the automatic rule exists
-        // for dual-audio anime, where burning is a guess at what somebody
-        // wants. Burning a subtitle nobody asked for is a picture they cannot
-        // turn off.
-        let burn_index = subtitle_override.filter(|i| *i >= 0).or_else(|| {
-            prefer_original
-                .then_some(selection.subtitle_index)
-                .flatten()
-        });
-        let subtitle_burn = burn_index.and_then(|idx| {
-            let codec = file
-                .subtitle_streams
-                .get(idx as usize)
-                .map(|s| s.codec.clone())?;
-            Some(plurx_core::transcode::SubtitleBurn {
-                subtitle_index: idx,
-                bitmap: plurx_core::tracks::is_bitmap_subtitle(&codec),
-            })
-        });
-        let audio_index = audio_override.or(selection.audio_index);
+        // Which tracks this session carries. Before the hardware slot, because
+        // the cache lookup below needs the answer — two sessions differing only
+        // in audio track are different bytes, and a cache that ignored that
+        // would serve the wrong language.
+        let Tracks {
+            audio_index,
+            subtitle_burn,
+        } = self
+            .select_tracks(&file, audio_override, subtitle_override)
+            .await;
 
         // The cache, before anything is claimed. A hit needs no encoder, no
         // hardware slot and no place in the queue — the work is already done,
@@ -3379,6 +3817,344 @@ mod tests {
             store.cache_hit(&hash, NODE).await.expect("hit").is_some(),
             "so the next viewer hits it too"
         );
+    }
+
+    /// The producer and the serving path, against each other, with a real
+    /// ffmpeg.
+    ///
+    /// This is the only test that can catch the two disagreeing, and the
+    /// disagreement is silent: a producer that hashes its output one way and a
+    /// playback that looks it up another produces a cache that fills forever
+    /// and never hits, which from outside is indistinguishable from a cache
+    /// that is simply cold. Every unit test above passes in that world.
+    #[tokio::test]
+    async fn what_the_producer_makes_is_what_a_playback_finds() {
+        super::require_ffmpeg();
+        use plurx_core::store::SqliteStore;
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let media = tempfile::tempdir().expect("media");
+        let source = media.path().join("Heat.mkv");
+        write_real_video(&source, 6);
+        let file_id = seed_real_file(&store, &source).await;
+        let (mgr, _work, cache) = cached_manager(&store);
+        let file = store.get_file(file_id).await.expect("get").expect("file");
+
+        let hash = mgr
+            .produce(&file, 240, Instant::now() + Duration::from_secs(120))
+            .await
+            .expect("produce")
+            .expect("something was produced")
+            .recipe;
+
+        // On disk as one continuous, finished asset — no part directories, no
+        // gaps in the numbering, and an ENDLIST so a player treats it as VOD.
+        let dir = cache.path().join(&hash[..2]).join(&hash);
+        let playlist = tokio::fs::read_to_string(dir.join("index.m3u8"))
+            .await
+            .expect("playlist");
+        assert!(playlist.contains("#EXT-X-ENDLIST"), "{playlist}");
+        assert!(playlist.contains("#EXT-X-PLAYLIST-TYPE:VOD"), "{playlist}");
+        let names: Vec<&str> = playlist.lines().filter(|l| l.ends_with(".ts")).collect();
+        assert!(names.len() >= 2, "expected several segments: {playlist}");
+        for (i, name) in names.iter().enumerate() {
+            assert_eq!(*name, format!("seg{i:05}.ts"), "numbering has a gap");
+            assert!(
+                tokio::fs::metadata(dir.join(name)).await.is_ok(),
+                "{name} is in the playlist but not on disk"
+            );
+        }
+        let mut entries = tokio::fs::read_dir(&dir).await.expect("read dir");
+        while let Ok(Some(e)) = entries.next_entry().await {
+            assert!(
+                !e.file_name().to_string_lossy().starts_with("part-"),
+                "a part directory survived publication"
+            );
+        }
+        // Nothing left in the staging area either.
+        assert!(
+            !cache.path().join("tmp").join(&hash).exists(),
+            "the temp directory was published, not left behind"
+        );
+
+        // And the part that cannot be checked any other way: a real playback,
+        // computing the recipe from its own inputs, finds it.
+        let info = mgr
+            .start(file_id, 240, 0.0, None, None, "paul", "pb-after-produce")
+            .await
+            .expect("start");
+        assert!(
+            info.vod,
+            "the producer and the player disagree about what this transcode is called"
+        );
+        assert_eq!(info.encoder, "cached");
+        assert!(mgr.playlist(&info.session_id).await.is_some());
+        assert!(mgr.stop_session(&info.session_id, "test").await);
+
+        // Producing it again is a no-op rather than a second encode.
+        assert!(
+            mgr.produce(&file, 240, Instant::now() + Duration::from_secs(120))
+                .await
+                .expect("produce again")
+                .is_none(),
+            "an entry that already exists was produced a second time"
+        );
+    }
+
+    /// A producer that is preempted must leave nothing behind: no claim (which
+    /// would make the recipe un-producible until the day-old sweep noticed) and
+    /// no bytes.
+    #[tokio::test]
+    async fn a_producer_that_yields_leaves_no_claim_and_no_bytes() {
+        super::require_ffmpeg();
+        use plurx_core::store::SqliteStore;
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let media = tempfile::tempdir().expect("media");
+        let source = media.path().join("Heat.mkv");
+        write_real_video(&source, 30);
+        let file_id = seed_real_file(&store, &source).await;
+        let (mgr, _work, cache) = cached_manager(&store);
+        let file = store.get_file(file_id).await.expect("get").expect("file");
+
+        // A viewer is already queuing, so every attempt to take a slot is
+        // refused and the run gives up without producing anything.
+        let _queued = mgr.admissions.wait_for_slot();
+        assert!(
+            mgr.produce(&file, 240, Instant::now() + Duration::from_secs(2))
+                .await
+                .expect("produce")
+                .is_none(),
+            "a run that never got a slot must not publish anything"
+        );
+
+        let hash = recipe_hash_for(&mgr, &file, 240).await;
+        assert!(
+            store.cache_hit(&hash, NODE).await.expect("hit").is_none(),
+            "an unfinished run must never be serveable"
+        );
+        // The claim went too. Left behind, this recipe could not be produced
+        // again until the stale-claim sweep noticed — a day later.
+        assert_eq!(
+            store.cache_by_age(NODE, 10).await.expect("by age").len()
+                + store
+                    .stale_cache_claims(NODE, i64::MAX)
+                    .await
+                    .expect("claims")
+                    .len(),
+            0,
+            "a yielded run left its claim behind"
+        );
+        assert!(
+            !cache.path().join(&hash[..2]).join(&hash).exists(),
+            "and it left bytes behind"
+        );
+    }
+
+    /// Two producers, one recipe. The loser has to be told, because the
+    /// alternative is not a wasted encode but a corrupted one: it would
+    /// publish over the directory the winner is still writing into.
+    #[tokio::test]
+    async fn a_second_producer_stands_down_rather_than_racing() {
+        use plurx_core::store::SqliteStore;
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let file_id = seed_file(&store).await;
+        let (mgr, _work, _cache) = cached_manager(&store);
+        let file = store.get_file(file_id).await.expect("get").expect("file");
+        let hash = recipe_hash_for(&mgr, &file, 1080).await;
+
+        // Somebody else is mid-encode.
+        store
+            .claim_cache_entry(&hash, file_id, 1, NODE, &format!("{}/{hash}", &hash[..2]))
+            .await
+            .expect("claim");
+
+        assert!(
+            mgr.produce(&file, 1080, Instant::now() + Duration::from_secs(30))
+                .await
+                .expect("produce")
+                .is_none(),
+            "the second producer started an encode against a claimed recipe"
+        );
+        // …and did not disturb the claim it lost to.
+        let claims = store
+            .stale_cache_claims(NODE, i64::MAX)
+            .await
+            .expect("claims");
+        assert_eq!(
+            claims.len(),
+            1,
+            "the winner's claim was removed by the loser"
+        );
+        assert_eq!(claims[0].relative_dir, format!("{}/{hash}", &hash[..2]));
+    }
+
+    /// Preempted mid-encode, then resumed — and the film that comes out has no
+    /// hole in it.
+    ///
+    /// This is the producer's whole reason for existing in parts, and the
+    /// failure it guards against is the quietest one in the system: resuming a
+    /// few hundred milliseconds late loses a moment of picture in the middle of
+    /// a film, in a file nobody watches until next week, with every log line
+    /// green. Only measuring the assembled timeline against the source catches
+    /// it, so that is what this does.
+    #[tokio::test]
+    async fn a_preempted_producer_resumes_without_losing_picture() {
+        super::require_ffmpeg();
+        use plurx_core::store::SqliteStore;
+        // Long enough that the encode cannot finish between the interrupts.
+        // Sized from measurement, not from taste: at 160x120 this fixture
+        // transcodes in about three seconds here, and the 24-second version it
+        // replaced took 394ms — which is to say the earlier version of this
+        // test was interrupting an encode that had already finished, and
+        // passing every assertion below without exercising a line of the
+        // resume path. The `parts >= 2` check now makes that failure loud.
+        const SECONDS: u32 = 240;
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let media = tempfile::tempdir().expect("media");
+        let source = media.path().join("Heat.mkv");
+        write_real_video(&source, SECONDS);
+        let file_id = seed_real_file(&store, &source).await;
+        let (mgr, _work, cache) = cached_manager(&store);
+        let mgr = Arc::new(mgr);
+        let file = store.get_file(file_id).await.expect("get").expect("file");
+
+        let run = {
+            let mgr = Arc::clone(&mgr);
+            let file = file.clone();
+            tokio::spawn(async move {
+                mgr.produce(&file, 240, Instant::now() + Duration::from_secs(180))
+                    .await
+            })
+        };
+        // Interrupt it twice, so the asset is assembled from at least three
+        // parts and any per-join error would compound rather than cancel.
+        for _ in 0..2 {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            let queued = mgr.admissions.wait_for_slot();
+            // Held for longer than one poll interval, so the running encoder
+            // cannot miss it.
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            drop(queued);
+        }
+        let made = run
+            .await
+            .expect("join")
+            .expect("produce")
+            .expect("something was produced");
+        // The assertion that stops this test passing for the wrong reason: a
+        // fixture small enough to finish before the first interrupt would
+        // satisfy every check below while exercising none of the resume path.
+        assert!(
+            made.parts >= 2,
+            "the encode finished in one part — nothing was actually preempted, \
+             so this test proved nothing about resuming"
+        );
+        let hash = made.recipe;
+
+        let dir = cache.path().join(&hash[..2]).join(&hash);
+        let playlist = tokio::fs::read_to_string(dir.join("index.m3u8"))
+            .await
+            .expect("playlist");
+        let part = crate::produce::Part::from_playlist(&playlist);
+
+        // Continuous numbering, every segment on disk and non-empty.
+        for (i, name) in part.segments.iter().enumerate() {
+            assert_eq!(*name, format!("seg{i:05}.ts"), "a gap at {i}: {playlist}");
+            let meta = tokio::fs::metadata(dir.join(name)).await.expect(name);
+            assert!(meta.len() > 0, "{name} is empty");
+        }
+
+        // And the timeline covers the source. A resume that restarted a beat
+        // late would land short here, by exactly the picture it dropped.
+        let produced_ms = part.duration_ms();
+        let source_ms = (SECONDS as i64) * 1000;
+        // Half a segment. The resume works in whole published segments, so a
+        // mistake here shows up as a segment lost or repeated — two seconds —
+        // and a tolerance loose enough to swallow that would hide the only
+        // thing this test exists to find. Measured drift on this fixture is
+        // zero.
+        assert!(
+            (produced_ms - source_ms).abs() <= 1_000,
+            "assembled {produced_ms}ms from a {source_ms}ms source — \
+             a resume lost or repeated picture:\n{playlist}"
+        );
+        // Belt and braces: ffprobe the assembled asset, because a playlist can
+        // claim a duration its bytes do not have.
+        let probed = std::process::Command::new(
+            std::env::var("PLURX_FFPROBE").unwrap_or_else(|_| "ffprobe".into()),
+        )
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=nw=1:nk=1",
+            "-allowed_extensions",
+            "ALL",
+        ])
+        .arg(dir.join("index.m3u8"))
+        .output()
+        .expect("ffprobe");
+        let probed_s: f64 = String::from_utf8_lossy(&probed.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(0.0);
+        assert!(
+            (probed_s - SECONDS as f64).abs() <= 2.0,
+            "ffprobe reads {probed_s}s from a {SECONDS}s source"
+        );
+
+        // It serves, which is the only thing any of this was for.
+        let info = mgr
+            .start(file_id, 240, 0.0, None, None, "paul", "pb-resumed")
+            .await
+            .expect("start");
+        assert!(info.vod, "a resumed asset is not findable");
+        assert!(mgr.stop_session(&info.session_id, "test").await);
+    }
+
+    /// A file whose real details are on disk, so ffmpeg can actually read it.
+    async fn seed_real_file(store: &Arc<dyn Store>, path: &std::path::Path) -> i64 {
+        use plurx_core::domain::{ItemKind, LibraryKind, NewItem, NewLibrary, ProbeResult};
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "L".into(),
+                kind: LibraryKind::Movies,
+                paths: vec![],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+        let movie = store
+            .insert_item(&NewItem {
+                library_id: lib.id,
+                kind: ItemKind::Movie,
+                parent_id: None,
+                title: "Heat".into(),
+                year: Some(1995),
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("movie");
+        let meta = std::fs::metadata(path).expect("fixture");
+        store
+            .upsert_file(
+                movie,
+                &path.to_string_lossy(),
+                meta.len() as i64,
+                1,
+                &ProbeResult {
+                    duration_ms: Some(6_000),
+                    container: Some("mkv".into()),
+                    video_codec: Some("h264".into()),
+                    width: Some(160),
+                    height: Some(120),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("file")
     }
 
     /// A node with no cache root is not a broken node — it is the ordinary

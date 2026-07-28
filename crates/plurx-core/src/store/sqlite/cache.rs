@@ -64,7 +64,7 @@ impl TranscodeCacheStore for SqliteStore {
         recipe_version: i64,
         node_id: &str,
         relative_dir: &str,
-    ) -> Result<(), StoreError> {
+    ) -> Result<bool, StoreError> {
         let (hash, node, dir) = (
             recipe_hash.to_owned(),
             node_id.to_owned(),
@@ -81,8 +81,10 @@ impl TranscodeCacheStore for SqliteStore {
             // DO NOTHING, not DO UPDATE: a claim that already exists belongs to
             // a producer that may be mid-write, and overwriting its directory
             // would leave that producer filling a path nobody will look in.
-            // The second producer's job is to notice and stand down.
-            tx.execute(
+            // The second producer's job is to notice and stand down — which is
+            // what the row count reports. Zero rows means somebody else owns
+            // this recipe, and that is the whole signal.
+            let taken = tx.execute(
                 "INSERT INTO transcode_cache_locations
                      (recipe_hash, node_id, storage_class, relative_dir, complete)
                  VALUES (?1, ?2, 'local', ?3, 0)
@@ -90,7 +92,7 @@ impl TranscodeCacheStore for SqliteStore {
                 params![hash, node, dir],
             )?;
             tx.commit()?;
-            Ok(())
+            Ok(taken > 0)
         })
         .await
     }
@@ -301,14 +303,20 @@ mod tests {
     async fn a_second_claim_does_not_move_the_first_ones_directory() {
         let store = SqliteStore::open_in_memory().expect("open");
         let file = seed_file(&store).await;
-        store
-            .claim_cache_entry("abc", file, 1, NODE, "first/dir")
-            .await
-            .expect("claim");
-        store
-            .claim_cache_entry("abc", file, 1, NODE, "second/dir")
-            .await
-            .expect("claim again");
+        assert!(
+            store
+                .claim_cache_entry("abc", file, 1, NODE, "first/dir")
+                .await
+                .expect("claim"),
+            "an unclaimed recipe is taken"
+        );
+        assert!(
+            !store
+                .claim_cache_entry("abc", file, 1, NODE, "second/dir")
+                .await
+                .expect("claim again"),
+            "the second producer has to be told it lost, or it publishes over the first"
+        );
         store
             .complete_cache_entry("abc", NODE, 10)
             .await
