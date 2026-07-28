@@ -5,13 +5,18 @@
 //! invocation that produces HLS. Hardware *encode* is the big CPU win and is
 //! selected per detected capability (NVENC/QSV/VAAPI/VideoToolbox), with a
 //! software x264 fallback; HDR→SDR tone-mapping and subtitle burn-in run as
-//! filters (ARCHITECTURE §3). Software and the hardware-encode-with-software-
-//! filters paths are the Phase 2 targets; zero-copy GPU filter graphs are a
-//! later refinement.
+//! filters (ARCHITECTURE §3).
+//!
+//! The video path between decode and encode is a [`Pipeline`] — either the CPU
+//! chain that downloads every frame to tone-map it in float, or one of the
+//! graphs that keeps frames on the GPU. Which a node uses is decided by probe,
+//! not by version (PERF-PLAN §5).
 
 mod encoder;
+mod pipeline;
 
 pub use encoder::{detect_encoders, Encoder, EncoderCaps};
+pub use pipeline::{Pipeline, CANDIDATES as PIPELINE_CANDIDATES};
 
 use crate::domain::MediaFile;
 
@@ -138,6 +143,10 @@ pub struct TranscodeOptions {
     /// Start offset in seconds (resume / session start).
     pub start_seconds: f64,
     pub tone_map: ToneMap,
+    /// The video path this session should use. Chosen per node by probe (see
+    /// [`Pipeline`]); [`Pipeline::Cpu`] is the always-available default and
+    /// what a GPU graph falls back to when it fails at runtime.
+    pub pipeline: Pipeline,
     pub subtitle_burn: Option<SubtitleBurn>,
 }
 
@@ -151,6 +160,7 @@ impl Default for TranscodeOptions {
             audio_index: None,
             start_seconds: 0.0,
             tone_map: ToneMap::Zscale,
+            pipeline: Pipeline::Cpu,
             subtitle_burn: None,
         }
     }
@@ -161,6 +171,19 @@ impl Default for TranscodeOptions {
 /// needed (rare for transcode, but keeps the caller simple).
 fn video_filters(source: &MediaFile, opts: &TranscodeOptions, source_path: &str) -> String {
     let mut chain: Vec<String> = Vec::new();
+
+    // A GPU pipeline owns scale and tone-map together: they are one pass on
+    // the video-processing block, and splitting them would put the download
+    // this exists to remove back in the middle. It is only ever selected for
+    // sessions it can handle — `effective_pipeline` has already routed HLG,
+    // Dolby Vision and burned text subtitles to the CPU chain.
+    if let Some(gpu) = opts
+        .pipeline
+        .filters(opts.target_height, source.hdr.as_deref())
+    {
+        chain.push(gpu);
+        return with_subtitles(chain, opts, source_path);
+    }
 
     // Downscale to target height, keep aspect, even dims, never upscale.
     chain.push(format!("scale=-2:'min({h},ih)'", h = opts.target_height));
@@ -198,11 +221,19 @@ fn video_filters(source: &MediaFile, opts: &TranscodeOptions, source_path: &str)
         chain.push("format=yuv420p".to_owned());
     }
 
-    // Subtitle burn-in, last, so subs render at output resolution in the
-    // output color space. Text/ASS is rendered with libass (covers the styled
-    // anime-subtitle case, REQ-SUB-2). Bitmap subs (PGS/VobSub) need an
-    // overlay filtergraph and are a documented fast-follow — requesting a
-    // bitmap burn here simply skips it rather than producing a broken graph.
+    with_subtitles(chain, opts, source_path)
+}
+
+/// Subtitle burn-in, last, so subs render at output resolution in the output
+/// color space. Text/ASS is rendered with libass (covers the styled
+/// anime-subtitle case, REQ-SUB-2). Bitmap subs (PGS/VobSub) need an overlay
+/// filtergraph and are a documented fast-follow — requesting a bitmap burn
+/// here simply skips it rather than producing a broken graph.
+///
+/// Shared by both branches above because it is genuinely the same step: the
+/// `subtitles` filter is CPU-only either way, which is why a session that
+/// burns text subtitles is routed to the CPU pipeline in the first place.
+fn with_subtitles(mut chain: Vec<String>, opts: &TranscodeOptions, source_path: &str) -> String {
     if let Some(burn) = &opts.subtitle_burn {
         if !burn.bitmap {
             let escaped = escape_filter_path(source_path);
@@ -212,7 +243,6 @@ fn video_filters(source: &MediaFile, opts: &TranscodeOptions, source_path: &str)
             ));
         }
     }
-
     chain.join(",")
 }
 
@@ -237,6 +267,27 @@ fn escape_filter_path(path: &str) -> String {
 /// Lighter sources keep software decode: it's the most compatible path and is
 /// already fast enough, so we don't risk the GPU decode/filter handoff where it
 /// isn't needed.
+/// Is this the kind of source that justifies hardware decode — and, with it,
+/// a GPU filter graph?
+///
+/// The distinction is the whole reason light sources still take the software
+/// path: the GPU decode/filter handoff is a real risk (driver bugs, surface
+/// format mismatches, Dolby Vision profiles that decode to garbage), and it is
+/// worth taking only where the CPU cannot cope. A 1080p H.264 scale is not a
+/// problem anyone has. Software-decoding 4K 10-bit HEVC pins a core at 100%
+/// and cannot finish the first segment, which is a gray screen.
+///
+/// Shared with [`Pipeline::for_session`] so the decode choice and the filter
+/// choice are made against one definition — a GPU graph selected for a source
+/// that decodes in software would be a graph with nothing on the GPU to work
+/// on.
+pub fn heavy_source(source: &MediaFile) -> bool {
+    matches!(
+        source.video_codec.as_deref(),
+        Some("hevc" | "h265" | "hevc10")
+    ) && (source.hdr.is_some() || source.height.unwrap_or(0) >= 2160)
+}
+
 fn decode_setup(encoder: Encoder, source: &MediaFile) -> (Vec<String>, Option<String>) {
     let arg = |x: &str| x.to_owned();
     // Escape hatch: force software decode (still hardware-encodes). Set when a
@@ -248,10 +299,7 @@ fn decode_setup(encoder: Encoder, source: &MediaFile) -> (Vec<String>, Option<St
     ) {
         return (Vec::new(), None);
     }
-    let heavy = matches!(
-        source.video_codec.as_deref(),
-        Some("hevc" | "h265" | "hevc10")
-    ) && (source.hdr.is_some() || source.height.unwrap_or(0) >= 2160);
+    let heavy = heavy_source(source);
     // 10-bit (HDR/DV) surfaces download as p010le; 8-bit as nv12.
     let dl = if source.bit_depth.unwrap_or(8) >= 10 {
         "p010le"
@@ -299,8 +347,11 @@ pub fn hls_args(
     let source_path = source.path.to_string_lossy().into_owned();
     let mut args: Vec<String> = vec!["-hide_banner".into(), "-loglevel".into(), "error".into()];
 
-    // Hardware device init (VAAPI/QSV) must precede the input.
+    // Hardware device init (VAAPI/QSV) must precede the input, and so must a
+    // filter device the pipeline brings of its own (Vulkan for libplacebo,
+    // OpenCL for tonemap_opencl).
     args.extend(encoder.init_args());
+    args.extend(opts.pipeline.init_args());
 
     // Fast input seek for resume/session start.
     if opts.start_seconds > 0.0 {
@@ -311,7 +362,18 @@ pub fn hls_args(
     // Hardware-accelerated decode (GPU decode for the heavy HEVC/4K/HDR case on
     // Intel too; see decode_setup). `hwdownload` leads the filter chain when the
     // decoder hands back hardware surfaces.
-    let (decode_args, hwdownload) = decode_setup(encoder, source);
+    // A vendor GPU pipeline claims the decoder itself — it needs hardware
+    // surfaces of its own family to work on, and cannot start from frames that
+    // were never on the GPU. Everything else keeps `decode_setup`'s answer,
+    // which knows things the pipeline doesn't (source codec, bit depth, and
+    // the `PLURX_HWDECODE=off` escape hatch for Dolby Vision profiles that
+    // hardware-decode to garbage).
+    let pipeline_decode = opts.pipeline.decode_args();
+    let (decode_args, hwdownload) = if pipeline_decode.is_empty() {
+        decode_setup(encoder, source)
+    } else {
+        (pipeline_decode, None)
+    };
     args.extend(decode_args);
 
     // Pace this input (see [`Pacing`]). An encode that runs faster than
@@ -351,13 +413,20 @@ pub fn hls_args(
 
     // Video filter chain: [hwdownload for GPU-decoded frames →] scale / tonemap /
     // subs [→ GPU upload suffix for VAAPI/QSV] → encoder.
+    //
+    // A vendor GPU pipeline skips both ends. Its output is already a surface
+    // of its encoder's own family, so the upload suffix would be uploading
+    // something that never came down — which is not a wasted copy but a broken
+    // graph. The neutral pipelines download explicitly inside their own chain
+    // and then take the suffix like the CPU path does.
+    let vendor_gpu = matches!(opts.pipeline, Pipeline::VppQsv | Pipeline::TonemapVaapi);
     let mut vf = String::new();
     if let Some(prefix) = &hwdownload {
         vf.push_str(prefix);
         vf.push(',');
     }
     vf.push_str(&video_filters(source, opts, &source_path));
-    if let Some(suffix) = encoder.filter_suffix() {
+    if let Some(suffix) = encoder.filter_suffix().filter(|_| !vendor_gpu) {
         vf.push(',');
         vf.push_str(suffix);
     }

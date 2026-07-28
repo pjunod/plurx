@@ -2,6 +2,7 @@ mod ffmpeg;
 mod http;
 mod logbuf;
 mod meter;
+mod pipeprobe;
 mod playstart;
 mod progressive;
 mod schedule;
@@ -175,18 +176,21 @@ async fn run(config: Config) -> anyhow::Result<()> {
         .await?
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| "auto".to_owned());
-    let encoder_selected = encoder_caps
-        .choose(if hwaccel_pref == "auto" {
-            ""
-        } else {
-            hwaccel_pref.as_str()
-        })
-        .label()
-        .to_owned();
+    let probe_pref = if hwaccel_pref == "auto" {
+        String::new()
+    } else {
+        hwaccel_pref.clone()
+    };
+    let encoder_selected = encoder_caps.choose(&probe_pref).label().to_owned();
     let ffprobe = std::env::var("PLURX_FFPROBE")
         .ok()
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| "ffprobe".to_owned());
+    // Which tone-map graph this node may use. After encoder detection, because
+    // a graph is only worth probing if it can feed the encoder that won. Costs
+    // a few seconds on a box with a GPU worth testing and nothing at all on one
+    // without.
+    let tone_map = pipeprobe::probe(&transcode_dir, encoder_caps.choose(&probe_pref)).await;
     let system = SystemInfo {
         data_dir: config.storage.data_dir.display().to_string(),
         ffmpeg_version: ffmpeg_version(&ffmpeg).await,
@@ -195,6 +199,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
         hwaccel_pref,
         encoders: encoder_caps.clone(),
         encoder_selected,
+        tone_map,
     };
 
     let instance_id = store.instance_id().await?;

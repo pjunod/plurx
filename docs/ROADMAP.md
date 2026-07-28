@@ -109,8 +109,14 @@ through M3; M4 *is* Phase 4's transcode chapter and waits for its plumbing.
   everything. Measured on the corpus: the CPU tone-map chain costs a quarter
   of the pipeline's throughput (0.98× → 0.71× at 4K), which is what takes a
   4K HDR session below realtime.
-- ⏭️ **M2 next** — tone-map on the GPU. It is the milestone that actually
-  fixes 4K; everything before it bought start latency and headroom.
+- 🚧 **M2 in progress** — tone-map on the GPU, the milestone that actually
+  fixes 4K. The selection half shipped 2026-07-28: candidate graphs as a
+  type, a boot probe that validates each end to end against real HDR10
+  (correct BT.709, a picture matching the CPU reference, and faster than it),
+  per-session routing, and a runtime downgrade that drops the graph before it
+  drops the encoder. Remaining: hardware-session admission
+  (`max_hw_sessions`), and the acceptance run — which needs a box with a GPU,
+  since CI can only prove candidates fail correctly.
 
 ## Phase 4 — HA for real
 

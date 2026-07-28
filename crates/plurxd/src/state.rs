@@ -35,6 +35,17 @@ pub struct SystemInfo {
     pub encoders: EncoderCaps,
     /// Human label of the encoder the transcoder will actually pick.
     pub encoder_selected: String,
+    /// What the tone-map probe found at boot: the graph this node uses, and
+    /// what each rejected candidate failed on.
+    ///
+    /// Here rather than in a field of its own because it is the same kind of
+    /// fact as the encoder list — something measured about this machine at
+    /// startup and true for the process's life. Worth surfacing rather than
+    /// leaving in the log, because falling back to the CPU chain is *silent*:
+    /// everything plays, 4K just stays slow. "This box has no GPU tone-map"
+    /// and "the driver refused the graph" are the difference between shrugging
+    /// and installing a package.
+    pub tone_map: crate::pipeprobe::PipelineReport,
 }
 
 /// Everything a request handler needs. Cheap to clone (all shared via `Arc`).
@@ -79,6 +90,7 @@ impl AppState {
             Arc::clone(&store),
             transcode_dir,
             encoder_caps,
+            system.tone_map.selected(),
         ));
         // PLURX_TRAKT_BASE overrides the API base for tests/mocks.
         let trakt_base = std::env::var("PLURX_TRAKT_BASE")

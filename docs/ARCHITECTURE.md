@@ -186,10 +186,16 @@ never depends on runtime state.
   re-encoded only when the target can't take the source codec. Solves "right
   codecs, wrong container" (the tvOS/Roku staple) for pennies of CPU.
 - **Transcode** — hardware first: QSV / VA-API (Linux), NVENC, VideoToolbox
-  (macOS); software x264/x265 fallback. HDR→SDR tone mapping via `libplacebo`
-  (Vulkan, `tonemapping=bt.2390`) as the cross-vendor path, with vendor filters
-  (`tonemap_opencl`, `vpp_qsv`, `tonemap_videotoolbox`) as alternates — mirroring
-  Jellyfin's proven matrix. Image subs and ASS burn-in happen here.
+  (macOS); software x264/x265 fallback. HDR→SDR tone mapping is
+  **chosen by probe, per node**: `vpp_qsv`, `tonemap_vaapi`, `libplacebo`
+  (Vulkan) and `tonemap_opencl` are candidates, and a node uses one only after
+  it has proved itself end to end against real HDR10 — correct BT.709 output,
+  a picture matching the CPU reference, and meaningfully faster than it. The
+  CPU zscale chain is the floor and the fallback. Version sniffing would not
+  do: a graph that parses can still produce clipped gray, and a driver that
+  accepts the filter can still be slower than what it replaced. Image subs and
+  ASS burn-in happen here — and a burned text subtitle sends the session back
+  to the CPU chain, because `subtitles` is CPU-only.
 - **Audio** — passthrough per device profile (TrueHD/DTS-HD where the chain
   allows), else transcode to EAC3/AC3/AAC with correct downmix.
 

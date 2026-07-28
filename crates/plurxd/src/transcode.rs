@@ -13,7 +13,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use plurx_core::store::{keys, Store};
-use plurx_core::transcode::{self, Encoder, EncoderCaps, Pacing, ToneMap, TranscodeOptions};
+use plurx_core::transcode::{
+    self, Encoder, EncoderCaps, Pacing, Pipeline, ToneMap, TranscodeOptions,
+};
 use tokio::process::Child;
 use tokio::sync::Mutex;
 
@@ -861,6 +863,11 @@ pub struct TranscodeManager {
     store: Arc<dyn Store>,
     work_dir: PathBuf,
     caps: EncoderCaps,
+    /// The tone-map graph this node proved it can run, or [`Pipeline::Cpu`]
+    /// when nothing did. A per-session decision still filters it — see
+    /// [`Pipeline::for_session`] — because a proven graph is a claim about the
+    /// box, not about the session.
+    pipeline: Pipeline,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     /// Answered creation requests: `request_id` -> (session id, fingerprint).
     /// Small by construction — an entry is dropped as soon as its session is
@@ -869,11 +876,22 @@ pub struct TranscodeManager {
 }
 
 impl TranscodeManager {
-    pub fn new(store: Arc<dyn Store>, work_dir: PathBuf, caps: EncoderCaps) -> Self {
+    /// `pipeline` is the tone-map graph this node proved at boot — see
+    /// [`crate::pipeprobe`]. It is fixed for the manager's life because it is
+    /// a fact about the hardware, not a setting; the per-session filtering
+    /// that decides whether a given stream may actually use it lives in
+    /// [`Pipeline::for_session`].
+    pub fn new(
+        store: Arc<dyn Store>,
+        work_dir: PathBuf,
+        caps: EncoderCaps,
+        pipeline: Pipeline,
+    ) -> Self {
         TranscodeManager {
             store,
             work_dir,
             caps,
+            pipeline,
             sessions: Mutex::new(HashMap::new()),
             requests: Mutex::new(HashMap::new()),
         }
@@ -1179,6 +1197,18 @@ impl TranscodeManager {
             audio_index: audio_override.or(selection.audio_index),
             start_seconds,
             tone_map: tone_map_pref(),
+            // The node proved a graph; this session may still not be entitled
+            // to it (HLG, Dolby Vision, a burned text subtitle, a light
+            // source, an encoder it cannot feed). Deciding once, here, is what
+            // keeps the log line honest — `pipeline=` below is what actually
+            // ran, not what the box is capable of.
+            pipeline: Pipeline::for_session(
+                self.pipeline,
+                encoder,
+                file.hdr.as_deref(),
+                transcode::heavy_source(&file),
+                subtitle_burn.as_ref().is_some_and(|b| !b.bitmap),
+            ),
             subtitle_burn,
             ..Default::default()
         };
@@ -1188,7 +1218,7 @@ impl TranscodeManager {
         // the decode/filter/encode pipeline actually used (e.g. whether heavy
         // HEVC is being hardware-decoded), and confirms which build is running.
         tracing::info!(
-            %session_id, encoder = encoder.label(),
+            %session_id, encoder = encoder.label(), pipeline = opts.pipeline.name(),
             "transcode ffmpeg args: {}", args.join(" ")
         );
         let progress = Arc::new(Progress::new());
@@ -1286,13 +1316,46 @@ impl TranscodeManager {
                         );
                         return;
                     }
+                    // Downgrade by ONE step, and take the cheaper step first.
+                    // A session running a GPU tone-map graph that stopped
+                    // producing is evidence about the graph — a driver state
+                    // the boot probe couldn't reach, a codec profile its
+                    // fixture didn't cover, another session contending for the
+                    // same block. None of that is evidence about the *encoder*,
+                    // and swapping to software would trade a stalled hardware
+                    // session for one that is slower still. So the graph goes
+                    // and the hardware stays; only a session already on the CPU
+                    // chain falls back to a software encoder.
+                    //
+                    // One step per session, deliberately: this watchdog fires
+                    // once, and a viewer who has waited out the grace window
+                    // twice has waited too long. If the downgraded session also
+                    // stalls, the running-stall watchdog below takes it.
+                    let downgrade_pipeline = opts.pipeline.on_gpu();
+                    let retry_encoder = if downgrade_pipeline {
+                        encoder
+                    } else {
+                        Encoder::Software
+                    };
+                    let mut retry_opts = opts.clone();
+                    if downgrade_pipeline {
+                        retry_opts.pipeline = opts.pipeline.fallback().unwrap_or(Pipeline::Cpu);
+                    }
                     tracing::warn!(
                         session = %sid,
                         stalled_s = session.progress.stalled_for().as_secs(),
+                        pipeline = opts.pipeline.name(),
+                        retry_pipeline = retry_opts.pipeline.name(),
+                        retry_encoder = retry_encoder.label(),
                         "no HLS segment from hardware within {}s and output has stopped \
                          advancing (GPU contention, or a decode the GPU can't do — e.g. \
-                         Dolby Vision); retrying on software",
-                        FIRST_SEGMENT_GRACE.as_secs()
+                         Dolby Vision); {}",
+                        FIRST_SEGMENT_GRACE.as_secs(),
+                        if downgrade_pipeline {
+                            "dropping the GPU tone-map and keeping the hardware encoder"
+                        } else {
+                            "retrying on software"
+                        }
                     );
                     {
                         let mut child = session.child.lock().await;
@@ -1301,8 +1364,8 @@ impl TranscodeManager {
                     clear_session_dir(&dir).await;
                     let sw_args = transcode::hls_args(
                         &file,
-                        Encoder::Software,
-                        &opts,
+                        retry_encoder,
+                        &retry_opts,
                         pacing,
                         &dir.to_string_lossy(),
                     );
@@ -1314,7 +1377,7 @@ impl TranscodeManager {
                     let generation = session.progress.begin_attempt();
                     match spawn_ffmpeg(
                         &sw_args,
-                        Encoder::Software.label(),
+                        retry_encoder.label(),
                         &sid,
                         Arc::clone(&session.progress),
                         generation,
@@ -1324,11 +1387,16 @@ impl TranscodeManager {
                             *session.last_access.lock().await = Instant::now();
                             // The activity page must stop naming the hardware
                             // encoder the moment it is no longer the one running.
-                            *session.encoder_label.lock().await = Encoder::Software.label();
-                            tracing::info!(session = %sid, "software fallback transcode started");
+                            *session.encoder_label.lock().await = retry_encoder.label();
+                            tracing::info!(
+                                session = %sid,
+                                encoder = retry_encoder.label(),
+                                pipeline = retry_opts.pipeline.name(),
+                                "fallback transcode started"
+                            );
                         }
                         Err(e) => {
-                            tracing::error!(session = %sid, "software fallback failed: {e}");
+                            tracing::error!(session = %sid, "fallback transcode failed: {e}");
                             session.failed.store(true, Relaxed);
                             return;
                         }
@@ -1901,11 +1969,13 @@ mod tests {
                 nvenc: true,
                 ..Default::default()
             },
+            Pipeline::Cpu,
         );
         let software = TranscodeManager::new(
             Arc::clone(&store),
             work.path().to_path_buf(),
             EncoderCaps::default(),
+            Pipeline::Cpu,
         );
 
         // Software keeps the conservative answer whatever the source is: a
@@ -2113,6 +2183,7 @@ mod tests {
             Arc::clone(&store),
             work.path().to_path_buf(),
             EncoderCaps::default(),
+            Pipeline::Cpu,
         );
         let info = mgr
             .start(file_id, 720, 0.0, None, "paul", "pb-paul")
@@ -2473,6 +2544,7 @@ mod tests {
             Arc::clone(&store),
             work.path().to_path_buf(),
             EncoderCaps::default(),
+            Pipeline::Cpu,
         );
         // Burst then crawl. The burst gives the session something to be ahead
         // *with* straight away; the realtime pace afterwards keeps it alive for
@@ -2634,6 +2706,7 @@ mod tests {
             Arc::clone(&store),
             work.path().to_path_buf(),
             EncoderCaps::default(),
+            Pipeline::Cpu,
         );
 
         // Defaults with an empty store.
@@ -2696,6 +2769,7 @@ mod tests {
             Arc::clone(&store),
             work.path().to_path_buf(),
             EncoderCaps::default(),
+            Pipeline::Cpu,
         );
 
         // Play, then "seek" three times. Only the newest survives.
@@ -2768,6 +2842,7 @@ mod tests {
             Arc::clone(&store),
             work.path().to_path_buf(),
             EncoderCaps::default(),
+            Pipeline::Cpu,
         );
         let request = SessionRequest {
             file_id,

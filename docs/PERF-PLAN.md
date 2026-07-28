@@ -1,11 +1,11 @@
 # Performance — where the seconds go, and the plan to get them back
 
-**Status:** M1 complete — Weekend 1, the §2.8 correction pass, and
-§4.4 / §4.6 / §4.7 are all shipped (2026-07-28). **M2 (GPU tone-map) is
-next**, and it is the one that fixes 4K: §2.9 measured the CPU tone-map
-chain costing a quarter of the pipeline's throughput, which is the quarter
-that takes a 4K HDR session below realtime · **Diagnosed against:**
-`e7a12cf`
+**Status:** M1 complete; **M2 landed its selection half** (2026-07-28) —
+the pipeline abstraction, the boot probe, per-session routing and the
+runtime downgrade are shipped and tested. What remains in M2 is the
+capacity/admission work (`transcode.max_hw_sessions`) and the acceptance
+run, which needs nynuc: no GPU in CI means no candidate can pass its probe
+there, only fail correctly · **Diagnosed against:** `e7a12cf`
 · **Review record:** [PERF-PLAN-REVIEW.md](PERF-PLAN-REVIEW.md) →
 [PERF-REVIEW-RESPONSE.md](PERF-REVIEW-RESPONSE.md) →
 [PERF-REVIEW-ASSESSMENT.md](PERF-REVIEW-ASSESSMENT.md) ·
@@ -753,6 +753,43 @@ so admission requires the M0/§4.5 recent-speed record for that pipeline
 class to clear ~1.2×, and a session expected to stall is refused rather
 than started. The cluster milestone (§7) later inserts "another node"
 ahead of the queue.
+
+**Shipped 2026-07-28 — the selection half.** `Pipeline` (plurx-core) is the
+video path as a value: candidate graphs, which encoder each can feed, which
+sources each may touch, its decode and device flags, and what it falls back
+to. `pipeprobe` (plurxd) runs each candidate at boot against a *generated*
+4K HDR10 HEVC fixture — generated rather than shipped, so it is
+redistribution-safe by construction, and real compressed HEVC with PQ/BT.2020
+in the stream so the decoder has metadata it must actually carry through.
+
+Two decisions worth recording against the plan's text:
+
+*The speed gate is a comparison, not a threshold.* The plan said "must clear a
+minimum recent speed". An absolute number would have to be guessed for
+hardware nobody has measured, and would be wrong on both the fast and slow
+ends. Running the CPU chain first as a reference and requiring a candidate to
+beat it by 20% costs one extra run, cancels process startup on both sides, and
+states the real requirement: a graph that merely matches the chain it replaces
+has bought nothing and taken on a driver dependency.
+
+*The runtime downgrade drops the graph before it drops the encoder.* A GPU
+graph that stops producing is evidence about the graph — a driver state the
+probe couldn't reach, a codec profile its fixture didn't cover, contention
+from a second session. It is not evidence about the encoder, and swapping to
+software would trade a stalled hardware session for a slower one. So the first
+retry keeps the hardware and drops to the CPU chain; only a session already on
+the CPU chain falls back to software.
+
+Per-session routing (`Pipeline::for_session`) sends HLG, Dolby Vision, burned
+text subtitles, light sources, and any graph/encoder mismatch to the CPU chain
+regardless of what the node proved — each of those fails *quietly* otherwise,
+which is the kind nobody reports. The chosen pipeline is on the session's
+ffmpeg log line and the probe's full verdict list is on `GET /api/v1/system`,
+because falling back is silent: everything plays, 4K just stays slow.
+
+**Still owed in M2:** `transcode.max_hw_sessions` and the admission ladder
+(queue → measured-safe software → capacity error), and the acceptance run
+below, which needs real hardware.
 
 **Acceptance:** on nynuc, the M0 telemetry shows a 4K HDR10 → 1080p
 session at ≥3× (QSV graph) vs the recorded CPU baseline; a 2 h 4K HDR
