@@ -4,12 +4,40 @@ use async_trait::async_trait;
 use rusqlite::{params, OptionalExtension};
 
 use super::{item_cols, item_from_row, SqliteStore, ITEM_COL_COUNT};
-use crate::domain::{InProgressItem, RecentItem, WatchState};
+use crate::domain::{InProgressItem, RecentItem, WatchRollup, WatchState};
 use crate::error::StoreError;
 use crate::store::WatchStore;
 
 /// Fraction of runtime past which an item is considered watched.
 const WATCHED_THRESHOLD: f64 = 0.95;
+
+/// Kinds that carry watch state. Photos are excluded deliberately: a home
+/// library full of stills would otherwise make every folder permanently
+/// unwatched, since nothing ever marks a picture seen.
+const PLAYABLE_KINDS: &str = "'movie','episode','video'";
+
+/// Every playable item at or under `item_id`, depth-first through whatever
+/// container chain sits above it — season → episode, show → season → episode,
+/// or the arbitrarily deep folder trees a home library mirrors from disk.
+/// A movie has no children and returns just itself.
+fn playable_leaves(conn: &rusqlite::Connection, item_id: i64) -> rusqlite::Result<Vec<i64>> {
+    let mut stmt = conn.prepare(&format!(
+        "WITH RECURSIVE tree(id) AS (
+             SELECT id FROM items WHERE id = ?1
+             -- UNION, not UNION ALL: it dedupes, so a corrupt parent cycle
+             -- terminates instead of spinning the recursion forever.
+             UNION
+             SELECT i.id FROM items i JOIN tree t ON i.parent_id = t.id
+         )
+         SELECT i.id FROM tree t JOIN items i ON i.id = t.id
+         WHERE i.kind IN ({PLAYABLE_KINDS})
+         ORDER BY i.id"
+    ))?;
+    let ids = stmt
+        .query_map(params![item_id], |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<i64>>>()?;
+    Ok(ids)
+}
 
 fn watch_from_row(row: &rusqlite::Row<'_>, base: usize) -> rusqlite::Result<WatchState> {
     Ok(WatchState {
@@ -191,6 +219,79 @@ impl WatchStore for SqliteStore {
                 )?;
             }
             Ok(())
+        })
+        .await
+    }
+
+    async fn set_watched_tree(
+        &self,
+        user_id: i64,
+        item_id: i64,
+        watched: bool,
+    ) -> Result<Vec<i64>, StoreError> {
+        self.with_conn(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            let ids = playable_leaves(&tx, item_id)?;
+            // The upsert's DO UPDATE carries a WHERE, so a row already in the
+            // target state is left alone entirely — `execute` returns 0 and the
+            // id never enters `changed`. That is what keeps re-marking a
+            // finished series from re-notifying about all forty episodes, and
+            // it keeps `updated_at` honest: it means "when this changed", not
+            // "when someone last clicked the button".
+            let mut changed = Vec::new();
+            {
+                let mut stmt = if watched {
+                    tx.prepare(
+                        "INSERT INTO watch_state (user_id, item_id, position_ms, watched, updated_at)
+                         VALUES (?1, ?2, 0, 1, unixepoch())
+                         ON CONFLICT(user_id, item_id) DO UPDATE SET
+                             watched = 1, updated_at = unixepoch()
+                         WHERE watch_state.watched = 0",
+                    )?
+                } else {
+                    // Un-watching clears progress too, so a half-watched episode
+                    // counts as changed even though its flag was already 0 —
+                    // otherwise it would linger in continue-watching.
+                    tx.prepare(
+                        "INSERT INTO watch_state (user_id, item_id, position_ms, watched, updated_at)
+                         VALUES (?1, ?2, 0, 0, unixepoch())
+                         ON CONFLICT(user_id, item_id) DO UPDATE SET
+                             watched = 0, position_ms = 0, updated_at = unixepoch()
+                         WHERE watch_state.watched = 1 OR watch_state.position_ms <> 0",
+                    )?
+                };
+                for id in ids {
+                    if stmt.execute(params![user_id, id])? > 0 {
+                        changed.push(id);
+                    }
+                }
+            }
+            tx.commit()?;
+            Ok(changed)
+        })
+        .await
+    }
+
+    async fn watch_rollup(&self, user_id: i64, item_id: i64) -> Result<WatchRollup, StoreError> {
+        self.with_conn(move |conn| {
+            let (leaves, watched) = conn.query_row(
+                &format!(
+                    "WITH RECURSIVE tree(id) AS (
+                         SELECT id FROM items WHERE id = ?2
+                         UNION
+                         SELECT i.id FROM items i JOIN tree t ON i.parent_id = t.id
+                     )
+                     SELECT COUNT(*),
+                            COALESCE(SUM(w.watched), 0)
+                     FROM tree t
+                     JOIN items i ON i.id = t.id
+                     LEFT JOIN watch_state w ON w.item_id = i.id AND w.user_id = ?1
+                     WHERE i.kind IN ({PLAYABLE_KINDS})"
+                ),
+                params![user_id, item_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )?;
+            Ok(WatchRollup { leaves, watched })
         })
         .await
     }
@@ -542,5 +643,176 @@ mod tests {
         let nu = store.next_up(user.id, 10).await.expect("nu");
         assert_eq!(nu.len(), 1);
         assert_eq!(nu[0].item.id, eps[2]);
+    }
+
+    #[tokio::test]
+    async fn marking_a_show_reaches_every_episode_under_it() {
+        let store = SqliteStore::open_in_memory().expect("open");
+        let user = store.create_user("u", "h", true).await.expect("user");
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "TV".into(),
+                kind: LibraryKind::Shows,
+                paths: vec![],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+        let show = store
+            .insert_item(&NewItem {
+                library_id: lib.id,
+                kind: ItemKind::Show,
+                parent_id: None,
+                title: "Severance".into(),
+                year: Some(2022),
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("show");
+        // Two seasons, so the walk has to go show → season → episode rather
+        // than picking up direct children only.
+        let mut seasons = Vec::new();
+        let mut eps = Vec::new();
+        for s in 1..=2 {
+            let season = store
+                .insert_item(&NewItem {
+                    library_id: lib.id,
+                    kind: ItemKind::Season,
+                    parent_id: Some(show),
+                    title: format!("Season {s}"),
+                    year: None,
+                    season_number: Some(s),
+                    episode_number: None,
+                })
+                .await
+                .expect("season");
+            seasons.push(season);
+            for n in 1..=2 {
+                eps.push(
+                    store
+                        .insert_item(&NewItem {
+                            library_id: lib.id,
+                            kind: ItemKind::Episode,
+                            parent_id: Some(season),
+                            title: format!("S{s}E{n}"),
+                            year: None,
+                            season_number: Some(s),
+                            episode_number: Some(n),
+                        })
+                        .await
+                        .expect("ep"),
+                );
+            }
+        }
+
+        // Nothing seen yet.
+        let r = store.watch_rollup(user.id, show).await.expect("rollup");
+        assert_eq!((r.leaves, r.watched), (4, 0));
+        assert!(!r.complete());
+
+        // Mark the series watched: all four episodes, and only the episodes —
+        // the show and season rows are containers, not things you watch.
+        let changed = store
+            .set_watched_tree(user.id, show, true)
+            .await
+            .expect("mark");
+        assert_eq!(changed.len(), 4);
+        assert_eq!(changed, eps);
+        for ep in &eps {
+            let w = store.watch_state(user.id, *ep).await.expect("w");
+            assert!(w.expect("row").watched, "episode {ep} should be watched");
+        }
+        assert!(store
+            .watch_state(user.id, show)
+            .await
+            .expect("show")
+            .is_none());
+        assert!(store
+            .watch_rollup(user.id, show)
+            .await
+            .expect("r")
+            .complete());
+
+        // Next Up is the reason this cascades: marking only the show row would
+        // leave the badge saying watched while the rail offered episode one.
+        assert!(store.next_up(user.id, 10).await.expect("nu").is_empty());
+
+        // Doing it again changes nothing, so nothing is reported — that is what
+        // keeps a second click from re-announcing all four episodes.
+        assert!(store
+            .set_watched_tree(user.id, show, true)
+            .await
+            .expect("again")
+            .is_empty());
+
+        // One season un-watches its own episodes and leaves the other alone.
+        let changed = store
+            .set_watched_tree(user.id, seasons[0], false)
+            .await
+            .expect("unmark");
+        assert_eq!(changed, eps[..2].to_vec());
+        let r = store.watch_rollup(user.id, show).await.expect("rollup");
+        assert_eq!((r.leaves, r.watched), (4, 2));
+        let r = store.watch_rollup(user.id, seasons[1]).await.expect("s2");
+        assert!(r.complete(), "season two is untouched");
+    }
+
+    #[tokio::test]
+    async fn un_watching_clears_a_half_finished_episode() {
+        let store = SqliteStore::open_in_memory().expect("open");
+        let user = store.create_user("u", "h", true).await.expect("user");
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "M".into(),
+                kind: LibraryKind::Movies,
+                paths: vec![],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+        let movie = store
+            .insert_item(&NewItem {
+                library_id: lib.id,
+                kind: ItemKind::Movie,
+                parent_id: None,
+                title: "Heat".into(),
+                year: Some(1995),
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("movie");
+
+        // A movie is its own tree of one, and a rollup answers 0/1 for it.
+        let r = store.watch_rollup(user.id, movie).await.expect("rollup");
+        assert_eq!((r.leaves, r.watched), (1, 0));
+
+        store
+            .put_progress(user.id, movie, 40_000, Some(170_000))
+            .await
+            .expect("prog");
+        assert_eq!(
+            store
+                .continue_watching(user.id, 10)
+                .await
+                .expect("cw")
+                .len(),
+            1
+        );
+
+        // The flag was already 0, but the position wasn't — so this is a real
+        // change, and it has to be reported as one or the film would sit in
+        // continue-watching with the UI insisting nothing happened.
+        let changed = store
+            .set_watched_tree(user.id, movie, false)
+            .await
+            .expect("unmark");
+        assert_eq!(changed, vec![movie]);
+        assert!(store
+            .continue_watching(user.id, 10)
+            .await
+            .expect("cw")
+            .is_empty());
     }
 }

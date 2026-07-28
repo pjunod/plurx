@@ -4,7 +4,7 @@
 
 use plurx_core::domain::{
     AudioStream, InProgressItem, Item, ItemKind, Library, MediaFile, RecentItem, SubtitleStream,
-    User, WatchState,
+    User, WatchRollup, WatchState,
 };
 use serde::Serialize;
 
@@ -67,6 +67,27 @@ pub struct ItemDto {
     pub show_title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub watch: Option<WatchDto>,
+    /// How many playable things sit under this item and how many are watched.
+    /// Only populated on the detail response, and only for containers — a
+    /// show has no `watch` of its own, so this is the only thing a client can
+    /// label a "mark watched / unwatched" control from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rollup: Option<RollupDto>,
+}
+
+#[derive(Serialize)]
+pub struct RollupDto {
+    pub leaves: i64,
+    pub watched: i64,
+}
+
+impl From<WatchRollup> for RollupDto {
+    fn from(r: WatchRollup) -> Self {
+        RollupDto {
+            leaves: r.leaves,
+            watched: r.watched,
+        }
+    }
 }
 
 impl From<Item> for ItemDto {
@@ -93,6 +114,7 @@ impl From<Item> for ItemDto {
             child_count: None,
             show_title: None,
             watch: None,
+            rollup: None,
         }
     }
 }
@@ -126,6 +148,11 @@ impl ItemDto {
 
     pub fn with_child_count(mut self, count: Option<i64>) -> Self {
         self.child_count = count;
+        self
+    }
+
+    pub fn with_rollup(mut self, rollup: Option<WatchRollup>) -> Self {
+        self.rollup = rollup.map(Into::into);
         self
     }
 }

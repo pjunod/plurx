@@ -1242,7 +1242,7 @@ mod tests {
             "watch state left plurx without anyone enabling it"
         );
 
-        // On: the same action queues one, addressed by id.
+        // On: an actual transition queues one, addressed by id.
         let (status, _) = call(
             &app,
             put(
@@ -1254,6 +1254,10 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
+
+        // Marking something already watched is not news. The film is still
+        // watched from the click above, so this announces nothing — otherwise
+        // a double-click on a series would re-announce every episode in it.
         let (status, _) = call(
             &app,
             post(
@@ -1264,6 +1268,25 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
+        settle().await;
+        assert!(
+            state.store.due_watched(10).await.expect("due").is_empty(),
+            "a redundant mark announced itself anyway"
+        );
+
+        // A real un-watch → watch round trip does announce, exactly once.
+        for action in ["unscrobble", "scrobble"] {
+            let (status, _) = call(
+                &app,
+                post(
+                    &format!("/api/v1/items/{movie}/{action}"),
+                    Some(&admin),
+                    json!({}),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+        }
         settle().await;
 
         let queued = state.store.due_watched(10).await.expect("due");
@@ -2883,6 +2906,84 @@ mod tests {
             .0,
             StatusCode::OK
         );
+    }
+
+    #[tokio::test]
+    async fn marking_a_show_watched_reaches_its_episodes() {
+        let (app, state) = test_state();
+        let admin = setup_admin(&app).await;
+        let s = seed_content(&state).await;
+
+        // A show has no watch state of its own, so the detail response carries
+        // a rollup instead — without it a client has nothing to label a
+        // mark-watched control from, since the response only reaches as far as
+        // the seasons and those are empty too.
+        let (st, show) = call(
+            &app,
+            get(&format!("/api/v1/items/{}", s.show), Some(&admin)),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(show["item"]["rollup"]["leaves"], 1);
+        assert_eq!(show["item"]["rollup"]["watched"], 0);
+        assert!(show["item"]["watch"].is_null(), "a show is not watchable");
+
+        // Marking the show marks the episode underneath it.
+        let (st, r) = call(
+            &app,
+            post(
+                &format!("/api/v1/items/{}/scrobble", s.show),
+                Some(&admin),
+                json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(r["updated"], 1);
+        let (_, ep) = call(&app, get(&format!("/api/v1/items/{}", s.ep), Some(&admin))).await;
+        assert_eq!(ep["item"]["watch"]["watched"], true);
+        let (_, show) = call(
+            &app,
+            get(&format!("/api/v1/items/{}", s.show), Some(&admin)),
+        )
+        .await;
+        assert_eq!(show["item"]["rollup"]["watched"], 1);
+
+        // A second click is honest about having done nothing.
+        let (_, r) = call(
+            &app,
+            post(
+                &format!("/api/v1/items/{}/scrobble", s.show),
+                Some(&admin),
+                json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(r["updated"], 0);
+
+        // And unscrobble walks the same tree back.
+        let (st, r) = call(
+            &app,
+            post(
+                &format!("/api/v1/items/{}/unscrobble", s.show),
+                Some(&admin),
+                json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(r["updated"], 1);
+        let (_, ep) = call(&app, get(&format!("/api/v1/items/{}", s.ep), Some(&admin))).await;
+        assert_eq!(ep["item"]["watch"]["watched"], false);
+
+        // A movie carries no rollup — it has a `watch` row of its own, and the
+        // client picks its control off that.
+        let (_, movie) = call(
+            &app,
+            get(&format!("/api/v1/items/{}", s.movie), Some(&admin)),
+        )
+        .await;
+        assert!(movie["item"]["rollup"].is_null());
     }
 
     #[tokio::test]

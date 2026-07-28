@@ -344,7 +344,10 @@ pub struct TimelineQuery {
     pub state: Option<String>,
 }
 
-/// GET /:/scrobble and /:/unscrobble — mark watched/unwatched.
+/// GET /:/scrobble and /:/unscrobble — mark watched/unwatched. A Plex client
+/// offers this on a show as well as an episode, and means the whole thing by
+/// it, so these cascade (`set_watched_tree`); for a movie or episode a tree is
+/// just the item itself, so nothing changes there.
 pub async fn scrobble(
     PlexUser(user): PlexUser,
     State(state): State<AppState>,
@@ -352,7 +355,7 @@ pub async fn scrobble(
 ) -> Result<Response, ApiError> {
     if let Some(key) = q.key {
         if state.store.get_item(key).await?.is_some() {
-            state.store.set_watched(user.id, key, true).await?;
+            state.store.set_watched_tree(user.id, key, true).await?;
         }
     }
     Ok(xml(plex::container(vec![])))
@@ -365,7 +368,7 @@ pub async fn unscrobble(
 ) -> Result<Response, ApiError> {
     if let Some(key) = q.key {
         if state.store.get_item(key).await?.is_some() {
-            state.store.set_watched(user.id, key, false).await?;
+            state.store.set_watched_tree(user.id, key, false).await?;
         }
     }
     Ok(xml(plex::container(vec![])))

@@ -1712,6 +1712,12 @@ async function viewItem(id){
   } else if(it.year){ chips.push(`<span>${it.year}</span>`); }
   if(runtime) chips.push(`<span>${fmtDur(runtime)}</span>`);
   if(it.kind) chips.push(`<span>${esc(it.kind)}</span>`);
+  // A container has no watch flag of its own, so say what it's made of:
+  // "3 of 10 watched" is the thing the mark-watched buttons below act on.
+  if(it.rollup&&it.rollup.leaves){
+    const r=it.rollup;
+    chips.push(`<span>${r.watched===r.leaves?`all ${r.leaves} watched`:`${r.watched} of ${r.leaves} watched`}</span>`);
+  }
   // Video badges show once: in the hero for a single version; per-version below
   // when there are several (so nothing is duplicated).
   const heroBadges = (best && !multi) ? specBadges(best) : "";
@@ -1730,7 +1736,7 @@ async function viewItem(id){
     // place that carries the synopsis and the show/season ancestry together.
     const pmeta=playerMeta(it, d.ancestors);
     const resume=it.watch&&it.watch.position_ms>3000&&!it.watch.watched?it.watch.position_ms:0;
-    const watchBtn=`<button class="ghost sm" onclick="toggleWatched(${it.id}, ${it.watch&&it.watch.watched?1:0})">${it.watch&&it.watch.watched?'Mark unwatched':'Mark watched'}</button>`;
+    const watchBtn=watchControls(it);
     const playable=d.files.find(f=>f.available);
     if(playable){
       body+=`<div class="actions">
@@ -1755,13 +1761,17 @@ async function viewItem(id){
     }).join("");
   } else if(d.children.length && d.children[0].kind==='episode'){
     // Season: episodes as a list.
-    body+=`<h2 class="section" style="margin:18px 0 0">${d.children.length} episode${d.children.length>1?'s':''}</h2>
+    const acts=watchControls(it);
+    body+=`${acts?`<div class="actions">${acts}</div>`:''}
+      <h2 class="section" style="margin:18px 0 0">${d.children.length} episode${d.children.length>1?'s':''}</h2>
       <div class="eplist">${d.children.map(episodeRow).join("")}</div>`;
   } else if(d.children.length){
     // Show, season, or a mirrored folder: children as a grid.
     const label = it.kind==='folder'? 'Contents'
                 : d.children[0].kind==='season'? 'Seasons' : 'Episodes';
-    body+=`<h2 class="section" style="margin:18px 0 12px">${label}</h2>${grid(d.children)}`;
+    const acts=watchControls(it);
+    body+=`${acts?`<div class="actions">${acts}</div>`:''}
+      <h2 class="section" style="margin:18px 0 12px">${label}</h2>${grid(d.children)}`;
   } else if(it.kind==='folder'){
     body+=`<div class="empty">This folder is empty.</div>`;
   }
@@ -1852,9 +1862,38 @@ async function saveEdit(id){
   }catch(e){ if(err) err.textContent=e.message; }
 }
 
-async function toggleWatched(id, watched){
-  try{ await api(`/items/${id}/${watched?'unscrobble':'scrobble'}`,{method:"POST"}); toast(watched?"Marked unwatched":"Marked watched"); viewItem(id); }
-  catch(e){ toast(e.message); }
+// The mark-watched control(s) for a detail page. A movie or episode is binary,
+// so it gets one button that flips it. A show, season, or folder is not: it can
+// sit at seven of ten, where "Mark watched" and "Mark unwatched" both do
+// something real and a single toggle would have to lie about one of them. So a
+// container gets whichever of the two actually changes anything.
+function watchControls(it){
+  const r=it.rollup;
+  if(r){
+    if(!r.leaves) return "";   // nothing playable underneath — nothing to mark
+    const noun = it.kind==='show'?'series' : it.kind==='season'?'season' : 'folder';
+    const btns=[];
+    if(r.watched<r.leaves) btns.push(`<button class="ghost sm" onclick="setWatched(${it.id},1)">Mark ${noun} watched</button>`);
+    if(r.watched>0)        btns.push(`<button class="ghost sm" onclick="setWatched(${it.id},0)">Mark ${noun} unwatched</button>`);
+    return btns.join("");
+  }
+  const w=!!(it.watch&&it.watch.watched);
+  return `<button class="ghost sm" onclick="setWatched(${it.id},${w?0:1})">${w?'Mark unwatched':'Mark watched'}</button>`;
+}
+
+// `watched` is the state to move to, not the state you're in — the container
+// buttons name an outcome rather than a flip, and one meaning for the argument
+// is worth more than a shorter call site.
+async function setWatched(id, watched){
+  try{
+    const r=await api(`/items/${id}/${watched?'scrobble':'unscrobble'}`,{method:"POST"});
+    // The count matters on a series: it's the difference between "did that do
+    // anything?" and "26 episodes marked watched".
+    const n=(r&&r.updated)||0;
+    toast(n>1 ? `${n} items marked ${watched?'watched':'unwatched'}`
+              : (watched?"Marked watched":"Marked unwatched"));
+    viewItem(id);
+  }catch(e){ toast(e.message); }
 }
 
 // ---- player ---------------------------------------------------------------

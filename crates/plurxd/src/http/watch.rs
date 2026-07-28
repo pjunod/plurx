@@ -60,7 +60,10 @@ pub async fn progress(
     Ok(Json(watch.into()))
 }
 
-/// POST /api/v1/items/:id/scrobble — mark watched.
+/// POST /api/v1/items/:id/scrobble — mark watched. On a show, season, or
+/// folder this marks every episode underneath: the container is a name for its
+/// children, and marking only the container would leave Next Up cheerfully
+/// offering episode one of a series you just said you'd seen.
 pub async fn scrobble(
     AuthUser(user): AuthUser,
     State(state): State<AppState>,
@@ -69,13 +72,21 @@ pub async fn scrobble(
     if state.store.get_item(id).await?.is_none() {
         return Err(ApiError::NotFound("item"));
     }
-    state.store.set_watched(user.id, id, true).await?;
-    state.watched.on_watched(user.id, id).await;
+    let changed = state.store.set_watched_tree(user.id, id, true).await?;
+    // Notify per episode that actually flipped. Re-marking a finished series
+    // changes nothing and so says nothing — the alternative is re-announcing
+    // forty episodes every time somebody clicks the button twice.
+    for item in &changed {
+        state.watched.on_watched(user.id, *item).await;
+    }
     state.trakt.request_sync(); // propagate the manual mark promptly
-    Ok(Json(serde_json::json!({ "ok": true })))
+    Ok(Json(
+        serde_json::json!({ "ok": true, "updated": changed.len() }),
+    ))
 }
 
 /// POST /api/v1/items/:id/unscrobble — mark unwatched (clears progress).
+/// Cascades the same way `scrobble` does.
 pub async fn unscrobble(
     AuthUser(user): AuthUser,
     State(state): State<AppState>,
@@ -84,7 +95,9 @@ pub async fn unscrobble(
     if state.store.get_item(id).await?.is_none() {
         return Err(ApiError::NotFound("item"));
     }
-    state.store.set_watched(user.id, id, false).await?;
+    let changed = state.store.set_watched_tree(user.id, id, false).await?;
     state.trakt.request_sync(); // an explicit un-watch removes on Trakt too
-    Ok(Json(serde_json::json!({ "ok": true })))
+    Ok(Json(
+        serde_json::json!({ "ok": true, "updated": changed.len() }),
+    ))
 }

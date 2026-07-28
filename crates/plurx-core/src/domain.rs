@@ -409,6 +409,29 @@ pub struct WatchState {
     pub updated_at: i64,
 }
 
+/// How much of a container has been seen: how many playable leaves sit under
+/// an item, and how many of those are watched.
+///
+/// A show has no watch state of its own — "I've seen this series" is a claim
+/// about its episodes. A rollup is the only honest way to label a container,
+/// and it is what lets a button read *Mark unwatched* on a series you have
+/// finished instead of forever offering to mark it watched again.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct WatchRollup {
+    /// Playable descendants — movies, episodes, home videos. Photos and
+    /// containers don't count; you don't watch them.
+    pub leaves: i64,
+    pub watched: i64,
+}
+
+impl WatchRollup {
+    /// Every leaf seen, and there is at least one. An empty container is not
+    /// "fully watched"; it is nothing at all.
+    pub fn complete(self) -> bool {
+        self.leaves > 0 && self.watched == self.leaves
+    }
+}
+
 /// An in-progress item for the continue-watching row.
 #[derive(Debug, Clone, Serialize)]
 pub struct InProgressItem {

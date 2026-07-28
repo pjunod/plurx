@@ -22,7 +22,8 @@ use async_trait::async_trait;
 
 use crate::domain::{
     InProgressItem, Item, ItemEdit, ItemKind, ItemPage, ItemSort, Library, MediaFile,
-    MetadataPatch, NewItem, NewLibrary, ProbeResult, RecentItem, TraktAuth, User, WatchState,
+    MetadataPatch, NewItem, NewLibrary, ProbeResult, RecentItem, TraktAuth, User, WatchRollup,
+    WatchState,
 };
 // RecentItem is reused for next-up (episode + show title).
 use crate::error::StoreError;
@@ -365,12 +366,34 @@ pub trait WatchStore: Send + Sync + 'static {
         position_ms: i64,
         duration_ms: Option<i64>,
     ) -> Result<WatchState, StoreError>;
+    /// Flip one item's flag and nothing else. Callers acting on something a
+    /// person clicked want [`WatchStore::set_watched_tree`] instead — this is
+    /// the single-row primitive it is built from.
     async fn set_watched(
         &self,
         user_id: i64,
         item_id: i64,
         watched: bool,
     ) -> Result<(), StoreError>;
+    /// Mark everything playable under `item_id` — and the item itself when it
+    /// is playable — watched or unwatched. Returns the ids that actually
+    /// changed, so a caller can notify on those and stay quiet about the rest.
+    ///
+    /// Containers are the point. A show is not something you watch; its
+    /// episodes are, and "I've seen this series" is a statement about all of
+    /// them. Marking only the show row would leave every episode unwatched
+    /// underneath it, which is worse than not offering the button: the badge
+    /// would say watched while Next Up went on offering episode one.
+    async fn set_watched_tree(
+        &self,
+        user_id: i64,
+        item_id: i64,
+        watched: bool,
+    ) -> Result<Vec<i64>, StoreError>;
+    /// Count the playable leaves under `item_id` and how many of them are
+    /// watched. A playable item is its own leaf, so this answers for movies
+    /// too — a movie is 1/1 or 0/1.
+    async fn watch_rollup(&self, user_id: i64, item_id: i64) -> Result<WatchRollup, StoreError>;
     async fn continue_watching(
         &self,
         user_id: i64,

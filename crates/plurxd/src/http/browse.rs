@@ -208,7 +208,19 @@ pub async fn item_detail(
     all.push(item.clone());
     let watch = watch_lookup(&state, user.id, &all).await?;
 
-    let item_dto = ItemDto::from(item).with_watch(watch.get(&id).copied());
+    // Containers have no watch row of their own, so the client would have no
+    // way to know a series is finished — its seasons carry nothing, and their
+    // episodes aren't in this response at all. One rollup query answers it.
+    let rollup = match item.kind {
+        ItemKind::Show | ItemKind::Season | ItemKind::Folder => {
+            Some(state.store.watch_rollup(user.id, id).await?)
+        }
+        _ => None,
+    };
+
+    let item_dto = ItemDto::from(item)
+        .with_watch(watch.get(&id).copied())
+        .with_rollup(rollup);
     Ok(Json(ItemDetail {
         item: item_dto,
         ancestors: ancestors.into_iter().map(Into::into).collect(),
