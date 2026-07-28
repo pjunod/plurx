@@ -3723,7 +3723,36 @@ function maintenancePanel(settings){
       trace a normal scan would notice. <b>Clean transcode cache</b> removes working directories left
       behind by a crash or a host reboot, which no live session will ever claim. <b>Scan at startup</b> covers
       the gap an interval can't: a server that was switched off while files landed doesn't notice them until
-      its next scheduled run.</div>`;
+      its next scheduled run.</div>
+    ${precachePanel(settings)}`;
+}
+// Pre-transcoding: encode ahead of time what somebody is likely to play, so
+// pressing play on a 4K film costs nothing. Off by default, and deliberately so
+// — it competes with live playback for the same encoder.
+const PRODUCE_EVERY=[[0,"Never"],[360,"6 hours"],[720,"12 hours"],[1440,"Daily"]];
+const CACHE_SIZES=[0,10,25,50,100,250,500,1000];
+function precachePanel(settings){
+  const used=settings.cache_used_bytes||0;
+  const bar = settings.cache_max_gb
+    ? `<span class="muted" style="font-size:12px">${fmtBytes(used)} of ${settings.cache_max_gb} GB used</span>`
+    : `<span class="muted" style="font-size:12px">off${used?` — ${fmtBytes(used)} still stored, cleared on the next sweep`:""}</span>`;
+  return `<h2 class="section">Pre-transcoding</h2>
+    <div class="row" style="gap:10px;align-items:center;flex-wrap:wrap">
+      <span class="muted" style="font-size:12px">Look for work</span>
+      ${everySelect("cache-produce",PRODUCE_EVERY,settings.cache_produce_mins,"How often to check what's worth encoding ahead of time")}
+      <span class="muted" style="font-size:12px">Disk budget</span>
+      <select id="cache-gb" title="How much disk finished pre-transcodes may occupy before the oldest are evicted">
+        ${CACHE_SIZES.map(n=>`<option value="${n}"${Number(settings.cache_max_gb)===n?' selected':''}>${n?n+" GB":"Off"}</option>`).join("")}
+      </select>
+      ${bar}
+      <button class="ghost sm" onclick="savePrecache(this)">Save</button></div>
+    <div class="hint">Encodes ahead of time what you're most likely to play next — what you're part-way
+      through, what's up next in a show, then anything 4K or HDR that arrived recently. When it hits, playback
+      starts instantly and seeking is as fast as direct play, because the whole stream already exists.
+      <b>It shares the encoder with live playback and always loses:</b> the moment anyone presses play it
+      stops what it's doing and hands the hardware over, picking up later from where it stopped.
+      Only sources nothing plays natively are worth it (4K, HDR, HEVC), so an ordinary 1080p file is skipped.
+      Setting the budget to <b>Off</b> stops production and clears what's stored.</div>`;
 }
 async function saveMaintenance(btn){
   btn.disabled=true;
@@ -3733,6 +3762,16 @@ async function saveMaintenance(btn){
       transcode_cleanup_mins:Number(document.getElementById("job-clean").value),
       scan_on_startup:document.getElementById("job-boot").checked}});
     toast("Maintenance schedule saved"); render();
+  }catch(e){ toast(e.message||"Couldn't save"); }
+  finally{ btn.disabled=false; }
+}
+async function savePrecache(btn){
+  btn.disabled=true;
+  try{
+    await api("/settings",{method:"PUT",body:{
+      cache_produce_mins:Number(document.getElementById("cache-produce").value),
+      cache_max_gb:Number(document.getElementById("cache-gb").value)}});
+    toast("Pre-transcoding saved"); render();
   }catch(e){ toast(e.message||"Couldn't save"); }
   finally{ btn.disabled=false; }
 }

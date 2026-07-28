@@ -458,6 +458,15 @@ pub struct SettingsDto {
     /// Per-library scan/refresh intervals are on the library, not here.
     pub probe_retry_mins: i64,
     pub transcode_cleanup_mins: i64,
+    /// How often the pre-transcode producer looks for something worth making,
+    /// and how much disk what it makes may occupy. Both off/0 by default: the
+    /// producer competes with live playback for the encoder, so it is a thing
+    /// an operator turns on, not a thing an upgrade turns on for them.
+    pub cache_produce_mins: i64,
+    pub cache_max_gb: i64,
+    /// What the cache currently holds on this node, in bytes — the number that
+    /// makes the budget above mean something.
+    pub cache_used_bytes: i64,
     /// Scan every library once, ~30s after the server starts.
     pub scan_on_startup: bool,
 }
@@ -536,6 +545,23 @@ async fn settings_dto(state: &AppState) -> Result<SettingsDto, ApiError> {
             .get_setting(keys::JOB_TRANSCODE_CLEANUP_MINS)
             .await?,
     );
+    let cache_produce_mins = mins(
+        state
+            .store
+            .get_setting(keys::JOB_CACHE_PRODUCE_MINS)
+            .await?,
+    );
+    let cache_max_gb = state
+        .store
+        .get_setting(keys::CACHE_MAX_GB)
+        .await?
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(crate::cachekeep::DEFAULT_MAX_GB)
+        .max(0);
+    let cache_used_bytes = match state.transcode.cache_location() {
+        Some((_, node)) => state.store.cache_bytes(node).await.unwrap_or(0),
+        None => 0,
+    };
     let scan_on_startup = state
         .store
         .get_setting(keys::JOB_SCAN_ON_STARTUP)
@@ -569,6 +595,9 @@ async fn settings_dto(state: &AppState) -> Result<SettingsDto, ApiError> {
         hls_scratch_max_bytes,
         probe_retry_mins,
         transcode_cleanup_mins,
+        cache_produce_mins,
+        cache_max_gb,
+        cache_used_bytes,
         scan_on_startup,
     })
 }
@@ -611,6 +640,8 @@ pub struct UpdateSettings {
     /// Server-wide job intervals in minutes; 0 turns one off.
     pub probe_retry_mins: Option<i64>,
     pub transcode_cleanup_mins: Option<i64>,
+    pub cache_produce_mins: Option<i64>,
+    pub cache_max_gb: Option<i64>,
     pub scan_on_startup: Option<bool>,
 }
 
@@ -757,6 +788,11 @@ pub async fn update_settings(
             "transcode_cleanup_mins",
             req.transcode_cleanup_mins,
         ),
+        (
+            keys::JOB_CACHE_PRODUCE_MINS,
+            "cache_produce_mins",
+            req.cache_produce_mins,
+        ),
     ] {
         if let Some(value) = value {
             if value < 0 || (value > 0 && value < 15) {
@@ -766,6 +802,20 @@ pub async fn update_settings(
             }
             state.store.put_setting(key, &value.to_string()).await?;
         }
+    }
+    if let Some(gb) = req.cache_max_gb {
+        // Ten terabytes is not a policy so much as a typo guard: the field is
+        // in gigabytes, and somebody entering bytes would set a budget no disk
+        // can reach — which reads as eviction being broken.
+        if !(0..=10_240).contains(&gb) {
+            return Err(ApiError::BadRequest(
+                "cache_max_gb must be between 0 (off) and 10240".into(),
+            ));
+        }
+        state
+            .store
+            .put_setting(keys::CACHE_MAX_GB, &gb.to_string())
+            .await?;
     }
     if let Some(on) = req.scan_on_startup {
         state
