@@ -432,6 +432,27 @@ impl WatchRollup {
     }
 }
 
+/// A cached transcode, as the server needs to know it.
+///
+/// One row of `transcode_cache_locations` joined to the recipe it belongs to —
+/// which is the only shape a caller ever wants. Identity and location are
+/// separate *tables* because a cluster needs them to be (PERF-PLAN §6.1); they
+/// are not separate *questions* at the point of use, where the question is
+/// always "is there a usable copy of this, and where".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CachedTranscode {
+    pub recipe_hash: String,
+    pub file_id: i64,
+    /// Under the configured cache root — never absolute, because an absolute
+    /// path is a fact about one machine's mounts and this row is meant to
+    /// travel between machines that do not share them.
+    pub relative_dir: String,
+    pub bytes: i64,
+    /// A partial entry is a producer that died. Nothing may serve one.
+    pub complete: bool,
+    pub last_used_at: i64,
+}
+
 /// An in-progress item for the continue-watching row.
 #[derive(Debug, Clone, Serialize)]
 pub struct InProgressItem {

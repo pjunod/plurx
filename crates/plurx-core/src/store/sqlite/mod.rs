@@ -9,6 +9,7 @@
 //! `watch` — this file owns open/migrate, shared row mappers, and settings.
 
 mod apikeys;
+mod cache;
 mod library;
 mod media;
 mod outbox;

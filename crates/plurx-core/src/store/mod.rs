@@ -21,9 +21,9 @@ pub use sqlite::SqliteStore;
 use async_trait::async_trait;
 
 use crate::domain::{
-    InProgressItem, Item, ItemEdit, ItemKind, ItemPage, ItemSort, Library, MediaFile,
-    MetadataPatch, NewItem, NewLibrary, ProbeResult, RecentItem, TraktAuth, User, WatchRollup,
-    WatchState,
+    CachedTranscode, InProgressItem, Item, ItemEdit, ItemKind, ItemPage, ItemSort, Library,
+    MediaFile, MetadataPatch, NewItem, NewLibrary, ProbeResult, RecentItem, TraktAuth, User,
+    WatchRollup, WatchState,
 };
 // RecentItem is reused for next-up (episode + show title).
 use crate::error::StoreError;
@@ -507,6 +507,74 @@ pub trait WatchedOutboxStore: Send + Sync + 'static {
     async fn watched_outbox_counts(&self) -> Result<(i64, i64, i64), StoreError>;
 }
 
+/// The pre-transcode cache: what has been produced, and where a copy is.
+///
+/// Split into recipes and locations at the schema level because a cluster
+/// needs to say "node A has this, node B had it and evicted it" (PERF-PLAN
+/// §6.1). Nothing here exposes that split, because no caller has ever wanted
+/// it: the question at every call site is "is there a usable copy" or "make a
+/// note that there is one", and a two-table join is an implementation detail
+/// of answering it.
+#[async_trait]
+pub trait TranscodeCacheStore: Send + Sync + 'static {
+    /// A complete local copy of `recipe_hash`, if one exists. `None` covers
+    /// both "never produced" and "produced but still being written", which are
+    /// the same answer to the only question a player asks.
+    async fn cache_hit(
+        &self,
+        recipe_hash: &str,
+        node_id: &str,
+    ) -> Result<Option<CachedTranscode>, StoreError>;
+
+    /// Claim a directory for a recipe about to be produced. Idempotent: a
+    /// second producer for the same recipe finds the claim and can stand down
+    /// rather than racing it.
+    async fn claim_cache_entry(
+        &self,
+        recipe_hash: &str,
+        file_id: i64,
+        recipe_version: i64,
+        node_id: &str,
+        relative_dir: &str,
+    ) -> Result<(), StoreError>;
+
+    /// Mark a claim finished and serveable, with its measured size. Until this
+    /// runs the entry is invisible to [`TranscodeCacheStore::cache_hit`].
+    async fn complete_cache_entry(
+        &self,
+        recipe_hash: &str,
+        node_id: &str,
+        bytes: i64,
+    ) -> Result<(), StoreError>;
+
+    /// Note that somebody watched it — the LRU clock.
+    async fn touch_cache_entry(&self, recipe_hash: &str, node_id: &str) -> Result<(), StoreError>;
+
+    /// Complete local entries, coldest first. What eviction walks.
+    async fn cache_by_age(
+        &self,
+        node_id: &str,
+        limit: i64,
+    ) -> Result<Vec<CachedTranscode>, StoreError>;
+
+    /// Claims older than `older_than_unix` that never completed — a producer
+    /// that died. Their directories are garbage and their rows are lies.
+    async fn stale_cache_claims(
+        &self,
+        node_id: &str,
+        older_than_unix: i64,
+    ) -> Result<Vec<CachedTranscode>, StoreError>;
+
+    /// Forget one copy. The recipe row goes too when its last copy does: a
+    /// recipe nobody has is not a fact worth keeping on a single node, and on
+    /// a cluster the other nodes' rows keep it alive.
+    async fn forget_cache_entry(&self, recipe_hash: &str, node_id: &str) -> Result<(), StoreError>;
+
+    /// Total bytes of complete local entries — what the budget is measured
+    /// against.
+    async fn cache_bytes(&self, node_id: &str) -> Result<i64, StoreError>;
+}
+
 /// The full storage boundary — what plurxd holds as `Arc<dyn Store>`.
 pub trait Store:
     SettingsStore
@@ -517,6 +585,7 @@ pub trait Store:
     + WatchStore
     + TraktStore
     + WatchedOutboxStore
+    + TranscodeCacheStore
     + Send
     + Sync
     + 'static
@@ -532,6 +601,7 @@ impl<T> Store for T where
         + WatchStore
         + TraktStore
         + WatchedOutboxStore
+        + TranscodeCacheStore
         + Send
         + Sync
         + 'static
