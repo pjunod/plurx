@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -73,45 +73,132 @@ pub(crate) const HLS_AHEAD_MAX_SECS_DEFAULT: i64 = 180;
 struct Progress {
     /// Monotonic zero point for `moved_at_ms`.
     started: Instant,
+    /// Which spawn attempt owns these numbers.
+    ///
+    /// A killed attempt's stdout reader does not stop the instant the process
+    /// does — it can still be draining buffered lines while the replacement is
+    /// already running. Without a generation, one of those late lines lands on
+    /// the new attempt's telemetry, and a stale `out_time` from a process that
+    /// got further along reads as "produced, then frozen": a healthy new
+    /// encoder declared stalled by its dead predecessor.
+    generation: AtomicU64,
     /// Content produced so far, in ms of output timeline; `-1` before the
-    /// first block. Relative to the session's own `-ss`, because an input
-    /// seek restarts output timestamps at zero — so this is "seconds of
-    /// content this session has made", which is what the ahead-window and the
-    /// stall check both want.
+    /// first block. Relative to the session's own `-ss`, because an input seek
+    /// restarts output timestamps at zero.
+    ///
+    /// This is ENCODER progress, not published media: it includes frames muxed
+    /// into the in-progress `.tmp` segment, which no client can fetch. The
+    /// watchdog wants exactly that (proof of motion); pacing must not use it
+    /// (that is what the segment index is for).
     out_time_ms: AtomicI64,
-    /// Encode rate x1000 (`speed=1.85x` → 1850); `-1` when unknown.
+    /// Cumulative encode rate x1000 (`speed=1.85x` -> 1850); `-1` when unknown.
     speed_milli: AtomicI64,
     /// `started.elapsed()` when `out_time_ms` last *moved*. Staleness is
     /// measured from here rather than from the last block received: a stuck
-    /// ffmpeg keeps emitting progress blocks, it just stops advancing.
+    /// ffmpeg keeps emitting blocks, it just stops advancing.
     moved_at_ms: AtomicI64,
+    /// Baseline for the recent-rate delta: wall clock and output time at the
+    /// last usable sample, or [`SAMPLE_UNSET`] before there is one.
+    sample_wall_ms: AtomicI64,
+    sample_out_ms: AtomicI64,
+    /// Smoothed recent rate x1000; `-1` until two usable samples exist.
+    recent_milli: AtomicI64,
+}
+
+/// "No baseline yet". A distinct sentinel rather than `-1`, because these two
+/// fields are *subtracted* — a sentinel inside the arithmetic's own range is a
+/// value that can be silently differenced against a real one.
+const SAMPLE_UNSET: i64 = i64::MIN;
+
+/// A sample separated by more than this much wall clock spans a suspend or a
+/// stall; dividing content by that gap reports a slowdown that never happened,
+/// so such a sample re-baselines instead of contributing.
+const RECENT_SAMPLE_MAX_GAP_MS: i64 = 5_000;
+/// Samples closer together than this are noise -- ffmpeg emits progress about
+/// twice a second and adjacent blocks carry real jitter.
+const RECENT_SAMPLE_MIN_MS: i64 = 400;
+
+/// One exponential-moving-average step over a progress sample, or `None` when
+/// the sample should not move the average at all.
+///
+/// Pure, because the two rejection rules are the whole subtlety and they are
+/// invisible in a test that has to sleep to produce a sample: a gap longer
+/// than the cutoff spans a suspend (dividing its content by the stopped time
+/// invents a slowdown the moment a held session resumes), and a gap shorter
+/// than the floor is two adjacent ffmpeg blocks whose jitter is larger than
+/// the signal.
+fn recent_rate_step(prev_ewma: i64, d_wall_ms: i64, d_out_ms: i64) -> Option<i64> {
+    if !(RECENT_SAMPLE_MIN_MS..=RECENT_SAMPLE_MAX_GAP_MS).contains(&d_wall_ms) || d_out_ms < 0 {
+        return None;
+    }
+    let instant = (d_out_ms * 1000) / d_wall_ms;
+    Some(if prev_ewma < 0 {
+        instant
+    } else {
+        // Weighted toward history: a single slow segment on a variable-bitrate
+        // film should bend the number, not spike it.
+        (prev_ewma * 7 + instant * 3) / 10
+    })
 }
 
 impl Progress {
     fn new() -> Progress {
         Progress {
             started: Instant::now(),
+            generation: AtomicU64::new(0),
             out_time_ms: AtomicI64::new(-1),
             speed_milli: AtomicI64::new(-1),
             moved_at_ms: AtomicI64::new(0),
+            sample_wall_ms: AtomicI64::new(SAMPLE_UNSET),
+            sample_out_ms: AtomicI64::new(SAMPLE_UNSET),
+            recent_milli: AtomicI64::new(-1),
         }
     }
 
-    /// Forget everything measured so far. Called when a session respawns (the
-    /// hardware→software fallback): the new process starts its own timeline
-    /// from the same seek point, and carrying the dead process's numbers over
-    /// would make the replacement look instantly stalled.
-    fn reset(&self) {
+    /// Start a new attempt: forget everything measured so far and return the
+    /// generation the new process's reader must quote to be believed.
+    ///
+    /// Called when a session respawns (the hardware->software fallback). The
+    /// replacement writes its own timeline from the same seek point, so
+    /// carrying the dead process's numbers would make it look instantly
+    /// stalled -- and the generation bump is what stops the dead process's
+    /// reader from putting them back.
+    fn begin_attempt(&self) -> u64 {
+        let generation = self.generation.fetch_add(1, Relaxed) + 1;
         self.out_time_ms.store(-1, Relaxed);
         self.speed_milli.store(-1, Relaxed);
+        self.recent_milli.store(-1, Relaxed);
+        self.sample_wall_ms.store(SAMPLE_UNSET, Relaxed);
+        self.sample_out_ms.store(SAMPLE_UNSET, Relaxed);
         self.moved_at_ms
             .store(self.started.elapsed().as_millis() as i64, Relaxed);
+        generation
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation.load(Relaxed)
     }
 
     fn note_out_time(&self, ms: i64) {
-        if self.out_time_ms.swap(ms, Relaxed) != ms {
-            self.moved_at_ms
-                .store(self.started.elapsed().as_millis() as i64, Relaxed);
+        let now = self.started.elapsed().as_millis() as i64;
+        if self.out_time_ms.swap(ms, Relaxed) == ms {
+            return; // a repeated timestamp is not progress
+        }
+        self.moved_at_ms.store(now, Relaxed);
+
+        // Recent rate: content produced per second of wall clock, smoothed.
+        // ffmpeg's own `speed=` is cumulative over the whole session, which
+        // hides a slowdown behind a fast start and reads as nonsense across a
+        // suspend -- and it is the recent number that predicts whether the
+        // viewer's reserve is about to drain.
+        let last_wall = self.sample_wall_ms.swap(now, Relaxed);
+        let last_out = self.sample_out_ms.swap(ms, Relaxed);
+        if last_wall == SAMPLE_UNSET || last_out == SAMPLE_UNSET {
+            return; // the first sample only establishes a baseline
+        }
+        let prev = self.recent_milli.load(Relaxed);
+        if let Some(next) = recent_rate_step(prev, now - last_wall, ms - last_out) {
+            self.recent_milli.store(next, Relaxed);
         }
     }
 
@@ -132,6 +219,16 @@ impl Progress {
             .filter(|v| *v >= 0)
             .map(|v| v as f64 / 1000.0)
     }
+
+    /// The rate over the last few seconds, which is the one that predicts a
+    /// stall. Falls back to nothing rather than to the cumulative figure --
+    /// reporting a session's lifetime average as "recent" is how a slowdown
+    /// stays invisible.
+    fn recent_speed(&self) -> Option<f64> {
+        Some(self.recent_milli.load(Relaxed))
+            .filter(|v| *v >= 0)
+            .map(|v| v as f64 / 1000.0)
+    }
 }
 
 /// Apply one `key=value` line of ffmpeg's `-progress` output.
@@ -140,7 +237,11 @@ impl Progress {
 /// `speed` on a copy that has not been running long enough to estimate),
 /// which parses to nothing rather than to zero — zero would read as "stalled"
 /// and zero would read as "not moving" respectively, both wrong.
-fn apply_progress_line(progress: &Progress, line: &str) {
+fn apply_progress_line(progress: &Progress, generation: u64, line: &str) {
+    // A line from a superseded attempt is not evidence about the running one.
+    if progress.generation() != generation {
+        return;
+    }
     let Some((key, value)) = line.split_once('=') else {
         return;
     };
@@ -174,6 +275,7 @@ fn spawn_ffmpeg(
     encoder_label: &'static str,
     session_id: &str,
     progress: Arc<Progress>,
+    generation: u64,
 ) -> Result<Child, String> {
     // `-progress pipe:1` is a global option, so it can lead the vector; the
     // HLS muxer writes to files, which leaves stdout free to carry it.
@@ -192,7 +294,7 @@ fn spawn_ffmpeg(
             use tokio::io::{AsyncBufReadExt, BufReader};
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                apply_progress_line(&progress, &line);
+                apply_progress_line(&progress, generation, &line);
             }
         });
     }
@@ -344,7 +446,11 @@ struct Session {
     item_title: String,
     user_name: String,
     target_height: i64,
-    encoder_label: &'static str,
+    /// The encoder actually running *now*. Mutable because the
+    /// hardware->software fallback replaces the process inside one session,
+    /// and an activity page still naming the hardware encoder after that is
+    /// reporting a pipeline that no longer exists.
+    encoder_label: Mutex<&'static str>,
     started_unix: i64,
     /// Set when the session can never produce output (hardware and software
     /// both failed to emit a first segment). Playlist/segment reads then fail
@@ -411,10 +517,11 @@ async fn session_info(id: &str, s: &Session) -> SessionInfo {
         item_title: s.item_title.clone(),
         user_name: s.user_name.clone(),
         target_height: s.target_height,
-        encoder: s.encoder_label,
+        encoder: *s.encoder_label.lock().await,
         started_unix: s.started_unix,
         idle_seconds: s.last_access.lock().await.elapsed().as_secs(),
         speed: s.progress.speed(),
+        recent_speed: s.progress.recent_speed(),
         out_time_ms: s.progress.out_time_ms(),
         ahead_seconds: s.ahead_seconds(),
         suspended: s.suspended.load(Relaxed),
@@ -441,10 +548,13 @@ pub struct SessionInfo {
     pub encoder: &'static str,
     pub started_unix: i64,
     pub idle_seconds: u64,
-    /// Encode rate as a multiple of realtime, once ffmpeg has reported one.
-    /// The first question every buffering report asks is whether the server
-    /// is keeping up, and until this existed nothing could answer it.
+    /// Cumulative encode rate as a multiple of realtime, as ffmpeg reports it.
     pub speed: Option<f64>,
+    /// Rate over the last few seconds. This is the one that answers "is the
+    /// server keeping up *now*" — the cumulative figure hides a slowdown
+    /// behind a fast start, which is exactly the shape a session takes when
+    /// its burst has ended and the encoder can't hold realtime.
+    pub recent_speed: Option<f64>,
     /// Content produced so far, in ms from this session's start offset.
     pub out_time_ms: Option<i64>,
     /// Seconds of content written beyond the segment the client last fetched.
@@ -667,7 +777,14 @@ impl TranscodeManager {
             "transcode ffmpeg args: {}", args.join(" ")
         );
         let progress = Arc::new(Progress::new());
-        let child = spawn_ffmpeg(&args, encoder.label(), &session_id, Arc::clone(&progress))?;
+        let generation = progress.begin_attempt();
+        let child = spawn_ffmpeg(
+            &args,
+            encoder.label(),
+            &session_id,
+            Arc::clone(&progress),
+            generation,
+        )?;
 
         tracing::info!(
             %session_id, file_id, target_height, start_seconds,
@@ -683,7 +800,7 @@ impl TranscodeManager {
             item_title,
             user_name: user_name.to_owned(),
             target_height,
-            encoder_label: encoder.label(),
+            encoder_label: Mutex::new(encoder.label()),
             started_unix: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs() as i64)
@@ -770,17 +887,23 @@ impl TranscodeManager {
                     );
                     // The replacement writes its own timeline from the same
                     // seek point; keeping the dead process's telemetry would
-                    // make it look stalled from its first second.
-                    session.progress.reset();
+                    // make it look stalled from its first second, and the
+                    // generation bump is what stops the dead process's reader
+                    // from writing those numbers back after the reset.
+                    let generation = session.progress.begin_attempt();
                     match spawn_ffmpeg(
                         &sw_args,
                         Encoder::Software.label(),
                         &sid,
                         Arc::clone(&session.progress),
+                        generation,
                     ) {
                         Ok(child) => {
                             *session.child.lock().await = child;
                             *session.last_access.lock().await = Instant::now();
+                            // The activity page must stop naming the hardware
+                            // encoder the moment it is no longer the one running.
+                            *session.encoder_label.lock().await = Encoder::Software.label();
                             tracing::info!(session = %sid, "software fallback transcode started");
                         }
                         Err(e) => {
@@ -857,7 +980,14 @@ impl TranscodeManager {
             "copy-video HLS ffmpeg args: {}", args.join(" ")
         );
         let progress = Arc::new(Progress::new());
-        let child = spawn_ffmpeg(&args, "copy", &session_id, Arc::clone(&progress))?;
+        let generation = progress.begin_attempt();
+        let child = spawn_ffmpeg(
+            &args,
+            "copy",
+            &session_id,
+            Arc::clone(&progress),
+            generation,
+        )?;
 
         let session = Arc::new(Session {
             dir: dir.clone(),
@@ -868,7 +998,7 @@ impl TranscodeManager {
             item_title,
             user_name: user_name.to_owned(),
             target_height: file.height.unwrap_or(0),
-            encoder_label: "copy",
+            encoder_label: Mutex::new("copy"),
             started_unix: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs() as i64)
@@ -1228,6 +1358,7 @@ mod tests {
     #[test]
     fn progress_lines_parse_and_reject() {
         let p = Progress::new();
+        let gen = p.begin_attempt();
         assert_eq!(
             p.out_time_ms(),
             None,
@@ -1239,33 +1370,33 @@ mod tests {
         // session too young to estimate one. It is not zero: zero out_time
         // reads as "produced nothing" and zero speed reads as "stalled".
         for line in ["out_time_us=N/A", "speed=N/A", "bitrate=N/A", "frame=0"] {
-            apply_progress_line(&p, line);
+            apply_progress_line(&p, gen, line);
         }
         assert_eq!(p.out_time_ms(), None);
         assert_eq!(p.speed(), None);
 
         // Microseconds in, milliseconds out — `out_time_ms` is misnamed by
         // ffmpeg and also carries microseconds, so both spellings mean the same.
-        apply_progress_line(&p, "out_time_us=5960000");
+        apply_progress_line(&p, gen, "out_time_us=5960000");
         assert_eq!(p.out_time_ms(), Some(5960));
-        apply_progress_line(&p, "out_time_ms=8000000");
+        apply_progress_line(&p, gen, "out_time_ms=8000000");
         assert_eq!(p.out_time_ms(), Some(8000));
 
-        apply_progress_line(&p, "speed=46.2x");
+        apply_progress_line(&p, gen, "speed=46.2x");
         assert_eq!(p.speed(), Some(46.2));
-        apply_progress_line(&p, "speed=0.71x");
+        apply_progress_line(&p, gen, "speed=0.71x");
         assert_eq!(p.speed(), Some(0.71));
 
         // Junk and unknown keys change nothing.
         for line in ["", "no-equals-sign", "speed=", "out_time_us=abc", "fps=25"] {
-            apply_progress_line(&p, line);
+            apply_progress_line(&p, gen, line);
         }
         assert_eq!(p.out_time_ms(), Some(8000));
         assert_eq!(p.speed(), Some(0.71));
 
         // A respawn (the hardware→software fallback) starts a fresh timeline;
         // carrying the dead process's numbers would read as an instant stall.
-        p.reset();
+        p.begin_attempt();
         assert_eq!(p.out_time_ms(), None);
         assert_eq!(p.speed(), None);
     }
@@ -1275,12 +1406,13 @@ mod tests {
     #[test]
     fn stall_is_measured_from_movement_not_from_chatter() {
         let p = Progress::new();
-        apply_progress_line(&p, "out_time_us=1000000");
+        let gen = p.begin_attempt();
+        apply_progress_line(&p, gen, "out_time_us=1000000");
         let after_move = p.stalled_for();
         // Re-reporting the same timestamp is not progress.
         for _ in 0..5 {
-            apply_progress_line(&p, "out_time_us=1000000");
-            apply_progress_line(&p, "speed=0.9x");
+            apply_progress_line(&p, gen, "out_time_us=1000000");
+            apply_progress_line(&p, gen, "speed=0.9x");
         }
         assert!(
             p.stalled_for() >= after_move,
@@ -1289,8 +1421,161 @@ mod tests {
         // Moving forward does reset it.
         std::thread::sleep(Duration::from_millis(5));
         let before = p.stalled_for();
-        apply_progress_line(&p, "out_time_us=2000000");
+        apply_progress_line(&p, gen, "out_time_us=2000000");
         assert!(p.stalled_for() <= before);
+    }
+
+    /// The race this closes: a killed attempt's stdout reader is still holding
+    /// buffered lines when the replacement starts, and those lines describe a
+    /// process that got further along. Applied to the new attempt they read as
+    /// "produced a lot, then froze" -- a healthy encoder declared dead by its
+    /// predecessor.
+    #[test]
+    fn a_dead_attempt_cannot_speak_for_its_replacement() {
+        let p = Progress::new();
+        let first = p.begin_attempt();
+        apply_progress_line(&p, first, "out_time_us=30000000");
+        assert_eq!(p.out_time_ms(), Some(30_000));
+
+        // The fallback fires: new attempt, clean slate.
+        let second = p.begin_attempt();
+        assert_ne!(first, second);
+        assert_eq!(p.out_time_ms(), None, "the replacement starts unmeasured");
+
+        // The dead reader drains its buffer. None of it lands.
+        for line in ["out_time_us=30000000", "speed=4.0x", "out_time_us=31000000"] {
+            apply_progress_line(&p, first, line);
+        }
+        assert_eq!(p.out_time_ms(), None, "stale attempt was ignored");
+        assert_eq!(p.speed(), None);
+
+        // The live attempt is believed.
+        apply_progress_line(&p, second, "out_time_us=2000000");
+        assert_eq!(p.out_time_ms(), Some(2_000));
+    }
+
+    /// Cumulative speed hides a slowdown behind a fast start; the recent rate
+    /// is what predicts whether the viewer's reserve is about to drain. The
+    /// smoothing is tested as arithmetic — a test that had to sleep to make a
+    /// sample could not cover the rejection rules at all.
+    #[test]
+    fn recent_rate_smooths_and_rejects() {
+        // First usable sample seeds the average: 2s of content in 1s = 2.00x.
+        assert_eq!(recent_rate_step(-1, 1_000, 2_000), Some(2_000));
+        // Subsequent samples bend it rather than replacing it: a crawl after a
+        // fast start pulls down, but not all the way in one step.
+        let bent = recent_rate_step(2_000, 1_000, 100).expect("a rate");
+        assert!(
+            bent < 2_000 && bent > 100,
+            "smoothed toward the new rate: {bent}"
+        );
+        // Sustained crawling converges on the truth.
+        let mut r = 2_000;
+        for _ in 0..40 {
+            r = recent_rate_step(r, 1_000, 100).expect("a rate");
+        }
+        assert!(r < 200, "converged on the real rate: {r}");
+
+        // A gap longer than the cutoff spans a suspend — it must not report
+        // the stopped time as slowness.
+        assert_eq!(
+            recent_rate_step(2_000, RECENT_SAMPLE_MAX_GAP_MS + 1, 500),
+            None
+        );
+        // Two adjacent ffmpeg blocks are jitter, not signal.
+        assert_eq!(recent_rate_step(2_000, RECENT_SAMPLE_MIN_MS - 1, 400), None);
+        // Output going backwards is nonsense, not a negative rate.
+        assert_eq!(recent_rate_step(2_000, 1_000, -50), None);
+    }
+
+    /// End to end through the atomics: the rate appears, and a gapped sample
+    /// leaves it alone.
+    #[test]
+    fn recent_speed_survives_a_hold() {
+        let p = Progress::new();
+        let generation = p.begin_attempt();
+        assert_eq!(p.recent_speed(), None, "nothing to average yet");
+        // Baseline, then a sample far enough apart in wall clock to count.
+        // (The test's own clock barely advances, so the baseline is backdated
+        // rather than slept for.)
+        apply_progress_line(&p, generation, "out_time_us=0");
+        p.sample_wall_ms.store(-1_000, Relaxed);
+        p.sample_out_ms.store(0, Relaxed);
+        apply_progress_line(&p, generation, "out_time_us=4000000");
+        let seen = p.recent_speed().expect("a rate once two samples exist");
+        assert!(seen > 0.0);
+
+        // Now a sample that looks like it spans a long hold: unchanged.
+        p.sample_wall_ms
+            .store(-RECENT_SAMPLE_MAX_GAP_MS * 2, Relaxed);
+        apply_progress_line(&p, generation, "out_time_us=5000000");
+        assert_eq!(
+            p.recent_speed(),
+            Some(seen),
+            "the hold did not count as slow"
+        );
+    }
+
+    /// Watching a stream is not fetching from it.
+    ///
+    /// The stats overlay polls session status every couple of seconds while it
+    /// is open. If that poll touched the idle clock, leaving the overlay up
+    /// would keep an abandoned encoder alive forever — the exact leak the idle
+    /// reaper exists to prevent. This is already true; the test is here so it
+    /// stays true, because the natural way to write `session_status` is to
+    /// reuse `touch` and nothing would visibly break.
+    #[tokio::test]
+    async fn polling_status_does_not_keep_a_session_alive() {
+        super::require_ffmpeg();
+        use plurx_core::store::SqliteStore;
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let file_id = seed_file(&store).await;
+        let work = tempfile::tempdir().expect("work");
+        let mgr = TranscodeManager::new(
+            Arc::clone(&store),
+            work.path().to_path_buf(),
+            EncoderCaps::default(),
+        );
+        let info = mgr
+            .start(file_id, 720, 0.0, None, "paul")
+            .await
+            .expect("start");
+
+        // Let the idle clock advance, then poll status several times.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let before = mgr
+            .session_status(&info.session_id)
+            .await
+            .expect("status")
+            .idle_seconds;
+        for _ in 0..5 {
+            assert!(mgr.session_status(&info.session_id).await.is_some());
+        }
+        let after = mgr
+            .session_status(&info.session_id)
+            .await
+            .expect("status")
+            .idle_seconds;
+        assert!(
+            after >= before,
+            "idle time must keep running while status is polled"
+        );
+
+        // A real fetch DOES reset it — the contrast that keeps the assertion
+        // above from passing vacuously on a session whose clock never moved.
+        // (`touch` is the shared front half of the playlist and segment
+        // readers; calling those here would long-poll for output this fixture
+        // can never produce.)
+        assert!(mgr.touch(&info.session_id).await.is_some());
+        assert_eq!(
+            mgr.session_status(&info.session_id)
+                .await
+                .expect("status")
+                .idle_seconds,
+            0,
+            "fetching from a session is what keeps it alive"
+        );
+        assert!(mgr.stop_session(&info.session_id).await);
     }
 
     #[test]

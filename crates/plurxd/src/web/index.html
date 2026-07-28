@@ -2919,9 +2919,15 @@ function updateStats(){
   let srv='';
   if(PLAYER.health){
     const h=PLAYER.health;
-    if(h.speed!=null){
-      const slow=h.speed<1.0 && !h.suspended;
-      srv+=`<div><b>Encode speed</b><span${slow?' style="color:var(--warn,#fbbf24)"':''}>${h.speed.toFixed(2)}×${slow?' — slower than realtime':''}</span></div>`;
+    // Prefer the recent rate over ffmpeg's cumulative one. A session that
+    // burst ahead and then fell behind reports a healthy lifetime average
+    // while actively draining the viewer's reserve — the cumulative number is
+    // the one that hides the problem this line exists to show.
+    const rate=(h.recent_speed!=null)?h.recent_speed:h.speed;
+    if(rate!=null){
+      const slow=rate<1.0 && !h.suspended;
+      const label=(h.recent_speed!=null)?'':' (avg)';
+      srv+=`<div><b>Encode speed</b><span${slow?' style="color:var(--warn,#fbbf24)"':''}>${rate.toFixed(2)}×${label}${slow?' — slower than realtime':''}</span></div>`;
     }
     if(h.ahead_seconds!=null) srv+=`<div><b>Server ahead</b>${Math.max(0,h.ahead_seconds)} s${h.suspended?' · held':''}</div>`;
   }
