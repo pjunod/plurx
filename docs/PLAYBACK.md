@@ -196,7 +196,9 @@ restart as a guaranteed-compatible transcode.
  <video> fires "error" on a direct_play or remux stream   (once per session)
         │
         ▼
- startTranscodeFallback()  ─▶  /hls/start?height=720  ─▶  full H.264 transcode
+ startTranscodeFallback() ─▶ POST /files/:id/hls/sessions ─▶ full H.264 transcode
+                             (height omitted = Auto: min(source,1080) on
+                              hardware, 720p on software — see PERF-PLAN §4.7)
 ```
 
 This is a good safety net and a bad first choice. The trap it created, worth

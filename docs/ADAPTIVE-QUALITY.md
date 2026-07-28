@@ -27,18 +27,26 @@ not a rebuild.
 
 | Piece | Where | State |
 |---|---|---|
-| Rung parameter | `GET /files/:id/hls/start?height=` (clamped 144–2160) | done |
+| Rung parameter | `POST /files/:id/hls/sessions` body `height` (clamped 144–2160); omitted = Auto, resolved server-side | done |
 | Height → bitrate ladder | `bitrate_for_height()` in `plurxd/src/transcode.rs` (2160→20 Mb/s, 1080→8, 720→4, 480→2, else 1.2) | done |
-| Segment-aligned keyframes | `-force_key_frames expr:gte(t,n_forced*4)` + `hls_time 4` in `hls_args` | done |
+| Segment-aligned keyframes | `-force_key_frames expr:gte(t,n_forced*SEGMENT_SECONDS)` + `hls_time SEGMENT_SECONDS` in `hls_args` (2 s since PERF-PLAN §4.4) | done |
 | Mid-stream session restart | the seek and audio-switch paths already call `hls/start?start=…` and re-attach via `attachHls()` | done |
 | Never upscale | `video_filters()` refuses to scale above source height | done |
 | Session lifecycle | idle reaper (60 s), first-segment watchdog, software self-heal | done |
 | Client stream health | `hls.bandwidthEstimate`, `waiting` events, stall self-diagnosis | available |
-| Bounded rung bitrate | `-maxrate`/`-bufsize` | **software & NVENC only** — QSV/VA-API/VideoToolbox get bare `-b:v` |
+| Bounded rung bitrate | `-maxrate` (1.5×) / `-bufsize` (2×) in `Encoder::encode_args` | done — **every** family, hardware included (PERF-PLAN §4.6) |
+| Probe runs production args | `validation_args()` calls `encode_args()` | done — a driver that refuses the real rate control now fails at boot, not at play |
 
-That last row is the one real server gap: a rung is only meaningful to an
-adaptation controller if its bitrate is *bounded*. A "4 Mb/s" QSV encode that
-bursts to 12 Mb/s on a grain-heavy scene defeats the estimate.
+The bound is what makes a rung mean anything to an adaptation controller: a
+"4 Mb/s" QSV encode that bursts to 12 Mb/s on a grain-heavy scene defeats the
+estimate it is supposed to inform. It is a *window*, not a per-segment cap —
+`bufsize` says how long a peak has to be paid back over — so the ladder's
+advertised bandwidth must cover the measured peak over that window rather than
+the nominal target.
+
+What remains here is the ladder API itself: snapping `height` to the nearest
+rung, and returning the rungs (height + total kb/s, source-height filtered) in
+the session and decision responses so the client stops hardcoding them.
 
 ## The ladder
 
@@ -63,15 +71,18 @@ localStorage persistence, forced decision modes, restart-at-position on
 change) and review R12 rightly called the drift. Phase 1 is now only the
 work that *remains*:
 
-*Server*: add `-maxrate` (1.5×) and `-bufsize` (2×) to the QSV, VA-API,
-and VideoToolbox arms of `Encoder::encode_args` — software and NVENC
-already have them — with the validation probe running the full production
-argument set and the bound stated as a sliding window
-([PERF-PLAN.md](PERF-PLAN.md) §4.6). Snap `height` to the nearest rung in
-session creation, and return the ladder (each rung's height + total kb/s,
-source-height filtered) in the `start` and `decision` responses so the
-client never hardcodes it. The advertised per-rung bandwidth covers the
-*measured* peak, not the nominal target.
+*Server*: the rate-control half shipped 2026-07-28 — every family now
+carries `-maxrate` (1.5×) / `-bufsize` (2×), and the startup probe encodes
+with the production argument set so a driver that accepts the encoder and
+refuses its rate control is caught at boot rather than on a viewer's first
+press of play ([PERF-PLAN.md](PERF-PLAN.md) §4.6). Auto also became a real
+policy rather than a constant: `min(source, 1080)` on hardware, 720p on
+software, decided server-side because only the server knows which encoder won
+(§4.7). What remains: snap `height` to the nearest rung in session creation,
+and return the ladder (each rung's height + total kb/s, source-height
+filtered) in the session and decision responses so the client never hardcodes
+it. The advertised per-rung bandwidth covers the *measured* peak, not the
+nominal target.
 
 *Client*: consume the server ladder instead of the hardcoded `QUALITIES`
 list; add the missing 360p rung; show the active rung and its reason in
@@ -147,9 +158,11 @@ True multivariant HLS, adapted to JIT: `master.m3u8` advertises every rung
 (`EXT-X-STREAM-INF` with `BANDWIDTH`/`RESOLUTION`); each variant's playlist
 and segments live at `/hls/:session/:rung/…` and its encoder starts *lazily*
 on first request. Because `-force_key_frames` already cuts every variant at
-t = 4n, segment N is the same time window in every rung; a variant joining
-mid-timeline starts with `-ss 4n`, `-start_number n`, and an
-`-output_ts_offset` for PTS continuity. hls.js's native ABR then does all
+`t = n × SEGMENT_SECONDS`, segment N is the same time window in every rung; a
+variant joining mid-timeline starts at that offset with `-start_number n` and
+an `-output_ts_offset` for PTS continuity. Read the length from the constant —
+it was 4 s, it is 2 s, and a hardcoded number here is a desync waiting for the
+next tuning pass. hls.js's native ABR then does all
 switching seamlessly — the Phase 2 controller is deleted, replaced by
 `capLevelToPlayerSize: true`. A variant reaper kills encoders nobody has
 fetched from in 30 s, so steady-state stays at one active encode (brief

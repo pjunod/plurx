@@ -1,7 +1,10 @@
 # Performance — where the seconds go, and the plan to get them back
 
-**Status:** ready to build — Weekend 1 and the §2.8 correction pass are both
-shipped (2026-07-28); §4.4 / §4.6 / §4.7 are next · **Diagnosed against:**
+**Status:** M1 complete — Weekend 1, the §2.8 correction pass, and
+§4.4 / §4.6 / §4.7 are all shipped (2026-07-28). **M2 (GPU tone-map) is
+next**, and it is the one that fixes 4K: §2.9 measured the CPU tone-map
+chain costing a quarter of the pipeline's throughput, which is the quarter
+that takes a 4K HDR session below realtime · **Diagnosed against:**
 `e7a12cf`
 · **Review record:** [PERF-PLAN-REVIEW.md](PERF-PLAN-REVIEW.md) →
 [PERF-REVIEW-RESPONSE.md](PERF-REVIEW-RESPONSE.md) →
@@ -539,6 +542,14 @@ cluster code.
 `ffprobe` of produced segments shows 2 s cadence; the full corpus
 (HDR/DV/VFR) still passes.
 
+**Shipped 2026-07-28.** The playlist of a live transcode session reads
+`#EXT-X-TARGETDURATION:2` with every `#EXTINF:2.000000`, so the cadence is
+confirmed end to end rather than inferred from the argument list. The
+keyframe-grid and `hls_time` assertions are now written against the constant
+itself, so the two can never be tuned apart — a session whose keyframes miss
+its segment boundaries produces segments that are not independently
+decodable, which is the one thing HLS requires of them.
+
 ### 4.5 A watchdog that reads the speedometer (kills B7)
 
 Replace the binary produced/not-produced checks with the `-progress`
@@ -607,6 +618,26 @@ fixture stays inside the documented sliding-window bound on QSV;
 ADAPTIVE-QUALITY.md's "software & NVENC only" caveat row is updated in
 the same commit.
 
+**Shipped 2026-07-28**, with `-rc_mode` deliberately left at auto. ffmpeg's
+VAAPI encoder already selects VBR when maxrate exceeds bitrate and falls back
+to what the driver implements; forcing VBR would turn a CBR-only driver from
+"works, roughly bounded" into "fails validation, no hardware at all" — a worse
+outcome than the looser bound it was meant to tighten. The probe is now
+`validation_args() → encode_args()`, proven by comparison in a test rather
+than by restating the flags, so a rate-control argument added to sessions and
+not to the probe is a test failure rather than a driver surprise.
+
+Two things fell out of making the probe representative. It had been a 64×64
+still at 1 fps for 0.1 s — one frame, which an encoder with any lookahead
+turns into zero packets, which ffmpeg reports as "nothing was written into
+output file": a *working* GPU failing validation. It is now 720p30 for half a
+second. And the failure line the operator reads was ffmpeg's last, which is
+that same generic summary; it is now the first real cause ("Operation not
+permitted" — a missing device — rather than "nothing was written").
+
+Still owed: the grain-heavy sliding-window measurement, which needs QSV
+hardware. `scripts/bench` is where it goes.
+
 ### 4.7 The Auto rung (B8 — decision needed, small code)
 
 Today Auto = 720p for every transcode. Once §5 makes 1080p cheap, the
@@ -617,6 +648,20 @@ implement behind one function (`transcodeHeight` caller side +
 `hls/start` default), flag the default in the PR description, and let the
 ladder API from ADAPTIVE-QUALITY Phase 1 carry it properly later.
 User-facing strings, as always, `${APP_NAME}`-clean and theme-mixed.
+
+**Shipped 2026-07-28, decided the other way round from the sketch.** The
+policy lives on the server (`TranscodeManager::auto_height`), not in
+`transcodeHeight()`, because the rung depends on which encoder wins and the
+player only learns that from the response to the request it is making. So the
+player sends no height at all for Auto and the server answers: `min(source,
+1080)` on hardware, 720p on software, never upscaling. Capped at 1080 rather
+than at the source deliberately — a 4K rung is a bandwidth decision as much as
+a CPU one, and Auto should not put 20 Mb/s on somebody's Wi-Fi without being
+asked. 4K stays a menu choice, and direct play and remux still deliver the
+source untouched.
+
+Note the default this changes: Auto on a QSV box now transcodes 1080p source
+at 1080p where it used to give 720p.
 
 ### 4.8 Ops notes that ride along (no code)
 

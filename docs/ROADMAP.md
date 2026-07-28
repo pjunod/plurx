@@ -101,8 +101,16 @@ through M3; M4 *is* Phase 4's transcode chapter and waits for its plumbing.
 - 📝 **Reviewed 2026-07-28**, two rounds: [PERF-PLAN-REVIEW.md](PERF-PLAN-REVIEW.md)
   → [PERF-REVIEW-RESPONSE.md](PERF-REVIEW-RESPONSE.md) →
   [PERF-REVIEW-ASSESSMENT.md](PERF-REVIEW-ASSESSMENT.md). The plan carries
-  the corrected contracts and a decisions ledger (PERF-PLAN §8.6); the
-  **correction pass** (PERF-PLAN §2.8) is the next work item.
+  the corrected contracts and a decisions ledger (PERF-PLAN §8.6).
+- ✅ **M1 complete 2026-07-28:** the correction pass (PERF-PLAN §2.8), the
+  fixture-matrix benchmark, 2-second segments, bounded rate control on every
+  encoder family with a probe that runs the production arguments, and an Auto
+  rung that means `min(source, 1080)` on hardware instead of 720p for
+  everything. Measured on the corpus: the CPU tone-map chain costs a quarter
+  of the pipeline's throughput (0.98× → 0.71× at 4K), which is what takes a
+  4K HDR session below realtime.
+- ⏭️ **M2 next** — tone-map on the GPU. It is the milestone that actually
+  fixes 4K; everything before it bought start latency and headroom.
 
 ## Phase 4 — HA for real
 
