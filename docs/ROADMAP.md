@@ -114,9 +114,11 @@ through M3; M4 *is* Phase 4's transcode chapter and waits for its plumbing.
   type, a boot probe that validates each end to end against real HDR10
   (correct BT.709, a picture matching the CPU reference, and faster than it),
   per-session routing, and a runtime downgrade that drops the graph before it
-  drops the encoder. Remaining: hardware-session admission
-  (`max_hw_sessions`), and the acceptance run — which needs a box with a GPU,
-  since CI can only prove candidates fail correctly.
+  drops the encoder. Hardware-session admission followed: a capped, racing-safe
+  slot with a queue → measured-safe-software → refusal ladder, where
+  "measured-safe" means this box has clocked that class of work above realtime
+  in software, not that the output looked small. Remaining: the acceptance run,
+  which needs a box with a GPU — CI can only prove candidates fail correctly.
 
 ## Phase 4 — HA for real
 

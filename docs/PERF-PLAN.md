@@ -1,11 +1,10 @@
 # Performance — where the seconds go, and the plan to get them back
 
-**Status:** M1 complete; **M2 landed its selection half** (2026-07-28) —
-the pipeline abstraction, the boot probe, per-session routing and the
-runtime downgrade are shipped and tested. What remains in M2 is the
-capacity/admission work (`transcode.max_hw_sessions`) and the acceptance
-run, which needs nynuc: no GPU in CI means no candidate can pass its probe
-there, only fail correctly · **Diagnosed against:** `e7a12cf`
+**Status:** M1 complete; **M2 code-complete** (2026-07-28) — pipeline
+abstraction, boot probe, per-session routing, runtime downgrade, and
+hardware-session admission are all shipped and tested. What remains is the
+acceptance run, which needs nynuc: no GPU in CI means no candidate can pass
+its probe there, only fail correctly · **Diagnosed against:** `e7a12cf`
 · **Review record:** [PERF-PLAN-REVIEW.md](PERF-PLAN-REVIEW.md) →
 [PERF-REVIEW-RESPONSE.md](PERF-REVIEW-RESPONSE.md) →
 [PERF-REVIEW-ASSESSMENT.md](PERF-REVIEW-ASSESSMENT.md) ·
@@ -787,9 +786,30 @@ which is the kind nobody reports. The chosen pipeline is on the session's
 ffmpeg log line and the probe's full verdict list is on `GET /api/v1/system`,
 because falling back is silent: everything plays, 4K just stays slow.
 
-**Still owed in M2:** `transcode.max_hw_sessions` and the admission ladder
-(queue → measured-safe software → capacity error), and the acceptance run
-below, which needs real hardware.
+**Admission shipped 2026-07-28.** `transcode.max_hw_sessions` (default 2),
+acquired by compare-and-swap rather than by a scan under the sessions lock —
+the property that matters is that two racing starts cannot both see the same
+free slot, and a CAS gives exactly that without a second lock to order against
+the first. The slot is a guard held by the session, released explicitly when
+the session ends and by `Drop` as the backstop: explicit because the watchdog
+holds an `Arc` to the session for its whole grace window, so waiting for the
+last reference would keep a slot for twelve seconds after a viewer closed the
+tab; by `Drop` because the ways a session can end outnumber the branches
+anyone writes.
+
+The ladder is queue (≤5 s) → measured-safe software → refusal, and
+"measured-safe" is measured *here*: sessions record their recent speed per
+class of work, and admission reads that class back. Two things are in the class
+key on purpose — the SOURCE's resolution and HDR rather than the output's (the
+decode and the tone-map happen at source resolution however small the output,
+which is what makes "admit it at 480p" the wrong answer), and the encoder (a
+QSV session at 6× has measured nothing about what x264 would do with the same
+file). A node that has measured nothing yet guesses from the shape, and guesses
+toward refusal for 4K and heavy-codec HDR, because §2.9 measured both
+sub-realtime in software on exactly this hardware and an optimistic guess there
+costs a viewer their whole session.
+
+**Still owed in M2:** the acceptance run below, which needs real hardware.
 
 **Acceptance:** on nynuc, the M0 telemetry shows a 4K HDR10 → 1080p
 session at ≥3× (QSV graph) vs the recorded CPU baseline; a 2 h 4K HDR

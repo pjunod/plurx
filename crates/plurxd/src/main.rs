@@ -1,3 +1,4 @@
+mod admission;
 mod ffmpeg;
 mod http;
 mod logbuf;

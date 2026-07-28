@@ -109,6 +109,14 @@ pub mod keys {
     /// one runaway session; it says nothing about several healthy ones filling
     /// the disk between them.
     pub const HLS_SCRATCH_MAX_BYTES: &str = "playback.hls_scratch_max_bytes";
+    /// How many transcodes may run on the hardware encoder at once.
+    ///
+    /// An iGPU has one video-processing block, and two 4K sessions on it do not
+    /// run at half speed each — they contend, and both can fall under realtime.
+    /// One person's stream becomes two people's stutter. Settable because the
+    /// right number is a property of the silicon: a discrete card with two
+    /// NVENC chips is not a NUC.
+    pub const MAX_HW_SESSIONS: &str = "transcode.max_hw_sessions";
 }
 
 #[async_trait]

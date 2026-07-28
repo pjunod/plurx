@@ -19,6 +19,9 @@ use plurx_core::transcode::{
 use tokio::process::Child;
 use tokio::sync::Mutex;
 
+use crate::admission::{
+    Admission, Admissions, HwSlot, Workload, DEFAULT_MAX_HW_SESSIONS, QUEUE_WAIT,
+};
 use crate::ffmpeg::{ffmpeg_bin, pacing_caps};
 use crate::meter::Meter;
 
@@ -655,6 +658,21 @@ struct Session {
     ahead_bytes: AtomicI64,
     /// Live encode telemetry (see [`Progress`]).
     progress: Arc<Progress>,
+    /// What kind of work this is, for the admission record (see
+    /// [`crate::admission::Workload::class`]). Kept on the session because the
+    /// speed that matters is measured while it runs, long after the file that
+    /// described it went out of scope.
+    class: String,
+    /// The hardware slot this session holds.
+    ///
+    /// Released two ways, on purpose. `release_hardware` hands it back the
+    /// moment the session ends, which is what makes the cap *prompt*: the
+    /// watchdog task holds an `Arc` to this session for its whole grace window,
+    /// so waiting for the last reference to go would keep a slot for twelve
+    /// seconds after the viewer closed the tab. And dropping the session
+    /// returns it too, which is what makes the cap *complete* — every way a
+    /// session can end, including the ones nobody wrote a branch for.
+    hw_slot: std::sync::Mutex<Option<HwSlot>>,
     /// Bytes of segment actually handed to this client, and how fast.
     ///
     /// The player cannot measure this for itself on every transport: native
@@ -683,6 +701,14 @@ fn ahead_of(index: &SegmentIndex, fetched_end_ms: i64) -> Option<Ahead> {
 }
 
 impl Session {
+    /// Hand the hardware slot back now rather than whenever the last reference
+    /// to this session happens to go. Idempotent, because the reaper and an
+    /// explicit stop can both reach a session and neither should have to know
+    /// whether the other got there first.
+    fn release_hardware(&self) {
+        let _ = self.hw_slot.lock().expect("hw slot mutex").take();
+    }
+
     /// Re-read the playlist and re-measure what is on disk.
     ///
     /// Sizes already known are carried forward by index, so a long session
@@ -868,6 +894,8 @@ pub struct TranscodeManager {
     /// [`Pipeline::for_session`] — because a proven graph is a claim about the
     /// box, not about the session.
     pipeline: Pipeline,
+    /// The hardware budget, and what this box has learned about its own speed.
+    admissions: Admissions,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     /// Answered creation requests: `request_id` -> (session id, fingerprint).
     /// Small by construction — an entry is dropped as soon as its session is
@@ -892,6 +920,7 @@ impl TranscodeManager {
             work_dir,
             caps,
             pipeline,
+            admissions: Admissions::new(),
             sessions: Mutex::new(HashMap::new()),
             requests: Mutex::new(HashMap::new()),
         }
@@ -1019,6 +1048,21 @@ impl TranscodeManager {
         pacing_caps().await.resolve(rate, burst, for_copy)
     }
 
+    /// Hardware slots in use, and the cap. The pair is the diagnostic: "2"
+    /// alone says nothing, and a viewer being refused while the count sits at
+    /// zero is a very different bug from one being refused at the cap.
+    pub async fn hardware_slots(&self) -> (usize, usize) {
+        (self.admissions.in_use(), self.max_hw_sessions().await)
+    }
+
+    /// How many hardware transcodes this node will run at once.
+    pub async fn max_hw_sessions(&self) -> usize {
+        // A configured zero means "no hardware transcoding", which is a
+        // legitimate thing to want on a box whose GPU is doing something else.
+        self.num_setting(keys::MAX_HW_SESSIONS, DEFAULT_MAX_HW_SESSIONS)
+            .await
+    }
+
     /// Choose the encoder given the admin preference setting (empty = auto).
     async fn encoder(&self) -> Encoder {
         let prefer = self
@@ -1111,6 +1155,10 @@ impl TranscodeManager {
                 .collect()
         };
         for (session_id, session) in doomed {
+            // Before the kill, and before the caller goes on to ask for a slot
+            // of its own: a player replacing its own session must not have to
+            // queue behind the session it just replaced.
+            session.release_hardware();
             let _ = session.child.lock().await.kill().await;
             let _ = tokio::fs::remove_dir_all(&session.dir).await;
             tracing::info!(
@@ -1151,7 +1199,51 @@ impl TranscodeManager {
             .map(|i| i.title)
             .unwrap_or_else(|| "(unknown)".to_owned());
 
-        let encoder = self.encoder().await;
+        // Claim a hardware slot before spawning anything. An iGPU has one
+        // video-processing block, and a third 4K session on it does not run a
+        // third as fast — it drags the other two under realtime with it, so one
+        // person pressing play becomes three people stuttering.
+        //
+        // The wait is short and deliberate: a slot usually frees within seconds
+        // (a superseded session, a closed tab), and someone who has pressed
+        // play will forgive five seconds far sooner than a hang.
+        let mut encoder = self.encoder().await;
+        let work = Workload::of(&file, target_height);
+        let mut hw_slot = None;
+        if encoder != Encoder::Software {
+            let max = self.max_hw_sessions().await;
+            let deadline = Instant::now() + QUEUE_WAIT;
+            loop {
+                match self.admissions.admit(max, work) {
+                    Admission::Hardware(slot) => {
+                        hw_slot = Some(slot);
+                        break;
+                    }
+                    _ if Instant::now() < deadline => {
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                    }
+                    // Out of patience. Software only when this box has measured
+                    // this *class of work* running comfortably above realtime —
+                    // never because the output is small, which is the reasoning
+                    // that admits a 4K HDR source at 480p and then stalls: the
+                    // decode and the tone-map happen at source resolution
+                    // whatever size you ask the output to be.
+                    Admission::Software => {
+                        tracing::info!(
+                            file = file_id, class = %work.software_class(),
+                            "hardware transcode slots full; this class runs comfortably                              in software here, so starting it there"
+                        );
+                        encoder = Encoder::Software;
+                        break;
+                    }
+                    Admission::Refused(why) => {
+                        tracing::warn!(file = file_id, class = %work.software_class(), "{why}");
+                        return Err(why);
+                    }
+                }
+            }
+        }
+
         let session_id = uuid::Uuid::new_v4().to_string();
         let dir = self.work_dir.join(&session_id);
         tokio::fs::create_dir_all(&dir)
@@ -1258,6 +1350,12 @@ impl TranscodeManager {
             segments: Mutex::new(SegmentIndex::default()),
             ahead_bytes: AtomicI64::new(0),
             progress: Arc::clone(&progress),
+            class: work.class(if encoder == Encoder::Software {
+                crate::admission::SOFTWARE
+            } else {
+                encoder.label()
+            }),
+            hw_slot: std::sync::Mutex::new(hw_slot),
             delivery: Meter::new(),
             suspended: AtomicBool::new(false),
         });
@@ -1501,6 +1599,8 @@ impl TranscodeManager {
             segments: Mutex::new(SegmentIndex::default()),
             ahead_bytes: AtomicI64::new(0),
             progress: Arc::clone(&progress),
+            class: String::new(),
+            hw_slot: std::sync::Mutex::new(None),
             delivery: Meter::new(),
             suspended: AtomicBool::new(false),
         });
@@ -1563,6 +1663,7 @@ impl TranscodeManager {
         let Some(session) = self.sessions.lock().await.remove(session_id) else {
             return false;
         };
+        session.release_hardware();
         let _ = session.child.lock().await.kill().await;
         let _ = tokio::fs::remove_dir_all(&session.dir).await;
         tracing::info!(%session_id, reason, "transcode session ended");
@@ -1831,11 +1932,26 @@ impl TranscodeManager {
             }
             for (id, session) in expired {
                 self.sessions.lock().await.remove(&id);
+                session.release_hardware();
                 // Kills a suspended child too — SIGKILL is not blockable and
                 // does not need the process scheduled to take effect.
                 let _ = session.child.lock().await.kill().await;
                 let _ = tokio::fs::remove_dir_all(&session.dir).await;
                 tracing::info!(session_id = %id, "reaped idle transcode session");
+            }
+            // What this box actually achieves, remembered per class of work.
+            // Admission asks it the next time hardware is full, so the answer
+            // to "can software cope with this" is a measurement from this
+            // machine rather than an assumption about machines in general.
+            // A suspended session is making no progress on purpose and would
+            // poison the record with a speed it was never asked to reach.
+            for (_id, session) in &live {
+                if session.class.is_empty() || session.suspended.load(Relaxed) {
+                    continue;
+                }
+                if let Some(speed) = session.progress.recent_speed() {
+                    self.admissions.record(&session.class, speed);
+                }
             }
             // Repair pass. Flow control proper runs on segment completion and
             // frontier advance; this catches a session nobody is currently
@@ -2391,6 +2507,8 @@ mod tests {
             segments: Mutex::new(SegmentIndex::default()),
             ahead_bytes: AtomicI64::new(0),
             progress: Arc::new(Progress::new()),
+            class: String::new(),
+            hw_slot: std::sync::Mutex::new(None),
             delivery: Meter::new(),
             suspended: AtomicBool::new(false),
         }
@@ -2693,6 +2811,70 @@ mod tests {
             )
             .await
             .expect("file")
+    }
+
+    /// The cap has to hold against *concurrent* starts, which is the only case
+    /// that matters: a third 4K session admitted alongside two others does not
+    /// run a third as fast, it drags all three under realtime. A count read and
+    /// then written would let every racer through.
+    #[tokio::test]
+    async fn concurrent_starts_cannot_exceed_the_hardware_slot_cap() {
+        super::require_ffmpeg();
+        use plurx_core::store::SqliteStore;
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let file_id = seed_file(&store).await;
+        let work = tempfile::tempdir().expect("work");
+        // A box that believes it has NVENC. The encode will fail (there is no
+        // GPU here) but admission happens before the spawn, which is the point.
+        let mgr = Arc::new(TranscodeManager::new(
+            Arc::clone(&store),
+            work.path().to_path_buf(),
+            EncoderCaps {
+                nvenc: true,
+                ..Default::default()
+            },
+            Pipeline::Cpu,
+        ));
+        store
+            .put_setting(keys::MAX_HW_SESSIONS, "2")
+            .await
+            .expect("cap");
+
+        // Five players, all at once, each with its own playback id so none
+        // supersedes another.
+        let mut starts = Vec::new();
+        for n in 0..5 {
+            let mgr = Arc::clone(&mgr);
+            starts.push(tokio::spawn(async move {
+                mgr.start(file_id, 1080, 0.0, None, "paul", &format!("pb-{n}"))
+                    .await
+            }));
+        }
+        let mut admitted = 0;
+        let mut refused = 0;
+        for s in starts {
+            match s.await.expect("join") {
+                Ok(_) => admitted += 1,
+                Err(why) => {
+                    // The 4K HEVC fixture is exactly the shape software cannot
+                    // carry, so the overflow is refused rather than downgraded
+                    // — and it says why rather than failing anonymously.
+                    assert!(why.contains("hardware transcode slots"), "{why}");
+                    refused += 1;
+                }
+            }
+        }
+        assert_eq!(admitted, 2, "the cap is the cap");
+        assert_eq!(refused, 3);
+        assert_eq!(mgr.admissions.in_use(), 2, "and it is accounted for");
+
+        // Ending a session gives its slot back — the guard rides on the
+        // session, so every way one can end returns the slot.
+        let live: Vec<String> = mgr.sessions.lock().await.keys().cloned().collect();
+        for id in live {
+            assert!(mgr.stop_session(&id, "test").await);
+        }
+        assert_eq!(mgr.admissions.in_use(), 0, "slots come back");
     }
 
     #[tokio::test]

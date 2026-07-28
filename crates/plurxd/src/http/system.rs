@@ -94,6 +94,12 @@ pub struct SystemDto {
     pub users: i64,
     pub libraries: usize,
     pub active_transcodes: usize,
+    /// Hardware encoder slots in use, and the cap
+    /// (`transcode.max_hw_sessions`). Reported as a pair because either number
+    /// alone is unreadable: a start refused while this says 0 of 2 is a very
+    /// different bug from one refused at 2 of 2.
+    pub hw_slots_in_use: usize,
+    pub hw_slots_max: usize,
     /// Recent targeted-scan requests from other applications, newest last.
     /// The one place an operator can see that monarr is actually talking to
     /// plurx — and what it asked for — without reading the log.
@@ -137,6 +143,7 @@ pub async fn system_info(
     let requests = state.jobs.scan_requests().await;
     let last = requests.last();
     let (by_trigger, notifications) = state.jobs.metrics().snapshot();
+    let (hw_in_use, hw_max) = state.transcode.hardware_slots().await;
     Ok(Json(SystemDto {
         name: state.server_name.clone(),
         version: crate::version::SEMVER,
@@ -146,6 +153,8 @@ pub async fn system_info(
         users: state.store.count_users().await?,
         libraries: state.store.list_libraries().await?.len(),
         active_transcodes: state.transcode.active_sessions().await,
+        hw_slots_in_use: hw_in_use,
+        hw_slots_max: hw_max,
         scan_requests: requests.clone(),
         integration: IntegrationDto {
             notifications_received: notifications,
