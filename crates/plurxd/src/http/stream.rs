@@ -500,7 +500,7 @@ async fn probe_chapters(path: &Path) -> Option<Vec<serde_json::Value>> {
 /// container=…&hdr=…&force=…` (runtime browser capabilities + quality override);
 /// native clients still pass `?profile=`.
 pub async fn decision(
-    AuthUser(user): AuthUser,
+    _user: AuthUser,
     State(state): State<AppState>,
     AxPath(id): AxPath<i64>,
     Query(q): Query<Caps>,
@@ -508,7 +508,10 @@ pub async fn decision(
     let file = load_file(&state, id).await?;
     // Never hand back a play URL for a file that isn't on disk — the client
     // would open a player that can never load (the unmounted-share case).
-    if tokio::fs::metadata(&file.path).await.is_err() {
+    // Cached briefly: on a cold NAS this stat is remote I/O sitting between
+    // the click and the answer, for a fact that rarely changes. Presence is
+    // cached, absence never is, and the open that follows stays authoritative.
+    if !state.availability.is_present(id, &file.path).await {
         return Err(ApiError::Conflict(
             "this media file is missing on the server — its library path may be \
              unmounted, moved, or renamed"
@@ -549,20 +552,10 @@ pub async fn decision(
         s.default = selection.subtitle_index == Some(s.index);
     }
 
-    // Tell Trakt "watching now" (fire-and-forget), resuming at the known spot.
-    let start_pct = state
-        .store
-        .watch_state(user.id, file.item_id)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|w| {
-            w.duration_ms
-                .filter(|d| *d > 0)
-                .map(|d| (w.position_ms as f64 / d as f64 * 100.0).clamp(0.0, 100.0))
-        })
-        .unwrap_or(0.0);
-    state.trakt.on_start(user.id, file.item_id, start_pct);
+    // No "watching now" from here. Deciding how a file would be delivered is
+    // not watching it: a stream that never started had still announced itself
+    // to Trakt, and a third-party call belongs nowhere near the click path.
+    // The media endpoints announce it once delivery is actually happening.
 
     Ok(Json(DecisionResponse {
         file_id: id,
@@ -678,13 +671,21 @@ pub async fn subtitles_vtt(
 
 /// GET /api/v1/files/:id/direct — raw file with HTTP range support.
 pub async fn direct(
-    _user: AuthUser,
+    AuthUser(user): AuthUser,
     State(state): State<AppState>,
     AxPath(id): AxPath<i64>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let file = load_file(&state, id).await?;
-    serve_file_range(&file.path, &headers).await
+    let served = serve_file_range(&file.path, &headers).await;
+    match &served {
+        // Bytes are going out: this is the moment playback is real.
+        Ok(_) => crate::playstart::note_playback_started(&state, user.id, id),
+        // The open failed, so whatever the availability cache believes is
+        // wrong — the unmounted-share case, arriving as it actually arrives.
+        Err(_) => state.availability.forget(id),
+    }
+    served
 }
 
 // The caps fields are inlined (not `#[serde(flatten)]`ed) because axum's
@@ -724,12 +725,13 @@ impl StreamQuery {
 
 /// GET /api/v1/files/:id/stream.mp4 — fragmented-MP4 remux, optional start.
 pub async fn stream_mp4(
-    _user: AuthUser,
+    AuthUser(user): AuthUser,
     State(state): State<AppState>,
     AxPath(id): AxPath<i64>,
     Query(q): Query<StreamQuery>,
 ) -> Result<Response, ApiError> {
     let file = load_file(&state, id).await?;
+    crate::playstart::note_playback_started(&state, user.id, id);
     let decision = q.caps().decide(&file);
     let audio = q.audio.unwrap_or(0).max(0);
     // Copy HEVC gets an `hvc1` tag so Safari's <video> accepts the fMP4 (an

@@ -1,6 +1,7 @@
 mod ffmpeg;
 mod http;
 mod logbuf;
+mod playstart;
 mod schedule;
 mod state;
 mod trakt;

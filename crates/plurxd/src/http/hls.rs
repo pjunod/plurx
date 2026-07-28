@@ -106,6 +106,9 @@ pub async fn create(
         return Err(ApiError::BadRequest("playback_id is required".into()));
     }
     let request = req.into_request(id);
+    // A session being created is playback beginning — the honest moment for
+    // the scrobble that used to fire from `/decision`.
+    crate::playstart::note_playback_started(&state, user.id, id);
     let info = state
         .transcode
         .create_session(&request, &user.username)

@@ -52,6 +52,10 @@ pub struct AppState {
     pub coming_soon: Arc<crate::http::ComingSoonCache>,
     /// Pushes watch state to monarr when enabled (plan §11.1).
     pub watched: Arc<crate::watched::WatchedNotifier>,
+    /// Keeps the click path off the NAS, and announces a start once playback
+    /// is real rather than once a decision has been made.
+    pub availability: Arc<crate::playstart::AvailabilityCache>,
+    pub starts: Arc<crate::playstart::StartNotifier>,
     pub started_at: Instant,
 }
 
@@ -90,6 +94,8 @@ impl AppState {
             logs,
             coming_soon,
             watched,
+            availability: Arc::new(crate::playstart::AvailabilityCache::new()),
+            starts: Arc::new(crate::playstart::StartNotifier::new()),
             started_at: Instant::now(),
         }
     }
