@@ -6,7 +6,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use plurx_core::domain::{LibraryKind, MetadataPatch};
+use plurx_core::domain::{Library, LibraryKind, MetadataPatch};
+use plurx_core::error::StoreError;
 use plurx_core::metadata::local::LocalArtReport;
 use plurx_core::metadata::{self, AniListClient, EnrichReport, TmdbClient};
 use plurx_core::scan::{self, PlacedFile, ScanProgress, ScanReport, TargetError, TargetedScan};
@@ -161,6 +162,19 @@ pub struct ScanStatus {
     pub started_at: Option<i64>,
     pub finished_at: Option<i64>,
     pub error: Option<String>,
+}
+
+/// What one enrichment pass produced. Exactly the two status fields a scan
+/// records, so the single enrichment path can hand them back to a caller that
+/// keeps a `ScanStatus` (the full scan) and to one that does not (a targeted
+/// scan, the retry sweep, a per-item refresh) without either learning which
+/// kind of provider ran.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct EnrichOutcome {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enrich: Option<EnrichReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_art: Option<LocalArtReport>,
 }
 
 /// Point-in-time view of a running scan's counters.
@@ -553,7 +567,142 @@ impl JobManager {
         );
         let out = scan::scan_path(self.store.as_ref(), &library, &req.path).await?;
         self.apply_ids(req, &out.items).await;
+
+        // The rows exist; without this they would have no artwork until
+        // somebody pressed Scan. Bounded to what this request placed (and the
+        // seasons/shows/folders above it) because monarr is holding the HTTP
+        // connection open on this call — enriching the whole library here
+        // would turn a per-episode import notification into a per-episode
+        // full-library metadata pass.
+        let placed: Vec<i64> = out.items.iter().map(|p| p.item_id).collect();
+        let targets = self.enrich_targets(&placed).await;
+        let outcome = self.enrich(&library, false, Some(&targets)).await;
+        tracing::info!(
+            target: "plurxd::integrate",
+            library = req.library_id,
+            items = targets.len(),
+            matched = outcome.enrich.map(|r| r.matched).unwrap_or(0),
+            correlation_id = req.correlation_id.as_deref().unwrap_or("-"),
+            "targeted scan enriched what it placed"
+        );
         Ok(out)
+    }
+
+    /// Which item ids a targeted scan should enrich, given what it placed.
+    ///
+    /// Not the placed ids alone: `scan_path` returns the rows that own the
+    /// *files*, which for a show are episodes — and episodes are not what
+    /// `items_needing_metadata` selects, so filtering on them would enrich
+    /// precisely nothing. The identity of an episode lives on its show, and a
+    /// home video's poster is what its folder inherits, so every ancestor
+    /// comes along too.
+    async fn enrich_targets(&self, item_ids: &[i64]) -> Vec<i64> {
+        let mut targets: Vec<i64> = Vec::new();
+        for id in item_ids {
+            let mut current = *id;
+            // Depth guard, not a shape assumption: library → show → season →
+            // episode is three levels, home folders can nest deeper, and a
+            // cycle in parent_id would otherwise hang the request.
+            for _ in 0..8 {
+                if !targets.contains(&current) {
+                    targets.push(current);
+                }
+                match self.store.get_item(current).await {
+                    Ok(Some(item)) => match item.parent_id {
+                        Some(parent) => current = parent,
+                        None => break,
+                    },
+                    // A row that vanished between the scan and here is not
+                    // worth failing the request over; it simply gets no
+                    // enrichment, exactly as if it had not been placed.
+                    _ => break,
+                }
+            }
+        }
+        targets
+    }
+
+    /// The one enrichment path. Both scans call it; neither has its own copy.
+    ///
+    /// It is a method rather than two blocks because it used to be two
+    /// blocks — or rather one, in `run_scan`, with `run_targeted` silently
+    /// having none. Peer-ingested items got a row and never got artwork, and
+    /// nothing about either function's shape said they were supposed to
+    /// agree. Now they physically cannot drift apart: there is one place that
+    /// knows a home library enriches locally, an anime library from AniList,
+    /// and everything else from TMDB, and adding a fourth kind is one edit.
+    ///
+    /// `force` re-fetches already-matched items; `only` narrows to specific
+    /// item ids (`None` = the whole library, the full scan's behaviour,
+    /// unchanged).
+    async fn enrich(&self, library: &Library, force: bool, only: Option<&[i64]>) -> EnrichOutcome {
+        let mut outcome = EnrichOutcome::default();
+        // Home libraries have no provider at all: their enrichment is local
+        // artwork (frame grabs and adopted sidecar images). Anime libraries
+        // enrich from AniList (no key needed); everything else from TMDB when
+        // a key is configured.
+        if library.kind == LibraryKind::Home {
+            outcome.local_art = Some(
+                metadata::local::enrich_home_library(
+                    self.store.as_ref(),
+                    &self.artwork_dir,
+                    library.id,
+                    force,
+                    only,
+                )
+                .await,
+            );
+        } else if library.anime {
+            let client = AniListClient::new();
+            outcome.enrich = Some(
+                metadata::enrich_anime_library(
+                    self.store.as_ref(),
+                    &client,
+                    &self.artwork_dir,
+                    library.id,
+                    force,
+                    only,
+                )
+                .await,
+            );
+        } else {
+            match self.store.get_setting(keys::TMDB_API_KEY).await {
+                Ok(Some(key)) if !key.is_empty() => {
+                    let tmdb = TmdbClient::new(key);
+                    outcome.enrich = Some(
+                        metadata::enrich_library(
+                            self.store.as_ref(),
+                            &tmdb,
+                            &self.artwork_dir,
+                            Some(library.id),
+                            force,
+                            only,
+                        )
+                        .await,
+                    );
+                }
+                Ok(_) => tracing::info!("no TMDB key configured; skipping enrichment"),
+                Err(e) => tracing::warn!(error = %e, "reading TMDB key"),
+            }
+        }
+        outcome
+    }
+
+    /// Re-fetch artwork for one item and its ancestors, ignoring every "we
+    /// already did this" marker. The per-item counterpart to a library
+    /// refresh, for when a poster is wrong or missing on exactly one thing.
+    pub async fn refresh_item_artwork(&self, item_id: i64) -> Result<EnrichOutcome, StoreError> {
+        let Some(item) = self.store.get_item(item_id).await? else {
+            return Ok(EnrichOutcome::default());
+        };
+        let Some(library) = self.store.get_library(item.library_id).await? else {
+            return Ok(EnrichOutcome::default());
+        };
+        // Ancestors for the same reason a targeted scan needs them: an
+        // episode's artwork is fetched through its show's season, so asking
+        // for the episode alone would ask for nothing.
+        let targets = self.enrich_targets(&[item_id]).await;
+        Ok(self.enrich(&library, true, Some(&targets)).await)
     }
 
     /// Apply caller-supplied ids to what the scan placed.
@@ -731,48 +880,12 @@ impl JobManager {
             }
         }
 
-        // Home libraries have no provider at all: their enrichment is local
-        // artwork (frame grabs and adopted sidecar images). Anime libraries
-        // enrich from AniList (no key needed); everything else from TMDB when
-        // a key is configured.
-        if library.kind == LibraryKind::Home {
-            let report = metadata::local::enrich_home_library(
-                self.store.as_ref(),
-                &self.artwork_dir,
-                library_id,
-                force_metadata,
-            )
-            .await;
-            status.last_local_art = Some(report);
-        } else if library.anime {
-            let client = AniListClient::new();
-            let report = metadata::enrich_anime_library(
-                self.store.as_ref(),
-                &client,
-                &self.artwork_dir,
-                library_id,
-                force_metadata,
-            )
-            .await;
-            status.last_enrich = Some(report);
-        } else {
-            match self.store.get_setting(keys::TMDB_API_KEY).await {
-                Ok(Some(key)) if !key.is_empty() => {
-                    let tmdb = TmdbClient::new(key);
-                    let report = metadata::enrich_library(
-                        self.store.as_ref(),
-                        &tmdb,
-                        &self.artwork_dir,
-                        Some(library_id),
-                        force_metadata,
-                    )
-                    .await;
-                    status.last_enrich = Some(report);
-                }
-                Ok(_) => tracing::info!("no TMDB key configured; skipping enrichment"),
-                Err(e) => tracing::warn!(error = %e, "reading TMDB key"),
-            }
-        }
+        // `None`: the whole library, which is what a full scan means. The
+        // provider-choosing lives in `enrich` so the targeted path cannot
+        // have a different idea of it.
+        let outcome = self.enrich(&library, force_metadata, None).await;
+        status.last_enrich = outcome.enrich;
+        status.last_local_art = outcome.local_art;
 
         status.running = false;
         status.finished_at = Some(now());
@@ -848,6 +961,18 @@ impl JobManager {
         let global = GlobalSchedule {
             probe_retry_mins: self.job_interval(keys::JOB_PROBE_RETRY_MINS).await,
             last_probe_retry: self.job_stamp(keys::JOB_LAST_PROBE_RETRY).await,
+            // The one job whose absent setting is not "off". A default of 0
+            // here would ship the exact bug this job exists to fix: every
+            // item whose poster download failed would sit there with a blank
+            // card until someone found a button to press, which is the state
+            // that made the job necessary in the first place.
+            artwork_retry_mins: self
+                .job_interval_or(
+                    keys::JOB_ARTWORK_RETRY_MINS,
+                    keys::ARTWORK_RETRY_DEFAULT_MINS,
+                )
+                .await,
+            last_artwork_retry: self.job_stamp(keys::JOB_LAST_ARTWORK_RETRY).await,
             transcode_cleanup_mins: self.job_interval(keys::JOB_TRANSCODE_CLEANUP_MINS).await,
             last_transcode_cleanup: self.job_stamp(keys::JOB_LAST_TRANSCODE_CLEANUP).await,
             cache_produce_mins: self.job_interval(keys::JOB_CACHE_PRODUCE_MINS).await,
@@ -880,6 +1005,10 @@ impl JobManager {
                             "scheduled re-probe finished"
                         );
                     }
+                }
+                DueJob::RetryArtwork => {
+                    self.stamp(keys::JOB_LAST_ARTWORK_RETRY).await;
+                    self.sweep_artwork().await?;
                 }
                 DueJob::CleanupTranscode => {
                     self.stamp(keys::JOB_LAST_TRANSCODE_CLEANUP).await;
@@ -1040,17 +1169,62 @@ impl JobManager {
         }
     }
 
+    /// Give every enriched item that still has no poster another go.
+    ///
+    /// The self-healing half of the artwork fix: §2 records *that* a download
+    /// failed, this is what comes back for it. Forced, because these items
+    /// already carry `metadata_at` and the ordinary queue would skip them
+    /// forever — which is precisely how they got here.
+    ///
+    /// Grouped by library because that is the unit that knows which provider
+    /// to ask. The per-item backoff, not this interval, is what stops a
+    /// permanently art-less item from being re-fetched every half hour.
+    pub async fn sweep_artwork(&self) -> Result<usize, plurx_core::error::StoreError> {
+        let items = self
+            .store
+            .items_missing_artwork(None, keys::ARTWORK_RETRY_BACKOFF_SECS)
+            .await?;
+        if items.is_empty() {
+            return Ok(0);
+        }
+        let mut by_library: HashMap<i64, Vec<i64>> = HashMap::new();
+        for item in &items {
+            by_library.entry(item.library_id).or_default().push(item.id);
+        }
+        let mut repaired = 0usize;
+        for (library_id, ids) in by_library {
+            let Ok(Some(library)) = self.store.get_library(library_id).await else {
+                continue;
+            };
+            let outcome = self.enrich(&library, true, Some(&ids)).await;
+            repaired += outcome.enrich.map(|r| r.matched).unwrap_or(0);
+        }
+        tracing::info!(
+            attempted = items.len(),
+            repaired,
+            "artwork retry sweep finished"
+        );
+        Ok(repaired)
+    }
+
     /// A minutes-interval setting; absent, blank or unparseable reads as off.
     /// Deliberately not an error: a hand-edited settings row should stop one
     /// job, not the server.
     async fn job_interval(&self, key: &str) -> i64 {
+        self.job_interval_or(key, 0).await
+    }
+
+    /// [`job_interval`](Self::job_interval) with a different reading of
+    /// "absent". A stored `0` still means off — an admin who turned a job off
+    /// must not have it turned back on by a default.
+    async fn job_interval_or(&self, key: &str, default_mins: i64) -> i64 {
         self.store
             .get_setting(key)
             .await
             .ok()
             .flatten()
             .and_then(|v| v.trim().parse::<i64>().ok())
-            .unwrap_or(0)
+            .unwrap_or(default_mins)
             .max(0)
     }
 
@@ -1087,5 +1261,137 @@ fn error_status(message: &str) -> ScanStatus {
         finished_at: Some(now()),
         error: Some(message.to_owned()),
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use plurx_core::domain::{ItemKind, NewItem, NewLibrary};
+    use plurx_core::store::{LibraryStore, MediaStore, SqliteStore};
+
+    fn manager(store: Arc<dyn Store>, artwork: &std::path::Path) -> Arc<JobManager> {
+        Arc::new(JobManager::new(store, artwork.to_path_buf()))
+    }
+
+    /// The bug this whole change exists for, in one test.
+    ///
+    /// monarr POSTs `/api/v1/scan` the moment an import finishes and waits for
+    /// the answer. Before this, the handler placed the row and stopped — no
+    /// enrichment, no artwork — and the item sat with a blank card until
+    /// somebody pressed Scan on the whole library. A home library is the
+    /// provider-free way to prove it: its enrichment adopts the picture
+    /// already sitting next to the file, so the assertion is about *whether
+    /// enrichment ran at all*, not about anyone's network.
+    #[tokio::test]
+    async fn a_targeted_scan_enriches_what_it_placed() {
+        let store = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let media = tempfile::tempdir().expect("media");
+        let artwork = tempfile::tempdir().expect("artwork");
+        std::fs::create_dir_all(media.path().join("Holiday")).expect("mkdir");
+        std::fs::write(media.path().join("Holiday/clip.mp4"), b"not really video").expect("clip");
+        std::fs::write(media.path().join("Holiday/clip-thumb.jpg"), b"jpeg-ish").expect("thumb");
+
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "Home".into(),
+                kind: LibraryKind::Home,
+                paths: vec![media.path().to_path_buf()],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+
+        let jobs = manager(store.clone(), artwork.path());
+        let scan = jobs
+            .request_scan(ScanRequest {
+                id: "req-1".into(),
+                library_id: lib.id,
+                path: media.path().join("Holiday"),
+                ids: None,
+                correlation_id: None,
+                source: Some("monarr".into()),
+            })
+            .await
+            .expect("scan ran")
+            .expect("not queued");
+        assert_eq!(scan.items.len(), 1, "the clip was placed");
+
+        let clip = store
+            .get_item(scan.items[0].item_id)
+            .await
+            .expect("get")
+            .expect("item");
+        assert!(
+            clip.poster_path.is_some(),
+            "a peer-ingested item must come out of the targeted scan with \
+             artwork; before the fix this was None and stayed None"
+        );
+
+        // And the folder above it inherited that poster — which only happens
+        // if the ancestors were enriched too, not just the placed row.
+        let folder = store
+            .get_item(clip.parent_id.expect("parent"))
+            .await
+            .expect("get")
+            .expect("folder");
+        assert_eq!(folder.kind, ItemKind::Folder);
+        assert!(folder.poster_path.is_some());
+    }
+
+    /// `scan_path` hands back the rows that own the *files* — episodes, not
+    /// shows. Enriching those ids alone would enrich nothing, because a show
+    /// is what the provider is asked about.
+    #[tokio::test]
+    async fn enrich_targets_walks_up_to_the_show() {
+        let store = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let artwork = tempfile::tempdir().expect("artwork");
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "Shows".into(),
+                kind: LibraryKind::Shows,
+                paths: vec![],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+        let new = |kind: ItemKind, parent: Option<i64>, title: &str| {
+            let store = store.clone();
+            let item = NewItem {
+                library_id: lib.id,
+                kind,
+                parent_id: parent,
+                title: title.into(),
+                year: None,
+                season_number: None,
+                episode_number: None,
+            };
+            async move { store.insert_item(&item).await.expect("insert") }
+        };
+        let show = new(ItemKind::Show, None, "Severance").await;
+        let season = new(ItemKind::Season, Some(show), "S1").await;
+        let episode = new(ItemKind::Episode, Some(season), "E1").await;
+
+        let jobs = manager(store.clone(), artwork.path());
+        let targets = jobs.enrich_targets(&[episode]).await;
+        assert!(targets.contains(&show), "the identity lives on the show");
+        assert!(targets.contains(&season));
+        assert!(targets.contains(&episode));
+
+        // Two episodes of the same show contribute the show once, not twice —
+        // a season import must not enrich the show ten times over.
+        let episode2 = new(ItemKind::Episode, Some(season), "E2").await;
+        let targets = jobs.enrich_targets(&[episode, episode2]).await;
+        assert_eq!(targets.iter().filter(|id| **id == show).count(), 1);
+    }
+
+    /// The sweep with nothing to sweep must not invent work — and must not
+    /// need a provider key to say so.
+    #[tokio::test]
+    async fn the_artwork_sweep_is_a_no_op_on_a_healthy_library() {
+        let store = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let artwork = tempfile::tempdir().expect("artwork");
+        let jobs = manager(store.clone(), artwork.path());
+        assert_eq!(jobs.sweep_artwork().await.expect("sweep"), 0);
     }
 }

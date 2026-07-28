@@ -359,17 +359,37 @@ const MIGRATIONS: &[&str] = &[
     -- Eviction reads this: complete copies on this node, coldest first.
     CREATE INDEX transcode_cache_lru
         ON transcode_cache_locations(node_id, complete, last_used_at);",
+    // v12: "was artwork ever actually fetched for this item, and what
+    // happened?" — the fact that `poster_path IS NULL` could not express.
+    //
+    // The enrichment queue (`items_needing_metadata`) keys on `metadata_at`,
+    // NOT on `poster_path`, and `metadata_at` was stamped whenever a provider
+    // answered — including when the *poster download* inside that answer
+    // failed. One 429 or one dropped connection therefore marked the item
+    // permanently done with a null poster, and nothing in the schema could
+    // tell that apart from "TMDB genuinely has no image for this". Both are
+    // a null column; only one is worth retrying.
+    //
+    // Not backfilled: every existing null-poster item is left with a null
+    // attempt stamp, which the retry sweep reads as "never tried" and picks
+    // up on its next pass. That is deliberate — draining the backlog an
+    // upgrade inherits is the point of shipping this.
+    "ALTER TABLE items ADD COLUMN artwork_attempted_at INTEGER;
+    ALTER TABLE items ADD COLUMN artwork_error TEXT;
+    CREATE INDEX idx_items_missing_artwork ON items(artwork_attempted_at)
+        WHERE poster_path IS NULL;",
 ];
 
 /// Column list matching [`item_from_row`]. Prefix with a table alias via
 /// [`item_cols`].
 const ITEM_COLS: &str = "id, library_id, kind, parent_id, title, sort_title, year, overview, \
      tmdb_id, imdb_id, season_number, episode_number, air_date, runtime_ms, \
-     poster_path, backdrop_path, added_at, updated_at, recorded_at, tags, nfo_seeded_at";
+     poster_path, backdrop_path, added_at, updated_at, recorded_at, tags, nfo_seeded_at, \
+     artwork_attempted_at, artwork_error";
 
 /// How many columns [`ITEM_COLS`] selects — the offset of the first column a
 /// query appends after it. Keep in step with [`ITEM_COLS`].
-const ITEM_COL_COUNT: usize = 21;
+const ITEM_COL_COUNT: usize = 23;
 
 /// `ITEM_COLS` qualified with a table alias (e.g. `i.id, i.library_id, ...`).
 fn item_cols(alias: &str) -> String {
@@ -417,6 +437,8 @@ fn item_from_row(row: &Row<'_>, base: usize) -> rusqlite::Result<Item> {
         tags: serde_json::from_str(&tags_json)
             .map_err(|e| conversion_err(base + 19, format!("tags: {e}")))?,
         nfo_seeded_at: row.get(base + 20)?,
+        artwork_attempted_at: row.get(base + 21)?,
+        artwork_error: row.get(base + 22)?,
     })
 }
 
@@ -763,7 +785,7 @@ mod tests {
 
         let store = SqliteStore::open(&db).expect("migrate");
         let needing = store
-            .items_needing_metadata(None, false)
+            .items_needing_metadata(None, false, None)
             .await
             .expect("needing");
         assert_eq!(
@@ -804,7 +826,7 @@ mod tests {
             .expect("version");
         assert_eq!(version, MIGRATIONS.len() as i64);
         assert_eq!(
-            version, 11,
+            version, 12,
             "a new migration must be a deliberate bump, not a surprise — \
              the list is append-only and every entry is one somebody shipped"
         );

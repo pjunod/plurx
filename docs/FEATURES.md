@@ -63,11 +63,24 @@ anime.
   not swallowed. The scan result publishes *before* enrichment so counts and
   problems appear immediately.
 - **Refresh art:** re-fetch all metadata and artwork for a library, including
-  backfilling season posters onto shows scanned before a poster existed.
-- **Scheduled jobs**, all off by default. Per library: a **scan** interval and a
-  **refresh art** interval (Settings → Libraries). Server-wide: **retry
-  unreadable files** and **clean transcode cache**. Intervals are minutes with a
-  floor of 15 · a refresh beats a scan when both fall due · runs are stamped on
+  backfilling season posters onto shows scanned before a poster existed — or for
+  **one item**, from a **⟳ Refresh artwork** button on its page
+  (`POST /api/v1/items/:id/refresh-artwork`, admin). Forced either way: an item
+  that already has a poster is fetched again, since "the poster is wrong" is the
+  reason someone presses it.
+- **Self-healing artwork.** A poster download that fails leaves nothing on disk
+  for a rescan to notice, and the enrichment queue keys on *has a provider
+  answered*, not on *is there a picture* — so one rate limit used to mean a blank
+  card forever. Every attempt is now recorded with its reason, and a sweep
+  re-fetches anything matched but pictureless, on a per-item daily backoff so a
+  film TMDB genuinely has no art for costs one request a day. TMDB calls
+  themselves retry a 429 or a 5xx (honouring `Retry-After`); a 404 stays a fast
+  permanent no.
+- **Scheduled jobs**, off by default except the artwork retry. Per library: a
+  **scan** interval and a **refresh art** interval (Settings → Libraries).
+  Server-wide: **retry unreadable files**, **retry missing artwork** (every 30
+  minutes unless turned off), and **clean transcode cache**. Intervals are
+  minutes with a floor of 15 · a refresh beats a scan when both fall due · runs are stamped on
   completion, on the library row, so neither a slow scan nor a nightly reboot can
   put the schedule into a spin. **Scan at startup** covers what an interval
   can't: files that landed while the server was switched off.

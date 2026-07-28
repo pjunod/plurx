@@ -10,8 +10,8 @@ use super::{
     file_from_row, item_cols, item_from_row, SqliteStore, FILE_COLS, ITEM_COLS, ITEM_COL_COUNT,
 };
 use crate::domain::{
-    sort_title_for, Item, ItemEdit, ItemKind, ItemPage, ItemSort, MediaFile, MetadataPatch,
-    NewItem, ProbeResult, RecentItem,
+    sort_title_for, ArtworkAttempt, Item, ItemEdit, ItemKind, ItemPage, ItemSort, MediaFile,
+    MetadataPatch, NewItem, ProbeResult, RecentItem,
 };
 use crate::error::StoreError;
 use crate::store::MediaStore;
@@ -51,6 +51,28 @@ fn find_by(
 ) -> rusqlite::Result<Option<Item>> {
     conn.query_row(sql, params, |row| item_from_row(row, 0))
         .optional()
+}
+
+/// An ` AND <column> IN (…)` fragment for an optional id narrowing.
+///
+/// `None` in gives an empty string out, so an unnarrowed query is the
+/// original SQL character for character — the whole-library path must not
+/// change shape because a targeted path wanted a filter. `Some(&[])` gives
+/// `None` out, meaning "the caller asked for zero items": the caller returns
+/// early rather than running a query that would match everything.
+///
+/// Inline rather than bound, like `child_counts`: these are our own row ids,
+/// i64s that came out of this database, and a bound IN-list needs a
+/// statement per arity.
+fn id_filter(column: &str, only: Option<&[i64]>) -> Option<String> {
+    match only {
+        None => Some(String::new()),
+        Some([]) => None,
+        Some(ids) => {
+            let list = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+            Some(format!(" AND {column} IN ({list})"))
+        }
+    }
 }
 
 #[async_trait]
@@ -396,6 +418,15 @@ impl MediaStore for SqliteStore {
                      -- that does not claim to be enrichment (caller-supplied
                      -- ids, a Trakt backfill) must not un-mark the item.
                      metadata_at = CASE WHEN ?14 = 1 THEN unixepoch() ELSE metadata_at END,
+                     -- Only a patch that actually tried to fetch artwork
+                     -- speaks for these two. Everything else — a Trakt
+                     -- backfill, a caller-supplied id — leaves the record of
+                     -- the last attempt intact, so the retry sweep keeps its
+                     -- backoff instead of being reset to zero by traffic that
+                     -- has nothing to do with images.
+                     artwork_attempted_at =
+                         CASE WHEN ?15 = 1 THEN unixepoch() ELSE artwork_attempted_at END,
+                     artwork_error = CASE WHEN ?15 = 1 THEN ?16 ELSE artwork_error END,
                      updated_at = unixepoch()
                  WHERE id = ?1",
                 params![
@@ -413,6 +444,11 @@ impl MediaStore for SqliteStore {
                     patch.recorded_at,
                     tags,
                     patch.enriched as i64,
+                    patch.artwork.is_some() as i64,
+                    match &patch.artwork {
+                        Some(ArtworkAttempt::Failed(why)) => Some(why.as_str()),
+                        _ => None,
+                    },
                 ],
             )?;
             Ok(())
@@ -486,14 +522,18 @@ impl MediaStore for SqliteStore {
         &self,
         library_id: i64,
         force: bool,
+        only: Option<&[i64]>,
     ) -> Result<Vec<Item>, StoreError> {
+        let Some(narrow) = id_filter("id", only) else {
+            return Ok(Vec::new());
+        };
         self.with_conn(move |conn| {
             // Folders last: a folder inherits its first child's poster, so the
             // children have to be thumbed first.
             let mut stmt = conn.prepare(&format!(
                 "SELECT {ITEM_COLS} FROM items
                  WHERE library_id = ?1 AND kind IN ('folder','video','photo')
-                   AND (?2 = 1 OR poster_path IS NULL)
+                   AND (?2 = 1 OR poster_path IS NULL){narrow}
                  ORDER BY (kind = 'folder'), id"
             ))?;
             let items = stmt
@@ -510,7 +550,11 @@ impl MediaStore for SqliteStore {
         &self,
         library_id: Option<i64>,
         force: bool,
+        only: Option<&[i64]>,
     ) -> Result<Vec<Item>, StoreError> {
+        let Some(narrow) = id_filter("i.id", only) else {
+            return Ok(Vec::new());
+        };
         self.with_conn(move |conn| {
             // Home libraries never see a provider: there is nothing to match
             // "Christmas 2019.mp4" against, and a false match would be worse
@@ -519,12 +563,52 @@ impl MediaStore for SqliteStore {
                 "SELECT {i} FROM items i
                  JOIN libraries l ON l.id = i.library_id AND l.kind != 'home'
                  WHERE i.kind IN ('movie','show') AND (?2 = 1 OR i.metadata_at IS NULL)
-                   AND (?1 IS NULL OR i.library_id = ?1)
+                   AND (?1 IS NULL OR i.library_id = ?1){narrow}
                  ORDER BY i.id",
                 i = item_cols("i")
             ))?;
             let items = stmt
                 .query_map(params![library_id, force as i64], |row| {
+                    item_from_row(row, 0)
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(items)
+        })
+        .await
+    }
+
+    async fn items_missing_artwork(
+        &self,
+        library_id: Option<i64>,
+        retry_after_secs: i64,
+    ) -> Result<Vec<Item>, StoreError> {
+        self.with_conn(move |conn| {
+            // `metadata_at IS NOT NULL` is what makes this "the provider was
+            // asked and the poster still isn't here" rather than "this item
+            // has not been enriched yet" — the latter is the ordinary scan's
+            // job and re-doing it here would race it.
+            //
+            // Only movies and shows: those are the kinds `enrich_library`
+            // acts on, and selecting anything else would hand the sweep work
+            // it cannot do, forever, with no attempt stamp written to make it
+            // stop. Home libraries are absent for free (they never stamp
+            // `metadata_at`) and need nothing here anyway — their artwork
+            // query already keys on `poster_path IS NULL`, which is the
+            // correct-by-construction version of the bug this repairs.
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {i} FROM items i
+                 JOIN libraries l ON l.id = i.library_id AND l.kind != 'home'
+                 WHERE i.kind IN ('movie','show')
+                   AND i.poster_path IS NULL
+                   AND i.metadata_at IS NOT NULL
+                   AND (i.artwork_attempted_at IS NULL
+                        OR i.artwork_attempted_at <= unixepoch() - ?2)
+                   AND (?1 IS NULL OR i.library_id = ?1)
+                 ORDER BY i.artwork_attempted_at IS NOT NULL, i.artwork_attempted_at, i.id",
+                i = item_cols("i")
+            ))?;
+            let items = stmt
+                .query_map(params![library_id, retry_after_secs.max(0)], |row| {
                     item_from_row(row, 0)
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -861,8 +945,8 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::domain::{
-        AudioStream, ItemKind, ItemSort, LibraryKind, MetadataPatch, NewItem, NewLibrary,
-        ProbeResult,
+        ArtworkAttempt, AudioStream, ItemKind, ItemSort, LibraryKind, MetadataPatch, NewItem,
+        NewLibrary, ProbeResult,
     };
     use crate::store::{LibraryStore, MediaStore, SqliteStore};
 
@@ -1310,7 +1394,7 @@ mod tests {
 
         assert_eq!(
             store
-                .items_needing_metadata(None, false)
+                .items_needing_metadata(None, false, None)
                 .await
                 .expect("needing")
                 .len(),
@@ -1332,7 +1416,7 @@ mod tests {
             .expect("ids only");
         assert_eq!(
             store
-                .items_needing_metadata(None, false)
+                .items_needing_metadata(None, false, None)
                 .await
                 .expect("needing")
                 .len(),
@@ -1354,7 +1438,7 @@ mod tests {
             .await
             .expect("patch");
         assert!(store
-            .items_needing_metadata(None, false)
+            .items_needing_metadata(None, false, None)
             .await
             .expect("needing")
             .is_empty());
@@ -1372,7 +1456,7 @@ mod tests {
             .await
             .expect("later patch");
         assert!(store
-            .items_needing_metadata(None, false)
+            .items_needing_metadata(None, false, None)
             .await
             .expect("needing")
             .is_empty());
@@ -1381,7 +1465,7 @@ mod tests {
         // season posters onto shows enriched before that existed).
         assert_eq!(
             store
-                .items_needing_metadata(None, true)
+                .items_needing_metadata(None, true, None)
                 .await
                 .expect("forced")
                 .len(),
@@ -1401,5 +1485,169 @@ mod tests {
             .await
             .expect("s")
             .is_empty());
+    }
+
+    /// The narrowing a targeted scan runs on. `None` must keep the query
+    /// exactly as it was — the whole-library path is not allowed to change
+    /// because a second caller wanted a filter.
+    #[tokio::test]
+    async fn items_needing_metadata_narrows_to_the_ids_asked_for() {
+        let store = SqliteStore::open_in_memory().expect("open");
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "Movies".into(),
+                kind: LibraryKind::Movies,
+                paths: vec![],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+        let a = seed_movie(&store, lib.id, "Alien", 1979).await;
+        let b = seed_movie(&store, lib.id, "Aliens", 1986).await;
+
+        let all = store
+            .items_needing_metadata(None, false, None)
+            .await
+            .expect("all");
+        assert_eq!(all.len(), 2, "no filter is every candidate, as before");
+
+        let one = store
+            .items_needing_metadata(None, false, Some(&[a]))
+            .await
+            .expect("one");
+        assert_eq!(one.iter().map(|i| i.id).collect::<Vec<_>>(), [a]);
+
+        let both = store
+            .items_needing_metadata(None, false, Some(&[a, b]))
+            .await
+            .expect("both");
+        assert_eq!(both.len(), 2);
+
+        // "These zero items" is not "every item" — the difference between a
+        // scan that placed nothing and a scan that placed the library.
+        assert!(store
+            .items_needing_metadata(None, false, Some(&[]))
+            .await
+            .expect("none")
+            .is_empty());
+    }
+
+    /// The retry sweep's input. The case that matters is the third one: an
+    /// item attempted moments ago must be left alone, or a permanently
+    /// art-less film is re-fetched on every cycle forever.
+    #[tokio::test]
+    async fn items_missing_artwork_finds_enriched_items_with_no_poster() {
+        let store = SqliteStore::open_in_memory().expect("open");
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "Movies".into(),
+                kind: LibraryKind::Movies,
+                paths: vec![],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+        let blank = seed_movie(&store, lib.id, "Solaris", 1972).await;
+        let posted = seed_movie(&store, lib.id, "Stalker", 1979).await;
+        let unenriched = seed_movie(&store, lib.id, "Mirror", 1975).await;
+
+        // Enriched, poster download failed: exactly the state one TMDB blip
+        // used to leave behind, silently and permanently.
+        store
+            .apply_metadata(
+                blank,
+                &MetadataPatch {
+                    title: Some("Solaris".into()),
+                    enriched: true,
+                    artwork: Some(ArtworkAttempt::Failed("download: status 429".into())),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("blank");
+        store
+            .apply_metadata(
+                posted,
+                &MetadataPatch {
+                    title: Some("Stalker".into()),
+                    poster_path: Some("2-poster.jpg".into()),
+                    enriched: true,
+                    artwork: Some(ArtworkAttempt::Stored),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("posted");
+
+        // No backoff: the one item that was matched and has no picture.
+        let due = store
+            .items_missing_artwork(None, 0)
+            .await
+            .expect("missing artwork");
+        assert_eq!(
+            due.iter().map(|i| i.id).collect::<Vec<_>>(),
+            [blank],
+            "an item with a poster is done, and an item nobody has enriched \
+             yet belongs to the scan, not to the sweep"
+        );
+        assert_eq!(
+            due[0].artwork_error.as_deref(),
+            Some("download: status 429"),
+            "the reason survives, so an operator can tell a rate limit from a 404"
+        );
+        assert!(due[0].artwork_attempted_at.is_some());
+        assert!(store.get_item(unenriched).await.expect("get").is_some());
+
+        // With a backoff, the same item is skipped — it was attempted a
+        // moment ago, and the point of recording that was to be able to wait.
+        assert!(store
+            .items_missing_artwork(None, 3600)
+            .await
+            .expect("backoff")
+            .is_empty());
+    }
+
+    /// A patch that is not about artwork must not disturb the attempt record.
+    /// A Trakt backfill landing between sweeps would otherwise reset the
+    /// backoff and turn the daily retry into a per-write retry.
+    #[tokio::test]
+    async fn an_unrelated_patch_leaves_the_artwork_attempt_alone() {
+        let store = SqliteStore::open_in_memory().expect("open");
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "Movies".into(),
+                kind: LibraryKind::Movies,
+                paths: vec![],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+        let id = seed_movie(&store, lib.id, "Stalker", 1979).await;
+        store
+            .apply_metadata(
+                id,
+                &MetadataPatch {
+                    enriched: true,
+                    artwork: Some(ArtworkAttempt::Failed("download: status 500".into())),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("attempt");
+        let before = store.get_item(id).await.expect("get").expect("item");
+
+        store
+            .apply_metadata(
+                id,
+                &MetadataPatch {
+                    imdb_id: Some("tt0079944".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("unrelated");
+        let after = store.get_item(id).await.expect("get").expect("item");
+        assert_eq!(after.artwork_attempted_at, before.artwork_attempted_at);
+        assert_eq!(after.artwork_error.as_deref(), Some("download: status 500"));
     }
 }

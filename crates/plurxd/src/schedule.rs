@@ -9,7 +9,9 @@
 //!
 //! Intervals are minutes and `0` means off, everywhere. Off is the default for
 //! every job, so upgrading a server changes nothing about what it does at 3am
-//! until someone asks for it.
+//! until someone asks for it — with one deliberate exception, the artwork
+//! retry, whose default and reasons live with the setting itself
+//! (`plurx_core::store::keys::ARTWORK_RETRY_DEFAULT_MINS`).
 
 use plurx_core::domain::Library;
 
@@ -22,6 +24,11 @@ pub enum DueJob {
     Refresh(i64),
     /// Re-probe files whose media details were never read (server-wide).
     RetryProbes,
+    /// Re-fetch artwork for enriched items that still have no poster
+    /// (server-wide). The sibling of [`RetryProbes`](DueJob::RetryProbes): a
+    /// download that failed leaves nothing on disk for a rescan to notice, so
+    /// without a job that goes looking, nothing ever tries again.
+    RetryArtwork,
     /// Delete transcode working directories no live session owns.
     CleanupTranscode,
     /// Pre-transcode what somebody is likely to play next (PERF-PLAN §6.2).
@@ -34,6 +41,8 @@ pub enum DueJob {
 pub struct GlobalSchedule {
     pub probe_retry_mins: i64,
     pub last_probe_retry: Option<i64>,
+    pub artwork_retry_mins: i64,
+    pub last_artwork_retry: Option<i64>,
     pub transcode_cleanup_mins: i64,
     pub last_transcode_cleanup: Option<i64>,
     pub cache_produce_mins: i64,
@@ -74,6 +83,9 @@ pub fn due_jobs(now: i64, libraries: &[Library], global: GlobalSchedule) -> Vec<
     }
     if due(now, global.last_probe_retry, global.probe_retry_mins) {
         jobs.push(DueJob::RetryProbes);
+    }
+    if due(now, global.last_artwork_retry, global.artwork_retry_mins) {
+        jobs.push(DueJob::RetryArtwork);
     }
     if due(
         now,
@@ -230,5 +242,34 @@ mod tests {
             due_jobs(NOW, &libs, GlobalSchedule::default()),
             [DueJob::Scan(1)]
         );
+    }
+
+    /// The artwork retry runs on the default interval — the point of it being
+    /// the one job that is on by default is that a server nobody has
+    /// configured drains its own backlog of blank posters.
+    #[test]
+    fn the_artwork_retry_runs_on_its_default_interval() {
+        let global = GlobalSchedule {
+            artwork_retry_mins: plurx_core::store::keys::ARTWORK_RETRY_DEFAULT_MINS,
+            last_artwork_retry: None,
+            ..GlobalSchedule::default()
+        };
+        assert_eq!(due_jobs(NOW, &[], global), [DueJob::RetryArtwork]);
+
+        // Half an hour is the interval, so 29 minutes ago is not yet.
+        let global = GlobalSchedule {
+            artwork_retry_mins: 30,
+            last_artwork_retry: Some(NOW - 29 * 60),
+            ..GlobalSchedule::default()
+        };
+        assert!(due_jobs(NOW, &[], global).is_empty());
+
+        // And an admin who turns it off keeps it off.
+        let global = GlobalSchedule {
+            artwork_retry_mins: 0,
+            last_artwork_retry: None,
+            ..GlobalSchedule::default()
+        };
+        assert!(due_jobs(NOW, &[], global).is_empty());
     }
 }

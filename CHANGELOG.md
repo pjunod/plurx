@@ -120,6 +120,32 @@ bump may break compatibility and a **patch** bump never does.
 
 ### Fixed
 
+- **An item imported by another application never got artwork.** monarr POSTs
+  `/api/v1/scan` the moment an import finishes; the handler placed the row and
+  stopped. Enrichment lived only in the *full* scan, so a peer-ingested episode
+  got a database row and a blank card, and stayed that way — the full scan that
+  would eventually have fixed it is off by default. Both scans now go through
+  one enrichment path, so they cannot drift apart again; the targeted one
+  enriches exactly the items it placed (and the seasons, shows and folders their
+  artwork is fetched through), because the caller is holding the connection open
+  and waiting.
+- **One transient TMDB failure marked an item permanently done.** The enrichment
+  queue keys on `metadata_at`, not on `poster_path`, and `metadata_at` was
+  stamped whenever the provider answered — including when the poster download
+  inside that answer failed. A single 429 therefore meant a null poster forever,
+  indistinguishable in the schema from "TMDB has no image for this". Attempts are
+  now recorded with their reason (`artwork_attempted_at`, `artwork_error`), a
+  half-hourly sweep re-fetches anything matched but pictureless, and each item
+  waits a day between attempts so a permanently art-less film costs one request,
+  not forty-eight. The sweep is **on by default** — a default of zero would ship
+  the bug it exists to fix — and drains the backlog an upgrade inherits with
+  nobody pressing anything.
+- **TMDB rate limits no longer eat the rest of a scan.** A 429 or a 5xx was
+  treated exactly like a 404: one attempt, permanent failure, artwork silently
+  lost for every item after it, run reported as a success. Both are now retried
+  with backoff, honouring `Retry-After`. A 404 is still a fast permanent no —
+  TMDB has answered, and asking three times is three times the load for the same
+  word.
 - The crammed `102` form is understood. DVD-era rips write season and episode
   as three digits — `drawn.together.102-med.avi` is S01E02 — and plurx skipped
   every one of them. It is tried only after `S01E02` and `1x02` fail, on a

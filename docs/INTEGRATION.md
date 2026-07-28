@@ -134,6 +134,15 @@ instead of leaving plurx to find it on the next scheduled sweep. One request
 per directory; a season pack that lands ten episodes in one folder is one
 thing that changed.
 
+The scan **enriches what it placed** before answering: the same provider pass a
+full scan runs, narrowed to the items this request produced and the seasons,
+shows and folders their artwork is fetched through. Narrowed because monarr is
+holding the connection open — a per-episode import notification must not become
+a per-episode full-library metadata pass. Anything whose poster still doesn't
+arrive is picked up later by the artwork retry sweep (Settings →
+**Scheduled maintenance**), so a TMDB rate limit during an import costs a delay
+rather than a permanently blank card.
+
 **Wire.** `POST /api/v1/scan`, carrying a key with scope `scan:trigger` as
 `Authorization: Bearer plx_…` — or `X-Api-Key: plx_…`, which plurx also
 accepts because it is the header every *arr application already uses. The

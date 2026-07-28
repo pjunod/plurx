@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 pub use anilist::AniListClient;
 pub use tmdb::TmdbClient;
 
-use crate::domain::{ItemKind, MetadataPatch};
+use crate::domain::{ArtworkAttempt, ItemKind, MetadataPatch};
 use crate::store::Store;
 
 /// Poster width bucket — small enough to be snappy in a grid, sharp on TV.
@@ -34,12 +34,17 @@ pub struct EnrichReport {
 /// Enrich every movie/show still lacking a TMDB id in the given library (or
 /// all libraries when `None`). Artwork is written under `artwork_dir`; the
 /// stored paths are relative filenames the API serves from that directory.
+///
+/// `only` restricts the pass to specific item ids — a targeted scan enriching
+/// what it just placed, or the retry sweep re-fetching one poster. `None` is
+/// the whole library, exactly as before.
 pub async fn enrich_library(
     store: &dyn Store,
     tmdb: &TmdbClient,
     artwork_dir: &Path,
     library_id: Option<i64>,
     force: bool,
+    only: Option<&[i64]>,
 ) -> EnrichReport {
     let mut report = EnrichReport::default();
     if let Err(e) = tokio::fs::create_dir_all(artwork_dir).await {
@@ -48,7 +53,7 @@ pub async fn enrich_library(
         return report;
     }
 
-    let items = match store.items_needing_metadata(library_id, force).await {
+    let items = match store.items_needing_metadata(library_id, force, only).await {
         Ok(items) => items,
         Err(e) => {
             tracing::error!(error = %e, "listing items needing metadata");
@@ -93,8 +98,15 @@ pub async fn enrich_library(
                         imdb_id: m.imdb_id,
                         air_date: m.air_date,
                         runtime_ms: m.runtime_ms,
-                        poster_path: poster,
-                        backdrop_path: backdrop,
+                        // `enriched: true` is still right — the provider DID
+                        // answer, and the title and ids it gave are worth
+                        // keeping. What used to be wrong was that this was the
+                        // only thing recorded: a poster that failed to download
+                        // left no trace at all, so the item read as finished.
+                        // `artwork` is that trace.
+                        artwork: poster.attempt.clone(),
+                        poster_path: poster.file,
+                        backdrop_path: backdrop.file,
                         enriched: true,
                         ..Default::default()
                     };
@@ -135,8 +147,9 @@ pub async fn enrich_library(
                         overview: m.overview,
                         tmdb_id: Some(m.tmdb_id),
                         air_date: m.air_date,
-                        poster_path: poster,
-                        backdrop_path: backdrop,
+                        artwork: poster.attempt.clone(),
+                        poster_path: poster.file,
+                        backdrop_path: backdrop.file,
                         enriched: true,
                         ..Default::default()
                     };
@@ -223,6 +236,7 @@ pub async fn enrich_anime_library(
     artwork_dir: &Path,
     library_id: i64,
     force: bool,
+    only: Option<&[i64]>,
 ) -> EnrichReport {
     let mut report = EnrichReport::default();
     if let Err(e) = tokio::fs::create_dir_all(artwork_dir).await {
@@ -230,7 +244,10 @@ pub async fn enrich_anime_library(
         report.errors += 1;
         return report;
     }
-    let items = match store.items_needing_metadata(Some(library_id), force).await {
+    let items = match store
+        .items_needing_metadata(Some(library_id), force, only)
+        .await
+    {
         Ok(items) => items,
         Err(e) => {
             tracing::error!(error = %e, "listing anime needing metadata");
@@ -265,8 +282,9 @@ pub async fn enrich_anime_library(
                     title: Some(m.title),
                     year: m.year,
                     overview: m.overview,
-                    poster_path: poster,
-                    backdrop_path: backdrop,
+                    artwork: poster.attempt.clone(),
+                    poster_path: poster.file,
+                    backdrop_path: backdrop.file,
                     // AniList never yields a TMDB id, so before `metadata_at`
                     // existed an anime show was re-matched on every single
                     // scan — the id-is-the-marker rule had no id to read.
@@ -300,22 +318,76 @@ async fn download_url(
     item_id: i64,
     kind: &str,
     url: Option<&str>,
-) -> Option<String> {
-    let url = url?;
+) -> Artwork {
+    let Some(url) = url else {
+        return Artwork::unavailable();
+    };
     let bytes = match client.download_image(url).await {
         Ok(b) => b,
         Err(e) => {
             tracing::warn!(item_id, kind, error = %e, "anime artwork download failed");
-            return None;
+            return Artwork::failed(format!("download: {e}"));
         }
     };
-    let filename = format!("{item_id}-{kind}.jpg");
-    let dest = artwork_dir.join(&filename);
-    if let Err(e) = tokio::fs::write(&dest, &bytes).await {
-        tracing::warn!(path = %dest.display(), error = %e, "writing anime artwork");
-        return None;
+    write_artwork(artwork_dir, item_id, kind, &bytes).await
+}
+
+/// One artwork slot after an attempt: the file to store, and the attempt to
+/// record. They are separate because the interesting case has a file of
+/// `None` and an attempt of `Failed` — which is precisely the state that used
+/// to be unrepresentable, and so went unrepaired.
+#[derive(Debug, Clone, Default)]
+struct Artwork {
+    file: Option<String>,
+    attempt: Option<ArtworkAttempt>,
+}
+
+impl Artwork {
+    /// We chose not to fetch (the item already has this image). Records
+    /// nothing: the attempt columns describe fetches, and a deliberate skip
+    /// would otherwise overwrite the record of the last real one.
+    fn skipped() -> Self {
+        Artwork::default()
     }
-    Some(filename)
+
+    /// The provider answered and named no image at all.
+    ///
+    /// Recorded as a failure, not as silence, and the distinction earns its
+    /// keep in the retry sweep: an item with no poster and no attempt stamp
+    /// is eligible on *every* cycle, so a film TMDB simply has no art for
+    /// would be re-fetched forever. Stamping it puts it on the same daily
+    /// backoff as everything else.
+    fn unavailable() -> Self {
+        Artwork::failed("the provider has no image for this".to_owned())
+    }
+
+    fn stored(filename: String) -> Self {
+        Artwork {
+            file: Some(filename),
+            attempt: Some(ArtworkAttempt::Stored),
+        }
+    }
+
+    fn failed(why: String) -> Self {
+        Artwork {
+            file: None,
+            attempt: Some(ArtworkAttempt::Failed(why)),
+        }
+    }
+}
+
+/// Write downloaded bytes into the artwork cache under the conventional name.
+async fn write_artwork(artwork_dir: &Path, item_id: i64, kind: &str, bytes: &[u8]) -> Artwork {
+    let filename = format!("{item_id}-{kind}.jpg");
+    let dest: PathBuf = artwork_dir.join(&filename);
+    if let Err(e) = tokio::fs::write(&dest, bytes).await {
+        tracing::warn!(path = %dest.display(), error = %e, "writing artwork");
+        // A full or read-only artwork directory is as much a reason to come
+        // back as a failed download, and from the item's side it is the same
+        // failure: the provider had an image and we do not.
+        return Artwork::failed(format!("write: {e}"));
+    }
+    Artwork::stored(filename)
 }
 
 /// Fetch each season once and patch this show's episodes by episode number.
@@ -377,7 +449,7 @@ async fn enrich_episodes(
                 )
                 .await
             } else {
-                None
+                Artwork::skipped()
             };
             let patch = MetadataPatch {
                 overview: remote
@@ -385,7 +457,8 @@ async fn enrich_episodes(
                     .clone()
                     .filter(|_| season_item.overview.is_none()),
                 air_date: remote.air_date.clone(),
-                poster_path: poster,
+                artwork: poster.attempt.clone(),
+                poster_path: poster.file,
                 ..Default::default()
             };
             if !patch.is_empty() {
@@ -414,7 +487,8 @@ async fn enrich_episodes(
                 overview: meta.overview.clone(),
                 air_date: meta.air_date.clone(),
                 runtime_ms: meta.runtime_ms,
-                poster_path: still,
+                artwork: still.attempt.clone(),
+                poster_path: still.file,
                 ..Default::default()
             };
             if apply(store, ep.id, patch, report).await {
@@ -440,8 +514,8 @@ async fn apply(
     }
 }
 
-/// Download and cache one image; returns the relative filename to store, or
-/// `None` if there was no source path or the download failed (non-fatal).
+/// Download and cache one image, reporting both the file and the attempt.
+/// Failures stay non-fatal — they are now merely recorded rather than lost.
 async fn cache_image(
     tmdb: &TmdbClient,
     artwork_dir: &Path,
@@ -449,22 +523,18 @@ async fn cache_image(
     kind: &str,
     tmdb_path: Option<&str>,
     size: &str,
-) -> Option<String> {
-    let tmdb_path = tmdb_path?;
+) -> Artwork {
+    let Some(tmdb_path) = tmdb_path else {
+        return Artwork::unavailable();
+    };
     let bytes = match tmdb.download_image(tmdb_path, size).await {
         Ok(b) => b,
         Err(e) => {
             tracing::warn!(item_id, kind, error = %e, "artwork download failed");
-            return None;
+            return Artwork::failed(format!("download: {e}"));
         }
     };
-    let filename = format!("{item_id}-{kind}.jpg");
-    let dest: PathBuf = artwork_dir.join(&filename);
-    if let Err(e) = tokio::fs::write(&dest, &bytes).await {
-        tracing::warn!(path = %dest.display(), error = %e, "writing artwork");
-        return None;
-    }
-    Some(filename)
+    write_artwork(artwork_dir, item_id, kind, &bytes).await
 }
 
 #[cfg(test)]
@@ -595,7 +665,7 @@ mod tests {
         let tmdb = TmdbClient::new("k").with_base(&base, &base);
         let art = tempfile::tempdir().expect("tmp");
 
-        let report = enrich_library(&store, &tmdb, art.path(), Some(lib.id), false).await;
+        let report = enrich_library(&store, &tmdb, art.path(), Some(lib.id), false, None).await;
         assert_eq!(report.matched, 2, "movie + show");
         assert_eq!(report.episodes_matched, 1);
         assert_eq!(report.errors, 0);
@@ -609,7 +679,7 @@ mod tests {
         assert_eq!(s.tmdb_id, Some(42));
 
         // A second run has nothing left needing metadata.
-        let again = enrich_library(&store, &tmdb, art.path(), Some(lib.id), false).await;
+        let again = enrich_library(&store, &tmdb, art.path(), Some(lib.id), false, None).await;
         assert_eq!(again.matched, 0);
     }
 
@@ -707,7 +777,7 @@ mod tests {
         let tmdb = TmdbClient::new("k").with_base(&base, &base);
         let art = tempfile::tempdir().expect("tmp");
 
-        let report = enrich_library(&store, &tmdb, art.path(), Some(lib), false).await;
+        let report = enrich_library(&store, &tmdb, art.path(), Some(lib), false, None).await;
         assert_eq!(report.matched, 1, "the id-carrying item was enriched");
         assert_eq!(report.errors, 0);
         assert_eq!(
@@ -726,7 +796,7 @@ mod tests {
         assert!(m.poster_path.is_some());
 
         // And now it is done: a second pass has nothing to do.
-        let again = enrich_library(&store, &tmdb, art.path(), Some(lib), false).await;
+        let again = enrich_library(&store, &tmdb, art.path(), Some(lib), false, None).await;
         assert_eq!(again.matched, 0);
         assert_eq!(searches.load(Ordering::SeqCst), 0);
     }
@@ -752,7 +822,7 @@ mod tests {
         let tmdb = TmdbClient::new("k").with_base(&base, &base);
         let art = tempfile::tempdir().expect("tmp");
 
-        let report = enrich_library(&store, &tmdb, art.path(), Some(lib), false).await;
+        let report = enrich_library(&store, &tmdb, art.path(), Some(lib), false, None).await;
         assert_eq!(report.matched, 1);
         assert_eq!(searches.load(Ordering::SeqCst), 0);
         let m = store.get_item(movie).await.expect("get").expect("item");
@@ -785,13 +855,13 @@ mod tests {
 
         // Not due normally — already enriched.
         assert_eq!(
-            enrich_library(&store, &tmdb, art.path(), Some(lib), false)
+            enrich_library(&store, &tmdb, art.path(), Some(lib), false, None)
                 .await
                 .matched,
             0
         );
         // Forced: fetched again, still by id.
-        let report = enrich_library(&store, &tmdb, art.path(), Some(lib), true).await;
+        let report = enrich_library(&store, &tmdb, art.path(), Some(lib), true, None).await;
         assert_eq!(report.matched, 1);
         assert_eq!(searches.load(Ordering::SeqCst), 0);
     }
@@ -807,7 +877,7 @@ mod tests {
         let tmdb = TmdbClient::new("k").with_base(&base, &base);
         let art = tempfile::tempdir().expect("tmp");
 
-        let report = enrich_library(&store, &tmdb, art.path(), Some(lib), false).await;
+        let report = enrich_library(&store, &tmdb, art.path(), Some(lib), false, None).await;
         assert_eq!(searches.load(Ordering::SeqCst), 1, "the search ran");
         assert_eq!(report.unmatched, 1);
         assert_eq!(report.errors, 0);
@@ -855,10 +925,166 @@ mod tests {
         let client = AniListClient::new().with_base(&base);
         let art = tempfile::tempdir().expect("tmp");
 
-        let report = enrich_anime_library(&store, &client, art.path(), lib.id, false).await;
+        let report = enrich_anime_library(&store, &client, art.path(), lib.id, false, None).await;
         assert_eq!(report.matched, 1);
         let s = store.get_item(show).await.expect("get").expect("item");
         assert_eq!(s.title, "Frieren");
         assert_eq!(s.year, Some(2023));
+    }
+
+    /// TMDB answers the search and then refuses every image, the way a rate
+    /// limit does halfway through a scan.
+    fn image_refusing_mock(status: axum::http::StatusCode) -> axum::Router {
+        use axum::routing::get;
+        use axum::Json;
+        axum::Router::new()
+            .route(
+                "/search/movie",
+                get(|| async {
+                    Json(json!({ "results": [
+                        { "id": 603, "title": "The Matrix", "release_date": "1999-03-30",
+                          "overview": "Truth.", "poster_path": "/mp.jpg" }
+                    ]}))
+                }),
+            )
+            .route(
+                "/movie/603",
+                get(|| async { Json(json!({ "runtime": 136 })) }),
+            )
+            .fallback(get(move || async move { status }))
+    }
+
+    /// The defect, stated as a test: an item whose poster download failed must
+    /// still be *findable*. It used to be indistinguishable from an item TMDB
+    /// has no art for — both were a null `poster_path` and a stamped
+    /// `metadata_at` — so one transient failure meant a blank card forever.
+    #[tokio::test]
+    async fn a_failed_poster_download_leaves_the_item_eligible_for_retry() {
+        let (store, lib, movie) = one_movie("matrix").await;
+        // 404 on the image CDN: not retried (that is `download_image`'s job to
+        // decide), so this is one clean failed attempt.
+        let base = serve(image_refusing_mock(axum::http::StatusCode::NOT_FOUND)).await;
+        let tmdb = TmdbClient::new("k").with_base(&base, &base);
+        let art = tempfile::tempdir().expect("tmp");
+
+        let report = enrich_library(&store, &tmdb, art.path(), Some(lib), false, None).await;
+        assert_eq!(report.matched, 1, "the metadata itself still landed");
+
+        let m = store.get_item(movie).await.expect("get").expect("item");
+        assert_eq!(m.title, "The Matrix");
+        assert!(m.poster_path.is_none(), "the image never arrived");
+        assert!(
+            m.artwork_attempted_at.is_some(),
+            "the attempt has to be on the record — without it, 'no poster' \
+             cannot be told from 'never tried', which is the whole bug"
+        );
+        assert!(m
+            .artwork_error
+            .as_deref()
+            .is_some_and(|e| e.contains("404")));
+
+        // And the sweep will therefore come back for it.
+        let due = store
+            .items_missing_artwork(Some(lib), 0)
+            .await
+            .expect("sweep");
+        assert_eq!(due.iter().map(|i| i.id).collect::<Vec<_>>(), [movie]);
+        // But not immediately: the recorded attempt is what makes the backoff
+        // possible, and a permanent 404 must not be re-fetched every cycle.
+        assert!(store
+            .items_missing_artwork(Some(lib), 3600)
+            .await
+            .expect("backoff")
+            .is_empty());
+    }
+
+    /// A provider that answers with no image at all is recorded too. Left
+    /// unrecorded it would have no attempt stamp, hence no backoff, hence a
+    /// re-fetch on every single sweep — a self-healing job turned into a
+    /// rate-limit generator.
+    #[tokio::test]
+    async fn an_item_the_provider_has_no_art_for_is_also_stamped() {
+        use axum::routing::get;
+        use axum::Json;
+        let (store, lib, movie) = one_movie("matrix").await;
+        let app = axum::Router::new()
+            .route(
+                "/search/movie",
+                get(|| async {
+                    Json(json!({ "results": [
+                        { "id": 603, "title": "The Matrix", "release_date": "1999-03-30" }
+                    ]}))
+                }),
+            )
+            .route(
+                "/movie/603",
+                get(|| async { Json(json!({ "runtime": 136 })) }),
+            );
+        let base = serve(app).await;
+        let tmdb = TmdbClient::new("k").with_base(&base, &base);
+        let art = tempfile::tempdir().expect("tmp");
+
+        enrich_library(&store, &tmdb, art.path(), Some(lib), false, None).await;
+        let m = store.get_item(movie).await.expect("get").expect("item");
+        assert!(m.poster_path.is_none());
+        assert!(m.artwork_attempted_at.is_some());
+        assert!(store
+            .items_missing_artwork(Some(lib), 3600)
+            .await
+            .expect("backoff")
+            .is_empty());
+    }
+
+    /// `only` is what keeps a targeted scan bounded. The library's other
+    /// items must be left exactly as they were.
+    #[tokio::test]
+    async fn enrich_library_touches_only_the_ids_it_was_given() {
+        let store = SqliteStore::open_in_memory().expect("open");
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "L".into(),
+                kind: LibraryKind::Movies,
+                paths: vec![],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+        let mut ids = Vec::new();
+        for title in ["matrix", "matrix"] {
+            ids.push(
+                store
+                    .insert_item(&NewItem {
+                        library_id: lib.id,
+                        kind: ItemKind::Movie,
+                        parent_id: None,
+                        title: title.into(),
+                        year: Some(1999),
+                        season_number: None,
+                        episode_number: None,
+                    })
+                    .await
+                    .expect("movie"),
+            );
+        }
+
+        let base = serve(tmdb_mock()).await;
+        let tmdb = TmdbClient::new("k").with_base(&base, &base);
+        let art = tempfile::tempdir().expect("tmp");
+
+        let report = enrich_library(
+            &store,
+            &tmdb,
+            art.path(),
+            Some(lib.id),
+            false,
+            Some(&ids[..1]),
+        )
+        .await;
+        assert_eq!(report.matched, 1);
+        let touched = store.get_item(ids[0]).await.expect("get").expect("item");
+        let untouched = store.get_item(ids[1]).await.expect("get").expect("item");
+        assert!(touched.poster_path.is_some());
+        assert!(untouched.poster_path.is_none());
+        assert_eq!(untouched.title, "matrix", "left for the next full pass");
     }
 }

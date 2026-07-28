@@ -71,10 +71,29 @@ pub mod keys {
     /// library; only the server-wide jobs are settings.
     pub const JOB_PROBE_RETRY_MINS: &str = "jobs.probe_retry_mins";
     pub const JOB_TRANSCODE_CLEANUP_MINS: &str = "jobs.transcode_cleanup_mins";
+    /// Re-fetch artwork for enriched items that still have no poster.
+    ///
+    /// The one job that is **on by default** ([`ARTWORK_RETRY_DEFAULT_MINS`]),
+    /// against the rule above and deliberately. Every other job is optional
+    /// housekeeping; this one repairs a hole the server itself left, and a
+    /// default of 0 would ship the bug it exists to fix — the backlog would
+    /// sit there until someone found a button, which is exactly the state
+    /// that made this necessary. Set it to 0 to turn it off.
+    pub const JOB_ARTWORK_RETRY_MINS: &str = "jobs.artwork_retry_mins";
     /// When those last ran, unix seconds. Persisted rather than kept in memory
     /// so restarting the server doesn't restart the clock.
     pub const JOB_LAST_PROBE_RETRY: &str = "jobs.last_probe_retry";
     pub const JOB_LAST_TRANSCODE_CLEANUP: &str = "jobs.last_transcode_cleanup";
+    pub const JOB_LAST_ARTWORK_RETRY: &str = "jobs.last_artwork_retry";
+    /// Default artwork-retry interval, in minutes. Half-hourly: often enough
+    /// that a scan interrupted by a TMDB blip repairs itself while the user is
+    /// still watching that evening, rare enough to be invisible to TMDB.
+    pub const ARTWORK_RETRY_DEFAULT_MINS: i64 = 30;
+    /// How long an item waits between artwork attempts, in seconds. Longer
+    /// than the sweep interval on purpose: the sweep decides how often to
+    /// *look*, this decides how often any one item is *tried*, and a
+    /// permanently art-less item should cost one request a day, not 48.
+    pub const ARTWORK_RETRY_BACKOFF_SECS: i64 = 24 * 60 * 60;
     /// Scan every library once, shortly after the server starts. "1" enables
     /// it; absent or anything else is off. For a server that was powered down
     /// while files landed — otherwise it waits out a whole interval (or, with
@@ -280,20 +299,43 @@ pub trait MediaStore: Send + Sync + 'static {
     /// request) and still need every other field. `force` includes
     /// already-enriched items too (a metadata refresh, e.g. to backfill
     /// season posters onto shows enriched before that existed).
+    ///
+    /// `only` narrows the result to specific item ids — what a targeted scan
+    /// enriches, so that a request another application is *waiting on* costs
+    /// the handful of items it just delivered rather than a whole library.
+    /// `None` means "no id filter" and is the unnarrowed query verbatim;
+    /// `Some(&[])` means "these zero items", i.e. nothing.
     async fn items_needing_metadata(
         &self,
         library_id: Option<i64>,
         force: bool,
+        only: Option<&[i64]>,
     ) -> Result<Vec<Item>, StoreError>;
     /// All episodes of a show (across seasons), for bulk episode enrichment.
     async fn episodes_for_show(&self, show_id: i64) -> Result<Vec<Item>, StoreError>;
     /// Home-library items whose artwork the local enricher should generate:
     /// folders, videos, and photos with no poster yet (`force` = all of them).
     /// Folders come last so they can inherit a child's finished poster.
+    /// `only` narrows to specific ids, as on
+    /// [`items_needing_metadata`](Self::items_needing_metadata).
     async fn items_needing_artwork(
         &self,
         library_id: i64,
         force: bool,
+        only: Option<&[i64]>,
+    ) -> Result<Vec<Item>, StoreError>;
+    /// Provider-enriched items still carrying no poster, oldest attempt first
+    /// — the retry sweep's input, and the mirror of
+    /// [`files_missing_probe`](Self::files_missing_probe).
+    ///
+    /// `retry_after_secs` is the backoff: an item attempted more recently than
+    /// that is skipped. Without it an item TMDB genuinely has no art for would
+    /// be re-fetched on every single cycle, forever, which is how a
+    /// self-healing job turns into a rate-limit generator.
+    async fn items_missing_artwork(
+        &self,
+        library_id: Option<i64>,
+        retry_after_secs: i64,
     ) -> Result<Vec<Item>, StoreError>;
     /// Apply a hand edit — distinct from [`apply_metadata`](Self::apply_metadata)
     /// because an edit must be able to *clear* a field. Returns the updated

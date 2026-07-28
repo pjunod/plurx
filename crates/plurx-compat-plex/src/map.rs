@@ -210,6 +210,8 @@ mod tests {
             recorded_at: None,
             tags: Vec::new(),
             nfo_seeded_at: None,
+            artwork_attempted_at: None,
+            artwork_error: None,
         }
     }
 

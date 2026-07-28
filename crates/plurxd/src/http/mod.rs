@@ -91,6 +91,7 @@ pub fn router(state: AppState) -> Router {
         // Browse
         .route("/items/{id}", get(browse::item_detail).patch(items::edit))
         .route("/items/{id}/reanalyze", post(items::reanalyze))
+        .route("/items/{id}/refresh-artwork", post(items::refresh_artwork))
         .route("/hubs", get(browse::hubs))
         .route("/search", get(browse::search))
         // Watch
@@ -1483,7 +1484,7 @@ mod tests {
 
         let queued = state
             .store
-            .items_needing_metadata(None, false)
+            .items_needing_metadata(None, false, None)
             .await
             .expect("needing");
         let mine = queued.iter().find(|i| i.id == item_id);
@@ -2804,6 +2805,47 @@ mod tests {
             "the file that failed is named: {report:?}"
         );
 
+        // Refresh artwork: reanalyze's sibling, same auth and the same 404. No
+        // TMDB key is configured in this fixture, so the pass has nothing to
+        // ask — the endpoint still has to answer honestly rather than error.
+        assert_eq!(
+            call(
+                &app,
+                post(
+                    &format!("/api/v1/items/{}/refresh-artwork", s.movie),
+                    None,
+                    json!({})
+                )
+            )
+            .await
+            .0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            call(
+                &app,
+                post(
+                    "/api/v1/items/999999/refresh-artwork",
+                    Some(&admin),
+                    json!({})
+                )
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+        let (st, art) = call(
+            &app,
+            post(
+                &format!("/api/v1/items/{}/refresh-artwork", s.movie),
+                Some(&admin),
+                json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "body: {art:?}");
+        assert!(art["poster"].is_null(), "no provider key, no poster");
+
         // Schedules: minutes, 0 = off, and a floor under anything non-zero so a
         // dropdown can't turn a NAS into a treadmill.
         assert_eq!(
@@ -2851,18 +2893,27 @@ mod tests {
         // settings endpoint, off unless asked for.
         let (_, before) = call(&app, get("/api/v1/settings", Some(&admin))).await;
         assert_eq!(before["scan_on_startup"], false);
+        // The artwork sweep is the one job that reads back as on before
+        // anybody has touched it. A 0 here would mean a fresh install never
+        // repairs a poster it failed to download.
+        assert_eq!(before["artwork_retry_mins"], 30);
         let (st, after) = call(
             &app,
             put(
                 "/api/v1/settings",
                 Some(&admin),
-                json!({ "scan_on_startup": true, "probe_retry_mins": 1440 }),
+                json!({ "scan_on_startup": true, "probe_retry_mins": 1440,
+                        "artwork_retry_mins": 0 }),
             ),
         )
         .await;
         assert_eq!(st, StatusCode::OK);
         assert_eq!(after["scan_on_startup"], true);
         assert_eq!(after["probe_retry_mins"], 1440);
+        assert_eq!(
+            after["artwork_retry_mins"], 0,
+            "an explicit 0 must survive the default, or the job cannot be turned off"
+        );
 
         // Settings round-trip.
         assert_eq!(

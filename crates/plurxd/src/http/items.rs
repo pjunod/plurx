@@ -179,6 +179,60 @@ pub async fn reanalyze(
     Ok(Json(report))
 }
 
+/// What a per-item artwork refresh did.
+#[derive(serde::Serialize)]
+pub struct RefreshArtworkReport {
+    /// The poster the item has now, or `null` if it still has none — the
+    /// answer the caller actually wants, since "the pass ran" and "there is a
+    /// poster" are not the same thing, and this whole feature exists because
+    /// they were once conflated.
+    pub poster: Option<String>,
+    /// Why the last attempt failed, when it did and left no poster.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(flatten)]
+    pub outcome: crate::state::EnrichOutcome,
+}
+
+/// POST /api/v1/items/:id/refresh-artwork (admin) — re-fetch this one item's
+/// artwork from its provider.
+///
+/// A library refresh is the sledgehammer: it re-fetches every item, takes as
+/// long as the library is big, and is the wrong tool when one show came back
+/// from an import with a blank card. This does that item — and the ancestors
+/// its artwork is fetched *through*, since an episode still comes from its
+/// show's season — forced, so an item already marked enriched and already
+/// holding a poster is fetched again regardless. Forced is the point: every
+/// unforced path skips precisely the items someone would press this on.
+pub async fn refresh_artwork(
+    _admin: AdminUser,
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<RefreshArtworkReport>, ApiError> {
+    if state.store.get_item(id).await?.is_none() {
+        return Err(ApiError::NotFound("item"));
+    }
+    let outcome = state.jobs.refresh_item_artwork(id).await?;
+    // Re-read rather than trust the report: the report counts matches, and an
+    // item can match and still end up with no image.
+    let after = state.store.get_item(id).await?;
+    let poster = after.as_ref().and_then(|i| i.poster_path.clone());
+    let error = after
+        .and_then(|i| i.artwork_error)
+        .filter(|_| poster.is_none());
+    tracing::info!(
+        item = id,
+        poster = poster.is_some(),
+        error = error.as_deref().unwrap_or("-"),
+        "artwork refresh requested"
+    );
+    Ok(Json(RefreshArtworkReport {
+        poster,
+        error,
+        outcome,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

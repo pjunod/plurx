@@ -11,6 +11,19 @@ use crate::error::MetadataError;
 const API_BASE: &str = "https://api.themoviedb.org/3";
 const IMAGE_BASE: &str = "https://image.tmdb.org/t/p";
 
+/// How many times one request is sent before giving up, first try included.
+/// Three because the failure being ridden out is a burst limit measured in
+/// seconds; a longer outage is the retry *sweep's* problem, not this loop's,
+/// and holding a scan open for it helps nobody.
+const MAX_ATTEMPTS: u32 = 3;
+/// First backoff step, doubling thereafter. Short enough that a scan does not
+/// visibly stall on one blip.
+const RETRY_BASE_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+/// Ceiling on an honoured `Retry-After`. A server asking for an hour is
+/// telling us to come back later, not to keep a scan open for one — the
+/// artwork retry job is what comes back later.
+const RETRY_AFTER_CAP: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// A resolved provider match for a movie or show.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Match {
@@ -78,23 +91,72 @@ impl TmdbClient {
     }
 
     async fn get(&self, path: &str, query: &[(&str, String)]) -> Result<Value, MetadataError> {
-        let mut req = self
-            .http
-            .get(format!("{}{path}", self.base))
-            .query(&[("api_key", self.api_key.as_str())]);
-        for (k, v) in query {
-            req = req.query(&[(*k, v.as_str())]);
-        }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| MetadataError::Http(e.to_string()))?;
-        if !resp.status().is_success() {
-            return Err(MetadataError::Status(resp.status().as_u16()));
-        }
+        let url = format!("{}{path}", self.base);
+        let resp = self
+            .send_with_retry(|| {
+                let mut req = self
+                    .http
+                    .get(&url)
+                    .query(&[("api_key", self.api_key.as_str())]);
+                for (k, v) in query {
+                    req = req.query(&[(*k, v.as_str())]);
+                }
+                req
+            })
+            .await?;
         resp.json()
             .await
             .map_err(|e| MetadataError::Parse(e.to_string()))
+    }
+
+    /// Send a request, retrying the failures that are about TMDB's mood
+    /// rather than about the request.
+    ///
+    /// A scan is hundreds of calls in a row, so it is exactly the workload
+    /// that trips a rate limit — and before this, a single 429 partway
+    /// through silently cost every remaining item its artwork, with the run
+    /// reporting success. A 404 is the opposite: TMDB has answered, the
+    /// answer is "no", and asking three times is three times the load for the
+    /// same word. So only 429 and 5xx come back here.
+    async fn send_with_retry(
+        &self,
+        build: impl Fn() -> reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, MetadataError> {
+        let mut delay = RETRY_BASE_DELAY;
+        for attempt in 1..=MAX_ATTEMPTS {
+            let resp = build().send().await;
+            let last = attempt == MAX_ATTEMPTS;
+            match resp {
+                Ok(resp) if resp.status().is_success() => return Ok(resp),
+                Ok(resp) => {
+                    let status = resp.status();
+                    if last || !retryable(status.as_u16()) {
+                        return Err(MetadataError::Status(status.as_u16()));
+                    }
+                    // TMDB says when it will talk again; guessing over the top
+                    // of that is how a client earns a longer ban.
+                    let wait = retry_after(resp.headers()).unwrap_or(delay);
+                    tracing::debug!(
+                        status = status.as_u16(),
+                        attempt,
+                        wait_ms = wait.as_millis() as u64,
+                        "tmdb retrying"
+                    );
+                    tokio::time::sleep(wait).await;
+                }
+                // A connection that never completed is the same kind of
+                // transient as a 503, and the request was never served, so
+                // repeating it cannot double anything.
+                Err(e) if last => return Err(MetadataError::Http(e.to_string())),
+                Err(e) => {
+                    tracing::debug!(error = %e, attempt, "tmdb request failed; retrying");
+                    tokio::time::sleep(delay).await;
+                }
+            }
+            delay *= 2;
+        }
+        // Unreachable: the loop returns on its last attempt either way.
+        Err(MetadataError::Http("retries exhausted".to_owned()))
     }
 
     /// Search movies and return the best match (title + year aware).
@@ -253,15 +315,10 @@ impl TmdbClient {
         size: &str,
     ) -> Result<Vec<u8>, MetadataError> {
         let url = format!("{}/{size}{tmdb_path}", self.image_base);
-        let resp = self
-            .http
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| MetadataError::Http(e.to_string()))?;
-        if !resp.status().is_success() {
-            return Err(MetadataError::Status(resp.status().as_u16()));
-        }
+        // Same retry as the API calls, and needed more: the image CDN is hit
+        // once per poster and once per backdrop, so it absorbs the bulk of a
+        // scan's requests and is where a rate limit lands first.
+        let resp = self.send_with_retry(|| self.http.get(&url)).await?;
         let bytes = resp
             .bytes()
             .await
@@ -273,6 +330,30 @@ impl TmdbClient {
 /// Full image URL for a TMDB-relative path.
 pub fn image_url(tmdb_path: &str, size: &str) -> String {
     format!("{IMAGE_BASE}/{size}{tmdb_path}")
+}
+
+/// Is this status worth sending the same request again?
+///
+/// 429 (rate limited) and 5xx (TMDB is having a moment) yes; everything else
+/// no. 404 in particular must stay a fast permanent failure — an item TMDB
+/// does not have is not an item TMDB will have in 500ms, and a library full
+/// of them would triple every scan's request count to learn nothing.
+fn retryable(status: u16) -> bool {
+    status == 429 || (500..600).contains(&status)
+}
+
+/// `Retry-After` as a duration, capped. Only the delta-seconds form is read:
+/// the HTTP-date form is legal but TMDB does not send it, and a date needs a
+/// clock comparison to mean anything.
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
+    let secs: u64 = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(std::time::Duration::from_secs(secs).min(RETRY_AFTER_CAP))
 }
 
 fn year_of(value: &Value, date_field: &str) -> Option<i32> {
@@ -396,6 +477,7 @@ fn episode_meta(v: &Value) -> EpisodeMeta {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::time::Duration;
 
     #[test]
     fn image_url_composes() {
@@ -561,5 +643,136 @@ mod tests {
             Err(crate::error::MetadataError::Status(500))
         ));
         assert!(c.download_image("/x.jpg", "w500").await.is_err());
+    }
+
+    #[test]
+    fn only_rate_limits_and_server_faults_are_worth_repeating() {
+        assert!(retryable(429));
+        assert!(retryable(500));
+        assert!(retryable(503));
+        assert!(!retryable(404), "TMDB has answered; the answer is no");
+        assert!(!retryable(401), "a bad key is not a bad moment");
+        assert!(!retryable(200));
+    }
+
+    #[test]
+    fn retry_after_is_read_in_seconds_and_capped() {
+        use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+        let mut headers = HeaderMap::new();
+        assert_eq!(retry_after(&headers), None);
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("2"));
+        assert_eq!(retry_after(&headers), Some(Duration::from_secs(2)));
+        // An hour is a server telling us to come back another day; the sweep
+        // is what comes back, not a scan held open for 60 minutes.
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("3600"));
+        assert_eq!(retry_after(&headers), Some(RETRY_AFTER_CAP));
+        // The HTTP-date form is legal and unread — better no wait than a
+        // parse that silently yields zero.
+        headers.insert(
+            RETRY_AFTER,
+            HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),
+        );
+        assert_eq!(retry_after(&headers), None);
+    }
+
+    /// A rate limit partway through a scan used to cost every remaining item
+    /// its artwork, with the run reporting success. One retry fixes the whole
+    /// tail; a 404 must not pay for it.
+    #[tokio::test]
+    async fn a_429_is_retried_and_a_404_is_not() {
+        use axum::http::StatusCode;
+        use axum::routing::get;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let image_hits = Arc::clone(&hits);
+        let missing_hits = Arc::new(AtomicUsize::new(0));
+        let missing = Arc::clone(&missing_hits);
+        let app = axum::Router::new()
+            .route(
+                "/w500/limited.jpg",
+                get(move || {
+                    let hits = Arc::clone(&image_hits);
+                    async move {
+                        // Rate limited once, then fine — a burst limit, which
+                        // is what a scan actually trips.
+                        if hits.fetch_add(1, Ordering::SeqCst) == 0 {
+                            (StatusCode::TOO_MANY_REQUESTS, Vec::new())
+                        } else {
+                            (StatusCode::OK, vec![7u8, 7, 7])
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/w500/gone.jpg",
+                get(move || {
+                    let hits = Arc::clone(&missing);
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::NOT_FOUND
+                    }
+                }),
+            );
+        let base = serve(app).await;
+        let c = TmdbClient::new("k").with_base(&base, &base);
+
+        let bytes = c
+            .download_image("/limited.jpg", "w500")
+            .await
+            .expect("the retry recovers the image");
+        assert_eq!(bytes, vec![7, 7, 7]);
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "one 429, then the retry");
+
+        assert!(matches!(
+            c.download_image("/gone.jpg", "w500").await,
+            Err(crate::error::MetadataError::Status(404))
+        ));
+        assert_eq!(
+            missing_hits.load(Ordering::SeqCst),
+            1,
+            "a 404 is permanent; asking again is load for the same word"
+        );
+    }
+
+    /// The API side gets the same treatment, and a 5xx counts too.
+    #[tokio::test]
+    async fn a_500_on_the_api_is_retried() {
+        use axum::http::StatusCode;
+        use axum::routing::get;
+        use axum::Json;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        let app = axum::Router::new().route(
+            "/search/movie",
+            get(move || {
+                let hits = Arc::clone(&counter);
+                async move {
+                    if hits.fetch_add(1, Ordering::SeqCst) == 0 {
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(json!({ "status_message": "down" })),
+                        )
+                    } else {
+                        (
+                            StatusCode::OK,
+                            Json(json!({ "results": [
+                                { "id": 1, "title": "X", "release_date": "2000-01-01" }
+                            ]})),
+                        )
+                    }
+                }
+            }),
+        );
+        let base = serve(app).await;
+        let c = TmdbClient::new("k").with_base(&base, &base);
+        // The details call 404s from this router; the search succeeding on the
+        // second attempt is what is under test.
+        let _ = c.find_movie("X", None).await;
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
 }

@@ -43,11 +43,16 @@ pub struct LocalArtReport {
 /// Give every item in a home library a poster. Failures are non-fatal and
 /// counted — the same posture as artwork downloads: one unreadable file must
 /// not stop the rest of a 2,000-photo import from getting thumbnails.
+///
+/// `only` restricts the pass to specific item ids — what a targeted scan just
+/// placed, plus the folders above them, so importing one evening's clips does
+/// not re-walk the whole library. `None` is every item, exactly as before.
 pub async fn enrich_home_library(
     store: &dyn Store,
     artwork_dir: &Path,
     library_id: i64,
     force: bool,
+    only: Option<&[i64]>,
 ) -> LocalArtReport {
     let mut report = LocalArtReport::default();
     if let Err(e) = tokio::fs::create_dir_all(artwork_dir).await {
@@ -55,7 +60,7 @@ pub async fn enrich_home_library(
         report.errors += 1;
         return report;
     }
-    let items = match store.items_needing_artwork(library_id, force).await {
+    let items = match store.items_needing_artwork(library_id, force, only).await {
         Ok(items) => items,
         Err(e) => {
             tracing::error!(error = %e, "listing home items needing artwork");
@@ -344,7 +349,7 @@ mod tests {
             .expect("lib");
         scan_library(&store, &lib).await.expect("scan");
 
-        let report = enrich_home_library(&store, &artwork, lib.id, false).await;
+        let report = enrich_home_library(&store, &artwork, lib.id, false, None).await;
         assert_eq!(report.errors, 0, "report: {report:?}");
         assert_eq!(report.generated, 1, "one frame grab");
         assert_eq!(report.adopted, 1, "one adopted sidecar image");
@@ -388,7 +393,7 @@ mod tests {
         assert!(folder_after.poster_path.is_some());
 
         // Nothing is left needing artwork, so a second pass is a no-op.
-        let again = enrich_home_library(&store, &artwork, lib.id, false).await;
+        let again = enrich_home_library(&store, &artwork, lib.id, false, None).await;
         assert_eq!(
             (
                 again.generated,

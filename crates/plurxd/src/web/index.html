@@ -1811,6 +1811,18 @@ async function reanalyze(itemId,btn){
   }catch(e){ toast(e.message||"Reanalyze failed"); }
   finally{ btn.disabled=false; btn.textContent=label; }
 }
+// Reanalyze's sibling, for pictures instead of media details. A poster that
+// never downloaded leaves nothing on disk for a rescan to notice, so without
+// this the only repair was refreshing the entire library.
+async function refreshArtwork(itemId,btn){
+  const label=btn.textContent; btn.disabled=true; btn.textContent="Fetching…";
+  try{
+    const r=await api(`/items/${itemId}/refresh-artwork`,{method:"POST"});
+    if(r.poster){ toast("Artwork updated"); render(); }
+    else toast(r.error?`Couldn’t fetch artwork — ${r.error}`:"The provider has no artwork for this");
+  }catch(e){ toast(e.message||"Artwork refresh failed"); }
+  finally{ btn.disabled=false; btn.textContent=label; }
+}
 function epThumb(ep){
   const art=ep.poster||ep.backdrop;
   const pct=progressPct(ep.watch);
@@ -1844,6 +1856,12 @@ async function viewItem(id){
   // Metadata editing is a home-library affair: elsewhere the provider agent
   // owns the fields and would overwrite a hand edit on the next refresh.
   const editable = ME&&ME.is_admin&&lib&&lib.kind==="home";
+  // Offered on every item, not only the ones that look broken: an admin who
+  // wants a different poster than the one that landed has no other way to ask
+  // for it short of refreshing the whole library.
+  const artBtn = ME&&ME.is_admin
+    ? ` <button class="ghost sm" title="Re-fetch this item's poster and backdrop" aria-label="Refresh artwork" onclick="refreshArtwork(${it.id},this)">⟳ Refresh artwork</button>`
+    : '';
   d.files.forEach(f=>ITEM_FOR_FILE[f.id]=Number(id));
 
   // Breadcrumb trail: Home / <list you came from> / Show / Season / …, every
@@ -1940,7 +1958,7 @@ async function viewItem(id){
   document.getElementById("main").innerHTML=`<div class="hero">${bg}
     <div class="dwrap">
       <div class="poster">${artHtml(it)}</div>
-      <div class="dhead">${crumbs}<h1>${esc(it.title)}${editable?` <button class="ghost sm" title="Edit details" aria-label="Edit details" onclick='openEdit(${esc(JSON.stringify(it))})'>✎ Edit</button>`:''}</h1>
+      <div class="dhead">${crumbs}<h1>${esc(it.title)}${editable?` <button class="ghost sm" title="Edit details" aria-label="Edit details" onclick='openEdit(${esc(JSON.stringify(it))})'>✎ Edit</button>`:''}${artBtn}</h1>
         <div class="chips">${chips.join("")}</div>
         ${(it.tags&&it.tags.length)?`<div class="chips">${it.tags.map(t=>`<span>${esc(t)}</span>`).join("")}</div>`:''}
         ${heroBadges?`<div class="vbadges" style="margin-top:10px">${heroBadges}</div>`:''}
@@ -3706,6 +3724,9 @@ async function saveSchedule(id,btn){
 // Server-wide scheduled maintenance. Per-library scanning lives in the table
 // above; these two are global because they aren't about any one library.
 const RETRY_EVERY=[[0,"Never"],[360,"6 hours"],[720,"12 hours"],[1440,"Daily"],[10080,"Weekly"]];
+// Shorter buckets than the rest: this job is on by default, and a missing
+// poster is visible on every screen the item appears on.
+const ART_EVERY=[[0,"Never"],[30,"30 minutes"],[60,"Hourly"],[360,"6 hours"],[1440,"Daily"]];
 const CLEAN_EVERY=[[0,"Never"],[60,"Hourly"],[360,"6 hours"],[1440,"Daily"]];
 function maintenancePanel(settings){
   if(!ME||!ME.is_admin||!settings) return '';
@@ -3713,14 +3734,18 @@ function maintenancePanel(settings){
     <div class="row" style="gap:10px;align-items:center;flex-wrap:wrap">
       <span class="muted" style="font-size:12px">Retry unreadable files</span>
       ${everySelect("job-probe",RETRY_EVERY,settings.probe_retry_mins,"Re-run ffprobe on files whose media details were never read")}
+      <span class="muted" style="font-size:12px">Retry missing artwork</span>
+      ${everySelect("job-art",ART_EVERY,settings.artwork_retry_mins,"Re-fetch posters for items a provider matched but that never got an image")}
       <span class="muted" style="font-size:12px">Clean transcode cache</span>
       ${everySelect("job-clean",CLEAN_EVERY,settings.transcode_cleanup_mins,"Delete leftover transcode working directories no session owns")}
       <label class="schedpair" title="Scan every library once, about 30 seconds after the server starts">
         <input type="checkbox" id="job-boot"${settings.scan_on_startup?' checked':''}> Scan at startup</label>
       <button class="ghost sm" onclick="saveMaintenance(this)">Save</button></div>
-    <div class="hint">Everything here is off by default. <b>Retry unreadable files</b> re-probes anything
+    <div class="hint">All off by default except <b>Retry missing artwork</b>. <b>Retry unreadable files</b> re-probes anything
       scanned without codec or duration — the fix for those (permissions, a remounted share) leaves no
-      trace a normal scan would notice. <b>Clean transcode cache</b> removes working directories left
+      trace a normal scan would notice. <b>Retry missing artwork</b> is on because a poster download that failed
+      leaves no trace either, and a blank card would otherwise stay blank until somebody refreshed the whole
+      library by hand. <b>Clean transcode cache</b> removes working directories left
       behind by a crash or a host reboot, which no live session will ever claim. <b>Scan at startup</b> covers
       the gap an interval can't: a server that was switched off while files landed doesn't notice them until
       its next scheduled run.</div>
@@ -3759,6 +3784,7 @@ async function saveMaintenance(btn){
   try{
     await api("/settings",{method:"PUT",body:{
       probe_retry_mins:Number(document.getElementById("job-probe").value),
+      artwork_retry_mins:Number(document.getElementById("job-art").value),
       transcode_cleanup_mins:Number(document.getElementById("job-clean").value),
       scan_on_startup:document.getElementById("job-boot").checked}});
     toast("Maintenance schedule saved"); render();

@@ -154,6 +154,15 @@ pub struct Item {
     /// `None` = never seeded (and eligible for seeding if a sidecar appears).
     /// Once set, the sidecar is dead to plurx — see docs/HOMEVIDEO-PLAN.md §4.3.
     pub nfo_seeded_at: Option<i64>,
+    /// Unix seconds of the last artwork *download attempt*, and why it failed
+    /// if it did (`None` = it didn't, or none has been made).
+    ///
+    /// These exist because `poster_path IS NULL` alone cannot tell "TMDB has
+    /// no poster for this" from "the download 429'd once and nobody ever
+    /// looked again". Without them a transient blip is indistinguishable
+    /// from never-tried, and the retry sweep has nothing to key on.
+    pub artwork_attempted_at: Option<i64>,
+    pub artwork_error: Option<String>,
 }
 
 /// What the scanner knows when it first sees a file — enough to place the
@@ -197,6 +206,25 @@ pub struct MetadataPatch {
     /// `tmdb_id`, and inferring "enriched" from that would mark the item done
     /// *because* it named an id — the exact opposite of what the id is for.
     pub enriched: bool,
+    /// What happened when this patch's artwork was fetched, when the provider
+    /// offered any. `None` = nothing was attempted, and the stored attempt
+    /// columns are left alone.
+    pub artwork: Option<ArtworkAttempt>,
+}
+
+/// The outcome of one artwork download.
+///
+/// The distinction that matters is *offered and failed* versus *never
+/// offered*: only the first is worth coming back for. `poster_path` cannot
+/// carry it — both are `None` there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArtworkAttempt {
+    /// The provider offered an image and it is now in the artwork cache.
+    Stored,
+    /// The provider offered an image and it did not land. The string is why,
+    /// kept for the operator: "the poster is missing" is a symptom, "429 from
+    /// TMDB" is the cause.
+    Failed(String),
 }
 
 impl MetadataPatch {
@@ -213,6 +241,7 @@ impl MetadataPatch {
             && self.recorded_at.is_none()
             && self.tags.is_none()
             && !self.enriched
+            && self.artwork.is_none()
     }
 }
 

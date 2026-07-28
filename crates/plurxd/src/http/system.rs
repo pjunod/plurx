@@ -483,6 +483,10 @@ pub struct SettingsDto {
     /// Server-wide scheduled maintenance, in minutes; 0 is off (the default).
     /// Per-library scan/refresh intervals are on the library, not here.
     pub probe_retry_mins: i64,
+    /// The exception to "0 is the default": on by default, because it repairs
+    /// artwork the server itself failed to fetch rather than adding a habit
+    /// nobody asked for. See `keys::ARTWORK_RETRY_DEFAULT_MINS`.
+    pub artwork_retry_mins: i64,
     pub transcode_cleanup_mins: i64,
     /// How often the pre-transcode producer looks for something worth making,
     /// and how much disk what it makes may occupy. Both off/0 by default: the
@@ -565,6 +569,16 @@ async fn settings_dto(state: &AppState) -> Result<SettingsDto, ApiError> {
             .max(0)
     };
     let probe_retry_mins = mins(state.store.get_setting(keys::JOB_PROBE_RETRY_MINS).await?);
+    // Absent means the default here, not 0 — the settings page must show the
+    // interval that is actually in force, or an admin reading "0" would
+    // reasonably conclude nothing is retrying their artwork.
+    let artwork_retry_mins = state
+        .store
+        .get_setting(keys::JOB_ARTWORK_RETRY_MINS)
+        .await?
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(keys::ARTWORK_RETRY_DEFAULT_MINS)
+        .max(0);
     let transcode_cleanup_mins = mins(
         state
             .store
@@ -620,6 +634,7 @@ async fn settings_dto(state: &AppState) -> Result<SettingsDto, ApiError> {
         hls_ahead_max_bytes,
         hls_scratch_max_bytes,
         probe_retry_mins,
+        artwork_retry_mins,
         transcode_cleanup_mins,
         cache_produce_mins,
         cache_max_gb,
@@ -665,6 +680,7 @@ pub struct UpdateSettings {
     pub hls_scratch_max_bytes: Option<String>,
     /// Server-wide job intervals in minutes; 0 turns one off.
     pub probe_retry_mins: Option<i64>,
+    pub artwork_retry_mins: Option<i64>,
     pub transcode_cleanup_mins: Option<i64>,
     pub cache_produce_mins: Option<i64>,
     pub cache_max_gb: Option<i64>,
@@ -808,6 +824,11 @@ pub async fn update_settings(
             keys::JOB_PROBE_RETRY_MINS,
             "probe_retry_mins",
             req.probe_retry_mins,
+        ),
+        (
+            keys::JOB_ARTWORK_RETRY_MINS,
+            "artwork_retry_mins",
+            req.artwork_retry_mins,
         ),
         (
             keys::JOB_TRANSCODE_CLEANUP_MINS,
