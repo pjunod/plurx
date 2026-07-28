@@ -117,6 +117,19 @@ pub mod keys {
     /// right number is a property of the silicon: a discrete card with two
     /// NVENC chips is not a NUC.
     pub const MAX_HW_SESSIONS: &str = "transcode.max_hw_sessions";
+    /// Disk the pre-transcode cache may occupy, in gigabytes. `0` turns the
+    /// cache off: nothing is produced, and what is already there is evicted.
+    ///
+    /// A budget rather than a target. The cache is worth exactly what it
+    /// saves, and a server that filled its disk to spare a few seconds has
+    /// made the trade backwards. Eviction is LRU, so what survives is what
+    /// people actually come back to.
+    pub const CACHE_MAX_GB: &str = "cache.max_gb";
+    /// How often the producer looks for something worth pre-transcoding, in
+    /// minutes; "0" is off, and off is the default like every other job — an
+    /// upgraded server must not start encoding overnight on its own.
+    pub const JOB_CACHE_PRODUCE_MINS: &str = "jobs.cache_produce_mins";
+    pub const JOB_LAST_CACHE_PRODUCE: &str = "jobs.last_cache_produce";
 }
 
 #[async_trait]

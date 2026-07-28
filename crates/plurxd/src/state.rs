@@ -855,6 +855,14 @@ impl JobManager {
                     if removed > 0 {
                         tracing::info!(removed, "swept orphaned transcode directories");
                     }
+                    // The cache is swept here as well as before each producer
+                    // run, and the redundancy is the point: production and
+                    // eviction are different settings, and a server whose
+                    // producer was turned off after filling the cache still has
+                    // to be able to get its disk back.
+                    if let Some((root, node)) = transcode.cache_location() {
+                        crate::cachekeep::sweep(&self.store, root, node, now()).await;
+                    }
                 }
             }
         }

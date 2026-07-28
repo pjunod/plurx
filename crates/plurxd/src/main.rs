@@ -1,4 +1,5 @@
 mod admission;
+mod cachekeep;
 mod ffmpeg;
 mod http;
 mod logbuf;

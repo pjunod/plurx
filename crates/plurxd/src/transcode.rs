@@ -1019,6 +1019,19 @@ impl TranscodeManager {
         self
     }
 
+    /// Where finished transcodes live and what this node is called there, or
+    /// `None` when no cache root is configured.
+    ///
+    /// Handed out rather than duplicated in the caller: the housekeeping sweep
+    /// and the serving path have to agree about both, and two copies of "the
+    /// cache root" is how they come to disagree after somebody makes one
+    /// configurable.
+    pub fn cache_location(&self) -> Option<(&std::path::Path, &str)> {
+        self.cache
+            .as_ref()
+            .map(|c| (c.dir.as_path(), c.node_id.as_str()))
+    }
+
     /// This node's output identity, for naming a transcode.
     fn digest(&self) -> Option<PipelineDigest> {
         let cache = self.cache.as_ref()?;

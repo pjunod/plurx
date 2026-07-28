@@ -140,7 +140,13 @@ impl TranscodeCacheStore for SqliteStore {
                  FROM transcode_cache_locations l
                  JOIN transcode_cache_recipes r ON r.recipe_hash = l.recipe_hash
                  WHERE l.node_id = ?1 AND l.complete = 1
-                 ORDER BY l.last_used_at ASC
+                 -- The rowid tiebreak makes eviction deterministic. Without it
+                 -- a batch of entries finished in the same second sorts
+                 -- arbitrarily, so which one an over-budget sweep deletes
+                 -- depends on the query plan — reproducible right up until it
+                 -- isn't. Oldest row first is the honest tiebreak: among
+                 -- equally cold entries, the one that has been here longest.
+                 ORDER BY l.last_used_at ASC, l.rowid ASC
                  LIMIT ?2"
             ))?;
             let rows = stmt
