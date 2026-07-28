@@ -1941,7 +1941,10 @@ function preferNativeHls(video){ return useNativeHls(video) && streamIsHevc(); }
 // seek-restart, and audio-switch). Worker off: a wallet extension's injected
 // CSP can silently kill a blob worker; main-thread demux of one 720p stream
 // is nothing.
-function attachHls(video, playlistUrl){
+// `startAt` is where to begin *inside* the playlist, and is non-zero only for a
+// cached (VOD) asset being resumed: a live session was built at the requested
+// offset, so its own zero already is the right place.
+function attachHls(video, playlistUrl, startAt){
   // Always tear the incumbent down first. Overwriting PLAYER.hls used to strand
   // the old instance: nothing else held a reference, but hls.js keeps polling a
   // media playlist that never gets #EXT-X-ENDLIST, so it lived on invisibly,
@@ -1974,6 +1977,11 @@ function attachHls(video, playlistUrl){
       enableWorker:false,
       maxBufferLength:60,
       backBufferLength:30,
+      // Told before the first fragment loads, not seeked afterwards. Seeking
+      // after attach downloads the opening of the film and throws it away —
+      // on a 4K cache hit that is tens of megabytes and several seconds of
+      // the viewer watching a spinner to arrive where they already were.
+      startPosition:(startAt>0?startAt:-1),
       xhrSetup:x=>{ if(TOKEN) x.setRequestHeader("authorization","Bearer "+TOKEN); }});
     PLAYER.hls=hls;
     hls.loadSource(playlistUrl);
@@ -1996,7 +2004,12 @@ function attachHls(video, playlistUrl){
   } else {
     // Native HLS: the session id in the URL is the credential, so the
     // Apple TV can fetch segments itself when AirPlaying.
-    video.src=tok(playlistUrl); video.play().catch(()=>{});
+    video.src=tok(playlistUrl);
+    if(startAt>0){
+      const go=()=>{ video.removeEventListener("loadedmetadata",go); try{video.currentTime=startAt}catch(e){} };
+      video.addEventListener("loadedmetadata",go);
+    }
+    video.play().catch(()=>{});
   }
 }
 
@@ -2054,6 +2067,32 @@ async function openSession(fileId, opts){
   // sending the key would have the server clamp null to its floor.
   if(body.height==null) delete body.height;
   return api(`/files/${fileId}/hls/sessions`,{method:"POST",body});
+}
+// Take on a newly-opened session's identity, and attach it.
+//
+// One function for the same reason `transcodeOpts` is one function: SIX paths
+// open a session — cold start, seek, audio switch, subtitle switch, the
+// copy-HLS path, the transcode fallback — and a response field wired into five
+// of them is a bug that only appears on the sixth. That is exactly how seeking
+// came to drop the burned subtitle, and `vod` would have gone the same way.
+//
+// `wantSec` is where the viewer expects to be, in film time. The two kinds of
+// stream reach it differently and this is the only place that knows which:
+// a live session was *built* at that offset, so it plays from its own zero,
+// while a cached one is the whole title and has to be seeked into. Returns the
+// absolute position playback should begin at, which is what the stall watchdog
+// has to be armed with — a watchdog armed at zero on a stream that correctly
+// starts at forty minutes early-outs immediately and never diagnoses anything.
+function attachSession(v, t, info, wantSec){
+  t.offset=info.start_seconds||0;
+  t.encoder=info.encoder||null;
+  t.sessionId=info.session_id||null;
+  t.streamId=null;
+  t.vod=!!info.vod;
+  t.probeUrl=info.playlist_url;
+  const into = t.vod ? Math.max(0, wantSec||0) : 0;
+  attachHls(v, info.playlist_url, into);
+  return into + (t.offset||0);
 }
 // Tell the server we are finished with a stream. Without this the encoder
 // lives on for the idle timeout plus a reaper tick — over a minute of a
@@ -2144,7 +2183,7 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
     transcodeAudio:!!decision.transcode_audio, copyHls:false,
     playStartedAt:clickedAt, ttffMs:null, stalls:0, sessionId:null, streamId:null, health:null,
     attemptId:null, attemptReason:null, bufferLimits:null,
-    waitAt:null, waitRunway:null, stallsByKind:null, burnedSub:null, };
+    waitAt:null, waitRunway:null, stallsByKind:null, burnedSub:null, vod:false, };
   newAttempt(PENDING_ATTEMPT_REASON || (startSec>0?"resume":"cold-start"));
   PENDING_ATTEMPT_REASON=null;
   if(PLAYER.curAudio<0) PLAYER.curAudio=0;
@@ -2163,11 +2202,10 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
     // Transcode: start an HLS session (server re-encodes + tone-maps).
     setLoading(true,"Starting the transcoder…",transcodeReason(decision));
     let info; try{ info=await openSession(fileId,transcodeOpts(startSec));}catch(e){ setLoading(false); toast(e.message); return closePlayer(); }
-    PLAYER.offset = info.start_seconds||0;
-    PLAYER.encoder = info.encoder||null; PLAYER.sessionId = info.session_id||null; PLAYER.streamId=null;
-    setLoading(true,"Preparing the stream…",(PLAYER.encoder?("encoder: "+PLAYER.encoder+" — "):"")+"buffering the first segments");
-    PLAYER.probeUrl=info.playlist_url; armStall(PLAYER.offset);
-    attachHls(video, info.playlist_url);
+    const from=attachSession(video, PLAYER, info, startSec);
+    setLoading(true,"Preparing the stream…",(PLAYER.encoder?("encoder: "+PLAYER.encoder+" — "):"")+
+      (PLAYER.vod?"already transcoded — playing from the cache":"buffering the first segments"));
+    armStall(from);
   } else if(decision.method!=='direct_play' && useNativeHls(video)){
     // Safari can't play a progressive fragmented-MP4 remux, but it plays the
     // same copy-video stream (source video kept, audio transcoded only) via
@@ -2215,9 +2253,8 @@ async function startCopyHls(v, startSec, live){
   const track=PLAYER.audio[PLAYER.curAudio]; const aidx=track?track.index:0;
   const info=await openSession(PLAYER.fileId,{copy:true,aac:!!PLAYER.transcodeAudio,start:startSec||0,audio:aidx});
   if(live && !live()) return false;
-  PLAYER.offset=info.start_seconds||0; PLAYER.method='remux'; PLAYER.copyHls=true; PLAYER.encoder=info.encoder||null; PLAYER.sessionId=info.session_id||null; PLAYER.streamId=null;
-  PLAYER.probeUrl=info.playlist_url; armStall();
-  attachHls(v, info.playlist_url);
+  PLAYER.method='remux'; PLAYER.copyHls=true;
+  armStall(attachSession(v, PLAYER, info, startSec));
   return true;
 }
 // One generation counter for "restart the server-side stream". Seek and audio
@@ -2273,10 +2310,9 @@ async function startTranscodeFallback(){
   teardownHls();
   let info; try{ info=await openSession(me.fileId,transcodeOpts(startSec));}catch(e){ if(live()){ setLoading(false); toast(e.message); } return; }
   if(!live()) return;   // closed the player, or seeked / switched audio meanwhile
-  me.method='transcode'; me.copyHls=false; me.offset=info.start_seconds||0; me.encoder=info.encoder||null; me.sessionId=info.session_id||null; me.streamId=null;
-  me.probeUrl=info.playlist_url; armStall(me.offset);
-  setLoading(true,"Preparing the stream…",(me.encoder?("encoder: "+me.encoder+" — "):"")+"transcoding instead of remuxing");
-  attachHls(v, info.playlist_url);
+  me.method='transcode'; me.copyHls=false;
+  setLoading(true,"Preparing the stream…",(info.encoder?("encoder: "+info.encoder+" — "):"")+"transcoding instead of remuxing");
+  armStall(attachSession(v, me, info, startSec));
 }
 // Arm the watchdog for a stream we have just (re)started at `fromSec`. Recording
 // the intended position is what makes this work after a *seek*: the old check
@@ -2638,7 +2674,16 @@ async function seekTo(targetSec){
   // packets, so it would "buffer" forever with nothing wrong on either side.
   const total=pbTotalSec();
   if(total>0) targetSec=Math.min(targetSec, Math.max(0,total-2));
-  if(PLAYER.method==='direct_play'){ try{ v.currentTime=targetSec; }catch(e){} playerActivity(); return; }
+  // Two kinds of stream seek without touching the server: direct play, and a
+  // cache hit. A cached transcode is a finished asset — every segment already
+  // exists — so seeking into it is a seek, in the same fraction of a second
+  // direct play manages, and the stall watchdog's restart arm has nothing to
+  // fix. Restarting the session instead would throw a hit away and start an
+  // encoder to produce bytes that are already on the disk it is reading from.
+  if(PLAYER.method==='direct_play' || PLAYER.vod){
+    try{ v.currentTime=Math.max(0,targetSec-(PLAYER.offset||0)); }catch(e){}
+    playerActivity(); return;
+  }
   // Every non-direct seek restarts the server stream, so overlapping seeks (a
   // double-clicked ±10, or a drag landing near a keyboard nudge) would tear down
   // and re-attach hls.js twice. Token the call and bail any superseded one after
@@ -2660,9 +2705,7 @@ async function seekTo(targetSec){
   if(PLAYER.method==='transcode'){
     let info; try{ info=await openSession(PLAYER.fileId,transcodeOpts(targetSec,aidx));}catch(e){ return failed(e); }
     if(!live()) return;   // a newer seek superseded this one
-    PLAYER.offset=info.start_seconds||0; PLAYER.encoder=info.encoder||null; PLAYER.sessionId=info.session_id||null; PLAYER.streamId=null;
-    PLAYER.probeUrl=info.playlist_url; armStall(PLAYER.offset,20000);
-    attachHls(v, info.playlist_url);
+    armStall(attachSession(v, PLAYER, info, targetSec), 20000);
   } else if(PLAYER.copyHls){
     // Copy-video HLS (Safari): re-open the session at the target position.
     // The guard goes *into* startCopyHls: checking after it returned would be
@@ -3019,10 +3062,7 @@ async function burnSub(index){
   }catch(e){ if(live()){ setLoading(false); toast(e.message); } return; }
   if(!live()) return;
   me.method='transcode'; me.copyHls=false;
-  me.offset=info.start_seconds||0; me.encoder=info.encoder||null;
-  me.sessionId=info.session_id||null; me.streamId=null;
-  me.probeUrl=info.playlist_url; armStall(me.offset,20000);
-  attachHls(v, info.playlist_url);
+  armStall(attachSession(v, me, info, pos), 20000);
   toast(index==null?"Subtitles off":"Subtitles: "+subLabelFor(s,index));
 }
 // Cycle Off → each track → Off (the 'c' hotkey and the CC button's long game).
@@ -3053,8 +3093,7 @@ async function switchAudio(idx){
   if(PLAYER.method==='transcode'){
     let info; try{ info=await openSession(PLAYER.fileId,transcodeOpts(pos,aidx));}catch(e){ return toast(e.message); }
     if(!live()) return;
-    PLAYER.offset=info.start_seconds||0; PLAYER.encoder=info.encoder||null; PLAYER.sessionId=info.session_id||null; PLAYER.streamId=null;
-    attachHls(v, info.playlist_url);
+    attachSession(v, PLAYER, info, pos);
   } else if(PLAYER.copyHls){
     // Copy-video HLS (Safari): re-open with the chosen audio track.
     try{ if(!await startCopyHls(v, pos, live)) return; }catch(e){ return toast(e.message); }
@@ -3110,7 +3149,8 @@ function updateStats(){
   const v=document.getElementById("video");
   const s=PLAYER.source||{};
   const method = PLAYER.method==='direct_play'?'Direct play'
-    : PLAYER.method==='transcode'?('Transcode'+(PLAYER.encoder?` · ${PLAYER.encoder}`:'')) : 'Remux';
+    : PLAYER.method==='transcode'?(PLAYER.vod?'Transcode · from cache'
+        :('Transcode'+(PLAYER.encoder?` · ${PLAYER.encoder}`:''))) : 'Remux';
   // source (from the server probe — the browser never sees these numbers)
   const srcVideo=[ (s.video_codec||'').toUpperCase(), s.bit_depth?`${s.bit_depth}-bit`:null, (s.hdr_format||(s.hdr?hdrLabel(s.hdr):null)) ].filter(Boolean).join(" · ")||'—';
   const srcRes = s.width&&s.height? `${s.width}×${s.height}`:'—';
@@ -3160,7 +3200,12 @@ function updateStats(){
   // outright; "held" means the transcoder is deliberately parked because the
   // buffer ahead is already deep, which is health, not a problem.
   let srv='';
-  if(PLAYER.health){
+  if(PLAYER.vod){
+    // A cache hit has no encoder, so it has no rate and no lead. Reporting the
+    // usual figures would be actively misleading: "Server ahead 1:32:00" reads
+    // as a runaway encoder rather than as a film that was finished yesterday.
+    srv+=`<div><b>Stream</b>already transcoded — served from the cache</div>`;
+  } else if(PLAYER.health){
     const h=PLAYER.health;
     // Prefer the recent rate over ffmpeg's cumulative one. A session that
     // burst ahead and then fell behind reports a healthy lifetime average
