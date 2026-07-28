@@ -18,12 +18,26 @@ use crate::domain::MediaFile;
 /// Segment length for on-the-fly HLS, in seconds. Keyframes are forced to
 /// align to this so segments are independently decodable.
 ///
+/// This is the floor under time-to-first-frame, and it is a hard one: a player
+/// cannot start on half a segment, so nothing plays until one whole segment
+/// exists. At 4 s a session that encodes at 1× spent four seconds producing
+/// the thing the viewer is waiting for, before any of the rest of the start
+/// path even begins. Two halves that (PERF-PLAN §4.4).
+///
+/// The costs are real and small: twice the playlist churn and segment
+/// requests (nothing at these sizes), a denser forced-keyframe grid worth a
+/// few percent of compression at a given bitrate, and double the per-segment
+/// mux overhead. The copy path cannot force keyframes at all — there
+/// `hls_time` is only a floor and real segmentation follows the source's GOP —
+/// so 2 s helps copy when the source GOP is short and never hurts it.
+///
 /// It is also the unit of every boundary the cluster failover contract talks
 /// about (`docs/PHASE3-SPIKE.md`): a session restarted on another node resumes
 /// at `N * SEGMENT_SECONDS`. Nothing may hardcode the number — the spike
-/// measured 4 but the property holds for any fixed length, and a second copy
-/// of the value is a failover bug waiting for the day this changes.
-pub const SEGMENT_SECONDS: u32 = 4;
+/// measured 4, this is now 2, and the property holds for any fixed length. A
+/// second copy of the value is a failover bug waiting for the day it changes
+/// again.
+pub const SEGMENT_SECONDS: u32 = 2;
 
 /// How fast ffmpeg may read a session's input, as data.
 ///
@@ -552,7 +566,13 @@ mod tests {
         assert!(joined.contains("scale=-2:'min(1080,ih)'"));
         assert!(joined.contains("-f hls"));
         assert!(joined.contains("/tmp/sess/index.m3u8"));
-        assert!(joined.contains("expr:gte(t,n_forced*4)"));
+        // The forced-keyframe grid and the muxer's segment length are the same
+        // number by construction — a session whose keyframes don't land on its
+        // segment boundaries produces segments that are not independently
+        // decodable, which is the one thing HLS requires of them. Written
+        // against the constant so the two can never be tuned apart.
+        assert!(joined.contains(&format!("expr:gte(t,n_forced*{SEGMENT_SECONDS})")));
+        assert!(joined.contains(&format!("-hls_time {SEGMENT_SECONDS}")));
         // SDR source → no tonemap, just pixel-format normalize.
         assert!(joined.contains("format=yuv420p"));
         assert!(!joined.contains("tonemap"));

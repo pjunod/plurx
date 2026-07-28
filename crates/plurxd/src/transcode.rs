@@ -1534,7 +1534,7 @@ impl TranscodeManager {
     /// Open a segment for streaming, waiting for ffmpeg to produce it if
     /// necessary.
     ///
-    /// Returns an open handle rather than the bytes. A 4-second segment of 4K
+    /// Returns an open handle rather than the bytes. One segment of 4K
     /// copy is around 35 MB, and reading that into a `Vec` before Axum sends
     /// its first byte is 35 MB of allocation and a memcpy per request, per
     /// session, four times a minute — for data that is about to be copied
@@ -2160,9 +2160,9 @@ mod tests {
     /// written down, which is the whole reason this parser exists.
     #[test]
     fn playlist_parsing_believes_extinf_not_the_index() {
-        // A copy session: `hls_time 4` is a floor, and real segments run to
-        // the source's GOP. Index arithmetic would call the third segment
-        // 8-12s; it is actually 14.5-24.5s.
+        // A copy session: `hls_time` is only a floor there, and real segments
+        // run to the source's GOP. Index arithmetic against a nominal 4 s
+        // would call the third segment 8-12s; it is actually 14.5-24.5s.
         let copy = "#EXTM3U\n\
                     #EXT-X-VERSION:7\n\
                     #EXT-X-TARGETDURATION:11\n\
