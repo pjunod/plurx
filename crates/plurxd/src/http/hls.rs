@@ -10,6 +10,7 @@
 //! attach our bearer token. Same model Plex uses; also what Phase 4 wants,
 //! since any cluster node can serve a session id without seeing the login.
 
+use axum::body::Body;
 use axum::extract::{Path as AxPath, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -129,7 +130,7 @@ pub async fn segment(
     State(state): State<AppState>,
     AxPath((session, seg)): AxPath<(String, String)>,
 ) -> Result<Response, ApiError> {
-    let bytes = state
+    let opened = state
         .transcode
         .segment(&session, &seg)
         .await
@@ -144,9 +145,22 @@ pub async fn segment(
         StatusCode::OK,
         [
             (header::CONTENT_TYPE, content_type.to_owned()),
-            (header::CACHE_CONTROL, "no-store".to_owned()),
+            (header::CONTENT_LENGTH, opened.len.to_string()),
+            // A finished segment never changes: ffmpeg writes `.tmp` and
+            // renames, and nothing rewrites the final name. The URI carries a
+            // session id, so the bytes behind it are unique to this session and
+            // safe to hold — `private` because that id is a capability, and
+            // `immutable` so a reload or a retry costs nothing. (The playlist
+            // stays `no-store`: it grows for the session's whole life.)
+            (
+                header::CACHE_CONTROL,
+                "private, max-age=3600, immutable".to_owned(),
+            ),
         ],
-        bytes,
+        // Streamed rather than buffered: a 4K copy segment is ~35 MB, and
+        // reading it into memory before the first byte goes out is an
+        // allocation and a copy per request for data on its way to a socket.
+        Body::from_stream(tokio_util::io::ReaderStream::new(opened.file)),
     )
         .into_response())
 }

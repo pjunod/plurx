@@ -731,6 +731,12 @@ async fn session_info(id: &str, s: &Session) -> SessionInfo {
     }
 }
 
+/// A segment, open and ready to stream.
+pub struct SegmentFile {
+    pub file: tokio::fs::File,
+    pub len: u64,
+}
+
 pub struct StartInfo {
     pub session_id: String,
     pub playlist_url: String,
@@ -1305,8 +1311,18 @@ impl TranscodeManager {
         None
     }
 
-    /// Read a segment, waiting for ffmpeg to produce it if necessary.
-    pub async fn segment(&self, session_id: &str, name: &str) -> Option<Vec<u8>> {
+    /// Open a segment for streaming, waiting for ffmpeg to produce it if
+    /// necessary.
+    ///
+    /// Returns an open handle rather than the bytes. A 4-second segment of 4K
+    /// copy is around 35 MB, and reading that into a `Vec` before Axum sends
+    /// its first byte is 35 MB of allocation and a memcpy per request, per
+    /// session, four times a minute — for data that is about to be copied
+    /// straight back out to a socket. Handing over the open file lets the
+    /// response stream, and opening it *here* closes the window where the
+    /// retention sweep could unlink the path between resolving it and reading
+    /// it: an unlinked file that is already open stays readable.
+    pub async fn segment(&self, session_id: &str, name: &str) -> Option<SegmentFile> {
         // Guard against path traversal: segment names are `segNNNNN.ts` only.
         if !is_safe_segment(name) {
             return None;
@@ -1317,7 +1333,8 @@ impl TranscodeManager {
 
         let deadline = Instant::now() + SEGMENT_WAIT;
         loop {
-            if let Ok(bytes) = tokio::fs::read(&path).await {
+            if let Ok(file) = tokio::fs::File::open(&path).await {
+                let len = file.metadata().await.ok()?.len();
                 // The client's download frontier just advanced. Resolve it
                 // against the index's real EXTINF bounds — the fetched
                 // segment's own end time, not an index times a nominal
@@ -1332,7 +1349,7 @@ impl TranscodeManager {
                         self.flow_control(&session, session_id).await;
                     }
                 }
-                return Some(bytes);
+                return Some(SegmentFile { file, len });
             }
             // Give up if the session was declared dead, or ffmpeg has exited and
             // the file still isn't there.
