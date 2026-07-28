@@ -159,6 +159,59 @@ The limit needs ffmpeg 5.1 or newer (`-readrate`), and the initial burst needs
 warning if the ffmpeg it found has neither, in which case streams run unpaced
 whatever this is set to.
 
+### Transcode buffering
+
+Delivery speed above governs the progressive remux, which the browser pulls at
+its own pace. An HLS session — a transcode, or the copy-video repackaging
+Safari and Apple TV get — is different: ffmpeg writes segments to disk and the
+player fetches them, so *the server decides how much buffer the viewer is
+allowed to have.* **Settings → Playback → Transcode buffering** is that
+decision, in three parts.
+
+| Control | Setting key | Default | What it does |
+|---|---|---|---|
+| Head start | `playback.hls_burst_secs` | 90 s | Content delivered flat-out before pacing engages. This is the buffer a stream *starts* with |
+| Then pace at | `playback.hls_readrate` | 2× | How fast the input is read afterwards. Every second of wall clock adds a second of runway at 2× |
+| Buffer limit | `playback.hls_ahead_max_secs` | 180 s | How far ahead of your playhead the session may get before it pauses itself |
+
+**How to read it:** the head start is the single number that decides whether a
+4K stream survives a network hiccup ten seconds in. Until 2026-07-28 the copy
+path ran at exactly real time with no head start at all, which is why 4K
+"started fine and then buffered", and why an Apple TV — which wants about three
+segments before it plays anything — took a dozen seconds to start. If 4K still
+stutters, raise the head start before touching anything else. If sessions eat
+too much disk, lower the buffer limit: a session's directory holds roughly the
+buffer limit plus a minute of already-played content, whatever the encoder's
+speed.
+
+The pause is real: at the buffer limit plurx sends the session's ffmpeg a
+`SIGSTOP` and resumes it with `SIGCONT` once you are within half the limit.
+`Settings → Activity` shows a held session, and the player's stats overlay
+(press `i`) says `held` beside how far ahead it is. A held session is healthy —
+it has built everything it is allowed to.
+
+### Where the transcode scratch lives
+
+Session segments are written under `<data_dir>/transcode`, which is wiped at
+every start. Two consequences worth acting on:
+
+- **Keep the data directory off the NAS.** If `PLURX_DATA_DIR` sits on a
+  network mount, every segment crosses the network twice — written by ffmpeg,
+  read back by the HTTP handler — on top of reading the source. Local disk for
+  the data directory, network mounts for media only.
+- **tmpfs is a good fit if you have the RAM.** The buffer limit bounds a
+  session, so the size is predictable: roughly `(ahead limit + 60 s) ×
+  bitrate`. At the 180 s default that is well under a gigabyte for a 720p
+  transcode and around 1.5 GB for a 4K copy-video session. Mount
+  `<data_dir>/transcode` as tmpfs and size it for the concurrent sessions you
+  expect, or lower the buffer limit to fit.
+
+For media on NFS or SMB, the head start is read from the NAS at whatever rate
+the mount can serve, so a starved mount now shows up as an encode speed below
+the configured pace in the stats overlay rather than as an unexplained stutter.
+Larger read sizes (`rsize=1048576` on NFS, SMB3 multichannel where the NAS
+offers it) help the burst land quickly.
+
 ## Pairing another application (monarr) — the runbook
 
 Another application can ask plurx to index exactly the folder it just wrote,
@@ -296,3 +349,6 @@ the loading overlay a few seconds longer, then playback).
 | Playback is software when you set `qsv` | The QSV probe was rejected at startup | Read `plurxd::transcode` logs; usually a driver/`/dev/dri` gap |
 | No posters, just filenames | No TMDB key (movies/TV) | Add a key in Settings → Metadata (anime needs none) |
 | Playing or seeking knocks a Wi-Fi client off the network (loses its IP and can't get another) | An unpaced stream is taking the whole link, starving the client's DHCP renewal of airtime | Lower **Settings → Playback → Delivery speed** to 2×; confirm with a `ping` to the gateway during a seek |
+| 4K starts, then buffers a few seconds in | The session never built a head start — the classic cause was realtime pacing on the copy-video path | Raise **Settings → Playback → Transcode buffering → Head start**; check the stats overlay's Server block for the encode speed |
+| Stutters every 20–40 seconds through a whole film | The encoder cannot keep up: the head start drains at (1 − speed) per second played | Stats overlay (`i`) → Server → encode speed. Below 1× means transcode, not network — pick a lower quality, or check that hardware encoding validated at startup |
+| The transcoder seems to stop partway through | It reached the buffer limit and suspended itself | Expected. `Settings → Activity` marks it held; it resumes when the playhead catches up |

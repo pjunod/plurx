@@ -262,13 +262,17 @@ decoding shows what the file is versus what your browser is actually rendering.
   progress, not a hang.
 - **Rich stats overlay:** Playback (method, encoder, position/duration), Source
   (codec, bit depth, HDR, resolution, bitrate, container, audio track), Now
-  decoding (the browser's actual resolution, dropped frames, buffer), and Network
-  (HLS bandwidth + stream rate) when transcoding.
+  decoding (the browser's actual resolution, dropped frames, buffer), Network
+  (HLS bandwidth + stream rate) when transcoding, and **Server** — the
+  encoder's speed as a multiple of real time, how many seconds it has produced
+  beyond your playhead, how long the stream took to start, and how many times
+  it has stalled.
 - **Skip Intro / Skip Credits** buttons appear when playback enters a marked
   region. Markers come from real **chapters** (MakeMKV, anime OP/ED, hand-
-  authored titles); a conservative duration-based end-credits estimate is the
-  fallback when a file has no chapters. Skipping credits that run to the end
-  finishes the item.
+  authored titles), read from the scan-time probe rather than by re-probing the
+  file every time you press Play; a conservative duration-based end-credits
+  estimate is the fallback when a file has no chapters. Skipping credits that
+  run to the end finishes the item.
 - **Auto-skip** intro & credits — an opt-in, per-user, persisted toggle in the
   preferences menu (default off).
 - **Method-aware seek:** direct play seeks natively; remux and transcode restart
@@ -277,6 +281,14 @@ decoding shows what the file is versus what your browser is actually rendering.
 **How to read it:** a "Skip Credits" button that reads as an estimate exists
 because that file had no end-credits chapter — it's a guess and the timeline
 knows it. Chapter-derived buttons are exact.
+
+**How to read the Server block:** encode speed below 1× means the server
+cannot produce the stream as fast as you are watching it, and a stall is only
+a matter of time — that is a transcode problem (a heavier file than this
+hardware can do at this quality), not a network one. Speed comfortably above
+1× with stalls anyway points at the link instead. "Server ahead · held" is not
+a fault: the transcoder has built the whole buffer it is allowed and paused
+itself until you catch up.
 
 ---
 

@@ -1,6 +1,8 @@
 # Performance — where the seconds go, and the plan to get them back
 
-**Status:** ready to build · **Diagnosed against:** `e7a12cf` (2026-07-28) ·
+**Status:** M0 + §4.1 + §4.2 + §4.3 shipped 2026-07-28 (plus §4.5, pulled
+forward — the telemetry made it a twenty-line change and it guards §4.2);
+§4.4, §4.6, §4.7 next · **Diagnosed against:** `e7a12cf` (2026-07-28) ·
 **Companions:** [PLAYBACK.md](PLAYBACK.md) (the delivery map),
 [ADAPTIVE-QUALITY.md](ADAPTIVE-QUALITY.md) (the ABR design this plan
 partially executes), [ARCHITECTURE.md](ARCHITECTURE.md) §3,
@@ -154,6 +156,51 @@ Numbered for citation; each names its evidence.
   session and pays the full §2.1 path again (`index.html:2331-2378`,
   by design — `reap_superseded`). Cached VOD assets (§6) make seeks free
   for cached items; live-session seek cost is otherwise accepted.
+
+## 2.7 What shipped 2026-07-28, and what it measured
+
+M0, §4.1, §4.2, §4.3 and §4.5 are built. Verified on a live server (not just
+unit tests) with a 5-minute 720p fixture; the numbers below are from that run
+and are the baseline the remaining milestones are judged against.
+
+- **Chapters no longer probe on play (§4.1).** Proved by breaking ffprobe
+  outright (`PLURX_FFPROBE=/nonexistent`): a file with chapters in its scan
+  probe still returned both real markers, and a file whose `chapters` key was
+  stripped fell back to the duration guess. The one-time backfill was observed
+  writing the key back into `probe_json`.
+- **Pacing reaches the command line (§4.2).** Live session args carry
+  `-readrate_initial_burst 30.0 -readrate 2.00`; the copy path's `-re` is gone.
+- **The head start is real.** 33 s of content produced in the first 5 s of a
+  session — under the old realtime pacing that number was 5 s, which is the
+  whole "starts, then buffers" bug in one measurement.
+- **The suspend cycle works.** With a deliberately small 20 s window: suspend
+  at 48 s ahead → output frozen at exactly the same `out_time` across four
+  polls → viewer fetched 13 segments → `ahead` went to −1 s → resumed → refilled
+  to 59 s → suspended again. SIGKILL on a suspended child still works, so the
+  reaper and the stop button needed no special case.
+- **Telemetry (M0).** `GET /hls/:session/status` reports `speed`,
+  `out_time_ms`, `ahead_seconds`, `suspended`; the player's stats overlay grew
+  a Server block, and TTFF/stall beacons land in Settings → Logs.
+- **Not yet measured on real hardware:** every number above is from software
+  x264 on a fixture, in a sandbox with no GPU. The 4K-HDR encode-speed
+  baseline that §5 must beat still has to be captured on nynuc — that is the
+  first thing to do before starting M2.
+
+Two deviations from the plan as written, both deliberate:
+
+1. **§4.5 came early.** The plan scheduled the progress-aware watchdog for
+   the second slice, but §4.2 forces the question — a suspended session makes
+   no progress, and the old watchdog would have read that as a wedge and
+   killed it. Given the telemetry already existed, the honest fix was the real
+   one. It also became a *poll* rather than a single verdict at a deadline,
+   which catches a session that produces a few seconds and then wedges — a
+   case the old one-shot check missed entirely.
+2. **A settings-UI bug found by testing, fixed in passing.** A stored value
+   that isn't one of the dropdown presets (say `20`, set through the API)
+   rendered as a different preset, and the next Save would have written that
+   one back — silently changing a setting nobody touched. `presetOpts` now
+   shows the stored value as its own option. The pre-existing Delivery-speed
+   dropdown has the same shape and could adopt it.
 
 ## 3. M0 — instrument first
 
@@ -691,8 +738,8 @@ chosen-by-probe (§5) · [ROADMAP.md](ROADMAP.md) — this plan's slice line.
 
 | Slice | Contents | Expected result |
 |---|---|---|
-| Weekend 1 | M0 + §4.1 + §4.2 + §4.3 | starts ~3–5 s; 4K copy-HLS and AirPlay stop stalling; numbers for everything else |
-| Weekend 2 | §4.4 + §4.5 + §4.6 (+§4.7 decision) | starts ~2–3 s; no spurious software fallbacks; Wi-Fi-stable rungs |
+| Weekend 1 ✅ | M0 + §4.1 + §4.2 + §4.3 + §4.5 | starts ~3–5 s; 4K copy-HLS and AirPlay stop stalling; numbers for everything else |
+| Weekend 2 | §4.4 + §4.6 (+§4.7 decision) | starts ~2–3 s; Wi-Fi-stable rungs |
 | Focused week | §5 (M2) | 4K HDR fully hardware; the 30 s stutter class gone; Auto=1080p viable |
 | Next | §6 (M3) | predicted plays start ≤1.5 s and seek like direct play |
 | With Phase 4 | §7 (M4) | pool of nodes; failover ≤5 s; overnight cluster pre-caching |

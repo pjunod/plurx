@@ -137,7 +137,7 @@ browser can't take the source codec. It is a remux, packaged as HLS.
 `TranscodeManager::start_copy`):
 
 ```
- ffmpeg -ss <resume> -re -i <file>
+ ffmpeg -ss <resume> -readrate_initial_burst 90 -readrate 2 -i <file>
         -map 0:v:0 -c:v copy [-tag:v hvc1]        # video untouched; hvc1 so Safari decodes HEVC
         -map 0:a:<n> -c:a aac -b:a 256k           # audio → AAC only when needed (else -c:a copy)
         -f hls -hls_segment_type fmp4             # fMP4 segments, NOT mpegts
@@ -153,10 +153,26 @@ Three details, each load-bearing:
   them as `video/mp4`.
 - **`-tag:v hvc1`.** MKV HEVC is usually tagged `hev1`, which Safari renders as
   a black frame; the sample entry must be `hvc1`. Harmless if already hvc1.
-- **`-re`.** Copy runs as fast as the disk allows; without pacing, a 45 Mb/s 4K
-  session would dump the whole file into the session dir at once. `-re` holds it
-  to ~1× real time, so a seek or an abandoned session is reaped before much
-  lands.
+- **Burst-then-hold pacing.** Copy runs as fast as the disk allows; without
+  pacing, a 45 Mb/s 4K session would dump the whole file into the session dir
+  at once. This was a bare `-re` — ~1× real time — until 2026-07-28, and that
+  was the bug behind "4K starts, then buffers a few seconds in": producing
+  segments at exactly the rate they are consumed means the player's runway is
+  whatever it fetched before playback began and never grows, so every hiccup
+  after that is a stall. Worse on an Apple TV, which wants ~3 segments before
+  it starts at all. Now the session delivers a configurable head start
+  flat-out (`-readrate_initial_burst`, default 90 s) and then settles to a
+  small multiple of real time (`-readrate`, default 2×), while the disk is
+  bounded by the ahead-window suspend below instead of by starving the viewer.
+  An ffmpeg older than 5.1 has neither flag and falls back to `-re`.
+- **The ahead-window suspend.** Once a session is more than
+  `playback.hls_ahead_max_secs` (default 180 s) of content ahead of the last
+  segment the client fetched, the reaper SIGSTOPs its ffmpeg, and SIGCONTs it
+  once the viewer is within half that. This is the bound `-re` used to
+  provide, minus the part where `-re` also capped the buffer. A stopped
+  process costs nothing, resumes instantly, and — unlike a rate limit —
+  adapts to a viewer who pauses. SIGKILL works on a stopped process, so the
+  idle reaper and the admin stop button need no special case.
 
 **Seek and audio-switch stay on this path.** A copy-HLS session sets
 `PLAYER.method = 'remux'` (honest — no video re-encode) and `PLAYER.copyHls =
@@ -233,14 +249,12 @@ verdict, a red flag if the reason is only container/audio.
 - **HLS session disk.** An HLS session's playlist grows for its whole life, so
   the reaper prunes segments more than ~60 s behind the playhead — on both the
   transcode and copy paths — keyed off the highest segment the client has
-  fetched. A 4K copy session is bounded to a rolling window instead of hoarding
-  the ~17 GB a full watch would otherwise accumulate. Two residuals remain: a
-  fast transcode can still race *ahead* of the playhead and write future
-  segments up to the transcoded file's size (bounded by the pre-existing
-  behavior, and at the lower transcode bitrate); and the prune is disk-only —
-  the playlist keeps listing pruned entries, which is safe precisely because
-  every seek starts a fresh session rather than scrubbing back into a deleted
-  window.
+  fetched. Ahead of the playhead, the suspend window bounds the other end, so
+  a session's directory now holds roughly
+  `hls_ahead_max_secs + 60 s` of content whatever the encoder's speed. One
+  residual remains: the prune is disk-only — the playlist keeps listing pruned
+  entries, which is safe precisely because every seek starts a fresh session
+  rather than scrubbing back into a deleted window.
 - **No client-side bitrate adaptation yet.** One encode runs at a time; the
   rung is chosen at start, not adapted per segment. The design for that is
   [ADAPTIVE-QUALITY.md](ADAPTIVE-QUALITY.md).
