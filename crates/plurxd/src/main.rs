@@ -1,3 +1,4 @@
+mod ffmpeg;
 mod http;
 mod logbuf;
 mod schedule;

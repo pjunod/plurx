@@ -13,9 +13,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use plurx_core::store::{keys, Store};
-use plurx_core::transcode::{self, Encoder, EncoderCaps, ToneMap, TranscodeOptions};
+use plurx_core::transcode::{
+    self, Encoder, EncoderCaps, Pacing, ToneMap, TranscodeOptions, SEGMENT_SECONDS,
+};
 use tokio::process::Child;
 use tokio::sync::Mutex;
+
+use crate::ffmpeg::{ffmpeg_bin, pacing_caps};
 
 /// Idle timeout after which a session's ffmpeg is killed and its dir removed.
 const SESSION_IDLE_SECS: u64 = 60;
@@ -33,6 +37,14 @@ const FIRST_SEGMENT_GRACE: Duration = Duration::from_secs(12);
 /// is unwatchable, and failing it gives the client a clear error instead of an
 /// endless gray screen (e.g. a Dolby Vision stream the build can't decode).
 const SOFTWARE_GRACE: Duration = Duration::from_secs(30);
+/// How long ffmpeg's output timestamp may sit still before the session counts
+/// as stuck rather than slow. ffmpeg emits a `-progress` block about twice a
+/// second while it is working at all, so a frozen `out_time` for this long is
+/// a wedged pipeline — not a 4K decode losing to the clock, which advances
+/// steadily however far behind realtime it falls.
+const PROGRESS_STALL: Duration = Duration::from_secs(10);
+/// How often the stall watchdog re-asks, once past its initial grace.
+const WATCHDOG_POLL: Duration = Duration::from_secs(5);
 /// How many segments behind the furthest-served one to keep on disk. An HLS
 /// session's playlist grows for its whole life (event type), so without pruning
 /// a full watch accumulates every segment — cheap at 720p, but a 4K copy-video
@@ -40,22 +52,150 @@ const SOFTWARE_GRACE: Duration = Duration::from_secs(30);
 /// playhead; ~60 s (15 × 4 s) covers a player's back-buffer, and a seek restarts
 /// the session anyway, so a played-past segment is never re-requested.
 const KEEP_BEHIND_SEGMENTS: i64 = 15;
+/// Default pace for an HLS session's input, as a multiple of realtime, and how
+/// many seconds it may deliver flat-out first. Admin-overridable (see
+/// [`keys::HLS_READRATE`] / [`keys::HLS_BURST_SECS`]).
+pub(crate) const HLS_READRATE_DEFAULT: f64 = 2.0;
+pub(crate) const HLS_BURST_SECS_DEFAULT: f64 = 90.0;
+/// How far ahead of the playhead a session may write before it is suspended,
+/// in seconds of content. See [`TranscodeManager::apply_ahead_window`].
+pub(crate) const HLS_AHEAD_MAX_SECS_DEFAULT: i64 = 180;
+
+/// Live encode telemetry for one session, fed by ffmpeg's `-progress` stream.
+///
+/// Without it, "slow" and "stalled" are the same observation. The only signal
+/// the session machinery had was whether a finished segment was listed yet —
+/// a yes/no answer to a question that needs a rate. A 4K HDR session
+/// tone-mapping at 0.7x and a session whose GPU has wedged look identical for
+/// the first twelve seconds, and the watchdog killed both, restarting the
+/// merely-slow one on software that is slower still.
+#[derive(Debug)]
+struct Progress {
+    /// Monotonic zero point for `moved_at_ms`.
+    started: Instant,
+    /// Content produced so far, in ms of output timeline; `-1` before the
+    /// first block. Relative to the session's own `-ss`, because an input
+    /// seek restarts output timestamps at zero — so this is "seconds of
+    /// content this session has made", which is what the ahead-window and the
+    /// stall check both want.
+    out_time_ms: AtomicI64,
+    /// Encode rate x1000 (`speed=1.85x` → 1850); `-1` when unknown.
+    speed_milli: AtomicI64,
+    /// `started.elapsed()` when `out_time_ms` last *moved*. Staleness is
+    /// measured from here rather than from the last block received: a stuck
+    /// ffmpeg keeps emitting progress blocks, it just stops advancing.
+    moved_at_ms: AtomicI64,
+}
+
+impl Progress {
+    fn new() -> Progress {
+        Progress {
+            started: Instant::now(),
+            out_time_ms: AtomicI64::new(-1),
+            speed_milli: AtomicI64::new(-1),
+            moved_at_ms: AtomicI64::new(0),
+        }
+    }
+
+    /// Forget everything measured so far. Called when a session respawns (the
+    /// hardware→software fallback): the new process starts its own timeline
+    /// from the same seek point, and carrying the dead process's numbers over
+    /// would make the replacement look instantly stalled.
+    fn reset(&self) {
+        self.out_time_ms.store(-1, Relaxed);
+        self.speed_milli.store(-1, Relaxed);
+        self.moved_at_ms
+            .store(self.started.elapsed().as_millis() as i64, Relaxed);
+    }
+
+    fn note_out_time(&self, ms: i64) {
+        if self.out_time_ms.swap(ms, Relaxed) != ms {
+            self.moved_at_ms
+                .store(self.started.elapsed().as_millis() as i64, Relaxed);
+        }
+    }
+
+    /// How long output has not advanced. Also the answer before the first
+    /// block ever arrives, which is what makes a session that never opened its
+    /// input measurable by the same rule as one that died halfway.
+    fn stalled_for(&self) -> Duration {
+        let now = self.started.elapsed().as_millis() as i64;
+        Duration::from_millis((now - self.moved_at_ms.load(Relaxed)).max(0) as u64)
+    }
+
+    fn out_time_ms(&self) -> Option<i64> {
+        Some(self.out_time_ms.load(Relaxed)).filter(|v| *v >= 0)
+    }
+
+    fn speed(&self) -> Option<f64> {
+        Some(self.speed_milli.load(Relaxed))
+            .filter(|v| *v >= 0)
+            .map(|v| v as f64 / 1000.0)
+    }
+}
+
+/// Apply one `key=value` line of ffmpeg's `-progress` output.
+///
+/// Values can be the literal `N/A` (before the first frame lands, and for
+/// `speed` on a copy that has not been running long enough to estimate),
+/// which parses to nothing rather than to zero — zero would read as "stalled"
+/// and zero would read as "not moving" respectively, both wrong.
+fn apply_progress_line(progress: &Progress, line: &str) {
+    let Some((key, value)) = line.split_once('=') else {
+        return;
+    };
+    let value = value.trim();
+    if value.is_empty() || value == "N/A" {
+        return;
+    }
+    match key.trim() {
+        // Both are microseconds despite the `_ms` name — an ffmpeg quirk, not
+        // a typo here. `out_time_us` is the newer spelling; accept either so
+        // this keeps working across builds.
+        "out_time_us" | "out_time_ms" => {
+            if let Ok(us) = value.parse::<i64>() {
+                progress.note_out_time(us / 1000);
+            }
+        }
+        "speed" => {
+            if let Ok(x) = value.trim_end_matches('x').parse::<f64>() {
+                progress.speed_milli.store((x * 1000.0) as i64, Relaxed);
+            }
+        }
+        _ => {}
+    }
+}
 
 /// Spawn an ffmpeg HLS transcode, draining its stderr (at `-loglevel error`)
-/// into the logs so a failure is visible instead of a silently dead session.
+/// into the logs so a failure is visible instead of a silently dead session,
+/// and its stdout — which carries `-progress` telemetry — into `progress`.
 fn spawn_ffmpeg(
     args: &[String],
     encoder_label: &'static str,
     session_id: &str,
+    progress: Arc<Progress>,
 ) -> Result<Child, String> {
+    // `-progress pipe:1` is a global option, so it can lead the vector; the
+    // HLS muxer writes to files, which leaves stdout free to carry it.
+    let mut full: Vec<String> = vec!["-progress".into(), "pipe:1".into()];
+    full.extend_from_slice(args);
     let mut child = tokio::process::Command::new(ffmpeg_bin())
-        .args(args)
+        .args(&full)
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
         .spawn()
         .map_err(|e| format!("spawning ffmpeg: {e}"))?;
+    if let Some(stdout) = child.stdout.take() {
+        tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            let mut lines = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                apply_progress_line(&progress, &line);
+            }
+        });
+    }
     if let Some(stderr) = child.stderr.take() {
         let sid = session_id.to_owned();
         let started = Instant::now();
@@ -96,6 +236,57 @@ async fn session_producing(dir: &std::path::Path) -> bool {
     }
 }
 
+/// Fail a session that has stopped producing, and only then.
+///
+/// This replaced a single verdict taken at a fixed deadline ("no segment after
+/// 30s ⇒ dead"), which could not tell a wedged pipeline from a slow one and
+/// killed both. It answers a different question — *is output still moving?* —
+/// on a poll, which is strictly more informative in both directions: a session
+/// that never opened its input still fails at the same deadline, a session
+/// decoding 4K at 0.4x is left alone, and a session that produced a few
+/// seconds and then wedged is now caught too (the old check looked once and,
+/// having found a segment, never looked again).
+///
+/// Exits as soon as there is real output, when the child dies on its own
+/// (which the playlist and segment readers already report), or when the
+/// session is failed by someone else.
+async fn watch_for_stall(session: Arc<Session>, dir: PathBuf, sid: String) {
+    // A generous floor before the first verdict: opening a 4K file over NFS
+    // and filling a first segment is legitimately slow, and `stalled_for`
+    // counts from session start, so judging earlier would fail cold opens.
+    tokio::time::sleep(SOFTWARE_GRACE).await;
+    loop {
+        if session.failed.load(Relaxed) || session_producing(&dir).await {
+            return;
+        }
+        let exited = {
+            let mut child = session.child.lock().await;
+            matches!(child.try_wait(), Ok(Some(_)))
+        };
+        if exited {
+            return;
+        }
+        // Stopped on purpose, or still moving: neither is a stall.
+        if !session.suspended.load(Relaxed) && session.progress.stalled_for() >= PROGRESS_STALL {
+            tracing::error!(
+                session = %sid,
+                stalled_s = session.progress.stalled_for().as_secs(),
+                produced_ms = session.progress.out_time_ms(),
+                "transcode produced no playable segment and its output has stopped advancing; \
+                 failing the session — the source is likely undecodable by this ffmpeg build \
+                 (e.g. a Dolby Vision profile it can't handle)"
+            );
+            {
+                let mut child = session.child.lock().await;
+                let _ = child.kill().await;
+            }
+            session.failed.store(true, Relaxed);
+            return;
+        }
+        tokio::time::sleep(WATCHDOG_POLL).await;
+    }
+}
+
 /// Remove the (empty/partial) HLS output so a restarted ffmpeg starts clean.
 async fn clear_session_dir(dir: &std::path::Path) {
     if let Ok(mut rd) = tokio::fs::read_dir(dir).await {
@@ -103,13 +294,6 @@ async fn clear_session_dir(dir: &std::path::Path) {
             let _ = tokio::fs::remove_file(entry.path()).await;
         }
     }
-}
-
-fn ffmpeg_bin() -> String {
-    std::env::var("PLURX_FFMPEG")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "ffmpeg".to_owned())
 }
 
 /// Fail in terms of the dependency that is actually missing.
@@ -167,8 +351,74 @@ struct Session {
     /// fast so the player shows an error instead of waiting on a gray screen.
     failed: AtomicBool,
     /// Highest segment index the client has fetched (-1 before the first). The
-    /// reaper prunes segments far enough behind this to bound disk use.
+    /// reaper prunes segments far enough behind this to bound disk use, and
+    /// the ahead-window measures from it.
     high_segment: AtomicI64,
+    /// Live encode telemetry (see [`Progress`]).
+    progress: Arc<Progress>,
+    /// True while the child is SIGSTOPped for running too far ahead of the
+    /// playhead. Everything that judges a session's health has to know: a
+    /// suspended encoder makes no progress *on purpose*.
+    suspended: AtomicBool,
+}
+
+/// Seconds of content produced beyond what the client has fetched.
+///
+/// Both terms are session-relative — ffmpeg's `out_time` restarts at zero after
+/// the input seek, and segment numbering restarts with the session — so the
+/// subtraction needs no absolute timeline. Derived from telemetry rather than
+/// by counting files on disk, which makes it exact to the frame, free to ask
+/// for, and correct for the copy path (whose segment lengths follow the source
+/// GOP and so can't be inferred from an index).
+fn ahead_seconds(produced_ms: Option<i64>, high_segment: i64) -> Option<i64> {
+    // `high_segment` is the last segment *fetched*, so the playhead sits at its
+    // end; -1 (nothing fetched yet) puts the playhead at zero.
+    let fetched_to = (high_segment + 1) * SEGMENT_SECONDS as i64;
+    Some(produced_ms? / 1000 - fetched_to)
+}
+
+/// Whether a session should be held, given how far ahead it is and whether it
+/// is already held.
+///
+/// The asymmetry is the point: suspend at the window, resume at half of it.
+/// A single threshold makes a session sitting on the boundary toggle on every
+/// reaper tick, which is a stream of signals and log lines to accomplish
+/// nothing. Resuming early is the safe direction — the cost of being wrong is
+/// some disk, and the cost of the other error is a viewer who runs dry.
+fn should_suspend(ahead_seconds: i64, max_secs: i64, currently_suspended: bool) -> bool {
+    if max_secs <= 0 {
+        return false; // window disabled
+    }
+    if currently_suspended {
+        ahead_seconds > max_secs / 2
+    } else {
+        ahead_seconds > max_secs
+    }
+}
+
+impl Session {
+    fn ahead_seconds(&self) -> Option<i64> {
+        ahead_seconds(self.progress.out_time_ms(), self.high_segment.load(Relaxed))
+    }
+}
+
+/// One live session as the activity page and the stats overlay see it.
+async fn session_info(id: &str, s: &Session) -> SessionInfo {
+    SessionInfo {
+        id: id.to_owned(),
+        file_id: s.file_id,
+        item_id: s.item_id,
+        item_title: s.item_title.clone(),
+        user_name: s.user_name.clone(),
+        target_height: s.target_height,
+        encoder: s.encoder_label,
+        started_unix: s.started_unix,
+        idle_seconds: s.last_access.lock().await.elapsed().as_secs(),
+        speed: s.progress.speed(),
+        out_time_ms: s.progress.out_time_ms(),
+        ahead_seconds: s.ahead_seconds(),
+        suspended: s.suspended.load(Relaxed),
+    }
 }
 
 pub struct StartInfo {
@@ -191,6 +441,15 @@ pub struct SessionInfo {
     pub encoder: &'static str,
     pub started_unix: i64,
     pub idle_seconds: u64,
+    /// Encode rate as a multiple of realtime, once ffmpeg has reported one.
+    /// The first question every buffering report asks is whether the server
+    /// is keeping up, and until this existed nothing could answer it.
+    pub speed: Option<f64>,
+    /// Content produced so far, in ms from this session's start offset.
+    pub out_time_ms: Option<i64>,
+    /// Seconds of content written beyond the segment the client last fetched.
+    pub ahead_seconds: Option<i64>,
+    pub suspended: bool,
 }
 
 pub struct TranscodeManager {
@@ -208,6 +467,42 @@ impl TranscodeManager {
             caps,
             sessions: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// A numeric setting, or its default when unset or unparseable.
+    async fn num_setting<T>(&self, key: &str, default: T) -> T
+    where
+        T: std::str::FromStr + PartialOrd + Default,
+    {
+        match self.store.get_setting(key).await {
+            Ok(Some(v)) => v
+                .trim()
+                .parse::<T>()
+                .ok()
+                .filter(|n| *n >= T::default())
+                .unwrap_or(default),
+            _ => default,
+        }
+    }
+
+    /// How an HLS session's input should be paced, given the admin settings
+    /// and what this ffmpeg build supports. `for_copy` picks the pre-5.1
+    /// degradation (see [`crate::ffmpeg::PacingCaps::resolve`]).
+    async fn pacing(&self, for_copy: bool) -> Pacing {
+        let rate = self
+            .num_setting(keys::HLS_READRATE, HLS_READRATE_DEFAULT)
+            .await;
+        let burst = self
+            .num_setting(keys::HLS_BURST_SECS, HLS_BURST_SECS_DEFAULT)
+            .await;
+        pacing_caps().await.resolve(rate, burst, for_copy)
+    }
+
+    /// Seconds of content a session may write beyond the client's playhead
+    /// before it is suspended. `0` disables the window entirely.
+    async fn ahead_max_secs(&self) -> i64 {
+        self.num_setting(keys::HLS_AHEAD_MAX_SECS, HLS_AHEAD_MAX_SECS_DEFAULT)
+            .await
     }
 
     /// Choose the encoder given the admin preference setting (empty = auto).
@@ -362,7 +657,8 @@ impl TranscodeManager {
             subtitle_burn,
             ..Default::default()
         };
-        let args = transcode::hls_args(&file, encoder, &opts, &dir.to_string_lossy());
+        let pacing = self.pacing(false).await;
+        let args = transcode::hls_args(&file, encoder, &opts, pacing, &dir.to_string_lossy());
         // Log the exact command — the single most useful diagnostic. It reveals
         // the decode/filter/encode pipeline actually used (e.g. whether heavy
         // HEVC is being hardware-decoded), and confirms which build is running.
@@ -370,7 +666,8 @@ impl TranscodeManager {
             %session_id, encoder = encoder.label(),
             "transcode ffmpeg args: {}", args.join(" ")
         );
-        let child = spawn_ffmpeg(&args, encoder.label(), &session_id)?;
+        let progress = Arc::new(Progress::new());
+        let child = spawn_ffmpeg(&args, encoder.label(), &session_id, Arc::clone(&progress))?;
 
         tracing::info!(
             %session_id, file_id, target_height, start_seconds,
@@ -393,6 +690,8 @@ impl TranscodeManager {
                 .unwrap_or(0),
             failed: AtomicBool::new(false),
             high_segment: AtomicI64::new(-1),
+            progress: Arc::clone(&progress),
+            suspended: AtomicBool::new(false),
         });
         self.sessions
             .lock()
@@ -420,18 +719,41 @@ impl TranscodeManager {
                     if session_producing(&dir).await {
                         // Producing real segments. If the picture is still gray,
                         // the problem is the *output* (tone-map/color), not the
-                        // pipeline stalling — this line says which.
+                        // pipeline stalling — this line says which. The speed
+                        // says how much headroom it has while doing it.
                         tracing::info!(
                             session = %sid,
+                            speed = session.progress.speed(),
                             "transcode producing segments within {}s (hardware path healthy)",
                             FIRST_SEGMENT_GRACE.as_secs()
                         );
                         return;
                     }
+                    // Producing nothing, but *is* it stuck? A session stopped
+                    // for running ahead obviously makes no progress, and one
+                    // decoding 4K at 0.4x is slow rather than broken —
+                    // restarting either on software trades a slow start for a
+                    // slower one. Only a session whose output has actually
+                    // stopped moving gets the fallback.
+                    if session.suspended.load(Relaxed) {
+                        return;
+                    }
+                    if session.progress.stalled_for() < PROGRESS_STALL {
+                        tracing::info!(
+                            session = %sid,
+                            produced_ms = session.progress.out_time_ms(),
+                            speed = session.progress.speed(),
+                            "no finished segment yet, but the encoder is still advancing — \
+                             letting it run rather than restarting it on something slower"
+                        );
+                        return;
+                    }
                     tracing::warn!(
                         session = %sid,
-                        "no HLS segment from hardware within {}s (GPU contention, or a decode \
-                         the GPU can't do — e.g. Dolby Vision); retrying on software",
+                        stalled_s = session.progress.stalled_for().as_secs(),
+                        "no HLS segment from hardware within {}s and output has stopped \
+                         advancing (GPU contention, or a decode the GPU can't do — e.g. \
+                         Dolby Vision); retrying on software",
                         FIRST_SEGMENT_GRACE.as_secs()
                     );
                     {
@@ -443,9 +765,19 @@ impl TranscodeManager {
                         &file,
                         Encoder::Software,
                         &opts,
+                        pacing,
                         &dir.to_string_lossy(),
                     );
-                    match spawn_ffmpeg(&sw_args, Encoder::Software.label(), &sid) {
+                    // The replacement writes its own timeline from the same
+                    // seek point; keeping the dead process's telemetry would
+                    // make it look stalled from its first second.
+                    session.progress.reset();
+                    match spawn_ffmpeg(
+                        &sw_args,
+                        Encoder::Software.label(),
+                        &sid,
+                        Arc::clone(&session.progress),
+                    ) {
                         Ok(child) => {
                             *session.child.lock().await = child;
                             *session.last_access.lock().await = Instant::now();
@@ -459,24 +791,7 @@ impl TranscodeManager {
                     }
                 }
 
-                // Fail-fast guard: whatever is running now (software, or a
-                // software-from-the-start session) must produce a first segment
-                // in the software window, or the session is declared dead.
-                tokio::time::sleep(SOFTWARE_GRACE).await;
-                if !session_producing(&dir).await {
-                    tracing::error!(
-                        session = %sid,
-                        "no HLS segment within {}s of software transcode; failing the session — \
-                         the source is likely undecodable by this ffmpeg build (e.g. a Dolby \
-                         Vision profile it can't handle)",
-                        SOFTWARE_GRACE.as_secs()
-                    );
-                    {
-                        let mut child = session.child.lock().await;
-                        let _ = child.kill().await;
-                    }
-                    session.failed.store(true, Relaxed);
-                }
+                watch_for_stall(session, dir, sid).await;
             });
         }
 
@@ -534,13 +849,15 @@ impl TranscodeManager {
             start_seconds,
             audio_override,
             transcode_audio,
+            self.pacing(true).await,
             &dir.to_string_lossy(),
         );
         tracing::info!(
             %session_id, file_id, start_seconds,
             "copy-video HLS ffmpeg args: {}", args.join(" ")
         );
-        let child = spawn_ffmpeg(&args, "copy", &session_id)?;
+        let progress = Arc::new(Progress::new());
+        let child = spawn_ffmpeg(&args, "copy", &session_id, Arc::clone(&progress))?;
 
         let session = Arc::new(Session {
             dir: dir.clone(),
@@ -558,34 +875,22 @@ impl TranscodeManager {
                 .unwrap_or(0),
             failed: AtomicBool::new(false),
             high_segment: AtomicI64::new(-1),
+            progress: Arc::clone(&progress),
+            suspended: AtomicBool::new(false),
         });
         self.sessions
             .lock()
             .await
             .insert(session_id.clone(), Arc::clone(&session));
 
-        // Fail-fast guard: copy has no encoder ladder, but if the first segment
-        // never lands (undecodable source, ffmpeg refusal) mark the session
-        // failed so the player errors instead of waiting on a gray screen.
+        // Fail-fast guard: copy has no encoder ladder, but if the segments stop
+        // coming (undecodable source, ffmpeg refusal) mark the session failed
+        // so the player errors instead of waiting on a gray screen.
         {
             let session = Arc::clone(&session);
             let dir = dir.clone();
             let sid = session_id.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(SOFTWARE_GRACE).await;
-                if !session_producing(&dir).await {
-                    tracing::error!(
-                        session = %sid,
-                        "no HLS segment within {}s of copy-video session; failing it",
-                        SOFTWARE_GRACE.as_secs()
-                    );
-                    {
-                        let mut child = session.child.lock().await;
-                        let _ = child.kill().await;
-                    }
-                    session.failed.store(true, Relaxed);
-                }
-            });
+            tokio::spawn(async move { watch_for_stall(session, dir, sid).await });
         }
 
         Ok(StartInfo {
@@ -607,20 +912,19 @@ impl TranscodeManager {
         let sessions = self.sessions.lock().await;
         let mut out = Vec::with_capacity(sessions.len());
         for (id, s) in sessions.iter() {
-            out.push(SessionInfo {
-                id: id.clone(),
-                file_id: s.file_id,
-                item_id: s.item_id,
-                item_title: s.item_title.clone(),
-                user_name: s.user_name.clone(),
-                target_height: s.target_height,
-                encoder: s.encoder_label,
-                started_unix: s.started_unix,
-                idle_seconds: s.last_access.lock().await.elapsed().as_secs(),
-            });
+            out.push(session_info(id, s).await);
         }
         out.sort_by_key(|s| s.started_unix);
         out
+    }
+
+    /// One session's live telemetry, for the player's stats overlay. Does not
+    /// touch `last_access`: asking how a stream is doing is not the same as
+    /// fetching from it, and a status poll must not keep an abandoned session
+    /// alive past the idle reaper.
+    pub async fn session_status(&self, session_id: &str) -> Option<SessionInfo> {
+        let session = self.sessions.lock().await.get(session_id).cloned()?;
+        Some(session_info(session_id, &session).await)
     }
 
     /// Kill one session now (the activity page's stop button). True if it
@@ -736,35 +1040,100 @@ impl TranscodeManager {
         removed
     }
 
-    /// Background loop: kill and remove sessions idle beyond the timeout.
+    /// Hold a session that has run far enough ahead of the playhead, and let
+    /// it go again once the viewer has caught up.
+    ///
+    /// This is what replaced realtime pacing as the bound on disk. `-re` held
+    /// production to exactly the rate of consumption, which bounded the
+    /// session directory *and* guaranteed the viewer never had a buffer. The
+    /// pair that separates those two concerns is: pace generously (burst, then
+    /// a small multiple of realtime) so a buffer actually builds, and stop the
+    /// encoder outright once the buffer is deep enough. A stopped ffmpeg costs
+    /// nothing and resumes in microseconds — it is the same trick every other
+    /// just-in-time server uses, and unlike a rate limit it adapts to a viewer
+    /// who pauses.
+    ///
+    /// Hysteresis is deliberate: resume at half the window rather than at the
+    /// window, or a session sitting exactly on the boundary would toggle every
+    /// tick. SIGKILL still works on a stopped process, so the idle reaper and
+    /// the admin stop button need no special case; a suspended session that
+    /// nobody comes back to is reaped on idle like any other.
+    async fn apply_ahead_window(&self, session: &Session, session_id: &str, max_secs: i64) {
+        let Some(ahead) = session.ahead_seconds() else {
+            return; // no telemetry yet — nothing produced, nothing to hold
+        };
+        let suspended = session.suspended.load(Relaxed);
+        let want_suspend = should_suspend(ahead, max_secs, suspended);
+        if want_suspend == suspended {
+            return;
+        }
+        let signal = if want_suspend {
+            libc::SIGSTOP
+        } else {
+            libc::SIGCONT
+        };
+        let sent = {
+            let child = session.child.lock().await;
+            match child.id() {
+                // SAFETY: `kill(2)` with a pid this process owns and a signal
+                // constant. The child is alive as far as we know; a race with
+                // its exit yields ESRCH, which the return check handles.
+                Some(pid) => unsafe { libc::kill(pid as libc::pid_t, signal) == 0 },
+                None => false, // already reaped
+            }
+        };
+        if !sent {
+            return;
+        }
+        session.suspended.store(want_suspend, Relaxed);
+        if want_suspend {
+            tracing::debug!(
+                session = %session_id, ahead_seconds = ahead, max_secs,
+                "suspending transcode: far enough ahead of the playhead"
+            );
+        } else {
+            tracing::debug!(
+                session = %session_id, ahead_seconds = ahead,
+                "resuming transcode: the viewer caught up"
+            );
+        }
+    }
+
+    /// Background loop: kill and remove sessions idle beyond the timeout,
+    /// prune played-past segments, and hold sessions that have run ahead.
     pub async fn reap_loop(self: Arc<Self>) {
         let mut ticker = tokio::time::interval(Duration::from_secs(15));
         loop {
             ticker.tick().await;
             let idle = Duration::from_secs(SESSION_IDLE_SECS);
+            let ahead_max = self.ahead_max_secs().await;
             let mut expired = Vec::new();
-            let mut live = Vec::new(); // (dir, high_segment) for behind-playhead GC
+            let mut live = Vec::new();
             {
                 let sessions = self.sessions.lock().await;
                 for (id, s) in sessions.iter() {
                     if s.last_access.lock().await.elapsed() > idle {
                         expired.push((id.clone(), Arc::clone(s)));
                     } else {
-                        live.push((s.dir.clone(), s.high_segment.load(Relaxed)));
+                        live.push((id.clone(), Arc::clone(s)));
                     }
                 }
             }
             for (id, session) in expired {
                 self.sessions.lock().await.remove(&id);
+                // Kills a suspended child too — SIGKILL is not blockable and
+                // does not need the process scheduled to take effect.
                 let _ = session.child.lock().await.kill().await;
                 let _ = tokio::fs::remove_dir_all(&session.dir).await;
                 tracing::info!(session_id = %id, "reaped idle transcode session");
             }
-            // Bound disk on active sessions: an HLS playlist grows for the whole
-            // session, so prune segments well behind the playhead (a 4K copy
-            // session would otherwise hoard tens of GB).
-            for (dir, high) in live {
-                gc_old_segments(&dir, high).await;
+            for (id, session) in live {
+                // Bound disk on active sessions: an HLS playlist grows for the
+                // whole session, so prune segments well behind the playhead (a
+                // 4K copy session would otherwise hoard tens of GB)…
+                gc_old_segments(&session.dir, session.high_segment.load(Relaxed)).await;
+                // …and bound how far *ahead* of the playhead it may get.
+                self.apply_ahead_window(&session, &id, ahead_max).await;
             }
         }
     }
@@ -854,6 +1223,109 @@ mod tests {
         assert_eq!(bitrate_for_height(240), 1_200);
     }
 
+    /// The progress stream is the only thing that can tell slow from stuck, so
+    /// what it refuses to believe matters as much as what it parses.
+    #[test]
+    fn progress_lines_parse_and_reject() {
+        let p = Progress::new();
+        assert_eq!(
+            p.out_time_ms(),
+            None,
+            "nothing known before the first block"
+        );
+        assert_eq!(p.speed(), None);
+
+        // `N/A` arrives before the first frame lands, and for `speed` on a
+        // session too young to estimate one. It is not zero: zero out_time
+        // reads as "produced nothing" and zero speed reads as "stalled".
+        for line in ["out_time_us=N/A", "speed=N/A", "bitrate=N/A", "frame=0"] {
+            apply_progress_line(&p, line);
+        }
+        assert_eq!(p.out_time_ms(), None);
+        assert_eq!(p.speed(), None);
+
+        // Microseconds in, milliseconds out — `out_time_ms` is misnamed by
+        // ffmpeg and also carries microseconds, so both spellings mean the same.
+        apply_progress_line(&p, "out_time_us=5960000");
+        assert_eq!(p.out_time_ms(), Some(5960));
+        apply_progress_line(&p, "out_time_ms=8000000");
+        assert_eq!(p.out_time_ms(), Some(8000));
+
+        apply_progress_line(&p, "speed=46.2x");
+        assert_eq!(p.speed(), Some(46.2));
+        apply_progress_line(&p, "speed=0.71x");
+        assert_eq!(p.speed(), Some(0.71));
+
+        // Junk and unknown keys change nothing.
+        for line in ["", "no-equals-sign", "speed=", "out_time_us=abc", "fps=25"] {
+            apply_progress_line(&p, line);
+        }
+        assert_eq!(p.out_time_ms(), Some(8000));
+        assert_eq!(p.speed(), Some(0.71));
+
+        // A respawn (the hardware→software fallback) starts a fresh timeline;
+        // carrying the dead process's numbers would read as an instant stall.
+        p.reset();
+        assert_eq!(p.out_time_ms(), None);
+        assert_eq!(p.speed(), None);
+    }
+
+    /// Staleness must measure the last time output *moved*, not the last block
+    /// received: a wedged ffmpeg keeps emitting progress with a frozen time.
+    #[test]
+    fn stall_is_measured_from_movement_not_from_chatter() {
+        let p = Progress::new();
+        apply_progress_line(&p, "out_time_us=1000000");
+        let after_move = p.stalled_for();
+        // Re-reporting the same timestamp is not progress.
+        for _ in 0..5 {
+            apply_progress_line(&p, "out_time_us=1000000");
+            apply_progress_line(&p, "speed=0.9x");
+        }
+        assert!(
+            p.stalled_for() >= after_move,
+            "repeating a timestamp must not reset the stall clock"
+        );
+        // Moving forward does reset it.
+        std::thread::sleep(Duration::from_millis(5));
+        let before = p.stalled_for();
+        apply_progress_line(&p, "out_time_us=2000000");
+        assert!(p.stalled_for() <= before);
+    }
+
+    #[test]
+    fn ahead_of_the_playhead() {
+        // 60s produced, nothing fetched → the whole 60s is runway.
+        assert_eq!(ahead_seconds(Some(60_000), -1), Some(60));
+        // Fetched segment 0 (0–4s) → 56s of runway at the default length.
+        assert_eq!(
+            ahead_seconds(Some(60_000), 0),
+            Some(60 - SEGMENT_SECONDS as i64)
+        );
+        // A client that has caught up to the write head has no runway…
+        assert_eq!(ahead_seconds(Some(40_000), 9), Some(0));
+        // …and one fetching faster than production goes negative, which is
+        // exactly the state a stall is made of.
+        assert!(ahead_seconds(Some(40_000), 12).is_some_and(|a| a < 0));
+        // No telemetry yet is not "zero ahead" — it is "don't know".
+        assert_eq!(ahead_seconds(None, 5), None);
+    }
+
+    #[test]
+    fn suspend_window_has_hysteresis() {
+        // Running: hold only once past the window.
+        assert!(!should_suspend(179, 180, false));
+        assert!(should_suspend(181, 180, false));
+        // Held: keep holding until the viewer has eaten half of it, so a
+        // session parked on the boundary doesn't toggle every tick.
+        assert!(should_suspend(120, 180, true));
+        assert!(should_suspend(91, 180, true));
+        assert!(!should_suspend(90, 180, true));
+        // Disabled window never suspends, whatever the numbers say.
+        assert!(!should_suspend(10_000, 0, false));
+        assert!(!should_suspend(10_000, 0, true));
+    }
+
     #[test]
     fn segment_index_parsing() {
         assert_eq!(segment_index("seg00000.ts"), Some(0));
@@ -898,7 +1370,149 @@ mod tests {
         assert!(p.join("seg00000.ts").exists());
     }
 
+    /// Write a real (tiny) H.264 file, because the fixtures elsewhere are
+    /// deliberately garbage bytes and ffmpeg refuses them — which is fine when
+    /// the assertion is about bookkeeping, and useless when it is about
+    /// telemetry that only exists while ffmpeg is genuinely working.
+    fn write_real_video(path: &std::path::Path, seconds: u32) {
+        let status = std::process::Command::new(
+            std::env::var("PLURX_FFMPEG").unwrap_or_else(|_| "ffmpeg".into()),
+        )
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("testsrc=size=160x120:rate=15:duration={seconds}"),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-g",
+            "15",
+            "-y",
+        ])
+        .arg(path)
+        .status();
+        assert!(
+            status.map(|s| s.success()).unwrap_or(false),
+            "fixture encode failed — this test needs a working ffmpeg"
+        );
+    }
+
+    /// The whole point of the telemetry is that it comes from a running
+    /// encoder, so this drives one: real input, real `-progress` stream, real
+    /// signals. It is the only test that can catch the plumbing being wrong —
+    /// a stdout that was never piped, a progress flag ffmpeg ignored, a
+    /// SIGSTOP sent to the wrong pid — because every one of those looks
+    /// perfectly healthy from the outside.
+    #[tokio::test]
+    async fn a_running_session_reports_progress_and_answers_to_signals() {
+        super::require_ffmpeg();
+        use plurx_core::store::SqliteStore;
+        let media = tempfile::tempdir().expect("media dir");
+        let src = media.path().join("clip.mp4");
+        write_real_video(&src, 60);
+
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let file_id = seed_file_at(&store, &src.to_string_lossy()).await;
+        let work = tempfile::tempdir().expect("work");
+        let mgr = TranscodeManager::new(
+            Arc::clone(&store),
+            work.path().to_path_buf(),
+            EncoderCaps::default(),
+        );
+        // Burst then crawl. The burst gives the session something to be ahead
+        // *with* straight away; the realtime pace afterwards keeps it alive for
+        // the rest of the test, because an unpaced copy of a short clip
+        // finishes before there is anything left to suspend.
+        store.put_setting(keys::HLS_READRATE, "1").await.expect("s");
+        store
+            .put_setting(keys::HLS_BURST_SECS, "20")
+            .await
+            .expect("s");
+
+        let info = mgr
+            .start_copy(file_id, 0.0, None, false, "paul")
+            .await
+            .expect("copy session");
+        let session = mgr
+            .sessions
+            .lock()
+            .await
+            .get(&info.session_id)
+            .cloned()
+            .expect("session is tracked");
+
+        // Telemetry arrives from the real progress stream, and advances. (The
+        // first block can legitimately read zero — a frame at PTS 0 — so this
+        // waits for movement, not merely for a number.)
+        let produced = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                match session.progress.out_time_ms() {
+                    Some(ms) if ms >= 3_000 => return ms,
+                    _ => tokio::time::sleep(Duration::from_millis(50)).await,
+                }
+            }
+        })
+        .await
+        .expect("ffmpeg reported an advancing output timeline");
+        assert!(produced >= 3_000);
+        assert!(
+            session.progress.speed().is_some(),
+            "the speed field parses too — it is what tells slow from stuck"
+        );
+
+        // Nothing has been fetched, so everything produced is runway.
+        assert!(
+            session.ahead_seconds().is_some_and(|a| a > 0),
+            "produced content with an unmoved playhead is ahead of the playhead"
+        );
+
+        // A window it has already exceeded suspends it, and a suspended
+        // encoder stops advancing — which is the property the watchdog relies
+        // on being able to tell apart from a wedge.
+        mgr.apply_ahead_window(&session, &info.session_id, 1).await;
+        assert!(session.suspended.load(Relaxed), "session was held");
+        let frozen = session.progress.out_time_ms();
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert_eq!(
+            session.progress.out_time_ms(),
+            frozen,
+            "a suspended encoder produces nothing"
+        );
+
+        // Disabling the window resumes it — and it really resumes, rather than
+        // just having a flag cleared.
+        mgr.apply_ahead_window(&session, &info.session_id, 0).await;
+        assert!(!session.suspended.load(Relaxed), "session was released");
+        let moved = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if session.progress.out_time_ms() > frozen {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap_or(false);
+        assert!(moved, "SIGCONT actually restarted the encoder");
+
+        // A suspended child still dies on request — SIGKILL does not need the
+        // process to be scheduled, which is what makes the reaper safe.
+        mgr.apply_ahead_window(&session, &info.session_id, 1).await;
+        assert!(session.suspended.load(Relaxed), "held again");
+        assert!(mgr.stop_session(&info.session_id).await);
+        assert_eq!(mgr.active_sessions().await, 0);
+    }
+
     async fn seed_file(store: &Arc<dyn Store>) -> i64 {
+        seed_file_at(store, "/media/Heat.mkv").await
+    }
+
+    async fn seed_file_at(store: &Arc<dyn Store>, path: &str) -> i64 {
         use plurx_core::domain::{ItemKind, LibraryKind, NewItem, NewLibrary, ProbeResult};
         let lib = store
             .create_library(&NewLibrary {
@@ -924,7 +1538,7 @@ mod tests {
         store
             .upsert_file(
                 movie,
-                "/media/Heat.mkv",
+                path,
                 1,
                 1,
                 &ProbeResult {

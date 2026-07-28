@@ -17,7 +17,77 @@ use crate::domain::MediaFile;
 
 /// Segment length for on-the-fly HLS, in seconds. Keyframes are forced to
 /// align to this so segments are independently decodable.
+///
+/// It is also the unit of every boundary the cluster failover contract talks
+/// about (`docs/PHASE3-SPIKE.md`): a session restarted on another node resumes
+/// at `N * SEGMENT_SECONDS`. Nothing may hardcode the number — the spike
+/// measured 4 but the property holds for any fixed length, and a second copy
+/// of the value is a failover bug waiting for the day this changes.
 pub const SEGMENT_SECONDS: u32 = 4;
+
+/// How fast ffmpeg may read a session's input, as data.
+///
+/// The daemon resolves this — it is the half that knows what the ffmpeg build
+/// supports (`-readrate` landed in 5.1, `-readrate_initial_burst` in 6.1, and
+/// passing either to an older build is a hard exit rather than a warning) and
+/// what the admin configured. The builders here stay pure functions of it.
+///
+/// Why pacing exists at all: an unpaced `-c copy` is a disk-to-socket pipe
+/// that will write a whole 4K film into the session directory as fast as the
+/// NAS will serve it. Why it is not simply `1x`: a session paced at exactly
+/// realtime can never build a buffer, so the player's runway is whatever it
+/// managed to fetch before playback started and every jitter after that is a
+/// visible stall. The shape that satisfies both is burst-then-hold — fill a
+/// comfortable buffer immediately, then settle to a small multiple of realtime
+/// and let the ahead-window suspend (`TranscodeManager`) bound the rest.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Pacing {
+    /// Multiple of realtime to read the input at. `None` leaves it unpaced.
+    pub readrate: Option<f64>,
+    /// Seconds delivered flat-out before the rate engages. `None` omits the
+    /// clause (an ffmpeg between 5.1 and 6.1 has the rate but not the burst).
+    pub initial_burst: Option<f64>,
+    /// Use bare `-re` instead: exactly 1x, no burst, and the only pacing an
+    /// ffmpeg older than 5.1 understands. The degradation path, not a choice.
+    pub legacy_re: bool,
+}
+
+impl Pacing {
+    /// No pacing at all — the input is read as fast as it can be.
+    pub fn unpaced() -> Pacing {
+        Pacing::default()
+    }
+
+    /// The flags for **one** input. Must be placed before that input's `-i`,
+    /// like `-ss`: these are input options, and a second input left unpaced
+    /// drags the whole pipeline back to flat-out because the muxer interleaves
+    /// them.
+    ///
+    /// Public because the progressive remux (`/stream.mp4`) builds a
+    /// `Command` rather than an argument vector and needs the same flags —
+    /// one place decides their shape, so the two delivery paths cannot drift.
+    pub fn args(&self) -> Vec<String> {
+        let mut args = Vec::new();
+        self.push(&mut args);
+        args
+    }
+
+    fn push(&self, args: &mut Vec<String>) {
+        if self.legacy_re {
+            args.push("-re".into());
+            return;
+        }
+        let Some(rate) = self.readrate.filter(|r| *r > 0.0) else {
+            return;
+        };
+        if let Some(burst) = self.initial_burst.filter(|b| *b > 0.0) {
+            args.push("-readrate_initial_burst".into());
+            args.push(format!("{burst:.1}"));
+        }
+        args.push("-readrate".into());
+        args.push(format!("{rate:.2}"));
+    }
+}
 
 /// How HDR→SDR tone-mapping is performed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,6 +279,7 @@ pub fn hls_args(
     source: &MediaFile,
     encoder: Encoder,
     opts: &TranscodeOptions,
+    pacing: Pacing,
     out_dir: &str,
 ) -> Vec<String> {
     let source_path = source.path.to_string_lossy().into_owned();
@@ -229,6 +300,10 @@ pub fn hls_args(
     let (decode_args, hwdownload) = decode_setup(encoder, source);
     args.extend(decode_args);
 
+    // Pace this input (see [`Pacing`]). An encode that runs faster than
+    // realtime otherwise writes the whole film ahead of a playhead that will
+    // never reach most of it.
+    pacing.push(&mut args);
     args.push("-i".into());
     args.push(source_path.clone());
 
@@ -241,6 +316,7 @@ pub fn hls_args(
             args.push("-ss".into());
             args.push(format!("{:.3}", opts.start_seconds));
         }
+        pacing.push(&mut args);
         args.push("-itsoffset".into());
         args.push(format!("{:.3}", source.audio_offset_ms as f64 / 1000.0));
         args.push("-i".into());
@@ -327,6 +403,7 @@ pub fn hls_copy_args(
     start_seconds: f64,
     audio_index: Option<i64>,
     transcode_audio: bool,
+    pacing: Pacing,
     out_dir: &str,
 ) -> Vec<String> {
     let source_path = source.path.to_string_lossy().into_owned();
@@ -337,10 +414,15 @@ pub fn hls_copy_args(
         args.push("-ss".into());
         args.push(format!("{start_seconds:.3}"));
     }
-    // Copy runs as fast as the disk allows; `-re` paces it to ~1x real time so a
-    // 4K session doesn't dump the whole file to the session dir at once (and a
-    // seek/abandon is reaped before much lands).
-    args.push("-re".into());
+    // Copy runs as fast as the disk allows, so it has to be paced — but *not*
+    // at 1x, which is what a bare `-re` here used to do. Realtime pacing meant
+    // the segments existed exactly as fast as they were consumed, so a 4K
+    // session's runway was whatever the player fetched before it started and
+    // never grew: the "starts fine, buffers ten seconds in" report, and the
+    // reason an Apple TV (which wants ~3 segments before it plays) took a
+    // dozen seconds to start. The disk is bounded by the ahead-window suspend
+    // and the behind-playhead GC now, not by starving the viewer.
+    pacing.push(&mut args);
     args.push("-i".into());
     args.push(source_path.clone());
 
@@ -351,7 +433,7 @@ pub fn hls_copy_args(
             args.push("-ss".into());
             args.push(format!("{start_seconds:.3}"));
         }
-        args.push("-re".into());
+        pacing.push(&mut args);
         args.push("-itsoffset".into());
         args.push(format!("{:.3}", source.audio_offset_ms as f64 / 1000.0));
         args.push("-i".into());
@@ -457,7 +539,13 @@ mod tests {
             video_bitrate_kbps: 6000,
             ..Default::default()
         };
-        let args = hls_args(&file(None), Encoder::Software, &opts, "/tmp/sess");
+        let args = hls_args(
+            &file(None),
+            Encoder::Software,
+            &opts,
+            Pacing::unpaced(),
+            "/tmp/sess",
+        );
         let joined = args.join(" ");
         assert!(joined.contains("-i /media/movie.mkv"));
         assert!(joined.contains("libx264"));
@@ -476,6 +564,7 @@ mod tests {
             &file(Some("hdr10")),
             Encoder::Software,
             &TranscodeOptions::default(),
+            Pacing::unpaced(),
             "/tmp/s",
         );
         let joined = args.join(" ");
@@ -494,6 +583,7 @@ mod tests {
             &file(Some("dolby_vision")),
             Encoder::Software,
             &opts,
+            Pacing::unpaced(),
             "/tmp/s",
         );
         let joined = args.join(" ");
@@ -508,7 +598,13 @@ mod tests {
             start_seconds: 90.5,
             ..Default::default()
         };
-        let args = hls_args(&file(None), Encoder::Software, &opts, "/tmp/s");
+        let args = hls_args(
+            &file(None),
+            Encoder::Software,
+            &opts,
+            Pacing::unpaced(),
+            "/tmp/s",
+        );
         // -ss must come before -i for fast input seeking.
         let ss = args.iter().position(|a| a == "-ss").expect("has -ss");
         let i = args.iter().position(|a| a == "-i").expect("has -i");
@@ -525,14 +621,27 @@ mod tests {
             }),
             ..Default::default()
         };
-        let args = hls_args(&file(None), Encoder::Software, &opts, "/tmp/s");
+        let args = hls_args(
+            &file(None),
+            Encoder::Software,
+            &opts,
+            Pacing::unpaced(),
+            "/tmp/s",
+        );
         assert!(args.join(" ").contains("subtitles='/media/movie.mkv':si=2"));
     }
 
     #[test]
     fn copy_args_keep_video_and_package_fmp4_hls() {
         // DTS → AAC, HEVC video copied, delivered as fMP4 HLS (the Safari path).
-        let args = hls_copy_args(&file(Some("hdr10")), 0.0, None, true, "/tmp/sess");
+        let args = hls_copy_args(
+            &file(Some("hdr10")),
+            0.0,
+            None,
+            true,
+            Pacing::unpaced(),
+            "/tmp/sess",
+        );
         let joined = args.join(" ");
         assert!(joined.contains("-c:v copy"));
         assert!(joined.contains("-tag:v hvc1")); // HEVC needs hvc1 for Safari
@@ -549,7 +658,14 @@ mod tests {
 
     #[test]
     fn copy_args_copy_audio_when_supported() {
-        let args = hls_copy_args(&file(None), 30.0, Some(1), false, "/tmp/s");
+        let args = hls_copy_args(
+            &file(None),
+            30.0,
+            Some(1),
+            false,
+            Pacing::unpaced(),
+            "/tmp/s",
+        );
         let joined = args.join(" ");
         assert!(joined.contains("-c:a copy")); // transcode_audio = false
         assert!(joined.contains("0:a:1?") || joined.contains("a:1?")); // chosen track
@@ -559,12 +675,98 @@ mod tests {
         assert!(ss < i);
     }
 
+    /// Pacing flags are *input* options: they must land before their own `-i`,
+    /// and a second input (the A/V-offset case) needs its own copy or the muxer
+    /// interleave drags the whole pipeline back to flat-out.
+    #[test]
+    fn pacing_precedes_every_input() {
+        let pacing = Pacing {
+            readrate: Some(2.0),
+            initial_burst: Some(90.0),
+            legacy_re: false,
+        };
+        let mut f = file(None);
+        f.audio_offset_ms = 250; // forces the second input
+        let args = hls_copy_args(&f, 0.0, None, false, pacing, "/tmp/s");
+
+        let inputs: Vec<usize> = args
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| *a == "-i")
+            .map(|(i, _)| i)
+            .collect();
+        let rates: Vec<usize> = args
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| *a == "-readrate")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(inputs.len(), 2, "offset file remuxes from two inputs");
+        assert_eq!(rates.len(), 2, "every input is paced, not just the first");
+        for (rate, input) in rates.iter().zip(&inputs) {
+            assert!(rate < input, "pacing is an input option, so it leads -i");
+        }
+        assert!(args.join(" ").contains("-readrate_initial_burst 90.0"));
+        // The old realtime pacing is gone: it is what starved the buffer.
+        assert!(!args.contains(&"-re".to_owned()));
+    }
+
+    #[test]
+    fn pacing_degrades_with_the_ffmpeg_build() {
+        let out = |p: Pacing| hls_copy_args(&file(None), 0.0, None, false, p, "/tmp/s").join(" ");
+        // Nothing configured (or pacing switched off): no flags at all.
+        assert!(!out(Pacing::unpaced()).contains("-readrate"));
+        assert!(!out(Pacing::unpaced()).contains("-re "));
+        // 5.1–6.0: rate limiting, no burst clause.
+        let rate_only = Pacing {
+            readrate: Some(3.0),
+            initial_burst: None,
+            legacy_re: false,
+        };
+        assert!(out(rate_only).contains("-readrate 3.00"));
+        assert!(!out(rate_only).contains("initial_burst"));
+        // Pre-5.1: bare `-re`, and never both.
+        let legacy = Pacing {
+            readrate: Some(2.0),
+            initial_burst: Some(90.0),
+            legacy_re: true,
+        };
+        assert!(out(legacy).contains("-re "));
+        assert!(!out(legacy).contains("-readrate"));
+    }
+
+    /// A transcode session is paced too — the same burst-then-hold shape. An
+    /// encoder faster than realtime otherwise races the playhead and writes
+    /// segments nobody fetches.
+    #[test]
+    fn transcode_input_is_paced_too() {
+        let pacing = Pacing {
+            readrate: Some(2.0),
+            initial_burst: Some(90.0),
+            legacy_re: false,
+        };
+        let args = hls_args(
+            &file(None),
+            Encoder::Software,
+            &TranscodeOptions::default(),
+            pacing,
+            "/tmp/s",
+        );
+        let rate = args
+            .iter()
+            .position(|a| a == "-readrate")
+            .expect("paced input");
+        let input = args.iter().position(|a| a == "-i").expect("has input");
+        assert!(rate < input);
+    }
+
     #[test]
     fn nvenc_swaps_encoder_and_adds_decode() {
         let args = hls_args(
             &file(None),
             Encoder::Nvenc,
             &TranscodeOptions::default(),
+            Pacing::unpaced(),
             "/tmp/s",
         );
         let joined = args.join(" ");
@@ -580,6 +782,7 @@ mod tests {
             &file(Some("dolby_vision")),
             Encoder::Qsv,
             &TranscodeOptions::default(),
+            Pacing::unpaced(),
             "/tmp/s",
         );
         let joined = args.join(" ");
@@ -599,7 +802,13 @@ mod tests {
         f.height = Some(1080);
         f.bit_depth = Some(8);
         f.hdr = None;
-        let args = hls_args(&f, Encoder::Qsv, &TranscodeOptions::default(), "/tmp/s");
+        let args = hls_args(
+            &f,
+            Encoder::Qsv,
+            &TranscodeOptions::default(),
+            Pacing::unpaced(),
+            "/tmp/s",
+        );
         let joined = args.join(" ");
         assert!(!joined.contains("-hwaccel qsv")); // software decode
         assert!(!joined.contains("hwdownload"));

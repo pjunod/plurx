@@ -655,6 +655,29 @@ impl MediaStore for SqliteStore {
         .await
     }
 
+    async fn merge_file_probe_chapters(
+        &self,
+        file_id: i64,
+        chapters_json: &str,
+    ) -> Result<(), StoreError> {
+        let chapters = chapters_json.to_owned();
+        self.with_conn(move |conn| {
+            // `json_set` rather than read-modify-write in Rust: the whole
+            // document is rewritten either way, but doing it in SQL keeps the
+            // update atomic against a concurrent scan writing the same row.
+            // Guarded on NOT NULL because json_set(NULL, …) is NULL, which
+            // would erase the probe-failed marker `probe_json IS NULL` — the
+            // one fingerprint the repair job keys on.
+            conn.execute(
+                "UPDATE files SET probe_json = json_set(probe_json, '$.chapters', json(?2))
+                 WHERE id = ?1 AND probe_json IS NOT NULL",
+                params![file_id, chapters],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     async fn get_file_probe_json(&self, file_id: i64) -> Result<Option<String>, StoreError> {
         self.with_conn(move |conn| {
             Ok(conn

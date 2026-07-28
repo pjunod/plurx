@@ -78,6 +78,28 @@ pub async fn start(
     }))
 }
 
+/// GET /api/v1/hls/:session/status — how the session is actually doing.
+///
+/// Capability auth like its siblings (the session id is the credential), and
+/// deliberately outside the `{segment}` route: a static path segment wins over
+/// a parameter in the router, and `status` is not a valid segment name anyway.
+///
+/// This exists because the first question every buffering report asks —
+/// *is the server keeping up?* — had no answer anywhere in the product. The
+/// player puts `speed` and `ahead_seconds` in the stats overlay, so "why did
+/// it stutter" resolves to a number instead of a theory.
+pub async fn status(
+    State(state): State<AppState>,
+    AxPath(session): AxPath<String>,
+) -> Result<Json<crate::transcode::SessionInfo>, ApiError> {
+    state
+        .transcode
+        .session_status(&session)
+        .await
+        .map(Json)
+        .ok_or(ApiError::NotFound("transcode session"))
+}
+
 /// GET /api/v1/hls/:session/index.m3u8 — capability auth (see module docs).
 pub async fn playlist(
     State(state): State<AppState>,

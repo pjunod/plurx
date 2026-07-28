@@ -21,6 +21,7 @@ tower-http = { workspace = true, features = ["trace", "fs", "cors"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 bytes = { workspace = true }
+libc = { workspace = true }
 futures-util = { workspace = true }
 mime_guess = { workspace = true }
 uuid = { workspace = true }

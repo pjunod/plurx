@@ -84,6 +84,21 @@ pub mod keys {
     /// else sharing the link — including, over Wi-Fi, the client's own DHCP.
     /// Absent means the built-in default.
     pub const STREAM_READRATE: &str = "playback.stream_readrate";
+    /// How fast an HLS session (transcode or copy-video) may read its input,
+    /// as a multiple of real time; "0" disables pacing. Separate from
+    /// [`STREAM_READRATE`] on purpose — the progressive remux is consumed by
+    /// the browser's own back-pressure, while an HLS session writes to disk
+    /// and needs its own answer.
+    pub const HLS_READRATE: &str = "playback.hls_readrate";
+    /// Seconds of content an HLS session may deliver flat-out before
+    /// [`HLS_READRATE`] engages. This is the buffer the viewer starts with, so
+    /// it is also what a marginal link gets to spend before it stalls.
+    pub const HLS_BURST_SECS: &str = "playback.hls_burst_secs";
+    /// Seconds of content an HLS session may write beyond the client's
+    /// playhead before it is suspended; "0" lets it run unbounded. This is the
+    /// disk bound that realtime pacing used to provide, minus the part where
+    /// realtime pacing also prevented the viewer from ever building a buffer.
+    pub const HLS_AHEAD_MAX_SECS: &str = "playback.hls_ahead_max_secs";
 }
 
 #[async_trait]
@@ -290,8 +305,21 @@ pub trait MediaStore: Send + Sync + 'static {
     /// Persist a manual A/V sync correction for one file (0 clears it).
     async fn set_file_audio_offset(&self, file_id: i64, offset_ms: i64) -> Result<(), StoreError>;
     /// The raw ffprobe JSON captured at scan time (for the declared per-stream
-    /// start-time readout in the player's sync menu).
+    /// start-time readout in the player's sync menu, and the chapter markers
+    /// the player shows as Skip Intro / Skip Credits).
     async fn get_file_probe_json(&self, file_id: i64) -> Result<Option<String>, StoreError>;
+    /// Graft a `chapters` array onto a file's stored probe JSON.
+    ///
+    /// Only for files probed before chapters were captured at scan time: the
+    /// play path probes such a file once, then writes the answer here so the
+    /// next play reads it like any other. `chapters_json` is a JSON array.
+    /// A file with no stored probe is left alone — there is nothing to graft
+    /// onto, and inventing a document would fake a successful probe.
+    async fn merge_file_probe_chapters(
+        &self,
+        file_id: i64,
+        chapters_json: &str,
+    ) -> Result<(), StoreError>;
     /// Files whose probe never succeeded (`probe_json IS NULL`), oldest scan
     /// first. `library_id` narrows to one library; `None` is server-wide. These
     /// are the records the retry job and the scan's repair pass exist for —

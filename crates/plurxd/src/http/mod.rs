@@ -106,6 +106,9 @@ pub fn router(state: AppState) -> Router {
         .route("/files/{id}/subs/{index}", get(stream::subtitles_vtt))
         .route("/files/{id}/hls/start", get(hls::start))
         .route("/hls/{session}/index.m3u8", get(hls::playlist))
+        // Before the `{segment}` catch-all in intent, though the router
+        // prefers the static segment regardless of registration order.
+        .route("/hls/{session}/status", get(hls::status))
         .route("/hls/{session}/{segment}", get(hls::segment))
         // Images
         .route("/images/{filename}", get(images::serve));

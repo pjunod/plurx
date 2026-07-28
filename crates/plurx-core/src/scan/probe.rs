@@ -60,6 +60,14 @@ pub async fn probe(path: &Path) -> Result<ProbeResult, ProbeError> {
             "json",
             "-show_format",
             "-show_streams",
+            // Chapters ride along here because the alternative is probing for
+            // them when someone presses Play — a second ffprobe of a
+            // NAS-mounted file on the click-to-first-frame path, paid every
+            // single time, for data that cannot change between scans. A file
+            // with no chapters still reports `"chapters": []`, so the key's
+            // *presence* is what tells a current probe from one taken before
+            // this landed (see `markers_for` in plurxd).
+            "-show_chapters",
         ])
         .arg(path)
         .output()

@@ -964,6 +964,7 @@ dependencies = [
  "clap",
  "futures-util",
  "http-body-util",
+ "libc",
  "mime_guess",
  "plurx-compat-plex",
  "plurx-core",

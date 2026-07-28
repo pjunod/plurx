@@ -19,23 +19,8 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use super::error::ApiError;
 use super::extract::AuthUser;
+use crate::ffmpeg::{ffmpeg_bin, ffprobe_bin, pacing_caps, PacingCaps};
 use crate::state::AppState;
-
-/// ffmpeg binary, overridable via `PLURX_FFMPEG` (jellyfin-ffmpeg / pinned path).
-fn ffmpeg_bin() -> String {
-    std::env::var("PLURX_FFMPEG")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "ffmpeg".to_owned())
-}
-
-/// ffprobe binary, overridable via `PLURX_FFPROBE` (jellyfin-ffmpeg / pinned).
-fn ffprobe_bin() -> String {
-    std::env::var("PLURX_FFPROBE")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "ffprobe".to_owned())
-}
 
 /// How fast a remux is allowed to run, as a multiple of real time, and how much
 /// it may deliver flat-out before that limit engages.
@@ -57,68 +42,6 @@ pub(crate) const READRATE_DEFAULT: f64 = 4.0;
 /// Seconds of content delivered flat-out before the rate limit engages.
 const READRATE_BURST_SECS: f64 = 30.0;
 
-/// Which pacing flags this ffmpeg understands. `-readrate` landed in 5.1 and
-/// `-readrate_initial_burst` in 6.1; passing either to an older build is a hard
-/// exit, not a warning, so probe rather than assume. Probed once per process.
-#[derive(Debug, Clone, Copy, Default)]
-struct PacingCaps {
-    readrate: bool,
-    initial_burst: bool,
-}
-
-static PACING: tokio::sync::OnceCell<PacingCaps> = tokio::sync::OnceCell::const_new();
-
-/// Scan `ffmpeg -h full` for the pacing options.
-///
-/// Matches the *declaration* — an indented line whose first token is the option
-/// — not any mention of the name. A plain substring search reports `-readrate`
-/// on an ffmpeg 4.x that has no such option, because `-re`'s own help line reads
-/// "…equivalent to -readrate 1". Getting that wrong is not cosmetic: an
-/// unrecognised option makes ffmpeg exit rather than warn, so every stream on
-/// that build would fail to start.
-fn parse_pacing_caps(help: &str) -> PacingCaps {
-    let declared = |name: &str| {
-        help.lines().any(|l| {
-            // split_whitespace already skips the leading indent.
-            l.split_whitespace().next().is_some_and(|tok| tok == name)
-        })
-    };
-    PacingCaps {
-        readrate: declared("-readrate"),
-        initial_burst: declared("-readrate_initial_burst"),
-    }
-}
-
-async fn pacing_caps() -> PacingCaps {
-    *PACING
-        .get_or_init(|| async {
-            let out = tokio::process::Command::new(ffmpeg_bin())
-                .args(["-hide_banner", "-h", "full"])
-                .output()
-                .await;
-            let caps = match out {
-                Ok(o) => {
-                    // Help goes to stdout, but older builds split it; check both.
-                    let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
-                    text.push_str(&String::from_utf8_lossy(&o.stderr));
-                    parse_pacing_caps(&text)
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "could not probe ffmpeg for pacing support");
-                    PacingCaps::default()
-                }
-            };
-            if !caps.readrate {
-                tracing::warn!(
-                    "this ffmpeg has no -readrate; remux streams will run unpaced and can \
-                     saturate a client's link. ffmpeg 5.1+ is recommended."
-                );
-            }
-            caps
-        })
-        .await
-}
-
 /// The configured remux pace, in multiples of real time. `0` disables pacing.
 /// Admin-settable because the right answer depends on the link: a 10GbE lab
 /// wants it off, a marginal Wi-Fi bridge wants it lower.
@@ -137,15 +60,15 @@ async fn readrate_setting(state: &AppState) -> f64 {
 /// Push `-readrate`/`-readrate_initial_burst` for one input, if this build
 /// supports them and pacing is enabled. Must be called before that input's
 /// `-i`, like `-ss`: these are input options.
+///
+/// The flags themselves come from `Pacing`, shared with the HLS builders, so
+/// the two delivery paths can't drift on what pacing means. `legacy_realtime_ok`
+/// is false here: a progressive remux is consumed by the browser's own
+/// back-pressure, so an old ffmpeg is better off unpaced than pinned to 1x.
 fn push_pacing(cmd: &mut tokio::process::Command, caps: PacingCaps, rate: f64) {
-    if rate <= 0.0 || !caps.readrate {
-        return;
+    for arg in caps.resolve(rate, READRATE_BURST_SECS, false).args() {
+        cmd.arg(arg);
     }
-    if caps.initial_burst {
-        cmd.arg("-readrate_initial_burst")
-            .arg(format!("{READRATE_BURST_SECS:.1}"));
-    }
-    cmd.arg("-readrate").arg(format!("{rate:.2}"));
 }
 
 async fn load_file(state: &AppState, id: i64) -> Result<MediaFile, ApiError> {
@@ -450,62 +373,35 @@ fn classify_chapter(title: &str) -> Option<(&'static str, &'static str)> {
     None
 }
 
-/// Probe the file's chapters (one `ffprobe` call) and derive skippable
-/// intro/credits markers. Falls back to a single duration-based end-credits
-/// guess when the file has no usable chapter markers, so the "Skip Credits"
-/// affordance still exists on the common case of a chapterless episode.
-async fn markers_for(path: &Path, duration_ms: Option<i64>) -> Vec<Marker> {
+/// Turn an ffprobe `chapters` array into skippable intro/credits markers.
+/// Pure, so the classification and the bounds checks are testable without a
+/// file or a subprocess.
+fn markers_from_chapters(chapters: &[serde_json::Value], duration_ms: Option<i64>) -> Vec<Marker> {
     let mut out = Vec::new();
-    let probe = tokio::process::Command::new(ffprobe_bin())
-        .args([
-            "-v",
-            "error",
-            "-print_format",
-            "json",
-            "-show_chapters",
-            "-i",
-        ])
-        .arg(path)
-        .stdin(Stdio::null())
-        .output()
-        .await;
-
-    if let Ok(o) = probe {
-        if o.status.success() {
-            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&o.stdout) {
-                if let Some(chapters) = v.get("chapters").and_then(|c| c.as_array()) {
-                    for ch in chapters {
-                        let title = ch
-                            .get("tags")
-                            .and_then(|t| t.get("title"))
-                            .and_then(|t| t.as_str())
-                            .unwrap_or("");
-                        let Some((kind, label)) = classify_chapter(title) else {
-                            continue;
-                        };
-                        let start_ms = ch
-                            .get("start_time")
-                            .and_then(|s| s.as_str())
-                            .and_then(|s| s.parse::<f64>().ok())
-                            .map(|s| (s * 1000.0) as i64);
-                        let end_ms = ch
-                            .get("end_time")
-                            .and_then(|s| s.as_str())
-                            .and_then(|s| s.parse::<f64>().ok())
-                            .map(|s| (s * 1000.0) as i64);
-                        if let (Some(start_ms), Some(end_ms)) = (start_ms, end_ms) {
-                            if end_ms > start_ms {
-                                out.push(Marker {
-                                    kind: kind.to_owned(),
-                                    label: label.to_owned(),
-                                    start_ms,
-                                    end_ms,
-                                    chapter: true,
-                                });
-                            }
-                        }
-                    }
-                }
+    for ch in chapters {
+        let title = ch
+            .get("tags")
+            .and_then(|t| t.get("title"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("");
+        let Some((kind, label)) = classify_chapter(title) else {
+            continue;
+        };
+        let at = |key: &str| -> Option<i64> {
+            ch.get(key)
+                .and_then(|s| s.as_str())
+                .and_then(|s| s.parse::<f64>().ok())
+                .map(|s| (s * 1000.0) as i64)
+        };
+        if let (Some(start_ms), Some(end_ms)) = (at("start_time"), at("end_time")) {
+            if end_ms > start_ms {
+                out.push(Marker {
+                    kind: kind.to_owned(),
+                    label: label.to_owned(),
+                    start_ms,
+                    end_ms,
+                    chapter: true,
+                });
             }
         }
     }
@@ -529,6 +425,75 @@ async fn markers_for(path: &Path, duration_ms: Option<i64>) -> Vec<Marker> {
 
     out.sort_by_key(|m| m.start_ms);
     out
+}
+
+/// The file's skippable regions, from the chapters captured at scan time.
+///
+/// This used to run its own `ffprobe -show_chapters` on every single `/decision`
+/// — i.e. on every press of Play, against a file that is usually on a NAS, for
+/// a fact that only changes when the file does. On a cold attribute cache that
+/// is seconds of dead time at the front of the click-to-first-frame path.
+///
+/// Chapters now come from the scan probe. A file probed before that landed has
+/// no `chapters` key at all (a chapterless file has an empty array, which is a
+/// different and perfectly good answer), so those get the old live probe
+/// exactly once and the result is written back — the next play reads it like
+/// any other. A file whose probe never succeeded has no document to graft
+/// onto and simply keeps probing live; it has larger problems, and the
+/// reanalyze button is the fix for them.
+async fn markers_for(state: &AppState, file: &MediaFile) -> Vec<Marker> {
+    if let Some(chapters) = stored_chapters(state, file.id).await {
+        return markers_from_chapters(&chapters, file.duration_ms);
+    }
+    let probed = probe_chapters(&file.path).await;
+    if let Some(chapters) = &probed {
+        // Best-effort backfill: a failure here costs one more probe next time,
+        // not correctness.
+        if let Ok(json) = serde_json::to_string(chapters) {
+            if let Err(e) = state.store.merge_file_probe_chapters(file.id, &json).await {
+                tracing::warn!(file_id = file.id, error = %e, "could not cache file chapters");
+            }
+        }
+    }
+    markers_from_chapters(&probed.unwrap_or_default(), file.duration_ms)
+}
+
+/// Chapters from the stored scan probe. `None` means "this probe predates
+/// chapter capture", which is distinct from `Some(vec![])` — "probed, and this
+/// file genuinely has none".
+async fn stored_chapters(state: &AppState, file_id: i64) -> Option<Vec<serde_json::Value>> {
+    let raw = state
+        .store
+        .get_file_probe_json(file_id)
+        .await
+        .ok()
+        .flatten()?;
+    let probe: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    probe.get("chapters")?.as_array().cloned()
+}
+
+/// One live `ffprobe -show_chapters`. `None` when ffprobe failed, so the caller
+/// can tell "no chapters" from "could not ask" and decline to cache the latter.
+async fn probe_chapters(path: &Path) -> Option<Vec<serde_json::Value>> {
+    let out = tokio::process::Command::new(ffprobe_bin())
+        .args([
+            "-v",
+            "error",
+            "-print_format",
+            "json",
+            "-show_chapters",
+            "-i",
+        ])
+        .arg(path)
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    v.get("chapters")?.as_array().cloned()
 }
 
 /// GET /api/v1/files/:id/decision — the web player sends `?vcodec=…&acodec=…&
@@ -556,7 +521,7 @@ pub async fn decision(
         playback::PlaybackMethod::DirectPlay => format!("/api/v1/files/{id}/direct"),
         _ => format!("/api/v1/files/{id}/stream.mp4"),
     };
-    let markers = markers_for(&file.path, file.duration_ms).await;
+    let markers = markers_for(&state, &file).await;
 
     // Default-track flags: the same selection rule the transcoder burns by —
     // anime dual-audio prefers the original + subs, everything else honors the
@@ -1071,56 +1036,134 @@ mod tests {
         assert_eq!(classify_chapter("The Heist"), None);
     }
 
-    #[test]
-    fn pacing_caps_come_from_the_help_text() {
-        // ffmpeg 6.1+: both flags.
-        let modern = "  -re                 read input at native frame rate\n  \
-                      -readrate speed     read input at specified rate\n  \
-                      -readrate_initial_burst seconds  initial burst\n";
-        let caps = parse_pacing_caps(modern);
-        assert!(caps.readrate);
-        assert!(caps.initial_burst);
-
-        // ffmpeg 5.1–6.0: rate limiting but no burst.
-        let caps = parse_pacing_caps("  -readrate speed     read input at specified rate\n");
-        assert!(caps.readrate);
-        assert!(!caps.initial_burst);
-
-        // Older: neither. Must not be fooled by the substring in -re's help.
-        let caps = parse_pacing_caps(
-            "  -re                 read input at native frame rate; equivalent to -readrate 1\n",
-        );
-        assert!(!caps.readrate);
-        assert!(!caps.initial_burst);
+    fn chapter(title: &str, start: &str, end: &str) -> serde_json::Value {
+        serde_json::json!({ "start_time": start, "end_time": end, "tags": { "title": title } })
     }
 
+    /// Markers are built from a chapters array, whatever produced it — which is
+    /// what lets the play path read them out of the scan probe instead of
+    /// running its own ffprobe against the NAS on every click.
     #[test]
-    fn pacing_flags_are_input_options_and_respect_support() {
-        let args = |caps: PacingCaps, rate: f64| {
-            let mut cmd = tokio::process::Command::new("ffmpeg");
-            push_pacing(&mut cmd, caps, rate);
-            cmd.as_std()
-                .get_args()
-                .map(|a| a.to_string_lossy().into_owned())
-                .collect::<Vec<_>>()
-        };
-        let both = PacingCaps {
-            readrate: true,
-            initial_burst: true,
-        };
-        assert_eq!(
-            args(both, 4.0),
-            vec!["-readrate_initial_burst", "30.0", "-readrate", "4.00"]
+    fn markers_come_from_a_chapters_array() {
+        let chapters = vec![
+            chapter("Opening", "0.000", "85.000"),
+            chapter("The Heist", "85.000", "3000.000"),
+            chapter("End Credits", "3000.000", "3180.000"),
+        ];
+        let m = markers_from_chapters(&chapters, Some(3_180_000));
+        assert_eq!(m.len(), 2, "only intro and credits are markers");
+        assert_eq!(m[0].kind, "intro");
+        assert_eq!((m[0].start_ms, m[0].end_ms), (0, 85_000));
+        assert!(m[0].chapter, "came from a real chapter");
+        assert_eq!(m[1].kind, "credits");
+        assert_eq!(m[1].start_ms, 3_000_000);
+
+        // A chapterless file still offers Skip Credits, flagged as a guess.
+        let m = markers_from_chapters(&[], Some(45 * 60_000));
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].kind, "credits");
+        assert!(!m[0].chapter, "the duration heuristic is not a chapter");
+
+        // Nothing to guess from, and nothing invented.
+        assert!(markers_from_chapters(&[], None).is_empty());
+        assert!(markers_from_chapters(&[], Some(60_000)).is_empty());
+
+        // Malformed entries are skipped rather than trusted: a zero-length or
+        // backwards chapter would render as an un-dismissable skip button.
+        let junk = vec![
+            chapter("Intro", "10.0", "10.0"),
+            chapter("Intro", "90.0", "10.0"),
+            serde_json::json!({ "tags": { "title": "Intro" } }),
+        ];
+        assert!(markers_from_chapters(&junk, None).is_empty());
+    }
+
+    /// The backfill writes chapters into the stored probe without disturbing
+    /// what else is in it — and refuses to invent a document for a file whose
+    /// probe never succeeded, because `probe_json IS NULL` is the fingerprint
+    /// the repair job keys on.
+    #[tokio::test]
+    async fn chapters_backfill_into_the_stored_probe() {
+        use plurx_core::domain::{ItemKind, LibraryKind, NewItem, NewLibrary, ProbeResult};
+        use plurx_core::store::{SqliteStore, Store};
+        let store: std::sync::Arc<dyn Store> =
+            std::sync::Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "L".into(),
+                kind: LibraryKind::Movies,
+                paths: vec![],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+        let item = store
+            .insert_item(&NewItem {
+                library_id: lib.id,
+                kind: ItemKind::Movie,
+                parent_id: None,
+                title: "Heat".into(),
+                year: Some(1995),
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("item");
+        // A pre-chapters probe: real JSON, no `chapters` key.
+        let legacy = store
+            .upsert_file(
+                item,
+                "/media/legacy.mkv",
+                1,
+                1,
+                &ProbeResult {
+                    duration_ms: Some(600_000),
+                    raw_json: Some(r#"{"format":{"duration":"600.0"},"streams":[]}"#.into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("legacy file");
+        // A file whose probe failed outright: probe_json IS NULL.
+        let unprobed = store
+            .upsert_file(item, "/media/broken.mkv", 1, 1, &ProbeResult::default())
+            .await
+            .expect("unprobed file");
+
+        let chapters = serde_json::to_string(&vec![chapter("Intro", "0.0", "60.0")]).expect("json");
+        store
+            .merge_file_probe_chapters(legacy, &chapters)
+            .await
+            .expect("merge");
+        store
+            .merge_file_probe_chapters(unprobed, &chapters)
+            .await
+            .expect("merge on a null probe is a no-op, not an error");
+
+        let raw = store
+            .get_file_probe_json(legacy)
+            .await
+            .expect("read")
+            .expect("has probe json");
+        let v: serde_json::Value = serde_json::from_str(&raw).expect("valid json");
+        let stored = v
+            .get("chapters")
+            .and_then(|c| c.as_array())
+            .expect("grafted");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(markers_from_chapters(stored, None)[0].kind, "intro");
+        // The rest of the document survived the graft.
+        assert!(v.get("format").is_some(), "format survived");
+        assert!(v.get("streams").is_some(), "streams survived");
+
+        // The failed probe is still recognisably a failed probe.
+        assert!(
+            store
+                .get_file_probe_json(unprobed)
+                .await
+                .expect("read")
+                .is_none(),
+            "a null probe must stay null — the repair job keys on it"
         );
-        // Rate 0 means "unpaced" — emit nothing at all.
-        assert!(args(both, 0.0).is_empty());
-        // An ffmpeg without the flags gets none of them, whatever the setting.
-        assert!(args(PacingCaps::default(), 4.0).is_empty());
-        // Burst is omitted when unsupported, but the rate limit still applies.
-        let rate_only = PacingCaps {
-            readrate: true,
-            initial_burst: false,
-        };
-        assert_eq!(args(rate_only, 2.5), vec!["-readrate", "2.50"]);
     }
 }

@@ -384,6 +384,13 @@ pub struct SettingsDto {
     /// How fast a remux may be delivered, as a multiple of real time. "0" means
     /// unpaced — which lets a single stream take the whole link.
     pub stream_readrate: String,
+    /// How an HLS session (transcode or copy-video) is paced: the multiple of
+    /// real time it settles at, how many seconds it may deliver flat-out first
+    /// (that burst IS the viewer's opening buffer), and how far ahead of the
+    /// playhead it may write before being suspended.
+    pub hls_readrate: String,
+    pub hls_burst_secs: String,
+    pub hls_ahead_max_secs: String,
     /// Server-wide scheduled maintenance, in minutes; 0 is off (the default).
     /// Per-library scan/refresh intervals are on the library, not here.
     pub probe_retry_mins: i64,
@@ -429,6 +436,23 @@ async fn settings_dto(state: &AppState) -> Result<SettingsDto, ApiError> {
         .get_setting(keys::STREAM_READRATE)
         .await?
         .unwrap_or_else(|| crate::http::stream::READRATE_DEFAULT.to_string());
+    let text = |v: Option<String>, default: &str| -> String {
+        v.map(|v| v.trim().to_owned())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| default.to_owned())
+    };
+    let hls_readrate = text(
+        state.store.get_setting(keys::HLS_READRATE).await?,
+        &crate::transcode::HLS_READRATE_DEFAULT.to_string(),
+    );
+    let hls_burst_secs = text(
+        state.store.get_setting(keys::HLS_BURST_SECS).await?,
+        &crate::transcode::HLS_BURST_SECS_DEFAULT.to_string(),
+    );
+    let hls_ahead_max_secs = text(
+        state.store.get_setting(keys::HLS_AHEAD_MAX_SECS).await?,
+        &crate::transcode::HLS_AHEAD_MAX_SECS_DEFAULT.to_string(),
+    );
     let mins = |v: Option<String>| -> i64 {
         v.and_then(|v| v.trim().parse::<i64>().ok())
             .unwrap_or(0)
@@ -467,6 +491,9 @@ async fn settings_dto(state: &AppState) -> Result<SettingsDto, ApiError> {
         default_sub_lang: prefs.sub_lang,
         sub_mode: prefs.sub_mode.as_str().to_owned(),
         stream_readrate,
+        hls_readrate,
+        hls_burst_secs,
+        hls_ahead_max_secs,
         probe_retry_mins,
         transcode_cleanup_mins,
         scan_on_startup,
@@ -501,6 +528,11 @@ pub struct UpdateSettings {
     pub sub_mode: Option<String>,
     /// Remux delivery pace, a multiple of real time; "0" disables the limit.
     pub stream_readrate: Option<String>,
+    /// HLS session pacing: rate (x real time, "0" unpaced), opening burst in
+    /// seconds, and the ahead-of-playhead window in seconds ("0" unbounded).
+    pub hls_readrate: Option<String>,
+    pub hls_burst_secs: Option<String>,
+    pub hls_ahead_max_secs: Option<String>,
     /// Server-wide job intervals in minutes; 0 turns one off.
     pub probe_retry_mins: Option<i64>,
     pub transcode_cleanup_mins: Option<i64>,
@@ -576,6 +608,50 @@ pub async fn update_settings(
             .store
             .put_setting(keys::STREAM_READRATE, &parsed.to_string())
             .await?;
+    }
+    // HLS pacing. Same "store only what the streamer can act on" rule as the
+    // remux rate, with per-key bounds: a rate below real time cannot keep up
+    // by construction, a burst is seconds of content (an hour of it is not a
+    // burst), and the ahead-window is what stops a 4K session filling the
+    // disk — an enormous one is the same as none, so say so rather than
+    // silently accept it.
+    for (key, label, value, max) in [
+        (
+            keys::HLS_READRATE,
+            "hls_readrate",
+            &req.hls_readrate,
+            1000.0,
+        ),
+        (
+            keys::HLS_BURST_SECS,
+            "hls_burst_secs",
+            &req.hls_burst_secs,
+            600.0,
+        ),
+        (
+            keys::HLS_AHEAD_MAX_SECS,
+            "hls_ahead_max_secs",
+            &req.hls_ahead_max_secs,
+            3600.0,
+        ),
+    ] {
+        let Some(raw) = value else { continue };
+        let parsed: f64 = raw
+            .trim()
+            .parse()
+            .map_err(|_| ApiError::BadRequest(format!("{label} must be a number")))?;
+        if !(0.0..=max).contains(&parsed) {
+            return Err(ApiError::BadRequest(format!(
+                "{label} must be between 0 and {max:.0}"
+            )));
+        }
+        if key == keys::HLS_READRATE && parsed > 0.0 && parsed < 1.0 {
+            return Err(ApiError::BadRequest(
+                "hls_readrate below 1.0 cannot keep up with playback; use 0 to disable pacing"
+                    .into(),
+            ));
+        }
+        state.store.put_setting(key, &parsed.to_string()).await?;
     }
     // Job intervals: 0 = off, otherwise a floor of 15 minutes, matching the
     // per-library schedule. The scheduler ticks once a minute, so anything

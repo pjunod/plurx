@@ -56,6 +56,9 @@ tokio-util = { version = "0.7", features = ["io"] }
 mime_guess = "2"
 # Misc
 clap = { version = "4", features = ["derive", "env"] }
+# POSIX signals: SIGSTOP/SIGCONT to hold a transcode that has run ahead of the
+# playhead (plurxd only, and only on the platforms plurxd runs on).
+libc = "0.2"
 uuid = { version = "1", features = ["v4"] }
 # Dev
 tempfile = "3"
