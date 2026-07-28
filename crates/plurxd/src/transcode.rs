@@ -611,6 +611,11 @@ struct Session {
     item_id: i64,
     item_title: String,
     user_name: String,
+    /// The player instance that owns this session — the supersession key.
+    playback_id: String,
+    /// Where this session's timeline begins in the source, so a recovered
+    /// (idempotent) create reports the same offset the first one did.
+    start_seconds: f64,
     target_height: i64,
     /// The encoder actually running *now*. Mutable because the
     /// hardware->software fallback replaces the process inside one session,
@@ -775,11 +780,60 @@ pub struct SessionInfo {
     pub suspended: bool,
 }
 
+/// What a client asked for, normalised. Two requests with the same
+/// fingerprint would produce byte-identical output, which is what makes a
+/// repeated create safe to answer with the session that already exists.
+#[derive(Debug, Clone)]
+pub struct SessionRequest {
+    pub file_id: i64,
+    /// Stable for one player instance; the supersession key.
+    pub playback_id: String,
+    /// Optional idempotency key for one creation attempt.
+    pub request_id: Option<String>,
+    pub kind: SessionKind,
+    pub start_seconds: f64,
+    pub audio_index: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SessionKind {
+    Transcode {
+        height: i64,
+    },
+    /// Copy the source video; `aac` re-encodes the audio the client can't take.
+    Copy {
+        aac: bool,
+    },
+}
+
+impl SessionRequest {
+    /// A stable description of the output this request would produce. Start
+    /// position is included: two creates at different offsets are different
+    /// streams, and answering the second with the first would silently seek
+    /// the viewer somewhere they didn't ask to be.
+    fn fingerprint(&self) -> String {
+        let kind = match self.kind {
+            SessionKind::Transcode { height } => format!("t{height}"),
+            SessionKind::Copy { aac } => format!("c{}", u8::from(aac)),
+        };
+        format!(
+            "{}:{kind}:{:.3}:{}",
+            self.file_id,
+            self.start_seconds,
+            self.audio_index.unwrap_or(-1)
+        )
+    }
+}
+
 pub struct TranscodeManager {
     store: Arc<dyn Store>,
     work_dir: PathBuf,
     caps: EncoderCaps,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
+    /// Answered creation requests: `request_id` -> (session id, fingerprint).
+    /// Small by construction — an entry is dropped as soon as its session is
+    /// gone, and one player instance has one in flight at a time.
+    requests: Mutex<HashMap<String, (String, String)>>,
 }
 
 impl TranscodeManager {
@@ -789,7 +843,101 @@ impl TranscodeManager {
             work_dir,
             caps,
             sessions: Mutex::new(HashMap::new()),
+            requests: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Create a session, or hand back the one an identical request already
+    /// created.
+    ///
+    /// The idempotency matters more than it looks. Session creation spawns a
+    /// process and kills its predecessor, and it used to be a GET — which is
+    /// idempotent *by definition*, so anything in the path that felt entitled
+    /// to replay a GET could spawn a second encoder and orphan the first.
+    /// Automatic quality switching would have multiplied how often that
+    /// mattered. A repeated `request_id` now returns the same session;
+    /// the same id asking for something different is a conflict rather than a
+    /// quiet second stream.
+    pub async fn create_session(
+        &self,
+        req: &SessionRequest,
+        user_name: &str,
+    ) -> Result<StartInfo, String> {
+        let fingerprint = req.fingerprint();
+        if let Some(key) = req.request_id.as_deref() {
+            let known = self.requests.lock().await.get(key).cloned();
+            if let Some((session_id, seen)) = known {
+                if seen != fingerprint {
+                    return Err(format!(
+                        "request {key} was already used for a different stream"
+                    ));
+                }
+                if let Some(info) = self.recover(&session_id).await {
+                    tracing::debug!(%session_id, request_id = key, "idempotent create: same session");
+                    return Ok(info);
+                }
+                // Its session is gone; the entry is stale, not authoritative.
+                self.requests.lock().await.remove(key);
+            }
+        }
+
+        let info = match req.kind {
+            SessionKind::Transcode { height } => {
+                self.start(
+                    req.file_id,
+                    height,
+                    req.start_seconds,
+                    req.audio_index,
+                    user_name,
+                    &req.playback_id,
+                )
+                .await?
+            }
+            SessionKind::Copy { aac } => {
+                self.start_copy(
+                    req.file_id,
+                    req.start_seconds,
+                    req.audio_index,
+                    aac,
+                    user_name,
+                    &req.playback_id,
+                )
+                .await?
+            }
+        };
+        if let Some(key) = req.request_id.as_deref() {
+            let mut requests = self.requests.lock().await;
+            let live: std::collections::HashSet<String> =
+                self.sessions.lock().await.keys().cloned().collect();
+            // Drop entries whose session has ended, so this map cannot grow
+            // for the life of the process.
+            requests.retain(|_, (session_id, _)| live.contains(session_id));
+            requests.insert(key.to_owned(), (info.session_id.clone(), fingerprint));
+        }
+        Ok(info)
+    }
+
+    /// Describe a session that already exists, for an idempotent re-create.
+    async fn recover(&self, session_id: &str) -> Option<StartInfo> {
+        let session = self.sessions.lock().await.get(session_id).cloned()?;
+        if session.failed.load(Relaxed) {
+            return None;
+        }
+        let duration_ms = self
+            .store
+            .get_file(session.file_id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|f| f.duration_ms);
+        let encoder = *session.encoder_label.lock().await;
+        Some(StartInfo {
+            playlist_url: format!("/api/v1/hls/{session_id}/index.m3u8"),
+            session_id: session_id.to_owned(),
+            duration_ms,
+            start_seconds: session.start_seconds,
+            encoder,
+        })
     }
 
     /// A numeric setting, or its default when unset or unparseable.
@@ -853,8 +1001,7 @@ impl TranscodeManager {
         prefs
     }
 
-    /// Kill any session this same viewer already has open on this same file,
-    /// because the one they're about to start replaces it.
+    /// Kill any session belonging to the same player instance.
     ///
     /// A seek is a *new* session: the client asks for a playlist starting at the
     /// new position and abandons the old one without telling anyone. Nothing in
@@ -866,18 +1013,18 @@ impl TranscodeManager {
     /// GPU, disk and link. That is enough on its own to starve a Wi-Fi client
     /// badly enough to cost it its DHCP lease.
     ///
-    /// Scoped to (viewer, file) rather than just viewer: one person legitimately
-    /// watching two different things on two devices keeps both, while the seek
-    /// case — same person, same file, moments apart — is always a replacement.
-    /// Two devices on the same file under one account is the rare loser here,
-    /// and it degrades to "the other device rebuffers and starts its own
-    /// session", not to an error.
-    async fn reap_superseded(&self, user_name: &str, file_id: i64) {
+    /// The key is the *player instance*, not the viewer. It used to be
+    /// (viewer, file), which made two devices signed in to one account fight
+    /// over the same film — each new session killing the other's — and
+    /// automatic quality restarts would have turned that from a rare
+    /// annoyance into a loop. A player instance restarts its own stream all
+    /// the time and never anyone else's, which is exactly the scope wanted.
+    async fn reap_superseded(&self, playback_id: &str) {
         let doomed: Vec<(String, Arc<Session>)> = {
             let mut sessions = self.sessions.lock().await;
             let ids: Vec<String> = sessions
                 .iter()
-                .filter(|(_, s)| s.file_id == file_id && s.user_name == user_name)
+                .filter(|(_, s)| s.playback_id == playback_id)
                 .map(|(id, _)| id.clone())
                 .collect();
             ids.into_iter()
@@ -888,8 +1035,8 @@ impl TranscodeManager {
             let _ = session.child.lock().await.kill().await;
             let _ = tokio::fs::remove_dir_all(&session.dir).await;
             tracing::info!(
-                %session_id, file_id, user = user_name,
-                "reaped superseded transcode session (client started a new one)"
+                %session_id, playback_id,
+                "reaped superseded transcode session (this player started a new one)"
             );
         }
     }
@@ -903,11 +1050,12 @@ impl TranscodeManager {
         start_seconds: f64,
         audio_override: Option<i64>,
         user_name: &str,
+        playback_id: &str,
     ) -> Result<StartInfo, String> {
         // Before spawning, not after: the point is to never have two encoders
-        // for one viewer running at once, and reaping first also frees the GPU
-        // slot the new session is about to want.
-        self.reap_superseded(user_name, file_id).await;
+        // for one player running at once, and reaping first also frees the
+        // hardware slot the new session is about to want.
+        self.reap_superseded(playback_id).await;
 
         let file = self
             .store
@@ -1005,6 +1153,8 @@ impl TranscodeManager {
             item_id: file.item_id,
             item_title,
             user_name: user_name.to_owned(),
+            playback_id: playback_id.to_owned(),
+            start_seconds,
             target_height,
             encoder_label: Mutex::new(encoder.label()),
             started_unix: std::time::SystemTime::now()
@@ -1150,10 +1300,11 @@ impl TranscodeManager {
         audio_override: Option<i64>,
         transcode_audio: bool,
         user_name: &str,
+        playback_id: &str,
     ) -> Result<StartInfo, String> {
         // Same reasoning as `start`; the copy path matters more if anything,
         // since an abandoned remux reads the source as fast as the disk allows.
-        self.reap_superseded(user_name, file_id).await;
+        self.reap_superseded(playback_id).await;
 
         let file = self
             .store
@@ -1206,6 +1357,8 @@ impl TranscodeManager {
             item_id: file.item_id,
             item_title,
             user_name: user_name.to_owned(),
+            playback_id: playback_id.to_owned(),
+            start_seconds,
             target_height: file.height.unwrap_or(0),
             encoder_label: Mutex::new("copy"),
             started_unix: std::time::SystemTime::now()
@@ -1847,7 +2000,7 @@ mod tests {
             EncoderCaps::default(),
         );
         let info = mgr
-            .start(file_id, 720, 0.0, None, "paul")
+            .start(file_id, 720, 0.0, None, "paul", "pb-paul")
             .await
             .expect("start");
 
@@ -2041,6 +2194,8 @@ mod tests {
             item_id: 1,
             item_title: "T".into(),
             user_name: "paul".into(),
+            playback_id: "pb-test".into(),
+            start_seconds: 0.0,
             target_height: 720,
             encoder_label: Mutex::new("test"),
             started_unix: 0,
@@ -2214,7 +2369,7 @@ mod tests {
             .expect("s");
 
         let info = mgr
-            .start_copy(file_id, 0.0, None, false, "paul")
+            .start_copy(file_id, 0.0, None, false, "paul", "pb-paul")
             .await
             .expect("copy session");
         let session = mgr
@@ -2392,7 +2547,7 @@ mod tests {
         // A real start spawns ffmpeg (it fails async on the fake path, but the
         // session is created and tracked). Then the admin stop kills it.
         let info = mgr
-            .start(file_id, 720, 0.0, None, "paul")
+            .start(file_id, 720, 0.0, None, "paul", "pb-paul")
             .await
             .expect("start");
         assert_eq!(info.encoder, "software (x264)");
@@ -2405,7 +2560,7 @@ mod tests {
 
         // The copy-video path likewise creates and tears down a session.
         let info = mgr
-            .start_copy(file_id, 5.0, Some(1), true, "paul")
+            .start_copy(file_id, 5.0, Some(1), true, "paul", "pb-paul")
             .await
             .expect("start_copy");
         assert_eq!(info.encoder, "copy");
@@ -2415,7 +2570,7 @@ mod tests {
     /// Seeking must not leave the old session running. Before this, every seek
     /// stacked another ffmpeg for up to ~75s (idle timeout + reaper tick).
     #[tokio::test]
-    async fn a_new_session_supersedes_the_same_viewers_old_one() {
+    async fn a_new_session_supersedes_the_same_players_old_one() {
         super::require_ffmpeg();
         use plurx_core::store::SqliteStore;
         let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
@@ -2429,15 +2584,15 @@ mod tests {
 
         // Play, then "seek" three times. Only the newest survives.
         let first = mgr
-            .start(file_id, 720, 0.0, None, "paul")
+            .start(file_id, 720, 0.0, None, "paul", "pb-paul")
             .await
             .expect("start");
         let second = mgr
-            .start(file_id, 720, 600.0, None, "paul")
+            .start(file_id, 720, 600.0, None, "paul", "pb-paul")
             .await
             .expect("seek");
         let third = mgr
-            .start(file_id, 720, 1200.0, None, "paul")
+            .start(file_id, 720, 1200.0, None, "paul", "pb-paul")
             .await
             .expect("seek again");
         assert_eq!(mgr.active_sessions().await, 1);
@@ -2448,32 +2603,103 @@ mod tests {
         // The copy path supersedes too, and across paths: a transcode fallback
         // after a copy attempt must not leave the copy remux reading the disk.
         let copy = mgr
-            .start_copy(file_id, 0.0, None, false, "paul")
+            .start_copy(file_id, 0.0, None, false, "paul", "pb-paul")
             .await
             .expect("copy");
         let fallback = mgr
-            .start(file_id, 720, 0.0, None, "paul")
+            .start(file_id, 720, 0.0, None, "paul", "pb-paul")
             .await
             .expect("fallback");
         assert_eq!(mgr.active_sessions().await, 1);
         assert!(!mgr.stop_session(&copy.session_id).await);
 
-        // Another viewer on the same file is untouched, and so is the same
-        // viewer on a different file — only (viewer, file) is superseded.
-        let other_viewer = mgr
-            .start(file_id, 720, 0.0, None, "sam")
+        // Another player is untouched — and this is the part that changed.
+        // Supersession used to be keyed by (viewer, file), so one account
+        // watching the same film in two places meant each device killed the
+        // other's stream on every seek. Two player instances now coexist even
+        // as the same person, on the same file, from the same account.
+        let laptop = mgr
+            .start(file_id, 720, 0.0, None, "paul", "pb-laptop")
             .await
-            .expect("other viewer");
+            .expect("second device");
         assert_eq!(mgr.active_sessions().await, 2);
         let reseek = mgr
-            .start(file_id, 720, 30.0, None, "paul")
+            .start(file_id, 720, 30.0, None, "paul", "pb-paul")
             .await
-            .expect("paul seeks");
-        assert_eq!(mgr.active_sessions().await, 2);
+            .expect("the first player seeks");
+        assert_eq!(
+            mgr.active_sessions().await,
+            2,
+            "one player's seek must not touch another player's stream"
+        );
         assert!(!mgr.stop_session(&fallback.session_id).await);
-        assert!(mgr.stop_session(&other_viewer.session_id).await);
+        assert!(mgr.stop_session(&laptop.session_id).await);
         assert!(mgr.stop_session(&reseek.session_id).await);
         assert_eq!(mgr.active_sessions().await, 0);
+    }
+
+    /// Creating a session spawns a process and kills its predecessor, so a
+    /// replayed create is not harmless — it orphans an encoder. The
+    /// idempotency key makes the retry return what the first call built.
+    #[tokio::test]
+    async fn a_repeated_create_returns_the_same_session() {
+        super::require_ffmpeg();
+        use plurx_core::store::SqliteStore;
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let file_id = seed_file(&store).await;
+        let work = tempfile::tempdir().expect("work");
+        let mgr = TranscodeManager::new(
+            Arc::clone(&store),
+            work.path().to_path_buf(),
+            EncoderCaps::default(),
+        );
+        let request = SessionRequest {
+            file_id,
+            playback_id: "pb-1".into(),
+            request_id: Some("req-1".into()),
+            kind: SessionKind::Transcode { height: 720 },
+            start_seconds: 0.0,
+            audio_index: None,
+        };
+
+        let first = mgr.create_session(&request, "paul").await.expect("create");
+        let again = mgr.create_session(&request, "paul").await.expect("replay");
+        assert_eq!(
+            first.session_id, again.session_id,
+            "a replayed create must not spawn a second encoder"
+        );
+        assert_eq!(mgr.active_sessions().await, 1);
+        assert_eq!(again.start_seconds, first.start_seconds);
+
+        // The same key asking for something else is a mistake worth naming,
+        // not a quiet second stream.
+        let different = SessionRequest {
+            start_seconds: 600.0,
+            ..request.clone()
+        };
+        assert!(mgr
+            .create_session(&different, "paul")
+            .await
+            .is_err_and(|e| e.contains("already used")));
+        assert_eq!(mgr.active_sessions().await, 1);
+
+        // A fresh key from the same player supersedes, as any restart does.
+        let next = SessionRequest {
+            request_id: Some("req-2".into()),
+            start_seconds: 600.0,
+            ..request.clone()
+        };
+        let moved = mgr.create_session(&next, "paul").await.expect("seek");
+        assert_ne!(moved.session_id, first.session_id);
+        assert_eq!(mgr.active_sessions().await, 1);
+
+        // And once a session is gone, its key is stale rather than binding —
+        // otherwise a client that reused an id would be told "conflict"
+        // forever.
+        assert!(mgr.stop_session(&moved.session_id).await);
+        let revived = mgr.create_session(&next, "paul").await.expect("recreate");
+        assert_ne!(revived.session_id, moved.session_id);
+        assert!(mgr.stop_session(&revived.session_id).await);
     }
 
     #[tokio::test]

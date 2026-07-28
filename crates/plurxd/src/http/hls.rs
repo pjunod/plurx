@@ -47,29 +47,78 @@ pub struct StartResponse {
     pub encoder: String,
 }
 
-/// GET /api/v1/files/:id/hls/start
-pub async fn start(
+/// Everything a client must say to open a stream.
+///
+/// A body rather than a query string, and a POST rather than a GET, because
+/// this call spawns a process and kills its predecessor. A GET that does that
+/// is a trap: GET is idempotent by definition, so anything entitled to replay
+/// one — a retry, a prefetch, an intermediary — could spawn a second encoder
+/// and orphan the first.
+#[derive(Deserialize)]
+pub struct CreateSession {
+    /// Stable for one player instance. Supersession is keyed by it, so two
+    /// devices on one account no longer kill each other's streams.
+    pub playback_id: String,
+    /// Optional idempotency key for this one attempt.
+    pub request_id: Option<String>,
+    /// Target height for a transcode. Ignored when `copy` is set.
+    pub height: Option<i64>,
+    pub start: Option<f64>,
+    pub audio: Option<i64>,
+    /// Copy the source video into HLS rather than re-encoding it.
+    pub copy: Option<bool>,
+    /// With `copy`: re-encode the audio the client can't take.
+    pub aac: Option<bool>,
+}
+
+impl CreateSession {
+    fn into_request(self, file_id: i64) -> crate::transcode::SessionRequest {
+        use crate::transcode::SessionKind;
+        let kind = if self.copy == Some(true) {
+            SessionKind::Copy {
+                aac: self.aac == Some(true),
+            }
+        } else {
+            SessionKind::Transcode {
+                height: self.height.unwrap_or(1080).clamp(144, 2160),
+            }
+        };
+        crate::transcode::SessionRequest {
+            file_id,
+            playback_id: self.playback_id,
+            request_id: self.request_id,
+            kind,
+            start_seconds: self.start.unwrap_or(0.0).max(0.0),
+            audio_index: self.audio.filter(|a| *a >= 0),
+        }
+    }
+}
+
+/// POST /api/v1/files/:id/hls/sessions — create a stream, or recover the one
+/// an identical request already created.
+pub async fn create(
     AuthUser(user): AuthUser,
     State(state): State<AppState>,
     AxPath(id): AxPath<i64>,
-    Query(q): Query<StartQuery>,
+    Json(req): Json<CreateSession>,
 ) -> Result<Json<StartResponse>, ApiError> {
-    let start = q.start.unwrap_or(0.0).max(0.0);
-    let audio = q.audio.filter(|a| *a >= 0);
-    let info = if q.copy == Some(1) {
-        // Copy-video HLS: keep the source video, transcode audio only.
-        state
-            .transcode
-            .start_copy(id, start, audio, q.aac == Some(1), &user.username)
-            .await
-    } else {
-        let height = q.height.unwrap_or(1080).clamp(144, 2160);
-        state
-            .transcode
-            .start(id, height, start, audio, &user.username)
-            .await
+    if req.playback_id.trim().is_empty() {
+        return Err(ApiError::BadRequest("playback_id is required".into()));
     }
-    .map_err(ApiError::Internal)?;
+    let request = req.into_request(id);
+    let info = state
+        .transcode
+        .create_session(&request, &user.username)
+        .await
+        // A reused request id asking for a different stream is the client's
+        // mistake, not the server's; say which it is.
+        .map_err(|e| {
+            if e.contains("already used") {
+                ApiError::Conflict(e)
+            } else {
+                ApiError::Internal(e)
+            }
+        })?;
     Ok(Json(StartResponse {
         session_id: info.session_id,
         playlist_url: info.playlist_url,
@@ -77,6 +126,46 @@ pub async fn start(
         start_seconds: info.start_seconds,
         encoder: info.encoder.to_owned(),
     }))
+}
+
+/// DELETE /api/v1/hls/:session — the player is done with this stream.
+///
+/// Capability auth, like the playlist and segment routes: the session id *is*
+/// the credential, and requiring a header would stop the browser sending this
+/// with `keepalive` as a tab closes — which is the whole point. Without it a
+/// finished stream keeps its encoder for the 60-second idle timeout plus a
+/// reaper tick, holding a hardware slot nobody is watching.
+///
+/// Idempotent: deleting a session that has already gone is a success, because
+/// the caller's intent ("this must not be running") is satisfied either way.
+pub async fn delete(State(state): State<AppState>, AxPath(session): AxPath<String>) -> StatusCode {
+    state.transcode.stop_session(&session).await;
+    StatusCode::NO_CONTENT
+}
+
+/// GET /api/v1/files/:id/hls/start — **deprecated**; use `POST …/hls/sessions`.
+///
+/// Kept as a bridge for clients that predate the POST route, and implemented
+/// over the same creation path so it cannot bypass identity or cleanup. Its
+/// one concession: with no `playback_id` to key supersession by, it
+/// synthesises the old (viewer, file) key, so its behaviour is exactly what it
+/// was — including the two-devices-one-account collision the new route fixes.
+pub async fn start(
+    AuthUser(user): AuthUser,
+    State(state): State<AppState>,
+    AxPath(id): AxPath<i64>,
+    Query(q): Query<StartQuery>,
+) -> Result<Json<StartResponse>, ApiError> {
+    let legacy = CreateSession {
+        playback_id: format!("legacy:{}:{id}", user.username),
+        request_id: None,
+        height: q.height,
+        start: q.start,
+        audio: q.audio,
+        copy: Some(q.copy == Some(1)),
+        aac: Some(q.aac == Some(1)),
+    };
+    create(AuthUser(user), State(state), AxPath(id), Json(legacy)).await
 }
 
 /// GET /api/v1/hls/:session/status — how the session is actually doing.

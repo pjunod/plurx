@@ -104,11 +104,17 @@ pub fn router(state: AppState) -> Router {
         .route("/files/{id}/direct", get(stream::direct))
         .route("/files/{id}/stream.mp4", get(stream::stream_mp4))
         .route("/files/{id}/subs/{index}", get(stream::subtitles_vtt))
+        // Creating a stream spawns a process and supersedes its predecessor,
+        // so it is a POST. The GET is a deprecated bridge over the same path.
+        .route("/files/{id}/hls/sessions", post(hls::create))
         .route("/files/{id}/hls/start", get(hls::start))
         .route("/hls/{session}/index.m3u8", get(hls::playlist))
         // Before the `{segment}` catch-all in intent, though the router
         // prefers the static segment regardless of registration order.
         .route("/hls/{session}/status", get(hls::status))
+        // Capability auth (the session id is the credential) so a closing tab
+        // can send this with `keepalive`, which cannot set headers.
+        .route("/hls/{session}", delete(hls::delete))
         .route("/hls/{session}/{segment}", get(hls::segment))
         // Images
         .route("/images/{filename}", get(images::serve));

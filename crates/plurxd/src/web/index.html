@@ -1921,6 +1921,40 @@ function attachHls(video, playlistUrl){
   }
 }
 
+// ---- session lifecycle -----------------------------------------------------
+// One identity per player instance, for the life of this page. Supersession is
+// keyed by it server-side, which is what stops two devices signed in to one
+// account from killing each other's streams — and lets this player's own
+// seeks, quality changes and audio switches replace its previous stream, which
+// is exactly what they should do.
+const PLAYBACK_ID=(function(){
+  try{ if(crypto&&crypto.randomUUID) return crypto.randomUUID(); }catch(e){}
+  return "pb-"+Math.random().toString(36).slice(2)+Date.now().toString(36);
+})();
+function newRequestId(){
+  try{ if(crypto&&crypto.randomUUID) return crypto.randomUUID(); }catch(e){}
+  return "rq-"+Math.random().toString(36).slice(2)+Date.now().toString(36);
+}
+// Open a stream. POST, not GET: this spawns a process and supersedes the
+// previous one, and a GET that does that can be replayed by anything that
+// believes GETs are safe.
+async function openSession(fileId, opts){
+  return api(`/files/${fileId}/hls/sessions`,{method:"POST",body:Object.assign({
+    playback_id:PLAYBACK_ID, request_id:newRequestId()}, opts||{})});
+}
+// Tell the server we are finished with a stream. Without this the encoder
+// lives on for the idle timeout plus a reaper tick — over a minute of a
+// hardware slot held for nobody — every time a player closes or replaces its
+// stream. `keepalive` is what makes it survive the page going away, and is
+// also why the route authenticates by session id rather than by header.
+function releaseSession(sessionId){
+  if(!sessionId) return;
+  try{
+    fetch(API+`/hls/${sessionId}`,{method:"DELETE",keepalive:true,
+      headers:TOKEN?{"authorization":"Bearer "+TOKEN}:{}}).catch(()=>{});
+  }catch(e){}
+}
+
 // ---- runtime playback capabilities ----------------------------------------
 // What THIS browser can actually decode, probed once. Sent on every decision so
 // the server direct-plays/remuxes whatever the browser supports and only
@@ -1974,6 +2008,10 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
   // 5-second progress poster running, and after N episodes N+1 of them were
   // POSTing at once. Same trap for the idle and stall timers.
   stopPlayerTimers();
+  // The outgoing item's session, if any, is finished the moment this one is
+  // decided — auto-next through a season would otherwise leave one encoder
+  // per episode running out its idle timeout.
+  if(PLAYER && PLAYER.sessionId) releaseSession(PLAYER.sessionId);
   teardownHls();
   clearSubs(video);   // drop whatever the last item left showing
   const src=decision.source||{};
@@ -2005,7 +2043,7 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
   if(decision.method==='transcode'){
     // Transcode: start an HLS session (server re-encodes + tone-maps).
     setLoading(true,"Starting the transcoder…",transcodeReason(decision));
-    let info; try{ info=await api(`/files/${fileId}/hls/start?height=${transcodeHeight()}&start=${startSec.toFixed(1)}`);}catch(e){ setLoading(false); toast(e.message); return closePlayer(); }
+    let info; try{ info=await openSession(fileId,{height:transcodeHeight(),start:startSec});}catch(e){ setLoading(false); toast(e.message); return closePlayer(); }
     PLAYER.offset = info.start_seconds||0;
     PLAYER.encoder = info.encoder||null; PLAYER.sessionId = info.session_id||null;
     setLoading(true,"Preparing the stream…",(PLAYER.encoder?("encoder: "+PLAYER.encoder+" — "):"")+"buffering the first segments");
@@ -2050,7 +2088,7 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
 // pulling two server sessions at once. Returns false when it bailed.
 async function startCopyHls(v, startSec, live){
   const track=PLAYER.audio[PLAYER.curAudio]; const aidx=track?track.index:0;
-  const info=await api(`/files/${PLAYER.fileId}/hls/start?copy=1&aac=${PLAYER.transcodeAudio?1:0}&start=${(startSec||0).toFixed(1)}&audio=${aidx}`);
+  const info=await openSession(PLAYER.fileId,{copy:true,aac:!!PLAYER.transcodeAudio,start:startSec||0,audio:aidx});
   if(live && !live()) return false;
   PLAYER.offset=info.start_seconds||0; PLAYER.method='remux'; PLAYER.copyHls=true; PLAYER.encoder=info.encoder||null; PLAYER.sessionId=info.session_id||null;
   PLAYER.probeUrl=info.playlist_url; armStall();
@@ -2108,7 +2146,7 @@ async function startTranscodeFallback(){
   const {me, live}=streamGeneration();
   newAttempt("fallback");
   teardownHls();
-  let info; try{ info=await api(`/files/${me.fileId}/hls/start?height=${transcodeHeight()}&start=${startSec.toFixed(1)}`);}catch(e){ if(live()){ setLoading(false); toast(e.message); } return; }
+  let info; try{ info=await openSession(me.fileId,{height:transcodeHeight(),start:startSec});}catch(e){ if(live()){ setLoading(false); toast(e.message); } return; }
   if(!live()) return;   // closed the player, or seeked / switched audio meanwhile
   me.method='transcode'; me.copyHls=false; me.offset=info.start_seconds||0; me.encoder=info.encoder||null; me.sessionId=info.session_id||null;
   me.probeUrl=info.playlist_url; armStall(me.offset);
@@ -2494,7 +2532,7 @@ async function seekTo(targetSec){
   teardownHls();
   [...v.querySelectorAll("track")].forEach(t=>t.remove());
   if(PLAYER.method==='transcode'){
-    let info; try{ info=await api(`/files/${PLAYER.fileId}/hls/start?height=${transcodeHeight()}&start=${targetSec.toFixed(1)}&audio=${aidx}`);}catch(e){ return failed(e); }
+    let info; try{ info=await openSession(PLAYER.fileId,{height:transcodeHeight(),start:targetSec,audio:aidx});}catch(e){ return failed(e); }
     if(!live()) return;   // a newer seek superseded this one
     PLAYER.offset=info.start_seconds||0; PLAYER.encoder=info.encoder||null; PLAYER.sessionId=info.session_id||null;
     PLAYER.probeUrl=info.playlist_url; armStall(PLAYER.offset,20000);
@@ -2830,7 +2868,7 @@ async function switchAudio(idx){
   const curSub=PLAYER.curSub;
   [...v.querySelectorAll("track")].forEach(t=>t.remove()); // re-added below if a sub was on
   if(PLAYER.method==='transcode'){
-    let info; try{ info=await api(`/files/${PLAYER.fileId}/hls/start?height=${transcodeHeight()}&start=${pos.toFixed(1)}&audio=${aidx}`);}catch(e){ return toast(e.message); }
+    let info; try{ info=await openSession(PLAYER.fileId,{height:transcodeHeight(),start:pos,audio:aidx});}catch(e){ return toast(e.message); }
     if(!live()) return;
     PLAYER.offset=info.start_seconds||0; PLAYER.encoder=info.encoder||null; PLAYER.sessionId=info.session_id||null;
     attachHls(v, info.playlist_url);
@@ -3001,6 +3039,10 @@ function closePlayer(){
   // the user has already closed. Closing doesn't replace PLAYER, so the
   // identity check alone would have let it through.
   if(PLAYER) PLAYER._seekToken=(PLAYER._seekToken||0)+1;
+  // Hand the encoder back now rather than letting the idle reaper find it a
+  // minute later. An AirPlay target fetching this same session keeps it alive
+  // by fetching; a browser that has closed the player is not going to.
+  if(PLAYER && PLAYER.sessionId){ releaseSession(PLAYER.sessionId); PLAYER.sessionId=null; }
   stopPlayerTimers();
   clearInterval(STATS_TIMER); STATS_TIMER=null; teardownHls();
   setLoading(false);
