@@ -848,12 +848,31 @@ function bufferRunway(v){
   }catch(e){}
   return 0;
 }
+// Every stream start gets an identity and a stated reason. Without them a
+// seek's numbers and a cold start's land in the same bucket, and "time to
+// first frame" stops meaning anything — the restart paths (seek, audio
+// switch, quality change, rescue transcode) are far cheaper than a cold start
+// and would flatter the average.
+let ATTEMPT_SEQ=0;
+// Set by a caller that is about to re-enter play() for a reason play()
+// cannot infer — a quality change looks exactly like a resume from the
+// inside, and mislabelling it would put restart timings in the cold-start
+// bucket where they flatter the numbers.
+let PENDING_ATTEMPT_REASON=null;
+function newAttempt(reason){
+  if(!PLAYER) return;
+  PLAYER.attemptId=`a${++ATTEMPT_SEQ}`;
+  PLAYER.attemptReason=reason||"cold-start";
+  PLAYER.attemptAt=performance.now();
+}
 function playbackContext(){
   const v=document.getElementById("video"), p=PLAYER||{};
   return {
     height:p.method==='transcode'?transcodeHeight():((p.source&&p.source.height)||null),
     encoder:p.encoder||null,
     runway:v?bufferRunway(v):null,
+    attempt:p.attemptId||null,
+    reason:p.attemptReason||null,
     // hls.js's EWMA over real segment downloads. On a just-in-time server this
     // measures min(link speed, encode speed) — which is exactly why a stall
     // needs the server's own `speed` reading beside it to say which one ran out.
@@ -865,7 +884,7 @@ function reportTtff(){
   const ms=Math.round(performance.now()-p.playStartedAt);
   p.playStartedAt=null;   // first frame only; a seek is not a start
   p.ttffMs=ms;
-  clientLog(Object.assign({level:"info",event:"ttff",detail:String(ms),
+  clientLog(Object.assign({level:"info",event:"ttff",ms,
     message:`first frame after ${(ms/1000).toFixed(1)}s`}, playbackContext()));
 }
 function reportStall(){
@@ -874,6 +893,24 @@ function reportStall(){
   const ctx=playbackContext();
   clientLog(Object.assign({level:"warn",event:"stall",detail:String(p.stalls),
     message:`stalled with ${ctx.runway}s buffered`}, ctx));
+}
+// The buffer stopped growing, and this says why. `quota` is the interesting
+// one: it is the browser refusing more data, which is the actual ceiling on a
+// 4K forward buffer and the number the buffer settings can't argue with. Rate
+// limited per session — a full buffer re-fires on every append attempt, and a
+// thousand identical log lines would bury the first one.
+function reportBufferLimit(kind, d){
+  const p=PLAYER; if(!p) return;
+  p.bufferLimits=p.bufferLimits||{};
+  p.bufferLimits[kind]=(p.bufferLimits[kind]||0)+1;
+  const n=p.bufferLimits[kind];
+  if(n!==1 && n%25!==0) return;
+  const ctx=playbackContext();
+  clientLog(Object.assign({level:"warn",event:"buffer_limit",detail:kind,
+    message:`${kind} after ${ctx.runway}s buffered (x${n})`,
+    // What the player ASKED for, beside what it got — the comparison that
+    // says whether our seconds target or the browser's quota is the limit.
+    target:60}, ctx));
 }
 // Durations. Home video made this care about seconds: a 6-second phone clip
 // reading "0m" is worse than saying nothing.
@@ -1834,27 +1871,49 @@ function attachHls(video, playlistUrl){
   // client half of the server's supersede.
   teardownHls();
   if(!preferNativeHls(video) && window.Hls && Hls.isSupported()){
-    // Buffer ceilings, raised from hls.js's defaults because those defaults
-    // are sized for 1080p web video and this player carries 4K remuxes. The
-    // binding one is maxBufferSize (60MB by default): at the 45-70 Mb/s a 4K
-    // copy-video stream runs at, 60MB is seven to eleven SECONDS, so the
-    // 30-second target was never reachable and the server sending more made
-    // no difference. A copy session gets the big allowance since its bitrate
-    // is the source's; a transcode is capped at its rung and needs far less.
-    // backBufferLength is bounded (hls.js keeps everything by default) because
-    // the server already prunes played-past segments and a two-hour 4K session
-    // would otherwise grow the tab's memory for the whole film.
+    // Buffer targets, in SECONDS, and deliberately not in bytes.
+    //
+    // An earlier version of this raised maxBufferSize to 400MB on the theory
+    // that hls.js's 60MB default was a hard cap binding before the 30s target
+    // — which would have made 4K unable to hold more than ~10s. That was
+    // backwards. hls.js computes its target as
+    //   min(max(8*maxBufferSize/bitrate, maxBufferLength), maxMaxBufferLength)
+    // so maxBufferLength is a FLOOR the byte value can only extend, never
+    // undercut: the stock config was already targeting 30s of 4K. What
+    // actually bounds a big forward buffer is the browser's own MSE quota,
+    // which varies by platform, device memory class, and version, and which
+    // no hls.js setting can raise — it arrives as BUFFER_FULL_ERROR and
+    // hls.js shrinks its own target in response.
+    //
+    // So: tune seconds, leave the byte target at its maintained default, and
+    // let the beacons below tell us what the real ceiling is per client.
+    // These two numbers are provisional until that data exists (PERF-PLAN
+    // §4.3). backBufferLength is bounded (hls.js keeps everything by default)
+    // because the server already prunes played-past segments and a two-hour
+    // 4K session would otherwise grow the tab's memory for the whole film.
     const hls=new Hls({
       enableWorker:false,
       maxBufferLength:60,
-      maxBufferSize:(PLAYER&&PLAYER.copyHls)?400e6:120e6,
       backBufferLength:30,
       xhrSetup:x=>{ if(TOKEN) x.setRequestHeader("authorization","Bearer "+TOKEN); }});
     PLAYER.hls=hls;
     hls.loadSource(playlistUrl);
     hls.attachMedia(video);
     hls.on(Hls.Events.MANIFEST_PARSED,()=>video.play().catch(()=>{}));
-    hls.on(Hls.Events.ERROR,(_,d)=>{ if(d.fatal){ console.warn("[cinemarr] hls.js fatal",d.type,d.details); clientLog({level:"error",event:"hls_fatal",detail:d.type,message:d.details}); setLoading(true,"Playback failed to start ("+d.details+").","the server couldn't build this stream — see Settings → Logs"); toast("Playback failed ("+d.details+")"); } });
+    // Buffer pressure, classified. "It stopped buffering" has four unrelated
+    // causes and they need different fixes: the browser refusing more data
+    // (quota — the ceiling we cannot raise), an append that failed for another
+    // reason, a decode error, or simply nothing arriving. Reporting them as
+    // one event would leave the M0 buffer question unanswerable.
+    hls.on(Hls.Events.ERROR,(_,d)=>{
+      if(d.details===Hls.ErrorDetails.BUFFER_FULL_ERROR){ reportBufferLimit("quota", d); return; }
+      if(d.details===Hls.ErrorDetails.BUFFER_APPEND_ERROR){ reportBufferLimit("append", d); return; }
+      if(!d.fatal) return;
+      console.warn("[cinemarr] hls.js fatal",d.type,d.details);
+      clientLog(Object.assign({level:"error",event:"hls_fatal",detail:d.type,message:d.details}, playbackContext()));
+      setLoading(true,"Playback failed to start ("+d.details+").","the server couldn't build this stream — see Settings → Logs");
+      toast("Playback failed ("+d.details+")");
+    });
   } else {
     // Native HLS: the session id in the URL is the credential, so the
     // Apple TV can fetch segments itself when AirPlaying.
@@ -1927,7 +1986,10 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
     aoffset:decision.audio_offset_ms||0, declared:decision.declared_offset_ms||0,
     reasons:(decision.reasons||[]), title, meta:meta||null,
     transcodeAudio:!!decision.transcode_audio, copyHls:false,
-    playStartedAt:clickedAt, ttffMs:null, stalls:0, sessionId:null, health:null, };
+    playStartedAt:clickedAt, ttffMs:null, stalls:0, sessionId:null, health:null,
+    attemptId:null, attemptReason:null, bufferLimits:null, };
+  newAttempt(PENDING_ATTEMPT_REASON || (startSec>0?"resume":"cold-start"));
+  PENDING_ATTEMPT_REASON=null;
   if(PLAYER.curAudio<0) PLAYER.curAudio=0;
   setupAirplay(video);
   setupTrackMenus();
@@ -2044,6 +2106,7 @@ async function startTranscodeFallback(){
   // was not enough — a seek mutates PLAYER in place rather than replacing it, so
   // an identity check still passed and both streams attached.
   const {me, live}=streamGeneration();
+  newAttempt("fallback");
   teardownHls();
   let info; try{ info=await api(`/files/${me.fileId}/hls/start?height=${transcodeHeight()}&start=${startSec.toFixed(1)}`);}catch(e){ if(live()){ setLoading(false); toast(e.message); } return; }
   if(!live()) return;   // closed the player, or seeked / switched audio meanwhile
@@ -2317,7 +2380,16 @@ function wirePlayer(){
   // overlay owns the message (and a watchdog owns the deadline), so a stalled
   // start or seek reports what actually went wrong instead of showing a
   // spinner that never resolves.
-  v.addEventListener("waiting",()=>{ if(PLAYER&&PLAYER.started){ setLoading(true,"Buffering…",""); reportStall(); } });
+  // A `waiting` that follows a deliberate action is not a stall. Seeking into
+  // un-buffered video and resuming from a pause both fire it, and counting
+  // those would make the stall rate a measure of how much the viewer touched
+  // the scrubber. Only an unasked-for interruption during playback counts.
+  v.addEventListener("waiting",()=>{
+    if(!PLAYER||!PLAYER.started) return;
+    setLoading(true,"Buffering…","");
+    if(v.seeking||v.paused) return;
+    reportStall();
+  });
   v.addEventListener("pause",()=>{ p.classList.remove("idle"); });
   // A media error never reaches the console on its own — surface it, always.
   // And a remux/direct stream the browser rejects gets one automatic rescue:
@@ -2408,6 +2480,7 @@ async function seekTo(targetSec){
   // and re-attach hls.js twice. Token the call and bail any superseded one after
   // its await, so only the last seek attaches.
   const {me, live}=streamGeneration();
+  newAttempt("seek");
   const track=PLAYER.audio[PLAYER.curAudio]; const aidx=track?track.index:(PLAYER.curAudio||0);
   const curSub=PLAYER.curSub;
   // The stream we are about to build has NOT started. Saying so is what stops a
@@ -2607,6 +2680,7 @@ function setQuality(q){
   const m=document.getElementById("pmenu"); if(m) m.classList.remove("on");
   toast("Quality: "+qualityLabel());
   if(PLAYER && PLAYER.fileId){
+    PENDING_ATTEMPT_REASON="quality";
     const v=document.getElementById("video");
     const pos=(PLAYER.offset||0)+((v&&v.currentTime)||0);
     play(PLAYER.fileId, PLAYER.title||"", Math.round(pos*1000), PLAYER.knownDur||0, PLAYER.meta);
@@ -2751,6 +2825,7 @@ async function switchAudio(idx){
   // a seek landing mid-switch (or a second switch) must win outright instead of
   // both attaching.
   const {live}=streamGeneration();
+  newAttempt("audio");
   teardownHls();
   const curSub=PLAYER.curSub;
   [...v.querySelectorAll("track")].forEach(t=>t.remove()); // re-added below if a sub was on

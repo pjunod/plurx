@@ -220,6 +220,28 @@ pub struct ClientLog {
     pub detail: Option<String>,
     /// Browser label the client computed ("Safari" | "Chrome" | …).
     pub ua: Option<String>,
+    // -- playback measurements (M0) ------------------------------------------
+    // These are the point of the beacons. Without them the log records THAT a
+    // stream stalled and not the one number that says why, which is how much
+    // was buffered when it did. Unknown fields are dropped by serde, so a
+    // measurement the client sends and this struct doesn't name is a
+    // measurement nobody ever sees — the reason these are listed explicitly.
+    /// Which playback attempt this belongs to (one per stream start/restart),
+    /// so a seek's numbers never contaminate a cold start's.
+    pub attempt: Option<String>,
+    /// Why that attempt began: cold-start · resume · seek · audio · quality ·
+    /// fallback.
+    pub reason: Option<String>,
+    /// Seconds of decoded video ahead of the playhead at the moment reported.
+    pub runway: Option<f64>,
+    /// Time from click to first frame, in ms (the `ttff` event).
+    pub ms: Option<i64>,
+    /// hls.js's bandwidth estimate, in kb/s.
+    pub bandwidth: Option<i64>,
+    /// Target height of the stream in play.
+    pub height: Option<i64>,
+    /// Encoder the server reported for this session.
+    pub encoder: Option<String>,
 }
 
 /// Sustained rate and burst allowance for `/client-log`, in reports per minute.
@@ -320,9 +342,26 @@ pub async fn client_log(_user: AuthUser, Json(ev): Json<ClientLog>) -> StatusCod
     if let Some(c) = ev.code {
         line.push_str(&format!(" code={c}"));
     }
+    if let Some(h) = ev.height.filter(|h| *h > 0) {
+        line.push_str(&format!(" height={h}"));
+    }
+    if let Some(e) = field(&ev.encoder, 32) {
+        line.push_str(&format!(" encoder={e}"));
+    }
     let msg = clip(&ev.message, 200);
     if !msg.is_empty() {
         line.push_str(&format!(": {msg}"));
+    }
+    // The measurements, in a fixed order so a grep over the log ring produces
+    // a column-alignable series rather than prose.
+    if let Some(ms) = ev.ms.filter(|v| *v >= 0) {
+        line.push_str(&format!(" ttff_ms={ms}"));
+    }
+    if let Some(r) = ev.runway.filter(|v| v.is_finite() && *v >= 0.0) {
+        line.push_str(&format!(" runway={r:.1}s"));
+    }
+    if let Some(b) = ev.bandwidth.filter(|v| *v > 0) {
+        line.push_str(&format!(" bw={b}kbps"));
     }
     if let Some(t) = field(&ev.title, 120) {
         line.push_str(&format!(" — {t}"));
@@ -335,6 +374,14 @@ pub async fn client_log(_user: AuthUser, Json(ev): Json<ClientLog>) -> StatusCod
     }
     if let Some(d) = field(&ev.detail, 200) {
         line.push_str(&format!(" [{d}]"));
+    }
+    // Attempt identity last: it's what you group by when reading back, and
+    // putting it at the end keeps the front of every line comparable.
+    match (field(&ev.attempt, 24), field(&ev.reason, 24)) {
+        (Some(a), Some(r)) => line.push_str(&format!(" attempt={a}/{r}")),
+        (Some(a), None) => line.push_str(&format!(" attempt={a}")),
+        (None, Some(r)) => line.push_str(&format!(" reason={r}")),
+        (None, None) => {}
     }
     if suppressed > 0 {
         line.push_str(&format!(" (+{suppressed} suppressed)"));
