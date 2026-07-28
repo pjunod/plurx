@@ -1,8 +1,11 @@
 # Performance — where the seconds go, and the plan to get them back
 
-**Status:** M0 + §4.1 + §4.2 + §4.3 shipped 2026-07-28 (plus §4.5, pulled
-forward — the telemetry made it a twenty-line change and it guards §4.2);
-§4.4, §4.6, §4.7 next · **Diagnosed against:** `e7a12cf` (2026-07-28) ·
+**Status:** ready to build — revised 2026-07-28 through a two-round review;
+Weekend 1 (M0 + §4.1 + §4.2 + §4.3 + §4.5) shipped, the §2.8 correction pass
+is the next work item, then §4.4/§4.6/§4.7 · **Diagnosed against:** `e7a12cf`
+· **Review record:** [PERF-PLAN-REVIEW.md](PERF-PLAN-REVIEW.md) →
+[PERF-REVIEW-RESPONSE.md](PERF-REVIEW-RESPONSE.md) →
+[PERF-REVIEW-ASSESSMENT.md](PERF-REVIEW-ASSESSMENT.md) ·
 **Companions:** [PLAYBACK.md](PLAYBACK.md) (the delivery map),
 [ADAPTIVE-QUALITY.md](ADAPTIVE-QUALITY.md) (the ABR design this plan
 partially executes), [ARCHITECTURE.md](ARCHITECTURE.md) §3,
@@ -27,7 +30,7 @@ similar Intel boxes.
 | Reported | Root cause (primary) | Contributing | Fixed by |
 |---|---|---|---|
 | ~10 s to start streaming | 4 s first segment × sub-realtime encode, plus player wants more than one segment (§2.1) | `/decision` runs a live ffprobe on the NAS (§2.4); 12 s watchdog can misfire into a *slower* restart (§2.5) | §4.4, §4.1, §4.5, §5 |
-| 4K starts, buffers a few seconds in, almost always | copy-video HLS is paced at `-re` = 1× — the player's opening buffer is the only buffer it will ever have (§2.2) | hls.js caps forward buffer at 60 MB ≈ 7–11 s of 4K (§2.3) | §4.2, §4.3 |
+| 4K starts, buffers a few seconds in, almost always | copy-video HLS is paced at `-re` = 1× — the player's opening buffer is the only buffer it will ever have (§2.2) | client buffer targets provisional, M0-owned (§2.3 — the original byte-cap claim was wrong; see §2.8) | §4.2, §4.3 |
 | Stutter/buffer every ~30 s | transcode production runs *below* 1×: the CPU float tone-map chain can't feed a 4K session (§2.2) | unbounded QSV/VA-API bitrate bursts defeat the client's estimate (§2.6-B6) | §5, §4.6, §6 |
 | AirPlay "does not work well" | same `-re` pacing — an Apple TV wants ~3 segments before it plays, so start ≈ 12 s and runway ≈ 0 forever | native HLS: no client-side knobs at all, the server pace is the whole story | §4.2 |
 
@@ -100,15 +103,31 @@ for 4K sources, and the pipeline is decode(GPU) → `hwdownload` →
 `transcode/mod.rs:183-199`). The GPU sits mostly idle while the CPU
 tone-maps. §5 moves the whole chain onto the GPU.
 
-### 2.3 The client's own ceilings
+### 2.3 The client's own ceilings — corrected after review
 
-`attachHls` (`web/index.html:1790`) constructs hls.js with defaults:
-`maxBufferLength: 30` (target 30 s) and `maxBufferSize: 60 MB`. At 4K
-copy-HLS bitrates (45–70 Mb/s), 60 MB is **7–11 seconds** — the size cap
-binds long before the 30 s target. So even with server pacing fixed, the
-client would refuse to hold more than ~10 s of 4K. Safari-native and
-Apple TV sessions have no knobs at all; for them the server pace from §4.2
-is the entire fix.
+**The first version of this section was wrong**, and shipped a wrong code
+comment before review R1 caught it. It claimed `maxBufferSize` (60 MB)
+binds before `maxBufferLength` (30 s), capping 4K at 7–11 s. The vendored
+hls.js 1.6.16 says otherwise, in code:
+
+```js
+getMaxBufferLength = function(e){ var t, r = this.config;
+  return t = e ? Math.max(8*r.maxBufferSize/e, r.maxBufferLength)
+               : r.maxBufferLength,
+  Math.min(t, r.maxMaxBufferLength) }
+```
+
+`maxBufferLength` is a **floor** — the byte value can only extend the
+target beyond it, never cap below. The stock player already targeted 30 s
+of 4K. What actually bounds a 4K forward buffer on Chromium is the
+browser's own MSE quota, whose limits vary by platform, device memory
+class, and version (desktop ≠ Android ≠ low-memory), surfaced as
+`QuotaExceededError` → hls.js `BUFFER_FULL_ERROR` → hls.js shrinks its own
+target. No hls.js number raises that quota, and no single figure for it
+belongs in this plan — which is why the client values are **provisional
+and M0-owned** (§8.6, decision 1). Safari-native and Apple TV sessions
+have no knobs at all; for every client class the server-side reserve from
+§4.2 is the primary fix, and the client config is a second-order tune.
 
 ### 2.4 `/decision` does NAS I/O on the critical path
 
@@ -141,7 +160,10 @@ Numbered for citation; each names its evidence.
 - **B4 — 4 s first-segment floor.** `SEGMENT_SECONDS = 4`
   (`transcode/mod.rs:20`), keyframes forced to that grid, playlist appears
   only when seg0 completes (`transcode.rs:651-662` long-polls it).
-- **B5 — client buffer caps.** §2.3. `index.html:1790`.
+- **B5 — client buffer targets (hypothesis, retired as stated).** §2.3.
+  The byte-cap mechanism was disproven against the vendored source; what
+  remains is "the defaults were sized for 1080p web video and the right 4K
+  values are unknown" — an M0 measurement, not a diagnosed cause.
 - **B6 — unbounded hardware bitrate.** QSV/VA-API/VideoToolbox get bare
   `-b:v`, no `-maxrate`/`-bufsize` (`encoder.rs:99-104`) — the gap
   [ADAPTIVE-QUALITY.md](ADAPTIVE-QUALITY.md) already calls "the one real
@@ -157,7 +179,7 @@ Numbered for citation; each names its evidence.
   by design — `reap_superseded`). Cached VOD assets (§6) make seeks free
   for cached items; live-session seek cost is otherwise accepted.
 
-## 2.7 What shipped 2026-07-28, and what it measured
+### 2.7 What shipped 2026-07-28, and what it measured
 
 M0, §4.1, §4.2, §4.3 and §4.5 are built. Verified on a live server (not just
 unit tests) with a 5-minute 720p fixture; the numbers below are from that run
@@ -202,6 +224,52 @@ Two deviations from the plan as written, both deliberate:
    shows the stored value as its own option. The pre-existing Delivery-speed
    dropdown has the same shape and could adopt it.
 
+### 2.8 The review cycle, and the correction pass it produced
+
+After Weekend 1 shipped, the plan went through a two-round review — the
+review ([PERF-PLAN-REVIEW.md](PERF-PLAN-REVIEW.md)), this plan's response
+([PERF-REVIEW-RESPONSE.md](PERF-REVIEW-RESPONSE.md)), and an assessment of
+that response ([PERF-REVIEW-ASSESSMENT.md](PERF-REVIEW-ASSESSMENT.md)).
+Every contract in this document now reflects the cycle's outcome; the
+record of who argued what lives in those three files, not here. Three
+findings touched shipped code, and they define the **correction pass — the
+next work item before anything else in §10**:
+
+1. **R1 — the client buffer diagnosis was backwards** (§2.3 has the
+   corrected mechanism, verified against the vendored hls.js). Code:
+   revert `maxBufferSize` to default, keep `maxBufferLength: 60` and
+   `backBufferLength: 30` as *provisional*, rewrite the `attachHls`
+   comment, and add classified buffer-recovery beacons (quota pressure ·
+   append failure · media error · network starvation) so M0 owns the final
+   values. The `performance.memory` acceptance is void — JS heap does not
+   see SourceBuffer; long-run memory checks use process/media measurements.
+2. **R2 (as tightened by the assessment) — three frontiers, one honest
+   clock each.** The shipped ahead-window mixes ffmpeg's `out_time` (which
+   includes frames muxed into the in-progress `.tmp` segment — encoder
+   progress, not fetchable media) with index×duration on the fetched side
+   (wrong for variable-GOP copy). The corrected accounting is §4.2's
+   contract: `encoder_out_time` for the watchdog only,
+   `produced_playable_end` from completed playlist segments (`EXTINF`) for
+   pacing, `fetched_end` from the served segment's actual `EXTINF`
+   boundary. Retention grows to cover the client's forward-fetch distance
+   (formula in §4.2), and a per-session **and** global byte budget joins
+   the time window.
+3. **R9 — attempt generations.** The hardware→software fallback resets a
+   `Progress` shared with the old child's still-draining stdout reader; a
+   stale line can land after the reset. Every process attempt gets a
+   generation; updates apply only when it matches. The activity page's
+   `encoder` label moves into per-attempt state (it currently keeps saying
+   the hardware name after a software fallback), and a recent-speed EWMA
+   joins the cumulative figure. The already-true invariant that status
+   polling never touches the idle clock gets a regression test.
+
+The pass also lands the review's lifecycle correction (§8.5 — idempotent
+`POST` creation, explicit `DELETE`, `playback_id`-scoped supersession) and
+the cheap play-path items from R11 (availability cached with a short age,
+Trakt "watching now" moved from `/decision` to session creation, completed
+segments streamed from disk instead of buffered as ~35 MB `Vec`s, immutable
+cache headers on segment bodies).
+
 ## 3. M0 — instrument first
 
 **Objective:** attribute each real-world stall to encoder speed, server
@@ -223,16 +291,27 @@ before/after evidence for every later milestone.
   client logs (`clientLog`, `index.html` — `hls_fatal` event). Add:
   `ttff` (click → first `playing`, with method/encoder/height),
   `stall` (each `waiting` after start, with `video.buffered` runway at
-  that moment, `hls.bandwidthEstimate` when hls.js is driving).
+  that moment, `hls.bandwidthEstimate` when hls.js is driving). Every
+  beacon carries a **playback-attempt id and a reason** (cold-start ·
+  resume · seek · audio-switch · manual quality · automatic quality ·
+  failover) so restarts don't pollute cold-start numbers, and intentional
+  pause/seek never counts as a stall. Buffer-recovery events are
+  classified (§2.8-1).
 - **New endpoint:** `GET /api/v1/hls/:session/status` →
   `{ out_time_ms, speed, suspended, encoder }` (capability-auth like its
   siblings). Powers the stats overlay's new "encode speed" line (§4.5)
-  and makes M0 measurable from the browser alone.
+  and makes M0 measurable from the browser alone. Invariant, with a
+  regression test: polling status never extends a session's idle
+  lifetime — watching a stream's numbers is not fetching from it.
 
 **Acceptance:** play a 4K HDR title on nynuc from Chrome; the logs +
 overlay answer, with numbers: TTFF, encode speed over time, each stall's
-runway, and `markers_for`'s cost. One evening of watching produces the
-baseline table the later milestones are judged against.
+runway, and `markers_for`'s cost. One evening of watching is discovery;
+the acceptance *suite* is the review's measurement contract
+([PERF-PLAN-REVIEW.md](PERF-PLAN-REVIEW.md) §16): distributions (p50/p95,
+p10 for encode speed and runway) split by method, source class, and
+client, over the fixture matrix listed there. That table is the baseline
+every later milestone is judged against.
 
 ## 4. M1 — single-node quick wins
 
@@ -289,23 +368,65 @@ with an ahead-window suspend replacing `-re` as the disk bound.
 - **Ahead-window suspend.** With burst 90 + readrate 2.0, a session gets
   ~90 s of runway almost immediately and then builds more at +1×/s —
   which un-bounded would still write tens of GB for a 4K copy. Bound it
-  with the mechanism Plex uses: **pause the transcoder**. The reaper tick
-  (`transcode.rs:740-770`) already walks each live session's dir for GC;
-  have that walk also return the max written segment index, and:
-
-  ```
-  ahead = (max_written − max(high_segment, 0)) × SEGMENT_SECONDS
-  ahead > hls_ahead_max  (default 180 s)  → SIGSTOP  (suspended = true)
-  ahead < hls_ahead_max / 2               → SIGCONT (suspended = false)
-  ```
-
-  SIGSTOP/SIGCONT via `libc::kill(child.id())` — Linux/macOS only, which
+  with the mechanism Plex uses: **pause the transcoder** —
+  SIGSTOP/SIGCONT via `libc::kill(child.id())`, Linux/macOS only, which
   is where plurxd runs. The idle reaper and admin stop still `kill()`
-  suspended children fine (SIGKILL wakes stopped processes). The §4.5
-  watchdog must treat `suspended` as healthy (a stopped encoder makes no
-  progress on purpose). Fallback if an ffmpeg without `-readrate`
-  (< 5.1) is detected: keep `-re` on copy (today's behavior) and log the
-  recommendation — same graceful degradation `push_pacing` has today.
+  suspended children fine (SIGKILL wakes stopped processes), and the §4.5
+  watchdog treats `suspended` as healthy (a stopped encoder makes no
+  progress on purpose). Note the scope: this SIGSTOP is a **disk**
+  mechanism on a *live* session, which keeps its hardware slot on purpose
+  — its viewer owns it. It is not a capacity-release mechanism; see §6.2
+  for why background work must terminate instead. Fallback if an ffmpeg
+  without `-readrate` (< 5.1) is detected: keep `-re` on copy (the old
+  behavior) and log the recommendation — same graceful degradation the
+  pacing resolve has today.
+- **The accounting — three frontiers, corrected per §2.8-2.** Three
+  distinct clocks, never conflated, each named for what it measures:
+
+  ```text
+  encoder_out_time        ffmpeg -progress out_time. Includes frames in
+                          the in-progress .tmp segment. Watchdog + speed
+                          telemetry ONLY — it is proof of motion, not of
+                          fetchable media.
+  produced_playable_end   end time of the newest COMPLETED, published
+                          playlist segment, from summed EXTINF. The
+                          pacing clock.
+  fetched_end             the actual EXTINF end of the highest segment
+                          served. A DOWNLOAD FRONTIER — the client may
+                          be up to its forward buffer ahead of the true
+                          playhead — and named as such everywhere.
+  ```
+
+  Per-segment metadata (`index`, `start_ms`, `end_ms`, `bytes`) is
+  recorded as each segment completes, derived from the playlist — never
+  `index × SEGMENT_SECONDS`, which lies on variable-GOP copy sources.
+  The controller runs on segment-completion and frontier-advance events
+  (the 15 s reaper stays as the repair loop, not the flow controller):
+
+  ```text
+  ahead_seconds = produced_playable_end − fetched_end
+  ahead_bytes   = Σ bytes of completed segments past fetched_end
+
+  suspend when: ahead_seconds > hls_ahead_max_secs (180)
+            or  ahead_bytes   > hls_ahead_max_bytes (2 GB/session)
+            or  global scratch across sessions > scratch budget
+  resume  when: every trigger is below half its limit
+  ```
+
+- **Retention behind the frontier.** Because `fetched_end` can sit a full
+  client forward-buffer past the true playhead, deleting at a fixed 60 s
+  behind it can destroy media near where the viewer actually *is*. The
+  keep-behind window is derived, not constant:
+
+  ```text
+  retention ≥ client_forward_buffer (60) + back_buffer (30) + retry (30)
+            = 120 s behind fetched_end
+  ```
+
+  Deletion inside that window is forbidden; outside it, the EVENT
+  playlist's older URIs 404 by documented contract (decision 3, §8.6).
+  Acceptance includes surviving a playlist reload and a forced segment
+  retry after GC has begun, on Chrome, Safari, and AirPlay.
 - **Why not just a bigger readrate?** Because unbounded ahead-writing is
   the thing `-re` was protecting against; suspend keeps the protection
   while un-linking it from the user's buffer. And why not SIGSTOP alone
@@ -315,26 +436,35 @@ with an ahead-window suspend replacing `-re` as the disk bound.
   on the link *and* fast to safety.
 
 **Acceptance:** copy-HLS of a 4K HEVC file reaches ≥60 s of client-side
-runway within 30 s of start (M0 beacons show it); session dir never
-exceeds `hls_ahead_max + KEEP_BEHIND` × segment size (test: fake clock or
-short window in an integration test); AirPlay from Safari starts in ≤5 s
+runway within 30 s of start (M0 beacons show it); a variable-GOP copy
+fixture proves the media window matches summed `EXTINF` durations; a
+high-bitrate fixture cannot exceed the byte budget beyond one in-progress
+segment, and a multi-session test holds the global budget; nothing inside
+the retention window is ever deleted; AirPlay from Safari starts in ≤5 s
 and survives a 10 s Wi-Fi hiccup without a visible stall; suspend/resume
 transitions are logged and visible in the activity page.
 
-### 4.3 Let the client hold what the server now sends (kills B5)
+### 4.3 Client buffer targets — provisional, M0-owned (B5 as revised)
 
-In `attachHls`, override hls.js defaults per session kind:
-`maxBufferLength: 60`, `maxBufferSize: copyHls ? 400e6 : 120e6`,
-`backBufferLength: 30` (default is Infinity; the server prunes behind the
-playhead anyway, and 30 s bounds tab memory on 4K). Worker stays off —
-the CSP note at `index.html:1778-1780` still applies, and fMP4 copy
-segments don't transmux, so main-thread cost is unchanged. Safari-native
-and Apple TV need nothing: their buffer follows playlist availability,
-which §4.2 already fixed.
+In `attachHls`, tune **seconds only**: `maxBufferLength: 60` and
+`backBufferLength: 30` (default Infinity; the server prunes behind the
+frontier anyway, and 30 s bounds tab memory on 4K). `maxBufferSize` stays
+at the hls.js default — the shipped `400e6` override encoded the disproven
+§2.3 model of browser capacity and reverts in the correction pass. Raising
+the byte value again requires M0 evidence that byte targeting, not the
+browser quota, is the binding limit (a recorded runway plateau *without*
+`BUFFER_FULL_ERROR` at the plateau). Worker stays off — the CSP note at
+`index.html:1778-1780` still applies, and fMP4 copy segments don't
+transmux, so main-thread cost is unchanged. Safari-native and Apple TV
+need nothing: their buffer follows playlist availability, which §4.2
+already fixed.
 
-**Acceptance:** on Chrome, a copy-HLS 4K session's `video.buffered` runway
-climbs past 30 s (M0 beacon); memory stays bounded on a 2 h play
-(no monotonic growth in `performance.memory` across an hour).
+**Acceptance:** on the 4K copy fixture, the chosen values show no repeated
+buffer-full recovery loop across the client matrix, and p10 runway
+improves against the default-config baseline without a TTFF penalty.
+Long-run memory is judged by browser-process/media measurements, not
+`performance.memory` (JS heap does not see SourceBuffer). Results are
+segmented by browser, codec, bitrate, and copy-vs-transcode.
 
 ### 4.4 2-second segments (halves the start floor, B4)
 
@@ -380,10 +510,27 @@ Surface `speed` in the stats overlay via the §3 status endpoint
 ("encode 1.7× · 38 s ahead"), because "is the server keeping up" is the
 first question every buffering report asks, and today nothing answers it.
 
+Two hardenings from the review cycle (§2.8-3):
+
+- **Attempt generations.** Each spawned process gets a monotonically
+  increasing generation; progress, exit, stall, and fallback updates apply
+  only while their generation matches the session's active attempt. This
+  closes the fallback race (a killed attempt's stdout reader draining
+  stale lines over the replacement's fresh telemetry) and moves the
+  encoder/pipeline label into per-attempt state, so the activity page
+  stops naming the hardware encoder after a software fallback.
+- **Recent speed, not only cumulative.** ffmpeg's `speed=` is cumulative
+  and hides a recent slowdown behind a fast start (and reads nonsense
+  across a suspend). Keep the raw value for diagnostics; compute
+  `recent_speed` as a windowed delta of `out_time` over wall time with a
+  short EWMA — it is what the watchdog, the overlay, §4.7's admission
+  rule, and §7.1's placement actually want.
+
 **Acceptance:** a deliberately slow software 4K session (no GPU) is
 *not* killed while progressing; pointing at a nonexistent decoder still
-fails inside the old windows; the unit test drives the state machine on
-synthetic progress feeds — no ffmpeg needed.
+fails inside the old windows; a synthetic-progress test proves a killed
+generation cannot mark its replacement dead or overwrite its label;
+recent speed reacts to a forced slowdown within its documented window.
 
 ### 4.6 Bound the hardware rate control (kills B6)
 
@@ -392,14 +539,24 @@ VideoToolbox arms of `Encoder::encode_args` (`encoder.rs:99-104`),
 matching software/NVENC. This is verbatim the server half of
 [ADAPTIVE-QUALITY.md](ADAPTIVE-QUALITY.md) Phase 1, promoted here because
 unbounded bursts also sabotage today's fixed-rung sessions on Wi-Fi.
-While in there: VA-API may need `-rc_mode VBR` alongside maxrate on some
-drivers — validate on nynuc, and lean on the existing per-encoder
-startup validation to catch a driver that rejects the flags.
+VA-API may need `-rc_mode VBR` alongside maxrate on some drivers.
 
-**Acceptance:** `ffprobe`-measured segment bitrates for a grain-heavy
-sample stay ≤1.6× the rung on QSV; the encoder validation still passes on
-all four families; ADAPTIVE-QUALITY.md's "software & NVENC only" caveat
-row is updated in the same commit.
+**Validation must exercise what production runs** (review R4): the
+current startup probe never calls `encode_args`, so a driver could
+validate and then reject the real session's flags. The probe becomes a
+short encode with the complete production argument set — rate-control
+mode, bitrate, maxrate, bufsize, pixel format, representative frame rate
+— per family. And the acceptance language is a *window*, not a
+per-segment cap: `maxrate`+`bufsize` describe a buffering model, so the
+bound is measured over a stated sliding window with a stated permitted
+overshoot, and the ladder's advertised `BANDWIDTH` covers the measured
+peak.
+
+**Acceptance:** every validated family accepts the exact production
+rate-control arguments (no-flag-rejection smoke test); a grain-heavy
+fixture stays inside the documented sliding-window bound on QSV;
+ADAPTIVE-QUALITY.md's "software & NVENC only" caveat row is updated in
+the same commit.
 
 ### 4.7 The Auto rung (B8 — decision needed, small code)
 
@@ -418,9 +575,10 @@ User-facing strings, as always, `${APP_NAME}`-clean and theme-mixed.
   `data_dir/transcode`, recreated at boot (`main.rs:143-150`). If
   `PLURX_DATA_DIR` sits on the NAS, every segment write pays the network
   twice. Document in OPERATIONS: data dir local, ideally tmpfs for the
-  transcode subdir on RAM-rich nodes (720p sessions are ~1.8 GB/h; a 4 GB
-  tmpfs holds a bounded §4.2 session comfortably; 4K copy at
-  `hls_ahead_max=180 s` peaks ≈ 1 GB ahead + the ~60 s back window).
+  transcode subdir on RAM-rich nodes. Session size is predictable from
+  §4.2's bounds: ahead window (≈1 GB at 180 s of 45 Mb/s copy, hard-capped
+  by `hls_ahead_max_bytes`) + the ~120 s retention window behind the
+  frontier — size tmpfs from `hls_scratch_max_bytes` plus headroom.
 - **NFS/SMB read-ahead.** One paragraph with mount suggestions
   (`rsize=1048576`, larger readahead for NFS; SMB3 multichannel where the
   NAS offers it) and the reminder that §4.2's burst reads at NAS speed —
@@ -448,41 +606,68 @@ frames on the GPU end-to-end instead of the
   jellyfin-ffmpeg also offers tonemap_opencl as the portable GPU alternate)
 ```
 
-**Gate by probe, not by version.** Extend the startup encoder validation
-(`encoder.rs:167-254` — testsrc → null encode per family) with a
-*tone-map* validation: a 10-bit HDR testsrc pushed through the candidate
-GPU graph. Only a node that proves the graph gets it; everyone else keeps
-today's CPU chain. This sidesteps the driver/build matrix (kernel `xe`
-vs `i915`, oneVPL vs MSDK, tonemap_vaapi's HDR10-only support) exactly
-the way encoder selection already does, and it gives the AMD NUCs the
-right answer for free: VA-API decode/encode validate, GPU tone-map
-probably doesn't (VCN has no tonemap filter) → they hardware-encode with
-CPU tone-map, or take `libplacebo` (Vulkan) if its probe passes —
-`PLURX_TONEMAP=libplacebo` already exists as the opt-in
+**Gate by probe, not by version — and probe real HDR** (review R5). A
+synthetic 10-bit pattern proves a graph parses and moves frames; it does
+not prove the decoder preserved HDR metadata, that the output is correct
+SDR rather than clipped gray, that it is tagged BT.709, or that it is
+*fast*. The validation is therefore end-to-end against a small
+redistribution-safe **HDR10 fixture** (real compressed HEVC), per
+candidate pipeline, per node:
+
+1. decode through the candidate hardware path;
+2. tone-map + scale with the exact production graph;
+3. encode a short H.264 output;
+4. `ffprobe` asserts BT.709 transfer/primaries/matrix on the output;
+5. sampled luma/chroma ranges compare against the CPU reference within a
+   deliberately broad tolerance (encoders differ; gray-screen doesn't);
+6. the run must clear a minimum recent speed — exit status zero is not a
+   capability.
+
+Only a node that proves a graph gets it; everyone else keeps today's CPU
+chain, and runtime fallback stays regardless (a probe cannot cover every
+codec profile or driver state — a chosen graph that stops progressing
+restarts once on the CPU graph and logs the pipeline downgrade). This
+gives the AMD NUCs the right answer for free: VA-API decode/encode
+validate, GPU tone-map probably doesn't (VCN has no tonemap filter) →
+hardware encode with CPU tone-map, or `libplacebo` (Vulkan) if *its*
+probe passes — `PLURX_TONEMAP=libplacebo` already exists as the opt-in
 (`transcode.rs:145-151`); promote it to a probed candidate rather than a
-blind preference.
+blind preference. The example QSV/VA-API graphs above stay hypotheses
+until they pass this probe on the deployed jellyfin-ffmpeg build.
 
 **Scope guards:** Dolby Vision profiles that hardware-decode to garbage
-stay on the existing `PLURX_HWDECODE=off` escape hatch; HLG through
-`tonemap_vaapi` is unreliable — route HLG to the CPU chain (or libplacebo)
-regardless of probe result, and say so in the graph-selection log line.
-Subtitle burn-in forces the CPU path today (the `subtitles` filter is
-CPU-only) — accept the download/upload for burn-in sessions rather than
-building an overlay-on-GPU graph now; log which pipeline a session chose.
+stay on the existing `PLURX_HWDECODE=off` escape hatch; HLG routes to the
+CPU chain (or a probe-passed libplacebo) regardless, and the
+graph-selection log line says so. **Text** subtitle burn-in selects the
+compatible CPU/hybrid graph (the `subtitles` filter is CPU-only) — accept
+the download/upload for those sessions. **Bitmap** subtitles are not
+burned at all today (`video_filters` skips them); per decision 10 (§8.6)
+that stays true, and it is *disclosed*: the decision/start response says
+the selected subtitles can't be shown on this path, the player tells the
+viewer, and nothing downstream (cache identity included) may claim a burn
+that didn't happen.
 
-**Concurrency cap, while in here:** the docs already warn two QSV
-sessions can stall an iGPU. Add `transcode.max_hw_sessions` (default 2):
-when live hardware sessions ≥ cap, a new session starts **directly on
-software** instead of stalling into the watchdog. A predictable slow
-session beats two wedged fast ones; the cluster milestone (§7) later
-turns this cap into placement pressure.
+**Capacity and admission, while in here** (review R6/assessment §8): the
+docs already warn two QSV sessions can stall an iGPU. Add
+`transcode.max_hw_sessions` (default 2), acquired **atomically under the
+sessions lock** — two racing starts cannot both observe a free slot. When
+the cap is full, the order is: brief queue (≤5 s) → a *measured-safe*
+software recipe → an explicit capacity error. "Software-safe" is decided
+by **measured pipeline speed, not output height** — a 4K HDR source is
+sub-realtime in software decode+tonemap no matter how small the output —
+so admission requires the M0/§4.5 recent-speed record for that pipeline
+class to clear ~1.2×, and a session expected to stall is refused rather
+than started. The cluster milestone (§7) later inserts "another node"
+ahead of the queue.
 
 **Acceptance:** on nynuc, the M0 telemetry shows a 4K HDR10 → 1080p
 session at ≥3× (QSV graph) vs the recorded CPU baseline; a 2 h 4K HDR
 play completes with zero stall beacons at the 1080p rung; the corpus adds
 one HDR10 and one HLG asset asserting *which* pipeline was chosen (log
 assertion), so a driver regression shows up as a pipeline downgrade in
-CI, not a user stutter.
+CI, not a user stutter; concurrent-start tests cannot exceed the slot
+cap; every admitted fallback sustains its speed margin over the
+validation window.
 
 ## 6. M3 — the pre-transcode cache
 
@@ -492,36 +677,58 @@ direct play**, because a completed HLS asset is a VOD playlist whose every
 segment already exists — the session-restart seek dance (`B9`) simply
 doesn't apply to it.
 
-### 6.1 The cache model
+### 6.1 The cache model — identity and location are different data
 
 Content-addressed by **recipe hash**: SHA-256 over
-`(cache_format_version, file_id, size, mtime, target_height,
-video_bitrate, audio_bitrate, audio_channels, audio_index,
-audio_action(copy|aac), tone_map_mode, subtitle_burn(idx,bitmap)?,
-audio_offset_ms, SEGMENT_SECONDS)`. Size+mtime in the key makes
+`(cache_format_version, pipeline_digest, file_id, size, mtime,
+target_height, video_bitrate, audio_bitrate, audio_channels, audio_index,
+audio_action(copy|aac), tone_map_mode, subtitle_burn(idx, bitmap,
+applied?), audio_offset_ms, SEGMENT_SECONDS)`. Size+mtime in the key makes
 invalidation lazy and unskippable — a changed file simply never matches
-again, and the orphaned entry ages out via LRU. The encoder family is
-**excluded**: any encoder's output satisfies the recipe (byte-determinism
-is a §7 option, not a requirement — per the spike, it never was one for
-correctness).
+again, and the orphaned entry ages out via LRU. `pipeline_digest` is the
+review-cycle addition (R7): a single digest over the ffmpeg/jellyfin-ffmpeg
+build fingerprint, output codec · profile · pixel format, color contract
+(transfer/primaries/matrix/range), muxer + segment format, GOP/segment
+policy, rate-control policy, and **encoder family** — included until QSV,
+VA-API, NVENC, VideoToolbox, and software are demonstrated to satisfy one
+declared output contract (decision 6, §8.6). A build upgrade that changes
+tone-map output therefore misses the old entries instead of serving them.
+`subtitle_burn.applied` records whether the burn actually happened —
+a bitmap request that was skipped hashes as burn-omitted, honestly.
 
-Storage: `data_dir/cache/transcode/<hash>/` — deliberately **not** under
-`data_dir/transcode`, which is wiped at every boot (`main.rs:149`).
-Index: migration **v11** (v10 is the watched-outbox — re-verify against
-`store/sqlite/mod.rs:291`):
+Identity and physical copies are **separate tables** — M4 needs "this
+recipe exists on nodes A and B, and B may evict its copy without lying to
+A", which one row with one `dir` cannot say. Migration **v11** (v10 is the
+watched-outbox — re-verify against `store/sqlite/mod.rs:291`):
 
 ```sql
-CREATE TABLE transcode_cache (
-    id           INTEGER PRIMARY KEY,
-    file_id      INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
-    recipe_hash  TEXT    NOT NULL UNIQUE,
-    dir          TEXT    NOT NULL,
-    bytes        INTEGER NOT NULL,
-    complete     INTEGER NOT NULL DEFAULT 0,
-    created_at   INTEGER NOT NULL DEFAULT (unixepoch()),
-    last_used_at INTEGER NOT NULL DEFAULT (unixepoch())
+CREATE TABLE transcode_cache_recipes (
+    recipe_hash    TEXT PRIMARY KEY,
+    file_id        INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+    recipe_version INTEGER NOT NULL,
+    created_at     INTEGER NOT NULL DEFAULT (unixepoch())
+) STRICT;
+
+CREATE TABLE transcode_cache_locations (
+    recipe_hash   TEXT NOT NULL REFERENCES transcode_cache_recipes(recipe_hash)
+                                ON DELETE CASCADE,
+    node_id       TEXT NOT NULL,          -- single-node: the instance id
+    storage_class TEXT NOT NULL,          -- 'local' | 'shared'
+    relative_dir  TEXT NOT NULL,          -- under the configured cache root
+    bytes         INTEGER NOT NULL,
+    complete      INTEGER NOT NULL DEFAULT 0,
+    last_used_at  INTEGER NOT NULL DEFAULT (unixepoch()),
+    last_seen_at  INTEGER NOT NULL DEFAULT (unixepoch()),
+    PRIMARY KEY (recipe_hash, node_id, storage_class)
 ) STRICT;
 ```
+
+Directories are **relative** to the configured cache root
+(`data_dir/cache/transcode/` locally, `cache.shared_dir` when shared) —
+absolute paths don't replicate across nodes with different mounts. The
+local root is deliberately **not** under `data_dir/transcode`, which is
+wiped at every boot (`main.rs:149`). On a single node this schema costs
+one extra table and buys M4 for free.
 
 ### 6.2 Producing entries
 
@@ -535,12 +742,28 @@ Candidates, in priority order, capped by budget: per-user **Next Up**
 episodes and in-progress items whose decision (against the caps the user
 last played with — persist the last-seen caps per user, one settings row)
 would be a transcode or copy; then recently-added 4K/HDR items. Producer
-runs the normal `hls_args`/`hls_copy_args` with no pacing, converts the
-playlist to VOD (`#EXT-X-ENDLIST` + type VOD), writes into a temp dir and
-publishes with an atomic rename + `complete=1`. Gate: **run only while
-`active_sessions == 0`** (setting to override) — live viewers own the
-GPU; the docs' two-QSV-sessions warning applies doubly to background
-work.
+runs the normal `hls_args`/`hls_copy_args` with no pacing, **generates the
+playlist as VOD** (not by string-appending `ENDLIST` to an EVENT file —
+an avoidable corruption path), writes into a unique temp dir on the same
+filesystem as the final path, and publishes with an atomic rename; only
+after the rename does the location row flip `complete=1`. Under M4's
+distributed producers, the worker re-proves its job lease *before* the
+rename, so an expired worker cannot publish over a newer result.
+
+**Preemption is terminate, not suspend** (assessment §5 — the sharpest
+correction in the cycle). A SIGSTOPped ffmpeg still holds its hardware
+codec session, GPU context, and mapped buffers; on an iGPU where the
+*session* is the scarce resource, a suspended producer blocks the live
+viewer exactly as if it were running. So: the producer admits through the
+same §5 slot machinery as live sessions, at strictly lower priority, and
+the moment a live session wants the slot the producer **checkpoints and
+terminates** — record the last published segment boundary, kill the
+process, release the slot, discard the unpublished temp segment, resume
+later from that boundary (cheap by construction: boundary restart is the
+spike's own property). It cannot re-acquire while a live waiter exists.
+Contrast with §4.2's live-session SIGSTOP, which is a *disk* mechanism on
+a session whose viewer owns its slot — the two uses share a syscall and
+nothing else.
 
 Budget & eviction: `cache.max_gb` (default 50), LRU by `last_used_at`,
 evict until under budget before each producer run; `complete=0` rows
@@ -571,9 +794,13 @@ complexity isn't buying enough. Revisit after M2/M3 telemetry.
 lands in ≤0.5 s (M0 beacons), zero ffmpeg processes spawned. Fill the
 cache past `max_gb`, run the producer: LRU entries evicted, budget held
 (integration test with tiny fixture "segments"). Change a source file's
-mtime: old entry never served, ages out. `SEGMENT_SECONDS` bump (§4.4)
-orphans old-format entries via `cache_format_version` — test asserts the
-stale hash misses.
+mtime: old entry never served, ages out. A `SEGMENT_SECONDS` bump (§4.4)
+or a pipeline change orphans old entries via the digest — test asserts
+the stale hash misses. Start a producer encode, then request live
+playback: the producer yields its slot within a bounded interval, live
+TTFF stays inside its SLO, and the producer later resumes from its
+checkpoint; slot release survives fallback, suspension, and process
+death without leaking.
 
 ## 7. M4 — cluster transcode (rides Phase 4)
 
@@ -607,15 +834,46 @@ serve a session id without seeing a login. Redirects (307 to the owner's
 address) are the cheaper alternative once clients carry the node list;
 note it, ship proxying first — it works for Apple TV's dumb fetcher too.
 
-### 7.3 Failover — already designed, just wire it
+### 7.3 Failover — the spike property, plus the serving protocol it lacked
 
-The spike's contract, verbatim: surviving node restarts the session from
-the replicated recipe, input-seeked to the last-served boundary
-(`N × SEGMENT_SECONDS` — §4.4's constant discipline pays off here),
-serves a stitched playlist (served-prefix entries + `EXT-X-DISCONTINUITY`
-+ new entries), client keeps its buffer, one small rebuffer. §4.2's
-suspend interacts trivially: a suspended session that dies restarts on
-the survivor un-suspended and immediately re-earns its window.
+The spike proved the *media* property: any node can restart an encode at a
+boundary and emit valid segments after a discontinuity. The review cycle
+(R8 + assessment §7) established that this is not yet a serving protocol —
+"stitched playlist with served-prefix entries" hand-waved where prefix
+*bytes* live when their owner is dead (they were node-local: nowhere), and
+"last served" is not "last received." The takeover contract, six fields,
+defined per event:
+
+```text
+SessionOwner {
+    session_id, owner_node, owner_epoch,
+    lease_expires_at,             -- 6 s lease, renewed every 2 s
+    recipe,
+    produced_playable_through,    -- §4.2's playable clock, replicated
+    fetched_through,              -- the download frontier
+}
+
+1  trusted prefix        last segment identity + end time the dead owner
+                         durably published
+2  resume boundary       input timestamp + sequence where the survivor's
+                         encoder starts: ONE segment before fetched_through
+3  publication boundary  that one overlap segment IS published — it covers
+                         the served-but-never-acknowledged gap; everything
+                         earlier is client-buffer reliance (decision 8)
+4  playlist sequence     the takeover playlist's first MEDIA-SEQUENCE
+5  discontinuity         EXT-X-DISCONTINUITY before the overlap segment;
+                         DISCONTINUITY-SEQUENCE advances by one
+6  fence                 every playlist, segment, and cache-location
+                         publication carries owner_epoch; a stale epoch is
+                         rejected even if the old owner's ffmpeg lives on
+```
+
+The playlist never references bytes neither owner durably published. The
+resume SLO is a **budget**, not a wish: detect (lease expiry, ≤6 s) +
+claim + NAS open/seek + first replacement segment + client playlist retry
+— initial target ≤10 s end-to-end, tightened only by measurement. §4.2's
+suspend interacts trivially: a suspended session that dies restarts on the
+survivor un-suspended and immediately re-earns its window.
 
 ### 7.4 The distributed pre-cache — the embarrassingly parallel win
 
@@ -641,28 +899,33 @@ Revisit only if M3 telemetry shows producer backlog, and say why in the
 PR that does it.
 
 **Acceptance:** Phase 4's own drill list gains: kill the owner node
-mid-4K-transcode → playback resumes ≤5 s with exactly one discontinuity
-(client beacon + playlist assertion); start a session from a node with no
-GPU → it lands on the capable node and plays; run the producer with all
-nodes idle → jobs spread across nodes (queue rows show distinct lessees)
-and a subsequent hit serves from the shared dir on a node that didn't
-produce it.
+mid-4K-transcode — **including mid-segment-response, not only between
+segments** — → playback resumes within the §7.3 budget with exactly one
+discontinuity and never loops on a missing prefix URI (client beacon +
+playlist assertion); a partitioned former owner cannot publish after a
+new epoch is active; start a session from a node with no GPU → it lands
+on the capable node and plays; run the producer with all nodes idle →
+jobs spread across nodes (queue rows show distinct lessees), a worker
+that loses its lease cannot publish, and a subsequent hit serves from the
+shared dir on a node that didn't produce it.
 
 ## 8. Contract — exact interfaces (re-verify at build time)
 
 ### 8.1 Constants & args
 
 - `SEGMENT_SECONDS: u32 = 4 → 2` — `plurx-core/src/transcode/mod.rs:20`.
-- `Pacing` struct (§4.2) in `plurx-core::transcode`; new parameters on
-  `hls_args` / `hls_copy_args`; delete both `-re` pushes
-  (`mod.rs:343,354`). `PacingCaps` probe moves out of `http/stream.rs`
-  into a module both stream.rs and the transcode manager reach
-  (suggestion: `plurxd/src/ffmpeg.rs`).
+- *(shipped)* `Pacing` struct (§4.2) in `plurx-core::transcode`; pacing
+  parameters on `hls_args` / `hls_copy_args`; both `-re` pushes deleted;
+  `PacingCaps` probe lives in `plurxd/src/ffmpeg.rs`.
 - `encoder.rs` `encode_args`: QSV/VA-API/VideoToolbox gain
-  `-maxrate {1.5×}k -bufsize {2×}k` (§4.6).
-- Session ffmpeg spawns gain `-progress pipe:1`; `spawn_ffmpeg`
-  (`transcode.rs:46-79`) takes over stdout parsing alongside its stderr
-  drain.
+  `-maxrate {1.5×}k -bufsize {2×}k`, and the validation probe runs the
+  full production argument set (§4.6).
+- *(shipped)* Session ffmpeg spawns carry `-progress pipe:1`;
+  `spawn_ffmpeg` parses stdout alongside its stderr drain. The correction
+  pass adds per-attempt generations and `recent_speed` (§4.5).
+- Correction pass: per-segment `SegmentMeta { index, start_ms, end_ms,
+  bytes }` recorded from the playlist as segments complete; the
+  suspend/GC controller consumes it (§4.2).
 
 ### 8.2 Store trait additions
 
@@ -679,8 +942,10 @@ async fn merge_file_probe_chapters(&self, file_id: i64, chapters_json: &str) -> 
 |---|---|---|
 | `playback.hls_readrate` | `2.0` | HLS input pace, ×realtime (0 = unpaced) |
 | `playback.hls_burst_secs` | `90` | flat-out seconds before the pace engages |
-| `playback.hls_ahead_max_secs` | `180` | suspend when written-ahead exceeds this |
-| `transcode.max_hw_sessions` | `2` | live hardware sessions before new ones start on software |
+| `playback.hls_ahead_max_secs` | `180` | suspend when playable-ahead exceeds this |
+| `playback.hls_ahead_max_bytes` | `2 GB` | per-session byte ceiling on ahead media (§4.2) |
+| `playback.hls_scratch_max_bytes` | `8 GB` | global scratch budget across all live sessions (§4.2) |
+| `transcode.max_hw_sessions` | `2` | hardware slots; admission order in §5 (queue → measured-safe software → capacity error) |
 | `cache.max_gb` | `50` | pre-transcode cache budget |
 | `cache.enabled` | `true` | master switch for producer + serving |
 | `cache.shared_dir` | *(empty)* | §7.4 shared cache root; empty = node-local |
@@ -691,11 +956,61 @@ or 0, windows sane, floors enforced server-side.
 
 ### 8.4 Endpoints
 
-- `GET /api/v1/hls/:session/status` (§3) — capability auth, no-store.
-- `/hls/start` response gains `vod: bool` and (informational)
-  `cached: bool` (§6.3). Additive; existing clients ignore them.
+- `GET /api/v1/hls/:session/status` (§3) — capability auth, no-store,
+  never touches the idle clock.
+- Session-creation responses gain `vod: bool` and (informational)
+  `cached: bool` (§6.3), plus `subtitle_unavailable: bool` when the
+  selected subtitles can't ride this delivery path (§5, decision 10).
+  Additive; existing clients ignore them.
 
-### 8.5 Docs this plan's commits must update (same-commit rule)
+### 8.5 Session lifecycle (review R10, as tightened by the assessment)
+
+Session creation is today a state-changing `GET`; identifiers alone don't
+fix the semantics (GET is idempotent *by definition*, so infrastructure
+may replay it). The canonical lifecycle becomes:
+
+```text
+POST   /api/v1/files/{id}/hls/sessions   create — or idempotently recover
+       body: { playback_id, request_id, height | copy+aac,
+               start_seconds, audio_index }
+GET    /api/v1/hls/{session}/status      read (exists today)
+DELETE /api/v1/hls/{session}             release — idempotent, keepalive-safe
+```
+
+- `playback_id` — client-generated, stable for one player instance.
+  **Supersession is keyed by it**, not by (user, file): two devices on one
+  account watching the same file stop killing each other's sessions,
+  which automatic quality restarts would otherwise make routine.
+- `request_id` — same id + same normalized recipe returns the same
+  session instead of spawning twice; same id + different recipe is a
+  conflict.
+- `DELETE` — the player calls it with `fetch(..., {keepalive: true})` on
+  close/replace, ending the 60–75 s zombie-encoder window. The idle
+  reaper remains the crash/AirPlay fallback, and a session an Apple TV is
+  still fetching is not deleted just because the browser page detached.
+- The existing `GET /hls/start` remains as a **deprecated bridge**
+  implemented over the same creation path — it cannot bypass admission,
+  identity, or cleanup rules — and is removed once no client uses it (we
+  own every client).
+
+Playlist/segment capability-URL auth is untouched — AirPlay depends on it.
+
+### 8.6 Decisions ledger — the review cycle's ten choices, final
+
+| # | Decision | Choice |
+|---|---|---|
+| 1 | Client buffer policy | Seconds only (`60`/`30`), provisional; byte value stays default; M0 evidence required to change it (§4.3) |
+| 2 | Server ahead policy | Three named frontiers (§4.2); pace on playable−fetched from `EXTINF`; suspend on time **or** per-session bytes **or** global scratch; resume when all below half; retention ≥ forward-fetch + back-buffer + retry ≈ 120 s |
+| 3 | Playlist/GC contract | EVENT + documented 404s outside the retention window; deletion inside it forbidden |
+| 4 | ABR handoff | Visible restart (Option A) with measured p95 interruption SLO — proposed ≤2.5 s on LAN, **operator confirms**; estimate seeded across Hls instances; severe pressure jumps straight to the highest safe rung |
+| 5 | Over-capacity & fallback admission | Queue ≤5 s → *measured-safe* software recipe (recent speed ≥ ~1.2× for that pipeline class — never "720p is safe") → capacity error; cluster inserts "another node" first |
+| 6 | Cache identity | Encoder family + pipeline digest in the hash; relaxation only after per-family output contracts are proven equivalent (**operator's call** whether ever worth it) |
+| 7 | Background preemption | Checkpoint-and-terminate — SIGSTOP does not release hardware sessions (§6.2); resume from last published boundary; discard unpublished temp |
+| 8 | Failover prefix | Hybrid: one regenerated overlap segment covers served-but-unacknowledged; client-buffer reliance for everything earlier (§7.3) |
+| 9 | Owner fencing | 6 s lease / 2 s renewal; epoch on every publication; resume SLO is a measured ≤10 s budget (§7.3) |
+| 10 | Bitmap subtitles | Remain unsupported; **disclosed, not rejected** — the server picks the burn track today, so there is no client request to refuse, and blocking a film over subtitles is worse than a labeled omission the UI announces. Cache identity records `applied=false`. (Deviates from the assessment's reject-or-negotiate wording; this is the negotiation, shaped for a living-room player.) |
+
+### 8.7 Docs this plan's commits must update (same-commit rule)
 
 [PLAYBACK.md](PLAYBACK.md) copy-video `-re` rationale + non-goals disk
 paragraph (§4.2 obsoletes both) · [ADAPTIVE-QUALITY.md](ADAPTIVE-QUALITY.md)
@@ -726,6 +1041,21 @@ chosen-by-probe (§5) · [ROADMAP.md](ROADMAP.md) — this plan's slice line.
 - **Do not** derive markers, chapters, or cache keys from anything the
   scanner didn't persist — a play-path that quietly re-probes on the NAS
   is this plan's original sin coming back.
+- **Do not** use SIGSTOP as a capacity-release mechanism — a stopped
+  ffmpeg still holds its hardware codec session (§6.2). Suspend is for a
+  live session's disk window only; background work terminates.
+- **Do not** conflate the three frontiers (§4.2). `encoder_out_time`
+  never feeds pacing or GC; nothing multiplies a segment index by
+  `SEGMENT_SECONDS` to get a timestamp; a field holding the download
+  frontier is not named "playhead".
+- **Do not** delete media inside the retention window, whatever any
+  budget says — pause production instead; a budget breach with no
+  evictable media is a capacity error, not a license to break the
+  playlist contract.
+- **Do not** state third-party mechanisms (hls.js, FFmpeg muxer, browser
+  quotas) as root causes without checking the vendored source or a live
+  probe — R1 is what skipping that costs. Plurx code gets file:line
+  citations; external behavior gets the same standard.
 - Keep every user-facing string `${APP_NAME}`-based and every new UI
   color theme-mixed (`color-mix(… var(--panel))`) — the light theme
   renders hardcoded dark hexes as black boxes, and the web UI is
@@ -739,12 +1069,14 @@ chosen-by-probe (§5) · [ROADMAP.md](ROADMAP.md) — this plan's slice line.
 | Slice | Contents | Expected result |
 |---|---|---|
 | Weekend 1 ✅ | M0 + §4.1 + §4.2 + §4.3 + §4.5 | starts ~3–5 s; 4K copy-HLS and AirPlay stop stalling; numbers for everything else |
-| Weekend 2 | §4.4 + §4.6 (+§4.7 decision) | starts ~2–3 s; Wi-Fi-stable rungs |
-| Focused week | §5 (M2) | 4K HDR fully hardware; the 30 s stutter class gone; Auto=1080p viable |
-| Next | §6 (M3) | predicted plays start ≤1.5 s and seek like direct play |
-| With Phase 4 | §7 (M4) | pool of nodes; failover ≤5 s; overnight cluster pre-caching |
+| **Correction pass** (next) | §2.8: R1 client config + comment · three-frontier accounting + retention + byte budgets · attempt generations + live labels · §8.5 lifecycle · R11 cheap wins (availability cache, Trakt move, streamed segments) | shipped code matches the reviewed contracts before anything is built on top of them |
+| Weekend 2 | §4.4 + §4.6 (+§4.7 decision) | starts ~2–3 s; Wi-Fi-stable rungs; validation exercises the production flags |
+| Focused week | §5 (M2) — real-HDR probe matrix on nynuc + one AMD node first | 4K HDR fully hardware; the 30 s stutter class gone; Auto=1080p viable; admission by measured speed |
+| Next | §6 (M3) — slot arbiter v1 lands with it | predicted plays start ≤1.5 s and seek like direct play; producers yield to viewers |
+| With Phase 4 | §7 (M4) — fencing + takeover protocol per §7.3 | pool of nodes; failover inside the measured budget; overnight cluster pre-caching |
 
 Every slice leaves the tree releasable; nothing in a later slice is
-load-bearing for an earlier one. If only one thing ships, ship
-Weekend 1 — it converts both reported 4K symptoms and most of the start
-latency with ~200 lines of change.
+load-bearing for an earlier one. The correction pass goes first because
+building §4.4 onward on accounting the review cycle disproved would
+compound the debt; after it lands, the remaining uncertainty is
+measurement uncertainty owned by M0 — which is where uncertainty belongs.

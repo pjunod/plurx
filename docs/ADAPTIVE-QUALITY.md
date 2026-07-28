@@ -55,55 +55,91 @@ take 20 Mb/s sustained is better served by direct play or remux — transcoding
 4K→4K burns GPU for nothing. "Original" (direct play / remux) sits above the
 ladder and is not adaptive; see "Adjacent wins" for its rescue path.
 
-## Phase 1 — the ladder made real, with a manual Quality menu
+## Phase 1 — the ladder made real (revised 2026-07-28: the menu already exists)
 
-*Server*: add `-maxrate` (1.5×) and `-bufsize` (2×) to the QSV, VA-API, and
-VideoToolbox arms of `Encoder::encode_args` — software and NVENC already have
-them. Snap `height` to the nearest rung in `hls/start`, and return the
-ladder (each rung's height + total kb/s, source-height filtered) in the
-`start` and `decision` responses so the client never hardcodes it.
+The first version of this phase said "add a manual Quality menu." That
+menu shipped 2026-07-23 (`Auto · Original · 1080p · 720p · 480p`,
+localStorage persistence, forced decision modes, restart-at-position on
+change) and review R12 rightly called the drift. Phase 1 is now only the
+work that *remains*:
 
-*Client*: a Quality entry in the player menu — `Auto · 1080p · 720p · 480p ·
-360p` — using the exact restart machinery the audio-switch path uses today
-(same `hls/start?height=…&start=<now>` call, same `attachHls`). Persist the
-choice in localStorage; show the active rung in the Stats overlay.
+*Server*: add `-maxrate` (1.5×) and `-bufsize` (2×) to the QSV, VA-API,
+and VideoToolbox arms of `Encoder::encode_args` — software and NVENC
+already have them — with the validation probe running the full production
+argument set and the bound stated as a sliding window
+([PERF-PLAN.md](PERF-PLAN.md) §4.6). Snap `height` to the nearest rung in
+session creation, and return the ladder (each rung's height + total kb/s,
+source-height filtered) in the `start` and `decision` responses so the
+client never hardcodes it. The advertised per-rung bandwidth covers the
+*measured* peak, not the nominal target.
 
-Effort: **small** — one sitting. Risk: low; every mechanism is already
-exercised elsewhere.
+*Client*: consume the server ladder instead of the hardcoded `QUALITIES`
+list; add the missing 360p rung; show the active rung and its reason in
+the Stats overlay. The menu itself, persistence, and the restart machinery
+are done.
 
-## Phase 2 — Auto (the actual feature)
+Effort: **small** — one sitting, still. Risk: low; every mechanism is
+already exercised elsewhere.
+
+## Phase 2 — Auto (the actual feature; controller revised per review R3)
 
 A client-side controller, roughly 120 lines, extracted as a pure function so
 it unit-tests without a video element:
 
 - **Sample** every 5 s: `hls.bandwidthEstimate` (hls.js's EWMA over real
   segment downloads), stalls (a `waiting` event after playback started, or
-  hls.js `bufferStalledError`), and buffer runway
-  (`buffered.end − currentTime`).
-- **Down** one rung when a stall lands, or when the estimate sits below
-  1.3× the current rung's total bitrate for two consecutive samples.
-  Restart at the current position; 20 s cooldown between any two switches.
+  hls.js `bufferStalledError`), buffer runway
+  (`buffered.end − currentTime`), and — new — the server's `recent_speed`
+  from the session status endpoint: on a JIT server the download estimate
+  measures `min(link, encode)`, and a producer below 1× with shrinking
+  runway is actionable *before* the client ever stalls.
+- **Severe pressure** (a stall, near-empty runway, or an estimate far
+  below the current rung) selects the highest rung safely below the
+  estimate **in one move** — never one-rung-at-a-time through a
+  bandwidth cliff, which leaves the player above the sustainable rate for
+  two full cooldowns (the review's 8 → 1.5 Mb/s example: 40 s of
+  guaranteed stalling).
+- **Mild pressure** (estimate below 1.3× the current rung's total bitrate
+  for two consecutive samples) steps down one rung.
+- **Cooldown** (20 s) governs *upgrades and mild steps only* — it exists
+  to stop oscillation, and it must never block an emergency downgrade
+  while the buffer is still draining.
 - **Up** one rung when the estimate exceeds 1.8× the *next* rung's bitrate
   for 45 s with no stall in the last 60 s — and never above the player's
   actual pixel height (a 1080p encode into a 700-px window is waste).
-- **Start** at the persisted last-good rung (default 720p), so a session on
-  known-bad Wi-Fi doesn't relearn the lesson at 1080p.
+- **Start** at the persisted last-good rung (default 720p), and **seed
+  the replacement Hls instance's `bandwidthEstimate`** from the outgoing
+  one — hls.js exposes the setter for exactly this, and without it every
+  restart forgets everything and re-learns from the 500 kb/s default.
 
-Asymmetric thresholds (down fast, up slow) are the whole trick of ABR;
-these constants are starting points to tune on real use.
+Asymmetric *selection* (down in one move, up one rung slowly) is the whole
+trick of ABR; the constants are starting points to tune on real use.
 
 The switch itself is the honest cost of the JIT model: a restart, not a
-seamless splice. QSV spins up in ~1–3 s and the buffer usually covers it; if
-the buffer runs dry the loading overlay says "Adjusting quality…" and the
-toast names the move (`Quality → 480p — bandwidth`). Plex behaves the same
-way. Every switch is logged to the Stats overlay with its reason, so "why did
-it get blurry" always has an answer.
+seamless splice — and the restart machinery **destroys the old stream
+before the new one is ready** (`teardownHls` runs first), so the claim
+that "the buffer covers it" is not true as built and this plan no longer
+makes it. The interruption is a measured product property with an SLO
+([PERF-PLAN.md](PERF-PLAN.md) §8.6, decision 4: p95 ≤ 2.5 s on LAN,
+operator-confirmed): the loading overlay says "Adjusting quality…", the
+toast names the move (`Quality → 480p — bandwidth`), and every switch is
+logged to the Stats overlay with its reason, so "why did it get blurry"
+always has an answer. A prepared-handoff variant (start the replacement,
+switch at a boundary) is Option B in the review record — build it only if
+the measured p95 misses the SLO.
 
-Server changes: none required beyond Phase 1.
+Server changes: none required beyond Phase 1 and the status endpoint that
+already exists.
 
 Effort: **medium** — one focused session including tests. Risk: low-medium;
 the failure mode of a mistuned controller is a visible switch, not a broken
 player, and Manual remains one menu tap away.
+
+**Acceptance (from the review):** a scripted 8 → 1.5 Mb/s cliff reaches a
+sustainable rung with at most one automatic restart; recovery causes at
+most one upgrade per 60 s; switch-interruption p95 is measured and
+documented; recreating hls.js demonstrably preserves the bandwidth
+estimate.
 
 ## Phase 3 — seamless switching (optional, the majors' UX)
 

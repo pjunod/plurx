@@ -85,7 +85,7 @@ now. What shipped instead — scheduled scans plus targeted scans — covers bot
 would improve only the case where a human moves files by hand *and* wants it
 noticed sooner than the reconcile interval.
 
-## Performance — start latency, 4K, pre-cache (PLANNED)
+## Performance — start latency, 4K, pre-cache (IN PROGRESS)
 
 Design record: [PERF-PLAN.md](PERF-PLAN.md) — where the seconds go when you
 press Play, and the milestones that get them back: instrument first (M0),
@@ -93,6 +93,16 @@ single-node pacing/buffer/segment fixes (M1), GPU tone-mapping end to end
 (M2), the pre-transcode cache (M3), and cluster transcode — placement,
 restart-at-boundary failover, distributed pre-caching (M4). HA-neutral
 through M3; M4 *is* Phase 4's transcode chapter and waits for its plumbing.
+
+- ✅ **Weekend 1 shipped 2026-07-28:** telemetry (encode speed, TTFF/stall
+  beacons, session status endpoint), chapters moved to scan time,
+  burst-then-hold pacing replacing `-re`, the ahead-window suspend, and the
+  progress-aware watchdog.
+- 📝 **Reviewed 2026-07-28**, two rounds: [PERF-PLAN-REVIEW.md](PERF-PLAN-REVIEW.md)
+  → [PERF-REVIEW-RESPONSE.md](PERF-REVIEW-RESPONSE.md) →
+  [PERF-REVIEW-ASSESSMENT.md](PERF-REVIEW-ASSESSMENT.md). The plan carries
+  the corrected contracts and a decisions ledger (PERF-PLAN §8.6); the
+  **correction pass** (PERF-PLAN §2.8) is the next work item.
 
 ## Phase 4 — HA for real
 
