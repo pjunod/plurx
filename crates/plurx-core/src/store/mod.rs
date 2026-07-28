@@ -99,6 +99,15 @@ pub mod keys {
     /// disk bound that realtime pacing used to provide, minus the part where
     /// realtime pacing also prevented the viewer from ever building a buffer.
     pub const HLS_AHEAD_MAX_SECS: &str = "playback.hls_ahead_max_secs";
+    /// The same window in bytes, per session. Time alone is not a disk
+    /// contract: 180 seconds is a few hundred megabytes at a transcode rung
+    /// and over a gigabyte of 4K copy, so a stream with an unexpectedly high
+    /// bitrate would blow through any time-only limit.
+    pub const HLS_AHEAD_MAX_BYTES: &str = "playback.hls_ahead_max_bytes";
+    /// Ceiling on scratch across every live session. A per-session cap bounds
+    /// one runaway session; it says nothing about several healthy ones filling
+    /// the disk between them.
+    pub const HLS_SCRATCH_MAX_BYTES: &str = "playback.hls_scratch_max_bytes";
 }
 
 #[async_trait]

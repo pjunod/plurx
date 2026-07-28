@@ -438,6 +438,13 @@ pub struct SettingsDto {
     pub hls_readrate: String,
     pub hls_burst_secs: String,
     pub hls_ahead_max_secs: String,
+    /// The ahead-window's other two bounds, in bytes: one session's share and
+    /// the ceiling across all of them. Safety limits rather than tuning knobs
+    /// — they have no dropdown, because the answer is "big enough that you
+    /// never meet it, small enough that a runaway stream cannot fill the
+    /// disk" and that is a property of the disk, not a preference.
+    pub hls_ahead_max_bytes: String,
+    pub hls_scratch_max_bytes: String,
     /// Server-wide scheduled maintenance, in minutes; 0 is off (the default).
     /// Per-library scan/refresh intervals are on the library, not here.
     pub probe_retry_mins: i64,
@@ -500,6 +507,14 @@ async fn settings_dto(state: &AppState) -> Result<SettingsDto, ApiError> {
         state.store.get_setting(keys::HLS_AHEAD_MAX_SECS).await?,
         &crate::transcode::HLS_AHEAD_MAX_SECS_DEFAULT.to_string(),
     );
+    let hls_ahead_max_bytes = text(
+        state.store.get_setting(keys::HLS_AHEAD_MAX_BYTES).await?,
+        &crate::transcode::HLS_AHEAD_MAX_BYTES_DEFAULT.to_string(),
+    );
+    let hls_scratch_max_bytes = text(
+        state.store.get_setting(keys::HLS_SCRATCH_MAX_BYTES).await?,
+        &crate::transcode::HLS_SCRATCH_MAX_BYTES_DEFAULT.to_string(),
+    );
     let mins = |v: Option<String>| -> i64 {
         v.and_then(|v| v.trim().parse::<i64>().ok())
             .unwrap_or(0)
@@ -541,6 +556,8 @@ async fn settings_dto(state: &AppState) -> Result<SettingsDto, ApiError> {
         hls_readrate,
         hls_burst_secs,
         hls_ahead_max_secs,
+        hls_ahead_max_bytes,
+        hls_scratch_max_bytes,
         probe_retry_mins,
         transcode_cleanup_mins,
         scan_on_startup,
@@ -580,6 +597,8 @@ pub struct UpdateSettings {
     pub hls_readrate: Option<String>,
     pub hls_burst_secs: Option<String>,
     pub hls_ahead_max_secs: Option<String>,
+    pub hls_ahead_max_bytes: Option<String>,
+    pub hls_scratch_max_bytes: Option<String>,
     /// Server-wide job intervals in minutes; 0 turns one off.
     pub probe_retry_mins: Option<i64>,
     pub transcode_cleanup_mins: Option<i64>,
@@ -680,6 +699,21 @@ pub async fn update_settings(
             "hls_ahead_max_secs",
             &req.hls_ahead_max_secs,
             3600.0,
+        ),
+        // Bytes. The ceiling is generous on purpose: this is a guard against a
+        // runaway stream, not a quota, and refusing a large disk would be the
+        // setting telling the operator they are wrong about their own hardware.
+        (
+            keys::HLS_AHEAD_MAX_BYTES,
+            "hls_ahead_max_bytes",
+            &req.hls_ahead_max_bytes,
+            1024.0 * 1024.0 * 1024.0 * 1024.0,
+        ),
+        (
+            keys::HLS_SCRATCH_MAX_BYTES,
+            "hls_scratch_max_bytes",
+            &req.hls_scratch_max_bytes,
+            1024.0 * 1024.0 * 1024.0 * 1024.0,
         ),
     ] {
         let Some(raw) = value else { continue };

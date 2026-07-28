@@ -13,9 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use plurx_core::store::{keys, Store};
-use plurx_core::transcode::{
-    self, Encoder, EncoderCaps, Pacing, ToneMap, TranscodeOptions, SEGMENT_SECONDS,
-};
+use plurx_core::transcode::{self, Encoder, EncoderCaps, Pacing, ToneMap, TranscodeOptions};
 use tokio::process::Child;
 use tokio::sync::Mutex;
 
@@ -45,21 +43,42 @@ const SOFTWARE_GRACE: Duration = Duration::from_secs(30);
 const PROGRESS_STALL: Duration = Duration::from_secs(10);
 /// How often the stall watchdog re-asks, once past its initial grace.
 const WATCHDOG_POLL: Duration = Duration::from_secs(5);
-/// How many segments behind the furthest-served one to keep on disk. An HLS
-/// session's playlist grows for its whole life (event type), so without pruning
-/// a full watch accumulates every segment — cheap at 720p, but a 4K copy-video
-/// session at ~45 Mb/s would hoard ~17 GB. We delete segments well behind the
-/// playhead; ~60 s (15 × 4 s) covers a player's back-buffer, and a seek restarts
-/// the session anyway, so a played-past segment is never re-requested.
-const KEEP_BEHIND_SEGMENTS: i64 = 15;
+/// How far behind the *download frontier* media is kept on disk, and why that
+/// is not the same as "behind the playhead".
+///
+/// An HLS session's playlist grows for its whole life (event type), so without
+/// pruning a full watch accumulates every segment — cheap at 720p, ~17 GB for
+/// a 4K copy. The subtlety is what to measure from. The server knows the
+/// highest segment a client has *fetched*, and a client fetches its whole
+/// forward buffer ahead of what it is showing: with a 60-second buffer the
+/// frontier sits a minute past the picture on screen. Pruning at a fixed
+/// distance behind the frontier therefore deletes media the viewer is about to
+/// watch — or is watching. Retention covers the forward buffer, the back
+/// buffer the client keeps for scrubbing, and an allowance for a retry or a
+/// playlist reload landing on something older.
+const CLIENT_FORWARD_BUFFER_SECS: i64 = 60;
+const CLIENT_BACK_BUFFER_SECS: i64 = 30;
+const RETRY_ALLOWANCE_SECS: i64 = 30;
+const RETENTION_SECS: i64 =
+    CLIENT_FORWARD_BUFFER_SECS + CLIENT_BACK_BUFFER_SECS + RETRY_ALLOWANCE_SECS;
 /// Default pace for an HLS session's input, as a multiple of realtime, and how
 /// many seconds it may deliver flat-out first. Admin-overridable (see
 /// [`keys::HLS_READRATE`] / [`keys::HLS_BURST_SECS`]).
 pub(crate) const HLS_READRATE_DEFAULT: f64 = 2.0;
 pub(crate) const HLS_BURST_SECS_DEFAULT: f64 = 90.0;
-/// How far ahead of the playhead a session may write before it is suspended,
-/// in seconds of content. See [`TranscodeManager::apply_ahead_window`].
+/// How far ahead of the download frontier a session may produce before it is
+/// suspended — in seconds of published media, and in bytes on disk.
+///
+/// Both, because neither alone is a bound. 180 seconds is a few hundred
+/// megabytes at a transcode rung and over a gigabyte of 4K copy, so a
+/// time-only limit is not a disk contract; and a byte-only limit would starve
+/// a low-bitrate stream of the reserve it could afford.
 pub(crate) const HLS_AHEAD_MAX_SECS_DEFAULT: i64 = 180;
+pub(crate) const HLS_AHEAD_MAX_BYTES_DEFAULT: i64 = 2 * 1024 * 1024 * 1024;
+/// Ceiling on scratch across *all* live sessions. A per-session cap bounds one
+/// runaway; it does nothing about four healthy 4K sessions filling the disk
+/// between them.
+pub(crate) const HLS_SCRATCH_MAX_BYTES_DEFAULT: i64 = 8 * 1024 * 1024 * 1024;
 
 /// Live encode telemetry for one session, fed by ffmpeg's `-progress` stream.
 ///
@@ -229,6 +248,153 @@ impl Progress {
             .filter(|v| *v >= 0)
             .map(|v| v as f64 / 1000.0)
     }
+}
+
+/// One completed, published segment — the unit of everything except the
+/// watchdog.
+#[derive(Debug, Clone, PartialEq)]
+struct SegmentMeta {
+    index: i64,
+    /// The URI exactly as the playlist wrote it, so the file can be found
+    /// without guessing an extension (`.ts` for transcode, `.m4s` for copy).
+    name: String,
+    /// Session-relative bounds, accumulated from `EXTINF`. Never
+    /// `index × SEGMENT_SECONDS`: the copy path cannot force keyframes, so its
+    /// segments run to the source's GOP and a 2-second target routinely
+    /// produces 5- and 10-second segments. Multiplying an index by the target
+    /// is a lie on exactly the sessions this accounting exists to bound.
+    start_ms: i64,
+    end_ms: i64,
+    /// Size on disk, or 0 until it has been measured (or after it is pruned).
+    bytes: i64,
+}
+
+/// What a session has actually published, in media time and bytes.
+///
+/// This is the second of the three frontiers a session has, and the one that
+/// pacing uses. The others are ffmpeg's `out_time` (encoder progress —
+/// includes the in-progress `.tmp` segment nobody can fetch) and the client's
+/// download frontier. Conflating any two of them produces a plausible number
+/// that is wrong in a different way each time.
+#[derive(Debug, Default)]
+struct SegmentIndex {
+    segs: Vec<SegmentMeta>,
+}
+
+impl SegmentIndex {
+    /// End of the newest completed segment: the pacing clock.
+    fn produced_playable_end_ms(&self) -> Option<i64> {
+        self.segs.last().map(|s| s.end_ms)
+    }
+
+    /// Where a given segment ends, for turning "the client fetched segment N"
+    /// into a position on the media timeline.
+    fn end_ms_of(&self, index: i64) -> Option<i64> {
+        self.segs
+            .iter()
+            .find(|s| s.index == index)
+            .map(|s| s.end_ms)
+    }
+
+    /// Bytes of published segments lying entirely after `ms`.
+    fn bytes_after_ms(&self, ms: i64) -> i64 {
+        self.segs
+            .iter()
+            .filter(|s| s.start_ms >= ms)
+            .map(|s| s.bytes)
+            .sum()
+    }
+
+    /// Segments old enough to delete: those that END before the retention
+    /// window opens. A segment straddling the boundary is kept — half a
+    /// segment is no use to anyone and the arithmetic is cheap.
+    fn prunable(&self, keep_from_ms: i64) -> impl Iterator<Item = &SegmentMeta> {
+        self.segs
+            .iter()
+            .filter(move |s| s.bytes > 0 && s.end_ms <= keep_from_ms)
+    }
+}
+
+/// Parse `EXTINF` durations and segment URIs out of an HLS media playlist.
+///
+/// Pure, and the reason the copy path's variable segment lengths stop being a
+/// guess: the playlist is the only place the true duration of a copied segment
+/// is written down.
+fn parse_playlist(text: &str) -> Vec<SegmentMeta> {
+    let mut out: Vec<SegmentMeta> = Vec::new();
+    let mut pending_ms: Option<i64> = None;
+    let mut cursor_ms = 0i64;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("#EXTINF:") {
+            pending_ms = rest
+                .split(',')
+                .next()
+                .and_then(|d| d.trim().parse::<f64>().ok())
+                .filter(|d| *d >= 0.0)
+                .map(|secs| (secs * 1000.0).round() as i64);
+            continue;
+        }
+        // Every other tag, including `#EXT-X-MAP:URI="init.mp4"`, which names
+        // a file that is not a segment and carries no duration.
+        if line.starts_with('#') {
+            continue;
+        }
+        // A URI line counts only when an EXTINF introduced it.
+        let (Some(duration_ms), Some(index)) = (pending_ms.take(), segment_index(line)) else {
+            continue;
+        };
+        out.push(SegmentMeta {
+            index,
+            name: line.to_owned(),
+            start_ms: cursor_ms,
+            end_ms: cursor_ms + duration_ms,
+            bytes: 0,
+        });
+        cursor_ms += duration_ms;
+    }
+    out
+}
+
+/// How far a session has run ahead of the client, both ways it can matter.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+struct Ahead {
+    seconds: i64,
+    bytes: i64,
+}
+
+/// The bounds a session's ahead-window is held to.
+#[derive(Debug, Clone, Copy)]
+struct AheadLimits {
+    max_secs: i64,
+    max_bytes: i64,
+    global_max_bytes: i64,
+}
+
+/// Whether a session should be held, given how far ahead it is, how much
+/// scratch every session is using between them, and whether it is already
+/// held.
+///
+/// Any single limit is enough to suspend; resuming needs all of them below
+/// half. The asymmetry is deliberate: a single threshold makes a session
+/// sitting on a boundary toggle on every evaluation, which is a stream of
+/// signals and log lines to accomplish nothing. Resuming early is the safe
+/// direction — the cost of being wrong is some disk, and the cost of the other
+/// error is a viewer who runs dry.
+fn should_suspend(
+    ahead: Ahead,
+    global_bytes: i64,
+    limits: AheadLimits,
+    currently_suspended: bool,
+) -> bool {
+    let divisor = if currently_suspended { 2 } else { 1 };
+    let over = |value: i64, limit: i64| limit > 0 && value > limit / divisor;
+    over(ahead.seconds, limits.max_secs)
+        || over(ahead.bytes, limits.max_bytes)
+        || over(global_bytes, limits.global_max_bytes)
 }
 
 /// Apply one `key=value` line of ffmpeg's `-progress` output.
@@ -456,10 +622,20 @@ struct Session {
     /// both failed to emit a first segment). Playlist/segment reads then fail
     /// fast so the player shows an error instead of waiting on a gray screen.
     failed: AtomicBool,
-    /// Highest segment index the client has fetched (-1 before the first). The
-    /// reaper prunes segments far enough behind this to bound disk use, and
-    /// the ahead-window measures from it.
+    /// Highest segment index the client has fetched (-1 before the first).
+    /// Kept for logs and for resolving the frontier against the index; the
+    /// accounting itself works in media time.
     high_segment: AtomicI64,
+    /// The client's DOWNLOAD frontier in session-relative ms: the end of the
+    /// furthest segment served, from that segment's own `EXTINF`. Not the
+    /// playhead — a client fetches its whole forward buffer ahead of the
+    /// picture — and every name and log line here says so.
+    fetched_end_ms: AtomicI64,
+    /// What the playlist says is published, refreshed as segments complete.
+    segments: Mutex<SegmentIndex>,
+    /// This session's share of scratch, cached from the last refresh so the
+    /// global budget can be summed without re-reading every session's disk.
+    ahead_bytes: AtomicI64,
     /// Live encode telemetry (see [`Progress`]).
     progress: Arc<Progress>,
     /// True while the child is SIGSTOPped for running too far ahead of the
@@ -468,48 +644,74 @@ struct Session {
     suspended: AtomicBool,
 }
 
-/// Seconds of content produced beyond what the client has fetched.
+/// How far a session's published media runs ahead of the client's download
+/// frontier, in seconds and in bytes.
 ///
-/// Both terms are session-relative — ffmpeg's `out_time` restarts at zero after
-/// the input seek, and segment numbering restarts with the session — so the
-/// subtraction needs no absolute timeline. Derived from telemetry rather than
-/// by counting files on disk, which makes it exact to the frame, free to ask
-/// for, and correct for the copy path (whose segment lengths follow the source
-/// GOP and so can't be inferred from an index).
-fn ahead_seconds(produced_ms: Option<i64>, high_segment: i64) -> Option<i64> {
-    // `high_segment` is the last segment *fetched*, so the playhead sits at its
-    // end; -1 (nothing fetched yet) puts the playhead at zero.
-    let fetched_to = (high_segment + 1) * SEGMENT_SECONDS as i64;
-    Some(produced_ms? / 1000 - fetched_to)
-}
-
-/// Whether a session should be held, given how far ahead it is and whether it
-/// is already held.
-///
-/// The asymmetry is the point: suspend at the window, resume at half of it.
-/// A single threshold makes a session sitting on the boundary toggle on every
-/// reaper tick, which is a stream of signals and log lines to accomplish
-/// nothing. Resuming early is the safe direction — the cost of being wrong is
-/// some disk, and the cost of the other error is a viewer who runs dry.
-fn should_suspend(ahead_seconds: i64, max_secs: i64, currently_suspended: bool) -> bool {
-    if max_secs <= 0 {
-        return false; // window disabled
-    }
-    if currently_suspended {
-        ahead_seconds > max_secs / 2
-    } else {
-        ahead_seconds > max_secs
-    }
+/// Both terms are session-relative: ffmpeg's input seek restarts output
+/// timestamps at zero and segment numbering restarts with the session, so the
+/// subtraction needs no absolute timeline.
+fn ahead_of(index: &SegmentIndex, fetched_end_ms: i64) -> Option<Ahead> {
+    let produced_end = index.produced_playable_end_ms()?;
+    Some(Ahead {
+        seconds: (produced_end - fetched_end_ms) / 1000,
+        bytes: index.bytes_after_ms(fetched_end_ms),
+    })
 }
 
 impl Session {
-    fn ahead_seconds(&self) -> Option<i64> {
-        ahead_seconds(self.progress.out_time_ms(), self.high_segment.load(Relaxed))
+    /// Re-read the playlist and re-measure what is on disk.
+    ///
+    /// Sizes already known are carried forward by index, so a long session
+    /// stats only the segments that appeared since the last refresh rather
+    /// than the whole directory each time.
+    async fn refresh_segments(&self) {
+        let Ok(raw) = tokio::fs::read(self.dir.join("index.m3u8")).await else {
+            return;
+        };
+        let mut segs = parse_playlist(&String::from_utf8_lossy(&raw));
+        {
+            let known = self.segments.lock().await;
+            let mut sizes: HashMap<i64, i64> = HashMap::with_capacity(known.segs.len());
+            for s in known.segs.iter().filter(|s| s.bytes > 0) {
+                sizes.insert(s.index, s.bytes);
+            }
+            for s in segs.iter_mut() {
+                if let Some(b) = sizes.get(&s.index) {
+                    s.bytes = *b;
+                }
+            }
+        }
+        for s in segs.iter_mut().filter(|s| s.bytes == 0) {
+            if let Ok(meta) = tokio::fs::metadata(self.dir.join(&s.name)).await {
+                s.bytes = meta.len() as i64;
+            }
+        }
+        let index = SegmentIndex { segs };
+        // Resolve the frontier against the fresh index: a segment served
+        // before its EXTINF was known gets its real end time now.
+        let high = self.high_segment.load(Relaxed);
+        if high >= 0 {
+            if let Some(end) = index.end_ms_of(high) {
+                self.fetched_end_ms.fetch_max(end, Relaxed);
+            }
+        }
+        if let Some(ahead) = ahead_of(&index, self.fetched_end_ms.load(Relaxed).max(0)) {
+            self.ahead_bytes.store(ahead.bytes, Relaxed);
+        }
+        *self.segments.lock().await = index;
+    }
+
+    async fn ahead(&self) -> Option<Ahead> {
+        ahead_of(
+            &*self.segments.lock().await,
+            self.fetched_end_ms.load(Relaxed).max(0),
+        )
     }
 }
 
 /// One live session as the activity page and the stats overlay see it.
 async fn session_info(id: &str, s: &Session) -> SessionInfo {
+    let ahead = s.ahead().await;
     SessionInfo {
         id: id.to_owned(),
         file_id: s.file_id,
@@ -523,7 +725,8 @@ async fn session_info(id: &str, s: &Session) -> SessionInfo {
         speed: s.progress.speed(),
         recent_speed: s.progress.recent_speed(),
         out_time_ms: s.progress.out_time_ms(),
-        ahead_seconds: s.ahead_seconds(),
+        ahead_seconds: ahead.map(|a| a.seconds),
+        ahead_bytes: ahead.map(|a| a.bytes),
         suspended: s.suspended.load(Relaxed),
     }
 }
@@ -557,8 +760,12 @@ pub struct SessionInfo {
     pub recent_speed: Option<f64>,
     /// Content produced so far, in ms from this session's start offset.
     pub out_time_ms: Option<i64>,
-    /// Seconds of content written beyond the segment the client last fetched.
+    /// Published media beyond the client's download frontier — the reserve a
+    /// hiccup gets to spend. Not measured from the playhead: the client has
+    /// usually fetched further than it is showing.
     pub ahead_seconds: Option<i64>,
+    /// The same reserve in bytes, which is what actually bounds the disk.
+    pub ahead_bytes: Option<i64>,
     pub suspended: bool,
 }
 
@@ -606,13 +813,6 @@ impl TranscodeManager {
             .num_setting(keys::HLS_BURST_SECS, HLS_BURST_SECS_DEFAULT)
             .await;
         pacing_caps().await.resolve(rate, burst, for_copy)
-    }
-
-    /// Seconds of content a session may write beyond the client's playhead
-    /// before it is suspended. `0` disables the window entirely.
-    async fn ahead_max_secs(&self) -> i64 {
-        self.num_setting(keys::HLS_AHEAD_MAX_SECS, HLS_AHEAD_MAX_SECS_DEFAULT)
-            .await
     }
 
     /// Choose the encoder given the admin preference setting (empty = auto).
@@ -807,6 +1007,9 @@ impl TranscodeManager {
                 .unwrap_or(0),
             failed: AtomicBool::new(false),
             high_segment: AtomicI64::new(-1),
+            fetched_end_ms: AtomicI64::new(0),
+            segments: Mutex::new(SegmentIndex::default()),
+            ahead_bytes: AtomicI64::new(0),
             progress: Arc::clone(&progress),
             suspended: AtomicBool::new(false),
         });
@@ -1005,6 +1208,9 @@ impl TranscodeManager {
                 .unwrap_or(0),
             failed: AtomicBool::new(false),
             high_segment: AtomicI64::new(-1),
+            fetched_end_ms: AtomicI64::new(0),
+            segments: Mutex::new(SegmentIndex::default()),
+            ahead_bytes: AtomicI64::new(0),
             progress: Arc::clone(&progress),
             suspended: AtomicBool::new(false),
         });
@@ -1088,6 +1294,9 @@ impl TranscodeManager {
             }
             if let Ok(bytes) = tokio::fs::read(&path).await {
                 if !bytes.is_empty() {
+                    // The playlist just told us what is published — the one
+                    // moment the segment index can be refreshed for free.
+                    self.flow_control(&session, session_id).await;
                     return Some(bytes);
                 }
             }
@@ -1109,9 +1318,19 @@ impl TranscodeManager {
         let deadline = Instant::now() + SEGMENT_WAIT;
         loop {
             if let Ok(bytes) = tokio::fs::read(&path).await {
-                // Track the playhead so the reaper can prune segments behind it.
+                // The client's download frontier just advanced. Resolve it
+                // against the index's real EXTINF bounds — the fetched
+                // segment's own end time, not an index times a nominal
+                // duration — and re-run flow control, since a frontier that
+                // moved may have earned the encoder its slot back.
                 if let Some(i) = idx {
-                    session.high_segment.fetch_max(i, Relaxed);
+                    let previous = session.high_segment.fetch_max(i, Relaxed);
+                    if i > previous {
+                        if let Some(end) = session.segments.lock().await.end_ms_of(i) {
+                            session.fetched_end_ms.fetch_max(end, Relaxed);
+                        }
+                        self.flow_control(&session, session_id).await;
+                    }
                 }
                 return Some(bytes);
             }
@@ -1170,8 +1389,8 @@ impl TranscodeManager {
         removed
     }
 
-    /// Hold a session that has run far enough ahead of the playhead, and let
-    /// it go again once the viewer has caught up.
+    /// Hold a session that has run far enough ahead of the client, and let it
+    /// go again once the client has caught up.
     ///
     /// This is what replaced realtime pacing as the bound on disk. `-re` held
     /// production to exactly the rate of consumption, which bounded the
@@ -1188,12 +1407,18 @@ impl TranscodeManager {
     /// tick. SIGKILL still works on a stopped process, so the idle reaper and
     /// the admin stop button need no special case; a suspended session that
     /// nobody comes back to is reaped on idle like any other.
-    async fn apply_ahead_window(&self, session: &Session, session_id: &str, max_secs: i64) {
-        let Some(ahead) = session.ahead_seconds() else {
-            return; // no telemetry yet — nothing produced, nothing to hold
+    async fn apply_ahead_window(
+        &self,
+        session: &Session,
+        session_id: &str,
+        limits: AheadLimits,
+        global_bytes: i64,
+    ) {
+        let Some(ahead) = session.ahead().await else {
+            return; // nothing published yet — nothing to hold
         };
         let suspended = session.suspended.load(Relaxed);
-        let want_suspend = should_suspend(ahead, max_secs, suspended);
+        let want_suspend = should_suspend(ahead, global_bytes, limits, suspended);
         if want_suspend == suspended {
             return;
         }
@@ -1218,15 +1443,60 @@ impl TranscodeManager {
         session.suspended.store(want_suspend, Relaxed);
         if want_suspend {
             tracing::debug!(
-                session = %session_id, ahead_seconds = ahead, max_secs,
-                "suspending transcode: far enough ahead of the playhead"
+                session = %session_id,
+                ahead_seconds = ahead.seconds, ahead_bytes = ahead.bytes,
+                global_bytes, max_secs = limits.max_secs, max_bytes = limits.max_bytes,
+                "suspending transcode: far enough ahead of the client"
             );
         } else {
             tracing::debug!(
-                session = %session_id, ahead_seconds = ahead,
-                "resuming transcode: the viewer caught up"
+                session = %session_id,
+                ahead_seconds = ahead.seconds, ahead_bytes = ahead.bytes,
+                "resuming transcode: the client caught up"
             );
         }
+    }
+
+    /// The bounds every session is held to, read once per evaluation.
+    async fn ahead_limits(&self) -> AheadLimits {
+        AheadLimits {
+            max_secs: self
+                .num_setting(keys::HLS_AHEAD_MAX_SECS, HLS_AHEAD_MAX_SECS_DEFAULT)
+                .await,
+            max_bytes: self
+                .num_setting(keys::HLS_AHEAD_MAX_BYTES, HLS_AHEAD_MAX_BYTES_DEFAULT)
+                .await,
+            global_max_bytes: self
+                .num_setting(keys::HLS_SCRATCH_MAX_BYTES, HLS_SCRATCH_MAX_BYTES_DEFAULT)
+                .await,
+        }
+    }
+
+    /// Scratch in use across every live session, from each one's cached
+    /// figure — summing this must not cost a directory walk per session, or
+    /// the flow controller could not run on every segment fetch.
+    async fn global_ahead_bytes(&self) -> i64 {
+        self.sessions
+            .lock()
+            .await
+            .values()
+            .map(|s| s.ahead_bytes.load(Relaxed))
+            .sum()
+    }
+
+    /// Re-evaluate one session after something changed for it: a segment
+    /// completed, or the client's frontier advanced.
+    ///
+    /// The reaper still sweeps every 15 seconds, but as a repair loop. A
+    /// window that is only checked on a 15-second tick is not a flow
+    /// controller — a fast encoder can put a great deal of 4K on disk between
+    /// two ticks.
+    async fn flow_control(&self, session: &Session, session_id: &str) {
+        session.refresh_segments().await;
+        let limits = self.ahead_limits().await;
+        let global = self.global_ahead_bytes().await;
+        self.apply_ahead_window(session, session_id, limits, global)
+            .await;
     }
 
     /// Background loop: kill and remove sessions idle beyond the timeout,
@@ -1236,7 +1506,7 @@ impl TranscodeManager {
         loop {
             ticker.tick().await;
             let idle = Duration::from_secs(SESSION_IDLE_SECS);
-            let ahead_max = self.ahead_max_secs().await;
+            let limits = self.ahead_limits().await;
             let mut expired = Vec::new();
             let mut live = Vec::new();
             {
@@ -1257,13 +1527,16 @@ impl TranscodeManager {
                 let _ = tokio::fs::remove_dir_all(&session.dir).await;
                 tracing::info!(session_id = %id, "reaped idle transcode session");
             }
-            for (id, session) in live {
-                // Bound disk on active sessions: an HLS playlist grows for the
-                // whole session, so prune segments well behind the playhead (a
-                // 4K copy session would otherwise hoard tens of GB)…
-                gc_old_segments(&session.dir, session.high_segment.load(Relaxed)).await;
-                // …and bound how far *ahead* of the playhead it may get.
-                self.apply_ahead_window(&session, &id, ahead_max).await;
+            // Repair pass. Flow control proper runs on segment completion and
+            // frontier advance; this catches a session nobody is currently
+            // fetching from, and prunes what has fallen out of retention.
+            for (_id, session) in &live {
+                session.refresh_segments().await;
+                gc_expired_segments(session).await;
+            }
+            let global = self.global_ahead_bytes().await;
+            for (id, session) in &live {
+                self.apply_ahead_window(session, id, limits, global).await;
             }
         }
     }
@@ -1297,21 +1570,41 @@ fn segment_index(name: &str) -> Option<i64> {
         .and_then(|d| d.parse::<i64>().ok())
 }
 
-/// Delete segments far enough behind the furthest-served one to be safe. The
-/// client restarts the session on any seek, so a played-past segment is never
-/// re-requested; `init.mp4` and the playlist are always kept.
-async fn gc_old_segments(dir: &std::path::Path, high: i64) {
-    if high < KEEP_BEHIND_SEGMENTS {
-        return; // not enough played yet to prune anything
+/// Delete published segments that have fallen out of the retention window.
+///
+/// The window is measured back from the client's DOWNLOAD frontier, not from
+/// its playhead, and is wide enough to cover the difference (see
+/// [`RETENTION_SECS`]). The previous version counted a fixed number of
+/// segments back from the furthest one fetched, which was two mistakes at
+/// once: a segment count is not a duration on the copy path, and the frontier
+/// is not where the viewer is. With a 60-second client buffer, "15 segments
+/// behind the frontier" could be *ahead* of the picture on screen.
+///
+/// `init.mp4` and the playlist are never candidates — neither carries an
+/// EXTINF, so neither appears in the index.
+async fn gc_expired_segments(session: &Session) {
+    let frontier = session.fetched_end_ms.load(Relaxed);
+    let keep_from = frontier - RETENTION_SECS * 1000;
+    if keep_from <= 0 {
+        return; // nothing can be old enough yet
     }
-    let cutoff = high - KEEP_BEHIND_SEGMENTS;
-    if let Ok(mut rd) = tokio::fs::read_dir(dir).await {
-        while let Ok(Some(entry)) = rd.next_entry().await {
-            if let Some(i) = segment_index(&entry.file_name().to_string_lossy()) {
-                if i < cutoff {
-                    let _ = tokio::fs::remove_file(entry.path()).await;
-                }
-            }
+    let doomed: Vec<String> = {
+        let index = session.segments.lock().await;
+        index.prunable(keep_from).map(|s| s.name.clone()).collect()
+    };
+    if doomed.is_empty() {
+        return;
+    }
+    for name in &doomed {
+        let _ = tokio::fs::remove_file(session.dir.join(name)).await;
+    }
+    // Forget their sizes so the budget stops counting bytes that are no longer
+    // on disk.
+    let doomed: std::collections::HashSet<&str> = doomed.iter().map(String::as_str).collect();
+    let mut index = session.segments.lock().await;
+    for seg in index.segs.iter_mut() {
+        if doomed.contains(seg.name.as_str()) {
+            seg.bytes = 0;
         }
     }
 }
@@ -1578,37 +1871,127 @@ mod tests {
         assert!(mgr.stop_session(&info.session_id).await);
     }
 
+    /// The playlist is the only place a copied segment's true duration is
+    /// written down, which is the whole reason this parser exists.
     #[test]
-    fn ahead_of_the_playhead() {
-        // 60s produced, nothing fetched → the whole 60s is runway.
-        assert_eq!(ahead_seconds(Some(60_000), -1), Some(60));
-        // Fetched segment 0 (0–4s) → 56s of runway at the default length.
-        assert_eq!(
-            ahead_seconds(Some(60_000), 0),
-            Some(60 - SEGMENT_SECONDS as i64)
-        );
-        // A client that has caught up to the write head has no runway…
-        assert_eq!(ahead_seconds(Some(40_000), 9), Some(0));
-        // …and one fetching faster than production goes negative, which is
-        // exactly the state a stall is made of.
-        assert!(ahead_seconds(Some(40_000), 12).is_some_and(|a| a < 0));
-        // No telemetry yet is not "zero ahead" — it is "don't know".
-        assert_eq!(ahead_seconds(None, 5), None);
+    fn playlist_parsing_believes_extinf_not_the_index() {
+        // A copy session: `hls_time 4` is a floor, and real segments run to
+        // the source's GOP. Index arithmetic would call the third segment
+        // 8-12s; it is actually 14.5-24.5s.
+        let copy = "#EXTM3U\n\
+                    #EXT-X-VERSION:7\n\
+                    #EXT-X-TARGETDURATION:11\n\
+                    #EXT-X-PLAYLIST-TYPE:EVENT\n\
+                    #EXT-X-MAP:URI=\"init.mp4\"\n\
+                    #EXTINF:4.000,\n\
+                    seg00000.m4s\n\
+                    #EXTINF:10.500,\n\
+                    seg00001.m4s\n\
+                    #EXTINF:10.000,\n\
+                    seg00002.m4s\n";
+        let segs = parse_playlist(copy);
+        assert_eq!(segs.len(), 3, "the EXT-X-MAP init file is not a segment");
+        assert_eq!(segs[0].name, "seg00000.m4s");
+        assert_eq!((segs[0].start_ms, segs[0].end_ms), (0, 4_000));
+        assert_eq!((segs[1].start_ms, segs[1].end_ms), (4_000, 14_500));
+        assert_eq!((segs[2].start_ms, segs[2].end_ms), (14_500, 24_500));
+
+        let index = SegmentIndex { segs };
+        assert_eq!(index.produced_playable_end_ms(), Some(24_500));
+        assert_eq!(index.end_ms_of(1), Some(14_500));
+        assert_eq!(index.end_ms_of(9), None);
+
+        // A transcode playlist, where the grid is forced and even.
+        let transcode = "#EXTM3U\n#EXT-X-TARGETDURATION:4\n\
+                         #EXTINF:4.000000,\n seg00000.ts\n\
+                         #EXTINF:4.000000,\nseg00001.ts\n";
+        let segs = parse_playlist(transcode);
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[1].end_ms, 8_000);
+
+        // Junk: a URI with no EXTINF, an EXTINF with no URI, an unparseable
+        // duration. None of them may invent a segment or shift the timeline.
+        let junk = "#EXTM3U\nseg00007.ts\n#EXTINF:abc,\nseg00008.ts\n#EXTINF:2.0,\n";
+        assert!(parse_playlist(junk).is_empty());
+        assert!(parse_playlist("").is_empty());
     }
 
     #[test]
-    fn suspend_window_has_hysteresis() {
-        // Running: hold only once past the window.
-        assert!(!should_suspend(179, 180, false));
-        assert!(should_suspend(181, 180, false));
-        // Held: keep holding until the viewer has eaten half of it, so a
-        // session parked on the boundary doesn't toggle every tick.
-        assert!(should_suspend(120, 180, true));
-        assert!(should_suspend(91, 180, true));
-        assert!(!should_suspend(90, 180, true));
-        // Disabled window never suspends, whatever the numbers say.
-        assert!(!should_suspend(10_000, 0, false));
-        assert!(!should_suspend(10_000, 0, true));
+    fn ahead_is_measured_against_the_fetched_frontier() {
+        let index = SegmentIndex {
+            segs: (0..10)
+                .map(|i| SegmentMeta {
+                    index: i,
+                    name: format!("seg{i:05}.ts"),
+                    start_ms: i * 4_000,
+                    end_ms: (i + 1) * 4_000,
+                    bytes: 1_000_000,
+                })
+                .collect(),
+        };
+        // 40s published, nothing fetched → the whole 40s is reserve.
+        let a = ahead_of(&index, 0).expect("published");
+        assert_eq!(a.seconds, 40);
+        assert_eq!(a.bytes, 10_000_000);
+        // Frontier at 16s → 24s and six segments of reserve.
+        let a = ahead_of(&index, 16_000).expect("published");
+        assert_eq!(a.seconds, 24);
+        assert_eq!(a.bytes, 6_000_000);
+        // Caught up entirely.
+        let a = ahead_of(&index, 40_000).expect("published");
+        assert_eq!((a.seconds, a.bytes), (0, 0));
+        // Nothing published is not "zero ahead" — it is "don't know".
+        assert_eq!(ahead_of(&SegmentIndex::default(), 0), None);
+    }
+
+    #[test]
+    fn suspend_holds_on_any_limit_and_releases_on_all() {
+        let limits = AheadLimits {
+            max_secs: 180,
+            max_bytes: 2_000,
+            global_max_bytes: 8_000,
+        };
+        let secs = |n| Ahead {
+            seconds: n,
+            bytes: 0,
+        };
+        let bytes = |n| Ahead {
+            seconds: 0,
+            bytes: n,
+        };
+        // Running: hold once past any single window.
+        assert!(!should_suspend(secs(179), 0, limits, false));
+        assert!(should_suspend(secs(181), 0, limits, false));
+        assert!(should_suspend(bytes(2_001), 0, limits, false));
+        // The global budget holds a session that is individually well behaved
+        // — several healthy 4K streams fill a disk between them.
+        assert!(should_suspend(secs(10), 8_001, limits, false));
+
+        // Held: keep holding until EVERY trigger is below half, so a session
+        // parked on a boundary doesn't toggle on every evaluation.
+        assert!(should_suspend(secs(120), 0, limits, true));
+        assert!(!should_suspend(secs(90), 0, limits, true));
+        assert!(should_suspend(secs(10), 4_001, limits, true));
+        assert!(!should_suspend(secs(10), 4_000, limits, true));
+        // Time is fine but bytes are not: still held.
+        assert!(should_suspend(
+            Ahead {
+                seconds: 10,
+                bytes: 1_001
+            },
+            0,
+            limits,
+            true
+        ));
+
+        // A disabled limit never suspends, whatever its number.
+        let off = AheadLimits {
+            max_secs: 0,
+            max_bytes: 0,
+            global_max_bytes: 0,
+        };
+        assert!(!should_suspend(secs(10_000), 1 << 40, off, false));
+        assert!(!should_suspend(secs(10_000), 1 << 40, off, true));
     }
 
     #[test]
@@ -1621,38 +2004,132 @@ mod tests {
         assert_eq!(segment_index("seg.ts"), None);
     }
 
+    /// A session with no encoder behind it, for exercising the index, the
+    /// retention window and the pruner without spawning ffmpeg. The child is a
+    /// real (idle) process because `Session` owns one; nothing here signals it.
+    fn test_session(dir: PathBuf) -> Session {
+        let child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn placeholder child");
+        Session {
+            dir,
+            child: Mutex::new(child),
+            last_access: Mutex::new(Instant::now()),
+            file_id: 1,
+            item_id: 1,
+            item_title: "T".into(),
+            user_name: "paul".into(),
+            target_height: 720,
+            encoder_label: Mutex::new("test"),
+            started_unix: 0,
+            failed: AtomicBool::new(false),
+            high_segment: AtomicI64::new(-1),
+            fetched_end_ms: AtomicI64::new(0),
+            segments: Mutex::new(SegmentIndex::default()),
+            ahead_bytes: AtomicI64::new(0),
+            progress: Arc::new(Progress::new()),
+            suspended: AtomicBool::new(false),
+        }
+    }
+
+    /// Build a session directory with a real playlist and real files, so the
+    /// index, the retention window and the pruner are all exercised against
+    /// what ffmpeg actually writes.
+    async fn seeded_session_dir(dir: &std::path::Path, count: i64, secs_each: f64) {
+        let mut playlist = String::from("#EXTM3U\n#EXT-X-TARGETDURATION:4\n");
+        for i in 0..count {
+            playlist.push_str(&format!("#EXTINF:{secs_each:.3},\nseg{i:05}.ts\n"));
+            tokio::fs::write(dir.join(format!("seg{i:05}.ts")), vec![b'x'; 1024])
+                .await
+                .expect("write seg");
+        }
+        tokio::fs::write(dir.join("index.m3u8"), playlist)
+            .await
+            .expect("write playlist");
+    }
+
+    /// Retention is measured back from the DOWNLOAD frontier and must cover
+    /// the client's forward buffer — the bug this replaced deleted media the
+    /// viewer was about to watch, because it counted segments back from the
+    /// furthest one *fetched* while the client had fetched a minute ahead of
+    /// the picture on screen.
     #[tokio::test]
-    async fn gc_prunes_segments_behind_playhead() {
+    async fn retention_covers_the_clients_forward_buffer() {
         let dir = tempfile::tempdir().expect("tempdir");
         let p = dir.path();
+        // 100 segments of 4s = 400s of media.
+        seeded_session_dir(p, 100, 4.0).await;
         tokio::fs::write(p.join("init.mp4"), b"i")
             .await
             .expect("write init");
-        for i in 0..=30 {
-            tokio::fs::write(p.join(format!("seg{i:05}.m4s")), b"x")
-                .await
-                .expect("write seg");
-        }
-        // Playhead at 30 → cutoff = 30 - KEEP_BEHIND_SEGMENTS (15) = 15.
-        gc_old_segments(p, 30).await;
-        assert!(!p.join("seg00000.m4s").exists()); // behind → pruned
-        assert!(!p.join("seg00014.m4s").exists()); // < cutoff → pruned
-        assert!(p.join("seg00015.m4s").exists()); // == cutoff → kept
-        assert!(p.join("seg00030.m4s").exists()); // playhead → kept
-        assert!(p.join("init.mp4").exists()); // init always kept
+
+        let session = test_session(p.to_path_buf());
+        session.refresh_segments().await;
+        assert_eq!(
+            session.segments.lock().await.produced_playable_end_ms(),
+            Some(400_000)
+        );
+
+        // The client has fetched through 300s. Its playhead may be a full
+        // forward buffer behind that.
+        session.fetched_end_ms.store(300_000, Relaxed);
+        gc_expired_segments(&session).await;
+
+        // Everything within RETENTION_SECS of the frontier survives…
+        let keep_from = 300_000 - RETENTION_SECS * 1000; // 180_000
+        assert!(
+            p.join(format!("seg{:05}.ts", keep_from / 4_000)).exists(),
+            "media at the retention boundary is kept"
+        );
+        assert!(p.join("seg00074.ts").exists(), "just inside the window");
+        // …and only what is older goes.
+        assert!(!p.join("seg00000.ts").exists());
+        assert!(!p.join("seg00010.ts").exists());
+        assert!(p.join("init.mp4").exists(), "init is never a segment");
+
+        // A frontier that has not yet passed the window prunes nothing.
+        let fresh = tempfile::tempdir().expect("tempdir");
+        seeded_session_dir(fresh.path(), 10, 4.0).await;
+        let young = test_session(fresh.path().to_path_buf());
+        young.refresh_segments().await;
+        young.fetched_end_ms.store(40_000, Relaxed);
+        gc_expired_segments(&young).await;
+        assert!(fresh.path().join("seg00000.ts").exists());
     }
 
+    /// The reserve in bytes has to shrink when the bytes stop existing, or the
+    /// budget would hold a session for scratch it already reclaimed.
     #[tokio::test]
-    async fn gc_keeps_everything_before_the_window_fills() {
+    async fn pruned_bytes_stop_counting_toward_the_budget() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let p = dir.path();
-        for i in 0..5 {
-            tokio::fs::write(p.join(format!("seg{i:05}.ts")), b"x")
-                .await
-                .expect("write seg");
-        }
-        gc_old_segments(p, 4).await; // high < KEEP_BEHIND → nothing pruned
-        assert!(p.join("seg00000.ts").exists());
+        seeded_session_dir(dir.path(), 100, 4.0).await;
+        let session = test_session(dir.path().to_path_buf());
+        session.refresh_segments().await;
+        session.fetched_end_ms.store(300_000, Relaxed);
+
+        let before = session.ahead().await.expect("published").bytes;
+        gc_expired_segments(&session).await;
+        let after = session.ahead().await.expect("published").bytes;
+        assert_eq!(
+            before, after,
+            "pruning happens BEHIND the frontier, so the ahead figure is untouched"
+        );
+        // What did change is total scratch, which a refresh re-measures.
+        session.refresh_segments().await;
+        let total: i64 = session
+            .segments
+            .lock()
+            .await
+            .segs
+            .iter()
+            .map(|s| s.bytes)
+            .sum();
+        assert!(total < 100 * 1024, "pruned files no longer count: {total}");
     }
 
     /// Write a real (tiny) H.264 file, because the fixtures elsewhere are
@@ -1750,16 +2227,33 @@ mod tests {
             "the speed field parses too — it is what tells slow from stuck"
         );
 
-        // Nothing has been fetched, so everything produced is runway.
+        // Nothing has been fetched, so everything published is reserve. This
+        // reads the index (what the playlist says exists) rather than the
+        // encoder clock, so it also proves the parser sees real ffmpeg output.
+        session.refresh_segments().await;
         assert!(
-            session.ahead_seconds().is_some_and(|a| a > 0),
-            "produced content with an unmoved playhead is ahead of the playhead"
+            session
+                .ahead()
+                .await
+                .is_some_and(|a| a.seconds > 0 && a.bytes > 0),
+            "published media with an unmoved frontier is reserve"
         );
 
         // A window it has already exceeded suspends it, and a suspended
         // encoder stops advancing — which is the property the watchdog relies
         // on being able to tell apart from a wedge.
-        mgr.apply_ahead_window(&session, &info.session_id, 1).await;
+        let hold = AheadLimits {
+            max_secs: 1,
+            max_bytes: 1,
+            global_max_bytes: 0,
+        };
+        let release = AheadLimits {
+            max_secs: 0,
+            max_bytes: 0,
+            global_max_bytes: 0,
+        };
+        mgr.apply_ahead_window(&session, &info.session_id, hold, 0)
+            .await;
         assert!(session.suspended.load(Relaxed), "session was held");
         let frozen = session.progress.out_time_ms();
         tokio::time::sleep(Duration::from_millis(1200)).await;
@@ -1771,7 +2265,8 @@ mod tests {
 
         // Disabling the window resumes it — and it really resumes, rather than
         // just having a flag cleared.
-        mgr.apply_ahead_window(&session, &info.session_id, 0).await;
+        mgr.apply_ahead_window(&session, &info.session_id, release, 0)
+            .await;
         assert!(!session.suspended.load(Relaxed), "session was released");
         let moved = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
@@ -1787,7 +2282,8 @@ mod tests {
 
         // A suspended child still dies on request — SIGKILL does not need the
         // process to be scheduled, which is what makes the reaper safe.
-        mgr.apply_ahead_window(&session, &info.session_id, 1).await;
+        mgr.apply_ahead_window(&session, &info.session_id, hold, 0)
+            .await;
         assert!(session.suspended.load(Relaxed), "held again");
         assert!(mgr.stop_session(&info.session_id).await);
         assert_eq!(mgr.active_sessions().await, 0);
