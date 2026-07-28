@@ -557,6 +557,16 @@ pub trait TranscodeCacheStore: Send + Sync + 'static {
         relative_dir: &str,
     ) -> Result<bool, StoreError>;
 
+    /// Say that a claim is still being worked on.
+    ///
+    /// Distinct from [`TranscodeCacheStore::touch_cache_entry`], which records
+    /// that somebody *watched* an entry and drives eviction. This records that
+    /// a producer is still making one, and drives the opposite decision — the
+    /// crash sweep. Sharing a timestamp would mean a producer's progress made
+    /// its output look freshly watched, and eviction would start protecting
+    /// something nobody has ever played.
+    async fn touch_cache_claim(&self, recipe_hash: &str, node_id: &str) -> Result<(), StoreError>;
+
     /// Mark a claim finished and serveable, with its measured size. Until this
     /// runs the entry is invisible to [`TranscodeCacheStore::cache_hit`].
     async fn complete_cache_entry(

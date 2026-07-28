@@ -45,6 +45,22 @@ pub const STALE_CLAIM_SECS: i64 = 24 * 3600;
 /// safe default on a NAS.
 pub const DEFAULT_MAX_GB: i64 = 50;
 
+/// Where a producer assembles an entry before publishing it: one directory per
+/// recipe, under the cache root so the publish is a rename on one filesystem.
+///
+/// Named here rather than in the producer because *this* file is the one that
+/// deletes things. It sits at the same depth as a fanout prefix and looks
+/// exactly like one, so the orphan walk would otherwise treat a producer's
+/// half-built asset as a leftover and remove it mid-encode — a producer losing
+/// hours of work to the housekeeping job that runs beside it.
+pub const STAGING: &str = "tmp";
+
+/// The staging directory for one recipe. Deterministic, so a later pass can
+/// find what an earlier one left and resume from it.
+pub fn staging_dir(root: &Path, recipe_hash: &str) -> PathBuf {
+    root.join(STAGING).join(recipe_hash)
+}
+
 const GB: i64 = 1024 * 1024 * 1024;
 
 /// What one sweep did, for the log and for tests.
@@ -230,11 +246,17 @@ fn entry_dir(root: &Path, relative: &str) -> Option<PathBuf> {
 /// because a leftover can be either: a half-published entry under a live
 /// prefix, or a whole prefix left by a producer that died before its first
 /// rename.
+///
+/// [`STAGING`] sits at the same depth as a prefix and is handled by its own
+/// rule below: what keeps a staging directory alive is the *claim* on its
+/// recipe, not a published location, because a producer part-way through a
+/// two-hour film has the former and cannot have the latter.
 async fn sweep_orphan_dirs(store: &Arc<dyn Store>, root: &Path, node_id: &str) -> usize {
-    // Everything a row claims, as absolute paths. Both complete and claimed:
-    // a producer's temp destination is claimed and must not be swept out from
+    // Everything a row names, as absolute paths. Both complete and claimed: a
+    // producer's publish destination is claimed and must not be swept out from
     // under it.
     let mut known: HashSet<PathBuf> = HashSet::new();
+    let mut claimed_recipes: HashSet<String> = HashSet::new();
     let rows = store
         .cache_by_age(node_id, i64::MAX)
         .await
@@ -247,12 +269,14 @@ async fn sweep_orphan_dirs(store: &Arc<dyn Store>, root: &Path, node_id: &str) -
         if let Some(dir) = entry_dir(root, &e.relative_dir) {
             known.insert(dir);
         }
+        claimed_recipes.insert(e.recipe_hash.clone());
     }
 
     let Ok(mut prefixes) = tokio::fs::read_dir(root).await else {
         return 0; // no cache root yet just means nothing has been produced
     };
     let mut removed = 0usize;
+    let mut staging: Option<PathBuf> = None;
     while let Ok(Some(prefix)) = prefixes.next_entry().await {
         let ppath = prefix.path();
         if !prefix
@@ -261,6 +285,10 @@ async fn sweep_orphan_dirs(store: &Arc<dyn Store>, root: &Path, node_id: &str) -
             .map(|t| t.is_dir())
             .unwrap_or(false)
         {
+            continue;
+        }
+        if prefix.file_name() == STAGING {
+            staging = Some(ppath);
             continue;
         }
         let Ok(mut entries) = tokio::fs::read_dir(&ppath).await else {
@@ -287,6 +315,40 @@ async fn sweep_orphan_dirs(store: &Arc<dyn Store>, root: &Path, node_id: &str) -
         // forcing: `remove_dir` fails harmlessly if something appeared.
         if kept == 0 {
             let _ = tokio::fs::remove_dir(&ppath).await;
+        }
+    }
+
+    // The staging area, by its own rule: a directory here is a producer's
+    // work-in-progress, and what says it is still wanted is a claim on its
+    // recipe. One with no claim is what a killed process leaves — and, since
+    // the claim is what a later pass resumes from, one without a claim is also
+    // work nothing will ever pick up again.
+    if let Some(staging) = staging {
+        if let Ok(mut entries) = tokio::fs::read_dir(&staging).await {
+            let mut kept = 0usize;
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if claimed_recipes.contains(&name) {
+                    kept += 1;
+                    continue;
+                }
+                let path = entry.path();
+                match tokio::fs::remove_dir_all(&path).await {
+                    Ok(()) => {
+                        removed += 1;
+                        tracing::info!(
+                            dir = %path.display(),
+                            "cache: removed staging for a recipe nothing claims"
+                        );
+                    }
+                    Err(e) => tracing::warn!(
+                        dir = %path.display(), error = %e, "cache: staging sweep failed"
+                    ),
+                }
+            }
+            if kept == 0 {
+                let _ = tokio::fs::remove_dir(&staging).await;
+            }
         }
     }
     removed
@@ -504,6 +566,98 @@ mod tests {
         assert!(
             !root.path().join("zz").exists(),
             "an emptied prefix goes with its last entry"
+        );
+    }
+
+    /// The staging area is not a fanout prefix, and the difference is hours of
+    /// somebody's GPU.
+    ///
+    /// A producer part-way through a two-hour film has a claim and no published
+    /// location — so judging its half-built asset by the rule that governs
+    /// published ones deletes it, mid-encode, from the housekeeping job running
+    /// beside it. The producer then finds its own files gone and fails, and the
+    /// log blames ffmpeg.
+    #[tokio::test]
+    async fn the_sweep_does_not_delete_what_a_producer_is_building() {
+        let (store, file) = store().await;
+        let root = root();
+        // A producer at work: a claim on the final path, bytes in staging.
+        let staging = staging_dir(root.path(), "aaworking");
+        tokio::fs::create_dir_all(staging.join("part-000"))
+            .await
+            .expect("mkdir");
+        tokio::fs::write(staging.join("part-000/seg00000.ts"), b"half a film")
+            .await
+            .expect("write");
+        store
+            .claim_cache_entry("aaworking", file, 1, NODE, "aa/aaworking")
+            .await
+            .expect("claim");
+
+        let out = sweep(&store, root.path(), NODE, unix_now()).await;
+        assert_eq!(out.orphans, 0, "the sweep took a producer's work");
+        assert!(
+            staging.join("part-000/seg00000.ts").exists(),
+            "an encode in progress was deleted by the housekeeping job beside it"
+        );
+    }
+
+    /// …but staging that nothing claims is a producer that died. Nothing will
+    /// pick it up — a later pass resumes from the *claim* — so it is bytes
+    /// costing disk for no possible benefit.
+    #[tokio::test]
+    async fn staging_with_no_claim_behind_it_is_reclaimed() {
+        let (store, _file) = store().await;
+        let root = root();
+        let abandoned = staging_dir(root.path(), "bbabandoned");
+        tokio::fs::create_dir_all(&abandoned).await.expect("mkdir");
+        tokio::fs::write(abandoned.join("seg00000.ts"), b"junk")
+            .await
+            .expect("write");
+
+        let out = sweep(&store, root.path(), NODE, unix_now()).await;
+        assert_eq!(out.orphans, 1);
+        assert!(!abandoned.exists());
+        assert!(
+            !root.path().join(STAGING).exists(),
+            "an emptied staging area goes with its last directory"
+        );
+    }
+
+    /// A crashed producer is cleaned up in one pass, not two: the claim ages
+    /// out, and the staging walk — which runs afterwards and re-reads the
+    /// claims — no longer finds anything keeping its bytes.
+    ///
+    /// The ordering inside `sweep` is what makes that true, and it is the only
+    /// reason these are separate steps rather than one.
+    #[tokio::test]
+    async fn a_crashed_producers_claim_and_bytes_go_together() {
+        let (store, file) = store().await;
+        let root = root();
+        let now = unix_now();
+        let staging = staging_dir(root.path(), "ccdead");
+        tokio::fs::create_dir_all(&staging).await.expect("mkdir");
+        tokio::fs::write(staging.join("seg00000.ts"), b"orphan")
+            .await
+            .expect("write");
+        store
+            .claim_cache_entry("ccdead", file, 1, NODE, "cc/ccdead")
+            .await
+            .expect("claim");
+
+        let out = sweep(&store, root.path(), NODE, now + STALE_CLAIM_SECS + 60).await;
+        assert_eq!((out.stale, out.orphans), (1, 1));
+        assert!(
+            store
+                .stale_cache_claims(NODE, i64::MAX)
+                .await
+                .expect("claims")
+                .is_empty(),
+            "the stale claim survived"
+        );
+        assert!(
+            !staging.exists(),
+            "the bytes outlived every reference to them"
         );
     }
 

@@ -97,6 +97,22 @@ impl TranscodeCacheStore for SqliteStore {
         .await
     }
 
+    async fn touch_cache_claim(&self, recipe_hash: &str, node_id: &str) -> Result<(), StoreError> {
+        let (hash, node) = (recipe_hash.to_owned(), node_id.to_owned());
+        self.with_conn(move |conn| {
+            // Only while incomplete: a finished entry's `last_seen_at` is the
+            // moment it was published, and there is nothing left to be seen
+            // working on it.
+            conn.execute(
+                "UPDATE transcode_cache_locations SET last_seen_at = unixepoch()
+                 WHERE recipe_hash = ?1 AND node_id = ?2 AND complete = 0",
+                params![hash, node],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     async fn complete_cache_entry(
         &self,
         recipe_hash: &str,

@@ -1017,6 +1017,31 @@ pub struct Produced {
     pub parts: usize,
 }
 
+/// Everything an earlier pass already encoded, in order.
+///
+/// Contiguity is what makes this a simple walk: a part that produced nothing is
+/// deleted rather than left as a gap, so the first missing number is the end.
+/// Reading the parts back off disk — rather than recording a resume point in
+/// the database — keeps the bookmark and the bytes the same fact, so they
+/// cannot disagree after a crash between writing one and the other.
+async fn resume_parts(temp: &std::path::Path) -> Vec<crate::produce::Part> {
+    let mut parts = Vec::new();
+    loop {
+        let dir = temp.join(crate::produce::part_dir(parts.len()));
+        if tokio::fs::metadata(&dir).await.is_err() {
+            return parts;
+        }
+        let part = read_part(&dir).await;
+        if part.is_empty() {
+            // A directory with no listed segments contributes nothing and
+            // would shift every later part's numbering if it were counted.
+            let _ = tokio::fs::remove_dir_all(&dir).await;
+            return parts;
+        }
+        parts.push(part);
+    }
+}
+
 /// Read what one part actually produced, from the playlist ffmpeg wrote.
 ///
 /// The playlist rather than a directory listing, because a directory contains
@@ -1382,8 +1407,16 @@ impl TranscodeManager {
     /// Runs at background priority and is expected to be interrupted: an encode
     /// of a two-hour 4K film will normally be preempted several times by people
     /// pressing play, and picks up from its last published segment boundary
-    /// each time. Preemption is by *termination* — see [`crate::admission`] for
-    /// why suspending would not release anything that matters.
+    /// each time — within this call, and across later ones. Preemption is by
+    /// *termination* — see [`crate::admission`] for why suspending would not
+    /// release anything that matters.
+    ///
+    /// **One of these at a time per node.** Resuming rests on it: an incomplete
+    /// claim held by this node is read as "an earlier pass of mine stopped
+    /// here", and two concurrent producers would each read the other's live
+    /// work that way and encode into the same staging directory.
+    /// [`crate::state::JobManager::produce_pass`] is the only caller and holds
+    /// a flag that enforces it.
     ///
     /// Returns the recipe hash on success, `None` when there was nothing to do
     /// (already cached, already claimed by another producer, no cache
@@ -1434,7 +1467,19 @@ impl TranscodeManager {
             return Ok(None);
         }
         let relative = format!("{}/{hash}", &hash[..2]);
-        let claimed = self
+        // The claim is both a lock and a bookmark.
+        //
+        // A claim we did not take means somebody else owns this recipe — on
+        // another node, or in another process — and standing down is the point:
+        // two producers on one film is an hour of GPU spent twice, and the
+        // loser would publish over the winner's directory.
+        //
+        // A claim we already hold on THIS node means an earlier pass ran out of
+        // time part-way through. That is not somebody else; it is us, last
+        // night. `JobManager::producing` allows one pass at a time here, so an
+        // incomplete local claim cannot belong to a producer that is currently
+        // running — it is a bookmark, and the work behind it is resumable.
+        let taken = self
             .store
             .claim_cache_entry(
                 &hash,
@@ -1445,35 +1490,52 @@ impl TranscodeManager {
             )
             .await
             .map_err(|e| e.to_string())?;
-        if !claimed {
-            // Somebody else owns this recipe. Standing down is the whole point
-            // of the claim: two producers on one film is an hour of GPU spent
-            // twice, and the loser would publish over the winner's directory.
-            tracing::debug!(recipe = %hash, file = file.id, "cache entry already claimed; standing down");
-            return Ok(None);
+        // Built beside the final directory so publication is a rename within
+        // one filesystem — atomic, and the only way a half-written asset cannot
+        // be observed as a whole one. Named for the recipe rather than a fresh
+        // uuid, so the next pass can find it.
+        let temp = crate::cachekeep::staging_dir(&cache.dir, &hash);
+        if !taken {
+            let resumable = tokio::fs::metadata(&temp).await.is_ok();
+            if !resumable {
+                tracing::debug!(
+                    recipe = %hash, file = file.id,
+                    "cache entry claimed elsewhere; standing down"
+                );
+                return Ok(None);
+            }
+            tracing::info!(
+                recipe = %hash, file = file.id,
+                "resuming a pre-transcode an earlier pass left unfinished"
+            );
         }
 
-        // Everything is built in a temp directory beside the final one, so the
-        // publish is a rename within one filesystem — which is atomic, and is
-        // the only way a half-written asset cannot be observed as a whole one.
-        let temp = cache
-            .dir
-            .join("tmp")
-            .join(format!("{hash}.{}", uuid::Uuid::new_v4()));
         let outcome = self
             .produce_into(&temp, file, &opts, encoder, &hash, deadline)
             .await;
         let published = match outcome {
             Ok(Some(assembled)) => assembled,
-            other => {
-                // Nothing to publish: preempted with no complete segment, out
-                // of time, or failed. The claim goes with the bytes so the next
-                // run can start over — leaving it would make this recipe
-                // permanently un-producible until the stale-claim sweep, a day
-                // later, noticed.
+            Ok(None) => {
+                // Nothing publishable yet. The claim and the staged parts BOTH
+                // stay, which is what makes this resumable: the next pass finds
+                // the bookmark, reads what is already encoded and carries on
+                // from that boundary rather than from zero. A two-hour 4K film
+                // on a contended box may take several passes, and discarding
+                // the work each time would mean it never finished at all.
+                //
+                // Nothing can serve it meanwhile — a claim is not a hit — and
+                // if this node dies for good, the stale-claim sweep takes the
+                // claim and its staging together a day later.
+                self.touch_claim(&hash, &cache.node_id).await;
+                return Ok(None);
+            }
+            Err(e) => {
+                // A failure is different from an interruption: whatever is
+                // staged was produced by something that then broke, and
+                // resuming from it would build on that. Start clean next time.
                 let _ = tokio::fs::remove_dir_all(&temp).await;
                 let _ = self.store.forget_cache_entry(&hash, &cache.node_id).await;
-                return other.map(|_| None);
+                return Err(e);
             }
         };
 
@@ -1503,6 +1565,18 @@ impl TranscodeManager {
         }))
     }
 
+    /// Keep a resumable claim from ageing into a crash leftover.
+    ///
+    /// Without this a film that needs several passes would have its bookmark
+    /// swept a day after the first one, and every pass after that would start
+    /// from zero — the loop that never finishes, wearing the disguise of a
+    /// cleanup working correctly.
+    async fn touch_claim(&self, hash: &str, node_id: &str) {
+        if let Err(e) = self.store.touch_cache_claim(hash, node_id).await {
+            tracing::warn!(recipe = %hash, error = %e, "could not mark a pre-transcode as still in progress");
+        }
+    }
+
     /// Encode into `temp` until finished, out of time, or out of patience with
     /// being preempted. `Ok(None)` means nothing publishable was produced.
     async fn produce_into(
@@ -1518,7 +1592,16 @@ impl TranscodeManager {
             .await
             .map_err(|e| format!("creating {}: {e}", temp.display()))?;
         let max = self.max_hw_sessions().await;
-        let mut parts: Vec<crate::produce::Part> = Vec::new();
+        // Whatever an earlier pass got through. Usually nothing; on a busy box
+        // making a long film, this is how it eventually finishes.
+        let mut parts = resume_parts(temp).await;
+        if !parts.is_empty() {
+            tracing::info!(
+                recipe = %hash, parts = parts.len(),
+                from_s = crate::produce::resume_at_ms(&parts) / 1000,
+                "picking up where an earlier pass stopped"
+            );
+        }
         // Counted separately from `parts` because a part that was killed
         // before its first segment produced nothing and so is not one — but it
         // did start an encoder, which is the thing worth bounding.
@@ -3900,52 +3983,81 @@ mod tests {
         );
     }
 
-    /// A producer that is preempted must leave nothing behind: no claim (which
-    /// would make the recipe un-producible until the day-old sweep noticed) and
-    /// no bytes.
+    /// An unfinished run keeps its claim and its bytes — and is never
+    /// serveable.
+    ///
+    /// Those are the same fact from two sides, and the second is what makes the
+    /// first safe. The claim is a *bookmark*: a two-hour 4K film on a contended
+    /// box takes several passes, and a run that discarded its work each time it
+    /// was interrupted would never finish one. Nothing can serve it in the
+    /// meantime because a claim is not a hit, and if the node dies for good the
+    /// stale-claim sweep takes the claim and its staging together.
     #[tokio::test]
-    async fn a_producer_that_yields_leaves_no_claim_and_no_bytes() {
+    async fn an_unfinished_run_keeps_its_place_but_is_never_serveable() {
         super::require_ffmpeg();
         use plurx_core::store::SqliteStore;
         let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
         let media = tempfile::tempdir().expect("media");
         let source = media.path().join("Heat.mkv");
-        write_real_video(&source, 30);
+        write_real_video(&source, 240);
         let file_id = seed_real_file(&store, &source).await;
         let (mgr, _work, cache) = cached_manager(&store);
         let file = store.get_file(file_id).await.expect("get").expect("file");
+        let hash = recipe_hash_for(&mgr, &file, 240).await;
 
-        // A viewer is already queuing, so every attempt to take a slot is
-        // refused and the run gives up without producing anything.
-        let _queued = mgr.admissions.wait_for_slot();
+        // A short budget: it encodes some of the film and runs out of time.
         assert!(
-            mgr.produce(&file, 240, Instant::now() + Duration::from_secs(2))
+            mgr.produce(&file, 240, Instant::now() + Duration::from_millis(700))
                 .await
                 .expect("produce")
                 .is_none(),
-            "a run that never got a slot must not publish anything"
+            "an unfinished run must not publish"
         );
 
-        let hash = recipe_hash_for(&mgr, &file, 240).await;
         assert!(
             store.cache_hit(&hash, NODE).await.expect("hit").is_none(),
             "an unfinished run must never be serveable"
         );
-        // The claim went too. Left behind, this recipe could not be produced
-        // again until the stale-claim sweep noticed — a day later.
-        assert_eq!(
-            store.cache_by_age(NODE, 10).await.expect("by age").len()
-                + store
-                    .stale_cache_claims(NODE, i64::MAX)
-                    .await
-                    .expect("claims")
-                    .len(),
-            0,
-            "a yielded run left its claim behind"
-        );
         assert!(
             !cache.path().join(&hash[..2]).join(&hash).exists(),
-            "and it left bytes behind"
+            "…and must not have a published directory"
+        );
+        // The bookmark, and the work it refers to.
+        let claims = store
+            .stale_cache_claims(NODE, i64::MAX)
+            .await
+            .expect("claims");
+        assert_eq!(claims.len(), 1, "the claim that lets a later pass resume");
+        let staging = crate::cachekeep::staging_dir(cache.path(), &hash);
+        assert!(
+            staging.join(crate::produce::part_dir(0)).exists(),
+            "the encoded part was thrown away, so the next pass starts from zero"
+        );
+
+        // And picking it up finishes the job from where it stopped rather than
+        // from the beginning.
+        let made = mgr
+            .produce(&file, 240, Instant::now() + Duration::from_secs(180))
+            .await
+            .expect("produce")
+            .expect("the second pass finishes it");
+        assert_eq!(made.recipe, hash);
+        assert!(
+            made.parts >= 2,
+            "the second pass restarted from zero instead of resuming"
+        );
+        assert!(
+            (made.duration_ms - 240_000).abs() <= 1_000,
+            "resuming across passes lost picture: {}ms",
+            made.duration_ms
+        );
+        assert!(
+            store.cache_hit(&hash, NODE).await.expect("hit").is_some(),
+            "and it is serveable now"
+        );
+        assert!(
+            !staging.exists(),
+            "the staging directory outlived the asset it built"
         );
     }
 
