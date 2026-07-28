@@ -828,6 +828,53 @@ function clientLog(ev){
       body:JSON.stringify(body)}).catch(()=>{});
   }catch(e){}
 }
+// ---- playback measurements -------------------------------------------------
+// Two numbers decide whether a playback change actually worked, and neither is
+// visible from the server alone: how long the viewer waited for the first
+// frame, and how much runway they had at the moment it ran out. Both land in
+// Settings → Logs next to the server's own timings for the same session, which
+// is what turns "4K buffers sometimes" into an attributable event.
+
+// Seconds of already-downloaded video ahead of the playhead. This is the
+// quantity every stall argument is really about: a stall with 0.2s of runway
+// is a supply problem (server or link), and a stall with 20s buffered is the
+// decoder or the tab, which is a completely different bug.
+function bufferRunway(v){
+  try{
+    const t=v.currentTime;
+    for(let i=0;i<v.buffered.length;i++){
+      if(v.buffered.start(i)<=t+0.25 && v.buffered.end(i)>=t) return +(v.buffered.end(i)-t).toFixed(1);
+    }
+  }catch(e){}
+  return 0;
+}
+function playbackContext(){
+  const v=document.getElementById("video"), p=PLAYER||{};
+  return {
+    height:p.method==='transcode'?transcodeHeight():((p.source&&p.source.height)||null),
+    encoder:p.encoder||null,
+    runway:v?bufferRunway(v):null,
+    // hls.js's EWMA over real segment downloads. On a just-in-time server this
+    // measures min(link speed, encode speed) — which is exactly why a stall
+    // needs the server's own `speed` reading beside it to say which one ran out.
+    bandwidth:(p.hls&&p.hls.bandwidthEstimate)?Math.round(p.hls.bandwidthEstimate/1000):null,
+  };
+}
+function reportTtff(){
+  const p=PLAYER; if(!p||!p.playStartedAt) return;
+  const ms=Math.round(performance.now()-p.playStartedAt);
+  p.playStartedAt=null;   // first frame only; a seek is not a start
+  p.ttffMs=ms;
+  clientLog(Object.assign({level:"info",event:"ttff",detail:String(ms),
+    message:`first frame after ${(ms/1000).toFixed(1)}s`}, playbackContext()));
+}
+function reportStall(){
+  const p=PLAYER; if(!p) return;
+  p.stalls=(p.stalls||0)+1;
+  const ctx=playbackContext();
+  clientLog(Object.assign({level:"warn",event:"stall",detail:String(p.stalls),
+    message:`stalled with ${ctx.runway}s buffered`}, ctx));
+}
 // Durations. Home video made this care about seconds: a 6-second phone clip
 // reading "0m" is worse than saying nothing.
 function fmtDur(ms){ if(!ms) return ""; const s=Math.round(ms/1000),h=Math.floor(s/3600),m=Math.floor(s%3600/60);
@@ -1787,7 +1834,22 @@ function attachHls(video, playlistUrl){
   // client half of the server's supersede.
   teardownHls();
   if(!preferNativeHls(video) && window.Hls && Hls.isSupported()){
-    const hls=new Hls({enableWorker:false,xhrSetup:x=>{ if(TOKEN) x.setRequestHeader("authorization","Bearer "+TOKEN); }});
+    // Buffer ceilings, raised from hls.js's defaults because those defaults
+    // are sized for 1080p web video and this player carries 4K remuxes. The
+    // binding one is maxBufferSize (60MB by default): at the 45-70 Mb/s a 4K
+    // copy-video stream runs at, 60MB is seven to eleven SECONDS, so the
+    // 30-second target was never reachable and the server sending more made
+    // no difference. A copy session gets the big allowance since its bitrate
+    // is the source's; a transcode is capped at its rung and needs far less.
+    // backBufferLength is bounded (hls.js keeps everything by default) because
+    // the server already prunes played-past segments and a two-hour 4K session
+    // would otherwise grow the tab's memory for the whole film.
+    const hls=new Hls({
+      enableWorker:false,
+      maxBufferLength:60,
+      maxBufferSize:(PLAYER&&PLAYER.copyHls)?400e6:120e6,
+      backBufferLength:30,
+      xhrSetup:x=>{ if(TOKEN) x.setRequestHeader("authorization","Bearer "+TOKEN); }});
     PLAYER.hls=hls;
     hls.loadSource(playlistUrl);
     hls.attachMedia(video);
@@ -1838,6 +1900,10 @@ function qualityLabel(){ const q=playQuality(); const f=QUALITIES.find(x=>x[0]==
 async function play(fileId, title, resumeMs, knownDurMs, meta){
   const modal=document.getElementById("modal"), video=document.getElementById("video");
   wirePlayer();
+  // Stamp the click, not the decision: time-to-first-frame is what the person
+  // waiting actually experiences, and it includes every server round trip
+  // this function is about to make.
+  const clickedAt=performance.now();
   document.getElementById("playTitle").textContent=title;
   modal.classList.add("open");
   setLoading(true,"Reading media…","checking the file on the server");
@@ -1860,7 +1926,8 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
     idleTimer:null, autoskip:autoskipOn(), stallTimer:null, probeUrl:null, triedFallback:false,
     aoffset:decision.audio_offset_ms||0, declared:decision.declared_offset_ms||0,
     reasons:(decision.reasons||[]), title, meta:meta||null,
-    transcodeAudio:!!decision.transcode_audio, copyHls:false, };
+    transcodeAudio:!!decision.transcode_audio, copyHls:false,
+    playStartedAt:clickedAt, ttffMs:null, stalls:0, sessionId:null, health:null, };
   if(PLAYER.curAudio<0) PLAYER.curAudio=0;
   setupAirplay(video);
   setupTrackMenus();
@@ -1878,7 +1945,7 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
     setLoading(true,"Starting the transcoder…",transcodeReason(decision));
     let info; try{ info=await api(`/files/${fileId}/hls/start?height=${transcodeHeight()}&start=${startSec.toFixed(1)}`);}catch(e){ setLoading(false); toast(e.message); return closePlayer(); }
     PLAYER.offset = info.start_seconds||0;
-    PLAYER.encoder = info.encoder||null;
+    PLAYER.encoder = info.encoder||null; PLAYER.sessionId = info.session_id||null;
     setLoading(true,"Preparing the stream…",(PLAYER.encoder?("encoder: "+PLAYER.encoder+" — "):"")+"buffering the first segments");
     PLAYER.probeUrl=info.playlist_url; armStall(PLAYER.offset);
     attachHls(video, info.playlist_url);
@@ -1923,7 +1990,7 @@ async function startCopyHls(v, startSec, live){
   const track=PLAYER.audio[PLAYER.curAudio]; const aidx=track?track.index:0;
   const info=await api(`/files/${PLAYER.fileId}/hls/start?copy=1&aac=${PLAYER.transcodeAudio?1:0}&start=${(startSec||0).toFixed(1)}&audio=${aidx}`);
   if(live && !live()) return false;
-  PLAYER.offset=info.start_seconds||0; PLAYER.method='remux'; PLAYER.copyHls=true; PLAYER.encoder=info.encoder||null;
+  PLAYER.offset=info.start_seconds||0; PLAYER.method='remux'; PLAYER.copyHls=true; PLAYER.encoder=info.encoder||null; PLAYER.sessionId=info.session_id||null;
   PLAYER.probeUrl=info.playlist_url; armStall();
   attachHls(v, info.playlist_url);
   return true;
@@ -1980,7 +2047,7 @@ async function startTranscodeFallback(){
   teardownHls();
   let info; try{ info=await api(`/files/${me.fileId}/hls/start?height=${transcodeHeight()}&start=${startSec.toFixed(1)}`);}catch(e){ if(live()){ setLoading(false); toast(e.message); } return; }
   if(!live()) return;   // closed the player, or seeked / switched audio meanwhile
-  me.method='transcode'; me.copyHls=false; me.offset=info.start_seconds||0; me.encoder=info.encoder||null;
+  me.method='transcode'; me.copyHls=false; me.offset=info.start_seconds||0; me.encoder=info.encoder||null; me.sessionId=info.session_id||null;
   me.probeUrl=info.playlist_url; armStall(me.offset);
   setLoading(true,"Preparing the stream…",(me.encoder?("encoder: "+me.encoder+" — "):"")+"transcoding instead of remuxing");
   attachHls(v, info.playlist_url);
@@ -2244,13 +2311,13 @@ function wirePlayer(){
   const p=document.getElementById("player"), v=document.getElementById("video");
   if(!p||!v) return;
   ["mousemove","pointerdown","touchstart","keydown"].forEach(ev=>p.addEventListener(ev,playerActivity));
-  v.addEventListener("playing",()=>{ PLAYER.started=true; clearStall(); setLoading(false); playerActivity(); pbTick(); pbSyncPlayIcon(); });
+  v.addEventListener("playing",()=>{ const first=!PLAYER.started; PLAYER.started=true; clearStall(); setLoading(false); playerActivity(); pbTick(); pbSyncPlayIcon(); if(first) reportTtff(); });
   v.addEventListener("canplay",()=>{ if(PLAYER.started) setLoading(false); });
   // Only a stream that HAS started can "buffer". Before that, the loading
   // overlay owns the message (and a watchdog owns the deadline), so a stalled
   // start or seek reports what actually went wrong instead of showing a
   // spinner that never resolves.
-  v.addEventListener("waiting",()=>{ if(PLAYER&&PLAYER.started) setLoading(true,"Buffering…",""); });
+  v.addEventListener("waiting",()=>{ if(PLAYER&&PLAYER.started){ setLoading(true,"Buffering…",""); reportStall(); } });
   v.addEventListener("pause",()=>{ p.classList.remove("idle"); });
   // A media error never reaches the console on its own — surface it, always.
   // And a remux/direct stream the browser rejects gets one automatic rescue:
@@ -2356,7 +2423,7 @@ async function seekTo(targetSec){
   if(PLAYER.method==='transcode'){
     let info; try{ info=await api(`/files/${PLAYER.fileId}/hls/start?height=${transcodeHeight()}&start=${targetSec.toFixed(1)}&audio=${aidx}`);}catch(e){ return failed(e); }
     if(!live()) return;   // a newer seek superseded this one
-    PLAYER.offset=info.start_seconds||0; PLAYER.encoder=info.encoder||null;
+    PLAYER.offset=info.start_seconds||0; PLAYER.encoder=info.encoder||null; PLAYER.sessionId=info.session_id||null;
     PLAYER.probeUrl=info.playlist_url; armStall(PLAYER.offset,20000);
     attachHls(v, info.playlist_url);
   } else if(PLAYER.copyHls){
@@ -2690,7 +2757,7 @@ async function switchAudio(idx){
   if(PLAYER.method==='transcode'){
     let info; try{ info=await api(`/files/${PLAYER.fileId}/hls/start?height=${transcodeHeight()}&start=${pos.toFixed(1)}&audio=${aidx}`);}catch(e){ return toast(e.message); }
     if(!live()) return;
-    PLAYER.offset=info.start_seconds||0; PLAYER.encoder=info.encoder||null;
+    PLAYER.offset=info.start_seconds||0; PLAYER.encoder=info.encoder||null; PLAYER.sessionId=info.session_id||null;
     attachHls(v, info.playlist_url);
   } else if(PLAYER.copyHls){
     // Copy-video HLS (Safari): re-open with the chosen audio track.
@@ -2768,6 +2835,23 @@ function updateStats(){
     const lv=PLAYER.hls.levels&&PLAYER.hls.levels[PLAYER.hls.currentLevel];
     if(lv&&lv.bitrate) net+=`<div><b>Stream rate</b>${fmtMbps(lv.bitrate)}</div>`;
   }
+  // How the server side of this stream is doing. Until this existed, a
+  // stutter had two indistinguishable explanations — the link can't carry it,
+  // or the encoder can't make it fast enough — and the overlay could only
+  // describe the client's half. `speed` under 1.0x names the second one
+  // outright; "held" means the transcoder is deliberately parked because the
+  // buffer ahead is already deep, which is health, not a problem.
+  let srv='';
+  if(PLAYER.health){
+    const h=PLAYER.health;
+    if(h.speed!=null){
+      const slow=h.speed<1.0 && !h.suspended;
+      srv+=`<div><b>Encode speed</b><span${slow?' style="color:var(--warn,#fbbf24)"':''}>${h.speed.toFixed(2)}×${slow?' — slower than realtime':''}</span></div>`;
+    }
+    if(h.ahead_seconds!=null) srv+=`<div><b>Server ahead</b>${Math.max(0,h.ahead_seconds)} s${h.suspended?' · held':''}</div>`;
+  }
+  if(PLAYER.ttffMs!=null) srv+=`<div><b>Started in</b>${(PLAYER.ttffMs/1000).toFixed(1)} s</div>`;
+  if(PLAYER.stalls) srv+=`<div><b>Stalls</b>${PLAYER.stalls}</div>`;
   const rate = v.playbackRate&&v.playbackRate!==1? ` · ${v.playbackRate}×`:'';
   const durTxt = PLAYER.durMs? ' / '+clockFromSec(PLAYER.durMs/1000):'';
   body.innerHTML=
@@ -2786,8 +2870,25 @@ function updateStats(){
     `<div><b>Resolution</b>${tgtRes}</div>`+
     `<div><b>Dropped</b>${dropped} frames</div>`+
     `<div><b>Buffer</b>${buf}</div>`+
-    (net? `<div class="sechd">Network</div>`+net : '');
+    (net? `<div class="sechd">Network</div>`+net : '')+
+    (srv? `<div class="sechd">Server</div>`+srv : '');
 }
+// Poll the session's server-side health while the stats overlay is open, and
+// only then: this is a diagnostic readout, not telemetry the server needs, and
+// a poll that ran regardless would keep an abandoned session's numbers moving
+// for no one. The endpoint deliberately does not count as activity, so this
+// can't keep a session alive past the idle reaper either.
+async function pollSessionHealth(){
+  const p=PLAYER;
+  if(!p||!p.sessionId) return;
+  const ov=document.getElementById("statsov");
+  if(!ov||!ov.classList.contains("on")) return;
+  try{
+    const h=await api(`/hls/${p.sessionId}/status`);
+    if(PLAYER===p) { p.health=h; updateStats(); }
+  }catch(e){ if(PLAYER===p) p.health=null; }
+}
+setInterval(()=>{ pollSessionHealth().catch(()=>{}); }, 2000);
 async function reportProgress(fileId, ended){
   const video=document.getElementById("video");
   const posMs=Math.round(((PLAYER.offset||0)+ (video.currentTime||0))*1000);
@@ -3108,6 +3209,18 @@ function metadataPanel(settings,trakt){
     ${traktCardHtml(trakt)}
     ${monarrCardHtml()}`;
 }
+// Options for a preset dropdown, plus the stored value when it isn't one of
+// the presets. Without that last part a select silently displays some *other*
+// preset — the browser falls back to the first option — and the next Save
+// writes that one back, quietly changing a setting nobody touched. Values can
+// come from the API or a config someone tuned by hand, so "not in my list" is
+// a real state and the honest thing is to show it.
+function presetOpts(pairs, cur, label){
+  cur=(cur==null?"":String(cur));
+  const opts=pairs.slice();
+  if(cur!=="" && !opts.some(([v])=>v===cur)) opts.unshift([cur, label?label(cur):cur]);
+  return opts.map(([v,l])=>`<option value="${esc(v)}" ${cur===v?'selected':''}>${esc(l)}</option>`).join("");
+}
 function playbackPanel(settings){
   return `<div class="card"><h2 class="section" style="margin-top:0">Playback defaults</h2>
       <p class="muted" style="margin-top:0">Default audio and subtitle selection for every player. Anime dual-audio still prefers the original audio with subtitles.</p>
@@ -3127,6 +3240,13 @@ function playbackPanel(settings){
         <option value="4" ${settings.stream_readrate==='4'?'selected':''}>4× — recommended</option>
         <option value="8" ${settings.stream_readrate==='8'?'selected':''}>8×</option>
         <option value="0" ${settings.stream_readrate==='0'?'selected':''}>Unlimited — wired networks only</option></select></div>
+      <h2 class="section">Transcode buffering</h2>
+      <p class="muted" style="margin-top:0">How much of a head start a transcoded or repackaged stream builds before it settles down. The head start <em>is</em> the buffer a player has to survive a network hiccup, so raise it if 4K stutters and lower it if streams eat too much disk. The transcoder pauses once it reaches the buffer limit and resumes when you catch up.</p>
+      <div class="row" style="align-items:end">
+        <div><label>Head start</label><select id="phb" style="width:auto;min-width:200px">${presetOpts([["30","30 seconds"],["90","90 seconds — recommended"],["180","3 minutes"],["0","None"]], settings.hls_burst_secs, v=>`${v} seconds`)}</select></div>
+        <div><label>Then pace at</label><select id="phr" style="width:auto;min-width:200px">${presetOpts([["1.5","1.5× — gentlest"],["2","2× — recommended"],["4","4×"],["0","Unlimited"]], settings.hls_readrate, v=>`${v}×`)}</select></div>
+        <div><label>Buffer limit</label><select id="pha" style="width:auto;min-width:200px">${presetOpts([["60","1 minute"],["180","3 minutes — recommended"],["600","10 minutes"],["0","No limit — needs disk"]], settings.hls_ahead_max_secs, v=>`${v} seconds`)}</select></div>
+      </div>
       <div class="err" id="perr"></div>
       <button style="margin-top:12px" onclick="savePlayback()">Save defaults</button></div>`;
 }
@@ -3269,7 +3389,10 @@ async function savePlayback(){
       default_audio_lang:document.getElementById("pal").value,
       default_sub_lang:document.getElementById("psl").value,
       sub_mode:document.getElementById("psm").value,
-      stream_readrate:document.getElementById("prr").value}});
+      stream_readrate:document.getElementById("prr").value,
+      hls_readrate:document.getElementById("phr").value,
+      hls_burst_secs:document.getElementById("phb").value,
+      hls_ahead_max_secs:document.getElementById("pha").value}});
     toast("Playback defaults saved");
   }catch(e){ err.textContent=e.message; }
 }
