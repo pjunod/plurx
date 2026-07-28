@@ -1,0 +1,324 @@
+#!/usr/bin/env python3
+"""plurx playback benchmark — the fixture matrix, run against a real server.
+
+Why this exists: every performance claim in docs/PERF-PLAN.md is a claim about
+numbers, and until now the only way to check one was to watch a film and form
+an impression. An impression cannot tell 0.9x from 1.1x, and that difference is
+the whole question — below realtime a session drains the viewer's reserve until
+it stalls, above it the reserve grows. It also cannot produce a distribution,
+and a mean hides exactly the starts people remember.
+
+    scripts/bench fixtures                 # build the corpus (once, ~2 min)
+    scripts/bench run --token TOKEN        # play everything, print the table
+    scripts/bench run --only 4k-hdr10      # one fixture, while iterating
+
+Needs: python3 (stdlib only), ffmpeg + ffprobe on PATH, a running plurxd with a
+library pointed at the fixture directory.
+
+What it does NOT do: decode pixels. It measures what the server does — time to
+first playable segment, encode speed over the session, published-vs-fetched
+reserve, real segment bitrates — because that is where every symptom in the
+plan lives, and because a headless browser on a build server cannot decode
+H.264 anyway. Client-side runway comes from the player's own beacons; read
+those in Settings -> Logs alongside this.
+"""
+
+import argparse
+import json
+import os
+import shutil
+import statistics
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+# --- the corpus -------------------------------------------------------------
+# Each entry is a shape that has bitten this pipeline, not a resolution ladder.
+# The comment on each says which failure it is here to catch.
+FIXTURES = {
+    # The baseline everything else is compared against: direct-playable.
+    "1080p-h264": dict(
+        size="1920x1080", codec="libx264", extra=["-g", "48"], hdr=None,
+        why="direct play / cheap remux baseline",
+    ),
+    # 4K HEVC SDR — heavy decode, no tone-map. Isolates decode cost from
+    # tone-map cost, which the plan's central claim depends on separating.
+    "4k-hevc-sdr": dict(
+        size="3840x2160", codec="libx265", extra=["-g", "48", "-x265-params", "log-level=none"],
+        hdr=None, why="4K decode cost without tone-mapping",
+    ),
+    # 4K HDR10 — the one the whole GPU tone-map milestone is about. Tagged
+    # properly (bt2020/PQ) so the decision engine and the filter chain both see
+    # HDR rather than a mislabelled SDR file.
+    "4k-hdr10": dict(
+        size="3840x2160", codec="libx265",
+        extra=["-g", "48", "-pix_fmt", "yuv420p10le", "-x265-params",
+               "log-level=none:hdr-opt=1:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc"],
+        hdr="pq", why="THE 4K case: decode + CPU float tone-map",
+    ),
+    # HLG differs from PQ only in transfer, and routes to a different pipeline
+    # on purpose (PERF-PLAN S5) — so it needs its own row.
+    "4k-hlg": dict(
+        size="3840x2160", codec="libx265",
+        extra=["-g", "48", "-pix_fmt", "yuv420p10le", "-x265-params",
+               "log-level=none:colorprim=bt2020:transfer=arib-std-b67:colormatrix=bt2020nc"],
+        hdr="hlg", why="HLG takes a different tone-map path",
+    ),
+    # Sparse keyframes: the copy path cannot force them, so segments run to the
+    # source GOP. This is the fixture that proves segment bounds come from
+    # EXTINF rather than from index arithmetic.
+    "sparse-gop": dict(
+        size="1920x1080", codec="libx264", extra=["-g", "600"], hdr=None,
+        why="variable/long segments on the copy path",
+    ),
+    # Grain defeats rate control; this is where a 'bounded' rung stops being
+    # bounded (PERF-PLAN S4.6).
+    "grainy": dict(
+        size="1920x1080", codec="libx264", extra=["-g", "48"], hdr=None,
+        grain=True, why="rate-control overshoot",
+    ),
+}
+
+# Long enough for a session to settle past its burst, short enough that
+# building the corpus is not itself an afternoon: 4K HEVC encodes slower than
+# realtime on most machines, and this runs once per machine.
+DURATION = 45
+
+
+def sh(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+
+def build_fixture(out_dir, name, spec):
+    path = os.path.join(out_dir, f"{name}.mkv")
+    if os.path.exists(path):
+        print(f"  {name:14s} exists")
+        return path
+    src = f"testsrc2=size={spec['size']}:rate=24:duration={DURATION}"
+    if spec.get("grain"):
+        # Real grain, not a synthetic pattern: noise is what makes an encoder
+        # spend its bit budget unevenly.
+        src += ",noise=alls=40:allf=t+u"
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error",
+           "-f", "lavfi", "-i", src,
+           "-f", "lavfi", "-i", f"sine=frequency=440:duration={DURATION}",
+           "-c:v", spec["codec"], "-preset", "ultrafast", *spec["extra"]]
+    if spec["hdr"]:
+        cmd += ["-color_primaries", "bt2020",
+                "-color_trc", "smpte2084" if spec["hdr"] == "pq" else "arib-std-b67",
+                "-colorspace", "bt2020nc"]
+    else:
+        cmd += ["-pix_fmt", "yuv420p"] if "-pix_fmt" not in spec["extra"] else []
+    cmd += ["-c:a", "aac", "-shortest", "-y", path]
+    print(f"  {name:14s} building… ({spec['why']})", flush=True)
+    r = sh(cmd)
+    if r.returncode != 0:
+        print(f"  {name:14s} FAILED: {r.stderr.strip().splitlines()[-1:]}")
+        return None
+    return path
+
+
+class Api:
+    def __init__(self, base, token):
+        self.base, self.token = base.rstrip("/"), token
+
+    def call(self, path, method="GET", body=None):
+        url = f"{self.base}/api/v1{path}"
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(url, data=data, method=method)
+        req.add_header("authorization", f"Bearer {self.token}")
+        if data:
+            req.add_header("content-type", "application/json")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                raw = r.read()
+                return json.loads(raw) if raw else None
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(f"{method} {path} -> {e.code} {e.read()[:200]!r}") from e
+
+    def fetch(self, path):
+        """Raw GET against a capability URL (playlist/segment: no auth header)."""
+        with urllib.request.urlopen(f"{self.base}/api/v1{path}", timeout=30) as r:
+            return r.read()
+
+
+def play_once(api, file_id, height, seconds, poll=0.5):
+    """Open a session, consume it like a player would, and record what happened.
+
+    Consuming matters: the ahead-window suspends a session that runs too far
+    past the client, so a benchmark that never fetches a segment measures a
+    parked encoder rather than a working one.
+    """
+    started = time.monotonic()
+    info = api.call(f"/files/{file_id}/hls/sessions", "POST", {
+        "playback_id": f"bench-{os.getpid()}",
+        "request_id": f"bench-{time.time()}",
+        "height": height, "start": 0,
+    })
+    sid = info["session_id"]
+    result = dict(session=sid, encoder=info.get("encoder"), height=height,
+                  ttfs=None, speeds=[], recent=[], ahead=[], seg_bytes=[], seg_secs=[])
+
+    try:
+        # Time to first playable segment: the server-side half of TTFF, and the
+        # part the plan's start-latency claims are about.
+        api.fetch(f"/hls/{sid}/index.m3u8")
+        deadline = started + 90
+        next_seg = 0
+        while time.monotonic() < deadline:
+            playlist = api.fetch(f"/hls/{sid}/index.m3u8").decode("utf8", "replace")
+            entries = parse_playlist(playlist)
+            while next_seg < len(entries):
+                name, dur = entries[next_seg]
+                try:
+                    body = api.fetch(f"/hls/{sid}/{name}")
+                except Exception:
+                    break
+                if result["ttfs"] is None:
+                    result["ttfs"] = time.monotonic() - started
+                result["seg_bytes"].append(len(body))
+                result["seg_secs"].append(dur)
+                next_seg += 1
+            st = api.call(f"/hls/{sid}/status")
+            if st.get("speed") is not None:
+                result["speeds"].append(st["speed"])
+            if st.get("recent_speed") is not None:
+                result["recent"].append(st["recent_speed"])
+            if st.get("ahead_seconds") is not None:
+                result["ahead"].append(st["ahead_seconds"])
+            if sum(result["seg_secs"]) >= seconds:
+                break
+            time.sleep(poll)
+    finally:
+        try:
+            urllib.request.urlopen(urllib.request.Request(
+                f"{api.base}/api/v1/hls/{sid}", method="DELETE"), timeout=10)
+        except Exception:
+            pass
+    return result
+
+
+def parse_playlist(text):
+    """(name, duration) for every completed segment, from EXTINF."""
+    out, pending = [], None
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("#EXTINF:"):
+            try:
+                pending = float(line[8:].split(",")[0])
+            except ValueError:
+                pending = None
+        elif line and not line.startswith("#") and pending is not None:
+            out.append((line, pending))
+            pending = None
+    return out
+
+
+def pct(values, p):
+    if not values:
+        return None
+    ordered = sorted(values)
+    k = max(0, min(len(ordered) - 1, int(round((p / 100) * (len(ordered) - 1)))))
+    return ordered[k]
+
+
+def report(rows):
+    print()
+    print(f"{'fixture':16s} {'rung':>5s} {'encoder':22s} {'TTFS':>6s} "
+          f"{'speed p10':>9s} {'p50':>6s} {'Mb/s p50':>8s} {'peak':>6s} {'ahead max':>9s}")
+    print("-" * 104)
+    for name, r in rows:
+        if r is None:
+            print(f"{name:16s} {'':>5s} {'FAILED':22s}")
+            continue
+        rates = [b * 8 / d / 1e6 for b, d in zip(r["seg_bytes"], r["seg_secs"]) if d > 0]
+        speeds = r["recent"] or r["speeds"]
+        print(f"{name:16s} {r['height']:>5d} {(r['encoder'] or '?')[:22]:22s} "
+              f"{fmt(r['ttfs'], '{:.1f}s'):>6s} "
+              f"{fmt(pct(speeds, 10), '{:.2f}x'):>9s} {fmt(pct(speeds, 50), '{:.2f}x'):>6s} "
+              f"{fmt(pct(rates, 50), '{:.1f}'):>8s} {fmt(max(rates) if rates else None, '{:.1f}'):>6s} "
+              f"{fmt(max(r['ahead']) if r['ahead'] else None, '{:d}s'):>9s}")
+    print()
+    print("How to read it. `speed p10` is the number that matters: it is the")
+    print("worst sustained rate over the run, and anything under 1.00x means the")
+    print("encoder is losing to the clock and the viewer's reserve is draining.")
+    print("A healthy p50 with a poor p10 is a session that stutters periodically")
+    print("rather than one that never worked. TTFS is the server's half of time")
+    print("to first frame; the client adds its own buffering threshold on top.")
+    print("`peak` vs `p50` Mb/s is rate-control honesty — a peak far above the")
+    print("median is a rung whose advertised bandwidth is a fiction.")
+
+
+def fmt(v, spec):
+    if v is None:
+        return "—"
+    return spec.format(int(v) if spec.endswith("d}s") else v)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    f = sub.add_parser("fixtures", help="build the corpus")
+    f.add_argument("--dir", default="./bench-media")
+
+    r = sub.add_parser("run", help="play the corpus against a server")
+    r.add_argument("--base", default="http://127.0.0.1:32400")
+    r.add_argument("--token", required=True, help="an API token (Settings -> API keys, or a login token)")
+    r.add_argument("--library", type=int, default=None, help="library id holding the fixtures")
+    r.add_argument("--height", type=int, default=1080, help="transcode rung to measure")
+    r.add_argument("--seconds", type=int, default=60, help="seconds of content to consume per fixture")
+    r.add_argument("--only", default=None, help="one fixture name")
+
+    args = ap.parse_args()
+
+    if args.cmd == "fixtures":
+        if not shutil.which("ffmpeg"):
+            sys.exit("ffmpeg not on PATH")
+        os.makedirs(args.dir, exist_ok=True)
+        print(f"building corpus in {args.dir} ({DURATION}s each)")
+        for name, spec in FIXTURES.items():
+            build_fixture(args.dir, name, spec)
+        print("\nPoint a plurx library at that directory and scan it, then:")
+        print(f"  scripts/bench run --token TOKEN --height 1080")
+        return
+
+    api = Api(args.base, args.token)
+    items = api.call(f"/libraries/{args.library}/items") if args.library else None
+    if items is None:
+        libs = api.call("/libraries")
+        if len(libs) != 1:
+            sys.exit("more than one library — pass --library ID")
+        items = api.call(f"/libraries/{libs[0]['id']}/items")
+
+    by_name = {}
+    for item in items.get("items", []):
+        detail = api.call(f"/items/{item['id']}")
+        for mf in detail.get("files", []):
+            # The API exposes `filename`, not the server-side path — the
+            # browser has no business knowing where media lives on disk.
+            stem = os.path.splitext(mf.get("filename") or "")[0]
+            by_name[stem] = mf["id"]
+
+    wanted = [args.only] if args.only else list(FIXTURES)
+    rows = []
+    for name in wanted:
+        file_id = by_name.get(name)
+        if file_id is None:
+            print(f"{name}: not in the library (scan it?)")
+            rows.append((name, None))
+            continue
+        print(f"playing {name}…", flush=True)
+        try:
+            rows.append((name, play_once(api, file_id, args.height, args.seconds)))
+        except Exception as e:  # a fixture that fails is a result, not a crash
+            print(f"  {name}: {e}")
+            rows.append((name, None))
+    report(rows)
+
+
+if __name__ == "__main__":
+    main()

@@ -281,6 +281,36 @@ cache headers on segment bodies).
 | `3fd1d38` | §8.5 lifecycle: `POST …/hls/sessions` with idempotency, `DELETE …`, supersession by `playback_id`, GET kept as a deprecated bridge |
 | `18f8802` | `/decision` made pure: availability cached (presence only), Trakt start moved to real delivery in a detached task |
 
+### 2.9 The corpus, measured (software, 2026-07-28)
+
+`scripts/bench` builds the fixture matrix and plays it against a running
+server. First run, all software x264 in a GPU-less sandbox — which is not
+nynuc, but *is* enough to isolate the one cost this plan is built around:
+
+| Fixture | TTFS | speed p10 | p50 | What it isolates |
+|---|---|---|---|---|
+| 1080p-h264 | 2.7 s | 1.99× | 2.04× | baseline; pacing holding at the configured 2× |
+| sparse-gop | 2.5 s | 1.98× | 2.07× | long-GOP copy segmentation |
+| grainy | 4.3 s | 1.11× | 1.15× | rate-control under grain |
+| **4k-hevc-sdr** | 5.4 s | **0.98×** | 1.00× | 4K decode **without** tone-mapping |
+| **4k-hdr10** | 6.7 s | **0.71×** | 0.75× | 4K decode **with** the CPU float tone-map |
+| 4k-hlg | 7.1 s | 0.69× | 0.73× | same, HLG transfer |
+
+**The middle two rows are the plan's central claim, measured.** Same
+resolution, same codec, same rung, same encoder — the only difference between
+them is the HDR→SDR chain, and it costs roughly a quarter of the pipeline's
+throughput and takes it from realtime to *below* realtime. A session at 0.75×
+drains a viewer's reserve by a second for every four seconds played, which is
+precisely the "stutters every ~30 s" report §2.2 attributes to it. §5 is
+therefore aimed at the right thing.
+
+Two honest limits on the table. It is **software x264** — on hardware the
+absolute numbers all move, and the question M2 must answer is whether the GPU
+graph clears 1.0× on *Paul's* silicon, which only nynuc can say. And TTFS is
+the **server's** half of time-to-first-frame (start → first playable segment);
+the client's buffering threshold sits on top, which is why §4.4's shorter
+segments matter more than these figures alone suggest.
+
 Two things worth carrying forward. The **client buffer values remain
 provisional** — the beacons that were supposed to justify them were dropping
 their numbers on the floor until `1d8d2e2`, so M0 still owes the decision in
@@ -322,9 +352,10 @@ before/after evidence for every later milestone.
   regression test: polling status never extends a session's idle
   lifetime — watching a stream's numbers is not fetching from it.
 
-**Acceptance:** play a 4K HDR title on nynuc from Chrome; the logs +
-overlay answer, with numbers: TTFF, encode speed over time, each stall's
-runway, and `markers_for`'s cost. One evening of watching is discovery;
+**Acceptance:** `scripts/bench fixtures` then `scripts/bench run` produces
+the table in §2.9 on the target machine; the player's own beacons supply the
+client half (runway, TTFF, stalls by kind) from Settings → Logs.
+One evening of watching is discovery;
 the acceptance *suite* is the review's measurement contract
 ([PERF-PLAN-REVIEW.md](PERF-PLAN-REVIEW.md) §16): distributions (p50/p95,
 p10 for encode speed and runway) split by method, source class, and
