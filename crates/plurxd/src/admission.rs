@@ -20,6 +20,15 @@
 //! cannot keep up — a viewer watching a stall counter climb, which is worse
 //! than a clear refusal. Admission is therefore decided on measured speed for
 //! that class of work, never on output height (PERF-PLAN §5, review R6).
+//!
+//! Background work — the pre-transcode producer — shares the same slots at
+//! strictly lower priority, and yields them by **terminating**, never by
+//! suspending. A SIGSTOPped ffmpeg still holds its hardware codec session, its
+//! GPU context and its mapped buffers: on an iGPU, where the *session* is the
+//! scarce thing, a suspended producer blocks the live viewer exactly as if it
+//! were running. (§4.2's live-session SIGSTOP is a *disk* mechanism on a
+//! session whose viewer already owns its slot. The two uses share a syscall and
+//! nothing else.)
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -46,6 +55,17 @@ const SOFTWARE_SAFE_SPEED: f64 = 1.2;
 /// typo in either would silently mean "nothing has ever been measured".
 pub const SOFTWARE: &str = "software";
 
+/// Who is asking, and therefore who yields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Priority {
+    /// Somebody pressed play and is looking at a spinner.
+    Live,
+    /// The pre-transcode producer. Takes what is spare, gives it back the
+    /// moment a live start wants it, and does not take it again until that
+    /// start has been served.
+    Background,
+}
+
 /// A held hardware slot. Releases on drop — which is what keeps the count
 /// honest across every way a session can end, including the ones nobody
 /// remembers to write a branch for.
@@ -57,6 +77,24 @@ pub struct HwSlot {
 impl Drop for HwSlot {
     fn drop(&mut self) {
         self.held.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// A live start queuing for a slot.
+///
+/// Its *existence* is the yield signal, which is why it is a guard and not a
+/// flag somebody sets and clears. A flag left set by a start that failed
+/// between setting and clearing would park the producer for the life of the
+/// process — silently, since a producer that never runs looks exactly like a
+/// producer with nothing to do.
+#[derive(Debug)]
+pub struct LiveWait {
+    waiting: Arc<AtomicUsize>,
+}
+
+impl Drop for LiveWait {
+    fn drop(&mut self) {
+        self.waiting.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -84,6 +122,9 @@ impl PartialEq for HwSlot {
 #[derive(Debug)]
 pub struct Admissions {
     held: Arc<AtomicUsize>,
+    /// Live starts currently queuing for a slot. Read by background work,
+    /// which stands down while it is non-zero.
+    waiting: Arc<AtomicUsize>,
     /// Recent speed, by class of work — see [`class_of`]. Learned from real
     /// sessions rather than configured, because the answer depends on the box
     /// and no default could be right for both a NUC and a Xeon.
@@ -100,6 +141,7 @@ impl Admissions {
     pub fn new() -> Admissions {
         Admissions {
             held: Arc::new(AtomicUsize::new(0)),
+            waiting: Arc::new(AtomicUsize::new(0)),
             measured: Mutex::new(HashMap::new()),
         }
     }
@@ -108,9 +150,36 @@ impl Admissions {
         self.held.load(Ordering::Acquire)
     }
 
+    /// Announce that a live start is queuing. Hold the guard for as long as the
+    /// wait lasts; drop it the moment the start has a slot or has given up.
+    pub fn wait_for_slot(&self) -> LiveWait {
+        self.waiting.fetch_add(1, Ordering::AcqRel);
+        LiveWait {
+            waiting: Arc::clone(&self.waiting),
+        }
+    }
+
+    /// Is a live start queuing right now?
+    ///
+    /// Background work asks this on a short interval and, when the answer is
+    /// yes, checkpoints and terminates. It is the whole preemption protocol:
+    /// no signal to the producer, no registry of who holds what, nothing to
+    /// leak — just a count that a waiting start makes non-zero.
+    pub fn live_is_waiting(&self) -> bool {
+        self.waiting.load(Ordering::Acquire) > 0
+    }
+
     /// Take a slot if one is free. The CAS loop is what makes two racing
     /// starts unable to both succeed on the last slot.
-    pub fn try_acquire(&self, max: usize) -> Option<HwSlot> {
+    ///
+    /// Background callers are refused outright while a live start is queuing,
+    /// which is the other half of preemption: without it a producer that had
+    /// just yielded could win the race back to its own slot and the waiter it
+    /// yielded to would keep waiting.
+    pub fn try_acquire(&self, max: usize, priority: Priority) -> Option<HwSlot> {
+        if priority == Priority::Background && self.live_is_waiting() {
+            return None;
+        }
         let mut held = self.held.load(Ordering::Acquire);
         loop {
             if held >= max {
@@ -157,9 +226,9 @@ impl Admissions {
             .copied()
     }
 
-    /// Decide what a start that wanted hardware actually gets.
+    /// Decide what a live start that wanted hardware actually gets.
     pub fn admit(&self, max: usize, work: Workload<'_>) -> Admission {
-        if let Some(slot) = self.try_acquire(max) {
+        if let Some(slot) = self.try_acquire(max, Priority::Live) {
             return Admission::Hardware(slot);
         }
         match self.measured(&work.software_class()) {
@@ -278,7 +347,7 @@ mod tests {
             let a = Arc::clone(&a);
             let winners = Arc::clone(&winners);
             threads.push(std::thread::spawn(move || {
-                if let Some(slot) = a.try_acquire(2) {
+                if let Some(slot) = a.try_acquire(2, Priority::Live) {
                     winners.fetch_add(1, Ordering::AcqRel);
                     // Hold it: a slot released immediately would let the next
                     // thread in and prove nothing.
@@ -302,12 +371,15 @@ mod tests {
     fn a_slot_comes_back_when_its_holder_does_not() {
         let a = Admissions::new();
         {
-            let _slot = a.try_acquire(1).expect("first");
+            let _slot = a.try_acquire(1, Priority::Live).expect("first");
             assert_eq!(a.in_use(), 1);
-            assert!(a.try_acquire(1).is_none(), "full means full");
+            assert!(
+                a.try_acquire(1, Priority::Live).is_none(),
+                "full means full"
+            );
         }
         assert_eq!(a.in_use(), 0);
-        assert!(a.try_acquire(1).is_some(), "and free again");
+        assert!(a.try_acquire(1, Priority::Live).is_some(), "and free again");
     }
 
     /// Admission is about measured speed, never about output height. A 4K HDR
@@ -316,7 +388,7 @@ mod tests {
     #[test]
     fn a_small_output_does_not_make_a_big_source_cheap() {
         let a = Admissions::new();
-        let _held = a.try_acquire(1).expect("fill the node");
+        let _held = a.try_acquire(1, Priority::Live).expect("fill the node");
 
         for target in [2160, 1080, 720, 480] {
             match a.admit(1, work(2160, "hevc", Some("hdr10"), target)) {
@@ -338,7 +410,7 @@ mod tests {
     #[test]
     fn measurement_overrides_the_guess_either_way() {
         let a = Admissions::new();
-        let _held = a.try_acquire(1).expect("fill the node");
+        let _held = a.try_acquire(1, Priority::Live).expect("fill the node");
         let uhd = work(2160, "hevc", Some("hdr10"), 1080);
         let easy = work(1080, "h264", None, 720);
 
@@ -405,5 +477,91 @@ mod tests {
             uhd_hdr.software_class(),
             "hardware and software cannot share a bucket"
         );
+    }
+
+    /// Background work takes what is spare. Nothing about that changes when
+    /// there is spare capacity — the priority only decides who loses.
+    #[test]
+    fn background_work_uses_a_free_slot_like_anything_else() {
+        let a = Admissions::new();
+        let slot = a.try_acquire(2, Priority::Background).expect("spare");
+        assert_eq!(a.in_use(), 1);
+        assert!(
+            a.try_acquire(2, Priority::Live).is_some(),
+            "a producer must not consume the headroom a viewer needs"
+        );
+        drop(slot);
+    }
+
+    /// The preemption protocol, both halves. A queuing live start is the signal
+    /// background work stands down for — and, just as importantly, the signal
+    /// that stops it taking the slot straight back. Without the second half a
+    /// producer that had just yielded could win the race to its own slot and
+    /// the start it yielded to would go on waiting.
+    #[test]
+    fn a_producer_yields_to_a_queuing_start_and_cannot_take_the_slot_back() {
+        let a = Admissions::new();
+        let producer = a
+            .try_acquire(1, Priority::Background)
+            .expect("the node is idle");
+        assert!(!a.live_is_waiting(), "nobody has pressed play");
+
+        // Somebody presses play. The node is full, so the start queues.
+        let queued = a.wait_for_slot();
+        assert!(a.live_is_waiting(), "the producer's cue to stand down");
+        assert!(
+            a.try_acquire(1, Priority::Background).is_none(),
+            "background work must not queue for a slot ahead of a viewer"
+        );
+
+        // The producer checkpoints and terminates, which drops its slot…
+        drop(producer);
+        assert_eq!(a.in_use(), 0);
+        // …and cannot immediately re-take it, even though it is free.
+        assert!(
+            a.try_acquire(1, Priority::Background).is_none(),
+            "the producer took back the slot it had just yielded"
+        );
+        // The waiter gets it.
+        let live = a.try_acquire(1, Priority::Live).expect("the viewer wins");
+        drop(queued);
+
+        // And while the viewer holds it, background work simply finds it full.
+        assert!(a.try_acquire(1, Priority::Background).is_none());
+        drop(live);
+        assert!(
+            a.try_acquire(1, Priority::Background).is_some(),
+            "once the viewer is gone the producer may resume"
+        );
+    }
+
+    /// A start that gives up, fails, or is cancelled must not park background
+    /// work forever. The signal is a guard rather than a flag precisely because
+    /// a flag left set is invisible — a producer that never runs looks exactly
+    /// like a producer with nothing to do.
+    #[test]
+    fn a_start_that_never_gets_its_slot_still_releases_the_producer() {
+        let a = Admissions::new();
+        let _producer = a.try_acquire(1, Priority::Background).expect("idle node");
+        {
+            let _queued = a.wait_for_slot();
+            assert!(a.live_is_waiting());
+        } // the start times out and returns an error
+        assert!(!a.live_is_waiting(), "the queue emptied with the waiter");
+    }
+
+    /// Two viewers queuing, one served: the producer stays down until the last
+    /// of them is out of the queue. A count rather than a flag is what makes
+    /// that true without anybody tracking whose wait is whose.
+    #[test]
+    fn the_producer_waits_out_every_queuing_start_not_just_the_first() {
+        let a = Admissions::new();
+        let first = a.wait_for_slot();
+        let second = a.wait_for_slot();
+        drop(first);
+        assert!(a.live_is_waiting(), "one is still queuing");
+        assert!(a.try_acquire(4, Priority::Background).is_none());
+        drop(second);
+        assert!(a.try_acquire(4, Priority::Background).is_some());
     }
 }

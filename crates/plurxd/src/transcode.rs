@@ -1541,6 +1541,13 @@ impl TranscodeManager {
         let mut hw_slot = None;
         if encoder != Encoder::Software {
             let max = self.max_hw_sessions().await;
+            // Announced for the whole wait, including the first attempt. A
+            // producer holding the slot this start wants sees the announcement,
+            // checkpoints and terminates; and while the announcement stands it
+            // cannot take the slot back. The guard is dropped by every exit
+            // from this block, so a start that fails or gives up does not park
+            // background work for the life of the process.
+            let _queued = self.admissions.wait_for_slot();
             let deadline = Instant::now() + QUEUE_WAIT;
             loop {
                 match self.admissions.admit(max, work) {
