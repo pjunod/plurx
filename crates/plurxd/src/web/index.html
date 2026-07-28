@@ -2035,6 +2035,19 @@ function remuxUrl(base, audioIndex, startSec){
 // Open a stream. POST, not GET: this spawns a process and supersedes the
 // previous one, and a GET that does that can be replayed by anything that
 // believes GETs are safe.
+// The options every transcode session open shares.
+//
+// A helper because there are four of them — first play, the error fallback, a
+// seek, an audio switch — and any one that forgot a field would drop it in
+// silence. A seek that omits the burned subtitle simply loses the subtitles,
+// which reads to a viewer as a bug in the subtitles rather than in the seek,
+// and that is exactly the shape of thing that survives a review.
+function transcodeOpts(startSec, audioIndex){
+  const o={height:transcodeHeight(), start:startSec};
+  if(audioIndex!=null) o.audio=audioIndex;
+  if(PLAYER && PLAYER.burnedSub!=null) o.subtitle_burn=PLAYER.burnedSub;
+  return o;
+}
 async function openSession(fileId, opts){
   const body=Object.assign({playback_id:PLAYBACK_ID, request_id:newRequestId()}, opts||{});
   // A null height is the *absence* of a request, not a request for nothing:
@@ -2149,7 +2162,7 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
   if(decision.method==='transcode'){
     // Transcode: start an HLS session (server re-encodes + tone-maps).
     setLoading(true,"Starting the transcoder…",transcodeReason(decision));
-    let info; try{ info=await openSession(fileId,{height:transcodeHeight(),start:startSec});}catch(e){ setLoading(false); toast(e.message); return closePlayer(); }
+    let info; try{ info=await openSession(fileId,transcodeOpts(startSec));}catch(e){ setLoading(false); toast(e.message); return closePlayer(); }
     PLAYER.offset = info.start_seconds||0;
     PLAYER.encoder = info.encoder||null; PLAYER.sessionId = info.session_id||null; PLAYER.streamId=null;
     setLoading(true,"Preparing the stream…",(PLAYER.encoder?("encoder: "+PLAYER.encoder+" — "):"")+"buffering the first segments");
@@ -2258,7 +2271,7 @@ async function startTranscodeFallback(){
   const {me, live}=streamGeneration();
   newAttempt("fallback");
   teardownHls();
-  let info; try{ info=await openSession(me.fileId,{height:transcodeHeight(),start:startSec});}catch(e){ if(live()){ setLoading(false); toast(e.message); } return; }
+  let info; try{ info=await openSession(me.fileId,transcodeOpts(startSec));}catch(e){ if(live()){ setLoading(false); toast(e.message); } return; }
   if(!live()) return;   // closed the player, or seeked / switched audio meanwhile
   me.method='transcode'; me.copyHls=false; me.offset=info.start_seconds||0; me.encoder=info.encoder||null; me.sessionId=info.session_id||null; me.streamId=null;
   me.probeUrl=info.playlist_url; armStall(me.offset);
@@ -2645,7 +2658,7 @@ async function seekTo(targetSec){
   teardownHls();
   [...v.querySelectorAll("track")].forEach(t=>t.remove());
   if(PLAYER.method==='transcode'){
-    let info; try{ info=await openSession(PLAYER.fileId,{height:transcodeHeight(),start:targetSec,audio:aidx});}catch(e){ return failed(e); }
+    let info; try{ info=await openSession(PLAYER.fileId,transcodeOpts(targetSec,aidx));}catch(e){ return failed(e); }
     if(!live()) return;   // a newer seek superseded this one
     PLAYER.offset=info.start_seconds||0; PLAYER.encoder=info.encoder||null; PLAYER.sessionId=info.session_id||null; PLAYER.streamId=null;
     PLAYER.probeUrl=info.playlist_url; armStall(PLAYER.offset,20000);
@@ -3002,8 +3015,7 @@ async function burnSub(index){
               :`${subLabelFor(s,index)} — this format is a picture, so the server draws it in`);
   let info;
   try{
-    info=await openSession(me.fileId,{height:transcodeHeight(),start:pos,audio:aidx,
-      subtitle_burn:index==null?undefined:index});
+    info=await openSession(me.fileId,transcodeOpts(pos,aidx));
   }catch(e){ if(live()){ setLoading(false); toast(e.message); } return; }
   if(!live()) return;
   me.method='transcode'; me.copyHls=false;
@@ -3039,7 +3051,7 @@ async function switchAudio(idx){
   const curSub=PLAYER.curSub;
   [...v.querySelectorAll("track")].forEach(t=>t.remove()); // re-added below if a sub was on
   if(PLAYER.method==='transcode'){
-    let info; try{ info=await openSession(PLAYER.fileId,{height:transcodeHeight(),start:pos,audio:aidx});}catch(e){ return toast(e.message); }
+    let info; try{ info=await openSession(PLAYER.fileId,transcodeOpts(pos,aidx));}catch(e){ return toast(e.message); }
     if(!live()) return;
     PLAYER.offset=info.start_seconds||0; PLAYER.encoder=info.encoder||null; PLAYER.sessionId=info.session_id||null; PLAYER.streamId=null;
     attachHls(v, info.playlist_url);
