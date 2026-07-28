@@ -103,6 +103,10 @@ pub fn router(state: AppState) -> Router {
         .route("/files/{id}/audio-offset", put(stream::set_audio_offset))
         .route("/files/{id}/direct", get(stream::direct))
         .route("/files/{id}/stream.mp4", get(stream::stream_mp4))
+        // How a progressive remux is doing. Session auth, not capability: the
+        // id is the client's own playback id, so the check is that the asker
+        // owns the stream.
+        .route("/stream/{id}/status", get(stream::stream_status))
         .route("/files/{id}/subs/{index}", get(stream::subtitles_vtt))
         // Creating a stream spawns a process and supersedes its predecessor,
         // so it is a POST. The GET is a deprecated bridge over the same path.
@@ -2905,6 +2909,38 @@ mod tests {
             .await
             .0,
             StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn a_progressive_streams_status_is_private_to_its_owner() {
+        let (app, state) = test_state();
+        let admin = setup_admin(&app).await;
+
+        // Nothing registered: not found, not an empty success. The player uses
+        // the difference to decide whether it has a server to report on at all.
+        assert_eq!(
+            call(&app, get("/api/v1/stream/pb-1-s1/status", Some(&admin)))
+                .await
+                .0,
+            StatusCode::NOT_FOUND
+        );
+
+        // The id is the client's own playback id rather than a capability, so
+        // it is guessable by construction — ownership is what protects it.
+        let (_stream, _guard) = state.streams.register("pb-1-s1", 9999, 42, 4.0);
+        assert_eq!(
+            call(&app, get("/api/v1/stream/pb-1-s1/status", Some(&admin)))
+                .await
+                .0,
+            StatusCode::NOT_FOUND,
+            "another user's stream is not visible"
+        );
+        assert_eq!(
+            call(&app, get("/api/v1/stream/pb-1-s1/status", None))
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
         );
     }
 

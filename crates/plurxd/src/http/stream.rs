@@ -707,6 +707,10 @@ pub struct StreamQuery {
     pub maxheight: Option<i64>,
     pub hdr: Option<u8>,
     pub force: Option<String>,
+    /// The player's own stream id, so it can ask `/stream/:id/status` how this
+    /// remux is doing. Optional: an old client, curl, or an AirPlay target
+    /// just gets an untracked stream.
+    pub stream: Option<String>,
 }
 
 impl StreamQuery {
@@ -738,16 +742,43 @@ pub async fn stream_mp4(
     // `hev1`-tagged MKV copy otherwise plays audio-only / black in Safari).
     let hevc = matches!(file.video_codec.as_deref(), Some("hevc" | "h265"));
     let readrate = readrate_setting(&state).await;
-    remux(
-        &file.path,
-        q.start,
-        decision.transcode_audio,
-        audio,
-        file.audio_offset_ms,
+    // Register before spawning so the player's first status poll — which it
+    // makes as soon as the overlay opens, possibly before a frame lands — finds
+    // the stream rather than a 404 it would have to distinguish from a
+    // finished one.
+    let tracked = q
+        .stream
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(|sid| state.streams.register(sid, user.id, id, readrate));
+    remux(RemuxSpec {
+        path: &file.path,
+        start: q.start,
+        transcode_audio: decision.transcode_audio,
+        audio_index: audio,
+        audio_offset_ms: file.audio_offset_ms,
         hevc,
         readrate,
-    )
+        tracked,
+    })
     .await
+}
+
+/// GET /api/v1/stream/:id/status — how a progressive remux is doing.
+///
+/// The HLS paths answer this from the transcode session; a progressive stream
+/// is not a session (see [`crate::progressive`]), so it answers from its own
+/// registry. Same shape of question, same reason for asking.
+pub async fn stream_status(
+    AuthUser(user): AuthUser,
+    State(state): State<AppState>,
+    AxPath(id): AxPath<String>,
+) -> Result<Json<crate::progressive::StreamInfo>, ApiError> {
+    state
+        .streams
+        .status(&id, user.id)
+        .map(Json)
+        .ok_or(ApiError::NotFound("stream"))
 }
 
 // --- direct-play range serving ---------------------------------------------
@@ -835,18 +866,47 @@ pub(crate) async fn serve_file_range(
 
 // --- remux ------------------------------------------------------------------
 
-async fn remux(
-    path: &Path,
+/// One progressive remux, fully specified. A struct rather than a parameter
+/// list because these are all *about the same stream* and half of them are
+/// bare bools and numbers — a call site with seven positional arguments is one
+/// transposition away from remuxing at the wrong pace with the wrong track.
+struct RemuxSpec<'a> {
+    path: &'a Path,
     start: Option<f64>,
     transcode_audio: bool,
     audio_index: i64,
     audio_offset_ms: i64,
+    /// Tag the video `hvc1` so Safari accepts HEVC in MP4.
     hevc: bool,
     readrate: f64,
-) -> Result<Response, ApiError> {
+    /// Telemetry handle and its registration, when the client asked to be able
+    /// to watch this stream's health.
+    tracked: Option<(
+        std::sync::Arc<crate::progressive::Stream>,
+        crate::progressive::StreamGuard,
+    )>,
+}
+
+async fn remux(spec: RemuxSpec<'_>) -> Result<Response, ApiError> {
+    let RemuxSpec {
+        path,
+        start,
+        transcode_audio,
+        audio_index,
+        audio_offset_ms,
+        hevc,
+        readrate,
+        tracked,
+    } = spec;
     let pacing = pacing_caps().await;
     let mut cmd = tokio::process::Command::new(ffmpeg_bin());
     cmd.arg("-hide_banner").arg("-loglevel").arg("error");
+    // Telemetry goes to stderr, not stdout: stdout is the MP4. The stderr
+    // reader below already exists to surface remux failures, and progress
+    // lines are `key=value` — trivially separable from ffmpeg's prose.
+    if tracked.is_some() {
+        cmd.arg("-progress").arg("pipe:2");
+    }
     // Input-side seek (fast) for resume.
     if let Some(s) = start.filter(|s| *s > 0.0) {
         cmd.arg("-ss").arg(format!("{s:.3}"));
@@ -920,14 +980,34 @@ async fn remux(
         .spawn()
         .map_err(|e| ApiError::Internal(format!("spawning ffmpeg: {e}")))?;
 
+    let (tracked_stream, guard) = match tracked {
+        Some((s, g)) => (Some(s), Some(g)),
+        None => (None, None),
+    };
+
     // Surface remux failures: ffmpeg runs at -loglevel error, so a codec/copy
     // problem (e.g. jellyfin-ffmpeg refusing a stream the old build accepted)
     // otherwise yields an empty pipe and a blank player with nothing logged.
+    // When tracked, the same pipe carries `-progress` telemetry; progress lines
+    // are keyed `key=value` and everything else is still an error worth logging.
     if let Some(stderr) = child.stderr.take() {
+        let telemetry = tracked_stream.as_ref().map(|s| {
+            let p = std::sync::Arc::clone(&s.progress);
+            // One attempt per stream — a progressive remux never respawns —
+            // so a single generation is taken here and quoted for its life.
+            let generation = p.begin_attempt();
+            (p, generation)
+        });
         tokio::spawn(async move {
             use tokio::io::{AsyncBufReadExt, BufReader};
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
+                if let Some((progress, generation)) = &telemetry {
+                    if is_progress_line(&line) {
+                        crate::transcode::apply_progress_line(progress, *generation, &line);
+                        continue;
+                    }
+                }
                 tracing::warn!("remux ffmpeg: {line}");
             }
         });
@@ -939,25 +1019,35 @@ async fn remux(
         .ok_or_else(|| ApiError::Internal("ffmpeg stdout unavailable".into()))?;
 
     // Stream ffmpeg stdout; the Child rides along in the stream state and is
-    // killed (kill_on_drop) if the client disconnects mid-stream.
+    // killed (kill_on_drop) if the client disconnects mid-stream. The
+    // registration guard rides along too, so the stream deregisters at exactly
+    // the moment its ffmpeg dies rather than on a timer that could outlive it.
     let reader = tokio::io::BufReader::new(stdout);
-    let stream = futures_util::stream::unfold((child, reader), |(child, mut reader)| async move {
-        let mut buf = vec![0u8; 64 * 1024];
-        match reader.read(&mut buf).await {
-            Ok(0) => None,
-            Ok(n) => {
-                buf.truncate(n);
-                Some((
-                    Ok::<_, std::io::Error>(bytes::Bytes::from(buf)),
-                    (child, reader),
-                ))
+    let state = (child, reader, tracked_stream, guard);
+    let stream =
+        futures_util::stream::unfold(state, |(child, mut reader, tracked, guard)| async move {
+            let mut buf = vec![0u8; 64 * 1024];
+            match reader.read(&mut buf).await {
+                Ok(0) => None,
+                Ok(n) => {
+                    buf.truncate(n);
+                    // Bytes are counted here — where they actually leave — rather
+                    // than at the top of the response. On a paced remux this is the
+                    // delivery rate a viewer is really getting, gaps included.
+                    if let Some(s) = &tracked {
+                        s.delivery.note(n as u64);
+                    }
+                    Some((
+                        Ok::<_, std::io::Error>(bytes::Bytes::from(buf)),
+                        (child, reader, tracked, guard),
+                    ))
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "remux stream read error");
+                    None
+                }
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "remux stream read error");
-                None
-            }
-        }
-    });
+        });
 
     Ok((
         StatusCode::OK,
@@ -967,9 +1057,54 @@ async fn remux(
         .into_response())
 }
 
+/// Is this stderr line one of ffmpeg's `-progress` blocks rather than a
+/// diagnostic? Progress is strictly `lower_snake_key=value`; ffmpeg's own
+/// messages are prose and normally carry a `[component @ 0x…]` prefix, so the
+/// two never collide — and a misfiled line costs a log entry, not correctness.
+fn is_progress_line(line: &str) -> bool {
+    match line.split_once('=') {
+        Some((key, _)) => {
+            let key = key.trim();
+            !key.is_empty()
+                && key
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        }
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ffmpeg's `-progress` shares stderr with its diagnostics here, because
+    /// stdout is the MP4. Telling them apart is the whole trick, and getting it
+    /// wrong in either direction is silent: a misread error line vanishes from
+    /// the log, a misread progress line does nothing at all.
+    #[test]
+    fn progress_blocks_are_distinguishable_from_ffmpegs_prose() {
+        for line in [
+            "out_time_us=5960000",
+            "speed=4.02x",
+            "frame=142",
+            "progress=continue",
+            "bitrate=N/A",
+        ] {
+            assert!(is_progress_line(line), "progress: {line}");
+        }
+        for line in [
+            "[matroska @ 0x55f4] Could not find codec parameters",
+            "Error opening input file /media/x.mkv.",
+            "Conversion failed!",
+            "",
+            // An ffmpeg message that happens to contain '=' is still prose:
+            // the key side has spaces and capitals, which progress keys never do.
+            "[out#0/mp4 @ 0x1] Output file is empty, nothing was encoded",
+        ] {
+            assert!(!is_progress_line(line), "prose: {line}");
+        }
+    }
 
     fn headers_with_range(value: &str) -> HeaderMap {
         let mut h = HeaderMap::new();

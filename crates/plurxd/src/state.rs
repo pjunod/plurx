@@ -56,6 +56,9 @@ pub struct AppState {
     /// is real rather than once a decision has been made.
     pub availability: Arc<crate::playstart::AvailabilityCache>,
     pub starts: Arc<crate::playstart::StartNotifier>,
+    /// Live telemetry for progressive `/stream.mp4` remuxes, which are not
+    /// transcode sessions and so have nowhere else to report from.
+    pub streams: Arc<crate::progressive::Streams>,
     pub started_at: Instant,
 }
 
@@ -96,6 +99,7 @@ impl AppState {
             watched,
             availability: Arc::new(crate::playstart::AvailabilityCache::new()),
             starts: Arc::new(crate::playstart::StartNotifier::new()),
+            streams: crate::progressive::Streams::new(),
             started_at: Instant::now(),
         }
     }

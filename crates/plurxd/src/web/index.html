@@ -1581,6 +1581,7 @@ async function viewSearch(q){
 // ---- detail helpers -------------------------------------------------------
 function fmtChannels(n){ return n===8?"7.1":n===7?"6.1":n===6?"5.1":n===2?"2.0":n===1?"Mono":(n?n+"ch":""); }
 function fmtMbps(bps){ return bps? (bps>=1000000? (bps/1000000).toFixed(bps>=10000000?0:1)+" Mb/s" : Math.round(bps/1000)+" kb/s") : ""; }
+function fmtBytes(n){ if(!n) return ""; const u=["B","KB","MB","GB"]; let i=0; while(n>=1024&&i<u.length-1){ n/=1024; i++; } return (i?n.toFixed(n>=10?0:1):Math.round(n))+" "+u[i]; }
 function audioLabel(a){ return [a.codec&&a.codec.toUpperCase(), fmtChannels(a.channels), a.language].filter(Boolean).join(" · "); }
 // Video-type badges from a file's probed specs. hdr_format carries the rich
 // label (Dolby Vision profile etc.); DV gets its own gold badge.
@@ -2009,6 +2010,24 @@ function newRequestId(){
   try{ if(crypto&&crypto.randomUUID) return crypto.randomUUID(); }catch(e){}
   return "rq-"+Math.random().toString(36).slice(2)+Date.now().toString(36);
 }
+// A progressive remux's telemetry handle. Fresh per stream rather than reusing
+// PLAYBACK_ID, because a seek starts a *new* ffmpeg while the old response is
+// still draining: one id for both would have the two of them writing to the
+// same counters, and the overlay would read a delivery rate that is the sum of
+// a stream and its own corpse.
+let STREAM_SEQ=0;
+function newStreamId(){ return PLAYBACK_ID+"-s"+(++STREAM_SEQ); }
+// Build a `/stream.mp4` URL and claim a telemetry handle for it. Every
+// progressive remux is built here — first play, seek, audio switch — because
+// each of those is a *new* ffmpeg, and a handle that outlived its process
+// would have the overlay reporting a dead stream's numbers as live.
+function remuxUrl(base, audioIndex, startSec){
+  PLAYER.streamId=newStreamId(); PLAYER.sessionId=null;
+  let u=tok(base)+"&"+CAPS_Q;
+  if(audioIndex!=null) u+="&audio="+audioIndex;
+  if(startSec>0) u+="&start="+startSec.toFixed(1);
+  return u+"&stream="+encodeURIComponent(PLAYER.streamId);
+}
 // Open a stream. POST, not GET: this spawns a process and supersedes the
 // previous one, and a GET that does that can be replayed by anything that
 // believes GETs are safe.
@@ -2098,7 +2117,7 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
     aoffset:decision.audio_offset_ms||0, declared:decision.declared_offset_ms||0,
     reasons:(decision.reasons||[]), title, meta:meta||null,
     transcodeAudio:!!decision.transcode_audio, copyHls:false,
-    playStartedAt:clickedAt, ttffMs:null, stalls:0, sessionId:null, health:null,
+    playStartedAt:clickedAt, ttffMs:null, stalls:0, sessionId:null, streamId:null, health:null,
     attemptId:null, attemptReason:null, bufferLimits:null,
     waitAt:null, waitRunway:null, stallsByKind:null, };
   newAttempt(PENDING_ATTEMPT_REASON || (startSec>0?"resume":"cold-start"));
@@ -2120,7 +2139,7 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
     setLoading(true,"Starting the transcoder…",transcodeReason(decision));
     let info; try{ info=await openSession(fileId,{height:transcodeHeight(),start:startSec});}catch(e){ setLoading(false); toast(e.message); return closePlayer(); }
     PLAYER.offset = info.start_seconds||0;
-    PLAYER.encoder = info.encoder||null; PLAYER.sessionId = info.session_id||null;
+    PLAYER.encoder = info.encoder||null; PLAYER.sessionId = info.session_id||null; PLAYER.streamId=null;
     setLoading(true,"Preparing the stream…",(PLAYER.encoder?("encoder: "+PLAYER.encoder+" — "):"")+"buffering the first segments");
     PLAYER.probeUrl=info.playlist_url; armStall(PLAYER.offset);
     attachHls(video, info.playlist_url);
@@ -2137,11 +2156,17 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
     const isRemux = decision.method!=='direct_play';
     setLoading(true,isRemux?"Preparing the stream…":"Loading…",
       isRemux?"remuxing to a browser-friendly container":"direct play — no conversion needed");
-    let url=tok(decision.play_url);
     // Remux carries the same caps so the server copies the audio when the
-    // browser can play it (Safari + AC-3) instead of re-encoding to AAC.
-    if(isRemux){ url+="&"+CAPS_Q; PLAYER.offset=startSec; if(startSec>0) url+="&start="+startSec.toFixed(1); }
-    if(isRemux){ PLAYER.probeUrl=decision.play_url; armStall(startSec); }
+    // browser can play it (Safari + AC-3) instead of re-encoding to AAC, and a
+    // stream handle so the overlay can ask how it's going — a progressive
+    // remux has no session, which is why the Server section used to be missing
+    // on Chrome entirely.
+    let url;
+    if(isRemux){
+      PLAYER.offset=startSec;
+      url=remuxUrl(decision.play_url, null, startSec);
+      PLAYER.probeUrl=decision.play_url; armStall(startSec);
+    } else { url=tok(decision.play_url); }
     video.src=url;
     video.onloadedmetadata=()=>{ if(!isRemux && startSec>0){ try{video.currentTime=startSec}catch(e){} } };
     video.play().catch(()=>{});
@@ -2165,7 +2190,7 @@ async function startCopyHls(v, startSec, live){
   const track=PLAYER.audio[PLAYER.curAudio]; const aidx=track?track.index:0;
   const info=await openSession(PLAYER.fileId,{copy:true,aac:!!PLAYER.transcodeAudio,start:startSec||0,audio:aidx});
   if(live && !live()) return false;
-  PLAYER.offset=info.start_seconds||0; PLAYER.method='remux'; PLAYER.copyHls=true; PLAYER.encoder=info.encoder||null; PLAYER.sessionId=info.session_id||null;
+  PLAYER.offset=info.start_seconds||0; PLAYER.method='remux'; PLAYER.copyHls=true; PLAYER.encoder=info.encoder||null; PLAYER.sessionId=info.session_id||null; PLAYER.streamId=null;
   PLAYER.probeUrl=info.playlist_url; armStall();
   attachHls(v, info.playlist_url);
   return true;
@@ -2223,7 +2248,7 @@ async function startTranscodeFallback(){
   teardownHls();
   let info; try{ info=await openSession(me.fileId,{height:transcodeHeight(),start:startSec});}catch(e){ if(live()){ setLoading(false); toast(e.message); } return; }
   if(!live()) return;   // closed the player, or seeked / switched audio meanwhile
-  me.method='transcode'; me.copyHls=false; me.offset=info.start_seconds||0; me.encoder=info.encoder||null; me.sessionId=info.session_id||null;
+  me.method='transcode'; me.copyHls=false; me.offset=info.start_seconds||0; me.encoder=info.encoder||null; me.sessionId=info.session_id||null; me.streamId=null;
   me.probeUrl=info.playlist_url; armStall(me.offset);
   setLoading(true,"Preparing the stream…",(me.encoder?("encoder: "+me.encoder+" — "):"")+"transcoding instead of remuxing");
   attachHls(v, info.playlist_url);
@@ -2610,7 +2635,7 @@ async function seekTo(targetSec){
   if(PLAYER.method==='transcode'){
     let info; try{ info=await openSession(PLAYER.fileId,{height:transcodeHeight(),start:targetSec,audio:aidx});}catch(e){ return failed(e); }
     if(!live()) return;   // a newer seek superseded this one
-    PLAYER.offset=info.start_seconds||0; PLAYER.encoder=info.encoder||null; PLAYER.sessionId=info.session_id||null;
+    PLAYER.offset=info.start_seconds||0; PLAYER.encoder=info.encoder||null; PLAYER.sessionId=info.session_id||null; PLAYER.streamId=null;
     PLAYER.probeUrl=info.playlist_url; armStall(PLAYER.offset,20000);
     attachHls(v, info.playlist_url);
   } else if(PLAYER.copyHls){
@@ -2621,7 +2646,7 @@ async function seekTo(targetSec){
     armStall(PLAYER.offset,20000);
   } else {
     PLAYER.method='remux'; PLAYER.offset=targetSec;
-    const url=tok(`/api/v1/files/${PLAYER.fileId}/stream.mp4`)+`&${CAPS_Q}&audio=${aidx}&start=${targetSec.toFixed(1)}`;
+    const url=remuxUrl(`/api/v1/files/${PLAYER.fileId}/stream.mp4`, aidx, targetSec);
     // Hand the element a clean slate first. Assigning .src straight over a live
     // progressive stream leaves the aborted fetch and its buffered range
     // attached, and the replacement can then sit at readyState 0 forever.
@@ -2946,7 +2971,7 @@ async function switchAudio(idx){
   if(PLAYER.method==='transcode'){
     let info; try{ info=await openSession(PLAYER.fileId,{height:transcodeHeight(),start:pos,audio:aidx});}catch(e){ return toast(e.message); }
     if(!live()) return;
-    PLAYER.offset=info.start_seconds||0; PLAYER.encoder=info.encoder||null; PLAYER.sessionId=info.session_id||null;
+    PLAYER.offset=info.start_seconds||0; PLAYER.encoder=info.encoder||null; PLAYER.sessionId=info.session_id||null; PLAYER.streamId=null;
     attachHls(v, info.playlist_url);
   } else if(PLAYER.copyHls){
     // Copy-video HLS (Safari): re-open with the chosen audio track.
@@ -2954,7 +2979,7 @@ async function switchAudio(idx){
   } else {
     // Switching audio forces a remux so the chosen track is the one delivered.
     PLAYER.method='remux'; PLAYER.offset=pos;
-    v.src=tok(`/api/v1/files/${PLAYER.fileId}/stream.mp4`)+`&${CAPS_Q}&audio=${aidx}&start=${pos.toFixed(1)}`;
+    v.src=remuxUrl(`/api/v1/files/${PLAYER.fileId}/stream.mp4`, aidx, pos);
     v.play().catch(()=>{});
   }
   toast("Audio: "+(langName(track&&track.language)||("Track "+(idx+1))));
@@ -3017,13 +3042,35 @@ function updateStats(){
   try{ const q=v.getVideoPlaybackQuality&&v.getVideoPlaybackQuality(); if(q) dropped=`${q.droppedVideoFrames} / ${q.totalVideoFrames}`; }catch(e){}
   let buf='—';
   try{ if(v.buffered&&v.buffered.length){ buf=Math.max(0,v.buffered.end(v.buffered.length-1)-v.currentTime).toFixed(1)+' s'; } }catch(e){}
-  // network (transcode/HLS rate info)
+  // The contiguous runway from the playhead, as a number — the Server section
+  // needs it to tell "the encoder can't keep up" from "nobody is asking it to".
+  const bufSec=bufferRunway(v);
+  // Network. The delivery rate comes from the SERVER, deliberately: it is the
+  // only participant present on every transport. hls.js has an estimator, but
+  // it exists only while hls.js is the one fetching — so the bandwidth line
+  // used to vanish on Safari's native-HLS path (its HEVC route) and on Chrome's
+  // progressive remux, which is to say on exactly the big files where anyone
+  // wants to see it. Measured where the bytes leave, it is always there.
+  //
+  // A full buffer means nobody is fetching, and the last measured rate is then
+  // a memory rather than a measurement. Rather than blank the line (the whole
+  // complaint) or quietly lie, it says so.
   let net='';
+  if(PLAYER.health && PLAYER.health.delivered_bps!=null){
+    const h=PLAYER.health;
+    const stale=!h.final && (h.delivered_idle_ms||0) > 8000;
+    const tag=h.final?' · final':(stale?' · idle':'');
+    const why=h.final?'the stream finished — these are its last figures'
+            :stale?'nothing has been fetched recently — a full buffer, not a slow link':'';
+    net+=`<div><b>Delivery rate</b><span${why?` style="opacity:.7" title="${why}"`:''}>`
+       + `${fmtMbps(h.delivered_bps)}${tag}</span></div>`;
+  }
   if(PLAYER.hls){
-    if(PLAYER.hls.bandwidthEstimate) net+=`<div><b>Est. bandwidth</b>${fmtMbps(PLAYER.hls.bandwidthEstimate)}</div>`;
+    if(PLAYER.hls.bandwidthEstimate) net+=`<div><b>Client estimate</b>${fmtMbps(PLAYER.hls.bandwidthEstimate)}</div>`;
     const lv=PLAYER.hls.levels&&PLAYER.hls.levels[PLAYER.hls.currentLevel];
     if(lv&&lv.bitrate) net+=`<div><b>Stream rate</b>${fmtMbps(lv.bitrate)}</div>`;
   }
+  if(PLAYER.health && PLAYER.health.delivered_bytes) net+=`<div><b>Delivered</b>${fmtBytes(PLAYER.health.delivered_bytes)}</div>`;
   // How the server side of this stream is doing. Until this existed, a
   // stutter had two indistinguishable explanations — the link can't carry it,
   // or the encoder can't make it fast enough — and the overlay could only
@@ -3039,11 +3086,34 @@ function updateStats(){
     // the one that hides the problem this line exists to show.
     const rate=(h.recent_speed!=null)?h.recent_speed:h.speed;
     if(rate!=null){
-      const slow=rate<1.0 && !h.suspended;
+      // Under 1.0x is only bad news when the viewer is also running out. A
+      // progressive remux is consumed through TCP back-pressure, so a player
+      // with a full buffer *stops reading* and ffmpeg's rate falls to match
+      // demand — the steady state of a perfectly healthy stream is a number
+      // near 1.0x. Warning on the rate alone would cry wolf on every well-fed
+      // session, which is the same mistake the stall counter used to make.
+      const reserve=(h.ahead_seconds!=null)?h.ahead_seconds:bufSec;
+      const slow=rate<1.0 && !h.suspended && !h.final && reserve<10;
       const label=(h.recent_speed!=null)?'':' (avg)';
-      srv+=`<div><b>Encode speed</b><span${slow?' style="color:var(--warn,#fbbf24)"':''}>${rate.toFixed(2)}×${label}${slow?' — slower than realtime':''}</span></div>`;
+      // Otherwise, name what is holding it back, because "9.7x" and "1.0x" on
+      // the same healthy stream five seconds apart are otherwise a mystery.
+      // The pace test is a band, not a floor — the initial burst runs well
+      // past the cap and calling that "at the pace" would be exactly backwards.
+      const paced=h.readrate>0 && rate>=h.readrate*0.9 && rate<=h.readrate*1.15;
+      const fed=h.ahead_seconds==null && !slow && reserve>=10 && rate<h.readrate*0.9;
+      const note=h.final?' — finished'
+               :slow?' — slower than realtime'
+               :paced?' — at the configured pace'
+               :fed?' — throttled by a full client buffer':'';
+      srv+=`<div><b>Encode speed</b><span${slow?' style="color:var(--warn,#fbbf24)"':''}>${rate.toFixed(2)}×${label}${note}</span></div>`;
     }
     if(h.ahead_seconds!=null) srv+=`<div><b>Server ahead</b>${Math.max(0,h.ahead_seconds)} s${h.suspended?' · held':''}</div>`;
+    if(h.out_time_ms!=null && h.ahead_seconds==null){
+      // A progressive stream has no published-media frontier to report; what
+      // it can say is how much content ffmpeg has produced, which is the same
+      // reserve seen from the other end.
+      srv+=`<div><b>Produced</b>${clockFromSec(h.out_time_ms/1000)}</div>`;
+    }
   }
   if(PLAYER.ttffMs!=null) srv+=`<div><b>Started in</b>${(PLAYER.ttffMs/1000).toFixed(1)} s</div>`;
   // Named by kind, because the two mean opposite things and the raw count sent
@@ -3086,13 +3156,30 @@ function updateStats(){
 // can't keep a session alive past the idle reaper either.
 async function pollSessionHealth(){
   const p=PLAYER;
-  if(!p||!p.sessionId) return;
+  if(!p) return;
   const ov=document.getElementById("statsov");
   if(!ov||!ov.classList.contains("on")) return;
+  // Two shapes of stream, one question. An HLS session answers from the
+  // transcode manager; a progressive remux answers from its own registry (see
+  // progressive.rs) — that path is Chrome's whole remux experience, and until
+  // it could answer, the overlay's Server section simply wasn't there. Direct
+  // play has neither, because there is no server-side process to report on:
+  // a file is being read, and the browser is the only one who knows how fast.
+  const url = p.sessionId? `/hls/${p.sessionId}/status`
+            : p.streamId? `/stream/${p.streamId}/status` : null;
+  if(!url){ if(p.health){ p.health=null; updateStats(); } return; }
   try{
-    const h=await api(`/hls/${p.sessionId}/status`);
+    const h=await api(url);
     if(PLAYER===p) { p.health=h; updateStats(); }
-  }catch(e){ if(PLAYER===p) p.health=null; }
+  }catch(e){
+    // A stream that has finished deregisters, and a short film's remux finishes
+    // long before the viewer does. Blanking the panel at that moment is exactly
+    // the vanishing-section problem this work exists to fix — so keep the last
+    // numbers, which are the real final ones, and say that is what they are.
+    if(PLAYER!==p) return;
+    if(p.health && !p.health.final){ p.health.final=true; updateStats(); }
+    else if(!p.health) p.health=null;
+  }
 }
 setInterval(()=>{ pollSessionHealth().catch(()=>{}); }, 2000);
 async function reportProgress(fileId, ended){

@@ -18,6 +18,7 @@ use tokio::process::Child;
 use tokio::sync::Mutex;
 
 use crate::ffmpeg::{ffmpeg_bin, pacing_caps};
+use crate::meter::Meter;
 
 /// Idle timeout after which a session's ffmpeg is killed and its dir removed.
 const SESSION_IDLE_SECS: u64 = 60;
@@ -89,7 +90,7 @@ pub(crate) const HLS_SCRATCH_MAX_BYTES_DEFAULT: i64 = 8 * 1024 * 1024 * 1024;
 /// the first twelve seconds, and the watchdog killed both, restarting the
 /// merely-slow one on software that is slower still.
 #[derive(Debug)]
-struct Progress {
+pub struct Progress {
     /// Monotonic zero point for `moved_at_ms`.
     started: Instant,
     /// Which spawn attempt owns these numbers.
@@ -161,7 +162,7 @@ fn recent_rate_step(prev_ewma: i64, d_wall_ms: i64, d_out_ms: i64) -> Option<i64
 }
 
 impl Progress {
-    fn new() -> Progress {
+    pub fn new() -> Progress {
         Progress {
             started: Instant::now(),
             generation: AtomicU64::new(0),
@@ -182,7 +183,7 @@ impl Progress {
     /// carrying the dead process's numbers would make it look instantly
     /// stalled -- and the generation bump is what stops the dead process's
     /// reader from putting them back.
-    fn begin_attempt(&self) -> u64 {
+    pub fn begin_attempt(&self) -> u64 {
         let generation = self.generation.fetch_add(1, Relaxed) + 1;
         self.out_time_ms.store(-1, Relaxed);
         self.speed_milli.store(-1, Relaxed);
@@ -229,11 +230,11 @@ impl Progress {
         Duration::from_millis((now - self.moved_at_ms.load(Relaxed)).max(0) as u64)
     }
 
-    fn out_time_ms(&self) -> Option<i64> {
+    pub fn out_time_ms(&self) -> Option<i64> {
         Some(self.out_time_ms.load(Relaxed)).filter(|v| *v >= 0)
     }
 
-    fn speed(&self) -> Option<f64> {
+    pub fn speed(&self) -> Option<f64> {
         Some(self.speed_milli.load(Relaxed))
             .filter(|v| *v >= 0)
             .map(|v| v as f64 / 1000.0)
@@ -243,7 +244,7 @@ impl Progress {
     /// stall. Falls back to nothing rather than to the cumulative figure --
     /// reporting a session's lifetime average as "recent" is how a slowdown
     /// stays invisible.
-    fn recent_speed(&self) -> Option<f64> {
+    pub fn recent_speed(&self) -> Option<f64> {
         Some(self.recent_milli.load(Relaxed))
             .filter(|v| *v >= 0)
             .map(|v| v as f64 / 1000.0)
@@ -403,7 +404,7 @@ fn should_suspend(
 /// `speed` on a copy that has not been running long enough to estimate),
 /// which parses to nothing rather than to zero — zero would read as "stalled"
 /// and zero would read as "not moving" respectively, both wrong.
-fn apply_progress_line(progress: &Progress, generation: u64, line: &str) {
+pub fn apply_progress_line(progress: &Progress, generation: u64, line: &str) {
     // A line from a superseded attempt is not evidence about the running one.
     if progress.generation() != generation {
         return;
@@ -643,6 +644,13 @@ struct Session {
     ahead_bytes: AtomicI64,
     /// Live encode telemetry (see [`Progress`]).
     progress: Arc<Progress>,
+    /// Bytes of segment actually handed to this client, and how fast.
+    ///
+    /// The player cannot measure this for itself on every transport: native
+    /// HLS (Safari's HEVC path) exposes no such number, and hls.js's estimator
+    /// exists only when hls.js is the one fetching. The server serves every
+    /// segment on every path, so it is the one place the answer always exists.
+    delivery: Meter,
     /// True while the child is SIGSTOPped for running too far ahead of the
     /// playhead. Everything that judges a session's health has to know: a
     /// suspended encoder makes no progress *on purpose*.
@@ -732,6 +740,9 @@ async fn session_info(id: &str, s: &Session) -> SessionInfo {
         out_time_ms: s.progress.out_time_ms(),
         ahead_seconds: ahead.map(|a| a.seconds),
         ahead_bytes: ahead.map(|a| a.bytes),
+        delivered_bytes: s.delivery.total_bytes(),
+        delivered_bps: s.delivery.recent_bps().map(|b| b * 8),
+        delivered_idle_ms: s.delivery.idle_for_ms(),
         suspended: s.suspended.load(Relaxed),
     }
 }
@@ -777,6 +788,18 @@ pub struct SessionInfo {
     pub ahead_seconds: Option<i64>,
     /// The same reserve in bytes, which is what actually bounds the disk.
     pub ahead_bytes: Option<i64>,
+    /// Segment bytes handed to this client since the session opened.
+    pub delivered_bytes: i64,
+    /// Recent delivery rate in BITS per second, or `None` before a window has
+    /// closed. Measured here rather than in the player because only the server
+    /// sees every transport — Safari's native HLS reports no such number, and
+    /// hls.js's estimator exists only when hls.js is doing the fetching.
+    pub delivered_bps: Option<i64>,
+    /// How long since that rate was last recomputed. A client with a full
+    /// buffer stops fetching, which is health, not a slow link — the rate keeps
+    /// its last real value and this says how old it is, so a reader can tell a
+    /// measurement from a memory.
+    pub delivered_idle_ms: i64,
     pub suspended: bool,
 }
 
@@ -1167,6 +1190,7 @@ impl TranscodeManager {
             segments: Mutex::new(SegmentIndex::default()),
             ahead_bytes: AtomicI64::new(0),
             progress: Arc::clone(&progress),
+            delivery: Meter::new(),
             suspended: AtomicBool::new(false),
         });
         self.sessions
@@ -1371,6 +1395,7 @@ impl TranscodeManager {
             segments: Mutex::new(SegmentIndex::default()),
             ahead_bytes: AtomicI64::new(0),
             progress: Arc::clone(&progress),
+            delivery: Meter::new(),
             suspended: AtomicBool::new(false),
         });
         self.sessions
@@ -1492,6 +1517,11 @@ impl TranscodeManager {
         loop {
             if let Ok(file) = tokio::fs::File::open(&path).await {
                 let len = file.metadata().await.ok()?.len();
+                // Counted on open rather than as the body drains: the client
+                // has committed to this many bytes, the meter's window is far
+                // longer than one fetch takes, and threading a counter through
+                // the response stream would buy a precision nobody reads.
+                session.delivery.note(len);
                 // The client's download frontier just advanced. Resolve it
                 // against the index's real EXTINF bounds — the fetched
                 // segment's own end time, not an index times a nominal
@@ -2209,6 +2239,7 @@ mod tests {
             segments: Mutex::new(SegmentIndex::default()),
             ahead_bytes: AtomicI64::new(0),
             progress: Arc::new(Progress::new()),
+            delivery: Meter::new(),
             suspended: AtomicBool::new(false),
         }
     }
