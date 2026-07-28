@@ -142,7 +142,10 @@ pub async fn create(
 /// Idempotent: deleting a session that has already gone is a success, because
 /// the caller's intent ("this must not be running") is satisfied either way.
 pub async fn delete(State(state): State<AppState>, AxPath(session): AxPath<String>) -> StatusCode {
-    state.transcode.stop_session(&session).await;
+    state
+        .transcode
+        .stop_session(&session, "released by client")
+        .await;
     StatusCode::NO_CONTENT
 }
 

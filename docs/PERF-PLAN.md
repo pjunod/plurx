@@ -1,8 +1,8 @@
 # Performance — where the seconds go, and the plan to get them back
 
-**Status:** ready to build — revised 2026-07-28 through a two-round review;
-Weekend 1 (M0 + §4.1 + §4.2 + §4.3 + §4.5) shipped, the §2.8 correction pass
-is the next work item, then §4.4/§4.6/§4.7 · **Diagnosed against:** `e7a12cf`
+**Status:** ready to build — Weekend 1 and the §2.8 correction pass are both
+shipped (2026-07-28); §4.4 / §4.6 / §4.7 are next · **Diagnosed against:**
+`e7a12cf`
 · **Review record:** [PERF-PLAN-REVIEW.md](PERF-PLAN-REVIEW.md) →
 [PERF-REVIEW-RESPONSE.md](PERF-REVIEW-RESPONSE.md) →
 [PERF-REVIEW-ASSESSMENT.md](PERF-REVIEW-ASSESSMENT.md) ·
@@ -266,9 +266,27 @@ next work item before anything else in §10**:
 The pass also lands the review's lifecycle correction (§8.5 — idempotent
 `POST` creation, explicit `DELETE`, `playback_id`-scoped supersession) and
 the cheap play-path items from R11 (availability cached with a short age,
-Trakt "watching now" moved from `/decision` to session creation, completed
+Trakt "watching now" moved from `/decision` to real media delivery, completed
 segments streamed from disk instead of buffered as ~35 MB `Vec`s, immutable
 cache headers on segment bodies).
+
+**Shipped 2026-07-28**, six commits, each independently revertable:
+
+| Commit | Contents |
+|---|---|
+| `1d8d2e2` | R1: byte override reverted, buffer pressure classified, beacon measurements actually reaching the log (the `ClientLog` DTO named none of them, so serde had been dropping every number), attempt ids + reasons, deliberate seeks no longer counted as stalls |
+| `36b56b8` | R9: attempt generations, per-attempt encoder label, recent-speed EWMA as a pure function, the status-vs-idle-clock regression test |
+| `8561879` | R2: `SegmentMeta`/`SegmentIndex` from `EXTINF`, the three frontiers separated, retention derived from the client's forward buffer, per-session + global byte budgets, event-driven flow control |
+| `5f75fc7` | Segments streamed from an open handle instead of a ~35 MB `Vec`, `private, immutable` caching |
+| `3fd1d38` | §8.5 lifecycle: `POST …/hls/sessions` with idempotency, `DELETE …`, supersession by `playback_id`, GET kept as a deprecated bridge |
+| `18f8802` | `/decision` made pure: availability cached (presence only), Trakt start moved to real delivery in a detached task |
+
+Two things worth carrying forward. The **client buffer values remain
+provisional** — the beacons that were supposed to justify them were dropping
+their numbers on the floor until `1d8d2e2`, so M0 still owes the decision in
+§8.6-1 its evidence. And the **fixture matrix has not been run**: everything
+above was verified on a 720p software fixture and a live browser, which
+proves the plumbing and nothing about 4K HDR on real hardware.
 
 ## 3. M0 — instrument first
 
@@ -914,6 +932,10 @@ shared dir on a node that didn't produce it.
 ### 8.1 Constants & args
 
 - `SEGMENT_SECONDS: u32 = 4 → 2` — `plurx-core/src/transcode/mod.rs:20`.
+  Now that segment bounds come from `EXTINF` rather than from this constant
+  (§4.2), changing it moves only the *forced keyframe grid* and the muxer's
+  target: nothing downstream multiplies by it any more, which is what makes
+  the change one line instead of an audit.
 - *(shipped)* `Pacing` struct (§4.2) in `plurx-core::transcode`; pacing
   parameters on `hls_args` / `hls_copy_args`; both `-re` pushes deleted;
   `PacingCaps` probe lives in `plurxd/src/ffmpeg.rs`.
@@ -1069,14 +1091,18 @@ chosen-by-probe (§5) · [ROADMAP.md](ROADMAP.md) — this plan's slice line.
 | Slice | Contents | Expected result |
 |---|---|---|
 | Weekend 1 ✅ | M0 + §4.1 + §4.2 + §4.3 + §4.5 | starts ~3–5 s; 4K copy-HLS and AirPlay stop stalling; numbers for everything else |
-| **Correction pass** (next) | §2.8: R1 client config + comment · three-frontier accounting + retention + byte budgets · attempt generations + live labels · §8.5 lifecycle · R11 cheap wins (availability cache, Trakt move, streamed segments) | shipped code matches the reviewed contracts before anything is built on top of them |
+| Correction pass ✅ | §2.8: R1 client config · three-frontier accounting + retention + byte budgets · attempt generations + live labels · §8.5 lifecycle · R11 cheap wins | shipped code now matches the reviewed contracts |
 | Weekend 2 | §4.4 + §4.6 (+§4.7 decision) | starts ~2–3 s; Wi-Fi-stable rungs; validation exercises the production flags |
 | Focused week | §5 (M2) — real-HDR probe matrix on nynuc + one AMD node first | 4K HDR fully hardware; the 30 s stutter class gone; Auto=1080p viable; admission by measured speed |
 | Next | §6 (M3) — slot arbiter v1 lands with it | predicted plays start ≤1.5 s and seek like direct play; producers yield to viewers |
 | With Phase 4 | §7 (M4) — fencing + takeover protocol per §7.3 | pool of nodes; failover inside the measured budget; overnight cluster pre-caching |
 
 Every slice leaves the tree releasable; nothing in a later slice is
-load-bearing for an earlier one. The correction pass goes first because
-building §4.4 onward on accounting the review cycle disproved would
-compound the debt; after it lands, the remaining uncertainty is
+load-bearing for an earlier one. The correction pass went first because
+building §4.4 onward on accounting the review cycle disproved would have
+compounded the debt; with it landed, the remaining uncertainty is
 measurement uncertainty owned by M0 — which is where uncertainty belongs.
+The next thing that should happen is not code: it is running the fixture
+matrix on nynuc, because §4.4's segment-length trade-off and §5's whole
+premise are both claims about numbers nobody has measured on the hardware
+this runs on.

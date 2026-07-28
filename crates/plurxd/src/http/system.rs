@@ -924,7 +924,7 @@ pub async fn stop_session(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let stopped = state.transcode.stop_session(&id).await;
+    let stopped = state.transcode.stop_session(&id, "stopped by admin").await;
     if !stopped {
         return Err(ApiError::NotFound("session"));
     }

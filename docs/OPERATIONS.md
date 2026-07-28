@@ -172,7 +172,14 @@ decision, in three parts.
 |---|---|---|---|
 | Head start | `playback.hls_burst_secs` | 90 s | Content delivered flat-out before pacing engages. This is the buffer a stream *starts* with |
 | Then pace at | `playback.hls_readrate` | 2× | How fast the input is read afterwards. Every second of wall clock adds a second of runway at 2× |
-| Buffer limit | `playback.hls_ahead_max_secs` | 180 s | How far ahead of your playhead the session may get before it pauses itself |
+| Buffer limit | `playback.hls_ahead_max_secs` | 180 s | How far ahead of the client the session may get before it pauses itself |
+| *(no dropdown)* | `playback.hls_ahead_max_bytes` | 2 GB | The same limit in bytes, per session — 180 s is a few hundred megabytes at a transcode rung and over a gigabyte of 4K copy, so time alone is not a disk bound |
+| *(no dropdown)* | `playback.hls_scratch_max_bytes` | 8 GB | Ceiling across *every* live session. A per-session cap bounds one runaway; it says nothing about four healthy 4K streams between them |
+
+The last two have no dropdown because they are safety limits rather than
+preferences — the right value is a property of the disk, not a taste — but
+both are settable through `PUT /api/v1/settings` when the defaults don't suit
+the hardware.
 
 **How to read it:** the head start is the single number that decides whether a
 4K stream survives a network hiccup ten seconds in. Until 2026-07-28 the copy
@@ -183,6 +190,13 @@ stutters, raise the head start before touching anything else. If sessions eat
 too much disk, lower the buffer limit: a session's directory holds roughly the
 buffer limit plus a minute of already-played content, whatever the encoder's
 speed.
+
+"Ahead of the client" means ahead of what the player has **downloaded**,
+which is not the same as ahead of what you are watching — a player fetches
+its whole forward buffer in advance, so the download frontier normally sits
+about a minute past the picture on screen. Everything plurx keeps and deletes
+is measured from that frontier with the difference allowed for, which is why
+segments survive roughly two minutes behind it rather than one.
 
 The pause is real: at the buffer limit plurx sends the session's ffmpeg a
 `SIGSTOP` and resumes it with `SIGCONT` once you are within half the limit.

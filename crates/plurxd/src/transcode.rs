@@ -1422,15 +1422,19 @@ impl TranscodeManager {
         Some(session_info(session_id, &session).await)
     }
 
-    /// Kill one session now (the activity page's stop button). True if it
-    /// existed.
-    pub async fn stop_session(&self, session_id: &str) -> bool {
+    /// End one session now. True if it existed.
+    ///
+    /// `reason` distinguishes the two callers in the log, because they mean
+    /// opposite things: a client releasing a stream it has finished with is
+    /// routine, and an admin killing one from the activity page is somebody
+    /// intervening.
+    pub async fn stop_session(&self, session_id: &str, reason: &'static str) -> bool {
         let Some(session) = self.sessions.lock().await.remove(session_id) else {
             return false;
         };
         let _ = session.child.lock().await.kill().await;
         let _ = tokio::fs::remove_dir_all(&session.dir).await;
-        tracing::info!(%session_id, "transcode session stopped by admin");
+        tracing::info!(%session_id, reason, "transcode session ended");
         true
     }
 
@@ -2038,7 +2042,7 @@ mod tests {
             0,
             "fetching from a session is what keeps it alive"
         );
-        assert!(mgr.stop_session(&info.session_id).await);
+        assert!(mgr.stop_session(&info.session_id, "test").await);
     }
 
     /// The playlist is the only place a copied segment's true duration is
@@ -2457,7 +2461,7 @@ mod tests {
         mgr.apply_ahead_window(&session, &info.session_id, hold, 0)
             .await;
         assert!(session.suspended.load(Relaxed), "held again");
-        assert!(mgr.stop_session(&info.session_id).await);
+        assert!(mgr.stop_session(&info.session_id, "test").await);
         assert_eq!(mgr.active_sessions().await, 0);
     }
 
@@ -2542,7 +2546,7 @@ mod tests {
         assert!(mgr.playlist("missing").await.is_none());
         assert!(mgr.segment("missing", "seg00000.ts").await.is_none());
         assert!(mgr.segment("missing", "../evil").await.is_none());
-        assert!(!mgr.stop_session("missing").await);
+        assert!(!mgr.stop_session("missing", "test").await);
 
         // A real start spawns ffmpeg (it fails async on the fake path, but the
         // session is created and tracked). Then the admin stop kills it.
@@ -2555,7 +2559,7 @@ mod tests {
         let sessions = mgr.list_sessions().await;
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].user_name, "paul");
-        assert!(mgr.stop_session(&info.session_id).await);
+        assert!(mgr.stop_session(&info.session_id, "test").await);
         assert_eq!(mgr.active_sessions().await, 0);
 
         // The copy-video path likewise creates and tears down a session.
@@ -2564,7 +2568,7 @@ mod tests {
             .await
             .expect("start_copy");
         assert_eq!(info.encoder, "copy");
-        assert!(mgr.stop_session(&info.session_id).await);
+        assert!(mgr.stop_session(&info.session_id, "test").await);
     }
 
     /// Seeking must not leave the old session running. Before this, every seek
@@ -2597,8 +2601,8 @@ mod tests {
             .expect("seek again");
         assert_eq!(mgr.active_sessions().await, 1);
         assert!(mgr.playlist(&first.session_id).await.is_none());
-        assert!(!mgr.stop_session(&second.session_id).await);
-        assert!(mgr.stop_session(&third.session_id).await);
+        assert!(!mgr.stop_session(&second.session_id, "test").await);
+        assert!(mgr.stop_session(&third.session_id, "test").await);
 
         // The copy path supersedes too, and across paths: a transcode fallback
         // after a copy attempt must not leave the copy remux reading the disk.
@@ -2611,7 +2615,7 @@ mod tests {
             .await
             .expect("fallback");
         assert_eq!(mgr.active_sessions().await, 1);
-        assert!(!mgr.stop_session(&copy.session_id).await);
+        assert!(!mgr.stop_session(&copy.session_id, "test").await);
 
         // Another player is untouched — and this is the part that changed.
         // Supersession used to be keyed by (viewer, file), so one account
@@ -2632,9 +2636,9 @@ mod tests {
             2,
             "one player's seek must not touch another player's stream"
         );
-        assert!(!mgr.stop_session(&fallback.session_id).await);
-        assert!(mgr.stop_session(&laptop.session_id).await);
-        assert!(mgr.stop_session(&reseek.session_id).await);
+        assert!(!mgr.stop_session(&fallback.session_id, "test").await);
+        assert!(mgr.stop_session(&laptop.session_id, "test").await);
+        assert!(mgr.stop_session(&reseek.session_id, "test").await);
         assert_eq!(mgr.active_sessions().await, 0);
     }
 
@@ -2696,10 +2700,10 @@ mod tests {
         // And once a session is gone, its key is stale rather than binding —
         // otherwise a client that reused an id would be told "conflict"
         // forever.
-        assert!(mgr.stop_session(&moved.session_id).await);
+        assert!(mgr.stop_session(&moved.session_id, "test").await);
         let revived = mgr.create_session(&next, "paul").await.expect("recreate");
         assert_ne!(revived.session_id, moved.session_id);
-        assert!(mgr.stop_session(&revived.session_id).await);
+        assert!(mgr.stop_session(&revived.session_id, "test").await);
     }
 
     #[tokio::test]
