@@ -492,7 +492,13 @@
   }
   .libbar{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin:0 4px 16px}
   .libbar select{width:auto;min-width:130px;padding:6px 9px}
+  .libbar .row select[onchange^="setPerPage"]{min-width:76px}
   .libbar .lbl{display:inline;margin:0 2px 0 0;font-size:12px;color:var(--muted)}
+  /* Page navigation under the grid. Only rendered when there is more than one
+     page, so an unpaged library keeps the layout it always had. */
+  .pager{display:flex;justify-content:center;align-items:center;gap:14px;margin:22px 4px 8px;flex-wrap:wrap}
+  .pager button[disabled]{opacity:.4;cursor:default}
+  .pager .muted{font-size:13px}
 
   /* ---- detail pages (movie / show / season / episode) ---- */
   .hero{position:relative;margin:-22px -20px 22px}
@@ -1444,6 +1450,44 @@ async function viewHome(){
 // something happened, everything else about what it is called. An explicit
 // pick from the dropdown wins from then on.
 let LIB_SORT="", LIB_FILTER="all";
+// How many posters a page of a library shows. "all" is a real choice, not the
+// default: 300 cards is a slow first paint on a TV browser and an easy scroll
+// on a desktop, and only the person looking at it knows which they are.
+// Remembered per browser — someone who wants 20 at a time wants it every time.
+const LIB_SIZES=[20,50,100,200];
+let LIB_PER=(function(){
+  try{ const v=localStorage.getItem("plurx_perpage"); if(v==="all"||LIB_SIZES.includes(+v)) return v==="all"?"all":+v; }catch(e){}
+  return 100;
+})();
+let LIB_PAGE_AT=0;   // which page of the filtered list is on screen
+function setPerPage(v){
+  LIB_PER = v==="all" ? "all" : (+v||100);
+  LIB_PAGE_AT=0;     // a resize makes the old page number meaningless
+  try{ localStorage.setItem("plurx_perpage", String(LIB_PER)); }catch(e){}
+}
+function libPageCount(n){ return LIB_PER==="all" ? 1 : Math.max(1, Math.ceil(n/LIB_PER)); }
+// Move to another page of the current listing. Redraws in place rather than
+// re-fetching — every item is already loaded, so paging is a slice.
+function libGoPage(n){
+  const pages=libPageCount(LIB_VIEW? LIB_VIEW.shown : 0);
+  LIB_PAGE_AT=Math.min(Math.max(0,n), pages-1);
+  if(LIB_VIEW) LIB_VIEW.draw(LIB_VIEW.done);
+  const m=document.querySelector("#main .libbar");
+  if(m) m.scrollIntoView({behavior:"smooth",block:"start"});
+}
+// The listing currently on screen, so the pager buttons can redraw it.
+let LIB_VIEW=null;
+function pagerHtml(shown){
+  const pages=libPageCount(shown);
+  if(pages<2) return "";
+  const at=LIB_PAGE_AT;
+  const btn=(n,label,dis)=>`<button class="ghost sm"${dis?" disabled":""} onclick="libGoPage(${n})">${label}</button>`;
+  return `<div class="pager">
+    ${btn(at-1,"‹ Previous",at<=0)}
+    <span class="muted">Page ${at+1} of ${pages}</span>
+    ${btn(at+1,"Next ›",at>=pages-1)}
+  </div>`;
+}
 function sortFor(lib){ return LIB_SORT || ((lib&&lib.kind==="home")?"recorded":"title"); }
 function libOpt(v,label,cur){ return `<option value="${v}" ${cur===v?'selected':''}>${esc(label)}</option>`; }
 function matchWatch(it,f){
@@ -1517,63 +1561,174 @@ function pageHead(trail,title){
   return `<div class="pagehead"><div class="phnav">${back}<div class="crumbs">${crumbs}</div></div>`+
     (title?`<h2 class="phtitle">${esc(title)}</h2>`:``)+`</div>`;
 }
-async function viewLibrary(id){
+// ---- library grids --------------------------------------------------------
+// One page of items per request, and every page fetched.
+//
+// The server caps a page at 200 and should — a library is unbounded, and "send
+// me everything at once" is a request that gets slower every time somebody adds
+// a film. What was wrong was the client asking for one page, showing it, and
+// saying "(first 200 of 321)" as though that were a state of affairs rather
+// than a bug: 121 films with no way to reach them, no pagination, no scroll.
+//
+// The filter made it worse and quieter. Show → Unwatched filters what has been
+// LOADED, so on a 321-item library it silently searched the first 200 — a film
+// you own and have not watched simply not appearing in a list of films you have
+// not watched, with nothing on screen to suggest the list was partial.
+const LIB_PAGE=200;
+// Which listing is current. Changing sort or filter, or leaving the page,
+// abandons whatever pages are still in flight for the previous one — without
+// this a slow second page from the old view lands in the new one.
+let LIB_LOAD=0;
+
+// Fetch every page of every listed library, handing each batch over as it
+// arrives so the first screenful paints while the rest is still coming.
+// Returns false if this load was superseded or failed.
+async function eachItemPage(libIds, sort, gen, onBatch){
+  // Summed across libraries as each one's first page reveals its size, so a
+  // category's "of N" is right from its second batch rather than only at the
+  // end.
+  let total=0;
+  for(const id of libIds){
+    for(let offset=0;; offset+=LIB_PAGE){
+      let page;
+      try{
+        page=await api(`/libraries/${id}/items?limit=${LIB_PAGE}&offset=${offset}&sort=${sort}`);
+      }catch(e){
+        if(LIB_LOAD===gen) toast(e.message);
+        return false;
+      }
+      // Superseded, or the view is simply no longer on screen. Checking the
+      // DOM as well as the token is what stops a big library fetching pages
+      // into nothing after the user has navigated away.
+      if(LIB_LOAD!==gen || !document.getElementById("libbody")) return false;
+      const got=page.items||[];
+      const libTotal=page.total||0;
+      if(offset===0) total+=libTotal;
+      onBatch(got, total);
+      if(!got.length || offset+LIB_PAGE>=libTotal) break;
+    }
+  }
+  return true;
+}
+
+// The shared body of both library views: a sort/filter bar, a grid that grows
+// as pages land, and an A–Z rail. One function because the two differ only in
+// which libraries they read and what their controls re-invoke — and a grid that
+// pages correctly in one of them and not the other is exactly the kind of
+// difference nobody notices until a library gets big.
+async function libraryView(o){
   chrome("home",`<div class="empty">Loading…</div>`);
-  const lib=(await libsCached()).find(l=>l.id==id);
-  const sort=sortFor(lib);
-  const page=await api(`/libraries/${id}/items?limit=200&sort=${sort}`);
-  const items=LIB_FILTER==="all"?page.items:page.items.filter(it=>matchWatch(it,LIB_FILTER));
-  const capNote = page.total>page.items.length? ` <span class="muted">(first ${page.items.length} of ${page.total})</span>`:"";
+  const gen=++LIB_LOAD;
+  // Every entry here is a fresh listing — a different library, a new sort, a
+  // new filter — and page 3 of a list you have just reordered is not a place.
+  // Paging itself does not come through here; `libGoPage` redraws in place.
+  LIB_PAGE_AT=0;
+  const sort=o.sort;
   const bar=`<div class="libbar">
     <div class="row">
       <span class="lbl">Sort</span>
-      <select onchange="LIB_SORT=this.value;viewLibrary(${Number(id)})">
+      <select onchange="LIB_SORT=this.value;${o.reload}">
         ${libOpt("title","Title (A–Z)",sort)}${libOpt("added","Recently added",sort)}${libOpt("recorded","Date recorded",sort)}${libOpt("year","Year",sort)}${libOpt("resolution","Resolution",sort)}</select>
       <span class="lbl" style="margin-left:8px">Show</span>
-      <select onchange="LIB_FILTER=this.value;viewLibrary(${Number(id)})">
+      <select onchange="LIB_FILTER=this.value;${o.reload}">
         ${libOpt("all","Everything",LIB_FILTER)}${libOpt("unwatched","Unwatched",LIB_FILTER)}${libOpt("inprogress","In progress",LIB_FILTER)}${libOpt("watched","Watched",LIB_FILTER)}</select>
+      <span class="lbl" style="margin-left:8px">Per page</span>
+      <select onchange="setPerPage(this.value);libGoPage(0)">
+        ${LIB_SIZES.map(n=>libOpt(String(n),String(n),String(LIB_PER))).join("")}${libOpt("all","All",String(LIB_PER))}</select>
     </div>
-    <span class="muted" style="font-size:13px">${items.length} item${items.length===1?'':'s'}${capNote}</span></div>`;
-  const body = items.length? (sort==="resolution"? resSections(items) : grid(items)) : `<div class="empty">Nothing matches this filter.</div>`;
-  const name=lib?lib.name:'Library';
-  setOrigin(`#/library/${id}`,name);
-  const head=pageHead([{href:"#/",label:"Home"},{label:name}],name);
-  document.getElementById("main").innerHTML=`${head}${bar}${body}${alphaRailHtml(items)}`;
-  tagAlpha(items);
+    <span class="muted" id="libcount" style="font-size:13px"></span></div>`;
+  setOrigin(o.href,o.title);
+  const head=pageHead([{href:"#/",label:"Home"},{label:o.title}],o.title);
+  document.getElementById("main").innerHTML=
+    `${head}${bar}<div id="libbody"><div class="empty">Loading…</div></div>`+
+    `<div id="libpager"></div><div id="librail"></div>`;
+
+  let all=[], total=0;
+  const draw=(done)=>{
+    const body=document.getElementById("libbody"); if(!body) return;
+    let items=all;
+    // Sorting the merged set matters only for a category, whose shares are
+    // each sorted on their own; a single library arrives in order.
+    if(o.resort) items=o.resort(items.slice(), sort);
+    // Filter before paging, always. The other order gives "50 films, of which
+    // the unwatched ones" — which is why an unwatched film could be missing
+    // from a list of unwatched films.
+    if(LIB_FILTER!=="all") items=items.filter(it=>matchWatch(it,LIB_FILTER));
+    const shown=items.length;
+    LIB_VIEW={draw, done, shown};
+    const pages=libPageCount(shown);
+    if(LIB_PAGE_AT>=pages) LIB_PAGE_AT=pages-1;   // the filter shrank the list under us
+    const from=LIB_PER==="all"?0:LIB_PAGE_AT*LIB_PER;
+    const page=LIB_PER==="all"?items:items.slice(from, from+LIB_PER);
+
+    body.innerHTML = page.length
+      ? (sort==="resolution"? resSections(page) : grid(page))
+      : (done? `<div class="empty">Nothing matches this filter.</div>`
+             : `<div class="empty">Loading…</div>`);
+    const pager=document.getElementById("libpager");
+    if(pager) pager.innerHTML = done? pagerHtml(shown) : "";
+    // The A–Z rail maps to what is on screen, so it describes this page.
+    const rail=document.getElementById("librail");
+    if(rail) rail.innerHTML=alphaRailHtml(page);
+    const count=document.getElementById("libcount");
+    if(count){
+      // While loading, say so rather than showing a number about to change —
+      // a count that ticks upward reads as items appearing from nowhere.
+      count.innerHTML = !done
+        ? `<span class="muted">loading… ${all.length}${total?` of ${total}`:""}</span>`
+        : pages>1
+          ? `${from+1}–${from+page.length} of ${shown}${shown!==total?` (${total} in all)`:""}`
+          : shown!==total
+            ? `${shown} of ${total} items`
+            : `${shown} item${shown===1?'':'s'}`;
+    }
+    tagAlpha(page);
+  };
+
+  const complete=await eachItemPage(o.libIds, sort, gen, (batch, t)=>{
+    all=all.concat(batch);
+    total=t;
+    draw(false);
+  });
+  if(LIB_LOAD!==gen) return;
+  draw(complete);
+}
+
+async function viewLibrary(id){
+  const lib=(await libsCached()).find(l=>l.id==id);
+  await libraryView({
+    libIds:[id],
+    sort:sortFor(lib),
+    title:lib?lib.name:'Library',
+    href:`#/library/${id}`,
+    reload:`viewLibrary(${Number(id)})`,
+  });
 }
 // "View all" for a category that spans more than one share: merge their items,
 // then apply the same client-side sort/filter as a single library.
 async function viewCategory(key){
-  chrome("home",`<div class="empty">Loading…</div>`);
   const libs=(await libsCached()).filter(l=>libCategory(l).key===key);
-  if(!libs.length){ document.getElementById("main").innerHTML=`<div class="empty">No libraries in this category.</div>`; return; }
+  if(!libs.length){
+    chrome("home",`<div class="empty">No libraries in this category.</div>`);
+    return;
+  }
   const cat=libCategory(libs[0]);
-  const sort=sortFor(libs[0]);
-  const pages=await Promise.all(libs.map(l=>api(`/libraries/${l.id}/items?limit=200&sort=${sort}`)));
-  let items=[].concat(...pages.map(p=>p.items));
-  // Each share is server-sorted; re-sort the merged set for fields we hold locally.
-  if(sort==="title") items.sort((a,b)=>sortKey(a.title).localeCompare(sortKey(b.title)));
-  else if(sort==="year") items.sort((a,b)=>(b.year||0)-(a.year||0));
-  else if(sort==="resolution") items.sort((a,b)=>(b.resolution||0)-(a.resolution||0));
-  else if(sort==="recorded") items.sort((a,b)=>(b.recorded_at||"").localeCompare(a.recorded_at||""));
-  if(LIB_FILTER!=="all") items=items.filter(it=>matchWatch(it,LIB_FILTER));
-  const total=pages.reduce((n,p)=>n+(p.total||0),0);
-  const capNote = total>items.length? ` <span class="muted">(first ${items.length} of ${total})</span>`:"";
-  const bar=`<div class="libbar">
-    <div class="row">
-      <span class="lbl">Sort</span>
-      <select onchange="LIB_SORT=this.value;viewCategory(${esc(JSON.stringify(key))})">
-        ${libOpt("title","Title (A–Z)",sort)}${libOpt("added","Recently added",sort)}${libOpt("recorded","Date recorded",sort)}${libOpt("year","Year",sort)}${libOpt("resolution","Resolution",sort)}</select>
-      <span class="lbl" style="margin-left:8px">Show</span>
-      <select onchange="LIB_FILTER=this.value;viewCategory(${esc(JSON.stringify(key))})">
-        ${libOpt("all","Everything",LIB_FILTER)}${libOpt("unwatched","Unwatched",LIB_FILTER)}${libOpt("inprogress","In progress",LIB_FILTER)}${libOpt("watched","Watched",LIB_FILTER)}</select>
-    </div>
-    <span class="muted" style="font-size:13px">${items.length} item${items.length===1?'':'s'}${capNote}</span></div>`;
-  const body = items.length? (sort==="resolution"? resSections(items) : grid(items)) : `<div class="empty">Nothing matches this filter.</div>`;
-  setOrigin(`#/category/${encodeURIComponent(key)}`,cat.name);
-  const head=pageHead([{href:"#/",label:"Home"},{label:cat.name}],cat.name);
-  document.getElementById("main").innerHTML=`${head}${bar}${body}${alphaRailHtml(items)}`;
-  tagAlpha(items);
+  await libraryView({
+    libIds:libs.map(l=>l.id),
+    sort:sortFor(libs[0]),
+    title:cat.name,
+    href:`#/category/${encodeURIComponent(key)}`,
+    reload:`viewCategory(${esc(JSON.stringify(key))})`,
+    resort:(items,sort)=>{
+      // Each share is server-sorted; the merged set needs re-sorting for the
+      // fields the client holds.
+      if(sort==="title") items.sort((a,b)=>sortKey(a.title).localeCompare(sortKey(b.title)));
+      else if(sort==="year") items.sort((a,b)=>(b.year||0)-(a.year||0));
+      else if(sort==="resolution") items.sort((a,b)=>(b.resolution||0)-(a.resolution||0));
+      else if(sort==="recorded") items.sort((a,b)=>(b.recorded_at||"").localeCompare(a.recorded_at||""));
+      return items;
+    },
+  });
 }
 async function viewSearch(q){
   chrome("home",`<div class="empty">Searching…</div>`);
