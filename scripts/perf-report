@@ -281,6 +281,18 @@ def log_section(out, logs, cache_settings, srv=None):
         for l in hitch[-3:]:
             out("    " + l[:240])
 
+    # The decode-margin verdicts. A rescue is the client measuring its own
+    # decoder out of headroom on a copied stream and switching itself to a
+    # transcode; a clear is an explicit-Original session finding the margin
+    # healthy again (a GPU upgrade, a driver fix) and unremembering the limit.
+    resc = [l for l in lines if "decode_rescue" in l or "decode_limit_cleared" in l]
+    if resc:
+        out("")
+        out(f"  {len(resc)} decode-margin event(s): the client's own measured decode")
+        out("    cost against its frame budget, and what it did about it.")
+        for l in resc[-3:]:
+            out("    " + l[:240])
+
     # Buffer-quota beacons. hls.js asks for a target in seconds; the browser
     # enforces a limit in BYTES that no setting can raise. When the two
     # disagree the result is an append/evict cycle that hitches near the

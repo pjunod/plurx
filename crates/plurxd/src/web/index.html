@@ -2534,6 +2534,24 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
   modal.classList.add("open");
   setLoading(true,"Reading media…","checking the file on the server");
   let decision; try{ decision=await api(`/files/${fileId}/decision?${CAPS_Q}&force=${qualityForce()}`);}catch(e){ setLoading(false); toast(e.message); return closePlayer(); }
+  // A device that measured itself out of decode headroom on this codec and
+  // resolution (see maybeDecodeRescue) routes straight to a transcode on Auto
+  // instead of stuttering for twenty seconds and rescuing mid-scene. Only
+  // Auto: an explicit Original is the viewer overriding this, which is also
+  // how the limit gets re-tested and cleared after a hardware upgrade.
+  if(qualityForce()==='auto' && decision
+     && (decision.method==='remux'||decision.method==='direct_play')){
+    const lim=decodeLimitFor(decision.source||{});
+    if(lim){
+      try{
+        const d2=await api(`/files/${fileId}/decision?${CAPS_Q}&force=transcode`);
+        d2.reasons=[`this device measured ${lim.decode_ms}ms/frame against a `+
+          `${lim.budget_ms}ms budget on ${decodeLimitKey(decision.source||{})} — `+
+          `transcoding (Quality → Original overrides)`].concat(d2.reasons||[]);
+        decision=d2;
+      }catch(e){ /* the limit is advice; the original decision still plays */ }
+    }
+  }
   const startSec=(resumeMs||0)/1000;
   // Stop the outgoing playback's timers *before* PLAYER is replaced below. The
   // clearInterval further down runs after the reassignment, so it only ever
@@ -2555,7 +2573,7 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
     markers:(decision.markers||[]).map(m=>({...m})), source:src, started:false,
     idleTimer:null, autoskip:autoskipOn(), stallTimer:null, probeUrl:null, triedFallback:false,
     aoffset:decision.audio_offset_ms||0, declared:decision.declared_offset_ms||0,
-    reasons:(decision.reasons||[]), title, meta:meta||null,
+    reasons:(decision.reasons||[]), title, meta:meta||null, decodeRescued:false,
     transcodeAudio:!!decision.transcode_audio, copyHls:false,
     playStartedAt:clickedAt, ttffMs:null, stalls:0, sessionId:null, streamId:null, health:null,
     attemptId:null, attemptReason:null, bufferLimits:null,
@@ -2627,7 +2645,7 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
   video.addEventListener("loadedmetadata", probeDecode, {once:true});
   armHitchDetector(video);
   clearInterval(PLAYER.timer);
-  PLAYER.timer=setInterval(()=>{ reportProgress(fileId); reportHitches(); }, 5000);
+  PLAYER.timer=setInterval(()=>{ reportProgress(fileId); reportHitches(); maybeDecodeRescue(); }, 5000);
   video.onended=()=>{ handleEnded(fileId).catch(()=>{}); };
   pbTick(); pbSyncPlayIcon();   // seed the transport (total time, play icon) at once
   playerActivity();
@@ -2914,7 +2932,9 @@ function armHitchDetector(v){
 // rate can.
 function hitchInterval(){
   const at=(PLAYER&&PLAYER.hitches&&PLAYER.hitches.at)||[];
-  if(at.length<3) return null;
+  // Five events before claiming a cadence: three lates clustered at startup
+  // produced "every ~0.0s", which reads as an emergency and means nothing.
+  if(at.length<5) return null;
   const d=[]; for(let i=1;i<at.length;i++){ if(at[i]>at[i-1]) d.push(at[i]-at[i-1]); }
   if(!d.length) return null;
   d.sort((a,b)=>a-b);
@@ -2943,6 +2963,61 @@ function hitchBlame(){
   // `slow` counter used to make out loud.
   if(h.decodeMs!=null) bits.push(`decode ${h.decodeMs}ms typical`);
   return bits.join(" · ");
+}
+// ---- decode margin ---------------------------------------------------------
+// The stutter investigation's verdict (docs/STUTTER-4K.md §5.3): on the 4K
+// HEVC remux the client's TYPICAL decode was 41.6ms against a 41.7ms frame
+// budget — the decoder running at exactly realtime, so every spike surfaced
+// as a held frame — while the same machine decodes the 1080p transcode at
+// 6ms and absorbs hundreds of spikes silently. No server change makes a
+// client's decoder faster; the honest response is to measure the margin and
+// route around it. The thresholds: a median at 80% of the frame budget
+// leaves too little room for the giant-IRAP spikes that actually occur, and
+// clearing needs comfortable headroom (60%) so a borderline device does not
+// flap between the two.
+const MARGIN_BAD=0.8;
+const MARGIN_GOOD=0.6;
+const MARGIN_MIN_EVENTS=4;
+const MARGIN_MIN_SECS=20;
+const MARGIN_CLEAR_SECS=60;
+// The verdict, pure so it is testable: null, or the numbers that justify a
+// rescue. Hitches are required alongside the margin — a device at 85% that
+// is presenting every frame on time has a problem on paper only.
+function decodeMarginVerdict(h, playedSecs){
+  if(!h || !h.fps || h.decodeMs==null) return null;
+  if(!(playedSecs>=MARGIN_MIN_SECS)) return null;
+  const events=(h.back|0)+(h.held|0)+(h.late|0)+(h.gap|0);
+  if(events<MARGIN_MIN_EVENTS) return null;
+  const budgetMs=1000/h.fps;
+  if(h.decodeMs < budgetMs*MARGIN_BAD) return null;
+  return {decodeMs:+h.decodeMs.toFixed(1), budgetMs:+budgetMs.toFixed(1), events};
+}
+// What this DEVICE cannot decode with margin, remembered per codec+height so
+// the next Auto playback routes straight to a transcode instead of stuttering
+// for twenty seconds first. Explicitly chosen Original always wins — the
+// limit only steers Auto — and an explicit-Original session that measures
+// comfortable margin for a minute clears its entry, so a GPU upgrade is
+// noticed rather than distrusted forever.
+function decodeLimitKey(src){ return (src&&src.video_codec)? `${src.video_codec}@${src.height||0}` : null; }
+function decodeLimits(){ try{ return JSON.parse(localStorage.getItem("plurx_decode_limits")||"{}")||{}; }catch(e){ return {}; } }
+function decodeLimitFor(src){ const k=decodeLimitKey(src); return k? (decodeLimits()[k]||null) : null; }
+function rememberDecodeLimit(src, decodeMs, budgetMs){
+  const k=decodeLimitKey(src); if(!k) return;
+  try{ const l=decodeLimits(); l[k]={decode_ms:decodeMs, budget_ms:budgetMs, at:Date.now()};
+       localStorage.setItem("plurx_decode_limits", JSON.stringify(l)); }catch(e){}
+}
+function clearDecodeLimit(src){
+  const k=decodeLimitKey(src); if(!k) return false;
+  try{ const l=decodeLimits(); if(!(k in l)) return false;
+       delete l[k]; localStorage.setItem("plurx_decode_limits", JSON.stringify(l)); return true;
+  }catch(e){ return false; }
+}
+// Seconds of video this element has actually PLAYED — pauses and stalls do
+// not count, which is what makes it the right observation clock for a
+// decode-margin judgement.
+function playedSecs(v){
+  let s=0; try{ for(let i=0;i<v.played.length;i++) s+=v.played.end(i)-v.played.start(i); }catch(e){}
+  return s;
 }
 // Buffer targets in SECONDS, bounded by BYTES — and the bytes are the point.
 //
@@ -3015,7 +3090,7 @@ function stopPlayerTimers(){
 function clearStall(){ if(PLAYER&&PLAYER.stallTimer){ clearTimeout(PLAYER.stallTimer); PLAYER.stallTimer=null; } }
 // Rescue path: the browser rejected a remux/direct stream outright, so restart
 // this playback as a server transcode (guaranteed-compatible H.264/AAC HLS).
-async function startTranscodeFallback(){
+async function startTranscodeFallback(reason){
   const v=document.getElementById("video");
   if(!PLAYER || !PLAYER.fileId || !v) return;
   const startSec=(PLAYER.offset||0)+(v.currentTime||0);
@@ -3023,13 +3098,48 @@ async function startTranscodeFallback(){
   // was not enough — a seek mutates PLAYER in place rather than replacing it, so
   // an identity check still passed and both streams attached.
   const {me, live}=streamGeneration();
-  newAttempt("fallback");
+  newAttempt(reason||"fallback");
   teardownHls();
   let info; try{ info=await openSession(me.fileId,transcodeOpts(startSec));}catch(e){ if(live()){ setLoading(false); toast(e.message); } return; }
   if(!live()) return;   // closed the player, or seeked / switched audio meanwhile
   me.method='transcode'; me.copyHls=false;
   setLoading(true,"Preparing the stream…",(info.encoder?("encoder: "+info.encoder+" — "):"")+"transcoding instead of remuxing");
   armStall(attachSession(v, me, info, startSec));
+}
+// The decode-margin rescue, run from the 5s tick. When an AUTO session on a
+// copy path has measured itself out of decoder headroom AND the viewer is
+// seeing hitches, switch this session to a transcode at position and remember
+// the limit so the next Auto play routes straight there. Explicit quality
+// choices are never overridden: Original means Original, stutters and all —
+// and an explicit-Original session that measures comfortable margin for a
+// minute CLEARS the remembered limit, so a GPU upgrade is noticed.
+function maybeDecodeRescue(){
+  const p=PLAYER, v=document.getElementById("video");
+  if(!p || !v || !p.started || !p.hitches || v.paused) return;
+  if(p.method!=='remux' && p.method!=='direct_play') return;
+  const h=p.hitches, secs=playedSecs(v), q=qualityForce();
+  if(q==='original'){
+    if(h.fps && h.decodeMs!=null && secs>=MARGIN_CLEAR_SECS
+       && h.decodeMs < (1000/h.fps)*MARGIN_GOOD && clearDecodeLimit(p.source)){
+      clientLog(Object.assign({level:"info",event:"decode_limit_cleared",
+        message:`this device now decodes ${decodeLimitKey(p.source)} with margin `+
+                `(${h.decodeMs}ms against ${(1000/h.fps).toFixed(1)}ms) — Auto may use Original again`},
+        playbackContext()));
+    }
+    return;
+  }
+  if(q!=='auto' || p.decodeRescued) return;
+  const verdict=decodeMarginVerdict(h, secs);
+  if(!verdict) return;
+  p.decodeRescued=true;
+  rememberDecodeLimit(p.source, verdict.decodeMs, verdict.budgetMs);
+  clientLog(Object.assign({level:"warn",event:"decode_rescue",
+    detail:`decode=${verdict.decodeMs}ms budget=${verdict.budgetMs}ms events=${verdict.events}`,
+    message:`this device decodes ${decodeLimitKey(p.source)||'this stream'} at `+
+            `${verdict.decodeMs}ms against a ${verdict.budgetMs}ms frame budget — `+
+            `no headroom, switching to transcode`}, playbackContext()));
+  toast("Original is at this device's decode limit — switching to optimized");
+  startTranscodeFallback("decode-rescue");
 }
 // Arm the watchdog for a stream we have just (re)started at `fromSec`. Recording
 // the intended position is what makes this work after a *seek*: the old check
@@ -4011,11 +4121,17 @@ function updateStats(){
     `<div><b>Method</b>${esc(method)}</div>`+
     // Said outright, because the two transports are different code paths in
     // the browser and "which one ran" was previously only inferable from
-    // which other rows happened to be missing.
+    // which other rows happened to be missing. The wire container is named
+    // honestly: a transcode ships MPEG-TS segments that hls.js transmuxes,
+    // a copy ships fMP4 that goes to the SourceBuffer untouched — and that
+    // difference mattered to the stutter investigation (STUTTER-4K.md §4).
     `<div><b>Transport</b><span class="muted">${
-      PLAYER.hls ? "segmented fMP4 · MediaSource"
-      : (PLAYER.copyHls||PLAYER.sessionId) ? "segmented fMP4 · native HLS"
-      : "one continuous file · range requests"}</span></div>`+
+      PLAYER.hls ? (PLAYER.method==='transcode'
+          ? "segmented MPEG-TS · MediaSource (hls.js transmuxes)"
+          : "segmented fMP4 · MediaSource")
+      : (PLAYER.copyHls||PLAYER.sessionId)
+        ? `segmented ${PLAYER.method==='transcode'?'MPEG-TS':'fMP4'} · native HLS`
+        : "one continuous file · range requests"}</span></div>`+
     ((PLAYER.reasons&&PLAYER.reasons.length)?`<div><b>Reason</b>${esc(PLAYER.reasons.join("; "))}</div>`:"")+
     `<div><b>Position</b>${clockFromSec((PLAYER.offset||0)+(v.currentTime||0))}${durTxt}${rate}</div>`+
     `<div class="sechd">Source</div>`+
@@ -4046,9 +4162,20 @@ function updateStats(){
     (PLAYER.hls&&PLAYER.hls.config?`<div><b>Buffer target</b><span class="muted">${
       PLAYER.hls.config.maxBufferLength}s ahead · ${PLAYER.hls.config.backBufferLength}s behind${
       PLAYER.bufferLimits&&PLAYER.bufferLimits.quota?` · ${PLAYER.bufferLimits.quota} quota refusals`:''}</span></div>`:'')+
-    (PLAYER.decodeInfo?`<div><b>Decoder</b><span${PLAYER.decodeInfo.hw?'':' style="color:var(--warn,#fbbf24)"'}>${
-      PLAYER.decodeInfo.hw?'hardware':'software — this machine has no GPU path for this stream'}${
-      PLAYER.decodeInfo.smooth?'':' · browser does not expect it to be smooth'}</span></div>`:'')+
+    (PLAYER.decodeInfo?(()=>{
+      // The measured margin, next to the browser's own claim — because the
+      // claim was `powerEfficient: true` on the exact session whose median
+      // decode equalled the frame budget. The measurement outranks it.
+      const h=PLAYER.hitches; let margin='';
+      if(h&&h.decodeMs!=null&&h.fps){
+        const b=1000/h.fps, hot=h.decodeMs>=b*MARGIN_BAD;
+        margin=` · <span${hot?' style="color:var(--warn,#fbbf24)"':' class="muted"'}>${
+          h.decodeMs.toFixed(0)}ms/frame against a ${b.toFixed(0)}ms budget${hot?' — no headroom':''}</span>`;
+      }
+      return `<div><b>Decoder</b><span${PLAYER.decodeInfo.hw?'':' style="color:var(--warn,#fbbf24)"'}>${
+        PLAYER.decodeInfo.hw?'hardware':'software — this machine has no GPU path for this stream'}${
+        PLAYER.decodeInfo.smooth?'':' · browser does not expect it to be smooth'}</span>${margin}</div>`;
+    })():'')+
     `<div><b>Buffer</b>${buf}</div>`+
     (net? `<div class="sechd">Network</div>`+net : '')+
     (srv? `<div class="sechd">Server</div>`+srv : '');

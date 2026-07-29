@@ -219,6 +219,39 @@ even the copy path can't hand to the browser).
 browser rejected a cheaper stream. `Method: Transcode` with a "video codec …"
 or "HDR …" reason is a real, up-front transcode verdict.
 
+## The decode-margin rescue — routing around a decoder with no headroom
+
+The error fallback catches streams the browser *refuses*. This one catches
+streams the browser accepts and then cannot sustain — found the hard way
+([STUTTER-4K.md](STUTTER-4K.md) §5.3): a client whose median decode of a 4K
+HEVC remux was 41.6 ms against a 41.7 ms frame budget, hardware-decoding at
+exactly realtime, surfacing every decoder spike as a held frame. The
+browser's own `mediaCapabilities` claim was `powerEfficient: true` for that
+stream; the measurement outranks the claim.
+
+The player measures per-frame decode cost (`requestVideoFrameCallback`
+`processingDuration`, median over a rolling window) and, on an **Auto**
+session playing a copy path, rescues when all three hold: 20 s of actual
+playback observed, at least 4 visible hitch events, and a median decode at
+or over 80% of the frame budget. The rescue is the same
+`startTranscodeFallback()` restart-at-position as the error path, once per
+session, and it writes a `decode_rescue` beacon with the numbers.
+
+The verdict is remembered per `codec@height` in the browser
+(`plurx_decode_limits`), so the next Auto play of a matching stream routes
+straight to a transcode — the Reason row says so, with the measured numbers.
+Two things keep the memory honest: an explicit **Quality → Original** always
+wins (the limit only steers Auto, never the viewer), and an
+explicit-Original session that measures comfortable margin — under 60% of
+budget for 60 s — clears the entry and logs `decode_limit_cleared`, so a GPU
+upgrade is noticed rather than distrusted forever.
+
+**How to read it:** the stats overlay's Decoder row shows the measurement
+live (`hardware · 42ms/frame against a 42ms budget — no headroom`); a
+`Reason` beginning "this device measured …" is the remembered limit
+steering an Auto session; `decode_rescue` / `decode_limit_cleared` lines in
+the perf report are the same events server-side.
+
 ## Resume & progress
 
 - **Resume** rides the same input-seek on every path: `?start=<seconds>` on
