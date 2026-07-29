@@ -1018,11 +1018,23 @@ function authShell(title, sub, fields, btn, onsubmit){
     try{ await onsubmit(); }catch(err){ document.getElementById("aerr").textContent=err.message; b.disabled=false; }
   });
 }
+// The first account, and the one place a typo is unrecoverable from inside the
+// product: there is no other admin to reset it and no email to recover to. A
+// mistyped password here locks the owner out of their own server, and the only
+// way back is `plurxd reset-password` on the console — which someone who just
+// installed this has no reason to know exists. Hence the confirm field, and
+// hence the length check running here rather than only at the server: the
+// server's "at least 8 characters" arrives as a red line under a form whose
+// contents are already gone.
 function renderSetup(){
   authShell("Welcome","Create your admin account to get started.",
     `<label>Username</label><input id="u" autocomplete="username" required>
-     <label>Password</label><input id="p" type="password" autocomplete="new-password" required placeholder="at least 8 characters">`,
+     <label>Password</label><input id="p" type="password" autocomplete="new-password" required placeholder="at least 8 characters">
+     <label>Confirm password</label><input id="p2" type="password" autocomplete="new-password" required placeholder="type it again">`,
     "Create account", async()=>{
+      if(u.value.trim()==="") throw new Error("Pick a username.");
+      if(p.value.length<8) throw new Error("Password must be at least 8 characters.");
+      if(p.value!==p2.value){ p2.value=""; p2.focus(); throw new Error("Those two passwords don't match. Try again."); }
       const r=await api("/setup",{method:"POST",body:{username:u.value.trim(),password:p.value}});
       TOKEN=r.token; localStorage.setItem("plurx_token",TOKEN); ME=r.user; location.hash="#/"; render();
     });
@@ -3962,6 +3974,7 @@ function usersPanel(users){
       <h2 class="section">Add user</h2>
       <div class="row"><input id="un" placeholder="Username" style="max-width:180px" autocomplete="off">
         <input id="up" placeholder="Password (min 8)" type="password" style="max-width:200px" autocomplete="new-password">
+        <input id="up2" placeholder="Confirm password" type="password" style="max-width:200px" autocomplete="new-password">
         <label class="row" style="margin:0;font-size:13px;color:var(--muted)"><input type="checkbox" id="ua" style="width:auto"> admin</label></div>
       <div class="err" id="uerr"></div>
       <button style="margin-top:12px" onclick="addUser()">Add user</button></div>`;
@@ -4304,12 +4317,27 @@ function userRow(u){
 async function addUser(){
   const username=un.value.trim(), password=up.value, is_admin=ua.checked;
   const err=document.getElementById("uerr"); err.textContent="";
+  // Cheaper to catch here than to have someone discover it at their first
+  // sign-in — a mistyped password creates an account nobody can get into,
+  // and the person who has to fix it isn't the one who made the mistake.
+  if(!username){ err.textContent="Pick a username."; return; }
+  if(password.length<8){ err.textContent="Password must be at least 8 characters."; return; }
+  if(password!==up2.value){ up2.value=""; up2.focus(); err.textContent="Those two passwords don't match."; return; }
   try{ await api("/users",{method:"POST",body:{username,password,is_admin}}); toast("User added"); viewSettings(); }
   catch(e){ err.textContent=e.message; }
 }
 async function resetPw(id, name){
   const pw=prompt(`New password for ${name} (min 8 characters). Their current sessions will be signed out.`);
   if(pw==null) return;
+  if(pw.length<8){ toast("Password must be at least 8 characters."); return; }
+  // Asked twice for the same reason the other two forms have a confirm field,
+  // and it matters more here: this signs every one of their sessions out, so a
+  // typo doesn't just set a password nobody knows — it takes away the one they
+  // were already using.
+  if(prompt(`Type it again to confirm the new password for ${name}.`)!==pw){
+    toast("Those two passwords don't match — nothing was changed.");
+    return;
+  }
   try{ await api(`/users/${id}`,{method:"PUT",body:{password:pw}}); toast("Password reset"); }catch(e){ toast(e.message); }
 }
 async function setAdmin(id, makeAdmin){
