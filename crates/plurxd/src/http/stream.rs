@@ -742,6 +742,13 @@ pub async fn stream_mp4(
     // `hev1`-tagged MKV copy otherwise plays audio-only / black in Safari).
     let hevc = matches!(file.video_codec.as_deref(), Some("hevc" | "h265"));
     let readrate = readrate_setting(&state).await;
+    // A remux copies the video untouched, so the wire and the source read both
+    // have to carry the file's own bitrate, sustained, for its whole length.
+    // Say up front whether that is even possible on this storage. A source the
+    // box cannot read fast enough reaches the viewer as a *stall*, which is
+    // indistinguishable at the client from a slow encoder or a slow link — and
+    // sends everyone to look at the two halves that are working.
+    log_source_headroom(&state, &file, readrate).await;
     // Register before spawning so the player's first status poll — which it
     // makes as soon as the overlay opens, possibly before a frame lands — finds
     // the stream rather than a 404 it would have to distinguish from a
@@ -762,6 +769,49 @@ pub async fn stream_mp4(
         tracked,
     })
     .await
+}
+
+/// Log what this file's storage can deliver against what the file needs.
+///
+/// Emitted once per remux start rather than sampled during one: the numbers
+/// come from the boot probe, so repeating them per chunk would add noise
+/// without adding a measurement. `warn` only when the margin is genuinely
+/// thin, because a line that fires on every healthy 4K start is one people
+/// filter out before it ever matters.
+async fn log_source_headroom(state: &AppState, file: &MediaFile, readrate: f64) {
+    let (Some(bitrate), storage) = (file.bitrate, state.storage.read().await) else {
+        return;
+    };
+    let bitrate = bitrate as f64;
+    let Some(mount) = storage.for_path(std::path::Path::new(&file.path)) else {
+        return;
+    };
+    let Some(headroom) = mount.realtime_multiple(bitrate) else {
+        return;
+    };
+    // Under 1x the source cannot be read as fast as it must be played, and no
+    // client buffer, encoder setting or pacing value can rescue that. Under
+    // the configured readrate it can still play, but it can never build the
+    // reserve that absorbs a hiccup — which is the shape of a stream that
+    // works until the moment anything else touches the same link.
+    if headroom < 1.2 {
+        tracing::warn!(
+            file = %file.path.display(),
+            source_mbps = bitrate / 1e6,
+            storage_mbps = mount.read_bps.unwrap_or_default() / 1e6,
+            headroom = headroom,
+            "remux source is at or beyond what its storage can read — this will stall"
+        );
+    } else if headroom < readrate {
+        tracing::info!(
+            file = %file.path.display(),
+            source_mbps = bitrate / 1e6,
+            storage_mbps = mount.read_bps.unwrap_or_default() / 1e6,
+            headroom = headroom,
+            readrate = readrate,
+            "remux cannot reach the configured pace from this storage — it will run at the storage's rate and build no reserve"
+        );
+    }
 }
 
 /// GET /api/v1/stream/:id/status — how a progressive remux is doing.
