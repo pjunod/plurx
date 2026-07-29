@@ -92,10 +92,31 @@
   .rowscroll{display:grid;grid-auto-flow:column;grid-auto-columns:var(--poster,120px);gap:16px;overflow-x:auto;padding-bottom:8px;align-items:stretch;scrollbar-width:none}
   .rowscroll::-webkit-scrollbar{height:0}
   .rowscroll::-webkit-scrollbar-thumb{border-radius:8px;background:transparent}
+  /* The arrows are the affordance and the scrollbar is the control. A rail
+     that only reveals its scrollbar on hover is clean at rest but says
+     nothing about being scrollable, so the arrows sit there permanently —
+     that is the thing someone sees before they have moved the mouse.
+     Hovering anywhere in the row (arrows included, hence the wrapper rather
+     than the strip) brings the bar up for anyone who would rather drag. */
+  .railbox{position:relative}
+  .railarrow{position:absolute;top:0;bottom:8px;width:52px;display:none;
+    align-items:center;justify-content:center;border:0;padding:0;cursor:pointer;
+    color:var(--text);font-size:26px;line-height:1;z-index:2;
+    opacity:.55;transition:opacity .12s}
+  .railarrow:hover{opacity:1}
+  /* A scrim rather than a solid button: cards sliding under a fade read as
+     "there is more that way", which a floating chevron on its own does not. */
+  .railarrow.l{left:0;background:linear-gradient(90deg,var(--bg) 45%,transparent)}
+  .railarrow.r{right:0;background:linear-gradient(270deg,var(--bg) 45%,transparent)}
+  /* Shown only in the direction there is something to scroll to, so an arrow
+     is never a button that does nothing — and neither appears at all on a
+     rail short enough to fit. */
   @media(hover:hover){
-    .rowscroll:hover{scrollbar-width:thin;scrollbar-color:color-mix(in srgb,var(--text) 26%,transparent) transparent}
-    .rowscroll:hover::-webkit-scrollbar{height:8px}
-    .rowscroll:hover::-webkit-scrollbar-thumb{background:color-mix(in srgb,var(--text) 22%,transparent)}
+    .railbox.can-l .railarrow.l,
+    .railbox.can-r .railarrow.r{display:flex}
+    .rowscroll:hover,.railbox:hover .rowscroll{scrollbar-width:thin;scrollbar-color:color-mix(in srgb,var(--text) 26%,transparent) transparent}
+    .rowscroll:hover::-webkit-scrollbar,.railbox:hover .rowscroll::-webkit-scrollbar{height:8px}
+    .rowscroll:hover::-webkit-scrollbar-thumb,.railbox:hover .rowscroll::-webkit-scrollbar-thumb{background:color-mix(in srgb,var(--text) 22%,transparent)}
   }
   .poster{background:var(--panel2);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;cursor:pointer;transition:transform .12s,border-color .12s;position:relative}
   .poster:hover{transform:translateY(-3px);border-color:var(--accent)}
@@ -1439,13 +1460,13 @@ async function viewHome(){
   let html=installBannerHtml();
   // The first two rails pass watchCtx: those rows are about where you are in
   // something, so the card carries "23m left" / "watched Tuesday".
-  if(hubs.continue_watching.length){ html+=`<h2 class="section">Continue watching</h2><div class="rowscroll">${hubs.continue_watching.map(i=>card(i,true)).join("")}</div>`; }
-  if(hubs.next_up && hubs.next_up.length){ html+=`<h2 class="section">Next up</h2><div class="rowscroll">${hubs.next_up.map(i=>card(i,true)).join("")}</div>`; }
-  if(hubs.recently_added.length){ html+=`<h2 class="section">Recently added</h2><div class="rowscroll">${hubs.recently_added.map(i=>card(i)).join("")}</div>`; }
+  if(hubs.continue_watching.length){ html+=rail("Continue watching", hubs.continue_watching.map(i=>card(i,true)).join("")); }
+  if(hubs.next_up && hubs.next_up.length){ html+=rail("Next up", hubs.next_up.map(i=>card(i,true)).join("")); }
+  if(hubs.recently_added.length){ html+=rail("Recently added", hubs.recently_added.map(i=>card(i)).join("")); }
   // Coming soon: what monarr expects. Absent entirely when nothing is paired
   // or monarr had nothing to say — an empty rail is worse than no rail.
   if(soon && soon.entries && soon.entries.length){
-    html+=`<h2 class="section">Coming soon</h2><div class="rowscroll">${soon.entries.map(comingCard).join("")}</div>`;
+    html+=rail("Coming soon", soon.entries.map(comingCard).join(""));
   }
   if(libs.length){
     const group=homeGroup();
@@ -1474,7 +1495,54 @@ async function viewHome(){
     html+=`<div class="empty">No libraries yet.${ME.is_admin?' Add one in <a href="#/settings">Settings</a>.':''}</div>`;
   }
   document.getElementById("main").innerHTML=html||`<div class="empty">Nothing here yet.</div>`;
+  wireRails();
 }
+// One rail: a heading, and a strip with an arrow at each end.
+//
+// A helper rather than four copies of the markup, because the arrows need a
+// wrapper the strip cannot provide — they are positioned against it, and the
+// hover that reveals the scrollbar has to cover them too.
+function rail(heading, cards){
+  return `<h2 class="section">${heading}</h2>
+    <div class="railbox">
+      <button class="railarrow l" aria-label="Scroll left" onclick="railScroll(this,-1)">‹</button>
+      <div class="rowscroll">${cards}</div>
+      <button class="railarrow r" aria-label="Scroll right" onclick="railScroll(this,1)">›</button>
+    </div>`;
+}
+// Just under a full view, so the card at the edge stays on screen and you keep
+// your place. A whole-width jump loses the thing you were looking at, which is
+// the complaint people have about carousels that page.
+function railScroll(btn, dir){
+  const strip=btn.parentElement.querySelector(".rowscroll"); if(!strip) return;
+  strip.scrollBy({left:dir*Math.max(160,strip.clientWidth*0.85),behavior:"smooth"});
+}
+// Which arrows apply right now. Recomputed on scroll and on resize: a window
+// that grows can turn a scrollable rail into one that fits, and an arrow that
+// scrolls nothing is worse than no arrow.
+function railSync(box){
+  const strip=box.querySelector(".rowscroll"); if(!strip) return;
+  // A pixel of slack: fractional scroll positions and subpixel layout mean
+  // scrollLeft rarely lands exactly on the end, and testing for equality
+  // leaves a live arrow at the last position of every rail.
+  const max=strip.scrollWidth-strip.clientWidth;
+  box.classList.toggle("can-l", strip.scrollLeft>1);
+  box.classList.toggle("can-r", strip.scrollLeft<max-1);
+}
+// Called after any render that emits rails. Idempotent: a re-render replaces
+// the elements, so the flag rides on the node and dies with it — no listener
+// outlives the DOM it was attached to, and no rail gets wired twice.
+function wireRails(){
+  for(const box of document.querySelectorAll(".railbox")){
+    if(box._wired) continue;
+    box._wired=true;
+    const strip=box.querySelector(".rowscroll");
+    if(strip) strip.addEventListener("scroll",()=>railSync(box),{passive:true});
+    if(window.ResizeObserver){ new ResizeObserver(()=>railSync(box)).observe(box); }
+    railSync(box);
+  }
+}
+window.addEventListener("resize",()=>document.querySelectorAll(".railbox").forEach(railSync),{passive:true});
 // "" means "whatever suits this library" — home libraries are about when
 // something happened, everything else about what it is called. An explicit
 // pick from the dropdown wins from then on.
