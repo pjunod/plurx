@@ -968,7 +968,32 @@ a fallback but the correct answer.
 
 Aggregated in SQL, one scan, on its own route rather than as a field on
 `/system` — the settings page polls `/system` every few seconds, and a table
-scan behind a UI timer is a different kind of mistake. `vpp_qsv` passed nynuc's boot probe at **4.88–4.89× the CPU chain**,
+scan behind a UI timer is a different kind of mistake.
+
+**Measured on nuc4, 2026-07-29 — and the answer is 24%.** 5427 probed files,
+1359 of them 4K:
+
+| | 4K files | share |
+| --- | --- | --- |
+| Dolby Vision | 614 | 45.2% |
+| SDR | 555 | 40.8% |
+| HDR10 | 190 | 14.0% |
+
+Of **804 4K HDR files the GPU tone-map can take 190**. The other 614 are Dolby
+Vision and go to the CPU chain — correctly, not as a fallback, and entirely
+unaffected by M2's speedup.
+
+So M2 is real and M2 is narrow. The graph does what §5 said it does, on a
+quarter of the 4K HDR in this library. That does not make it wrong to have
+built — a 4.9x tone-map on 190 titles is 190 titles — but "4K HDR is fast now"
+was never the claim the probe supported, and on this library it would have been
+three-quarters false. **The pre-transcode cache (M3) is the lever for the other
+614**, because a cached Dolby Vision title pays the CPU chain once, overnight,
+instead of every time somebody presses play.
+
+Two more numbers worth keeping from the same run: 186 files sit at or above the
+40 Mb/s segmented-remux floor (§4.3bis), the largest at 98 Mb/s; and the codec
+split is 58% H.264, 37% HEVC, with 96 AV1 files already on disk. `vpp_qsv` passed nynuc's boot probe at **4.88–4.89× the CPU chain**,
 above the ≥3× objective. Every node reports its own verdicts on Settings →
 System and in `/api/v1/system`.
 

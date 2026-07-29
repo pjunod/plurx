@@ -141,7 +141,7 @@ def node_section(out, sys_info):
         out("  M2: the probe never ran, so nothing is known about GPU tone-mapping here.")
 
 
-def log_section(out, logs, cache_settings):
+def log_section(out, logs, cache_settings, srv=None):
     """What actually ran, and what the browsers measured."""
     lines = [clean(e.get("message", "")) for e in logs]
 
@@ -150,8 +150,15 @@ def log_section(out, logs, cache_settings):
         m = re.search(rf'\b{name}="([^"]*)"', line) or re.search(rf"\b{name}=(\S*)", line)
         return m.group(1) if m else "?"
 
+    # TWO kinds of session write an ffmpeg command line, and this used to look
+    # for one of them. A copy-video HLS session — which is what a big remux
+    # takes since §4.3bis — logs "copy-video HLS ffmpeg args:", so a report
+    # taken while one was running said "transcode sessions in the log ring: 0"
+    # and printed no command at all. The exact thing the report exists to
+    # surface was the one thing it could not see.
     ran = [l for l in lines if "transcode ffmpeg args:" in l]
-    out(f"transcode sessions in the log ring: {len(ran)}")
+    copies = [l for l in lines if "copy-video HLS ffmpeg args:" in l]
+    out(f"encode sessions in the log ring: {len(ran)} transcode · {len(copies)} copy-video")
     seen = {}
     for l in ran:
         key = (field(l, "encoder"), field(l, "pipeline"), field(l, "proven"))
@@ -159,6 +166,9 @@ def log_section(out, logs, cache_settings):
     for (encoder, pipeline, proven), n in sorted(seen.items(), key=lambda kv: -kv[1]):
         note = "" if pipeline == proven or proven == "?" else f" (node proved {proven})"
         out(f"  {n:4d} × encoder={encoder} · pipeline={pipeline}{note}")
+    if copies:
+        out(f"  {len(copies):4d} × copy-video (source video untouched; audio re-encoded "
+            "only if the browser can't take it)")
 
     # Why a session did not get the graph this node proved. Usually a correct
     # answer — Dolby Vision cannot go through a vendor tone-map — and without
@@ -177,8 +187,36 @@ def log_section(out, logs, cache_settings):
 
     if ran:
         out("")
-        out("  most recent command (this is what production ran):")
+        out("  most recent transcode command (this is what production ran):")
         out("    " + ran[-1][:2000])
+    if copies:
+        out("")
+        out("  most recent copy-video command (this is what production ran):")
+        out("    " + copies[-1][:2000])
+        # `-hls_time` is a REQUEST on this path, not a setting. `-c copy` can
+        # only cut where the source already has a key frame, so a disc remux
+        # keyed every 5-10s produces 5-10s segments however small a number is
+        # asked for — and nothing plays until a whole segment exists. Measured
+        # from the session's own playlist rather than assumed, when it is still
+        # alive to ask.
+        sid = field(copies[-1], "session_id")
+        if sid != "?":
+            st, body = srv.call(f"/hls/{sid}/index.m3u8", raw=True)
+            if st == 200 and isinstance(body, (bytes, bytearray)):
+                durs = [d for _, d in parse_playlist(body.decode(errors="replace"))]
+                if durs:
+                    want = 2.0
+                    sd = sorted(durs)
+                    out("")
+                    out(f"  segments it actually produced: {len(durs)} · "
+                        f"median {sd[len(sd)//2]:.2f}s · min {sd[0]:.2f}s · max {sd[-1]:.2f}s")
+                    if sd[len(sd) // 2] > want * 1.5:
+                        out(f"    ⚠ asked for {want:.0f}s. A copy can only cut on the source's own")
+                        out("      key frames, so this is the source's key-frame interval, not a")
+                        out("      setting. Nothing plays until a whole segment exists, and every")
+                        out("      seek lands at one of these boundaries.")
+            else:
+                out(f"  (session {sid[:8]} has already gone, so no segment lengths)")
 
     downgrades = [l for l in lines if "downgrad" in l.lower() or "falling back" in l.lower()]
     if downgrades:
@@ -640,7 +678,7 @@ def main():
     storage_section(out, sys_info, settings if isinstance(settings, dict) else {})
     out("")
     out("-- what ran, and what it cost --------------------------------------")
-    log_section(out, logs, settings if isinstance(settings, dict) else {})
+    log_section(out, logs, settings if isinstance(settings, dict) else {}, srv)
 
     if rc_lines:
         out("")
