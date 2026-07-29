@@ -2491,9 +2491,30 @@ const CAPS_Q=`vcodec=${PLAY_CAPS.vcodec}&acodec=${PLAY_CAPS.acodec}&container=${
 // Manual quality override (player menu), persisted per browser. Auto runs the
 // automatic ladder; Original never transcodes video (direct/remux only); a
 // height forces a transcode at that size.
-const QUALITIES=[["auto","Auto"],["original","Original"],["1080","1080p"],["720","720p"],["480","480p"]];
+// "Original · one stream" is a TRANSPORT choice, not a quality one, and it is
+// here because this menu is where a viewer already changes how a title is
+// being delivered.
+//
+// A remux above §4.3bis's floor is cut into fMP4 fragments and fed through
+// MediaSource; below it, the same remux is one continuous file served by range
+// request. Those are very different code paths in the browser, and the only
+// way to compare them on the SAME title at the SAME bitrate is to be able to
+// ask for the second one. Without it, testing "is it the segmenting?" means
+// finding a different film with a lower bitrate and accepting two variables at
+// once, which is how a whole day gets spent eliminating the wrong things.
+const QUALITIES=[["auto","Auto"],["original","Original"],["nomse","Original · one stream"],
+                 ["1080","1080p"],["720","720p"],["480","480p"]];
 function playQuality(){ try{ return localStorage.getItem("plurx_quality")||"auto"; }catch(e){ return "auto"; } }
-function qualityForce(){ const q=playQuality(); return q==="auto"?"auto":(q==="original"?"original":"transcode"); }
+function qualityForce(){
+  const q=playQuality();
+  if(q==="auto") return "auto";
+  // Same server-side decision as Original: this only changes how the client
+  // carries the result.
+  return (q==="original"||q==="nomse")?"original":"transcode";
+}
+// The viewer has asked for one continuous stream, so decline the segmented
+// transport however attractive the server thinks it is.
+function noSegments(){ return playQuality()==="nomse"; }
 // The rung a transcode should run at, or null for Auto — which is not a
 // number this side can compute. Auto depends on which encoder the server ends
 // up using, and the player only finds that out in the response to the request
@@ -2690,6 +2711,7 @@ function mseCanTake(srcCodec, audioCodec){
 // which is stuttery on a big file, but stuttery is recoverable and black is not.
 function segmentedRemuxOk(decision, video){
   if(!decision || !decision.prefer_segmented) return false;
+  if(noSegments()) return false;             // the viewer asked for one stream
   if(!(window.Hls && Hls.isSupported())) return false;
   if(useNativeHls(video)) return false;      // Safari already routes here below
   const src=decision.source||{};
@@ -3946,6 +3968,13 @@ function updateStats(){
   body.innerHTML=
     `<div class="sechd">Playback</div>`+
     `<div><b>Method</b>${esc(method)}</div>`+
+    // Said outright, because the two transports are different code paths in
+    // the browser and "which one ran" was previously only inferable from
+    // which other rows happened to be missing.
+    `<div><b>Transport</b><span class="muted">${
+      PLAYER.hls ? "segmented fMP4 · MediaSource"
+      : (PLAYER.copyHls||PLAYER.sessionId) ? "segmented fMP4 · native HLS"
+      : "one continuous file · range requests"}</span></div>`+
     ((PLAYER.reasons&&PLAYER.reasons.length)?`<div><b>Reason</b>${esc(PLAYER.reasons.join("; "))}</div>`:"")+
     `<div><b>Position</b>${clockFromSec((PLAYER.offset||0)+(v.currentTime||0))}${durTxt}${rate}</div>`+
     `<div class="sechd">Source</div>`+
