@@ -255,6 +255,26 @@ def log_section(out, logs, cache_settings, srv=None):
     # whole point: `supply` ran out of buffered video and is a server or link
     # problem; `decode` had video in hand and could not play it, which is the
     # browser and which no amount of pacing will improve.
+    # Frame-level hitches: the artifact that is smaller than every aggregate.
+    # A count alone says little; the SPACING says which subsystem it tracks —
+    # segment cadence, a timer, or the decoder.
+    hitch = [l for l in lines if " hitch " in l or "event=hitch" in l or "[back=" in l]
+    if hitch:
+        out("")
+        out(f"  ⚠ {len(hitch)} hitch beacon(s) — frames stepping backwards, being held on")
+        out("    screen, or being skipped: below the 350ms a stall needs and invisible to")
+        out("    every other counter here.")
+        out("      back = the media clock moved backwards (a resync)")
+        out("      held = the same frame presented twice (the picture stopped for a beat)")
+        out("      skip = media time moved past frames that never reached the screen")
+        out("      slow = the frame arrived, but decode took over 40ms")
+        out("    A hitch also carries what the player was doing within 150ms of it —")
+        out("    a buffer flush, a segment boundary, an append — and the skew between")
+        out("    the frame on screen and the element's own clock, which is the audio")
+        out("    clock whenever there is audio.")
+        for l in hitch[-3:]:
+            out("    " + l[:240])
+
     # Buffer-quota beacons. hls.js asks for a target in seconds; the browser
     # enforces a limit in BYTES that no setting can raise. When the two
     # disagree the result is an append/evict cycle that hitches near the

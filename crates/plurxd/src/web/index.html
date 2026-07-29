@@ -1021,6 +1021,22 @@ function endWait(resumed){
 // 4K forward buffer and the number the buffer settings can't argue with. Rate
 // limited per session — a full buffer re-fires on every append attempt, and a
 // thousand identical log lines would bury the first one.
+// Reported once a pattern exists rather than per hitch: one beacon per frame
+// would be a denial of service on the log ring, and a single hitch is noise —
+// what identifies a cause is the count and the spacing.
+function reportHitches(){
+  const p=PLAYER; if(!p||!p.hitches) return;
+  const h=p.hitches, n=h.back+h.held+h.gap;
+  if(n<5 || p._hitchReported===n) return;
+  if(n!==5 && n%50!==0) return;
+  p._hitchReported=n;
+  const iv=hitchInterval();
+  const blame=hitchBlame();
+  clientLog(Object.assign({level:"warn",event:"hitch",
+    detail:`back=${h.back} held=${h.held} skip=${h.gap} slow=${h.slow}${h.fps?` fps=${h.fps.toFixed(2)}`:''}`,
+    message:`${n} frame hitches${iv?`, one every ~${iv.toFixed(1)}s`:''}${blame?` — ${blame}`:''} — ${h.last||''}`},
+    playbackContext()));
+}
 function reportBufferLimit(kind, d){
   const p=PLAYER; if(!p) return;
   p.bufferLimits=p.bufferLimits||{};
@@ -2306,6 +2322,26 @@ function attachHls(video, playlistUrl, startAt){
     hls.loadSource(playlistUrl);
     hls.attachMedia(video);
     hls.on(Hls.Events.MANIFEST_PARSED,()=>video.play().catch(()=>{}));
+    // Timestamps for the hitch detector to blame things on. A count of hitches
+    // says the picture stuttered; only an attribution says which subsystem to
+    // fix, and these three are the only things happening on a cadence that
+    // could plausibly produce one every few seconds:
+    //   flush   hls.js asking the browser to DROP buffered video. It does this
+    //           to honour backBufferLength and again whenever the quota bites,
+    //           and a removal that lands near the playhead is visible.
+    //   frag    a segment boundary — 1.75s apart on this source.
+    //   append  new data handed to the SourceBuffer.
+    if(Hls.Events.BUFFER_FLUSHING) hls.on(Hls.Events.BUFFER_FLUSHING,(_,d)=>{
+      markEvent("flush");
+      const p=PLAYER; if(!p||!p.marks) return;
+      // How far BEHIND the picture the eviction ended. A few seconds is the
+      // interesting case: that is the browser being asked to free memory in
+      // the region the decoder is still working in.
+      const end=d&&isFinite(d.endOffset)?d.endOffset:null;
+      p.marks.flushEdge=end==null?null:+((video.currentTime||0)-end).toFixed(1);
+    });
+    if(Hls.Events.FRAG_CHANGED) hls.on(Hls.Events.FRAG_CHANGED,()=>markEvent("frag"));
+    if(Hls.Events.BUFFER_APPENDED) hls.on(Hls.Events.BUFFER_APPENDED,()=>markEvent("append"));
     // Buffer pressure, classified. "It stopped buffering" has four unrelated
     // causes and they need different fixes: the browser refusing more data
     // (quota — the ceiling we cannot raise), an append that failed for another
@@ -2568,8 +2604,9 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
   // Once, per playback, as soon as the element knows what it is decoding.
   probeDecode();
   video.addEventListener("loadedmetadata", probeDecode, {once:true});
+  armHitchDetector(video);
   clearInterval(PLAYER.timer);
-  PLAYER.timer=setInterval(()=>reportProgress(fileId), 5000);
+  PLAYER.timer=setInterval(()=>{ reportProgress(fileId); reportHitches(); }, 5000);
   video.onended=()=>{ handleEnded(fileId).catch(()=>{}); };
   pbTick(); pbSyncPlayIcon();   // seed the transport (total time, play icon) at once
   playerActivity();
@@ -2661,6 +2698,155 @@ function segmentedRemuxOk(decision, video){
   const track=(decision.audio||[]).find(a=>a.default) || (decision.audio||[])[0];
   const audio=decision.transcode_audio? "aac" : (track&&track.codec);
   return mseCanTake(src.video_codec, audio);
+}
+// Catch the hitch itself, frame by frame.
+//
+// Every aggregate on the stats panel has now come back healthy on a session
+// that visibly stutters: full buffer, hardware decode, 4 dropped frames in
+// 699, no quota refusals. That is not a contradiction — it means the artifact
+// is smaller than any of those measurements. `requestVideoFrameCallback` is
+// the only API that sees individual presented frames, so it is the only place
+// left to look.
+//
+// Four distinct faults, kept apart because they have different causes:
+//   back    the media clock moved BACKWARDS between presented frames. This is
+//           the "it repeats a frame" report, and it is what a resync looks
+//           like from the outside.
+//   held    the same frame presented again: the media clock did not advance a
+//           whole frame while the screen refreshed. Nothing was lost, but the
+//           picture stopped for a beat — the other half of "backs up a frame
+//           and then resumes", and invisible to every counter we have.
+//   gap     media time advanced past frames that were never presented at all,
+//           which `droppedVideoFrames` does not count because they were never
+//           decoded.
+//   slow    the frame arrived but took a long time to process — the decoder
+//           falling behind rather than the pipeline skipping.
+const HITCH_GAP_FRAMES=2.5;
+const HITCH_SLOW_MS=40;
+// Frames of history before any judgement. The nominal interval has to be
+// measured, not assumed: the source rate is anywhere from 23.976 to 60.
+const HITCH_WARMUP=12;
+const HITCH_WINDOW=120;
+// How close in time a player event has to be to count as the cause. Segments
+// are 1.75s apart, so a 150ms window puts the odds of an innocent coincidence
+// under one in ten — which is what makes "12 of 13 hitches landed on a flush"
+// mean something.
+const HITCH_NEAR_MS=150;
+function markEvent(kind){
+  const p=PLAYER; if(!p) return;
+  (p.marks||(p.marks={}))[kind]=performance.now();
+}
+function armHitchDetector(v){
+  if(!v.requestVideoFrameCallback) return;
+  const p=PLAYER; if(!p) return;
+  p.hitches={back:0, held:0, gap:0, slow:0, worst:0, last:null, at:[], fps:null,
+             n:0, near:{}, flushEdge:null, skewMax:0, skewAt:null};
+  let prev=null;
+  // The nominal frame interval, from HISTORY — never from the step under
+  // test. Deriving it from the current step lets a skip define itself as
+  // normal (dt over one presented frame IS the frame interval, so nothing can
+  // ever exceed it), which is how the first cut of this scored a five-frame
+  // jump as healthy. A median, because one outlier must not move it.
+  const seen=[];
+  const nominal=()=>{
+    if(seen.length<HITCH_WARMUP) return null;
+    const s=seen.slice().sort((a,b)=>a-b);
+    return s[s.length>>1];
+  };
+  const step=(now, meta)=>{
+    // Bail the moment this playback is replaced, or the callback outlives its
+    // PLAYER and starts recording another stream's frames as this one's.
+    if(PLAYER!==p) return;
+    if(prev!=null && !v.paused && !v.seeking){
+      const h=p.hitches;
+      const dt=meta.mediaTime-prev.mediaTime;
+      const dn=Math.max(1, meta.presentedFrames-prev.presentedFrames);
+      const nom=nominal();
+      if(nom) h.fps=1/nom;
+      // How far the frame ON SCREEN is from the element's own playback
+      // position. With an audio track that position IS the audio clock, so
+      // this is the A/V skew — and a renderer repeating video frames to wait
+      // for audio is the one explanation for a periodic hitch that leaves
+      // every buffer, decode and delivery counter healthy. Healthy playback
+      // sits within about a frame; a sync correction swings it and puts the
+      // swing next to the hitch that it caused.
+      const ct=(typeof v.currentTime==="number" && v.currentTime>0)?v.currentTime:null;
+      const skew=ct==null?null:meta.mediaTime-ct;
+      if(skew!=null && nom && Math.abs(skew)>Math.abs(h.skewMax)) h.skewMax=+skew.toFixed(3);
+      // What the player was doing when this frame went wrong. Called on every
+      // fault, before the counters, so the attribution covers all of them.
+      const blame=()=>{
+        h.n++;
+        if(skew!=null) h.skewAt=+skew.toFixed(3);
+        const m=p.marks||{};
+        for(const k of ["flush","frag","append"]){
+          const t=m[k];
+          if(t!=null && now-t>=0 && now-t<HITCH_NEAR_MS){
+            h.near[k]=(h.near[k]||0)+1;
+            if(k==="flush" && m.flushEdge!=null) h.flushEdge=m.flushEdge;
+          }
+        }
+      };
+      if(dt<-0.001){
+        blame();
+        h.back++; h.last=`stepped back ${(-dt*1000).toFixed(0)}ms at ${meta.mediaTime.toFixed(1)}s`;
+        h.at.push(+meta.mediaTime.toFixed(2));
+      } else if(nom && dt<nom*0.5){
+        blame();
+        h.held++; h.last=`held a frame at ${meta.mediaTime.toFixed(1)}s`;
+        h.at.push(+meta.mediaTime.toFixed(2));
+      } else if(nom && dt/nom-dn>HITCH_GAP_FRAMES){
+        blame();
+        // Frames the stream moved past that never reached the screen. Counted
+        // against `dn` on purpose: the callback can coalesce and report three
+        // frames at once, and three frames PRESENTED in one callback is the
+        // browser batching, not a stutter — the viewer saw all of them.
+        h.gap++; h.worst=Math.max(h.worst, (dt-dn*nom)*1000);
+        h.last=`skipped ${((dt-dn*nom)*1000).toFixed(0)}ms at ${meta.mediaTime.toFixed(1)}s`;
+        h.at.push(+meta.mediaTime.toFixed(2));
+      } else {
+        if(dt>0) seen.push(dt/dn);
+        if(seen.length>HITCH_WINDOW) seen.shift();
+        if(meta.processingDuration!=null && meta.processingDuration*1000>HITCH_SLOW_MS) h.slow++;
+      }
+      if(h.at.length>40) h.at.shift();
+    }
+    prev=meta;
+    v.requestVideoFrameCallback(step);
+  };
+  v.requestVideoFrameCallback(step);
+}
+// The spacing between hitches, which is the thing that identifies the cause.
+// Segments are ~1.75s here and the report is "every 5-10 seconds"; a median
+// interval says which of those it actually tracks, and neither a count nor a
+// rate can.
+function hitchInterval(){
+  const at=(PLAYER&&PLAYER.hitches&&PLAYER.hitches.at)||[];
+  if(at.length<3) return null;
+  const d=[]; for(let i=1;i<at.length;i++){ if(at[i]>at[i-1]) d.push(at[i]-at[i-1]); }
+  if(!d.length) return null;
+  d.sort((a,b)=>a-b);
+  return d[Math.floor(d.length/2)];
+}
+// The attribution, in words, and only once there is enough of it to mean
+// something. Segments arrive every 1.75s, so a 150ms window catches roughly
+// one hitch in ten by luck alone — a share well above that is a finding, and
+// anything at or below it is this line saying so by not appearing.
+function hitchBlame(){
+  const h=(PLAYER&&PLAYER.hitches)||null;
+  if(!h||!h.n||h.n<5) return "";
+  const bits=[];
+  for(const k of ["flush","frag","append"]){
+    const n=h.near[k]||0;
+    if(n*4>=h.n) bits.push(`${n}/${h.n} at a ${k==="frag"?"segment boundary":k}`);
+  }
+  if(h.near.flush && h.flushEdge!=null) bits.push(`eviction ended ${h.flushEdge}s behind the picture`);
+  // Only worth a line once it is bigger than a frame — below that it is the
+  // ordinary distance between the frame on screen and the reported position.
+  if(h.fps && Math.abs(h.skewMax)>1.5/h.fps)
+    bits.push(`clock skew up to ${(h.skewMax*1000).toFixed(0)}ms`+
+      (h.skewAt!=null?`, ${(h.skewAt*1000).toFixed(0)}ms at the last one`:''));
+  return bits.join(" · ");
 }
 // Buffer targets in SECONDS, bounded by BYTES — and the bytes are the point.
 //
@@ -3744,6 +3930,15 @@ function updateStats(){
     // software 4K HEVC decode is a full buffer, few dropped frames and
     // constant judder — indistinguishable from a delivery problem on every
     // other line of this panel.
+    (PLAYER.hitches&&(PLAYER.hitches.back||PLAYER.hitches.held||PLAYER.hitches.gap||PLAYER.hitches.slow)?
+      `<div><b>Hitches</b><span style="color:var(--warn,#fbbf24)">${
+        [PLAYER.hitches.back?`${PLAYER.hitches.back} back`:null,
+         PLAYER.hitches.held?`${PLAYER.hitches.held} held`:null,
+         PLAYER.hitches.gap?`${PLAYER.hitches.gap} skip`:null,
+         PLAYER.hitches.slow?`${PLAYER.hitches.slow} slow`:null].filter(Boolean).join(" · ")
+      }${hitchInterval()?` · every ~${hitchInterval().toFixed(1)}s`:''}</span></div>`
+      +`<div><b></b><span class="muted" style="font-size:11px">${esc(PLAYER.hitches.last||'')}</span></div>`
+      +(hitchBlame()?`<div><b></b><span class="muted" style="font-size:11px">${esc(hitchBlame())}</span></div>`:''):'')+
     (PLAYER.hls&&PLAYER.hls.config?`<div><b>Buffer target</b><span class="muted">${
       PLAYER.hls.config.maxBufferLength}s ahead · ${PLAYER.hls.config.backBufferLength}s behind${
       PLAYER.bufferLimits&&PLAYER.bufferLimits.quota?` · ${PLAYER.bufferLimits.quota} quota refusals`:''}</span></div>`:'')+
