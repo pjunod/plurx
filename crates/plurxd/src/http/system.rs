@@ -1081,6 +1081,22 @@ pub async fn activity(
         });
     }
 
+    // The pre-transcode pass. It is the only background job that holds an
+    // encoder for hours, and it was the only one that never said so: an admin
+    // who found a busy ffmpeg had no way, from inside plurx, to learn what it
+    // was or why it had chosen that file.
+    if let Some(p) = state.jobs.producing_now().await {
+        activities.push(Activity {
+            kind: "produce",
+            label: format!("Pre-transcoding {}", p.title),
+            detail: Some(format!("{} · {} of {}", p.reason, p.index, p.total)),
+            // Titles done, not percent of this encode — the encoder does not
+            // report a percentage and inventing one would be a lie that reads
+            // like a measurement.
+            percent: None,
+        });
+    }
+
     if let Some((label, detail)) = state.trakt.activity().await {
         activities.push(Activity {
             kind: "trakt",
@@ -1138,6 +1154,7 @@ pub async fn activity_detail(
     Ok(Json(serde_json::json!({
         "sessions": sessions,
         "scans": scans,
+        "producing": state.jobs.producing_now().await,
         "trakt": {
             "configured": trakt.configured,
             "linked": linked,
@@ -1145,6 +1162,24 @@ pub async fn activity_detail(
             "note": trakt.note,
         },
     })))
+}
+
+/// DELETE /api/v1/activity/producer (admin) — stop the pre-transcode pass.
+///
+/// It stops after the title it is on rather than mid-encode: the producer
+/// resumes from published segment boundaries, so a clean stop keeps the part
+/// it has already made and a kill throws it away. The next scheduled pass
+/// picks up from there.
+pub async fn stop_producer(
+    _admin: AdminUser,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if !state.jobs.stop_producing() {
+        return Err(ApiError::NotFound("producer"));
+    }
+    Ok(Json(
+        serde_json::json!({ "ok": true, "note": "stopping after the current title" }),
+    ))
 }
 
 /// DELETE /api/v1/activity/sessions/:id (admin) — stop a transcode session.

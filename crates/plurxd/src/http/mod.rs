@@ -54,6 +54,10 @@ pub fn router(state: AppState) -> Router {
             "/activity/sessions/{id}",
             axum::routing::delete(system::stop_session),
         )
+        .route(
+            "/activity/producer",
+            axum::routing::delete(system::stop_producer),
+        )
         .route("/trakt/status", get(trakt::status))
         .route("/trakt/link", post(trakt::link).delete(trakt::unlink))
         .route("/trakt/sync", post(trakt::sync_now))
@@ -226,6 +230,13 @@ mod tests {
     }
 
     fn test_app() -> Router {
+        test_app_with_state().0
+    }
+
+    /// The same app, plus the state behind it — for tests that have to put the
+    /// server into a condition a request cannot create, like a pre-transcode
+    /// pass already running.
+    fn test_app_with_state() -> (Router, AppState) {
         let store = SqliteStore::open_in_memory().expect("store");
         let base = std::env::temp_dir().join(format!("plurx-test-{}", uuid::Uuid::new_v4()));
         let state = AppState::new(
@@ -237,7 +248,7 @@ mod tests {
             Default::default(),
             Arc::new(crate::logbuf::LogBuffer::new(64)),
         );
-        router(state)
+        (router(state.clone()), state)
     }
 
     async fn call(app: &Router, req: Request<Body>) -> (StatusCode, Value) {
@@ -1871,6 +1882,91 @@ mod tests {
         let (status, body) = call(&app, get("/api/v1/activity", Some(&admin))).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.as_array().expect("array").is_empty(), "idle = empty");
+    }
+
+    // The gap this closes: a producer pass holds an encoder for up to six
+    // hours, and until it reported itself the only way to find out what a busy
+    // ffmpeg was doing — or why it had chosen that file — was `ps` on the box.
+    #[tokio::test]
+    async fn a_pre_transcode_pass_says_what_it_is_doing_and_why() {
+        let (app, state) = test_app_with_state();
+        let admin = setup_admin(&app).await;
+
+        let (_, body) = call(&app, get("/api/v1/activity", Some(&admin))).await;
+        assert!(
+            body.as_array().expect("array").is_empty(),
+            "no pass running = nothing claimed"
+        );
+
+        state
+            .jobs
+            .set_producing(Some(crate::state::ProducingNow {
+                title: "Willow".into(),
+                reason: crate::produce::REASON_IN_PROGRESS,
+                index: 2,
+                total: 12,
+            }))
+            .await;
+
+        let (status, body) = call(&app, get("/api/v1/activity", Some(&admin))).await;
+        assert_eq!(status, StatusCode::OK);
+        let acts = body.as_array().expect("array");
+        let a = acts
+            .iter()
+            .find(|a| a["kind"] == "produce")
+            .expect("the pass is in the activity feed");
+        assert!(
+            a["label"].as_str().unwrap_or_default().contains("Willow"),
+            "the title is named: {a}"
+        );
+        let detail = a["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains("in progress") && detail.contains("2 of 12"),
+            "why it was chosen, and how far in: {detail}"
+        );
+
+        // And on the page that has a stop button next to it.
+        let (_, page) = call(&app, get("/api/v1/activity/detail", Some(&admin))).await;
+        assert_eq!(page["producing"]["title"], "Willow");
+    }
+
+    #[tokio::test]
+    async fn stopping_the_producer_is_admin_only_and_needs_one_to_be_running() {
+        let (app, state) = test_app_with_state();
+        let (status, _) = call(&app, delete("/api/v1/activity/producer", None)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let admin = setup_admin(&app).await;
+        call(
+            &app,
+            post(
+                "/api/v1/users",
+                Some(&admin),
+                json!({ "username": "viewer", "password": "longenough" }),
+            ),
+        )
+        .await;
+        let (_, login) = call(
+            &app,
+            post(
+                "/api/v1/auth/login",
+                None,
+                json!({ "username": "viewer", "password": "longenough" }),
+            ),
+        )
+        .await;
+        let viewer = login["token"].as_str().expect("token").to_owned();
+        let (status, _) = call(&app, delete("/api/v1/activity/producer", Some(&viewer))).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "not a viewer's button");
+
+        // Nothing running: say so rather than pretending to have stopped it.
+        let (status, _) = call(&app, delete("/api/v1/activity/producer", Some(&admin))).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        assert!(
+            !state.jobs.stop_producing(),
+            "idle producer cannot be stopped"
+        );
     }
 
     #[tokio::test]

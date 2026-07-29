@@ -318,6 +318,30 @@ pub struct JobManager {
     /// the first for the same slots, and queuing one behind an encode that
     /// takes hours is worse than skipping it.
     producing: std::sync::atomic::AtomicBool,
+    /// Which title the pass is on, for the activity feed.
+    ///
+    /// The flag above answers "may another pass start"; this answers "what is
+    /// using the GPU, and why", which is the question an admin looking at a
+    /// busy ffmpeg actually has. Without it the producer holds an encoder for
+    /// up to six hours with no entry in the activity feed, no session in the
+    /// UI and nothing to stop — `ps auxwww` on the box was the only way to
+    /// find out, which is not an acceptable answer for someone's own server.
+    now_producing: Mutex<Option<ProducingNow>>,
+    /// Set to ask the running pass to stop after the title it is on.
+    stop_producing: std::sync::atomic::AtomicBool,
+}
+
+/// The title a producer pass is working on, and why it chose it.
+#[derive(Clone, Debug, Serialize)]
+pub struct ProducingNow {
+    pub title: String,
+    /// One of [`crate::produce::REASON_IN_PROGRESS`] and friends — the rail
+    /// this candidate came off. "Why is it encoding *that*" is half the
+    /// question, and the answer is never obvious from the filename.
+    pub reason: &'static str,
+    /// 1-based position within this pass, and how many it means to attempt.
+    pub index: usize,
+    pub total: usize,
 }
 
 /// Clears [`JobManager::producing`] however the pass ends — including the ways
@@ -328,6 +352,13 @@ struct ProducingGuard(Arc<JobManager>);
 impl Drop for ProducingGuard {
     fn drop(&mut self) {
         self.0.producing.store(false, Ordering::Relaxed);
+        self.0.stop_producing.store(false, Ordering::Relaxed);
+        // The label has to go with the flag. A pass that ends between titles
+        // would otherwise leave the activity feed claiming an encode that is
+        // not happening — worse than saying nothing, because it is wrong.
+        if let Ok(mut now) = self.0.now_producing.try_lock() {
+            *now = None;
+        }
     }
 }
 
@@ -420,7 +451,33 @@ impl JobManager {
             requests: Mutex::new(VecDeque::new()),
             metrics: IntegrationMetrics::default(),
             producing: std::sync::atomic::AtomicBool::new(false),
+            now_producing: Mutex::new(None),
+            stop_producing: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// What the pre-transcode pass is working on, or `None` if none is.
+    pub async fn producing_now(&self) -> Option<ProducingNow> {
+        self.now_producing.lock().await.clone()
+    }
+
+    /// Publish (or clear) the title the pass is on. The pass owns this; it is
+    /// crate-visible so the HTTP layer's tests can put the server in the state
+    /// an admin actually complains about.
+    pub(crate) async fn set_producing(&self, now: Option<ProducingNow>) {
+        *self.now_producing.lock().await = now;
+    }
+
+    /// Ask a running pass to stop. It finishes the title it is on — killing an
+    /// encoder mid-segment would throw away the part it has made, and the
+    /// producer is built to resume from published boundaries, not from the
+    /// middle of one. Returns whether there was anything to stop.
+    pub fn stop_producing(&self) -> bool {
+        if !self.producing.load(Ordering::Relaxed) {
+            return false;
+        }
+        self.stop_producing.store(true, Ordering::Relaxed);
+        true
     }
 
     /// Snapshot of all libraries' scan statuses, with live progress attached
@@ -1148,9 +1205,14 @@ impl JobManager {
             window_mins = PRODUCE_WINDOW.as_secs() / 60,
             "pre-transcode pass starting"
         );
-        for c in candidates {
+        let total = candidates.len();
+        for (i, c) in candidates.into_iter().enumerate() {
             if std::time::Instant::now() >= deadline {
                 tracing::info!("pre-transcode pass out of time");
+                break;
+            }
+            if self.stop_producing.load(Ordering::Relaxed) {
+                tracing::info!("pre-transcode pass stopped by request");
                 break;
             }
             let Ok(Some(file)) = self.store.get_file(c.file_id).await else {
@@ -1159,6 +1221,22 @@ impl JobManager {
             if !produce::worth_producing(&file) {
                 continue;
             }
+            // Published BEFORE the encode starts, not after it finishes. The
+            // encode is the part that takes hours and holds the hardware, so
+            // announcing it afterwards describes only work that is already
+            // over — which is exactly the gap that made a busy ffmpeg
+            // unattributable from inside the product.
+            self.set_producing(Some(ProducingNow {
+                title: c.title.clone(),
+                reason: c.reason,
+                index: i + 1,
+                total,
+            }))
+            .await;
+            tracing::info!(
+                title = %c.title, reason = c.reason, n = i + 1, of = total,
+                "pre-transcoding"
+            );
             // The rung a viewer would actually be given, so the entry matches
             // what a real playback looks up. Asking the manager rather than
             // assuming is what keeps the two in step when Auto's policy moves.
@@ -1177,6 +1255,7 @@ impl JobManager {
                     tracing::warn!(title = %c.title, error = %e, "pre-transcode failed");
                 }
             }
+            self.set_producing(None).await;
         }
     }
 
