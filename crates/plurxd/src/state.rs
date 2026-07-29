@@ -77,6 +77,16 @@ pub struct AppState {
     pub coming_soon: Arc<crate::http::ComingSoonCache>,
     /// Pushes watch state to monarr when enabled (plan §11.1).
     pub watched: Arc<crate::watched::WatchedNotifier>,
+    /// What the storage under each library actually reads at
+    /// (`crate::storeprobe`). Behind a lock and not in `SystemInfo` because,
+    /// unlike the encoder list, it is not a fact about the machine that is
+    /// true for the process's life: a mount can be re-exported, a link can be
+    /// re-cabled, and the number is re-measurable on demand.
+    ///
+    /// Filled by a background task shortly after boot rather than during it —
+    /// the numbers are worth having, but not at the price of a server that
+    /// will not answer until a sleeping array has spun up.
+    pub storage: Arc<tokio::sync::RwLock<crate::storeprobe::StorageReport>>,
     /// Keeps the click path off the NAS, and announces a start once playback
     /// is real rather than once a decision has been made.
     pub availability: Arc<crate::playstart::AvailabilityCache>,
@@ -137,6 +147,7 @@ impl AppState {
             logs,
             coming_soon,
             watched,
+            storage: Arc::new(tokio::sync::RwLock::new(Default::default())),
             availability: Arc::new(crate::playstart::AvailabilityCache::new()),
             starts: Arc::new(crate::playstart::StartNotifier::new()),
             streams: crate::progressive::Streams::new(),

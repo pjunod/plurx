@@ -10,6 +10,7 @@ mod produce;
 mod progressive;
 mod schedule;
 mod state;
+mod storeprobe;
 mod trakt;
 mod transcode;
 mod version;
@@ -237,6 +238,14 @@ async fn run(config: Config) -> anyhow::Result<()> {
     );
     // Reap idle transcode sessions in the background.
     tokio::spawn(std::sync::Arc::clone(&state.transcode).reap_loop());
+
+    // What the libraries' storage reads at. Deliberately after the listener
+    // would come up rather than inline with the encoder and tone-map probes:
+    // those measure local hardware in milliseconds, this one may be talking to
+    // a NAS that is asleep, on a link that is down, or behind a mount that
+    // will block for thirty seconds before admitting it. None of that should
+    // delay a server answering requests, and all of it is worth knowing.
+    tokio::spawn(crate::http::system::probe_storage(state.clone()));
 
     // Scheduled jobs: library scans, metadata refreshes, probe retries, and
     // transcode-cache cleanup. Every interval defaults to off, so this loop
