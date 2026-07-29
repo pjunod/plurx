@@ -267,7 +267,7 @@ def log_section(out, logs, cache_settings, srv=None):
         out("      back = the media clock moved backwards (a resync)")
         out("      held = the same frame presented twice (the picture stopped for a beat)")
         out("      skip = media time moved past frames that never reached the screen")
-        out("      slow = the frame arrived, but decode took over 40ms")
+        out("      slow = one frame took over 3x this session's own typical decode")
         out("    A hitch also carries what the player was doing within 150ms of it —")
         out("    a buffer flush, a segment boundary, an append — and the skew between")
         out("    the frame on screen and the element's own clock, which is the audio")

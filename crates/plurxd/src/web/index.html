@@ -2719,10 +2719,24 @@ function segmentedRemuxOk(decision, video){
 //   gap     media time advanced past frames that were never presented at all,
 //           which `droppedVideoFrames` does not count because they were never
 //           decoded.
-//   slow    the frame arrived but took a long time to process — the decoder
-//           falling behind rather than the pipeline skipping.
+//   slow    this frame took far longer through the decoder than this session's
+//           own typical frame — an OUTLIER, not an absolute duration.
+//
+// `slow` was originally "processingDuration over 40ms", and that was wrong on
+// its face. processingDuration is measured from submitting the encoded packet
+// to the frame being ready, so on a pipelined hardware decoder fed from a 12s
+// buffer it is mostly queue latency: packets are submitted long before they
+// are needed and sit there. Against a 41.7ms frame budget it reported 993 slow
+// frames out of 1249 on a session whose decoder was keeping up perfectly —
+// 80%, which is not a signal, it is a broken instrument, and it buried the one
+// row on the panel that had actually found something.
+//
+// So the question becomes relative: is THIS frame unusual for this session?
+// The median is the session's own pipeline latency, whatever that happens to
+// be, and an outlier against it is a real stumble. It must also miss its frame
+// budget, because 3x a 2ms median is still 6ms and nobody sees that.
 const HITCH_GAP_FRAMES=2.5;
-const HITCH_SLOW_MS=40;
+const HITCH_SLOW_FACTOR=3;
 // Frames of history before any judgement. The nominal interval has to be
 // measured, not assumed: the source rate is anywhere from 23.976 to 60.
 const HITCH_WARMUP=12;
@@ -2740,7 +2754,7 @@ function armHitchDetector(v){
   if(!v.requestVideoFrameCallback) return;
   const p=PLAYER; if(!p) return;
   p.hitches={back:0, held:0, gap:0, slow:0, worst:0, last:null, at:[], fps:null,
-             n:0, near:{}, flushEdge:null, skewMax:0, skewAt:null};
+             n:0, near:{}, flushEdge:null, skewMax:0, skewAt:null, decodeMs:null};
   let prev=null;
   // The nominal frame interval, from HISTORY — never from the step under
   // test. Deriving it from the current step lets a skip define itself as
@@ -2748,11 +2762,13 @@ function armHitchDetector(v){
   // ever exceed it), which is how the first cut of this scored a five-frame
   // jump as healthy. A median, because one outlier must not move it.
   const seen=[];
-  const nominal=()=>{
-    if(seen.length<HITCH_WARMUP) return null;
-    const s=seen.slice().sort((a,b)=>a-b);
-    return s[s.length>>1];
-  };
+  const median=(a)=>{ const s=a.slice().sort((x,y)=>x-y); return s[s.length>>1]; };
+  const nominal=()=>seen.length<HITCH_WARMUP?null:median(seen);
+  // The same treatment for decode cost. This session's own median IS the
+  // baseline; the absolute number is a property of the decoder's pipeline
+  // depth, not of whether it is coping.
+  const decodes=[];
+  const typicalDecode=()=>decodes.length<HITCH_WARMUP?null:median(decodes);
   const step=(now, meta)=>{
     // Bail the moment this playback is replaced, or the callback outlives its
     // PLAYER and starts recording another stream's frames as this one's.
@@ -2807,7 +2823,20 @@ function armHitchDetector(v){
       } else {
         if(dt>0) seen.push(dt/dn);
         if(seen.length>HITCH_WINDOW) seen.shift();
-        if(meta.processingDuration!=null && meta.processingDuration*1000>HITCH_SLOW_MS) h.slow++;
+        // Judged against this session's own median, and only once there is a
+        // median to judge against. A frame also has to miss its frame budget
+        // to count: three times a 2ms baseline is 6ms, which nobody sees.
+        const pd=meta.processingDuration;
+        if(pd!=null){
+          const typ=typicalDecode();
+          if(typ!=null){
+            h.decodeMs=+(typ*1000).toFixed(1);
+            if(pd>typ*HITCH_SLOW_FACTOR && (!nom || pd>nom)) h.slow++;
+            else { decodes.push(pd); if(decodes.length>HITCH_WINDOW) decodes.shift(); }
+          } else {
+            decodes.push(pd);
+          }
+        }
       }
       if(h.at.length>40) h.at.shift();
     }
@@ -2846,6 +2875,10 @@ function hitchBlame(){
   if(h.fps && Math.abs(h.skewMax)>1.5/h.fps)
     bits.push(`clock skew up to ${(h.skewMax*1000).toFixed(0)}ms`+
       (h.skewAt!=null?`, ${(h.skewAt*1000).toFixed(0)}ms at the last one`:''));
+  // Stated as context, never as a fault. A deep decode pipeline is normal and
+  // says nothing about whether it is keeping up — which is the mistake the
+  // `slow` counter used to make out loud.
+  if(h.decodeMs!=null) bits.push(`decode ${h.decodeMs}ms typical`);
   return bits.join(" · ");
 }
 // Buffer targets in SECONDS, bounded by BYTES — and the bytes are the point.
