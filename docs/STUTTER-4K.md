@@ -1,10 +1,12 @@
 # 4K copy-path stutter — what it is, what it isn't, and what to try next
 
-**Status:** candidate fix shipped (§5.0) — awaiting a playback on real
-hardware · **Symptom:** one held video frame per segment boundary on a 4K
-HEVC remux · **Reproduced on:** all four of Paul's nodes, Chrome only client
-tested · **Diagnosed against:** `95e88eb`; fix and instrument upgrades
-landed after (2026-07-29 evening) · **Instrument:** `armHitchDetector` in
+**Status:** root cause identified — the client's decoder has no headroom at
+4K HEVC (§5.3, confirmed by measurement 2026-07-29 evening); response
+shipped as the decode-margin rescue
+([PLAYBACK.md](PLAYBACK.md#the-decode-margin-rescue--routing-around-a-decoder-with-no-headroom))
+· **Symptom:** one held video frame per segment boundary on a 4K HEVC remux
+· **Reproduced on:** all four of Paul's nodes, Chrome only client tested ·
+**Instrument:** `armHitchDetector` in
 [index.html](../crates/plurxd/src/web/index.html), surfaced by
 [`scripts/perf-report`](../scripts/perf-report) ·
 **Companions:** [PERF-PLAN.md](PERF-PLAN.md) §4.3bis (the routing that
@@ -343,10 +345,12 @@ exactly zero**. §3.9 proved Chrome tolerates that overlap in isolation; it
 is still gone, and the stream a browser now receives is clean on every axis
 this investigation learned to measure.
 
-**Acceptance:** pull, rebuild, play Wicked on Quality → Auto with the stats
-overlay up. Clean → done, and §5.1–5.3 are moot. Still hitching → the new
-Hitches row now carries the discriminator (§5.3): every event names the
-decode cost at the hitch against the session's typical.
+**Outcome (same evening):** the strip shipped and the stream is clean on
+every measured axis, but the visible hitch rate did not move materially —
+because the forensics it shipped alongside found the real bound: the
+client's decoder itself, §5.3, now confirmed. The strip stays: it is
+spec-correctness with zero cost, it removed three real defects, and on DV
+sources it shrinks the IRAP access units that spike a margin-less decoder.
 
 The strongest surviving lead, and the newest — it comes from the `mpegts` vs
 `fmp4` row in §4. Every clean comparison in §3 either used hls.js's TS
@@ -380,33 +384,43 @@ test still separates DV from generic 4K HEVC: play a 4K remux over 40 Mb/s
 that is **not** Dolby Vision (the library has 190 4K HDR10 files; §5 of the
 perf report enumerates them).
 
-### 5.3 The decoder itself, spiking on giant IRAP access units
+### 5.3 The decoder itself, out of headroom — CONFIRMED
 
-The theory §5.0's reframe adds. A 69 Mb/s 4K 10-bit I-frame is several
-megabytes; a hardware decoder takes a multiple of a frame-time on it; the
-B-frame reorder queue eats most of the decoder's output slack; one frame
-gets held per GOP — which is per segment, because they coincide. Consistent
-with every §3 elimination (nothing about buffers or delivery is wrong), with
-1080p being clean (its I-frames are ~50× smaller), and with the VP9
-reproduction being clean (software VP9 at 4 Mb/s decodes in ~2 ms). It also
-predicts the "Original · one stream" test (§4.1) **still stutters**, since
-the IRAPs are in the bitstream, not the transport.
+The theory §5.0's reframe added, and the forensics settled it in one round
+of screenshots (2026-07-29 evening, same title, same client):
 
-The detector now settles this without another build: every hitch event
-names `decode Xms (typ Y)` — the `processingDuration` of the frame at the
-hitch against the session's own median. Spikes at the hitches → this
-theory; flat → delivery. A `late` counter also now exists for the fault the
-callback could never see directly: a compositor hold presents no new frame
-and fires no callback, so the evidence is the next frame arriving with a
-normal media step and a display-clock step nearly twice as long
-(`expectedDisplayTime`, thresholded above 3:2 pulldown jitter). The 16
-`held` events in §2 were likely the *minority* shadow of holds this counter
-was blind to.
+| | 4K remux (hitches) | 1080p transcode (smooth) |
+|---|---|---|
+| Typical decode | **41.6 ms/frame** | 6 ms/frame |
+| Frame budget (23.976) | 41.7 ms | 41.7 ms |
+| Margin | **none — median = budget** | ~7× |
+| Slow spikes (>3× typical) | 324, and they surface | 540, absorbed silently |
+| Visible hitches | 7 held · 1 late, every ~2.6 s | 3 late at startup, then none |
+| Decode at the hitch itself | 5 ms (a small B-frame) | — |
 
-If confirmed, the fix is a routing decision — cap the copy path by bitrate
-or resolution for Chrome and transcode above it — which costs GPU and
-quality and is the last resort (§8.3). §5.0's strip still helps at the
-margin for DV: shedding the EL shrinks exactly the access units that spike.
+The client hardware-decodes this 4K HEVC at exactly realtime: the median
+per-frame cost *equals* the frame budget, so roughly half of all frames run
+over it and there is no slack anywhere to absorb a spike. The hitch frame's
+own decode being fast (5 ms) is the confirming detail — it is not the slow
+frame; it is the frame that found the pipeline dry after a giant IRAP ate
+three budgets upstream. The same machine absorbs *more* spikes on the
+1080p stream without a single visible event, because 6 ms of median cost
+leaves 35 ms of margin per frame. `mediaCapabilities` claimed
+`powerEfficient: true` throughout; the measurement outranks the claim.
+
+Honest accounting: §5.0's strip cleaned the bitstream but did not move the
+visible hitch rate materially (~0.3/s before and after in the observed
+windows). The margin was the binding constraint all along.
+
+The response shipped the same evening — the **decode-margin rescue**
+([PLAYBACK.md](PLAYBACK.md#the-decode-margin-rescue--routing-around-a-decoder-with-no-headroom)):
+an Auto session on a copy path that measures ≥20 s of playback, ≥4 hitch
+events and a median decode ≥80% of budget switches itself to a transcode at
+position, remembers the limit per `codec@height`, and routes straight to a
+transcode on the next Auto play. Explicit Original always overrides, and a
+clean explicit-Original session clears the memory. This is §8.3's "last
+resort" done the acceptable way: per-client, measured, reversible, and
+saying its numbers out loud.
 
 ### 5.4 Segment length, as mitigation rather than cause
 
@@ -581,9 +595,11 @@ rejected for a reason.
    change with no measured effect.
 2. **Do not raise `SEGMENT_SECONDS` globally.** §5.4. It feeds the cache
    recipe hash and the failover contract.
-3. **Do not route 4K copies to a transcode as the first fix.** It burns GPU
-   on every 4K remux and throws away the quality the library exists for.
-   It is the answer only if §5.3 turns out to be the cause.
+3. **Do not route 4K copies to a transcode blindly.** §5.3 turned out to be
+   the cause, so routing IS the answer — but only the measured, per-client,
+   reversible form the rescue implements. A global "4K → transcode" rule
+   would burn GPU for every client with a decoder that copes fine (the TVs
+   do) and throw away the quality the library exists for.
 4. **Do not trust a healthy stats panel.** Every aggregate on it read clean
    through the entire investigation.
 5. **Do not treat a viewer's interval estimate as a measurement.** §2.1.
