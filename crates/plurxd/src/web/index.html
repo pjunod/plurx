@@ -2379,12 +2379,23 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
     setLoading(true,"Preparing the stream…",(PLAYER.encoder?("encoder: "+PLAYER.encoder+" — "):"")+
       (PLAYER.vod?"already transcoded — playing from the cache":"buffering the first segments"));
     armStall(from);
-  } else if(decision.method!=='direct_play' && useNativeHls(video)){
-    // Safari can't play a progressive fragmented-MP4 remux, but it plays the
-    // same copy-video stream (source video kept, audio transcoded only) via
-    // native HLS. Route it there so it keeps the original resolution instead of
-    // the error-fallback re-encoding to 720p.
-    setLoading(true,"Preparing the stream…","remuxing to HLS — keeping the original video");
+  } else if(decision.method!=='direct_play' && (useNativeHls(video)||segmentedRemuxOk(decision,video))){
+    // Two different reasons to land here, same destination.
+    //
+    // Safari can't play a progressive fragmented-MP4 remux at all, but it plays
+    // the same copy-video stream (source video kept, audio transcoded only) via
+    // native HLS — routing it here keeps the original resolution instead of the
+    // error-fallback re-encoding to 720p.
+    //
+    // Chrome *can* play the progressive stream, and on a big file it plays it
+    // badly: its read-ahead there is a hard ~2.2 s that no response header can
+    // raise (PERF-PLAN §4.3bis, measured), so any supply gap over two seconds
+    // is a stall. The same bytes through MSE let hls.js hold a real buffer.
+    // Identical video either way — this is a transport choice, not a rung.
+    const why=!useNativeHls(video) && decision.prefer_segmented;
+    setLoading(true,"Preparing the stream…",
+      why? `${why} — sending it as HLS so the player can buffer ahead`
+         : "remuxing to HLS — keeping the original video");
     try{ await startCopyHls(video, startSec); }
     catch(e){ setLoading(false); toast(e.message); return closePlayer(); }
   } else {
@@ -2451,6 +2462,56 @@ function setupAirplay(video){
     });
     btn.onclick=()=>{ try{ video.webkitShowPlaybackTargetPicker(); }catch(e){} };
   } else { btn.style.display="none"; }
+}
+// Codec strings to try through MediaSource, per source codec. Several per
+// codec because the profile/level in the string is checked and we do not know
+// the source's: Chrome answers "no" to a level it cannot decode, so asking
+// only about L153 (4K) would reject a 1080p file it would have played fine.
+// Any accepted variant proves the *decoder* exists, which is the question.
+const MSE_VIDEO = {
+  hevc:["hvc1.2.4.L153.B0","hvc1.1.6.L153.B0","hvc1.2.4.L120.B0","hvc1.1.6.L120.B0"],
+  h265:["hvc1.2.4.L153.B0","hvc1.1.6.L153.B0","hvc1.2.4.L120.B0","hvc1.1.6.L120.B0"],
+  hevc10:["hvc1.2.4.L153.B0","hvc1.2.4.L120.B0"],
+  h264:["avc1.640033","avc1.640029","avc1.4d401f"],
+  avc:["avc1.640033","avc1.640029","avc1.4d401f"],
+  av1:["av01.0.09M.10","av01.0.08M.10","av01.0.05M.08"],
+  vp9:["vp09.02.51.10","vp09.00.41.08","vp09.00.10.08"],
+};
+const MSE_AUDIO = {
+  aac:"mp4a.40.2", ac3:"ac-3", eac3:"ec-3", opus:"opus", flac:"flac", mp3:"mp4a.40.34",
+};
+// Will this browser take the copy-video stream through MediaSource?
+//
+// Asked because `<video src>` and MSE are different code paths with different
+// answers: Chrome plays plenty progressively that MediaSource refuses, and
+// routing a remux to hls.js on the strength of the first would turn a stuttery
+// stream into a black one. Video and audio are asked about together, in one
+// string, because that is exactly what hls.js will ask — checking them apart
+// passes pairs the browser will not accept as a pair.
+function mseCanTake(srcCodec, audioCodec){
+  if(!(window.MediaSource && MediaSource.isTypeSupported)) return false;
+  const v=MSE_VIDEO[String(srcCodec||"").toLowerCase()];
+  if(!v) return false;                       // unknown codec: do not gamble
+  const a=MSE_AUDIO[String(audioCodec||"").toLowerCase()];
+  if(!a) return false;
+  return v.some(c=>{ try{ return MediaSource.isTypeSupported(`video/mp4; codecs="${c},${a}"`); }catch(e){ return false; } });
+}
+// Should this remux take the HLS path instead of progressive /stream.mp4?
+//
+// The server decides *whether* (it knows the bitrate and what the storage under
+// the file reads at); this decides *whether it can* (only the browser knows its
+// own MSE). Both must agree, and a no from either keeps today's behaviour —
+// which is stuttery on a big file, but stuttery is recoverable and black is not.
+function segmentedRemuxOk(decision, video){
+  if(!decision || !decision.prefer_segmented) return false;
+  if(!(window.Hls && Hls.isSupported())) return false;
+  if(useNativeHls(video)) return false;      // Safari already routes here below
+  const src=decision.source||{};
+  // What the audio will actually be on the wire: the server re-encodes to AAC
+  // when the browser can't take the source, so ask about what arrives.
+  const track=(decision.audio||[]).find(a=>a.default) || (decision.audio||[])[0];
+  const audio=decision.transcode_audio? "aac" : (track&&track.codec);
+  return mseCanTake(src.video_codec, audio);
 }
 function teardownHls(){ if(PLAYER&&PLAYER.hls){ try{PLAYER.hls.destroy()}catch(e){} PLAYER.hls=null; } }
 // Every timer hanging off PLAYER, stopped. Anything that replaces or discards

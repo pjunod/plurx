@@ -2642,6 +2642,79 @@ mod tests {
         );
     }
 
+    /// A big remux gets told to go through MSE; an ordinary direct play does
+    /// not. Both halves matter — the second is the regression that would
+    /// reroute a whole library's worth of files that were working.
+    #[tokio::test]
+    async fn a_high_bitrate_remux_is_hinted_toward_segments() {
+        let (app, state) = test_state();
+        let admin = setup_admin(&app).await;
+        let s = seed_content(&state).await;
+
+        // The seeded file is an 8 Mb/s H.264 MP4: a browser that takes it
+        // direct-plays, and there is no transport choice to hint about.
+        let (status, body) = call(
+            &app,
+            get(
+                &format!(
+                    "/api/v1/files/{}/decision?vcodec=h264&acodec=aac&container=mp4&hdr=0",
+                    s.file
+                ),
+                Some(&admin),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["method"], "direct_play");
+        assert!(body["prefer_segmented"].is_null(), "{body}");
+
+        // A 69 Mb/s HEVC MKV with TrueHD: the video decodes, the container and
+        // the audio do not, so it remuxes — and it is far too fast for the
+        // browser's 2.2 s progressive buffer.
+        let dir = std::env::temp_dir().join(format!("plurx-big-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("mediadir");
+        let path = dir.join("Big.mkv");
+        std::fs::write(&path, b"\x1a\x45\xdf\xa3 tiny placeholder").expect("write");
+        let probe = plurx_core::domain::ProbeResult {
+            duration_ms: Some(9_000_000),
+            container: Some("mkv".into()),
+            video_codec: Some("hevc".into()),
+            width: Some(3840),
+            height: Some(2160),
+            bit_depth: Some(10),
+            bitrate: Some(69_000_000),
+            audio_streams: vec![plurx_core::domain::AudioStream {
+                index: 0,
+                codec: "truehd".into(),
+                channels: Some(8),
+                language: Some("eng".into()),
+                default: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let big = state
+            .store
+            .upsert_file(s.movie, &path.to_string_lossy(), 99, 1, &probe)
+            .await
+            .expect("file");
+
+        let (status, body) = call(
+            &app,
+            get(
+                &format!(
+                    "/api/v1/files/{big}/decision?vcodec=h264,hevc&acodec=aac&container=mp4&hdr=1"
+                ),
+                Some(&admin),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["method"], "remux", "{body}");
+        let why = body["prefer_segmented"].as_str().unwrap_or_default();
+        assert!(why.contains("69 Mb/s"), "{body}");
+    }
+
     #[tokio::test]
     async fn seeded_read_surface() {
         let (app, state) = test_state();
