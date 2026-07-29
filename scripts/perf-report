@@ -14,8 +14,10 @@ itself is the rate-control measurement, and it does that by starting a real
 session and measuring the segments that session wrote — not by reconstructing
 the arguments, which would only prove that two copies of the flag list agree.
 
-    scripts/perf-report --url http://nynuc:32400 --user paul
-    scripts/perf-report --url http://nynuc:32400 --user paul --ratecontrol 42
+    scripts/perf-report --sustained
+    scripts/perf-report --url http://nynuc:32400 --ratecontrol 42
+
+Prompts for the admin username and password if you don't pass them.
 
 Writes perf-report-<host>-<date>.txt. Send that file back.
 """
@@ -302,7 +304,11 @@ def sustained_lines(out, mount):
     out(f"    sustained {s['seconds']:.0f}s, sampled every "
         f"{s['window_secs']*1000:.0f}ms{wrapped}:")
     out(f"      min {s['min_bps']/1e6:.0f} · p10 {s['p10_bps']/1e6:.0f} · "
-        f"median {s['median_bps']/1e6:.0f} · max {s['max_bps']/1e6:.0f} Mb/s")
+        f"median {s['median_bps']/1e6:.0f} · max {s['max_bps']/1e6:.0f} Mb/s"
+        f" ({len(s['windows_bps'])} windows)")
+    if s.get("cached_windows"):
+        out(f"      ⚠ {s['cached_windows']} window(s) discarded as page cache, not storage — "
+            "this mount's biggest file is small enough to sit in RAM")
     verdicts = mount.get("verdicts") or []
     if not verdicts:
         return
@@ -470,7 +476,7 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--url", default="http://127.0.0.1:32400",
                     help="server base URL (default: %(default)s)")
-    ap.add_argument("--user", required=True, help="an ADMIN username")
+    ap.add_argument("--user", help="an ADMIN username; prompted for if omitted")
     ap.add_argument("--password", help="prompted for if omitted")
     ap.add_argument("--ratecontrol", type=int, metavar="FILE_ID",
                     help="also measure §4.6 against this file id — pick the "
@@ -490,13 +496,19 @@ def main():
     ap.add_argument("--out", help="output file (default: perf-report-<host>-<date>.txt)")
     args = ap.parse_args()
 
-    password = args.password or getpass.getpass(f"password for {args.user}: ")
+    # Asked for rather than defaulted. The admin's name is not something this
+    # script can know, and a placeholder baked into the docs gets copied,
+    # fails, and reads as the tool being broken.
+    user = args.user or input("admin username: ").strip()
+    if not user:
+        sys.exit("an admin username is required")
+    password = args.password or getpass.getpass(f"password for {user}: ")
     srv = Server(args.url)
-    srv.login(args.user, password)
+    srv.login(user, password)
 
     st, sys_info = srv.call("/system")
     if st != 200:
-        sys.exit(f"/system says {st}: {sys_info} — is {args.user} an admin?")
+        sys.exit(f"/system says {st}: {sys_info} — is {user} an admin?")
 
     # Before /settings, and before the log fetch: the sustained probe takes
     # minutes and its result has to be the one /system reports below.

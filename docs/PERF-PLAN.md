@@ -744,7 +744,7 @@ prove that two copies agree, which is the drift review R4 already objected
 to. Re-run it after any rate-control change:
 
 ```bash
-scripts/perf-report --url http://nynuc:32400 --user paul \
+scripts/perf-report --url http://nynuc:32400 \
   --ratecontrol <file_id> --height 1080   # pick the grainiest 4K HDR title
 ```
 

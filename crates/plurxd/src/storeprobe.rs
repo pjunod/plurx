@@ -186,6 +186,11 @@ pub struct Sustained {
     pub p10_bps: f64,
     pub median_bps: f64,
     pub max_bps: f64,
+    /// Windows discarded as page cache rather than storage. Non-zero means
+    /// the trace is shorter than it looks, and that this mount's file was
+    /// small enough to be re-read from memory — point the probe at a library
+    /// with bigger files before trusting the shape.
+    pub cached_windows: usize,
     /// The read ran off the end of the file and started again from the top.
     /// Everything after that point is re-reading ground the first pass just
     /// warmed, so the trace is optimistic from there on — worth knowing, and
@@ -510,6 +515,7 @@ fn sustained_read(path: &Path, size: u64, secs: f64) -> Sustained {
         p10_bps: 0.0,
         median_bps: 0.0,
         max_bps: 0.0,
+        cached_windows: 0,
         wrapped: false,
     };
     let Ok(mut f) = File::open(path) else {
@@ -535,7 +541,18 @@ fn sustained_read(path: &Path, size: u64, secs: f64) -> Sustained {
             // have contained one. Flagged, because the second pass is reading
             // ground the first pass just warmed.
             Ok(0) => {
+                // Out of file before out of time. Wrap rather than stop: the
+                // trace is meant to cover a *duration*, and one that quietly
+                // returns four windows because the library's biggest file was
+                // small reports "no gaps found" on evidence that could not
+                // have held one.
+                //
+                // Drop the whole file from cache on the way round, or the
+                // second pass reads at memory speed and the trace stops being
+                // about storage — nynuc's first run came back with 134 Gb/s
+                // windows for exactly this reason.
                 out.wrapped = true;
+                drop_cache(&f, 0, size);
                 if f.seek(SeekFrom::Start(0)).is_err() {
                     break;
                 }
@@ -551,14 +568,26 @@ fn sustained_read(path: &Path, size: u64, secs: f64) -> Sustained {
             win_start = Instant::now();
         }
     }
-    // The tail, if it covered enough of a window to mean anything. Dropping it
-    // silently is how a two-second probe reports zero windows.
+    // The tail, only if it is nearly a whole window.
+    //
+    // A short one is not merely noisy, it is *wrong*: every consumer treats a
+    // window as `window_secs` of supply, so a 60 ms sample at 2.2 Gb/s enters
+    // the simulation as 250 ms at 2.2 Gb/s and hands the client four times the
+    // data that was actually read. nynuc's first trace ended on one.
     let tail = win_start.elapsed();
-    if win_bytes > 0 && tail >= SUSTAINED_WINDOW / 4 {
+    if win_bytes > 0 && tail >= SUSTAINED_WINDOW.mul_f64(0.9) {
         out.windows_bps
             .push((win_bytes * 8) as f64 / tail.as_secs_f64());
     }
     out.seconds = started.elapsed().as_secs_f64();
+
+    // Windows that read faster than any device can are page cache, by the same
+    // argument the quick probe already uses — and they are worse here, because
+    // a handful of them at 134 Gb/s drown every real dip in the statistics and
+    // hand the simulation an infinite buffer. Counted, not silently dropped.
+    let before = out.windows_bps.len();
+    out.windows_bps.retain(|&b| b <= CACHE_SUSPECT_BPS);
+    out.cached_windows = before - out.windows_bps.len();
 
     let mut sorted = out.windows_bps.clone();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -753,6 +782,7 @@ mod tests {
             p10_bps: 0.0,
             median_bps: 0.0,
             max_bps: 0.0,
+            cached_windows: 0,
             wrapped: false,
         }
     }
