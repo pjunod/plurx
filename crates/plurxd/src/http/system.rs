@@ -315,6 +315,27 @@ pub async fn client_log(_user: AuthUser, Json(ev): Json<ClientLog>) -> StatusCod
     let Some(suppressed) = suppressed else {
         return StatusCode::NO_CONTENT;
     };
+    let line = client_log_line(&ev, suppressed);
+
+    // Both WARN and ERROR clear the default `info` filter, so either shows in
+    // the admin log without the operator touching PLURX_LOG.
+    if ev.level.eq_ignore_ascii_case("error") {
+        tracing::error!(target: "plurxd::client", "{line}");
+    } else {
+        tracing::warn!(target: "plurxd::client", "{line}");
+    }
+    StatusCode::NO_CONTENT
+}
+
+/// One client report as a log line.
+///
+/// Pure, and separate from the handler for the reason every other pure
+/// decision in this codebase is: the thing worth checking here is the *naming*
+/// of the measurements, and naming mistakes read perfectly and produce wrong
+/// data. This one printed every event's `ms` as `ttff_ms` — so a stall's
+/// duration entered the start-time series, and a grep that looked exactly
+/// right returned numbers that were part start and part stall.
+fn client_log_line(ev: &ClientLog, suppressed: u64) -> String {
     /// Trim and cap one field so a client can't spam oversized log lines.
     fn clip(s: &str, n: usize) -> String {
         let s = s.trim();
@@ -363,8 +384,21 @@ pub async fn client_log(_user: AuthUser, Json(ev): Json<ClientLog>) -> StatusCod
     }
     // The measurements, in a fixed order so a grep over the log ring produces
     // a column-alignable series rather than prose.
+    //
+    // `ms` is named for what the EVENT measured, not for the field it arrived
+    // in. It used to be printed as `ttff_ms=` on every event that carried one,
+    // which meant a stall's *duration* was logged as a time-to-first-frame —
+    // so `grep ttff_ms` returned a distribution that was part start times and
+    // part stall lengths, and the tail of it was entirely stalls. That is the
+    // one number M0 exists to produce, and it was wrong in the direction that
+    // makes the system look worse than it is.
     if let Some(ms) = ev.ms.filter(|v| *v >= 0) {
-        line.push_str(&format!(" ttff_ms={ms}"));
+        let name = match ev.event.as_str() {
+            "ttff" => "ttff_ms",
+            "stall" => "stall_ms",
+            _ => "ms",
+        };
+        line.push_str(&format!(" {name}={ms}"));
     }
     if let Some(r) = ev.runway.filter(|v| v.is_finite() && *v >= 0.0) {
         line.push_str(&format!(" runway={r:.1}s"));
@@ -395,15 +429,7 @@ pub async fn client_log(_user: AuthUser, Json(ev): Json<ClientLog>) -> StatusCod
     if suppressed > 0 {
         line.push_str(&format!(" (+{suppressed} suppressed)"));
     }
-
-    // Both WARN and ERROR clear the default `info` filter, so either shows in
-    // the admin log without the operator touching PLURX_LOG.
-    if ev.level.eq_ignore_ascii_case("error") {
-        tracing::error!(target: "plurxd::client", "{line}");
-    } else {
-        tracing::warn!(target: "plurxd::client", "{line}");
-    }
-    StatusCode::NO_CONTENT
+    line
 }
 
 #[derive(Serialize)]
@@ -1067,6 +1093,60 @@ pub async fn metrics(State(state): State<AppState>) -> impl axum::response::Into
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    fn beacon(event: &str, ms: i64) -> ClientLog {
+        ClientLog {
+            level: "warn".into(),
+            event: event.into(),
+            message: "x".into(),
+            method: Some("remux".into()),
+            code: None,
+            title: None,
+            file_id: None,
+            vcodec: None,
+            src: None,
+            detail: None,
+            ua: None,
+            attempt: None,
+            reason: None,
+            runway: None,
+            ms: Some(ms),
+            bandwidth: None,
+            height: None,
+            encoder: None,
+        }
+    }
+
+    /// A measurement is named for what it measured.
+    ///
+    /// `ms` carries a start time on a `ttff` event and a stall's *duration* on
+    /// a `stall` one, and both were printed as `ttff_ms`. So a grep for
+    /// `ttff_ms` over the log ring returned a series that was part start times
+    /// and part stall lengths — with the stalls, being longer, owning the whole
+    /// tail. That is the one number M0 exists to produce, wrong in the
+    /// direction that makes the server look worse than it is: on nynuc a real
+    /// p90 of 1.5 s read as 4.6 s.
+    #[test]
+    fn a_stalls_duration_is_never_reported_as_a_start_time() {
+        let start = client_log_line(&beacon("ttff", 684), 0);
+        assert!(start.contains("ttff_ms=684"), "{start}");
+
+        let stall = client_log_line(&beacon("stall", 4584), 0);
+        assert!(stall.contains("stall_ms=4584"), "{stall}");
+        assert!(
+            !stall.contains("ttff_ms"),
+            "a stall's duration entered the start-time series: {stall}"
+        );
+
+        // An event nobody has taught this about says the neutral thing rather
+        // than borrowing whichever name is nearest.
+        let other = client_log_line(&beacon("hls_fatal", 12), 0);
+        assert!(other.contains(" ms=12"), "{other}");
+        assert!(
+            !other.contains("ttff_ms") && !other.contains("stall_ms"),
+            "{other}"
+        );
+    }
 
     /// The log ring must survive a client stuck in an error loop: the burst gets
     /// through, the flood does not, and the gap is accounted for rather than

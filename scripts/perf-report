@@ -186,30 +186,46 @@ def log_section(out, logs, cache_settings):
             out("  " + l[:200])
 
     # The M0 beacons: the only numbers that say what a start actually cost.
+    #
+    # `ttff_ms=` only, never a bare `ms=`. A stall carries a duration in the
+    # same field, and mixing the two gives a distribution that is part start
+    # times and part stall lengths — with the stalls, being longer, owning the
+    # whole tail. Older servers printed both as `ttff_ms`; there is nothing to
+    # be done about those logs except know it.
     ttff = []
     for l in lines:
-        m = re.search(r"ttff_ms=(\d+)", l)
+        m = re.search(r"\bttff_ms=(\d+)", l)
         if m:
             method = (re.search(r"method=(\w+)", l) or [None, "?"])[1]
             reason = (re.search(r"attempt=[^/]*/(\S+)", l) or [None, "?"])[1]
-            enc = (re.search(r"encoder=([^\s]+)", l) or [None, "?"])[1]
-            ttff.append((int(m.group(1)), method, reason, enc))
+            ttff.append((int(m.group(1)), method, reason))
     out("")
-    out(f"playback beacons with a start time: {len(ttff)}")
+    out(f"playback starts measured: {len(ttff)}")
     if ttff:
         vals = sorted(v[0] for v in ttff)
         out(f"  time-to-first-frame  min {vals[0]}ms · median {vals[len(vals)//2]}ms "
-            f"· p90 {vals[int(len(vals)*0.9)]}ms · max {vals[-1]}ms")
-        for ms, method, reason, enc in ttff[-12:]:
-            out(f"    {ms:6d}ms  {method:12s} {reason:12s} {enc}")
+            f"· p90 {vals[min(len(vals)-1, int(len(vals)*0.9))]}ms · max {vals[-1]}ms")
+        for ms, method, reason in ttff[-12:]:
+            out(f"    {ms:6d}ms  {method:12s} {reason}")
     else:
         out("  none — play a few things in a browser and run this again.")
         out("  (cold starts, a seek, and one 4K HDR title is enough.)")
 
-    stalls = [l for l in lines if "stall" in l]
+    # Stalls are a separate series, and the distinction in `detail` is the
+    # whole point: `supply` ran out of buffered video and is a server or link
+    # problem; `decode` had video in hand and could not play it, which is the
+    # browser and which no amount of pacing will improve.
+    stalls = [l for l in lines if re.search(r"client\S* stall\b", l)]
     if stalls:
+        kinds = {}
+        for l in stalls:
+            k = "supply" if "[supply]" in l else "decode" if "[decode]" in l else "?"
+            kinds[k] = kinds.get(k, 0) + 1
         out("")
-        out(f"stalls reported by clients: {len(stalls)}")
+        out(f"stalls reported by clients: {len(stalls)} "
+            f"({' · '.join(f'{n} {k}' for k, n in sorted(kinds.items()))})")
+        if kinds.get("supply"):
+            out("  supply = the client ran dry. Server or link, not the browser.")
         for l in stalls[-8:]:
             out("  " + l[:220])
 
