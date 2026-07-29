@@ -1493,11 +1493,18 @@ function pagerHtml(shown){
   const pages=libPageCount(shown);
   if(pages<2) return "";
   const at=LIB_PAGE_AT;
-  const btn=(n,label,dis)=>`<button class="ghost sm"${dis?" disabled":""} onclick="libGoPage(${n})">${label}</button>`;
+  const btn=(n,label,dis,title)=>`<button class="ghost sm"${dis?" disabled":""}${title?` title="${title}"`:""} onclick="libGoPage(${n})">${label}</button>`;
+  // First and last, because "sorted by date added, newest last" makes the far
+  // end a destination and not an edge case — and getting there a page at a
+  // time on a 300-title library is sixteen clicks. Hidden below three pages,
+  // where they would duplicate Previous and Next exactly.
+  const ends=pages>2;
   return `<div class="pager">
+    ${ends?btn(0,"«",at<=0,"First page"):""}
     ${btn(at-1,"‹ Previous",at<=0)}
     <span class="muted">Page ${at+1} of ${pages}</span>
     ${btn(at+1,"Next ›",at>=pages-1)}
+    ${ends?btn(pages-1,"»",at>=pages-1,"Last page"):""}
   </div>`;
 }
 function sortFor(lib){ return LIB_SORT || ((lib&&lib.kind==="home")?"recorded":"title"); }
