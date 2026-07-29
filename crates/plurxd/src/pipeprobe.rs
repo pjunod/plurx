@@ -324,7 +324,10 @@ async fn run(
     }
     args.push("-vf".into());
     args.push(vf);
-    args.extend(encoder.encode_args(4_000));
+    // No forced IDR here: this probe asks whether a tone-map graph produces the
+    // right *picture* fast enough, and it writes one short clip rather than a
+    // segmented playlist. Where the key frames land does not enter into it.
+    args.extend(encoder.encode_args(4_000, false));
     args.push(out.to_string_lossy().into_owned());
 
     let started = Instant::now();

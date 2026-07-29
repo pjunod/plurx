@@ -150,6 +150,15 @@ pub struct TranscodeOptions {
     /// what a GPU graph falls back to when it fails at runtime.
     pub pipeline: Pipeline,
     pub subtitle_burn: Option<SubtitleBurn>,
+    /// Pass the encoder's forced-IDR option, so `-force_key_frames` produces
+    /// key frames the HLS muxer can actually cut at (see
+    /// [`Encoder::forced_idr_flag`]). Set from the startup probe, which is
+    /// what establishes that this build accepts it.
+    ///
+    /// Deliberately NOT part of the cache recipe: it changes where segments
+    /// begin, not what any frame looks like, and an entry produced before this
+    /// existed decodes to the same picture.
+    pub force_idr: bool,
 }
 
 impl Default for TranscodeOptions {
@@ -164,6 +173,7 @@ impl Default for TranscodeOptions {
             tone_map: ToneMap::Zscale,
             pipeline: Pipeline::Cpu,
             subtitle_burn: None,
+            force_idr: false,
         }
     }
 }
@@ -500,7 +510,7 @@ pub fn hls_args(
             args.push(vf);
         }
     }
-    args.extend(encoder.encode_args(opts.video_bitrate_kbps));
+    args.extend(encoder.encode_args(opts.video_bitrate_kbps, opts.force_idr));
 
     // Segment-aligned keyframes so each segment is independently decodable.
     args.push("-force_key_frames".into());

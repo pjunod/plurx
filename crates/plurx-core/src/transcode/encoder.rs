@@ -64,6 +64,33 @@ impl Encoder {
         }
     }
 
+    /// The option that makes this family's forced key frames *splittable*, if
+    /// it needs one.
+    ///
+    /// `-force_key_frames` asks the encoder for a key frame; QSV and NVENC
+    /// answer with an I-frame that is not an IDR, and a non-IDR I-frame does
+    /// not carry `AV_PKT_FLAG_KEY`. The HLS muxer can only cut at a flagged
+    /// key frame, so it ignores every boundary asked for and falls back to
+    /// cutting at the encoder's own GOP — measured on nynuc as **10.4-second
+    /// segments from a 2-second request**, which is the original
+    /// "~10 s to start streaming" symptom this entire plan is about, still
+    /// present on the one box with hardware.
+    ///
+    /// The two spellings are not a typo. QSV's option is `-forced_idr` and
+    /// NVENC's is `-forced-idr`; passing either name to the other family is an
+    /// unrecognised option, which ffmpeg treats as a hard exit.
+    ///
+    /// VA-API needs nothing: it has no such option because its `idr_interval`
+    /// defaults to 0, which already means every I-frame is an IDR. Software and
+    /// VideoToolbox likewise emit IDR for forced key frames.
+    pub fn forced_idr_flag(self) -> Option<&'static str> {
+        match self {
+            Encoder::Qsv => Some("-forced_idr"),
+            Encoder::Nvenc => Some("-forced-idr"),
+            Encoder::Vaapi | Encoder::VideoToolbox | Encoder::Software => None,
+        }
+    }
+
     /// Encode-side args (encoder + rate control at `bitrate_kbps`).
     ///
     /// Every family is bounded, not just the two that always were. `-b:v`
@@ -80,11 +107,19 @@ impl Encoder {
     /// 1.5× / 2× because a cap tight enough to bind constantly is a quality
     /// setting in disguise — the point is to clip the outliers that hurt
     /// delivery, not to flatten the bitrate curve a VBR encoder exists to
-    /// produce (PERF-PLAN §4.6, ADAPTIVE-QUALITY.md Phase 1).
-    pub fn encode_args(self, bitrate_kbps: u32) -> Vec<String> {
+    /// produce (PERF-PLAN §4.6, ADAPTIVE-QUALITY.md Phase 1). Measured on
+    /// nynuc's QSV at 9.05 Mb/s peak over a 10 s window against a 13.6 Mb/s
+    /// bound, on a 1080p rung — the model holds.
+    ///
+    /// `force_idr` asks for [`Encoder::forced_idr_flag`] to be set. It is a
+    /// parameter rather than always-on because the option has to be *accepted*
+    /// by the build, and the startup probe is what establishes that — see
+    /// `validate`.
+    pub fn encode_args(self, bitrate_kbps: u32, force_idr: bool) -> Vec<String> {
         let br = format!("{bitrate_kbps}k");
         let maxrate = format!("{}k", bitrate_kbps * 3 / 2);
         let bufsize = format!("{}k", bitrate_kbps * 2);
+        let idr = force_idr.then(|| self.forced_idr_flag()).flatten();
         let rate_control = |v: Vec<&str>| -> Vec<String> {
             let mut args: Vec<String> = v.into_iter().map(str::to_owned).collect();
             args.extend([
@@ -95,6 +130,9 @@ impl Encoder {
                 "-bufsize".to_owned(),
                 bufsize.clone(),
             ]);
+            if let Some(flag) = idr {
+                args.extend([flag.to_owned(), "1".to_owned()]);
+            }
             args
         };
         match self {
@@ -125,6 +163,37 @@ fn vaapi_device() -> String {
         .unwrap_or_else(|| "/dev/dri/renderD128".to_owned())
 }
 
+/// Which families accept the forced-IDR flag, as measured at startup.
+///
+/// Serialised beside the caps because it is the difference between two-second
+/// segments and ten-second ones, and there is nowhere else an operator could
+/// see which they are getting — the segments look fine, playback just takes
+/// five times longer to start.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct ForcedIdr {
+    pub nvenc: bool,
+    pub qsv: bool,
+}
+
+impl ForcedIdr {
+    fn set(&mut self, encoder: Encoder) {
+        match encoder {
+            Encoder::Nvenc => self.nvenc = true,
+            Encoder::Qsv => self.qsv = true,
+            _ => {}
+        }
+    }
+
+    /// Should a session on `encoder` pass the flag?
+    pub fn wanted_by(&self, encoder: Encoder) -> bool {
+        match encoder {
+            Encoder::Nvenc => self.nvenc,
+            Encoder::Qsv => self.qsv,
+            _ => false,
+        }
+    }
+}
+
 /// Which encoders this ffmpeg build exposes.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct EncoderCaps {
@@ -132,9 +201,21 @@ pub struct EncoderCaps {
     pub qsv: bool,
     pub vaapi: bool,
     pub videotoolbox: bool,
+    #[serde(default)]
+    pub forced_idr: ForcedIdr,
 }
 
 impl EncoderCaps {
+    fn set(&mut self, encoder: Encoder, usable: bool) {
+        match encoder {
+            Encoder::Nvenc => self.nvenc = usable,
+            Encoder::Qsv => self.qsv = usable,
+            Encoder::Vaapi => self.vaapi = usable,
+            Encoder::VideoToolbox => self.videotoolbox = usable,
+            Encoder::Software => {}
+        }
+    }
+
     /// Pick the best encoder, honoring an explicit preference. `prefer` is a
     /// lowercase family name ("nvenc"|"qsv"|"vaapi"|"videotoolbox"|"software")
     /// or empty for automatic. Automatic order favors the most capable common
@@ -170,6 +251,9 @@ pub fn parse_encoder_list(output: &str) -> EncoderCaps {
         qsv: output.contains("h264_qsv"),
         vaapi: output.contains("h264_vaapi"),
         videotoolbox: output.contains("h264_videotoolbox"),
+        // Compiled-in says nothing about which options a driver will take;
+        // that is what `validate` measures.
+        forced_idr: ForcedIdr::default(),
     }
 }
 
@@ -198,7 +282,7 @@ const PROBE_BITRATE_KBPS: u32 = 4_000;
 /// that accepts the encoder and rejects `-maxrate` would pass here and fail at
 /// play time, on a viewer's first press of play, with the fallback machinery
 /// discovering it (PERF-PLAN §4.6, review R4).
-fn validation_args(encoder: Encoder) -> Vec<String> {
+fn validation_args(encoder: Encoder, force_idr: bool) -> Vec<String> {
     let mut args: Vec<String> = vec!["-hide_banner".into(), "-loglevel".into(), "error".into()];
     args.extend(encoder.init_args());
     args.extend([
@@ -218,9 +302,18 @@ fn validation_args(encoder: Encoder) -> Vec<String> {
     }
     args.push("-vf".into());
     args.push(vf);
-    args.extend(encoder.encode_args(PROBE_BITRATE_KBPS));
+    args.extend(encoder.encode_args(PROBE_BITRATE_KBPS, force_idr));
     args.extend(["-f".into(), "null".into(), "-".into()]);
     args
+}
+
+/// What one family's probe concluded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Verdict {
+    usable: bool,
+    /// The build accepted [`Encoder::forced_idr_flag`]. Meaningless for the
+    /// families that do not need one.
+    forced_idr: bool,
 }
 
 /// The most useful line of a failed probe's stderr.
@@ -239,35 +332,92 @@ fn first_cause(stderr: &str) -> &str {
         .unwrap_or("no error output")
 }
 
-async fn validate(ffmpeg_bin: &str, encoder: Encoder) -> bool {
-    let output = tokio::process::Command::new(ffmpeg_bin)
-        .args(validation_args(encoder))
+/// One probe run. `Ok(())` on success, `Err(stderr)` otherwise.
+async fn try_encode(ffmpeg_bin: &str, encoder: Encoder, force_idr: bool) -> Result<(), String> {
+    match tokio::process::Command::new(ffmpeg_bin)
+        .args(validation_args(encoder, force_idr))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .output()
-        .await;
-    match output {
-        Ok(out) if out.status.success() => {
-            tracing::info!(encoder = encoder.label(), "hardware encoder validated");
-            true
+        .await
+    {
+        Ok(out) if out.status.success() => Ok(()),
+        Ok(out) => Err(String::from_utf8_lossy(&out.stderr).into_owned()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Test-encode one family with production's arguments, and find out whether it
+/// will take the flag that makes its key frames splittable.
+///
+/// Measured rather than assumed. The alternative — reading `ffmpeg -h full` for
+/// the option name — answers "does this build declare it", which is a
+/// different question from "will this driver accept it", and gets the two
+/// spellings and the per-encoder scoping wrong in ways a string search cannot
+/// notice. The cost is one extra half-second encode, and only on a build that
+/// refuses the flag.
+async fn validate(ffmpeg_bin: &str, encoder: Encoder) -> Verdict {
+    let wants_idr = encoder.forced_idr_flag().is_some();
+    match try_encode(ffmpeg_bin, encoder, wants_idr).await {
+        Ok(()) => {
+            tracing::info!(
+                encoder = encoder.label(),
+                forced_idr = wants_idr,
+                "hardware encoder validated"
+            );
+            Verdict {
+                usable: true,
+                forced_idr: wants_idr,
+            }
         }
-        Ok(out) => {
+        Err(first) if wants_idr => {
+            // The flag is the only difference, so try without it before giving
+            // up on the whole family. Losing a GPU because one option was not
+            // recognised would be a far worse trade than the long segments the
+            // option exists to prevent.
+            match try_encode(ffmpeg_bin, encoder, false).await {
+                Ok(()) => {
+                    tracing::warn!(
+                        encoder = encoder.label(),
+                        flag = encoder.forced_idr_flag().unwrap_or("?"),
+                        reason = first_cause(&first),
+                        "this ffmpeg will not take the forced-IDR flag, so segments will \
+                         follow the encoder's own GOP rather than the requested length — \
+                         playback will start slower than it should"
+                    );
+                    Verdict {
+                        usable: true,
+                        forced_idr: false,
+                    }
+                }
+                Err(second) => {
+                    tracing::warn!(
+                        encoder = encoder.label(),
+                        reason = first_cause(&second),
+                        "hardware encoder present but failed validation — not using it"
+                    );
+                    Verdict {
+                        usable: false,
+                        forced_idr: false,
+                    }
+                }
+            }
+        }
+        Err(why) => {
             // Capturing stderr is the whole point: a bare "software x264" tells
             // the operator nothing, but "vaapi failed: Permission denied" points
             // straight at a missing render-group / device passthrough. Shown in
             // the admin log viewer at WARN.
-            let why = String::from_utf8_lossy(&out.stderr);
             tracing::warn!(
                 encoder = encoder.label(),
                 reason = first_cause(&why),
                 "hardware encoder present but failed validation — not using it"
             );
-            false
-        }
-        Err(e) => {
-            tracing::warn!(encoder = encoder.label(), error = %e, "could not run encoder probe");
-            false
+            Verdict {
+                usable: false,
+                forced_idr: false,
+            }
         }
     }
 }
@@ -288,12 +438,26 @@ pub async fn detect_encoders(ffmpeg_bin: &str) -> EncoderCaps {
     };
 
     // Validate each compiled-in hardware encoder against real hardware.
-    let caps = EncoderCaps {
-        nvenc: compiled.nvenc && validate(ffmpeg_bin, Encoder::Nvenc).await,
-        qsv: compiled.qsv && validate(ffmpeg_bin, Encoder::Qsv).await,
-        vaapi: compiled.vaapi && validate(ffmpeg_bin, Encoder::Vaapi).await,
-        videotoolbox: compiled.videotoolbox && validate(ffmpeg_bin, Encoder::VideoToolbox).await,
-    };
+    let mut caps = EncoderCaps::default();
+    for (compiled_in, encoder) in [
+        (compiled.nvenc, Encoder::Nvenc),
+        (compiled.qsv, Encoder::Qsv),
+        (compiled.vaapi, Encoder::Vaapi),
+        (compiled.videotoolbox, Encoder::VideoToolbox),
+    ] {
+        let verdict = if compiled_in {
+            validate(ffmpeg_bin, encoder).await
+        } else {
+            Verdict {
+                usable: false,
+                forced_idr: false,
+            }
+        };
+        caps.set(encoder, verdict.usable);
+        if verdict.forced_idr {
+            caps.forced_idr.set(encoder);
+        }
+    }
     tracing::info!(
         nvenc = caps.nvenc,
         qsv = caps.qsv,
@@ -414,7 +578,7 @@ mod tests {
             Encoder::Vaapi,
             Encoder::Qsv,
         ] {
-            let args = encoder.encode_args(4000);
+            let args = encoder.encode_args(4000, false);
             assert!(has(&args, encoder.video_codec()), "{encoder:?} codec");
             // 4000k target → 1.5x cap over a 2x window.
             assert!(
@@ -431,9 +595,88 @@ mod tests {
             );
         }
         // Per-family extras survive the shared rate-control block.
-        let sw = Encoder::Software.encode_args(4000);
+        let sw = Encoder::Software.encode_args(4000, false);
         assert!(has(&sw, "veryfast") && has(&sw, "high"));
-        assert!(has(&Encoder::Nvenc.encode_args(4000), "p4"));
+        assert!(has(&Encoder::Nvenc.encode_args(4000, false), "p4"));
+    }
+
+    /// The two spellings, and that they never cross.
+    ///
+    /// QSV's option is `-forced_idr` and NVENC's is `-forced-idr`. Passing
+    /// either name to the other family is an unrecognised option, and ffmpeg
+    /// treats that as a hard exit — so a swap here does not produce longer
+    /// segments, it produces a hardware family that fails validation and
+    /// silently stops being used.
+    #[test]
+    fn each_family_gets_its_own_spelling_of_forced_idr() {
+        let qsv = Encoder::Qsv.encode_args(4000, true);
+        assert!(has(&qsv, "-forced_idr"), "{qsv:?}");
+        assert!(
+            !has(&qsv, "-forced-idr"),
+            "QSV got NVENC's spelling: {qsv:?}"
+        );
+
+        let nvenc = Encoder::Nvenc.encode_args(4000, true);
+        assert!(has(&nvenc, "-forced-idr"), "{nvenc:?}");
+        assert!(
+            !has(&nvenc, "-forced_idr"),
+            "NVENC got QSV's spelling: {nvenc:?}"
+        );
+
+        // The value has to be there too — a bare flag is not a boolean option.
+        for args in [&qsv, &nvenc] {
+            let at = args
+                .iter()
+                .position(|a| a.starts_with("-forced"))
+                .expect("flag");
+            assert_eq!(args.get(at + 1).map(String::as_str), Some("1"), "{args:?}");
+        }
+    }
+
+    /// The families that do not need the flag never get one — including when
+    /// asked. VA-API has no such option (its `idr_interval` already defaults to
+    /// making every I-frame an IDR), and passing an unrecognised option would
+    /// cost the whole family.
+    #[test]
+    fn families_that_do_not_need_forced_idr_never_receive_it() {
+        for encoder in [Encoder::Software, Encoder::Vaapi, Encoder::VideoToolbox] {
+            assert_eq!(encoder.forced_idr_flag(), None, "{encoder:?}");
+            let args = encoder.encode_args(4000, true);
+            assert!(
+                !args.iter().any(|a| a.starts_with("-forced")),
+                "{encoder:?} was handed a forced-IDR flag it has no option for: {args:?}"
+            );
+        }
+    }
+
+    /// Off unless asked. The flag is only passed where the startup probe
+    /// proved the build accepts it, so the default has to be no flag.
+    #[test]
+    fn forced_idr_is_off_unless_the_probe_asked_for_it() {
+        for encoder in [Encoder::Qsv, Encoder::Nvenc] {
+            let args = encoder.encode_args(4000, false);
+            assert!(
+                !args.iter().any(|a| a.starts_with("-forced")),
+                "{encoder:?}: {args:?}"
+            );
+        }
+    }
+
+    /// Which families the probe's answer applies to.
+    #[test]
+    fn the_probes_forced_idr_answer_is_per_family() {
+        let mut caps = ForcedIdr::default();
+        assert!(!caps.wanted_by(Encoder::Qsv));
+        caps.set(Encoder::Qsv);
+        assert!(caps.wanted_by(Encoder::Qsv));
+        assert!(
+            !caps.wanted_by(Encoder::Nvenc),
+            "one family's answer cannot speak for another's"
+        );
+        // Setting a family that has no such option is a no-op rather than a
+        // silent truth about something else.
+        caps.set(Encoder::Vaapi);
+        assert!(!caps.wanted_by(Encoder::Vaapi));
     }
 
     /// The probe must run what production runs. Proving it by *comparison*
@@ -449,8 +692,9 @@ mod tests {
             Encoder::Vaapi,
             Encoder::Qsv,
         ] {
-            let probe = validation_args(encoder);
-            let production = encoder.encode_args(PROBE_BITRATE_KBPS);
+            let force_idr = encoder.forced_idr_flag().is_some();
+            let probe = validation_args(encoder, force_idr);
+            let production = encoder.encode_args(PROBE_BITRATE_KBPS, force_idr);
             let at = probe
                 .windows(production.len())
                 .position(|w| w == production.as_slice());
@@ -503,7 +747,7 @@ mod tests {
     /// to fill a lookahead and large enough to clear hardware minimums.
     #[test]
     fn the_probe_clip_is_long_enough_to_produce_packets() {
-        let args = validation_args(Encoder::Nvenc);
+        let args = validation_args(Encoder::Nvenc, false);
         let src = args
             .iter()
             .find(|a| a.starts_with("testsrc="))

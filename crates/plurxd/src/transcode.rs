@@ -1287,6 +1287,11 @@ impl TranscodeManager {
                 subtitle_burn.is_some(),
             ),
             subtitle_burn,
+            // Only where the startup probe proved this build takes it. A
+            // family that needs the flag and cannot have it still works; its
+            // segments just follow the encoder's GOP, which is slower to start
+            // and is logged as such at boot.
+            force_idr: self.caps.forced_idr.wanted_by(encoder),
             ..Default::default()
         }
     }

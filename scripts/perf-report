@@ -77,6 +77,16 @@ def node_section(out, sys_info):
     enc = sys_info.get("encoders") or {}
     validated = [k for k in ("nvenc", "qsv", "vaapi", "videotoolbox") if enc.get(k)]
     out(f"encoders       validated: {', '.join(validated) or 'none — software only'}")
+    # QSV and NVENC need a flag before their forced key frames are splittable,
+    # and without it the muxer cuts at the encoder's GOP instead — segments five
+    # times longer than asked for, and a viewer waiting for every one of them.
+    idr = (enc.get("forced_idr") or {}) if isinstance(enc, dict) else {}
+    for fam in ("qsv", "nvenc"):
+        if enc.get(fam):
+            state = ("accepted" if idr.get(fam) else
+                     "NOT ACCEPTED — segments will follow the encoder's GOP, "
+                     "not the requested length")
+            out(f"forced IDR     {fam}: {state}")
     out(f"transcoder     {sys_info.get('encoder_selected')} "
         f"(preference: {sys_info.get('hwaccel_pref')})")
     out(f"hw slots       {sys_info.get('hw_slots_in_use')} of {sys_info.get('hw_slots_max')}")
@@ -232,6 +242,24 @@ def ratecontrol_section(out, srv, file_id, height, seconds, window):
     out(f"  {len(sizes)} segments · {total_s:.1f}s of media · "
         f"mean {total_b / total_s / 1e6:.2f} Mb/s")
 
+    # Segment length, which is a different question from bitrate and the one
+    # that decides how long a viewer stares at a spinner: nothing plays until a
+    # whole segment exists. The server asks for SEGMENT_SECONDS, but the HLS
+    # muxer can only cut at a key frame the encoder actually flagged — so this
+    # reports what was delivered, not what was requested. Ten-second segments
+    # from a two-second request is the shape of a hardware encoder whose forced
+    # key frames are not IDR.
+    durs = sorted(d for _, d, _ in sizes)
+    med = durs[len(durs) // 2]
+    out(f"  segment length: median {med:.2f}s · min {durs[0]:.2f}s · max {durs[-1]:.2f}s")
+    if med > 3.0:
+        out(f"  ⚠ segments are {med:.1f}s, not ~2s. Nothing plays until one exists, so "
+            "this is start-up latency directly.")
+        out("    On QSV/NVENC the usual cause is forced key frames that are not IDR; "
+            "look for a boot warning about the forced-IDR flag.")
+    else:
+        out("    (~2s as requested — the muxer is cutting where it was asked to.)")
+
     # Peak over a sliding window of `window` seconds.
     peak, peak_at = 0.0, 0.0
     elapsed = 0.0
@@ -310,9 +338,6 @@ def main():
     if st != 200:
         sys.exit(f"/system says {st}: {sys_info} — is {args.user} an admin?")
     st, settings = srv.call("/settings")
-    st, logs = srv.call("/system/logs?level=debug&limit=2000")
-    if not isinstance(logs, list):
-        logs = []
 
     host = re.sub(r"[^a-zA-Z0-9]+", "-", args.url.split("//")[-1]).strip("-")
     path = args.out or f"perf-report-{host}-{datetime.now().strftime('%Y%m%d-%H%M')}.txt"
@@ -321,6 +346,21 @@ def main():
     def out(line=""):
         buf.append(line)
         print(line)
+
+    # The rate-control run happens FIRST and is held back for printing, so the
+    # log fetch below sees the session it started. Read in the obvious order,
+    # this fetched the logs and then started a session — and so could never
+    # report the one ffmpeg command most worth reading.
+    rc_lines = []
+    if args.ratecontrol:
+        rc = rc_lines.append
+        print("running the rate-control measurement…", file=sys.stderr)
+        ratecontrol_section(rc, srv, args.ratecontrol, args.height,
+                            args.seconds, args.window)
+
+    st, logs = srv.call("/system/logs?level=debug&limit=2000")
+    if not isinstance(logs, list):
+        logs = []
 
     out("=" * 72)
     out(f"plurx perf report · {datetime.now(timezone.utc).isoformat(timespec='seconds')}")
@@ -333,11 +373,11 @@ def main():
     out("-- what ran, and what it cost --------------------------------------")
     log_section(out, logs, settings if isinstance(settings, dict) else {})
 
-    if args.ratecontrol:
+    if rc_lines:
         out("")
         out("-- §4.6 bounded rate control ---------------------------------------")
-        ratecontrol_section(out, srv, args.ratecontrol, args.height,
-                            args.seconds, args.window)
+        for line in rc_lines:
+            out(line)
 
     out("")
     out("-- raw ---------------------------------------------------------------")
