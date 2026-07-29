@@ -343,7 +343,17 @@
   .statsx{background:transparent;border:0;color:rgba(255,255,255,.6);font-size:13px;line-height:1;cursor:pointer;padding:6px 8px;border-radius:6px}
   .statsx:hover{background:rgba(255,255,255,.1);color:#fff}
   .statsbody{overflow-y:auto;overscroll-behavior:contain;-webkit-overflow-scrolling:touch;padding:10px 13px 11px}
-  .statsov b{color:rgba(255,255,255,.5);font-weight:600;display:inline-block;min-width:104px}
+  /* Two real columns rather than an inline-block label with a minimum width.
+     That version had no gap of its own, so any label wider than the minimum
+     touched its value ("Client estimate338 Mb/s"), and a value long enough to
+     wrap — the Reason line, every time — came back to the left margin and read
+     as a new field. A grid fixes both: the gap is the gutter, and wrapped text
+     stays inside the value column. Each row is its own grid, so the width is
+     fixed rather than max-content; every label here fits 116px at this size.
+     Section headers opt out, being one item and not two. */
+  .statsbody > div{display:grid;grid-template-columns:116px minmax(0,1fr);gap:0 10px;align-items:baseline}
+  .statsbody > div.sechd{display:block}
+  .statsov b{color:rgba(255,255,255,.5);font-weight:600}
   .statsov .sechd{color:var(--accent);font-weight:700;margin-top:8px;text-transform:uppercase;letter-spacing:.05em;font-size:10.5px}
   .statsov .sechd:first-child{margin-top:0}
   .pmenu{position:absolute;top:60px;right:20px;min-width:190px;max-width:300px;background:rgba(14,16,22,.97);border:1px solid rgba(255,255,255,.14);
@@ -3506,7 +3516,10 @@ function updateStats(){
     const parts=[];
     if(k.supply) parts.push(`${k.supply} supply`);
     if(k.decode) parts.push(`${k.decode} decode`);
-    srv+=`<div><b>Stalls</b>${PLAYER.stalls}${parts.length?` <span style="opacity:.7">(${parts.join(" · ")})</span>`:''}</div>`;
+    // One <span> around the whole value, not a bare number plus a sibling:
+    // the row is a two-column grid and a third child would drop into the next
+    // row's label column.
+    srv+=`<div><b>Stalls</b><span>${PLAYER.stalls}${parts.length?` <span style="opacity:.7">(${parts.join(" · ")})</span>`:''}</span></div>`;
   }
   const rate = v.playbackRate&&v.playbackRate!==1? ` · ${v.playbackRate}×`:'';
   const durTxt = PLAYER.durMs? ' / '+clockFromSec(PLAYER.durMs/1000):'';
@@ -3521,7 +3534,7 @@ function updateStats(){
     `<div><b>Bitrate</b>${srcBr}</div>`+
     `<div><b>Container</b>${esc(srcCont)}</div>`+
     `<div><b>Audio</b>${esc(aLine)}</div>`+
-    `<div><b>AV offset</b>${(PLAYER.aoffset||0)+" ms"}${PLAYER.declared?` <span style="opacity:.6">(container ${PLAYER.declared>0?"+":""}${PLAYER.declared} ms)</span>`:''}</div>`+
+    `<div><b>AV offset</b><span>${(PLAYER.aoffset||0)+" ms"}${PLAYER.declared?` <span style="opacity:.6">(container ${PLAYER.declared>0?"+":""}${PLAYER.declared} ms)</span>`:''}</span></div>`+
     `<div class="sechd">Now decoding</div>`+
     `<div><b>Resolution</b>${tgtRes}</div>`+
     `<div><b>Dropped</b>${dropped} frames</div>`+
