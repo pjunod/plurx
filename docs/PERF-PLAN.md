@@ -602,6 +602,51 @@ verified here is the case that matters most — whether a real Chrome accepts
 Dolby Vision HEVC through MediaSource. That is why there is a veto rather than
 a version check.
 
+### 4.3ter The buffer targets did not survive being reused (found 2026-07-29)
+
+§4.3 picked 60 s forward and 30 s back. Correctly — for a **transcode**, whose
+output is bounded by its rung (§4.6), so 90 seconds of an 8 Mb/s stream is
+~90 MB and sits comfortably inside any browser's MSE quota.
+
+§4.3bis then routed big remuxes down the same hls.js path, and a remux carries
+the **source's** bitrate. The same 90 seconds of a 69 Mb/s film is **776 MB**,
+against a quota nearer 150 MB. hls.js spent the whole playback appending,
+hitting `QuotaExceededError`, evicting, and appending again — and the eviction
+runs near the playhead. What that looks like from a sofa is a hitch every few
+seconds that never lasts the 350 ms a stall needs, so it appeared nowhere in
+the report and every other number read as healthy: full buffer, 1.1% dropped
+frames, one stall.
+
+Two things made it hard to see. The regression arrived with the fix for
+§4.3bis, so it looked like a property of the file rather than of the change;
+and the `buffer_limit` beacon that records exactly this had been in the client
+since M0 but was never surfaced by `scripts/perf-report`.
+
+**The lesson is the reuse, not the numbers.** A constant tuned against one
+stream's bitrate was applied to a path where the bitrate is an order of
+magnitude larger, and nothing in the type system, the tests, or the plan
+noticed — because 60 and 30 are *seconds*, and the constraint they have to
+satisfy is *bytes*.
+
+Fixed by deriving the seconds from a byte budget whenever the video is copied,
+and leaving §4.3's numbers exactly as they are for anything whose bitrate is
+already bounded:
+
+| source | forward | back | buffered |
+| --- | --- | --- | --- |
+| transcode (any) | 60 s | 30 s | ~90 MB |
+| 8 Mb/s copy | 60 s | 30 s | 90 MB |
+| 25 Mb/s copy | 31 s | 10 s | 128 MB |
+| 69 Mb/s copy | 11 s | 4 s | 129 MB |
+| 98 Mb/s copy | 8 s | 3 s | 135 MB |
+
+The back buffer gets a much smaller floor than the forward one: it holds video
+already watched, so every second of it is quota spent on data nobody will see
+again. A total cap is applied last, because past roughly 150 Mb/s the floors
+stop fitting and the honest answer is a small buffer that survives rather than
+a comfortable one that gets evicted — a stream that big does not belong on the
+copy path at all, which is a routing question rather than a buffering one.
+
 ### 4.4 2-second segments (halves the start floor, B4)
 
 `SEGMENT_SECONDS: 4 → 2` (`transcode/mod.rs:20`) — the constant already

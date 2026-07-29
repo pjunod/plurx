@@ -255,6 +255,20 @@ def log_section(out, logs, cache_settings, srv=None):
     # whole point: `supply` ran out of buffered video and is a server or link
     # problem; `decode` had video in hand and could not play it, which is the
     # browser and which no amount of pacing will improve.
+    # Buffer-quota beacons. hls.js asks for a target in seconds; the browser
+    # enforces a limit in BYTES that no setting can raise. When the two
+    # disagree the result is an append/evict cycle that hitches near the
+    # playhead every few seconds and never lasts the 350ms a stall needs — so
+    # it shows up nowhere else in this report, and reads as a healthy session.
+    quota = [l for l in lines if "buffer_limit" in l]
+    if quota:
+        out("")
+        out(f"  ⚠ {len(quota)} buffer-limit beacon(s): the browser refused the buffer size")
+        out("    the player asked for. Repeated eviction near the playhead is a hitch")
+        out("    every few seconds that never registers as a stall.")
+        for l in quota[-3:]:
+            out("    " + l[:220])
+
     # The browser's own verdict on hardware decode, hoisted out of the beacons
     # because it changes how every line below is read. A machine
     # software-decoding 4K shows a full buffer, few dropped frames and constant

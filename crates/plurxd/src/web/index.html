@@ -1032,7 +1032,9 @@ function reportBufferLimit(kind, d){
     message:`${kind} after ${ctx.runway}s buffered (x${n})`,
     // What the player ASKED for, beside what it got — the comparison that
     // says whether our seconds target or the browser's quota is the limit.
-    target:60}, ctx));
+    // Read from the live config rather than restated: a hardcoded 60 here
+    // would have kept claiming 60 long after the target became bitrate-aware.
+    target:(p.hls&&p.hls.config&&p.hls.config.maxBufferLength)||null}, ctx));
 }
 // Durations. Home video made this care about seconds: a 6-second phone clip
 // reading "0m" is worse than saying nothing.
@@ -2289,10 +2291,11 @@ function attachHls(video, playlistUrl, startAt){
     // §4.3). backBufferLength is bounded (hls.js keeps everything by default)
     // because the server already prunes played-past segments and a two-hour
     // 4K session would otherwise grow the tab's memory for the whole film.
+    const tgt=bufferTargets();
     const hls=new Hls({
       enableWorker:false,
-      maxBufferLength:60,
-      backBufferLength:30,
+      maxBufferLength:tgt.fwd,
+      backBufferLength:tgt.back,
       // Told before the first fragment loads, not seeked afterwards. Seeking
       // after attach downloads the opening of the film and throws it away —
       // on a 4K cache hit that is tens of megabytes and several seconds of
@@ -2658,6 +2661,58 @@ function segmentedRemuxOk(decision, video){
   const track=(decision.audio||[]).find(a=>a.default) || (decision.audio||[])[0];
   const audio=decision.transcode_audio? "aac" : (track&&track.codec);
   return mseCanTake(src.video_codec, audio);
+}
+// Buffer targets in SECONDS, bounded by BYTES — and the bytes are the point.
+//
+// §4.3 picked 60s forward and 30s back, correctly, for a TRANSCODE: its output
+// is bounded by the rung (§4.6), so 90 seconds of an 8 Mb/s stream is ~90 MB
+// and sits comfortably inside any browser's MSE quota.
+//
+// §4.3bis then started routing big remuxes down the same hls.js path, and a
+// remux carries the SOURCE's bitrate. The same 90 seconds of a 69 Mb/s film is
+// ~775 MB against a quota nearer 150 MB, so hls.js spends the whole playback
+// appending, hitting QuotaExceededError, evicting, and appending again. The
+// eviction runs near the playhead, and what a viewer sees is a hitch every few
+// seconds that never lasts long enough to count as a stall.
+//
+// So: keep the seconds for anything whose bitrate is already bounded, and for
+// a copied stream derive the seconds from a byte budget instead. The floor
+// exists because a very large file would otherwise buffer almost nothing.
+const MSE_FORWARD_BYTES=96e6;
+const MSE_BACK_BYTES=32e6;
+// A forward floor, because a very large file would otherwise buffer almost
+// nothing. The BACK buffer gets a much smaller one: it holds video already
+// watched, so every second of it is quota spent on data nobody is going to
+// see again — at 98 Mb/s a 6s back buffer is 73 MB, which was enough on its
+// own to push the total back over the limit this exists to stay under.
+const MSE_MIN_SECS=6;
+const MSE_MIN_BACK_SECS=2;
+// The invariant, enforced last. The two budgets above already sum to a fixed
+// number of bytes, so the only things that can break it are the floors (at a
+// very high bitrate) and the 60s/30s caps (at a low one, harmlessly). Past
+// roughly 150 Mb/s the floors no longer fit and the honest answer is a small
+// buffer that fits rather than a comfortable one that gets evicted — a stream
+// that big does not belong on the copy path at all, which is a routing
+// decision (§4.3bis) rather than one this function can make.
+const MSE_TOTAL_BYTES=144e6;
+function bufferTargets(){
+  const p=PLAYER||{};
+  // Only a copied stream puts the source's own bitrate on the wire. A
+  // transcode's source bitrate says nothing about what it will send, and
+  // using it here would shrink the buffer on exactly the streams that do not
+  // need it.
+  const bps=p.copyHls ? ((p.source&&p.source.bitrate)||0) : 0;
+  if(!bps || bps<=0) return {fwd:60, back:30, budgeted:false};
+  const secs=(b,floor)=>Math.max(floor, Math.min(60, 8*b/bps));
+  let fwd=secs(MSE_FORWARD_BYTES, MSE_MIN_SECS);
+  let back=Math.min(30, secs(MSE_BACK_BYTES, MSE_MIN_BACK_SECS));
+  const total=(fwd+back)*bps/8;
+  if(total>MSE_TOTAL_BYTES){
+    const k=MSE_TOTAL_BYTES/total;
+    fwd=Math.max(4, fwd*k);
+    back=Math.max(1, back*k);
+  }
+  return {fwd:Math.round(fwd), back:Math.round(back), budgeted:true};
 }
 function teardownHls(){ if(PLAYER&&PLAYER.hls){ try{PLAYER.hls.destroy()}catch(e){} PLAYER.hls=null; } }
 // Every timer hanging off PLAYER, stopped. Anything that replaces or discards
@@ -3689,6 +3744,9 @@ function updateStats(){
     // software 4K HEVC decode is a full buffer, few dropped frames and
     // constant judder — indistinguishable from a delivery problem on every
     // other line of this panel.
+    (PLAYER.hls&&PLAYER.hls.config?`<div><b>Buffer target</b><span class="muted">${
+      PLAYER.hls.config.maxBufferLength}s ahead · ${PLAYER.hls.config.backBufferLength}s behind${
+      PLAYER.bufferLimits&&PLAYER.bufferLimits.quota?` · ${PLAYER.bufferLimits.quota} quota refusals`:''}</span></div>`:'')+
     (PLAYER.decodeInfo?`<div><b>Decoder</b><span${PLAYER.decodeInfo.hw?'':' style="color:var(--warn,#fbbf24)"'}>${
       PLAYER.decodeInfo.hw?'hardware':'software — this machine has no GPU path for this stream'}${
       PLAYER.decodeInfo.smooth?'':' · browser does not expect it to be smooth'}</span></div>`:'')+
