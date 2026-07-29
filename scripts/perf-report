@@ -67,6 +67,33 @@ def clean(s):
     return ANSI.sub("", s)
 
 
+# `/settings` returns API keys in the clear, because an admin editing them has
+# to see what is there. A diagnostic report does not: it gets pasted into a
+# chat, attached to an issue, and kept in a downloads folder. The first version
+# of this dumped them verbatim — TMDB, OMDb, Trakt and monarr, all of them, in
+# a file whose entire purpose is to be sent to somebody else.
+SECRET = re.compile(r"(key|secret|token|password)", re.I)
+
+
+def redact(obj):
+    """Every value whose *name* says it is a credential, replaced by its shape.
+
+    Matching on the name rather than the value, because a key is only
+    recognisable by what it is called — and a report that leaks one because the
+    pattern did not match is worse than one that redacts a field it needn't.
+    The length is kept: "did the key get truncated" is a real diagnostic
+    question, and it does not need the key to answer it.
+    """
+    if isinstance(obj, dict):
+        return {k: (f"<redacted, {len(v)} chars>"
+                    if SECRET.search(k) and isinstance(v, str) and v
+                    else redact(v))
+                for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [redact(v) for v in obj]
+    return obj
+
+
 # ---- sections -------------------------------------------------------------
 
 def node_section(out, sys_info):
@@ -116,15 +143,36 @@ def log_section(out, logs, cache_settings):
     """What actually ran, and what the browsers measured."""
     lines = [clean(e.get("message", "")) for e in logs]
 
+    def field(line, name):
+        """A tracing field: quoted values keep their spaces, bare ones don't."""
+        m = re.search(rf'\b{name}="([^"]*)"', line) or re.search(rf"\b{name}=(\S*)", line)
+        return m.group(1) if m else "?"
+
     ran = [l for l in lines if "transcode ffmpeg args:" in l]
     out(f"transcode sessions in the log ring: {len(ran)}")
     seen = {}
     for l in ran:
-        m = re.search(r"encoder=\"?([^\"\s]+)\"?.*pipeline=\"?([^\"\s]+)\"?", l)
-        if m:
-            seen[m.group(1, 2)] = seen.get(m.group(1, 2), 0) + 1
-    for (encoder, pipeline), n in sorted(seen.items(), key=lambda kv: -kv[1]):
-        out(f"  {n:4d} × encoder={encoder} pipeline={pipeline}")
+        key = (field(l, "encoder"), field(l, "pipeline"), field(l, "proven"))
+        seen[key] = seen.get(key, 0) + 1
+    for (encoder, pipeline, proven), n in sorted(seen.items(), key=lambda kv: -kv[1]):
+        note = "" if pipeline == proven or proven == "?" else f" (node proved {proven})"
+        out(f"  {n:4d} × encoder={encoder} · pipeline={pipeline}{note}")
+
+    # Why a session did not get the graph this node proved. Usually a correct
+    # answer — Dolby Vision cannot go through a vendor tone-map — and without
+    # it `pipeline=cpu` on a 4K HDR title is indistinguishable from the GPU
+    # path being broken.
+    declined = {}
+    for l in ran:
+        why = field(l, "declined")
+        if why not in ("", "?"):
+            declined[(field(l, "hdr"), why)] = declined.get((field(l, "hdr"), why), 0) + 1
+    if declined:
+        out("")
+        out("  sessions that did NOT get this node's proven graph:")
+        for (hdr, why), n in sorted(declined.items(), key=lambda kv: -kv[1]):
+            out(f"    {n:4d} × [{hdr}] {why}")
+
     if ran:
         out("")
         out("  most recent command (this is what production ran):")
@@ -382,7 +430,7 @@ def main():
     out("")
     out("-- raw ---------------------------------------------------------------")
     out(json.dumps({"system": sys_info,
-                    "settings": settings if isinstance(settings, dict) else None},
+                    "settings": redact(settings if isinstance(settings, dict) else None)},
                    indent=2, sort_keys=True))
 
     with open(path, "w", encoding="utf-8") as f:

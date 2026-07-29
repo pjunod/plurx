@@ -2128,8 +2128,22 @@ impl TranscodeManager {
         // Log the exact command — the single most useful diagnostic. It reveals
         // the decode/filter/encode pipeline actually used (e.g. whether heavy
         // HEVC is being hardware-decoded), and confirms which build is running.
+        //
+        // And, when this session did not get the graph the node proved, why
+        // not. Without it `pipeline=cpu` on a 4K HDR title reads as the GPU
+        // path being broken, when the usual answer is that the source is Dolby
+        // Vision and the CPU chain is the *correct* choice.
+        let declined = Pipeline::declined(
+            self.pipeline,
+            encoder,
+            file.hdr.as_deref(),
+            transcode::heavy_source(&file),
+            opts.subtitle_burn.is_some(),
+        );
         tracing::info!(
             %session_id, encoder = encoder.label(), pipeline = opts.pipeline.name(),
+            proven = self.pipeline.name(), hdr = file.hdr.as_deref().unwrap_or("sdr"),
+            declined = declined.unwrap_or(""),
             "transcode ffmpeg args: {}", args.join(" ")
         );
         let progress = Arc::new(Progress::new());

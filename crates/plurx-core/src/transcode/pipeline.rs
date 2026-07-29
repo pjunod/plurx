@@ -279,10 +279,57 @@ impl Pipeline {
         heavy: bool,
         burns_subtitles: bool,
     ) -> Pipeline {
-        if !heavy || burns_subtitles || !proven.handles(hdr_format) || !proven.pairs_with(encoder) {
-            return Pipeline::Cpu;
+        match Pipeline::declined(proven, encoder, hdr_format, heavy, burns_subtitles) {
+            Some(_) => Pipeline::Cpu,
+            None => proven,
         }
-        proven
+    }
+
+    /// Why this session is not getting the graph the node proved, in words.
+    ///
+    /// `None` when it is getting it — or when there was nothing to decline,
+    /// because the CPU chain is all this node has.
+    ///
+    /// [`Pipeline::for_session`] is defined in terms of this, so the decision
+    /// and its explanation cannot drift apart. That matters more than it
+    /// sounds. The doc above has said "the log says why" since M2 shipped, and
+    /// the log did not: it printed `pipeline=cpu` on a 4K HDR session, on a box
+    /// that had just probed a GPU graph at 4.9× — and left the reader to guess
+    /// which of four conditions had fired. A fallback nobody can explain is
+    /// indistinguishable from a bug, and this one is usually *correct*.
+    pub fn declined(
+        proven: Pipeline,
+        encoder: Encoder,
+        hdr_format: Option<&str>,
+        heavy: bool,
+        burns_subtitles: bool,
+    ) -> Option<&'static str> {
+        if proven == Pipeline::Cpu {
+            return None;
+        }
+        if !heavy {
+            return Some("light source — a GPU graph is not worth the handoff");
+        }
+        if burns_subtitles {
+            return Some("a burned subtitle is composited in system memory");
+        }
+        if !proven.handles(hdr_format) {
+            return Some(match hdr_format {
+                Some("dolby_vision") => {
+                    "Dolby Vision — the vendor tone-map cannot read its dynamic metadata, \
+                     so the CPU chain is the correct answer rather than a fallback"
+                }
+                Some("hlg") => {
+                    "HLG — the vendor tone-map handles it inconsistently across drivers, and \
+                     a wrong answer there is a washed-out picture nobody reports"
+                }
+                _ => "the source's HDR format is not one the vendor tone-map is built for",
+            });
+        }
+        if !proven.pairs_with(encoder) {
+            return Some("the proven graph and this session's encoder are different families");
+        }
+        None
     }
 
     /// The next thing to try when this pipeline fails at runtime.
@@ -483,6 +530,59 @@ mod tests {
         assert_eq!(
             Pipeline::for_session(Pipeline::Cpu, Encoder::Qsv, Some("hdr10"), true, false),
             Pipeline::Cpu
+        );
+    }
+
+    /// Every route back to the CPU chain can say which one it was, and the
+    /// answer never disagrees with the decision.
+    ///
+    /// The pairing is the point. `pipeline=cpu` on a 4K HDR session, on a box
+    /// whose probe just cleared a GPU graph at 4.9×, reads as the GPU path
+    /// being broken — when the usual truth is Dolby Vision, where the CPU
+    /// chain is *correct*. A silent right answer and a silent wrong one look
+    /// identical, so neither may be silent.
+    #[test]
+    fn every_route_to_the_cpu_chain_says_which_one_it_was() {
+        let proven = Pipeline::VppQsv;
+        let cases: &[(&str, Option<&str>, bool, bool, Encoder)] = &[
+            // (what we expect the reason to mention, hdr, heavy, burns, encoder)
+            (
+                "Dolby Vision",
+                Some("dolby_vision"),
+                true,
+                false,
+                Encoder::Qsv,
+            ),
+            ("HLG", Some("hlg"), true, false, Encoder::Qsv),
+            ("subtitle", Some("hdr10"), true, true, Encoder::Qsv),
+            ("light source", Some("hdr10"), false, false, Encoder::Qsv),
+            ("families", Some("hdr10"), true, false, Encoder::Software),
+        ];
+        for (expect, hdr, heavy, burns, encoder) in cases {
+            let why = Pipeline::declined(proven, *encoder, *hdr, *heavy, *burns);
+            let why = why.unwrap_or_else(|| panic!("{expect}: no reason given"));
+            assert!(
+                why.contains(expect),
+                "{expect}: reason does not say so — {why:?}"
+            );
+            assert_eq!(
+                Pipeline::for_session(proven, *encoder, *hdr, *heavy, *burns),
+                Pipeline::Cpu,
+                "{expect}: a reason was given but the graph was used anyway"
+            );
+        }
+
+        // A session that gets the proven graph has nothing to explain…
+        assert_eq!(
+            Pipeline::declined(proven, Encoder::Qsv, Some("hdr10"), true, false),
+            None
+        );
+        // …and neither does a node that never had one to decline. Reporting
+        // "light source" on a software-only box would be noise on every
+        // session it ever runs.
+        assert_eq!(
+            Pipeline::declined(Pipeline::Cpu, Encoder::Software, None, false, false),
+            None
         );
     }
 
