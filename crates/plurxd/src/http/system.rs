@@ -177,6 +177,38 @@ pub async fn system_info(
     }))
 }
 
+#[derive(Serialize)]
+pub struct MediaShapeDto {
+    pub probed: i64,
+    pub unprobed: i64,
+    pub hdr: Vec<(String, i64)>,
+    pub hdr_4k: Vec<(String, i64)>,
+    pub codecs: Vec<(String, i64)>,
+    pub over_segmented_floor: i64,
+    pub max_bitrate: Option<i64>,
+}
+
+/// GET /api/v1/system/library-shape (admin) — what the libraries actually hold.
+///
+/// Its own route rather than a field on `/system` because it is a table scan.
+/// `/system` is polled by the settings page every few seconds; a census that
+/// rides along with it would put a scan of every file behind a UI timer.
+pub async fn library_shape(
+    _admin: AdminUser,
+    State(state): State<AppState>,
+) -> Result<Json<MediaShapeDto>, ApiError> {
+    let s = state.store.media_shape().await?;
+    Ok(Json(MediaShapeDto {
+        probed: s.probed,
+        unprobed: s.unprobed,
+        hdr: s.hdr,
+        hdr_4k: s.hdr_4k,
+        codecs: s.codecs,
+        over_segmented_floor: s.over_segmented_floor,
+        max_bitrate: s.max_bitrate,
+    }))
+}
+
 /// Measure every library's storage and record the result on `state`.
 ///
 /// Shared by the boot task and the admin re-run so there is one definition of

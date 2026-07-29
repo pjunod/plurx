@@ -953,7 +953,22 @@ against a plan's guess at them.
 ## 5. M2 — the real 4K fix: tone-map on the GPU (kills B2)
 
 **Status:** the graph is accepted; how much of a real library it reaches is
-not. `vpp_qsv` passed nynuc's boot probe at **4.88–4.89× the CPU chain**,
+now *measurable* — `GET /api/v1/system/library-shape` and the `library shape`
+section of `scripts/perf-report` count what is on disk by HDR flavour, at 4K
+and overall.
+
+That question needed asking because the probe cannot answer it. The graph is
+raced against a generated HDR10 fixture, and the same graph is **declined
+outright for Dolby Vision** — the vendor filter cannot read its dynamic
+metadata, so those titles take the CPU chain regardless of how fast the GPU
+one measured. A node can therefore report a 5x tone-map and get it on almost
+nothing. The census states the split directly: of N 4K HDR files, the GPU
+graph can take the HDR10 and HLG ones, and the Dolby Vision remainder is not
+a fallback but the correct answer.
+
+Aggregated in SQL, one scan, on its own route rather than as a field on
+`/system` — the settings page polls `/system` every few seconds, and a table
+scan behind a UI timer is a different kind of mistake. `vpp_qsv` passed nynuc's boot probe at **4.88–4.89× the CPU chain**,
 above the ≥3× objective. Every node reports its own verdicts on Settings →
 System and in `/api/v1/system`.
 

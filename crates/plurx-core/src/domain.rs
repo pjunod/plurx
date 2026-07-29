@@ -540,6 +540,40 @@ pub struct ItemPage {
     pub total: i64,
 }
 
+/// What a library is actually made of, in the terms the transcoder cares about.
+///
+/// Exists to answer a question PERF-PLAN §5 could not. The GPU tone-map passed
+/// its probe at ~5× the CPU chain, but it is declined outright for Dolby
+/// Vision — the vendor filter cannot read the dynamic metadata. "The graph is
+/// accepted" and "the graph helps *this* library" are different claims, and
+/// only a census of what is on disk settles the second.
+///
+/// Counts, deliberately, not a list. Nobody needs to know which files; they
+/// need to know whether the 4K HDR they own is mostly the kind the fast path
+/// can reach.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MediaShape {
+    /// Files with a successful probe. Everything below is a subset — an
+    /// unprobed file has no codec, no height and no HDR flavour, and counting
+    /// it in a denominator would understate every percentage.
+    pub probed: i64,
+    /// Files nothing has ever read. Reported because a large number here makes
+    /// the rest of this a sample rather than a census.
+    pub unprobed: i64,
+    /// `sdr` | `hdr10` | `hlg` | `dolby_vision` → count, over probed files.
+    pub hdr: Vec<(String, i64)>,
+    /// The same split, restricted to 4K. This is the set M2's tone-map exists
+    /// for: at 1080p the CPU chain is fast enough that the question does not
+    /// arise.
+    pub hdr_4k: Vec<(String, i64)>,
+    /// Video codec → count.
+    pub codecs: Vec<(String, i64)>,
+    /// Files at or above the bitrate where a progressive remux stops coping
+    /// (§4.3bis) — the set that now takes the segmented path.
+    pub over_segmented_floor: i64,
+    pub max_bitrate: Option<i64>,
+}
+
 /// A user's linked Trakt account (tokens + sync bookkeeping).
 #[derive(Debug, Clone)]
 pub struct TraktAuth {

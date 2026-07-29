@@ -9,3 +9,12 @@ _to_delete/
 *.bundle
 deploy/docker-compose.override.yml
 deploy/.env
+
+# perf-report writes its output into the working directory, and the server
+# checkouts are reset to the remote — an untracked report is the one thing in
+# them worth keeping, so name it here rather than sweeping it by hand.
+perf-report-*.txt
+# Merge residue. A .orig sitting in a checkout means someone resolved a
+# conflict there; git leaves them behind and nothing cleans them up.
+*.orig
+*.rej

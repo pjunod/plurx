@@ -11,7 +11,7 @@ use super::{
 };
 use crate::domain::{
     sort_title_for, ArtworkAttempt, Item, ItemEdit, ItemKind, ItemPage, ItemSort, MediaFile,
-    MetadataPatch, NewItem, ProbeResult, RecentItem,
+    MediaShape, MetadataPatch, NewItem, ProbeResult, RecentItem,
 };
 use crate::error::StoreError;
 use crate::store::MediaStore;
@@ -715,6 +715,72 @@ impl MediaStore for SqliteStore {
         .await
     }
 
+    async fn media_shape(&self) -> Result<MediaShape, StoreError> {
+        self.with_conn(|conn| {
+            // "Probed" is `video_codec IS NOT NULL`, which is what every other
+            // read in the app treats as "we have looked at this file". A row
+            // that was never read has NULL in every column below, and letting
+            // those into a denominator would report a library as 60% SDR when
+            // 40% of it has simply never been opened.
+            let probed: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM files WHERE video_codec IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )?;
+            let unprobed: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM files WHERE video_codec IS NULL",
+                [],
+                |r| r.get(0),
+            )?;
+
+            let pairs = |sql: &str| -> Result<Vec<(String, i64)>, StoreError> {
+                let mut st = conn.prepare(sql)?;
+                let rows =
+                    st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+                let mut out: Vec<(String, i64)> = rows.collect::<Result<_, _>>()?;
+                // Biggest first: the shape of a library is the first two lines
+                // of this, and alphabetical order buries them.
+                out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                Ok(out)
+            };
+
+            let hdr = pairs(
+                "SELECT COALESCE(NULLIF(hdr,''),'sdr'), COUNT(*) FROM files \
+                 WHERE video_codec IS NOT NULL GROUP BY 1",
+            )?;
+            // 4K by height rather than by width: 3840x1600 scope-cropped
+            // releases are 4K and would be missed by a width test, and nothing
+            // that is not 4K is 1600 lines tall.
+            let hdr_4k = pairs(
+                "SELECT COALESCE(NULLIF(hdr,''),'sdr'), COUNT(*) FROM files \
+                 WHERE video_codec IS NOT NULL AND height >= 1600 GROUP BY 1",
+            )?;
+            let codecs = pairs(
+                "SELECT LOWER(video_codec), COUNT(*) FROM files \
+                 WHERE video_codec IS NOT NULL GROUP BY 1",
+            )?;
+
+            let over_segmented_floor: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM files WHERE bitrate >= 40000000",
+                [],
+                |r| r.get(0),
+            )?;
+            let max_bitrate: Option<i64> =
+                conn.query_row("SELECT MAX(bitrate) FROM files", [], |r| r.get(0))?;
+
+            Ok(MediaShape {
+                probed,
+                unprobed,
+                hdr,
+                hdr_4k,
+                codecs,
+                over_segmented_floor,
+                max_bitrate,
+            })
+        })
+        .await
+    }
+
     async fn get_file(&self, id: i64) -> Result<Option<MediaFile>, StoreError> {
         self.with_conn(move |conn| {
             Ok(conn
@@ -949,6 +1015,127 @@ mod tests {
         NewLibrary, ProbeResult,
     };
     use crate::store::{LibraryStore, MediaStore, SqliteStore};
+
+    /// The census PERF-PLAN §5 is waiting on, against rows whose answer is
+    /// known by construction. The arithmetic is trivial; the SQL is not, and
+    /// every mistake it can make (counting unprobed rows as SDR, missing the
+    /// 4K cut, treating empty string as a flavour) produces a plausible number
+    /// rather than an error.
+    #[tokio::test]
+    async fn media_shape_counts_what_the_transcoder_cares_about() {
+        let store = SqliteStore::open_in_memory().expect("open");
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "Movies".into(),
+                kind: LibraryKind::Movies,
+                paths: vec![PathBuf::from("/media")],
+                anime: false,
+            })
+            .await
+            .expect("lib")
+            .id;
+
+        let add = |title: &str, hdr: Option<&str>, height: i64, bitrate: i64| {
+            let (title, hdr) = (title.to_owned(), hdr.map(str::to_owned));
+            let store = &store;
+            async move {
+                let item = store
+                    .insert_item(&NewItem {
+                        library_id: lib,
+                        kind: ItemKind::Movie,
+                        parent_id: None,
+                        title: title.clone(),
+                        year: Some(2024),
+                        season_number: None,
+                        episode_number: None,
+                    })
+                    .await
+                    .expect("item");
+                store
+                    .upsert_file(
+                        item,
+                        &format!("/media/{title}.mkv"),
+                        1,
+                        1,
+                        &ProbeResult {
+                            container: Some("mkv".into()),
+                            video_codec: Some("hevc".into()),
+                            height: Some(height),
+                            hdr: hdr.clone(),
+                            bitrate: Some(bitrate),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("file");
+            }
+        };
+        add("dv4k", Some("dolby_vision"), 2160, 69_000_000).await;
+        add("dv4k2", Some("dolby_vision"), 2160, 45_000_000).await;
+        add("hdr4k", Some("hdr10"), 2160, 50_000_000).await;
+        add("hlg4k", Some("hlg"), 2160, 30_000_000).await;
+        add("sdr4k", None, 2160, 20_000_000).await;
+        // 1080p HDR10: real, but not the set M2 is about.
+        add("hdr1080", Some("hdr10"), 1080, 12_000_000).await;
+
+        // A file that was never probed. It must not land in any flavour.
+        let ghost = store
+            .insert_item(&NewItem {
+                library_id: lib,
+                kind: ItemKind::Movie,
+                parent_id: None,
+                title: "Ghost".into(),
+                year: Some(2024),
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("item");
+        store
+            .upsert_file(ghost, "/media/Ghost.mkv", 1, 1, &ProbeResult::default())
+            .await
+            .expect("file");
+
+        let shape = store.media_shape().await.expect("shape");
+        assert_eq!(shape.probed, 6);
+        assert_eq!(shape.unprobed, 1, "an unprobed file is its own category");
+
+        let all: std::collections::HashMap<_, _> = shape.hdr.iter().cloned().collect();
+        assert_eq!(all.get("dolby_vision"), Some(&2));
+        assert_eq!(all.get("hdr10"), Some(&2), "includes the 1080p one");
+        assert_eq!(all.get("hlg"), Some(&1));
+        assert_eq!(
+            all.get("sdr"),
+            Some(&1),
+            "null hdr reads as sdr, not as a gap"
+        );
+        assert_eq!(all.values().sum::<i64>(), shape.probed);
+
+        let four_k: std::collections::HashMap<_, _> = shape.hdr_4k.iter().cloned().collect();
+        assert_eq!(
+            four_k.get("hdr10"),
+            Some(&1),
+            "the 1080p HDR10 file is excluded"
+        );
+        assert_eq!(four_k.get("dolby_vision"), Some(&2));
+        assert_eq!(four_k.values().sum::<i64>(), 5);
+
+        // The §5 answer itself: 1 of 4 pieces of 4K HDR can use the GPU graph.
+        let fast =
+            four_k.get("hdr10").copied().unwrap_or(0) + four_k.get("hlg").copied().unwrap_or(0);
+        assert_eq!(fast, 2);
+        assert_eq!(four_k.get("dolby_vision").copied().unwrap_or(0), 2);
+
+        // Biggest first, so the shape of a library is its first line.
+        assert!(
+            shape.hdr.windows(2).all(|w| w[0].1 >= w[1].1),
+            "{:?}",
+            shape.hdr
+        );
+
+        assert_eq!(shape.over_segmented_floor, 3, "69, 50 and 45 Mb/s");
+        assert_eq!(shape.max_bitrate, Some(69_000_000));
+    }
 
     async fn seed_movie(store: &SqliteStore, lib: i64, title: &str, year: i32) -> i64 {
         let id = store

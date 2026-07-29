@@ -59,6 +59,9 @@ pub fn router(state: AppState) -> Router {
         .route("/trakt/sync", post(trakt::sync_now))
         .route("/system", get(system::system_info))
         .route("/system/logs", get(system::logs))
+        // What the libraries hold, in transcoder terms — the census PERF-PLAN
+        // §5 needs to say whether the GPU tone-map reaches a real library.
+        .route("/system/library-shape", get(system::library_shape))
         // Re-measure storage. POST because it costs real I/O against the
         // library, and separate from GET /system so that reading the last
         // numbers is never the thing that goes and takes new ones.

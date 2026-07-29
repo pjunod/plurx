@@ -22,8 +22,8 @@ use async_trait::async_trait;
 
 use crate::domain::{
     CachedTranscode, InProgressItem, Item, ItemEdit, ItemKind, ItemPage, ItemSort, Library,
-    MediaFile, MetadataPatch, NewItem, NewLibrary, ProbeResult, RecentItem, TraktAuth, User,
-    WatchRollup, WatchState,
+    MediaFile, MediaShape, MetadataPatch, NewItem, NewLibrary, ProbeResult, RecentItem, TraktAuth,
+    User, WatchRollup, WatchState,
 };
 // RecentItem is reused for next-up (episode + show title).
 use crate::error::StoreError;
@@ -361,6 +361,12 @@ pub trait MediaStore: Send + Sync + 'static {
         probe: &ProbeResult,
     ) -> Result<i64, StoreError>;
     async fn get_file(&self, id: i64) -> Result<Option<MediaFile>, StoreError>;
+    /// A census of what the libraries actually hold, in transcoder terms.
+    ///
+    /// Aggregated in SQL rather than by walking files: a library of a few
+    /// hundred thousand rows should cost one scan, not one round trip per
+    /// title, or nobody will run it twice.
+    async fn media_shape(&self) -> Result<MediaShape, StoreError>;
     async fn files_for_item(&self, item_id: i64) -> Result<Vec<MediaFile>, StoreError>;
     /// How many children each of the given items has. Folder cards say "12
     /// items"; doing that with one query per card would be an N+1 on every

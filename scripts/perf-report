@@ -336,6 +336,75 @@ def sustained_lines(out, mount):
     out("       §4.3bis; right is what an MSE path holds. Same trace, same file.)")
 
 
+# ---- §5: does the GPU tone-map reach a real library? ----------------------
+
+def shape_section(out, shape):
+    """What is actually on disk, in the terms the transcoder cares about.
+
+    M2 accepted the GPU tone-map on a probe: a generated HDR10 fixture, ~5x the
+    CPU chain. What the probe cannot say is how much of a real library that
+    reaches, because the same graph is declined outright for Dolby Vision — the
+    vendor filter cannot read its dynamic metadata, so those titles take the
+    CPU path no matter how fast the GPU one measured.
+    """
+    if not shape:
+        out("  could not read the library census.")
+        return
+    probed, unprobed = shape.get("probed", 0), shape.get("unprobed", 0)
+    out(f"  {probed} probed file(s)" + (f" · {unprobed} never probed" if unprobed else ""))
+    if unprobed:
+        out("    (an unprobed file has no codec or HDR flavour, so it is left out of")
+        out("     the counts below rather than counted as SDR.)")
+    if not probed:
+        return
+
+    def bar(pairs, total, indent="    "):
+        for name, n in pairs:
+            out(f"{indent}{name:<14} {n:>6}  {100.0*n/total:5.1f}%")
+
+    out("")
+    out("  every probed file, by HDR flavour:")
+    bar(shape.get("hdr") or [], probed)
+
+    four_k = shape.get("hdr_4k") or []
+    total_4k = sum(n for _, n in four_k)
+    out("")
+    if not total_4k:
+        out("  no 4K files — M2's tone-map has nothing to do here either way.")
+    else:
+        out(f"  4K only ({total_4k} file(s)) — the set M2 exists for:")
+        bar(four_k, total_4k)
+        # The whole point of the section, stated so it cannot be misread.
+        by = dict(four_k)
+        fast = by.get("hdr10", 0) + by.get("hlg", 0)
+        dv = by.get("dolby_vision", 0)
+        hdr_total = fast + dv
+        out("")
+        if not hdr_total:
+            out("  §5: no 4K HDR at all, so the GPU tone-map never runs on this library.")
+        else:
+            out(f"  §5: of {hdr_total} 4K HDR file(s), the GPU tone-map can take "
+                f"{fast} ({100.0*fast/hdr_total:.0f}%).")
+            if dv:
+                out(f"      The other {dv} are Dolby Vision and go to the CPU chain — "
+                    "not a")
+                out("      fallback, the correct answer, and unaffected by M2's speedup.")
+
+    codecs = shape.get("codecs") or []
+    if codecs:
+        out("")
+        out("  video codecs:")
+        bar(codecs[:6], probed)
+
+    over = shape.get("over_segmented_floor", 0)
+    mx = shape.get("max_bitrate")
+    out("")
+    out(f"  {over} file(s) at or above 40 Mb/s — these take the segmented remux "
+        "path (§4.3bis)")
+    if mx:
+        out(f"  biggest file on disk: {mx/1e6:.0f} Mb/s")
+
+
 # ---- §4.6: does bounded rate control actually hold? -----------------------
 
 def parse_playlist(text):
@@ -527,6 +596,10 @@ def main():
             print(f"  sustained probe failed ({st}) — reporting the quick numbers",
                   file=sys.stderr)
 
+    st, shape = srv.call("/system/library-shape")
+    if st != 200:
+        shape = None
+
     st, settings = srv.call("/settings")
 
     host = re.sub(r"[^a-zA-Z0-9]+", "-", args.url.split("//")[-1]).strip("-")
@@ -559,6 +632,9 @@ def main():
     out("")
     out("-- node ------------------------------------------------------------")
     node_section(out, sys_info)
+    out("")
+    out("-- library shape (§5) ------------------------------------------------")
+    shape_section(out, shape if isinstance(shape, dict) else None)
     out("")
     out("-- storage -----------------------------------------------------------")
     storage_section(out, sys_info, settings if isinstance(settings, dict) else {})
