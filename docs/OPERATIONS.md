@@ -144,6 +144,36 @@ than quietly boasting; treat that mount's figure as a floor.
 `scripts/perf-report` prints the same numbers with the comparison already
 done, which is usually the faster way to answer "is my storage the problem".
 
+### When the average looks fine and it still stalls
+
+An average cannot show a gap, and a gap is what stalls a viewer: a stretch
+where supply fell below demand for longer than the client's buffer covers. A
+mount reading 250 Mb/s has ample room for a 69 Mb/s film on paper and can
+still stall it several times an hour.
+
+`scripts/perf-report --sustained` answers that. It reads continuously for 30
+seconds per mount (pass a number for longer, up to 120), samples every 250 ms,
+and reports the distribution — min, p10, median, max — instead of one figure.
+It then *replays* that trace against a simulated client at a ladder of source
+bitrates and two buffer depths, and prints what would have happened:
+
+```
+        source         2.2s buffer     15.0s buffer
+          75 Mb/s    3 stalls/6s dry   ok (low 4.2s)
+```
+
+The left column is the progressive `/stream.mp4` path, whose read-ahead Chrome
+caps at about 2.2 seconds; the right is what an MSE path (hls.js — your
+transcodes and cache hits) holds. Same trace, same file, different outcome. A
+row that stalls on the left and not the right means the storage is fine and the
+delivery path is the problem.
+
+`ok` is not automatically comfortable — the low-water figure in brackets is how
+close the buffer came to empty. `ok (low 0.2s)` is a near miss.
+
+It costs real reading: seconds × the read rate × the number of mounts. Run it
+when something is wrong, not on a schedule.
+
 ## Reading playback (and the stats overlay)
 
 Every playback resolves to one of three methods; open the player **Stats**

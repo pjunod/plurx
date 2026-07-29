@@ -39,7 +39,7 @@ class Server:
         self.base = url.rstrip("/") + "/api/v1"
         self.token = token
 
-    def call(self, path, method="GET", body=None, raw=False):
+    def call(self, path, method="GET", body=None, raw=False, timeout=60):
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(self.base + path, data=data, method=method)
         if data:
@@ -47,7 +47,7 @@ class Server:
         if self.token:
             req.add_header("authorization", "Bearer " + self.token)
         try:
-            with urllib.request.urlopen(req, timeout=60) as r:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
                 payload = r.read()
                 return r.status, (payload if raw else json.loads(payload or b"null"))
         except urllib.error.HTTPError as e:
@@ -276,11 +276,58 @@ def storage_section(out, sys_info, settings):
                if readrate > 0 else ""))
         out(f"    sampled {m.get('sampled_bytes', 0)/1e6:.0f} MB of "
             f"{m.get('sampled') or '?'}")
+        sustained_lines(out, m)
     out("")
     out("  A remux or a direct play needs the source bitrate sustained off this")
     out("  storage for the whole film. Under the realtime figure above it cannot")
     out("  work, whatever the encoder or the client does; under the paced figure")
     out("  it plays but never builds a reserve, so any hiccup is a stall.")
+
+
+def sustained_lines(out, mount):
+    """The trace, and what it would do to a real stream.
+
+    The average is the wrong question once it clears the bitrate — what stalls
+    a viewer is a *gap*, a stretch where supply fell under demand for longer
+    than the client's buffer covers, and an average cannot show one. The
+    verdicts replay the measured trace against a client at each buffer depth,
+    so "a deeper buffer would fix this" stops being an argument and becomes a
+    number measured on this hardware.
+    """
+    s = mount.get("sustained")
+    if not s:
+        return
+    wrapped = (" · re-read the file from the top partway through, so the later "
+               "windows are optimistic" if s.get("wrapped") else "")
+    out(f"    sustained {s['seconds']:.0f}s, sampled every "
+        f"{s['window_secs']*1000:.0f}ms{wrapped}:")
+    out(f"      min {s['min_bps']/1e6:.0f} · p10 {s['p10_bps']/1e6:.0f} · "
+        f"median {s['median_bps']/1e6:.0f} · max {s['max_bps']/1e6:.0f} Mb/s")
+    verdicts = mount.get("verdicts") or []
+    if not verdicts:
+        return
+    # Grouped by bitrate so the two buffer depths sit side by side — the
+    # comparison is the finding, and putting them in separate blocks would
+    # make the reader do the join.
+    depths = sorted({v["buffer_secs"] for v in verdicts})
+    out("      replayed against a real client:")
+    out("        source      " + "".join(f"{d:>6.1f}s buffer   " for d in depths))
+    for br in sorted({v["bitrate_bps"] for v in verdicts}):
+        cells = []
+        for d in depths:
+            v = next((x for x in verdicts
+                      if x["bitrate_bps"] == br and x["buffer_secs"] == d), None)
+            if v is None:
+                cells.append(f"{'—':>17}")
+            elif v["stalls"]:
+                cells.append(f"{v['stalls']} stalls/{v['dry_seconds']:.0f}s dry".rjust(17))
+            else:
+                # No stalls is not the same as comfortable. The low-water mark
+                # separates "held up fine" from "came within a hair of it".
+                cells.append(f"ok (low {v['min_buffer_secs']:.1f}s)".rjust(17))
+        out(f"        {br/1e6:>4.0f} Mb/s " + "".join(cells))
+    out("      (left column is the progressive /stream.mp4 ceiling measured in")
+    out("       §4.3bis; right is what an MSE path holds. Same trace, same file.)")
 
 
 # ---- §4.6: does bounded rate control actually hold? -----------------------
@@ -435,6 +482,11 @@ def main():
     ap.add_argument("--window", type=float, default=10.0,
                     help="sliding window for the bitrate bound, seconds "
                          "(default: %(default)s)")
+    ap.add_argument("--sustained", type=float, nargs="?", const=30.0, metavar="SECS",
+                    help="also read continuously for SECS per mount (default 30) "
+                         "and report the distribution plus what it would do to a "
+                         "real stream. Costs real I/O: SECS x the read rate x the "
+                         "number of mounts")
     ap.add_argument("--out", help="output file (default: perf-report-<host>-<date>.txt)")
     args = ap.parse_args()
 
@@ -445,6 +497,24 @@ def main():
     st, sys_info = srv.call("/system")
     if st != 200:
         sys.exit(f"/system says {st}: {sys_info} — is {args.user} an admin?")
+
+    # Before /settings, and before the log fetch: the sustained probe takes
+    # minutes and its result has to be the one /system reports below.
+    if args.sustained:
+        mounts = len((sys_info.get("storage") or {}).get("mounts") or []) or 1
+        print(f"reading for {args.sustained:.0f}s on each of {mounts} mount(s) — "
+              f"about {args.sustained * mounts / 60:.0f} min…", file=sys.stderr)
+        # The server reads for `sustained` seconds *per mount*, in series, and
+        # the request does not answer until it has finished them all. The
+        # default 60 s timeout would abandon a probe that is working fine.
+        st, storage = srv.call(f"/system/storage?sustained={args.sustained}", "POST",
+                               timeout=args.sustained * mounts + 120)
+        if st == 200:
+            sys_info["storage"] = storage
+        else:
+            print(f"  sustained probe failed ({st}) — reporting the quick numbers",
+                  file=sys.stderr)
+
     st, settings = srv.call("/settings")
 
     host = re.sub(r"[^a-zA-Z0-9]+", "-", args.url.split("//")[-1]).strip("-")
