@@ -239,6 +239,50 @@ def log_section(out, logs, cache_settings):
         out("  " + l[:220])
 
 
+# ---- storage: can the source even be read fast enough? --------------------
+
+def storage_section(out, sys_info, settings):
+    """What the libraries' storage reads at, against what playback needs.
+
+    The report's other sections all describe what the server *did* with a file
+    once it had it. This one asks whether it could get it. A remux copies the
+    video untouched, so the source read has to sustain the file's own bitrate
+    for the whole film — and when it cannot, every symptom lands somewhere
+    else: the client reports a supply stall, the encoder shows under 1x, and
+    both are true and neither is the cause.
+    """
+    st = sys_info.get("storage") or {}
+    if not st.get("ran"):
+        out("  not measured yet — the probe runs a few seconds after boot, and")
+        out("  POST /api/v1/system/storage re-runs it on demand.")
+        return
+    readrate = float(settings.get("stream_readrate") or 4)
+    for m in st.get("mounts") or []:
+        roots = ", ".join(m.get("roots") or []) or "?"
+        read = m.get("read_bps")
+        if read is None:
+            out(f"  {roots}: no measurement — {m.get('note') or 'unknown'}")
+            continue
+        seek = m.get("seek_ms")
+        out(f"  {roots}: {read/1e6:.0f} Mb/s ({read/8e6:.0f} MB/s)"
+            + (f" · cold seek {seek:.1f} ms" if seek is not None else ""))
+        if m.get("cache_suspect"):
+            out(f"    ⚠ {m.get('note')}")
+        # The number that matters, stated in the unit people have in hand: the
+        # biggest source this mount can feed, at realtime and at the pace the
+        # server is configured to want.
+        out(f"    feeds a source of up to {read/1e6:.0f} Mb/s at realtime"
+            + (f", {read/readrate/1e6:.0f} Mb/s at the configured {readrate:g}x pace"
+               if readrate > 0 else ""))
+        out(f"    sampled {m.get('sampled_bytes', 0)/1e6:.0f} MB of "
+            f"{m.get('sampled') or '?'}")
+    out("")
+    out("  A remux or a direct play needs the source bitrate sustained off this")
+    out("  storage for the whole film. Under the realtime figure above it cannot")
+    out("  work, whatever the encoder or the client does; under the paced figure")
+    out("  it plays but never builds a reserve, so any hiccup is a stall.")
+
+
 # ---- §4.6: does bounded rate control actually hold? -----------------------
 
 def parse_playlist(text):
@@ -433,6 +477,9 @@ def main():
     out("")
     out("-- node ------------------------------------------------------------")
     node_section(out, sys_info)
+    out("")
+    out("-- storage -----------------------------------------------------------")
+    storage_section(out, sys_info, settings if isinstance(settings, dict) else {})
     out("")
     out("-- what ran, and what it cost --------------------------------------")
     log_section(out, logs, settings if isinstance(settings, dict) else {})
