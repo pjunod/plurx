@@ -330,6 +330,19 @@ pub struct ClientLog {
     pub detail: Option<String>,
     /// Browser label the client computed ("Safari" | "Chrome" | …).
     pub ua: Option<String>,
+    /// Whether this browser will decode this stream in hardware, as reported
+    /// by `navigator.mediaCapabilities` for the real codec, resolution and
+    /// bitrate — not for a codec string alone.
+    ///
+    /// The one thing that separates two failures every other field here
+    /// renders identically: a full buffer with late frames because the GPU is
+    /// doing the work and something upstream hiccuped, versus a full buffer
+    /// with late frames because a CPU is software-decoding 4K. `null` from a
+    /// browser without the API is honest; `false` is the finding.
+    pub decode_hw: Option<bool>,
+    /// The browser's own guess at whether it can keep up. `false` alongside
+    /// `decode_hw: false` is the browser saying so before it even started.
+    pub decode_smooth: Option<bool>,
     // -- playback measurements (M0) ------------------------------------------
     // These are the point of the beacons. Without them the log records THAT a
     // stream stalled and not the one number that says why, which is how much
@@ -478,6 +491,15 @@ fn client_log_line(ev: &ClientLog, suppressed: u64) -> String {
     }
     if let Some(e) = field(&ev.encoder, 32) {
         line.push_str(&format!(" encoder={e}"));
+    }
+    // Printed before the message so it sits with the other facts about the
+    // client rather than in the trailing measurements: it describes the
+    // machine, not this event.
+    if let Some(hw) = ev.decode_hw {
+        line.push_str(if hw { " decode=hw" } else { " decode=SOFTWARE" });
+        if ev.decode_smooth == Some(false) {
+            line.push_str("/not-smooth");
+        }
     }
     let msg = clip(&ev.message, 200);
     if !msg.is_empty() {
@@ -1236,7 +1258,29 @@ mod tests {
             bandwidth: None,
             height: None,
             encoder: None,
+            decode_hw: None,
+            decode_smooth: None,
         }
+    }
+
+    /// The decoder verdict rides with the client facts, and says which one it
+    /// is loudly enough to notice in a wall of log lines. `null` (a browser
+    /// without mediaCapabilities) prints nothing rather than guessing.
+    #[test]
+    fn a_software_decode_is_named_in_the_beacon() {
+        let mut ev = beacon("stall", 900);
+        assert!(
+            !client_log_line(&ev, 0).contains("decode="),
+            "silent when unknown"
+        );
+
+        ev.decode_hw = Some(true);
+        assert!(client_log_line(&ev, 0).contains(" decode=hw"));
+
+        ev.decode_hw = Some(false);
+        ev.decode_smooth = Some(false);
+        let line = client_log_line(&ev, 0);
+        assert!(line.contains(" decode=SOFTWARE/not-smooth"), "{line}");
     }
 
     /// A measurement is named for what it measured.

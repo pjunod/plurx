@@ -255,6 +255,21 @@ def log_section(out, logs, cache_settings, srv=None):
     # whole point: `supply` ran out of buffered video and is a server or link
     # problem; `decode` had video in hand and could not play it, which is the
     # browser and which no amount of pacing will improve.
+    # The browser's own verdict on hardware decode, hoisted out of the beacons
+    # because it changes how every line below is read. A machine
+    # software-decoding 4K shows a full buffer, few dropped frames and constant
+    # judder — which the rest of this report renders as perfect health.
+    soft = [l for l in lines if "decode=SOFTWARE" in l]
+    if soft:
+        out("")
+        out(f"  ⚠ {len(soft)} beacon(s) report SOFTWARE decoding. The browser says this")
+        out("    machine has no GPU path for that stream, so late frames and judder are")
+        out("    the decoder, not the link — no amount of buffering or pacing helps.")
+        out("    " + soft[-1][:220])
+    elif any("decode=hw" in l for l in lines):
+        out("")
+        out("  decode: hardware, per the browser's own mediaCapabilities verdict.")
+
     stalls = [l for l in lines if re.search(r"client\S* stall\b", l)]
     if stalls:
         kinds = {}

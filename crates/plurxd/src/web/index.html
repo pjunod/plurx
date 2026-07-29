@@ -925,7 +925,46 @@ function playbackContext(){
     // measures min(link speed, encode speed) — which is exactly why a stall
     // needs the server's own `speed` reading beside it to say which one ran out.
     bandwidth:(p.hls&&p.hls.bandwidthEstimate)?Math.round(p.hls.bandwidthEstimate/1000):null,
+    // Whether this machine is decoding in hardware. `powerEfficient` is the
+    // browser's own word for it, and it is the difference between two failures
+    // that look identical from every other number here: a full buffer with
+    // late frames because the link is fine and the GPU is doing the work, and
+    // a full buffer with late frames because a CPU is software-decoding 4K.
+    // Nothing else in the beacon can tell those apart, and asking the operator
+    // which machine the browser is on has not worked.
+    decode_hw:p.decodeInfo?p.decodeInfo.hw:null,
+    decode_smooth:p.decodeInfo?p.decodeInfo.smooth:null,
   };
+}
+// Ask the browser what it will do with this stream, before it does it.
+//
+// mediaCapabilities is the only API that answers "will this be hardware
+// decoded" — `smooth` and `powerEfficient` are computed from the real codec,
+// resolution, framerate and bitrate rather than from a codec string alone, so
+// it distinguishes 1080p HEVC (fine nearly everywhere) from 4K HEVC at 69 Mb/s
+// (fine almost nowhere without a GPU path). Best-effort: a browser without it,
+// or one that throws on an odd configuration, leaves the field null rather
+// than blocking playback on a diagnostic.
+async function probeDecode(){
+  const p=PLAYER; if(!p) return;
+  const src=p.source||{};
+  const codec=MSE_VIDEO[String(src.video_codec||"").toLowerCase()];
+  if(!codec || !navigator.mediaCapabilities || !navigator.mediaCapabilities.decodingInfo) return;
+  const v=document.getElementById("video");
+  const cfg={
+    type:p.hls?"media-source":"file",
+    video:{
+      contentType:`video/mp4; codecs="${codec[0]}"`,
+      width:(v&&v.videoWidth)||src.width||1920,
+      height:(v&&v.videoHeight)||src.height||1080,
+      bitrate:Math.max(1, src.bitrate||5000000),
+      framerate:24,
+    },
+  };
+  try{
+    const r=await navigator.mediaCapabilities.decodingInfo(cfg);
+    if(PLAYER===p) p.decodeInfo={supported:!!r.supported, smooth:!!r.smooth, hw:!!r.powerEfficient};
+  }catch(e){}
 }
 function reportTtff(){
   const p=PLAYER; if(!p||!p.playStartedAt) return;
@@ -2523,6 +2562,9 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
     video.play().catch(()=>{});
   }
 
+  // Once, per playback, as soon as the element knows what it is decoding.
+  probeDecode();
+  video.addEventListener("loadedmetadata", probeDecode, {once:true});
   clearInterval(PLAYER.timer);
   PLAYER.timer=setInterval(()=>reportProgress(fileId), 5000);
   video.onended=()=>{ handleEnded(fileId).catch(()=>{}); };
@@ -3643,6 +3685,13 @@ function updateStats(){
     `<div><b>Resolution</b>${tgtRes}</div>`+
     `<div><b>Dropped</b>${dropped} frames</div>`+
     (fps!=null?`<div><b>Frame rate</b><span${fps<20?' style="color:var(--warn,#fbbf24)"':''}>${fps.toFixed(1)} fps rendered</span></div>`:'')+
+    // The browser's own verdict on whether it is using the GPU for this. A
+    // software 4K HEVC decode is a full buffer, few dropped frames and
+    // constant judder — indistinguishable from a delivery problem on every
+    // other line of this panel.
+    (PLAYER.decodeInfo?`<div><b>Decoder</b><span${PLAYER.decodeInfo.hw?'':' style="color:var(--warn,#fbbf24)"'}>${
+      PLAYER.decodeInfo.hw?'hardware':'software — this machine has no GPU path for this stream'}${
+      PLAYER.decodeInfo.smooth?'':' · browser does not expect it to be smooth'}</span></div>`:'')+
     `<div><b>Buffer</b>${buf}</div>`+
     (net? `<div class="sechd">Network</div>`+net : '')+
     (srv? `<div class="sechd">Server</div>`+srv : '');
