@@ -183,7 +183,7 @@ pub async fn system_info(
 /// what "the storage numbers" are. Roots come from the library table rather
 /// than from a config path: what matters is the storage plurx will actually
 /// read media from, which is exactly the set of paths libraries point at.
-pub async fn probe_storage(state: AppState) {
+pub async fn probe_storage(state: AppState, sustained_secs: f64) {
     let roots: Vec<std::path::PathBuf> = match state.store.list_libraries().await {
         Ok(libs) => libs.into_iter().flat_map(|l| l.paths).collect(),
         Err(e) => {
@@ -194,7 +194,8 @@ pub async fn probe_storage(state: AppState) {
     if roots.is_empty() {
         return;
     }
-    let report = crate::storeprobe::probe(roots).await;
+    let mut report = crate::storeprobe::probe(roots, sustained_secs).await;
+    report.judge();
     for m in &report.mounts {
         // One line per mount, at info: this is the kind of fact someone reads
         // the log to find, and burying it at debug would mean it is only ever
@@ -211,14 +212,30 @@ pub async fn probe_storage(state: AppState) {
     *state.storage.write().await = report;
 }
 
+#[derive(Deserialize, Default)]
+pub struct StorageQuery {
+    /// Seconds of continuous reading, per mount, on top of the quick probe.
+    /// Absent or `0` is the quick probe alone. This costs real I/O — seconds
+    /// × the read rate × the number of mounts — so it is opt-in and never
+    /// happens at boot.
+    #[serde(default)]
+    pub sustained: Option<f64>,
+}
+
+/// The longest a sustained probe may be asked to run, per mount. A diagnostic
+/// that can be told to read for an hour is a denial-of-service with a nice UI.
+const SUSTAINED_MAX_SECS: f64 = 120.0;
+
 /// POST /api/v1/system/storage (admin) — re-measure and return the new
 /// numbers. Synchronous, because the caller asked for a measurement and an
 /// immediate 200 with the *old* figures would be worse than a slow one.
 pub async fn remeasure_storage(
     _admin: AdminUser,
     State(state): State<AppState>,
+    Query(q): Query<StorageQuery>,
 ) -> Result<Json<crate::storeprobe::StorageReport>, ApiError> {
-    probe_storage(state.clone()).await;
+    let sustained = q.sustained.unwrap_or(0.0).clamp(0.0, SUSTAINED_MAX_SECS);
+    probe_storage(state.clone(), sustained).await;
     Ok(Json(state.storage.read().await.clone()))
 }
 

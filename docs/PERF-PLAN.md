@@ -835,6 +835,43 @@ in `scripts/perf-report`, which states the answer in the unit the decision
 needs: the largest source this mount can feed at realtime, and at the
 configured pace.
 
+### 4.9bis An average is the wrong question (shipped 2026-07-29)
+
+nynuc's first numbers made the point immediately. Four mounts — `/8t-2`,
+`/8tb`, `/media`, `/20t`, four separate devices — came back at 242, 265, 242
+and 258 Mb/s, with cold seeks of 3.0–3.3 ms. Four different arrays do not read
+at the same speed by coincidence: that number is **the path they share**, not
+the disks. On a NAS with 2×2.5G, ~250 Mb/s means the current wireless bridge
+is costing about 90% of the available bandwidth.
+
+But it also refuted the explanation §4.3bis was reaching for. 250 Mb/s against
+a 69 Mb/s source is 3.6× headroom, and steady-state playback needs 138 Mb/s
+even if the read and the delivery cross the same hop. **The average is fine.**
+Whatever produced nine stalls is not visible in it.
+
+Which is the general lesson: an average cannot show a gap, and a gap is what
+stalls a viewer — a stretch where supply fell under demand for longer than the
+client's buffer covers. So the probe grew a second, opt-in mode: read
+continuously for N seconds, sample every **250 ms** (short enough to resolve
+the ~2.2 s that matters), and keep the trace rather than only its statistics.
+
+The trace is then *replayed*. `Sustained::dry_spells` simulates a client
+holding `buffer_secs` of a `bitrate_bps` stream against the measured windows
+and counts how often it would run dry, how long it spent dry, and how close it
+came at its worst. Run over a ladder of source bitrates at both buffer depths —
+2.2 s for the progressive path, a conservative 15 s for MSE — and the value of
+a deeper buffer stops being an argument and becomes a number measured on the
+operator's own hardware. `0 stalls` alone would not be enough, so the low-water
+mark rides along: a run that survived with 0.1 s to spare is a near miss, not a
+pass.
+
+Two failure modes the first version had, both of which reported success:
+reading off the end of a small file produced a trace too short to contain a gap
+(now wraps, and says it wrapped, so later windows are marked optimistic), and
+a probe shorter than one window produced no windows at all (now flushes a
+partial tail). Both would have answered "no gaps found" from evidence that
+could not have held one.
+
 The one place it currently changes behaviour is a log line at remux start:
 under 1.2× headroom it warns that the stream will stall, and under the
 configured readrate it notes that the stream can play but will never build a
