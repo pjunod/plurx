@@ -4468,9 +4468,16 @@ function usersPanel(users){
 // doesn't: on a tagged release `build` is just "v" + the version, and repeating
 // it is noise. Between releases it's the one string that says which commit is
 // actually running, which is what a bug report needs.
+//
+// "unknown" gets said out loud rather than hidden. Hiding it is how this
+// screen came to read `plurx 0.1.0` for weeks of daily deploys with no way to
+// tell one from the next — the version number alone cannot answer "did my
+// change land?", and staying quiet made a broken deploy look like a stale one.
 function buildTag(sys){
   const b=sys.build;
-  if(!b || b==="unknown" || b==="v"+sys.version || b===sys.version) return "";
+  if(!b || b==="unknown")
+    return ` <span class="muted" style="font-size:12px" title="Built without PLURX_BUILD_REF, so the image cannot say which commit it is. The deploy sets it: PLURX_BUILD_REF=$(git describe --tags --always --dirty) docker compose up -d --build">(unstamped build)</span>`;
+  if(b==="v"+sys.version || b===sys.version) return "";
   return ` <span class="muted" style="font-size:12px">(${esc(b)})</span>`;
 }
 // What the boot probe found out about tone-mapping HDR on this machine.

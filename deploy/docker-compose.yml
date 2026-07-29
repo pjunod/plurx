@@ -42,6 +42,15 @@ services:
     build:
       context: ..            # repo root (where the Dockerfile + workspace live)
       dockerfile: Dockerfile
+      args:
+        # Which commit this image is. `.git` is deliberately outside the build
+        # context, so the build script cannot work it out for itself and every
+        # image ends up stamped "unknown" — which makes "did my deploy land?"
+        # unanswerable from inside the product, exactly when it matters most.
+        # Empty is still honest; the deploy tooling sets it:
+        #   PLURX_BUILD_REF=$(git describe --tags --always --dirty) \
+        #     docker compose up -d --build
+        PLURX_BUILD_REF: ${PLURX_BUILD_REF:-}
     image: plurx/plurxd:latest
     container_name: plurxd
     restart: unless-stopped
