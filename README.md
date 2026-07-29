@@ -30,7 +30,11 @@ for running it day to day and reading every status and log line it shows you, wi
 decisions (why one binary clusters without external infra), and
 [docs/PLAYBACK.md](docs/PLAYBACK.md) traces the end-to-end path a file takes to
 become a stream — every direct/remux/transcode fork and the per-browser
-transport choice behind it. If you run plurx beside monarr,
+transport choice behind it, with
+[docs/STUTTER-4K.md](docs/STUTTER-4K.md) as the open investigation into the one
+fork that misbehaves: what is already ruled out and the experiment that ruled it
+out, so the next attempt starts where the last one stopped. If you run plurx
+beside monarr,
 [docs/INTEGRATION.md](docs/INTEGRATION.md) documents every seam between them —
 what each does, where you watch it, and the command that proves it works.
 Scope and the phased
