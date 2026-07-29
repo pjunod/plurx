@@ -521,6 +521,62 @@ Long-run memory is judged by browser-process/media measurements, not
 `performance.memory` (JS heap does not see SourceBuffer). Results are
 segmented by browser, codec, bitrate, and copy-vs-transcode.
 
+### 4.3bis The progressive remux has a buffer ceiling nothing can raise (measured 2026-07-29)
+
+§4.3 tunes the buffer on the paths hls.js owns. The progressive `/stream.mp4`
+path is not one of them, and it turns out to have a ceiling of its own that no
+setting on either side can move.
+
+The symptom was nine `supply` stalls on a 69 Mb/s Dolby Vision remux in
+Chrome, with **5 dropped frames out of 2058** — so not decode — while the
+overlay showed a 0.2 s buffer and a 263 Mb/s delivery rate. Those two look
+contradictory until you notice the reading was taken *during* a stall: the
+client's buffer is empty then, TCP back-pressure releases, and ffmpeg runs
+flat out at its `-readrate 4` cap. 263 ÷ 69 ≈ 3.8×, which is exactly that.
+
+Measured directly, in headless Chromium, against a 59 Mb/s fragmented MP4
+carrying the production muxer flags, varying only the response headers:
+
+| response headers | steady-state read-ahead |
+| --- | --- |
+| neither (what `/stream.mp4` sends) | **2.27 s** |
+| `Content-Length` only | 2.23 s |
+| `Accept-Ranges` only | 2.27 s |
+| **both** (what direct play sends) | **10.83 s** |
+| neither, delivered paced at 4× | 2.24 s |
+
+Median and max agreed to four decimals on every capped run, which is what a
+ceiling looks like rather than a coincidence. A 9.6 Mb/s file with both
+headers reached 19.7 s, so the deep buffer is real and not a fluke of one
+bitrate.
+
+The rule this exposes: **Chrome only buffers deeply when it can treat the
+response as a seekable file of known length.** Either header alone buys
+nothing. A live remux can offer neither — the length is unknown until ffmpeg
+finishes, and there are no byte ranges to serve of a stream that does not
+exist yet. So the progressive path is pinned at ~2.2 s in Chrome, and pacing
+does not move it.
+
+Two consequences worth stating plainly:
+
+- At 69 Mb/s, 2.2 s is ~19 MB of margin. On a link with any contention that
+  is not a buffer, it is a coin flip.
+- `-readrate 4` is *actively harmful* on a shared or wireless link. Refilling
+  that 2.2 s means pulling up to 4× the source bitrate from storage while
+  pushing ~4× back out to the client — half a gigabit of demand, on the same
+  link the playback it is rescuing has to cross. The stall feeds itself.
+
+The fix is therefore not a header and not a pacing value. Every other path
+plurx has already gets a real buffer: direct play is a range-served file
+(10.8 s measured), transcode and cache hits go through hls.js where the buffer
+is ours to set (§4.3). Only the progressive remux is stuck, and the way out is
+to stop using it for high-bitrate sources — route them to the copy-video HLS
+session that already exists for Safari, where hls.js manages the buffer in
+seconds. **Not yet shipped:** it is a behaviour change on the path every
+Chrome viewer takes, and Chrome's MSE acceptance of a Dolby Vision HEVC copy
+stream is exactly the thing this environment cannot test (the Chromium build
+here has no HEVC at all).
+
 ### 4.4 2-second segments (halves the start floor, B4)
 
 `SEGMENT_SECONDS: 4 → 2` (`transcode/mod.rs:20`) — the constant already
@@ -734,6 +790,59 @@ at 1080p where it used to give 720p.
   telemetry instead of as a mystery.
 - **jellyfin-ffmpeg everywhere** (already the OPERATIONS recommendation)
   — §5 leans on its filter set; the pacing flags need ≥6.1 for burst.
+
+### 4.9 The input side had never been measured (shipped 2026-07-29)
+
+Everything in §4 measures what the server did with a file once it had it. The
+encoder is probed at boot, the tone-map graph is raced against a CPU
+reference (§5), the output bitrate is bounded and checked (§4.6), and the
+client reports what it received (§3). Nothing measured whether the source
+could be *read* — and that is the one link in the chain that is usually
+neither local nor fast nor constant.
+
+The gap is not academic. A remux copies the video untouched, so a 69 Mb/s
+file needs 8.6 MB/s off storage forever just to break even, and `-readrate 4`
+asks for 34 MB/s. When either is unavailable, nothing in the system says so:
+it reaches the viewer as a client `supply` stall, and the encoder
+simultaneously reports under 1×. Both readings are true, neither is the
+cause, and both point away from it. §4.8's ops note — "a starved mount now
+shows up as `speed < readrate`" — was the closest the plan came, and it is a
+symptom, not a measurement.
+
+`storeprobe.rs` measures it. Per **mount** (roots grouped by device id, so
+two libraries on one array cost one probe): sustained sequential read, and
+median cold-seek latency — the second because it is what `-ss` pays before
+ffmpeg can emit anything, and on a remote mount it frequently explains a slow
+scrub on its own. Reported in bits per second, deliberately, so it can be
+compared to a source bitrate by looking at it.
+
+Measuring honestly is most of the work, and the enemy is the page cache. A
+probe that writes its own fixture and reads it back measures RAM and reports
+a NAS at 6 GB/s. So it reads a **real media file already in the library**, at
+offsets deep inside it, drops the range first via `posix_fadvise(DONTNEED)`,
+samples twice at unrelated offsets and keeps the **lower** result, and flags
+anything past 64 Gb/s as cache-warm rather than reporting it. That threshold
+is deliberately high: low enough to catch every cached read would
+permanently label an ordinary SATA SSD as "not a measurement", which is a
+worse lie in the other direction.
+
+It runs a few seconds after boot rather than during it — the numbers are
+worth having, but not at the price of a server that will not answer until a
+sleeping array has spun up — and re-runs on demand via
+`POST /api/v1/system/storage`, because a mount can be re-exported and a link
+re-cabled without a restart. Surfaced on Settings → System, in `/system`, and
+in `scripts/perf-report`, which states the answer in the unit the decision
+needs: the largest source this mount can feed at realtime, and at the
+configured pace.
+
+The one place it currently changes behaviour is a log line at remux start:
+under 1.2× headroom it warns that the stream will stall, and under the
+configured readrate it notes that the stream can play but will never build a
+reserve. That is deliberately advisory for now. Capping `readrate` at what
+the storage can actually deliver is the obvious next step and the right one —
+§4.3bis shows the refill burst can be the thing that causes the stall — but
+it should be made against real numbers from a real library rather than
+against a plan's guess at them.
 
 ## 5. M2 — the real 4K fix: tone-map on the GPU (kills B2)
 
