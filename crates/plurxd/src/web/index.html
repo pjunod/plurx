@@ -3431,7 +3431,36 @@ function updateStats(){
   // now decoding (what the <video> element actually reports)
   const tgtRes = v.videoWidth? `${v.videoWidth}×${v.videoHeight}` : '—';
   let dropped='—';
-  try{ const q=v.getVideoPlaybackQuality&&v.getVideoPlaybackQuality(); if(q) dropped=`${q.droppedVideoFrames} / ${q.totalVideoFrames}`; }catch(e){}
+  // How fast frames are actually reaching the screen, measured rather than
+  // inferred. The dropped counter alone cannot see this: `droppedVideoFrames`
+  // counts frames the compositor discarded, and a decoder that is merely
+  // *late* drops nothing while still visibly juddering. A session reading
+  // 22 fps against a 24 fps source is one frame in eleven never produced —
+  // which is exactly what "it stutters but the buffer is full" looks like
+  // from in here, and the difference between blaming the link and blaming
+  // the decoder.
+  //
+  // Sampled over a second at least. The overlay ticks at 1 s; a shorter
+  // interval divides a small integer by a small float and reads as wild
+  // swings on a stream that is perfectly steady.
+  let fps=null;
+  try{
+    const q=v.getVideoPlaybackQuality&&v.getVideoPlaybackQuality();
+    if(q){
+      dropped=`${q.droppedVideoFrames} / ${q.totalVideoFrames}`;
+      const now=performance.now(), prev=PLAYER._fps;
+      // Only while actually playing: a paused or seeking element produces no
+      // frames, and reporting 0 fps for a stream nobody asked to advance is
+      // an alarm about nothing. The last reading is kept across a pause
+      // rather than blanked, so the line doesn't flicker while being read.
+      if(!v.paused && !v.seeking && prev && now-prev.t>=950){
+        const got=(q.totalVideoFrames-prev.n)/((now-prev.t)/1000);
+        PLAYER._fpsVal=(PLAYER._fpsVal==null)?got:(PLAYER._fpsVal*0.5+got*0.5);
+      }
+      if(!prev || now-prev.t>=950) PLAYER._fps={n:q.totalVideoFrames,t:now};
+      fps=PLAYER._fpsVal;
+    }
+  }catch(e){}
   let buf='—';
   try{ if(v.buffered&&v.buffered.length){ buf=Math.max(0,v.buffered.end(v.buffered.length-1)-v.currentTime).toFixed(1)+' s'; } }catch(e){}
   // The contiguous runway from the playhead, as a number — the Server section
@@ -3545,6 +3574,7 @@ function updateStats(){
     `<div class="sechd">Now decoding</div>`+
     `<div><b>Resolution</b>${tgtRes}</div>`+
     `<div><b>Dropped</b>${dropped} frames</div>`+
+    (fps!=null?`<div><b>Frame rate</b><span${fps<20?' style="color:var(--warn,#fbbf24)"':''}>${fps.toFixed(1)} fps rendered</span></div>`:'')+
     `<div><b>Buffer</b>${buf}</div>`+
     (net? `<div class="sechd">Network</div>`+net : '')+
     (srv? `<div class="sechd">Server</div>`+srv : '');
