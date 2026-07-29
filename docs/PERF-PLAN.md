@@ -572,10 +572,35 @@ plurx has already gets a real buffer: direct play is a range-served file
 is ours to set (§4.3). Only the progressive remux is stuck, and the way out is
 to stop using it for high-bitrate sources — route them to the copy-video HLS
 session that already exists for Safari, where hls.js manages the buffer in
-seconds. **Not yet shipped:** it is a behaviour change on the path every
-Chrome viewer takes, and Chrome's MSE acceptance of a Dolby Vision HEVC copy
-stream is exactly the thing this environment cannot test (the Chromium build
-here has no HEVC at all).
+seconds.
+
+**Shipped 2026-07-29, as a hint plus a veto.** The split matters. The server
+decides *whether* a remux wants segments (`playback::prefer_segmented`): above
+40 Mb/s outright, or below 8× headroom against what `storeprobe` measured for
+the mount holding the file — so a modest file on slow storage is caught too,
+and a big one on fast storage is left alone. The client decides *whether it
+can* (`segmentedRemuxOk`), because only the browser knows its own
+MediaSource, and `<video src>` and MSE are different code paths with different
+answers: Chrome decodes plenty progressively that MediaSource refuses. A no
+from either side keeps today's behaviour — which is stuttery on a big file,
+and stuttery is recoverable where black is not.
+
+The codec question is asked the way hls.js will ask it: video and audio in one
+`isTypeSupported` string, since checking them apart passes pairs the browser
+rejects as a pair. The audio asked about is what will be *on the wire*, not
+what is in the file — a TrueHD track re-encoded to AAC must not veto itself,
+which would exclude every disc remux, i.e. precisely the set this exists to
+fix.
+
+Verified in headless Chromium against the shipped code, extracted from
+`index.html` rather than reimplemented. That build has no HEVC and no AAC,
+which makes it the ideal negative control: it *is* the refusing browser. HEVC
+is refused and the routing declines; VP9/Opus is accepted and it routes; a
+missing hint, an absent hls.js, and a copied TrueHD track each decline; and a
+spy on `isTypeSupported` confirms the AAC-on-the-wire rule. What cannot be
+verified here is the case that matters most — whether a real Chrome accepts
+Dolby Vision HEVC through MediaSource. That is why there is a veto rather than
+a version check.
 
 ### 4.4 2-second segments (halves the start floor, B4)
 
@@ -872,7 +897,51 @@ a probe shorter than one window produced no windows at all (now flushes a
 partial tail). Both would have answered "no gaps found" from evidence that
 could not have held one.
 
-The one place it currently changes behaviour is a log line at remux start:
+### 4.9ter nynuc's measured baseline (2026-07-29)
+
+Recorded so later runs have something to diff against. All four mounts are
+NFSv4.1 exports from one QNAP; nynuc reaches it over a wirelessly-bridged hop
+while every other node is wired at 2.5G.
+
+Before, with the original mount options (`rsize=wsize=32768`, `timeo=14`, no
+`nconnect`), 30 s traces at 250 ms:
+
+| mount | min | p10 | median |
+| --- | --- | --- | --- |
+| `/8t-2` | 84 | 134 | 161 Mb/s |
+| `/media` | 100 | 183 | 235 Mb/s |
+| `/20t` | 98 | 172 | 253 Mb/s |
+
+After (`rsize=wsize` negotiated to 1 MB, `timeo=600`, `nconnect=8`):
+
+| mount | min | p10 | median |
+| --- | --- | --- | --- |
+| `/8t-2` | 159 | 200 | 328 Mb/s |
+| `/media` | 112 | 249 | 300 Mb/s |
+| `/20t` | 103 | 261 | 335 Mb/s |
+| `/8tb` | 142 | 255 | 333 Mb/s |
+
+Medians up 28–104%, p10 up 36–52% — well outside the ±25% run-to-run variance
+the quick probe shows on its own. 32 KB reads were costing a third to a half
+of the available bandwidth.
+
+Two things the after-numbers say that the before-numbers could not. All four
+mounts **re-converged**, at 300/333/328/335 — four separate arrays and four
+separate exports agreeing to within 10% again, just higher. Individual windows
+burst past 500 Mb/s. That is a shared ceiling that the per-mount inefficiency
+had been masking, and it is still there. And under playback the whole path
+loses 25–40% (`/20t` median 253 → 149 on the old options), with cold-seek
+latency more than doubling on `/8t-2` — real contention, measured.
+
+**What none of it shows is a gap.** Across four traces on two mount
+configurations, no 250 ms window ever fell below the 69 Mb/s the stalling file
+needs; the worst on `/20t` was 103 Mb/s. At the observed rate of one stall per
+ten seconds, a 30 s trace should have caught three every time. It has never
+caught one. The read side is not the trigger — which is what sent the
+investigation to §4.3bis and the browser's own buffer.
+
+The one place the probe currently changes behaviour is a log line at remux
+start:
 under 1.2× headroom it warns that the stream will stall, and under the
 configured readrate it notes that the stream can play but will never build a
 reserve. That is deliberately advisory for now. Capping `readrate` at what

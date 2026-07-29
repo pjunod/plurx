@@ -284,6 +284,19 @@ pub struct DecisionResponse {
     /// What the container itself declares (audio start − video start), when
     /// nonzero. Diagnostic only — declared offsets are already honored.
     pub declared_offset_ms: Option<i64>,
+    /// Why this remux should be delivered as HLS segments rather than
+    /// progressively (PERF-PLAN §4.3bis). `None` means the progressive path is
+    /// fine, which is the common case.
+    ///
+    /// A hint and not an instruction: the server knows the bitrate and what
+    /// the storage under the file reads at, but only the browser knows whether
+    /// its MSE implementation will accept this codec — Chrome decodes plenty
+    /// through `<video src>` that it refuses through MediaSource. So the
+    /// server says "this one would be better segmented" and the client
+    /// verifies before acting, falling back to the progressive path it would
+    /// otherwise have used.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefer_segmented: Option<String>,
 }
 
 fn source_summary(file: &MediaFile) -> SourceSummary {
@@ -524,6 +537,17 @@ pub async fn decision(
         playback::PlaybackMethod::DirectPlay => format!("/api/v1/files/{id}/direct"),
         _ => format!("/api/v1/files/{id}/stream.mp4"),
     };
+    // Only a remux has a transport choice to make. Direct play is already a
+    // range-served file, which is the case Chrome buffers *well* — it was the
+    // control in §4.3bis, at 10.8 s against the progressive path's 2.2 — and a
+    // transcode is HLS already.
+    let prefer_segmented = if decision.method == playback::PlaybackMethod::Remux {
+        let storage = state.storage.read().await;
+        let read_bps = storage.for_path(&file.path).and_then(|m| m.read_bps);
+        playback::prefer_segmented(file.bitrate, read_bps)
+    } else {
+        None
+    };
     let markers = markers_for(&state, &file).await;
 
     // Default-track flags: the same selection rule the transcoder burns by —
@@ -567,6 +591,7 @@ pub async fn decision(
         markers,
         audio_offset_ms: file.audio_offset_ms,
         declared_offset_ms: declared_av_offset(&state, id).await,
+        prefer_segmented,
     }))
 }
 
