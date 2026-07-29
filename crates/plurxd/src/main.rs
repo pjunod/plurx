@@ -58,7 +58,7 @@ enum Command {
     /// Reset a user's password directly in the database — the recovery path
     /// when an admin password is forgotten (admins reset *other* users in
     /// the web UI). Safe while the server runs (WAL); revokes the user's
-    /// sessions. In Docker: docker exec -it plurxd plurxd reset-password paul
+    /// sessions. In Docker: docker exec -it plurxd plurxd reset-password NAME
     ResetPassword {
         /// Username whose password to reset.
         username: String,
