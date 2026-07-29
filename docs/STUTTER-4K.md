@@ -1,11 +1,12 @@
 # 4K copy-path stutter — what it is, what it isn't, and what to try next
 
-**Status:** unsolved, cause narrowed to the segmented copy-video path ·
-**Symptom:** one held video frame per segment boundary on a 4K HEVC remux ·
-**Reproduced on:** all four of Paul's nodes, Chrome only client tested ·
-**Diagnosed against:** `95e88eb` (2026-07-29) · **Instrument:**
-`armHitchDetector` in [index.html](../crates/plurxd/src/web/index.html),
-surfaced by [`scripts/perf-report`](../scripts/perf-report) ·
+**Status:** candidate fix shipped (§5.0) — awaiting a playback on real
+hardware · **Symptom:** one held video frame per segment boundary on a 4K
+HEVC remux · **Reproduced on:** all four of Paul's nodes, Chrome only client
+tested · **Diagnosed against:** `95e88eb`; fix and instrument upgrades
+landed after (2026-07-29 evening) · **Instrument:** `armHitchDetector` in
+[index.html](../crates/plurxd/src/web/index.html), surfaced by
+[`scripts/perf-report`](../scripts/perf-report) ·
 **Companions:** [PERF-PLAN.md](PERF-PLAN.md) §4.3bis (the routing that
 created this path), [PLAYBACK.md](PLAYBACK.md) (the delivery map)
 
@@ -293,7 +294,59 @@ This result was not available at the time of writing.
 
 Ordered by how cheaply each can be tested.
 
-### 5.1 ffmpeg's fMP4 fragment timing, versus hls.js's own transmuxer
+### 5.0 The reframe, and the defect that fell out of it (fix shipped)
+
+Everything above treats "at a segment boundary" as evidence about
+*segmentation*. It is not, on its own: the copy path can only cut segments at
+source keyframes, so **every segment boundary is an IRAP by construction** —
+the boundary attribution in §2 supports a per-IRAP cause exactly as strongly
+as a per-fragment one. The 1080p transcode being clean does not break the
+tie either: its I-frames are ~50× smaller, a different codec, and a
+different decoder path. With that lens, the question becomes: what happens
+*in the bitstream* at every IRAP that does not happen elsewhere?
+
+Answer, measured on a fixture built to match a Blu-ray remux
+(`repeat-headers=1`, open GOP): the source repeats VPS/SPS/PPS at every
+IRAP, `-c:v copy` preserves them, and the production command therefore
+opened **the first sample of every fragment** with in-band parameter sets —
+
+```
+NAL 32 VPS x18  (in first sample of a fragment: 15)
+NAL 33 SPS x18  (in first sample of a fragment: 15)
+NAL 34 PPS x18  (in first sample of a fragment: 15)
+```
+
+— while tagging the stream `hvc1`, whose definition (ISO 14496-15) is that
+parameter sets live in the sample entry *only*. Every segment boundary
+handed Chrome's decoder a spec violation and an invitation to reconsider its
+configuration, at exactly the cadence of the stutter. Dolby Vision sources
+additionally carry EL/RPU NAL units (62/63) in every access unit that
+nothing on an `hvc1` wire can use.
+
+The fix is `hevc_copy_bsf` in
+[transcode/mod.rs](../crates/plurx-core/src/transcode/mod.rs):
+`filter_units=remove_types=32-34` on every copied HEVC stream, `32-34|62-63`
+when the source is Dolby Vision, applied to both the segmented and the
+progressive copy paths. Verified on the fixture, not argued: `framemd5` of
+the decoded output is **bit-identical** with and without; HDR10 static
+metadata (SEI, type 39) survives; hvcC in the init segment is untouched; and
+23.976 content lands exactly on the frame grid (uniform 1001/24000
+durations, last pts on-grid, audio end identical — no drift over the
+fixture's length).
+
+Two further defects fell to the same change, unlooked-for. Routing copy
+through a bitstream filter makes ffmpeg re-derive packet timing through the
+parser, so the MKV's millisecond rounding (sample durations jittering
+504/516 at timescale 12288) becomes uniform frame-grid durations — and the
+**0.977 ms presentation overlap at every segment join (§3.9) goes to
+exactly zero**. §3.9 proved Chrome tolerates that overlap in isolation; it
+is still gone, and the stream a browser now receives is clean on every axis
+this investigation learned to measure.
+
+**Acceptance:** pull, rebuild, play Wicked on Quality → Auto with the stats
+overlay up. Clean → done, and §5.1–5.3 are moot. Still hitching → the new
+Hitches row now carries the discriminator (§5.3): every event names the
+decode cost at the hitch against the session's typical.
 
 The strongest surviving lead, and the newest — it comes from the `mpegts` vs
 `fmp4` row in §4. Every clean comparison in §3 either used hls.js's TS
@@ -302,13 +355,16 @@ has yet tested *ffmpeg's fMP4 fragment timing on a reordered HEVC stream*
 against a browser that can decode it, because no such browser was available.
 
 **Test:** serve the copy path as `-hls_segment_type mpegts` instead of
-`fmp4`, changing nothing else. HEVC in MPEG-TS is standardised; confirm
-hls.js 1.6.16's TS demuxer accepts HEVC before spending time on it (it
-handled AVC only for years). If the stutter vanishes, the fault is in the
-fMP4 fragments ffmpeg writes for a copied, reordered HEVC stream, and §3.9
-proves it is not the join overlap — so look next at `trun` composition
-offsets, per-fragment `sidx`/`elst` interaction, and whether `-tag:v hvc1`
-belongs on a Dolby Vision stream (`dvh1`/`dvhe` are the DV sample entries).
+`fmp4`, changing nothing else. The bundled hls.js 1.6.16 **does** demux
+HEVC-in-TS — confirmed in the minified source: `case 36` (the HEVC TS
+stream type) sets `segmentVideoCodec="hevc"` and logs "HEVC in M2TS found",
+and there is an `hvc1()` box builder fed by a parsed VPS. Two constraints
+before building it: Apple requires fMP4 for HEVC in HLS, so a global flip
+breaks Safari/AirPlay — the container has to be chosen per session, which
+means the session key must carry it; and if §5.0's strip fixes the stutter,
+this whole test is moot. If the stutter survives §5.0 and the forensics rule
+out decode (§5.3), this is the next experiment: it swaps ffmpeg's fragment
+timing for hls.js's own transmuxer with the bitstream unchanged.
 
 ### 5.2 Dolby Vision Profile 7's second layer, riding along under `-c:v copy`
 
@@ -317,22 +373,40 @@ layer and RPU metadata. Chrome decodes only the base layer and must skip the
 rest. `-c:v copy` passes all of it through, and `-tag:v hvc1` declares it as
 plain HEVC.
 
-**Test:** the cheapest version needs no code — play a 4K remux over 40 Mb/s
-that is **not** Dolby Vision (Paul's library has 190 4K HDR10 and 555 4K SDR
-files; §5 of the perf report enumerates them). Clean → DV is implicated.
-Still stuttering → DV is innocent and it is 4K/bitrate/fMP4.
+**Status: shipped as part of §5.0** — DV sources now shed their EL/RPU
+units (types 62/63) on both copy paths, since `-tag:v hvc1` already
+forecloses any client engaging DV. If the stutter survives, the no-code
+test still separates DV from generic 4K HEVC: play a 4K remux over 40 Mb/s
+that is **not** Dolby Vision (the library has 190 4K HDR10 files; §5 of the
+perf report enumerates them).
 
-A code-level test is `-bsf:v filter_units=remove_types=…` to drop the EL and
-RPU NAL units on the way out, which is legal for a copy and would make the
-stream plain HDR10.
+### 5.3 The decoder itself, spiking on giant IRAP access units
 
-### 5.3 4K HEVC through MediaSource, independent of transport
+The theory §5.0's reframe adds. A 69 Mb/s 4K 10-bit I-frame is several
+megabytes; a hardware decoder takes a multiple of a frame-time on it; the
+B-frame reorder queue eats most of the decoder's output slack; one frame
+gets held per GOP — which is per segment, because they coincide. Consistent
+with every §3 elimination (nothing about buffers or delivery is wrong), with
+1080p being clean (its I-frames are ~50× smaller), and with the VP9
+reproduction being clean (software VP9 at 4 Mb/s decodes in ~2 ms). It also
+predicts the "Original · one stream" test (§4.1) **still stutters**, since
+the IRAPs are in the bitstream, not the transport.
 
-If §4.1 shows progressive is clean, this is dead. If §4.1 shows the cadence
-persists without segments, this is the whole answer: Chrome's HEVC decode
-path fed by MSE appends at 4K, and the fix is a routing decision — cap the
-copy path by bitrate or resolution and transcode above it, which costs GPU
-and quality and should be the last resort.
+The detector now settles this without another build: every hitch event
+names `decode Xms (typ Y)` — the `processingDuration` of the frame at the
+hitch against the session's own median. Spikes at the hitches → this
+theory; flat → delivery. A `late` counter also now exists for the fault the
+callback could never see directly: a compositor hold presents no new frame
+and fires no callback, so the evidence is the next frame arriving with a
+normal media step and a display-clock step nearly twice as long
+(`expectedDisplayTime`, thresholded above 3:2 pulldown jitter). The 16
+`held` events in §2 were likely the *minority* shadow of holds this counter
+was blind to.
+
+If confirmed, the fix is a routing decision — cap the copy path by bitrate
+or resolution for Chrome and transcode above it — which costs GPU and
+quality and is the last resort (§8.3). §5.0's strip still helps at the
+margin for DV: shedding the EL shrinks exactly the access units that spike.
 
 ### 5.4 Segment length, as mitigation rather than cause
 
@@ -470,6 +544,21 @@ it is worth knowing and is not a fault.
 §4.1. `Quality → "Original · one stream"`, and the stats panel names the
 transport.
 
+### 7.6bis The evening pass (fresh eyes on this document)
+
+Two commits after the doc was first written, from re-reading it cold.
+
+**The §5.0 strip.** `hevc_copy_bsf` on both copy paths, with the fixture
+evidence above. The commit message carries the census numbers and the
+framemd5 proof.
+
+**The `late` counter and per-hitch decode forensics (§5.3).** The detector
+could not see a compositor hold — no new frame, no callback — which is
+probably why 16 `held` events undercounted a stutter Paul describes as
+constant. Every fault's `last` line now carries the decode cost at the
+hitch against the session's typical, so the next screenshot discriminates
+the decoder theory from the delivery theories on its own.
+
 ### 7.7 Earlier the same day, before the stutter investigation
 
 `e59bd69` password confirm on account creation · `cd8aa60` first/last
@@ -508,21 +597,25 @@ rejected for a reason.
 
 ## 9. Open questions for a fresh pair of eyes
 
-1. Does hls.js 1.6.16's MPEG-TS demuxer handle HEVC? If yes, §5.1 is a
-   one-line change to the copy args and the most informative test left.
+1. **Answered (2026-07-29 evening): yes.** hls.js 1.6.16's TS demuxer
+   handles HEVC — `case 36` sets `segmentVideoCodec="hevc"` and an `hvc1()`
+   box builder consumes the parsed VPS. See §5.1 for the constraints the
+   test still carries (per-session container choice; Apple requires fMP4).
 2. Is the `prefer_segmented` routing still needed at all, now that
    progressive reads ahead 10.8 s instead of 2.2 s? Nobody re-measured
    progressive at 69 Mb/s after the `Content-Length` + `Accept-Ranges` fix.
    If it holds, the whole segmented copy path — and this bug with it — can be
    deleted rather than debugged.
 3. Should `-tag:v hvc1` be `dvh1`/`dvhe` for Dolby Vision, and does Chrome
-   care? Every DV file in the library currently ships as plain HEVC.
-4. Is the held frame *lost* or *repeated*? The detector says media time did
-   not advance a full frame, which is consistent with either the frame being
-   removed from the buffer or the renderer holding it. Distinguishing them
-   would separate an MSE buffer problem from a renderer/sync problem, and
-   `VideoPlaybackQuality.totalVideoFrames` against the source frame count
-   over a known interval should settle it.
+   care? Every DV file in the library currently ships as plain HEVC — and
+   since §5.0 it ships without RPUs at all, which makes `hvc1` the honest
+   tag rather than a mislabel.
+4. Is the held frame *lost* or *repeated*? Partially addressed: the `late`
+   counter (§5.3) now sees the compositor holding a frame, which the
+   original detector could not, and every event carries the decode cost at
+   the hitch. `VideoPlaybackQuality.totalVideoFrames` against the source
+   frame count over a known interval would still settle the lost-vs-repeated
+   half exactly.
 5. Does it reproduce in Firefox or Safari? Only Chrome has been tested, on
    one browser across four servers. A second engine would separate "Chrome's
    MSE" from "the stream".
