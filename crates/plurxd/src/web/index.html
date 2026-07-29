@@ -401,6 +401,13 @@
   .setwarn{background:color-mix(in srgb,#e8a33d 15%,var(--panel));border:1px solid color-mix(in srgb,#e8a33d 45%,var(--line));
     border-radius:10px;padding:11px 14px;margin:0 0 16px;font-size:13.5px;line-height:1.55}
   .setwarn a{color:var(--accent);cursor:pointer;text-decoration:underline}
+  /* Storage on the System card: one grid for the whole list, not a grid per
+     row. Per-row grids let each mount size its own path column, so four rows
+     started their numbers at four different x positions — legible, but it
+     reads as four sentences rather than a table. `max-content` across the
+     shared grid lines them all up on the longest path. */
+  .stgtable{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:0 14px;align-items:baseline;line-height:1.7}
+  .stgpath{font-weight:600;white-space:nowrap}
   /* Phones: a wide settings table (libraries/users) overflows the viewport,
      which used to push the sticky header out of alignment. Reflow each row into
      a self-contained card — name as a heading, labeled cells, action buttons
@@ -4092,23 +4099,28 @@ function toneMapHtml(tm){
 // to tune the two halves that were working.
 function storageHtml(st){
   if(!st || !st.ran) return `<span class="muted">measuring…</span> <button class="ghost sm" onclick="remeasureStorage(this)">Measure now</button>`;
+  // One line per mount, in columns. The earlier version put "feeds up to 2462
+  // Mb/s at realtime" under every row, which restated the number immediately
+  // above it in different words and doubled the height of the block for no
+  // information. The read rate IS the ceiling a source bitrate is compared
+  // against; saying so once below the list is enough.
   const rows=(st.mounts||[]).map(m=>{
     const roots=esc((m.roots||[]).join(", "));
     if(m.read_bps==null){
-      return `<div><b>${roots}</b> <span style="color:var(--bad)">${esc(m.note||"not measured")}</span></div>`;
+      return `<span class="stgpath">${roots}</span><span style="color:var(--bad)">${esc(m.note||"not measured")}</span>`;
     }
-    const mbps=m.read_bps/1e6;
-    const seek=m.seek_ms!=null?` · cold seek ${m.seek_ms.toFixed(1)} ms`:"";
-    // Stated as a bitrate ceiling rather than as MB/s, because the decision it
-    // informs — can this file be remuxed or direct-played from here — is a
-    // comparison against a bitrate.
-    const cap=`<div class="muted" style="font-size:12px">feeds up to ${fmtMbps(m.read_bps)} at realtime</div>`;
-    const warn=m.cache_suspect?`<div class="muted" style="font-size:12px;color:var(--warn,#fbbf24)">${esc(m.note||"")}</div>`:"";
-    return `<div><b>${roots}</b> ${mbps.toFixed(0)} Mb/s${esc(seek)}</div>${cap}${warn}`;
+    // MB/s alongside Mb/s because the two get confused constantly and every
+    // other tool an operator reaches for (dd, iostat) reports bytes.
+    const rate=`${(m.read_bps/1e6).toFixed(0)} Mb/s <span class="muted">(${(m.read_bps/8e6).toFixed(0)} MB/s)</span>`;
+    const seek=m.seek_ms!=null?` <span class="muted">· seek ${m.seek_ms.toFixed(1)} ms</span>`:"";
+    const warn=m.cache_suspect?`<span class="stgpath"></span><span class="muted" style="color:var(--warn,#fbbf24)">${esc(m.note||"")}</span>`:"";
+    return `<span class="stgpath">${roots}</span><span>${rate}${seek}</span>${warn}`;
   }).join("");
-  const when=st.measured_at?` <span class="muted">· measured ${fmtAgo(st.measured_at)}</span>`:"";
-  return `${rows||`<span class="muted">no libraries to measure</span>`}${when}
-    <button class="ghost sm" style="margin-top:6px" onclick="remeasureStorage(this)">Re-measure</button>`;
+  const hint=rows?`<div class="muted" style="font-size:12px;margin-top:4px">A remux or direct play needs its own bitrate sustained from here.</div>`:"";
+  const when=st.measured_at?`<span class="muted" style="font-size:12px">measured ${fmtAgo(st.measured_at)}</span>`:"";
+  return `${rows?`<div class="stgtable">${rows}</div>`:`<span class="muted">no libraries to measure</span>`}${hint}
+    <div class="row" style="margin-top:8px;gap:10px;align-items:center">
+      <button class="ghost sm" onclick="remeasureStorage(this)">Re-measure</button>${when}</div>`;
 }
 // Synchronous by design: the button asked for a measurement, and it may take
 // as long as a sleeping array takes to answer. Re-rendering immediately with
