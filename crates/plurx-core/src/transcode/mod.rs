@@ -46,6 +46,38 @@ use crate::domain::MediaFile;
 /// again.
 pub const SEGMENT_SECONDS: u32 = 2;
 
+/// The bitstream filter every copied HEVC stream gets before a client sees it.
+///
+/// Two kinds of NAL unit ride inside a `-c:v copy` that have no business on
+/// this wire. In-band parameter sets (VPS/SPS/PPS, types 32–34): a
+/// Blu-ray-lineage stream repeats all three at every IRAP and copy preserves
+/// them, but the `hvc1` sample entry tagged just above *promises they are not
+/// there* (ISO 14496-15 — parameter sets live in the sample entry only, which
+/// ffmpeg's hvcC already carries). So every fragment used to open with a spec
+/// violation, at exactly the boundary cadence of the 4K stutter this exists
+/// to fix (docs/STUTTER-4K.md §5.0). And Dolby Vision's EL/RPU units (62/63):
+/// tagging `hvc1` rather than `dvh1`/`dvhe` already forecloses any client
+/// engaging DV on this path, so those units are dead weight in every access
+/// unit — the browser's parser steps over them, and the base layer is
+/// HDR10-compatible on its own.
+///
+/// Removing them is not a transcode. Verified 2026-07-29 on a repeat-headers
+/// open-GOP fixture: `framemd5` of the decoded output is bit-identical with
+/// and without, HDR10 static metadata (SEI, type 39) survives, and hvcC in
+/// the init segment is untouched. A measured side effect worth having:
+/// routing copy through a bitstream filter makes ffmpeg re-derive packet
+/// timing through the parser, so sample durations land exactly on the frame
+/// grid (1001/24000 at 23.976) instead of carrying the MKV's millisecond
+/// rounding — which also zeroes the sub-frame presentation overlap the plain
+/// copy left at every segment join.
+pub fn hevc_copy_bsf(hdr: Option<&str>) -> String {
+    if hdr == Some("dolby_vision") {
+        "filter_units=remove_types=32-34|62-63".to_owned()
+    } else {
+        "filter_units=remove_types=32-34".to_owned()
+    }
+}
+
 /// How fast ffmpeg may read a session's input, as data.
 ///
 /// The daemon resolves this — it is the half that knows what the ffmpeg build
@@ -621,6 +653,8 @@ pub fn hls_copy_args(
     if matches!(source.video_codec.as_deref(), Some("hevc" | "h265")) {
         args.push("-tag:v".into());
         args.push("hvc1".into());
+        args.push("-bsf:v".into());
+        args.push(hevc_copy_bsf(source.hdr.as_deref()));
     }
 
     if transcode_audio {
@@ -910,6 +944,45 @@ mod tests {
         assert!(!joined.contains("libx264"));
         assert!(!joined.contains("scale="));
         assert!(!joined.contains("tonemap"));
+    }
+
+    /// The `hvc1` tag promises no in-band parameter sets, and a
+    /// Blu-ray-lineage copy breaks that promise at every IRAP — which on this
+    /// path is every segment boundary. The filter is what keeps the promise;
+    /// a Dolby Vision source additionally sheds the EL/RPU units nothing on
+    /// an hvc1 wire can use.
+    #[test]
+    fn copied_hevc_keeps_the_hvc1_promise() {
+        let joined = hls_copy_args(
+            &file(Some("hdr10")),
+            0.0,
+            None,
+            true,
+            Pacing::unpaced(),
+            "/tmp/s",
+        )
+        .join(" ");
+        assert!(joined.contains("-bsf:v filter_units=remove_types=32-34"));
+        assert!(!joined.contains("62-63"), "HDR10 keeps nothing to shed");
+
+        let dv = hls_copy_args(
+            &file(Some("dolby_vision")),
+            0.0,
+            None,
+            true,
+            Pacing::unpaced(),
+            "/tmp/s",
+        )
+        .join(" ");
+        assert!(dv.contains("-bsf:v filter_units=remove_types=32-34|62-63"));
+
+        // H.264 copies are untouched: they are not on the stuttering path and
+        // avc1 + in-band parameter sets plays everywhere today.
+        let mut f = file(None);
+        f.video_codec = Some("h264".into());
+        let h264 = hls_copy_args(&f, 0.0, None, true, Pacing::unpaced(), "/tmp/s").join(" ");
+        assert!(!h264.contains("-bsf:v"));
+        assert!(!h264.contains("-tag:v"));
     }
 
     #[test]

@@ -790,6 +790,7 @@ pub async fn stream_mp4(
         audio_index: audio,
         audio_offset_ms: file.audio_offset_ms,
         hevc,
+        hdr: file.hdr.clone(),
         readrate,
         tracked,
     })
@@ -953,6 +954,9 @@ struct RemuxSpec<'a> {
     audio_offset_ms: i64,
     /// Tag the video `hvc1` so Safari accepts HEVC in MP4.
     hevc: bool,
+    /// The source's HDR flavour — picks the copy bitstream filter (a Dolby
+    /// Vision source also sheds its EL/RPU units; see `hevc_copy_bsf`).
+    hdr: Option<String>,
     readrate: f64,
     /// Telemetry handle and its registration, when the client asked to be able
     /// to watch this stream's health.
@@ -970,6 +974,7 @@ async fn remux(spec: RemuxSpec<'_>) -> Result<Response, ApiError> {
         audio_index,
         audio_offset_ms,
         hevc,
+        hdr,
         readrate,
         tracked,
     } = spec;
@@ -1019,8 +1024,15 @@ async fn remux(spec: RemuxSpec<'_>) -> Result<Response, ApiError> {
     // Safari only decodes HEVC in MP4 when the sample entry is tagged `hvc1`;
     // MKV HEVC is commonly `hev1`, which Safari renders black. Harmless for a
     // stream that's already hvc1. Video-stream-scoped so H.264 is untouched.
+    // The bitstream filter makes the stream keep hvc1's promise: no in-band
+    // parameter sets (and no dead DV metadata) — same hygiene, same reasons,
+    // as the segmented copy path (`hevc_copy_bsf`).
     if hevc {
         cmd.args(["-tag:v", "hvc1"]);
+        cmd.args([
+            "-bsf:v",
+            &plurx_core::transcode::hevc_copy_bsf(hdr.as_deref()),
+        ]);
     }
     if transcode_audio {
         cmd.args(["-c:a", "aac", "-ac", "2", "-b:a", "256k"]);
