@@ -1081,10 +1081,12 @@ checkpoint would live, so lifting this is contained — it has simply not
 been needed, because a pass that gets any hardware at all finishes a film
 well inside the window.
 
-**Not measured yet:** the TTFF and seek numbers in the acceptance list.
-The mechanism is verified end to end — a hit starts with no ffmpeg spawned
-and seeks by `currentTime` — but ≤1.5 s and ≤0.5 s are claims about a
-machine, and belong with M2's acceptance run on nynuc.
+**Still not measured:** the *cached* TTFF and seek numbers. The mechanism is
+verified end to end — a hit starts with no ffmpeg spawned and seeks by
+`currentTime` — and nynuc's live starts now measure ~684 ms median, so the
+≤1.5 s target is already met before a cache hit is involved. Nobody has
+played a cached title yet, because the producer has not been switched on
+there (`cache_produce_mins: 0`).
 
 ## 7. M4 — cluster transcode (rides Phase 4)
 
@@ -1364,6 +1366,7 @@ chosen-by-probe (§5) · [ROADMAP.md](ROADMAP.md) — this plan's slice line.
 | Weekend 3 ✅ | §6 (M3) — slot arbiter v1 landed with it | predicted plays start with no encoder and seek like direct play; producers yield to viewers |
 | The nynuc run ✅ | §5 + §4.6 accepted; §4.5bis found | 4.89× tone-map, 9.05 of 13.6 Mb/s — and the 10.4 s segments nobody had measured |
 | The second run ✅ | §4.5bis accepted; the DV question found | 2.00 s segments — and a 4K session on the CPU chain, correctly, for a reason nothing logged |
+| The third run ✅ | starts measured; the beacon label fixed | median ~684 ms — and five supply stalls on 4K remux that the mislabelled series had been hiding inside the start times |
 | With Phase 4 | §7 (M4) — fencing + takeover protocol per §7.3 | pool of nodes; failover inside the measured budget; overnight cluster pre-caching |
 
 Every slice leaves the tree releasable; nothing in a later slice is
@@ -1386,8 +1389,20 @@ five times too long on hardware. **An acceptance run on a machine where the
 bug cannot occur is not an acceptance run** — and §4 is full of criteria
 about what an *encoder* does, all of which were checked exactly that way.
 
-**Next, in order.** How much of the library M2 actually reaches (§5) — the
-4.88× applies only to HDR10, and a library of Dolby Vision remuxes gets none
-of it. Sessions log the reason now, so this needs playback rather than code.
-Then M3's TTFF and seek targets (§6.4), from the same beacons. Then M4, which
-waits on Phase 4.
+**Measured on nynuc, 2026-07-29.** Start times, once the beacon labels were
+corrected (a stall's duration had been entering the series as a start):
+**197 ms direct play, 651–1536 ms remux, median ~684 ms** — against the
+~2–3 s M1 aimed at and the ~10 s this plan opened with.
+
+**Still open, and it is a real one:** five `supply` stalls on the same 4K
+HEVC progressive remux, each with **0.1 s buffered** — the client running
+dry over and over on a title it never builds a reserve for. That is symptom
+#2 from §1, on the remux path rather than the copy-HLS one §4.2 fixed. The
+delivery-rate telemetry added in §4.3 is what should settle whether it is
+the NAS read, the link, or `stream_readrate`; it has not been read yet.
+
+**Next, in order.** The 4K remux stall above — it is the last of the four
+original symptoms with no explanation. Then how much of the library M2
+actually reaches (§5): 4.88× applies only to HDR10, and a library of Dolby
+Vision remuxes gets none of it. Both need playback rather than code. Then
+M4, which waits on Phase 4.
