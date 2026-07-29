@@ -3901,14 +3901,28 @@ function librariesPanel(libs,status,settings){
   // Movies/TV need a TMDB key for artwork; without one the scan finds files but
   // downloads nothing. Surface that right here, where libraries are managed.
   // Home libraries have no provider at all, so they don't want a key either.
-  const needTmdb = settings && !settings.tmdb_configured
-      && libs.some(l=>!l.anime && l.kind!=="home");
-  const warn = needTmdb ? `<div class="setwarn">⚠ <b>No TMDB API key set.</b> Your Movies/TV libraries scan fine, but posters, overviews, and episode data won't download without one. <a onclick="setSettingsTab('metadata')">Add a free key in Metadata</a>, then use <b>Refresh all art</b>. (Anime libraries use AniList, and home libraries use no provider at all — neither needs a key.)</div>` : "";
+  // Two different moments, and the useful thing to say differs between them.
+  //
+  // Before any library exists this is *advice*: set the key first and the very
+  // first scan brings artwork down with it. After one exists it is a *repair
+  // notice*: the scan already ran and found nothing to illustrate it with, so
+  // the key alone won't fix what's on screen — a refresh has to follow.
+  //
+  // The old version only ever showed the second, which meant the one person
+  // who could still act on the advice — someone setting the server up, on an
+  // empty Libraries tab — was the only one who never saw it.
+  const wantsProvider = l => !l.anime && l.kind!=="home";
+  const noKey = settings && !settings.tmdb_configured;
+  let warn = "";
+  if(noKey && libs.some(wantsProvider)){
+    warn = `<div class="setwarn">⚠ <b>No TMDB API key set.</b> Your Movies/TV libraries scan fine, but posters, overviews, and episode data won't download without one. <a onclick="setSettingsTab('metadata')">Add a free key in Metadata</a>, then come back and use <b>Refresh all art</b> — adding the key does not backfill what the earlier scans missed. (Anime libraries use AniList, and home libraries use no provider at all — neither needs a key.)</div>`;
+  } else if(noKey && !libs.some(wantsProvider)){
+    warn = `<div class="setwarn">⚠ <b>Set up a metadata key before you add a Movies or TV library.</b> Without one the scan finds every file and downloads no posters, overviews or episode data — and adding the key afterwards doesn't backfill it, so you'd have to re-run a full refresh over the whole library. <a onclick="setSettingsTab('metadata')">Add a free TMDB key in Metadata</a> first; it takes a minute. (Anime and home-video libraries need no key.)</div>`;
+  }
   return `<div class="card"><h2 class="section" style="margin-top:0">Libraries</h2>
       ${warn}${bulk}
       <table><thead><tr><th>Name</th><th>Kind</th><th>Paths</th><th>Status</th><th></th></tr></thead>
       <tbody>${rows}</tbody></table>
-      ${maintenancePanel(settings)}
       <h2 class="section">Add library</h2>
       <div class="row"><input id="ln" placeholder="Name" style="max-width:180px">
         <select id="lk" style="max-width:170px"><option value="movies">Movies</option><option value="shows">TV Shows</option><option value="anime">Anime</option><option value="home">Home videos &amp; photos</option></select>
@@ -3916,10 +3930,35 @@ function librariesPanel(libs,status,settings){
       <div class="hint">Paths are as the <b>server process</b> sees them — running in Docker, that's the path inside the container (e.g. <code>/media/movies</code>), which must be mounted in your compose file.</div>
       <div class="err" id="lerr"></div>
       <button style="margin-top:12px" onclick="addLib()">Add & scan</button>
-    </div>`;
+    </div>
+    ${maintenancePanel(settings)?`<div class="card">${maintenancePanel(settings)}</div>`:""}`;
+}
+// Set when a provider key is saved while libraries already exist.
+//
+// A key is not retroactive: everything scanned before it went in was matched
+// against nothing and stays blank until something re-fetches it. Saving the
+// key therefore *looks* like it worked and changes nothing on screen, which
+// reads as the key being wrong. Survives until they act on it or leave the
+// page — a toast would be gone before they finished reading it.
+let KEY_NEEDS_BACKFILL=null;
+function keyBackfillHtml(libs){
+  if(!KEY_NEEDS_BACKFILL || !libs.length) return "";
+  return `<div class="setwarn">⚠ <b>${esc(KEY_NEEDS_BACKFILL)} key saved — but it won't fill in what's already scanned.</b>
+    Everything in your ${libs.length} librar${libs.length===1?'y':'ies'} was matched before the key existed, so posters and overviews stay blank until they're re-fetched. This runs in the background and can take a while on a big library.
+    <div style="margin-top:8px"><button class="ghost sm" onclick="backfillFromKey()">Refresh all art now</button>
+    <button class="ghost sm" onclick="KEY_NEEDS_BACKFILL=null;renderSettings()">Not now</button></div></div>`;
+}
+async function backfillFromKey(){
+  KEY_NEEDS_BACKFILL=null;
+  const libs=(SETTINGS_DATA&&SETTINGS_DATA.libs)||[];
+  await Promise.all(libs.map(l=>api(`/libraries/${l.id}/refresh`,{method:"POST"}).catch(()=>{})));
+  toast("Refreshing metadata & artwork for every library…");
+  setSettingsTab("libraries");
+  setTimeout(settingsTick,400);
 }
 function metadataPanel(settings,trakt){
-  return `<div class="card"><h2 class="section" style="margin-top:0">API keys</h2>
+  const libs=(SETTINGS_DATA&&SETTINGS_DATA.libs)||[];
+  return `${keyBackfillHtml(libs)}<div class="card"><h2 class="section" style="margin-top:0">API keys</h2>
       <label>TMDB — posters, overviews, episode data</label>
       <p class="muted" style="margin:2px 0 6px">${settings.tmdb_configured?"Configured. Click the field to reveal it, or type a new key to replace it.":"Add a free key (<a href='https://www.themoviedb.org/settings/api' target='_blank' rel='noopener'>themoviedb.org</a>) to fetch posters, overviews, and episode data."}</p>
       <input id="tk" placeholder="TMDB API key" type="password" autocomplete="off" value="${esc(settings.tmdb_api_key||'')}" onfocus="this.type='text'" onblur="this.type='password'">
@@ -4172,8 +4211,28 @@ async function addLib(){
 async function scanLib(id){ try{ await api(`/libraries/${id}/scan`,{method:"POST"}); toast("Scan started"); setTimeout(settingsTick,400);}catch(e){toast(e.message)} }
 async function refreshLib(id){ try{ await api(`/libraries/${id}/refresh`,{method:"POST"}); toast("Refreshing metadata & artwork…"); setTimeout(settingsTick,400);}catch(e){toast(e.message)} }
 async function delLib(id){ if(!confirm("Delete this library? Media files are not touched.")) return; try{ await api(`/libraries/${id}`,{method:"DELETE"}); invalidateLibs(); toast("Deleted"); viewSettings(); }catch(e){toast(e.message)} }
-async function saveTmdb(){ const err=document.getElementById("terr"); err.textContent=""; try{ await api("/settings",{method:"PUT",body:{tmdb_api_key:tk.value.trim()}}); toast("Saved"); viewSettings(); }catch(e){err.textContent=e.message} }
-async function saveOmdb(){ const err=document.getElementById("oerr"); err.textContent=""; try{ await api("/settings",{method:"PUT",body:{omdb_api_key:document.getElementById("ok").value.trim()}}); toast("Saved"); viewSettings(); }catch(e){err.textContent=e.message} }
+// Saving a key over libraries that already exist needs the backfill notice;
+// saving one on a fresh server does not, because the first scan will pick it
+// up on its own. Decided before the save, since `viewSettings` refetches and
+// `tmdb_configured` is true either way afterwards.
+function noteKeySaved(label, value, wasConfigured){
+  const libs=(SETTINGS_DATA&&SETTINGS_DATA.libs)||[];
+  if(value && !wasConfigured && libs.length) KEY_NEEDS_BACKFILL=label;
+}
+async function saveTmdb(){
+  const err=document.getElementById("terr"); err.textContent="";
+  const was=!!(SETTINGS_DATA&&SETTINGS_DATA.settings&&SETTINGS_DATA.settings.tmdb_configured);
+  const v=tk.value.trim();
+  try{ await api("/settings",{method:"PUT",body:{tmdb_api_key:v}}); noteKeySaved("TMDB",v,was); toast("Saved"); viewSettings(); }
+  catch(e){err.textContent=e.message}
+}
+async function saveOmdb(){
+  const err=document.getElementById("oerr"); err.textContent="";
+  const was=!!(SETTINGS_DATA&&SETTINGS_DATA.settings&&SETTINGS_DATA.settings.omdb_configured);
+  const v=document.getElementById("ok").value.trim();
+  try{ await api("/settings",{method:"PUT",body:{omdb_api_key:v}}); noteKeySaved("OMDb",v,was); toast("Saved"); viewSettings(); }
+  catch(e){err.textContent=e.message}
+}
 
 // ---- playback defaults + Trakt (settings page) -----------------------------
 const LANG_CHOICES=[["eng","English"],["jpn","Japanese"],["spa","Spanish"],["fre","French"],
