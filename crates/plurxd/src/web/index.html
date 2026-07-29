@@ -1026,14 +1026,14 @@ function endWait(resumed){
 // what identifies a cause is the count and the spacing.
 function reportHitches(){
   const p=PLAYER; if(!p||!p.hitches) return;
-  const h=p.hitches, n=h.back+h.held+h.gap;
+  const h=p.hitches, n=h.back+h.held+(h.late||0)+h.gap;
   if(n<5 || p._hitchReported===n) return;
   if(n!==5 && n%50!==0) return;
   p._hitchReported=n;
   const iv=hitchInterval();
   const blame=hitchBlame();
   clientLog(Object.assign({level:"warn",event:"hitch",
-    detail:`back=${h.back} held=${h.held} skip=${h.gap} slow=${h.slow}${h.fps?` fps=${h.fps.toFixed(2)}`:''}`,
+    detail:`back=${h.back} held=${h.held} late=${h.late||0} skip=${h.gap} slow=${h.slow}${h.fps?` fps=${h.fps.toFixed(2)}`:''}`,
     message:`${n} frame hitches${iv?`, one every ~${iv.toFixed(1)}s`:''}${blame?` — ${blame}`:''} — ${h.last||''}`},
     playbackContext()));
 }
@@ -2730,7 +2730,7 @@ function segmentedRemuxOk(decision, video){
 // the only API that sees individual presented frames, so it is the only place
 // left to look.
 //
-// Four distinct faults, kept apart because they have different causes:
+// Five distinct faults, kept apart because they have different causes:
 //   back    the media clock moved BACKWARDS between presented frames. This is
 //           the "it repeats a frame" report, and it is what a resync looks
 //           like from the outside.
@@ -2738,6 +2738,14 @@ function segmentedRemuxOk(decision, video){
 //           whole frame while the screen refreshed. Nothing was lost, but the
 //           picture stopped for a beat — the other half of "backs up a frame
 //           and then resumes", and invisible to every counter we have.
+//   late    the fault this callback cannot see directly, and the one a viewer
+//           actually watches: the compositor HELD the previous frame for an
+//           extra refresh or two. No new frame is presented during the hold,
+//           so no callback fires — the evidence is the NEXT frame arriving
+//           with a normal media step but a display-clock step nearly twice as
+//           long. Judged on expectedDisplayTime, the compositor's own
+//           schedule, not the callback timestamp, which runs on the main
+//           thread and jitters with it.
 //   gap     media time advanced past frames that were never presented at all,
 //           which `droppedVideoFrames` does not count because they were never
 //           decoded.
@@ -2768,6 +2776,13 @@ const HITCH_WINDOW=120;
 // under one in ten — which is what makes "12 of 13 hitches landed on a flush"
 // mean something.
 const HITCH_NEAR_MS=150;
+// A late frame has to be this far behind the compositor's schedule to count.
+// The floor clears 3:2 pulldown on a 60 Hz panel, whose display intervals
+// legitimately alternate 33/50 ms around a 42 ms mean (±8 ms of jitter is
+// healthy); three-quarters of a frame catches a whole extra refresh at any
+// display rate from 24 Hz up.
+const HITCH_LATE_FLOOR_MS=25;
+const HITCH_LATE_FRACTION=0.75;
 function markEvent(kind){
   const p=PLAYER; if(!p) return;
   (p.marks||(p.marks={}))[kind]=performance.now();
@@ -2775,7 +2790,7 @@ function markEvent(kind){
 function armHitchDetector(v){
   if(!v.requestVideoFrameCallback) return;
   const p=PLAYER; if(!p) return;
-  p.hitches={back:0, held:0, gap:0, slow:0, worst:0, last:null, at:[], fps:null,
+  p.hitches={back:0, held:0, late:0, gap:0, slow:0, worst:0, last:null, at:[], fps:null,
              n:0, near:{}, flushEdge:null, skewMax:0, skewAt:null, decodeMs:null};
   let prev=null;
   // The nominal frame interval, from HISTORY — never from the step under
@@ -2825,13 +2840,24 @@ function armHitchDetector(v){
           }
         }
       };
+      // This frame's decode cost, said alongside every fault. The one report
+      // that can separate "the decoder spiked on the giant IRAP" from every
+      // buffer- and container-shaped theory is the decode time AT the hitch
+      // against the session's own typical — so it goes in the words, where a
+      // screenshot carries it.
+      const pd=meta.processingDuration;
+      const fx=()=>{
+        const typ=typicalDecode();
+        return (pd!=null && typ!=null)
+          ? ` · decode ${(pd*1000).toFixed(0)}ms (typ ${(typ*1000).toFixed(0)})` : '';
+      };
       if(dt<-0.001){
         blame();
-        h.back++; h.last=`stepped back ${(-dt*1000).toFixed(0)}ms at ${meta.mediaTime.toFixed(1)}s`;
+        h.back++; h.last=`stepped back ${(-dt*1000).toFixed(0)}ms at ${meta.mediaTime.toFixed(1)}s${fx()}`;
         h.at.push(+meta.mediaTime.toFixed(2));
       } else if(nom && dt<nom*0.5){
         blame();
-        h.held++; h.last=`held a frame at ${meta.mediaTime.toFixed(1)}s`;
+        h.held++; h.last=`held a frame at ${meta.mediaTime.toFixed(1)}s${fx()}`;
         h.at.push(+meta.mediaTime.toFixed(2));
       } else if(nom && dt/nom-dn>HITCH_GAP_FRAMES){
         blame();
@@ -2840,15 +2866,30 @@ function armHitchDetector(v){
         // frames at once, and three frames PRESENTED in one callback is the
         // browser batching, not a stutter — the viewer saw all of them.
         h.gap++; h.worst=Math.max(h.worst, (dt-dn*nom)*1000);
-        h.last=`skipped ${((dt-dn*nom)*1000).toFixed(0)}ms at ${meta.mediaTime.toFixed(1)}s`;
+        h.last=`skipped ${((dt-dn*nom)*1000).toFixed(0)}ms at ${meta.mediaTime.toFixed(1)}s${fx()}`;
         h.at.push(+meta.mediaTime.toFixed(2));
       } else {
+        // The media step is normal — but was it ON TIME? A compositor hold
+        // never presents a frame, so it never fires this callback; the next
+        // frame lands here with dt ≈ one frame and a display-clock step of
+        // two. expectedDisplayTime is compared against the media step scaled
+        // by the playback rate; the pulldown-safe threshold is above.
+        const eDt=(meta.expectedDisplayTime!=null && prev.expectedDisplayTime!=null)
+          ? meta.expectedDisplayTime-prev.expectedDisplayTime : null;
+        const rate=v.playbackRate||1;
+        const lateMs=(eDt!=null && dt>0)? eDt-(dt*1000)/rate : null;
+        if(nom && lateMs!=null && dt<nom*2.5
+           && lateMs>Math.max(HITCH_LATE_FLOOR_MS, nom*1000*HITCH_LATE_FRACTION)){
+          blame();
+          h.late++; h.worst=Math.max(h.worst, lateMs);
+          h.last=`${lateMs.toFixed(0)}ms late at ${meta.mediaTime.toFixed(1)}s${fx()}`;
+          h.at.push(+meta.mediaTime.toFixed(2));
+        }
         if(dt>0) seen.push(dt/dn);
         if(seen.length>HITCH_WINDOW) seen.shift();
         // Judged against this session's own median, and only once there is a
         // median to judge against. A frame also has to miss its frame budget
         // to count: three times a 2ms baseline is 6ms, which nobody sees.
-        const pd=meta.processingDuration;
         if(pd!=null){
           const typ=typicalDecode();
           if(typ!=null){
@@ -3992,10 +4033,11 @@ function updateStats(){
     // software 4K HEVC decode is a full buffer, few dropped frames and
     // constant judder — indistinguishable from a delivery problem on every
     // other line of this panel.
-    (PLAYER.hitches&&(PLAYER.hitches.back||PLAYER.hitches.held||PLAYER.hitches.gap||PLAYER.hitches.slow)?
+    (PLAYER.hitches&&(PLAYER.hitches.back||PLAYER.hitches.held||PLAYER.hitches.late||PLAYER.hitches.gap||PLAYER.hitches.slow)?
       `<div><b>Hitches</b><span style="color:var(--warn,#fbbf24)">${
         [PLAYER.hitches.back?`${PLAYER.hitches.back} back`:null,
          PLAYER.hitches.held?`${PLAYER.hitches.held} held`:null,
+         PLAYER.hitches.late?`${PLAYER.hitches.late} late`:null,
          PLAYER.hitches.gap?`${PLAYER.hitches.gap} skip`:null,
          PLAYER.hitches.slow?`${PLAYER.hitches.slow} slow`:null].filter(Boolean).join(" · ")
       }${hitchInterval()?` · every ~${hitchInterval().toFixed(1)}s`:''}</span></div>`
