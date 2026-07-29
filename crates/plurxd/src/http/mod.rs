@@ -21,7 +21,7 @@ mod photos;
 mod plex;
 mod scan;
 pub(crate) mod stream;
-mod system;
+pub(crate) mod system;
 mod trakt;
 mod users;
 mod watch;
@@ -59,6 +59,10 @@ pub fn router(state: AppState) -> Router {
         .route("/trakt/sync", post(trakt::sync_now))
         .route("/system", get(system::system_info))
         .route("/system/logs", get(system::logs))
+        // Re-measure storage. POST because it costs real I/O against the
+        // library, and separate from GET /system so that reading the last
+        // numbers is never the thing that goes and takes new ones.
+        .route("/system/storage", post(system::remeasure_storage))
         // Any signed-in user can post a client-side playback error here so it
         // lands in the admin log (browsers that reject a stream produce no
         // server log on their own).
@@ -1792,6 +1796,66 @@ mod tests {
         assert!(body["version"].is_string());
         assert!(body["encoders"].is_object());
         assert_eq!(body["users"], 1);
+    }
+
+    /// The storage numbers have to reach `/system`, and an unmeasured server
+    /// has to say so rather than reporting zeroes. A probe that runs perfectly
+    /// and never surfaces is the same to an operator as one that never ran.
+    #[tokio::test]
+    async fn storage_is_reported_and_remeasurable() {
+        let app = test_app();
+        let admin = setup_admin(&app).await;
+
+        // Before any probe: present, and honestly empty.
+        let (status, body) = call(&app, get("/api/v1/system", Some(&admin))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["storage"]["ran"], false);
+        assert!(body["storage"]["measured_at"].is_null());
+
+        // Re-measuring with no libraries is a no-op rather than an error: there
+        // is nothing to read, which is not a failure to read.
+        let (status, _) = call(
+            &app,
+            post("/api/v1/system/storage", Some(&admin), json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // With a library, the probe runs and the mount appears — here with no
+        // file big enough to sample, which is the honest answer for the path
+        // and still tells the operator the path resolved.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (status, _) = call(
+            &app,
+            post(
+                "/api/v1/libraries",
+                Some(&admin),
+                json!({"name": "M", "kind": "movies", "paths": [dir.path()]}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, st) = call(
+            &app,
+            post("/api/v1/system/storage", Some(&admin), json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(st["ran"], true);
+        assert_eq!(st["mounts"].as_array().expect("mounts").len(), 1);
+        assert!(st["mounts"][0]["note"].is_string());
+
+        // And it is the same report GET /system serves, not a second one.
+        let (_, body) = call(&app, get("/api/v1/system", Some(&admin))).await;
+        assert_eq!(body["storage"]["measured_at"], st["measured_at"]);
+    }
+
+    #[tokio::test]
+    async fn storage_remeasure_is_admin_only() {
+        let app = test_app();
+        let (status, _) = call(&app, post("/api/v1/system/storage", None, json!({}))).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

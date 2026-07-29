@@ -3949,6 +3949,45 @@ function toneMapHtml(tm){
   ).join("");
   return `${head}${note}${rows}`;
 }
+// What each library's storage reads at, in the unit the rest of the page uses
+// for bitrates — so "this mount does 240 Mb/s" and "this file is 69 Mb/s" can
+// be compared by looking at them.
+//
+// The input side of the pipeline, and the last part of it with no number. A
+// source the server cannot read fast enough never says so: it surfaces as a
+// client stall, which reads as a network or encoder problem and sends people
+// to tune the two halves that were working.
+function storageHtml(st){
+  if(!st || !st.ran) return `<span class="muted">measuring…</span> <button class="ghost sm" onclick="remeasureStorage(this)">Measure now</button>`;
+  const rows=(st.mounts||[]).map(m=>{
+    const roots=esc((m.roots||[]).join(", "));
+    if(m.read_bps==null){
+      return `<div><b>${roots}</b> <span style="color:var(--bad)">${esc(m.note||"not measured")}</span></div>`;
+    }
+    const mbps=m.read_bps/1e6;
+    const seek=m.seek_ms!=null?` · cold seek ${m.seek_ms.toFixed(1)} ms`:"";
+    // Stated as a bitrate ceiling rather than as MB/s, because the decision it
+    // informs — can this file be remuxed or direct-played from here — is a
+    // comparison against a bitrate.
+    const cap=`<div class="muted" style="font-size:12px">feeds up to ${fmtMbps(m.read_bps)} at realtime</div>`;
+    const warn=m.cache_suspect?`<div class="muted" style="font-size:12px;color:var(--warn,#fbbf24)">${esc(m.note||"")}</div>`:"";
+    return `<div><b>${roots}</b> ${mbps.toFixed(0)} Mb/s${esc(seek)}</div>${cap}${warn}`;
+  }).join("");
+  const when=st.measured_at?` <span class="muted">· measured ${fmtAgo(st.measured_at)}</span>`:"";
+  return `${rows||`<span class="muted">no libraries to measure</span>`}${when}
+    <button class="ghost sm" style="margin-top:6px" onclick="remeasureStorage(this)">Re-measure</button>`;
+}
+// Synchronous by design: the button asked for a measurement, and it may take
+// as long as a sleeping array takes to answer. Re-rendering immediately with
+// the previous numbers would look like it worked and be wrong.
+async function remeasureStorage(btn){
+  const was=btn.textContent; btn.disabled=true; btn.textContent="Measuring…";
+  try{
+    const st=await api("/system/storage",{method:"POST"});
+    if(SETTINGS_DATA&&SETTINGS_DATA.sys) SETTINGS_DATA.sys.storage=st;
+    renderSettings();
+  }catch(e){ toast(e.message); btn.disabled=false; btn.textContent=was; }
+}
 function systemPanel(sys){
   const enc=sys.encoders||{};
   const pills=[["NVENC",enc.nvenc],["QuickSync",enc.qsv],["VA-API",enc.vaapi],["VideoToolbox",enc.videotoolbox]]
@@ -3961,6 +4000,7 @@ function systemPanel(sys){
         <dt>Hardware</dt><dd>${pills}</dd>
         <dt>Transcoder</dt><dd>${esc(sys.encoder_selected)} <span class="muted">(preference: ${esc(sys.hwaccel_pref)})</span></dd>
         <dt>HDR tone-map</dt><dd>${toneMapHtml(sys.tone_map)}</dd>
+        <dt>Storage</dt><dd>${storageHtml(sys.storage)}</dd>
         <dt>Right now</dt><dd>${sys.active_transcodes} active stream${sys.active_transcodes===1?'':'s'} · ${sys.libraries} librar${sys.libraries===1?'y':'ies'} · ${sys.users} user${sys.users===1?'':'s'}</dd>
       </dl></div>
     <div class="card"><h2 class="section" style="margin-top:0">Logs</h2>

@@ -108,7 +108,41 @@ The Server card is the health-at-a-glance panel:
 - **Transcoder** — the encoder the server will actually pick, and your preference
   (`PLURX_HWACCEL`). If you set `qsv` but see software selected, the QSV probe was
   rejected — the log line says why.
+- **Storage** — what each library's storage reads at, and what a cold seek into
+  a file costs there. See below; it is the one number on this card that can
+  change without a restart, so it has a **Re-measure** button.
 - **Right now** — active streams, library count, user count.
+
+## Reading the storage numbers
+
+A remux and a direct play both send the source's own video untouched, so the
+storage has to sustain that file's bitrate for the whole film — and the
+transcode paths have to read it at least that fast to keep an encoder fed.
+When storage cannot, there is nothing in the playback UI that says so: the
+viewer sees a `supply` stall, the Stats overlay shows the encoder under 1×,
+and both readings are true while pointing away from the cause.
+
+The probe answers it directly. It runs a few seconds after boot (so a sleeping
+array never delays startup) and again whenever you press **Re-measure** or
+`POST /api/v1/system/storage`. Per mount — libraries on the same device are
+measured once, together — it reports:
+
+- **Read rate**, in Mb/s, the same unit as a file's bitrate. A file whose
+  bitrate is above this cannot play from here, whatever the encoder or the
+  client does. A file above `read rate ÷ stream_readrate` plays but never
+  builds a reserve, so any hiccup on the link becomes a stall.
+- **Cold seek**, the median time to the first bytes at an untouched offset.
+  Single-digit milliseconds is local storage; tens of milliseconds is a
+  network mount, and it is what every scrub and every resume pays before
+  ffmpeg can emit a frame.
+
+It reads a real media file from the library rather than a fixture it wrote —
+a fixture would still be in the page cache and would report a NAS at several
+GB/s. If a number still comes back impossibly high the card says so rather
+than quietly boasting; treat that mount's figure as a floor.
+
+`scripts/perf-report` prints the same numbers with the comparison already
+done, which is usually the faster way to answer "is my storage the problem".
 
 ## Reading playback (and the stats overlay)
 

@@ -114,6 +114,12 @@ pub struct SystemDto {
     /// two apart, which is the difference between "fix monarr's path
     /// mapping" and "check monarr's URL and key".
     pub integration: IntegrationDto,
+    /// What the libraries' storage reads at, last time anyone measured. The
+    /// input side of the pipeline, and until this existed the only side that
+    /// had never been measured — which is why a source the box could not read
+    /// fast enough surfaced as a *client* stall and sent everyone to look at
+    /// the encoder.
+    pub storage: crate::storeprobe::StorageReport,
     #[serde(flatten)]
     pub info: crate::state::SystemInfo,
 }
@@ -166,8 +172,54 @@ pub async fn system_info(
             last_notification_source: last.and_then(|r| r.source.clone()),
             last_correlation_id: last.and_then(|r| r.correlation_id.clone()),
         },
+        storage: state.storage.read().await.clone(),
         info: (*state.system).clone(),
     }))
+}
+
+/// Measure every library's storage and record the result on `state`.
+///
+/// Shared by the boot task and the admin re-run so there is one definition of
+/// what "the storage numbers" are. Roots come from the library table rather
+/// than from a config path: what matters is the storage plurx will actually
+/// read media from, which is exactly the set of paths libraries point at.
+pub async fn probe_storage(state: AppState) {
+    let roots: Vec<std::path::PathBuf> = match state.store.list_libraries().await {
+        Ok(libs) => libs.into_iter().flat_map(|l| l.paths).collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, "storage probe: could not list libraries");
+            return;
+        }
+    };
+    if roots.is_empty() {
+        return;
+    }
+    let report = crate::storeprobe::probe(roots).await;
+    for m in &report.mounts {
+        // One line per mount, at info: this is the kind of fact someone reads
+        // the log to find, and burying it at debug would mean it is only ever
+        // seen by someone who already suspected storage.
+        tracing::info!(
+            roots = %m.roots.join(", "),
+            read_mbps = m.read_bps.map(|b| b / 1e6),
+            seek_ms = m.seek_ms,
+            cache_suspect = m.cache_suspect,
+            note = m.note.as_deref().unwrap_or(""),
+            "storage probe"
+        );
+    }
+    *state.storage.write().await = report;
+}
+
+/// POST /api/v1/system/storage (admin) — re-measure and return the new
+/// numbers. Synchronous, because the caller asked for a measurement and an
+/// immediate 200 with the *old* figures would be worse than a slow one.
+pub async fn remeasure_storage(
+    _admin: AdminUser,
+    State(state): State<AppState>,
+) -> Result<Json<crate::storeprobe::StorageReport>, ApiError> {
+    probe_storage(state.clone()).await;
+    Ok(Json(state.storage.read().await.clone()))
 }
 
 #[derive(Deserialize)]
