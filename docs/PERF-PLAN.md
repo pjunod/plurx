@@ -1,13 +1,14 @@
 # Performance — where the seconds go, and the plan to get them back
 
-**Status:** M1 complete; **M2 code-complete**; **M3 complete** (2026-07-28)
-— the pre-transcode cache produces, serves, resumes across process death,
-and stays inside a disk budget. What remains needs hardware rather than
-code: M2's acceptance run and §4.6's grain-heavy bitrate measurement.
-Neither can happen in CI — with no GPU there, a candidate can only fail its
-probe, never pass. The probe's verdicts now render on Settings → System, so
-the M2 run is a look rather than a `curl`. M4 waits on Phase 4's plumbing,
-which does not exist yet · **Diagnosed against:** `e7a12cf`
+**Status:** M1, **M2** and **M3 complete** (2026-07-29). M2's acceptance ran
+on nynuc: the QSV tone-map graph passed at **4.89× the CPU chain**, and
+§4.6's bound held at **9.05 Mb/s peak over a 10 s window against a permitted
+13.6** on the 1080p rung. The same run found the bug in §4.4bis below — 10.4
+second segments from a 2-second request, the original start-up symptom still
+alive on the only box with hardware. M4 waits on Phase 4's plumbing, which
+does not exist yet · **Collected with:**
+[`scripts/perf-report`](../scripts/perf-report) · **Diagnosed against:**
+`e7a12cf`
 · **Review record:** [PERF-PLAN-REVIEW.md](PERF-PLAN-REVIEW.md) →
 [PERF-REVIEW-RESPONSE.md](PERF-REVIEW-RESPONSE.md) →
 [PERF-REVIEW-ASSESSMENT.md](PERF-REVIEW-ASSESSMENT.md) ·
@@ -594,6 +595,43 @@ fails inside the old windows; a synthetic-progress test proves a killed
 generation cannot mark its replacement dead or overwrite its label;
 recent speed reacts to a forced slowdown within its documented window.
 
+### 4.5bis Asking for a key frame is not getting one (found 2026-07-29)
+
+§4.4 shipped, and on nynuc the segments were **10.4 seconds long**. The
+request was two. This is the first measurement the plan has of a hardware
+encoder doing what §4.4 asked, and it was not doing it.
+
+`-force_key_frames` asks the encoder for a key frame. QSV and NVENC answer
+with an I-frame that is *not an IDR*, and a non-IDR I-frame does not carry
+`AV_PKT_FLAG_KEY`. The HLS muxer can only cut at a flagged key frame, so it
+ignores every boundary asked for and falls back to the encoder's own GOP:
+250 frames at 23.976 fps is 10.43 s, against 187.7 s over 18 segments
+measured. Reproduced locally at 2.00 s with effective forced key frames and
+10.00 s without.
+
+The consequence is the whole plan's headline symptom. Nothing plays until a
+segment exists, so the start floor was still ten seconds of encoding on the
+one box that has hardware — while §4.4's acceptance, run in CI on software,
+passed. **A milestone validated only where the bug cannot occur is not
+validated.**
+
+Fixed by passing `-forced_idr` (QSV) / `-forced-idr` (NVENC); VA-API needs
+nothing, its `idr_interval` already defaults to making every I-frame an IDR,
+which is why VA-API never showed the symptom. The flag is *measured* by the
+startup probe rather than assumed: the probe runs production's arguments
+with it and retries without on failure, so a build that will not take the
+option keeps its hardware and gets a warning instead of vanishing. Losing a
+GPU to an unrecognised option is a worse trade than the latency the option
+removes — the same reasoning that left VA-API's `-rc_mode` alone below.
+
+**Acceptance:** `scripts/perf-report --ratecontrol <id>` reports median
+segment length; it must read ~2 s on QSV. **Not yet re-run on nynuc.**
+
+**The lesson worth keeping:** every acceptance in §4 that is about what an
+*encoder* does was run in CI, on software, where the encoder in question is
+absent. §4.4's segment length is simply the one that got caught. The others
+are worth re-reading with that in mind.
+
 ### 4.6 Bound the hardware rate control (kills B6)
 
 Add `-maxrate` (1.5×) / `-bufsize` (2×) to the QSV, VA-API, and
@@ -637,8 +675,21 @@ second. And the failure line the operator reads was ffmpeg's last, which is
 that same generic summary; it is now the first real cause ("Operation not
 permitted" — a missing device — rather than "nothing was written").
 
-Still owed: the grain-heavy sliding-window measurement, which needs QSV
-hardware. `scripts/bench` is where it goes.
+**Measured on nynuc, 2026-07-29 — the bound holds.** A 1080p QSV session:
+mean 7.74 Mb/s against an 8 Mb/s nominal, peak **9.05 Mb/s over a 10-second
+window** where the model permits `maxrate + bufsize/W` = **13.6**. The worst
+single segment was also 9.05, so the peak is not a windowing artefact.
+
+The measurement lives in [`scripts/perf-report`](../scripts/perf-report)
+rather than `scripts/bench`, and starts a real session rather than
+reconstructing the flags — a Python copy of the argument list would only
+prove that two copies agree, which is the drift review R4 already objected
+to. Re-run it after any rate-control change:
+
+```bash
+scripts/perf-report --url http://nynuc:32400 --user paul \
+  --ratecontrol <file_id> --height 1080   # pick the grainiest 4K HDR title
+```
 
 ### 4.7 The Auto rung (B8 — decision needed, small code)
 
@@ -684,6 +735,11 @@ at 1080p where it used to give 720p.
   — §5 leans on its filter set; the pacing flags need ≥6.1 for burst.
 
 ## 5. M2 — the real 4K fix: tone-map on the GPU (kills B2)
+
+**Status:** accepted on nynuc, 2026-07-29. `vpp_qsv` passed the boot probe
+at **4.89× the CPU chain** — above the ≥3× objective — and is what QSV
+sessions run. Every node reports its own verdicts on Settings → System and
+in `/api/v1/system`, so this stays re-checkable without a benchmark run.
 
 **Objective:** a 4K HDR10 → 1080p SDR transcode runs ≥3× realtime on a
 Gen11+ Intel iGPU, making the ~30 s stutter class structurally impossible
@@ -1294,8 +1350,9 @@ chosen-by-probe (§5) · [ROADMAP.md](ROADMAP.md) — this plan's slice line.
 | Weekend 1 ✅ | M0 + §4.1 + §4.2 + §4.3 + §4.5 | starts ~3–5 s; 4K copy-HLS and AirPlay stop stalling; numbers for everything else |
 | Correction pass ✅ | §2.8: R1 client config · three-frontier accounting + retention + byte budgets · attempt generations + live labels · §8.5 lifecycle · R11 cheap wins | shipped code now matches the reviewed contracts |
 | Weekend 2 | §4.4 + §4.6 (+§4.7 decision) | starts ~2–3 s; Wi-Fi-stable rungs; validation exercises the production flags |
-| Focused week | §5 (M2) — real-HDR probe matrix on nynuc + one AMD node first | 4K HDR fully hardware; the 30 s stutter class gone; Auto=1080p viable; admission by measured speed |
+| Focused week ✅ | §5 (M2) — real-HDR probe on nynuc | `vpp_qsv` at 4.89×; the 30 s stutter class gone; admission by measured speed |
 | Weekend 3 ✅ | §6 (M3) — slot arbiter v1 landed with it | predicted plays start with no encoder and seek like direct play; producers yield to viewers |
+| The nynuc run ✅ | §5 + §4.6 accepted; §4.5bis found | 4.89× tone-map, 9.05 of 13.6 Mb/s — and the 10.4 s segments nobody had measured |
 | With Phase 4 | §7 (M4) — fencing + takeover protocol per §7.3 | pool of nodes; failover inside the measured budget; overnight cluster pre-caching |
 
 Every slice leaves the tree releasable; nothing in a later slice is
@@ -1307,11 +1364,18 @@ measurement uncertainty owned by M0 — which is where uncertainty belongs.
 M3 shipped ahead of M2's acceptance run, which was the right order for a
 reason worth writing down: the cache is the only milestone whose value does
 not depend on which encoder wins, so it could be built and proved on a box
-with no GPU at all. M2's remaining work cannot be.
+with no GPU at all. M2's could not be, and the delay cost something — §4.4
+had been "done" for a day while the symptom it exists to kill was still
+there on the only machine that could show it.
 
-**The next thing that should happen is still not code.** It is running the
-fixture matrix on nynuc, because §4.4's segment-length trade-off and §5's
-whole premise are both claims about numbers nobody has measured on the
-hardware this runs on — and M3's own TTFF and seek targets (§6.4) now wait
-in the same queue, for the same reason. Everything that could be settled
-without that hardware has been.
+**What the nynuc run actually taught.** Two acceptances passed on the first
+try, which is the boring half. The valuable half is §4.5bis: a milestone
+about segment length, validated in CI on software, shipped with segments
+five times too long on hardware. **An acceptance run on a machine where the
+bug cannot occur is not an acceptance run** — and §4 is full of criteria
+about what an *encoder* does, all of which were checked exactly that way.
+
+**Next, in order.** Re-run `scripts/perf-report --ratecontrol` on nynuc to
+confirm ~2 s segments after the forced-IDR fix; that is the one open
+regression. Then M3's TTFF and seek targets (§6.4), which want beacons from
+real playback rather than a synthetic run. Then M4, which waits on Phase 4.
