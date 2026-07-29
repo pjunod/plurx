@@ -624,8 +624,9 @@ option keeps its hardware and gets a warning instead of vanishing. Losing a
 GPU to an unrecognised option is a worse trade than the latency the option
 removes — the same reasoning that left VA-API's `-rc_mode` alone below.
 
-**Acceptance:** `scripts/perf-report --ratecontrol <id>` reports median
-segment length; it must read ~2 s on QSV. **Not yet re-run on nynuc.**
+**Accepted 2026-07-29:** nynuc reads **2.00 s median** (min 1.96, max 2.00)
+across 92 segments, where the same command read 10.4 s before the fix. The
+start floor is where §4.4 said it was.
 
 **The lesson worth keeping:** every acceptance in §4 that is about what an
 *encoder* does was run in CI, on software, where the encoder in question is
@@ -736,10 +737,19 @@ at 1080p where it used to give 720p.
 
 ## 5. M2 — the real 4K fix: tone-map on the GPU (kills B2)
 
-**Status:** accepted on nynuc, 2026-07-29. `vpp_qsv` passed the boot probe
-at **4.89× the CPU chain** — above the ≥3× objective — and is what QSV
-sessions run. Every node reports its own verdicts on Settings → System and
-in `/api/v1/system`, so this stays re-checkable without a benchmark run.
+**Status:** the graph is accepted; how much of a real library it reaches is
+not. `vpp_qsv` passed nynuc's boot probe at **4.88–4.89× the CPU chain**,
+above the ≥3× objective. Every node reports its own verdicts on Settings →
+System and in `/api/v1/system`.
+
+**But the first 4K session measured on that box ran the CPU chain anyway** —
+and correctly. `Pipeline::handles` sends Dolby Vision and HLG to the float
+chain, because the vendor tone-map cannot read DV's dynamic metadata and
+handles HLG inconsistently across drivers. Most 2024-era UHD remuxes are DV.
+So the question this milestone did not think to ask is **what fraction of a
+real library is HDR10** — the only part 4.88× applies to. Sessions now log
+`proven`, `hdr` and `declined`, so a report answers that rather than raising
+it; not enough sessions have been collected yet to say.
 
 **Objective:** a 4K HDR10 → 1080p SDR transcode runs ≥3× realtime on a
 Gen11+ Intel iGPU, making the ~30 s stutter class structurally impossible
@@ -1353,6 +1363,7 @@ chosen-by-probe (§5) · [ROADMAP.md](ROADMAP.md) — this plan's slice line.
 | Focused week ✅ | §5 (M2) — real-HDR probe on nynuc | `vpp_qsv` at 4.89×; the 30 s stutter class gone; admission by measured speed |
 | Weekend 3 ✅ | §6 (M3) — slot arbiter v1 landed with it | predicted plays start with no encoder and seek like direct play; producers yield to viewers |
 | The nynuc run ✅ | §5 + §4.6 accepted; §4.5bis found | 4.89× tone-map, 9.05 of 13.6 Mb/s — and the 10.4 s segments nobody had measured |
+| The second run ✅ | §4.5bis accepted; the DV question found | 2.00 s segments — and a 4K session on the CPU chain, correctly, for a reason nothing logged |
 | With Phase 4 | §7 (M4) — fencing + takeover protocol per §7.3 | pool of nodes; failover inside the measured budget; overnight cluster pre-caching |
 
 Every slice leaves the tree releasable; nothing in a later slice is
@@ -1375,7 +1386,8 @@ five times too long on hardware. **An acceptance run on a machine where the
 bug cannot occur is not an acceptance run** — and §4 is full of criteria
 about what an *encoder* does, all of which were checked exactly that way.
 
-**Next, in order.** Re-run `scripts/perf-report --ratecontrol` on nynuc to
-confirm ~2 s segments after the forced-IDR fix; that is the one open
-regression. Then M3's TTFF and seek targets (§6.4), which want beacons from
-real playback rather than a synthetic run. Then M4, which waits on Phase 4.
+**Next, in order.** How much of the library M2 actually reaches (§5) — the
+4.88× applies only to HDR10, and a library of Dolby Vision remuxes gets none
+of it. Sessions log the reason now, so this needs playback rather than code.
+Then M3's TTFF and seek targets (§6.4), from the same beacons. Then M4, which
+waits on Phase 4.
