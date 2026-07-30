@@ -8,6 +8,83 @@ bump may break compatibility and a **patch** bump never does.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.2.0] — 2026-07-30
+
+### Added
+
+- **Big remuxes stream in segments.** A remux at or above 40 Mb/s — or one
+  whose storage can't stay comfortably ahead of it — is delivered as
+  copy-video HLS instead of one progressive file, so Chrome's shallow
+  progressive read-ahead stops being the ceiling on 4K playback. The video
+  stream is untouched; audio is re-encoded only when the browser can't take
+  the source. The player verifies the browser will actually accept the codec
+  through MediaSource before taking the segmented path, and **Quality →
+  "Original · one stream"** forces the old single-stream delivery when you
+  want it.
+- **The pre-transcode pass reports itself.** The cache producer — the only
+  background job that holds an encoder for hours — now appears in the
+  activity header and on the Activity page while it runs: which title, why
+  it was chosen, how far through the pass it is, with an admin Stop that
+  finishes the current title cleanly. Previously the only way to learn what
+  was pinning the GPU was `ps` on the box.
+- **Frame-level playback diagnostics.** The stats overlay now watches every
+  presented frame and counts five distinct faults — backwards steps, held
+  frames, late frames (a compositor hold), single dropped frames, and skips
+  — with the spacing between them, what the player was doing within 150 ms
+  of each one, the decode cost at the fault against the session's own
+  typical, and the realized playback rate versus what was requested. The
+  panel also names the transport outright and discloses when a browser
+  gives the detector no frame callbacks at all.
+- **Decode-margin rescue.** An Auto session on a copy path that measures
+  itself out of decode slack — median decode at 80% of the frame budget or
+  worse, with visible hitches, over at least 20 s — switches itself to a
+  transcode at position and remembers the verdict per codec and resolution,
+  so the next Auto play routes straight there and the Reason row says why.
+  An explicit Quality → Original always overrides, and a clean explicit
+  Original session clears the memory again.
+- **Per-mount storage probe.** The server measures what each library mount
+  can actually deliver — throughput, cold seek, a sustained trace replayed
+  against a simulated client buffer — and reports it in the System page and
+  the perf report, so "is the disk fast enough for this file" is a number
+  rather than a guess.
+
+### Fixed
+
+- **One frame died at every segment boundary of a 4K HEVC remux.** The
+  investigation is written up in `docs/STUTTER-4K.md`; the shipped fixes,
+  in order: the copied stream no longer carries in-band parameter sets that
+  its `hvc1` tag promises are absent (a spec violation handed to the
+  decoder once per segment); a Dolby Vision source sheds its enhancement
+  layer, RPUs, **and the container's DV Profile 7 declaration** — the
+  declaration alone made Safari on Apple silicon refuse hardware decode of
+  a stream it decodes natively (needs ffmpeg ≥ 7.1 server-side; older
+  builds strip the data but keep the box); and the copy path no longer
+  advertises `#EXT-X-INDEPENDENT-SEGMENTS`, a claim that is false for
+  open-GOP sources and an invitation to discard one leading picture per
+  segment.
+- **The buffer asked Chrome for five times more memory than it grants.**
+  Copied 4K streams targeted 60 s of forward buffer — ~775 MB of a 69 Mb/s
+  film against a ~150 MB browser quota — so playback spent its life
+  appending, being refused, and evicting near the playhead. Buffer targets
+  for copied streams now derive from a byte budget; transcodes keep the old
+  targets, which were always within it.
+- **The server couldn't say which commit it was running.** `docker compose
+  up -d --build` never passed the build stamp through, and the UI hid the
+  resulting "unknown" as noise, so the System page read a bare version
+  through weeks of deploys. Compose now forwards `PLURX_BUILD_REF`, an
+  unstamped build says so on the page, and the deploy playbook stamps it
+  automatically.
+- Mistyping the password when creating an account no longer locks the new
+  user out immediately: account creation and password reset ask for the
+  password twice and require a match.
+- Library pagination gained first/last buttons; the Libraries page warns
+  when no metadata keys are configured and offers the artwork refresh
+  directly; the stats overlay and storage block are legible again; home
+  rails scroll with arrows and a hover scrollbar, like the rest of the
+  noirr apps.
+
 ### Added
 
 - **Home video & photos.** A fourth library kind, `home`, turns a folder tree of
@@ -375,5 +452,6 @@ a hundred commits of history.
   binary is stamped with the git commit it was built from, and `/api/v1/server`
   reports both. See [docs/RELEASING.md](docs/RELEASING.md).
 
-[Unreleased]: https://github.com/pjunod/plurx/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/pjunod/plurx/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/pjunod/plurx/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/pjunod/plurx/releases/tag/v0.1.0
