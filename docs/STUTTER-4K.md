@@ -494,6 +494,19 @@ spec tag was not a thing to keep shipping. The rescue verdict also now
 counts `drop` events — a session that only drops frames previously could
 never earn the rescue, which was exactly the session that needed it.
 
+**Safari, after the withdrawal (same night):** still dropping at segment
+cadence — 41 drops in ~86 s, every ~1.8 s, held down to 2 — so AVFoundation
+never needed the tag's permission: it treats every fMP4 segment start as a
+random-access point by design, and the leading picture dies with or without
+the invitation. Two other things that session settled: the realized-rate
+line stayed silent while the fps counter read 31.3 on a 23.976 film, which
+disproves live-edge chasing and convicts the counter (`totalVideoFrames`
+counts Safari's decode-ahead; the panel now derives "rendered" from
+presented frames instead), and native transports now mark playlist-boundary
+crossings themselves — cumulative `EXTINF` against `mediaTime` — so
+Safari's next screenshot carries the same boundary attribution hls.js
+sessions get.
+
 **Discriminators, all one click on the existing build:**
 
 - **Quality → "Original · one stream"**: same bitstream, no MSE, no

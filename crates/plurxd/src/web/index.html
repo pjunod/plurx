@@ -2359,6 +2359,8 @@ function attachHls(video, playlistUrl, startAt){
   } else {
     // Native HLS: the session id in the URL is the credential, so the
     // Apple TV can fetch segments itself when AirPlaying.
+    PLAYER.segSrc=tok(playlistUrl); PLAYER.segTimes=null; PLAYER._segIdx=null;
+    refreshSegTimes();
     video.src=tok(playlistUrl);
     if(startAt>0){
       const go=()=>{ video.removeEventListener("loadedmetadata",go); try{video.currentTime=startAt}catch(e){} };
@@ -2645,7 +2647,7 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
   video.addEventListener("loadedmetadata", probeDecode, {once:true});
   armHitchDetector(video);
   clearInterval(PLAYER.timer);
-  PLAYER.timer=setInterval(()=>{ reportProgress(fileId); reportHitches(); maybeDecodeRescue(); }, 5000);
+  PLAYER.timer=setInterval(()=>{ reportProgress(fileId); reportHitches(); maybeDecodeRescue(); refreshSegTimes(); }, 5000);
   video.onended=()=>{ handleEnded(fileId).catch(()=>{}); };
   pbTick(); pbSyncPlayIcon();   // seed the transport (total time, play icon) at once
   playerActivity();
@@ -2805,12 +2807,38 @@ function markEvent(kind){
   const p=PLAYER; if(!p) return;
   (p.marks||(p.marks={}))[kind]=performance.now();
 }
+// Segment boundaries from the playlist itself, for transports that have no
+// hls.js to announce them. Safari's native HLS session showed 41 drops at
+// segment cadence with NO attribution line — blame() had nothing to match
+// against, because FRAG_CHANGED is an hls.js event. The playlist knows where
+// every boundary is, and cumulative EXTINF is the same timeline the
+// element's mediaTime runs on (both start at the session's own zero).
+function parseSegTimes(text){
+  const out=[]; let t=0;
+  for(const line of String(text).split("\n")){
+    const m=/^#EXTINF:([\d.]+)/.exec(line.trim());
+    if(m){ t+=parseFloat(m[1]); out.push(+t.toFixed(3)); }
+  }
+  return out;
+}
+async function refreshSegTimes(){
+  const p=PLAYER;
+  if(!p || !p.segSrc || p.hls) return;
+  const now=performance.now();
+  if(p._segFetch && now-p._segFetch<9000) return;   // the playlist grows ~every 4s at 2x
+  p._segFetch=now;
+  try{
+    const r=await fetch(p.segSrc,{cache:"no-store"}); if(!r.ok) return;
+    const times=parseSegTimes(await r.text());
+    if(PLAYER===p && times.length>((p.segTimes&&p.segTimes.length)||0)) p.segTimes=times;
+  }catch(e){}
+}
 function armHitchDetector(v){
   if(!v.requestVideoFrameCallback) return;
   const p=PLAYER; if(!p) return;
   p.hitches={back:0, held:0, late:0, gap:0, drop:0, slow:0, worst:0, last:null, at:[], fps:null,
              n:0, near:{}, flushEdge:null, skewMax:0, skewAt:null, decodeMs:null, frames:0,
-             rate:null};
+             rate:null, renderedFps:null};
   // When the detector armed, so "zero faults" can be told apart from "zero
   // callbacks". Safari has shipped rVFC for years and still declines to fire
   // it on some pipelines — a session that stutters visibly while this
@@ -2841,11 +2869,16 @@ function armHitchDetector(v){
   // callback timestamps averages out; cleared on pause/seek because a ring
   // spanning a seek measures the seek.
   const rateWin=[];
-  const noteRate=(now, mediaTime, h)=>{
-    rateWin.push({w:now, m:mediaTime});
+  const noteRate=(now, mediaTime, pf, h)=>{
+    rateWin.push({w:now, m:mediaTime, p:pf});
     while(rateWin.length>240) rateWin.shift();
     const a=rateWin[0], b=rateWin[rateWin.length-1];
-    if(b.w-a.w>4000) h.rate=+(((b.m-a.m)*1000)/(b.w-a.w)).toFixed(3);
+    if(b.w-a.w>4000){
+      h.rate=+(((b.m-a.m)*1000)/(b.w-a.w)).toFixed(3);
+      // Frames that actually reached the screen, per second — the honest
+      // "rendered" figure. Same window as the rate so they agree about time.
+      h.renderedFps=+(((b.p-a.p)*1000)/(b.w-a.w)).toFixed(1);
+    }
   };
   const step=(now, meta)=>{
     // Bail the moment this playback is replaced, or the callback outlives its
@@ -2853,7 +2886,26 @@ function armHitchDetector(v){
     if(PLAYER!==p) return;
     p.hitches.frames++;
     if(v.paused || v.seeking) rateWin.length=0;
-    else noteRate(now, meta.mediaTime, p.hitches);
+    else noteRate(now, meta.mediaTime, meta.presentedFrames||0, p.hitches);
+    // Native-transport boundary marks: crossing a playlist boundary is this
+    // path's FRAG_CHANGED. Checked before the fault branch so a fault AT the
+    // boundary sees the mark in the same callback. A jump re-derives the
+    // index instead of marking every boundary the seek flew over.
+    const st=p.segTimes;
+    if(st && st.length && !v.seeking){
+      if(p._segIdx==null || p._segIdx>st.length
+         || (p._segIdx>0 && meta.mediaTime<st[p._segIdx-1]-2)
+         || (p._segIdx<st.length && meta.mediaTime>st[p._segIdx]+4)){
+        const i=st.findIndex(t=>t>meta.mediaTime);
+        p._segIdx=(i<0)?st.length:i;
+      }
+      if(p._segIdx<st.length && meta.mediaTime>=st[p._segIdx]){
+        // Stamped with the callback's own timestamp, not performance.now():
+        // they are the same clock in a browser, and blame() compares against
+        // callback time — one clock for both sides, no skew to argue about.
+        (p.marks||(p.marks={})).frag=now; p._segIdx++;
+      }
+    }
     if(prev!=null && !v.paused && !v.seeking){
       const h=p.hitches;
       const dt=meta.mediaTime-prev.mediaTime;
@@ -4057,6 +4109,13 @@ function updateStats(){
       fps=PLAYER._fpsVal;
     }
   }catch(e){}
+  // Prefer PRESENTED frames when the detector is seeing them.
+  // totalVideoFrames counts decoded frames, and Safari decodes ahead in
+  // bursts — its panel read "31.3 fps rendered" on a 23.976 film that was
+  // measurably playing at 1.000x. The per-presented-frame callback counts
+  // what actually reached the screen, which is the only meaning "rendered"
+  // should have.
+  if(PLAYER.hitches&&PLAYER.hitches.renderedFps!=null) fps=PLAYER.hitches.renderedFps;
   let buf='—';
   try{ if(v.buffered&&v.buffered.length){ buf=Math.max(0,v.buffered.end(v.buffered.length-1)-v.currentTime).toFixed(1)+' s'; } }catch(e){}
   // The contiguous runway from the playhead, as a number — the Server section
