@@ -2,9 +2,12 @@
 
 **Status:** measured fact: the client pipeline holds zero decode slack on
 this stream (§5.3) — first misread as decoder capacity, corrected the same
-night by the client itself (an M3 Max); top surviving cause is
-VideoToolbox refusing the stream's Dolby Vision Profile 7 container
-signaling, fix shipped (dovi_rpu strip, §5.3); the decode-margin rescue
+night by the client itself (an M3 Max); the DV P7 signaling fix
+(§5.3) is CONFIRMED — VideoToolbox flipped software → hardware the moment
+the false declaration disappeared; the residual is one dropped frame per
+segment boundary, characterized and top-suspected as the open-GOP
+leading-picture discard (§5.3bis, independence claim withdrawn); the
+decode-margin rescue
 ([PLAYBACK.md](PLAYBACK.md#the-decode-margin-rescue--routing-around-a-pipeline-with-no-slack))
 stands as the measured mitigation
 · **Symptom:** one held video frame per segment boundary on a 4K HEVC remux
@@ -455,6 +458,57 @@ component is eating the reserve, and it never overrides an explicit
 Original. If the dvcC fix restores VideoToolbox’s hardware path, the slack
 reappears, the rescue stops firing, and the remembered limit clears itself
 on the next explicit-Original session.
+
+### 5.3bis One dropped frame per boundary — the leading-picture discard
+
+The `drop` counter's first real session (Chrome, forced Original, 45 s
+watched) characterized the residual exactly:
+
+- **22 drops**, and `droppedVideoFrames` reads 22 — the same events,
+  counted by two unrelated instruments.
+- Spacing **every ~1.8 s**; **15/23 events within 150 ms of a segment
+  boundary** against an ~8% coincidence baseline.
+- The dropped frame decodes in **5 ms**; typical decode is now 91 ms
+  (the pipeline holds ~2 frames since the dvcC fix — which is why `held`
+  and `late` fell to ~zero). Nothing is slow. A frame is being
+  *discarded*, not delayed.
+
+One thing in this stream is discarded deliberately, once per boundary: the
+**open-GOP leading picture**. Every segment opens with a CRA keyframe
+followed by a RASL frame that presents *before* it. In continuous decode
+RASL frames are legal and needed; at a random-access point the HEVC spec
+says to drop them. Blu-ray-typical structure carries one leading picture
+per CRA — one GOP per segment — one dropped frame per boundary. The
+count, the cadence and the attribution all fit, and so does the fault
+surviving every bitstream strip: it is the GOP *structure*, which a copy
+cannot change.
+
+What shipped now: the copy path no longer advertises
+`#EXT-X-INDEPENDENT-SEGMENTS`. That tag claims every segment is
+independently decodable — true for the transcode path (closed GOP, forced
+IDR), **false** for an open-GOP copy, and an explicit invitation for a
+player to treat each segment start as random access and discard the
+leading pictures. This was flagged days ago as "proved, not fixed"; it is
+now fixed. Whether any given player honours the tag, a false claim in a
+spec tag was not a thing to keep shipping. The rescue verdict also now
+counts `drop` events — a session that only drops frames previously could
+never earn the rescue, which was exactly the session that needed it.
+
+**Discriminators, all one click on the existing build:**
+
+- **Quality → "Original · one stream"**: same bitstream, no MSE, no
+  per-fragment appends (the progressive fMP4's moof boundaries are
+  invisible to a demuxer reading a continuous stream). Drops vanish →
+  the discard is triggered by segmented/MSE delivery, and the fix space
+  is fragment structure or the hls.js transmux route. Drops persist →
+  the decoder discards RASL at every CRA regardless of transport, and no
+  copy-path change can fix it: mitigation is the measured rescue, or a
+  GOP-aware segmenter that cuts only at closed points.
+- **A 4K HDR10 (non-DV) remux on Auto**: whether every open-GOP HEVC copy
+  does this, or the DV lineage still matters post-strip.
+- **Safari, same build**: whether removing the false independence claim
+  changes native HLS behaviour, and what the realized-rate line says
+  about live-edge chasing on the EVENT playlist.
 
 ### 5.4 Segment length, as mitigation rather than cause
 

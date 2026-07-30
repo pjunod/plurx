@@ -716,6 +716,19 @@ pub fn hls_copy_args(
 
     // fMP4 HLS. Segments split at existing keyframes (copy can't force them), so
     // a normally-GOP'd source segments cleanly; the init segment is `init.mp4`.
+    //
+    // NO `independent_segments` here, and the omission is the point. That tag
+    // declares every segment independently decodable, which is TRUE for the
+    // transcode path (closed GOP, forced IDR) and FALSE for a copy of an
+    // open-GOP source: each segment opens with a CRA whose RASL leading
+    // picture needs the previous segment's frames. A player that believes the
+    // tag may treat every segment start as a random-access point, and the
+    // HEVC spec's instruction at random access is to DISCARD the leading
+    // pictures — one dropped frame per segment boundary, which is exactly
+    // the measured residual stutter (22 drops in 45s, 15/23 within 150ms of
+    // a boundary, docs/STUTTER-4K.md §5.5). The claim was a lie on this path;
+    // whether any given player acts on it, a lie in a spec tag is not a
+    // thing to keep shipping.
     args.extend(
         [
             "-f",
@@ -725,7 +738,7 @@ pub fn hls_copy_args(
             "-hls_playlist_type",
             "event",
             "-hls_flags",
-            "independent_segments+temp_file",
+            "temp_file",
             "-hls_segment_type",
             "fmp4",
             "-hls_fmp4_init_filename",
@@ -984,6 +997,11 @@ mod tests {
         assert!(joined.contains("-c:a aac")); // audio transcoded when asked
         assert!(joined.contains("-hls_segment_type fmp4")); // not mpegts
         assert!(joined.contains("-hls_fmp4_init_filename init.mp4"));
+        // An open-GOP copy cannot promise independently decodable segments,
+        // and a player that believes the promise discards one leading picture
+        // per boundary. The transcode path (closed GOP) keeps the tag.
+        assert!(!joined.contains("independent_segments"));
+        assert!(joined.contains("-hls_flags temp_file"));
         assert!(joined.contains("/tmp/sess/seg%05d.m4s"));
         assert!(joined.contains("/tmp/sess/index.m3u8"));
         // No re-encode: none of the transcode machinery leaks in.

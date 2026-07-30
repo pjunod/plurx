@@ -3025,7 +3025,7 @@ const MARGIN_CLEAR_SECS=60;
 function decodeMarginVerdict(h, playedSecs){
   if(!h || !h.fps || h.decodeMs==null) return null;
   if(!(playedSecs>=MARGIN_MIN_SECS)) return null;
-  const events=(h.back|0)+(h.held|0)+(h.late|0)+(h.gap|0);
+  const events=(h.back|0)+(h.held|0)+(h.late|0)+(h.drop|0)+(h.gap|0);
   if(events<MARGIN_MIN_EVENTS) return null;
   const budgetMs=1000/h.fps;
   if(h.decodeMs < budgetMs*MARGIN_BAD) return null;
