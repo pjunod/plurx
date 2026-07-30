@@ -2600,13 +2600,19 @@ impl TranscodeManager {
                         tracing::info!(session = %sid, "{}", copyseg::summary(&counts));
                     }
                     copyseg::Outcome::Unsupported(reason) => {
+                        // A session that has already been failed or stopped is
+                        // one nobody is watching; respawning into it would put
+                        // an ffmpeg behind a session id the manager has let go.
+                        if session.failed.load(Relaxed) {
+                            return;
+                        }
                         tracing::warn!(
                             session = %sid,
                             "copy segmenter cannot read this stream ({reason}); \
                              falling back to ffmpeg's HLS muxer for this session"
                         );
                         session.kill_child().await;
-                        copyseg::clear(&dir).await;
+                        clear_session_dir(&dir).await;
                         let args = transcode::hls_copy_args(
                             &file,
                             start_seconds,

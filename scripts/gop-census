@@ -400,21 +400,26 @@ def run_census(ffmpeg, ffprobe, path, seconds, start):
 
 
 def simulate(fragments, timescale, floor_s, ceiling_bytes, max_s):
-    """Replay the shipped cut policy over the census, returning (clean, ceiling)."""
+    """Replay the shipped cut policy (CutPolicy::cut_before) — (clean, ceiling).
+
+    The floor gates the ceilings, and that is not a detail: 48 MB arrives in
+    5.6s at 69 Mb/s, so a ceiling allowed to fire on its own would cut below
+    the six-second floor and produce MORE boundaries than ffmpeg's own muxer
+    on exactly the files this exists for. Keep this in step with
+    crates/plurx-core/src/fmp4.rs — a census that models a different policy
+    than the server runs is worse than no census.
+    """
     floor = floor_s * timescale
     max_ticks = max_s * timescale
     clean = ceiling = 0
     ticks = nbytes = 0
     for cls, size, dur in fragments:
-        if nbytes:
-            is_clean = cls in ("idr", "cra")
+        if nbytes and ticks >= floor:
             cut = None
-            if ticks >= floor and is_clean:
+            if cls in ("idr", "cra"):
                 cut = "clean"
-            elif nbytes >= ceiling_bytes:
-                cut = "clean" if is_clean else "ceiling"
-            elif ticks >= max_ticks:
-                cut = "clean" if is_clean else "ceiling"
+            elif nbytes >= ceiling_bytes or ticks >= max_ticks:
+                cut = "ceiling"
             if cut:
                 clean += cut == "clean"
                 ceiling += cut == "ceiling"

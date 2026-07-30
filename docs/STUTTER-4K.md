@@ -593,15 +593,35 @@ segment boundary **only in front of a clean one**:
  anything unparseable                         DIRTY, and counted
 ```
 
-The cut rule, in full: past the `COPY_SEGMENT_SECONDS` floor **and** the next
-fragment is clean → cut. Otherwise keep accumulating, up to
-`COPY_SEGMENT_MAX_BYTES` (48 MB, half the byte-budgeted forward buffer so MSE
-still holds two segments) or `COPY_SEGMENT_MAX_SECS` (15 s, so
-`EXT-X-TARGETDURATION` can be declared up front and never has to decrease).
-Reaching either ceiling with no clean point in sight takes the cut anyway —
-**a ceiling cut**, which still costs the leading picture and is counted as
-such in the session's closing log line and in
-[`scripts/perf-report`](../scripts/perf-report).
+The cut rule, in full:
+
+```
+ under COPY_SEGMENT_SECONDS (6 s)? ─── yes ──▶ keep accumulating, always
+        │ no
+ next fragment CLEAN? ──────────────── yes ──▶ cut (clean)
+        │ no
+ past COPY_SEGMENT_MAX_BYTES (48 MB)
+   or COPY_SEGMENT_MAX_SECS (15 s)? ── yes ──▶ cut anyway (CEILING CUT)
+        │ no
+        ▼
+   keep accumulating
+```
+
+**The floor gates the ceilings, and that ordering is load-bearing.** 48 MB
+arrives in 5.6 seconds at the reference file's 69 Mb/s, so a byte ceiling
+allowed to fire on its own would cut *below* the six-second floor and hand a
+viewer MORE boundaries than the muxer it replaces — on precisely the file this
+whole investigation is about. Every boundary costs a frame; a segmenter that
+adds boundaries to a source with no clean point would be worse than doing
+nothing, and that is the one thing it is not allowed to be. The floor is the
+measured decision from `e212c55`, which weighed 6 s ≈ 52 MB at 69 Mb/s and
+took it. The ceilings bound how long the segmenter is willing to wait *past*
+the floor for a clean point, and nothing else. (Asserted:
+`no_ceiling_may_cut_below_the_floor`.)
+
+A cut taken at a ceiling with no clean point in reach is **a ceiling cut**: it
+still costs the leading picture, and it is counted as such in the session's
+closing log line and in [`scripts/perf-report`](../scripts/perf-report).
 
 **What it does not change.** Same `init.mp4` (the pipe's `ftyp`+`moov`,
 verbatim), same `segNNNNN.m4s` from zero, same EVENT playlist, same

@@ -20,7 +20,7 @@
 //! reader cannot follow, the session kills the pipe and respawns on ffmpeg's
 //! own muxer, so the worst case of any surprise is exactly today's behaviour.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use plurx_core::fmp4::{self, FragmentReader, Init, Published, SegmentCounts, Segmenter, Unit};
 use plurx_core::transcode::{COPY_SEGMENT_MAX_BYTES, COPY_SEGMENT_MAX_SECS, COPY_SEGMENT_SECONDS};
@@ -304,17 +304,6 @@ pub fn summary(counts: &SegmentCounts) -> String {
     )
 }
 
-/// Remove whatever a failed segmenter attempt left behind, so the legacy
-/// respawn starts on an empty directory. Deliberately not `clear_session_dir`:
-/// this runs before anything was published, and it names what it removes.
-pub async fn clear(dir: &Path) {
-    if let Ok(mut rd) = tokio::fs::read_dir(dir).await {
-        while let Ok(Some(entry)) = rd.next_entry().await {
-            let _ = tokio::fs::remove_file(entry.path()).await;
-        }
-    }
-}
-
 /// Whether the segmenter can be attempted for a source at all.
 ///
 /// The classifier reads HEVC and H.264 keyframes; anything else would be
@@ -330,6 +319,7 @@ mod tests {
     use super::*;
     use plurx_core::fmp4::CutReason;
     use plurx_core::testfixtures::pipe;
+    use std::path::Path;
 
     /// Long enough to reach a ceiling from a 12 s fixture. The floor is 3 s
     /// rather than the shipped 6 s for the same reason: the property under

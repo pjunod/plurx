@@ -1,11 +1,113 @@
 # GOP-aware segmenter — zero boundary drops on the copy path
 
-**Status:** ready to build · **Executes:** the residual in
+**Status:** BUILT 2026-07-30, M0–M6 · CI gate green (`make check`: fmt +
+clippy + 247 core / 188 daemon tests) · **awaiting morning validation on
+real hardware by Paul** · **Executes:** the residual in
 [STUTTER-4K.md](STUTTER-4K.md) §5.3ter — one discarded leading picture per
 segment start · **Written:** 2026-07-30, against `e212c55` (v0.2.0-2) —
 **re-verify every cited line at build time; the file is the truth, this doc
-is the map** · **Owner of record:** overnight build, morning validation on
-real hardware by Paul
+is the map**
+
+## 0. What shipped, and what was flagged
+
+Four commits on top of `b3bc94f`:
+
+| Commit | Milestone | What |
+|---|---|---|
+| `3fde76d` | M0 + M1 | `plurx_core::fmp4` reader + classifier + `CutPolicy`; `scripts/gop-census`; the two new constants |
+| `53d8813` | M2 | `fmp4::merge` and `fmp4::Segmenter`, with the framemd5 proof |
+| `6913c20` | M3 | `plurxd::copyseg`, `copy_pipe_args`, manager integration + fallback ladder |
+| `323569b` | M5 | perf-report, STUTTER-4K §5.6, PLAYBACK, FEATURES, CHANGELOG |
+
+**First thing to run in the morning**, because it is the number this whole
+design's value depends on and no fixture in this container can stand in for
+it:
+
+```bash
+scripts/gop-census "/path/to/Wicked (2024) Remux-2160p.mkv"     # and a few others
+```
+
+It prints what percentage of cuts the shipped floor and ceiling would take
+cleanly on that source. High → the boundary drop is gone on that title. Low →
+the segmenter costs nothing and gains nothing there, and `docs/STUTTER-4K.md`
+§5.6 says so rather than claiming otherwise. Then play the reference file in
+Chrome and in Safari, forced Original, and read the Hitches row: `drop` should
+fall by roughly the clean-cut percentage.
+
+### 0.1 Deviations from this plan, each with its reason
+
+1. **The floor now gates the ceilings — the one substantive change to §3's
+   rule, and it is a correctness fix, not a preference.** As written, "cut
+   when `bytes ≥ BYTE_CEILING` at any keyframe fragment" fires independently
+   of the floor. `COPY_SEGMENT_MAX_BYTES` is 48 MB and the reference file
+   runs at 69 Mb/s, which reaches 48 MB in **5.6 seconds** — so on precisely
+   the file this plan exists for, the segmenter would have cut *below* the
+   six-second floor and produced ~8% MORE boundaries than the muxer it
+   replaces. Every boundary costs a frame, so that is strictly worse than
+   doing nothing, and §3's own promise ("misclassification degrades to today's
+   behavior, never worse") forbids it. The rule is now: nothing cuts below the
+   floor, ever; past the floor a clean fragment wins; past the floor with no
+   clean fragment, either ceiling cuts. §7.3 puts the floor and ceiling
+   constants in code rather than in settings, so this is a code decision, but
+   it is flagged here because it changes a rule §3 states explicitly.
+   Asserted by `no_ceiling_may_cut_below_the_floor`, mirrored in
+   `scripts/gop-census`'s simulator, and drawn in STUTTER-4K §5.6.
+2. **M0 and M1 landed in one commit.** They are one file and one deliverable —
+   the classifier is unusable without the reader, and `gop-census` is the
+   classifier's field instrument. Every other milestone is its own commit.
+3. **The merger keeps one `trun` per source run, not one merged `trun`
+   (§3).** The plan offered both and said to pick whichever survives M2's
+   tests; this is the one that does. ffmpeg writes each track's samples
+   contiguously *within* a fragment but interleaves the tracks *between*
+   fragments, so a single `trun` — which carries one data offset — would force
+   the sample data to be de-interleaved and rewritten sample by sample. Per
+   source run, each `mdat` payload is memcpy'd whole and every offset is
+   arithmetic. The sample values are still fully materialized, so §3's other
+   reason for the single trun (erasing the default/first-sample-flag edge
+   cases) is delivered anyway.
+4. **§8.6's bundle command names `v0.2.0`, which does not exist as a tag in
+   the working repo** (`git tag -l` is empty there — the tag lives on the
+   remote). The bundle was built as `946486b..main HEAD`, which is what makes
+   a bare `git pull <bundle>` work.
+5. **M4 drives `fmp4::Segmenter` directly rather than `copyseg::run`.** The
+   only codecs headless Chromium decodes are VP9 and Opus, and `copyseg::run`
+   correctly refuses a video track whose keyframes it cannot read — that
+   refusal *is* the capability check the fallback ladder depends on, so
+   loosening it to make the test easier would have deleted the thing under
+   test. The harness reproduces copyseg's writing loop over the same shipped
+   playlist helpers; copyseg's own file semantics (tmp+rename, no ENDLIST on
+   a killed session) are covered by unit tests that drive the real `run()`
+   from a byte slice. The M2 equality checks were re-run against that
+   session's actual published output, as §5 M4 asks.
+6. **The M4 harness lives in `/tmp/segtest-e2e/` and is not committed**, per
+   §5 M4's instruction to write it fresh. Its result is recorded in
+   STUTTER-4K §5.6.
+7. **The M0 timing test compares pts, dts and size against ffprobe, not
+   `packet=duration`.** ffprobe derives that field from the stream's frame
+   rate, not from the sample table: on 24 fps at timescale 16000 it reads a
+   flat 666 against real durations that cycle 672/672/656 to sum exactly.
+   Per-packet dts *is* read from the container and every dts here is generated
+   by summing our resolved durations, so dts agreement is the duration check
+   from the other end; the stream's `duration_ts` closes the last sample.
+8. **`-progress` moved to `pipe:2` for the pipe path**, since stdout now
+   carries media. The stderr drain sorts progress blocks from log lines by
+   key, so `speed`, `out_time` and the stall watchdog keep working — §4.4 said
+   to keep the stderr wiring, and this is what keeping it costs.
+9. **Fixtures are 12 s of 640x360, not §8.1's 30 s of 1280x720**, and live in
+   `target/fixtures/` shared by both crates (`plurx_core::testfixtures`,
+   behind a dev-only feature). CI pays for every x265 encode on every run, and
+   no property under test cares how big the picture is. The four GOP shapes
+   §8.1 asks for are all there, plus VP9+Opus for M4.
+
+Nothing in §7 was violated: `SEGMENT_SECONDS` is untouched, hlsenc is still
+the transcode muxer, there is no settings knob, no hls.js or web-app change,
+no change to rescue thresholds or `prefer_segmented`,
+`#EXT-X-INDEPENDENT-SEGMENTS` stays withdrawn, and `Cargo.lock` did not
+change. `SEGMENT_SECONDS`, `Recipe` and `cachekeep` appear nowhere in the
+diff, and the only `produce::` reference is the test that feeds our playlist
+to `produce::Part::from_playlist` — which §4.3 explicitly allows, and which is
+the cheapest possible proof that the playlist this writes is one the rest of
+the daemon already reads.
 
 This is a handoff plan for an implementing agent. Read
 [STUTTER-4K.md](STUTTER-4K.md) first — §5.0–§5.3ter is the evidence chain

@@ -1061,38 +1061,42 @@ impl CutPolicy {
     }
 
     /// Should the fragments accumulated so far be published *before* the
-    /// fragment that just arrived?
+    /// fragment that just arrived? `None` means keep accumulating.
     ///
-    /// `None` means keep accumulating. Note the order: a clean cut past the
-    /// floor wins, so a boundary that could be clean is never spent as a
-    /// ceiling cut. And a ceiling that happens to land in front of a clean
-    /// fragment is reported as clean, because the ceiling decided only *when*,
-    /// not *where*.
+    /// **The floor gates everything, including the ceilings**, and that order
+    /// is load-bearing rather than tidy. `COPY_SEGMENT_MAX_BYTES` is 48 MB and
+    /// the reference 4K remux runs at 69 Mb/s, which reaches 48 MB in 5.6
+    /// seconds — so a ceiling allowed to fire on its own would cut *below* the
+    /// six-second floor and produce MORE boundaries than the muxer this
+    /// replaces, on exactly the file the whole investigation is about. Every
+    /// boundary costs a frame; a segmenter that adds boundaries to a source
+    /// with no clean point would be worse than doing nothing, which is the one
+    /// thing this is not allowed to be. The floor is the measured decision
+    /// (`e212c55`, which weighed 6 s ≈ 52 MB at 69 Mb/s and took it); the
+    /// ceilings bound how long we are willing to wait *past* it for a clean
+    /// point, and nothing else.
+    ///
+    /// After the floor, a clean cut wins over both ceilings — so a boundary
+    /// that could be clean is never spent as a ceiling cut, and a ceiling that
+    /// happens to land in front of a clean fragment is counted clean, because
+    /// the ceiling decided only *when*, not *where*.
     pub fn cut_before(
         &self,
         pending_ticks: u64,
         pending_bytes: usize,
         next: CutClass,
     ) -> Option<CutReason> {
-        if pending_bytes == 0 {
+        if pending_bytes == 0 || pending_ticks < self.floor_ticks {
             return None;
         }
-        if pending_ticks >= self.floor_ticks && next.is_clean() {
+        if next.is_clean() {
             return Some(CutReason::Clean);
         }
         if pending_bytes >= self.max_bytes {
-            return Some(if next.is_clean() {
-                CutReason::Clean
-            } else {
-                CutReason::ByteCeiling
-            });
+            return Some(CutReason::ByteCeiling);
         }
         if pending_ticks >= self.max_ticks {
-            return Some(if next.is_clean() {
-                CutReason::Clean
-            } else {
-                CutReason::TimeCeiling
-            });
+            return Some(CutReason::TimeCeiling);
         }
         None
     }
@@ -1866,6 +1870,26 @@ mod tests {
         );
         // Nothing pending is not a cut, however clean the next fragment is.
         assert_eq!(p.cut_before(0, 0, CutClass::CleanIdr), None);
+    }
+
+    /// The trap this ordering exists for, in one assertion. 48 MB arrives in
+    /// 5.6 s at the reference file's 69 Mb/s — a ceiling allowed to fire on
+    /// its own would cut below the six-second floor and hand the viewer MORE
+    /// boundaries than ffmpeg's muxer does, on the exact file this was built
+    /// for. Every boundary costs a frame.
+    #[test]
+    fn no_ceiling_may_cut_below_the_floor() {
+        let p = CutPolicy::new(6, 48_000_000, 15, 1_000);
+        assert_eq!(p.cut_before(5_600, 48_000_000, CutClass::Dirty), None);
+        assert_eq!(p.cut_before(5_999, usize::MAX, CutClass::Dirty), None);
+        // Not even for a clean fragment: under the floor there is nothing to
+        // publish yet, and waiting costs nothing but a longer segment.
+        assert_eq!(p.cut_before(5_999, 48_000_000, CutClass::CleanIdr), None);
+        // One tick past it, the ceiling is free to act.
+        assert_eq!(
+            p.cut_before(6_000, 48_000_000, CutClass::Dirty),
+            Some(CutReason::ByteCeiling)
+        );
     }
 
     #[test]
