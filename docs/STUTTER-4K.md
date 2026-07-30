@@ -899,6 +899,67 @@ bought nothing and cost boundaries — each one a dropped frame on an open-GOP
 disc — on every source quiet enough for the duration ceiling to bind. §5.6's
 cut-rule numbers stand as written again.
 
+### 5.8 The stop at 12.5 seconds, and the chase that reported nothing
+
+Same evening, same reference file, gate build running: "still pausing to
+buffer or whatever." The overlay disagreed with the words: buffer 10–15 s
+and full, delivery estimate ~500 Mb/s, 0–1 dropped frames, hardware decode
+confirmed in `chrome://media-internals` (`VideoToolboxVideoDecoder`, decode
+5–8 ms against a 42 ms budget) — and 18.1 fps rendered at a realized rate
+of 75.5–75.8%, flagged as rate-chasing.
+
+**The chase reading was an artifact; the real phenomenon is a point event.**
+Four plays lined up: every one stops for a few seconds at 12.4–12.5 s of
+media — once a frame 3201 ms late whose decode took 5 ms — and an overlay
+read at 0:24, once the detector's ~10 s window had moved past the stop,
+showed 23.9 fps and no chase at all. The 75% readings were the window
+digesting one multi-second stop, not a sustained presentation deficit.
+Reproduced with Chrome fully restarted, a single tab, the machine plugged
+in and forced to high power: not thermal, not tab contention, not battery
+policy, not capacity (healthy either side of the stop), not supply (the
+buffer is full straight through it). A stop at a *fixed position* is a
+mechanism at that position.
+
+**And telemetry missed all of it, twice over.** The hitch beacon triggers
+on `back+held+late+drop+skip ≥ 5`; `slow` does not count, correctly — the
+healthy 24 fps play logged 140 slows — and these sessions had 1–3 countable
+hitches, so not one line reached the log ring; the diagnosis ran on
+screenshots. Worse: hls.js *names* this class of event — `bufferStalledError`,
+`bufferNudgeOnStall`, `bufferSeekOverHole`, the whole gap-controller family
+arrives through the ERROR event as non-fatal — and the player's handler
+dropped every non-fatal on the floor. The stop has been explaining itself
+on every play, into a function that ignored it.
+
+Two instruments close that, both measurement-only:
+
+- **A `rate_chase` beacon**: realized rate under 90% of the asked rate over
+  the detector's window (which clears on pause and seek — and now clears
+  its *measurement* with it, so the beacon can never fire on a stale
+  number), with ≥ 4 s of runway so a supply stall can never wear this
+  label. One WARN per minute while it persists, carrying rate, rendered
+  fps, runway, slow/late counts, and the decode forecast. A window
+  containing a multi-second stop fires it too — which is what makes these
+  sessions visible at all.
+- **`player_event` forwarding**: non-fatal hls.js errors in the
+  stall/nudge/hole family are logged with the media position and runway,
+  first three per kind per session. If the 12.5 s stop is hls.js's gap
+  controller working around a buffered hole, the very first line names it
+  and its position.
+
+What would settle the mechanism, each one play long: whether the stop
+follows the *film* (a session started past 12.5 s never stops; one started
+at 0:11 stops almost immediately — a defect at that position in the stream,
+e.g. a bad join or a source splice at the logo transition) or follows the
+*session* (a session started anywhere stops ~12.5 s after its own start —
+session structure: a join the segmenter makes at the same offset every
+time, and note `repaired joins` in the session's closing summary line);
+whether audio plays through the stop (present-side) or stops with the
+picture (clock/audio side — the media clock follows the audio master, and
+TrueHD → 7.1-channel AAC is the least-tested audio shape in this chain:
+every fixture is stereo); and what the browser console prints at the stop.
+Whether Auto should eventually *rescue* on a sustained chase is a decision
+that waits for this data — the beacons are its evidence.
+
 ---
 
 ## 6. The harnesses

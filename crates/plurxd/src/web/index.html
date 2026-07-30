@@ -1013,6 +1013,9 @@ function reportTtff(){
 // looking at pacing.
 const STALL_MIN_MS=350;      // shorter than this and playback did not visibly pause
 const SUPPLY_RUNWAY_SECS=1.5; // less buffered than this when it began: we ran dry
+const CHASE_RATE_MAX=0.90;   // realized rate under this fraction of the asked rate is a chase
+const CHASE_RUNWAY_SECS=4;   // and only with this much buffered — starved is a stall, not a chase
+const CHASE_REPORT_MS=60000; // one report per minute while it persists
 function beginWait(v){
   const p=PLAYER;
   if(!p||!p.started||v.seeking||v.paused) return;
@@ -1036,6 +1039,30 @@ function endWait(resumed){
   clientLog(Object.assign({level:"warn",event:"stall",detail:kind,ms,
     message:`${kind} stall, ${(ms/1000).toFixed(1)}s, ${runway==null?"?":runway}s buffered`},
     ctx, {runway}));
+}
+// The failure every per-frame counter forgives: hardware decode, a full
+// buffer, and the presentation clock quietly running at three-quarter speed.
+// No frame drops, no stall fires, and `slow` hitches accumulate on healthy
+// sessions too — so the one session that LOOKED like buffering reported
+// nothing. Seen live (Tron, 2026-07-30): 18.2 fps rendered at 75.8% speed,
+// 9 s buffered, VideoToolbox decoding in hardware per chrome://media-internals
+// — and not one line in the log ring. The realized rate over the detector's
+// ~10 s window is the clean signal: the window already clears on pause and
+// seek, and requiring a healthy runway keeps supply stalls out (those belong
+// to endWait, and only those should send anyone looking at pacing).
+function reportRateChase(v){
+  const p=PLAYER; if(!p||!p.hitches) return;
+  const h=p.hitches, want=(v.playbackRate||1);
+  if(h.rate==null || want<=0 || h.rate>=want*CHASE_RATE_MAX) return;
+  const runway=bufferRunway(v);
+  if(runway<CHASE_RUNWAY_SECS) return;       // starved — endWait's case, not this one
+  const now=performance.now();
+  if(p._chaseAt && now-p._chaseAt<CHASE_REPORT_MS) return;
+  p._chaseAt=now;
+  clientLog(Object.assign({level:"warn",event:"rate_chase",
+    detail:`rate=${h.rate.toFixed(3)} of ${want} fps=${h.renderedFps!=null?h.renderedFps.toFixed(1):"?"} runway=${runway}s slow=${h.slow} late=${h.late||0}`,
+    message:`presenting at ${(h.rate*100/want).toFixed(1)}% speed with ${runway}s buffered — decode/present side, not supply`},
+    playbackContext(), {runway}));
 }
 // The buffer stopped growing, and this says why. `quota` is the interesting
 // one: it is the browser refusing more data, which is the actual ceiling on a
@@ -2395,7 +2422,28 @@ function attachHls(video, playlistUrl, startAt){
     hls.on(Hls.Events.ERROR,(_,d)=>{
       if(d.details===Hls.ErrorDetails.BUFFER_FULL_ERROR){ reportBufferLimit("quota", d); return; }
       if(d.details===Hls.ErrorDetails.BUFFER_APPEND_ERROR){ reportBufferLimit("append", d); return; }
-      if(!d.fatal) return;
+      if(!d.fatal){
+        // The stall family names its mechanism — bufferStalledError,
+        // bufferNudgeOnStall, bufferSeekOverHole — and this handler used to
+        // drop every non-fatal on the floor. A deterministic 3-second stop
+        // at 12.5 s emitted its own explanation into this function on every
+        // play, and nothing kept it. First three per kind per session: the
+        // first occurrence is the diagnosis, the count is the pattern, and
+        // the thousandth would bury both.
+        const det=String(d.details||"");
+        if(/stall|nudge|hole|gap/i.test(det)){
+          const p=PLAYER;
+          if(p){
+            p._hlsEvt=p._hlsEvt||{};
+            const n=(p._hlsEvt[det]=(p._hlsEvt[det]||0)+1);
+            if(n<=3) clientLog(Object.assign({level:"warn",event:"player_event",
+              detail:det,
+              message:`hls.js ${det}${d.reason?` — ${d.reason}`:""} at ${(video.currentTime||0).toFixed(1)}s (#${n})`},
+              playbackContext(), {runway:bufferRunway(video)}));
+          }
+        }
+        return;
+      }
       console.warn("[cinemarr] hls.js fatal",d.type,d.details);
       clientLog(Object.assign({level:"error",event:"hls_fatal",detail:d.type,message:d.details}, playbackContext()));
       setLoading(true,"Playback failed to start ("+d.details+").","the server couldn't build this stream — see Settings → Logs");
@@ -2939,8 +2987,16 @@ function armHitchDetector(v){
     // PLAYER and starts recording another stream's frames as this one's.
     if(PLAYER!==p) return;
     p.hitches.frames++;
-    if(v.paused || v.seeking) rateWin.length=0;
-    else noteRate(now, meta.mediaTime, meta.presentedFrames||0, p.hitches);
+    if(v.paused || v.seeking){
+      // Clear the MEASUREMENT with the window: a rate left standing after a
+      // seek is last session's number wearing this one's label, and the
+      // chase beacon below must never fire on it.
+      rateWin.length=0;
+      p.hitches.rate=null; p.hitches.renderedFps=null;
+    } else {
+      noteRate(now, meta.mediaTime, meta.presentedFrames||0, p.hitches);
+      reportRateChase(v);
+    }
     // Native-transport boundary marks: crossing a playlist boundary is this
     // path's FRAG_CHANGED. Checked before the fault branch so a fault AT the
     // boundary sees the mark in the same callback. A jump re-derives the

@@ -173,6 +173,31 @@ bump may break compatibility and a **patch** bump never does.
   session's logged ffmpeg args show the flag present or absent outright.
   plurxd now warns at startup when pacing runs without the burst, because
   the gate turned that quiet degradation into seconds of every open.
+- **A playback that stopped for seconds at the same spot every play
+  reported nothing — twice over.** The same reference file, the same
+  evening: buffer full at 10–15 s, ~500 Mb/s measured to the client, 0–1
+  dropped frames, hardware decode confirmed in `chrome://media-internals`
+  — and a multi-second stop at 12.5 s of media on every single play, which
+  the stats overlay showed only obliquely, as "18 fps rendered · 75%
+  realized speed" while the detector's window still contained the stop.
+  Every per-frame counter forgave it: no drops, no supply stalls, `slow`
+  hitches accumulate on healthy sessions too — so the hitch beacon never
+  fired. And hls.js *names* this class of event (`bufferStalledError`,
+  `bufferNudgeOnStall`, `bufferSeekOverHole` arrive through the ERROR
+  event as non-fatal), but the player's handler dropped every non-fatal on
+  the floor: the stop explained itself on every play into a function that
+  ignored it. Two measurement-only fixes. Non-fatal stall-family events
+  are now forwarded to the server log with the media position and runway,
+  first three per kind per session. And a `rate_chase` beacon fires when
+  the realized playback rate over the hitch detector's ~10-second window
+  falls under 90% of what was asked while at least four seconds sit
+  buffered — once a minute while it persists, carrying the realized rate,
+  rendered fps, runway, and the decoder forecast. Supply stalls can never
+  wear either label (they require a near-empty buffer; these require a
+  healthy one), and the rate measurement now clears on pause and seek so
+  it can never fire on a stale window. What Auto should *do* about a
+  sustained chase, and what the 12.5 s stop actually is, are decisions
+  that now have evidence arriving instead of screenshots.
 - **The server could not say which build it was running — again.** `.git` sits
   outside the Docker build context, so the image can only name its commit if
   the deploy passes `PLURX_BUILD_REF`. That was previously "fixed" by having
