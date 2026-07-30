@@ -383,6 +383,8 @@
      that opened it instead of flying to the far corner of the screen. */
   .pmenu.low{top:auto;bottom:76px}
   .pmenu.on{display:block}
+  /* positionMenu() overrides left/top inline; these stay as the fallback for a
+     menu whose anchor button is hidden. */
   .pmenu button{display:block;width:100%;text-align:left;background:transparent;color:#e8e8ea;border:0;padding:8px 10px;border-radius:7px;font-size:13px;font-weight:400;cursor:pointer}
   .pmenu button:hover{background:rgba(255,255,255,.08)}
   .pmenu button.sel{color:var(--accent);font-weight:600}
@@ -600,7 +602,23 @@
     color:var(--muted);text-transform:none;letter-spacing:0}
   /* Each label+dropdown stays one unit: wrapping a select away from the word
      that names it turns a narrow column into a puzzle. */
-  .schedpair{display:inline-flex;align-items:center;gap:5px;white-space:nowrap}
+  /* A label and the control it names, as ONE flex item. Settings rows wrap, and
+     a bare <span> next to a bare <select> wraps BETWEEN them — leaving the
+     label at the end of one line and its control alone on the next, where the
+     global `width:100%` then stretches it across the card. Pairing them means
+     a row can only break where a break makes sense. */
+  .schedpair{display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
+  /* …and inside a pair, a control is as wide as it needs to be. `width:100%`
+     is for the stacked forms; here it made a checkbox fill the pair and push
+     its own text to the far right. */
+  .schedpair input,.schedpair select{width:auto}
+  .schedpair select{max-width:140px;font-size:12px;padding:3px 6px}
+  .schedpair input[type=checkbox]{margin:0}
+  /* The settings panels' control rows: one type size for every label in them,
+     set here rather than on each span, and a row gap big enough that a wrapped
+     line reads as a new row rather than as a taller one. */
+  .setrow{font-size:12px;color:var(--muted)}
+  .setrow .ghost{color:var(--text)}
   .missbadge{display:inline-block;background:#5a2a2e;color:#f7b6ba;font-size:10px;padding:1px 6px;border-radius:5px;vertical-align:middle;margin-left:6px;text-transform:uppercase;letter-spacing:.05em}
   .art.ph.season{background:linear-gradient(160deg,#2b3350,#141826);flex-direction:column;gap:1px}
   .art.ph.season .snum{font-size:38px;line-height:1}
@@ -3804,7 +3822,60 @@ function toggleMenu(kind,low){
       PLAYER.subs.map(s=>`<button class="${PLAYER.curSub===s.index?'sel':''}" onclick="setSub(${s.index})">${esc(subLabelMenu(s))}</button>`).join("");
   }
   m.classList.add("on");
+  positionMenu(kind,low);
 }
+
+// Which control owns each menu. The menu is one shared element, so the button
+// that opened it is the only thing that says where it belongs.
+const MENU_ANCHORS={audio:["audiobtn","pbaudio"],subs:["subsbtn","pbsubs"],
+                    quality:["qualbtn",null],sync:["syncbtn",null]};
+
+// Put the menu under (or above) the button that opened it.
+//
+// It used to fly to the top-right corner of the player whatever you clicked,
+// because the stylesheet pins one shared element to `right:20px`. With four
+// buttons spread across the bar that means the menu for Audio opens nowhere
+// near Audio, and on a wide screen it is a long way to look.
+//
+// Horizontal: align the menu's left edge with the button's, then clamp so it
+// cannot hang off either side. Vertical: below the button for the top bar,
+// above it for the transport — measured, because the top row wraps to two
+// lines on a narrow window and a fixed offset then lands on top of the row it
+// was supposed to sit under.
+function positionMenu(kind,low){
+  const m=document.getElementById("pmenu"), player=document.getElementById("player");
+  if(!m||!player) return;
+  const anchor=MENU_ANCHORS[kind]&&MENU_ANCHORS[kind][low?1:0];
+  const btn=anchor?document.getElementById(anchor):null;
+  // No anchor (or a hidden one): leave the stylesheet's corner placement,
+  // which is still a sane place for a menu to be.
+  if(!btn||!btn.offsetParent){ m.style.left=m.style.right=m.style.top=m.style.bottom=""; return; }
+  const pr=player.getBoundingClientRect(), br=btn.getBoundingClientRect();
+  const gap=8, edge=12;
+  // Left edges aligned, flipping to right edges only when that would hang off
+  // the player. Consistency is the point: choosing per-button by which half of
+  // the screen it sits in made two ADJACENT buttons open their menus opposite
+  // ways, which looks like a bug even though each one was individually
+  // sensible.
+  let want=br.left-pr.left;
+  if(want+m.offsetWidth > pr.width-edge) want=br.right-pr.left-m.offsetWidth;
+  const left=Math.max(edge, Math.min(want, pr.width-m.offsetWidth-edge));
+  m.style.left=left+"px";
+  m.style.right="auto";
+  if(low){
+    m.style.top="auto";
+    m.style.bottom=Math.max(edge, pr.bottom-br.top+gap)+"px";
+  } else {
+    m.style.bottom="auto";
+    m.style.top=Math.max(edge, br.bottom-pr.top+gap)+"px";
+  }
+}
+// A menu left open across a resize or a fullscreen change is anchored to where
+// its button used to be.
+window.addEventListener("resize",()=>{
+  const m=document.getElementById("pmenu");
+  if(m&&m.classList.contains("on")) positionMenu(m.dataset.kind, m.classList.contains("low"));
+},{passive:true});
 
 // ---- quality override -----------------------------------------------------
 // Auto follows the automatic ladder; Original forces direct/remux (no video
@@ -4597,13 +4668,13 @@ const CLEAN_EVERY=[[0,"Never"],[60,"Hourly"],[360,"6 hours"],[1440,"Daily"]];
 function maintenancePanel(settings){
   if(!ME||!ME.is_admin||!settings) return '';
   return `<h2 class="section">Scheduled maintenance</h2>
-    <div class="row" style="gap:10px;align-items:center;flex-wrap:wrap">
-      <span class="muted" style="font-size:12px">Retry unreadable files</span>
-      ${everySelect("job-probe",RETRY_EVERY,settings.probe_retry_mins,"Re-run ffprobe on files whose media details were never read")}
-      <span class="muted" style="font-size:12px">Retry missing artwork</span>
-      ${everySelect("job-art",ART_EVERY,settings.artwork_retry_mins,"Re-fetch posters for items a provider matched but that never got an image")}
-      <span class="muted" style="font-size:12px">Clean transcode cache</span>
-      ${everySelect("job-clean",CLEAN_EVERY,settings.transcode_cleanup_mins,"Delete leftover transcode working directories no session owns")}
+    <div class="row setrow" style="gap:14px 18px">
+      <span class="schedpair">Retry unreadable files
+        ${everySelect("job-probe",RETRY_EVERY,settings.probe_retry_mins,"Re-run ffprobe on files whose media details were never read")}</span>
+      <span class="schedpair">Retry missing artwork
+        ${everySelect("job-art",ART_EVERY,settings.artwork_retry_mins,"Re-fetch posters for items a provider matched but that never got an image")}</span>
+      <span class="schedpair">Clean transcode cache
+        ${everySelect("job-clean",CLEAN_EVERY,settings.transcode_cleanup_mins,"Delete leftover transcode working directories no session owns")}</span>
       <label class="schedpair" title="Scan every library once, about 30 seconds after the server starts">
         <input type="checkbox" id="job-boot"${settings.scan_on_startup?' checked':''}> Scan at startup</label>
       <button class="ghost sm" onclick="saveMaintenance(this)">Save</button></div>
@@ -4625,17 +4696,17 @@ const CACHE_SIZES=[0,10,25,50,100,250,500,1000];
 function precachePanel(settings){
   const used=settings.cache_used_bytes||0;
   const bar = settings.cache_max_gb
-    ? `<span class="muted" style="font-size:12px">${fmtBytes(used)} of ${settings.cache_max_gb} GB used</span>`
-    : `<span class="muted" style="font-size:12px">off${used?` — ${fmtBytes(used)} still stored, cleared on the next sweep`:""}</span>`;
+    ? `<span class="muted">· ${fmtBytes(used)} of ${settings.cache_max_gb} GB used</span>`
+    : `<span class="muted">· off${used?` — ${fmtBytes(used)} still stored, cleared on the next sweep`:""}</span>`;
   return `<h2 class="section">Pre-transcoding</h2>
-    <div class="row" style="gap:10px;align-items:center;flex-wrap:wrap">
-      <span class="muted" style="font-size:12px">Look for work</span>
-      ${everySelect("cache-produce",PRODUCE_EVERY,settings.cache_produce_mins,"How often to check what's worth encoding ahead of time")}
-      <span class="muted" style="font-size:12px">Disk budget</span>
-      <select id="cache-gb" title="How much disk finished pre-transcodes may occupy before the oldest are evicted">
-        ${CACHE_SIZES.map(n=>`<option value="${n}"${Number(settings.cache_max_gb)===n?' selected':''}>${n?n+" GB":"Off"}</option>`).join("")}
-      </select>
-      ${bar}
+    <div class="row setrow" style="gap:14px 18px">
+      <span class="schedpair">Look for work
+        ${everySelect("cache-produce",PRODUCE_EVERY,settings.cache_produce_mins,"How often to check what's worth encoding ahead of time")}</span>
+      <span class="schedpair">Disk budget
+        <select id="cache-gb" title="How much disk finished pre-transcodes may occupy before the oldest are evicted">
+          ${CACHE_SIZES.map(n=>`<option value="${n}"${Number(settings.cache_max_gb)===n?' selected':''}>${n?n+" GB":"Off"}</option>`).join("")}
+        </select>
+        ${bar}</span>
       <button class="ghost sm" onclick="savePrecache(this)">Save</button></div>
     <div class="hint">Encodes ahead of time what you're most likely to play next — what you're part-way
       through, what's up next in a show, then anything 4K or HDR that arrived recently. When it hits, playback
