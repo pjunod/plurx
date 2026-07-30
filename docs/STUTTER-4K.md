@@ -552,8 +552,8 @@ What a 6 s floor does not do is reach zero. The residual is one discard
 per ~6 s on forced-Original open-GOP playback in browsers; Auto sessions
 rescue past it, TVs and players that direct-play the MKV never segment
 at all, and the only true zero for browsers would be a GOP-aware
-segmenter that cuts exclusively at closed points — future work if one
-drop per six seconds still reads as a stutter on the couch.
+segmenter that cuts exclusively at closed points — designed and scoped as
+a buildable handoff in [SEGMENTER-PLAN.md](SEGMENTER-PLAN.md).
 
 ### 5.4 Segment length, as mitigation rather than cause
 
