@@ -738,6 +738,26 @@ at 96 MB, repeatable across runs. Peak buffered bytes were **identical**
 it is the size of a single append, which no client-side byte budget can be
 traded against. 64 MB is the last rung that measured clean.
 
+> **Correction, 2026-07-30 — the second sentence of that paragraph is wrong,
+> and it is the sentence the ceiling was chosen on.** A single append *is*
+> traded against the client's byte budget, because during an `appendBuffer`
+> the browser holds the resident buffer **and** the segment arriving. The
+> right invariant is `forward + one segment + back <= quota` (PERF-PLAN
+> §4.3quater), and the shipped budget did not have the segment term in it at
+> all: 13 s + 4 s at 61 Mb/s is 128 MB resident, plus a 64 MB segment is
+> ~190 MB against a ~150 MB quota.
+>
+> The experiment above did not catch it because **a headless Chromium in a
+> container is not the client**. Its quota is a function of the device memory
+> class, and it let all four arms park at 155 MB — above what a real desktop
+> Chrome allowed on the same bitrate. Reported from the sofa on *Tron*, Chrome,
+> the same day: 6 quota refusals in two and a half minutes and then a fatal
+> append failure that froze playback. The lesson is the one this document keeps
+> re-learning: a measurement taken on the machine that is not the one
+> complaining answers a different question. The ceiling itself stands — 64 MB
+> is still the right cut size — but the client's budget now reserves room for
+> it instead of assuming appends are free.
+
 **What it is worth on any other title is still a property of that source.**
 Clean-cut density is decided by whoever encoded the disc, and no synthetic
 fixture can answer it — a file full of x265 test patterns has whatever GOP the

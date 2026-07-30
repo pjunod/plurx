@@ -647,6 +647,80 @@ stop fitting and the honest answer is a small buffer that survives rather than
 a comfortable one that gets evicted — a stream that big does not belong on the
 copy path at all, which is a routing question rather than a buffering one.
 
+### 4.3quater The budget was resident-only, and an append is not free (found 2026-07-30)
+
+§4.3ter above is right about the bytes and wrong about *which* bytes. It
+budgets what the browser will be **holding** — forward plus back — and the
+quota is charged on what the browser holds **plus the segment being appended**,
+because during an `appendBuffer` both exist at once.
+
+That was invisible while segments were 2 s. At 61 Mb/s a 2-second segment is
+15 MB, so a 128 MB resident budget peaked at 143 MB and squeaked under a
+~150 MB quota. Then the segmenter (§5.6 of STUTTER-4K) took the cutting away
+from ffmpeg and moved the floor to 6 s to stop losing a frame at every
+boundary. At 61 Mb/s a 6-second segment is **46 MB**, and one that runs to the
+byte ceiling is **64 MB** — so every append began asking for ~190 MB and being
+refused.
+
+What that costs is worse than the churn of §4.3ter, because hls.js escalates:
+`BUFFER_FULL_ERROR` → evict → halve its own target → retry, and after
+`appendErrorMaxRetry` (3) failures on the same segment it fails **fatally**.
+Reported from the sofa on *Tron* in Chrome, 2026-07-30: several rebuffers and
+then a freeze that would not resume without leaving and re-entering the
+stream. Safari never saw any of it — native HLS uses none of these numbers,
+which is why the same file was fine there and is the same asymmetry that made
+§4.3ter hard to see.
+
+The invariant is now stated as the thing the quota actually charges:
+
+```
+forward + one segment + back  <=  MSE_QUOTA_BYTES (144 MB)
+```
+
+and the segment term is **measured, not assumed**: `EXT-X-TARGETDURATION` is
+the longest segment the session has published (copyseg keeps it honest), so
+the client re-derives the targets on the first playlist and again whenever a
+longer segment appears.
+
+| source | segment | forward | back | peak |
+| --- | --- | --- | --- | --- |
+| transcode (any) | — | 60 s | 30 s | ~90 MB |
+| 8 Mb/s copy | 15 s | 60 s | 12 s | 87 MB |
+| 25 Mb/s copy | 15 s | 27 s | 3 s | 141 MB |
+| 61 Mb/s copy | 9 s | 8 s | 1 s | 137 MB |
+| 69 Mb/s copy | 9 s | 6 s | 1 s | 138 MB |
+| 98 Mb/s copy | 7 s | 3 s | 1 s | 135 MB |
+| 200 Mb/s copy | 4 s | 1 s | 1 s | 150 MB — does not fit, and says so |
+
+Three things changed besides the invariant:
+
+- **The forward *seconds* floor is gone.** It existed so a very large file
+  would not buffer almost nothing, and it was the mechanism by which the
+  budget promised bytes the quota would refuse. It is also no longer needed:
+  the segment is the runway. hls.js refills as soon as what is buffered ahead
+  dips under the target, so a 3 s target with 7 s segments oscillates between
+  3 s and 10 s of real runway. Targets round *down* for the same reason — a
+  target rounded up spends bytes nobody allocated.
+- **`maxBufferSize` moves with `maxBufferLength`.** hls.js takes the *larger*
+  of the seconds target and `8*maxBufferSize/bitrate`, so the stock 60 MB is a
+  floor under the seconds rather than a cap on them: it pinned the forward
+  buffer at 8 s of a 61 Mb/s stream regardless of what the seconds said. Same
+  class of mistake as the one this section is about — a limit that reads like
+  a cap and behaves like a floor.
+- **The back buffer is byte-capped at 12 MB** (was 32 MB). On this path a seek
+  starts a fresh session, so the back buffer buys a scrub of a second or two
+  and nothing else; 32 MB of it at 61 Mb/s was a fifth of the whole budget
+  spent on video nobody would watch again.
+
+**And the decode rescue no longer learns from these sessions.** Quota pressure
+produces exactly the signature the rescue looks for — visible hitches on a
+copy session — so on Auto it fired, blamed the decoder, and wrote a per-device
+per-codec limit that steered every future playback of anything that shape.
+That is how Chrome taught itself that an M3 Max cannot play HEVC 2160p. A
+session with any `buffer_limit quota` beacon still falls back (a transcode
+genuinely fixes it, by being smaller) but no longer remembers it as a decode
+limit, because it was never a decode limit.
+
 ### 4.4 2-second segments (halves the start floor, B4)
 
 `SEGMENT_SECONDS: 4 → 2` (`transcode/mod.rs:20`) — the constant already

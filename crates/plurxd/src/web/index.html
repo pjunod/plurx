@@ -2322,17 +2322,20 @@ function attachHls(video, playlistUrl, startAt){
     // no hls.js setting can raise — it arrives as BUFFER_FULL_ERROR and
     // hls.js shrinks its own target in response.
     //
-    // So: tune seconds, leave the byte target at its maintained default, and
-    // let the beacons below tell us what the real ceiling is per client.
-    // These two numbers are provisional until that data exists (PERF-PLAN
-    // §4.3). backBufferLength is bounded (hls.js keeps everything by default)
-    // because the server already prunes played-past segments and a two-hour
-    // 4K session would otherwise grow the tab's memory for the whole film.
-    const tgt=bufferTargets();
+    // So: tune seconds, and move the byte target WITH them rather than leaving
+    // it at the stock 60 MB — hls.js takes the larger of the two, so a stock
+    // byte target is a floor under the seconds, not a cap on them (see
+    // applyBufferTargets). backBufferLength is bounded (hls.js keeps
+    // everything by default) because the server already prunes played-past
+    // segments and a two-hour 4K session would otherwise grow the tab's memory
+    // for the whole film.
+    const tgt=bufferTargets(PLAYER&&PLAYER.bufSegSecs);
+    PLAYER.bufTarget=tgt;
     const hls=new Hls({
       enableWorker:false,
       maxBufferLength:tgt.fwd,
       backBufferLength:tgt.back,
+      ...(tgt.budgeted?{maxBufferSize:tgt.fwdBytes}:{}),
       // Told before the first fragment loads, not seeked afterwards. Seeking
       // after attach downloads the opening of the film and throws it away —
       // on a 4K cache hit that is tens of megabytes and several seconds of
@@ -2362,6 +2365,13 @@ function attachHls(video, playlistUrl, startAt){
       p.marks.flushEdge=end==null?null:+((video.currentTime||0)-end).toFixed(1);
     });
     if(Hls.Events.FRAG_CHANGED) hls.on(Hls.Events.FRAG_CHANGED,()=>markEvent("frag"));
+    // The playlist is the only place the real append granularity is written
+    // down. TARGETDURATION tracks the longest segment published so far, so a
+    // session that later cuts a longer one re-tunes again.
+    if(Hls.Events.LEVEL_LOADED) hls.on(Hls.Events.LEVEL_LOADED,(_,d)=>{
+      const t=d&&d.details&&d.details.targetduration;
+      if(t>0) retuneBuffer(t);
+    });
     if(Hls.Events.BUFFER_APPENDED) hls.on(Hls.Events.BUFFER_APPENDED,()=>markEvent("append"));
     // Buffer pressure, classified. "It stopped buffering" has four unrelated
     // causes and they need different fixes: the browser refusing more data
@@ -3242,41 +3252,118 @@ function playedSecs(v){
 // So: keep the seconds for anything whose bitrate is already bounded, and for
 // a copied stream derive the seconds from a byte budget instead. The floor
 // exists because a very large file would otherwise buffer almost nothing.
-const MSE_FORWARD_BYTES=96e6;
-const MSE_BACK_BYTES=32e6;
-// A forward floor, because a very large file would otherwise buffer almost
-// nothing. The BACK buffer gets a much smaller one: it holds video already
-// watched, so every second of it is quota spent on data nobody is going to
-// see again — at 98 Mb/s a 6s back buffer is 73 MB, which was enough on its
-// own to push the total back over the limit this exists to stay under.
-const MSE_MIN_SECS=6;
-const MSE_MIN_BACK_SECS=2;
-// The invariant, enforced last. The two budgets above already sum to a fixed
-// number of bytes, so the only things that can break it are the floors (at a
-// very high bitrate) and the 60s/30s caps (at a low one, harmlessly). Past
-// roughly 150 Mb/s the floors no longer fit and the honest answer is a small
-// buffer that fits rather than a comfortable one that gets evicted — a stream
-// that big does not belong on the copy path at all, which is a routing
-// decision (§4.3bis) rather than one this function can make.
-const MSE_TOTAL_BYTES=144e6;
-function bufferTargets(){
+// What the browser will hold before it starts refusing appends. Chrome's video
+// SourceBuffer quota is ~150 MB on a desktop and no hls.js setting raises it;
+// this is that number with a little left over, because being wrong about it in
+// the optimistic direction is what the whole comment below is about.
+const MSE_QUOTA_BYTES=144e6;
+// **An append is not free, and forgetting that cost a session.**
+//
+// The budget used to be resident-only: 96 MB forward, 32 MB back, capped at a
+// 144 MB total — and it held, as long as the data arrived in small pieces. It
+// arrived in 2-second pieces, so the browser was asked for at most another
+// ~15 MB on top of what it already had, and 128 + 15 fitted.
+//
+// Then plurx took the cutting away from ffmpeg (see the segmenter) and the
+// floor went to 6 s to stop losing a frame at every boundary. At 61 Mb/s a
+// 6-second segment is 46 MB, and a segment that runs to the byte ceiling is
+// 64 MB. The browser has to hold what it already has PLUS the whole segment
+// being appended, so every append now asked for ~190 MB against a ~150 MB
+// quota and was refused. hls.js responds by evicting, halving its own target
+// and retrying; after `appendErrorMaxRetry` (3) failures on the same segment
+// it gives up fatally. Reported from the couch on Tron in Chrome, 2026-07-30:
+// several rebuffers and then a freeze that would not resume. Safari never saw
+// it, because native HLS does not use any of this.
+//
+// So the budget reserves room for the segment in flight:
+//
+//     forward + one segment + back  <=  MSE_QUOTA_BYTES
+//
+// The segment term is measured, not assumed: `EXT-X-TARGETDURATION` is the
+// longest segment the session has actually published (copyseg keeps it
+// honest), so `retuneBuffer` re-derives these the moment the first playlist
+// lands. The constant below is only what we guess before that.
+//
+// A forward target smaller than one segment is not the deadlock it looks
+// like: hls.js fetches whenever what is buffered ahead falls under the
+// target, so an 8 s target with 9 s segments oscillates between 8 s and 17 s
+// of runway. The peak is what the quota sees, which is why the peak is what
+// this budgets.
+const MSE_SEGMENT_CEILING_BYTES=64e6;   // copyseg's COPY_SEGMENT_MAX_BYTES
+const MSE_SEGMENT_CEILING_SECS=15;      // copyseg's COPY_SEGMENT_MAX_SECS
+// The back buffer holds video already watched — every byte of it is quota
+// spent on something nobody will see again, and on this path a seek starts a
+// fresh session anyway, so it buys a scrub of a second or two and nothing
+// else. It gets a byte allowance rather than a seconds one, and the smallest
+// floor that still permits a scrub.
+const MSE_BACK_BYTES=12e6;
+// Below this there is no budget left to divide and the stream does not belong
+// on the copy path at all — a routing decision (§4.3bis) rather than one this
+// function can make. It reports `fits:false` and takes what it can get.
+const MSE_MIN_RESIDENT_BYTES=48e6;
+// `segSecs` is the longest segment this session publishes, once known.
+function bufferTargets(segSecs){
   const p=PLAYER||{};
   // Only a copied stream puts the source's own bitrate on the wire. A
-  // transcode's source bitrate says nothing about what it will send, and
-  // using it here would shrink the buffer on exactly the streams that do not
-  // need it.
+  // transcode's output is bounded by the rung, and its SOURCE bitrate says
+  // nothing about what it will send — using it here would shrink the buffer on
+  // exactly the streams that do not need it.
   const bps=p.copyHls ? ((p.source&&p.source.bitrate)||0) : 0;
-  if(!bps || bps<=0) return {fwd:60, back:30, budgeted:false};
-  const secs=(b,floor)=>Math.max(floor, Math.min(60, 8*b/bps));
-  let fwd=secs(MSE_FORWARD_BYTES, MSE_MIN_SECS);
-  let back=Math.min(30, secs(MSE_BACK_BYTES, MSE_MIN_BACK_SECS));
-  const total=(fwd+back)*bps/8;
-  if(total>MSE_TOTAL_BYTES){
-    const k=MSE_TOTAL_BYTES/total;
-    fwd=Math.max(4, fwd*k);
-    back=Math.max(1, back*k);
-  }
-  return {fwd:Math.round(fwd), back:Math.round(back), budgeted:true};
+  if(!bps || bps<=0) return {fwd:60, back:30, budgeted:false, fits:true};
+  const Bps=bps/8;
+  // Before the playlist arrives, assume the worst segment copyseg can cut.
+  const guess=Math.min(MSE_SEGMENT_CEILING_SECS, MSE_SEGMENT_CEILING_BYTES/Bps);
+  const seg=Math.max(1, segSecs>0?segSecs:guess);
+  // What is left for resident data once the append in flight is paid for.
+  const resident=MSE_QUOTA_BYTES-seg*Bps;
+  const fits=resident>=MSE_MIN_RESIDENT_BYTES;
+  const room=Math.max(MSE_MIN_RESIDENT_BYTES, resident);
+  const back=Math.max(1, Math.min(30, MSE_BACK_BYTES/Bps, room*0.25/Bps));
+  // Forward is simply what remains. Deliberately no seconds floor: the segment
+  // IS the runway, because hls.js refills the moment the buffer dips under the
+  // target, so a 4 s target with 7 s segments still oscillates around 11 s
+  // buffered. A floor here could only promise bytes the quota will refuse —
+  // which is precisely the bug this rewrite exists to fix, and a floor is how
+  // it would come back.
+  const fwd=Math.max(1, Math.min(60, (room-back*Bps)/Bps));
+  // Rounded DOWN, both of them. Rounding a target up spends bytes the budget
+  // above did not allocate, which on a 4K remux is megabytes per second of
+  // rounding error and is exactly the sort of small optimism the quota
+  // punishes with a freeze.
+  const rf=Math.max(1, Math.floor(fwd)), rb=Math.max(1, Math.floor(back));
+  return {fwd:rf, back:rb, budgeted:true, fits,
+          seg:+seg.toFixed(1), fwdBytes:Math.round(rf*Bps),
+          peakBytes:Math.round((rf+seg+rb)*Bps)};
+}
+// Apply a budget to a live hls.js instance.
+//
+// `maxBufferSize` has to move with `maxBufferLength` or it silently wins:
+// hls.js takes the LARGER of the seconds target and `8*maxBufferSize/bitrate`,
+// so leaving the stock 60 MB there pins the forward buffer at 8 s on a 61 Mb/s
+// stream no matter what the seconds say. That is the same class of mistake as
+// the one above — a limit that reads like a cap and behaves like a floor.
+function applyBufferTargets(hls, tgt){
+  if(!hls||!hls.config||!tgt||!tgt.budgeted) return;
+  hls.config.maxBufferLength=tgt.fwd;
+  hls.config.backBufferLength=tgt.back;
+  hls.config.maxBufferSize=tgt.fwdBytes;
+}
+// The playlist knows the real segment length; the constants above only
+// guessed it. Runs once per session, on the first playlist that carries a
+// target duration.
+function retuneBuffer(segSecs){
+  const p=PLAYER; if(!p||!p.hls||!(segSecs>0)) return;
+  if(p.bufSegSecs===segSecs) return;
+  p.bufSegSecs=segSecs;
+  const tgt=bufferTargets(segSecs);
+  if(!tgt.budgeted) return;
+  p.bufTarget=tgt;
+  applyBufferTargets(p.hls, tgt);
+  clientLog({level:"info",event:"buffer_budget",
+    detail:`seg=${tgt.seg}s fwd=${tgt.fwd}s back=${tgt.back}s peak=${Math.round(tgt.peakBytes/1e6)}MB`,
+    message:`buffer budget for a ${Math.round(((p.source&&p.source.bitrate)||0)/1e6)} Mb/s copy: `+
+            `${tgt.fwd}s ahead + one ${tgt.seg}s segment + ${tgt.back}s behind = `+
+            `${Math.round(tgt.peakBytes/1e6)}MB against a ${Math.round(MSE_QUOTA_BYTES/1e6)}MB quota`});
 }
 function teardownHls(){ if(PLAYER&&PLAYER.hls){ try{PLAYER.hls.destroy()}catch(e){} PLAYER.hls=null; } }
 // Every timer hanging off PLAYER, stopped. Anything that replaces or discards
@@ -3360,12 +3447,26 @@ function maybeDecodeRescue(){
   const verdict=decodeMarginVerdict(h, secs);
   if(!verdict) return;
   p.decodeRescued=true;
-  rememberDecodeLimit(p.source, verdict.decodeMs, verdict.budgetMs);
+  // A session the browser refused data on has an explanation for its hitches
+  // that is not the decoder, and a decode limit is the wrong thing to learn
+  // from it: it is per-device and per-codec, it steers every future Auto
+  // playback of anything that shape, and the actual constraint was the size of
+  // this stream against this browser's buffer quota — which a transcode fixes
+  // by being smaller, and which says nothing about what the GPU can decode.
+  // Getting this wrong is how Chrome taught itself that an M3 Max cannot play
+  // HEVC 2160p. Fall back, because falling back genuinely helps; just do not
+  // remember it as something it wasn't.
+  const quota=(p.bufferLimits&&p.bufferLimits.quota)|0;
+  if(!quota) rememberDecodeLimit(p.source, verdict.decodeMs, verdict.budgetMs);
   clientLog(Object.assign({level:"warn",event:"decode_rescue",
-    detail:`decode=${verdict.decodeMs}ms budget=${verdict.budgetMs}ms events=${verdict.events}`,
-    message:`this browser delivers ${decodeLimitKey(p.source)||'this stream'} just-in-time `+
-            `(${verdict.decodeMs}ms against a ${verdict.budgetMs}ms frame budget, no slack) `+
-            `with visible hitches — switching to transcode`}, playbackContext()));
+    detail:`decode=${verdict.decodeMs}ms budget=${verdict.budgetMs}ms events=${verdict.events} quota=${quota}`,
+    message:quota
+      ? `this browser refused buffer ${quota}x on ${decodeLimitKey(p.source)||'this stream'} `+
+        `and hitched with it — switching to transcode, but not remembering a decode limit: `+
+        `the constraint was buffer quota, not the decoder`
+      : `this browser delivers ${decodeLimitKey(p.source)||'this stream'} just-in-time `+
+        `(${verdict.decodeMs}ms against a ${verdict.budgetMs}ms frame budget, no slack) `+
+        `with visible hitches — switching to transcode`}, playbackContext()));
   toast("This browser can't hold Original smoothly — switching to optimized");
   startTranscodeFallback("decode-rescue");
 }
@@ -4509,9 +4610,20 @@ function updateStats(){
       }${hitchInterval()?` · every ~${hitchInterval().toFixed(1)}s`:''}</span></div>`
       +`<div><b></b><span class="muted" style="font-size:11px">${esc(PLAYER.hitches.last||'')}</span></div>`
       +(hitchBlame()?`<div><b></b><span class="muted" style="font-size:11px">${esc(hitchBlame())}</span></div>`:''):'')+
-    (PLAYER.hls&&PLAYER.hls.config?`<div><b>Buffer target</b><span class="muted">${
-      PLAYER.hls.config.maxBufferLength}s ahead · ${PLAYER.hls.config.backBufferLength}s behind${
-      PLAYER.bufferLimits&&PLAYER.bufferLimits.quota?` · ${PLAYER.bufferLimits.quota} quota refusals`:''}</span></div>`:'')+
+    (PLAYER.hls&&PLAYER.hls.config?(()=>{
+      // The peak is the number that matters, and it was the number nobody was
+      // looking at: the browser holds the forward buffer, the back buffer AND
+      // the segment being appended at the same moment, and it is that sum the
+      // quota refuses. Stating the parts without the sum is what let a 128 MB
+      // budget quietly ask for 190 MB.
+      const t=PLAYER.bufTarget, q=(PLAYER.bufferLimits&&PLAYER.bufferLimits.quota)|0;
+      const peak=(t&&t.budgeted)?` · peak ${Math.round(t.peakBytes/1e6)}MB of ~${
+        Math.round(MSE_QUOTA_BYTES/1e6)}MB (+ a ${t.seg}s segment)`:'';
+      return `<div><b>Buffer target</b><span class="${q?'':'muted'}"${
+        q?' style="color:var(--warn,#fbbf24)"':''}>${
+        PLAYER.hls.config.maxBufferLength}s ahead · ${PLAYER.hls.config.backBufferLength}s behind${
+        peak}${q?` · ${q} quota refusals — the browser is refusing data`:''}</span></div>`;
+    })():'')+
     (PLAYER.decodeInfo?(()=>{
       // The measured margin, next to the browser's own claim — because the
       // claim was `powerEfficient: true` on the exact session whose median

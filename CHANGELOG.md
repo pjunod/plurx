@@ -79,6 +79,37 @@ bump may break compatibility and a **patch** bump never does.
   they now coexist — the overlay closes when you close it — and the menu
   slides clear of the panel instead of covering it, overlapping only in a
   window too narrow to hold both.
+- **Chrome could freeze on a 4K remux, because the buffer budget forgot that
+  an append is not free.** The client sizes its MSE buffer in bytes against the
+  browser's ~150 MB quota, and it sized only what the browser would be
+  *holding* — while the quota is charged on what it holds *plus the segment
+  being appended*, both of which exist at once during an `appendBuffer`. That
+  squeaked under while segments were 2 s and 15 MB. Once plurx started cutting
+  its own segments at a 6-second floor, a segment at 61 Mb/s became 46–64 MB,
+  every append asked for ~190 MB, and Chrome refused. hls.js answers a refusal
+  by evicting, halving its own target and retrying — and gives up fatally after
+  three failures on the same segment, which is a film that stops and will not
+  resume without leaving the stream. The budget now reserves room for the
+  segment in flight (`forward + one segment + back <= 144 MB`) and takes the
+  segment length from the playlist rather than assuming it, so it follows
+  whatever the segmenter actually cut. Safari was never affected: native HLS
+  uses none of these numbers.
+
+  Two smaller things fell out of the same investigation. hls.js takes the
+  *larger* of the seconds target and `8 * maxBufferSize / bitrate`, so leaving
+  its stock 60 MB byte target in place made it a floor under the buffer rather
+  than a cap on it — it now moves with the seconds. And the back buffer is
+  capped at 12 MB rather than 32 MB: a seek starts a fresh session on this
+  path, so the back buffer buys a second or two of scrubbing and was otherwise
+  a fifth of the budget spent on video nobody would watch again.
+- **A buffer-quota problem could be remembered as a decode limit.** Quota
+  pressure produces exactly what the decode rescue looks for — visible hitches
+  on a copy session — so on Auto it fired, blamed the decoder, and wrote a
+  per-device per-codec limit that then steered every future playback of
+  anything that shape. That is how one browser taught itself that a fast
+  machine could not play HEVC 2160p. A session the browser refused buffer on
+  still falls back to a transcode, because a smaller stream genuinely fixes
+  it, but no longer records a decode limit it did not measure.
 - **The first copy segment could out-run the playlist.** `EXT-X-TARGETDURATION`
   is a live playlist's reload interval, and it was declared as the segment
   duration *ceiling* rather than what had actually been published — so a player
