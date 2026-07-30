@@ -20,7 +20,7 @@ run it, in order of how most people do:
 # Docker / Compose (recommended for homelabs) — builds from source the first time
 cd deploy
 cp docker-compose.override.example.yml docker-compose.override.yml   # your mounts + GPU
-cd .. && make deploy      # builds + starts, and stamps the commit so the server can name it
+cd .. && make docker-up      # builds + starts, and stamps the commit so the server can name it
 
 # Bare metal — one binary, needs ffmpeg/ffprobe on PATH (or PLURX_FFMPEG/PLURX_FFPROBE)
 plurxd run            # serves :32400
@@ -178,7 +178,7 @@ when something is wrong, not on a schedule.
 
 The overlay's first row is **Build** — which binary is answering, as
 `0.2.0 · v0.2.0-7-g0e80e42`, or `0.2.0 · built 30 Jul 16:35Z` when the image
-was made from a context with no commit in it (deploy with `make deploy` and it
+was made from a context with no commit in it (deploy with `make docker-up` and it
 can name the commit). It is there because "which build is this?" is the first
 question of any debugging session, and the answer used to live behind an admin
 login on the System page — invisible in every screenshot anybody sends. The web

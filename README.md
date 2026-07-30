@@ -112,7 +112,7 @@ sudo install -d -o $(id -u) -g $(id -g) /srv/plurx
 cd deploy
 cp docker-compose.override.example.yml docker-compose.override.yml
 $EDITOR docker-compose.override.yml     # media mounts as host:container:ro, + optional GPU
-cd .. && make deploy                    # builds, starts, and stamps the commit into the build
+cd .. && make docker-up                    # builds, starts, and stamps the commit into the build
 
 # 3. Open the web app — the first launch is the admin-account setup screen
 open http://<host>:32400                # :32400 is the default port
@@ -137,7 +137,7 @@ Three ways to run it; all serve the web app + API on `:32400`.
 
 ```bash
 # Docker / Compose — recommended for homelabs; bundles ffmpeg, builds from source first run
-make deploy      # == docker compose up -d --build, with the commit stamped in
+make docker-up      # == docker compose up -d --build, with the commit stamped in
 
 # Bare metal — one static binary; needs ffmpeg/ffprobe on PATH
 #   (jellyfin-ffmpeg recommended, or point PLURX_FFMPEG / PLURX_FFPROBE at them)

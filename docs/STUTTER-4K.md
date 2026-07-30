@@ -896,9 +896,11 @@ playbook computes it per host.
 >
 > Three changes, in order of how much they matter:
 >
-> 1. **`make deploy`** — the deploy is one command that sets the variable
->    itself. Every doc that said `docker compose up -d --build` now says this.
->    The correct thing is the easy thing; nothing has to be remembered.
+> 1. **`make docker-up`** — the Compose deploy is one command that sets the
+>    variable itself. Every doc that said `docker compose up -d --build` now says
+>    this. The correct thing is the easy thing; nothing has to be remembered.
+>    Named for the container path rather than `deploy`, because bare metal and
+>    systemd are equally supported and stamp themselves from their own checkout.
 > 2. **An unstamped build reports its compile time** (`version::BUILT_AT`,
 >    stamped unconditionally by `build.rs`). It cannot name the commit, but
 >    "did my change land?" is answerable from a timestamp and unanswerable from

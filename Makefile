@@ -66,7 +66,7 @@ version: ## Print the version and git build stamp a build would report
 docker: ## Build the container image
 	docker build --build-arg PLURX_BUILD_REF="$(BUILD_REF)" -t plurx/plurxd:latest .
 
-# The deploy, as one command that cannot forget the stamp.
+# The Compose deploy, as one command that cannot forget the stamp.
 #
 # `docker compose up -d --build` is what every doc told people to run, and it
 # leaves PLURX_BUILD_REF empty — `.git` is outside the build context, so the
@@ -77,13 +77,17 @@ docker: ## Build the container image
 # time, and the failure is silent. Nobody remembered, and the System page read
 # "(unstamped build)" for weeks of daily deploys.
 #
-# So make the correct thing the easy thing. This is the deploy command now, and
-# the docs point here rather than at a variable to remember.
-.PHONY: deploy
-deploy: ## Build and (re)start the container stack, stamped with this commit
+# So make the correct thing the easy thing. Named `docker-up` and not `deploy`
+# because deploying plurx is not one thing: bare metal and systemd are equally
+# supported (see deploy/README.md), and a target called `deploy` would claim to
+# be the way to ship it while quietly meaning only one of the three. Container
+# hosts get this; the other two stamp themselves from their own checkout,
+# because `.git` is right there.
+.PHONY: docker-up
+docker-up: ## Build + (re)start the Compose stack, stamping this commit into the image
 	PLURX_BUILD_REF="$(BUILD_REF)" \
 	  docker compose -f deploy/docker-compose.yml up -d --build
-	@echo "deployed $(VERSION) ($(BUILD_REF))"
+	@echo "up: $(VERSION) ($(BUILD_REF))"
 
 .PHONY: release-check
 release-check: ## Verify the tree is ready to tag the current version

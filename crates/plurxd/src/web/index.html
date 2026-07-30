@@ -5263,7 +5263,7 @@ function usersPanel(users){
 function buildTag(sys){
   const b=sys.build;
   if(!b || b==="unknown")
-    return ` <span class="muted" style="font-size:12px" title="Built from a context with no .git and no PLURX_BUILD_REF, so the image cannot name its commit — the build time below is the next best thing. Deploy with 'make deploy', which stamps it.">(unstamped · built ${esc(builtAtLabel(sys.built_at))})</span>`;
+    return ` <span class="muted" style="font-size:12px" title="Built from a context with no .git and no PLURX_BUILD_REF, so the image cannot name its commit — the build time below is the next best thing. Deploy with 'make docker-up', which stamps it.">(unstamped · built ${esc(builtAtLabel(sys.built_at))})</span>`;
   if(b==="v"+sys.version || b===sys.version) return "";
   return ` <span class="muted" style="font-size:12px">(${esc(b)})</span>`;
 }

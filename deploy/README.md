@@ -12,7 +12,7 @@ file, so pulling updates never conflicts with your local edits:
 cd deploy
 cp docker-compose.override.example.yml docker-compose.override.yml
 $EDITOR docker-compose.override.yml   # your media mounts (host:container:ro), your GPU
-cd .. && make deploy                  # builds from source; stamps the commit into the build
+cd .. && make docker-up                  # builds from source; stamps the commit into the build
 ```
 
 Open `http://<host>:32400` and create your admin account. Library paths in

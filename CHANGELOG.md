@@ -111,10 +111,13 @@ bump may break compatibility and a **patch** bump never does.
   `0.2.0 (unstamped build)` for weeks of daily deploys, and three debugging
   sessions stalled on nobody being able to say what was running.
 
-  `make deploy` is now the deploy — one command that stamps the commit itself,
-  and every doc points at it instead of at a variable to remember. A build that
-  still ends up unstamped reports its **compile time** instead of the word
-  "unknown", because "did my change land?" is answerable from a timestamp. And
+  `make docker-up` is the Compose deploy now — one command that stamps the commit
+  itself, and every doc points at it instead of at a variable to remember. (It is
+  not called `deploy`: bare metal and systemd are equally supported, and they
+  stamp themselves from their own checkout because `.git` is right there.) A
+  build that still ends up unstamped reports its **compile time** instead of
+  the word "unknown", because "did my change land?" is answerable from a
+  timestamp. And
   the build is now the first row of the player's stats overlay, where it can be
   read without an admin login and appears in any screenshot — the page and the
   binary are the same artifact, so one line answers for both.
