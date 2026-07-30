@@ -83,10 +83,24 @@ docker: ## Build the container image
 # be the way to ship it while quietly meaning only one of the three. Container
 # hosts get this; the other two stamp themselves from their own checkout,
 # because `.git` is right there.
+#
+# **`cd deploy` — never `-f deploy/docker-compose.yml` from here.** Passing
+# `-f` turns OFF Compose's automatic override discovery, so
+# `docker-compose.override.yml` is silently ignored — and that file is where
+# every host keeps the things this tracked repo cannot know: the media mounts,
+# the GPU device passthrough, the ports. The stack still comes up, which is the
+# worst part: it comes up with no media visible ("path does not resolve" on
+# every library), no /dev/dri, and the transcoder fallen back to software x264.
+# `-f` also moves the project directory to the repo root, so `deploy/.env` stops
+# being read on the way past.
+#
+# The recipe below is character-for-character what somebody runs by hand in
+# `deploy/`, with only the build arg added. That is the point: a convenience
+# target that is not equivalent to the command it replaces is a trap, and this
+# one sprang on the first real deploy.
 .PHONY: docker-up
 docker-up: ## Build + (re)start the Compose stack, stamping this commit into the image
-	PLURX_BUILD_REF="$(BUILD_REF)" \
-	  docker compose -f deploy/docker-compose.yml up -d --build
+	cd deploy && PLURX_BUILD_REF="$(BUILD_REF)" docker compose up -d --build
 	@echo "up: $(VERSION) ($(BUILD_REF))"
 
 .PHONY: release-check

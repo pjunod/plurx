@@ -122,9 +122,16 @@ bump may break compatibility and a **patch** bump never does.
   `0.2.0 (unstamped build)` for weeks of daily deploys, and three debugging
   sessions stalled on nobody being able to say what was running.
 
-  `make docker-up` is the Compose deploy now — one command that stamps the commit
-  itself, and every doc points at it instead of at a variable to remember. (It is
-  not called `deploy`: bare metal and systemd are equally supported, and they
+  `make docker-up` is the Compose deploy now — and it `cd`s into `deploy/`
+  rather than passing `-f deploy/docker-compose.yml` from the repo root.
+  Passing `-f` turns off Compose's automatic override discovery, so
+  `docker-compose.override.yml` is silently ignored: the stack comes up with
+  no media mounts, no GPU passthrough, and the transcoder fallen back to
+  software. A convenience target that is not equivalent to the command it
+  replaces is a trap, and this one sprang on the first real deploy. It is one
+  command that stamps the commit itself, and every doc points at it instead of
+  at a variable to remember. (It is not called `deploy`: bare metal and
+  systemd are equally supported, and they
   stamp themselves from their own checkout because `.git` is right there.) A
   build that still ends up unstamped reports its **compile time** instead of
   the word "unknown", because "did my change land?" is answerable from a
