@@ -71,7 +71,13 @@ pub const SEGMENT_SECONDS: u32 = 2;
 /// Safe to diverge from [`SEGMENT_SECONDS`]: copy sessions are live-only —
 /// never cached (no recipe hash to collide with) and outside the Phase 3
 /// failover contract, which is about transcode sessions.
-pub const COPY_SEGMENT_SECONDS: u32 = 6;
+/// Lowered from 6 s when [`COPY_SEGMENT_MAX_SECS`] came down to 6: the floor
+/// GATES the ceilings (`CutPolicy::cut_before` refuses any cut below it), so a
+/// floor equal to the ceiling leaves a zero-width window to hunt for a clean
+/// cut in and turns the segmenter back into a fixed grid. Four gives it two
+/// seconds of hunting room against a GOP grid that offers a clean point every
+/// couple of seconds on the reference disc.
+pub const COPY_SEGMENT_SECONDS: u32 = 4;
 
 /// Hard byte ceiling on one copy-path segment.
 ///
@@ -131,16 +137,36 @@ pub const COPY_FIRST_SEGMENT_SECONDS: u32 = 2;
 /// minutes, and `EXT-X-TARGETDURATION` has to be declared up front and may
 /// never decrease — so without a duration ceiling the playlist would have to
 /// promise something absurd on session one to stay honest on session two.
-/// Fifteen seconds keeps the tag believable and still leaves the floor plenty
-/// of room to find a clean point on any normal GOP grid.
+/// The two ceilings meet at about 34 Mb/s (64 MB ÷ this), and they meet rather
+/// than cross: below that the duration ceiling binds and a segment is under
+/// 64 MB, above it the byte ceiling binds and a segment is under this many
+/// seconds. So one published segment is at most [`COPY_SEGMENT_MAX_BYTES`]
+/// plus the fragment that crossed it, at any bitrate — which is the property
+/// the SourceBuffer measurement was taken against.
 ///
-/// The two ceilings meet at about 34 Mb/s (64 MB ÷ 15 s), and they meet
-/// rather than cross: below that the duration ceiling binds and a segment is
-/// under 64 MB, above it the byte ceiling binds and a segment is under 15 s.
-/// So one published segment is at most [`COPY_SEGMENT_MAX_BYTES`] plus the
-/// fragment that crossed it, at any bitrate — which is the property the
-/// SourceBuffer measurement was taken against.
-pub const COPY_SEGMENT_MAX_SECS: u32 = 15;
+/// **Why it came down from fifteen: a segment is invisible until it is cut.**
+///
+/// The segmenter accumulates a whole segment before publishing it, so the
+/// client's view of the stream advances in steps of one segment, however
+/// smooth the producer is. A viewer's buffer therefore has to be longer than
+/// one segment's worth of *production* time or it drains to nothing in the gap
+/// between publications — and the buffer cannot simply be made longer, because
+/// on a 69 Mb/s remux the browser's ~150 MB SourceBuffer quota allows about
+/// seven seconds and no more (see `bufferTargets`).
+///
+/// At fifteen seconds those two numbers were on the wrong sides of each other.
+/// Reported on *Wicked* in Chrome, deterministically at 9.2 s every time: an
+/// 8.8-second freeze — one whole publication gap — with the network delivering
+/// at 137 Mb/s and the buffer perfectly healthy either side of it. Safari saw
+/// the same event as a 597 ms hiccup, being less patient about reloading.
+///
+/// Six seconds puts the ceiling under the quota-bound forward buffer at every
+/// bitrate the copy path accepts, which is what makes the gap survivable. It
+/// costs boundaries on a low-bitrate source — where the byte ceiling would
+/// never have fired — and boundaries cost at most one frame each, only at a
+/// cut with a leading picture to discard. One frame occasionally beats nine
+/// seconds of nothing, once, in the same place, every time you play the film.
+pub const COPY_SEGMENT_MAX_SECS: u32 = 6;
 
 /// The bitstream filter every copied HEVC stream gets before a client sees it.
 ///

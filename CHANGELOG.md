@@ -113,6 +113,28 @@ bump may break compatibility and a **patch** bump never does.
   capped at 12 MB rather than 32 MB: a seek starts a fresh session on this
   path, so the back buffer buys a second or two of scrubbing and was otherwise
   a fifth of the budget spent on video nobody would watch again.
+- **A film froze for ~9 seconds, at the same second, every time you played
+  it.** *Wicked* in Chrome stalled 8.8 s at 9.2 s in; Safari saw the same event
+  as a 597 ms hiccup. The network was delivering at 137 Mb/s and the buffer was
+  healthy either side of it, which is why it survived a day of looking at
+  buffer numbers.
+
+  A segment is invisible until it is cut. The segmenter accumulates a whole
+  one before publishing, so the client's view of the stream advances in steps
+  of one segment however smooth the producer is — and the client's buffer has
+  to outlast one segment's worth of *production* time or it drains to nothing
+  in the gap. That buffer cannot simply be made longer: on a 69 Mb/s remux the
+  browser's ~150 MB SourceBuffer quota allows about seven seconds and no more.
+  With a 15-second duration ceiling those two numbers were on the wrong sides
+  of each other, and the gap was the freeze.
+
+  The duration ceiling is now 6 s and the floor 4 s (the floor gates the
+  ceiling, so they cannot be equal without turning the segmenter back into a
+  fixed grid). That puts a publication gap inside the forward buffer at every
+  bitrate the copy path accepts. It costs boundaries on low-bitrate sources,
+  where the byte ceiling would never have fired — and a boundary costs at most
+  one frame, only where the cut has a leading picture to discard. One frame
+  occasionally beats nine seconds of nothing in the same place every time.
 - **The server could not say which build it was running — again.** `.git` sits
   outside the Docker build context, so the image can only name its commit if
   the deploy passes `PLURX_BUILD_REF`. That was previously "fixed" by having
