@@ -1,7 +1,7 @@
 # GOP-aware segmenter — zero boundary drops on the copy path
 
 **Status:** BUILT 2026-07-30, M0–M6 · CI gate green (`make check`: fmt +
-clippy + 254 core / 188 daemon tests) · **awaiting morning validation on
+clippy + 254 core / 189 daemon tests) · **awaiting morning validation on
 real hardware by Paul** · **Executes:** the residual in
 [STUTTER-4K.md](STUTTER-4K.md) §5.3ter — one discarded leading picture per
 segment start · **Written:** 2026-07-30, against `e212c55` (v0.2.0-2) —

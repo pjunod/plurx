@@ -535,6 +535,115 @@ mod tests {
         assert_eq!(segment_files(dir.path()), segment_files(whole.path()));
     }
 
+    /// The whole path, once, against a live ffmpeg: the real
+    /// `copy_pipe_args`, a real child process, its real stdout, this reader,
+    /// and real files on disk — and what comes out decodes frame for frame
+    /// like the source.
+    ///
+    /// Every other test here feeds `run()` a byte slice, which is right for
+    /// the disk semantics but proves nothing about the arguments or about
+    /// reading from a pipe that arrives at ffmpeg's pace. This is the one that
+    /// would notice if `copy_pipe_args` stopped producing a stream this reader
+    /// can follow — the exact failure that would silently put every copy
+    /// session on the legacy fallback with only a log line to say so.
+    #[tokio::test]
+    async fn a_live_ffmpeg_pipe_produces_a_session_that_decodes_like_the_source() {
+        use plurx_core::domain::MediaFile;
+        use plurx_core::transcode::{copy_pipe_args, Pacing};
+
+        let src = plurx_core::testfixtures::source("clean-cra");
+        let file = MediaFile {
+            id: 1,
+            item_id: 1,
+            path: src.clone(),
+            size: 1,
+            mtime: 1,
+            duration_ms: Some(12_000),
+            container: Some("mkv".into()),
+            video_codec: Some("hevc".into()),
+            video_profile: Some("Main".into()),
+            width: Some(640),
+            height: Some(360),
+            bit_depth: Some(8),
+            hdr: None,
+            hdr_format: None,
+            bitrate: Some(1_000_000),
+            audio_streams: vec![],
+            subtitle_streams: vec![],
+            scanned_at: 1,
+            audio_offset_ms: 0,
+            probed: true,
+        };
+        // Unpaced: the pacing flags are the daemon's business and a 12 s
+        // fixture read at 2× would just make the test slow.
+        let args = copy_pipe_args(&file, 0.0, None, true, Pacing::unpaced(), false);
+        let mut child = tokio::process::Command::new(plurx_core::testfixtures::ffmpeg())
+            .args(&args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawning ffmpeg");
+        let stdout = child.stdout.take().expect("stdout pipe");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let limits = Limits {
+            floor_seconds: 3,
+            max_bytes: 48_000_000,
+            max_seconds: 15,
+        };
+        let outcome = run(stdout, dir.path().to_path_buf(), "live", limits).await;
+        let _ = child.wait().await;
+
+        let Outcome::Ran(counts) = outcome else {
+            panic!("a live ffmpeg pipe was not readable: {outcome:?}");
+        };
+        assert!(counts.segments >= 2, "{counts:?}");
+        assert_eq!(counts.unparseable, 0, "{counts:?}");
+        assert_eq!(
+            counts.ceiling_cuts, 0,
+            "a clean source cut dirty: {counts:?}"
+        );
+        let text = playlist(dir.path());
+        assert!(text.ends_with("#EXT-X-ENDLIST\n"), "{text}");
+
+        // init + every segment, concatenated, against the source. framemd5
+        // hashes each frame WITH its pts and duration, so a reordered,
+        // retimed or dropped frame all fail here.
+        let mut cat = std::fs::read(dir.path().join("init.mp4")).expect("init.mp4");
+        for i in 0..counts.segments {
+            let seg = dir.path().join(format!("seg{i:05}.m4s"));
+            cat.extend_from_slice(&std::fs::read(&seg).expect("segment"));
+        }
+        let candidate = dir.path().join("candidate.mp4");
+        std::fs::write(&candidate, &cat).expect("candidate");
+
+        let framemd5 = |path: &Path, stream: &str| {
+            let out = plurx_core::testfixtures::run(
+                std::process::Command::new(plurx_core::testfixtures::ffmpeg())
+                    .args(["-v", "error", "-i"])
+                    .arg(path)
+                    .args(["-map", stream, "-f", "framemd5", "-"]),
+            );
+            String::from_utf8_lossy(&out)
+                .lines()
+                .filter(|l| !l.starts_with('#'))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        // Materialize the reference through the cached path, then compare.
+        let _ = plurx_core::testfixtures::pipe("clean-cra");
+        let reference = plurx_core::testfixtures::pipe_path("clean-cra");
+        for stream in ["0:v:0", "0:a:0"] {
+            assert_eq!(
+                framemd5(&candidate, stream),
+                framemd5(&reference, stream),
+                "{stream} decodes differently after a live session"
+            );
+        }
+    }
+
     #[test]
     fn only_codecs_whose_keyframes_can_be_read_are_attempted() {
         assert!(supports(Some("hevc")));
