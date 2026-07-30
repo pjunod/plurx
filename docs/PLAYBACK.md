@@ -219,15 +219,20 @@ even the copy path can't hand to the browser).
 browser rejected a cheaper stream. `Method: Transcode` with a "video codec …"
 or "HDR …" reason is a real, up-front transcode verdict.
 
-## The decode-margin rescue — routing around a decoder with no headroom
+## The decode-margin rescue — routing around a pipeline with no slack
 
 The error fallback catches streams the browser *refuses*. This one catches
-streams the browser accepts and then cannot sustain — found the hard way
-([STUTTER-4K.md](STUTTER-4K.md) §5.3): a client whose median decode of a 4K
-HEVC remux was 41.6 ms against a 41.7 ms frame budget, hardware-decoding at
-exactly realtime, surfacing every decoder spike as a held frame. The
-browser's own `mediaCapabilities` claim was `powerEfficient: true` for that
-stream; the measurement outranks the claim.
+streams the browser accepts and then cannot present smoothly — found the
+hard way ([STUTTER-4K.md](STUTTER-4K.md) §5.3): a client whose median
+decode of a 4K HEVC remux was 41.6 ms against a 41.7 ms frame budget. Read
+that number carefully — it is **slack, not capability**. A median pinned to
+the frame budget is a pipeline delivering frames just-in-time (the client
+in question was an M3 Max, whose media engine loafs through this stream);
+whatever the reason the pipeline holds no reserve, every spike lands on
+screen. The browser's `mediaCapabilities` claimed `powerEfficient: true`
+throughout; the measurement outranks the claim, and the rescue triggers on
+the measurement — zero slack *plus* visible hitches — which is the right
+trigger whichever component is eating the reserve.
 
 The player measures per-frame decode cost (`requestVideoFrameCallback`
 `processingDuration`, median over a rolling window) and, on an **Auto**

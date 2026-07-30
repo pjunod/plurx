@@ -1,9 +1,12 @@
 # 4K copy-path stutter — what it is, what it isn't, and what to try next
 
-**Status:** root cause identified — the client's decoder has no headroom at
-4K HEVC (§5.3, confirmed by measurement 2026-07-29 evening); response
-shipped as the decode-margin rescue
-([PLAYBACK.md](PLAYBACK.md#the-decode-margin-rescue--routing-around-a-decoder-with-no-headroom))
+**Status:** measured fact: the client pipeline holds zero decode slack on
+this stream (§5.3) — first misread as decoder capacity, corrected the same
+night by the client itself (an M3 Max); top surviving cause is
+VideoToolbox refusing the stream's Dolby Vision Profile 7 container
+signaling, fix shipped (dovi_rpu strip, §5.3); the decode-margin rescue
+([PLAYBACK.md](PLAYBACK.md#the-decode-margin-rescue--routing-around-a-pipeline-with-no-slack))
+stands as the measured mitigation
 · **Symptom:** one held video frame per segment boundary on a 4K HEVC remux
 · **Reproduced on:** all four of Paul's nodes, Chrome only client tested ·
 **Instrument:** `armHitchDetector` in
@@ -347,10 +350,10 @@ this investigation learned to measure.
 
 **Outcome (same evening):** the strip shipped and the stream is clean on
 every measured axis, but the visible hitch rate did not move materially —
-because the forensics it shipped alongside found the real bound: the
-client's decoder itself, §5.3, now confirmed. The strip stays: it is
-spec-correctness with zero cost, it removed three real defects, and on DV
-sources it shrinks the IRAP access units that spike a margin-less decoder.
+and the forensics it shipped alongside produced the zero-slack measurement
+whose reading, misreading and correction are §5.3. The strip stays: it is
+spec-correctness with zero cost, it removed three real defects, and it is
+half of the DV signaling fix §5.3 completes.
 
 The strongest surviving lead, and the newest — it comes from the `mpegts` vs
 `fmp4` row in §4. Every clean comparison in §3 either used hls.js's TS
@@ -384,43 +387,74 @@ test still separates DV from generic 4K HEVC: play a 4K remux over 40 Mb/s
 that is **not** Dolby Vision (the library has 190 4K HDR10 files; §5 of the
 perf report enumerates them).
 
-### 5.3 The decoder itself, out of headroom — CONFIRMED
+### 5.3 Zero slack, measured — and the correction the client itself supplied
 
-The theory §5.0's reframe added, and the forensics settled it in one round
-of screenshots (2026-07-29 evening, same title, same client):
+The forensics settled the *measurement* in one round of screenshots
+(2026-07-29 evening, same title, same client):
 
 | | 4K remux (hitches) | 1080p transcode (smooth) |
 |---|---|---|
 | Typical decode | **41.6 ms/frame** | 6 ms/frame |
 | Frame budget (23.976) | 41.7 ms | 41.7 ms |
-| Margin | **none — median = budget** | ~7× |
+| Slack | **none — median = budget** | ~7× |
 | Slow spikes (>3× typical) | 324, and they surface | 540, absorbed silently |
 | Visible hitches | 7 held · 1 late, every ~2.6 s | 3 late at startup, then none |
 | Decode at the hitch itself | 5 ms (a small B-frame) | — |
 
-The client hardware-decodes this 4K HEVC at exactly realtime: the median
-per-frame cost *equals* the frame budget, so roughly half of all frames run
-over it and there is no slack anywhere to absorb a spike. The hitch frame's
-own decode being fast (5 ms) is the confirming detail — it is not the slow
-frame; it is the frame that found the pipeline dry after a giant IRAP ate
-three budgets upstream. The same machine absorbs *more* spikes on the
-1080p stream without a single visible event, because 6 ms of median cost
-leaves 35 ms of margin per frame. `mediaCapabilities` claimed
-`powerEfficient: true` throughout; the measurement outranks the claim.
+The first reading of that table — "the decoder is out of headroom" — was
+**wrong**, and the client is what proved it: an M3 Max MacBook Pro, whose
+media engine decodes this stream at many times realtime, with
+`chrome://gpu` confirming hardware video decode (HEVC Main-10 to
+8192×8192), ANGLE Metal, zero GPU-process crashes and no video-related
+workarounds. A median pinned to exactly 1.000× the frame budget is not what
+a saturated decoder produces — it is what a **cadence-clocked pipeline**
+produces: frames decoded just-in-time, one in flight, ready precisely when
+consumed. The silicon loafs; the pipeline holds no reserve, so every spike
+lands on screen. `processingDuration` measures submission-to-ready, which
+in a just-in-time pipeline is the consumption interval, not the decode
+cost. The same number on the 1080p stream (6 ms) is decode-clocked because
+that pipeline holds a reserve. Guardrail 8 exists because this misread
+shipped before the client corrected it.
 
-Honest accounting: §5.0's strip cleaned the bitstream but did not move the
-visible hitch rate materially (~0.3/s before and after in the observed
-windows). The margin was the binding constraint all along.
+Then Safari made the picture sharper. On the same machine, the same file
+through native HLS — the path this stream format was built for — played
+*worse*, with `mediaCapabilities` answering `powerEfficient: false, smooth:
+false` for plain 4K HEVC Main-10 L5.1 on silicon with a dedicated HEVC
+block, and the overlay reading "software — this machine has no GPU path
+for this stream". Both macOS browsers sit on VideoToolbox. When both
+misbehave on capable, correctly-configured hardware, the remaining suspect
+is **what the stream declares to VideoToolbox**.
 
-The response shipped the same evening — the **decode-margin rescue**
-([PLAYBACK.md](PLAYBACK.md#the-decode-margin-rescue--routing-around-a-decoder-with-no-headroom)):
-an Auto session on a copy path that measures ≥20 s of playback, ≥4 hitch
-events and a median decode ≥80% of budget switches itself to a transcode at
-position, remembers the limit per `codec@height`, and routes straight to a
-transcode on the next Auto play. Explicit Original always overrides, and a
-clean explicit-Original session clears the memory. This is §8.3's "last
-resort" done the acceptable way: per-client, measured, reversible, and
-saying its numbers out loud.
+And this stream declares Dolby Vision Profile 7 — the dual-layer Blu-ray
+profile that no browser and no Apple device supports. The NAL-level strip
+(§5.0) removed the RPU/EL *data* but left the DOVI configuration **side
+data**, which the muxer writes as a `dvcC` box in the init segment: a
+stream that promises DV P7 and delivers none of it. Chrome mostly ignores
+the box; VideoToolbox honours it, and refusing the hardware path over an
+unsupported-profile declaration is exactly Safari’s observed behaviour.
+
+**Fix shipped:** the DV strip now runs `dovi_rpu=strip=1` ahead of
+`filter_units` (`hevc_copy_bsf`), which removes the RPUs *and* the DOVI
+side data, so nothing remains to write a `dvcC` from and the stream is
+signalled as what it is: plain HDR10. Version-gated on ffmpeg ≥ 7.1
+(production runs jellyfin-ffmpeg 7.1.4; the gate is tested against real
+version lines, and an older ffmpeg falls back to the NAL-only strip rather
+than hard-exiting on an unknown filter). The perf report now fetches the
+live session’s init segment and states outright whether any DV box
+survives — the wire is proven clean or the report says why not.
+
+Also shipped: the detector discloses blindness. Safari’s stutter produced
+an *empty* Hitches row, which read as exoneration but meant
+`requestVideoFrameCallback` never fired — Safari declines it on some
+pipelines. A session that has played 10 s with zero frame callbacks now
+says so on the panel ("faults here are invisible, not absent").
+
+The decode-margin rescue stands, reworded: it triggers on measured zero
+slack *plus* visible hitches, which is the right trigger whichever
+component is eating the reserve, and it never overrides an explicit
+Original. If the dvcC fix restores VideoToolbox’s hardware path, the slack
+reappears, the rescue stops firing, and the remembered limit clears itself
+on the next explicit-Original session.
 
 ### 5.4 Segment length, as mitigation rather than cause
 
@@ -595,11 +629,12 @@ rejected for a reason.
    change with no measured effect.
 2. **Do not raise `SEGMENT_SECONDS` globally.** §5.4. It feeds the cache
    recipe hash and the failover contract.
-3. **Do not route 4K copies to a transcode blindly.** §5.3 turned out to be
-   the cause, so routing IS the answer — but only the measured, per-client,
-   reversible form the rescue implements. A global "4K → transcode" rule
-   would burn GPU for every client with a decoder that copes fine (the TVs
-   do) and throw away the quality the library exists for.
+3. **Do not route 4K copies to a transcode blindly.** The measured,
+   per-client, reversible rescue is the acceptable form: it keys on zero
+   slack plus visible hitches and never overrides an explicit Original. A
+   global "4K → transcode" rule would burn GPU for every client whose
+   pipeline holds a reserve (the TVs do) and throw away the quality the
+   library exists for.
 4. **Do not trust a healthy stats panel.** Every aggregate on it read clean
    through the entire investigation.
 5. **Do not treat a viewer's interval estimate as a measurement.** §2.1.
@@ -608,6 +643,15 @@ rejected for a reason.
    reordered. §6.1.
 7. **Do not add absolute thresholds to per-frame browser metrics.** §7.5.
    Pipeline depth, decoder generation and buffer depth all move them.
+8. **Do not read `processingDuration` as decoder capability.** A median
+   pinned to the frame budget is a cadence-clocked pipeline delivering
+   just-in-time; the number measures slack, and capability claims need
+   context it does not carry. §5.3 shipped that misread for a few hours
+   before an M3 Max corrected it.
+9. **Do not let an empty instrument read as a clean bill.** Safari
+   stuttered with a blank Hitches row because rVFC never fired. Every
+   detector needs a way to say "I observed nothing", and the overlay now
+   has one.
 
 ---
 
