@@ -10,6 +10,21 @@ bump may break compatibility and a **patch** bump never does.
 
 ### Changed
 
+- **plurx cuts the copy path's segments now, not ffmpeg.** On an HEVC or
+  H.264 source, a copy-video HLS session runs ffmpeg with no HLS muxer at
+  all: it writes one continuous fragmented stream and the server decides
+  where the segments end. It ends them only in front of a keyframe a player
+  will not discard a frame at — the leading-picture discard that costs one
+  frame at every ordinary boundary on an open-GOP disc remux. Where a
+  stretch of film offers no such keyframe within 48 MB or 15 s the cut is
+  taken anyway and counted, so the residual is stated rather than hidden;
+  `scripts/gop-census <file>` measures how often that happens on your own
+  library. Nothing about the delivered stream changes otherwise: the same
+  `init.mp4`, the same segment names, the same playlist, and the decoded
+  frames are bit-identical to the unsegmented stream (asserted by
+  `framemd5`, both tracks). A source this reader cannot follow falls back to
+  ffmpeg's own muxer automatically, once, before anything is published — so
+  the worst case is the previous behaviour.
 - **Copy-path segments grew from a 2 s floor to 6 s.** Every segment start
   costs one frame on an open-GOP source — the player treats it as a
   random-access point and discards the leading picture, which was the last

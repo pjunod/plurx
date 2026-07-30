@@ -249,6 +249,14 @@ and delivers it. Full decision logic is [ARCHITECTURE.md](ARCHITECTURE.md) §3.
   one restarts the stream as a transcode with the subtitle drawn into the
   frames. The menu says `burned in` on those, because that restart is a cost
   worth knowing about before you choose between two English tracks.
+- **Copy-video segments are cut where a player loses nothing:** on an HEVC or
+  H.264 copy session, plurx does the segmenting itself and places a boundary
+  only in front of a keyframe with no leading picture to discard — every
+  ordinary boundary on an open-GOP disc remux costs exactly one frame
+  ([STUTTER-4K.md](STUTTER-4K.md) §5.6). Where no such keyframe appears
+  within 48 MB or 15 s the cut is taken anyway and counted; the decoded
+  frames are bit-identical either way, and a stream the reader cannot follow
+  falls back to ffmpeg's own muxer automatically.
 - **A stalled hardware session self-repairs:** if no HLS segment lands within 8 s,
   the session is killed and respawned on software x264 (the concurrent-QSV-stall
   fix). The user sees the loading overlay a little longer, not a gray screen.

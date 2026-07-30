@@ -169,6 +169,16 @@ def log_section(out, logs, cache_settings, srv=None):
     if copies:
         out(f"  {len(copies):4d} × copy-video (source video untouched; audio re-encoded "
             "only if the browser can't take it)")
+        modes = {}
+        for l in copies:
+            modes[field(l, "mode")] = modes.get(field(l, "mode"), 0) + 1
+        for mode, n in sorted(modes.items(), key=lambda kv: -kv[1]):
+            label = {
+                "segmenter": "plurx cuts the segments (GOP-aware)",
+                "legacy": "ffmpeg's HLS muxer cuts the segments",
+                "?": "mode not recorded — server predates the segmenter",
+            }.get(mode, mode)
+            out(f"       {n:4d} × {label}")
 
     # Why a session did not get the graph this node proved. Usually a correct
     # answer — Dolby Vision cannot go through a vendor tone-map — and without
@@ -236,6 +246,42 @@ def log_section(out, logs, cache_settings, srv=None):
                         out("    init segment signals no Dolby Vision — the wire is plain HDR10")
             else:
                 out(f"  (session {sid[:8]} has already gone, so no segment lengths)")
+
+    # What the GOP-aware segmenter did with the cuts it was given.
+    #
+    # A clean cut is one taken in front of a keyframe a player will not discard
+    # a leading picture at, which is the whole reason plurx took the cutting
+    # away from ffmpeg (docs/SEGMENTER-PLAN.md, docs/STUTTER-4K.md §5.6). A
+    # ceiling cut is one taken anyway because no clean point appeared before
+    # the byte or duration limit — it still costs the frame, and printing the
+    # number is the difference between a bounded residual and a hidden one.
+    segruns = [l for l in lines if "copy segmenter: segments" in l]
+    if segruns:
+        out("")
+        out(f"  GOP-aware segmenter: {len(segruns)} finished session(s)")
+        totals = {}
+        for l in segruns:
+            for name in ("segments", "clean cuts", "ceiling cuts", "fragments", "unparseable"):
+                m = re.search(rf"{name} (\d+)", l)
+                if m:
+                    totals[name] = totals.get(name, 0) + int(m.group(1))
+        cuts = totals.get("clean cuts", 0) + totals.get("ceiling cuts", 0)
+        out(f"    segments {totals.get('segments', 0)} · "
+            f"clean cuts {totals.get('clean cuts', 0)} · "
+            f"ceiling cuts {totals.get('ceiling cuts', 0)}"
+            + (f" ({100.0 * totals.get('clean cuts', 0) / cuts:.0f}% clean)" if cuts else ""))
+        if totals.get("ceiling cuts", 0):
+            out("      a ceiling cut is a boundary taken with no clean keyframe in reach")
+            out("      before the 48MB/15s limit — it still costs one dropped frame, which")
+            out("      is the residual `scripts/gop-census <file>` measures per source.")
+        if totals.get("unparseable", 0):
+            out(f"      ⚠ {totals['unparseable']} fragment(s) the classifier could not read;")
+            out("        a cut is never taken in front of one, so these only cost cut sites")
+    fellback = [l for l in lines if "copy segmenter cannot read this stream" in l]
+    if fellback:
+        out(f"    ⚠ {len(fellback)} session(s) fell back to ffmpeg's HLS muxer:")
+        for l in fellback[-3:]:
+            out("      " + l[:200])
 
     downgrades = [l for l in lines if "downgrad" in l.lower() or "falling back" in l.lower()]
     if downgrades:

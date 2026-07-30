@@ -133,17 +133,27 @@ bug: identical file, Chrome kept 4K, Safari dropped to 720p.
 4K HEVC/HDR bitstream, no re-encode — and transcodes only the audio when the
 browser can't take the source codec. It is a remux, packaged as HLS.
 
-**How it's built** (`hls_copy_args` in `plurx-core/src/transcode`, driven by
-`TranscodeManager::start_copy`):
+**How it's built** (`copy_pipe_args` / `hls_copy_args` in
+`plurx-core/src/transcode`, driven by `TranscodeManager::start_copy`):
 
 ```
  ffmpeg -ss <resume> -readrate_initial_burst 90 -readrate 2 -i <file>
         -map 0:v:0 -c:v copy [-tag:v hvc1]        # video untouched; hvc1 so Safari decodes HEVC
         -map 0:a:<n> -c:a aac -b:a 256k           # audio → AAC only when needed (else -c:a copy)
-        -f hls -hls_segment_type fmp4             # fMP4 segments, NOT mpegts
-        -hls_fmp4_init_filename init.mp4          #   (Apple does not carry HEVC in a TS container)
-        -hls_segment_filename seg%05d.m4s
+        -movflags frag_keyframe+empty_moov+…      # one continuous fMP4, one fragment per GOP
+        -f mp4 pipe:1                             #   → plurxd cuts the segments (copyseg)
+                                                  # non-HEVC/H.264 sources keep ffmpeg's HLS muxer
 ```
+
+**Who cuts the segments.** On an HEVC or H.264 source plurx does, not ffmpeg:
+ffmpeg writes one continuous fragmented stream down a pipe and
+[`copyseg`](../crates/plurxd/src/copyseg.rs) publishes a boundary only in front
+of a keyframe a player will not discard a leading picture at, because on an
+open-GOP remux every ordinary boundary costs exactly one frame
+([STUTTER-4K.md](STUTTER-4K.md) §5.6). Everything downstream is unchanged —
+same `init.mp4`, same `segNNNNN.m4s`, same EVENT playlist — and a stream the
+reader cannot follow falls back to ffmpeg's own muxer once, automatically, so
+the worst case is the behaviour above.
 
 Three details, each load-bearing:
 

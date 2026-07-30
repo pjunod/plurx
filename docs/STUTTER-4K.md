@@ -7,7 +7,11 @@ night by the client itself (an M3 Max); the DV P7 signaling fix
 the false declaration disappeared; the residual — one dropped
 frame per segment boundary — is PROVEN segment-triggered (§5.3ter: the
 same bitstream unsegmented plays 1781 frames with zero drops); the copy
-segment floor moved 2 s → 6 s to cut boundary count ~3×; the
+segment floor moved 2 s → 6 s to cut boundary count ~3×, and since
+2026-07-30 plurx cuts the copy path's segments itself, placing a boundary
+only where a player has no leading picture to discard — so the residual is
+now bounded by the source's clean-cut density, which `scripts/gop-census`
+measures (§5.6, [SEGMENTER-PLAN.md](SEGMENTER-PLAN.md)); the
 decode-margin rescue
 ([PLAYBACK.md](PLAYBACK.md#the-decode-margin-rescue--routing-around-a-pipeline-with-no-slack))
 stands as the measured mitigation
@@ -565,6 +569,92 @@ free:** `SEGMENT_SECONDS` is single-sourced in
 cache recipe hash, and is the unit of the cluster failover contract in
 [PHASE3-SPIKE.md](PHASE3-SPIKE.md). A copy-path-only override has to enter
 the recipe hash or cached entries from the two settings will collide.
+
+### 5.6 The GOP-aware segmenter — plurx takes over the cutting
+
+Built 2026-07-30 from [SEGMENTER-PLAN.md](SEGMENTER-PLAN.md). §5.3ter left one
+residual and named its only true fix: a segmenter that cuts exclusively at
+points a player finds nothing to discard at. That is now what runs.
+
+**What changed.** A copy session on an HEVC or H.264 source no longer uses
+ffmpeg's HLS muxer at all. ffmpeg writes one continuous fragmented MP4 down a
+pipe — `frag_keyframe` puts one fragment per GOP on the wire — and
+[`copyseg`](../crates/plurxd/src/copyseg.rs) reads it, classifies each
+fragment's opening keyframe, merges consecutive fragments, and publishes a
+segment boundary **only in front of a clean one**:
+
+```
+ fragment opens on …                          verdict
+ ─────────────────────────────────────────    ───────
+ IDR (HEVC NAL 19/20, H.264 NAL 5)            CLEAN — nothing can lead it
+ CRA/BLA (NAL 16-18, 21), no sample in the    CLEAN — nothing to discard
+   fragment presenting before its first
+ CRA/BLA with a leading picture               DIRTY — a cut here costs a frame
+ anything unparseable                         DIRTY, and counted
+```
+
+The cut rule, in full: past the `COPY_SEGMENT_SECONDS` floor **and** the next
+fragment is clean → cut. Otherwise keep accumulating, up to
+`COPY_SEGMENT_MAX_BYTES` (48 MB, half the byte-budgeted forward buffer so MSE
+still holds two segments) or `COPY_SEGMENT_MAX_SECS` (15 s, so
+`EXT-X-TARGETDURATION` can be declared up front and never has to decrease).
+Reaching either ceiling with no clean point in sight takes the cut anyway —
+**a ceiling cut**, which still costs the leading picture and is counted as
+such in the session's closing log line and in
+[`scripts/perf-report`](../scripts/perf-report).
+
+**What it does not change.** Same `init.mp4` (the pipe's `ftyp`+`moov`,
+verbatim), same `segNNNNN.m4s` from zero, same EVENT playlist, same
+tmp-then-rename. The segment index, the ahead-window suspend, the
+behind-playhead GC and the serving layer all read the playlist and never
+learned anything happened. No player-side change of any kind.
+
+**The proof it is a byte mover, not a transcode.** `framemd5` of `init.mp4`
+plus every published segment is identical to `framemd5` of the continuous
+stream they were cut from, on the video and the audio track both — and
+`framemd5` prints a hash per frame *with* its pts and duration, so a
+reordered, retimed, dropped or duplicated frame all fail it. Asserted in CI
+(`cargo test -p plurx-core fmp4::merge`) and re-run against the browser
+harness's real session output (1152 video frames, 2401 audio frames,
+identical). Consecutive segments join at exactly zero ticks on both tracks —
+the 0.977 ms overlap of §3.9 is not merely gone, it is asserted against in
+integer sample units.
+
+**End to end, in this container.** VP9 has no leading pictures, so the
+*discard* cannot be reproduced here; what the browser run proves is the
+serving contract. A 48 s VP9+Opus session cut by the segmenter, served
+statically, played by the repo's own `hls.min.js` in headless Chromium with
+`armHitchDetector` extracted from `index.html`: 40 s played, ~965 frames,
+`back=held=drop=gap=0`, no hls.js fatal, zero `droppedVideoFrames`, realized
+rate 0.999. The same run against ffmpeg's own hlsenc output scores identically
+— which is the point: on a codec with nothing to discard the two are
+equivalent, so the segmenter has not introduced anything of its own.
+
+One incidental finding from that comparison. On the same source our playlist's
+`EXTINF` sums to 47.999000 s against the container's own 47.999000 s, while
+hlsenc's sums to 47.904 s — 95 ms, or 2.3 frames, short. `EXTINF` here is
+summed video sample durations in the video timescale, so it is exact by
+construction rather than by luck.
+
+**What it is worth is a property of the source, and there is an instrument.**
+Clean-cut density is decided by whoever encoded the disc, and no synthetic
+fixture can answer it — a file full of x265 test patterns has whatever GOP the
+test asked for. `scripts/gop-census <file>` runs the production pipe command
+against a real library file and reports fragments, clean/dirty counts, the gaps
+between clean points, and what percentage of cuts would be clean at the shipped
+floor and ceiling. On the repeat-headers open-GOP fixture built to match a
+remux it reports 18 fragments, 1 IDR, 17 dirty: a source that gains nothing,
+correctly, and says so. **Run it against the real library before believing any
+number in this section applies there.**
+
+**The residual, restated honestly.** §5.3ter's one discard per ~6 s is now one
+discard per *ceiling cut*, and a ceiling cut happens only where a stretch of
+film offers no clean keyframe within 48 MB or 15 s. Where clean points exist,
+the drop is gone. Where they do not, this is exactly the old behaviour with a
+counter attached. There is no case where it is worse: a misclassification costs
+a boundary that could have been cleaner, never a frame that would have
+survived, and a stream this reader cannot follow falls back to ffmpeg's muxer
+once, automatically, before anything is published.
 
 ---
 
