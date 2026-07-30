@@ -211,3 +211,48 @@ pub fn pipe(kind: &str) -> Vec<u8> {
 pub fn pipe_path(kind: &str) -> PathBuf {
     fixture_dir().join(format!("{kind}.pipe.mp4"))
 }
+
+/// The `open-gop` source with chapters attached.
+///
+/// Every disc remux has chapters and no `lavfi` fixture does, which is exactly
+/// how a chapter track reached production unnoticed: ffmpeg's mp4 muxer turns
+/// chapters into a QuickTime `text` track plus a `chpl` box, so the segmenter's
+/// pipe carried a third track its predecessor never did, and Safari refused the
+/// stream. Anything comparing the two muxers has to be asked on a source that
+/// has them.
+pub fn source_with_chapters() -> PathBuf {
+    let src = source("open-gop");
+    let dir = fixture_dir();
+    let path = dir.join("chaptered.mkv");
+    let _guard = FIXTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if path.exists() {
+        return path;
+    }
+    let meta = dir.join("chapters.ffmeta");
+    // Built line by line rather than as one continued literal: ffmetadata
+    // rejects a section header with leading whitespace, and Rust's `\`
+    // continuation keeps the source indentation inside the string.
+    let mut chapters = String::from(";FFMETADATA1\n");
+    for (i, (start, end)) in [(0, 4000), (4000, 8000), (8000, 12_000)]
+        .into_iter()
+        .enumerate()
+    {
+        chapters.push_str("[CHAPTER]\n");
+        chapters.push_str("TIMEBASE=1/1000\n");
+        chapters.push_str(&format!("START={start}\n"));
+        chapters.push_str(&format!("END={end}\n"));
+        chapters.push_str(&format!("title=Chapter {}\n", i + 1));
+    }
+    std::fs::write(&meta, chapters).expect("writing the chapter metadata");
+    let tmp = dir.join("chaptered.mkv.tmp");
+    run(Command::new(ffmpeg())
+        .args(["-y", "-v", "error", "-i"])
+        .arg(&src)
+        .arg("-i")
+        .arg(&meta)
+        .args(["-map_metadata", "1", "-map", "0", "-c", "copy"])
+        .args(["-f", "matroska"])
+        .arg(&tmp));
+    std::fs::rename(&tmp, &path).expect("publishing the chaptered fixture");
+    path
+}

@@ -22,7 +22,9 @@
 
 use std::path::PathBuf;
 
-use plurx_core::fmp4::{self, FragmentReader, Init, Published, SegmentCounts, Segmenter, Unit};
+use plurx_core::fmp4::{
+    self, FragmentReader, Init, Published, SegmentCounts, Segmenter, TrackKind, Unit,
+};
 use plurx_core::transcode::{COPY_SEGMENT_MAX_BYTES, COPY_SEGMENT_MAX_SECS, COPY_SEGMENT_SECONDS};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
@@ -217,6 +219,21 @@ pub async fn run<R: AsyncRead + Unpin>(
                         return Outcome::Unsupported(
                             "the video track carries no hvcC/avcC to read keyframes with".into(),
                         );
+                    }
+                    // A copy session maps exactly one video stream and at most
+                    // one audio stream, so anything else in the `moov` is
+                    // something ffmpeg added on its own — a chapter `text`
+                    // track is what it was the first time, and Safari refused
+                    // the stream over it while Chrome played on. Falling back
+                    // is the right answer to a shape this path did not ask
+                    // for: the legacy muxer's output is known to be playable,
+                    // and a warning names what appeared.
+                    if let Some(odd) = init.tracks.iter().find(|t| t.kind == TrackKind::Other) {
+                        return Outcome::Unsupported(format!(
+                            "the pipe declared a track this path never asked for \
+                             (id {}, timescale {})",
+                            odd.id, odd.timescale
+                        ));
                     }
                     let policy = fmp4::CutPolicy::new(
                         limits.floor_seconds,
@@ -538,6 +555,58 @@ mod tests {
             matches!(outcome, Outcome::Unsupported(_)),
             "a broken moov did not ask for the fallback: {outcome:?}"
         );
+        assert!(!dir.path().join("index.m3u8").exists());
+    }
+
+    /// A chapter track in the init is the shape that broke Safari. Even with
+    /// `-map_chapters -1` shutting it off at the source, a stream that somehow
+    /// arrives carrying one must go to the legacy muxer rather than to a
+    /// player: that output is known to be playable, and this one is known not
+    /// to be.
+    #[tokio::test]
+    async fn a_track_this_path_never_asked_for_takes_the_fallback() {
+        let src = plurx_core::testfixtures::source_with_chapters();
+        // The pipe command WITHOUT the chapter strip — what shipped, and what
+        // Safari refused.
+        let out = std::process::Command::new(plurx_core::testfixtures::ffmpeg())
+            .args(["-hide_banner", "-loglevel", "error", "-i"])
+            .arg(&src)
+            .args(["-map", "0:v:0", "-map", "0:a:0?", "-sn", "-c:v", "copy"])
+            .args([
+                "-tag:v",
+                "hvc1",
+                "-bsf:v",
+                "filter_units=remove_types=32-34",
+            ])
+            .args([
+                "-c:a",
+                "aac",
+                "-b:a",
+                "256k",
+                "-avoid_negative_ts",
+                "make_zero",
+            ])
+            .args([
+                "-movflags",
+                "frag_keyframe+empty_moov+default_base_moof+delay_moov",
+            ])
+            .args(["-f", "mp4", "pipe:1"])
+            .output()
+            .expect("ffmpeg");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outcome = run(&out.stdout[..], dir.path().to_path_buf(), "test", brisk()).await;
+        match outcome {
+            Outcome::Unsupported(reason) => {
+                assert!(reason.contains("never asked for"), "{reason}");
+            }
+            other => panic!("a chapter track was served to a player: {other:?}"),
+        }
         assert!(!dir.path().join("index.m3u8").exists());
     }
 

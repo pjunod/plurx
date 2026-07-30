@@ -2761,6 +2761,117 @@ mod tests {
         );
     }
 
+    /// The golden comparison SEGMENTER-PLAN §8.4 asked for, and the one that
+    /// would have caught the bug that reached production: run BOTH muxers on
+    /// the same source and require them to declare the same tracks.
+    ///
+    /// On a source with chapters — which every disc remux has and no `lavfi`
+    /// fixture did — ffmpeg's plain mp4 muxer writes them as a QuickTime `text`
+    /// track plus a `chpl` box, with `tref` links from the real tracks. Its HLS
+    /// muxer does not. So the segmenter's stream carried a third track nothing
+    /// asked for, in the init and in every fragment; Safari refused it outright
+    /// and the player's error fallback re-encoded a 4K remux to 1080p, while
+    /// Chrome ignored the extra track and played fine.
+    ///
+    /// The assertion is deliberately "the same as the muxer we replaced" rather
+    /// than "video and audio only": the whole promise of this path is that the
+    /// only thing a player sees differently is where the boundaries fall.
+    #[test]
+    fn the_pipe_declares_the_same_tracks_as_the_hls_muxer() {
+        use crate::domain::MediaFile;
+        use crate::testfixtures::source_with_chapters;
+        use crate::transcode::{copy_pipe_args, hls_copy_args, Pacing};
+
+        let src = source_with_chapters();
+        // The chapters really are in the source, or this test proves nothing.
+        let probe = run(Command::new(ffprobe())
+            .args(["-v", "error", "-show_chapters", "-of", "csv=p=0"])
+            .arg(&src));
+        assert!(
+            String::from_utf8_lossy(&probe).lines().count() >= 3,
+            "the fixture lost its chapters"
+        );
+
+        let file = MediaFile {
+            id: 1,
+            item_id: 1,
+            path: src.clone(),
+            size: 1,
+            mtime: 1,
+            duration_ms: Some(12_000),
+            container: Some("mkv".into()),
+            video_codec: Some("hevc".into()),
+            video_profile: Some("Main".into()),
+            width: Some(640),
+            height: Some(360),
+            bit_depth: Some(8),
+            hdr: None,
+            hdr_format: None,
+            bitrate: Some(1_000_000),
+            audio_streams: vec![],
+            subtitle_streams: vec![],
+            scanned_at: 1,
+            audio_offset_ms: 0,
+            probed: true,
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out_dir = dir.path().to_string_lossy().into_owned();
+
+        // What the segmenter reads.
+        let pipe_bytes = run(Command::new(ffmpeg()).args(copy_pipe_args(
+            &file,
+            0.0,
+            None,
+            true,
+            Pacing::unpaced(),
+            false,
+        )));
+        let mut reader = FragmentReader::new();
+        reader.push(&pipe_bytes);
+        let Ok(Some(Unit::Init(ours))) = reader.next_unit() else {
+            panic!("the pipe produced no init");
+        };
+
+        // What ffmpeg's own HLS muxer writes for the same session.
+        run(Command::new(ffmpeg()).args(hls_copy_args(
+            &file,
+            0.0,
+            None,
+            true,
+            Pacing::unpaced(),
+            false,
+            &out_dir,
+        )));
+        let their_init = std::fs::read(dir.path().join("init.mp4")).expect("hlsenc init.mp4");
+        let mut reader = FragmentReader::new();
+        reader.push(&their_init);
+        let Ok(Some(Unit::Init(theirs))) = reader.next_unit() else {
+            panic!("the hls muxer produced no init");
+        };
+
+        // Track KINDS, in order — not timescales. Each muxer picks its own
+        // (16000 here against hlsenc's 12288) and every duration in its own
+        // stream is consistent with it, so a timescale difference is not a
+        // divergence a player can see. A track that exists on one side and
+        // not the other is.
+        let shape = |i: &Init| -> Vec<TrackKind> { i.tracks.iter().map(|t| t.kind).collect() };
+        assert_eq!(
+            shape(&ours),
+            shape(&theirs),
+            "the pipe declares tracks the HLS muxer does not — a chapter or \
+             data track reaching a player is what broke Safari"
+        );
+        assert!(
+            ours.tracks.iter().all(|t| t.timescale > 0),
+            "a track with no timescale"
+        );
+        assert!(
+            !ours.tracks.iter().any(|t| t.kind == TrackKind::Other),
+            "a non-media track in the init: {:?}",
+            ours.tracks.iter().map(|t| t.kind).collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn merging_nothing_is_an_error_not_an_empty_segment() {
         let feed = pipe("open-gop");

@@ -758,6 +758,22 @@ fn copy_input_args(
     };
 
     // Copy the video untouched; map the chosen (or first) audio; drop subs.
+    //
+    // And drop CHAPTERS, which `-map` does not govern. ffmpeg's mp4 muxer
+    // writes a source's chapters as a QuickTime `text` track plus a `chpl`
+    // box, with `tref` links from the real tracks — a third track, in the
+    // init and in every fragment, that nothing asked for. ffmpeg's own HLS
+    // muxer never carried it, so the copy path never had it; the segmenter
+    // reads a plain `-f mp4` pipe, which does. Safari refused the resulting
+    // stream outright (`MEDIA_ERR_DECODE`, 708 ms in) and the player's error
+    // fallback re-encoded a 4K remux down to 1080p. Chrome ignored the extra
+    // track entirely, which is why only real hardware found it — and every
+    // disc remux has chapters while no synthetic fixture does.
+    //
+    // Nothing is lost: plurx serves chapter markers from ffprobe at playback
+    // start (ARCHITECTURE §7 decision 6), never from the media stream.
+    args.push("-map_chapters".into());
+    args.push("-1".into());
     args.push("-map".into());
     args.push("0:v:0".into());
     args.push("-map".into());

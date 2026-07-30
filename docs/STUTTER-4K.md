@@ -650,10 +650,34 @@ that every sample writes its own duration, size and flags where ffmpeg leans
 on `tfhd` defaults — a density choice, and the most-exercised encoding in any
 MP4 parser.
 
-The lesson worth keeping: "optional in the spec, and one player ignores it"
-is not evidence that another player does. The bytes a browser sees should
-differ from the muxer being replaced only in the thing being changed — here,
-where the boundaries fall.
+**And the segments carry only the tracks the session asked for — the actual
+bug.** Closing the two structural divergences above did not fix Safari, and
+the reason was in the init rather than the segments. ffmpeg's mp4 muxer turns
+a source's chapters into a QuickTime `text` track plus a `chpl` box, with
+`tref` links from the real tracks; its HLS muxer does not. So the segmenter's
+pipe declared and carried a **third track** nothing asked for. Safari refused
+the stream — `MEDIA_ERR_DECODE`, 708 ms in, `stream_rejected` in the log —
+and the error fallback re-encoded a 4K remux to 1080p. Chrome ignored the
+extra track and played on.
+
+`-map_chapters -1` on the copy path stops it at the source (chapters reach
+the player from ffprobe at playback start, never from the media stream), and
+an init that declares a non-media track now takes the legacy fallback rather
+than reaching a player at all.
+
+Why nothing here caught it: **every disc remux has chapters and no `lavfi`
+fixture does.** The suite is built from synthetic sources, and this is the
+class of difference synthetic sources cannot have. The test that exists now
+runs BOTH muxers on a chaptered fixture and requires them to declare the same
+tracks — the golden comparison SEGMENTER-PLAN §8.4 asked for, which would
+have caught this before it shipped and which was the one milestone check
+skipped.
+
+The lesson worth keeping, twice over: "optional in the spec, and one player
+ignores it" is not evidence that another player does — and the bytes a browser
+sees should differ from the muxer being replaced **only** in the thing being
+changed. Both failures were the same mistake: a difference introduced without
+being noticed, in a stream whose whole promise was that one thing changed.
 
 **The proof it is a byte mover, not a transcode.** `framemd5` of `init.mp4`
 plus every published segment is identical to `framemd5` of the continuous
