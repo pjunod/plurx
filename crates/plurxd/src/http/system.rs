@@ -21,6 +21,8 @@ pub struct ServerInfo {
     pub version: &'static str,
     /// Git description of the exact build ("v0.1.0-14-gc0ffee"), for support.
     pub build: &'static str,
+    /// Compile time, always present — the fallback when `build` is "unknown".
+    pub built_at: &'static str,
     pub instance_id: String,
     pub uptime_seconds: u64,
     /// True when no users exist yet — the web app shows first-run setup.
@@ -39,6 +41,7 @@ pub async fn server_info(State(state): State<AppState>) -> Result<Json<ServerInf
         name: state.server_name.clone(),
         version: crate::version::SEMVER,
         build: crate::version::BUILD,
+        built_at: crate::version::BUILT_AT,
         instance_id,
         uptime_seconds: state.started_at.elapsed().as_secs(),
         setup_required,
@@ -89,6 +92,7 @@ pub struct SystemDto {
     pub name: String,
     pub version: &'static str,
     pub build: &'static str,
+    pub built_at: &'static str,
     pub instance_id: String,
     pub uptime_seconds: u64,
     pub users: i64,
@@ -154,6 +158,7 @@ pub async fn system_info(
         name: state.server_name.clone(),
         version: crate::version::SEMVER,
         build: crate::version::BUILD,
+        built_at: crate::version::BUILT_AT,
         instance_id: state.store.instance_id().await?,
         uptime_seconds: state.started_at.elapsed().as_secs(),
         users: state.store.count_users().await?,

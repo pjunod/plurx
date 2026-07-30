@@ -44,12 +44,17 @@ services:
       dockerfile: Dockerfile
       args:
         # Which commit this image is. `.git` is deliberately outside the build
-        # context, so the build script cannot work it out for itself and every
-        # image ends up stamped "unknown" — which makes "did my deploy land?"
-        # unanswerable from inside the product, exactly when it matters most.
-        # Empty is still honest; the deploy tooling sets it:
-        #   PLURX_BUILD_REF=$(git describe --tags --always --dirty) \
-        #     docker compose up -d --build
+        # context, so the build script cannot work it out for itself and a
+        # bare `docker compose up -d --build` produces an image stamped
+        # "unknown" — which makes "did my deploy land?" unanswerable from
+        # inside the product, exactly when it matters most.
+        #
+        # **Use `make deploy` from the repo root**, which is this command with
+        # the variable already set. Relying on a human to type it was tried and
+        # it does not work: nobody remembers, nothing complains, and the System
+        # page reads "(unstamped build)" for weeks. An image built without it
+        # still reports its compile time, which at least tells one deploy from
+        # the next.
         PLURX_BUILD_REF: ${PLURX_BUILD_REF:-}
     image: plurx/plurxd:latest
     container_name: plurxd

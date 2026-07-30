@@ -4615,6 +4615,18 @@ function updateStats(){
   const durTxt = PLAYER.durMs? ' / '+clockFromSec(PLAYER.durMs/1000):'';
   body.innerHTML=
     `<div class="sechd">Playback</div>`+
+    // **Which build this is, in the place people photograph.**
+    //
+    // It lives on the admin-only System page and nowhere else, so the answer to
+    // "is my fix running?" was behind a login, two clicks away from the thing
+    // being tested, and absent from every screenshot anybody has ever sent.
+    // Three separate debugging sessions have stalled on me asking which build
+    // was running and being told, reasonably, that nobody knew.
+    //
+    // The page and the binary are the same artifact — index.html is
+    // `include_str!`-embedded — so the server's stamp is also this UI's stamp.
+    // That is what makes one line able to answer for both.
+    `<div><b>Build</b><span class="muted">${esc(buildLabel())}</span></div>`+
     `<div><b>Method</b>${esc(method)}</div>`+
     // Said outright, because the two transports are different code paths in
     // the browser and "which one ran" was previously only inferable from
@@ -5251,9 +5263,26 @@ function usersPanel(users){
 function buildTag(sys){
   const b=sys.build;
   if(!b || b==="unknown")
-    return ` <span class="muted" style="font-size:12px" title="Built without PLURX_BUILD_REF, so the image cannot say which commit it is. The deploy sets it: PLURX_BUILD_REF=$(git describe --tags --always --dirty) docker compose up -d --build">(unstamped build)</span>`;
+    return ` <span class="muted" style="font-size:12px" title="Built from a context with no .git and no PLURX_BUILD_REF, so the image cannot name its commit — the build time below is the next best thing. Deploy with 'make deploy', which stamps it.">(unstamped · built ${esc(builtAtLabel(sys.built_at))})</span>`;
   if(b==="v"+sys.version || b===sys.version) return "";
   return ` <span class="muted" style="font-size:12px">(${esc(b)})</span>`;
+}
+// The compile timestamp, shortened for a UI: the date is what distinguishes
+// one deploy from another, the seconds never are.
+function builtAtLabel(s){
+  if(!s) return "unknown";
+  const m=/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(s);
+  return m? `${m[3]} ${["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][+m[2]-1]} ${m[4]}:${m[5]}Z` : s;
+}
+// One string that answers "which build am I looking at". Prefers the commit,
+// falls back to when it was compiled — because "unknown" cannot answer the
+// only question anybody asks this for, and a build time can.
+function buildLabel(){
+  const s=SERVER||{};
+  const v=s.version||"?";
+  const b=s.build;
+  if(b && b!=="unknown" && b!=="v"+v && b!==v) return `${v} · ${b}`;
+  return `${v} · built ${builtAtLabel(s.built_at)}`;
 }
 // What the boot probe found out about tone-mapping HDR on this machine.
 //

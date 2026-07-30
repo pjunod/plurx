@@ -885,6 +885,30 @@ unstamped build says so. Deploys supply it with
 `PLURX_BUILD_REF=$(git describe --tags --always --dirty)`; the Ansible
 playbook computes it per host.
 
+> **This did not hold, and the reason is worth keeping.** 2026-07-30, mid-way
+> through a debugging session that had already stalled twice on "which build
+> are you running?": the System page read `plurx · cinemarr 0.2.0 (unstamped
+> build)`. Forwarding the argument was necessary and not sufficient — the fix
+> ended at *documenting* that deploys must set a variable, which puts the work
+> on a human remembering it every single time and fails silently when they
+> don't. Nobody remembered. That is not a deployment mistake, it is a design
+> that had a required manual step and no way to notice its absence.
+>
+> Three changes, in order of how much they matter:
+>
+> 1. **`make deploy`** — the deploy is one command that sets the variable
+>    itself. Every doc that said `docker compose up -d --build` now says this.
+>    The correct thing is the easy thing; nothing has to be remembered.
+> 2. **An unstamped build reports its compile time** (`version::BUILT_AT`,
+>    stamped unconditionally by `build.rs`). It cannot name the commit, but
+>    "did my change land?" is answerable from a timestamp and unanswerable from
+>    the word `unknown`.
+> 3. **The build is on the stats overlay**, first row under Playback. It was on
+>    the admin-only System page — behind a login, two clicks from the thing
+>    being tested, and absent from every screenshot anyone has ever sent. The
+>    page and the binary are the same artifact (`include_str!`), so one line
+>    answers for both.
+
 ### 7.5 `9a9179b` — `slow` measured pipeline depth, not health
 
 The original threshold was "`processingDuration` over 40 ms", which reported

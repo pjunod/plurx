@@ -66,6 +66,25 @@ version: ## Print the version and git build stamp a build would report
 docker: ## Build the container image
 	docker build --build-arg PLURX_BUILD_REF="$(BUILD_REF)" -t plurx/plurxd:latest .
 
+# The deploy, as one command that cannot forget the stamp.
+#
+# `docker compose up -d --build` is what every doc told people to run, and it
+# leaves PLURX_BUILD_REF empty — `.git` is outside the build context, so the
+# image comes out stamped "unknown" and the running server cannot say which
+# commit it is. That was "fixed" once, by teaching compose to forward the
+# variable and documenting that deploys must set it. That is not a fix: it
+# moves the work onto a human remembering an environment variable every single
+# time, and the failure is silent. Nobody remembered, and the System page read
+# "(unstamped build)" for weeks of daily deploys.
+#
+# So make the correct thing the easy thing. This is the deploy command now, and
+# the docs point here rather than at a variable to remember.
+.PHONY: deploy
+deploy: ## Build and (re)start the container stack, stamped with this commit
+	PLURX_BUILD_REF="$(BUILD_REF)" \
+	  docker compose -f deploy/docker-compose.yml up -d --build
+	@echo "deployed $(VERSION) ($(BUILD_REF))"
+
 .PHONY: release-check
 release-check: ## Verify the tree is ready to tag the current version
 	@test -z "$$(git status --porcelain)" || { echo "working tree is dirty — commit first"; exit 1; }

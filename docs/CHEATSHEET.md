@@ -11,7 +11,7 @@ needed.
 # 1. Start the server (pick one)
 cd deploy && cp docker-compose.override.example.yml docker-compose.override.yml
 $EDITOR docker-compose.override.yml         # set your media mounts (host:container:ro) + GPU
-docker compose up -d --build                # builds from source the first time
+cd .. && make deploy                        # builds from source; stamps the commit
 # ...or bare metal / dev:
 cargo run -p plurxd                          # serves http://localhost:32400
 

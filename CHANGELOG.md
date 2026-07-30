@@ -102,6 +102,22 @@ bump may break compatibility and a **patch** bump never does.
   capped at 12 MB rather than 32 MB: a seek starts a fresh session on this
   path, so the back buffer buys a second or two of scrubbing and was otherwise
   a fifth of the budget spent on video nobody would watch again.
+- **The server could not say which build it was running — again.** `.git` sits
+  outside the Docker build context, so the image can only name its commit if
+  the deploy passes `PLURX_BUILD_REF`. That was previously "fixed" by having
+  Compose forward the variable and documenting that deploys must set it, which
+  put the work on a human remembering an environment variable every time and
+  failed silently when they didn't. Nobody did: the System page read
+  `0.2.0 (unstamped build)` for weeks of daily deploys, and three debugging
+  sessions stalled on nobody being able to say what was running.
+
+  `make deploy` is now the deploy — one command that stamps the commit itself,
+  and every doc points at it instead of at a variable to remember. A build that
+  still ends up unstamped reports its **compile time** instead of the word
+  "unknown", because "did my change land?" is answerable from a timestamp. And
+  the build is now the first row of the player's stats overlay, where it can be
+  read without an admin login and appears in any screenshot — the page and the
+  binary are the same artifact, so one line answers for both.
 - **The decode rescue was firing on a number that condemns every stream.** It
   switched an Auto session off the original when the measured decode figure
   reached 80% of the frame budget and a few hitches had been seen. That figure

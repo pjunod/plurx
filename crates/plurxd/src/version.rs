@@ -21,6 +21,16 @@ pub const SEMVER: &str = env!("CARGO_PKG_VERSION");
 /// that have no `.git`.
 pub const BUILD: &str = env!("PLURX_BUILD");
 
+/// When this binary was compiled, `YYYY-MM-DDTHH:MM:SSZ`. Always present, even
+/// when [`BUILD`] is `unknown`.
+///
+/// A container built from a context with no `.git` and no `PLURX_BUILD_REF`
+/// cannot say *which* commit it is — but it can always say it is not
+/// yesterday's, and "did my change land?" is the question somebody who just
+/// deployed is actually asking. `unknown` alone could not answer it, which is
+/// how the System page read `plurx 0.1.0` through weeks of daily deploys.
+pub const BUILT_AT: &str = env!("PLURX_BUILT_AT");
+
 /// Both, for `--version` and the startup log: `0.1.0 (v0.1.0-14-gc0ffee)`.
 pub const LONG: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("PLURX_BUILD"), ")");
 
