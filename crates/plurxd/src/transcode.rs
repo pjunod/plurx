@@ -2587,8 +2587,10 @@ impl TranscodeManager {
         // for the session's life, and it owns the one fallback: a stream it
         // cannot follow is killed and respawned on ffmpeg's HLS muxer, in this
         // same session, so the player never learns anything happened. Only
-        // before the first segment — once a timeline exists on disk, a
-        // respawn would rewrite one a player is already holding.
+        // while the playlist is unpublished — once it is out, a respawn would
+        // rewrite a timeline a player may already be holding. (The publish
+        // gate keeps that window open through the first few segments: files
+        // nothing was ever told about are cleared and recut, not a timeline.)
         if let Some(stdout) = pipe_stdout {
             let session = Arc::clone(&session);
             let sid = session_id.clone();
@@ -2739,10 +2741,19 @@ impl TranscodeManager {
     pub async fn playlist(&self, session_id: &str) -> Option<Vec<u8>> {
         let session = self.touch(session_id).await?;
         let path = session.dir.join("index.m3u8");
-        // The playlist appears a beat after ffmpeg starts; wait briefly. A failed
-        // session returns None → 404 → the player reports an error rather than
-        // polling a segment-less playlist on a gray screen forever.
-        for _ in 0..100 {
+        // Hold the request until the playlist exists. On the transcode path
+        // that is a beat after ffmpeg starts; on the copy path it is the
+        // publish gate filling (COPY_PUBLISH_GATE_SEGMENTS), which on a
+        // NAS-bound 4K remux is production time in the double-digit seconds —
+        // so the window is 30 s, not a beat. Holding beats 404ing because the
+        // client's patience is asymmetric, verified against the vendored
+        // hls.js: a slow first byte is waited on indefinitely
+        // (manifestLoadPolicy.maxTimeToFirstByteMs: Infinity, 20 s per
+        // attempt, two timeout retries), while a 404 spends one of a single
+        // error retry. A failed session still returns None immediately → 404
+        // → the player reports an error rather than polling a segment-less
+        // playlist on a gray screen forever.
+        for _ in 0..300 {
             if session.failed.load(Relaxed) {
                 return None;
             }

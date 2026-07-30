@@ -778,6 +778,77 @@ a boundary that could have been cleaner, never a frame that would have
 survived, and a stream this reader cannot follow falls back to ffmpeg's muxer
 once, automatically, before anything is published.
 
+### 5.7 The once-per-film freeze — the client was starting at the live edge
+
+Reported the day the segmenter shipped, on the reference file itself: *Wicked*
+in Chrome froze for 8.8 seconds at 9.2 seconds in, deterministically, every
+play. Safari saw the same event as a 597 ms hiccup. Every buffer number either
+side of the freeze was healthy — 137 Mb/s delivered, 7.6 s held against a 7 s
+target — which is why a day of buffer work never touched it.
+
+**The wrong lever, and the experiment that exposed it.** The first diagnosis
+read the freeze as a segment-size problem: a segment is invisible until it is
+cut, the client's forward buffer is quota-bound to ~7 s at this bitrate, so a
+15 s publication step cannot hide inside it — bring the ceiling down to 6 s.
+The fix *worked* in the way that indicts it: the freeze moved from 9.2 s in to
+6.0 s in and shrank from 8.8 s to 5.5 s — one segment's production time,
+before and after, in both browsers. The freeze tracks the segment size all
+the way down. Shrinking segments approaches zero freeze asymptotically,
+trading permanent boundary drops on every low-bitrate source for a shorter
+version of the same stall.
+
+**The right reading.** Delivery to the client ran at 428 Mb/s against a
+69 Mb/s source read off the NAS at not much over real time. A player whose
+first playlist begins at the live edge therefore drains everything published
+within seconds and is then pinned to the producer's publication rate,
+advancing in one-segment steps. The first publication it has to wait out
+whole *is* the freeze, and its length is exactly one segment's production
+time. It happens once per film because the stall itself hands the producer a
+free segment of lead, and always at the same second because where the drain
+completes is a property of the film's opening bitrate, not of timing. No
+segment size fixes "the client is standing at the edge"; the only fix is for
+it never to stand there.
+
+**The fix: a publish gate.** `copyseg` now withholds `index.m3u8` until three
+segments exist (`COPY_PUBLISH_GATE_SEGMENTS`) — segments land on disk from
+the start; the *announcement* waits. The first playlist a player loads
+already lists ≥ 14 s of media (2 s opener + two floor-or-better segments), a
+cushion deeper than the worst publication gap measured (8.8 s), so the client
+starts behind the edge and never reaches it: every later segment adds lead
+faster than playback spends it. The cushion lives on the server —
+`bufferTargets` and the MSE quota budget are untouched; the client simply
+always has published-but-unfetched segments in front of it. Three interlocks
+make it safe:
+
+- **`Manager::playlist` holds the request** (up to 30 s, was 10) instead of
+  404ing while the gate fills. Verified against the vendored hls.js rather
+  than assumed (§9's process rule): `manifestLoadPolicy` waits *indefinitely*
+  for the manifest's first byte (`maxTimeToFirstByteMs: Infinity`, 20 s per
+  attempt, two timeout retries) but forgives only one 404. Holding is the
+  side the client is patient with.
+- **End of stream opens the gate unconditionally** — a film shorter than the
+  cushion publishes whole, `ENDLIST` and all, as plain VOD.
+- **No suspension deadlock by construction**: the ahead-window reads the
+  playlist to learn what is produced, so a held playlist means ahead = 0 and
+  the producer is never SIGSTOPped while filling the gate.
+
+And one door widened: the legacy-muxer fallback now stays available until the
+playlist is published, not until the first segment lands. Segments no player
+has ever been told about are not a timeline anyone holds — the respawn clears
+the directory and recuts, and the viewer never learns anything happened.
+
+**The cost, honestly.** Time-to-first-frame rises by the cushion's production
+time: a second or two on any file the NAS reads faster than it plays, up to
+the cushion itself (~13–15 s) on a NAS-bound 4K remux — the reference file is
+the worst case of its own fix. That is a spinner at open, once, priced
+against a mid-scene freeze at a second the film chose, every single play.
+
+**And the ceiling went back up.** `COPY_SEGMENT_MAX_SECS` 6 → 15 and the
+floor 4 → 6, reverting the wrong lever: with the gate in place the shrink
+bought nothing and cost boundaries — each one a dropped frame on an open-GOP
+disc — on every source quiet enough for the duration ceiling to bind. §5.6's
+cut-rule numbers stand as written again.
+
 ---
 
 ## 6. The harnesses

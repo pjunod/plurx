@@ -71,13 +71,7 @@ pub const SEGMENT_SECONDS: u32 = 2;
 /// Safe to diverge from [`SEGMENT_SECONDS`]: copy sessions are live-only —
 /// never cached (no recipe hash to collide with) and outside the Phase 3
 /// failover contract, which is about transcode sessions.
-/// Lowered from 6 s when [`COPY_SEGMENT_MAX_SECS`] came down to 6: the floor
-/// GATES the ceilings (`CutPolicy::cut_before` refuses any cut below it), so a
-/// floor equal to the ceiling leaves a zero-width window to hunt for a clean
-/// cut in and turns the segmenter back into a fixed grid. Four gives it two
-/// seconds of hunting room against a GOP grid that offers a clean point every
-/// couple of seconds on the reference disc.
-pub const COPY_SEGMENT_SECONDS: u32 = 4;
+pub const COPY_SEGMENT_SECONDS: u32 = 6;
 
 /// Hard byte ceiling on one copy-path segment.
 ///
@@ -137,36 +131,67 @@ pub const COPY_FIRST_SEGMENT_SECONDS: u32 = 2;
 /// minutes, and `EXT-X-TARGETDURATION` has to be declared up front and may
 /// never decrease — so without a duration ceiling the playlist would have to
 /// promise something absurd on session one to stay honest on session two.
-/// The two ceilings meet at about 34 Mb/s (64 MB ÷ this), and they meet rather
-/// than cross: below that the duration ceiling binds and a segment is under
-/// 64 MB, above it the byte ceiling binds and a segment is under this many
-/// seconds. So one published segment is at most [`COPY_SEGMENT_MAX_BYTES`]
-/// plus the fragment that crossed it, at any bitrate — which is the property
-/// the SourceBuffer measurement was taken against.
+/// Fifteen seconds keeps the tag believable and still leaves the floor plenty
+/// of room to find a clean point on any normal GOP grid.
 ///
-/// **Why it came down from fifteen: a segment is invisible until it is cut.**
+/// The two ceilings meet at about 34 Mb/s (64 MB ÷ 15 s), and they meet
+/// rather than cross: below that the duration ceiling binds and a segment is
+/// under 64 MB, above it the byte ceiling binds and a segment is under 15 s.
+/// So one published segment is at most [`COPY_SEGMENT_MAX_BYTES`] plus the
+/// fragment that crossed it, at any bitrate — which is the property the
+/// SourceBuffer measurement was taken against.
 ///
-/// The segmenter accumulates a whole segment before publishing it, so the
-/// client's view of the stream advances in steps of one segment, however
-/// smooth the producer is. A viewer's buffer therefore has to be longer than
-/// one segment's worth of *production* time or it drains to nothing in the gap
-/// between publications — and the buffer cannot simply be made longer, because
-/// on a 69 Mb/s remux the browser's ~150 MB SourceBuffer quota allows about
-/// seven seconds and no more (see `bufferTargets`).
+/// It spent a day at 6 s, chasing a once-per-film freeze, and came back. The
+/// freeze was the client starting at the live edge and catching the producer
+/// — shrinking segments only scaled it down (8.8 s frozen at 9.2 s in became
+/// 5.5 s at 6.0 s), because the freeze length *is* one segment's production
+/// time. The publish gate ([`COPY_PUBLISH_GATE_SEGMENTS`]) removes it
+/// outright, at which point a 6 s ceiling was pure cost: boundaries on every
+/// low-bitrate source, each one a dropped frame on an open-GOP disc, buying
+/// nothing.
+pub const COPY_SEGMENT_MAX_SECS: u32 = 15;
+
+/// How many segments must exist before the first `index.m3u8` is published.
 ///
-/// At fifteen seconds those two numbers were on the wrong sides of each other.
-/// Reported on *Wicked* in Chrome, deterministically at 9.2 s every time: an
-/// 8.8-second freeze — one whole publication gap — with the network delivering
-/// at 137 Mb/s and the buffer perfectly healthy either side of it. Safari saw
-/// the same event as a 597 ms hiccup, being less patient about reloading.
+/// **A playlist that starts at the live edge starts one publication gap from
+/// a freeze.** Delivery to the browser runs at hundreds of Mb/s against a
+/// producer that reads a 4K remux off the NAS at not much over 1×, so a
+/// client that starts on segment zero drains everything published within
+/// seconds and is then advancing at exactly the producer's publication rate.
+/// The first time it has to wait a whole publication out, the picture stops
+/// for one segment's worth of *production* time — once per film, always at
+/// the same second, because where the buffer first runs dry is a property of
+/// the film's early bitrate, not of timing. Measured on *Wicked* in Chrome:
+/// an 8.8 s freeze at 9.2 s in under a 15 s ceiling, a 5.5 s freeze at 6.0 s
+/// under a 6 s one — the freeze moved with the ceiling and scaled with it,
+/// which is the experiment that showed shrinking segments approaches this
+/// asymptotically and can never remove it. After that first stall the
+/// producer's accumulated lead covers every later gap, which is why it
+/// happens exactly once.
 ///
-/// Six seconds puts the ceiling under the quota-bound forward buffer at every
-/// bitrate the copy path accepts, which is what makes the gap survivable. It
-/// costs boundaries on a low-bitrate source — where the byte ceiling would
-/// never have fired — and boundaries cost at most one frame each, only at a
-/// cut with a leading picture to discard. One frame occasionally beats nine
-/// seconds of nothing, once, in the same place, every time you play the film.
-pub const COPY_SEGMENT_MAX_SECS: u32 = 6;
+/// So the fix is a head start rather than a segment size: hold the playlist
+/// until [`COPY_FIRST_SEGMENT_SECONDS`] plus two more floor-or-better
+/// segments of media exist, and the client begins that far behind the edge.
+/// The cushion has to outlast the worst single-segment production gap (8.8 s
+/// is the worst measured); two full segments past the opener clear it at
+/// every bitrate the copy path accepts, with margin. The cushion lives on
+/// the server — the client's quota-bounded buffer stays as small as
+/// `bufferTargets` says, it just always has published-but-unfetched segments
+/// in front of it, and every segment after the gate only adds lead.
+///
+/// The cost is time-to-first-frame, and it is paid mostly by exactly the
+/// files that need the cushion: the gate's worth of media takes seconds to
+/// produce on anything read faster than it plays, and up to the cushion
+/// itself on a NAS-bound 4K remux. That spend is once, at open, with the
+/// player showing a spinner — against a mid-scene freeze in a place the film
+/// chose. `Manager::playlist` holds the HTTP response while the gate fills
+/// rather than 404ing (verified against the vendored hls.js: the manifest
+/// loader waits indefinitely for the first byte — `maxTimeToFirstByteMs` is
+/// `Infinity` — inside a 20 s per-attempt window with two retries).
+///
+/// At end of stream the gate yields: a film shorter than the cushion
+/// publishes whole, `ENDLIST` and all, the moment it finishes.
+pub const COPY_PUBLISH_GATE_SEGMENTS: u32 = 3;
 
 /// The bitstream filter every copied HEVC stream gets before a client sees it.
 ///

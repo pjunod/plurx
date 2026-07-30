@@ -7,7 +7,10 @@
 //! it writes — `init.mp4`, `segNNNNN.m4s`, `index.m3u8` — has the same names,
 //! the same shape and the same tmp-then-rename semantics ffmpeg's HLS muxer
 //! gave it, so the serving layer, the segment index, the ahead-window suspend
-//! and the GC all carry on unchanged. The playlist is the interface.
+//! and the GC all carry on unchanged. The playlist is the interface — which
+//! is what lets the publish gate hold it back until a cushion of segments
+//! exists ([`plurx_core::transcode::COPY_PUBLISH_GATE_SEGMENTS`]): until the
+//! playlist is out, the rest of the daemon agrees nothing has happened.
 //!
 //! Why bother: every boundary on an open-GOP copy costs exactly one dropped
 //! frame, because a player treats a segment's first keyframe as a
@@ -26,7 +29,8 @@ use plurx_core::fmp4::{
     self, FragmentReader, Init, Published, SegmentCounts, Segmenter, TrackKind, Unit,
 };
 use plurx_core::transcode::{
-    COPY_FIRST_SEGMENT_SECONDS, COPY_SEGMENT_MAX_BYTES, COPY_SEGMENT_MAX_SECS, COPY_SEGMENT_SECONDS,
+    COPY_FIRST_SEGMENT_SECONDS, COPY_PUBLISH_GATE_SEGMENTS, COPY_SEGMENT_MAX_BYTES,
+    COPY_SEGMENT_MAX_SECS, COPY_SEGMENT_SECONDS,
 };
 use tokio::io::{AsyncRead, AsyncReadExt};
 
@@ -63,6 +67,11 @@ pub struct Limits {
     pub first_floor_seconds: u32,
     pub max_bytes: usize,
     pub max_seconds: u32,
+    /// Hold `index.m3u8` until this many segments exist, so playback starts
+    /// behind a cushion instead of at the live edge — the whole story is on
+    /// [`plurx_core::transcode::COPY_PUBLISH_GATE_SEGMENTS`]. End of stream
+    /// overrides it: a film shorter than the gate publishes whole.
+    pub publish_gate_segments: u32,
 }
 
 impl Default for Limits {
@@ -72,6 +81,7 @@ impl Default for Limits {
             first_floor_seconds: COPY_FIRST_SEGMENT_SECONDS,
             max_bytes: COPY_SEGMENT_MAX_BYTES,
             max_seconds: COPY_SEGMENT_MAX_SECS,
+            publish_gate_segments: COPY_PUBLISH_GATE_SEGMENTS,
         }
     }
 }
@@ -79,12 +89,14 @@ impl Default for Limits {
 /// How a segmenter session ended.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Outcome {
-    /// The stream was never one this reader could follow, and nothing was
-    /// published. The caller respawns on the legacy muxer — once.
+    /// The stream was not one this reader could follow, and no player ever
+    /// saw output — the playlist was never published, whatever segment files
+    /// the publish gate was still holding invisible. The caller respawns on
+    /// the legacy muxer — once — clearing the directory first.
     ///
     /// Separate from every other failure on purpose: this is the only ending
-    /// where falling back is both possible and correct. Once a segment exists,
-    /// a respawn would rewrite a timeline a player is already holding.
+    /// where falling back is both possible and correct. Once the playlist is
+    /// out, a respawn would rewrite a timeline a player is already holding.
     Unsupported(String),
     /// It ran. The counts are what it published, whether it reached the end of
     /// the film or the session was killed under it.
@@ -103,22 +115,40 @@ pub enum Outcome {
 /// memory, written to `index.m3u8.tmp` and renamed over. At 6 s a segment a
 /// three-hour film is 1800 lines — rewriting 50 KB per segment costs nothing
 /// next to the 50 MB of segment that triggered it.
+///
+/// The first write is gated: segments land on disk from the start, but
+/// `index.m3u8` is withheld until `gate` of them exist, so the first playlist
+/// a player loads already holds a cushion and playback starts behind the
+/// live edge rather than at it
+/// ([`plurx_core::transcode::COPY_PUBLISH_GATE_SEGMENTS`]). While the gate is
+/// closed nothing downstream knows the segments exist — the segment index,
+/// the ahead-window suspend and the GC all read the playlist — and nothing
+/// can be served from them, because a client only learns names from the
+/// playlist too.
 struct SessionDir {
     dir: PathBuf,
     /// The `#EXTINF`/URI pairs, without the header. The header is regenerated
     /// on every write because `TARGETDURATION` grows with the longest segment
     /// published so far.
     entries: String,
+    /// Segments written so far — what the publish gate counts.
+    segments: u32,
+    /// Withhold `index.m3u8` until this many segments exist.
+    gate: u32,
     /// `ceil` of the longest `EXTINF` so far. Never decreases.
     target_duration: u32,
+    /// The playlist is on disk — the moment a player could be holding this
+    /// timeline, and so the moment the legacy fallback stops being safe.
     started: bool,
 }
 
 impl SessionDir {
-    fn new(dir: PathBuf) -> SessionDir {
+    fn new(dir: PathBuf, gate: u32) -> SessionDir {
         SessionDir {
             dir,
             entries: String::new(),
+            segments: 0,
+            gate,
             target_duration: 0,
             started: false,
         }
@@ -146,7 +176,7 @@ impl SessionDir {
         // No playlist yet: one with no segment in it is a promise the session
         // cannot keep if ffmpeg dies in the next second, and
         // `session_producing` reads exactly this file to decide whether there
-        // is real output. It lands with the first segment.
+        // is real output. It lands when the publish gate opens.
         Ok(())
     }
 
@@ -155,21 +185,34 @@ impl SessionDir {
         self.publish_file(&name, &published.segment.bytes).await?;
         self.entries
             .push_str(&fmp4::playlist_entry(published.seconds, &name));
+        self.segments += 1;
         // Grows, never shrinks. A client that read a smaller number and then
         // met a longer segment would be entitled to complain; one that read a
         // number far larger than any real segment waits that long between
         // playlist fetches, which is the stall this replaced.
         let need = published.seconds.ceil().max(1.0) as u32;
         self.target_duration = self.target_duration.max(need);
+        // The publish gate. The segment is on disk; whether the world learns
+        // of it is a separate decision, taken once: until `gate` segments
+        // exist there is no playlist at all, and the first one a player loads
+        // already lists the whole cushion.
+        if !self.started && self.segments < self.gate {
+            return Ok(());
+        }
         self.started = true;
         let text = self.playlist(false);
         self.publish_file("index.m3u8", text.as_bytes()).await
     }
 
     async fn write_endlist(&mut self) -> std::io::Result<()> {
-        if !self.started {
+        if self.entries.is_empty() {
             return Ok(());
         }
+        // End of stream opens the gate no matter how few segments exist: a
+        // film shorter than the cushion still has to play, and a complete
+        // playlist with its ENDLIST is a *better* first read than a live one
+        // — the client sees VOD from the start.
+        self.started = true;
         let text = self.playlist(true);
         self.publish_file("index.m3u8", text.as_bytes()).await
     }
@@ -199,11 +242,10 @@ pub async fn run<R: AsyncRead + Unpin>(
     limits: Limits,
 ) -> Outcome {
     let mut reader = FragmentReader::new();
-    let mut out = SessionDir::new(dir);
+    let mut out = SessionDir::new(dir, limits.publish_gate_segments);
     let mut segmenter: Option<Segmenter> = None;
     let mut buf = vec![0u8; READ_CHUNK];
     let mut warned_memory = false;
-    let mut published_any = false;
 
     loop {
         let n = match src.read(&mut buf).await {
@@ -223,14 +265,20 @@ pub async fn run<R: AsyncRead + Unpin>(
                 Ok(Some(unit)) => unit,
                 Ok(None) => break,
                 Err(e) => {
-                    if !published_any {
+                    // The fallback door is open until the playlist is out —
+                    // not until the first segment. Segments on disk that no
+                    // player has ever been told about are not a timeline
+                    // anyone holds; the respawn clears the directory and
+                    // recuts, and the viewer never learns anything happened.
+                    // The publish gate widens this window on purpose.
+                    if !out.started {
                         return Outcome::Unsupported(format!("{e}"));
                     }
-                    // Mid-stream: the fallback door is shut, because a player
-                    // is holding segments from this timeline. Stop reading and
-                    // let the session end like any ffmpeg that died — the
-                    // playlist keeps what was real, without an ENDLIST
-                    // claiming the film finished here.
+                    // Past the playlist: the door is shut, because a player
+                    // may be holding segments from this timeline. Stop
+                    // reading and let the session end like any ffmpeg that
+                    // died — the playlist keeps what was real, without an
+                    // ENDLIST claiming the film finished here.
                     tracing::error!(
                         session = %session_id,
                         "copy segmenter lost the fragment stream: {e}"
@@ -295,11 +343,12 @@ pub async fn run<R: AsyncRead + Unpin>(
                                 }
                                 return Outcome::Ran(seg.counts());
                             }
-                            published_any = true;
                         }
                         Ok(None) => {}
                         Err(e) => {
-                            if !published_any {
+                            // Same door as the reader's: open until the
+                            // playlist is out, shut after.
+                            if !out.started {
                                 return Outcome::Unsupported(format!("{e}"));
                             }
                             tracing::error!(session = %session_id, "merging a segment: {e}");
@@ -424,13 +473,17 @@ mod tests {
 
     /// Long enough to reach a ceiling from a 12 s fixture. The floor is 3 s
     /// rather than the shipped 6 s for the same reason: the property under
-    /// test is which keyframe a cut lands on, not what the constant is.
+    /// test is which keyframe a cut lands on, not what the constant is. The
+    /// publish gate is 1 — playlist from the first segment, the pre-gate
+    /// behaviour — because these tests observe cut placement, not
+    /// publication; the gate has its own tests.
     fn brisk() -> Limits {
         Limits {
             floor_seconds: 3,
             first_floor_seconds: 1,
             max_bytes: 48_000_000,
             max_seconds: 15,
+            publish_gate_segments: 1,
         }
     }
 
@@ -494,6 +547,7 @@ mod tests {
             first_floor_seconds: 1,
             max_bytes: 300_000,
             max_seconds: 15,
+            publish_gate_segments: 1,
         };
         let (dir, outcome) = session("open-gop", limits).await;
         let Outcome::Ran(counts) = outcome else {
@@ -630,6 +684,86 @@ mod tests {
         );
         let text = playlist(dir.path());
         assert!(!text.contains("ENDLIST"), "claimed the film ended: {text}");
+        assert_eq!(text.matches(".m4s\n").count() as u64, counts.segments);
+    }
+
+    /// The publish gate: segments land on disk from the start, but the
+    /// playlist does not exist until the cushion does. A session killed
+    /// before the gate fills leaves segment files and NO playlist — the
+    /// player was never told anything, which is the property the whole gate
+    /// stands on (a client that can't see the live edge can't start at it).
+    #[tokio::test]
+    async fn the_publish_gate_holds_the_playlist_while_segments_land() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let feed = pipe("clean-cra");
+        // Mid-fragment, so nothing mistakes this for end of stream — EOF is
+        // the one thing allowed to open the gate early.
+        let cut = feed.len() * 2 / 3;
+        let mut limits = brisk();
+        limits.publish_gate_segments = 99;
+        let outcome = run(&feed[..cut], dir.path().to_path_buf(), "test", limits).await;
+        let Outcome::Ran(counts) = outcome else {
+            panic!("{outcome:?}");
+        };
+        assert!(counts.segments >= 1, "{counts:?}");
+        assert!(
+            !dir.path().join("index.m3u8").exists(),
+            "the gate published a playlist at {} of 99 segments",
+            counts.segments
+        );
+        // The work itself was not held back — only the announcement.
+        assert!(dir.path().join("init.mp4").exists());
+        for i in 0..counts.segments {
+            assert!(dir.path().join(format!("seg{i:05}.m4s")).exists());
+        }
+    }
+
+    /// And the gate opening mid-stream: once the cushion exists, the first
+    /// playlist published lists all of it, and every later segment
+    /// republishes as before. Same truncated feed as above, gate the fixture
+    /// can actually fill.
+    #[tokio::test]
+    async fn the_gate_opens_mid_stream_and_the_first_playlist_lists_the_cushion() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let feed = pipe("clean-cra");
+        let cut = feed.len() * 2 / 3;
+        let mut limits = brisk();
+        limits.publish_gate_segments = 2;
+        let outcome = run(&feed[..cut], dir.path().to_path_buf(), "test", limits).await;
+        let Outcome::Ran(counts) = outcome else {
+            panic!("{outcome:?}");
+        };
+        assert!(
+            counts.segments >= 2,
+            "the fixture no longer cuts two segments by two thirds in — \
+             re-derive this test's cut point: {counts:?}"
+        );
+        let text = playlist(dir.path());
+        assert_eq!(
+            text.matches(".m4s\n").count() as u64,
+            counts.segments,
+            "once open, the playlist must keep step with every segment: {text}"
+        );
+        assert!(!text.contains("ENDLIST"), "{text}");
+    }
+
+    /// End of stream overrides the gate: a film shorter than the cushion
+    /// publishes whole — ENDLIST and all — the moment it finishes. The first
+    /// playlist a player loads is simply VOD.
+    #[tokio::test]
+    async fn a_film_shorter_than_the_gate_still_publishes_whole_at_eof() {
+        let mut limits = brisk();
+        limits.publish_gate_segments = 99;
+        let (dir, outcome) = session("clean-cra", limits).await;
+        let Outcome::Ran(counts) = outcome else {
+            panic!("{outcome:?}");
+        };
+        assert!(counts.segments >= 2, "{counts:?}");
+        let text = playlist(dir.path());
+        assert!(
+            text.ends_with("#EXT-X-ENDLIST\n"),
+            "a finished film must say so however few segments it has: {text}"
+        );
         assert_eq!(text.matches(".m4s\n").count() as u64, counts.segments);
     }
 
@@ -786,6 +920,7 @@ mod tests {
             first_floor_seconds: 1,
             max_bytes: 48_000_000,
             max_seconds: 15,
+            publish_gate_segments: 1,
         };
         let outcome = run(stdout, dir.path().to_path_buf(), "live", limits).await;
         let _ = child.wait().await;

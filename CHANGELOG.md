@@ -113,28 +113,48 @@ bump may break compatibility and a **patch** bump never does.
   capped at 12 MB rather than 32 MB: a seek starts a fresh session on this
   path, so the back buffer buys a second or two of scrubbing and was otherwise
   a fifth of the budget spent on video nobody would watch again.
-- **A film froze for ~9 seconds, at the same second, every time you played
-  it.** *Wicked* in Chrome stalled 8.8 s at 9.2 s in; Safari saw the same event
-  as a 597 ms hiccup. The network was delivering at 137 Mb/s and the buffer was
-  healthy either side of it, which is why it survived a day of looking at
-  buffer numbers.
+- **A film froze for several seconds, at the same second, every time you
+  played it — playback now starts behind a cushion instead of at the live
+  edge.** *Wicked* in Chrome stalled 8.8 s at 9.2 s in; Safari saw the same
+  event as a 597 ms hiccup. The network was delivering at 137 Mb/s and the
+  buffer was healthy either side of it, which is why it survived a day of
+  looking at buffer numbers.
 
-  A segment is invisible until it is cut. The segmenter accumulates a whole
-  one before publishing, so the client's view of the stream advances in steps
-  of one segment however smooth the producer is — and the client's buffer has
-  to outlast one segment's worth of *production* time or it drains to nothing
-  in the gap. That buffer cannot simply be made longer: on a 69 Mb/s remux the
-  browser's ~150 MB SourceBuffer quota allows about seven seconds and no more.
-  With a 15-second duration ceiling those two numbers were on the wrong sides
-  of each other, and the gap was the freeze.
+  A segment is invisible until it is cut, so the client's view of the stream
+  advances in steps of one segment however smooth the producer is. Delivery
+  to the browser runs at hundreds of Mb/s against a producer reading a 4K
+  remux off the NAS at not much over real time, so a player that starts on
+  segment zero drains everything published within seconds and is then pinned
+  to the producer's publication rate — and the first publication it has to
+  wait out whole *is* the freeze: exactly one segment's production time,
+  once per film, always at the same second, because where the buffer first
+  runs dry is a property of the film's opening bitrate. After that stall the
+  producer's accumulated lead covers every later gap, which is why it never
+  happened twice. Shrinking segments was tried first and only scaled the
+  freeze — a 6 s ceiling moved it from 9.2 s in to 6.0 s and cut it from
+  8.8 s to 5.5 s, proportionally, an asymptote rather than a fix — so that
+  change is undone: the ceiling is back at 15 s and the floor at 6 s, and
+  low-bitrate sources keep the boundaries (each one a dropped frame on an
+  open-GOP disc) that the shrink was spending on nothing.
 
-  The duration ceiling is now 6 s and the floor 4 s (the floor gates the
-  ceiling, so they cannot be equal without turning the segmenter back into a
-  fixed grid). That puts a publication gap inside the forward buffer at every
-  bitrate the copy path accepts. It costs boundaries on low-bitrate sources,
-  where the byte ceiling would never have fired — and a boundary costs at most
-  one frame, only where the cut has a leading picture to discard. One frame
-  occasionally beats nine seconds of nothing in the same place every time.
+  The actual fix is a head start. A copy session now withholds `index.m3u8`
+  until three segments exist, so the first playlist a player loads is
+  already a cushion of media deeper than the worst publication gap measured,
+  and the client never catches the producer at all. The cushion lives on the
+  server — the browser's quota-bounded buffer stays exactly as
+  `bufferTargets` sizes it, it just always has published-but-unfetched
+  segments in front of it. The server holds the playlist request open while
+  the gate fills rather than 404ing (verified against the vendored hls.js:
+  a manifest's first byte is waited on indefinitely, a 404 forgiven exactly
+  once), and end of stream overrides the gate, so a film shorter than the
+  cushion publishes whole, `ENDLIST` and all. The cost is honest:
+  time-to-first-frame rises by the cushion's production time — seconds on
+  anything read faster than it plays, up to the cushion itself on a
+  NAS-bound 4K remux — spent once, at open, behind a spinner, instead of a
+  freeze mid-scene at a moment the film chose. One more door opened on the
+  way: the legacy-muxer fallback now stays available until the playlist is
+  published rather than until the first segment lands, because segments no
+  player has ever been told about are not a timeline anyone holds.
 - **The server could not say which build it was running — again.** `.git` sits
   outside the Docker build context, so the image can only name its commit if
   the deploy passes `PLURX_BUILD_REF`. That was previously "fixed" by having
