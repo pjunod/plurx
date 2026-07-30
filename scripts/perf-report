@@ -205,7 +205,7 @@ def log_section(out, logs, cache_settings, srv=None):
             if st == 200 and isinstance(body, (bytes, bytearray)):
                 durs = [d for _, d in parse_playlist(body.decode(errors="replace"))]
                 if durs:
-                    want = 2.0
+                    want = 6.0
                     sd = sorted(durs)
                     out("")
                     out(f"  segments it actually produced: {len(durs)} · "

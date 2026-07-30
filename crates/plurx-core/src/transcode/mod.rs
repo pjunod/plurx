@@ -46,6 +46,33 @@ use crate::domain::MediaFile;
 /// again.
 pub const SEGMENT_SECONDS: u32 = 2;
 
+/// Segment floor for the COPY path, and deliberately not [`SEGMENT_SECONDS`].
+///
+/// On a copy, `hls_time` is a floor under cuts that can only happen at source
+/// keyframes — and every cut costs a frame. The one-stream experiment
+/// (docs/STUTTER-4K.md §5.3ter) proved it: the same open-GOP bitstream plays
+/// 1781 frames with ZERO drops as one continuous stream, and drops exactly
+/// one leading picture per segment start when fragmented, in Chrome's MSE
+/// and Safari's native player alike. Only the segment-START keyframe gets
+/// the random-access treatment; keyframes inside a segment decode
+/// continuously and keep their leading pictures. So boundary count is the
+/// drop count, and a 6 s floor cuts it ~3.4× against the ~1.75 s GOP grid.
+///
+/// Why 6 and not more: hls.js fetches whole segments into MediaSource, and
+/// at the ~100 Mb/s this path carries a segment must stay comfortably inside
+/// the byte-budgeted forward buffer (`bufferTargets`) — 6 s at 69 Mb/s is
+/// ~52 MB against a 96 MB forward budget; 10 s would make one segment the
+/// entire buffer. Why the transcode path stays at 2: its encoder produces at
+/// ~1×, so a viewer waits for the whole first segment (TTFF), and its closed
+/// GOP has no leading pictures to lose. The copy path bursts the first 90 s
+/// at disk speed, so a 6 s first segment still exists in well under a
+/// second.
+///
+/// Safe to diverge from [`SEGMENT_SECONDS`]: copy sessions are live-only —
+/// never cached (no recipe hash to collide with) and outside the Phase 3
+/// failover contract, which is about transcode sessions.
+pub const COPY_SEGMENT_SECONDS: u32 = 6;
+
 /// The bitstream filter every copied HEVC stream gets before a client sees it.
 ///
 /// Two kinds of NAL unit ride inside a `-c:v copy` that have no business on
@@ -734,7 +761,7 @@ pub fn hls_copy_args(
             "-f",
             "hls",
             "-hls_time",
-            &SEGMENT_SECONDS.to_string(),
+            &COPY_SEGMENT_SECONDS.to_string(),
             "-hls_playlist_type",
             "event",
             "-hls_flags",
@@ -1002,6 +1029,11 @@ mod tests {
         // per boundary. The transcode path (closed GOP) keeps the tag.
         assert!(!joined.contains("independent_segments"));
         assert!(joined.contains("-hls_flags temp_file"));
+        // Every boundary costs a leading picture, so the copy path asks for
+        // long segments; the burst covers the first-segment wait. The
+        // transcode path keeps SEGMENT_SECONDS — TTFF at 1x encode.
+        assert!(joined.contains(&format!("-hls_time {COPY_SEGMENT_SECONDS}")));
+        assert!(!joined.contains(&format!("-hls_time {SEGMENT_SECONDS} ")));
         assert!(joined.contains("/tmp/sess/seg%05d.m4s"));
         assert!(joined.contains("/tmp/sess/index.m3u8"));
         // No re-encode: none of the transcode machinery leaks in.

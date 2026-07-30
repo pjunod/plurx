@@ -4,9 +4,10 @@
 this stream (§5.3) — first misread as decoder capacity, corrected the same
 night by the client itself (an M3 Max); the DV P7 signaling fix
 (§5.3) is CONFIRMED — VideoToolbox flipped software → hardware the moment
-the false declaration disappeared; the residual is one dropped frame per
-segment boundary, characterized and top-suspected as the open-GOP
-leading-picture discard (§5.3bis, independence claim withdrawn); the
+the false declaration disappeared; the residual — one dropped
+frame per segment boundary — is PROVEN segment-triggered (§5.3ter: the
+same bitstream unsegmented plays 1781 frames with zero drops); the copy
+segment floor moved 2 s → 6 s to cut boundary count ~3×; the
 decode-margin rescue
 ([PLAYBACK.md](PLAYBACK.md#the-decode-margin-rescue--routing-around-a-pipeline-with-no-slack))
 stands as the measured mitigation
@@ -522,6 +523,37 @@ sessions get.
 - **Safari, same build**: whether removing the false independence claim
   changes native HLS behaviour, and what the realized-rate line says
   about live-edge chasing on the EVENT playlist.
+
+### 5.3ter The verdict: segment-triggered, and the segment floor is the dial
+
+The one-stream experiment ran on the reference file (Chrome, ~75 s,
+resumed mid-film): **zero drops in 1781 frames**, one 41 ms late blip, on
+the same open-GOP bitstream that loses a frame at every boundary when
+segmented. Continuous decode keeps the leading pictures; segment starts
+are what discard them. The discard is proven segment-triggered in
+Chrome's MSE, and Safari's cadence (§5.3bis) says the same for
+AVFoundation.
+
+The same panel also answered §9.2, in the negative: progressive at
+69 Mb/s runs with a **2.3 s buffer** at 1.18× encode pace — Chrome
+consumes the pipe at exactly realtime and holds almost nothing. Smooth,
+but one storage hiccup from a stall, which is the failure mode that
+created the segmented path in the first place. So the routing stays, and
+the dial that remains is boundary *count*: only the segment-start
+keyframe gets the random-access treatment, so drops scale with segment
+length. The copy path's floor moved from 2 s to 6 s
+(`COPY_SEGMENT_SECONDS`) — ~3× fewer drops in both browsers, no start-up
+cost because the copy path bursts its first 90 s at disk speed, and 6 s
+at 69 Mb/s (~52 MB) still fits the byte-budgeted forward buffer.
+Transcode segments stay at 2 s: real-time encoder, closed GOP, nothing
+to lose at a boundary.
+
+What a 6 s floor does not do is reach zero. The residual is one discard
+per ~6 s on forced-Original open-GOP playback in browsers; Auto sessions
+rescue past it, TVs and players that direct-play the MKV never segment
+at all, and the only true zero for browsers would be a GOP-aware
+segmenter that cuts exclusively at closed points — future work if one
+drop per six seconds still reads as a stutter on the couch.
 
 ### 5.4 Segment length, as mitigation rather than cause
 

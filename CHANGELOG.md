@@ -8,7 +8,27 @@ bump may break compatibility and a **patch** bump never does.
 
 ## [Unreleased]
 
-Nothing yet.
+### Changed
+
+- **Copy-path segments grew from a 2 s floor to 6 s.** Every segment start
+  costs one frame on an open-GOP source — the player treats it as a
+  random-access point and discards the leading picture, which was the last
+  remaining stutter on 4K disc remuxes in both Chrome and Safari. Keyframes
+  *inside* a segment decode continuously and lose nothing (proved by playing
+  the same stream unsegmented: zero drops in 1781 frames), so fewer
+  boundaries means proportionally fewer drops — about 3× fewer on a typical
+  1.75 s GOP. Start time is unaffected: the copy path bursts its first 90
+  seconds at disk speed, so even a 6 s first segment exists almost
+  immediately. Transcode segments stay at 2 s, where the encoder produces in
+  real time and a closed GOP has nothing to lose at a boundary.
+
+### Added
+
+- Playback stats: native HLS (Safari) sessions now attribute hitches to
+  playlist segment boundaries, the "fps rendered" figure counts frames that
+  actually reached the screen rather than Safari's decode-ahead, and the
+  overlay reports the realized playback rate whenever it deviates from what
+  was requested.
 
 ## [0.2.0] — 2026-07-30
 
