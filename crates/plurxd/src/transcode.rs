@@ -2600,10 +2600,23 @@ impl TranscodeManager {
                         tracing::info!(session = %sid, "{}", copyseg::summary(&counts));
                     }
                     copyseg::Outcome::Unsupported(reason) => {
-                        // A session that has already been failed or stopped is
-                        // one nobody is watching; respawning into it would put
-                        // an ffmpeg behind a session id the manager has let go.
-                        if session.failed.load(Relaxed) {
+                        // Is this session still one anybody is watching?
+                        //
+                        // The reader task holds its own `Arc<Session>`, so the
+                        // struct outlives removal from the manager's map —
+                        // respawning into a stopped, superseded or reaped
+                        // session would put an ffmpeg behind a session id
+                        // nothing schedules, suspends or reaps, reading the
+                        // source flat out through its 90 s burst until the
+                        // last Arc drops. And it would log a warning blaming
+                        // the SOURCE for what was a viewer pressing stop,
+                        // which is how a good path gets a bad reputation.
+                        //
+                        // The session directory is the test, because every
+                        // teardown path removes it (`Session::discard_dir`)
+                        // and `failed` is set by none of them.
+                        if session.failed.load(Relaxed) || tokio::fs::metadata(&dir).await.is_err()
+                        {
                             return;
                         }
                         tracing::warn!(
@@ -2625,11 +2638,18 @@ impl TranscodeManager {
                         // A fresh generation, or the dead process's last
                         // progress blocks land on the replacement's telemetry
                         // and the watchdog reads it as stalled from birth.
+                        // (The replacement then gets PROGRESS_STALL rather
+                        // than the full SOFTWARE_GRACE to emit its first
+                        // block, exactly as the hardware→software ladder's
+                        // replacement does. It matters only for a fallback
+                        // taken tens of seconds in, which means ffmpeg never
+                        // produced a moov — a session already in trouble.)
                         let generation = progress.begin_attempt();
                         match spawn_ffmpeg(&args, "copy", &sid, progress, generation) {
                             Ok(child) => {
                                 *session.child.lock().await = Some(child);
                                 *session.last_access.lock().await = Instant::now();
+                                tracing::info!(session = %sid, "fallback copy started");
                             }
                             Err(e) => {
                                 tracing::error!(session = %sid, "fallback copy failed: {e}");

@@ -36,6 +36,14 @@ const READ_CHUNK: usize = 256 * 1024;
 /// segment plus one fragment in flight. Exceeding it is logged once — it does
 /// not stop the session, because a stream that is merely unusual is still a
 /// stream someone is watching.
+///
+/// What a healthy session actually costs, since the number should be honest:
+/// the pending fragments (up to the floor's worth of media — ~52 MB at the
+/// 69 Mb/s reference bitrate) plus, for the instant the merge runs, a second
+/// copy of the same bytes in the merged buffer. So peak is roughly 2× a
+/// segment, ~105 MB, and this threshold sits above that on purpose: it is
+/// meant to catch a policy that has stopped cutting, not to complain about
+/// the copy every merge makes.
 const MEMORY_WARN_BYTES: usize = 160 * 1024 * 1024;
 
 /// The floor and the two ceilings, as a session sees them.
@@ -72,6 +80,11 @@ pub enum Outcome {
     Unsupported(String),
     /// It ran. The counts are what it published, whether it reached the end of
     /// the film or the session was killed under it.
+    ///
+    /// Returning stops the reader, which drops the `ChildStdout` the caller
+    /// handed over — ffmpeg then takes EPIPE on its next muxer write and
+    /// exits. That is how a segmenter session ends its own ffmpeg, and it is
+    /// why no path here needs to kill the child itself.
     Ran(SegmentCounts),
 }
 
@@ -266,17 +279,29 @@ async fn finish(
         return Outcome::Unsupported("the pipe ended before its moov arrived".into());
     };
     if complete {
-        match seg.finish() {
-            Ok(Some(published)) => {
-                if let Err(e) = out.write_segment(&published).await {
+        // `#EXT-X-ENDLIST` says "this is the whole film". Only write it if the
+        // last segment actually landed — a playlist terminated one segment
+        // short of what was produced tells the player it has everything while
+        // the picture stops early, which is worse than a playlist that simply
+        // stops growing.
+        let final_ok = match seg.finish() {
+            Ok(Some(published)) => match out.write_segment(&published).await {
+                Ok(()) => true,
+                Err(e) => {
                     tracing::error!(session = %session_id, "writing the final segment: {e}");
+                    false
                 }
+            },
+            Ok(None) => true,
+            Err(e) => {
+                tracing::error!(session = %session_id, "merging the final segment: {e}");
+                false
             }
-            Ok(None) => {}
-            Err(e) => tracing::error!(session = %session_id, "merging the final segment: {e}"),
-        }
-        if let Err(e) = out.write_endlist().await {
-            tracing::error!(session = %session_id, "writing the playlist end: {e}");
+        };
+        if final_ok {
+            if let Err(e) = out.write_endlist().await {
+                tracing::error!(session = %session_id, "writing the playlist end: {e}");
+            }
         }
     }
     let counts = seg.counts();

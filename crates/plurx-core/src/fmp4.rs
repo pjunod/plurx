@@ -56,6 +56,38 @@ fn malformed<T>(msg: impl Into<String>) -> Result<T, Fmp4Error> {
     Err(Fmp4Error::Malformed(msg.into()))
 }
 
+/// Largest box this reader will believe in.
+///
+/// Two jobs. It is a sanity bound — one fragment is one GOP, and a GOP that
+/// serialized to two gigabytes is a stream nobody produced — and it is what
+/// makes every `pos + size` in this module safe to write as a plain add: with
+/// `size` bounded here and `pos` bounded by a buffer that had to be allocated,
+/// the sum cannot wrap. Without it, a 64-bit `largesize` of `2^64 - 16` makes
+/// `pos + size` wrap to *behind* the cursor: the reader spins forever on the
+/// same bytes in release, and hands the merger a fragment whose mdat range
+/// runs backwards. Both were found by review, both are one hostile box away.
+///
+/// `i32::MAX` rather than a round number, because a merged segment's `trun`
+/// data offsets are signed 32-bit and the merger refuses anything larger
+/// anyway — a box this reader accepted but the merger could not address would
+/// be a failure deferred rather than avoided.
+const MAX_BOX_BYTES: usize = i32::MAX as usize;
+
+/// Largest `sample_count` a single `trun` may declare.
+///
+/// The length check below it is necessary but NOT sufficient: a `trun` that
+/// sets none of the per-sample flags (legal — every value then comes from the
+/// `tfhd`/`trex` defaults) has a per-sample cost of zero bytes, so an
+/// eight-byte box can declare four billion samples and pass. `Vec` then tries
+/// to reserve 64 GB, and a failed allocation is an abort, not an error: the
+/// whole daemon dies rather than the one session falling back to ffmpeg's
+/// muxer. Found by review, with a 76-byte `moof` that reproduces it.
+///
+/// A million samples is ~11 hours of 24 fps video or ~6 hours of AAC in ONE
+/// fragment, against fragments that are one GOP each. Nothing real comes near
+/// it, and the allocation it bounds is 16 MB.
+const MAX_SAMPLES_PER_RUN: usize = 1 << 20;
+
 /// What a track carries. Only `Video` is load-bearing — it is the track whose
 /// keyframes decide where segments may be cut and whose durations become
 /// `EXTINF` — but audio has to be identified to be carried along faithfully.
@@ -245,6 +277,15 @@ pub struct FragmentReader {
     /// that preceded them. Only meaningful before the init is emitted.
     init_start: Option<usize>,
     init_done: bool,
+    /// The track table from the `moov`, kept after the [`Init`] is handed out
+    /// because the `trex` defaults on it are the bottom rung of every
+    /// fragment's sample-resolution ladder. ffmpeg always fills `tfhd` and so
+    /// never reaches them, which is exactly why they had to be wired up
+    /// deliberately: a rung nothing exercises is a rung that quietly does not
+    /// exist, and a stream that did lean on `trex` would have resolved every
+    /// sample to zero duration — a segmenter that never reaches its floor and
+    /// holds the whole film in memory.
+    tracks: Vec<Track>,
     saw_trailer: bool,
 }
 
@@ -295,6 +336,7 @@ impl FragmentReader {
                         self.pos = end;
                         self.init_done = true;
                         self.init_start = None;
+                        self.tracks = tracks.clone();
                         self.compact();
                         return Ok(Some(Unit::Init(Init { bytes, tracks })));
                     }
@@ -321,8 +363,11 @@ impl FragmentReader {
                         return Ok(None);
                     }
                     let end = mdat_pos + mdat.size;
-                    let tracks =
-                        parse_moof(&self.buf[self.pos..self.pos + hdr.size], hdr.header_len)?;
+                    let tracks = parse_moof(
+                        &self.buf[self.pos..self.pos + hdr.size],
+                        hdr.header_len,
+                        &self.tracks,
+                    )?;
                     let bytes = self.buf[self.pos..end].to_vec();
                     let payload_start = hdr.size + mdat.header_len;
                     let fragment = Fragment {
@@ -406,8 +451,11 @@ fn peek_box(buf: &[u8], pos: usize) -> Result<Option<BoxHeader>, Fmp4Error> {
                 return Ok(None);
             }
             let large = be_u64(buf, pos + 8);
-            if large > usize::MAX as u64 {
-                return malformed("64-bit box size out of range");
+            if large > MAX_BOX_BYTES as u64 {
+                return Err(Fmp4Error::Unsupported(format!(
+                    "box {} declares {large} bytes",
+                    fourcc(&ty)
+                )));
             }
             (large as usize, 16)
         }
@@ -423,6 +471,12 @@ fn peek_box(buf: &[u8], pos: usize) -> Result<Option<BoxHeader>, Fmp4Error> {
     };
     if size < header_len {
         return malformed(format!("box {} declares size {size}", fourcc(&ty)));
+    }
+    if size > MAX_BOX_BYTES {
+        return Err(Fmp4Error::Unsupported(format!(
+            "box {} declares {size} bytes",
+            fourcc(&ty)
+        )));
     }
     Ok(Some(BoxHeader {
         size,
@@ -638,14 +692,18 @@ fn parse_stbl(payload: &[u8], track: &mut Track) -> Result<(), Fmp4Error> {
 
 /// Parse a `moof`'s track fragments. Takes the whole box, header included,
 /// because every `trun` data offset is relative to its first byte.
-fn parse_moof(moof: &[u8], header_len: usize) -> Result<Vec<TrackFragment>, Fmp4Error> {
+fn parse_moof(
+    moof: &[u8],
+    header_len: usize,
+    tracks: &[Track],
+) -> Result<Vec<TrackFragment>, Fmp4Error> {
     let mut out = Vec::new();
     let body = &moof[header_len..];
     for (hdr, start, end) in children(body)? {
         if hdr.kind() != b"traf" {
             continue;
         }
-        out.push(parse_traf(&body[start..end])?);
+        out.push(parse_traf(&body[start..end], tracks)?);
     }
     if out.is_empty() {
         return malformed("moof has no traf");
@@ -653,9 +711,13 @@ fn parse_moof(moof: &[u8], header_len: usize) -> Result<Vec<TrackFragment>, Fmp4
     Ok(out)
 }
 
-fn parse_traf(payload: &[u8]) -> Result<TrackFragment, Fmp4Error> {
+fn parse_traf(payload: &[u8], tracks: &[Track]) -> Result<TrackFragment, Fmp4Error> {
     let mut track_id = 0u32;
     let mut base_decode_time = 0u64;
+    // Seeded from `trex`, overwritten by `tfhd`, overwritten again per sample
+    // by `trun` — the ladder ISO 14496-12 §8.8.7 describes, bottom rung first.
+    // Filled once the `tfhd` names the track, since which `trex` applies is
+    // not known before that.
     let mut default_duration = 0u32;
     let mut default_size = 0u32;
     let mut default_flags = 0u32;
@@ -674,6 +736,11 @@ fn parse_traf(payload: &[u8]) -> Result<TrackFragment, Fmp4Error> {
                 }
                 let flags = be_u32(b, 0) & 0x00ff_ffff;
                 track_id = be_u32(b, 4);
+                if let Some(t) = tracks.iter().find(|t| t.id == track_id) {
+                    default_duration = t.default_sample_duration;
+                    default_size = t.default_sample_size;
+                    default_flags = t.default_sample_flags;
+                }
                 if flags & 0x00_0001 != 0 {
                     // An absolute base_data_offset only appears without
                     // `default_base_moof`, which plurx always passes. Refusing
@@ -788,6 +855,13 @@ fn parse_trun(
         None
     };
 
+    // Both checks are needed. The length check catches a `trun` whose declared
+    // samples run past the box; the count cap catches one whose per-sample
+    // cost is zero (no per-sample flags set), where any `sample_count`
+    // survives the length check and the allocation below is what dies.
+    if count > MAX_SAMPLES_PER_RUN {
+        return malformed(format!("trun declares {count} samples"));
+    }
     let per = 4 * usize::from(flags & 0x00_0100 != 0)
         + 4 * usize::from(flags & 0x00_0200 != 0)
         + 4 * usize::from(flags & 0x00_0400 != 0)
@@ -1162,10 +1236,27 @@ pub fn merge(fragments: &[Fragment], init: &Init, sequence: u32) -> Result<Segme
     }
     let mut stats = MergeStats::default();
 
-    // Track order comes from the first fragment, which is ffmpeg's own
-    // interleave order — video first. Keeping it makes a diff against hlsenc's
-    // output readable.
-    let track_ids: Vec<u32> = fragments[0].tracks.iter().map(|t| t.track_id).collect();
+    // The UNION of the tracks in the run, in first-seen order — which is
+    // ffmpeg's own interleave order, video first, so a diff against hlsenc's
+    // output stays readable.
+    //
+    // The union, and not `fragments[0]`'s tracks, because ffmpeg does not
+    // guarantee every fragment carries every track: `mov_flush_fragment`
+    // writes a `traf` only for tracks with buffered samples, and once a track
+    // goes `max_interleave_delta` (10 s) without a packet the muxer stops
+    // waiting for it. A source with a late-starting or gapped audio track
+    // therefore produces video-only fragments followed by fragments that
+    // carry audio again — and taking the track list from the first of those
+    // published a SILENT segment whose audio bytes were still copied into the
+    // mdat, with no error and no counter anywhere. Found by review.
+    let mut track_ids: Vec<u32> = Vec::new();
+    for frag in fragments {
+        for t in &frag.tracks {
+            if !track_ids.contains(&t.track_id) {
+                track_ids.push(t.track_id);
+            }
+        }
+    }
     let mut plans: Vec<Plan> = Vec::with_capacity(track_ids.len());
 
     for &id in &track_ids {
@@ -1317,6 +1408,20 @@ fn trun_flags(samples: &[Sample]) -> u32 {
     }
 }
 
+/// A `trun` is version 1 exactly when it has to be: version 0 composition
+/// offsets are UNSIGNED.
+///
+/// ffmpeg shifts dts to keep every offset non-negative unless it is asked for
+/// `+negative_cts_offsets`, which plurx does not pass — so in production this
+/// is always 0. It matters anyway, because the alternative was writing
+/// `cto.max(0)` into a version-0 field: a negative offset would then be
+/// silently clamped, shifting that frame's presentation time by the offset it
+/// lost, with no error — which is exactly the class of change the framemd5
+/// equality exists to forbid, arriving without tripping it. Found by review.
+fn trun_version(samples: &[Sample]) -> u8 {
+    u8::from(samples.iter().any(|s| s.cto < 0))
+}
+
 /// Serialize the `moof`, recording where each `trun`'s data offset field
 /// landed so the caller can patch it once the total size is known.
 fn build_moof(plans: &[Plan], sequence: u32, offset_slots: &mut Vec<usize>) -> Vec<u8> {
@@ -1347,12 +1452,13 @@ fn build_moof(plans: &[Plan], sequence: u32, offset_slots: &mut Vec<usize>) -> V
 
         for run in &plan.runs {
             let flags = trun_flags(&run.samples);
+            let version = trun_version(&run.samples);
             let has_cto = flags & 0x0000_0800 != 0;
             let per = if has_cto { 16 } else { 12 };
             let size = 8 + 4 + 4 + 4 + run.samples.len() * per;
             moof.extend_from_slice(&(size as u32).to_be_bytes());
             moof.extend_from_slice(b"trun");
-            moof.extend_from_slice(&flags.to_be_bytes());
+            moof.extend_from_slice(&(((version as u32) << 24) | flags).to_be_bytes());
             moof.extend_from_slice(&(run.samples.len() as u32).to_be_bytes());
             offset_slots.push(moof.len());
             moof.extend_from_slice(&0u32.to_be_bytes()); // data_offset, patched
@@ -1361,10 +1467,10 @@ fn build_moof(plans: &[Plan], sequence: u32, offset_slots: &mut Vec<usize>) -> V
                 moof.extend_from_slice(&s.size.to_be_bytes());
                 moof.extend_from_slice(&s.flags.to_be_bytes());
                 if has_cto {
-                    // Version 0, so the offset is unsigned: ffmpeg shifts dts
-                    // to keep every one non-negative, and a stream where that
-                    // was not true would need a v1 trun.
-                    moof.extend_from_slice(&(s.cto.max(0) as u32).to_be_bytes());
+                    // Written in whichever width the values need, and clamped
+                    // in neither: version 0 is unsigned, version 1 signed.
+                    let clamped = s.cto.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+                    moof.extend_from_slice(&clamped.to_be_bytes());
                 }
             }
         }
@@ -1456,6 +1562,45 @@ impl Segmenter {
         self.counts
     }
 
+    /// How long the pending run runs, in seconds — the number that becomes
+    /// `EXTINF`.
+    ///
+    /// The video track's summed sample durations in the video timescale, per
+    /// STUTTER-4K §6.3: audio fragment durations differ from video's by up to
+    /// one AAC frame, and using them drifts the playlist against the media
+    /// over a film.
+    ///
+    /// The fallback exists for exactly one case: a source whose audio outlasts
+    /// its video. ffmpeg keeps muxing audio-only fragments past the last video
+    /// sample, and a run made only of those has zero video duration — which
+    /// would publish `#EXTINF:0.000000`, a segment the playlist claims takes
+    /// no time at all. There is no video timeline left to measure at that
+    /// point, so the longest track present is the honest answer.
+    fn pending_seconds(&self) -> f64 {
+        let video_ticks: u64 = self
+            .pending
+            .iter()
+            .map(|f| f.video_duration(&self.init))
+            .sum();
+        if video_ticks > 0 {
+            return video_ticks as f64 / self.video_timescale as f64;
+        }
+        let mut longest = 0.0f64;
+        for track in &self.init.tracks {
+            let ticks: u64 = self
+                .pending
+                .iter()
+                .filter_map(|f| f.track(track.id))
+                .map(|t| t.duration())
+                .sum();
+            let secs = ticks as f64 / track.timescale.max(1) as f64;
+            if secs > longest {
+                longest = secs;
+            }
+        }
+        longest
+    }
+
     /// Bytes held back waiting for a cut point. Bounded by the byte ceiling
     /// plus one fragment; anything beyond that is worth a log line.
     pub fn pending_bytes(&self) -> usize {
@@ -1495,6 +1640,7 @@ impl Segmenter {
 
     fn flush(&mut self, reason: CutReason) -> Result<Published, Fmp4Error> {
         let index = self.next_index;
+        let seconds = self.pending_seconds();
         let segment = merge(&self.pending, &self.init, index as u32 + 1)?;
         self.pending.clear();
         self.pending_bytes = 0;
@@ -1510,7 +1656,6 @@ impl Segmenter {
             // either would flatter or slander the policy.
             CutReason::EndOfStream => {}
         }
-        let seconds = segment.video_ticks as f64 / self.video_timescale as f64;
         Ok(Published {
             index,
             segment,
@@ -2185,6 +2330,280 @@ mod tests {
         }
         assert_eq!(types, vec!["styp", "moof", "mdat"]);
         assert_eq!(&bytes[..24], &STYP, "styp is not hlsenc's 24 bytes");
+    }
+
+    // -----------------------------------------------------------------------
+    // hostile input — every one of these was found by review, not by a fixture
+    // -----------------------------------------------------------------------
+
+    /// Build a minimal `moof`+`mdat` by hand, so the reader can be shown bytes
+    /// no ffmpeg would ever write.
+    fn hand_built_fragment(trun_flags: u32, sample_count: u32, samples: &[u8]) -> Vec<u8> {
+        let mut trun = Vec::new();
+        trun.extend_from_slice(&trun_flags.to_be_bytes());
+        trun.extend_from_slice(&sample_count.to_be_bytes());
+        trun.extend_from_slice(samples);
+        let mut traf = Vec::new();
+        traf.extend_from_slice(&16u32.to_be_bytes());
+        traf.extend_from_slice(b"tfhd");
+        traf.extend_from_slice(&0x0002_0000u32.to_be_bytes());
+        traf.extend_from_slice(&1u32.to_be_bytes());
+        traf.extend_from_slice(&20u32.to_be_bytes());
+        traf.extend_from_slice(b"tfdt");
+        traf.extend_from_slice(&0x0100_0000u32.to_be_bytes());
+        traf.extend_from_slice(&0u64.to_be_bytes());
+        traf.extend_from_slice(&((trun.len() + 8) as u32).to_be_bytes());
+        traf.extend_from_slice(b"trun");
+        traf.extend_from_slice(&trun);
+
+        let mut moof = Vec::new();
+        moof.extend_from_slice(&((traf.len() + 8 + 16 + 8) as u32).to_be_bytes());
+        moof.extend_from_slice(b"moof");
+        moof.extend_from_slice(&16u32.to_be_bytes());
+        moof.extend_from_slice(b"mfhd");
+        moof.extend_from_slice(&0u32.to_be_bytes());
+        moof.extend_from_slice(&1u32.to_be_bytes());
+        moof.extend_from_slice(&((traf.len() + 8) as u32).to_be_bytes());
+        moof.extend_from_slice(b"traf");
+        moof.extend_from_slice(&traf);
+        moof.extend_from_slice(&8u32.to_be_bytes());
+        moof.extend_from_slice(b"mdat");
+        moof
+    }
+
+    /// A `trun` that sets no per-sample flags has a per-sample cost of ZERO
+    /// bytes, so the "declares samples it does not carry" length check passes
+    /// for any `sample_count` — and `Vec::with_capacity` then asks the
+    /// allocator for 64 GB. A failed allocation is an abort, not an error:
+    /// the whole daemon dies rather than one session falling back to ffmpeg's
+    /// muxer. This is a 76-byte input.
+    #[test]
+    fn a_trun_cannot_declare_four_billion_samples() {
+        // flags = data-offset only; count = u32::MAX; no per-sample bytes.
+        let frag = hand_built_fragment(0x0000_0001, u32::MAX, &0u32.to_be_bytes());
+        assert!(frag.len() < 200, "the whole attack is {} bytes", frag.len());
+        let feed = pipe("open-gop");
+        let (init, _, _) = read_all(&feed);
+        let mut reader = FragmentReader::new();
+        reader.push(&init.bytes); // a real init, so the fragment path is reached
+        assert!(matches!(reader.next_unit(), Ok(Some(Unit::Init(_)))));
+        reader.push(&frag);
+        assert!(
+            matches!(reader.next_unit(), Err(Fmp4Error::Malformed(_))),
+            "a four-billion-sample trun was accepted"
+        );
+    }
+
+    /// A 64-bit `largesize` near `u64::MAX` makes `pos + size` wrap to behind
+    /// the cursor. Two things followed: the reader spun forever on the same
+    /// bytes in release, and the merger got a fragment whose mdat range ran
+    /// backwards and panicked slicing it. One bound fixes both.
+    #[test]
+    fn a_box_that_would_wrap_the_cursor_is_refused() {
+        let mut feed = Vec::new();
+        feed.extend_from_slice(&16u32.to_be_bytes());
+        feed.extend_from_slice(b"free");
+        feed.extend_from_slice(&[0u8; 8]);
+        // size==1 → 64-bit largesize, chosen so `16 + size` wraps to 0.
+        feed.extend_from_slice(&1u32.to_be_bytes());
+        feed.extend_from_slice(b"skip");
+        feed.extend_from_slice(&(u64::MAX - 15).to_be_bytes());
+        let mut reader = FragmentReader::new();
+        reader.push(&feed);
+        assert!(
+            matches!(reader.next_unit(), Err(Fmp4Error::Unsupported(_))),
+            "a box big enough to wrap the cursor was accepted"
+        );
+    }
+
+    /// ffmpeg writes a `traf` only for tracks with buffered samples, and stops
+    /// waiting for one that has gone `max_interleave_delta` without a packet —
+    /// so a late-starting or gapped audio track produces video-only fragments
+    /// followed by fragments that carry audio again. Taking the track list
+    /// from the run's FIRST fragment published a silent segment whose audio
+    /// bytes were copied into the mdat but described by no `traf` at all.
+    #[test]
+    fn a_track_that_joins_late_is_not_dropped_from_the_segment() {
+        let feed = pipe("open-gop");
+        let (init, frags, _) = read_all(&feed);
+        let audio = init
+            .tracks
+            .iter()
+            .find(|t| t.kind == TrackKind::Audio)
+            .expect("audio")
+            .id;
+
+        // Fragment 0 loses its audio traf, exactly as a muxer that had no
+        // audio buffered would have written it.
+        let mut first = frags[0].clone();
+        first.tracks.retain(|t| t.track_id != audio);
+        let run = vec![first, frags[1].clone(), frags[2].clone()];
+
+        let merged = merge(&run, &init, 1).expect("merge");
+        let mut feed = init.bytes.clone();
+        feed.extend_from_slice(&merged.bytes);
+        let (_, out, _) = read_all(&feed);
+        assert_eq!(out.len(), 1);
+        assert!(
+            out[0].track(audio).is_some(),
+            "the segment published no audio at all"
+        );
+        let want: usize = run
+            .iter()
+            .filter_map(|f| f.track(audio))
+            .map(|t| t.sample_count())
+            .sum();
+        assert_eq!(
+            out[0].track(audio).map(|t| t.sample_count()),
+            Some(want),
+            "audio samples went missing between the fragments and the segment"
+        );
+    }
+
+    /// The bottom rung of the sample-resolution ladder. ffmpeg always fills
+    /// `tfhd`, so nothing in production reaches `trex` — which is precisely
+    /// why it had to be wired up deliberately and tested here. Left
+    /// unimplemented, a stream that leaned on it resolved every sample to zero
+    /// duration: the segmenter would never reach its floor, never cut, and
+    /// hold the whole film in memory.
+    #[test]
+    fn trex_defaults_are_the_bottom_rung_of_the_ladder() {
+        let feed = pipe("open-gop");
+        let (init, _, _) = read_all(&feed);
+        let video_id = init.video().expect("video").id;
+
+        // ffmpeg writes an all-zero `trex` and puts the real defaults in each
+        // `tfhd`, so the fixture cannot exercise this rung as it stands. Patch
+        // values into the moov's own `trex` — same length, same structure —
+        // and the rung becomes reachable without inventing a whole moov.
+        let mut bytes = init.bytes.clone();
+        let mut patched = false;
+        for i in 0..bytes.len().saturating_sub(28) {
+            if &bytes[i..i + 4] != b"trex" {
+                continue;
+            }
+            if be_u32(&bytes, i + 8) != video_id {
+                continue;
+            }
+            bytes[i + 16..i + 20].copy_from_slice(&4_242u32.to_be_bytes()); // duration
+            bytes[i + 20..i + 24].copy_from_slice(&1_234u32.to_be_bytes()); // size
+            bytes[i + 24..i + 28].copy_from_slice(&0x0101_0000u32.to_be_bytes()); // flags
+            patched = true;
+            break;
+        }
+        assert!(patched, "no trex for the video track in the fixture's moov");
+        let mut reader = FragmentReader::new();
+        reader.push(&bytes);
+        let Ok(Some(Unit::Init(init))) = reader.next_unit() else {
+            panic!("the patched moov did not parse");
+        };
+        let video = init.video().expect("video").clone();
+        assert_eq!(video.default_sample_duration, 4_242);
+        assert_eq!(video.default_sample_size, 1_234);
+
+        // A traf with a bare tfhd (no defaults) and a trun with no per-sample
+        // values: everything has to come from trex.
+        let mut trun = Vec::new();
+        trun.extend_from_slice(&0x0000_0001u32.to_be_bytes()); // data-offset only
+        trun.extend_from_slice(&2u32.to_be_bytes());
+        trun.extend_from_slice(&0u32.to_be_bytes());
+        let mut traf = Vec::new();
+        traf.extend_from_slice(&16u32.to_be_bytes());
+        traf.extend_from_slice(b"tfhd");
+        traf.extend_from_slice(&0x0002_0000u32.to_be_bytes());
+        traf.extend_from_slice(&video.id.to_be_bytes());
+        traf.extend_from_slice(&((trun.len() + 8) as u32).to_be_bytes());
+        traf.extend_from_slice(b"trun");
+        traf.extend_from_slice(&trun);
+        let mut moof = Vec::new();
+        moof.extend_from_slice(&((traf.len() + 8 + 8) as u32).to_be_bytes());
+        moof.extend_from_slice(b"moof");
+        moof.extend_from_slice(&((traf.len() + 8) as u32).to_be_bytes());
+        moof.extend_from_slice(b"traf");
+        moof.extend_from_slice(&traf);
+        moof.extend_from_slice(&8u32.to_be_bytes());
+        moof.extend_from_slice(b"mdat");
+
+        reader.push(&moof);
+        let Ok(Some(Unit::Fragment(f))) = reader.next_unit() else {
+            panic!("the hand-built fragment did not parse");
+        };
+        let tf = f.track(video.id).expect("video traf");
+        for s in tf.samples() {
+            assert_eq!(s.duration, video.default_sample_duration);
+            assert_eq!(s.size, video.default_sample_size);
+            assert_eq!(s.flags, video.default_sample_flags);
+        }
+    }
+
+    /// Version-0 composition offsets are UNSIGNED. Writing a negative one into
+    /// a version-0 `trun` clamped it to zero and shifted that frame's
+    /// presentation time silently — the exact class of change framemd5 exists
+    /// to forbid, arriving without tripping it. A run with a negative offset
+    /// must come out as version 1.
+    #[test]
+    fn a_negative_composition_offset_forces_a_version_1_trun() {
+        let feed = pipe("open-gop");
+        let (init, frags, _) = read_all(&feed);
+        let video = init.video().expect("video").id;
+        let mut frag = frags[0].clone();
+        let mut wanted = 0i64;
+        if let Some(tf) = frag.tracks.iter_mut().find(|t| t.track_id == video) {
+            if let Some(s) = tf.runs.first_mut().and_then(|r| r.samples.get_mut(1)) {
+                s.cto = -600;
+                wanted = -600;
+            }
+        }
+        assert_eq!(wanted, -600, "the fixture fragment had no second sample");
+
+        let merged = merge(&[frag], &init, 1).expect("merge");
+        let mut feed = init.bytes.clone();
+        feed.extend_from_slice(&merged.bytes);
+        let (_, out, _) = read_all(&feed);
+        let got = out[0]
+            .track(video)
+            .and_then(|t| t.runs.first())
+            .and_then(|r| r.samples.get(1))
+            .map(|s| s.cto);
+        assert_eq!(got, Some(-600), "a negative offset was clamped away");
+    }
+
+    /// A source whose audio outlasts its video: ffmpeg keeps muxing audio-only
+    /// fragments past the last video sample, and a run made only of those has
+    /// zero video duration. `EXTINF` is summed from the VIDEO track by rule
+    /// (§6.3 — audio drifts against the media by up to an AAC frame per
+    /// fragment), so the tail would have published `#EXTINF:0.000000`: a
+    /// segment the playlist claims takes no time at all.
+    #[test]
+    fn a_tail_with_no_video_left_still_reports_a_real_duration() {
+        let feed = pipe("open-gop");
+        let (init, frags, _) = read_all(&feed);
+        let video = init.video().expect("video").id;
+        let timescale = init.video().map(|v| v.timescale).unwrap_or(1);
+
+        // A floor nothing can reach, so the whole run lands in one segment at
+        // `finish()` — which is what the real tail does.
+        let policy = CutPolicy::new(u32::MAX / timescale.max(1), usize::MAX, u32::MAX, timescale);
+        let mut seg = Segmenter::new(init.clone(), policy);
+        for f in frags.iter().take(3) {
+            let mut stripped = f.clone();
+            stripped.tracks.retain(|t| t.track_id != video);
+            assert!(
+                !stripped.tracks.is_empty(),
+                "the fixture has no audio track"
+            );
+            assert!(seg.push(stripped).expect("push").is_none());
+        }
+        let published = seg.finish().expect("finish").expect("a final segment");
+        assert_eq!(
+            published.segment.video_ticks, 0,
+            "video was supposed to be gone"
+        );
+        assert!(
+            published.seconds > 0.1,
+            "an audio-only tail published EXTINF {}",
+            published.seconds
+        );
     }
 
     #[test]

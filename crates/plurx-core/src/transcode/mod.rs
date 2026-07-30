@@ -675,16 +675,6 @@ pub fn hls_args(
     args
 }
 
-/// Build ffmpeg args to *copy* the source video into HLS (fMP4 segments),
-/// transcoding only the audio when the client can't take the source codec.
-///
-/// This is "remux, packaged as HLS". Safari's `<video>` will not play a
-/// progressive fragmented MP4 (the `/stream.mp4` remux) — it only accepts
-/// fragmented content via HLS — but it decodes HEVC/HDR natively through HLS.
-/// So for those clients we keep the original 4K video stream untouched and
-/// repackage it as HLS, instead of letting the player's error-fallback re-encode
-/// the whole thing down to 720p. fMP4 segments (not MPEG-TS) are required: Apple
-/// does not support HEVC in a TS container.
 /// Everything a copy session's ffmpeg does *before* the muxer: input seek,
 /// pacing, stream mapping, the video copy with its bitstream hygiene, and the
 /// audio decision.
@@ -821,6 +811,24 @@ pub fn copy_pipe_args(
     args
 }
 
+/// Build ffmpeg args to *copy* the source video into HLS (fMP4 segments) with
+/// ffmpeg's own HLS muxer doing the cutting, transcoding only the audio when
+/// the client can't take the source codec.
+///
+/// This is "remux, packaged as HLS". Safari's `<video>` will not play a
+/// progressive fragmented MP4 (the `/stream.mp4` remux) — it only accepts
+/// fragmented content via HLS — but it decodes HEVC/HDR natively through HLS.
+/// So for those clients we keep the original 4K video stream untouched and
+/// repackage it as HLS, instead of letting the player's error-fallback
+/// re-encode the whole thing down to 720p. fMP4 segments (not MPEG-TS) are
+/// required: Apple does not support HEVC in a TS container.
+///
+/// Since the GOP-aware segmenter this is the FALLBACK path — taken for a
+/// source whose keyframes `crate::fmp4` cannot read, and for a stream it
+/// turned out not to be able to follow. It cuts wherever it finds a keyframe
+/// past the floor, which on an open-GOP source costs one frame per boundary
+/// (docs/STUTTER-4K.md §5.6). That is the behaviour the segmenter exists to
+/// improve on, and the behaviour anything unexpected degrades back to.
 pub fn hls_copy_args(
     source: &MediaFile,
     start_seconds: f64,
