@@ -656,7 +656,39 @@ hlsenc's sums to 47.904 s — 95 ms, or 2.3 frames, short. `EXTINF` here is
 summed video sample durations in the video timescale, so it is exact by
 construction rather than by luck.
 
-**What it is worth is a property of the source, and there is an instrument.**
+**What it was worth on the reference file, measured (2026-07-30).** The first
+census of *Wicked* said 32% of cuts clean and looked like a source problem. It
+was not. Clean points on that file come every 2.3 seconds (median, 189 IDRs in
+a 600 s sample) — but at 58 Mb/s the 48 MB ceiling arrived 6.6 seconds in, so
+past the six-second floor the segmenter had **0.6 seconds**, less than one GOP,
+to find one. The ceiling was starving the search. `scripts/gop-census --sweep`
+replays the policy over a floor × ceiling grid and reports dirty cuts per
+minute — the rate of the artifact, since a clean cut costs nothing — against
+what ffmpeg's own muxer would do at the same floor:
+
+| policy | dropped frames / min on *Wicked* |
+|---|---|
+| ffmpeg's HLS muxer, 6 s | 8.0 |
+| segmenter, floor 6 s · ceiling 48 MB (as first shipped) | 5.9 |
+| segmenter, floor 6 s · ceiling **64 MB** (shipped now) | **1.9** |
+| segmenter, floor 4 s · ceiling 64 MB | 1.7 |
+| segmenter, floor 2 s · ceiling 80 MB | 0.6 |
+
+The ceiling dominates the floor across the whole grid, which is the opposite
+of the intuition the six-second floor came from — under the old regime every
+boundary cost a frame, so the goal was fewer of them; under this one most
+boundaries are free, so the goal is a wide enough window to find them in.
+
+**How far the ceiling can go is a SourceBuffer measurement, not a budget.** A
+real hls.js in headless Chromium, fed a 59.6 Mb/s stream cut at each size with
+the shipped `bufferTargets()` numbers (13 s forward / 4 s back at that
+bitrate): zero quota events at 48 MB and 64 MB, `bufferFullError` at 80 MB and
+at 96 MB, repeatable across runs. Peak buffered bytes were **identical**
+(155 MB, 20.9 s) in all four arms — so what fails at 80 MB is not the total,
+it is the size of a single append, which no client-side byte budget can be
+traded against. 64 MB is the last rung that measured clean.
+
+**What it is worth on any other title is still a property of that source.**
 Clean-cut density is decided by whoever encoded the disc, and no synthetic
 fixture can answer it — a file full of x265 test patterns has whatever GOP the
 test asked for. `scripts/gop-census <file>` runs the production pipe command

@@ -77,14 +77,35 @@ pub const COPY_SEGMENT_SECONDS: u32 = 6;
 ///
 /// The segmenter (`crate::fmp4`) holds fragments back until it finds a
 /// keyframe a player can start on without discarding a leading picture. On a
-/// source that offers no such point, "hold back" has to stop somewhere, and
-/// bytes are the binding constraint on this path long before seconds are: at
-/// the ~100 Mb/s a 4K remux carries, a segment is 12 MB a second, and
-/// `bufferTargets` gives MSE a 96 MB forward budget. Half of that is the
-/// number, so hls.js can hold two whole segments and still evict cleanly —
-/// a ceiling at the full budget would make one segment the entire buffer, the
-/// same mistake `946486b` fixed at the other end of the same arithmetic.
-pub const COPY_SEGMENT_MAX_BYTES: usize = 48 * 1024 * 1024;
+/// stretch of film that offers no such point, "hold back" has to stop
+/// somewhere, and bytes are the binding constraint here long before seconds
+/// are: at the ~60 Mb/s a 4K remux carries, a segment is 7.5 MB a second.
+///
+/// **This number is the search window, and it was measured twice.** It first
+/// shipped at 48 MB, chosen as half of `bufferTargets`' 96 MB forward budget
+/// so MSE could hold two whole segments. That reasoning was arithmetic, and
+/// the arithmetic missed something: at 58 Mb/s a 48 MB ceiling arrives 6.6
+/// seconds in, so past the six-second floor the segmenter had **0.6 seconds**
+/// — less than one GOP — to find a clean keyframe in. On *Wicked* (2024),
+/// whose clean points come every 2.3 s, that produced 5.9 dropped frames a
+/// minute against ffmpeg's own muxer at 8.0: a segmenter barely beating the
+/// thing it replaced, on a source full of the cut points it was looking for.
+/// `scripts/gop-census --sweep` is the instrument that showed it.
+///
+/// 64 MB opens the window to 2.8 seconds — about three and a half GOPs — and
+/// takes the same file to 1.9 drops a minute, 4.2x better than the muxer. The
+/// ceiling on going further is the SourceBuffer quota, and it is a
+/// measurement rather than a budget: a real hls.js in headless Chromium, fed
+/// a 59.6 Mb/s stream cut at each size with the shipped `bufferTargets()`
+/// numbers (13 s forward / 4 s back), reports zero quota events at 48 and 64
+/// MB, and `bufferFullError` at 80 MB and above — repeatably, in every run.
+/// Peak buffered bytes were identical (155 MB) in all four arms, so what
+/// fails at 80 MB is not the total: it is the size of a single append, which
+/// is a limit no byte budget on the client side can be traded against.
+///
+/// So 64 MB is the last rung that measured clean, and the "two whole
+/// segments" framing it replaces was never the thing that mattered.
+pub const COPY_SEGMENT_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 /// Secondary ceiling, in seconds, for sources whose bytes never pile up.
 ///
@@ -92,8 +113,15 @@ pub const COPY_SEGMENT_MAX_BYTES: usize = 48 * 1024 * 1024;
 /// minutes, and `EXT-X-TARGETDURATION` has to be declared up front and may
 /// never decrease — so without a duration ceiling the playlist would have to
 /// promise something absurd on session one to stay honest on session two.
-/// Fifteen seconds keeps the tag believable and still leaves the floor two
-/// full GOPs of room to find a clean point on a typical 1.75 s grid.
+/// Fifteen seconds keeps the tag believable and still leaves the floor plenty
+/// of room to find a clean point on any normal GOP grid.
+///
+/// The two ceilings meet at about 34 Mb/s (64 MB ÷ 15 s), and they meet
+/// rather than cross: below that the duration ceiling binds and a segment is
+/// under 64 MB, above it the byte ceiling binds and a segment is under 15 s.
+/// So one published segment is at most [`COPY_SEGMENT_MAX_BYTES`] plus the
+/// fragment that crossed it, at any bitrate — which is the property the
+/// SourceBuffer measurement was taken against.
 pub const COPY_SEGMENT_MAX_SECS: u32 = 15;
 
 /// The bitstream filter every copied HEVC stream gets before a client sees it.
