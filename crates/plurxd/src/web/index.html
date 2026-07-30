@@ -3081,11 +3081,12 @@ function hitchBlame(){
 // 6ms and absorbs hundreds of spikes silently. No server change makes a
 // client's decoder faster; the honest response is to measure the margin and
 // route around it. The thresholds: a median at 80% of the frame budget
-// leaves too little room for the giant-IRAP spikes that actually occur, and
-// clearing needs comfortable headroom (60%) so a borderline device does not
-// flap between the two.
+// leaves too little room for the giant-IRAP spikes that actually occur.
+// Clearing does NOT use a decode number at all — see `maybeDecodeRescue`: it
+// waits for the faults to be absent instead, because the same metric read the
+// other way round measures pipeline depth and gets BIGGER as playback gets
+// healthier.
 const MARGIN_BAD=0.8;
-const MARGIN_GOOD=0.6;
 const MARGIN_MIN_EVENTS=4;
 const MARGIN_MIN_SECS=20;
 const MARGIN_CLEAR_SECS=60;
@@ -3228,11 +3229,25 @@ function maybeDecodeRescue(){
   if(p.method!=='remux' && p.method!=='direct_play') return;
   const h=p.hitches, secs=playedSecs(v), q=qualityForce();
   if(q==='original'){
-    if(h.fps && h.decodeMs!=null && secs>=MARGIN_CLEAR_SECS
-       && h.decodeMs < (1000/h.fps)*MARGIN_GOOD && clearDecodeLimit(p.source)){
+    // Clearing is the rescue's own trigger, inverted: it fires on measured
+    // hitches, so it lifts on their measured absence — same window, same
+    // event count, the other way round.
+    //
+    // It used to lift when `decodeMs` fell under 60% of the frame budget,
+    // which reads `processingDuration` as decode cost. That is the misread
+    // guardrail 8 exists for, and here it was worse than wrong: on a
+    // pipelined decoder that number measures how DEEP the pipeline is, so a
+    // client holding a healthy reserve reports a LARGER one. On the 4K remux
+    // it went from 41.6ms to 91ms against a 41.7ms budget once the dvcC fix
+    // restored the hardware path — the playback got better and the clearing
+    // condition got further away. The entry could never clear at all, and
+    // Auto stayed pinned to a transcode on a device that had long since
+    // stopped needing one.
+    const clean=(h.back|0)+(h.held|0)+(h.late|0)+(h.drop|0)+(h.gap|0);
+    if(secs>=MARGIN_CLEAR_SECS && clean<MARGIN_MIN_EVENTS && clearDecodeLimit(p.source)){
       clientLog(Object.assign({level:"info",event:"decode_limit_cleared",
-        message:`this device now decodes ${decodeLimitKey(p.source)} with margin `+
-                `(${h.decodeMs}ms against ${(1000/h.fps).toFixed(1)}ms) — Auto may use Original again`},
+        message:`this device played ${decodeLimitKey(p.source)} for ${Math.round(secs)}s `+
+                `with ${clean} visible fault(s) — Auto may use Original again`},
         playbackContext()));
     }
     return;

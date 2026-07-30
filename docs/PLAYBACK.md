@@ -256,10 +256,23 @@ The verdict is remembered per `codec@height` in the browser
 (`plurx_decode_limits`), so the next Auto play of a matching stream routes
 straight to a transcode — the Reason row says so, with the measured numbers.
 Two things keep the memory honest: an explicit **Quality → Original** always
-wins (the limit only steers Auto, never the viewer), and an
-explicit-Original session that measures comfortable margin — under 60% of
-budget for 60 s — clears the entry and logs `decode_limit_cleared`, so a GPU
-upgrade is noticed rather than distrusted forever.
+wins (the limit only steers Auto, never the viewer), and an explicit-Original
+session that plays **60 s with fewer than 4 visible faults** clears the entry
+and logs `decode_limit_cleared`, so a device that stops needing the rescue is
+noticed rather than distrusted forever.
+
+Clearing is the trigger inverted — same window, same event count, the other
+way round — and deliberately not a decode number. It used to require
+`decodeMs` under 60% of the frame budget, which reads `processingDuration` as
+decode cost: guardrail 8's mistake, and worse here than usual, because on a
+pipelined decoder that figure measures how deep the pipeline is. A client
+holding a healthy reserve reports a *larger* one. On the 4K remux it went from
+41.6 ms to 91 ms against a 41.7 ms budget once the `dvcC` fix restored the
+hardware path — playback improved and the clearing condition moved further
+away, so the entry could never clear and Auto stayed on a transcode
+permanently. Found from the couch, 2026-07-30: Safari on Auto played 4K while
+Chrome on Auto would not, same machine, same file — only Chrome carried the
+remembered entry.
 
 **How to read it:** the stats overlay's Decoder row shows the measurement
 live (`hardware · 42ms/frame against a 42ms budget — no headroom`); a

@@ -1112,6 +1112,20 @@ impl CutReason {
 pub struct CutPolicy {
     /// Floor, in video timescale ticks, before a clean cut may be taken.
     pub floor_ticks: u64,
+    /// The same, for the FIRST segment only, and much lower.
+    ///
+    /// A player's runway at startup is exactly the first segment, because that
+    /// is all the playlist holds; its next chance to learn any other segment
+    /// exists is one `TARGETDURATION` away. So the first segment has to be
+    /// short enough that the first reload lands with time to spare — and by
+    /// then the burst has filled the playlist and the question never arises
+    /// again. It also puts the first frame on screen sooner, since nothing
+    /// plays until one whole segment exists.
+    ///
+    /// The cost is one extra boundary per session, and usually not even that:
+    /// the cut still has to land on a clean keyframe, and on a source with
+    /// clean points every couple of seconds it will.
+    pub first_floor_ticks: u64,
     /// Hard ceiling in bytes. Binding at 69 Mb/s long before any duration is.
     pub max_bytes: usize,
     /// Secondary ceiling in ticks, for sources whose bytes never pile up.
@@ -1122,6 +1136,7 @@ impl CutPolicy {
     /// Build from the shipped constants and the stream's own video timescale.
     pub fn new(
         floor_seconds: u32,
+        first_floor_seconds: u32,
         max_bytes: usize,
         max_seconds: u32,
         timescale: u32,
@@ -1129,6 +1144,7 @@ impl CutPolicy {
         let ts = timescale.max(1) as u64;
         CutPolicy {
             floor_ticks: floor_seconds as u64 * ts,
+            first_floor_ticks: first_floor_seconds.min(floor_seconds) as u64 * ts,
             max_bytes,
             max_ticks: max_seconds as u64 * ts,
         }
@@ -1159,8 +1175,14 @@ impl CutPolicy {
         pending_ticks: u64,
         pending_bytes: usize,
         next: CutClass,
+        first_segment: bool,
     ) -> Option<CutReason> {
-        if pending_bytes == 0 || pending_ticks < self.floor_ticks {
+        let floor = if first_segment {
+            self.first_floor_ticks
+        } else {
+            self.floor_ticks
+        };
+        if pending_bytes == 0 || pending_ticks < floor {
             return None;
         }
         if next.is_clean() {
@@ -1694,10 +1716,12 @@ impl Segmenter {
         if class == CutClass::Unparseable {
             self.counts.unparseable += 1;
         }
-        let published = match self
-            .policy
-            .cut_before(self.pending_ticks, self.pending_bytes, class)
-        {
+        let published = match self.policy.cut_before(
+            self.pending_ticks,
+            self.pending_bytes,
+            class,
+            self.next_index == 0,
+        ) {
             Some(reason) => Some(self.flush(reason)?),
             None => None,
         };
@@ -1746,12 +1770,22 @@ impl Segmenter {
 // playlist
 // ---------------------------------------------------------------------------
 
-/// The playlist header, written once when the session's first segment lands.
+/// The playlist header, rewritten with the playlist on every segment.
 ///
-/// `TARGETDURATION` is the duration ceiling from the start rather than a
-/// number that grows with the longest segment so far: the tag may never
-/// decrease mid-session, and a player that read a small one and then met a
-/// longer segment is entitled to complain.
+/// **`TARGETDURATION` is `ceil` of the longest segment published so far, and
+/// it only ever grows.** SEGMENTER-PLAN §3 said to declare the duration
+/// ceiling (15) up front instead, so the tag could never decrease. The
+/// reasoning was right and the consequence was not: on a live EVENT playlist
+/// this tag *is* the client's reload interval (RFC 8216 §6.3.4), so declaring
+/// 15 told Safari to wait fifteen seconds between playlist fetches. It loaded
+/// a playlist holding one 9.2-second segment, played it out, and then sat with
+/// nothing to play for the remaining 5.8 seconds — measured at 5631 ms, once
+/// per film, always at the same position, on a server that was 55 seconds
+/// ahead the whole time.
+///
+/// ffmpeg's HLS muxer grows this tag, which is why the path never had the
+/// problem before. Growing is what a live playlist needs; the invariant that
+/// matters is that it never *shrinks*, and this never does.
 ///
 /// No `#EXT-X-INDEPENDENT-SEGMENTS`. With clean cuts the claim would actually
 /// be true for most segments — but a ceiling cut makes it a lie again, and a
@@ -2078,20 +2112,23 @@ mod tests {
 
     #[test]
     fn the_policy_waits_past_the_floor_for_a_clean_fragment() {
-        let p = CutPolicy::new(6, 48_000_000, 15, 1_000);
+        let p = CutPolicy::new(6, 2, 48_000_000, 15, 1_000);
         // Under the floor, clean or not: keep going.
-        assert_eq!(p.cut_before(5_000, 1_000, CutClass::CleanIdr), None);
+        assert_eq!(p.cut_before(5_000, 1_000, CutClass::CleanIdr, false), None);
         // Past the floor but the next fragment is dirty: still keep going,
         // which is the entire behaviour change this module ships.
-        assert_eq!(p.cut_before(7_000, 1_000, CutClass::Dirty), None);
-        assert_eq!(p.cut_before(7_000, 1_000, CutClass::Unparseable), None);
+        assert_eq!(p.cut_before(7_000, 1_000, CutClass::Dirty, false), None);
+        assert_eq!(
+            p.cut_before(7_000, 1_000, CutClass::Unparseable, false),
+            None
+        );
         // Past the floor with a clean fragment in front: cut.
         assert_eq!(
-            p.cut_before(7_000, 1_000, CutClass::CleanCra),
+            p.cut_before(7_000, 1_000, CutClass::CleanCra, false),
             Some(CutReason::Clean)
         );
         // Nothing pending is not a cut, however clean the next fragment is.
-        assert_eq!(p.cut_before(0, 0, CutClass::CleanIdr), None);
+        assert_eq!(p.cut_before(0, 0, CutClass::CleanIdr, false), None);
     }
 
     /// The trap this ordering exists for, in one assertion. 48 MB arrives in
@@ -2101,34 +2138,43 @@ mod tests {
     /// for. Every boundary costs a frame.
     #[test]
     fn no_ceiling_may_cut_below_the_floor() {
-        let p = CutPolicy::new(6, 48_000_000, 15, 1_000);
-        assert_eq!(p.cut_before(5_600, 48_000_000, CutClass::Dirty), None);
-        assert_eq!(p.cut_before(5_999, usize::MAX, CutClass::Dirty), None);
+        let p = CutPolicy::new(6, 2, 48_000_000, 15, 1_000);
+        assert_eq!(
+            p.cut_before(5_600, 48_000_000, CutClass::Dirty, false),
+            None
+        );
+        assert_eq!(
+            p.cut_before(5_999, usize::MAX, CutClass::Dirty, false),
+            None
+        );
         // Not even for a clean fragment: under the floor there is nothing to
         // publish yet, and waiting costs nothing but a longer segment.
-        assert_eq!(p.cut_before(5_999, 48_000_000, CutClass::CleanIdr), None);
+        assert_eq!(
+            p.cut_before(5_999, 48_000_000, CutClass::CleanIdr, false),
+            None
+        );
         // One tick past it, the ceiling is free to act.
         assert_eq!(
-            p.cut_before(6_000, 48_000_000, CutClass::Dirty),
+            p.cut_before(6_000, 48_000_000, CutClass::Dirty, false),
             Some(CutReason::ByteCeiling)
         );
     }
 
     #[test]
     fn the_ceilings_cut_when_no_clean_point_arrives() {
-        let p = CutPolicy::new(6, 48_000_000, 15, 1_000);
+        let p = CutPolicy::new(6, 2, 48_000_000, 15, 1_000);
         assert_eq!(
-            p.cut_before(7_000, 48_000_000, CutClass::Dirty),
+            p.cut_before(7_000, 48_000_000, CutClass::Dirty, false),
             Some(CutReason::ByteCeiling)
         );
         assert_eq!(
-            p.cut_before(15_000, 1_000, CutClass::Dirty),
+            p.cut_before(15_000, 1_000, CutClass::Dirty, false),
             Some(CutReason::TimeCeiling)
         );
         // A ceiling that happens to land in front of a clean fragment is a
         // clean cut: the ceiling decided when, not where.
         assert_eq!(
-            p.cut_before(15_000, 48_000_000, CutClass::CleanIdr),
+            p.cut_before(15_000, 48_000_000, CutClass::CleanIdr, false),
             Some(CutReason::Clean)
         );
     }
@@ -2148,7 +2194,7 @@ mod tests {
         let feed = pipe(kind);
         let (init, frags, _) = read_all(&feed);
         let timescale = init.video().map(|v| v.timescale).unwrap_or(1);
-        let policy = CutPolicy::new(floor_s, max_bytes, max_s, timescale);
+        let policy = CutPolicy::new(floor_s, floor_s, max_bytes, max_s, timescale);
         let mut seg = Segmenter::new(init.clone(), policy);
         let mut out = Vec::new();
         for f in frags {
@@ -2738,7 +2784,13 @@ mod tests {
 
         // A floor nothing can reach, so the whole run lands in one segment at
         // `finish()` — which is what the real tail does.
-        let policy = CutPolicy::new(u32::MAX / timescale.max(1), usize::MAX, u32::MAX, timescale);
+        let policy = CutPolicy::new(
+            u32::MAX / timescale.max(1),
+            u32::MAX / timescale.max(1),
+            usize::MAX,
+            u32::MAX,
+            timescale,
+        );
         let mut seg = Segmenter::new(init.clone(), policy);
         for f in frags.iter().take(3) {
             let mut stripped = f.clone();

@@ -107,6 +107,24 @@ pub const COPY_SEGMENT_SECONDS: u32 = 6;
 /// segments" framing it replaces was never the thing that mattered.
 pub const COPY_SEGMENT_MAX_BYTES: usize = 64 * 1024 * 1024;
 
+/// Duration floor for the FIRST copy segment, and only the first.
+///
+/// A player starting a live EVENT playlist has exactly one segment of runway,
+/// because that is all the playlist holds when it loads it; its next chance to
+/// learn any other segment exists is one `EXT-X-TARGETDURATION` away. So the
+/// first segment being long is not a small cost — it is the whole startup
+/// buffer. Two seconds means the first reload lands with time to spare, and
+/// by then the session's burst has filled the playlist and the question never
+/// arises again.
+///
+/// It also puts the first frame on screen sooner: nothing plays until one
+/// whole segment exists.
+///
+/// Costs at most one extra boundary per session, and usually not even that —
+/// the cut still has to land on a keyframe with nothing to discard, which on a
+/// source with clean points every couple of seconds it will.
+pub const COPY_FIRST_SEGMENT_SECONDS: u32 = 2;
+
 /// Secondary ceiling, in seconds, for sources whose bytes never pile up.
 ///
 /// A 3 Mb/s home video would reach [`COPY_SEGMENT_MAX_BYTES`] after two

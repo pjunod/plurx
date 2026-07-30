@@ -25,7 +25,9 @@ use std::path::PathBuf;
 use plurx_core::fmp4::{
     self, FragmentReader, Init, Published, SegmentCounts, Segmenter, TrackKind, Unit,
 };
-use plurx_core::transcode::{COPY_SEGMENT_MAX_BYTES, COPY_SEGMENT_MAX_SECS, COPY_SEGMENT_SECONDS};
+use plurx_core::transcode::{
+    COPY_FIRST_SEGMENT_SECONDS, COPY_SEGMENT_MAX_BYTES, COPY_SEGMENT_MAX_SECS, COPY_SEGMENT_SECONDS,
+};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 /// How much pipe is read at a time. Big enough that a 12 MB/s copy is not a
@@ -56,6 +58,9 @@ const MEMORY_WARN_BYTES: usize = 160 * 1024 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     pub floor_seconds: u32,
+    /// The floor for the first segment only — see
+    /// [`plurx_core::fmp4::CutPolicy::first_floor_ticks`].
+    pub first_floor_seconds: u32,
     pub max_bytes: usize,
     pub max_seconds: u32,
 }
@@ -64,6 +69,7 @@ impl Default for Limits {
     fn default() -> Limits {
         Limits {
             floor_seconds: COPY_SEGMENT_SECONDS,
+            first_floor_seconds: COPY_FIRST_SEGMENT_SECONDS,
             max_bytes: COPY_SEGMENT_MAX_BYTES,
             max_seconds: COPY_SEGMENT_MAX_SECS,
         }
@@ -99,15 +105,32 @@ pub enum Outcome {
 /// next to the 50 MB of segment that triggered it.
 struct SessionDir {
     dir: PathBuf,
-    playlist: String,
+    /// The `#EXTINF`/URI pairs, without the header. The header is regenerated
+    /// on every write because `TARGETDURATION` grows with the longest segment
+    /// published so far.
+    entries: String,
+    /// `ceil` of the longest `EXTINF` so far. Never decreases.
+    target_duration: u32,
+    started: bool,
 }
 
 impl SessionDir {
     fn new(dir: PathBuf) -> SessionDir {
         SessionDir {
             dir,
-            playlist: String::new(),
+            entries: String::new(),
+            target_duration: 0,
+            started: false,
         }
+    }
+
+    fn playlist(&self, end: bool) -> String {
+        let mut out = fmp4::playlist_header(self.target_duration.max(1));
+        out.push_str(&self.entries);
+        if end {
+            out.push_str("#EXT-X-ENDLIST\n");
+        }
+        out
     }
 
     /// tmp + rename, the semantics the whole daemon assumes: a segment or a
@@ -118,32 +141,37 @@ impl SessionDir {
         tokio::fs::rename(&tmp, self.dir.join(name)).await
     }
 
-    async fn write_init(&mut self, init: &Init, target_duration: u32) -> std::io::Result<()> {
+    async fn write_init(&mut self, init: &Init) -> std::io::Result<()> {
         self.publish_file("init.mp4", &init.bytes).await?;
-        self.playlist = fmp4::playlist_header(target_duration);
-        // The header is not written yet: a playlist with no segment in it is
-        // a promise the session cannot keep if ffmpeg dies in the next second,
-        // and `session_producing` reads exactly this file to decide whether
-        // there is real output. It lands with the first segment.
+        // No playlist yet: one with no segment in it is a promise the session
+        // cannot keep if ffmpeg dies in the next second, and
+        // `session_producing` reads exactly this file to decide whether there
+        // is real output. It lands with the first segment.
         Ok(())
     }
 
     async fn write_segment(&mut self, published: &Published) -> std::io::Result<()> {
         let name = published.name();
         self.publish_file(&name, &published.segment.bytes).await?;
-        self.playlist
+        self.entries
             .push_str(&fmp4::playlist_entry(published.seconds, &name));
-        self.publish_file("index.m3u8", self.playlist.as_bytes())
-            .await
+        // Grows, never shrinks. A client that read a smaller number and then
+        // met a longer segment would be entitled to complain; one that read a
+        // number far larger than any real segment waits that long between
+        // playlist fetches, which is the stall this replaced.
+        let need = published.seconds.ceil().max(1.0) as u32;
+        self.target_duration = self.target_duration.max(need);
+        self.started = true;
+        let text = self.playlist(false);
+        self.publish_file("index.m3u8", text.as_bytes()).await
     }
 
     async fn write_endlist(&mut self) -> std::io::Result<()> {
-        if self.playlist.is_empty() {
+        if !self.started {
             return Ok(());
         }
-        self.playlist.push_str("#EXT-X-ENDLIST\n");
-        self.publish_file("index.m3u8", self.playlist.as_bytes())
-            .await
+        let text = self.playlist(true);
+        self.publish_file("index.m3u8", text.as_bytes()).await
     }
 }
 
@@ -237,11 +265,12 @@ pub async fn run<R: AsyncRead + Unpin>(
                     }
                     let policy = fmp4::CutPolicy::new(
                         limits.floor_seconds,
+                        limits.first_floor_seconds,
                         limits.max_bytes,
                         limits.max_seconds,
                         video.timescale,
                     );
-                    if let Err(e) = out.write_init(&init, limits.max_seconds).await {
+                    if let Err(e) = out.write_init(&init).await {
                         return Outcome::Unsupported(format!("writing init.mp4: {e}"));
                     }
                     segmenter = Some(Segmenter::new(init, policy));
@@ -399,6 +428,7 @@ mod tests {
     fn brisk() -> Limits {
         Limits {
             floor_seconds: 3,
+            first_floor_seconds: 1,
             max_bytes: 48_000_000,
             max_seconds: 15,
         }
@@ -461,6 +491,7 @@ mod tests {
     async fn a_source_with_no_clean_points_cuts_at_the_ceiling_and_says_so() {
         let limits = Limits {
             floor_seconds: 3,
+            first_floor_seconds: 1,
             max_bytes: 300_000,
             max_seconds: 15,
         };
@@ -492,7 +523,6 @@ mod tests {
         for tag in [
             "#EXTM3U\n",
             "#EXT-X-VERSION:7\n",
-            "#EXT-X-TARGETDURATION:15\n",
             "#EXT-X-MEDIA-SEQUENCE:0\n",
             "#EXT-X-PLAYLIST-TYPE:EVENT\n",
             "#EXT-X-MAP:URI=\"init.mp4\"\n",
@@ -504,6 +534,27 @@ mod tests {
             "a claim a ceiling cut makes false"
         );
 
+        // TARGETDURATION is the client's playlist-reload interval on a live
+        // EVENT playlist (RFC 8216 §6.3.4), so it has to be the real ceiling
+        // of what was published — not a constant far above it, which is how a
+        // player ends up waiting fifteen seconds to learn a second segment
+        // exists and stalls at the end of the first.
+        let longest = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("#EXTINF:"))
+            .filter_map(|l| l.split(',').next()?.parse::<f64>().ok())
+            .fold(0.0f64, f64::max);
+        let declared: u32 = text
+            .lines()
+            .find_map(|l| l.strip_prefix("#EXT-X-TARGETDURATION:"))
+            .and_then(|v| v.trim().parse().ok())
+            .expect("a target duration");
+        assert_eq!(
+            declared,
+            longest.ceil().max(1.0) as u32,
+            "TARGETDURATION {declared} against a longest segment of {longest:.3}s"
+        );
+
         let part = crate::produce::Part::from_playlist(&text);
         assert_eq!(part.segments.len() as u64, counts.segments);
         assert_eq!(part.durations_ms.len() as u64, counts.segments);
@@ -512,6 +563,49 @@ mod tests {
             (11_900..=12_100).contains(&total),
             "produce read {total}ms out of a 12 s fixture"
         );
+    }
+
+    /// The startup stall, as a test. A player's runway when it loads a live
+    /// playlist is the first segment and nothing else; its next chance to see
+    /// a second one is one TARGETDURATION away. So the first segment must be
+    /// short and the tag must be honest, or the picture stops the moment
+    /// segment zero runs out — which is exactly what Safari did, 5631 ms at
+    /// 9.2 s, on a server 55 seconds ahead.
+    #[tokio::test]
+    async fn the_first_segment_is_short_and_the_playlist_says_so() {
+        let (dir, outcome) = session("clean-cra", Limits::default()).await;
+        let Outcome::Ran(counts) = outcome else {
+            panic!("{outcome:?}");
+        };
+        assert!(counts.segments >= 2, "{counts:?}");
+        let text = playlist(dir.path());
+        let extinf: Vec<f64> = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("#EXTINF:"))
+            .filter_map(|l| l.split(',').next()?.parse::<f64>().ok())
+            .collect();
+        let declared: u32 = text
+            .lines()
+            .find_map(|l| l.strip_prefix("#EXT-X-TARGETDURATION:"))
+            .and_then(|v| v.trim().parse().ok())
+            .expect("a target duration");
+
+        // Short enough that the first reload arrives before it runs out.
+        assert!(
+            extinf[0] < declared as f64,
+            "the first segment is {}s against a {declared}s reload interval — \
+             the player runs dry before it can learn segment 1 exists",
+            extinf[0]
+        );
+        // And short in absolute terms: this is the whole startup buffer.
+        assert!(extinf[0] <= 4.0, "first segment {}s", extinf[0]);
+        // The shipped floor still governs everything after it.
+        for (i, d) in extinf.iter().enumerate().skip(1).take(extinf.len() - 2) {
+            assert!(
+                *d >= COPY_SEGMENT_SECONDS as f64,
+                "segment {i} is {d}s, under the {COPY_SEGMENT_SECONDS}s floor"
+            );
+        }
     }
 
     /// A killed session — the pipe stops mid-fragment. What is on disk has to
@@ -689,6 +783,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let limits = Limits {
             floor_seconds: 3,
+            first_floor_seconds: 1,
             max_bytes: 48_000_000,
             max_seconds: 15,
         };

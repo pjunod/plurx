@@ -44,6 +44,26 @@ bump may break compatibility and a **patch** bump never does.
   immediately. Transcode segments stay at 2 s, where the encoder produces in
   real time and a closed GOP has nothing to lose at a boundary.
 
+### Fixed
+
+- **A remembered decode limit could never be forgotten.** The player remembers
+  a stream a device measured itself unable to hold smoothly, so Auto routes
+  straight to a transcode instead of stuttering first. Clearing that memory
+  required the measured decode figure to fall below 60% of the frame budget —
+  but that figure measures how deep the decoder's pipeline is, not how hard it
+  is working, and it gets *bigger* as playback gets healthier. So a device that
+  had stopped needing the rescue could never say so, and Auto stayed pinned to
+  a transcode for good. Clearing is now the trigger inverted: a minute of
+  explicit-Original playback with almost no visible faults lifts it.
+- **The first copy segment could out-run the playlist.** `EXT-X-TARGETDURATION`
+  is a live playlist's reload interval, and it was declared as the segment
+  duration *ceiling* rather than what had actually been published — so a player
+  loaded a playlist holding one nine-second segment, played it out, and waited
+  the remaining six seconds for its next look at the playlist. Once per film,
+  always at the same spot. The tag now tracks the longest segment published,
+  and the first segment is deliberately short so the first reload lands with
+  time to spare.
+
 ### Added
 
 - Playback stats: native HLS (Safari) sessions now attribute hitches to
