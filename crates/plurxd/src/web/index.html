@@ -1026,14 +1026,14 @@ function endWait(resumed){
 // what identifies a cause is the count and the spacing.
 function reportHitches(){
   const p=PLAYER; if(!p||!p.hitches) return;
-  const h=p.hitches, n=h.back+h.held+(h.late||0)+h.gap;
+  const h=p.hitches, n=h.back+h.held+(h.late||0)+(h.drop||0)+h.gap;
   if(n<5 || p._hitchReported===n) return;
   if(n!==5 && n%50!==0) return;
   p._hitchReported=n;
   const iv=hitchInterval();
   const blame=hitchBlame();
   clientLog(Object.assign({level:"warn",event:"hitch",
-    detail:`back=${h.back} held=${h.held} late=${h.late||0} skip=${h.gap} slow=${h.slow}${h.fps?` fps=${h.fps.toFixed(2)}`:''}`,
+    detail:`back=${h.back} held=${h.held} late=${h.late||0} drop=${h.drop||0} skip=${h.gap} slow=${h.slow}${h.fps?` fps=${h.fps.toFixed(2)}`:''}${h.rate!=null?` rate=${h.rate.toFixed(3)}`:''}`,
     message:`${n} frame hitches${iv?`, one every ~${iv.toFixed(1)}s`:''}${blame?` — ${blame}`:''} — ${h.last||''}`},
     playbackContext()));
 }
@@ -2808,8 +2808,9 @@ function markEvent(kind){
 function armHitchDetector(v){
   if(!v.requestVideoFrameCallback) return;
   const p=PLAYER; if(!p) return;
-  p.hitches={back:0, held:0, late:0, gap:0, slow:0, worst:0, last:null, at:[], fps:null,
-             n:0, near:{}, flushEdge:null, skewMax:0, skewAt:null, decodeMs:null, frames:0};
+  p.hitches={back:0, held:0, late:0, gap:0, drop:0, slow:0, worst:0, last:null, at:[], fps:null,
+             n:0, near:{}, flushEdge:null, skewMax:0, skewAt:null, decodeMs:null, frames:0,
+             rate:null};
   // When the detector armed, so "zero faults" can be told apart from "zero
   // callbacks". Safari has shipped rVFC for years and still declines to fire
   // it on some pipelines — a session that stutters visibly while this
@@ -2829,11 +2830,30 @@ function armHitchDetector(v){
   // depth, not of whether it is coping.
   const decodes=[];
   const typicalDecode=()=>decodes.length<HITCH_WARMUP?null:median(decodes);
+  // The REALIZED playback rate: media time advanced per wall-clock second,
+  // over a rolling window. `video.playbackRate` says what was asked for;
+  // this says what is happening — and the gap between them is how Safari's
+  // live-edge chasing shows itself. A native HLS session on our growing
+  // EVENT playlist (no ENDLIST until the film is fully written) can be
+  // rate-matched toward the live edge by the browser without ever admitting
+  // it in playbackRate, and 5-10% fast is judder a viewer sees and every
+  // per-frame counter forgives. Window ~10s so main-thread jitter in the
+  // callback timestamps averages out; cleared on pause/seek because a ring
+  // spanning a seek measures the seek.
+  const rateWin=[];
+  const noteRate=(now, mediaTime, h)=>{
+    rateWin.push({w:now, m:mediaTime});
+    while(rateWin.length>240) rateWin.shift();
+    const a=rateWin[0], b=rateWin[rateWin.length-1];
+    if(b.w-a.w>4000) h.rate=+(((b.m-a.m)*1000)/(b.w-a.w)).toFixed(3);
+  };
   const step=(now, meta)=>{
     // Bail the moment this playback is replaced, or the callback outlives its
     // PLAYER and starts recording another stream's frames as this one's.
     if(PLAYER!==p) return;
     p.hitches.frames++;
+    if(v.paused || v.seeking) rateWin.length=0;
+    else noteRate(now, meta.mediaTime, p.hitches);
     if(prev!=null && !v.paused && !v.seeking){
       const h=p.hitches;
       const dt=meta.mediaTime-prev.mediaTime;
@@ -2891,6 +2911,19 @@ function armHitchDetector(v){
         // browser batching, not a stutter — the viewer saw all of them.
         h.gap++; h.worst=Math.max(h.worst, (dt-dn*nom)*1000);
         h.last=`skipped ${((dt-dn*nom)*1000).toFixed(0)}ms at ${meta.mediaTime.toFixed(1)}s${fx()}`;
+        h.at.push(+meta.mediaTime.toFixed(2));
+      } else if(nom && dn===1 && dt>nom*1.6 && dt<nom*2.6){
+        // Exactly one frame missing: one presented callback, media two frames
+        // on. The gap threshold above deliberately tolerates this — Chrome's
+        // coalescing makes small dt/dn mismatches routine — which made the
+        // single dropped frame, Safari's signature fault at one every few
+        // seconds and plainly visible to a viewer, the one artifact this
+        // instrument refused to count (17 in droppedVideoFrames, zero on this
+        // row). dn===1 keeps the coalescing exemption: several frames
+        // PRESENTED in one callback is batching, not a drop.
+        blame();
+        h.drop=(h.drop||0)+1;
+        h.last=`dropped a frame at ${meta.mediaTime.toFixed(1)}s${fx()}`;
         h.at.push(+meta.mediaTime.toFixed(2));
       } else {
         // The media step is normal — but was it ON TIME? A compositor hold
@@ -4150,7 +4183,13 @@ function updateStats(){
     `<div class="sechd">Now decoding</div>`+
     `<div><b>Resolution</b>${tgtRes}</div>`+
     `<div><b>Dropped</b>${dropped} frames</div>`+
-    (fps!=null?`<div><b>Frame rate</b><span${fps<20?' style="color:var(--warn,#fbbf24)"':''}>${fps.toFixed(1)} fps rendered</span></div>`:'')+
+    (fps!=null?(()=>{
+      const h=PLAYER.hitches, want=(v.playbackRate||1);
+      const chased=h&&h.rate!=null&&Math.abs(h.rate-want)>0.02;
+      return `<div><b>Frame rate</b><span${fps<20?' style="color:var(--warn,#fbbf24)"':''}>${fps.toFixed(1)} fps rendered</span>${
+        chased?` · <span style="color:var(--warn,#fbbf24)">playing at ${(h.rate*100).toFixed(1)}% speed${
+          want===1?" — the browser is rate-chasing":""}</span>`:''}</div>`;
+    })():'')+
     // The browser's own verdict on whether it is using the GPU for this. A
     // software 4K HEVC decode is a full buffer, few dropped frames and
     // constant judder — indistinguishable from a delivery problem on every
@@ -4162,11 +4201,12 @@ function updateStats(){
     (PLAYER.hitches&&!PLAYER.hitches.frames&&PLAYER.started
       &&PLAYER.hitchArmedAt&&(performance.now()-PLAYER.hitchArmedAt)>10000?
       `<div><b>Hitches</b><span class="muted">this browser gives the detector no frame callbacks — faults here are invisible, not absent</span></div>`:'')+
-    (PLAYER.hitches&&(PLAYER.hitches.back||PLAYER.hitches.held||PLAYER.hitches.late||PLAYER.hitches.gap||PLAYER.hitches.slow)?
+    (PLAYER.hitches&&(PLAYER.hitches.back||PLAYER.hitches.held||PLAYER.hitches.late||PLAYER.hitches.drop||PLAYER.hitches.gap||PLAYER.hitches.slow)?
       `<div><b>Hitches</b><span style="color:var(--warn,#fbbf24)">${
         [PLAYER.hitches.back?`${PLAYER.hitches.back} back`:null,
          PLAYER.hitches.held?`${PLAYER.hitches.held} held`:null,
          PLAYER.hitches.late?`${PLAYER.hitches.late} late`:null,
+         PLAYER.hitches.drop?`${PLAYER.hitches.drop} drop`:null,
          PLAYER.hitches.gap?`${PLAYER.hitches.gap} skip`:null,
          PLAYER.hitches.slow?`${PLAYER.hitches.slow} slow`:null].filter(Boolean).join(" · ")
       }${hitchInterval()?` · every ~${hitchInterval().toFixed(1)}s`:''}</span></div>`
