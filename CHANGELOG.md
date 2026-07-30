@@ -46,6 +46,28 @@ bump may break compatibility and a **patch** bump never does.
 
 ### Fixed
 
+- **Playback stopped for a few seconds at the same spot in every film — the
+  client was losing a race the server didn't know it was running.** With
+  the publish gate, the first playlist a player loads is a cushion of
+  media — 12 s or more — while hls.js buffers only ~9 s of it and parks.
+  hls.js reloads a live playlist on demand rather than on the
+  targetduration cadence, and it stretches the reload interval when
+  playback sits far behind the live edge, which is exactly where the gate
+  puts every session on purpose. So the reload that would have revealed
+  the next segment raced the playhead to the cushion's edge and lost:
+  `bufferStalledError` at the edge, a several-second freeze at the same
+  position every play, then recovery when the backoff finally re-polled.
+  Safari never stalled on the identical stream — AVFoundation polls every
+  targetduration unconditionally. Diagnosed end to end by the new beacons
+  (supply stall with 0.1 s runway; `bufferStalledError at 12.4s`), the
+  session's own playlist (first-playlist edge at 12.471 s, the stall
+  position exactly), and a headless harness that reproduced the stall on
+  synthetic media from the playlist shape alone. The fix restores the
+  cadence Safari always had: while the playlist is live and hls.js has
+  not refreshed it for ~half a target duration, the player asks for a
+  refresh through the loader's own entry point. In the harness that took
+  the stall from 7.8 seconds to zero, with every segment fetched on the
+  first poll after it existed.
 - **A remembered decode limit could never be forgotten.** The player remembers
   a stream a device measured itself unable to hold smoothly, so Auto routes
   straight to a transcode instead of stuttering first. Clearing that memory

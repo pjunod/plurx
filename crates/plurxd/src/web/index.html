@@ -1061,7 +1061,7 @@ function reportRateChase(v){
   p._chaseAt=now;
   clientLog(Object.assign({level:"warn",event:"rate_chase",
     detail:`rate=${h.rate.toFixed(3)} of ${want} fps=${h.renderedFps!=null?h.renderedFps.toFixed(1):"?"} runway=${runway}s slow=${h.slow} late=${h.late||0}`,
-    message:`presenting at ${(h.rate*100/want).toFixed(1)}% speed with ${runway}s buffered — decode/present side, not supply`},
+    message:`presenting at ${(h.rate*100/want).toFixed(1)}% speed with ${runway}s buffered now — the window may be digesting a stall just before this (check stall/player_event lines)`},
     playbackContext(), {runway}));
 }
 // The buffer stopped growing, and this says why. `quota` is the interesting
@@ -2398,7 +2398,44 @@ function attachHls(video, playlistUrl, startAt){
     if(Hls.Events.LEVEL_LOADED) hls.on(Hls.Events.LEVEL_LOADED,(_,d)=>{
       const t=d&&d.details&&d.details.targetduration;
       if(t>0) retuneBuffer(t);
+      // Feed the reload keeper below: when the playlist last arrived, and
+      // whether it is still growing.
+      PLAYER._levelAt=performance.now();
+      PLAYER._levelLive=!!(d&&d.details&&d.details.live);
     });
+    // The live-playlist reload keeper — the fix for the stop at the cushion
+    // edge (STUTTER-4K §5.8). hls.js reloads a live playlist on demand, not
+    // on the RFC's targetduration cadence, and it stretches the interval
+    // when playback is far behind the live edge — which is exactly where the
+    // publish gate puts every session on purpose: the first playlist IS a
+    // cushion. Measured in a headless harness against this very hls.min.js:
+    // on a 16 s initial playlist the first reload came 16 s after load, then
+    // 4 s unchanged-backoff, so the playhead reached the cushion edge before
+    // the reload that would have revealed the next segment — a several-second
+    // freeze at a fixed position, every play (bufferStalledError at 12.4 s on
+    // the reference film). Safari never stalled on the same stream:
+    // AVFoundation polls every targetduration unconditionally. So restore
+    // that cadence ourselves: while the playlist is live and hls.js has not
+    // refreshed it for ~half a target duration, ask for one. LEVEL_LOADING
+    // with levelInfo is the loader's own entry point, verified against this
+    // vendored build (without levelInfo it works but throws an
+    // internalException per poll; with it, clean). With the keeper the
+    // harness fetched every segment on the first poll after it existed and
+    // the stall was gone outright. The interval outlives nothing: it clears
+    // itself the moment this hls instance is no longer the player's.
+    {
+      const iv=setInterval(()=>{
+        const p=PLAYER;
+        if(!p || p.hls!==hls){ clearInterval(iv); return; }
+        if(!p._levelLive || !p._levelAt) return;
+        if(performance.now()-p._levelAt<=4500) return;
+        const li=hls.currentLevel<0?0:hls.currentLevel;
+        const lv=hls.levels&&hls.levels[li];
+        if(!lv) return;
+        try{ hls.trigger(Hls.Events.LEVEL_LOADING,
+          {url:lv.url,level:li,levelInfo:lv,id:0,deliveryDirectives:null}); }catch(e){}
+      },1000);
+    }
     // The largest segment this session has actually appended, in BYTES.
     //
     // Every other figure available before this one is a derivation — seconds

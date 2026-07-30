@@ -916,9 +916,13 @@ showed 23.9 fps and no chase at all. The 75% readings were the window
 digesting one multi-second stop, not a sustained presentation deficit.
 Reproduced with Chrome fully restarted, a single tab, the machine plugged
 in and forced to high power: not thermal, not tab contention, not battery
-policy, not capacity (healthy either side of the stop), not supply (the
-buffer is full straight through it). A stop at a *fixed position* is a
-mechanism at that position.
+policy, not capacity (healthy either side of the stop). This paragraph
+originally added "not supply — the buffer is full straight through it",
+and the beacons disproved that within the hour: every overlay's 10–15 s
+buffer was read *after* recovery, while at the stall itself the stall
+beacon measured **0.1 s of contiguous runway**. A stop at a *fixed
+position* is a mechanism at that position — and the position, it turned
+out, was the playlist's.
 
 **And telemetry missed all of it, twice over.** The hitch beacon triggers
 on `back+held+late+drop+skip ≥ 5`; `slow` does not count, correctly — the
@@ -946,19 +950,49 @@ Two instruments close that, both measurement-only:
   controller working around a buffered hole, the very first line names it
   and its position.
 
-What would settle the mechanism, each one play long: whether the stop
-follows the *film* (a session started past 12.5 s never stops; one started
-at 0:11 stops almost immediately — a defect at that position in the stream,
-e.g. a bad join or a source splice at the logo transition) or follows the
-*session* (a session started anywhere stops ~12.5 s after its own start —
-session structure: a join the segmenter makes at the same offset every
-time, and note `repaired joins` in the session's closing summary line);
-whether audio plays through the stop (present-side) or stops with the
-picture (clock/audio side — the media clock follows the audio master, and
-TrueHD → 7.1-channel AAC is the least-tested audio shape in this chain:
-every fixture is stereo); and what the browser console prints at the stop.
-Whether Auto should eventually *rescue* on a sustained chase is a decision
-that waits for this data — the beacons are its evidence.
+**Resolved the same night, with the instruments' own evidence.** The
+chain, each link measured:
+
+1. The stall beacon classified it: `supply stall, 3.1 s, 0.1 s buffered` —
+   the contiguous range ran out. `player_event` named the mechanism from
+   hls.js's side: `bufferStalledError at 12.4s (#1) runway=0.1s`, every
+   play.
+2. The session directory named the position: the live session's playlist
+   read `#EXTINF:4.505` + `#EXTINF:7.966` — **the first playlist's edge is
+   12.471 s**, exactly where every play stopped. ffprobe over the actual
+   segments found both tracks' timelines gap-free through every join: the
+   bytes were innocent; the *announcement* of the next segment was late.
+3. A headless harness (fresh in `/tmp`, per the M4 tradition: VP9 fixture,
+   a growing EVENT playlist server, this repo's own `hls.min.js`, the
+   app's buffer numbers) reproduced it on synthetic media from the playlist
+   shape alone — STALL 7.8 s at the 16 s initial-playlist edge — and the
+   server's request log showed why: **hls.js reloads a live playlist on
+   demand, not on the targetduration cadence**, and it stretches the
+   interval when playback is far behind the live edge. First reload 16 s
+   after load, then 4 s unchanged-backoff. The publish gate puts every
+   session exactly there on purpose: the first playlist IS a cushion, the
+   client buffers 9 s of its 12–16 s and parks, and the reload that would
+   reveal the next segment loses the race with the playhead. Safari never
+   stalls on the identical stream because AVFoundation polls every
+   targetduration unconditionally.
+
+The fix is a client-side reload keeper: while the playlist is live and
+hls.js has not refreshed it for 4.5 s (~half a target duration), the player
+asks for a refresh through the loader's own entry point
+(`LEVEL_LOADING` with `levelInfo` — verified against the vendored build;
+without `levelInfo` it works but throws an `internalException` per poll).
+In the harness, the keeper restored Safari's cadence: a playlist request
+every ~5 s, every segment fetched on the first poll after it existed, and
+the stall gone outright — `END wall 50.01s media 49.72s`, zero stall lines.
+The keeper clears itself the moment its hls instance stops being the
+player's.
+
+Still open, smaller and separate: the `bufferStalledError at 0.0s` startup
+blip (recovers in under a second; likely first-append latency), and Tron's
+clean-cut density — 8 clean of 17 cuts, against Wicked's ~68% — which is a
+`gop-census` question about that disc, not a defect. Whether Auto should
+rescue on a *sustained* chase remains a decision with beacons now feeding
+it.
 
 ---
 
