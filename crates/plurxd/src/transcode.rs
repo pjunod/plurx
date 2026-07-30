@@ -2387,12 +2387,21 @@ impl TranscodeManager {
             .await
             .map_err(|e| format!("creating session dir: {e}"))?;
 
+        // Whether the DV strip may use dovi_rpu is an ffmpeg capability, and
+        // the version line the cache config already carries is the record of
+        // which ffmpeg this manager runs.
+        let have_dovi = self
+            .cache
+            .as_ref()
+            .map(|c| transcode::ffmpeg_has_dovi_bsf(&c.ffmpeg_build))
+            .unwrap_or(false);
         let args = transcode::hls_copy_args(
             &file,
             start_seconds,
             audio_override,
             transcode_audio,
             self.pacing(true).await,
+            have_dovi,
             &dir.to_string_lossy(),
         );
         tracing::info!(

@@ -70,11 +70,55 @@ pub const SEGMENT_SECONDS: u32 = 2;
 /// grid (1001/24000 at 23.976) instead of carrying the MKV's millisecond
 /// rounding — which also zeroes the sub-frame presentation overlap the plain
 /// copy left at every segment join.
-pub fn hevc_copy_bsf(hdr: Option<&str>) -> String {
+///
+/// One more thing a Dolby Vision source has to shed, learned from Safari on
+/// an M3 Max (docs/STUTTER-4K.md): the *container signaling*. Stripping the
+/// RPU/EL NAL units leaves the stream's DOVI configuration side data intact,
+/// and the muxer writes it out as a `dvcC` box — a stream that DECLARES
+/// Dolby Vision Profile 7 (the dual-layer Blu-ray profile no browser and no
+/// Apple device supports) while carrying none of its data. Chrome ignores
+/// the box; VideoToolbox honours it, and Safari answered with a software
+/// decode of 4K10 HEVC on hardware that has a dedicated HEVC block. The
+/// `dovi_rpu=strip=1` filter (ffmpeg ≥ 7.1) removes the RPUs *and* the DOVI
+/// side data, so nothing is left to write a `dvcC` from and the stream is
+/// signalled as what it now is: plain HDR10.
+pub fn hevc_copy_bsf(hdr: Option<&str>, have_dovi_bsf: bool) -> String {
     if hdr == Some("dolby_vision") {
-        "filter_units=remove_types=32-34|62-63".to_owned()
+        if have_dovi_bsf {
+            "dovi_rpu=strip=1,filter_units=remove_types=32-34|62-63".to_owned()
+        } else {
+            "filter_units=remove_types=32-34|62-63".to_owned()
+        }
     } else {
         "filter_units=remove_types=32-34".to_owned()
+    }
+}
+
+/// Whether this ffmpeg has the `dovi_rpu` bitstream filter (landed in 7.1).
+///
+/// Parsed from the version line the daemon already collects at boot
+/// ("ffmpeg version 7.1.4-Jellyfin …"). Unknown parses answer `false`: the
+/// fallback path merely leaves the `dvcC` box behind, while passing an
+/// unknown filter to an older ffmpeg is a hard exit for the whole session.
+pub fn ffmpeg_has_dovi_bsf(version_line: &str) -> bool {
+    // The first token carrying a digit is the version, wherever the build put
+    // it: "7.1.4-Jellyfin", "n7.1.2", "6.1.1-3ubuntu5" all qualify.
+    let v = version_line
+        .split_whitespace()
+        .find(|w| w.chars().any(|c| c.is_ascii_digit()))
+        .unwrap_or("");
+    let mut parts = v.split(|c: char| !c.is_ascii_digit()).filter_map(|p| {
+        if p.is_empty() {
+            None
+        } else {
+            p.parse::<u32>().ok()
+        }
+    });
+    match (parts.next(), parts.next()) {
+        (Some(major), _) if major > 7 => true,
+        (Some(7), Some(minor)) => minor >= 1,
+        (Some(7), None) => false,
+        _ => false,
     }
 }
 
@@ -597,6 +641,7 @@ pub fn hls_copy_args(
     audio_index: Option<i64>,
     transcode_audio: bool,
     pacing: Pacing,
+    have_dovi_bsf: bool,
     out_dir: &str,
 ) -> Vec<String> {
     let source_path = source.path.to_string_lossy().into_owned();
@@ -654,7 +699,7 @@ pub fn hls_copy_args(
         args.push("-tag:v".into());
         args.push("hvc1".into());
         args.push("-bsf:v".into());
-        args.push(hevc_copy_bsf(source.hdr.as_deref()));
+        args.push(hevc_copy_bsf(source.hdr.as_deref(), have_dovi_bsf));
     }
 
     if transcode_audio {
@@ -930,6 +975,7 @@ mod tests {
             None,
             true,
             Pacing::unpaced(),
+            false,
             "/tmp/sess",
         );
         let joined = args.join(" ");
@@ -959,6 +1005,7 @@ mod tests {
             None,
             true,
             Pacing::unpaced(),
+            false,
             "/tmp/s",
         )
         .join(" ");
@@ -971,18 +1018,56 @@ mod tests {
             None,
             true,
             Pacing::unpaced(),
+            false,
             "/tmp/s",
         )
         .join(" ");
         assert!(dv.contains("-bsf:v filter_units=remove_types=32-34|62-63"));
 
+        // With a capable ffmpeg the DV strip also removes the container
+        // signaling: dovi_rpu drops the DOVI side data, so the muxer writes
+        // no dvcC and the stream stops claiming a profile nothing supports.
+        let dv7 = hls_copy_args(
+            &file(Some("dolby_vision")),
+            0.0,
+            None,
+            true,
+            Pacing::unpaced(),
+            true,
+            "/tmp/s",
+        )
+        .join(" ");
+        assert!(dv7.contains("-bsf:v dovi_rpu=strip=1,filter_units=remove_types=32-34|62-63"));
+
         // H.264 copies are untouched: they are not on the stuttering path and
         // avc1 + in-band parameter sets plays everywhere today.
         let mut f = file(None);
         f.video_codec = Some("h264".into());
-        let h264 = hls_copy_args(&f, 0.0, None, true, Pacing::unpaced(), "/tmp/s").join(" ");
+        let h264 = hls_copy_args(&f, 0.0, None, true, Pacing::unpaced(), true, "/tmp/s").join(" ");
         assert!(!h264.contains("-bsf:v"));
         assert!(!h264.contains("-tag:v"));
+    }
+
+    /// The gate on dovi_rpu is an ffmpeg version parse, and getting it wrong
+    /// in either direction has a cost: too eager is a hard session exit on an
+    /// older build ("Unknown bit stream filter"), too shy leaves the dvcC box
+    /// that made Safari software-decode 4K on an M3 Max.
+    #[test]
+    fn dovi_bsf_gate_reads_real_version_lines() {
+        assert!(ffmpeg_has_dovi_bsf(
+            "ffmpeg version 7.1.4-Jellyfin Copyright (c) 2000-2026"
+        ));
+        assert!(ffmpeg_has_dovi_bsf("ffmpeg version 7.1"));
+        assert!(ffmpeg_has_dovi_bsf("ffmpeg version 8.0-static"));
+        assert!(!ffmpeg_has_dovi_bsf(
+            "ffmpeg version 6.1.1-3ubuntu5 Copyright (c) 2000-2023"
+        ));
+        assert!(!ffmpeg_has_dovi_bsf("ffmpeg version 7.0.2"));
+        assert!(!ffmpeg_has_dovi_bsf("ffmpeg version 7"));
+        assert!(!ffmpeg_has_dovi_bsf(""));
+        assert!(!ffmpeg_has_dovi_bsf("not a version line at all"));
+        // The n-prefixed spelling some builds use.
+        assert!(ffmpeg_has_dovi_bsf("ffmpeg version n7.1.2"));
     }
 
     #[test]
@@ -993,6 +1078,7 @@ mod tests {
             Some(1),
             false,
             Pacing::unpaced(),
+            false,
             "/tmp/s",
         );
         let joined = args.join(" ");
@@ -1016,7 +1102,7 @@ mod tests {
         };
         let mut f = file(None);
         f.audio_offset_ms = 250; // forces the second input
-        let args = hls_copy_args(&f, 0.0, None, false, pacing, "/tmp/s");
+        let args = hls_copy_args(&f, 0.0, None, false, pacing, false, "/tmp/s");
 
         let inputs: Vec<usize> = args
             .iter()
@@ -1042,7 +1128,8 @@ mod tests {
 
     #[test]
     fn pacing_degrades_with_the_ffmpeg_build() {
-        let out = |p: Pacing| hls_copy_args(&file(None), 0.0, None, false, p, "/tmp/s").join(" ");
+        let out =
+            |p: Pacing| hls_copy_args(&file(None), 0.0, None, false, p, false, "/tmp/s").join(" ");
         // Nothing configured (or pacing switched off): no flags at all.
         assert!(!out(Pacing::unpaced()).contains("-readrate"));
         assert!(!out(Pacing::unpaced()).contains("-re "));

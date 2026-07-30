@@ -215,6 +215,25 @@ def log_section(out, logs, cache_settings, srv=None):
                         out("      key frames, so this is the source's key-frame interval, not a")
                         out("      setting. Nothing plays until a whole segment exists, and every")
                         out("      seek lands at one of these boundaries.")
+                # What the init segment SIGNALS, which is not always what the
+                # stream carries. A Dolby Vision configuration box (dvcC/dvvC)
+                # naming Profile 7 — the dual-layer disc profile nothing
+                # browser-shaped supports — makes VideoToolbox refuse the
+                # hardware path: Safari software-decoded 4K10 HEVC on an M3
+                # Max over exactly this. The dovi_rpu strip removes the side
+                # data this box is written from; this check is how a report
+                # proves the wire is actually clean.
+                st2, init = srv.call(f"/hls/{sid}/init.mp4", raw=True)
+                if st2 == 200 and isinstance(init, (bytes, bytearray)):
+                    boxes = [b for b in (b"dvcC", b"dvvC", b"dvwC") if b in init]
+                    if boxes:
+                        names = ", ".join(b.decode() for b in boxes)
+                        out(f"    ⚠ init segment still signals Dolby Vision ({names}) — with the")
+                        out("      RPUs stripped that is a promise the stream no longer keeps, and")
+                        out("      VideoToolbox (both Mac browsers) refuses the hardware path over")
+                        out("      it. The dovi_rpu strip needs ffmpeg ≥ 7.1 on the server.")
+                    else:
+                        out("    init segment signals no Dolby Vision — the wire is plain HDR10")
             else:
                 out(f"  (session {sid[:8]} has already gone, so no segment lengths)")
 

@@ -791,6 +791,9 @@ pub async fn stream_mp4(
         audio_offset_ms: file.audio_offset_ms,
         hevc,
         hdr: file.hdr.clone(),
+        have_dovi_bsf: plurx_core::transcode::ffmpeg_has_dovi_bsf(
+            state.system.ffmpeg_version.as_deref().unwrap_or(""),
+        ),
         readrate,
         tracked,
     })
@@ -957,6 +960,9 @@ struct RemuxSpec<'a> {
     /// The source's HDR flavour — picks the copy bitstream filter (a Dolby
     /// Vision source also sheds its EL/RPU units; see `hevc_copy_bsf`).
     hdr: Option<String>,
+    /// This ffmpeg has `dovi_rpu` (≥ 7.1), so a DV strip can also drop the
+    /// DOVI side data and with it the `dvcC` box VideoToolbox chokes on.
+    have_dovi_bsf: bool,
     readrate: f64,
     /// Telemetry handle and its registration, when the client asked to be able
     /// to watch this stream's health.
@@ -975,6 +981,7 @@ async fn remux(spec: RemuxSpec<'_>) -> Result<Response, ApiError> {
         audio_offset_ms,
         hevc,
         hdr,
+        have_dovi_bsf,
         readrate,
         tracked,
     } = spec;
@@ -1031,7 +1038,7 @@ async fn remux(spec: RemuxSpec<'_>) -> Result<Response, ApiError> {
         cmd.args(["-tag:v", "hvc1"]);
         cmd.args([
             "-bsf:v",
-            &plurx_core::transcode::hevc_copy_bsf(hdr.as_deref()),
+            &plurx_core::transcode::hevc_copy_bsf(hdr.as_deref(), have_dovi_bsf),
         ]);
     }
     if transcode_audio {
