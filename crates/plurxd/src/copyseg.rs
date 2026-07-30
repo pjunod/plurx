@@ -145,6 +145,18 @@ impl SessionDir {
     }
 }
 
+/// Did this write fail because the session was torn down under us?
+///
+/// Every teardown path removes the session directory (`Session::discard_dir`),
+/// and the reader can still be finalizing when it does — a viewer who presses
+/// stop, or a player that supersedes its own session, races the last segment
+/// out of existence. That is a session ending normally, not a fault, and
+/// logging it at ERROR taught the log to cry wolf on the most ordinary event
+/// there is. Observed within an hour of the first deploy.
+fn session_gone(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::NotFound
+}
+
 /// Read `src` to exhaustion, publishing segments into `dir`.
 ///
 /// Generic over the source so the tests can drive a whole session from a byte
@@ -224,10 +236,17 @@ pub async fn run<R: AsyncRead + Unpin>(
                     match seg.push(fragment) {
                         Ok(Some(published)) => {
                             if let Err(e) = out.write_segment(&published).await {
-                                tracing::error!(
-                                    session = %session_id,
-                                    "writing {}: {e}", published.name()
-                                );
+                                if session_gone(&e) {
+                                    tracing::debug!(
+                                        session = %session_id,
+                                        "session directory went away mid-write; stopping"
+                                    );
+                                } else {
+                                    tracing::error!(
+                                        session = %session_id,
+                                        "writing {}: {e}", published.name()
+                                    );
+                                }
                                 return Outcome::Ran(seg.counts());
                             }
                             published_any = true;
@@ -287,6 +306,13 @@ async fn finish(
         let final_ok = match seg.finish() {
             Ok(Some(published)) => match out.write_segment(&published).await {
                 Ok(()) => true,
+                Err(e) if session_gone(&e) => {
+                    tracing::debug!(
+                        session = %session_id,
+                        "session directory went away before the final segment; stopping"
+                    );
+                    false
+                }
                 Err(e) => {
                     tracing::error!(session = %session_id, "writing the final segment: {e}");
                     false
@@ -300,7 +326,11 @@ async fn finish(
         };
         if final_ok {
             if let Err(e) = out.write_endlist().await {
-                tracing::error!(session = %session_id, "writing the playlist end: {e}");
+                if session_gone(&e) {
+                    tracing::debug!(session = %session_id, "session gone before the playlist end");
+                } else {
+                    tracing::error!(session = %session_id, "writing the playlist end: {e}");
+                }
             }
         }
     }
