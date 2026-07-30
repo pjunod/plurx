@@ -1,7 +1,7 @@
 # GOP-aware segmenter — zero boundary drops on the copy path
 
 **Status:** BUILT 2026-07-30, M0–M6 · CI gate green (`make check`: fmt +
-clippy + 247 core / 188 daemon tests) · **awaiting morning validation on
+clippy + 248 core / 188 daemon tests) · **awaiting morning validation on
 real hardware by Paul** · **Executes:** the residual in
 [STUTTER-4K.md](STUTTER-4K.md) §5.3ter — one discarded leading picture per
 segment start · **Written:** 2026-07-30, against `e212c55` (v0.2.0-2) —
@@ -10,7 +10,7 @@ is the map**
 
 ## 0. What shipped, and what was flagged
 
-Four commits on top of `b3bc94f`:
+Five commits on top of `b3bc94f`:
 
 | Commit | Milestone | What |
 |---|---|---|
@@ -18,6 +18,10 @@ Four commits on top of `b3bc94f`:
 | `53d8813` | M2 | `fmp4::merge` and `fmp4::Segmenter`, with the framemd5 proof |
 | `6913c20` | M3 | `plurxd::copyseg`, `copy_pipe_args`, manager integration + fallback ladder |
 | `323569b` | M5 | perf-report, STUTTER-4K §5.6, PLAYBACK, FEATURES, CHANGELOG |
+| `ba276c7` | — | the floor gates the ceilings (§0.1 item 1 — read that one) |
+
+M4 produced no commit by design: §5 M4 says to write the browser harness
+fresh in `/tmp`, and its result is recorded in STUTTER-4K §5.6.
 
 **First thing to run in the morning**, because it is the number this whole
 design's value depends on and no fixture in this container can stand in for
