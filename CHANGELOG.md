@@ -55,6 +55,14 @@ bump may break compatibility and a **patch** bump never does.
   had stopped needing the rescue could never say so, and Auto stayed pinned to
   a transcode for good. Clearing is now the trigger inverted: a minute of
   explicit-Original playback with almost no visible faults lifts it.
+
+  And because this is invisible state that steers playback, automatic
+  clearing is no longer the only way out: the player's **Quality** menu names
+  the measurement when one is steering the stream and offers to forget it,
+  **Settings → Measured playback limits** lists everything this browser
+  carries and clears the lot, and entries expire on their own after 30 days.
+  A verdict about a device, a browser build and a stream at one moment should
+  not outlive all three.
 - **The first copy segment could out-run the playlist.** `EXT-X-TARGETDURATION`
   is a live playlist's reload interval, and it was declared as the segment
   duration *ceiling* rather than what had actually been published — so a player

@@ -274,6 +274,22 @@ permanently. Found from the couch, 2026-07-30: Safari on Auto played 4K while
 Chrome on Auto would not, same machine, same file — only Chrome carried the
 remembered entry.
 
+**Three ways out, because this is invisible state that steers playback.** The
+self-clearing rule above is the automatic one, and it was unreachable for a
+month without anyone noticing — so it is not the only one:
+
+| Where | What it does |
+|---|---|
+| Player → **Quality** menu | Names the measurement and its age when one is steering this stream, with a **Forget this measurement** button that clears it and re-measures on the spot |
+| Settings → **Measured playback limits** | Lists every entry this browser carries and forgets them all |
+| By itself | Entries expire 30 days after they were taken |
+
+The expiry is the part worth arguing for: an entry is evidence about one
+device, one browser build and one stream at one moment, and every part of that
+moves. This mechanism exists because a 4K remux stuttered — and it stopped
+stuttering without the device changing at all. Evidence with no shelf life
+stops being a measurement and becomes a belief.
+
 **How to read it:** the stats overlay's Decoder row shows the measurement
 live (`hardware · 42ms/frame against a 42ms budget — no headroom`); a
 `Reason` beginning "this device measured …" is the remembered limit

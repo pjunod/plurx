@@ -237,6 +237,9 @@
   .amenu button.sel{color:var(--accent);font-weight:600}
   .amenu button.sel::before{content:"✓ "}
   .amsec{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);padding:8px 10px 3px}
+  /* A sentence of context inside a menu of choices — the measurement behind a
+     decision, next to the button that undoes it. */
+  .menunote{font-size:11.5px;line-height:1.45;color:var(--muted);padding:0 10px 6px}
   /* account menu: the signed-in user, anchored to the far right of the header */
   .profile{display:inline-flex;align-items:center;gap:8px}
   .profile .caret{color:var(--muted);font-size:10px}
@@ -3108,8 +3111,61 @@ function decodeMarginVerdict(h, playedSecs){
 // limit only steers Auto — and an explicit-Original session that measures
 // comfortable margin for a minute clears its entry, so a GPU upgrade is
 // noticed rather than distrusted forever.
+// How long a measured limit is believed.
+//
+// It is evidence about one device, one browser build and one stream at one
+// moment — and every part of that moves. Browsers update, drivers change, and
+// the SERVER's output changes underneath it: this whole mechanism exists
+// because a 4K remux stuttered, and it stopped stuttering without the device
+// changing at all. An entry with no expiry is not a measurement any more, it
+// is a belief. Thirty days is long enough that a viewer who watches the same
+// film every week never re-measures, and short enough that nobody is stuck
+// with a verdict from a machine they have since replaced.
+const DECODE_LIMIT_TTL_MS=30*24*3600*1000;
 function decodeLimitKey(src){ return (src&&src.video_codec)? `${src.video_codec}@${src.height||0}` : null; }
-function decodeLimits(){ try{ return JSON.parse(localStorage.getItem("plurx_decode_limits")||"{}")||{}; }catch(e){ return {}; } }
+// Reads and prunes. Anything past its shelf life is dropped on the way out,
+// so an expired verdict cannot steer a decision even once.
+function decodeLimits(){
+  let l; try{ l=JSON.parse(localStorage.getItem("plurx_decode_limits")||"{}")||{}; }catch(e){ return {}; }
+  const now=Date.now(); let dropped=false;
+  for(const k of Object.keys(l)){
+    const at=l[k]&&l[k].at;
+    if(!at || now-at>DECODE_LIMIT_TTL_MS){ delete l[k]; dropped=true; }
+  }
+  if(dropped){ try{ localStorage.setItem("plurx_decode_limits", JSON.stringify(l)); }catch(e){} }
+  return l;
+}
+// Forget everything measured on this browser.
+//
+// The escape hatch, and it exists because the automatic ones cannot be trusted
+// to cover every case: this state is invisible, it silently steers Auto, and
+// its self-clearing condition was unreachable for a month before anyone
+// noticed (docs/PLAYBACK.md). A viewer whose player is quietly transcoding a
+// film it could direct-play needs a way to say "measure it again" that does
+// not involve a developer console.
+function forgetDecodeLimits(){
+  let n=0;
+  try{ n=Object.keys(decodeLimits()).length; localStorage.removeItem("plurx_decode_limits"); }catch(e){}
+  toast(n? `Forgot ${n} measured playback limit${n===1?"":"s"} — Auto will re-measure`
+         : "No measured playback limits to forget");
+  return n;
+}
+// Forget the one that applies to what is playing now, and act on it: an Auto
+// session steered by it is restarted so the viewer sees the effect rather than
+// being told about it.
+function forgetDecodeLimitHere(){
+  const p=PLAYER; if(!p) return;
+  const had=clearDecodeLimit(p.source||{});
+  const m=document.getElementById("pmenu"); if(m) m.classList.remove("on");
+  if(!had){ toast("Nothing measured for this stream"); return; }
+  toast("Forgotten — measuring this stream again");
+  if(qualityForce()==='auto' && p.fileId){
+    PENDING_ATTEMPT_REASON="decode-limit-cleared";
+    const v=document.getElementById("video");
+    const pos=(p.offset||0)+((v&&v.currentTime)||0);
+    play(p.fileId, p.title||"", Math.round(pos*1000), p.knownDur||0, p.meta);
+  }
+}
 function decodeLimitFor(src){ const k=decodeLimitKey(src); return k? (decodeLimits()[k]||null) : null; }
 function rememberDecodeLimit(src, decodeMs, budgetMs){
   const k=decodeLimitKey(src); if(!k) return;
@@ -3121,6 +3177,20 @@ function clearDecodeLimit(src){
   try{ const l=decodeLimits(); if(!(k in l)) return false;
        delete l[k]; localStorage.setItem("plurx_decode_limits", JSON.stringify(l)); return true;
   }catch(e){ return false; }
+}
+// What Settings shows about the limits this browser is carrying: the entries
+// themselves, not just a button, because "forget the thing you cannot see" is
+// not an offer anybody can evaluate.
+function decodeLimitsSummary(){
+  const l=decodeLimits(), keys=Object.keys(l);
+  if(!keys.length) return `<span class="muted" style="font-size:13px">Nothing measured on this browser.</span>`;
+  const items=keys.map(k=>`<span class="pill">${esc(k)} · ${l[k].decode_ms}ms/${l[k].budget_ms}ms · ${esc(agoLabel(Math.round(l[k].at/1000)))}</span>`).join(" ");
+  return `${items} <button class="ghost sm" onclick="forgetDecodeLimitsUI()">Forget ${keys.length===1?"it":"them all"}</button>`;
+}
+function forgetDecodeLimitsUI(){
+  forgetDecodeLimits();
+  const row=document.getElementById("dlrow");
+  if(row) row.innerHTML=decodeLimitsSummary();
 }
 // Seconds of video this element has actually PLAYED — pauses and stalls do
 // not count, which is what makes it the right observation clock for a
@@ -3828,10 +3898,20 @@ function toggleMenu(kind,low){
   } else if(kind==="sync"){
     m.innerHTML=syncMenuHtml();
   } else if(kind==="quality"){
+    // If a remembered measurement is why Auto is not giving this viewer the
+    // source, say so HERE — this menu is where somebody goes when they wonder
+    // why the picture is soft — and give them the button rather than a
+    // console incantation.
+    const lim=PLAYER?decodeLimitFor(PLAYER.source||{}):null;
+    const limNote=lim?`<div class="amsec">Measured on this device</div>
+      <div class="menunote">No decode slack on ${esc(decodeLimitKey(PLAYER.source||{})||"this stream")}
+        (${lim.decode_ms}ms against a ${lim.budget_ms}ms frame budget), ${esc(agoLabel(Math.round(lim.at/1000)))}.
+        Auto transcodes it; Original overrides.</div>
+      <button onclick="forgetDecodeLimitHere()">Forget this measurement</button>`:"";
     m.innerHTML=`<div class="amsec">Quality</div>`+QUALITIES.map(([v,l])=>{
       const note=v==="auto"?" — automatic":v==="original"?" — max, no transcode":"";
       return `<button class="${playQuality()===v?'sel':''}" onclick="setQuality('${v}')">${l}${note}</button>`;
-    }).join("");
+    }).join("")+limNote;
   } else {
     m.innerHTML=`<button class="${PLAYER.curSub<0?'sel':''}" onclick="setSub(-1)">Off</button>`+
       PLAYER.subs.map(s=>`<button class="${PLAYER.curSub===s.index?'sel':''}" onclick="setSub(${s.index})">${esc(subLabelMenu(s))}</button>`).join("");
@@ -4868,6 +4948,13 @@ function playbackPanel(settings){
           <option value="off" ${settings.sub_mode==='off'?'selected':''}>Off</option></select></div>
       </div>
       <label class="row" style="margin:16px 0 0;font-size:14px;color:var(--text)"><input type="checkbox" id="autonext" ${autoNextOn()?'checked':''} onchange="setAutoNext(this.checked)" style="width:auto;margin-right:9px"> Auto-play the next episode when one finishes <span class="muted" style="font-size:12px;margin-left:6px">· saved on this browser</span></label>
+      <h2 class="section">Measured playback limits</h2>
+      <p class="muted" style="margin-top:0">When a stream plays with visible faults and no decode headroom, this browser
+        remembers the combination and lets <b>Auto</b> transcode it next time instead of stuttering first. The measurement
+        expires by itself after 30 days, and an explicit <b>Quality → Original</b> always overrides it — but if a player is
+        giving you a soft picture on a file you know this machine can handle, forget them and it will measure again.
+        Saved on this browser only; nothing here affects anyone else.</p>
+      <div class="row" id="dlrow">${decodeLimitsSummary()}</div>
       <h2 class="section">Delivery speed</h2>
       <p class="muted" style="margin-top:0">How fast a stream is sent, relative to how fast it plays. The first 30 seconds always arrive at full speed so starting and seeking stay instant; the limit applies after that. Unlimited lets one stream take the entire link, which on Wi-Fi can crowd out everything else on the network.</p>
       <div><label>Stream pace</label><select id="prr" style="width:auto;min-width:230px">
