@@ -82,12 +82,14 @@ of media exist, end-of-stream overrides it, `Manager::playlist` holds the
 HTTP request while it fills, and the legacy fallback window widened from
 "first segment" to "playlist published" to match. A ceiling shrink (15 s → 6 s)
 was tried first and only scaled the freeze; it is reverted. The gate itself
-shipped first as a segment *count*, which a quiet opening multiplied into a
-32 s cushion (21 s to first frame on *Tron*) — the unit is seconds now, and
-the missing `-readrate_initial_burst` on pre-6.1 ffmpeg builds is a startup
-WARN because the gate made it expensive. The full diagnosis, the experiment
-that separated the two readings, and the measured startup arithmetic are
-`docs/STUTTER-4K.md` §5.7.
+shipped first as a segment *count* — the wrong unit, since a quiet-opening
+title can multiply three segments into a 32 s cushion — and is 12 s of media
+now; the missing `-readrate_initial_burst` on pre-6.1 ffmpeg builds is a
+startup WARN because the gate made it expensive (a flat 2× fills the cushion
+at half speed however fast the NAS is). The full diagnosis, the experiment
+that separated the two readings, and the measured startup arithmetic —
+including the correction that *Tron*'s own 21 s was mostly flat pacing plus
+a cold NFS open, not the count — are `docs/STUTTER-4K.md` §5.7.
 
 ### 0.1 Deviations from this plan, each with its reason
 

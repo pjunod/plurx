@@ -178,16 +178,21 @@ pub const COPY_SEGMENT_MAX_SECS: u32 = 15;
 /// segment after the gate only adds lead.
 ///
 /// **The unit is seconds, not segments, and it was segments for a day.** A
-/// count gate multiplies by whatever the opening happens to cut, and a quiet
-/// opening — studio logos run ~30 Mb/s against this film's 61 — is exactly
-/// where the 15 s duration ceiling binds: three segments meant
-/// 2 + 15 + 15 = 32 s of cushion, twice what the freeze needs, every extra
-/// second of it produced at the paced rate before a viewer sees frame one.
-/// Measured on *Tron* the day the gate shipped: 21.0 s to first frame, ~16 s
-/// of it producing that cushion at exactly 2× pacing. A duration gate opens
-/// at the first cut past this line instead (realized cushion: this value up
-/// to this value plus one ceiling), which took the same open to
-/// 2 + 15 = 17 s of cushion.
+/// count gate multiplies by whatever the opening happens to cut, and the cut
+/// is a property of the title: a stretch quiet enough for the 15 s duration
+/// ceiling to bind turns "three segments" into 2 + 15 + 15 = 32 s of
+/// cushion, 2.4× what the freeze needs, every extra second of it produced at
+/// the paced rate before a viewer sees frame one. A duration gate promises
+/// the cushion in the unit the freeze is measured in; its realized size is
+/// this value up to this value plus one segment, whatever the title cuts.
+/// (*Tron*, the file that exposed the slow start at 21.0 s to first frame,
+/// turned out to cut clean 7.5–8.5 s segments — the overlay's own
+/// largest-appended figure said so — so its cushion was ~17 s under either
+/// unit, and its 21 s decomposes as ~8 s of cushion at the flat 2× pacing
+/// below plus a cold NFS open and probe of a Dolby Vision MKV plus fetch
+/// and decode; a warm second play started visibly faster with nothing
+/// changed. The count was still the wrong unit — it just wasn't *Tron's*
+/// biggest cost.)
 ///
 /// Why 12 s clears the worst gap: the gap is one segment's production time,
 /// and duration and production speed are inversely coupled through bitrate.

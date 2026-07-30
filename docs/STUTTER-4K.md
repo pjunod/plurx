@@ -849,20 +849,26 @@ far more than the cushion should. Two compounders, found in that order:
 
 1. **The gate's first unit was wrong: a segment count, not a duration.** It
    shipped as "three segments", and a count multiplies by whatever the
-   opening happens to cut. A quiet opening (studio logos — *Tron*'s first
-   half-minute averages ~32 Mb/s against the film's 61) is exactly where the
-   15 s *duration* ceiling binds, so three segments meant 2 + 15 + 15 =
-   **32 s of cushion** — 2.4× what the freeze needs — every extra second
-   produced before frame one. The overlay's own arithmetic confirms it:
-   encode speed pinned at exactly 2.00× (the `HLS_READRATE` cap), so ~16 s
-   of the 21 was cushion production alone. The gate is now the 12 s of media
-   above: the same *Tron* open fills it at 2 + 15 = 17 s of cushion, and an
-   open whose segments cut short (byte-capped high-bitrate) fills it in
-   10–12 s of media. Why 12 clears the worst gap: duration and production
-   speed are inversely coupled through bitrate — quiet stretches cut long
-   segments but read cheap (readrate-paced, gap ≤ 15/2 = 7.5 s), heavy
-   stretches can be NAS-bound near 1× but cut byte-capped short (64 MB in
-   ≤ ~8.5 s at any bitrate the NAS can sustain playback of at all).
+   opening happens to cut — a title quiet enough for the 15 s *duration*
+   ceiling to bind turns that into 2 + 15 + 15 = **32 s of cushion**, 2.4×
+   what the freeze needs, every extra second produced before frame one. The
+   gate is now the 12 s of media above, which promises the cushion in the
+   unit the freeze is measured in: realized size 12 s plus at most one
+   segment, whatever the title cuts. Why 12 clears the worst gap: duration
+   and production speed are inversely coupled through bitrate — quiet
+   stretches cut long segments but read cheap (readrate-paced, gap ≤
+   15/2 = 7.5 s), heavy stretches can be NAS-bound near 1× but cut
+   byte-capped short (64 MB in ≤ ~8.5 s at any bitrate the NAS can sustain
+   playback of at all). **A correction from the same day, because the first
+   version of this paragraph blamed the count for all of *Tron*'s 21 s:**
+   the overlay's largest-appended segment on that title reads 8.5 s a
+   minute in, so its opening cut clean 7.5–8.5 s segments and its cushion
+   was ~17 s under either unit. Its 21 s decomposes as ~8 s of cushion at
+   the flat 2× below, plus a cold NFS open and probe of a Dolby Vision MKV,
+   plus fetch and decode — and a warm second play of the same file started
+   visibly faster with nothing changed, which is the cold-open term showing
+   itself. The count was still the wrong unit; it just wasn't *Tron*'s
+   biggest cost.
 
 2. **`-readrate_initial_burst` is quietly load-bearing, and not every ffmpeg
    has it.** The pacing design is burst-then-hold (90 s flat-out, then 2×) —
@@ -877,11 +883,15 @@ far more than the cushion should. Two compounders, found in that order:
    the flag.
 
 With both in place the arithmetic says a *Tron*-class open lands around
-6–10 s with the burst working (ffprobe/decision + ffmpeg open of a DV MKV
-over NFS + ~17 s of low-bitrate cushion at I/O speed + first fetch/decode),
-and ~12 s paced flat. The TTFF beacon is the scoreboard; if a start is slow,
-read the encoder speed first — pinned at exactly the readrate during startup
-means the burst is missing.
+6–10 s with the burst working and a warm cache (ffprobe/decision + ffmpeg
+open + ~17 s of cushion at I/O speed + first fetch/decode), ~12–13 s paced
+flat, and worse from a cold NFS cache — the open/probe of a big DV MKV is
+its own multi-second term and the reason two plays of the same file can
+differ with nothing changed. The TTFF beacon is the scoreboard; if a start
+is slow, read the encoder speed first — pinned at exactly the readrate
+during startup means the burst is missing — and the session's logged ffmpeg
+args second, which show `-readrate_initial_burst` present or absent
+directly.
 
 **And the ceiling went back up.** `COPY_SEGMENT_MAX_SECS` 6 → 15 and the
 floor 4 → 6, reverting the wrong lever: with the gate in place the shrink

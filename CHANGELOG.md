@@ -157,19 +157,22 @@ bump may break compatibility and a **patch** bump never does.
 
   The gate's first day found the two things that made that spinner longer
   than it had any right to be. It shipped as a segment *count* — three — and
-  a count multiplies by whatever the opening cuts: studio logos run at half
-  a film's bitrate, which is exactly where the 15-second duration ceiling
-  binds, so "three segments" meant a 32-second cushion and a 21-second first
-  frame on *Tron*. The gate is a duration now, so a quiet opening fills it
-  in two segments and a busy one in ten to twelve seconds of media either
-  way. And producing even that cushion is only fast if ffmpeg's
-  `-readrate_initial_burst` exists to let the paced session start flat-out:
-  the flag needs ffmpeg 6.1 (jellyfin-ffmpeg7, the Docker image's engine,
-  has it), and a build without it fills the gate at a flat 2× however fast
-  the storage is — an encoder speed pinned at exactly 2.00× during startup
-  is the tell. plurxd now warns at startup when pacing runs without the
-  burst, because the gate turned that quiet degradation into seconds of
-  every open.
+  a count multiplies by whatever the opening cuts: a title quiet enough for
+  the 15-second duration ceiling to bind turns three segments into a
+  32-second cushion, so the gate is a duration now and promises twelve
+  seconds of media whatever the title's segments happen to be. (The film
+  that exposed the 21-second first frame, *Tron*, turned out to cut clean
+  7.5–8.5 s segments — its cushion was ~17 s under either unit, and most of
+  its 21 s was the pacing below plus a cold NFS open of a Dolby Vision MKV;
+  a warm replay started visibly faster with nothing changed.) And producing
+  any cushion is only fast if ffmpeg's `-readrate_initial_burst` exists to
+  let the paced session start flat-out: the flag needs ffmpeg 6.1
+  (jellyfin-ffmpeg7, the Docker image's engine, has it), and a build
+  without it fills the gate at a flat 2× however fast the storage is — an
+  encoder speed pinned at exactly 2.00× during startup is the tell, and the
+  session's logged ffmpeg args show the flag present or absent outright.
+  plurxd now warns at startup when pacing runs without the burst, because
+  the gate turned that quiet degradation into seconds of every open.
 - **The server could not say which build it was running — again.** `.git` sits
   outside the Docker build context, so the image can only name its commit if
   the deploy passes `PLURX_BUILD_REF`. That was previously "fixed" by having
