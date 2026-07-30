@@ -28,6 +28,9 @@ uuid = { workspace = true }
 reqwest = { workspace = true }
 
 [dev-dependencies]
+# `fixtures` builds plurx-core's shared media-fixture helper for the copyseg
+# tests. A dev-dependency, so a release build never compiles it.
+plurx-core = { path = "../plurx-core", features = ["fixtures"] }
 http-body-util = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 uuid = { workspace = true }

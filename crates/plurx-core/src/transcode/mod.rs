@@ -685,14 +685,22 @@ pub fn hls_args(
 /// repackage it as HLS, instead of letting the player's error-fallback re-encode
 /// the whole thing down to 720p. fMP4 segments (not MPEG-TS) are required: Apple
 /// does not support HEVC in a TS container.
-pub fn hls_copy_args(
+/// Everything a copy session's ffmpeg does *before* the muxer: input seek,
+/// pacing, stream mapping, the video copy with its bitstream hygiene, and the
+/// audio decision.
+///
+/// Shared by [`hls_copy_args`] (ffmpeg's HLS muxer writes the segments) and
+/// [`copy_pipe_args`] (plurx cuts the segments itself, `crate::fmp4`). The two
+/// paths deliver the same bitstream by different routes, and every argument up
+/// to the muxer has to be identical for that to be true — a second copy of
+/// this list is a divergence waiting for the day one of them is edited.
+fn copy_input_args(
     source: &MediaFile,
     start_seconds: f64,
     audio_index: Option<i64>,
     transcode_audio: bool,
     pacing: Pacing,
     have_dovi_bsf: bool,
-    out_dir: &str,
 ) -> Vec<String> {
     let source_path = source.path.to_string_lossy().into_owned();
     let mut args: Vec<String> = vec!["-hide_banner".into(), "-loglevel".into(), "error".into()];
@@ -763,6 +771,73 @@ pub fn hls_copy_args(
         args.push("-c:a".into());
         args.push("copy".into());
     }
+    args
+}
+
+/// Build ffmpeg args for a copy session that plurx segments itself.
+///
+/// One continuous fragmented MP4 down stdout — `frag_keyframe` puts one
+/// fragment per GOP on the wire, `delay_moov` lets the `moov` describe the
+/// real stream instead of a guess, and `default_base_moof` keeps every sample
+/// offset relative to its own `moof` so a reader that has never seen the file
+/// start can resolve them. `crates/plurx-core/src/fmp4.rs` reads that stream
+/// and decides where the segment boundaries go; the point of moving the cut
+/// out of ffmpeg is that a boundary can then be placed only in front of a
+/// keyframe no player will discard a leading picture at.
+///
+/// `-avoid_negative_ts make_zero` comes from the progressive remux, for its
+/// reasons: an input seek leaves the first packet's timestamp wherever the
+/// keyframe was, and a fragmented MP4 whose timeline does not start at zero is
+/// a stream players disagree about.
+pub fn copy_pipe_args(
+    source: &MediaFile,
+    start_seconds: f64,
+    audio_index: Option<i64>,
+    transcode_audio: bool,
+    pacing: Pacing,
+    have_dovi_bsf: bool,
+) -> Vec<String> {
+    let mut args = copy_input_args(
+        source,
+        start_seconds,
+        audio_index,
+        transcode_audio,
+        pacing,
+        have_dovi_bsf,
+    );
+    args.extend(
+        [
+            "-avoid_negative_ts",
+            "make_zero",
+            "-movflags",
+            "frag_keyframe+empty_moov+default_base_moof+delay_moov",
+            "-f",
+            "mp4",
+            "pipe:1",
+        ]
+        .iter()
+        .map(|s| s.to_string()),
+    );
+    args
+}
+
+pub fn hls_copy_args(
+    source: &MediaFile,
+    start_seconds: f64,
+    audio_index: Option<i64>,
+    transcode_audio: bool,
+    pacing: Pacing,
+    have_dovi_bsf: bool,
+    out_dir: &str,
+) -> Vec<String> {
+    let mut args = copy_input_args(
+        source,
+        start_seconds,
+        audio_index,
+        transcode_audio,
+        pacing,
+        have_dovi_bsf,
+    );
 
     // fMP4 HLS. Segments split at existing keyframes (copy can't force them), so
     // a normally-GOP'd source segments cleanly; the init segment is `init.mp4`.

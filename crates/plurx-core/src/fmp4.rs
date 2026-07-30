@@ -1561,180 +1561,8 @@ mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
     use std::process::Command;
-    use std::sync::{LazyLock, Mutex};
 
-    // -----------------------------------------------------------------------
-    // fixtures
-    // -----------------------------------------------------------------------
-
-    /// Generated once into `target/fixtures/` and reused. They are small (12 s
-    /// of 640x360) because every one of them is an x265 encode CI pays for,
-    /// and none of the properties under test — GOP structure, box layout,
-    /// sample timing — care how big the picture is.
-    fn fixture_dir() -> PathBuf {
-        let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        p.pop(); // crates/
-        p.pop(); // repo root
-        p.push("target");
-        p.push("fixtures");
-        p
-    }
-
-    fn ffmpeg() -> String {
-        std::env::var("PLURX_FFMPEG")
-            .ok()
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| "ffmpeg".to_owned())
-    }
-
-    fn ffprobe() -> String {
-        std::env::var("PLURX_FFPROBE")
-            .ok()
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| "ffprobe".to_owned())
-    }
-
-    /// Fail in terms of the dependency that is missing rather than in terms of
-    /// whatever the parser made of an empty file. plurxd shells out to ffmpeg
-    /// at runtime, so this is a thing to install, not a test to skip.
-    fn require_ffmpeg() {
-        let bin = ffmpeg();
-        let ok = Command::new(&bin)
-            .arg("-version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok();
-        assert!(
-            ok,
-            "these tests need ffmpeg; running `{bin}` failed. Install it \
-             (`apt-get install ffmpeg`) or point PLURX_FFMPEG at a build — \
-             plurxd requires it at runtime too"
-        );
-    }
-
-    fn run(cmd: &mut Command) -> Vec<u8> {
-        let out = cmd.output().expect("running ffmpeg");
-        assert!(
-            out.status.success(),
-            "{:?} failed: {}",
-            cmd,
-            String::from_utf8_lossy(&out.stderr)
-        );
-        out.stdout
-    }
-
-    /// x265 parameters per fixture. The GOP shape is the entire point of each
-    /// one, so it is spelled out rather than left to the encoder's defaults.
-    fn x265_params(kind: &str) -> &'static str {
-        match kind {
-            // Every keyframe a CRA with a RASL leading picture: the disc-remux
-            // shape, and the source of the bug.
-            "open-gop" => {
-                "keyint=42:min-keyint=42:open-gop=1:bframes=4:b-pyramid=2:\
-                           scenecut=0:repeat-headers=1:log-level=none"
-            }
-            // Every keyframe an IDR: the control.
-            "closed-gop" => {
-                "keyint=42:min-keyint=42:open-gop=0:bframes=4:scenecut=0:\
-                             repeat-headers=1:log-level=none"
-            }
-            // Open GOP with no B-frames, so every CRA is clean — the case the
-            // classifier must not confuse with the open-gop fixture.
-            "clean-cra" => {
-                "keyint=42:min-keyint=42:open-gop=1:bframes=0:scenecut=0:\
-                            repeat-headers=1:log-level=none"
-            }
-            other => panic!("no x265 params for fixture {other}"),
-        }
-    }
-
-    static FIXTURE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-
-    /// Path to a source fixture, generating it on first use.
-    fn source(kind: &str) -> PathBuf {
-        require_ffmpeg();
-        let dir = fixture_dir();
-        let path = dir.join(format!("{kind}.mkv"));
-        let _guard = FIXTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        if path.exists() {
-            return path;
-        }
-        std::fs::create_dir_all(&dir).expect("creating target/fixtures");
-        let tmp = dir.join(format!("{kind}.mkv.tmp"));
-        let mut cmd = Command::new(ffmpeg());
-        cmd.args(["-y", "-v", "error"])
-            .args([
-                "-f",
-                "lavfi",
-                "-i",
-                "testsrc2=size=640x360:rate=24:duration=12",
-            ])
-            .args([
-                "-f",
-                "lavfi",
-                "-i",
-                "sine=frequency=440:sample_rate=48000:duration=12",
-            ]);
-        if kind == "h264" {
-            cmd.args(["-c:v", "libx264", "-preset", "ultrafast"]).args([
-                "-x264-params",
-                "keyint=42:min-keyint=42:open_gop=1:bframes=3",
-            ]);
-        } else {
-            cmd.args(["-c:v", "libx265", "-preset", "ultrafast"])
-                .args(["-x265-params", x265_params(kind)]);
-        }
-        // `-f matroska` because the temp name has no extension ffmpeg knows;
-        // the file is renamed into place only once it is complete, so a killed
-        // run never leaves a half-written fixture for the next one to read.
-        cmd.args([
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            "aac",
-            "-ac",
-            "2",
-            "-shortest",
-        ])
-        .args(["-f", "matroska"])
-        .arg(&tmp);
-        run(&mut cmd);
-        std::fs::rename(&tmp, &path).expect("publishing the fixture");
-        path
-    }
-
-    /// The production pipe command, exactly as `copy_pipe_args` builds it, run
-    /// against a fixture. Cached beside the source: it is deterministic, and
-    /// every test in this module wants the same bytes.
-    fn pipe(kind: &str) -> Vec<u8> {
-        let src = source(kind);
-        let out = fixture_dir().join(format!("{kind}.pipe.mp4"));
-        let _guard = FIXTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        if let Ok(bytes) = std::fs::read(&out) {
-            return bytes;
-        }
-        let hevc = kind != "h264";
-        let mut cmd = Command::new(ffmpeg());
-        cmd.args(["-hide_banner", "-loglevel", "error"])
-            .arg("-i")
-            .arg(&src)
-            .args(["-map", "0:v:0", "-map", "0:a:0?", "-sn", "-c:v", "copy"]);
-        if hevc {
-            cmd.args(["-tag:v", "hvc1"])
-                .args(["-bsf:v", "filter_units=remove_types=32-34"]);
-        }
-        cmd.args(["-c:a", "aac", "-b:a", "256k"])
-            .args(["-avoid_negative_ts", "make_zero"])
-            .args([
-                "-movflags",
-                "frag_keyframe+empty_moov+default_base_moof+delay_moov",
-            ])
-            .args(["-f", "mp4", "pipe:1"]);
-        let bytes = run(&mut cmd);
-        std::fs::write(&out, &bytes).expect("caching the pipe output");
-        bytes
-    }
+    use crate::testfixtures::{ffmpeg, ffprobe, pipe, pipe_path, run};
 
     /// Everything a feed produces, in order.
     fn read_all(feed: &[u8]) -> (Init, Vec<Fragment>, bool) {
@@ -1850,7 +1678,7 @@ mod tests {
     #[test]
     fn resolved_samples_reproduce_ffprobe_timing() {
         let feed = pipe("open-gop");
-        let path = fixture_dir().join("open-gop.pipe.mp4");
+        let path = pipe_path("open-gop");
         let (init, frags, _) = read_all(&feed);
         let video = init.video().expect("video").clone();
 
@@ -2127,7 +1955,7 @@ mod tests {
         assert_eq!(counts.tfdt_adjustments, 0, "a join had to be repaired");
 
         let candidate = write_candidate(dir.path(), &init, &published);
-        let reference = fixture_dir().join("open-gop.pipe.mp4");
+        let reference = pipe_path("open-gop");
         for stream in ["0:v:0", "0:a:0"] {
             assert_eq!(
                 framemd5(&candidate, stream),
@@ -2239,7 +2067,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let (init, published, _) = segment("open-gop", 3, 300_000, 15);
         let candidate = write_candidate(dir.path(), &init, &published);
-        let reference = fixture_dir().join("open-gop.pipe.mp4");
+        let reference = pipe_path("open-gop");
 
         let describe = |p: &Path| {
             let out = run(Command::new(ffprobe())

@@ -1,5 +1,6 @@
 mod admission;
 mod cachekeep;
+mod copyseg;
 mod ffmpeg;
 mod http;
 mod logbuf;

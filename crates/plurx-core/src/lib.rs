@@ -16,6 +16,11 @@ pub mod metadata;
 pub mod playback;
 pub mod scan;
 pub mod store;
+/// Media fixtures for the test suites, shared so `plurx-core` and `plurxd`
+/// cannot drift onto different GOP structures and disagree about what the
+/// classifier should have said. Not part of the shipped library.
+#[cfg(any(test, feature = "fixtures"))]
+pub mod testfixtures;
 pub mod tracks;
 pub mod trakt;
 pub mod transcode;

@@ -22,6 +22,7 @@ use tokio::sync::Mutex;
 use crate::admission::{
     Admission, Admissions, HwSlot, Priority, Workload, DEFAULT_MAX_HW_SESSIONS, QUEUE_WAIT,
 };
+use crate::copyseg;
 use crate::ffmpeg::{ffmpeg_bin, pacing_caps};
 use crate::meter::Meter;
 
@@ -499,6 +500,85 @@ fn spawn_ffmpeg(
         });
     }
     Ok(child)
+}
+
+/// Spawn a copy-session ffmpeg whose **stdout is the media**, not telemetry.
+///
+/// The one structural difference from [`spawn_ffmpeg`]: with the fragmented
+/// stream on stdout, `-progress` has to go somewhere else, so it goes to
+/// stderr alongside the log. Progress blocks are `key=value` on a line of
+/// their own and ffmpeg's own messages are not, so the drain sorts them and
+/// feeds the telemetry the watchdog and the activity page already read. Losing
+/// that would leave a segmenter session with no `speed`, no `out_time`, and a
+/// stall watchdog with nothing to watch.
+fn spawn_ffmpeg_pipe(
+    args: &[String],
+    session_id: &str,
+    progress: Arc<Progress>,
+    generation: u64,
+) -> Result<(Child, tokio::process::ChildStdout), String> {
+    let mut full: Vec<String> = vec!["-progress".into(), "pipe:2".into()];
+    full.extend_from_slice(args);
+    let mut child = tokio::process::Command::new(ffmpeg_bin())
+        .args(&full)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("spawning ffmpeg: {e}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "ffmpeg started without a stdout pipe".to_owned())?;
+    if let Some(stderr) = child.stderr.take() {
+        let sid = session_id.to_owned();
+        let started = Instant::now();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if is_progress_line(&line) {
+                    apply_progress_line(&progress, generation, &line);
+                } else {
+                    tracing::warn!(session = %sid, encoder = "copy", "transcode ffmpeg: {line}");
+                }
+            }
+            tracing::warn!(
+                session = %sid, encoder = "copy",
+                elapsed_s = started.elapsed().as_secs(),
+                "transcode ffmpeg process ended"
+            );
+        });
+    }
+    Ok((child, stdout))
+}
+
+/// Is this stderr line one of ffmpeg's `-progress` blocks rather than a log
+/// message?
+///
+/// Matched on the key, from the set `-progress` actually emits, rather than on
+/// "contains an `=`" — an error message about `filter_units=remove_types=32-34`
+/// contains plenty of those, and swallowing it would hide exactly the failure
+/// a copy session is most likely to have.
+fn is_progress_line(line: &str) -> bool {
+    let Some((key, _)) = line.split_once('=') else {
+        return false;
+    };
+    matches!(
+        key,
+        "frame"
+            | "fps"
+            | "bitrate"
+            | "total_size"
+            | "out_time_us"
+            | "out_time_ms"
+            | "out_time"
+            | "dup_frames"
+            | "drop_frames"
+            | "speed"
+            | "progress"
+    ) || (key.starts_with("stream_") && key.ends_with("_q"))
 }
 
 /// True once the playlist actually lists a finished segment — i.e. real,
@@ -2395,28 +2475,77 @@ impl TranscodeManager {
             .as_ref()
             .map(|c| transcode::ffmpeg_has_dovi_bsf(&c.ffmpeg_build))
             .unwrap_or(false);
-        let args = transcode::hls_copy_args(
-            &file,
-            start_seconds,
-            audio_override,
-            transcode_audio,
-            self.pacing(true).await,
-            have_dovi,
-            &dir.to_string_lossy(),
-        );
-        tracing::info!(
-            %session_id, file_id, start_seconds,
-            "copy-video HLS ffmpeg args: {}", args.join(" ")
-        );
+        let pacing = self.pacing(true).await;
+        let legacy_args = || {
+            transcode::hls_copy_args(
+                &file,
+                start_seconds,
+                audio_override,
+                transcode_audio,
+                pacing,
+                have_dovi,
+                &dir.to_string_lossy(),
+            )
+        };
         let progress = Arc::new(Progress::new());
         let generation = progress.begin_attempt();
-        let child = spawn_ffmpeg(
-            &args,
-            "copy",
-            &session_id,
-            Arc::clone(&progress),
-            generation,
-        )?;
+
+        // Take over the cutting when the source is one whose keyframes can be
+        // read (docs/SEGMENTER-PLAN.md). ffmpeg then writes one continuous
+        // fragmented stream down a pipe and `copyseg` decides where the
+        // segments end — in front of a keyframe no player will discard a
+        // leading picture at. If anything about that stream turns out to be
+        // unreadable, the reader task respawns this same session on the
+        // arguments below, so the worst case is exactly today's behaviour.
+        let segmenting = copyseg::supports(file.video_codec.as_deref());
+        let (child, pipe_stdout) = if segmenting {
+            let args = transcode::copy_pipe_args(
+                &file,
+                start_seconds,
+                audio_override,
+                transcode_audio,
+                pacing,
+                have_dovi,
+            );
+            tracing::info!(
+                %session_id, file_id, start_seconds, mode = "segmenter",
+                "copy-video HLS ffmpeg args: {}", args.join(" ")
+            );
+            match spawn_ffmpeg_pipe(&args, &session_id, Arc::clone(&progress), generation) {
+                Ok((child, stdout)) => (child, Some(stdout)),
+                Err(e) => {
+                    // Spawning failed before any of this was decided, so there
+                    // is nothing to unwind: start the legacy path here.
+                    tracing::warn!(
+                        %session_id,
+                        "copy segmenter could not start ffmpeg ({e}); using the HLS muxer"
+                    );
+                    let args = legacy_args();
+                    let child = spawn_ffmpeg(
+                        &args,
+                        "copy",
+                        &session_id,
+                        Arc::clone(&progress),
+                        generation,
+                    )?;
+                    (child, None)
+                }
+            }
+        } else {
+            let args = legacy_args();
+            tracing::info!(
+                %session_id, file_id, start_seconds, mode = "legacy",
+                "copy-video HLS ffmpeg args: {}", args.join(" ")
+            );
+            let child = spawn_ffmpeg(
+                &args,
+                "copy",
+                &session_id,
+                Arc::clone(&progress),
+                generation,
+            )?;
+            (child, None)
+        };
 
         let session = Arc::new(Session {
             dir: dir.clone(),
@@ -2450,6 +2579,61 @@ impl TranscodeManager {
             .lock()
             .await
             .insert(session_id.clone(), Arc::clone(&session));
+
+        // The reader task, when plurx is doing the cutting. It owns the pipe
+        // for the session's life, and it owns the one fallback: a stream it
+        // cannot follow is killed and respawned on ffmpeg's HLS muxer, in this
+        // same session, so the player never learns anything happened. Only
+        // before the first segment — once a timeline exists on disk, a
+        // respawn would rewrite one a player is already holding.
+        if let Some(stdout) = pipe_stdout {
+            let session = Arc::clone(&session);
+            let sid = session_id.clone();
+            let dir = dir.clone();
+            let file = file.clone();
+            let progress = Arc::clone(&progress);
+            tokio::spawn(async move {
+                let outcome =
+                    copyseg::run(stdout, dir.clone(), &sid, copyseg::Limits::default()).await;
+                match outcome {
+                    copyseg::Outcome::Ran(counts) => {
+                        tracing::info!(session = %sid, "{}", copyseg::summary(&counts));
+                    }
+                    copyseg::Outcome::Unsupported(reason) => {
+                        tracing::warn!(
+                            session = %sid,
+                            "copy segmenter cannot read this stream ({reason}); \
+                             falling back to ffmpeg's HLS muxer for this session"
+                        );
+                        session.kill_child().await;
+                        copyseg::clear(&dir).await;
+                        let args = transcode::hls_copy_args(
+                            &file,
+                            start_seconds,
+                            audio_override,
+                            transcode_audio,
+                            pacing,
+                            have_dovi,
+                            &dir.to_string_lossy(),
+                        );
+                        // A fresh generation, or the dead process's last
+                        // progress blocks land on the replacement's telemetry
+                        // and the watchdog reads it as stalled from birth.
+                        let generation = progress.begin_attempt();
+                        match spawn_ffmpeg(&args, "copy", &sid, progress, generation) {
+                            Ok(child) => {
+                                *session.child.lock().await = Some(child);
+                                *session.last_access.lock().await = Instant::now();
+                            }
+                            Err(e) => {
+                                tracing::error!(session = %sid, "fallback copy failed: {e}");
+                                session.failed.store(true, Relaxed);
+                            }
+                        }
+                    }
+                }
+            });
+        }
 
         // Fail-fast guard: copy has no encoder ladder, but if the segments stop
         // coming (undecodable source, ffmpeg refusal) mark the session failed

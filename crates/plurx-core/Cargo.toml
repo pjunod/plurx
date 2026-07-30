@@ -6,6 +6,11 @@ edition.workspace = true
 publish.workspace = true
 repository.workspace = true
 
+[features]
+# Compiles `testfixtures` — the shared media-fixture builder the plurxd test
+# suite also uses. Dev-dependencies only; `cargo build` never turns it on.
+fixtures = []
+
 [dependencies]
 async-trait = { workspace = true }
 rusqlite = { workspace = true }
