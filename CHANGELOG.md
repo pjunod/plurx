@@ -95,6 +95,17 @@ bump may break compatibility and a **patch** bump never does.
   whatever the segmenter actually cut. Safari was never affected: native HLS
   uses none of these numbers.
 
+  Sized from the segment's real BYTES, not from its duration. The first cut of
+  this budgeted `TARGETDURATION x bitrate`, which is wrong in the one direction
+  that matters: copyseg cuts on 64 MB **or** 15 s, whichever comes first, so a
+  15-second segment exists precisely because that stretch was quiet enough to
+  fit 15 s under 64 MB. Costing it at the 69 Mb/s average said 129 MB — not
+  merely wrong but impossible — and the client answered by running a 4-second
+  forward buffer on a 4K remux, which stuttered worse than the bug this
+  replaced. The server's byte ceiling is now a hard cap on the estimate, and
+  the largest segment actually appended (from hls.js `FRAG_LOADED`) replaces
+  the estimate entirely as soon as one arrives.
+
   Two smaller things fell out of the same investigation. hls.js takes the
   *larger* of the seconds target and `8 * maxBufferSize / bitrate`, so leaving
   its stock 60 MB byte target in place made it a floor under the buffer rather

@@ -2372,6 +2372,20 @@ function attachHls(video, playlistUrl, startAt){
       const t=d&&d.details&&d.details.targetduration;
       if(t>0) retuneBuffer(t);
     });
+    // The largest segment this session has actually appended, in BYTES.
+    //
+    // Every other figure available before this one is a derivation — seconds
+    // times an average bitrate, or a server-side ceiling — and the derivation
+    // was wrong by 2x on a real film, because a long segment is long exactly
+    // when the picture is cheap. This is the number the quota is charged in,
+    // read from the transfer that just happened.
+    if(Hls.Events.FRAG_LOADED) hls.on(Hls.Events.FRAG_LOADED,(_,d)=>{
+      const b=d&&d.frag&&d.frag.stats&&(d.frag.stats.total||d.frag.stats.loaded);
+      const p=PLAYER; if(!p||!(b>0)) return;
+      if(b<=(p.segBytes|0)) return;
+      p.segBytes=b;
+      retuneBuffer(p.bufSegSecs||((d.frag.duration>0)?d.frag.duration:1), true);
+    });
     if(Hls.Events.BUFFER_APPENDED) hls.on(Hls.Events.BUFFER_APPENDED,()=>markEvent("append"));
     // Buffer pressure, classified. "It stopped buffering" has four unrelated
     // causes and they need different fixes: the browser refusing more data
@@ -3361,11 +3375,30 @@ function bufferTargets(segSecs){
   const bps=p.copyHls ? ((p.source&&p.source.bitrate)||0) : 0;
   if(!bps || bps<=0) return {fwd:60, back:30, budgeted:false, fits:true};
   const Bps=bps/8;
-  // Before the playlist arrives, assume the worst segment copyseg can cut.
-  const guess=Math.min(MSE_SEGMENT_CEILING_SECS, MSE_SEGMENT_CEILING_BYTES/Bps);
-  const seg=Math.max(1, segSecs>0?segSecs:guess);
+  // **Seconds times the average bitrate is not the size of a segment.**
+  //
+  // This budgeted `TARGETDURATION * bitrate` and got it badly wrong in the one
+  // direction that matters. copyseg cuts on TWO ceilings — 64 MB or 15 s,
+  // whichever comes first — so a 15-second segment exists precisely BECAUSE
+  // that stretch of film was quiet enough for 15 s to fit under 64 MB. Costing
+  // it at the 69 Mb/s average says 129 MB, which is not merely wrong, it is
+  // impossible: the byte ceiling forbids it.
+  //
+  // What that did on Tron in Chrome: seg 129 MB left 15 MB of resident budget,
+  // the floor clamped it to 48 MB, and the client ran a **4 s forward buffer**
+  // on a 69 Mb/s remux — 322 slow frames and a ten-second freeze, worse than
+  // the bug this budget was written to fix a few hours earlier.
+  //
+  // So the byte ceiling is the cap, always. It is a server-side guarantee, not
+  // an estimate, and `PLAYER.segBytes` replaces it with the largest segment
+  // this session has actually appended as soon as one has (see FRAG_LOADED) —
+  // measured beats derived, and both beat multiplying by an average.
+  const guess=Math.min(MSE_SEGMENT_CEILING_SECS*Bps, MSE_SEGMENT_CEILING_BYTES);
+  const seen=(p.segBytes|0)>0 ? Math.min(p.segBytes, MSE_SEGMENT_CEILING_BYTES) : 0;
+  const segBytes=seen || Math.min(segSecs>0?segSecs*Bps:Infinity, guess);
+  const seg=segBytes/Bps;
   // What is left for resident data once the append in flight is paid for.
-  const resident=MSE_QUOTA_BYTES-seg*Bps;
+  const resident=MSE_QUOTA_BYTES-segBytes;
   const fits=resident>=MSE_MIN_RESIDENT_BYTES;
   const room=Math.max(MSE_MIN_RESIDENT_BYTES, resident);
   const back=Math.max(1, Math.min(30, MSE_BACK_BYTES/Bps, room*0.25/Bps));
@@ -3401,9 +3434,9 @@ function applyBufferTargets(hls, tgt){
 // The playlist knows the real segment length; the constants above only
 // guessed it. Runs once per session, on the first playlist that carries a
 // target duration.
-function retuneBuffer(segSecs){
+function retuneBuffer(segSecs, force){
   const p=PLAYER; if(!p||!p.hls||!(segSecs>0)) return;
-  if(p.bufSegSecs===segSecs) return;
+  if(p.bufSegSecs===segSecs && !force) return;
   p.bufSegSecs=segSecs;
   const tgt=bufferTargets(segSecs);
   if(!tgt.budgeted) return;
