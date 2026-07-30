@@ -2224,6 +2224,7 @@ impl TranscodeManager {
             %session_id, encoder = encoder.label(), pipeline = opts.pipeline.name(),
             proven = self.pipeline.name(), hdr = file.hdr.as_deref().unwrap_or("sdr"),
             declined = declined.unwrap_or(""),
+            build = crate::version::BUILD,
             "transcode ffmpeg args: {}", args.join(" ")
         );
         let progress = Arc::new(Progress::new());
@@ -2509,6 +2510,7 @@ impl TranscodeManager {
             );
             tracing::info!(
                 %session_id, file_id, start_seconds, mode = "segmenter",
+                build = crate::version::BUILD,
                 "copy-video HLS ffmpeg args: {}", args.join(" ")
             );
             match spawn_ffmpeg_pipe(&args, &session_id, Arc::clone(&progress), generation) {
@@ -2535,6 +2537,7 @@ impl TranscodeManager {
             let args = legacy_args();
             tracing::info!(
                 %session_id, file_id, start_seconds, mode = "legacy",
+                build = crate::version::BUILD,
                 "copy-video HLS ffmpeg args: {}", args.join(" ")
             );
             let child = spawn_ffmpeg(
@@ -2597,7 +2600,10 @@ impl TranscodeManager {
                     copyseg::run(stdout, dir.clone(), &sid, copyseg::Limits::default()).await;
                 match outcome {
                     copyseg::Outcome::Ran(counts) => {
-                        tracing::info!(session = %sid, "{}", copyseg::summary(&counts));
+                        tracing::info!(
+                            session = %sid, build = crate::version::BUILD,
+                            "{}", copyseg::summary(&counts)
+                        );
                     }
                     copyseg::Outcome::Unsupported(reason) => {
                         // Is this session still one anybody is watching?
