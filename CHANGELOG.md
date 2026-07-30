@@ -102,6 +102,35 @@ bump may break compatibility and a **patch** bump never does.
   capped at 12 MB rather than 32 MB: a seek starts a fresh session on this
   path, so the back buffer buys a second or two of scrubbing and was otherwise
   a fifth of the budget spent on video nobody would watch again.
+- **The decode rescue was firing on a number that condemns every stream.** It
+  switched an Auto session off the original when the measured decode figure
+  reached 80% of the frame budget and a few hitches had been seen. That figure
+  is `processingDuration` — queue latency on a pipelined hardware decoder,
+  which grows as the pipeline gets *healthier*. The proof arrived as a
+  screenshot: a 1080p transcode at 7.5 Mb/s with **zero** dropped frames
+  reporting 83 ms/frame against a 42 ms budget, the identical "no slack"
+  verdict as the 4K remux it had just moved the viewer away from. With that
+  gate always true, the rescue was in practice firing on four hitch events in
+  twenty seconds, which any two-hour film produces for a dozen transient
+  reasons.
+
+  It now judges frames the viewer actually lost — never presented or presented
+  out of order — as a rate over a long window: 150 s of playback, 15 lost
+  frames, 6 or more a minute. Clearing is that same measure inverted rather
+  than a second heuristic, which fixes a related bug where a session the viewer
+  called flawless could not clear its own entry (six compositor holds and three
+  lost frames over two and a half minutes counted as nine "faults" against a
+  bar of four). Entries written by the old gate are discarded rather than
+  migrated: they were produced by a test that reads true on everything, so they
+  are not measurements. And the overlay's Decoder row states the pipeline
+  figure flat and grey instead of in warning amber — a number that accuses
+  every stream should not look like a diagnosis.
+- **Nothing said why a film had dropped to 1080p.** The rescue announced itself
+  in a toast, which vanishes, and the Reason row is the server's verdict on the
+  *file* and does not change when the client switches — so a viewer who looked
+  five minutes later found no explanation anywhere. The stats overlay now
+  carries a **Switched** row, with the numbers, for as long as that session
+  lasts.
 - **A buffer-quota problem could be remembered as a decode limit.** Quota
   pressure produces exactly what the decode rescue looks for — visible hitches
   on a copy session — so on Auto it fired, blamed the decoder, and wrote a

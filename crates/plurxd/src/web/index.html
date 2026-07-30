@@ -3108,21 +3108,57 @@ function hitchBlame(){
 // waits for the faults to be absent instead, because the same metric read the
 // other way round measures pipeline depth and gets BIGGER as playback gets
 // healthier.
-const MARGIN_BAD=0.8;
-const MARGIN_MIN_EVENTS=4;
-const MARGIN_MIN_SECS=20;
+// **The decode figure is not allowed to decide this any more.**
+//
+// The trigger used to require `decodeMs >= 80%` of the frame budget, on the
+// reading that a decoder pinned to the budget has no room for a spike. The
+// clearing condition was fixed a day earlier for reading the same number
+// backwards; the trigger was left alone, which was inconsistent and wrong in
+// the same way.
+//
+// What settled it was one screenshot. A 1920x1080 transcode at 7.5 Mb/s, zero
+// dropped frames, hardware decode, reporting **83 ms/frame against a 42 ms
+// budget** — the same "no slack" verdict as the 4K remux it had just rescued
+// the viewer away from. A metric that condemns an 8 Mb/s 1080p stream on the
+// machine it is measuring has no discriminating power at all: it is
+// `processingDuration`, which is queue latency on a pipelined hardware decoder
+// and gets LARGER the healthier the pipeline is. With that gate always true,
+// the rescue was in practice firing on four hitch events in twenty seconds —
+// which any two-hour film will produce for a dozen transient reasons.
+//
+// So judge the thing the viewer actually loses: frames that were never
+// presented, or presented out of order. Not `late` (the compositor holding a
+// frame an extra refresh — real, but it happens on the transcode too, so it
+// cannot tell the two apart) and not `held` (a repeat, with nothing lost) and
+// emphatically not `slow`, which is an outlier count against the session's own
+// median and says nothing about capacity.
+//
+// And judge it as a RATE over a long window. The old 20-second window could
+// not tell a bad scene from a bad machine.
+const MARGIN_LOST_PER_MIN=6;
+const MARGIN_MIN_SECS=150;
+const MARGIN_MIN_LOST=15;
 const MARGIN_CLEAR_SECS=60;
+// Frames lost per minute of PLAYED video — the one measure both the rescue and
+// its undo are judged on, so that "it got better" is literally the inverse of
+// "it went bad" rather than a second heuristic that can drift away from the
+// first. Returns null when there is not enough playback to say anything.
+function lostFrameRate(h, playedSecs){
+  if(!h || !(playedSecs>0)) return null;
+  const lost=(h.back|0)+(h.drop|0)+(h.gap|0);
+  return {lost, rate:+(lost/(playedSecs/60)).toFixed(1)};
+}
 // The verdict, pure so it is testable: null, or the numbers that justify a
-// rescue. Hitches are required alongside the margin — a device at 85% that
-// is presenting every frame on time has a problem on paper only.
+// rescue. The absolute floor sits beside the rate so that a single ugly
+// stretch early on cannot condemn the session on arithmetic alone.
 function decodeMarginVerdict(h, playedSecs){
-  if(!h || !h.fps || h.decodeMs==null) return null;
   if(!(playedSecs>=MARGIN_MIN_SECS)) return null;
-  const events=(h.back|0)+(h.held|0)+(h.late|0)+(h.drop|0)+(h.gap|0);
-  if(events<MARGIN_MIN_EVENTS) return null;
-  const budgetMs=1000/h.fps;
-  if(h.decodeMs < budgetMs*MARGIN_BAD) return null;
-  return {decodeMs:+h.decodeMs.toFixed(1), budgetMs:+budgetMs.toFixed(1), events};
+  const x=lostFrameRate(h, playedSecs);
+  if(!x || x.lost<MARGIN_MIN_LOST || x.rate<MARGIN_LOST_PER_MIN) return null;
+  // Carried for the log line and the menu, as context. Not as a reason.
+  const budgetMs=h.fps?+(1000/h.fps).toFixed(1):null;
+  return {lost:x.lost, rate:x.rate, secs:Math.round(playedSecs),
+          decodeMs:h.decodeMs==null?null:+h.decodeMs.toFixed(1), budgetMs};
 }
 // What this DEVICE cannot decode with margin, remembered per codec+height so
 // the next Auto playback routes straight to a transcode instead of stuttering
@@ -3161,13 +3197,19 @@ const DECODE_LIMIT_RETEST_MS=7*24*3600*1000;
 function decodeLimitDue(lim){ return !!lim && (Date.now()-(lim.at||0))>DECODE_LIMIT_RETEST_MS; }
 function decodeLimitKey(src){ return (src&&src.video_codec)? `${src.video_codec}@${src.height||0}` : null; }
 // Reads and prunes. Anything past its shelf life is dropped on the way out,
-// so an expired verdict cannot steer a decision even once.
+// so an expired verdict cannot steer a decision even once — and so is anything
+// written before the trigger stopped believing the decode figure. Those
+// entries carry `decode_ms` and no `rate`, and they were produced by a gate
+// that reads true on every stream this browser has ever played, including an
+// 8 Mb/s 1080p transcode with no dropped frames. They are not measurements of
+// anything. Dropping them re-measures whatever was real, and spares the
+// viewer having to find a button to undo a verdict they were never told about.
 function decodeLimits(){
   let l; try{ l=JSON.parse(localStorage.getItem("plurx_decode_limits")||"{}")||{}; }catch(e){ return {}; }
   const now=Date.now(); let dropped=false;
   for(const k of Object.keys(l)){
     const at=l[k]&&l[k].at;
-    if(!at || now-at>DECODE_LIMIT_TTL_MS){ delete l[k]; dropped=true; }
+    if(!at || now-at>DECODE_LIMIT_TTL_MS || l[k].rate==null){ delete l[k]; dropped=true; }
   }
   if(dropped){ try{ localStorage.setItem("plurx_decode_limits", JSON.stringify(l)); }catch(e){} }
   return l;
@@ -3204,10 +3246,17 @@ function forgetDecodeLimitHere(){
   }
 }
 function decodeLimitFor(src){ const k=decodeLimitKey(src); return k? (decodeLimits()[k]||null) : null; }
-function rememberDecodeLimit(src, decodeMs, budgetMs){
-  const k=decodeLimitKey(src); if(!k) return;
-  try{ const l=decodeLimits(); l[k]={decode_ms:decodeMs, budget_ms:budgetMs, at:Date.now()};
+function rememberDecodeLimit(src, v){
+  const k=decodeLimitKey(src); if(!k||!v) return;
+  try{ const l=decodeLimits();
+       l[k]={lost:v.lost, rate:v.rate, secs:v.secs,
+             decode_ms:v.decodeMs, budget_ms:v.budgetMs, at:Date.now()};
        localStorage.setItem("plurx_decode_limits", JSON.stringify(l)); }catch(e){}
+}
+// What an entry says it measured. `decodeLimits()` drops anything without a
+// rate, so this only ever describes the current shape.
+function decodeLimitWhy(lim){
+  return lim&&lim.rate!=null ? `lost ${lim.lost} frames in ${lim.secs}s (${lim.rate}/min)` : "";
 }
 function clearDecodeLimit(src){
   const k=decodeLimitKey(src); if(!k) return false;
@@ -3221,7 +3270,8 @@ function clearDecodeLimit(src){
 function decodeLimitsSummary(){
   const l=decodeLimits(), keys=Object.keys(l);
   if(!keys.length) return `<span class="muted" style="font-size:13px">Nothing measured on this browser.</span>`;
-  const items=keys.map(k=>`<span class="pill">${esc(k)} · ${l[k].decode_ms}ms/${l[k].budget_ms}ms · ${esc(agoLabel(Math.round(l[k].at/1000)))}</span>`).join(" ");
+  const items=keys.map(k=>`<span class="pill">${esc(k)} · ${l[k].rate} lost/min · ${
+    esc(agoLabel(Math.round(l[k].at/1000)))}</span>`).join(" ");
   return `${items} <button class="ghost sm" onclick="forgetDecodeLimitsUI()">Forget ${keys.length===1?"it":"them all"}</button>`;
 }
 function forgetDecodeLimitsUI(){
@@ -3416,26 +3466,27 @@ function maybeDecodeRescue(){
   // by the same rule as an explicit Original — that is what makes the re-test
   // able to clear the entry without the viewer choosing anything.
   if(q==='original' || (q==='auto' && p.decodeRetest)){
-    // Clearing is the rescue's own trigger, inverted: it fires on measured
-    // hitches, so it lifts on their measured absence — same window, same
-    // event count, the other way round.
+    // Clearing is the rescue's own trigger inverted — literally, now: the same
+    // lost-frame rate against the same threshold, the other way round. It used
+    // to be a second heuristic (fewer than four faults of ANY kind in a
+    // minute), and the two drifted apart badly enough that a session the
+    // viewer described as flawless still could not clear its entry: six
+    // compositor holds and three lost frames over two and a half minutes is
+    // nine "faults", and the bar was four.
     //
-    // It used to lift when `decodeMs` fell under 60% of the frame budget,
-    // which reads `processingDuration` as decode cost. That is the misread
-    // guardrail 8 exists for, and here it was worse than wrong: on a
-    // pipelined decoder that number measures how DEEP the pipeline is, so a
-    // client holding a healthy reserve reports a LARGER one. On the 4K remux
-    // it went from 41.6ms to 91ms against a 41.7ms budget once the dvcC fix
-    // restored the hardware path — the playback got better and the clearing
-    // condition got further away. The entry could never clear at all, and
-    // Auto stayed pinned to a transcode on a device that had long since
-    // stopped needing one.
-    const clean=(h.back|0)+(h.held|0)+(h.late|0)+(h.drop|0)+(h.gap|0);
-    if(secs>=MARGIN_CLEAR_SECS && clean<MARGIN_MIN_EVENTS && clearDecodeLimit(p.source)){
+    // Before that it was a decode number under 60% of the frame budget, which
+    // reads `processingDuration` as decode cost — the misread guardrail 8
+    // exists for, and worse than usual here, because on a pipelined decoder
+    // that figure measures how DEEP the pipeline is. A client holding a
+    // healthy reserve reports a LARGER one. On the 4K remux it went from
+    // 41.6 ms to 91 ms against a 41.7 ms budget once the `dvcC` fix restored
+    // the hardware path — playback improved and the condition receded.
+    const x=lostFrameRate(h, secs);
+    if(secs>=MARGIN_CLEAR_SECS && x && x.rate<MARGIN_LOST_PER_MIN && clearDecodeLimit(p.source)){
       p.decodeRetest=false;
       clientLog(Object.assign({level:"info",event:"decode_limit_cleared",
         message:`this device played ${decodeLimitKey(p.source)} for ${Math.round(secs)}s `+
-                `with ${clean} visible fault(s) — Auto may use Original again`},
+                `losing ${x.lost} frame(s), ${x.rate}/min — Auto may use Original again`},
         playbackContext()));
       toast("This browser handles the original now — Auto will use it");
     }
@@ -3457,16 +3508,25 @@ function maybeDecodeRescue(){
   // HEVC 2160p. Fall back, because falling back genuinely helps; just do not
   // remember it as something it wasn't.
   const quota=(p.bufferLimits&&p.bufferLimits.quota)|0;
-  if(!quota) rememberDecodeLimit(p.source, verdict.decodeMs, verdict.budgetMs);
+  if(!quota) rememberDecodeLimit(p.source, verdict);
+  // Why this session is not the picture the viewer asked for, kept where they
+  // can find it later. The toast says it once and then it is gone — which is
+  // exactly what happened on Tron: dropped to 1080p mid-film with a message
+  // that vanished, and nothing anywhere afterwards that said why.
+  p.rescuedNote=quota
+    ? `switched to a transcode: this browser refused buffered data ${quota}x on the original`
+    : `switched to a transcode: ${verdict.lost} frames lost in ${verdict.secs}s `+
+      `(${verdict.rate}/min) playing the original`;
   clientLog(Object.assign({level:"warn",event:"decode_rescue",
-    detail:`decode=${verdict.decodeMs}ms budget=${verdict.budgetMs}ms events=${verdict.events} quota=${quota}`,
+    detail:`lost=${verdict.lost} rate=${verdict.rate}/min secs=${verdict.secs} `+
+           `decode=${verdict.decodeMs}ms budget=${verdict.budgetMs}ms quota=${quota}`,
     message:quota
       ? `this browser refused buffer ${quota}x on ${decodeLimitKey(p.source)||'this stream'} `+
-        `and hitched with it — switching to transcode, but not remembering a decode limit: `+
-        `the constraint was buffer quota, not the decoder`
-      : `this browser delivers ${decodeLimitKey(p.source)||'this stream'} just-in-time `+
-        `(${verdict.decodeMs}ms against a ${verdict.budgetMs}ms frame budget, no slack) `+
-        `with visible hitches — switching to transcode`}, playbackContext()));
+        `and lost ${verdict.lost} frames with it — switching to transcode, but not `+
+        `remembering a decode limit: the constraint was buffer quota, not the decoder`
+      : `this browser lost ${verdict.lost} frames in ${verdict.secs}s (${verdict.rate}/min) `+
+        `playing ${decodeLimitKey(p.source)||'this stream'} — switching to transcode`},
+    playbackContext()));
   toast("This browser can't hold Original smoothly — switching to optimized");
   startTranscodeFallback("decode-rescue");
 }
@@ -4050,8 +4110,8 @@ function toggleMenu(kind,low){
       ? `Auto is re-testing it right now — if this plays cleanly it clears itself.`
       : `Auto transcodes it; Original overrides.`;
     const limNote=lim?`<div class="amsec">Measured on this device</div>
-      <div class="menunote">No decode slack on ${esc(decodeLimitKey(PLAYER.source||{})||"this stream")}
-        (${lim.decode_ms}ms against a ${lim.budget_ms}ms frame budget), ${esc(agoLabel(Math.round(lim.at/1000)))}.
+      <div class="menunote">On ${esc(decodeLimitKey(PLAYER.source||{})||"this stream")} this browser
+        ${esc(decodeLimitWhy(lim))}, ${esc(agoLabel(Math.round(lim.at/1000)))}.
         ${limWhat}</div>
       <button onclick="forgetDecodeLimitHere()">Forget this measurement</button>`:"";
     m.innerHTML=`<div class="amsec">Quality</div>`+QUALITIES.map(([v,l])=>{
@@ -4570,6 +4630,12 @@ function updateStats(){
         ? `segmented ${PLAYER.method==='transcode'?'MPEG-TS':'fMP4'} · native HLS`
         : "one continuous file · range requests"}</span></div>`+
     ((PLAYER.reasons&&PLAYER.reasons.length)?`<div><b>Reason</b>${esc(PLAYER.reasons.join("; "))}</div>`:"")+
+    // A session the player moved off the original owes the viewer a standing
+    // answer, not a toast that disappears. The Reason line above is the
+    // server's verdict on the FILE and does not change when the client
+    // switches, so it cannot carry this.
+    (PLAYER.rescuedNote?`<div><b>Switched</b><span style="color:var(--warn,#fbbf24)">${
+      esc(PLAYER.rescuedNote)}</span></div>`:"")+
     `<div><b>Position</b>${clockFromSec((PLAYER.offset||0)+(v.currentTime||0))}${durTxt}${rate}</div>`+
     `<div class="sechd">Source</div>`+
     `<div><b>Video</b>${esc(srcVideo)}</div>`+
@@ -4630,13 +4696,18 @@ function updateStats(){
       // decode equalled the frame budget. The measurement outranks it.
       const h=PLAYER.hitches; let margin='';
       if(h&&h.decodeMs!=null&&h.fps){
-        const b=1000/h.fps, hot=h.decodeMs>=b*MARGIN_BAD;
-        // "no slack", never "can't keep up": a median pinned to the frame
-        // budget is a pipeline delivering just-in-time. On an M3 Max it is
-        // certainly not the silicon — the measurement is of the slack, and
-        // capacity claims need context this number does not carry.
-        margin=` · <span${hot?' style="color:var(--warn,#fbbf24)"':' class="muted"'}>${
-          h.decodeMs.toFixed(0)}ms/frame against a ${b.toFixed(0)}ms budget${hot?' — delivering just-in-time, no slack':''}</span>`;
+        const b=1000/h.fps;
+        // Stated flat, and never amber. This used to warn "delivering
+        // just-in-time, no slack" whenever the figure passed 80% of the frame
+        // budget — and then said exactly that about a 7.5 Mb/s 1080p transcode
+        // with zero dropped frames, on the machine it was accusing. It is
+        // `processingDuration`: pipeline latency, which grows as the pipeline
+        // gets healthier. A number that condemns every stream condemns none of
+        // them, and dressing it in a warning colour is how it came to be
+        // believed. Frames lost per minute is the row that means something —
+        // it is two lines up, under Hitches.
+        margin=` · <span class="muted">${h.decodeMs.toFixed(0)}ms/frame in the pipeline `+
+          `against a ${b.toFixed(0)}ms budget — latency, not load</span>`;
       }
       return `<div><b>Decoder</b><span${PLAYER.decodeInfo.hw?'':' style="color:var(--warn,#fbbf24)"'}>${
         PLAYER.decodeInfo.hw?'hardware':'software — this machine has no GPU path for this stream'}${

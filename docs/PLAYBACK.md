@@ -246,33 +246,60 @@ trigger whichever component is eating the reserve.
 
 The player measures per-frame decode cost (`requestVideoFrameCallback`
 `processingDuration`, median over a rolling window) and, on an **Auto**
-session playing a copy path, rescues when all three hold: 20 s of actual
-playback observed, at least 4 visible hitch events, and a median decode at
-or over 80% of the frame budget. The rescue is the same
-`startTranscodeFallback()` restart-at-position as the error path, once per
-session, and it writes a `decode_rescue` beacon with the numbers.
+session playing a copy path, rescues on **frames the viewer lost**: at least
+150 s of actual playback observed, at least 15 lost frames, and a rate of 6 or
+more per minute. "Lost" is `drop + gap + back` — never presented, or presented
+out of order. The rescue is the same `startTranscodeFallback()` restart-at-
+position as the error path, once per session, and it writes a `decode_rescue`
+beacon with the numbers.
 
 The verdict is remembered per `codec@height` in the browser
 (`plurx_decode_limits`), so the next Auto play of a matching stream routes
 straight to a transcode — the Reason row says so, with the measured numbers.
 Two things keep the memory honest: an explicit **Quality → Original** always
 wins (the limit only steers Auto, never the viewer), and an explicit-Original
-session that plays **60 s with fewer than 4 visible faults** clears the entry
+session that plays **60 s under the same 6-per-minute rate** clears the entry
 and logs `decode_limit_cleared`, so a device that stops needing the rescue is
 noticed rather than distrusted forever.
 
-Clearing is the trigger inverted — same window, same event count, the other
-way round — and deliberately not a decode number. It used to require
-`decodeMs` under 60% of the frame budget, which reads `processingDuration` as
-decode cost: guardrail 8's mistake, and worse here than usual, because on a
-pipelined decoder that figure measures how deep the pipeline is. A client
-holding a healthy reserve reports a *larger* one. On the 4K remux it went from
-41.6 ms to 91 ms against a 41.7 ms budget once the `dvcC` fix restored the
-hardware path — playback improved and the clearing condition moved further
-away, so the entry could never clear and Auto stayed on a transcode
-permanently. Found from the couch, 2026-07-30: Safari on Auto played 4K while
-Chrome on Auto would not, same machine, same file — only Chrome carried the
-remembered entry.
+**The decode figure is not allowed to decide this, and getting there took
+three passes.** Clearing originally required `decodeMs` under 60% of the frame
+budget, which reads `processingDuration` as decode cost — guardrail 8's
+mistake, and worse here than usual, because on a pipelined decoder that figure
+measures how *deep* the pipeline is. A client holding a healthy reserve reports
+a **larger** one. On the 4K remux it went from 41.6 ms to 91 ms against a
+41.7 ms budget once the `dvcC` fix restored the hardware path — playback
+improved and the clearing condition moved further away, so the entry could
+never clear and Auto stayed on a transcode permanently.
+
+That fixed the clearing rule and left the **trigger** reading the same number
+the same wrong way (`decodeMs >= 80%` of budget), which is the inconsistency
+that should have been the tell. What settled it was one screenshot, 2026-07-30:
+a 1920x1080 transcode at 7.5 Mb/s, **zero** dropped frames, hardware decode,
+reporting **83 ms/frame against a 42 ms budget** — the identical "no slack"
+verdict as the 4K remux it had just rescued the viewer away from. A gate that
+condemns an 8 Mb/s 1080p stream on the machine it is judging has no
+discriminating power at all, so in practice the rescue was firing on *four
+hitch events in twenty seconds* — which any two-hour film produces for a dozen
+transient reasons.
+
+Two consequences worth stating plainly, because both were live bugs:
+
+- Trigger and clear are now literally the same measure inverted, rather than
+  two heuristics that can drift. They had drifted: a session the viewer
+  described as flawless (6 compositor holds, 3 lost frames, two and a half
+  minutes) still counted 9 "faults" against a bar of 4, so it could not clear
+  its own entry no matter how well it played.
+- Entries written by the old gate are **discarded on read** rather than
+  migrated. They carry `decode_ms` and no `rate`, they were produced by a test
+  that reads true on every stream, and they are not measurements of anything.
+
+Found from the couch, 2026-07-30: Safari on Auto played 4K while Chrome on
+Auto would not, same machine, same file — only Chrome carried the remembered
+entry. The entry itself turned out to be a buffer-quota problem
+(PERF-PLAN §4.3quater) wearing a decode costume, which is why a session the
+browser refused buffered data on now falls back **without** recording a decode
+limit.
 
 **Three ways out, because this is invisible state that steers playback.** The
 self-clearing rule above is the automatic one, and it was unreachable for a
@@ -300,11 +327,22 @@ what the rescue always cost — roughly twenty seconds of hitches before it
 switches back, once a week — against the alternative of never getting the
 source back at all.
 
-**How to read it:** the stats overlay's Decoder row shows the measurement
-live (`hardware · 42ms/frame against a 42ms budget — no headroom`); a
-`Reason` beginning "this device measured …" is the remembered limit
-steering an Auto session; `decode_rescue` / `decode_limit_cleared` lines in
-the perf report are the same events server-side.
+And when the player *does* move a session off the original, the overlay carries
+a **Switched** row saying why, for as long as that session lasts. The toast
+says it once and vanishes; the Reason row above it is the server's verdict on
+the *file* and does not change when the client switches, so neither of them
+could answer "why am I watching 1080p?" ten minutes later.
+
+**How to read it:** the **Hitches** row is the one that means something —
+`drop` and `skip` are frames the viewer lost, and their rate is what the rescue
+judges. The Decoder row states the pipeline figure flat and grey
+(`83ms/frame in the pipeline against a 42ms budget — latency, not load`),
+deliberately without a warning colour: it is `processingDuration`, it grows as
+the pipeline gets healthier, and dressing it in amber is how it came to be
+believed. A `Reason` beginning "this device measured …" is the remembered limit
+steering an Auto session, a **Switched** row is this session having been moved
+off the original, and `decode_rescue` / `decode_limit_cleared` lines in the
+perf report are the same events server-side.
 
 ## Resume & progress
 
