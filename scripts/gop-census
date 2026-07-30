@@ -429,6 +429,116 @@ def simulate(fragments, timescale, floor_s, ceiling_bytes, max_s):
     return clean, ceiling
 
 
+def simulate_legacy(fragments, timescale, floor_s):
+    """What ffmpeg's own HLS muxer does — cut at the first keyframe past the
+    floor, whatever it is. The baseline every policy has to beat."""
+    floor = floor_s * timescale
+    clean = dirty = 0
+    ticks = nbytes = 0
+    for cls, size, dur in fragments:
+        if nbytes and ticks >= floor:
+            if cls in ("idr", "cra"):
+                clean += 1
+            else:
+                dirty += 1
+            ticks = nbytes = 0
+        ticks += dur
+        nbytes += size
+    return clean, dirty
+
+
+def segment_shape(fragments, timescale, floor_s, ceiling_bytes, max_s):
+    """Mean and max published segment, in seconds and bytes, under a policy.
+
+    The byte figure is the one that binds: hls.js appends whole segments into a
+    SourceBuffer whose forward budget is 96 MB (MSE_FORWARD_BYTES), so a policy
+    whose biggest segment approaches that has spent the entire buffer on one
+    fragment — the mistake 946486b fixed at the other end of the same sum.
+    """
+    floor = floor_s * timescale
+    max_ticks = max_s * timescale
+    segs = []
+    ticks = nbytes = 0
+    for cls, size, dur in fragments:
+        if nbytes and ticks >= floor:
+            if cls in ("idr", "cra") or nbytes >= ceiling_bytes or ticks >= max_ticks:
+                segs.append((ticks / timescale, nbytes))
+                ticks = nbytes = 0
+        ticks += dur
+        nbytes += size
+    if ticks:
+        segs.append((ticks / timescale, nbytes))
+    if not segs:
+        return 0.0, 0.0, 0.0
+    return (
+        sum(s for s, _ in segs) / len(segs),
+        max(s for s, _ in segs),
+        max(b for _, b in segs) / 1e6,
+    )
+
+
+def sweep(census, floors, ceilings, max_s, out=print):
+    """Replay the cut policy over a grid, and report what actually matters.
+
+    Not "how many cuts are clean" — DIRTY cuts per minute of video, because a
+    clean cut is free. That reframing is the whole point of the grid: lowering
+    the floor makes more boundaries, but converts enough of them to clean that
+    the rate of dropped frames can fall anyway. A percentage cannot show that
+    trade-off and a rate can.
+    """
+    frags = census.fragments
+    ts = census.timescale or 1
+    span = sum(f[2] for f in frags) / ts
+    if span <= 0:
+        return
+    minutes = span / 60.0
+
+    out("")
+    out("  -- policy sweep: DIRTY cuts per minute of video (lower is better) --")
+    out("     a dirty cut is one dropped frame; a clean cut costs nothing, so")
+    out("     this is the rate of the artifact, not the rate of boundaries")
+    out("")
+    header = "     floor │" + "".join(f"{c:>8}MB" for c in ceilings)
+    out(header)
+    out("     " + "──────┼" + "─" * (10 * len(ceilings)))
+    best = None
+    for f in floors:
+        row = f"     {f:>4}s │"
+        for c in ceilings:
+            clean, ceiling = simulate(frags, ts, f, c * 1_000_000, max_s)
+            rate = ceiling / minutes
+            row += f"{rate:>10.1f}"
+            if best is None or rate < best[0]:
+                best = (rate, f, c, clean, ceiling)
+        out(row)
+
+    out("")
+    out("     for comparison, ffmpeg's own muxer (cut at the first keyframe")
+    out("     past the floor, clean or not):")
+    for f in floors:
+        lclean, ldirty = simulate_legacy(frags, ts, f)
+        out(f"       floor {f:>2}s → {ldirty / minutes:>5.1f} dirty/min "
+            f"({lclean} of {lclean + ldirty} cuts happened to be clean)")
+
+    if best:
+        rate, f, c, clean, ceiling = best
+        mean_s, max_s_seen, max_mb = segment_shape(frags, ts, f, c * 1_000_000, max_s)
+        _, ldirty = simulate_legacy(frags, ts, f)
+        out("")
+        out(f"  best on this sample: floor {f}s / ceiling {c}MB → {rate:.1f} dirty/min")
+        out(f"    {clean} clean cuts, {ceiling} ceiling cuts over {span:.0f}s")
+        out(f"    segments: mean {mean_s:.1f}s · longest {max_s_seen:.1f}s · "
+            f"biggest {max_mb:.0f} MB")
+        if max_mb > 96:
+            out("    ⚠ a segment bigger than the 96 MB forward buffer (bufferTargets)")
+            out("      is one hls.js cannot hold — this ceiling is not shippable")
+        elif max_mb > 48:
+            out("      (over 48 MB, so hls.js holds one segment forward, not two)")
+        out(f"    against ffmpeg's muxer at the same floor: "
+            f"{ldirty / minutes:.1f} dirty/min — "
+            f"{'no better' if rate >= ldirty / minutes else f'{ldirty / max(rate, 1e-9):.1f}x fewer drops'}")
+
+
 def pct(n, d):
     return 0.0 if not d else 100.0 * n / d
 
@@ -502,6 +612,29 @@ def report(path, census, floor_s, ceiling_mb, max_s, out=print):
             f"{span:.1f}s — the whole sample is one segment"
         )
 
+    # Is the CEILING the constraint rather than the source? At a high enough
+    # bitrate the byte ceiling arrives only moments after the floor, and the
+    # segmenter gets less than one GOP of room to find a clean point in — which
+    # looks exactly like a source with no clean points and is a completely
+    # different problem. Say which one this is, in seconds, because the fix is
+    # different: one is "this title gains nothing", the other is "the constants
+    # collide at this bitrate".
+    rate_bps = total_bytes / span if span else 0
+    ceiling_s = ceiling_bytes / rate_bps if rate_bps else float("inf")
+    window = ceiling_s - floor_s
+    gap_p50 = sorted(gaps)[len(gaps) // 2] if gaps else None
+    if cuts and gap_p50 is not None and window < gap_p50:
+        out(
+            f"  ⚠ the CEILING is the constraint here, not the source: at "
+            f"{rate_bps * 8 / 1e6:.0f} Mb/s the {ceiling_mb}MB ceiling arrives "
+            f"{ceiling_s:.1f}s in,"
+        )
+        out(
+            f"    so past the {floor_s}s floor there is only a {window:.1f}s window to "
+            f"find a clean point — and they come every {gap_p50:.1f}s (median)."
+        )
+        out("    Run again with --sweep to see what the floor/ceiling pair costs.")
+
     frac = pct(clean_cuts, cuts) if cuts else 0.0
     if not cuts:
         verdict = (
@@ -516,6 +649,11 @@ def report(path, census, floor_s, ceiling_mb, max_s, out=print):
         verdict = (
             "this source offers no clean cut point; the segmenter costs nothing "
             "and gains nothing — the byte ceiling does all the cutting"
+        )
+    elif gap_p50 is not None and window < gap_p50:
+        verdict = (
+            f"clean points are NOT sparse here (one every {gap_p50:.1f}s) — the "
+            f"{ceiling_mb}MB ceiling is cutting before they arrive; try --sweep"
         )
     else:
         verdict = (
@@ -543,6 +681,9 @@ def main():
                     help="how much of each file to read; 0 for all of it")
     ap.add_argument("--start", type=float, default=0.0,
                     help="seek this far in first (skips titles/black)")
+    ap.add_argument("--sweep", action="store_true",
+                    help="replay a grid of floor/ceiling pairs over the same census "
+                         "and report dirty cuts per minute for each")
     ap.add_argument("--ffmpeg", default=os.environ.get("PLURX_FFMPEG", "ffmpeg"))
     ap.add_argument("--ffprobe", default=os.environ.get("PLURX_FFPROBE", "ffprobe"))
     args = ap.parse_args()
@@ -561,6 +702,9 @@ def main():
             print()
         census = run_census(args.ffmpeg, args.ffprobe, path, args.seconds, args.start)
         rc |= report(path, census, args.floor, args.ceiling, args.max_seconds)
+        if args.sweep and census.fragments:
+            sweep(census, [2, 3, 4, 5, 6, 8, 10], [32, 48, 64, 80, 96, 128],
+                  args.max_seconds)
     return rc
 
 
