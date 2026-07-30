@@ -1099,6 +1099,424 @@ impl CutPolicy {
 }
 
 // ---------------------------------------------------------------------------
+// merge
+// ---------------------------------------------------------------------------
+
+/// What merging a run of fragments cost in fidelity. Anything non-zero here is
+/// worth a log line; on a stream ffmpeg produced in one pass it is all zero.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MergeStats {
+    /// Times a source `tfdt` did not equal the previous fragment's end and the
+    /// join had to be absorbed into a sample duration.
+    pub tfdt_adjustments: u32,
+}
+
+/// The merged segment, and what it cost.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Segment {
+    pub bytes: Vec<u8>,
+    pub stats: MergeStats,
+    /// Video duration in the video track's timescale — the number `EXTINF` is
+    /// written from.
+    pub video_ticks: u64,
+}
+
+/// One output `trun`: a source run's samples, and where its bytes came from.
+struct PlanRun {
+    /// Index into the merged fragment list.
+    fragment: usize,
+    /// The run's data offset within that fragment's own bytes.
+    src_offset: usize,
+    samples: Vec<Sample>,
+}
+
+struct Plan {
+    track_id: u32,
+    base_decode_time: u64,
+    runs: Vec<PlanRun>,
+}
+
+/// Merge consecutive fragments into one `styp moof mdat` HLS segment.
+///
+/// The shape, and why. One `traf` per track, and inside it one `trun` per
+/// source run rather than one merged `trun`: ffmpeg writes each track's
+/// samples contiguously *within* a fragment but interleaves the tracks between
+/// fragments, so a single `trun` — which can carry only one data offset —
+/// would force the sample data to be de-interleaved and rewritten. Keeping a
+/// `trun` per source run lets each `mdat` payload be copied whole and every
+/// offset be arithmetic, which is what makes `framemd5` equality with the
+/// unsegmented stream provable rather than hoped for.
+///
+/// Everything else is normalized: `tfhd` carries only `default-base-is-moof`,
+/// `tfdt` is version 1, and every sample's duration, size, flags and
+/// composition offset is written explicitly. So the default-value and
+/// first-sample-flags ladders exist only in the reader, and nothing downstream
+/// has to re-derive them.
+pub fn merge(fragments: &[Fragment], init: &Init, sequence: u32) -> Result<Segment, Fmp4Error> {
+    if fragments.is_empty() {
+        return malformed("nothing to merge");
+    }
+    let mut stats = MergeStats::default();
+
+    // Track order comes from the first fragment, which is ffmpeg's own
+    // interleave order — video first. Keeping it makes a diff against hlsenc's
+    // output readable.
+    let track_ids: Vec<u32> = fragments[0].tracks.iter().map(|t| t.track_id).collect();
+    let mut plans: Vec<Plan> = Vec::with_capacity(track_ids.len());
+
+    for &id in &track_ids {
+        let mut runs: Vec<PlanRun> = Vec::new();
+        let mut base: Option<u64> = None;
+        let mut expected_next: Option<u64> = None;
+        for (fi, frag) in fragments.iter().enumerate() {
+            let Some(tf) = frag.track(id) else { continue };
+            match base {
+                None => base = Some(tf.base_decode_time),
+                Some(_) => {
+                    // One `traf` carries one `tfdt`, so every later fragment's
+                    // decode time has to be reachable by summing durations. It
+                    // always is on a stream ffmpeg produced in one pass; when
+                    // it is not, the join goes into the previous fragment's
+                    // last sample rather than silently shifting everything
+                    // after it.
+                    if let Some(exp) = expected_next {
+                        if tf.base_decode_time != exp {
+                            let delta = tf.base_decode_time as i64 - exp as i64;
+                            if let Some(last) = runs.last_mut().and_then(|r| r.samples.last_mut()) {
+                                let adjusted = last.duration as i64 + delta;
+                                if (0..=u32::MAX as i64).contains(&adjusted) {
+                                    last.duration = adjusted as u32;
+                                    stats.tfdt_adjustments += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let mut dur = 0u64;
+            for run in &tf.runs {
+                if run.samples.is_empty() {
+                    continue;
+                }
+                dur += run.samples.iter().map(|s| s.duration as u64).sum::<u64>();
+                runs.push(PlanRun {
+                    fragment: fi,
+                    src_offset: run.data_offset,
+                    samples: run.samples.clone(),
+                });
+            }
+            expected_next = Some(tf.base_decode_time + dur);
+        }
+        if let (Some(base), false) = (base, runs.is_empty()) {
+            plans.push(Plan {
+                track_id: id,
+                base_decode_time: base,
+                runs,
+            });
+        }
+    }
+    if plans.is_empty() {
+        return malformed("no track survived the merge");
+    }
+
+    // Pass 1: build the moof with zeroed data offsets to learn its size. Every
+    // field that could change the size is fixed-width, so pass 2 only patches
+    // values — the layout is already final.
+    let mut offset_slots: Vec<usize> = Vec::new();
+    let mut moof = build_moof(&plans, sequence, &mut offset_slots);
+    let moof_size = moof.len();
+
+    // Where each source fragment's mdat payload lands inside the new one.
+    let mut payload_base: Vec<usize> = Vec::with_capacity(fragments.len());
+    let mut payload_total = 0usize;
+    for frag in fragments {
+        payload_base.push(payload_total);
+        payload_total += frag.mdat_payload.len();
+    }
+    let Some(mdat_size) = payload_total.checked_add(8) else {
+        return malformed("merged mdat size overflows");
+    };
+    if mdat_size > u32::MAX as usize {
+        return Err(Fmp4Error::Unsupported(format!(
+            "merged mdat would be {mdat_size} bytes"
+        )));
+    }
+
+    // Pass 2: patch each trun's data offset. A run's samples start at the same
+    // place in the merged payload as they did in their own fragment's, shifted
+    // by where that fragment's payload landed.
+    let mut slot = 0usize;
+    for plan in &plans {
+        for run in &plan.runs {
+            let frag = &fragments[run.fragment];
+            let within = run.src_offset.saturating_sub(frag.mdat_payload.start);
+            let offset = moof_size + 8 + payload_base[run.fragment] + within;
+            if offset > i32::MAX as usize {
+                return Err(Fmp4Error::Unsupported(
+                    "merged segment exceeds a 32-bit trun data offset".into(),
+                ));
+            }
+            let pos = offset_slots[slot];
+            moof[pos..pos + 4].copy_from_slice(&(offset as u32).to_be_bytes());
+            slot += 1;
+        }
+    }
+
+    let mut out = Vec::with_capacity(STYP.len() + moof_size + mdat_size);
+    out.extend_from_slice(&STYP);
+    out.extend_from_slice(&moof);
+    out.extend_from_slice(&(mdat_size as u32).to_be_bytes());
+    out.extend_from_slice(b"mdat");
+    for frag in fragments {
+        out.extend_from_slice(&frag.bytes[frag.mdat_payload.clone()]);
+    }
+
+    let video_ticks = init
+        .video()
+        .and_then(|v| plans.iter().find(|p| p.track_id == v.id))
+        .map(|p| {
+            p.runs
+                .iter()
+                .flat_map(|r| r.samples.iter())
+                .map(|s| s.duration as u64)
+                .sum()
+        })
+        .unwrap_or(0);
+
+    Ok(Segment {
+        bytes: out,
+        stats,
+        video_ticks,
+    })
+}
+
+/// The 24-byte `styp` hlsenc writes, copied exactly: major brand `msdh`,
+/// compatible with `msdh` and `msix`. Emitting it — and omitting hlsenc's two
+/// `sidx` boxes, which are optional in HLS fMP4 and which hls.js's passthrough
+/// ignores — is the one deliberate byte-level divergence from the muxer this
+/// replaces.
+const STYP: [u8; 24] = [
+    0, 0, 0, 24, b's', b't', b'y', b'p', b'm', b's', b'd', b'h', 0, 0, 0, 0, b'm', b's', b'd',
+    b'h', b'm', b's', b'i', b'x',
+];
+
+/// Video runs get composition offsets; audio does not. Decided per run by
+/// whether any sample actually carries one, so an audio track never pays four
+/// bytes a sample for a column of zeros.
+fn trun_flags(samples: &[Sample]) -> u32 {
+    // data-offset + duration + size + flags, all present, for every sample.
+    let base = 0x0000_0701;
+    if samples.iter().any(|s| s.cto != 0) {
+        base | 0x0000_0800
+    } else {
+        base
+    }
+}
+
+/// Serialize the `moof`, recording where each `trun`'s data offset field
+/// landed so the caller can patch it once the total size is known.
+fn build_moof(plans: &[Plan], sequence: u32, offset_slots: &mut Vec<usize>) -> Vec<u8> {
+    let mut moof: Vec<u8> = Vec::new();
+    moof.extend_from_slice(&[0, 0, 0, 0]); // size, patched at the end
+    moof.extend_from_slice(b"moof");
+    moof.extend_from_slice(&16u32.to_be_bytes());
+    moof.extend_from_slice(b"mfhd");
+    moof.extend_from_slice(&0u32.to_be_bytes());
+    moof.extend_from_slice(&sequence.to_be_bytes());
+
+    for plan in plans {
+        let traf_start = moof.len();
+        moof.extend_from_slice(&[0, 0, 0, 0]);
+        moof.extend_from_slice(b"traf");
+        // tfhd: default-base-is-moof and nothing else. Every default it could
+        // carry is written per sample instead.
+        moof.extend_from_slice(&16u32.to_be_bytes());
+        moof.extend_from_slice(b"tfhd");
+        moof.extend_from_slice(&0x0002_0000u32.to_be_bytes());
+        moof.extend_from_slice(&plan.track_id.to_be_bytes());
+        // tfdt v1 — 64-bit, because a long film in a 90 kHz timescale outgrows
+        // 32 bits, and because it is what ffmpeg writes.
+        moof.extend_from_slice(&20u32.to_be_bytes());
+        moof.extend_from_slice(b"tfdt");
+        moof.extend_from_slice(&0x0100_0000u32.to_be_bytes());
+        moof.extend_from_slice(&plan.base_decode_time.to_be_bytes());
+
+        for run in &plan.runs {
+            let flags = trun_flags(&run.samples);
+            let has_cto = flags & 0x0000_0800 != 0;
+            let per = if has_cto { 16 } else { 12 };
+            let size = 8 + 4 + 4 + 4 + run.samples.len() * per;
+            moof.extend_from_slice(&(size as u32).to_be_bytes());
+            moof.extend_from_slice(b"trun");
+            moof.extend_from_slice(&flags.to_be_bytes());
+            moof.extend_from_slice(&(run.samples.len() as u32).to_be_bytes());
+            offset_slots.push(moof.len());
+            moof.extend_from_slice(&0u32.to_be_bytes()); // data_offset, patched
+            for s in &run.samples {
+                moof.extend_from_slice(&s.duration.to_be_bytes());
+                moof.extend_from_slice(&s.size.to_be_bytes());
+                moof.extend_from_slice(&s.flags.to_be_bytes());
+                if has_cto {
+                    // Version 0, so the offset is unsigned: ffmpeg shifts dts
+                    // to keep every one non-negative, and a stream where that
+                    // was not true would need a v1 trun.
+                    moof.extend_from_slice(&(s.cto.max(0) as u32).to_be_bytes());
+                }
+            }
+        }
+        let traf_len = (moof.len() - traf_start) as u32;
+        moof[traf_start..traf_start + 4].copy_from_slice(&traf_len.to_be_bytes());
+    }
+    let total = moof.len() as u32;
+    moof[0..4].copy_from_slice(&total.to_be_bytes());
+    moof
+}
+
+// ---------------------------------------------------------------------------
+// the segmenter
+// ---------------------------------------------------------------------------
+
+/// What a session's segmenter has done so far. This is the end-of-session log
+/// line, and `scripts/perf-report` greps it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SegmentCounts {
+    pub fragments: u64,
+    pub segments: u64,
+    /// Cuts taken in front of a true random-access point — the ones that cost
+    /// no frame.
+    pub clean_cuts: u64,
+    /// Cuts forced by the byte or duration ceiling with no clean point in
+    /// reach. Each one still costs the leading picture, and saying so is the
+    /// difference between a measured residual and a silent one.
+    pub ceiling_cuts: u64,
+    /// Fragments this reader could not classify. Never cut in front of;
+    /// counted because a stream shape nobody anticipated should show up as a
+    /// number rather than as silence.
+    pub unparseable: u64,
+    pub tfdt_adjustments: u32,
+}
+
+/// One segment, ready to write.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Published {
+    pub index: u64,
+    pub segment: Segment,
+    pub reason: CutReason,
+    /// `EXTINF`, from summed video sample durations in the video timescale.
+    pub seconds: f64,
+}
+
+impl Published {
+    pub fn name(&self) -> String {
+        segment_name(self.index)
+    }
+}
+
+/// Accumulates fragments and publishes segments that start on clean keyframes.
+///
+/// Pure by design: the daemon feeds it fragments and writes what comes back
+/// out, so every rule about where a boundary may land is testable without a
+/// filesystem, a process or a clock.
+#[derive(Debug)]
+pub struct Segmenter {
+    init: Init,
+    policy: CutPolicy,
+    video_timescale: u32,
+    pending: Vec<Fragment>,
+    pending_bytes: usize,
+    pending_ticks: u64,
+    next_index: u64,
+    counts: SegmentCounts,
+}
+
+impl Segmenter {
+    pub fn new(init: Init, policy: CutPolicy) -> Segmenter {
+        let video_timescale = init.video().map(|v| v.timescale).unwrap_or(0).max(1);
+        Segmenter {
+            init,
+            policy,
+            video_timescale,
+            pending: Vec::new(),
+            pending_bytes: 0,
+            pending_ticks: 0,
+            next_index: 0,
+            counts: SegmentCounts::default(),
+        }
+    }
+
+    pub fn init(&self) -> &Init {
+        &self.init
+    }
+
+    pub fn counts(&self) -> SegmentCounts {
+        self.counts
+    }
+
+    /// Bytes held back waiting for a cut point. Bounded by the byte ceiling
+    /// plus one fragment; anything beyond that is worth a log line.
+    pub fn pending_bytes(&self) -> usize {
+        self.pending_bytes
+    }
+
+    /// Feed the next fragment. Returns a segment when this fragment's arrival
+    /// is what ended the previous one — the cut is decided *in front of* the
+    /// new fragment, which is the whole trick: a boundary can only be judged
+    /// once you can see what comes after it.
+    pub fn push(&mut self, fragment: Fragment) -> Result<Option<Published>, Fmp4Error> {
+        let class = classify(&fragment, &self.init);
+        self.counts.fragments += 1;
+        if class == CutClass::Unparseable {
+            self.counts.unparseable += 1;
+        }
+        let published = match self
+            .policy
+            .cut_before(self.pending_ticks, self.pending_bytes, class)
+        {
+            Some(reason) => Some(self.flush(reason)?),
+            None => None,
+        };
+        self.pending_ticks += fragment.video_duration(&self.init);
+        self.pending_bytes += fragment.len();
+        self.pending.push(fragment);
+        Ok(published)
+    }
+
+    /// End of stream: whatever is still pending becomes the last segment.
+    pub fn finish(&mut self) -> Result<Option<Published>, Fmp4Error> {
+        if self.pending.is_empty() {
+            return Ok(None);
+        }
+        self.flush(CutReason::EndOfStream).map(Some)
+    }
+
+    fn flush(&mut self, reason: CutReason) -> Result<Published, Fmp4Error> {
+        let index = self.next_index;
+        let segment = merge(&self.pending, &self.init, index as u32 + 1)?;
+        self.pending.clear();
+        self.pending_bytes = 0;
+        self.pending_ticks = 0;
+        self.next_index += 1;
+        self.counts.segments += 1;
+        self.counts.tfdt_adjustments += segment.stats.tfdt_adjustments;
+        match reason {
+            CutReason::Clean => self.counts.clean_cuts += 1,
+            CutReason::ByteCeiling | CutReason::TimeCeiling => self.counts.ceiling_cuts += 1,
+            // The last segment of a session did not choose where it ended, so
+            // it is neither a clean cut nor a ceiling cut. Counting it as
+            // either would flatter or slander the policy.
+            CutReason::EndOfStream => {}
+        }
+        let seconds = segment.video_ticks as f64 / self.video_timescale as f64;
+        Ok(Published {
+            index,
+            segment,
+            reason,
+            seconds,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // playlist
 // ---------------------------------------------------------------------------
 
@@ -1141,7 +1559,7 @@ pub fn segment_name(index: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::{LazyLock, Mutex};
 
@@ -1641,6 +2059,243 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // M2 — the merger
+    // -----------------------------------------------------------------------
+
+    /// Run a whole feed through the segmenter, returning what a session would
+    /// have published.
+    fn segment(
+        kind: &str,
+        floor_s: u32,
+        max_bytes: usize,
+        max_s: u32,
+    ) -> (Init, Vec<Published>, SegmentCounts) {
+        let feed = pipe(kind);
+        let (init, frags, _) = read_all(&feed);
+        let timescale = init.video().map(|v| v.timescale).unwrap_or(1);
+        let policy = CutPolicy::new(floor_s, max_bytes, max_s, timescale);
+        let mut seg = Segmenter::new(init.clone(), policy);
+        let mut out = Vec::new();
+        for f in frags {
+            if let Some(p) = seg.push(f).expect("merging") {
+                out.push(p);
+            }
+        }
+        if let Some(p) = seg.finish().expect("final merge") {
+            out.push(p);
+        }
+        (init, out, seg.counts())
+    }
+
+    fn write_candidate(dir: &Path, init: &Init, published: &[Published]) -> PathBuf {
+        let path = dir.join("candidate.mp4");
+        let mut bytes = init.bytes.clone();
+        for p in published {
+            bytes.extend_from_slice(&p.segment.bytes);
+        }
+        std::fs::write(&path, &bytes).expect("writing the candidate");
+        path
+    }
+
+    fn framemd5(path: &Path, stream: &str) -> String {
+        let out = run(Command::new(ffmpeg())
+            .args(["-v", "error", "-i"])
+            .arg(path)
+            .args(["-map", stream, "-f", "framemd5", "-"]));
+        String::from_utf8_lossy(&out)
+            .lines()
+            .filter(|l| !l.starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The licence to ship: what comes out of the merger decodes to exactly
+    /// the same frames, at exactly the same times, as the continuous stream it
+    /// was cut from. `framemd5` covers both — it prints a hash per frame *with*
+    /// its pts and duration — so a re-ordered, re-timed or dropped frame all
+    /// fail it. Nothing else in this module is allowed to be interesting if
+    /// this is not true.
+    #[test]
+    fn merged_stream_decodes_bit_identical() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (init, published, counts) = segment("open-gop", 3, 300_000, 15);
+        assert!(
+            published.len() >= 2,
+            "the fixture produced one segment only"
+        );
+        assert_eq!(counts.tfdt_adjustments, 0, "a join had to be repaired");
+
+        let candidate = write_candidate(dir.path(), &init, &published);
+        let reference = fixture_dir().join("open-gop.pipe.mp4");
+        for stream in ["0:v:0", "0:a:0"] {
+            assert_eq!(
+                framemd5(&candidate, stream),
+                framemd5(&reference, stream),
+                "{stream} decodes differently after merging"
+            );
+        }
+    }
+
+    /// Re-parse our own output and check it against the fragments it was made
+    /// from. framemd5 proves the decoder agrees; this proves the container
+    /// says what we meant it to say, which is what a *different* player will
+    /// read.
+    #[test]
+    fn every_sample_keeps_its_pts_dur_size() {
+        let (init, published, _) = segment("open-gop", 3, 300_000, 15);
+        let feed = pipe("open-gop");
+        let (_, source_frags, _) = read_all(&feed);
+
+        // Flatten the source into (dts, pts, duration, size, flags) per track.
+        let mut want: Vec<(u32, i64, i64, u32, u32, u32)> = Vec::new();
+        for f in &source_frags {
+            for tf in &f.tracks {
+                let mut dts = tf.base_decode_time as i64;
+                for s in tf.samples() {
+                    want.push((tf.track_id, dts, dts + s.cto, s.duration, s.size, s.flags));
+                    dts += s.duration as i64;
+                }
+            }
+        }
+
+        let mut got: Vec<(u32, i64, i64, u32, u32, u32)> = Vec::new();
+        for p in &published {
+            let mut feed = init.bytes.clone();
+            feed.extend_from_slice(&p.segment.bytes);
+            let (_, frags, _) = read_all(&feed);
+            assert_eq!(frags.len(), 1, "a published segment is one fragment");
+            for tf in &frags[0].tracks {
+                let mut dts = tf.base_decode_time as i64;
+                for s in tf.samples() {
+                    got.push((tf.track_id, dts, dts + s.cto, s.duration, s.size, s.flags));
+                    dts += s.duration as i64;
+                }
+            }
+            // And the bytes each sample points at are the bytes it had.
+            for tf in &frags[0].tracks {
+                for r in &tf.runs {
+                    assert!(
+                        r.data_offset + r.byte_len() <= p.segment.bytes.len(),
+                        "a run points past the end of its own segment"
+                    );
+                }
+            }
+        }
+
+        want.sort_by_key(|s| (s.0, s.1));
+        got.sort_by_key(|s| (s.0, s.1));
+        assert_eq!(got.len(), want.len(), "the merger lost or invented samples");
+        assert_eq!(got, want, "a sample changed on the way through the merger");
+    }
+
+    /// The defect this whole investigation chased first (STUTTER-4K §3.8/§3.9)
+    /// was a join overlap of one source timestamp tick. Consecutive published
+    /// segments must join at exactly zero, on both tracks, in the tracks' own
+    /// integer units — a float comparison would hide precisely the size of
+    /// error that matters.
+    #[test]
+    fn joins_are_gapless_and_overlap_free() {
+        let (init, published, _) = segment("open-gop", 3, 300_000, 15);
+        assert!(published.len() >= 3, "not enough joins to be evidence");
+
+        let mut end: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+        for (i, p) in published.iter().enumerate() {
+            let mut feed = init.bytes.clone();
+            feed.extend_from_slice(&p.segment.bytes);
+            let (_, frags, _) = read_all(&feed);
+            for tf in &frags[0].tracks {
+                if let Some(prev) = end.get(&tf.track_id) {
+                    assert_eq!(
+                        tf.base_decode_time,
+                        *prev,
+                        "segment {i} track {} starts {} ticks from where {} ended",
+                        tf.track_id,
+                        tf.base_decode_time as i64 - *prev as i64,
+                        i - 1
+                    );
+                }
+                end.insert(tf.track_id, tf.base_decode_time + tf.duration());
+            }
+        }
+
+        // And the video timeline the playlist claims matches the media.
+        let video = init.video().expect("video");
+        let claimed: f64 = published.iter().map(|p| p.seconds).sum();
+        let actual = end.get(&video.id).copied().unwrap_or(0) as f64 / video.timescale as f64;
+        assert!(
+            (claimed - actual).abs() < 1e-6,
+            "EXTINF sums to {claimed}s against {actual}s of media"
+        );
+    }
+
+    /// Two tracks go in, two tracks come out, with the same durations —
+    /// checked through ffprobe rather than through our own parser, because the
+    /// failure this guards against (an offset rebased against the wrong
+    /// track's payload) produces a file our parser would still describe
+    /// happily.
+    #[test]
+    fn audio_and_video_survive_interleaved() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (init, published, _) = segment("open-gop", 3, 300_000, 15);
+        let candidate = write_candidate(dir.path(), &init, &published);
+        let reference = fixture_dir().join("open-gop.pipe.mp4");
+
+        let describe = |p: &Path| {
+            let out = run(Command::new(ffprobe())
+                .args(["-v", "error", "-show_entries"])
+                .args(["stream=index,codec_name,nb_read_packets", "-count_packets"])
+                .args(["-of", "csv=p=0"])
+                .arg(p));
+            String::from_utf8_lossy(&out).trim().to_owned()
+        };
+        assert_eq!(
+            describe(&candidate),
+            describe(&reference),
+            "the merged file does not carry the same streams as the source"
+        );
+    }
+
+    /// A source with no clean point anywhere still has to make progress, and
+    /// has to say that it did so the honest way.
+    #[test]
+    fn a_source_with_no_clean_points_cuts_at_the_ceiling_and_counts_it() {
+        // Ceiling small enough that a 12 s fixture reaches it: the policy is a
+        // parameter precisely so this is testable without a 4K file.
+        let (_, published, counts) = segment("open-gop", 3, 300_000, 15);
+        assert!(published.len() >= 2);
+        assert!(
+            counts.ceiling_cuts >= 1,
+            "no ceiling cut on a source with no clean point: {counts:?}"
+        );
+        assert_eq!(counts.clean_cuts, 0, "there was no clean point to find");
+        assert_eq!(counts.unparseable, 0);
+        assert!(published.iter().any(|p| p.reason == CutReason::ByteCeiling));
+        assert_eq!(
+            published.last().map(|p| p.reason),
+            Some(CutReason::EndOfStream)
+        );
+    }
+
+    /// The other half: given clean points, every cut takes one.
+    #[test]
+    fn a_source_with_clean_points_never_cuts_dirty() {
+        let (_, published, counts) = segment("clean-cra", 3, 48_000_000, 15);
+        assert!(published.len() >= 2);
+        assert_eq!(
+            counts.ceiling_cuts, 0,
+            "a ceiling cut with clean points available"
+        );
+        assert_eq!(counts.clean_cuts as usize, published.len() - 1);
+        for p in &published[..published.len() - 1] {
+            assert_eq!(p.reason, CutReason::Clean);
+            // Past the floor, and not wildly past it: the cut is taken at the
+            // *first* clean point after the floor, not the last.
+            assert!(p.seconds >= 3.0, "cut below the floor at {}s", p.seconds);
+            assert!(p.seconds < 3.0 + 2.0, "cut {}s past the floor", p.seconds);
+        }
+    }
+
     #[test]
     fn the_playlist_matches_the_template() {
         let header = playlist_header(15);
@@ -1658,5 +2313,32 @@ mod tests {
         );
         assert_eq!(segment_name(0), "seg00000.m4s");
         assert_eq!(segment_name(12_345), "seg12345.m4s");
+    }
+
+    /// The one deliberate byte-level divergence from hlsenc is the two `sidx`
+    /// boxes; everything else about a segment's shape is the same. Assert the
+    /// shape here so a future change to the merger has to mean it.
+    #[test]
+    fn a_published_segment_is_styp_moof_mdat() {
+        let (_, published, _) = segment("open-gop", 3, 300_000, 15);
+        let bytes = &published[0].segment.bytes;
+        let mut types = Vec::new();
+        let mut p = 0usize;
+        while let Ok(Some(hdr)) = peek_box(bytes, p) {
+            types.push(fourcc(hdr.kind()));
+            p += hdr.size;
+            if p >= bytes.len() {
+                break;
+            }
+        }
+        assert_eq!(types, vec!["styp", "moof", "mdat"]);
+        assert_eq!(&bytes[..24], &STYP, "styp is not hlsenc's 24 bytes");
+    }
+
+    #[test]
+    fn merging_nothing_is_an_error_not_an_empty_segment() {
+        let feed = pipe("open-gop");
+        let (init, _, _) = read_all(&feed);
+        assert!(merge(&[], &init, 1).is_err());
     }
 }
