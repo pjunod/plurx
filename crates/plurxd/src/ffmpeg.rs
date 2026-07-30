@@ -82,10 +82,17 @@ pub async fn pacing_caps() -> PacingCaps {
                      (which cannot build a playback buffer). ffmpeg 6.1+ is recommended."
                 );
             } else if !caps.initial_burst {
-                tracing::info!(
-                    "this ffmpeg has -readrate but not -readrate_initial_burst; streams are \
-                     paced but start without a burst, so the first seconds of buffer build \
-                     at the configured rate. ffmpeg 6.1+ starts faster."
+                // WARN, not info, since the publish gate raised the stakes: a
+                // copy session's first playlist waits for COPY_PUBLISH_GATE_SECS
+                // of media, and without a burst that cushion is produced at the
+                // flat paced rate instead of at I/O speed — at the default 2x,
+                // that alone is ~6+ seconds of every time-to-first-frame, and
+                // it is invisible unless something names it.
+                tracing::warn!(
+                    "this ffmpeg has -readrate but not -readrate_initial_burst (needs 6.1+; \
+                     jellyfin-ffmpeg7 has it): sessions are paced flat from the first byte, \
+                     so the copy path's publish gate fills at the paced rate instead of at \
+                     I/O speed and every play starts seconds slower than it needs to"
                 );
             }
             caps

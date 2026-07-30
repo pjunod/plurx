@@ -2743,7 +2743,7 @@ impl TranscodeManager {
         let path = session.dir.join("index.m3u8");
         // Hold the request until the playlist exists. On the transcode path
         // that is a beat after ffmpeg starts; on the copy path it is the
-        // publish gate filling (COPY_PUBLISH_GATE_SEGMENTS), which on a
+        // publish gate filling (COPY_PUBLISH_GATE_SECS), which on a
         // NAS-bound 4K remux is production time in the double-digit seconds —
         // so the window is 30 s, not a beat. Holding beats 404ing because the
         // client's patience is asymmetric, verified against the vendored

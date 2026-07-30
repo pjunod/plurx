@@ -8,8 +8,8 @@
 //! the same shape and the same tmp-then-rename semantics ffmpeg's HLS muxer
 //! gave it, so the serving layer, the segment index, the ahead-window suspend
 //! and the GC all carry on unchanged. The playlist is the interface — which
-//! is what lets the publish gate hold it back until a cushion of segments
-//! exists ([`plurx_core::transcode::COPY_PUBLISH_GATE_SEGMENTS`]): until the
+//! is what lets the publish gate hold it back until a cushion of media
+//! exists ([`plurx_core::transcode::COPY_PUBLISH_GATE_SECS`]): until the
 //! playlist is out, the rest of the daemon agrees nothing has happened.
 //!
 //! Why bother: every boundary on an open-GOP copy costs exactly one dropped
@@ -29,7 +29,7 @@ use plurx_core::fmp4::{
     self, FragmentReader, Init, Published, SegmentCounts, Segmenter, TrackKind, Unit,
 };
 use plurx_core::transcode::{
-    COPY_FIRST_SEGMENT_SECONDS, COPY_PUBLISH_GATE_SEGMENTS, COPY_SEGMENT_MAX_BYTES,
+    COPY_FIRST_SEGMENT_SECONDS, COPY_PUBLISH_GATE_SECS, COPY_SEGMENT_MAX_BYTES,
     COPY_SEGMENT_MAX_SECS, COPY_SEGMENT_SECONDS,
 };
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -67,11 +67,13 @@ pub struct Limits {
     pub first_floor_seconds: u32,
     pub max_bytes: usize,
     pub max_seconds: u32,
-    /// Hold `index.m3u8` until this many segments exist, so playback starts
-    /// behind a cushion instead of at the live edge — the whole story is on
-    /// [`plurx_core::transcode::COPY_PUBLISH_GATE_SEGMENTS`]. End of stream
-    /// overrides it: a film shorter than the gate publishes whole.
-    pub publish_gate_segments: u32,
+    /// Hold `index.m3u8` until this many seconds of media exist, so playback
+    /// starts behind a cushion instead of at the live edge — the whole story
+    /// is on [`plurx_core::transcode::COPY_PUBLISH_GATE_SECS`]. Seconds, not
+    /// a segment count: a count multiplies by whatever the opening cuts, and
+    /// a quiet opening cuts ceiling-length segments. End of stream overrides
+    /// the gate: a film shorter than the cushion publishes whole.
+    pub publish_gate_secs: u32,
 }
 
 impl Default for Limits {
@@ -81,7 +83,7 @@ impl Default for Limits {
             first_floor_seconds: COPY_FIRST_SEGMENT_SECONDS,
             max_bytes: COPY_SEGMENT_MAX_BYTES,
             max_seconds: COPY_SEGMENT_MAX_SECS,
-            publish_gate_segments: COPY_PUBLISH_GATE_SEGMENTS,
+            publish_gate_secs: COPY_PUBLISH_GATE_SECS,
         }
     }
 }
@@ -117,10 +119,10 @@ pub enum Outcome {
 /// next to the 50 MB of segment that triggered it.
 ///
 /// The first write is gated: segments land on disk from the start, but
-/// `index.m3u8` is withheld until `gate` of them exist, so the first playlist
-/// a player loads already holds a cushion and playback starts behind the
-/// live edge rather than at it
-/// ([`plurx_core::transcode::COPY_PUBLISH_GATE_SEGMENTS`]). While the gate is
+/// `index.m3u8` is withheld until `gate_secs` of media exist, so the first
+/// playlist a player loads already holds a cushion and playback starts behind
+/// the live edge rather than at it
+/// ([`plurx_core::transcode::COPY_PUBLISH_GATE_SECS`]). While the gate is
 /// closed nothing downstream knows the segments exist — the segment index,
 /// the ahead-window suspend and the GC all read the playlist — and nothing
 /// can be served from them, because a client only learns names from the
@@ -131,10 +133,11 @@ struct SessionDir {
     /// on every write because `TARGETDURATION` grows with the longest segment
     /// published so far.
     entries: String,
-    /// Segments written so far — what the publish gate counts.
-    segments: u32,
-    /// Withhold `index.m3u8` until this many segments exist.
-    gate: u32,
+    /// Media written so far, summed from every published segment's real
+    /// duration — what the publish gate measures.
+    published_secs: f64,
+    /// Withhold `index.m3u8` until this many seconds of media exist.
+    gate_secs: u32,
     /// `ceil` of the longest `EXTINF` so far. Never decreases.
     target_duration: u32,
     /// The playlist is on disk — the moment a player could be holding this
@@ -143,12 +146,12 @@ struct SessionDir {
 }
 
 impl SessionDir {
-    fn new(dir: PathBuf, gate: u32) -> SessionDir {
+    fn new(dir: PathBuf, gate_secs: u32) -> SessionDir {
         SessionDir {
             dir,
             entries: String::new(),
-            segments: 0,
-            gate,
+            published_secs: 0.0,
+            gate_secs,
             target_duration: 0,
             started: false,
         }
@@ -185,7 +188,7 @@ impl SessionDir {
         self.publish_file(&name, &published.segment.bytes).await?;
         self.entries
             .push_str(&fmp4::playlist_entry(published.seconds, &name));
-        self.segments += 1;
+        self.published_secs += published.seconds;
         // Grows, never shrinks. A client that read a smaller number and then
         // met a longer segment would be entitled to complain; one that read a
         // number far larger than any real segment waits that long between
@@ -193,10 +196,10 @@ impl SessionDir {
         let need = published.seconds.ceil().max(1.0) as u32;
         self.target_duration = self.target_duration.max(need);
         // The publish gate. The segment is on disk; whether the world learns
-        // of it is a separate decision, taken once: until `gate` segments
-        // exist there is no playlist at all, and the first one a player loads
-        // already lists the whole cushion.
-        if !self.started && self.segments < self.gate {
+        // of it is a separate decision, taken once: until `gate_secs` of
+        // media exist there is no playlist at all, and the first one a player
+        // loads already lists the whole cushion.
+        if !self.started && self.published_secs < f64::from(self.gate_secs) {
             return Ok(());
         }
         self.started = true;
@@ -242,7 +245,7 @@ pub async fn run<R: AsyncRead + Unpin>(
     limits: Limits,
 ) -> Outcome {
     let mut reader = FragmentReader::new();
-    let mut out = SessionDir::new(dir, limits.publish_gate_segments);
+    let mut out = SessionDir::new(dir, limits.publish_gate_secs);
     let mut segmenter: Option<Segmenter> = None;
     let mut buf = vec![0u8; READ_CHUNK];
     let mut warned_memory = false;
@@ -474,7 +477,7 @@ mod tests {
     /// Long enough to reach a ceiling from a 12 s fixture. The floor is 3 s
     /// rather than the shipped 6 s for the same reason: the property under
     /// test is which keyframe a cut lands on, not what the constant is. The
-    /// publish gate is 1 — playlist from the first segment, the pre-gate
+    /// publish gate is 0 — playlist from the first segment, the pre-gate
     /// behaviour — because these tests observe cut placement, not
     /// publication; the gate has its own tests.
     fn brisk() -> Limits {
@@ -483,7 +486,7 @@ mod tests {
             first_floor_seconds: 1,
             max_bytes: 48_000_000,
             max_seconds: 15,
-            publish_gate_segments: 1,
+            publish_gate_secs: 0,
         }
     }
 
@@ -547,7 +550,7 @@ mod tests {
             first_floor_seconds: 1,
             max_bytes: 300_000,
             max_seconds: 15,
-            publish_gate_segments: 1,
+            publish_gate_secs: 0,
         };
         let (dir, outcome) = session("open-gop", limits).await;
         let Outcome::Ran(counts) = outcome else {
@@ -700,7 +703,7 @@ mod tests {
         // the one thing allowed to open the gate early.
         let cut = feed.len() * 2 / 3;
         let mut limits = brisk();
-        limits.publish_gate_segments = 99;
+        limits.publish_gate_secs = 999;
         let outcome = run(&feed[..cut], dir.path().to_path_buf(), "test", limits).await;
         let Outcome::Ran(counts) = outcome else {
             panic!("{outcome:?}");
@@ -708,7 +711,7 @@ mod tests {
         assert!(counts.segments >= 1, "{counts:?}");
         assert!(
             !dir.path().join("index.m3u8").exists(),
-            "the gate published a playlist at {} of 99 segments",
+            "the gate published a playlist {} segments into a 999 s hold",
             counts.segments
         );
         // The work itself was not held back — only the announcement.
@@ -718,17 +721,17 @@ mod tests {
         }
     }
 
-    /// And the gate opening mid-stream: once the cushion exists, the first
-    /// playlist published lists all of it, and every later segment
-    /// republishes as before. Same truncated feed as above, gate the fixture
-    /// can actually fill.
+    /// And the gate opening mid-stream: once the cushion of media exists, the
+    /// first playlist published lists all of it, and every later segment
+    /// republishes as before. Same truncated feed as above, a gate the
+    /// fixture can actually fill.
     #[tokio::test]
     async fn the_gate_opens_mid_stream_and_the_first_playlist_lists_the_cushion() {
         let dir = tempfile::tempdir().expect("tempdir");
         let feed = pipe("clean-cra");
         let cut = feed.len() * 2 / 3;
         let mut limits = brisk();
-        limits.publish_gate_segments = 2;
+        limits.publish_gate_secs = 4;
         let outcome = run(&feed[..cut], dir.path().to_path_buf(), "test", limits).await;
         let Outcome::Ran(counts) = outcome else {
             panic!("{outcome:?}");
@@ -744,6 +747,15 @@ mod tests {
             counts.segments,
             "once open, the playlist must keep step with every segment: {text}"
         );
+        let listed: f64 = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("#EXTINF:"))
+            .filter_map(|l| l.split(',').next()?.parse::<f64>().ok())
+            .sum();
+        assert!(
+            listed >= 4.0,
+            "the gate opened at {listed:.3}s of media against a 4 s line"
+        );
         assert!(!text.contains("ENDLIST"), "{text}");
     }
 
@@ -753,7 +765,7 @@ mod tests {
     #[tokio::test]
     async fn a_film_shorter_than_the_gate_still_publishes_whole_at_eof() {
         let mut limits = brisk();
-        limits.publish_gate_segments = 99;
+        limits.publish_gate_secs = 999;
         let (dir, outcome) = session("clean-cra", limits).await;
         let Outcome::Ran(counts) = outcome else {
             panic!("{outcome:?}");
@@ -920,7 +932,7 @@ mod tests {
             first_floor_seconds: 1,
             max_bytes: 48_000_000,
             max_seconds: 15,
-            publish_gate_segments: 1,
+            publish_gate_secs: 0,
         };
         let outcome = run(stdout, dir.path().to_path_buf(), "live", limits).await;
         let _ = child.wait().await;

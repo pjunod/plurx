@@ -151,7 +151,8 @@ pub const COPY_FIRST_SEGMENT_SECONDS: u32 = 2;
 /// nothing.
 pub const COPY_SEGMENT_MAX_SECS: u32 = 15;
 
-/// How many segments must exist before the first `index.m3u8` is published.
+/// Seconds of media that must exist before the first `index.m3u8` is
+/// published.
 ///
 /// **A playlist that starts at the live edge starts one publication gap from
 /// a freeze.** Delivery to the browser runs at hundreds of Mb/s against a
@@ -170,28 +171,48 @@ pub const COPY_SEGMENT_MAX_SECS: u32 = 15;
 /// happens exactly once.
 ///
 /// So the fix is a head start rather than a segment size: hold the playlist
-/// until [`COPY_FIRST_SEGMENT_SECONDS`] plus two more floor-or-better
-/// segments of media exist, and the client begins that far behind the edge.
-/// The cushion has to outlast the worst single-segment production gap (8.8 s
-/// is the worst measured); two full segments past the opener clear it at
-/// every bitrate the copy path accepts, with margin. The cushion lives on
-/// the server — the client's quota-bounded buffer stays as small as
-/// `bufferTargets` says, it just always has published-but-unfetched segments
-/// in front of it, and every segment after the gate only adds lead.
+/// until this many seconds of media exist, and the client begins that far
+/// behind the edge. The cushion lives on the server — the client's
+/// quota-bounded buffer stays as small as `bufferTargets` says, it just
+/// always has published-but-unfetched segments in front of it, and every
+/// segment after the gate only adds lead.
 ///
-/// The cost is time-to-first-frame, and it is paid mostly by exactly the
-/// files that need the cushion: the gate's worth of media takes seconds to
-/// produce on anything read faster than it plays, and up to the cushion
-/// itself on a NAS-bound 4K remux. That spend is once, at open, with the
-/// player showing a spinner — against a mid-scene freeze in a place the film
-/// chose. `Manager::playlist` holds the HTTP response while the gate fills
-/// rather than 404ing (verified against the vendored hls.js: the manifest
-/// loader waits indefinitely for the first byte — `maxTimeToFirstByteMs` is
-/// `Infinity` — inside a 20 s per-attempt window with two retries).
+/// **The unit is seconds, not segments, and it was segments for a day.** A
+/// count gate multiplies by whatever the opening happens to cut, and a quiet
+/// opening — studio logos run ~30 Mb/s against this film's 61 — is exactly
+/// where the 15 s duration ceiling binds: three segments meant
+/// 2 + 15 + 15 = 32 s of cushion, twice what the freeze needs, every extra
+/// second of it produced at the paced rate before a viewer sees frame one.
+/// Measured on *Tron* the day the gate shipped: 21.0 s to first frame, ~16 s
+/// of it producing that cushion at exactly 2× pacing. A duration gate opens
+/// at the first cut past this line instead (realized cushion: this value up
+/// to this value plus one ceiling), which took the same open to
+/// 2 + 15 = 17 s of cushion.
+///
+/// Why 12 s clears the worst gap: the gap is one segment's production time,
+/// and duration and production speed are inversely coupled through bitrate.
+/// A quiet stretch cuts long segments (up to 15 s) but reads cheap —
+/// `HLS_READRATE` holds production at 2×, so the gap is ≤ 7.5 s. A heavy
+/// stretch can be NAS-bound near 1×, but its segments are byte-capped: at
+/// any bitrate the NAS can sustain playback of at all, a 64 MB segment
+/// produces in ≤ ~8.5 s (8.8 s is the worst ever measured, on a 15 s
+/// segment under the old regime). 12 covers both shapes; raising it buys
+/// margin at one-for-one cost in time-to-first-frame on every paced open.
+///
+/// The remaining startup cost is honest and has one more owner: an ffmpeg
+/// without `-readrate_initial_burst` (pre-6.1 — jellyfin-ffmpeg7 has it)
+/// fills the gate at the flat paced rate instead of at I/O speed, which
+/// `pacing_caps` now warns about at startup. With the burst working, the
+/// cushion is produced as fast as the NAS will go and the gate costs a few
+/// seconds; without it, the gate costs cushion ÷ readrate. `Manager::playlist`
+/// holds the HTTP response while the gate fills rather than 404ing (verified
+/// against the vendored hls.js: the manifest loader waits indefinitely for
+/// the first byte — `maxTimeToFirstByteMs` is `Infinity` — inside a 20 s
+/// per-attempt window with two retries).
 ///
 /// At end of stream the gate yields: a film shorter than the cushion
 /// publishes whole, `ENDLIST` and all, the moment it finishes.
-pub const COPY_PUBLISH_GATE_SEGMENTS: u32 = 3;
+pub const COPY_PUBLISH_GATE_SECS: u32 = 12;
 
 /// The bitstream filter every copied HEVC stream gets before a client sees it.
 ///

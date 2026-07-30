@@ -809,16 +809,16 @@ completes is a property of the film's opening bitrate, not of timing. No
 segment size fixes "the client is standing at the edge"; the only fix is for
 it never to stand there.
 
-**The fix: a publish gate.** `copyseg` now withholds `index.m3u8` until three
-segments exist (`COPY_PUBLISH_GATE_SEGMENTS`) — segments land on disk from
-the start; the *announcement* waits. The first playlist a player loads
-already lists ≥ 14 s of media (2 s opener + two floor-or-better segments), a
-cushion deeper than the worst publication gap measured (8.8 s), so the client
-starts behind the edge and never reaches it: every later segment adds lead
-faster than playback spends it. The cushion lives on the server —
-`bufferTargets` and the MSE quota budget are untouched; the client simply
-always has published-but-unfetched segments in front of it. Three interlocks
-make it safe:
+**The fix: a publish gate.** `copyseg` now withholds `index.m3u8` until
+**12 seconds of media** exist (`COPY_PUBLISH_GATE_SECS`) — segments land on
+disk from the start; the *announcement* waits for the first cut past the
+line. The first playlist a player loads therefore lists a 12–27 s cushion,
+deeper than the worst publication gap measured (8.8 s), so the client starts
+behind the edge and never reaches it: every later segment adds lead faster
+than playback spends it. The cushion lives on the server — `bufferTargets`
+and the MSE quota budget are untouched; the client simply always has
+published-but-unfetched segments in front of it. Three interlocks make it
+safe:
 
 - **`Manager::playlist` holds the request** (up to 30 s, was 10) instead of
   404ing while the gate fills. Verified against the vendored hls.js rather
@@ -838,10 +838,50 @@ has ever been told about are not a timeline anyone holds — the respawn clears
 the directory and recuts, and the viewer never learns anything happened.
 
 **The cost, honestly.** Time-to-first-frame rises by the cushion's production
-time: a second or two on any file the NAS reads faster than it plays, up to
-the cushion itself (~13–15 s) on a NAS-bound 4K remux — the reference file is
-the worst case of its own fix. That is a spinner at open, once, priced
-against a mid-scene freeze at a second the film chose, every single play.
+time: a second or two on any file the NAS reads faster than it plays, more on
+a NAS-bound 4K remux — the reference file is the worst case of its own fix.
+That is a spinner at open, once, priced against a mid-scene freeze at a
+second the film chose, every single play.
+
+**Measured the same day, and corrected (Tron: 21.0 s to first frame).** The
+freeze was gone — 0 dropped in 486 frames, buffer steady — but the open cost
+far more than the cushion should. Two compounders, found in that order:
+
+1. **The gate's first unit was wrong: a segment count, not a duration.** It
+   shipped as "three segments", and a count multiplies by whatever the
+   opening happens to cut. A quiet opening (studio logos — *Tron*'s first
+   half-minute averages ~32 Mb/s against the film's 61) is exactly where the
+   15 s *duration* ceiling binds, so three segments meant 2 + 15 + 15 =
+   **32 s of cushion** — 2.4× what the freeze needs — every extra second
+   produced before frame one. The overlay's own arithmetic confirms it:
+   encode speed pinned at exactly 2.00× (the `HLS_READRATE` cap), so ~16 s
+   of the 21 was cushion production alone. The gate is now the 12 s of media
+   above: the same *Tron* open fills it at 2 + 15 = 17 s of cushion, and an
+   open whose segments cut short (byte-capped high-bitrate) fills it in
+   10–12 s of media. Why 12 clears the worst gap: duration and production
+   speed are inversely coupled through bitrate — quiet stretches cut long
+   segments but read cheap (readrate-paced, gap ≤ 15/2 = 7.5 s), heavy
+   stretches can be NAS-bound near 1× but cut byte-capped short (64 MB in
+   ≤ ~8.5 s at any bitrate the NAS can sustain playback of at all).
+
+2. **`-readrate_initial_burst` is quietly load-bearing, and not every ffmpeg
+   has it.** The pacing design is burst-then-hold (90 s flat-out, then 2×) —
+   *with* the burst, the gate fills at I/O speed and costs a few seconds;
+   without it (any ffmpeg older than 6.1 — distro ffmpeg on Debian 12 is
+   5.1), the cushion is produced at a flat 2× and the gate costs
+   cushion ÷ 2 no matter how fast the NAS is. An encode speed pinned at
+   exactly 2.00× during startup is the fingerprint. The capability probe
+   now logs a WARN naming the consequence (it was an `info` from before the
+   gate existed, when the stakes were a slow buffer ramp rather than a slow
+   first frame); jellyfin-ffmpeg7 — the Docker image's default engine — has
+   the flag.
+
+With both in place the arithmetic says a *Tron*-class open lands around
+6–10 s with the burst working (ffprobe/decision + ffmpeg open of a DV MKV
+over NFS + ~17 s of low-bitrate cushion at I/O speed + first fetch/decode),
+and ~12 s paced flat. The TTFF beacon is the scoreboard; if a start is slow,
+read the encoder speed first — pinned at exactly the readrate during startup
+means the burst is missing.
 
 **And the ceiling went back up.** `COPY_SEGMENT_MAX_SECS` 6 → 15 and the
 floor 4 → 6, reverting the wrong lever: with the gate in place the shrink

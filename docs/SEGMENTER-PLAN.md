@@ -77,13 +77,17 @@ The first real play of the reference file froze once, hard, at the same
 second every time — not a cutting defect but a *publication* one: the first
 playlist began at the live edge, so the client drained everything published
 and then had to wait a whole segment's production out. The fix is a publish
-gate in `copyseg`: `index.m3u8` is withheld until `COPY_PUBLISH_GATE_SEGMENTS`
-segments exist, end-of-stream overrides it, `Manager::playlist` holds the
+gate in `copyseg`: `index.m3u8` is withheld until `COPY_PUBLISH_GATE_SECS`
+of media exist, end-of-stream overrides it, `Manager::playlist` holds the
 HTTP request while it fills, and the legacy fallback window widened from
 "first segment" to "playlist published" to match. A ceiling shrink (15 s → 6 s)
-was tried first and only scaled the freeze; it is reverted. The full
-diagnosis, the experiment that separated the two readings, and the safety
-interlocks are `docs/STUTTER-4K.md` §5.7.
+was tried first and only scaled the freeze; it is reverted. The gate itself
+shipped first as a segment *count*, which a quiet opening multiplied into a
+32 s cushion (21 s to first frame on *Tron*) — the unit is seconds now, and
+the missing `-readrate_initial_burst` on pre-6.1 ffmpeg builds is a startup
+WARN because the gate made it expensive. The full diagnosis, the experiment
+that separated the two readings, and the measured startup arithmetic are
+`docs/STUTTER-4K.md` §5.7.
 
 ### 0.1 Deviations from this plan, each with its reason
 

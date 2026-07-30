@@ -138,9 +138,9 @@ bump may break compatibility and a **patch** bump never does.
   open-GOP disc) that the shrink was spending on nothing.
 
   The actual fix is a head start. A copy session now withholds `index.m3u8`
-  until three segments exist, so the first playlist a player loads is
-  already a cushion of media deeper than the worst publication gap measured,
-  and the client never catches the producer at all. The cushion lives on the
+  until twelve seconds of media exist, so the first playlist a player loads
+  is already a cushion deeper than the worst publication gap measured, and
+  the client never catches the producer at all. The cushion lives on the
   server — the browser's quota-bounded buffer stays exactly as
   `bufferTargets` sizes it, it just always has published-but-unfetched
   segments in front of it. The server holds the playlist request open while
@@ -148,13 +148,28 @@ bump may break compatibility and a **patch** bump never does.
   a manifest's first byte is waited on indefinitely, a 404 forgiven exactly
   once), and end of stream overrides the gate, so a film shorter than the
   cushion publishes whole, `ENDLIST` and all. The cost is honest:
-  time-to-first-frame rises by the cushion's production time — seconds on
-  anything read faster than it plays, up to the cushion itself on a
-  NAS-bound 4K remux — spent once, at open, behind a spinner, instead of a
-  freeze mid-scene at a moment the film chose. One more door opened on the
-  way: the legacy-muxer fallback now stays available until the playlist is
-  published rather than until the first segment lands, because segments no
-  player has ever been told about are not a timeline anyone holds.
+  time-to-first-frame rises by the cushion's production time — spent once,
+  at open, behind a spinner, instead of a freeze mid-scene at a moment the
+  film chose. One more door opened on the way: the legacy-muxer fallback now
+  stays available until the playlist is published rather than until the
+  first segment lands, because segments no player has ever been told about
+  are not a timeline anyone holds.
+
+  The gate's first day found the two things that made that spinner longer
+  than it had any right to be. It shipped as a segment *count* — three — and
+  a count multiplies by whatever the opening cuts: studio logos run at half
+  a film's bitrate, which is exactly where the 15-second duration ceiling
+  binds, so "three segments" meant a 32-second cushion and a 21-second first
+  frame on *Tron*. The gate is a duration now, so a quiet opening fills it
+  in two segments and a busy one in ten to twelve seconds of media either
+  way. And producing even that cushion is only fast if ffmpeg's
+  `-readrate_initial_burst` exists to let the paced session start flat-out:
+  the flag needs ffmpeg 6.1 (jellyfin-ffmpeg7, the Docker image's engine,
+  has it), and a build without it fills the gate at a flat 2× however fast
+  the storage is — an encoder speed pinned at exactly 2.00× during startup
+  is the tell. plurxd now warns at startup when pacing runs without the
+  burst, because the gate turned that quiet degradation into seconds of
+  every open.
 - **The server could not say which build it was running — again.** `.git` sits
   outside the Docker build context, so the image can only name its commit if
   the deploy passes `PLURX_BUILD_REF`. That was previously "fixed" by having
