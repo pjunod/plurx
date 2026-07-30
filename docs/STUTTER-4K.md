@@ -629,6 +629,32 @@ tmp-then-rename. The segment index, the ahead-window suspend, the
 behind-playhead GC and the serving layer all read the playlist and never
 learned anything happened. No player-side change of any kind.
 
+**And the segments have the muxer's shape, box for box — learned the hard
+way.** The first cut of the merger diverged twice from what ffmpeg's HLS muxer
+writes: it omitted the two `sidx` boxes (optional in HLS fMP4, ignored by
+hls.js's passthrough) and it wrote one `trun` per source fragment rather than
+one per track, because that let each source `mdat` payload be copied whole.
+Chrome played it. **Safari refused the stream outright**, and the player's
+error fallback re-encoded a 4K remux down to 1080p — the exact failure this
+whole path exists to prevent, on the exact browser it exists for, reported by
+Paul within an hour of the deploy. A `stream_rejected` beacon is what it
+leaves in the log.
+
+Both divergences are closed. Each track's slices go into the merged `mdat`
+consecutively, so its whole contribution is contiguous and one `trun` with one
+data offset covers it; the `sidx` boxes are ffmpeg's shape byte for byte,
+`earliest_presentation_time` (which ffmpeg fills with the track's `tfdt`)
+included. `styp sidx sidx moof[traf traf] mdat`, asserted by
+`a_published_segment_has_the_muxers_shape`. The only remaining difference is
+that every sample writes its own duration, size and flags where ffmpeg leans
+on `tfhd` defaults — a density choice, and the most-exercised encoding in any
+MP4 parser.
+
+The lesson worth keeping: "optional in the spec, and one player ignores it"
+is not evidence that another player does. The bytes a browser sees should
+differ from the muxer being replaced only in the thing being changed — here,
+where the boundaries fall.
+
 **The proof it is a byte mover, not a transcode.** `framemd5` of `init.mp4`
 plus every published segment is identical to `framemd5` of the continuous
 stream they were cut from, on the video and the audio track both — and

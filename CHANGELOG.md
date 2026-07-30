@@ -24,7 +24,10 @@ bump may break compatibility and a **patch** bump never does.
   frames are bit-identical to the unsegmented stream (asserted by
   `framemd5`, both tracks). A source this reader cannot follow falls back to
   ffmpeg's own muxer automatically, once, before anything is published — so
-  the worst case is the previous behaviour. Measured on *Wicked* (2024), a
+  the worst case is the previous behaviour. Segments have the same box shape
+  ffmpeg's own muxer wrote — `styp sidx sidx moof mdat`, one `trun` per
+  track — so the only thing a browser sees differently is where the
+  boundaries fall. Measured on *Wicked* (2024), a
   4K remux at 58 Mb/s: 1.9 dropped frames a minute against 8.0 for ffmpeg's
   own muxer, a 4.2x improvement. `scripts/gop-census --sweep <file>` reports
   the same figure for any file in your library.

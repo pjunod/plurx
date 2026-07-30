@@ -41,6 +41,18 @@ next person to touch this file should know which edges are sharp:
 | fallback respawn guarded only on `session.failed` | a viewer pressing stop could spawn an unmanaged ffmpeg reading the source flat out, and log a warning blaming the source |
 | `#EXT-X-ENDLIST` written after a failed final-segment write | the player is told it has the whole film while the picture stops short |
 
+And one the review pass did not catch, which real hardware did within an
+hour of the deploy: §4.2's "emit `styp` and OMIT the two `sidx`" — taken as
+written, and combined with one `trun` per source fragment — made Safari
+refuse the stream, so the player's error fallback re-encoded a 4K remux to
+1080p. Chrome was fine throughout, which is exactly why it was not caught
+here: the only browser in this container is Chromium. The segments now have
+ffmpeg's shape box for box. **"Optional in the spec, and hls.js ignores it"
+was not evidence that AVFoundation does**, and the plan said so in the same
+breath ("if Safari balks the follow-up is a per-track single-reference
+sidx") — the risk was named and taken, and it was the wrong side of the
+trade.
+
 Each has a test that fails without its fix. The M4 browser run and the
 framemd5 equality were both repeated afterwards.
 

@@ -1199,37 +1199,57 @@ pub struct Segment {
     pub video_ticks: u64,
 }
 
-/// One output `trun`: a source run's samples, and where its bytes came from.
-struct PlanRun {
+/// A contiguous stretch of one track's sample data inside one source fragment.
+/// Copied whole into the merged `mdat`; every sample in it keeps its bytes.
+struct Slice {
     /// Index into the merged fragment list.
     fragment: usize,
-    /// The run's data offset within that fragment's own bytes.
-    src_offset: usize,
-    samples: Vec<Sample>,
+    /// Byte range within that fragment's own bytes.
+    start: usize,
+    len: usize,
 }
 
+/// One track's whole contribution to the merged segment: every sample in
+/// order, and the byte slices they live in.
 struct Plan {
     track_id: u32,
     base_decode_time: u64,
-    runs: Vec<PlanRun>,
+    samples: Vec<Sample>,
+    slices: Vec<Slice>,
+}
+
+impl Plan {
+    fn byte_len(&self) -> usize {
+        self.slices.iter().map(|s| s.len).sum()
+    }
 }
 
 /// Merge consecutive fragments into one `styp moof mdat` HLS segment.
 ///
-/// The shape, and why. One `traf` per track, and inside it one `trun` per
-/// source run rather than one merged `trun`: ffmpeg writes each track's
-/// samples contiguously *within* a fragment but interleaves the tracks between
-/// fragments, so a single `trun` — which can carry only one data offset —
-/// would force the sample data to be de-interleaved and rewritten. Keeping a
-/// `trun` per source run lets each `mdat` payload be copied whole and every
-/// offset be arithmetic, which is what makes `framemd5` equality with the
-/// unsegmented stream provable rather than hoped for.
+/// **The shape is ffmpeg's HLS muxer's shape, deliberately** — `styp`, one
+/// `sidx` per track, `moof` with one `traf` and one `trun` per track, `mdat`.
 ///
-/// Everything else is normalized: `tfhd` carries only `default-base-is-moof`,
-/// `tfdt` is version 1, and every sample's duration, size, flags and
-/// composition offset is written explicitly. So the default-value and
-/// first-sample-flags ladders exist only in the reader, and nothing downstream
-/// has to re-derive them.
+/// The first cut of this diverged twice: it omitted the `sidx` boxes (optional
+/// in HLS fMP4, and hls.js's passthrough ignores them) and it wrote one `trun`
+/// per source fragment rather than one per track, because that let each source
+/// `mdat` payload be copied whole. Chrome did not care about either. Safari
+/// refused the stream outright and the player's error fallback re-encoded a 4K
+/// remux down to 1080p — the exact failure this path exists to prevent, on the
+/// exact browser it exists for.
+///
+/// So the divergence is gone. Each track's slices are copied into the merged
+/// `mdat` consecutively, which makes its whole contribution contiguous and one
+/// data offset enough for it; the `sidx` boxes are byte-for-byte the shape
+/// ffmpeg writes, `earliest_presentation_time` included. The bytes a player
+/// sees now differ from the muxer this replaced only in *where the boundaries
+/// fall*, which was always the entire point.
+///
+/// The one thing still normalized rather than copied: `tfhd` carries only
+/// `default-base-is-moof` and every sample writes its own duration, size,
+/// flags and composition offset, where ffmpeg leans on `tfhd` defaults. That
+/// is a density choice, not a structural one — the fully-explicit form is the
+/// most-exercised path in every MP4 parser there is — and it keeps the
+/// default-value and first-sample-flags ladders confined to the reader.
 pub fn merge(fragments: &[Fragment], init: &Init, sequence: u32) -> Result<Segment, Fmp4Error> {
     if fragments.is_empty() {
         return malformed("nothing to merge");
@@ -1260,7 +1280,8 @@ pub fn merge(fragments: &[Fragment], init: &Init, sequence: u32) -> Result<Segme
     let mut plans: Vec<Plan> = Vec::with_capacity(track_ids.len());
 
     for &id in &track_ids {
-        let mut runs: Vec<PlanRun> = Vec::new();
+        let mut samples: Vec<Sample> = Vec::new();
+        let mut slices: Vec<Slice> = Vec::new();
         let mut base: Option<u64> = None;
         let mut expected_next: Option<u64> = None;
         for (fi, frag) in fragments.iter().enumerate() {
@@ -1277,7 +1298,7 @@ pub fn merge(fragments: &[Fragment], init: &Init, sequence: u32) -> Result<Segme
                     if let Some(exp) = expected_next {
                         if tf.base_decode_time != exp {
                             let delta = tf.base_decode_time as i64 - exp as i64;
-                            if let Some(last) = runs.last_mut().and_then(|r| r.samples.last_mut()) {
+                            if let Some(last) = samples.last_mut() {
                                 let adjusted = last.duration as i64 + delta;
                                 if (0..=u32::MAX as i64).contains(&adjusted) {
                                     last.duration = adjusted as u32;
@@ -1294,19 +1315,21 @@ pub fn merge(fragments: &[Fragment], init: &Init, sequence: u32) -> Result<Segme
                     continue;
                 }
                 dur += run.samples.iter().map(|s| s.duration as u64).sum::<u64>();
-                runs.push(PlanRun {
+                samples.extend_from_slice(&run.samples);
+                slices.push(Slice {
                     fragment: fi,
-                    src_offset: run.data_offset,
-                    samples: run.samples.clone(),
+                    start: run.data_offset,
+                    len: run.byte_len(),
                 });
             }
             expected_next = Some(tf.base_decode_time + dur);
         }
-        if let (Some(base), false) = (base, runs.is_empty()) {
+        if let (Some(base), false) = (base, samples.is_empty()) {
             plans.push(Plan {
                 track_id: id,
                 base_decode_time: base,
-                runs,
+                samples,
+                slices,
             });
         }
     }
@@ -1314,20 +1337,14 @@ pub fn merge(fragments: &[Fragment], init: &Init, sequence: u32) -> Result<Segme
         return malformed("no track survived the merge");
     }
 
-    // Pass 1: build the moof with zeroed data offsets to learn its size. Every
-    // field that could change the size is fixed-width, so pass 2 only patches
-    // values — the layout is already final.
+    // Build the moof with zeroed data offsets to learn its size. Every field
+    // that could change the size is fixed-width, so the patch below only
+    // changes values — the layout is already final.
     let mut offset_slots: Vec<usize> = Vec::new();
     let mut moof = build_moof(&plans, sequence, &mut offset_slots);
     let moof_size = moof.len();
 
-    // Where each source fragment's mdat payload lands inside the new one.
-    let mut payload_base: Vec<usize> = Vec::with_capacity(fragments.len());
-    let mut payload_total = 0usize;
-    for frag in fragments {
-        payload_base.push(payload_total);
-        payload_total += frag.mdat_payload.len();
-    }
+    let payload_total: usize = plans.iter().map(|p| p.byte_len()).sum();
     let Some(mdat_size) = payload_total.checked_add(8) else {
         return malformed("merged mdat size overflows");
     };
@@ -1337,45 +1354,63 @@ pub fn merge(fragments: &[Fragment], init: &Init, sequence: u32) -> Result<Segme
         )));
     }
 
-    // Pass 2: patch each trun's data offset. A run's samples start at the same
-    // place in the merged payload as they did in their own fragment's, shifted
-    // by where that fragment's payload landed.
-    let mut slot = 0usize;
-    for plan in &plans {
-        for run in &plan.runs {
-            let frag = &fragments[run.fragment];
-            let within = run.src_offset.saturating_sub(frag.mdat_payload.start);
-            let offset = moof_size + 8 + payload_base[run.fragment] + within;
-            if offset > i32::MAX as usize {
-                return Err(Fmp4Error::Unsupported(
-                    "merged segment exceeds a 32-bit trun data offset".into(),
-                ));
-            }
-            let pos = offset_slots[slot];
-            moof[pos..pos + 4].copy_from_slice(&(offset as u32).to_be_bytes());
-            slot += 1;
+    // Each track's data is contiguous in the merged mdat, which is what lets
+    // its whole contribution be one `trun` with one data offset.
+    let mut base = 0usize;
+    for (i, plan) in plans.iter().enumerate() {
+        let offset = moof_size + 8 + base;
+        if offset > i32::MAX as usize {
+            return Err(Fmp4Error::Unsupported(
+                "merged segment exceeds a 32-bit trun data offset".into(),
+            ));
         }
+        let pos = offset_slots[i];
+        moof[pos..pos + 4].copy_from_slice(&(offset as u32).to_be_bytes());
+        base += plan.byte_len();
     }
 
-    let mut out = Vec::with_capacity(STYP.len() + moof_size + mdat_size);
+    let sidx_total = plans.len() * SIDX_BYTES;
+    let referenced_size = moof_size + mdat_size;
+    let mut out = Vec::with_capacity(STYP.len() + sidx_total + referenced_size);
     out.extend_from_slice(&STYP);
+    for (i, plan) in plans.iter().enumerate() {
+        let timescale = init
+            .track(plan.track_id)
+            .map(|t| t.timescale)
+            .unwrap_or(1)
+            .max(1);
+        let duration: u64 = plan.samples.iter().map(|s| s.duration as u64).sum();
+        // Every sidx after this one sits between it and the material it
+        // describes, which is what `first_offset` measures.
+        let first_offset = ((plans.len() - 1 - i) * SIDX_BYTES) as u64;
+        write_sidx(
+            &mut out,
+            plan.track_id,
+            timescale,
+            plan.base_decode_time,
+            first_offset,
+            referenced_size as u32,
+            duration.min(u32::MAX as u64) as u32,
+        );
+    }
     out.extend_from_slice(&moof);
     out.extend_from_slice(&(mdat_size as u32).to_be_bytes());
     out.extend_from_slice(b"mdat");
-    for frag in fragments {
-        out.extend_from_slice(&frag.bytes[frag.mdat_payload.clone()]);
+    for plan in &plans {
+        for slice in &plan.slices {
+            let frag = &fragments[slice.fragment];
+            let end = slice.start.saturating_add(slice.len);
+            if end > frag.bytes.len() {
+                return malformed("a run points past the end of its fragment");
+            }
+            out.extend_from_slice(&frag.bytes[slice.start..end]);
+        }
     }
 
     let video_ticks = init
         .video()
         .and_then(|v| plans.iter().find(|p| p.track_id == v.id))
-        .map(|p| {
-            p.runs
-                .iter()
-                .flat_map(|r| r.samples.iter())
-                .map(|s| s.duration as u64)
-                .sum()
-        })
+        .map(|p| p.samples.iter().map(|s| s.duration as u64).sum())
         .unwrap_or(0);
 
     Ok(Segment {
@@ -1385,11 +1420,49 @@ pub fn merge(fragments: &[Fragment], init: &Init, sequence: u32) -> Result<Segme
     })
 }
 
+/// A version-1 `sidx` is 52 bytes: the box header, the full-box header, two
+/// 32-bit ids, two 64-bit times, the reserved/count pair, and one 12-byte
+/// reference.
+const SIDX_BYTES: usize = 52;
+
+/// One `sidx`, in exactly the shape ffmpeg's HLS muxer writes — version 1,
+/// one reference covering the whole `moof`+`mdat`, `earliest_presentation_time`
+/// set to the track's `tfdt` (which is what ffmpeg puts there; it is a decode
+/// time, not the true earliest presentation time, and every player that has
+/// ever consumed this path has consumed that).
+///
+/// `starts_with_SAP` is 1 with `SAP_type` 0, again copying ffmpeg rather than
+/// getting clever: a segment this module publishes starts on a random-access
+/// point by construction on the clean path, and on a ceiling cut it starts on
+/// an IRAP whose leading pictures a player discards — the same thing ffmpeg's
+/// own segments have always declared here.
+fn write_sidx(
+    out: &mut Vec<u8>,
+    track_id: u32,
+    timescale: u32,
+    earliest_presentation_time: u64,
+    first_offset: u64,
+    referenced_size: u32,
+    subsegment_duration: u32,
+) {
+    out.extend_from_slice(&(SIDX_BYTES as u32).to_be_bytes());
+    out.extend_from_slice(b"sidx");
+    out.extend_from_slice(&0x0100_0000u32.to_be_bytes()); // version 1, flags 0
+    out.extend_from_slice(&track_id.to_be_bytes());
+    out.extend_from_slice(&timescale.to_be_bytes());
+    out.extend_from_slice(&earliest_presentation_time.to_be_bytes());
+    out.extend_from_slice(&first_offset.to_be_bytes());
+    out.extend_from_slice(&0u16.to_be_bytes()); // reserved
+    out.extend_from_slice(&1u16.to_be_bytes()); // reference_count
+                                                // reference_type 0 (media) | referenced_size
+    out.extend_from_slice(&(referenced_size & 0x7fff_ffff).to_be_bytes());
+    out.extend_from_slice(&subsegment_duration.to_be_bytes());
+    // starts_with_SAP 1 | SAP_type 0 | SAP_delta_time 0
+    out.extend_from_slice(&0x8000_0000u32.to_be_bytes());
+}
+
 /// The 24-byte `styp` hlsenc writes, copied exactly: major brand `msdh`,
-/// compatible with `msdh` and `msix`. Emitting it — and omitting hlsenc's two
-/// `sidx` boxes, which are optional in HLS fMP4 and which hls.js's passthrough
-/// ignores — is the one deliberate byte-level divergence from the muxer this
-/// replaces.
+/// compatible with `msdh` and `msix`.
 const STYP: [u8; 24] = [
     0, 0, 0, 24, b's', b't', b'y', b'p', b'm', b's', b'd', b'h', 0, 0, 0, 0, b'm', b's', b'd',
     b'h', b'm', b's', b'i', b'x',
@@ -1450,28 +1523,32 @@ fn build_moof(plans: &[Plan], sequence: u32, offset_slots: &mut Vec<usize>) -> V
         moof.extend_from_slice(&0x0100_0000u32.to_be_bytes());
         moof.extend_from_slice(&plan.base_decode_time.to_be_bytes());
 
-        for run in &plan.runs {
-            let flags = trun_flags(&run.samples);
-            let version = trun_version(&run.samples);
-            let has_cto = flags & 0x0000_0800 != 0;
-            let per = if has_cto { 16 } else { 12 };
-            let size = 8 + 4 + 4 + 4 + run.samples.len() * per;
-            moof.extend_from_slice(&(size as u32).to_be_bytes());
-            moof.extend_from_slice(b"trun");
-            moof.extend_from_slice(&(((version as u32) << 24) | flags).to_be_bytes());
-            moof.extend_from_slice(&(run.samples.len() as u32).to_be_bytes());
-            offset_slots.push(moof.len());
-            moof.extend_from_slice(&0u32.to_be_bytes()); // data_offset, patched
-            for s in &run.samples {
-                moof.extend_from_slice(&s.duration.to_be_bytes());
-                moof.extend_from_slice(&s.size.to_be_bytes());
-                moof.extend_from_slice(&s.flags.to_be_bytes());
-                if has_cto {
-                    // Written in whichever width the values need, and clamped
-                    // in neither: version 0 is unsigned, version 1 signed.
-                    let clamped = s.cto.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
-                    moof.extend_from_slice(&clamped.to_be_bytes());
-                }
+        // ONE trun per traf. Not a style choice: ffmpeg's HLS muxer writes
+        // exactly one, and a segment carrying seven of them is a shape Safari
+        // has never been asked to read on this path. Getting there costs
+        // nothing — each track's slices are copied into the merged mdat
+        // consecutively, so its whole contribution is contiguous and one data
+        // offset addresses all of it.
+        let flags = trun_flags(&plan.samples);
+        let version = trun_version(&plan.samples);
+        let has_cto = flags & 0x0000_0800 != 0;
+        let per = if has_cto { 16 } else { 12 };
+        let size = 8 + 4 + 4 + 4 + plan.samples.len() * per;
+        moof.extend_from_slice(&(size as u32).to_be_bytes());
+        moof.extend_from_slice(b"trun");
+        moof.extend_from_slice(&(((version as u32) << 24) | flags).to_be_bytes());
+        moof.extend_from_slice(&(plan.samples.len() as u32).to_be_bytes());
+        offset_slots.push(moof.len());
+        moof.extend_from_slice(&0u32.to_be_bytes()); // data_offset, patched
+        for s in &plan.samples {
+            moof.extend_from_slice(&s.duration.to_be_bytes());
+            moof.extend_from_slice(&s.size.to_be_bytes());
+            moof.extend_from_slice(&s.flags.to_be_bytes());
+            if has_cto {
+                // Written in whichever width the values need, and clamped in
+                // neither: version 0 is unsigned, version 1 signed.
+                let clamped = s.cto.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+                moof.extend_from_slice(&clamped.to_be_bytes());
             }
         }
         let traf_len = (moof.len() - traf_start) as u32;
@@ -2312,12 +2389,15 @@ mod tests {
         assert_eq!(segment_name(12_345), "seg12345.m4s");
     }
 
-    /// The one deliberate byte-level divergence from hlsenc is the two `sidx`
-    /// boxes; everything else about a segment's shape is the same. Assert the
-    /// shape here so a future change to the merger has to mean it.
+    /// A published segment has ffmpeg's HLS muxer's shape, box for box.
+    ///
+    /// This is not tidiness. The first cut of the merger omitted the `sidx`
+    /// boxes and wrote one `trun` per source fragment; Chrome played it and
+    /// Safari refused the stream, and the player's error fallback re-encoded
+    /// a 4K remux down to 1080p. The shape is load-bearing, so it is asserted.
     #[test]
-    fn a_published_segment_is_styp_moof_mdat() {
-        let (_, published, _) = segment("open-gop", 3, 300_000, 15);
+    fn a_published_segment_has_the_muxers_shape() {
+        let (init, published, _) = segment("open-gop", 3, 300_000, 15);
         let bytes = &published[0].segment.bytes;
         let mut types = Vec::new();
         let mut p = 0usize;
@@ -2328,8 +2408,83 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(types, vec!["styp", "moof", "mdat"]);
+        assert_eq!(types, vec!["styp", "sidx", "sidx", "moof", "mdat"]);
         assert_eq!(&bytes[..24], &STYP, "styp is not hlsenc's 24 bytes");
+
+        // One traf per track, and inside it exactly one trun.
+        let mut feed = init.bytes.clone();
+        feed.extend_from_slice(bytes);
+        let (_, frags, _) = read_all(&feed);
+        assert_eq!(frags.len(), 1);
+        assert_eq!(frags[0].tracks.len(), 2);
+        for t in &frags[0].tracks {
+            assert_eq!(
+                t.runs.len(),
+                1,
+                "track {} published {} truns; ffmpeg writes one",
+                t.track_id,
+                t.runs.len()
+            );
+        }
+    }
+
+    /// The `sidx` boxes say what ffmpeg's say: version 1, one reference
+    /// covering the whole moof+mdat, `earliest_presentation_time` equal to the
+    /// track's `tfdt`, and a `first_offset` that steps over the sidx boxes
+    /// still between it and the material.
+    #[test]
+    fn the_segment_index_describes_the_segment_it_precedes() {
+        let (init, published, _) = segment("open-gop", 3, 300_000, 15);
+        let seg = &published[0].segment.bytes;
+        let mut feed = init.bytes.clone();
+        feed.extend_from_slice(seg);
+        let (_, frags, _) = read_all(&feed);
+
+        let mut p = STYP.len();
+        let mut seen = 0usize;
+        let mut sidxes = Vec::new();
+        while let Ok(Some(hdr)) = peek_box(seg, p) {
+            if hdr.kind() != b"sidx" {
+                break;
+            }
+            let b = &seg[p..p + hdr.size];
+            assert_eq!(hdr.size, 52, "not a version-1 sidx");
+            assert_eq!(b[8], 1, "sidx version");
+            sidxes.push((
+                be_u32(b, 12),               // reference_ID
+                be_u32(b, 16),               // timescale
+                be_u64(b, 20),               // earliest_presentation_time
+                be_u64(b, 28),               // first_offset
+                be_u32(b, 40) & 0x7fff_ffff, // referenced_size
+                be_u32(b, 44),               // subsegment_duration
+                be_u32(b, 48) >> 31,         // starts_with_SAP
+            ));
+            p += hdr.size;
+            seen += 1;
+        }
+        assert_eq!(seen, frags[0].tracks.len(), "one sidx per track");
+
+        let after_sidx = STYP.len() + seen * 52;
+        let referenced = seg.len() - after_sidx;
+        for (i, sx) in sidxes.iter().enumerate() {
+            let tf = frags[0]
+                .track(sx.0)
+                .unwrap_or_else(|| panic!("sidx names track {} which is absent", sx.0));
+            let track = init.track(sx.0).expect("track in the init");
+            assert_eq!(sx.1, track.timescale, "sidx timescale");
+            assert_eq!(
+                sx.2, tf.base_decode_time,
+                "earliest_presentation_time != tfdt"
+            );
+            assert_eq!(
+                sx.3,
+                ((seen - 1 - i) * 52) as u64,
+                "first_offset does not step over the remaining sidx boxes"
+            );
+            assert_eq!(sx.4 as usize, referenced, "referenced_size != moof+mdat");
+            assert_eq!(sx.5 as u64, tf.duration(), "subsegment_duration");
+            assert_eq!(sx.6, 1, "starts_with_SAP");
+        }
     }
 
     // -----------------------------------------------------------------------
