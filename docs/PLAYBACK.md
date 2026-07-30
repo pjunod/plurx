@@ -282,13 +282,23 @@ month without anyone noticing — so it is not the only one:
 |---|---|
 | Player → **Quality** menu | Names the measurement and its age when one is steering this stream, with a **Forget this measurement** button that clears it and re-measures on the spot |
 | Settings → **Measured playback limits** | Lists every entry this browser carries and forgets them all |
-| By itself | Entries expire 30 days after they were taken |
+| By itself, weekly | One Auto session ignores an entry older than 7 days and plays the source instead. A clean minute clears it; hitches re-stamp it and push the next re-test out another week |
+| By itself, monthly | Entries expire 30 days after they were taken |
 
 The expiry is the part worth arguing for: an entry is evidence about one
 device, one browser build and one stream at one moment, and every part of that
 moves. This mechanism exists because a 4K remux stuttered — and it stopped
 stuttering without the device changing at all. Evidence with no shelf life
 stops being a measurement and becomes a belief.
+
+The weekly re-test is the same argument at a shorter horizon. Every other way
+out requires the viewer to know this mechanism exists, to know it is why their
+picture is soft, and to know which menu undoes it — and almost nobody knows any
+of the three, so in practice the verdict was permanent. Once a week an Auto
+session simply plays the source and finds out. A re-test that goes badly costs
+what the rescue always cost — roughly twenty seconds of hitches before it
+switches back, once a week — against the alternative of never getting the
+source back at all.
 
 **How to read it:** the stats overlay's Decoder row shows the measurement
 live (`hardware · 42ms/frame against a 42ms budget — no headroom`); a
@@ -322,6 +332,15 @@ The one comparison that matters: **Source resolution vs Now-decoding
 resolution.** Equal ⇒ you're getting the original video (direct or remux/copy).
 Lower ⇒ the video is being re-encoded down — expected for a true transcode
 verdict, a red flag if the reason is only container/audio.
+
+The overlay closes when *you* close it — the `i` key or its own ✕ — and stays
+open while you use the Quality, Audio, Subtitles and Sync menus, which is the
+point: the reason to have it open during a quality change is to watch what the
+change does to it. The menu slides clear of the panel rather than sitting on
+top of it, and falls back to overlapping only in a window too narrow to hold
+both side by side. On a touch screen the two still take turns, because a phone
+has room for one of them and no keyboard shortcut to escape whichever is
+covering the other.
 
 ## Non-goals & known limits
 

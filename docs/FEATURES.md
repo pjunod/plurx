@@ -289,7 +289,10 @@ decoding shows what the file is versus what your browser is actually rendering.
   (HLS bandwidth + stream rate) when transcoding, and **Server** — the
   encoder's speed as a multiple of real time, how many seconds it has produced
   beyond your playhead, how long the stream took to start, and how many times
-  it has stalled.
+  it has stalled. It stays open until you close it, alongside the Quality,
+  Audio, Subtitles and Sync menus — which slide clear of it rather than over
+  it — so you can watch what a quality change does to the numbers. On a touch
+  screen the two still take turns, there being room for one.
 - **Skip Intro / Skip Credits** buttons appear when playback enters a marked
   region. Markers come from real **chapters** (MakeMKV, anime OP/ED, hand-
   authored titles), read from the scan-time probe rather than by re-probing the

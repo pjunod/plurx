@@ -63,6 +63,22 @@ bump may break compatibility and a **patch** bump never does.
   carries and clears the lot, and entries expire on their own after 30 days.
   A verdict about a device, a browser build and a stream at one moment should
   not outlive all three.
+
+  Every one of those exits still needed the viewer to know the mechanism
+  exists, so Auto now re-tests by itself: an entry older than a week is
+  ignored for one session, which plays the source and finds out. A clean
+  minute clears it — 4K comes back with nobody having touched anything —
+  while hitches re-stamp it and push the next re-test out another week. The
+  Quality menu says so while it is happening, rather than claiming a
+  transcode the viewer is not being given.
+- **Opening a menu closed the playback-info overlay.** The two panels took
+  turns, which is right on a phone (each wants most of the screen, and
+  stacking them left neither dismissible) and wrong everywhere else: the
+  reason to have the overlay open during a quality change is to watch what
+  the change does to it, and it was gone before the menu appeared. On a mouse
+  they now coexist — the overlay closes when you close it — and the menu
+  slides clear of the panel instead of covering it, overlapping only in a
+  window too narrow to hold both.
 - **The first copy segment could out-run the playlist.** `EXT-X-TARGETDURATION`
   is a live playlist's reload interval, and it was declared as the segment
   duration *ceiling* rather than what had actually been published — so a player

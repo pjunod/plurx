@@ -2557,6 +2557,7 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
   modal.classList.add("open");
   setLoading(true,"Reading media…","checking the file on the server");
   let decision; try{ decision=await api(`/files/${fileId}/decision?${CAPS_Q}&force=${qualityForce()}`);}catch(e){ setLoading(false); toast(e.message); return closePlayer(); }
+  let retestDecodeLimit=false;
   // A device that measured itself out of decode headroom on this codec and
   // resolution (see maybeDecodeRescue) routes straight to a transcode on Auto
   // instead of stuttering for twenty seconds and rescuing mid-scene. Only
@@ -2565,7 +2566,14 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
   if(qualityForce()==='auto' && decision
      && (decision.method==='remux'||decision.method==='direct_play')){
     const lim=decodeLimitFor(decision.source||{});
-    if(lim){
+    // Past its re-test date: let this one session play the source and find
+    // out, rather than trusting a week-old verdict forever.
+    if(decodeLimitDue(lim)){
+      retestDecodeLimit=true;
+      clientLog({level:"info",event:"decode_limit_retest",
+        message:`re-testing ${decodeLimitKey(decision.source||{})} on Auto — `+
+                `the remembered measurement is over a week old`});
+    } else if(lim){
       try{
         const d2=await api(`/files/${fileId}/decision?${CAPS_Q}&force=transcode`);
         d2.reasons=[`this browser measured no decode slack on `+
@@ -2590,6 +2598,7 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
   clearSubs(video);   // drop whatever the last item left showing
   const src=decision.source||{};
   PLAYER={fileId, timer:null, offset:0, hls:null, knownDur:knownDurMs||0,
+    decodeRetest:retestDecodeLimit,
     durMs:(src.duration_ms||knownDurMs||0), method:decision.method, encoder:null,
     audio:decision.audio||[], subs:(decision.subtitles||[]),
     curAudio:(decision.audio||[]).findIndex(a=>a.default), curSub:-1,
@@ -3122,6 +3131,24 @@ function decodeMarginVerdict(h, playedSecs){
 // film every week never re-measures, and short enough that nobody is stuck
 // with a verdict from a machine they have since replaced.
 const DECODE_LIMIT_TTL_MS=30*24*3600*1000;
+// How long before Auto re-tests a limit by itself.
+//
+// The limit is only ever re-measured on an explicit Quality → Original, which
+// assumes the viewer knows the mechanism exists, knows their picture is soft
+// because of it, and knows which menu undoes it. Most people know none of
+// those things, so in practice the verdict was permanent — a device that grew
+// out of it (a browser update, a GPU driver, or the server fixing the thing
+// that made the stream stutter in the first place, which is exactly what
+// happened here) stayed on a transcode forever.
+//
+// So every week, one Auto session ignores the entry and plays the source. If
+// it goes well, the entry clears itself and 4K comes back with nobody having
+// touched anything. If it stutters, the rescue fires as it always did and
+// stamps a fresh date, pushing the next re-test out another week — so the
+// worst case is ~20 seconds of hitches once a week, against the alternative
+// of never getting the source back at all.
+const DECODE_LIMIT_RETEST_MS=7*24*3600*1000;
+function decodeLimitDue(lim){ return !!lim && (Date.now()-(lim.at||0))>DECODE_LIMIT_RETEST_MS; }
 function decodeLimitKey(src){ return (src&&src.video_codec)? `${src.video_codec}@${src.height||0}` : null; }
 // Reads and prunes. Anything past its shelf life is dropped on the way out,
 // so an expired verdict cannot steer a decision even once.
@@ -3298,7 +3325,10 @@ function maybeDecodeRescue(){
   if(!p || !v || !p.started || !p.hitches || v.paused) return;
   if(p.method!=='remux' && p.method!=='direct_play') return;
   const h=p.hitches, secs=playedSecs(v), q=qualityForce();
-  if(q==='original'){
+  // An Auto session that is deliberately re-testing an old limit gets judged
+  // by the same rule as an explicit Original — that is what makes the re-test
+  // able to clear the entry without the viewer choosing anything.
+  if(q==='original' || (q==='auto' && p.decodeRetest)){
     // Clearing is the rescue's own trigger, inverted: it fires on measured
     // hitches, so it lifts on their measured absence — same window, same
     // event count, the other way round.
@@ -3315,12 +3345,16 @@ function maybeDecodeRescue(){
     // stopped needing one.
     const clean=(h.back|0)+(h.held|0)+(h.late|0)+(h.drop|0)+(h.gap|0);
     if(secs>=MARGIN_CLEAR_SECS && clean<MARGIN_MIN_EVENTS && clearDecodeLimit(p.source)){
+      p.decodeRetest=false;
       clientLog(Object.assign({level:"info",event:"decode_limit_cleared",
         message:`this device played ${decodeLimitKey(p.source)} for ${Math.round(secs)}s `+
                 `with ${clean} visible fault(s) — Auto may use Original again`},
         playbackContext()));
+      toast("This browser handles the original now — Auto will use it");
     }
-    return;
+    // A re-test that goes badly must still be able to rescue and re-stamp the
+    // entry, so it falls through to the trigger below rather than returning.
+    if(q==='original') return;
   }
   if(q!=='auto' || p.decodeRescued) return;
   const verdict=decodeMarginVerdict(h, secs);
@@ -3888,10 +3922,14 @@ function pbSyncSubIcon(){ const cc=document.getElementById("pbsubs");
 function toggleMenu(kind,low){
   const m=document.getElementById("pmenu"); if(!m) return;
   if(m.classList.contains("on") && m.dataset.kind===kind){ m.classList.remove("on"); return; }
-  // Opening a menu retires the stats panel — on a phone they'd cover each
-  // other and both cover the controls.
+  // On a phone the two panels take turns: each wants most of the screen, and
+  // stacking them left neither one dismissible. On a mouse there is room for
+  // both, and wanting both is the normal case — you open the readout to watch
+  // what a quality change does to it, and having the menu dismiss it meant the
+  // numbers you came to compare were gone before you could change anything.
+  // positionMenu() slides the menu clear of the panel rather than over it.
   const sov=document.getElementById("statsov");
-  if(sov&&sov.classList.contains("on")) toggleStats();
+  if(coarsePointer() && sov && sov.classList.contains("on")) toggleStats();
   m.dataset.kind=kind; m.classList.toggle("low",!!low);
   if(kind==="audio"){
     m.innerHTML=PLAYER.audio.map((a,i)=>`<button class="${PLAYER.curAudio===i?'sel':''}" onclick="switchAudio(${i})">${esc(audioLabelMenu(a,i))}</button>`).join("");
@@ -3903,10 +3941,17 @@ function toggleMenu(kind,low){
     // why the picture is soft — and give them the button rather than a
     // console incantation.
     const lim=PLAYER?decodeLimitFor(PLAYER.source||{}):null;
+    // Two sentences, because during a re-test the entry still exists but is
+    // NOT what Auto is doing right now — telling somebody their picture is
+    // being transcoded while they are watching the source is worse than
+    // saying nothing.
+    const limWhat=(PLAYER&&PLAYER.decodeRetest)
+      ? `Auto is re-testing it right now — if this plays cleanly it clears itself.`
+      : `Auto transcodes it; Original overrides.`;
     const limNote=lim?`<div class="amsec">Measured on this device</div>
       <div class="menunote">No decode slack on ${esc(decodeLimitKey(PLAYER.source||{})||"this stream")}
         (${lim.decode_ms}ms against a ${lim.budget_ms}ms frame budget), ${esc(agoLabel(Math.round(lim.at/1000)))}.
-        Auto transcodes it; Original overrides.</div>
+        ${limWhat}</div>
       <button onclick="forgetDecodeLimitHere()">Forget this measurement</button>`:"";
     m.innerHTML=`<div class="amsec">Quality</div>`+QUALITIES.map(([v,l])=>{
       const note=v==="auto"?" — automatic":v==="original"?" — max, no transcode":"";
@@ -3964,7 +4009,28 @@ function positionMenu(kind,low){
     m.style.bottom="auto";
     m.style.top=Math.max(edge, br.bottom-pr.top+gap)+"px";
   }
+  dodgeStats(m, pr, edge);
 }
+// The two panels may be open together on a mouse, and the buttons that open
+// the menus sit directly above where the readout lives — so the menu's natural
+// place is on top of the numbers somebody just asked to keep watching. Slide it
+// clear when there is room beside the panel, preferring the side away from it.
+//
+// When there is no room, leave it overlapping: the menu has the higher
+// z-index, and a menu you cannot reach is a worse outcome than a number you
+// cannot read for a moment.
+function dodgeStats(m, pr, edge){
+  const ov=document.getElementById("statsov");
+  if(!ov || !ov.classList.contains("on")) return;
+  const mr=m.getBoundingClientRect(), sr=ov.getBoundingClientRect();
+  if(!(mr.left < sr.right && mr.right > sr.left && mr.top < sr.bottom && mr.bottom > sr.top)) return;
+  const gap=10;
+  const beside=sr.right-pr.left+gap;
+  if(beside+mr.width <= pr.width-edge){ m.style.left=beside+"px"; return; }
+  const before=sr.left-pr.left-gap-mr.width;
+  if(before >= edge) m.style.left=before+"px";
+}
+function coarsePointer(){ try{ return matchMedia("(pointer:coarse)").matches; }catch(e){ return false; } }
 // A menu left open across a resize or a fullscreen change is anchored to where
 // its button used to be.
 window.addEventListener("resize",()=>{
@@ -4198,13 +4264,19 @@ function toggleStats(){
   const on=!ov.classList.contains("on");
   ov.classList.toggle("on",on);
   // On a phone these two panels each need most of the screen, so they take
-  // turns rather than stacking (which left neither one dismissible).
-  if(on){ const m=document.getElementById("pmenu"); if(m) m.classList.remove("on"); }
+  // turns rather than stacking (which left neither one dismissible). A mouse
+  // gets both — see toggleMenu.
+  const m=document.getElementById("pmenu");
+  if(on && coarsePointer() && m) m.classList.remove("on");
   const pl=document.getElementById("player"); if(pl) pl.classList.toggle("statson",on);
   const sb=document.getElementById("statsbtn"); if(sb) sb.classList.toggle("on",on);
   clearInterval(STATS_TIMER); STATS_TIMER=null;
   if(on){ updateStats(); positionStats(); STATS_TIMER=setInterval(updateStats,1000); }
   else { ov.style.top=""; ov.style.maxHeight=""; }
+  // The panel that just appeared (or left) changes where the menu belongs, and
+  // a menu open across that change is anchored to the old geometry — same
+  // reason the resize listener re-runs it.
+  if(m && m.classList.contains("on")) positionMenu(m.dataset.kind, m.classList.contains("low"));
 }
 // The top button row wraps to two or three lines on a phone, so the panel's
 // ceiling isn't a constant — measure it, or the readout parks itself over the
