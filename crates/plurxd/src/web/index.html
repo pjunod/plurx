@@ -2545,9 +2545,9 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
     if(lim){
       try{
         const d2=await api(`/files/${fileId}/decision?${CAPS_Q}&force=transcode`);
-        d2.reasons=[`this device measured ${lim.decode_ms}ms/frame against a `+
-          `${lim.budget_ms}ms budget on ${decodeLimitKey(decision.source||{})} — `+
-          `transcoding (Quality → Original overrides)`].concat(d2.reasons||[]);
+        d2.reasons=[`this browser measured no decode slack on `+
+          `${decodeLimitKey(decision.source||{})} (${lim.decode_ms}ms/frame against `+
+          `${lim.budget_ms}ms) — transcoding (Quality → Original overrides)`].concat(d2.reasons||[]);
         decision=d2;
       }catch(e){ /* the limit is advice; the original decision still plays */ }
     }
@@ -2809,7 +2809,12 @@ function armHitchDetector(v){
   if(!v.requestVideoFrameCallback) return;
   const p=PLAYER; if(!p) return;
   p.hitches={back:0, held:0, late:0, gap:0, slow:0, worst:0, last:null, at:[], fps:null,
-             n:0, near:{}, flushEdge:null, skewMax:0, skewAt:null, decodeMs:null};
+             n:0, near:{}, flushEdge:null, skewMax:0, skewAt:null, decodeMs:null, frames:0};
+  // When the detector armed, so "zero faults" can be told apart from "zero
+  // callbacks". Safari has shipped rVFC for years and still declines to fire
+  // it on some pipelines — a session that stutters visibly while this
+  // instrument records nothing is the instrument's fault to disclose.
+  p.hitchArmedAt=performance.now();
   let prev=null;
   // The nominal frame interval, from HISTORY — never from the step under
   // test. Deriving it from the current step lets a skip define itself as
@@ -2828,6 +2833,7 @@ function armHitchDetector(v){
     // Bail the moment this playback is replaced, or the callback outlives its
     // PLAYER and starts recording another stream's frames as this one's.
     if(PLAYER!==p) return;
+    p.hitches.frames++;
     if(prev!=null && !v.paused && !v.seeking){
       const h=p.hitches;
       const dt=meta.mediaTime-prev.mediaTime;
@@ -3135,10 +3141,10 @@ function maybeDecodeRescue(){
   rememberDecodeLimit(p.source, verdict.decodeMs, verdict.budgetMs);
   clientLog(Object.assign({level:"warn",event:"decode_rescue",
     detail:`decode=${verdict.decodeMs}ms budget=${verdict.budgetMs}ms events=${verdict.events}`,
-    message:`this device decodes ${decodeLimitKey(p.source)||'this stream'} at `+
-            `${verdict.decodeMs}ms against a ${verdict.budgetMs}ms frame budget — `+
-            `no headroom, switching to transcode`}, playbackContext()));
-  toast("Original is at this device's decode limit — switching to optimized");
+    message:`this browser delivers ${decodeLimitKey(p.source)||'this stream'} just-in-time `+
+            `(${verdict.decodeMs}ms against a ${verdict.budgetMs}ms frame budget, no slack) `+
+            `with visible hitches — switching to transcode`}, playbackContext()));
+  toast("This browser can't hold Original smoothly — switching to optimized");
   startTranscodeFallback("decode-rescue");
 }
 // Arm the watchdog for a stream we have just (re)started at `fromSec`. Recording
@@ -4149,6 +4155,13 @@ function updateStats(){
     // software 4K HEVC decode is a full buffer, few dropped frames and
     // constant judder — indistinguishable from a delivery problem on every
     // other line of this panel.
+    // A blind detector says so: zero faults with zero CALLBACKS after ten
+    // seconds of playback is the browser declining to fire rVFC on this
+    // pipeline, not a clean session — and a stutter with an empty Hitches
+    // row would otherwise read as exoneration.
+    (PLAYER.hitches&&!PLAYER.hitches.frames&&PLAYER.started
+      &&PLAYER.hitchArmedAt&&(performance.now()-PLAYER.hitchArmedAt)>10000?
+      `<div><b>Hitches</b><span class="muted">this browser gives the detector no frame callbacks — faults here are invisible, not absent</span></div>`:'')+
     (PLAYER.hitches&&(PLAYER.hitches.back||PLAYER.hitches.held||PLAYER.hitches.late||PLAYER.hitches.gap||PLAYER.hitches.slow)?
       `<div><b>Hitches</b><span style="color:var(--warn,#fbbf24)">${
         [PLAYER.hitches.back?`${PLAYER.hitches.back} back`:null,
@@ -4169,8 +4182,12 @@ function updateStats(){
       const h=PLAYER.hitches; let margin='';
       if(h&&h.decodeMs!=null&&h.fps){
         const b=1000/h.fps, hot=h.decodeMs>=b*MARGIN_BAD;
+        // "no slack", never "can't keep up": a median pinned to the frame
+        // budget is a pipeline delivering just-in-time. On an M3 Max it is
+        // certainly not the silicon — the measurement is of the slack, and
+        // capacity claims need context this number does not carry.
         margin=` · <span${hot?' style="color:var(--warn,#fbbf24)"':' class="muted"'}>${
-          h.decodeMs.toFixed(0)}ms/frame against a ${b.toFixed(0)}ms budget${hot?' — no headroom':''}</span>`;
+          h.decodeMs.toFixed(0)}ms/frame against a ${b.toFixed(0)}ms budget${hot?' — delivering just-in-time, no slack':''}</span>`;
       }
       return `<div><b>Decoder</b><span${PLAYER.decodeInfo.hw?'':' style="color:var(--warn,#fbbf24)"'}>${
         PLAYER.decodeInfo.hw?'hardware':'software — this machine has no GPU path for this stream'}${
