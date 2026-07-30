@@ -11,6 +11,7 @@ pub mod auth;
 pub mod config;
 pub mod domain;
 pub mod error;
+pub mod fmp4;
 pub mod metadata;
 pub mod playback;
 pub mod scan;

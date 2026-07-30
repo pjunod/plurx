@@ -1,0 +1,563 @@
+#!/usr/bin/env python3
+"""Measure how often a real media file offers a *clean* place to cut a segment.
+
+This is the go/no-go instrument for the GOP-aware segmenter (docs/SEGMENTER-
+PLAN.md). The segmenter only publishes a segment boundary in front of a
+fragment whose first frame is a true random-access point — an IDR, or a CRA
+carrying no leading pictures — because any other boundary costs exactly one
+dropped frame in Chrome's MSE and in Safari's native player alike
+(docs/STUTTER-4K.md §5.3ter). How much that is worth on a given library is a
+property of the *source encodes*, and no synthetic fixture can answer it: a
+container with x265 test patterns has whatever GOP structure the test asked
+for, while a Blu-ray remux has whatever the studio's encoder did.
+
+So point this at real files:
+
+    scripts/gop-census ~/media/Wicked\\ (2024)\\ Remux-2160p.mkv
+    scripts/gop-census --floor 6 --ceiling 48 /mnt/media/**/*.mkv
+
+It runs the same ffmpeg command the server runs — one continuous fragmented
+MP4 down a pipe, one fragment per GOP — parses every fragment's first sample,
+and reports what fraction of cuts the segmenter would get to take cleanly.
+Nothing is written; the pipe is read and discarded.
+
+Reading the verdict:
+
+  * a high clean percentage means the segmenter removes the per-boundary
+    dropped frame on this source, which is the whole point;
+  * a low one means the source's keyframes are nearly all open CRAs and the
+    byte ceiling is doing the cutting — the segmenter still never does worse
+    than today, it just has nothing to work with.
+
+Standard library only, like scripts/perf-report: it has to run on a NAS box
+with nothing installed.
+"""
+
+import argparse
+import os
+import shutil
+import struct
+import subprocess
+import sys
+
+# ---------------------------------------------------------------------------
+# box plumbing
+# ---------------------------------------------------------------------------
+
+
+def boxes(buf, start, end):
+    """Walk the top-level boxes in buf[start:end], yielding (type, payload_start, box_end)."""
+    p = start
+    while p + 8 <= end:
+        (size,) = struct.unpack_from(">I", buf, p)
+        btype = buf[p + 4 : p + 8].decode("latin1")
+        hdr = 8
+        if size == 1:
+            (size,) = struct.unpack_from(">Q", buf, p + 8)
+            hdr = 16
+        elif size == 0:
+            size = end - p
+        if size < hdr or p + size > end:
+            return
+        yield btype, p + hdr, p + size
+        p += size
+
+
+def find(buf, start, end, path):
+    """Depth-first search for a box path like ('moov', 'trak', 'mdia'). Yields payload ranges."""
+    head, rest = path[0], path[1:]
+    for btype, ps, pe in boxes(buf, start, end):
+        if btype != head:
+            continue
+        if not rest:
+            yield ps, pe
+        else:
+            yield from find(buf, ps, pe, rest)
+
+
+# ---------------------------------------------------------------------------
+# moov: the one video track, its timescale and its NAL length size
+# ---------------------------------------------------------------------------
+
+HEVC_ENTRIES = ("hvc1", "hev1", "dvh1", "dvhe")
+H264_ENTRIES = ("avc1", "avc3", "dva1", "dvav")
+
+
+def parse_moov(buf, ps, pe):
+    """Return (track_id, timescale, codec, nal_length_size) for the video track."""
+    for ts, te in find(buf, ps, pe, ("trak",)):
+        track_id = timescale = 0
+        handler = ""
+        codec = None
+        lsz = 0
+        for btype, bs, be in boxes(buf, ts, te):
+            if btype == "tkhd":
+                off = 20 if buf[bs] == 1 else 12
+                (track_id,) = struct.unpack_from(">I", buf, bs + off)
+            elif btype == "mdia":
+                for m, ms, me in boxes(buf, bs, be):
+                    if m == "mdhd":
+                        off = 20 if buf[ms] == 1 else 12
+                        (timescale,) = struct.unpack_from(">I", buf, ms + off)
+                    elif m == "hdlr":
+                        handler = buf[ms + 8 : ms + 12].decode("latin1")
+                    elif m == "minf":
+                        for sts, ste in find(buf, ms, me, ("stbl", "stsd")):
+                            # stsd payload: version/flags(4) entry_count(4)
+                            for e, es, ee in boxes(buf, sts + 8, ste):
+                                if e in HEVC_ENTRIES:
+                                    codec = "hevc"
+                                elif e in H264_ENTRIES:
+                                    codec = "h264"
+                                else:
+                                    continue
+                                # VisualSampleEntry: 78 bytes before children.
+                                for c, cs, ce in boxes(buf, es + 78, ee):
+                                    if c == "hvcC" and ce - cs >= 22:
+                                        lsz = (buf[cs + 21] & 3) + 1
+                                    elif c == "avcC" and ce - cs >= 5:
+                                        lsz = (buf[cs + 4] & 3) + 1
+        if handler == "vide" and track_id:
+            return track_id, timescale, codec, lsz
+    return None
+
+
+# ---------------------------------------------------------------------------
+# moof: resolved samples for one track
+# ---------------------------------------------------------------------------
+
+
+def parse_traf(buf, ts, te):
+    track_id = 0
+    tfdt = 0
+    d_dur = d_size = d_flags = 0
+    runs = []
+    running = 0
+    for btype, bs, be in boxes(buf, ts, te):
+        if btype == "tfhd":
+            (vf,) = struct.unpack_from(">I", buf, bs)
+            flags = vf & 0xFFFFFF
+            (track_id,) = struct.unpack_from(">I", buf, bs + 4)
+            p = bs + 8
+            if flags & 0x000001:
+                p += 8  # explicit base_data_offset — plurx never produces one
+            if flags & 0x000002:
+                p += 4
+            if flags & 0x000008:
+                (d_dur,) = struct.unpack_from(">I", buf, p)
+                p += 4
+            if flags & 0x000010:
+                (d_size,) = struct.unpack_from(">I", buf, p)
+                p += 4
+            if flags & 0x000020:
+                (d_flags,) = struct.unpack_from(">I", buf, p)
+        elif btype == "tfdt":
+            if buf[bs] == 1:
+                (tfdt,) = struct.unpack_from(">Q", buf, bs + 4)
+            else:
+                (tfdt,) = struct.unpack_from(">I", buf, bs + 4)
+        elif btype == "trun":
+            (vf,) = struct.unpack_from(">I", buf, bs)
+            version, flags = vf >> 24, vf & 0xFFFFFF
+            (count,) = struct.unpack_from(">I", buf, bs + 4)
+            p = bs + 8
+            if flags & 0x000001:
+                (raw,) = struct.unpack_from(">i", buf, p)
+                offset = raw
+                p += 4
+            else:
+                offset = running
+            first_flags = None
+            if flags & 0x000004:
+                (first_flags,) = struct.unpack_from(">I", buf, p)
+                p += 4
+            samples = []
+            for i in range(count):
+                dur, size, sflags, cto = d_dur, d_size, d_flags, 0
+                if i == 0 and first_flags is not None:
+                    sflags = first_flags
+                if flags & 0x000100:
+                    (dur,) = struct.unpack_from(">I", buf, p)
+                    p += 4
+                if flags & 0x000200:
+                    (size,) = struct.unpack_from(">I", buf, p)
+                    p += 4
+                if flags & 0x000400:
+                    (v,) = struct.unpack_from(">I", buf, p)
+                    p += 4
+                    if not (i == 0 and first_flags is not None):
+                        sflags = v
+                if flags & 0x000800:
+                    fmt = ">I" if version == 0 else ">i"
+                    (cto,) = struct.unpack_from(fmt, buf, p)
+                    p += 4
+                samples.append((dur, size, sflags, cto))
+            runs.append((offset, samples))
+            running = offset + sum(s[1] for s in samples)
+    return track_id, tfdt, runs
+
+
+# ---------------------------------------------------------------------------
+# classification — the exact rule the Rust classifier implements
+# ---------------------------------------------------------------------------
+
+
+def first_vcl_nal(buf, start, size, lsz, codec):
+    q, end = start, start + size
+    while q + lsz + 1 <= end:
+        nlen = int.from_bytes(buf[q : q + lsz], "big")
+        head = buf[q + lsz]
+        ntype = ((head >> 1) & 0x3F) if codec == "hevc" else (head & 0x1F)
+        vcl = ntype <= 31 if codec == "hevc" else 1 <= ntype <= 5
+        if vcl:
+            return ntype
+        if nlen == 0:
+            return None
+        q += lsz + nlen
+    return None
+
+
+def has_leading(samples):
+    dts = 0
+    first = None
+    for dur, _size, _flags, cto in samples:
+        pts = dts + cto
+        if first is None:
+            first = pts
+        elif pts < first:
+            return True
+        dts += dur
+    return False
+
+
+def classify(buf, frag_start, runs, lsz, codec):
+    """('idr'|'cra'|'dirty'|'unparseable')."""
+    if not runs or not runs[0][1] or not lsz or not codec:
+        return "unparseable"
+    offset, samples = runs[0]
+    ntype = first_vcl_nal(buf, frag_start + offset, samples[0][1], lsz, codec)
+    if ntype is None:
+        return "unparseable"
+    flat = [s for _o, ss in runs for s in ss]
+    if codec == "hevc":
+        if ntype in (19, 20):
+            return "idr"
+        if ntype in (16, 17, 18, 21):
+            return "dirty" if has_leading(flat) else "cra"
+        return "dirty"
+    return "idr" if ntype == 5 else "dirty"
+
+
+# ---------------------------------------------------------------------------
+# the production pipe command
+# ---------------------------------------------------------------------------
+
+
+def hevc_bsf(is_dv, have_dovi):
+    """The same filter chain crates/plurx-core/src/transcode/mod.rs builds."""
+    if is_dv:
+        strip = "dovi_rpu=strip=1," if have_dovi else ""
+        return strip + "filter_units=remove_types=32-34|62-63"
+    return "filter_units=remove_types=32-34"
+
+
+def probe(ffprobe, path):
+    """(codec, hdr-ish flag) for the first video stream."""
+    out = subprocess.run(
+        [ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries",
+         "stream=codec_name:stream_side_data=side_data_type", "-of", "default=nw=1", path],
+        capture_output=True, text=True, check=False,
+    ).stdout
+    codec = ""
+    for line in out.splitlines():
+        if line.startswith("codec_name="):
+            codec = line.split("=", 1)[1].strip()
+    return codec, ("DOVI" in out or "Dolby Vision" in out)
+
+
+def has_dovi_bsf(ffmpeg):
+    out = subprocess.run([ffmpeg, "-hide_banner", "-bsfs"], capture_output=True,
+                         text=True, check=False).stdout
+    return any(line.strip() == "dovi_rpu" for line in out.splitlines())
+
+
+def pipe_command(ffmpeg, path, codec, is_dv, dovi, start):
+    args = [ffmpeg, "-hide_banner", "-loglevel", "error"]
+    if start:
+        args += ["-ss", f"{start:.3f}"]
+    args += ["-i", path, "-map", "0:v:0", "-map", "0:a:0?", "-sn", "-c:v", "copy"]
+    if codec in ("hevc", "h265"):
+        args += ["-tag:v", "hvc1", "-bsf:v", hevc_bsf(is_dv, dovi)]
+    args += ["-c:a", "aac", "-b:a", "256k", "-avoid_negative_ts", "make_zero",
+             "-movflags", "frag_keyframe+empty_moov+default_base_moof+delay_moov",
+             "-f", "mp4", "pipe:1"]
+    return args
+
+
+# ---------------------------------------------------------------------------
+# the census itself
+# ---------------------------------------------------------------------------
+
+
+class Census:
+    def __init__(self):
+        self.fragments = []  # (class, bytes, ticks)
+        self.timescale = 0
+        self.limit_hit = False
+
+
+def run_census(ffmpeg, ffprobe, path, seconds, start):
+    codec, is_dv = probe(ffprobe, path)
+    cmd = pipe_command(ffmpeg, path, codec, is_dv, has_dovi_bsf(ffmpeg), start)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    census = Census()
+    buf = bytearray()
+    pos = 0
+    video = None
+    budget_ticks = None
+
+    def want(n):
+        """Read until buf has n bytes past pos, or the pipe ends."""
+        while len(buf) - pos < n:
+            chunk = proc.stdout.read(1 << 16)
+            if not chunk:
+                return False
+            buf.extend(chunk)
+        return True
+
+    try:
+        while True:
+            if not want(8):
+                break
+            (size,) = struct.unpack_from(">I", buf, pos)
+            btype = bytes(buf[pos + 4 : pos + 8]).decode("latin1")
+            hdr = 8
+            if size == 1:
+                if not want(16):
+                    break
+                (size,) = struct.unpack_from(">Q", buf, pos + 8)
+                hdr = 16
+            if size < hdr or not want(size):
+                break
+
+            if btype == "moov":
+                video = parse_moov(buf, pos + hdr, pos + size)
+                if not video:
+                    sys.exit(f"{path}: no video track in the pipe's moov")
+                census.timescale = video[1] or 1
+                if seconds:
+                    budget_ticks = seconds * census.timescale
+                pos += size
+            elif btype == "moof":
+                moof_start, moof_end = pos, pos + size
+                if not want(size + 8):
+                    break
+                (msize,) = struct.unpack_from(">I", buf, moof_end)
+                mhdr = 8
+                if msize == 1:
+                    (msize,) = struct.unpack_from(">Q", buf, moof_end + 8)
+                    mhdr = 16
+                if not want(size + msize):
+                    break
+                track_id, timescale, vcodec, lsz = video
+                cls, ticks = "unparseable", 0
+                for t, ts_, te_ in boxes(buf, moof_start + hdr, moof_end):
+                    if t != "traf":
+                        continue
+                    tid, _tfdt, runs = parse_traf(buf, ts_, te_)
+                    if tid != track_id:
+                        continue
+                    cls = classify(buf, moof_start, runs, lsz, vcodec)
+                    ticks = sum(s[0] for _o, ss in runs for s in ss)
+                census.fragments.append((cls, size + msize, ticks))
+                pos = moof_end + msize
+                if budget_ticks is not None:
+                    if sum(f[2] for f in census.fragments) >= budget_ticks:
+                        census.limit_hit = True
+                        break
+            else:
+                pos += size
+
+            # Keep the working buffer small; nothing before pos is needed again.
+            if pos > (1 << 22):
+                del buf[:pos]
+                pos = 0
+    finally:
+        try:
+            proc.stdout.close()
+        except OSError:
+            pass
+        proc.terminate()
+        try:
+            err = proc.stderr.read().decode(errors="replace")
+        except OSError:
+            err = ""
+        proc.wait()
+        if err.strip() and not census.fragments:
+            sys.stderr.write(err)
+    return census
+
+
+def simulate(fragments, timescale, floor_s, ceiling_bytes, max_s):
+    """Replay the shipped cut policy over the census, returning (clean, ceiling)."""
+    floor = floor_s * timescale
+    max_ticks = max_s * timescale
+    clean = ceiling = 0
+    ticks = nbytes = 0
+    for cls, size, dur in fragments:
+        if nbytes:
+            is_clean = cls in ("idr", "cra")
+            cut = None
+            if ticks >= floor and is_clean:
+                cut = "clean"
+            elif nbytes >= ceiling_bytes:
+                cut = "clean" if is_clean else "ceiling"
+            elif ticks >= max_ticks:
+                cut = "clean" if is_clean else "ceiling"
+            if cut:
+                clean += cut == "clean"
+                ceiling += cut == "ceiling"
+                ticks = nbytes = 0
+        ticks += dur
+        nbytes += size
+    return clean, ceiling
+
+
+def pct(n, d):
+    return 0.0 if not d else 100.0 * n / d
+
+
+def report(path, census, floor_s, ceiling_mb, max_s, out=print):
+    frags = census.fragments
+    ts = census.timescale or 1
+    ceiling_bytes = ceiling_mb * 1_000_000
+    name = os.path.basename(path)
+    out(f"gop-census: {name}")
+    if not frags:
+        out("  no fragments — ffmpeg produced nothing readable (see stderr above)")
+        return 1
+
+    counts = {k: 0 for k in ("idr", "cra", "dirty", "unparseable")}
+    for cls, _size, _dur in frags:
+        counts[cls] += 1
+    cleanf = counts["idr"] + counts["cra"]
+    total_ticks = sum(f[2] for f in frags)
+    total_bytes = sum(f[1] for f in frags)
+    span = total_ticks / ts
+    out(
+        f"  fragments {len(frags)} · clean {cleanf} "
+        f"(IDR {counts['idr']}, CRA {counts['cra']}) · dirty {counts['dirty']} "
+        f"· unparseable {counts['unparseable']}"
+    )
+    if span:
+        out(
+            f"  {span:.1f}s of video, {total_bytes / 1e6:.1f} MB "
+            f"→ {total_bytes * 8 / span / 1e6:.1f} Mb/s, "
+            f"{len(frags) / span * 60:.0f} GOPs/min"
+        )
+    else:
+        out("  (zero duration — the sample carried no video)")
+
+    # Gaps between clean points, measured start-to-start in seconds of video.
+    gaps = []
+    since = None
+    for cls, _size, dur in frags:
+        if cls in ("idr", "cra"):
+            if since is not None:
+                gaps.append(since / ts)
+            since = 0.0
+        if since is not None:
+            since += dur
+    if gaps:
+        s = sorted(gaps)
+        p50 = s[len(s) // 2]
+        p90 = s[min(len(s) - 1, int(len(s) * 0.9))]
+        out(
+            f"  gaps between clean points: p50 {p50:.1f}s  p90 {p90:.1f}s  "
+            f"max {max(s):.1f}s  (n={len(s)})"
+        )
+    elif cleanf:
+        out(f"  gaps between clean points: only {cleanf} clean point in {span:.1f}s")
+    else:
+        out("  gaps between clean points: none — this source has no clean point at all")
+
+    clean_cuts, ceiling_cuts = simulate(frags, ts, floor_s, ceiling_bytes, max_s)
+    cuts = clean_cuts + ceiling_cuts
+    if cuts:
+        every = span / cuts
+        out(
+            f"  at floor {floor_s}s / ceiling {ceiling_mb}MB: "
+            f"{pct(clean_cuts, cuts):.0f}% of cuts clean "
+            f"({clean_cuts} clean, {ceiling_cuts} ceiling) — a cut every ~{every:.1f}s"
+        )
+    else:
+        out(
+            f"  at floor {floor_s}s / ceiling {ceiling_mb}MB: no cut in "
+            f"{span:.1f}s — the whole sample is one segment"
+        )
+
+    frac = pct(clean_cuts, cuts) if cuts else 0.0
+    if not cuts:
+        verdict = (
+            "the sample never reached a cut — census more of the file with "
+            "--seconds 0, or a longer --seconds"
+        )
+    elif frac >= 95:
+        verdict = "the segmenter removes essentially every boundary drop here"
+    elif frac >= 50:
+        verdict = f"the segmenter removes ~{frac:.0f}% of the boundary drops here"
+    elif cleanf == 0:
+        verdict = (
+            "this source offers no clean cut point; the segmenter costs nothing "
+            "and gains nothing — the byte ceiling does all the cutting"
+        )
+    else:
+        verdict = (
+            f"clean points are too sparse to help much ({frac:.0f}%); the byte "
+            "ceiling does most of the cutting"
+        )
+    out(f"  verdict: {verdict}")
+    if census.limit_hit:
+        out("  (sampled — pass --seconds 0 to census the whole file)")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument("files", nargs="+", help="media files to census")
+    ap.add_argument("--floor", type=int, default=6,
+                    help="segment duration floor in seconds (COPY_SEGMENT_SECONDS)")
+    ap.add_argument("--ceiling", type=int, default=48,
+                    help="segment byte ceiling in MB (COPY_SEGMENT_MAX_BYTES)")
+    ap.add_argument("--max-seconds", type=int, default=15,
+                    help="segment duration ceiling (COPY_SEGMENT_MAX_SECS)")
+    ap.add_argument("--seconds", type=int, default=300,
+                    help="how much of each file to read; 0 for all of it")
+    ap.add_argument("--start", type=float, default=0.0,
+                    help="seek this far in first (skips titles/black)")
+    ap.add_argument("--ffmpeg", default=os.environ.get("PLURX_FFMPEG", "ffmpeg"))
+    ap.add_argument("--ffprobe", default=os.environ.get("PLURX_FFPROBE", "ffprobe"))
+    args = ap.parse_args()
+
+    for binary in (args.ffmpeg, args.ffprobe):
+        if not shutil.which(binary):
+            sys.exit(f"{binary} not found — install ffmpeg or pass --ffmpeg/--ffprobe")
+
+    rc = 0
+    for i, path in enumerate(args.files):
+        if not os.path.exists(path):
+            sys.stderr.write(f"{path}: no such file\n")
+            rc = 1
+            continue
+        if i:
+            print()
+        census = run_census(args.ffmpeg, args.ffprobe, path, args.seconds, args.start)
+        rc |= report(path, census, args.floor, args.ceiling, args.max_seconds)
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

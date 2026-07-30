@@ -73,6 +73,29 @@ pub const SEGMENT_SECONDS: u32 = 2;
 /// failover contract, which is about transcode sessions.
 pub const COPY_SEGMENT_SECONDS: u32 = 6;
 
+/// Hard byte ceiling on one copy-path segment.
+///
+/// The segmenter (`crate::fmp4`) holds fragments back until it finds a
+/// keyframe a player can start on without discarding a leading picture. On a
+/// source that offers no such point, "hold back" has to stop somewhere, and
+/// bytes are the binding constraint on this path long before seconds are: at
+/// the ~100 Mb/s a 4K remux carries, a segment is 12 MB a second, and
+/// `bufferTargets` gives MSE a 96 MB forward budget. Half of that is the
+/// number, so hls.js can hold two whole segments and still evict cleanly —
+/// a ceiling at the full budget would make one segment the entire buffer, the
+/// same mistake `946486b` fixed at the other end of the same arithmetic.
+pub const COPY_SEGMENT_MAX_BYTES: usize = 48 * 1024 * 1024;
+
+/// Secondary ceiling, in seconds, for sources whose bytes never pile up.
+///
+/// A 3 Mb/s home video would reach [`COPY_SEGMENT_MAX_BYTES`] after two
+/// minutes, and `EXT-X-TARGETDURATION` has to be declared up front and may
+/// never decrease — so without a duration ceiling the playlist would have to
+/// promise something absurd on session one to stay honest on session two.
+/// Fifteen seconds keeps the tag believable and still leaves the floor two
+/// full GOPs of room to find a clean point on a typical 1.75 s grid.
+pub const COPY_SEGMENT_MAX_SECS: u32 = 15;
+
 /// The bitstream filter every copied HEVC stream gets before a client sees it.
 ///
 /// Two kinds of NAL unit ride inside a `-c:v copy` that have no business on
