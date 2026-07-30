@@ -18,3 +18,10 @@ perf-report-*.txt
 # conflict there; git leaves them behind and nothing cleans them up.
 *.orig
 *.rej
+# Python bytecode from the scripts/ tools. `scripts/gop-census` imports
+# `scripts/perf-report` for its shared helpers, so running either one leaves a
+# __pycache__ beside them — machine-specific, interpreter-version-specific, and
+# regenerated on demand. Two of these were committed by a `git add -A` and rode
+# along in bundles for a week before anyone looked.
+__pycache__/
+*.py[cod]
