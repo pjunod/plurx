@@ -4,6 +4,9 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Android 17+ gates Bonjour discovery and direct LAN connections behind
+         this runtime permission. Earlier releases continue to use INTERNET. -->
+    <uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK" />
     <!-- Keep the screen awake / audio focus during playback. -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 

@@ -7,6 +7,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import tv.plurx.app.data.Caps
 import tv.plurx.app.data.Appearance
@@ -19,6 +20,7 @@ import tv.plurx.app.data.User
 import tv.plurx.app.data.ViewerPreferences
 import tv.plurx.app.data.CreateSessionReq
 import tv.plurx.app.data.Decision
+import tv.plurx.app.data.DiscoveredServer
 import tv.plurx.app.data.HlsStart
 import tv.plurx.app.data.Hubs
 import tv.plurx.app.data.Item
@@ -29,6 +31,7 @@ import tv.plurx.app.data.Net
 import tv.plurx.app.data.PlurxApi
 import tv.plurx.app.data.ProgressReq
 import tv.plurx.app.data.Session
+import tv.plurx.app.data.ServerDiscovery
 import tv.plurx.app.data.SettingsStore
 
 /** Top-level app state: which screen the shell should show. */
@@ -59,6 +62,7 @@ data class PlaybackTarget(val itemId: Long, val fileId: Long, val startMs: Long 
 class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     private val settings = SettingsStore(app)
+    private val serverBrowser = ServerDiscovery(app)
 
     private val _phase = MutableStateFlow<Phase>(Phase.Loading)
     val phase: StateFlow<Phase> = _phase.asStateFlow()
@@ -68,6 +72,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     private val _authError = MutableStateFlow<String?>(null)
     val authError: StateFlow<String?> = _authError.asStateFlow()
+
+    val serverDiscovery = serverBrowser.state
 
     private val _home = MutableStateFlow(HomeState())
     val home: StateFlow<HomeState> = _home.asStateFlow()
@@ -136,19 +142,40 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         _busy.value = true
         viewModelScope.launch {
             try {
-                Session.origin = normalized
-                val a = Net.api(normalized)
-                val info = a.server()
-                origin = normalized
-                api = a
-                serverName = info.name
-                settings.saveOrigin(normalized)
-                _phase.value = Phase.NeedLogin
+                connectToOrigin(normalized)
             } catch (_: Exception) {
                 _authError.value = "Couldn't reach a plurx server at $normalized"
             } finally {
                 _busy.value = false
             }
+        }
+    }
+
+    fun connect(server: DiscoveredServer) {
+        _authError.value = null
+        _busy.value = true
+        viewModelScope.launch {
+            try {
+                connectToOrigin(serverBrowser.resolve(server))
+            } catch (e: Exception) {
+                _authError.value = e.message
+                    ?: "The discovered server stopped responding. Try scanning again."
+            } finally {
+                _busy.value = false
+            }
+        }
+    }
+
+    fun startServerDiscovery() = serverBrowser.start()
+
+    fun stopServerDiscovery() = serverBrowser.stop()
+
+    fun restartServerDiscovery() {
+        serverBrowser.stop()
+        serverBrowser.clear()
+        viewModelScope.launch {
+            delay(350)
+            if (_phase.value == Phase.NeedServer) serverBrowser.start()
         }
     }
 
@@ -332,5 +359,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         if (s.isEmpty()) return s
         if (!s.startsWith("http://") && !s.startsWith("https://")) s = "http://$s"
         return s.trimEnd('/')
+    }
+
+    private suspend fun connectToOrigin(normalized: String) {
+        Session.origin = normalized
+        val candidate = Net.api(normalized)
+        val info = candidate.server()
+        origin = normalized
+        api = candidate
+        serverName = info.name
+        settings.saveOrigin(normalized)
+        _phase.value = Phase.NeedLogin
     }
 }
