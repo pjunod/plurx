@@ -1214,7 +1214,14 @@ pub enum SessionKind {
     /// Copy the source video; `aac` re-encodes the audio the client can't take.
     Copy {
         aac: bool,
+        preserve_dolby_vision: bool,
     },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CopySessionOptions {
+    transcode_audio: bool,
+    preserve_dolby_vision: bool,
 }
 
 impl SessionRequest {
@@ -1225,7 +1232,10 @@ impl SessionRequest {
     fn fingerprint(&self) -> String {
         let kind = match self.kind {
             SessionKind::Transcode { height } => format!("t{height}"),
-            SessionKind::Copy { aac } => format!("c{}", u8::from(aac)),
+            SessionKind::Copy {
+                aac,
+                preserve_dolby_vision,
+            } => format!("c{}d{}", u8::from(aac), u8::from(preserve_dolby_vision)),
         };
         format!(
             "{}:{kind}:{:.3}:{}:{}",
@@ -2282,12 +2292,18 @@ impl TranscodeManager {
                 )
                 .await?
             }
-            SessionKind::Copy { aac } => {
+            SessionKind::Copy {
+                aac,
+                preserve_dolby_vision,
+            } => {
                 self.start_copy(
                     req.file_id,
                     req.start_seconds,
                     req.audio_index,
-                    aac,
+                    CopySessionOptions {
+                        transcode_audio: aac,
+                        preserve_dolby_vision,
+                    },
                     user_name,
                     &req.playback_id,
                 )
@@ -3056,12 +3072,12 @@ impl TranscodeManager {
     /// natively via HLS — so the original 4K stream is preserved instead of the
     /// error-fallback re-encoding it down to 720p. No hardware/software encoder
     /// ladder (nothing is encoded), just a fail-fast guard.
-    pub async fn start_copy(
+    async fn start_copy(
         &self,
         file_id: i64,
         start_seconds: f64,
         audio_override: Option<i64>,
-        transcode_audio: bool,
+        options: CopySessionOptions,
         user_name: &str,
         playback_id: &str,
     ) -> Result<StartInfo, String> {
@@ -3099,13 +3115,13 @@ impl TranscodeManager {
         let have_dovi = self.dv_strippable();
         let pacing = self.pacing(true).await;
         let legacy_args = || {
-            transcode::hls_copy_args(
+            transcode::hls_copy_args_with_dolby_vision(
                 &file,
                 start_seconds,
                 audio_override,
-                transcode_audio,
+                options.transcode_audio,
                 pacing,
-                have_dovi,
+                transcode::DolbyVisionCopyOptions::new(have_dovi, options.preserve_dolby_vision),
                 &dir.to_string_lossy(),
             )
         };
@@ -3121,13 +3137,14 @@ impl TranscodeManager {
         // arguments below, so the worst case is exactly today's behaviour.
         let segmenting = copyseg::supports(file.video_codec.as_deref());
         let (child, pipe_stdout) = if segmenting {
-            let args = transcode::copy_pipe_args(
+            let args = transcode::copy_pipe_args_with_dolby_vision(
                 &file,
                 start_seconds,
                 audio_override,
-                transcode_audio,
+                options.transcode_audio,
                 pacing,
                 have_dovi,
+                options.preserve_dolby_vision,
             );
             tracing::info!(
                 %session_id, file_id, start_seconds, mode = "segmenter",
@@ -3257,13 +3274,16 @@ impl TranscodeManager {
                         );
                         session.kill_child().await;
                         clear_session_dir(&dir).await;
-                        let args = transcode::hls_copy_args(
+                        let args = transcode::hls_copy_args_with_dolby_vision(
                             &file,
                             start_seconds,
                             audio_override,
-                            transcode_audio,
+                            options.transcode_audio,
                             pacing,
-                            have_dovi,
+                            transcode::DolbyVisionCopyOptions::new(
+                                have_dovi,
+                                options.preserve_dolby_vision,
+                            ),
                             &dir.to_string_lossy(),
                         );
                         // A fresh generation, or the dead process's last
@@ -4735,7 +4755,17 @@ mod tests {
             .expect("s");
 
         let info = mgr
-            .start_copy(file_id, 0.0, None, false, "paul", "pb-paul")
+            .start_copy(
+                file_id,
+                0.0,
+                None,
+                CopySessionOptions {
+                    transcode_audio: false,
+                    preserve_dolby_vision: false,
+                },
+                "paul",
+                "pb-paul",
+            )
             .await
             .expect("copy session");
         let session = mgr
@@ -6193,7 +6223,17 @@ mod tests {
 
         // The copy-video path likewise creates and tears down a session.
         let info = mgr
-            .start_copy(file_id, 5.0, Some(1), true, "paul", "pb-paul")
+            .start_copy(
+                file_id,
+                5.0,
+                Some(1),
+                CopySessionOptions {
+                    transcode_audio: true,
+                    preserve_dolby_vision: false,
+                },
+                "paul",
+                "pb-paul",
+            )
             .await
             .expect("start_copy");
         assert_eq!(info.encoder, "copy");
@@ -6245,7 +6285,17 @@ mod tests {
         // The copy path supersedes too, and across paths: a transcode fallback
         // after a copy attempt must not leave the copy remux reading the disk.
         let copy = mgr
-            .start_copy(file_id, 0.0, None, false, "paul", "pb-paul")
+            .start_copy(
+                file_id,
+                0.0,
+                None,
+                CopySessionOptions {
+                    transcode_audio: false,
+                    preserve_dolby_vision: false,
+                },
+                "paul",
+                "pb-paul",
+            )
             .await
             .expect("copy");
         let fallback = mgr

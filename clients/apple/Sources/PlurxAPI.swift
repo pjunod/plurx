@@ -19,7 +19,18 @@ enum APIError: Error, LocalizedError {
 /// models stay idiomatic.
 struct PlurxAPI {
     let origin: String
-    private let session: URLSession = .shared
+    /// A local-network request may be the operation that causes iOS to show
+    /// its permission sheet. The first request must wait for that choice,
+    /// rather than failing underneath the sheet and making login work only on
+    /// the second attempt.
+    private static let waitingSession: URLSession = {
+        let configuration = URLSessionConfiguration.default
+        configuration.waitsForConnectivity = true
+        configuration.timeoutIntervalForRequest = 30
+        configuration.timeoutIntervalForResource = 30
+        return URLSession(configuration: configuration)
+    }()
+    private var session: URLSession { Self.waitingSession }
 
     private static let decoder: JSONDecoder = {
         let d = JSONDecoder()
@@ -51,6 +62,14 @@ struct PlurxAPI {
         return try await run(req)
     }
 
+    private func post<T: Decodable>(_ path: String) async throws -> T {
+        guard let url = makeURL(path) else { throw APIError.badURL }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        Session.shared.authorize(&req)
+        return try await run(req)
+    }
+
     private func postNoContent<B: Encodable>(_ path: String, body: B) async throws {
         var req = try jsonRequest(path, body: body)
         Session.shared.authorize(&req)
@@ -71,9 +90,22 @@ struct PlurxAPI {
         let data: Data
         let resp: URLResponse
         do { (data, resp) = try await session.data(for: req) }
-        catch { throw APIError.transport(error.localizedDescription) }
+        catch { throw Self.transportError(from: error) }
         try Self.check(resp)
         return try Self.decoder.decode(T.self, from: data)
+    }
+
+    /// Cancellation is control flow, not a server failure. Keeping it typed
+    /// lets view models distinguish SwiftUI replacing a task from the server
+    /// actually becoming unreachable. URLSession reports cancellation as
+    /// either Swift's CancellationError or NSURLErrorCancelled depending on
+    /// which layer observes it first.
+    static func transportError(from error: Error) -> Error {
+        if error is CancellationError { return CancellationError() }
+        if let urlError = error as? URLError, urlError.code == .cancelled {
+            return CancellationError()
+        }
+        return APIError.transport(error.localizedDescription)
     }
 
     private static func check(_ resp: URLResponse) throws {
@@ -89,15 +121,33 @@ struct PlurxAPI {
     func me() async throws -> User { try await get("me") }
     func libraries() async throws -> [Library] { try await get("libraries") }
 
-    func libraryItems(_ id: Int) async throws -> Page {
+    func libraryItems(
+        _ id: Int,
+        sort: LibrarySort = .title,
+        offset: Int = 0,
+        limit: Int = 200
+    ) async throws -> Page {
         try await get("libraries/\(id)/items", query: [
-            URLQueryItem(name: "limit", value: "200"),
-            URLQueryItem(name: "sort", value: "title"),
+            URLQueryItem(name: "limit", value: String(limit)),
+            URLQueryItem(name: "offset", value: String(offset)),
+            URLQueryItem(name: "sort", value: sort.rawValue),
         ])
     }
 
     func hubs() async throws -> Hubs { try await get("hubs") }
+    func comingSoon() async throws -> ComingSoonResponse { try await get("coming-soon") }
     func item(_ id: Int) async throws -> ItemDetail { try await get("items/\(id)") }
+
+    func setWatched(itemId: Int, watched: Bool) async throws -> MutationResponse {
+        try await post("items/\(itemId)/\(watched ? "scrobble" : "unscrobble")")
+    }
+
+    func search(_ query: String, limit: Int = 200) async throws -> SearchResponse {
+        try await get("search", query: [
+            URLQueryItem(name: "q", value: query),
+            URLQueryItem(name: "limit", value: String(limit)),
+        ])
+    }
 
     func decision(fileId: Int, caps: [URLQueryItem]) async throws -> Decision {
         try await get("files/\(fileId)/decision", query: caps)
@@ -110,6 +160,10 @@ struct PlurxAPI {
     /// same session instead.
     func createHlsSession(fileId: Int, body: CreateSessionRequest) async throws -> HlsStart {
         try await post("files/\(fileId)/hls/sessions", body: body)
+    }
+
+    func hlsStatus(sessionId: String) async throws -> PlaybackSessionStatus {
+        try await get("hls/\(sessionId)/status")
     }
 
     /// DELETE the session the moment playback ends. Without it the encoder

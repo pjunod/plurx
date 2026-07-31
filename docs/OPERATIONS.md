@@ -64,10 +64,28 @@ path in `PLURX_CONFIG`). Every key has an env override:
 |---|---|---|
 | 32400 | TCP | HTTP API + web app (and the Plex-compat façade) |
 | 32414 | UDP | GDM discovery so Plex/Kodi clients find the server on the LAN |
+| 5353 | UDP multicast | Bonjour `_plurx._tcp` discovery for native clients |
 
 GDM discovery only works on 32414 (the protocol hard-codes it), but the *host*
 port is movable via `PLURX_GDM_PORT` when a still-running Plex owns it — you lose
 LAN auto-discovery on that host port, not the server.
+
+Bonjour is best-effort and link-local. It works for a bare-metal service and a
+container using host networking, but multicast normally does not cross a guest
+network, VLAN, VPN, routed subnet, or Docker bridge. In those layouts, publish
+TCP 32400 normally and use the client's manual server option; do not expose UDP
+5353 to the internet.
+
+**How to verify it:** run this from another Mac on the same LAN:
+
+```bash
+dns-sd -B _plurx._tcp local.
+```
+
+A line naming your server means the advertiser reached the LAN; silence means
+the deployed `plurxd` is too old, is bound only to loopback, or is isolated
+behind bridge networking. Opening TCP 32400 or removing firewall filters does
+not create a missing multicast advertisement.
 
 ## Reading the activity pill
 

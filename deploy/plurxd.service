@@ -10,7 +10,7 @@ User=plurx
 Group=plurx
 ExecStart=/usr/local/bin/plurxd run
 Environment=PLURX_DATA_DIR=/var/lib/plurx
-Environment=PLURX_BIND=0.0.0.0:32600
+Environment=PLURX_BIND=0.0.0.0:32400
 # Point at a specific ffmpeg build if desired:
 # Environment=PLURX_FFMPEG=/usr/lib/jellyfin-ffmpeg/ffmpeg
 Restart=on-failure

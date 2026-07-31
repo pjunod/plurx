@@ -60,7 +60,7 @@ fun ConnectScreen(vm: AppViewModel, busy: Boolean, error: String?) {
             value = url,
             onValueChange = { url = it },
             label = { Text("Server address") },
-            placeholder = { Text("192.168.1.10:32600") },
+            placeholder = { Text("192.168.1.10:32400") },
             singleLine = true,
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri, imeAction = ImeAction.Go),
             modifier = Modifier.fillMaxWidth(),
@@ -74,7 +74,7 @@ fun ConnectScreen(vm: AppViewModel, busy: Boolean, error: String?) {
             else Text("Connect")
         }
         Text(
-            "Enter the address shown in plurx → Settings, e.g. http://192.168.1.10:32600",
+            "Enter the address shown in plurx → Settings, e.g. http://192.168.1.10:32400",
             color = Muted,
             style = MaterialTheme.typography.labelMedium,
         )

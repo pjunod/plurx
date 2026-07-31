@@ -4,107 +4,268 @@ struct HomeView: View {
     @EnvironmentObject var model: AppModel
 
     var body: some View {
-        NavigationStack {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 4) {
-                    header
-                    if model.homeLoading {
-                        ProgressView().tint(Palette.accent)
-                            .frame(maxWidth: .infinity).padding(.top, 60)
-                    } else if let err = model.homeError {
-                        Text(err).foregroundColor(Palette.muted)
-                            .frame(maxWidth: .infinity).padding(.top, 60)
-                    } else {
-                        content
-                    }
-                }
-                .padding(.bottom, 24)
-            }
-            .background(Palette.bg.ignoresSafeArea())
-            .navigationDestination(for: Route.self) { route in
-                switch route {
-                case .library(let lib): LibraryView(library: lib)
-                case .item(let id): DetailView(itemId: id)
-                case .settings: SettingsView()
-                }
-            }
-            .task { if model.homeLoading { await model.loadHome() } }
+        #if os(iOS)
+        if #available(iOS 18.0, *) {
+            tabs.tabViewStyle(.sidebarAdaptable)
+        } else {
+            tabs
         }
+        #else
+        tabs
+        #endif
     }
 
-    private var header: some View {
-        HStack(alignment: .firstTextBaseline) {
-            Text("plurx")
-                .font(.system(size: 30, weight: .bold, design: .monospaced))
-                .foregroundColor(Palette.accent)
-            Spacer()
-            if let name = model.username {
-                Text(name)
-                    .font(.system(.caption, design: .monospaced))
-                    .foregroundColor(Palette.muted)
+    private var tabs: some View {
+        TabView {
+            NavigationStack {
+                HomeDashboard()
+                    .appDestinations()
             }
-            NavigationLink(value: Route.settings) {
-                Image(systemName: "gearshape")
-                    .font(.title3)
-                    .foregroundColor(Palette.muted)
-            }
-            .buttonStyle(.plain)
-        }
-        .padding(.horizontal, screenHPad)
-        .padding(.top, 14)
-        .padding(.bottom, 6)
-    }
+            .tabItem { Label("Home", systemImage: "house") }
 
-    @ViewBuilder
-    private var content: some View {
-        if !model.libraries.isEmpty {
-            Text("Libraries")
-                .font(.system(.title3, design: .monospaced)).fontWeight(.semibold)
-                .foregroundColor(Palette.onBg)
-                .padding(.horizontal, screenHPad).padding(.top, 8)
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 12) {
-                    ForEach(model.libraries) { lib in
-                        NavigationLink(value: Route.library(lib)) {
-                            LibraryChip(library: lib)
-                        }
-                        .posterButtonStyle()
-                    }
+            NavigationStack {
+                if let movies = model.collection(kind: "movie") {
+                    LibraryView(collection: movies)
+                        .appDestinations()
+                } else {
+                    EmptyLibraryCategory(title: "Movies")
                 }
-                .padding(.horizontal, screenHPad).padding(.vertical, 8)
             }
+            .tabItem { Label("Movies", systemImage: "film") }
+
+            NavigationStack {
+                if let shows = model.collection(kind: "show") {
+                    LibraryView(collection: shows)
+                        .appDestinations()
+                } else {
+                    EmptyLibraryCategory(title: "TV Shows")
+                }
+            }
+            .tabItem { Label("TV", systemImage: "tv") }
+
+            NavigationStack {
+                SearchView()
+                    .appDestinations()
+            }
+            .tabItem { Label("Search", systemImage: "magnifyingglass") }
+
+            NavigationStack {
+                SettingsView()
+            }
+            .tabItem { Label("Settings", systemImage: "gearshape") }
         }
+        .tint(Palette.accent)
+        .task { if model.homeLoading { await model.loadHome() } }
+    }
+}
 
-        MediaRow(title: "Continue Watching", items: model.hubs.continueWatching ?? [])
-        MediaRow(title: "Next Up", items: model.hubs.nextUp ?? [])
-        MediaRow(title: "Recently Added", items: model.hubs.recentlyAdded ?? [])
-
-        let empty = (model.hubs.continueWatching ?? []).isEmpty
-            && (model.hubs.nextUp ?? []).isEmpty
-            && (model.hubs.recentlyAdded ?? []).isEmpty
-        if empty && model.libraries.isEmpty {
-            Text("Nothing here yet — add a library on your server.")
-                .foregroundColor(Palette.muted)
-                .frame(maxWidth: .infinity).padding(.top, 60)
+private struct AppDestinations: ViewModifier {
+    func body(content: Content) -> some View {
+        content.navigationDestination(for: Route.self) { route in
+            switch route {
+            case .collection(let collection): LibraryView(collection: collection)
+            case .item(let id): DetailView(itemId: id)
+            }
         }
     }
 }
 
-struct LibraryChip: View {
-    let library: Library
+extension View {
+    fileprivate func appDestinations() -> some View { modifier(AppDestinations()) }
+}
+
+private struct HomeDashboard: View {
+    @EnvironmentObject var model: AppModel
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+
+    private var featured: Item? {
+        (model.hubs.continueWatching ?? []).first
+            ?? (model.hubs.nextUp ?? []).first
+            ?? (model.hubs.recentlyAdded ?? []).first
+    }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(library.name)
-                .font(.system(.headline, design: .monospaced))
-                .foregroundColor(Palette.onBg)
-            Text(library.kind.prefix(1).uppercased() + library.kind.dropFirst())
-                .font(.system(.caption, design: .monospaced))
-                .foregroundColor(Palette.muted)
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 6) {
+                homeHeader
+                if model.homeLoading {
+                    ProgressView().tint(Palette.accent)
+                        .frame(maxWidth: .infinity).padding(.top, 80)
+                } else if let error = model.homeError {
+                    ContentUnavailableView(
+                        "Server unavailable",
+                        systemImage: "exclamationmark.triangle",
+                        description: Text(error)
+                    )
+                } else {
+                    homeContent
+                }
+            }
+            .padding(.bottom, 36)
         }
-        .padding(.horizontal, 22).padding(.vertical, 16)
-        .background(Palette.surfaceHi)
-        .cornerRadius(10)
-        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Palette.outline, lineWidth: 1))
+        .background(Palette.bg.ignoresSafeArea())
+        #if os(iOS)
+        .toolbar(.hidden, for: .navigationBar)
+        .refreshable { await model.loadHome() }
+        #endif
     }
+
+    private var homeHeader: some View {
+        HStack(alignment: .firstTextBaseline) {
+            Text("plurx")
+                .font(.system(size: 32, weight: .bold, design: .monospaced))
+                .foregroundColor(Palette.accent)
+            Spacer()
+            if let username = model.username {
+                Text(username)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundColor(Palette.muted)
+            }
+        }
+        .padding(.horizontal, screenHPad)
+        .padding(.top, 16)
+        .padding(.bottom, 8)
+    }
+
+    @ViewBuilder
+    private var homeContent: some View {
+        if let featured {
+            FeaturedHero(item: featured, compact: horizontalSizeClass == .compact)
+                .padding(.bottom, 12)
+        }
+
+        MediaRow(
+            title: "Continue Watching",
+            items: model.hubs.continueWatching ?? [],
+            style: .landscape
+        )
+        MediaRow(
+            title: "Next Up",
+            items: model.hubs.nextUp ?? [],
+            style: .landscape
+        )
+        MediaRow(title: "Recently Added", items: model.hubs.recentlyAdded ?? [])
+        ComingSoonRow(entries: model.comingSoon)
+
+        if !model.libraries.isEmpty {
+            libraryHeading
+            ForEach(model.libraryCollections()) { collection in
+                MediaRow(
+                    title: collection.title,
+                    items: model.previewItems(for: collection),
+                    collection: collection,
+                    destination: collection
+                )
+            }
+        }
+
+        if featured == nil && model.libraries.isEmpty {
+            ContentUnavailableView(
+                "Your library is empty",
+                systemImage: "rectangle.stack",
+                description: Text("Add a library in the plurx web app, then pull to refresh.")
+            )
+            .frame(maxWidth: .infinity)
+            .padding(.top, 80)
+        }
+    }
+
+    private var libraryHeading: some View {
+        HStack {
+            Text("Browse")
+                .font(.title3.weight(.semibold))
+                .foregroundColor(Palette.onBg)
+            Spacer()
+            Picker("Group by", selection: Binding(
+                get: { model.libraryGrouping },
+                set: { model.setLibraryGrouping($0) }
+            )) {
+                ForEach(LibraryGrouping.allCases) { grouping in
+                    Text(grouping.label).tag(grouping)
+                }
+            }
+            #if os(iOS)
+            .pickerStyle(.segmented)
+            .frame(maxWidth: 280)
+            #endif
+        }
+        .padding(.horizontal, screenHPad)
+        .padding(.top, 18)
+    }
+}
+
+private struct FeaturedHero: View {
+    let item: Item
+    let compact: Bool
+
+    var body: some View {
+        NavigationLink(value: Route.item(item.id)) {
+            ZStack(alignment: .bottomLeading) {
+                AuthImage(path: item.backdrop ?? item.poster)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: heroHeight)
+                    .clipped()
+                LinearGradient(
+                    colors: [.clear, Palette.bg.opacity(0.18), Palette.bg],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(item.showTitle ?? item.title)
+                        .font(compact ? .title.bold() : .largeTitle.bold())
+                        .foregroundColor(.white)
+                        .lineLimit(2)
+                    if item.showTitle != nil {
+                        Text(episodeSubtitleForHero(item))
+                            .font(.headline)
+                            .foregroundColor(.white.opacity(0.82))
+                            .lineLimit(1)
+                    }
+                    Label(heroAction, systemImage: "play.fill")
+                        .font(.system(.headline, design: .monospaced).weight(.bold))
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 16).padding(.vertical, 10)
+                        .background(Palette.accent, in: Capsule())
+                }
+                .padding(.horizontal, screenHPad)
+                .padding(.bottom, 24)
+            }
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("\(heroAction) \(item.title)")
+    }
+
+    private var heroHeight: CGFloat {
+        #if os(tvOS)
+        return 520
+        #else
+        return compact ? 290 : 430
+        #endif
+    }
+
+    private var heroAction: String {
+        progressFraction(item.watch, runtimeMs: item.runtimeMs) > 0 ? "Resume" : "View details"
+    }
+}
+
+private struct EmptyLibraryCategory: View {
+    let title: String
+    var body: some View {
+        ContentUnavailableView(
+            "No \(title)",
+            systemImage: "rectangle.stack",
+            description: Text("No matching library shares are configured on this server.")
+        )
+        .background(Palette.bg.ignoresSafeArea())
+        .navigationTitle(title)
+    }
+}
+
+private func episodeSubtitleForHero(_ item: Item) -> String {
+    var parts: [String] = []
+    if let season = item.seasonNumber, let episode = item.episodeNumber {
+        parts.append("S\(season) E\(episode)")
+    }
+    parts.append(item.title)
+    return parts.joined(separator: " · ")
 }

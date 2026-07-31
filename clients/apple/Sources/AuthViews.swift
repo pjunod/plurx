@@ -53,31 +53,114 @@ private struct AuthScaffold<Content: View>: View {
 
 struct ConnectView: View {
     @EnvironmentObject var model: AppModel
+    @ObservedObject var discovery: ServerDiscovery
     @State private var url = ""
+    @State private var showManual = false
+    @State private var resolving: String?
 
     var body: some View {
-        AuthScaffold(subtitle: "Connect to your server", error: model.authError) {
-            TextField("192.168.1.10:32600", text: $url)
-                .plurxFieldStyle()
-                .font(.system(.body, design: .monospaced))
-                #if os(iOS)
-                .keyboardType(.URL)
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled()
-                #endif
-                .onSubmit { connect() }
+        AuthScaffold(subtitle: "Servers on your network", error: model.authError) {
+            if discovery.servers.isEmpty {
+                HStack(spacing: 10) {
+                    if discovery.isSearching { ProgressView().tint(Palette.accent) }
+                    Text(discovery.isSearching ? "Looking for plurx…" : "No servers found")
+                        .font(.system(.callout, design: .monospaced))
+                        .foregroundColor(Palette.muted)
+                }
+                .padding(.vertical, 8)
+            } else {
+                VStack(spacing: 10) {
+                    ForEach(discovery.servers) { server in
+                        Button { choose(server) } label: {
+                            HStack(spacing: 12) {
+                                Image(systemName: "externaldrive.connected.to.line.below")
+                                    .foregroundColor(Palette.accent)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(server.name).fontWeight(.semibold)
+                                    Text("plurx server")
+                                        .font(.caption)
+                                        .foregroundColor(Palette.muted)
+                                }
+                                Spacer()
+                                if resolving == server.id {
+                                    ProgressView().tint(Palette.accent)
+                                } else {
+                                    Image(systemName: "chevron.right")
+                                        .foregroundColor(Palette.muted)
+                                }
+                            }
+                            .font(.system(.body, design: .monospaced))
+                            .padding(14)
+                            .background(Palette.surface, in: RoundedRectangle(cornerRadius: 10))
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(model.busy || resolving != nil)
+                    }
+                }
+            }
 
-            PrimaryButton(title: "Connect", busy: model.busy, disabled: url.isEmpty) { connect() }
+            Button {
+                withAnimation { showManual.toggle() }
+            } label: {
+                Label(showManual ? "Hide manual setup" : "Add server manually",
+                      systemImage: showManual ? "chevron.up" : "plus")
+            }
+            .font(.system(.callout, design: .monospaced))
+            .buttonStyle(.plain)
+            .foregroundColor(Palette.muted)
 
-            Text("Enter the address shown in plurx → Settings, e.g. http://192.168.1.10:32600")
-                .font(.system(.caption2, design: .monospaced))
+            if showManual {
+                TextField("192.168.1.10:32400", text: $url)
+                    .plurxFieldStyle()
+                    .font(.system(.body, design: .monospaced))
+                    #if os(iOS)
+                    .keyboardType(.URL)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    #endif
+                    .onSubmit { connect() }
+
+                PrimaryButton(title: "Connect", busy: model.busy, disabled: url.isEmpty) { connect() }
+
+                Text("Enter a hostname or address. A bare host uses port 32400.")
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundColor(Palette.muted)
+                    .multilineTextAlignment(.center)
+            }
+
+            if let message = discovery.errorMessage {
+                Text(message)
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundColor(Palette.muted)
+                    .multilineTextAlignment(.center)
+            }
+
+            Button("Scan again") { discovery.restart() }
+                .font(.system(.caption, design: .monospaced))
+                .buttonStyle(.plain)
                 .foregroundColor(Palette.muted)
-                .multilineTextAlignment(.center)
         }
-        .onAppear { if url.isEmpty { url = model.origin } }
+        .onAppear {
+            discovery.start()
+            if url.isEmpty { url = model.origin }
+        }
     }
 
     private func connect() { Task { await model.connect(url) } }
+
+    private func choose(_ server: DiscoveredServer) {
+        resolving = server.id
+        Task {
+            do {
+                let origin = try await discovery.resolve(server)
+                resolving = nil
+                await model.connect(origin)
+            } catch {
+                resolving = nil
+                model.authError = error.localizedDescription
+            }
+        }
+    }
 }
 
 struct LoginView: View {

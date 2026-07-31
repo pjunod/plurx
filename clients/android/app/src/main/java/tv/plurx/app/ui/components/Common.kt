@@ -19,6 +19,8 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -36,6 +38,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.Dp
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import androidx.compose.ui.platform.LocalContext
@@ -44,6 +47,7 @@ import tv.plurx.app.data.Session
 import tv.plurx.app.ui.theme.Accent
 import tv.plurx.app.ui.theme.Muted
 import tv.plurx.app.ui.theme.SurfaceHi
+import tv.plurx.app.ui.theme.Outline
 
 /** Absolute image URL for a server-relative poster/backdrop path (or null). */
 fun imageUrl(path: String?): String? = path?.let { Session.url(it) }
@@ -71,7 +75,7 @@ fun NetworkImage(url: String?, modifier: Modifier = Modifier) {
 fun PosterCard(
     item: Item,
     modifier: Modifier = Modifier,
-    width: androidx.compose.ui.unit.Dp = 128.dp,
+    width: Dp = 128.dp,
     onClick: () -> Unit,
 ) {
     var focused by remember { mutableStateOf(false) }
@@ -82,22 +86,53 @@ fun PosterCard(
             .width(width)
             .scale(scale)
             .onFocusChanged { focused = it.isFocused }
-            .focusable()
             .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) { onClick() }
+            .focusable()
     ) {
         Box(
             Modifier
                 .fillMaxWidth()
                 .aspectRatio(2f / 3f)
-                .clip(RoundedCornerShape(8.dp))
+                .clip(MaterialTheme.shapes.medium)
                 .background(SurfaceHi)
                 .border(
                     width = if (focused) 2.dp else 0.dp,
                     color = if (focused) Accent else Color.Transparent,
-                    shape = RoundedCornerShape(8.dp),
+                    shape = MaterialTheme.shapes.medium,
                 )
         ) {
             NetworkImage(imageUrl(item.poster), Modifier.fillMaxSize())
+            item.resolution?.let { height ->
+                val label = when {
+                    height >= 2160 -> "4K"
+                    height >= 1440 -> "1440p"
+                    height >= 1080 -> "1080p"
+                    height >= 720 -> "720p"
+                    else -> "${height}p"
+                }
+                Text(
+                    label,
+                    color = Color.White,
+                    style = MaterialTheme.typography.labelMedium,
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(5.dp)
+                        .background(Color(0xB3000000), MaterialTheme.shapes.small)
+                        .padding(horizontal = 6.dp, vertical = 3.dp),
+                )
+            }
+            if (item.watch?.watched == true) {
+                Text(
+                    "✓",
+                    color = Color.White,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier
+                        .align(Alignment.TopStart)
+                        .padding(5.dp)
+                        .background(Accent, MaterialTheme.shapes.small)
+                        .padding(horizontal = 6.dp, vertical = 2.dp),
+                )
+            }
             item.watch?.let { w ->
                 val pct = progressFraction(w.position_ms, w.duration_ms ?: item.runtime_ms)
                 if (pct > 0f) {
@@ -130,19 +165,75 @@ fun PosterCard(
 }
 
 @Composable
-fun MediaRow(title: String, items: List<Item>, onOpen: (Item) -> Unit) {
+fun MediaRow(
+    title: String,
+    items: List<Item>,
+    posterWidth: Dp = 128.dp,
+    onViewAll: (() -> Unit)? = null,
+    onOpen: (Item) -> Unit,
+) {
     if (items.isEmpty()) return
     Column(Modifier.padding(vertical = 10.dp)) {
-        Text(
-            title,
-            style = MaterialTheme.typography.titleMedium,
-            modifier = Modifier.padding(start = 20.dp, bottom = 10.dp),
-        )
+        androidx.compose.foundation.layout.Row(
+            Modifier.fillMaxWidth().padding(start = 20.dp, end = 12.dp, bottom = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(title, style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
+            if (onViewAll != null) {
+                Text(
+                    "View all",
+                    color = Accent,
+                    style = MaterialTheme.typography.labelLarge,
+                    modifier = Modifier.clickable(onClick = onViewAll).padding(8.dp),
+                )
+            }
+        }
         LazyRow(
             contentPadding = PaddingValues(horizontal = 20.dp),
             horizontalArrangement = Arrangement.spacedBy(14.dp),
         ) {
-            items(items, key = { it.id }) { item -> PosterCard(item) { onOpen(item) } }
+            items(items, key = { it.id }) { item -> PosterCard(item, width = posterWidth) { onOpen(item) } }
+        }
+    }
+}
+
+@Composable
+fun <T> ChoicePicker(
+    label: String,
+    value: T,
+    options: List<T>,
+    optionLabel: (T) -> String,
+    onSelect: (T) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    var open by remember { mutableStateOf(false) }
+    Column(modifier) {
+        Text(label, color = Muted, style = MaterialTheme.typography.labelMedium, modifier = Modifier.padding(bottom = 6.dp))
+        Box {
+            Text(
+                optionLabel(value),
+                fontWeight = FontWeight.SemiBold,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(SurfaceHi, MaterialTheme.shapes.small)
+                    .border(1.dp, Outline, MaterialTheme.shapes.small)
+                    .clickable { open = true }
+                    .focusable()
+                    .padding(horizontal = 16.dp, vertical = 14.dp),
+            )
+            DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+                options.forEach { option ->
+                    DropdownMenuItem(
+                        text = {
+                            Text(
+                                optionLabel(option),
+                                color = if (option == value) Accent else MaterialTheme.colorScheme.onSurface,
+                            )
+                        },
+                        onClick = { onSelect(option); open = false },
+                    )
+                }
+            }
         }
     }
 }
@@ -155,6 +246,7 @@ fun LoadingBox(modifier: Modifier = Modifier) {
 }
 
 private fun subtitleFor(item: Item): String = when {
+    item.kind == "folder" && item.child_count != null -> "${item.child_count} items"
     item.kind == "episode" && item.season_number != null && item.episode_number != null ->
         "S${item.season_number}·E${item.episode_number}"
     item.year != null -> item.year.toString()

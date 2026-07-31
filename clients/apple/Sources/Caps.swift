@@ -11,7 +11,8 @@ import VideoToolbox
 enum Caps {
     static func query() -> [URLQueryItem] {
         var vcodec = ["h264"]
-        if VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC) { vcodec.append("hevc") }
+        let hevc = VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC)
+        if hevc { vcodec.append("hevc") }
         if VTIsHardwareDecodeSupported(kCMVideoCodecType_AV1) { vcodec.append("av1") }
         // AVPlayer handles these audio codecs; DTS / TrueHD are deliberately out.
         let acodec = ["aac", "ac3", "eac3", "alac", "mp3"]
@@ -23,12 +24,28 @@ enum Caps {
             URLQueryItem(name: "acodec", value: acodec.joined(separator: ",")),
             URLQueryItem(name: "container", value: container.joined(separator: ",")),
             URLQueryItem(name: "hdr", value: hdrSupported ? "1" : "0"),
+            // The former profile-specific HDR API was removed in iOS/tvOS 26.
+            // Apple's replacement is the display-aware eligibility signal;
+            // with hardware HEVC it is the supported
+            // public capability check for AVPlayer's HDR/Dolby Vision path.
+            // Profile 5 and 8 are advertised explicitly so the server never
+            // mistakes support for those delivery profiles as support for
+            // Blu-ray Profile 7.
+            URLQueryItem(name: "dv", value: dolbyVisionSupported(hevc: hevc) ? "1" : "0"),
+            URLQueryItem(
+                name: "dvprofile",
+                value: dolbyVisionSupported(hevc: hevc) ? "5,8" : ""
+            ),
         ]
     }
 
-    /// True when the current display advertises any HDR mode — mirrors the
-    /// server's tone-map-on-SDR rule.
+    /// True when this device can present HDR to its current display — mirrors
+    /// the server's tone-map-on-SDR rule.
     private static var hdrSupported: Bool {
-        !AVPlayer.availableHDRModes.isEmpty
+        AVPlayer.eligibleForHDRPlayback
+    }
+
+    private static func dolbyVisionSupported(hevc: Bool) -> Bool {
+        hevc && hdrSupported
     }
 }

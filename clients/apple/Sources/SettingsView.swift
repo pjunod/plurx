@@ -37,10 +37,25 @@ struct SettingsView: View {
                 Picker("Subtitle language", selection: subBinding) {
                     ForEach(subtitleLanguages) { Text($0.name).tag($0.id) }
                 }
+                Toggle("Autoplay next episode", isOn: Binding(
+                    get: { model.autoplay },
+                    set: { model.setAutoplay($0) }
+                ))
             } header: {
                 Text("Playback defaults")
             } footer: {
-                Text("Preferred tracks when a title has more than one. Applied on the fly for direct play.")
+                Text("Track preferences apply when a title has more than one. Autoplay continues episodic series and can also be toggled in the player.")
+            }
+
+            Section("Appearance") {
+                Picker("Icon size", selection: Binding(
+                    get: { model.posterSize },
+                    set: { model.setPosterSize($0) }
+                )) {
+                    ForEach(PosterSize.allCases) { size in
+                        Text(size.label).tag(size)
+                    }
+                }
             }
 
             Section("Account") {

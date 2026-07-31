@@ -101,7 +101,7 @@ Then set your team once, in `clients/apple/project.yml`:
 ```yaml
 settings:
   base:
-    DEVELOPMENT_TEAM: "ABCDE12345"   # Membership details → Team ID
+    DEVELOPMENT_TEAM: "YHK542LK23"   # Paul Junod's paid developer team
 ```
 
 ### 2.2 Version and build numbers
@@ -147,8 +147,9 @@ xcrun altool --upload-app -f "build/$SCHEME/plurx.ipa" -t "$ALTOOL_TYPE" \
 ```
 
 `ExportOptions.plist` is three keys — `method: app-store-connect`, `teamID`,
-and `uploadSymbols: true` — and is not in the repo because it carries your team
-ID.
+and `uploadSymbols: true`. The committed Team ID identifies the paid developer
+team; it is not a credential. Certificates and App Store Connect API keys remain
+in the login Keychain and environment, never in this repository.
 
 Note `altool`'s platform word for Apple TV is **`appletvos`**, not `tvos` —
 `tvos` is rejected outright, and it's the kind of typo you discover after the
@@ -224,7 +225,8 @@ target had nowhere to get an icon from.
 
 | Key / file | Where | What it buys | What breaks without it |
 |---|---|---|---|
-| `NSLocalNetworkUsageDescription` | both targets, `project.yml` | The iOS local-network permission prompt | iOS **silently refuses** connections to LAN addresses. The app can't reach `192.168.x.x` at all — not a store problem, a *functional* one |
+| `NSLocalNetworkUsageDescription` | both targets, `project.yml` | Explains the iOS local-network permission prompt | LAN requests are denied when the person declines access |
+| `NSBonjourServices` (`_plurx._tcp`) | both targets, `project.yml` | Lets the app browse for plurx and trigger the permission prompt before sign-in | Automatic discovery fails and the first login request can race the prompt |
 | `NSAppTransportSecurity` → `NSAllowsArbitraryLoads` | both targets | Plain-HTTP connections to any host | Every `http://` server fails |
 | `ITSAppUsesNonExemptEncryption: false` | both targets | Skips the export-compliance questionnaire on every upload | A manual questionnaire per build, and a build stuck in "Missing Compliance" until you answer it |
 | `Resources/PrivacyInfo.xcprivacy` | both targets | Declares no tracking, no collection, and `UserDefaults` under reason `CA92.1` | App Store Connect **rejects the upload by email** for a missing required-reason declaration |
@@ -351,8 +353,9 @@ Ordered by what blocks a submission soonest.
       store requirement, but it's a bearer token to your whole library sitting
       in a plaintext plist
 - [ ] tvOS launch storyboard (cosmetic)
-- [ ] Transcode scrubber timeline on Apple — a reviewer scrubbing a transcoded
-      title will notice ([clients/apple/README.md](../clients/apple/README.md#roadmap))
+- [ ] Complete the P1 viewer items in the
+      [Apple parity matrix](APPLE-CLIENT-PARITY.md), especially free text
+      subtitles and audio-sync controls
 
 ## 7. Non-goals
 

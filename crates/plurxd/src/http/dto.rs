@@ -45,6 +45,11 @@ pub struct ItemDto {
     pub episode_number: Option<i32>,
     pub air_date: Option<String>,
     pub runtime_ms: Option<i64>,
+    /// Stable ordering fields for native clients that merge several library
+    /// shares into one Movies / TV category. Without these, each share is
+    /// sorted correctly but the combined grid cannot be.
+    pub added_at: i64,
+    pub updated_at: i64,
     /// When the footage/photo was captured (home libraries). ISO-8601 date or
     /// datetime; sorts lexicographically.
     pub recorded_at: Option<String>,
@@ -104,6 +109,8 @@ impl From<Item> for ItemDto {
             episode_number: item.episode_number,
             air_date: item.air_date,
             runtime_ms: item.runtime_ms,
+            added_at: item.added_at,
+            updated_at: item.updated_at,
             recorded_at: item.recorded_at,
             tags: item.tags,
             tmdb_id: item.tmdb_id,

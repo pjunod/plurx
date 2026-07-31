@@ -24,6 +24,7 @@ bytes = { workspace = true }
 libc = { workspace = true }
 futures-util = { workspace = true }
 mime_guess = { workspace = true }
+mdns-sd = { workspace = true }
 uuid = { workspace = true }
 reqwest = { workspace = true }
 

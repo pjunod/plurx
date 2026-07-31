@@ -54,6 +54,7 @@ bytes = "1"
 futures-util = "0.3"
 tokio-util = { version = "0.7", features = ["io"] }
 mime_guess = "2"
+mdns-sd = "0.20"
 # Misc
 clap = { version = "4", features = ["derive", "env"] }
 # POSIX signals: SIGSTOP/SIGCONT to hold a transcode that has run ahead of the

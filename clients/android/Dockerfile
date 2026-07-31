@@ -1,4 +1,4 @@
-# Reproducible Android build environment — JDK 17 + the exact SDK this app pins.
+# Reproducible Android build environment — JDK 25 + the exact SDK this app pins.
 # The image is the toolchain only; the source is bind-mounted at run time (see
 # `make android`), so the same image builds any revision without a rebuild.
 #
@@ -8,7 +8,7 @@
 #     plurx-android-build ./gradlew --no-daemon :app:assembleDebug
 #
 # Or just `make android` from the repo root.
-FROM eclipse-temurin:17-jdk-jammy
+FROM eclipse-temurin:25-jdk-jammy
 
 ENV ANDROID_HOME=/opt/android-sdk \
     ANDROID_SDK_ROOT=/opt/android-sdk \
@@ -30,10 +30,10 @@ RUN mkdir -p "${ANDROID_HOME}/cmdline-tools" \
 
 ENV PATH="${ANDROID_HOME}/cmdline-tools/latest/bin:${ANDROID_HOME}/platform-tools:${PATH}"
 
-# The exact packages the app pins (compileSdk 35 / build-tools 35.0.0). Accepting
+# The exact packages the app pins (compileSdk 37 / build-tools 36.0.0). Accepting
 # the licenses non-interactively is required for an unattended build.
 RUN yes | sdkmanager --licenses > /dev/null \
-    && sdkmanager --install "platform-tools" "platforms;android-35" "build-tools;35.0.0" > /dev/null \
+    && sdkmanager --install "platform-tools" "platforms;android-37" "build-tools;36.0.0" > /dev/null \
     # World-read/write so a build run as an arbitrary host UID (`-u $(id -u)`, so
     # the APK lands host-owned) can read the SDK and, if AGP ever needs to, write
     # to it. This is a throwaway build container, not a runtime image.

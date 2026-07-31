@@ -7,6 +7,7 @@ import retrofit2.http.POST
 import retrofit2.http.Path
 import retrofit2.http.Query
 import retrofit2.http.QueryMap
+import retrofit2.http.PUT
 
 /**
  * plurx native API (`/api/v1`). Base URL is `<origin>/api/v1/`, so paths are
@@ -29,6 +30,7 @@ interface PlurxApi {
     suspend fun libraryItems(
         @Path("id") id: Long,
         @Query("limit") limit: Int = 200,
+        @Query("offset") offset: Int = 0,
         @Query("sort") sort: String = "title",
     ): Page
 
@@ -37,6 +39,15 @@ interface PlurxApi {
 
     @GET("items/{id}")
     suspend fun item(@Path("id") id: Long): ItemDetail
+
+    @GET("search")
+    suspend fun search(@Query("q") query: String, @Query("limit") limit: Int = 200): SearchResponse
+
+    @POST("items/{id}/scrobble")
+    suspend fun markWatched(@Path("id") id: Long): MutationResult
+
+    @POST("items/{id}/unscrobble")
+    suspend fun markUnwatched(@Path("id") id: Long): MutationResult
 
     /** The runtime caps map (vcodec/acodec/container/hdr/force) rides as query params. */
     @GET("files/{id}/decision")
@@ -63,4 +74,7 @@ interface PlurxApi {
 
     @POST("items/{id}/progress")
     suspend fun progress(@Path("id") id: Long, @Body body: ProgressReq)
+
+    @PUT("files/{id}/audio-offset")
+    suspend fun setAudioOffset(@Path("id") id: Long, @Body body: AudioOffsetReq): AudioOffsetResp
 }

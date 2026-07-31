@@ -18,6 +18,7 @@ mod version;
 mod watched;
 
 use std::future::IntoFuture;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -270,21 +271,54 @@ async fn run(config: Config) -> anyhow::Result<()> {
     // anything a viewer is waiting on.
     tokio::spawn(std::sync::Arc::clone(&state.watched).run());
 
-    // GDM responder for Plex-client LAN discovery (best-effort).
-    let gdm_id = instance_id.clone();
-    let gdm_name = config.server.name.clone();
-    let gdm_port = config.server.bind.port();
-    tokio::spawn(async move {
-        if let Err(e) = gdm_responder(gdm_id, gdm_name, gdm_port).await {
-            tracing::warn!(error = %e, "GDM discovery responder unavailable");
-        }
-    });
-
     let app = http::router(state);
     let listener = tokio::net::TcpListener::bind(config.server.bind)
         .await
         .with_context(|| format!("binding {}", config.server.bind))?;
     tracing::info!(addr = %listener.local_addr()?, "listening");
+
+    // Advertise only a server that another LAN device can actually reach.
+    // A loopback-only bind is common in proxy deployments; publishing it would
+    // produce a tempting setup button that can never connect.
+    let lan_discovery = !config.server.bind.ip().is_loopback();
+    if lan_discovery {
+        // GDM keeps direct-connect Plex clients working. Bonjour is the native
+        // plurx contract used by the Apple apps. Both are best-effort: failure
+        // to join multicast must not take down the HTTP server.
+        let gdm_id = instance_id.clone();
+        let gdm_name = config.server.name.clone();
+        let http_port = config.server.bind.port();
+        match gdm_bind_port(std::env::var("PLURX_GDM_PORT").ok().as_deref()) {
+            Ok(gdm_port) => {
+                tokio::spawn(async move {
+                    if let Err(e) = gdm_responder(gdm_id, gdm_name, http_port, gdm_port).await {
+                        tracing::warn!(error = %e, "GDM discovery responder unavailable");
+                    }
+                });
+            }
+            Err(error) => {
+                tracing::warn!(%error, "GDM discovery responder disabled");
+            }
+        }
+    } else {
+        tracing::info!(bind = %config.server.bind, "LAN discovery disabled for loopback bind");
+    }
+    let mdns = if lan_discovery {
+        match start_mdns_advertiser(
+            &instance_id,
+            &config.server.name,
+            config.server.bind,
+            crate::version::SEMVER,
+        ) {
+            Ok(daemon) => Some(daemon),
+            Err(error) => {
+                tracing::warn!(%error, "Bonjour discovery advertiser unavailable");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // Drain in-flight requests on SIGTERM, but not forever. A playback
     // response is a stream: a paced remux holds its connection open for a
@@ -322,6 +356,11 @@ async fn run(config: Config) -> anyhow::Result<()> {
             );
         }
     }
+    if let Some(mdns) = mdns {
+        if let Err(error) = mdns.shutdown() {
+            tracing::warn!(%error, "Bonjour discovery shutdown failed");
+        }
+    }
     Ok(())
 }
 
@@ -329,6 +368,91 @@ async fn run(config: Config) -> anyhow::Result<()> {
 /// Comfortably inside Docker's default ten-second stop grace period, so the
 /// process gets to choose its own exit rather than being killed mid-drain.
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Native plurx discovery contract. The Apple clients declare this exact type
+/// in `NSBonjourServices`, so changing it is a protocol change, not a rename.
+const MDNS_SERVICE_TYPE: &str = "_plurx._tcp.local.";
+
+/// Start the local DNS-SD advertiser and keep its daemon handle alive for the
+/// lifetime of the HTTP server. Address auto-detection is correct for the
+/// default wildcard bind; an explicit bind advertises only that address.
+fn start_mdns_advertiser(
+    instance_id: &str,
+    name: &str,
+    bind: SocketAddr,
+    version: &str,
+) -> anyhow::Result<mdns_sd::ServiceDaemon> {
+    let daemon = mdns_sd::ServiceDaemon::new().context("starting mDNS daemon")?;
+    let monitor = daemon.monitor().context("monitoring mDNS daemon")?;
+    std::thread::Builder::new()
+        .name("plurx-mdns-monitor".to_owned())
+        .spawn(move || {
+            while let Ok(event) = monitor.recv() {
+                if let mdns_sd::DaemonEvent::Error(error) = event {
+                    tracing::warn!(%error, "Bonjour discovery daemon error");
+                }
+            }
+        })
+        .context("starting mDNS monitor")?;
+
+    let service = mdns_service_info(instance_id, name, bind, version)?;
+    daemon
+        .register(service)
+        .context("registering plurx Bonjour service")?;
+    tracing::info!(
+        service = MDNS_SERVICE_TYPE,
+        server_name = name,
+        port = bind.port(),
+        "Bonjour discovery advertiser registered"
+    );
+    Ok(daemon)
+}
+
+/// Build one testable DNS-SD record. The stable instance id names the `.local`
+/// host; the human server name remains the service instance users see.
+fn mdns_service_info(
+    instance_id: &str,
+    name: &str,
+    bind: SocketAddr,
+    version: &str,
+) -> anyhow::Result<mdns_sd::ServiceInfo> {
+    let suffix: String = instance_id
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(12)
+        .collect();
+    let suffix = if suffix.is_empty() { "server" } else { &suffix };
+    let hostname = format!("plurx-{suffix}.local.");
+    let instance_name = if name.trim().is_empty() {
+        "plurx"
+    } else {
+        name
+    };
+    let properties = [
+        ("id", instance_id),
+        ("name", instance_name),
+        ("version", version),
+        ("api", "/api/v1"),
+    ];
+    let addresses = if bind.ip().is_unspecified() {
+        String::new()
+    } else {
+        bind.ip().to_string()
+    };
+    let service = mdns_sd::ServiceInfo::new(
+        MDNS_SERVICE_TYPE,
+        instance_name,
+        &hostname,
+        addresses.as_str(),
+        bind.port(),
+        &properties[..],
+    )?;
+    Ok(if bind.ip().is_unspecified() {
+        service.enable_addr_auto()
+    } else {
+        service
+    })
+}
 
 /// First line of `ffmpeg -version` (e.g. "ffmpeg version 6.1.1 …"), if the
 /// binary runs at all. Purely informational, for the settings page.
@@ -348,23 +472,24 @@ async fn ffmpeg_version(bin: &str) -> Option<String> {
 /// GDM discovery responder: answers Plex clients' multicast `M-SEARCH` on the
 /// LAN (docs/CLIENTS.md §3). Multicast is TTL-scoped to the local network, so
 /// this never answers WAN queries (avoids GDM/SSDP reflection abuse).
-async fn gdm_responder(instance_id: String, name: String, port: u16) -> anyhow::Result<()> {
+async fn gdm_responder(
+    instance_id: String,
+    name: String,
+    http_port: u16,
+    gdm_port: u16,
+) -> anyhow::Result<()> {
     use std::net::Ipv4Addr;
 
-    let socket =
-        tokio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, plurx_compat_plex::gdm::GDM_PORT))
-            .await
-            .context("binding GDM port")?;
+    let socket = tokio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, gdm_port))
+        .await
+        .context("binding GDM port")?;
     socket
         .join_multicast_v4(
             plurx_compat_plex::gdm::GDM_MULTICAST_ADDR.parse()?,
             Ipv4Addr::UNSPECIFIED,
         )
         .context("joining GDM multicast group")?;
-    tracing::info!(
-        port = plurx_compat_plex::gdm::GDM_PORT,
-        "GDM discovery responder listening"
-    );
+    tracing::info!(port = gdm_port, "GDM discovery responder listening");
 
     // Plex clients parse what GDM advertises, so this stays bare semver — the
     // git build stamp would not survive their version comparisons.
@@ -373,12 +498,21 @@ async fn gdm_responder(instance_id: String, name: String, port: u16) -> anyhow::
     loop {
         let (n, addr) = socket.recv_from(&mut buf).await?;
         if plurx_compat_plex::gdm::is_search(&buf[..n]) {
-            let resp = plurx_compat_plex::gdm::response(&instance_id, &name, version, port);
+            let resp = plurx_compat_plex::gdm::response(&instance_id, &name, version, http_port);
             if let Err(e) = socket.send_to(&resp, addr).await {
                 tracing::warn!(error = %e, "GDM response send failed");
             }
         }
     }
+}
+
+fn gdm_bind_port(value: Option<&str>) -> anyhow::Result<u16> {
+    let Some(value) = value else {
+        return Ok(plurx_compat_plex::gdm::GDM_PORT);
+    };
+    value
+        .parse::<u16>()
+        .with_context(|| format!("invalid PLURX_GDM_PORT {value:?}"))
 }
 
 async fn shutdown_signal() {
@@ -425,5 +559,57 @@ fn healthcheck(config: &Config) -> anyhow::Result<()> {
         Ok(())
     } else {
         anyhow::bail!("unhealthy: {status_line:?}");
+    }
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+
+    #[test]
+    fn gdm_port_defaults_and_accepts_an_override() {
+        assert_eq!(
+            gdm_bind_port(None).expect("default GDM port"),
+            plurx_compat_plex::gdm::GDM_PORT
+        );
+        assert_eq!(
+            gdm_bind_port(Some("32415")).expect("GDM port override"),
+            32415
+        );
+        assert!(gdm_bind_port(Some("not-a-port")).is_err());
+    }
+
+    #[test]
+    fn wildcard_bind_advertises_the_native_plurx_contract() {
+        let info = mdns_service_info(
+            "550e8400-e29b-41d4-a716-446655440000",
+            "Living Room",
+            "0.0.0.0:32400".parse().expect("socket address"),
+            "0.2.0",
+        )
+        .expect("service info");
+
+        assert_eq!(info.get_type(), MDNS_SERVICE_TYPE);
+        assert_eq!(info.get_port(), 32400);
+        assert_eq!(info.get_hostname(), "plurx-550e8400e29b.local.");
+        assert_eq!(info.get_property_val_str("name"), Some("Living Room"));
+        assert_eq!(info.get_property_val_str("version"), Some("0.2.0"));
+        assert_eq!(info.get_property_val_str("api"), Some("/api/v1"));
+        assert!(info.is_addr_auto());
+    }
+
+    #[test]
+    fn explicit_bind_advertises_only_that_address() {
+        let address = "192.168.1.20".parse().expect("IP address");
+        let info = mdns_service_info(
+            "server-id",
+            "plurx",
+            "192.168.1.20:32400".parse().expect("socket address"),
+            "0.2.0",
+        )
+        .expect("service info");
+
+        assert!(!info.is_addr_auto());
+        assert!(info.get_addresses().contains(&address));
     }
 }
