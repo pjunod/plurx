@@ -226,6 +226,7 @@ mod tests {
             artwork: base.join("artwork"),
             transcode: base.join("transcode"),
             cache: base.join("cache"),
+            subs: base.join("subs"),
         }
     }
 
@@ -3474,6 +3475,145 @@ mod tests {
 
     async fn status_of(app: &Router, req: Request<Body>) -> StatusCode {
         app.clone().oneshot(req).await.expect("resp").status()
+    }
+
+    async fn body_of(app: &Router, req: Request<Body>) -> (StatusCode, Vec<u8>) {
+        let resp = app.clone().oneshot(req).await.expect("resp");
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+        (status, bytes.to_vec())
+    }
+
+    /// The §3.3 contract: the first request extracts and files the VTT under
+    /// the source's fingerprint; the second is served from that file without
+    /// ffmpeg reading the source again — proven by editing the cached entry
+    /// and getting the edit back.
+    #[tokio::test]
+    async fn subtitle_extraction_is_cached_by_source_identity() {
+        crate::transcode::require_ffmpeg();
+        use plurx_core::domain::{ItemKind, LibraryKind, NewItem, NewLibrary, ProbeResult};
+
+        let (app, state) = test_state();
+        let admin = setup_admin(&app).await;
+
+        // A real MKV with a real SRT track, so extraction actually runs.
+        let dir = std::env::temp_dir().join(format!("plurx-subs-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let srt = dir.join("s.srt");
+        std::fs::write(&srt, "1\n00:00:00,000 --> 00:00:01,000\nhello plurx\n\n").expect("srt");
+        let mkv = dir.join("subbed.mkv");
+        let made = std::process::Command::new(crate::ffmpeg::ffmpeg_bin())
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=64x64:r=10:d=1",
+                "-i",
+            ])
+            .arg(&srt)
+            .args(["-c:v", "libx264", "-preset", "ultrafast", "-c:s", "srt"])
+            .arg(&mkv)
+            .output()
+            .expect("spawn ffmpeg");
+        assert!(
+            made.status.success(),
+            "fixture mux failed: {}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+
+        let lib = state
+            .store
+            .create_library(&NewLibrary {
+                name: "Subbed".into(),
+                kind: LibraryKind::Movies,
+                paths: vec![std::path::PathBuf::from("/media")],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+        let movie = state
+            .store
+            .insert_item(&NewItem {
+                library_id: lib.id,
+                kind: ItemKind::Movie,
+                parent_id: None,
+                title: "Subbed".into(),
+                year: None,
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("movie");
+        let probe = ProbeResult {
+            duration_ms: Some(1_000),
+            container: Some("mkv".into()),
+            video_codec: Some("h264".into()),
+            subtitle_streams: vec![plurx_core::domain::SubtitleStream {
+                index: 0,
+                codec: "subrip".into(),
+                language: Some("eng".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let file = state
+            .store
+            .upsert_file(movie, &mkv.to_string_lossy(), 4242, 7, &probe)
+            .await
+            .expect("file");
+
+        let (status, body) = body_of(
+            &app,
+            get_q(&format!("/api/v1/files/{file}/subs/0?token={admin}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("WEBVTT"), "{text}");
+        assert!(text.contains("hello plurx"), "{text}");
+
+        // Exactly one entry, keyed by (file, stream, size, mtime).
+        let cached = state.subs_dir.join(format!("f{file}-s0-4242-7.vtt"));
+        assert!(
+            tokio::fs::metadata(&cached).await.is_ok(),
+            "the extraction must be filed under the source's fingerprint"
+        );
+
+        // Edit the cached entry; a second request returns the edit — which it
+        // can only do by serving the cache instead of re-reading the source.
+        tokio::fs::write(&cached, "WEBVTT\n\ncache-proof\n")
+            .await
+            .expect("edit cache");
+        let (status, body) = body_of(
+            &app,
+            get_q(&format!("/api/v1/files/{file}/subs/0?token={admin}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            String::from_utf8_lossy(&body).contains("cache-proof"),
+            "the second request must come from the cache"
+        );
+
+        // A replaced source is a different fingerprint: not served the stale
+        // entry.
+        let refreshed = state
+            .store
+            .upsert_file(movie, &mkv.to_string_lossy(), 4242, 8, &probe)
+            .await
+            .expect("refreshed");
+        assert_eq!(refreshed, file, "same row, new mtime");
+        let (status, body) = body_of(
+            &app,
+            get_q(&format!("/api/v1/files/{file}/subs/0?token={admin}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            String::from_utf8_lossy(&body).contains("hello plurx"),
+            "a changed fingerprint must re-extract, not serve the stale entry"
+        );
     }
 
     #[tokio::test]

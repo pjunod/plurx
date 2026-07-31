@@ -61,6 +61,11 @@ pub struct Dirs {
     pub artwork: PathBuf,
     pub transcode: PathBuf,
     pub cache: PathBuf,
+    /// Extracted-subtitle cache (review §3.3). A sibling of the transcode
+    /// cache under `cache/`, for the same reason that one is: it survives
+    /// restarts, and the transcode scratch — which is cleared at boot and
+    /// swept for orphans — must not contain it.
+    pub subs: PathBuf,
 }
 
 /// Everything a request handler needs. Cheap to clone (all shared via `Arc`).
@@ -69,6 +74,9 @@ pub struct AppState {
     pub store: Arc<dyn Store>,
     pub server_name: String,
     pub artwork_dir: PathBuf,
+    /// Where extracted subtitles are kept, keyed by file identity and source
+    /// fingerprint — see `http::stream::subtitles_vtt`.
+    pub subs_dir: PathBuf,
     pub jobs: Arc<JobManager>,
     pub transcode: Arc<TranscodeManager>,
     pub trakt: Arc<TraktManager>,
@@ -114,6 +122,7 @@ impl AppState {
             artwork: artwork_dir,
             transcode: transcode_dir,
             cache: cache_dir,
+            subs: subs_dir,
         } = dirs;
         let jobs = Arc::new(JobManager::new(Arc::clone(&store), artwork_dir.clone()));
         let coming_soon = crate::http::ComingSoonCache::new();
@@ -141,6 +150,7 @@ impl AppState {
             store,
             server_name,
             artwork_dir,
+            subs_dir,
             jobs,
             transcode,
             trakt,

@@ -161,6 +161,11 @@ async fn run(config: Config) -> anyhow::Result<()> {
     let cache_dir = config.storage.data_dir.join("cache").join("transcode");
     std::fs::create_dir_all(&cache_dir)
         .with_context(|| format!("creating cache directory {}", cache_dir.display()))?;
+    // Extracted subtitles, cached by source fingerprint. Beside the transcode
+    // cache and not inside the session scratch, which is cleared at boot.
+    let subs_dir = config.storage.data_dir.join("cache").join("subs");
+    std::fs::create_dir_all(&subs_dir)
+        .with_context(|| format!("creating subtitle cache {}", subs_dir.display()))?;
     let transcode_dir = config.storage.data_dir.join("transcode");
     // Clear any stale sessions from a previous run, then recreate.
     let _ = std::fs::remove_dir_all(&transcode_dir);
@@ -231,6 +236,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
             artwork: artwork_dir,
             transcode: transcode_dir,
             cache: cache_dir,
+            subs: subs_dir,
         },
         instance_id.clone(),
         encoder_caps,
