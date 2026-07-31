@@ -66,7 +66,10 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.ui.AspectRatioFrameLayout
@@ -141,29 +144,12 @@ fun PlayerScreen(
     onPlayNext: (PlaybackTarget) -> Unit,
     onExit: () -> Unit,
 ) {
-    val activity = androidx.activity.compose.LocalActivity.current
     var plan by remember(itemId, fileId) { mutableStateOf<Plan?>(null) }
     var failed by remember(itemId, fileId) { mutableStateOf(false) }
     var generation by remember(itemId, fileId) { mutableIntStateOf(0) }
     var resumeAt by remember(itemId, fileId) { mutableLongStateOf(startMs) }
 
-    DisposableEffect(activity) {
-        val window = activity?.window
-        if (window != null) {
-            WindowCompat.setDecorFitsSystemWindows(window, false)
-            WindowCompat.getInsetsController(window, window.decorView).apply {
-                hide(WindowInsetsCompat.Type.systemBars())
-                systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-            }
-        }
-        onDispose {
-            if (window != null) {
-                WindowCompat.getInsetsController(window, window.decorView)
-                    .show(WindowInsetsCompat.Type.systemBars())
-                WindowCompat.setDecorFitsSystemWindows(window, true)
-            }
-        }
-    }
+    ImmersivePlaybackEffect()
 
     LaunchedEffect(itemId, fileId, generation) {
         failed = false
@@ -191,6 +177,50 @@ fun PlayerScreen(
                 onPlayNext = onPlayNext,
                 onExit = onExit,
             )
+        }
+    }
+}
+
+@Composable
+private fun ImmersivePlaybackEffect() {
+    val activity = androidx.activity.compose.LocalActivity.current ?: return
+    val lifecycleOwner = LocalLifecycleOwner.current
+
+    DisposableEffect(activity, lifecycleOwner) {
+        val window = activity.window
+        val decorView = window.decorView
+        val insetsController = WindowCompat.getInsetsController(window, decorView)
+        var active = true
+
+        val enterImmersiveMode = Runnable {
+            if (!active) return@Runnable
+            WindowCompat.setDecorFitsSystemWindows(window, false)
+            insetsController.systemBarsBehavior =
+                WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            insetsController.hide(WindowInsetsCompat.Type.systemBars())
+        }
+        val focusListener = android.view.ViewTreeObserver.OnWindowFocusChangeListener { hasFocus ->
+            if (hasFocus) decorView.post(enterImmersiveMode)
+        }
+        val lifecycleObserver = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) decorView.post(enterImmersiveMode)
+        }
+
+        decorView.viewTreeObserver.addOnWindowFocusChangeListener(focusListener)
+        lifecycleOwner.lifecycle.addObserver(lifecycleObserver)
+        // Waiting for the decor view's next frame prevents the initial request from
+        // being lost while Compose and PlayerView are still taking window focus.
+        decorView.post(enterImmersiveMode)
+
+        onDispose {
+            active = false
+            decorView.removeCallbacks(enterImmersiveMode)
+            if (decorView.viewTreeObserver.isAlive) {
+                decorView.viewTreeObserver.removeOnWindowFocusChangeListener(focusListener)
+            }
+            lifecycleOwner.lifecycle.removeObserver(lifecycleObserver)
+            insetsController.show(WindowInsetsCompat.Type.systemBars())
+            WindowCompat.setDecorFitsSystemWindows(window, true)
         }
     }
 }
