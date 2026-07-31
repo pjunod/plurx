@@ -2160,16 +2160,19 @@ impl TranscodeManager {
                         let _ = tokio::fs::remove_dir_all(&part_dir).await;
                     }
                     if matches!(ended, PartEnd::Deadline) {
-                        // Out of budget for this pass. What was produced is
-                        // discarded, because a partial asset must never be
-                        // serveable and there is nowhere to record a
-                        // checkpoint that outlives this call — resume is
-                        // within a run, not across them. A film that cannot
-                        // finish inside one six-hour window therefore never
-                        // gets cached, which is a real limitation and a
-                        // straightforward one to lift later: the parts are
-                        // already named and numbered on disk, and the claim
-                        // row is already the place a checkpoint would live.
+                        // Out of budget for this pass. Nothing is published —
+                        // a partial asset must never be serveable — but
+                        // nothing is discarded either: the numbered parts
+                        // stay on disk under the claim, and the next pass
+                        // over this recipe starts at `resume_parts`, picking
+                        // up exactly where this one stopped (the log line at
+                        // the top of this loop is that event). A film that
+                        // cannot finish inside one window therefore still
+                        // gets cached — across as many passes as it takes —
+                        // provided the claim row survives between them; the
+                        // parts and the claim are the checkpoint, and there
+                        // is deliberately no second bookmark in the database
+                        // to disagree with them after a crash.
                         return Ok(None);
                     }
                 }
