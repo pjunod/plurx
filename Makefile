@@ -51,6 +51,36 @@ coverage: ## Line coverage (installs cargo-llvm-cov on first run); writes lcov.i
 	$(CARGO) llvm-cov --workspace --lcov --output-path lcov.info
 	@$(CARGO) llvm-cov --workspace --summary-only
 
+## ---- playback lab ------------------------------------------------------
+
+.PHONY: playback-doctor
+playback-doctor: ## Check playback-lab codecs, filters, browser, and server binary
+	@scripts/playback-lab doctor
+
+.PHONY: playback-fixtures
+playback-fixtures: ## Build + ffprobe the deterministic playback corpus
+	@scripts/playback-lab fixtures
+
+.PHONY: playback-smoke
+playback-smoke: ## Run the risk-weighted end-to-end playback matrix in Chrome
+	@scripts/playback-lab run --suite smoke
+
+.PHONY: playback-smoke-safari
+playback-smoke-safari: ## Run the playback smoke matrix in Safari (macOS)
+	@scripts/playback-lab run --suite smoke --browser safari
+
+.PHONY: playback-smoke-edge
+playback-smoke-edge: ## Run the playback smoke matrix in Microsoft Edge
+	@scripts/playback-lab run --suite smoke --browser edge
+
+.PHONY: playback-smoke-firefox
+playback-smoke-firefox: ## Run the playback smoke matrix in Firefox (needs geckodriver)
+	@scripts/playback-lab run --suite smoke --browser firefox
+
+.PHONY: playback-full
+playback-full: ## Run every fixture x quality plus playback restart cases
+	@scripts/playback-lab run --suite full
+
 ## ---- packaging & setup -------------------------------------------------
 
 # What a build from this tree stamps into the binary. Keep in step with

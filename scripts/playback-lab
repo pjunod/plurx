@@ -1,0 +1,1256 @@
+#!/usr/bin/env node
+/*
+ * End-to-end playback matrix for plurx.
+ *
+ * Deliberately dependency-free: Node's built-in fetch + WebSocket drive the
+ * real web player through Chrome/Edge DevTools or Safari/Firefox WebDriver.
+ * See docs/PLAYBACK-TESTING.md for the contract and the limits.
+ */
+"use strict";
+
+const fs = require("node:fs");
+const fsp = fs.promises;
+const net = require("node:net");
+const os = require("node:os");
+const path = require("node:path");
+const { spawn, spawnSync } = require("node:child_process");
+
+const ROOT = path.resolve(__dirname, "..");
+const MANIFEST_PATH = path.join(ROOT, "tests", "playback", "cases.json");
+const DEFAULT_FIXTURE_DIR = path.join(ROOT, "target", "playback-lab", "fixtures");
+const DEFAULT_REPORT_DIR = path.join(ROOT, "target", "playback-lab", "reports");
+const ELEMENT_KEY = "element-6066-11e4-a52e-4f735466cecf";
+
+function usage() {
+  process.stdout.write(`plurx playback lab
+
+Usage:
+  scripts/playback-lab doctor [--browser chrome|safari|edge|firefox]
+  scripts/playback-lab fixtures [--rebuild] [--fixtures DIR]
+  scripts/playback-lab plan [--suite smoke|full] [--case TEXT]
+  scripts/playback-lab run [--suite smoke|full] [--browser chrome|safari|edge|firefox]
+                             [--case TEXT] [--observe SECONDS]
+                             [--fixtures DIR] [--server PATH]
+                             [--chrome PATH] [--edge PATH]
+                             [--firefox PATH] [--geckodriver PATH]
+                             [--headed] [--keep-runtime]
+
+Commands:
+  doctor    Verify the external programs and browser automation surface.
+  fixtures  Generate and ffprobe-verify the deterministic media corpus.
+  plan      Print the cases without starting a server or browser.
+  run       Boot an isolated server, scan the corpus, and play every case.
+
+The smoke suite covers each verdict plus the high-risk 4K transport forks and
+seek/audio/subtitle restarts. The full suite adds every fixture x quality mode.
+Reports are written below target/playback-lab/reports/ as JSON and JUnit XML.
+`);
+}
+
+function parseArgs(argv) {
+  const command = argv[0] || "help";
+  const options = {};
+  for (let i = 1; i < argv.length; i += 1) {
+    const raw = argv[i];
+    if (!raw.startsWith("--")) throw new Error(`unexpected argument: ${raw}`);
+    const eq = raw.indexOf("=");
+    if (eq > 0) {
+      options[raw.slice(2, eq).replaceAll("-", "_")] = raw.slice(eq + 1);
+      continue;
+    }
+    const key = raw.slice(2).replaceAll("-", "_");
+    const next = argv[i + 1];
+    if (next !== undefined && !next.startsWith("--")) {
+      options[key] = next;
+      i += 1;
+    } else {
+      options[key] = true;
+    }
+  }
+  return { command, options };
+}
+
+function loadManifest() {
+  const manifest = JSON.parse(fs.readFileSync(MANIFEST_PATH, "utf8"));
+  if (manifest.schema_version !== 1) {
+    throw new Error(`unsupported playback manifest schema ${manifest.schema_version}`);
+  }
+  const ids = new Set();
+  for (const fixture of manifest.fixtures || []) {
+    if (!fixture.id || !fixture.filename || !fixture.builder) {
+      throw new Error("each playback fixture needs id, filename, and builder");
+    }
+    if (ids.has(fixture.id)) throw new Error(`duplicate fixture id: ${fixture.id}`);
+    ids.add(fixture.id);
+  }
+  return manifest;
+}
+
+function fixtureMap(manifest) {
+  return new Map(manifest.fixtures.map((fixture) => [fixture.id, fixture]));
+}
+
+function caseName(testCase) {
+  return `${testCase.fixture} :: ${testCase.quality} :: ${testCase.operation}`;
+}
+
+function expandCases(manifest, suiteName, filter) {
+  const suite = manifest.suites[suiteName];
+  if (!suite) throw new Error(`unknown suite ${suiteName}; choose smoke or full`);
+  const fixtures = fixtureMap(manifest);
+  const cases = [];
+  if (suite.cross_product) {
+    const fixtureIds = suite.cross_product.fixtures === "all"
+      ? manifest.fixtures.map((fixture) => fixture.id)
+      : suite.cross_product.fixtures;
+    const qualities = suite.cross_product.qualities === "all"
+      ? manifest.qualities
+      : suite.cross_product.qualities;
+    for (const fixture of fixtureIds) {
+      for (const quality of qualities) {
+        cases.push({ fixture, quality, operation: suite.cross_product.operation || "steady" });
+      }
+    }
+  }
+  cases.push(...(suite.cases || []));
+  const seen = new Set();
+  const selected = [];
+  for (const testCase of cases) {
+    if (!fixtures.has(testCase.fixture)) throw new Error(`case uses unknown fixture ${testCase.fixture}`);
+    if (!manifest.qualities.includes(testCase.quality)) throw new Error(`case uses unknown quality ${testCase.quality}`);
+    const name = caseName(testCase);
+    if (seen.has(name)) continue;
+    seen.add(name);
+    if (filter && !name.toLowerCase().includes(String(filter).toLowerCase())) continue;
+    selected.push({ ...testCase, name });
+  }
+  if (selected.length === 0) throw new Error(filter ? `no cases match ${filter}` : "suite has no cases");
+  return selected;
+}
+
+function printPlan(manifest, suiteName, filter) {
+  const fixtures = fixtureMap(manifest);
+  const cases = expandCases(manifest, suiteName, filter);
+  process.stdout.write(`Suite: ${suiteName} (${cases.length} cases)\n\n`);
+  process.stdout.write(" #  fixture                          quality   operation\n");
+  process.stdout.write("--  -------------------------------  --------  ---------------\n");
+  cases.forEach((testCase, index) => {
+    process.stdout.write(
+      `${String(index + 1).padStart(2)}  ${testCase.fixture.padEnd(31)}  ` +
+      `${testCase.quality.padEnd(8)}  ${testCase.operation}\n`,
+    );
+  });
+  process.stdout.write("\nCorpus:\n");
+  for (const fixture of manifest.fixtures) {
+    process.stdout.write(`  ${fixture.id}: ${fixture.description}\n`);
+  }
+  process.stdout.write(`\nHow to read it: every case uses the shipped player. A verdict-path fallback,\n`);
+  process.stdout.write(`media error, clock rate under ${manifest.thresholds.minimum_clock_rate.toFixed(2)}x, `);
+  process.stdout.write(`more than ${manifest.thresholds.maximum_hitches} hitches, or any stall fails.\n`);
+  return { fixtures, cases };
+}
+
+function commandExists(command, versionFlag = "--version") {
+  const result = spawnSync(command, [versionFlag], { encoding: "utf8" });
+  return result.status === 0;
+}
+
+function findOnPath(names) {
+  for (const name of names) {
+    const result = spawnSync("sh", ["-c", "command -v \"$1\"", "playback-lab", name], {
+      encoding: "utf8",
+    });
+    if (result.status === 0 && result.stdout.trim()) return result.stdout.trim();
+  }
+  return null;
+}
+
+function findChrome(explicit) {
+  if (explicit) {
+    const candidate = path.resolve(explicit);
+    return fs.existsSync(candidate) ? candidate : findOnPath([explicit]);
+  }
+  const candidates = [
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+    "/usr/bin/google-chrome",
+    "/usr/bin/google-chrome-stable",
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+  ];
+  for (const candidate of candidates) if (fs.existsSync(candidate)) return candidate;
+  return findOnPath(["google-chrome", "google-chrome-stable", "chromium", "chromium-browser"]);
+}
+
+function findEdge(explicit) {
+  if (explicit) {
+    const candidate = path.resolve(explicit);
+    return fs.existsSync(candidate) ? candidate : findOnPath([explicit]);
+  }
+  const candidates = [
+    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+    "/Applications/Microsoft Edge Beta.app/Contents/MacOS/Microsoft Edge Beta",
+    "/Applications/Microsoft Edge Dev.app/Contents/MacOS/Microsoft Edge Dev",
+    "/Applications/Microsoft Edge Canary.app/Contents/MacOS/Microsoft Edge Canary",
+    "/usr/bin/microsoft-edge",
+    "/usr/bin/microsoft-edge-stable",
+    "/usr/bin/microsoft-edge-beta",
+    "/usr/bin/microsoft-edge-dev",
+  ];
+  for (const candidate of candidates) if (fs.existsSync(candidate)) return candidate;
+  return findOnPath(["microsoft-edge", "microsoft-edge-stable", "microsoft-edge-beta", "microsoft-edge-dev"]);
+}
+
+function findFirefox(explicit) {
+  if (explicit) {
+    const candidate = path.resolve(explicit);
+    return fs.existsSync(candidate) ? candidate : findOnPath([explicit]);
+  }
+  const candidates = [
+    "/Applications/Firefox.app/Contents/MacOS/firefox",
+    "/Applications/Firefox Developer Edition.app/Contents/MacOS/firefox",
+    "/Applications/Firefox Nightly.app/Contents/MacOS/firefox",
+    "/usr/bin/firefox",
+    "/usr/bin/firefox-esr",
+  ];
+  for (const candidate of candidates) if (fs.existsSync(candidate)) return candidate;
+  return findOnPath(["firefox", "firefox-esr"]);
+}
+
+function findGeckodriver(explicit) {
+  if (explicit) {
+    const candidate = path.resolve(explicit);
+    return fs.existsSync(candidate) ? candidate : findOnPath([explicit]);
+  }
+  return findOnPath(["geckodriver"]);
+}
+
+function doctor(options) {
+  const browser = options.browser || "chrome";
+  const checks = [];
+  const add = (name, ok, detail) => checks.push({ name, ok, detail });
+  add("Node >= 22", Number(process.versions.node.split(".")[0]) >= 22, process.version);
+  add("Node WebSocket", typeof WebSocket === "function", typeof WebSocket);
+  add("ffmpeg", commandExists("ffmpeg", "-version"), findOnPath(["ffmpeg"]) || "not found");
+  add("ffprobe", commandExists("ffprobe", "-version"), findOnPath(["ffprobe"]) || "not found");
+  const encoders = spawnSync("ffmpeg", ["-hide_banner", "-encoders"], { encoding: "utf8" });
+  const encoderText = `${encoders.stdout || ""}\n${encoders.stderr || ""}`;
+  for (const encoder of ["libx264", "libx265", "libvpx-vp9", "aac", "ac3", "libopus", "libmp3lame"]) {
+    add(`ffmpeg ${encoder}`, encoderText.includes(encoder), encoderText.includes(encoder) ? "available" : "missing");
+  }
+  const filters = spawnSync("ffmpeg", ["-hide_banner", "-filters"], { encoding: "utf8" });
+  const filterText = `${filters.stdout || ""}\n${filters.stderr || ""}`;
+  add("ffmpeg zscale", /\bzscale\b/.test(filterText), /\bzscale\b/.test(filterText) ? "available" : "missing (HDR tone-map cases will fail)");
+  const server = path.resolve(options.server || path.join(ROOT, "target", "debug", "plurxd"));
+  add("plurxd debug binary", fs.existsSync(server), fs.existsSync(server) ? server : `${server} (run cargo build -p plurxd)`);
+  if (browser === "chrome") {
+    const chrome = findChrome(options.chrome);
+    add("Chrome", Boolean(chrome && fs.existsSync(chrome)), chrome || "not found");
+  } else if (browser === "safari") {
+    add("Safari WebDriver", fs.existsSync("/usr/bin/safaridriver"), "/usr/bin/safaridriver");
+  } else if (browser === "edge") {
+    const edge = findEdge(options.edge);
+    add("Microsoft Edge", Boolean(edge && fs.existsSync(edge)), edge || "not found");
+  } else if (browser === "firefox") {
+    const firefox = findFirefox(options.firefox);
+    const geckodriver = findGeckodriver(options.geckodriver);
+    add("Firefox", Boolean(firefox && fs.existsSync(firefox)), firefox || "not found");
+    add("Firefox WebDriver", Boolean(geckodriver && fs.existsSync(geckodriver)), geckodriver || "geckodriver not found on PATH");
+  } else {
+    add("browser", false, `unknown browser ${browser}`);
+  }
+  for (const check of checks) {
+    process.stdout.write(`${check.ok ? "PASS" : "FAIL"}  ${check.name.padEnd(24)} ${check.detail}\n`);
+  }
+  if (browser === "safari") {
+    process.stdout.write("\nSafari must have Develop > Allow Remote Automation enabled. If macOS has\n");
+    process.stdout.write("not authorized it yet, run `safaridriver --enable` once yourself.\n");
+  }
+  if (checks.some((check) => !check.ok)) process.exitCode = 1;
+}
+
+function ffmpegPrefix() {
+  return ["-hide_banner", "-loglevel", "error", "-nostdin", "-y"];
+}
+
+function fixtureCommand(fixture, output, directory, fixtures) {
+  const seconds = fixture.builder === "hevc_hdr_open_gop_mkv" ? "18" : "24";
+  switch (fixture.builder) {
+    case "h264_aac_mp4":
+      return [
+        ...ffmpegPrefix(),
+        "-f", "lavfi", "-i", `testsrc2=size=1920x1080:rate=24:duration=${seconds}`,
+        "-f", "lavfi", "-i", `sine=frequency=440:sample_rate=48000:duration=${seconds}`,
+        "-map", "0:v:0", "-map", "1:a:0",
+        "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+        "-g", "48", "-keyint_min", "48", "-sc_threshold", "0", "-b:v", "8M",
+        "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", "-shortest", output,
+      ];
+    case "h264_multitrack_mkv": { // video is copied so this case differs only where intended
+      const source = path.join(directory, fixtures.get(fixture.depends_on).filename);
+      const subtitle = path.join(directory, "playback-lab.srt");
+      fs.writeFileSync(subtitle, "1\n00:00:01,000 --> 00:00:05,000\nplurx playback lab\n\n2\n00:00:08,000 --> 00:00:22,000\nsubtitle continuity check\n", "utf8");
+      return [
+        ...ffmpegPrefix(), "-i", source,
+        "-f", "lavfi", "-i", `sine=frequency=440:sample_rate=48000:duration=${seconds}`,
+        "-f", "lavfi", "-i", `sine=frequency=660:sample_rate=48000:duration=${seconds}`,
+        "-f", "srt", "-i", subtitle,
+        "-map", "0:v:0", "-map", "1:a:0", "-map", "2:a:0", "-map", "3:s:0",
+        "-c:v", "copy", "-c:a:0", "aac", "-b:a:0", "192k",
+        "-c:a:1", "ac3", "-b:a:1", "384k", "-c:s", "srt",
+        "-metadata:s:a:0", "language=eng", "-metadata:s:a:0", "title=AAC baseline",
+        "-metadata:s:a:1", "language=spa", "-metadata:s:a:1", "title=AC-3 alternate",
+        "-metadata:s:s:0", "language=eng", "-metadata:s:s:0", "title=Text subtitles",
+        "-disposition:a:0", "default", "-disposition:a:1", "0", "-shortest", output,
+      ];
+    }
+    case "mpeg4_mp3_avi":
+      return [
+        ...ffmpegPrefix(),
+        "-f", "lavfi", "-i", `testsrc2=size=1280x720:rate=30:duration=${seconds}`,
+        "-f", "lavfi", "-i", `sine=frequency=330:sample_rate=48000:duration=${seconds}`,
+        "-map", "0:v:0", "-map", "1:a:0", "-c:v", "mpeg4", "-q:v", "3",
+        "-c:a", "libmp3lame", "-b:a", "192k", "-shortest", output,
+      ];
+    case "vp9_opus_webm":
+      return [
+        ...ffmpegPrefix(),
+        "-f", "lavfi", "-i", `testsrc2=size=1280x720:rate=24:duration=${seconds}`,
+        "-f", "lavfi", "-i", `sine=frequency=550:sample_rate=48000:duration=${seconds}`,
+        "-map", "0:v:0", "-map", "1:a:0", "-c:v", "libvpx-vp9",
+        "-deadline", "realtime", "-cpu-used", "8", "-row-mt", "1", "-b:v", "3M",
+        "-g", "96", "-c:a", "libopus", "-b:a", "160k", "-shortest", output,
+      ];
+    case "hevc_hdr_open_gop_mkv":
+      return [
+        ...ffmpegPrefix(),
+        "-f", "lavfi", "-i", `testsrc2=size=3840x2160:rate=24000/1001:duration=${seconds}`,
+        "-f", "lavfi", "-i", `sine=frequency=220:sample_rate=48000:duration=${seconds}`,
+        "-map", "0:v:0", "-map", "1:a:0", "-c:v", "libx265", "-preset", "ultrafast",
+        "-vf", "setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc",
+        "-pix_fmt", "yuv420p10le", "-b:v", "48M", "-maxrate", "48M", "-bufsize", "96M",
+        "-x265-params", "log-level=error:keyint=144:min-keyint=144:open-gop=1:scenecut=0:vbv-maxrate=48000:vbv-bufsize=96000:strict-cbr=1:filler=1:hrd=1:repeat-headers=1:hdr10=1:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc",
+        "-color_primaries", "bt2020", "-color_trc", "smpte2084", "-colorspace", "bt2020nc",
+        "-c:a", "aac", "-b:a", "256k", "-shortest", output,
+      ];
+    default:
+      throw new Error(`unknown fixture builder ${fixture.builder}`);
+  }
+}
+
+function runProcess(command, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      cwd: options.cwd || ROOT,
+      env: options.env || process.env,
+      stdio: ["ignore", options.quiet ? "pipe" : "inherit", "pipe"],
+    });
+    let stderr = "";
+    let stdout = "";
+    if (child.stderr) child.stderr.on("data", (chunk) => { stderr += chunk.toString(); if (!options.quiet) process.stderr.write(chunk); });
+    if (options.quiet && child.stdout) child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
+    child.on("error", reject);
+    child.on("exit", (code, signal) => {
+      if (code === 0) resolve({ code, stdout, stderr });
+      else reject(new Error(`${command} exited ${code ?? signal}${stderr ? `: ${stderr.trim()}` : ""}`));
+    });
+  });
+}
+
+function ffprobe(file) {
+  const result = spawnSync("ffprobe", [
+    "-v", "error", "-show_format", "-show_streams", "-of", "json", file,
+  ], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
+  if (result.status !== 0) throw new Error(`ffprobe failed for ${file}: ${result.stderr.trim()}`);
+  return JSON.parse(result.stdout);
+}
+
+function verifyFixture(fixture, file) {
+  const probe = ffprobe(file);
+  const video = probe.streams.find((stream) => stream.codec_type === "video");
+  const audio = probe.streams.filter((stream) => stream.codec_type === "audio");
+  const subtitles = probe.streams.filter((stream) => stream.codec_type === "subtitle");
+  const failures = [];
+  if (!video) failures.push("no video stream");
+  const want = {
+    h264_aac_mp4: { video: "h264", audio: ["aac"], width: 1920, height: 1080, minDuration: 20 },
+    h264_multitrack_mkv: { video: "h264", audio: ["aac", "ac3"], subtitles: 1, width: 1920, height: 1080, minDuration: 20 },
+    mpeg4_mp3_avi: { video: "mpeg4", audio: ["mp3"], width: 1280, height: 720, minDuration: 20 },
+    vp9_opus_webm: { video: "vp9", audio: ["opus"], width: 1280, height: 720, minDuration: 20 },
+    hevc_hdr_open_gop_mkv: { video: "hevc", audio: ["aac"], width: 3840, height: 2160, hdr: true, minBitrate: 40_000_000, minDuration: 16 },
+  }[fixture.builder];
+  if (video && video.codec_name !== want.video) failures.push(`video codec ${video.codec_name}, want ${want.video}`);
+  if (video && (video.width !== want.width || video.height !== want.height)) {
+    failures.push(`dimensions ${video.width}x${video.height}, want ${want.width}x${want.height}`);
+  }
+  for (const codec of want.audio) if (!audio.some((stream) => stream.codec_name === codec)) failures.push(`missing ${codec} audio`);
+  if (want.subtitles && subtitles.length < want.subtitles) failures.push(`subtitle streams ${subtitles.length}, want ${want.subtitles}`);
+  if (want.hdr && video && video.color_transfer !== "smpte2084") failures.push(`transfer ${video.color_transfer || "none"}, want smpte2084`);
+  const bitrate = Number(probe.format.bit_rate || video?.bit_rate || 0);
+  const duration = Number(probe.format.duration || 0);
+  if (want.minDuration && duration < want.minDuration) failures.push(`duration ${duration.toFixed(1)}s, want >= ${want.minDuration}s`);
+  if (want.minBitrate && bitrate < want.minBitrate) failures.push(`bitrate ${(bitrate / 1e6).toFixed(1)} Mb/s, want >= ${(want.minBitrate / 1e6).toFixed(0)} Mb/s`);
+  if (failures.length) throw new Error(`${fixture.id}: ${failures.join("; ")}`);
+  return {
+    codec: video.codec_name,
+    dimensions: `${video.width}x${video.height}`,
+    audio: audio.map((stream) => stream.codec_name),
+    subtitles: subtitles.map((stream) => stream.codec_name),
+    duration_seconds: duration,
+    bitrate_mbps: Number((bitrate / 1e6).toFixed(1)),
+    size_mb: Number((Number(probe.format.size || 0) / 1e6).toFixed(1)),
+  };
+}
+
+async function buildFixtures(manifest, options) {
+  const directory = path.resolve(options.fixtures || DEFAULT_FIXTURE_DIR);
+  await fsp.mkdir(directory, { recursive: true });
+  const fixtures = fixtureMap(manifest);
+  const metadata = {};
+  for (const fixture of manifest.fixtures) {
+    const output = path.join(directory, fixture.filename);
+    let valid = false;
+    if (!options.rebuild && fs.existsSync(output)) {
+      try {
+        metadata[fixture.id] = verifyFixture(fixture, output);
+        valid = true;
+      } catch (error) {
+        process.stdout.write(`REBUILD ${fixture.id}: ${error.message}\n`);
+      }
+    }
+    if (!valid) {
+      process.stdout.write(`BUILD   ${fixture.id} — ${fixture.description}\n`);
+      const args = fixtureCommand(fixture, output, directory, fixtures);
+      await runProcess("ffmpeg", args, { quiet: true });
+      metadata[fixture.id] = verifyFixture(fixture, output);
+    }
+    const item = metadata[fixture.id];
+    process.stdout.write(
+      `PASS    ${fixture.id}: ${item.codec} ${item.dimensions} · ` +
+      `${item.bitrate_mbps} Mb/s · ${item.size_mb} MB\n`,
+    );
+  }
+  return { directory, metadata };
+}
+
+async function freePort() {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.unref();
+    server.on("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const port = server.address().port;
+      server.close(() => resolve(port));
+    });
+  });
+}
+
+async function stopChild(child, graceMs = 5_000) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) return;
+  const exited = new Promise((resolve) => child.once("exit", resolve));
+  child.kill("SIGTERM");
+  const graceful = await Promise.race([
+    exited.then(() => true),
+    new Promise((resolve) => setTimeout(() => resolve(false), graceMs)),
+  ]);
+  if (graceful || child.exitCode !== null || child.signalCode !== null) return;
+  child.kill("SIGKILL");
+  await Promise.race([exited, new Promise((resolve) => setTimeout(resolve, 2_000))]);
+}
+
+function tomlString(value) {
+  return JSON.stringify(String(value));
+}
+
+async function waitFor(check, timeoutMs, label, intervalMs = 250) {
+  const deadline = Date.now() + timeoutMs;
+  let lastError = null;
+  while (Date.now() < deadline) {
+    try {
+      const value = await check();
+      if (value) return value;
+    } catch (error) {
+      lastError = error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  throw new Error(`timed out waiting for ${label}${lastError ? `: ${lastError.message}` : ""}`);
+}
+
+async function api(baseUrl, route, { token, method = "GET", body, timeout = 30_000 } = {}) {
+  const headers = {};
+  if (token) headers.authorization = `Bearer ${token}`;
+  if (body !== undefined) headers["content-type"] = "application/json";
+  const response = await fetch(`${baseUrl}/api/v1${route}`, {
+    method,
+    headers,
+    body: body === undefined ? undefined : JSON.stringify(body),
+    signal: AbortSignal.timeout(timeout),
+  });
+  const text = await response.text();
+  let value = null;
+  if (text) {
+    try { value = JSON.parse(text); } catch (_) { value = text; }
+  }
+  if (!response.ok) {
+    const message = value && typeof value === "object" ? value.error : text;
+    throw new Error(`${method} ${route} -> ${response.status}${message ? `: ${message}` : ""}`);
+  }
+  return value;
+}
+
+async function startServer(options, fixtureDirectory) {
+  const port = await freePort();
+  const runtime = await fsp.mkdtemp(path.join(os.tmpdir(), "plurx-playback-lab-"));
+  const logFile = path.join(runtime, "plurxd.log");
+  let log = null;
+  let child = null;
+  try {
+  const dataDir = path.join(runtime, "data");
+  await fsp.mkdir(dataDir, { recursive: true });
+  const baseUrl = `http://127.0.0.1:${port}`;
+  const config = path.join(runtime, "plurx.toml");
+  await fsp.writeFile(config,
+    `[server]\nname = "plurx playback lab"\nbind = "127.0.0.1:${port}"\n\n` +
+    `[storage]\ndata_dir = ${tomlString(dataDir)}\n`, "utf8");
+  const serverBin = path.resolve(options.server || path.join(ROOT, "target", "debug", "plurxd"));
+  if (!fs.existsSync(serverBin)) {
+    if (options.server) throw new Error(`server binary does not exist: ${serverBin}`);
+    process.stdout.write("BUILD   plurxd debug binary\n");
+    await runProcess("cargo", ["build", "-p", "plurxd"], { quiet: false });
+  }
+  log = fs.createWriteStream(logFile, { flags: "a" });
+  child = spawn(serverBin, ["--config", config, "run"], {
+    cwd: ROOT,
+    env: { ...process.env, PLURX_LOG: options.server_log || "info" },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  child.stdout.pipe(log);
+  child.stderr.pipe(log);
+  let exited = null;
+  child.on("exit", (code, signal) => { exited = { code, signal }; });
+  child.on("error", (error) => { exited = { error }; });
+  await waitFor(async () => {
+    if (exited) throw exited.error || new Error(`plurxd exited ${exited.code ?? exited.signal}`);
+    const response = await fetch(`${baseUrl}/healthz`, { signal: AbortSignal.timeout(1000) });
+    return response.ok;
+  }, 60_000, "plurxd health");
+  const setup = await api(baseUrl, "/setup", {
+    method: "POST",
+    body: { username: "playback-lab", password: "playback-lab" },
+  });
+  const token = setup.token;
+  const library = await api(baseUrl, "/libraries", {
+    token,
+    method: "POST",
+    body: { name: "Playback lab", kind: "home", paths: [fixtureDirectory], anime: false },
+  });
+  await waitFor(async () => {
+    const statuses = await api(baseUrl, "/scan/status", { token });
+    const status = statuses[String(library.id)];
+    return status && !status.running && status.last_scan ? status : null;
+  }, 180_000, "fixture scan", 500);
+  const items = await api(baseUrl, `/libraries/${library.id}/items?limit=200&sort=title`, { token });
+  const files = new Map();
+  for (const item of items.items) {
+    const detail = await api(baseUrl, `/items/${item.id}`, { token });
+    for (const file of detail.files || []) files.set(file.filename, { ...file, item_id: item.id, title: item.title });
+  }
+  return {
+    runtime, dataDir, baseUrl, token, library, files, child, log, logFile,
+    async close(keep) {
+      await stopChild(child, 12_000);
+      log.end();
+      if (keep) process.stdout.write(`KEEP    runtime ${runtime}\n`);
+      else await fsp.rm(runtime, { recursive: true, force: true });
+    },
+  };
+  } catch (error) {
+    await stopChild(child, 2_000);
+    if (log) log.end();
+    const tail = fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8").slice(-4000) : "";
+    if (options.keep_runtime) process.stdout.write(`KEEP    failed runtime ${runtime}\n`);
+    else await fsp.rm(runtime, { recursive: true, force: true });
+    throw new Error(`${error.message}${tail ? `\n${tail}` : ""}`);
+  }
+}
+
+class CdpDriver {
+  constructor(options, baseUrl, runtime, browserName) {
+    this.options = options;
+    this.baseUrl = baseUrl;
+    this.runtime = runtime;
+    this.browserName = browserName;
+    this.pending = new Map();
+    this.nextId = 1;
+  }
+
+  async start() {
+    const executable = this.browserName === "edge"
+      ? findEdge(this.options.edge)
+      : findChrome(this.options.chrome);
+    if (!executable) {
+      const label = this.browserName === "edge" ? "Microsoft Edge" : "Chrome";
+      throw new Error(`${label} not found; run doctor or pass --${this.browserName} PATH`);
+    }
+    const profile = path.join(this.runtime, `${this.browserName}-profile`);
+    await fsp.mkdir(profile, { recursive: true });
+    const args = [
+      this.options.headed ? "" : "--headless=new",
+      "--remote-debugging-port=0",
+      `--user-data-dir=${profile}`,
+      "--no-first-run",
+      "--no-default-browser-check",
+      "--autoplay-policy=no-user-gesture-required",
+      "--disable-background-timer-throttling",
+      "--disable-backgrounding-occluded-windows",
+      "--disable-renderer-backgrounding",
+      "--disable-features=Translate,MediaRouter",
+      this.baseUrl,
+    ].filter(Boolean);
+    const logPath = path.join(this.runtime, "browser.log");
+    this.log = fs.createWriteStream(logPath, { flags: "a" });
+    this.child = spawn(executable, args, { stdio: ["ignore", "pipe", "pipe"] });
+    this.child.stdout.pipe(this.log);
+    let stderr = "";
+    this.child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+      this.log.write(chunk);
+    });
+    let exited = null;
+    this.child.on("exit", (code, signal) => { exited = { code, signal }; });
+    this.child.on("error", (error) => { exited = { error }; });
+    const devtools = await waitFor(async () => {
+      if (exited) throw exited.error || new Error(`browser exited ${exited.code ?? exited.signal}`);
+      const match = stderr.match(/DevTools listening on (ws:\/\/[^\s]+)/);
+      return match ? match[1] : null;
+    }, 30_000, `${this.browserName} DevTools`, 100);
+    const parsed = new URL(devtools);
+    const jsonBase = `http://${parsed.host}`;
+    const target = await waitFor(async () => {
+      const response = await fetch(`${jsonBase}/json/list`, { signal: AbortSignal.timeout(1000) });
+      const targets = await response.json();
+      return targets.find((candidate) => candidate.type === "page") || null;
+    }, 10_000, `${this.browserName} page target`);
+    this.ws = new WebSocket(target.webSocketDebuggerUrl);
+    await new Promise((resolve, reject) => {
+      this.ws.addEventListener("open", resolve, { once: true });
+      this.ws.addEventListener("error", reject, { once: true });
+    });
+    this.ws.addEventListener("message", (event) => {
+      const message = JSON.parse(event.data);
+      if (!message.id || !this.pending.has(message.id)) return;
+      const pending = this.pending.get(message.id);
+      this.pending.delete(message.id);
+      if (message.error) pending.reject(new Error(message.error.message));
+      else pending.resolve(message.result);
+    });
+    await this.send("Runtime.enable");
+    await this.send("Page.enable");
+    await this.send("Page.navigate", { url: this.baseUrl });
+    await waitFor(() => this.eval("document.readyState === 'complete'"), 20_000, "web app load");
+  }
+
+  send(method, params = {}) {
+    return new Promise((resolve, reject) => {
+      const id = this.nextId++;
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`CDP ${method} timed out`));
+      }, 60_000);
+      this.pending.set(id, {
+        resolve: (value) => { clearTimeout(timer); resolve(value); },
+        reject: (error) => { clearTimeout(timer); reject(error); },
+      });
+      this.ws.send(JSON.stringify({ id, method, params }));
+    });
+  }
+
+  async eval(expression) {
+    const result = await this.send("Runtime.evaluate", {
+      expression,
+      awaitPromise: true,
+      returnByValue: true,
+    });
+    if (result.exceptionDetails) {
+      const detail = result.exceptionDetails.exception?.description || result.exceptionDetails.text;
+      throw new Error(`browser evaluation failed: ${detail}`);
+    }
+    return result.result.value;
+  }
+
+  exec(script) {
+    return this.eval(`(async()=>{${script}})()`);
+  }
+
+  async reload() {
+    await this.send("Page.reload", { ignoreCache: true });
+    await waitFor(() => this.eval("document.readyState === 'complete'"), 20_000, "web app reload");
+  }
+
+  async startPlayback(fileId, title, durationMs) {
+    await this.exec(`play(${Number(fileId)}, ${JSON.stringify(title)}, 0, ${Number(durationMs || 0)}, null); return true;`);
+  }
+
+  async close() {
+    try {
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify({ id: this.nextId++, method: "Browser.close", params: {} }));
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+    } catch (_) {}
+    try { if (this.ws) this.ws.close(); } catch (_) {}
+    await stopChild(this.child);
+    if (this.log) this.log.end();
+  }
+}
+
+class SafariDriver {
+  constructor(options, baseUrl, runtime) {
+    this.options = options;
+    this.baseUrl = baseUrl;
+    this.runtime = runtime;
+  }
+
+  async wd(method, route, body) {
+    const response = await fetch(`http://127.0.0.1:${this.port}${route}`, {
+      method,
+      headers: body === undefined ? {} : { "content-type": "application/json" },
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal: AbortSignal.timeout(70_000),
+    });
+    const value = await response.json().catch(() => ({}));
+    if (!response.ok || value.value?.error) {
+      const error = value.value?.message || value.value?.error || `HTTP ${response.status}`;
+      throw new Error(`Safari WebDriver ${method} ${route}: ${error}`);
+    }
+    return value.value;
+  }
+
+  async start() {
+    if (!fs.existsSync("/usr/bin/safaridriver")) throw new Error("/usr/bin/safaridriver not found");
+    this.port = await freePort();
+    const logPath = path.join(this.runtime, "browser.log");
+    this.log = fs.createWriteStream(logPath, { flags: "a" });
+    this.child = spawn("/usr/bin/safaridriver", ["--port", String(this.port)], { stdio: ["ignore", "pipe", "pipe"] });
+    this.child.stdout.pipe(this.log);
+    this.child.stderr.pipe(this.log);
+    await waitFor(async () => {
+      try { await this.wd("GET", "/status"); return true; } catch (_) { return false; }
+    }, 15_000, "Safari WebDriver");
+    const session = await this.wd("POST", "/session", {
+      capabilities: { alwaysMatch: { browserName: "safari", acceptInsecureCerts: true } },
+    });
+    this.sessionId = session.sessionId || session.capabilities?.sessionId;
+    if (!this.sessionId) throw new Error("Safari WebDriver returned no session id");
+    await this.wd("POST", `/session/${this.sessionId}/timeouts`, { script: 60_000, pageLoad: 60_000 });
+    await this.wd("POST", `/session/${this.sessionId}/url`, { url: this.baseUrl });
+    await waitFor(() => this.eval("document.readyState === 'complete'"), 20_000, "Safari web app load");
+  }
+
+  exec(script, args = []) {
+    return this.wd("POST", `/session/${this.sessionId}/execute/sync`, { script, args });
+  }
+
+  eval(expression) {
+    return this.exec(`return (${expression});`);
+  }
+
+  async reload() {
+    await this.wd("POST", `/session/${this.sessionId}/refresh`, {});
+    await waitFor(() => this.eval("document.readyState === 'complete'"), 20_000, "Safari web app reload");
+  }
+
+  async startPlayback(fileId, title, durationMs) {
+    await this.exec(`
+      var old=document.getElementById('plurx-lab-start'); if(old) old.remove();
+      var button=document.createElement('button'); button.id='plurx-lab-start';
+      button.textContent='Start playback test';
+      button.style='position:fixed;z-index:99999;left:20px;top:20px;width:220px;height:80px';
+      button.onclick=function(){ play(arguments[0], arguments[1], 0, arguments[2], null); button.remove(); }.bind(null, arguments[0], arguments[1], arguments[2]);
+      document.body.appendChild(button); return true;
+    `, [Number(fileId), String(title), Number(durationMs || 0)]);
+    const element = await this.wd("POST", `/session/${this.sessionId}/element`, { using: "css selector", value: "#plurx-lab-start" });
+    const elementId = element[ELEMENT_KEY] || element.ELEMENT;
+    await this.wd("POST", `/session/${this.sessionId}/element/${elementId}/click`, {});
+  }
+
+  async close() {
+    try { if (this.sessionId) await this.wd("DELETE", `/session/${this.sessionId}`); } catch (_) {}
+    await stopChild(this.child);
+    if (this.log) this.log.end();
+  }
+}
+
+class FirefoxDriver {
+  constructor(options, baseUrl, runtime) {
+    this.options = options;
+    this.baseUrl = baseUrl;
+    this.runtime = runtime;
+  }
+
+  async wd(method, route, body) {
+    const response = await fetch(`http://127.0.0.1:${this.port}${route}`, {
+      method,
+      headers: body === undefined ? {} : { "content-type": "application/json" },
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal: AbortSignal.timeout(70_000),
+    });
+    const value = await response.json().catch(() => ({}));
+    if (!response.ok || value.value?.error) {
+      const error = value.value?.message || value.value?.error || `HTTP ${response.status}`;
+      throw new Error(`Firefox WebDriver ${method} ${route}: ${error}`);
+    }
+    return value.value;
+  }
+
+  async start() {
+    const firefox = findFirefox(this.options.firefox);
+    const geckodriver = findGeckodriver(this.options.geckodriver);
+    if (!firefox) throw new Error("Firefox not found; run doctor or pass --firefox PATH");
+    if (!geckodriver) throw new Error("geckodriver not found; install it on PATH or pass --geckodriver PATH");
+    this.port = await freePort();
+    const logPath = path.join(this.runtime, "browser.log");
+    this.log = fs.createWriteStream(logPath, { flags: "a" });
+    this.child = spawn(geckodriver, ["--port", String(this.port)], { stdio: ["ignore", "pipe", "pipe"] });
+    this.child.stdout.pipe(this.log);
+    this.child.stderr.pipe(this.log);
+    await waitFor(async () => {
+      try { await this.wd("GET", "/status"); return true; } catch (_) { return false; }
+    }, 15_000, "Firefox WebDriver");
+    const firefoxOptions = { binary: firefox };
+    if (!this.options.headed) firefoxOptions.args = ["-headless"];
+    const session = await this.wd("POST", "/session", {
+      capabilities: {
+        alwaysMatch: {
+          browserName: "firefox",
+          acceptInsecureCerts: true,
+          "moz:firefoxOptions": firefoxOptions,
+        },
+      },
+    });
+    this.sessionId = session.sessionId || session.capabilities?.sessionId;
+    if (!this.sessionId) throw new Error("Firefox WebDriver returned no session id");
+    await this.wd("POST", `/session/${this.sessionId}/timeouts`, { script: 60_000, pageLoad: 60_000 });
+    await this.wd("POST", `/session/${this.sessionId}/url`, { url: this.baseUrl });
+    await waitFor(() => this.eval("document.readyState === 'complete'"), 20_000, "Firefox web app load");
+  }
+
+  exec(script, args = []) {
+    return this.wd("POST", `/session/${this.sessionId}/execute/sync`, { script, args });
+  }
+
+  eval(expression) {
+    return this.exec(`return (${expression});`);
+  }
+
+  async reload() {
+    await this.wd("POST", `/session/${this.sessionId}/refresh`, {});
+    await waitFor(() => this.eval("document.readyState === 'complete'"), 20_000, "Firefox web app reload");
+  }
+
+  async startPlayback(fileId, title, durationMs) {
+    await this.exec(`
+      var old=document.getElementById('plurx-lab-start'); if(old) old.remove();
+      var button=document.createElement('button'); button.id='plurx-lab-start';
+      button.textContent='Start playback test';
+      button.style='position:fixed;z-index:99999;left:20px;top:20px;width:220px;height:80px';
+      button.onclick=function(){ play(arguments[0], arguments[1], 0, arguments[2], null); button.remove(); }.bind(null, arguments[0], arguments[1], arguments[2]);
+      document.body.appendChild(button); return true;
+    `, [Number(fileId), String(title), Number(durationMs || 0)]);
+    const element = await this.wd("POST", `/session/${this.sessionId}/element`, { using: "css selector", value: "#plurx-lab-start" });
+    const elementId = element[ELEMENT_KEY] || element.ELEMENT;
+    await this.wd("POST", `/session/${this.sessionId}/element/${elementId}/click`, {});
+  }
+
+  async close() {
+    try { if (this.sessionId) await this.wd("DELETE", `/session/${this.sessionId}`); } catch (_) {}
+    await stopChild(this.child);
+    if (this.log) this.log.end();
+  }
+}
+
+function qualityForce(quality) {
+  if (quality === "auto") return "auto";
+  if (quality === "original" || quality === "nomse") return "original";
+  return "transcode";
+}
+
+function playerSnapshotExpression() {
+  return `(()=>{
+    const p=(typeof PLAYER!=='undefined'&&PLAYER)||{};
+    const v=document.getElementById('video');
+    const h=p.hitches||{};
+    const q=(()=>{try{return v&&v.getVideoPlaybackQuality?v.getVideoPlaybackQuality():null}catch(e){return null}})();
+    const mediaError=v&&v.error?{code:v.error.code,message:v.error.message||null}:null;
+    return {
+      file_id:p.fileId||null, started:!!p.started, decided_method:p.decidedMethod||null,
+      method:p.method||null, copy_hls:!!p.copyHls, tried_fallback:!!p.triedFallback,
+      encoder:p.encoder||null, vod:!!p.vod, attempt_reason:p.attemptReason||null,
+      offset:Number(p.offset||0),
+      ttff_ms:p.ttffMs==null?null:p.ttffMs, stalls:p.stalls||0,
+      stalls_by_kind:p.stallsByKind||{supply:0,decode:0}, buffer_limits:p.bufferLimits||{},
+      hitches:{back:h.back||0,held:h.held||0,late:h.late||0,drop:h.drop||0,gap:h.gap||0,slow:h.slow||0,rate:h.rate==null?null:h.rate},
+      decode:p.decodeInfo||null, health:p.health||null,
+      source:p.source||null, audio_count:(p.audio||[]).length, subtitle_count:(p.subs||[]).length,
+      current_audio:p.curAudio==null?null:p.curAudio, current_subtitle:p.curSub==null?null:p.curSub,
+      video:{current_time:v?Number((v.currentTime||0).toFixed(3)):0,
+        absolute_time:v?Number(((p.offset||0)+(v.currentTime||0)).toFixed(3)):Number(p.offset||0),
+        duration:v&&isFinite(v.duration)?v.duration:null,
+        paused:v?!!v.paused:true,seeking:v?!!v.seeking:false,ended:v?!!v.ended:false,ready_state:v?v.readyState:0,
+        width:v?v.videoWidth:0,height:v?v.videoHeight:0,playback_rate:v?v.playbackRate:0,
+        runway:v&&typeof bufferRunway==='function'?bufferRunway(v):0,error:mediaError,
+        dropped:q?q.droppedVideoFrames:null,total:q?q.totalVideoFrames:null}
+    };
+  })()`;
+}
+
+async function prepareBrowser(driver, token) {
+  await driver.exec(`
+    localStorage.setItem('plurx_token', ${JSON.stringify(token)});
+    localStorage.setItem('plurx_autonext', '0');
+    localStorage.setItem('plurx_autoskip', '0');
+    localStorage.removeItem('plurx_decode_limits');
+    return true;
+  `);
+  await driver.reload();
+  await waitFor(() => driver.eval("typeof play === 'function' && typeof CAPS_Q === 'string'"), 30_000, "player code");
+  return driver.eval(`({browser:browserLabel(),user_agent:navigator.userAgent,caps:PLAY_CAPS,caps_q:CAPS_Q,
+    native_hls:useNativeHls(document.getElementById('video')),mse:!!(window.MediaSource&&window.Hls&&Hls.isSupported())})`);
+}
+
+async function setCasePreferences(driver, quality) {
+  await driver.exec(`
+    try{closePlayer()}catch(e){}
+    localStorage.setItem('plurx_quality', ${JSON.stringify(quality)});
+    localStorage.setItem('plurx_autonext', '0');
+    localStorage.setItem('plurx_autoskip', '0');
+    localStorage.removeItem('plurx_decode_limits');
+    return true;
+  `);
+}
+
+async function performOperation(driver, testCase, start) {
+  if (testCase.operation === "steady") return null;
+  if (testCase.operation === "seek") {
+    const duration = Number(start.source?.duration_ms || 0) / 1000;
+    const target = Math.max(5, Math.min(duration > 0 ? duration - 5 : 10, duration > 0 ? duration * 0.45 : 10));
+    await driver.exec(`seekTo(${target}); return true;`);
+    await waitFor(async () => {
+      const state = await driver.eval(playerSnapshotExpression());
+      return state.video.error || (state.started && !state.video.seeking && state.video.ready_state >= 2 &&
+        state.video.current_time > 0.1 && state.video.absolute_time >= target - 0.25) ? state : null;
+    }, 30_000, `seek to ${target.toFixed(1)}s`);
+    return { target_seconds: target };
+  }
+  if (testCase.operation === "audio-switch") {
+    if (start.audio_count < 2) throw new Error("fixture has fewer than two audio tracks");
+    await driver.exec("switchAudio(1); return true;");
+    await waitFor(async () => {
+      const state = await driver.eval(playerSnapshotExpression());
+      return state.video.error || (state.current_audio === 1 && state.attempt_reason === "audio" &&
+        state.started && state.video.ready_state >= 2 && state.video.current_time > 0.1) ? state : null;
+    }, 30_000, "alternate audio playback");
+    return { audio_index: 1 };
+  }
+  if (testCase.operation === "subtitle-toggle") {
+    if (start.subtitle_count < 1) throw new Error("fixture has no subtitle track");
+    await driver.exec("setSub(0); return true;");
+    await waitFor(async () => {
+      const state = await driver.eval(playerSnapshotExpression());
+      const showing = await driver.eval(`(()=>{const v=document.getElementById('video');return [...(v?v.textTracks:[])].some(t=>t.mode==='showing')})()`);
+      return state.current_subtitle === 0 && showing ? state : null;
+    }, 15_000, "text subtitle display");
+    return { subtitle_index: 0 };
+  }
+  throw new Error(`unknown operation ${testCase.operation}`);
+}
+
+function hitchTotal(snapshot) {
+  const h = snapshot.hitches || {};
+  return (h.back || 0) + (h.held || 0) + (h.late || 0) + (h.drop || 0) + (h.gap || 0);
+}
+
+function scoreCase(manifest, testCase, decision, start, end, elapsedSeconds) {
+  const thresholds = manifest.thresholds;
+  const errors = [];
+  const warnings = [];
+  if (end.video.error) errors.push(`media error ${end.video.error.code}: ${end.video.error.message || "unknown"}`);
+  if (!end.started) errors.push("player never reached a presented frame");
+  if (start.decided_method !== decision.method) {
+    errors.push(`player recorded decision ${start.decided_method}, API returned ${decision.method}`);
+  }
+  if (end.tried_fallback) errors.push("the selected direct/remux path was rejected and fell back to transcode");
+  const advanced = end.video.current_time - start.video.current_time;
+  const clockRate = elapsedSeconds > 0 ? advanced / elapsedSeconds : 0;
+  if (clockRate < thresholds.minimum_clock_rate) {
+    errors.push(`media clock advanced at ${clockRate.toFixed(3)}x, want >= ${thresholds.minimum_clock_rate.toFixed(2)}x`);
+  }
+  const hitches = Math.max(0, hitchTotal(end) - hitchTotal(start));
+  if (hitches > thresholds.maximum_hitches) errors.push(`${hitches} visible frame hitches, want <= ${thresholds.maximum_hitches}`);
+  const stalls = Math.max(0, (end.stalls || 0) - (start.stalls || 0));
+  if (stalls > thresholds.maximum_stalls) errors.push(`${stalls} stalls, want <= ${thresholds.maximum_stalls}`);
+  if (testCase.quality === "nomse" && end.copy_hls) errors.push("Original · one stream unexpectedly used copy-HLS");
+  if (["1080", "720", "480"].includes(testCase.quality)) {
+    const rung = Number(testCase.quality);
+    if (end.decided_method !== "transcode") errors.push(`${rung}p quality did not select a transcode verdict`);
+    if (end.video.height > rung) errors.push(`decoded height ${end.video.height} exceeds requested ${rung}p rung`);
+  }
+  if (end.ttff_ms === null) warnings.push("TTFF beacon was not populated");
+  if (end.decode && end.decode.supported === false) warnings.push("browser MediaCapabilities reports the decoded stream unsupported");
+  return {
+    status: errors.length ? "failed" : "passed",
+    errors,
+    warnings,
+    metrics: {
+      decision_method: decision.method,
+      delivery_mode: decision.delivery?.mode || null,
+      actual_method: end.method,
+      copy_hls: end.copy_hls,
+      encoder: end.encoder,
+      ttff_ms: end.ttff_ms,
+      observed_seconds: Number(elapsedSeconds.toFixed(3)),
+      clock_advanced_seconds: Number(advanced.toFixed(3)),
+      clock_rate: Number(clockRate.toFixed(3)),
+      hitches,
+      stalls,
+      stalls_by_kind: end.stalls_by_kind,
+      buffer_limits: end.buffer_limits,
+      decoded_dimensions: `${end.video.width}x${end.video.height}`,
+      runway_seconds: end.video.runway,
+      dropped_frames: end.video.dropped,
+      total_frames: end.video.total,
+      decode: end.decode,
+      server_health: end.health,
+    },
+  };
+}
+
+async function runOneCase(driver, server, manifest, fixture, testCase, browserInfo, observeOverride) {
+  const file = server.files.get(fixture.filename);
+  if (!file) throw new Error(`scanner did not return ${fixture.filename}`);
+  await setCasePreferences(driver, testCase.quality);
+  const decision = await api(server.baseUrl,
+    `/files/${file.id}/decision?${browserInfo.caps_q}&force=${qualityForce(testCase.quality)}`,
+    { token: server.token });
+  const startedAt = Date.now();
+  await driver.startPlayback(file.id, file.title || fixture.id, file.duration_ms || 0);
+  let start;
+  try {
+    start = await waitFor(async () => {
+      const state = await driver.eval(playerSnapshotExpression());
+      if (state.video.error) return state;
+      return state.file_id === file.id && state.started && state.video.ready_state >= 2 && state.video.current_time > 0
+        ? state : null;
+    }, manifest.thresholds.start_timeout_seconds * 1000, "first presented frame", 250);
+  } catch (error) {
+    const end = await driver.eval(playerSnapshotExpression()).catch(() => null);
+    return {
+      name: testCase.name, fixture: fixture.id, quality: testCase.quality, operation: testCase.operation,
+      status: "failed", duration_ms: Date.now() - startedAt,
+      errors: [error.message], warnings: [], decision, start: null, end,
+    };
+  }
+  if (start.video.error) {
+    return {
+      name: testCase.name, fixture: fixture.id, quality: testCase.quality, operation: testCase.operation,
+      status: "failed", duration_ms: Date.now() - startedAt,
+      errors: [`media error ${start.video.error.code}: ${start.video.error.message || "unknown"}`], warnings: [], decision, start, end: start,
+    };
+  }
+  let operation = null;
+  try {
+    operation = await performOperation(driver, testCase, start);
+    if (operation) start = await driver.eval(playerSnapshotExpression());
+  } catch (error) {
+    const end = await driver.eval(playerSnapshotExpression()).catch(() => start);
+    return {
+      name: testCase.name, fixture: fixture.id, quality: testCase.quality, operation: testCase.operation,
+      status: "failed", duration_ms: Date.now() - startedAt,
+      errors: [`${testCase.operation}: ${error.message}`], warnings: [], decision, start, end,
+    };
+  }
+  const observeSeconds = Number(observeOverride || manifest.thresholds.observe_seconds);
+  const wallStart = performance.now();
+  await new Promise((resolve) => setTimeout(resolve, observeSeconds * 1000));
+  const elapsedSeconds = (performance.now() - wallStart) / 1000;
+  const end = await driver.eval(playerSnapshotExpression());
+  const score = scoreCase(manifest, testCase, decision, start, end, elapsedSeconds);
+  return {
+    name: testCase.name,
+    fixture: fixture.id,
+    quality: testCase.quality,
+    operation: testCase.operation,
+    status: score.status,
+    duration_ms: Date.now() - startedAt,
+    errors: score.errors,
+    warnings: score.warnings,
+    metrics: score.metrics,
+    operation_detail: operation,
+    decision,
+    start,
+    end,
+  };
+}
+
+function xmlEscape(value) {
+  return String(value).replaceAll("&", "&amp;").replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&apos;");
+}
+
+function junit(report) {
+  const failures = report.results.filter((result) => result.status !== "passed").length;
+  const totalSeconds = report.results.reduce((sum, result) => sum + result.duration_ms, 0) / 1000;
+  const cases = report.results.map((result) => {
+    const failure = result.status === "passed" ? "" :
+      `<failure message="${xmlEscape(result.errors.join("; "))}">${xmlEscape(JSON.stringify(result, null, 2))}</failure>`;
+    const output = xmlEscape(JSON.stringify({ metrics: result.metrics, warnings: result.warnings }, null, 2));
+    return `  <testcase classname="playback.${xmlEscape(report.browser.browser)}" name="${xmlEscape(result.name)}" time="${(result.duration_ms / 1000).toFixed(3)}">${failure}<system-out>${output}</system-out></testcase>`;
+  }).join("\n");
+  return `<?xml version="1.0" encoding="UTF-8"?>\n<testsuite name="plurx playback ${xmlEscape(report.suite)}" tests="${report.results.length}" failures="${failures}" time="${totalSeconds.toFixed(3)}">\n${cases}\n</testsuite>\n`;
+}
+
+async function writeReport(report, options) {
+  await fsp.mkdir(DEFAULT_REPORT_DIR, { recursive: true });
+  const stamp = new Date().toISOString().replaceAll(":", "-").replace(/\.\d{3}Z$/, "Z");
+  const stem = path.join(DEFAULT_REPORT_DIR, `${stamp}-${report.browser.browser.toLowerCase()}-${report.suite}`);
+  const jsonPath = path.resolve(options.json || `${stem}.json`);
+  const junitPath = path.resolve(options.junit || `${stem}.xml`);
+  await fsp.mkdir(path.dirname(jsonPath), { recursive: true });
+  await fsp.mkdir(path.dirname(junitPath), { recursive: true });
+  await fsp.writeFile(jsonPath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
+  await fsp.writeFile(junitPath, junit(report), "utf8");
+  return { jsonPath, junitPath };
+}
+
+async function runSuite(manifest, options) {
+  const suite = options.suite || "smoke";
+  const browserName = options.browser || "chrome";
+  if (!new Set(["chrome", "safari", "edge", "firefox"]).has(browserName)) {
+    throw new Error(`unknown browser ${browserName}; choose chrome, safari, edge, or firefox`);
+  }
+  if (options.observe !== undefined && !(Number(options.observe) > 0)) {
+    throw new Error("--observe must be a positive number of seconds");
+  }
+  const plan = printPlan(manifest, suite, options.case);
+  process.stdout.write("\n");
+  const corpus = await buildFixtures(manifest, options);
+  process.stdout.write("\nSTART   isolated plurx server\n");
+  const server = await startServer(options, corpus.directory);
+  const missing = manifest.fixtures.filter((fixture) => !server.files.has(fixture.filename));
+  if (missing.length) {
+    await server.close(options.keep_runtime);
+    throw new Error(`scan missed fixtures: ${missing.map((fixture) => fixture.filename).join(", ")}`);
+  }
+  let driver;
+  if (browserName === "safari") {
+    driver = new SafariDriver(options, server.baseUrl, server.runtime);
+  } else if (browserName === "firefox") {
+    driver = new FirefoxDriver(options, server.baseUrl, server.runtime);
+  } else {
+    driver = new CdpDriver(options, server.baseUrl, server.runtime, browserName);
+  }
+  let browserInfo;
+  const results = [];
+  try {
+    process.stdout.write(`START   ${browserName} player\n`);
+    await driver.start();
+    browserInfo = await prepareBrowser(driver, server.token);
+    const system = await api(server.baseUrl, "/system", { token: server.token });
+    process.stdout.write(`CAPS    ${browserInfo.browser}: video=${browserInfo.caps.vcodec} · audio=${browserInfo.caps.acodec} · hdr=${browserInfo.caps.hdr} · native_hls=${browserInfo.native_hls}\n\n`);
+    for (let index = 0; index < plan.cases.length; index += 1) {
+      const testCase = plan.cases[index];
+      const fixture = plan.fixtures.get(testCase.fixture);
+      process.stdout.write(`CASE    ${String(index + 1).padStart(2)}/${plan.cases.length} ${testCase.name}\n`);
+      const caseLogStart = Date.now();
+      let result;
+      try {
+        result = await runOneCase(driver, server, manifest, fixture, testCase, browserInfo, options.observe);
+      } catch (error) {
+        result = {
+          name: testCase.name, fixture: fixture.id, quality: testCase.quality, operation: testCase.operation,
+          status: "failed", duration_ms: 0, errors: [error.message], warnings: [],
+        };
+      } finally {
+        // A timeout can leave native HLS or a transcode session attached to the
+        // video element. Close it, then make a fresh page the case boundary so
+        // WebKit media state cannot turn one real failure into a false cascade.
+        await driver.exec("try{closePlayer()}catch(e){} return true;").catch(() => {});
+        if (index + 1 < plan.cases.length) {
+          await driver.reload();
+          await waitFor(
+            () => driver.eval("typeof play === 'function' && typeof CAPS_Q === 'string'"),
+            30_000,
+            `${browserName} player reset`,
+          );
+        }
+      }
+      try {
+        const logs = await api(server.baseUrl, "/system/logs?level=trace&limit=500", { token: server.token });
+        result.server_logs = logs.filter((entry) => entry.ts_ms >= caseLogStart - 100);
+        result.diagnostics = result.server_logs
+          .filter((entry) => entry.level === "ERROR" || entry.level === "WARN")
+          .filter((entry) => !(entry.target === "plurxd::client" && entry.message.includes("] ttff ")))
+          .slice(-8);
+      } catch (_) {
+        result.server_logs = [];
+        result.diagnostics = [];
+      }
+      results.push(result);
+      if (result.status === "passed") {
+        const m = result.metrics;
+        process.stdout.write(`PASS         ${m.decision_method} -> ${m.actual_method}${m.copy_hls ? " / copy-HLS" : ""} · TTFF ${m.ttff_ms ?? "?"} ms · clock ${m.clock_rate.toFixed(3)}x · hitches ${m.hitches} · stalls ${m.stalls}\n`);
+      } else {
+        process.stdout.write(`FAIL         ${result.errors.join("; ")}\n`);
+        for (const diagnostic of result.diagnostics.slice(-5)) {
+          process.stdout.write(`SERVER       ${diagnostic.level} ${diagnostic.target}: ${diagnostic.message}\n`);
+        }
+      }
+    }
+    const passed = results.filter((result) => result.status === "passed").length;
+    const report = {
+      schema_version: 1,
+      generated_at: new Date().toISOString(),
+      suite,
+      browser: browserInfo,
+      server: {
+        base_url: server.baseUrl,
+        version: system.version,
+        build: system.build,
+        ffmpeg_version: system.ffmpeg_version,
+        encoder_selected: system.encoder_selected,
+        tone_map: system.tone_map,
+      },
+      corpus: corpus.metadata,
+      summary: { total: results.length, passed, failed: results.length - passed },
+      results,
+    };
+    const paths = await writeReport(report, options);
+    process.stdout.write(`\nRESULT  ${passed}/${results.length} passed\n`);
+    process.stdout.write(`JSON    ${paths.jsonPath}\n`);
+    process.stdout.write(`JUNIT   ${paths.junitPath}\n`);
+    if (passed !== results.length) process.exitCode = 1;
+  } finally {
+    await driver.close().catch(() => {});
+    await server.close(options.keep_runtime);
+  }
+}
+
+async function main() {
+  const { command, options } = parseArgs(process.argv.slice(2));
+  if (command === "help" || command === "--help" || command === "-h") {
+    usage();
+    return;
+  }
+  const manifest = loadManifest();
+  if (command === "doctor") doctor(options);
+  else if (command === "fixtures") await buildFixtures(manifest, options);
+  else if (command === "plan") printPlan(manifest, options.suite || "smoke", options.case);
+  else if (command === "run") await runSuite(manifest, options);
+  else throw new Error(`unknown command ${command}`);
+}
+
+main().catch((error) => {
+  process.stderr.write(`playback-lab: ${error.stack || error.message}\n`);
+  process.exitCode = 1;
+});

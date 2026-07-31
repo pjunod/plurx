@@ -1,0 +1,204 @@
+# Playback testing — turn playback failures into a reproducible matrix
+
+Companion to [PLAYBACK.md](PLAYBACK.md) (how a file becomes a stream) and
+[STUTTER-4K.md](STUTTER-4K.md) (the measured 4K investigation) — this is how
+you exercise those paths automatically and read the result.
+
+The playback lab generates a deterministic media corpus, boots a new isolated
+plurx server, scans the corpus through the real library API, and drives the
+shipped web player in a real browser. It does not touch your normal database or
+media. One run produces a human summary, a detailed JSON report, and JUnit XML.
+
+## The harness tests four layers, because "did it play?" is not a diagnosis
+
+```text
+ cases.json ──▶ ffmpeg corpus ──▶ isolated plurxd ──▶ shipped web player
+      │                │                 │                    │
+      │                ├─ ffprobe shape  ├─ decision          ├─ first frame
+      │                └─ real codecs    ├─ remux/transcode   ├─ media clock
+      │                                  └─ HLS/progressive   ├─ stalls/hitches
+      └─ source × quality × operation                         └─ fallback/decode
+```
+
+The split is load-bearing. Pure Rust tests already prove the decision engine
+and ffmpeg argument builders without a browser. The playback lab proves that
+the resulting bytes make it through the selected transport and become frames.
+When a case fails, its report keeps the API verdict, actual player method,
+session health, browser capabilities, and server warnings together.
+
+## Run it
+
+Node 22+ and `ffmpeg`/`ffprobe` are lab prerequisites; they are not new plurxd
+runtime dependencies. Chrome and Edge need no separate driver. Safari uses the
+`safaridriver` included with macOS. Firefox needs `geckodriver` on `PATH` (or
+passed with `--geckodriver`); it adds no package to plurx or the harness.
+
+```bash
+make playback-doctor       # check codecs, filters, browser, and the debug server
+make playback-fixtures     # build + ffprobe the corpus; cached under target/
+make playback-smoke        # 11 risk-weighted Chrome cases, about 2–4 minutes
+make playback-full         # 44 Chrome cases: every fixture × quality + restarts
+
+# Safari: first enable Develop → Allow Remote Automation in Safari.
+# macOS may also require you to run `safaridriver --enable` once yourself.
+scripts/playback-lab doctor --browser safari
+make playback-smoke-safari
+
+# Optional engine coverage. Missing browsers produce a clear diagnostic.
+scripts/playback-lab doctor --browser edge
+make playback-smoke-edge
+scripts/playback-lab doctor --browser firefox
+make playback-smoke-firefox
+
+# Tight loop while fixing one path. Matching is case-insensitive substring.
+scripts/playback-lab run --suite smoke --case "2160 :: original" --observe 8
+```
+
+The harness binds a loopback port and launches a browser. Sandboxed agent or CI
+environments must explicitly allow those two local actions. It makes no network
+request outside the machine. Each case begins on a freshly loaded player page;
+a failed native-HLS or transcode session therefore cannot poison later results.
+
+## The matrix is broad on purpose, but not a blind Cartesian product
+
+[`tests/playback/cases.json`](../tests/playback/cases.json) is the reviewable
+test contract. The smoke suite covers each verdict, the three costly 4K
+transport choices, and every restart class. The full suite adds the complete
+source × quality product, then targeted operations where they are meaningful.
+
+| Axis | Values exercised |
+|---|---|
+| Verdict | direct play · remux · transcode |
+| Transport | native file/range · progressive fMP4 · copy-video HLS · transcode HLS |
+| Video | H.264 · HEVC Main 10 HDR · VP9 · unsupported MPEG-4 Part 2 |
+| Audio | AAC · AC-3 · Opus · MP3 · multi-track switch |
+| Container | MP4 · MKV · WebM · AVI |
+| Resolution | 720p · 1080p · 2160p |
+| Quality | Auto · Original · Original one-stream · 1080p · 720p · 480p |
+| Operation | cold play · seek/restart · audio switch · text-subtitle toggle |
+| Browser state | reported codecs · HDR display · MSE · native HLS |
+
+Running every operation against every source adds minutes without adding a new
+path: toggling a subtitle on a file with no subtitle cannot teach us anything.
+The manifest therefore uses a full product for source × quality and explicit
+cases for applicable operations. Add a case when a failure introduces a new
+branch; do not multiply the suite merely because another axis exists.
+
+## The corpus makes each intended branch true
+
+| Fixture | Why it exists |
+|---|---|
+| `direct-h264-aac-1080.mp4` | Browser baseline: H.264 + AAC + MP4 should direct-play. |
+| `remux-h264-multitrack-1080.mkv` | Container remux with two audio codecs and a text subtitle; owns seek/audio/subtitle restarts. |
+| `transcode-mpeg4-mp3-720.avi` | Unsupported video codec forces a real video transcode. |
+| `direct-vp9-opus-720.webm` | Non-MP4 direct path where this browser reports VP9 + Opus. |
+| `hevc-hdr-open-gop-2160.mkv` | 3840×2160 · 10-bit PQ/BT.2020 · open GOP · approximately 48 Mb/s, above the 40 Mb/s segmented-remux floor. |
+
+Generation is cached. Every invocation still runs `ffprobe` and rejects a file
+whose codec, streams, dimensions, HDR tags, duration, or critical bitrate no
+longer match. That guard prevents a fast-compressing synthetic 4K clip from
+quietly falling below the routing threshold and "passing" the wrong path.
+
+The 4K file is about 108 MB; the whole corpus is about 195 MB under
+`target/playback-lab/fixtures/`, which Git ignores. `--rebuild` regenerates it.
+
+## A pass means continuous presentation, not just an HTTP 200
+
+After the first presented frame, the default observation window is 8 seconds.
+A case fails on any of these:
+
+- no first frame within 30 seconds;
+- an `HTMLMediaElement` error;
+- media-clock progress below 0.90× wall time;
+- more than two visible hitches in the window;
+- any supply or decode stall;
+- a direct/remux path rejected by the browser and rescued by fallback;
+- a quality rung decoding above its requested height;
+- `Original · one stream` accidentally using copy-HLS.
+
+**How to read it:** a fallback is a failure even when the rescue transcode
+plays. The viewer got pixels, but the requested path broke — exactly the Safari
+failure that once turned a 4K remux into a 720p transcode. TTFF, runway, dropped
+frames, `MediaCapabilities`, encoder, and server-ahead health are recorded but
+not all are hard gates yet; promote a number to a gate only after it is stable
+across the target hardware.
+
+## Reports keep enough evidence to reproduce the failing layer
+
+Reports land in `target/playback-lab/reports/`:
+
+- `*.json` contains the corpus probes · browser capabilities · server build and
+  ffmpeg · full decision and player snapshots · case-local server logs;
+- `*.xml` is JUnit, ready for CI artifact and test-result ingestion.
+
+The console is the shortest reading path:
+
+```text
+PASS  remux -> remux / copy-HLS · TTFF 563 ms · clock 0.974x · hitches 0 · stalls 0
+FAIL  timed out waiting for first presented frame
+SERVER WARN plurxd::transcode: transcode ffmpeg: No such filter: 'zscale'
+```
+
+The first line proves the expensive 4K video stayed on the copy path. The next
+two isolate a missing first frame to the server's tone-map command rather than
+to browser decode. Use the JSON when the one-line cause is not enough.
+
+## Browser and device coverage is a pool, not one pretend-universal browser
+
+**Chrome and Edge:** these are separate explicit targets, both driven through
+the browser's built-in DevTools protocol. They run headless unless `--headed`
+is passed and need no downloaded driver. Chrome never silently substitutes
+Edge, or vice versa, so a green browser name means that browser actually ran.
+
+**Safari:** `--browser safari` uses macOS's built-in WebDriver and performs a
+real element click to satisfy autoplay policy. It is headed because Safari has
+no production-equivalent headless mode. Run this on the Mac whose HEVC/HDR
+pipeline you care about.
+
+**Firefox:** `--browser firefox` uses Mozilla's small `geckodriver` bridge and
+runs headless unless `--headed` is passed. Like Safari, it starts playback with
+a real element click instead of weakening the browser's autoplay policy. This
+target is optional: if Firefox or `geckodriver` is absent, only the Firefox run
+is unavailable; the required Chrome and Safari commands are unaffected.
+
+**Native Apple/Android clients:** not covered by this first slice. Their player
+engines and passthrough rules are not the web player's, so pretending a browser
+test covers them would be worse than an honest gap. Reuse the same corpus and
+result schema when device adapters land; keep the browser-reported capability
+block as a device-reported capability block.
+
+Container Chromium without proprietary decoders remains useful as a negative
+control, not as 4K proof. [STUTTER-4K.md](STUTTER-4K.md#6-the-harnesses) records
+the scar: that browser cannot validate H.264, HEVC, or AAC.
+
+## Add a regression without turning the suite into a junk drawer
+
+1. Reproduce the failure on a corpus fixture. If no fixture has the relevant
+   codec/container/GOP/subtitle shape, add one builder in
+   [`scripts/playback-lab`](../scripts/playback-lab) and its exact probe
+   contract beside the existing builders.
+2. Add the smallest case to `smoke.cases` that would have failed before the
+   fix. Add broader combinations to `full` only when they exercise distinct
+   delivery or restart behavior.
+3. Run the case by substring, then the smoke suite. Keep its JSON report with
+   the investigation until the failure is understood.
+4. Run `make check`; the browser suite supplements the Rust gate and does not
+   replace it.
+
+Real commercial-media clips should stay outside Git. A sanitized or synthetic
+reproducer belongs in the corpus only when redistribution is safe and its
+probe contract is stable.
+
+## Non-goals — what this first harness deliberately does not claim
+
+- **No exhaustive codec-profile proof.** H.264 and HEVC each contain more
+  profiles, levels, reference-frame patterns, and vendor quirks than a small
+  generated corpus can represent.
+- **No WAN or congested-Wi-Fi simulation.** This is a correctness and local
+  performance harness. Network shaping is a separate fault-injection layer.
+- **No visual-quality oracle yet.** It detects presentation failure, cadence,
+  size, and fallback; it does not score banding, color accuracy, or subtitle
+  placement from screenshots.
+- **No live-library mutation.** Every run owns a new database and scratch
+  directory, because a QC tool must not alter watch state or caches in the
+  server you actually use.

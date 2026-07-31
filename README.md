@@ -30,7 +30,8 @@ for running it day to day and reading every status and log line it shows you, wi
 decisions (why one binary clusters without external infra), and
 [docs/PLAYBACK.md](docs/PLAYBACK.md) traces the end-to-end path a file takes to
 become a stream — every direct/remux/transcode fork and the per-browser
-transport choice behind it, with
+transport choice behind it. [docs/PLAYBACK-TESTING.md](docs/PLAYBACK-TESTING.md)
+turns that map into an automated source × quality × operation matrix, with
 [docs/STUTTER-4K.md](docs/STUTTER-4K.md) as the open investigation into the one
 fork that misbehaves: what is already ruled out and the experiment that ruled it
 out, so the next attempt starts where the last one stopped. If you run plurx
@@ -181,6 +182,7 @@ git clone https://github.com/pjunod/plurx && cd plurx
 make run          # build + serve http://localhost:32400  (cargo run -p plurxd)
 make check        # fmt-check + clippy + test — the CI gate, the single quality bar
 make hooks        # install a pre-commit hook that runs `make check` before each commit
+make playback-smoke # real-browser matrix; Chrome default, Safari/Edge/Firefox targets available
 ```
 
 Everything goes through the `Makefile`; `make` with no target lists them all
@@ -224,6 +226,7 @@ live, filterable log viewer. Full guide: [docs/OPERATIONS.md](docs/OPERATIONS.md
 | [`crates/plurx-core`](crates/plurx-core) | Domain model · the `Store` trait · scanner · metadata agents · playback decision engine |
 | [`crates/plurxd`](crates/plurxd) | The HTTP daemon (axum) · transcode orchestrator · the embedded single-file web app |
 | [`crates/plurx-compat-plex`](crates/plurx-compat-plex) | Plex Media Server API façade + GDM discovery responder |
+| [`tests/playback`](tests/playback) | Synthetic playback corpus contract · smoke/full source × quality × operation matrix |
 | [`docs/`](docs) | Architecture · playback · features · operations · cheat sheet · requirements · roadmap · clients |
 | [`deploy/`](deploy) | Docker/Compose, systemd unit, macOS launchd agent, and Unraid templates |
 

@@ -1,0 +1,96 @@
+{
+  "schema_version": 1,
+  "thresholds": {
+    "start_timeout_seconds": 30,
+    "observe_seconds": 8,
+    "minimum_clock_rate": 0.9,
+    "maximum_hitches": 2,
+    "maximum_stalls": 0
+  },
+  "qualities": [
+    "auto",
+    "original",
+    "nomse",
+    "1080",
+    "720",
+    "480"
+  ],
+  "fixtures": [
+    {
+      "id": "direct-h264-aac-1080",
+      "filename": "direct-h264-aac-1080.mp4",
+      "builder": "h264_aac_mp4",
+      "description": "1080p H.264 + AAC in MP4; the baseline direct-play path",
+      "tags": ["direct", "h264", "aac", "mp4", "1080p", "sdr", "seek"]
+    },
+    {
+      "id": "remux-h264-multitrack-1080",
+      "filename": "remux-h264-multitrack-1080.mkv",
+      "builder": "h264_multitrack_mkv",
+      "depends_on": "direct-h264-aac-1080",
+      "description": "1080p H.264 in MKV with AAC + AC-3 audio and SRT subtitles",
+      "tags": ["remux", "h264", "aac", "ac3", "mkv", "1080p", "sdr", "seek", "audio-switch", "subtitle-toggle"]
+    },
+    {
+      "id": "transcode-mpeg4-mp3-720",
+      "filename": "transcode-mpeg4-mp3-720.avi",
+      "builder": "mpeg4_mp3_avi",
+      "description": "720p MPEG-4 Part 2 + MP3 in AVI; an intentional video transcode",
+      "tags": ["transcode", "mpeg4", "mp3", "avi", "720p", "sdr", "seek"]
+    },
+    {
+      "id": "direct-vp9-opus-720",
+      "filename": "direct-vp9-opus-720.webm",
+      "builder": "vp9_opus_webm",
+      "description": "720p VP9 + Opus in WebM; direct where the browser reports support",
+      "tags": ["direct", "vp9", "opus", "webm", "720p", "sdr", "seek"]
+    },
+    {
+      "id": "hevc-hdr-open-gop-2160",
+      "filename": "hevc-hdr-open-gop-2160.mkv",
+      "builder": "hevc_hdr_open_gop_mkv",
+      "description": "High-bitrate 4K 10-bit HEVC HDR open-GOP MKV; copy-HLS, progressive-remux, and tone-map stress case",
+      "tags": ["remux", "transcode", "hevc", "aac", "mkv", "2160p", "hdr", "high-bitrate", "open-gop", "seek"]
+    }
+  ],
+  "suites": {
+    "smoke": {
+      "cases": [
+        {"fixture": "direct-h264-aac-1080", "quality": "auto", "operation": "steady"},
+        {"fixture": "remux-h264-multitrack-1080", "quality": "auto", "operation": "steady"},
+        {"fixture": "transcode-mpeg4-mp3-720", "quality": "auto", "operation": "steady"},
+        {"fixture": "direct-vp9-opus-720", "quality": "auto", "operation": "steady"},
+        {"fixture": "hevc-hdr-open-gop-2160", "quality": "auto", "operation": "steady"},
+        {"fixture": "hevc-hdr-open-gop-2160", "quality": "original", "operation": "steady"},
+        {"fixture": "hevc-hdr-open-gop-2160", "quality": "nomse", "operation": "steady"},
+        {"fixture": "hevc-hdr-open-gop-2160", "quality": "1080", "operation": "steady"},
+        {"fixture": "remux-h264-multitrack-1080", "quality": "auto", "operation": "seek"},
+        {"fixture": "remux-h264-multitrack-1080", "quality": "auto", "operation": "audio-switch"},
+        {"fixture": "remux-h264-multitrack-1080", "quality": "auto", "operation": "subtitle-toggle"}
+      ]
+    },
+    "full": {
+      "cross_product": {
+        "fixtures": "all",
+        "qualities": "all",
+        "operation": "steady"
+      },
+      "cases": [
+        {"fixture": "direct-h264-aac-1080", "quality": "auto", "operation": "seek"},
+        {"fixture": "remux-h264-multitrack-1080", "quality": "auto", "operation": "seek"},
+        {"fixture": "remux-h264-multitrack-1080", "quality": "nomse", "operation": "seek"},
+        {"fixture": "remux-h264-multitrack-1080", "quality": "720", "operation": "seek"},
+        {"fixture": "transcode-mpeg4-mp3-720", "quality": "auto", "operation": "seek"},
+        {"fixture": "hevc-hdr-open-gop-2160", "quality": "auto", "operation": "seek"},
+        {"fixture": "hevc-hdr-open-gop-2160", "quality": "original", "operation": "seek"},
+        {"fixture": "hevc-hdr-open-gop-2160", "quality": "nomse", "operation": "seek"},
+        {"fixture": "hevc-hdr-open-gop-2160", "quality": "1080", "operation": "seek"},
+        {"fixture": "remux-h264-multitrack-1080", "quality": "auto", "operation": "audio-switch"},
+        {"fixture": "remux-h264-multitrack-1080", "quality": "nomse", "operation": "audio-switch"},
+        {"fixture": "remux-h264-multitrack-1080", "quality": "720", "operation": "audio-switch"},
+        {"fixture": "remux-h264-multitrack-1080", "quality": "auto", "operation": "subtitle-toggle"},
+        {"fixture": "remux-h264-multitrack-1080", "quality": "nomse", "operation": "subtitle-toggle"}
+      ]
+    }
+  }
+}
