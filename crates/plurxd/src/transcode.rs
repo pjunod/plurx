@@ -1500,16 +1500,19 @@ impl TranscodeManager {
             start_seconds,
             tone_map: tone_map_pref(),
             // The node proved a graph; this session may still not be entitled
-            // to it (HLG, Dolby Vision, a burned subtitle of either kind, a
-            // light source, an encoder it cannot feed). Deciding once, here,
+            // to it (HLG, non-compatible Dolby Vision, a burned TEXT subtitle,
+            // a light source, an encoder it cannot feed). Deciding once, here,
             // is what keeps the log line honest — `pipeline=` is what actually
-            // ran, not what the box is capable of.
+            // ran, not what the box is capable of. Routed by `routing_hdr`
+            // rather than the raw column: a DV base layer that is
+            // HDR10-compatible is an hdr10 stream to a tone-map, and a bitmap
+            // burn keeps the GPU graph (it downloads once for the composite).
             pipeline: Pipeline::for_session(
                 self.pipeline,
                 encoder,
-                file.hdr.as_deref(),
+                transcode::routing_hdr(file),
                 transcode::heavy_source(file),
-                subtitle_burn.is_some(),
+                subtitle_burn.as_ref().is_some_and(|b| !b.bitmap),
             ),
             subtitle_burn,
             // Only where the startup probe proved this build takes it. A
@@ -2428,9 +2431,9 @@ impl TranscodeManager {
         let declined = Pipeline::declined(
             self.pipeline,
             encoder,
-            file.hdr.as_deref(),
+            transcode::routing_hdr(&file),
             transcode::heavy_source(&file),
-            opts.subtitle_burn.is_some(),
+            opts.subtitle_burn.as_ref().is_some_and(|b| !b.bitmap),
         );
         tracing::info!(
             %session_id, encoder = encoder.label(), pipeline = opts.pipeline.name(),

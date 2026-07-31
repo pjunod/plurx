@@ -543,10 +543,12 @@ pub struct ItemPage {
 /// What a library is actually made of, in the terms the transcoder cares about.
 ///
 /// Exists to answer a question PERF-PLAN §5 could not. The GPU tone-map passed
-/// its probe at ~5× the CPU chain, but it is declined outright for Dolby
-/// Vision — the vendor filter cannot read the dynamic metadata. "The graph is
-/// accepted" and "the graph helps *this* library" are different claims, and
-/// only a census of what is on disk settles the second.
+/// its probe at ~5× the CPU chain, but it is declined for Dolby Vision with
+/// no HDR10-compatible base layer — the vendor filter cannot read the dynamic
+/// metadata, and only a compatible base gives it plain PQ it can map (see
+/// `transcode::routing_hdr`). "The graph is accepted" and "the graph helps
+/// *this* library" are different claims, and only a census of what is on disk
+/// settles the second.
 ///
 /// Counts, deliberately, not a list. Nobody needs to know which files; they
 /// need to know whether the 4K HDR they own is mostly the kind the fast path

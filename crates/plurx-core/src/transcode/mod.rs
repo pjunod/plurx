@@ -480,13 +480,34 @@ fn video_filters(source: &MediaFile, opts: &TranscodeOptions, source_path: &str)
     // A GPU pipeline owns scale and tone-map together: they are one pass on
     // the video-processing block, and splitting them would put the download
     // this exists to remove back in the middle. It is only ever selected for
-    // sessions it can handle — `effective_pipeline` has already routed HLG,
-    // Dolby Vision and burned text subtitles to the CPU chain.
-    if let Some(gpu) = opts
-        .pipeline
-        .filters(opts.target_height, source.hdr.as_deref())
-    {
-        chain.push(gpu);
+    // sessions it can handle — `Pipeline::for_session` has already routed
+    // HLG, unsupported Dolby Vision and burned TEXT subtitles to the CPU
+    // chain. A bitmap burn rides the GPU graph: the scaler is pinned to the
+    // exact frame `bitmap_overlay` scales the subtitle plane to (two filters,
+    // one geometry — see `output_size`), and the vendor-surface graphs come
+    // down to system memory right here, once, because `overlay` composites
+    // there. What this keeps off the CPU is the float tone-map — the cost
+    // that put a 4K burn under realtime while the GPU graph measured 4.9×
+    // (PERF-PLAN §5).
+    let bitmap_burn = opts.subtitle_burn.as_ref().is_some_and(|b| b.bitmap);
+    let burn_size = if bitmap_burn {
+        output_size(source, opts.target_height)
+    } else {
+        None
+    };
+    if let Some(gpu) = opts.pipeline.filters(
+        burn_size.map(|(w, _)| w),
+        burn_size.map_or(opts.target_height, |(_, h)| h),
+        source.hdr.as_deref(),
+    ) {
+        if bitmap_burn && matches!(opts.pipeline, Pipeline::VppQsv | Pipeline::TonemapVaapi) {
+            // These two end in vendor surfaces (their encoders read them
+            // directly); the composite cannot. Libplacebo and OpenCL already
+            // finish with their own download, so they need nothing here.
+            chain.push(format!("{gpu},hwdownload,format=nv12"));
+        } else {
+            chain.push(gpu);
+        }
         return with_subtitles(chain, opts, source_path);
     }
 
@@ -574,6 +595,38 @@ fn escape_filter_path(path: &str) -> String {
 /// Lighter sources keep software decode: it's the most compatible path and is
 /// already fast enough, so we don't risk the GPU decode/filter handoff where it
 /// isn't needed.
+/// The HDR format a session should be ROUTED by, as opposed to what the file
+/// is.
+///
+/// A Dolby Vision source whose base layer is HDR10-compatible (Profiles 7/8
+/// with the cross-compatible id — the probe's rich label says so) decodes to
+/// ordinary PQ surfaces carrying HDR10 static metadata: exactly what an hdr10
+/// file decodes to, because the BL *is* a compliant HDR10 stream by
+/// construction. Neither tone-map chain reads the RPU dynamic metadata — the
+/// CPU chain declares `tin=smpte2084` and maps statically, and the vendor
+/// graphs do the same from surface metadata — so for graph selection this IS
+/// an hdr10 source, and declining the 4.9× GPU tone-map for it (PERF-PLAN §5)
+/// bought no correctness. Profiles without that base (5: IPTPQc2) keep
+/// routing as `dolby_vision`, which the vendor graphs correctly decline.
+///
+/// Routing only: everything that *builds* filters keeps the file's real
+/// `hdr` ("dolby_vision" still picks `tin=smpte2084`, still strips RPUs on
+/// the copy path), and the cache digest keys on the pipeline that actually
+/// ran, so entries made under either routing stay distinct and honest.
+pub fn routing_hdr(file: &MediaFile) -> Option<&str> {
+    match file.hdr.as_deref() {
+        Some("dolby_vision")
+            if file
+                .hdr_format
+                .as_deref()
+                .is_some_and(|f| f.contains("HDR10-compatible")) =>
+        {
+            Some("hdr10")
+        }
+        other => other,
+    }
+}
+
 /// Is this the kind of source that justifies hardware decode — and, with it,
 /// a GPU filter graph?
 ///
@@ -716,18 +769,20 @@ pub fn hls_args(
     // of its encoder's own family, so the upload suffix would be uploading
     // something that never came down — which is not a wasted copy but a broken
     // graph. The neutral pipelines download explicitly inside their own chain
-    // and then take the suffix like the CPU path does.
-    let vendor_gpu = matches!(opts.pipeline, Pipeline::VppQsv | Pipeline::TonemapVaapi);
+    // and then take the suffix like the CPU path does. A bitmap burn on a
+    // vendor pipeline is the exception both ways: `video_filters` appended a
+    // download so the composite can run, which means the encoder's upload IS
+    // owed again.
+    let bitmap_burn = opts.subtitle_burn.as_ref().is_some_and(|b| b.bitmap);
+    let vendor_gpu =
+        matches!(opts.pipeline, Pipeline::VppQsv | Pipeline::TonemapVaapi) && !bitmap_burn;
+    let suffix = encoder.filter_suffix().filter(|_| !vendor_gpu);
     let mut vf = String::new();
     if let Some(prefix) = &hwdownload {
         vf.push_str(prefix);
         vf.push(',');
     }
     vf.push_str(&video_filters(source, opts, &source_path));
-    if let Some(suffix) = encoder.filter_suffix().filter(|_| !vendor_gpu) {
-        vf.push(',');
-        vf.push_str(suffix);
-    }
 
     // A bitmap subtitle is a picture, so burning one is a *composite* — two
     // streams into one filter — and that needs `-filter_complex` and a mapped
@@ -748,13 +803,24 @@ pub fn hls_args(
 
     match overlay {
         Some(sub) => {
+            // The upload suffix comes AFTER the composite. `overlay` draws in
+            // system memory; a chain that uploads first hands it a hardware
+            // surface it cannot read. It used to be appended to the [vburn]
+            // half of this very graph — upload, then overlay — which is that
+            // broken order exactly, hidden by the tests only ever burning
+            // with the suffix-less software encoder.
+            let up = suffix.map(|s| format!(",{s}")).unwrap_or_default();
             args.push("-filter_complex".into());
             args.push(format!(
                 "[0:v]{vf}[vburn];{sub};\
-                 [vburn][sburn]overlay=eof_action=pass{BURNED_VIDEO_LABEL}"
+                 [vburn][sburn]overlay=eof_action=pass{up}{BURNED_VIDEO_LABEL}"
             ));
         }
         None => {
+            if let Some(s) = suffix {
+                vf.push(',');
+                vf.push_str(s);
+            }
             args.push("-vf".into());
             args.push(vf);
         }
@@ -1149,6 +1215,113 @@ mod tests {
         assert!(joined.contains("-vf "), "text burn stays a simple chain");
         assert!(joined.contains("subtitles="));
         assert!(!joined.contains("overlay"));
+    }
+
+    /// A bitmap burn no longer costs the GPU tone-map (the 4.9× of PERF-PLAN
+    /// §5): the vendor graph runs scale + tone-map on the GPU pinned to the
+    /// overlay's exact frame, comes down once for the composite, and the
+    /// encoder's upload runs after the overlay — never before it.
+    #[test]
+    fn a_bitmap_burn_keeps_the_gpu_tonemap_and_downloads_once() {
+        let mut f = file(Some("dolby_vision"));
+        f.width = Some(3840);
+        f.height = Some(2160);
+        f.bit_depth = Some(10);
+        let opts = TranscodeOptions {
+            target_height: 2160,
+            pipeline: Pipeline::VppQsv,
+            subtitle_burn: Some(SubtitleBurn {
+                subtitle_index: 5,
+                bitmap: true,
+            }),
+            ..Default::default()
+        };
+        let args = hls_args(&f, Encoder::Qsv, &opts, Pacing::unpaced(), "/tmp/s");
+        let joined = args.join(" ");
+
+        // The GPU graph is present, pinned to the overlay's frame, and comes
+        // down to system memory exactly once, before the composite.
+        assert!(
+            joined.contains(
+                "vpp_qsv=w=3840:h=2160:tonemap=1:format=nv12,hwdownload,format=nv12[vburn]"
+            ),
+            "{joined}"
+        );
+        // The subtitle plane lands on the same geometry.
+        assert!(joined.contains("[0:s:5]scale=3840:2160[sburn]"), "{joined}");
+        // The encoder's upload happens AFTER the overlay — a chain that
+        // uploads first hands `overlay` a hardware surface it cannot read.
+        assert!(
+            joined.contains("overlay=eof_action=pass,hwupload=extra_hw_frames=64,format=qsv[vout]"),
+            "{joined}"
+        );
+        let up = joined.find("hwupload").expect("upload present");
+        let ov = joined.find("overlay=").expect("overlay present");
+        assert!(ov < up, "upload must follow the composite: {joined}");
+        // No float tone-map anywhere near this session.
+        assert!(!joined.contains("zscale"), "{joined}");
+        assert!(!joined.contains("tonemap=tonemap=hable"), "{joined}");
+    }
+
+    /// The same ordering rule on the CPU chain: a QSV encode of a burned
+    /// session uploads after the composite, not before it. (The old graph put
+    /// the encoder suffix on the [vburn] half — upload, then overlay — an
+    /// order only the suffix-less software encoder could survive, which is
+    /// exactly what the tests used to burn with.)
+    #[test]
+    fn the_upload_suffix_follows_the_composite_on_the_cpu_chain_too() {
+        let mut f = file(Some("hdr10"));
+        f.width = Some(3840);
+        f.height = Some(2160);
+        f.bit_depth = Some(10);
+        let opts = TranscodeOptions {
+            target_height: 1080,
+            subtitle_burn: Some(SubtitleBurn {
+                subtitle_index: 0,
+                bitmap: true,
+            }),
+            ..Default::default()
+        };
+        let args = hls_args(&f, Encoder::Qsv, &opts, Pacing::unpaced(), "/tmp/s");
+        let joined = args.join(" ");
+        assert!(
+            joined.contains("overlay=eof_action=pass,hwupload=extra_hw_frames=64,format=qsv[vout]"),
+            "{joined}"
+        );
+        assert!(
+            !joined.contains("format=qsv[vburn]"),
+            "the upload crept back in front of the overlay: {joined}"
+        );
+        // Without a burn the suffix stays at the end of the plain chain.
+        let plain = TranscodeOptions {
+            target_height: 1080,
+            ..Default::default()
+        };
+        let joined = hls_args(&f, Encoder::Qsv, &plain, Pacing::unpaced(), "/tmp/s").join(" ");
+        assert!(joined.contains("-vf "), "{joined}");
+        assert!(
+            joined.contains("hwupload=extra_hw_frames=64,format=qsv"),
+            "{joined}"
+        );
+    }
+
+    /// A Dolby Vision source with an HDR10-compatible base layer routes like
+    /// the HDR10 stream its base layer is; one without keeps the DV routing
+    /// the vendor graphs decline. The file's real `hdr` column is untouched —
+    /// this is about graph selection, not about what the file is.
+    #[test]
+    fn dv_with_an_hdr10_base_routes_as_hdr10() {
+        let mut f = file(Some("dolby_vision"));
+        f.hdr_format = Some("Dolby Vision · Profile 7 (HDR10-compatible)".into());
+        assert_eq!(routing_hdr(&f), Some("hdr10"));
+        f.hdr_format = Some("Dolby Vision · Profile 5".into());
+        assert_eq!(routing_hdr(&f), Some("dolby_vision"));
+        f.hdr_format = None;
+        assert_eq!(routing_hdr(&f), Some("dolby_vision"));
+        let f = file(Some("hdr10"));
+        assert_eq!(routing_hdr(&f), Some("hdr10"));
+        let f = file(None);
+        assert_eq!(routing_hdr(&f), None);
     }
 
     /// The output frame is what a bitmap subtitle is scaled against, so its

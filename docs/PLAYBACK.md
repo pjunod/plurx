@@ -410,8 +410,13 @@ covering the other.
   adds an encode, not a downscale (and costs *less* bandwidth than the remux
   it replaces). Only a burn on a genuine transcode verdict keeps the server's
   Auto rung (`min(source, 1080)` on hardware), where the cap is the bandwidth
-  call it was designed to be. A 4K burn runs the CPU filter chain (a composite happens
-  in system memory), so whether a given box holds realtime at 2160p is a
+  call it was designed to be. A bitmap burn keeps the node's proven GPU
+  tone-map (PERF-PLAN §5): the graph scales and maps on the GPU pinned to the
+  overlay's exact frame, comes down to system memory once for the composite,
+  and the encoder's upload runs after it — and a Dolby Vision source whose
+  base layer is HDR10-compatible counts as HDR10 for that routing, since
+  neither chain reads the RPUs. Text burns still take the CPU chain (libass
+  lives there). Whether a given box holds realtime on a 2160p burn remains a
   measurement, not a promise. Direct/remux/copy carry text subs as selectable
   `<track>`s, which toggle for free.
 - **DTS/TrueHD never passthrough to a browser.** No browser decodes them, so a

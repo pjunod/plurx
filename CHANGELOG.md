@@ -123,6 +123,28 @@ bump may break compatibility and a **patch** bump never does.
 
 ### Fixed
 
+- **A 4K subtitle burn ran the CPU tone-map below realtime — buffering every
+  two seconds on hardware whose GPU graph was probed at 4.9×.** Playing the
+  burn at source resolution exposed the routing: *any* burned subtitle sent
+  the session to the CPU chain ("composited in system memory"), and Dolby
+  Vision did too, so a 4K DV film with forced PGS subs did its float
+  tone-map on the CPU at ~0.9× while the viewer's buffer sat pinned at one
+  segment, rate-chasing at 90%. Three routing truths replace that. A bitmap
+  burn now keeps the proven GPU graph: scale + tone-map on the GPU pinned to
+  the overlay's exact frame (two filters, one geometry), one download for
+  the composite, and the encoder's upload after it — text burns still take
+  the CPU chain, because libass lives there. A Dolby Vision source whose
+  base layer is HDR10-compatible (Profiles 7/8 cross-compatible — the
+  probe's label says so) now routes as the HDR10 stream its base layer is:
+  it decodes to ordinary PQ with static metadata, and neither tone-map chain
+  reads the RPUs, so declining the 4.9× graph for it bought no correctness;
+  profiles without that base (5) still decline. And a latent ordering bug
+  died on the way: the encoder's upload suffix used to be appended *before*
+  the overlay in every burned graph — upload, then composite — an order only
+  the suffix-less software encoder could survive, which is exactly what the
+  tests used to burn with. Whether a given box holds realtime on a 2160p
+  burn remains a measurement (the graph is new to the fleet); the chain it
+  now runs is the one that measured 4.9× faster.
 - **Playback stopped for a few seconds at the same spot in every film — the
   client was losing a race the server didn't know it was running.** With
   the publish gate, the first playlist a player loads is a cushion of

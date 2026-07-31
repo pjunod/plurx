@@ -303,7 +303,7 @@ async fn run(
     args.push("-i".into());
     args.push(fixture.to_string_lossy().into_owned());
 
-    let mut vf = match candidate.filters(PROBE_HEIGHT, Some("hdr10")) {
+    let mut vf = match candidate.filters(None, PROBE_HEIGHT, Some("hdr10")) {
         Some(g) => g,
         // The CPU reference: the exact chain `video_filters` builds for an
         // HDR10 source, spelled here because a probe that measured a

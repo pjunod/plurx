@@ -192,8 +192,21 @@ impl Pipeline {
     /// `hdr_format` is taken rather than assumed because a GPU pipeline may be
     /// selected for a session with no HDR at all: the scaler is worth having
     /// on the GPU either way, and the tone-map step simply drops out.
-    pub fn filters(self, height: i64, hdr_format: Option<&str>) -> Option<String> {
+    ///
+    /// `width` pins the frame to an exact size instead of letting the scaler
+    /// keep aspect on its own. A bitmap burn needs that: the subtitle plane is
+    /// scaled by a *different* filter against `output_size`'s answer, and two
+    /// scalers rounding independently is a composite that can miss by a pixel.
+    /// `None` preserves the keep-aspect spellings, which also never upscale;
+    /// an exact size is the caller promising it already clamped to the source.
+    pub fn filters(
+        self,
+        width: Option<i64>,
+        height: i64,
+        hdr_format: Option<&str>,
+    ) -> Option<String> {
         let hdr = hdr_format.is_some();
+        let w = width.map_or_else(|| "-1".to_owned(), |w| w.to_string());
         Some(match self {
             Pipeline::Cpu => return None,
             // vpp_qsv does scale and tone-map in one pass. `w=-1` keeps the
@@ -201,18 +214,18 @@ impl Pipeline {
             // wants, so no format conversion is needed on either side.
             Pipeline::VppQsv => {
                 if hdr {
-                    format!("vpp_qsv=w=-1:h={height}:tonemap=1:format=nv12")
+                    format!("vpp_qsv=w={w}:h={height}:tonemap=1:format=nv12")
                 } else {
-                    format!("vpp_qsv=w=-1:h={height}:format=nv12")
+                    format!("vpp_qsv=w={w}:h={height}:format=nv12")
                 }
             }
             // VA-API splits them: scale_vaapi resizes, tonemap_vaapi maps. Both
             // stay in VA-API surfaces, which h264_vaapi encodes directly.
             Pipeline::TonemapVaapi => {
                 if hdr {
-                    format!("scale_vaapi=w=-1:h={height}:format=p010,tonemap_vaapi=format=nv12:matrix=bt709:transfer=bt709:primaries=bt709")
+                    format!("scale_vaapi=w={w}:h={height}:format=p010,tonemap_vaapi=format=nv12:matrix=bt709:transfer=bt709:primaries=bt709")
                 } else {
-                    format!("scale_vaapi=w=-1:h={height}:format=nv12")
+                    format!("scale_vaapi=w={w}:h={height}:format=nv12")
                 }
             }
             // libplacebo scales and maps together and outputs to whatever the
@@ -225,21 +238,25 @@ impl Pipeline {
                     ""
                 };
                 format!(
-                    "hwupload,libplacebo=w=-1:h={height}{tm}:format=nv12,hwdownload,format=nv12"
+                    "hwupload,libplacebo=w={w}:h={height}{tm}:format=nv12,hwdownload,format=nv12"
                 )
             }
             // tonemap_opencl maps only, so the scale stays on the CPU side of
             // it. Its output is an OpenCL surface no H.264 encoder takes, hence
             // the explicit download.
             Pipeline::TonemapOpencl => {
+                let scale = match width {
+                    Some(w) => format!("scale={w}:{height}"),
+                    None => format!("scale=-2:'min({height},ih)'"),
+                };
                 if hdr {
                     format!(
-                        "scale=-2:'min({height},ih)',format=p010,hwupload,\
+                        "{scale},format=p010,hwupload,\
                          tonemap_opencl=tonemap=hable:transfer=bt709:matrix=bt709:primaries=bt709:format=nv12,\
                          hwdownload,format=nv12"
                     )
                 } else {
-                    format!("scale=-2:'min({height},ih)',format=nv12")
+                    format!("{scale},format=nv12")
                 }
             }
         })
@@ -255,16 +272,19 @@ impl Pipeline {
     /// being left to the graph to discover:
     ///
     /// - **The source it can't map.** HLG and Dolby Vision (see
-    ///   [`Pipeline::handles`]).
+    ///   [`Pipeline::handles`] — but note `transcode::routing_hdr`: a DV
+    ///   source whose base layer is HDR10-compatible routes as `hdr10`,
+    ///   because it decodes to ordinary PQ surfaces and neither chain reads
+    ///   the RPUs anyway).
     /// - **The encoder it can't feed.** A graph and an encoder from different
     ///   families produce surfaces the other cannot read (see
     ///   [`Pipeline::pairs_with`]).
-    /// - **Any burned subtitle.** Text goes through the CPU-only `subtitles`
-    ///   filter; a bitmap is composited by `overlay` against a scaled
-    ///   subtitle plane, which is also system memory here. Either way a GPU
-    ///   graph would have to come down for it and go back up — the round trip
-    ///   this whole milestone exists to delete, plus a second one. Those
-    ///   sessions take the CPU chain and the log says why (PERF-PLAN §5).
+    /// - **A burned TEXT subtitle.** libass renders inside the CPU chain and
+    ///   nowhere else. A *bitmap* burn no longer declines: its overlay still
+    ///   composites in system memory, but the graph comes down exactly once —
+    ///   after the GPU scale + tone-map — and it is the float tone-map, not
+    ///   the download, that decides whether a 4K burn holds realtime
+    ///   (PERF-PLAN §5 measured the two chains 4.9× apart).
     ///
     /// And one more that is about worth rather than correctness: `heavy` (see
     /// `transcode::heavy_source`). The vendor graphs require hardware decode,
@@ -277,9 +297,9 @@ impl Pipeline {
         encoder: Encoder,
         hdr_format: Option<&str>,
         heavy: bool,
-        burns_subtitles: bool,
+        burns_text_subtitles: bool,
     ) -> Pipeline {
-        match Pipeline::declined(proven, encoder, hdr_format, heavy, burns_subtitles) {
+        match Pipeline::declined(proven, encoder, hdr_format, heavy, burns_text_subtitles) {
             Some(_) => Pipeline::Cpu,
             None => proven,
         }
@@ -302,7 +322,7 @@ impl Pipeline {
         encoder: Encoder,
         hdr_format: Option<&str>,
         heavy: bool,
-        burns_subtitles: bool,
+        burns_text_subtitles: bool,
     ) -> Option<&'static str> {
         if proven == Pipeline::Cpu {
             return None;
@@ -310,8 +330,8 @@ impl Pipeline {
         if !heavy {
             return Some("light source — a GPU graph is not worth the handoff");
         }
-        if burns_subtitles {
-            return Some("a burned subtitle is composited in system memory");
+        if burns_text_subtitles {
+            return Some("a text subtitle is rendered by libass, which lives in the CPU chain");
         }
         if !proven.handles(hdr_format) {
             return Some(match hdr_format {
@@ -380,7 +400,7 @@ mod tests {
             assert!(Pipeline::Cpu.handles(hdr), "cpu must handle {hdr:?}");
         }
         assert_eq!(Pipeline::Cpu.fallback(), None, "nothing is below it");
-        assert!(Pipeline::Cpu.filters(1080, Some("hdr10")).is_none());
+        assert!(Pipeline::Cpu.filters(None, 1080, Some("hdr10")).is_none());
         assert!(!Pipeline::Cpu.on_gpu());
     }
 
@@ -429,7 +449,7 @@ mod tests {
     #[test]
     fn every_gpu_graph_targets_bt709_for_hdr() {
         for p in CANDIDATES.iter().filter(|p| p.on_gpu()) {
-            let hdr = p.filters(1080, Some("hdr10")).expect("a graph");
+            let hdr = p.filters(None, 1080, Some("hdr10")).expect("a graph");
             assert!(
                 hdr.contains("bt709") || hdr.contains("tonemap=1"),
                 "{p:?} does not retarget colour: {hdr}"
@@ -439,7 +459,7 @@ mod tests {
             // With no HDR the tone-map step drops out — the scaler is still
             // worth having on the GPU, but mapping an SDR source to SDR is
             // work that changes nothing.
-            let sdr = p.filters(1080, None).expect("a graph");
+            let sdr = p.filters(None, 1080, None).expect("a graph");
             assert!(
                 !sdr.contains("tonemap"),
                 "{p:?} tone-maps an SDR source: {sdr}"
@@ -455,14 +475,14 @@ mod tests {
     #[test]
     fn neutral_graphs_download_and_vendor_graphs_do_not() {
         for p in [Pipeline::Libplacebo, Pipeline::TonemapOpencl] {
-            let g = p.filters(1080, Some("hdr10")).expect("a graph");
+            let g = p.filters(None, 1080, Some("hdr10")).expect("a graph");
             assert!(
                 g.contains("hwdownload"),
                 "{p:?} leaves frames on the GPU: {g}"
             );
         }
         for p in [Pipeline::VppQsv, Pipeline::TonemapVaapi] {
-            let g = p.filters(1080, Some("hdr10")).expect("a graph");
+            let g = p.filters(None, 1080, Some("hdr10")).expect("a graph");
             assert!(
                 !g.contains("hwdownload"),
                 "{p:?} round-trips needlessly: {g}"
@@ -486,7 +506,11 @@ mod tests {
             Pipeline::VppQsv
         );
 
-        // HLG and DV go back regardless of what the probe proved.
+        // HLG and DV go back regardless of what the probe proved. (A DV
+        // source whose base layer is HDR10-compatible never presents as
+        // "dolby_vision" here — `transcode::routing_hdr` routes it as hdr10
+        // before this question is asked. What reaches this arm is the DV
+        // that has no PQ base to fall back on, and the CPU chain is right.)
         for hdr in [Some("hlg"), Some("dolby_vision")] {
             assert_eq!(
                 Pipeline::for_session(proven, Encoder::Qsv, hdr, true, false),
@@ -584,6 +608,29 @@ mod tests {
             Pipeline::declined(Pipeline::Cpu, Encoder::Software, None, false, false),
             None
         );
+    }
+
+    /// An explicit width pins every graph to the same frame the subtitle
+    /// plane of a bitmap burn is scaled to. `None` keeps the keep-aspect
+    /// spellings that also never upscale.
+    #[test]
+    fn an_exact_width_pins_the_frame_and_none_keeps_aspect() {
+        let g = Pipeline::VppQsv
+            .filters(Some(3840), 2160, Some("hdr10"))
+            .expect("a graph");
+        assert!(g.contains("vpp_qsv=w=3840:h=2160:tonemap=1"), "{g}");
+        let g = Pipeline::VppQsv
+            .filters(None, 1080, Some("hdr10"))
+            .expect("a graph");
+        assert!(g.contains("w=-1:h=1080"), "{g}");
+        let g = Pipeline::TonemapOpencl
+            .filters(Some(1920), 1080, Some("hdr10"))
+            .expect("a graph");
+        assert!(g.contains("scale=1920:1080,"), "{g}");
+        let g = Pipeline::TonemapOpencl
+            .filters(None, 1080, Some("hdr10"))
+            .expect("a graph");
+        assert!(g.contains("scale=-2:'min(1080,ih)'"), "{g}");
     }
 
     /// Failure goes to the floor, not to the next-best guess.
