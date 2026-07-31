@@ -1,8 +1,8 @@
 # plurx single-node deployment.
 #
-# Host-specific configuration (your media mounts and GPU passthrough) belongs
-# in an override file; bind ports live in .env, so this tracked file never needs local
-# edits and `git pull` always applies cleanly:
+# Host-specific configuration (your media mounts, GPU passthrough, and shared
+# Docker networks) belongs in an override file. The standard ports stay here,
+# so this tracked file never needs local edits and `git pull` applies cleanly:
 #
 #   cp docker-compose.override.example.yml docker-compose.override.yml
 #   $EDITOR docker-compose.override.yml         # your mounts, your GPU
@@ -59,20 +59,22 @@ services:
     image: plurx/plurxd:latest
     container_name: plurxd
     restart: unless-stopped
-    # Bonjour is link-local multicast. A Docker bridge can publish TCP 32400,
-    # but it cannot put the server's _plurx._tcp advertisement on the host LAN.
-    # Host networking is therefore part of the native auto-discovery contract.
-    network_mode: host
+    # Keep the base service on ordinary Docker networking. Host-specific
+    # overrides commonly attach plurxd to an external media network, and
+    # Compose forbids combining `networks` with `network_mode: host`.
+    ports:
+      - "32400:32400"                          # HTTP API + web app
+      # GDM discovery for Plex clients. Discovery only works on host port
+      # 32414; if something else owns it (a still-running Plex), set
+      # PLURX_GDM_PORT in .env to park it elsewhere until Plex retires.
+      - "${PLURX_GDM_PORT:-32414}:32414/udp"
     # Run as you, not as the image's internal `plurx` user, so the files under
     # PLURX_DATA are readable and removable without sudo. Set PUID/PGID in
     # .env if your uid is not 1000; `id -u` and `id -g` say what to use.
     user: "${PUID:-1000}:${PGID:-1000}"
     environment:
       PLURX_SERVER_NAME: "plurx"
-      PLURX_BIND: "${PLURX_BIND:-0.0.0.0:32400}"
-      # GDM discovery only works on 32414. A different value avoids a bind
-      # conflict with Plex but intentionally disables GDM discovery.
-      PLURX_GDM_PORT: "${PLURX_GDM_PORT:-32414}"
+      PLURX_BIND: "0.0.0.0:32400"
       PLURX_DATA_DIR: "/var/lib/plurx"
     volumes:
       # The database and everything else that must survive a rebuild. Create
