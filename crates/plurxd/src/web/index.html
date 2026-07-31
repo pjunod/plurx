@@ -356,7 +356,14 @@
      has no "i" key to press), so it's bounded: never taller than the space
      between the two control bars, and the readout scrolls inside it rather
      than growing over them. */
-  .statsov{position:absolute;top:64px;left:20px;width:min(360px,calc(100vw - 40px));max-height:calc(100dvh - 190px);
+  /* Wide enough to lay the sections out side by side. It was a 360px column
+     that every real session overflowed — a 4K transcode fills five sections
+     and roughly thirty rows, so the numbers people actually compare (what the
+     decoder is doing, against what the network and the server are doing) were
+     never on screen together and had to be scrolled between and remembered.
+     Capped against the viewport, so a narrow window still gets the old single
+     column rather than a panel wider than the video. */
+  .statsov{position:absolute;top:64px;left:20px;width:min(880px,calc(100vw - 40px));max-height:calc(100dvh - 190px);
     background:rgba(8,10,15,.84);border:1px solid rgba(255,255,255,.12);border-radius:10px;
     font:12px/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#e8e8ea;
     display:none;flex-direction:column;overflow:hidden;backdrop-filter:blur(5px);z-index:5}
@@ -366,7 +373,42 @@
     font:600 10.5px/1 ui-sans-serif,system-ui,sans-serif;text-transform:uppercase;letter-spacing:.06em;color:rgba(255,255,255,.55)}
   .statsx{background:transparent;border:0;color:rgba(255,255,255,.6);font-size:13px;line-height:1;cursor:pointer;padding:6px 8px;border-radius:6px}
   .statsx:hover{background:rgba(255,255,255,.1);color:#fff}
-  .statsbody{overflow-y:auto;overscroll-behavior:contain;-webkit-overflow-scrolling:touch;padding:10px 13px 11px}
+  /* Multi-column rather than a grid: the sections have very different
+     heights (Network is three rows, Now decoding can be ten), and grid rows
+     align to the tallest item in each row, which would reintroduce as much
+     empty space as the columns saved. `columns` takes a WIDTH, not a count,
+     so the number of columns follows the panel and no media query has to
+     guess it. The panel still scrolls if a session somehow outgrows even
+     this — the max-height above is a bound, not a promise.
+
+     880/270/112 were measured, not picked: narrower columns fit three across
+     but wrapped the values so hard (46 wrapped lines against 32) that the
+     panel came out TALLER than at two columns, and squeezed the label column
+     until "Client estimate" broke over two lines. Fewer, wider columns is
+     the shorter answer here. */
+  .statsbody{overflow-y:auto;overscroll-behavior:contain;-webkit-overflow-scrolling:touch;padding:10px 13px 11px;
+    columns:270px;column-gap:22px}
+  /* A section is the unit a column break may not fall inside — otherwise a
+     header lands at the foot of one column and its rows at the head of the
+     next, which reads as two unrelated sections. */
+  .stsec{break-inside:avoid;-webkit-column-break-inside:avoid;page-break-inside:avoid;margin-bottom:9px}
+  /* Playback spans the full width: Reason and Switched are sentences, and a
+     sentence in a 224px column is six short lines. Everything below it is
+     label-and-number, which is what columns are good at. */
+  .stsec.wide{column-span:all;margin-bottom:11px}
+  /* A short screen — a phone held sideways, which is how a phone watches
+     video — inverts the trade. There, vertical space is the scarce thing, and
+     a full-width Playback section spends the entire visible panel on two
+     sentences: measured, 4 of 28 rows reachable without scrolling. Letting it
+     flow with the rest and narrowing the columns puts 13 of 28 on the first
+     screen. It still scrolls (28 rows will not fit a 200px-tall panel however
+     they are arranged) — but what you see first is numbers beside their
+     labels rather than prose. */
+  @media(max-height:640px){
+    .stsec.wide{column-span:none;margin-bottom:9px}
+    .statsbody{columns:230px}
+    .stsec.wide > div{grid-template-columns:112px minmax(0,1fr)}
+  }
   /* Two real columns rather than an inline-block label with a minimum width.
      That version had no gap of its own, so any label wider than the minimum
      touched its value ("Client estimate338 Mb/s"), and a value long enough to
@@ -375,11 +417,18 @@
      stays inside the value column. Each row is its own grid, so the width is
      fixed rather than max-content; every label here fits 116px at this size.
      Section headers opt out, being one item and not two. */
-  .statsbody > div{display:grid;grid-template-columns:116px minmax(0,1fr);gap:0 10px;align-items:baseline}
-  .statsbody > div.sechd{display:block}
+  /* `anywhere`, because the values worth reading most are the ones with no
+     break opportunity in them: a browser's own error text arrives as
+     PipelineStatus::CHUNK_DEMUXER_ERROR_APPEND_FAILED, one unbreakable token
+     wider than any column here, and it was being clipped at the panel edge —
+     losing the end of the sentence that says what went wrong. */
+  .stsec > div{display:grid;grid-template-columns:112px minmax(0,1fr);gap:0 10px;align-items:baseline;
+    overflow-wrap:anywhere}
+  /* The full-width section can afford the wider label column it always had. */
+  .stsec.wide > div{grid-template-columns:116px minmax(0,1fr)}
+  .stsec > div.sechd{display:block}
   .statsov b{color:rgba(255,255,255,.5);font-weight:600}
-  .statsov .sechd{color:var(--accent);font-weight:700;margin-top:8px;text-transform:uppercase;letter-spacing:.05em;font-size:10.5px}
-  .statsov .sechd:first-child{margin-top:0}
+  .statsov .sechd{color:var(--accent);font-weight:700;margin-bottom:1px;text-transform:uppercase;letter-spacing:.05em;font-size:10.5px}
   .pmenu{position:absolute;top:60px;right:20px;min-width:190px;max-width:300px;background:rgba(14,16,22,.97);border:1px solid rgba(255,255,255,.14);
     border-radius:10px;padding:6px;display:none;z-index:6;box-shadow:0 10px 30px rgba(0,0,0,.5)}
   /* Opened from the transport rather than the top bar: sit above the button
@@ -404,7 +453,7 @@
        to both edges — pinned made it as tall as the gap no matter how little it
        held; positionStats() caps it against the real bars instead. */
     .statsov{top:calc(env(safe-area-inset-top,0px) + 96px);left:12px;right:auto;
-      width:min(360px,calc(100vw - 24px));
+      width:min(880px,calc(100vw - 24px));
       max-height:calc(100dvh - env(safe-area-inset-top,0px) - env(safe-area-inset-bottom,0px) - 190px)}
     .pmenu{top:calc(env(safe-area-inset-top,0px) + 92px);right:12px;max-width:min(300px,calc(100vw - 24px));
       max-height:calc(100dvh - env(safe-area-inset-top,0px) - env(safe-area-inset-bottom,0px) - 190px);overflow-y:auto;overscroll-behavior:contain}
@@ -4831,8 +4880,14 @@ function updateStats(){
   }
   const rate = v.playbackRate&&v.playbackRate!==1? ` · ${v.playbackRate}×`:'';
   const durTxt = PLAYER.durMs? ' / '+clockFromSec(PLAYER.durMs/1000):'';
+  // Sections are WRAPPED now, not a flat run of siblings, because the panel
+  // lays them out in columns and a column break is free to fall between a
+  // header and its own rows. `break-inside:avoid` needs a box to avoid
+  // breaking inside of; this is that box.
+  const sec=(rows,title,cls)=> rows? `<div class="stsec${cls||''}">`+
+    `<div class="sechd">${title}</div>`+rows+`</div>` : '';
   body.innerHTML=
-    `<div class="sechd">Playback</div>`+
+    sec(
     // **Which build this is, in the place people photograph.**
     //
     // It lives on the admin-only System page and nowhere else, so the answer to
@@ -4866,15 +4921,17 @@ function updateStats(){
     // switches, so it cannot carry this.
     (PLAYER.rescuedNote?`<div><b>Switched</b><span style="color:var(--warn,#fbbf24)">${
       esc(PLAYER.rescuedNote)}</span></div>`:"")+
-    `<div><b>Position</b>${clockFromSec((PLAYER.offset||0)+(v.currentTime||0))}${durTxt}${rate}</div>`+
-    `<div class="sechd">Source</div>`+
+    `<div><b>Position</b>${clockFromSec((PLAYER.offset||0)+(v.currentTime||0))}${durTxt}${rate}</div>`
+    , "Playback", " wide")+
+    sec(
     `<div><b>Video</b>${esc(srcVideo)}</div>`+
     `<div><b>Resolution</b>${srcRes}</div>`+
     `<div><b>Bitrate</b>${srcBr}</div>`+
     `<div><b>Container</b>${esc(srcCont)}</div>`+
     `<div><b>Audio</b>${esc(aLine)}</div>`+
-    `<div><b>AV offset</b><span>${(PLAYER.aoffset||0)+" ms"}${PLAYER.declared?` <span style="opacity:.6">(container ${PLAYER.declared>0?"+":""}${PLAYER.declared} ms)</span>`:''}</span></div>`+
-    `<div class="sechd">Now decoding</div>`+
+    `<div><b>AV offset</b><span>${(PLAYER.aoffset||0)+" ms"}${PLAYER.declared?` <span style="opacity:.6">(container ${PLAYER.declared>0?"+":""}${PLAYER.declared} ms)</span>`:''}</span></div>`
+    , "Source")+
+    sec(
     `<div><b>Resolution</b>${tgtRes}</div>`+
     `<div><b>Dropped</b>${dropped} frames</div>`+
     (fps!=null?(()=>{
@@ -4943,9 +5000,10 @@ function updateStats(){
         PLAYER.decodeInfo.hw?'hardware':'software — this machine has no GPU path for this stream'}${
         PLAYER.decodeInfo.smooth?'':' · browser does not expect it to be smooth'}</span>${margin}</div>`;
     })():'')+
-    `<div><b>Buffer</b>${buf}</div>`+
-    (net? `<div class="sechd">Network</div>`+net : '')+
-    (srv? `<div class="sechd">Server</div>`+srv : '');
+    `<div><b>Buffer</b>${buf}</div>`
+    , "Now decoding")+
+    sec(net, "Network")+
+    sec(srv, "Server");
 }
 // Poll the session's server-side health while the stats overlay is open, and
 // only then: this is a diagnostic readout, not telemetry the server needs, and
