@@ -707,6 +707,32 @@ fn decode_setup(encoder: Encoder, source: &MediaFile) -> (Vec<String>, Option<St
     }
 }
 
+/// The persisted A/V-sync correction as an audio filter, for a session whose
+/// audio is being ENCODED anyway. Same sign convention as the `-itsoffset`
+/// input it replaces: positive = delay audio.
+///
+/// The two-input technique — the same file opened again, shifted, used only
+/// for its audio — exists because a COPIED audio stream cannot take a
+/// filter: copy moves packets and filters need frames. But every encoded
+/// path was paying its price too: a second demuxer reading the whole source
+/// again, which on NAS media doubles the read traffic and competes with the
+/// video path for the same spindle (review §3.4). Where the audio is
+/// encoded, the correction is a one-line filter on the single input:
+/// `adelay` to push audio later, `atrim` + `asetpts` to pull it earlier
+/// (the trimmed head is exactly what fell before the video's start under
+/// `-itsoffset`, capped by the ±15s the API allows). Copy semantics keep
+/// the second input, and nothing else does.
+pub fn audio_offset_filter(offset_ms: i64) -> Option<String> {
+    match offset_ms.cmp(&0) {
+        std::cmp::Ordering::Equal => None,
+        std::cmp::Ordering::Greater => Some(format!("adelay={offset_ms}:all=1")),
+        std::cmp::Ordering::Less => Some(format!(
+            "atrim=start={:.3},asetpts=PTS-STARTPTS",
+            -offset_ms as f64 / 1000.0
+        )),
+    }
+}
+
 /// Build the full ffmpeg argument vector to transcode `source` into HLS in
 /// `out_dir` (which must exist). Produces `index.m3u8` + `seg%05d.ts`.
 pub fn hls_args(
@@ -755,23 +781,16 @@ pub fn hls_args(
     args.push("-i".into());
     args.push(source_path.clone());
 
-    // A per-file A/V sync correction rides in on a second input of the same
-    // file, shifted with -itsoffset and used only for its audio (positive =
-    // audio later). Both inputs get the same fast input-seek so resume stays
-    // aligned; the video still comes from input 0 (with its hw decode).
-    let audio_input = if source.audio_offset_ms != 0 {
-        if opts.start_seconds > 0.0 {
-            args.push("-ss".into());
-            args.push(format!("{:.3}", opts.start_seconds));
-        }
-        pacing.push(&mut args);
-        args.push("-itsoffset".into());
-        args.push(format!("{:.3}", source.audio_offset_ms as f64 / 1000.0));
-        args.push("-i".into());
-        args.push(source_path.clone());
-        1
+    // A per-file A/V sync correction. The audio on this path is ALWAYS
+    // re-encoded (AAC below), so the correction is an audio filter on the one
+    // input — the second `-itsoffset` input this used to open read the whole
+    // source again for nothing but its audio (review §3.4). Guarded on the
+    // file actually having audio: a simple `-af` with no audio stream to
+    // attach to is a hard ffmpeg error, where the old optional map was inert.
+    let audio_offset = if source.audio_streams.is_empty() {
+        None
     } else {
-        0
+        audio_offset_filter(source.audio_offset_ms)
     };
 
     // Video filter chain: [hwdownload for GPU-decoded frames →] scale / tonemap /
@@ -809,8 +828,8 @@ pub fn hls_args(
     });
     args.push("-map".into());
     match opts.audio_index {
-        Some(i) => args.push(format!("{audio_input}:a:{i}?")),
-        None => args.push(format!("{audio_input}:a:0?")),
+        Some(i) => args.push(format!("0:a:{i}?")),
+        None => args.push("0:a:0?".to_owned()),
     }
 
     match overlay {
@@ -847,7 +866,12 @@ pub fn hls_args(
     args.push("-force_key_frames".into());
     args.push(format!("expr:gte(t,n_forced*{SEGMENT_SECONDS})"));
 
-    // Audio: downmix + AAC (browser-universal).
+    // Audio: downmix + AAC (browser-universal), with the A/V correction as
+    // a filter on the same input rather than a second read of the source.
+    if let Some(af) = audio_offset {
+        args.push("-af".into());
+        args.push(af);
+    }
     args.push("-c:a".into());
     args.push("aac".into());
     args.push("-ac".into());
@@ -917,9 +941,15 @@ fn copy_input_args(
     args.push("-i".into());
     args.push(source_path.clone());
 
-    // A per-file A/V sync correction rides in on a second, `-itsoffset`'d input
-    // of the same file, used only for its audio (positive = audio later).
-    let audio_input = if source.audio_offset_ms != 0 {
+    // A per-file A/V sync correction (positive = audio later). COPIED audio
+    // cannot take a filter — copy moves packets, filters need frames — so
+    // that case keeps the second `-itsoffset`'d input of the same file, used
+    // only for its audio. Audio that is being transcoded anyway takes the
+    // correction as a filter on the one input instead: the second demuxer
+    // read the whole source again — on NAS media, double the read traffic in
+    // exactly the sessions that need the disk most (review §3.4).
+    let has_offset = source.audio_offset_ms != 0 && !source.audio_streams.is_empty();
+    let audio_input = if has_offset && !transcode_audio {
         if start_seconds > 0.0 {
             args.push("-ss".into());
             args.push(format!("{start_seconds:.3}"));
@@ -972,6 +1002,14 @@ fn copy_input_args(
     }
 
     if transcode_audio {
+        // The correction rides the encode as a filter — same input, no
+        // second read.
+        if has_offset {
+            if let Some(af) = audio_offset_filter(source.audio_offset_ms) {
+                args.push("-af".into());
+                args.push(af);
+            }
+        }
         // e.g. DTS/TrueHD → AAC. Keep the source channel layout (5.1 stays 5.1);
         // a copy-video session implies a player that can take multichannel AAC.
         args.push("-c:a".into());
@@ -1585,7 +1623,14 @@ mod tests {
             legacy_re: false,
         };
         let mut f = file(None);
-        f.audio_offset_ms = 250; // forces the second input
+        f.audio_offset_ms = 250;
+        // Copied audio: the one case that still forces the second input —
+        // and an offset only applies to a file that has audio at all.
+        f.audio_streams = vec![crate::domain::AudioStream {
+            index: 0,
+            codec: "dts".into(),
+            ..Default::default()
+        }];
         let args = hls_copy_args(&f, 0.0, None, false, pacing, false, "/tmp/s");
 
         let inputs: Vec<usize> = args
@@ -1608,6 +1653,85 @@ mod tests {
         assert!(args.join(" ").contains("-readrate_initial_burst 90.0"));
         // The old realtime pacing is gone: it is what starved the buffer.
         assert!(!args.contains(&"-re".to_owned()));
+    }
+
+    /// §3.4: where the audio is being encoded anyway, the A/V correction is
+    /// a filter on the ONE input — the second `-itsoffset` input read the
+    /// whole source again for nothing but its audio. Copy semantics (and
+    /// only copy semantics) keep the second input.
+    #[test]
+    fn an_encoded_audio_offset_needs_no_second_read() {
+        let audio = |f: &mut MediaFile| {
+            f.audio_streams = vec![crate::domain::AudioStream {
+                index: 0,
+                codec: "dts".into(),
+                ..Default::default()
+            }];
+        };
+        let inputs = |args: &[String]| args.iter().filter(|a| *a == "-i").count();
+
+        // Transcode path: audio is always AAC, so always one input.
+        let mut f = file(None);
+        f.audio_offset_ms = 250;
+        audio(&mut f);
+        let args = hls_args(
+            &f,
+            Encoder::Software,
+            &TranscodeOptions::default(),
+            Pacing::unpaced(),
+            "/tmp/s",
+        );
+        assert_eq!(inputs(&args), 1, "no second read of the source");
+        assert!(!args.contains(&"-itsoffset".to_owned()));
+        let af = args.iter().position(|a| a == "-af").expect("-af");
+        assert_eq!(args[af + 1], "adelay=250:all=1", "positive = audio later");
+        assert!(
+            args.contains(&"0:a:0?".to_owned()),
+            "audio maps from input 0"
+        );
+
+        // Negative offset: pull audio earlier by trimming its head — what
+        // -itsoffset dropped before the video's start anyway.
+        f.audio_offset_ms = -500;
+        let args = hls_args(
+            &f,
+            Encoder::Software,
+            &TranscodeOptions::default(),
+            Pacing::unpaced(),
+            "/tmp/s",
+        );
+        let af = args.iter().position(|a| a == "-af").expect("-af");
+        assert_eq!(args[af + 1], "atrim=start=0.500,asetpts=PTS-STARTPTS");
+
+        // Copy path, audio transcoded (DTS→AAC): same one-input treatment.
+        let args = hls_copy_args(&f, 0.0, None, true, Pacing::unpaced(), false, "/tmp/s");
+        assert_eq!(
+            inputs(&args),
+            1,
+            "an encoded copy-session audio needs no second read"
+        );
+        assert!(args.iter().any(|a| a.starts_with("atrim=")));
+
+        // Copy path, audio COPIED: packets cannot be filtered — the second
+        // input is retained, exactly as before.
+        let args = hls_copy_args(&f, 0.0, None, false, Pacing::unpaced(), false, "/tmp/s");
+        assert_eq!(inputs(&args), 2, "copy semantics keep the -itsoffset input");
+        assert!(args.contains(&"-itsoffset".to_owned()));
+        assert!(!args.contains(&"-af".to_owned()));
+
+        // A file with no audio track: an offset row is metadata about
+        // nothing — no filter (a hard error to attach), no second input.
+        let mut mute = file(None);
+        mute.audio_offset_ms = 250;
+        let args = hls_args(
+            &mute,
+            Encoder::Software,
+            &TranscodeOptions::default(),
+            Pacing::unpaced(),
+            "/tmp/s",
+        );
+        assert_eq!(inputs(&args), 1);
+        assert!(!args.contains(&"-af".to_owned()));
     }
 
     #[test]

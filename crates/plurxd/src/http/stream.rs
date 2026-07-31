@@ -920,7 +920,15 @@ pub async fn stream_mp4(
         start: q.start,
         transcode_audio: decision.transcode_audio,
         audio_index: audio,
-        audio_offset_ms: file.audio_offset_ms,
+        // Zeroed for a file with no audio track: the correction becomes an
+        // `-af` when audio is transcoded, and a filter with no stream to
+        // attach to is a hard ffmpeg error where the old optional map was
+        // inert.
+        audio_offset_ms: if file.audio_streams.is_empty() {
+            0
+        } else {
+            file.audio_offset_ms
+        },
         hevc,
         hdr: file.hdr.clone(),
         have_dovi_bsf: plurx_core::transcode::ffmpeg_has_dovi_bsf(
@@ -1135,11 +1143,15 @@ async fn remux(spec: RemuxSpec<'_>) -> Result<Response, ApiError> {
     // input would drag the whole pipeline back to flat-out.
     push_pacing(&mut cmd, pacing, readrate);
     cmd.arg("-i").arg(path);
-    // A persisted A/V sync correction rides in on a second input of the same
-    // file, shifted with -itsoffset (positive = audio later) and used only for
-    // its audio. Same input-seek so resume stays aligned; make_zero below
-    // shifts all streams by one shared amount, preserving the correction.
-    let audio_input = if audio_offset_ms != 0 {
+    // A persisted A/V sync correction (positive = audio later). Copied audio
+    // keeps the second `-itsoffset`'d input of the same file — copy moves
+    // packets and filters need frames, so there is no other way in — with
+    // the same input-seek so resume stays aligned (make_zero below shifts
+    // all streams by one shared amount, preserving the correction). Audio
+    // that is being transcoded anyway takes the correction as a filter on
+    // the one input instead of a second demuxer reading the whole source
+    // again (review §3.4).
+    let audio_input = if audio_offset_ms != 0 && !transcode_audio {
         if let Some(s) = start.filter(|s| *s > 0.0) {
             cmd.arg("-ss").arg(format!("{s:.3}"));
         }
@@ -1174,6 +1186,9 @@ async fn remux(spec: RemuxSpec<'_>) -> Result<Response, ApiError> {
         ]);
     }
     if transcode_audio {
+        if let Some(af) = plurx_core::transcode::audio_offset_filter(audio_offset_ms) {
+            cmd.arg("-af").arg(af);
+        }
         cmd.args(["-c:a", "aac", "-ac", "2", "-b:a", "256k"]);
     } else {
         cmd.args(["-c:a", "copy"]);
