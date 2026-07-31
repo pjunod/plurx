@@ -10,6 +10,22 @@ bump may break compatibility and a **patch** bump never does.
 
 ### Added
 
+- **Software transcodes are admitted against a CPU budget, and spend it
+  explicitly.** Software sessions used to bypass admission entirely: each
+  x264 process picked its own thread count (cores × 1.5), so a few of them
+  could oversubscribe every core and drag every stream on the box under
+  realtime together. Admission now runs a thread-denominated pool — a
+  session's weight follows the encode size plus a 4K-decode surcharge, and
+  what it reserves is exactly what its encoder is told to use
+  (`-threads`). The lone session on an idle box always starts, whatever its
+  weight; the mid-film hardware→software fallback takes its share by force
+  rather than hold a playing viewer hostage, but visibly, so later
+  admissions see a full pool. The pre-transcode producer draws from the
+  same pool at background priority, and *every* live start — software
+  included — now signals the producer to stand down. The budget defaults to
+  every core but one and is settable as `transcode.software_pool_threads`
+  (see [docs/OPERATIONS.md](docs/OPERATIONS.md)).
+
 - **`/decision` now carries an executable delivery plan, and the native
   clients execute it.** The response's new `delivery` field says what to *do*
   about the verdict — `direct { url }`, `remux { url, sessions_url, aac }`,
@@ -29,8 +45,43 @@ bump may break compatibility and a **patch** bump never does.
   `request_id`, and an explicit `DELETE` when playback ends, instead of
   leaving encoders to the idle reaper. `play_url` stays for older clients.
 
+### Changed
+
+- **The hot control path stops re-doing a session's whole history.** Flow
+  control runs on every published segment and every frontier advance; each
+  run re-parsed the complete growing playlist, re-measured every segment it
+  already knew, re-statted every pruned file for an ENOENT, and read the
+  same three settings rows through the store's single serialized
+  connection. The segment index is append-oriented now, pruned segments are
+  never statted again, the ahead-window limits are a snapshot with a
+  two-second staleness bound, and read-only settings and metadata lookups
+  run on dedicated read connections instead of queuing behind the writer.
+  Subtitle extraction joins in: the VTT endpoint used to run ffmpeg over
+  the whole source — a full NAS read of a 60 GB remux — on every request,
+  and now files each track by source fingerprint beside the transcode
+  cache and serves the file.
+
 ### Fixed
 
+- **A transcode that wedged mid-film was nobody's problem.** The stall
+  watchdog declared victory at the first playable segment (and on two other
+  early exits), so a pipeline that froze at minute 40 just drained the
+  client's buffer into a hang on a segment nobody was writing. One watchdog
+  now runs for the life of every encoder: suspension pauses judgement
+  instead of ending it (and resume restarts the stall clock, so a long
+  SIGSTOP can never be read back as a stall), EOF and kills end the watch
+  without a verdict, and a mid-stream wedge fails the session so the
+  player's recovery paths get their chance.
+- **The global scratch cap did not measure the disk.** It summed each
+  session's bytes *ahead* of the client while retention deliberately keeps
+  another two minutes of media *behind* every frontier — so several healthy
+  sessions could exceed the documented 8 GB ceiling by a whole retention
+  window each. The cap now counts total live bytes; pacing keeps using the
+  reserve, because they answer different questions.
+- **Auto on a software encoder advertised 720p for smaller sources.** The
+  filter never upscaled, but the bitrate target and the response metadata
+  described 720p for a 480p stream. Both encoder arms of the Auto rung now
+  follow the source down.
 - **Two concurrent session creates with the same `request_id` could both pass
   the idempotency check and spawn two encoders.** The map recorded a create
   only after it finished — check, release the lock, spawn ffmpeg, record — so
