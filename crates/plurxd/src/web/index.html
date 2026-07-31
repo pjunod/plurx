@@ -2627,9 +2627,21 @@ const PLAY_CAPS=(function(){
   if(can('audio/mp4; codecs="ec-3"')) ac.push("eac3");
   const hdrDisplay=!!(window.matchMedia && window.matchMedia("(dynamic-range: high)").matches);
   const hdr=hdrDisplay && (vc.includes("hevc")||vc.includes("av1"));
-  return {vcodec:vc.join(","), acodec:ac.join(","), container:"mp4,webm,mov", hdr:hdr?1:0};
+  // Dolby Vision, asked separately from HDR because the two answers differ
+  // and the difference is a whole class of failure. A DV disc remux usually
+  // carries an HDR10-compatible base layer, so a browser that reports HDR
+  // looks able to take it — and Chrome then refuses the track outright
+  // (MEDIA_ERR_DECODE), because what reaches its decoder is flagged Dolby
+  // Vision whatever the base layer looks like. Safari decodes those. Without
+  // this probe the server could not tell the two apart, remuxed to both, and
+  // the error-fallback quietly re-encoded a 4K disc remux down to the Auto
+  // rung on Chrome. `dvh1`/`dvhe` are the DV sample entries; a browser that
+  // claims either can take the stream as it stands.
+  const dv=["dvh1.05.06","dvh1.08.07","dvhe.05.06","dvhe.08.07"]
+    .some(c=>can(`video/mp4; codecs="${c}"`)||mse(`video/mp4; codecs="${c}"`));
+  return {vcodec:vc.join(","), acodec:ac.join(","), container:"mp4,webm,mov", hdr:hdr?1:0, dv:dv?1:0};
 })();
-const CAPS_Q=`vcodec=${PLAY_CAPS.vcodec}&acodec=${PLAY_CAPS.acodec}&container=${PLAY_CAPS.container}&hdr=${PLAY_CAPS.hdr}`;
+const CAPS_Q=`vcodec=${PLAY_CAPS.vcodec}&acodec=${PLAY_CAPS.acodec}&container=${PLAY_CAPS.container}&hdr=${PLAY_CAPS.hdr}&dv=${PLAY_CAPS.dv}`;
 
 // Manual quality override (player menu), persisted per browser. Auto runs the
 // automatic ladder; Original never transcodes video (direct/remux only); a

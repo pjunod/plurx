@@ -1543,6 +1543,16 @@ pub struct TranscodeManager {
     requests: std::sync::Mutex<HashMap<String, (String, RequestState)>>,
     /// See [`ProducerTuning`]. Always the default outside tests.
     producer: ProducerTuning,
+    /// The ffmpeg this daemon runs, as its version line — the authority for
+    /// build-gated capabilities (above all whether `dovi_rpu` can strip a
+    /// Dolby Vision configuration, ffmpeg 7.1+).
+    ///
+    /// Its own field because the copy path used to read this off the *cache
+    /// config*, which happens to carry a copy of the same string: a server
+    /// with no cache answered "no dovi_rpu" whatever ffmpeg it was running,
+    /// so every Dolby Vision remux kept its DV box and every browser that
+    /// cannot decode DV refused the stream.
+    ffmpeg_build: String,
     /// The ahead-window limits, snapshotted ([`AHEAD_LIMITS_TTL`]).
     ///
     /// Flow control consults the limits on every segment publish and
@@ -1576,6 +1586,7 @@ impl TranscodeManager {
             sessions: Mutex::new(HashMap::new()),
             requests: std::sync::Mutex::new(HashMap::new()),
             producer: ProducerTuning::default(),
+            ffmpeg_build: String::new(),
             cached_limits: std::sync::RwLock::new(None),
         }
     }
@@ -1587,6 +1598,19 @@ impl TranscodeManager {
     /// the ffmpeg build from the startup probe, the node id from the store.
     /// Chaining keeps every existing call site — and every test that does not
     /// care about caching — unchanged.
+    /// Record which ffmpeg this daemon runs. Independent of the cache: the
+    /// capabilities it gates are the daemon's, not the cache's.
+    pub fn with_ffmpeg_build(mut self, ffmpeg_build: String) -> Self {
+        self.ffmpeg_build = ffmpeg_build;
+        self
+    }
+
+    /// Whether this build can strip a Dolby Vision configuration
+    /// (`dovi_rpu`, ffmpeg 7.1+).
+    pub fn dv_strippable(&self) -> bool {
+        transcode::ffmpeg_has_dovi_bsf(&self.ffmpeg_build)
+    }
+
     pub fn with_cache(mut self, cache_dir: PathBuf, ffmpeg_build: String, node_id: String) -> Self {
         self.cache = Some(CacheConfig {
             dir: cache_dir,
@@ -3066,14 +3090,13 @@ impl TranscodeManager {
             .await
             .map_err(|e| format!("creating session dir: {e}"))?;
 
-        // Whether the DV strip may use dovi_rpu is an ffmpeg capability, and
-        // the version line the cache config already carries is the record of
-        // which ffmpeg this manager runs.
-        let have_dovi = self
-            .cache
-            .as_ref()
-            .map(|c| transcode::ffmpeg_has_dovi_bsf(&c.ffmpeg_build))
-            .unwrap_or(false);
+        // An ffmpeg capability, read from the daemon's own record of which
+        // ffmpeg it runs. It used to be read off the CACHE config — which
+        // carries a copy of the same string — so a node with no cache
+        // configured silently answered "no dovi_rpu" whatever it was running,
+        // left the DV configuration in every remux, and had Chrome refuse the
+        // stream Safari played fine.
+        let have_dovi = self.dv_strippable();
         let pacing = self.pacing(true).await;
         let legacy_args = || {
             transcode::hls_copy_args(

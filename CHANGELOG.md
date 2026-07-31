@@ -63,6 +63,25 @@ bump may break compatibility and a **patch** bump never does.
 
 ### Fixed
 
+- **Every Dolby Vision film played at the Auto rung in Chrome, and untouched
+  in Safari.** A DV disc remux usually carries an HDR10-compatible base
+  layer, so a browser reporting HDR support looked able to take it. Chrome
+  refuses the track outright (`MEDIA_ERR_DECODE`) — what reaches its decoder
+  is flagged Dolby Vision whatever the base layer looks like — so the
+  player's error path rescued it into a transcode, and a 4K remux played at
+  1080p with nothing anywhere saying why. Safari, which decodes DV, played
+  the same files perfectly; that difference is what named the cause. Three
+  fixes. The player now probes Dolby Vision separately from HDR (`dvh1`/
+  `dvhe`) and says so, because HDR support was never the same question. The
+  decision uses it: a DV source a browser cannot decode is a **strip remux**
+  where ffmpeg can remove the DV configuration (video untouched — the viewer
+  keeps the source's pixels) and a re-encode only where it cannot, decided up
+  front instead of after a failed decode. And the strip capability now comes
+  from the daemon's own record of which ffmpeg it runs, not from the
+  *pre-transcode cache config* that happened to carry a copy of the version
+  string — a server with no cache configured answered "no `dovi_rpu`"
+  whatever ffmpeg it was running, which is how the strip came to be skipped
+  on a build that supported it.
 - **A transcode that wedged mid-film was nobody's problem.** The stall
   watchdog declared victory at the first playable segment (and on two other
   early exits), so a pipeline that froze at minute 40 just drained the

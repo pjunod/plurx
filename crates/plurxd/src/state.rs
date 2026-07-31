@@ -134,6 +134,7 @@ impl AppState {
                 encoder_caps,
                 system.tone_map.selected(),
             )
+            .with_ffmpeg_build(system.ffmpeg_version.clone().unwrap_or_default())
             .with_cache(
                 cache_dir,
                 system.ffmpeg_version.clone().unwrap_or_default(),

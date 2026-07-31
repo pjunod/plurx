@@ -53,6 +53,7 @@ pub fn caps_profile(
     audio_codecs: Vec<String>,
     max_height: Option<i64>,
     supports_hdr: bool,
+    supports_dolby_vision: bool,
 ) -> DeviceProfile {
     DeviceProfile {
         name: "client-caps".to_owned(),
@@ -63,6 +64,7 @@ pub fn caps_profile(
         max_height,
         max_bitrate: None,
         supports_hdr,
+        supports_dolby_vision,
     }
 }
 
@@ -103,6 +105,17 @@ pub struct DeviceProfile {
     pub max_bitrate: Option<i64>,
     #[serde(default)]
     pub supports_hdr: bool,
+    /// Whether this client decodes a **Dolby Vision** stream as delivered.
+    ///
+    /// Separate from `supports_hdr`, and the distinction is the whole point:
+    /// a DV track's base layer is often HDR10-compatible, so a client that
+    /// reports HDR support looks able to take it — and then refuses, because
+    /// what reaches its decoder is a track the container flags as Dolby
+    /// Vision. Safari decodes those; Chrome does not, at any profile.
+    /// Defaulted off, so a profile that has never heard of DV is assumed not
+    /// to handle it.
+    #[serde(default)]
+    pub supports_dolby_vision: bool,
 }
 
 impl DeviceProfile {
@@ -240,12 +253,75 @@ fn evaluate(file: &MediaFile, profile: &DeviceProfile) -> (Checks, Vec<String>) 
     )
 }
 
+/// Is this source Dolby Vision — i.e. does it carry a DV configuration a
+/// player either understands or chokes on?
+pub fn is_dolby_vision(file: &MediaFile) -> bool {
+    file.hdr.as_deref() == Some("dolby_vision")
+}
+
+/// What a Dolby Vision source needs doing about it for THIS client.
+///
+/// The failure this exists to prevent: a DV remux was handed to Chrome
+/// because the base layer is HDR10-compatible and the client claimed HDR.
+/// Chrome refuses the track outright (`MEDIA_ERR_DECODE`) — the DV
+/// configuration is in the sample entry whatever the base layer looks like —
+/// so the player's error path rescued it into a transcode at the Auto rung,
+/// and a 4K disc remux played at 1080p with nothing saying why. Safari, which
+/// decodes DV, played the same file perfectly: that difference is what named
+/// the cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DvHandling {
+    /// Not DV, or the client decodes it: nothing to do.
+    None,
+    /// The client can't take DV, but the server can strip it to its HDR10
+    /// base — which only ffmpeg can do, so direct play (the raw file) is out
+    /// and a remux is the minimum.
+    Strip,
+    /// The client can't take DV and the server can't remove it. The only
+    /// stream this client will play is a re-encoded one.
+    Reencode,
+}
+
+fn dv_handling(file: &MediaFile, profile: &DeviceProfile, dv_strippable: bool) -> DvHandling {
+    if !is_dolby_vision(file) || profile.supports_dolby_vision {
+        DvHandling::None
+    } else if dv_strippable {
+        DvHandling::Strip
+    } else {
+        DvHandling::Reencode
+    }
+}
+
 /// Decide how to play `file` on a device described by `profile` — the automatic
 /// ladder: direct play when everything matches, remux for a container/audio
 /// mismatch (copy video, maybe re-encode audio), transcode only when the video
 /// itself won't decode (codec/resolution/bitrate/HDR).
-pub fn decide(file: &MediaFile, profile: &DeviceProfile) -> Decision {
-    let (c, mut reasons) = evaluate(file, profile);
+///
+/// `dv_strippable` is a fact about the SERVER, not the device: whether this
+/// ffmpeg build can remove a Dolby Vision configuration on the way out (the
+/// `dovi_rpu` bitstream filter, ffmpeg 7.1+). It decides whether a DV source
+/// a client cannot decode is a remux or a re-encode.
+pub fn decide(file: &MediaFile, profile: &DeviceProfile, dv_strippable: bool) -> Decision {
+    let (mut c, mut reasons) = evaluate(file, profile);
+
+    match dv_handling(file, profile, dv_strippable) {
+        DvHandling::None => {}
+        DvHandling::Strip => {
+            // Not a transcode: the base layer is kept untouched and only the
+            // DV configuration goes. But it takes ffmpeg, so the raw file
+            // cannot be handed over as-is.
+            c.container_ok = false;
+            reasons.push("Dolby Vision removed for this browser (video kept)".to_owned());
+        }
+        DvHandling::Reencode => {
+            c.video_ok = false;
+            reasons.push(
+                "Dolby Vision can't be removed by this ffmpeg (needs 7.1+) and this \
+                 browser won't decode it"
+                    .to_owned(),
+            );
+        }
+    }
 
     // A manual A/V sync correction can only be applied by ffmpeg, so direct
     // play is off the table for that file — remux at minimum.
@@ -274,9 +350,14 @@ pub fn decide(file: &MediaFile, profile: &DeviceProfile) -> Decision {
 }
 
 /// Like [`decide`], but honoring a manual quality override from the player.
-pub fn decide_forced(file: &MediaFile, profile: &DeviceProfile, force: Force) -> Decision {
+pub fn decide_forced(
+    file: &MediaFile,
+    profile: &DeviceProfile,
+    force: Force,
+    dv_strippable: bool,
+) -> Decision {
     match force {
-        Force::Auto => decide(file, profile),
+        Force::Auto => decide(file, profile, dv_strippable),
         Force::Transcode => {
             let (_, mut reasons) = evaluate(file, profile);
             reasons.insert(0, "forced transcode (manual quality)".to_owned());
@@ -293,14 +374,25 @@ pub fn decide_forced(file: &MediaFile, profile: &DeviceProfile, force: Force) ->
             // undecodable, the client's error path falls back to transcode.
             let (c, _) = evaluate(file, profile);
             let has_av_offset = file.audio_offset_ms != 0;
-            let method = if c.container_ok && c.audio_ok && !has_av_offset {
+            // A DV source this client can't decode still may not be handed
+            // over raw — Original means "no video re-encode", which a strip
+            // remux honours (the base layer is untouched). When even that is
+            // unavailable the remux is the client's error path to rescue, as
+            // it always was.
+            let dv = dv_handling(file, profile, dv_strippable);
+            let method = if c.container_ok && c.audio_ok && !has_av_offset && dv == DvHandling::None
+            {
                 PlaybackMethod::DirectPlay
             } else {
                 PlaybackMethod::Remux
             };
+            let mut reasons = vec!["forced original quality (no video transcode)".to_owned()];
+            if dv == DvHandling::Strip {
+                reasons.push("Dolby Vision removed for this browser (video kept)".to_owned());
+            }
             Decision {
                 method,
-                reasons: vec!["forced original quality (no video transcode)".to_owned()],
+                reasons,
                 transcode_audio: !c.audio_ok,
                 container: "mp4",
             }
@@ -400,7 +492,7 @@ mod tests {
 
     #[test]
     fn mp4_h264_aac_direct_plays_on_web() {
-        let d = decide(&file("mp4", "h264", "aac"), default_profile());
+        let d = decide(&file("mp4", "h264", "aac"), default_profile(), true);
         assert_eq!(d.method, PlaybackMethod::DirectPlay);
         assert!(d.reasons.is_empty());
     }
@@ -408,14 +500,14 @@ mod tests {
     #[test]
     fn mkv_h264_aac_remuxes_on_web() {
         // Right codecs, wrong container → remux, no audio transcode.
-        let d = decide(&file("mkv", "h264", "aac"), default_profile());
+        let d = decide(&file("mkv", "h264", "aac"), default_profile(), true);
         assert_eq!(d.method, PlaybackMethod::Remux);
         assert!(!d.transcode_audio);
     }
 
     #[test]
     fn mkv_h264_ac3_remuxes_with_audio_transcode() {
-        let d = decide(&file("mkv", "h264", "ac3"), default_profile());
+        let d = decide(&file("mkv", "h264", "ac3"), default_profile(), true);
         assert_eq!(d.method, PlaybackMethod::Remux);
         assert!(
             d.transcode_audio,
@@ -427,18 +519,21 @@ mod tests {
     fn hevc_transcodes_on_web_but_direct_plays_on_native() {
         let hevc = file("mkv", "hevc", "aac");
         assert_eq!(
-            decide(&hevc, default_profile()).method,
+            decide(&hevc, default_profile(), true).method,
             PlaybackMethod::Transcode
         );
         let native = profile("directplay-any").expect("profile");
-        assert_eq!(decide(&hevc, native).method, PlaybackMethod::DirectPlay);
+        assert_eq!(
+            decide(&hevc, native, true).method,
+            PlaybackMethod::DirectPlay
+        );
     }
 
     #[test]
     fn hdr_forces_transcode_on_sdr_profile() {
         let mut f = file("mp4", "h264", "aac");
         f.hdr = Some("hdr10".to_owned());
-        let d = decide(&f, default_profile());
+        let d = decide(&f, default_profile(), true);
         assert_eq!(d.method, PlaybackMethod::Transcode);
         assert!(d.reasons.iter().any(|r| r.contains("HDR")));
     }
@@ -454,11 +549,117 @@ mod tests {
             vec!["aac".into(), "opus".into()],
             None,
             false,
+            false,
         );
-        assert_eq!(decide(&hevc_mp4, &caps).method, PlaybackMethod::DirectPlay);
+        assert_eq!(
+            decide(&hevc_mp4, &caps, true).method,
+            PlaybackMethod::DirectPlay
+        );
         // Same codecs, MKV container → remux (copy video), not transcode.
         let hevc_mkv = file("mkv", "hevc", "aac");
-        assert_eq!(decide(&hevc_mkv, &caps).method, PlaybackMethod::Remux);
+        assert_eq!(decide(&hevc_mkv, &caps, true).method, PlaybackMethod::Remux);
+    }
+
+    /// The Chrome-refuses-Dolby-Vision failure, as a decision. Both films it
+    /// was found on (a P7 and a P8 disc remux, both "HDR10-compatible") were
+    /// remuxed to Chrome because the client claimed HDR — and Chrome refused
+    /// the track outright, so the player's error path re-encoded a 4K remux
+    /// down to the Auto rung. Safari played the same files untouched.
+    #[test]
+    fn dolby_vision_is_not_handed_to_a_browser_that_cannot_decode_it() {
+        let mut dv = file("mkv", "hevc", "aac");
+        dv.hdr = Some("dolby_vision".to_owned());
+        let hdr_client = |dolby: bool| {
+            caps_profile(
+                vec!["mkv".into(), "mp4".into()],
+                vec!["hevc".into(), "h264".into()],
+                vec!["aac".into()],
+                None,
+                true,
+                dolby,
+            )
+        };
+
+        // Safari: decodes DV, so nothing changes — the file direct-plays.
+        let safari = hdr_client(true);
+        assert_eq!(
+            decide(&dv, &safari, true).method,
+            PlaybackMethod::DirectPlay,
+            "a client that decodes Dolby Vision is handed it untouched"
+        );
+
+        // Chrome, on a server that can strip: a remux, not a re-encode. The
+        // base layer is kept, so the viewer still gets the source's pixels —
+        // but it takes ffmpeg, so the raw file may not be handed over.
+        let chrome = hdr_client(false);
+        let stripped = decide(&dv, &chrome, true);
+        assert_eq!(stripped.method, PlaybackMethod::Remux);
+        assert!(
+            stripped.reasons.iter().any(|r| r.contains("Dolby Vision")),
+            "and it says so: {:?}",
+            stripped.reasons
+        );
+
+        // Chrome, on a server that cannot strip (ffmpeg < 7.1): the only
+        // stream this browser will play is a re-encoded one. Deciding that up
+        // front is the point — the alternative is what shipped: a remux the
+        // browser refuses, then a rescue nobody asked for.
+        let reencoded = decide(&dv, &chrome, false);
+        assert_eq!(reencoded.method, PlaybackMethod::Transcode);
+        assert!(
+            reencoded.reasons.iter().any(|r| r.contains("7.1")),
+            "naming the fix, not just the symptom: {:?}",
+            reencoded.reasons
+        );
+
+        // An HDR10 file is untouched by any of this — the rule is about the
+        // Dolby Vision configuration, not about HDR.
+        let mut hdr10 = file("mp4", "hevc", "aac");
+        hdr10.hdr = Some("hdr10".to_owned());
+        assert_eq!(
+            decide(&hdr10, &chrome, false).method,
+            PlaybackMethod::DirectPlay
+        );
+    }
+
+    /// Original means "no video re-encode", and a DV strip honours that — the
+    /// base layer is copied. But it still cannot be direct play, because the
+    /// raw file is what the browser refuses.
+    #[test]
+    fn forced_original_strips_dolby_vision_rather_than_handing_over_the_raw_file() {
+        let mut dv = file("mp4", "hevc", "aac"); // container+audio both fine
+        dv.hdr = Some("dolby_vision".to_owned());
+        let chrome = caps_profile(
+            vec!["mp4".into()],
+            vec!["hevc".into()],
+            vec!["aac".into()],
+            None,
+            true,
+            false,
+        );
+        let d = decide_forced(&dv, &chrome, Force::Original, true);
+        assert_eq!(
+            d.method,
+            PlaybackMethod::Remux,
+            "direct play would hand over the DV track the browser refuses"
+        );
+        assert!(
+            !d.transcode_audio,
+            "and the audio it can already play is copied"
+        );
+
+        let safari = caps_profile(
+            vec!["mp4".into()],
+            vec!["hevc".into()],
+            vec!["aac".into()],
+            None,
+            true,
+            true,
+        );
+        assert_eq!(
+            decide_forced(&dv, &safari, Force::Original, true).method,
+            PlaybackMethod::DirectPlay
+        );
     }
 
     #[test]
@@ -471,16 +672,18 @@ mod tests {
             vec!["aac".into()],
             None,
             false,
+            false,
         );
-        assert_eq!(decide(&f, &sdr).method, PlaybackMethod::Transcode); // SDR display → tone-map
+        assert_eq!(decide(&f, &sdr, true).method, PlaybackMethod::Transcode); // SDR display → tone-map
         let hdr = caps_profile(
             vec!["mp4".into()],
             vec!["hevc".into()],
             vec!["aac".into()],
             None,
             true,
+            false,
         );
-        assert_eq!(decide(&f, &hdr).method, PlaybackMethod::DirectPlay); // HDR display → direct
+        assert_eq!(decide(&f, &hdr, true).method, PlaybackMethod::DirectPlay); // HDR display → direct
     }
 
     #[test]
@@ -495,8 +698,9 @@ mod tests {
             vec!["aac".into()],
             None,
             false,
+            false,
         );
-        assert_eq!(decide(&f, &caps).method, PlaybackMethod::DirectPlay);
+        assert_eq!(decide(&f, &caps, true).method, PlaybackMethod::DirectPlay);
     }
 
     #[test]
@@ -504,19 +708,19 @@ mod tests {
         // HEVC the browser can't take would auto-transcode; Original forces a
         // copy-video remux instead (client rescues if it truly won't decode).
         let hevc = file("mkv", "hevc", "aac");
-        let d = decide_forced(&hevc, default_profile(), Force::Original);
+        let d = decide_forced(&hevc, default_profile(), Force::Original, true);
         assert_eq!(d.method, PlaybackMethod::Remux);
-        assert!(decide(&hevc, default_profile()).method == PlaybackMethod::Transcode);
+        assert!(decide(&hevc, default_profile(), true).method == PlaybackMethod::Transcode);
     }
 
     #[test]
     fn forced_transcode_overrides_a_direct_playable_file() {
         let mp4 = file("mp4", "h264", "aac");
         assert_eq!(
-            decide(&mp4, default_profile()).method,
+            decide(&mp4, default_profile(), true).method,
             PlaybackMethod::DirectPlay
         );
-        let d = decide_forced(&mp4, default_profile(), Force::Transcode);
+        let d = decide_forced(&mp4, default_profile(), Force::Transcode, true);
         assert_eq!(d.method, PlaybackMethod::Transcode);
     }
 
@@ -524,8 +728,8 @@ mod tests {
     fn forced_auto_matches_plain_decide() {
         let mkv = file("mkv", "h264", "ac3");
         assert_eq!(
-            decide_forced(&mkv, default_profile(), Force::Auto).method,
-            decide(&mkv, default_profile()).method
+            decide_forced(&mkv, default_profile(), Force::Auto, true).method,
+            decide(&mkv, default_profile(), true).method
         );
     }
 

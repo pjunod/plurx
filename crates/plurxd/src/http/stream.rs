@@ -124,6 +124,10 @@ pub struct Caps {
     pub maxheight: Option<i64>,
     /// 1 when HDR may be shown directly (browser decodes it AND display is HDR).
     pub hdr: Option<u8>,
+    /// `1` when this client decodes Dolby Vision (Safari does; Chrome does
+    /// not, at any profile). Absent means no — an old client that never sends
+    /// it is exactly one that has not been taught to ask.
+    pub dv: Option<u8>,
     /// Manual override: `auto` (default) | `original` | `transcode`.
     pub force: Option<String>,
 }
@@ -179,6 +183,7 @@ impl Caps {
                 acodec,
                 self.maxheight,
                 self.hdr == Some(1),
+                self.dv == Some(1),
             )
         } else {
             self.profile
@@ -197,8 +202,12 @@ impl Caps {
     }
 
     /// The decision this client should get for `file`.
-    fn decide(&self, file: &MediaFile) -> Decision {
-        playback::decide_forced(file, &self.profile(), self.force())
+    ///
+    /// `dv_strippable` is the server's own capability (see
+    /// [`playback::decide`]) — passed in because only the caller holds the
+    /// system info that records which ffmpeg is running.
+    fn decide(&self, file: &MediaFile, dv_strippable: bool) -> Decision {
+        playback::decide_forced(file, &self.profile(), self.force(), dv_strippable)
     }
 }
 
@@ -340,6 +349,16 @@ pub struct DecisionResponse {
     /// otherwise have used.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefer_segmented: Option<String>,
+}
+
+/// Can this server remove a Dolby Vision configuration on the way out?
+///
+/// One authority — the ffmpeg the daemon actually probed at boot — because
+/// the answer decides a *verdict* now, not just a bitstream-filter argument,
+/// and a second copy of it somewhere else is a second answer waiting to
+/// disagree.
+fn dv_strippable(state: &AppState) -> bool {
+    plurx_core::transcode::ffmpeg_has_dovi_bsf(state.system.ffmpeg_version.as_deref().unwrap_or(""))
 }
 
 fn source_summary(file: &MediaFile) -> SourceSummary {
@@ -574,7 +593,7 @@ pub async fn decision(
                 .into(),
         ));
     }
-    let decision = q.decide(&file);
+    let decision = q.decide(&file, dv_strippable(&state));
 
     let play_url = match decision.method {
         playback::PlaybackMethod::DirectPlay => format!("/api/v1/files/{id}/direct"),
@@ -869,6 +888,10 @@ pub struct StreamQuery {
     pub container: Option<String>,
     pub maxheight: Option<i64>,
     pub hdr: Option<u8>,
+    /// `1` when this client decodes Dolby Vision (Safari does; Chrome does
+    /// not, at any profile). Absent means no — an old client that never sends
+    /// it is exactly one that has not been taught to ask.
+    pub dv: Option<u8>,
     pub force: Option<String>,
     /// The player's own stream id, so it can ask `/stream/:id/status` how this
     /// remux is doing. Optional: an old client, curl, or an AirPlay target
@@ -885,6 +908,7 @@ impl StreamQuery {
             container: self.container.clone(),
             maxheight: self.maxheight,
             hdr: self.hdr,
+            dv: self.dv,
             force: self.force.clone(),
         }
     }
@@ -899,7 +923,7 @@ pub async fn stream_mp4(
 ) -> Result<Response, ApiError> {
     let file = load_file(&state, id).await?;
     crate::playstart::note_playback_started(&state, user.id, id);
-    let decision = q.caps().decide(&file);
+    let decision = q.caps().decide(&file, dv_strippable(&state));
     let audio = q.audio.unwrap_or(0).max(0);
     // Copy HEVC gets an `hvc1` tag so Safari's <video> accepts the fMP4 (an
     // `hev1`-tagged MKV copy otherwise plays audio-only / black in Safari).
