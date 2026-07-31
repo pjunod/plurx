@@ -2454,13 +2454,20 @@ impl TranscodeManager {
     /// which encoder won — the player learns that from the response it gets
     /// back *after* the height has been chosen (PERF-PLAN §4.7).
     pub async fn auto_height(&self, source_height: Option<i64>) -> i64 {
-        if self.encoder().await == Encoder::Software {
-            return AUTO_SOFTWARE_HEIGHT;
-        }
+        // Software's ceiling is lower; the shape is the same. It used to
+        // return its ceiling unconditionally, which never *upscaled* — the
+        // filter caps at the source — but advertised 720p bitrate and
+        // response metadata for a 480p stream (review §3.1). The rung is a
+        // promise about the output; it follows the source on both encoders.
+        let max = if self.encoder().await == Encoder::Software {
+            AUTO_SOFTWARE_HEIGHT
+        } else {
+            AUTO_HARDWARE_MAX_HEIGHT
+        };
         source_height
             .filter(|h| *h > 0)
-            .unwrap_or(AUTO_HARDWARE_MAX_HEIGHT)
-            .clamp(MIN_HEIGHT, AUTO_HARDWARE_MAX_HEIGHT)
+            .unwrap_or(max)
+            .clamp(MIN_HEIGHT, max)
     }
 
     /// The admin's playback language preferences (Settings → Playback
@@ -3806,12 +3813,16 @@ mod tests {
             Pipeline::Cpu,
         );
 
-        // Software keeps the conservative answer whatever the source is: a
+        // Software keeps the conservative ceiling whatever the source is: a
         // 1080p x264 session on a NUC cannot hold realtime, and a stream that
         // stutters at 1080p is worse than one that plays at 720p.
-        for source in [Some(2160), Some(1080), Some(480), None] {
+        for source in [Some(2160), Some(1080), None] {
             assert_eq!(software.auto_height(source).await, 720, "source {source:?}");
         }
+        // …and never advertises a rung above the source: the filter already
+        // refused to upscale, but the bitrate and the response metadata
+        // described 720p for a 480p stream (§3.1).
+        assert_eq!(software.auto_height(Some(480)).await, 480, "never upscales");
 
         // Hardware follows the source, capped at 1080 — 4K is a bandwidth
         // decision as well as a CPU one, and Auto should not put 20 Mb/s on
