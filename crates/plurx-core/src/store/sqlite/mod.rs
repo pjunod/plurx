@@ -18,6 +18,7 @@ mod users;
 mod watch;
 
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -495,12 +496,53 @@ fn user_from_row(row: &Row<'_>) -> rusqlite::Result<User> {
 
 pub struct SqliteStore {
     conn: Arc<Mutex<Connection>>,
+    /// Dedicated read-only connections, for file-backed stores.
+    ///
+    /// Serializing writes through the one guarded connection is right;
+    /// making every read-only settings and metadata lookup queue behind it
+    /// is not — with WAL on, readers and the writer are concurrent by
+    /// design, and the hottest control paths (flow-control settings, the
+    /// per-request file/item lookups) were paying writer-lock latency for
+    /// no isolation benefit (review §3.2). `None` for in-memory stores,
+    /// where a second connection would be a different, empty database;
+    /// their reads take the writer connection exactly as before.
+    reads: Option<Arc<ReadPool>>,
 }
+
+/// A few read-only connections picked round-robin. Opened READ_ONLY so a
+/// routing mistake is a loud error instead of a write sneaking around the
+/// writer's serialization.
+struct ReadPool {
+    conns: Vec<Mutex<Connection>>,
+    next: AtomicUsize,
+}
+
+/// Two: enough that a settings read and a metadata read can overlap, few
+/// enough to be nothing on any box this runs on.
+const READ_CONNS: usize = 2;
 
 impl SqliteStore {
     /// Open (creating if necessary) the database at `path` and migrate it.
     pub fn open(path: &Path) -> Result<Self, StoreError> {
-        Self::init(Connection::open(path)?)
+        let mut store = Self::init(Connection::open(path)?)?;
+        // After init: the writer has migrated, so the schema the readers see
+        // is the one this binary expects.
+        let mut conns = Vec::with_capacity(READ_CONNS);
+        for _ in 0..READ_CONNS {
+            let conn = Connection::open_with_flags(
+                path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )?;
+            conn.pragma_update(None, "busy_timeout", 5000)?;
+            conns.push(Mutex::new(conn));
+        }
+        store.reads = Some(Arc::new(ReadPool {
+            conns,
+            next: AtomicUsize::new(0),
+        }));
+        Ok(store)
     }
 
     /// In-memory store for tests.
@@ -519,6 +561,7 @@ impl SqliteStore {
         Self::backfill_hdr_format(&conn)?;
         Ok(SqliteStore {
             conn: Arc::new(Mutex::new(conn)),
+            reads: None,
         })
     }
 
@@ -640,6 +683,29 @@ impl SqliteStore {
         .await
         .map_err(|e| StoreError::Task(e.to_string()))?
     }
+
+    /// Like [`with_conn`](Self::with_conn), on a read connection when the
+    /// store has them. Only for closures that read: the pool's connections
+    /// are opened READ_ONLY, so a write through here fails loudly rather
+    /// than dodging the writer's serialization.
+    pub(crate) async fn with_read<T, F>(&self, f: F) -> Result<T, StoreError>
+    where
+        F: FnOnce(&Connection) -> Result<T, StoreError> + Send + 'static,
+        T: Send + 'static,
+    {
+        let Some(pool) = self.reads.clone() else {
+            return self.with_conn(f).await;
+        };
+        tokio::task::spawn_blocking(move || {
+            let idx = pool.next.fetch_add(1, Ordering::Relaxed) % pool.conns.len();
+            let guard = pool.conns[idx]
+                .lock()
+                .map_err(|_| StoreError::Task("sqlite read mutex poisoned".to_owned()))?;
+            f(&guard)
+        })
+        .await
+        .map_err(|e| StoreError::Task(e.to_string()))?
+    }
 }
 
 #[async_trait]
@@ -654,7 +720,7 @@ impl SettingsStore for SqliteStore {
 
     async fn get_setting(&self, key: &str) -> Result<Option<String>, StoreError> {
         let key = key.to_owned();
-        self.with_conn(move |conn| {
+        self.with_read(move |conn| {
             Ok(conn
                 .query_row(
                     "SELECT value FROM settings WHERE key = ?1",
@@ -693,6 +759,56 @@ impl SettingsStore for SqliteStore {
 mod tests {
     use super::*;
     use crate::store::{MediaStore, SettingsStore};
+
+    /// The §3.2 pair: a write on the writer connection is visible to the
+    /// read pool at once (WAL read-your-writes across connections), and a
+    /// busy writer no longer makes readers queue — the read completes while
+    /// the writer connection is deliberately held hostage.
+    #[tokio::test]
+    async fn reads_see_writes_and_do_not_queue_behind_the_writer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(SqliteStore::open(&dir.path().join("plurx.db")).expect("open"));
+
+        // Visibility across connections: put on the writer, get on a reader.
+        store.put_setting("k", "v").await.expect("put");
+        assert_eq!(
+            store.get_setting("k").await.expect("get"),
+            Some("v".to_owned()),
+            "a committed write is visible to the read pool immediately"
+        );
+
+        // Park the writer connection: the closure holds its mutex until
+        // released, which is exactly what a slow write or a scan batch does.
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let store = Arc::clone(&store);
+            tokio::spawn(async move {
+                store
+                    .with_conn(move |_conn| {
+                        held_tx.send(()).ok();
+                        release_rx.recv().ok();
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+        tokio::task::spawn_blocking(move || held_rx.recv())
+            .await
+            .expect("join")
+            .expect("the holder took the writer connection");
+
+        // The read must complete while the writer is held. Generous bound:
+        // it passes in microseconds, and only a regression that routes reads
+        // back through the writer mutex can spend it.
+        tokio::time::timeout(std::time::Duration::from_secs(10), store.get_setting("k"))
+            .await
+            .expect("a read must not queue behind the writer")
+            .expect("get");
+
+        release_tx.send(()).expect("release");
+        holder.await.expect("join").expect("holder");
+    }
 
     #[tokio::test]
     async fn settings_roundtrip_and_upsert() {

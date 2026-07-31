@@ -251,7 +251,8 @@ impl MediaStore for SqliteStore {
     }
 
     async fn get_item(&self, id: i64) -> Result<Option<Item>, StoreError> {
-        self.with_conn(move |conn| {
+        // Same reasoning as `get_file`: hot, read-only, off the writer.
+        self.with_read(move |conn| {
             Ok(find_by(
                 conn,
                 &format!("SELECT {ITEM_COLS} FROM items WHERE id = ?1"),
@@ -782,7 +783,10 @@ impl MediaStore for SqliteStore {
     }
 
     async fn get_file(&self, id: i64) -> Result<Option<MediaFile>, StoreError> {
-        self.with_conn(move |conn| {
+        // The per-request metadata lookup: session starts, decisions, VTT.
+        // Read-only, so it takes a read connection instead of queuing behind
+        // whatever the writer is doing (review §3.2).
+        self.with_read(move |conn| {
             Ok(conn
                 .query_row(
                     &format!("SELECT {FILE_COLS} FROM files WHERE id = ?1"),
