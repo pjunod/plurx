@@ -1037,6 +1037,38 @@ const PRODUCER_POLL: Duration = Duration::from_millis(250);
 /// there, and retrying eagerly would just spin.
 const PRODUCER_RETRY: Duration = Duration::from_secs(5);
 
+/// The producer timings that are data rather than constants, so a test can
+/// state what it needs instead of racing the hardware.
+///
+/// Every field defaults to the production value above and nothing in the
+/// daemon ever changes one — `TranscodeManager::new` takes the default and
+/// there is no setter outside `#[cfg(test)]`. They live here because the
+/// resume path is only reachable by *interrupting an encoder that is still
+/// running*, and whether that is possible at all depends on how fast the box
+/// is: a 16-core desktop finished the whole 240-second fixture between two
+/// sleeps that a 2-core CI runner needed five seconds for, so the test
+/// asserting "this was preempted" was really asserting "this machine is
+/// slow". Pacing the producer's input makes a part's wall-clock duration a
+/// property of the *source and the rate* instead of the CPU, and shortening
+/// the retry keeps the test from paying five seconds per preemption.
+#[derive(Debug, Clone, Copy)]
+struct ProducerTuning {
+    /// Pacing for a producer part's input. [`Pacing::unpaced`] in production —
+    /// see the comment at the `hls_args` call in `produce_into` for why.
+    pacing: Pacing,
+    /// Stand-in for [`PRODUCER_RETRY`].
+    retry: Duration,
+}
+
+impl Default for ProducerTuning {
+    fn default() -> Self {
+        ProducerTuning {
+            pacing: Pacing::unpaced(),
+            retry: PRODUCER_RETRY,
+        }
+    }
+}
+
 /// How many times one run will resume after being preempted before giving up
 /// until the next producer pass.
 ///
@@ -1212,6 +1244,8 @@ pub struct TranscodeManager {
     /// Small by construction — an entry is dropped as soon as its session is
     /// gone, and one player instance has one in flight at a time.
     requests: Mutex<HashMap<String, (String, String)>>,
+    /// See [`ProducerTuning`]. Always the default outside tests.
+    producer: ProducerTuning,
 }
 
 impl TranscodeManager {
@@ -1235,6 +1269,7 @@ impl TranscodeManager {
             cache: None,
             sessions: Mutex::new(HashMap::new()),
             requests: Mutex::new(HashMap::new()),
+            producer: ProducerTuning::default(),
         }
     }
 
@@ -1251,6 +1286,15 @@ impl TranscodeManager {
             ffmpeg_build,
             node_id,
         });
+        self
+    }
+
+    /// Override [`ProducerTuning`]. Tests only — there is deliberately no
+    /// production path that reaches this, so the daemon cannot be configured
+    /// into pacing a producer or into a shorter retry by accident.
+    #[cfg(test)]
+    fn with_producer_tuning(mut self, producer: ProducerTuning) -> Self {
+        self.producer = producer;
         self
     }
 
@@ -1707,7 +1751,7 @@ impl TranscodeManager {
             // second, for as long as somebody was waiting to play something.
             let slot = if encoder == Encoder::Software {
                 if self.admissions.live_is_waiting() {
-                    tokio::time::sleep(PRODUCER_RETRY).await;
+                    tokio::time::sleep(self.producer.retry).await;
                     continue;
                 }
                 None
@@ -1715,7 +1759,7 @@ impl TranscodeManager {
                 match self.admissions.try_acquire(max, Priority::Background) {
                     Some(slot) => Some(slot),
                     None => {
-                        tokio::time::sleep(PRODUCER_RETRY).await;
+                        tokio::time::sleep(self.producer.retry).await;
                         continue;
                     }
                 }
@@ -1734,12 +1778,14 @@ impl TranscodeManager {
             // Unpaced, deliberately. Pacing exists so a live session does not
             // write a film ahead of a playhead that will never reach it; a
             // producer has no playhead and every second it spends holding the
-            // hardware is a second a viewer might want it.
+            // hardware is a second a viewer might want it. The value is
+            // [`ProducerTuning::pacing`], which is `unpaced()` everywhere
+            // except the one test that has to interrupt this encoder.
             let args = transcode::hls_args(
                 file,
                 encoder,
                 &part_opts,
-                Pacing::unpaced(),
+                self.producer.pacing,
                 &part_dir.to_string_lossy(),
             );
             tracing::info!(
@@ -4251,23 +4297,102 @@ mod tests {
     async fn an_unfinished_run_keeps_its_place_but_is_never_serveable() {
         super::require_ffmpeg();
         use plurx_core::store::SqliteStore;
+        // The budget below is squeezed between two facts about the encoder,
+        // and the two ends fail on opposite hardware:
+        //
+        //   too generous → a quick box finishes the whole film inside it, and
+        //     "an unfinished run must not publish" fails on a run that finished
+        //   too tight    → a busy box has not published a segment yet, and
+        //     "the encoded part was thrown away" fails on a part never written
+        //
+        // Unpaced, both ends are facts about the CPU, and no constant satisfies
+        // both: 700 ms failed the first way on a 16-core desktop, 100 ms failed
+        // the second way on a 2-core runner, and 1200 ms failed the second way
+        // again on the desktop once the suite around it got busier.
+        //
+        // Pacing the input fixes the upper end **arithmetically**: at READRATE,
+        // a budget of B reaches B x READRATE seconds of source and no more, on
+        // any hardware, so "it cannot have finished" stops being a hope. See
+        // the pacing note in `a_preempted_producer_resumes_without_losing_picture`.
+        //
+        // The lower end cannot be closed the same way, because "ffmpeg starts
+        // and publishes one segment" is genuinely a fact about the machine and
+        // about what else is running on it. So it is not asserted on the first
+        // try: a pass that produced nothing gets one more with twice the
+        // budget, and only a second empty pass is a failure. That costs a slow
+        // build a few seconds and costs a correct one nothing, where the
+        // alternative — a bigger constant — costs every build every time and
+        // still guesses.
+        const SECONDS: u32 = 120;
+        const READRATE: f64 = 5.0;
+        // 25 s of a 120 s film on the first try and 51 s on the second, so
+        // even the doubled budget is nowhere near the end; and 5 s for ffmpeg
+        // to start against the 0.4 s of reading one segment needs.
+        const PARTIAL_BUDGET: Duration = Duration::from_millis(5_000);
+
+        if !crate::ffmpeg::pacing_caps().await.readrate {
+            eprintln!(
+                "skipping an_unfinished_run_keeps_its_place_but_is_never_serveable: \
+                 `{}` has no -readrate (needs ffmpeg 5.1+), so the partial budget \
+                 cannot be made independent of this machine's speed",
+                crate::ffmpeg::ffmpeg_bin()
+            );
+            return;
+        }
+
         let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
         let media = tempfile::tempdir().expect("media");
         let source = media.path().join("Heat.mkv");
-        write_real_video(&source, 240);
+        write_real_video(&source, SECONDS);
         let file_id = seed_real_file(&store, &source).await;
         let (mgr, _work, cache) = cached_manager(&store);
+        let mgr = mgr.with_producer_tuning(ProducerTuning {
+            pacing: Pacing {
+                readrate: Some(READRATE),
+                initial_burst: None,
+                legacy_re: false,
+            },
+            ..ProducerTuning::default()
+        });
         let file = store.get_file(file_id).await.expect("get").expect("file");
         let hash = recipe_hash_for(&mgr, &file, 240).await;
 
         // A short budget: it encodes some of the film and runs out of time.
-        assert!(
-            mgr.produce(&file, 240, Instant::now() + Duration::from_millis(700))
+        let staging = crate::cachekeep::staging_dir(cache.path(), &hash);
+        let mut budget = PARTIAL_BUDGET;
+        for attempt in 1..=2 {
+            let started = Instant::now();
+            let unfinished = mgr
+                .produce(&file, 240, Instant::now() + budget)
                 .await
-                .expect("produce")
-                .is_none(),
-            "an unfinished run must not publish"
-        );
+                .expect("produce");
+            assert!(
+                unfinished.is_none(),
+                "an unfinished run must not publish — but this box finished the \
+                 whole {SECONDS}s fixture in {:?}, inside a {budget:?} budget \
+                 that at {READRATE}x realtime reaches only {}s of it, so the \
+                 pacing is not being applied rather than the cache being wrong",
+                started.elapsed(),
+                budget.as_secs_f64() * READRATE
+            );
+            if staging.join(crate::produce::part_dir(0)).exists() {
+                break;
+            }
+            // Nothing was encoded, so there is nothing for the rest of this
+            // test to be about. That is the lower end giving way — see above.
+            assert!(
+                attempt < 2,
+                "two passes, {:?} and {:?}, and ffmpeg never published a \
+                 segment: at {READRATE}x realtime one {}s segment is {}s of \
+                 reading, so this box needed more than {budget:?} just to \
+                 start an encoder",
+                PARTIAL_BUDGET,
+                budget,
+                plurx_core::transcode::SEGMENT_SECONDS,
+                f64::from(plurx_core::transcode::SEGMENT_SECONDS) / READRATE
+            );
+            budget *= 2;
+        }
 
         assert!(
             store.cache_hit(&hash, NODE).await.expect("hit").is_none(),
@@ -4283,7 +4408,6 @@ mod tests {
             .await
             .expect("claims");
         assert_eq!(claims.len(), 1, "the claim that lets a later pass resume");
-        let staging = crate::cachekeep::staging_dir(cache.path(), &hash);
         assert!(
             staging.join(crate::produce::part_dir(0)).exists(),
             "the encoded part was thrown away, so the next pass starts from zero"
@@ -4291,6 +4415,12 @@ mod tests {
 
         // And picking it up finishes the job from where it stopped rather than
         // from the beginning.
+        //
+        // Flat out, deliberately: the pacing above exists to bound what the
+        // *budgeted* pass could reach, and this pass has no budget to bound.
+        // Pacing it too would add SECONDS/READRATE seconds to every run of
+        // this test in exchange for nothing.
+        let mgr = mgr.with_producer_tuning(ProducerTuning::default());
         let made = mgr
             .produce(&file, 240, Instant::now() + Duration::from_secs(180))
             .await
@@ -4302,8 +4432,8 @@ mod tests {
             "the second pass restarted from zero instead of resuming"
         );
         assert!(
-            (made.duration_ms - 240_000).abs() <= 1_000,
-            "resuming across passes lost picture: {}ms",
+            (made.duration_ms - (SECONDS as i64) * 1_000).abs() <= 1_000,
+            "resuming across passes lost picture: {}ms of a {SECONDS}s source",
             made.duration_ms
         );
         assert!(
@@ -4363,24 +4493,75 @@ mod tests {
     /// a film, in a file nobody watches until next week, with every log line
     /// green. Only measuring the assembled timeline against the source catches
     /// it, so that is what this does.
+    ///
+    /// Everything about the timing here is derived from the producer's own
+    /// output or from a rate this test sets — see the comment on the pacing
+    /// below. A test of preemption that sleeps a fixed interval is really a
+    /// test of how fast the machine is.
     #[tokio::test]
     async fn a_preempted_producer_resumes_without_losing_picture() {
         super::require_ffmpeg();
         use plurx_core::store::SqliteStore;
-        // Long enough that the encode cannot finish between the interrupts.
-        // Sized from measurement, not from taste: at 160x120 this fixture
-        // transcodes in about three seconds here, and the 24-second version it
-        // replaced took 394ms — which is to say the earlier version of this
-        // test was interrupting an encode that had already finished, and
-        // passing every assertion below without exercising a line of the
-        // resume path. The `parts >= 2` check now makes that failure loud.
-        const SECONDS: u32 = 240;
+        // The producer's input is paced for this test, which is what makes it
+        // a test rather than a race.
+        //
+        // Preemption is only observable while the encoder is still running, so
+        // the previous shape — a 240-second fixture and a 400 ms sleep — was
+        // an unwritten assertion that this machine needs more than 400 ms to
+        // transcode 240 seconds of 160x120. A 2-core CI box needs about five
+        // seconds and passed; a 16-core desktop needs about a third of one,
+        // finished before the first interrupt, and failed with "nothing was
+        // actually preempted". No fixture length satisfies both: whatever is
+        // long enough for the fast box is minutes of CI time on the slow one.
+        //
+        // `-readrate N` removes the CPU from the equation. The encoder reads
+        // its input at N times realtime, so a part's wall-clock duration is
+        // SECONDS / READRATE on any box quick enough to keep up — and the
+        // margin for "quick enough" is what the numbers below are chosen for:
+        // the slowest machine seen here manages about 50x realtime on this
+        // fixture, five times the rate asked for. A box slower than READRATE
+        // just takes longer and still gets preempted, so the failure mode is
+        // a slow test rather than a false one.
+        const SECONDS: u32 = 30;
+        const READRATE: f64 = 10.0;
+        // Long enough that a running encoder cannot miss it (PRODUCER_POLL is
+        // a quarter-second), short enough not to dominate the test.
+        const HOLD: Duration = Duration::from_millis(750);
+
+        // `-readrate` landed in ffmpeg 5.1 and is a hard exit on anything
+        // older, so an ancient build gets a skip rather than a failure — the
+        // same bargain `pipeprobe` strikes with a missing zscale. CI has a
+        // modern ffmpeg, so the coverage is not lost.
+        if !crate::ffmpeg::pacing_caps().await.readrate {
+            eprintln!(
+                "skipping a_preempted_producer_resumes_without_losing_picture: \
+                 `{}` has no -readrate (needs ffmpeg 5.1+), so a producer part's \
+                 duration cannot be made independent of this machine's speed",
+                crate::ffmpeg::ffmpeg_bin()
+            );
+            return;
+        }
+
         let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
         let media = tempfile::tempdir().expect("media");
         let source = media.path().join("Heat.mkv");
         write_real_video(&source, SECONDS);
         let file_id = seed_real_file(&store, &source).await;
         let (mgr, _work, cache) = cached_manager(&store);
+        let mgr = mgr.with_producer_tuning(ProducerTuning {
+            pacing: Pacing {
+                readrate: Some(READRATE),
+                // No burst: a burst is exactly the "read the first N seconds
+                // flat out" behaviour this test needs not to have.
+                initial_burst: None,
+                legacy_re: false,
+            },
+            // Production waits five seconds before asking for the hardware
+            // again, and that is the right number for a box where a viewer
+            // just took the slot. Here it is dead time the test pays once per
+            // preemption, and the retry is not what is under test.
+            retry: Duration::from_millis(250),
+        });
         let mgr = Arc::new(mgr);
         let file = store.get_file(file_id).await.expect("get").expect("file");
 
@@ -4392,28 +4573,39 @@ mod tests {
                     .await
             })
         };
-        // Interrupt it twice, so the asset is assembled from at least three
-        // parts and any per-join error would compound rather than cancel.
-        for _ in 0..2 {
-            tokio::time::sleep(Duration::from_millis(400)).await;
+        // Interrupt it twice, so the asset is assembled from three parts and a
+        // per-join error compounds rather than cancels.
+        //
+        // Each interrupt waits for the part it is about to kill to have
+        // published a segment, and then for the *next* part to publish one
+        // before interrupting again. Both waits are observations of the
+        // producer's own output, not sleeps: they are what stops an interrupt
+        // landing before the encoder started (killing a part that produced
+        // nothing, which the producer renumbers away) or during the retry
+        // backoff (where it is simply lost — the reason the old loop's second
+        // interrupt never landed, so this test only ever built two parts even
+        // where it passed).
+        for part in 0..2usize {
+            wait_for_part_segment(cache.path(), part).await;
             let queued = mgr.admissions.wait_for_slot();
-            // Held for longer than one poll interval, so the running encoder
-            // cannot miss it.
-            tokio::time::sleep(Duration::from_millis(600)).await;
+            tokio::time::sleep(HOLD).await;
             drop(queued);
+            wait_for_part_segment(cache.path(), part + 1).await;
         }
         let made = run
             .await
             .expect("join")
             .expect("produce")
             .expect("something was produced");
-        // The assertion that stops this test passing for the wrong reason: a
-        // fixture small enough to finish before the first interrupt would
-        // satisfy every check below while exercising none of the resume path.
+        // The assertion that stops this test passing for the wrong reason: an
+        // encode that finished before it was interrupted would satisfy every
+        // check below while exercising none of the resume path.
         assert!(
-            made.parts >= 2,
-            "the encode finished in one part — nothing was actually preempted, \
-             so this test proved nothing about resuming"
+            made.parts >= 3,
+            "assembled from {} part(s) — two interrupts must leave three, and \
+             fewer means the encode was not actually preempted, so this test \
+             proved nothing about resuming",
+            made.parts
         );
         let hash = made.recipe;
 
@@ -4478,6 +4670,36 @@ mod tests {
             .expect("start");
         assert!(info.vod, "a resumed asset is not findable");
         assert!(mgr.stop_session(&info.session_id, "test").await);
+    }
+
+    /// Wait until part `index` of the one staged pre-transcode has published a
+    /// segment.
+    ///
+    /// The producer publishes each part's segments as it makes them, so this
+    /// is the encoder saying "I am running and I got somewhere" in the only
+    /// vocabulary it has. Polling for it replaces a sleep, and a sleep here is
+    /// always a guess about CPU speed dressed up as a constant.
+    async fn wait_for_part_segment(cache: &std::path::Path, index: usize) {
+        let staging = cache.join(crate::cachekeep::STAGING);
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            // One recipe is in flight, but find it rather than recomputing the
+            // hash: a hash spelled out twice is a hash that can drift.
+            if let Ok(mut entries) = tokio::fs::read_dir(&staging).await {
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    let dir = entry.path().join(crate::produce::part_dir(index));
+                    if !read_part(&dir).await.is_empty() {
+                        return;
+                    }
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "part {index} never published a segment under {}",
+                staging.display()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     /// A file whose real details are on disk, so ffmpeg can actually read it.

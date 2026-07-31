@@ -612,14 +612,14 @@ fn parse_mdia(payload: &[u8], track: &mut Track) -> Result<(), Fmp4Error> {
                 }
                 track.timescale = be_u32(b, off);
             }
-            b"hdlr" => {
-                if b.len() >= 12 {
-                    track.kind = match &b[8..12] {
-                        b"vide" => TrackKind::Video,
-                        b"soun" => TrackKind::Audio,
-                        _ => TrackKind::Other,
-                    };
-                }
+            // Guard rather than a nested `if`: a short hdlr falls through to
+            // the `_ => {}` arm below, which is what the nested form did too.
+            b"hdlr" if b.len() >= 12 => {
+                track.kind = match &b[8..12] {
+                    b"vide" => TrackKind::Video,
+                    b"soun" => TrackKind::Audio,
+                    _ => TrackKind::Other,
+                };
             }
             b"minf" => {
                 for (h2, s2, e2) in children(b)? {

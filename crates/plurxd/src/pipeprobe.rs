@@ -508,6 +508,29 @@ fn escape_lavfi(path: &Path) -> String {
 mod tests {
     use super::*;
 
+    /// True when this ffmpeg build actually has every named filter.
+    ///
+    /// `require_ffmpeg` only proves the binary runs. The CPU tone-map chain
+    /// needs `zscale` (libzimg) and `tonemap`, and a stock Homebrew ffmpeg
+    /// ships without zscale — so the guard passed and the graph then failed
+    /// with `No such filter: 'zscale'`, which reads as a broken repo rather
+    /// than a thin ffmpeg.
+    async fn has_filters(names: &[&str]) -> bool {
+        let Ok(out) = tokio::process::Command::new(ffmpeg_bin())
+            .args(["-hide_banner", "-filters"])
+            .output()
+            .await
+        else {
+            return false;
+        };
+        let listed = String::from_utf8_lossy(&out.stdout);
+        names.iter().all(|n| {
+            listed
+                .lines()
+                .any(|l| l.split_whitespace().nth(1) == Some(n))
+        })
+    }
+
     #[test]
     fn a_gray_screen_is_further_from_the_reference_than_any_tone_map_operator() {
         let reference = Sample {
@@ -623,6 +646,22 @@ mod tests {
     #[tokio::test]
     async fn the_reference_run_produces_real_bt709_from_real_hdr10() {
         crate::transcode::require_ffmpeg();
+        // A box whose ffmpeg cannot tone-map at all has nothing for this probe
+        // to measure, so skip rather than fail — the same way the metadata
+        // tests degrade to "not run here" when ffmpeg is absent. CI runs a
+        // build that has these, so the coverage is not lost. Note this is also
+        // a real deployment fact, not just a test one: plurxd on such a build
+        // cannot run the CPU tone-map chain either, which is why OPERATIONS
+        // recommends jellyfin-ffmpeg.
+        if !has_filters(&["zscale", "tonemap"]).await {
+            eprintln!(
+                "skipping the_reference_run_produces_real_bt709_from_real_hdr10: \
+                 `{}` has no zscale/tonemap — install jellyfin-ffmpeg or point \
+                 PLURX_FFMPEG at a full build",
+                ffmpeg_bin()
+            );
+            return;
+        }
         let dir = tempfile::tempdir().expect("workdir");
 
         let clip = fixture(dir.path()).await.expect("fixture");
