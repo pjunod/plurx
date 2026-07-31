@@ -344,6 +344,12 @@ impl SegmentIndex {
             .sum()
     }
 
+    /// Every byte still on disk, wherever the frontier is. Pruned segments
+    /// carry zero, so this is what the session actually occupies.
+    fn total_bytes(&self) -> i64 {
+        self.segs.iter().map(|s| s.bytes).sum()
+    }
+
     /// Segments old enough to delete: those that END before the retention
     /// window opens. A segment straddling the boundary is kept — half a
     /// segment is no use to anyone and the arithmetic is cheap.
@@ -900,9 +906,18 @@ struct Session {
     fetched_end_ms: AtomicI64,
     /// What the playlist says is published, refreshed as segments complete.
     segments: Mutex<SegmentIndex>,
-    /// This session's share of scratch, cached from the last refresh so the
-    /// global budget can be summed without re-reading every session's disk.
+    /// Published bytes past the client's frontier, cached from the last
+    /// refresh. This is the PACING number: how much reserve the client has.
+    /// It is not a disk number — retention keeps [`RETENTION_SECS`] of
+    /// media *behind* the frontier too, and those bytes are just as much on
+    /// the disk (review §2.7).
     ahead_bytes: AtomicI64,
+    /// Everything this session has on disk that retention has not deleted —
+    /// ahead of the frontier and behind it alike. This is the BUDGET number:
+    /// what the global scratch cap sums. The two used to be one figure, and
+    /// the cap it produced was not a bound: several healthy sessions could
+    /// exceed the documented ceiling by their whole retention windows.
+    live_bytes: AtomicI64,
     /// Live encode telemetry (see [`Progress`]).
     progress: Arc<Progress>,
     /// What kind of work this is, for the admission record (see
@@ -1065,6 +1080,7 @@ impl Session {
             if let Some(ahead) = ahead_of(&index, self.fetched_end_ms.load(Relaxed).max(0)) {
                 self.ahead_bytes.store(ahead.bytes, Relaxed);
             }
+            self.live_bytes.store(index.total_bytes(), Relaxed);
         }
     }
 
@@ -1798,6 +1814,7 @@ impl TranscodeManager {
             fetched_end_ms: AtomicI64::new(0),
             segments: Mutex::new(SegmentIndex::default()),
             ahead_bytes: AtomicI64::new(0),
+            live_bytes: AtomicI64::new(0),
             progress: Arc::new(Progress::new()),
             class: std::sync::Mutex::new(String::new()),
             hw_slot: std::sync::Mutex::new(None),
@@ -2761,6 +2778,7 @@ impl TranscodeManager {
             fetched_end_ms: AtomicI64::new(0),
             segments: Mutex::new(SegmentIndex::default()),
             ahead_bytes: AtomicI64::new(0),
+            live_bytes: AtomicI64::new(0),
             progress: Arc::clone(&progress),
             class: std::sync::Mutex::new(work.class(if encoder == Encoder::Software {
                 crate::admission::SOFTWARE
@@ -3142,6 +3160,7 @@ impl TranscodeManager {
             fetched_end_ms: AtomicI64::new(0),
             segments: Mutex::new(SegmentIndex::default()),
             ahead_bytes: AtomicI64::new(0),
+            live_bytes: AtomicI64::new(0),
             progress: Arc::clone(&progress),
             class: std::sync::Mutex::new(String::new()),
             hw_slot: std::sync::Mutex::new(None),
@@ -3555,12 +3574,19 @@ impl TranscodeManager {
     /// Scratch in use across every live session, from each one's cached
     /// figure — summing this must not cost a directory walk per session, or
     /// the flow controller could not run on every segment fetch.
-    async fn global_ahead_bytes(&self) -> i64 {
+    ///
+    /// TOTAL bytes, not bytes-ahead. The cap this feeds is the documented
+    /// disk ceiling ([`keys::HLS_SCRATCH_MAX_BYTES`]), and a session's disk
+    /// is its whole retention window, not just its reserve: summing the
+    /// ahead figure let several healthy sessions exceed the "cap" by
+    /// [`RETENTION_SECS`] of media each (review §2.7). Pacing keeps using
+    /// each session's own ahead figure — that one is really about reserve.
+    async fn global_live_bytes(&self) -> i64 {
         self.sessions
             .lock()
             .await
             .values()
-            .map(|s| s.ahead_bytes.load(Relaxed))
+            .map(|s| s.live_bytes.load(Relaxed))
             .sum()
     }
 
@@ -3574,7 +3600,7 @@ impl TranscodeManager {
     async fn flow_control(&self, session: &Session, session_id: &str) {
         session.refresh_segments().await;
         let limits = self.ahead_limits().await;
-        let global = self.global_ahead_bytes().await;
+        let global = self.global_live_bytes().await;
         self.apply_ahead_window(session, session_id, limits, global)
             .await;
     }
@@ -3631,7 +3657,7 @@ impl TranscodeManager {
                 session.refresh_segments().await;
                 gc_expired_segments(session).await;
             }
-            let global = self.global_ahead_bytes().await;
+            let global = self.global_live_bytes().await;
             for (id, session) in &live {
                 self.apply_ahead_window(session, id, limits, global).await;
             }
@@ -3715,6 +3741,10 @@ async fn gc_expired_segments(session: &Session) {
             seg.pruned = true;
         }
     }
+    // The budget number follows the deletion now, not at the next refresh:
+    // freed disk a suspended session cannot trigger a refresh for should
+    // release the global cap on the reaper pass that freed it.
+    session.live_bytes.store(index.total_bytes(), Relaxed);
 }
 
 /// A sensible video bitrate (kbps) for a target height.
@@ -4161,6 +4191,47 @@ mod tests {
         assert_eq!(index.segs[1].bytes, 0, "and no stale size survives it");
     }
 
+    /// The two byte figures answer different questions (review §2.7): the
+    /// AHEAD figure is the client's reserve, the TOTAL is what the disk
+    /// actually holds — the retention window behind the frontier is on disk
+    /// too, and summing reserves let several healthy sessions blow through
+    /// the documented scratch cap by a whole window each.
+    #[test]
+    fn the_disk_budget_counts_retained_bytes_the_reserve_does_not() {
+        let mut index = SegmentIndex {
+            segs: (0..10)
+                .map(|i| SegmentMeta {
+                    index: i,
+                    name: format!("seg{i:05}.ts"),
+                    start_ms: i * 4_000,
+                    end_ms: (i + 1) * 4_000,
+                    bytes: 1_000_000,
+                    pruned: false,
+                })
+                .collect(),
+        };
+        // Frontier at 20s: five segments ahead of it, five behind it —
+        // retained for scrubbing, and every one of them still on disk.
+        let ahead = ahead_of(&index, 20_000).expect("published");
+        assert_eq!(ahead.bytes, 5_000_000, "the reserve is what pacing sees");
+        assert_eq!(
+            index.total_bytes(),
+            10_000_000,
+            "the disk holds the retention window too — the cap must count it"
+        );
+        // Retention deletes two; the budget follows the disk down.
+        for seg in index.segs.iter_mut().take(2) {
+            seg.bytes = 0;
+            seg.pruned = true;
+        }
+        assert_eq!(index.total_bytes(), 8_000_000);
+        assert_eq!(
+            ahead_of(&index, 20_000).expect("published").bytes,
+            5_000_000,
+            "and the reserve never noticed — different questions"
+        );
+    }
+
     /// Flow control's limits come from the snapshot while it is fresh: an
     /// admin's change lands within the TTL, and the hot path stops paying
     /// three settings reads per segment event.
@@ -4334,6 +4405,7 @@ mod tests {
             fetched_end_ms: AtomicI64::new(0),
             segments: Mutex::new(SegmentIndex::default()),
             ahead_bytes: AtomicI64::new(0),
+            live_bytes: AtomicI64::new(0),
             progress: Arc::new(Progress::new()),
             class: std::sync::Mutex::new(String::new()),
             hw_slot: std::sync::Mutex::new(None),
@@ -4958,6 +5030,7 @@ mod tests {
             fetched_end_ms: AtomicI64::new(0),
             segments: Mutex::new(SegmentIndex::default()),
             ahead_bytes: AtomicI64::new(0),
+            live_bytes: AtomicI64::new(0),
             progress: Arc::new(Progress::new()),
             class: std::sync::Mutex::new(String::new()),
             hw_slot: std::sync::Mutex::new(None),
@@ -5318,6 +5391,11 @@ mod tests {
             session.ahead_bytes.load(Relaxed),
             0,
             "a cache entry is not scratch, and must not push live encoders over the global budget"
+        );
+        assert_eq!(
+            session.live_bytes.load(Relaxed),
+            0,
+            "on the disk-budget figure exactly as on the pacing one"
         );
 
         assert!(mgr.stop_session(&info.session_id, "test").await);
