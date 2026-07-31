@@ -82,6 +82,16 @@ bump may break compatibility and a **patch** bump never does.
   string — a server with no cache configured answered "no `dovi_rpu`"
   whatever ffmpeg it was running, which is how the strip came to be skipped
   on a build that supported it.
+- **"Can this server strip Dolby Vision" is now observed rather than
+  inferred.** It was decided by parsing the ffmpeg version line, which is a
+  proxy nobody can check from outside the machine — and it now decides a
+  playback *verdict*, not just a filter argument. The daemon asks its own
+  ffmpeg at boot (`-bsfs`), logs the answer with what it costs when missing,
+  and reports it in `/api/v1/system`. The container asserts the same
+  capability at build time: the `jellyfin-ffmpeg7` install is deliberately
+  unpinned so it tracks current, which means a stale image silently loses
+  `dovi_rpu` — that is a failed build now instead of a 4K film quietly
+  playing at the automatic rung.
 - **A transcode that wedged mid-film was nobody's problem.** The stall
   watchdog declared victory at the first playable segment (and on two other
   early exits), so a pipeline that froze at minute 40 just drained the

@@ -353,12 +353,12 @@ pub struct DecisionResponse {
 
 /// Can this server remove a Dolby Vision configuration on the way out?
 ///
-/// One authority — the ffmpeg the daemon actually probed at boot — because
-/// the answer decides a *verdict* now, not just a bitstream-filter argument,
-/// and a second copy of it somewhere else is a second answer waiting to
-/// disagree.
+/// One authority — what the daemon *probed* of its own ffmpeg at boot, not
+/// what it parsed out of a version line — because the answer decides a
+/// verdict now, not just a bitstream-filter argument, and a second copy of it
+/// somewhere else is a second answer waiting to disagree.
 fn dv_strippable(state: &AppState) -> bool {
-    plurx_core::transcode::ffmpeg_has_dovi_bsf(state.system.ffmpeg_version.as_deref().unwrap_or(""))
+    state.system.dovi_rpu
 }
 
 fn source_summary(file: &MediaFile) -> SourceSummary {
@@ -961,9 +961,9 @@ pub async fn stream_mp4(
         },
         hevc,
         hdr: file.hdr.clone(),
-        have_dovi_bsf: plurx_core::transcode::ffmpeg_has_dovi_bsf(
-            state.system.ffmpeg_version.as_deref().unwrap_or(""),
-        ),
+        // The probed capability, like the decision above — not the version
+        // line parsed a second time somewhere else.
+        have_dovi_bsf: state.system.dovi_rpu,
         readrate,
         tracked,
     })

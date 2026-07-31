@@ -217,6 +217,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
         encoders: encoder_caps.clone(),
         encoder_selected,
         tone_map,
+        dovi_rpu: crate::ffmpeg::has_dovi_rpu().await,
     };
 
     let instance_id = store.instance_id().await?;

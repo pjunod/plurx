@@ -1543,16 +1543,15 @@ pub struct TranscodeManager {
     requests: std::sync::Mutex<HashMap<String, (String, RequestState)>>,
     /// See [`ProducerTuning`]. Always the default outside tests.
     producer: ProducerTuning,
-    /// The ffmpeg this daemon runs, as its version line — the authority for
-    /// build-gated capabilities (above all whether `dovi_rpu` can strip a
-    /// Dolby Vision configuration, ffmpeg 7.1+).
+    /// Whether this daemon's ffmpeg can strip a Dolby Vision configuration —
+    /// probed at boot ([`crate::ffmpeg::has_dovi_rpu`]).
     ///
-    /// Its own field because the copy path used to read this off the *cache
-    /// config*, which happens to carry a copy of the same string: a server
-    /// with no cache answered "no dovi_rpu" whatever ffmpeg it was running,
-    /// so every Dolby Vision remux kept its DV box and every browser that
-    /// cannot decode DV refused the stream.
-    ffmpeg_build: String,
+    /// Its own field because the copy path used to derive this from the
+    /// *cache config*, which happens to carry a copy of the ffmpeg version
+    /// string: a node with no cache configured would answer "no dovi_rpu"
+    /// whatever ffmpeg it was running, leave the DV configuration in every
+    /// remux, and have browsers that cannot decode DV refuse the stream.
+    dv_strippable: bool,
     /// The ahead-window limits, snapshotted ([`AHEAD_LIMITS_TTL`]).
     ///
     /// Flow control consults the limits on every segment publish and
@@ -1586,7 +1585,7 @@ impl TranscodeManager {
             sessions: Mutex::new(HashMap::new()),
             requests: std::sync::Mutex::new(HashMap::new()),
             producer: ProducerTuning::default(),
-            ffmpeg_build: String::new(),
+            dv_strippable: false,
             cached_limits: std::sync::RwLock::new(None),
         }
     }
@@ -1598,17 +1597,18 @@ impl TranscodeManager {
     /// the ffmpeg build from the startup probe, the node id from the store.
     /// Chaining keeps every existing call site — and every test that does not
     /// care about caching — unchanged.
-    /// Record which ffmpeg this daemon runs. Independent of the cache: the
-    /// capabilities it gates are the daemon's, not the cache's.
-    pub fn with_ffmpeg_build(mut self, ffmpeg_build: String) -> Self {
-        self.ffmpeg_build = ffmpeg_build;
+    /// Record what the boot probe found out about this daemon's ffmpeg.
+    /// Independent of the cache: the capabilities it gates are the daemon's,
+    /// not the cache's.
+    pub fn with_dv_strippable(mut self, dv_strippable: bool) -> Self {
+        self.dv_strippable = dv_strippable;
         self
     }
 
     /// Whether this build can strip a Dolby Vision configuration
     /// (`dovi_rpu`, ffmpeg 7.1+).
     pub fn dv_strippable(&self) -> bool {
-        transcode::ffmpeg_has_dovi_bsf(&self.ffmpeg_build)
+        self.dv_strippable
     }
 
     pub fn with_cache(mut self, cache_dir: PathBuf, ffmpeg_build: String, node_id: String) -> Self {

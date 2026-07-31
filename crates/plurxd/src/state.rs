@@ -47,6 +47,14 @@ pub struct SystemInfo {
     /// and "the driver refused the graph" are the difference between shrugging
     /// and installing a package.
     pub tone_map: crate::pipeprobe::PipelineReport,
+    /// Whether this ffmpeg can strip a Dolby Vision configuration
+    /// (`dovi_rpu`, 7.1+) — probed at boot, not inferred from the version
+    /// line. It decides a *verdict*, not just a filter argument: without it a
+    /// DV source has to be re-encoded for any browser that cannot decode DV,
+    /// instead of remuxed to its HDR10 base. Surfaced because the symptom
+    /// (a 4K film quietly playing at the Auto rung in Chrome and perfectly in
+    /// Safari) is otherwise unattributable from outside the machine.
+    pub dovi_rpu: bool,
 }
 
 /// The daemon's directories, all under the configured data dir.
@@ -134,7 +142,7 @@ impl AppState {
                 encoder_caps,
                 system.tone_map.selected(),
             )
-            .with_ffmpeg_build(system.ffmpeg_version.clone().unwrap_or_default())
+            .with_dv_strippable(system.dovi_rpu)
             .with_cache(
                 cache_dir,
                 system.ffmpeg_version.clone().unwrap_or_default(),

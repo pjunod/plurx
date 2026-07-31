@@ -27,6 +27,17 @@ FROM debian:bookworm-slim
 #   * the distro ffmpeg + Mesa/Intel VA drivers — the fallback if you override
 #     PLURX_FFMPEG back to plain `ffmpeg` (older, widely-tested GPUs).
 # Startup validation test-encodes each path, so only what actually works is used.
+#
+# The jellyfin-ffmpeg install below is deliberately unpinned — it should track
+# the current build — but it is then ASSERTED to carry `dovi_rpu`, the
+# bitstream filter (ffmpeg 7.1+) that removes a Dolby Vision configuration
+# from a remux. That is a capability, not a nicety: without it every DV film
+# is re-encoded for browsers that cannot decode Dolby Vision (Chrome cannot;
+# Safari can), so a 4K disc remux quietly plays at the automatic rung. Because
+# the install is unpinned, WHICH ffmpeg lands here depends on the day the image
+# was built, and a stale build loses the capability with no visible symptom.
+# The assertion turns that into a failed build instead of a mystery on
+# somebody's television.
 RUN sed -i 's/Components: main/Components: main non-free non-free-firmware/' \
         /etc/apt/sources.list.d/debian.sources \
     && apt-get update \
@@ -43,6 +54,12 @@ RUN sed -i 's/Components: main/Components: main non-free non-free-firmware/' \
         > /etc/apt/sources.list.d/jellyfin.list \
     && apt-get update \
     && apt-get install -y --no-install-recommends jellyfin-ffmpeg7 \
+    && ( /usr/lib/jellyfin-ffmpeg/ffmpeg -hide_banner -bsfs 2>&1 | grep -qx 'dovi_rpu' \
+      || ( echo "FATAL: this jellyfin-ffmpeg7 has no dovi_rpu bitstream filter." >&2; \
+           echo "Got: $(/usr/lib/jellyfin-ffmpeg/ffmpeg -version 2>&1 | head -1)" >&2; \
+           echo "dovi_rpu needs ffmpeg 7.1+; see the note above this RUN." >&2; \
+           echo "Rebuild fetching current packages: docker build --no-cache --pull" >&2; \
+           exit 1 ) ) \
     && apt-get purge -y curl gnupg && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd -r plurx \

@@ -34,6 +34,62 @@ pub struct PacingCaps {
 }
 
 static PACING: tokio::sync::OnceCell<PacingCaps> = tokio::sync::OnceCell::const_new();
+static DOVI_RPU: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
+
+/// Does this build carry a given bitstream filter? Matched on a whole line of
+/// `ffmpeg -bsfs`, which lists exactly one filter per line — a substring
+/// search would report `dovi_rpu` for anything merely mentioning it.
+fn declares_bsf(list: &str, name: &str) -> bool {
+    list.lines().any(|l| l.trim() == name)
+}
+
+/// Can this ffmpeg strip a Dolby Vision configuration (`dovi_rpu`, added in
+/// 7.1)?
+///
+/// **Asked of the binary, not of its version string.** The version heuristic
+/// it replaces was a proxy for the capability, and a proxy is exactly what
+/// nobody can check from the outside: a Dolby Vision film that played at
+/// 1080p in Chrome and untouched in Safari could not be explained without
+/// someone shelling into the server, because the one fact that decided it —
+/// "does this build have dovi_rpu" — was inferred rather than observed. It is
+/// observed now, once, at startup (PERF-PLAN §9: mechanism claims get
+/// verified against a live probe).
+pub async fn has_dovi_rpu() -> bool {
+    *DOVI_RPU
+        .get_or_init(|| async {
+            let out = tokio::process::Command::new(ffmpeg_bin())
+                .args(["-hide_banner", "-bsfs"])
+                .output()
+                .await;
+            let found = match out {
+                Ok(o) => {
+                    let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
+                    text.push_str(&String::from_utf8_lossy(&o.stderr));
+                    declares_bsf(&text, "dovi_rpu")
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "could not probe ffmpeg for bitstream filters");
+                    false
+                }
+            };
+            if found {
+                tracing::info!(
+                    "ffmpeg has dovi_rpu: Dolby Vision sources remux to their HDR10 base \
+                     for browsers that cannot decode DV"
+                );
+            } else {
+                tracing::warn!(
+                    "this ffmpeg has no dovi_rpu bitstream filter (added in 7.1), so a Dolby \
+                     Vision configuration cannot be removed from a remux — browsers that \
+                     don't decode DV (Chrome does not; Safari does) will be given a \
+                     re-encode instead of the source video. Upgrade ffmpeg to 7.1+ to \
+                     stream those files untouched"
+                );
+            }
+            found
+        })
+        .await
+}
 
 /// Scan `ffmpeg -h full` for the pacing options.
 ///
