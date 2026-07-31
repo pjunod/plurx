@@ -95,6 +95,10 @@ pub(crate) const HLS_AHEAD_MAX_BYTES_DEFAULT: i64 = 2 * 1024 * 1024 * 1024;
 /// runaway; it does nothing about four healthy 4K sessions filling the disk
 /// between them.
 pub(crate) const HLS_SCRATCH_MAX_BYTES_DEFAULT: i64 = 8 * 1024 * 1024 * 1024;
+/// How long a snapshot of the ahead-window limits may serve flow control
+/// before the settings are consulted again. The bound on how stale an
+/// admin's change can look, and the whole cost of caching it.
+const AHEAD_LIMITS_TTL: Duration = Duration::from_secs(2);
 
 /// Live encode telemetry for one session, fed by ffmpeg's `-progress` stream.
 ///
@@ -298,6 +302,10 @@ struct SegmentMeta {
     end_ms: i64,
     /// Size on disk, or 0 until it has been measured (or after it is pruned).
     bytes: i64,
+    /// Retention deleted the file. Without the flag, every refresh re-stats
+    /// every pruned segment forever — by the back half of a film that is
+    /// hundreds of ENOENTs per refresh, all to relearn `bytes: 0`.
+    pruned: bool,
 }
 
 /// What a session has actually published, in media time and bytes.
@@ -344,6 +352,82 @@ impl SegmentIndex {
             .iter()
             .filter(move |s| s.bytes > 0 && s.end_ms <= keep_from_ms)
     }
+
+    /// Bring the index up to date with the playlist text by *appending* what
+    /// is newly published, and only that. Returns true when it had to rebuild
+    /// instead.
+    ///
+    /// This replaced re-parsing the complete growing EVENT playlist on every
+    /// refresh — reconstructing every prior entry, round-tripping every known
+    /// size through a map — which approached quadratic work over a long
+    /// session on exactly the hot path that runs on every segment publish
+    /// (review §2.6). An EVENT playlist may not mutate published entries, so
+    /// known ordinals are counted and skipped without so much as a float
+    /// parse; sizes and prune flags stay where they are.
+    ///
+    /// Two things do force a rebuild, both real: the playlist shrank
+    /// (truncation, recovery), or its content disagrees with what is held —
+    /// the fallback respawn clears the directory and rewrites the timeline
+    /// from the same seek point, reusing the same names, so the sentinel is
+    /// the last *known* entry's duration and index rather than the count.
+    /// A rebuild drops carried sizes on purpose: they described files a
+    /// replaced timeline no longer contains.
+    fn extend_from_playlist(&mut self, text: &str) -> bool {
+        let known = self.segs.len();
+        let mut seen = 0usize;
+        let mut pending: Option<&str> = None;
+        let mut cursor_ms = self.segs.last().map(|s| s.end_ms).unwrap_or(0);
+        let mut disagreed = false;
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("#EXTINF:") {
+                pending = Some(rest);
+                continue;
+            }
+            if line.starts_with('#') {
+                continue;
+            }
+            let (Some(ext), Some(index)) = (pending.take(), segment_index(line)) else {
+                continue;
+            };
+            seen += 1;
+            if seen <= known {
+                let held = &self.segs[seen - 1];
+                // The cheap sentinel on every known ordinal is the index; the
+                // one duration parse per refresh is spent on the last known
+                // entry, where a rewritten timeline's different cut point
+                // shows first.
+                if held.index != index
+                    || (seen == known
+                        && extinf_ms(ext).is_some_and(|d| d != held.end_ms - held.start_ms))
+                {
+                    disagreed = true;
+                    break;
+                }
+                continue;
+            }
+            let Some(duration_ms) = extinf_ms(ext) else {
+                continue;
+            };
+            self.segs.push(SegmentMeta {
+                index,
+                name: line.to_owned(),
+                start_ms: cursor_ms,
+                end_ms: cursor_ms + duration_ms,
+                bytes: 0,
+                pruned: false,
+            });
+            cursor_ms += duration_ms;
+        }
+        if disagreed || seen < known {
+            self.segs = parse_playlist(text);
+            return true;
+        }
+        false
+    }
 }
 
 /// Parse `EXTINF` durations and segment URIs out of an HLS media playlist.
@@ -351,6 +435,14 @@ impl SegmentIndex {
 /// Pure, and the reason the copy path's variable segment lengths stop being a
 /// guess: the playlist is the only place the true duration of a copied segment
 /// is written down.
+fn extinf_ms(rest: &str) -> Option<i64> {
+    rest.split(',')
+        .next()
+        .and_then(|d| d.trim().parse::<f64>().ok())
+        .filter(|d| *d >= 0.0)
+        .map(|secs| (secs * 1000.0).round() as i64)
+}
+
 fn parse_playlist(text: &str) -> Vec<SegmentMeta> {
     let mut out: Vec<SegmentMeta> = Vec::new();
     let mut pending_ms: Option<i64> = None;
@@ -361,12 +453,7 @@ fn parse_playlist(text: &str) -> Vec<SegmentMeta> {
             continue;
         }
         if let Some(rest) = line.strip_prefix("#EXTINF:") {
-            pending_ms = rest
-                .split(',')
-                .next()
-                .and_then(|d| d.trim().parse::<f64>().ok())
-                .filter(|d| *d >= 0.0)
-                .map(|secs| (secs * 1000.0).round() as i64);
+            pending_ms = extinf_ms(rest);
             continue;
         }
         // Every other tag, including `#EXT-X-MAP:URI="init.mp4"`, which names
@@ -384,6 +471,7 @@ fn parse_playlist(text: &str) -> Vec<SegmentMeta> {
             start_ms: cursor_ms,
             end_ms: cursor_ms + duration_ms,
             bytes: 0,
+            pruned: false,
         });
         cursor_ms += duration_ms;
     }
@@ -922,34 +1010,43 @@ impl Session {
         *self.sw_permit.lock().expect("sw permit mutex") = Some(permit);
     }
 
-    /// Re-read the playlist and re-measure what is on disk.
+    /// Re-read the playlist, take in what is newly published, and measure
+    /// only that.
     ///
-    /// Sizes already known are carried forward by index, so a long session
-    /// stats only the segments that appeared since the last refresh rather
-    /// than the whole directory each time.
+    /// The index is extended in place ([`SegmentIndex::extend_from_playlist`])
+    /// rather than reconstructed, sizes stay where they were measured, and a
+    /// pruned segment is never re-stated — this runs on every segment publish
+    /// and frontier advance, and it used to redo a whole session's worth of
+    /// parsing and ENOENTs each time (review §2.6).
     async fn refresh_segments(&self) {
         let Ok(raw) = tokio::fs::read(self.dir.join("index.m3u8")).await else {
             return;
         };
-        let mut segs = parse_playlist(&String::from_utf8_lossy(&raw));
-        {
-            let known = self.segments.lock().await;
-            let mut sizes: HashMap<i64, i64> = HashMap::with_capacity(known.segs.len());
-            for s in known.segs.iter().filter(|s| s.bytes > 0) {
-                sizes.insert(s.index, s.bytes);
+        // Under the lock only to extend; the stats happen with it released.
+        let to_stat: Vec<(i64, String)> = {
+            let mut index = self.segments.lock().await;
+            if index.extend_from_playlist(&String::from_utf8_lossy(&raw)) {
+                tracing::debug!("segment index rebuilt — the playlist was truncated or replaced");
             }
-            for s in segs.iter_mut() {
-                if let Some(b) = sizes.get(&s.index) {
-                    s.bytes = *b;
-                }
+            index
+                .segs
+                .iter()
+                .filter(|s| s.bytes == 0 && !s.pruned)
+                .map(|s| (s.index, s.name.clone()))
+                .collect()
+        };
+        let mut sizes: Vec<(i64, i64)> = Vec::with_capacity(to_stat.len());
+        for (idx, name) in to_stat {
+            if let Ok(meta) = tokio::fs::metadata(self.dir.join(&name)).await {
+                sizes.push((idx, meta.len() as i64));
             }
         }
-        for s in segs.iter_mut().filter(|s| s.bytes == 0) {
-            if let Ok(meta) = tokio::fs::metadata(self.dir.join(&s.name)).await {
-                s.bytes = meta.len() as i64;
+        let mut index = self.segments.lock().await;
+        for (idx, len) in sizes {
+            if let Some(s) = index.segs.iter_mut().find(|s| s.index == idx && !s.pruned) {
+                s.bytes = len;
             }
         }
-        let index = SegmentIndex { segs };
         // Resolve the frontier against the fresh index: a segment served
         // before its EXTINF was known gets its real end time now.
         let high = self.high_segment.load(Relaxed);
@@ -969,7 +1066,6 @@ impl Session {
                 self.ahead_bytes.store(ahead.bytes, Relaxed);
             }
         }
-        *self.segments.lock().await = index;
     }
 
     async fn ahead(&self) -> Option<Ahead> {
@@ -1431,6 +1527,15 @@ pub struct TranscodeManager {
     requests: std::sync::Mutex<HashMap<String, (String, RequestState)>>,
     /// See [`ProducerTuning`]. Always the default outside tests.
     producer: ProducerTuning,
+    /// The ahead-window limits, snapshotted ([`AHEAD_LIMITS_TTL`]).
+    ///
+    /// Flow control consults the limits on every segment publish and
+    /// frontier advance — which used to mean three SQLite round-trips a
+    /// time, through the store's one serialized connection, on the hottest
+    /// control path the server has (review §2.6). The keys are API-settable
+    /// with no UI knob, so a two-second staleness bound is invisible to an
+    /// operator and removes the reads from the path entirely.
+    cached_limits: std::sync::RwLock<Option<(Instant, AheadLimits)>>,
 }
 
 impl TranscodeManager {
@@ -1455,6 +1560,7 @@ impl TranscodeManager {
             sessions: Mutex::new(HashMap::new()),
             requests: std::sync::Mutex::new(HashMap::new()),
             producer: ProducerTuning::default(),
+            cached_limits: std::sync::RwLock::new(None),
         }
     }
 
@@ -3413,9 +3519,15 @@ impl TranscodeManager {
         }
     }
 
-    /// The bounds every session is held to, read once per evaluation.
+    /// The bounds every session is held to — from the snapshot while it is
+    /// fresh, from the settings when it is not.
     async fn ahead_limits(&self) -> AheadLimits {
-        AheadLimits {
+        if let Some((at, limits)) = *self.cached_limits.read().expect("limits lock") {
+            if at.elapsed() < AHEAD_LIMITS_TTL {
+                return limits;
+            }
+        }
+        let limits = AheadLimits {
             max_secs: self
                 .num_setting(keys::HLS_AHEAD_MAX_SECS, HLS_AHEAD_MAX_SECS_DEFAULT)
                 .await,
@@ -3425,7 +3537,19 @@ impl TranscodeManager {
             global_max_bytes: self
                 .num_setting(keys::HLS_SCRATCH_MAX_BYTES, HLS_SCRATCH_MAX_BYTES_DEFAULT)
                 .await,
-        }
+        };
+        // Two refreshers racing both read the same rows; last write wins and
+        // they agree to within the TTL anyway.
+        *self.cached_limits.write().expect("limits lock") = Some((Instant::now(), limits));
+        limits
+    }
+
+    /// Forget the snapshot, so the next evaluation reads the settings. For
+    /// tests, which assert on the *policy* (cached-until-stale) and must not
+    /// spend wall clock waiting a TTL out.
+    #[cfg(test)]
+    fn forget_cached_limits(&self) {
+        *self.cached_limits.write().expect("limits lock") = None;
     }
 
     /// Scratch in use across every live session, from each one's cached
@@ -3586,6 +3710,9 @@ async fn gc_expired_segments(session: &Session) {
     for seg in index.segs.iter_mut() {
         if doomed.contains(seg.name.as_str()) {
             seg.bytes = 0;
+            // The file is gone; without the flag every later refresh would
+            // re-stat it forever to relearn that.
+            seg.pruned = true;
         }
     }
 }
@@ -3943,6 +4070,150 @@ mod tests {
         assert!(parse_playlist("").is_empty());
     }
 
+    // ---- the append-oriented index (review §2.6) ----------------------------
+
+    /// The steady state: a grown playlist APPENDS to the index. Known
+    /// entries keep their measured sizes without being re-parsed, and the new
+    /// entry's timeline continues from the held cursor.
+    #[test]
+    fn the_index_appends_what_is_new_and_keeps_what_it_measured() {
+        let two = "#EXTM3U\n#EXTINF:2.0,\nseg00000.ts\n#EXTINF:3.0,\nseg00001.ts\n";
+        let mut index = SegmentIndex {
+            segs: parse_playlist(two),
+        };
+        index.segs[0].bytes = 111;
+        index.segs[1].bytes = 222;
+
+        let three = "#EXTM3U\n#EXTINF:2.0,\nseg00000.ts\n#EXTINF:3.0,\nseg00001.ts\n\
+                     #EXTINF:2.5,\nseg00002.ts\n";
+        assert!(
+            !index.extend_from_playlist(three),
+            "an append, not a rebuild"
+        );
+        assert_eq!(index.segs.len(), 3);
+        assert_eq!(
+            (index.segs[0].bytes, index.segs[1].bytes),
+            (111, 222),
+            "measured sizes stay put"
+        );
+        assert_eq!(
+            (index.segs[2].start_ms, index.segs[2].end_ms),
+            (5_000, 7_500),
+            "the new entry continues the held timeline"
+        );
+        assert_eq!(
+            index.segs[2].bytes, 0,
+            "and is not pretended to be measured"
+        );
+
+        // Nothing new: still not a rebuild, still three.
+        assert!(!index.extend_from_playlist(three));
+        assert_eq!(index.segs.len(), 3);
+    }
+
+    /// A playlist with fewer entries than the index is a truncation or a
+    /// recovery; what is held describes files that are gone. Rebuild, and
+    /// drop the carried sizes with the timeline they measured.
+    #[test]
+    fn a_shrunken_playlist_rebuilds_the_index() {
+        let three = "#EXTM3U\n#EXTINF:2.0,\nseg00000.ts\n#EXTINF:2.0,\nseg00001.ts\n\
+                     #EXTINF:2.0,\nseg00002.ts\n";
+        let mut index = SegmentIndex {
+            segs: parse_playlist(three),
+        };
+        index.segs[0].bytes = 999;
+        let one = "#EXTM3U\n#EXTINF:4.0,\nseg00000.ts\n";
+        assert!(index.extend_from_playlist(one), "a shrink is a rebuild");
+        assert_eq!(index.segs.len(), 1);
+        assert_eq!(index.segs[0].end_ms, 4_000, "the new timeline, not the old");
+        assert_eq!(
+            index.segs[0].bytes, 0,
+            "carried sizes went with the old one"
+        );
+    }
+
+    /// The fallback respawn clears the directory and rewrites the timeline
+    /// from the same seek point — same names, same indices, different cut
+    /// points. The sentinel is the last known entry's duration: when it
+    /// disagrees, everything held describes a timeline that no longer
+    /// exists.
+    #[test]
+    fn a_replaced_timeline_is_caught_by_its_last_known_entry() {
+        let two = "#EXTM3U\n#EXTINF:2.0,\nseg00000.ts\n#EXTINF:2.0,\nseg00001.ts\n";
+        let mut index = SegmentIndex {
+            segs: parse_playlist(two),
+        };
+        index.segs[1].bytes = 555;
+        // Same names, but the second segment now cuts at 5s, and a third
+        // exists. A blind append would graft a new timeline onto a stale one.
+        let replaced = "#EXTM3U\n#EXTINF:2.0,\nseg00000.ts\n#EXTINF:5.0,\nseg00001.ts\n\
+                        #EXTINF:2.0,\nseg00002.ts\n";
+        assert!(
+            index.extend_from_playlist(replaced),
+            "the disagreement rebuilds"
+        );
+        assert_eq!(index.segs.len(), 3);
+        assert_eq!(
+            (index.segs[1].start_ms, index.segs[1].end_ms),
+            (2_000, 7_000),
+            "the rewritten cut, not the remembered one"
+        );
+        assert_eq!(index.segs[1].bytes, 0, "and no stale size survives it");
+    }
+
+    /// Flow control's limits come from the snapshot while it is fresh: an
+    /// admin's change lands within the TTL, and the hot path stops paying
+    /// three settings reads per segment event.
+    #[tokio::test]
+    async fn flow_limits_are_snapshotted_until_stale() {
+        use plurx_core::store::SqliteStore;
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let work = tempfile::tempdir().expect("work");
+        let mgr = TranscodeManager::new(
+            Arc::clone(&store),
+            work.path().to_path_buf(),
+            EncoderCaps::default(),
+            Pipeline::Cpu,
+        );
+
+        let first = mgr.ahead_limits().await;
+        assert_eq!(first.max_secs, HLS_AHEAD_MAX_SECS_DEFAULT);
+
+        store
+            .put_setting(keys::HLS_AHEAD_MAX_SECS, "999")
+            .await
+            .expect("setting");
+        assert_eq!(
+            mgr.ahead_limits().await.max_secs,
+            HLS_AHEAD_MAX_SECS_DEFAULT,
+            "within the TTL the snapshot answers — that is the whole point"
+        );
+        mgr.forget_cached_limits();
+        assert_eq!(
+            mgr.ahead_limits().await.max_secs,
+            999,
+            "a stale snapshot re-reads the settings"
+        );
+    }
+
+    /// A pruned segment's file is deleted on purpose; the flag is what stops
+    /// every later refresh from re-statting it forever, and an extend must
+    /// not lose it.
+    #[test]
+    fn a_pruned_segment_stays_pruned_through_an_append() {
+        let two = "#EXTM3U\n#EXTINF:2.0,\nseg00000.ts\n#EXTINF:2.0,\nseg00001.ts\n";
+        let mut index = SegmentIndex {
+            segs: parse_playlist(two),
+        };
+        index.segs[0].bytes = 0;
+        index.segs[0].pruned = true;
+        let three = "#EXTM3U\n#EXTINF:2.0,\nseg00000.ts\n#EXTINF:2.0,\nseg00001.ts\n\
+                     #EXTINF:2.0,\nseg00002.ts\n";
+        assert!(!index.extend_from_playlist(three));
+        assert!(index.segs[0].pruned, "still pruned");
+        assert!(!index.segs[2].pruned, "the new entry is not");
+    }
+
     #[test]
     fn ahead_is_measured_against_the_fetched_frontier() {
         let index = SegmentIndex {
@@ -3953,6 +4224,7 @@ mod tests {
                     start_ms: i * 4_000,
                     end_ms: (i + 1) * 4_000,
                     bytes: 1_000_000,
+                    pruned: false,
                 })
                 .collect(),
         };
