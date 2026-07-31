@@ -3608,7 +3608,7 @@ function stopPlayerTimers(){
 function clearStall(){ if(PLAYER&&PLAYER.stallTimer){ clearTimeout(PLAYER.stallTimer); PLAYER.stallTimer=null; } }
 // Rescue path: the browser rejected a remux/direct stream outright, so restart
 // this playback as a server transcode (guaranteed-compatible H.264/AAC HLS).
-async function startTranscodeFallback(reason){
+async function startTranscodeFallback(reason, note){
   const v=document.getElementById("video");
   if(!PLAYER || !PLAYER.fileId || !v) return;
   const startSec=(PLAYER.offset||0)+(v.currentTime||0);
@@ -3621,6 +3621,15 @@ async function startTranscodeFallback(reason){
   let info; try{ info=await openSession(me.fileId,transcodeOpts(startSec));}catch(e){ if(live()){ setLoading(false); toast(e.message); } return; }
   if(!live()) return;   // closed the player, or seeked / switched audio meanwhile
   me.method='transcode'; me.copyHls=false;
+  // A silent switch is a lie of omission. Without this the overlay keeps the
+  // decision's remux Reason over a transcode session picked mid-flight — and
+  // a cache hit makes the swap fast enough to miss entirely, which read as
+  // "this film only plays 1080p" with nothing anywhere saying why. The
+  // Reason row is the server's verdict on the FILE and stays; the Switched
+  // row is the standing answer for what the client did about it. The
+  // decode-rescue writes its own note before calling here, so only fill one
+  // in when this caller brought one.
+  if(note && !me.rescuedNote) me.rescuedNote=note;
   setLoading(true,"Preparing the stream…",(info.encoder?("encoder: "+info.encoder+" — "):"")+"transcoding instead of remuxing");
   armStall(attachSession(v, me, info, startSec));
 }
@@ -4000,7 +4009,8 @@ function wirePlayer(){
       clientLog({level:"warn",event:"stream_rejected",code,src,
         message:"browser refused the "+PLAYER.method.replace('_',' ')+" stream — re-encoding"});
       setLoading(true,"Stream rejected — switching to transcode…","the browser refused the "+PLAYER.method.replace('_',' ')+" stream (code "+code+"); re-encoding instead");
-      startTranscodeFallback();
+      startTranscodeFallback("stream-rejected",
+        "the browser refused the "+PLAYER.method.replace('_',' ')+" stream ("+(names[code]||("error "+code))+(msg?": "+msg:"")+") — re-encoded instead");
       return;
     }
     clientLog({level:"error",event:"playback_failed",code,src,

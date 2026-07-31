@@ -75,7 +75,12 @@ bump may break compatibility and a **patch** bump never does.
   burn session itself rather than quoting the file's `/decision` verdict —
   it used to read "forced original quality (no video transcode)" over a
   running QuickSync re-encode, which is the line that sent the diagnosis in
-  the wrong direction. Caveat stated where it belongs (PLAYBACK.md): a burn
+  the wrong direction. The error-fallback owed the same honesty: a remux
+  stream the browser refuses falls back to a transcode silently, and when a
+  cached encode makes that swap instant, a film reads as "only plays 1080p"
+  with nothing anywhere saying why — the fallback now writes the overlay's
+  Switched row with the browser's own error, the way the decode-rescue
+  already did. Caveat stated where it belongs (PLAYBACK.md): a burn
   composites in system memory, so a 2160p burn runs the CPU filter chain,
   and whether a given box holds realtime there is a measurement to take, not
   a promise this change makes.
