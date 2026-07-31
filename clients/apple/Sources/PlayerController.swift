@@ -2,13 +2,20 @@ import AVKit
 import Combine
 import Foundation
 
-/// Drives one AVPlayer for a title. plurx's two delivery shapes map cleanly to
-/// Apple:
-///  - `direct_play` → the original file at `/files/{id}/direct?token=…`, which
+/// Drives one AVPlayer for a title, executing the server's delivery plan
+/// (`decision.delivery`) instead of re-deriving policy from the verdict:
+///  - direct → the original file at `/files/{id}/direct?token=…`, which
 ///    AVPlayer range-seeks natively (base = 0).
-///  - remux/transcode → a native HLS session started at the resume point; the
-///    capability-authed playlist needs no token, and `startSeconds` becomes the
-///    base offset so the true timeline position is reported for the scrobble.
+///  - remux → a **copy** HLS session: the source video repackaged untouched,
+///    so a 4K HEVC/HDR MKV reaches the screen at full quality with no encoder
+///    running. (This used to start a hardcoded 1080p re-encode.)
+///  - transcode → a transcode HLS session with **no height named**, because
+///    Auto is the server's choice — the rung depends on which encoder wins.
+/// Either session kind starts at the resume point; the capability-authed
+/// playlist needs no token, and `startSeconds` becomes the base offset so the
+/// true timeline position is reported for the scrobble. The session is closed
+/// with a DELETE the moment playback ends, instead of leaving the encoder to
+/// the server's idle reaper.
 @MainActor
 final class PlayerController: ObservableObject {
     let player = AVPlayer()
@@ -20,6 +27,11 @@ final class PlayerController: ObservableObject {
     private weak var model: AppModel?
     private var timeObserver: Any?
     private var started = false
+    /// The HLS session this player owns, if the plan opened one.
+    private var sessionId: String?
+    /// Stable for this player instance — the server's supersession key, so a
+    /// second device on the same account no longer kills this stream.
+    private let playbackId = UUID().uuidString
 
     func start(model: AppModel, itemId: Int, fileId: Int, startMs: Int, durationMs: Int, title: String) {
         guard !started else { return }
@@ -44,14 +56,23 @@ final class PlayerController: ObservableObject {
         do {
             let decision = try await model.decision(fileId: fileId)
             let url: URL?
-            let direct = decision.method == "direct_play"
+            let mode = decision.delivery?.mode ?? Self.legacyMode(decision.method)
+            let direct = mode == "direct"
             if direct {
                 baseMs = 0
-                url = Session.shared.mediaURL(decision.playUrl)
+                url = Session.shared.mediaURL(decision.delivery?.url ?? decision.playUrl)
             } else {
-                let hls = try await model.hlsStart(
-                    fileId: fileId, height: 1080, start: Double(startMs) / 1000.0, audio: nil
+                // remux → copy session (video untouched); transcode → encode
+                // at the server's Auto rung. Same session surface either way.
+                let copy = mode == "remux"
+                let body = CreateSessionRequest(
+                    playbackId: playbackId,
+                    start: Double(startMs) / 1000.0,
+                    copy: copy ? true : nil,
+                    aac: copy ? (decision.delivery?.aac ?? decision.transcodeAudio ?? false) : nil
                 )
+                let hls = try await model.createHlsSession(fileId: fileId, body: body)
+                sessionId = hls.sessionId
                 baseMs = Int((hls.startSeconds ?? Double(startMs) / 1000.0) * 1000)
                 url = Session.shared.url(hls.playlistUrl)   // capability auth — no token
             }
@@ -76,7 +97,10 @@ final class PlayerController: ObservableObject {
         return baseMs + max(pos, 0)
     }
 
-    /// Post the final position and tear down (drives the server-side Trakt scrobble).
+    /// Post the final position and tear down (drives the server-side Trakt
+    /// scrobble), and release the HLS session so its encoder stops now rather
+    /// than when the idle reaper notices — over a minute of a hardware slot
+    /// held for nobody, every time a viewer presses back.
     func stop() {
         if let timeObserver { player.removeTimeObserver(timeObserver); self.timeObserver = nil }
         let pos = realPositionMs()
@@ -87,9 +111,24 @@ final class PlayerController: ObservableObject {
             let m = model
             Task { await m?.reportProgress(itemId: id, positionMs: pos, durationMs: dur) }
         }
+        if let sessionId {
+            self.sessionId = nil
+            let m = model
+            Task { await m?.endHlsSession(sessionId) }
+        }
     }
 
     // MARK: - Internals
+
+    /// A plan for servers that predate `delivery`, from the verdict alone —
+    /// the same mapping the server's plan encodes.
+    private static func legacyMode(_ method: String) -> String {
+        switch method {
+        case "direct_play": return "direct"
+        case "remux": return "remux"
+        default: return "transcode"
+        }
+    }
 
     private func addPeriodicObserver() {
         let interval = CMTime(seconds: 10, preferredTimescale: 1)

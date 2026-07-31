@@ -263,13 +263,51 @@ pub struct Marker {
     pub chapter: bool,
 }
 
+/// The server-owned execution plan for a verdict.
+///
+/// `method` says what was decided; this says what to *do* about it, so a
+/// client executes the plan instead of re-deriving policy from the verdict —
+/// which is how Android came to play transcode verdicts through a copy path
+/// and Apple came to re-encode remux verdicts at a hardcoded 1080p. Every
+/// URL and flag a client needs is here; the only things a client adds to a
+/// session create are its own identity (`playback_id`, `request_id`) and its
+/// position (`start`, `audio`).
+#[derive(Serialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum DeliveryPlan {
+    /// Play the original file over HTTP range.
+    Direct { url: String },
+    /// Copy the video untouched. `url` is the progressive fMP4 for players
+    /// whose `<video>` accepts one; a player that needs HLS transport
+    /// (AVPlayer) POSTs `sessions_url` with `copy: true` and this `aac`
+    /// instead — same bytes, different envelope. `aac` is whether the copy
+    /// session must re-encode the audio (the client said it can't take the
+    /// source codec); it is the session-shaped spelling of
+    /// `transcode_audio`.
+    Remux {
+        url: String,
+        sessions_url: String,
+        aac: bool,
+    },
+    /// Re-encode. POST `sessions_url`, omitting `height`: Auto is the
+    /// server's choice because the rung depends on which encoder wins, and
+    /// only the create response knows that (`TranscodeManager::auto_height`).
+    Transcode { sessions_url: String },
+}
+
 #[derive(Serialize)]
 pub struct DecisionResponse {
     pub file_id: i64,
     #[serde(flatten)]
     pub decision: Decision,
     /// The URL the client should use to play, given the verdict.
+    ///
+    /// Legacy: predates `delivery`, and for a transcode verdict it points at
+    /// the remux endpoint (the only progressive URL there is). Clients should
+    /// execute `delivery`; this stays for ones that don't yet.
     pub play_url: String,
+    /// What to actually do about the verdict — see [`DeliveryPlan`].
+    pub delivery: DeliveryPlan,
     /// Source video/container facts for the stats overlay.
     pub source: SourceSummary,
     /// Selectable audio tracks (for the player's audio-language menu).
@@ -537,6 +575,18 @@ pub async fn decision(
         playback::PlaybackMethod::DirectPlay => format!("/api/v1/files/{id}/direct"),
         _ => format!("/api/v1/files/{id}/stream.mp4"),
     };
+    let sessions_url = format!("/api/v1/files/{id}/hls/sessions");
+    let delivery = match decision.method {
+        playback::PlaybackMethod::DirectPlay => DeliveryPlan::Direct {
+            url: play_url.clone(),
+        },
+        playback::PlaybackMethod::Remux => DeliveryPlan::Remux {
+            url: play_url.clone(),
+            sessions_url,
+            aac: decision.transcode_audio,
+        },
+        playback::PlaybackMethod::Transcode => DeliveryPlan::Transcode { sessions_url },
+    };
     // Only a remux has a transport choice to make. Direct play is already a
     // range-served file, which is the case Chrome buffers *well* — it was the
     // control in §4.3bis, at 10.8 s against the progressive path's 2.2 — and a
@@ -586,6 +636,7 @@ pub async fn decision(
         source: source_summary(&file),
         decision,
         play_url,
+        delivery,
         audio,
         subtitles,
         markers,

@@ -8,6 +8,48 @@ bump may break compatibility and a **patch** bump never does.
 
 ## [Unreleased]
 
+### Added
+
+- **`/decision` now carries an executable delivery plan, and the native
+  clients execute it.** The response's new `delivery` field says what to *do*
+  about the verdict — `direct { url }`, `remux { url, sessions_url, aac }`,
+  `transcode { sessions_url }` — because clients that re-derived policy from
+  `method` got it differently wrong on every platform. Android played every
+  non-direct verdict through `stream.mp4`, which never re-encodes video, so a
+  tone-map or downscale verdict shipped the copied source anyway; it now opens
+  a transcode HLS session at the server's Auto rung, seeks by opening a
+  session at the new offset (as the web player does), and releases sessions
+  with a `DELETE`. Apple started a hardcoded 1080p re-encode for everything
+  non-direct via the deprecated GET bridge; a remux verdict now becomes a
+  **copy** session — a 4K HEVC/HDR MKV reaches an Apple TV at full quality
+  with no encoder running, which is what [docs/CLIENTS.md](docs/CLIENTS.md)
+  promised all along — and a transcode verdict names no height, because Auto
+  is the server's choice. Both clients now send a stable `playback_id` (so two
+  devices on one account stop killing each other's streams), a per-attempt
+  `request_id`, and an explicit `DELETE` when playback ends, instead of
+  leaving encoders to the idle reaper. `play_url` stays for older clients.
+
+### Fixed
+
+- **Two concurrent session creates with the same `request_id` could both pass
+  the idempotency check and spawn two encoders.** The map recorded a create
+  only after it finished — check, release the lock, spawn ffmpeg, record — so
+  concurrent retries raced through the gap, and the loser could be handed a
+  session its twin's supersession had already killed. A `request_id` is now
+  *reserved* before any work starts; a concurrent identical create finds the
+  reservation and waits for the first one's session instead of starting its
+  own. A create that fails — or whose caller vanishes mid-await — clears its
+  reservation on the way out, so a died attempt never poisons its id.
+- **The hardware→software fallback kept its hardware slot for the session's
+  whole life.** A session that fell back to a software encoder held the GPU
+  slot it was admitted with until teardown — with the cap at one, the next
+  hardware start queued behind a session no longer using the GPU, potentially
+  for a whole film. The slot is now released at the transition, and the
+  session's admission class flips to software at the same moment, so the
+  speeds measured from the replacement encoder stop being filed as evidence
+  about hardware (which was quietly poisoning the very record admission
+  decides software-viability by).
+
 ### Changed
 
 - **plurx cuts the copy path's segments now, not ffmpeg.** On an HEVC or

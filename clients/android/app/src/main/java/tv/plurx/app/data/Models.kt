@@ -153,11 +153,26 @@ data class Marker(
     val chapter: Boolean = false,
 )
 
+/**
+ * The server-owned execution plan for a verdict (`DecisionResponse.delivery`
+ * in crates/plurxd http/stream.rs). The player executes this rather than
+ * re-deriving policy from `method` — re-deriving is how this app came to play
+ * transcode verdicts through the copy-only progressive path.
+ */
+@Serializable
+data class Delivery(
+    val mode: String, // "direct" | "remux" | "transcode"
+    val url: String? = null, // direct: the file; remux: progressive fMP4
+    val sessions_url: String? = null, // POST target for an HLS session
+    val aac: Boolean = false, // remux over HLS: re-encode the audio
+)
+
 @Serializable
 data class Decision(
     val file_id: Long,
     val method: String,
     val play_url: String,
+    val delivery: Delivery? = null,
     val reasons: List<String> = emptyList(),
     val transcode_audio: Boolean = false,
     val audio: List<AudioTrack> = emptyList(),
@@ -173,6 +188,25 @@ data class HlsStart(
     val duration_ms: Long? = null,
     val start_seconds: Double = 0.0,
     val encoder: String? = null,
+)
+
+/**
+ * Body for `POST /files/{id}/hls/sessions`. `height` stays null on purpose:
+ * omitting it selects the server's Auto rung — the rung depends on which
+ * encoder wins, and only the create response knows that. (`Net`'s Json has
+ * `explicitNulls = false`, so nulls are genuinely absent on the wire.)
+ */
+@Serializable
+data class CreateSessionReq(
+    /** Stable for one player instance; supersession is keyed by it. */
+    val playback_id: String,
+    /** Fresh per attempt: a replayed create recovers the same session. */
+    val request_id: String? = null,
+    val height: Int? = null,
+    val start: Double? = null,
+    val audio: Int? = null,
+    val copy: Boolean? = null,
+    val aac: Boolean? = null,
 )
 
 @Serializable

@@ -752,8 +752,11 @@ struct Session {
     /// What kind of work this is, for the admission record (see
     /// [`crate::admission::Workload::class`]). Kept on the session because the
     /// speed that matters is measured while it runs, long after the file that
-    /// described it went out of scope.
-    class: String,
+    /// described it went out of scope. Mutable because the hardware→software
+    /// fallback replaces the encoder inside one session — speeds measured
+    /// after that are software speeds, and recording them under the hardware
+    /// class would poison the very measurements admission decides by.
+    class: std::sync::Mutex<String>,
     /// The hardware slot this session holds.
     ///
     /// Released two ways, on purpose. `release_hardware` hands it back the
@@ -820,6 +823,19 @@ impl Session {
     /// whether the other got there first.
     fn release_hardware(&self) {
         let _ = self.hw_slot.lock().expect("hw slot mutex").take();
+    }
+
+    /// The bookkeeping half of the hardware→software fallback, split out so a
+    /// test can prove it. Two things must happen at the transition, not at
+    /// teardown: the hardware slot goes back (a software session holding a
+    /// GPU slot parks the next hardware start in the admission queue for as
+    /// long as this session lives — potentially a whole film), and the
+    /// admission class flips to software, so the speeds measured from here on
+    /// are recorded as what they are rather than poisoning the hardware
+    /// class's record with a software encoder's numbers.
+    fn demote_to_software(&self, work: Workload<'_>) {
+        self.release_hardware();
+        *self.class.lock().expect("class mutex") = work.software_class();
     }
 
     /// Re-read the playlist and re-measure what is on disk.
@@ -1023,6 +1039,83 @@ impl SessionRequest {
             self.subtitle_burn.unwrap_or(-1)
         )
     }
+}
+
+/// One creation request's lifecycle, keyed by the client's `request_id`.
+enum RequestState {
+    /// A create with this id is running and its outcome isn't known yet.
+    /// A concurrent create with the same id waits for it rather than pass
+    /// the same check and start a second encoder.
+    InFlight,
+    /// The create finished, and this is the session it made.
+    Ready(String),
+}
+
+/// How long a create will wait on an identical in-flight one before calling
+/// it lost. An honest peer resolves within the slot queue's patience plus
+/// spawn overhead; a reservation still standing past this belongs to a
+/// process that died without unwinding, and erroring beats hanging the
+/// player behind it.
+const INFLIGHT_WAIT: Duration = Duration::from_secs(QUEUE_WAIT.as_secs() + 10);
+const INFLIGHT_POLL: Duration = Duration::from_millis(100);
+
+/// The reservation a creating call holds while it works.
+///
+/// Exists so a create that never completes — an error, or a caller that
+/// vanished mid-await (a closed tab drops its request future wherever it
+/// happens to be) — cannot leave its `request_id` parked `InFlight` forever,
+/// wedging every honest retry behind [`INFLIGHT_WAIT`]. `complete` records
+/// the session and defuses the guard; `Drop` covers every other exit by
+/// clearing the reservation so the next attempt starts fresh.
+struct RequestClaim<'a> {
+    requests: &'a std::sync::Mutex<HashMap<String, (String, RequestState)>>,
+    key: Option<String>,
+    fingerprint: String,
+}
+
+impl RequestClaim<'_> {
+    /// Record the created session under this reservation's key, pruning
+    /// entries whose sessions have ended so the map cannot grow for the life
+    /// of the process. In-flight reservations are never pruned — their
+    /// sessions aren't in the map *yet*.
+    fn complete(mut self, session_id: &str, live: &std::collections::HashSet<String>) {
+        let Some(key) = self.key.take() else { return };
+        let mut requests = self.requests.lock().expect("requests mutex");
+        requests.retain(|_, (_, state)| match state {
+            RequestState::InFlight => true,
+            RequestState::Ready(sid) => live.contains(sid),
+        });
+        requests.insert(
+            key,
+            (
+                std::mem::take(&mut self.fingerprint),
+                RequestState::Ready(session_id.to_owned()),
+            ),
+        );
+    }
+}
+
+impl Drop for RequestClaim<'_> {
+    fn drop(&mut self) {
+        let Some(key) = self.key.take() else { return };
+        if let Ok(mut requests) = self.requests.lock() {
+            // Only this claim's own reservation. Nothing else removes an
+            // `InFlight` entry, so finding one under our key means it is
+            // ours; a `Ready` entry is a completed create and belongs to
+            // the map.
+            if matches!(requests.get(&key), Some((_, RequestState::InFlight))) {
+                requests.remove(&key);
+            }
+        }
+    }
+}
+
+/// What claiming a `request_id` resolved to.
+enum Claimed<'a> {
+    /// This call owns the create; the claim must be completed or dropped.
+    Mine(RequestClaim<'a>),
+    /// An identical create already made this session.
+    Recovered(StartInfo),
 }
 
 /// How often a running producer checks whether a viewer wants its slot.
@@ -1240,10 +1333,18 @@ pub struct TranscodeManager {
     /// written so that a miss is the ordinary case.
     cache: Option<CacheConfig>,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
-    /// Answered creation requests: `request_id` -> (session id, fingerprint).
-    /// Small by construction — an entry is dropped as soon as its session is
-    /// gone, and one player instance has one in flight at a time.
-    requests: Mutex<HashMap<String, (String, String)>>,
+    /// Creation requests by `request_id` — reserved *before* work starts, so
+    /// two concurrent creates with the same id cannot both pass the check and
+    /// spawn two encoders (the check-then-act race this map used to have).
+    /// Values are `(fingerprint, state)`. Small by construction — a `Ready`
+    /// entry is dropped as soon as its session is gone, an `InFlight` one the
+    /// moment its create resolves or is abandoned, and one player instance
+    /// has one in flight at a time.
+    ///
+    /// A `std` mutex rather than tokio's, never held across an await: the
+    /// abandoned-create cleanup runs in a `Drop` impl, and `Drop` cannot
+    /// await.
+    requests: std::sync::Mutex<HashMap<String, (String, RequestState)>>,
     /// See [`ProducerTuning`]. Always the default outside tests.
     producer: ProducerTuning,
 }
@@ -1268,7 +1369,7 @@ impl TranscodeManager {
             admissions: Admissions::new(),
             cache: None,
             sessions: Mutex::new(HashMap::new()),
-            requests: Mutex::new(HashMap::new()),
+            requests: std::sync::Mutex::new(HashMap::new()),
             producer: ProducerTuning::default(),
         }
     }
@@ -1502,7 +1603,7 @@ impl TranscodeManager {
             segments: Mutex::new(SegmentIndex::default()),
             ahead_bytes: AtomicI64::new(0),
             progress: Arc::new(Progress::new()),
-            class: String::new(),
+            class: std::sync::Mutex::new(String::new()),
             hw_slot: std::sync::Mutex::new(None),
             delivery: Meter::new(),
             suspended: AtomicBool::new(false),
@@ -1884,28 +1985,27 @@ impl TranscodeManager {
     /// mattered. A repeated `request_id` now returns the same session;
     /// the same id asking for something different is a conflict rather than a
     /// quiet second stream.
+    ///
+    /// The id is *reserved* before any work starts, not checked and then
+    /// acted on: the old shape read the map, released the lock, spawned
+    /// ffmpeg, and recorded the result — so two concurrent retries with the
+    /// same id could both pass the check, spawn two encoders, and leave one
+    /// caller holding a session its twin's supersession had already killed.
+    /// Now the second caller finds the reservation and waits for the first
+    /// one's session instead.
     pub async fn create_session(
         &self,
         req: &SessionRequest,
         user_name: &str,
     ) -> Result<StartInfo, String> {
         let fingerprint = req.fingerprint();
-        if let Some(key) = req.request_id.as_deref() {
-            let known = self.requests.lock().await.get(key).cloned();
-            if let Some((session_id, seen)) = known {
-                if seen != fingerprint {
-                    return Err(format!(
-                        "request {key} was already used for a different stream"
-                    ));
-                }
-                if let Some(info) = self.recover(&session_id).await {
-                    tracing::debug!(%session_id, request_id = key, "idempotent create: same session");
-                    return Ok(info);
-                }
-                // Its session is gone; the entry is stale, not authoritative.
-                self.requests.lock().await.remove(key);
-            }
-        }
+        let claim = match req.request_id.as_deref() {
+            Some(key) => match self.claim_request(key, &fingerprint).await? {
+                Claimed::Recovered(info) => return Ok(info),
+                Claimed::Mine(claim) => Some(claim),
+            },
+            None => None,
+        };
 
         let info = match req.kind {
             SessionKind::Transcode { height } => {
@@ -1932,16 +2032,82 @@ impl TranscodeManager {
                 .await?
             }
         };
-        if let Some(key) = req.request_id.as_deref() {
-            let mut requests = self.requests.lock().await;
+        if let Some(claim) = claim {
             let live: std::collections::HashSet<String> =
                 self.sessions.lock().await.keys().cloned().collect();
-            // Drop entries whose session has ended, so this map cannot grow
-            // for the life of the process.
-            requests.retain(|_, (session_id, _)| live.contains(session_id));
-            requests.insert(key.to_owned(), (info.session_id.clone(), fingerprint));
+            claim.complete(&info.session_id, &live);
         }
         Ok(info)
+    }
+
+    /// Resolve a `request_id` to either a reservation this call owns or the
+    /// session an identical create already made. Errors on a fingerprint
+    /// mismatch (same id, different stream) and on a reservation that outlives
+    /// [`INFLIGHT_WAIT`].
+    async fn claim_request(&self, key: &str, fingerprint: &str) -> Result<Claimed<'_>, String> {
+        let deadline = Instant::now() + INFLIGHT_WAIT;
+        loop {
+            // What the map says right now, decided under one lock so there is
+            // no gap between reading the entry and reserving the key.
+            enum Step {
+                Reserved,
+                Wait,
+                Recover(String),
+            }
+            let step = {
+                let mut requests = self.requests.lock().expect("requests mutex");
+                match requests.get(key) {
+                    Some((seen, _)) if seen != fingerprint => {
+                        return Err(format!(
+                            "request {key} was already used for a different stream"
+                        ));
+                    }
+                    Some((_, RequestState::InFlight)) => Step::Wait,
+                    Some((_, RequestState::Ready(session_id))) => Step::Recover(session_id.clone()),
+                    None => {
+                        requests.insert(
+                            key.to_owned(),
+                            (fingerprint.to_owned(), RequestState::InFlight),
+                        );
+                        Step::Reserved
+                    }
+                }
+            };
+            match step {
+                Step::Reserved => {
+                    return Ok(Claimed::Mine(RequestClaim {
+                        requests: &self.requests,
+                        key: Some(key.to_owned()),
+                        fingerprint: fingerprint.to_owned(),
+                    }))
+                }
+                Step::Recover(session_id) => {
+                    if let Some(info) = self.recover(&session_id).await {
+                        tracing::debug!(%session_id, request_id = key, "idempotent create: same session");
+                        return Ok(Claimed::Recovered(info));
+                    }
+                    // Its session is gone; the entry is stale, not
+                    // authoritative. Remove exactly the entry that was seen —
+                    // a peer may have re-reserved the key meanwhile — and
+                    // re-decide from the top.
+                    let mut requests = self.requests.lock().expect("requests mutex");
+                    if matches!(requests.get(key), Some((_, RequestState::Ready(sid))) if *sid == session_id)
+                    {
+                        requests.remove(key);
+                    }
+                }
+                Step::Wait => {
+                    if Instant::now() >= deadline {
+                        return Err(format!(
+                            "a create with request id {key} has been in flight for over {}s; \
+                             assume it died and retry",
+                            INFLIGHT_WAIT.as_secs()
+                        ));
+                    }
+                    tokio::time::sleep(INFLIGHT_POLL).await;
+                }
+            }
+        }
     }
 
     /// Describe a session that already exists, for an idempotent re-create.
@@ -2311,11 +2477,11 @@ impl TranscodeManager {
             segments: Mutex::new(SegmentIndex::default()),
             ahead_bytes: AtomicI64::new(0),
             progress: Arc::clone(&progress),
-            class: work.class(if encoder == Encoder::Software {
+            class: std::sync::Mutex::new(work.class(if encoder == Encoder::Software {
                 crate::admission::SOFTWARE
             } else {
                 encoder.label()
-            }),
+            })),
             hw_slot: std::sync::Mutex::new(hw_slot),
             delivery: Meter::new(),
             suspended: AtomicBool::new(false),
@@ -2418,6 +2584,14 @@ impl TranscodeManager {
                     );
                     session.kill_child().await;
                     clear_session_dir(&dir).await;
+                    if !downgrade_pipeline {
+                        // The slot belonged to the encoder that just died, not
+                        // to the session: hand it back at the transition so
+                        // the next hardware start gets it now, and re-class
+                        // the admission record for the software encoder that
+                        // is about to be measured.
+                        session.demote_to_software(Workload::of(&file, session.target_height));
+                    }
                     let sw_args = transcode::hls_args(
                         &file,
                         retry_encoder,
@@ -2619,7 +2793,7 @@ impl TranscodeManager {
             segments: Mutex::new(SegmentIndex::default()),
             ahead_bytes: AtomicI64::new(0),
             progress: Arc::clone(&progress),
-            class: String::new(),
+            class: std::sync::Mutex::new(String::new()),
             hw_slot: std::sync::Mutex::new(None),
             delivery: Meter::new(),
             suspended: AtomicBool::new(false),
@@ -3064,11 +3238,12 @@ impl TranscodeManager {
             // A suspended session is making no progress on purpose and would
             // poison the record with a speed it was never asked to reach.
             for (_id, session) in &live {
-                if session.class.is_empty() || session.suspended.load(Relaxed) {
+                let class = session.class.lock().expect("class mutex").clone();
+                if class.is_empty() || session.suspended.load(Relaxed) {
                     continue;
                 }
                 if let Some(speed) = session.progress.recent_speed() {
-                    self.admissions.record(&session.class, speed);
+                    self.admissions.record(&class, speed);
                 }
             }
             // Repair pass. Flow control proper runs on segment completion and
@@ -3634,7 +3809,7 @@ mod tests {
             segments: Mutex::new(SegmentIndex::default()),
             ahead_bytes: AtomicI64::new(0),
             progress: Arc::new(Progress::new()),
-            class: String::new(),
+            class: std::sync::Mutex::new(String::new()),
             hw_slot: std::sync::Mutex::new(None),
             delivery: Meter::new(),
             suspended: AtomicBool::new(false),
@@ -4002,6 +4177,73 @@ mod tests {
             assert!(mgr.stop_session(&id, "test").await);
         }
         assert_eq!(mgr.admissions.in_use(), 0, "slots come back");
+    }
+
+    /// The hardware→software fallback must return its slot at the transition,
+    /// not at teardown: with a cap of one, the next hardware start would
+    /// otherwise queue behind a software session for as long as it lives —
+    /// potentially a whole film. And the admission record must flip to the
+    /// software class, or every speed measured from the replacement encoder
+    /// is filed as evidence about hardware.
+    #[tokio::test]
+    async fn a_fallback_to_software_frees_the_hardware_slot_at_once() {
+        super::require_ffmpeg();
+        use plurx_core::store::SqliteStore;
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let file_id = seed_file(&store).await;
+        let work = tempfile::tempdir().expect("work");
+        let mgr = TranscodeManager::new(
+            Arc::clone(&store),
+            work.path().to_path_buf(),
+            EncoderCaps {
+                nvenc: true,
+                ..Default::default()
+            },
+            Pipeline::Cpu,
+        );
+        store
+            .put_setting(keys::MAX_HW_SESSIONS, "1")
+            .await
+            .expect("cap");
+
+        let info = mgr
+            .start(file_id, 1080, 0.0, None, None, "paul", "pb-fallback")
+            .await
+            .expect("hardware start");
+        assert_eq!(mgr.admissions.in_use(), 1, "the start holds the only slot");
+
+        let session = mgr
+            .sessions
+            .lock()
+            .await
+            .get(&info.session_id)
+            .cloned()
+            .expect("session");
+        let file = store.get_file(file_id).await.expect("get").expect("file");
+        let work_class = Workload::of(&file, session.target_height);
+        session.demote_to_software(work_class);
+
+        assert_eq!(
+            mgr.admissions.in_use(),
+            0,
+            "the slot came back at the transition"
+        );
+        assert_eq!(
+            *session.class.lock().expect("class"),
+            Workload::of(&file, session.target_height).software_class(),
+            "speeds measured from here on are software evidence"
+        );
+        // The whole point, stated as the viewer experiences it: with the cap
+        // at one and the demoted session still alive, the next hardware start
+        // is admitted immediately instead of queuing for this session's life.
+        match mgr
+            .admissions
+            .admit(1, Workload::of(&file, session.target_height))
+        {
+            Admission::Hardware(_slot) => {}
+            other => panic!("the freed slot must be grantable now, got {other:?}"),
+        }
+        assert!(mgr.stop_session(&info.session_id, "test").await);
     }
 
     // ---- the pre-transcode cache, serving side (PERF-PLAN §6.3) -------------
@@ -4967,6 +5209,89 @@ mod tests {
         let revived = mgr.create_session(&next, "paul").await.expect("recreate");
         assert_ne!(revived.session_id, moved.session_id);
         assert!(mgr.stop_session(&revived.session_id, "test").await);
+    }
+
+    /// The check-then-act race the reservation exists to close: two creates
+    /// carrying the same request id, in flight at the same time, must produce
+    /// one session between them — not one encoder each with the loser handed
+    /// a stream its twin's supersession already killed. No interleaving is
+    /// asserted, only the outcome, so this passes whether the runtime overlaps
+    /// them or happens to serialize them.
+    #[tokio::test]
+    async fn concurrent_creates_with_one_request_id_share_one_session() {
+        super::require_ffmpeg();
+        use plurx_core::store::SqliteStore;
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let file_id = seed_file(&store).await;
+        let work = tempfile::tempdir().expect("work");
+        let mgr = TranscodeManager::new(
+            Arc::clone(&store),
+            work.path().to_path_buf(),
+            EncoderCaps::default(),
+            Pipeline::Cpu,
+        );
+        let request = SessionRequest {
+            file_id,
+            playback_id: "pb-race".into(),
+            request_id: Some("req-race".into()),
+            kind: SessionKind::Transcode { height: 720 },
+            start_seconds: 0.0,
+            audio_index: None,
+            subtitle_burn: None,
+        };
+
+        let (a, b) = tokio::join!(
+            mgr.create_session(&request, "paul"),
+            mgr.create_session(&request, "paul"),
+        );
+        let a = a.expect("first create");
+        let b = b.expect("second create");
+        assert_eq!(
+            a.session_id, b.session_id,
+            "both callers must be handed the one session the id names"
+        );
+        assert_eq!(mgr.active_sessions().await, 1, "and exactly one exists");
+        assert!(mgr.stop_session(&a.session_id, "test").await);
+    }
+
+    /// A create that fails must clear its reservation on the way out. The
+    /// second call reuses the id for a *different* stream on purpose: were the
+    /// failed reservation left behind, this would be refused as a conflict —
+    /// a client whose first attempt died would find its id poisoned and could
+    /// never retry.
+    #[tokio::test]
+    async fn a_failed_create_does_not_poison_its_request_id() {
+        super::require_ffmpeg();
+        use plurx_core::store::SqliteStore;
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let file_id = seed_file(&store).await;
+        let work = tempfile::tempdir().expect("work");
+        let mgr = TranscodeManager::new(
+            Arc::clone(&store),
+            work.path().to_path_buf(),
+            EncoderCaps::default(),
+            Pipeline::Cpu,
+        );
+        let request = SessionRequest {
+            file_id: 999_999, // nothing has this id, so the create fails
+            playback_id: "pb-fail".into(),
+            request_id: Some("req-fail".into()),
+            kind: SessionKind::Transcode { height: 720 },
+            start_seconds: 0.0,
+            audio_index: None,
+            subtitle_burn: None,
+        };
+        assert!(mgr.create_session(&request, "paul").await.is_err());
+
+        let retry = SessionRequest {
+            file_id,
+            ..request.clone()
+        };
+        let info = mgr
+            .create_session(&retry, "paul")
+            .await
+            .expect("a failed attempt must not bind its request id");
+        assert!(mgr.stop_session(&info.session_id, "test").await);
     }
 
     #[tokio::test]

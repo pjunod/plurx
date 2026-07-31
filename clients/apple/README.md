@@ -70,13 +70,25 @@ that defines them (bundle id `tv.plurx.app`, deployment target 17.0).
 - **Container**: `mp4, mov, m4v` (what AVPlayer direct-plays).
 - **HDR**: on when the display advertises any HDR mode.
 
-On play the client calls `GET /files/{id}/decision?<caps>`:
+On play the client calls `GET /files/{id}/decision?<caps>` and executes the
+server's **delivery plan**:
 
-- `direct_play` → AVPlayer streams `/files/{id}/direct?token=…`, seeking natively
+- `direct` → AVPlayer streams `/files/{id}/direct?token=…`, seeking natively
   over HTTP range.
-- otherwise → `POST`-less `GET /files/{id}/hls/start` opens a native **HLS**
-  session (capability-authed by its own session id, so no token needed on the
-  playlist), starting at the resume point.
+- `remux` → `POST /files/{id}/hls/sessions` with `copy: true`: the source video
+  repackaged into HLS **untouched**, so a 4K HEVC/HDR MKV reaches the screen at
+  full quality with no encoder running (audio re-encodes only when the plan
+  says so). The playlist is capability-authed by its own session id, so no
+  token is needed on it — which is also what lets an Apple TV fetch it itself
+  during AirPlay.
+- `transcode` → the same `POST` with **no height named**: Auto is the server's
+  choice, because the rung depends on which encoder wins and only the create
+  response knows that.
+
+Either session starts at the resume point, carries this player's `playback_id`
+(the server's supersession key) plus a per-attempt `request_id` (so a replayed
+create recovers the same session), and is released with a `DELETE` the moment
+playback ends instead of waiting out the server's idle reaper.
 
 ## Project layout
 

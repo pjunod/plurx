@@ -2814,6 +2814,120 @@ mod tests {
         assert!(why.contains("69 Mb/s"), "{body}");
     }
 
+    /// `/decision` must say what to DO, not just what was decided. Clients
+    /// that re-derived policy from `method` got it differently wrong on every
+    /// platform — Android played transcode verdicts through the copy-only
+    /// progressive path, Apple re-encoded remux verdicts at a hardcoded
+    /// 1080p — so the response now carries an executable plan per verdict.
+    #[tokio::test]
+    async fn the_decision_carries_an_executable_delivery_plan() {
+        let (app, state) = test_state();
+        let admin = setup_admin(&app).await;
+        let s = seed_content(&state).await;
+
+        // Direct play: the plan is the file itself.
+        let (status, body) = call(
+            &app,
+            get(
+                &format!(
+                    "/api/v1/files/{}/decision?vcodec=h264&acodec=aac&container=mp4&hdr=0",
+                    s.file
+                ),
+                Some(&admin),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["delivery"]["mode"], "direct", "{body}");
+        assert_eq!(body["delivery"]["url"], body["play_url"], "{body}");
+
+        // Remux (HEVC decodes, MKV + TrueHD don't): the plan offers both
+        // envelopes for the same copied bytes — the progressive URL, and the
+        // copy-session POST for players that need HLS transport — and settles
+        // the audio question so no client re-derives it.
+        let dir = std::env::temp_dir().join(format!("plurx-plan-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("mediadir");
+        let path = dir.join("Plan.mkv");
+        std::fs::write(&path, b"\x1a\x45\xdf\xa3 tiny placeholder").expect("write");
+        let probe = plurx_core::domain::ProbeResult {
+            duration_ms: Some(9_000_000),
+            container: Some("mkv".into()),
+            video_codec: Some("hevc".into()),
+            width: Some(3840),
+            height: Some(2160),
+            bit_depth: Some(10),
+            bitrate: Some(69_000_000),
+            audio_streams: vec![plurx_core::domain::AudioStream {
+                index: 0,
+                codec: "truehd".into(),
+                channels: Some(8),
+                language: Some("eng".into()),
+                default: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mkv = state
+            .store
+            .upsert_file(s.movie, &path.to_string_lossy(), 98, 1, &probe)
+            .await
+            .expect("file");
+        let (status, body) = call(
+            &app,
+            get(
+                &format!(
+                    "/api/v1/files/{mkv}/decision?vcodec=h264,hevc&acodec=aac&container=mp4&hdr=1"
+                ),
+                Some(&admin),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["method"], "remux", "{body}");
+        assert_eq!(body["delivery"]["mode"], "remux", "{body}");
+        assert_eq!(
+            body["delivery"]["url"],
+            format!("/api/v1/files/{mkv}/stream.mp4"),
+            "{body}"
+        );
+        assert_eq!(
+            body["delivery"]["sessions_url"],
+            format!("/api/v1/files/{mkv}/hls/sessions"),
+            "{body}"
+        );
+        assert_eq!(
+            body["delivery"]["aac"], true,
+            "TrueHD is not in the client's acodec list, so the copy session must re-encode it: {body}"
+        );
+
+        // Transcode: the plan is a session create, and deliberately carries no
+        // height — Auto belongs to the server (the rung depends on which
+        // encoder wins, which only the create response knows).
+        let (status, body) = call(
+            &app,
+            get(
+                &format!(
+                    "/api/v1/files/{}/decision?vcodec=h264&acodec=aac&container=mp4&hdr=0&force=transcode",
+                    s.file
+                ),
+                Some(&admin),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["method"], "transcode", "{body}");
+        assert_eq!(body["delivery"]["mode"], "transcode", "{body}");
+        assert_eq!(
+            body["delivery"]["sessions_url"],
+            format!("/api/v1/files/{}/hls/sessions", s.file),
+            "{body}"
+        );
+        assert!(
+            body["delivery"].get("height").is_none(),
+            "Auto is the server's call, not a field in the plan: {body}"
+        );
+    }
+
     #[tokio::test]
     async fn seeded_read_surface() {
         let (app, state) = test_state();

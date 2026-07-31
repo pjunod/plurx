@@ -25,12 +25,16 @@ and the player says so out loud in `/decision`.
       │
       ▼
  server pure fn:  (file streams, device profile, caps, prefs) ─▶ Decision
-      │           { method, play_url, reasons[], transcode_audio, audio[], subs[], markers[] }
+      │           { method, delivery, reasons[], transcode_audio, audio[], subs[], markers[] }
       │
-      ├─ direct_play ─▶ play_url = /files/{id}/direct       (HTTP range)
-      ├─ remux ───────▶ play_url = /files/{id}/stream.mp4    (progressive fMP4)
-      └─ transcode ───▶ (client then calls /files/{id}/hls/start)
-      │
+      │    `delivery` is the server-owned EXECUTION PLAN for the verdict, so a
+      │    client acts on it instead of re-deriving policy from `method`:
+      ├─ { mode: direct,    url: /files/{id}/direct }                  (HTTP range)
+      ├─ { mode: remux,     url: /files/{id}/stream.mp4,               (progressive fMP4)
+      │                     sessions_url, aac }        (or POST sessions_url with copy:true
+      │                                                 for players that need HLS transport)
+      └─ { mode: transcode, sessions_url }             (POST it, omitting `height`: Auto is
+      │                                                 the server's rung to pick)
       ▼
  client picks the transport its browser can actually play  (see "Delivery")
       │

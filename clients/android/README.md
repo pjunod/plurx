@@ -22,8 +22,9 @@ hardware genuinely can't play — everything else streams the original file unto
 - **Detail** pages with backdrop, overview, and Resume / Start-over.
 - **Player** built on ExoPlayer:
   - **Direct play** of the original file with native seeking (HTTP range).
-  - **Transcode / remux fallback** via `stream.mp4`, with seek handled by re-requesting the
-    stream at the new offset.
+  - **Remux** via `stream.mp4`, with seek handled by re-requesting the stream at the new
+    offset; **transcode** via an HLS session at the server's Auto quality rung, released
+    with a `DELETE` when playback ends.
   - Custom Compose controls, a scrubber, ±10s, **Skip Intro / Skip Credits** from server
     markers, and an **audio / subtitle** track menu.
   - Progress is reported back to the server every 10s and on pause/exit, which drives your
@@ -157,11 +158,14 @@ The interesting part lives in `data/Caps.kt` and `player/`. On play, the client:
 
 1. Enumerates the device's decoders (`MediaCodecList`) and HDR display support, and builds a
    caps map: `vcodec`, `acodec`, `container`, `hdr`.
-2. Calls `GET /api/v1/files/{id}/decision?<caps>`. The server replies with a **method**
-   (`direct_play` / `remux` / `transcode`) and a `play_url`.
-3. `direct_play` → ExoPlayer streams `/files/{id}/direct` (seekable via range). Anything else
-   → `/files/{id}/stream.mp4?start=…`, a live fast-seek remux, and seeks re-request at the
-   new position. Either way the true timeline position is what gets scrobbled.
+2. Calls `GET /api/v1/files/{id}/decision?<caps>`. The server replies with a **delivery
+   plan** (`direct` / `remux` / `transcode`) that the player executes as given.
+3. `direct` → ExoPlayer streams `/files/{id}/direct` (seekable via range). `remux` →
+   `/files/{id}/stream.mp4?start=…`, a live fast-seek remux, and seeks re-request at the
+   new position. `transcode` → `POST /files/{id}/hls/sessions` (no `height`: the Auto rung
+   is the server's choice), played as HLS; a seek opens a session at the new offset and the
+   old one is released with a `DELETE`, as is the session on exit. Either way the true
+   timeline position is what gets scrobbled.
 
 This is why the Android app transcodes so rarely compared to a browser: MKV/HEVC/etc. that a
 `<video>` tag refuses, ExoPlayer just plays.
@@ -190,7 +194,8 @@ Intentionally out of scope for v0.1.0, in rough priority order:
 - Search across libraries.
 - Client-side A/V **audio-offset** application on direct play (today the server applies sync
   offsets on transcode paths; the field is read but not yet acted on for direct play).
-- HLS delivery for the transcode path (proper in-stream seeking instead of seek-by-restart).
+- In-stream seeking within a transcode session's produced range (today every seek opens a
+  session at the new offset, like the web player).
 - Proper TV **focus engine** polish (initial focus, row memory) and a dedicated leanback
   browse layout.
 - Downloads / offline, Cast, PiP.

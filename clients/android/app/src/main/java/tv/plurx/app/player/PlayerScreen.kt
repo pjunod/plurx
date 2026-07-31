@@ -2,7 +2,6 @@
 
 package tv.plurx.app.player
 
-import android.net.Uri
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -39,6 +38,7 @@ import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -64,8 +64,9 @@ import tv.plurx.app.ui.theme.Accent
 private data class Plan(
     val title: String,
     override val durationMs: Long,
+    override val fileId: Long,
     override val playUrl: String,
-    override val direct: Boolean,
+    override val mode: String,
     val markers: List<Marker>,
 ) : PlanLike
 
@@ -73,11 +74,19 @@ private suspend fun loadPlan(vm: AppViewModel, itemId: Long, fileId: Long): Plan
     val detail = vm.itemDetail(itemId)
     val decision: Decision = vm.decision(fileId)
     val file = detail.files.firstOrNull { it.id == fileId } ?: detail.files.firstOrNull()
+    // Execute the server's delivery plan; the method-string mapping is the
+    // fallback for servers that predate `delivery`.
+    val mode = decision.delivery?.mode ?: when (decision.method) {
+        "direct_play" -> "direct"
+        "remux" -> "remux"
+        else -> "transcode"
+    }
     Plan(
         title = detail.item.title,
         durationMs = file?.duration_ms ?: detail.item.runtime_ms ?: 0L,
-        playUrl = Session.url(decision.play_url),
-        direct = decision.method == "direct_play",
+        fileId = fileId,
+        playUrl = Session.url(decision.delivery?.url ?: decision.play_url),
+        mode = mode,
         markers = decision.markers,
     )
 } catch (_: Exception) {
@@ -101,17 +110,26 @@ fun PlayerScreen(
 
     Box(Modifier.fillMaxSize().background(Color.Black)) {
         when {
-            failed -> Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) {
-                Text("Couldn't start playback.", color = Color.White)
-                Spacer(Modifier.size(12.dp))
-                Button(onClick = onExit) { Text("Back") }
-            }
+            failed -> PlaybackFailed(onExit)
             plan == null -> {
                 LoadingBox()
                 BackChip(onExit)
             }
             else -> PlayerContent(vm, itemId, plan!!, startMs, onExit)
         }
+    }
+}
+
+@Composable
+private fun PlaybackFailed(onExit: () -> Unit) {
+    Column(
+        Modifier.fillMaxSize(),
+        verticalArrangement = Arrangement.Center,
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Text("Couldn't start playback.", color = Color.White)
+        Spacer(Modifier.size(12.dp))
+        Button(onClick = onExit) { Text("Back") }
     }
 }
 
@@ -124,7 +142,14 @@ private fun PlayerContent(
     onExit: () -> Unit,
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
-    val controller = remember(plan) { Controller(buildPlayer(context, vm), plan, vm.caps()) }
+    val scope = rememberCoroutineScope()
+    // The transcode path opens its HLS session asynchronously; if that create
+    // fails there is no player error event to lean on, so the controller says
+    // so and the same failure surface as a failed plan is shown.
+    var playFailed by remember { mutableStateOf(false) }
+    val controller = remember(plan) {
+        Controller(buildPlayer(context, vm), plan, vm.caps(), vm, scope, onError = { playFailed = true })
+    }
 
     var positionMs by remember { mutableLongStateOf(startMs) }
     var scrubbing by remember { mutableStateOf(false) }
@@ -180,6 +205,11 @@ private fun PlayerContent(
             delay(3800)
             controlsVisible = false
         }
+    }
+
+    if (playFailed) {
+        PlaybackFailed(onExit)
+        return
     }
 
     Box(Modifier.fillMaxSize()) {

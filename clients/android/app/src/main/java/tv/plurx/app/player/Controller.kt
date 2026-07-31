@@ -34,38 +34,64 @@ import androidx.media3.datasource.okhttp.OkHttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.launch
+import tv.plurx.app.data.CreateSessionReq
 import tv.plurx.app.data.Net
+import tv.plurx.app.data.Session
 import tv.plurx.app.ui.AppViewModel
 import tv.plurx.app.ui.theme.Accent
 import tv.plurx.app.ui.theme.Muted
 import java.util.Locale
+import java.util.UUID
 
 /**
- * Bridges plurx's two delivery shapes to one ExoPlayer:
- *  - direct play → the original file over HTTP range; ExoPlayer seeks natively.
- *  - remux/transcode → `stream.mp4?start=…`, a live fast-seek remux that can't be
- *    range-sought, so a seek re-requests the stream at the new offset. Either
- *    way [realPosition] reports the true timeline position (base + player pos),
- *    which is what gets scrobbled.
+ * Bridges plurx's delivery plan to one ExoPlayer, executing the mode the
+ * server chose instead of re-deriving policy from the verdict:
+ *  - direct → the original file over HTTP range; ExoPlayer seeks natively.
+ *  - remux → `stream.mp4?start=…`, a live fast-seek remux that can't be
+ *    range-sought, so a seek re-requests the stream at the new offset.
+ *  - transcode → an HLS session (this used to go through `stream.mp4` too,
+ *    which never re-encodes video — a tone-map or downscale verdict shipped
+ *    the copied source anyway). A seek opens a session at the new offset,
+ *    like the web player, and the old one is released with a DELETE rather
+ *    than left to the server's idle reaper.
+ * Either way [realPosition] reports the true timeline position (base + player
+ * pos), which is what gets scrobbled.
  */
 @UnstableApi
 class Controller(
     val player: ExoPlayer,
     private val plan: PlanLike,
     private val caps: Map<String, String>,
+    private val vm: AppViewModel,
+    private val scope: CoroutineScope,
+    private val onError: () -> Unit = {},
 ) {
-    private val direct = plan.direct
+    private val direct = plan.mode == "direct"
     private var baseMs = 0L
 
+    /** The HLS session this player owns, if the plan opened one. */
+    private var sessionId: String? = null
+
+    /** Stable for this player instance — the server's supersession key. */
+    private val playbackId = UUID.randomUUID().toString()
+
     fun startAt(ms: Long) {
-        if (direct) {
-            player.setMediaItem(MediaItem.fromUri(plan.playUrl), ms.coerceAtLeast(0))
-        } else {
-            baseMs = ms.coerceAtLeast(0)
-            player.setMediaItem(MediaItem.fromUri(transcodeUri(baseMs)))
+        when (plan.mode) {
+            "direct" -> {
+                player.setMediaItem(MediaItem.fromUri(plan.playUrl), ms.coerceAtLeast(0))
+                player.prepare()
+                player.playWhenReady = true
+            }
+            "remux" -> {
+                baseMs = ms.coerceAtLeast(0)
+                player.setMediaItem(MediaItem.fromUri(remuxUri(baseMs)))
+                player.prepare()
+                player.playWhenReady = true
+            }
+            else -> openSession(ms.coerceAtLeast(0))
         }
-        player.prepare()
-        player.playWhenReady = true
     }
 
     fun realPosition(): Long {
@@ -75,13 +101,15 @@ class Controller(
 
     fun seekTo(targetMs: Long) {
         val t = targetMs.coerceIn(0, if (plan.durationMs > 0) plan.durationMs else Long.MAX_VALUE)
-        if (direct) {
-            player.seekTo(t)
-        } else {
-            baseMs = t
-            player.setMediaItem(MediaItem.fromUri(transcodeUri(t)))
-            player.prepare()
-            player.playWhenReady = true
+        when (plan.mode) {
+            "direct" -> player.seekTo(t)
+            "remux" -> {
+                baseMs = t
+                player.setMediaItem(MediaItem.fromUri(remuxUri(t)))
+                player.prepare()
+                player.playWhenReady = true
+            }
+            else -> openSession(t)
         }
     }
 
@@ -89,9 +117,43 @@ class Controller(
         player.playWhenReady = !player.playWhenReady
     }
 
-    fun release() = player.release()
+    fun release() {
+        sessionId?.let { vm.endHlsSession(it) }
+        sessionId = null
+        player.release()
+    }
 
-    private fun transcodeUri(ms: Long): String {
+    /**
+     * Open a transcode session at `ms`, releasing the one it replaces. A seek
+     * is a new session, exactly as the web player does it; `height` is never
+     * sent, so the rung is the server's Auto choice.
+     */
+    private fun openSession(ms: Long) {
+        sessionId?.let { vm.endHlsSession(it) }
+        sessionId = null
+        scope.launch {
+            val hls = try {
+                vm.createHlsSession(
+                    plan.fileId,
+                    CreateSessionReq(
+                        playback_id = playbackId,
+                        request_id = UUID.randomUUID().toString(),
+                        start = ms / 1000.0,
+                    ),
+                )
+            } catch (_: Exception) {
+                onError()
+                return@launch
+            }
+            sessionId = hls.session_id
+            baseMs = (hls.start_seconds * 1000).toLong()
+            player.setMediaItem(MediaItem.fromUri(Session.url(hls.playlist_url)))
+            player.prepare()
+            player.playWhenReady = true
+        }
+    }
+
+    private fun remuxUri(ms: Long): String {
         val sb = StringBuilder(plan.playUrl)
         sb.append(if (plan.playUrl.contains('?')) '&' else '?')
         sb.append("start=").append(ms / 1000.0)
@@ -102,8 +164,9 @@ class Controller(
 
 /** Minimal view of [Plan] so the controller doesn't depend on the screen file. */
 interface PlanLike {
+    val fileId: Long
     val playUrl: String
-    val direct: Boolean
+    val mode: String // "direct" | "remux" | "transcode"
     val durationMs: Long
 }
 

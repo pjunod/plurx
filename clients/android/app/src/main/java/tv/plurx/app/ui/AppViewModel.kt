@@ -9,7 +9,9 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import tv.plurx.app.data.Caps
+import tv.plurx.app.data.CreateSessionReq
 import tv.plurx.app.data.Decision
+import tv.plurx.app.data.HlsStart
 import tv.plurx.app.data.Hubs
 import tv.plurx.app.data.Item
 import tv.plurx.app.data.ItemDetail
@@ -189,6 +191,25 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     suspend fun itemDetail(id: Long): ItemDetail = api().item(id)
 
     suspend fun decision(fileId: Long): Decision = api().decision(fileId, caps())
+
+    suspend fun createHlsSession(fileId: Long, body: CreateSessionReq): HlsStart =
+        api().createHlsSession(fileId, body)
+
+    /**
+     * Fire-and-forget session release, on [viewModelScope] for the same reason
+     * as [postProgress]: teardown can't await, and the scope outlives the
+     * screen. Best-effort — the route is idempotent, and the stream is over
+     * either way.
+     */
+    fun endHlsSession(sessionId: String) {
+        viewModelScope.launch {
+            try {
+                api().endHlsSession(sessionId)
+            } catch (_: Exception) {
+                // The reaper remains the backstop.
+            }
+        }
+    }
 
     suspend fun reportProgress(itemId: Long, positionMs: Long, durationMs: Long?) {
         try {

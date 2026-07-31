@@ -162,8 +162,13 @@ final class AppModel: ObservableObject {
         try await requireAPI().decision(fileId: fileId, caps: caps())
     }
 
-    func hlsStart(fileId: Int, height: Int, start: Double, audio: Int?) async throws -> HlsStart {
-        try await requireAPI().hlsStart(fileId: fileId, height: height, start: start, audio: audio)
+    func createHlsSession(fileId: Int, body: CreateSessionRequest) async throws -> HlsStart {
+        try await requireAPI().createHlsSession(fileId: fileId, body: body)
+    }
+
+    /// Best-effort — the stream is over either way.
+    func endHlsSession(_ sessionId: String) async {
+        await requireAPI().endHlsSession(sessionId)
     }
 
     /// Best-effort — a dropped progress beat shouldn't surface an error.

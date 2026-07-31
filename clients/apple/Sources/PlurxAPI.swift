@@ -103,13 +103,26 @@ struct PlurxAPI {
         try await get("files/\(fileId)/decision", query: caps)
     }
 
-    func hlsStart(fileId: Int, height: Int, start: Double, audio: Int?) async throws -> HlsStart {
-        var q: [URLQueryItem] = [
-            URLQueryItem(name: "height", value: "\(height)"),
-            URLQueryItem(name: "start", value: "\(start)"),
-        ]
-        if let audio { q.append(URLQueryItem(name: "audio", value: "\(audio)")) }
-        return try await get("files/\(fileId)/hls/start", query: q)
+    /// POST rather than the deprecated GET bridge: creating a session spawns a
+    /// process and kills its predecessor, and anything entitled to replay a
+    /// GET could spawn a second encoder. The body carries this player's
+    /// `playback_id` and a per-attempt `request_id` so a replay recovers the
+    /// same session instead.
+    func createHlsSession(fileId: Int, body: CreateSessionRequest) async throws -> HlsStart {
+        try await post("files/\(fileId)/hls/sessions", body: body)
+    }
+
+    /// DELETE the session the moment playback ends. Without it the encoder
+    /// lives on for the idle timeout plus a reaper tick — a hardware slot
+    /// held for over a minute for nobody. Best-effort by design: the route is
+    /// idempotent and capability-authed, and a failure to say goodbye is not
+    /// worth surfacing to a viewer who has already left.
+    func endHlsSession(_ sessionId: String) async {
+        guard let url = makeURL("hls/\(sessionId)") else { return }
+        var req = URLRequest(url: url)
+        req.httpMethod = "DELETE"
+        Session.shared.authorize(&req)
+        _ = try? await session.data(for: req)
     }
 
     func progress(itemId: Int, positionMs: Int, durationMs: Int?) async throws {

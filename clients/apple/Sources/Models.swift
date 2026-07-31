@@ -89,10 +89,22 @@ struct Marker: Codable, Hashable {
     var chapter: Bool?
 }
 
+/// The server-owned execution plan for a verdict (`DecisionResponse.delivery`
+/// in crates/plurxd http/stream.rs). The client *executes* this rather than
+/// re-deriving policy from `method` — re-deriving is how this app came to
+/// re-encode remux verdicts at a hardcoded 1080p.
+struct Delivery: Codable {
+    let mode: String            // "direct" | "remux" | "transcode"
+    var url: String?            // direct: the file; remux: progressive fMP4
+    var sessionsUrl: String?    // POST target for a copy or transcode session
+    var aac: Bool?              // remux: the copy session must re-encode audio
+}
+
 struct Decision: Codable {
     let fileId: Int
     let method: String          // "direct_play" | "remux" | "transcode"
     let playUrl: String
+    var delivery: Delivery?
     var reasons: [String]?
     var transcodeAudio: Bool?
     var markers: [Marker]?
@@ -113,6 +125,26 @@ struct LoginRequest: Codable {
     let username: String
     let password: String
     var device: String = "Apple"
+}
+
+/// Body for `POST /files/{id}/hls/sessions`. Optionals encode as absent
+/// (synthesized Codable uses `encodeIfPresent`), which matters for `height`:
+/// omitting it selects the server's Auto rung — the rung depends on which
+/// encoder wins, and only the create response knows that — so this client
+/// never names a height at all.
+struct CreateSessionRequest: Codable {
+    /// Stable for one player instance; supersession is keyed by it.
+    let playbackId: String
+    /// Fresh per attempt: makes a replayed create return the same session
+    /// instead of spawning a second encoder.
+    var requestId: String? = UUID().uuidString
+    var height: Int?
+    var start: Double?
+    var audio: Int?
+    /// Copy the source video into HLS untouched (the remux plan).
+    var copy: Bool?
+    /// With `copy`: re-encode the audio the client can't take.
+    var aac: Bool?
 }
 
 struct ProgressRequest: Codable {
