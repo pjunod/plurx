@@ -49,6 +49,30 @@ bump may break compatibility and a **patch** bump never does.
   speeds measured from the replacement encoder stop being filed as evidence
   about hardware (which was quietly poisoning the very record admission
   decides software-viability by).
+- **A 4K film with forced subtitles played at 1080p whatever the quality menu
+  said — while the overlay claimed "no video transcode".** Bitmap subtitles
+  (PGS/VobSub) can only be shown by drawing them into the frames, so selecting
+  one — including the player auto-applying a forced-flag track, which is every
+  foreign-dialogue disc remux — restarts the stream as a transcode. That
+  restart sent no target height, and the server's Auto rung answers
+  `min(source, 1080)` on hardware: the right bandwidth call for Auto,
+  silently overriding an explicit Original. Three fixes, one per lie. A
+  transcode opened while Original is forced now carries the source's own
+  height (the server still clamps to [144, 2160] and never upscales), so the
+  burn re-encodes at source resolution — Auto keeps its 1080p rung, which is
+  a bandwidth decision and unchanged. Turning subtitles off now goes back
+  through the playback decision instead of opening yet another transcode: it
+  restores the remux/direct-play (and the resolution) the burn took away,
+  where it used to park the viewer in a burn-less re-encode forever — with a
+  one-shot guard so the restart doesn't re-apply the default track and burn
+  it straight back in. And the stats overlay's Reason row now describes the
+  burn session itself rather than quoting the file's `/decision` verdict —
+  it used to read "forced original quality (no video transcode)" over a
+  running QuickSync re-encode, which is the line that sent the diagnosis in
+  the wrong direction. Caveat stated where it belongs (PLAYBACK.md): a burn
+  composites in system memory, so a 2160p burn runs the CPU filter chain,
+  and whether a given box holds realtime there is a measurement to take, not
+  a promise this change makes.
 
 ### Changed
 

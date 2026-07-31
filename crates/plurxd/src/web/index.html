@@ -924,6 +924,12 @@ let ATTEMPT_SEQ=0;
 // inside, and mislabelling it would put restart timings in the cold-start
 // bucket where they flatter the numbers.
 let PENDING_ATTEMPT_REASON=null;
+// Set when a restart's whole point is "without the subtitles". play() re-applies
+// the server-chosen default track on arrival, and when that default is the
+// bitmap track that forced a burn — a forced-flag PGS on a foreign-dialogue
+// film — "subtitles off" would burn them straight back in. One-shot, consumed
+// at the top of play().
+let PENDING_DEFAULT_SUB_OFF=false;
 function newAttempt(reason){
   if(!PLAYER) return;
   PLAYER.attemptId=`a${++ATTEMPT_SEQ}`;
@@ -2544,6 +2550,11 @@ function remuxUrl(base, audioIndex, startSec){
 // and that is exactly the shape of thing that survives a review.
 function transcodeOpts(startSec, audioIndex){
   const o={height:transcodeHeight(), start:startSec};
+  // No explicit rung: under Original the session still owes the viewer the
+  // source's resolution (see originalHeight). Every transcode open shares this
+  // helper precisely so the burn, the fallback, a seek and an audio switch
+  // cannot disagree about it mid-session.
+  if(o.height==null) o.height=originalHeight();
   if(audioIndex!=null) o.audio=audioIndex;
   if(PLAYER && PLAYER.burnedSub!=null) o.subtitle_burn=PLAYER.burnedSub;
   return o;
@@ -2653,9 +2664,27 @@ function noSegments(){ return playQuality()==="nomse"; }
 // it is about to make. So it asks for nothing and lets the server answer
 // (PERF-PLAN §4.7); the menu's explicit rungs still mean exactly themselves.
 function transcodeHeight(){ const q=playQuality(); return (q==="1080"||q==="720"||q==="480")?parseInt(q,10):null; }
+// The height a transcode opened under Original should carry: the source's own.
+// Original is a promise about resolution, and it must survive the cases where a
+// transcode happens anyway — a bitmap-subtitle burn, or the browser refusing
+// the remux. Those sessions used to send no height at all, and the server's
+// Auto answered `min(source, 1080)`: the right bandwidth call for Auto and the
+// wrong one for a viewer who explicitly asked for max, which is how a 4K film
+// with forced PGS subs played at 1080p whatever the quality menu said. The
+// server still clamps ([144, 2160]) and never upscales; an unprobed source has
+// no height to promise, so it stays the server's choice.
+function originalHeight(){
+  if(qualityForce()!=="original") return null;
+  const h=PLAYER&&PLAYER.source&&PLAYER.source.height;
+  return h>0?h:null;
+}
 function qualityLabel(){ const q=playQuality(); const f=QUALITIES.find(x=>x[0]===q); return f?f[1]:"Auto"; }
 
 async function play(fileId, title, resumeMs, knownDurMs, meta){
+  // Consumed first, whatever happens to this attempt: a "subtitles off"
+  // restart that failed at the decision must not leak its flag into the next
+  // unrelated play and silently strip that one's default track.
+  const skipDefaultSub=PENDING_DEFAULT_SUB_OFF; PENDING_DEFAULT_SUB_OFF=false;
   const modal=document.getElementById("modal"), video=document.getElementById("video");
   wirePlayer();
   // Stamp the click, not the decision: time-to-first-frame is what the person
@@ -2731,7 +2760,7 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
   // Server-chosen default subtitle (Settings → Playback defaults / anime rule).
   // Native <track> subs ride direct/remux only; transcode burns them instead.
   const defSub=PLAYER.subs.find(s=>s.default);
-  if(defSub && decision.method!=='transcode'){ setTimeout(()=>{ if(PLAYER.fileId===fileId) setSub(defSub.index); }, 400); }
+  if(defSub && !skipDefaultSub && decision.method!=='transcode'){ setTimeout(()=>{ if(PLAYER.fileId===fileId) setSub(defSub.index); }, 400); }
 
   if(decision.method==='transcode'){
     // Transcode: start an HLS session (server re-encodes + tone-maps).
@@ -4480,27 +4509,47 @@ async function burnSub(index){
   const v=document.getElementById("video"); if(!v||!PLAYER) return;
   const me=PLAYER;
   const pos=(me.offset||0)+(v.currentTime||0);
+  // Burning nothing is not a transcode wish. This used to open another
+  // transcode session with no burn in it — so a viewer who turned subtitles
+  // OFF stayed in the re-encode the burn had forced, at the burn's resolution,
+  // forever. Go back through the decision instead: that is what restores the
+  // direct play / remux (and the picture) the burn took away. The one-shot
+  // flag stops play() from re-applying the default track, which on a film
+  // whose default is the forced bitmap track would burn it straight back in.
+  if(index==null){
+    me.burnedSub=null;
+    PENDING_ATTEMPT_REASON="subtitle-off";
+    PENDING_DEFAULT_SUB_OFF=true;
+    toast("Subtitles off");
+    play(me.fileId, me.title||"", Math.round(pos*1000), me.knownDur||0, me.meta);
+    return;
+  }
   const track=me.audio&&me.audio[me.curAudio];
   const aidx=track?track.index:(me.curAudio||0);
   const {live}=streamGeneration();
   newAttempt("subtitle-burn");
   teardownHls();
   clearSubs(v);
-  me.curSub=index==null?-1:index;
+  me.curSub=index;
   me.burnedSub=index;
   pbSyncSubIcon();
   const s=(me.subs||[]).find(x=>x.index===index);
-  setLoading(true, index==null?"Removing subtitles…":"Burning in subtitles…",
-    index==null?"restarting the stream without them"
-              :`${subLabelFor(s,index)} — this format is a picture, so the server draws it in`);
+  setLoading(true, "Burning in subtitles…",
+    `${subLabelFor(s,index)} — this format is a picture, so the server draws it in`);
   let info;
   try{
     info=await openSession(me.fileId,transcodeOpts(pos,aidx));
   }catch(e){ if(live()){ setLoading(false); toast(e.message); } return; }
   if(!live()) return;
   me.method='transcode'; me.copyHls=false;
+  // The overlay's Reason row otherwise keeps quoting the /decision verdict —
+  // "forced original quality (no video transcode)" — over a session that IS a
+  // transcode, which sent a whole debugging session in the wrong direction.
+  // The decision was about the FILE; this line is about the session.
+  me.reasons=[`subtitle burn-in (${subLabelFor(s,index)}) — drawing subtitles into the picture forces a re-encode`
+              +(originalHeight()?" · kept at source resolution (Original)":"")];
   armStall(attachSession(v, me, info, pos), 20000);
-  toast(index==null?"Subtitles off":"Subtitles: "+subLabelFor(s,index));
+  toast("Subtitles: "+subLabelFor(s,index));
 }
 // Cycle Off → each track → Off (the 'c' hotkey and the CC button's long game).
 function cycleSub(){

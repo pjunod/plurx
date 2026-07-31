@@ -401,8 +401,15 @@ covering the other.
 - **Bitmap subs (PGS/VobSub) cost a stream restart.** They can't be copied or
   `<track>`'d — a picture has no text to send — so selecting one re-opens the
   stream as a transcode with the subtitle composited into the frames, and
-  turning it off restarts again. Direct/remux/copy carry text subs as
-  selectable `<track>`s, which toggle for free.
+  turning it off restarts again — back through the decision, so the viewer
+  returns to the direct play / remux (and the resolution) the burn took away.
+  The burn's rung follows the quality menu: under **Auto** it is the server's
+  Auto height (a bandwidth call, `min(source, 1080)` on hardware), under
+  **Original** it is the source's own height — the burn is unavoidable, the
+  downscale was not. A 4K burn runs the CPU filter chain (a composite happens
+  in system memory), so whether a given box holds realtime at 2160p is a
+  measurement, not a promise. Direct/remux/copy carry text subs as selectable
+  `<track>`s, which toggle for free.
 - **DTS/TrueHD never passthrough to a browser.** No browser decodes them, so a
   remux/copy always transcodes that audio to AAC. Passthrough is a
   native-client concern (see [CLIENTS.md](CLIENTS.md)).
