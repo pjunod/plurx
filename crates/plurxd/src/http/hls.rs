@@ -85,6 +85,9 @@ pub struct CreateSession {
     pub copy: Option<bool>,
     /// With `copy`: re-encode the audio the client can't take.
     pub aac: Option<bool>,
+    /// With `copy`: retain Dolby Vision signaling and dynamic metadata because
+    /// the decision established that this client supports the source profile.
+    pub preserve_dolby_vision: Option<bool>,
 }
 
 impl CreateSession {
@@ -98,6 +101,7 @@ impl CreateSession {
         let kind = if self.copy == Some(true) {
             SessionKind::Copy {
                 aac: self.aac == Some(true),
+                preserve_dolby_vision: self.preserve_dolby_vision == Some(true),
             }
         } else {
             SessionKind::Transcode { height }
@@ -211,6 +215,7 @@ pub async fn start(
         audio: q.audio,
         copy: Some(q.copy == Some(1)),
         aac: Some(q.aac == Some(1)),
+        preserve_dolby_vision: Some(false),
     };
     create(AuthUser(user), State(state), AxPath(id), Json(legacy)).await
 }

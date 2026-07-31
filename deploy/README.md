@@ -5,8 +5,8 @@ path that matches your setup.
 
 ## Docker / Compose (recommended for homelabs)
 
-Host-specific bits (media mounts, GPU, ports) live in an untracked override
-file, so pulling updates never conflicts with your local edits:
+Host-specific bits (media mounts and GPU) live in an untracked override file;
+bind ports live in `.env`, so pulling updates never conflicts with local edits:
 
 ```sh
 cd deploy
@@ -21,6 +21,13 @@ hardware transcode, uncomment the GPU block in your override (Intel/AMD via
 `/dev/dri`, NVIDIA via the container toolkit). If another service (a
 still-running Plex) owns UDP 32414, set `PLURX_GDM_PORT` in `.env`
 (see `.env.example`).
+
+The Compose service uses host networking. This is required for its Bonjour
+`_plurx._tcp` advertisement to reach iPhone, iPad, and Apple TV; publishing a
+TCP port from a bridge is not enough. On Docker Desktop, enable host networking
+in Docker's settings first. If host networking is unavailable, remove
+`network_mode: host`, restore a `32400:32400` port mapping in your override,
+and use manual server entry in the native app.
 
 ### Project name
 
@@ -206,7 +213,16 @@ no VideoToolbox, so hardware transcoding falls back to software x264.
 
 Add [`unraid-plurx.xml`](unraid-plurx.xml) as a user template (or via the
 Docker "Add Container" screen), set your media and appdata paths, and
-optionally pass through `/dev/dri` for QuickSync/VA-API.
+optionally pass through `/dev/dri` for QuickSync/VA-API. The template uses
+host networking because Bonjour multicast does not leave a Docker bridge.
+That is what makes `_plurx._tcp` visible to iPhone, iPad, and Apple TV; a
+bridge deployment can still use manual server entry, but cannot provide
+automatic native discovery.
+
+Host networking also means the ports are real host ports. Stop any process
+already using TCP 32400, or change `PLURX_BIND`. If Plex still owns UDP 32414,
+change `PLURX_GDM_PORT`; this disables GDM discovery on its fixed standard port
+but does not affect Bonjour.
 
 ## TrueNAS SCALE / Kubernetes
 
@@ -221,6 +237,7 @@ single replica.
 |---|---|---|
 | 32400 | TCP | HTTP API + web app (and the Plex-compat façade) |
 | 32414 | UDP | GDM discovery so Plex/Kodi clients find the server on the LAN (host port movable via `PLURX_GDM_PORT`, but discovery only works on 32414) |
+| 5353 | UDP multicast | Bonjour `_plurx._tcp` discovery for native Apple clients; requires bare metal or host networking |
 
 ## Observability
 

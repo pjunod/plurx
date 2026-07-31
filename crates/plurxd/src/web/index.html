@@ -1596,8 +1596,8 @@ function expectedOn(date){
 function homeGroup(){ try{ return localStorage.getItem("plurx_home_group")||"category"; }catch(e){ return "category"; } }
 function setHomeGroup(v){ try{ localStorage.setItem("plurx_home_group",v); }catch(e){} viewHome(); }
 function libCategory(lib){
-  if(lib.kind==="movie") return {key:"movie", name:"Movies"};
-  if(lib.kind==="show")  return {key:"show",  name:"TV Shows"};
+  if(lib.kind==="movie"||lib.kind==="movies") return {key:"movie", name:"Movies"};
+  if(lib.kind==="show"||lib.kind==="shows")   return {key:"show",  name:"TV Shows"};
   if(lib.kind==="home")  return {key:"home",  name:"Home videos"};
   const k=lib.kind||"other";
   return {key:k, name:k.charAt(0).toUpperCase()+k.slice(1)};
@@ -2686,11 +2686,15 @@ const PLAY_CAPS=(function(){
   // the error-fallback quietly re-encoded a 4K disc remux down to the Auto
   // rung on Chrome. `dvh1`/`dvhe` are the DV sample entries; a browser that
   // claims either can take the stream as it stands.
-  const dv=["dvh1.05.06","dvh1.08.07","dvhe.05.06","dvhe.08.07"]
+  const dvCan=p=>[`dvh1.${p}`,`dvhe.${p}`]
     .some(c=>can(`video/mp4; codecs="${c}"`)||mse(`video/mp4; codecs="${c}"`));
-  return {vcodec:vc.join(","), acodec:ac.join(","), container:"mp4,webm,mov", hdr:hdr?1:0, dv:dv?1:0};
+  const dvProfiles=[];
+  if(dvCan("05.06")) dvProfiles.push(5);
+  if(dvCan("08.07")) dvProfiles.push(8);
+  return {vcodec:vc.join(","), acodec:ac.join(","), container:"mp4,webm,mov", hdr:hdr?1:0,
+    dv:dvProfiles.length?1:0, dvprofile:dvProfiles.join(",")};
 })();
-const CAPS_Q=`vcodec=${PLAY_CAPS.vcodec}&acodec=${PLAY_CAPS.acodec}&container=${PLAY_CAPS.container}&hdr=${PLAY_CAPS.hdr}&dv=${PLAY_CAPS.dv}`;
+const CAPS_Q=`vcodec=${PLAY_CAPS.vcodec}&acodec=${PLAY_CAPS.acodec}&container=${PLAY_CAPS.container}&hdr=${PLAY_CAPS.hdr}&dv=${PLAY_CAPS.dv}&dvprofile=${PLAY_CAPS.dvprofile}`;
 
 // Manual quality override (player menu), persisted per browser. Auto runs the
 // automatic ladder; Original never transcodes video (direct/remux only); a
@@ -2843,7 +2847,8 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
     refusedOriginal:false,
     aoffset:decision.audio_offset_ms||0, declared:decision.declared_offset_ms||0,
     reasons:(decision.reasons||[]), title, meta:meta||null, decodeRescued:false,
-    transcodeAudio:!!decision.transcode_audio, copyHls:false,
+    transcodeAudio:!!decision.transcode_audio,
+    preserveDolbyVision:!!decision.preserve_dolby_vision, copyHls:false,
     playStartedAt:clickedAt, ttffMs:null, stalls:0, sessionId:null, streamId:null, health:null,
     attemptId:null, attemptReason:null, bufferLimits:null,
     waitAt:null, waitRunway:null, stallsByKind:null, burnedSub:null, vod:false, };
@@ -2929,7 +2934,8 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
 // pulling two server sessions at once. Returns false when it bailed.
 async function startCopyHls(v, startSec, live){
   const track=PLAYER.audio[PLAYER.curAudio]; const aidx=track?track.index:0;
-  const info=await openSession(PLAYER.fileId,{copy:true,aac:!!PLAYER.transcodeAudio,start:startSec||0,audio:aidx});
+  const info=await openSession(PLAYER.fileId,{copy:true,aac:!!PLAYER.transcodeAudio,
+    preserve_dolby_vision:!!PLAYER.preserveDolbyVision,start:startSec||0,audio:aidx});
   if(live && !live()) return false;
   PLAYER.method='remux'; PLAYER.copyHls=true;
   armStall(attachSession(v, PLAYER, info, startSec));

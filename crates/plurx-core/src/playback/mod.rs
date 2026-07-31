@@ -65,6 +65,7 @@ pub fn caps_profile(
         max_bitrate: None,
         supports_hdr,
         supports_dolby_vision,
+        dolby_vision_profiles: Vec::new(),
     }
 }
 
@@ -116,6 +117,11 @@ pub struct DeviceProfile {
     /// to handle it.
     #[serde(default)]
     pub supports_dolby_vision: bool,
+    /// Dolby Vision profile numbers this client has actually probed. New
+    /// clients use this instead of the legacy all-or-nothing flag: Apple
+    /// AVPlayer supports specific delivery profiles, not every disc profile.
+    #[serde(default)]
+    pub dolby_vision_profiles: Vec<u8>,
 }
 
 impl DeviceProfile {
@@ -136,6 +142,12 @@ impl DeviceProfile {
             .iter()
             .any(|x| x.eq_ignore_ascii_case(codec))
     }
+
+    fn allows_dolby_vision(&self, file: &MediaFile) -> bool {
+        self.supports_dolby_vision
+            || dolby_vision_profile(file)
+                .is_some_and(|profile| self.dolby_vision_profiles.contains(&profile))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -154,6 +166,10 @@ pub struct Decision {
     /// For remux/transcode: re-encode audio to AAC because the source audio
     /// codec isn't in the profile.
     pub transcode_audio: bool,
+    /// Preserve Dolby Vision configuration + RPU metadata on a copy/remux.
+    /// False means the client cannot take this source profile and the remux
+    /// must expose a compatible HDR base instead.
+    pub preserve_dolby_vision: bool,
     /// Target container for remux/transcode delivery.
     pub container: &'static str,
 }
@@ -259,6 +275,23 @@ pub fn is_dolby_vision(file: &MediaFile) -> bool {
     file.hdr.as_deref() == Some("dolby_vision")
 }
 
+/// Profile number from the scan's rich label (for example Profile 5 or 8).
+/// Unknown is deliberately `None`: claiming every DV profile from a generic
+/// HDR bit is the bug this profile-aware path replaces.
+pub fn dolby_vision_profile(file: &MediaFile) -> Option<u8> {
+    let label = file.hdr_format.as_deref()?;
+    let after = label.to_ascii_lowercase();
+    let after = after.split("profile").nth(1)?.trim_start();
+    let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+fn has_compatible_dv_base(file: &MediaFile) -> bool {
+    file.hdr_format
+        .as_deref()
+        .is_some_and(|label| label.contains("HDR10-compatible") || label.contains("HLG-compatible"))
+}
+
 /// What a Dolby Vision source needs doing about it for THIS client.
 ///
 /// The failure this exists to prevent: a DV remux was handed to Chrome
@@ -283,9 +316,9 @@ enum DvHandling {
 }
 
 fn dv_handling(file: &MediaFile, profile: &DeviceProfile, dv_strippable: bool) -> DvHandling {
-    if !is_dolby_vision(file) || profile.supports_dolby_vision {
+    if !is_dolby_vision(file) || profile.allows_dolby_vision(file) {
         DvHandling::None
-    } else if dv_strippable {
+    } else if dv_strippable && has_compatible_dv_base(file) {
         DvHandling::Strip
     } else {
         DvHandling::Reencode
@@ -303,6 +336,7 @@ fn dv_handling(file: &MediaFile, profile: &DeviceProfile, dv_strippable: bool) -
 /// a client cannot decode is a remux or a re-encode.
 pub fn decide(file: &MediaFile, profile: &DeviceProfile, dv_strippable: bool) -> Decision {
     let (mut c, mut reasons) = evaluate(file, profile);
+    let preserve_dolby_vision = is_dolby_vision(file) && profile.allows_dolby_vision(file);
 
     match dv_handling(file, profile, dv_strippable) {
         DvHandling::None => {}
@@ -311,15 +345,22 @@ pub fn decide(file: &MediaFile, profile: &DeviceProfile, dv_strippable: bool) ->
             // DV configuration goes. But it takes ffmpeg, so the raw file
             // cannot be handed over as-is.
             c.container_ok = false;
-            reasons.push("Dolby Vision removed for this browser (video kept)".to_owned());
+            reasons.push(
+                "Dolby Vision metadata removed for this device; compatible HDR base kept"
+                    .to_owned(),
+            );
         }
         DvHandling::Reencode => {
             c.video_ok = false;
-            reasons.push(
-                "Dolby Vision can't be removed by this ffmpeg (needs 7.1+) and this \
-                 browser won't decode it"
-                    .to_owned(),
-            );
+            reasons.push(if has_compatible_dv_base(file) && !dv_strippable {
+                "this Dolby Vision profile is unsupported by this device and this ffmpeg \
+                 cannot expose its compatible HDR base (requires dovi_rpu in ffmpeg 7.1+)"
+                    .to_owned()
+            } else {
+                "this Dolby Vision profile is unsupported by this device and has no \
+                 compatible HDR base; transcoding"
+                    .to_owned()
+            });
         }
     }
 
@@ -345,6 +386,7 @@ pub fn decide(file: &MediaFile, profile: &DeviceProfile, dv_strippable: bool) ->
         method,
         reasons,
         transcode_audio: !c.audio_ok,
+        preserve_dolby_vision,
         container: "mp4",
     }
 }
@@ -365,6 +407,7 @@ pub fn decide_forced(
                 method: PlaybackMethod::Transcode,
                 reasons,
                 transcode_audio: true,
+                preserve_dolby_vision: false,
                 container: "mp4",
             }
         }
@@ -388,12 +431,16 @@ pub fn decide_forced(
             };
             let mut reasons = vec!["forced original quality (no video transcode)".to_owned()];
             if dv == DvHandling::Strip {
-                reasons.push("Dolby Vision removed for this browser (video kept)".to_owned());
+                reasons.push(
+                    "Dolby Vision metadata removed for this device; compatible HDR base kept"
+                        .to_owned(),
+                );
             }
             Decision {
                 method,
                 reasons,
                 transcode_audio: !c.audio_ok,
+                preserve_dolby_vision: is_dolby_vision(file) && profile.allows_dolby_vision(file),
                 container: "mp4",
             }
         }
@@ -569,6 +616,7 @@ mod tests {
     fn dolby_vision_is_not_handed_to_a_browser_that_cannot_decode_it() {
         let mut dv = file("mkv", "hevc", "aac");
         dv.hdr = Some("dolby_vision".to_owned());
+        dv.hdr_format = Some("Dolby Vision · Profile 7 (HDR10-compatible)".to_owned());
         let hdr_client = |dolby: bool| {
             caps_profile(
                 vec!["mkv".into(), "mp4".into()],
@@ -587,6 +635,7 @@ mod tests {
             PlaybackMethod::DirectPlay,
             "a client that decodes Dolby Vision is handed it untouched"
         );
+        assert!(decide(&dv, &safari, true).preserve_dolby_vision);
 
         // Chrome, on a server that can strip: a remux, not a re-encode. The
         // base layer is kept, so the viewer still gets the source's pixels —
@@ -599,6 +648,7 @@ mod tests {
             "and it says so: {:?}",
             stripped.reasons
         );
+        assert!(!stripped.preserve_dolby_vision);
 
         // Chrome, on a server that cannot strip (ffmpeg < 7.1): the only
         // stream this browser will play is a re-encoded one. Deciding that up
@@ -629,6 +679,7 @@ mod tests {
     fn forced_original_strips_dolby_vision_rather_than_handing_over_the_raw_file() {
         let mut dv = file("mp4", "hevc", "aac"); // container+audio both fine
         dv.hdr = Some("dolby_vision".to_owned());
+        dv.hdr_format = Some("Dolby Vision · Profile 7 (HDR10-compatible)".to_owned());
         let chrome = caps_profile(
             vec!["mp4".into()],
             vec!["hevc".into()],
@@ -660,6 +711,37 @@ mod tests {
             decide_forced(&dv, &safari, Force::Original, true).method,
             PlaybackMethod::DirectPlay
         );
+    }
+
+    #[test]
+    fn dolby_vision_profiles_are_negotiated_individually() {
+        let mut apple = caps_profile(
+            vec!["mp4".into()],
+            vec!["hevc".into()],
+            vec!["aac".into()],
+            None,
+            true,
+            false,
+        );
+        apple.dolby_vision_profiles = vec![5, 8];
+
+        let mut p5 = file("mp4", "hevc", "aac");
+        p5.hdr = Some("dolby_vision".to_owned());
+        p5.hdr_format = Some("Dolby Vision · Profile 5".to_owned());
+        let supported = decide(&p5, &apple, true);
+        assert_eq!(supported.method, PlaybackMethod::DirectPlay);
+        assert!(supported.preserve_dolby_vision);
+
+        let mut p7 = file("mp4", "hevc", "aac");
+        p7.hdr = Some("dolby_vision".to_owned());
+        p7.hdr_format = Some("Dolby Vision · Profile 7 (HDR10-compatible)".to_owned());
+        let fallback = decide(&p7, &apple, true);
+        assert_eq!(fallback.method, PlaybackMethod::Remux);
+        assert!(!fallback.preserve_dolby_vision);
+        assert!(fallback
+            .reasons
+            .iter()
+            .all(|reason| !reason.contains("browser")));
     }
 
     #[test]

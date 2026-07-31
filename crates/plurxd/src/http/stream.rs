@@ -104,8 +104,9 @@ fn content_type(path: &Path) -> &'static str {
     }
 }
 
-/// Runtime browser capabilities + a manual quality override, sent by the web
-/// player so the server only transcodes what this specific browser can't play.
+/// Runtime client capabilities + a manual quality override, sent by web and
+/// native players so the server only transcodes what this specific device
+/// can't play.
 /// All optional and back-compatible: absent caps fall back to the named
 /// `profile` (default `web-h264`). CSV fields are lowercase codec/container
 /// short names.
@@ -128,6 +129,10 @@ pub struct Caps {
     /// not, at any profile). Absent means no — an old client that never sends
     /// it is exactly one that has not been taught to ask.
     pub dv: Option<u8>,
+    /// Comma-separated Dolby Vision profiles the client has actually probed,
+    /// e.g. `5,8`. When present this is authoritative over the legacy `dv`
+    /// all-or-nothing bit.
+    pub dvprofile: Option<String>,
     /// Manual override: `auto` (default) | `original` | `transcode`.
     pub force: Option<String>,
 }
@@ -177,14 +182,19 @@ impl Caps {
                     a
                 }
             };
-            playback::caps_profile(
+            let mut profile = playback::caps_profile(
                 containers,
                 vcodec,
                 acodec,
                 self.maxheight,
                 self.hdr == Some(1),
-                self.dv == Some(1),
-            )
+                self.dvprofile.is_none() && self.dv == Some(1),
+            );
+            profile.dolby_vision_profiles = csv(&self.dvprofile)
+                .into_iter()
+                .filter_map(|value| value.parse::<u8>().ok())
+                .collect();
+            profile
         } else {
             self.profile
                 .as_deref()
@@ -297,6 +307,9 @@ pub enum DeliveryPlan {
         url: String,
         sessions_url: String,
         aac: bool,
+        /// Keep Dolby Vision signaling and dynamic metadata through the copy
+        /// remux. False means expose the compatible HDR base for this client.
+        preserve_dolby_vision: bool,
     },
     /// Re-encode. POST `sessions_url`, omitting `height`: Auto is the
     /// server's choice because the rung depends on which encoder wins, and
@@ -608,6 +621,7 @@ pub async fn decision(
             url: play_url.clone(),
             sessions_url,
             aac: decision.transcode_audio,
+            preserve_dolby_vision: decision.preserve_dolby_vision,
         },
         playback::PlaybackMethod::Transcode => DeliveryPlan::Transcode { sessions_url },
     };
@@ -892,6 +906,7 @@ pub struct StreamQuery {
     /// not, at any profile). Absent means no — an old client that never sends
     /// it is exactly one that has not been taught to ask.
     pub dv: Option<u8>,
+    pub dvprofile: Option<String>,
     pub force: Option<String>,
     /// The player's own stream id, so it can ask `/stream/:id/status` how this
     /// remux is doing. Optional: an old client, curl, or an AirPlay target
@@ -909,6 +924,7 @@ impl StreamQuery {
             maxheight: self.maxheight,
             hdr: self.hdr,
             dv: self.dv,
+            dvprofile: self.dvprofile.clone(),
             force: self.force.clone(),
         }
     }
@@ -964,6 +980,7 @@ pub async fn stream_mp4(
         // The probed capability, like the decision above — not the version
         // line parsed a second time somewhere else.
         have_dovi_bsf: state.system.dovi_rpu,
+        preserve_dolby_vision: decision.preserve_dolby_vision,
         readrate,
         tracked,
     })
@@ -1133,6 +1150,9 @@ struct RemuxSpec<'a> {
     /// This ffmpeg has `dovi_rpu` (≥ 7.1), so a DV strip can also drop the
     /// DOVI side data and with it the `dvcC` box VideoToolbox chokes on.
     have_dovi_bsf: bool,
+    /// Preserve a client-supported Dolby Vision profile instead of stripping
+    /// its configuration and RPU metadata to the compatible HDR base.
+    preserve_dolby_vision: bool,
     readrate: f64,
     /// Telemetry handle and its registration, when the client asked to be able
     /// to watch this stream's health.
@@ -1152,6 +1172,7 @@ async fn remux(spec: RemuxSpec<'_>) -> Result<Response, ApiError> {
         hevc,
         hdr,
         have_dovi_bsf,
+        preserve_dolby_vision,
         readrate,
         tracked,
     } = spec;
@@ -1209,10 +1230,17 @@ async fn remux(spec: RemuxSpec<'_>) -> Result<Response, ApiError> {
     // parameter sets (and no dead DV metadata) — same hygiene, same reasons,
     // as the segmented copy path (`hevc_copy_bsf`).
     if hevc {
-        cmd.args(["-tag:v", "hvc1"]);
+        cmd.args([
+            "-tag:v",
+            plurx_core::transcode::hevc_copy_tag(hdr.as_deref(), preserve_dolby_vision),
+        ]);
         cmd.args([
             "-bsf:v",
-            &plurx_core::transcode::hevc_copy_bsf(hdr.as_deref(), have_dovi_bsf),
+            &plurx_core::transcode::hevc_copy_bsf_for_client(
+                hdr.as_deref(),
+                have_dovi_bsf,
+                preserve_dolby_vision,
+            ),
         ]);
     }
     if transcode_audio {
@@ -1348,6 +1376,25 @@ fn is_progress_line(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_dolby_vision_profiles_override_the_legacy_all_profiles_bit() {
+        let caps = Caps {
+            vcodec: Some("hevc".into()),
+            acodec: Some("aac".into()),
+            container: Some("mp4".into()),
+            hdr: Some(1),
+            // Kept for compatibility with an older server, which ignores the
+            // new profile list. A new server must prefer the specific list.
+            dv: Some(1),
+            dvprofile: Some("5,8".into()),
+            ..Default::default()
+        };
+
+        let profile = caps.profile();
+        assert!(!profile.supports_dolby_vision);
+        assert_eq!(profile.dolby_vision_profiles, vec![5, 8]);
+    }
 
     /// ffmpeg's `-progress` shares stderr with its diagnostics here, because
     /// stdout is the MP4. Telling them apart is the whole trick, and getting it

@@ -256,7 +256,20 @@ pub const COPY_PUBLISH_GATE_SECS: u32 = 12;
 /// side data, so nothing is left to write a `dvcC` from and the stream is
 /// signalled as what it now is: plain HDR10.
 pub fn hevc_copy_bsf(hdr: Option<&str>, have_dovi_bsf: bool) -> String {
-    if hdr == Some("dolby_vision") {
+    hevc_copy_bsf_for_client(hdr, have_dovi_bsf, false)
+}
+
+/// Client-aware form of [`hevc_copy_bsf`]. A player that explicitly supports
+/// this Dolby Vision profile receives its RPU/EL units unchanged; other
+/// clients receive only the compatible HDR base.
+pub fn hevc_copy_bsf_for_client(
+    hdr: Option<&str>,
+    have_dovi_bsf: bool,
+    preserve_dolby_vision: bool,
+) -> String {
+    if hdr == Some("dolby_vision") && preserve_dolby_vision {
+        "filter_units=remove_types=32-34".to_owned()
+    } else if hdr == Some("dolby_vision") {
         if have_dovi_bsf {
             "dovi_rpu=strip=1,filter_units=remove_types=32-34|62-63".to_owned()
         } else {
@@ -264,6 +277,17 @@ pub fn hevc_copy_bsf(hdr: Option<&str>, have_dovi_bsf: bool) -> String {
         }
     } else {
         "filter_units=remove_types=32-34".to_owned()
+    }
+}
+
+/// HEVC sample-entry tag for the copy output. `hvc1` promises ordinary HEVC;
+/// a preserved Dolby Vision stream must remain `dvh1` or AVPlayer never
+/// engages its Dolby Vision pipeline even when the RPU metadata survived.
+pub fn hevc_copy_tag(hdr: Option<&str>, preserve_dolby_vision: bool) -> &'static str {
+    if hdr == Some("dolby_vision") && preserve_dolby_vision {
+        "dvh1"
+    } else {
+        "hvc1"
     }
 }
 
@@ -925,6 +949,7 @@ fn copy_input_args(
     transcode_audio: bool,
     pacing: Pacing,
     have_dovi_bsf: bool,
+    preserve_dolby_vision: bool,
 ) -> Vec<String> {
     let source_path = source.path.to_string_lossy().into_owned();
     let mut args: Vec<String> = vec!["-hide_banner".into(), "-loglevel".into(), "error".into()];
@@ -1001,9 +1026,13 @@ fn copy_input_args(
     // is commonly `hev1`, which renders black. Harmless if already hvc1.
     if matches!(source.video_codec.as_deref(), Some("hevc" | "h265")) {
         args.push("-tag:v".into());
-        args.push("hvc1".into());
+        args.push(hevc_copy_tag(source.hdr.as_deref(), preserve_dolby_vision).into());
         args.push("-bsf:v".into());
-        args.push(hevc_copy_bsf(source.hdr.as_deref(), have_dovi_bsf));
+        args.push(hevc_copy_bsf_for_client(
+            source.hdr.as_deref(),
+            have_dovi_bsf,
+            preserve_dolby_vision,
+        ));
     }
 
     if transcode_audio {
@@ -1051,6 +1080,26 @@ pub fn copy_pipe_args(
     pacing: Pacing,
     have_dovi_bsf: bool,
 ) -> Vec<String> {
+    copy_pipe_args_with_dolby_vision(
+        source,
+        start_seconds,
+        audio_index,
+        transcode_audio,
+        pacing,
+        have_dovi_bsf,
+        false,
+    )
+}
+
+pub fn copy_pipe_args_with_dolby_vision(
+    source: &MediaFile,
+    start_seconds: f64,
+    audio_index: Option<i64>,
+    transcode_audio: bool,
+    pacing: Pacing,
+    have_dovi_bsf: bool,
+    preserve_dolby_vision: bool,
+) -> Vec<String> {
     let mut args = copy_input_args(
         source,
         start_seconds,
@@ -1058,6 +1107,7 @@ pub fn copy_pipe_args(
         transcode_audio,
         pacing,
         have_dovi_bsf,
+        preserve_dolby_vision,
     );
     args.extend(
         [
@@ -1102,13 +1152,47 @@ pub fn hls_copy_args(
     have_dovi_bsf: bool,
     out_dir: &str,
 ) -> Vec<String> {
+    hls_copy_args_with_dolby_vision(
+        source,
+        start_seconds,
+        audio_index,
+        transcode_audio,
+        pacing,
+        DolbyVisionCopyOptions::new(have_dovi_bsf, false),
+        out_dir,
+    )
+}
+
+/// Dolby Vision handling for an HLS copy session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DolbyVisionCopyOptions {
+    have_bsf: bool,
+    preserve: bool,
+}
+
+impl DolbyVisionCopyOptions {
+    pub const fn new(have_bsf: bool, preserve: bool) -> Self {
+        Self { have_bsf, preserve }
+    }
+}
+
+pub fn hls_copy_args_with_dolby_vision(
+    source: &MediaFile,
+    start_seconds: f64,
+    audio_index: Option<i64>,
+    transcode_audio: bool,
+    pacing: Pacing,
+    dolby_vision: DolbyVisionCopyOptions,
+    out_dir: &str,
+) -> Vec<String> {
     let mut args = copy_input_args(
         source,
         start_seconds,
         audio_index,
         transcode_audio,
         pacing,
-        have_dovi_bsf,
+        dolby_vision.have_bsf,
+        dolby_vision.preserve,
     );
 
     // fMP4 HLS. Segments split at existing keyframes (copy can't force them), so
@@ -1565,6 +1649,24 @@ mod tests {
         )
         .join(" ");
         assert!(dv7.contains("-bsf:v dovi_rpu=strip=1,filter_units=remove_types=32-34|62-63"));
+
+        // A profile the client explicitly accepts keeps both its Dolby Vision
+        // sample entry and RPU/EL units. This is the path AVPlayer needs to
+        // engage Dolby Vision rather than silently receiving HDR10.
+        let preserved = hls_copy_args_with_dolby_vision(
+            &file(Some("dolby_vision")),
+            0.0,
+            None,
+            true,
+            Pacing::unpaced(),
+            DolbyVisionCopyOptions::new(true, true),
+            "/tmp/s",
+        )
+        .join(" ");
+        assert!(preserved.contains("-tag:v dvh1"));
+        assert!(preserved.contains("-bsf:v filter_units=remove_types=32-34"));
+        assert!(!preserved.contains("62-63"));
+        assert!(!preserved.contains("dovi_rpu=strip=1"));
 
         // H.264 copies are untouched: they are not on the stuttering path and
         // avc1 + in-band parameter sets plays everywhere today.

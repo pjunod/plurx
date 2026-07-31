@@ -30,7 +30,7 @@
              keep it to this Mac only. macOS may prompt to allow incoming
              connections the first time. -->
         <key>PLURX_BIND</key>
-        <string>0.0.0.0:32600</string>
+        <string>0.0.0.0:32400</string>
         <!-- ffmpeg/ffprobe for scanning + remux/transcode. `brew install ffmpeg`
              satisfies this; point these at jellyfin-ffmpeg for the best
              tone-mapping if you prefer. -->
