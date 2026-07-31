@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="512" height="512">
+  <defs>
+    <pattern id="scan" width="4" height="4" patternUnits="userSpaceOnUse">
+      <rect width="4" height="1" fill="#ffffff" opacity="0.035"/>
+    </pattern>
+    <filter id="glow" x="-80%" y="-80%" width="260%" height="260%">
+      <feDropShadow dx="0" dy="0" stdDeviation="2.5" flood-color="#e5484d" flood-opacity="0.9"/>
+      <feDropShadow dx="0" dy="0" stdDeviation="7" flood-color="#e5484d" flood-opacity="0.5"/>
+    </filter>
+    <radialGradient id="vig" cx="50%" cy="42%" r="70%">
+      <stop offset="0%" stop-color="#17171c"/>
+      <stop offset="100%" stop-color="#0a0a0c"/>
+    </radialGradient>
+  </defs>
+  <rect width="64" height="64" rx="14" fill="url(#vig)"/>
+  <rect width="64" height="64" rx="14" fill="url(#scan)"/>
+  <rect x="0.5" y="0.5" width="63" height="63" rx="13.5" fill="none" stroke="#ffffff" stroke-opacity="0.07"/>
+  <rect x="26" y="23" width="12" height="18" rx="1.5" fill="#e5484d" filter="url(#glow)"/>
+</svg>

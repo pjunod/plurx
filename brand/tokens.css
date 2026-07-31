@@ -1,0 +1,155 @@
+/* noirr — design tokens v0.2
+   terminal noir, two showtimes:
+     midnight — dark, default. the terminal at night.
+     matinee  — light. daylight noir: the case file at noon.
+   semantic tokens remap per theme; components never change.
+   reserved slots: projection (auto, fullscreen) · giallo · silver */
+
+/* ---------- midnight (dark · default) ---------- */
+:root,
+[data-theme="midnight"] {
+  color-scheme: dark;
+
+  /* surfaces — light has a source; never pure #000 except projection */
+  --noirr-oled:        #050506;
+  --noirr-bg:          #0a0a0c;
+  --noirr-surface:     #101014;
+  --noirr-raised:      #16161b;
+  --noirr-line:        rgba(255, 255, 255, 0.08);
+
+  /* ink ramp */
+  --noirr-ink:         #ededef;
+  --noirr-dim:         #9a9aa3;
+  --noirr-faint:       #5c5c66;
+
+  /* accent — the cursor burns crimson at night */
+  --noirr-accent:      #e5484d;
+  --noirr-accent-deep: #8e1c22;
+  --noirr-glow:        rgba(229, 72, 77, 0.35);
+
+  /* in midnight, glow does the lifting; shadow is minimal */
+  --noirr-shadow:      0 4px 14px rgba(0, 0, 0, 0.5);
+
+  /* semantic — error is coral, never brand crimson */
+  --noirr-ok:          #5fb582;
+  --noirr-warn:        #d9a05b;
+  --noirr-err:         #ff7a66;
+
+  /* loading shimmer stops */
+  --noirr-skel-a:      var(--noirr-raised);
+  --noirr-skel-b:      #1d1d24;
+
+  --noirr-grain-opacity: 0.045;
+}
+
+/* ---------- matinee (light) ---------- */
+[data-theme="matinee"] {
+  color-scheme: light;
+
+  /* surfaces — warm paper, never clinical blue-white */
+  --noirr-oled:        #050506;   /* playback is always midnight */
+  --noirr-bg:          #f2efe8;   /* the desk */
+  --noirr-surface:     #faf8f2;   /* the sheet */
+  --noirr-raised:      #ffffff;
+  --noirr-line:        rgba(24, 22, 20, 0.12);
+
+  /* ink ramp */
+  --noirr-ink:         #1a1a1e;
+  --noirr-dim:         #5d5c63;
+  --noirr-faint:       #908f95;
+
+  /* accent — the cursor becomes red ink. in daylight, nothing glows */
+  --noirr-accent:      #c2343a;
+  --noirr-accent-deep: #8e1c22;
+  --noirr-glow:        rgba(194, 52, 58, 0.16);  /* soft tint, not neon */
+
+  /* shadows do the work daylight-side */
+  --noirr-shadow:      0 2px 10px rgba(25, 20, 15, 0.12);
+
+  /* semantic — terracotta error, distinct from red-ink accent */
+  --noirr-ok:          #35855c;
+  --noirr-warn:        #a3742b;
+  --noirr-err:         #c96442;
+
+  --noirr-skel-a:      #e8e5dd;
+  --noirr-skel-b:      #efece4;
+
+  --noirr-grain-opacity: 0.03;   /* paper grain, quieter than film grain */
+}
+
+/* auto-select when no explicit choice; manual data-theme wins */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme]) {
+    color-scheme: light;
+    --noirr-oled:        #050506;
+    --noirr-bg:          #f2efe8;
+    --noirr-surface:     #faf8f2;
+    --noirr-raised:      #ffffff;
+    --noirr-line:        rgba(24, 22, 20, 0.12);
+    --noirr-ink:         #1a1a1e;
+    --noirr-dim:         #5d5c63;
+    --noirr-faint:       #908f95;
+    --noirr-accent:      #c2343a;
+    --noirr-accent-deep: #8e1c22;
+    --noirr-glow:        rgba(194, 52, 58, 0.16);
+    --noirr-shadow:      0 2px 10px rgba(25, 20, 15, 0.12);
+    --noirr-ok:          #35855c;
+    --noirr-warn:       #a3742b;
+    --noirr-err:         #c96442;
+    --noirr-skel-a:      #e8e5dd;
+    --noirr-skel-b:      #efece4;
+    --noirr-grain-opacity: 0.03;
+  }
+}
+
+/* ---------- projection (mode, not theme) ----------
+   fullscreen playback drops to true black in ANY theme —
+   you watch in the dark. apply to the player root. */
+.noirr-projection {
+  --noirr-bg:      var(--noirr-oled);
+  --noirr-surface: var(--noirr-oled);
+  background: var(--noirr-oled);
+}
+
+/* ---------- type ---------- */
+:root {
+  --noirr-font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --noirr-font-ui:   "Inter", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+  --noirr-fade:      140ms ease-out;  /* cuts, not slides */
+}
+
+/* ---------- shared components ---------- */
+
+/* the cursor is the status light: blinking = working, solid = idle.
+   midnight: neon glow · matinee: red ink, no glow */
+.noirr-cursor {
+  color: var(--noirr-accent);
+  text-shadow: 0 0 10px var(--noirr-glow), 0 0 32px var(--noirr-glow);
+}
+[data-theme="matinee"] .noirr-cursor { text-shadow: none; }
+.noirr-cursor.working { animation: noirr-blink 1.15s steps(1) infinite; }
+@keyframes noirr-blink { 50% { opacity: 0; } }
+
+/* scanlines are the loading language — horizontal, always */
+.noirr-skeleton {
+  height: 9px;
+  border-radius: 2px;
+  background: linear-gradient(90deg,
+    var(--noirr-skel-a) 25%, var(--noirr-skel-b) 42%, var(--noirr-skel-a) 58%);
+  background-size: 220% 100%;
+  animation: noirr-shimmer 1.6s linear infinite;
+}
+@keyframes noirr-shimmer {
+  0%   { background-position: 120% 0; }
+  100% { background-position: -120% 0; }
+}
+
+/* grain — film grain at midnight, paper grain at matinee. never over text */
+.noirr-grain::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: var(--noirr-grain-opacity);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)'/%3E%3C/svg%3E");
+}

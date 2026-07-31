@@ -108,10 +108,12 @@ Deliberately out of scope for v0.1.0:
 - **Skip Intro / Skip Credits** buttons (the server sends markers; the Android
   client already surfaces them).
 - **Search**, **downloads/offline**, **PiP**, **AirPlay** polish.
-- **tvOS app icon** — the target intentionally references no App Icon so it builds
-  and runs in the Simulator without Brand Assets. Add an "App Icon & Top Shelf
-  Image" asset (and set `ASSETCATALOG_COMPILER_APPICON_NAME`) before installing on
-  a physical Apple TV.
+- **tvOS launch storyboard** — cosmetic only (a black frame at launch), not a
+  blocker for upload. The layered Brand Assets themselves are committed under
+  `Resources/tvOS.xcassets` and wired up via
+  `ASSETCATALOG_COMPILER_APPICON_NAME: tvOS`; see
+  [docs/PUBLISHING.md](../../docs/PUBLISHING.md) §4 for what each store-facing
+  key buys and what breaks without it.
 
 ## License
 

@@ -26,7 +26,8 @@ targets:
     platform: iOS
     sources:
       - path: Sources
-      - path: Resources        # iOS app icon lives here
+      - path: Resources/Assets.xcassets        # iOS app icon
+      - path: Resources/PrivacyInfo.xcprivacy  # required-reason API manifest
     settings:
       base:
         PRODUCT_NAME: plurx
@@ -40,25 +41,38 @@ targets:
       path: Support/iOS-Info.plist
       properties:
         CFBundleDisplayName: plurx
-        # Home servers are usually plain http on the LAN — permit it.
+        # Home servers are usually plain http on the LAN — permit it. The
+        # narrower NSAllowsLocalNetworking is NOT a substitute: it misses
+        # Tailscale's 100.64/10 and, on iOS 10+, its mere presence makes
+        # NSAllowsArbitraryLoads be ignored. See docs/PUBLISHING.md §4.
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
+        # Without this iOS silently refuses connections to 192.168.x.x —
+        # a functional bug, not paperwork.
+        NSLocalNetworkUsageDescription: "plurx connects to your media server on your local network."
+        # Skips the export-compliance questionnaire on every upload.
+        ITSAppUsesNonExemptEncryption: false
 
   plurx-tvOS:
     type: application
     platform: tvOS
     sources:
       - path: Sources
+      - path: Resources/tvOS.xcassets          # layered Brand Assets + Top Shelf
+      - path: Resources/PrivacyInfo.xcprivacy  # required-reason API manifest
     settings:
       base:
         PRODUCT_NAME: plurx
         PRODUCT_BUNDLE_IDENTIFIER: tv.plurx.app
-        # No AppIcon reference: builds/runs in the tvOS Simulator without Brand
-        # Assets. Add an "App Icon & Top Shelf" asset before installing on a
-        # physical Apple TV (see README).
+        # Names tvOS.brandassets inside Resources/tvOS.xcassets. Without it the
+        # tvOS archive cannot be uploaded at all.
+        ASSETCATALOG_COMPILER_APPICON_NAME: tvOS
     info:
       path: Support/tvOS-Info.plist
       properties:
         CFBundleDisplayName: plurx
+        # Same reasoning as iOS above — docs/PUBLISHING.md §4.
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
+        NSLocalNetworkUsageDescription: "plurx connects to your media server on your local network."
+        ITSAppUsesNonExemptEncryption: false
