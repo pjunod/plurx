@@ -9,6 +9,14 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import tv.plurx.app.data.Caps
+import tv.plurx.app.data.Appearance
+import tv.plurx.app.data.AudioOffsetReq
+import tv.plurx.app.data.HomeGrouping
+import tv.plurx.app.data.PlaybackQuality
+import tv.plurx.app.data.PosterSize
+import tv.plurx.app.data.ThemeId
+import tv.plurx.app.data.User
+import tv.plurx.app.data.ViewerPreferences
 import tv.plurx.app.data.CreateSessionReq
 import tv.plurx.app.data.Decision
 import tv.plurx.app.data.HlsStart
@@ -34,9 +42,12 @@ sealed interface Phase {
 data class HomeState(
     val hubs: Hubs = Hubs(),
     val libraries: List<Library> = emptyList(),
+    val libraryItems: Map<Long, List<Item>> = emptyMap(),
     val loading: Boolean = true,
     val error: String? = null,
 )
+
+data class PlaybackTarget(val itemId: Long, val fileId: Long, val startMs: Long = 0)
 
 /**
  * Single view-model for the whole app (manual DI — no Hilt). Owns the session
@@ -61,6 +72,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val _home = MutableStateFlow(HomeState())
     val home: StateFlow<HomeState> = _home.asStateFlow()
 
+    private val _preferences = MutableStateFlow(ViewerPreferences())
+    val preferences: StateFlow<ViewerPreferences> = _preferences.asStateFlow()
+
     var origin: String = ""
         private set
     var username: String? = null
@@ -70,6 +84,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     var audioLang: String = "eng"
         private set
     var subLang: String = "eng"
+        private set
+    var currentUser: User? = null
         private set
 
     private var api: PlurxApi? = null
@@ -85,6 +101,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             username = saved.username
             audioLang = saved.audioLang
             subLang = saved.subLang
+            _preferences.value = saved.preferences
 
             when {
                 saved.origin.isNotBlank() && saved.token != null -> {
@@ -92,7 +109,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     Session.token = saved.token
                     api = Net.api(saved.origin)
                     try {
-                        username = api().me().username
+                        currentUser = api().me()
+                        username = currentUser?.username
                         _phase.value = Phase.Ready
                         loadHome()
                     } catch (_: Exception) {
@@ -141,6 +159,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             try {
                 val resp = api().login(LoginReq(username = user.trim(), password = pass))
                 Session.token = resp.token
+                currentUser = resp.user
                 username = resp.user.username
                 settings.saveSession(origin, resp.token, resp.user.username)
                 _phase.value = Phase.Ready
@@ -159,7 +178,15 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             try {
                 val hubs = api().hubs()
                 val libs = api().libraries()
-                _home.value = HomeState(hubs = hubs, libraries = libs, loading = false)
+                val previews = libs.associate { lib ->
+                    lib.id to api().libraryItems(lib.id, limit = 24, sort = "added").items
+                }
+                _home.value = HomeState(
+                    hubs = hubs,
+                    libraries = libs,
+                    libraryItems = previews,
+                    loading = false,
+                )
             } catch (e: Exception) {
                 _home.value = _home.value.copy(loading = false, error = e.message ?: "Failed to load")
             }
@@ -169,6 +196,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun logout() {
         viewModelScope.launch { settings.clearToken() }
         Session.token = null
+        currentUser = null
         _home.value = HomeState()
         _phase.value = Phase.NeedLogin
     }
@@ -184,13 +212,83 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch { settings.saveLangs(audio, sub) }
     }
 
+    fun setTheme(theme: ThemeId) = updatePreferences { copy(theme = theme) }
+
+    fun setAppearance(appearance: Appearance) = updatePreferences { copy(appearance = appearance) }
+
+    fun setPosterSize(size: PosterSize) = updatePreferences { copy(posterSize = size) }
+
+    fun setHomeGrouping(grouping: HomeGrouping) = updatePreferences { copy(homeGrouping = grouping) }
+
+    fun setPlaybackQuality(quality: PlaybackQuality) = updatePreferences { copy(playbackQuality = quality) }
+
+    fun setAutoSkip(enabled: Boolean) = updatePreferences { copy(autoSkip = enabled) }
+
+    fun setAutoplayNext(enabled: Boolean) = updatePreferences { copy(autoplayNext = enabled) }
+
+    private fun updatePreferences(change: ViewerPreferences.() -> ViewerPreferences) {
+        val updated = _preferences.value.change()
+        _preferences.value = updated
+        viewModelScope.launch { settings.saveViewerPreferences(updated) }
+    }
+
     // ---- Suspend loaders used by individual screens --------------------------
 
-    suspend fun libraryItems(id: Long): List<Item> = api().libraryItems(id).items
+    suspend fun libraryItems(id: Long, sort: String = "title"): List<Item> {
+        val result = mutableListOf<Item>()
+        var offset = 0
+        do {
+            val page = api().libraryItems(id, limit = 200, offset = offset, sort = sort)
+            result += page.items
+            offset += page.items.size
+        } while (page.items.isNotEmpty() && offset < page.total)
+        return result
+    }
+
+    suspend fun search(query: String): List<Item> = api().search(query.trim()).results
 
     suspend fun itemDetail(id: Long): ItemDetail = api().item(id)
 
-    suspend fun decision(fileId: Long): Decision = api().decision(fileId, caps())
+    suspend fun decision(fileId: Long): Decision = api().decision(
+        fileId,
+        caps() + ("force" to _preferences.value.playbackQuality.storageValue),
+    )
+
+    suspend fun setWatched(itemId: Long, watched: Boolean): Int = if (watched) {
+        api().markWatched(itemId).updated
+    } else {
+        api().markUnwatched(itemId).updated
+    }
+
+    suspend fun setAudioOffset(fileId: Long, offsetMs: Long): Long =
+        api().setAudioOffset(fileId, AudioOffsetReq(offsetMs)).audio_offset_ms
+
+    suspend fun nextEpisode(itemId: Long): PlaybackTarget? {
+        val current = itemDetail(itemId)
+        if (current.item.kind != "episode") return null
+        val season = current.ancestors.lastOrNull() ?: return null
+        val show = current.ancestors.dropLast(1).lastOrNull()
+
+        val seasonDetail = itemDetail(season.id)
+        val episodes = seasonDetail.children.filter { it.kind == "episode" }
+        val index = episodes.indexOfFirst { it.id == itemId }
+        var next = episodes.getOrNull(index + 1)
+
+        if (next == null && show != null) {
+            val showDetail = itemDetail(show.id)
+            val seasons = showDetail.children.filter { it.kind == "season" }
+            val seasonIndex = seasons.indexOfFirst { it.id == season.id }
+            val nextSeason = seasons.getOrNull(seasonIndex + 1)
+            if (nextSeason != null) {
+                next = itemDetail(nextSeason.id).children.firstOrNull { it.kind == "episode" }
+            }
+        }
+
+        val item = next ?: return null
+        val detail = itemDetail(item.id)
+        val file = detail.files.firstOrNull { it.available } ?: return null
+        return PlaybackTarget(item.id, file.id)
+    }
 
     suspend fun createHlsSession(fileId: Long, body: CreateSessionReq): HlsStart =
         api().createHlsSession(fileId, body)

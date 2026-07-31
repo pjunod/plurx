@@ -7,7 +7,7 @@ package tv.plurx.app.data
  * token can change without rebuilding it.
  */
 object Session {
-    /** Server origin, no trailing slash, e.g. `http://192.168.1.10:32600`. */
+    /** Server origin, no trailing slash, e.g. `http://192.168.1.10:32400`. */
     @Volatile
     var origin: String = ""
 

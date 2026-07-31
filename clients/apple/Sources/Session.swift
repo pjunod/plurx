@@ -8,7 +8,7 @@ import Foundation
 final class Session: @unchecked Sendable {
     static let shared = Session()
 
-    /// Server origin, no trailing slash, e.g. `http://192.168.1.10:32600`.
+    /// Server origin, no trailing slash, e.g. `http://192.168.1.10:32400`.
     var origin: String = ""
     /// Bearer token, or nil when signed out.
     var token: String?

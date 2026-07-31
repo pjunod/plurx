@@ -37,7 +37,7 @@ object Net {
 
     private val contentType = "application/json".toMediaType()
 
-    /** Build an API bound to a server origin (`http://host:32600`). */
+    /** Build an API bound to a server origin (`http://host:32400`). */
     fun api(origin: String): PlurxApi =
         Retrofit.Builder()
             .baseUrl("$origin/api/v1/")

@@ -46,12 +46,21 @@ data class Watch(
     val position_ms: Long = 0,
     val duration_ms: Long? = null,
     val watched: Boolean = false,
+    val updated_at: Long? = null,
+)
+
+@Serializable
+data class Rollup(
+    val leaves: Long = 0,
+    val watched: Long = 0,
 )
 
 @Serializable
 data class Item(
     val id: Long,
+    val library_id: Long? = null,
     val kind: String,
+    val parent_id: Long? = null,
     val title: String,
     val year: Int? = null,
     val overview: String? = null,
@@ -59,11 +68,17 @@ data class Item(
     val backdrop: String? = null,
     val season_number: Int? = null,
     val episode_number: Int? = null,
+    val air_date: String? = null,
+    val recorded_at: String? = null,
+    val tags: List<String> = emptyList(),
     val show_title: String? = null,
     val runtime_ms: Long? = null,
+    val resolution: Long? = null,
+    val child_count: Long? = null,
     val watch: Watch? = null,
+    val rollup: Rollup? = null,
 ) {
-    val isMovieOrEpisode get() = kind == "movie" || kind == "episode"
+    val isPlayableVideo get() = kind == "movie" || kind == "episode" || kind == "video"
 }
 
 @Serializable
@@ -74,7 +89,15 @@ data class Hubs(
 )
 
 @Serializable
-data class Page(val items: List<Item> = emptyList(), val total: Int = 0)
+data class Page(
+    val items: List<Item> = emptyList(),
+    val total: Int = 0,
+    val offset: Int = 0,
+    val limit: Int = 0,
+)
+
+@Serializable
+data class SearchResponse(val results: List<Item> = emptyList())
 
 @Serializable
 data class AudioStream(
@@ -104,6 +127,7 @@ data class MediaFileDto(
     val duration_ms: Long? = null,
     val container: String? = null,
     val video_codec: String? = null,
+    val video_profile: String? = null,
     val width: Long? = null,
     val height: Long? = null,
     val bit_depth: Long? = null,
@@ -113,6 +137,8 @@ data class MediaFileDto(
     val audio_streams: List<AudioStream> = emptyList(),
     val subtitle_streams: List<SubtitleStream> = emptyList(),
     val available: Boolean = true,
+    val probed: Boolean = true,
+    val missing_path: String? = null,
 )
 
 @Serializable
@@ -179,6 +205,7 @@ data class Decision(
     val subtitles: List<SubTrack> = emptyList(),
     val markers: List<Marker> = emptyList(),
     val audio_offset_ms: Long = 0,
+    val declared_offset_ms: Long? = null,
 )
 
 @Serializable
@@ -205,9 +232,19 @@ data class CreateSessionReq(
     val height: Int? = null,
     val start: Double? = null,
     val audio: Int? = null,
+    val subtitle_burn: Int? = null,
     val copy: Boolean? = null,
     val aac: Boolean? = null,
 )
 
 @Serializable
 data class ProgressReq(val position_ms: Long, val duration_ms: Long? = null)
+
+@Serializable
+data class MutationResult(val ok: Boolean = true, val updated: Int = 0)
+
+@Serializable
+data class AudioOffsetReq(val offset_ms: Long)
+
+@Serializable
+data class AudioOffsetResp(val audio_offset_ms: Long)

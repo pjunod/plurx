@@ -10,6 +10,11 @@ _to_delete/
 deploy/docker-compose.override.yml
 deploy/.env
 
+# The Apple project and Info.plists are generated from clients/apple/project.yml.
+clients/apple/plurx.xcodeproj/
+clients/apple/Support/
+clients/apple/build/
+
 # perf-report writes its output into the working directory, and the server
 # checkouts are reset to the remote — an untracked report is the one thing in
 # them worth keeping, so name it here rather than sweeping it by hand.

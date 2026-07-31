@@ -14,11 +14,10 @@ struct PlurxApp: App {
     }
 }
 
-/// Navigation targets pushed onto the home stack.
+/// Navigation targets shared by each top-level tab's navigation stack.
 enum Route: Hashable {
-    case library(Library)
+    case collection(LibraryCollection)
     case item(Int)
-    case settings
 }
 
 struct RootView: View {
@@ -31,7 +30,7 @@ struct RootView: View {
             case .loading:
                 ProgressView().tint(Palette.accent)
             case .needServer:
-                ConnectView()
+                ConnectView(discovery: model.discovery)
             case .needLogin:
                 LoginView()
             case .ready:

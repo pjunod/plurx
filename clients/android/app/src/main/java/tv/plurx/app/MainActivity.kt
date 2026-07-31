@@ -25,6 +25,8 @@ import tv.plurx.app.ui.HomeScreen
 import tv.plurx.app.ui.LibraryScreen
 import tv.plurx.app.ui.LoginScreen
 import tv.plurx.app.ui.Phase
+import tv.plurx.app.ui.PhotoScreen
+import tv.plurx.app.ui.SearchScreen
 import tv.plurx.app.ui.SettingsScreen
 import tv.plurx.app.ui.components.LoadingBox
 import tv.plurx.app.ui.theme.PlurxTheme
@@ -33,9 +35,11 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
-            PlurxTheme {
+            val vm: AppViewModel = viewModel()
+            val preferences by vm.preferences.collectAsStateWithLifecycle()
+            PlurxTheme(preferences.theme, preferences.appearance) {
                 Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-                    AppRoot(viewModel())
+                    AppRoot(vm)
                 }
             }
         }
@@ -64,21 +68,31 @@ private fun MainNav(vm: AppViewModel) {
             HomeScreen(
                 vm = vm,
                 onOpenItem = { id -> nav.navigate("detail/$id") },
-                onOpenLibrary = { lib -> nav.navigate("library/${lib.id}/${Uri.encode(lib.name)}") },
+                onOpenCollection = { title, libraries ->
+                    nav.navigate("library/${libraries.joinToString(",") { it.id.toString() }}/${Uri.encode(title)}")
+                },
+                onSearch = { nav.navigate("search") },
                 onOpenSettings = { nav.navigate("settings") },
             )
         }
         composable(
-            "library/{id}/{name}",
+            "library/{ids}/{name}",
             arguments = listOf(
-                navArgument("id") { type = NavType.LongType },
+                navArgument("ids") { type = NavType.StringType },
                 navArgument("name") { type = NavType.StringType },
             ),
         ) { entry ->
             LibraryScreen(
                 vm = vm,
-                libraryId = entry.arguments!!.getLong("id"),
+                libraryIds = entry.arguments!!.getString("ids").orEmpty().split(',').mapNotNull(String::toLongOrNull),
                 title = entry.arguments!!.getString("name").orEmpty(),
+                onOpenItem = { id -> nav.navigate("detail/$id") },
+                onBack = { nav.popBackStack() },
+            )
+        }
+        composable("search") {
+            SearchScreen(
+                vm = vm,
                 onOpenItem = { id -> nav.navigate("detail/$id") },
                 onBack = { nav.popBackStack() },
             )
@@ -92,6 +106,16 @@ private fun MainNav(vm: AppViewModel) {
                 itemId = entry.arguments!!.getLong("id"),
                 onPlay = { itemId, fileId, startMs -> nav.navigate("player/$itemId/$fileId/$startMs") },
                 onOpenItem = { id -> nav.navigate("detail/$id") },
+                onViewPhoto = { id -> nav.navigate("photo/$id") },
+                onBack = { nav.popBackStack() },
+            )
+        }
+        composable(
+            "photo/{id}",
+            arguments = listOf(navArgument("id") { type = NavType.LongType }),
+        ) { entry ->
+            PhotoScreen(
+                itemId = entry.arguments!!.getLong("id"),
                 onBack = { nav.popBackStack() },
             )
         }
@@ -112,6 +136,10 @@ private fun MainNav(vm: AppViewModel) {
                 itemId = a.getLong("itemId"),
                 fileId = a.getLong("fileId"),
                 startMs = a.getLong("startMs"),
+                onPlayNext = { target ->
+                    nav.navigate("detail/${target.itemId}") { popUpTo("home") }
+                    nav.navigate("player/${target.itemId}/${target.fileId}/${target.startMs}")
+                },
                 onExit = { nav.popBackStack() },
             )
         }

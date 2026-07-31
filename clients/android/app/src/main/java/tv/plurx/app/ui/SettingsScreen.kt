@@ -1,25 +1,21 @@
 package tv.plurx.app.ui
 
-import androidx.compose.foundation.background
-import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material3.DropdownMenu
-import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -28,15 +24,16 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import tv.plurx.app.ui.theme.Accent
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import tv.plurx.app.data.Appearance
+import tv.plurx.app.data.HomeGrouping
+import tv.plurx.app.data.PlaybackQuality
+import tv.plurx.app.data.PosterSize
+import tv.plurx.app.data.ThemeId
+import tv.plurx.app.ui.components.ChoicePicker
 import tv.plurx.app.ui.theme.Muted
-import tv.plurx.app.ui.theme.Outline
-import tv.plurx.app.ui.theme.SurfaceHi
 
-// Common audio/subtitle languages (ISO 639-2/B, matching the server's codes).
 private val LANGS = listOf(
     "eng" to "English", "jpn" to "Japanese", "spa" to "Spanish", "fre" to "French",
     "ger" to "German", "ita" to "Italian", "por" to "Portuguese", "kor" to "Korean",
@@ -44,17 +41,17 @@ private val LANGS = listOf(
 )
 private val SUB_LANGS = listOf("off" to "Off") + LANGS
 
-private fun labelFor(code: String, options: List<Pair<String, String>>): String =
-    options.firstOrNull { it.first == code }?.second ?: code
-
 @Composable
 fun SettingsScreen(vm: AppViewModel, onBack: () -> Unit) {
-    var audio by remember { mutableStateOf(vm.audioLang) }
-    var sub by remember { mutableStateOf(vm.subLang) }
+    val preferences by vm.preferences.collectAsStateWithLifecycle()
+    val formFactor = currentFormFactor()
+    val side = formFactor.horizontalPadding()
+    var audio by remember { mutableStateOf(LANGS.firstOrNull { it.first == vm.audioLang } ?: LANGS.first()) }
+    var sub by remember { mutableStateOf(SUB_LANGS.firstOrNull { it.first == vm.subLang } ?: SUB_LANGS.first()) }
 
     Column(Modifier.fillMaxSize()) {
         Row(
-            Modifier.fillMaxWidth().padding(start = 4.dp, top = 8.dp),
+            Modifier.fillMaxWidth().padding(start = side - 12.dp, end = side, top = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             IconButton(onClick = onBack) {
@@ -63,74 +60,77 @@ fun SettingsScreen(vm: AppViewModel, onBack: () -> Unit) {
             Text("Settings", style = MaterialTheme.typography.titleLarge)
         }
 
+        val sectionModifier = Modifier.weight(1f)
+        val content: @Composable () -> Unit = {
+            SettingsSection("Appearance", "Theme and room brightness are independent, matching the web viewer.") {
+                ChoicePicker("Theme", preferences.theme, ThemeId.entries, { it.label }, vm::setTheme)
+                ChoicePicker("Appearance", preferences.appearance, Appearance.entries, { it.label }, vm::setAppearance)
+                ChoicePicker("Poster size", preferences.posterSize, PosterSize.entries, { it.label }, vm::setPosterSize)
+                ChoicePicker("Home grouping", preferences.homeGrouping, HomeGrouping.entries, { it.label }, vm::setHomeGrouping)
+            }
+        }
+        val playback: @Composable () -> Unit = {
+            SettingsSection("Playback defaults", "Applied to new playback sessions and remembered on this device.") {
+                ChoicePicker("Quality", preferences.playbackQuality, PlaybackQuality.entries, { it.label }, vm::setPlaybackQuality)
+                ChoicePicker("Audio language", audio, LANGS, { it.second }, onSelect = {
+                    audio = it
+                    vm.setLanguages(audio.first, sub.first)
+                })
+                ChoicePicker("Subtitle language", sub, SUB_LANGS, { it.second }, onSelect = {
+                    sub = it
+                    vm.setLanguages(audio.first, sub.first)
+                })
+                PreferenceSwitch("Auto-skip intro and credits", preferences.autoSkip, vm::setAutoSkip)
+                PreferenceSwitch("Autoplay next episode", preferences.autoplayNext, vm::setAutoplayNext)
+            }
+        }
+
         Column(
-            Modifier.padding(20.dp).fillMaxWidth(),
-            verticalArrangement = Arrangement.spacedBy(20.dp),
+            Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = side, vertical = 16.dp),
+            verticalArrangement = Arrangement.spacedBy(28.dp),
         ) {
-            Text("Playback defaults", style = MaterialTheme.typography.titleMedium)
-            Text(
-                "Preferred tracks when a title has more than one. Applied on the fly for direct play.",
-                color = Muted,
-                style = MaterialTheme.typography.labelMedium,
-            )
-
-            LanguagePicker("Audio language", audio, LANGS) {
-                audio = it
-                vm.setLanguages(audio, sub)
-            }
-            LanguagePicker("Subtitle language", sub, SUB_LANGS) {
-                sub = it
-                vm.setLanguages(audio, sub)
-            }
-
-            Box(Modifier.padding(top = 8.dp)) {
-                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text("Account", style = MaterialTheme.typography.titleMedium)
-                    Text(
-                        "Signed in as ${vm.username ?: "—"} on ${vm.serverName ?: vm.origin}",
-                        color = Muted,
-                        style = MaterialTheme.typography.labelMedium,
-                    )
+            if (formFactor == FormFactor.Compact) {
+                content()
+                playback()
+            } else {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(32.dp)) {
+                    Column(sectionModifier) { content() }
+                    Column(sectionModifier) { playback() }
                 }
             }
-            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                OutlinedButton(onClick = { vm.logout() }) { Text("Sign out") }
-                OutlinedButton(onClick = { vm.changeServer() }) { Text("Change server") }
+
+            SettingsSection("Account", null) {
+                Text(
+                    "Signed in as ${vm.username ?: "—"} on ${vm.serverName ?: vm.origin}",
+                    color = Muted,
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    OutlinedButton(onClick = vm::logout) { Text("Sign out") }
+                    OutlinedButton(onClick = vm::changeServer) { Text("Change server") }
+                }
             }
         }
     }
 }
 
 @Composable
-private fun LanguagePicker(
-    label: String,
-    value: String,
-    options: List<Pair<String, String>>,
-    onSelect: (String) -> Unit,
+private fun SettingsSection(
+    title: String,
+    description: String?,
+    content: @Composable ColumnScope.() -> Unit,
 ) {
-    var open by remember { mutableStateOf(false) }
-    Column {
-        Text(label, color = Muted, style = MaterialTheme.typography.labelMedium, modifier = Modifier.padding(bottom = 6.dp))
-        Box {
-            Row(
-                Modifier
-                    .clip(RoundedCornerShape(8.dp))
-                    .background(SurfaceHi)
-                    .border(1.dp, Outline, RoundedCornerShape(8.dp))
-                    .clickable { open = true }
-                    .padding(horizontal = 16.dp, vertical = 14.dp)
-                    .width(240.dp),
-            ) {
-                Text(labelFor(value, options), fontWeight = FontWeight.SemiBold)
-            }
-            DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
-                options.forEach { (code, name) ->
-                    DropdownMenuItem(
-                        text = { Text(name, color = if (code == value) Accent else MaterialTheme.colorScheme.onSurface) },
-                        onClick = { onSelect(code); open = false },
-                    )
-                }
-            }
-        }
+    Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+        Text(title, style = MaterialTheme.typography.titleMedium)
+        description?.let { Text(it, color = Muted, style = MaterialTheme.typography.bodyMedium) }
+        content()
+    }
+}
+
+@Composable
+private fun PreferenceSwitch(label: String, checked: Boolean, onCheckedChange: (Boolean) -> Unit) {
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Text(label, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
+        Switch(checked = checked, onCheckedChange = onCheckedChange)
     }
 }

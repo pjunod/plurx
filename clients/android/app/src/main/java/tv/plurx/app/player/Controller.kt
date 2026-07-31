@@ -1,4 +1,4 @@
-@file:OptIn(UnstableApi::class)
+@file:androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
 
 package tv.plurx.app.player
 
@@ -13,7 +13,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.MaterialTheme
@@ -34,9 +34,12 @@ import androidx.media3.datasource.okhttp.OkHttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
+import androidx.media3.session.MediaSession
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
 import tv.plurx.app.data.CreateSessionReq
+import tv.plurx.app.data.AudioTrack
+import tv.plurx.app.data.SubTrack
 import tv.plurx.app.data.Net
 import tv.plurx.app.data.Session
 import tv.plurx.app.ui.AppViewModel
@@ -61,6 +64,7 @@ import java.util.UUID
  */
 @UnstableApi
 class Controller(
+    context: Context,
     val player: ExoPlayer,
     private val plan: PlanLike,
     private val caps: Map<String, String>,
@@ -68,8 +72,15 @@ class Controller(
     private val scope: CoroutineScope,
     private val onError: () -> Unit = {},
 ) {
-    private val direct = plan.mode == "direct"
+    private var activeMode = plan.mode
     private var baseMs = 0L
+    var selectedAudio: Long? = plan.audio.firstOrNull { it.default }?.index
+        private set
+    var selectedSubtitle: Long? = null
+        private set
+    val deliveryMode: String get() = activeMode
+
+    private val mediaSession = MediaSession.Builder(context, player).build()
 
     /** The HLS session this player owns, if the plan opened one. */
     private var sessionId: String? = null
@@ -78,7 +89,7 @@ class Controller(
     private val playbackId = UUID.randomUUID().toString()
 
     fun startAt(ms: Long) {
-        when (plan.mode) {
+        when (activeMode) {
             "direct" -> {
                 player.setMediaItem(MediaItem.fromUri(plan.playUrl), ms.coerceAtLeast(0))
                 player.prepare()
@@ -96,12 +107,12 @@ class Controller(
 
     fun realPosition(): Long {
         val pos = player.currentPosition.coerceAtLeast(0)
-        return if (direct) pos else baseMs + pos
+        return if (activeMode == "direct") pos else baseMs + pos
     }
 
     fun seekTo(targetMs: Long) {
         val t = targetMs.coerceIn(0, if (plan.durationMs > 0) plan.durationMs else Long.MAX_VALUE)
-        when (plan.mode) {
+        when (activeMode) {
             "direct" -> player.seekTo(t)
             "remux" -> {
                 baseMs = t
@@ -120,7 +131,38 @@ class Controller(
     fun release() {
         sessionId?.let { vm.endHlsSession(it) }
         sessionId = null
+        mediaSession.release()
         player.release()
+    }
+
+    fun switchAudio(index: Long) {
+        val position = realPosition()
+        selectedAudio = index
+        restartAt(position)
+    }
+
+    fun switchSubtitle(index: Long?) {
+        val position = realPosition()
+        selectedSubtitle = index
+        activeMode = if (index == null) plan.mode else "transcode"
+        restartAt(position)
+    }
+
+    private fun restartAt(positionMs: Long) {
+        when (activeMode) {
+            "direct" -> {
+                player.setMediaItem(MediaItem.fromUri(plan.playUrl), positionMs)
+                player.prepare()
+                player.playWhenReady = true
+            }
+            "remux" -> {
+                baseMs = positionMs
+                player.setMediaItem(MediaItem.fromUri(remuxUri(positionMs)))
+                player.prepare()
+                player.playWhenReady = true
+            }
+            else -> openSession(positionMs)
+        }
     }
 
     /**
@@ -139,6 +181,9 @@ class Controller(
                         playback_id = playbackId,
                         request_id = UUID.randomUUID().toString(),
                         start = ms / 1000.0,
+                        height = vm.preferences.value.playbackQuality.storageValue.toIntOrNull(),
+                        audio = selectedAudio?.toInt(),
+                        subtitle_burn = selectedSubtitle?.toInt(),
                     ),
                 )
             } catch (_: Exception) {
@@ -157,6 +202,7 @@ class Controller(
         val sb = StringBuilder(plan.playUrl)
         sb.append(if (plan.playUrl.contains('?')) '&' else '?')
         sb.append("start=").append(ms / 1000.0)
+        selectedAudio?.let { sb.append("&audio=").append(it) }
         caps.forEach { (k, v) -> sb.append('&').append(k).append('=').append(Uri.encode(v)) }
         return sb.toString()
     }
@@ -168,6 +214,8 @@ interface PlanLike {
     val playUrl: String
     val mode: String // "direct" | "remux" | "transcode"
     val durationMs: Long
+    val audio: List<AudioTrack>
+    val subtitles: List<SubTrack>
 }
 
 @UnstableApi
@@ -193,7 +241,17 @@ fun buildPlayer(context: Context, vm: AppViewModel): ExoPlayer {
  */
 @UnstableApi
 @Composable
-fun TrackMenu(player: ExoPlayer, onDismiss: () -> Unit) {
+fun TrackMenu(
+    player: ExoPlayer,
+    serverAudio: List<AudioTrack>,
+    serverSubtitles: List<SubTrack>,
+    serverControlledAudio: Boolean,
+    selectedServerAudio: Long?,
+    selectedServerSubtitle: Long?,
+    onServerAudio: (Long) -> Unit,
+    onServerSubtitle: (Long?) -> Unit,
+    onDismiss: () -> Unit,
+) {
     val tracks = player.currentTracks
     val audio = tracks.groups.filter { it.type == C.TRACK_TYPE_AUDIO }
     val text = tracks.groups.filter { it.type == C.TRACK_TYPE_TEXT }
@@ -208,13 +266,23 @@ fun TrackMenu(player: ExoPlayer, onDismiss: () -> Unit) {
             Modifier
                 .align(Alignment.CenterEnd)
                 .fillMaxHeight()
-                .width(320.dp)
+                .widthIn(max = 380.dp)
+                .fillMaxWidth(0.92f)
                 .background(Color(0xFF141418))
                 .verticalScroll(rememberScrollState())
                 .padding(20.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
-            if (audio.isNotEmpty()) {
+            if (serverControlledAudio && serverAudio.isNotEmpty()) {
+                Text("Audio", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(bottom = 4.dp))
+                serverAudio.forEach { track ->
+                    TrackRow(
+                        label = serverAudioLabel(track),
+                        selected = selectedServerAudio == track.index,
+                        enabled = true,
+                    ) { onServerAudio(track.index) }
+                }
+            } else if (audio.isNotEmpty()) {
                 Text("Audio", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(bottom = 4.dp))
                 audio.forEach { group ->
                     for (i in 0 until group.length) {
@@ -233,13 +301,19 @@ fun TrackMenu(player: ExoPlayer, onDismiss: () -> Unit) {
                 }
             }
 
-            if (text.isNotEmpty()) {
+            val selectableServerSubs = if (serverControlledAudio) serverSubtitles else serverSubtitles.filterNot { it.text }
+            if (text.isNotEmpty() || selectableServerSubs.isNotEmpty()) {
                 Text("Subtitles", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(top = 14.dp, bottom = 4.dp))
-                TrackRow(label = "Off", selected = tracks.isTypeSelected(C.TRACK_TYPE_TEXT).not(), enabled = true) {
+                TrackRow(
+                    label = "Off",
+                    selected = selectedServerSubtitle == null && tracks.isTypeSelected(C.TRACK_TYPE_TEXT).not(),
+                    enabled = true,
+                ) {
                     player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
                         .clearOverridesOfType(C.TRACK_TYPE_TEXT)
                         .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
                         .build()
+                    onServerSubtitle(null)
                     onDismiss()
                 }
                 text.forEach { group ->
@@ -257,9 +331,16 @@ fun TrackMenu(player: ExoPlayer, onDismiss: () -> Unit) {
                         }
                     }
                 }
+                selectableServerSubs.forEach { track ->
+                    TrackRow(
+                        label = serverSubtitleLabel(track),
+                        selected = selectedServerSubtitle == track.index,
+                        enabled = true,
+                    ) { onServerSubtitle(track.index) }
+                }
             }
 
-            if (audio.isEmpty() && text.isEmpty()) {
+            if (audio.isEmpty() && text.isEmpty() && serverAudio.isEmpty() && serverSubtitles.isEmpty()) {
                 Text("No selectable tracks", color = Muted, style = MaterialTheme.typography.bodyMedium)
             }
         }
@@ -308,10 +389,28 @@ private fun subLabel(f: Format): String {
     return parts.distinct().joinToString(" · ").ifBlank { "Subtitle" }
 }
 
+private fun serverAudioLabel(track: AudioTrack): String = listOfNotNull(
+    languageName(track.language),
+    track.title,
+    track.channels?.let {
+        when (it) {
+            1 -> "Mono"; 2 -> "Stereo"; 6 -> "5.1"; 8 -> "7.1"; else -> "${it}ch"
+        }
+    },
+    track.codec.uppercase(),
+).distinct().joinToString(" · ").ifBlank { "Audio" }
+
+private fun serverSubtitleLabel(track: SubTrack): String = listOfNotNull(
+    languageName(track.language),
+    track.title,
+    if (track.forced) "Forced" else null,
+    if (!track.text) "Burn-in" else null,
+).distinct().joinToString(" · ").ifBlank { "Subtitle" }
+
 private fun languageName(code: String?): String? {
     if (code.isNullOrBlank() || code == "und") return null
     return try {
-        Locale(code).displayLanguage.ifBlank { code }
+        Locale.forLanguageTag(code).displayLanguage.ifBlank { code }
     } catch (_: Exception) {
         code
     }

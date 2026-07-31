@@ -21,7 +21,7 @@ build: ## Debug build of the whole workspace
 	$(CARGO) build --workspace
 
 .PHONY: run
-run: ## Run the server (http://localhost:32600)
+run: ## Run the server (http://localhost:32400)
 	$(CARGO) run -p plurxd
 
 .PHONY: fmt
@@ -152,7 +152,7 @@ hooks: ## Install the git pre-commit hook (runs `make check`)
 ## ---- android client ----------------------------------------------------
 
 .PHONY: android-image
-android-image: ## Build the pinned Android build-env image (JDK 17 + SDK)
+android-image: ## Build the pinned Android build-env image (JDK 25 + SDK)
 	docker build -t $(ANDROID_IMAGE) clients/android
 
 .PHONY: android

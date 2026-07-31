@@ -16,8 +16,9 @@ settings:
     SWIFT_VERSION: "5.9"
     MARKETING_VERSION: "0.1.0"
     CURRENT_PROJECT_VERSION: "1"
-    # Set your Apple Developer team here (or per-target in Xcode's Signing tab).
-    DEVELOPMENT_TEAM: ""
+    # Paul Junod's paid Apple Developer Program team. Automatic signing creates
+    # and refreshes development profiles for both platform targets.
+    DEVELOPMENT_TEAM: "YHK542LK23"
     CODE_SIGN_STYLE: Automatic
 
 targets:
@@ -34,13 +35,23 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: tv.plurx.app
         TARGETED_DEVICE_FAMILY: "1,2"          # iPhone + iPad
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
-        INFOPLIST_KEY_UILaunchScreen_Generation: YES
-        INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
-        INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents: YES
     info:
       path: Support/iOS-Info.plist
       properties:
         CFBundleDisplayName: plurx
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UIApplicationSupportsIndirectInputEvents: true
         # Home servers are usually plain http on the LAN — permit it. The
         # narrower NSAllowsLocalNetworking is NOT a substitute: it misses
         # Tailscale's 100.64/10 and, on iOS 10+, its mere presence makes
@@ -50,6 +61,11 @@ targets:
         # Without this iOS silently refuses connections to 192.168.x.x —
         # a functional bug, not paperwork.
         NSLocalNetworkUsageDescription: "plurx connects to your media server on your local network."
+        # Browsing is also the permission preflight: it makes iOS ask before a
+        # login request can race the system sheet. The value must match the
+        # service plurxd publishes through DNS-SD.
+        NSBonjourServices:
+          - _plurx._tcp
         # Skips the export-compliance questionnaire on every upload.
         ITSAppUsesNonExemptEncryption: false
 
@@ -71,8 +87,59 @@ targets:
       path: Support/tvOS-Info.plist
       properties:
         CFBundleDisplayName: plurx
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         # Same reasoning as iOS above — docs/PUBLISHING.md §4.
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
         NSLocalNetworkUsageDescription: "plurx connects to your media server on your local network."
+        NSBonjourServices:
+          - _plurx._tcp
         ITSAppUsesNonExemptEncryption: false
+
+  plurx-iOSTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: Tests
+    dependencies:
+      - target: plurx-iOS
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: tv.plurx.app.tests.ios
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/plurx.app/plurx"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+
+  plurx-tvOSTests:
+    type: bundle.unit-test
+    platform: tvOS
+    sources:
+      - path: Tests
+    dependencies:
+      - target: plurx-tvOS
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: tv.plurx.app.tests.tvos
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/plurx.app/plurx"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+
+schemes:
+  plurx-iOS:
+    build:
+      targets:
+        plurx-iOS: all
+        plurx-iOSTests: [test]
+    test:
+      targets:
+        - plurx-iOSTests
+
+  plurx-tvOS:
+    build:
+      targets:
+        plurx-tvOS: all
+        plurx-tvOSTests: [test]
+    test:
+      targets:
+        - plurx-tvOSTests
