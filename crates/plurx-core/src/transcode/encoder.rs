@@ -115,7 +115,12 @@ impl Encoder {
     /// parameter rather than always-on because the option has to be *accepted*
     /// by the build, and the startup probe is what establishes that — see
     /// `validate`.
-    pub fn encode_args(self, bitrate_kbps: u32, force_idr: bool) -> Vec<String> {
+    pub fn encode_args(
+        self,
+        bitrate_kbps: u32,
+        force_idr: bool,
+        software_threads: Option<u32>,
+    ) -> Vec<String> {
         let br = format!("{bitrate_kbps}k");
         let maxrate = format!("{}k", bitrate_kbps * 3 / 2);
         let bufsize = format!("{}k", bitrate_kbps * 2);
@@ -139,6 +144,14 @@ impl Encoder {
             Encoder::Software => {
                 let mut args = rate_control(vec!["-c:v", "libx264", "-preset", "veryfast"]);
                 args.extend(["-profile:v".to_owned(), "high".to_owned()]);
+                // Explicit, when the admission pool granted a budget. x264's
+                // own default is cores x 1.5 — the right call for the only
+                // session on the box, and precisely how three sessions
+                // oversubscribe every core (review §2.4). Hardware encoders
+                // ignore the budget: their parallelism is silicon.
+                if let Some(threads) = software_threads {
+                    args.extend(["-threads".to_owned(), threads.to_string()]);
+                }
                 args
             }
             Encoder::Nvenc => rate_control(vec!["-c:v", "h264_nvenc", "-preset", "p4"]),
@@ -302,7 +315,7 @@ fn validation_args(encoder: Encoder, force_idr: bool) -> Vec<String> {
     }
     args.push("-vf".into());
     args.push(vf);
-    args.extend(encoder.encode_args(PROBE_BITRATE_KBPS, force_idr));
+    args.extend(encoder.encode_args(PROBE_BITRATE_KBPS, force_idr, None));
     args.extend(["-f".into(), "null".into(), "-".into()]);
     args
 }
@@ -578,7 +591,7 @@ mod tests {
             Encoder::Vaapi,
             Encoder::Qsv,
         ] {
-            let args = encoder.encode_args(4000, false);
+            let args = encoder.encode_args(4000, false, None);
             assert!(has(&args, encoder.video_codec()), "{encoder:?} codec");
             // 4000k target → 1.5x cap over a 2x window.
             assert!(
@@ -595,9 +608,40 @@ mod tests {
             );
         }
         // Per-family extras survive the shared rate-control block.
-        let sw = Encoder::Software.encode_args(4000, false);
+        let sw = Encoder::Software.encode_args(4000, false, None);
         assert!(has(&sw, "veryfast") && has(&sw, "high"));
-        assert!(has(&Encoder::Nvenc.encode_args(4000, false), "p4"));
+        assert!(has(&Encoder::Nvenc.encode_args(4000, false, None), "p4"));
+    }
+
+    /// The admission pool's thread budget reaches x264 as an explicit
+    /// `-threads`, and only x264: a hardware encoder's parallelism is
+    /// silicon, and handing it the flag would throttle nothing useful. And
+    /// `None` stays absent — x264's own default is the right answer for the
+    /// only session on the box.
+    #[test]
+    fn the_thread_budget_is_explicit_and_software_only() {
+        let sw = Encoder::Software.encode_args(4000, false, Some(3));
+        let t = sw.iter().position(|a| a == "-threads").expect("-threads");
+        assert_eq!(sw[t + 1], "3", "the granted budget, verbatim");
+
+        let unbudgeted = Encoder::Software.encode_args(4000, false, None);
+        assert!(
+            !unbudgeted.iter().any(|a| a == "-threads"),
+            "no budget, no flag"
+        );
+        for hw in [
+            Encoder::Nvenc,
+            Encoder::Qsv,
+            Encoder::Vaapi,
+            Encoder::VideoToolbox,
+        ] {
+            assert!(
+                !hw.encode_args(4000, false, Some(3))
+                    .iter()
+                    .any(|a| a == "-threads"),
+                "{hw:?} must ignore a software budget"
+            );
+        }
     }
 
     /// The two spellings, and that they never cross.
@@ -609,14 +653,14 @@ mod tests {
     /// silently stops being used.
     #[test]
     fn each_family_gets_its_own_spelling_of_forced_idr() {
-        let qsv = Encoder::Qsv.encode_args(4000, true);
+        let qsv = Encoder::Qsv.encode_args(4000, true, None);
         assert!(has(&qsv, "-forced_idr"), "{qsv:?}");
         assert!(
             !has(&qsv, "-forced-idr"),
             "QSV got NVENC's spelling: {qsv:?}"
         );
 
-        let nvenc = Encoder::Nvenc.encode_args(4000, true);
+        let nvenc = Encoder::Nvenc.encode_args(4000, true, None);
         assert!(has(&nvenc, "-forced-idr"), "{nvenc:?}");
         assert!(
             !has(&nvenc, "-forced_idr"),
@@ -641,7 +685,7 @@ mod tests {
     fn families_that_do_not_need_forced_idr_never_receive_it() {
         for encoder in [Encoder::Software, Encoder::Vaapi, Encoder::VideoToolbox] {
             assert_eq!(encoder.forced_idr_flag(), None, "{encoder:?}");
-            let args = encoder.encode_args(4000, true);
+            let args = encoder.encode_args(4000, true, None);
             assert!(
                 !args.iter().any(|a| a.starts_with("-forced")),
                 "{encoder:?} was handed a forced-IDR flag it has no option for: {args:?}"
@@ -654,7 +698,7 @@ mod tests {
     #[test]
     fn forced_idr_is_off_unless_the_probe_asked_for_it() {
         for encoder in [Encoder::Qsv, Encoder::Nvenc] {
-            let args = encoder.encode_args(4000, false);
+            let args = encoder.encode_args(4000, false, None);
             assert!(
                 !args.iter().any(|a| a.starts_with("-forced")),
                 "{encoder:?}: {args:?}"
@@ -694,7 +738,7 @@ mod tests {
         ] {
             let force_idr = encoder.forced_idr_flag().is_some();
             let probe = validation_args(encoder, force_idr);
-            let production = encoder.encode_args(PROBE_BITRATE_KBPS, force_idr);
+            let production = encoder.encode_args(PROBE_BITRATE_KBPS, force_idr, None);
             let at = probe
                 .windows(production.len())
                 .position(|w| w == production.as_slice());

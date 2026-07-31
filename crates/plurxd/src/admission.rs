@@ -80,6 +80,78 @@ impl Drop for HwSlot {
     }
 }
 
+/// A held share of the software CPU pool, denominated in encoder threads.
+/// Releases its weight on drop, for the same reason [`HwSlot`] does.
+#[derive(Debug)]
+pub struct SwPermit {
+    used: Arc<AtomicUsize>,
+    weight: usize,
+}
+
+impl SwPermit {
+    /// The x264 thread budget this permit reserved — what the session is
+    /// allowed to spend is exactly what it reserved, one number on purpose.
+    pub fn threads(&self) -> usize {
+        self.weight
+    }
+}
+
+impl Drop for SwPermit {
+    fn drop(&mut self) {
+        self.used.fetch_sub(self.weight, Ordering::AcqRel);
+    }
+}
+
+/// A cloneable handle on the software CPU pool's counter, so a task that has
+/// no reach back to [`Admissions`] — the stall watchdog's one-step downgrade
+/// runs in a detached task — can still take the permit its fallback owes.
+#[derive(Debug, Clone)]
+pub struct SwPool {
+    used: Arc<AtomicUsize>,
+}
+
+impl SwPool {
+    /// Take `weight` threads if they fit — with one deliberate exception: an
+    /// empty pool always grants, whatever the weight. On a 2-core box every
+    /// session is over budget, and refusing all of them would turn the budget
+    /// into a ban; one saturating session is the best that box can do.
+    fn try_take(&self, budget: usize, weight: usize) -> Option<SwPermit> {
+        let mut used = self.used.load(Ordering::Acquire);
+        loop {
+            if used > 0 && used + weight > budget {
+                return None;
+            }
+            match self.used.compare_exchange_weak(
+                used,
+                used + weight,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(SwPermit {
+                        used: Arc::clone(&self.used),
+                        weight,
+                    })
+                }
+                Err(actual) => used = actual,
+            }
+        }
+    }
+
+    /// Take `weight` threads unconditionally. For the hardware→software
+    /// fallback mid-session: the viewer is already watching, and holding
+    /// their film hostage to the budget would turn an accounting rule into a
+    /// stall. Overcommit is recorded (the pool goes over budget, and every
+    /// later `try_take` sees it) rather than hidden.
+    pub fn take_forced(&self, weight: usize) -> SwPermit {
+        self.used.fetch_add(weight, Ordering::AcqRel);
+        SwPermit {
+            used: Arc::clone(&self.used),
+            weight,
+        }
+    }
+}
+
 /// A live start queuing for a slot.
 ///
 /// Its *existence* is the yield signal, which is why it is a guard and not a
@@ -125,6 +197,12 @@ pub struct Admissions {
     /// Live starts currently queuing for a slot. Read by background work,
     /// which stands down while it is non-zero.
     waiting: Arc<AtomicUsize>,
+    /// Encoder threads the software pool has handed out. Software transcodes
+    /// used to bypass admission entirely — each x264 process picked its own
+    /// thread count, and several of them could oversubscribe every core on
+    /// the box, dragging every session (and the live viewers') under
+    /// realtime together (review §2.4).
+    software: SwPool,
     /// Recent speed, by class of work — see [`class_of`]. Learned from real
     /// sessions rather than configured, because the answer depends on the box
     /// and no default could be right for both a NUC and a Xeon.
@@ -142,12 +220,42 @@ impl Admissions {
         Admissions {
             held: Arc::new(AtomicUsize::new(0)),
             waiting: Arc::new(AtomicUsize::new(0)),
+            software: SwPool {
+                used: Arc::new(AtomicUsize::new(0)),
+            },
             measured: Mutex::new(HashMap::new()),
         }
     }
 
     pub fn in_use(&self) -> usize {
         self.held.load(Ordering::Acquire)
+    }
+
+    /// Encoder threads currently reserved from the software pool.
+    pub fn software_in_use(&self) -> usize {
+        self.software.used.load(Ordering::Acquire)
+    }
+
+    /// A handle a detached task can carry — see [`SwPool`].
+    pub fn software_pool(&self) -> SwPool {
+        self.software.clone()
+    }
+
+    /// Take a software permit if the pool has room, against `budget` threads.
+    ///
+    /// Background callers are refused outright while a live start is queuing,
+    /// exactly as they are for hardware slots — the pre-transcode producer
+    /// must not spend the cores a viewer is waiting on.
+    pub fn try_admit_software(
+        &self,
+        budget: usize,
+        weight: usize,
+        priority: Priority,
+    ) -> Option<SwPermit> {
+        if priority == Priority::Background && self.live_is_waiting() {
+            return None;
+        }
+        self.software.try_take(budget, weight)
     }
 
     /// Announce that a live start is queuing. Hold the guard for as long as the
@@ -315,6 +423,46 @@ impl<'a> Workload<'a> {
         // corpus put both under realtime on exactly this class of hardware.
         self.source_height >= 2160 || (heavy_codec && self.hdr.is_some())
     }
+
+    /// The x264 thread budget for this shape of work — and, identically, its
+    /// weight in the software pool. One number on purpose: what a session is
+    /// allowed to spend is exactly what it reserves, so the pool's arithmetic
+    /// and the encoder's `-threads` cannot drift apart.
+    ///
+    /// The encode scales with the *output*, which sets the base; the decode
+    /// (and any tone-map) happen at *source* resolution however small the
+    /// output is, which is the 4K surcharge — the same asymmetry
+    /// [`Workload::class`] encodes for admission speed.
+    pub fn software_threads(&self) -> usize {
+        let base = match self.target_height {
+            h if h <= 480 => 2,
+            h if h <= 720 => 3,
+            h if h <= 1080 => 4,
+            _ => 6,
+        };
+        if self.source_height >= 2160 {
+            base + 2
+        } else {
+            base
+        }
+    }
+}
+
+/// Threads the software pool may hand out at once on this machine: every
+/// core but one. The reserved core is everything that is not a video
+/// encoder — the daemon itself, audio transcodes, the copy segmenter, the
+/// OS. Floor of two, because a budget of one on a tiny box would refuse work
+/// the empty-pool exception exists to admit anyway.
+///
+/// Passed into [`Admissions::try_admit_software`] by the caller rather than
+/// read here, exactly like the hardware cap: the tests hand in fixed numbers
+/// so the suite is not an assertion about the build machine's core count.
+pub fn software_budget() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .saturating_sub(1)
+        .max(2)
 }
 
 #[cfg(test)]
@@ -563,5 +711,108 @@ mod tests {
         assert!(a.try_acquire(4, Priority::Background).is_none());
         drop(second);
         assert!(a.try_acquire(4, Priority::Background).is_some());
+    }
+
+    // ---- the software CPU pool (review §2.4) --------------------------------
+
+    /// The pool bounds *concurrent* software encoders in threads, and the
+    /// weight comes back however a permit's holder ends — same guard shape,
+    /// same reason, as the hardware slots.
+    #[test]
+    fn the_software_pool_is_a_bound_and_permits_come_back() {
+        let a = Admissions::new();
+        let first = a
+            .try_admit_software(6, 4, Priority::Live)
+            .expect("an empty pool admits");
+        assert_eq!(a.software_in_use(), 4);
+        assert!(
+            a.try_admit_software(6, 4, Priority::Live).is_none(),
+            "4 + 4 exceeds a budget of 6"
+        );
+        let second = a
+            .try_admit_software(6, 2, Priority::Live)
+            .expect("4 + 2 fits exactly");
+        assert_eq!(a.software_in_use(), 6);
+        drop(first);
+        assert_eq!(a.software_in_use(), 2, "weight returns on drop");
+        assert!(a.try_admit_software(6, 4, Priority::Live).is_some());
+        drop(second);
+    }
+
+    /// An empty pool always admits, whatever the weight: on a 2-core box
+    /// every session is over budget, and refusing all of them would turn the
+    /// budget into a ban. One saturating session is the best that box can do.
+    #[test]
+    fn an_empty_pool_admits_even_over_budget() {
+        let a = Admissions::new();
+        let big = a
+            .try_admit_software(2, 8, Priority::Live)
+            .expect("the only session may saturate the box");
+        assert_eq!(a.software_in_use(), 8);
+        assert!(
+            a.try_admit_software(2, 2, Priority::Live).is_none(),
+            "but nothing joins it while it does"
+        );
+        drop(big);
+    }
+
+    /// The mid-film hardware→software fallback takes its threads
+    /// unconditionally — a viewer already watching is not held hostage to
+    /// the budget — but the overcommit is *recorded*, so later admissions
+    /// see a full pool rather than an accounting hole.
+    #[test]
+    fn a_forced_permit_overcommits_visibly_and_still_returns() {
+        let a = Admissions::new();
+        let pool = a.software_pool();
+        let live = a
+            .try_admit_software(6, 4, Priority::Live)
+            .expect("a live session");
+        let forced = pool.take_forced(6);
+        assert_eq!(forced.threads(), 6);
+        assert_eq!(a.software_in_use(), 10, "the overcommit is on the books");
+        assert!(
+            a.try_admit_software(6, 2, Priority::Live).is_none(),
+            "and later admissions respect it"
+        );
+        drop(forced);
+        drop(live);
+        assert_eq!(a.software_in_use(), 0);
+    }
+
+    /// The producer must not spend the cores a viewer is waiting on — the
+    /// same preemption rule as hardware, now covering the pool software
+    /// starts used to bypass.
+    #[test]
+    fn background_software_work_yields_to_a_queuing_start() {
+        let a = Admissions::new();
+        assert!(
+            a.try_admit_software(6, 3, Priority::Background).is_some(),
+            "spare capacity is anyone's"
+        );
+        let queued = a.wait_for_slot();
+        assert!(
+            a.try_admit_software(6, 1, Priority::Background).is_none(),
+            "a queuing viewer parks background work"
+        );
+        assert!(
+            a.try_admit_software(6, 1, Priority::Live).is_some(),
+            "and never the viewer"
+        );
+        drop(queued);
+    }
+
+    /// The thread budget scales with the encode and pays the 4K decode
+    /// surcharge — the same source-vs-output asymmetry as the class key.
+    #[test]
+    fn software_threads_follow_the_work() {
+        assert_eq!(work(1080, "h264", None, 480).software_threads(), 2);
+        assert_eq!(work(1080, "h264", None, 720).software_threads(), 3);
+        assert_eq!(work(1080, "h264", None, 1080).software_threads(), 4);
+        assert_eq!(
+            work(2160, "hevc", Some("hdr10"), 1080).software_threads(),
+            6,
+            "the decode and tone-map happen at source resolution"
+        );
+        assert!(software_budget() >= 2, "the floor holds on any machine");
     }
 }

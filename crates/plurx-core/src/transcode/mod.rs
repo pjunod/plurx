@@ -408,6 +408,17 @@ pub struct TranscodeOptions {
     /// begin, not what any frame looks like, and an entry produced before this
     /// existed decodes to the same picture.
     pub force_idr: bool,
+    /// Explicit thread budget for the software encoder, from the admission
+    /// pool's permit (plurxd's `Workload::software_threads`). `None` lets
+    /// x264 pick — which is cores x 1.5, a fine answer for exactly one
+    /// session and an oversubscription for two. Ignored by hardware
+    /// encoders: their parallelism lives in silicon, not in threads.
+    ///
+    /// Also deliberately NOT part of the cache recipe, for force_idr's
+    /// reason: it changes how fast frames are made, not what they look like
+    /// to a viewer — and on any one box the same workload computes the same
+    /// budget anyway.
+    pub software_threads: Option<u32>,
 }
 
 impl Default for TranscodeOptions {
@@ -423,6 +434,7 @@ impl Default for TranscodeOptions {
             pipeline: Pipeline::Cpu,
             subtitle_burn: None,
             force_idr: false,
+            software_threads: None,
         }
     }
 }
@@ -825,7 +837,11 @@ pub fn hls_args(
             args.push(vf);
         }
     }
-    args.extend(encoder.encode_args(opts.video_bitrate_kbps, opts.force_idr));
+    args.extend(encoder.encode_args(
+        opts.video_bitrate_kbps,
+        opts.force_idr,
+        opts.software_threads,
+    ));
 
     // Segment-aligned keyframes so each segment is independently decodable.
     args.push("-force_key_frames".into());

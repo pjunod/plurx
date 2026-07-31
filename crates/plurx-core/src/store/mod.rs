@@ -136,6 +136,12 @@ pub mod keys {
     /// right number is a property of the silicon: a discrete card with two
     /// NVENC chips is not a NUC.
     pub const MAX_HW_SESSIONS: &str = "transcode.max_hw_sessions";
+    /// Threads the software-encoder CPU pool may hand out at once. Defaults
+    /// to every core but one (plurxd derives it from the machine); an admin
+    /// sets it lower on a box whose CPU has other jobs, or higher at their
+    /// own risk. API-settable, deliberately no UI dropdown — the same policy
+    /// as the scratch limits.
+    pub const SW_POOL_THREADS: &str = "transcode.software_pool_threads";
     /// Disk the pre-transcode cache may occupy, in gigabytes. `0` turns the
     /// cache off: nothing is produced, and what is already there is evicted.
     ///

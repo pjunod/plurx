@@ -835,6 +835,11 @@ struct Session {
     /// returns it too, which is what makes the cap *complete* — every way a
     /// session can end, including the ones nobody wrote a branch for.
     hw_slot: std::sync::Mutex<Option<HwSlot>>,
+    /// This session's reservation from the software CPU pool, when it runs
+    /// (or fell back to) a software encoder. Held for the session's life and
+    /// released the same two ways as the hardware slot, for the same two
+    /// reasons: promptly via `release_software`, completely via drop.
+    sw_permit: std::sync::Mutex<Option<crate::admission::SwPermit>>,
     /// Bytes of segment actually handed to this client, and how fast.
     ///
     /// The player cannot measure this for itself on every transport: native
@@ -893,6 +898,13 @@ impl Session {
         let _ = self.hw_slot.lock().expect("hw slot mutex").take();
     }
 
+    /// Hand the software pool its threads back now — the watchdog task holds
+    /// an `Arc` to this session for its whole grace window, and a viewer who
+    /// closed the tab should not keep cores reserved for it.
+    fn release_software(&self) {
+        let _ = self.sw_permit.lock().expect("sw permit mutex").take();
+    }
+
     /// The bookkeeping half of the hardware→software fallback, split out so a
     /// test can prove it. Two things must happen at the transition, not at
     /// teardown: the hardware slot goes back (a software session holding a
@@ -901,9 +913,13 @@ impl Session {
     /// admission class flips to software, so the speeds measured from here on
     /// are recorded as what they are rather than poisoning the hardware
     /// class's record with a software encoder's numbers.
-    fn demote_to_software(&self, work: Workload<'_>) {
+    fn demote_to_software(&self, work: Workload<'_>, permit: crate::admission::SwPermit) {
         self.release_hardware();
         *self.class.lock().expect("class mutex") = work.software_class();
+        // Forced, not negotiated — the viewer is already watching — but on
+        // the books: the pool runs over budget and every later admission
+        // sees it (review §2.4).
+        *self.sw_permit.lock().expect("sw permit mutex") = Some(permit);
     }
 
     /// Re-read the playlist and re-measure what is on disk.
@@ -1552,6 +1568,7 @@ impl TranscodeManager {
     /// what it is looking for, once to name what it is about to produce — and
     /// two spellings of "what this session is" would eventually disagree,
     /// which is a cache that never hits or, worse, one that hits wrongly.
+    #[allow(clippy::too_many_arguments)] // one session's worth of knobs
     fn options_for(
         &self,
         encoder: Encoder,
@@ -1560,9 +1577,11 @@ impl TranscodeManager {
         start_seconds: f64,
         audio_index: Option<i64>,
         subtitle_burn: Option<plurx_core::transcode::SubtitleBurn>,
+        software_threads: Option<u32>,
     ) -> TranscodeOptions {
         TranscodeOptions {
             target_height,
+            software_threads,
             video_bitrate_kbps: bitrate_for_height(target_height),
             audio_index,
             start_seconds,
@@ -1676,6 +1695,7 @@ impl TranscodeManager {
             progress: Arc::new(Progress::new()),
             class: std::sync::Mutex::new(String::new()),
             hw_slot: std::sync::Mutex::new(None),
+            sw_permit: std::sync::Mutex::new(None),
             delivery: Meter::new(),
             suspended: AtomicBool::new(false),
         });
@@ -1747,6 +1767,9 @@ impl TranscodeManager {
             0.0,
             audio_index,
             subtitle_burn,
+            // Parts pick their own budget from the Background permit they run
+            // under (produce_into) — and the recipe hash excludes it anyway.
+            None,
         );
         let mut digest = self.digest().ok_or("no cache digest")?;
         digest.encoder = encoder;
@@ -1913,20 +1936,33 @@ impl TranscodeManager {
                 tracing::debug!(recipe = %hash, "producer out of time for this run");
                 return Ok(None);
             }
-            // Do not even start while a viewer is queuing.
+            // Do not even start while a viewer is queuing — and never spend
+            // what a viewer would want.
             //
-            // For a hardware encoder the slot request answers this, since
-            // background acquisition is refused outright while anyone is in the
-            // queue. Software has no slot to ask for, and without the explicit
-            // check this loop span: spawn ffmpeg, kill it on the first poll
-            // microseconds later, spawn another — hundreds of processes a
-            // second, for as long as somebody was waiting to play something.
+            // For a hardware encoder the slot request answers both, since
+            // background acquisition is refused outright while anyone is in
+            // the queue. Software parts draw from the CPU pool at Background
+            // priority now (§2.4): the same refusal while a viewer queues —
+            // which also keeps this loop from spawning ffmpeg just to kill it
+            // on the first poll, hundreds of times a second — plus a real
+            // reservation, so producer parts and live software sessions can
+            // no longer oversubscribe every core between them.
+            let mut sw_hold = None;
             let slot = if encoder == Encoder::Software {
-                if self.admissions.live_is_waiting() {
-                    tokio::time::sleep(self.producer.retry).await;
-                    continue;
+                match self.admissions.try_admit_software(
+                    self.software_budget().await,
+                    Workload::of(file, opts.target_height).software_threads(),
+                    Priority::Background,
+                ) {
+                    Some(permit) => {
+                        sw_hold = Some(permit);
+                        None
+                    }
+                    None => {
+                        tokio::time::sleep(self.producer.retry).await;
+                        continue;
+                    }
                 }
-                None
             } else {
                 match self.admissions.try_acquire(max, Priority::Background) {
                     Some(slot) => Some(slot),
@@ -1945,6 +1981,10 @@ impl TranscodeManager {
             let resume_ms = crate::produce::resume_at_ms(&parts);
             let part_opts = TranscodeOptions {
                 start_seconds: resume_ms as f64 / 1000.0,
+                // What the Background permit reserved is what this part may
+                // spend. Not part of the recipe hash, so resumed parts and
+                // cache identity are unaffected.
+                software_threads: sw_hold.as_ref().map(|p| p.threads() as u32),
                 ..opts.clone()
             };
             // Unpaced, deliberately. Pacing exists so a live session does not
@@ -1976,6 +2016,7 @@ impl TranscodeManager {
 
             let ended = self.run_part(&mut child, deadline).await;
             drop(slot); // before anything else: a viewer is probably waiting on it
+            drop(sw_hold); // and the pool share with it
             let part = read_part(&part_dir).await;
             let produced = !part.is_empty();
             if produced {
@@ -2249,6 +2290,15 @@ impl TranscodeManager {
             .await
     }
 
+    /// Threads the software-encoder pool may hand out at once: every core
+    /// but one unless the admin says otherwise ([`keys::SW_POOL_THREADS`]).
+    /// The tests set the key, so the suite asserts policy rather than the
+    /// build machine's core count.
+    pub async fn software_budget(&self) -> usize {
+        self.num_setting(keys::SW_POOL_THREADS, crate::admission::software_budget())
+            .await
+    }
+
     /// Choose the encoder given the admin preference setting (empty = auto).
     async fn encoder(&self) -> Encoder {
         let prefer = self
@@ -2343,8 +2393,9 @@ impl TranscodeManager {
         for (session_id, session) in doomed {
             // Before the kill, and before the caller goes on to ask for a slot
             // of its own: a player replacing its own session must not have to
-            // queue behind the session it just replaced.
+            // queue behind the session it just replaced — on either pool.
             session.release_hardware();
+            session.release_software();
             session.kill_child().await;
             session.discard_dir().await;
             tracing::info!(
@@ -2410,6 +2461,7 @@ impl TranscodeManager {
             start_seconds,
             audio_index,
             subtitle_burn.clone(),
+            None,
         );
         if let Some(info) = self
             .serve_cached(&file, &opts, encoder, &item_title, user_name, playback_id)
@@ -2428,6 +2480,8 @@ impl TranscodeManager {
         // play will forgive five seconds far sooner than a hang.
         let work = Workload::of(&file, target_height);
         let mut hw_slot = None;
+        let mut sw_permit = None;
+        let sw_budget = self.software_budget().await;
         if encoder != Encoder::Software {
             let max = self.max_hw_sessions().await;
             // Announced for the whole wait, including the first attempt. A
@@ -2452,20 +2506,71 @@ impl TranscodeManager {
                     // never because the output is small, which is the reasoning
                     // that admits a 4K HDR source at 480p and then stalls: the
                     // decode and the tone-map happen at source resolution
-                    // whatever size you ask the output to be.
+                    // whatever size you ask the output to be. And only with a
+                    // permit from the CPU pool: measured-fast is a claim about
+                    // one session on an otherwise-idle box, not about joining
+                    // three others already spending every core (§2.4).
                     Admission::Software => {
-                        tracing::info!(
-                            file = file_id, class = %work.software_class(),
-                            "hardware transcode slots full; this class runs comfortably                              in software here, so starting it there"
-                        );
-                        encoder = Encoder::Software;
-                        break;
+                        match self.admissions.try_admit_software(
+                            sw_budget,
+                            work.software_threads(),
+                            Priority::Live,
+                        ) {
+                            Some(permit) => {
+                                tracing::info!(
+                                    file = file_id, class = %work.software_class(),
+                                    threads = permit.threads(),
+                                    "hardware transcode slots full; this class runs comfortably                                      in software here, so starting it there"
+                                );
+                                encoder = Encoder::Software;
+                                sw_permit = Some(permit);
+                                break;
+                            }
+                            None => {
+                                let why = format!(
+                                    "all {max} hardware transcode slots are in use and the                                      software CPU pool is spent ({} of {sw_budget} threads                                      reserved). Try again in a moment.",
+                                    self.admissions.software_in_use()
+                                );
+                                tracing::warn!(file = file_id, class = %work.software_class(), "{why}");
+                                return Err(why);
+                            }
+                        }
                     }
                     Admission::Refused(why) => {
                         tracing::warn!(file = file_id, class = %work.software_class(), "{why}");
                         return Err(why);
                     }
                 }
+            }
+        } else {
+            // Software from the start — a box with no hardware encoder. This
+            // path used to bypass admission entirely: every x264 process
+            // chose its own thread count, and nothing stopped a fourth
+            // session from joining three that already had every core spoken
+            // for (§2.4). The wait is announced exactly like a hardware
+            // queue, so the producer checkpoints out of the way of a viewer
+            // here too.
+            let _queued = self.admissions.wait_for_slot();
+            let deadline = Instant::now() + QUEUE_WAIT;
+            loop {
+                if let Some(permit) = self.admissions.try_admit_software(
+                    sw_budget,
+                    work.software_threads(),
+                    Priority::Live,
+                ) {
+                    sw_permit = Some(permit);
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    let why = format!(
+                        "the software CPU pool is spent ({} of {sw_budget} threads reserved)                          and no slot freed within {}s. Try again in a moment.",
+                        self.admissions.software_in_use(),
+                        QUEUE_WAIT.as_secs()
+                    );
+                    tracing::warn!(file = file_id, class = %work.software_class(), "{why}");
+                    return Err(why);
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
             }
         }
 
@@ -2478,6 +2583,8 @@ impl TranscodeManager {
         // Admission may have moved this session to software, which changes the
         // pipeline it is entitled to — so the options are rebuilt rather than
         // patched. Same builder, so the two cannot describe different sessions.
+        // The software permit's thread budget rides in the same rebuild: what
+        // admission reserved is exactly what x264 is told to spend.
         let opts = self.options_for(
             encoder,
             &file,
@@ -2485,6 +2592,7 @@ impl TranscodeManager {
             start_seconds,
             audio_index,
             subtitle_burn,
+            sw_permit.as_ref().map(|p| p.threads() as u32),
         );
         let pacing = self.pacing(false).await;
         let args = transcode::hls_args(&file, encoder, &opts, pacing, &dir.to_string_lossy());
@@ -2554,6 +2662,7 @@ impl TranscodeManager {
                 encoder.label()
             })),
             hw_slot: std::sync::Mutex::new(hw_slot),
+            sw_permit: std::sync::Mutex::new(sw_permit),
             delivery: Meter::new(),
             suspended: AtomicBool::new(false),
         });
@@ -2577,6 +2686,7 @@ impl TranscodeManager {
             let dir = dir.clone();
             let sid = session_id.clone();
             let started_on_hardware = encoder != Encoder::Software;
+            let sw_pool = self.admissions.software_pool();
             tokio::spawn(async move {
                 if started_on_hardware {
                     tokio::time::sleep(FIRST_SEGMENT_GRACE).await;
@@ -2650,7 +2760,7 @@ impl TranscodeManager {
                     // stalled without a segment (downgrade one step).
                     if !session_producing(&dir).await {
                         Self::downgrade_one_step(
-                            &session, &file, &opts, encoder, pacing, &dir, &sid,
+                            &session, &file, &opts, encoder, pacing, &sw_pool, &dir, &sid,
                         )
                         .await;
                         if session.failed.load(Relaxed) {
@@ -2689,12 +2799,14 @@ impl TranscodeManager {
     /// has waited out the grace window twice has waited too long. If the
     /// downgraded session also stalls, the lifetime watchdog takes it. On a
     /// spawn failure the session is marked failed; the caller checks.
+    #[allow(clippy::too_many_arguments)] // one fallback's worth of context
     async fn downgrade_one_step(
         session: &Session,
         file: &plurx_core::domain::MediaFile,
         opts: &TranscodeOptions,
         encoder: Encoder,
         pacing: Pacing,
+        sw_pool: &crate::admission::SwPool,
         dir: &std::path::Path,
         sid: &str,
     ) {
@@ -2730,8 +2842,14 @@ impl TranscodeManager {
             // to the session: hand it back at the transition so
             // the next hardware start gets it now, and re-class
             // the admission record for the software encoder that
-            // is about to be measured.
-            session.demote_to_software(Workload::of(file, session.target_height));
+            // is about to be measured. The replacement takes its CPU
+            // pool share by force — a viewer already watching is not
+            // held hostage to the budget — and spends exactly what it
+            // reserved, as an explicit -threads.
+            let work = Workload::of(file, session.target_height);
+            let permit = sw_pool.take_forced(work.software_threads());
+            retry_opts.software_threads = Some(permit.threads() as u32);
+            session.demote_to_software(work, permit);
         }
         let sw_args = transcode::hls_args(
             file,
@@ -2921,6 +3039,7 @@ impl TranscodeManager {
             progress: Arc::clone(&progress),
             class: std::sync::Mutex::new(String::new()),
             hw_slot: std::sync::Mutex::new(None),
+            sw_permit: std::sync::Mutex::new(None),
             delivery: Meter::new(),
             suspended: AtomicBool::new(false),
         });
@@ -3071,6 +3190,7 @@ impl TranscodeManager {
             return false;
         };
         session.release_hardware();
+        session.release_software();
         session.kill_child().await;
         session.discard_dir().await;
         tracing::info!(%session_id, reason, "transcode session ended");
@@ -3358,6 +3478,7 @@ impl TranscodeManager {
             for (id, session) in expired {
                 self.sessions.lock().await.remove(&id);
                 session.release_hardware();
+                session.release_software();
                 // Kills a suspended child too — SIGKILL is not blockable and
                 // does not need the process scheduled to take effect.
                 session.kill_child().await;
@@ -3944,6 +4065,7 @@ mod tests {
             progress: Arc::new(Progress::new()),
             class: std::sync::Mutex::new(String::new()),
             hw_slot: std::sync::Mutex::new(None),
+            sw_permit: std::sync::Mutex::new(None),
             delivery: Meter::new(),
             suspended: AtomicBool::new(false),
         }
@@ -4354,7 +4476,11 @@ mod tests {
             .expect("session");
         let file = store.get_file(file_id).await.expect("get").expect("file");
         let work_class = Workload::of(&file, session.target_height);
-        session.demote_to_software(work_class);
+        let permit = mgr
+            .admissions
+            .software_pool()
+            .take_forced(work_class.software_threads());
+        session.demote_to_software(work_class, permit);
 
         assert_eq!(
             mgr.admissions.in_use(),
@@ -4377,6 +4503,120 @@ mod tests {
             other => panic!("the freed slot must be grantable now, got {other:?}"),
         }
         assert!(mgr.stop_session(&info.session_id, "test").await);
+    }
+
+    // ---- the software CPU pool, wired through start() (review §2.4) ---------
+
+    /// A software-only box. Sessions used to bypass admission entirely here;
+    /// now a start reserves its thread weight and every ending returns it.
+    #[tokio::test]
+    async fn software_starts_reserve_the_cpu_pool_and_stops_return_it() {
+        super::require_ffmpeg();
+        use plurx_core::store::SqliteStore;
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let file_id = seed_file(&store).await;
+        let work = tempfile::tempdir().expect("work");
+        let mgr = TranscodeManager::new(
+            Arc::clone(&store),
+            work.path().to_path_buf(),
+            EncoderCaps::default(), // no hardware: software from the start
+            Pipeline::Cpu,
+        );
+
+        let info = mgr
+            .start(file_id, 1080, 0.0, None, None, "paul", "pb-sw")
+            .await
+            .expect("software start");
+        // The 4K fixture at a 1080 rung: base 4 threads + the 4K decode
+        // surcharge — the weight is the workload's, not the machine's.
+        assert_eq!(
+            mgr.admissions.software_in_use(),
+            6,
+            "the start reserved its weight"
+        );
+        assert!(mgr.stop_session(&info.session_id, "test").await);
+        assert_eq!(
+            mgr.admissions.software_in_use(),
+            0,
+            "and the stop returned it"
+        );
+    }
+
+    /// The budget is a bound on *joining*, not on existing: a second session
+    /// that does not fit is refused with the reason, and space freed by a
+    /// stop is grantable again.
+    #[tokio::test]
+    async fn the_software_pool_refuses_what_it_cannot_fit() {
+        super::require_ffmpeg();
+        use plurx_core::store::SqliteStore;
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let file_id = seed_file(&store).await;
+        let work = tempfile::tempdir().expect("work");
+        let mgr = TranscodeManager::new(
+            Arc::clone(&store),
+            work.path().to_path_buf(),
+            EncoderCaps::default(),
+            Pipeline::Cpu,
+        );
+        // Policy under test, not the build machine's core count.
+        store
+            .put_setting(keys::SW_POOL_THREADS, "8")
+            .await
+            .expect("budget");
+
+        let first = mgr
+            .start(file_id, 1080, 0.0, None, None, "paul", "pb-a")
+            .await
+            .expect("first fits an empty pool");
+        let refused = match mgr
+            .start(file_id, 1080, 0.0, None, None, "paul", "pb-b")
+            .await
+        {
+            Err(why) => why,
+            Ok(_) => panic!("6 + 6 exceeds a budget of 8 and must be refused"),
+        };
+        assert!(refused.contains("software CPU pool"), "{refused}");
+
+        assert!(mgr.stop_session(&first.session_id, "test").await);
+        let second = mgr
+            .start(file_id, 1080, 0.0, None, None, "paul", "pb-c")
+            .await
+            .expect("freed weight is grantable again");
+        assert!(mgr.stop_session(&second.session_id, "test").await);
+    }
+
+    /// On a tiny box every session is over budget; the empty-pool exception
+    /// is what keeps the budget from being a ban. One saturating session is
+    /// the best that box can do.
+    #[tokio::test]
+    async fn a_lone_software_session_may_exceed_a_tiny_budget() {
+        super::require_ffmpeg();
+        use plurx_core::store::SqliteStore;
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let file_id = seed_file(&store).await;
+        let work = tempfile::tempdir().expect("work");
+        let mgr = TranscodeManager::new(
+            Arc::clone(&store),
+            work.path().to_path_buf(),
+            EncoderCaps::default(),
+            Pipeline::Cpu,
+        );
+        store
+            .put_setting(keys::SW_POOL_THREADS, "2")
+            .await
+            .expect("budget");
+
+        let info = mgr
+            .start(file_id, 1080, 0.0, None, None, "paul", "pb-lone")
+            .await
+            .expect("the only session may saturate the box");
+        assert_eq!(
+            mgr.admissions.software_in_use(),
+            6,
+            "overcommit on the books"
+        );
+        assert!(mgr.stop_session(&info.session_id, "test").await);
+        assert_eq!(mgr.admissions.software_in_use(), 0);
     }
 
     // ---- the lifetime watchdog (review §2.3) --------------------------------
@@ -4449,6 +4689,7 @@ mod tests {
             progress: Arc::new(Progress::new()),
             class: std::sync::Mutex::new(String::new()),
             hw_slot: std::sync::Mutex::new(None),
+            sw_permit: std::sync::Mutex::new(None),
             delivery: Meter::new(),
             suspended: AtomicBool::new(false),
         })
@@ -4658,7 +4899,7 @@ mod tests {
         height: i64,
     ) -> String {
         let encoder = mgr.encoder().await;
-        let opts = mgr.options_for(encoder, file, height, 0.0, None, None);
+        let opts = mgr.options_for(encoder, file, height, 0.0, None, None, None);
         let mut digest = mgr.digest().expect("cache configured");
         digest.encoder = encoder;
         Recipe {
@@ -4695,7 +4936,7 @@ mod tests {
         let file = store.get_file(file_id).await.expect("get").expect("file");
         let hash = recipe_hash_for(&mgr, &file, 1080).await;
         let encoder = mgr.encoder().await;
-        let opts = mgr.options_for(encoder, &file, 1080, 0.0, None, None);
+        let opts = mgr.options_for(encoder, &file, 1080, 0.0, None, None, None);
         let look = || mgr.serve_cached(&file, &opts, encoder, "Heat", "paul", "pb-1");
 
         // Nothing claimed yet.
@@ -5382,7 +5623,7 @@ mod tests {
         assert!(mgr.digest().is_none());
         let file = store.get_file(file_id).await.expect("get").expect("file");
         let encoder = mgr.encoder().await;
-        let opts = mgr.options_for(encoder, &file, 1080, 0.0, None, None);
+        let opts = mgr.options_for(encoder, &file, 1080, 0.0, None, None, None);
         assert!(mgr
             .serve_cached(&file, &opts, encoder, "Heat", "paul", "pb-1")
             .await
@@ -5465,6 +5706,14 @@ mod tests {
             EncoderCaps::default(),
             Pipeline::Cpu,
         );
+        // Two players deliberately coexist below; this test is about the
+        // supersession key, not the CPU pool, so give the pool room — on a
+        // 2-core runner the machine-derived budget would refuse the second
+        // player and fail the test for the wrong reason.
+        store
+            .put_setting(keys::SW_POOL_THREADS, "64")
+            .await
+            .expect("pool headroom");
 
         // Play, then "seek" three times. Only the newest survives.
         let first = mgr
