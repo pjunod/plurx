@@ -11,9 +11,20 @@
 # mount /mnt/qnap/media at /media below, then add /media/movies in the UI.
 # Mounting shares at the same path as the host (second example) keeps UI
 # paths identical to host paths — pick whichever you find saner.
+#
+# A shared external network is also valid here. If you add `networks:` to the
+# service, do not also set `network_mode: host`: Compose treats those as
+# mutually exclusive and refuses the entire project before starting a build.
+# Ordinary bridge networks do not carry Bonjour multicast onto the physical
+# LAN, so native clients use manual server entry in that layout.
 
 services:
   plurxd:
+    # Attach the service to a shared external media network by uncommenting
+    # these two lines and the matching top-level declaration below:
+    # networks:
+    #   - media
+
     volumes:
       - /mnt/qnap/media:/media:ro
       # - /mnt/qnap/20t:/mnt/qnap/20t:ro
@@ -40,3 +51,8 @@ services:
     #         - driver: nvidia
     #           count: 1
     #           capabilities: [gpu]
+
+# Matching top-level declaration for the optional service attachment above:
+# networks:
+#   media:
+#     external: true

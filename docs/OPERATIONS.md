@@ -76,6 +76,13 @@ network, VLAN, VPN, routed subnet, or Docker bridge. In those layouts, publish
 TCP 32400 normally and use the client's manual server option; do not expose UDP
 5353 to the internet.
 
+The tracked Compose file stays on ordinary Docker networking so a host override
+can attach plurxd to an external `media` network. Do not combine that
+`networks:` attachment with `network_mode: host`: Compose rejects the project
+because the two network models are mutually exclusive. If inter-container
+connectivity needs the shared network, keep it and accept manual native-client
+entry unless the external network is LAN-facing macvlan/ipvlan with multicast.
+
 **How to verify it:** run this from another Mac on the same LAN:
 
 ```bash

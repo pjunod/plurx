@@ -5,8 +5,8 @@ path that matches your setup.
 
 ## Docker / Compose (recommended for homelabs)
 
-Host-specific bits (media mounts and GPU) live in an untracked override file;
-bind ports live in `.env`, so pulling updates never conflicts with local edits:
+Host-specific bits (media mounts, GPU, and shared Docker networks) live in an
+untracked override file, so pulling updates never conflicts with local edits:
 
 ```sh
 cd deploy
@@ -22,12 +22,18 @@ hardware transcode, uncomment the GPU block in your override (Intel/AMD via
 still-running Plex) owns UDP 32414, set `PLURX_GDM_PORT` in `.env`
 (see `.env.example`).
 
-The Compose service uses host networking. This is required for its Bonjour
-`_plurx._tcp` advertisement to reach iPhone, iPad, and Apple TV; publishing a
-TCP port from a bridge is not enough. On Docker Desktop, enable host networking
-in Docker's settings first. If host networking is unavailable, remove
-`network_mode: host`, restore a `32400:32400` port mapping in your override,
-and use manual server entry in the native app.
+The base Compose service deliberately uses ordinary Docker networking and
+publishes TCP 32400 plus UDP 32414. Your override may therefore attach plurxd
+to an external network such as `media`. Compose forbids a service from declaring
+both `network_mode: host` and `networks`; combining them makes `docker compose
+up` fail before it builds anything.
+
+**Discovery trade-off:** Bonjour `_plurx._tcp` is link-local multicast, and a
+normal bridge network does not carry it onto the physical LAN. In that layout,
+use the native app's manual server entry. Automatic Bonjour discovery requires
+bare metal, a LAN-facing macvlan/ipvlan network that carries multicast, or a
+host-network deployment with no `networks:` stanza. Do not replace working
+inter-container connectivity with host networking merely to gain discovery.
 
 ### Project name
 
