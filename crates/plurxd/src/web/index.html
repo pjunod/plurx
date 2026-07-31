@@ -396,6 +396,19 @@
      sentence in a 224px column is six short lines. Everything below it is
      label-and-number, which is what columns are good at. */
   .stsec.wide{column-span:all;margin-bottom:11px}
+  /* A short screen — a phone held sideways, which is how a phone watches
+     video — inverts the trade. There, vertical space is the scarce thing, and
+     a full-width Playback section spends the entire visible panel on two
+     sentences: measured, 4 of 28 rows reachable without scrolling. Letting it
+     flow with the rest and narrowing the columns puts 13 of 28 on the first
+     screen. It still scrolls (28 rows will not fit a 200px-tall panel however
+     they are arranged) — but what you see first is numbers beside their
+     labels rather than prose. */
+  @media(max-height:640px){
+    .stsec.wide{column-span:none;margin-bottom:9px}
+    .statsbody{columns:230px}
+    .stsec.wide > div{grid-template-columns:112px minmax(0,1fr)}
+  }
   /* Two real columns rather than an inline-block label with a minimum width.
      That version had no gap of its own, so any label wider than the minimum
      touched its value ("Client estimate338 Mb/s"), and a value long enough to
@@ -404,7 +417,13 @@
      stays inside the value column. Each row is its own grid, so the width is
      fixed rather than max-content; every label here fits 116px at this size.
      Section headers opt out, being one item and not two. */
-  .stsec > div{display:grid;grid-template-columns:112px minmax(0,1fr);gap:0 10px;align-items:baseline}
+  /* `anywhere`, because the values worth reading most are the ones with no
+     break opportunity in them: a browser's own error text arrives as
+     PipelineStatus::CHUNK_DEMUXER_ERROR_APPEND_FAILED, one unbreakable token
+     wider than any column here, and it was being clipped at the panel edge —
+     losing the end of the sentence that says what went wrong. */
+  .stsec > div{display:grid;grid-template-columns:112px minmax(0,1fr);gap:0 10px;align-items:baseline;
+    overflow-wrap:anywhere}
   /* The full-width section can afford the wider label column it always had. */
   .stsec.wide > div{grid-template-columns:116px minmax(0,1fr)}
   .stsec > div.sechd{display:block}
