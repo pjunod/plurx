@@ -264,6 +264,21 @@ impl Progress {
             .filter(|v| *v >= 0)
             .map(|v| v as f64 / 1000.0)
     }
+
+    /// Restart the motion clock without touching anything measured.
+    ///
+    /// Called when a suspended session is resumed. `moved_at_ms` stopped
+    /// advancing the moment the SIGSTOP landed — correctly, nothing was
+    /// moving — so the first stall check after SIGCONT would otherwise read
+    /// the whole suspension as "output has not advanced for minutes" and fail
+    /// a healthy session that simply had not emitted its first post-resume
+    /// progress block yet. The recent-rate sampler needs no equivalent: a
+    /// sample spanning the suspension is already rejected by
+    /// [`RECENT_SAMPLE_MAX_GAP_MS`].
+    fn touch(&self) {
+        self.moved_at_ms
+            .store(self.started.elapsed().as_millis() as i64, Relaxed);
+    }
 }
 
 /// One completed, published segment — the unit of everything except the
@@ -599,28 +614,71 @@ async fn session_producing(dir: &std::path::Path) -> bool {
     }
 }
 
-/// Fail a session that has stopped producing, and only then.
+/// What one watchdog poll should do with what it observed. Pure, because the
+/// subtlety is entirely in which states are *not* a stall, and each of those
+/// is a healthy session the wrong verdict would kill mid-film: a suspended
+/// encoder is motionless on purpose, an exited child is EOF or a kill (both
+/// already have owners reporting them), and a session failed elsewhere is
+/// already being torn down.
+#[derive(Debug, PartialEq)]
+enum WatchNext {
+    /// Nothing wrong, or nothing judgeable: look again next poll.
+    Wait,
+    /// The watch is over — the process exited or someone else failed the
+    /// session. Not a verdict; both cases already have their own reporters.
+    Done,
+    /// Output stopped advancing while the session was supposed to be moving.
+    Stall,
+}
+
+fn watch_next(failed: bool, exited: bool, suspended: bool, stalled_for: Duration) -> WatchNext {
+    if failed || exited {
+        return WatchNext::Done;
+    }
+    if !suspended && stalled_for >= PROGRESS_STALL {
+        return WatchNext::Stall;
+    }
+    WatchNext::Wait
+}
+
+/// Fail a session whose output has stopped advancing — for the life of the
+/// encoder, not just its start.
 ///
 /// This replaced a single verdict taken at a fixed deadline ("no segment after
 /// 30s ⇒ dead"), which could not tell a wedged pipeline from a slow one and
 /// killed both. It answers a different question — *is output still moving?* —
 /// on a poll, which is strictly more informative in both directions: a session
-/// that never opened its input still fails at the same deadline, a session
-/// decoding 4K at 0.4x is left alone, and a session that produced a few
-/// seconds and then wedged is now caught too (the old check looked once and,
-/// having found a segment, never looked again).
+/// that never opened its input still fails at the same deadline, and a session
+/// decoding 4K at 0.4x is left alone.
 ///
-/// Exits as soon as there is real output, when the child dies on its own
-/// (which the playlist and segment readers already report), or when the
-/// session is failed by someone else.
+/// It used to return at the first playable segment, which left every *later*
+/// wedge unwatched: a pipeline that froze at minute 40 drained the client's
+/// buffer and then hung the player on a segment nobody was writing (review
+/// §2.3). Now the watch ends only when the process exits (EOF and kills both
+/// have owners reporting them) or the session is failed elsewhere. The states
+/// that are deliberately never judged: a *suspended* session is motionless on
+/// purpose — and `apply_ahead_window` restarts the motion clock at resume, so
+/// the suspension itself can never be read back as a stall — and a *cached*
+/// session has no process at all, so there is nothing here to watch.
 async fn watch_for_stall(session: Arc<Session>, dir: PathBuf, sid: String) {
+    // No process, nothing to judge — and `failed` on a cache entry would be a
+    // lie with consequences (its segments exist; readers would refuse them).
+    // No start path spawns a watchdog for a cache hit; this is the guard that
+    // keeps that true if one ever does.
+    if session.cached {
+        return;
+    }
     // A generous floor before the first verdict: opening a 4K file over NFS
     // and filling a first segment is legitimately slow, and `stalled_for`
     // counts from session start, so judging earlier would fail cold opens.
     tokio::time::sleep(SOFTWARE_GRACE).await;
+    let mut produced = false;
     loop {
-        if session.failed.load(Relaxed) || session_producing(&dir).await {
-            return;
+        // Once true, stays true — and stops the per-poll playlist read. The
+        // flag only picks the failure message: which half of the session's
+        // life wedged decides what the operator should go look at.
+        if !produced && session_producing(&dir).await {
+            produced = true;
         }
         let exited = {
             let mut child = session.child.lock().await;
@@ -628,24 +686,34 @@ async fn watch_for_stall(session: Arc<Session>, dir: PathBuf, sid: String) {
                 .as_mut()
                 .is_some_and(|c| matches!(c.try_wait(), Ok(Some(_))))
         };
-        if exited {
-            return;
+        match watch_next(
+            session.failed.load(Relaxed),
+            exited,
+            session.suspended.load(Relaxed),
+            session.progress.stalled_for(),
+        ) {
+            WatchNext::Done => return,
+            WatchNext::Wait => tokio::time::sleep(WATCHDOG_POLL).await,
+            WatchNext::Stall => {
+                tracing::error!(
+                    session = %sid,
+                    stalled_s = session.progress.stalled_for().as_secs(),
+                    produced_ms = session.progress.out_time_ms(),
+                    "{}",
+                    if produced {
+                        "transcode output stopped advancing mid-stream; failing the session \
+                         so the player can recover instead of draining its buffer into a hang"
+                    } else {
+                        "transcode produced no playable segment and its output has stopped \
+                         advancing; failing the session — the source is likely undecodable \
+                         by this ffmpeg build (e.g. a Dolby Vision profile it can't handle)"
+                    }
+                );
+                session.kill_child().await;
+                session.failed.store(true, Relaxed);
+                return;
+            }
         }
-        // Stopped on purpose, or still moving: neither is a stall.
-        if !session.suspended.load(Relaxed) && session.progress.stalled_for() >= PROGRESS_STALL {
-            tracing::error!(
-                session = %sid,
-                stalled_s = session.progress.stalled_for().as_secs(),
-                produced_ms = session.progress.out_time_ms(),
-                "transcode produced no playable segment and its output has stopped advancing; \
-                 failing the session — the source is likely undecodable by this ffmpeg build \
-                 (e.g. a Dolby Vision profile it can't handle)"
-            );
-            session.kill_child().await;
-            session.failed.store(true, Relaxed);
-            return;
-        }
-        tokio::time::sleep(WATCHDOG_POLL).await;
     }
 }
 
@@ -2512,125 +2580,80 @@ impl TranscodeManager {
             tokio::spawn(async move {
                 if started_on_hardware {
                     tokio::time::sleep(FIRST_SEGMENT_GRACE).await;
-                    if session_producing(&dir).await {
-                        // Producing real segments. If the picture is still gray,
-                        // the problem is the *output* (tone-map/color), not the
-                        // pipeline stalling — this line says which. The speed
-                        // says how much headroom it has while doing it.
-                        tracing::info!(
-                            session = %sid,
-                            speed = session.progress.speed(),
-                            "transcode producing segments within {}s (hardware path healthy)",
-                            FIRST_SEGMENT_GRACE.as_secs()
-                        );
-                        return;
-                    }
-                    // Producing nothing, but *is* it stuck? A session stopped
-                    // for running ahead obviously makes no progress, and one
-                    // decoding 4K at 0.4x is slow rather than broken —
-                    // restarting either on software trades a slow start for a
-                    // slower one. Only a session whose output has actually
-                    // stopped moving gets the fallback.
-                    if session.suspended.load(Relaxed) {
-                        return;
-                    }
-                    if session.progress.stalled_for() < PROGRESS_STALL {
-                        tracing::info!(
-                            session = %sid,
-                            produced_ms = session.progress.out_time_ms(),
-                            speed = session.progress.speed(),
-                            "no finished segment yet, but the encoder is still advancing — \
-                             letting it run rather than restarting it on something slower"
-                        );
-                        return;
-                    }
-                    // Downgrade by ONE step, and take the cheaper step first.
-                    // A session running a GPU tone-map graph that stopped
-                    // producing is evidence about the graph — a driver state
-                    // the boot probe couldn't reach, a codec profile its
-                    // fixture didn't cover, another session contending for the
-                    // same block. None of that is evidence about the *encoder*,
-                    // and swapping to software would trade a stalled hardware
-                    // session for one that is slower still. So the graph goes
-                    // and the hardware stays; only a session already on the CPU
-                    // chain falls back to a software encoder.
-                    //
-                    // One step per session, deliberately: this watchdog fires
-                    // once, and a viewer who has waited out the grace window
-                    // twice has waited too long. If the downgraded session also
-                    // stalls, the running-stall watchdog below takes it.
-                    let downgrade_pipeline = opts.pipeline.on_gpu();
-                    let retry_encoder = if downgrade_pipeline {
-                        encoder
-                    } else {
-                        Encoder::Software
-                    };
-                    let mut retry_opts = opts.clone();
-                    if downgrade_pipeline {
-                        retry_opts.pipeline = opts.pipeline.fallback().unwrap_or(Pipeline::Cpu);
-                    }
-                    tracing::warn!(
-                        session = %sid,
-                        stalled_s = session.progress.stalled_for().as_secs(),
-                        pipeline = opts.pipeline.name(),
-                        retry_pipeline = retry_opts.pipeline.name(),
-                        retry_encoder = retry_encoder.label(),
-                        "no HLS segment from hardware within {}s and output has stopped \
-                         advancing (GPU contention, or a decode the GPU can't do — e.g. \
-                         Dolby Vision); {}",
-                        FIRST_SEGMENT_GRACE.as_secs(),
-                        if downgrade_pipeline {
-                            "dropping the GPU tone-map and keeping the hardware encoder"
-                        } else {
-                            "retrying on software"
+                    // A watch, not a glance. The single verdict this used to
+                    // take had three ways to walk away early — producing,
+                    // suspended, still advancing — and every one of them ended
+                    // monitoring for the life of the session, so a pipeline
+                    // that wedged a minute in was nobody's problem (§2.3).
+                    // Now the only exits are into the lifetime watchdog below,
+                    // or through the one-step downgrade — which still fires at
+                    // most once per session, on the same evidence as before:
+                    // no playable segment AND output stopped advancing.
+                    let mut announced_slow = false;
+                    loop {
+                        if session.failed.load(Relaxed) {
+                            return;
                         }
-                    );
-                    session.kill_child().await;
-                    clear_session_dir(&dir).await;
-                    if !downgrade_pipeline {
-                        // The slot belonged to the encoder that just died, not
-                        // to the session: hand it back at the transition so
-                        // the next hardware start gets it now, and re-class
-                        // the admission record for the software encoder that
-                        // is about to be measured.
-                        session.demote_to_software(Workload::of(&file, session.target_height));
-                    }
-                    let sw_args = transcode::hls_args(
-                        &file,
-                        retry_encoder,
-                        &retry_opts,
-                        pacing,
-                        &dir.to_string_lossy(),
-                    );
-                    // The replacement writes its own timeline from the same
-                    // seek point; keeping the dead process's telemetry would
-                    // make it look stalled from its first second, and the
-                    // generation bump is what stops the dead process's reader
-                    // from writing those numbers back after the reset.
-                    let generation = session.progress.begin_attempt();
-                    match spawn_ffmpeg(
-                        &sw_args,
-                        retry_encoder.label(),
-                        &sid,
-                        Arc::clone(&session.progress),
-                        generation,
-                    ) {
-                        Ok(child) => {
-                            *session.child.lock().await = Some(child);
-                            *session.last_access.lock().await = Instant::now();
-                            // The activity page must stop naming the hardware
-                            // encoder the moment it is no longer the one running.
-                            *session.encoder_label.lock().await = retry_encoder.label();
+                        if session_producing(&dir).await {
+                            // Producing real segments. If the picture is still
+                            // gray, the problem is the *output* (tone-map/
+                            // color), not the pipeline stalling — this line
+                            // says which. The speed says how much headroom it
+                            // has while doing it.
                             tracing::info!(
                                 session = %sid,
-                                encoder = retry_encoder.label(),
-                                pipeline = retry_opts.pipeline.name(),
-                                "fallback transcode started"
+                                speed = session.progress.speed(),
+                                "transcode producing segments (hardware path healthy)"
                             );
+                            break;
                         }
-                        Err(e) => {
-                            tracing::error!(session = %sid, "fallback transcode failed: {e}");
-                            session.failed.store(true, Relaxed);
+                        let exited = {
+                            let mut child = session.child.lock().await;
+                            child
+                                .as_mut()
+                                .is_some_and(|c| matches!(c.try_wait(), Ok(Some(_))))
+                        };
+                        if exited {
+                            // Died before producing: the playlist and segment
+                            // readers report that; there is nothing left here
+                            // to downgrade.
+                            return;
+                        }
+                        // Producing nothing, but *is* it stuck? A session
+                        // stopped for running ahead obviously makes no
+                        // progress, and one decoding 4K at 0.4x is slow rather
+                        // than broken — restarting either on software trades a
+                        // slow start for a slower one. Only a session whose
+                        // output has actually stopped moving gets the
+                        // fallback; the rest keep being watched rather than
+                        // walked away from.
+                        let suspended = session.suspended.load(Relaxed);
+                        if suspended || session.progress.stalled_for() < PROGRESS_STALL {
+                            if !suspended && !announced_slow {
+                                announced_slow = true;
+                                tracing::info!(
+                                    session = %sid,
+                                    produced_ms = session.progress.out_time_ms(),
+                                    speed = session.progress.speed(),
+                                    "no finished segment yet, but the encoder is still \
+                                     advancing — watching it rather than restarting it on \
+                                     something slower"
+                                );
+                            }
+                            tokio::time::sleep(WATCHDOG_POLL).await;
+                            continue;
+                        }
+                        break;
+                    }
+                    // Fell out of the loop two ways: producing (nothing to
+                    // fix — skip straight to the lifetime watchdog), or
+                    // stalled without a segment (downgrade one step).
+                    if !session_producing(&dir).await {
+                        Self::downgrade_one_step(
+                            &session, &file, &opts, encoder, pacing, &dir, &sid,
+                        )
+                        .await;
+                        if session.failed.load(Relaxed) {
                             return;
                         }
                     }
@@ -2648,6 +2671,106 @@ impl TranscodeManager {
             encoder: encoder.label(),
             vod: false,
         })
+    }
+
+    /// Downgrade a stalled hardware start by ONE step, taking the cheaper
+    /// step first.
+    ///
+    /// A session running a GPU tone-map graph that stopped producing is
+    /// evidence about the graph — a driver state the boot probe couldn't
+    /// reach, a codec profile its fixture didn't cover, another session
+    /// contending for the same block. None of that is evidence about the
+    /// *encoder*, and swapping to software would trade a stalled hardware
+    /// session for one that is slower still. So the graph goes and the
+    /// hardware stays; only a session already on the CPU chain falls back to
+    /// a software encoder.
+    ///
+    /// One step per session, deliberately: this fires once, and a viewer who
+    /// has waited out the grace window twice has waited too long. If the
+    /// downgraded session also stalls, the lifetime watchdog takes it. On a
+    /// spawn failure the session is marked failed; the caller checks.
+    async fn downgrade_one_step(
+        session: &Session,
+        file: &plurx_core::domain::MediaFile,
+        opts: &TranscodeOptions,
+        encoder: Encoder,
+        pacing: Pacing,
+        dir: &std::path::Path,
+        sid: &str,
+    ) {
+        let downgrade_pipeline = opts.pipeline.on_gpu();
+        let retry_encoder = if downgrade_pipeline {
+            encoder
+        } else {
+            Encoder::Software
+        };
+        let mut retry_opts = opts.clone();
+        if downgrade_pipeline {
+            retry_opts.pipeline = opts.pipeline.fallback().unwrap_or(Pipeline::Cpu);
+        }
+        tracing::warn!(
+            session = %sid,
+            stalled_s = session.progress.stalled_for().as_secs(),
+            pipeline = opts.pipeline.name(),
+            retry_pipeline = retry_opts.pipeline.name(),
+            retry_encoder = retry_encoder.label(),
+            "no HLS segment from hardware and output has stopped \
+             advancing (GPU contention, or a decode the GPU can't do — e.g. \
+             Dolby Vision); {}",
+            if downgrade_pipeline {
+                "dropping the GPU tone-map and keeping the hardware encoder"
+            } else {
+                "retrying on software"
+            }
+        );
+        session.kill_child().await;
+        clear_session_dir(dir).await;
+        if !downgrade_pipeline {
+            // The slot belonged to the encoder that just died, not
+            // to the session: hand it back at the transition so
+            // the next hardware start gets it now, and re-class
+            // the admission record for the software encoder that
+            // is about to be measured.
+            session.demote_to_software(Workload::of(file, session.target_height));
+        }
+        let sw_args = transcode::hls_args(
+            file,
+            retry_encoder,
+            &retry_opts,
+            pacing,
+            &dir.to_string_lossy(),
+        );
+        // The replacement writes its own timeline from the same
+        // seek point; keeping the dead process's telemetry would
+        // make it look stalled from its first second, and the
+        // generation bump is what stops the dead process's reader
+        // from writing those numbers back after the reset.
+        let generation = session.progress.begin_attempt();
+        match spawn_ffmpeg(
+            &sw_args,
+            retry_encoder.label(),
+            sid,
+            Arc::clone(&session.progress),
+            generation,
+        ) {
+            Ok(child) => {
+                *session.child.lock().await = Some(child);
+                *session.last_access.lock().await = Instant::now();
+                // The activity page must stop naming the hardware
+                // encoder the moment it is no longer the one running.
+                *session.encoder_label.lock().await = retry_encoder.label();
+                tracing::info!(
+                    session = %sid,
+                    encoder = retry_encoder.label(),
+                    pipeline = retry_opts.pipeline.name(),
+                    "fallback transcode started"
+                );
+            }
+            Err(e) => {
+                tracing::error!(session = %sid, "fallback transcode failed: {e}");
+                session.failed.store(true, Relaxed);
+            }
+        }
     }
 
     /// Start a **copy-video** HLS session: the source video is repackaged into
@@ -3145,6 +3268,13 @@ impl TranscodeManager {
         };
         if !sent {
             return;
+        }
+        if !want_suspend {
+            // Before the flag flips, so the watchdog can never observe
+            // "running" beside a motion clock that still spans the suspension
+            // — that read would fail a healthy session at the moment of its
+            // resume, before ffmpeg has emitted a single post-SIGCONT block.
+            session.progress.touch();
         }
         session.suspended.store(want_suspend, Relaxed);
         if want_suspend {
@@ -4247,6 +4377,250 @@ mod tests {
             other => panic!("the freed slot must be grantable now, got {other:?}"),
         }
         assert!(mgr.stop_session(&info.session_id, "test").await);
+    }
+
+    // ---- the lifetime watchdog (review §2.3) --------------------------------
+
+    /// Every state that is not a stall, and the one that is. Each `Wait` here
+    /// is a healthy session the wrong verdict would kill mid-film.
+    #[test]
+    fn a_stall_is_the_only_thing_the_watchdog_calls_a_stall() {
+        let long = PROGRESS_STALL + Duration::from_secs(1);
+        let short = PROGRESS_STALL - Duration::from_secs(1);
+        // Failed elsewhere, or exited (EOF and kills both have their own
+        // reporters): the watch simply ends, whatever the clock says.
+        assert_eq!(watch_next(true, false, false, long), WatchNext::Done);
+        assert_eq!(watch_next(false, true, false, long), WatchNext::Done);
+        // Suspended: motionless on purpose, however long it lasts.
+        assert_eq!(watch_next(false, false, true, long), WatchNext::Wait);
+        // Moving recently enough.
+        assert_eq!(watch_next(false, false, false, short), WatchNext::Wait);
+        // Running, unsuspended, and the output has sat still too long.
+        assert_eq!(watch_next(false, false, false, long), WatchNext::Stall);
+    }
+
+    /// `moved_at_ms` freezes with the SIGSTOP — correctly — so without a
+    /// resume re-baseline, the first check after SIGCONT reads the whole
+    /// suspension as a stall and kills a session that was healthy on both
+    /// sides of it.
+    #[test]
+    fn resume_restarts_the_motion_clock() {
+        let p = Progress::new();
+        p.begin_attempt();
+        // A long-suspended session: last movement far in the past.
+        p.moved_at_ms.store(
+            p.started.elapsed().as_millis() as i64 - 10 * PROGRESS_STALL.as_millis() as i64,
+            Relaxed,
+        );
+        assert!(
+            p.stalled_for() >= PROGRESS_STALL,
+            "the setup must look stalled"
+        );
+        p.touch();
+        assert!(
+            p.stalled_for() < PROGRESS_STALL,
+            "after resume the clock counts from the resume, not the suspension"
+        );
+    }
+
+    /// A session for driving `watch_for_stall` directly: a real (harmless)
+    /// child process, a directory the test controls, and telemetry the test
+    /// can backdate.
+    fn watchdog_session(dir: &std::path::Path, child: Option<Child>, cached: bool) -> Arc<Session> {
+        Arc::new(Session {
+            dir: dir.to_path_buf(),
+            child: Mutex::new(child),
+            cached,
+            last_access: Mutex::new(Instant::now()),
+            file_id: 1,
+            item_id: 1,
+            item_title: "Watchdog Fixture".into(),
+            user_name: "paul".into(),
+            playback_id: "pb-watchdog".into(),
+            start_seconds: 0.0,
+            target_height: 1080,
+            encoder_label: Mutex::new("test"),
+            started_unix: 0,
+            failed: AtomicBool::new(false),
+            high_segment: AtomicI64::new(-1),
+            fetched_end_ms: AtomicI64::new(0),
+            segments: Mutex::new(SegmentIndex::default()),
+            ahead_bytes: AtomicI64::new(0),
+            progress: Arc::new(Progress::new()),
+            class: std::sync::Mutex::new(String::new()),
+            hw_slot: std::sync::Mutex::new(None),
+            delivery: Meter::new(),
+            suspended: AtomicBool::new(false),
+        })
+    }
+
+    /// A process that outlives the test unless the watchdog kills it.
+    fn long_running_child() -> Child {
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("60").kill_on_drop(true);
+        cmd.spawn().expect("spawn sleep")
+    }
+
+    /// Backdate the motion clock so `stalled_for` reads past the threshold
+    /// without the test waiting it out.
+    fn force_stalled(p: &Progress) {
+        p.moved_at_ms.store(
+            p.started.elapsed().as_millis() as i64 - 2 * PROGRESS_STALL.as_millis() as i64,
+            Relaxed,
+        );
+    }
+
+    /// Drive virtual time in poll-sized hops until the watchdog settles.
+    ///
+    /// Hop-sized on purpose: under a paused clock, auto-advance jumps to the
+    /// *nearest* pending timer whenever every task is off doing file I/O — so
+    /// a single distant `timeout` wrapped around the watchdog is a deadline
+    /// the clock can leap straight to while the watchdog sits in a playlist
+    /// read. Small hops leave it nothing to leap past. Bounded, so a watchdog
+    /// that never reaches a verdict fails the test instead of hanging it.
+    async fn settle(handle: tokio::task::JoinHandle<()>) {
+        for _ in 0..1_000 {
+            if handle.is_finished() {
+                handle.await.expect("watchdog task");
+                return;
+            }
+            tokio::time::sleep(WATCHDOG_POLL).await;
+        }
+        panic!("the watchdog did not settle inside the bounded window");
+    }
+
+    /// THE §2.3 regression: the watchdog used to return at the first playable
+    /// segment, so a pipeline that wedged after producing was nobody's
+    /// problem — the client drained its buffer into a hang. Virtual time; the
+    /// only real thing here is the child process the verdict must kill.
+    #[tokio::test(start_paused = true)]
+    async fn the_watchdog_outlives_the_first_segment() {
+        let dir = tempfile::tempdir().expect("dir");
+        // The playlist lists a finished segment: the session HAS produced.
+        tokio::fs::write(
+            dir.path().join("index.m3u8"),
+            "#EXTM3U\n#EXTINF:2.0,\nseg00000.ts\n",
+        )
+        .await
+        .expect("playlist");
+        let session = watchdog_session(dir.path(), Some(long_running_child()), false);
+        force_stalled(&session.progress);
+
+        settle(tokio::spawn(watch_for_stall(
+            Arc::clone(&session),
+            dir.path().to_path_buf(),
+            "wd".into(),
+        )))
+        .await;
+
+        assert!(
+            session.failed.load(Relaxed),
+            "a mid-stream wedge must fail the session even though a segment was published"
+        );
+        let killed = session
+            .child
+            .lock()
+            .await
+            .as_mut()
+            .is_some_and(|c| matches!(c.try_wait(), Ok(Some(_))));
+        assert!(killed, "and the wedged process must be gone");
+    }
+
+    /// Flow control SIGSTOPs a session that has run far enough ahead; that is
+    /// health, not a stall — for as long as it lasts. And the resume path
+    /// re-baselines the clock, so the suspension itself can never be read
+    /// back as one.
+    #[tokio::test(start_paused = true)]
+    async fn a_suspended_session_is_never_judged() {
+        let dir = tempfile::tempdir().expect("dir");
+        tokio::fs::write(
+            dir.path().join("index.m3u8"),
+            "#EXTM3U\n#EXTINF:2.0,\nseg00000.ts\n",
+        )
+        .await
+        .expect("playlist");
+        let session = watchdog_session(dir.path(), Some(long_running_child()), false);
+        session.suspended.store(true, Relaxed);
+        force_stalled(&session.progress);
+
+        let watchdog = tokio::spawn(watch_for_stall(
+            Arc::clone(&session),
+            dir.path().to_path_buf(),
+            "wd".into(),
+        ));
+        // Long enough (in virtual time) for many verdicts, were one coming.
+        tokio::time::sleep(SOFTWARE_GRACE + 20 * WATCHDOG_POLL).await;
+        assert!(
+            !session.failed.load(Relaxed),
+            "a suspended session is motionless on purpose"
+        );
+
+        // Resume, the way `apply_ahead_window` does: clock first, flag second.
+        session.progress.touch();
+        session.suspended.store(false, Relaxed);
+        tokio::time::sleep(WATCHDOG_POLL).await;
+        assert!(
+            !session.failed.load(Relaxed),
+            "the suspension must not be read back as a stall at resume"
+        );
+
+        // Now a real wedge: running, unsuspended, output sits still.
+        force_stalled(&session.progress);
+        settle(watchdog).await;
+        assert!(
+            session.failed.load(Relaxed),
+            "a wedge after the resume is still caught"
+        );
+    }
+
+    /// EOF is success: the encoder finishing the film exits, and the watch
+    /// ends without a verdict — nothing here may mark that session failed.
+    #[tokio::test(start_paused = true)]
+    async fn an_exited_encoder_ends_the_watch_without_a_verdict() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut child = tokio::process::Command::new("true")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn true");
+        // Already exited before the watch begins — the deterministic version
+        // of "the encoder reached EOF". (tokio caches the status, so the
+        // watchdog's `try_wait` sees it.)
+        child.wait().await.expect("exit");
+        let session = watchdog_session(dir.path(), Some(child), false);
+        // Backdated clock: if the exit check did not come first, this would
+        // read as a stall — the assertion below is what makes EOF win.
+        force_stalled(&session.progress);
+
+        settle(tokio::spawn(watch_for_stall(
+            Arc::clone(&session),
+            dir.path().to_path_buf(),
+            "wd".into(),
+        )))
+        .await;
+        assert!(
+            !session.failed.load(Relaxed),
+            "an exit is EOF or a kill; both already have owners reporting them"
+        );
+    }
+
+    /// A cached session has no process; every stall question about it is
+    /// about nothing, and `failed` on it would poison a finished asset other
+    /// viewers want.
+    #[tokio::test(start_paused = true)]
+    async fn a_cached_session_is_not_watched() {
+        let dir = tempfile::tempdir().expect("dir");
+        let session = watchdog_session(dir.path(), None, true);
+        force_stalled(&session.progress);
+        settle(tokio::spawn(watch_for_stall(
+            Arc::clone(&session),
+            dir.path().to_path_buf(),
+            "wd".into(),
+        )))
+        .await;
+        assert!(
+            !session.failed.load(Relaxed),
+            "nothing to watch, no verdict"
+        );
     }
 
     // ---- the pre-transcode cache, serving side (PERF-PLAN §6.3) -------------
