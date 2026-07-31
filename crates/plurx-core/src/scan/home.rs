@@ -227,14 +227,28 @@ pub fn date_from_unix(secs: i64) -> String {
 /// the file itself. `None` when the path is under no configured root.
 fn relative_dirs(library: &Library, path: &Path) -> Option<Vec<String>> {
     let parent = path.parent()?;
-    let root = library
+    // Match against the resolved root as well as the configured one. The
+    // TARGETED scan canonicalizes the file path on purpose (see `scan_path` —
+    // it is what stops `root/../../etc` escaping the library), while the full
+    // scan walks from `library.paths` and hands us the configured spelling. A
+    // root reached through a symlink therefore matched its own files on a full
+    // scan and none of them on a targeted one, so monarr's import placed
+    // nothing and said it succeeded.
+    let rest: PathBuf = library
         .paths
         .iter()
-        // Longest root first: nested roots would otherwise mirror the deeper
-        // one's folders under the shallower one.
-        .filter(|root| parent.starts_with(root))
-        .max_by_key(|root| root.as_os_str().len())?;
-    let rest: PathBuf = parent.strip_prefix(root).ok()?.to_path_buf();
+        .filter_map(|root| {
+            let resolved = root.canonicalize().unwrap_or_else(|_| root.clone());
+            let rel = parent
+                .strip_prefix(&resolved)
+                .or_else(|_| parent.strip_prefix(root))
+                .ok()?;
+            // Longest root first: nested roots would otherwise mirror the
+            // deeper one's folders under the shallower one.
+            Some((resolved.as_os_str().len(), rel.to_path_buf()))
+        })
+        .max_by_key(|(len, _)| *len)
+        .map(|(_, rel)| rel)?;
     Some(
         rest.components()
             .filter_map(|c| match c {
@@ -275,6 +289,53 @@ async fn find_or_create_folder(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use crate::scan::LibraryKind;
+
+    /// A library root reached through a symlink must place its files. The
+    /// targeted scan canonicalizes the file path and the full scan does not,
+    /// so before this was fixed the same file placed on one and vanished on
+    /// the other — "the same file behaves differently depending on who
+    /// asked", which `record_candidates` exists to prevent.
+    #[cfg(unix)]
+    #[test]
+    fn a_root_reached_through_a_symlink_still_places_its_files() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(real.join("Holiday")).expect("mkdir");
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        // Configured through the symlink, walked as the real path — exactly
+        // what a targeted scan hands us.
+        let library = Library {
+            id: 1,
+            name: "Home".into(),
+            kind: LibraryKind::Home,
+            paths: vec![link.clone()],
+            anime: false,
+            created_at: 0,
+            scan_interval_mins: 0,
+            refresh_interval_mins: 0,
+            last_scan_at: None,
+            last_refresh_at: None,
+        };
+        let canonical = real
+            .canonicalize()
+            .expect("canonical")
+            .join("Holiday/clip.mp4");
+        assert_eq!(
+            relative_dirs(&library, &canonical),
+            Some(vec!["Holiday".to_string()]),
+            "a canonicalized file under a symlinked root must still resolve"
+        );
+
+        // The configured spelling keeps working — the full scan's shape.
+        assert_eq!(
+            relative_dirs(&library, &link.join("Holiday/clip.mp4")),
+            Some(vec!["Holiday".to_string()]),
+        );
+    }
 
     #[test]
     fn photo_extensions_are_case_insensitive() {

@@ -1015,7 +1015,12 @@ mod tests {
         // Content is irrelevant — probe will fail gracefully and the scanner
         // still records the file and builds the hierarchy.
         std::fs::write(&path, b"not really video").expect("write");
-        path
+        // Return what the SCANNER will report, not what we happened to join.
+        // scan_path canonicalizes on purpose (see the roots-escape test), and
+        // on macOS TMPDIR is `/var/folders/...` — a symlink to
+        // `/private/var/folders/...`. Without this, every path assertion here
+        // passes on Linux and fails on a Mac.
+        path.canonicalize().expect("canonicalize")
     }
 
     // ---- targeted scan (integration plan P2) ---------------------------
