@@ -43,6 +43,7 @@ final class AppModel: ObservableObject {
 
     private let settings = SettingsStore()
     private var api: PlurxAPI?
+    private var homeLoadTask: Task<Void, Never>?
 
     init() {
         discovery = ServerDiscovery()
@@ -145,6 +146,25 @@ final class AppModel: ObservableObject {
     }
 
     func loadHome() async {
+        // `.refreshable` belongs to a view task that SwiftUI may cancel while
+        // reconstructing the iPad tab/sidebar hierarchy. Run one shared,
+        // unstructured refresh so that lifecycle churn cannot cancel the
+        // underlying requests, and coalesce overlapping launch/manual loads.
+        if let homeLoadTask {
+            await homeLoadTask.value
+            return
+        }
+
+        let task = Task<Void, Never> { [weak self] in
+            guard let self else { return }
+            await self.performHomeLoad()
+        }
+        homeLoadTask = task
+        await task.value
+        homeLoadTask = nil
+    }
+
+    private func performHomeLoad() async {
         homeLoading = true
         homeError = nil
         do {
@@ -173,9 +193,28 @@ final class AppModel: ObservableObject {
             }
             libraryPreviews = previews
         } catch {
-            homeError = (error as? LocalizedError)?.errorDescription ?? "Failed to load"
+            homeError = Self.homeErrorMessage(for: error, hasCachedContent: hasHomeContent)
             homeLoading = false
         }
+    }
+
+    private var hasHomeContent: Bool {
+        !libraries.isEmpty
+            || !(hubs.continueWatching ?? []).isEmpty
+            || !(hubs.nextUp ?? []).isEmpty
+            || !(hubs.recentlyAdded ?? []).isEmpty
+            || !comingSoon.isEmpty
+    }
+
+    /// A cancelled refresh should leave the last good Home screen in place.
+    /// The same applies to a transient refresh failure when cached content is
+    /// available; a fatal empty-state message is reserved for initial loads
+    /// that have never produced anything useful.
+    nonisolated static func homeErrorMessage(for error: Error, hasCachedContent: Bool) -> String? {
+        if error is CancellationError { return nil }
+        if let urlError = error as? URLError, urlError.code == .cancelled { return nil }
+        guard !hasCachedContent else { return nil }
+        return (error as? LocalizedError)?.errorDescription ?? "Failed to load"
     }
 
     func logout() {

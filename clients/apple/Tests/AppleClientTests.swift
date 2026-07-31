@@ -139,4 +139,21 @@ final class AppleClientTests: XCTestCase {
         XCTAssertLessThan(PosterSize.medium.posterWidth, PosterSize.large.posterWidth)
         XCTAssertLessThan(PosterSize.large.posterWidth, PosterSize.extraLarge.posterWidth)
     }
+
+    func testCancelledURLRequestRemainsCancellationInsteadOfConnectionFailure() {
+        let mapped = PlurxAPI.transportError(from: URLError(.cancelled))
+
+        XCTAssertTrue(mapped is CancellationError)
+        XCTAssertNil(AppModel.homeErrorMessage(for: mapped, hasCachedContent: false))
+    }
+
+    func testTransientRefreshFailureKeepsCachedHomeContentVisible() {
+        let failure = APIError.transport("The request timed out.")
+
+        XCTAssertNil(AppModel.homeErrorMessage(for: failure, hasCachedContent: true))
+        XCTAssertEqual(
+            AppModel.homeErrorMessage(for: failure, hasCachedContent: false),
+            "The request timed out."
+        )
+    }
 }

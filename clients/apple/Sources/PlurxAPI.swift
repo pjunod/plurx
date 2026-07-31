@@ -90,9 +90,22 @@ struct PlurxAPI {
         let data: Data
         let resp: URLResponse
         do { (data, resp) = try await session.data(for: req) }
-        catch { throw APIError.transport(error.localizedDescription) }
+        catch { throw Self.transportError(from: error) }
         try Self.check(resp)
         return try Self.decoder.decode(T.self, from: data)
+    }
+
+    /// Cancellation is control flow, not a server failure. Keeping it typed
+    /// lets view models distinguish SwiftUI replacing a task from the server
+    /// actually becoming unreachable. URLSession reports cancellation as
+    /// either Swift's CancellationError or NSURLErrorCancelled depending on
+    /// which layer observes it first.
+    static func transportError(from error: Error) -> Error {
+        if error is CancellationError { return CancellationError() }
+        if let urlError = error as? URLError, urlError.code == .cancelled {
+            return CancellationError()
+        }
+        return APIError.transport(error.localizedDescription)
     }
 
     private static func check(_ resp: URLResponse) throws {
