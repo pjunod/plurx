@@ -2745,13 +2745,31 @@ function transcodeHeight(){ const q=playQuality(); return (q==="1080"||q==="720"
 // 20 Mb/s is *less* than the 57 Mb/s remux it replaces, while on a genuine
 // transcode it would be 2.5× the rung Auto chose.
 //
+// A REFUSED original is that same promise again, and it was the case still
+// getting downscaled. When the browser rejects a remux outright the client
+// rescues it into a transcode — and that rescue was taking Auto's rung, so a
+// 4K disc remux Chrome would not accept came back at 1080p with the overlay
+// cheerfully reporting a remux verdict beside a 1080p picture. But the
+// refusal is a statement about a CONTAINER or a codec (here: an fMP4 whose
+// segments Chrome's demuxer will not parse), never about how many pixels the
+// machine can push — and the server had already judged this client able to
+// take the source. So the rescue adds the encode it must and keeps the
+// resolution it was promised. Bandwidth agrees here too, and by more: 20 Mb/s
+// of 4K rung against the 68 Mb/s remux it stands in for.
+//
+// Only that refusal. `maybeDecodeRescue` also lands in the same fallback, and
+// it means the opposite thing — a machine that measured itself short of
+// decode headroom — so it keeps the Auto cap, which is the entire point of
+// rescuing it.
+//
 // The server still clamps ([144, 2160]) and never upscales; an unprobed
 // source has no height to promise, so it stays the server's choice.
 function sessionHeight(){
   const h=PLAYER&&PLAYER.source&&PLAYER.source.height;
   if(!(h>0)) return null;
   if(qualityForce()==="original") return h;
-  if(qualityForce()==="auto" && PLAYER.burnedSub!=null && PLAYER.decidedMethod!=='transcode') return h;
+  if(qualityForce()==="auto" && PLAYER.decidedMethod!=='transcode'
+     && (PLAYER.burnedSub!=null || PLAYER.refusedOriginal)) return h;
   return null;
 }
 function qualityLabel(){ const q=playQuality(); const f=QUALITIES.find(x=>x[0]===q); return f?f[1]:"Auto"; }
@@ -2822,6 +2840,7 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
     curAudio:(decision.audio||[]).findIndex(a=>a.default), curSub:-1,
     markers:(decision.markers||[]).map(m=>({...m})), source:src, started:false,
     idleTimer:null, autoskip:autoskipOn(), stallTimer:null, probeUrl:null, triedFallback:false,
+    refusedOriginal:false,
     aoffset:decision.audio_offset_ms||0, declared:decision.declared_offset_ms||0,
     reasons:(decision.reasons||[]), title, meta:meta||null, decodeRescued:false,
     transcodeAudio:!!decision.transcode_audio, copyHls:false,
@@ -3678,6 +3697,12 @@ async function startTranscodeFallback(reason, note){
   // an identity check still passed and both streams attached.
   const {me, live}=streamGeneration();
   newAttempt(reason||"fallback");
+  // Before the session is opened, because `transcodeOpts` reads it: a stream
+  // the browser refused is not a stream it lacked the pixels for, so the
+  // replacement keeps the source's resolution (see sessionHeight). Set only
+  // for that reason — the decode rescue and the manual Force-transcode button
+  // both arrive here meaning something else entirely.
+  if(reason==="stream-rejected") me.refusedOriginal=true;
   teardownHls();
   let info; try{ info=await openSession(me.fileId,transcodeOpts(startSec));}catch(e){ if(live()){ setLoading(false); toast(e.message); } return; }
   if(!live()) return;   // closed the player, or seeked / switched audio meanwhile
