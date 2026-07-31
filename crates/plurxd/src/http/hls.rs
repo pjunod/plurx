@@ -50,6 +50,10 @@ pub struct StartResponse {
     /// The player treats it like direct play: seek by `currentTime`, and don't
     /// arm the stall watchdog's restart — see `StartInfo::vod`.
     pub vod: bool,
+    /// The quality ladder for this source, top rung first — the rungs the
+    /// menu and the Auto controller move between, so the client never
+    /// hardcodes them (ADAPTIVE-QUALITY.md Phase 1).
+    pub ladder: Vec<crate::transcode::Rung>,
 }
 
 /// Everything a client must say to open a stream.
@@ -84,23 +88,19 @@ pub struct CreateSession {
 }
 
 impl CreateSession {
-    /// `auto_height` is resolved by the caller and passed in, because it needs
-    /// the store and the encoder choice — and because it must be settled
-    /// before the request is fingerprinted, or two identical Auto requests
-    /// could not recognise each other.
-    fn into_request(self, file_id: i64, auto_height: i64) -> crate::transcode::SessionRequest {
+    /// `height` is fully resolved by the caller — Auto answered, explicit
+    /// rungs snapped, the source-height promise honored — because resolution
+    /// needs the store and the encoder choice, and because it must be settled
+    /// before the request is fingerprinted, or two identical requests could
+    /// not recognise each other.
+    fn into_request(self, file_id: i64, height: i64) -> crate::transcode::SessionRequest {
         use crate::transcode::SessionKind;
         let kind = if self.copy == Some(true) {
             SessionKind::Copy {
                 aac: self.aac == Some(true),
             }
         } else {
-            SessionKind::Transcode {
-                height: self
-                    .height
-                    .unwrap_or(auto_height)
-                    .clamp(crate::transcode::MIN_HEIGHT, crate::transcode::MAX_HEIGHT),
-            }
+            SessionKind::Transcode { height }
         };
         crate::transcode::SessionRequest {
             file_id,
@@ -125,15 +125,24 @@ pub async fn create(
     if req.playback_id.trim().is_empty() {
         return Err(ApiError::BadRequest("playback_id is required".into()));
     }
-    // Only pay for the lookup when Auto is actually in play — an explicit rung
-    // from the quality menu needs nothing from the file.
-    let auto_height = if req.height.is_none() && req.copy != Some(true) {
-        let source = state.store.get_file(id).await?.and_then(|f| f.height);
-        state.transcode.auto_height(source).await
-    } else {
-        0
-    };
-    let request = req.into_request(id, auto_height);
+    // The source height answers three things now: Auto, the ladder in the
+    // response, and the snap's source-height escape. One read, from the read
+    // pool.
+    let source_height = state.store.get_file(id).await?.and_then(|f| f.height);
+    let height = match req.height {
+        // Auto: the server's own choice already lands where it means to —
+        // snapping it would re-decide policy (a 900p source deliberately
+        // transcodes at 900: no scaler in the chain at all).
+        None => state.transcode.auto_height(source_height).await,
+        // The source's own height is the Original/forced-burn promise
+        // (see the player's sessionHeight): never snapped, never downgraded.
+        Some(h) if Some(h) == source_height => h,
+        // An explicit rung from a menu: snap strays onto the ladder;
+        // above-ladder heights pass through as what they are.
+        Some(h) => crate::transcode::snap_height(h),
+    }
+    .clamp(crate::transcode::MIN_HEIGHT, crate::transcode::MAX_HEIGHT);
+    let request = req.into_request(id, height);
     // A session being created is playback beginning — the honest moment for
     // the scrobble that used to fire from `/decision`.
     crate::playstart::note_playback_started(&state, user.id, id);
@@ -147,6 +156,7 @@ pub async fn create(
             if e.contains("already used") {
                 ApiError::Conflict(e)
             } else {
+                tracing::warn!(file = id, "session create failed: {e}");
                 ApiError::Internal(e)
             }
         })?;
@@ -157,6 +167,7 @@ pub async fn create(
         start_seconds: info.start_seconds,
         encoder: info.encoder.to_owned(),
         vod: info.vod,
+        ladder: crate::transcode::ladder(source_height),
     }))
 }
 

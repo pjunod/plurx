@@ -3768,6 +3768,70 @@ fn bitrate_for_height(height: i64) -> u32 {
     }
 }
 
+/// The quality ladder's rungs, bottom to top (ADAPTIVE-QUALITY.md).
+///
+/// 4K output rungs are deliberately absent: a client that can take 20 Mb/s
+/// sustained is better served by direct play or remux, and a 4K→4K
+/// transcode burns GPU for nothing. Heights ABOVE the ladder still exist as
+/// explicit requests — Original with a forced burn carries the source's own
+/// height, a promise nothing here may downgrade.
+pub const LADDER_HEIGHTS: [i64; 4] = [360, 480, 720, 1080];
+
+/// One advertised rung of the ladder.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+pub struct Rung {
+    pub height: i64,
+    /// The rung's nominal cost on the wire: video target + audio, in kb/s.
+    /// This is the number an adaptation controller compares its estimate to
+    /// (its thresholds carry their own headroom factors).
+    pub total_kbps: u32,
+    /// What the rung may PEAK at over the rate-control window: `-maxrate`
+    /// (1.5× the target, PERF-PLAN §4.6) + audio. The number that must
+    /// cover the measured burst — nynuc measured 9.05 Mb/s on the 1080
+    /// rung's 8 Mb/s target — and the one an HLS `BANDWIDTH` attribute
+    /// would be required to state.
+    pub peak_kbps: u32,
+}
+
+/// The ladder as advertised to a client, top rung first, filtered to what
+/// the source can actually feed: rungs above the source height are dropped
+/// (a 720p file offers 720p and below — never an upscale), and an unprobed
+/// source offers the whole ladder because there is nothing to filter by.
+pub fn ladder(source_height: Option<i64>) -> Vec<Rung> {
+    LADDER_HEIGHTS
+        .iter()
+        .rev()
+        .filter(|h| source_height.filter(|s| *s > 0).is_none_or(|s| **h <= s))
+        .map(|&height| {
+            let video = bitrate_for_height(height);
+            Rung {
+                height,
+                total_kbps: video + plurx_core::transcode::AUDIO_BITRATE_KBPS_DEFAULT,
+                peak_kbps: video * 3 / 2 + plurx_core::transcode::AUDIO_BITRATE_KBPS_DEFAULT,
+            }
+        })
+        .collect()
+}
+
+/// Snap an explicitly requested height onto the ladder: nearest rung, ties
+/// DOWN (bandwidth is the scarce thing). Two escapes, both deliberate.
+/// Heights above the top rung pass through untouched — they are
+/// Original-class requests (a forced-subtitle burn under Original carries a
+/// 4K source's own 2160), not strays. And the caller must not snap a
+/// request for the source's own height for the same reason; that exception
+/// needs the file and so lives at the call site.
+pub fn snap_height(height: i64) -> i64 {
+    let top = LADDER_HEIGHTS[LADDER_HEIGHTS.len() - 1];
+    if height > top {
+        return height;
+    }
+    LADDER_HEIGHTS
+        .iter()
+        .copied()
+        .min_by_key(|rung| ((rung - height).abs(), *rung))
+        .unwrap_or(top)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3792,6 +3856,64 @@ mod tests {
         assert_eq!(bitrate_for_height(1080), 8_000);
         assert_eq!(bitrate_for_height(720), 4_000);
         assert_eq!(bitrate_for_height(240), 1_200);
+    }
+
+    /// The snap normalises menu strays onto the ladder — nearest rung, ties
+    /// DOWN, because bandwidth is the scarce thing — and refuses to touch
+    /// what is not a stray: anything above the ladder is an Original-class
+    /// request carrying a source's own height.
+    #[test]
+    fn stray_heights_snap_to_the_ladder_and_promises_pass_through() {
+        assert_eq!(snap_height(1080), 1080, "a rung is already home");
+        assert_eq!(snap_height(540), 480, "nearest");
+        assert_eq!(snap_height(600), 480, "equidistant resolves DOWN");
+        assert_eq!(snap_height(900), 720, "equidistant resolves DOWN");
+        assert_eq!(
+            snap_height(144),
+            360,
+            "below the ladder climbs to its floor"
+        );
+        assert_eq!(
+            snap_height(1440),
+            1440,
+            "above the ladder is a promise, not a stray"
+        );
+        assert_eq!(snap_height(2160), 2160);
+    }
+
+    /// The advertised ladder follows the source down and never offers an
+    /// upscale; its totals are the wire cost the controller reasons about,
+    /// and its peaks are what the rate-control window may actually spend.
+    #[test]
+    fn the_ladder_is_filtered_by_the_source_and_priced_both_ways() {
+        let full = ladder(Some(2160));
+        assert_eq!(
+            full.iter().map(|r| r.height).collect::<Vec<_>>(),
+            vec![1080, 720, 480, 360],
+            "top first, no 4K output rung — that is what remux is for"
+        );
+        let top = full[0];
+        assert_eq!(top.total_kbps, 8_160, "8 Mb/s video + 160 kb/s audio");
+        assert_eq!(top.peak_kbps, 12_160, "the -maxrate window bound + audio");
+
+        assert_eq!(
+            ladder(Some(720))
+                .iter()
+                .map(|r| r.height)
+                .collect::<Vec<_>>(),
+            vec![720, 480, 360],
+            "a 720p file offers 720p and below — never an upscale"
+        );
+        assert!(
+            ladder(Some(240)).is_empty(),
+            "nothing to offer below the floor"
+        );
+        assert_eq!(
+            ladder(None).len(),
+            4,
+            "an unprobed source has nothing to filter by"
+        );
+        assert_eq!(ladder(Some(0)).len(), 4, "0 is not a height");
     }
 
     /// Auto is a policy about the encoder, not about the file.

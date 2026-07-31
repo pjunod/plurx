@@ -421,13 +421,18 @@ pub struct TranscodeOptions {
     pub software_threads: Option<u32>,
 }
 
+/// The AAC bitrate every HLS transcode uses unless asked otherwise — public
+/// because the quality ladder's advertised totals must include the audio a
+/// session will actually carry, from the same constant rather than a copy.
+pub const AUDIO_BITRATE_KBPS_DEFAULT: u32 = 160;
+
 impl Default for TranscodeOptions {
     fn default() -> Self {
         TranscodeOptions {
             target_height: 1080,
             video_bitrate_kbps: 8000,
             audio_channels: 2,
-            audio_bitrate_kbps: 160,
+            audio_bitrate_kbps: AUDIO_BITRATE_KBPS_DEFAULT,
             audio_index: None,
             start_seconds: 0.0,
             tone_map: ToneMap::Zscale,

@@ -322,6 +322,11 @@ pub struct DecisionResponse {
     /// What the container itself declares (audio start − video start), when
     /// nonzero. Diagnostic only — declared offsets are already honored.
     pub declared_offset_ms: Option<i64>,
+    /// The quality ladder for this source, top rung first (ADAPTIVE-QUALITY.md
+    /// Phase 1): each rung's height, nominal wire cost, and rate-control peak,
+    /// filtered to what the source can feed — so the client's quality menu and
+    /// Auto controller stop hardcoding any of it.
+    pub ladder: Vec<crate::transcode::Rung>,
     /// Why this remux should be delivered as HLS segments rather than
     /// progressively (PERF-PLAN §4.3bis). `None` means the progressive path is
     /// fine, which is the common case.
@@ -642,6 +647,7 @@ pub async fn decision(
         markers,
         audio_offset_ms: file.audio_offset_ms,
         declared_offset_ms: declared_av_offset(&state, id).await,
+        ladder: crate::transcode::ladder(file.height),
         prefer_segmented,
     }))
 }

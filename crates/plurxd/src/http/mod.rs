@@ -2929,6 +2929,120 @@ mod tests {
         );
     }
 
+    /// ADAPTIVE-QUALITY Phase 1, the server half: the decision and the
+    /// session response both carry the source-filtered ladder, a stray
+    /// explicit height snaps onto it, and a request for the source's own
+    /// height — the Original/forced-burn promise — passes through unsnapped.
+    #[tokio::test]
+    async fn the_ladder_is_advertised_and_stray_heights_snap() {
+        crate::transcode::require_ffmpeg();
+        let (app, state) = test_state();
+        let admin = setup_admin(&app).await;
+        let s = seed_content(&state).await;
+
+        // A 900p source: not itself a rung, which is the interesting case.
+        let dir = std::env::temp_dir().join(format!("plurx-ladder-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("Odd.mkv");
+        std::fs::write(&path, b"\x00\x00\x00\x18ftypmp42 placeholder").expect("write");
+        let probe = plurx_core::domain::ProbeResult {
+            duration_ms: Some(600_000),
+            container: Some("mkv".into()),
+            video_codec: Some("h264".into()),
+            width: Some(1600),
+            height: Some(900),
+            audio_streams: vec![plurx_core::domain::AudioStream {
+                index: 0,
+                codec: "aac".into(),
+                channels: Some(2),
+                default: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let odd = state
+            .store
+            .upsert_file(s.movie, &path.to_string_lossy(), 77, 1, &probe)
+            .await
+            .expect("file");
+
+        // The decision advertises the ladder, filtered to the source: a 900p
+        // file offers 720 and below, priced both ways.
+        let (status, body) = call(
+            &app,
+            get(
+                &format!("/api/v1/files/{odd}/decision?vcodec=h264&acodec=aac&container=mp4&hdr=0"),
+                Some(&admin),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let heights: Vec<i64> = body["ladder"]
+            .as_array()
+            .expect("ladder")
+            .iter()
+            .map(|r| r["height"].as_i64().expect("height"))
+            .collect();
+        assert_eq!(
+            heights,
+            vec![720, 480, 360],
+            "source-filtered, top first: {body}"
+        );
+        assert_eq!(body["ladder"][0]["total_kbps"], 4_160, "{body}");
+        assert_eq!(body["ladder"][0]["peak_kbps"], 6_160, "{body}");
+
+        // A stray explicit height snaps onto the ladder (850 → 720)…
+        let (status, body) = call(
+            &app,
+            post(
+                &format!("/api/v1/files/{odd}/hls/sessions"),
+                Some(&admin),
+                json!({ "playback_id": "pb-snap", "height": 850 }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            body["ladder"].as_array().is_some_and(|l| !l.is_empty()),
+            "the session response carries the ladder too: {body}"
+        );
+        let sid = body["session_id"].as_str().expect("sid").to_owned();
+        let info = state
+            .transcode
+            .session_status(&sid)
+            .await
+            .expect("session status");
+        assert_eq!(info.target_height, 720, "850 is a stray; 720 is its rung");
+        // Release it before the next create: this test is about the snap,
+        // and on a 2-core runner the machine-derived CPU pool would refuse
+        // a second coexisting software session for the wrong reason.
+        assert!(state.transcode.stop_session(&sid, "test").await);
+
+        // …and the source's own height does not: that request is the
+        // Original/forced-burn promise, and snapping it to 720 would be
+        // exactly the silent downgrade the burn fix removed.
+        let (status, body) = call(
+            &app,
+            post(
+                &format!("/api/v1/files/{odd}/hls/sessions"),
+                Some(&admin),
+                json!({ "playback_id": "pb-promise", "height": 900 }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let sid = body["session_id"].as_str().expect("sid").to_owned();
+        let info = state
+            .transcode
+            .session_status(&sid)
+            .await
+            .expect("session status");
+        assert_eq!(
+            info.target_height, 900,
+            "the source's own height is a promise"
+        );
+    }
+
     #[tokio::test]
     async fn seeded_read_surface() {
         let (app, state) = test_state();
