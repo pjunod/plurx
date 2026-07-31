@@ -28,6 +28,14 @@ FROM debian:bookworm-slim
 #     PLURX_FFMPEG back to plain `ffmpeg` (older, widely-tested GPUs).
 # Startup validation test-encodes each path, so only what actually works is used.
 #
+# `apt-get clean` runs between the two ffmpeg installs, not just at the end.
+# This layer downloads two independent stacks — the distro ffmpeg and its
+# driver set (~150 MB of archives), then jellyfin-ffmpeg — and apt keeps every
+# .deb under /var/cache/apt/archives until told otherwise, so the peak is both
+# stacks' archives PLUS both unpacked. On a builder with a small disk that
+# overflows partway through with an error naming the apt cache rather than the
+# real cause. Cleaning between stages keeps the peak to one stack at a time.
+#
 # The jellyfin-ffmpeg install below is deliberately unpinned — it should track
 # the current build — but it is then ASSERTED to carry `dovi_rpu`, the
 # bitstream filter (ffmpeg 7.1+) that removes a Dolby Vision configuration
@@ -47,6 +55,7 @@ RUN sed -i 's/Components: main/Components: main non-free non-free-firmware/' \
         apt-get install -y --no-install-recommends \
             intel-media-va-driver-non-free i965-va-driver; \
     fi \
+    && apt-get clean \
     && install -d /etc/apt/keyrings \
     && curl -fsSL https://repo.jellyfin.org/jellyfin_team.gpg.key \
         | gpg --dearmor -o /etc/apt/keyrings/jellyfin.gpg \
@@ -54,6 +63,7 @@ RUN sed -i 's/Components: main/Components: main non-free non-free-firmware/' \
         > /etc/apt/sources.list.d/jellyfin.list \
     && apt-get update \
     && apt-get install -y --no-install-recommends jellyfin-ffmpeg7 \
+    && apt-get clean \
     && ( /usr/lib/jellyfin-ffmpeg/ffmpeg -hide_banner -bsfs 2>&1 | grep -qx 'dovi_rpu' \
       || ( echo "FATAL: this jellyfin-ffmpeg7 has no dovi_rpu bitstream filter." >&2; \
            echo "Got: $(/usr/lib/jellyfin-ffmpeg/ffmpeg -version 2>&1 | head -1)" >&2; \
