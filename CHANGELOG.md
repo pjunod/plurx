@@ -59,8 +59,14 @@ bump may break compatibility and a **patch** bump never does.
   silently overriding an explicit Original. Three fixes, one per lie. A
   transcode opened while Original is forced now carries the source's own
   height (the server still clamps to [144, 2160] and never upscales), so the
-  burn re-encodes at source resolution — Auto keeps its 1080p rung, which is
-  a bandwidth decision and unchanged. Turning subtitles off now goes back
+  burn re-encodes at source resolution. The same rule turned out to owe Auto
+  the same honesty: an Auto burn over a remux/direct verdict also keeps the
+  source's height, because the decision had already chosen to send this
+  client the full-resolution stream — the burn adds an encode, not a
+  downscale, and its 4K rung costs *less* bandwidth than the remux it
+  replaces. Auto's `min(source, 1080)` cap still governs burns on genuine
+  transcode verdicts, where it is the bandwidth call it was designed to be
+  (PERF-PLAN §4.7). Turning subtitles off now goes back
   through the playback decision instead of opening yet another transcode: it
   restores the remux/direct-play (and the resolution) the burn took away,
   where it used to park the viewer in a burn-less re-encode forever — with a

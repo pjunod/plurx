@@ -403,10 +403,14 @@ covering the other.
   stream as a transcode with the subtitle composited into the frames, and
   turning it off restarts again — back through the decision, so the viewer
   returns to the direct play / remux (and the resolution) the burn took away.
-  The burn's rung follows the quality menu: under **Auto** it is the server's
-  Auto height (a bandwidth call, `min(source, 1080)` on hardware), under
-  **Original** it is the source's own height — the burn is unavoidable, the
-  downscale was not. A 4K burn runs the CPU filter chain (a composite happens
+  The burn's rung may not downgrade a resolution already promised: under
+  **Original** it is the source's own height, and under **Auto** it is also
+  the source's height whenever the verdict was remux/direct — the decision had
+  already chosen to send this client the full-resolution stream, so the burn
+  adds an encode, not a downscale (and costs *less* bandwidth than the remux
+  it replaces). Only a burn on a genuine transcode verdict keeps the server's
+  Auto rung (`min(source, 1080)` on hardware), where the cap is the bandwidth
+  call it was designed to be. A 4K burn runs the CPU filter chain (a composite happens
   in system memory), so whether a given box holds realtime at 2160p is a
   measurement, not a promise. Direct/remux/copy carry text subs as selectable
   `<track>`s, which toggle for free.

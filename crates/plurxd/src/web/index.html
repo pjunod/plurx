@@ -2550,11 +2550,11 @@ function remuxUrl(base, audioIndex, startSec){
 // and that is exactly the shape of thing that survives a review.
 function transcodeOpts(startSec, audioIndex){
   const o={height:transcodeHeight(), start:startSec};
-  // No explicit rung: under Original the session still owes the viewer the
-  // source's resolution (see originalHeight). Every transcode open shares this
-  // helper precisely so the burn, the fallback, a seek and an audio switch
-  // cannot disagree about it mid-session.
-  if(o.height==null) o.height=originalHeight();
+  // No explicit rung: the session may still owe the viewer the source's
+  // resolution (see sessionHeight). Every transcode open shares this helper
+  // precisely so the burn, the fallback, a seek and an audio switch cannot
+  // disagree about it mid-session.
+  if(o.height==null) o.height=sessionHeight();
   if(audioIndex!=null) o.audio=audioIndex;
   if(PLAYER && PLAYER.burnedSub!=null) o.subtitle_burn=PLAYER.burnedSub;
   return o;
@@ -2664,19 +2664,34 @@ function noSegments(){ return playQuality()==="nomse"; }
 // it is about to make. So it asks for nothing and lets the server answer
 // (PERF-PLAN §4.7); the menu's explicit rungs still mean exactly themselves.
 function transcodeHeight(){ const q=playQuality(); return (q==="1080"||q==="720"||q==="480")?parseInt(q,10):null; }
-// The height a transcode opened under Original should carry: the source's own.
-// Original is a promise about resolution, and it must survive the cases where a
-// transcode happens anyway — a bitmap-subtitle burn, or the browser refusing
-// the remux. Those sessions used to send no height at all, and the server's
-// Auto answered `min(source, 1080)`: the right bandwidth call for Auto and the
-// wrong one for a viewer who explicitly asked for max, which is how a 4K film
-// with forced PGS subs played at 1080p whatever the quality menu said. The
-// server still clamps ([144, 2160]) and never upscales; an unprobed source has
-// no height to promise, so it stays the server's choice.
-function originalHeight(){
-  if(qualityForce()!=="original") return null;
+// The height a transcode session should carry when the rung is not Auto's to
+// pick, or null where it is. Two cases, one principle: the rung may not
+// downgrade a resolution that was already promised.
+//
+// Original is that promise made explicitly, and it must survive the cases
+// where a transcode happens anyway — a bitmap-subtitle burn, or the browser
+// refusing the remux. Those sessions used to send no height at all, and the
+// server's Auto answered `min(source, 1080)`: the right bandwidth call for
+// Auto and the wrong one for a viewer who explicitly asked for max, which is
+// how a 4K film with forced PGS subs played at 1080p whatever the menu said.
+//
+// An AUTO burn over a remux/direct verdict is the same promise made by the
+// server: the decision already chose to send this client the full-resolution
+// stream, so the burn may add a re-encode but not a downscale. The Auto cap
+// (PERF-PLAN §4.7) is about genuine transcodes — sessions whose client never
+// proved it could carry the source — and stays for them: a burn on top of a
+// transcode verdict keeps the Auto rung. Bandwidth agrees: the 4K rung's
+// 20 Mb/s is *less* than the 57 Mb/s remux it replaces, while on a genuine
+// transcode it would be 2.5× the rung Auto chose.
+//
+// The server still clamps ([144, 2160]) and never upscales; an unprobed
+// source has no height to promise, so it stays the server's choice.
+function sessionHeight(){
   const h=PLAYER&&PLAYER.source&&PLAYER.source.height;
-  return h>0?h:null;
+  if(!(h>0)) return null;
+  if(qualityForce()==="original") return h;
+  if(qualityForce()==="auto" && PLAYER.burnedSub!=null && PLAYER.decidedMethod!=='transcode') return h;
+  return null;
 }
 function qualityLabel(){ const q=playQuality(); const f=QUALITIES.find(x=>x[0]===q); return f?f[1]:"Auto"; }
 
@@ -2738,6 +2753,10 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
   PLAYER={fileId, timer:null, offset:0, hls:null, knownDur:knownDurMs||0,
     decodeRetest:retestDecodeLimit,
     durMs:(src.duration_ms||knownDurMs||0), method:decision.method, encoder:null,
+    // `method` mutates as the session moves (a burn sets it to 'transcode');
+    // this keeps the DECISION's verdict, which is what sessionHeight() needs
+    // to tell a burn-over-remux from a burn on a genuine transcode.
+    decidedMethod:decision.method,
     audio:decision.audio||[], subs:(decision.subtitles||[]),
     curAudio:(decision.audio||[]).findIndex(a=>a.default), curSub:-1,
     markers:(decision.markers||[]).map(m=>({...m})), source:src, started:false,
@@ -4547,7 +4566,9 @@ async function burnSub(index){
   // transcode, which sent a whole debugging session in the wrong direction.
   // The decision was about the FILE; this line is about the session.
   me.reasons=[`subtitle burn-in (${subLabelFor(s,index)}) — drawing subtitles into the picture forces a re-encode`
-              +(originalHeight()?" · kept at source resolution (Original)":"")];
+              +(sessionHeight()?(qualityForce()==="original"
+                  ?" · kept at source resolution (Original)"
+                  :" · kept at source resolution (the verdict was to send the source)"):"")];
   armStall(attachSession(v, me, info, pos), 20000);
   toast("Subtitles: "+subLabelFor(s,index));
 }
