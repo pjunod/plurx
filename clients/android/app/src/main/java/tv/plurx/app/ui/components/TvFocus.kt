@@ -92,10 +92,12 @@ fun TvButton(
     enabled: Boolean = true,
     content: @Composable RowScope.() -> Unit,
 ) {
+    val shape = MaterialTheme.shapes.extraLarge
     Button(
         onClick = onClick,
-        modifier = modifier.tvFocusRing(MaterialTheme.shapes.extraLarge),
+        modifier = modifier.tvFocusRing(shape),
         enabled = enabled,
+        shape = shape,
         content = content,
     )
 }
@@ -107,10 +109,12 @@ fun TvOutlinedButton(
     enabled: Boolean = true,
     content: @Composable RowScope.() -> Unit,
 ) {
+    val shape = MaterialTheme.shapes.extraLarge
     OutlinedButton(
         onClick = onClick,
-        modifier = modifier.tvFocusRing(MaterialTheme.shapes.extraLarge),
+        modifier = modifier.tvFocusRing(shape),
         enabled = enabled,
+        shape = shape,
         content = content,
     )
 }
@@ -122,10 +126,12 @@ fun TvTextButton(
     enabled: Boolean = true,
     content: @Composable RowScope.() -> Unit,
 ) {
+    val shape = MaterialTheme.shapes.extraLarge
     TextButton(
         onClick = onClick,
-        modifier = modifier.tvFocusRing(MaterialTheme.shapes.extraLarge),
+        modifier = modifier.tvFocusRing(shape),
         enabled = enabled,
+        shape = shape,
         content = content,
     )
 }
