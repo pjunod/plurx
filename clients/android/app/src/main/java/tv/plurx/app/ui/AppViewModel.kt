@@ -14,7 +14,6 @@ import retrofit2.HttpException
 import java.net.URI
 import tv.plurx.app.data.Caps
 import tv.plurx.app.data.Appearance
-import tv.plurx.app.data.AudioOffsetReq
 import tv.plurx.app.data.HomeGrouping
 import tv.plurx.app.data.PlaybackQuality
 import tv.plurx.app.data.PosterSize
@@ -301,9 +300,6 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     } else {
         api().markUnwatched(itemId).updated
     }
-
-    suspend fun setAudioOffset(fileId: Long, offsetMs: Long): Long =
-        api().setAudioOffset(fileId, AudioOffsetReq(offsetMs)).audio_offset_ms
 
     suspend fun nextEpisode(itemId: Long): PlaybackTarget? {
         val current = itemDetail(itemId)

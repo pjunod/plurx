@@ -127,7 +127,6 @@ private data class Plan(
     val source: MediaFileDto?,
     override val audio: List<AudioTrack>,
     override val subtitles: List<SubTrack>,
-    val audioOffsetMs: Long,
     val declaredOffsetMs: Long?,
 ) : PlanLike
 
@@ -153,7 +152,6 @@ private suspend fun loadPlan(vm: AppViewModel, itemId: Long, fileId: Long): Plan
         source = file,
         audio = decision.audio,
         subtitles = decision.subtitles,
-        audioOffsetMs = decision.audio_offset_ms,
         declaredOffsetMs = decision.declared_offset_ms,
     )
 } catch (_: Exception) {
@@ -245,6 +243,7 @@ fun PlayerScreen(
     var failed by remember(itemId, fileId) { mutableStateOf(false) }
     var generation by remember(itemId, fileId) { mutableIntStateOf(0) }
     var resumeAt by remember(itemId, fileId) { mutableLongStateOf(startMs) }
+    var playbackAudioOffset by remember(itemId, fileId) { mutableLongStateOf(0) }
 
     ImmersivePlaybackEffect()
 
@@ -266,6 +265,8 @@ fun PlayerScreen(
                 itemId = itemId,
                 plan = plan!!,
                 startMs = resumeAt,
+                audioOffsetMs = playbackAudioOffset,
+                onAudioOffsetChanged = { playbackAudioOffset = it },
                 onReload = { position ->
                     resumeAt = position
                     plan = null
@@ -341,6 +342,8 @@ private fun PlayerContent(
     itemId: Long,
     plan: Plan,
     startMs: Long,
+    audioOffsetMs: Long,
+    onAudioOffsetChanged: (Long) -> Unit,
     onReload: (Long) -> Unit,
     onPlayNext: (PlaybackTarget) -> Unit,
     onExit: () -> Unit,
@@ -354,7 +357,16 @@ private fun PlayerContent(
     val preferences by vm.preferences.collectAsStateWithLifecycle()
     var playFailed by remember { mutableStateOf(false) }
     val controller = remember(plan) {
-        Controller(context, buildPlayer(context, vm), plan, vm.caps(), vm, scope, onError = { playFailed = true })
+        Controller(
+            context,
+            buildPlayer(context, vm),
+            plan,
+            vm.caps(),
+            vm,
+            scope,
+            initialAudioOffsetMs = audioOffsetMs,
+            onError = { playFailed = true },
+        )
     }
     val surfaceFocusRequester = remember { FocusRequester() }
 
@@ -672,7 +684,7 @@ private fun PlayerContent(
                 player = controller.player,
                 serverAudio = plan.audio,
                 serverSubtitles = plan.subtitles,
-                serverControlledAudio = plan.mode != "direct",
+                serverControlledAudio = controller.deliveryMode != "direct",
                 selectedServerAudio = controller.selectedAudio,
                 selectedServerSubtitle = controller.selectedSubtitle,
                 onServerAudio = { controller.switchAudio(it); panel = null; poke() },
@@ -681,11 +693,14 @@ private fun PlayerContent(
             )
             PlayerPanel.Settings -> PlayerSettings(
                 vm = vm,
-                fileId = plan.fileId,
-                audioOffsetMs = plan.audioOffsetMs,
+                audioOffsetMs = controller.audioOffsetMs,
                 declaredOffsetMs = plan.declaredOffsetMs,
                 currentPosition = controller::realPosition,
                 onReload = onReload,
+                onAudioOffset = {
+                    controller.setAudioOffset(it)
+                    onAudioOffsetChanged(it)
+                },
                 onDismiss = { panel = null; poke() },
             )
             PlayerPanel.Info -> PlayerInfo(
@@ -814,15 +829,14 @@ internal fun Controls(
 @Composable
 private fun PlayerSettings(
     vm: AppViewModel,
-    fileId: Long,
     audioOffsetMs: Long,
     declaredOffsetMs: Long?,
     currentPosition: () -> Long,
     onReload: (Long) -> Unit,
+    onAudioOffset: (Long) -> Unit,
     onDismiss: () -> Unit,
 ) {
     val preferences by vm.preferences.collectAsStateWithLifecycle()
-    val scope = rememberCoroutineScope()
     val initialFocusRequester = remember { FocusRequester() }
     var offset by remember(audioOffsetMs) { mutableLongStateOf(audioOffsetMs) }
     RequestInitialFocus(initialFocusRequester)
@@ -850,20 +864,14 @@ private fun PlayerSettings(
         }
         listOf(-250L, -50L, 50L, 250L).forEach { delta ->
             PanelRow("${if (delta > 0) "+" else ""}$delta ms · audio ${if (delta > 0) "later" else "earlier"}", false) {
-                val position = currentPosition()
-                scope.launch {
-                    offset = runCatching { vm.setAudioOffset(fileId, offset + delta) }.getOrDefault(offset)
-                    onReload(position)
-                }
+                offset = (offset + delta).coerceIn(-15_000, 15_000)
+                onAudioOffset(offset)
             }
         }
         if (offset != 0L) {
             PanelRow("Reset sync to 0 ms", false) {
-                val position = currentPosition()
-                scope.launch {
-                    offset = runCatching { vm.setAudioOffset(fileId, 0) }.getOrDefault(offset)
-                    onReload(position)
-                }
+                offset = 0
+                onAudioOffset(0)
             }
         }
         PanelSwitch("Auto-skip intro and credits", preferences.autoSkip, vm::setAutoSkip)
@@ -894,7 +902,7 @@ private fun PlayerInfo(plan: Plan, controller: Controller, positionMs: Long, onD
             playingAudio = selectedAudio,
             subtitles = selectedSubtitle,
             encoder = controller.encoder,
-            audioSync = plan.audioOffsetMs.takeIf { it != 0L }?.let(::offsetLabel),
+            audioSync = controller.audioOffsetMs.takeIf { it != 0L }?.let(::offsetLabel),
         ),
         reasons = plan.reasons,
         onDismiss = onDismiss,

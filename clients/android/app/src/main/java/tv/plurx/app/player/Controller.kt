@@ -76,9 +76,10 @@ class Controller(
     private val caps: Map<String, String>,
     private val vm: AppViewModel,
     private val scope: CoroutineScope,
+    initialAudioOffsetMs: Long = 0,
     private val onError: () -> Unit = {},
 ) {
-    private var activeMode = plan.mode
+    private var activeMode = if (initialAudioOffsetMs != 0L && plan.mode == "direct") "remux" else plan.mode
     private var baseMs = 0L
     var selectedAudio: Long? = plan.audio.firstOrNull { it.default }?.index
         private set
@@ -86,6 +87,8 @@ class Controller(
         private set
     val deliveryMode: String get() = activeMode
     var encoder: String? = null
+        private set
+    var audioOffsetMs: Long = initialAudioOffsetMs.coerceIn(-15_000, 15_000)
         private set
 
     private val mediaSession = MediaSession.Builder(context, player).build()
@@ -161,7 +164,19 @@ class Controller(
     fun switchSubtitle(index: Long?) {
         val position = realPosition()
         selectedSubtitle = index
-        activeMode = if (index == null) plan.mode else "transcode"
+        activeMode = if (index == null) {
+            if (audioOffsetMs != 0L && plan.mode == "direct") "remux" else plan.mode
+        } else {
+            "transcode"
+        }
+        restartAt(position)
+    }
+
+    /** Apply an A/V correction to this controller only and reopen in place. */
+    fun setAudioOffset(offsetMs: Long) {
+        val position = realPosition()
+        audioOffsetMs = offsetMs.coerceIn(-15_000, 15_000)
+        if (activeMode == "direct") activeMode = "remux"
         restartAt(position)
     }
 
@@ -205,6 +220,7 @@ class Controller(
                         height = vm.preferences.value.playbackQuality.storageValue.toIntOrNull(),
                         audio = selectedAudio?.toInt(),
                         subtitle_burn = selectedSubtitle?.toInt(),
+                        audio_offset_ms = audioOffsetMs.takeIf { it != 0L },
                     ),
                 )
             } catch (_: Exception) {
@@ -235,10 +251,16 @@ class Controller(
     }
 
     private fun remuxUri(ms: Long): String {
-        val sb = StringBuilder(plan.playUrl)
-        sb.append(if (plan.playUrl.contains('?')) '&' else '?')
+        val base = if (plan.mode == "direct") {
+            Session.url("/api/v1/files/${plan.fileId}/stream.mp4")
+        } else {
+            plan.playUrl
+        }
+        val sb = StringBuilder(base)
+        sb.append(if (base.contains('?')) '&' else '?')
         sb.append("start=").append(ms / 1000.0)
         selectedAudio?.let { sb.append("&audio=").append(it) }
+        if (audioOffsetMs != 0L) sb.append("&audio_offset_ms=").append(audioOffsetMs)
         caps.forEach { (k, v) -> sb.append('&').append(k).append('=').append(Uri.encode(v)) }
         return sb.toString()
     }

@@ -233,6 +233,8 @@ data class CreateSessionReq(
     val start: Double? = null,
     val audio: Int? = null,
     val subtitle_burn: Int? = null,
+    /** Manual A/V correction for this playback only; positive delays audio. */
+    val audio_offset_ms: Long? = null,
     val copy: Boolean? = null,
     val aac: Boolean? = null,
 )
@@ -242,9 +244,3 @@ data class ProgressReq(val position_ms: Long, val duration_ms: Long? = null)
 
 @Serializable
 data class MutationResult(val ok: Boolean = true, val updated: Int = 0)
-
-@Serializable
-data class AudioOffsetReq(val offset_ms: Long)
-
-@Serializable
-data class AudioOffsetResp(val audio_offset_ms: Long)

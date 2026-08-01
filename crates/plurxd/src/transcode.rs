@@ -1204,6 +1204,8 @@ pub struct SessionRequest {
     /// PGS tracks a UHD Blu-ray remux carries and which plurx simply had no
     /// answer for before.
     pub subtitle_burn: Option<i64>,
+    /// Manual A/V correction for this playback only (positive delays audio).
+    pub audio_offset_ms: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1238,11 +1240,12 @@ impl SessionRequest {
             } => format!("c{}d{}", u8::from(aac), u8::from(preserve_dolby_vision)),
         };
         format!(
-            "{}:{kind}:{:.3}:{}:{}",
+            "{}:{kind}:{:.3}:{}:{}:{}",
             self.file_id,
             self.start_seconds,
             self.audio_index.unwrap_or(-1),
-            self.subtitle_burn.unwrap_or(-1)
+            self.subtitle_burn.unwrap_or(-1),
+            self.audio_offset_ms
         )
     }
 }
@@ -1908,6 +1911,11 @@ impl TranscodeManager {
         let Some(cache) = self.cache.as_ref() else {
             return Ok(None);
         };
+        // A background artifact is the zero-offset default shared by future
+        // plays. Never bake a historical, file-persisted correction into it.
+        let mut playback_file = file.clone();
+        playback_file.audio_offset_ms = 0;
+        let file = &playback_file;
         let encoder = self.encoder().await;
         // Through the same track selection a real playback uses. Not an
         // optimisation — the tracks are part of the recipe, so producing with
@@ -2281,12 +2289,13 @@ impl TranscodeManager {
 
         let info = match req.kind {
             SessionKind::Transcode { height } => {
-                self.start(
+                self.start_with_audio_offset(
                     req.file_id,
                     height,
                     req.start_seconds,
                     req.audio_index,
                     req.subtitle_burn,
+                    req.audio_offset_ms,
                     user_name,
                     &req.playback_id,
                 )
@@ -2296,10 +2305,11 @@ impl TranscodeManager {
                 aac,
                 preserve_dolby_vision,
             } => {
-                self.start_copy(
+                self.start_copy_with_audio_offset(
                     req.file_id,
                     req.start_seconds,
                     req.audio_index,
+                    req.audio_offset_ms,
                     CopySessionOptions {
                         transcode_audio: aac,
                         preserve_dolby_vision,
@@ -2580,6 +2590,7 @@ impl TranscodeManager {
 
     /// Start a transcode session for a file, superseding this viewer's previous
     /// session on the same file (see [`Self::reap_superseded`]).
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)] // one stream's worth of knobs
     pub async fn start(
         &self,
@@ -2591,17 +2602,47 @@ impl TranscodeManager {
         user_name: &str,
         playback_id: &str,
     ) -> Result<StartInfo, String> {
+        self.start_with_audio_offset(
+            file_id,
+            target_height,
+            start_seconds,
+            audio_override,
+            subtitle_override,
+            0,
+            user_name,
+            playback_id,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)] // one stream's worth of knobs
+    async fn start_with_audio_offset(
+        &self,
+        file_id: i64,
+        target_height: i64,
+        start_seconds: f64,
+        audio_override: Option<i64>,
+        subtitle_override: Option<i64>,
+        audio_offset_ms: i64,
+        user_name: &str,
+        playback_id: &str,
+    ) -> Result<StartInfo, String> {
         // Before spawning, not after: the point is to never have two encoders
         // for one player running at once, and reaping first also frees the
         // hardware slot the new session is about to want.
         self.reap_superseded(playback_id).await;
 
-        let file = self
+        let mut file = self
             .store
             .get_file(file_id)
             .await
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "file not found".to_owned())?;
+        file.audio_offset_ms = if file.audio_streams.is_empty() {
+            0
+        } else {
+            audio_offset_ms.clamp(-15_000, 15_000)
+        };
         let item_title = self
             .store
             .get_item(file.item_id)
@@ -3072,6 +3113,7 @@ impl TranscodeManager {
     /// natively via HLS — so the original 4K stream is preserved instead of the
     /// error-fallback re-encoding it down to 720p. No hardware/software encoder
     /// ladder (nothing is encoded), just a fail-fast guard.
+    #[cfg(test)]
     async fn start_copy(
         &self,
         file_id: i64,
@@ -3081,16 +3123,44 @@ impl TranscodeManager {
         user_name: &str,
         playback_id: &str,
     ) -> Result<StartInfo, String> {
+        self.start_copy_with_audio_offset(
+            file_id,
+            start_seconds,
+            audio_override,
+            0,
+            options,
+            user_name,
+            playback_id,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)] // one stream's worth of knobs
+    async fn start_copy_with_audio_offset(
+        &self,
+        file_id: i64,
+        start_seconds: f64,
+        audio_override: Option<i64>,
+        audio_offset_ms: i64,
+        options: CopySessionOptions,
+        user_name: &str,
+        playback_id: &str,
+    ) -> Result<StartInfo, String> {
         // Same reasoning as `start`; the copy path matters more if anything,
         // since an abandoned remux reads the source as fast as the disk allows.
         self.reap_superseded(playback_id).await;
 
-        let file = self
+        let mut file = self
             .store
             .get_file(file_id)
             .await
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "file not found".to_owned())?;
+        file.audio_offset_ms = if file.audio_streams.is_empty() {
+            0
+        } else {
+            audio_offset_ms.clamp(-15_000, 15_000)
+        };
         let item_title = self
             .store
             .get_item(file.item_id)
@@ -6354,7 +6424,18 @@ mod tests {
             start_seconds: 0.0,
             audio_index: None,
             subtitle_burn: None,
+            audio_offset_ms: 0,
         };
+
+        let shifted = SessionRequest {
+            audio_offset_ms: 250,
+            ..request.clone()
+        };
+        assert_ne!(
+            shifted.fingerprint(),
+            request.fingerprint(),
+            "session-scoped audio sync must identify different output bytes"
+        );
 
         let first = mgr.create_session(&request, "paul").await.expect("create");
         let again = mgr.create_session(&request, "paul").await.expect("replay");
@@ -6423,6 +6504,7 @@ mod tests {
             start_seconds: 0.0,
             audio_index: None,
             subtitle_burn: None,
+            audio_offset_ms: 0,
         };
 
         let (a, b) = tokio::join!(
@@ -6465,6 +6547,7 @@ mod tests {
             start_seconds: 0.0,
             audio_index: None,
             subtitle_burn: None,
+            audio_offset_ms: 0,
         };
         assert!(mgr.create_session(&request, "paul").await.is_err());
 

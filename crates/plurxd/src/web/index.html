@@ -2584,6 +2584,7 @@ function remuxUrl(base, audioIndex, startSec){
   PLAYER.streamId=newStreamId(); PLAYER.sessionId=null;
   let u=tok(base)+"&"+CAPS_Q;
   if(audioIndex!=null) u+="&audio="+audioIndex;
+  if(PLAYER.aoffset) u+="&audio_offset_ms="+PLAYER.aoffset;
   if(startSec>0) u+="&start="+startSec.toFixed(1);
   return u+"&stream="+encodeURIComponent(PLAYER.streamId);
 }
@@ -2606,6 +2607,7 @@ function transcodeOpts(startSec, audioIndex){
   if(o.height==null) o.height=sessionHeight();
   if(audioIndex!=null) o.audio=audioIndex;
   if(PLAYER && PLAYER.burnedSub!=null) o.subtitle_burn=PLAYER.burnedSub;
+  if(PLAYER && PLAYER.aoffset) o.audio_offset_ms=PLAYER.aoffset;
   return o;
 }
 async function openSession(fileId, opts){
@@ -2783,6 +2785,10 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
   // restart that failed at the decision must not leak its flag into the next
   // unrelated play and silently strip that one's default track.
   const skipDefaultSub=PENDING_DEFAULT_SUB_OFF; PENDING_DEFAULT_SUB_OFF=false;
+  // An internal reopen (quality/subtitle change) is still this playback and
+  // keeps its correction. A different title, or a player that was closed,
+  // starts clean at zero.
+  const sessionAudioOffset=PLAYER&&PLAYER.fileId===fileId ? (PLAYER.aoffset||0) : 0;
   const modal=document.getElementById("modal"), video=document.getElementById("video");
   wirePlayer();
   // Stamp the click, not the decision: time-to-first-frame is what the person
@@ -2845,7 +2851,7 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
     markers:(decision.markers||[]).map(m=>({...m})), source:src, started:false,
     idleTimer:null, autoskip:autoskipOn(), stallTimer:null, probeUrl:null, triedFallback:false,
     refusedOriginal:false,
-    aoffset:decision.audio_offset_ms||0, declared:decision.declared_offset_ms||0,
+    aoffset:sessionAudioOffset, declared:decision.declared_offset_ms||0,
     reasons:(decision.reasons||[]), title, meta:meta||null, decodeRescued:false,
     transcodeAudio:!!decision.transcode_audio,
     preserveDolbyVision:!!decision.preserve_dolby_vision, copyHls:false,
@@ -2935,7 +2941,8 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
 async function startCopyHls(v, startSec, live){
   const track=PLAYER.audio[PLAYER.curAudio]; const aidx=track?track.index:0;
   const info=await openSession(PLAYER.fileId,{copy:true,aac:!!PLAYER.transcodeAudio,
-    preserve_dolby_vision:!!PLAYER.preserveDolbyVision,start:startSec||0,audio:aidx});
+    preserve_dolby_vision:!!PLAYER.preserveDolbyVision,start:startSec||0,audio:aidx,
+    audio_offset_ms:PLAYER.aoffset||0});
   if(live && !live()) return false;
   PLAYER.method='remux'; PLAYER.copyHls=true;
   armStall(attachSession(v, PLAYER, info, startSec));
@@ -4491,8 +4498,8 @@ function setQuality(q){
 }
 
 // ---- audio sync (A/V offset) ----------------------------------------------
-// Persisted per file server-side; every nudge restarts the stream at the same
-// position with ffmpeg applying the shift, so it works for any method.
+// Scoped to this player only. Every nudge restarts at the same position with
+// the shift on that stream request; closing or starting another title resets.
 function offsetLabel(ms){ return ms===0?"0 ms (no correction)":`${ms>0?"+":""}${ms} ms — audio plays ${ms>0?"later":"earlier"}`; }
 function syncMenuHtml(){
   return `<div class="amsec">Audio sync</div>
@@ -4507,23 +4514,19 @@ function syncMenuHtml(){
 function nudgeSync(d){ setSync((PLAYER.aoffset||0)+d); }
 async function setSync(v){
   const me=PLAYER; if(!me||!me.fileId) return;
-  let saved;
-  try{ saved=await api(`/files/${me.fileId}/audio-offset`,{method:"PUT",body:{offset_ms:v}}); }
-  catch(e){ return toast(e.message); }
-  if(PLAYER!==me) return;
-  PLAYER.aoffset=saved.audio_offset_ms;
+  PLAYER.aoffset=Math.max(-15000,Math.min(15000,Math.round(v)));
   const m=document.getElementById("pmenu");
   if(m&&m.classList.contains("on")&&m.dataset.kind==="sync") m.innerHTML=syncMenuHtml();
   toast("Audio sync: "+offsetLabel(PLAYER.aoffset));
   const video=document.getElementById("video");
   const pos=(PLAYER.offset||0)+((video&&video.currentTime)||0);
   if(PLAYER.method==='direct_play'){
-    // Direct play can't carry a correction — re-decide (the server now forces
-    // a remux for this file) and resume where we were.
-    play(PLAYER.fileId, PLAYER.title||"", Math.round(pos*1000), PLAYER.knownDur||0, PLAYER.meta);
-  } else {
-    seekTo(pos); // restarts the server stream; ffmpeg applies the new offset
+    // A direct file has nowhere to apply a correction, so this playback alone
+    // moves onto the remux path. The next play still begins from its decision.
+    PLAYER.method='remux';
+    PLAYER.copyHls=useNativeHls(video);
   }
+  seekTo(pos); // restarts the stream with this playback's offset
 }
 // Subtitles. The VTT the server extracts carries the file's own timestamps. A
 // stream that starts at an offset (a transcode, a copy-HLS session, a resumed
@@ -5104,6 +5107,7 @@ function closePlayer(){
   // minute later. An AirPlay target fetching this same session keeps it alive
   // by fetching; a browser that has closed the player is not going to.
   if(PLAYER && PLAYER.sessionId){ releaseSession(PLAYER.sessionId); PLAYER.sessionId=null; }
+  if(PLAYER) PLAYER.aoffset=0;
   stopPlayerTimers();
   clearInterval(STATS_TIMER); STATS_TIMER=null; teardownHls();
   setLoading(false);

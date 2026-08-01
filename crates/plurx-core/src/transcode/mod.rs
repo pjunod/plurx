@@ -736,7 +736,7 @@ fn decode_setup(encoder: Encoder, source: &MediaFile) -> (Vec<String>, Option<St
     }
 }
 
-/// The persisted A/V-sync correction as an audio filter, for a session whose
+/// The current playback's A/V-sync correction as an audio filter, for a session whose
 /// audio is being ENCODED anyway. Same sign convention as the `-itsoffset`
 /// input it replaces: positive = delay audio.
 ///

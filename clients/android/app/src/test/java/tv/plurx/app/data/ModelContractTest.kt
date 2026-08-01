@@ -1,8 +1,10 @@
 package tv.plurx.app.data
 
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.encodeToString
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ModelContractTest {
@@ -39,5 +41,17 @@ class ModelContractTest {
         assertEquals("transcode", decision.delivery!!.mode)
         assertEquals(50L, decision.audio_offset_ms)
         assertEquals("Skip intro", decision.markers.single().label)
+    }
+
+    @Test
+    fun audioSyncRidesOnlyOnThePlaybackSessionRequest() {
+        val wire = Json { explicitNulls = false }
+        val adjusted = wire.encodeToString(
+            CreateSessionReq(playback_id = "player", audio_offset_ms = 250),
+        )
+        val freshPlay = wire.encodeToString(CreateSessionReq(playback_id = "next-player"))
+
+        assertTrue(adjusted.contains("\"audio_offset_ms\":250"))
+        assertFalse(freshPlay.contains("audio_offset_ms"))
     }
 }

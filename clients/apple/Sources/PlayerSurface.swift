@@ -77,15 +77,17 @@ final class PictureInPictureController: NSObject, ObservableObject,
         }
     }
 
-    func detach() {
+    func detach(resetPublishedState: Bool = true) {
         stop()
         possibleObservation = nil
         activeObservation = nil
         controller?.delegate = nil
         controller = nil
         playerLayer = nil
-        isPossible = false
-        isActive = false
+        if resetPublishedState {
+            isPossible = false
+            isActive = false
+        }
     }
 
     func pictureInPictureControllerDidStartPictureInPicture(
@@ -143,7 +145,12 @@ struct PlayerSurface: UIViewRepresentable {
     }
 
     static func dismantleUIView(_ view: PlayerSurfaceView, coordinator: Coordinator) {
-        coordinator.pictureInPicture.detach()
+        // SwiftUI is invalidating its observation graph while this callback
+        // runs. Publishing from here violates Swift's exclusivity rules on
+        // tvOS, so tear down the AVKit objects without notifying a view that
+        // is already being destroyed. A surviving controller is reset by the
+        // normal detach at the start of its next attachment.
+        coordinator.pictureInPicture.detach(resetPublishedState: false)
         view.playerLayer.player = nil
     }
 

@@ -3179,20 +3179,50 @@ mod tests {
             .0,
             StatusCode::OK
         );
-        // Manual A/V offset.
+        // The legacy A/V endpoint still accepts an old client, but no longer
+        // persists its correction into later plays.
+        let (status, offset) = call(
+            &app,
+            put(
+                &format!("/api/v1/files/{}/audio-offset", s.file),
+                Some(&admin),
+                json!({ "offset_ms": 250 }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(offset["audio_offset_ms"], 250);
         assert_eq!(
-            call(
-                &app,
-                put(
-                    &format!("/api/v1/files/{}/audio-offset", s.file),
-                    Some(&admin),
-                    json!({ "offset_ms": 250 })
-                )
-            )
-            .await
-            .0,
-            StatusCode::OK
+            state
+                .store
+                .get_file(s.file)
+                .await
+                .expect("read file")
+                .expect("file")
+                .audio_offset_ms,
+            0,
+            "manual sync belongs to the active play, not the media file"
         );
+        // A value left behind by an older server is ignored as well: opening
+        // the title again always begins at neutral sync.
+        state
+            .store
+            .set_file_audio_offset(s.file, 250)
+            .await
+            .expect("seed historical audio offset");
+        let (status, decision) = call(
+            &app,
+            get(
+                &format!(
+                    "/api/v1/files/{}/decision?vcodec=h264,hevc&acodec=aac&container=mp4&hdr=0",
+                    s.file
+                ),
+                Some(&admin),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(decision["audio_offset_ms"], 0);
         // Progress on a missing item → 404.
         assert_eq!(
             call(

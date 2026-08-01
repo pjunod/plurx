@@ -338,8 +338,9 @@ pub struct DecisionResponse {
     pub subtitles: Vec<SubTrackDto>,
     /// Skippable intro/credits regions (chapter-derived where possible).
     pub markers: Vec<Marker>,
-    /// Persisted manual A/V sync correction for this file (positive = audio
-    /// later). The player's sync menu edits this and restarts the stream.
+    /// Initial manual A/V correction. Always zero: corrections belong to one
+    /// active playback and travel on that playback's stream/session requests.
+    /// Retained in the response for older client compatibility.
     pub audio_offset_ms: i64,
     /// What the container itself declares (audio start − video start), when
     /// nonzero. Diagnostic only — declared offsets are already honored.
@@ -593,7 +594,11 @@ pub async fn decision(
     AxPath(id): AxPath<i64>,
     Query(q): Query<Caps>,
 ) -> Result<Json<DecisionResponse>, ApiError> {
-    let file = load_file(&state, id).await?;
+    let mut file = load_file(&state, id).await?;
+    // Older builds stored this against the file. A fresh playback must never
+    // inherit that historical value; its client starts at zero and carries
+    // any adjustment on each stream request for this one playback only.
+    file.audio_offset_ms = 0;
     // Never hand back a play URL for a file that isn't on disk — the client
     // would open a player that can never load (the unmounted-share case).
     // Cached briefly: on a cold NAS this stat is remote I/O sitting between
@@ -678,7 +683,7 @@ pub async fn decision(
         audio,
         subtitles,
         markers,
-        audio_offset_ms: file.audio_offset_ms,
+        audio_offset_ms: 0,
         declared_offset_ms: declared_av_offset(&state, id).await,
         ladder: crate::transcode::ladder(file.height),
         prefer_segmented,
@@ -716,9 +721,9 @@ pub struct AudioOffsetRequest {
     pub offset_ms: i64,
 }
 
-/// PUT /api/v1/files/:id/audio-offset — persist a manual A/V sync correction
-/// (positive = delay audio). Sticks to the file, so the fix survives across
-/// sessions and users; the player restarts its stream to apply it.
+/// Deprecated compatibility endpoint. Audio sync is now session-scoped and
+/// supplied on stream/session creation, so this validates and echoes an old
+/// client's value without persisting it to the file or affecting future plays.
 pub async fn set_audio_offset(
     _user: AuthUser,
     State(state): State<AppState>,
@@ -730,7 +735,6 @@ pub async fn set_audio_offset(
     }
     // ±15s covers any real-world desync; beyond that it's a different problem.
     let offset = req.offset_ms.clamp(-15_000, 15_000);
-    state.store.set_file_audio_offset(id, offset).await?;
     Ok(Json(serde_json::json!({ "audio_offset_ms": offset })))
 }
 
@@ -912,6 +916,8 @@ pub struct StreamQuery {
     /// remux is doing. Optional: an old client, curl, or an AirPlay target
     /// just gets an untracked stream.
     pub stream: Option<String>,
+    /// Manual A/V correction for this playback only (positive delays audio).
+    pub audio_offset_ms: Option<i64>,
 }
 
 impl StreamQuery {
@@ -937,7 +943,12 @@ pub async fn stream_mp4(
     AxPath(id): AxPath<i64>,
     Query(q): Query<StreamQuery>,
 ) -> Result<Response, ApiError> {
-    let file = load_file(&state, id).await?;
+    let mut file = load_file(&state, id).await?;
+    file.audio_offset_ms = if file.audio_streams.is_empty() {
+        0
+    } else {
+        q.audio_offset_ms.unwrap_or(0).clamp(-15_000, 15_000)
+    };
     crate::playstart::note_playback_started(&state, user.id, id);
     let decision = q.caps().decide(&file, dv_strippable(&state));
     let audio = q.audio.unwrap_or(0).max(0);
@@ -970,11 +981,7 @@ pub async fn stream_mp4(
         // `-af` when audio is transcoded, and a filter with no stream to
         // attach to is a hard ffmpeg error where the old optional map was
         // inert.
-        audio_offset_ms: if file.audio_streams.is_empty() {
-            0
-        } else {
-            file.audio_offset_ms
-        },
+        audio_offset_ms: file.audio_offset_ms,
         hevc,
         hdr: file.hdr.clone(),
         // The probed capability, like the decision above — not the version
@@ -1196,7 +1203,7 @@ async fn remux(spec: RemuxSpec<'_>) -> Result<Response, ApiError> {
     // input would drag the whole pipeline back to flat-out.
     push_pacing(&mut cmd, pacing, readrate);
     cmd.arg("-i").arg(path);
-    // A persisted A/V sync correction (positive = audio later). Copied audio
+    // This playback's A/V sync correction (positive = audio later). Copied audio
     // keeps the second `-itsoffset`'d input of the same file — copy moves
     // packets and filters need frames, so there is no other way in — with
     // the same input-seek so resume stays aligned (make_zero below shifts

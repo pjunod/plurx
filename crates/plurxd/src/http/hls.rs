@@ -88,6 +88,10 @@ pub struct CreateSession {
     /// With `copy`: retain Dolby Vision signaling and dynamic metadata because
     /// the decision established that this client supports the source profile.
     pub preserve_dolby_vision: Option<bool>,
+    /// Manual A/V correction for this playback attempt only. Positive delays
+    /// audio. It is carried into every seek/reopen by the client and is never
+    /// written back to the media file.
+    pub audio_offset_ms: Option<i64>,
 }
 
 impl CreateSession {
@@ -114,6 +118,7 @@ impl CreateSession {
             start_seconds: self.start.unwrap_or(0.0).max(0.0),
             audio_index: self.audio.filter(|a| *a >= 0),
             subtitle_burn: self.subtitle_burn.filter(|s| *s >= 0),
+            audio_offset_ms: self.audio_offset_ms.unwrap_or(0).clamp(-15_000, 15_000),
         }
     }
 }
@@ -216,6 +221,7 @@ pub async fn start(
         copy: Some(q.copy == Some(1)),
         aac: Some(q.aac == Some(1)),
         preserve_dolby_vision: Some(false),
+        audio_offset_ms: None,
     };
     create(AuthUser(user), State(state), AxPath(id), Json(legacy)).await
 }
@@ -304,4 +310,29 @@ pub async fn segment(
         Body::from_stream(tokio_util::io::ReaderStream::new(opened.file)),
     )
         .into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn playback_audio_offset_is_bounded_and_carried_by_the_session() {
+        let request = CreateSession {
+            playback_id: "player".into(),
+            request_id: Some("attempt".into()),
+            height: None,
+            subtitle_burn: None,
+            start: Some(12.0),
+            audio: None,
+            copy: Some(false),
+            aac: None,
+            preserve_dolby_vision: None,
+            audio_offset_ms: Some(20_000),
+        }
+        .into_request(7, 1080);
+
+        assert_eq!(request.audio_offset_ms, 15_000);
+        assert_eq!(request.file_id, 7);
+    }
 }

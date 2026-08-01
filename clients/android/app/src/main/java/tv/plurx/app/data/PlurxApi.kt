@@ -7,7 +7,6 @@ import retrofit2.http.POST
 import retrofit2.http.Path
 import retrofit2.http.Query
 import retrofit2.http.QueryMap
-import retrofit2.http.PUT
 
 /**
  * plurx native API (`/api/v1`). Base URL is `<origin>/api/v1/`, so paths are
@@ -75,6 +74,4 @@ interface PlurxApi {
     @POST("items/{id}/progress")
     suspend fun progress(@Path("id") id: Long, @Body body: ProgressReq)
 
-    @PUT("files/{id}/audio-offset")
-    suspend fun setAudioOffset(@Path("id") id: Long, @Body body: AudioOffsetReq): AudioOffsetResp
 }
