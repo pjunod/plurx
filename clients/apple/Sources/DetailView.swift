@@ -162,12 +162,14 @@ struct DetailView: View {
             )
             .font(.system(.body, design: .monospaced))
         }
+        #if os(tvOS)
+        .buttonStyle(TVReadableButtonStyle(prominent: watched))
+        .fixedSize()
+        #else
         .buttonStyle(.bordered)
         .tint(watched ? Palette.accent : Palette.muted)
-        .disabled(watchBusy)
-        #if os(tvOS)
-        .fixedSize()
         #endif
+        .disabled(watchBusy)
     }
 
     private func isWatched(_ item: Item) -> Bool {
@@ -263,9 +265,11 @@ struct DetailView: View {
                 .font(.system(.body, design: .monospaced))
                 .frame(maxWidth: .infinity)
         }
+        #if os(tvOS)
+        .buttonStyle(TVReadableButtonStyle(prominent: false))
+        #else
         .buttonStyle(.bordered)
         .tint(Palette.muted)
-        #if os(iOS)
         .controlSize(.large)
         #endif
     }

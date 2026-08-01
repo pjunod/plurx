@@ -267,18 +267,14 @@ struct PlayerView: View {
             }
 
             if let marker = controller.activeMarker {
-                Button {
-                    controller.skipActiveMarker()
-                    revealControls()
-                } label: {
-                    Label(marker.label, systemImage: "forward.end.fill")
-                        .font(.system(.caption, design: .monospaced))
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(Palette.accent)
                 #if os(tvOS)
-                .focused($focusedControl, equals: .marker)
+                HStack {
+                    Spacer(minLength: 0)
+                    markerButton(marker)
+                        .fixedSize(horizontal: true, vertical: false)
+                }
+                #else
+                markerButton(marker)
                 #endif
             }
 
@@ -304,6 +300,26 @@ struct PlayerView: View {
         .padding(12)
         .frame(maxWidth: .infinity)
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
+    }
+
+    private func markerButton(_ marker: Marker) -> some View {
+        Button {
+            controller.skipActiveMarker()
+            revealControls()
+        } label: {
+            Label(marker.label, systemImage: "forward.end.fill")
+                .font(.system(.caption, design: .monospaced))
+                #if os(iOS)
+                .frame(maxWidth: .infinity)
+                #endif
+        }
+        #if os(tvOS)
+        .buttonStyle(TVReadableButtonStyle(prominent: true))
+        .focused($focusedControl, equals: .marker)
+        #else
+        .buttonStyle(.borderedProminent)
+        .tint(Palette.accent)
+        #endif
     }
 
     private var expandedControlRow: some View {
