@@ -18,7 +18,7 @@ mod version;
 mod watched;
 
 use std::future::IntoFuture;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -317,10 +317,17 @@ async fn run(config: Config) -> anyhow::Result<()> {
     } else {
         tracing::info!(bind = %config.server.bind, "LAN discovery disabled for loopback bind");
     }
+    let host_name = system_hostname();
+    let lan_address = primary_lan_address();
+    let discovery_name = discovery_display_name(
+        &config.server.name,
+        host_name.as_deref(),
+        lan_address.as_ref(),
+    );
     let mdns = if lan_discovery && mdns_advertising_enabled() {
         match start_mdns_advertiser(
             &instance_id,
-            &config.server.name,
+            &discovery_name,
             config.server.bind,
             crate::version::SEMVER,
         ) {
@@ -407,6 +414,72 @@ fn mdns_advertising_value_enabled(value: &str) -> bool {
     )
 }
 
+/// A fresh Compose deployment is named `plurx`, which is useful branding but
+/// useless when three machines appear in one picker. Use the machine hostname
+/// for that default only; an operator's explicit server name remains theirs.
+fn discovery_display_name(
+    configured: &str,
+    hostname: Option<&str>,
+    address: Option<&IpAddr>,
+) -> String {
+    let configured = configured.trim();
+    let label = if !configured.is_empty() && !configured.eq_ignore_ascii_case("plurx") {
+        configured.to_owned()
+    } else {
+        hostname
+            .and_then(normalized_hostname)
+            .unwrap_or_else(|| "plurx".to_owned())
+    };
+    let Some(address) = address else { return label };
+    let identified = format!("{label} · {address}");
+    // A DNS-SD service instance is one DNS label (63 bytes). A long custom
+    // name remains more useful than a registration failure merely to add IP.
+    if identified.len() <= 63 {
+        identified
+    } else {
+        label
+    }
+}
+
+fn normalized_hostname(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_end_matches('.');
+    let without_local = trimmed.strip_suffix(".local").unwrap_or(trimmed).trim();
+    (!without_local.is_empty() && !without_local.eq_ignore_ascii_case("localhost"))
+        .then(|| without_local.to_owned())
+}
+
+/// Ask the routing table which local IPv4 address carries mDNS. UDP `connect`
+/// chooses an interface without sending a packet, so this works while the
+/// server is still offline and avoids accidentally showing a Docker bridge IP.
+fn primary_lan_address() -> Option<IpAddr> {
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("224.0.0.251:5353").ok()?;
+    let address = socket.local_addr().ok()?.ip();
+    (!address.is_loopback() && !address.is_unspecified()).then_some(address)
+}
+
+#[cfg(unix)]
+fn system_hostname() -> Option<String> {
+    let mut buffer = [0_u8; 256];
+    // SAFETY: `buffer` is writable for exactly the length passed to libc, and
+    // it remains alive until the returned bytes are copied into a Rust String.
+    if unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) } != 0 {
+        return None;
+    }
+    let end = buffer
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(buffer.len());
+    normalized_hostname(&String::from_utf8_lossy(&buffer[..end]))
+}
+
+#[cfg(not(unix))]
+fn system_hostname() -> Option<String> {
+    std::env::var("COMPUTERNAME")
+        .ok()
+        .and_then(|value| normalized_hostname(&value))
+}
+
 #[derive(Deserialize)]
 struct DiscoveryServerInfo {
     name: String,
@@ -464,9 +537,13 @@ async fn advertise(server: &str) -> anyhow::Result<()> {
         }
     };
 
+    let host_name = system_hostname();
+    let lan_address = primary_lan_address();
+    let discovery_name =
+        discovery_display_name(&info.name, host_name.as_deref(), lan_address.as_ref());
     let daemon = start_mdns_advertiser(
         &info.instance_id,
-        &info.name,
+        &discovery_name,
         SocketAddr::from(([0, 0, 0, 0], port)),
         &info.version,
     )?;
@@ -728,6 +805,28 @@ mod discovery_tests {
         assert_eq!(info.name, "Living Room");
         assert_eq!(info.version, "0.2.0");
         assert_eq!(info.instance_id, "server-id");
+    }
+
+    #[test]
+    fn default_discovery_name_uses_the_machine_but_custom_names_win() {
+        let address: IpAddr = "192.168.1.20".parse().expect("IP");
+        assert_eq!(
+            discovery_display_name("plurx", Some("m6"), Some(&address)),
+            "m6 · 192.168.1.20"
+        );
+        assert_eq!(
+            discovery_display_name("PLURX", Some("nuc4.local."), None),
+            "nuc4"
+        );
+        assert_eq!(
+            discovery_display_name("Living Room", Some("m6"), Some(&address)),
+            "Living Room · 192.168.1.20"
+        );
+        assert_eq!(
+            discovery_display_name("plurx", Some("localhost"), None),
+            "plurx"
+        );
+        assert_eq!(discovery_display_name("plurx", None, None), "plurx");
     }
 
     #[test]

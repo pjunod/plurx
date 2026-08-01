@@ -97,6 +97,9 @@ services:
     container_name: plurx-discovery
     restart: unless-stopped
     network_mode: host
+    # The advertiser uses the machine hostname when the configured server name
+    # is the generic default `plurx`, so a multi-server picker shows m6/nuc4/etc.
+    uts: host
     depends_on:
       plurxd:
         condition: service_healthy

@@ -30,6 +30,12 @@ through published port 32400 and advertises the host's LAN address. That split
 keeps automatic iPhone, iPad, Apple TV, and Android discovery without moving
 the media server off the networks its peer services use.
 
+When `PLURX_SERVER_NAME` is still the default `plurx`, the companion advertises
+the Docker host name plus its LAN address, so a picker says
+`m6 · 192.168.1.20` instead of showing another anonymous `plurx` row. Set a
+custom `PLURX_SERVER_NAME` when a room or role name is clearer; the custom name
+replaces the host name while the address remains visible.
+
 Do not add `network_mode: host` to `plurxd`. Compose forbids one service from
 declaring both host networking and `networks`, so doing that recreates the
 configuration error the companion is designed to avoid. If the Docker host
