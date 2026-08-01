@@ -567,12 +567,15 @@ fn spawn_ffmpeg(
     session_id: &str,
     progress: Arc<Progress>,
     generation: u64,
+    runtime_cache: &std::path::Path,
 ) -> Result<Child, String> {
     // `-progress pipe:1` is a global option, so it can lead the vector; the
     // HLS muxer writes to files, which leaves stdout free to carry it.
     let mut full: Vec<String> = vec!["-progress".into(), "pipe:1".into()];
     full.extend_from_slice(args);
-    let mut child = tokio::process::Command::new(ffmpeg_bin())
+    let mut command = tokio::process::Command::new(ffmpeg_bin());
+    configure_ffmpeg_runtime(&mut command, runtime_cache);
+    let mut child = command
         .args(&full)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -625,10 +628,13 @@ fn spawn_ffmpeg_pipe(
     session_id: &str,
     progress: Arc<Progress>,
     generation: u64,
+    runtime_cache: &std::path::Path,
 ) -> Result<(Child, tokio::process::ChildStdout), String> {
     let mut full: Vec<String> = vec!["-progress".into(), "pipe:2".into()];
     full.extend_from_slice(args);
-    let mut child = tokio::process::Command::new(ffmpeg_bin())
+    let mut command = tokio::process::Command::new(ffmpeg_bin());
+    configure_ffmpeg_runtime(&mut command, runtime_cache);
+    let mut child = command
         .args(&full)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -661,6 +667,24 @@ fn spawn_ffmpeg_pipe(
         });
     }
     Ok((child, stdout))
+}
+
+/// Give libraries loaded by ffmpeg a cache owned by plurxd.
+///
+/// Docker deployments commonly override the image user with a numeric host
+/// UID while leaving `HOME` out of the daemon environment. A non-login process
+/// does not synthesize it from passwd, so fontconfig has no user cache while
+/// libass initializes a text-subtitle burn. A transcode can then spend the
+/// entire first-segment watchdog window rebuilding font metadata, leaving the
+/// player with no HLS resource.
+/// Keep the environment local to ffmpeg rather than changing the daemon's
+/// process environment, and use the data directory whose ownership plurxd has
+/// already proved by creating its session and cache directories.
+fn configure_ffmpeg_runtime(
+    command: &mut tokio::process::Command,
+    runtime_cache: &std::path::Path,
+) {
+    command.env("XDG_CACHE_HOME", runtime_cache);
 }
 
 /// Is this stderr line one of ffmpeg's `-progress` blocks rather than a log
@@ -1528,6 +1552,8 @@ struct CacheConfig {
 pub struct TranscodeManager {
     store: Arc<dyn Store>,
     work_dir: PathBuf,
+    /// Writable XDG cache inherited by ffmpeg and libraries such as fontconfig.
+    runtime_cache: PathBuf,
     caps: EncoderCaps,
     /// The tone-map graph this node proved it can run, or [`Pipeline::Cpu`]
     /// when nothing did. A per-session decision still filters it — see
@@ -1588,9 +1614,21 @@ impl TranscodeManager {
         caps: EncoderCaps,
         pipeline: Pipeline,
     ) -> Self {
+        // Managers without a finished-transcode cache (mainly tests and
+        // embedded uses) still get a writable location without reaching
+        // outside their scratch root. `with_cache` moves this beside the
+        // persistent caches in a normal daemon.
+        let runtime_cache = work_dir.join(".runtime-cache");
+        if let Err(err) = std::fs::create_dir_all(&runtime_cache) {
+            tracing::warn!(
+                path = %runtime_cache.display(),
+                "could not create ffmpeg runtime cache: {err}"
+            );
+        }
         TranscodeManager {
             store,
             work_dir,
+            runtime_cache,
             caps,
             pipeline,
             admissions: Admissions::new(),
@@ -1625,6 +1663,16 @@ impl TranscodeManager {
     }
 
     pub fn with_cache(mut self, cache_dir: PathBuf, ffmpeg_build: String, node_id: String) -> Self {
+        self.runtime_cache = cache_dir
+            .parent()
+            .unwrap_or(cache_dir.as_path())
+            .join("runtime");
+        if let Err(err) = std::fs::create_dir_all(&self.runtime_cache) {
+            tracing::warn!(
+                path = %self.runtime_cache.display(),
+                "could not create ffmpeg runtime cache: {err}"
+            );
+        }
         self.cache = Some(CacheConfig {
             dir: cache_dir,
             ffmpeg_build,
@@ -2177,6 +2225,7 @@ impl TranscodeManager {
                 hash,
                 Arc::clone(&progress),
                 generation,
+                &self.runtime_cache,
             )?;
 
             let ended = self.run_part(&mut child, deadline).await;
@@ -2840,6 +2889,7 @@ impl TranscodeManager {
             &session_id,
             Arc::clone(&progress),
             generation,
+            &self.runtime_cache,
         )?;
 
         tracing::info!(
@@ -2902,6 +2952,7 @@ impl TranscodeManager {
             let sid = session_id.clone();
             let started_on_hardware = encoder != Encoder::Software;
             let sw_pool = self.admissions.software_pool();
+            let runtime_cache = self.runtime_cache.clone();
             tokio::spawn(async move {
                 if started_on_hardware {
                     tokio::time::sleep(FIRST_SEGMENT_GRACE).await;
@@ -2975,7 +3026,15 @@ impl TranscodeManager {
                     // stalled without a segment (downgrade one step).
                     if !session_producing(&dir).await {
                         Self::downgrade_one_step(
-                            &session, &file, &opts, encoder, pacing, &sw_pool, &dir, &sid,
+                            &session,
+                            &file,
+                            &opts,
+                            encoder,
+                            pacing,
+                            &sw_pool,
+                            &dir,
+                            &sid,
+                            &runtime_cache,
                         )
                         .await;
                         if session.failed.load(Relaxed) {
@@ -3024,6 +3083,7 @@ impl TranscodeManager {
         sw_pool: &crate::admission::SwPool,
         dir: &std::path::Path,
         sid: &str,
+        runtime_cache: &std::path::Path,
     ) {
         let downgrade_pipeline = opts.pipeline.on_gpu();
         let retry_encoder = if downgrade_pipeline {
@@ -3085,6 +3145,7 @@ impl TranscodeManager {
             sid,
             Arc::clone(&session.progress),
             generation,
+            runtime_cache,
         ) {
             Ok(child) => {
                 *session.child.lock().await = Some(child);
@@ -3221,7 +3282,13 @@ impl TranscodeManager {
                 build = crate::version::BUILD,
                 "copy-video HLS ffmpeg args: {}", args.join(" ")
             );
-            match spawn_ffmpeg_pipe(&args, &session_id, Arc::clone(&progress), generation) {
+            match spawn_ffmpeg_pipe(
+                &args,
+                &session_id,
+                Arc::clone(&progress),
+                generation,
+                &self.runtime_cache,
+            ) {
                 Ok((child, stdout)) => (child, Some(stdout)),
                 Err(e) => {
                     // Spawning failed before any of this was decided, so there
@@ -3237,6 +3304,7 @@ impl TranscodeManager {
                         &session_id,
                         Arc::clone(&progress),
                         generation,
+                        &self.runtime_cache,
                     )?;
                     (child, None)
                 }
@@ -3254,6 +3322,7 @@ impl TranscodeManager {
                 &session_id,
                 Arc::clone(&progress),
                 generation,
+                &self.runtime_cache,
             )?;
             (child, None)
         };
@@ -3307,6 +3376,7 @@ impl TranscodeManager {
             let dir = dir.clone();
             let file = file.clone();
             let progress = Arc::clone(&progress);
+            let runtime_cache = self.runtime_cache.clone();
             tokio::spawn(async move {
                 let outcome =
                     copyseg::run(stdout, dir.clone(), &sid, copyseg::Limits::default()).await;
@@ -3366,7 +3436,14 @@ impl TranscodeManager {
                         // taken tens of seconds in, which means ffmpeg never
                         // produced a moov — a session already in trouble.)
                         let generation = progress.begin_attempt();
-                        match spawn_ffmpeg(&args, "copy", &sid, progress, generation) {
+                        match spawn_ffmpeg(
+                            &args,
+                            "copy",
+                            &sid,
+                            progress,
+                            generation,
+                            &runtime_cache,
+                        ) {
                             Ok(child) => {
                                 *session.child.lock().await = Some(child);
                                 *session.last_access.lock().await = Instant::now();
@@ -3948,6 +4025,32 @@ pub fn snap_height(height: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ffmpeg_gets_the_app_owned_runtime_cache() {
+        use plurx_core::store::SqliteStore;
+
+        let root = tempfile::tempdir().expect("root");
+        let work = root.path().join("transcode");
+        let finished = root.path().join("cache").join("transcode");
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let manager = TranscodeManager::new(store, work, EncoderCaps::default(), Pipeline::Cpu)
+            .with_cache(finished, "test-ffmpeg".into(), "test-node".into());
+
+        let expected = root.path().join("cache").join("runtime");
+        assert_eq!(manager.runtime_cache, expected);
+        assert!(expected.is_dir(), "the cache exists before ffmpeg starts");
+
+        let mut command = tokio::process::Command::new("ffmpeg");
+        configure_ffmpeg_runtime(&mut command, &manager.runtime_cache);
+        let inherited = command
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == "XDG_CACHE_HOME")
+            .and_then(|(_, value)| value)
+            .expect("XDG_CACHE_HOME");
+        assert_eq!(inherited, expected.as_os_str());
+    }
 
     #[test]
     fn safe_segment_names() {
