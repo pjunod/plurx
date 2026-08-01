@@ -173,31 +173,63 @@ struct PlayContext: Identifiable {
     var overview: String? = nil
 }
 
-/// Keeps the readable detail column centered on large screens without ever
-/// growing wider than the compact device that contains it.
-struct DetailBodyFrame<Content: View>: View {
-    @ViewBuilder let content: Content
+enum DetailLayoutMetrics {
+    static let maximumBodyWidth: CGFloat = 980 - (2 * screenHPad)
 
-    var body: some View {
-        content
-            // Reserve both insets before proposing a width to the content.
-            // This keeps a wide child from consuming the trailing padding.
-            .frame(maxWidth: 980 - (2 * screenHPad), alignment: .leading)
-            .frame(maxWidth: .infinity, alignment: .center)
-            .padding(.horizontal, screenHPad)
+    static func bodyWidth(in viewportWidth: CGFloat) -> CGFloat {
+        min(maximumBodyWidth, max(0, viewportWidth - (2 * screenHPad)))
     }
 }
 
-/// Constrains the detail page to the ScrollView's visible width. Unlike an
-/// outer GeometryReader, this accounts for the navigation container's safe
-/// area and any iPad sidebar before proposing a width to the page content.
+private struct DetailViewportWidthKey: EnvironmentKey {
+    static let defaultValue: CGFloat? = nil
+}
+
+private extension EnvironmentValues {
+    var detailViewportWidth: CGFloat? {
+        get { self[DetailViewportWidthKey.self] }
+        set { self[DetailViewportWidthKey.self] = newValue }
+    }
+}
+
+/// Keeps the readable detail column centered on large screens without ever
+/// growing wider than the compact device that contains it.
+struct DetailBodyFrame<Content: View>: View {
+    @Environment(\.detailViewportWidth) private var viewportWidth
+    @ViewBuilder let content: Content
+
+    @ViewBuilder
+    var body: some View {
+        if let viewportWidth {
+            content
+                .frame(
+                    width: DetailLayoutMetrics.bodyWidth(in: viewportWidth),
+                    alignment: .leading
+                )
+                .frame(width: viewportWidth, alignment: .center)
+        } else {
+            content
+                .frame(maxWidth: DetailLayoutMetrics.maximumBodyWidth, alignment: .leading)
+                .frame(maxWidth: .infinity, alignment: .center)
+                .padding(.horizontal, screenHPad)
+        }
+    }
+}
+
+/// Reads the actual navigation viewport and pins the full page to that exact
+/// width. `containerRelativeFrame` can instead read the underlying tab
+/// container on iPhone, which is wider than a pushed navigation destination.
 struct DetailViewportFrame<Content: View>: View {
     @ViewBuilder let content: Content
 
     var body: some View {
-        ScrollView {
-            content
-                .containerRelativeFrame(.horizontal, alignment: .leading)
+        GeometryReader { viewport in
+            ScrollView {
+                content
+                    .environment(\.detailViewportWidth, viewport.size.width)
+                    .frame(width: viewport.size.width, alignment: .leading)
+            }
+            .frame(width: viewport.size.width, height: viewport.size.height)
         }
     }
 }
