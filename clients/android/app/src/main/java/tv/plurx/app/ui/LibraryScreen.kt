@@ -15,7 +15,6 @@ import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -33,6 +32,7 @@ import tv.plurx.app.ui.components.ChoicePicker
 import tv.plurx.app.ui.components.LoadingBox
 import tv.plurx.app.ui.components.PosterCard
 import tv.plurx.app.ui.components.SafeTopRow
+import tv.plurx.app.ui.components.TvIconButton
 import tv.plurx.app.ui.theme.Muted
 
 private enum class WatchFilter(val label: String) {
@@ -71,7 +71,7 @@ fun LibraryScreen(
         SafeTopRow(
             Modifier.fillMaxWidth().padding(start = side - 12.dp, end = side, top = 8.dp),
         ) {
-            IconButton(onClick = onBack) {
+            TvIconButton(onClick = onBack) {
                 Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
             }
             Column(Modifier.weight(1f)) {

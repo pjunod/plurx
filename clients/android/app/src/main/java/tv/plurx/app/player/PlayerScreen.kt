@@ -42,10 +42,8 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.PictureInPictureAlt
 import androidx.compose.material.icons.filled.Replay10
 import androidx.compose.material.icons.filled.Tune
-import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Slider
@@ -66,6 +64,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.onPreviewKeyEvent
@@ -99,7 +98,10 @@ import tv.plurx.app.data.SubTrack
 import tv.plurx.app.ui.AppViewModel
 import tv.plurx.app.ui.PlaybackTarget
 import tv.plurx.app.ui.components.LoadingBox
+import tv.plurx.app.ui.components.TvButton
+import tv.plurx.app.ui.components.TvIconButton
 import tv.plurx.app.ui.components.formatTime
+import tv.plurx.app.ui.components.tvFocusRing
 import tv.plurx.app.ui.theme.Accent
 import tv.plurx.app.ui.theme.Muted
 import tv.plurx.app.ui.theme.Surface
@@ -311,7 +313,7 @@ private fun PlaybackFailed(onExit: () -> Unit) {
     ) {
         Text("Couldn't start playback.", color = Color.White)
         Spacer(Modifier.size(12.dp))
-        Button(onClick = onExit) { Text("Back") }
+        TvButton(onClick = onExit) { Text("Back") }
     }
 }
 
@@ -574,7 +576,7 @@ private fun PlayerContent(
 
         if (!isInPip) {
             Box(
-                Modifier.fillMaxSize().clickable(
+                Modifier.fillMaxSize().focusProperties { canFocus = false }.clickable(
                     interactionSource = remember { MutableInteractionSource() },
                     indication = null,
                 ) { if (controlsVisible) controlsVisible = false else poke() },
@@ -589,7 +591,7 @@ private fun PlayerContent(
         }
 
         if (!isInPip && activeMarker != null && !scrubbing && !preferences.autoSkip) {
-            Button(
+            TvButton(
                 onClick = { controller.seekTo(activeMarker.end_ms); poke() },
                 modifier = Modifier.align(Alignment.BottomEnd).padding(end = 28.dp, bottom = 112.dp),
             ) { Text(activeMarker.label, fontWeight = FontWeight.SemiBold) }
@@ -681,7 +683,7 @@ private fun Controls(
             Modifier.align(Alignment.TopStart).fillMaxWidth().padding(12.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            IconButton(onClick = onBack) {
+            TvIconButton(onClick = onBack) {
                 Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back", tint = Color.White)
             }
             Text(
@@ -692,17 +694,17 @@ private fun Controls(
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.weight(1f),
             )
-            IconButton(onClick = onTracks) {
+            TvIconButton(onClick = onTracks) {
                 Icon(Icons.Filled.ClosedCaption, contentDescription = "Audio and subtitles", tint = Color.White)
             }
-            IconButton(onClick = onSettings) {
+            TvIconButton(onClick = onSettings) {
                 Icon(Icons.Filled.Tune, contentDescription = "Playback settings", tint = Color.White)
             }
-            IconButton(onClick = onInfo) {
+            TvIconButton(onClick = onInfo) {
                 Icon(Icons.Filled.Info, contentDescription = "Playback info", tint = Color.White)
             }
             if (onPip != null) {
-                IconButton(onClick = onPip) {
+                TvIconButton(onClick = onPip) {
                     Icon(Icons.Filled.PictureInPictureAlt, contentDescription = "Picture in picture", tint = Color.White)
                 }
             }
@@ -713,10 +715,10 @@ private fun Controls(
             horizontalArrangement = Arrangement.spacedBy(28.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            IconButton(onClick = onSeekBack, modifier = Modifier.size(56.dp)) {
+            TvIconButton(onClick = onSeekBack, modifier = Modifier.size(56.dp)) {
                 Icon(Icons.Filled.Replay10, contentDescription = "Back 10 seconds", tint = Color.White, modifier = Modifier.size(42.dp))
             }
-            IconButton(onClick = onPlayPause, modifier = Modifier.size(76.dp)) {
+            TvIconButton(onClick = onPlayPause, modifier = Modifier.size(76.dp)) {
                 Icon(
                     if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
                     contentDescription = if (isPlaying) "Pause" else "Play",
@@ -724,7 +726,7 @@ private fun Controls(
                     modifier = Modifier.size(62.dp),
                 )
             }
-            IconButton(onClick = onSeekForward, modifier = Modifier.size(56.dp)) {
+            TvIconButton(onClick = onSeekForward, modifier = Modifier.size(56.dp)) {
                 Icon(Icons.Filled.Forward10, contentDescription = "Forward 10 seconds", tint = Color.White, modifier = Modifier.size(42.dp))
             }
         }
@@ -826,7 +828,7 @@ internal fun PlaybackInfoOverlay(
 ) {
     val shape = MaterialTheme.shapes.large
     Box(
-        Modifier.fillMaxSize().clickable(
+        Modifier.fillMaxSize().focusProperties { canFocus = false }.clickable(
             interactionSource = remember { MutableInteractionSource() },
             indication = null,
             onClick = onDismiss,
@@ -842,6 +844,7 @@ internal fun PlaybackInfoOverlay(
                 .clip(shape)
                 .background(Color(0xD917181E))
                 .border(1.dp, Color.White.copy(alpha = 0.14f), shape)
+                .focusProperties { canFocus = false }
                 .clickable(
                     interactionSource = remember { MutableInteractionSource() },
                     indication = null,
@@ -872,7 +875,7 @@ internal fun PlaybackInfoOverlay(
                         overflow = TextOverflow.Ellipsis,
                     )
                 }
-                IconButton(onClick = onDismiss) {
+                TvIconButton(onClick = onDismiss) {
                     Icon(Icons.Filled.Close, contentDescription = "Close playback info", tint = Color.White)
                 }
             }
@@ -944,16 +947,23 @@ private fun PlaybackInfoRow(label: String, value: String) {
 
 @Composable
 private fun PlayerPanelSurface(title: String, onDismiss: () -> Unit, content: @Composable ColumnScope.() -> Unit) {
-    Box(Modifier.fillMaxSize().background(Color(0x99000000)).clickable(onClick = onDismiss)) {
+    Box(
+        Modifier
+            .fillMaxSize()
+            .background(Color(0x99000000))
+            .focusProperties { canFocus = false }
+            .clickable(onClick = onDismiss),
+    ) {
         Column(
             Modifier.align(Alignment.CenterEnd).fillMaxHeight().widthIn(max = 420.dp).fillMaxWidth(0.92f)
                 .background(Surface).verticalScroll(rememberScrollState()).padding(24.dp)
+                .focusProperties { canFocus = false }
                 .clickable(onClick = {}),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(title, style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f))
-                IconButton(onClick = onDismiss) {
+                TvIconButton(onClick = onDismiss) {
                     Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Close")
                 }
             }
@@ -968,15 +978,27 @@ private fun PanelRow(label: String, selected: Boolean, onClick: () -> Unit) {
         (if (selected) "●  " else "    ") + label,
         color = if (selected) Accent else Color.White,
         fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
-        modifier = Modifier.fillMaxWidth().clickable(onClick = onClick).padding(vertical = 9.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .tvFocusRing(MaterialTheme.shapes.small, focusedScale = 1.02f)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 8.dp, vertical = 9.dp),
     )
 }
 
 @Composable
 private fun PanelSwitch(label: String, checked: Boolean, onCheckedChange: (Boolean) -> Unit) {
-    Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .padding(top = 8.dp)
+            .tvFocusRing(MaterialTheme.shapes.small, focusedScale = 1.02f)
+            .clickable { onCheckedChange(!checked) }
+            .padding(horizontal = 8.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
         Text(label, color = Color.White, modifier = Modifier.weight(1f))
-        Switch(checked = checked, onCheckedChange = onCheckedChange)
+        Switch(checked = checked, onCheckedChange = null)
     }
 }
 
@@ -988,7 +1010,7 @@ private fun offsetLabel(ms: Long): String = if (ms == 0L) {
 
 @Composable
 private fun BackChip(onExit: () -> Unit) {
-    IconButton(onClick = onExit, modifier = Modifier.padding(4.dp)) {
+    TvIconButton(onClick = onExit, modifier = Modifier.padding(4.dp)) {
         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back", tint = Color.White)
     }
 }

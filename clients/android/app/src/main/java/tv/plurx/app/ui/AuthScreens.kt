@@ -22,13 +22,10 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -49,6 +46,9 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import tv.plurx.app.ui.theme.Accent
 import tv.plurx.app.ui.theme.Muted
+import tv.plurx.app.ui.components.TvButton
+import tv.plurx.app.ui.components.TvOutlinedButton
+import tv.plurx.app.ui.components.TvTextButton
 
 private const val LocalNetworkPermission = "android.permission.ACCESS_LOCAL_NETWORK"
 
@@ -136,7 +136,7 @@ fun ConnectScreen(vm: AppViewModel, busy: Boolean, error: String?) {
                 style = MaterialTheme.typography.labelMedium,
             )
             discovery.servers.forEach { server ->
-                OutlinedButton(
+                TvOutlinedButton(
                     onClick = { vm.connect(server) },
                     enabled = !busy,
                     modifier = Modifier.fillMaxWidth(),
@@ -153,7 +153,7 @@ fun ConnectScreen(vm: AppViewModel, busy: Boolean, error: String?) {
             }
         }
 
-        TextButton(onClick = { showManual = !showManual }) {
+        TvTextButton(onClick = { showManual = !showManual }) {
             Text(if (showManual) "Hide manual setup" else "+ Add server manually", color = Muted)
         }
 
@@ -167,7 +167,7 @@ fun ConnectScreen(vm: AppViewModel, busy: Boolean, error: String?) {
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri, imeAction = ImeAction.Go),
                 modifier = Modifier.fillMaxWidth(),
             )
-            Button(
+            TvButton(
                 onClick = { vm.connect(url) },
                 enabled = !busy && url.isNotBlank(),
                 modifier = Modifier.fillMaxWidth(),
@@ -199,7 +199,7 @@ fun ConnectScreen(vm: AppViewModel, busy: Boolean, error: String?) {
             Text(discovery.error!!, color = Muted, style = MaterialTheme.typography.labelMedium)
         }
 
-        TextButton(
+        TvTextButton(
             onClick = {
                 if (hasLocalNetworkPermission()) {
                     vm.restartServerDiscovery()
@@ -234,7 +234,7 @@ fun LoginScreen(vm: AppViewModel, busy: Boolean, error: String?) {
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password, imeAction = ImeAction.Go),
             modifier = Modifier.fillMaxWidth(),
         )
-        Button(
+        TvButton(
             onClick = { vm.login(user, pass) },
             enabled = !busy && user.isNotBlank() && pass.isNotBlank(),
             modifier = Modifier.fillMaxWidth(),
@@ -242,6 +242,6 @@ fun LoginScreen(vm: AppViewModel, busy: Boolean, error: String?) {
             if (busy) CircularProgressIndicator(Modifier.padding(2.dp), strokeWidth = 2.dp, color = androidx.compose.ui.graphics.Color.White)
             else Text("Sign in")
         }
-        TextButton(onClick = { vm.changeServer() }) { Text("Use a different server", color = Muted) }
+        TvTextButton(onClick = { vm.changeServer() }) { Text("Use a different server", color = Muted) }
     }
 }

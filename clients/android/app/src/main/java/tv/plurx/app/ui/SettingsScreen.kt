@@ -1,5 +1,6 @@
 package tv.plurx.app.ui
 
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
@@ -13,9 +14,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -34,6 +33,9 @@ import tv.plurx.app.data.PosterSize
 import tv.plurx.app.data.ThemeId
 import tv.plurx.app.ui.components.ChoicePicker
 import tv.plurx.app.ui.components.SafeTopRow
+import tv.plurx.app.ui.components.TvIconButton
+import tv.plurx.app.ui.components.TvOutlinedButton
+import tv.plurx.app.ui.components.tvFocusRing
 import tv.plurx.app.ui.theme.Muted
 
 private val LANGS = listOf(
@@ -55,7 +57,7 @@ fun SettingsScreen(vm: AppViewModel, onBack: () -> Unit) {
         SafeTopRow(
             Modifier.fillMaxWidth().padding(start = side - 12.dp, end = side, top = 8.dp),
         ) {
-            IconButton(onClick = onBack) {
+            TvIconButton(onClick = onBack) {
                 Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
             }
             Text("Settings", style = MaterialTheme.typography.titleLarge)
@@ -107,8 +109,8 @@ fun SettingsScreen(vm: AppViewModel, onBack: () -> Unit) {
                     style = MaterialTheme.typography.bodyMedium,
                 )
                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    OutlinedButton(onClick = vm::logout) { Text("Sign out") }
-                    OutlinedButton(onClick = vm::changeServer) { Text("Change server") }
+                    TvOutlinedButton(onClick = vm::logout) { Text("Sign out") }
+                    TvOutlinedButton(onClick = vm::changeServer) { Text("Change server") }
                 }
             }
         }
@@ -130,8 +132,15 @@ private fun SettingsSection(
 
 @Composable
 private fun PreferenceSwitch(label: String, checked: Boolean, onCheckedChange: (Boolean) -> Unit) {
-    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .tvFocusRing(MaterialTheme.shapes.small, focusedScale = 1.02f)
+            .clickable { onCheckedChange(!checked) }
+            .padding(horizontal = 8.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
         Text(label, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
-        Switch(checked = checked, onCheckedChange = onCheckedChange)
+        Switch(checked = checked, onCheckedChange = null)
     }
 }
