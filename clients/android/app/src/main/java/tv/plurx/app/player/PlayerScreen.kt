@@ -83,6 +83,7 @@ import androidx.media3.common.Format
 import androidx.media3.common.Player
 import androidx.media3.common.VideoSize
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import androidx.core.app.PictureInPictureModeChangedInfo
@@ -92,6 +93,7 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import java.util.Locale
 import kotlin.math.roundToInt
 import tv.plurx.app.data.AudioTrack
 import tv.plurx.app.data.Decision
@@ -884,6 +886,7 @@ private fun PlayerInfo(plan: Plan, controller: Controller, positionMs: Long, onD
             position = "${formatTime(positionMs)} / ${formatTime(plan.durationMs)}",
             buffer = "${formatTime((player.bufferedPosition - player.currentPosition).coerceAtLeast(0))} ahead · " +
                 "${player.bufferedPercentage.coerceIn(0, 100)}%",
+            videoHealth = videoHealthSummary(player),
             sourceFile = plan.source?.filename,
             sourceVideo = sourceVideoSummary(plan.source),
             sourceAudio = sourceAudioSummary(plan.source),
@@ -904,6 +907,7 @@ internal data class PlaybackInfoDetails(
     val delivery: String,
     val position: String,
     val buffer: String,
+    val videoHealth: String? = null,
     val sourceFile: String? = null,
     val sourceVideo: String? = null,
     val sourceAudio: String? = null,
@@ -953,22 +957,26 @@ internal fun PlaybackInfoOverlay(
         ) {
             Row(verticalAlignment = Alignment.Top) {
                 Column(Modifier.weight(1f)) {
-                    Text(
-                        "PLAYBACK",
-                        color = Accent,
-                        style = MaterialTheme.typography.labelMedium,
-                        fontWeight = FontWeight.Bold,
-                    )
-                    Text(
-                        "Playback info",
-                        color = Color.White,
-                        style = MaterialTheme.typography.titleLarge,
-                    )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            "Playback info",
+                            color = Color.White,
+                            style = MaterialTheme.typography.titleLarge,
+                        )
+                        Text(
+                            details.position,
+                            color = Accent,
+                            style = MaterialTheme.typography.labelLarge,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.padding(start = 16.dp),
+                            maxLines = 1,
+                        )
+                    }
                     Text(
                         details.title,
                         color = Color.White.copy(alpha = 0.72f),
                         style = MaterialTheme.typography.bodyMedium,
-                        maxLines = 2,
+                        maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                     )
                 }
@@ -986,8 +994,8 @@ internal fun PlaybackInfoOverlay(
                 label = "Delivery",
                 value = details.delivery,
             )
-            PlaybackInfoRow("Position", details.position)
             PlaybackInfoRow("Buffer", details.buffer)
+            details.videoHealth?.let { PlaybackInfoRow("Frames", it) }
 
             PlaybackInfoSection("SOURCE MEDIA")
             details.sourceFile?.let { PlaybackInfoRow("File", it) }
@@ -1129,6 +1137,35 @@ private fun formatBitrate(bitsPerSecond: Long): String = if (bitsPerSecond >= 1_
     "%.1f Mbps".format(bitsPerSecond / 1_000_000.0)
 } else {
     "${bitsPerSecond / 1_000} kbps"
+}
+
+private fun videoHealthSummary(player: ExoPlayer): String? {
+    val counters = player.videoDecoderCounters ?: return null
+    counters.ensureUpdated()
+    return videoHealthSummary(
+        renderedFrames = counters.renderedOutputBufferCount,
+        droppedFrames = counters.droppedBufferCount,
+        maxConsecutiveDroppedFrames = counters.maxConsecutiveDroppedBufferCount,
+    )
+}
+
+internal fun videoHealthSummary(
+    renderedFrames: Int,
+    droppedFrames: Int,
+    maxConsecutiveDroppedFrames: Int,
+): String {
+    val rendered = renderedFrames.coerceAtLeast(0)
+    val dropped = droppedFrames.coerceAtLeast(0)
+    val total = rendered.toLong() + dropped
+    val dropRate = if (total == 0L) 0.0 else dropped * 100.0 / total
+    return String.format(
+        Locale.US,
+        "%,d rendered · %,d dropped (%.1f%%) · max streak %,d",
+        rendered,
+        dropped,
+        dropRate,
+        maxConsecutiveDroppedFrames.coerceAtLeast(0),
+    )
 }
 
 @Composable
