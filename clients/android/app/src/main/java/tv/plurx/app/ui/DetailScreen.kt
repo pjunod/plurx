@@ -26,6 +26,7 @@ import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -55,6 +56,7 @@ import tv.plurx.app.ui.components.PosterCard
 import tv.plurx.app.ui.components.SafeBackButton
 import tv.plurx.app.ui.components.TvButton
 import tv.plurx.app.ui.components.TvOutlinedButton
+import tv.plurx.app.ui.components.TvTextButton
 import tv.plurx.app.ui.components.formatTime
 import tv.plurx.app.ui.components.imageUrl
 import tv.plurx.app.ui.components.tvFocusRing
@@ -64,7 +66,11 @@ import tv.plurx.app.ui.theme.Muted
 import tv.plurx.app.ui.theme.Outline
 import tv.plurx.app.ui.theme.SurfaceHi
 
-private data class DetailLoad(val detail: ItemDetail? = null, val error: String? = null)
+private data class DetailLoad(
+    val detail: ItemDetail? = null,
+    val seriesPlayback: EpisodePlaybackTarget? = null,
+    val error: String? = null,
+)
 
 @Composable
 fun DetailScreen(
@@ -78,7 +84,11 @@ fun DetailScreen(
     var refresh by remember(itemId) { mutableIntStateOf(0) }
     val load by produceState<DetailLoad?>(initialValue = null, itemId, refresh) {
         value = try {
-            DetailLoad(detail = vm.itemDetail(itemId))
+            val detail = vm.itemDetail(itemId)
+            DetailLoad(
+                detail = detail,
+                seriesPlayback = runCatching { vm.seriesPlayback(detail) }.getOrNull(),
+            )
         } catch (e: Exception) {
             DetailLoad(error = e.message ?: "Couldn't load this item")
         }
@@ -96,6 +106,7 @@ fun DetailScreen(
         else -> DetailContent(
             vm = vm,
             detail = load!!.detail!!,
+            seriesPlayback = load!!.seriesPlayback,
             onPlay = onPlay,
             onOpenItem = onOpenItem,
             onViewPhoto = onViewPhoto,
@@ -109,6 +120,7 @@ fun DetailScreen(
 private fun DetailContent(
     vm: AppViewModel,
     detail: ItemDetail,
+    seriesPlayback: EpisodePlaybackTarget?,
     onPlay: (Long, Long, Long) -> Unit,
     onOpenItem: (Long) -> Unit,
     onViewPhoto: (Long) -> Unit,
@@ -118,6 +130,8 @@ private fun DetailContent(
     val formFactor = currentFormFactor()
     val side = formFactor.horizontalPadding()
     val item = detail.item
+    val scope = rememberCoroutineScope()
+    var startingEpisodeId by remember(item.id) { mutableStateOf<Long?>(null) }
     val best = detail.files.firstOrNull()
     val durationMs = best?.duration_ms ?: item.runtime_ms
     val resumeMs = item.watch?.position_ms ?: 0L
@@ -181,6 +195,7 @@ private fun DetailContent(
                         vm = vm,
                         item = item,
                         files = detail.files,
+                        seriesPlayback = seriesPlayback,
                         resumeMs = resumeMs,
                         canResume = canResume,
                         onPlay = onPlay,
@@ -221,7 +236,21 @@ private fun DetailContent(
             }
             if (detail.children.firstOrNull()?.kind == "episode") {
                 items(detail.children, key = { it.id }) { child ->
-                    EpisodeRow(child, side) { onOpenItem(child.id) }
+                    EpisodeRow(child, side, starting = startingEpisodeId == child.id) {
+                        if (startingEpisodeId == null) {
+                            startingEpisodeId = child.id
+                            scope.launch {
+                                val result = runCatching { vm.episodePlayback(child) }.getOrNull()
+                                startingEpisodeId = null
+                                if (result != null) {
+                                    val target = result.playback
+                                    onPlay(target.itemId, target.fileId, target.startMs)
+                                } else {
+                                    onOpenItem(child.id)
+                                }
+                            }
+                        }
+                    }
                 }
             } else {
                 item {
@@ -247,6 +276,7 @@ private fun Actions(
     vm: AppViewModel,
     item: Item,
     files: List<MediaFileDto>,
+    seriesPlayback: EpisodePlaybackTarget?,
     resumeMs: Long,
     canResume: Boolean,
     onPlay: (Long, Long, Long) -> Unit,
@@ -265,6 +295,16 @@ private fun Actions(
                 TvButton(onClick = { onViewPhoto(item.id) }) {
                     Icon(Icons.Filled.Image, contentDescription = null)
                     Text("  View full size")
+                }
+            }
+        } else if (seriesPlayback != null) {
+            item {
+                TvButton(onClick = {
+                    val target = seriesPlayback.playback
+                    onPlay(target.itemId, target.fileId, target.startMs)
+                }) {
+                    Icon(Icons.Filled.PlayArrow, contentDescription = null, modifier = Modifier.size(20.dp))
+                    Text("  ${seriesPlayLabel(seriesPlayback)}", fontWeight = FontWeight.SemiBold)
                 }
             }
         } else if (playable != null && item.isPlayableVideo) {
@@ -289,28 +329,38 @@ private fun Actions(
         if (rollup != null) {
             if (rollup.leaves > rollup.watched) {
                 item {
-                    TvOutlinedButton(enabled = !changingWatch, onClick = {
+                    TvTextButton(enabled = !changingWatch, onClick = {
                         changingWatch = true
                         scope.launch { runCatching { vm.setWatched(item.id, true) }; changingWatch = false; onWatchedChanged() }
-                    }) { Text("Mark ${containerNoun(item.kind)} watched") }
+                    }) {
+                        Icon(Icons.Filled.CheckCircle, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Text("  ${markWatchedLabel(item.kind)}")
+                    }
                 }
             }
             if (rollup.watched > 0) {
                 item {
-                    TvOutlinedButton(enabled = !changingWatch, onClick = {
+                    TvTextButton(enabled = !changingWatch, onClick = {
                         changingWatch = true
                         scope.launch { runCatching { vm.setWatched(item.id, false) }; changingWatch = false; onWatchedChanged() }
-                    }) { Text("Mark ${containerNoun(item.kind)} unwatched") }
+                    }) {
+                        Icon(Icons.Filled.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Text("  ${markUnwatchedLabel(item.kind)}")
+                    }
                 }
             }
         } else if (item.kind != "photo") {
             item {
-                TvOutlinedButton(enabled = !changingWatch, onClick = {
+                TvTextButton(enabled = !changingWatch, onClick = {
                     changingWatch = true
                     scope.launch { runCatching { vm.setWatched(item.id, !watched) }; changingWatch = false; onWatchedChanged() }
                 }) {
-                    if (watched) Icon(Icons.Filled.CheckCircle, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Text(if (watched) "  Mark unwatched" else "Mark watched")
+                    Icon(
+                        if (watched) Icons.Filled.Refresh else Icons.Filled.CheckCircle,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp),
+                    )
+                    Text(if (watched) "  Mark unwatched" else "  Mark watched")
                 }
             }
         }
@@ -347,12 +397,12 @@ private fun VersionCard(file: MediaFileDto, showPlay: Boolean, onPlay: () -> Uni
 }
 
 @Composable
-private fun EpisodeRow(item: Item, side: androidx.compose.ui.unit.Dp, onClick: () -> Unit) {
+private fun EpisodeRow(item: Item, side: androidx.compose.ui.unit.Dp, starting: Boolean, onClick: () -> Unit) {
     Row(
         Modifier
             .fillMaxWidth()
             .tvFocusRing(MaterialTheme.shapes.medium, focusedScale = 1.02f)
-            .clickable(onClick = onClick)
+            .clickable(enabled = !starting, onClick = onClick)
             .padding(horizontal = side, vertical = 9.dp),
         horizontalArrangement = Arrangement.spacedBy(14.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -379,7 +429,11 @@ private fun EpisodeRow(item: Item, side: androidx.compose.ui.unit.Dp, onClick: (
                 Text(it, color = Muted, style = MaterialTheme.typography.bodyMedium, maxLines = 2, overflow = TextOverflow.Ellipsis)
             }
         }
-        Icon(Icons.Filled.PlayArrow, contentDescription = "Open episode", tint = Accent)
+        if (starting) {
+            CircularProgressIndicator(Modifier.size(24.dp), color = Accent, strokeWidth = 2.dp)
+        } else {
+            Icon(Icons.Filled.PlayArrow, contentDescription = "Play episode", tint = Accent)
+        }
     }
 }
 
@@ -430,10 +484,26 @@ private fun childrenHeading(kind: String): String = when (kind) {
     else -> "Contents"
 }
 
-private fun containerNoun(kind: String): String = when (kind) {
-    "show" -> "series"
-    "season" -> "season"
-    else -> "folder"
+private fun seriesPlayLabel(target: EpisodePlaybackTarget): String {
+    val episode = target.episode
+    val number = if (episode.season_number != null && episode.episode_number != null) {
+        "S${episode.season_number} · E${episode.episode_number}"
+    } else {
+        episode.title
+    }
+    return if (target.playback.startMs > 0L) "Resume $number" else "Play $number"
+}
+
+private fun markWatchedLabel(kind: String): String = when (kind) {
+    "show" -> "Mark all watched"
+    "season" -> "Mark season watched"
+    else -> "Mark watched"
+}
+
+private fun markUnwatchedLabel(kind: String): String = when (kind) {
+    "show" -> "Mark all unwatched"
+    "season" -> "Mark season unwatched"
+    else -> "Mark unwatched"
 }
 
 @Composable
