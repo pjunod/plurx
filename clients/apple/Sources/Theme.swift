@@ -170,6 +170,8 @@ enum TVPlayerChromeMetrics {
     static let headerVerticalInset: CGFloat = 5
     static let timeHorizontalInset: CGFloat = 6
     static let timeVerticalInset: CGFloat = 3
+    static let infoHeadingFontSize: CGFloat = 15
+    static let infoBodyFontSize: CGFloat = 26
 }
 
 /// Replaces tvOS's thick white focus plate with the same restrained red
@@ -213,6 +215,7 @@ struct TVMediaCardButtonStyle: ButtonStyle {
     static let outerStrokeWidth: CGFloat = 6
     static let fadeStrokeWidth: CGFloat = 4
     static let accentStrokeWidth: CGFloat = 2
+    static let contentClearance: CGFloat = 7
 
     func makeBody(configuration: Configuration) -> Body {
         Body(configuration: configuration)
@@ -224,19 +227,20 @@ struct TVMediaCardButtonStyle: ButtonStyle {
 
         var body: some View {
             let shape = RoundedRectangle(cornerRadius: 13, style: .continuous)
+            let ringShape = shape.inset(by: -TVMediaCardButtonStyle.contentClearance)
             configuration.label
                 .background(Palette.bg.opacity(isFocused ? 0.96 : 0), in: shape)
                 .overlay {
                     ZStack {
-                        shape.stroke(
+                        ringShape.stroke(
                             .black.opacity(0.96),
                             lineWidth: TVMediaCardButtonStyle.outerStrokeWidth
                         )
-                        shape.stroke(
+                        ringShape.stroke(
                             Palette.accent.opacity(0.32),
                             lineWidth: TVMediaCardButtonStyle.fadeStrokeWidth
                         )
-                        shape.stroke(
+                        ringShape.stroke(
                             Palette.accent.opacity(0.95),
                             lineWidth: TVMediaCardButtonStyle.accentStrokeWidth
                         )

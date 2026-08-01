@@ -419,16 +419,20 @@ struct PlayerView: View {
     private var nowPlayingInfoSection: some View {
         VStack(alignment: .leading, spacing: 5) {
             Text("NOW PLAYING")
-                .font(.system(size: 14, weight: .bold, design: .monospaced))
+                .font(.system(
+                    size: TVPlayerChromeMetrics.infoHeadingFontSize,
+                    weight: .bold,
+                    design: .monospaced
+                ))
                 .foregroundStyle(Palette.accent)
             Text(Self.nowPlayingSummary(overview))
-                .font(.system(size: 20, weight: .regular))
+                .font(.system(size: TVPlayerChromeMetrics.infoBodyFontSize, weight: .regular))
                 .foregroundStyle(.white.opacity(0.88))
-                .lineLimit(3)
+                .lineLimit(4)
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 8)
-        .frame(maxWidth: 820, alignment: .leading)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .frame(maxWidth: 980, alignment: .leading)
         .background(
             Palette.bg.opacity(0.68),
             in: RoundedRectangle(cornerRadius: 8, style: .continuous)
@@ -588,7 +592,7 @@ struct PlayerView: View {
         if let audio, let sound = soundLabel(audio) {
             badges.append(PlayerMetadataBadge(
                 kind: .audio,
-                symbol: "waveform",
+                symbol: "speaker.wave.3.fill",
                 mark: sound.mark,
                 accessibilityLabel: sound.accessibilityLabel
             ))

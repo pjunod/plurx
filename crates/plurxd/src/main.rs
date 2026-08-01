@@ -26,7 +26,9 @@ use std::time::Duration;
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use plurx_core::config::Config;
-use plurx_core::store::{keys, SqliteStore, Store, UserStore};
+use plurx_core::domain::LibraryKind;
+use plurx_core::metadata::{self, AniListClient, TmdbClient};
+use plurx_core::store::{keys, LibraryStore, SettingsStore, SqliteStore, Store, UserStore};
 use serde::Deserialize;
 use tracing_subscriber::EnvFilter;
 
@@ -82,6 +84,13 @@ enum Command {
         #[arg(long)]
         password: Option<String>,
     },
+    /// Force provider metadata and artwork back into the local cache. Useful
+    /// after an artwork-quality upgrade; safe beside the running server.
+    RefreshMetadata {
+        /// Refresh one library id instead of every provider-backed library.
+        #[arg(long)]
+        library: Option<i64>,
+    },
 }
 
 #[tokio::main]
@@ -102,7 +111,69 @@ async fn main() -> anyhow::Result<()> {
         Command::ResetPassword { username, password } => {
             reset_password(&config, &username, password).await
         }
+        Command::RefreshMetadata { library } => refresh_metadata(&config, library).await,
     }
+}
+
+/// Re-fetch provider-backed metadata without requiring an HTTP admin token.
+/// SQLite WAL permits this maintenance process beside the daemon, and artwork
+/// writes replace the same cache files the ordinary refresh path owns.
+async fn refresh_metadata(config: &Config, library_id: Option<i64>) -> anyhow::Result<()> {
+    std::fs::create_dir_all(&config.storage.data_dir)?;
+    let artwork_dir = config.storage.data_dir.join("artwork");
+    std::fs::create_dir_all(&artwork_dir)?;
+    let db_path = config.storage.data_dir.join("plurx.db");
+    let store = SqliteStore::open(&db_path)
+        .with_context(|| format!("opening database {}", db_path.display()))?;
+    let libraries = store.list_libraries().await?;
+
+    if let Some(id) = library_id {
+        anyhow::ensure!(
+            libraries.iter().any(|library| library.id == id),
+            "no library with id {id}"
+        );
+    }
+
+    let tmdb_key = store.get_setting(keys::TMDB_API_KEY).await?;
+    for library in libraries
+        .into_iter()
+        .filter(|library| library_id.is_none_or(|id| library.id == id))
+    {
+        match library.kind {
+            LibraryKind::Home => {
+                println!("{}: skipped local artwork", library.name);
+            }
+            LibraryKind::Shows if library.anime => {
+                let report = metadata::enrich_anime_library(
+                    &store,
+                    &AniListClient::new(),
+                    &artwork_dir,
+                    library.id,
+                    true,
+                    None,
+                )
+                .await;
+                println!("{}: {}", library.name, serde_json::to_string(&report)?);
+            }
+            LibraryKind::Movies | LibraryKind::Shows => {
+                let key = tmdb_key
+                    .as_deref()
+                    .filter(|key| !key.is_empty())
+                    .context("TMDB API key is not configured")?;
+                let report = metadata::enrich_library(
+                    &store,
+                    &TmdbClient::new(key),
+                    &artwork_dir,
+                    Some(library.id),
+                    true,
+                    None,
+                )
+                .await;
+                println!("{}: {}", library.name, serde_json::to_string(&report)?);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Console recovery path: rewrite one user's password hash and revoke their
@@ -763,6 +834,16 @@ fn healthcheck(config: &Config) -> anyhow::Result<()> {
 #[cfg(test)]
 mod discovery_tests {
     use super::*;
+
+    #[test]
+    fn refresh_metadata_can_target_one_library() {
+        let cli = Cli::try_parse_from(["plurxd", "refresh-metadata", "--library", "7"])
+            .expect("refresh command");
+        assert!(matches!(
+            cli.command,
+            Some(Command::RefreshMetadata { library: Some(7) })
+        ));
+    }
 
     #[test]
     fn gdm_port_defaults_and_accepts_an_override() {

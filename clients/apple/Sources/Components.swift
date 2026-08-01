@@ -16,15 +16,14 @@ enum MediaRowStyle: Equatable {
     case episode
 }
 
-enum MediaCardResolutionPlacement: Equatable {
-    case artworkBadge
-    case trailingMetadata
+enum LandscapeCardCopyStyle: Equatable {
+    case plain
+    case accentPanel
 }
 
 struct PosterCard: View {
     let item: Item
     var width: CGFloat = shelfPosterWidth
-    var resolutionPlacement: MediaCardResolutionPlacement = .artworkBadge
 
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
@@ -63,9 +62,7 @@ struct PosterCard: View {
                 .foregroundColor(Palette.onBg)
                 .lineLimit(1)
             let metadata = cardShelfMetadata(item)
-            let trailingResolution = resolutionPlacement == .trailingMetadata
-                ? resolutionLabel(item.resolution)
-                : nil
+            let trailingResolution = resolutionLabel(item.resolution)
             if !metadata.isEmpty || trailingResolution != nil {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
                     if !metadata.isEmpty {
@@ -95,15 +92,6 @@ struct PosterCard: View {
                     .padding(7)
             }
             Spacer()
-            if resolutionPlacement == .artworkBadge,
-               let label = resolutionLabel(item.resolution) {
-                Text(label)
-                    .font(.system(.caption2, design: .monospaced).weight(.bold))
-                    .foregroundColor(.white)
-                    .padding(.horizontal, 6).padding(.vertical, 3)
-                    .background(.black.opacity(0.72), in: Capsule())
-                    .padding(7)
-            }
         }
     }
 }
@@ -112,6 +100,7 @@ struct LandscapeCard: View {
     let item: Item
     var width: CGFloat = shelfLandscapeWidth
     var reservesEpisodeSubtitleLine = false
+    var copyStyle: LandscapeCardCopyStyle = .plain
 
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
@@ -134,36 +123,56 @@ struct LandscapeCard: View {
                     }
                 }
             }
-            Text(landscapeCardShowTitle(item) ?? item.title)
-                #if os(tvOS)
-                .font(.callout.weight(.semibold))
-                #else
-                .font(.headline.weight(.semibold))
-                #endif
-                .foregroundColor(Palette.onBg)
-                .lineLimit(1)
-            if landscapeCardShowTitle(item) != nil {
-                Text(item.title)
-                    .font(.caption)
-                    .foregroundColor(Palette.muted)
+            VStack(alignment: .leading, spacing: 5) {
+                Text(landscapeCardShowTitle(item) ?? item.title)
+                    #if os(tvOS)
+                    .font(.callout.weight(.semibold))
+                    #else
+                    .font(.headline.weight(.semibold))
+                    #endif
+                    .foregroundColor(Palette.onBg)
                     .lineLimit(1)
-            } else if reservesEpisodeSubtitleLine {
-                Text("Episode title")
-                    .font(.caption)
-                    .hidden()
-                    .accessibilityHidden(true)
+
+                if landscapeCardShowTitle(item) != nil {
+                    Text(item.title)
+                        .font(.caption)
+                        .foregroundColor(Palette.muted)
+                        .lineLimit(1)
+                }
+
+                let metadata = cardShelfMetadata(item)
+                if !metadata.isEmpty {
+                    Text(metadata)
+                        .font(.system(.caption2, design: .rounded).weight(.medium))
+                        .foregroundColor(Palette.muted)
+                        .lineLimit(1)
+                } else {
+                    Text("Metadata")
+                        .font(.system(.caption2, design: .rounded).weight(.medium))
+                        .hidden()
+                        .accessibilityHidden(true)
+                }
+
+                if landscapeCardShowTitle(item) == nil, reservesEpisodeSubtitleLine {
+                    Text("Episode title")
+                        .font(.caption)
+                        .hidden()
+                        .accessibilityHidden(true)
+                }
             }
-            let metadata = cardShelfMetadata(item)
-            if !metadata.isEmpty {
-                Text(metadata)
-                    .font(.system(.caption2, design: .rounded).weight(.medium))
-                    .foregroundColor(Palette.muted)
-                    .lineLimit(1)
-            } else {
-                Text("Metadata")
-                    .font(.system(.caption2, design: .rounded).weight(.medium))
-                    .hidden()
-                    .accessibilityHidden(true)
+            .padding(.horizontal, copyStyle == .accentPanel ? 10 : 0)
+            .padding(.vertical, copyStyle == .accentPanel ? 7 : 0)
+            .background {
+                if copyStyle == .accentPanel {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(Palette.accent.opacity(0.18))
+                }
+            }
+            .overlay {
+                if copyStyle == .accentPanel {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .stroke(Palette.accent.opacity(0.58), lineWidth: 1)
+                }
             }
         }
         .frame(width: width, alignment: .leading)
@@ -237,7 +246,7 @@ struct MediaRow: View {
     var style: MediaRowStyle = .poster
     var collection: LibraryCollection?
     var destination: LibraryCollection?
-    var resolutionPlacement: MediaCardResolutionPlacement = .artworkBadge
+    var landscapeCopyStyle: LandscapeCardCopyStyle = .plain
 
     var body: some View {
         if !items.isEmpty {
@@ -269,14 +278,14 @@ struct MediaRow: View {
                                 case .poster:
                                     PosterCard(
                                         item: item,
-                                        width: model.posterSize.posterWidth,
-                                        resolutionPlacement: resolutionPlacement
+                                        width: model.posterSize.posterWidth
                                     )
                                 case .landscape:
                                     LandscapeCard(
                                         item: item,
                                         width: model.posterSize.landscapeWidth,
-                                        reservesEpisodeSubtitleLine: reservesEpisodeSubtitleLine
+                                        reservesEpisodeSubtitleLine: reservesEpisodeSubtitleLine,
+                                        copyStyle: landscapeCopyStyle
                                     )
                                 case .episode:
                                     EpisodeCard(

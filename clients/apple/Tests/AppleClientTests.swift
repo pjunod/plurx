@@ -180,6 +180,10 @@ final class AppleClientTests: XCTestCase {
             PlayerView.playbackBadges(source: source, audio: audio).map(\.mark),
             [nil, "DV", "DD+ 5.1"]
         )
+        XCTAssertEqual(
+            PlayerView.playbackBadges(source: source, audio: audio).map(\.symbol),
+            ["4k.tv.fill", "sparkles", "speaker.wave.3.fill"]
+        )
     }
 
     func testPlayerOverlayAutoHidesWheneverItIsIdle() {
@@ -233,6 +237,7 @@ final class AppleClientTests: XCTestCase {
     #if os(tvOS)
     func testTVHomeStartsWithMediaRailsInsteadOfAFeaturedBillboard() {
         XCTAssertFalse(HomeLayoutPolicy.usesFeaturedHero)
+        XCTAssertEqual(HomeLayoutPolicy.continueWatchingCopyStyle, .accentPanel)
     }
 
     func testTVSeriesDetailKeepsCorrectArtworkRatioAndVisibleChildShelf() {
@@ -282,6 +287,19 @@ final class AppleClientTests: XCTestCase {
             DetailView.tvPlayableMetadataParts(item, file: file, durationMs: file.durationMs),
             ["Season 4, Episode 2", "54 min", "4K", "HEVC"]
         )
+        let badges = DetailView.itemMetadataBadges(
+            item,
+            file: file,
+            durationMs: file.durationMs,
+            includeSeries: false
+        )
+        XCTAssertEqual(
+            badges.map(\.symbol),
+            ["rectangle.stack.fill", "clock.fill", "4k.tv.fill", "film.fill"]
+        )
+        XCTAssertEqual(badges.map(\.accessibilityLabel), [
+            "Season 4, Episode 2", "54 min", "4K", "HEVC",
+        ])
     }
 
     func testTVActionButtonsRemainReadableWithAndWithoutFocus() {
@@ -332,6 +350,11 @@ final class AppleClientTests: XCTestCase {
             TVMediaCardButtonStyle.fadeStrokeWidth,
             TVMediaCardButtonStyle.accentStrokeWidth
         )
+        XCTAssertGreaterThan(
+            TVMediaCardButtonStyle.contentClearance,
+            TVMediaCardButtonStyle.outerStrokeWidth / 2,
+            "the curved ring must stay outside card text"
+        )
         XCTAssertEqual(
             TVMediaCardButtonStyle.outerStrokeWidth - TVMediaCardButtonStyle.fadeStrokeWidth,
             TVMediaCardButtonStyle.fadeStrokeWidth - TVMediaCardButtonStyle.accentStrokeWidth,
@@ -346,6 +369,7 @@ final class AppleClientTests: XCTestCase {
         XCTAssertLessThanOrEqual(TVPlayerChromeMetrics.headerVerticalInset, 5)
         XCTAssertLessThanOrEqual(TVPlayerChromeMetrics.timeHorizontalInset, 6)
         XCTAssertLessThanOrEqual(TVPlayerChromeMetrics.timeVerticalInset, 3)
+        XCTAssertGreaterThanOrEqual(TVPlayerChromeMetrics.infoBodyFontSize, 24)
         XCTAssertLessThanOrEqual(TVPlayerProgressFocusRing.outerStrokeWidth, 1.5)
         XCTAssertGreaterThan(
             TVPlayerProgressFocusRing.outerStrokeWidth,

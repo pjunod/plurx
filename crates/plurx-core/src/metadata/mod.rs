@@ -20,8 +20,12 @@ use crate::store::Store;
 
 /// Poster width bucket — small enough to be snappy in a grid, sharp on TV.
 const POSTER_SIZE: &str = "w500";
-const BACKDROP_SIZE: &str = "w1280";
-const STILL_SIZE: &str = "w300";
+// Backdrops and episode stills become full-width television heroes. The old
+// w1280/w300 cache buckets were visibly upscaled there, especially the w300
+// episode art. These files are downloaded once and then served locally, so
+// keeping TMDB's source resolution is the right tradeoff for large screens.
+const BACKDROP_SIZE: &str = "original";
+const STILL_SIZE: &str = "original";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 pub struct EnrichReport {
@@ -545,6 +549,12 @@ mod tests {
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn television_hero_art_keeps_source_resolution() {
+        assert_eq!(BACKDROP_SIZE, "original");
+        assert_eq!(STILL_SIZE, "original");
+    }
 
     async fn serve(app: axum::Router) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

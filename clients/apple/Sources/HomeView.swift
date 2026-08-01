@@ -191,7 +191,8 @@ private struct HomeDashboard: View {
         MediaRow(
             title: "Continue Watching",
             items: model.hubs.continueWatching ?? [],
-            style: .landscape
+            style: .landscape,
+            landscapeCopyStyle: HomeLayoutPolicy.continueWatchingCopyStyle
         )
         MediaRow(
             title: "Next Up",
@@ -200,8 +201,7 @@ private struct HomeDashboard: View {
         )
         MediaRow(
             title: "Recently Added",
-            items: model.hubs.recentlyAdded ?? [],
-            resolutionPlacement: .trailingMetadata
+            items: model.hubs.recentlyAdded ?? []
         )
         ComingSoonRow(entries: model.comingSoon)
 
@@ -253,6 +253,8 @@ private struct HomeDashboard: View {
 }
 
 enum HomeLayoutPolicy {
+    static let continueWatchingCopyStyle: LandscapeCardCopyStyle = .accentPanel
+
     #if os(tvOS)
     static let usesFeaturedHero = false
     #else

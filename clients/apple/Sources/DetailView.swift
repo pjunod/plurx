@@ -1,5 +1,65 @@
 import SwiftUI
 
+struct ItemMetadataBadge: Equatable, Identifiable {
+    enum Kind: String, Equatable {
+        case series
+        case episode
+        case year
+        case runtime
+        case resolution
+        case video
+    }
+
+    let kind: Kind
+    let symbol: String
+    let mark: String?
+    let accessibilityLabel: String
+
+    var id: String { kind.rawValue }
+}
+
+private struct ItemMetadataBadgeRow: View {
+    let badges: [ItemMetadataBadge]
+
+    var body: some View {
+        #if os(tvOS)
+        badgeContent
+        #else
+        ScrollView(.horizontal, showsIndicators: false) {
+            badgeContent
+        }
+        #endif
+    }
+
+    private var badgeContent: some View {
+        HStack(spacing: 9) {
+            ForEach(badges) { badge in
+                HStack(spacing: 6) {
+                    Image(systemName: badge.symbol)
+                    if let mark = badge.mark {
+                        Text(mark)
+                            .fontWeight(.semibold)
+                    }
+                }
+                .padding(.horizontal, 9)
+                .padding(.vertical, 5)
+                .background(Palette.surfaceHi.opacity(0.84), in: Capsule())
+                .overlay {
+                    Capsule().stroke(Palette.outline.opacity(0.72), lineWidth: 0.5)
+                }
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(badge.accessibilityLabel)
+            }
+        }
+        #if os(tvOS)
+        .font(.system(size: 19, weight: .medium, design: .rounded))
+        #else
+        .font(.system(.callout, design: .rounded))
+        #endif
+        .foregroundColor(Palette.onBg.opacity(0.86))
+    }
+}
+
 /// Identifies a play request for the full-screen player cover.
 struct PlayContext: Identifiable {
     let id = UUID()
@@ -155,10 +215,12 @@ struct DetailView: View {
                         #endif
                         .foregroundColor(Palette.onBg)
                         .fixedSize(horizontal: false, vertical: true)
-                    Text(metaLine(item, durationMs: durationMs))
-                        .font(.system(.callout, design: .monospaced))
-                        .foregroundColor(Palette.muted)
-                        .fixedSize(horizontal: false, vertical: true)
+                    ItemMetadataBadgeRow(badges: Self.itemMetadataBadges(
+                        item,
+                        file: file,
+                        durationMs: durationMs,
+                        includeSeries: true
+                    ))
 
                     if let file, item.isPlayable {
                         playbackActions(
@@ -271,6 +333,7 @@ struct DetailView: View {
             }
             .frame(height: TVPlayableDetailMetrics.heroHeight)
             .clipped()
+            .containerRelativeFrame(.vertical, alignment: .center)
 
             if let children = detail.children, !children.isEmpty {
                 MediaRow(title: childrenHeading(item.kind), items: children)
@@ -282,27 +345,12 @@ struct DetailView: View {
     }
 
     private func tvMetadataLine(_ item: Item, file: MediaFile?, durationMs: Int?) -> some View {
-        let facts = Self.tvPlayableMetadataParts(item, file: file, durationMs: durationMs)
-        return HStack(spacing: 13) {
-            ForEach(Array(facts.enumerated()), id: \.offset) { index, fact in
-                if index > 0 {
-                    Circle()
-                        .fill(Palette.accent.opacity(0.82))
-                        .frame(width: 5, height: 5)
-                }
-
-                Text(fact)
-                    .font(.system(
-                        size: 20,
-                        weight: index == 0 ? .semibold : .medium,
-                        design: .rounded
-                    ))
-                    .foregroundColor(
-                        index == 0 ? Palette.onBg : Palette.onBg.opacity(0.74)
-                    )
-            }
-        }
-        .lineLimit(1)
+        ItemMetadataBadgeRow(badges: Self.itemMetadataBadges(
+            item,
+            file: file,
+            durationMs: durationMs,
+            includeSeries: false
+        ))
     }
 
     @ViewBuilder
@@ -377,23 +425,6 @@ struct DetailView: View {
             parts.append(tvCodecLabel(codec))
         }
         return parts
-    }
-
-    private static func tvRuntimeLabel(_ durationMs: Int) -> String {
-        let totalMinutes = max(1, durationMs / 60_000)
-        let hours = totalMinutes / 60
-        let minutes = totalMinutes % 60
-        if hours == 0 { return "\(minutes) min" }
-        return minutes == 0 ? "\(hours) hr" : "\(hours) hr \(minutes) min"
-    }
-
-    private static func tvCodecLabel(_ codec: String) -> String {
-        switch codec.lowercased().replacingOccurrences(of: "-", with: "") {
-        case "h264", "avc": return "H.264"
-        case "h265", "hevc": return "HEVC"
-        case "av1": return "AV1"
-        default: return codec.uppercased()
-        }
     }
 
     private func tvSeriesContent(_ detail: ItemDetail) -> some View {
@@ -528,6 +559,87 @@ struct DetailView: View {
         kind == "season" ? .episode : .poster
     }
     #endif
+
+    static func itemMetadataBadges(
+        _ item: Item,
+        file: MediaFile?,
+        durationMs: Int?,
+        includeSeries: Bool
+    ) -> [ItemMetadataBadge] {
+        var badges: [ItemMetadataBadge] = []
+
+        if includeSeries,
+           item.kind == "episode",
+           let showTitle = item.showTitle,
+           !showTitle.isEmpty {
+            badges.append(ItemMetadataBadge(
+                kind: .series,
+                symbol: "tv.fill",
+                mark: showTitle,
+                accessibilityLabel: showTitle
+            ))
+        }
+        if item.kind == "episode", let season = item.seasonNumber, let episode = item.episodeNumber {
+            badges.append(ItemMetadataBadge(
+                kind: .episode,
+                symbol: "rectangle.stack.fill",
+                mark: "S\(season) E\(episode)",
+                accessibilityLabel: "Season \(season), Episode \(episode)"
+            ))
+        }
+        if item.kind != "episode", let year = item.year {
+            badges.append(ItemMetadataBadge(
+                kind: .year,
+                symbol: "calendar",
+                mark: String(year),
+                accessibilityLabel: String(year)
+            ))
+        }
+        if let durationMs, durationMs > 0 {
+            let runtime = tvRuntimeLabel(durationMs)
+            badges.append(ItemMetadataBadge(
+                kind: .runtime,
+                symbol: "clock.fill",
+                mark: runtime,
+                accessibilityLabel: runtime
+            ))
+        }
+        if let resolution = resolutionLabel(file?.height ?? item.resolution) {
+            badges.append(ItemMetadataBadge(
+                kind: .resolution,
+                symbol: resolution == "4K" ? "4k.tv.fill" : "tv.fill",
+                mark: resolution == "4K" ? nil : resolution.uppercased(),
+                accessibilityLabel: resolution
+            ))
+        }
+        if let codec = file?.videoCodec, !codec.isEmpty {
+            let label = tvCodecLabel(codec)
+            badges.append(ItemMetadataBadge(
+                kind: .video,
+                symbol: "film.fill",
+                mark: label,
+                accessibilityLabel: label
+            ))
+        }
+        return badges
+    }
+
+    private static func tvRuntimeLabel(_ durationMs: Int) -> String {
+        let totalMinutes = max(1, durationMs / 60_000)
+        let hours = totalMinutes / 60
+        let minutes = totalMinutes % 60
+        if hours == 0 { return "\(minutes) min" }
+        return minutes == 0 ? "\(hours) hr" : "\(hours) hr \(minutes) min"
+    }
+
+    private static func tvCodecLabel(_ codec: String) -> String {
+        switch codec.lowercased().replacingOccurrences(of: "-", with: "") {
+        case "h264", "avc": return "H.264"
+        case "h265", "hevc": return "HEVC"
+        case "av1": return "AV1"
+        default: return codec.uppercased()
+        }
+    }
 
     private func watchButton(_ detail: ItemDetail) -> some View {
         let watched = isWatched(detail.item)
