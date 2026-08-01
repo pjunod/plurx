@@ -324,6 +324,10 @@ final class AppleClientTests: XCTestCase {
     func testTVPlayerChromeStaysCompactWithAHairlineProgressFocusRing() {
         XCTAssertLessThanOrEqual(TVPlayerControlButtonStyle.width, 54)
         XCTAssertLessThanOrEqual(TVPlayerControlButtonStyle.height, 46)
+        XCTAssertLessThanOrEqual(TVPlayerChromeMetrics.headerHorizontalInset, 8)
+        XCTAssertLessThanOrEqual(TVPlayerChromeMetrics.headerVerticalInset, 5)
+        XCTAssertLessThanOrEqual(TVPlayerChromeMetrics.timeHorizontalInset, 6)
+        XCTAssertLessThanOrEqual(TVPlayerChromeMetrics.timeVerticalInset, 3)
         XCTAssertLessThanOrEqual(TVPlayerProgressFocusRing.outerStrokeWidth, 2)
         XCTAssertGreaterThan(
             TVPlayerProgressFocusRing.outerStrokeWidth,

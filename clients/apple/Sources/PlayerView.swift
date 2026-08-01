@@ -310,13 +310,22 @@ struct PlayerView: View {
     #endif
 
     private var playbackControls: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 6) {
+            #if os(tvOS)
             playbackInfoHeader
+                .padding(.horizontal, TVPlayerChromeMetrics.headerHorizontalInset)
+                .padding(.vertical, TVPlayerChromeMetrics.headerVerticalInset)
+                .background(
+                    Palette.bg.opacity(0.68),
+                    in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                )
+            #else
+            playbackInfoHeader
+            #endif
 
             if controller.knownDurationMs > 0 {
                 HStack(spacing: 10) {
-                    Text(formatTime(Int(isScrubbing ? scrubMs : Double(controller.currentMs))))
-                        .fixedSize()
+                    playbackTimeLabel(Int(isScrubbing ? scrubMs : Double(controller.currentMs)))
                     #if os(tvOS)
                     tvProgressBar
                     #else
@@ -338,8 +347,7 @@ struct PlayerView: View {
                     )
                     .tint(Palette.accent)
                     #endif
-                    Text(formatTime(controller.knownDurationMs))
-                        .fixedSize()
+                    playbackTimeLabel(controller.knownDurationMs)
                 }
                 .font(.system(.caption, design: .monospaced))
                 .foregroundColor(.white)
@@ -373,22 +381,32 @@ struct PlayerView: View {
         .buttonStyle(TVPlayerControlButtonStyle())
         .focusEffectDisabled()
         .foregroundStyle(.white)
+        .frame(maxWidth: .infinity)
         #else
         .font(.title3)
         .buttonStyle(.bordered)
         .tint(.white)
-        #endif
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
         .frame(maxWidth: .infinity)
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
+        #endif
+    }
+
+    private func playbackTimeLabel(_ milliseconds: Int) -> some View {
+        Text(formatTime(milliseconds))
+            .fixedSize()
+            #if os(tvOS)
+            .padding(.horizontal, TVPlayerChromeMetrics.timeHorizontalInset)
+            .padding(.vertical, TVPlayerChromeMetrics.timeVerticalInset)
+            .background(.black.opacity(0.58), in: Capsule())
+            #endif
     }
 
     private var playbackInfoHeader: some View {
         #if os(tvOS)
         HStack(alignment: .firstTextBaseline, spacing: 18) {
             playbackIdentity
-            Spacer(minLength: 12)
             playbackFacts
         }
         #else

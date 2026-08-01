@@ -162,6 +162,16 @@ enum TVPlayerProgressFocusRing {
     static let accentStrokeWidth: CGFloat = 0.5
 }
 
+/// Opaque player chrome is limited to the pixels immediately surrounding copy.
+/// The timeline and controls already carry their own contrast and need no
+/// full-width material panel behind them.
+enum TVPlayerChromeMetrics {
+    static let headerHorizontalInset: CGFloat = 8
+    static let headerVerticalInset: CGFloat = 5
+    static let timeHorizontalInset: CGFloat = 6
+    static let timeVerticalInset: CGFloat = 3
+}
+
 /// Replaces tvOS's thick white focus plate with the same restrained red
 /// signal used throughout plurx. The hero still lifts enough to read from the
 /// couch without turning the artwork into a glowing white rectangle.
