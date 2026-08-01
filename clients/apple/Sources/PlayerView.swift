@@ -313,12 +313,6 @@ struct PlayerView: View {
         VStack(alignment: .leading, spacing: 6) {
             #if os(tvOS)
             playbackInfoHeader
-                .padding(.horizontal, TVPlayerChromeMetrics.headerHorizontalInset)
-                .padding(.vertical, TVPlayerChromeMetrics.headerVerticalInset)
-                .background(
-                    Palette.bg.opacity(0.68),
-                    in: RoundedRectangle(cornerRadius: 8, style: .continuous)
-                )
             #else
             playbackInfoHeader
             #endif
@@ -407,8 +401,18 @@ struct PlayerView: View {
         #if os(tvOS)
         HStack(alignment: .firstTextBaseline, spacing: 18) {
             playbackIdentity
+                .padding(.horizontal, TVPlayerChromeMetrics.headerHorizontalInset)
+                .padding(.vertical, TVPlayerChromeMetrics.headerVerticalInset)
+                .background(
+                    Palette.bg.opacity(0.68),
+                    in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                )
+                .layoutPriority(1)
+            Spacer(minLength: 18)
             playbackFacts
+                .fixedSize(horizontal: true, vertical: false)
         }
+        .frame(maxWidth: .infinity)
         #else
         VStack(alignment: .leading, spacing: 7) {
             playbackIdentity
