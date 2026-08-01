@@ -2,6 +2,7 @@ package tv.plurx.app.ui
 
 import android.content.pm.PackageManager
 import android.os.Build
+import android.view.KeyEvent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
@@ -36,10 +37,16 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.SemanticsPropertyKey
+import androidx.compose.ui.semantics.SemanticsPropertyReceiver
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
@@ -51,6 +58,8 @@ import tv.plurx.app.ui.components.TvOutlinedButton
 import tv.plurx.app.ui.components.TvTextButton
 
 private const val LocalNetworkPermission = "android.permission.ACCESS_LOCAL_NETWORK"
+internal val AuthTextEditingKey = SemanticsPropertyKey<Boolean>("AuthTextEditing")
+internal var SemanticsPropertyReceiver.authTextEditing by AuthTextEditingKey
 
 @Composable
 private fun AuthScaffold(
@@ -158,12 +167,11 @@ fun ConnectScreen(vm: AppViewModel, busy: Boolean, error: String?) {
         }
 
         if (showManual) {
-            OutlinedTextField(
+            AuthTextField(
                 value = url,
                 onValueChange = { url = it },
-                label = { Text("Server address") },
-                placeholder = { Text("192.168.1.10:32400") },
-                singleLine = true,
+                label = "Server address",
+                placeholder = "192.168.1.10:32400",
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri, imeAction = ImeAction.Go),
                 modifier = Modifier.fillMaxWidth(),
             )
@@ -217,19 +225,17 @@ fun LoginScreen(vm: AppViewModel, busy: Boolean, error: String?) {
     var user by rememberSaveable { mutableStateOf(vm.username ?: "") }
     var pass by remember { mutableStateOf("") }
     AuthScaffold(vm.serverName ?: vm.origin, error) {
-        OutlinedTextField(
+        AuthTextField(
             value = user,
             onValueChange = { user = it },
-            label = { Text("Username") },
-            singleLine = true,
+            label = "Username",
             keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next),
             modifier = Modifier.fillMaxWidth(),
         )
-        OutlinedTextField(
+        AuthTextField(
             value = pass,
             onValueChange = { pass = it },
-            label = { Text("Password") },
-            singleLine = true,
+            label = "Password",
             visualTransformation = PasswordVisualTransformation(),
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password, imeAction = ImeAction.Go),
             modifier = Modifier.fillMaxWidth(),
@@ -245,3 +251,64 @@ fun LoginScreen(vm: AppViewModel, busy: Boolean, error: String?) {
         TvTextButton(onClick = { vm.changeServer() }) { Text("Use a different server", color = Muted) }
     }
 }
+
+@Composable
+internal fun AuthTextField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    label: String,
+    modifier: Modifier = Modifier,
+    placeholder: String? = null,
+    visualTransformation: VisualTransformation = VisualTransformation.None,
+    keyboardOptions: KeyboardOptions = KeyboardOptions.Default,
+) {
+    val television = currentFormFactor() == FormFactor.Television
+    var editing by remember { mutableStateOf(false) }
+    var activationInProgress by remember { mutableStateOf(false) }
+
+    OutlinedTextField(
+        value = value,
+        onValueChange = onValueChange,
+        label = { Text(label) },
+        placeholder = placeholder?.let { { Text(it) } },
+        singleLine = true,
+        visualTransformation = visualTransformation,
+        keyboardOptions = keyboardOptions.copy(showKeyboardOnFocus = !television || editing),
+        modifier = modifier
+            .semantics { authTextEditing = editing }
+            .onFocusChanged { focus ->
+                if (!focus.isFocused) {
+                    editing = false
+                    activationInProgress = false
+                }
+            }
+            .onPreviewKeyEvent { event ->
+                if (!television || !event.nativeKeyEvent.isTvSelectKey()) {
+                    return@onPreviewKeyEvent false
+                }
+                when (event.nativeKeyEvent.action) {
+                    KeyEvent.ACTION_DOWN -> {
+                        if (!editing) {
+                            editing = true
+                            activationInProgress = true
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    KeyEvent.ACTION_UP -> {
+                        if (activationInProgress) {
+                            activationInProgress = false
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    else -> false
+                }
+            },
+    )
+}
+
+private fun KeyEvent.isTvSelectKey(): Boolean =
+    keyCode == KeyEvent.KEYCODE_DPAD_CENTER || keyCode == KeyEvent.KEYCODE_ENTER
