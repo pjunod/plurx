@@ -181,7 +181,15 @@ pub async fn fallback(uri: axum::http::Uri) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::connection_qr_svg;
+    use super::{connection_qr_svg, INDEX_HTML};
+
+    #[test]
+    fn app_shell_shows_the_running_build_to_signed_in_and_signed_out_users() {
+        assert_eq!(
+            INDEX_HTML.matches("Version ${esc(buildLabel())}").count(),
+            2
+        );
+    }
 
     #[test]
     fn connection_qr_accepts_only_an_http_server_origin() {

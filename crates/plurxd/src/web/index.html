@@ -73,6 +73,9 @@
   .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:24px}
   .auth{width:100%;max-width:380px}
   .auth h1{margin:.2em 0 .1em}
+  .versionstamp{color:var(--muted);font-size:11px;letter-spacing:.02em;text-align:center}
+  .auth .versionstamp{margin-top:18px}
+  main>.versionstamp{margin:34px 0 -42px}
   .connectqr{margin-top:14px;border-top:1px solid var(--line);padding-top:12px;text-align:center}
   .connectqr summary{cursor:pointer;color:var(--muted);font-size:13px;font-weight:600}
   .connectqr img{display:block;width:220px;max-width:100%;height:auto;margin:12px auto 8px;background:#fff;border-radius:10px}
@@ -1216,7 +1219,8 @@ function authShell(title, sub, fields, btn, onsubmit){
     <div class="logo" style="font-size:30px">${APP_NAME}</div>
     <h1>${title}</h1><p class="muted" style="margin-top:0">${sub}</p>
     ${fields}<div class="err" id="aerr"></div>
-    <button style="width:100%;margin-top:16px" id="ab">${btn}</button></form></div>`;
+    <button style="width:100%;margin-top:16px" id="ab">${btn}</button>
+    <div class="versionstamp">Version ${esc(buildLabel())}</div></form></div>`;
   document.getElementById("af").addEventListener("submit",async e=>{
     e.preventDefault(); const b=document.getElementById("ab"); b.disabled=true;
     try{ await onsubmit(); }catch(err){ document.getElementById("aerr").textContent=err.message; b.disabled=false; }
@@ -1292,7 +1296,7 @@ function chrome(active, inner){
          <div class="amenu" id="profilemenu"></div>
        </div>
      </div>
-   </header><main id="main">${inner}</main>`;
+   </header><main id="main">${inner}<div class="versionstamp">Version ${esc(buildLabel())}</div></main>`;
   const q=document.getElementById("q");
   let t; q.addEventListener("input",()=>{ clearTimeout(t); t=setTimeout(()=>{ location.hash= q.value?("#/search/"+encodeURIComponent(q.value)):"#/"; },300); });
   pollActivity();

@@ -80,6 +80,15 @@ final class AppleClientTests: XCTestCase {
         super.tearDown()
     }
 
+    func testAppVersionLabelIncludesThePackageBuild() {
+        XCTAssertEqual(
+            AppBuildInfo.label(version: "0.2.0", build: "2"),
+            "0.2.0 (2)"
+        )
+        XCTAssertEqual(AppBuildInfo.label(version: "0.2.0", build: nil), "0.2.0")
+        XCTAssertEqual(AppBuildInfo.label(version: nil, build: nil), "Unknown")
+    }
+
     func testOriginNormalizationAcceptsHostnamesAndRemovesTrailingSlashes() {
         XCTAssertEqual(AppModel.normalizeOrigin("  media-box:32400///  "), "http://media-box:32400")
         XCTAssertEqual(AppModel.normalizeOrigin("media-box"), "http://media-box:32400")
