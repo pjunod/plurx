@@ -76,9 +76,28 @@ services:
       PLURX_SERVER_NAME: "plurx"
       PLURX_BIND: "0.0.0.0:32400"
       PLURX_DATA_DIR: "/var/lib/plurx"
+      # Multicast cannot escape a Docker bridge. The host-network discovery
+      # companion below owns Bonjour so this container does not publish a
+      # duplicate service on the private `media` bridge.
+      PLURX_MDNS_ADVERTISE: "false"
     volumes:
       # The database and everything else that must survive a rebuild. Create
       # it first, owned by the same uid the container runs as:
       #   sudo install -d -o $(id -u) -g $(id -g) /srv/plurx
       - ${PLURX_DATA:-/srv/plurx}:/var/lib/plurx
       # Media mounts go in docker-compose.override.yml (see example file).
+
+  # Keep only multicast discovery on the host network. The actual server stays
+  # on its ordinary/external Compose networks, including a host override's
+  # `media` network, and remains reachable here through published port 32400.
+  # Splitting these roles avoids Compose's forbidden `network_mode` +
+  # `networks` combination while making Bonjour visible to phones and TVs.
+  plurx-discovery:
+    image: plurx/plurxd:latest
+    container_name: plurx-discovery
+    restart: unless-stopped
+    network_mode: host
+    depends_on:
+      plurxd:
+        condition: service_healthy
+    command: ["advertise"]

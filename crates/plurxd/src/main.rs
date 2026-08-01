@@ -27,6 +27,7 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use plurx_core::config::Config;
 use plurx_core::store::{keys, SqliteStore, Store, UserStore};
+use serde::Deserialize;
 use tracing_subscriber::EnvFilter;
 
 use crate::state::{AppState, SystemInfo};
@@ -57,6 +58,18 @@ enum Command {
     /// Probe a running local server's /healthz and exit 0/1 (container
     /// health checks: no curl needed in the image).
     Healthcheck,
+    /// Advertise a bridge-networked server on the host's Bonjour interfaces.
+    /// This is intended for the discovery companion container; the HTTP server
+    /// remains attached to its normal Docker networks.
+    Advertise {
+        /// Base URL where the server is published on the Docker host.
+        #[arg(
+            long,
+            env = "PLURX_DISCOVERY_SERVER_URL",
+            default_value = "http://127.0.0.1:32400"
+        )]
+        server: String,
+    },
     /// Reset a user's password directly in the database — the recovery path
     /// when an admin password is forgotten (admins reset *other* users in
     /// the web UI). Safe while the server runs (WAL); revokes the user's
@@ -85,6 +98,7 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Command::Advertise { server } => advertise(&server).await,
         Command::ResetPassword { username, password } => {
             reset_password(&config, &username, password).await
         }
@@ -303,7 +317,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
     } else {
         tracing::info!(bind = %config.server.bind, "LAN discovery disabled for loopback bind");
     }
-    let mdns = if lan_discovery {
+    let mdns = if lan_discovery && mdns_advertising_enabled() {
         match start_mdns_advertiser(
             &instance_id,
             &config.server.name,
@@ -317,6 +331,9 @@ async fn run(config: Config) -> anyhow::Result<()> {
             }
         }
     } else {
+        if lan_discovery {
+            tracing::info!("in-process Bonjour advertising disabled");
+        }
         None
     };
 
@@ -372,6 +389,110 @@ const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// Native plurx discovery contract. The Apple clients declare this exact type
 /// in `NSBonjourServices`, so changing it is a protocol change, not a rename.
 const MDNS_SERVICE_TYPE: &str = "_plurx._tcp.local.";
+
+/// The normal server advertises directly when it runs on a LAN interface.
+/// Docker deployments turn this off and run `plurxd advertise` in a tiny
+/// host-network companion instead, because multicast cannot cross a bridge.
+fn mdns_advertising_enabled() -> bool {
+    std::env::var("PLURX_MDNS_ADVERTISE")
+        .ok()
+        .map(|value| mdns_advertising_value_enabled(&value))
+        .unwrap_or(true)
+}
+
+fn mdns_advertising_value_enabled(value: &str) -> bool {
+    !matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "no" | "off"
+    )
+}
+
+#[derive(Deserialize)]
+struct DiscoveryServerInfo {
+    name: String,
+    version: String,
+    instance_id: String,
+}
+
+/// Fetch identity from the running server, then publish that identity through
+/// the host's mDNS interfaces. Keeping this process separate is what allows
+/// the main container to stay on an external Compose network such as `media`.
+async fn advertise(server: &str) -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_env("PLURX_LOG").unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .try_init()
+        .ok();
+
+    let base = reqwest::Url::parse(server).context("parsing discovery server URL")?;
+    anyhow::ensure!(
+        matches!(base.scheme(), "http" | "https"),
+        "discovery server URL must use http or https"
+    );
+    let port = base
+        .port_or_known_default()
+        .context("discovery server URL has no port")?;
+    let info_url = base
+        .join("/api/v1/server")
+        .context("building discovery server-info URL")?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .context("building discovery HTTP client")?;
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+
+    let mut failed_attempts = 0_u64;
+    let info = loop {
+        match fetch_discovery_server_info(&client, info_url.clone()).await {
+            Ok(info) => break info,
+            Err(error) => {
+                failed_attempts += 1;
+                if failed_attempts == 1 || failed_attempts.is_multiple_of(15) {
+                    tracing::warn!(
+                        %error,
+                        server = %base,
+                        "waiting for server before advertising Bonjour"
+                    );
+                }
+                tokio::select! {
+                    _ = &mut shutdown => return Ok(()),
+                    _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                }
+            }
+        }
+    };
+
+    let daemon = start_mdns_advertiser(
+        &info.instance_id,
+        &info.name,
+        SocketAddr::from(([0, 0, 0, 0], port)),
+        &info.version,
+    )?;
+    tracing::info!(server = %base, "host Bonjour discovery companion ready");
+    (&mut shutdown).await;
+    daemon
+        .shutdown()
+        .context("shutting down host Bonjour advertiser")?;
+    Ok(())
+}
+
+async fn fetch_discovery_server_info(
+    client: &reqwest::Client,
+    url: reqwest::Url,
+) -> anyhow::Result<DiscoveryServerInfo> {
+    client
+        .get(url)
+        .send()
+        .await
+        .context("requesting server identity")?
+        .error_for_status()
+        .context("server identity request failed")?
+        .json()
+        .await
+        .context("decoding server identity")
+}
 
 /// Start the local DNS-SD advertiser and keep its daemon handle alive for the
 /// lifetime of the HTTP server. Address auto-detection is correct for the
@@ -577,6 +698,36 @@ mod discovery_tests {
             32415
         );
         assert!(gdm_bind_port(Some("not-a-port")).is_err());
+    }
+
+    #[test]
+    fn compose_can_disable_only_the_in_process_advertiser() {
+        for value in ["0", "false", "FALSE", " no ", "off"] {
+            assert!(!mdns_advertising_value_enabled(value), "{value:?}");
+        }
+        for value in ["1", "true", "yes", "on", "anything-else"] {
+            assert!(mdns_advertising_value_enabled(value), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn discovery_companion_decodes_the_public_server_identity() {
+        let info: DiscoveryServerInfo = serde_json::from_str(
+            r#"{
+                "name": "Living Room",
+                "version": "0.2.0",
+                "build": "v0.2.0-4-gabc",
+                "instance_id": "server-id",
+                "uptime_seconds": 12,
+                "setup_required": false,
+                "android_app": true
+            }"#,
+        )
+        .expect("server identity");
+
+        assert_eq!(info.name, "Living Room");
+        assert_eq!(info.version, "0.2.0");
+        assert_eq!(info.instance_id, "server-id");
     }
 
     #[test]

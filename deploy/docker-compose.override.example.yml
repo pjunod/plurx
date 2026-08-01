@@ -15,8 +15,8 @@
 # A shared external network is also valid here. If you add `networks:` to the
 # service, do not also set `network_mode: host`: Compose treats those as
 # mutually exclusive and refuses the entire project before starting a build.
-# Ordinary bridge networks do not carry Bonjour multicast onto the physical
-# LAN, so native clients use manual server entry in that layout.
+# The tracked `plurx-discovery` companion already uses host networking for
+# Bonjour, so adding this shared network does not disable native discovery.
 
 services:
   plurxd:

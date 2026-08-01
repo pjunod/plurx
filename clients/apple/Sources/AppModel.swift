@@ -415,9 +415,10 @@ final class AppModel: ObservableObject {
         let suppliedScheme = s.hasPrefix("http://") || s.hasPrefix("https://")
         if !suppliedScheme { s = "http://" + s }
         guard var components = URLComponents(string: s) else { return s }
-        // A bare host means the standard plurx/Plex port. An explicit scheme
-        // keeps that scheme's own default, and an explicit port always wins.
-        if !suppliedScheme && components.port == nil {
+        // A bare host or an explicit HTTP URL with no port means the standard
+        // plurx/Plex port. HTTPS keeps 443 for reverse-proxy deployments, and
+        // an explicit port always wins.
+        if components.port == nil && (!suppliedScheme || components.scheme == "http") {
             components.port = PlurxClientDefaults.port
         }
         if components.path == "/" { components.path = "" }

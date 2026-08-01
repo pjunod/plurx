@@ -9,6 +9,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import java.net.URI
 import tv.plurx.app.data.Caps
 import tv.plurx.app.data.Appearance
 import tv.plurx.app.data.AudioOffsetReq
@@ -354,13 +355,6 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch { reportProgress(itemId, positionMs, durationMs) }
     }
 
-    private fun normalizeOrigin(raw: String): String {
-        var s = raw.trim()
-        if (s.isEmpty()) return s
-        if (!s.startsWith("http://") && !s.startsWith("https://")) s = "http://$s"
-        return s.trimEnd('/')
-    }
-
     private suspend fun connectToOrigin(normalized: String) {
         Session.origin = normalized
         val candidate = Net.api(normalized)
@@ -371,4 +365,25 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         settings.saveOrigin(normalized)
         _phase.value = Phase.NeedLogin
     }
+}
+
+/** Normalize the manual server field to the same origin contract as Apple. */
+internal fun normalizeOrigin(raw: String): String {
+    val trimmed = raw.trim().trimEnd('/')
+    if (trimmed.isEmpty()) return trimmed
+
+    val suppliedScheme = trimmed.startsWith("http://") || trimmed.startsWith("https://")
+    val candidate = if (suppliedScheme) trimmed else "http://$trimmed"
+    val uri = runCatching { URI(candidate) }.getOrNull() ?: return candidate
+    if (uri.scheme != "http" || uri.port != -1 || uri.host == null) return candidate
+
+    return URI(
+        uri.scheme,
+        uri.userInfo,
+        uri.host,
+        32400,
+        uri.path,
+        uri.query,
+        uri.fragment,
+    ).toString()
 }
