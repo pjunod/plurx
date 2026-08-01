@@ -11,6 +11,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -22,6 +23,8 @@ import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Shape
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.semantics.SemanticsPropertyKey
 import androidx.compose.ui.semantics.SemanticsPropertyReceiver
 import androidx.compose.ui.semantics.semantics
@@ -31,6 +34,17 @@ import androidx.compose.ui.zIndex
 
 internal val TvFocusVisibleKey = SemanticsPropertyKey<Boolean>("TvFocusVisible")
 internal var SemanticsPropertyReceiver.tvFocusVisible by TvFocusVisibleKey
+
+/** Requests focus after the target has been attached and laid out for a frame. */
+@Composable
+fun RequestInitialFocus(focusRequester: FocusRequester, enabled: Boolean = true) {
+    val view = LocalView.current
+    DisposableEffect(view, focusRequester, enabled) {
+        val request = Runnable { focusRequester.requestFocus() }
+        if (enabled) view.postOnAnimation(request)
+        onDispose { view.removeCallbacks(request) }
+    }
+}
 
 @Composable
 internal fun tvFocusGradient(): Brush = Brush.linearGradient(
@@ -54,6 +68,7 @@ fun Modifier.tvFocusRing(
     shape: Shape? = null,
     focusedScale: Float = 1.06f,
     ringWidth: Dp = 2.dp,
+    showRing: Boolean = true,
 ): Modifier = composed {
     var focused by remember { mutableStateOf(false) }
     val scale by animateFloatAsState(if (focused) focusedScale else 1f, label = "tv-focus-scale")
@@ -66,7 +81,7 @@ fun Modifier.tvFocusRing(
         .zIndex(if (focused) 1f else 0f)
         .scale(scale)
         .background(if (focused) fill else Color.Transparent, resolvedShape)
-        .then(if (focused) Modifier.border(ringWidth, ring, resolvedShape) else Modifier)
+        .then(if (focused && showRing) Modifier.border(ringWidth, ring, resolvedShape) else Modifier)
         .semantics { tvFocusVisible = focused }
 }
 
@@ -120,11 +135,12 @@ fun TvIconButton(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
     enabled: Boolean = true,
+    showFocusRing: Boolean = true,
     content: @Composable () -> Unit,
 ) {
     IconButton(
         onClick = onClick,
-        modifier = modifier.tvFocusRing(CircleShape, focusedScale = 1.12f),
+        modifier = modifier.tvFocusRing(CircleShape, focusedScale = 1.12f, showRing = showFocusRing),
         enabled = enabled,
         content = content,
     )

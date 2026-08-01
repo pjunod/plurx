@@ -40,6 +40,7 @@ internal fun SafeBackButton(
     TvIconButton(
         onClick = onBack,
         modifier = modifier.windowInsetsPadding(safeInsets).padding(8.dp),
+        showFocusRing = false,
     ) {
         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back", tint = tint)
     }

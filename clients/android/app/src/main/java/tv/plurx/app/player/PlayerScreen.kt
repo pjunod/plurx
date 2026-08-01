@@ -98,6 +98,7 @@ import tv.plurx.app.data.SubTrack
 import tv.plurx.app.ui.AppViewModel
 import tv.plurx.app.ui.PlaybackTarget
 import tv.plurx.app.ui.components.LoadingBox
+import tv.plurx.app.ui.components.RequestInitialFocus
 import tv.plurx.app.ui.components.TvButton
 import tv.plurx.app.ui.components.TvIconButton
 import tv.plurx.app.ui.components.formatTime
@@ -338,7 +339,7 @@ private fun PlayerContent(
     val controller = remember(plan) {
         Controller(context, buildPlayer(context, vm), plan, vm.caps(), vm, scope, onError = { playFailed = true })
     }
-    val focusRequester = remember { FocusRequester() }
+    val surfaceFocusRequester = remember { FocusRequester() }
 
     var positionMs by remember { mutableLongStateOf(startMs) }
     var scrubbing by remember { mutableStateOf(false) }
@@ -517,7 +518,11 @@ private fun PlayerContent(
         }
     }
 
-    LaunchedEffect(Unit) { focusRequester.requestFocus() }
+    LaunchedEffect(controlsVisible, panel, isInPip) {
+        if (!isInPip && !controlsVisible && panel == null) {
+            surfaceFocusRequester.requestFocus()
+        }
+    }
 
     if (playFailed) {
         PlaybackFailed(onExit)
@@ -526,7 +531,7 @@ private fun PlayerContent(
 
     Box(
         Modifier.fillMaxSize()
-            .focusRequester(focusRequester)
+            .focusRequester(surfaceFocusRequester)
             .focusable()
             .onPreviewKeyEvent { event ->
                 if (event.nativeKeyEvent.action != KeyEvent.ACTION_DOWN) return@onPreviewKeyEvent false
@@ -540,6 +545,7 @@ private fun PlayerContent(
                             poke()
                             true
                         } else {
+                            poke()
                             false
                         }
                     }
@@ -551,10 +557,18 @@ private fun PlayerContent(
                     }
                     KeyEvent.KEYCODE_DPAD_LEFT -> if (!controlsVisible) {
                         controller.seekTo(controller.realPosition() - 10_000); poke(); true
-                    } else false
+                    } else {
+                        poke(); false
+                    }
                     KeyEvent.KEYCODE_DPAD_RIGHT -> if (!controlsVisible) {
                         controller.seekTo(controller.realPosition() + 10_000); poke(); true
-                    } else false
+                    } else {
+                        poke(); false
+                    }
+                    KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN -> {
+                        if (controlsVisible) poke()
+                        false
+                    }
                     else -> false
                 }
             },
@@ -603,6 +617,7 @@ private fun PlayerContent(
                 positionMs = if (scrubbing) scrubPreview else positionMs,
                 durationMs = plan.durationMs,
                 isPlaying = isPlaying,
+                requestInitialFocus = panel == null,
                 onBack = onExit,
                 onPlayPause = { controller.playPause(); poke() },
                 onSeekBack = { controller.seekTo(controller.realPosition() - 10_000); poke() },
@@ -661,11 +676,12 @@ private fun PlayerContent(
 }
 
 @Composable
-private fun Controls(
+internal fun Controls(
     title: String,
     positionMs: Long,
     durationMs: Long,
     isPlaying: Boolean,
+    requestInitialFocus: Boolean,
     onBack: () -> Unit,
     onPlayPause: () -> Unit,
     onSeekBack: () -> Unit,
@@ -678,6 +694,8 @@ private fun Controls(
     onInfo: () -> Unit,
     onPip: (() -> Unit)?,
 ) {
+    val playFocusRequester = remember { FocusRequester() }
+    RequestInitialFocus(playFocusRequester, enabled = requestInitialFocus)
     Box(Modifier.fillMaxSize().background(Color(0x66000000))) {
         Row(
             Modifier.align(Alignment.TopStart).fillMaxWidth().padding(12.dp),
@@ -718,7 +736,10 @@ private fun Controls(
             TvIconButton(onClick = onSeekBack, modifier = Modifier.size(56.dp)) {
                 Icon(Icons.Filled.Replay10, contentDescription = "Back 10 seconds", tint = Color.White, modifier = Modifier.size(42.dp))
             }
-            TvIconButton(onClick = onPlayPause, modifier = Modifier.size(76.dp)) {
+            TvIconButton(
+                onClick = onPlayPause,
+                modifier = Modifier.size(76.dp).focusRequester(playFocusRequester),
+            ) {
                 Icon(
                     if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
                     contentDescription = if (isPlaying) "Pause" else "Play",
@@ -764,11 +785,21 @@ private fun PlayerSettings(
 ) {
     val preferences by vm.preferences.collectAsStateWithLifecycle()
     val scope = rememberCoroutineScope()
+    val initialFocusRequester = remember { FocusRequester() }
     var offset by remember(audioOffsetMs) { mutableLongStateOf(audioOffsetMs) }
+    RequestInitialFocus(initialFocusRequester)
     PlayerPanelSurface("Playback settings", onDismiss) {
         Text("Quality", color = Muted, style = MaterialTheme.typography.labelMedium)
         PlaybackQuality.entries.forEach { quality ->
-            PanelRow(quality.label, preferences.playbackQuality == quality) {
+            PanelRow(
+                label = quality.label,
+                selected = preferences.playbackQuality == quality,
+                modifier = if (preferences.playbackQuality == quality) {
+                    Modifier.focusRequester(initialFocusRequester)
+                } else {
+                    Modifier
+                },
+            ) {
                 val position = currentPosition()
                 vm.setPlaybackQuality(quality)
                 onReload(position)
@@ -827,6 +858,8 @@ internal fun PlaybackInfoOverlay(
     onDismiss: () -> Unit,
 ) {
     val shape = MaterialTheme.shapes.large
+    val closeFocusRequester = remember { FocusRequester() }
+    RequestInitialFocus(closeFocusRequester)
     Box(
         Modifier.fillMaxSize().focusProperties { canFocus = false }.clickable(
             interactionSource = remember { MutableInteractionSource() },
@@ -875,7 +908,10 @@ internal fun PlaybackInfoOverlay(
                         overflow = TextOverflow.Ellipsis,
                     )
                 }
-                TvIconButton(onClick = onDismiss) {
+                TvIconButton(
+                    onClick = onDismiss,
+                    modifier = Modifier.focusRequester(closeFocusRequester),
+                ) {
                     Icon(Icons.Filled.Close, contentDescription = "Close playback info", tint = Color.White)
                 }
             }
@@ -973,12 +1009,17 @@ private fun PlayerPanelSurface(title: String, onDismiss: () -> Unit, content: @C
 }
 
 @Composable
-private fun PanelRow(label: String, selected: Boolean, onClick: () -> Unit) {
+private fun PanelRow(
+    label: String,
+    selected: Boolean,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit,
+) {
     Text(
         (if (selected) "●  " else "    ") + label,
         color = if (selected) Accent else Color.White,
         fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
             .tvFocusRing(MaterialTheme.shapes.small, focusedScale = 1.02f)
             .clickable(onClick = onClick)

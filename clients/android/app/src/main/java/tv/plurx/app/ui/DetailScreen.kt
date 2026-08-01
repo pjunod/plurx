@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.aspectRatio
@@ -41,6 +42,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
@@ -53,6 +56,7 @@ import tv.plurx.app.data.MediaFileDto
 import tv.plurx.app.ui.components.LoadingBox
 import tv.plurx.app.ui.components.NetworkImage
 import tv.plurx.app.ui.components.PosterCard
+import tv.plurx.app.ui.components.RequestInitialFocus
 import tv.plurx.app.ui.components.SafeBackButton
 import tv.plurx.app.ui.components.TvButton
 import tv.plurx.app.ui.components.TvOutlinedButton
@@ -198,6 +202,7 @@ private fun DetailContent(
                         seriesPlayback = seriesPlayback,
                         resumeMs = resumeMs,
                         canResume = canResume,
+                        requestInitialFocus = formFactor == FormFactor.Television,
                         onPlay = onPlay,
                         onViewPhoto = onViewPhoto,
                         onWatchedChanged = onWatchedChanged,
@@ -279,6 +284,7 @@ private fun Actions(
     seriesPlayback: EpisodePlaybackTarget?,
     resumeMs: Long,
     canResume: Boolean,
+    requestInitialFocus: Boolean,
     onPlay: (Long, Long, Long) -> Unit,
     onViewPhoto: (Long) -> Unit,
     onWatchedChanged: () -> Unit,
@@ -292,24 +298,33 @@ private fun Actions(
     ) {
         if (item.kind == "photo") {
             item {
-                TvButton(onClick = { onViewPhoto(item.id) }) {
+                DetailPrimaryActionButton(
+                    onClick = { onViewPhoto(item.id) },
+                    requestInitialFocus = requestInitialFocus,
+                ) {
                     Icon(Icons.Filled.Image, contentDescription = null)
                     Text("  View full size")
                 }
             }
         } else if (seriesPlayback != null) {
             item {
-                TvButton(onClick = {
-                    val target = seriesPlayback.playback
-                    onPlay(target.itemId, target.fileId, target.startMs)
-                }) {
+                DetailPrimaryActionButton(
+                    onClick = {
+                        val target = seriesPlayback.playback
+                        onPlay(target.itemId, target.fileId, target.startMs)
+                    },
+                    requestInitialFocus = requestInitialFocus,
+                ) {
                     Icon(Icons.Filled.PlayArrow, contentDescription = null, modifier = Modifier.size(20.dp))
                     Text("  ${seriesPlayLabel(seriesPlayback)}", fontWeight = FontWeight.SemiBold)
                 }
             }
         } else if (playable != null && item.isPlayableVideo) {
             item {
-                TvButton(onClick = { onPlay(item.id, playable.id, if (canResume) resumeMs else 0L) }) {
+                DetailPrimaryActionButton(
+                    onClick = { onPlay(item.id, playable.id, if (canResume) resumeMs else 0L) },
+                    requestInitialFocus = requestInitialFocus,
+                ) {
                     Icon(Icons.Filled.PlayArrow, contentDescription = null, modifier = Modifier.size(20.dp))
                     Text(if (canResume) "  Resume · ${formatTime(resumeMs)}" else "  Play", fontWeight = FontWeight.SemiBold)
                 }
@@ -368,6 +383,22 @@ private fun Actions(
 }
 
 @Composable
+internal fun DetailPrimaryActionButton(
+    onClick: () -> Unit,
+    requestInitialFocus: Boolean,
+    modifier: Modifier = Modifier,
+    content: @Composable RowScope.() -> Unit,
+) {
+    val focusRequester = remember { FocusRequester() }
+    RequestInitialFocus(focusRequester, enabled = requestInitialFocus)
+    TvButton(
+        onClick = onClick,
+        modifier = modifier.focusRequester(focusRequester),
+        content = content,
+    )
+}
+
+@Composable
 private fun VersionCard(file: MediaFileDto, showPlay: Boolean, onPlay: () -> Unit, label: String?) {
     Column(
         Modifier.fillMaxWidth().background(SurfaceHi, MaterialTheme.shapes.medium)
@@ -398,12 +429,14 @@ private fun VersionCard(file: MediaFileDto, showPlay: Boolean, onPlay: () -> Uni
 
 @Composable
 private fun EpisodeRow(item: Item, side: androidx.compose.ui.unit.Dp, starting: Boolean, onClick: () -> Unit) {
+    val focusEndPadding = 12.dp
     Row(
         Modifier
             .fillMaxWidth()
+            .padding(horizontal = side - focusEndPadding)
             .tvFocusRing(MaterialTheme.shapes.medium, focusedScale = 1.02f)
             .clickable(enabled = !starting, onClick = onClick)
-            .padding(horizontal = side, vertical = 9.dp),
+            .padding(horizontal = focusEndPadding, vertical = 9.dp),
         horizontalArrangement = Arrangement.spacedBy(14.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {

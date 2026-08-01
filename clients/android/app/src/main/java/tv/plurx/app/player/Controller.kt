@@ -19,9 +19,12 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusProperties
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -47,6 +50,7 @@ import tv.plurx.app.ui.AppViewModel
 import tv.plurx.app.ui.theme.Accent
 import tv.plurx.app.ui.theme.Muted
 import tv.plurx.app.ui.components.tvFocusRing
+import tv.plurx.app.ui.components.RequestInitialFocus
 import java.util.Locale
 import java.util.UUID
 
@@ -280,6 +284,14 @@ fun TrackMenu(
     val tracks = player.currentTracks
     val audio = tracks.groups.filter { it.type == C.TRACK_TYPE_AUDIO }
     val text = tracks.groups.filter { it.type == C.TRACK_TYPE_TEXT }
+    val initialFocusRequester = remember { FocusRequester() }
+    var initialFocusAttached = false
+
+    fun initialFocusModifier(enabled: Boolean): Modifier {
+        if (!enabled || initialFocusAttached) return Modifier
+        initialFocusAttached = true
+        return Modifier.focusRequester(initialFocusRequester)
+    }
 
     Box(
         Modifier
@@ -306,16 +318,19 @@ fun TrackMenu(
                         label = serverAudioLabel(track),
                         selected = selectedServerAudio == track.index,
                         enabled = true,
+                        modifier = initialFocusModifier(enabled = true),
                     ) { onServerAudio(track.index) }
                 }
             } else if (audio.isNotEmpty()) {
                 Text("Audio", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(bottom = 4.dp))
                 audio.forEach { group ->
                     for (i in 0 until group.length) {
+                        val enabled = group.isTrackSupported(i)
                         TrackRow(
                             label = audioLabel(group.getTrackFormat(i)),
                             selected = group.isTrackSelected(i),
-                            enabled = group.isTrackSupported(i),
+                            enabled = enabled,
+                            modifier = initialFocusModifier(enabled),
                         ) {
                             player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
                                 .setOverrideForType(TrackSelectionOverride(group.mediaTrackGroup, i))
@@ -334,6 +349,7 @@ fun TrackMenu(
                     label = "Off",
                     selected = selectedServerSubtitle == null && tracks.isTypeSelected(C.TRACK_TYPE_TEXT).not(),
                     enabled = true,
+                    modifier = initialFocusModifier(enabled = true),
                 ) {
                     player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
                         .clearOverridesOfType(C.TRACK_TYPE_TEXT)
@@ -344,10 +360,12 @@ fun TrackMenu(
                 }
                 text.forEach { group ->
                     for (i in 0 until group.length) {
+                        val enabled = group.isTrackSupported(i)
                         TrackRow(
                             label = subLabel(group.getTrackFormat(i)),
                             selected = group.isTrackSelected(i),
-                            enabled = group.isTrackSupported(i),
+                            enabled = enabled,
+                            modifier = initialFocusModifier(enabled),
                         ) {
                             player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
                                 .setOverrideForType(TrackSelectionOverride(group.mediaTrackGroup, i))
@@ -362,6 +380,7 @@ fun TrackMenu(
                         label = serverSubtitleLabel(track),
                         selected = selectedServerSubtitle == track.index,
                         enabled = true,
+                        modifier = initialFocusModifier(enabled = true),
                     ) { onServerSubtitle(track.index) }
                 }
             }
@@ -371,10 +390,20 @@ fun TrackMenu(
             }
         }
     }
+
+    if (initialFocusAttached) {
+        RequestInitialFocus(initialFocusRequester)
+    }
 }
 
 @Composable
-private fun TrackRow(label: String, selected: Boolean, enabled: Boolean, onClick: () -> Unit) {
+private fun TrackRow(
+    label: String,
+    selected: Boolean,
+    enabled: Boolean,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit,
+) {
     Text(
         text = (if (selected) "● " else "   ") + label,
         color = when {
@@ -384,7 +413,7 @@ private fun TrackRow(label: String, selected: Boolean, enabled: Boolean, onClick
         },
         fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
         style = MaterialTheme.typography.bodyMedium,
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
             .tvFocusRing(MaterialTheme.shapes.small, focusedScale = 1.02f)
             .clickable(enabled = enabled, onClick = onClick)
