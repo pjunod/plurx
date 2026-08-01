@@ -115,6 +115,51 @@ final class AppleClientTests: XCTestCase {
         }
     }
 
+    #if os(tvOS)
+    func testTVActionButtonsRemainReadableWithAndWithoutFocus() {
+        for prominent in [false, true] {
+            for focused in [false, true] {
+                let foreground = TVReadableButtonStyle.foregroundColor(
+                    prominent: prominent,
+                    focused: focused
+                )
+                let background = TVReadableButtonStyle.backgroundColor(
+                    prominent: prominent,
+                    focused: focused
+                )
+
+                XCTAssertGreaterThanOrEqual(
+                    contrastRatio(foreground, background),
+                    4.5,
+                    "prominent=\(prominent), focused=\(focused)"
+                )
+            }
+        }
+    }
+
+    private func contrastRatio(_ foreground: Color, _ background: Color) -> CGFloat {
+        let lighter = max(relativeLuminance(foreground), relativeLuminance(background))
+        let darker = min(relativeLuminance(foreground), relativeLuminance(background))
+        return (lighter + 0.05) / (darker + 0.05)
+    }
+
+    private func relativeLuminance(_ color: Color) -> CGFloat {
+        var red: CGFloat = 0
+        var green: CGFloat = 0
+        var blue: CGFloat = 0
+        var alpha: CGFloat = 0
+        XCTAssertTrue(UIColor(color).getRed(&red, green: &green, blue: &blue, alpha: &alpha))
+
+        func linear(_ component: CGFloat) -> CGFloat {
+            component <= 0.04045
+                ? component / 12.92
+                : pow((component + 0.055) / 1.055, 2.4)
+        }
+
+        return 0.2126 * linear(red) + 0.7152 * linear(green) + 0.0722 * linear(blue)
+    }
+    #endif
+
     func testNativeItemDecodesLibraryProvenanceAndSortFields() throws {
         let json = #"{"id":7,"library_id":12,"kind":"movie","title":"Feature","added_at":99,"updated_at":101}"#
         let decoder = JSONDecoder()

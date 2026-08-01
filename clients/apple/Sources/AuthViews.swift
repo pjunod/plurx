@@ -15,9 +15,11 @@ struct PrimaryButton: View {
             }
             .frame(maxWidth: .infinity)
         }
+        #if os(tvOS)
+        .buttonStyle(TVReadableButtonStyle(prominent: true))
+        #else
         .buttonStyle(.borderedProminent)
         .tint(Palette.accent)
-        #if !os(tvOS)
         .controlSize(.large)   // ControlSize is unavailable on tvOS
         #endif
         .disabled(disabled || busy)
