@@ -23,6 +23,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Image
@@ -172,12 +173,9 @@ private fun DetailContent(
                 }
                 Column(Modifier.weight(1f)) {
                     if (detail.ancestors.isNotEmpty()) {
-                        Text(
-                            detail.ancestors.joinToString("  /  ") { it.title },
-                            color = Accent,
-                            style = MaterialTheme.typography.labelMedium,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
+                        AncestorBreadcrumb(
+                            ancestors = detail.ancestors,
+                            onOpenItem = onOpenItem,
                         )
                     }
                     Text(item.title, style = MaterialTheme.typography.headlineMedium)
@@ -274,6 +272,41 @@ private fun DetailContent(
             }
         }
         item { Spacer(Modifier.height(32.dp)) }
+    }
+}
+
+@Composable
+internal fun AncestorBreadcrumb(
+    ancestors: List<Item>,
+    onOpenItem: (Long) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    LazyRow(
+        modifier = modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        itemsIndexed(ancestors, key = { _, ancestor -> ancestor.id }) { index, ancestor ->
+            if (index > 0) {
+                Text(
+                    "/",
+                    color = Muted,
+                    style = MaterialTheme.typography.labelMedium,
+                    modifier = Modifier.padding(horizontal = 2.dp),
+                )
+            }
+            Text(
+                ancestor.title,
+                color = Accent,
+                style = MaterialTheme.typography.labelMedium,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier
+                    .tvFocusRing(MaterialTheme.shapes.small, focusedScale = 1.04f)
+                    .clickable { onOpenItem(ancestor.id) }
+                    .padding(horizontal = 6.dp, vertical = 4.dp),
+            )
+        }
     }
 }
 
