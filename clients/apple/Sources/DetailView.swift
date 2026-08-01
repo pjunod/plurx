@@ -10,6 +10,7 @@ struct PlayContext: Identifiable {
     let title: String
     var subtitle: String? = nil
     var year: Int? = nil
+    var overview: String? = nil
 }
 
 /// Keeps the readable detail column centered on large screens without ever
@@ -95,7 +96,7 @@ struct DetailView: View {
         .fullScreenCover(item: $play) { ctx in
             PlayerView(itemId: ctx.itemId, fileId: ctx.fileId, startMs: ctx.startMs,
                        durationMs: ctx.durationMs, title: ctx.title,
-                       subtitle: ctx.subtitle, year: ctx.year,
+                       subtitle: ctx.subtitle, year: ctx.year, overview: ctx.overview,
                        onPlayNext: { play = $0 })
                 .id(ctx.id)
                 .environmentObject(model)
@@ -618,7 +619,8 @@ struct DetailView: View {
                 durationMs: durationMs,
                 title: item.title,
                 subtitle: playbackSubtitle(item),
-                year: item.year
+                year: item.year,
+                overview: item.overview
             )
         }
     }
@@ -632,7 +634,8 @@ struct DetailView: View {
                 durationMs: durationMs,
                 title: item.title,
                 subtitle: playbackSubtitle(item),
-                year: item.year
+                year: item.year,
+                overview: item.overview
             )
         } label: {
             Text("Start over")

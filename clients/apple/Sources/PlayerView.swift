@@ -51,11 +51,13 @@ struct PlayerView: View {
     let title: String
     var subtitle: String? = nil
     var year: Int? = nil
+    var overview: String? = nil
     var onPlayNext: ((PlayContext) -> Void)?
 
     @StateObject private var controller = PlayerController()
     @StateObject private var pictureInPicture = PictureInPictureController()
     @State private var showStats = false
+    @State private var showNowPlayingInfo = false
     @State private var findingNext = false
     @State private var isScrubbing = false
     @State private var scrubMs = 0.0
@@ -188,6 +190,7 @@ struct PlayerView: View {
         .onChange(of: controller.isPlaying) { _, _ in revealControls() }
         .onChange(of: controller.isChangingStream) { _, _ in revealControls() }
         .onChange(of: showStats) { _, _ in restartAutoHideTimer() }
+        .onChange(of: showNowPlayingInfo) { _, _ in restartAutoHideTimer() }
         .onChange(of: isScrubbing) { _, _ in restartAutoHideTimer() }
         .onChange(of: controller.finished) { _, finished in
             guard finished, model.autoplay else { return }
@@ -255,6 +258,7 @@ struct PlayerView: View {
         withAnimation(.easeOut(duration: 0.2)) {
             controlsVisible = false
             showStats = false
+            showNowPlayingInfo = false
         }
         #if os(tvOS)
         focusedControl = nil
@@ -317,6 +321,13 @@ struct PlayerView: View {
             playbackInfoHeader
             #endif
 
+            #if os(tvOS)
+            if showNowPlayingInfo {
+                nowPlayingInfoSection
+                    .transition(.opacity.combined(with: .move(edge: .bottom)))
+            }
+            #endif
+
             if controller.knownDurationMs > 0 {
                 HStack(spacing: 10) {
                     playbackTimeLabel(Int(isScrubbing ? scrubMs : Double(controller.currentMs)))
@@ -376,6 +387,9 @@ struct PlayerView: View {
         .focusEffectDisabled()
         .foregroundStyle(.white)
         .frame(maxWidth: .infinity)
+        .onMoveCommand { direction in
+            if direction == .down { revealNowPlayingInfo() }
+        }
         #else
         .font(.title3)
         .buttonStyle(.bordered)
@@ -385,6 +399,39 @@ struct PlayerView: View {
         .frame(maxWidth: .infinity)
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
         #endif
+    }
+
+    #if os(tvOS)
+    private var nowPlayingInfoSection: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text("NOW PLAYING")
+                .font(.system(size: 14, weight: .bold, design: .monospaced))
+                .foregroundStyle(Palette.accent)
+            Text(Self.nowPlayingSummary(overview))
+                .font(.system(size: 20, weight: .regular))
+                .foregroundStyle(.white.opacity(0.88))
+                .lineLimit(3)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .frame(maxWidth: 820, alignment: .leading)
+        .background(
+            Palette.bg.opacity(0.68),
+            in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+        )
+        .accessibilityElement(children: .combine)
+    }
+
+    private func revealNowPlayingInfo() {
+        guard controlsVisible else { return }
+        withAnimation(.easeOut(duration: 0.18)) { showNowPlayingInfo = true }
+        restartAutoHideTimer()
+    }
+    #endif
+
+    static func nowPlayingSummary(_ overview: String?) -> String {
+        let summary = overview?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return summary.isEmpty ? "No description available." : summary
     }
 
     private func playbackTimeLabel(_ milliseconds: Int) -> some View {
@@ -596,6 +643,11 @@ struct PlayerView: View {
             Spacer(minLength: 8)
             playbackOptionGroup
         }
+        #if os(tvOS)
+        .onMoveCommand { direction in
+            if direction == .down { revealNowPlayingInfo() }
+        }
+        #endif
     }
 
     private var transportControlGroup: some View {
@@ -776,47 +828,49 @@ struct PlayerView: View {
     #if os(tvOS)
     /// SwiftUI's Slider is unavailable on tvOS. This focusable bar uses the
     /// Siri Remote's left/right commands to move through the same absolute
-    /// film timeline in 30-second steps.
+    /// film timeline in 30-second steps. This is deliberately not a Button:
+    /// tvOS adds a large white pressed/focus surround to Buttons even when the
+    /// ordinary focus effect is disabled.
     private var tvProgressBar: some View {
-        Button {} label: {
-            GeometryReader { geometry in
-                let fraction = controller.knownDurationMs > 0
-                    ? min(max(Double(controller.currentMs) / Double(controller.knownDurationMs), 0), 1)
-                    : 0
-                ZStack(alignment: .leading) {
-                    Capsule().fill(.white.opacity(0.25))
-                    Capsule()
-                        .fill(Palette.accent)
-                        .frame(width: geometry.size.width * fraction)
-                }
-                .overlay {
-                    if focusedControl == .progress {
-                        ZStack {
-                            Capsule().stroke(
-                                .black.opacity(0.96),
-                                lineWidth: TVPlayerProgressFocusRing.outerStrokeWidth
-                            )
-                            Capsule().stroke(
-                                Palette.accent.opacity(0.34),
-                                lineWidth: TVPlayerProgressFocusRing.fadeStrokeWidth
-                            )
-                            Capsule().stroke(
-                                Palette.accent,
-                                lineWidth: TVPlayerProgressFocusRing.accentStrokeWidth
-                            )
-                        }
+        GeometryReader { geometry in
+            let fraction = controller.knownDurationMs > 0
+                ? min(max(Double(controller.currentMs) / Double(controller.knownDurationMs), 0), 1)
+                : 0
+            ZStack(alignment: .leading) {
+                Capsule().fill(.white.opacity(0.25))
+                Capsule()
+                    .fill(Palette.accent)
+                    .frame(width: geometry.size.width * fraction)
+            }
+            .overlay {
+                if focusedControl == .progress {
+                    ZStack {
+                        Capsule().stroke(
+                            .black.opacity(0.96),
+                            lineWidth: TVPlayerProgressFocusRing.outerStrokeWidth
+                        )
+                        Capsule().stroke(
+                            Palette.accent.opacity(0.34),
+                            lineWidth: TVPlayerProgressFocusRing.fadeStrokeWidth
+                        )
+                        Capsule().stroke(
+                            Palette.accent,
+                            lineWidth: TVPlayerProgressFocusRing.accentStrokeWidth
+                        )
                     }
                 }
             }
-            .frame(height: 8)
         }
-        .buttonStyle(.plain)
+        .frame(height: 8)
+        .contentShape(Rectangle())
+        .focusable()
         .focusEffectDisabled()
         .focused($focusedControl, equals: .progress)
         .onMoveCommand { direction in
             switch direction {
             case .left: controller.skip(seconds: -30)
             case .right: controller.skip(seconds: 30)
+            case .down: revealNowPlayingInfo()
             default: break
             }
             revealControls()

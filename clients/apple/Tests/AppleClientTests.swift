@@ -143,9 +143,11 @@ final class AppleClientTests: XCTestCase {
 
     func testPlayContextKeepsTheServerDurationForProgressReporting() {
         let context = PlayContext(itemId: 7, fileId: 11, startMs: 3_000,
-                                  durationMs: 7_200_000, title: "Feature")
+                                  durationMs: 7_200_000, title: "Feature",
+                                  overview: "A precise description.")
 
         XCTAssertEqual(context.durationMs, 7_200_000)
+        XCTAssertEqual(context.overview, "A precise description.")
     }
 
     func testPlayerFactsSurfaceUsefulSourceInformation() {
@@ -196,6 +198,15 @@ final class AppleClientTests: XCTestCase {
             scrubbing: false,
             changingStream: false
         ))
+    }
+
+    func testNowPlayingSummaryUsesLoadedOverviewAndHasAFallback() {
+        XCTAssertEqual(
+            PlayerView.nowPlayingSummary("  A family crosses the stars.\n"),
+            "A family crosses the stars."
+        )
+        XCTAssertEqual(PlayerView.nowPlayingSummary("  "), "No description available.")
+        XCTAssertEqual(PlayerView.nowPlayingSummary(nil), "No description available.")
     }
 
     func testDetailBodyNeverOutgrowsItsAvailableWidth() {
@@ -328,7 +339,7 @@ final class AppleClientTests: XCTestCase {
         XCTAssertLessThanOrEqual(TVPlayerChromeMetrics.headerVerticalInset, 5)
         XCTAssertLessThanOrEqual(TVPlayerChromeMetrics.timeHorizontalInset, 6)
         XCTAssertLessThanOrEqual(TVPlayerChromeMetrics.timeVerticalInset, 3)
-        XCTAssertLessThanOrEqual(TVPlayerProgressFocusRing.outerStrokeWidth, 2)
+        XCTAssertLessThanOrEqual(TVPlayerProgressFocusRing.outerStrokeWidth, 1.5)
         XCTAssertGreaterThan(
             TVPlayerProgressFocusRing.outerStrokeWidth,
             TVPlayerProgressFocusRing.fadeStrokeWidth

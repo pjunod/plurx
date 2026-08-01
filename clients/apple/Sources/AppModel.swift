@@ -386,14 +386,16 @@ final class AppModel: ObservableObject {
         guard let next, let detail = try? await itemDetail(next.id), let file = detail.files?.first else {
             return nil
         }
+        let playable = detail.item
         return PlayContext(
-            itemId: next.id,
+            itemId: playable.id,
             fileId: file.id,
             startMs: 0,
-            durationMs: file.durationMs ?? next.runtimeMs ?? 0,
-            title: next.title,
-            subtitle: nextEpisodeSubtitle(next),
-            year: next.year
+            durationMs: file.durationMs ?? playable.runtimeMs ?? 0,
+            title: playable.title,
+            subtitle: nextEpisodeSubtitle(playable),
+            year: playable.year,
+            overview: playable.overview
         )
     }
 

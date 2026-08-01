@@ -157,9 +157,9 @@ struct TVPlayerControlButtonStyle: ButtonStyle {
 /// Three concentric sub-two-point strokes make the progress focus indicator a
 /// red hairline whose two edges fall back into black.
 enum TVPlayerProgressFocusRing {
-    static let outerStrokeWidth: CGFloat = 2
-    static let fadeStrokeWidth: CGFloat = 1.25
-    static let accentStrokeWidth: CGFloat = 0.5
+    static let outerStrokeWidth: CGFloat = 1.5
+    static let fadeStrokeWidth: CGFloat = 0.9
+    static let accentStrokeWidth: CGFloat = 0.3
 }
 
 /// Opaque player chrome is limited to the pixels immediately surrounding copy.
