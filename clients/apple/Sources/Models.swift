@@ -181,10 +181,10 @@ enum PosterSize: String, CaseIterable, Identifiable {
     var posterWidth: CGFloat {
         #if os(tvOS)
         switch self {
-        case .small: return 160
-        case .medium: return 190
-        case .large: return 226
-        case .extraLarge: return 270
+        case .small: return 180
+        case .medium: return 220
+        case .large: return 260
+        case .extraLarge: return 300
         }
         #else
         switch self {
