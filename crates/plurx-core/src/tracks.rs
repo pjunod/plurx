@@ -154,11 +154,20 @@ fn sub_in_lang<'a>(subs: &'a [SubtitleStream], lang: &str) -> Option<&'a Subtitl
         .or_else(|| subs.iter().find(|s| lang_matches(&s.language, lang)))
 }
 
-/// The floor: only forced overlay subs (or the container's flagged default).
-fn forced_or_default(subs: &[SubtitleStream]) -> Option<i64> {
+/// The floor: only a forced overlay (or flagged default) in the viewer's
+/// language. A mux whose primary language is Italian can flag its Italian
+/// forced track as both first and default even while English audio is playing;
+/// burning that track is not a harmless fallback, it is the wrong language.
+/// Untagged tracks remain eligible because there is no contrary information.
+fn forced_or_default(subs: &[SubtitleStream], lang: &str) -> Option<i64> {
     subs.iter()
-        .find(|s| s.forced)
-        .or_else(|| subs.iter().find(|s| s.default))
+        .find(|s| s.forced && lang_matches(&s.language, lang))
+        .or_else(|| {
+            subs.iter()
+                .find(|s| s.default && lang_matches(&s.language, lang))
+        })
+        .or_else(|| subs.iter().find(|s| s.forced && s.language.is_none()))
+        .or_else(|| subs.iter().find(|s| s.default && s.language.is_none()))
         .map(|s| s.index)
 }
 
@@ -207,16 +216,16 @@ pub fn select_tracks(
         SubMode::Always => sub_in_lang(subs, &prefs.sub_lang)
             .map(|s| s.index)
             .or_else(|| subs.iter().find(|s| !s.forced).map(|s| s.index))
-            .or_else(|| forced_or_default(subs)),
+            .or_else(|| forced_or_default(subs, &prefs.sub_lang)),
         SubMode::Auto => {
             if lang_matches(&audio_lang, &prefs.sub_lang) {
                 // Audio already speaks the preferred language → overlay only.
-                forced_or_default(subs)
+                forced_or_default(subs, &prefs.sub_lang)
             } else {
                 // Foreign audio → full subs in the preferred language.
                 sub_in_lang(subs, &prefs.sub_lang)
                     .map(|s| s.index)
-                    .or_else(|| forced_or_default(subs))
+                    .or_else(|| forced_or_default(subs, &prefs.sub_lang))
             }
         }
     };
@@ -310,6 +319,23 @@ mod tests {
         let s = vec![sub(0, "eng", false, false)];
         let sel = select_tracks(&a, &s, false, &LangPrefs::default());
         assert_eq!(sel.subtitle_index, None); // no forced subs → nothing
+    }
+
+    #[test]
+    fn forced_subtitles_follow_the_viewers_language_not_container_order() {
+        let a = vec![audio(0, "eng", true)];
+        let s = vec![
+            sub(0, "ita", true, true),
+            sub(1, "ita", false, false),
+            sub(2, "eng", true, false),
+            sub(3, "eng", false, false),
+        ];
+        let sel = select_tracks(&a, &s, false, &LangPrefs::default());
+        assert_eq!(
+            sel.subtitle_index,
+            Some(2),
+            "the Italian container default must not beat English forced subs"
+        );
     }
 
     #[test]

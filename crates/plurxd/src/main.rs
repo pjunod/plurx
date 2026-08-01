@@ -12,6 +12,7 @@ mod progressive;
 mod schedule;
 mod state;
 mod storeprobe;
+mod subtitles;
 mod trakt;
 mod transcode;
 mod version;

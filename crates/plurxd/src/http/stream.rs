@@ -738,48 +738,6 @@ pub async fn set_audio_offset(
     Ok(Json(serde_json::json!({ "audio_offset_ms": offset })))
 }
 
-/// Entries the subtitle cache may hold before the oldest are trimmed, and
-/// how far a trim takes it. Hysteresis so the sweep runs once in a while
-/// rather than on every insert at the boundary. VTTs run tens to a few
-/// hundred kilobytes, so the cap is megabytes of disk, not gigabytes.
-const SUBS_CACHE_MAX_ENTRIES: usize = 256;
-const SUBS_CACHE_TRIM_TO: usize = 224;
-
-/// Drop the oldest cached subtitles once the cache outgrows its cap, and any
-/// abandoned temp file a crashed extraction left behind.
-async fn prune_subs_cache(dir: &std::path::Path) {
-    let Ok(mut rd) = tokio::fs::read_dir(dir).await else {
-        return;
-    };
-    let mut entries: Vec<(std::time::SystemTime, std::path::PathBuf)> = Vec::new();
-    while let Ok(Some(entry)) = rd.next_entry().await {
-        let path = entry.path();
-        let Ok(meta) = entry.metadata().await else {
-            continue;
-        };
-        let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        // A temp file older than an hour is a crashed extraction, not one in
-        // flight; a live one is written and renamed within seconds.
-        if name.starts_with(".tmp-") {
-            if modified.elapsed().is_ok_and(|age| age.as_secs() > 3600) {
-                let _ = tokio::fs::remove_file(&path).await;
-            }
-            continue;
-        }
-        entries.push((modified, path));
-    }
-    if entries.len() <= SUBS_CACHE_MAX_ENTRIES {
-        return;
-    }
-    entries.sort_by_key(|(modified, _)| *modified);
-    let doomed = entries.len() - SUBS_CACHE_TRIM_TO;
-    for (_, path) in entries.into_iter().take(doomed) {
-        let _ = tokio::fs::remove_file(path).await;
-    }
-}
-
 /// GET /api/v1/files/:id/subs/{index}.vtt — subtitle stream `index` as
 /// WebVTT, for a native `<track>`. Auth is by `?token=` (a `<track>` element
 /// can't set headers). Text subs only; a bitmap sub (PGS/VobSub) can't
@@ -812,48 +770,17 @@ pub async fn subtitles_vtt(
         ));
     }
 
-    let cached = state
-        .subs_dir
-        .join(format!("f{id}-s{index}-{}-{}.vtt", file.size, file.mtime));
-    if let Ok(bytes) = tokio::fs::read(&cached).await {
-        return Ok(vtt_response(bytes));
-    }
-
-    tokio::fs::create_dir_all(&state.subs_dir)
+    let cached = crate::subtitles::ensure_vtt(&state.subs_dir, &file, index)
         .await
-        .map_err(|e| ApiError::Internal(format!("creating subtitle cache: {e}")))?;
-    let tmp = state
-        .subs_dir
-        .join(format!(".tmp-{}.vtt", uuid::Uuid::new_v4()));
-    let out = tokio::process::Command::new(ffmpeg_bin())
-        .args(["-hide_banner", "-loglevel", "error", "-i"])
-        .arg(&file.path)
-        .args(["-map", &format!("0:s:{index}"), "-f", "webvtt"])
-        .arg(&tmp)
-        .stdin(Stdio::null())
-        .output()
-        .await
-        .map_err(|e| ApiError::Internal(format!("spawning ffmpeg: {e}")))?;
-    if !out.status.success() {
-        let _ = tokio::fs::remove_file(&tmp).await;
-        let why = String::from_utf8_lossy(&out.stderr);
-        tracing::warn!(
-            file_id = id,
-            index,
-            "subtitle extraction failed: {}",
-            why.trim()
-        );
-        return Err(ApiError::Internal("subtitle extraction failed".into()));
-    }
-    // This response's bytes come from the temp file, so serving does not
-    // depend on winning the rename.
-    let bytes = tokio::fs::read(&tmp)
+        .map_err(|why| {
+            // Keep the endpoint's existing diagnostic while sharing the
+            // extraction/cache implementation with text subtitle burns.
+            tracing::warn!(file_id = id, index, "subtitle extraction failed: {why}");
+            ApiError::Internal("subtitle extraction failed".into())
+        })?;
+    let bytes = tokio::fs::read(&cached)
         .await
         .map_err(|e| ApiError::Internal(format!("reading extracted subtitles: {e}")))?;
-    if tokio::fs::rename(&tmp, &cached).await.is_err() {
-        let _ = tokio::fs::remove_file(&tmp).await;
-    }
-    prune_subs_cache(&state.subs_dir).await;
     Ok(vtt_response(bytes))
 }
 

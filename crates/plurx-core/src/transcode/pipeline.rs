@@ -266,8 +266,8 @@ impl Pipeline {
     /// and what this particular session is doing.
     ///
     /// A probe answers "can this box run this graph"; it cannot answer "should
-    /// this session". Three things send a session back to the CPU chain no
-    /// matter what the node proved, and all three are quiet failures rather
+    /// this session". Two correctness constraints send a session back to the
+    /// CPU chain no matter what the node proved, and both are quiet failures
     /// than loud ones — which is why they are decided here, once, instead of
     /// being left to the graph to discover:
     ///
@@ -279,12 +279,11 @@ impl Pipeline {
     /// - **The encoder it can't feed.** A graph and an encoder from different
     ///   families produce surfaces the other cannot read (see
     ///   [`Pipeline::pairs_with`]).
-    /// - **A burned TEXT subtitle.** libass renders inside the CPU chain and
-    ///   nowhere else. A *bitmap* burn no longer declines: its overlay still
-    ///   composites in system memory, but the graph comes down exactly once —
-    ///   after the GPU scale + tone-map — and it is the float tone-map, not
-    ///   the download, that decides whether a 4K burn holds realtime
-    ///   (PERF-PLAN §5 measured the two chains 4.9× apart).
+    ///
+    /// Text and bitmap subtitle burns both keep the GPU scale + tone-map. The
+    /// mapped frame comes down exactly once for libass/overlay and returns to
+    /// the hardware encoder; it is the CPU float tone-map, not that one copy,
+    /// that decides whether a 4K burn can produce its first segment in time.
     ///
     /// And one more that is about worth rather than correctness: `heavy` (see
     /// `transcode::heavy_source`). The vendor graphs require hardware decode,
@@ -315,23 +314,20 @@ impl Pipeline {
     /// sounds. The doc above has said "the log says why" since M2 shipped, and
     /// the log did not: it printed `pipeline=cpu` on a 4K HDR session, on a box
     /// that had just probed a GPU graph at 4.9× — and left the reader to guess
-    /// which of four conditions had fired. A fallback nobody can explain is
+    /// which of three conditions had fired. A fallback nobody can explain is
     /// indistinguishable from a bug, and this one is usually *correct*.
     pub fn declined(
         proven: Pipeline,
         encoder: Encoder,
         hdr_format: Option<&str>,
         heavy: bool,
-        burns_text_subtitles: bool,
+        _burns_text_subtitles: bool,
     ) -> Option<&'static str> {
         if proven == Pipeline::Cpu {
             return None;
         }
         if !heavy {
             return Some("light source — a GPU graph is not worth the handoff");
-        }
-        if burns_text_subtitles {
-            return Some("a text subtitle is rendered by libass, which lives in the CPU chain");
         }
         if !proven.handles(hdr_format) {
             return Some(match hdr_format {
@@ -527,11 +523,11 @@ mod tests {
             Pipeline::Cpu
         );
 
-        // Burning text subtitles needs a CPU filter, so the GPU chain would
-        // have to come down and go back up — two round trips to avoid one.
+        // A text subtitle comes down after the GPU has done the expensive
+        // scale + tone-map, renders in system memory, then returns to QSV.
         assert_eq!(
             Pipeline::for_session(proven, Encoder::Qsv, Some("hdr10"), true, true),
-            Pipeline::Cpu
+            Pipeline::VppQsv
         );
 
         // A heavy SDR source still gets the GPU scaler: no tone-map to do, but
@@ -578,7 +574,6 @@ mod tests {
                 Encoder::Qsv,
             ),
             ("HLG", Some("hlg"), true, false, Encoder::Qsv),
-            ("subtitle", Some("hdr10"), true, true, Encoder::Qsv),
             ("light source", Some("hdr10"), false, false, Encoder::Qsv),
             ("families", Some("hdr10"), true, false, Encoder::Software),
         ];

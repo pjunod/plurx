@@ -1554,6 +1554,8 @@ pub struct TranscodeManager {
     work_dir: PathBuf,
     /// Writable XDG cache inherited by ffmpeg and libraries such as fontconfig.
     runtime_cache: PathBuf,
+    /// Extracted text subtitles shared with the WebVTT endpoint.
+    subtitle_cache: PathBuf,
     caps: EncoderCaps,
     /// The tone-map graph this node proved it can run, or [`Pipeline::Cpu`]
     /// when nothing did. A per-session decision still filters it — see
@@ -1619,6 +1621,7 @@ impl TranscodeManager {
         // outside their scratch root. `with_cache` moves this beside the
         // persistent caches in a normal daemon.
         let runtime_cache = work_dir.join(".runtime-cache");
+        let subtitle_cache = work_dir.join(".subtitle-cache");
         if let Err(err) = std::fs::create_dir_all(&runtime_cache) {
             tracing::warn!(
                 path = %runtime_cache.display(),
@@ -1629,6 +1632,7 @@ impl TranscodeManager {
             store,
             work_dir,
             runtime_cache,
+            subtitle_cache,
             caps,
             pipeline,
             admissions: Admissions::new(),
@@ -1663,10 +1667,9 @@ impl TranscodeManager {
     }
 
     pub fn with_cache(mut self, cache_dir: PathBuf, ffmpeg_build: String, node_id: String) -> Self {
-        self.runtime_cache = cache_dir
-            .parent()
-            .unwrap_or(cache_dir.as_path())
-            .join("runtime");
+        let cache_parent = cache_dir.parent().unwrap_or(cache_dir.as_path());
+        self.runtime_cache = cache_parent.join("runtime");
+        self.subtitle_cache = cache_parent.join("subs");
         if let Err(err) = std::fs::create_dir_all(&self.runtime_cache) {
             tracing::warn!(
                 path = %self.runtime_cache.display(),
@@ -1786,6 +1789,7 @@ impl TranscodeManager {
         subtitle_burn: Option<plurx_core::transcode::SubtitleBurn>,
         software_threads: Option<u32>,
     ) -> TranscodeOptions {
+        let subtitle_file = self.subtitle_file(file, subtitle_burn.as_ref());
         TranscodeOptions {
             target_height,
             software_threads,
@@ -1794,13 +1798,14 @@ impl TranscodeManager {
             start_seconds,
             tone_map: tone_map_pref(),
             // The node proved a graph; this session may still not be entitled
-            // to it (HLG, non-compatible Dolby Vision, a burned TEXT subtitle,
-            // a light source, an encoder it cannot feed). Deciding once, here,
+            // to it (HLG, non-compatible Dolby Vision, a light source, an
+            // encoder it cannot feed). Deciding once, here,
             // is what keeps the log line honest — `pipeline=` is what actually
             // ran, not what the box is capable of. Routed by `routing_hdr`
             // rather than the raw column: a DV base layer that is
             // HDR10-compatible is an hdr10 stream to a tone-map, and a bitmap
-            // burn keeps the GPU graph (it downloads once for the composite).
+            // subtitle burn keeps the GPU graph (it downloads once for
+            // libass/overlay after the expensive scale + tone-map is done).
             pipeline: Pipeline::for_session(
                 self.pipeline,
                 encoder,
@@ -1809,6 +1814,7 @@ impl TranscodeManager {
                 subtitle_burn.as_ref().is_some_and(|b| !b.bitmap),
             ),
             subtitle_burn,
+            subtitle_file,
             // Only where the startup probe proved this build takes it. A
             // family that needs the flag and cannot have it still works; its
             // segments just follow the encoder's GOP, which is slower to start
@@ -1816,6 +1822,43 @@ impl TranscodeManager {
             force_idr: self.caps.forced_idr.wanted_by(encoder),
             ..Default::default()
         }
+    }
+
+    /// A lossless-enough sidecar for simple text codecs. ASS/SSA remains
+    /// embedded because converting it to WebVTT would discard positioning,
+    /// styles, and the release's authored typography.
+    fn subtitle_file(
+        &self,
+        file: &plurx_core::domain::MediaFile,
+        burn: Option<&plurx_core::transcode::SubtitleBurn>,
+    ) -> Option<PathBuf> {
+        let burn = burn.filter(|burn| !burn.bitmap)?;
+        let codec = file
+            .subtitle_streams
+            .get(burn.subtitle_index as usize)?
+            .codec
+            .to_lowercase();
+        matches!(codec.as_str(), "subrip" | "srt" | "webvtt" | "mov_text")
+            .then(|| crate::subtitles::vtt_path(&self.subtitle_cache, file, burn.subtitle_index))
+    }
+
+    /// Materialise a text subtitle before ffmpeg opens the video pipeline.
+    /// libass reopening the MKV itself reads the entire movie before frame one;
+    /// the small cached VTT opens immediately and is shared with `/subs`.
+    async fn ensure_text_subtitle(
+        &self,
+        file: &plurx_core::domain::MediaFile,
+        burn: Option<&plurx_core::transcode::SubtitleBurn>,
+    ) -> Result<(), String> {
+        let Some(burn) = burn else {
+            return Ok(());
+        };
+        if self.subtitle_file(file, Some(burn)).is_none() {
+            return Ok(());
+        }
+        crate::subtitles::ensure_vtt(&self.subtitle_cache, file, burn.subtitle_index)
+            .await
+            .map(|_| ())
     }
 
     /// Serve a finished transcode, if this exact one has already been made.
@@ -2003,6 +2046,8 @@ impl TranscodeManager {
         ) {
             return Ok(None);
         }
+        self.ensure_text_subtitle(file, opts.subtitle_burn.as_ref())
+            .await?;
         let relative = format!("{}/{hash}", &hash[..2]);
         // The claim is both a lock and a bookmark.
         //
@@ -2732,6 +2777,8 @@ impl TranscodeManager {
         {
             return Ok(info);
         }
+        self.ensure_text_subtitle(&file, subtitle_burn.as_ref())
+            .await?;
 
         // Claim a hardware slot before spawning anything. An iGPU has one
         // video-processing block, and a third 4K session on it does not run a
