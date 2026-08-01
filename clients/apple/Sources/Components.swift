@@ -101,28 +101,6 @@ struct LandscapeCard: View {
                     .background(Palette.surfaceHi)
                     .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
 
-                LinearGradient(colors: [.clear, .black.opacity(0.82)], startPoint: .center, endPoint: .bottom)
-                    .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
-
-                VStack(alignment: .leading, spacing: 4) {
-                    Spacer()
-                    Text(item.showTitle ?? item.title)
-                        #if os(tvOS)
-                        .font(.callout.weight(.semibold))
-                        #else
-                        .font(.headline.weight(.semibold))
-                        #endif
-                        .foregroundColor(.white)
-                        .lineLimit(1)
-                    if item.showTitle != nil {
-                        Text(item.title)
-                            .font(.caption)
-                            .foregroundColor(.white.opacity(0.76))
-                            .lineLimit(1)
-                    }
-                }
-                .padding(12)
-
                 let fraction = progressFraction(item.watch, runtimeMs: item.runtimeMs)
                 if fraction > 0, fraction < 0.98 {
                     GeometryReader { geometry in
@@ -134,6 +112,20 @@ struct LandscapeCard: View {
                         }
                     }
                 }
+            }
+            Text(item.showTitle ?? item.title)
+                #if os(tvOS)
+                .font(.callout.weight(.semibold))
+                #else
+                .font(.headline.weight(.semibold))
+                #endif
+                .foregroundColor(Palette.onBg)
+                .lineLimit(1)
+            if item.showTitle != nil {
+                Text(item.title)
+                    .font(.caption)
+                    .foregroundColor(Palette.muted)
+                    .lineLimit(1)
             }
             let metadata = cardShelfMetadata(item)
             if !metadata.isEmpty {

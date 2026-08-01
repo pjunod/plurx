@@ -270,6 +270,21 @@ final class AppleClientTests: XCTestCase {
         }
     }
 
+    func testTVMediaCardFocusSurroundFadesAtBothEdges() {
+        XCTAssertGreaterThan(
+            TVMediaCardButtonStyle.outerStrokeWidth,
+            TVMediaCardButtonStyle.darkRedStrokeWidth
+        )
+        XCTAssertGreaterThan(
+            TVMediaCardButtonStyle.darkRedStrokeWidth,
+            TVMediaCardButtonStyle.accentStrokeWidth
+        )
+        XCTAssertGreaterThan(
+            TVMediaCardButtonStyle.accentStrokeWidth,
+            TVMediaCardButtonStyle.innerStrokeWidth
+        )
+    }
+
     func testShelfMetadataUsesMediaFactsInsteadOfLibraryCategory() throws {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
