@@ -89,6 +89,39 @@ final class AppleClientTests: XCTestCase {
         XCTAssertEqual(AppBuildInfo.label(version: nil, build: nil), "Unknown")
     }
 
+    @MainActor
+    func testTVSeriesPrimaryActionPrefersProgressAndSupportsSingleSeasonShapes() {
+        var first = Item(id: 1, kind: "episode", title: "First")
+        var progressing = Item(id: 2, kind: "episode", title: "In progress")
+        var watched = Item(id: 3, kind: "episode", title: "Watched")
+        first.watch = Watch(positionMs: 0, watched: false)
+        progressing.watch = Watch(positionMs: 30_000, watched: false)
+        watched.watch = Watch(positionMs: 0, watched: true)
+
+        XCTAssertEqual(
+            AppModel.orderedEpisodeCandidates([first, progressing, watched]).map(\.id),
+            [2, 1, 3]
+        )
+        XCTAssertEqual(AppModel.resumableStartMs(positionMs: 30_000, durationMs: 100_000), 30_000)
+        XCTAssertEqual(AppModel.resumableStartMs(positionMs: 96_000, durationMs: 100_000), 0)
+    }
+
+    @MainActor
+    func testApplePlayerRetriesAnUnopenableOriginalOnlyOnce() {
+        XCTAssertTrue(PlayerController.shouldRetryWithCompatibilityTranscode(
+            canRetry: true,
+            alreadyAttempted: false
+        ))
+        XCTAssertFalse(PlayerController.shouldRetryWithCompatibilityTranscode(
+            canRetry: true,
+            alreadyAttempted: true
+        ))
+        XCTAssertFalse(PlayerController.shouldRetryWithCompatibilityTranscode(
+            canRetry: false,
+            alreadyAttempted: false
+        ))
+    }
+
     func testOriginNormalizationAcceptsHostnamesAndRemovesTrailingSlashes() {
         XCTAssertEqual(AppModel.normalizeOrigin("  media-box:32400///  "), "http://media-box:32400")
         XCTAssertEqual(AppModel.normalizeOrigin("media-box"), "http://media-box:32400")

@@ -56,6 +56,9 @@ final class PlayerController: ObservableObject {
     private var sessionId: String?
     private var lastReportedMs = 0
     private var usesDirectTimeline = false
+    private var canRetryCurrentItemWithTranscode = false
+    private var compatibilityFallbackAttempted = false
+    private var forceCompatibilityTranscode = false
     /// Stable for this player instance. Server-side supersession uses it to
     /// replace this player's own stream without touching another device.
     private let playbackId = UUID().uuidString
@@ -272,8 +275,9 @@ final class PlayerController: ObservableObject {
         }
 
         let normalMode = decision.delivery?.mode ?? Self.legacyMode(decision.method)
-        let forceTranscode = selectedSubtitle != nil || selectedHeight != nil
+        let forceTranscode = selectedSubtitle != nil || selectedHeight != nil || forceCompatibilityTranscode
         let customAudio = audioOverride != nil
+        canRetryCurrentItemWithTranscode = normalMode != "transcode" && !forceTranscode && !customAudio
         let direct = normalMode == "direct" && !forceTranscode && !customAudio
         let url: URL?
         var seekAfterAttach: Int?
@@ -437,6 +441,18 @@ final class PlayerController: ObservableObject {
             guard item.status == .failed else { return }
             Task { @MainActor in
                 guard let self, self.player.currentItem === item else { return }
+                if Self.shouldRetryWithCompatibilityTranscode(
+                    canRetry: self.canRetryCurrentItemWithTranscode,
+                    alreadyAttempted: self.compatibilityFallbackAttempted
+                ), self.started {
+                    self.compatibilityFallbackAttempted = true
+                    self.forceCompatibilityTranscode = true
+                    self.canRetryCurrentItemWithTranscode = false
+                    self.isChangingStream = false
+                    self.playbackError = "The original stream could not open. Retrying a compatible stream…"
+                    await self.reopen(at: self.realPositionMs())
+                    return
+                }
                 self.player.pause()
                 self.isPlaying = false
                 self.isChangingStream = false
@@ -445,6 +461,13 @@ final class PlayerController: ObservableObject {
                     ?? PlaybackPreparationError.failed.localizedDescription
             }
         }
+    }
+
+    static func shouldRetryWithCompatibilityTranscode(
+        canRetry: Bool,
+        alreadyAttempted: Bool
+    ) -> Bool {
+        canRetry && !alreadyAttempted
     }
 
     private func report(_ position: Int) {

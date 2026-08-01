@@ -6,6 +6,6 @@ import org.junit.Test
 class AppVersionTest {
     @Test
     fun packageVersionIncludesItsBuildNumber() {
-        assertEquals("0.2.0 (2)", appVersionLabel("0.2.0", 2))
+        assertEquals("0.2.0 (3)", appVersionLabel("0.2.0", 3))
     }
 }

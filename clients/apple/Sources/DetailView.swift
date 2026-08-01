@@ -263,6 +263,10 @@ enum TVPlayableDetailMetrics {
 #endif
 
 struct DetailView: View {
+    #if os(tvOS)
+    private enum TVDetailFocus: Hashable { case primaryAction }
+    #endif
+
     @EnvironmentObject var model: AppModel
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     let itemId: Int
@@ -271,6 +275,10 @@ struct DetailView: View {
     @State private var loadError: String?
     @State private var watchBusy = false
     @State private var actionError: String?
+    #if os(tvOS)
+    @State private var seriesPlayback: PlayContext?
+    @FocusState private var tvFocusedAction: TVDetailFocus?
+    #endif
 
     var body: some View {
         DetailViewportFrame {
@@ -296,8 +304,21 @@ struct DetailView: View {
         #endif
         .task(id: itemId) {
             do {
-                detail = try await model.itemDetail(itemId)
+                let loaded = try await model.itemDetail(itemId)
+                detail = loaded
                 loadError = nil
+                #if os(tvOS)
+                tvFocusedAction = nil
+                if loaded.item.kind == "show" || loaded.item.kind == "season" {
+                    seriesPlayback = await model.seriesPlayback(loaded)
+                } else {
+                    seriesPlayback = nil
+                }
+                if Self.hasTVPrimaryAction(loaded, seriesPlayback: seriesPlayback) {
+                    try? await Task.sleep(for: .milliseconds(120))
+                    tvFocusedAction = .primaryAction
+                }
+                #endif
             } catch {
                 loadError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             }
@@ -638,7 +659,13 @@ struct DetailView: View {
                                 .fixedSize(horizontal: false, vertical: true)
                         }
 
-                        watchButton(detail)
+                        HStack(spacing: 16) {
+                            if let seriesPlayback {
+                                seriesPlaybackButton(seriesPlayback)
+                                    .fixedSize()
+                            }
+                            watchButton(detail)
+                        }
 
                         if let actionError {
                             Text(actionError)
@@ -718,6 +745,27 @@ struct DetailView: View {
 
     static func tvSeriesChildStyle(for kind: String) -> MediaRowStyle {
         kind == "season" ? .episode : .poster
+    }
+
+    static func hasTVPrimaryAction(
+        _ detail: ItemDetail,
+        seriesPlayback: PlayContext?
+    ) -> Bool {
+        if detail.item.kind == "show" || detail.item.kind == "season" {
+            return seriesPlayback != nil
+        }
+        return detail.item.isPlayable && detail.files?.first != nil
+    }
+
+    private func seriesPlaybackButton(_ target: PlayContext) -> some View {
+        PrimaryButton(
+            title: target.startMs > 0
+                ? "▶  Resume · \(formatTime(target.startMs))"
+                : "▶  Play"
+        ) {
+            play = target
+        }
+        .focused($tvFocusedAction, equals: .primaryAction)
     }
     #endif
 
@@ -886,6 +934,7 @@ struct DetailView: View {
         #endif
     }
 
+    @ViewBuilder
     private func resumeButton(
         item: Item,
         file: MediaFile,
@@ -893,7 +942,7 @@ struct DetailView: View {
         resumeMs: Int,
         canResume: Bool
     ) -> some View {
-        PrimaryButton(title: canResume ? "▶  Resume · \(formatTime(resumeMs))" : "▶  Play") {
+        let button = PrimaryButton(title: canResume ? "▶  Resume · \(formatTime(resumeMs))" : "▶  Play") {
             play = PlayContext(
                 itemId: item.id,
                 fileId: file.id,
@@ -905,6 +954,11 @@ struct DetailView: View {
                 overview: item.overview
             )
         }
+        #if os(tvOS)
+        button.focused($tvFocusedAction, equals: .primaryAction)
+        #else
+        button
+        #endif
     }
 
     private func startOverButton(item: Item, file: MediaFile, durationMs: Int) -> some View {

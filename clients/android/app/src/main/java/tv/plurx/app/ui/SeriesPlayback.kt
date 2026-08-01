@@ -25,6 +25,9 @@ internal fun orderedSeasonCandidates(items: List<Item>): List<Item> {
     return inProgress + notStarted + completed
 }
 
+internal fun directShowEpisodeCandidates(items: List<Item>): List<Item> =
+    if (orderedSeasonCandidates(items).isEmpty()) orderedEpisodeCandidates(items) else emptyList()
+
 internal fun resumableStartMs(positionMs: Long, durationMs: Long?): Long {
     if (positionMs <= 3_000L) return 0L
     if (durationMs != null && durationMs > 0L && positionMs.toDouble() > durationMs * 0.95) return 0L

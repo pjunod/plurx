@@ -344,12 +344,18 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     suspend fun seriesPlayback(detail: ItemDetail): EpisodePlaybackTarget? = when (detail.item.kind) {
         "season" -> playableEpisode(orderedEpisodeCandidates(detail.children))
         "show" -> {
-            var target: EpisodePlaybackTarget? = null
-            for (season in orderedSeasonCandidates(detail.children)) {
-                target = playableEpisode(orderedEpisodeCandidates(itemDetail(season.id).children))
-                if (target != null) break
+            val children = detail.children
+            val seasons = orderedSeasonCandidates(children)
+            if (seasons.isEmpty()) {
+                playableEpisode(directShowEpisodeCandidates(children))
+            } else {
+                var target: EpisodePlaybackTarget? = null
+                for (season in seasons) {
+                    target = playableEpisode(orderedEpisodeCandidates(itemDetail(season.id).children))
+                    if (target != null) break
+                }
+                target
             }
-            target
         }
         else -> null
     }
