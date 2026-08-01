@@ -40,7 +40,8 @@ enum TVSeriesDetailMetrics {
 /// the first television viewport while leaving enough room for readable copy.
 enum TVPlayableDetailMetrics {
     static let heroHeight: CGFloat = 690
-    static let copyWidth: CGFloat = 880
+    static let copyWidth: CGFloat = 980
+    static let bottomInset: CGFloat = 26
 }
 #endif
 
@@ -201,35 +202,30 @@ struct DetailView: View {
         let canResume = resumeMs > 3000 && !nearlyDone
 
         return VStack(alignment: .leading, spacing: 0) {
-            ZStack(alignment: .leading) {
+            ZStack(alignment: .bottomLeading) {
                 tvPlayableBackground(item)
 
-                VStack(alignment: .leading, spacing: 18) {
-                    Spacer(minLength: 0)
-
+                VStack(alignment: .leading, spacing: 12) {
                     Text(tvPlayableEyebrow(detail).uppercased())
-                        .font(.system(.caption, design: .monospaced).weight(.bold))
-                        .tracking(2.2)
+                        .font(.system(size: 20, weight: .bold, design: .rounded))
+                        .tracking(2.6)
                         .foregroundColor(Palette.accent)
 
                     Text(item.title)
-                        .font(.system(size: 66, weight: .bold))
+                        .font(.system(size: 60, weight: .heavy, design: .rounded))
                         .foregroundColor(Palette.onBg)
                         .lineLimit(2)
                         .fixedSize(horizontal: false, vertical: true)
-                        .shadow(color: .black.opacity(0.65), radius: 12, y: 4)
+                        .shadow(color: .black.opacity(0.72), radius: 14, y: 5)
 
-                    Text(Self.tvPlayableMetadata(item, file: file, durationMs: durationMs))
-                        .font(.system(.callout, design: .monospaced).weight(.semibold))
-                        .foregroundColor(Palette.onBg.opacity(0.82))
-                        .lineLimit(1)
+                    tvMetadataLine(item, file: file, durationMs: durationMs)
 
                     if let overview = item.overview, !overview.isEmpty {
                         Text(overview)
-                            .font(.title3)
-                            .foregroundColor(Palette.onBg.opacity(0.84))
-                            .lineSpacing(5)
-                            .lineLimit(4)
+                            .font(.system(size: 24, weight: .regular, design: .rounded))
+                            .foregroundColor(Palette.onBg.opacity(0.88))
+                            .lineSpacing(3)
+                            .lineLimit(2)
                             .fixedSize(horizontal: false, vertical: true)
                     }
 
@@ -252,7 +248,7 @@ struct DetailView: View {
 
                         watchButton(detail)
                     }
-                    .padding(.top, 4)
+                    .padding(.top, 3)
 
                     if let actionError {
                         Text(actionError)
@@ -260,10 +256,10 @@ struct DetailView: View {
                             .foregroundColor(Palette.accent)
                     }
                 }
-                .frame(maxWidth: TVPlayableDetailMetrics.copyWidth, maxHeight: .infinity,
-                       alignment: .bottomLeading)
-                .padding(.horizontal, 96)
-                .padding(.vertical, 48)
+                .frame(maxWidth: TVPlayableDetailMetrics.copyWidth, alignment: .leading)
+                .padding(.leading, 88)
+                .padding(.trailing, 70)
+                .padding(.bottom, TVPlayableDetailMetrics.bottomInset)
             }
             .frame(height: TVPlayableDetailMetrics.heroHeight)
             .clipped()
@@ -277,17 +273,50 @@ struct DetailView: View {
         .padding(.bottom, 30)
     }
 
+    private func tvMetadataLine(_ item: Item, file: MediaFile?, durationMs: Int?) -> some View {
+        let facts = Self.tvPlayableMetadataParts(item, file: file, durationMs: durationMs)
+        return HStack(spacing: 13) {
+            ForEach(Array(facts.enumerated()), id: \.offset) { index, fact in
+                if index > 0 {
+                    Circle()
+                        .fill(Palette.accent.opacity(0.82))
+                        .frame(width: 5, height: 5)
+                }
+
+                Text(fact)
+                    .font(.system(
+                        size: 20,
+                        weight: index == 0 ? .semibold : .medium,
+                        design: .rounded
+                    ))
+                    .foregroundColor(
+                        index == 0 ? Palette.onBg : Palette.onBg.opacity(0.74)
+                    )
+            }
+        }
+        .lineLimit(1)
+    }
+
     @ViewBuilder
     private func tvPlayableBackground(_ item: Item) -> some View {
-        AuthImage(path: item.backdrop ?? item.poster)
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .clipped()
+        GeometryReader { geometry in
+            HStack(spacing: 0) {
+                Spacer(minLength: geometry.size.width * 0.28)
+                AuthImage(path: item.backdrop ?? item.poster, contentMode: .fit)
+                    .frame(
+                        width: geometry.size.width * 0.72,
+                        height: geometry.size.height,
+                        alignment: .trailing
+                    )
+            }
+            .frame(width: geometry.size.width, height: geometry.size.height)
+        }
 
         LinearGradient(
             stops: [
-                .init(color: Palette.bg.opacity(0.98), location: 0),
-                .init(color: Palette.bg.opacity(0.82), location: 0.34),
-                .init(color: Palette.bg.opacity(0.2), location: 0.72),
+                .init(color: Palette.bg, location: 0),
+                .init(color: Palette.bg.opacity(0.94), location: 0.3),
+                .init(color: Palette.bg.opacity(0.38), location: 0.53),
                 .init(color: .clear, location: 1)
             ],
             startPoint: .leading,
@@ -296,9 +325,9 @@ struct DetailView: View {
 
         LinearGradient(
             stops: [
-                .init(color: .black.opacity(0.08), location: 0),
-                .init(color: .clear, location: 0.48),
-                .init(color: Palette.bg.opacity(0.92), location: 1)
+                .init(color: Palette.bg.opacity(0.16), location: 0),
+                .init(color: .clear, location: 0.46),
+                .init(color: Palette.bg.opacity(0.98), location: 1)
             ],
             startPoint: .top,
             endPoint: .bottom
@@ -317,12 +346,21 @@ struct DetailView: View {
     }
 
     static func tvPlayableMetadata(_ item: Item, file: MediaFile?, durationMs: Int?) -> String {
+        tvPlayableMetadataParts(item, file: file, durationMs: durationMs)
+            .joined(separator: "   ·   ")
+    }
+
+    static func tvPlayableMetadataParts(
+        _ item: Item,
+        file: MediaFile?,
+        durationMs: Int?
+    ) -> [String] {
         var parts: [String] = []
 
         if item.kind == "episode", let season = item.seasonNumber, let episode = item.episodeNumber {
-            parts.append("S\(season) E\(episode)")
+            parts.append("Season \(season), Episode \(episode)")
         }
-        if let year = item.year { parts.append(String(year)) }
+        if item.kind != "episode", let year = item.year { parts.append(String(year)) }
         if let durationMs, durationMs > 0 { parts.append(tvRuntimeLabel(durationMs)) }
         if let resolution = resolutionLabel(file?.height ?? item.resolution) {
             parts.append(resolution)
@@ -330,19 +368,15 @@ struct DetailView: View {
         if let codec = file?.videoCodec, !codec.isEmpty {
             parts.append(tvCodecLabel(codec))
         }
-        if let container = file?.container, !container.isEmpty {
-            parts.append(container.uppercased())
-        }
-
-        return parts.joined(separator: "   ·   ")
+        return parts
     }
 
     private static func tvRuntimeLabel(_ durationMs: Int) -> String {
         let totalMinutes = max(1, durationMs / 60_000)
         let hours = totalMinutes / 60
         let minutes = totalMinutes % 60
-        if hours == 0 { return "\(minutes)m" }
-        return minutes == 0 ? "\(hours)h" : "\(hours)h \(minutes)m"
+        if hours == 0 { return "\(minutes) min" }
+        return minutes == 0 ? "\(hours) hr" : "\(hours) hr \(minutes) min"
     }
 
     private static func tvCodecLabel(_ codec: String) -> String {

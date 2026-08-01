@@ -33,6 +33,8 @@ struct RootView: View {
                 ConnectView(discovery: model.discovery)
             case .needLogin:
                 LoginView()
+            case .reconnectFailed:
+                ReconnectView()
             case .ready:
                 HomeView()
             }

@@ -1,9 +1,19 @@
 import Foundation
 
-/// Persisted server + token (for silent reconnect) and the default audio /
-/// subtitle languages, in UserDefaults. English out of the box.
+/// Persisted server, secure session token, and playback preferences. Ordinary
+/// preferences live in UserDefaults; the bearer token lives in Keychain so a
+/// development app replacement cannot silently sign the viewer out.
 struct SettingsStore {
-    private let defaults = UserDefaults.standard
+    private let defaults: UserDefaults
+    private let tokenVault: any TokenStoring
+
+    init(
+        defaults: UserDefaults = .standard,
+        tokenVault: any TokenStoring = TokenVault()
+    ) {
+        self.defaults = defaults
+        self.tokenVault = tokenVault
+    }
 
     private enum Key {
         static let origin = "plurx.origin"
@@ -21,8 +31,29 @@ struct SettingsStore {
         nonmutating set { defaults.set(newValue, forKey: Key.origin) }
     }
     var token: String? {
-        get { defaults.string(forKey: Key.token) }
-        nonmutating set { defaults.set(newValue, forKey: Key.token) }
+        get {
+            if let secured = tokenVault.read() { return secured }
+
+            // One-time migration for existing installs. Keep the legacy copy
+            // only if Keychain is unavailable, so a working session is never
+            // discarded while improving its storage.
+            guard let legacy = defaults.string(forKey: Key.token) else { return nil }
+            if tokenVault.write(legacy) {
+                defaults.removeObject(forKey: Key.token)
+            }
+            return legacy
+        }
+        nonmutating set {
+            guard let newValue else {
+                clearToken()
+                return
+            }
+            if tokenVault.write(newValue) {
+                defaults.removeObject(forKey: Key.token)
+            } else {
+                defaults.set(newValue, forKey: Key.token)
+            }
+        }
     }
     var username: String? {
         get { defaults.string(forKey: Key.username) }
@@ -54,5 +85,8 @@ struct SettingsStore {
     }
 
     /// Drop the token (sign out) but keep the origin so login stays pre-filled.
-    func clearToken() { defaults.removeObject(forKey: Key.token) }
+    func clearToken() {
+        tokenVault.clear()
+        defaults.removeObject(forKey: Key.token)
+    }
 }
