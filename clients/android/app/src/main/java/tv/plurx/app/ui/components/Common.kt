@@ -233,6 +233,7 @@ fun <T> ChoicePicker(
     modifier: Modifier = Modifier,
 ) {
     var open by remember { mutableStateOf(false) }
+    val selectorShape = MaterialTheme.shapes.small
     Column(modifier) {
         Text(label, color = Muted, style = MaterialTheme.typography.labelMedium, modifier = Modifier.padding(bottom = 6.dp))
         Box {
@@ -241,9 +242,11 @@ fun <T> ChoicePicker(
                 fontWeight = FontWeight.SemiBold,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .background(SurfaceHi, MaterialTheme.shapes.small)
-                    .border(1.dp, Outline, MaterialTheme.shapes.small)
-                    .tvFocusRing(MaterialTheme.shapes.small, focusedScale = 1.03f)
+                    // The focus transform must wrap the painted selector so the ring, surface,
+                    // outline, and label scale as one shape without side gaps.
+                    .tvFocusRing(selectorShape, focusedScale = 1.03f)
+                    .background(SurfaceHi, selectorShape)
+                    .border(1.dp, Outline, selectorShape)
                     .clickable { open = true }
                     .focusable()
                     .padding(horizontal = 16.dp, vertical = 14.dp),
