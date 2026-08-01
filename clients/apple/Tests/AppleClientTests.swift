@@ -234,6 +234,16 @@ final class AppleClientTests: XCTestCase {
         }
     }
 
+    func testEpisodeBreadcrumbLinksToTheShowAndSeasonInOrder() {
+        let show = Item(id: 10, kind: "show", title: "Shameless")
+        let season = Item(id: 20, kind: "season", title: "Season 1")
+
+        XCTAssertEqual(
+            [show, season].map(DetailBreadcrumb.destination(for:)),
+            [.item(10), .item(20)]
+        )
+    }
+
     #if os(tvOS)
     func testTVHomeStartsWithMediaRailsInsteadOfAFeaturedBillboard() {
         XCTAssertFalse(HomeLayoutPolicy.usesFeaturedHero)

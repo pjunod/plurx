@@ -60,6 +60,102 @@ private struct ItemMetadataBadgeRow: View {
     }
 }
 
+/// Clickable ancestors for a detail page. The server returns these outermost
+/// first, so an episode naturally reads "Show / Season" and a season reads
+/// "Show". The current title sits immediately below the trail.
+struct DetailBreadcrumb: View {
+    let ancestors: [Item]
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 2) {
+                ForEach(ancestors.indices, id: \.self) { index in
+                    if index > ancestors.startIndex {
+                        Text("/")
+                            .foregroundColor(Palette.muted)
+                            .accessibilityHidden(true)
+                    }
+
+                    let ancestor = ancestors[index]
+                    NavigationLink(value: Self.destination(for: ancestor)) {
+                        Text(ancestor.title)
+                            .lineLimit(1)
+                    }
+                    .breadcrumbButtonStyle()
+                    .accessibilityHint("Open \(ancestor.kind)")
+                }
+            }
+            .breadcrumbFont()
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Show path")
+    }
+
+    static func destination(for ancestor: Item) -> Route {
+        .item(ancestor.id)
+    }
+}
+
+private struct DetailBreadcrumbLinkStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        #if os(tvOS)
+        TVBody(configuration: configuration)
+        #else
+        configuration.label
+            .foregroundStyle(Palette.accent)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 4)
+            .opacity(configuration.isPressed ? 0.66 : 1)
+        #endif
+    }
+
+    #if os(tvOS)
+    private struct TVBody: View {
+        let configuration: ButtonStyle.Configuration
+        @Environment(\.isFocused) private var isFocused
+
+        var body: some View {
+            configuration.label
+                .foregroundStyle(isFocused ? Palette.onBg : Palette.accent)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 7)
+                .background(
+                    Palette.surfaceHi.opacity(isFocused ? 0.96 : 0),
+                    in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                )
+                .overlay {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .stroke(Palette.accent.opacity(isFocused ? 1 : 0), lineWidth: 2)
+                }
+                .scaleEffect(isFocused ? 1.05 : (configuration.isPressed ? 0.98 : 1))
+                .animation(.easeOut(duration: 0.12), value: isFocused)
+        }
+    }
+    #endif
+}
+
+private extension View {
+    @ViewBuilder
+    func breadcrumbButtonStyle() -> some View {
+        #if os(tvOS)
+        self
+            .buttonStyle(DetailBreadcrumbLinkStyle())
+            .focusEffectDisabled()
+        #else
+        self.buttonStyle(DetailBreadcrumbLinkStyle())
+        #endif
+    }
+
+    @ViewBuilder
+    func breadcrumbFont() -> some View {
+        #if os(tvOS)
+        self.font(.system(size: 20, weight: .semibold, design: .rounded))
+        #else
+        self.font(.system(.subheadline, design: .rounded).weight(.semibold))
+        #endif
+    }
+}
+
 /// Identifies a play request for the full-screen player cover.
 struct PlayContext: Identifiable {
     let id = UUID()
@@ -185,6 +281,7 @@ struct DetailView: View {
 
     private func standardContent(_ detail: ItemDetail) -> some View {
         let item = detail.item
+        let ancestors = detail.ancestors ?? []
         let file = detail.files?.first
         let durationMs = file?.durationMs ?? item.runtimeMs
         let resumeMs = item.watch?.positionMs ?? 0
@@ -207,6 +304,10 @@ struct DetailView: View {
 
             DetailBodyFrame {
                 VStack(alignment: .leading, spacing: 12) {
+                    if !ancestors.isEmpty {
+                        DetailBreadcrumb(ancestors: ancestors)
+                    }
+
                     Text(item.title)
                         #if os(tvOS)
                         .font(.system(size: 54, weight: .bold))
@@ -219,7 +320,7 @@ struct DetailView: View {
                         item,
                         file: file,
                         durationMs: durationMs,
-                        includeSeries: true
+                        includeSeries: ancestors.isEmpty
                     ))
 
                     if let file, item.isPlayable {
@@ -265,6 +366,7 @@ struct DetailView: View {
     #if os(tvOS)
     private func tvPlayableContent(_ detail: ItemDetail) -> some View {
         let item = detail.item
+        let ancestors = detail.ancestors ?? []
         let file = detail.files?.first
         let durationMs = file?.durationMs ?? item.runtimeMs
         let resumeMs = item.watch?.positionMs ?? 0
@@ -276,10 +378,16 @@ struct DetailView: View {
                 tvPlayableBackground(item)
 
                 VStack(alignment: .leading, spacing: 12) {
-                    Text(tvPlayableEyebrow(detail).uppercased())
-                        .font(.system(size: 20, weight: .bold, design: .rounded))
-                        .tracking(2.6)
-                        .foregroundColor(Palette.accent)
+                    if !ancestors.isEmpty {
+                        DetailBreadcrumb(ancestors: ancestors)
+                    }
+
+                    if item.kind != "episode" || ancestors.isEmpty {
+                        Text(tvPlayableEyebrow(detail).uppercased())
+                            .font(.system(size: 20, weight: .bold, design: .rounded))
+                            .tracking(2.6)
+                            .foregroundColor(Palette.accent)
+                    }
 
                     Text(item.title)
                         .font(.system(size: 60, weight: .heavy, design: .rounded))
@@ -429,6 +537,7 @@ struct DetailView: View {
 
     private func tvSeriesContent(_ detail: ItemDetail) -> some View {
         let item = detail.item
+        let ancestors = detail.ancestors ?? []
         let children = detail.children ?? []
 
         return VStack(alignment: .leading, spacing: 0) {
@@ -451,7 +560,9 @@ struct DetailView: View {
                         .shadow(color: .black.opacity(0.55), radius: 24, y: 14)
 
                     VStack(alignment: .leading, spacing: 15) {
-                        if let eyebrow = tvSeriesEyebrow(detail) {
+                        if !ancestors.isEmpty {
+                            DetailBreadcrumb(ancestors: ancestors)
+                        } else if let eyebrow = tvSeriesEyebrow(detail) {
                             Text(eyebrow.uppercased())
                                 .font(.system(.caption, design: .monospaced).weight(.semibold))
                                 .foregroundColor(Palette.accent)
