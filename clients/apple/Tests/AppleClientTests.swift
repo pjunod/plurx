@@ -257,6 +257,19 @@ final class AppleClientTests: XCTestCase {
         }
     }
 
+    func testTVShelfActionsRemainReadableWithAndWithoutFocus() {
+        for focused in [false, true] {
+            XCTAssertGreaterThanOrEqual(
+                contrastRatio(
+                    TVShelfActionButtonStyle.foregroundColor(focused: focused),
+                    TVShelfActionButtonStyle.backgroundColor(focused: focused)
+                ),
+                4.5,
+                "focused=\(focused)"
+            )
+        }
+    }
+
     private func contrastRatio(_ foreground: Color, _ background: Color) -> CGFloat {
         let lighter = max(relativeLuminance(foreground), relativeLuminance(background))
         let darker = min(relativeLuminance(foreground), relativeLuminance(background))

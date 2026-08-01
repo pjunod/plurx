@@ -72,6 +72,44 @@ struct TVReadableButtonStyle: ButtonStyle {
     }
 }
 
+/// Compact trailing action for shelf headers. tvOS 26 can tint a default
+/// NavigationLink's label and background identically, leaving only an empty
+/// accent-colored capsule. This style owns that contrast pair explicitly.
+struct TVShelfActionButtonStyle: ButtonStyle {
+    static func foregroundColor(focused: Bool) -> Color { Palette.bg }
+    static func backgroundColor(focused: Bool) -> Color { Palette.accent }
+
+    func makeBody(configuration: Configuration) -> Body {
+        Body(configuration: configuration)
+    }
+
+    struct Body: View {
+        let configuration: ButtonStyle.Configuration
+        @Environment(\.isFocused) private var isFocused
+
+        var body: some View {
+            configuration.label
+                .foregroundStyle(TVShelfActionButtonStyle.foregroundColor(focused: isFocused))
+                .padding(.horizontal, 22)
+                .padding(.vertical, 10)
+                .frame(minWidth: 126, minHeight: 48)
+                .background(
+                    TVShelfActionButtonStyle.backgroundColor(focused: isFocused),
+                    in: Capsule()
+                )
+                .brightness(isFocused ? 0.08 : 0)
+                .scaleEffect(isFocused ? 1.07 : (configuration.isPressed ? 0.97 : 1))
+                .shadow(
+                    color: Palette.accent.opacity(isFocused ? 0.42 : 0),
+                    radius: 14,
+                    y: 6
+                )
+                .animation(.easeOut(duration: 0.14), value: isFocused)
+                .animation(.easeOut(duration: 0.08), value: configuration.isPressed)
+        }
+    }
+}
+
 /// Replaces tvOS's thick white focus plate with the same restrained red
 /// signal used throughout plurx. The hero still lifts enough to read from the
 /// couch without turning the artwork into a glowing white rectangle.
@@ -153,6 +191,19 @@ extension View {
         #if os(tvOS)
         self
             .buttonStyle(TVHeroButtonStyle())
+            .focusEffectDisabled()
+        #else
+        self.buttonStyle(.plain)
+        #endif
+    }
+
+    /// Keeps shelf-header navigation readable under tvOS's tint and focus
+    /// transformations while retaining a simple plain link on touch devices.
+    @ViewBuilder
+    func shelfActionButtonStyle() -> some View {
+        #if os(tvOS)
+        self
+            .buttonStyle(TVShelfActionButtonStyle())
             .focusEffectDisabled()
         #else
         self.buttonStyle(.plain)

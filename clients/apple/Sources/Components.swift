@@ -226,9 +226,14 @@ struct MediaRow: View {
                     Spacer()
                     if let destination {
                         NavigationLink(value: Route.collection(destination)) {
-                            Text("See all")
-                                .font(.system(.caption, design: .monospaced).weight(.semibold))
+                            HStack(spacing: 8) {
+                                Text("See All")
+                                Image(systemName: "chevron.right")
+                                    .font(.caption.weight(.bold))
+                            }
+                            .font(.system(.caption, design: .rounded).weight(.bold))
                         }
+                        .shelfActionButtonStyle()
                     }
                 }
                 .padding(.horizontal, screenHPad)
