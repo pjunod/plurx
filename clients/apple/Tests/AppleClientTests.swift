@@ -299,8 +299,11 @@ final class AppleClientTests: XCTestCase {
         )
         XCTAssertEqual(
             PlayerView.playbackBadges(source: source, audio: audio).map(\.symbol),
-            ["4k.tv.fill", "sparkles", "speaker.wave.3.fill"]
+            ["4k.tv.fill", "sparkles", "waveform"]
         )
+        XCTAssertLessThanOrEqual(PlayerMetadataBadgeMetrics.rowSpacing, 6)
+        XCTAssertLessThanOrEqual(PlayerMetadataBadgeMetrics.horizontalPadding, 6)
+        XCTAssertLessThanOrEqual(PlayerMetadataBadgeMetrics.verticalPadding, 2)
 
         // Resolution tiers use the short edge, so a source whose dimensions
         // arrive in portrait/orientation order is still 1080p, not 1920p.

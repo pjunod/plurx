@@ -33,6 +33,18 @@ struct PlayerMetadataBadge: Equatable, Identifiable {
     var id: String { kind.rawValue }
 }
 
+enum PlayerMetadataBadgeMetrics {
+    static let rowSpacing: CGFloat = 6
+    static let contentSpacing: CGFloat = 4
+    static let horizontalPadding: CGFloat = 6
+    static let verticalPadding: CGFloat = 2
+    static let strokeWidth: CGFloat = 0.5
+
+    #if os(tvOS)
+    static let fontSize: CGFloat = 16
+    #endif
+}
+
 /// Full-screen Apple player with an explicit on-demand transport. AVPlayer
 /// sees a growing plurx HLS playlist as an EVENT stream while the server is
 /// producing it, so relying on the system overlay alone labels a movie LIVE
@@ -529,31 +541,39 @@ struct PlayerView: View {
             source: controller.decision?.source,
             audio: audio
         )
-        return HStack(spacing: 8) {
+        return HStack(spacing: PlayerMetadataBadgeMetrics.rowSpacing) {
             ForEach(badges) { badge in
-                HStack(spacing: 5) {
+                HStack(spacing: PlayerMetadataBadgeMetrics.contentSpacing) {
                     Image(systemName: badge.symbol)
+                        .imageScale(.small)
                     if let mark = badge.mark {
                         Text(mark)
-                            .fontWeight(.bold)
+                            .fontWeight(.semibold)
                     }
                 }
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .background(.black.opacity(0.38), in: Capsule())
+                .padding(.horizontal, PlayerMetadataBadgeMetrics.horizontalPadding)
+                .padding(.vertical, PlayerMetadataBadgeMetrics.verticalPadding)
+                .background(.black.opacity(0.32), in: Capsule())
                 .overlay {
-                    Capsule().stroke(.white.opacity(0.22), lineWidth: 0.5)
+                    Capsule().stroke(
+                        .white.opacity(0.18),
+                        lineWidth: PlayerMetadataBadgeMetrics.strokeWidth
+                    )
                 }
                 .accessibilityElement(children: .ignore)
                 .accessibilityLabel(badge.accessibilityLabel)
             }
         }
-            #if os(tvOS)
-            .font(.system(size: 19, design: .monospaced).weight(.medium))
-            #else
-            .font(.system(.caption, design: .monospaced).weight(.semibold))
-            #endif
-            .foregroundColor(.white.opacity(0.82))
+        #if os(tvOS)
+        .font(.system(
+            size: PlayerMetadataBadgeMetrics.fontSize,
+            weight: .medium,
+            design: .rounded
+        ))
+        #else
+        .font(.system(.caption2, design: .rounded).weight(.medium))
+        #endif
+        .foregroundColor(.white.opacity(0.78))
     }
 
     private var runtimeLabel: String? {
@@ -590,7 +610,7 @@ struct PlayerView: View {
         if let audio, let sound = soundLabel(audio) {
             badges.append(PlayerMetadataBadge(
                 kind: .audio,
-                symbol: "speaker.wave.3.fill",
+                symbol: "waveform",
                 mark: sound.mark,
                 accessibilityLabel: sound.accessibilityLabel
             ))
