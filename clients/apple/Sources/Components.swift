@@ -10,9 +10,10 @@ private let shelfPosterWidth: CGFloat = 132
 private let shelfLandscapeWidth: CGFloat = 250
 #endif
 
-enum MediaRowStyle {
+enum MediaRowStyle: Equatable {
     case poster
     case landscape
+    case episode
 }
 
 struct PosterCard: View {
@@ -143,6 +144,66 @@ struct LandscapeCard: View {
     }
 }
 
+struct EpisodeCard: View {
+    let item: Item
+    var width: CGFloat = shelfLandscapeWidth
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ZStack(alignment: .bottomLeading) {
+                AuthImage(path: item.backdrop ?? item.poster)
+                    .frame(width: width, height: width * 9 / 16)
+                    .clipped()
+                    .background(Palette.surfaceHi)
+                    .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+
+                LinearGradient(
+                    colors: [.clear, .black.opacity(0.78)],
+                    startPoint: .center,
+                    endPoint: .bottom
+                )
+                .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+
+                if item.watch?.watched == true {
+                    Label("Watched", systemImage: "checkmark.circle.fill")
+                        .font(.system(.caption2, design: .monospaced).weight(.semibold))
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 6)
+                        .background(.black.opacity(0.72), in: Capsule())
+                        .padding(10)
+                }
+
+                let fraction = progressFraction(item.watch, runtimeMs: item.runtimeMs)
+                if fraction > 0, fraction < 0.98 {
+                    GeometryReader { geometry in
+                        VStack {
+                            Spacer()
+                            HStack(spacing: 0) {
+                                Rectangle()
+                                    .fill(Palette.accent)
+                                    .frame(width: geometry.size.width * fraction, height: 5)
+                                Rectangle().fill(.white.opacity(0.2)).frame(height: 5)
+                            }
+                        }
+                    }
+                }
+            }
+
+            Text(episodeCardTitle(item))
+                .font(.callout.weight(.semibold))
+                .foregroundColor(Palette.onBg)
+                .lineLimit(1)
+
+            Text(episodeCardMeta(item))
+                .font(.system(.caption, design: .monospaced))
+                .foregroundColor(Palette.muted)
+                .lineLimit(1)
+        }
+        .frame(width: width, alignment: .leading)
+    }
+}
+
 struct MediaRow: View {
     @EnvironmentObject var model: AppModel
     let title: String
@@ -185,6 +246,11 @@ struct MediaRow: View {
                                         width: model.posterSize.landscapeWidth,
                                         source: model.libraryName(for: item, in: collection)
                                     )
+                                case .episode:
+                                    EpisodeCard(
+                                        item: item,
+                                        width: model.posterSize.landscapeWidth
+                                    )
                                 }
                             }
                             .posterButtonStyle()
@@ -199,6 +265,25 @@ struct MediaRow: View {
             .padding(.vertical, 10)
         }
     }
+}
+
+private func episodeCardTitle(_ item: Item) -> String {
+    guard let number = item.episodeNumber else { return item.title }
+    return "\(number). \(item.title)"
+}
+
+private func episodeCardMeta(_ item: Item) -> String {
+    var parts: [String] = []
+    if let airDate = item.airDate, !airDate.isEmpty {
+        parts.append(String(airDate.prefix(10)))
+    }
+    if let runtime = item.runtimeMs, runtime > 0 {
+        parts.append(formatTime(runtime))
+    }
+    if let remaining = timeRemaining(item) {
+        parts.append(remaining)
+    }
+    return parts.isEmpty ? "Episode" : parts.joined(separator: "   ·   ")
 }
 
 struct ComingSoonRow: View {
