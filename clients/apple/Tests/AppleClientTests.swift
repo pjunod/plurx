@@ -464,6 +464,9 @@ final class AppleClientTests: XCTestCase {
             [show, season].map(DetailBreadcrumb.destination(for:)),
             [.item(10), .item(20)]
         )
+        XCTAssertGreaterThanOrEqual(DetailBreadcrumbMetrics.itemSpacing, 6)
+        XCTAssertLessThanOrEqual(DetailBreadcrumbMetrics.verticalPadding, 4)
+        XCTAssertLessThanOrEqual(DetailBreadcrumbMetrics.focusStrokeWidth, 1)
     }
 
     #if os(tvOS)

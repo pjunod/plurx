@@ -70,7 +70,7 @@ struct DetailBreadcrumb: View {
 
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 2) {
+            HStack(spacing: DetailBreadcrumbMetrics.itemSpacing) {
                 ForEach(ancestors.indices, id: \.self) { index in
                     if index > ancestors.startIndex {
                         Text("/")
@@ -100,6 +100,13 @@ struct DetailBreadcrumb: View {
     }
 }
 
+enum DetailBreadcrumbMetrics {
+    static let itemSpacing: CGFloat = 6
+    static let horizontalPadding: CGFloat = 8
+    static let verticalPadding: CGFloat = 4
+    static let focusStrokeWidth: CGFloat = 1
+}
+
 private struct DetailBreadcrumbLinkStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         #if os(tvOS)
@@ -121,17 +128,21 @@ private struct DetailBreadcrumbLinkStyle: ButtonStyle {
         var body: some View {
             configuration.label
                 .foregroundStyle(isFocused ? Palette.onBg : Palette.accent)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 7)
+                .padding(.horizontal, DetailBreadcrumbMetrics.horizontalPadding)
+                .padding(.vertical, DetailBreadcrumbMetrics.verticalPadding)
                 .background(
-                    Palette.surfaceHi.opacity(isFocused ? 0.96 : 0),
-                    in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    Palette.surfaceHi.opacity(isFocused ? 0.9 : 0),
+                    in: Capsule()
                 )
                 .overlay {
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .stroke(Palette.accent.opacity(isFocused ? 1 : 0), lineWidth: 2)
+                    Capsule()
+                        .stroke(
+                            Palette.accent.opacity(isFocused ? 0.9 : 0),
+                            lineWidth: DetailBreadcrumbMetrics.focusStrokeWidth
+                        )
                 }
-                .scaleEffect(isFocused ? 1.05 : (configuration.isPressed ? 0.98 : 1))
+                .contentShape(Capsule())
+                .scaleEffect(configuration.isPressed ? 0.98 : 1)
                 .animation(.easeOut(duration: 0.12), value: isFocused)
         }
     }
