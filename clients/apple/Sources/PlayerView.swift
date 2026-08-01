@@ -8,6 +8,7 @@ private enum PlayerControl: Hashable {
     case skipBack
     case playPause
     case skipForward
+    case pictureInPicture
     case audio
     case subtitles
     case quality
@@ -33,6 +34,7 @@ struct PlayerView: View {
     var onPlayNext: ((PlayContext) -> Void)?
 
     @StateObject private var controller = PlayerController()
+    @StateObject private var pictureInPicture = PictureInPictureController()
     @State private var showStats = false
     @State private var findingNext = false
     @State private var isScrubbing = false
@@ -47,7 +49,7 @@ struct PlayerView: View {
         ZStack(alignment: .topLeading) {
             Color.black.ignoresSafeArea()
 
-            PlayerSurface(player: controller.player)
+            PlayerSurface(player: controller.player, pictureInPicture: pictureInPicture)
                 .ignoresSafeArea()
 
             #if os(iOS)
@@ -100,7 +102,8 @@ struct PlayerView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
 
-            if let error = controller.playbackError, !controller.failed {
+            if let error = controller.playbackError ?? pictureInPicture.errorMessage,
+               !controller.failed {
                 Text(error)
                     .font(.system(.caption, design: .monospaced))
                     .foregroundColor(.white)
@@ -125,7 +128,10 @@ struct PlayerView: View {
             focusedControl = .playPause
             #endif
         }
-        .onDisappear { controller.stop() }
+        .onDisappear {
+            pictureInPicture.stop()
+            controller.stop()
+        }
         .task(id: autoHideGeneration) {
             #if os(iOS)
             guard controlsVisible,
@@ -328,6 +334,7 @@ struct PlayerView: View {
             playPauseButton
             skipForwardButton
             Spacer(minLength: 4)
+            if pictureInPicture.isSupported { pictureInPictureButton }
             if controller.audioTracks.count > 1 { audioMenu }
             if !controller.subtitles.isEmpty { subtitleMenu }
             if !controller.qualityRungs.isEmpty { qualityMenu }
@@ -343,6 +350,7 @@ struct PlayerView: View {
             playPauseButton
             skipForwardButton
             Spacer(minLength: 4)
+            if pictureInPicture.isSupported { pictureInPictureButton }
             moreMenu
         }
         .frame(maxWidth: .infinity)
@@ -386,6 +394,23 @@ struct PlayerView: View {
         .accessibilityLabel("Forward 10 seconds")
         #if os(tvOS)
         .focused($focusedControl, equals: .skipForward)
+        #endif
+    }
+
+    private var pictureInPictureButton: some View {
+        Button {
+            pictureInPicture.toggle()
+            revealControls()
+        } label: {
+            Image(systemName: pictureInPicture.isActive ? "pip.exit" : "pip.enter")
+                .foregroundStyle(pictureInPicture.isActive ? Palette.accent : .white)
+        }
+        .disabled(!pictureInPicture.isActive && !pictureInPicture.isPossible)
+        .accessibilityLabel(pictureInPicture.isActive
+                            ? "Stop Picture in Picture"
+                            : "Start Picture in Picture")
+        #if os(tvOS)
+        .focused($focusedControl, equals: .pictureInPicture)
         #endif
     }
 

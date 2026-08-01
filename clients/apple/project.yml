@@ -52,6 +52,10 @@ targets:
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
         UIApplicationSupportsIndirectInputEvents: true
+        # The Audio, AirPlay, and Picture in Picture background mode lets the
+        # native PiP window keep its AVPlayer alive after leaving the app.
+        UIBackgroundModes:
+          - audio
         # Home servers are usually plain http on the LAN — permit it. The
         # narrower NSAllowsLocalNetworking is NOT a substitute: it misses
         # Tailscale's 100.64/10 and, on iOS 10+, its mere presence makes
@@ -89,6 +93,8 @@ targets:
         CFBundleDisplayName: plurx
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        UIBackgroundModes:
+          - audio
         # Same reasoning as iOS above — docs/PUBLISHING.md §4.
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
