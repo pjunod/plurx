@@ -13,23 +13,21 @@ import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.Button
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
@@ -56,6 +54,7 @@ import tv.plurx.app.data.MediaFileDto
 import tv.plurx.app.ui.components.LoadingBox
 import tv.plurx.app.ui.components.NetworkImage
 import tv.plurx.app.ui.components.PosterCard
+import tv.plurx.app.ui.components.SafeBackButton
 import tv.plurx.app.ui.components.formatTime
 import tv.plurx.app.ui.components.imageUrl
 import tv.plurx.app.ui.theme.Accent
@@ -129,7 +128,7 @@ private fun DetailContent(
         FormFactor.Television -> 360.dp
     }
 
-    LazyColumn(Modifier.fillMaxSize()) {
+    LazyColumn(Modifier.fillMaxSize().navigationBarsPadding()) {
         item {
             Box(Modifier.fillMaxWidth().height(heroHeight)) {
                 NetworkImage(imageUrl(item.backdrop ?: item.poster), Modifier.fillMaxSize())
@@ -437,10 +436,5 @@ internal fun DetailBackButton(
     onBack: () -> Unit,
     safeInsets: WindowInsets = WindowInsets.statusBars,
 ) {
-    IconButton(
-        onClick = onBack,
-        modifier = Modifier.windowInsetsPadding(safeInsets).padding(8.dp),
-    ) {
-        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back", tint = Color.White)
-    }
+    SafeBackButton(onBack = onBack, safeInsets = safeInsets)
 }

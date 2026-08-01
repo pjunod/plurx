@@ -4,9 +4,10 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
@@ -36,6 +37,7 @@ import kotlinx.coroutines.delay
 import tv.plurx.app.data.Item
 import tv.plurx.app.ui.components.LoadingBox
 import tv.plurx.app.ui.components.PosterCard
+import tv.plurx.app.ui.components.SafeTopRow
 import tv.plurx.app.ui.theme.Muted
 
 @Composable
@@ -72,10 +74,9 @@ fun SearchScreen(
         }
     }
 
-    Column(Modifier.fillMaxSize()) {
-        Row(
+    Column(Modifier.fillMaxSize().navigationBarsPadding().imePadding()) {
+        SafeTopRow(
             Modifier.fillMaxWidth().padding(start = side - 12.dp, end = side, top = 8.dp),
-            verticalAlignment = Alignment.CenterVertically,
         ) {
             IconButton(onClick = onBack) {
                 Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")

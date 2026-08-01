@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
@@ -31,6 +32,7 @@ import tv.plurx.app.data.Item
 import tv.plurx.app.ui.components.ChoicePicker
 import tv.plurx.app.ui.components.LoadingBox
 import tv.plurx.app.ui.components.PosterCard
+import tv.plurx.app.ui.components.SafeTopRow
 import tv.plurx.app.ui.theme.Muted
 
 private enum class WatchFilter(val label: String) {
@@ -65,10 +67,9 @@ fun LibraryScreen(
     val shown = load?.items.orEmpty().filter { matchesFilter(it, filter) }
     val posterWidth = (preferences.posterSize.widthDp * formFactor.posterScale()).dp
 
-    Column(Modifier.fillMaxSize()) {
-        Row(
+    Column(Modifier.fillMaxSize().navigationBarsPadding()) {
+        SafeTopRow(
             Modifier.fillMaxWidth().padding(start = side - 12.dp, end = side, top = 8.dp),
-            verticalAlignment = Alignment.CenterVertically,
         ) {
             IconButton(onClick = onBack) {
                 Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
