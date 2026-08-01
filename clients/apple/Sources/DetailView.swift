@@ -10,6 +10,22 @@ struct PlayContext: Identifiable {
     let title: String
 }
 
+/// Keeps the readable detail column centered on large screens without ever
+/// growing wider than the compact device that contains it.
+struct DetailBodyFrame<Content: View>: View {
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        content
+            // Padding must be inside the width cap. Applying it after a
+            // max-width frame makes compact iPhones report `screen + 2 * pad`
+            // and SwiftUI centers that oversized body, clipping both edges.
+            .padding(.horizontal, screenHPad)
+            .frame(maxWidth: 980, alignment: .leading)
+            .frame(maxWidth: .infinity, alignment: .center)
+    }
+}
+
 struct DetailView: View {
     @EnvironmentObject var model: AppModel
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
@@ -80,50 +96,50 @@ struct DetailView: View {
             .frame(height: heroHeight)
             .clipped()
 
-            VStack(alignment: .leading, spacing: 12) {
-                Text(item.title)
-                    #if os(tvOS)
-                    .font(.system(size: 54, weight: .bold))
-                    #else
-                    .font(.largeTitle.bold())
-                    #endif
-                    .foregroundColor(Palette.onBg)
-                    .fixedSize(horizontal: false, vertical: true)
-                Text(metaLine(item, durationMs: durationMs))
-                    .font(.system(.callout, design: .monospaced))
-                    .foregroundColor(Palette.muted)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                if let file, item.isPlayable {
-                    playbackActions(
-                        item: item,
-                        file: file,
-                        durationMs: durationMs ?? 0,
-                        resumeMs: resumeMs,
-                        canResume: canResume
-                    )
-                    .padding(.top, 4)
-                }
-
-                watchButton(detail)
-
-                if let actionError {
-                    Text(actionError)
-                        .font(.caption)
-                        .foregroundColor(Palette.accent)
-                }
-
-                if let overview = item.overview, !overview.isEmpty {
-                    Text(overview)
-                        .font(.body)
-                        .foregroundColor(Palette.onBg.opacity(0.78))
-                        .lineSpacing(4)
+            DetailBodyFrame {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text(item.title)
+                        #if os(tvOS)
+                        .font(.system(size: 54, weight: .bold))
+                        #else
+                        .font(.largeTitle.bold())
+                        #endif
+                        .foregroundColor(Palette.onBg)
                         .fixedSize(horizontal: false, vertical: true)
-                        .padding(.top, 8)
+                    Text(metaLine(item, durationMs: durationMs))
+                        .font(.system(.callout, design: .monospaced))
+                        .foregroundColor(Palette.muted)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    if let file, item.isPlayable {
+                        playbackActions(
+                            item: item,
+                            file: file,
+                            durationMs: durationMs ?? 0,
+                            resumeMs: resumeMs,
+                            canResume: canResume
+                        )
+                        .padding(.top, 4)
+                    }
+
+                    watchButton(detail)
+
+                    if let actionError {
+                        Text(actionError)
+                            .font(.caption)
+                            .foregroundColor(Palette.accent)
+                    }
+
+                    if let overview = item.overview, !overview.isEmpty {
+                        Text(overview)
+                            .font(.body)
+                            .foregroundColor(Palette.onBg.opacity(0.78))
+                            .lineSpacing(4)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(.top, 8)
+                    }
                 }
             }
-            .frame(maxWidth: 980, alignment: .leading)
-            .padding(.horizontal, screenHPad)
             .padding(.top, 8)
 
             if let children = detail.children, !children.isEmpty {
