@@ -1,4 +1,32 @@
 import SwiftUI
+#if os(iOS)
+import Vision
+import VisionKit
+#endif
+
+enum ConnectionCode {
+    static func origin(from payload: String) -> String? {
+        var candidate = payload.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !candidate.isEmpty else { return nil }
+
+        if let code = URLComponents(string: candidate), code.scheme?.lowercased() == "plurx" {
+            guard code.host?.lowercased() == "connect",
+                  let encodedOrigin = code.queryItems?.first(where: {
+                    ["origin", "server", "address"].contains($0.name.lowercased())
+                  })?.value else { return nil }
+            candidate = encodedOrigin
+        }
+
+        let normalized = AppModel.normalizeOrigin(candidate)
+        guard let url = URLComponents(string: normalized),
+              ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
+              url.host?.isEmpty == false,
+              url.user == nil,
+              url.password == nil,
+              url.path.isEmpty else { return nil }
+        return normalized
+    }
+}
 
 /// Filled primary action with an inline spinner while `busy`.
 struct PrimaryButton: View {
@@ -59,6 +87,10 @@ struct ConnectView: View {
     @State private var url = ""
     @State private var showManual = false
     @State private var resolving: String?
+    #if os(iOS)
+    @State private var showQRScanner = false
+    @State private var qrError: String?
+    #endif
 
     var body: some View {
         AuthScaffold(subtitle: "Servers on your network", error: model.authError) {
@@ -111,6 +143,32 @@ struct ConnectView: View {
             .buttonStyle(.plain)
             .foregroundColor(Palette.muted)
 
+            #if os(iOS)
+            if DataScannerViewController.isSupported {
+                Button {
+                    if DataScannerViewController.isAvailable {
+                        qrError = nil
+                        showQRScanner = true
+                    } else {
+                        qrError = "Camera scanning is unavailable. Check Camera access in Settings."
+                    }
+                } label: {
+                    Label("Scan server QR code", systemImage: "qrcode.viewfinder")
+                }
+                .font(.system(.callout, design: .monospaced))
+                .buttonStyle(.bordered)
+                .tint(Palette.accent)
+                .disabled(model.busy || resolving != nil)
+            }
+
+            if let qrError {
+                Text(qrError)
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundColor(Palette.accent)
+                    .multilineTextAlignment(.center)
+            }
+            #endif
+
             if showManual {
                 TextField("192.168.1.10:32400", text: $url)
                     .plurxFieldStyle()
@@ -146,6 +204,22 @@ struct ConnectView: View {
             discovery.start()
             if url.isEmpty { url = model.origin }
         }
+        #if os(iOS)
+        .sheet(isPresented: $showQRScanner) {
+            QRCodeScannerView { payload in
+                showQRScanner = false
+                guard let scannedOrigin = ConnectionCode.origin(from: payload) else {
+                    qrError = "That QR code doesn't contain a valid plurx server address."
+                    return
+                }
+                qrError = nil
+                url = scannedOrigin
+                showManual = true
+                Task { await model.connect(scannedOrigin) }
+            }
+            .ignoresSafeArea()
+        }
+        #endif
     }
 
     private func connect() { Task { await model.connect(url) } }
@@ -164,6 +238,75 @@ struct ConnectView: View {
         }
     }
 }
+
+#if os(iOS)
+private struct QRCodeScannerView: UIViewControllerRepresentable {
+    let onScanned: (String) -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(onScanned: onScanned) }
+
+    func makeUIViewController(context: Context) -> DataScannerViewController {
+        let scanner = DataScannerViewController(
+            recognizedDataTypes: [.barcode(symbologies: [.qr])],
+            qualityLevel: .balanced,
+            recognizesMultipleItems: false,
+            isHighFrameRateTrackingEnabled: true,
+            isPinchToZoomEnabled: true,
+            isGuidanceEnabled: true,
+            isHighlightingEnabled: true
+        )
+        scanner.delegate = context.coordinator
+        DispatchQueue.main.async { try? scanner.startScanning() }
+        return scanner
+    }
+
+    func updateUIViewController(_ scanner: DataScannerViewController, context: Context) {}
+
+    static func dismantleUIViewController(
+        _ scanner: DataScannerViewController,
+        coordinator: Coordinator
+    ) {
+        scanner.stopScanning()
+    }
+
+    final class Coordinator: NSObject, DataScannerViewControllerDelegate {
+        let onScanned: (String) -> Void
+        private var finished = false
+
+        init(onScanned: @escaping (String) -> Void) {
+            self.onScanned = onScanned
+        }
+
+        func dataScanner(
+            _ dataScanner: DataScannerViewController,
+            didAdd addedItems: [RecognizedItem],
+            allItems: [RecognizedItem]
+        ) {
+            guard let item = addedItems.first else { return }
+            finish(item, using: dataScanner)
+        }
+
+        func dataScanner(
+            _ dataScanner: DataScannerViewController,
+            didTapOn item: RecognizedItem
+        ) {
+            finish(item, using: dataScanner)
+        }
+
+        private func finish(
+            _ item: RecognizedItem,
+            using dataScanner: DataScannerViewController
+        ) {
+            guard !finished,
+                  case .barcode(let barcode) = item,
+                  let payload = barcode.payloadStringValue else { return }
+            finished = true
+            dataScanner.stopScanning()
+            onScanned(payload)
+        }
+    }
+}
+#endif
 
 struct LoginView: View {
     @EnvironmentObject var model: AppModel

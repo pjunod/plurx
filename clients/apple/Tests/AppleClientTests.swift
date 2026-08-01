@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import SwiftUI
 import UIKit
@@ -18,6 +19,40 @@ final class AppleClientTests: XCTestCase {
         XCTAssertEqual(AppModel.normalizeOrigin("http://192.168.1.20"), "http://192.168.1.20:32400")
         XCTAssertEqual(AppModel.normalizeOrigin("https://media.example.test/"), "https://media.example.test")
         XCTAssertEqual(AppModel.normalizeOrigin("   "), "")
+    }
+
+    func testConnectionCodesAcceptServerAddressesAndRejectUnrelatedPayloads() {
+        XCTAssertEqual(
+            ConnectionCode.origin(from: "http://192.168.4.10:32400/"),
+            "http://192.168.4.10:32400"
+        )
+        XCTAssertEqual(
+            ConnectionCode.origin(
+                from: "plurx://connect?origin=http%3A%2F%2Fmedia-box%3A32400"
+            ),
+            "http://media-box:32400"
+        )
+        XCTAssertNil(ConnectionCode.origin(from: "https://example.com/not-a-server-page"))
+        XCTAssertNil(ConnectionCode.origin(from: "wifi password"))
+    }
+
+    func testSavedServerIdentityMatchesExactlyAndMigratesLegacyBonjourHosts() {
+        let instanceId = "4f2cfb82-9162-4be0-a8bb-0123456789ab"
+        XCTAssertTrue(AppModel.matchesSavedServer(
+            candidateInstanceId: instanceId,
+            expectedInstanceId: instanceId,
+            savedOrigin: "http://old-address:32400"
+        ))
+        XCTAssertTrue(AppModel.matchesSavedServer(
+            candidateInstanceId: instanceId,
+            expectedInstanceId: nil,
+            savedOrigin: "http://plurx-4f2cfb829162.local:32400"
+        ))
+        XCTAssertFalse(AppModel.matchesSavedServer(
+            candidateInstanceId: "different-server",
+            expectedInstanceId: instanceId,
+            savedOrigin: "http://plurx-4f2cfb829162.local:32400"
+        ))
     }
 
     func testSessionTokenMovesOutOfDefaultsAndSurvivesPreferenceReplacement() throws {
@@ -52,6 +87,20 @@ final class AppleClientTests: XCTestCase {
                        "http://media-box.local:32400")
         XCTAssertEqual(BonjourAddress.origin(host: "fe80::1", port: 32400),
                        "http://[fe80::1]:32400")
+        XCTAssertEqual(BonjourAddress.origin(host: "fe80::1%en0", port: 32400),
+                       "http://[fe80::1%25en0]:32400")
+    }
+
+    func testBonjourResolutionPrefersAFreshNumericAddress() {
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        XCTAssertEqual(
+            "192.168.4.42".withCString { inet_pton(AF_INET, $0, &address.sin_addr) },
+            1
+        )
+        let data = Data(bytes: &address, count: MemoryLayout<sockaddr_in>.size)
+        XCTAssertEqual(BonjourAddress.numericHost(from: [data]), "192.168.4.42")
     }
 
     func testRelativeMediaURLCarriesTokenAndPreservesExistingQuery() throws {

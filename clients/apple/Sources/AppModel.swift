@@ -88,6 +88,7 @@ final class AppModel: ObservableObject {
         Session.shared.token = savedToken
         do {
             username = try await requireAPI().me().username
+            await backfillServerIdentityIfNeeded()
             phase = .ready
             discovery.stop()
             await loadHome()
@@ -96,11 +97,14 @@ final class AppModel: ObservableObject {
             settings.clearToken()
             phase = .needLogin
         } catch {
-            // An offline server or denied LAN permission is not an expired
-            // token. Keep it and offer a reconnect instead of presenting a
-            // credential form that cannot solve a network failure.
-            authError = "Couldn't reach \(serverName ?? origin). Check Local Network access and the server."
-            phase = .reconnectFailed
+            if let recovered = await rediscoverSavedServer(
+                expectedInstanceId: settings.instanceId,
+                savedOrigin: savedOrigin
+            ) {
+                await retrySavedSession(at: recovered, token: savedToken)
+            } else {
+                showReconnectFailure()
+            }
         }
     }
 
@@ -125,6 +129,7 @@ final class AppModel: ObservableObject {
             api = a
             serverName = info.name
             settings.origin = normalized
+            settings.instanceId = info.instanceId
             phase = .needLogin
         } catch {
             authError = "Couldn't reach a plurx server at \(normalized)"
@@ -239,6 +244,88 @@ final class AppModel: ObservableObject {
         Session.shared.token = nil
         phase = .needServer
         discovery.restart()
+    }
+
+    private func retrySavedSession(at recovered: RecoveredServer, token: String) async {
+        origin = recovered.origin
+        serverName = recovered.name
+        api = PlurxAPI(origin: recovered.origin)
+        Session.shared.origin = recovered.origin
+        Session.shared.token = token
+        settings.origin = recovered.origin
+        settings.instanceId = recovered.instanceId
+
+        do {
+            username = try await requireAPI().me().username
+            phase = .ready
+            discovery.stop()
+            await loadHome()
+        } catch APIError.http(let code) where code == 401 || code == 403 {
+            Session.shared.token = nil
+            settings.clearToken()
+            phase = .needLogin
+        } catch {
+            showReconnectFailure()
+        }
+    }
+
+    private func rediscoverSavedServer(
+        expectedInstanceId: String?,
+        savedOrigin: String
+    ) async -> RecoveredServer? {
+        let candidates = await discovery.availableServers()
+        for candidate in candidates {
+            guard let candidateOrigin = try? await discovery.resolve(candidate),
+                  let info = try? await PlurxAPI(origin: candidateOrigin).serverInfo(),
+                  Self.matchesSavedServer(
+                    candidateInstanceId: info.instanceId,
+                    expectedInstanceId: expectedInstanceId,
+                    savedOrigin: savedOrigin
+                  ) else { continue }
+            return RecoveredServer(
+                origin: candidateOrigin,
+                instanceId: info.instanceId,
+                name: info.name
+            )
+        }
+        return nil
+    }
+
+    private func backfillServerIdentityIfNeeded() async {
+        guard settings.instanceId == nil,
+              let info = try? await requireAPI().serverInfo() else { return }
+        settings.instanceId = info.instanceId
+        serverName = info.name
+    }
+
+    private func showReconnectFailure() {
+        authError = "Couldn't reach \(serverName ?? origin). I also searched this network for the saved server."
+        phase = .reconnectFailed
+    }
+
+    nonisolated static func matchesSavedServer(
+        candidateInstanceId: String?,
+        expectedInstanceId: String?,
+        savedOrigin: String
+    ) -> Bool {
+        guard let candidate = candidateInstanceId?.lowercased(), !candidate.isEmpty else {
+            return false
+        }
+        if let expected = expectedInstanceId?.lowercased(), !expected.isEmpty {
+            return candidate == expected
+        }
+
+        // Migration for builds that saved `plurx-<first 12 id chars>.local`
+        // before the stable instance id was persisted separately.
+        guard let host = URLComponents(string: savedOrigin)?.host?.lowercased(),
+              host.hasPrefix("plurx-"), host.hasSuffix(".local") else { return false }
+        let start = host.index(host.startIndex, offsetBy: "plurx-".count)
+        let end = host.index(host.endIndex, offsetBy: -".local".count)
+        let savedPrefix = String(host[start..<end])
+        let candidatePrefix = candidate
+            .filter { $0.isASCII && ($0.isLetter || $0.isNumber) }
+            .prefix(12)
+        return !savedPrefix.isEmpty && savedPrefix == String(candidatePrefix)
     }
 
     func setLanguages(audio: String, sub: String) {
@@ -501,4 +588,10 @@ final class AppModel: ObservableObject {
         }
         return title
     }
+}
+
+private struct RecoveredServer {
+    let origin: String
+    let instanceId: String?
+    let name: String?
 }

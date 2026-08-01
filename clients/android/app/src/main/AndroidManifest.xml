@@ -30,6 +30,12 @@
         <!-- usesCleartextTraffic: home media servers are commonly plain http on
              the LAN (http://192.168.x.x:32400); this permits that. -->
 
+        <!-- Pre-fetch the permissionless Google Play services QR scanner on
+             devices that support it. Television layouts hide the camera action. -->
+        <meta-data
+            android:name="com.google.mlkit.vision.DEPENDENCIES"
+            android:value="barcode_ui" />
+
         <activity
             android:name=".MainActivity"
             android:exported="true"

@@ -51,6 +51,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.google.mlkit.vision.barcode.common.Barcode
+import com.google.mlkit.vision.codescanner.GmsBarcodeScannerOptions
+import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
 import tv.plurx.app.ui.theme.Accent
 import tv.plurx.app.ui.theme.Muted
 import tv.plurx.app.ui.components.TvButton
@@ -97,6 +100,17 @@ fun ConnectScreen(vm: AppViewModel, busy: Boolean, error: String?) {
     var url by rememberSaveable { mutableStateOf(vm.origin) }
     var showManual by rememberSaveable { mutableStateOf(vm.origin.isNotBlank()) }
     var permissionDenied by rememberSaveable { mutableStateOf(false) }
+    var qrError by rememberSaveable { mutableStateOf<String?>(null) }
+    val formFactor = currentFormFactor()
+    val qrScanner = remember(context) {
+        val options = GmsBarcodeScannerOptions.Builder()
+            .setBarcodeFormats(Barcode.FORMAT_QR_CODE)
+            .enableAutoZoom()
+            .build()
+        GmsBarcodeScanning.getClient(context, options)
+    }
+    val canScanQr = formFactor != FormFactor.Television &&
+        context.packageManager.hasSystemFeature(PackageManager.FEATURE_CAMERA_ANY)
 
     fun hasLocalNetworkPermission(): Boolean = Build.VERSION.SDK_INT < 37 ||
         ContextCompat.checkSelfPermission(context, LocalNetworkPermission) ==
@@ -164,6 +178,36 @@ fun ConnectScreen(vm: AppViewModel, busy: Boolean, error: String?) {
 
         TvTextButton(onClick = { showManual = !showManual }) {
             Text(if (showManual) "Hide manual setup" else "+ Add server manually", color = Muted)
+        }
+
+        if (canScanQr) {
+            TvOutlinedButton(
+                onClick = {
+                    qrError = null
+                    qrScanner.startScan()
+                        .addOnSuccessListener { barcode ->
+                            val scannedOrigin = connectionOriginFromQr(barcode.rawValue.orEmpty())
+                            if (scannedOrigin == null) {
+                                qrError = "That QR code doesn't contain a valid plurx server address."
+                            } else {
+                                url = scannedOrigin
+                                showManual = true
+                                vm.connect(scannedOrigin)
+                            }
+                        }
+                        .addOnFailureListener {
+                            qrError = "QR scanning is unavailable. You can still enter the server manually."
+                        }
+                },
+                enabled = !busy,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text("Scan server QR code")
+            }
+        }
+
+        if (qrError != null) {
+            Text(qrError!!, color = Accent, style = MaterialTheme.typography.labelMedium)
         }
 
         if (showManual) {

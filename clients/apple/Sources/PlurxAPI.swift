@@ -116,7 +116,12 @@ struct PlurxAPI {
 
     // MARK: - Endpoints
 
-    func serverInfo() async throws -> ServerInfo { try await get("server") }
+    /// Server identity is public and is also used to verify a rediscovered
+    /// endpoint. Never attach a saved bearer token while probing candidates.
+    func serverInfo() async throws -> ServerInfo {
+        guard let url = makeURL("server") else { throw APIError.badURL }
+        return try await run(URLRequest(url: url))
+    }
     func login(_ body: LoginRequest) async throws -> LoginResponse { try await post("auth/login", body: body) }
     func me() async throws -> User { try await get("me") }
     func libraries() async throws -> [Library] { try await get("libraries") }

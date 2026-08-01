@@ -6,6 +6,7 @@ import android.net.nsd.NsdServiceInfo
 import android.os.Build
 import java.io.IOException
 import java.net.Inet4Address
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -170,6 +171,17 @@ class ServerDiscovery(context: Context) {
                 if (continuation.isActive) continuation.resumeWith(result)
             }
         })
+    }
+
+    /** Wait briefly for NSD after launch or a network handoff. */
+    suspend fun availableServers(timeoutMs: Long = 3_000): List<DiscoveredServer> {
+        start()
+        var waitedMs = 0L
+        while (_state.value.servers.isEmpty() && waitedMs < timeoutMs) {
+            delay(150)
+            waitedMs += 150
+        }
+        return _state.value.servers
     }
 
     private fun updateState(

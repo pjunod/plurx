@@ -23,6 +23,7 @@ class SettingsStore(private val context: Context) {
 
     data class Saved(
         val origin: String = "",
+        val instanceId: String? = null,
         val token: String? = null,
         val username: String? = null,
         val audioLang: String = "eng",
@@ -32,6 +33,7 @@ class SettingsStore(private val context: Context) {
 
     private object Keys {
         val ORIGIN = stringPreferencesKey("origin")
+        val INSTANCE_ID = stringPreferencesKey("instance_id")
         val TOKEN = stringPreferencesKey("token")
         val USERNAME = stringPreferencesKey("username")
         val AUDIO_LANG = stringPreferencesKey("audio_lang")
@@ -48,6 +50,7 @@ class SettingsStore(private val context: Context) {
     val flow: Flow<Saved> = context.dataStore.data.map { p ->
         Saved(
             origin = p[Keys.ORIGIN] ?: "",
+            instanceId = p[Keys.INSTANCE_ID],
             token = p[Keys.TOKEN],
             username = p[Keys.USERNAME],
             audioLang = p[Keys.AUDIO_LANG] ?: "eng",
@@ -64,9 +67,16 @@ class SettingsStore(private val context: Context) {
         )
     }
 
-    suspend fun saveOrigin(origin: String) {
-        context.dataStore.edit { it[Keys.ORIGIN] = origin }
+    suspend fun saveOrigin(origin: String, instanceId: String?) {
+        context.dataStore.edit {
+            it[Keys.ORIGIN] = origin
+            if (instanceId == null) it.remove(Keys.INSTANCE_ID)
+            else it[Keys.INSTANCE_ID] = instanceId
+        }
     }
+
+    suspend fun saveServerIdentity(origin: String, instanceId: String?) =
+        saveOrigin(origin, instanceId)
 
     suspend fun saveSession(origin: String, token: String, username: String) {
         context.dataStore.edit { p ->

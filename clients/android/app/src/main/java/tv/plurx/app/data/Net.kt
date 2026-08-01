@@ -26,7 +26,10 @@ object Net {
         .addInterceptor { chain ->
             val token = Session.token
             val req = chain.request()
-            val out = if (token != null) {
+            // `/server` is public and identifies rediscovered candidates.
+            // Never leak a saved bearer token while probing the LAN.
+            val publicIdentityRequest = req.url.encodedPath == "/api/v1/server"
+            val out = if (token != null && !publicIdentityRequest) {
                 req.newBuilder().header("Authorization", "Bearer $token").build()
             } else {
                 req

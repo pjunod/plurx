@@ -34,6 +34,7 @@ import tv.plurx.app.data.PlurxApi
 import tv.plurx.app.data.ProgressReq
 import tv.plurx.app.data.Session
 import tv.plurx.app.data.ServerDiscovery
+import tv.plurx.app.data.Server
 import tv.plurx.app.data.SettingsStore
 
 /** Top-level app state: which screen the shell should show. */
@@ -115,13 +116,25 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
             when {
                 saved.origin.isNotBlank() && saved.token != null -> {
-                    Session.origin = saved.origin
-                    Session.token = saved.token
-                    api = Net.api(saved.origin)
-                    when (val validation = validateSavedSession { api().me() }) {
+                    bindOrigin(saved.origin, saved.token)
+                    var validation = validateSavedSession { api().me() }
+                    if (validation == SavedSessionValidation.ServerUnavailable) {
+                        val recovered = rediscoverSavedServer(saved.instanceId, saved.origin)
+                        if (recovered != null) {
+                            bindOrigin(recovered.origin, saved.token)
+                            serverName = recovered.info.name
+                            settings.saveServerIdentity(
+                                recovered.origin,
+                                recovered.info.instance_id,
+                            )
+                            validation = validateSavedSession { api().me() }
+                        }
+                    }
+                    when (validation) {
                         is SavedSessionValidation.Authenticated -> {
                             currentUser = validation.user
                             username = validation.user.username
+                            if (saved.instanceId == null) backfillServerIdentity()
                             _phase.value = Phase.Ready
                             loadHome()
                         }
@@ -405,10 +418,41 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         origin = normalized
         api = candidate
         serverName = info.name
-        settings.saveOrigin(normalized)
+        settings.saveOrigin(normalized, info.instance_id)
         _phase.value = Phase.NeedLogin
     }
+
+    private fun bindOrigin(value: String, token: String?) {
+        origin = value
+        Session.origin = value
+        Session.token = token
+        api = Net.api(value)
+    }
+
+    private suspend fun rediscoverSavedServer(
+        expectedInstanceId: String?,
+        savedOrigin: String,
+    ): RecoveredServer? {
+        for (candidate in serverBrowser.availableServers()) {
+            val candidateOrigin = runCatching { serverBrowser.resolve(candidate) }.getOrNull()
+                ?: continue
+            val info = runCatching { Net.api(candidateOrigin).server() }.getOrNull()
+                ?: continue
+            if (matchesSavedServer(info.instance_id, expectedInstanceId, savedOrigin)) {
+                return RecoveredServer(candidateOrigin, info)
+            }
+        }
+        return null
+    }
+
+    private suspend fun backfillServerIdentity() {
+        val info = runCatching { api().server() }.getOrNull() ?: return
+        serverName = info.name
+        settings.saveServerIdentity(origin, info.instance_id)
+    }
 }
+
+private data class RecoveredServer(val origin: String, val info: Server)
 
 internal sealed interface SavedSessionValidation<out T> {
     data class Authenticated<T>(val user: T) : SavedSessionValidation<T>
@@ -467,4 +511,48 @@ internal fun normalizeOrigin(raw: String): String {
         uri.query,
         uri.fragment,
     ).toString()
+}
+
+internal fun connectionOriginFromQr(payload: String): String? {
+    var candidate = payload.trim()
+    if (candidate.isEmpty()) return null
+
+    val code = runCatching { URI(candidate) }.getOrNull()
+    if (code?.scheme.equals("plurx", ignoreCase = true)) {
+        if (!code?.host.equals("connect", ignoreCase = true)) return null
+        val query = code?.rawQuery.orEmpty().split('&').mapNotNull { part ->
+            val pieces = part.split('=', limit = 2)
+            if (pieces.size != 2) null
+            else java.net.URLDecoder.decode(pieces[0], Charsets.UTF_8.name()) to
+                java.net.URLDecoder.decode(pieces[1], Charsets.UTF_8.name())
+        }.toMap()
+        candidate = query.entries.firstOrNull {
+            it.key.lowercase() in setOf("origin", "server", "address")
+        }?.value ?: return null
+    }
+
+    val normalized = normalizeOrigin(candidate)
+    val origin = runCatching { URI(normalized) }.getOrNull() ?: return null
+    if (origin.scheme !in setOf("http", "https") ||
+        origin.host.isNullOrBlank() ||
+        origin.userInfo != null ||
+        origin.path.orEmpty().isNotEmpty()
+    ) return null
+    return normalized
+}
+
+internal fun matchesSavedServer(
+    candidateInstanceId: String?,
+    expectedInstanceId: String?,
+    savedOrigin: String,
+): Boolean {
+    val candidate = candidateInstanceId?.lowercase()?.takeIf { it.isNotEmpty() } ?: return false
+    val expected = expectedInstanceId?.lowercase()?.takeIf { it.isNotEmpty() }
+    if (expected != null) return candidate == expected
+
+    val host = runCatching { URI(savedOrigin).host?.lowercase() }.getOrNull() ?: return false
+    if (!host.startsWith("plurx-") || !host.endsWith(".local")) return false
+    val savedPrefix = host.removePrefix("plurx-").removeSuffix(".local")
+    val candidatePrefix = candidate.filter(Char::isLetterOrDigit).take(12)
+    return savedPrefix.isNotEmpty() && savedPrefix == candidatePrefix
 }

@@ -14,6 +14,7 @@ data class Server(
     val setup_required: Boolean = false,
     val name: String? = null,
     val version: String? = null,
+    val instance_id: String? = null,
 )
 
 @Serializable

@@ -17,6 +17,7 @@ struct SettingsStore {
 
     private enum Key {
         static let origin = "plurx.origin"
+        static let instanceId = "plurx.instanceId"
         static let token = "plurx.token"
         static let username = "plurx.username"
         static let audioLang = "plurx.audioLang"
@@ -29,6 +30,10 @@ struct SettingsStore {
     var origin: String {
         get { defaults.string(forKey: Key.origin) ?? "" }
         nonmutating set { defaults.set(newValue, forKey: Key.origin) }
+    }
+    var instanceId: String? {
+        get { defaults.string(forKey: Key.instanceId) }
+        nonmutating set { defaults.set(newValue, forKey: Key.instanceId) }
     }
     var token: String? {
         get {

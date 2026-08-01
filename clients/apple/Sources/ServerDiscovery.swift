@@ -1,4 +1,5 @@
 import Combine
+import Darwin
 import Foundation
 import Network
 
@@ -91,6 +92,20 @@ final class ServerDiscovery: ObservableObject {
         return try await resolver.resolve()
     }
 
+    /// Give Bonjour a short window to populate after app launch or a network
+    /// handoff. Saved-session recovery uses these candidates to find the same
+    /// stable server instance at its current address.
+    func availableServers(timeoutMs: UInt64 = 3_000) async -> [DiscoveredServer] {
+        start()
+        let intervalMs: UInt64 = 150
+        var waitedMs: UInt64 = 0
+        while servers.isEmpty && waitedMs < timeoutMs && !Task.isCancelled {
+            try? await Task.sleep(nanoseconds: intervalMs * 1_000_000)
+            waitedMs += intervalMs
+        }
+        return servers
+    }
+
     private func update(_ results: Set<NWBrowser.Result>) {
         servers = results
             .compactMap { DiscoveredServer(endpoint: $0.endpoint) }
@@ -118,9 +133,9 @@ final class ServerDiscovery: ObservableObject {
 }
 
 /// `NWBrowser` deliberately returns a Bonjour service rather than resolving
-/// every result. Foundation's resolver supplies the DNS hostname and port only
-/// after a person chooses one server; URLSession then connects by hostname so
-/// IPv4/IPv6 and interface selection stay with the system.
+/// every result. Foundation's resolver supplies fresh addresses only after a
+/// person chooses one server. Prefer that numeric address so reconnecting also
+/// escapes a stale `.local` DNS cache.
 private final class BonjourResolver: NSObject, NetServiceDelegate {
     private let service: NetService
     private var continuation: CheckedContinuation<String, Error>?
@@ -142,7 +157,9 @@ private final class BonjourResolver: NSObject, NetServiceDelegate {
     }
 
     func netServiceDidResolveAddress(_ sender: NetService) {
-        guard let host = sender.hostName, sender.port > 0 else {
+        guard sender.port > 0,
+              let host = BonjourAddress.numericHost(from: sender.addresses ?? [])
+                ?? sender.hostName else {
             finish(.failure(ServerDiscoveryError.invalidService))
             return
         }
@@ -169,7 +186,48 @@ private final class BonjourResolver: NSObject, NetServiceDelegate {
 enum BonjourAddress {
     static func origin(host: String, port: Int) -> String {
         let host = host.trimmingCharacters(in: CharacterSet(charactersIn: "."))
-        let formattedHost = host.contains(":") && !host.hasPrefix("[") ? "[\(host)]" : host
+        let escapedHost = host.replacingOccurrences(of: "%", with: "%25")
+        let formattedHost = escapedHost.contains(":") && !escapedHost.hasPrefix("[")
+            ? "[\(escapedHost)]"
+            : escapedHost
         return "http://\(formattedHost):\(port)"
+    }
+
+    static func numericHost(from addresses: [Data]) -> String? {
+        let ordered = addresses.sorted { lhs, rhs in
+            addressFamily(lhs) == AF_INET && addressFamily(rhs) != AF_INET
+        }
+        for address in ordered {
+            let host = address.withUnsafeBytes { bytes -> String? in
+                guard address.count >= MemoryLayout<sockaddr>.size,
+                      let base = bytes.baseAddress?.assumingMemoryBound(to: sockaddr.self) else {
+                    return nil
+                }
+                var buffer = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                let result = getnameinfo(
+                    base,
+                    socklen_t(address.count),
+                    &buffer,
+                    socklen_t(buffer.count),
+                    nil,
+                    0,
+                    NI_NUMERICHOST
+                )
+                guard result == 0 else { return nil }
+                return String(cString: buffer)
+            }
+            if let host, !host.isEmpty { return host }
+        }
+        return nil
+    }
+
+    private static func addressFamily(_ address: Data) -> Int32? {
+        address.withUnsafeBytes { bytes in
+            guard address.count >= MemoryLayout<sockaddr>.size,
+                  let base = bytes.baseAddress?.assumingMemoryBound(to: sockaddr.self) else {
+                return nil
+            }
+            return Int32(base.pointee.sa_family)
+        }
     }
 }

@@ -61,6 +61,7 @@ dependencies {
 
     implementation(libs.coil.compose)
     implementation(libs.datastore.preferences)
+    implementation(libs.google.code.scanner)
 
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.test.ext.junit)

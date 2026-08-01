@@ -65,6 +65,7 @@ targets:
         # Without this iOS silently refuses connections to 192.168.x.x —
         # a functional bug, not paperwork.
         NSLocalNetworkUsageDescription: "plurx connects to your media server on your local network."
+        NSCameraUsageDescription: "plurx scans a QR code containing your media server address."
         # Browsing is also the permission preflight: it makes iOS ask before a
         # login request can race the system sheet. The value must match the
         # service plurxd publishes through DNS-SD.
