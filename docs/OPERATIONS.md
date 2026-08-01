@@ -56,6 +56,8 @@ path in `PLURX_CONFIG`). Every key has an env override:
 | `PLURX_TONEMAP` | — | zscale | The **CPU** tone-map operator: `zscale` · `libplacebo` · `off` (no tone-map — plays HDR washed, but a useful test/escape hatch). Which *pipeline* runs — GPU or CPU — is probed at boot, not configured; this only chooses the operator when the CPU chain is the one running |
 | `PLURX_HWDECODE` | — | on | Set `off` to force software decode (still hardware-encodes) — for a GPU that decodes a stream to garbage, e.g. some Dolby Vision |
 | `PLURX_GDM_PORT` | — | `32414` | Host UDP port for GDM discovery (move if Plex owns 32414) |
+| `PLURX_MDNS_ADVERTISE` | — | `true` | Run Bonjour inside the server process; Compose sets this to `false` because its host-network companion advertises instead |
+| `PLURX_DISCOVERY_SERVER_URL` | — | `http://127.0.0.1:32400` | Server URL read by `plurxd advertise`; normally only the Compose companion uses it |
 | `PLURX_LOG` | — | `info` | Log filter (`tracing` EnvFilter syntax, e.g. `plurxd=debug`) |
 
 ## Ports
@@ -70,18 +72,17 @@ GDM discovery only works on 32414 (the protocol hard-codes it), but the *host*
 port is movable via `PLURX_GDM_PORT` when a still-running Plex owns it — you lose
 LAN auto-discovery on that host port, not the server.
 
-Bonjour is best-effort and link-local. It works for a bare-metal service and a
-container using host networking, but multicast normally does not cross a guest
-network, VLAN, VPN, routed subnet, or Docker bridge. In those layouts, publish
-TCP 32400 normally and use the client's manual server option; do not expose UDP
-5353 to the internet.
+Bonjour is best-effort and link-local. It does not cross a guest network, VLAN,
+VPN, routed subnet, or Docker bridge. The tracked Compose stack therefore keeps
+`plurxd` on ordinary or external networks and runs `plurx-discovery` as a
+host-network companion. The companion fetches the public server identity at
+`http://127.0.0.1:32400`, then publishes that same `_plurx._tcp` service on the
+physical LAN. Do not expose UDP 5353 to the internet.
 
-The tracked Compose file stays on ordinary Docker networking so a host override
-can attach plurxd to an external `media` network. Do not combine that
-`networks:` attachment with `network_mode: host`: Compose rejects the project
-because the two network models are mutually exclusive. If inter-container
-connectivity needs the shared network, keep it and accept manual native-client
-entry unless the external network is LAN-facing macvlan/ipvlan with multicast.
+Do not add `network_mode: host` to `plurxd`: Compose rejects a service that also
+has a `networks:` attachment. The companion is a different service, so an
+override can safely keep `plurxd` on an external `media` network. On a Docker
+host without host-network support, manual server entry remains the fallback.
 
 **How to verify it:** run this from another Mac on the same LAN:
 
@@ -89,10 +90,10 @@ entry unless the external network is LAN-facing macvlan/ipvlan with multicast.
 dns-sd -B _plurx._tcp local.
 ```
 
-A line naming your server means the advertiser reached the LAN; silence means
-the deployed `plurxd` is too old, is bound only to loopback, or is isolated
-behind bridge networking. Opening TCP 32400 or removing firewall filters does
-not create a missing multicast advertisement.
+A line naming your server means the advertiser reached the LAN. Silence means
+the deployed stack is too old, `plurx-discovery` is not running, host networking
+is unavailable, or multicast is filtered between the devices. Opening TCP
+32400 alone does not create a missing multicast advertisement.
 
 ## Reading the activity pill
 

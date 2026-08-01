@@ -22,18 +22,19 @@ hardware transcode, uncomment the GPU block in your override (Intel/AMD via
 still-running Plex) owns UDP 32414, set `PLURX_GDM_PORT` in `.env`
 (see `.env.example`).
 
-The base Compose service deliberately uses ordinary Docker networking and
-publishes TCP 32400 plus UDP 32414. Your override may therefore attach plurxd
-to an external network such as `media`. Compose forbids a service from declaring
-both `network_mode: host` and `networks`; combining them makes `docker compose
-up` fail before it builds anything.
+The base Compose stack keeps `plurxd` on ordinary Docker networking and
+publishes TCP 32400 plus UDP 32414. Your override may therefore attach it to an
+external network such as `media`. A separate `plurx-discovery` companion uses
+host networking only for Bonjour `_plurx._tcp`; it reads the server identity
+through published port 32400 and advertises the host's LAN address. That split
+keeps automatic iPhone, iPad, Apple TV, and Android discovery without moving
+the media server off the networks its peer services use.
 
-**Discovery trade-off:** Bonjour `_plurx._tcp` is link-local multicast, and a
-normal bridge network does not carry it onto the physical LAN. In that layout,
-use the native app's manual server entry. Automatic Bonjour discovery requires
-bare metal, a LAN-facing macvlan/ipvlan network that carries multicast, or a
-host-network deployment with no `networks:` stanza. Do not replace working
-inter-container connectivity with host networking merely to gain discovery.
+Do not add `network_mode: host` to `plurxd`. Compose forbids one service from
+declaring both host networking and `networks`, so doing that recreates the
+configuration error the companion is designed to avoid. If the Docker host
+cannot provide host networking, the server still works at
+`http://<host>:32400`, but native clients must use manual entry.
 
 ### Project name
 
@@ -243,7 +244,7 @@ single replica.
 |---|---|---|
 | 32400 | TCP | HTTP API + web app (and the Plex-compat façade) |
 | 32414 | UDP | GDM discovery so Plex/Kodi clients find the server on the LAN (host port movable via `PLURX_GDM_PORT`, but discovery only works on 32414) |
-| 5353 | UDP multicast | Bonjour `_plurx._tcp` discovery for native Apple clients; requires bare metal or host networking |
+| 5353 | UDP multicast | Bonjour `_plurx._tcp` discovery for native clients; the Compose companion owns this on the host network |
 
 ## Observability
 

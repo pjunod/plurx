@@ -12,6 +12,8 @@ final class AppleClientTests: XCTestCase {
     func testOriginNormalizationAcceptsHostnamesAndRemovesTrailingSlashes() {
         XCTAssertEqual(AppModel.normalizeOrigin("  media-box:32400///  "), "http://media-box:32400")
         XCTAssertEqual(AppModel.normalizeOrigin("media-box"), "http://media-box:32400")
+        XCTAssertEqual(AppModel.normalizeOrigin("192.168.1.20"), "http://192.168.1.20:32400")
+        XCTAssertEqual(AppModel.normalizeOrigin("http://192.168.1.20"), "http://192.168.1.20:32400")
         XCTAssertEqual(AppModel.normalizeOrigin("https://media.example.test/"), "https://media.example.test")
         XCTAssertEqual(AppModel.normalizeOrigin("   "), "")
     }
