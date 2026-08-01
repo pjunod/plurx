@@ -88,14 +88,19 @@ class Controller(
     /** Stable for this player instance — the server's supersession key. */
     private val playbackId = UUID.randomUUID().toString()
 
+    /** Only the newest asynchronous session request may replace the player. */
+    private var sessionRequestVersion = 0L
+
     fun startAt(ms: Long) {
         when (activeMode) {
             "direct" -> {
+                leaveSessionPlayback()
                 player.setMediaItem(MediaItem.fromUri(plan.playUrl), ms.coerceAtLeast(0))
                 player.prepare()
                 player.playWhenReady = true
             }
             "remux" -> {
+                leaveSessionPlayback()
                 baseMs = ms.coerceAtLeast(0)
                 player.setMediaItem(MediaItem.fromUri(remuxUri(baseMs)))
                 player.prepare()
@@ -115,6 +120,7 @@ class Controller(
         when (activeMode) {
             "direct" -> player.seekTo(t)
             "remux" -> {
+                leaveSessionPlayback()
                 baseMs = t
                 player.setMediaItem(MediaItem.fromUri(remuxUri(t)))
                 player.prepare()
@@ -129,6 +135,7 @@ class Controller(
     }
 
     fun release() {
+        sessionRequestVersion++
         sessionId?.let { vm.endHlsSession(it) }
         sessionId = null
         mediaSession.release()
@@ -151,11 +158,13 @@ class Controller(
     private fun restartAt(positionMs: Long) {
         when (activeMode) {
             "direct" -> {
+                leaveSessionPlayback()
                 player.setMediaItem(MediaItem.fromUri(plan.playUrl), positionMs)
                 player.prepare()
                 player.playWhenReady = true
             }
             "remux" -> {
+                leaveSessionPlayback()
                 baseMs = positionMs
                 player.setMediaItem(MediaItem.fromUri(remuxUri(positionMs)))
                 player.prepare()
@@ -171,6 +180,7 @@ class Controller(
      * sent, so the rung is the server's Auto choice.
      */
     private fun openSession(ms: Long) {
+        val requestVersion = ++sessionRequestVersion
         sessionId?.let { vm.endHlsSession(it) }
         sessionId = null
         scope.launch {
@@ -187,7 +197,14 @@ class Controller(
                     ),
                 )
             } catch (_: Exception) {
-                onError()
+                if (requestVersion == sessionRequestVersion) onError()
+                return@launch
+            }
+            // A later seek or track switch won while this request was in
+            // flight. Release this now-stale server session instead of letting
+            // its older timeline replace the current one.
+            if (requestVersion != sessionRequestVersion) {
+                vm.endHlsSession(hls.session_id)
                 return@launch
             }
             sessionId = hls.session_id
@@ -196,6 +213,12 @@ class Controller(
             player.prepare()
             player.playWhenReady = true
         }
+    }
+
+    private fun leaveSessionPlayback() {
+        sessionRequestVersion++
+        sessionId?.let { vm.endHlsSession(it) }
+        sessionId = null
     }
 
     private fun remuxUri(ms: Long): String {
