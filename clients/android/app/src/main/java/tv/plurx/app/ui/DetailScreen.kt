@@ -8,13 +8,16 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
@@ -84,10 +87,10 @@ fun DetailScreen(
     when {
         load == null -> Box(Modifier.fillMaxSize()) {
             LoadingBox()
-            BackButton(onBack)
+            DetailBackButton(onBack)
         }
         load?.error != null -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            BackButton(onBack)
+            DetailBackButton(onBack)
             Text(load?.error.orEmpty(), color = MaterialTheme.colorScheme.error)
         }
         else -> DetailContent(
@@ -131,7 +134,7 @@ private fun DetailContent(
             Box(Modifier.fillMaxWidth().height(heroHeight)) {
                 NetworkImage(imageUrl(item.backdrop ?: item.poster), Modifier.fillMaxSize())
                 Box(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color(0x22000000), Bg))))
-                BackButton(onBack)
+                DetailBackButton(onBack)
             }
         }
 
@@ -430,8 +433,14 @@ private fun containerNoun(kind: String): String = when (kind) {
 }
 
 @Composable
-private fun BackButton(onBack: () -> Unit) {
-    IconButton(onClick = onBack, modifier = Modifier.padding(8.dp)) {
+internal fun DetailBackButton(
+    onBack: () -> Unit,
+    safeInsets: WindowInsets = WindowInsets.statusBars,
+) {
+    IconButton(
+        onClick = onBack,
+        modifier = Modifier.windowInsetsPadding(safeInsets).padding(8.dp),
+    ) {
         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back", tint = Color.White)
     }
 }
