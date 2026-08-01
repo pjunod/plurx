@@ -5,8 +5,10 @@ package tv.plurx.app.player
 import android.view.KeyEvent
 import android.app.PictureInPictureParams
 import android.content.pm.PackageManager
+import android.graphics.Rect
 import android.os.Build
 import android.util.Rational
+import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -76,14 +78,18 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.media3.common.Player
+import androidx.media3.common.VideoSize
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
+import androidx.core.app.PictureInPictureModeChangedInfo
+import androidx.core.util.Consumer
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlin.math.roundToInt
 import tv.plurx.app.data.AudioTrack
 import tv.plurx.app.data.Decision
 import tv.plurx.app.data.Marker
@@ -106,6 +112,8 @@ private data class Plan(
     override val mode: String,
     val markers: List<Marker>,
     val reasons: List<String>,
+    val videoWidth: Int?,
+    val videoHeight: Int?,
     override val audio: List<AudioTrack>,
     override val subtitles: List<SubTrack>,
     val audioOffsetMs: Long,
@@ -129,6 +137,8 @@ private suspend fun loadPlan(vm: AppViewModel, itemId: Long, fileId: Long): Plan
         mode = mode,
         markers = decision.markers,
         reasons = decision.reasons,
+        videoWidth = file?.width?.toInt(),
+        videoHeight = file?.height?.toInt(),
         audio = decision.audio,
         subtitles = decision.subtitles,
         audioOffsetMs = decision.audio_offset_ms,
@@ -139,6 +149,68 @@ private suspend fun loadPlan(vm: AppViewModel, itemId: Long, fileId: Long): Plan
 }
 
 private enum class PlayerPanel { Tracks, Settings, Info }
+
+private const val MAX_PIP_ASPECT_RATIO = 2.39
+
+/** Returns an Android-supported PiP aspect ratio, using 16:9 when media metadata is unusable. */
+internal fun calculatePipAspectRatio(
+    width: Int,
+    height: Int,
+    pixelWidthHeightRatio: Float = 1f,
+): Rational {
+    if (width <= 0 || height <= 0 || !pixelWidthHeightRatio.isFinite() || pixelWidthHeightRatio <= 0f) {
+        return Rational(16, 9)
+    }
+
+    val adjustedWidth = (width.toDouble() * pixelWidthHeightRatio).roundToInt()
+    if (adjustedWidth <= 0) return Rational(16, 9)
+
+    val aspectRatio = adjustedWidth.toDouble() / height
+    val minimumAspectRatio = 1.0 / MAX_PIP_ASPECT_RATIO
+    return if (aspectRatio in minimumAspectRatio..MAX_PIP_ASPECT_RATIO) {
+        Rational(adjustedWidth, height)
+    } else {
+        Rational(16, 9)
+    }
+}
+
+private fun pictureInPictureParams(
+    aspectRatio: Rational,
+    sourceRect: Rect?,
+    autoEnter: Boolean,
+): PictureInPictureParams? {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return null
+
+    val builder = PictureInPictureParams.Builder().setAspectRatio(aspectRatio)
+    if (sourceRect != null && !sourceRect.isEmpty) builder.setSourceRectHint(sourceRect)
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        builder
+            .setAutoEnterEnabled(autoEnter)
+            .setSeamlessResizeEnabled(true)
+    }
+    return builder.build()
+}
+
+private fun setPictureInPictureParams(
+    activity: android.app.Activity,
+    params: PictureInPictureParams?,
+) {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && params != null) {
+        activity.setPictureInPictureParams(params)
+    }
+}
+
+private fun enterPictureInPicture(
+    activity: android.app.Activity,
+    params: PictureInPictureParams?,
+) {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && params != null) {
+        activity.enterPictureInPictureMode(params)
+    }
+}
+
+private fun isInPictureInPicture(activity: android.app.Activity): Boolean =
+    Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && activity.isInPictureInPictureMode
 
 @Composable
 fun PlayerScreen(
@@ -255,6 +327,7 @@ private fun PlayerContent(
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val activity = androidx.activity.compose.LocalActivity.current
+    val componentActivity = activity as? ComponentActivity
     val canUsePip = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
         context.packageManager.hasSystemFeature(PackageManager.FEATURE_PICTURE_IN_PICTURE)
     val scope = rememberCoroutineScope()
@@ -272,6 +345,16 @@ private fun PlayerContent(
     var buffering by remember { mutableStateOf(true) }
     var controlsVisible by remember { mutableStateOf(true) }
     var panel by remember { mutableStateOf<PlayerPanel?>(null) }
+    var playerView by remember { mutableStateOf<PlayerView?>(null) }
+    var isInPip by remember(activity) {
+        mutableStateOf(
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+                activity?.isInPictureInPictureMode == true,
+        )
+    }
+    var pipAspectRatio by remember(plan) {
+        mutableStateOf(calculatePipAspectRatio(plan.videoWidth ?: 0, plan.videoHeight ?: 0))
+    }
     var lastInteraction by remember { mutableLongStateOf(0L) }
     var lastAutoSkipped by remember(plan) { mutableLongStateOf(-1L) }
     var findingNext by remember { mutableStateOf(false) }
@@ -281,7 +364,7 @@ private fun PlayerContent(
         lastInteraction += 1
     }
 
-    BackHandler {
+    BackHandler(enabled = !isInPip) {
         if (panel != null) panel = null else onExit()
     }
 
@@ -307,6 +390,14 @@ private fun PlayerContent(
                     }
                 }
             }
+
+            override fun onVideoSizeChanged(videoSize: VideoSize) {
+                pipAspectRatio = calculatePipAspectRatio(
+                    videoSize.width,
+                    videoSize.height,
+                    videoSize.pixelWidthHeightRatio,
+                )
+            }
         }
         controller.player.addListener(listener)
         controller.startAt(startMs)
@@ -314,6 +405,86 @@ private fun PlayerContent(
             vm.postProgress(itemId, controller.realPosition(), plan.durationMs)
             controller.player.removeListener(listener)
             controller.release()
+        }
+    }
+
+    fun currentPipParams(autoEnter: Boolean = isPlaying): PictureInPictureParams? {
+        val sourceRect = playerView?.let { view ->
+            Rect().takeIf { view.getGlobalVisibleRect(it) && !it.isEmpty }
+        }
+        return pictureInPictureParams(pipAspectRatio, sourceRect, autoEnter)
+    }
+
+    DisposableEffect(componentActivity, canUsePip) {
+        if (!canUsePip || componentActivity == null) {
+            onDispose { }
+        } else {
+            val pipModeListener = Consumer<PictureInPictureModeChangedInfo> { info ->
+                isInPip = info.isInPictureInPictureMode
+                panel = null
+                if (info.isInPictureInPictureMode) {
+                    controlsVisible = false
+                } else {
+                    controlsVisible = true
+                    lastInteraction += 1
+                }
+            }
+            componentActivity.addOnPictureInPictureModeChangedListener(pipModeListener)
+            onDispose {
+                componentActivity.removeOnPictureInPictureModeChangedListener(pipModeListener)
+            }
+        }
+    }
+
+    // Android 12+ reads auto-enter from the current PiP parameters. Android 8–11
+    // instead needs an explicit request when the user leaves the activity.
+    DisposableEffect(componentActivity, canUsePip, isPlaying, pipAspectRatio, playerView) {
+        if (
+            !canUsePip || componentActivity == null ||
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+        ) {
+            onDispose { }
+        } else {
+            val leaveHintListener = Runnable {
+                if (isPlaying && !isInPictureInPicture(componentActivity)) {
+                    controlsVisible = false
+                    panel = null
+                    enterPictureInPicture(componentActivity, currentPipParams(autoEnter = false))
+                }
+            }
+            componentActivity.addOnUserLeaveHintListener(leaveHintListener)
+            onDispose { componentActivity.removeOnUserLeaveHintListener(leaveHintListener) }
+        }
+    }
+
+    DisposableEffect(activity, canUsePip, isPlaying, pipAspectRatio, playerView) {
+        if (!canUsePip || activity == null) {
+            onDispose { }
+        } else {
+            val updateParams = Runnable {
+                setPictureInPictureParams(activity, currentPipParams())
+            }
+            val layoutListener = android.view.View.OnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+                updateParams.run()
+            }
+            playerView?.addOnLayoutChangeListener(layoutListener)
+            playerView?.post(updateParams) ?: updateParams.run()
+            onDispose {
+                playerView?.removeOnLayoutChangeListener(layoutListener)
+                playerView?.removeCallbacks(updateParams)
+            }
+        }
+    }
+
+    // Do not leave automatic PiP armed after navigating away from the player.
+    DisposableEffect(activity, canUsePip) {
+        onDispose {
+            if (canUsePip && activity != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                setPictureInPictureParams(
+                    activity,
+                    pictureInPictureParams(pipAspectRatio, null, autoEnter = false),
+                )
+            }
         }
     }
 
@@ -394,33 +565,37 @@ private fun PlayerContent(
                     resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
                     setShutterBackgroundColor(android.graphics.Color.BLACK)
                     keepScreenOn = true
+                    playerView = this
                 }
             },
+            update = { playerView = it },
             modifier = Modifier.fillMaxSize(),
         )
 
-        Box(
-            Modifier.fillMaxSize().clickable(
-                interactionSource = remember { MutableInteractionSource() },
-                indication = null,
-            ) { if (controlsVisible) controlsVisible = false else poke() },
-        )
+        if (!isInPip) {
+            Box(
+                Modifier.fillMaxSize().clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null,
+                ) { if (controlsVisible) controlsVisible = false else poke() },
+            )
+        }
 
-        if (buffering || findingNext) {
+        if (!isInPip && (buffering || findingNext)) {
             Column(Modifier.align(Alignment.Center), horizontalAlignment = Alignment.CenterHorizontally) {
                 CircularProgressIndicator(color = Accent)
                 if (findingNext) Text("Up next…", color = Color.White, modifier = Modifier.padding(top = 12.dp))
             }
         }
 
-        if (activeMarker != null && !scrubbing && !preferences.autoSkip) {
+        if (!isInPip && activeMarker != null && !scrubbing && !preferences.autoSkip) {
             Button(
                 onClick = { controller.seekTo(activeMarker.end_ms); poke() },
                 modifier = Modifier.align(Alignment.BottomEnd).padding(end = 28.dp, bottom = 112.dp),
             ) { Text(activeMarker.label, fontWeight = FontWeight.SemiBold) }
         }
 
-        if (controlsVisible) {
+        if (!isInPip && controlsVisible) {
             Controls(
                 title = plan.title,
                 positionMs = if (scrubbing) scrubPreview else positionMs,
@@ -442,15 +617,16 @@ private fun PlayerContent(
                 onPip = if (canUsePip && activity != null) {
                     {
                         controlsVisible = false
-                        activity.enterPictureInPictureMode(
-                            PictureInPictureParams.Builder().setAspectRatio(Rational(16, 9)).build(),
-                        )
+                        panel = null
+                        val params = currentPipParams(autoEnter = false)
+                        setPictureInPictureParams(activity, params)
+                        enterPictureInPicture(activity, params)
                     }
                 } else null,
             )
         }
 
-        when (panel) {
+        when (if (isInPip) null else panel) {
             PlayerPanel.Tracks -> TrackMenu(
                 player = controller.player,
                 serverAudio = plan.audio,
