@@ -97,9 +97,9 @@ final class PlayerController: ObservableObject {
         self.knownDurationMs = durationMs
         self.title = title
 
-        #if os(iOS)
         try? AVAudioSession.sharedInstance().setCategory(.playback)
         try? AVAudioSession.sharedInstance().setActive(true)
+        #if os(iOS)
         installRemoteCommands()
         #endif
 

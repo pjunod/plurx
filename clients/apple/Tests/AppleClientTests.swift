@@ -78,6 +78,26 @@ final class AppleClientTests: XCTestCase {
         }
     }
 
+    func testPictureInPictureCommandStartsStopsAndWaitsForAvailability() {
+        XCTAssertEqual(
+            PictureInPictureController.command(isActive: false, isPossible: true),
+            .start
+        )
+        XCTAssertEqual(
+            PictureInPictureController.command(isActive: true, isPossible: false),
+            .stop
+        )
+        XCTAssertEqual(
+            PictureInPictureController.command(isActive: false, isPossible: false),
+            .unavailable
+        )
+    }
+
+    func testAppDeclaresBackgroundAudioForPictureInPicture() {
+        let modes = Bundle.main.object(forInfoDictionaryKey: "UIBackgroundModes") as? [String] ?? []
+        XCTAssertTrue(modes.contains("audio"))
+    }
+
     func testCopySessionCanPreserveNegotiatedDolbyVision() throws {
         let request = CreateSessionRequest(
             playbackId: "player-dv",
