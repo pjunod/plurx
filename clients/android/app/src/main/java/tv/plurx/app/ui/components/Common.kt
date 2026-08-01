@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -42,12 +43,18 @@ import androidx.compose.ui.unit.Dp
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
 import tv.plurx.app.data.Item
 import tv.plurx.app.data.Session
 import tv.plurx.app.ui.theme.Accent
 import tv.plurx.app.ui.theme.Muted
 import tv.plurx.app.ui.theme.SurfaceHi
 import tv.plurx.app.ui.theme.Outline
+
+enum class PosterResolutionPlacement {
+    ArtworkOverlay,
+    BelowArtwork,
+}
 
 /** Absolute image URL for a server-relative poster/backdrop path (or null). */
 fun imageUrl(path: String?): String? = path?.let { Session.url(it) }
@@ -76,6 +83,7 @@ fun PosterCard(
     item: Item,
     modifier: Modifier = Modifier,
     width: Dp = 128.dp,
+    resolutionPlacement: PosterResolutionPlacement = PosterResolutionPlacement.ArtworkOverlay,
     onClick: () -> Unit,
 ) {
     var focused by remember { mutableStateOf(false) }
@@ -93,6 +101,7 @@ fun PosterCard(
         Box(
             Modifier
                 .fillMaxWidth()
+                .testTag("poster-artwork")
                 .aspectRatio(2f / 3f)
                 .clip(MaterialTheme.shapes.medium)
                 .background(SurfaceHi)
@@ -105,19 +114,13 @@ fun PosterCard(
                 )
         ) {
             NetworkImage(imageUrl(item.poster), Modifier.fillMaxSize())
-            item.resolution?.let { height ->
-                val label = when {
-                    height >= 2160 -> "4K"
-                    height >= 1440 -> "1440p"
-                    height >= 1080 -> "1080p"
-                    height >= 720 -> "720p"
-                    else -> "${height}p"
-                }
+            if (resolutionPlacement == PosterResolutionPlacement.ArtworkOverlay) item.resolution?.let { height ->
                 Text(
-                    label,
+                    resolutionLabel(height),
                     color = Color.White,
                     style = MaterialTheme.typography.labelMedium,
                     modifier = Modifier
+                        .testTag("poster-resolution-overlay")
                         .align(Alignment.TopEnd)
                         .padding(5.dp)
                         .background(Color(0xB3000000), MaterialTheme.shapes.small)
@@ -157,13 +160,27 @@ fun PosterCard(
             overflow = TextOverflow.Ellipsis,
             modifier = Modifier.padding(top = 6.dp),
         )
-        Text(
-            subtitleFor(item),
-            style = MaterialTheme.typography.labelMedium,
-            color = Muted,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                subtitleFor(item),
+                style = MaterialTheme.typography.labelMedium,
+                color = Muted,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
+            if (resolutionPlacement == PosterResolutionPlacement.BelowArtwork) item.resolution?.let { height ->
+                Text(
+                    resolutionLabel(height),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = Muted,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier
+                        .testTag("poster-resolution-metadata")
+                        .padding(start = 6.dp),
+                )
+            }
+        }
     }
 }
 
@@ -172,6 +189,7 @@ fun MediaRow(
     title: String,
     items: List<Item>,
     posterWidth: Dp = 128.dp,
+    resolutionPlacement: PosterResolutionPlacement = PosterResolutionPlacement.ArtworkOverlay,
     onViewAll: (() -> Unit)? = null,
     onOpen: (Item) -> Unit,
 ) {
@@ -198,7 +216,9 @@ fun MediaRow(
             contentPadding = PaddingValues(horizontal = 20.dp),
             horizontalArrangement = Arrangement.spacedBy(14.dp),
         ) {
-            items(items, key = { it.id }) { item -> PosterCard(item, width = posterWidth) { onOpen(item) } }
+            items(items, key = { it.id }) { item ->
+                PosterCard(item, width = posterWidth, resolutionPlacement = resolutionPlacement) { onOpen(item) }
+            }
         }
     }
 }
@@ -260,6 +280,14 @@ private fun subtitleFor(item: Item): String = when {
     item.year != null -> item.year.toString()
     item.show_title != null -> item.show_title
     else -> item.kind.replaceFirstChar { it.uppercase() }
+}
+
+private fun resolutionLabel(height: Long): String = when {
+    height >= 2160 -> "4K"
+    height >= 1440 -> "1440p"
+    height >= 1080 -> "1080p"
+    height >= 720 -> "720p"
+    else -> "${height}p"
 }
 
 private fun progressFraction(positionMs: Long, durationMs: Long?): Float {

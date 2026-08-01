@@ -35,6 +35,7 @@ import tv.plurx.app.data.ThemeId
 import tv.plurx.app.ui.components.ChoicePicker
 import tv.plurx.app.ui.components.LoadingBox
 import tv.plurx.app.ui.components.MediaRow
+import tv.plurx.app.ui.components.PosterResolutionPlacement
 import tv.plurx.app.ui.components.TvIconButton
 import tv.plurx.app.ui.theme.Accent
 import tv.plurx.app.ui.theme.Muted
@@ -78,9 +79,25 @@ fun HomeScreen(
             else -> {
                 val collections = homeCollections(state.libraries, state.libraryItems, preferences.homeGrouping)
                 LazyColumn(contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 32.dp)) {
-                    item { MediaRow("Continue watching", state.hubs.continue_watching, posterWidth, onOpen = { onOpenItem(it.id) }) }
+                    item {
+                        MediaRow(
+                            "Continue watching",
+                            state.hubs.continue_watching,
+                            posterWidth,
+                            resolutionPlacement = PosterResolutionPlacement.BelowArtwork,
+                            onOpen = { onOpenItem(it.id) },
+                        )
+                    }
                     item { MediaRow("Next up", state.hubs.next_up, posterWidth, onOpen = { onOpenItem(it.id) }) }
-                    item { MediaRow("Recently added", state.hubs.recently_added, posterWidth, onOpen = { onOpenItem(it.id) }) }
+                    item {
+                        MediaRow(
+                            "Recently added",
+                            state.hubs.recently_added,
+                            posterWidth,
+                            resolutionPlacement = PosterResolutionPlacement.BelowArtwork,
+                            onOpen = { onOpenItem(it.id) },
+                        )
+                    }
 
                     if (state.libraries.isNotEmpty()) {
                         item {
