@@ -85,6 +85,8 @@ class Controller(
     var selectedSubtitle: Long? = null
         private set
     val deliveryMode: String get() = activeMode
+    var encoder: String? = null
+        private set
 
     private val mediaSession = MediaSession.Builder(context, player).build()
 
@@ -101,12 +103,14 @@ class Controller(
         when (activeMode) {
             "direct" -> {
                 leaveSessionPlayback()
+                encoder = null
                 player.setMediaItem(MediaItem.fromUri(plan.playUrl), ms.coerceAtLeast(0))
                 player.prepare()
                 player.playWhenReady = true
             }
             "remux" -> {
                 leaveSessionPlayback()
+                encoder = null
                 baseMs = ms.coerceAtLeast(0)
                 player.setMediaItem(MediaItem.fromUri(remuxUri(baseMs)))
                 player.prepare()
@@ -189,6 +193,7 @@ class Controller(
         val requestVersion = ++sessionRequestVersion
         sessionId?.let { vm.endHlsSession(it) }
         sessionId = null
+        encoder = null
         scope.launch {
             val hls = try {
                 vm.createHlsSession(
@@ -214,6 +219,7 @@ class Controller(
                 return@launch
             }
             sessionId = hls.session_id
+            encoder = hls.encoder
             baseMs = (hls.start_seconds * 1000).toLong()
             player.setMediaItem(MediaItem.fromUri(Session.url(hls.playlist_url)))
             player.prepare()
@@ -225,6 +231,7 @@ class Controller(
         sessionRequestVersion++
         sessionId?.let { vm.endHlsSession(it) }
         sessionId = null
+        encoder = null
     }
 
     private fun remuxUri(ms: Long): String {
@@ -421,7 +428,7 @@ private fun TrackRow(
     )
 }
 
-private fun audioLabel(f: Format): String {
+internal fun audioLabel(f: Format): String {
     val parts = mutableListOf<String>()
     languageName(f.language)?.let { parts.add(it) }
     f.label?.let { parts.add(it) }
@@ -437,7 +444,7 @@ private fun audioLabel(f: Format): String {
     return parts.distinct().joinToString(" · ").ifBlank { "Audio" }
 }
 
-private fun subLabel(f: Format): String {
+internal fun subLabel(f: Format): String {
     val parts = mutableListOf<String>()
     languageName(f.language)?.let { parts.add(it) }
     f.label?.let { parts.add(it) }
@@ -445,7 +452,7 @@ private fun subLabel(f: Format): String {
     return parts.distinct().joinToString(" · ").ifBlank { "Subtitle" }
 }
 
-private fun serverAudioLabel(track: AudioTrack): String = listOfNotNull(
+internal fun serverAudioLabel(track: AudioTrack): String = listOfNotNull(
     languageName(track.language),
     track.title,
     track.channels?.let {
@@ -456,14 +463,14 @@ private fun serverAudioLabel(track: AudioTrack): String = listOfNotNull(
     track.codec.uppercase(),
 ).distinct().joinToString(" · ").ifBlank { "Audio" }
 
-private fun serverSubtitleLabel(track: SubTrack): String = listOfNotNull(
+internal fun serverSubtitleLabel(track: SubTrack): String = listOfNotNull(
     languageName(track.language),
     track.title,
     if (track.forced) "Forced" else null,
     if (!track.text) "Burn-in" else null,
 ).distinct().joinToString(" · ").ifBlank { "Subtitle" }
 
-private fun languageName(code: String?): String? {
+internal fun languageName(code: String?): String? {
     if (code.isNullOrBlank() || code == "und") return null
     return try {
         Locale.forLanguageTag(code).displayLanguage.ifBlank { code }
@@ -472,8 +479,12 @@ private fun languageName(code: String?): String? {
     }
 }
 
-private fun codecShort(mime: String?): String? = when {
+internal fun codecShort(mime: String?): String? = when {
     mime == null -> null
+    mime.contains("hevc", true) || mime.contains("h265", true) -> "HEVC"
+    mime.contains("avc", true) || mime.contains("h264", true) -> "H.264"
+    mime.contains("av01", true) || mime.contains("av1", true) -> "AV1"
+    mime.contains("vp9", true) -> "VP9"
     mime.contains("ac3", true) && mime.contains("e", true) -> "E-AC3"
     mime.contains("ac3", true) -> "AC3"
     mime.contains("dts", true) -> "DTS"

@@ -68,6 +68,8 @@ import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -76,6 +78,8 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.media3.common.C
+import androidx.media3.common.Format
 import androidx.media3.common.Player
 import androidx.media3.common.VideoSize
 import androidx.media3.common.util.UnstableApi
@@ -92,6 +96,7 @@ import kotlin.math.roundToInt
 import tv.plurx.app.data.AudioTrack
 import tv.plurx.app.data.Decision
 import tv.plurx.app.data.Marker
+import tv.plurx.app.data.MediaFileDto
 import tv.plurx.app.data.PlaybackQuality
 import tv.plurx.app.data.Session
 import tv.plurx.app.data.SubTrack
@@ -117,6 +122,7 @@ private data class Plan(
     val reasons: List<String>,
     val videoWidth: Int?,
     val videoHeight: Int?,
+    val source: MediaFileDto?,
     override val audio: List<AudioTrack>,
     override val subtitles: List<SubTrack>,
     val audioOffsetMs: Long,
@@ -142,6 +148,7 @@ private suspend fun loadPlan(vm: AppViewModel, itemId: Long, fileId: Long): Plan
         reasons = decision.reasons,
         videoWidth = file?.width?.toInt(),
         videoHeight = file?.height?.toInt(),
+        source = file,
         audio = decision.audio,
         subtitles = decision.subtitles,
         audioOffsetMs = decision.audio_offset_ms,
@@ -152,6 +159,14 @@ private suspend fun loadPlan(vm: AppViewModel, itemId: Long, fileId: Long): Plan
 }
 
 private enum class PlayerPanel { Tracks, Settings, Info }
+
+internal enum class PlayerBackAction { ClosePanel, HideControls, ExitPlayback }
+
+internal fun playerBackAction(panelOpen: Boolean, controlsVisible: Boolean): PlayerBackAction = when {
+    panelOpen -> PlayerBackAction.ClosePanel
+    controlsVisible -> PlayerBackAction.HideControls
+    else -> PlayerBackAction.ExitPlayback
+}
 
 private const val MAX_PIP_ASPECT_RATIO = 2.39
 
@@ -368,7 +383,14 @@ private fun PlayerContent(
     }
 
     BackHandler(enabled = !isInPip) {
-        if (panel != null) panel = null else onExit()
+        when (playerBackAction(panel != null, controlsVisible)) {
+            PlayerBackAction.ClosePanel -> {
+                panel = null
+                poke()
+            }
+            PlayerBackAction.HideControls -> controlsVisible = false
+            PlayerBackAction.ExitPlayback -> onExit()
+        }
     }
 
     DisposableEffect(controller, preferences.autoplayNext) {
@@ -666,8 +688,8 @@ private fun PlayerContent(
             )
             PlayerPanel.Info -> PlayerInfo(
                 plan = plan,
-                deliveryMode = controller.deliveryMode,
-                bufferedPercent = controller.player.bufferedPercentage,
+                controller = controller,
+                positionMs = positionMs,
                 onDismiss = { panel = null; poke() },
             )
             null -> Unit
@@ -759,6 +781,20 @@ internal fun Controls(
                 onValueChange = { onScrubStart(); onScrub(it.toLong()) },
                 onValueChangeFinished = onScrubEnd,
                 valueRange = 0f..range,
+                modifier = Modifier
+                    .semantics { contentDescription = "Playback position" }
+                    .onPreviewKeyEvent { event ->
+                        val vertical = event.nativeKeyEvent.keyCode == KeyEvent.KEYCODE_DPAD_UP ||
+                            event.nativeKeyEvent.keyCode == KeyEvent.KEYCODE_DPAD_DOWN
+                        if (vertical) {
+                            if (event.nativeKeyEvent.action == KeyEvent.ACTION_DOWN) {
+                                playFocusRequester.requestFocus()
+                            }
+                            true
+                        } else {
+                            false
+                        }
+                    },
                 colors = SliderDefaults.colors(
                     thumbColor = Accent,
                     activeTrackColor = Accent,
@@ -834,26 +870,54 @@ private fun PlayerSettings(
 }
 
 @Composable
-private fun PlayerInfo(plan: Plan, deliveryMode: String, bufferedPercent: Int, onDismiss: () -> Unit) {
+private fun PlayerInfo(plan: Plan, controller: Controller, positionMs: Long, onDismiss: () -> Unit) {
+    val player = controller.player
+    val selectedAudio = player.audioFormat?.let(::audioLabel)
+        ?: plan.audio.firstOrNull { it.index == controller.selectedAudio }?.let(::serverAudioLabel)
+        ?: plan.audio.firstOrNull { it.default }?.let(::serverAudioLabel)
+    val selectedSubtitle = selectedSubtitleLabel(player, plan.subtitles, controller.selectedSubtitle)
     PlaybackInfoOverlay(
-        title = plan.title,
-        fileId = plan.fileId,
-        deliveryMode = deliveryMode,
-        bufferedPercent = bufferedPercent,
-        durationMs = plan.durationMs,
+        details = PlaybackInfoDetails(
+            title = plan.title,
+            fileId = plan.fileId,
+            delivery = deliveryLabel(controller.deliveryMode),
+            position = "${formatTime(positionMs)} / ${formatTime(plan.durationMs)}",
+            buffer = "${formatTime((player.bufferedPosition - player.currentPosition).coerceAtLeast(0))} ahead · " +
+                "${player.bufferedPercentage.coerceIn(0, 100)}%",
+            sourceFile = plan.source?.filename,
+            sourceVideo = sourceVideoSummary(plan.source),
+            sourceAudio = sourceAudioSummary(plan.source),
+            playingVideo = videoFormatSummary(player.videoFormat),
+            playingAudio = selectedAudio,
+            subtitles = selectedSubtitle,
+            encoder = controller.encoder,
+            audioSync = plan.audioOffsetMs.takeIf { it != 0L }?.let(::offsetLabel),
+        ),
         reasons = plan.reasons,
         onDismiss = onDismiss,
     )
 }
 
+internal data class PlaybackInfoDetails(
+    val title: String,
+    val fileId: Long,
+    val delivery: String,
+    val position: String,
+    val buffer: String,
+    val sourceFile: String? = null,
+    val sourceVideo: String? = null,
+    val sourceAudio: String? = null,
+    val playingVideo: String? = null,
+    val playingAudio: String? = null,
+    val subtitles: String = "Off",
+    val encoder: String? = null,
+    val audioSync: String? = null,
+)
+
 /** Floating playback details that preserve the video as their background. */
 @Composable
 internal fun PlaybackInfoOverlay(
-    title: String,
-    fileId: Long,
-    deliveryMode: String,
-    bufferedPercent: Int,
-    durationMs: Long,
+    details: PlaybackInfoDetails,
     reasons: List<String>,
     onDismiss: () -> Unit,
 ) {
@@ -871,9 +935,9 @@ internal fun PlaybackInfoOverlay(
             Modifier
                 .align(Alignment.Center)
                 .padding(horizontal = 20.dp, vertical = 28.dp)
-                .widthIn(max = 520.dp)
+                .widthIn(max = 680.dp)
                 .fillMaxWidth()
-                .heightIn(max = 560.dp)
+                .heightIn(max = 640.dp)
                 .clip(shape)
                 .background(Color(0xD917181E))
                 .border(1.dp, Color.White.copy(alpha = 0.14f), shape)
@@ -901,7 +965,7 @@ internal fun PlaybackInfoOverlay(
                         style = MaterialTheme.typography.titleLarge,
                     )
                     Text(
-                        title,
+                        details.title,
                         color = Color.White.copy(alpha = 0.72f),
                         style = MaterialTheme.typography.bodyMedium,
                         maxLines = 2,
@@ -920,22 +984,26 @@ internal fun PlaybackInfoOverlay(
 
             PlaybackInfoRow(
                 label = "Delivery",
-                value = deliveryMode.ifBlank { "unknown" }
-                    .replace('_', ' ')
-                    .replaceFirstChar { it.uppercase() },
+                value = details.delivery,
             )
-            PlaybackInfoRow("Buffered", "${bufferedPercent.coerceIn(0, 100)}%")
-            PlaybackInfoRow("Duration", formatTime(durationMs))
-            PlaybackInfoRow("File", "#$fileId")
+            PlaybackInfoRow("Position", details.position)
+            PlaybackInfoRow("Buffer", details.buffer)
+
+            PlaybackInfoSection("SOURCE MEDIA")
+            details.sourceFile?.let { PlaybackInfoRow("File", it) }
+            details.sourceVideo?.let { PlaybackInfoRow("Video", it) }
+            details.sourceAudio?.let { PlaybackInfoRow("Audio", it) }
+
+            PlaybackInfoSection("NOW PLAYING")
+            details.playingVideo?.let { PlaybackInfoRow("Video", it) }
+            details.playingAudio?.let { PlaybackInfoRow("Audio", it) }
+            PlaybackInfoRow("Subtitles", details.subtitles)
+            details.encoder?.let { PlaybackInfoRow("Encoder", it) }
+            details.audioSync?.let { PlaybackInfoRow("Audio sync", it) }
+            PlaybackInfoRow("File ID", "#${details.fileId}")
 
             if (reasons.isNotEmpty()) {
-                Text(
-                    "PLAYBACK DECISION",
-                    color = Color.White.copy(alpha = 0.58f),
-                    style = MaterialTheme.typography.labelMedium,
-                    fontWeight = FontWeight.Bold,
-                    modifier = Modifier.padding(top = 4.dp),
-                )
+                PlaybackInfoSection("PLAYBACK DECISION")
                 reasons.forEach { reason ->
                     Row(
                         Modifier.fillMaxWidth(),
@@ -957,6 +1025,17 @@ internal fun PlaybackInfoOverlay(
 }
 
 @Composable
+private fun PlaybackInfoSection(title: String) {
+    Text(
+        title,
+        color = Color.White.copy(alpha = 0.58f),
+        style = MaterialTheme.typography.labelMedium,
+        fontWeight = FontWeight.Bold,
+        modifier = Modifier.padding(top = 4.dp),
+    )
+}
+
+@Composable
 private fun PlaybackInfoRow(label: String, value: String) {
     Row(
         Modifier
@@ -970,15 +1049,86 @@ private fun PlaybackInfoRow(label: String, value: String) {
             label,
             color = Color.White.copy(alpha = 0.62f),
             style = MaterialTheme.typography.labelLarge,
-            modifier = Modifier.weight(1f),
+            modifier = Modifier.width(112.dp),
         )
         Text(
             value,
             color = Color.White,
             style = MaterialTheme.typography.bodyMedium,
             fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.weight(1f),
         )
     }
+}
+
+internal fun deliveryLabel(mode: String): String = when (mode) {
+    "direct" -> "Direct play"
+    "remux" -> "Direct stream · remux"
+    "transcode" -> "Transcode · HLS"
+    else -> mode.ifBlank { "Unknown" }.replace('_', ' ').replaceFirstChar { it.uppercase() }
+}
+
+internal fun sourceVideoSummary(file: MediaFileDto?): String? {
+    if (file == null) return null
+    return listOfNotNull(
+        file.video_codec?.uppercase(),
+        file.video_profile?.takeIf { it.isNotBlank() },
+        if (file.width != null && file.height != null) "${file.width}×${file.height}" else file.height?.let { "${it}p" },
+        (file.hdr_format ?: file.hdr)?.takeIf { it.isNotBlank() },
+        file.bit_depth?.takeIf { it > 0 }?.let { "${it}-bit" },
+        file.bitrate?.takeIf { it > 0 }?.let(::formatBitrate),
+    ).joinToString(" · ").ifBlank { null }
+}
+
+internal fun sourceAudioSummary(file: MediaFileDto?): String? {
+    val streams = file?.audio_streams.orEmpty()
+    val stream = streams.firstOrNull { it.default } ?: streams.firstOrNull() ?: return null
+    val base = listOfNotNull(
+        stream.codec?.uppercase(),
+        stream.channels?.let(::channelLabel),
+        languageName(stream.language),
+        stream.title?.takeIf { it.isNotBlank() },
+    ).distinct().joinToString(" · ")
+    val others = streams.size - 1
+    return if (others > 0) "$base · +$others track${if (others == 1) "" else "s"}" else base
+}
+
+private fun videoFormatSummary(format: Format?): String? {
+    if (format == null) return null
+    val hdr = when (format.colorInfo?.colorTransfer) {
+        C.COLOR_TRANSFER_ST2084 -> "HDR10 / PQ"
+        C.COLOR_TRANSFER_HLG -> "HLG"
+        else -> null
+    }
+    return listOfNotNull(
+        codecShort(format.sampleMimeType) ?: format.codecs?.takeIf { it.isNotBlank() },
+        if (format.width != Format.NO_VALUE && format.height != Format.NO_VALUE) "${format.width}×${format.height}" else null,
+        hdr,
+        format.bitrate.takeIf { it != Format.NO_VALUE && it > 0 }?.toLong()?.let(::formatBitrate),
+    ).joinToString(" · ").ifBlank { null }
+}
+
+private fun selectedSubtitleLabel(player: Player, serverTracks: List<SubTrack>, selectedServerTrack: Long?): String {
+    player.currentTracks.groups.filter { it.type == C.TRACK_TYPE_TEXT }.forEach { group ->
+        repeat(group.length) { index ->
+            if (group.isTrackSelected(index)) return subLabel(group.getTrackFormat(index))
+        }
+    }
+    return serverTracks.firstOrNull { it.index == selectedServerTrack }?.let(::serverSubtitleLabel) ?: "Off"
+}
+
+private fun channelLabel(channels: Int): String = when (channels) {
+    1 -> "Mono"
+    2 -> "Stereo"
+    6 -> "5.1"
+    8 -> "7.1"
+    else -> "${channels}ch"
+}
+
+private fun formatBitrate(bitsPerSecond: Long): String = if (bitsPerSecond >= 1_000_000) {
+    "%.1f Mbps".format(bitsPerSecond / 1_000_000.0)
+} else {
+    "${bitsPerSecond / 1_000} kbps"
 }
 
 @Composable
