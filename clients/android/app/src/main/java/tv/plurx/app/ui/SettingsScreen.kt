@@ -6,6 +6,7 @@ import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -32,6 +33,7 @@ import tv.plurx.app.data.PlaybackQuality
 import tv.plurx.app.data.PosterSize
 import tv.plurx.app.data.ThemeId
 import tv.plurx.app.ui.components.ChoicePicker
+import tv.plurx.app.ui.components.SafeTopRow
 import tv.plurx.app.ui.theme.Muted
 
 private val LANGS = listOf(
@@ -49,10 +51,9 @@ fun SettingsScreen(vm: AppViewModel, onBack: () -> Unit) {
     var audio by remember { mutableStateOf(LANGS.firstOrNull { it.first == vm.audioLang } ?: LANGS.first()) }
     var sub by remember { mutableStateOf(SUB_LANGS.firstOrNull { it.first == vm.subLang } ?: SUB_LANGS.first()) }
 
-    Column(Modifier.fillMaxSize()) {
-        Row(
+    Column(Modifier.fillMaxSize().navigationBarsPadding()) {
+        SafeTopRow(
             Modifier.fillMaxWidth().padding(start = side - 12.dp, end = side, top = 8.dp),
-            verticalAlignment = Alignment.CenterVertically,
         ) {
             IconButton(onClick = onBack) {
                 Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")

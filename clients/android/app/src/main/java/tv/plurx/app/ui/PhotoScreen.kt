@@ -4,10 +4,6 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -18,6 +14,7 @@ import coil.request.ImageRequest
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import tv.plurx.app.data.Session
+import tv.plurx.app.ui.components.SafeBackButton
 
 @Composable
 fun PhotoScreen(itemId: Long, onBack: () -> Unit) {
@@ -33,8 +30,6 @@ fun PhotoScreen(itemId: Long, onBack: () -> Unit) {
                 detectTapGestures(onDoubleTap = { /* Reserved for zoom state. */ })
             },
         )
-        IconButton(onClick = onBack, modifier = Modifier.align(Alignment.TopStart)) {
-            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back", tint = Color.White)
-        }
+        SafeBackButton(onBack = onBack, modifier = Modifier.align(Alignment.TopStart))
     }
 }
