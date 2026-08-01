@@ -72,6 +72,44 @@ struct TVReadableButtonStyle: ButtonStyle {
     }
 }
 
+/// Compact trailing action for shelf headers. tvOS 26 can tint a default
+/// NavigationLink's label and background identically, leaving only an empty
+/// accent-colored capsule. This style owns that contrast pair explicitly.
+struct TVShelfActionButtonStyle: ButtonStyle {
+    static func foregroundColor(focused: Bool) -> Color { Palette.bg }
+    static func backgroundColor(focused: Bool) -> Color { Palette.accent }
+
+    func makeBody(configuration: Configuration) -> Body {
+        Body(configuration: configuration)
+    }
+
+    struct Body: View {
+        let configuration: ButtonStyle.Configuration
+        @Environment(\.isFocused) private var isFocused
+
+        var body: some View {
+            configuration.label
+                .foregroundStyle(TVShelfActionButtonStyle.foregroundColor(focused: isFocused))
+                .padding(.horizontal, 22)
+                .padding(.vertical, 10)
+                .frame(minWidth: 126, minHeight: 48)
+                .background(
+                    TVShelfActionButtonStyle.backgroundColor(focused: isFocused),
+                    in: Capsule()
+                )
+                .brightness(isFocused ? 0.08 : 0)
+                .scaleEffect(isFocused ? 1.07 : (configuration.isPressed ? 0.97 : 1))
+                .shadow(
+                    color: Palette.accent.opacity(isFocused ? 0.42 : 0),
+                    radius: 14,
+                    y: 6
+                )
+                .animation(.easeOut(duration: 0.14), value: isFocused)
+                .animation(.easeOut(duration: 0.08), value: configuration.isPressed)
+        }
+    }
+}
+
 /// Replaces tvOS's thick white focus plate with the same restrained red
 /// signal used throughout plurx. The hero still lifts enough to read from the
 /// couch without turning the artwork into a glowing white rectangle.
@@ -106,6 +144,11 @@ struct TVHeroButtonStyle: ButtonStyle {
 /// Shelf cards get a subtle lift and shadow, not the default opaque tvOS
 /// surround that hides the edges of posters and backdrops.
 struct TVMediaCardButtonStyle: ButtonStyle {
+    static let outerStrokeWidth: CGFloat = 14
+    static let darkRedStrokeWidth: CGFloat = 11
+    static let accentStrokeWidth: CGFloat = 7
+    static let innerStrokeWidth: CGFloat = 2
+
     func makeBody(configuration: Configuration) -> Body {
         Body(configuration: configuration)
     }
@@ -115,16 +158,33 @@ struct TVMediaCardButtonStyle: ButtonStyle {
         @Environment(\.isFocused) private var isFocused
 
         var body: some View {
+            let shape = RoundedRectangle(cornerRadius: 13, style: .continuous)
             configuration.label
-                .scaleEffect(isFocused ? 1.045 : (configuration.isPressed ? 0.985 : 1))
-                .shadow(color: .black.opacity(isFocused ? 0.6 : 0), radius: 18, y: 10)
-                .overlay(alignment: .top) {
-                    Capsule()
-                        .fill(Palette.accent)
-                        .frame(width: 42, height: 4)
-                        .offset(y: -10)
-                        .opacity(isFocused ? 1 : 0)
+                .background(Palette.bg.opacity(isFocused ? 0.96 : 0), in: shape)
+                .overlay {
+                    ZStack {
+                        shape.stroke(
+                            .black.opacity(0.96),
+                            lineWidth: TVMediaCardButtonStyle.outerStrokeWidth
+                        )
+                        shape.stroke(
+                            Palette.accent.opacity(0.32),
+                            lineWidth: TVMediaCardButtonStyle.darkRedStrokeWidth
+                        )
+                        shape.stroke(
+                            Palette.accent.opacity(0.95),
+                            lineWidth: TVMediaCardButtonStyle.accentStrokeWidth
+                        )
+                        shape.stroke(
+                            .black.opacity(0.88),
+                            lineWidth: TVMediaCardButtonStyle.innerStrokeWidth
+                        )
+                    }
+                    .opacity(isFocused ? 1 : 0)
                 }
+                .scaleEffect(isFocused ? 1.035 : (configuration.isPressed ? 0.985 : 1))
+                .shadow(color: .black.opacity(isFocused ? 0.72 : 0), radius: 19, y: 10)
+                .shadow(color: Palette.accent.opacity(isFocused ? 0.24 : 0), radius: 12)
                 .animation(.easeOut(duration: 0.14), value: isFocused)
                 .animation(.easeOut(duration: 0.08), value: configuration.isPressed)
         }
@@ -159,6 +219,19 @@ extension View {
         #endif
     }
 
+    /// Keeps shelf-header navigation readable under tvOS's tint and focus
+    /// transformations while retaining a simple plain link on touch devices.
+    @ViewBuilder
+    func shelfActionButtonStyle() -> some View {
+        #if os(tvOS)
+        self
+            .buttonStyle(TVShelfActionButtonStyle())
+            .focusEffectDisabled()
+        #else
+        self.buttonStyle(.plain)
+        #endif
+    }
+
     /// Rounded-border text field on iOS; tvOS has no such style (its fields are
     /// focus-driven), so leave the default there.
     @ViewBuilder
@@ -172,15 +245,6 @@ extension View {
 }
 
 // MARK: - Small formatting helpers
-
-func mediaSubtitle(_ item: Item) -> String {
-    if item.kind == "episode", let s = item.seasonNumber, let e = item.episodeNumber {
-        return "S\(s)·E\(e)"
-    }
-    if let y = item.year { return String(y) }
-    if let show = item.showTitle { return show }
-    return item.kind.prefix(1).uppercased() + item.kind.dropFirst()
-}
 
 func progressFraction(_ watch: Watch?, runtimeMs: Int?) -> Double {
     guard let watch, let pos = watch.positionMs else { return 0 }
