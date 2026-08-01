@@ -5,6 +5,7 @@ enum Phase {
     case loading      // checking a saved session on launch
     case needServer   // no server yet, or the saved one is gone
     case needLogin    // server reachable, needs credentials
+    case reconnectFailed // saved credentials are intact; the server is temporarily unreachable
     case ready        // authenticated
 }
 
@@ -92,14 +93,21 @@ final class AppModel: ObservableObject {
             await loadHome()
         } catch APIError.http(let code) where code == 401 || code == 403 {
             Session.shared.token = nil       // token rotated / server reset
+            settings.clearToken()
             phase = .needLogin
         } catch {
             // An offline server or denied LAN permission is not an expired
-            // token. Keep it, and say this is connectivity rather than making
-            // the person re-enter valid credentials under a false diagnosis.
+            // token. Keep it and offer a reconnect instead of presenting a
+            // credential form that cannot solve a network failure.
             authError = "Couldn't reach \(serverName ?? origin). Check Local Network access and the server."
-            phase = .needLogin
+            phase = .reconnectFailed
         }
+    }
+
+    func retrySavedSession() async {
+        authError = nil
+        phase = .loading
+        await bootstrap()
     }
 
     func connect(_ raw: String) async {
