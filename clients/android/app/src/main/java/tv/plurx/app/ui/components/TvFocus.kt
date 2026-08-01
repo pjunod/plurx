@@ -7,10 +7,12 @@ import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LocalMinimumInteractiveComponentSize
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -19,11 +21,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.composed
 import androidx.compose.ui.draw.scale
+import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Shape
-import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.semantics.SemanticsPropertyKey
 import androidx.compose.ui.semantics.SemanticsPropertyReceiver
@@ -93,13 +95,15 @@ fun TvButton(
     content: @Composable RowScope.() -> Unit,
 ) {
     val shape = MaterialTheme.shapes.extraLarge
-    Button(
-        onClick = onClick,
-        modifier = modifier.tvFocusRing(shape),
-        enabled = enabled,
-        shape = shape,
-        content = content,
-    )
+    TightTvButtonFocusBounds {
+        Button(
+            onClick = onClick,
+            modifier = modifier.tvFocusRing(shape),
+            enabled = enabled,
+            shape = shape,
+            content = content,
+        )
+    }
 }
 
 @Composable
@@ -110,13 +114,15 @@ fun TvOutlinedButton(
     content: @Composable RowScope.() -> Unit,
 ) {
     val shape = MaterialTheme.shapes.extraLarge
-    OutlinedButton(
-        onClick = onClick,
-        modifier = modifier.tvFocusRing(shape),
-        enabled = enabled,
-        shape = shape,
-        content = content,
-    )
+    TightTvButtonFocusBounds {
+        OutlinedButton(
+            onClick = onClick,
+            modifier = modifier.tvFocusRing(shape),
+            enabled = enabled,
+            shape = shape,
+            content = content,
+        )
+    }
 }
 
 @Composable
@@ -127,11 +133,26 @@ fun TvTextButton(
     content: @Composable RowScope.() -> Unit,
 ) {
     val shape = MaterialTheme.shapes.extraLarge
-    TextButton(
-        onClick = onClick,
-        modifier = modifier.tvFocusRing(shape),
-        enabled = enabled,
-        shape = shape,
+    TightTvButtonFocusBounds {
+        TextButton(
+            onClick = onClick,
+            modifier = modifier.tvFocusRing(shape),
+            enabled = enabled,
+            shape = shape,
+            content = content,
+        )
+    }
+}
+
+/**
+ * Material buttons paint a 40dp surface inside a 48dp layout touch target. A focus modifier on the
+ * button otherwise outlines that invisible outer layout, leaving a gap around the painted surface.
+ * Android still expands touch hit testing; TV navigation uses the component's focus target.
+ */
+@Composable
+private fun TightTvButtonFocusBounds(content: @Composable () -> Unit) {
+    CompositionLocalProvider(
+        LocalMinimumInteractiveComponentSize provides Dp.Unspecified,
         content = content,
     )
 }
