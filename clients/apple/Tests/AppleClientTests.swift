@@ -78,6 +78,26 @@ final class AppleClientTests: XCTestCase {
         }
     }
 
+    func testPictureInPictureCommandStartsStopsAndWaitsForAvailability() {
+        XCTAssertEqual(
+            PictureInPictureController.command(isActive: false, isPossible: true),
+            .start
+        )
+        XCTAssertEqual(
+            PictureInPictureController.command(isActive: true, isPossible: false),
+            .stop
+        )
+        XCTAssertEqual(
+            PictureInPictureController.command(isActive: false, isPossible: false),
+            .unavailable
+        )
+    }
+
+    func testAppDeclaresBackgroundAudioForPictureInPicture() {
+        let modes = Bundle.main.object(forInfoDictionaryKey: "UIBackgroundModes") as? [String] ?? []
+        XCTAssertTrue(modes.contains("audio"))
+    }
+
     func testCopySessionCanPreserveNegotiatedDolbyVision() throws {
         let request = CreateSessionRequest(
             playbackId: "player-dv",
@@ -116,6 +136,21 @@ final class AppleClientTests: XCTestCase {
     }
 
     #if os(tvOS)
+    func testTVSeriesDetailKeepsCorrectArtworkRatioAndVisibleChildShelf() {
+        XCTAssertEqual(
+            TVSeriesDetailMetrics.posterHeight / TVSeriesDetailMetrics.posterWidth,
+            1.5,
+            accuracy: 0.001
+        )
+        XCTAssertLessThanOrEqual(
+            TVSeriesDetailMetrics.headerHeight + 320,
+            900,
+            "the first row must begin inside the usable area below the tvOS tab bar"
+        )
+        XCTAssertEqual(DetailView.tvSeriesChildStyle(for: "show"), .poster)
+        XCTAssertEqual(DetailView.tvSeriesChildStyle(for: "season"), .episode)
+    }
+
     func testTVActionButtonsRemainReadableWithAndWithoutFocus() {
         for prominent in [false, true] {
             for focused in [false, true] {
