@@ -116,6 +116,21 @@ final class AppleClientTests: XCTestCase {
     }
 
     #if os(tvOS)
+    func testTVSeriesDetailKeepsCorrectArtworkRatioAndVisibleChildShelf() {
+        XCTAssertEqual(
+            TVSeriesDetailMetrics.posterHeight / TVSeriesDetailMetrics.posterWidth,
+            1.5,
+            accuracy: 0.001
+        )
+        XCTAssertLessThanOrEqual(
+            TVSeriesDetailMetrics.headerHeight + 320,
+            900,
+            "the first row must begin inside the usable area below the tvOS tab bar"
+        )
+        XCTAssertEqual(DetailView.tvSeriesChildStyle(for: "show"), .poster)
+        XCTAssertEqual(DetailView.tvSeriesChildStyle(for: "season"), .episode)
+    }
+
     func testTVActionButtonsRemainReadableWithAndWithoutFocus() {
         for prominent in [false, true] {
             for focused in [false, true] {

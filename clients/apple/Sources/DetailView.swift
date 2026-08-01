@@ -26,6 +26,14 @@ struct DetailBodyFrame<Content: View>: View {
     }
 }
 
+#if os(tvOS)
+enum TVSeriesDetailMetrics {
+    static let headerHeight: CGFloat = 460
+    static let posterWidth: CGFloat = 250
+    static let posterHeight: CGFloat = 375
+}
+#endif
+
 struct DetailView: View {
     @EnvironmentObject var model: AppModel
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
@@ -75,6 +83,18 @@ struct DetailView: View {
 
     @ViewBuilder
     private func content(_ detail: ItemDetail) -> some View {
+        #if os(tvOS)
+        if detail.item.kind == "show" || detail.item.kind == "season" {
+            tvSeriesContent(detail)
+        } else {
+            standardContent(detail)
+        }
+        #else
+        standardContent(detail)
+        #endif
+    }
+
+    private func standardContent(_ detail: ItemDetail) -> some View {
         let item = detail.item
         let file = detail.files?.first
         let durationMs = file?.durationMs ?? item.runtimeMs
@@ -82,7 +102,7 @@ struct DetailView: View {
         let nearlyDone = (durationMs ?? 0) > 0 && Double(resumeMs) > Double(durationMs!) * 0.95
         let canResume = resumeMs > 3000 && !nearlyDone
 
-        VStack(alignment: .leading, spacing: 0) {
+        return VStack(alignment: .leading, spacing: 0) {
             ZStack(alignment: .bottom) {
                 AuthImage(path: item.backdrop ?? item.poster)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -150,6 +170,140 @@ struct DetailView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.bottom, 30)
     }
+
+    #if os(tvOS)
+    private func tvSeriesContent(_ detail: ItemDetail) -> some View {
+        let item = detail.item
+        let children = detail.children ?? []
+
+        return VStack(alignment: .leading, spacing: 0) {
+            ZStack {
+                tvSeriesBackground(item)
+
+                HStack(alignment: .top, spacing: 46) {
+                    AuthImage(path: item.poster ?? item.backdrop)
+                        .frame(
+                            width: TVSeriesDetailMetrics.posterWidth,
+                            height: TVSeriesDetailMetrics.posterHeight
+                        )
+                        .clipped()
+                        .background(Palette.surfaceHi)
+                        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                                .stroke(.white.opacity(0.14), lineWidth: 1)
+                        }
+                        .shadow(color: .black.opacity(0.55), radius: 24, y: 14)
+
+                    VStack(alignment: .leading, spacing: 15) {
+                        if let eyebrow = tvSeriesEyebrow(detail) {
+                            Text(eyebrow.uppercased())
+                                .font(.system(.caption, design: .monospaced).weight(.semibold))
+                                .foregroundColor(Palette.accent)
+                        }
+
+                        Text(item.title)
+                            .font(.system(size: 52, weight: .bold))
+                            .foregroundColor(Palette.onBg)
+                            .lineLimit(2)
+                            .fixedSize(horizontal: false, vertical: true)
+
+                        Text(tvSeriesMeta(item, childCount: children.count))
+                            .font(.system(.callout, design: .monospaced))
+                            .foregroundColor(Palette.muted)
+                            .lineLimit(2)
+
+                        if let overview = item.overview, !overview.isEmpty {
+                            Text(overview)
+                                .font(.body)
+                                .foregroundColor(Palette.onBg.opacity(0.82))
+                                .lineSpacing(5)
+                                .lineLimit(5)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+
+                        watchButton(detail)
+
+                        if let actionError {
+                            Text(actionError)
+                                .font(.caption)
+                                .foregroundColor(Palette.accent)
+                        }
+                    }
+                    .frame(maxWidth: 980, alignment: .leading)
+
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 92)
+                .padding(.vertical, 27)
+            }
+            .frame(height: TVSeriesDetailMetrics.headerHeight)
+            .clipped()
+
+            if !children.isEmpty {
+                MediaRow(
+                    title: childrenHeading(item.kind),
+                    items: children,
+                    style: Self.tvSeriesChildStyle(for: item.kind)
+                )
+                .padding(.top, 4)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.bottom, 30)
+    }
+
+    @ViewBuilder
+    private func tvSeriesBackground(_ item: Item) -> some View {
+        if let backdrop = item.backdrop {
+            AuthImage(path: backdrop)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .clipped()
+                .opacity(0.3)
+        } else {
+            Palette.surface
+        }
+
+        LinearGradient(
+            colors: [.black.opacity(0.2), Palette.bg.opacity(0.72), Palette.bg],
+            startPoint: .leading,
+            endPoint: .trailing
+        )
+        LinearGradient(
+            colors: [.clear, Palette.bg],
+            startPoint: .top,
+            endPoint: .bottom
+        )
+    }
+
+    private func tvSeriesEyebrow(_ detail: ItemDetail) -> String? {
+        if detail.item.kind == "season" {
+            return detail.ancestors?.last(where: { $0.kind == "show" })?.title ?? "TV season"
+        }
+        return "TV series"
+    }
+
+    private func tvSeriesMeta(_ item: Item, childCount: Int) -> String {
+        var parts: [String] = []
+        if let year = item.year { parts.append(String(year)) }
+
+        let childName = item.kind == "season" ? "episode" : "season"
+        parts.append("\(childCount) \(childName)\(childCount == 1 ? "" : "s")")
+
+        if let rollup = item.rollup, rollup.leaves > 0 {
+            if rollup.watched == rollup.leaves {
+                parts.append("All \(rollup.leaves) watched")
+            } else {
+                parts.append("\(rollup.watched) of \(rollup.leaves) watched")
+            }
+        }
+        return parts.joined(separator: "   ·   ")
+    }
+
+    static func tvSeriesChildStyle(for kind: String) -> MediaRowStyle {
+        kind == "season" ? .episode : .poster
+    }
+    #endif
 
     private func watchButton(_ detail: ItemDetail) -> some View {
         let watched = isWatched(detail.item)
