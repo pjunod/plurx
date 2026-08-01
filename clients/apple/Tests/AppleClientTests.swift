@@ -422,6 +422,24 @@ final class AppleClientTests: XCTestCase {
         XCTAssertTrue(landscapeShelfNeedsEpisodeSubtitleLine([movie, episode]))
     }
 
+    func testContinueWatchingUsesTwoRowsAndRightAlignedTimeCopy() throws {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let episode = try decoder.decode(
+            Item.self,
+            from: Data(#"{"id":1,"kind":"episode","title":"Fray","show_title":"FROM","season_number":4,"episode_number":2,"watch":{"position_ms":600000,"duration_ms":3240000}}"#.utf8)
+        )
+        let movie = try decoder.decode(
+            Item.self,
+            from: Data(#"{"id":2,"kind":"movie","title":"TRON: Ares","year":2025,"watch":{"position_ms":300000,"duration_ms":7200000}}"#.utf8)
+        )
+
+        XCTAssertEqual(continueWatchingDetail(episode), "S4 E2 · Fray")
+        XCTAssertEqual(continueWatchingTimeRemaining(episode), "44m left")
+        XCTAssertEqual(continueWatchingDetail(movie), "2025")
+        XCTAssertEqual(continueWatchingTimeRemaining(movie), "115m left")
+    }
+
     private func contrastRatio(_ foreground: Color, _ background: Color) -> CGFloat {
         let lighter = max(relativeLuminance(foreground), relativeLuminance(background))
         let darker = min(relativeLuminance(foreground), relativeLuminance(background))

@@ -130,40 +130,10 @@ struct LandscapeCard: View {
                 }
             }
             VStack(alignment: .leading, spacing: 5) {
-                Text(landscapeCardShowTitle(item) ?? item.title)
-                    #if os(tvOS)
-                    .font(.callout.weight(.semibold))
-                    #else
-                    .font(.headline.weight(.semibold))
-                    #endif
-                    .foregroundColor(Palette.onBg)
-                    .lineLimit(1)
-
-                if landscapeCardShowTitle(item) != nil {
-                    Text(item.title)
-                        .font(.caption)
-                        .foregroundColor(Palette.muted)
-                        .lineLimit(1)
-                }
-
-                let metadata = cardShelfMetadata(item)
-                if !metadata.isEmpty {
-                    Text(metadata)
-                        .font(.system(.caption2, design: .rounded).weight(.medium))
-                        .foregroundColor(Palette.muted)
-                        .lineLimit(1)
+                if copyStyle == .accentPanel {
+                    continueWatchingCopy
                 } else {
-                    Text("Metadata")
-                        .font(.system(.caption2, design: .rounded).weight(.medium))
-                        .hidden()
-                        .accessibilityHidden(true)
-                }
-
-                if landscapeCardShowTitle(item) == nil, reservesEpisodeSubtitleLine {
-                    Text("Episode title")
-                        .font(.caption)
-                        .hidden()
-                        .accessibilityHidden(true)
+                    standardLandscapeCopy
                 }
             }
             .padding(.horizontal, copyStyle == .accentPanel ? 10 : 0)
@@ -189,6 +159,74 @@ struct LandscapeCard: View {
             }
         }
         .frame(width: width, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private var continueWatchingCopy: some View {
+        Text(landscapeCardShowTitle(item) ?? item.title)
+            #if os(tvOS)
+            .font(.callout.weight(.semibold))
+            #else
+            .font(.headline.weight(.semibold))
+            #endif
+            .foregroundColor(Palette.onBg)
+            .lineLimit(1)
+
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            let detail = continueWatchingDetail(item)
+            if !detail.isEmpty {
+                Text(detail)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 8)
+            if let remaining = continueWatchingTimeRemaining(item) {
+                Text(remaining)
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .multilineTextAlignment(.trailing)
+            }
+        }
+        .font(.system(.caption2, design: .rounded).weight(.medium))
+        .foregroundColor(Palette.muted)
+    }
+
+    @ViewBuilder
+    private var standardLandscapeCopy: some View {
+        Text(landscapeCardShowTitle(item) ?? item.title)
+            #if os(tvOS)
+            .font(.callout.weight(.semibold))
+            #else
+            .font(.headline.weight(.semibold))
+            #endif
+            .foregroundColor(Palette.onBg)
+            .lineLimit(1)
+
+        if landscapeCardShowTitle(item) != nil {
+            Text(item.title)
+                .font(.caption)
+                .foregroundColor(Palette.muted)
+                .lineLimit(1)
+        }
+
+        let metadata = cardShelfMetadata(item)
+        if !metadata.isEmpty {
+            Text(metadata)
+                .font(.system(.caption2, design: .rounded).weight(.medium))
+                .foregroundColor(Palette.muted)
+                .lineLimit(1)
+        } else {
+            Text("Metadata")
+                .font(.system(.caption2, design: .rounded).weight(.medium))
+                .hidden()
+                .accessibilityHidden(true)
+        }
+
+        if landscapeCardShowTitle(item) == nil, reservesEpisodeSubtitleLine {
+            Text("Episode title")
+                .font(.caption)
+                .hidden()
+                .accessibilityHidden(true)
+        }
     }
 }
 
@@ -456,6 +494,24 @@ private func timeRemaining(_ item: Item) -> String? {
           duration > position else { return nil }
     let minutes = max(1, (duration - position) / 60_000)
     return "\(minutes)m left"
+}
+
+/// Continue Watching uses exactly two visible copy rows. Episodes combine
+/// their season/episode number and title on the lower row; movies use the year.
+func continueWatchingDetail(_ item: Item) -> String {
+    if landscapeCardShowTitle(item) != nil {
+        var parts: [String] = []
+        if let season = item.seasonNumber, let episode = item.episodeNumber {
+            parts.append("S\(season) E\(episode)")
+        }
+        parts.append(item.title)
+        return parts.joined(separator: " · ")
+    }
+    return item.year.map(String.init) ?? ""
+}
+
+func continueWatchingTimeRemaining(_ item: Item) -> String? {
+    timeRemaining(item)
 }
 
 /// The shelf's lower line should identify the item, not repeat its library
