@@ -238,6 +238,11 @@ final class AppleClientTests: XCTestCase {
     func testTVHomeStartsWithMediaRailsInsteadOfAFeaturedBillboard() {
         XCTAssertFalse(HomeLayoutPolicy.usesFeaturedHero)
         XCTAssertEqual(HomeLayoutPolicy.continueWatchingCopyStyle, .accentPanel)
+        XCTAssertEqual(
+            HomeLayoutPolicy.topLevelTabs,
+            ["Home", "Libraries", "Search", "Settings"]
+        )
+        XCTAssertFalse(HomeLayoutPolicy.showsLibraryShelvesOnHome)
         XCTAssertLessThanOrEqual(LandscapeAccentPanelMetrics.fillOpacity, 0.06)
         XCTAssertLessThanOrEqual(LandscapeAccentPanelMetrics.strokeOpacity, 0.18)
         XCTAssertLessThanOrEqual(LandscapeAccentPanelMetrics.strokeWidth, 0.5)

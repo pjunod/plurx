@@ -31,24 +31,10 @@ struct HomeView: View {
             .tabItem { Label("Home", systemImage: "house") }
 
             NavigationStack {
-                if let movies = model.collection(kind: "movie") {
-                    LibraryView(collection: movies)
-                        .appDestinations()
-                } else {
-                    EmptyLibraryCategory(title: "Movies")
-                }
+                LibrariesDashboard()
+                    .appDestinations()
             }
-            .tabItem { Label("Movies", systemImage: "film") }
-
-            NavigationStack {
-                if let shows = model.collection(kind: "show") {
-                    LibraryView(collection: shows)
-                        .appDestinations()
-                } else {
-                    EmptyLibraryCategory(title: "TV Shows")
-                }
-            }
-            .tabItem { Label("TV", systemImage: "tv") }
+            .tabItem { Label("Libraries", systemImage: "rectangle.stack") }
 
             NavigationStack {
                 SearchView()
@@ -70,23 +56,8 @@ struct HomeView: View {
             HomeDashboard()
                 .tabItem { Label("Home", systemImage: "house") }
 
-            Group {
-                if let movies = model.collection(kind: "movie") {
-                    LibraryView(collection: movies)
-                } else {
-                    EmptyLibraryCategory(title: "Movies")
-                }
-            }
-            .tabItem { Label("Movies", systemImage: "film") }
-
-            Group {
-                if let shows = model.collection(kind: "show") {
-                    LibraryView(collection: shows)
-                } else {
-                    EmptyLibraryCategory(title: "TV Shows")
-                }
-            }
-            .tabItem { Label("TV", systemImage: "tv") }
+            LibrariesDashboard()
+                .tabItem { Label("Libraries", systemImage: "rectangle.stack") }
 
             SearchView()
                 .tabItem { Label("Search", systemImage: "magnifyingglass") }
@@ -205,32 +176,81 @@ private struct HomeDashboard: View {
         )
         ComingSoonRow(entries: model.comingSoon)
 
-        if !model.libraries.isEmpty {
-            libraryHeading
-            ForEach(model.libraryCollections()) { collection in
-                MediaRow(
-                    title: collection.title,
-                    items: model.previewItems(for: collection),
-                    collection: collection,
-                    destination: collection
-                )
-            }
-        }
-
-        if featured == nil && model.libraries.isEmpty {
+        if featured == nil,
+           (model.hubs.nextUp ?? []).isEmpty,
+           model.comingSoon.isEmpty {
             ContentUnavailableView(
-                "Your library is empty",
-                systemImage: "rectangle.stack",
-                description: Text("Add a library in the plurx web app, then pull to refresh.")
+                "Nothing new yet",
+                systemImage: "house",
+                description: Text("Continue watching, recently added titles, and upcoming releases will appear here.")
             )
             .frame(maxWidth: .infinity)
             .padding(.top, 80)
         }
     }
+}
+
+enum HomeLayoutPolicy {
+    static let continueWatchingCopyStyle: LandscapeCardCopyStyle = .accentPanel
+    static let topLevelTabs = ["Home", "Libraries", "Search", "Settings"]
+    static let showsLibraryShelvesOnHome = false
+
+    #if os(tvOS)
+    static let usesFeaturedHero = false
+    #else
+    static let usesFeaturedHero = true
+    #endif
+}
+
+private struct LibrariesDashboard: View {
+    @EnvironmentObject var model: AppModel
+
+    var body: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 12) {
+                if model.homeLoading {
+                    ProgressView()
+                        .tint(Palette.accent)
+                        .frame(maxWidth: .infinity)
+                        .padding(.top, 80)
+                } else if let error = model.homeError {
+                    ContentUnavailableView(
+                        "Server unavailable",
+                        systemImage: "exclamationmark.triangle",
+                        description: Text(error)
+                    )
+                } else if model.libraries.isEmpty {
+                    ContentUnavailableView(
+                        "Your library is empty",
+                        systemImage: "rectangle.stack",
+                        description: Text("Add a library in the plurx web app, then pull to refresh.")
+                    )
+                    .frame(maxWidth: .infinity)
+                    .padding(.top, 80)
+                } else {
+                    libraryHeading
+                    ForEach(model.libraryCollections()) { collection in
+                        MediaRow(
+                            title: collection.title,
+                            items: model.previewItems(for: collection),
+                            collection: collection,
+                            destination: collection
+                        )
+                    }
+                }
+            }
+            .padding(.bottom, 36)
+        }
+        .background(Palette.bg.ignoresSafeArea())
+        #if os(iOS)
+        .toolbar(.hidden, for: .navigationBar)
+        .refreshable { await model.loadHome() }
+        #endif
+    }
 
     private var libraryHeading: some View {
         HStack {
-            Text("Browse")
+            Text("Libraries")
                 .font(.title3.weight(.semibold))
                 .foregroundColor(Palette.onBg)
             Spacer()
@@ -250,16 +270,6 @@ private struct HomeDashboard: View {
         .padding(.horizontal, screenHPad)
         .padding(.top, 18)
     }
-}
-
-enum HomeLayoutPolicy {
-    static let continueWatchingCopyStyle: LandscapeCardCopyStyle = .accentPanel
-
-    #if os(tvOS)
-    static let usesFeaturedHero = false
-    #else
-    static let usesFeaturedHero = true
-    #endif
 }
 
 private struct FeaturedHero: View {
