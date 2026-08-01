@@ -171,6 +171,31 @@ final class AppleClientTests: XCTestCase {
         XCTAssertEqual(DetailView.tvSeriesChildStyle(for: "season"), .episode)
     }
 
+    func testTVPlayableDetailUsesOneCinematicViewportAndUsefulMetadata() throws {
+        XCTAssertLessThanOrEqual(
+            TVPlayableDetailMetrics.heroHeight,
+            720,
+            "title, synopsis, and actions must remain visible below the tvOS tab bar"
+        )
+        XCTAssertGreaterThanOrEqual(TVPlayableDetailMetrics.copyWidth, 800)
+
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let item = try decoder.decode(
+            Item.self,
+            from: Data(#"{"id":7,"kind":"episode","title":"Fray","year":2026,"season_number":4,"episode_number":2,"runtime_ms":3245000}"#.utf8)
+        )
+        let file = try decoder.decode(
+            MediaFile.self,
+            from: Data(#"{"id":11,"duration_ms":3245000,"container":"mkv","video_codec":"hevc","height":2160}"#.utf8)
+        )
+
+        XCTAssertEqual(
+            DetailView.tvPlayableMetadata(item, file: file, durationMs: file.durationMs),
+            "S4 E2   ·   2026   ·   54m   ·   4K   ·   HEVC   ·   MKV"
+        )
+    }
+
     func testTVActionButtonsRemainReadableWithAndWithoutFocus() {
         for prominent in [false, true] {
             for focused in [false, true] {
