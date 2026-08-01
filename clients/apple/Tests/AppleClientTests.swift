@@ -305,8 +305,8 @@ final class AppleClientTests: XCTestCase {
         XCTAssertLessThanOrEqual(PlayerMetadataBadgeMetrics.horizontalPadding, 6)
         XCTAssertLessThanOrEqual(PlayerMetadataBadgeMetrics.verticalPadding, 2)
 
-        // Resolution tiers use the short edge, so a source whose dimensions
-        // arrive in portrait/orientation order is still 1080p, not 1920p.
+        // Resolution tiers use both edges, so orientation ordering cannot turn
+        // 1080p into 1920p and cropped scope masters retain their 4K tier.
         var orientationOrderedSource = source
         orientationOrderedSource.width = 1080
         orientationOrderedSource.height = 1920
@@ -314,6 +314,14 @@ final class AppleClientTests: XCTestCase {
         XCTAssertEqual(
             PlayerView.playbackFacts(source: orientationOrderedSource, audio: nil),
             ["1080p"]
+        )
+        var scope4KSource = source
+        scope4KSource.width = 3840
+        scope4KSource.height = 1608
+        scope4KSource.hdrFormat = nil
+        XCTAssertEqual(
+            PlayerView.playbackFacts(source: scope4KSource, audio: nil),
+            ["4K"]
         )
     }
 

@@ -5,6 +5,20 @@ import Foundation
 import MediaPlayer
 #endif
 
+private enum PlaybackPreparationError: LocalizedError {
+    case timedOut
+    case failed
+
+    var errorDescription: String? {
+        switch self {
+        case .timedOut:
+            return "The video took too long to prepare. Check that the Plurx server is reachable."
+        case .failed:
+            return "The video stream could not be prepared. Check the server and try again."
+        }
+    }
+}
+
 /// Drives one AVPlayer and executes the server-owned delivery plan. It also
 /// supplies the controls AVPlayer withholds for a growing EVENT playlist: an
 /// explicit on-demand timeline, reliable play/pause commands, server playback
@@ -36,6 +50,7 @@ final class PlayerController: ObservableObject {
     private weak var model: AppModel?
     private var timeObserver: Any?
     private var endObserver: NSObjectProtocol?
+    private var itemStatusObservation: NSKeyValueObservation?
     private var statusTask: Task<Void, Never>?
     private var started = false
     private var sessionId: String?
@@ -97,9 +112,13 @@ final class PlayerController: ObservableObject {
         self.knownDurationMs = durationMs
         self.title = title
 
+        #if os(iOS)
+        // iOS needs an explicit playback audio session for silent-switch and
+        // background/PiP behavior. Activating it on tvOS was a regression:
+        // Apple TV owns the output route and AVPlayer can remain waiting even
+        // though the item and server are healthy.
         try? AVAudioSession.sharedInstance().setCategory(.playback)
         try? AVAudioSession.sharedInstance().setActive(true)
-        #if os(iOS)
         installRemoteCommands()
         #endif
 
@@ -180,6 +199,7 @@ final class PlayerController: ObservableObject {
             NotificationCenter.default.removeObserver(endObserver)
             self.endObserver = nil
         }
+        itemStatusObservation = nil
         statusTask?.cancel()
         statusTask = nil
         let position = realPositionMs()
@@ -226,7 +246,12 @@ final class PlayerController: ObservableObject {
     }
 
     private func reopen(at position: Int) async {
-        guard let decision else { return }
+        // A growing EVENT playlist can momentarily announce its current end,
+        // and several UI actions can also request a restart. Never overlap two
+        // server-session replacements: they share a playback ID, so the newer
+        // request intentionally removes the older session and can otherwise
+        // strand AVPlayer on a URL the server has just deleted.
+        guard let decision, started, !isChangingStream else { return }
         do {
             try await open(decision: decision, at: position)
         } catch {
@@ -235,11 +260,16 @@ final class PlayerController: ObservableObject {
     }
 
     private func open(decision: Decision, at startMs: Int) async throws {
-        guard let model else { return }
+        guard let model, started else { return }
         isChangingStream = true
+        failed = false
         playbackError = nil
         player.pause()
         await releaseCurrentSession()
+        guard started else {
+            isChangingStream = false
+            return
+        }
 
         let normalMode = decision.delivery?.mode ?? Self.legacyMode(decision.method)
         let forceTranscode = selectedSubtitle != nil || selectedHeight != nil
@@ -277,6 +307,11 @@ final class PlayerController: ObservableObject {
                 preserveDolbyVision: copy ? (decision.preserveDolbyVision ?? false) : nil
             )
             let hls = try await model.createHlsSession(fileId: fileId, body: body)
+            guard started else {
+                await model.endHlsSession(hls.sessionId)
+                isChangingStream = false
+                return
+            }
             sessionId = hls.sessionId
             encoder = hls.encoder
             isVOD = hls.vod ?? false
@@ -302,11 +337,17 @@ final class PlayerController: ObservableObject {
         item.externalMetadata = [titleMetadata(title)]
         #endif
         observeEnd(of: item)
+        observeStatus(of: item)
         player.replaceCurrentItem(with: item)
-        if let seekAfterAttach { await seekWhenReady(item, ms: seekAfterAttach) }
+        // Start loading/playing immediately. Previously a resume point gated
+        // this call behind item readiness and could leave tvOS permanently
+        // presenting a stopped transport.
         player.play()
         isPlaying = true
+        if let seekAfterAttach { try await seekWhenReady(item, ms: seekAfterAttach) }
+        player.play()
         currentMs = startMs
+        failed = false
         isChangingStream = false
         updateNowPlaying()
     }
@@ -333,7 +374,7 @@ final class PlayerController: ObservableObject {
 
     private func fail(_ error: Error) {
         isChangingStream = false
-        failed = player.currentItem == nil
+        failed = player.currentItem == nil || error is PlaybackPreparationError
         playbackError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
     }
 
@@ -370,7 +411,11 @@ final class PlayerController: ObservableObject {
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor in
-                guard let self else { return }
+                guard let self,
+                      self.started,
+                      !self.isChangingStream,
+                      self.player.currentItem === item
+                else { return }
                 self.isPlaying = false
                 let endedAt = self.realPositionMs()
                 // A growing EVENT playlist can momentarily end before the
@@ -387,6 +432,21 @@ final class PlayerController: ObservableObject {
         }
     }
 
+    private func observeStatus(of item: AVPlayerItem) {
+        itemStatusObservation = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
+            guard item.status == .failed else { return }
+            Task { @MainActor in
+                guard let self, self.player.currentItem === item else { return }
+                self.player.pause()
+                self.isPlaying = false
+                self.isChangingStream = false
+                self.failed = true
+                self.playbackError = item.error?.localizedDescription
+                    ?? PlaybackPreparationError.failed.localizedDescription
+            }
+        }
+    }
+
     private func report(_ position: Int) {
         guard position > 0 else { return }
         let duration = knownDurationMs > 0 ? knownDurationMs : nil
@@ -395,18 +455,31 @@ final class PlayerController: ObservableObject {
         Task { await model?.reportProgress(itemId: itemId, positionMs: position, durationMs: duration) }
     }
 
-    private func seekWhenReady(_ item: AVPlayerItem, ms: Int) async {
-        for await status in item.publisher(for: \.status).values {
-            if status == .readyToPlay {
-                _ = await player.seek(
-                    to: CMTime(seconds: Double(ms) / 1000.0, preferredTimescale: 600),
-                    toleranceBefore: .zero,
-                    toleranceAfter: .zero
-                )
-                return
-            }
-            if status == .failed { return }
+    private func seekWhenReady(_ item: AVPlayerItem, ms: Int) async throws {
+        // AVPlayerItem's KVO publisher is not guaranteed to deliver another
+        // value when a tvOS network request stalls. The old unbounded
+        // `for await` consequently held the initial `play()` forever and left
+        // the transport looking paused. Poll the authoritative status with a
+        // finite deadline so playback either resumes or surfaces a useful
+        // connection error.
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(15))
+        while item.status == .unknown {
+            try Task.checkCancellation()
+            guard clock.now < deadline else { throw PlaybackPreparationError.timedOut }
+            try await Task.sleep(for: .milliseconds(100))
         }
+
+        if item.status == .failed {
+            throw item.error ?? PlaybackPreparationError.failed
+        }
+        guard item.status == .readyToPlay else { throw PlaybackPreparationError.failed }
+
+        _ = await player.seek(
+            to: CMTime(seconds: Double(ms) / 1000.0, preferredTimescale: 600),
+            toleranceBefore: .zero,
+            toleranceAfter: .zero
+        )
     }
 
     private func applyLanguagePrefs(audio: String, sub: String) {

@@ -73,6 +73,10 @@
   .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:24px}
   .auth{width:100%;max-width:380px}
   .auth h1{margin:.2em 0 .1em}
+  .connectqr{margin-top:14px;border-top:1px solid var(--line);padding-top:12px;text-align:center}
+  .connectqr summary{cursor:pointer;color:var(--muted);font-size:13px;font-weight:600}
+  .connectqr img{display:block;width:220px;max-width:100%;height:auto;margin:12px auto 8px;background:#fff;border-radius:10px}
+  .connectqr p{font-size:11.5px;line-height:1.45;margin:6px 0;color:var(--muted)}
 
   h2.section{font-size:16px;font-weight:600;text-transform:uppercase;letter-spacing:.07em;color:var(--text);margin:26px 4px 14px;padding-top:24px;border-top:1px solid var(--line)}
   h2.section:first-child{border-top:0;padding-top:4px}
@@ -329,12 +333,13 @@
     color:#fff;pointer-events:none;transition:opacity .2s ease-out;text-shadow:0 1px 5px rgba(0,0,0,.85)}
   .player.idle .pinfo{opacity:0}
   .pinfo.off,.pinfo:empty{display:none}
-  .pinfo h3{margin:0 0 5px;font-size:21px;font-weight:650;letter-spacing:.01em;line-height:1.2}
-  .pinfo .pimeta{font-size:12.5px;opacity:.82;margin-bottom:6px}
+  .pinfo h3{margin:0 0 4px;font-size:18px;font-weight:650;letter-spacing:.01em;line-height:1.2}
+  .pinfo .pimeta{font-size:11.5px;opacity:.82;margin-bottom:5px}
   .pinfo .pimeta i{font-style:normal;opacity:.45;padding:0 7px}
-  .pinfo p{margin:0;font-size:13.5px;line-height:1.5;opacity:.88;
+  .pinfo .pifacts{margin:0 0 5px}
+  .pinfo p{margin:0;font-size:12px;line-height:1.45;opacity:.88;
     display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
-  @media(max-width:700px){ .pinfo{max-width:none;bottom:78px} .pinfo h3{font-size:17px} .pinfo p{-webkit-line-clamp:2} }
+  @media(max-width:700px){ .pinfo{max-width:none;bottom:78px} .pinfo h3{font-size:16px} .pinfo p{-webkit-line-clamp:2} }
   /* Recovery buttons inside the loading overlay: a diagnosed stall gets an
      action, not just a verdict. */
   .ploadAct{display:flex;gap:10px;flex-wrap:wrap;justify-content:center}
@@ -607,9 +612,10 @@
   .chip.res{color:#8fd0ff;border-color:#254458;background:#0f1e29}
   /* video-type badges (codec / resolution / HDR·DV / audio), color-coded and
      theme-aware via color-mix so they read on light and dark */
-  .vbadges{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
-  .vbadge{display:inline-flex;align-items:center;font-size:11px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;
-    padding:3px 8px;border-radius:6px;border:1px solid var(--line);background:var(--panel2);color:var(--text);white-space:nowrap}
+  .vbadges{display:flex;gap:5px;flex-wrap:wrap;align-items:center}
+  .vbadge{display:inline-flex;align-items:center;gap:4px;font-size:10px;font-weight:700;letter-spacing:.035em;text-transform:uppercase;
+    padding:2px 6px;border-radius:999px;border:1px solid var(--line);background:var(--panel2);color:var(--text);white-space:nowrap}
+  .vbadge .material-icon{width:13px;height:13px;fill:currentColor;flex:0 0 auto}
   .vbadge.res{color:var(--accent);border-color:color-mix(in srgb,var(--accent) 42%,transparent);background:color-mix(in srgb,var(--accent) 13%,transparent)}
   .vbadge.codec{color:var(--muted)}
   .vbadge.depth{color:var(--muted)}
@@ -1240,7 +1246,12 @@ function renderSetup(){
 function renderLogin(){
   authShell("Sign in","Welcome back.",
     `<label>Username</label><input id="u" autocomplete="username" required>
-     <label>Password</label><input id="p" type="password" autocomplete="current-password" required>`,
+     <label>Password</label><input id="p" type="password" autocomplete="current-password" required>
+     <details class="connectqr"><summary>Connect an app with a QR code</summary>
+       <img src="/connect.svg?origin=${encodeURIComponent(location.origin)}" alt="QR code for ${esc(location.origin)}">
+       <p>Scan this from the Plurx iPhone, iPad, or Android app to add this server.</p>
+       <p>The code contains only the server address. Sign in inside the app with your usual account.</p>
+     </details>`,
     "Sign in", async()=>{
       const r=await api("/auth/login",{method:"POST",body:{username:u.value.trim(),password:p.value,device:"Web"}});
       TOKEN=r.token; localStorage.setItem("plurx_token",TOKEN); ME=r.user; location.hash="#/"; render();
@@ -2006,17 +2017,29 @@ function fmtChannels(n){ return n===8?"7.1":n===7?"6.1":n===6?"5.1":n===2?"2.0":
 function fmtMbps(bps){ return bps? (bps>=1000000? (bps/1000000).toFixed(bps>=10000000?0:1)+" Mb/s" : Math.round(bps/1000)+" kb/s") : ""; }
 function fmtBytes(n){ if(!n) return ""; const u=["B","KB","MB","GB"]; let i=0; while(n>=1024&&i<u.length-1){ n/=1024; i++; } return (i?n.toFixed(n>=10?0:1):Math.round(n))+" "+u[i]; }
 function audioLabel(a){ return [a.codec&&a.codec.toUpperCase(), fmtChannels(a.channels), a.language].filter(Boolean).join(" · "); }
+// Apache-2.0 Google Material icon paths. Inline SVG keeps the self-hosted web
+// client usable without a font or CDN connection.
+function mediaIcon(kind){
+  const paths={
+    resolution:'M21 3H3c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h5v2h8v-2h5c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 14H3V5h18v12z',
+    video:'M18 4l2 4h-3l-2-4h-2l2 4h-3l-2-4H8l2 4H7L5 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V4h-4z',
+    dynamic:'m19 9 1.25-2.75L23 5l-2.75-1.25L19 1l-1.25 2.75L15 5l2.75 1.25L19 9zm-7.5.5L9 4 6.5 9.5 1 12l5.5 2.5L9 20l2.5-5.5L17 12l-5.5-2.5zM19 15l-1.25 2.75L15 19l2.75 1.25L19 23l1.25-2.75L23 19l-2.75-1.25L19 15z',
+    audio:'M7 18h2V6H7v12zm-4-4h2v-4H3v4zm8 8h2V2h-2v20zm4-4h2V6h-2v12zm4-8v4h2v-4h-2z'
+  };
+  return `<svg class="material-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="${paths[kind]||paths.video}"></path></svg>`;
+}
 // Video-type badges from a file's probed specs. hdr_format carries the rich
 // label (Dolby Vision profile etc.); DV gets its own gold badge.
-// Key off WIDTH primarily: scope/'Scope 4K is only ~1600–2076 tall (3840×2076),
-// so a height-only test wrongly calls it 1080p.
+// Use both edges so portrait metadata such as 1080×1920 stays 1080p,
+// while a cropped 3840×1608 scope encode still identifies as 2160p.
 function resLabel(w,h){ w=w||0; h=h||0;
-  if(w>=3000||h>=1700) return '2160p';
-  if(w>=2000||h>=1300) return '1440p';
-  if(w>=1400||h>=900) return '1080p';
-  if(w>=1000||h>=650) return '720p';
-  if(w>=600||h>=400) return '480p';
-  return h?h+'p':null; }
+  const short=w&&h?Math.min(w,h):(h||w), long=w&&h?Math.max(w,h):short;
+  if(long>=3200||short>=1700) return '2160p';
+  if(long>=2300||short>=1300) return '1440p';
+  if(long>=1600||short>=900) return '1080p';
+  if(long>=1100||short>=650) return '720p';
+  if(long>=700||short>=400) return '480p';
+  return short?short+'p':null; }
 function codecLabel(c){ if(!c) return null; return ({hevc:'HEVC',h265:'HEVC',h264:'H.264',avc1:'H.264',av1:'AV1',vp9:'VP9',vc1:'VC-1',mpeg2video:'MPEG-2'})[c.toLowerCase()]||c.toUpperCase(); }
 // Badges stay terse: "Dolby Vision · Profile 7 (HDR10-compatible)" → "DV P7"
 // (the spelled-out string lives in the Video detail row and the hover title).
@@ -2036,12 +2059,35 @@ function premiumAudio(f){ const cs=(f.audio_streams||[]).map(a=>(a.codec||'').to
   return null; }
 function specBadges(f){
   const b=[];
-  const r=resLabel(f.width,f.height); if(r) b.push(`<span class="vbadge res">${r}</span>`);
-  const c=codecLabel(f.video_codec); if(c) b.push(`<span class="vbadge codec">${esc(c)}</span>`);
+  const r=resLabel(f.width,f.height); if(r) b.push(`<span class="vbadge res">${mediaIcon('resolution')}${r}</span>`);
+  const c=codecLabel(f.video_codec); if(c) b.push(`<span class="vbadge codec">${mediaIcon('video')}${esc(c)}</span>`);
   if(f.bit_depth>=10) b.push(`<span class="vbadge depth">${f.bit_depth}-bit</span>`);
-  const h=hdrChip(f); if(h) b.push(`<span class="vbadge ${h.cls}" title="${esc(h.full||h.text)}">${esc(h.text)}</span>`);
-  const au=premiumAudio(f); if(au) b.push(`<span class="vbadge audio">${esc(au)}</span>`);
+  const h=hdrChip(f); if(h) b.push(`<span class="vbadge ${h.cls}" title="${esc(h.full||h.text)}">${mediaIcon('dynamic')}${esc(h.text)}</span>`);
+  const au=premiumAudio(f); if(au) b.push(`<span class="vbadge audio">${mediaIcon('audio')}${esc(au)}</span>`);
   return b.join("");
+}
+function playbackAudioChip(a){
+  if(!a) return null;
+  const codec=(a.codec||'').toLowerCase(), title=a.title||'';
+  let mark='', full='';
+  if(/atmos/i.test(title)){ mark='ATMOS'; full='Dolby Atmos'; }
+  else if(codec==='eac3'||codec==='e-ac-3'){ mark='DD+'; full='Dolby Digital Plus'; }
+  else if(codec==='ac3'||codec==='ac-3'){ mark='DD'; full='Dolby Digital'; }
+  else if(codec==='truehd'){ mark='TRUEHD'; full='Dolby TrueHD'; }
+  else if(codec==='dts'||codec==='dca'){ mark='DTS'; full='DTS'; }
+  else if(codec){ mark=codec.toUpperCase(); full=mark; }
+  if(!mark) return null;
+  const channels=fmtChannels(a.channels), text=[mark,channels].filter(Boolean).join(' ');
+  return {text,full:[full,channels].filter(Boolean).join(' ')};
+}
+function playerFactBadges(){
+  if(!PLAYER) return '';
+  const s=PLAYER.source||{}, b=[];
+  const r=resLabel(s.width,s.height); if(r) b.push(`<span class="vbadge res">${mediaIcon('resolution')}${r}</span>`);
+  const h=hdrChip(s); if(h) b.push(`<span class="vbadge ${h.cls}" title="${esc(h.full||h.text)}">${mediaIcon('dynamic')}${esc(h.text)}</span>`);
+  const au=playbackAudioChip(PLAYER.audio&&PLAYER.audio[PLAYER.curAudio]);
+  if(au) b.push(`<span class="vbadge audio" title="${esc(au.full)}">${mediaIcon('audio')}${esc(au.text)}</span>`);
+  return b.join('');
 }
 function specBlock(f){
   const vid=[f.video_codec&&f.video_codec.toUpperCase(),(f.width&&f.height)?`${f.width}×${f.height}`:null,(f.hdr_format||f.hdr),f.bit_depth?`${f.bit_depth}-bit`:null,fmtMbps(f.bitrate)].filter(Boolean).join(" · ");
@@ -3931,7 +3977,9 @@ function renderPlayerInfo(){
   if(m.air_date) bits.push(esc(fmtDate(m.air_date)));
   else if(m.year) bits.push(String(m.year));
   if(m.runtime_ms) bits.push(fmtDur(m.runtime_ms));
+  const facts=playerFactBadges();
   c.innerHTML=`<h3>${head.join(' <i>·</i> ')}</h3>`
+    +(facts?`<div class="vbadges pifacts">${facts}</div>`:``)
     +(bits.length?`<div class="pimeta">${bits.join(' <i>·</i> ')}</div>`:``)
     +(m.overview?`<p>${esc(m.overview)}</p>`:``);
 }
@@ -4691,6 +4739,7 @@ async function switchAudio(idx){
   const m=document.getElementById("pmenu"); if(m) m.classList.remove("on");
   if(idx===PLAYER.curAudio) return;
   PLAYER.curAudio=idx;
+  renderPlayerInfo();
   const v=document.getElementById("video");
   const pos=(PLAYER.offset||0)+(v.currentTime||0);
   const track=PLAYER.audio[idx]; const aidx=track?track.index:idx;

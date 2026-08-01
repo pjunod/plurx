@@ -61,6 +61,7 @@ clap = { version = "4", features = ["derive", "env"] }
 # playhead (plurxd only, and only on the platforms plurxd runs on).
 libc = "0.2"
 uuid = { version = "1", features = ["v4"] }
+qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
 # Dev
 tempfile = "3"
 http-body-util = "0.1"

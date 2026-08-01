@@ -162,6 +162,7 @@ pub fn router(state: AppState) -> Router {
         // `/` serves the web app for browsers, Plex capabilities for Plex clients.
         .route("/", get(root_dispatch))
         .route("/assets/hls.min.js", get(web::hls_js))
+        .route("/connect.svg", get(web::connect_qr))
         // PWA install assets + the sideloadable Android APK.
         .route("/manifest.webmanifest", get(web::manifest))
         .route("/icons/{file}", get(web::icon))

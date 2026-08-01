@@ -56,6 +56,7 @@ import tv.plurx.app.data.Item
 import tv.plurx.app.data.ItemDetail
 import tv.plurx.app.data.MediaFileDto
 import tv.plurx.app.ui.components.LoadingBox
+import tv.plurx.app.ui.components.MediaFactChip
 import tv.plurx.app.ui.components.NetworkImage
 import tv.plurx.app.ui.components.PosterCard
 import tv.plurx.app.ui.components.RequestInitialFocus
@@ -65,6 +66,7 @@ import tv.plurx.app.ui.components.TvOutlinedButton
 import tv.plurx.app.ui.components.TvTextButton
 import tv.plurx.app.ui.components.formatTime
 import tv.plurx.app.ui.components.imageUrl
+import tv.plurx.app.ui.components.detailMediaFacts
 import tv.plurx.app.ui.components.tvFocusRing
 import tv.plurx.app.ui.theme.Accent
 import tv.plurx.app.ui.theme.Bg
@@ -445,8 +447,10 @@ private fun VersionCard(file: MediaFileDto, showPlay: Boolean, onPlay: () -> Uni
             if (!file.available) SpecChip("Missing", MaterialTheme.colorScheme.error)
             if (showPlay) TvOutlinedButton(onClick = onPlay) { Text("Play") }
         }
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            videoBadges(file).forEach { SpecChip(it) }
+        LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            items(detailMediaFacts(file), key = { it.kind }) { fact ->
+                MediaFactChip(fact)
+            }
         }
         Text(file.filename, color = Muted, style = MaterialTheme.typography.labelMedium)
         Text(fileSpecLine(file), color = Muted, style = MaterialTheme.typography.bodyMedium)
@@ -513,12 +517,6 @@ private fun SpecChip(text: String, color: Color = Accent) {
         style = MaterialTheme.typography.labelMedium,
         modifier = Modifier.border(1.dp, color, MaterialTheme.shapes.small).padding(horizontal = 8.dp, vertical = 4.dp),
     )
-}
-
-private fun videoBadges(file: MediaFileDto): List<String> = buildList {
-    file.video_codec?.uppercase()?.let(::add)
-    file.height?.let { add(if (it >= 2160) "4K" else "${it}p") }
-    (file.hdr_format ?: file.hdr)?.let(::add)
 }
 
 private fun fileSpecLine(file: MediaFileDto): String {

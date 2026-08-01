@@ -488,12 +488,20 @@ func resolutionLabel(_ height: Int?) -> String? {
     return nil
 }
 
-/// Video quality tiers describe the short edge: both 1920×1080 landscape
-/// and 1080×1920 orientation-ordered video are conventionally 1080p.
+/// Video quality tiers describe the encoded raster rather than blindly using
+/// `height`: both 1920×1080 and orientation-ordered 1080×1920 are 1080p, while
+/// a cropped 3840×1608 scope encode is still 4K.
 func resolutionLabel(width: Int?, height: Int?) -> String? {
     guard let height, height > 0 else { return nil }
     guard let width, width > 0 else { return resolutionLabel(height) }
-    return resolutionLabel(min(width, height))
+    let longEdge = max(width, height)
+    let shortEdge = min(width, height)
+    if longEdge >= 3_200 || shortEdge >= 1_700 { return "4K" }
+    if longEdge >= 2_300 || shortEdge >= 1_300 { return "1440p" }
+    if longEdge >= 1_600 || shortEdge >= 900 { return "1080p" }
+    if longEdge >= 1_100 || shortEdge >= 650 { return "720p" }
+    if longEdge >= 700 || shortEdge >= 400 { return "480p" }
+    return "\(shortEdge)p"
 }
 
 private func timeRemaining(_ item: Item) -> String? {
