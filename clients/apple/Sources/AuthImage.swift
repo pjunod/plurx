@@ -5,6 +5,7 @@ import UIKit
 /// (URLSession's cache handles repeats), showing a muted placeholder until then.
 struct AuthImage: View {
     let path: String?
+    var contentMode: ContentMode = .fill
     @State private var image: UIImage?
 
     var body: some View {
@@ -12,7 +13,7 @@ struct AuthImage: View {
             if let image {
                 Image(uiImage: image)
                     .resizable()
-                    .scaledToFill()
+                    .aspectRatio(contentMode: contentMode)
             } else {
                 Palette.surfaceHi
             }

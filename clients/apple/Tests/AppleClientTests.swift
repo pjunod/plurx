@@ -20,6 +20,33 @@ final class AppleClientTests: XCTestCase {
         XCTAssertEqual(AppModel.normalizeOrigin("   "), "")
     }
 
+    func testSessionTokenMovesOutOfDefaultsAndSurvivesPreferenceReplacement() throws {
+        final class MemoryTokenStore: TokenStoring {
+            var value: String?
+            func read() -> String? { value }
+            func write(_ token: String) -> Bool { value = token; return true }
+            func clear() { value = nil }
+        }
+
+        let suite = "tv.plurx.tests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let vault = MemoryTokenStore()
+
+        defaults.set("legacy-token", forKey: "plurx.token")
+        let migrated = SettingsStore(defaults: defaults, tokenVault: vault)
+        XCTAssertEqual(migrated.token, "legacy-token")
+        XCTAssertEqual(vault.value, "legacy-token")
+        XCTAssertNil(defaults.string(forKey: "plurx.token"))
+
+        defaults.removePersistentDomain(forName: suite)
+        let restored = SettingsStore(defaults: defaults, tokenVault: vault)
+        XCTAssertEqual(restored.token, "legacy-token")
+
+        restored.clearToken()
+        XCTAssertNil(restored.token)
+    }
+
     func testBonjourOriginsHandleDnsNamesAndIpv6() {
         XCTAssertEqual(BonjourAddress.origin(host: "media-box.local.", port: 32400),
                        "http://media-box.local:32400")
@@ -156,6 +183,10 @@ final class AppleClientTests: XCTestCase {
     }
 
     #if os(tvOS)
+    func testTVHomeStartsWithMediaRailsInsteadOfAFeaturedBillboard() {
+        XCTAssertFalse(HomeLayoutPolicy.usesFeaturedHero)
+    }
+
     func testTVSeriesDetailKeepsCorrectArtworkRatioAndVisibleChildShelf() {
         XCTAssertEqual(
             TVSeriesDetailMetrics.posterHeight / TVSeriesDetailMetrics.posterWidth,
@@ -178,6 +209,11 @@ final class AppleClientTests: XCTestCase {
             "title, synopsis, and actions must remain visible below the tvOS tab bar"
         )
         XCTAssertGreaterThanOrEqual(TVPlayableDetailMetrics.copyWidth, 800)
+        XCTAssertLessThanOrEqual(
+            TVPlayableDetailMetrics.bottomInset,
+            32,
+            "the information group belongs against the lower television edge"
+        )
 
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
@@ -192,7 +228,11 @@ final class AppleClientTests: XCTestCase {
 
         XCTAssertEqual(
             DetailView.tvPlayableMetadata(item, file: file, durationMs: file.durationMs),
-            "S4 E2   ·   2026   ·   54m   ·   4K   ·   HEVC   ·   MKV"
+            "Season 4, Episode 2   ·   54 min   ·   4K   ·   HEVC"
+        )
+        XCTAssertEqual(
+            DetailView.tvPlayableMetadataParts(item, file: file, durationMs: file.durationMs),
+            ["Season 4, Episode 2", "54 min", "4K", "HEVC"]
         )
     }
 

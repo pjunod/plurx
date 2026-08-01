@@ -6,16 +6,23 @@ struct HomeView: View {
     var body: some View {
         #if os(iOS)
         if #available(iOS 18.0, *) {
-            tabs.tabViewStyle(.sidebarAdaptable)
+            iOSTabs.tabViewStyle(.sidebarAdaptable)
         } else {
-            tabs
+            iOSTabs
         }
         #else
-        tabs
+        // Detail destinations replace the entire tab shell on television.
+        // That keeps the Home tab from remaining visibly selected while an
+        // episode or movie detail is on screen.
+        NavigationStack {
+            tvTabs
+                .appDestinations()
+        }
         #endif
     }
 
-    private var tabs: some View {
+    #if os(iOS)
+    private var iOSTabs: some View {
         TabView {
             NavigationStack {
                 HomeDashboard()
@@ -57,6 +64,40 @@ struct HomeView: View {
         .tint(Palette.accent)
         .task { if model.homeLoading { await model.loadHome() } }
     }
+    #else
+    private var tvTabs: some View {
+        TabView {
+            HomeDashboard()
+                .tabItem { Label("Home", systemImage: "house") }
+
+            Group {
+                if let movies = model.collection(kind: "movie") {
+                    LibraryView(collection: movies)
+                } else {
+                    EmptyLibraryCategory(title: "Movies")
+                }
+            }
+            .tabItem { Label("Movies", systemImage: "film") }
+
+            Group {
+                if let shows = model.collection(kind: "show") {
+                    LibraryView(collection: shows)
+                } else {
+                    EmptyLibraryCategory(title: "TV Shows")
+                }
+            }
+            .tabItem { Label("TV", systemImage: "tv") }
+
+            SearchView()
+                .tabItem { Label("Search", systemImage: "magnifyingglass") }
+
+            SettingsView()
+                .tabItem { Label("Settings", systemImage: "gearshape") }
+        }
+        .tint(Palette.accent)
+        .task { if model.homeLoading { await model.loadHome() } }
+    }
+    #endif
 }
 
 private struct AppDestinations: ViewModifier {
@@ -139,7 +180,7 @@ private struct HomeDashboard: View {
 
     @ViewBuilder
     private var homeContent: some View {
-        if let featured {
+        if HomeLayoutPolicy.usesFeaturedHero, let featured {
             FeaturedHero(item: featured, compact: horizontalSizeClass == .compact)
                 #if os(tvOS)
                 .padding(.horizontal, screenHPad)
@@ -205,6 +246,14 @@ private struct HomeDashboard: View {
         .padding(.horizontal, screenHPad)
         .padding(.top, 18)
     }
+}
+
+enum HomeLayoutPolicy {
+    #if os(tvOS)
+    static let usesFeaturedHero = false
+    #else
+    static let usesFeaturedHero = true
+    #endif
 }
 
 private struct FeaturedHero: View {

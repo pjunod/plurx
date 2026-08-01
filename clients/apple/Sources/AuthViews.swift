@@ -197,3 +197,27 @@ struct LoginView: View {
 
     private func signIn() { Task { await model.login(username, password) } }
 }
+
+/// A saved token is still valid until the server explicitly rejects it. A
+/// timeout, unavailable route, or local-network permission problem belongs on
+/// a reconnect screen—not on a username/password form.
+struct ReconnectView: View {
+    @EnvironmentObject var model: AppModel
+
+    var body: some View {
+        AuthScaffold(subtitle: model.serverName ?? model.origin, error: model.authError) {
+            Text("Your sign-in is still saved.")
+                .font(.system(.body, design: .rounded))
+                .foregroundColor(Palette.onBg.opacity(0.82))
+
+            PrimaryButton(title: "Try again", busy: model.busy) {
+                Task { await model.retrySavedSession() }
+            }
+
+            Button("Use a different server") { model.changeServer() }
+                .font(.system(.caption, design: .monospaced))
+                .foregroundColor(Palette.muted)
+                .buttonStyle(.plain)
+        }
+    }
+}
