@@ -34,6 +34,14 @@ enum TVSeriesDetailMetrics {
     static let posterWidth: CGFloat = 250
     static let posterHeight: CGFloat = 375
 }
+
+/// The playable detail page is a single cinematic composition, not a hero
+/// image followed by a narrow article column. Keep its essential actions in
+/// the first television viewport while leaving enough room for readable copy.
+enum TVPlayableDetailMetrics {
+    static let heroHeight: CGFloat = 690
+    static let copyWidth: CGFloat = 880
+}
 #endif
 
 struct DetailView: View {
@@ -99,7 +107,7 @@ struct DetailView: View {
         if detail.item.kind == "show" || detail.item.kind == "season" {
             tvSeriesContent(detail)
         } else {
-            standardContent(detail)
+            tvPlayableContent(detail)
         }
         #else
         standardContent(detail)
@@ -184,6 +192,168 @@ struct DetailView: View {
     }
 
     #if os(tvOS)
+    private func tvPlayableContent(_ detail: ItemDetail) -> some View {
+        let item = detail.item
+        let file = detail.files?.first
+        let durationMs = file?.durationMs ?? item.runtimeMs
+        let resumeMs = item.watch?.positionMs ?? 0
+        let nearlyDone = (durationMs ?? 0) > 0 && Double(resumeMs) > Double(durationMs!) * 0.95
+        let canResume = resumeMs > 3000 && !nearlyDone
+
+        return VStack(alignment: .leading, spacing: 0) {
+            ZStack(alignment: .leading) {
+                tvPlayableBackground(item)
+
+                VStack(alignment: .leading, spacing: 18) {
+                    Spacer(minLength: 0)
+
+                    Text(tvPlayableEyebrow(detail).uppercased())
+                        .font(.system(.caption, design: .monospaced).weight(.bold))
+                        .tracking(2.2)
+                        .foregroundColor(Palette.accent)
+
+                    Text(item.title)
+                        .font(.system(size: 66, weight: .bold))
+                        .foregroundColor(Palette.onBg)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .shadow(color: .black.opacity(0.65), radius: 12, y: 4)
+
+                    Text(Self.tvPlayableMetadata(item, file: file, durationMs: durationMs))
+                        .font(.system(.callout, design: .monospaced).weight(.semibold))
+                        .foregroundColor(Palette.onBg.opacity(0.82))
+                        .lineLimit(1)
+
+                    if let overview = item.overview, !overview.isEmpty {
+                        Text(overview)
+                            .font(.title3)
+                            .foregroundColor(Palette.onBg.opacity(0.84))
+                            .lineSpacing(5)
+                            .lineLimit(4)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    HStack(spacing: 16) {
+                        if let file, item.isPlayable {
+                            resumeButton(
+                                item: item,
+                                file: file,
+                                durationMs: durationMs ?? 0,
+                                resumeMs: resumeMs,
+                                canResume: canResume
+                            )
+                            .fixedSize()
+
+                            if canResume {
+                                startOverButton(item: item, file: file, durationMs: durationMs ?? 0)
+                                    .fixedSize()
+                            }
+                        }
+
+                        watchButton(detail)
+                    }
+                    .padding(.top, 4)
+
+                    if let actionError {
+                        Text(actionError)
+                            .font(.caption)
+                            .foregroundColor(Palette.accent)
+                    }
+                }
+                .frame(maxWidth: TVPlayableDetailMetrics.copyWidth, maxHeight: .infinity,
+                       alignment: .bottomLeading)
+                .padding(.horizontal, 96)
+                .padding(.vertical, 48)
+            }
+            .frame(height: TVPlayableDetailMetrics.heroHeight)
+            .clipped()
+
+            if let children = detail.children, !children.isEmpty {
+                MediaRow(title: childrenHeading(item.kind), items: children)
+                    .padding(.top, 8)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.bottom, 30)
+    }
+
+    @ViewBuilder
+    private func tvPlayableBackground(_ item: Item) -> some View {
+        AuthImage(path: item.backdrop ?? item.poster)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .clipped()
+
+        LinearGradient(
+            stops: [
+                .init(color: Palette.bg.opacity(0.98), location: 0),
+                .init(color: Palette.bg.opacity(0.82), location: 0.34),
+                .init(color: Palette.bg.opacity(0.2), location: 0.72),
+                .init(color: .clear, location: 1)
+            ],
+            startPoint: .leading,
+            endPoint: .trailing
+        )
+
+        LinearGradient(
+            stops: [
+                .init(color: .black.opacity(0.08), location: 0),
+                .init(color: .clear, location: 0.48),
+                .init(color: Palette.bg.opacity(0.92), location: 1)
+            ],
+            startPoint: .top,
+            endPoint: .bottom
+        )
+    }
+
+    private func tvPlayableEyebrow(_ detail: ItemDetail) -> String {
+        let item = detail.item
+        if item.kind == "episode" {
+            return item.showTitle
+                ?? detail.ancestors?.last(where: { $0.kind == "show" })?.title
+                ?? "TV episode"
+        }
+        if item.kind == "movie" { return "Movie" }
+        return item.kind
+    }
+
+    static func tvPlayableMetadata(_ item: Item, file: MediaFile?, durationMs: Int?) -> String {
+        var parts: [String] = []
+
+        if item.kind == "episode", let season = item.seasonNumber, let episode = item.episodeNumber {
+            parts.append("S\(season) E\(episode)")
+        }
+        if let year = item.year { parts.append(String(year)) }
+        if let durationMs, durationMs > 0 { parts.append(tvRuntimeLabel(durationMs)) }
+        if let resolution = resolutionLabel(file?.height ?? item.resolution) {
+            parts.append(resolution)
+        }
+        if let codec = file?.videoCodec, !codec.isEmpty {
+            parts.append(tvCodecLabel(codec))
+        }
+        if let container = file?.container, !container.isEmpty {
+            parts.append(container.uppercased())
+        }
+
+        return parts.joined(separator: "   ·   ")
+    }
+
+    private static func tvRuntimeLabel(_ durationMs: Int) -> String {
+        let totalMinutes = max(1, durationMs / 60_000)
+        let hours = totalMinutes / 60
+        let minutes = totalMinutes % 60
+        if hours == 0 { return "\(minutes)m" }
+        return minutes == 0 ? "\(hours)h" : "\(hours)h \(minutes)m"
+    }
+
+    private static func tvCodecLabel(_ codec: String) -> String {
+        switch codec.lowercased().replacingOccurrences(of: "-", with: "") {
+        case "h264", "avc": return "H.264"
+        case "h265", "hevc": return "HEVC"
+        case "av1": return "AV1"
+        default: return codec.uppercased()
+        }
+    }
+
     private func tvSeriesContent(_ detail: ItemDetail) -> some View {
         let item = detail.item
         let children = detail.children ?? []

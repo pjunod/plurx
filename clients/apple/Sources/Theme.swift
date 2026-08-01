@@ -15,16 +15,16 @@ enum Palette {
 #if os(tvOS)
 /// tvOS 26 can apply a button's tint to both its glass and its label, making a
 /// muted bordered action look blank. This style owns both sides of the
-/// contrast pair and changes them together when focus moves.
+/// contrast pair. Focus is expressed with the plurx red signal, lift, and glow
+/// instead of turning the entire control into a bright white plate.
 struct TVReadableButtonStyle: ButtonStyle {
     let prominent: Bool
 
     static func foregroundColor(prominent: Bool, focused: Bool) -> Color {
-        focused || prominent ? Palette.bg : Palette.onBg
+        prominent ? Palette.bg : Palette.onBg
     }
 
     static func backgroundColor(prominent: Bool, focused: Bool) -> Color {
-        if focused { return Palette.onBg }
         return prominent ? Palette.accent : Palette.surfaceHi
     }
 
@@ -59,12 +59,12 @@ struct TVReadableButtonStyle: ButtonStyle {
                 .overlay {
                     RoundedRectangle(cornerRadius: 14, style: .continuous)
                         .stroke(
-                            isFocused ? Palette.onBg : Palette.outline,
-                            lineWidth: isFocused ? 3 : 1
+                            isFocused ? Palette.accent : Palette.outline,
+                            lineWidth: isFocused ? 4 : 1
                         )
                 }
-                .scaleEffect(isFocused ? 1.04 : (configuration.isPressed ? 0.98 : 1))
-                .shadow(color: .black.opacity(isFocused ? 0.45 : 0), radius: 12, y: 6)
+                .scaleEffect(isFocused ? 1.045 : (configuration.isPressed ? 0.98 : 1))
+                .shadow(color: Palette.accent.opacity(isFocused ? 0.3 : 0), radius: 16, y: 7)
                 .opacity(isEnabled ? 1 : 0.45)
                 .animation(.easeOut(duration: 0.14), value: isFocused)
                 .animation(.easeOut(duration: 0.08), value: configuration.isPressed)
