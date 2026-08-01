@@ -21,6 +21,7 @@ pub use pipeline::{Pipeline, CANDIDATES as PIPELINE_CANDIDATES};
 pub use recipe::{PipelineDigest, Recipe};
 
 use crate::domain::MediaFile;
+use std::path::PathBuf;
 
 /// Segment length for on-the-fly HLS, in seconds. Keyframes are forced to
 /// align to this so segments are independently decodable.
@@ -423,6 +424,12 @@ pub struct TranscodeOptions {
     /// what a GPU graph falls back to when it fails at runtime.
     pub pipeline: Pipeline,
     pub subtitle_burn: Option<SubtitleBurn>,
+    /// Cached simple-text subtitle sidecar used by libass. `None` means the
+    /// subtitle is bitmap, absent, or a styled embedded source retained for
+    /// compatibility.
+    /// Not part of the recipe: the selected stream identifies the pixels;
+    /// this only avoids reopening and scanning the full media file.
+    pub subtitle_file: Option<PathBuf>,
     /// Pass the encoder's forced-IDR option, so `-force_key_frames` produces
     /// key frames the HLS muxer can actually cut at (see
     /// [`Encoder::forced_idr_flag`]). Set from the startup probe, which is
@@ -462,6 +469,7 @@ impl Default for TranscodeOptions {
             tone_map: ToneMap::Zscale,
             pipeline: Pipeline::Cpu,
             subtitle_burn: None,
+            subtitle_file: None,
             force_idr: false,
             software_threads: None,
         }
@@ -521,16 +529,14 @@ fn video_filters(source: &MediaFile, opts: &TranscodeOptions, source_path: &str)
     // A GPU pipeline owns scale and tone-map together: they are one pass on
     // the video-processing block, and splitting them would put the download
     // this exists to remove back in the middle. It is only ever selected for
-    // sessions it can handle — `Pipeline::for_session` has already routed
-    // HLG, unsupported Dolby Vision and burned TEXT subtitles to the CPU
-    // chain. A bitmap burn rides the GPU graph: the scaler is pinned to the
-    // exact frame `bitmap_overlay` scales the subtitle plane to (two filters,
-    // one geometry — see `output_size`), and the vendor-surface graphs come
-    // down to system memory right here, once, because `overlay` composites
-    // there. What this keeps off the CPU is the float tone-map — the cost
-    // that put a 4K burn under realtime while the GPU graph measured 4.9×
-    // (PERF-PLAN §5).
+    // sessions it can handle — `Pipeline::for_session` has already routed HLG
+    // and unsupported Dolby Vision to the CPU chain. Subtitle burns ride the
+    // GPU graph too: scale + tone-map happen first, then vendor surfaces come
+    // down to system memory exactly once for libass/overlay. What stays off
+    // the CPU is the float tone-map — the cost that put a 4K burn under
+    // realtime while the GPU graph measured 4.9× (PERF-PLAN §5).
     let bitmap_burn = opts.subtitle_burn.as_ref().is_some_and(|b| b.bitmap);
+    let text_burn = opts.subtitle_burn.as_ref().is_some_and(|b| !b.bitmap);
     let burn_size = if bitmap_burn {
         output_size(source, opts.target_height)
     } else {
@@ -541,7 +547,9 @@ fn video_filters(source: &MediaFile, opts: &TranscodeOptions, source_path: &str)
         burn_size.map_or(opts.target_height, |(_, h)| h),
         source.hdr.as_deref(),
     ) {
-        if bitmap_burn && matches!(opts.pipeline, Pipeline::VppQsv | Pipeline::TonemapVaapi) {
+        if (bitmap_burn || text_burn)
+            && matches!(opts.pipeline, Pipeline::VppQsv | Pipeline::TonemapVaapi)
+        {
             // These two end in vendor surfaces (their encoders read them
             // directly); the composite cannot. Libplacebo and OpenCL already
             // finish with their own download, so they need nothing here.
@@ -597,19 +605,24 @@ fn video_filters(source: &MediaFile, opts: &TranscodeOptions, source_path: &str)
 /// a second stream composited over this chain's output by [`bitmap_overlay`],
 /// which `-vf` cannot express.
 ///
-/// Shared by both branches above because it is genuinely the same step: the
-/// `subtitles` filter is CPU-only either way, which is why a session that
-/// burns text subtitles is routed to the CPU pipeline in the first place.
+/// Shared by both branches above because it is genuinely the same step. On a
+/// vendor GPU path the frame is downloaded immediately before this filter and
+/// uploaded immediately after it; scale + tone-map remain on the GPU.
 fn with_subtitles(mut chain: Vec<String>, opts: &TranscodeOptions, source_path: &str) -> String {
     if let Some(burn) = &opts.subtitle_burn {
         // A bitmap burn is not part of this chain: it is a second stream
         // composited over the chain's output, built by `bitmap_overlay`.
         if !burn.bitmap {
-            let escaped = escape_filter_path(source_path);
-            chain.push(format!(
-                "subtitles='{escaped}':si={idx}",
-                idx = burn.subtitle_index
-            ));
+            if let Some(path) = &opts.subtitle_file {
+                let escaped = escape_filter_path(&path.to_string_lossy());
+                chain.push(format!("subtitles='{escaped}'"));
+            } else {
+                let escaped = escape_filter_path(source_path);
+                chain.push(format!(
+                    "subtitles='{escaped}':si={idx}",
+                    idx = burn.subtitle_index
+                ));
+            }
         }
     }
     chain.join(",")
@@ -829,13 +842,12 @@ pub fn hls_args(
     // of its encoder's own family, so the upload suffix would be uploading
     // something that never came down — which is not a wasted copy but a broken
     // graph. The neutral pipelines download explicitly inside their own chain
-    // and then take the suffix like the CPU path does. A bitmap burn on a
+    // and then take the suffix like the CPU path does. Any subtitle burn on a
     // vendor pipeline is the exception both ways: `video_filters` appended a
-    // download so the composite can run, which means the encoder's upload IS
-    // owed again.
-    let bitmap_burn = opts.subtitle_burn.as_ref().is_some_and(|b| b.bitmap);
+    // download for libass/overlay, so the encoder's upload IS owed again.
+    let subtitle_burn = opts.subtitle_burn.is_some();
     let vendor_gpu =
-        matches!(opts.pipeline, Pipeline::VppQsv | Pipeline::TonemapVaapi) && !bitmap_burn;
+        matches!(opts.pipeline, Pipeline::VppQsv | Pipeline::TonemapVaapi) && !subtitle_burn;
     let suffix = encoder.filter_suffix().filter(|_| !vendor_gpu);
     let mut vf = String::new();
     if let Some(prefix) = &hwdownload {
@@ -1578,6 +1590,35 @@ mod tests {
             "/tmp/s",
         );
         assert!(args.join(" ").contains("subtitles='/media/movie.mkv':si=2"));
+    }
+
+    #[test]
+    fn cached_text_burn_keeps_gpu_tonemap_and_round_trips_once() {
+        let mut f = file(Some("dolby_vision"));
+        f.width = Some(3840);
+        f.height = Some(2160);
+        f.bit_depth = Some(10);
+        let opts = TranscodeOptions {
+            target_height: 1080,
+            pipeline: Pipeline::VppQsv,
+            subtitle_burn: Some(SubtitleBurn {
+                subtitle_index: 2,
+                bitmap: false,
+            }),
+            subtitle_file: Some(PathBuf::from("/cache/scary-forced.vtt")),
+            ..Default::default()
+        };
+        let joined = hls_args(&f, Encoder::Qsv, &opts, Pacing::unpaced(), "/tmp/s").join(" ");
+
+        assert!(
+            joined.contains(
+                "vpp_qsv=w=-1:h=1080:tonemap=1:format=nv12,hwdownload,format=nv12,subtitles='/cache/scary-forced.vtt',hwupload=extra_hw_frames=64,format=qsv"
+            ),
+            "{joined}"
+        );
+        assert_eq!(joined.matches("hwdownload").count(), 1, "{joined}");
+        assert_eq!(joined.matches("hwupload").count(), 1, "{joined}");
+        assert!(!joined.contains("zscale"), "{joined}");
     }
 
     #[test]
