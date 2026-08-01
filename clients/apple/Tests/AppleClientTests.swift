@@ -121,6 +121,26 @@ final class AppleClientTests: XCTestCase {
         XCTAssertEqual(context.durationMs, 7_200_000)
     }
 
+    func testPlayerFactsSurfaceUsefulSourceInformation() {
+        let source = SourceSummary(
+            container: nil,
+            videoCodec: "hevc",
+            videoProfile: nil,
+            width: nil,
+            height: 2160,
+            bitDepth: nil,
+            hdr: nil,
+            hdrFormat: "Dolby Vision · Profile 8",
+            bitrate: nil,
+            durationMs: nil
+        )
+
+        XCTAssertEqual(
+            PlayerView.playbackFacts(source: source, method: "Direct play"),
+            ["4K", "Dolby Vision · Profile 8", "HEVC", "Direct play"]
+        )
+    }
+
     func testDetailBodyNeverOutgrowsItsAvailableWidth() {
         for availableWidth: CGFloat in [320, 390, 430, 744, 1_366] {
             let controller = UIHostingController(rootView: DetailBodyFrame {

@@ -86,8 +86,10 @@ private struct HomeDashboard: View {
 
     var body: some View {
         ScrollView {
-            LazyVStack(alignment: .leading, spacing: 6) {
+            LazyVStack(alignment: .leading, spacing: dashboardSpacing) {
+                #if os(iOS)
                 homeHeader
+                #endif
                 if model.homeLoading {
                     ProgressView().tint(Palette.accent)
                         .frame(maxWidth: .infinity).padding(.top, 80)
@@ -107,6 +109,14 @@ private struct HomeDashboard: View {
         #if os(iOS)
         .toolbar(.hidden, for: .navigationBar)
         .refreshable { await model.loadHome() }
+        #endif
+    }
+
+    private var dashboardSpacing: CGFloat {
+        #if os(tvOS)
+        return 12
+        #else
+        return 6
         #endif
     }
 
@@ -131,6 +141,9 @@ private struct HomeDashboard: View {
     private var homeContent: some View {
         if let featured {
             FeaturedHero(item: featured, compact: horizontalSizeClass == .compact)
+                #if os(tvOS)
+                .padding(.horizontal, screenHPad)
+                #endif
                 .padding(.bottom, 12)
         }
 
@@ -212,13 +225,23 @@ private struct FeaturedHero: View {
                 )
                 VStack(alignment: .leading, spacing: 8) {
                     Text(item.showTitle ?? item.title)
+                        #if os(tvOS)
+                        .font(.system(size: 52, weight: .bold))
+                        #else
                         .font(compact ? .title.bold() : .largeTitle.bold())
+                        #endif
                         .foregroundColor(.white)
                         .lineLimit(2)
                     if item.showTitle != nil {
                         Text(episodeSubtitleForHero(item))
                             .font(.headline)
                             .foregroundColor(.white.opacity(0.82))
+                            .lineLimit(1)
+                    }
+                    if !heroMetadata.isEmpty {
+                        Text(heroMetadata)
+                            .font(.system(.callout, design: .monospaced).weight(.semibold))
+                            .foregroundColor(.white.opacity(0.72))
                             .lineLimit(1)
                     }
                     Label(heroAction, systemImage: "play.fill")
@@ -230,17 +253,39 @@ private struct FeaturedHero: View {
                 .padding(.horizontal, screenHPad)
                 .padding(.bottom, 24)
             }
+            .clipShape(RoundedRectangle(cornerRadius: heroCornerRadius, style: .continuous))
         }
-        .buttonStyle(.plain)
+        .featuredButtonStyle()
         .accessibilityLabel("\(heroAction) \(item.title)")
     }
 
     private var heroHeight: CGFloat {
         #if os(tvOS)
-        return 520
+        return 470
         #else
         return compact ? 290 : 430
         #endif
+    }
+
+    private var heroCornerRadius: CGFloat {
+        #if os(tvOS)
+        return 24
+        #else
+        return 0
+        #endif
+    }
+
+    private var heroMetadata: String {
+        var parts: [String] = []
+        if let year = item.year { parts.append(String(year)) }
+        if let runtime = item.runtimeMs, runtime > 0 {
+            let totalMinutes = runtime / 60_000
+            let hours = totalMinutes / 60
+            let minutes = totalMinutes % 60
+            parts.append(hours > 0 ? "\(hours)h \(minutes)m" : "\(minutes)m")
+        }
+        if let resolution = resolutionLabel(item.resolution) { parts.append(resolution) }
+        return parts.joined(separator: "   ·   ")
     }
 
     private var heroAction: String {

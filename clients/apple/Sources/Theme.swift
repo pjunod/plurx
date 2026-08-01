@@ -71,6 +71,65 @@ struct TVReadableButtonStyle: ButtonStyle {
         }
     }
 }
+
+/// Replaces tvOS's thick white focus plate with the same restrained red
+/// signal used throughout plurx. The hero still lifts enough to read from the
+/// couch without turning the artwork into a glowing white rectangle.
+struct TVHeroButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> Body {
+        Body(configuration: configuration)
+    }
+
+    struct Body: View {
+        let configuration: ButtonStyle.Configuration
+        @Environment(\.isFocused) private var isFocused
+
+        var body: some View {
+            configuration.label
+                .overlay {
+                    RoundedRectangle(cornerRadius: 24, style: .continuous)
+                        .stroke(Palette.accent.opacity(isFocused ? 0.95 : 0.18),
+                                lineWidth: isFocused ? 4 : 1)
+                }
+                .scaleEffect(isFocused ? 1.012 : (configuration.isPressed ? 0.994 : 1))
+                .shadow(
+                    color: Palette.accent.opacity(isFocused ? 0.22 : 0),
+                    radius: 20,
+                    y: 8
+                )
+                .animation(.easeOut(duration: 0.15), value: isFocused)
+                .animation(.easeOut(duration: 0.08), value: configuration.isPressed)
+        }
+    }
+}
+
+/// Shelf cards get a subtle lift and shadow, not the default opaque tvOS
+/// surround that hides the edges of posters and backdrops.
+struct TVMediaCardButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> Body {
+        Body(configuration: configuration)
+    }
+
+    struct Body: View {
+        let configuration: ButtonStyle.Configuration
+        @Environment(\.isFocused) private var isFocused
+
+        var body: some View {
+            configuration.label
+                .scaleEffect(isFocused ? 1.045 : (configuration.isPressed ? 0.985 : 1))
+                .shadow(color: .black.opacity(isFocused ? 0.6 : 0), radius: 18, y: 10)
+                .overlay(alignment: .top) {
+                    Capsule()
+                        .fill(Palette.accent)
+                        .frame(width: 42, height: 4)
+                        .offset(y: -10)
+                        .opacity(isFocused ? 1 : 0)
+                }
+                .animation(.easeOut(duration: 0.14), value: isFocused)
+                .animation(.easeOut(duration: 0.08), value: configuration.isPressed)
+        }
+    }
+}
 #endif
 
 extension View {
@@ -79,7 +138,22 @@ extension View {
     @ViewBuilder
     func posterButtonStyle() -> some View {
         #if os(tvOS)
-        self.buttonStyle(.card)
+        self
+            .buttonStyle(TVMediaCardButtonStyle())
+            .focusEffectDisabled()
+        #else
+        self.buttonStyle(.plain)
+        #endif
+    }
+
+    /// Large featured-card treatment kept separate from shelf cards so its
+    /// focus indication follows the hero's rounded artwork bounds.
+    @ViewBuilder
+    func featuredButtonStyle() -> some View {
+        #if os(tvOS)
+        self
+            .buttonStyle(TVHeroButtonStyle())
+            .focusEffectDisabled()
         #else
         self.buttonStyle(.plain)
         #endif

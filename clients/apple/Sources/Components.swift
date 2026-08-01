@@ -50,7 +50,11 @@ struct PosterCard: View {
             .aspectRatio(2 / 3, contentMode: .fit)
 
             Text(item.title)
+                #if os(tvOS)
+                .font(.headline.weight(.semibold))
+                #else
                 .font(.callout.weight(.semibold))
+                #endif
                 .foregroundColor(Palette.onBg)
                 .lineLimit(1)
             HStack(spacing: 5) {
@@ -230,7 +234,7 @@ struct MediaRow: View {
                 .padding(.horizontal, screenHPad)
 
                 ScrollView(.horizontal, showsIndicators: false) {
-                    LazyHStack(alignment: .top, spacing: 16) {
+                    LazyHStack(alignment: .top, spacing: shelfSpacing) {
                         ForEach(items) { item in
                             NavigationLink(value: Route.item(item.id)) {
                                 switch style {
@@ -265,6 +269,14 @@ struct MediaRow: View {
             .padding(.vertical, 10)
         }
     }
+
+    private var shelfSpacing: CGFloat {
+        #if os(tvOS)
+        return 24
+        #else
+        return 16
+        #endif
+    }
 }
 
 private func episodeCardTitle(_ item: Item) -> String {
@@ -298,7 +310,7 @@ struct ComingSoonRow: View {
                     .foregroundColor(Palette.onBg)
                     .padding(.horizontal, screenHPad)
                 ScrollView(.horizontal, showsIndicators: false) {
-                    LazyHStack(alignment: .top, spacing: 16) {
+                    LazyHStack(alignment: .top, spacing: comingSoonSpacing) {
                         ForEach(entries) { entry in
                             if let itemId = entry.itemId {
                                 NavigationLink(value: Route.item(itemId)) {
@@ -318,6 +330,14 @@ struct ComingSoonRow: View {
             }
             .padding(.vertical, 10)
         }
+    }
+
+    private var comingSoonSpacing: CGFloat {
+        #if os(tvOS)
+        return 24
+        #else
+        return 16
+        #endif
     }
 }
 
@@ -341,7 +361,11 @@ private struct ComingSoonCard: View {
                     .padding(8)
             }
             Text(entry.title)
+                #if os(tvOS)
+                .font(.headline.weight(.semibold))
+                #else
                 .font(.callout.weight(.semibold))
+                #endif
                 .foregroundColor(Palette.onBg)
                 .lineLimit(1)
             Text(entry.detail.isEmpty ? entry.kind.capitalized : entry.detail)
@@ -353,7 +377,7 @@ private struct ComingSoonCard: View {
     }
 }
 
-private func resolutionLabel(_ height: Int?) -> String? {
+func resolutionLabel(_ height: Int?) -> String? {
     guard let height else { return nil }
     if height >= 2160 { return "4K" }
     if height >= 1080 { return "1080p" }

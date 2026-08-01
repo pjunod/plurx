@@ -31,6 +31,8 @@ struct PlayerView: View {
     let startMs: Int
     let durationMs: Int
     let title: String
+    var subtitle: String? = nil
+    var year: Int? = nil
     var onPlayNext: ((PlayContext) -> Void)?
 
     @StateObject private var controller = PlayerController()
@@ -239,7 +241,12 @@ struct PlayerView: View {
     #endif
 
     private var playbackControls: some View {
-        VStack(spacing: 10) {
+        VStack(alignment: .leading, spacing: 12) {
+            playbackInfoHeader
+
+            Divider()
+                .overlay(.white.opacity(0.15))
+
             if controller.knownDurationMs > 0 {
                 HStack(spacing: 10) {
                     Text(formatTime(Int(isScrubbing ? scrubMs : Double(controller.currentMs))))
@@ -308,6 +315,83 @@ struct PlayerView: View {
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
     }
 
+    private var playbackInfoHeader: some View {
+        #if os(tvOS)
+        HStack(alignment: .bottom, spacing: 30) {
+            playbackIdentity
+            Spacer(minLength: 20)
+            playbackFacts
+        }
+        #else
+        VStack(alignment: .leading, spacing: 7) {
+            playbackIdentity
+            playbackFacts
+        }
+        #endif
+    }
+
+    private var playbackIdentity: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title)
+                #if os(tvOS)
+                .font(.title2.bold())
+                #else
+                .font(.headline.bold())
+                #endif
+                .foregroundColor(.white)
+                .lineLimit(1)
+
+            let context = [subtitle, year.map(String.init), runtimeLabel]
+                .compactMap { $0 }
+                .filter { !$0.isEmpty }
+                .joined(separator: "   ·   ")
+            if !context.isEmpty {
+                Text(context)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.7))
+                    .lineLimit(1)
+            }
+        }
+    }
+
+    private var playbackFacts: some View {
+        let facts = Self.playbackFacts(
+            source: controller.decision?.source,
+            method: controller.decision == nil ? nil : controller.methodLabel
+        )
+        return Text(facts.joined(separator: "   ·   "))
+            .font(.system(.caption, design: .monospaced).weight(.semibold))
+            .foregroundColor(.white.opacity(0.82))
+            .lineLimit(2)
+            .multilineTextAlignment(.trailing)
+    }
+
+    private var runtimeLabel: String? {
+        let milliseconds = controller.knownDurationMs > 0
+            ? controller.knownDurationMs
+            : durationMs
+        guard milliseconds > 0 else { return nil }
+        let totalMinutes = milliseconds / 60_000
+        let hours = totalMinutes / 60
+        let minutes = totalMinutes % 60
+        return hours > 0 ? "\(hours)h \(minutes)m" : "\(minutes)m"
+    }
+
+    static func playbackFacts(source: SourceSummary?, method: String?) -> [String] {
+        var facts: [String] = []
+        if let height = source?.height {
+            facts.append(height >= 2160 ? "4K" : "\(height)p")
+        }
+        if let hdr = source?.hdrFormat ?? source?.hdr?.uppercased(), !hdr.isEmpty {
+            facts.append(hdr)
+        }
+        if let codec = source?.videoCodec?.uppercased(), !codec.isEmpty {
+            facts.append(codec)
+        }
+        if let method, !method.isEmpty { facts.append(method) }
+        return facts
+    }
+
     private func markerButton(_ marker: Marker) -> some View {
         Button {
             controller.skipActiveMarker()
@@ -329,11 +413,26 @@ struct PlayerView: View {
     }
 
     private var expandedControlRow: some View {
+        HStack(spacing: 18) {
+            transportControlGroup
+            Spacer(minLength: 8)
+            playbackOptionGroup
+        }
+    }
+
+    private var transportControlGroup: some View {
         HStack(spacing: 12) {
             skipBackButton
             playPauseButton
             skipForwardButton
-            Spacer(minLength: 4)
+        }
+        .padding(.horizontal, 5)
+        .padding(.vertical, 4)
+        .background(.black.opacity(0.14), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    private var playbackOptionGroup: some View {
+        HStack(spacing: 12) {
             if pictureInPicture.isSupported { pictureInPictureButton }
             if controller.audioTracks.count > 1 { audioMenu }
             if !controller.subtitles.isEmpty { subtitleMenu }
@@ -341,6 +440,9 @@ struct PlayerView: View {
             autoplayButton
             statsButton
         }
+        .padding(.horizontal, 5)
+        .padding(.vertical, 4)
+        .background(.black.opacity(0.14), in: RoundedRectangle(cornerRadius: 12))
     }
 
     #if os(iOS)
