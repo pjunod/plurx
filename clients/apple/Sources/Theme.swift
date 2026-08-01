@@ -110,6 +110,58 @@ struct TVShelfActionButtonStyle: ButtonStyle {
     }
 }
 
+/// The player chrome should stay subordinate to the picture. These controls
+/// keep a compact, dark footprint and use only a hairline accent when focused
+/// instead of tvOS's large white focus plate.
+struct TVPlayerControlButtonStyle: ButtonStyle {
+    static let width: CGFloat = 54
+    static let height: CGFloat = 46
+
+    func makeBody(configuration: Configuration) -> Body {
+        Body(configuration: configuration)
+    }
+
+    struct Body: View {
+        let configuration: ButtonStyle.Configuration
+        @Environment(\.isFocused) private var isFocused
+        @Environment(\.isEnabled) private var isEnabled
+
+        var body: some View {
+            configuration.label
+                .font(.system(size: 23, weight: .semibold))
+                .foregroundStyle(.white)
+                .frame(
+                    width: TVPlayerControlButtonStyle.width,
+                    height: TVPlayerControlButtonStyle.height
+                )
+                .background(
+                    Palette.bg.opacity(isFocused ? 0.9 : 0.68),
+                    in: RoundedRectangle(cornerRadius: 11, style: .continuous)
+                )
+                .overlay {
+                    RoundedRectangle(cornerRadius: 11, style: .continuous)
+                        .stroke(
+                            isFocused ? Palette.accent.opacity(0.95) : Palette.outline.opacity(0.7),
+                            lineWidth: isFocused ? 1 : 0.5
+                        )
+                }
+                .scaleEffect(isFocused ? 1.035 : (configuration.isPressed ? 0.97 : 1))
+                .shadow(color: .black.opacity(isFocused ? 0.55 : 0), radius: 8, y: 4)
+                .opacity(isEnabled ? 1 : 0.42)
+                .animation(.easeOut(duration: 0.12), value: isFocused)
+                .animation(.easeOut(duration: 0.08), value: configuration.isPressed)
+        }
+    }
+}
+
+/// Three concentric sub-two-point strokes make the progress focus indicator a
+/// red hairline whose two edges fall back into black.
+enum TVPlayerProgressFocusRing {
+    static let outerStrokeWidth: CGFloat = 2
+    static let fadeStrokeWidth: CGFloat = 1.25
+    static let accentStrokeWidth: CGFloat = 0.5
+}
+
 /// Replaces tvOS's thick white focus plate with the same restrained red
 /// signal used throughout plurx. The hero still lifts enough to read from the
 /// couch without turning the artwork into a glowing white rectangle.

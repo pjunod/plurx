@@ -2,6 +2,7 @@ import SwiftUI
 
 #if os(tvOS)
 private enum PlayerControl: Hashable {
+    case reveal
     case close
     case progress
     case marker
@@ -17,12 +18,29 @@ private enum PlayerControl: Hashable {
 }
 #endif
 
+struct PlayerMetadataBadge: Equatable, Identifiable {
+    enum Kind: String, Equatable {
+        case resolution
+        case dynamicRange
+        case audio
+    }
+
+    let kind: Kind
+    let symbol: String
+    let mark: String?
+    let accessibilityLabel: String
+
+    var id: String { kind.rawValue }
+}
+
 /// Full-screen Apple player with an explicit on-demand transport. AVPlayer
 /// sees a growing plurx HLS playlist as an EVENT stream while the server is
 /// producing it, so relying on the system overlay alone labels a movie LIVE
 /// and can replace Pause with Stop. The controls here use the known film
 /// runtime and work for direct, remux, and transcode delivery alike.
 struct PlayerView: View {
+    static let controlAutoHideDelayNanoseconds: UInt64 = 4_000_000_000
+
     @EnvironmentObject var model: AppModel
     @Environment(\.dismiss) private var dismiss
 
@@ -53,6 +71,24 @@ struct PlayerView: View {
 
             PlayerSurface(player: controller.player, pictureInPicture: pictureInPicture)
                 .ignoresSafeArea()
+
+            #if os(tvOS)
+            if !controlsVisible {
+                Color.clear
+                    .contentShape(Rectangle())
+                    .ignoresSafeArea()
+                    .focusable()
+                    .focusEffectDisabled()
+                    .focused($focusedControl, equals: .reveal)
+                    .onTapGesture { revealControlsFromRemote() }
+                    .onMoveCommand { _ in revealControlsFromRemote() }
+                    .onPlayPauseCommand {
+                        controller.togglePlayPause()
+                        revealControlsFromRemote()
+                    }
+                    .accessibilityLabel("Show playback controls")
+            }
+            #endif
 
             #if os(iOS)
             Color.clear
@@ -135,20 +171,19 @@ struct PlayerView: View {
             controller.stop()
         }
         .task(id: autoHideGeneration) {
-            #if os(iOS)
-            guard controlsVisible,
-                  controller.isPlaying,
-                  !showStats,
-                  !isScrubbing,
-                  !controller.isChangingStream else { return }
-            try? await Task.sleep(nanoseconds: 3_500_000_000)
+            guard Self.shouldAutoHideControls(
+                visible: controlsVisible,
+                scrubbing: isScrubbing,
+                changingStream: controller.isChangingStream
+            ) else { return }
+            try? await Task.sleep(nanoseconds: Self.controlAutoHideDelayNanoseconds)
             guard !Task.isCancelled,
-                  controller.isPlaying,
-                  !showStats,
-                  !isScrubbing,
-                  !controller.isChangingStream else { return }
-            withAnimation(.easeOut(duration: 0.2)) { controlsVisible = false }
-            #endif
+                  Self.shouldAutoHideControls(
+                      visible: controlsVisible,
+                      scrubbing: isScrubbing,
+                      changingStream: controller.isChangingStream
+                  ) else { return }
+            hideControls()
         }
         .onChange(of: controller.isPlaying) { _, _ in revealControls() }
         .onChange(of: controller.isChangingStream) { _, _ in revealControls() }
@@ -167,16 +202,29 @@ struct PlayerView: View {
             }
         }
         #if os(tvOS)
-        .onExitCommand { dismiss() }
+        .onChange(of: focusedControl) { _, _ in
+            if controlsVisible { restartAutoHideTimer() }
+        }
+        .onExitCommand {
+            if controlsVisible {
+                hideControls()
+            } else {
+                dismiss()
+            }
+        }
         #endif
     }
 
     private var shouldShowControls: Bool {
-        #if os(tvOS)
-        true
-        #else
         controlsVisible
-        #endif
+    }
+
+    static func shouldAutoHideControls(
+        visible: Bool,
+        scrubbing: Bool,
+        changingStream: Bool
+    ) -> Bool {
+        visible && !scrubbing && !changingStream
     }
 
     private func toggleControls() {
@@ -194,17 +242,38 @@ struct PlayerView: View {
     }
 
     private func revealControls() {
-        #if os(iOS)
         withAnimation(.easeInOut(duration: 0.2)) { controlsVisible = true }
         restartAutoHideTimer()
-        #endif
     }
 
     private func restartAutoHideTimer() {
-        #if os(iOS)
         autoHideGeneration &+= 1
+    }
+
+    private func hideControls() {
+        guard controlsVisible else { return }
+        withAnimation(.easeOut(duration: 0.2)) {
+            controlsVisible = false
+            showStats = false
+        }
+        #if os(tvOS)
+        focusedControl = nil
+        Task { @MainActor in
+            await Task.yield()
+            if !controlsVisible { focusedControl = .reveal }
+        }
         #endif
     }
+
+    #if os(tvOS)
+    private func revealControlsFromRemote() {
+        revealControls()
+        Task { @MainActor in
+            await Task.yield()
+            if controlsVisible { focusedControl = .playPause }
+        }
+    }
+    #endif
 
     private var failureView: some View {
         VStack(spacing: 14) {
@@ -241,11 +310,8 @@ struct PlayerView: View {
     #endif
 
     private var playbackControls: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 8) {
             playbackInfoHeader
-
-            Divider()
-                .overlay(.white.opacity(0.15))
 
             if controller.knownDurationMs > 0 {
                 HStack(spacing: 10) {
@@ -302,24 +368,27 @@ struct PlayerView: View {
             .frame(maxWidth: .infinity)
             #endif
         }
-        .font(.title3)
-        .buttonStyle(.bordered)
         #if os(tvOS)
-        .tint(Palette.surfaceHi)
+        .font(.body)
+        .buttonStyle(TVPlayerControlButtonStyle())
+        .focusEffectDisabled()
         .foregroundStyle(.white)
         #else
+        .font(.title3)
+        .buttonStyle(.bordered)
         .tint(.white)
         #endif
-        .padding(12)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
         .frame(maxWidth: .infinity)
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
     }
 
     private var playbackInfoHeader: some View {
         #if os(tvOS)
-        HStack(alignment: .bottom, spacing: 30) {
+        HStack(alignment: .firstTextBaseline, spacing: 18) {
             playbackIdentity
-            Spacer(minLength: 20)
+            Spacer(minLength: 12)
             playbackFacts
         }
         #else
@@ -331,20 +400,28 @@ struct PlayerView: View {
     }
 
     private var playbackIdentity: some View {
-        VStack(alignment: .leading, spacing: 3) {
+        let context = [subtitle, year.map(String.init), runtimeLabel]
+            .compactMap { $0 }
+            .filter { !$0.isEmpty }
+            .joined(separator: "   ·   ")
+
+        #if os(tvOS)
+        return (
             Text(title)
-                #if os(tvOS)
-                .font(.title2.bold())
-                #else
+                .font(.system(size: 26, weight: .semibold))
+                .foregroundColor(.white)
+            + Text(context.isEmpty ? "" : "   ·   \(context)")
+                .font(.system(size: 22, design: .monospaced))
+                .foregroundColor(.white.opacity(0.76))
+        )
+        .lineLimit(1)
+        #else
+        return VStack(alignment: .leading, spacing: 3) {
+            Text(title)
                 .font(.headline.bold())
-                #endif
                 .foregroundColor(.white)
                 .lineLimit(1)
 
-            let context = [subtitle, year.map(String.init), runtimeLabel]
-                .compactMap { $0 }
-                .filter { !$0.isEmpty }
-                .joined(separator: "   ·   ")
             if !context.isEmpty {
                 Text(context)
                     .font(.system(.caption, design: .monospaced))
@@ -352,18 +429,42 @@ struct PlayerView: View {
                     .lineLimit(1)
             }
         }
+        #endif
     }
 
     private var playbackFacts: some View {
-        let facts = Self.playbackFacts(
+        let audio = controller.audioTracks.first { $0.index == controller.selectedAudio }
+            ?? controller.audioTracks.first { $0.default }
+            ?? controller.audioTracks.first
+        let badges = Self.playbackBadges(
             source: controller.decision?.source,
-            method: controller.decision == nil ? nil : controller.methodLabel
+            audio: audio
         )
-        return Text(facts.joined(separator: "   ·   "))
+        return HStack(spacing: 8) {
+            ForEach(badges) { badge in
+                HStack(spacing: 5) {
+                    Image(systemName: badge.symbol)
+                    if let mark = badge.mark {
+                        Text(mark)
+                            .fontWeight(.bold)
+                    }
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(.black.opacity(0.38), in: Capsule())
+                .overlay {
+                    Capsule().stroke(.white.opacity(0.22), lineWidth: 0.5)
+                }
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(badge.accessibilityLabel)
+            }
+        }
+            #if os(tvOS)
+            .font(.system(size: 19, design: .monospaced).weight(.medium))
+            #else
             .font(.system(.caption, design: .monospaced).weight(.semibold))
+            #endif
             .foregroundColor(.white.opacity(0.82))
-            .lineLimit(2)
-            .multilineTextAlignment(.trailing)
     }
 
     private var runtimeLabel: String? {
@@ -377,19 +478,74 @@ struct PlayerView: View {
         return hours > 0 ? "\(hours)h \(minutes)m" : "\(minutes)m"
     }
 
-    static func playbackFacts(source: SourceSummary?, method: String?) -> [String] {
-        var facts: [String] = []
+    static func playbackBadges(source: SourceSummary?, audio: AudioTrack?) -> [PlayerMetadataBadge] {
+        var badges: [PlayerMetadataBadge] = []
         if let height = source?.height {
-            facts.append(height >= 2160 ? "4K" : "\(height)p")
+            let label = height >= 2160 ? "4K" : "\(height)p"
+            badges.append(PlayerMetadataBadge(
+                kind: .resolution,
+                symbol: height >= 2160 ? "4k.tv.fill" : "tv.fill",
+                mark: height >= 2160 ? nil : label.uppercased(),
+                accessibilityLabel: label
+            ))
         }
-        if let hdr = source?.hdrFormat ?? source?.hdr?.uppercased(), !hdr.isEmpty {
-            facts.append(hdr)
+        if let hdr = source?.hdrFormat ?? source?.hdr, !hdr.isEmpty {
+            let dolbyVision = hdr.localizedCaseInsensitiveContains("dolby vision")
+            badges.append(PlayerMetadataBadge(
+                kind: .dynamicRange,
+                symbol: "sparkles",
+                mark: dolbyVision ? "DV" : "HDR",
+                accessibilityLabel: dolbyVision ? "Dolby Vision" : "HDR"
+            ))
         }
-        if let codec = source?.videoCodec?.uppercased(), !codec.isEmpty {
-            facts.append(codec)
+        if let audio, let sound = soundLabel(audio) {
+            badges.append(PlayerMetadataBadge(
+                kind: .audio,
+                symbol: "waveform",
+                mark: sound.mark,
+                accessibilityLabel: sound.accessibilityLabel
+            ))
         }
-        if let method, !method.isEmpty { facts.append(method) }
-        return facts
+        return badges
+    }
+
+    static func playbackFacts(source: SourceSummary?, audio: AudioTrack?) -> [String] {
+        playbackBadges(source: source, audio: audio).map(\.accessibilityLabel)
+    }
+
+    static func soundLabel(_ track: AudioTrack) -> (mark: String, accessibilityLabel: String)? {
+        let title = track.title ?? ""
+        let format: (mark: String, label: String)
+        if title.localizedCaseInsensitiveContains("atmos") {
+            format = ("ATMOS", "Dolby Atmos")
+        } else {
+            switch track.codec.lowercased() {
+            case "eac3", "e-ac-3": format = ("DD+", "Dolby Digital Plus")
+            case "ac3", "ac-3": format = ("DD", "Dolby Digital")
+            case "truehd": format = ("TRUEHD", "Dolby TrueHD")
+            case "dts", "dca": format = ("DTS", "DTS")
+            case "aac": format = ("AAC", "AAC")
+            case "flac": format = ("FLAC", "FLAC")
+            case "opus": format = ("OPUS", "Opus")
+            default:
+                let codec = track.codec.uppercased()
+                format = (codec, codec)
+            }
+        }
+        let channels: (mark: String, label: String)?
+        switch track.channels {
+        case 1: channels = ("1.0", "mono")
+        case 2: channels = ("2.0", "stereo")
+        case 6: channels = ("5.1", "5.1 channels")
+        case 8: channels = ("7.1", "7.1 channels")
+        case let count?: channels = ("\(count)CH", "\(count) channels")
+        case nil: channels = nil
+        }
+        guard !format.mark.isEmpty else { return nil }
+        return (
+            [format.mark, channels?.mark].compactMap { $0 }.joined(separator: " "),
+            [format.label, channels?.label].compactMap { $0 }.joined(separator: " ")
+        )
     }
 
     private func markerButton(_ marker: Marker) -> some View {
@@ -413,7 +569,7 @@ struct PlayerView: View {
     }
 
     private var expandedControlRow: some View {
-        HStack(spacing: 18) {
+        HStack(spacing: 12) {
             transportControlGroup
             Spacer(minLength: 8)
             playbackOptionGroup
@@ -421,18 +577,20 @@ struct PlayerView: View {
     }
 
     private var transportControlGroup: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 8) {
             skipBackButton
             playPauseButton
             skipForwardButton
         }
+        #if os(iOS)
         .padding(.horizontal, 5)
         .padding(.vertical, 4)
         .background(.black.opacity(0.14), in: RoundedRectangle(cornerRadius: 12))
+        #endif
     }
 
     private var playbackOptionGroup: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 8) {
             if pictureInPicture.isSupported { pictureInPictureButton }
             if controller.audioTracks.count > 1 { audioMenu }
             if !controller.subtitles.isEmpty { subtitleMenu }
@@ -440,9 +598,11 @@ struct PlayerView: View {
             autoplayButton
             statsButton
         }
+        #if os(iOS)
         .padding(.horizontal, 5)
         .padding(.vertical, 4)
         .background(.black.opacity(0.14), in: RoundedRectangle(cornerRadius: 12))
+        #endif
     }
 
     #if os(iOS)
@@ -468,6 +628,8 @@ struct PlayerView: View {
         }
         .accessibilityLabel("Back 10 seconds")
         #if os(tvOS)
+        .buttonStyle(TVPlayerControlButtonStyle())
+        .focusEffectDisabled()
         .focused($focusedControl, equals: .skipBack)
         #endif
     }
@@ -482,6 +644,8 @@ struct PlayerView: View {
         }
         .accessibilityLabel(controller.isPlaying ? "Pause" : "Play")
         #if os(tvOS)
+        .buttonStyle(TVPlayerControlButtonStyle())
+        .focusEffectDisabled()
         .focused($focusedControl, equals: .playPause)
         #endif
     }
@@ -495,6 +659,8 @@ struct PlayerView: View {
         }
         .accessibilityLabel("Forward 10 seconds")
         #if os(tvOS)
+        .buttonStyle(TVPlayerControlButtonStyle())
+        .focusEffectDisabled()
         .focused($focusedControl, equals: .skipForward)
         #endif
     }
@@ -512,6 +678,8 @@ struct PlayerView: View {
                             ? "Stop Picture in Picture"
                             : "Start Picture in Picture")
         #if os(tvOS)
+        .buttonStyle(TVPlayerControlButtonStyle())
+        .focusEffectDisabled()
         .focused($focusedControl, equals: .pictureInPicture)
         #endif
     }
@@ -526,6 +694,8 @@ struct PlayerView: View {
         }
         .accessibilityLabel(model.autoplay ? "Autoplay next on" : "Autoplay next off")
         #if os(tvOS)
+        .buttonStyle(TVPlayerControlButtonStyle())
+        .focusEffectDisabled()
         .focused($focusedControl, equals: .autoplay)
         #endif
     }
@@ -540,6 +710,8 @@ struct PlayerView: View {
         }
         .accessibilityLabel("Playback info")
         #if os(tvOS)
+        .buttonStyle(TVPlayerControlButtonStyle())
+        .focusEffectDisabled()
         .focused($focusedControl, equals: .stats)
         #endif
     }
@@ -595,10 +767,29 @@ struct PlayerView: View {
                         .fill(Palette.accent)
                         .frame(width: geometry.size.width * fraction)
                 }
+                .overlay {
+                    if focusedControl == .progress {
+                        ZStack {
+                            Capsule().stroke(
+                                .black.opacity(0.96),
+                                lineWidth: TVPlayerProgressFocusRing.outerStrokeWidth
+                            )
+                            Capsule().stroke(
+                                Palette.accent.opacity(0.34),
+                                lineWidth: TVPlayerProgressFocusRing.fadeStrokeWidth
+                            )
+                            Capsule().stroke(
+                                Palette.accent,
+                                lineWidth: TVPlayerProgressFocusRing.accentStrokeWidth
+                            )
+                        }
+                    }
+                }
             }
             .frame(height: 8)
         }
         .buttonStyle(.plain)
+        .focusEffectDisabled()
         .focused($focusedControl, equals: .progress)
         .onMoveCommand { direction in
             switch direction {
@@ -606,6 +797,7 @@ struct PlayerView: View {
             case .right: controller.skip(seconds: 30)
             default: break
             }
+            revealControls()
         }
         .accessibilityLabel("Playback position. Left or right seeks 30 seconds.")
     }
@@ -617,6 +809,8 @@ struct PlayerView: View {
         }
         .accessibilityLabel("Audio track")
         #if os(tvOS)
+        .buttonStyle(TVPlayerControlButtonStyle())
+        .focusEffectDisabled()
         .focused($focusedControl, equals: .audio)
         #endif
     }
@@ -628,6 +822,8 @@ struct PlayerView: View {
         }
         .accessibilityLabel("Subtitles")
         #if os(tvOS)
+        .buttonStyle(TVPlayerControlButtonStyle())
+        .focusEffectDisabled()
         .focused($focusedControl, equals: .subtitles)
         #endif
     }
@@ -638,6 +834,8 @@ struct PlayerView: View {
         }
         .accessibilityLabel("Playback quality")
         #if os(tvOS)
+        .buttonStyle(TVPlayerControlButtonStyle())
+        .focusEffectDisabled()
         .focused($focusedControl, equals: .quality)
         #endif
     }

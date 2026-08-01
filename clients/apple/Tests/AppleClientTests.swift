@@ -161,11 +161,41 @@ final class AppleClientTests: XCTestCase {
             bitrate: nil,
             durationMs: nil
         )
+        let audio = AudioTrack(
+            index: 0,
+            codec: "eac3",
+            channels: 6,
+            language: "eng",
+            title: nil,
+            default: true
+        )
 
         XCTAssertEqual(
-            PlayerView.playbackFacts(source: source, method: "Direct play"),
-            ["4K", "Dolby Vision · Profile 8", "HEVC", "Direct play"]
+            PlayerView.playbackFacts(source: source, audio: audio),
+            ["4K", "Dolby Vision", "Dolby Digital Plus 5.1 channels"]
         )
+        XCTAssertEqual(
+            PlayerView.playbackBadges(source: source, audio: audio).map(\.mark),
+            [nil, "DV", "DD+ 5.1"]
+        )
+    }
+
+    func testPlayerOverlayAutoHidesWheneverItIsIdle() {
+        XCTAssertFalse(PlayerView.shouldAutoHideControls(
+            visible: true,
+            scrubbing: true,
+            changingStream: false
+        ))
+        XCTAssertTrue(PlayerView.shouldAutoHideControls(
+            visible: true,
+            scrubbing: false,
+            changingStream: false
+        ))
+        XCTAssertFalse(PlayerView.shouldAutoHideControls(
+            visible: false,
+            scrubbing: false,
+            changingStream: false
+        ))
     }
 
     func testDetailBodyNeverOutgrowsItsAvailableWidth() {
@@ -288,6 +318,20 @@ final class AppleClientTests: XCTestCase {
             TVMediaCardButtonStyle.outerStrokeWidth - TVMediaCardButtonStyle.fadeStrokeWidth,
             TVMediaCardButtonStyle.fadeStrokeWidth - TVMediaCardButtonStyle.accentStrokeWidth,
             "the red core should taper evenly toward both black edges"
+        )
+    }
+
+    func testTVPlayerChromeStaysCompactWithAHairlineProgressFocusRing() {
+        XCTAssertLessThanOrEqual(TVPlayerControlButtonStyle.width, 54)
+        XCTAssertLessThanOrEqual(TVPlayerControlButtonStyle.height, 46)
+        XCTAssertLessThanOrEqual(TVPlayerProgressFocusRing.outerStrokeWidth, 2)
+        XCTAssertGreaterThan(
+            TVPlayerProgressFocusRing.outerStrokeWidth,
+            TVPlayerProgressFocusRing.fadeStrokeWidth
+        )
+        XCTAssertGreaterThan(
+            TVPlayerProgressFocusRing.fadeStrokeWidth,
+            TVPlayerProgressFocusRing.accentStrokeWidth
         )
     }
 
