@@ -86,8 +86,7 @@ struct LibraryView: View {
                     NavigationLink(value: Route.item(item.id)) {
                         PosterCard(
                             item: item,
-                            width: model.posterSize.posterWidth,
-                            source: model.libraryName(for: item, in: collection)
+                            width: model.posterSize.posterWidth
                         )
                     }
                     .posterButtonStyle()

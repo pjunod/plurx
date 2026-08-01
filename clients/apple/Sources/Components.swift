@@ -19,10 +19,9 @@ enum MediaRowStyle: Equatable {
 struct PosterCard: View {
     let item: Item
     var width: CGFloat = shelfPosterWidth
-    var source: String?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 7) {
+        VStack(alignment: .leading, spacing: 5) {
             ZStack(alignment: .bottomLeading) {
                 AuthImage(path: item.poster ?? item.backdrop)
                     .frame(width: width, height: width * 1.5)
@@ -51,22 +50,19 @@ struct PosterCard: View {
 
             Text(item.title)
                 #if os(tvOS)
-                .font(.headline.weight(.semibold))
+                .font(.callout.weight(.semibold))
                 #else
                 .font(.callout.weight(.semibold))
                 #endif
                 .foregroundColor(Palette.onBg)
                 .lineLimit(1)
-            HStack(spacing: 5) {
-                Text(mediaSubtitle(item))
-                if let source, !source.isEmpty {
-                    Text("·")
-                    Text(source)
-                }
+            let metadata = cardShelfMetadata(item)
+            if !metadata.isEmpty {
+                Text(metadata)
+                    .font(.system(.caption2, design: .rounded).weight(.medium))
+                    .foregroundColor(Palette.muted)
+                    .lineLimit(1)
             }
-            .font(.system(.caption, design: .monospaced))
-            .foregroundColor(Palette.muted)
-            .lineLimit(1)
         }
         .frame(width: width, alignment: .leading)
     }
@@ -95,10 +91,9 @@ struct PosterCard: View {
 struct LandscapeCard: View {
     let item: Item
     var width: CGFloat = shelfLandscapeWidth
-    var source: String?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 7) {
+        VStack(alignment: .leading, spacing: 5) {
             ZStack(alignment: .bottom) {
                 AuthImage(path: item.backdrop ?? item.poster)
                     .frame(width: width, height: width * 9 / 16)
@@ -112,16 +107,19 @@ struct LandscapeCard: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Spacer()
                     Text(item.showTitle ?? item.title)
+                        #if os(tvOS)
+                        .font(.callout.weight(.semibold))
+                        #else
                         .font(.headline.weight(.semibold))
+                        #endif
                         .foregroundColor(.white)
                         .lineLimit(1)
-                    HStack {
-                        Text(item.showTitle == nil ? mediaSubtitle(item) : episodeSubtitle(item))
-                        Spacer()
-                        if let remaining = timeRemaining(item) { Text(remaining) }
+                    if item.showTitle != nil {
+                        Text(item.title)
+                            .font(.caption)
+                            .foregroundColor(.white.opacity(0.76))
+                            .lineLimit(1)
                     }
-                    .font(.system(.caption, design: .monospaced))
-                    .foregroundColor(.white.opacity(0.76))
                 }
                 .padding(12)
 
@@ -137,9 +135,10 @@ struct LandscapeCard: View {
                     }
                 }
             }
-            if let source {
-                Text(source)
-                    .font(.system(.caption2, design: .monospaced))
+            let metadata = cardShelfMetadata(item)
+            if !metadata.isEmpty {
+                Text(metadata)
+                    .font(.system(.caption2, design: .rounded).weight(.medium))
                     .foregroundColor(Palette.muted)
                     .lineLimit(1)
             }
@@ -246,14 +245,12 @@ struct MediaRow: View {
                                 case .poster:
                                     PosterCard(
                                         item: item,
-                                        width: model.posterSize.posterWidth,
-                                        source: model.libraryName(for: item, in: collection)
+                                        width: model.posterSize.posterWidth
                                     )
                                 case .landscape:
                                     LandscapeCard(
                                         item: item,
-                                        width: model.posterSize.landscapeWidth,
-                                        source: model.libraryName(for: item, in: collection)
+                                        width: model.posterSize.landscapeWidth
                                     )
                                 case .episode:
                                     EpisodeCard(
@@ -391,17 +388,28 @@ func resolutionLabel(_ height: Int?) -> String? {
     return nil
 }
 
-private func episodeSubtitle(_ item: Item) -> String {
-    guard let season = item.seasonNumber, let episode = item.episodeNumber else { return item.title }
-    return "S\(season) E\(episode) · \(item.title)"
-}
-
 private func timeRemaining(_ item: Item) -> String? {
     guard let position = item.watch?.positionMs,
           let duration = item.watch?.durationMs ?? item.runtimeMs,
           duration > position else { return nil }
     let minutes = max(1, (duration - position) / 60_000)
     return "\(minutes)m left"
+}
+
+/// The shelf's lower line should identify the item, not repeat its library
+/// category. Episodes carry season/episode, movies carry year, and an active
+/// watch carries the genuinely useful remaining time.
+func cardShelfMetadata(_ item: Item) -> String {
+    var parts: [String] = []
+    if let season = item.seasonNumber, let episode = item.episodeNumber {
+        parts.append("S\(season) E\(episode)")
+    } else if let year = item.year {
+        parts.append(String(year))
+    }
+    if let remaining = timeRemaining(item) {
+        parts.append(remaining)
+    }
+    return parts.joined(separator: " · ")
 }
 
 private func shortDate(_ raw: String) -> String {

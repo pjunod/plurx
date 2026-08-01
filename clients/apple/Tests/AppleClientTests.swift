@@ -270,6 +270,24 @@ final class AppleClientTests: XCTestCase {
         }
     }
 
+    func testShelfMetadataUsesMediaFactsInsteadOfLibraryCategory() throws {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let episode = try decoder.decode(
+            Item.self,
+            from: Data(#"{"id":1,"kind":"episode","title":"Fray","season_number":4,"episode_number":2,"year":2026,"watch":{"position_ms":600000,"duration_ms":3240000}}"#.utf8)
+        )
+        let movie = try decoder.decode(
+            Item.self,
+            from: Data(#"{"id":2,"kind":"movie","title":"TRON: Ares","year":2025,"watch":{"position_ms":300000,"duration_ms":7200000}}"#.utf8)
+        )
+
+        XCTAssertEqual(cardShelfMetadata(episode), "S4 E2 · 44m left")
+        XCTAssertEqual(cardShelfMetadata(movie), "2025 · 115m left")
+        XCTAssertFalse(cardShelfMetadata(episode).contains("TV"))
+        XCTAssertFalse(cardShelfMetadata(movie).contains("Movies"))
+    }
+
     private func contrastRatio(_ foreground: Color, _ background: Color) -> CGFloat {
         let lighter = max(relativeLuminance(foreground), relativeLuminance(background))
         let darker = min(relativeLuminance(foreground), relativeLuminance(background))

@@ -224,15 +224,6 @@ extension View {
 
 // MARK: - Small formatting helpers
 
-func mediaSubtitle(_ item: Item) -> String {
-    if item.kind == "episode", let s = item.seasonNumber, let e = item.episodeNumber {
-        return "S\(s)·E\(e)"
-    }
-    if let y = item.year { return String(y) }
-    if let show = item.showTitle { return show }
-    return item.kind.prefix(1).uppercased() + item.kind.dropFirst()
-}
-
 func progressFraction(_ watch: Watch?, runtimeMs: Int?) -> Double {
     guard let watch, let pos = watch.positionMs else { return 0 }
     let dur = watch.durationMs ?? runtimeMs ?? 0
