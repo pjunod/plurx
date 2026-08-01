@@ -164,6 +164,9 @@ android: android-image ## Build the Android debug APK in Docker (no host JDK/SDK
 	  $(ANDROID_IMAGE) ./gradlew --no-daemon :app:assembleDebug
 	@echo "→ clients/android/app/build/outputs/apk/debug/app-debug.apk"
 
+.PHONY: apk
+apk: android ## Build the Android debug APK (alias for android)
+
 .PHONY: android-publish
 android-publish: android ## Build the APK + serve it from the web UI (ANDROID_DATA_DIR=/path/to/data)
 	@test -n "$(ANDROID_DATA_DIR)" || { echo "set ANDROID_DATA_DIR to the server's data_dir, e.g. make android-publish ANDROID_DATA_DIR=~/.local/share/plurx"; exit 1; }
