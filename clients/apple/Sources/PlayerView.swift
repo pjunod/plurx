@@ -372,6 +372,10 @@ struct PlayerView: View {
 
             #if os(tvOS)
             expandedControlRow
+            if let cue = Self.nowPlayingInfoCueLabel(showingInfo: showNowPlayingInfo) {
+                nowPlayingInfoCue(cue)
+                    .transition(.opacity)
+            }
             #else
             ViewThatFits(in: .horizontal) {
                 expandedControlRow
@@ -402,6 +406,20 @@ struct PlayerView: View {
     }
 
     #if os(tvOS)
+    private func nowPlayingInfoCue(_ label: String) -> some View {
+        Label(label, systemImage: "chevron.down")
+            .font(.system(size: 13, weight: .bold, design: .monospaced))
+            .foregroundStyle(.white.opacity(0.72))
+            .padding(.horizontal, 9)
+            .padding(.vertical, 3)
+            .background(.black.opacity(0.48), in: Capsule())
+            .overlay {
+                Capsule().stroke(.white.opacity(0.16), lineWidth: 0.5)
+            }
+            .frame(maxWidth: .infinity)
+            .accessibilityLabel("Press Down for information about what is playing")
+    }
+
     private var nowPlayingInfoSection: some View {
         VStack(alignment: .leading, spacing: 5) {
             Text("NOW PLAYING")
@@ -432,6 +450,10 @@ struct PlayerView: View {
     static func nowPlayingSummary(_ overview: String?) -> String {
         let summary = overview?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return summary.isEmpty ? "No description available." : summary
+    }
+
+    static func nowPlayingInfoCueLabel(showingInfo: Bool) -> String? {
+        showingInfo ? nil : "INFO"
     }
 
     private func playbackTimeLabel(_ milliseconds: Int) -> some View {

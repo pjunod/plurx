@@ -209,6 +209,11 @@ final class AppleClientTests: XCTestCase {
         XCTAssertEqual(PlayerView.nowPlayingSummary(nil), "No description available.")
     }
 
+    func testPlayerOffersDownCueUntilNowPlayingInfoIsVisible() {
+        XCTAssertEqual(PlayerView.nowPlayingInfoCueLabel(showingInfo: false), "INFO")
+        XCTAssertNil(PlayerView.nowPlayingInfoCueLabel(showingInfo: true))
+    }
+
     func testDetailBodyNeverOutgrowsItsAvailableWidth() {
         for availableWidth: CGFloat in [320, 390, 430, 744, 1_366] {
             let controller = UIHostingController(rootView: DetailBodyFrame {
