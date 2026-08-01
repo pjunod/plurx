@@ -329,22 +329,42 @@ impl MediaStore for SqliteStore {
     ) -> Result<Vec<RecentItem>, StoreError> {
         self.with_conn(move |conn| {
             // One card per movie, per show (latest episode represents the
-            // show), and — in home libraries — per video or folder. SQLite's
-            // bare-column-with-MAX picks that latest row. Photos are excluded
-            // on purpose: a 2,000-photo import would otherwise flood the home
-            // screen, and its videos and folders still surface it.
+            // show), and — in home libraries — per video or folder. A scan can
+            // insert several seasons inside the same second, so added_at alone
+            // cannot choose the representative episode: break ties by season,
+            // episode, then id so the card also gets the newest season poster.
+            // Photos are excluded on purpose: a 2,000-photo import would
+            // otherwise flood the home screen, and its videos and folders
+            // still surface it.
             let mut stmt = conn.prepare(&format!(
-                "SELECT {i}, show.title, season.poster_path, MAX(i.added_at) AS latest
-                 FROM items i
-                 LEFT JOIN items season
-                        ON season.id = i.parent_id AND i.kind = 'episode'
-                 LEFT JOIN items show ON show.id = season.parent_id
-                 WHERE i.kind IN ('movie','episode','video','folder')
-                   AND (?1 IS NULL OR i.library_id = ?1)
-                 GROUP BY CASE WHEN i.kind = 'episode' THEN 'show:' || show.id
-                               ELSE 'item:' || i.id END
-                 ORDER BY latest DESC LIMIT ?2",
-                i = item_cols("i")
+                "WITH ranked AS (
+                     SELECT {i},
+                            show.title AS rail_show_title,
+                            season.poster_path AS rail_season_poster,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY
+                                    CASE WHEN i.kind = 'episode' AND show.id IS NOT NULL
+                                         THEN 'show:' || show.id
+                                         ELSE 'item:' || i.id END
+                                ORDER BY i.added_at DESC,
+                                         COALESCE(season.season_number, -1) DESC,
+                                         COALESCE(i.episode_number, -1) DESC,
+                                         i.id DESC
+                            ) AS rail_rank
+                     FROM items i
+                     LEFT JOIN items season
+                            ON season.id = i.parent_id AND i.kind = 'episode'
+                     LEFT JOIN items show ON show.id = season.parent_id
+                     WHERE i.kind IN ('movie','episode','video','folder')
+                       AND (?1 IS NULL OR i.library_id = ?1)
+                 )
+                 SELECT {r}, r.rail_show_title, r.rail_season_poster
+                 FROM ranked r
+                 WHERE r.rail_rank = 1
+                 ORDER BY r.added_at DESC, r.id DESC
+                 LIMIT ?2",
+                i = item_cols("i"),
+                r = item_cols("r")
             ))?;
             let items = stmt
                 .query_map(params![library_id, limit], |row| {
@@ -1375,6 +1395,95 @@ mod tests {
             .expect("delete files");
         assert_eq!(store.prune_empty_items(lib.id).await.expect("prune"), 3);
         assert!(store.get_item(show).await.expect("get").is_none());
+    }
+
+    #[tokio::test]
+    async fn recently_added_uses_the_latest_seasons_poster_when_timestamps_tie() {
+        let store = SqliteStore::open_in_memory().expect("open");
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "TV".into(),
+                kind: LibraryKind::Shows,
+                paths: vec![PathBuf::from("/tv")],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+        let show = store
+            .insert_item(&NewItem {
+                library_id: lib.id,
+                kind: ItemKind::Show,
+                parent_id: None,
+                title: "Severance".into(),
+                year: Some(2022),
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("show");
+
+        let mut episode_ids = Vec::new();
+        for season_number in 1..=2 {
+            let season = store
+                .insert_item(&NewItem {
+                    library_id: lib.id,
+                    kind: ItemKind::Season,
+                    parent_id: Some(show),
+                    title: format!("Season {season_number}"),
+                    year: None,
+                    season_number: Some(season_number),
+                    episode_number: None,
+                })
+                .await
+                .expect("season");
+            store
+                .apply_metadata(
+                    season,
+                    &MetadataPatch {
+                        poster_path: Some(format!("season-{season_number}.jpg")),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("season poster");
+            let episode = store
+                .insert_item(&NewItem {
+                    library_id: lib.id,
+                    kind: ItemKind::Episode,
+                    parent_id: Some(season),
+                    title: format!("Episode {season_number}"),
+                    year: None,
+                    season_number: Some(season_number),
+                    episode_number: Some(1),
+                })
+                .await
+                .expect("episode");
+            episode_ids.push(episode);
+        }
+
+        // A scan inserts a batch in one second, so added_at cannot decide
+        // which season represents the show. The episode/season ordering must
+        // break the tie instead of letting SQLite choose an arbitrary row.
+        let first = episode_ids[0];
+        let second = episode_ids[1];
+        store
+            .with_conn(move |conn| {
+                conn.execute(
+                    "UPDATE items SET added_at = 100 WHERE id IN (?1, ?2)",
+                    rusqlite::params![first, second],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("tie timestamps");
+
+        let recent = store
+            .recently_added(Some(lib.id), 20)
+            .await
+            .expect("recent");
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].item.id, second);
+        assert_eq!(recent[0].season_poster.as_deref(), Some("season-2.jpg"));
     }
 
     #[tokio::test]
