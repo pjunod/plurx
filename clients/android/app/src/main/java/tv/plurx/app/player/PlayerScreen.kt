@@ -9,6 +9,7 @@ import android.os.Build
 import android.util.Rational
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -21,6 +22,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -30,6 +32,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.ClosedCaption
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Forward10
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Pause
@@ -41,6 +44,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
@@ -58,6 +62,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
@@ -430,7 +435,10 @@ private fun PlayerContent(
                 onScrubEnd = { controller.seekTo(scrubPreview); scrubbing = false; poke() },
                 onTracks = { panel = PlayerPanel.Tracks },
                 onSettings = { panel = PlayerPanel.Settings },
-                onInfo = { panel = PlayerPanel.Info },
+                onInfo = {
+                    controlsVisible = false
+                    panel = PlayerPanel.Info
+                },
                 onPip = if (canUsePip && activity != null) {
                     {
                         controlsVisible = false
@@ -618,14 +626,143 @@ private fun PlayerSettings(
 
 @Composable
 private fun PlayerInfo(plan: Plan, deliveryMode: String, bufferedPercent: Int, onDismiss: () -> Unit) {
-    PlayerPanelSurface("Playback info", onDismiss) {
-        Text("Delivery · ${deliveryMode.replaceFirstChar { it.uppercase() }}", color = Color.White)
-        Text("Buffered · $bufferedPercent%", color = Color.White)
-        Text("Duration · ${formatTime(plan.durationMs)}", color = Color.White)
-        if (plan.reasons.isNotEmpty()) {
-            Text("Decision", color = Muted, style = MaterialTheme.typography.labelMedium, modifier = Modifier.padding(top = 12.dp))
-            plan.reasons.forEach { Text("• $it", color = Color.White, style = MaterialTheme.typography.bodyMedium) }
+    PlaybackInfoOverlay(
+        title = plan.title,
+        fileId = plan.fileId,
+        deliveryMode = deliveryMode,
+        bufferedPercent = bufferedPercent,
+        durationMs = plan.durationMs,
+        reasons = plan.reasons,
+        onDismiss = onDismiss,
+    )
+}
+
+/** Floating playback details that preserve the video as their background. */
+@Composable
+internal fun PlaybackInfoOverlay(
+    title: String,
+    fileId: Long,
+    deliveryMode: String,
+    bufferedPercent: Int,
+    durationMs: Long,
+    reasons: List<String>,
+    onDismiss: () -> Unit,
+) {
+    val shape = MaterialTheme.shapes.large
+    Box(
+        Modifier.fillMaxSize().clickable(
+            interactionSource = remember { MutableInteractionSource() },
+            indication = null,
+            onClick = onDismiss,
+        ),
+    ) {
+        Column(
+            Modifier
+                .align(Alignment.Center)
+                .padding(horizontal = 20.dp, vertical = 28.dp)
+                .widthIn(max = 520.dp)
+                .fillMaxWidth()
+                .heightIn(max = 560.dp)
+                .clip(shape)
+                .background(Color(0xD917181E))
+                .border(1.dp, Color.White.copy(alpha = 0.14f), shape)
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null,
+                    onClick = {},
+                )
+                .verticalScroll(rememberScrollState())
+                .padding(20.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Row(verticalAlignment = Alignment.Top) {
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        "PLAYBACK",
+                        color = Accent,
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.Bold,
+                    )
+                    Text(
+                        "Playback info",
+                        color = Color.White,
+                        style = MaterialTheme.typography.titleLarge,
+                    )
+                    Text(
+                        title,
+                        color = Color.White.copy(alpha = 0.72f),
+                        style = MaterialTheme.typography.bodyMedium,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                IconButton(onClick = onDismiss) {
+                    Icon(Icons.Filled.Close, contentDescription = "Close playback info", tint = Color.White)
+                }
+            }
+
+            HorizontalDivider(color = Color.White.copy(alpha = 0.12f))
+
+            PlaybackInfoRow(
+                label = "Delivery",
+                value = deliveryMode.ifBlank { "unknown" }
+                    .replace('_', ' ')
+                    .replaceFirstChar { it.uppercase() },
+            )
+            PlaybackInfoRow("Buffered", "${bufferedPercent.coerceIn(0, 100)}%")
+            PlaybackInfoRow("Duration", formatTime(durationMs))
+            PlaybackInfoRow("File", "#$fileId")
+
+            if (reasons.isNotEmpty()) {
+                Text(
+                    "PLAYBACK DECISION",
+                    color = Color.White.copy(alpha = 0.58f),
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(top = 4.dp),
+                )
+                reasons.forEach { reason ->
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        verticalAlignment = Alignment.Top,
+                    ) {
+                        Text("•", color = Accent, fontWeight = FontWeight.Bold)
+                        Text(
+                            reason,
+                            color = Color.White.copy(alpha = 0.86f),
+                            style = MaterialTheme.typography.bodyMedium,
+                            modifier = Modifier.weight(1f),
+                        )
+                    }
+                }
+            }
         }
+    }
+}
+
+@Composable
+private fun PlaybackInfoRow(label: String, value: String) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .background(Color.White.copy(alpha = 0.07f), MaterialTheme.shapes.medium)
+            .padding(horizontal = 14.dp, vertical = 12.dp),
+        horizontalArrangement = Arrangement.spacedBy(16.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            label,
+            color = Color.White.copy(alpha = 0.62f),
+            style = MaterialTheme.typography.labelLarge,
+            modifier = Modifier.weight(1f),
+        )
+        Text(
+            value,
+            color = Color.White,
+            style = MaterialTheme.typography.bodyMedium,
+            fontWeight = FontWeight.SemiBold,
+        )
     }
 }
 
