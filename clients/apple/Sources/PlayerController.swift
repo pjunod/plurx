@@ -237,11 +237,13 @@ final class PlayerController: ObservableObject {
             self.decision = decision
             if knownDurationMs <= 0 { knownDurationMs = decision.source?.durationMs ?? 0 }
             selectedAudio = decision.audio?.first(where: { $0.default })?.index
-            // The server's default flag already contains its Auto/Always/Off
-            // subtitle rule. A local explicit Off remains an override.
-            if model.subLang != "off" {
-                selectedSubtitle = decision.subtitles?.first(where: { $0.default })?.index
-            }
+            // Container defaults describe the muxer's primary language, not
+            // this viewer. Choose only within the preferred language and
+            // prefer a forced/narrative track before a full subtitle track.
+            selectedSubtitle = Self.automaticSubtitleIndex(
+                decision.subtitles ?? [],
+                preferredLanguage: model.subLang
+            )
             try await open(decision: decision, at: startMs)
         } catch {
             fail(error)
@@ -540,6 +542,45 @@ final class PlayerController: ObservableObject {
         ]
         if let two = map[code] { return [two, code] }
         return [code]
+    }
+
+    /// Pick the subtitle the player may enable automatically. Never fall back
+    /// to a flagged container default in another language: an Italian-first
+    /// mux can otherwise burn Italian captions while English audio is playing.
+    /// Some release muxes omit the forced disposition and retain only a
+    /// "Forced" title, so both signals are meaningful.
+    static func automaticSubtitleIndex(
+        _ tracks: [SubtitleTrack],
+        preferredLanguage: String
+    ) -> Int? {
+        guard preferredLanguage.lowercased() != "off" else { return nil }
+        let matching = tracks.filter {
+            languageCode($0.language) == languageCode(preferredLanguage)
+        }
+        guard !matching.isEmpty else { return nil }
+        return matching.first(where: {
+            $0.forced || $0.title?.localizedCaseInsensitiveContains("forced") == true
+        })?.index
+            ?? matching.first(where: { $0.default })?.index
+            ?? matching.first?.index
+    }
+
+    /// Collapse the common ISO 639-1 and 639-2/B spellings used by settings
+    /// and ffprobe into the same comparison key.
+    private static func languageCode(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        let code = raw
+            .lowercased()
+            .replacingOccurrences(of: "_", with: "-")
+            .split(separator: "-")
+            .first
+            .map(String.init) ?? ""
+        let aliases = [
+            "eng": "en", "jpn": "ja", "spa": "es", "fre": "fr", "fra": "fr",
+            "ger": "de", "deu": "de", "ita": "it", "por": "pt", "kor": "ko",
+            "chi": "zh", "zho": "zh", "rus": "ru", "hin": "hi", "ara": "ar",
+        ]
+        return aliases[code] ?? (code.isEmpty ? nil : code)
     }
 
     private static func legacyMode(_ method: String) -> String {

@@ -19,6 +19,10 @@ enum APIError: Error, LocalizedError {
 /// models stay idiomatic.
 struct PlurxAPI {
     let origin: String
+    /// A cold embedded-subtitle extraction can require one full sequential
+    /// read of a large MKV before the HLS session exists. Keep ordinary API
+    /// calls brisk, but let this explicit playback-preparation action finish.
+    static let playbackPreparationTimeout: TimeInterval = 180
     /// A local-network request may be the operation that causes iOS to show
     /// its permission sheet. The first request must wait for that choice,
     /// rather than failing underneath the sheet and making login work only on
@@ -28,6 +32,13 @@ struct PlurxAPI {
         configuration.waitsForConnectivity = true
         configuration.timeoutIntervalForRequest = 30
         configuration.timeoutIntervalForResource = 30
+        return URLSession(configuration: configuration)
+    }()
+    private static let playbackPreparationSession: URLSession = {
+        let configuration = URLSessionConfiguration.default
+        configuration.waitsForConnectivity = true
+        configuration.timeoutIntervalForRequest = playbackPreparationTimeout
+        configuration.timeoutIntervalForResource = playbackPreparationTimeout
         return URLSession(configuration: configuration)
     }()
     private var session: URLSession { Self.waitingSession }
@@ -56,10 +67,14 @@ struct PlurxAPI {
         return try await run(req)
     }
 
-    private func post<B: Encodable, T: Decodable>(_ path: String, body: B) async throws -> T {
+    private func post<B: Encodable, T: Decodable>(
+        _ path: String,
+        body: B,
+        using session: URLSession? = nil
+    ) async throws -> T {
         var req = try jsonRequest(path, body: body)
         Session.shared.authorize(&req)
-        return try await run(req)
+        return try await run(req, using: session)
     }
 
     private func post<T: Decodable>(_ path: String) async throws -> T {
@@ -86,10 +101,13 @@ struct PlurxAPI {
         return req
     }
 
-    private func run<T: Decodable>(_ req: URLRequest) async throws -> T {
+    private func run<T: Decodable>(
+        _ req: URLRequest,
+        using session: URLSession? = nil
+    ) async throws -> T {
         let data: Data
         let resp: URLResponse
-        do { (data, resp) = try await session.data(for: req) }
+        do { (data, resp) = try await (session ?? self.session).data(for: req) }
         catch { throw Self.transportError(from: error) }
         try Self.check(resp)
         return try Self.decoder.decode(T.self, from: data)
@@ -164,7 +182,11 @@ struct PlurxAPI {
     /// `playback_id` and a per-attempt `request_id` so a replay recovers the
     /// same session instead.
     func createHlsSession(fileId: Int, body: CreateSessionRequest) async throws -> HlsStart {
-        try await post("files/\(fileId)/hls/sessions", body: body)
+        try await post(
+            "files/\(fileId)/hls/sessions",
+            body: body,
+            using: Self.playbackPreparationSession
+        )
     }
 
     func hlsStatus(sessionId: String) async throws -> PlaybackSessionStatus {

@@ -122,6 +122,45 @@ final class AppleClientTests: XCTestCase {
         ))
     }
 
+    @MainActor
+    func testAutomaticSubtitlesFollowViewerLanguageNotContainerDefault() {
+        let tracks = [
+            SubtitleTrack(
+                index: 0, codec: "subrip", language: "ita", title: "Forced",
+                default: true, forced: true, text: true
+            ),
+            SubtitleTrack(
+                index: 1, codec: "subrip", language: "ita", title: "Regular",
+                default: false, forced: false, text: true
+            ),
+            // This is the affected Scary Movie shape: the mux retained the
+            // English Forced title but omitted its forced disposition.
+            SubtitleTrack(
+                index: 2, codec: "subrip", language: "eng", title: "Forced",
+                default: false, forced: false, text: true
+            ),
+            SubtitleTrack(
+                index: 3, codec: "subrip", language: "eng", title: "Regular",
+                default: false, forced: false, text: true
+            ),
+        ]
+
+        XCTAssertEqual(
+            PlayerController.automaticSubtitleIndex(tracks, preferredLanguage: "eng"),
+            2
+        )
+        XCTAssertEqual(
+            PlayerController.automaticSubtitleIndex(tracks, preferredLanguage: "en-US"),
+            2
+        )
+        XCTAssertNil(
+            PlayerController.automaticSubtitleIndex(tracks, preferredLanguage: "spa")
+        )
+        XCTAssertNil(
+            PlayerController.automaticSubtitleIndex(tracks, preferredLanguage: "off")
+        )
+    }
+
     func testOriginNormalizationAcceptsHostnamesAndRemovesTrailingSlashes() {
         XCTAssertEqual(AppModel.normalizeOrigin("  media-box:32400///  "), "http://media-box:32400")
         XCTAssertEqual(AppModel.normalizeOrigin("media-box"), "http://media-box:32400")
@@ -249,6 +288,7 @@ final class AppleClientTests: XCTestCase {
         XCTAssertEqual(json["start"] as? Double, 12.5)
         XCTAssertNotNil(json["request_id"] as? String)
         XCTAssertNil(json["height"])
+        XCTAssertEqual(PlurxAPI.playbackPreparationTimeout, 180)
     }
 
     func testAppleCapsDescribeDolbyVisionProfilesWithoutDeprecatedHDRAPI() {
