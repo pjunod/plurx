@@ -170,8 +170,9 @@ enum TVPlayerChromeMetrics {
     static let headerVerticalInset: CGFloat = 5
     static let timeHorizontalInset: CGFloat = 6
     static let timeVerticalInset: CGFloat = 3
-    static let infoHeadingFontSize: CGFloat = 15
-    static let infoBodyFontSize: CGFloat = 26
+    static let infoHeadingFontSize: CGFloat = 13
+    static let infoBodyFontSize: CGFloat = 17
+    static let infoLineLimit = 8
 }
 
 /// Replaces tvOS's thick white focus plate with the same restrained red

@@ -369,7 +369,8 @@ final class AppleClientTests: XCTestCase {
         XCTAssertLessThanOrEqual(TVPlayerChromeMetrics.headerVerticalInset, 5)
         XCTAssertLessThanOrEqual(TVPlayerChromeMetrics.timeHorizontalInset, 6)
         XCTAssertLessThanOrEqual(TVPlayerChromeMetrics.timeVerticalInset, 3)
-        XCTAssertGreaterThanOrEqual(TVPlayerChromeMetrics.infoBodyFontSize, 24)
+        XCTAssertLessThanOrEqual(TVPlayerChromeMetrics.infoBodyFontSize, 18)
+        XCTAssertGreaterThanOrEqual(TVPlayerChromeMetrics.infoLineLimit, 6)
         XCTAssertLessThanOrEqual(TVPlayerProgressFocusRing.outerStrokeWidth, 1.5)
         XCTAssertGreaterThan(
             TVPlayerProgressFocusRing.outerStrokeWidth,

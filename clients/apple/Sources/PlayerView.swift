@@ -428,10 +428,11 @@ struct PlayerView: View {
             Text(Self.nowPlayingSummary(overview))
                 .font(.system(size: TVPlayerChromeMetrics.infoBodyFontSize, weight: .regular))
                 .foregroundStyle(.white.opacity(0.88))
-                .lineLimit(4)
+                .lineLimit(TVPlayerChromeMetrics.infoLineLimit)
+                .fixedSize(horizontal: false, vertical: true)
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
         .frame(maxWidth: 980, alignment: .leading)
         .background(
             Palette.bg.opacity(0.68),
