@@ -53,6 +53,8 @@ data class HomeState(
 
 data class PlaybackTarget(val itemId: Long, val fileId: Long, val startMs: Long = 0)
 
+data class EpisodePlaybackTarget(val episode: Item, val playback: PlaybackTarget)
+
 /**
  * Single view-model for the whole app (manual DI — no Hilt). Owns the session
  * lifecycle (silent reconnect, connect, login, logout) and exposes suspend
@@ -316,6 +318,39 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val detail = itemDetail(item.id)
         val file = detail.files.firstOrNull { it.available } ?: return null
         return PlaybackTarget(item.id, file.id)
+    }
+
+    suspend fun seriesPlayback(detail: ItemDetail): EpisodePlaybackTarget? = when (detail.item.kind) {
+        "season" -> playableEpisode(orderedEpisodeCandidates(detail.children))
+        "show" -> {
+            var target: EpisodePlaybackTarget? = null
+            for (season in orderedSeasonCandidates(detail.children)) {
+                target = playableEpisode(orderedEpisodeCandidates(itemDetail(season.id).children))
+                if (target != null) break
+            }
+            target
+        }
+        else -> null
+    }
+
+    suspend fun episodePlayback(episode: Item): EpisodePlaybackTarget? = playableEpisode(listOf(episode))
+
+    private suspend fun playableEpisode(episodes: List<Item>): EpisodePlaybackTarget? {
+        for (episode in episodes) {
+            val detail = itemDetail(episode.id)
+            val file = detail.files.firstOrNull { it.available } ?: continue
+            val positionMs = detail.item.watch?.position_ms ?: episode.watch?.position_ms ?: 0L
+            val durationMs = file.duration_ms ?: detail.item.runtime_ms ?: episode.runtime_ms
+            return EpisodePlaybackTarget(
+                episode = detail.item,
+                playback = PlaybackTarget(
+                    itemId = detail.item.id,
+                    fileId = file.id,
+                    startMs = resumableStartMs(positionMs, durationMs),
+                ),
+            )
+        }
+        return null
     }
 
     suspend fun createHlsSession(fileId: Long, body: CreateSessionReq): HlsStart =
