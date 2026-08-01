@@ -17,7 +17,6 @@ import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -36,6 +35,7 @@ import tv.plurx.app.data.ThemeId
 import tv.plurx.app.ui.components.ChoicePicker
 import tv.plurx.app.ui.components.LoadingBox
 import tv.plurx.app.ui.components.MediaRow
+import tv.plurx.app.ui.components.TvIconButton
 import tv.plurx.app.ui.theme.Accent
 import tv.plurx.app.ui.theme.Muted
 
@@ -160,13 +160,13 @@ internal fun HomeTopBar(
         username?.let {
             Text(it, color = Muted, style = MaterialTheme.typography.labelMedium, modifier = Modifier.padding(end = 4.dp))
         }
-        IconButton(onClick = onRefresh) {
+        TvIconButton(onClick = onRefresh) {
             Icon(Icons.Filled.Refresh, contentDescription = "Refresh", tint = Muted)
         }
-        IconButton(onClick = onSearch) {
+        TvIconButton(onClick = onSearch) {
             Icon(Icons.Filled.Search, contentDescription = "Search", tint = Muted)
         }
-        IconButton(onClick = onOpenSettings) {
+        TvIconButton(onClick = onOpenSettings) {
             Icon(Icons.Filled.Settings, contentDescription = "Settings", tint = Muted)
         }
     }

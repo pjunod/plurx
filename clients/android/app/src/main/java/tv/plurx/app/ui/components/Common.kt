@@ -79,7 +79,8 @@ fun PosterCard(
     onClick: () -> Unit,
 ) {
     var focused by remember { mutableStateOf(false) }
-    val scale by animateFloatAsState(if (focused) 1.06f else 1f, label = "poster-scale")
+    val scale by animateFloatAsState(if (focused) 1.08f else 1f, label = "poster-scale")
+    val focusRing = tvFocusGradient()
 
     Column(
         modifier
@@ -95,10 +96,12 @@ fun PosterCard(
                 .aspectRatio(2f / 3f)
                 .clip(MaterialTheme.shapes.medium)
                 .background(SurfaceHi)
-                .border(
-                    width = if (focused) 2.dp else 0.dp,
-                    color = if (focused) Accent else Color.Transparent,
-                    shape = MaterialTheme.shapes.medium,
+                .then(
+                    if (focused) {
+                        Modifier.border(2.dp, focusRing, MaterialTheme.shapes.medium)
+                    } else {
+                        Modifier
+                    },
                 )
         ) {
             NetworkImage(imageUrl(item.poster), Modifier.fillMaxSize())
@@ -184,7 +187,10 @@ fun MediaRow(
                     "View all",
                     color = Accent,
                     style = MaterialTheme.typography.labelLarge,
-                    modifier = Modifier.clickable(onClick = onViewAll).padding(8.dp),
+                    modifier = Modifier
+                        .tvFocusRing(MaterialTheme.shapes.small)
+                        .clickable(onClick = onViewAll)
+                        .padding(8.dp),
                 )
             }
         }
@@ -217,6 +223,7 @@ fun <T> ChoicePicker(
                     .fillMaxWidth()
                     .background(SurfaceHi, MaterialTheme.shapes.small)
                     .border(1.dp, Outline, MaterialTheme.shapes.small)
+                    .tvFocusRing(MaterialTheme.shapes.small, focusedScale = 1.03f)
                     .clickable { open = true }
                     .focusable()
                     .padding(horizontal = 16.dp, vertical = 14.dp),
@@ -224,6 +231,7 @@ fun <T> ChoicePicker(
             DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
                 options.forEach { option ->
                     DropdownMenuItem(
+                        modifier = Modifier.tvFocusRing(MaterialTheme.shapes.small, focusedScale = 1.02f),
                         text = {
                             Text(
                                 optionLabel(option),

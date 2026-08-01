@@ -17,7 +17,6 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
@@ -38,6 +37,7 @@ import tv.plurx.app.data.Item
 import tv.plurx.app.ui.components.LoadingBox
 import tv.plurx.app.ui.components.PosterCard
 import tv.plurx.app.ui.components.SafeTopRow
+import tv.plurx.app.ui.components.TvIconButton
 import tv.plurx.app.ui.theme.Muted
 
 @Composable
@@ -78,7 +78,7 @@ fun SearchScreen(
         SafeTopRow(
             Modifier.fillMaxWidth().padding(start = side - 12.dp, end = side, top = 8.dp),
         ) {
-            IconButton(onClick = onBack) {
+            TvIconButton(onClick = onBack) {
                 Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
             }
             OutlinedTextField(
@@ -88,7 +88,7 @@ fun SearchScreen(
                 placeholder = { Text("Search movies, shows, episodes, tags…") },
                 leadingIcon = { Icon(Icons.Filled.Search, contentDescription = null) },
                 trailingIcon = if (query.isNotEmpty()) {
-                    { IconButton(onClick = { query = "" }) { Icon(Icons.Filled.Close, contentDescription = "Clear") } }
+                    { TvIconButton(onClick = { query = "" }) { Icon(Icons.Filled.Close, contentDescription = "Clear") } }
                 } else null,
                 singleLine = true,
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),

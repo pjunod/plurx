@@ -21,6 +21,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -45,6 +46,7 @@ import tv.plurx.app.data.Session
 import tv.plurx.app.ui.AppViewModel
 import tv.plurx.app.ui.theme.Accent
 import tv.plurx.app.ui.theme.Muted
+import tv.plurx.app.ui.components.tvFocusRing
 import java.util.Locale
 import java.util.UUID
 
@@ -283,6 +285,7 @@ fun TrackMenu(
         Modifier
             .fillMaxSize()
             .background(Color(0x99000000))
+            .focusProperties { canFocus = false }
             .clickable(onClick = onDismiss),
     ) {
         Column(
@@ -383,6 +386,7 @@ private fun TrackRow(label: String, selected: Boolean, enabled: Boolean, onClick
         style = MaterialTheme.typography.bodyMedium,
         modifier = Modifier
             .fillMaxWidth()
+            .tvFocusRing(MaterialTheme.shapes.small, focusedScale = 1.02f)
             .clickable(enabled = enabled, onClick = onClick)
             .padding(vertical = 8.dp),
     )

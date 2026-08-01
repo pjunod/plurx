@@ -26,10 +26,8 @@ import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material3.Button
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -55,8 +53,11 @@ import tv.plurx.app.ui.components.LoadingBox
 import tv.plurx.app.ui.components.NetworkImage
 import tv.plurx.app.ui.components.PosterCard
 import tv.plurx.app.ui.components.SafeBackButton
+import tv.plurx.app.ui.components.TvButton
+import tv.plurx.app.ui.components.TvOutlinedButton
 import tv.plurx.app.ui.components.formatTime
 import tv.plurx.app.ui.components.imageUrl
+import tv.plurx.app.ui.components.tvFocusRing
 import tv.plurx.app.ui.theme.Accent
 import tv.plurx.app.ui.theme.Bg
 import tv.plurx.app.ui.theme.Muted
@@ -261,21 +262,21 @@ private fun Actions(
     ) {
         if (item.kind == "photo") {
             item {
-                Button(onClick = { onViewPhoto(item.id) }) {
+                TvButton(onClick = { onViewPhoto(item.id) }) {
                     Icon(Icons.Filled.Image, contentDescription = null)
                     Text("  View full size")
                 }
             }
         } else if (playable != null && item.isPlayableVideo) {
             item {
-                Button(onClick = { onPlay(item.id, playable.id, if (canResume) resumeMs else 0L) }) {
+                TvButton(onClick = { onPlay(item.id, playable.id, if (canResume) resumeMs else 0L) }) {
                     Icon(Icons.Filled.PlayArrow, contentDescription = null, modifier = Modifier.size(20.dp))
                     Text(if (canResume) "  Resume · ${formatTime(resumeMs)}" else "  Play", fontWeight = FontWeight.SemiBold)
                 }
             }
             if (canResume) {
                 item {
-                    OutlinedButton(onClick = { onPlay(item.id, playable.id, 0L) }) {
+                    TvOutlinedButton(onClick = { onPlay(item.id, playable.id, 0L) }) {
                         Icon(Icons.Filled.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
                         Text("  Start over")
                     }
@@ -288,7 +289,7 @@ private fun Actions(
         if (rollup != null) {
             if (rollup.leaves > rollup.watched) {
                 item {
-                    OutlinedButton(enabled = !changingWatch, onClick = {
+                    TvOutlinedButton(enabled = !changingWatch, onClick = {
                         changingWatch = true
                         scope.launch { runCatching { vm.setWatched(item.id, true) }; changingWatch = false; onWatchedChanged() }
                     }) { Text("Mark ${containerNoun(item.kind)} watched") }
@@ -296,7 +297,7 @@ private fun Actions(
             }
             if (rollup.watched > 0) {
                 item {
-                    OutlinedButton(enabled = !changingWatch, onClick = {
+                    TvOutlinedButton(enabled = !changingWatch, onClick = {
                         changingWatch = true
                         scope.launch { runCatching { vm.setWatched(item.id, false) }; changingWatch = false; onWatchedChanged() }
                     }) { Text("Mark ${containerNoun(item.kind)} unwatched") }
@@ -304,7 +305,7 @@ private fun Actions(
             }
         } else if (item.kind != "photo") {
             item {
-                OutlinedButton(enabled = !changingWatch, onClick = {
+                TvOutlinedButton(enabled = !changingWatch, onClick = {
                     changingWatch = true
                     scope.launch { runCatching { vm.setWatched(item.id, !watched) }; changingWatch = false; onWatchedChanged() }
                 }) {
@@ -326,7 +327,7 @@ private fun VersionCard(file: MediaFileDto, showPlay: Boolean, onPlay: () -> Uni
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(label ?: file.filename, style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
             if (!file.available) SpecChip("Missing", MaterialTheme.colorScheme.error)
-            if (showPlay) OutlinedButton(onClick = onPlay) { Text("Play") }
+            if (showPlay) TvOutlinedButton(onClick = onPlay) { Text("Play") }
         }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             videoBadges(file).forEach { SpecChip(it) }
@@ -348,7 +349,11 @@ private fun VersionCard(file: MediaFileDto, showPlay: Boolean, onPlay: () -> Uni
 @Composable
 private fun EpisodeRow(item: Item, side: androidx.compose.ui.unit.Dp, onClick: () -> Unit) {
     Row(
-        Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = side, vertical = 9.dp),
+        Modifier
+            .fillMaxWidth()
+            .tvFocusRing(MaterialTheme.shapes.medium, focusedScale = 1.02f)
+            .clickable(onClick = onClick)
+            .padding(horizontal = side, vertical = 9.dp),
         horizontalArrangement = Arrangement.spacedBy(14.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
