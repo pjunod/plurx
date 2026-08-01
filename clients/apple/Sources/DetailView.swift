@@ -29,6 +29,20 @@ struct DetailBodyFrame<Content: View>: View {
     }
 }
 
+/// Constrains the detail page to the ScrollView's visible width. Unlike an
+/// outer GeometryReader, this accounts for the navigation container's safe
+/// area and any iPad sidebar before proposing a width to the page content.
+struct DetailViewportFrame<Content: View>: View {
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        ScrollView {
+            content
+                .containerRelativeFrame(.horizontal, alignment: .leading)
+        }
+    }
+}
+
 #if os(tvOS)
 enum TVSeriesDetailMetrics {
     static let headerHeight: CGFloat = 460
@@ -57,28 +71,21 @@ struct DetailView: View {
     @State private var actionError: String?
 
     var body: some View {
-        // A vertical ScrollView does not reliably constrain a child's ideal
-        // width. The artwork and full-width buttons can otherwise make the
-        // whole detail page wider than a compact iPhone and center the excess
-        // off both edges. Pin every state to the actual visible viewport.
-        GeometryReader { viewport in
-            ScrollView {
-                Group {
-                    if let detail {
-                        content(detail)
-                    } else if let loadError {
-                        ContentUnavailableView(
-                            "Couldn't load this title",
-                            systemImage: "exclamationmark.triangle",
-                            description: Text(loadError)
-                        )
+        DetailViewportFrame {
+            Group {
+                if let detail {
+                    content(detail)
+                } else if let loadError {
+                    ContentUnavailableView(
+                        "Couldn't load this title",
+                        systemImage: "exclamationmark.triangle",
+                        description: Text(loadError)
+                    )
+                    .frame(maxWidth: .infinity).padding(.top, 80)
+                } else {
+                    ProgressView().tint(Palette.accent)
                         .frame(maxWidth: .infinity).padding(.top, 80)
-                    } else {
-                        ProgressView().tint(Palette.accent)
-                            .frame(maxWidth: .infinity).padding(.top, 80)
-                    }
                 }
-                .frame(width: viewport.size.width, alignment: .leading)
             }
         }
         .background(Palette.bg.ignoresSafeArea())

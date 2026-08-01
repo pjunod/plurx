@@ -214,11 +214,13 @@ final class AppleClientTests: XCTestCase {
         XCTAssertNil(PlayerView.nowPlayingInfoCueLabel(showingInfo: true))
     }
 
-    func testDetailBodyNeverOutgrowsItsAvailableWidth() {
+    func testDetailViewportAndBodyNeverOutgrowTheirAvailableWidth() {
         for availableWidth: CGFloat in [320, 390, 430, 744, 1_366] {
-            let controller = UIHostingController(rootView: DetailBodyFrame {
-                Text(String(repeating: "A wide detail overview. ", count: 20))
-                    .fixedSize(horizontal: false, vertical: true)
+            let controller = UIHostingController(rootView: DetailViewportFrame {
+                DetailBodyFrame {
+                    Text(String(repeating: "A wide detail overview. ", count: 20))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             })
             let measured = controller.sizeThatFits(
                 in: CGSize(width: availableWidth, height: 10_000)

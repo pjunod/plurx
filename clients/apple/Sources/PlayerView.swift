@@ -321,13 +321,6 @@ struct PlayerView: View {
             playbackInfoHeader
             #endif
 
-            #if os(tvOS)
-            if showNowPlayingInfo {
-                nowPlayingInfoSection
-                    .transition(.opacity.combined(with: .move(edge: .bottom)))
-            }
-            #endif
-
             if controller.knownDurationMs > 0 {
                 HStack(spacing: 10) {
                     playbackTimeLabel(Int(isScrubbing ? scrubMs : Double(controller.currentMs)))
@@ -372,7 +365,10 @@ struct PlayerView: View {
 
             #if os(tvOS)
             expandedControlRow
-            if let cue = Self.nowPlayingInfoCueLabel(showingInfo: showNowPlayingInfo) {
+            if showNowPlayingInfo {
+                nowPlayingInfoSection
+                    .transition(.opacity.combined(with: .move(edge: .bottom)))
+            } else if let cue = Self.nowPlayingInfoCueLabel(showingInfo: showNowPlayingInfo) {
                 nowPlayingInfoCue(cue)
                     .transition(.opacity)
             }
