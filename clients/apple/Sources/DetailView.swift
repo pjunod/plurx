@@ -563,7 +563,9 @@ struct DetailView: View {
         }
         if item.kind != "episode", let year = item.year { parts.append(String(year)) }
         if let durationMs, durationMs > 0 { parts.append(tvRuntimeLabel(durationMs)) }
-        if let resolution = resolutionLabel(file?.height ?? item.resolution) {
+        if let resolution = file.flatMap({
+            resolutionLabel(width: $0.width, height: $0.height)
+        }) ?? resolutionLabel(item.resolution) {
             parts.append(resolution)
         }
         if let codec = file?.videoCodec, !codec.isEmpty {
@@ -752,7 +754,9 @@ struct DetailView: View {
                 accessibilityLabel: runtime
             ))
         }
-        if let resolution = resolutionLabel(file?.height ?? item.resolution) {
+        if let resolution = file.flatMap({
+            resolutionLabel(width: $0.width, height: $0.height)
+        }) ?? resolutionLabel(item.resolution) {
             badges.append(ItemMetadataBadge(
                 kind: .resolution,
                 symbol: resolution == "4K" ? "4k.tv.fill" : "tv.fill",

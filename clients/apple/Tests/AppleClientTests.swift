@@ -301,6 +301,17 @@ final class AppleClientTests: XCTestCase {
             PlayerView.playbackBadges(source: source, audio: audio).map(\.symbol),
             ["4k.tv.fill", "sparkles", "speaker.wave.3.fill"]
         )
+
+        // Resolution tiers use the short edge, so a source whose dimensions
+        // arrive in portrait/orientation order is still 1080p, not 1920p.
+        var orientationOrderedSource = source
+        orientationOrderedSource.width = 1080
+        orientationOrderedSource.height = 1920
+        orientationOrderedSource.hdrFormat = nil
+        XCTAssertEqual(
+            PlayerView.playbackFacts(source: orientationOrderedSource, audio: nil),
+            ["1080p"]
+        )
     }
 
     func testPlayerOverlayAutoHidesWheneverItIsIdle() {

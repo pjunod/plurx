@@ -488,6 +488,14 @@ func resolutionLabel(_ height: Int?) -> String? {
     return nil
 }
 
+/// Video quality tiers describe the short edge: both 1920×1080 landscape
+/// and 1080×1920 orientation-ordered video are conventionally 1080p.
+func resolutionLabel(width: Int?, height: Int?) -> String? {
+    guard let height, height > 0 else { return nil }
+    guard let width, width > 0 else { return resolutionLabel(height) }
+    return resolutionLabel(min(width, height))
+}
+
 private func timeRemaining(_ item: Item) -> String? {
     guard let position = item.watch?.positionMs,
           let duration = item.watch?.durationMs ?? item.runtimeMs,

@@ -569,12 +569,12 @@ struct PlayerView: View {
 
     static func playbackBadges(source: SourceSummary?, audio: AudioTrack?) -> [PlayerMetadataBadge] {
         var badges: [PlayerMetadataBadge] = []
-        if let height = source?.height {
-            let label = height >= 2160 ? "4K" : "\(height)p"
+        if let label = resolutionLabel(width: source?.width, height: source?.height) {
+            let is4K = label == "4K"
             badges.append(PlayerMetadataBadge(
                 kind: .resolution,
-                symbol: height >= 2160 ? "4k.tv.fill" : "tv.fill",
-                mark: height >= 2160 ? nil : label.uppercased(),
+                symbol: is4K ? "4k.tv.fill" : "tv.fill",
+                mark: is4K ? nil : label.uppercased(),
                 accessibilityLabel: label
             ))
         }
