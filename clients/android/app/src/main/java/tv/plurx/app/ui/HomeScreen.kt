@@ -4,9 +4,12 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.statusBars
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Refresh
@@ -21,6 +24,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -55,34 +59,15 @@ fun HomeScreen(
     val posterWidth = (preferences.posterSize.widthDp * formFactor.posterScale()).dp
 
     Column(Modifier.fillMaxSize()) {
-        Row(
-            Modifier.fillMaxWidth().padding(start = side, end = side - 8.dp, top = 14.dp, bottom = 4.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Text(
-                when (preferences.theme) {
-                    ThemeId.Classic -> "plurx"
-                    ThemeId.Terminal -> ":~\$ plurx ▊"
-                    ThemeId.Noirr -> "noirr ▬"
-                },
-                color = Accent,
-                fontSize = if (formFactor == FormFactor.Television) 32.sp else 26.sp,
-                fontWeight = FontWeight.Bold,
-            )
-            Box(Modifier.weight(1f))
-            vm.username?.let {
-                Text(it, color = Muted, style = MaterialTheme.typography.labelMedium, modifier = Modifier.padding(end = 4.dp))
-            }
-            IconButton(onClick = vm::loadHome) {
-                Icon(Icons.Filled.Refresh, contentDescription = "Refresh", tint = Muted)
-            }
-            IconButton(onClick = onSearch) {
-                Icon(Icons.Filled.Search, contentDescription = "Search", tint = Muted)
-            }
-            IconButton(onClick = onOpenSettings) {
-                Icon(Icons.Filled.Settings, contentDescription = "Settings", tint = Muted)
-            }
-        }
+        HomeTopBar(
+            theme = preferences.theme,
+            username = vm.username,
+            formFactor = formFactor,
+            side = side,
+            onRefresh = vm::loadHome,
+            onSearch = onSearch,
+            onOpenSettings = onOpenSettings,
+        )
 
         when {
             state.loading -> LoadingBox()
@@ -138,6 +123,50 @@ fun HomeScreen(
                     }
                 }
             }
+        }
+    }
+}
+
+@Composable
+internal fun HomeTopBar(
+    theme: ThemeId,
+    username: String?,
+    formFactor: FormFactor,
+    side: Dp,
+    onRefresh: () -> Unit,
+    onSearch: () -> Unit,
+    onOpenSettings: () -> Unit,
+    safeInsets: WindowInsets = WindowInsets.statusBars,
+) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .windowInsetsPadding(safeInsets)
+            .padding(start = side, end = side - 8.dp, top = 14.dp, bottom = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            when (theme) {
+                ThemeId.Classic -> "plurx"
+                ThemeId.Terminal -> ":~\$ plurx ▊"
+                ThemeId.Noirr -> "noirr ▬"
+            },
+            color = Accent,
+            fontSize = if (formFactor == FormFactor.Television) 32.sp else 26.sp,
+            fontWeight = FontWeight.Bold,
+        )
+        Box(Modifier.weight(1f))
+        username?.let {
+            Text(it, color = Muted, style = MaterialTheme.typography.labelMedium, modifier = Modifier.padding(end = 4.dp))
+        }
+        IconButton(onClick = onRefresh) {
+            Icon(Icons.Filled.Refresh, contentDescription = "Refresh", tint = Muted)
+        }
+        IconButton(onClick = onSearch) {
+            Icon(Icons.Filled.Search, contentDescription = "Search", tint = Muted)
+        }
+        IconButton(onClick = onOpenSettings) {
+            Icon(Icons.Filled.Settings, contentDescription = "Settings", tint = Muted)
         }
     }
 }
