@@ -942,6 +942,24 @@ pub fn hls_args(
 /// paths deliver the same bitstream by different routes, and every argument up
 /// to the muxer has to be identical for that to be true — a second copy of
 /// this list is a divergence waiting for the day one of them is edited.
+///
+/// A copied video can only begin at the preceding keyframe. When audio is
+/// encoded, ffmpeg's default accurate input seek discards audio up to the
+/// requested timestamp while retaining that video preroll, leaving the two
+/// tracks out of sync. Copy sessions therefore use `-noaccurate_seek` so both
+/// tracks retain the same preroll and `-avoid_negative_ts make_zero` can shift
+/// them onto one shared output timeline.
+pub fn copy_input_seek_args(start_seconds: f64) -> Vec<String> {
+    if start_seconds <= 0.0 {
+        return Vec::new();
+    }
+    vec![
+        "-noaccurate_seek".into(),
+        "-ss".into(),
+        format!("{start_seconds:.3}"),
+    ]
+}
+
 fn copy_input_args(
     source: &MediaFile,
     start_seconds: f64,
@@ -954,11 +972,9 @@ fn copy_input_args(
     let source_path = source.path.to_string_lossy().into_owned();
     let mut args: Vec<String> = vec!["-hide_banner".into(), "-loglevel".into(), "error".into()];
 
-    // Fast input seek for resume/session start.
-    if start_seconds > 0.0 {
-        args.push("-ss".into());
-        args.push(format!("{start_seconds:.3}"));
-    }
+    // Fast input seek for resume/session start. The non-accurate mode keeps
+    // encoded audio aligned with the keyframe preroll of the copied video.
+    args.extend(copy_input_seek_args(start_seconds));
     // Copy runs as fast as the disk allows, so it has to be paced — but *not*
     // at 1x, which is what a bare `-re` here used to do. Realtime pacing meant
     // the segments existed exactly as fast as they were consumed, so a 4K
@@ -980,10 +996,7 @@ fn copy_input_args(
     // exactly the sessions that need the disk most (review §3.4).
     let has_offset = source.audio_offset_ms != 0 && !source.audio_streams.is_empty();
     let audio_input = if has_offset && !transcode_audio {
-        if start_seconds > 0.0 {
-            args.push("-ss".into());
-            args.push(format!("{start_seconds:.3}"));
-        }
+        args.extend(copy_input_seek_args(start_seconds));
         pacing.push(&mut args);
         args.push("-itsoffset".into());
         args.push(format!("{:.3}", source.audio_offset_ms as f64 / 1000.0));
@@ -1717,6 +1730,80 @@ mod tests {
         let ss = args.iter().position(|a| a == "-ss").expect("has -ss");
         let i = args.iter().position(|a| a == "-i").expect("has -i");
         assert!(ss < i);
+    }
+
+    /// A copy-video seek may start at the prior keyframe. Accurate input seek
+    /// would discard encoded audio until the requested instant but retain that
+    /// video preroll, which is an immediate A/V offset after every seek.
+    #[test]
+    fn copy_seek_preserves_audio_preroll() {
+        let args = hls_copy_args(
+            &file(None),
+            32.125,
+            None,
+            true,
+            Pacing::unpaced(),
+            false,
+            "/tmp/s",
+        );
+        let ss = args.iter().position(|a| a == "-ss").expect("has -ss");
+        assert_eq!(args[ss - 1], "-noaccurate_seek");
+        assert_eq!(args[ss + 1], "32.125");
+        let input = args.iter().position(|a| a == "-i").expect("has input");
+        assert!(ss < input, "seek flags must remain input options");
+
+        assert!(copy_input_seek_args(0.0).is_empty());
+        assert!(copy_input_seek_args(-1.0).is_empty());
+    }
+
+    /// Exercise the actual ffmpeg boundary that exposed the bug: the seek is
+    /// between video keyframes and audio is re-encoded. The first timestamps
+    /// must still land together rather than leaving silence until the exact
+    /// requested instant.
+    #[test]
+    fn copy_seek_emits_aligned_audio_and_video() {
+        use crate::testfixtures::{ffmpeg, ffprobe, run, source};
+        use std::process::Command;
+
+        let mut media = file(None);
+        media.path = source("h264");
+        media.video_codec = Some("h264".into());
+        let bytes = run(Command::new(ffmpeg()).args(copy_pipe_args(
+            &media,
+            3.0,
+            None,
+            true,
+            Pacing::unpaced(),
+            false,
+        )));
+        let output = tempfile::Builder::new()
+            .suffix(".mp4")
+            .tempfile()
+            .expect("temporary remux");
+        std::fs::write(output.path(), bytes).expect("write remux");
+
+        let probe = run(Command::new(ffprobe())
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=codec_type,start_time",
+                "-of",
+                "json",
+            ])
+            .arg(output.path()));
+        let value: serde_json::Value = serde_json::from_slice(&probe).expect("ffprobe json");
+        let starts = value["streams"].as_array().expect("stream list");
+        let start = |kind: &str| {
+            starts
+                .iter()
+                .find(|stream| stream["codec_type"] == kind)
+                .and_then(|stream| stream["start_time"].as_str())
+                .and_then(|time| time.parse::<f64>().ok())
+                .unwrap_or_else(|| panic!("{kind} start time in {value}"))
+        };
+        let skew = (start("video") - start("audio")).abs();
+        assert!(skew < 0.150, "A/V starts differ by {skew:.3}s: {value}");
     }
 
     /// Pacing flags are *input* options: they must land before their own `-i`,

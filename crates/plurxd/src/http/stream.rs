@@ -1185,9 +1185,11 @@ async fn remux(spec: RemuxSpec<'_>) -> Result<Response, ApiError> {
     if tracked.is_some() {
         cmd.arg("-progress").arg("pipe:2");
     }
-    // Input-side seek (fast) for resume.
+    // Input-side seek (fast) for resume. Copied video starts at the preceding
+    // keyframe, so retain the matching audio preroll as well; accurate seek
+    // would discard it when audio is being encoded and desynchronise the two.
     if let Some(s) = start.filter(|s| *s > 0.0) {
-        cmd.arg("-ss").arg(format!("{s:.3}"));
+        cmd.args(plurx_core::transcode::copy_input_seek_args(s));
     }
     // Pace this input (see READRATE_DEFAULT). Every input gets the same
     // treatment, as with -ss: the muxer interleaves them, so an unpaced second
@@ -1204,7 +1206,7 @@ async fn remux(spec: RemuxSpec<'_>) -> Result<Response, ApiError> {
     // again (review §3.4).
     let audio_input = if audio_offset_ms != 0 && !transcode_audio {
         if let Some(s) = start.filter(|s| *s > 0.0) {
-            cmd.arg("-ss").arg(format!("{s:.3}"));
+            cmd.args(plurx_core::transcode::copy_input_seek_args(s));
         }
         push_pacing(&mut cmd, pacing, readrate);
         cmd.arg("-itsoffset")
