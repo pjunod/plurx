@@ -238,6 +238,9 @@ final class AppleClientTests: XCTestCase {
     func testTVHomeStartsWithMediaRailsInsteadOfAFeaturedBillboard() {
         XCTAssertFalse(HomeLayoutPolicy.usesFeaturedHero)
         XCTAssertEqual(HomeLayoutPolicy.continueWatchingCopyStyle, .accentPanel)
+        XCTAssertLessThanOrEqual(LandscapeAccentPanelMetrics.fillOpacity, 0.06)
+        XCTAssertLessThanOrEqual(LandscapeAccentPanelMetrics.strokeOpacity, 0.18)
+        XCTAssertLessThanOrEqual(LandscapeAccentPanelMetrics.strokeWidth, 0.5)
     }
 
     func testTVSeriesDetailKeepsCorrectArtworkRatioAndVisibleChildShelf() {
@@ -369,7 +372,8 @@ final class AppleClientTests: XCTestCase {
         XCTAssertLessThanOrEqual(TVPlayerChromeMetrics.headerVerticalInset, 5)
         XCTAssertLessThanOrEqual(TVPlayerChromeMetrics.timeHorizontalInset, 6)
         XCTAssertLessThanOrEqual(TVPlayerChromeMetrics.timeVerticalInset, 3)
-        XCTAssertLessThanOrEqual(TVPlayerChromeMetrics.infoBodyFontSize, 18)
+        XCTAssertGreaterThanOrEqual(TVPlayerChromeMetrics.infoBodyFontSize, 18)
+        XCTAssertLessThanOrEqual(TVPlayerChromeMetrics.infoBodyFontSize, 20)
         XCTAssertGreaterThanOrEqual(TVPlayerChromeMetrics.infoLineLimit, 6)
         XCTAssertLessThanOrEqual(TVPlayerProgressFocusRing.outerStrokeWidth, 1.5)
         XCTAssertGreaterThan(

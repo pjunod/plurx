@@ -21,6 +21,12 @@ enum LandscapeCardCopyStyle: Equatable {
     case accentPanel
 }
 
+enum LandscapeAccentPanelMetrics {
+    static let fillOpacity = 0.055
+    static let strokeOpacity = 0.16
+    static let strokeWidth: CGFloat = 0.5
+}
+
 struct PosterCard: View {
     let item: Item
     var width: CGFloat = shelfPosterWidth
@@ -162,16 +168,23 @@ struct LandscapeCard: View {
             }
             .padding(.horizontal, copyStyle == .accentPanel ? 10 : 0)
             .padding(.vertical, copyStyle == .accentPanel ? 7 : 0)
+            .frame(
+                width: copyStyle == .accentPanel ? width : nil,
+                alignment: .leading
+            )
             .background {
                 if copyStyle == .accentPanel {
                     RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .fill(Palette.accent.opacity(0.18))
+                        .fill(Palette.accent.opacity(LandscapeAccentPanelMetrics.fillOpacity))
                 }
             }
             .overlay {
                 if copyStyle == .accentPanel {
                     RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .stroke(Palette.accent.opacity(0.58), lineWidth: 1)
+                        .stroke(
+                            Palette.accent.opacity(LandscapeAccentPanelMetrics.strokeOpacity),
+                            lineWidth: LandscapeAccentPanelMetrics.strokeWidth
+                        )
                 }
             }
         }

@@ -171,7 +171,7 @@ enum TVPlayerChromeMetrics {
     static let timeHorizontalInset: CGFloat = 6
     static let timeVerticalInset: CGFloat = 3
     static let infoHeadingFontSize: CGFloat = 13
-    static let infoBodyFontSize: CGFloat = 17
+    static let infoBodyFontSize: CGFloat = 19
     static let infoLineLimit = 8
 }
 

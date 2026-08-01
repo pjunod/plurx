@@ -387,9 +387,6 @@ struct PlayerView: View {
         .focusEffectDisabled()
         .foregroundStyle(.white)
         .frame(maxWidth: .infinity)
-        .onMoveCommand { direction in
-            if direction == .down { revealNowPlayingInfo() }
-        }
         #else
         .font(.title3)
         .buttonStyle(.bordered)
@@ -893,7 +890,7 @@ struct PlayerView: View {
             switch direction {
             case .left: controller.skip(seconds: -30)
             case .right: controller.skip(seconds: 30)
-            case .down: revealNowPlayingInfo()
+            case .down: focusedControl = .playPause
             default: break
             }
             revealControls()
