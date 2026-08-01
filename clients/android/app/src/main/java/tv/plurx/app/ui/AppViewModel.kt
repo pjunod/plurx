@@ -3,12 +3,14 @@ package tv.plurx.app.ui
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import retrofit2.HttpException
 import java.net.URI
 import tv.plurx.app.data.Caps
 import tv.plurx.app.data.Appearance
@@ -117,15 +119,25 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     Session.origin = saved.origin
                     Session.token = saved.token
                     api = Net.api(saved.origin)
-                    try {
-                        currentUser = api().me()
-                        username = currentUser?.username
-                        _phase.value = Phase.Ready
-                        loadHome()
-                    } catch (_: Exception) {
-                        // Token no longer valid (rotated, server reset) — re-auth.
-                        Session.token = null
-                        _phase.value = Phase.NeedLogin
+                    when (val validation = validateSavedSession { api().me() }) {
+                        is SavedSessionValidation.Authenticated -> {
+                            currentUser = validation.user
+                            username = validation.user.username
+                            _phase.value = Phase.Ready
+                            loadHome()
+                        }
+                        SavedSessionValidation.InvalidToken -> {
+                            Session.token = null
+                            settings.clearToken()
+                            _phase.value = Phase.NeedLogin
+                        }
+                        SavedSessionValidation.ServerUnavailable -> {
+                            // Google TV often launches before networking has fully resumed.
+                            // Keep the saved credentials and let Home surface a retryable
+                            // connection error instead of incorrectly demanding a login.
+                            _phase.value = Phase.Ready
+                            loadHome()
+                        }
                     }
                 }
                 saved.origin.isNotBlank() -> {
@@ -400,6 +412,44 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         settings.saveOrigin(normalized)
         _phase.value = Phase.NeedLogin
     }
+}
+
+internal sealed interface SavedSessionValidation<out T> {
+    data class Authenticated<T>(val user: T) : SavedSessionValidation<T>
+    data object InvalidToken : SavedSessionValidation<Nothing>
+    data object ServerUnavailable : SavedSessionValidation<Nothing>
+}
+
+/**
+ * Validate a persisted login without confusing a waking network with an
+ * expired token. Only an explicit authentication response may discard the
+ * session; transport and server failures get a few brief retries.
+ */
+internal suspend fun <T> validateSavedSession(
+    attempts: Int = 4,
+    waitBeforeRetry: suspend (Long) -> Unit = { delay(it) },
+    request: suspend () -> T,
+): SavedSessionValidation<T> {
+    require(attempts > 0)
+    var retryDelayMs = 500L
+    repeat(attempts) { attempt ->
+        try {
+            return SavedSessionValidation.Authenticated(request())
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: HttpException) {
+            if (error.code() == 401 || error.code() == 403) {
+                return SavedSessionValidation.InvalidToken
+            }
+        } catch (_: Exception) {
+            // Connection, timeout, and decoding failures do not invalidate a token.
+        }
+
+        if (attempt == attempts - 1) return SavedSessionValidation.ServerUnavailable
+        waitBeforeRetry(retryDelayMs)
+        retryDelayMs *= 2
+    }
+    return SavedSessionValidation.ServerUnavailable
 }
 
 /** Normalize the manual server field to the same origin contract as Apple. */
