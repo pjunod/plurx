@@ -111,6 +111,7 @@ struct PosterCard: View {
 struct LandscapeCard: View {
     let item: Item
     var width: CGFloat = shelfLandscapeWidth
+    var reservesEpisodeSubtitleLine = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
@@ -133,7 +134,7 @@ struct LandscapeCard: View {
                     }
                 }
             }
-            Text(item.showTitle ?? item.title)
+            Text(landscapeCardShowTitle(item) ?? item.title)
                 #if os(tvOS)
                 .font(.callout.weight(.semibold))
                 #else
@@ -141,11 +142,16 @@ struct LandscapeCard: View {
                 #endif
                 .foregroundColor(Palette.onBg)
                 .lineLimit(1)
-            if item.showTitle != nil {
+            if landscapeCardShowTitle(item) != nil {
                 Text(item.title)
                     .font(.caption)
                     .foregroundColor(Palette.muted)
                     .lineLimit(1)
+            } else if reservesEpisodeSubtitleLine {
+                Text("Episode title")
+                    .font(.caption)
+                    .hidden()
+                    .accessibilityHidden(true)
             }
             let metadata = cardShelfMetadata(item)
             if !metadata.isEmpty {
@@ -153,6 +159,11 @@ struct LandscapeCard: View {
                     .font(.system(.caption2, design: .rounded).weight(.medium))
                     .foregroundColor(Palette.muted)
                     .lineLimit(1)
+            } else {
+                Text("Metadata")
+                    .font(.system(.caption2, design: .rounded).weight(.medium))
+                    .hidden()
+                    .accessibilityHidden(true)
             }
         }
         .frame(width: width, alignment: .leading)
@@ -264,7 +275,8 @@ struct MediaRow: View {
                                 case .landscape:
                                     LandscapeCard(
                                         item: item,
-                                        width: model.posterSize.landscapeWidth
+                                        width: model.posterSize.landscapeWidth,
+                                        reservesEpisodeSubtitleLine: reservesEpisodeSubtitleLine
                                     )
                                 case .episode:
                                     EpisodeCard(
@@ -293,6 +305,20 @@ struct MediaRow: View {
         return 16
         #endif
     }
+
+    private var reservesEpisodeSubtitleLine: Bool {
+        style == .landscape && landscapeShelfNeedsEpisodeSubtitleLine(items)
+    }
+}
+
+func landscapeShelfNeedsEpisodeSubtitleLine(_ items: [Item]) -> Bool {
+    items.contains { landscapeCardShowTitle($0) != nil }
+}
+
+private func landscapeCardShowTitle(_ item: Item) -> String? {
+    guard let showTitle = item.showTitle?.trimmingCharacters(in: .whitespacesAndNewlines),
+          !showTitle.isEmpty else { return nil }
+    return showTitle
 }
 
 private func episodeCardTitle(_ item: Item) -> String {

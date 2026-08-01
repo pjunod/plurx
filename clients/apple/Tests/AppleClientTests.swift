@@ -370,6 +370,22 @@ final class AppleClientTests: XCTestCase {
         XCTAssertFalse(cardShelfMetadata(movie).contains("Movies"))
     }
 
+    func testMixedLandscapeShelfReservesEpisodeSubtitleLine() throws {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let movie = try decoder.decode(
+            Item.self,
+            from: Data(#"{"id":1,"kind":"movie","title":"TRON: Ares","year":2025}"#.utf8)
+        )
+        let episode = try decoder.decode(
+            Item.self,
+            from: Data(#"{"id":2,"kind":"episode","title":"Fray","show_title":"FROM","season_number":4,"episode_number":2}"#.utf8)
+        )
+
+        XCTAssertFalse(landscapeShelfNeedsEpisodeSubtitleLine([movie]))
+        XCTAssertTrue(landscapeShelfNeedsEpisodeSubtitleLine([movie, episode]))
+    }
+
     private func contrastRatio(_ foreground: Color, _ background: Color) -> CGFloat {
         let lighter = max(relativeLuminance(foreground), relativeLuminance(background))
         let darker = min(relativeLuminance(foreground), relativeLuminance(background))
