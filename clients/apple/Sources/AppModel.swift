@@ -383,8 +383,19 @@ final class AppModel: ObservableObject {
             fileId: file.id,
             startMs: 0,
             durationMs: file.durationMs ?? next.runtimeMs ?? 0,
-            title: next.title
+            title: next.title,
+            subtitle: nextEpisodeSubtitle(next),
+            year: next.year
         )
+    }
+
+    private func nextEpisodeSubtitle(_ item: Item) -> String? {
+        var parts: [String] = []
+        if let show = item.showTitle, !show.isEmpty { parts.append(show) }
+        if let season = item.seasonNumber, let episode = item.episodeNumber {
+            parts.append("S\(season) E\(episode)")
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: "  ·  ")
     }
 
     func decision(fileId: Int) async throws -> Decision {

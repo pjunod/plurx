@@ -8,6 +8,8 @@ struct PlayContext: Identifiable {
     let startMs: Int
     let durationMs: Int
     let title: String
+    var subtitle: String? = nil
+    var year: Int? = nil
 }
 
 /// Keeps the readable detail column centered on large screens without ever
@@ -45,19 +47,28 @@ struct DetailView: View {
     @State private var actionError: String?
 
     var body: some View {
-        ScrollView {
-            if let detail {
-                content(detail)
-            } else if let loadError {
-                ContentUnavailableView(
-                    "Couldn't load this title",
-                    systemImage: "exclamationmark.triangle",
-                    description: Text(loadError)
-                )
-                .frame(maxWidth: .infinity).padding(.top, 80)
-            } else {
-                ProgressView().tint(Palette.accent)
-                    .frame(maxWidth: .infinity).padding(.top, 80)
+        // A vertical ScrollView does not reliably constrain a child's ideal
+        // width. The artwork and full-width buttons can otherwise make the
+        // whole detail page wider than a compact iPhone and center the excess
+        // off both edges. Pin every state to the actual visible viewport.
+        GeometryReader { viewport in
+            ScrollView {
+                Group {
+                    if let detail {
+                        content(detail)
+                    } else if let loadError {
+                        ContentUnavailableView(
+                            "Couldn't load this title",
+                            systemImage: "exclamationmark.triangle",
+                            description: Text(loadError)
+                        )
+                        .frame(maxWidth: .infinity).padding(.top, 80)
+                    } else {
+                        ProgressView().tint(Palette.accent)
+                            .frame(maxWidth: .infinity).padding(.top, 80)
+                    }
+                }
+                .frame(width: viewport.size.width, alignment: .leading)
             }
         }
         .background(Palette.bg.ignoresSafeArea())
@@ -75,6 +86,7 @@ struct DetailView: View {
         .fullScreenCover(item: $play) { ctx in
             PlayerView(itemId: ctx.itemId, fileId: ctx.fileId, startMs: ctx.startMs,
                        durationMs: ctx.durationMs, title: ctx.title,
+                       subtitle: ctx.subtitle, year: ctx.year,
                        onPlayNext: { play = $0 })
                 .id(ctx.id)
                 .environmentObject(model)
@@ -400,7 +412,9 @@ struct DetailView: View {
                 fileId: file.id,
                 startMs: canResume ? resumeMs : 0,
                 durationMs: durationMs,
-                title: item.title
+                title: item.title,
+                subtitle: playbackSubtitle(item),
+                year: item.year
             )
         }
     }
@@ -412,7 +426,9 @@ struct DetailView: View {
                 fileId: file.id,
                 startMs: 0,
                 durationMs: durationMs,
-                title: item.title
+                title: item.title,
+                subtitle: playbackSubtitle(item),
+                year: item.year
             )
         } label: {
             Text("Start over")
@@ -437,6 +453,16 @@ struct DetailView: View {
         if let y = item.year { parts.append(String(y)) }
         if let d = durationMs, d > 0 { parts.append(formatTime(d)) }
         return parts.joined(separator: "   ·   ")
+    }
+
+    private func playbackSubtitle(_ item: Item) -> String? {
+        guard item.kind == "episode" else { return nil }
+        var parts: [String] = []
+        if let show = item.showTitle, !show.isEmpty { parts.append(show) }
+        if let season = item.seasonNumber, let episode = item.episodeNumber {
+            parts.append("S\(season) E\(episode)")
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: "  ·  ")
     }
 
     private func childrenHeading(_ kind: String) -> String {
