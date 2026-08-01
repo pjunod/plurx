@@ -79,6 +79,13 @@ host-network companion. The companion fetches the public server identity at
 `http://127.0.0.1:32400`, then publishes that same `_plurx._tcp` service on the
 physical LAN. Do not expose UDP 5353 to the internet.
 
+The Compose companion shares the host's UTS namespace only to read its
+hostname. If `PLURX_SERVER_NAME` is the generic default `plurx`, that hostname
+is the discovery label; an explicit server name replaces it. The LAN address
+is appended in either case (`m6 · 192.168.1.20`), so a picker remains
+identifiable even when several machines have similar names. This avoids making
+every host override repeat its own machine identity.
+
 Do not add `network_mode: host` to `plurxd`: Compose rejects a service that also
 has a `networks:` attachment. The companion is a different service, so an
 override can safely keep `plurxd` on an external `media` network. On a Docker
