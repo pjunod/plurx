@@ -18,7 +18,7 @@ enum MediaRowStyle: Equatable {
 
 enum MediaCardResolutionPlacement: Equatable {
     case artworkBadge
-    case metadata
+    case trailingMetadata
 }
 
 struct PosterCard: View {
@@ -62,15 +62,25 @@ struct PosterCard: View {
                 #endif
                 .foregroundColor(Palette.onBg)
                 .lineLimit(1)
-            let metadata = cardShelfMetadata(
-                item,
-                includesResolution: resolutionPlacement == .metadata
-            )
-            if !metadata.isEmpty {
-                Text(metadata)
-                    .font(.system(.caption2, design: .rounded).weight(.medium))
-                    .foregroundColor(Palette.muted)
-                    .lineLimit(1)
+            let metadata = cardShelfMetadata(item)
+            let trailingResolution = resolutionPlacement == .trailingMetadata
+                ? resolutionLabel(item.resolution)
+                : nil
+            if !metadata.isEmpty || trailingResolution != nil {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    if !metadata.isEmpty {
+                        Text(metadata)
+                            .font(.system(.caption2, design: .rounded).weight(.medium))
+                    }
+                    Spacer(minLength: 4)
+                    if let trailingResolution {
+                        Text(trailingResolution)
+                            .font(.system(.caption2, design: .monospaced).weight(.bold))
+                    }
+                }
+                .frame(maxWidth: .infinity)
+                .foregroundColor(Palette.muted)
+                .lineLimit(1)
             }
         }
         .frame(width: width, alignment: .leading)
@@ -403,15 +413,12 @@ private func timeRemaining(_ item: Item) -> String? {
 /// The shelf's lower line should identify the item, not repeat its library
 /// category. Episodes carry season/episode, movies carry year, and an active
 /// watch carries the genuinely useful remaining time.
-func cardShelfMetadata(_ item: Item, includesResolution: Bool = false) -> String {
+func cardShelfMetadata(_ item: Item) -> String {
     var parts: [String] = []
     if let season = item.seasonNumber, let episode = item.episodeNumber {
         parts.append("S\(season) E\(episode)")
     } else if let year = item.year {
         parts.append(String(year))
-    }
-    if includesResolution, let resolution = resolutionLabel(item.resolution) {
-        parts.append(resolution)
     }
     if let remaining = timeRemaining(item) {
         parts.append(remaining)

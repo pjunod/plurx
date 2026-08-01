@@ -305,10 +305,8 @@ final class AppleClientTests: XCTestCase {
 
         XCTAssertEqual(cardShelfMetadata(episode), "S4 E2 · 44m left")
         XCTAssertEqual(cardShelfMetadata(movie), "2025 · 115m left")
-        XCTAssertEqual(
-            cardShelfMetadata(movie, includesResolution: true),
-            "2025 · 4K · 115m left"
-        )
+        XCTAssertEqual(resolutionLabel(movie.resolution), "4K")
+        XCTAssertFalse(cardShelfMetadata(movie).contains("4K"))
         XCTAssertFalse(cardShelfMetadata(episode).contains("TV"))
         XCTAssertFalse(cardShelfMetadata(movie).contains("Movies"))
     }

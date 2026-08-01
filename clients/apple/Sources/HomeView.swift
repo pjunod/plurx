@@ -201,7 +201,7 @@ private struct HomeDashboard: View {
         MediaRow(
             title: "Recently Added",
             items: model.hubs.recentlyAdded ?? [],
-            resolutionPlacement: .metadata
+            resolutionPlacement: .trailingMetadata
         )
         ComingSoonRow(entries: model.comingSoon)
 
