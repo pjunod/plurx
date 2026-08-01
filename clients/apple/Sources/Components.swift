@@ -16,9 +16,15 @@ enum MediaRowStyle: Equatable {
     case episode
 }
 
+enum MediaCardResolutionPlacement: Equatable {
+    case artworkBadge
+    case metadata
+}
+
 struct PosterCard: View {
     let item: Item
     var width: CGFloat = shelfPosterWidth
+    var resolutionPlacement: MediaCardResolutionPlacement = .artworkBadge
 
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
@@ -56,7 +62,10 @@ struct PosterCard: View {
                 #endif
                 .foregroundColor(Palette.onBg)
                 .lineLimit(1)
-            let metadata = cardShelfMetadata(item)
+            let metadata = cardShelfMetadata(
+                item,
+                includesResolution: resolutionPlacement == .metadata
+            )
             if !metadata.isEmpty {
                 Text(metadata)
                     .font(.system(.caption2, design: .rounded).weight(.medium))
@@ -76,7 +85,8 @@ struct PosterCard: View {
                     .padding(7)
             }
             Spacer()
-            if let label = resolutionLabel(item.resolution) {
+            if resolutionPlacement == .artworkBadge,
+               let label = resolutionLabel(item.resolution) {
                 Text(label)
                     .font(.system(.caption2, design: .monospaced).weight(.bold))
                     .foregroundColor(.white)
@@ -206,6 +216,7 @@ struct MediaRow: View {
     var style: MediaRowStyle = .poster
     var collection: LibraryCollection?
     var destination: LibraryCollection?
+    var resolutionPlacement: MediaCardResolutionPlacement = .artworkBadge
 
     var body: some View {
         if !items.isEmpty {
@@ -237,7 +248,8 @@ struct MediaRow: View {
                                 case .poster:
                                     PosterCard(
                                         item: item,
-                                        width: model.posterSize.posterWidth
+                                        width: model.posterSize.posterWidth,
+                                        resolutionPlacement: resolutionPlacement
                                     )
                                 case .landscape:
                                     LandscapeCard(
@@ -391,12 +403,15 @@ private func timeRemaining(_ item: Item) -> String? {
 /// The shelf's lower line should identify the item, not repeat its library
 /// category. Episodes carry season/episode, movies carry year, and an active
 /// watch carries the genuinely useful remaining time.
-func cardShelfMetadata(_ item: Item) -> String {
+func cardShelfMetadata(_ item: Item, includesResolution: Bool = false) -> String {
     var parts: [String] = []
     if let season = item.seasonNumber, let episode = item.episodeNumber {
         parts.append("S\(season) E\(episode)")
     } else if let year = item.year {
         parts.append(String(year))
+    }
+    if includesResolution, let resolution = resolutionLabel(item.resolution) {
+        parts.append(resolution)
     }
     if let remaining = timeRemaining(item) {
         parts.append(remaining)

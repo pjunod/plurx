@@ -144,10 +144,13 @@ struct TVHeroButtonStyle: ButtonStyle {
 /// Shelf cards get a subtle lift and shadow, not the default opaque tvOS
 /// surround that hides the edges of posters and backdrops.
 struct TVMediaCardButtonStyle: ButtonStyle {
-    static let outerStrokeWidth: CGFloat = 14
-    static let darkRedStrokeWidth: CGFloat = 11
-    static let accentStrokeWidth: CGFloat = 7
-    static let innerStrokeWidth: CGFloat = 2
+    // Strokes share one center line, so progressively narrower layers produce
+    // a symmetric black → muted red → signal red → muted red → black
+    // cross-section. Keep the complete surround narrow enough to read as a
+    // selection ring rather than a frame around the card.
+    static let outerStrokeWidth: CGFloat = 6
+    static let fadeStrokeWidth: CGFloat = 4
+    static let accentStrokeWidth: CGFloat = 2
 
     func makeBody(configuration: Configuration) -> Body {
         Body(configuration: configuration)
@@ -169,22 +172,17 @@ struct TVMediaCardButtonStyle: ButtonStyle {
                         )
                         shape.stroke(
                             Palette.accent.opacity(0.32),
-                            lineWidth: TVMediaCardButtonStyle.darkRedStrokeWidth
+                            lineWidth: TVMediaCardButtonStyle.fadeStrokeWidth
                         )
                         shape.stroke(
                             Palette.accent.opacity(0.95),
                             lineWidth: TVMediaCardButtonStyle.accentStrokeWidth
-                        )
-                        shape.stroke(
-                            .black.opacity(0.88),
-                            lineWidth: TVMediaCardButtonStyle.innerStrokeWidth
                         )
                     }
                     .opacity(isFocused ? 1 : 0)
                 }
                 .scaleEffect(isFocused ? 1.035 : (configuration.isPressed ? 0.985 : 1))
                 .shadow(color: .black.opacity(isFocused ? 0.72 : 0), radius: 19, y: 10)
-                .shadow(color: Palette.accent.opacity(isFocused ? 0.24 : 0), radius: 12)
                 .animation(.easeOut(duration: 0.14), value: isFocused)
                 .animation(.easeOut(duration: 0.08), value: configuration.isPressed)
         }

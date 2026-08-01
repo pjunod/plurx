@@ -270,18 +270,24 @@ final class AppleClientTests: XCTestCase {
         }
     }
 
-    func testTVMediaCardFocusSurroundFadesAtBothEdges() {
+    func testTVMediaCardFocusSurroundIsThinAndFadesAtBothEdges() {
+        XCTAssertLessThanOrEqual(
+            TVMediaCardButtonStyle.outerStrokeWidth,
+            6,
+            "the complete focus surround should remain a thin ring"
+        )
         XCTAssertGreaterThan(
             TVMediaCardButtonStyle.outerStrokeWidth,
-            TVMediaCardButtonStyle.darkRedStrokeWidth
+            TVMediaCardButtonStyle.fadeStrokeWidth
         )
         XCTAssertGreaterThan(
-            TVMediaCardButtonStyle.darkRedStrokeWidth,
+            TVMediaCardButtonStyle.fadeStrokeWidth,
             TVMediaCardButtonStyle.accentStrokeWidth
         )
-        XCTAssertGreaterThan(
-            TVMediaCardButtonStyle.accentStrokeWidth,
-            TVMediaCardButtonStyle.innerStrokeWidth
+        XCTAssertEqual(
+            TVMediaCardButtonStyle.outerStrokeWidth - TVMediaCardButtonStyle.fadeStrokeWidth,
+            TVMediaCardButtonStyle.fadeStrokeWidth - TVMediaCardButtonStyle.accentStrokeWidth,
+            "the red core should taper evenly toward both black edges"
         )
     }
 
@@ -294,11 +300,15 @@ final class AppleClientTests: XCTestCase {
         )
         let movie = try decoder.decode(
             Item.self,
-            from: Data(#"{"id":2,"kind":"movie","title":"TRON: Ares","year":2025,"watch":{"position_ms":300000,"duration_ms":7200000}}"#.utf8)
+            from: Data(#"{"id":2,"kind":"movie","title":"TRON: Ares","year":2025,"resolution":2160,"watch":{"position_ms":300000,"duration_ms":7200000}}"#.utf8)
         )
 
         XCTAssertEqual(cardShelfMetadata(episode), "S4 E2 · 44m left")
         XCTAssertEqual(cardShelfMetadata(movie), "2025 · 115m left")
+        XCTAssertEqual(
+            cardShelfMetadata(movie, includesResolution: true),
+            "2025 · 4K · 115m left"
+        )
         XCTAssertFalse(cardShelfMetadata(episode).contains("TV"))
         XCTAssertFalse(cardShelfMetadata(movie).contains("Movies"))
     }

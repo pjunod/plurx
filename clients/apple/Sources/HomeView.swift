@@ -198,7 +198,11 @@ private struct HomeDashboard: View {
             items: model.hubs.nextUp ?? [],
             style: .landscape
         )
-        MediaRow(title: "Recently Added", items: model.hubs.recentlyAdded ?? [])
+        MediaRow(
+            title: "Recently Added",
+            items: model.hubs.recentlyAdded ?? [],
+            resolutionPlacement: .metadata
+        )
         ComingSoonRow(entries: model.comingSoon)
 
         if !model.libraries.isEmpty {
