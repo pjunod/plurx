@@ -18,7 +18,7 @@ struct ItemMetadataBadge: Equatable, Identifiable {
     var id: String { kind.rawValue }
 }
 
-private struct ItemMetadataBadgeRow: View {
+struct ItemMetadataBadgeRow: View {
     let badges: [ItemMetadataBadge]
 
     var body: some View {
@@ -28,6 +28,8 @@ private struct ItemMetadataBadgeRow: View {
         ScrollView(.horizontal, showsIndicators: false) {
             badgeContent
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .clipped()
         #endif
     }
 
@@ -87,6 +89,8 @@ struct DetailBreadcrumb: View {
             }
             .breadcrumbFont()
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .clipped()
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Show path")
     }
@@ -176,12 +180,11 @@ struct DetailBodyFrame<Content: View>: View {
 
     var body: some View {
         content
-            // Padding must be inside the width cap. Applying it after a
-            // max-width frame makes compact iPhones report `screen + 2 * pad`
-            // and SwiftUI centers that oversized body, clipping both edges.
-            .padding(.horizontal, screenHPad)
-            .frame(maxWidth: 980, alignment: .leading)
+            // Reserve both insets before proposing a width to the content.
+            // This keeps a wide child from consuming the trailing padding.
+            .frame(maxWidth: 980 - (2 * screenHPad), alignment: .leading)
             .frame(maxWidth: .infinity, alignment: .center)
+            .padding(.horizontal, screenHPad)
     }
 }
 
@@ -315,7 +318,9 @@ struct DetailView: View {
                         .font(.largeTitle.bold())
                         #endif
                         .foregroundColor(Palette.onBg)
-                        .fixedSize(horizontal: false, vertical: true)
+                        .lineLimit(nil)
+                        .multilineTextAlignment(.leading)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     ItemMetadataBadgeRow(badges: Self.itemMetadataBadges(
                         item,
                         file: file,
@@ -870,14 +875,11 @@ struct DetailView: View {
         } label: {
             Text("Start over")
                 .font(.system(.body, design: .monospaced))
-                .frame(maxWidth: .infinity)
         }
         #if os(tvOS)
         .buttonStyle(TVReadableButtonStyle(prominent: false))
         #else
-        .buttonStyle(.bordered)
-        .tint(Palette.muted)
-        .controlSize(.large)
+        .buttonStyle(IOSFullWidthActionButtonStyle(prominent: false))
         #endif
     }
 

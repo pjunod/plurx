@@ -5,6 +5,53 @@ import UIKit
 import XCTest
 @testable import plurx
 
+private struct LayoutWidthPreferenceKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
+private extension View {
+    func reportLayoutWidth() -> some View {
+        background {
+            GeometryReader { geometry in
+                Color.clear.preference(
+                    key: LayoutWidthPreferenceKey.self,
+                    value: geometry.size.width
+                )
+            }
+        }
+    }
+}
+
+private func visibleHorizontalBounds(in image: UIImage) -> ClosedRange<CGFloat>? {
+    guard let cgImage = image.cgImage,
+          let providerData = cgImage.dataProvider?.data,
+          let bytes = CFDataGetBytePtr(providerData) else { return nil }
+
+    let bytesPerPixel = cgImage.bitsPerPixel / 8
+    guard bytesPerPixel >= 3 else { return nil }
+
+    var minimumX = cgImage.width
+    var maximumX = -1
+    for y in 0..<cgImage.height {
+        let rowOffset = y * cgImage.bytesPerRow
+        for x in 0..<cgImage.width {
+            let offset = rowOffset + (x * bytesPerPixel)
+            let brightness = max(bytes[offset], bytes[offset + 1], bytes[offset + 2])
+            if brightness > 16 {
+                minimumX = min(minimumX, x)
+                maximumX = max(maximumX, x)
+            }
+        }
+    }
+
+    guard maximumX >= minimumX else { return nil }
+    return (CGFloat(minimumX) / image.scale)...(CGFloat(maximumX) / image.scale)
+}
+
 final class AppleClientTests: XCTestCase {
     override func tearDown() {
         Session.shared.origin = ""
@@ -282,6 +329,83 @@ final class AppleClientTests: XCTestCase {
             XCTAssertLessThanOrEqual(measured.width, availableWidth + 0.5)
         }
     }
+
+    #if os(iOS)
+    func testDetailBodyKeepsScrollableRowsAndActionsInsidePhoneInsets() throws {
+        let viewportWidth: CGFloat = 393
+        let expectedBodyWidth = viewportWidth - (2 * screenHPad)
+        var laidOutWidth: CGFloat = 0
+        let controller = UIHostingController(rootView:
+            DetailViewportFrame {
+                DetailBodyFrame {
+                    VStack(alignment: .leading, spacing: 12) {
+                        ItemMetadataBadgeRow(badges: [
+                            ItemMetadataBadge(
+                                kind: .episode,
+                                symbol: "rectangle.stack.fill",
+                                mark: "S4 E3",
+                                accessibilityLabel: "Season 4, Episode 3"
+                            ),
+                            ItemMetadataBadge(
+                                kind: .runtime,
+                                symbol: "clock.fill",
+                                mark: "42 min",
+                                accessibilityLabel: "42 min"
+                            ),
+                            ItemMetadataBadge(
+                                kind: .resolution,
+                                symbol: "tv.fill",
+                                mark: "1080P",
+                                accessibilityLabel: "1080P"
+                            ),
+                            ItemMetadataBadge(
+                                kind: .video,
+                                symbol: "film.fill",
+                                mark: "H.264",
+                                accessibilityLabel: "H.264"
+                            ),
+                        ])
+
+                        Text("'Til Death Do You Part")
+                            .font(.largeTitle.bold())
+                            .lineLimit(nil)
+                            .multilineTextAlignment(.leading)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+
+                        PrimaryButton(title: "Resume · 0:44", action: {})
+                    }
+                    .reportLayoutWidth()
+                }
+            }
+            .frame(width: viewportWidth)
+            .dynamicTypeSize(.xxLarge)
+            .onPreferenceChange(LayoutWidthPreferenceKey.self) {
+                laidOutWidth = $0
+            }
+        )
+
+        controller.view.frame = CGRect(
+            origin: .zero,
+            size: CGSize(width: viewportWidth, height: 800)
+        )
+        controller.view.setNeedsLayout()
+        controller.view.layoutIfNeeded()
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.02))
+
+        let renderer = UIGraphicsImageRenderer(bounds: controller.view.bounds)
+        let image = renderer.image { _ in
+            controller.view.drawHierarchy(in: controller.view.bounds, afterScreenUpdates: true)
+        }
+        let visibleBounds = try XCTUnwrap(visibleHorizontalBounds(in: image))
+
+        XCTAssertLessThanOrEqual(laidOutWidth, expectedBodyWidth + 0.5)
+        XCTAssertGreaterThanOrEqual(visibleBounds.lowerBound, screenHPad - 1)
+        XCTAssertLessThanOrEqual(
+            visibleBounds.upperBound,
+            viewportWidth - screenHPad + 1
+        )
+    }
+    #endif
 
     func testEpisodeBreadcrumbLinksToTheShowAndSeasonInOrder() {
         let show = Item(id: 10, kind: "show", title: "Shameless")

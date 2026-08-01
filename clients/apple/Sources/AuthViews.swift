@@ -41,14 +41,11 @@ struct PrimaryButton: View {
                 if busy { ProgressView().tint(.white) }
                 Text(title).fontWeight(.semibold).opacity(busy ? 0 : 1)
             }
-            .frame(maxWidth: .infinity)
         }
         #if os(tvOS)
         .buttonStyle(TVReadableButtonStyle(prominent: true))
         #else
-        .buttonStyle(.borderedProminent)
-        .tint(Palette.accent)
-        .controlSize(.large)   // ControlSize is unavailable on tvOS
+        .buttonStyle(IOSFullWidthActionButtonStyle(prominent: true))
         #endif
         .disabled(disabled || busy)
     }
