@@ -69,8 +69,7 @@ struct SearchView: View {
                     NavigationLink(value: Route.item(item.id)) {
                         PosterCard(
                             item: item,
-                            width: model.posterSize.posterWidth,
-                            source: model.libraryName(for: item)
+                            width: model.posterSize.posterWidth
                         )
                     }
                     .posterButtonStyle()
