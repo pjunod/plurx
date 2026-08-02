@@ -7,6 +7,11 @@ the working tree (two uncommitted Apple files: `PlurxApp.swift`,
 that landed after that snapshot (`ab5438ca2`, `a2f5239f9`).
 **Outcome:** review only; no code was changed
 
+**Assessment:**
+[CLIENTS-CODE-REVIEW-ASSESSMENT.md](CLIENTS-CODE-REVIEW-ASSESSMENT.md)
+accepts the review as the remediation roadmap, narrows its few overstatements,
+and turns the priority order into observable acceptance checks.
+
 This review complements [PLAYBACK.md](PLAYBACK.md) (the delivery contract the
 clients execute), [ANDROID-CLIENT-PARITY.md](ANDROID-CLIENT-PARITY.md) and
 [APPLE-CLIENT-PARITY.md](APPLE-CLIENT-PARITY.md) (what the clients are meant
