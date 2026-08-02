@@ -938,13 +938,13 @@ mod tests {
         let master = master_playlist(
             &file,
             Some(2),
-            "hvc1.2.4.L150.B0,ec-3",
+            "hvc1.2.20000000.L150.B0,ec-3",
             Some("dvh1.08.06/db1p"),
         );
 
         assert!(master.starts_with("#EXTM3U\n#EXT-X-VERSION:10\n"));
         assert!(master.contains(
-            "#EXT-X-STREAM-INF:BANDWIDTH=40000000,CODECS=\"hvc1.2.4.L150.B0,ec-3\",SUPPLEMENTAL-CODECS=\"dvh1.08.06/db1p\",RESOLUTION=3840x2160,VIDEO-RANGE=PQ,SUBTITLES=\"subs\""
+            "#EXT-X-STREAM-INF:BANDWIDTH=40000000,CODECS=\"hvc1.2.20000000.L150.B0,ec-3\",SUPPLEMENTAL-CODECS=\"dvh1.08.06/db1p\",RESOLUTION=3840x2160,VIDEO-RANGE=PQ,SUBTITLES=\"subs\""
         ));
         assert!(!master.contains("#EXT-X-INDEPENDENT-SEGMENTS"));
         assert!(master.contains("NAME=\"English · Forced\",LANGUAGE=\"en\",DEFAULT=YES,AUTOSELECT=YES,FORCED=YES,URI=\"subs/2/index.m3u8\""));

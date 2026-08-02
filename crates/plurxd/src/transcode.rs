@@ -909,7 +909,7 @@ struct Session {
     /// (idempotent) create reports the same offset the first one did.
     start_seconds: f64,
     /// RFC 6381 sample types present in the primary HLS rendition. A native
-    /// subtitle master must advertise these alongside `wvtt`; omitting the
+    /// subtitle master must advertise these; omitting or abbreviating the
     /// referenced formats makes AVPlayer reject an otherwise playable copy.
     hls_codecs: String,
     /// Backward-compatible enhancement carried by the video samples, such as
@@ -1211,8 +1211,11 @@ fn copied_hls_codecs(
                 None => "dvh1".to_owned(),
             }
         }
-        Some("hevc" | "h265") => "hvc1".to_owned(),
-        _ => "avc1".to_owned(),
+        Some("hevc" | "h265") => hevc_hls_codec(probe_json).unwrap_or_else(|| "hvc1".to_owned()),
+        Some("h264" | "avc") => {
+            avc_hls_codec(probe_json).unwrap_or_else(|| "avc1.640034".to_owned())
+        }
+        _ => "avc1.640034".to_owned(),
     };
     let audio = if options.transcode_audio {
         "mp4a.40.2"
@@ -1273,9 +1276,9 @@ fn dolby_vision_hls_config(probe_json: Option<&str>) -> Option<DolbyVisionHlsCon
 /// places after the tier letter (for example 150 for HEVC level 5.0).
 fn hevc_hls_codec(probe_json: Option<&str>) -> Option<String> {
     let video = video_probe_stream(probe_json)?;
-    let profile = match video.get("profile")?.as_str()? {
-        "Main" => 1,
-        "Main 10" => 2,
+    let (profile, compatibility) = match video.get("profile")?.as_str()? {
+        "Main" => (1, "60000000"),
+        "Main 10" => (2, "20000000"),
         _ => return None,
     };
     let level = video.get("level")?.as_u64()?;
@@ -1284,7 +1287,20 @@ fn hevc_hls_codec(probe_json: Option<&str>) -> Option<String> {
     } else {
         'L'
     };
-    Some(format!("hvc1.{profile}.4.{tier}{level}.B0"))
+    Some(format!("hvc1.{profile}.{compatibility}.{tier}{level}.B0"))
+}
+
+fn avc_hls_codec(probe_json: Option<&str>) -> Option<String> {
+    let video = video_probe_stream(probe_json)?;
+    let profile = match video.get("profile")?.as_str()? {
+        "Baseline" | "Constrained Baseline" => 66_u8,
+        "Main" => 77,
+        "High" => 100,
+        _ => return None,
+    };
+    let level = video.get("level")?.as_u64()?;
+    let level = u8::try_from(level).ok()?;
+    Some(format!("avc1.{profile:02x}00{level:02x}"))
 }
 
 pub struct StartInfo {
@@ -2076,7 +2092,7 @@ impl TranscodeManager {
             user_name: user_name.to_owned(),
             playback_id: playback_id.to_owned(),
             start_seconds: 0.0,
-            hls_codecs: "avc1,mp4a.40.2".into(),
+            hls_codecs: "avc1.640034,mp4a.40.2".into(),
             hls_supplemental_codecs: None,
             target_height: opts.target_height,
             encoder_label: Mutex::new("cached"),
@@ -3102,7 +3118,7 @@ impl TranscodeManager {
             user_name: user_name.to_owned(),
             playback_id: playback_id.to_owned(),
             start_seconds,
-            hls_codecs: "avc1,mp4a.40.2".into(),
+            hls_codecs: "avc1.640034,mp4a.40.2".into(),
             hls_supplemental_codecs: None,
             target_height,
             encoder_label: Mutex::new(encoder.label()),
@@ -4973,7 +4989,7 @@ mod tests {
                 ),
             ),
             (
-                "hvc1.2.4.L150.B0,ec-3".to_owned(),
+                "hvc1.2.20000000.L150.B0,ec-3".to_owned(),
                 Some("dvh1.08.06/db1p".to_owned())
             )
         );
@@ -4988,6 +5004,21 @@ mod tests {
                 None,
             ),
             ("hvc1,mp4a.40.2".to_owned(), None)
+        );
+
+        file.hdr = None;
+        file.video_codec = Some("h264".into());
+        assert_eq!(
+            copied_hls_codecs(
+                &file,
+                None,
+                CopySessionOptions {
+                    transcode_audio: true,
+                    preserve_dolby_vision: false,
+                },
+                Some(r#"{"streams":[{"codec_type":"video","profile":"High","level":50}]}"#,),
+            ),
+            ("avc1.640032,mp4a.40.2".to_owned(), None)
         );
     }
 
@@ -5014,7 +5045,7 @@ mod tests {
             user_name: "paul".into(),
             playback_id: "pb-test".into(),
             start_seconds: 0.0,
-            hls_codecs: "avc1,mp4a.40.2".into(),
+            hls_codecs: "avc1.640034,mp4a.40.2".into(),
             hls_supplemental_codecs: None,
             target_height: 720,
             encoder_label: Mutex::new("test"),
@@ -5651,7 +5682,7 @@ mod tests {
             user_name: "paul".into(),
             playback_id: "pb-watchdog".into(),
             start_seconds: 0.0,
-            hls_codecs: "avc1,mp4a.40.2".into(),
+            hls_codecs: "avc1.640034,mp4a.40.2".into(),
             hls_supplemental_codecs: None,
             target_height: 1080,
             encoder_label: Mutex::new("test"),
