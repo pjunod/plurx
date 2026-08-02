@@ -493,6 +493,16 @@ fn track_is_forced(track: &SubtitleStream) -> bool {
             .is_some_and(|title| title.to_ascii_lowercase().contains("forced"))
 }
 
+fn subtitle_characteristics(track: &SubtitleStream) -> Option<&'static str> {
+    let title = track.title.as_deref()?.to_ascii_lowercase();
+    ["sdh", "closed caption", "closed-caption", "hard of hearing", "non udenti"]
+        .iter()
+        .any(|marker| title.contains(marker))
+        .then_some(
+            "public.accessibility.transcribes-spoken-dialog,public.accessibility.describes-music-and-sound",
+        )
+}
+
 fn master_playlist(file: &MediaFile, selected: Option<i64>) -> String {
     let native: Vec<(usize, &SubtitleStream)> = file
         .subtitle_streams
@@ -506,12 +516,32 @@ fn master_playlist(file: &MediaFile, selected: Option<i64>) -> String {
         // an explicit Off, not permission to resurrect a foreign-language
         // container default behind the client's back.
         let default = selected.is_some_and(|pick| pick == *index as i64);
+        let characteristics = subtitle_characteristics(track);
+        // RFC 8216 requires every AUTOSELECT=YES member of a rendition group
+        // to have a unique LANGUAGE/ASSOC-LANGUAGE/FORCED/CHARACTERISTICS
+        // combination. AVPlayer rejects the entire master when two ordinary
+        // tracks share that tuple, so exact duplicates stay manually
+        // selectable. DEFAULT=YES itself requires AUTOSELECT=YES.
+        let tuple_copies = native
+            .iter()
+            .filter(|(_, other)| {
+                language_tag(other.language.as_deref()) == language_tag(track.language.as_deref())
+                    && track_is_forced(other) == track_is_forced(track)
+                    && subtitle_characteristics(other) == characteristics
+            })
+            .count();
+        let autoselect = default || tuple_copies == 1;
+        let characteristics = characteristics
+            .map(|value| format!(",CHARACTERISTICS=\"{value}\""))
+            .unwrap_or_default();
         out.push_str(&format!(
-            "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"{}\",LANGUAGE=\"{}\",DEFAULT={},AUTOSELECT=YES,FORCED={},URI=\"subs/{index}/index.m3u8\"\n",
+            "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"{}\",LANGUAGE=\"{}\",DEFAULT={},AUTOSELECT={},FORCED={}{},URI=\"subs/{index}/index.m3u8\"\n",
             quoted(&subtitle_name(track, *index)),
             quoted(language_tag(track.language.as_deref())),
             if default { "YES" } else { "NO" },
+            if autoselect { "YES" } else { "NO" },
             if track_is_forced(track) { "YES" } else { "NO" },
+            characteristics,
         ));
     }
     let bandwidth = file.bitrate.unwrap_or(25_000_000).max(128_000);
@@ -756,7 +786,22 @@ mod tests {
             "NAME=\"Italian · Forced\",LANGUAGE=\"it\",DEFAULT=NO,AUTOSELECT=YES,FORCED=YES"
         ));
         assert!(master.contains("NAME=\"English · Regular\",LANGUAGE=\"en\",DEFAULT=NO"));
+        assert!(master.contains("NAME=\"English · SDH\",LANGUAGE=\"en\",DEFAULT=NO,AUTOSELECT=YES,FORCED=NO,CHARACTERISTICS=\"public.accessibility.transcribes-spoken-dialog,public.accessibility.describes-music-and-sound\""));
         assert!(master.ends_with("video.m3u8\n"));
+    }
+
+    #[test]
+    fn duplicate_manual_renditions_do_not_violate_hls_autoselect_uniqueness() {
+        let file = hls_file(vec![
+            sub("subrip", "eng", "Regular", false, false),
+            sub("webvtt", "eng", "Alternate", false, false),
+        ]);
+        let master = master_playlist(&file, None);
+        assert_eq!(master.matches("AUTOSELECT=NO").count(), 2);
+
+        let selected = master_playlist(&file, Some(1));
+        assert!(selected
+            .contains("NAME=\"English · Alternate\",LANGUAGE=\"en\",DEFAULT=YES,AUTOSELECT=YES"));
     }
 
     #[test]
