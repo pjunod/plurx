@@ -288,7 +288,6 @@ pub async fn status(
 pub struct PlaylistQuery {
     pub native: Option<u8>,
     pub subtitle: Option<i64>,
-    pub diagnostic: Option<String>,
 }
 
 fn playlist_response(bytes: Vec<u8>) -> Response {
@@ -335,33 +334,9 @@ pub async fn playlist(
     if query.native != Some(1) {
         return video_playlist(State(state), AxPath(session)).await;
     }
-    let (context, mut file) = session_file(&state, &session).await?;
-    let (primary_codecs, supplemental_codecs) = match query.diagnostic.as_deref() {
-        Some("base-only") => (context.codecs.as_str(), None),
-        Some("dv-direct") => ("dvh1.08.06,ec-3", None),
-        Some("no-subs") => ("dvh1.08.06,ec-3", None),
-        Some("no-codecs") => ("", None),
-        Some("base-short") => (
-            "hvc1.2.4.L150.B0,ec-3",
-            context.supplemental_codecs.as_deref(),
-        ),
-        _ => (
-            context.codecs.as_str(),
-            context.supplemental_codecs.as_deref(),
-        ),
-    };
-    tracing::info!(
-        session_id = %session,
-        file_id = file.id,
-        subtitle = query.subtitle,
-        diagnostic = query.diagnostic.as_deref().unwrap_or(""),
-        "serving native HLS master playlist"
-    );
-    if matches!(query.diagnostic.as_deref(), Some("no-subs" | "no-codecs")) {
-        file.subtitle_streams.clear();
-    }
+    let (_, file) = session_file(&state, &session).await?;
     Ok(playlist_response(
-        master_playlist(&file, query.subtitle, primary_codecs, supplemental_codecs).into_bytes(),
+        master_playlist(&file, query.subtitle).into_bytes(),
     ))
 }
 
@@ -375,11 +350,6 @@ pub async fn video_playlist(
         .playlist(&session)
         .await
         .ok_or(ApiError::NotFound("transcode session"))?;
-    tracing::info!(
-        session_id = %session,
-        bytes = bytes.len(),
-        "serving HLS video playlist"
-    );
     Ok(playlist_response(bytes))
 }
 
@@ -405,12 +375,6 @@ pub async fn subtitle_playlist(
         .playlist(&session)
         .await
         .ok_or(ApiError::NotFound("transcode session"))?;
-    tracing::info!(
-        session_id = %session,
-        file_id = file.id,
-        index,
-        "serving native HLS subtitle playlist"
-    );
     Ok(playlist_response(
         subtitle_media_playlist(&video).into_bytes(),
     ))
@@ -467,7 +431,6 @@ pub async fn subtitle_vtt(
         session_id = %session,
         file_id = file.id,
         index,
-        sequence,
         codec = %track.codec,
         language = track.language.as_deref().unwrap_or("und"),
         title = track.title.as_deref().unwrap_or(""),
@@ -566,12 +529,7 @@ fn subtitle_characteristics(track: &SubtitleStream) -> Option<&'static str> {
         )
 }
 
-fn master_playlist(
-    file: &MediaFile,
-    selected: Option<i64>,
-    primary_codecs: &str,
-    supplemental_codecs: Option<&str>,
-) -> String {
+fn master_playlist(file: &MediaFile, selected: Option<i64>) -> String {
     let native: Vec<(usize, &SubtitleStream)> = file
         .subtitle_streams
         .iter()
@@ -582,8 +540,7 @@ fn master_playlist(
     // not promise independently decodable segments. The master must not make
     // that stronger claim on its behalf: AVPlayer acts on it at a resume
     // boundary and can reject an otherwise playable copied HEVC/DV stream.
-    let version = if supplemental_codecs.is_some() { 10 } else { 7 };
-    let mut out = format!("#EXTM3U\n#EXT-X-VERSION:{version}\n");
+    let mut out = String::from("#EXTM3U\n#EXT-X-VERSION:7\n");
     for (index, track) in &native {
         // The query describes this player's selection. No selected index is
         // an explicit Off, not permission to resurrect a foreign-language
@@ -627,21 +584,6 @@ fn master_playlist(
     }
     let bandwidth = file.bitrate.unwrap_or(25_000_000).max(128_000);
     out.push_str(&format!("#EXT-X-STREAM-INF:BANDWIDTH={bandwidth}"));
-    if !primary_codecs.is_empty() {
-        out.push_str(&format!(",CODECS=\"{primary_codecs}\""));
-    }
-    if let Some(supplemental) = supplemental_codecs {
-        out.push_str(&format!(",SUPPLEMENTAL-CODECS=\"{supplemental}\""));
-        if let (Some(width), Some(height)) = (file.width, file.height) {
-            out.push_str(&format!(",RESOLUTION={width}x{height}"));
-        }
-        let video_range = if supplemental.ends_with("/db4h") {
-            "HLG"
-        } else {
-            "PQ"
-        };
-        out.push_str(&format!(",VIDEO-RANGE={video_range}"));
-    }
     if !native.is_empty() {
         out.push_str(",SUBTITLES=\"subs\"");
     }
@@ -844,12 +786,6 @@ pub async fn segment(
         .segment(&session, &seg)
         .await
         .ok_or(ApiError::NotFound("segment"))?;
-    tracing::info!(
-        session_id = %session,
-        segment = %seg,
-        bytes = opened.len,
-        "serving HLS video resource"
-    );
     // MPEG-TS segments (transcode) vs fMP4 init/segments (copy-video path).
     let content_type = if seg.ends_with(".ts") {
         "video/mp2t"
@@ -981,17 +917,11 @@ mod tests {
             sub("subrip", "eng", "Regular", false, false),
             sub("webvtt", "eng", "SDH", false, false),
         ]);
-        let master = master_playlist(
-            &file,
-            Some(2),
-            "hvc1.2.20000000.L150.B0,ec-3",
-            Some("dvh1.08.06/db1p"),
-        );
+        let master = master_playlist(&file, Some(2));
 
-        assert!(master.starts_with("#EXTM3U\n#EXT-X-VERSION:10\n"));
-        assert!(master.contains(
-            "#EXT-X-STREAM-INF:BANDWIDTH=40000000,CODECS=\"hvc1.2.20000000.L150.B0,ec-3\",SUPPLEMENTAL-CODECS=\"dvh1.08.06/db1p\",RESOLUTION=3840x2160,VIDEO-RANGE=PQ,SUBTITLES=\"subs\""
-        ));
+        assert!(master.starts_with("#EXTM3U\n#EXT-X-VERSION:7\n"));
+        assert!(master.contains("#EXT-X-STREAM-INF:BANDWIDTH=40000000,SUBTITLES=\"subs\""));
+        assert!(!master.contains("CODECS="));
         assert!(!master.contains("#EXT-X-INDEPENDENT-SEGMENTS"));
         assert!(master.contains("NAME=\"English · Forced\",LANGUAGE=\"en\",DEFAULT=NO,AUTOSELECT=YES,FORCED=YES,URI=\"subs/2/index.m3u8\""));
         assert!(master.contains(
@@ -1008,10 +938,10 @@ mod tests {
             sub("subrip", "eng", "Regular", false, false),
             sub("webvtt", "eng", "Alternate", false, false),
         ]);
-        let master = master_playlist(&file, None, "avc1,mp4a.40.2", None);
+        let master = master_playlist(&file, None);
         assert_eq!(master.matches("AUTOSELECT=NO").count(), 2);
 
-        let selected = master_playlist(&file, Some(1), "avc1,mp4a.40.2", None);
+        let selected = master_playlist(&file, Some(1));
         assert!(selected
             .contains("NAME=\"English · Alternate\",LANGUAGE=\"en\",DEFAULT=YES,AUTOSELECT=YES"));
     }
@@ -1025,7 +955,7 @@ mod tests {
             sub("ass", "eng", "Styled Signs", false, false),
             sub("ssa", "eng", "Styled Dialogue", false, false),
         ]);
-        let master = master_playlist(&file, None, "avc1,mp4a.40.2", None);
+        let master = master_playlist(&file, None);
         assert!(master.contains("subs/0/index.m3u8"));
         for index in 1..=4 {
             assert!(!master.contains(&format!("subs/{index}/index.m3u8")));
