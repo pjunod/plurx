@@ -76,6 +76,12 @@ data class Item(
     val runtime_ms: Long? = null,
     val resolution: Long? = null,
     val child_count: Long? = null,
+    /**
+     * Epoch seconds the server first saw this item. The stable ordering key
+     * for a merged category, where each share sorts correctly on its own but
+     * the combined grid cannot without it.
+     */
+    val added_at: Long? = null,
     val watch: Watch? = null,
     val rollup: Rollup? = null,
 ) {
@@ -192,6 +198,41 @@ data class Delivery(
     val url: String? = null, // direct: the file; remux: progressive fMP4
     val sessions_url: String? = null, // POST target for an HLS session
     val aac: Boolean = false, // remux over HLS: re-encode the audio
+    /** Keep Dolby Vision signalling through a copy session (remux verdicts). */
+    val preserve_dolby_vision: Boolean = false,
+)
+
+/**
+ * Source facts as the *decision* read them. `height` is the number every
+ * height promise is made of: a subtitle burn or Quality = Original sends this
+ * back on the session create, and the server passes `height == source.height`
+ * through unsnapped (`hls.rs`, "the source's own height is the
+ * Original/forced-burn promise").
+ */
+@Serializable
+data class SourceSummary(
+    val container: String? = null,
+    val video_codec: String? = null,
+    val video_profile: String? = null,
+    val width: Long? = null,
+    val height: Long? = null,
+    val bit_depth: Long? = null,
+    val hdr: String? = null,
+    val hdr_format: String? = null,
+    val bitrate: Long? = null,
+    val duration_ms: Long? = null,
+)
+
+/**
+ * One advertised rung of the server's quality ladder, top rung first and
+ * already filtered to what the source can feed — so the client's quality menu
+ * stops hardcoding heights the source cannot reach.
+ */
+@Serializable
+data class Rung(
+    val height: Int,
+    val total_kbps: Int = 0,
+    val peak_kbps: Int = 0,
 )
 
 @Serializable
@@ -200,13 +241,23 @@ data class Decision(
     val method: String,
     val play_url: String,
     val delivery: Delivery? = null,
+    val source: SourceSummary? = null,
     val reasons: List<String> = emptyList(),
     val transcode_audio: Boolean = false,
     val audio: List<AudioTrack> = emptyList(),
     val subtitles: List<SubTrack> = emptyList(),
     val markers: List<Marker> = emptyList(),
+    val ladder: List<Rung> = emptyList(),
     val audio_offset_ms: Long = 0,
     val declared_offset_ms: Long? = null,
+    /**
+     * The dynamic range of the bytes this delivery plan would put on the wire —
+     * `"dolby_vision" | "hdr10" | "hlg" | "sdr"`, the source's own vocabulary
+     * plus `"sdr"`, so a client compares source against delivered with string
+     * equality. Absent on a server that predates it; the badge then falls back
+     * to describing the source alone.
+     */
+    val delivered_dynamic_range: String? = null,
 )
 
 @Serializable
@@ -216,13 +267,27 @@ data class HlsStart(
     val duration_ms: Long? = null,
     val start_seconds: Double = 0.0,
     val encoder: String? = null,
+    /**
+     * The whole stream is already on disk (a pre-transcode cache hit). Treat
+     * it like direct play: `start_seconds` is 0 and the client seeks, rather
+     * than opening a fresh session per seek.
+     */
+    val vod: Boolean = false,
+    val ladder: List<Rung> = emptyList(),
+    /**
+     * What *this session* delivers, which overrides the decision's answer the
+     * moment the session attaches: a burn or a manually-picked rung forces a
+     * transcode the decision never promised. Null when the server could not
+     * read the source mid-request — the client then keeps what it had.
+     */
+    val delivered_dynamic_range: String? = null,
 )
 
 /**
- * Body for `POST /files/{id}/hls/sessions`. `height` stays null on purpose:
- * omitting it selects the server's Auto rung — the rung depends on which
- * encoder wins, and only the create response knows that. (`Net`'s Json has
- * `explicitNulls = false`, so nulls are genuinely absent on the wire.)
+ * Body for `POST /files/{id}/hls/sessions`. A null `height` selects the
+ * server's Auto rung — the rung depends on which encoder wins, and only the
+ * create response knows that. (`Net`'s Json has `explicitNulls = false`, so
+ * nulls are genuinely absent on the wire.)
  */
 @Serializable
 data class CreateSessionReq(
@@ -233,11 +298,28 @@ data class CreateSessionReq(
     val height: Int? = null,
     val start: Double? = null,
     val audio: Int? = null,
+    /**
+     * Burn a track into the picture. Only for the ones with no text to send —
+     * a bitmap (PGS/VobSub) or a styled ASS/SSA track. Costs the stream its
+     * encoder slot, its resolution promise, and its HDR, so a text track must
+     * never come through here.
+     */
     val subtitle_burn: Int? = null,
+    /**
+     * Advertise this source's WebVTT-convertible tracks as HLS renditions.
+     * Changes only playlist metadata, never the video recipe.
+     */
+    val native_subtitles: Boolean? = null,
+    /**
+     * Initially selected native rendition — the **absolute** subtitle-stream
+     * index, not an ordinal among the text-only ones.
+     */
+    val subtitle: Int? = null,
     /** Manual A/V correction for this playback only; positive delays audio. */
     val audio_offset_ms: Long? = null,
     val copy: Boolean? = null,
     val aac: Boolean? = null,
+    val preserve_dolby_vision: Boolean? = null,
 )
 
 @Serializable

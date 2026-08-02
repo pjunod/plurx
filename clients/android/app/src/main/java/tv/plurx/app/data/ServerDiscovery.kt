@@ -11,8 +11,12 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeoutOrNull
 
 private const val PlurxServiceType = "_plurx._tcp."
+
+/** A LAN mDNS resolution that takes longer than this is not coming back. */
+private const val RESOLVE_TIMEOUT_MS = 5_000L
 
 class DiscoveredServer internal constructor(
     val id: String,
@@ -143,8 +147,23 @@ class ServerDiscovery(context: Context) {
         updateState(error = null)
     }
 
+    /**
+     * Resolve a discovered service to an origin.
+     *
+     * Bounded, because `NsdManager.resolveService` is a callback with no
+     * timeout of its own: a service that vanished between discovery and
+     * selection — a server that just went to sleep, a stale multicast record —
+     * never calls either callback, and the suspension never ends. The caller
+     * sets `busy = true` before this and clears it in a `finally`, so an
+     * unbounded wait wedges the connect screen with a spinner and no way out.
+     */
     @Suppress("DEPRECATION")
-    suspend fun resolve(server: DiscoveredServer): String = suspendCancellableCoroutine { continuation ->
+    suspend fun resolve(server: DiscoveredServer): String =
+        withTimeoutOrNull(RESOLVE_TIMEOUT_MS) { awaitResolve(server) }
+            ?: throw IOException("The discovered server stopped responding.")
+
+    @Suppress("DEPRECATION")
+    private suspend fun awaitResolve(server: DiscoveredServer): String = suspendCancellableCoroutine { continuation ->
         manager.resolveService(server.serviceInfo, object : NsdManager.ResolveListener {
             override fun onResolveFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
                 if (continuation.isActive) {

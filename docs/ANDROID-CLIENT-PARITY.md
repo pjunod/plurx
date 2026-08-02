@@ -4,11 +4,19 @@ The Android client is the native plurx **viewer** for phones, foldables,
 tablets, Android TV, and Google TV. This page records what “web parity” means
 for that viewer and keeps server administration out of the comparison.
 
-> Status: broad viewer parity exists, but playback-contract parity with the
-> Apple client is incomplete. In particular, Android still burns and restarts
-> for server-controlled text subtitles. The build-ready handoff is
-> [CLIENTS-REMEDIATION-PLAN.md](CLIENTS-REMEDIATION-PLAN.md), beginning with
-> §5; native subtitle parity is §5.4.
+> Status: viewer parity exists and both the playback-negotiation arc
+> ([CLIENTS-REMEDIATION-PLAN.md](CLIENTS-REMEDIATION-PLAN.md) §4.2–§4.5,
+> §5.1–§5.6) and the P2 pass (§7.1–§7.3, §7.5, §7.6) have landed: Dolby Vision
+> and route-aware audio caps, `force` and height promises, native text
+> subtitles, `vod` sessions, the server's ladder, a row-container TV focus
+> graph, rollup-aware watch filters, parallel first paint, the lifecycle-edge
+> hygiene pass, and an R8-minified release build. The dynamic-range badge also
+> reports what is being *delivered and rendered*, not only what the file
+> carries ([MEDIA-BADGES-PLAN.md](MEDIA-BADGES-PLAN.md) §6).
+>
+> Two acceptance checks remain device-only and unproven in CI: `ShelfFocusTest`
+> (needs a TV emulator or device) and the badge's on-screen behaviour on an HDR
+> panel.
 
 ## Viewer surface
 
@@ -17,18 +25,19 @@ for that viewer and keeps server administration out of the comparison.
 | Connect, login, remembered session | Native connect/login screens and DataStore session |
 | Continue Watching, Next Up, Recently Added | Adaptive home rails |
 | Category- or library-grouped home | Home grouping preference |
-| Browse, pagination, sort, watch filters | Adaptive library grid |
+| Browse, pagination, sort, watch filters | Adaptive library grid; pages paint as they arrive, sort is client-side, and containers classify by `rollup` |
 | Cross-library search | Native search screen |
 | Movie/show/season/episode hierarchy | Native detail and episode rows |
 | Home-video folders and photos | Folder navigation and photo viewer |
 | Resume, restart, watched/unwatched | Detail actions and progress sync |
 | Direct, remux, HLS transcode | Media3/ExoPlayer delivery-plan execution |
-| Audio/subtitle choice | Embedded tracks are native; server-controlled text still burns and reopens (parity work §5.4) |
-| Auto/original/fixed playback quality | Viewer preference and in-player selector |
+| Audio/subtitle choice | Embedded tracks are native; server text tracks arrive as HLS renditions, and only bitmap or styled tracks burn |
+| Auto/original/fixed playback quality | Viewer preference and an in-player selector built from the server's advertised ladder |
 | Intro/credits markers | Manual skip or automatic skip |
 | Autoplay next episode | Ordered season/show traversal |
 | A/V sync correction | Persistent per-file correction |
-| Playback decision/stats | In-player information panel |
+| Playback decision/stats | In-player information panel, including a "Dynamic range" row |
+| Source-vs-delivered media badges | Dynamic-range chip dims and names what is on screen (`DV → HDR10`) |
 | Classic, Terminal, noirr | Matching palettes, shapes, and typography |
 | System, light, dark appearance | Independent appearance preference |
 
@@ -38,19 +47,20 @@ media keys, and D-pad focus states.
 
 ## Apple parity handoff
 
-The gap is large enough to keep out of the Apple subtitle release. The detailed
-handoff in [CLIENTS-REMEDIATION-PLAN.md](CLIENTS-REMEDIATION-PLAN.md) pins the
-wire contracts, exact files, milestones, tests, hardware matrix, rollout
-evidence, and non-goals for a separate implementation session.
-
-The subtitle milestone must preserve these outcomes:
+The handoff in [CLIENTS-REMEDIATION-PLAN.md](CLIENTS-REMEDIATION-PLAN.md) pins
+the wire contracts, exact files, milestones, tests, hardware matrix, rollout
+evidence, and non-goals. These are the subtitle outcomes it required, now
+implemented and pinned by `PlaybackPolicyTest`:
 
 - SRT/SubRip/WebVTT sends `native_subtitles = true`, `subtitle = <index>`,
   and no `subtitle_burn`; the selected quality and video recipe do not change.
 - Media3 switches native text tracks with `TrackSelectionOverride` and turns
   them off by disabling `C.TRACK_TYPE_TEXT`; neither action creates a new HLS
   session.
-- PGS, VobSub, and styled ASS/SSA use `subtitle_burn` at source height.
+- PGS, VobSub, and styled ASS/SSA use `subtitle_burn` at source height. Note
+  that `/decision` reports `text: true` for ASS/SSA — it is not a bitmap — but
+  the session endpoint rejects it as a native rendition and the master never
+  advertises it, so the client classifies renditions by codec, not by `text`.
 - Viewer-language automatic selection treats a forced disposition and a
   case-insensitive `Forced` title as equivalent signals. For file 5615 with
   English preferences, subtitle index 2 wins over the Italian container
@@ -90,3 +100,21 @@ cd clients/android
 The connected Compose test renders a core card/control surface under all three
 themes. The manual pass uses a disposable plurx library to verify real home,
 settings, detail, photo, and playback content rather than empty previews.
+
+## D-pad focus
+
+`ShelfFocusTest` (androidTest) is the reproduction
+[CLIENTS-REMEDIATION-PLAN.md](CLIENTS-REMEDIATION-PLAN.md) §7.1 asked for
+before the fix. A shelf's `FocusRequester` used to ride on the card at index 0,
+which a `LazyRow` disposes as soon as the viewer scrolls past it — every
+neighbouring shelf then aimed `up`/`down` at a requester attached to nothing.
+The requester and the `up`/`down` overrides now live on the row container with
+`focusGroup()`; `FocusTargetNode` resolves properties by walking ancestors, so
+one declaration governs every card whether or not it was composed. Poster cards
+and pickers carry one focus target apiece (`clickable` is already focusable),
+and the "Group by" picker is a stop on the vertical chain rather than a
+touch-only control.
+
+**Run it on a TV profile.** It cannot run in CI or in a cloud sandbox — there
+is no device — so it is written, compiled, and unproven until someone runs it
+against `plurx_android_tv_1080p_api36`.
