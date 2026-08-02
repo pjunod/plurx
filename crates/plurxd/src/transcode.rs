@@ -908,6 +908,10 @@ struct Session {
     /// Where this session's timeline begins in the source, so a recovered
     /// (idempotent) create reports the same offset the first one did.
     start_seconds: f64,
+    /// RFC 6381 sample types present in the primary HLS rendition. A native
+    /// subtitle master must advertise these alongside `wvtt`; omitting the
+    /// referenced formats makes AVPlayer reject an otherwise playable copy.
+    hls_codecs: String,
     target_height: i64,
     /// The encoder actually running *now*. Mutable because the
     /// hardware->software fallback replaces the process inside one session,
@@ -1150,10 +1154,53 @@ pub struct SegmentFile {
 /// The source timeline behind one capability-authenticated HLS session.
 /// Subtitle child requests resolve this instead of accepting a file id from
 /// the URL, so one session capability can never be used to read another file.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct HlsContext {
     pub file_id: i64,
     pub start_seconds: f64,
+    pub codecs: String,
+}
+
+fn audio_track(
+    file: &plurx_core::domain::MediaFile,
+    selected: Option<i64>,
+) -> Option<&plurx_core::domain::AudioStream> {
+    selected
+        .and_then(|index| file.audio_streams.iter().find(|track| track.index == index))
+        .or_else(|| file.audio_streams.iter().find(|track| track.default))
+        .or_else(|| file.audio_streams.first())
+}
+
+fn copied_audio_codec(file: &plurx_core::domain::MediaFile, selected: Option<i64>) -> &'static str {
+    match audio_track(file, selected).map(|track| track.codec.as_str()) {
+        Some("ac3" | "ac-3") => "ac-3",
+        Some("eac3" | "eac-3" | "ec-3") => "ec-3",
+        Some("alac") => "alac",
+        Some("mp3") => "mp4a.40.34",
+        _ => "mp4a.40.2",
+    }
+}
+
+fn copied_hls_codecs(
+    file: &plurx_core::domain::MediaFile,
+    audio_index: Option<i64>,
+    options: CopySessionOptions,
+) -> String {
+    let video = match file.video_codec.as_deref() {
+        Some("hevc" | "h265")
+            if options.preserve_dolby_vision && file.hdr.as_deref() == Some("dolby_vision") =>
+        {
+            "dvh1"
+        }
+        Some("hevc" | "h265") => "hvc1",
+        _ => "avc1",
+    };
+    let audio = if options.transcode_audio {
+        "mp4a.40.2"
+    } else {
+        copied_audio_codec(file, audio_index)
+    };
+    format!("{video},{audio}")
 }
 
 pub struct StartInfo {
@@ -1945,6 +1992,7 @@ impl TranscodeManager {
             user_name: user_name.to_owned(),
             playback_id: playback_id.to_owned(),
             start_seconds: 0.0,
+            hls_codecs: "avc1,mp4a.40.2".into(),
             target_height: opts.target_height,
             encoder_label: Mutex::new("cached"),
             started_unix: std::time::SystemTime::now()
@@ -2969,6 +3017,7 @@ impl TranscodeManager {
             user_name: user_name.to_owned(),
             playback_id: playback_id.to_owned(),
             start_seconds,
+            hls_codecs: "avc1,mp4a.40.2".into(),
             target_height,
             encoder_label: Mutex::new(encoder.label()),
             started_unix: std::time::SystemTime::now()
@@ -3399,6 +3448,7 @@ impl TranscodeManager {
             user_name: user_name.to_owned(),
             playback_id: playback_id.to_owned(),
             start_seconds,
+            hls_codecs: copied_hls_codecs(&file, audio_override, options),
             target_height: file.height.unwrap_or(0),
             encoder_label: Mutex::new("copy"),
             started_unix: std::time::SystemTime::now()
@@ -3595,6 +3645,7 @@ impl TranscodeManager {
         Some(HlsContext {
             file_id: session.file_id,
             start_seconds: session.start_seconds,
+            codecs: session.hls_codecs.clone(),
         })
     }
 
@@ -4796,6 +4847,52 @@ mod tests {
         assert_eq!(segment_index("seg.ts"), None);
     }
 
+    #[tokio::test]
+    async fn hls_codec_metadata_matches_copy_and_audio_conversion() {
+        use plurx_core::domain::AudioStream;
+        use plurx_core::store::SqliteStore;
+
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let file_id = seed_file(&store).await;
+        let mut file = store
+            .get_file(file_id)
+            .await
+            .expect("read file")
+            .expect("seeded file");
+        file.hdr = Some("dolby_vision".into());
+        file.audio_streams = vec![AudioStream {
+            index: 0,
+            codec: "eac3".into(),
+            channels: Some(6),
+            language: Some("eng".into()),
+            title: None,
+            default: true,
+        }];
+
+        assert_eq!(
+            copied_hls_codecs(
+                &file,
+                None,
+                CopySessionOptions {
+                    transcode_audio: false,
+                    preserve_dolby_vision: true,
+                },
+            ),
+            "dvh1,ec-3"
+        );
+        assert_eq!(
+            copied_hls_codecs(
+                &file,
+                None,
+                CopySessionOptions {
+                    transcode_audio: true,
+                    preserve_dolby_vision: false,
+                },
+            ),
+            "hvc1,mp4a.40.2"
+        );
+    }
+
     /// A session with no encoder behind it, for exercising the index, the
     /// retention window and the pruner without spawning ffmpeg. The child is a
     /// real (idle) process because `Session` owns one; nothing here signals it.
@@ -4819,6 +4916,7 @@ mod tests {
             user_name: "paul".into(),
             playback_id: "pb-test".into(),
             start_seconds: 0.0,
+            hls_codecs: "avc1,mp4a.40.2".into(),
             target_height: 720,
             encoder_label: Mutex::new("test"),
             started_unix: 0,
@@ -5454,6 +5552,7 @@ mod tests {
             user_name: "paul".into(),
             playback_id: "pb-watchdog".into(),
             start_seconds: 0.0,
+            hls_codecs: "avc1,mp4a.40.2".into(),
             target_height: 1080,
             encoder_label: Mutex::new("test"),
             started_unix: 0,
