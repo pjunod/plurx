@@ -263,9 +263,13 @@ checks are:
 ./gradlew :app:connectedDebugAndroidTest
 ```
 
-`ShelfFocusTest` is the one to run on a **TV** profile: it scrolls a shelf until
-its first card is disposed and then walks focus down and back up, which is the
-failure the row-container focus graph exists to prevent.
+`ShelfFocusTest` is the one to run on a **TV** profile. Every move in it is a
+real D-pad key event, not a `FocusRequester.requestFocus()` call: it scrolls a
+shelf until its first card is disposed and then presses *towards* that shelf,
+and it presses towards destinations — a shelf's own "View all", the "Group by"
+picker — that Compose's spatial search would not choose on its own. Those are
+the two failures the focus graph exists to prevent: a requester left on a
+disposed card, and a `focusProperties` block declared where no card can read it.
 
 The v0.1 viewer layout was exercised on API 36 AOSP profiles matching Pixel 10
 Pro XL (`1344×2992`), Pixel 10 Pro Fold open (`2076×2152`), and Android TV

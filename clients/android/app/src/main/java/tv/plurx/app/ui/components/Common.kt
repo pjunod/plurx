@@ -98,10 +98,13 @@ fun PosterCard(
             .width(width)
             .scale(scale)
             .onFocusChanged { focused = it.isFocused }
-            // One focus target, not two. `clickable` is already focusable, so
-            // the trailing `focusable()` added a second, *unclickable* target
-            // in front of it: the D-pad could land on a card whose centre
-            // press then did nothing.
+            // One focus target, not two. `clickable` already delegates a
+            // focusable node, so the trailing `focusable()` was a second focus
+            // target on the same layout node. Removing it is hygiene, not a
+            // bug fix: the outer target is the one focus search collects, so
+            // the ring still lit and centre press still worked. The behaviour
+            // that *is* pinned by a test is that the focused card is the node
+            // carrying the click — see ShelfFocusTest.
             .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) { onClick() }
     ) {
         Box(
@@ -227,38 +230,48 @@ fun MediaRow(
                 )
             }
         }
-        // The shelf, not a card, is what the neighbours point at.
+        // The two halves of a shelf's focus wiring live in different places,
+        // and they have to.
         //
-        // The requester used to ride on the card at index 0, which a `LazyRow`
-        // disposes as soon as the viewer scrolls past it — after that, every
-        // neighbour aiming `up`/`down` here was calling `requestFocus()` on a
-        // requester attached to nothing. `focusGroup` makes the row itself the
-        // target and lets Compose hand focus to whichever card is on screen,
-        // and the row survives scrolling because the row is what exists.
+        // *The requester* belongs on the row container. It used to ride on the
+        // card at index 0, which a `LazyRow` disposes the moment the viewer
+        // scrolls past it; every neighbour aiming `up`/`down` at this shelf was
+        // then calling `requestFocus()` on a requester attached to nothing —
+        // `IllegalStateException: FocusRequester is not initialized`. The row
+        // survives scrolling because the row is what exists, and `focusGroup()`
+        // gives the requester a focus target of our own to bind to, which then
+        // hands focus to whichever card is on screen.
         //
-        // The `up`/`down` overrides live here too: `FocusTargetNode` resolves
-        // its properties by walking ancestors, so one declaration on the
-        // container governs every card in the shelf, whether or not that card
-        // was composed when the shelf was laid out.
+        // *The `up`/`down` overrides* cannot follow it out here. A card's
+        // `FocusTargetNode` resolves its properties with
+        // `visitSelfAndAncestors(FocusProperties, untilType = FocusTarget)` —
+        // the walk stops at the first ancestor focus target. `LazyRow` carries
+        // `Modifier.scrollable` internally, and `ScrollableNode` delegates a
+        // `FocusTargetModifierNode` (`Focusability.Never`), which sits between
+        // the cards and anything the caller hangs on the row. A
+        // `focusProperties` block declared out here is therefore invisible to
+        // every card inside it. It goes on the card — where it costs nothing,
+        // because what it points at is the neighbour's *container*, and
+        // containers do not dispose.
+        val upTarget = if (onViewAll != null) viewAllFocusRequester else previousRowFocusRequester
+        val cardFocusOrder = remember(upTarget, nextRowFocusRequester) {
+            Modifier.focusProperties {
+                upTarget?.let { up = it }
+                nextRowFocusRequester?.let { down = it }
+            }
+        }
         LazyRow(
             modifier = Modifier
                 .testTag(shelfTestTag(title))
                 .then(rowFocusRequester?.let { Modifier.focusRequester(it) } ?: Modifier)
-                .focusGroup()
-                .focusProperties {
-                    if (onViewAll != null) {
-                        up = viewAllFocusRequester
-                    } else if (previousRowFocusRequester != null) {
-                        up = previousRowFocusRequester
-                    }
-                    if (nextRowFocusRequester != null) down = nextRowFocusRequester
-                },
+                .focusGroup(),
             contentPadding = PaddingValues(horizontal = 20.dp),
             horizontalArrangement = Arrangement.spacedBy(14.dp),
         ) {
             items(items, key = { item -> item.id }) { item ->
                 PosterCard(
                     item,
+                    modifier = cardFocusOrder,
                     width = posterWidth,
                     resolutionPlacement = resolutionPlacement,
                 ) { onOpen(item) }

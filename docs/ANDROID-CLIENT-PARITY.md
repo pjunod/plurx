@@ -8,8 +8,8 @@ for that viewer and keeps server administration out of the comparison.
 > ([CLIENTS-REMEDIATION-PLAN.md](CLIENTS-REMEDIATION-PLAN.md) §4.2–§4.5,
 > §5.1–§5.6) and the P2 pass (§7.1–§7.3, §7.5, §7.6) have landed: Dolby Vision
 > and route-aware audio caps, `force` and height promises, native text
-> subtitles, `vod` sessions, the server's ladder, a row-container TV focus
-> graph, rollup-aware watch filters, parallel first paint, the lifecycle-edge
+> subtitles, `vod` sessions, the server's ladder, a TV focus graph whose
+> destinations survive scrolling on both axes, rollup-aware watch filters, parallel first paint, the lifecycle-edge
 > hygiene pass, and an R8-minified release build. The dynamic-range badge also
 > reports what is being *delivered and rendered*, not only what the file
 > carries ([MEDIA-BADGES-PLAN.md](MEDIA-BADGES-PLAN.md) §6).
@@ -105,15 +105,36 @@ settings, detail, photo, and playback content rather than empty previews.
 
 `ShelfFocusTest` (androidTest) is the reproduction
 [CLIENTS-REMEDIATION-PLAN.md](CLIENTS-REMEDIATION-PLAN.md) §7.1 asked for
-before the fix. A shelf's `FocusRequester` used to ride on the card at index 0,
-which a `LazyRow` disposes as soon as the viewer scrolls past it — every
-neighbouring shelf then aimed `up`/`down` at a requester attached to nothing.
-The requester and the `up`/`down` overrides now live on the row container with
-`focusGroup()`; `FocusTargetNode` resolves properties by walking ancestors, so
-one declaration governs every card whether or not it was composed. Poster cards
-and pickers carry one focus target apiece (`clickable` is already focusable),
-and the "Group by" picker is a stop on the vertical chain rather than a
-touch-only control.
+before the fix. Every movement in it is a real D-pad key event; a bare
+`FocusRequester.requestFocus()` would prove nothing, because it consults
+neither the declared order nor whether the destination is still attached.
+
+**The requester lives on the container; the `up`/`down` order lives on the
+card.** A shelf's `FocusRequester` used to ride on the card at index 0, which a
+`LazyRow` disposes as soon as the viewer scrolls past it — every neighbouring
+shelf then aimed `up`/`down` at a requester attached to nothing. It now rides on
+the row's `LazyRow` behind a `focusGroup()`, which a horizontal scroll cannot
+dispose. The `up`/`down` overrides cannot follow it there: a card collects focus
+properties with `visitSelfAndAncestors(FocusProperties, untilType = FocusTarget)`,
+and `LazyRow` carries a focus target of its own inside it (`ScrollableNode`
+delegates a `FocusTargetModifierNode(Focusability.Never)`), so a block declared
+on the row modifier is invisible to every card in the row. They are declared per
+card, pointing at the *neighbour's* container.
+
+**The vertical list is scrolled, not lazy.** Home's shelf list is a
+`Column(verticalScroll)`: in a `LazyColumn` a shelf scrolled out of the window
+detached its requester and the next press towards it threw
+`IllegalStateException: FocusRequester is not initialized`. Spatial focus search
+composes beyond-bounds lazy items to avoid exactly that, but a custom `up`/`down`
+destination bypasses spatial search, so the rescue never runs. Three hub shelves,
+the picker and one shelf per library (or per kind) is a small enough list to
+compose eagerly; each shelf is still a `LazyRow`.
+
+Poster cards and pickers carry one focus target apiece (`clickable` is already
+focusable — hygiene, not a behaviour fix), and the "Group by" picker is a stop on
+the vertical chain rather than a touch-only control: right-aligned, it is outside
+the beam of a card on the left of the shelf above, so spatial search alone steps
+straight past it.
 
 **Run it on a TV profile.** It cannot run in CI or in a cloud sandbox — there
 is no device — so it is written, compiled, and unproven until someone runs it

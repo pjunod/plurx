@@ -11,7 +11,8 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.windowInsetsPadding
-import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
@@ -115,94 +116,114 @@ fun HomeScreen(
                     val index = visibleShelfKeys.indexOf(key)
                     return visibleShelfKeys.getOrNull(index + 1)?.let { shelfFocus[it] }
                 }
-                LazyColumn(contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 32.dp)) {
-                    item {
-                        MediaRow(
-                            "Continue watching",
-                            state.hubs.continue_watching,
-                            posterWidth,
-                            resolutionPlacement = PosterResolutionPlacement.BelowArtwork,
-                            rowFocusRequester = shelfFocus["continue"],
-                            previousRowFocusRequester = previousShelf("continue"),
-                            nextRowFocusRequester = nextShelf("continue"),
-                            onOpen = { onOpenItem(it.id) },
-                        )
-                    }
-                    item {
-                        MediaRow(
-                            "Next up",
-                            state.hubs.next_up,
-                            posterWidth,
-                            rowFocusRequester = shelfFocus["next"],
-                            previousRowFocusRequester = previousShelf("next"),
-                            nextRowFocusRequester = nextShelf("next"),
-                            onOpen = { onOpenItem(it.id) },
-                        )
-                    }
-                    item {
-                        MediaRow(
-                            "Recently added",
-                            state.hubs.recently_added,
-                            posterWidth,
-                            resolutionPlacement = PosterResolutionPlacement.BelowArtwork,
-                            rowFocusRequester = shelfFocus["recent"],
-                            previousRowFocusRequester = previousShelf("recent"),
-                            nextRowFocusRequester = nextShelf("recent"),
-                            onOpen = { onOpenItem(it.id) },
-                        )
-                    }
+                // Scrolled, not lazy — deliberately.
+                //
+                // Every stop above points `up`/`down` at the *next* stop's
+                // `FocusRequester`, and a `FocusRequester` only works while the
+                // node it is attached to is composed. In a `LazyColumn` each
+                // shelf is an item, so scrolling one out of the window detached
+                // its requester and the next D-pad press towards it threw
+                // `IllegalStateException: FocusRequester is not initialized` —
+                // strictly worse than the horizontal case, which merely
+                // no-opped. Compose's own spatial focus search handles that by
+                // composing beyond-bounds items mid-search, but a custom
+                // `up`/`down` destination bypasses spatial search entirely, so
+                // that rescue never runs.
+                //
+                // The alternative — drop the explicit chain and let spatial
+                // search do the vertical walk — loses the "Group by" picker:
+                // it is right-aligned, so from a card on the left of a shelf
+                // the beam heuristic prefers the full-width shelf below it and
+                // steps straight past. §7.1 asks for the picker to be
+                // reachable, so the chain stays and the container stops being
+                // lazy.
+                //
+                // The cost is bounded: this list holds three hub shelves, the
+                // picker, and one shelf per library (or per library *kind*,
+                // which is a handful) — and each shelf is still a `LazyRow`, so
+                // per-shelf composition stays bounded by screen width rather
+                // than by the 24 items it was handed. If a library count ever
+                // reaches the dozens this needs revisiting.
+                Column(
+                    Modifier
+                        .verticalScroll(rememberScrollState())
+                        .padding(bottom = 32.dp)
+                ) {
+                    MediaRow(
+                        "Continue watching",
+                        state.hubs.continue_watching,
+                        posterWidth,
+                        resolutionPlacement = PosterResolutionPlacement.BelowArtwork,
+                        rowFocusRequester = shelfFocus["continue"],
+                        previousRowFocusRequester = previousShelf("continue"),
+                        nextRowFocusRequester = nextShelf("continue"),
+                        onOpen = { onOpenItem(it.id) },
+                    )
+                    MediaRow(
+                        "Next up",
+                        state.hubs.next_up,
+                        posterWidth,
+                        rowFocusRequester = shelfFocus["next"],
+                        previousRowFocusRequester = previousShelf("next"),
+                        nextRowFocusRequester = nextShelf("next"),
+                        onOpen = { onOpenItem(it.id) },
+                    )
+                    MediaRow(
+                        "Recently added",
+                        state.hubs.recently_added,
+                        posterWidth,
+                        resolutionPlacement = PosterResolutionPlacement.BelowArtwork,
+                        rowFocusRequester = shelfFocus["recent"],
+                        previousRowFocusRequester = previousShelf("recent"),
+                        nextRowFocusRequester = nextShelf("recent"),
+                        onOpen = { onOpenItem(it.id) },
+                    )
 
                     if (state.libraries.isNotEmpty()) {
-                        item {
-                            Row(
-                                Modifier.fillMaxWidth().padding(horizontal = side, vertical = 12.dp),
-                                horizontalArrangement = Arrangement.End,
-                            ) {
-                                ChoicePicker(
-                                    label = "Group by",
-                                    value = preferences.homeGrouping,
-                                    options = HomeGrouping.entries,
-                                    optionLabel = { it.label },
-                                    onSelect = vm::setHomeGrouping,
-                                    modifier = Modifier
-                                        .fillMaxWidth(if (formFactor == FormFactor.Compact) 1f else .32f)
-                                        .then(
-                                            shelfFocus[GROUPING_KEY]
-                                                ?.let { Modifier.focusRequester(it) } ?: Modifier,
-                                        )
-                                        .focusProperties {
-                                            previousShelf(GROUPING_KEY)?.let { up = it }
-                                            nextShelf(GROUPING_KEY)?.let { down = it }
-                                        },
-                                )
-                            }
+                        Row(
+                            Modifier.fillMaxWidth().padding(horizontal = side, vertical = 12.dp),
+                            horizontalArrangement = Arrangement.End,
+                        ) {
+                            ChoicePicker(
+                                label = "Group by",
+                                value = preferences.homeGrouping,
+                                options = HomeGrouping.entries,
+                                optionLabel = { it.label },
+                                onSelect = vm::setHomeGrouping,
+                                modifier = Modifier
+                                    .fillMaxWidth(if (formFactor == FormFactor.Compact) 1f else .32f)
+                                    .then(
+                                        shelfFocus[GROUPING_KEY]
+                                            ?.let { Modifier.focusRequester(it) } ?: Modifier,
+                                    )
+                                    .focusProperties {
+                                        previousShelf(GROUPING_KEY)?.let { up = it }
+                                        nextShelf(GROUPING_KEY)?.let { down = it }
+                                    },
+                            )
                         }
                     }
 
                     collections.forEach { collection ->
                         val key = "collection-${collection.title}"
-                        item(key = key) {
-                            MediaRow(
-                                title = collection.title,
-                                items = collection.items,
-                                posterWidth = posterWidth,
-                                onViewAll = { onOpenCollection(collection.title, collection.libraries) },
-                                rowFocusRequester = shelfFocus[key],
-                                previousRowFocusRequester = previousShelf(key),
-                                nextRowFocusRequester = nextShelf(key),
-                                onOpen = { onOpenItem(it.id) },
-                            )
-                        }
+                        MediaRow(
+                            title = collection.title,
+                            items = collection.items,
+                            posterWidth = posterWidth,
+                            onViewAll = { onOpenCollection(collection.title, collection.libraries) },
+                            rowFocusRequester = shelfFocus[key],
+                            previousRowFocusRequester = previousShelf(key),
+                            nextRowFocusRequester = nextShelf(key),
+                            onOpen = { onOpenItem(it.id) },
+                        )
                     }
 
                     val empty = state.hubs.continue_watching.isEmpty() &&
                         state.hubs.next_up.isEmpty() && state.hubs.recently_added.isEmpty() &&
                         state.libraries.isEmpty()
                     if (empty) {
-                        item {
-                            Box(Modifier.fillMaxWidth().padding(40.dp), contentAlignment = Alignment.Center) {
-                                Text("Nothing here yet — add a library on your server.", color = Muted)
-                            }
+                        Box(Modifier.fillMaxWidth().padding(40.dp), contentAlignment = Alignment.Center) {
+                            Text("Nothing here yet — add a library on your server.", color = Muted)
                         }
                     }
                 }
