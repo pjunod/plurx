@@ -1052,6 +1052,18 @@ fn copy_input_args(
     if matches!(source.video_codec.as_deref(), Some("hevc" | "h265")) {
         args.push("-tag:v".into());
         args.push(hevc_copy_tag(source.hdr.as_deref(), preserve_dolby_vision).into());
+        // FFmpeg's MOV muxer guards dvcC/dvvC behind `unofficial`. Without
+        // this, it keeps the Dolby Vision RPUs and writes a `dvh1` sample
+        // entry but silently omits the decoder configuration box. A media
+        // playlist can then appear to play through the HDR10 base layer,
+        // while an HLS master that correctly advertises `dvh1.08.06` fails
+        // AVPlayer with CoreMedia -12927. The strictness option is scoped to
+        // preserved DV; ordinary HEVC and stripped HDR10 copies do not need
+        // an experimental muxer feature.
+        if source.hdr.as_deref() == Some("dolby_vision") && preserve_dolby_vision {
+            args.push("-strict".into());
+            args.push("unofficial".into());
+        }
         args.push("-bsf:v".into());
         args.push(hevc_copy_bsf_for_client(
             source.hdr.as_deref(),
@@ -1718,9 +1730,11 @@ mod tests {
         )
         .join(" ");
         assert!(preserved.contains("-tag:v dvh1"));
+        assert!(preserved.contains("-strict unofficial"));
         assert!(preserved.contains("-bsf:v filter_units=remove_types=32-34"));
         assert!(!preserved.contains("62-63"));
         assert!(!preserved.contains("dovi_rpu=strip=1"));
+        assert!(!dv7.contains("-strict unofficial"));
 
         // H.264 copies are untouched: they are not on the stuttering path and
         // avc1 + in-band parameter sets plays everywhere today.
