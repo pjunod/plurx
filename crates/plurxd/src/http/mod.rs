@@ -4025,7 +4025,7 @@ mod tests {
             shifted.contains("00:00:00.000 --> 00:00:01.000"),
             "{shifted}"
         );
-        assert!(shifted.contains("X-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:0"));
+        assert!(shifted.contains("X-TIMESTAMP-MAP=MPEGTS:0,LOCAL:00:00:00.000"));
 
         // The old file-id route is still bearer protected; only URLs rooted
         // in the live session capability are headerless.
