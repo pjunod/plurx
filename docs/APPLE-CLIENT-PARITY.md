@@ -9,7 +9,10 @@ testable set of behaviors rather than a general impression.
 > simulator targets, and deployed server-side. The physical Apple TV accepts
 > the native WebVTT master and selects the requested rendition; the exact
 > copied-Dolby-Vision regression file still falls back after a CoreMedia
-> `-12927` rejection. Other P1 and P2 items below remain open.
+> `-12927` rejection. The P2 comfort pass has landed in source — watch filters
+> for show libraries, incremental first paint, the ImageIO image pipeline,
+> centralized session expiry, and the delivered-dynamic-range badge (§5) — and
+> is awaiting its device run. Other P1 items below remain open.
 
 ## What parity means
 
@@ -28,18 +31,19 @@ testable set of behaviors rather than a general impression.
 
 | Area | Web client | iOS / tvOS now | Remaining work |
 |---|---|---|---|
-| Server setup | Manual address | Bonjour `_plurx._tcp` first; manual fallback; port 32400 | Validate discovery on bare metal, host-network Docker, iPhone, and Apple TV |
+| Server setup | Manual address | Bonjour `_plurx._tcp` first; manual fallback; port 32400; resolution runs on the main run loop and always returns or fails within its own deadline | Validate discovery on bare metal, host-network Docker, iPhone, and Apple TV; eventual `NWBrowser`/`NWConnection` migration (`NetService` is legacy) |
 | Local-network permission | Browser permission model | Bonjour starts before auth; URL requests wait while the iOS prompt is open | Add UI that distinguishes Denied from multicast unavailable |
-| Session | Local login and remembered token | Local login and silent reconnect | Move bearer token from `UserDefaults` to Keychain |
-| Home and browse | Hubs, libraries, hierarchy | Hubs, libraries, show → season → episode | Sorting, filters, denser iPad/tvOS layouts |
+| Session | Local login and remembered token | Local login and silent reconnect; bearer in the Keychain; origin and token are written together, so changing servers cannot leave the previous server's credential on disk; a 401/403 on any request after bootstrap clears the token and returns to the login screen instead of printing "Server returned 401" on every screen | Verify Keychain behavior across device restore and app replacement |
+| Home and browse | Hubs, libraries, hierarchy | Hubs, libraries, show → season → episode; sort and watch-status filters, with containers classified from the server's `rollup`; hubs/libraries/Coming Soon fetched in parallel, shelves and library pages published as they arrive, spinner only over an empty screen, and a refresh on player dismissal and on `scenePhase == .active` | Denser iPad/tvOS layouts; a device pass on very large libraries |
 | Search | Global search | Native API-backed search | Improve keyboard, history, and tvOS focus polish |
 | Playback decision | Runtime caps, server delivery plan | Runtime VideoToolbox/display caps; executes `delivery` | Real-device codec/HDR matrix, especially Dolby Vision profiles |
-| Transport | Play/pause, ±10, full seek | Explicit play/pause, ±10, full-film slider; HLS seeks reopen at the film position | Validate rapid/overlapping seek cancellation and long transcodes |
+| Transport | Play/pause, ±10, full seek | Explicit play/pause, ±10, full-film slider; HLS seeks reopen at the film position; a seek or track change issued during a stream change is queued and replayed once, last writer wins, instead of being dropped | Device-verify hammered tvOS step-seeks during a quality change, and long transcodes |
 | iOS Now Playing | Not applicable | Known duration, elapsed time, pause/play/seek commands, `isLiveStream = false` | Add artwork and series/episode metadata |
 | Audio tracks | Select and restart when needed | Select and restart at the same position | Add friendlier channel/codec labels; validate TrueHD/DTS fallback |
-| Subtitles | Text WebVTT stays client-side; bitmap tracks burn in | SRT/SubRip/WebVTT use native HLS renditions; PGS, VobSub, and styled ASS/SSA retain burn-in | Complete the Android parity milestone and broaden physical-device coverage |
-| Quality | Auto adaptation, Original, explicit rungs | Server Auto plus explicit ladder rungs | P1: continuous adaptation and an honest Original option when compatible |
-| Playback info | Detailed source, output, network, encoder, stalls | Source/output, access-log bitrate/stalls, server encode speed/ahead/delivery | Add TTFF, frame presentation rate, stall classification, and build stamp |
+| Subtitles | Text WebVTT stays client-side; bitmap tracks burn in | SRT/SubRip/WebVTT use native HLS renditions; PGS, VobSub, and styled ASS/SSA retain burn-in; automatic selection never starts a burn except a forced track (see §2) | Complete the Android parity milestone and broaden physical-device coverage |
+| Quality | Auto adaptation, Original, explicit rungs | Server Auto plus explicit ladder rungs; a change that fails to create its session leaves the current stream playing | P1: continuous adaptation and an honest Original option when compatible |
+| Playback info | Detailed source, output, network, encoder, stalls | Source/output, dynamic range, access-log bitrate/stalls, server encode speed/ahead/delivery | Add TTFF, frame presentation rate, stall classification, and build stamp |
+| Media badges | Source badges on detail pages; source-vs-delivered dynamic range in the player | Same shape: detail pages carry resolution/codec/dynamic range source-only; the player's chip dims and names what is actually being delivered (§5) | Extend the same mechanism to audio (Atmos → AAC) and resolution (4K → rung), each with its own truth table |
 | Intro/credits | Manual and automatic skip | Manual marker button | P1: persisted auto-skip and next-episode handling for end credits |
 | Autoplay | Next episode, then next season; default on | Same traversal and default | Add a cancelable countdown and “Up Next” metadata |
 | Audio sync | Persisted per-file ±ms correction | Missing | P1: expose the existing server offset endpoint and restart at position |
@@ -80,15 +84,63 @@ PGS, VobSub, and styled ASS/SSA still reopen at the same film position and burn
 at source height. This is intentional: those formats cannot be represented as
 ordinary WebVTT without losing pixels or important styling.
 
-For v0.2, a playable file containing native text tracks opens through a copy-HLS
-session even if its video could otherwise use the raw direct URL. That makes all
-text tracks available before the viewer opens the subtitle menu and permits
-restart-free toggles. The cost is a segmenter session for that title. A future
-direct-until-first-toggle design may remove that cost, but the first subtitle
-selection would necessarily reopen playback.
+#### The accepted tradeoff: text tracks cost a session, not a restart
+
+**Decision, v0.2: keep it.** Any playable file containing an SRT/SubRip/WebVTT
+track opens through a copy-HLS session even when its video could have used the
+raw direct URL. The guard is one line —
+`let direct = normalMode == "direct" && … && !hasNativeSubtitles` in
+`PlayerController.open()`.
+
+*What it costs.* A server session plus a segmenter for that title, on every
+play, where the web and Android clients serve raw bytes over an HTTP range
+request. Nothing else: `copy: true` means the video is repackaged untouched, so
+resolution, HDR, Dolby Vision, and bitrate are identical to direct play, and no
+encoder is attached.
+
+*What it buys.* Every text track exists as an HLS rendition before the viewer
+opens the subtitle menu, so turning subtitles on, switching between two
+languages, and turning them off again are all AVPlayer media selections on the
+item that is already playing. No reopen, no reseek, no black frame, no lost
+buffer. Subtitles are most often reached for *mid-scene*, after a line was
+missed — which is exactly when a restart is most expensive to the viewer.
+
+*Why it is not an accident.* The alternative was considered and declined for
+v0.2, not overlooked. A direct-play session that has no subtitle renditions
+cannot grow them: the first selection has to tear the item down and rebuild it
+as a copy session, which is the restart this design exists to avoid.
+
+*The alternative, if Paul wants it.* **Direct-until-first-toggle**: direct-play
+the file, and reopen as a copy-HLS session the first time a subtitle is
+selected. That reclaims the session for the majority of plays where subtitles
+are never touched, at the price of one clean restart at first selection — the
+code already restarts cleanly for burns, so this is a contained change to the
+same `guard`, not a redesign. It is *not* implemented; it is an open option,
+and switching to it is a behavior change that belongs in its own commit with its
+own line in this document.
+
+#### What automatic subtitle selection is allowed to do
+
+Automatic (cold-start) selection never starts a burn — **except a forced track,
+which may, always at source height**. The whole policy is one pure function,
+`PlayerController.automaticSubtitleIndex`, and the carve-out is one line of it:
+
+| Track shape (within the viewer's preferred language) | Cold start |
+|---|---|
+| Forced — disposition flag *or* "forced" in the title, any codec | apply; bitmap forced tracks are the one permitted automatic burn, at source height |
+| Default-flagged and native text (SRT/SubRip/WebVTT) | apply through the free rendition path |
+| Default-flagged but bitmap (PGS/VobSub) or styled (ASS/SSA) | never automatic — explicit selection only |
+| Merely the same language, unflagged | never automatic |
+
+The rows that decline are the substance. Before this, a 4K HDR remux whose only
+English subtitle track was a default-flagged PGS cold-started as a burn
+transcode on every play: an encoder slot, H.264, and no HDR, for a track nobody
+had asked for. Manual selection is untouched — a viewer who picks a PGS track
+still gets a burn, at source height.
 
 The cross-client implementation handoff is
-[CLIENTS-REMEDIATION-PLAN.md](CLIENTS-REMEDIATION-PLAN.md), especially §5.4.
+[CLIENTS-REMEDIATION-PLAN.md](CLIENTS-REMEDIATION-PLAN.md), especially §5.4;
+the session tradeoff above is its §6.4 and the selection table is its §3.1.
 
 ### 3. Add the remaining web playback controls
 
@@ -103,10 +155,54 @@ In order:
 
 ### 4. Fill discovery and browsing comfort gaps
 
-Add permission-denied guidance, search, library sorting/filtering, and Keychain
-storage. Multicast discovery must remain best-effort: Bonjour normally does not
-cross VLANs, guest Wi-Fi, VPNs, or a Docker bridge, so manual setup remains a
-supported path rather than an error screen.
+Search, library sorting/filtering, and Keychain token storage are done. What
+remains here is permission-denied guidance — a screen that distinguishes a
+denied Local Network prompt from multicast simply being unavailable. Multicast
+discovery must remain best-effort: Bonjour normally does not cross VLANs, guest
+Wi-Fi, VPNs, or a Docker bridge, so manual setup remains a supported path rather
+than an error screen.
+
+Two browsing gaps closed with it, both about not lying while loading. Watch
+filters now classify shows and seasons from the `rollup` the server attaches to
+containers, because a container has no watch row of its own — before this,
+"Watched" and "In progress" filtered a TV library to nothing and "Unwatched"
+listed finished series. And first paint no longer waits on the last response:
+hubs, libraries, and Coming Soon go out together, shelves and library pages
+publish as they arrive, and the spinner is reserved for a screen that has never
+held anything — so pull-to-refresh, leaving the player, and returning from the
+background all refresh in place instead of blanking.
+
+### 5. What the dynamic-range badge is allowed to claim
+
+The player's HDR/DV chip used to be built from the source probe alone, which
+made it a statement about the file rather than about the picture: a Dolby Vision
+disc remux read `DV` while a forced 1080p rung was delivering tone-mapped SDR.
+It now answers both questions at once, from three inputs and no more:
+
+| Layer | Where it comes from |
+|---|---|
+| Source | `SourceSummary.hdr` / `hdr_format` — what the file carries |
+| Delivered | `delivered_dynamic_range` on the decision, overridden by the same field on the HLS session response the moment a session attaches |
+| Rendered | `AVPlayer.eligibleForHDRPlayback` — delivered HDR on an SDR display is rendered SDR |
+
+The chip text always starts from the source grade, because that claim stays true
+either way. When the rendered grade differs it dims to ~0.45 and appends an
+arrow (`DV → HDR10`, `HDR → SDR`), with a spelled-out accessibility label
+("Dolby Vision, playing as HDR10") and a matching "Dynamic range" row in the
+playback-info panel carrying the server's own reason string.
+
+**Eligibility is the whole of the local signal, deliberately.** AVFoundation
+exposes nothing public about which HLS variant is active, so there is no honest
+per-stream confirmation to add; `UIScreen.currentEDRHeadroom` and
+`AVDisplayManager` are explicit non-goals in
+[MEDIA-BADGES-PLAN.md](MEDIA-BADGES-PLAN.md) §9. Eligibility is read at render
+time rather than cached, so turning an Apple TV's Dolby Vision output off in
+Settings changes the badge without relaunching the app.
+
+The badge is a reporter. Nothing it computes reaches a decision, a capability
+query, or a session request; the audio and resolution badges stay source-only in
+this pass because their truth tables are not written yet. Detail pages stay
+source-only by design — there is no session there to report a downgrade against.
 
 ## Release gate
 

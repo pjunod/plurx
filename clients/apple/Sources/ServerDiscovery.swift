@@ -136,23 +136,48 @@ final class ServerDiscovery: ObservableObject {
 /// every result. Foundation's resolver supplies fresh addresses only after a
 /// person chooses one server. Prefer that numeric address so reconnecting also
 /// escapes a stale `.local` DNS cache.
-private final class BonjourResolver: NSObject, NetServiceDelegate {
+///
+/// `@MainActor` is load-bearing, not decoration. `NetService` delivers every
+/// outcome — success, failure, and its own `withTimeout:` expiry — through
+/// run-loop sources. A `nonisolated` `async` method runs on a cooperative-pool
+/// thread whose run loop is never spun, so no delegate callback could ever
+/// fire: the continuation leaked and `await` never returned, wedging both the
+/// connect screen and saved-session recovery. Being main-actor isolated puts
+/// the resolve on the main run loop, which SwiftUI already spins.
+@MainActor
+final class BonjourResolver: NSObject, @preconcurrency NetServiceDelegate {
     private let service: NetService
     private var continuation: CheckedContinuation<String, Error>?
+    private var timeoutTask: Task<Void, Never>?
     private var finished = false
 
-    init(server: DiscoveredServer) {
-        let type = server.type.hasSuffix(".") ? server.type : server.type + "."
-        let domain = server.domain.hasSuffix(".") ? server.domain : server.domain + "."
-        service = NetService(domain: domain, type: type, name: server.name)
+    init(name: String, type: String, domain: String) {
+        let type = type.hasSuffix(".") ? type : type + "."
+        let domain = domain.hasSuffix(".") ? domain : domain + "."
+        service = NetService(domain: domain, type: type, name: name)
         super.init()
     }
 
-    func resolve() async throws -> String {
+    convenience init(server: DiscoveredServer) {
+        self.init(name: server.name, type: server.type, domain: server.domain)
+    }
+
+    /// Resolves to an `http://host:port` origin, or throws. It always returns:
+    /// the explicit main-run-loop scheduling is what makes `NetService`'s own
+    /// callbacks reachable, and the Task-side deadline one second past the
+    /// service timeout is belt and braces so no future scheduling regression
+    /// can strand a caller again.
+    func resolve(timeout: TimeInterval = 5) async throws -> String {
         try await withCheckedThrowingContinuation { continuation in
             self.continuation = continuation
             service.delegate = self
-            service.resolve(withTimeout: 5)
+            service.schedule(in: .main, forMode: .common)
+            service.resolve(withTimeout: timeout)
+            timeoutTask = Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .seconds(timeout + 1))
+                guard !Task.isCancelled else { return }
+                self?.finish(.failure(ServerDiscoveryError.resolutionFailed))
+            }
         }
     }
 
@@ -173,6 +198,8 @@ private final class BonjourResolver: NSObject, NetServiceDelegate {
     private func finish(_ result: Result<String, Error>) {
         guard !finished else { return }
         finished = true
+        timeoutTask?.cancel()
+        timeoutTask = nil
         service.delegate = nil
         service.stop()
         continuation?.resume(with: result)

@@ -121,15 +121,22 @@ final class AppModel: ObservableObject {
         busy = true
         defer { busy = false }
 
+        // Point the shared session at the candidate before probing it, and drop
+        // any in-memory bearer in the same breath: a token belongs to exactly
+        // one origin, so not even a failed probe may leave the previous
+        // server's credential attached to this address.
         Session.shared.origin = normalized
+        Session.shared.token = nil
         let a = PlurxAPI(origin: normalized)
         do {
             let info = try await a.serverInfo()
             origin = normalized
             api = a
             serverName = info.name
-            settings.origin = normalized
-            settings.instanceId = info.instanceId
+            // The persisted half of the same invariant. A relaunch between here
+            // and the login below must not be able to hand server A's bearer to
+            // server B — one write, both facts.
+            settings.setServer(origin: normalized, instanceId: info.instanceId, token: nil)
             phase = .needLogin
         } catch {
             authError = "Couldn't reach a plurx server at \(normalized)"
@@ -178,34 +185,51 @@ final class AppModel: ObservableObject {
     }
 
     private func performHomeLoad() async {
-        homeLoading = true
+        // The spinner belongs to a dashboard that has never held anything
+        // useful. Raising it for every refresh is what let pull-to-refresh —
+        // and, now, returning from the player or from the background — blank a
+        // populated screen for the length of a round trip. Both dashboards key
+        // their `ProgressView` off this flag, so the policy lives here once.
+        homeLoading = !hasHomeContent
         homeError = nil
         do {
+            // Three independent requests, one round trip. Coming Soon is
+            // started with the other two rather than after them: it is never
+            // required for first paint, and waiting for it delayed the shelves.
             async let h = requireAPI().hubs()
             async let l = requireAPI().libraries()
+            async let soon = requireAPI().comingSoon()
             let loadedHubs = try await h
             let loadedLibraries = try await l
             hubs = loadedHubs
             libraries = loadedLibraries
+            // Paint as soon as the responses that make a home screen useful
+            // have arrived, not once the last shelf preview has.
             homeLoading = false
 
-            comingSoon = (try? await requireAPI().comingSoon().entries) ?? []
+            comingSoon = (try? await soon)?.entries ?? []
 
-            // Prime the category/library shelves after the useful first paint.
-            // A failed preview must not hide hubs or make the whole home screen
-            // look offline.
-            var previews: [Int: [Item]] = [:]
+            // Prime the category/library shelves after the useful first paint,
+            // publishing each page the moment it lands so shelves fill in
+            // rather than appearing all at once at the end. A failed preview
+            // must not hide hubs or make the whole home screen look offline.
+            var removed = Set(libraryPreviews.keys)
             for library in loadedLibraries {
+                removed.remove(library.id)
                 if let page = try? await requireAPI().libraryItems(
                     library.id,
                     sort: .added,
                     limit: 24
                 ) {
-                    previews[library.id] = page.items ?? []
+                    libraryPreviews[library.id] = page.items ?? []
                 }
             }
-            libraryPreviews = previews
+            // Shelves are published incrementally, so a library that has since
+            // been deleted server-side has to be dropped explicitly; the old
+            // whole-dictionary replacement did it implicitly.
+            for id in removed { libraryPreviews.removeValue(forKey: id) }
         } catch {
+            noteAuthFailure(error)
             homeError = Self.homeErrorMessage(for: error, hasCachedContent: hasHomeContent)
             homeLoading = false
         }
@@ -230,18 +254,60 @@ final class AppModel: ObservableObject {
         return (error as? LocalizedError)?.errorDescription ?? "Failed to load"
     }
 
+    /// Is this the answer a server gives to a bearer it no longer honors?
+    /// Rotating the signing secret, a server reset, or an administrator
+    /// revoking a session all land here.
+    nonisolated static func isSessionExpired(_ error: Error) -> Bool {
+        guard let api = error as? APIError, case .http(let code) = api else { return false }
+        return code == 401 || code == 403
+    }
+
+    /// One place where a signed-in session discovers it is no longer signed in.
+    /// Bootstrap already handled its own 401/403; every screen after it turned
+    /// a rotated token into a per-screen error string instead, so a viewer got
+    /// "Server returned 401" on Home, on every library, and on every detail
+    /// page while still appearing to be logged in. Returns whether it acted, so
+    /// callers can skip an error message that is about to be replaced by the
+    /// login screen.
+    @discardableResult
+    func noteAuthFailure(_ error: Error) -> Bool {
+        // Only after bootstrap: the launch paths clear their own token and
+        // choose between `.needLogin` and `.reconnectFailed` themselves.
+        guard case .ready = phase, Self.isSessionExpired(error) else { return false }
+        signOut()
+        return true
+    }
+
     func logout() {
+        signOut()
+    }
+
+    private func signOut() {
         settings.clearToken()
         Session.shared.token = nil
+        AuthImageCache.shared.clear()
         hubs = Hubs()
         comingSoon = []
         libraries = []
         libraryPreviews = [:]
+        homeLoading = true
+        homeError = nil
         phase = .needLogin
     }
 
     func changeServer() {
+        // Clearing the origin clears the persisted bearer in the same write:
+        // abandoning a server must not leave its credential on disk where the
+        // next one could be handed it, whether or not this process survives to
+        // reach the login screen. The in-memory `origin` deliberately stays as
+        // the connect screen's manual-entry prefill — it is an address, not a
+        // credential, and both copies of the credential are gone.
+        settings.clearServer()
         Session.shared.token = nil
+        // Artwork is cached per origin, but the bytes belong to the server that
+        // served them; leaving them behind wastes memory the next server will
+        // want for its own.
+        AuthImageCache.shared.clear()
         phase = .needServer
         discovery.restart()
     }
@@ -252,8 +318,14 @@ final class AppModel: ObservableObject {
         api = PlurxAPI(origin: recovered.origin)
         Session.shared.origin = recovered.origin
         Session.shared.token = token
-        settings.origin = recovered.origin
-        settings.instanceId = recovered.instanceId
+        // The same server instance at a new address: a move, not a change of
+        // identity, so this token stays with it. `matchesSavedServer` already
+        // proved the instance id matches before we got here.
+        settings.setServer(
+            origin: recovered.origin,
+            instanceId: recovered.instanceId,
+            token: token
+        )
 
         do {
             username = try await requireAPI().me().username
@@ -406,36 +478,65 @@ final class AppModel: ObservableObject {
         return candidates.first(where: { $0.id == id })?.name
     }
 
-    func libraryItems(_ collection: LibraryCollection, sort: LibrarySort) async throws -> [Item] {
+    /// Page a collection, handing the caller everything received so far — in
+    /// the requested order — as each page lands. A thousand-item library used
+    /// to sit behind a spinner for five sequential round trips before showing
+    /// anything; now the first page paints after the first one. `publish` is
+    /// never called with an empty list while pages are still arriving, so a
+    /// refresh over a populated grid replaces it rather than blanking it.
+    func libraryItems(
+        _ collection: LibraryCollection,
+        sort: LibrarySort,
+        publish: ([Item]) -> Void
+    ) async throws {
         var merged: [Item] = []
-        for library in collection.libraries {
-            var offset = 0
-            let limit = 200
-            while true {
-                let page = try await requireAPI().libraryItems(
-                    library.id,
-                    sort: sort,
-                    offset: offset,
-                    limit: limit
-                )
-                let batch = page.items ?? []
-                merged.append(contentsOf: batch)
-                offset += batch.count
-                let total = page.total ?? batch.count
-                if batch.isEmpty || offset >= total || batch.count < limit { break }
+        do {
+            for library in collection.libraries {
+                var offset = 0
+                let limit = 200
+                while true {
+                    let page = try await requireAPI().libraryItems(
+                        library.id,
+                        sort: sort,
+                        offset: offset,
+                        limit: limit
+                    )
+                    let batch = page.items ?? []
+                    merged.append(contentsOf: batch)
+                    offset += batch.count
+                    if !batch.isEmpty {
+                        publish(merged.sorted { Self.compare($0, $1, sort: sort) })
+                    }
+                    let total = page.total ?? batch.count
+                    if batch.isEmpty || offset >= total || batch.count < limit { break }
+                }
             }
+        } catch {
+            noteAuthFailure(error)
+            throw error
         }
-        return merged.sorted { Self.compare($0, $1, sort: sort) }
+        // An empty collection still has to clear whatever was on screen.
+        if merged.isEmpty { publish([]) }
     }
 
     func search(_ query: String) async throws -> [Item] {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return [] }
-        return try await requireAPI().search(trimmed).results ?? []
+        do {
+            return try await requireAPI().search(trimmed).results ?? []
+        } catch {
+            noteAuthFailure(error)
+            throw error
+        }
     }
 
     func itemDetail(_ id: Int) async throws -> ItemDetail {
-        try await requireAPI().item(id)
+        do {
+            return try await requireAPI().item(id)
+        } catch {
+            noteAuthFailure(error)
+            throw error
+        }
     }
 
     /// Resolve a show or season to the episode its primary TV action should
@@ -518,7 +619,12 @@ final class AppModel: ObservableObject {
     }
 
     func setWatched(itemId: Int, watched: Bool) async throws {
-        _ = try await requireAPI().setWatched(itemId: itemId, watched: watched)
+        do {
+            _ = try await requireAPI().setWatched(itemId: itemId, watched: watched)
+        } catch {
+            noteAuthFailure(error)
+            throw error
+        }
     }
 
     /// The web client's next-episode rule: next child in this season, then the
@@ -575,15 +681,30 @@ final class AppModel: ObservableObject {
     }
 
     func decision(fileId: Int) async throws -> Decision {
-        try await requireAPI().decision(fileId: fileId, caps: caps())
+        do {
+            return try await requireAPI().decision(fileId: fileId, caps: caps())
+        } catch {
+            noteAuthFailure(error)
+            throw error
+        }
     }
 
     func createHlsSession(fileId: Int, body: CreateSessionRequest) async throws -> HlsStart {
-        try await requireAPI().createHlsSession(fileId: fileId, body: body)
+        do {
+            return try await requireAPI().createHlsSession(fileId: fileId, body: body)
+        } catch {
+            noteAuthFailure(error)
+            throw error
+        }
     }
 
     func hlsStatus(_ sessionId: String) async throws -> PlaybackSessionStatus {
-        try await requireAPI().hlsStatus(sessionId: sessionId)
+        do {
+            return try await requireAPI().hlsStatus(sessionId: sessionId)
+        } catch {
+            noteAuthFailure(error)
+            throw error
+        }
     }
 
     /// Best-effort — the stream is over either way.
@@ -622,14 +743,29 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// A show has no watch row of its own — the state lives on its episodes,
+    /// which are not in a library page — so filtering a TV grid on `watch`
+    /// alone left "Watched" and "In progress" empty and listed finished series
+    /// under "Unwatched". `list_items` now attaches the same `rollup`
+    /// (`leaves` / `watched`) the detail endpoint has always returned for
+    /// containers, and a container answers from it, exactly as
+    /// `orderedSeasonCandidates` already reasons about seasons. Leaves keep a
+    /// rollup-free `watch` row and are unaffected.
+    nonisolated static func watchState(of item: Item) -> WatchState {
+        if let rollup = item.rollup, rollup.leaves > 0 {
+            if rollup.watched >= rollup.leaves { return .watched }
+            return rollup.watched > 0 ? .inProgress : .unwatched
+        }
+        if item.watch?.watched == true { return .watched }
+        return (item.watch?.positionMs ?? 0) > 3_000 ? .inProgress : .unwatched
+    }
+
     nonisolated static func matches(_ item: Item, filter: WatchFilter) -> Bool {
-        let watched = item.watch?.watched == true
-        let progress = (item.watch?.positionMs ?? 0) > 3_000 && !watched
         switch filter {
         case .all: return true
-        case .unwatched: return !watched && !progress
-        case .inProgress: return progress
-        case .watched: return watched
+        case .unwatched: return watchState(of: item) == .unwatched
+        case .inProgress: return watchState(of: item) == .inProgress
+        case .watched: return watchState(of: item) == .watched
         }
     }
 

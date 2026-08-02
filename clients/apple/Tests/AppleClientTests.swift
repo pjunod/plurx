@@ -203,6 +203,171 @@ final class AppleClientTests: XCTestCase {
         )
     }
 
+    /// Pins every row of the standing subtitle rule: automatic selection never
+    /// starts a burn, except a forced track, which may. Rows that return nil
+    /// are the point — an encoder slot per play, H.264 SDR, HDR gone, is what
+    /// the deleted `?? matching.first` tail used to buy.
+    @MainActor
+    func testAutomaticSubtitlePolicyPinsAllFourRowsOfTheSubtitleRule() {
+        // Row 1 — forced, whatever the codec. A forced PGS is the one burn
+        // automatic selection is allowed to start, because a film whose foreign
+        // dialogue is unsubtitled is not watchable at all.
+        let forcedBitmap = [
+            SubtitleTrack(
+                index: 0, codec: "hdmv_pgs_subtitle", language: "eng", title: "Forced",
+                default: false, forced: true, text: false
+            ),
+            SubtitleTrack(
+                index: 1, codec: "subrip", language: "eng", title: "Regular",
+                default: false, forced: false, text: true
+            ),
+        ]
+        XCTAssertEqual(
+            PlayerController.automaticSubtitleIndex(forcedBitmap, preferredLanguage: "eng"),
+            0,
+            "forced-PGS is the one permitted automatic burn"
+        )
+        // Both forced signals reach the same carve-out: some muxes set only the
+        // title.
+        let titleOnlyForcedBitmap = [
+            SubtitleTrack(
+                index: 0, codec: "hdmv_pgs_subtitle", language: "eng", title: "Forced Narrative",
+                default: false, forced: false, text: false
+            ),
+        ]
+        XCTAssertTrue(PlayerController.isForcedSubtitle(titleOnlyForcedBitmap[0]))
+        XCTAssertEqual(
+            PlayerController.automaticSubtitleIndex(titleOnlyForcedBitmap, preferredLanguage: "eng"),
+            0
+        )
+
+        // Row 2 — default-flagged native text goes on through the free
+        // rendition path: no encoder, no restart.
+        let defaultText = [
+            SubtitleTrack(
+                index: 0, codec: "subrip", language: "eng", title: "English",
+                default: true, forced: false, text: true
+            ),
+        ]
+        XCTAssertEqual(
+            PlayerController.automaticSubtitleIndex(defaultText, preferredLanguage: "eng"),
+            0
+        )
+
+        // Row 3 — the standard 4K disc remux: the only English track is a
+        // default-flagged PGS. Cold start stays a copy.
+        let defaultBitmapOnly = [
+            SubtitleTrack(
+                index: 0, codec: "hdmv_pgs_subtitle", language: "eng", title: "English",
+                default: true, forced: false, text: false
+            ),
+        ]
+        XCTAssertNil(
+            PlayerController.automaticSubtitleIndex(defaultBitmapOnly, preferredLanguage: "eng"),
+            "a default-flagged bitmap track must never cold-start a burn transcode"
+        )
+        let defaultStyled = [
+            SubtitleTrack(
+                index: 0, codec: "ass", language: "eng", title: "Signs",
+                default: true, forced: false, text: false
+            ),
+        ]
+        XCTAssertNil(
+            PlayerController.automaticSubtitleIndex(defaultStyled, preferredLanguage: "eng"),
+            "styled ASS cannot become a WebVTT rendition, so it burns — never automatically"
+        )
+
+        // Row 4 — merely the same language. This is the deleted tail: an
+        // unflagged English track no longer captions every English film, and an
+        // unflagged English PGS no longer transcodes one.
+        let unflaggedText = [
+            SubtitleTrack(
+                index: 0, codec: "subrip", language: "eng", title: "English",
+                default: false, forced: false, text: true
+            ),
+            SubtitleTrack(
+                index: 1, codec: "subrip", language: "eng", title: "SDH",
+                default: false, forced: false, text: true
+            ),
+        ]
+        XCTAssertNil(
+            PlayerController.automaticSubtitleIndex(unflaggedText, preferredLanguage: "eng")
+        )
+        let unflaggedBitmapOnly = [
+            SubtitleTrack(
+                index: 0, codec: "hdmv_pgs_subtitle", language: "eng", title: "English",
+                default: false, forced: false, text: false
+            ),
+        ]
+        XCTAssertNil(
+            PlayerController.automaticSubtitleIndex(unflaggedBitmapOnly, preferredLanguage: "eng"),
+            "unflagged English PGS only: cold start must attach no encoder"
+        )
+
+        // The language guard survives the rewrite: a flagged Italian default
+        // never captions an English-audio film.
+        let italianDefault = [
+            SubtitleTrack(
+                index: 0, codec: "subrip", language: "ita", title: "Italiano",
+                default: true, forced: false, text: true
+            ),
+        ]
+        XCTAssertNil(
+            PlayerController.automaticSubtitleIndex(italianDefault, preferredLanguage: "eng")
+        )
+    }
+
+    /// The no-overlap guard stays (two replacements share a `playback_id`), but
+    /// intent that lands during one is now queued rather than dropped.
+    func testASeekDuringAStreamChangeIsQueuedAndReplayedExactlyOnce() {
+        var queue = PlayerReopenQueue()
+
+        // Nothing in flight: the request opens immediately and queues nothing.
+        let immediate = queue.request(10_000, changeInFlight: false)
+        XCTAssertEqual(immediate, 10_000)
+        XCTAssertNil(queue.pendingMs)
+
+        // A burst of tvOS 30-second step-seeks landing during that change. Each
+        // is remembered instead of vanishing, the newest wins, and none of them
+        // starts a second, overlapping replacement.
+        let firstStep = queue.request(40_000, changeInFlight: true)
+        let secondStep = queue.request(70_000, changeInFlight: true)
+        let thirdStep = queue.request(100_000, changeInFlight: true)
+        XCTAssertNil(firstStep)
+        XCTAssertNil(secondStep)
+        XCTAssertNil(thirdStep)
+        XCTAssertEqual(queue.pendingMs, 100_000)
+
+        // Exactly one trailing reopen, at the position of the last press —
+        // not the one the change started from.
+        let trailing = queue.takePending()
+        let secondTrailing = queue.takePending()
+        XCTAssertEqual(trailing, 100_000)
+        XCTAssertNil(secondTrailing, "the trailing reopen runs once, not once per request")
+
+        // A track change naming the position already being opened must still
+        // reopen: it is the session recipe that has to change, not the timeline.
+        let trackChangeStart = queue.request(100_000, changeInFlight: false)
+        let queuedTrackChange = queue.request(100_000, changeInFlight: true)
+        let trackChangeTrailing = queue.takePending()
+        XCTAssertEqual(trackChangeStart, 100_000)
+        XCTAssertNil(queuedTrackChange)
+        XCTAssertEqual(
+            trackChangeTrailing,
+            100_000,
+            "a queued request at the same position still has to rebuild the session"
+        )
+
+        // A failed change, or a stopped player, drops the queue rather than
+        // reopening a stream that is already gone.
+        let orphaned = queue.request(5_000, changeInFlight: true)
+        XCTAssertNil(orphaned)
+        queue.clear()
+        XCTAssertNil(queue.pendingMs)
+        let afterClear = queue.takePending()
+        XCTAssertNil(afterClear)
+    }
+
     @MainActor
     func testNativeSubtitleSwitchingUsesAVPlayerMediaSelectionWithoutAStreamReopen() {
         let tracks = [
@@ -319,6 +484,92 @@ final class AppleClientTests: XCTestCase {
 
         restored.clearToken()
         XCTAssertNil(restored.token)
+    }
+
+    /// Origin and bearer are written together or not at all. The failure this
+    /// pins is a real one: killed between connecting to B and signing in, the
+    /// old build relaunched holding server A's bearer next to server B's
+    /// address, sent it in cleartext, and destroyed A's still-valid session the
+    /// moment B answered 401.
+    func testChangingTheServerClearsThePersistedTokenInTheSameWrite() throws {
+        final class TokenStoreDouble: TokenStoring {
+            var value: String?
+            func read() -> String? { value }
+            func write(_ token: String) -> Bool { value = token; return true }
+            func clear() { value = nil }
+        }
+
+        let suite = "tv.plurx.tests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let vault = TokenStoreDouble()
+        let settings = SettingsStore(defaults: defaults, tokenVault: vault)
+
+        // Signed in to server A.
+        settings.setServer(origin: "http://a:32400", instanceId: "server-a", token: nil)
+        settings.token = "server-a-bearer"
+        XCTAssertEqual(settings.token, "server-a-bearer")
+
+        // Connect to B, then lose the process before the login can complete.
+        settings.setServer(origin: "http://b:32400", instanceId: "server-b", token: nil)
+
+        // A fresh launch reads storage: B's address, and nothing to authorize
+        // with — so no `Authorization` header can be built for B at all.
+        let relaunched = SettingsStore(defaults: defaults, tokenVault: vault)
+        XCTAssertEqual(relaunched.origin, "http://b:32400")
+        XCTAssertEqual(relaunched.instanceId, "server-b")
+        XCTAssertNil(relaunched.token, "server A's bearer must never reach server B")
+        XCTAssertNil(defaults.string(forKey: "plurx.token"))
+        XCTAssertNil(vault.value)
+
+        // The same instance rediscovered at a new address is a move, not a
+        // change of identity: its own token travels with it, every time.
+        relaunched.setServer(
+            origin: "http://b2:32400", instanceId: "server-b", token: "server-b-bearer"
+        )
+        XCTAssertEqual(relaunched.token, "server-b-bearer")
+        relaunched.setServer(
+            origin: "http://b3:32400", instanceId: "server-b", token: "server-b-bearer"
+        )
+        XCTAssertEqual(relaunched.token, "server-b-bearer")
+
+        // Leaving a server entirely takes address, identity, and bearer.
+        relaunched.clearServer()
+        XCTAssertEqual(relaunched.origin, "")
+        XCTAssertNil(relaunched.instanceId)
+        XCTAssertNil(relaunched.token)
+        XCTAssertNil(vault.value)
+    }
+
+    /// The value of this test is that it *finishes*. `NetService` delivers every
+    /// outcome — including its own `withTimeout:` expiry — through run-loop
+    /// sources, so resolving from a cooperative-pool thread could never call
+    /// back: the continuation leaked and `await` never returned, wedging the
+    /// connect screen and saved-session recovery behind a permanent spinner.
+    @MainActor
+    func testBonjourResolutionOfAMissingServiceFailsInsteadOfHangingTheCaller() async {
+        let resolver = BonjourResolver(
+            name: "plurx-absent-\(UUID().uuidString)",
+            type: PlurxClientDefaults.bonjourServiceType,
+            domain: "local."
+        )
+        let started = Date()
+
+        do {
+            let origin = try await resolver.resolve(timeout: 1)
+            XCTFail("a service that does not exist must not resolve; got \(origin)")
+        } catch {
+            XCTAssertTrue(
+                error is ServerDiscoveryError,
+                "resolution failure must surface as a discovery error, got \(error)"
+            )
+        }
+
+        XCTAssertLessThan(
+            Date().timeIntervalSince(started),
+            5,
+            "resolve must return on its own deadline rather than outlive the caller"
+        )
     }
 
     func testBonjourOriginsHandleDnsNamesAndIpv6() {
@@ -516,6 +767,238 @@ final class AppleClientTests: XCTestCase {
         XCTAssertEqual(
             PlayerView.playbackFacts(source: scope4KSource, audio: nil),
             ["4K"]
+        )
+    }
+
+    /// The three states of MEDIA-BADGES-PLAN §2.3 on one DV Profile 8 remux.
+    /// The badge text always starts from what the *file* carries — that claim
+    /// stays true either way — and the arrow says what is actually reaching the
+    /// screen. Nothing here is allowed to influence a decision or a session
+    /// request: this whole function is a readout.
+    func testDynamicRangeBadgeNamesWhatIsDeliveredNotOnlyWhatTheFileCarries() throws {
+        let dolbyVision = SourceSummary(
+            container: "mkv", videoCodec: "hevc", videoProfile: nil,
+            width: 3_840, height: 2_160, bitDepth: 10,
+            hdr: "dolby_vision", hdrFormat: "Dolby Vision · Profile 8 (HDR10-compatible)",
+            bitrate: nil, durationMs: nil
+        )
+
+        func badge(_ delivered: String?, displayHDR: Bool = true) throws -> PlayerMetadataBadge {
+            try XCTUnwrap(PlayerView.dynamicRangeBadge(
+                hdr: dolbyVision.hdr,
+                hdrFormat: dolbyVision.hdrFormat,
+                delivered: delivered,
+                displayHDR: displayHDR
+            ))
+        }
+
+        // Source-only: no session yet, or a server too old to report. Exactly
+        // the chip this client has always drawn.
+        let sourceOnly = try badge(nil)
+        XCTAssertEqual(sourceOnly.mark, "DV")
+        XCTAssertFalse(sourceOnly.dimmed)
+
+        // Lit: the copy session kept the RPUs and the display can show them.
+        let lit = try badge("dolby_vision")
+        XCTAssertEqual(lit.mark, "DV")
+        XCTAssertEqual(lit.accessibilityLabel, "Dolby Vision")
+        XCTAssertFalse(lit.dimmed)
+
+        // Downgraded by the server: an unclaimed profile takes the strip path,
+        // which delivers the compatible HDR10 base.
+        let stripped = try badge("hdr10")
+        XCTAssertEqual(stripped.mark, "DV → HDR10")
+        XCTAssertEqual(stripped.accessibilityLabel, "Dolby Vision, playing as HDR10")
+        XCTAssertTrue(stripped.dimmed)
+
+        // Downgraded by the transcode: a burn or a picked rung is H.264 8-bit.
+        let transcoded = try badge("sdr")
+        XCTAssertEqual(transcoded.mark, "DV → SDR")
+        XCTAssertTrue(transcoded.dimmed)
+
+        // Downgraded by the display: delivered bits are necessary, not
+        // sufficient. This is the whole of what the client is allowed to know
+        // about rendering — no headroom polling, no variant introspection.
+        let sdrPanel = try badge("dolby_vision", displayHDR: false)
+        XCTAssertEqual(sdrPanel.mark, "DV → SDR")
+        XCTAssertTrue(sdrPanel.dimmed)
+
+        // A plain HDR10 source keeps the terse base mark and reports its own
+        // losses; an SDR source has no grade to report on at all.
+        let hdr10 = try XCTUnwrap(PlayerView.dynamicRangeBadge(
+            hdr: "hdr10", hdrFormat: "HDR10", delivered: "sdr", displayHDR: true
+        ))
+        XCTAssertEqual(hdr10.mark, "HDR → SDR")
+        XCTAssertEqual(hdr10.accessibilityLabel, "HDR, playing as SDR")
+        XCTAssertNil(PlayerView.dynamicRangeBadge(
+            hdr: nil, hdrFormat: nil, delivered: "sdr", displayHDR: true
+        ))
+    }
+
+    /// The badge row as a whole: the dynamic-range chip is the only one this
+    /// pass may touch. Resolution and audio stay source-only by design
+    /// (MEDIA-BADGES-PLAN §9), and the defaulted arguments keep every
+    /// pre-existing caller on the source-only path.
+    func testDeliveredRangeChangesOnlyTheDynamicRangeBadge() {
+        let source = SourceSummary(
+            container: nil, videoCodec: "hevc", videoProfile: nil,
+            width: nil, height: 2_160, bitDepth: nil,
+            hdr: nil, hdrFormat: "Dolby Vision · Profile 7 (HDR10-compatible)",
+            bitrate: nil, durationMs: nil
+        )
+        let audio = AudioTrack(
+            index: 0, codec: "truehd", channels: 8,
+            language: "eng", title: "Atmos", default: true
+        )
+
+        XCTAssertEqual(
+            PlayerView.playbackBadges(source: source, audio: audio).map(\.mark),
+            [nil, "DV", "ATMOS 7.1"]
+        )
+        let downgraded = PlayerView.playbackBadges(
+            source: source, audio: audio, delivered: "sdr", displayHDR: true
+        )
+        XCTAssertEqual(downgraded.map(\.mark), [nil, "DV → SDR", "ATMOS 7.1"])
+        XCTAssertEqual(downgraded.map(\.dimmed), [false, true, false])
+        XCTAssertEqual(
+            downgraded.map(\.symbol),
+            ["4k.tv.fill", "sparkles", "waveform"]
+        )
+        XCTAssertLessThanOrEqual(PlayerMetadataBadgeMetrics.dimmedOpacity, 0.5)
+        XCTAssertGreaterThan(PlayerMetadataBadgeMetrics.dimmedOpacity, 0.2)
+    }
+
+    /// The playback-info panel says the same thing in a sentence, and prefers
+    /// the server's own reason over anything the client could invent.
+    func testDynamicRangePanelRowExplainsWhyTheGradeChanged() {
+        let source = SourceSummary(
+            container: nil, videoCodec: "hevc", videoProfile: nil,
+            width: 3_840, height: 2_160, bitDepth: 10,
+            hdr: "dolby_vision", hdrFormat: "Dolby Vision · Profile 7 (HDR10-compatible)",
+            bitrate: nil, durationMs: nil
+        )
+        let reason = "Dolby Vision metadata removed for this device; compatible HDR base kept"
+
+        XCTAssertEqual(
+            PlayerView.dynamicRangeSummary(
+                source: source, delivered: "dolby_vision",
+                displayHDR: true, reasons: [reason]
+            ),
+            "Dolby Vision (rendering)"
+        )
+        XCTAssertEqual(
+            PlayerView.dynamicRangeSummary(
+                source: source, delivered: "hdr10", displayHDR: true, reasons: [reason]
+            ),
+            "HDR10 — \(reason)"
+        )
+        XCTAssertEqual(
+            PlayerView.dynamicRangeSummary(
+                source: source, delivered: "dolby_vision", displayHDR: false, reasons: [reason]
+            ),
+            "SDR — this display is not HDR"
+        )
+        XCTAssertEqual(
+            PlayerView.dynamicRangeSummary(
+                source: source, delivered: "sdr", displayHDR: true, reasons: ["Container not supported"]
+            ),
+            "SDR — tone-mapped from Dolby Vision"
+        )
+        // No session and no report: the rich source label, and nothing invented.
+        XCTAssertEqual(
+            PlayerView.dynamicRangeSummary(
+                source: source, delivered: nil, displayHDR: true, reasons: nil
+            ),
+            "Dolby Vision · Profile 7 (HDR10-compatible)"
+        )
+        XCTAssertNil(PlayerView.dynamicRangeSummary(
+            source: nil, delivered: nil, displayHDR: true, reasons: nil
+        ))
+    }
+
+    /// Source grades collapse to the server's own vocabulary so that a source
+    /// and `delivered_dynamic_range` compare by string equality. Files probed
+    /// before `hdr` existed carry only the rich label, so both fields are read.
+    func testSourceGradeCollapsesToTheServersVocabulary() {
+        XCTAssertEqual(
+            PlayerView.playbackBadges(source: nil, audio: nil).count,
+            0
+        )
+        XCTAssertEqual(DynamicRange.source(hdr: "dolby_vision", hdrFormat: nil), "dolby_vision")
+        XCTAssertEqual(
+            DynamicRange.source(hdr: nil, hdrFormat: "Dolby Vision · Profile 5"),
+            "dolby_vision"
+        )
+        XCTAssertEqual(DynamicRange.source(hdr: "hdr10", hdrFormat: "HDR10+"), "hdr10")
+        XCTAssertEqual(DynamicRange.source(hdr: nil, hdrFormat: "HDR10+"), "hdr10")
+        XCTAssertEqual(DynamicRange.source(hdr: nil, hdrFormat: "HLG"), "hlg")
+        XCTAssertEqual(DynamicRange.source(hdr: "hlg", hdrFormat: nil), "hlg")
+        XCTAssertNil(DynamicRange.source(hdr: nil, hdrFormat: nil))
+        XCTAssertNil(DynamicRange.source(hdr: "sdr", hdrFormat: nil))
+        XCTAssertNil(DynamicRange.source(hdr: "", hdrFormat: "  "))
+    }
+
+    /// The wire fields M4 consumes. Both are optional in Swift because both can
+    /// be absent — an older server on the decision, and a session whose source
+    /// row could not be read on the start response.
+    func testDeliveredDynamicRangeDecodesFromBothResponses() throws {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+
+        let decision = try decoder.decode(Decision.self, from: Data(#"""
+        {"file_id":6045,"method":"remux","play_url":"/api/v1/files/6045/direct",
+         "preserve_dolby_vision":true,"delivered_dynamic_range":"dolby_vision"}
+        """#.utf8))
+        XCTAssertEqual(decision.deliveredDynamicRange, "dolby_vision")
+
+        let session = try decoder.decode(HlsStart.self, from: Data(#"""
+        {"session_id":"s1","playlist_url":"/hls/s1/master.m3u8",
+         "delivered_dynamic_range":"sdr"}
+        """#.utf8))
+        XCTAssertEqual(session.deliveredDynamicRange, "sdr")
+
+        // An older server: the field is simply absent, and the badge falls back
+        // to source-only rather than failing to decode.
+        let legacy = try decoder.decode(HlsStart.self, from: Data(#"""
+        {"session_id":"s2","playlist_url":"/hls/s2/master.m3u8"}
+        """#.utf8))
+        XCTAssertNil(legacy.deliveredDynamicRange)
+    }
+
+    /// The detail page had no dynamic-range badge at all, while Android and the
+    /// web both did. It is source-only and stays that way: there is no session
+    /// on a detail page to report a downgrade against.
+    func testDetailBadgesCarryTheSourceDynamicRangeAfterTheCodec() throws {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let item = try decoder.decode(
+            Item.self,
+            from: Data(#"{"id":6045,"kind":"movie","title":"Feature","year":1994}"#.utf8)
+        )
+        let file = try decoder.decode(MediaFile.self, from: Data(#"""
+        {"id":11,"duration_ms":8520000,"container":"mkv","video_codec":"hevc",
+         "width":3840,"height":2160,"hdr":"dolby_vision",
+         "hdr_format":"Dolby Vision · Profile 8 (HDR10-compatible)"}
+        """#.utf8))
+
+        let badges = DetailView.itemMetadataBadges(
+            item, file: file, durationMs: file.durationMs, includeSeries: false
+        )
+        XCTAssertEqual(badges.map(\.kind), [.year, .runtime, .resolution, .video, .dynamicRange])
+        let range = try XCTUnwrap(badges.last)
+        XCTAssertEqual(range.symbol, "sparkles")
+        XCTAssertEqual(range.mark, "DV")
+        XCTAssertEqual(range.accessibilityLabel, "Dolby Vision")
+
+        // An SDR file gains nothing, exactly as before.
+        let sdr = try decoder.decode(MediaFile.self, from: Data(#"""
+        {"id":12,"duration_ms":8520000,"container":"mp4","video_codec":"h264","height":1080}
+        """#.utf8))
+        XCTAssertEqual(
+            DetailView.itemMetadataBadges(
+                item, file: sdr, durationMs: sdr.durationMs, includeSeries: false
+            ).map(\.kind),
+            [.year, .runtime, .resolution, .video]
         )
     }
 
@@ -924,6 +1407,102 @@ final class AppleClientTests: XCTestCase {
         XCTAssertTrue(AppModel.matches(progressing, filter: .inProgress))
         XCTAssertTrue(AppModel.matches(watched, filter: .watched))
         XCTAssertFalse(AppModel.matches(progressing, filter: .unwatched))
+    }
+
+    /// A show has no watch row: the state lives on its episodes, which a
+    /// library page does not contain. Before the server started attaching
+    /// `rollup` to containers, a TV grid's "Watched" and "In progress" filtered
+    /// to nothing at all and "Unwatched" listed finished series — this pins the
+    /// three buckets the acceptance case asks for, on one page of shows.
+    func testShowLibraryFiltersClassifyContainersFromTheirRollup() throws {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        func show(_ id: Int, _ rollup: String) throws -> Item {
+            try decoder.decode(Item.self, from: Data(
+                "{\"id\":\(id),\"kind\":\"show\",\"title\":\"Series\",\"rollup\":\(rollup)}".utf8
+            ))
+        }
+        let finished = try show(1, "{\"leaves\":24,\"watched\":24}")
+        let halfWatched = try show(2, "{\"leaves\":24,\"watched\":11}")
+        let untouched = try show(3, "{\"leaves\":24,\"watched\":0}")
+
+        XCTAssertEqual(AppModel.watchState(of: finished), .watched)
+        XCTAssertEqual(AppModel.watchState(of: halfWatched), .inProgress)
+        XCTAssertEqual(AppModel.watchState(of: untouched), .unwatched)
+
+        let page = [finished, halfWatched, untouched]
+        XCTAssertEqual(page.filter { AppModel.matches($0, filter: .watched) }.map(\.id), [1])
+        XCTAssertEqual(page.filter { AppModel.matches($0, filter: .inProgress) }.map(\.id), [2])
+        XCTAssertEqual(page.filter { AppModel.matches($0, filter: .unwatched) }.map(\.id), [3])
+        XCTAssertEqual(page.filter { AppModel.matches($0, filter: .all) }.count, 3)
+
+        // A container the server could not roll up (no episodes yet) is not
+        // silently called watched: an empty rollup falls through to `watch`.
+        let empty = try show(4, "{\"leaves\":0,\"watched\":0}")
+        XCTAssertEqual(AppModel.watchState(of: empty), .unwatched)
+
+        // Leaves are untouched by any of this — they still answer from `watch`.
+        let episode = try decoder.decode(Item.self, from: Data(
+            #"{"id":5,"kind":"episode","title":"Fray","watch":{"position_ms":600000,"watched":false}}"#.utf8
+        ))
+        XCTAssertEqual(AppModel.watchState(of: episode), .inProgress)
+    }
+
+    /// After bootstrap, a rotated or revoked bearer has to end the session
+    /// rather than degrade every screen to "Server returned 401" while the app
+    /// still looks signed in. The classification is the testable half; the
+    /// effect (`clearToken` + `.needLogin`) hangs off it in `noteAuthFailure`.
+    func testRevokedTokenIsRecognizedAsAnExpiredSessionAndNothingElseIs() {
+        XCTAssertTrue(AppModel.isSessionExpired(APIError.http(401)))
+        XCTAssertTrue(AppModel.isSessionExpired(APIError.http(403)))
+        XCTAssertFalse(AppModel.isSessionExpired(APIError.http(404)))
+        XCTAssertFalse(AppModel.isSessionExpired(APIError.http(500)))
+        XCTAssertFalse(AppModel.isSessionExpired(APIError.transport("The request timed out.")))
+        XCTAssertFalse(AppModel.isSessionExpired(APIError.badURL))
+        XCTAssertFalse(AppModel.isSessionExpired(CancellationError()))
+        XCTAssertFalse(AppModel.isSessionExpired(URLError(.notConnectedToInternet)))
+    }
+
+    /// Posters are decoded to the cell that will draw them, not to their full
+    /// raster. A 400×600 source through a 120-pixel ceiling comes back inside
+    /// that ceiling with its aspect intact — the whole reason a tvOS
+    /// `.extraLarge` grid stops decoding megabytes per cell.
+    func testPosterArtworkDecodesDownToTheCellThatWillDrawIt() throws {
+        let format = UIGraphicsImageRendererFormat.preferredFormat()
+        format.scale = 1
+        let renderer = UIGraphicsImageRenderer(
+            size: CGSize(width: 400, height: 600),
+            format: format
+        )
+        let data = renderer.pngData { context in
+            UIColor.red.setFill()
+            context.fill(CGRect(x: 0, y: 0, width: 400, height: 600))
+        }
+
+        let downsampled = try XCTUnwrap(AuthImageCache.downsample(data, maxPixelSize: 120))
+        XCTAssertLessThanOrEqual(max(downsampled.size.width, downsampled.size.height), 120)
+        XCTAssertGreaterThan(max(downsampled.size.width, downsampled.size.height), 60)
+        XCTAssertLessThan(downsampled.size.width, downsampled.size.height)
+
+        // Bytes that are not an image stay nil rather than becoming a blank
+        // placeholder that never retries.
+        XCTAssertNil(AuthImageCache.downsample(Data("not an image".utf8), maxPixelSize: 120))
+
+        // Cache identity: the same path is a different picture on another
+        // server, and the same picture is a different decode at another size.
+        let poster = AuthImageCache.key(origin: "http://a:32400", path: "/i/7", maxPixelSize: 300)
+        XCTAssertNotEqual(
+            poster,
+            AuthImageCache.key(origin: "http://b:32400", path: "/i/7", maxPixelSize: 300)
+        )
+        XCTAssertNotEqual(
+            poster,
+            AuthImageCache.key(origin: "http://a:32400", path: "/i/7", maxPixelSize: 900)
+        )
+        XCTAssertEqual(
+            poster,
+            AuthImageCache.key(origin: "http://a:32400", path: "/i/7", maxPixelSize: 300)
+        )
     }
 
     func testPluralServerLibraryKindsMapToNativeMovieAndTVTabs() {

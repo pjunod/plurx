@@ -23,7 +23,7 @@ enum Caps {
             URLQueryItem(name: "vcodec", value: vcodec.joined(separator: ",")),
             URLQueryItem(name: "acodec", value: acodec.joined(separator: ",")),
             URLQueryItem(name: "container", value: container.joined(separator: ",")),
-            URLQueryItem(name: "hdr", value: hdrSupported ? "1" : "0"),
+            URLQueryItem(name: "hdr", value: displayIsHDR ? "1" : "0"),
             // The former profile-specific HDR API was removed in iOS/tvOS 26.
             // Apple's replacement is the display-aware eligibility signal;
             // with hardware HEVC it is the supported
@@ -41,11 +41,18 @@ enum Caps {
 
     /// True when this device can present HDR to its current display — mirrors
     /// the server's tone-map-on-SDR rule.
-    private static var hdrSupported: Bool {
+    ///
+    /// This is also the *whole* of what the dynamic-range badge is allowed to
+    /// know about rendering (MEDIA-BADGES-PLAN.md §2.2): AVFoundation exposes
+    /// nothing public about which HLS variant is active, and EDR-headroom
+    /// polling is a stated non-goal. Read live rather than cached — an Apple TV
+    /// whose output format changes in Settings changes this answer without the
+    /// app relaunching.
+    static var displayIsHDR: Bool {
         AVPlayer.eligibleForHDRPlayback
     }
 
     private static func dolbyVisionSupported(hevc: Bool) -> Bool {
-        hevc && hdrSupported
+        hevc && displayIsHDR
     }
 }

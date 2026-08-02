@@ -19,6 +19,41 @@ private enum PlaybackPreparationError: LocalizedError {
     }
 }
 
+/// Requests that arrive while a stream replacement is in flight are remembered
+/// rather than dropped. Two replacements must never overlap — they share a
+/// `playback_id`, so the newer create intentionally removes the older session
+/// and can otherwise strand AVPlayer on a URL the server has just deleted — but
+/// a seek or track change issued during one is real viewer intent, and dropping
+/// it snapped the tvOS progress bar back to where the change had started. Last
+/// writer wins, and exactly one trailing reopen runs when the change lands.
+///
+/// A plain value with no player and no network in it, so the policy is
+/// unit-testable without either.
+struct PlayerReopenQueue: Equatable {
+    private(set) var pendingMs: Int?
+
+    /// The position to open right now, or `nil` when a replacement is already
+    /// running and this request was queued behind it instead.
+    mutating func request(_ positionMs: Int, changeInFlight: Bool) -> Int? {
+        guard changeInFlight else { return positionMs }
+        pendingMs = positionMs
+        return nil
+    }
+
+    /// The single trailing reopen that accumulated during the change which just
+    /// finished, consumed. Deliberately *not* deduplicated against the position
+    /// just opened: a queued audio, quality, or subtitle change can name the
+    /// very same position and still needs the session rebuilt around it.
+    mutating func takePending() -> Int? {
+        defer { pendingMs = nil }
+        return pendingMs
+    }
+
+    /// The stream is gone — the change failed, or the player stopped. Nothing
+    /// queued behind it is worth reopening.
+    mutating func clear() { pendingMs = nil }
+}
+
 /// Drives one AVPlayer and executes the server-owned delivery plan. It also
 /// supplies the controls AVPlayer withholds for a growing EVENT playlist: an
 /// explicit on-demand timeline, reliable play/pause commands, server playback
@@ -38,6 +73,12 @@ final class PlayerController: ObservableObject {
     @Published private(set) var selectedAudio: Int?
     @Published private(set) var selectedHeight: Int?
     @Published private(set) var encoder: String?
+    /// The dynamic range of the bytes this playback is actually receiving —
+    /// `"dolby_vision" | "hdr10" | "hlg" | "sdr"`, or nil against a server that
+    /// does not report it. Purely a readout: nothing in this controller ever
+    /// reads it back, and no decision, capability, or session request depends
+    /// on it (MEDIA-BADGES-PLAN.md §9).
+    @Published private(set) var deliveredRange: String?
     @Published private(set) var isVOD = false
     @Published private(set) var failed = false
     @Published private(set) var playbackError: String?
@@ -63,6 +104,9 @@ final class PlayerController: ObservableObject {
     /// A burn is part of the current video frames. Leaving one requires one
     /// reopen; native-to-native and native-to-Off never do.
     private var activeBurnedSubtitle: Int?
+    /// Holds the newest seek/track intent that arrived mid-change so it wins
+    /// instead of vanishing.
+    private var reopenQueue = PlayerReopenQueue()
     /// Stable for this player instance. Server-side supersession uses it to
     /// replace this player's own stream without touching another device.
     private let playbackId = UUID().uuidString
@@ -256,8 +300,9 @@ final class PlayerController: ObservableObject {
                 decision.subtitles ?? [],
                 preferredLanguage: model.subLang
             )
-            try await open(decision: decision, at: startMs)
+            try await openAndDrain(decision: decision, at: startMs)
         } catch {
+            reopenQueue.clear()
             fail(error)
         }
     }
@@ -265,28 +310,53 @@ final class PlayerController: ObservableObject {
     private func reopen(at position: Int) async {
         // A growing EVENT playlist can momentarily announce its current end,
         // and several UI actions can also request a restart. Never overlap two
-        // server-session replacements: they share a playback ID, so the newer
-        // request intentionally removes the older session and can otherwise
-        // strand AVPlayer on a URL the server has just deleted.
-        guard let decision, started, !isChangingStream else { return }
+        // server-session replacements (see `PlayerReopenQueue`) — but never
+        // discard one either: a request that lands mid-change is remembered and
+        // replayed as the single trailing reopen.
+        guard let decision, started else { return }
+        guard let next = reopenQueue.request(position, changeInFlight: isChangingStream) else {
+            return
+        }
         do {
-            try await open(decision: decision, at: position)
+            try await openAndDrain(decision: decision, at: next)
         } catch {
+            reopenQueue.clear()
             fail(error)
+        }
+    }
+
+    /// Open, then honor whatever queued behind that open. A loop rather than
+    /// recursion, so "exactly one trailing reopen per completed change" stays
+    /// true however long a burst of step-seeks runs. Nothing awaits between a
+    /// finished `open` and the next one, so no other request can observe the
+    /// gap and start a competing replacement.
+    private func openAndDrain(decision: Decision, at startMs: Int) async throws {
+        var next = startMs
+        while true {
+            try await open(decision: decision, at: next)
+            guard started else {
+                reopenQueue.clear()
+                return
+            }
+            guard let trailing = reopenQueue.takePending() else { return }
+            next = trailing
         }
     }
 
     private func open(decision: Decision, at startMs: Int) async throws {
         guard let model, started else { return }
+        let wasPlaying = isPlaying
         isChangingStream = true
         failed = false
         playbackError = nil
         player.pause()
-        await releaseCurrentSession()
-        guard started else {
-            isChangingStream = false
-            return
-        }
+        // The session this open replaces. It is retired only once its successor
+        // exists: releasing first meant a failed create left the viewer's item
+        // pointing at a playlist this client had just deleted — buffered runway,
+        // then a stall, with `fail()` deliberately quiet because an item still
+        // existed. Its telemetry poll stops now; the session itself does not.
+        let superseded = sessionId
+        stopStatusPolling()
 
         let normalMode = decision.delivery?.mode ?? Self.legacyMode(decision.method)
         let burnSubtitle = selectedSubtitle.flatMap { index in
@@ -309,7 +379,9 @@ final class PlayerController: ObservableObject {
             usesDirectTimeline = true
             isVOD = true
             encoder = nil
-            sessionStatus = nil
+            // Direct play has no session, so the decision's answer stands for
+            // the whole playback (MEDIA-BADGES-PLAN.md §3.2).
+            deliveredRange = decision.deliveredDynamicRange
             url = Session.shared.mediaURL(decision.delivery?.url ?? decision.playUrl)
             if startMs > 0 { seekAfterAttach = startMs }
         } else {
@@ -335,7 +407,17 @@ final class PlayerController: ObservableObject {
                 aac: copy ? aac : nil,
                 preserveDolbyVision: copy ? (decision.preserveDolbyVision ?? false) : nil
             )
-            let hls = try await model.createHlsSession(fileId: fileId, body: body)
+            let hls: HlsStart
+            do {
+                hls = try await model.createHlsSession(fileId: fileId, body: body)
+            } catch {
+                // Nothing came into existence to replace the current stream, so
+                // nothing about it changes: same session, same player item,
+                // telemetry running again, and playing if it was. The caller
+                // surfaces a transient error instead of a coming stall.
+                restoreAfterFailedChange(wasPlaying: wasPlaying, session: superseded)
+                throw error
+            }
             guard started else {
                 await model.endHlsSession(hls.sessionId)
                 isChangingStream = false
@@ -344,6 +426,13 @@ final class PlayerController: ObservableObject {
             sessionId = hls.sessionId
             activeBurnedSubtitle = burnSubtitle
             encoder = hls.encoder
+            // The session that exists overrides the plan that was decided: a
+            // burn or an explicitly picked rung forces a transcode the decision
+            // never promised. A server that cannot answer leaves the decision's
+            // value standing rather than blanking the badge. Set only after a
+            // successful create, so a failed change leaves the still-playing
+            // stream's answer alone.
+            deliveredRange = hls.deliveredDynamicRange ?? decision.deliveredDynamicRange
             isVOD = hls.vod ?? false
             usesDirectTimeline = isVOD
             if knownDurationMs <= 0 { knownDurationMs = hls.durationMs ?? 0 }
@@ -357,7 +446,25 @@ final class PlayerController: ObservableObject {
             startStatusPolling()
         }
 
-        guard let url else { throw APIError.badURL }
+        guard let url else {
+            restoreAfterFailedChange(wasPlaying: wasPlaying, session: superseded)
+            throw APIError.badURL
+        }
+        // The successor exists — only now does the predecessor go. Server-side
+        // supersession has already retired it (the create carried the same
+        // `playback_id`); this DELETE just hands the encoder slot back at once
+        // rather than at the idle reaper's convenience.
+        if direct { sessionId = nil }
+        await release(session: superseded)
+        // That DELETE is a network round trip, so the viewer can leave during
+        // it. Attaching an item and calling `play()` after `stop()` has run
+        // would resurrect a player nobody is watching — and with the background
+        // audio mode on, keep it audible. `stop()` has already retired whatever
+        // session this open created.
+        guard started else {
+            isChangingStream = false
+            return
+        }
         let item = AVPlayerItem(url: url)
         #if os(iOS)
         // The tvOS 26 SDK exposes this setter, but some shipping Apple TV
@@ -383,13 +490,34 @@ final class PlayerController: ObservableObject {
         updateNowPlaying()
     }
 
-    private func releaseCurrentSession() async {
+    /// Stop polling the session being left behind. The session itself survives
+    /// this call — it is retired by `release(session:)` once its replacement
+    /// exists.
+    private func stopStatusPolling() {
         statusTask?.cancel()
         statusTask = nil
         sessionStatus = nil
-        guard let sessionId else { return }
-        self.sessionId = nil
-        await model?.endHlsSession(sessionId)
+    }
+
+    /// Retire a superseded HLS session, best effort.
+    private func release(session id: String?) async {
+        guard let id else { return }
+        await model?.endHlsSession(id)
+    }
+
+    /// Put back everything `open` disturbed before it discovered it could not
+    /// produce a successor. The viewer keeps watching what they were watching.
+    private func restoreAfterFailedChange(wasPlaying: Bool, session: String?) {
+        isChangingStream = false
+        // The create it failed on is a round trip too: if the viewer left
+        // during it there is nothing left to keep watching, and resuming here
+        // would restart a player `stop()` has already paused and detached from.
+        guard started else { return }
+        if session != nil { startStatusPolling() }
+        if wasPlaying {
+            player.play()
+            isPlaying = true
+        }
     }
 
     private func startStatusPolling() {
@@ -607,11 +735,33 @@ final class PlayerController: ObservableObject {
         return [code]
     }
 
-    /// Pick the subtitle the player may enable automatically. Never fall back
-    /// to a flagged container default in another language: an Italian-first
-    /// mux can otherwise burn Italian captions while English audio is playing.
-    /// Some release muxes omit the forced disposition and retain only a
-    /// "Forced" title, so both signals are meaningful.
+    /// The whole automatic-subtitle policy, in one pure function.
+    ///
+    /// > Automatic selection must never start a burn — except a forced track,
+    /// > which may, always at source height.
+    ///
+    /// | Track shape | Automatic behavior |
+    /// |---|---|
+    /// | Forced (disposition flag *or* "forced" in the title), any codec | apply — the one permitted auto-burn |
+    /// | Default-flagged and native text (`isNativeHLS`) | apply through the free rendition path |
+    /// | Default-flagged but bitmap or styled | never automatic; explicit selection only |
+    /// | Merely the same language | never automatic |
+    ///
+    /// The forced carve-out is the `forcedIndex` line and nothing else: delete
+    /// it and automatic selection can no longer reach an encoder at all. It
+    /// exists because a forced track marks dialogue the film is unintelligible
+    /// without, so refusing it by default trades a comprehension failure for an
+    /// encoder slot. A burn that does start here carries source height already
+    /// (see `burnHeight` in `open`).
+    ///
+    /// Language is filtered first in every row: never fall back to a flagged
+    /// container default in another language, because an Italian-first mux can
+    /// otherwise caption an English-audio film in Italian. Some release muxes
+    /// omit the forced disposition and retain only a "Forced" title, so both
+    /// signals are meaningful.
+    ///
+    /// Manual selection is untouched by any of this — a viewer who picks a PGS
+    /// track still gets a burn, at source height.
     static func automaticSubtitleIndex(
         _ tracks: [SubtitleTrack],
         preferredLanguage: String
@@ -620,12 +770,15 @@ final class PlayerController: ObservableObject {
         let matching = tracks.filter {
             languageCode($0.language) == languageCode(preferredLanguage)
         }
-        guard !matching.isEmpty else { return nil }
-        return matching.first(where: {
-            $0.forced || $0.title?.localizedCaseInsensitiveContains("forced") == true
-        })?.index
-            ?? matching.first(where: { $0.default })?.index
-            ?? matching.first?.index
+        if let forcedIndex = matching.first(where: { isForcedSubtitle($0) })?.index {
+            return forcedIndex
+        }
+        return matching.first(where: { $0.default && $0.isNativeHLS })?.index
+    }
+
+    /// Forced-ness has two signals because muxes disagree about which to set.
+    static func isForcedSubtitle(_ track: SubtitleTrack) -> Bool {
+        track.forced || track.title?.localizedCaseInsensitiveContains("forced") == true
     }
 
     /// Collapse the common ISO 639-1 and 639-2/B spellings used by settings

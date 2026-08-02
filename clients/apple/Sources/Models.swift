@@ -154,6 +154,16 @@ enum WatchFilter: String, CaseIterable, Identifiable {
     }
 }
 
+/// Where one row of a library grid sits in the watch cycle. Leaves answer from
+/// their own `watch` row; containers have none — the state lives on their
+/// episodes, which are not in a library page at all — so they answer from the
+/// `rollup` the server now attaches to them (`AppModel.watchState`).
+enum WatchState: Equatable {
+    case unwatched
+    case inProgress
+    case watched
+}
+
 enum LibraryGrouping: String, CaseIterable, Identifiable {
     case category
     case share
@@ -219,6 +229,11 @@ struct MediaFile: Codable, Identifiable {
     var videoCodec: String?
     var width: Int?
     var height: Int?
+    /// Coarse source grade — `"dolby_vision" | "hdr10" | "hlg"` — and the rich
+    /// display label ("Dolby Vision · Profile 7 (HDR10-compatible)"). Both have
+    /// always been on `FileDto`; the detail screen now shows them.
+    var hdr: String?
+    var hdrFormat: String?
 }
 
 struct ItemDetail: Codable {
@@ -310,6 +325,12 @@ struct Decision: Codable {
     var audioOffsetMs: Int?
     var declaredOffsetMs: Int?
     var ladder: [QualityRung]?
+    /// The dynamic range of the bytes this delivery plan would put on the wire
+    /// — `"dolby_vision" | "hdr10" | "hlg" | "sdr"`, the same vocabulary as
+    /// `SourceSummary.hdr` plus `"sdr"`, so source and delivered compare by
+    /// string equality. Optional because an older server does not send it;
+    /// absent means "unknown", and the badges stay source-only.
+    var deliveredDynamicRange: String?
 }
 
 struct HlsStart: Codable {
@@ -320,6 +341,12 @@ struct HlsStart: Codable {
     var encoder: String?
     var vod: Bool?
     var ladder: [QualityRung]?
+    /// What the session that was actually created delivers. It overrides the
+    /// decision's value the moment a session attaches, because a burn or a
+    /// manually-picked rung forces a transcode the decision never promised.
+    /// Nullable server-side too: a session whose source row could not be read
+    /// omits it, and the client keeps whatever it had.
+    var deliveredDynamicRange: String?
 }
 
 /// Live HLS telemetry used by the web client's playback-info panel and now by
