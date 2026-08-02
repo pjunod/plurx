@@ -149,41 +149,69 @@ if [ "$DO_DEPLOY" -eq 1 ]; then
 fi
 
 # --- Apple -----------------------------------------------------------------
+# The simulator suites run FIRST and a failure stops the target, because the
+# agent sessions that write this Swift cannot compile it. For Rust the CI gate
+# is the safety net; for the clients, `xcodebuild test` on this machine IS the
+# first compiler the code has ever met. Archiving before testing would just be
+# a slower way to find out.
 if [ "$DO_APPLE" -eq 1 ]; then
   say "apple"
   command -v xcodebuild >/dev/null || die "no xcodebuild — this target needs Xcode"
   cd "$ROOT/clients/apple"
   BUILD="$(sed -n 's/.*CURRENT_PROJECT_VERSION: *"\{0,1\}\([0-9][0-9]*\)"\{0,1\}.*/\1/p' project.yml | head -1)"
   note "build number $BUILD (TestFlight refuses a repeat, so this must exceed the last upload)"
-  if command -v xcodegen >/dev/null; then run xcodegen generate; fi
-  run xcodebuild -scheme Plurx -destination 'generic/platform=tvOS' \
-    -archivePath "$ROOT/target/apple/Plurx-tvOS.xcarchive" archive
-  run xcodebuild -scheme Plurx -destination 'generic/platform=iOS' \
-    -archivePath "$ROOT/target/apple/Plurx-iOS.xcarchive" archive
-  note "then: Xcode → Organizer → Distribute App → App Store Connect (or xcrun altool)"
-  note "the simulator suites are the other half of the gate for client changes:"
-  note "  xcodebuild test -scheme Plurx -destination 'platform=tvOS Simulator,name=Apple TV'"
+  if command -v xcodegen >/dev/null; then
+    run xcodegen generate
+  else
+    note "no xcodegen (brew install xcodegen) — using the checked-in project as-is"
+  fi
+
+  note "simulator suites first — the shared XCTest source, both platforms"
+  run xcodebuild -project plurx.xcodeproj -scheme plurx-iOS \
+    -destination "${APPLE_IOS_SIM:-platform=iOS Simulator,name=iPhone 17 Pro}" test
+  run xcodebuild -project plurx.xcodeproj -scheme plurx-tvOS \
+    -destination "${APPLE_TVOS_SIM:-platform=tvOS Simulator,name=Apple TV 4K (3rd generation)}" test
+  note "(override the simulator names with APPLE_IOS_SIM / APPLE_TVOS_SIM if"
+  note " 'xcrun simctl list devices available' shows different ones on this Mac)"
+
+  say "apple — archive"
+  run xcodebuild -project plurx.xcodeproj -scheme plurx-tvOS \
+    -destination 'generic/platform=tvOS' \
+    -archivePath "$ROOT/target/apple/plurx-tvOS.xcarchive" archive
+  run xcodebuild -project plurx.xcodeproj -scheme plurx-iOS \
+    -destination 'generic/platform=iOS' \
+    -archivePath "$ROOT/target/apple/plurx-iOS.xcarchive" archive
+  note "then: Xcode → Organizer → Distribute App → App Store Connect"
   cd "$ROOT"
 fi
 
 # --- Android ---------------------------------------------------------------
+# DEBUG, not release, and that is not laziness. `release` in
+# clients/android/app/build.gradle.kts carries no signing config, so
+# `assembleRelease` produces an unsigned APK that `adb install` refuses —
+# a confusing failure five minutes after the build finishes. Debug is what
+# every doc in this repo builds and what the server publishes at
+# /download/plurx-android.apk. Signing a release build is its own decision
+# (docs/PUBLISHING.md), not something this script should improvise.
+APK="app/build/outputs/apk/debug/app-debug.apk"
 if [ "$DO_ANDROID" -eq 1 ]; then
   say "android"
   cd "$ROOT/clients/android"
   [ -x ./gradlew ] || die "no gradlew in clients/android"
-  run ./gradlew assembleRelease
+  note "no host JDK/SDK? \`make android\` from the repo root builds the same APK in Docker"
+  run ./gradlew testDebugUnitTest :app:lintDebug :app:assembleDebug
   if command -v adb >/dev/null; then
     DEVICES="$(adb devices | awk 'NR>1 && $2=="device" {print $1}')"
     if [ -z "$DEVICES" ]; then
-      note "no attached devices — build only"
+      note "no attached devices — build only (pair a TV with \`adb connect <ip>:5555\`)"
     else
       for d in $DEVICES; do
         note "installing to $d"
-        run adb -s "$d" install -r app/build/outputs/apk/release/app-release.apk
+        run adb -s "$d" install -r "$APK"
       done
     fi
   else
-    note "no adb on PATH — build only"
+    note "no adb on PATH — build only; the APK is at clients/android/$APK"
   fi
   cd "$ROOT"
 fi
