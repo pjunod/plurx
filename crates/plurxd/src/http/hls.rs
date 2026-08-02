@@ -288,7 +288,6 @@ pub async fn status(
 pub struct PlaylistQuery {
     pub native: Option<u8>,
     pub subtitle: Option<i64>,
-    pub diagnostic: Option<String>,
 }
 
 fn playlist_response(bytes: Vec<u8>) -> Response {
@@ -335,19 +334,15 @@ pub async fn playlist(
     if query.native != Some(1) {
         return video_playlist(State(state), AxPath(session)).await;
     }
-    let (context, mut file) = session_file(&state, &session).await?;
-    let mut codecs = context.codecs;
-    let diagnostic = query.diagnostic.as_deref().unwrap_or_default();
-    if diagnostic.contains("no-subs") {
-        file.subtitle_streams.clear();
-    }
-    if diagnostic.contains("base-hevc") {
-        if let Some((_, audio)) = codecs.split_once(',') {
-            codecs = format!("hvc1.2.4.L150.B0,{audio}");
-        }
-    }
+    let (context, file) = session_file(&state, &session).await?;
     Ok(playlist_response(
-        master_playlist(&file, query.subtitle, &codecs).into_bytes(),
+        master_playlist(
+            &file,
+            query.subtitle,
+            &context.codecs,
+            context.supplemental_codecs.as_deref(),
+        )
+        .into_bytes(),
     ))
 }
 
@@ -540,7 +535,12 @@ fn subtitle_characteristics(track: &SubtitleStream) -> Option<&'static str> {
         )
 }
 
-fn master_playlist(file: &MediaFile, selected: Option<i64>, primary_codecs: &str) -> String {
+fn master_playlist(
+    file: &MediaFile,
+    selected: Option<i64>,
+    primary_codecs: &str,
+    supplemental_codecs: Option<&str>,
+) -> String {
     let native: Vec<(usize, &SubtitleStream)> = file
         .subtitle_streams
         .iter()
@@ -551,7 +551,8 @@ fn master_playlist(file: &MediaFile, selected: Option<i64>, primary_codecs: &str
     // not promise independently decodable segments. The master must not make
     // that stronger claim on its behalf: AVPlayer acts on it at a resume
     // boundary and can reject an otherwise playable copied HEVC/DV stream.
-    let mut out = String::from("#EXTM3U\n#EXT-X-VERSION:7\n");
+    let version = if supplemental_codecs.is_some() { 10 } else { 7 };
+    let mut out = format!("#EXTM3U\n#EXT-X-VERSION:{version}\n");
     for (index, track) in &native {
         // The query describes this player's selection. No selected index is
         // an explicit Off, not permission to resurrect a foreign-language
@@ -589,6 +590,18 @@ fn master_playlist(file: &MediaFile, selected: Option<i64>, primary_codecs: &str
     out.push_str(&format!(
         "#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},CODECS=\"{primary_codecs}\""
     ));
+    if let Some(supplemental) = supplemental_codecs {
+        out.push_str(&format!(",SUPPLEMENTAL-CODECS=\"{supplemental}\""));
+        if let (Some(width), Some(height)) = (file.width, file.height) {
+            out.push_str(&format!(",RESOLUTION={width}x{height}"));
+        }
+        let video_range = if supplemental.ends_with("/db4h") {
+            "HLG"
+        } else {
+            "PQ"
+        };
+        out.push_str(&format!(",VIDEO-RANGE={video_range}"));
+    }
     if !native.is_empty() {
         out.push_str(",SUBTITLES=\"subs\"");
     }
@@ -922,10 +935,16 @@ mod tests {
             sub("subrip", "eng", "Regular", false, false),
             sub("webvtt", "eng", "SDH", false, false),
         ]);
-        let master = master_playlist(&file, Some(2), "dvh1,ec-3");
+        let master = master_playlist(
+            &file,
+            Some(2),
+            "hvc1.2.4.L150.B0,ec-3",
+            Some("dvh1.08.06/db1p"),
+        );
 
+        assert!(master.starts_with("#EXTM3U\n#EXT-X-VERSION:10\n"));
         assert!(master.contains(
-            "#EXT-X-STREAM-INF:BANDWIDTH=40000000,CODECS=\"dvh1,ec-3\",SUBTITLES=\"subs\""
+            "#EXT-X-STREAM-INF:BANDWIDTH=40000000,CODECS=\"hvc1.2.4.L150.B0,ec-3\",SUPPLEMENTAL-CODECS=\"dvh1.08.06/db1p\",RESOLUTION=3840x2160,VIDEO-RANGE=PQ,SUBTITLES=\"subs\""
         ));
         assert!(!master.contains("#EXT-X-INDEPENDENT-SEGMENTS"));
         assert!(master.contains("NAME=\"English · Forced\",LANGUAGE=\"en\",DEFAULT=YES,AUTOSELECT=YES,FORCED=YES,URI=\"subs/2/index.m3u8\""));
@@ -943,10 +962,10 @@ mod tests {
             sub("subrip", "eng", "Regular", false, false),
             sub("webvtt", "eng", "Alternate", false, false),
         ]);
-        let master = master_playlist(&file, None, "avc1,mp4a.40.2");
+        let master = master_playlist(&file, None, "avc1,mp4a.40.2", None);
         assert_eq!(master.matches("AUTOSELECT=NO").count(), 2);
 
-        let selected = master_playlist(&file, Some(1), "avc1,mp4a.40.2");
+        let selected = master_playlist(&file, Some(1), "avc1,mp4a.40.2", None);
         assert!(selected
             .contains("NAME=\"English · Alternate\",LANGUAGE=\"en\",DEFAULT=YES,AUTOSELECT=YES"));
     }
@@ -960,7 +979,7 @@ mod tests {
             sub("ass", "eng", "Styled Signs", false, false),
             sub("ssa", "eng", "Styled Dialogue", false, false),
         ]);
-        let master = master_playlist(&file, None, "avc1,mp4a.40.2");
+        let master = master_playlist(&file, None, "avc1,mp4a.40.2", None);
         assert!(master.contains("subs/0/index.m3u8"));
         for index in 1..=4 {
             assert!(!master.contains(&format!("subs/{index}/index.m3u8")));
