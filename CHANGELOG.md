@@ -10,6 +10,66 @@ bump may break compatibility and a **patch** bump never does.
 
 ### Added
 
+- **Choosing a text subtitle on the Apple apps is no longer a video
+  decision.** Selecting an SRT/SubRip/WebVTT track used to send
+  `subtitle_burn`: the server opened a fresh session and started a video
+  encoder to paint the text into the picture, and the player rebuilt its item
+  around it. A subtitle therefore cost a re-encode, dropped Dolby Vision or
+  HDR on a copied 4K remux, and discarded the quality rung the viewer had
+  picked. Those tracks are now advertised in the HLS master as WebVTT
+  renditions carrying their language, display name, default, forced, and
+  accessibility metadata, and iOS/tvOS select them — and Off — inside the
+  running player item: no new session, no encoder, no quality change, no
+  ffmpeg subtitle filter. Cues are cut per segment and anchored to the
+  session's own media origin rather than to the offset that was requested, so
+  they stay with the picture through a resume and through a seek on a copy
+  session, whose timeline starts at the keyframe before the requested point.
+  Language tags come from the same alias table the rest of the server uses,
+  so a track muxed `dut`, `cze`, or `gre` still matches a viewer whose
+  preference is Dutch, Czech, or Greek; a track whose title says "Forced"
+  counts as forced, while "Non-Forced" and "Unforced" no longer do (they were
+  being hidden from Apple's subtitle menu); and a cue that straddles a
+  segment boundary keeps the end time it was authored with instead of being
+  clipped short in both halves. A file whose video the device can take
+  directly still direct-plays — merely *containing* text tracks no longer
+  forces it into a session — and entering one is deferred until a native
+  subtitle is actually chosen, which costs a single reopen at that moment and
+  nothing before it. Automatic selection is never allowed to start a burn on
+  its own; the one exception is a forced track, which may, at source height,
+  because that is what a forced track is for. PGS, VobSub, and styled ASS/SSA
+  still burn and still reopen at the same film position, deliberately: they
+  are positioned bitmaps and authored styling, and plain WebVTT would lose
+  them. Android still burns every server-side subtitle; its native path is
+  tracked in [docs/ANDROID-CLIENT-PARITY.md](docs/ANDROID-CLIENT-PARITY.md).
+
+- **Point an app at this server by scanning a code.** The web sign-in screen
+  now offers a QR code of the server's own address, and the iOS and Android
+  apps read it to add a server. That is for the networks Bonjour cannot
+  cross — a separate VLAN, guest Wi-Fi, a VPN, a Docker bridge — where the
+  alternative was typing a LAN address with a TV remote. The code contains
+  the address and nothing else: no token, no account, and you still sign in
+  inside the app.
+
+- **The apps say which build they are.** Settings on iOS/tvOS and on Android
+  now shows the app's version and build number next to the server's, so a
+  report from a device names the build it came from instead of "the app".
+
+- **Android labels what a file actually is.** Detail and player pages carry
+  compact chips for resolution, video codec, dynamic range, and audio, drawn
+  with real icons and given their own accessibility text, so picking between
+  two versions of a title stops being a guess about which one is the remux.
+
+- **Two HLS master experiments ship compiled in and off by default.**
+  `PLURX_HLS_CLOSED_CAPTIONS_NONE=1` adds `CLOSED-CAPTIONS=NONE` to the
+  variant; `PLURX_HLS_FORCED_AUTOSELECT=1` puts `AUTOSELECT=YES` on forced
+  renditions. Both are Apple authoring-rules items, and both are candidates
+  for the one thing this work did not solve — a physical Apple TV rejecting a
+  copied Dolby Vision master with CoreMedia `-12927`. They are flags rather
+  than changes because every master regression so far passed the unit tests
+  and failed on the device: enable one per deploy, watch the device, then
+  keep it or drop it. Full description in
+  [docs/OPERATIONS.md](docs/OPERATIONS.md#the-two-hls-master-experiments).
+
 - **Software transcodes are admitted against a CPU budget, and spend it
   explicitly.** Software sessions used to bypass admission entirely: each
   x264 process picked its own thread count (cores × 1.5), so a few of them
@@ -46,6 +106,23 @@ bump may break compatibility and a **patch** bump never does.
   leaving encoders to the idle reaper. `play_url` stays for older clients.
 
 ### Changed
+
+- **A subtitle track that cannot be extracted now fails fast and stays
+  failed.** Extracting one is a full read of the source, so a wedged ffmpeg —
+  a NAS mount that stops returning bytes without ever erroring — parked every
+  waiting request forever, and a track that *failed* was remembered as
+  nothing at all: AVPlayer asks for a subtitle segment about every six
+  seconds, and each of those requests relaunched a multi-gigabyte scan of a
+  file that had just failed. Extraction is now bounded at ten minutes and the
+  ffmpeg process is actually killed at the bound — three times the worst
+  honest cold extraction measured over a congested NAS, so nothing that would
+  have succeeded is cut off. A failure is remembered for two minutes, which
+  turns that storm into one attempt per window while staying short enough
+  that remounting the share or replacing the file is picked up without a
+  restart. And a sidecar larger than 8 MB is refused at publish instead of
+  landing in the cache: real WebVTT is kilobytes, a dense SDH track for a
+  three-hour film is about 200 KB, and anything at that size is a mislabelled
+  stream this file gets re-read whole for on every segment request.
 
 - **The hot control path stops re-doing a session's whole history.** Flow
   control runs on every published segment and every frontier advance; each

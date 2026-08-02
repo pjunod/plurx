@@ -9,11 +9,17 @@ The implementation history, deployment evidence, and unresolved copied-Dolby-
 Vision failure are recorded in
 [APPLE-NATIVE-SUBTITLES-HANDOFF.md](APPLE-NATIVE-SUBTITLES-HANDOFF.md).
 
-> Status: the native text-subtitle path is implemented, covered on both Apple
-> simulator targets, and deployed server-side. The physical Apple TV accepts
-> the native WebVTT master and selects the requested rendition; the exact
+> Status (2026-08-02): the native text-subtitle path is implemented and
+> covered on both Apple simulator targets. The physical Apple TV accepts the
+> native WebVTT master and selects the requested rendition; the exact
 > copied-Dolby-Vision regression file still falls back after a CoreMedia
-> `-12927` rejection. Other P1 and P2 items below remain open.
+> `-12927` rejection, which is the one open failure
+> ([APPLE-NATIVE-SUBTITLES-PLAN.md](APPLE-NATIVE-SUBTITLES-PLAN.md) §5.4).
+> The version deployed on the fleet is the earlier server at `787eaa6`: the
+> 2026-08-02 selection, timing, and extraction fixes are committed locally
+> only and reach a node when Paul pushes and runs the ansible playbooks,
+> which pin every node to `origin/main`. The Apple fixes need a build ≥ 6.
+> The real-hardware matrix below has not been re-run since those fixes.
 
 ## What parity means
 
@@ -34,7 +40,7 @@ Vision failure are recorded in
 |---|---|---|---|
 | Server setup | Manual address | Bonjour `_plurx._tcp` first; manual fallback; port 32400 | Validate discovery on bare metal, host-network Docker, iPhone, and Apple TV |
 | Local-network permission | Browser permission model | Bonjour starts before auth; URL requests wait while the iOS prompt is open | Add UI that distinguishes Denied from multicast unavailable |
-| Session | Local login and remembered token | Local login and silent reconnect | Move bearer token from `UserDefaults` to Keychain |
+| Session | Local login and remembered token | Local login, silent reconnect, bearer token in the Keychain (`TokenVault.swift`) so a new build does not sign the viewer out | — |
 | Home and browse | Hubs, libraries, hierarchy | Hubs, libraries, show → season → episode | Sorting, filters, denser iPad/tvOS layouts |
 | Search | Global search | Native API-backed search | Improve keyboard, history, and tvOS focus polish |
 | Playback decision | Runtime caps, server delivery plan | Runtime VideoToolbox/display caps; executes `delivery` | Real-device codec/HDR matrix, especially Dolby Vision profiles |
@@ -63,8 +69,14 @@ modes, not merely one compatible MP4:
 2. Copy/remux MKV: same controls, HDR preserved, audio switch.
 3. Transcode: full-film seek restarts correctly; stats show encoder speed and
    server-ahead reserve.
-4. Text subtitle and PGS subtitle: selection restarts at the same position and
-   turning subtitles off restores the original delivery plan.
+4. Text subtitle and PGS subtitle, which behave differently on purpose. A text
+   track (SRT/SubRip/WebVTT) and Off apply **inside the running player** — no
+   restart, no new session, no quality change, no video encoder — and the cues
+   stay with the picture across a seek and a resume. The one restart is the
+   first native selection on a file that was direct-playing, which enters a
+   session once (§2); every selection after it is in place. A PGS track still
+   reopens at the same film position and burns at source height, and turning
+   subtitles off restores the original delivery plan.
 5. Episode ending: next episode begins; season rollover begins the first episode
    of the next season; a finale stays stopped.
 
@@ -84,12 +96,18 @@ PGS, VobSub, and styled ASS/SSA still reopen at the same film position and burn
 at source height. This is intentional: those formats cannot be represented as
 ordinary WebVTT without losing pixels or important styling.
 
-For v0.2, a playable file containing native text tracks opens through a copy-HLS
-session even if its video could otherwise use the raw direct URL. That makes all
-text tracks available before the viewer opens the subtitle menu and permits
-restart-free toggles. The cost is a segmenter session for that title. A future
-direct-until-first-toggle design may remove that cost, but the first subtitle
-selection would necessarily reopen playback.
+Merely *containing* native text tracks no longer costs a file its direct play.
+Until 2026-08-02 it did: any playable file with a text track opened through a
+copy-HLS session even when its video could have used the raw direct URL, so
+every such title paid for a segmenter session whether or not the viewer ever
+opened the subtitle menu — and on the Bedroom Apple TV that path degrades
+further, to a compatibility transcode, through the unresolved `-12927` failure.
+Paul chose the alternative on 2026-08-02: stay on true direct play, and enter a
+session at the moment a native subtitle is actually selected. The cost is one
+reopen at that boundary, paid only by viewers who turn subtitles on, and every
+selection after it is in place. Automatic selection cannot trigger it either —
+it is constrained to native formats, so it can never start a burn on its own,
+the single exception being a forced track, which burns at source height.
 
 The cross-client implementation handoff is
 [CLIENTS-REMEDIATION-PLAN.md](CLIENTS-REMEDIATION-PLAN.md), especially §5.4.

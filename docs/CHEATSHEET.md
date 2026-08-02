@@ -130,6 +130,14 @@ Runbook, with monarr's side too: [OPERATIONS.md](OPERATIONS.md).
 | `PLURX_GDM_PORT` | `32414` | GDM host port |
 | `PLURX_TRAKT_BASE` | `https://api.trakt.tv` | Trakt API base (tests/mocks) |
 | `PLURX_LOG` | `info` | `tracing` filter (e.g. `plurxd=debug`) |
+| `PLURX_HLS_CLOSED_CAPTIONS_NONE` | off | Experiment: `CLOSED-CAPTIONS=NONE` on the HLS variant |
+| `PLURX_HLS_FORCED_AUTOSELECT` | off | Experiment: `AUTOSELECT=YES` on forced subtitle renditions |
+
+The last two are HLS master experiments, not settings: enable **one per
+deploy**, restart, and watch a real Apple TV — the device is the only thing
+that can accept or reject a master, and unit tests have passed for every
+master regression so far. Reasoning and the failure they target are in
+[OPERATIONS.md](OPERATIONS.md#the-two-hls-master-experiments).
 
 ## Reference — health & API surfaces
 

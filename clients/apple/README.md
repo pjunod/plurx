@@ -12,10 +12,14 @@ anything it can't (MKV, DTS/TrueHD, …) is delivered as the server's on-the-fly
 HDR display at runtime and sends that to `/decision`, so the server transcodes
 only what this hardware genuinely can't play.
 
-> Status: **v0.1.0** — working development client. Browse, resume, discover,
-> and play on both iOS and tvOS. Both targets compile against the iOS/tvOS
-> 26.5 SDKs and share the same regression suite. It is not yet at full web
-> parity; the exact boundary is in [Feature parity](#feature-parity).
+> Status: **v0.2.0**, build `6` in [`project.yml`](project.yml) — working
+> development client. Browse, resume, discover, and play on both iOS and
+> tvOS. Both targets compile against the iOS/tvOS 26.5 SDKs and share the
+> same regression suite. Build 6 carries the 2026-08-02 subtitle-selection
+> and playback-state fixes and **has not been built, installed, or uploaded
+> to TestFlight**; build `5` is what is installed on the Bedroom Apple TV.
+> It is not yet at full web parity; the exact boundary is in
+> [Feature parity](#feature-parity).
 
 ## What works
 
@@ -23,8 +27,13 @@ only what this hardware genuinely can't play.
   host entry as a fallback. A bare host uses the standard port `32400`.
 - **Prompt for local-network access before sign-in** and hold requests while
   the iOS permission sheet is open, so first sign-in no longer fails behind it.
-- **Connect & sign in**; the session is remembered (Keychain-free
-  `UserDefaults` token) and reconnects silently on next launch.
+- **Connect & sign in**; the session is remembered and reconnects silently on
+  next launch. The bearer token lives in the Keychain
+  (`TokenVault.swift`) rather than `UserDefaults`, so installing a new build
+  does not sign the viewer out; ordinary preferences stay in `UserDefaults`.
+- **Add a server by scanning the QR code** the web sign-in screen shows, for
+  the networks Bonjour cannot cross. The code carries the server address
+  only — you still sign in inside the app.
 - **Home** with Continue Watching / Next Up / Recently Added and your libraries.
 - **Browse** libraries as a poster grid; open show → season → episode.
 - **Detail** pages with backdrop, overview, Resume / Start-over.
@@ -32,8 +41,16 @@ only what this hardware genuinely can't play.
   Skip Intro/Credits, a real runtime in iOS Now Playing instead of `LIVE`,
   audio/subtitle/quality menus, and a playback-info panel fed by the server's
   live encoder and delivery telemetry.
-- **Subtitles**, including bitmap formats, through reliable server burn-in.
-  Changing a subtitle restarts at the same film position.
+- **Subtitles**, split by what the format can survive. Text tracks
+  (SRT/SubRip/WebVTT) are native HLS WebVTT renditions: selecting one, or
+  Off, applies inside the running player item — no restart, no new session,
+  no quality change, and no video encoder — and the cues stay with the
+  picture through a resume and a seek. Bitmap and styled formats (PGS,
+  VobSub, ASS/SSA) still burn in server-side and reopen at the same film
+  position, because positioned bitmap planes and authored styling do not
+  survive conversion to plain WebVTT. Automatic selection never starts a
+  burn on its own; a forced track is the one exception, and it burns at
+  source height.
 - **Autoplay next episode**, including rollover to the next season; it is on
   by default to match the web client and can be toggled in the player or
   Settings.
@@ -141,7 +158,11 @@ On play the client calls `GET /files/{id}/decision?<caps>` and executes the
 server's **delivery plan**:
 
 - `direct` → AVPlayer streams `/files/{id}/direct?token=…`, seeking natively
-  over HTTP range.
+  over HTTP range. A file that merely *contains* native text tracks stays on
+  this path: since 2026-08-02 the client enters a session only when a native
+  subtitle is actually selected, which costs one reopen at that moment
+  instead of taxing every play of every subtitled file with a segmenter
+  session.
 - `remux` → `POST /files/{id}/hls/sessions` with `copy: true`: the source video
   repackaged into HLS **untouched**, so a 4K HEVC/HDR MKV reaches the screen at
   full quality with no encoder running (audio re-encodes only when the plan
@@ -171,13 +192,15 @@ clients/apple/
   project.yml            XcodeGen spec — the iOS + tvOS targets
   Sources/               all shared Swift (compiled into both apps)
     Session, Models, PlurxAPI, Caps, SettingsStore, AppModel   (core)
+    TokenVault                                        (Keychain bearer token)
     ServerDiscovery                                            (Bonjour)
     Theme, Components, AuthImage                               (UI support)
     PlurxApp + RootView, AuthViews, HomeView, LibraryView,
-    DetailView, SettingsView                                  (screens)
-    PlayerController, PlayerView                              (AVPlayer)
+    DetailView, SearchView, SettingsView                       (screens)
+    PlayerController, PlayerView, PlayerSurface     (AVPlayer, incl. iOS PiP)
   Tests/                 shared iOS + tvOS unit tests
   Resources/Assets.xcassets   iOS app icon
+  Resources/tvOS.xcassets     tvOS layered Brand Assets
 ```
 
 One authenticated path backs everything: API/image requests carry the bearer
@@ -193,12 +216,18 @@ track and quality selection, playback stats, markers, and next-episode autoplay
 are present. These are still outstanding:
 
 - **Automatic** intro/credits skipping. Manual Skip buttons are present.
-- Sidecar WebVTT rendering. Today's Apple subtitle path burns every selected
-  track for correctness, which forces a re-encode; native text subtitles should
-  eventually remain selectable without touching the video.
+- **Copied Dolby Vision on a physical Apple TV.** The server prepares the
+  copy correctly and the child video playlist plays on its own, but AVPlayer
+  rejects the same stream reached through the multivariant master with
+  CoreMedia `-12927` and the client falls back to a compatibility transcode —
+  so that one file loses Dolby Vision. This is the arc's one open failure;
+  the investigation, including two master experiments an operator can enable
+  one per deploy, is
+  [docs/APPLE-NATIVE-SUBTITLES-PLAN.md](../../docs/APPLE-NATIVE-SUBTITLES-PLAN.md)
+  §5.4.
 - Continuous adaptive quality changes and audio-sync controls.
-- **Search**, filters/sorting, playlists, downloads/offline, **PiP**, and
-  **AirPlay** polish.
+- Filters/sorting, playlists, downloads/offline, and **AirPlay** polish.
+  Search and iOS **PiP** are present.
 - **tvOS launch storyboard** — cosmetic only (a black frame at launch), not a
   blocker for upload. The layered Brand Assets themselves are committed under
   `Resources/tvOS.xcassets` and wired up via
