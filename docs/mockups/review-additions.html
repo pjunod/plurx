@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cinemarr — reviewer layout and theme additions</title>
+<style>
+  *{box-sizing:border-box}
+  :root{color-scheme:dark;--bg:#0a0a0c;--panel:#101014;--line:#29292e;
+    --text:#ededef;--muted:#9a9aa3;--accent:#e5484d}
+  body{margin:0;background:var(--bg);color:var(--text);
+    font:15px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif}
+  header{position:sticky;top:0;z-index:2;display:flex;align-items:center;gap:16px;
+    padding:14px 24px;background:color-mix(in srgb,var(--bg) 90%,transparent);
+    border-bottom:1px solid var(--line);backdrop-filter:blur(12px)}
+  header a{color:var(--muted);text-decoration:none}
+  header a:hover,header a:focus-visible{color:var(--text)}
+  header b{font:700 16px ui-monospace,Menlo,monospace;margin-right:auto}
+  main{width:min(1500px,100%);margin:auto;padding:38px 24px 70px}
+  h1{font-size:clamp(28px,4vw,48px);line-height:1.08;letter-spacing:-.035em;
+    max-width:900px;margin:0 0 14px}
+  h2{font-size:25px;margin:54px 0 8px}
+  p{color:var(--muted);max-width:78ch}
+  .lede{font-size:17px;max-width:72ch}
+  .tag{display:inline-block;margin:4px 6px 0 0;padding:3px 9px;border-radius:999px;
+    border:1px solid var(--line);color:var(--muted);font:12px ui-monospace,Menlo,monospace}
+  figure{margin:20px 0 0;border:1px solid var(--line);border-radius:14px;
+    overflow:hidden;background:var(--panel)}
+  figure img{display:block;width:100%;height:auto}
+  figcaption{padding:12px 16px;color:var(--muted);border-top:1px solid var(--line)}
+  .pair{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-top:20px}
+  .card{padding:18px;border:1px solid var(--line);border-radius:12px;background:var(--panel)}
+  .card h3{margin:0 0 5px;font-size:19px}.card p{margin:0}
+  .review{margin-top:56px;padding:20px;border-left:3px solid var(--accent);
+    background:color-mix(in srgb,var(--accent) 7%,var(--panel))}
+  .review a{color:var(--text)}
+  @media(max-width:800px){.pair{grid-template-columns:1fr}header{position:static}}
+</style>
+</head>
+<body>
+<header>
+  <b>cinemarr reviewer additions</b>
+  <a href="index.html">all mockups</a>
+  <a href="../UI-LAYOUTS-REVIEW.md">written review</a>
+</header>
+<main>
+  <h1>Two missing use cases, not two more launch commitments.</h1>
+  <p class="lede">Spine preserves browsing context. Archive gives home video
+    and photos a first-class surface. Paper and Tide are both light-capable,
+    low-motion themes whose normal text pairs meet 4.5:1 contrast.</p>
+  <span class="tag">fictional media</span><span class="tag">no network</span>
+  <span class="tag">review candidates</span>
+
+  <h2>Spine × Paper light</h2>
+  <p>A source pane, stable result list, and item inspector remain visible
+    together. This is a human browsing layout, not Deck without the telemetry.</p>
+  <figure>
+    <img src="../img/mockups/review-spine-paper.svg"
+         alt="Spine layout showing sources, a continue-watching list, and a persistent title inspector">
+    <figcaption>Desktop and tablet · phone collapses to a three-step trail ·
+      not offered on TV.</figcaption>
+  </figure>
+
+  <h2>Archive × Tide dark</h2>
+  <p>A chronological Home for personal media. Captured and added time remain
+    explicit, and missing dates live in their own honest group.</p>
+  <figure>
+    <img src="../img/mockups/review-archive-tide.svg"
+         alt="Archive layout showing home videos, photos, and catalog titles on a date timeline">
+    <figcaption>Web, tablet, and phone · standard browse/detail routes remain ·
+      TV falls back to Classic.</figcaption>
+  </figure>
+
+  <h2>Paper and Tide, both appearances</h2>
+  <div class="pair">
+    <div class="card"><h3>Paper</h3><p>Warm stock, graphite, ink blue. Light
+      first, quiet in dark mode, and deliberately free of grain or glow.</p></div>
+    <div class="card"><h3>Tide</h3><p>Sea-glass green, deep teal, and a sand
+      secondary. A calm family missing from the existing red/gold/neon set.</p></div>
+  </div>
+  <figure>
+    <img src="../img/mockups/review-themes.svg"
+         alt="Paper and Tide theme component sheets in light and dark modes">
+    <figcaption>The visual samples pair selection and status colors with words;
+      color never carries state alone.</figcaption>
+  </figure>
+
+  <div class="review">
+    The recommendation and implementation critique live in
+    <a href="../UI-LAYOUTS-REVIEW.md">UI-LAYOUTS-REVIEW.md</a>. The short
+    version: prove Classic + Plex + Amber on web before turning any other
+    layout into a compatibility promise.
+  </div>
+</main>
+</body>
+</html>

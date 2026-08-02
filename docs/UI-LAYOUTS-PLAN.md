@@ -2,7 +2,8 @@
 
 **Status:** proposals, nothing implemented · **Decides:** a layout system,
 four new layouts, five new themes · **Written:** 2026-08-02 · **Companion
-mockups:** [`docs/mockups/`](mockups/index.html)
+mockups:** [`docs/mockups/`](mockups/index.html) · **Independent review:**
+[UI-LAYOUTS-REVIEW.md](UI-LAYOUTS-REVIEW.md)
 
 This document proposes a *layout system* for every plurx surface — the web
 app and the Android / iOS / iPadOS / Apple TV / Google TV clients — plus a

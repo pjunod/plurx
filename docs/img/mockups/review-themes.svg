@@ -1,0 +1,152 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="980"
+     viewBox="0 0 1600 980" role="img"
+     aria-label="Paper and Tide themes shown in light and dark appearances">
+  <defs>
+    <style>
+      .ui{font-family:Inter,system-ui,-apple-system,"Segoe UI",sans-serif}
+      .mono{font-family:"SFMono-Regular",Menlo,Consolas,monospace}
+      .name{font-size:25px;font-weight:760}.mode{font-size:12px;font-weight:700;letter-spacing:1.8px}
+      .title{font-size:19px;font-weight:700}.body{font-size:14px}.small{font-size:12px}
+    </style>
+  </defs>
+
+  <rect width="1600" height="980" fill="#0a0a0c"/>
+  <g class="ui">
+    <text x="42" y="52" fill="#ededef" font-size="28" font-weight="760">Reviewer theme additions</text>
+    <text x="42" y="80" fill="#9a9aa3" font-size="14">Two palettes · both appearances · normal text pairs ≥ 4.5:1</text>
+
+    <!-- Paper light -->
+    <rect x="40" y="112" width="745" height="390" rx="16" fill="#f4f0e8"/>
+    <rect x="40" y="112" width="745" height="66" rx="16" fill="#fffdf8"/>
+    <rect x="40" y="162" width="745" height="16" fill="#fffdf8"/>
+    <line x1="40" y1="178" x2="785" y2="178" stroke="#c8bfb2"/>
+    <text x="68" y="153" fill="#1f2328" class="name">Paper</text>
+    <text x="740" y="151" fill="#5f625f" class="mode" text-anchor="end">LIGHT · EDITORIAL</text>
+    <rect x="68" y="207" width="455" height="127" rx="8" fill="#fffdf8" stroke="#c8bfb2"/>
+    <text x="91" y="238" fill="#5f625f" class="mode">CONTINUE WATCHING</text>
+    <text x="91" y="275" fill="#1f2328" class="title">Static City</text>
+    <text x="91" y="302" fill="#5f625f" class="body">41% watched · 84 minutes left</text>
+    <rect x="374" y="249" width="122" height="48" rx="6" fill="#3451b2"/>
+    <text x="399" y="279" fill="#fff" class="body" font-weight="700">▶ Resume</text>
+    <rect x="68" y="354" width="146" height="38" rx="6" fill="#e9e2d7"/>
+    <text x="88" y="378" fill="#3451b2" class="body" font-weight="650">Selected item</text>
+    <rect x="226" y="354" width="92" height="38" rx="6" fill="#fffdf8" stroke="#c8bfb2"/>
+    <text x="248" y="378" fill="#1f2328" class="body">Ghost</text>
+    <circle cx="92" cy="433" r="7" fill="#287a51"/>
+    <text x="108" y="438" fill="#287a51" class="body" font-weight="650">Ready</text>
+    <circle cx="204" cy="433" r="7" fill="#b3261e"/>
+    <text x="220" y="438" fill="#b3261e" class="body" font-weight="650">Failed</text>
+    <circle cx="330" cy="433" r="7" fill="#765c00"/>
+    <text x="346" y="438" fill="#765c00" class="body" font-weight="650">Warning</text>
+    <text x="545" y="225" fill="#5f625f" class="mode">PALETTE</text>
+    <rect x="545" y="245" width="48" height="48" rx="7" fill="#f4f0e8" stroke="#c8bfb2"/>
+    <rect x="601" y="245" width="48" height="48" rx="7" fill="#fffdf8" stroke="#c8bfb2"/>
+    <rect x="657" y="245" width="48" height="48" rx="7" fill="#3451b2"/>
+    <rect x="713" y="245" width="48" height="48" rx="7" fill="#a33a3a"/>
+    <text x="545" y="329" fill="#1f2328" class="mono small">ink blue</text>
+    <text x="545" y="352" fill="#5f625f" class="small">no glow</text>
+    <text x="545" y="375" fill="#5f625f" class="small">6px corners</text>
+    <text x="545" y="398" fill="#5f625f" class="small">light first</text>
+
+    <!-- Paper dark -->
+    <rect x="815" y="112" width="745" height="390" rx="16" fill="#171715"/>
+    <rect x="815" y="112" width="745" height="66" rx="16" fill="#201f1c"/>
+    <rect x="815" y="162" width="745" height="16" fill="#201f1c"/>
+    <line x1="815" y1="178" x2="1560" y2="178" stroke="#454139"/>
+    <text x="843" y="153" fill="#f2eee6" class="name">Paper</text>
+    <text x="1515" y="151" fill="#aaa49a" class="mode" text-anchor="end">DARK · READING ROOM</text>
+    <rect x="843" y="207" width="455" height="127" rx="8" fill="#201f1c" stroke="#454139"/>
+    <text x="866" y="238" fill="#aaa49a" class="mode">CONTINUE WATCHING</text>
+    <text x="866" y="275" fill="#f2eee6" class="title">Static City</text>
+    <text x="866" y="302" fill="#aaa49a" class="body">41% watched · 84 minutes left</text>
+    <rect x="1149" y="249" width="122" height="48" rx="6" fill="#9db2ff"/>
+    <text x="1174" y="279" fill="#101322" class="body" font-weight="700">▶ Resume</text>
+    <rect x="843" y="354" width="146" height="38" rx="6" fill="#2a2823"/>
+    <text x="863" y="378" fill="#9db2ff" class="body" font-weight="650">Selected item</text>
+    <rect x="1001" y="354" width="92" height="38" rx="6" fill="#201f1c" stroke="#454139"/>
+    <text x="1023" y="378" fill="#f2eee6" class="body">Ghost</text>
+    <circle cx="867" cy="433" r="7" fill="#6fc49a"/>
+    <text x="883" y="438" fill="#6fc49a" class="body" font-weight="650">Ready</text>
+    <circle cx="979" cy="433" r="7" fill="#ff8a80"/>
+    <text x="995" y="438" fill="#ff8a80" class="body" font-weight="650">Failed</text>
+    <circle cx="1105" cy="433" r="7" fill="#e2c36f"/>
+    <text x="1121" y="438" fill="#e2c36f" class="body" font-weight="650">Warning</text>
+    <text x="1320" y="225" fill="#aaa49a" class="mode">PALETTE</text>
+    <rect x="1320" y="245" width="48" height="48" rx="7" fill="#171715" stroke="#454139"/>
+    <rect x="1376" y="245" width="48" height="48" rx="7" fill="#201f1c" stroke="#454139"/>
+    <rect x="1432" y="245" width="48" height="48" rx="7" fill="#9db2ff"/>
+    <rect x="1488" y="245" width="48" height="48" rx="7" fill="#e58b84"/>
+    <text x="1320" y="329" fill="#f2eee6" class="mono small">soft paper</text>
+    <text x="1320" y="352" fill="#aaa49a" class="small">no glow</text>
+    <text x="1320" y="375" fill="#aaa49a" class="small">6px corners</text>
+    <text x="1320" y="398" fill="#aaa49a" class="small">quiet shadows</text>
+
+    <!-- Tide light -->
+    <rect x="40" y="532" width="745" height="390" rx="16" fill="#edf4f0"/>
+    <rect x="40" y="532" width="745" height="66" rx="16" fill="#fbfdfa"/>
+    <rect x="40" y="582" width="745" height="16" fill="#fbfdfa"/>
+    <line x1="40" y1="598" x2="785" y2="598" stroke="#bccfc5"/>
+    <text x="68" y="573" fill="#14201c" class="name">Tide</text>
+    <text x="740" y="571" fill="#586a62" class="mode" text-anchor="end">LIGHT · SEA GLASS</text>
+    <rect x="68" y="627" width="455" height="127" rx="10" fill="#fbfdfa" stroke="#bccfc5"/>
+    <text x="91" y="658" fill="#586a62" class="mode">SATURDAY, AUGUST 2</text>
+    <text x="91" y="695" fill="#14201c" class="title">Lake Weekend</text>
+    <text x="91" y="722" fill="#586a62" class="body">16 photos · 3 videos · captured</text>
+    <rect x="374" y="669" width="122" height="48" rx="8" fill="#176b54"/>
+    <text x="399" y="699" fill="#fff" class="body" font-weight="700">▶ Watch</text>
+    <rect x="68" y="774" width="146" height="38" rx="8" fill="#dfeae4"/>
+    <text x="88" y="798" fill="#176b54" class="body" font-weight="650">Captured</text>
+    <rect x="226" y="774" width="92" height="38" rx="8" fill="#fbfdfa" stroke="#bccfc5"/>
+    <text x="248" y="798" fill="#14201c" class="body">Added</text>
+    <circle cx="92" cy="853" r="7" fill="#196b48"/>
+    <text x="108" y="858" fill="#196b48" class="body" font-weight="650">Ready</text>
+    <circle cx="204" cy="853" r="7" fill="#b33a32"/>
+    <text x="220" y="858" fill="#b33a32" class="body" font-weight="650">Failed</text>
+    <circle cx="330" cy="853" r="7" fill="#735b0b"/>
+    <text x="346" y="858" fill="#735b0b" class="body" font-weight="650">Warning</text>
+    <text x="545" y="645" fill="#586a62" class="mode">PALETTE</text>
+    <rect x="545" y="665" width="48" height="48" rx="8" fill="#edf4f0" stroke="#bccfc5"/>
+    <rect x="601" y="665" width="48" height="48" rx="8" fill="#fbfdfa" stroke="#bccfc5"/>
+    <rect x="657" y="665" width="48" height="48" rx="8" fill="#176b54"/>
+    <rect x="713" y="665" width="48" height="48" rx="8" fill="#8a631a"/>
+    <text x="545" y="749" fill="#14201c" class="mono small">sea glass</text>
+    <text x="545" y="772" fill="#586a62" class="small">sand secondary</text>
+    <text x="545" y="795" fill="#586a62" class="small">10px corners</text>
+    <text x="545" y="818" fill="#586a62" class="small">both modes</text>
+
+    <!-- Tide dark -->
+    <rect x="815" y="532" width="745" height="390" rx="16" fill="#071412"/>
+    <rect x="815" y="532" width="745" height="66" rx="16" fill="#0d1e1b"/>
+    <rect x="815" y="582" width="745" height="16" fill="#0d1e1b"/>
+    <line x1="815" y1="598" x2="1560" y2="598" stroke="#2a4841"/>
+    <text x="843" y="573" fill="#e4f2ed" class="name">Tide</text>
+    <text x="1515" y="571" fill="#93aaa2" class="mode" text-anchor="end">DARK · DEEP WATER</text>
+    <rect x="843" y="627" width="455" height="127" rx="10" fill="#0d1e1b" stroke="#2a4841"/>
+    <text x="866" y="658" fill="#93aaa2" class="mode">SATURDAY, AUGUST 2</text>
+    <text x="866" y="695" fill="#e4f2ed" class="title">Lake Weekend</text>
+    <text x="866" y="722" fill="#93aaa2" class="body">16 photos · 3 videos · captured</text>
+    <rect x="1149" y="669" width="122" height="48" rx="8" fill="#73d6b1"/>
+    <text x="1174" y="699" fill="#052019" class="body" font-weight="700">▶ Watch</text>
+    <rect x="843" y="774" width="146" height="38" rx="8" fill="#142a25"/>
+    <text x="863" y="798" fill="#73d6b1" class="body" font-weight="650">Captured</text>
+    <rect x="1001" y="774" width="92" height="38" rx="8" fill="#0d1e1b" stroke="#2a4841"/>
+    <text x="1023" y="798" fill="#e4f2ed" class="body">Added</text>
+    <circle cx="867" cy="853" r="7" fill="#6fd39f"/>
+    <text x="883" y="858" fill="#6fd39f" class="body" font-weight="650">Ready</text>
+    <circle cx="979" cy="853" r="7" fill="#ff8a80"/>
+    <text x="995" y="858" fill="#ff8a80" class="body" font-weight="650">Failed</text>
+    <circle cx="1105" cy="853" r="7" fill="#e5c875"/>
+    <text x="1121" y="858" fill="#e5c875" class="body" font-weight="650">Warning</text>
+    <text x="1320" y="645" fill="#93aaa2" class="mode">PALETTE</text>
+    <rect x="1320" y="665" width="48" height="48" rx="8" fill="#071412" stroke="#2a4841"/>
+    <rect x="1376" y="665" width="48" height="48" rx="8" fill="#0d1e1b" stroke="#2a4841"/>
+    <rect x="1432" y="665" width="48" height="48" rx="8" fill="#73d6b1"/>
+    <rect x="1488" y="665" width="48" height="48" rx="8" fill="#d6b56d"/>
+    <text x="1320" y="749" fill="#e4f2ed" class="mono small">deep teal</text>
+    <text x="1320" y="772" fill="#93aaa2" class="small">sand secondary</text>
+    <text x="1320" y="795" fill="#93aaa2" class="small">10px corners</text>
+    <text x="1320" y="818" fill="#93aaa2" class="small">calm, not neon</text>
+
+    <text x="40" y="955" fill="#62626c" class="mono small">fictional media · component sheet · semantic colors always carry text</text>
+  </g>
+</svg>

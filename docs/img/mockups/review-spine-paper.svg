@@ -1,0 +1,198 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1000"
+     viewBox="0 0 1600 1000" role="img"
+     aria-label="Spine three-pane media layout in the Paper light theme">
+  <defs>
+    <linearGradient id="city" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#16234d"/>
+      <stop offset="0.58" stop-color="#3451b2"/>
+      <stop offset="1" stop-color="#a33a3a"/>
+    </linearGradient>
+    <linearGradient id="night" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#182230"/>
+      <stop offset="1" stop-color="#52666d"/>
+    </linearGradient>
+    <linearGradient id="harvest" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5d712b"/>
+      <stop offset="1" stop-color="#25320f"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="8" stdDeviation="12"
+                    flood-color="#241f18" flood-opacity="0.12"/>
+    </filter>
+    <style>
+      .ui{font-family:Inter,system-ui,-apple-system,"Segoe UI",sans-serif}
+      .mono{font-family:"SFMono-Regular",Menlo,Consolas,monospace}
+      .ink{fill:#1f2328}.muted{fill:#5f625f}.accent{fill:#3451b2}
+      .small{font-size:13px}.meta{font-size:14px}.body{font-size:16px}
+      .label{font-size:12px;font-weight:700;letter-spacing:1.6px}
+      .title{font-size:28px;font-weight:720;letter-spacing:-0.5px}
+      .rowtitle{font-size:17px;font-weight:680}
+    </style>
+  </defs>
+
+  <rect width="1600" height="1000" fill="#f4f0e8"/>
+  <rect width="1600" height="74" fill="#fffdf8"/>
+  <line x1="0" y1="74" x2="1600" y2="74" stroke="#c8bfb2"/>
+
+  <g class="ui">
+    <text x="30" y="45" class="ink" font-size="23" font-weight="760">cinemarr</text>
+    <rect x="145" y="24" width="58" height="27" rx="5" fill="#e9e2d7"/>
+    <text x="158" y="42" class="mono accent small">SPINE</text>
+
+    <rect x="505" y="17" width="560" height="40" rx="7" fill="#f4f0e8"
+          stroke="#c8bfb2"/>
+    <text x="529" y="42" class="muted body">Search titles, people, or file names</text>
+    <text x="1021" y="42" class="mono muted small">⌘ K</text>
+
+    <rect x="1400" y="18" width="42" height="38" rx="6" fill="#e9e2d7"/>
+    <text x="1414" y="43" class="ink body">◐</text>
+    <circle cx="1480" cy="37" r="19" fill="#3451b2"/>
+    <text x="1473" y="43" fill="#fff" font-size="15" font-weight="700">P</text>
+    <text x="1510" y="42" class="ink body">paul</text>
+
+    <!-- source pane -->
+    <rect x="0" y="75" width="252" height="925" fill="#e9e2d7"/>
+    <line x1="252" y1="75" x2="252" y2="1000" stroke="#c8bfb2"/>
+    <text x="25" y="112" class="muted label">LISTEN NOW</text>
+
+    <rect x="14" y="130" width="224" height="42" rx="6" fill="#3451b2"/>
+    <text x="30" y="157" fill="#fff" font-size="16" font-weight="650">▶  Continue</text>
+    <text x="215" y="157" fill="#fff" font-size="13" text-anchor="end">3</text>
+    <text x="30" y="201" class="ink body">✦  Recently added</text>
+    <text x="215" y="201" class="muted small" text-anchor="end">18</text>
+    <text x="30" y="242" class="ink body">✓  Watched lately</text>
+
+    <text x="25" y="298" class="muted label">LIBRARIES</text>
+    <text x="30" y="340" class="ink body">▣  Movies</text>
+    <text x="215" y="340" class="muted small" text-anchor="end">210</text>
+    <text x="30" y="381" class="ink body">▤  TV shows</text>
+    <text x="215" y="381" class="muted small" text-anchor="end">58</text>
+    <text x="30" y="422" class="ink body">◇  Anime</text>
+    <text x="215" y="422" class="muted small" text-anchor="end">24</text>
+    <text x="30" y="463" class="ink body">▹  Home videos</text>
+    <text x="215" y="463" class="muted small" text-anchor="end">112</text>
+    <text x="30" y="504" class="ink body">▦  Photos</text>
+    <text x="215" y="504" class="muted small" text-anchor="end">1,834</text>
+
+    <text x="25" y="570" class="muted label">SYSTEM</text>
+    <text x="30" y="612" class="ink body">⌁  Activity</text>
+    <circle cx="217" cy="606" r="5" fill="#287a51"/>
+    <text x="30" y="653" class="ink body">⚙  Settings</text>
+
+    <rect x="18" y="913" width="216" height="54" rx="7" fill="#fffdf8"
+          stroke="#c8bfb2"/>
+    <circle cx="39" cy="936" r="5" fill="#287a51"/>
+    <text x="54" y="940" class="ink small" font-weight="650">Server ready</text>
+    <text x="39" y="958" class="mono muted" font-size="11">2 libraries scanned · 41d</text>
+
+    <!-- result pane -->
+    <rect x="253" y="75" width="527" height="925" fill="#fffdf8"/>
+    <line x1="780" y1="75" x2="780" y2="1000" stroke="#c8bfb2"/>
+    <text x="282" y="122" class="title ink">Continue watching</text>
+    <text x="282" y="151" class="muted meta">3 titles · list position stays put while you inspect</text>
+
+    <rect x="624" y="104" width="126" height="34" rx="6" fill="#f4f0e8"
+          stroke="#c8bfb2"/>
+    <text x="644" y="126" class="ink small">Progress ↓</text>
+
+    <!-- selected row -->
+    <rect x="266" y="178" width="500" height="150" rx="8" fill="#e8ebf7"
+          stroke="#3451b2" stroke-width="2"/>
+    <rect x="282" y="194" width="112" height="118" rx="5" fill="url(#city)"/>
+    <path d="M282 284 L394 234 L394 312 L282 312 Z" fill="#11182e" opacity="0.38"/>
+    <text x="414" y="222" class="rowtitle ink">Static City</text>
+    <text x="414" y="247" class="muted meta">2024 · neo-noir · 2h 22m</text>
+    <rect x="414" y="272" width="276" height="5" rx="3" fill="#c8bfb2"/>
+    <rect x="414" y="272" width="113" height="5" rx="3" fill="#3451b2"/>
+    <text x="414" y="300" class="mono muted small">41% · 84m left</text>
+    <rect x="703" y="205" width="42" height="30" rx="5" fill="#3451b2"/>
+    <text x="717" y="226" fill="#fff" font-size="14">▶</text>
+
+    <rect x="266" y="341" width="500" height="136" rx="8" fill="#fffdf8"
+          stroke="#c8bfb2"/>
+    <rect x="282" y="357" width="112" height="104" rx="5" fill="url(#night)"/>
+    <line x1="300" y1="380" x2="375" y2="380" stroke="#aaa49a"/>
+    <text x="301" y="401" class="mono" fill="#f2eee6" font-size="12">dead air</text>
+    <text x="414" y="385" class="rowtitle ink">Dead Air</text>
+    <text x="414" y="410" class="muted meta">Signal Lost · S2E7</text>
+    <rect x="414" y="434" width="276" height="5" rx="3" fill="#c8bfb2"/>
+    <rect x="414" y="434" width="174" height="5" rx="3" fill="#3451b2"/>
+    <text x="706" y="444" class="mono muted small">63%</text>
+
+    <rect x="266" y="490" width="500" height="136" rx="8" fill="#fffdf8"
+          stroke="#c8bfb2"/>
+    <rect x="282" y="506" width="112" height="104" rx="5" fill="url(#harvest)"/>
+    <g stroke="#9bb85a" opacity="0.65">
+      <line x1="282" y1="522" x2="394" y2="522"/><line x1="282" y1="532" x2="394" y2="532"/>
+      <line x1="282" y1="542" x2="394" y2="542"/><line x1="282" y1="552" x2="394" y2="552"/>
+    </g>
+    <text x="414" y="534" class="rowtitle ink">Neon Harvest</text>
+    <text x="414" y="559" class="muted meta">2023 · science fiction</text>
+    <rect x="414" y="583" width="276" height="5" rx="3" fill="#c8bfb2"/>
+    <rect x="414" y="583" width="215" height="5" rx="3" fill="#3451b2"/>
+    <text x="706" y="593" class="mono muted small">78%</text>
+
+    <text x="282" y="681" class="muted label">UP NEXT</text>
+    <rect x="266" y="700" width="500" height="92" rx="8" fill="#fffdf8"
+          stroke="#c8bfb2"/>
+    <rect x="282" y="716" width="96" height="60" rx="5" fill="#263949"/>
+    <text x="396" y="742" class="rowtitle ink">Skip Distance</text>
+    <text x="396" y="765" class="muted small">Signal Lost · S2E8 · 42m</text>
+    <text x="728" y="752" class="accent" font-size="18">›</text>
+
+    <text x="282" y="843" class="muted label">KEYBOARD</text>
+    <text x="282" y="872" class="mono muted small">j / k move   enter open   space play   / search</text>
+
+    <!-- inspector pane -->
+    <rect x="781" y="75" width="819" height="925" fill="#f4f0e8"/>
+    <g filter="url(#shadow)">
+      <rect x="824" y="112" width="732" height="314" rx="10" fill="url(#city)"/>
+    </g>
+    <path d="M824 340 C1020 255 1190 285 1556 165 L1556 426 L824 426 Z"
+          fill="#0d1429" opacity="0.52"/>
+    <circle cx="1380" cy="205" r="118" fill="#fff" opacity="0.05"/>
+    <text x="858" y="157" class="mono" fill="#fff" font-size="13"
+          letter-spacing="2">SELECTED TITLE</text>
+    <text x="858" y="338" fill="#fff" font-size="46" font-weight="760"
+          letter-spacing="-1">Static City</text>
+    <text x="860" y="374" fill="#fff" opacity="0.84" font-size="16">2024 · 2h 22m · neo-noir</text>
+    <rect x="858" y="389" width="44" height="24" rx="5" fill="#fff" opacity="0.16"/>
+    <text x="870" y="406" fill="#fff" class="mono" font-size="11">4K</text>
+    <rect x="910" y="389" width="54" height="24" rx="5" fill="#fff" opacity="0.16"/>
+    <text x="920" y="406" fill="#fff" class="mono" font-size="11">HEVC</text>
+    <rect x="972" y="389" width="42" height="24" rx="5" fill="#fff" opacity="0.16"/>
+    <text x="984" y="406" fill="#fff" class="mono" font-size="11">DV</text>
+
+    <text x="830" y="485" class="title ink">Static City</text>
+    <text x="830" y="519" class="muted body">A blackout traps a fixer and a stranger on the same stalled train;</text>
+    <text x="830" y="544" class="muted body">by dawn only one story survives.</text>
+
+    <rect x="830" y="576" width="174" height="48" rx="6" fill="#3451b2"/>
+    <text x="856" y="607" fill="#fff" font-size="16" font-weight="700">▶  Resume · 58m</text>
+    <rect x="1016" y="576" width="118" height="48" rx="6" fill="#fffdf8"
+          stroke="#c8bfb2"/>
+    <text x="1040" y="607" class="ink body" font-weight="650">Start over</text>
+    <rect x="1146" y="576" width="142" height="48" rx="6" fill="#fffdf8"
+          stroke="#c8bfb2"/>
+    <text x="1171" y="607" class="ink body" font-weight="650">✓ Watched</text>
+
+    <text x="830" y="685" class="muted label">AVAILABLE VERSIONS</text>
+    <rect x="830" y="706" width="726" height="76" rx="7" fill="#fffdf8"
+          stroke="#c8bfb2"/>
+    <text x="852" y="735" class="ink" font-size="15" font-weight="680">Feature · 57.0 GB</text>
+    <text x="852" y="760" class="mono muted small">2160p · HEVC · Dolby Vision · TrueHD 7.1</text>
+    <rect x="1466" y="725" width="66" height="36" rx="5" fill="#e9e2d7"/>
+    <text x="1486" y="748" class="accent small" font-weight="700">Play</text>
+
+    <rect x="830" y="792" width="726" height="76" rx="7" fill="#fffdf8"
+          stroke="#c8bfb2"/>
+    <text x="852" y="821" class="ink" font-size="15" font-weight="680">Compatibility · 13.5 GB</text>
+    <text x="852" y="846" class="mono muted small">1080p · H.264 · SDR · DTS 5.1</text>
+    <rect x="1466" y="811" width="66" height="36" rx="5" fill="#e9e2d7"/>
+    <text x="1486" y="834" class="accent small" font-weight="700">Play</text>
+
+    <text x="830" y="924" class="muted label">WHY THIS LAYOUT</text>
+    <text x="830" y="951" class="ink meta">Your list position survives the trip into detail.</text>
+    <text x="830" y="974" class="muted small">Three panes on desktop · two on tablet · stacked trail on phone</text>
+  </g>
+</svg>
