@@ -340,6 +340,7 @@ pub async fn playlist(
         Some("base-only") => (context.codecs.as_str(), None),
         Some("dv-direct") => ("dvh1.08.06,ec-3", None),
         Some("no-subs") => ("dvh1.08.06,ec-3", None),
+        Some("no-codecs") => ("", None),
         Some("base-short") => (
             "hvc1.2.4.L150.B0,ec-3",
             context.supplemental_codecs.as_deref(),
@@ -356,7 +357,7 @@ pub async fn playlist(
         diagnostic = query.diagnostic.as_deref().unwrap_or(""),
         "serving native HLS master playlist"
     );
-    if query.diagnostic.as_deref() == Some("no-subs") {
+    if matches!(query.diagnostic.as_deref(), Some("no-subs" | "no-codecs")) {
         file.subtitle_streams.clear();
     }
     Ok(playlist_response(
@@ -625,9 +626,10 @@ fn master_playlist(
         ));
     }
     let bandwidth = file.bitrate.unwrap_or(25_000_000).max(128_000);
-    out.push_str(&format!(
-        "#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},CODECS=\"{primary_codecs}\""
-    ));
+    out.push_str(&format!("#EXT-X-STREAM-INF:BANDWIDTH={bandwidth}"));
+    if !primary_codecs.is_empty() {
+        out.push_str(&format!(",CODECS=\"{primary_codecs}\""));
+    }
     if let Some(supplemental) = supplemental_codecs {
         out.push_str(&format!(",SUPPLEMENTAL-CODECS=\"{supplemental}\""));
         if let (Some(width), Some(height)) = (file.width, file.height) {
