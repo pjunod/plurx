@@ -5,11 +5,250 @@ import UIKit
 import XCTest
 @testable import plurx
 
+private struct LayoutWidthPreferenceKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
+private struct LayoutFramePreferenceKey: PreferenceKey {
+    static var defaultValue: CGRect = .null
+
+    static func reduce(value: inout CGRect, nextValue: () -> CGRect) {
+        let next = nextValue()
+        value = value.isNull ? next : value.union(next)
+    }
+}
+
+private extension View {
+    func reportLayoutWidth() -> some View {
+        background {
+            GeometryReader { geometry in
+                Color.clear.preference(
+                    key: LayoutWidthPreferenceKey.self,
+                    value: geometry.size.width
+                )
+            }
+        }
+    }
+
+    func reportLayoutFrame() -> some View {
+        background {
+            GeometryReader { geometry in
+                Color.clear.preference(
+                    key: LayoutFramePreferenceKey.self,
+                    value: geometry.frame(in: .global)
+                )
+            }
+        }
+    }
+}
+
+#if os(iOS)
+private struct DetailNavigationTestHost<Content: View>: View {
+    @State private var path = [1]
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        if #available(iOS 18.0, *) {
+            tabs.tabViewStyle(.sidebarAdaptable)
+        } else {
+            tabs
+        }
+    }
+
+    private var tabs: some View {
+        TabView {
+            NavigationStack(path: $path) {
+                Color.clear
+                    .navigationDestination(for: Int.self) { _ in
+                        content
+                    }
+            }
+            .tabItem { Label("Home", systemImage: "house") }
+        }
+    }
+}
+#endif
+
 final class AppleClientTests: XCTestCase {
     override func tearDown() {
         Session.shared.origin = ""
         Session.shared.token = nil
         super.tearDown()
+    }
+
+    func testAppVersionLabelIncludesThePackageBuild() {
+        XCTAssertEqual(
+            AppBuildInfo.label(version: "0.2.0", build: "2"),
+            "0.2.0 (2)"
+        )
+        XCTAssertEqual(AppBuildInfo.label(version: "0.2.0", build: nil), "0.2.0")
+        XCTAssertEqual(AppBuildInfo.label(version: nil, build: nil), "Unknown")
+    }
+
+    func testDetailResumeUsesThePositionHandedBackByThePlayer() throws {
+        var item = Item(id: 7, kind: "movie", title: "Feature")
+        item.watch = Watch(positionMs: 12_000, durationMs: 7_200_000, watched: false)
+        let original = ItemDetail(item: item)
+
+        let updated = DetailView.detail(
+            original,
+            applyingPositionMs: 91_687,
+            durationMs: 7_200_000,
+            forItemId: 7
+        )
+
+        XCTAssertEqual(updated.item.watch?.positionMs, 91_687)
+        XCTAssertEqual(updated.item.watch?.durationMs, 7_200_000)
+        XCTAssertEqual(updated.item.watch?.watched, false)
+
+        let unrelated = DetailView.detail(
+            original,
+            applyingPositionMs: 300_000,
+            durationMs: 7_200_000,
+            forItemId: 8
+        )
+        XCTAssertEqual(unrelated.item.watch?.positionMs, 12_000)
+    }
+
+    func testDetailProgressReflectsTheServerWatchedThreshold() throws {
+        let original = ItemDetail(item: Item(id: 7, kind: "movie", title: "Feature"))
+
+        let updated = DetailView.detail(
+            original,
+            applyingPositionMs: 95_000,
+            durationMs: 100_000,
+            forItemId: 7
+        )
+
+        XCTAssertEqual(updated.item.watch?.watched, true)
+    }
+
+    @MainActor
+    func testTVSeriesPrimaryActionPrefersProgressAndSupportsSingleSeasonShapes() {
+        var first = Item(id: 1, kind: "episode", title: "First")
+        var progressing = Item(id: 2, kind: "episode", title: "In progress")
+        var watched = Item(id: 3, kind: "episode", title: "Watched")
+        first.watch = Watch(positionMs: 0, watched: false)
+        progressing.watch = Watch(positionMs: 30_000, watched: false)
+        watched.watch = Watch(positionMs: 0, watched: true)
+
+        XCTAssertEqual(
+            AppModel.orderedEpisodeCandidates([first, progressing, watched]).map(\.id),
+            [2, 1, 3]
+        )
+        XCTAssertEqual(AppModel.resumableStartMs(positionMs: 30_000, durationMs: 100_000), 30_000)
+        XCTAssertEqual(AppModel.resumableStartMs(positionMs: 96_000, durationMs: 100_000), 0)
+    }
+
+    @MainActor
+    func testApplePlayerRetriesAnUnopenableOriginalOnlyOnce() {
+        XCTAssertTrue(PlayerController.shouldRetryWithCompatibilityTranscode(
+            canRetry: true,
+            alreadyAttempted: false
+        ))
+        XCTAssertFalse(PlayerController.shouldRetryWithCompatibilityTranscode(
+            canRetry: true,
+            alreadyAttempted: true
+        ))
+        XCTAssertFalse(PlayerController.shouldRetryWithCompatibilityTranscode(
+            canRetry: false,
+            alreadyAttempted: false
+        ))
+    }
+
+    @MainActor
+    func testAutomaticSubtitlesFollowViewerLanguageNotContainerDefault() {
+        let tracks = [
+            SubtitleTrack(
+                index: 0, codec: "subrip", language: "ita", title: "Forced",
+                default: true, forced: true, text: true
+            ),
+            SubtitleTrack(
+                index: 1, codec: "subrip", language: "ita", title: "Regular",
+                default: false, forced: false, text: true
+            ),
+            // This is the affected Scary Movie shape: the mux retained the
+            // English Forced title but omitted its forced disposition.
+            SubtitleTrack(
+                index: 2, codec: "subrip", language: "eng", title: "Forced",
+                default: false, forced: false, text: true
+            ),
+            SubtitleTrack(
+                index: 3, codec: "subrip", language: "eng", title: "Regular",
+                default: false, forced: false, text: true
+            ),
+            SubtitleTrack(
+                index: 4, codec: "subrip", language: "eng", title: "SDH",
+                default: false, forced: false, text: true
+            ),
+        ]
+
+        XCTAssertEqual(
+            PlayerController.automaticSubtitleIndex(tracks, preferredLanguage: "eng"),
+            2
+        )
+        XCTAssertEqual(
+            PlayerController.automaticSubtitleIndex(tracks, preferredLanguage: "en-US"),
+            2
+        )
+        XCTAssertNil(
+            PlayerController.automaticSubtitleIndex(tracks, preferredLanguage: "spa")
+        )
+        XCTAssertNil(
+            PlayerController.automaticSubtitleIndex(tracks, preferredLanguage: "off")
+        )
+    }
+
+    @MainActor
+    func testNativeSubtitleSwitchingUsesAVPlayerMediaSelectionWithoutAStreamReopen() {
+        let tracks = [
+            SubtitleTrack(
+                index: 0, codec: "subrip", language: "eng", title: "Forced",
+                default: true, forced: true, text: true
+            ),
+            SubtitleTrack(
+                index: 1, codec: "hdmv_pgs_subtitle", language: "eng", title: "PGS",
+                default: false, forced: false, text: false
+            ),
+            SubtitleTrack(
+                index: 2, codec: "ass", language: "eng", title: "Styled",
+                default: false, forced: false, text: true
+            ),
+            SubtitleTrack(
+                index: 3, codec: "webvtt", language: "eng", title: "Regular",
+                default: false, forced: false, text: true
+            ),
+        ]
+        var selectedOrdinals: [Int?] = []
+
+        XCTAssertTrue(PlayerController.applyNativeSubtitleSelection(
+            3,
+            tracks: tracks,
+            select: { selectedOrdinals.append($0) }
+        ))
+        XCTAssertEqual(selectedOrdinals.count, 1)
+        XCTAssertEqual(selectedOrdinals[0], 1, "bitmap/styled tracks are absent from HLS order")
+
+        XCTAssertTrue(PlayerController.applyNativeSubtitleSelection(
+            nil,
+            tracks: tracks,
+            select: { selectedOrdinals.append($0) }
+        ))
+        XCTAssertEqual(selectedOrdinals.count, 2)
+        XCTAssertNil(selectedOrdinals[1], "Off deselects the AVPlayer option in place")
+
+        XCTAssertFalse(PlayerController.applyNativeSubtitleSelection(
+            1,
+            tracks: tracks,
+            select: { _ in XCTFail("PGS must use the burn/reopen fallback") }
+        ))
+        XCTAssertTrue(PlayerController.subtitleRequiresBurn(1, in: tracks))
+        XCTAssertTrue(PlayerController.subtitleRequiresBurn(2, in: tracks))
+        XCTAssertFalse(PlayerController.subtitleRequiresBurn(3, in: tracks))
     }
 
     func testOriginNormalizationAcceptsHostnamesAndRemovesTrailingSlashes() {
@@ -139,6 +378,29 @@ final class AppleClientTests: XCTestCase {
         XCTAssertEqual(json["start"] as? Double, 12.5)
         XCTAssertNotNil(json["request_id"] as? String)
         XCTAssertNil(json["height"])
+        XCTAssertEqual(PlurxAPI.playbackPreparationTimeout, 180)
+    }
+
+    func testNativeSubtitleRequestDoesNotAskForBurnOrQualityChange() throws {
+        let request = CreateSessionRequest(
+            playbackId: "player-native-subs",
+            start: 3_600,
+            subtitleBurn: nil,
+            nativeSubtitles: true,
+            subtitle: 2,
+            copy: true
+        )
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let json = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: encoder.encode(request)) as? [String: Any]
+        )
+
+        XCTAssertEqual(json["native_subtitles"] as? Bool, true)
+        XCTAssertEqual(json["subtitle"] as? Int, 2)
+        XCTAssertNil(json["subtitle_burn"])
+        XCTAssertNil(json["height"], "subtitle selection must preserve Auto quality")
+        XCTAssertEqual(json["copy"] as? Bool, true)
     }
 
     func testAppleCapsDescribeDolbyVisionProfilesWithoutDeprecatedHDRAPI() {
@@ -231,7 +493,29 @@ final class AppleClientTests: XCTestCase {
         )
         XCTAssertEqual(
             PlayerView.playbackBadges(source: source, audio: audio).map(\.symbol),
-            ["4k.tv.fill", "sparkles", "speaker.wave.3.fill"]
+            ["4k.tv.fill", "sparkles", "waveform"]
+        )
+        XCTAssertLessThanOrEqual(PlayerMetadataBadgeMetrics.rowSpacing, 6)
+        XCTAssertLessThanOrEqual(PlayerMetadataBadgeMetrics.horizontalPadding, 6)
+        XCTAssertLessThanOrEqual(PlayerMetadataBadgeMetrics.verticalPadding, 2)
+
+        // Resolution tiers use both edges, so orientation ordering cannot turn
+        // 1080p into 1920p and cropped scope masters retain their 4K tier.
+        var orientationOrderedSource = source
+        orientationOrderedSource.width = 1080
+        orientationOrderedSource.height = 1920
+        orientationOrderedSource.hdrFormat = nil
+        XCTAssertEqual(
+            PlayerView.playbackFacts(source: orientationOrderedSource, audio: nil),
+            ["1080p"]
+        )
+        var scope4KSource = source
+        scope4KSource.width = 3840
+        scope4KSource.height = 1608
+        scope4KSource.hdrFormat = nil
+        XCTAssertEqual(
+            PlayerView.playbackFacts(source: scope4KSource, audio: nil),
+            ["4K"]
         )
     }
 
@@ -283,6 +567,89 @@ final class AppleClientTests: XCTestCase {
         }
     }
 
+    #if os(iOS)
+    func testDetailBodyKeepsScrollableRowsAndActionsInsidePhoneInsets() throws {
+        for viewportWidth: CGFloat in [393, 440] {
+            let expectedBodyWidth = viewportWidth - (2 * screenHPad)
+            var laidOutWidth: CGFloat = 0
+            var laidOutFrame: CGRect = .null
+            let controller = UIHostingController(rootView:
+                DetailNavigationTestHost {
+                    DetailViewportFrame {
+                        DetailBodyFrame {
+                            VStack(alignment: .leading, spacing: 12) {
+                                ItemMetadataBadgeRow(badges: [
+                                    ItemMetadataBadge(
+                                        kind: .episode,
+                                        symbol: "rectangle.stack.fill",
+                                        mark: "S4 E3",
+                                        accessibilityLabel: "Season 4, Episode 3"
+                                    ),
+                                    ItemMetadataBadge(
+                                        kind: .runtime,
+                                        symbol: "clock.fill",
+                                        mark: "42 min",
+                                        accessibilityLabel: "42 min"
+                                    ),
+                                    ItemMetadataBadge(
+                                        kind: .resolution,
+                                        symbol: "tv.fill",
+                                        mark: "1080P",
+                                        accessibilityLabel: "1080P"
+                                    ),
+                                    ItemMetadataBadge(
+                                        kind: .video,
+                                        symbol: "film.fill",
+                                        mark: "H.264",
+                                        accessibilityLabel: "H.264"
+                                    ),
+                                ])
+
+                                Text("'Til Death Do You Part")
+                                    .font(.largeTitle.bold())
+                                    .lineLimit(nil)
+                                    .multilineTextAlignment(.leading)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                                PrimaryButton(title: "Resume · 0:44", action: {})
+                            }
+                            .reportLayoutWidth()
+                            .reportLayoutFrame()
+                        }
+                    }
+                }
+                .dynamicTypeSize(.xxLarge)
+                .onPreferenceChange(LayoutWidthPreferenceKey.self) {
+                    laidOutWidth = $0
+                }
+                .onPreferenceChange(LayoutFramePreferenceKey.self) {
+                    laidOutFrame = $0
+                }
+            )
+
+            controller.view.frame = CGRect(
+                origin: .zero,
+                size: CGSize(width: viewportWidth, height: 800)
+            )
+            let window = UIWindow(frame: controller.view.frame)
+            window.rootViewController = controller
+            window.makeKeyAndVisible()
+            controller.view.setNeedsLayout()
+            controller.view.layoutIfNeeded()
+            RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.2))
+
+            XCTAssertFalse(laidOutFrame.isNull)
+            XCTAssertLessThanOrEqual(laidOutWidth, expectedBodyWidth + 0.5)
+            XCTAssertGreaterThanOrEqual(laidOutFrame.minX, screenHPad - 1)
+            XCTAssertLessThanOrEqual(
+                laidOutFrame.maxX,
+                viewportWidth - screenHPad + 1
+            )
+            window.isHidden = true
+        }
+    }
+    #endif
+
     func testEpisodeBreadcrumbLinksToTheShowAndSeasonInOrder() {
         let show = Item(id: 10, kind: "show", title: "Shameless")
         let season = Item(id: 20, kind: "season", title: "Season 1")
@@ -291,6 +658,9 @@ final class AppleClientTests: XCTestCase {
             [show, season].map(DetailBreadcrumb.destination(for:)),
             [.item(10), .item(20)]
         )
+        XCTAssertGreaterThanOrEqual(DetailBreadcrumbMetrics.itemSpacing, 6)
+        XCTAssertLessThanOrEqual(DetailBreadcrumbMetrics.verticalPadding, 4)
+        XCTAssertLessThanOrEqual(DetailBreadcrumbMetrics.focusStrokeWidth, 1)
     }
 
     #if os(tvOS)

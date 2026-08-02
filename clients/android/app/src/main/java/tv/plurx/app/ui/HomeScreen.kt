@@ -21,8 +21,10 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -78,6 +80,25 @@ fun HomeScreen(
             }
             else -> {
                 val collections = homeCollections(state.libraries, state.libraryItems, preferences.homeGrouping)
+                val visibleShelfKeys = buildList {
+                    if (state.hubs.continue_watching.isNotEmpty()) add("continue")
+                    if (state.hubs.next_up.isNotEmpty()) add("next")
+                    if (state.hubs.recently_added.isNotEmpty()) add("recent")
+                    collections.filter { it.items.isNotEmpty() }.forEach {
+                        add("collection-${it.title}")
+                    }
+                }
+                val shelfFocus = remember(visibleShelfKeys) {
+                    visibleShelfKeys.associateWith { FocusRequester() }
+                }
+                fun previousShelf(key: String): FocusRequester? {
+                    val index = visibleShelfKeys.indexOf(key)
+                    return visibleShelfKeys.getOrNull(index - 1)?.let { shelfFocus[it] }
+                }
+                fun nextShelf(key: String): FocusRequester? {
+                    val index = visibleShelfKeys.indexOf(key)
+                    return visibleShelfKeys.getOrNull(index + 1)?.let { shelfFocus[it] }
+                }
                 LazyColumn(contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 32.dp)) {
                     item {
                         MediaRow(
@@ -85,16 +106,32 @@ fun HomeScreen(
                             state.hubs.continue_watching,
                             posterWidth,
                             resolutionPlacement = PosterResolutionPlacement.BelowArtwork,
+                            rowFocusRequester = shelfFocus["continue"],
+                            previousRowFocusRequester = previousShelf("continue"),
+                            nextRowFocusRequester = nextShelf("continue"),
                             onOpen = { onOpenItem(it.id) },
                         )
                     }
-                    item { MediaRow("Next up", state.hubs.next_up, posterWidth, onOpen = { onOpenItem(it.id) }) }
+                    item {
+                        MediaRow(
+                            "Next up",
+                            state.hubs.next_up,
+                            posterWidth,
+                            rowFocusRequester = shelfFocus["next"],
+                            previousRowFocusRequester = previousShelf("next"),
+                            nextRowFocusRequester = nextShelf("next"),
+                            onOpen = { onOpenItem(it.id) },
+                        )
+                    }
                     item {
                         MediaRow(
                             "Recently added",
                             state.hubs.recently_added,
                             posterWidth,
                             resolutionPlacement = PosterResolutionPlacement.BelowArtwork,
+                            rowFocusRequester = shelfFocus["recent"],
+                            previousRowFocusRequester = previousShelf("recent"),
+                            nextRowFocusRequester = nextShelf("recent"),
                             onOpen = { onOpenItem(it.id) },
                         )
                     }
@@ -118,12 +155,16 @@ fun HomeScreen(
                     }
 
                     collections.forEach { collection ->
-                        item(key = "collection-${collection.title}") {
+                        val key = "collection-${collection.title}"
+                        item(key = key) {
                             MediaRow(
                                 title = collection.title,
                                 items = collection.items,
                                 posterWidth = posterWidth,
                                 onViewAll = { onOpenCollection(collection.title, collection.libraries) },
+                                rowFocusRequester = shelfFocus[key],
+                                previousRowFocusRequester = previousShelf(key),
+                                nextRowFocusRequester = nextShelf(key),
                                 onOpen = { onOpenItem(it.id) },
                             )
                         }

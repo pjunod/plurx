@@ -6,9 +6,11 @@
 
 use std::path::{Path, PathBuf};
 
-use axum::extract::{Path as AxPath, State};
-use axum::http::{header, StatusCode};
+use axum::extract::{Path as AxPath, Query, State};
+use axum::http::{header, StatusCode, Uri};
 use axum::response::{Html, IntoResponse, Response};
+use qrcode::{render::svg, QrCode};
+use serde::Deserialize;
 
 use crate::state::AppState;
 
@@ -40,6 +42,50 @@ pub async fn hls_js() -> Response {
         HLS_JS,
     )
         .into_response()
+}
+
+#[derive(Deserialize)]
+pub struct ConnectQrQuery {
+    origin: String,
+}
+
+/// Render the current browser origin as a QR code native clients can scan.
+/// It deliberately contains no credential: scanning chooses a server, then
+/// the app signs in normally so passwords and tokens never cross the code.
+pub async fn connect_qr(Query(query): Query<ConnectQrQuery>) -> Response {
+    let Ok(svg) = connection_qr_svg(&query.origin) else {
+        return (StatusCode::BAD_REQUEST, "invalid server origin").into_response();
+    };
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "image/svg+xml; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+            (header::CONTENT_SECURITY_POLICY, "default-src 'none'"),
+        ],
+        svg,
+    )
+        .into_response()
+}
+
+fn connection_qr_svg(origin: &str) -> Result<String, ()> {
+    let origin = origin.trim().trim_end_matches('/');
+    let uri: Uri = origin.parse().map_err(|_| ())?;
+    if !matches!(uri.scheme_str(), Some("http" | "https"))
+        || uri.authority().is_none()
+        || uri
+            .path_and_query()
+            .is_some_and(|path| path.as_str() != "/")
+    {
+        return Err(());
+    }
+    let code = QrCode::new(origin.as_bytes()).map_err(|_| ())?;
+    Ok(code
+        .render::<svg::Color>()
+        .min_dimensions(240, 240)
+        .dark_color(svg::Color("#111217"))
+        .light_color(svg::Color("#ffffff"))
+        .build())
 }
 
 /// Serve the PWA manifest (enables install / Add-to-Home-Screen).
@@ -130,5 +176,30 @@ pub async fn fallback(uri: axum::http::Uri) -> Response {
             .into_response()
     } else {
         Html(INDEX_HTML).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{connection_qr_svg, INDEX_HTML};
+
+    #[test]
+    fn app_shell_shows_the_running_build_to_signed_in_and_signed_out_users() {
+        assert_eq!(
+            INDEX_HTML.matches("Version ${esc(buildLabel())}").count(),
+            2
+        );
+    }
+
+    #[test]
+    fn connection_qr_accepts_only_an_http_server_origin() {
+        let svg = connection_qr_svg("http://192.168.4.14:32400/").expect("valid origin");
+        assert!(svg.starts_with("<?xml"));
+        assert!(svg.contains("<svg"));
+        assert!(svg.contains("#111217"));
+
+        assert!(connection_qr_svg("javascript:alert(1)").is_err());
+        assert!(connection_qr_svg("http://server.test/path").is_err());
+        assert!(connection_qr_svg("").is_err());
     }
 }

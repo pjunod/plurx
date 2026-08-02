@@ -105,10 +105,13 @@ import tv.plurx.app.data.SubTrack
 import tv.plurx.app.ui.AppViewModel
 import tv.plurx.app.ui.PlaybackTarget
 import tv.plurx.app.ui.components.LoadingBox
+import tv.plurx.app.ui.components.MediaFact
+import tv.plurx.app.ui.components.MediaFactChip
 import tv.plurx.app.ui.components.RequestInitialFocus
 import tv.plurx.app.ui.components.TvButton
 import tv.plurx.app.ui.components.TvIconButton
 import tv.plurx.app.ui.components.formatTime
+import tv.plurx.app.ui.components.playerMediaFacts
 import tv.plurx.app.ui.components.tvFocusRing
 import tv.plurx.app.ui.theme.Accent
 import tv.plurx.app.ui.theme.Muted
@@ -654,6 +657,11 @@ private fun PlayerContent(
                 durationMs = plan.durationMs,
                 isPlaying = isPlaying,
                 requestInitialFocus = panel == null,
+                mediaFacts = playerMediaFacts(
+                    plan.source,
+                    plan.audio.firstOrNull { it.index == controller.selectedAudio }
+                        ?: plan.audio.firstOrNull { it.default },
+                ),
                 onBack = onExit,
                 onPlayPause = { controller.playPause(); poke() },
                 onSeekBack = { controller.seekTo(controller.realPosition() - 10_000); poke() },
@@ -721,6 +729,7 @@ internal fun Controls(
     durationMs: Long,
     isPlaying: Boolean,
     requestInitialFocus: Boolean,
+    mediaFacts: List<MediaFact> = emptyList(),
     onBack: () -> Unit,
     onPlayPause: () -> Unit,
     onSeekBack: () -> Unit,
@@ -792,6 +801,14 @@ internal fun Controls(
         }
 
         Column(Modifier.align(Alignment.BottomCenter).fillMaxWidth().padding(horizontal = 28.dp, vertical = 22.dp)) {
+            if (mediaFacts.isNotEmpty()) {
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    modifier = Modifier.padding(bottom = 5.dp),
+                ) {
+                    mediaFacts.forEach { fact -> MediaFactChip(fact) }
+                }
+            }
             val range = if (durationMs > 0) durationMs.toFloat() else 1f
             Slider(
                 value = positionMs.coerceIn(0, durationMs.coerceAtLeast(0)).toFloat(),

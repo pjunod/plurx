@@ -16,6 +16,23 @@ private let languages: [Lang] = [
 ]
 private let subtitleLanguages: [Lang] = [Lang(id: "off", name: "Off")] + languages
 
+enum AppBuildInfo {
+    static func label(version: String?, build: String?) -> String {
+        let version = version?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let build = build?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let readableVersion = version.flatMap { $0.isEmpty ? nil : $0 } ?? "Unknown"
+        guard let build, !build.isEmpty else { return readableVersion }
+        return "\(readableVersion) (\(build))"
+    }
+
+    static var current: String {
+        label(
+            version: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String,
+            build: Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String
+        )
+    }
+}
+
 struct SettingsView: View {
     @EnvironmentObject var model: AppModel
 
@@ -63,6 +80,10 @@ struct SettingsView: View {
                 LabeledContent("Server", value: model.serverName ?? model.origin)
                 Button("Sign out", role: .destructive) { model.logout() }
                 Button("Change server") { model.changeServer() }
+            }
+
+            Section("About") {
+                LabeledContent("App version", value: AppBuildInfo.current)
             }
         }
         .navigationTitle("Settings")

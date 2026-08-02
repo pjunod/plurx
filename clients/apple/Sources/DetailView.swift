@@ -18,7 +18,7 @@ struct ItemMetadataBadge: Equatable, Identifiable {
     var id: String { kind.rawValue }
 }
 
-private struct ItemMetadataBadgeRow: View {
+struct ItemMetadataBadgeRow: View {
     let badges: [ItemMetadataBadge]
 
     var body: some View {
@@ -28,6 +28,8 @@ private struct ItemMetadataBadgeRow: View {
         ScrollView(.horizontal, showsIndicators: false) {
             badgeContent
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .clipped()
         #endif
     }
 
@@ -68,7 +70,7 @@ struct DetailBreadcrumb: View {
 
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 2) {
+            HStack(spacing: DetailBreadcrumbMetrics.itemSpacing) {
                 ForEach(ancestors.indices, id: \.self) { index in
                     if index > ancestors.startIndex {
                         Text("/")
@@ -87,6 +89,8 @@ struct DetailBreadcrumb: View {
             }
             .breadcrumbFont()
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .clipped()
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Show path")
     }
@@ -94,6 +98,13 @@ struct DetailBreadcrumb: View {
     static func destination(for ancestor: Item) -> Route {
         .item(ancestor.id)
     }
+}
+
+enum DetailBreadcrumbMetrics {
+    static let itemSpacing: CGFloat = 6
+    static let horizontalPadding: CGFloat = 8
+    static let verticalPadding: CGFloat = 4
+    static let focusStrokeWidth: CGFloat = 1
 }
 
 private struct DetailBreadcrumbLinkStyle: ButtonStyle {
@@ -117,17 +128,21 @@ private struct DetailBreadcrumbLinkStyle: ButtonStyle {
         var body: some View {
             configuration.label
                 .foregroundStyle(isFocused ? Palette.onBg : Palette.accent)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 7)
+                .padding(.horizontal, DetailBreadcrumbMetrics.horizontalPadding)
+                .padding(.vertical, DetailBreadcrumbMetrics.verticalPadding)
                 .background(
-                    Palette.surfaceHi.opacity(isFocused ? 0.96 : 0),
-                    in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    Palette.surfaceHi.opacity(isFocused ? 0.9 : 0),
+                    in: Capsule()
                 )
                 .overlay {
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .stroke(Palette.accent.opacity(isFocused ? 1 : 0), lineWidth: 2)
+                    Capsule()
+                        .stroke(
+                            Palette.accent.opacity(isFocused ? 0.9 : 0),
+                            lineWidth: DetailBreadcrumbMetrics.focusStrokeWidth
+                        )
                 }
-                .scaleEffect(isFocused ? 1.05 : (configuration.isPressed ? 0.98 : 1))
+                .contentShape(Capsule())
+                .scaleEffect(configuration.isPressed ? 0.98 : 1)
                 .animation(.easeOut(duration: 0.12), value: isFocused)
         }
     }
@@ -169,32 +184,63 @@ struct PlayContext: Identifiable {
     var overview: String? = nil
 }
 
-/// Keeps the readable detail column centered on large screens without ever
-/// growing wider than the compact device that contains it.
-struct DetailBodyFrame<Content: View>: View {
-    @ViewBuilder let content: Content
+enum DetailLayoutMetrics {
+    static let maximumBodyWidth: CGFloat = 980 - (2 * screenHPad)
 
-    var body: some View {
-        content
-            // Padding must be inside the width cap. Applying it after a
-            // max-width frame makes compact iPhones report `screen + 2 * pad`
-            // and SwiftUI centers that oversized body, clipping both edges.
-            .padding(.horizontal, screenHPad)
-            .frame(maxWidth: 980, alignment: .leading)
-            .frame(maxWidth: .infinity, alignment: .center)
+    static func bodyWidth(in viewportWidth: CGFloat) -> CGFloat {
+        min(maximumBodyWidth, max(0, viewportWidth - (2 * screenHPad)))
     }
 }
 
-/// Constrains the detail page to the ScrollView's visible width. Unlike an
-/// outer GeometryReader, this accounts for the navigation container's safe
-/// area and any iPad sidebar before proposing a width to the page content.
+private struct DetailViewportWidthKey: EnvironmentKey {
+    static let defaultValue: CGFloat? = nil
+}
+
+private extension EnvironmentValues {
+    var detailViewportWidth: CGFloat? {
+        get { self[DetailViewportWidthKey.self] }
+        set { self[DetailViewportWidthKey.self] = newValue }
+    }
+}
+
+/// Keeps the readable detail column centered on large screens without ever
+/// growing wider than the compact device that contains it.
+struct DetailBodyFrame<Content: View>: View {
+    @Environment(\.detailViewportWidth) private var viewportWidth
+    @ViewBuilder let content: Content
+
+    @ViewBuilder
+    var body: some View {
+        if let viewportWidth {
+            content
+                .frame(
+                    width: DetailLayoutMetrics.bodyWidth(in: viewportWidth),
+                    alignment: .leading
+                )
+                .frame(width: viewportWidth, alignment: .center)
+        } else {
+            content
+                .frame(maxWidth: DetailLayoutMetrics.maximumBodyWidth, alignment: .leading)
+                .frame(maxWidth: .infinity, alignment: .center)
+                .padding(.horizontal, screenHPad)
+        }
+    }
+}
+
+/// Reads the actual navigation viewport and pins the full page to that exact
+/// width. `containerRelativeFrame` can instead read the underlying tab
+/// container on iPhone, which is wider than a pushed navigation destination.
 struct DetailViewportFrame<Content: View>: View {
     @ViewBuilder let content: Content
 
     var body: some View {
-        ScrollView {
-            content
-                .containerRelativeFrame(.horizontal, alignment: .leading)
+        GeometryReader { viewport in
+            ScrollView {
+                content
+                    .environment(\.detailViewportWidth, viewport.size.width)
+                    .frame(width: viewport.size.width, alignment: .leading)
+            }
+            .frame(width: viewport.size.width, height: viewport.size.height)
         }
     }
 }
@@ -217,6 +263,10 @@ enum TVPlayableDetailMetrics {
 #endif
 
 struct DetailView: View {
+    #if os(tvOS)
+    private enum TVDetailFocus: Hashable { case primaryAction }
+    #endif
+
     @EnvironmentObject var model: AppModel
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     let itemId: Int
@@ -225,6 +275,10 @@ struct DetailView: View {
     @State private var loadError: String?
     @State private var watchBusy = false
     @State private var actionError: String?
+    #if os(tvOS)
+    @State private var seriesPlayback: PlayContext?
+    @FocusState private var tvFocusedAction: TVDetailFocus?
+    #endif
 
     var body: some View {
         DetailViewportFrame {
@@ -250,8 +304,21 @@ struct DetailView: View {
         #endif
         .task(id: itemId) {
             do {
-                detail = try await model.itemDetail(itemId)
+                let loaded = try await model.itemDetail(itemId)
+                detail = loaded
                 loadError = nil
+                #if os(tvOS)
+                tvFocusedAction = nil
+                if loaded.item.kind == "show" || loaded.item.kind == "season" {
+                    seriesPlayback = await model.seriesPlayback(loaded)
+                } else {
+                    seriesPlayback = nil
+                }
+                if Self.hasTVPrimaryAction(loaded, seriesPlayback: seriesPlayback) {
+                    try? await Task.sleep(for: .milliseconds(120))
+                    tvFocusedAction = .primaryAction
+                }
+                #endif
             } catch {
                 loadError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             }
@@ -260,10 +327,56 @@ struct DetailView: View {
             PlayerView(itemId: ctx.itemId, fileId: ctx.fileId, startMs: ctx.startMs,
                        durationMs: ctx.durationMs, title: ctx.title,
                        subtitle: ctx.subtitle, year: ctx.year, overview: ctx.overview,
-                       onPlayNext: { play = $0 })
+                       onPlayNext: { play = $0 },
+                       onPlaybackStopped: { positionMs in
+                           updateVisibleProgress(
+                               itemId: ctx.itemId,
+                               positionMs: positionMs,
+                               durationMs: ctx.durationMs
+                           )
+                       })
                 .id(ctx.id)
                 .environmentObject(model)
         }
+    }
+
+    private func updateVisibleProgress(itemId: Int, positionMs: Int, durationMs: Int) {
+        guard let detail else { return }
+        self.detail = Self.detail(
+            detail,
+            applyingPositionMs: positionMs,
+            durationMs: durationMs,
+            forItemId: itemId
+        )
+    }
+
+    /// Apply the final player position to the detail snapshot that remains on
+    /// screen underneath the full-screen cover. The server receives the same
+    /// position from `PlayerController.stop()`; this local copy removes the UI
+    /// race without making dismissal wait on the network.
+    static func detail(
+        _ detail: ItemDetail,
+        applyingPositionMs positionMs: Int,
+        durationMs: Int,
+        forItemId itemId: Int
+    ) -> ItemDetail {
+        guard detail.item.id == itemId, positionMs > 0 else { return detail }
+        var item = detail.item
+        var watch = item.watch ?? Watch()
+        watch.positionMs = positionMs
+        if durationMs > 0 {
+            watch.durationMs = durationMs
+            if Double(positionMs) >= Double(durationMs) * 0.95 {
+                watch.watched = true
+            }
+        }
+        item.watch = watch
+        return ItemDetail(
+            item: item,
+            files: detail.files,
+            children: detail.children,
+            ancestors: detail.ancestors
+        )
     }
 
     @ViewBuilder
@@ -315,7 +428,9 @@ struct DetailView: View {
                         .font(.largeTitle.bold())
                         #endif
                         .foregroundColor(Palette.onBg)
-                        .fixedSize(horizontal: false, vertical: true)
+                        .lineLimit(nil)
+                        .multilineTextAlignment(.leading)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     ItemMetadataBadgeRow(badges: Self.itemMetadataBadges(
                         item,
                         file: file,
@@ -526,7 +641,9 @@ struct DetailView: View {
         }
         if item.kind != "episode", let year = item.year { parts.append(String(year)) }
         if let durationMs, durationMs > 0 { parts.append(tvRuntimeLabel(durationMs)) }
-        if let resolution = resolutionLabel(file?.height ?? item.resolution) {
+        if let resolution = file.flatMap({
+            resolutionLabel(width: $0.width, height: $0.height)
+        }) ?? resolutionLabel(item.resolution) {
             parts.append(resolution)
         }
         if let codec = file?.videoCodec, !codec.isEmpty {
@@ -588,7 +705,13 @@ struct DetailView: View {
                                 .fixedSize(horizontal: false, vertical: true)
                         }
 
-                        watchButton(detail)
+                        HStack(spacing: 16) {
+                            if let seriesPlayback {
+                                seriesPlaybackButton(seriesPlayback)
+                                    .fixedSize()
+                            }
+                            watchButton(detail)
+                        }
 
                         if let actionError {
                             Text(actionError)
@@ -605,6 +728,10 @@ struct DetailView: View {
             }
             .frame(height: TVSeriesDetailMetrics.headerHeight)
             .clipped()
+            // Treat the full-width header as a focus target. Without this, the
+            // focus engine cannot find the narrower action buttons when moving
+            // up from episodes at the far-right end of the horizontal shelf.
+            .focusSection()
 
             if !children.isEmpty {
                 MediaRow(
@@ -669,6 +796,27 @@ struct DetailView: View {
     static func tvSeriesChildStyle(for kind: String) -> MediaRowStyle {
         kind == "season" ? .episode : .poster
     }
+
+    static func hasTVPrimaryAction(
+        _ detail: ItemDetail,
+        seriesPlayback: PlayContext?
+    ) -> Bool {
+        if detail.item.kind == "show" || detail.item.kind == "season" {
+            return seriesPlayback != nil
+        }
+        return detail.item.isPlayable && detail.files?.first != nil
+    }
+
+    private func seriesPlaybackButton(_ target: PlayContext) -> some View {
+        PrimaryButton(
+            title: target.startMs > 0
+                ? "▶  Resume · \(formatTime(target.startMs))"
+                : "▶  Play"
+        ) {
+            play = target
+        }
+        .focused($tvFocusedAction, equals: .primaryAction)
+    }
     #endif
 
     static func itemMetadataBadges(
@@ -715,7 +863,9 @@ struct DetailView: View {
                 accessibilityLabel: runtime
             ))
         }
-        if let resolution = resolutionLabel(file?.height ?? item.resolution) {
+        if let resolution = file.flatMap({
+            resolutionLabel(width: $0.width, height: $0.height)
+        }) ?? resolutionLabel(item.resolution) {
             badges.append(ItemMetadataBadge(
                 kind: .resolution,
                 symbol: resolution == "4K" ? "4k.tv.fill" : "tv.fill",
@@ -834,6 +984,7 @@ struct DetailView: View {
         #endif
     }
 
+    @ViewBuilder
     private func resumeButton(
         item: Item,
         file: MediaFile,
@@ -841,7 +992,7 @@ struct DetailView: View {
         resumeMs: Int,
         canResume: Bool
     ) -> some View {
-        PrimaryButton(title: canResume ? "▶  Resume · \(formatTime(resumeMs))" : "▶  Play") {
+        let button = PrimaryButton(title: canResume ? "▶  Resume · \(formatTime(resumeMs))" : "▶  Play") {
             play = PlayContext(
                 itemId: item.id,
                 fileId: file.id,
@@ -853,6 +1004,11 @@ struct DetailView: View {
                 overview: item.overview
             )
         }
+        #if os(tvOS)
+        button.focused($tvFocusedAction, equals: .primaryAction)
+        #else
+        button
+        #endif
     }
 
     private func startOverButton(item: Item, file: MediaFile, durationMs: Int) -> some View {
@@ -870,14 +1026,11 @@ struct DetailView: View {
         } label: {
             Text("Start over")
                 .font(.system(.body, design: .monospaced))
-                .frame(maxWidth: .infinity)
         }
         #if os(tvOS)
         .buttonStyle(TVReadableButtonStyle(prominent: false))
         #else
-        .buttonStyle(.bordered)
-        .tint(Palette.muted)
-        .controlSize(.large)
+        .buttonStyle(IOSFullWidthActionButtonStyle(prominent: false))
         #endif
     }
 

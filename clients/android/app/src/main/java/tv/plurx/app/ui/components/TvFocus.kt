@@ -13,11 +13,12 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
-import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.composed
 import androidx.compose.ui.draw.scale
@@ -26,13 +27,13 @@ import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Shape
-import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.semantics.SemanticsPropertyKey
 import androidx.compose.ui.semantics.SemanticsPropertyReceiver
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
+import kotlinx.coroutines.delay
 
 internal val TvFocusVisibleKey = SemanticsPropertyKey<Boolean>("TvFocusVisible")
 internal var SemanticsPropertyReceiver.tvFocusVisible by TvFocusVisibleKey
@@ -40,11 +41,15 @@ internal var SemanticsPropertyReceiver.tvFocusVisible by TvFocusVisibleKey
 /** Requests focus after the target has been attached and laid out for a frame. */
 @Composable
 fun RequestInitialFocus(focusRequester: FocusRequester, enabled: Boolean = true) {
-    val view = LocalView.current
-    DisposableEffect(view, focusRequester, enabled) {
-        val request = Runnable { focusRequester.requestFocus() }
-        if (enabled) view.postOnAnimation(request)
-        onDispose { view.removeCallbacks(request) }
+    LaunchedEffect(focusRequester, enabled) {
+        if (!enabled) return@LaunchedEffect
+        // Detail content is nested in lazy containers. One frame can attach a
+        // button before the outer column has completed focus layout, allowing
+        // the breadcrumb above it to win. Reinforce the request after layout.
+        withFrameNanos { }
+        focusRequester.requestFocus()
+        delay(80)
+        focusRequester.requestFocus()
     }
 }
 

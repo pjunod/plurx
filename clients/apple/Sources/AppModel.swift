@@ -438,6 +438,85 @@ final class AppModel: ObservableObject {
         try await requireAPI().item(id)
     }
 
+    /// Resolve a show or season to the episode its primary TV action should
+    /// play. Single-season servers may expose episodes directly under a show,
+    /// so that shape remains playable instead of becoming a dead detail page.
+    func seriesPlayback(_ detail: ItemDetail) async -> PlayContext? {
+        switch detail.item.kind {
+        case "season":
+            return await playableEpisode(from: Self.orderedEpisodeCandidates(detail.children ?? []))
+        case "show":
+            let children = detail.children ?? []
+            let seasons = Self.orderedSeasonCandidates(children)
+            if seasons.isEmpty {
+                return await playableEpisode(from: Self.orderedEpisodeCandidates(children))
+            }
+            for season in seasons {
+                guard let seasonDetail = try? await itemDetail(season.id) else { continue }
+                if let target = await playableEpisode(
+                    from: Self.orderedEpisodeCandidates(seasonDetail.children ?? [])
+                ) {
+                    return target
+                }
+            }
+            return nil
+        default:
+            return nil
+        }
+    }
+
+    static func orderedEpisodeCandidates(_ items: [Item]) -> [Item] {
+        let episodes = items.filter { $0.kind == "episode" }
+        let inProgress = episodes.filter {
+            $0.watch?.watched != true && ($0.watch?.positionMs ?? 0) > 3_000
+        }
+        let unwatched = episodes.filter {
+            $0.watch?.watched != true && ($0.watch?.positionMs ?? 0) <= 3_000
+        }
+        let watched = episodes.filter { $0.watch?.watched == true }
+        return inProgress + unwatched + watched
+    }
+
+    static func orderedSeasonCandidates(_ items: [Item]) -> [Item] {
+        let seasons = items.filter { $0.kind == "season" }
+        let inProgress = seasons.filter {
+            guard let rollup = $0.rollup, rollup.leaves > 0 else { return false }
+            return rollup.watched > 0 && rollup.watched < rollup.leaves
+        }
+        let notStarted = seasons.filter { ($0.rollup?.watched ?? 0) == 0 }
+        let completed = seasons.filter { !inProgress.contains($0) && !notStarted.contains($0) }
+        return inProgress + notStarted + completed
+    }
+
+    static func resumableStartMs(positionMs: Int, durationMs: Int?) -> Int {
+        guard positionMs > 3_000 else { return 0 }
+        if let durationMs, durationMs > 0, Double(positionMs) > Double(durationMs) * 0.95 {
+            return 0
+        }
+        return positionMs
+    }
+
+    private func playableEpisode(from episodes: [Item]) async -> PlayContext? {
+        for episode in episodes {
+            guard let detail = try? await itemDetail(episode.id),
+                  let file = detail.files?.first else { continue }
+            let playable = detail.item
+            let durationMs = file.durationMs ?? playable.runtimeMs ?? episode.runtimeMs ?? 0
+            let positionMs = playable.watch?.positionMs ?? episode.watch?.positionMs ?? 0
+            return PlayContext(
+                itemId: playable.id,
+                fileId: file.id,
+                startMs: Self.resumableStartMs(positionMs: positionMs, durationMs: durationMs),
+                durationMs: durationMs,
+                title: playable.title,
+                subtitle: nextEpisodeSubtitle(playable),
+                year: playable.year,
+                overview: playable.overview
+            )
+        }
+        return nil
+    }
+
     func setWatched(itemId: Int, watched: Bool) async throws {
         _ = try await requireAPI().setWatched(itemId: itemId, watched: watched)
     }

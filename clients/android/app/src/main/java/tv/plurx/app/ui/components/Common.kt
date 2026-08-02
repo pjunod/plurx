@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -34,6 +35,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusProperties
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
@@ -191,9 +195,13 @@ fun MediaRow(
     posterWidth: Dp = 128.dp,
     resolutionPlacement: PosterResolutionPlacement = PosterResolutionPlacement.ArtworkOverlay,
     onViewAll: (() -> Unit)? = null,
+    rowFocusRequester: FocusRequester? = null,
+    previousRowFocusRequester: FocusRequester? = null,
+    nextRowFocusRequester: FocusRequester? = null,
     onOpen: (Item) -> Unit,
 ) {
     if (items.isEmpty()) return
+    val viewAllFocusRequester = remember { FocusRequester() }
     Column(Modifier.padding(vertical = 10.dp)) {
         androidx.compose.foundation.layout.Row(
             Modifier.fillMaxWidth().padding(start = 20.dp, end = 12.dp, bottom = 10.dp),
@@ -206,6 +214,11 @@ fun MediaRow(
                     color = Accent,
                     style = MaterialTheme.typography.labelLarge,
                     modifier = Modifier
+                        .focusRequester(viewAllFocusRequester)
+                        .focusProperties {
+                            if (previousRowFocusRequester != null) up = previousRowFocusRequester
+                            if (rowFocusRequester != null) down = rowFocusRequester
+                        }
                         .tvFocusRing(MaterialTheme.shapes.small)
                         .clickable(onClick = onViewAll)
                         .padding(8.dp),
@@ -216,8 +229,24 @@ fun MediaRow(
             contentPadding = PaddingValues(horizontal = 20.dp),
             horizontalArrangement = Arrangement.spacedBy(14.dp),
         ) {
-            items(items, key = { it.id }) { item ->
-                PosterCard(item, width = posterWidth, resolutionPlacement = resolutionPlacement) { onOpen(item) }
+            itemsIndexed(items, key = { _, item -> item.id }) { index, item ->
+                var cardModifier = Modifier.focusProperties {
+                    if (onViewAll != null) {
+                        up = viewAllFocusRequester
+                    } else if (previousRowFocusRequester != null) {
+                        up = previousRowFocusRequester
+                    }
+                    if (nextRowFocusRequester != null) down = nextRowFocusRequester
+                }
+                if (index == 0 && rowFocusRequester != null) {
+                    cardModifier = cardModifier.focusRequester(rowFocusRequester)
+                }
+                PosterCard(
+                    item,
+                    modifier = cardModifier,
+                    width = posterWidth,
+                    resolutionPlacement = resolutionPlacement,
+                ) { onOpen(item) }
             }
         }
     }

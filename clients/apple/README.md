@@ -100,13 +100,17 @@ wait for the choice instead of failing underneath the prompt. If access was
 denied, re-enable plurx under **Settings → Privacy & Security → Local Network**.
 
 Both targets share everything under `Sources/`; `project.yml` is the single place
-that defines them (bundle id `tv.plurx.app`, deployment target 17.0).
+that defines them (bundle id `tv.plurx.app`, deployment target 17.0). The native
+subtitle design, deployment record, and remaining physical Dolby Vision failure
+are documented in
+[`docs/APPLE-NATIVE-SUBTITLES-HANDOFF.md`](../../docs/APPLE-NATIVE-SUBTITLES-HANDOFF.md).
 
 ## Test
 
-The iOS and tvOS schemes each run the same six unit tests. They cover origin
+The iOS and tvOS schemes run the shared XCTest source. Coverage includes origin
 and Bonjour URL normalization, authenticated media URLs, bearer headers, HLS
-request semantics, and the playback duration passed into progress reporting.
+request semantics, playback duration and progress, automatic subtitle
+selection, and in-place AVPlayer media selection.
 
 ```bash
 cd clients/apple

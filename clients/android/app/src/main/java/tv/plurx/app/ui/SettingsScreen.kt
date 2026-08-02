@@ -26,6 +26,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import tv.plurx.app.BuildConfig
 import tv.plurx.app.data.Appearance
 import tv.plurx.app.data.HomeGrouping
 import tv.plurx.app.data.PlaybackQuality
@@ -44,6 +45,9 @@ private val LANGS = listOf(
     "chi" to "Chinese", "rus" to "Russian", "hin" to "Hindi", "ara" to "Arabic",
 )
 private val SUB_LANGS = listOf("off" to "Off") + LANGS
+
+internal fun appVersionLabel(versionName: String, versionCode: Int): String =
+    "$versionName ($versionCode)"
 
 @Composable
 fun SettingsScreen(vm: AppViewModel, onBack: () -> Unit) {
@@ -111,6 +115,17 @@ fun SettingsScreen(vm: AppViewModel, onBack: () -> Unit) {
                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     TvOutlinedButton(onClick = vm::logout) { Text("Sign out") }
                     TvOutlinedButton(onClick = vm::changeServer) { Text("Change server") }
+                }
+            }
+
+            SettingsSection("About", null) {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                    Text("App version", style = MaterialTheme.typography.bodyLarge)
+                    Text(
+                        appVersionLabel(BuildConfig.VERSION_NAME, BuildConfig.VERSION_CODE),
+                        color = Muted,
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
                 }
             }
         }

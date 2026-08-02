@@ -257,6 +257,33 @@ struct TVMediaCardButtonStyle: ButtonStyle {
 }
 #endif
 
+#if os(iOS)
+/// Full-width touch actions own their complete shape. The system bordered
+/// styles add horizontal chrome outside an already-flexible label, which can
+/// paint past a compact detail column's trailing inset.
+struct IOSFullWidthActionButtonStyle: ButtonStyle {
+    let prominent: Bool
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .foregroundStyle(prominent ? Color.white : Palette.onBg.opacity(0.7))
+            .frame(maxWidth: .infinity, minHeight: 24)
+            .padding(.vertical, 12)
+            .background(
+                prominent ? Palette.accent : Palette.surfaceHi,
+                in: Capsule()
+            )
+            .overlay {
+                if !prominent {
+                    Capsule().stroke(Palette.outline, lineWidth: 1)
+                }
+            }
+            .contentShape(Capsule())
+            .opacity(configuration.isPressed ? 0.76 : 1)
+    }
+}
+#endif
+
 extension View {
     /// Poster/link focus treatment: the tvOS "card" lift on focus, a plain
     /// (untinted) button on touch platforms.

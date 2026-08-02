@@ -15,7 +15,11 @@ enum PictureInPictureCommand: Equatable {
 @MainActor
 final class PictureInPictureController: NSObject, ObservableObject,
                                         @preconcurrency AVPictureInPictureControllerDelegate {
+    #if os(iOS)
     @Published private(set) var isSupported = AVPictureInPictureController.isPictureInPictureSupported()
+    #else
+    @Published private(set) var isSupported = false
+    #endif
     @Published private(set) var isPossible = false
     @Published private(set) var isActive = false
     @Published private(set) var errorMessage: String?
@@ -31,6 +35,7 @@ final class PictureInPictureController: NSObject, ObservableObject,
     }
 
     func attach(to playerLayer: AVPlayerLayer) {
+        #if os(iOS)
         guard self.playerLayer !== playerLayer || controller == nil else { return }
         detach()
         self.playerLayer = playerLayer
@@ -57,6 +62,7 @@ final class PictureInPictureController: NSObject, ObservableObject,
                 self?.isActive = controller.isPictureInPictureActive
             }
         }
+        #endif
     }
 
     func toggle() {

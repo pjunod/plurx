@@ -33,6 +33,18 @@ struct PlayerMetadataBadge: Equatable, Identifiable {
     var id: String { kind.rawValue }
 }
 
+enum PlayerMetadataBadgeMetrics {
+    static let rowSpacing: CGFloat = 6
+    static let contentSpacing: CGFloat = 4
+    static let horizontalPadding: CGFloat = 6
+    static let verticalPadding: CGFloat = 2
+    static let strokeWidth: CGFloat = 0.5
+
+    #if os(tvOS)
+    static let fontSize: CGFloat = 16
+    #endif
+}
+
 /// Full-screen Apple player with an explicit on-demand transport. AVPlayer
 /// sees a growing plurx HLS playlist as an EVENT stream while the server is
 /// producing it, so relying on the system overlay alone labels a movie LIVE
@@ -53,6 +65,11 @@ struct PlayerView: View {
     var year: Int? = nil
     var overview: String? = nil
     var onPlayNext: ((PlayContext) -> Void)?
+    /// Hands the owning detail screen the last on-screen position immediately.
+    /// The server progress write is intentionally best-effort and asynchronous;
+    /// without this handoff the still-present detail view keeps rendering the
+    /// resume point it loaded before playback began.
+    var onPlaybackStopped: ((Int) -> Void)?
 
     @StateObject private var controller = PlayerController()
     @StateObject private var pictureInPicture = PictureInPictureController()
@@ -169,8 +186,10 @@ struct PlayerView: View {
             #endif
         }
         .onDisappear {
+            let stoppedAt = controller.realPositionMs()
             pictureInPicture.stop()
             controller.stop()
+            onPlaybackStopped?(stoppedAt)
         }
         .task(id: autoHideGeneration) {
             guard Self.shouldAutoHideControls(
@@ -529,31 +548,39 @@ struct PlayerView: View {
             source: controller.decision?.source,
             audio: audio
         )
-        return HStack(spacing: 8) {
+        return HStack(spacing: PlayerMetadataBadgeMetrics.rowSpacing) {
             ForEach(badges) { badge in
-                HStack(spacing: 5) {
+                HStack(spacing: PlayerMetadataBadgeMetrics.contentSpacing) {
                     Image(systemName: badge.symbol)
+                        .imageScale(.small)
                     if let mark = badge.mark {
                         Text(mark)
-                            .fontWeight(.bold)
+                            .fontWeight(.semibold)
                     }
                 }
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .background(.black.opacity(0.38), in: Capsule())
+                .padding(.horizontal, PlayerMetadataBadgeMetrics.horizontalPadding)
+                .padding(.vertical, PlayerMetadataBadgeMetrics.verticalPadding)
+                .background(.black.opacity(0.32), in: Capsule())
                 .overlay {
-                    Capsule().stroke(.white.opacity(0.22), lineWidth: 0.5)
+                    Capsule().stroke(
+                        .white.opacity(0.18),
+                        lineWidth: PlayerMetadataBadgeMetrics.strokeWidth
+                    )
                 }
                 .accessibilityElement(children: .ignore)
                 .accessibilityLabel(badge.accessibilityLabel)
             }
         }
-            #if os(tvOS)
-            .font(.system(size: 19, design: .monospaced).weight(.medium))
-            #else
-            .font(.system(.caption, design: .monospaced).weight(.semibold))
-            #endif
-            .foregroundColor(.white.opacity(0.82))
+        #if os(tvOS)
+        .font(.system(
+            size: PlayerMetadataBadgeMetrics.fontSize,
+            weight: .medium,
+            design: .rounded
+        ))
+        #else
+        .font(.system(.caption2, design: .rounded).weight(.medium))
+        #endif
+        .foregroundColor(.white.opacity(0.78))
     }
 
     private var runtimeLabel: String? {
@@ -569,12 +596,12 @@ struct PlayerView: View {
 
     static func playbackBadges(source: SourceSummary?, audio: AudioTrack?) -> [PlayerMetadataBadge] {
         var badges: [PlayerMetadataBadge] = []
-        if let height = source?.height {
-            let label = height >= 2160 ? "4K" : "\(height)p"
+        if let label = resolutionLabel(width: source?.width, height: source?.height) {
+            let is4K = label == "4K"
             badges.append(PlayerMetadataBadge(
                 kind: .resolution,
-                symbol: height >= 2160 ? "4k.tv.fill" : "tv.fill",
-                mark: height >= 2160 ? nil : label.uppercased(),
+                symbol: is4K ? "4k.tv.fill" : "tv.fill",
+                mark: is4K ? nil : label.uppercased(),
                 accessibilityLabel: label
             ))
         }
@@ -590,7 +617,7 @@ struct PlayerView: View {
         if let audio, let sound = soundLabel(audio) {
             badges.append(PlayerMetadataBadge(
                 kind: .audio,
-                symbol: "speaker.wave.3.fill",
+                symbol: "waveform",
                 mark: sound.mark,
                 accessibilityLabel: sound.accessibilityLabel
             ))
@@ -1020,7 +1047,7 @@ struct PlayerView: View {
         var parts = [track.title, languageName(track.language), track.codec.uppercased()]
             .compactMap { $0 }
         if track.forced { parts.append("Forced") }
-        if !track.text { parts.append("Burn-in") }
+        if !track.isNativeHLS { parts.append("Burn-in") }
         return parts.joined(separator: " · ")
     }
 
@@ -1108,7 +1135,8 @@ private struct PlaybackStatsView: View {
         }
         if let subtitle = controller.selectedSubtitle,
            let track = controller.subtitles.first(where: { $0.index == subtitle }) {
-            row("Subtitles", (track.title ?? track.language?.uppercased() ?? "Track \(subtitle + 1)") + " · burned in")
+            let delivery = track.isNativeHLS ? "native WebVTT" : "burned in"
+            row("Subtitles", (track.title ?? track.language?.uppercased() ?? "Track \(subtitle + 1)") + " · \(delivery)")
         }
     }
 

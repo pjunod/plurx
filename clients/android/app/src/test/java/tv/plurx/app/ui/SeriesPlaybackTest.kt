@@ -43,6 +43,14 @@ class SeriesPlaybackTest {
         assertEquals(0L, resumableStartMs(96_000, 100_000))
     }
 
+    @Test
+    fun aShowWithEpisodesButNoSeasonNodesStillHasAPlayablePath() {
+        val episodes = listOf(episode(1), episode(2, positionMs = 90_000))
+
+        assertEquals(listOf(2L, 1L), directShowEpisodeCandidates(episodes).map { it.id })
+        assertEquals(emptyList<Item>(), directShowEpisodeCandidates(listOf(season(1, watched = 0, leaves = 8))))
+    }
+
     private fun episode(id: Long, positionMs: Long = 0L, watched: Boolean = false) = Item(
         id = id,
         kind = "episode",
