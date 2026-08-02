@@ -1099,10 +1099,15 @@ mod tests {
             sub("dvd_subtitle", "eng", "VobSub", false, false),
             sub("ass", "eng", "Styled Signs", false, false),
             sub("ssa", "eng", "Styled Dialogue", false, false),
+            // The MP4 case, and the common one: every WEB-DL carries these.
+            // `SubTrackDto.text` says true of them (they do have text to
+            // extract), which is exactly why `native` exists — the master
+            // must not carry a rendition this path cannot slice.
+            sub("mov_text", "eng", "MP4 Timed Text", false, false),
         ]);
         let master = master_playlist(&file, None);
         assert!(master.contains("subs/0/index.m3u8"));
-        for index in 1..=4 {
+        for index in 1..=5 {
             assert!(!master.contains(&format!("subs/{index}/index.m3u8")));
         }
     }

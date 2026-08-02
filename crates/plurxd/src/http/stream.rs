@@ -13,7 +13,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use plurx_core::domain::MediaFile;
 use plurx_core::playback::{self, Decision};
-use plurx_core::tracks::is_bitmap_subtitle;
+use plurx_core::tracks::{is_bitmap_subtitle, is_native_text_subtitle};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
@@ -241,9 +241,25 @@ pub struct SubTrackDto {
     pub title: Option<String>,
     pub default: bool,
     pub forced: bool,
-    /// Text subs convert to WebVTT for a selectable `<track>`; bitmap subs
-    /// (PGS/VobSub) can't and are only burnable via transcode.
+    /// **This track has text a client can be handed.** True for every
+    /// non-bitmap codec, so it answers exactly one question: can the server
+    /// extract a WebVTT sidecar for it (`GET /files/{id}/subs/{index}.vtt`,
+    /// a `<track>` on a direct/remux `<video>`)? Bitmap subs (PGS/VobSub) are
+    /// pictures, have nothing to extract, and can only be burned in.
+    ///
+    /// **`text` is not permission to ask for a native HLS rendition** — see
+    /// `native`. A `mov_text` or ASS/SSA track is `text: true, native: false`:
+    /// the sidecar works, the rendition does not.
     pub text: bool,
+    /// **This track can be published as a native HLS subtitle rendition.**
+    /// True only for the codecs the rendition path actually accepts
+    /// (`plurx_core::tracks::is_native_text_subtitle`: `subrip|srt|webvtt|
+    /// vtt`) — the same predicate that puts an `EXT-X-MEDIA` line in the
+    /// master and that `POST /files/{id}/hls/sessions` enforces on an
+    /// explicit `subtitle` pick. Anything else (`mov_text`, ASS/SSA, bitmap)
+    /// is absent from the master and 400s if asked for by index, so a client
+    /// choosing a session-mode subtitle must gate on `native`, not on `text`.
+    pub native: bool,
 }
 
 /// A compact description of the source file's video, for the stats overlay's
@@ -417,6 +433,7 @@ fn sub_tracks(file: &MediaFile) -> Vec<SubTrackDto> {
             default: s.default,
             forced: s.forced,
             text: !is_bitmap_subtitle(&s.codec),
+            native: is_native_text_subtitle(&s.codec),
         })
         .collect()
 }
@@ -1561,5 +1578,86 @@ mod tests {
                 .is_none(),
             "a null probe must stay null — the repair job keys on it"
         );
+    }
+
+    /// `text` and `native` answer different questions and a client that reads
+    /// one for the other gets a 400 or an empty subtitle menu. Three classes
+    /// pin the whole contract:
+    ///
+    /// * `subrip` — extractable *and* publishable as an HLS rendition.
+    /// * `mov_text` — extractable only. Every MP4 WEB-DL carries these, so
+    ///   this is the row that matters: `text: true` is what lets a client
+    ///   offer the sidecar, and `native: false` is what stops it asking for a
+    ///   rendition `master_playlist` never wrote and `create_session` refuses.
+    /// * `hdmv_pgs_subtitle` — a picture: neither. Burn-in only.
+    ///
+    /// ASS/SSA rides with `mov_text` for the opposite reason (WebVTT would
+    /// throw away its authored typography), and lands in the same place.
+    #[test]
+    fn sub_tracks_separate_extractable_text_from_publishable_renditions() {
+        fn stream(index: i64, codec: &str) -> plurx_core::domain::SubtitleStream {
+            plurx_core::domain::SubtitleStream {
+                index,
+                codec: codec.into(),
+                language: Some("eng".into()),
+                ..Default::default()
+            }
+        }
+        let file = MediaFile {
+            id: 1,
+            item_id: 1,
+            path: "/media/heat.mp4".into(),
+            size: 1,
+            mtime: 1,
+            duration_ms: None,
+            container: Some("mp4".into()),
+            video_codec: Some("hevc".into()),
+            video_profile: None,
+            width: None,
+            height: None,
+            bit_depth: None,
+            hdr: None,
+            hdr_format: None,
+            bitrate: None,
+            audio_streams: vec![],
+            subtitle_streams: vec![
+                stream(0, "subrip"),
+                stream(1, "mov_text"),
+                stream(2, "ass"),
+                stream(3, "ssa"),
+                stream(4, "hdmv_pgs_subtitle"),
+            ],
+            scanned_at: 0,
+            audio_offset_ms: 0,
+            probed: true,
+        };
+
+        let tracks = sub_tracks(&file);
+        let flags: Vec<(bool, bool)> = tracks.iter().map(|t| (t.text, t.native)).collect();
+        assert_eq!(
+            flags,
+            vec![
+                (true, true),   // subrip: sidecar and rendition
+                (true, false),  // mov_text: sidecar only
+                (true, false),  // ass: sidecar only
+                (true, false),  // ssa: sidecar only
+                (false, false), // PGS: burn-in only
+            ]
+        );
+        // `native` is exactly the predicate the rendition path gates on, so a
+        // track the DTO calls native is a track the master will carry.
+        for track in &tracks {
+            assert_eq!(
+                track.native,
+                plurx_core::tracks::is_native_text_subtitle(&track.codec),
+                "{}",
+                track.codec
+            );
+            assert!(
+                !track.native || track.text,
+                "a publishable rendition is always extractable text: {}",
+                track.codec
+            );
+        }
     }
 }

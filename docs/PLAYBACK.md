@@ -144,6 +144,30 @@ it engaged — and renders one of three badge states:
 An older client never reads the field; a newer one treats an absent field as
 "unknown" and falls back to the source-only chip. Nothing breaks either way.
 
+## Subtitles — two different questions, two different flags
+
+Every subtitle in `/decision` carries `text` and `native`, and they are not
+the same claim. A client that reads one for the other either offers a track
+the server will refuse, or hides one it would happily serve.
+
+| Flag | The question it answers | True when | The route it unlocks |
+|---|---|---|---|
+| `text` | Is there text here at all? | the codec isn't a bitmap (`is_bitmap_subtitle`) | `GET /files/{id}/subs/{index}.vtt` — the extracted WebVTT sidecar, and a `<track>` on a direct/remux `<video>` |
+| `native` | Can this be an HLS rendition? | `is_native_text_subtitle`: `subrip \| srt \| webvtt \| vtt` | an `EXT-X-MEDIA` line in the native master, and an accepted `subtitle` index on `POST /files/{id}/hls/sessions` |
+
+`native` implies `text`; the reverse is false, and the gap is the whole point
+of having two flags. **`mov_text`** — the timed text every MP4 WEB-DL carries
+— and **ASS/SSA** are `text: true, native: false`: the sidecar extracts fine,
+but the rendition path would have to convert them to WebVTT while slicing
+segments, and for ASS/SSA that conversion discards the positioning and
+typography the release was authored with. So they are absent from the native
+master, and asking for one by index is a 400 (`"the selected subtitle
+requires burn-in"`) rather than a rendition that silently plays wrong.
+
+The practical rule for a client: **gate a session-mode subtitle pick on
+`native`, and offer everything else with `text` through the sidecar.** A
+bitmap track (`text: false`) has neither route and only ever burns in.
+
 ## Delivery — the client's transport choice
 
 A verdict names *what* to send; the client still has to pick *how*, because a

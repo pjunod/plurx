@@ -4091,6 +4091,132 @@ mod tests {
         );
     }
 
+    /// `/decision` used to promise more than the server would accept: a
+    /// `mov_text` track came back `text: true` and nothing else, so a client
+    /// offered it, asked for it as a native rendition, and got a 400 from a
+    /// master that never listed it. `native` closes that gap on the wire —
+    /// this walks the whole loop on one file that carries all three classes.
+    #[tokio::test]
+    async fn decision_marks_which_subtitles_can_be_native_hls_renditions() {
+        let (app, state) = test_state();
+        let admin = setup_admin(&app).await;
+        let s = seed_content(&state).await;
+
+        let dir = std::env::temp_dir().join(format!("plurx-subs-dto-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("WEB-DL.mp4");
+        std::fs::write(&path, b"\x00\x00\x00\x18ftypmp42 placeholder").expect("write");
+        let sub = |index: i64, codec: &str| plurx_core::domain::SubtitleStream {
+            index,
+            codec: codec.into(),
+            language: Some("eng".into()),
+            ..Default::default()
+        };
+        let probe = plurx_core::domain::ProbeResult {
+            duration_ms: Some(600_000),
+            container: Some("mp4".into()),
+            video_codec: Some("h264".into()),
+            width: Some(3840),
+            height: Some(2160),
+            audio_streams: vec![plurx_core::domain::AudioStream {
+                index: 0,
+                codec: "aac".into(),
+                channels: Some(2),
+                default: true,
+                ..Default::default()
+            }],
+            subtitle_streams: vec![
+                sub(0, "subrip"),
+                sub(1, "mov_text"),
+                sub(2, "ass"),
+                sub(3, "hdmv_pgs_subtitle"),
+            ],
+            ..Default::default()
+        };
+        let file = state
+            .store
+            .upsert_file(s.movie, &path.to_string_lossy(), 88, 1, &probe)
+            .await
+            .expect("file");
+
+        let (status, body) = call(
+            &app,
+            get(
+                &format!(
+                    "/api/v1/files/{file}/decision?vcodec=h264&acodec=aac&container=mp4&hdr=0"
+                ),
+                Some(&admin),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let flags: Vec<(&str, bool, bool)> = body["subtitles"]
+            .as_array()
+            .expect("subtitles")
+            .iter()
+            .map(|t| {
+                (
+                    t["codec"].as_str().expect("codec"),
+                    t["text"].as_bool().expect("text"),
+                    t["native"].as_bool().expect("native"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            flags,
+            vec![
+                ("subrip", true, true),
+                ("mov_text", true, false),
+                ("ass", true, false),
+                ("hdmv_pgs_subtitle", false, false),
+            ],
+            "{body}"
+        );
+
+        // The promise `native: false` makes, kept: asking for one of these by
+        // index is refused before a session is ever spawned.
+        for index in [1, 2, 3] {
+            let (status, why) = call(
+                &app,
+                post(
+                    &format!("/api/v1/files/{file}/hls/sessions"),
+                    Some(&admin),
+                    json!({
+                        "playback_id": format!("non-native-{index}"),
+                        "request_id": format!("non-native-attempt-{index}"),
+                        "native_subtitles": true,
+                        "subtitle": index
+                    }),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "index {index}: {why}");
+        }
+
+        // And the promise `text: true` makes: the sidecar route accepts
+        // `mov_text` and ASS (it only turns bitmap tracks away), so these
+        // tracks are still watchable — that is the path a client uses for
+        // them. The placeholder MP4 has no real streams, so ffmpeg fails and
+        // the answer is a 500; a bitmap track never gets that far.
+        for (index, expected) in [
+            (1, StatusCode::INTERNAL_SERVER_ERROR),
+            (2, StatusCode::INTERNAL_SERVER_ERROR),
+            (3, StatusCode::BAD_REQUEST),
+        ] {
+            assert_eq!(
+                status_of(
+                    &app,
+                    get_q(&format!(
+                        "/api/v1/files/{file}/subs/{index}.vtt?token={admin}"
+                    )),
+                )
+                .await,
+                expected,
+                "sidecar for stream {index}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn plex_write_image_and_part_paths() {
         let (app, state) = test_state();

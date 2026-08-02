@@ -41,6 +41,51 @@ fn extractions() -> &'static Extractions {
     EXTRACTIONS.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
 }
 
+/// What a request should do about one cache key, decided under the registry
+/// lock. See [`enlist`] for why that lock is the only place it can be decided.
+enum Flight {
+    /// The sidecar is already on disk. Nothing to run, nothing to wait for.
+    Published,
+    /// Someone else is extracting this key; wait on their result.
+    Join(Arc<Extraction>),
+    /// This request registered the key and owes everyone an extraction.
+    Own(Arc<Extraction>),
+}
+
+/// Decide, atomically, whether a cold request joins an extraction or starts
+/// one.
+///
+/// The unlocked cache read that precedes this is only a snapshot, and an
+/// extraction that finishes between that read and this call leaves *nothing
+/// to join*: the owner renames its sidecar into place and then drops its
+/// registry entry, so a request landing in that window sees an absent file
+/// and an absent flight, and would start a second run of work already done —
+/// which is precisely the extraction a deduplicated request must never
+/// perform.
+///
+/// The registry lock is the only ordering point that closes it. Because the
+/// rename happens-before the entry is removed, and the removal happens-before
+/// this lock is acquired, a key with no flight registered here is a key whose
+/// sidecar is either visible on disk right now or genuinely absent. So the
+/// cache is read again, under the lock, before anyone is allowed to own the
+/// work. (A failed extraction leaves neither, and the next request correctly
+/// retries it.)
+async fn enlist(cached: &Path) -> Flight {
+    let mut active = extractions().lock().await;
+    if let Some(flight) = active.get(cached) {
+        return Flight::Join(Arc::clone(flight));
+    }
+    if tokio::fs::metadata(cached).await.is_ok() {
+        return Flight::Published;
+    }
+    let flight = Arc::new(Extraction {
+        result: tokio::sync::Mutex::new(None),
+        ready: tokio::sync::Notify::new(),
+    });
+    active.insert(cached.to_owned(), Arc::clone(&flight));
+    Flight::Own(flight)
+}
+
 /// Return a cached WebVTT sidecar, extracting it atomically on a miss.
 pub async fn ensure_vtt(dir: &Path, file: &MediaFile, index: i64) -> Result<PathBuf, String> {
     ensure_vtt_with(dir, file, index, |tmp, file, index| async move {
@@ -53,6 +98,11 @@ pub async fn ensure_vtt(dir: &Path, file: &MediaFile, index: i64) -> Result<Path
 /// task, rather than in the HTTP request awaiting it: if AVPlayer times out or
 /// a client cancels, ffmpeg still publishes the completed sidecar and every
 /// concurrent waiter observes that same result.
+///
+/// The cache read below is a fast path, not the decision — the decision is
+/// [`enlist`]'s, because only the registry lock orders "is it on disk?"
+/// against "is someone extracting it?". Reading the cache here and acting on
+/// it later is what lets a request start work that has already finished.
 async fn ensure_vtt_with<F, Fut>(
     dir: &Path,
     file: &MediaFile,
@@ -71,18 +121,10 @@ where
     tokio::fs::create_dir_all(dir)
         .await
         .map_err(|e| format!("creating subtitle cache: {e}"))?;
-    let (flight, owner) = {
-        let mut active = extractions().lock().await;
-        if let Some(flight) = active.get(&cached) {
-            (Arc::clone(flight), false)
-        } else {
-            let flight = Arc::new(Extraction {
-                result: tokio::sync::Mutex::new(None),
-                ready: tokio::sync::Notify::new(),
-            });
-            active.insert(cached.clone(), Arc::clone(&flight));
-            (flight, true)
-        }
+    let (flight, owner) = match enlist(&cached).await {
+        Flight::Published => return Ok(cached),
+        Flight::Join(flight) => (flight, false),
+        Flight::Own(flight) => (flight, true),
     };
 
     if owner {
@@ -308,5 +350,45 @@ mod tests {
                 "a completed extraction must not remain unpublished"
             );
         }
+    }
+
+    /// The interleaving the test above only hits by luck, stated directly.
+    ///
+    /// A request reads the cache, misses, and reaches the registry a moment
+    /// later — by which time the owner has renamed its sidecar into place and
+    /// retired its entry. There is no flight left to join, and the stale miss
+    /// says nothing is there. Owning a second extraction at that point is the
+    /// bug; [`enlist`] must read the cache again under the lock and hand back
+    /// the published answer.
+    #[tokio::test]
+    async fn a_sidecar_published_after_the_cache_read_is_joined_not_re_extracted() {
+        let dir = tempfile::tempdir().expect("cache");
+        let file = media_file(dir.path().join("source.mkv"));
+        let cached = vtt_path(dir.path(), &file, 0);
+        tokio::fs::write(&cached, "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhello\n")
+            .await
+            .expect("publish");
+
+        // Exactly the state a request finds in that window: sidecar on disk,
+        // registry empty for this key.
+        assert!(
+            !extractions().lock().await.contains_key(&cached),
+            "no flight is registered for a retired extraction"
+        );
+        assert!(
+            matches!(enlist(&cached).await, Flight::Published),
+            "a published sidecar must never be re-owned"
+        );
+        assert!(
+            !extractions().lock().await.contains_key(&cached),
+            "and deciding must not leave a flight behind"
+        );
+
+        // The other two arms still work: an unpublished key is owned once and
+        // joined thereafter.
+        let missing = vtt_path(dir.path(), &file, 1);
+        assert!(matches!(enlist(&missing).await, Flight::Own(_)));
+        assert!(matches!(enlist(&missing).await, Flight::Join(_)));
+        extractions().lock().await.remove(&missing);
     }
 }
