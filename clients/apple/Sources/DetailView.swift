@@ -265,6 +265,7 @@ enum TVPlayableDetailMetrics {
 struct DetailView: View {
     #if os(tvOS)
     private enum TVDetailFocus: Hashable { case primaryAction }
+    @Environment(\.tvShowHome) private var showHome
     #endif
 
     @EnvironmentObject var model: AppModel
@@ -299,6 +300,11 @@ struct DetailView: View {
             }
         }
         .background(Palette.bg.ignoresSafeArea())
+        #if os(tvOS)
+        .safeAreaInset(edge: .top, spacing: 0) {
+            tvHomeNavigation
+        }
+        #endif
         #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
         #endif
@@ -479,6 +485,25 @@ struct DetailView: View {
     }
 
     #if os(tvOS)
+    private var tvHomeNavigation: some View {
+        HStack {
+            Button(action: showHome) {
+                Label("Home", systemImage: "house.fill")
+                    .font(.system(.body, design: .monospaced).weight(.semibold))
+            }
+            .buttonStyle(TVReadableButtonStyle(prominent: false))
+            .focusEffectDisabled()
+            .accessibilityHint("Return to the main Home screen")
+
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 64)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Palette.bg.opacity(0.94))
+        .tvNavigationFocusSection()
+    }
+
     private func tvPlayableContent(_ detail: ItemDetail) -> some View {
         let item = detail.item
         let ancestors = detail.ancestors ?? []

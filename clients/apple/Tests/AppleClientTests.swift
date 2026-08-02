@@ -127,6 +127,20 @@ final class AppleClientTests: XCTestCase {
         XCTAssertEqual(updated.item.watch?.watched, true)
     }
 
+    #if os(tvOS)
+    @MainActor
+    func testTVHomeActionClearsAnArbitraryDetailTrailAndSelectsHome() {
+        let navigation = TVNavigationCoordinator()
+        navigation.selectedTab = .libraries
+        navigation.path = [.item(10), .item(20), .item(30)]
+
+        navigation.showHome()
+
+        XCTAssertEqual(navigation.selectedTab, .home)
+        XCTAssertTrue(navigation.path.isEmpty)
+    }
+    #endif
+
     @MainActor
     func testTVSeriesPrimaryActionPrefersProgressAndSupportsSingleSeasonShapes() {
         var first = Item(id: 1, kind: "episode", title: "First")

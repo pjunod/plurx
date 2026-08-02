@@ -1,7 +1,44 @@
 import SwiftUI
 
+#if os(tvOS)
+enum TVTopLevelTab: Hashable {
+    case home
+    case libraries
+    case search
+    case settings
+}
+
+@MainActor
+final class TVNavigationCoordinator: ObservableObject {
+    @Published var path: [Route] = []
+    @Published var selectedTab: TVTopLevelTab = .home
+
+    /// Return to a known root instead of depending on how the current detail
+    /// was reached. A breadcrumb-heavy show/season/episode trail therefore
+    /// exits in the same single action as a movie opened directly from Home.
+    func showHome() {
+        selectedTab = .home
+        path = []
+    }
+}
+
+private struct TVShowHomeActionKey: EnvironmentKey {
+    static let defaultValue: () -> Void = {}
+}
+
+extension EnvironmentValues {
+    var tvShowHome: () -> Void {
+        get { self[TVShowHomeActionKey.self] }
+        set { self[TVShowHomeActionKey.self] = newValue }
+    }
+}
+#endif
+
 struct HomeView: View {
     @EnvironmentObject var model: AppModel
+    #if os(tvOS)
+    @StateObject private var tvNavigation = TVNavigationCoordinator()
+    #endif
 
     var body: some View {
         #if os(iOS)
@@ -14,10 +51,11 @@ struct HomeView: View {
         // Detail destinations replace the entire tab shell on television.
         // That keeps the Home tab from remaining visibly selected while an
         // episode or movie detail is on screen.
-        NavigationStack {
+        NavigationStack(path: $tvNavigation.path) {
             tvTabs
                 .appDestinations()
         }
+        .environment(\.tvShowHome, tvNavigation.showHome)
         #endif
     }
 
@@ -52,18 +90,22 @@ struct HomeView: View {
     }
     #else
     private var tvTabs: some View {
-        TabView {
+        TabView(selection: $tvNavigation.selectedTab) {
             HomeDashboard()
                 .tabItem { Label("Home", systemImage: "house") }
+                .tag(TVTopLevelTab.home)
 
             LibrariesDashboard()
                 .tabItem { Label("Libraries", systemImage: "rectangle.stack") }
+                .tag(TVTopLevelTab.libraries)
 
             SearchView()
                 .tabItem { Label("Search", systemImage: "magnifyingglass") }
+                .tag(TVTopLevelTab.search)
 
             SettingsView()
                 .tabItem { Label("Settings", systemImage: "gearshape") }
+                .tag(TVTopLevelTab.settings)
         }
         .tint(Palette.accent)
         .task { if model.homeLoading { await model.loadHome() } }
