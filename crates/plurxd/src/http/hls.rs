@@ -540,14 +540,6 @@ fn subtitle_characteristics(track: &SubtitleStream) -> Option<&'static str> {
         )
 }
 
-fn video_range(file: &MediaFile) -> &'static str {
-    match file.hdr.as_deref() {
-        Some("dolby_vision" | "hdr10") => "PQ",
-        Some("hlg") => "HLG",
-        _ => "SDR",
-    }
-}
-
 fn master_playlist(file: &MediaFile, selected: Option<i64>, primary_codecs: &str) -> String {
     let native: Vec<(usize, &SubtitleStream)> = file
         .subtitle_streams
@@ -597,10 +589,6 @@ fn master_playlist(file: &MediaFile, selected: Option<i64>, primary_codecs: &str
     out.push_str(&format!(
         "#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},CODECS=\"{primary_codecs}\""
     ));
-    if let (Some(width), Some(height)) = (file.width, file.height) {
-        out.push_str(&format!(",RESOLUTION={width}x{height}"));
-    }
-    out.push_str(&format!(",VIDEO-RANGE={}", video_range(file)));
     if !native.is_empty() {
         out.push_str(",SUBTITLES=\"subs\"");
     }
@@ -937,7 +925,7 @@ mod tests {
         let master = master_playlist(&file, Some(2), "dvh1,ec-3");
 
         assert!(master.contains(
-            "#EXT-X-STREAM-INF:BANDWIDTH=40000000,CODECS=\"dvh1,ec-3\",RESOLUTION=3840x2160,VIDEO-RANGE=PQ,SUBTITLES=\"subs\""
+            "#EXT-X-STREAM-INF:BANDWIDTH=40000000,CODECS=\"dvh1,ec-3\",SUBTITLES=\"subs\""
         ));
         assert!(!master.contains("#EXT-X-INDEPENDENT-SEGMENTS"));
         assert!(master.contains("NAME=\"English · Forced\",LANGUAGE=\"en\",DEFAULT=YES,AUTOSELECT=YES,FORCED=YES,URI=\"subs/2/index.m3u8\""));
