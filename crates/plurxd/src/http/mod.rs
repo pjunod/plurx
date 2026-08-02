@@ -133,7 +133,7 @@ pub fn router(state: AppState) -> Router {
             get(hls::subtitle_playlist),
         )
         .route(
-            "/hls/{session}/subs/{index}/subtitle.vtt",
+            "/hls/{session}/subs/{index}/{segment}",
             get(hls::subtitle_vtt),
         )
         // Before the `{segment}` catch-all in intent, though the router
@@ -3877,6 +3877,48 @@ mod tests {
         let (app, state) = test_state();
         let admin = setup_admin(&app).await;
         let s = seed_content(&state).await;
+        // This endpoint now mirrors the live video playlist. Replace the
+        // general router fixture's placeholder bytes with a tiny real source
+        // so the copy segmenter can publish that playlist.
+        let media = state
+            .store
+            .get_file(s.file)
+            .await
+            .expect("file read")
+            .expect("file");
+        let made = std::process::Command::new(crate::ffmpeg::ffmpeg_bin())
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=64x64:r=10:d=16",
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=channel_layout=stereo:sample_rate=48000",
+                "-t",
+                "16",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-g",
+                "20",
+                "-c:a",
+                "aac",
+            ])
+            .arg(&media.path)
+            .output()
+            .expect("spawn ffmpeg");
+        assert!(
+            made.status.success(),
+            "HLS fixture encode failed: {}",
+            String::from_utf8_lossy(&made.stderr)
+        );
 
         // Unknown session → 404 for both playlist and segment.
         assert_eq!(
@@ -3942,7 +3984,16 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        assert!(String::from_utf8_lossy(&subtitle_playlist).contains("#EXTINF:8990.000"));
+        let subtitle_playlist = String::from_utf8(subtitle_playlist).expect("playlist utf8");
+        assert!(
+            subtitle_playlist.contains("#EXT-X-PLAYLIST-TYPE:EVENT"),
+            "{subtitle_playlist}"
+        );
+        assert!(
+            subtitle_playlist.contains("seg00000.vtt"),
+            "{subtitle_playlist}"
+        );
+        assert!(subtitle_playlist.contains("#EXT-X-ENDLIST"));
 
         // Seed the extraction cache so the handler test can focus on the
         // capability and timeline mapping rather than the placeholder MP4.
@@ -3964,7 +4015,7 @@ mod tests {
         .expect("cached VTT");
         let (status, shifted) = body_of(
             &app,
-            get_q(&format!("/api/v1/hls/{session}/subs/0/subtitle.vtt")),
+            get_q(&format!("/api/v1/hls/{session}/subs/0/seg00000.vtt")),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -3973,10 +4024,7 @@ mod tests {
             shifted.contains("00:00:00.000 --> 00:00:01.000"),
             "{shifted}"
         );
-        assert!(
-            shifted.contains("00:00:05.000 --> 00:00:06.000"),
-            "{shifted}"
-        );
+        assert!(shifted.contains("X-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:0"));
 
         // The old file-id route is still bearer protected; only URLs rooted
         // in the live session capability are headerless.
@@ -3988,6 +4036,14 @@ mod tests {
             status_of(
                 &app,
                 get_q("/api/v1/hls/not-the-capability/subs/0/index.m3u8")
+            )
+            .await,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            status_of(
+                &app,
+                get_q(&format!("/api/v1/hls/{session}/subs/0/not-a-segment.vtt"))
             )
             .await,
             StatusCode::NOT_FOUND
