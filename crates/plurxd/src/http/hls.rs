@@ -557,7 +557,15 @@ fn master_playlist(
         // The query describes this player's selection. No selected index is
         // an explicit Off, not permission to resurrect a foreign-language
         // container default behind the client's back.
-        let default = selected.is_some_and(|pick| pick == *index as i64);
+        let forced = track_is_forced(track);
+        // A forced rendition is a narrow set of cues the player may use when
+        // its language matches the presentation. Apple's authoring examples
+        // deliberately keep those renditions DEFAULT=NO: DEFAULT=YES means
+        // "play this whole selection absent any user choice", which is not
+        // the same thing as FORCED=YES and makes AVPlayer reject or repeatedly
+        // reload some subtitle groups. The Apple client explicitly selects
+        // its preferred media option once the item exposes the legible group.
+        let default = !forced && selected.is_some_and(|pick| pick == *index as i64);
         let characteristics = subtitle_characteristics(track);
         // RFC 8216 requires every AUTOSELECT=YES member of a rendition group
         // to have a unique LANGUAGE/ASSOC-LANGUAGE/FORCED/CHARACTERISTICS
@@ -568,7 +576,7 @@ fn master_playlist(
             .iter()
             .filter(|(_, other)| {
                 language_tag(other.language.as_deref()) == language_tag(track.language.as_deref())
-                    && track_is_forced(other) == track_is_forced(track)
+                    && track_is_forced(other) == forced
                     && subtitle_characteristics(other) == characteristics
             })
             .count();
@@ -582,7 +590,7 @@ fn master_playlist(
             quoted(language_tag(track.language.as_deref())),
             if default { "YES" } else { "NO" },
             if autoselect { "YES" } else { "NO" },
-            if track_is_forced(track) { "YES" } else { "NO" },
+            if forced { "YES" } else { "NO" },
             characteristics,
         ));
     }
@@ -947,7 +955,7 @@ mod tests {
             "#EXT-X-STREAM-INF:BANDWIDTH=40000000,CODECS=\"hvc1.2.20000000.L150.B0,ec-3\",SUPPLEMENTAL-CODECS=\"dvh1.08.06/db1p\",RESOLUTION=3840x2160,VIDEO-RANGE=PQ,SUBTITLES=\"subs\""
         ));
         assert!(!master.contains("#EXT-X-INDEPENDENT-SEGMENTS"));
-        assert!(master.contains("NAME=\"English · Forced\",LANGUAGE=\"en\",DEFAULT=YES,AUTOSELECT=YES,FORCED=YES,URI=\"subs/2/index.m3u8\""));
+        assert!(master.contains("NAME=\"English · Forced\",LANGUAGE=\"en\",DEFAULT=NO,AUTOSELECT=YES,FORCED=YES,URI=\"subs/2/index.m3u8\""));
         assert!(master.contains(
             "NAME=\"Italian · Forced\",LANGUAGE=\"it\",DEFAULT=NO,AUTOSELECT=YES,FORCED=YES"
         ));
