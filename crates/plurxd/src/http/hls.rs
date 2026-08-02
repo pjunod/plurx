@@ -588,7 +588,11 @@ fn master_playlist(file: &MediaFile, selected: Option<i64>) -> String {
         out.push_str(",SUBTITLES=\"subs\"");
     }
     out.push('\n');
-    out.push_str("video.m3u8\n");
+    // Resolve back to the historical media-playlist URL without carrying the
+    // master's `native=1` query. AVPlayer accepts the exact same copied fMP4
+    // when reached through this stable session URL, while treating a second
+    // synthetic child path as a different (and incompatible) asset.
+    out.push_str("index.m3u8\n");
     out
 }
 
@@ -929,7 +933,7 @@ mod tests {
         ));
         assert!(master.contains("NAME=\"English · Regular\",LANGUAGE=\"en\",DEFAULT=NO"));
         assert!(master.contains("NAME=\"English · SDH\",LANGUAGE=\"en\",DEFAULT=NO,AUTOSELECT=YES,FORCED=NO,CHARACTERISTICS=\"public.accessibility.transcribes-spoken-dialog,public.accessibility.describes-music-and-sound\""));
-        assert!(master.ends_with("video.m3u8\n"));
+        assert!(master.ends_with("index.m3u8\n"));
     }
 
     #[test]
