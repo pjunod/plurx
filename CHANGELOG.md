@@ -10,6 +10,97 @@ bump may break compatibility and a **patch** bump never does.
 
 ### Added
 
+- **The server says which dynamic range a delivery actually carries.** Every
+  client's HDR/DV badge was built from the source probe alone, because the one
+  fact that would let it be honest — what grade is in the bytes this session
+  sends — existed nowhere on the wire, even though the decision engine has
+  always known it. `/files/{id}/decision` and the HLS session response now both
+  carry `delivered_dynamic_range` (`"dolby_vision" | "hdr10" | "hlg" | "sdr"`,
+  the same vocabulary as the source's `hdr` plus `"sdr"`), computed by one
+  shared function so the two can never disagree: a preserved-DV copy answers
+  `dolby_vision`, a stripped one answers the base layer its compatibility
+  marker names, and every transcode answers `sdr` because every encoder in the
+  pipeline emits H.264 8-bit through the tone-map graph. The session's answer
+  overrides the decision's, since a burn or a manually-picked rung produces a
+  transcode the decision never promised. Additive and nullable: nothing about
+  the decision, the DV strip, or tone-mapping changed — this reports them.
+
+- **Library grids can finally classify a show's watch state.** `/libraries/
+  {id}/items` attached a `watch` row per item and nothing else, but a show has
+  no watch row of its own — the state lives on its episodes, which are not in
+  that response — so "Watched" and "In progress" filtered to nothing and
+  "Unwatched" listed finished series. The page now carries the same `rollup`
+  (`leaves` / `watched`) the detail endpoint has always returned for
+  containers, batched into a single recursive query per page rather than one
+  per card, so the cost does not grow with the number of shows on screen.
+
+- **SDH subtitle renditions are tagged from the container's own flag.** The
+  accessibility `CHARACTERISTICS` on a native HLS subtitle rendition was
+  decided by sniffing the track's title for "SDH", "closed caption" and
+  friends, so a hard-of-hearing track named "English 2" was untagged and a
+  film named by someone else's convention was invisible to a viewer who needs
+  captions. The scanner now reads ffprobe's `disposition.hearing_impaired` and
+  the playlist prefers it, with the title sniff kept as the fallback.
+
+- **The Apple player's dynamic-range badge, and one for the detail page at
+  last.** The iOS/tvOS overlay had the same problem as the web player's: its
+  HDR/DV chip was built from the source probe, so a Dolby Vision remux read
+  `DV` even while a forced 1080p rung delivered tone-mapped SDR. The chip still
+  starts from what the file carries and now dims and names what is actually
+  arriving — `DV → HDR10` when the server strips a profile this Apple TV does
+  not claim, `DV → SDR` for a transcode session or a display that reports it
+  cannot show HDR — with a spelled-out VoiceOver label and a matching "Dynamic
+  range" row in the playback-info panel carrying the server's own reason. It
+  reads `delivered_dynamic_range` from the decision and, once a session
+  attaches, from the session response, which overrides it; an absent field
+  falls back to today's source-only chip. `AVPlayer.eligibleForHDRPlayback` is
+  the only local signal used, asked at render time so switching an Apple TV's
+  Dolby Vision output off in Settings changes the badge without a relaunch.
+  Separately, the Apple **detail** page finally has a dynamic-range badge at
+  all — Android and the web have had one all along — built by the same function
+  so the two screens cannot label one file two ways. Nothing about the
+  decision, the caps probe, or session creation changed: this reports them.
+
+- **Apple: watch filters work on show libraries, and the first paint stops
+  waiting for the last response.** "Watched" and "In progress" filtered a TV
+  grid to nothing while "Unwatched" listed finished series, because a show has
+  no watch row — the state lives on its episodes. Containers now classify from
+  the `rollup` the server attaches to library pages. Alongside it, home fetches
+  hubs, libraries, and Coming Soon together instead of in sequence, publishes
+  each shelf and each library page as it arrives, and raises a spinner only over
+  a screen that has never held anything — so pull-to-refresh no longer blanks a
+  populated dashboard, and a thousand-item library shows its first page after
+  one round trip rather than five.
+
+- **Apple: posters decode to the cell that draws them, a failed one retries,
+  and an expired token lands on the login screen.** Artwork was decoded at full
+  raster into every cell — a 2000×3000 poster into a 132-point card, once per
+  cell, which is what made large tvOS grids stutter — and a poster that failed
+  its single fetch stayed a grey rectangle for the life of the process. Loads
+  now downsample through ImageIO to the cell's pixel ceiling, off the main
+  actor, into a shared `NSCache` keyed by origin and size, over a
+  `waitsForConnectivity` session with one retry. Separately, a 401 or 403 on any
+  request after launch now clears the bearer and returns to the login screen
+  once, instead of degrading every screen to "Server returned 401" while the app
+  still appeared signed in; and home refreshes when the player is dismissed and
+  when the app becomes active, which tvOS never did at all.
+
+- **The web player's dynamic-range badge says what you are getting, not just
+  what the file is.** Every media badge was built from the source probe, so a
+  Dolby Vision disc remux showed a full-colour "DV P7" while Chrome was in
+  fact watching a tone-mapped SDR H.264 transcode of it. The play overlay's
+  chip now starts from the source grade as before and, when the session is
+  delivering something else, dims and names it inside the same chip — `DV P7 →
+  HDR10` where the server stripped DV for this browser, `DV P7 → SDR` where it
+  fell back to a transcode. The display is re-asked at render time
+  (`matchMedia("(dynamic-range: high)")`), so an HDR stream on an SDR monitor
+  reads `HDR10 → SDR` and moving the window between screens changes the badge.
+  The stats overlay gains a matching "Dynamic range" row, built from the same
+  function and carrying the server's own reason. It consumes the new
+  `delivered_dynamic_range` field on `/decision` and on the HLS session
+  response; an absent field degrades to the old source-only chip, and the
+  detail pages stay source-only because there is no session to report on.
+
 - **Software transcodes are admitted against a CPU budget, and spend it
   explicitly.** Software sessions used to bypass admission entirely: each
   x264 process picked its own thread count (cores × 1.5), so a few of them
@@ -44,6 +135,86 @@ bump may break compatibility and a **patch** bump never does.
   devices on one account stop killing each other's streams), a per-attempt
   `request_id`, and an explicit `DELETE` when playback ends, instead of
   leaving encoders to the idle reaper. `play_url` stays for older clients.
+
+- **Android: the dynamic-range badge says what is on screen, not what the file
+  is.** The chip was built from the source probe alone, so a Dolby Vision disc
+  remux read a confident "DV" while the device was in fact watching the
+  stripped HDR10 base — or, on a forced rung, a tone-mapped SDR transcode. It
+  now starts from the source grade as before and, when the session is
+  delivering something weaker, dims and names it inside the same chip: `DV →
+  HDR10`, `HDR → SDR`. The verdict combines the server's new
+  `delivered_dynamic_range` with the two signals Android actually has — the
+  panel's `Display.HdrCapabilities` and the decoder's `Format.colorInfo` — and
+  the decoder wins when it contradicts the plan, because it is downstream of
+  every fallback. A missing decoder signal is not a contradiction, so an HLS
+  variant that publishes no `ColorInfo` leaves the server's answer standing,
+  and a server that does not send the field at all keeps the old source-only
+  chip. The playback-info panel gains a matching "Dynamic range" row carrying
+  the server's own reason. Nothing about the decision, the caps probe, or
+  session creation changed: this reports them.
+
+- **Android TV: a shelf you have scrolled is still reachable.** Each shelf's
+  `FocusRequester` was attached to the card at index 0 — which a `LazyRow`
+  disposes the moment the viewer scrolls past it. Every neighbouring shelf aims
+  its `up`/`down` at that requester, so after one horizontal scroll the vertical
+  walk was requesting focus on a requester attached to nothing. The requester
+  and the direction overrides now live on the row container with `focusGroup()`,
+  which exists for as long as the shelf does. Poster cards and pickers carry one
+  focus target each rather than two: `clickable` is already focusable, and the
+  trailing `focusable()` put an *unclickable* target in front of it, so the
+  D-pad could land on a card whose centre press did nothing. The "Group by"
+  picker is now a stop on the vertical chain instead of a control the shelves
+  pointed straight past, which made it unreachable without a touchscreen. An
+  instrumented reproduction (`ShelfFocusTest`) scrolls a shelf until its first
+  card is disposed and then walks focus down and back up.
+
+- **Android: watch filters work on show libraries, and first paint stops
+  waiting for the last response.** "Watched" and "In progress" filtered a TV
+  grid to nothing while "Unwatched" listed finished series, because a show has
+  no watch row — the state lives on its episodes, which are not in that
+  response. Containers now classify from the `rollup` the server attaches to
+  library pages. Alongside it: home issues hubs, libraries, and every library
+  preview at once and publishes each as it arrives, instead of 2 + N round trips
+  in strict sequence; a library grid paints its first page after one round trip
+  and fills in behind; sorting is client-side, so changing the sort no longer
+  re-fetches the whole collection behind a spinner to receive the same items
+  back; a detail page draws before the season-and-episode walk that decides what
+  the Play button is *labelled*; and the spinner is raised only over a screen
+  that has never held anything, so a refresh — or a refresh that fails — cannot
+  blank a populated dashboard.
+
+- **Android lifecycle edges: discovery stops, waits are bounded, and a quality
+  change keeps your tracks.** Recovering a moved server started NSD discovery
+  and never stopped it, leaving multicast running for the life of the process;
+  it is now closed in a `finally`. `NsdManager.resolveService` is a callback
+  with no timeout of its own — a service that vanished between discovery and
+  selection calls neither callback — so the connect screen could sit on a
+  spinner forever; the resolve is bounded at five seconds. Launch validation
+  could hold the splash for well over a minute (four attempts against a 20 s
+  connect timeout, twice over if rediscovery found a candidate) before Home,
+  which has a Retry button, ever appeared; it is capped at twelve seconds.
+  Changing quality mid-film rebuilt the player and silently reset the audio and
+  subtitle selections to their defaults — those now live beside the A/V
+  correction, which already survived. Safe insets are the union of the status
+  bar and the display cutout, so a landscape hole-punch no longer sits under the
+  back button. Tunneled playback is requested on television devices, where the
+  SoC pipeline is what 4K HDR is built around, and not on handsets where some
+  decoders refuse it. The tight focus bounds that surrendered Material's 48 dp
+  minimum touch target are scoped to television, where there are no fingers.
+  Search, sort, and filter survive rotation and process death. And the several
+  `runCatching` blocks around suspend calls no longer swallow
+  `CancellationException` — a screen that has left composition stops "recovering"
+  from its own teardown.
+
+- **Android release builds shrink from 18.5 MB to 3.4 MB.** `isMinifyEnabled`
+  was `false` and `proguard-rules.pro` had been dead configuration since the day
+  it was written, so every release APK shipped the whole of
+  `material-icons-extended` — several thousand vector assets, of which this app
+  draws about twenty — plus every library path the viewer never reaches. R8 and
+  `shrinkResources` are on; the keep rules cover what is reached reflectively
+  and nothing else: the generated kotlinx.serialization serializers for the wire
+  models, and the generic signatures Retrofit reads off `PlurxApi`. Line numbers
+  are kept so a crash report from a viewer's TV is still readable.
 
 ### Changed
 
@@ -470,6 +641,50 @@ bump may break compatibility and a **patch** bump never does.
   always at the same spot. The tag now tracks the longest segment published,
   and the first segment is deliberately short so the first reload lands with
   time to spare.
+- **Changing servers on iPhone and Apple TV left the old server's bearer token
+  on the device.** Only the in-memory copy was cleared, so an app killed
+  between connecting to server B and signing in to it relaunched holding
+  server A's token beside server B's address — and sent it there, in cleartext
+  on a LAN, where B answered 401 and A's still-valid session was destroyed for
+  answering a question it was never asked. The origin and the token are now
+  written together or not at all, through one `SettingsStore` entry point that
+  makes every caller name the token belonging with the address it is storing.
+  A server rediscovered at a new address keeps its own token, because that is
+  a move and not a change of identity.
+- **Choosing a discovered plurx server on Apple could spin forever.**
+  `NetService` delivers every outcome — the address, the failure, and its own
+  five-second timeout — through run-loop sources, and the resolver was called
+  from a cooperative-pool thread whose run loop is never spun, so no callback
+  could ever arrive: the row stayed "resolving", every other row stayed
+  disabled, and saved-session recovery sat on the bootstrap spinner. It now
+  resolves on the main run loop, with a deadline one second past the service's
+  own so that no future scheduling change can strand a caller again.
+- **A 4K HDR disc remux no longer starts a transcode just because it has
+  subtitles.** Cold start picked the first subtitle track matching the
+  viewer's language whether or not anything had flagged it, so an
+  English-audio film with an unflagged English track showed full subtitles on
+  every play — and when the only English track was PGS, as on almost every
+  disc remux, showing it meant burning it: an encoder slot per play, H.264,
+  and the HDR gone. Automatic selection now applies a forced track (whatever
+  its format — a film whose foreign dialogue is unsubtitled is not watchable),
+  or a default-flagged text track through the free rendition path, and
+  otherwise selects nothing. Picking a PGS track by hand still burns it, at
+  source height, exactly as before.
+- **A seek made during an Apple stream change no longer vanishes.** Two
+  server-session replacements must not overlap — they share a `playback_id`,
+  so the newer one deletes the older — but the guard enforcing that silently
+  dropped any seek or track change that arrived while a replacement was in
+  flight, which is what made the tvOS progress bar snap back after a burst of
+  30-second step-seeks during a quality change. The newest request is now
+  remembered instead, and replayed as exactly one trailing reopen when the
+  change lands.
+- **A quality or track change that fails no longer takes the film with it.**
+  The old session was deleted before its replacement was requested, so a
+  create that failed left the player pointed at a playlist the client had
+  already removed: the buffer played out, then the stream stalled, and the
+  error stayed quiet because an item still existed. The predecessor is now
+  retired only once its successor exists; a failed change leaves the current
+  stream playing, telemetry running, and surfaces a transient error instead.
 
 ### Added
 
@@ -478,6 +693,80 @@ bump may break compatibility and a **patch** bump never does.
   actually reached the screen rather than Safari's decode-ahead, and the
   overlay reports the realized playback rate whenever it deviates from what
   was requested.
+
+### Fixed
+
+- **Android told the server nothing about Dolby Vision, so no Android device
+  ever kept it.** Absent `dv` means no — the server says so in as many words —
+  so every DV title on every Android box took the strip path, and a Profile 5
+  source, which has no compatible base layer to fall back to, was re-encoded
+  in full. The client now probes `MediaCodecList` for `video/dolby-vision`,
+  maps the decoder's profile constants to Dolby's numbering, and claims the
+  intersection of that and a display that actually shows DV — never dual-layer
+  Profile 7, which stays on the server's strip path where it belongs. Nothing
+  on the server changed; it was always deciding correctly from what it was
+  told.
+- **Lossless Atmos came back as 256 kb/s AAC on the boxes most likely to have
+  a receiver.** Audio codecs were claimed only where the device had a
+  *decoder*, and a Shield feeding an AVR has no TrueHD decoder — the receiver
+  does that job. The claim is now the union of decoder support and what the
+  *active route* accepts as a bitstream (Media3's `AudioCapabilities`, which
+  reads the HDMI plug extras and, on API 33+, the direct audio profiles), and
+  it is recomputed on every decision, because unplugging HDMI or switching to
+  the TV's speakers changes the truthful answer. The whole probe also moved
+  off the main thread, where it had been running binder IPC per play.
+- **An explicit quality choice did nothing, and "Original" made things
+  smaller.** The quality menu sent its rung as `force=720`, which the server
+  parses as Auto, so picking 720p over a slow link silently direct-played 4K
+  anyway; and an Original-quality subtitle burn sent no height at all, so a
+  4K remux restarted as 1080p — the exact opposite of what the menu promised.
+  `force` now says `auto`, `original`, or `transcode`, and the height rides on
+  the session create, where a burn or Original carries the source's own height
+  and only a genuine Auto omits it.
+- **A subtitle cost the film its resolution and its HDR.** Every
+  server-listed subtitle — including an SRT the server would hand over free —
+  started a burn transcode, so choosing English subtitles on a 4K HDR remux
+  swapped it for a tone-mapped H.264 re-encode. SRT and WebVTT now arrive as
+  native HLS text renditions on a copy session that leaves the video stream
+  untouched, switching between two of them changes only which rendition is
+  selected rather than creating a server session, and only tracks with no text
+  to send are burned in. The cold-start rule is now one function with the
+  table in front of it: a forced track auto-shows whatever its codec, a
+  default-flagged text track auto-shows for free, a default-flagged bitmap
+  track does not, and a merely-same-language track never did belong there.
+- **A cached transcode resumed at 0:00 and rebuilt itself on every scrub.**
+  The session response's `vod` flag — the whole stream already on disk — was
+  never decoded, so a cache hit started from the beginning and each seek threw
+  away a complete encode to make another. A VOD session now seeks in place,
+  like direct play; a live one still reopens, because a live playlist cannot
+  be range-sought.
+- **A stream the device refused was a black screen.** There was no
+  `onPlayerError` anywhere, so a rejected direct or remux stream simply never
+  started and said nothing. It now gets exactly one automatic rescue —
+  reopened as a guaranteed-compatible transcode at the current position — and
+  a second failure is a real error with Retry and Back. Decoder fallback is
+  enabled too, so a flaky hardware decoder degrades to software rather than
+  spending that rescue; the player also takes audio focus properly and pauses
+  when the headphones come out.
+- **Toggling "Autoplay next episode" mid-film restarted the film.** The
+  listener effect was keyed on the preference, so changing it disposed the
+  effect, released the live player, and re-registered on the released one —
+  which restarted the episode at the position it had opened with. The effect
+  is keyed on the player alone now and reads the preference as it stands.
+- **Changing servers left the old server's token on disk.** Only the
+  in-memory copy was cleared, so killing the app between connecting to a new
+  server and logging in sent the previous server's bearer to the new one over
+  plain HTTP — and destroyed the still-valid session on the old one when the
+  new one answered 401. Origin and token are written together or not at all
+  now, with one owner for the invariant.
+- **The quality menu offered rungs that did not exist.** It was a hardcoded
+  enum listing 2160p and 1440p for every file, including a 1080p source that
+  can only be upscaled into them. It is built from the ladder the server
+  advertises for that source, labelled with each rung's bitrate, falling back
+  to the old list only for a server too old to send one. Separately, a merged
+  collection's "Recently added" sort was a no-op: the client never decoded the
+  `added_at` the server sends, so several shares arrived as sorted runs laid
+  end to end instead of one interleaved grid.
 
 ## [0.2.0] — 2026-07-30
 

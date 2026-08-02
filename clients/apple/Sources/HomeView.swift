@@ -2,6 +2,7 @@ import SwiftUI
 
 struct HomeView: View {
     @EnvironmentObject var model: AppModel
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         #if os(iOS)
@@ -49,6 +50,15 @@ struct HomeView: View {
         }
         .tint(Palette.accent)
         .task { if model.homeLoading { await model.loadHome() } }
+        .onChange(of: scenePhase) { _, phase in
+            // Coming back to a foregrounded app should not show yesterday's
+            // Continue Watching. An Apple TV in particular is suspended rather
+            // than quit, so before this the tvOS dashboard only ever refreshed
+            // by relaunching the app. `loadHome` coalesces overlapping refreshes
+            // and no longer raises a spinner over content, so this is free.
+            guard phase == .active else { return }
+            Task { await model.loadHome() }
+        }
     }
     #else
     private var tvTabs: some View {
@@ -67,6 +77,15 @@ struct HomeView: View {
         }
         .tint(Palette.accent)
         .task { if model.homeLoading { await model.loadHome() } }
+        .onChange(of: scenePhase) { _, phase in
+            // Coming back to a foregrounded app should not show yesterday's
+            // Continue Watching. An Apple TV in particular is suspended rather
+            // than quit, so before this the tvOS dashboard only ever refreshed
+            // by relaunching the app. `loadHome` coalesces overlapping refreshes
+            // and no longer raises a spinner over content, so this is free.
+            guard phase == .active else { return }
+            Task { await model.loadHome() }
+        }
     }
     #endif
 }

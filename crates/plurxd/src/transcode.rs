@@ -1159,6 +1159,15 @@ pub struct SegmentFile {
 /// The source timeline behind one capability-authenticated HLS session.
 /// Subtitle child requests resolve this instead of accepting a file id from
 /// the URL, so one session capability can never be used to read another file.
+///
+/// **`codecs` and `supplemental_codecs` currently have no consumer.** They
+/// were built for `CODECS` / `SUPPLEMENTAL-CODECS` attributes on the native
+/// HLS master; that whole shape was tried against real AVPlayer hardware on
+/// 2026-08-01/02 and deliberately reverted — the master now carries no codec
+/// claims at all and AVPlayer inspects the published init segment instead (a
+/// test pins `!master.contains("CODECS=")`). The machinery stays because it
+/// is correct and re-deriving it is the expensive part; this note exists so
+/// the next reader does not hunt for a consumer that is not there.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HlsContext {
     pub file_id: i64,
@@ -1177,6 +1186,20 @@ fn audio_track(
         .or_else(|| file.audio_streams.first())
 }
 
+/// RFC 6381 sample type for audio that is being *copied* into the HLS
+/// rendition.
+///
+/// The `_` arm answers `mp4a.40.2` (AAC-LC) for anything unlisted, which
+/// **mislabels a genuinely copied FLAC, Opus or DTS track** — it claims AAC
+/// for bytes that are not AAC. The Apple client only ever claims codecs the
+/// arms above cover, but the web player claims `flac`/`opus` when the browser
+/// does, and Safari takes the copy-HLS path — so a FLAC-in-MKV remux reaches
+/// this arm today. Recorded rather than fixed
+/// (CLIENTS-REMEDIATION-PLAN §8.3) because the value has no consumer at all:
+/// the native master carries no `CODECS` attribute (see [`HlsContext`]), so
+/// the wrong label is currently written to nothing. It is one match arm, and
+/// it wants doing in the same change as whatever starts reading the result —
+/// a fix landed now would be untestable through any wire output.
 fn copied_audio_codec(file: &plurx_core::domain::MediaFile, selected: Option<i64>) -> &'static str {
     match audio_track(file, selected).map(|track| track.codec.as_str()) {
         Some("ac3" | "ac-3") => "ac-3",

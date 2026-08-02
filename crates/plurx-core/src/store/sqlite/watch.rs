@@ -296,6 +296,63 @@ impl WatchStore for SqliteStore {
         .await
     }
 
+    async fn watch_rollups(
+        &self,
+        user_id: i64,
+        ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, WatchRollup>, StoreError> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        // ids are our own row ids (trusted i64s), so an inline IN-list is
+        // safe — same reasoning `child_counts` runs on.
+        let list = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+        let ids = ids.to_vec();
+        self.with_conn(move |conn| {
+            // One walk for the whole page: the recursion carries the root it
+            // started from alongside each descendant, so a single pass can
+            // group the leaf counts back onto the containers that asked.
+            // UNION (not UNION ALL) still dedupes, so a parent cycle
+            // terminates — and a (root, id) pair is unique per root, so two
+            // containers on the same page never contaminate each other's
+            // count.
+            let mut stmt = conn.prepare(&format!(
+                "WITH RECURSIVE tree(root, id) AS (
+                     SELECT id, id FROM items WHERE id IN ({list})
+                     UNION
+                     SELECT t.root, i.id FROM items i JOIN tree t ON i.parent_id = t.id
+                 )
+                 SELECT t.root, COUNT(*), COALESCE(SUM(w.watched), 0)
+                 FROM tree t
+                 JOIN items i ON i.id = t.id
+                 LEFT JOIN watch_state w ON w.item_id = i.id AND w.user_id = ?1
+                 WHERE i.kind IN ({PLAYABLE_KINDS})
+                 GROUP BY t.root"
+            ))?;
+            let rows = stmt
+                .query_map(params![user_id], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        WatchRollup {
+                            leaves: row.get(1)?,
+                            watched: row.get(2)?,
+                        },
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            // A container with nothing playable under it produces no group,
+            // and the single-item version answers 0/0 for exactly that case.
+            // Seed the map so both agree.
+            let mut out: std::collections::HashMap<i64, WatchRollup> = ids
+                .into_iter()
+                .map(|id| (id, WatchRollup::default()))
+                .collect();
+            out.extend(rows);
+            Ok(out)
+        })
+        .await
+    }
+
     async fn continue_watching(
         &self,
         user_id: i64,
@@ -391,7 +448,7 @@ impl WatchStore for SqliteStore {
 
 #[cfg(test)]
 mod tests {
-    use crate::domain::{ItemKind, LibraryKind, NewItem, NewLibrary};
+    use crate::domain::{ItemKind, LibraryKind, NewItem, NewLibrary, WatchRollup};
     use crate::store::{LibraryStore, MediaStore, SqliteStore, UserStore, WatchStore};
 
     #[tokio::test]
@@ -813,6 +870,151 @@ mod tests {
             .continue_watching(user.id, 10)
             .await
             .expect("cw")
+            .is_empty());
+    }
+
+    /// The library grid's "Watched"/"In progress" filters ask a question
+    /// about containers, and a container has no watch row — so the grid gets
+    /// rollups or it gets nothing. Batched, because a page of a show library
+    /// is tens of containers and a rollup is a recursive walk.
+    #[tokio::test]
+    async fn a_page_of_containers_rolls_up_in_one_pass_and_agrees_with_the_single_walk() {
+        let store = SqliteStore::open_in_memory().expect("open");
+        let user = store.create_user("u", "h", true).await.expect("user");
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "TV".into(),
+                kind: LibraryKind::Shows,
+                paths: vec![],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+        let show = |title: &str| {
+            let title = title.to_owned();
+            async {
+                store
+                    .insert_item(&NewItem {
+                        library_id: lib.id,
+                        kind: ItemKind::Show,
+                        parent_id: None,
+                        title,
+                        year: Some(2022),
+                        season_number: None,
+                        episode_number: None,
+                    })
+                    .await
+                    .expect("show")
+            }
+        };
+        let finished = show("Finished").await;
+        let half = show("Half").await;
+        let untouched = show("Untouched").await;
+        let empty = show("Announced").await;
+
+        let mut episodes = std::collections::HashMap::new();
+        for parent in [finished, half, untouched] {
+            let season = store
+                .insert_item(&NewItem {
+                    library_id: lib.id,
+                    kind: ItemKind::Season,
+                    parent_id: Some(parent),
+                    title: "Season 1".into(),
+                    year: None,
+                    season_number: Some(1),
+                    episode_number: None,
+                })
+                .await
+                .expect("season");
+            let mut eps = Vec::new();
+            for n in 1..=2 {
+                eps.push(
+                    store
+                        .insert_item(&NewItem {
+                            library_id: lib.id,
+                            kind: ItemKind::Episode,
+                            parent_id: Some(season),
+                            title: format!("E{n}"),
+                            year: None,
+                            season_number: Some(1),
+                            episode_number: Some(n),
+                        })
+                        .await
+                        .expect("ep"),
+                );
+            }
+            episodes.insert(parent, (season, eps));
+        }
+
+        store
+            .set_watched_tree(user.id, finished, true)
+            .await
+            .expect("mark");
+        store
+            .set_watched(user.id, episodes[&half].1[0], true)
+            .await
+            .expect("mark");
+
+        let containers = [finished, half, untouched, empty];
+        let rollups = store
+            .watch_rollups(user.id, &containers)
+            .await
+            .expect("rollups");
+        assert_eq!(rollups.len(), 4, "every id asked about gets an answer");
+        assert_eq!(
+            rollups[&finished],
+            WatchRollup {
+                leaves: 2,
+                watched: 2
+            }
+        );
+        assert_eq!(
+            rollups[&half],
+            WatchRollup {
+                leaves: 2,
+                watched: 1
+            }
+        );
+        assert_eq!(
+            rollups[&untouched],
+            WatchRollup {
+                leaves: 2,
+                watched: 0
+            }
+        );
+        assert_eq!(
+            rollups[&empty],
+            WatchRollup::default(),
+            "a show with nothing in it yet is 0/0, not absent"
+        );
+        assert!(rollups[&finished].complete());
+        assert!(!rollups[&empty].complete());
+
+        // The batched walk and the per-item walk are the same question asked
+        // two ways; if they can disagree, a grid card and its detail page can
+        // disagree. Seasons too, since the grid paints those as cards as well.
+        for id in containers
+            .iter()
+            .copied()
+            .chain(episodes.values().map(|(season, _)| *season))
+        {
+            let one = store.watch_rollup(user.id, id).await.expect("single");
+            let batched = store.watch_rollups(user.id, &[id]).await.expect("batched")[&id];
+            assert_eq!(one, batched, "rollups disagree for item {id}");
+        }
+
+        // Two containers on the same page must not contaminate each other:
+        // one of them being fully watched cannot lift the other's count.
+        let together = store
+            .watch_rollups(user.id, &[finished, untouched])
+            .await
+            .expect("pair");
+        assert_eq!(together[&untouched].watched, 0);
+
+        assert!(store
+            .watch_rollups(user.id, &[])
+            .await
+            .expect("none")
             .is_empty());
     }
 }

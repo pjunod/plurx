@@ -27,10 +27,9 @@ struct SettingsStore {
         static let posterSize = "plurx.posterSize"
     }
 
-    var origin: String {
-        get { defaults.string(forKey: Key.origin) ?? "" }
-        nonmutating set { defaults.set(newValue, forKey: Key.origin) }
-    }
+    /// Read-only on purpose. Every write goes through `setServer`, which is
+    /// what keeps the origin and the bearer token from drifting apart.
+    var origin: String { defaults.string(forKey: Key.origin) ?? "" }
     var instanceId: String? {
         get { defaults.string(forKey: Key.instanceId) }
         nonmutating set { defaults.set(newValue, forKey: Key.instanceId) }
@@ -93,5 +92,37 @@ struct SettingsStore {
     func clearToken() {
         tokenVault.clear()
         defaults.removeObject(forKey: Key.token)
+    }
+
+    /// The single owner of the "origin and token are written together or not at
+    /// all" invariant. A bearer is issued by one server and is meaningless — and
+    /// dangerous — at another: without this, a kill-and-relaunch between
+    /// `connect(B)` and signing in sent server A's bearer to server B in
+    /// cleartext, and A's still-valid session was destroyed the moment B
+    /// answered 401.
+    ///
+    /// Callers must name the token that belongs with the address, so no path can
+    /// write one without deciding the other. Pass `token: nil` for a new or
+    /// changed server; pass the existing token only when the *same* server
+    /// instance was rediscovered at a new address, which is a move, not a
+    /// change of identity.
+    func setServer(origin: String, instanceId: String?, token: String?) {
+        defaults.set(origin, forKey: Key.origin)
+        if let instanceId {
+            defaults.set(instanceId, forKey: Key.instanceId)
+        } else {
+            defaults.removeObject(forKey: Key.instanceId)
+        }
+        guard let token else {
+            clearToken()
+            return
+        }
+        self.token = token
+    }
+
+    /// Leaving a server entirely (the "Change server" action). Address,
+    /// identity, and bearer go together.
+    func clearServer() {
+        setServer(origin: "", instanceId: nil, token: nil)
     }
 }

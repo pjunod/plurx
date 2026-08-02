@@ -2779,6 +2779,11 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["method"], "direct_play");
         assert!(body["prefer_segmented"].is_null(), "{body}");
+        // The badge field reaches the wire through `Decision`'s flatten, so
+        // nothing in plurxd would notice if it stopped. Which *grade* each
+        // delivery reports is pinned in playback/mod.rs; what this pins is
+        // that the key is there at all, on every method.
+        assert_eq!(body["delivered_dynamic_range"], "sdr", "{body}");
 
         // A 69 Mb/s HEVC MKV with TrueHD: the video decodes, the container and
         // the audio do not, so it remuxes — and it is far too fast for the
@@ -2912,6 +2917,7 @@ mod tests {
             body["delivery"]["aac"], true,
             "TrueHD is not in the client's acodec list, so the copy session must re-encode it: {body}"
         );
+        assert_eq!(body["delivered_dynamic_range"], "sdr", "{body}");
 
         // Transcode: the plan is a session create, and deliberately carries no
         // height — Auto belongs to the server (the rung depends on which
@@ -2939,6 +2945,7 @@ mod tests {
             body["delivery"].get("height").is_none(),
             "Auto is the server's call, not a field in the plan: {body}"
         );
+        assert_eq!(body["delivered_dynamic_range"], "sdr", "{body}");
     }
 
     /// ADAPTIVE-QUALITY Phase 1, the server half: the decision and the
@@ -3530,6 +3537,35 @@ mod tests {
         assert_eq!(show["item"]["rollup"]["watched"], 0);
         assert!(show["item"]["watch"].is_null(), "a show is not watchable");
 
+        // The grid asks the same question the detail page does — a library
+        // filtered by "Watched" has to classify the show card itself — so the
+        // list carries the same rollup, batched for the whole page.
+        let (_, page) = call(
+            &app,
+            get(&format!("/api/v1/libraries/{}/items", s.lib), Some(&admin)),
+        )
+        .await;
+        let row = page["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .find(|i| i["id"] == s.show)
+            .expect("the show is on the page")
+            .clone();
+        assert_eq!(row["rollup"]["leaves"], 1);
+        assert_eq!(row["rollup"]["watched"], 0);
+        let movie_row = page["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .find(|i| i["id"] == s.movie)
+            .expect("the movie is on the page")
+            .clone();
+        assert!(
+            movie_row["rollup"].is_null(),
+            "a leaf still answers with its own watch row, not a rollup"
+        );
+
         // Marking the show marks the episode underneath it.
         let (st, r) = call(
             &app,
@@ -3959,6 +3995,10 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::OK, "{native}");
+        // The session's own answer, on the wire: `StartResponse` skips the key
+        // when it is None, so this is the only thing that would catch it
+        // silently disappearing from every create.
+        assert_eq!(native["delivered_dynamic_range"], "sdr", "{native}");
         let session = native["session_id"].as_str().expect("session");
         let expected_playlist = format!("/api/v1/hls/{session}/index.m3u8?native=1&subtitle=0");
         assert_eq!(

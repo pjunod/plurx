@@ -24,24 +24,53 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.unit.dp
 import tv.plurx.app.data.AudioStream
 import tv.plurx.app.data.AudioTrack
+import tv.plurx.app.data.DynamicRange
 import tv.plurx.app.data.MediaFileDto
 import kotlin.math.min
 
 internal enum class MediaFactKind { Resolution, Video, DynamicRange, Audio }
 
+/**
+ * How a fact relates to what is actually happening right now
+ * (MEDIA-BADGES-PLAN.md §2.3). The chip's text always names what the *source*
+ * carries; the state says whether the viewer is getting it.
+ *
+ * The mechanics are deliberately generic — resolution and audio have the same
+ * shape of lie to tell (4K source on a 1080p rung, Atmos downmixed to AAC) —
+ * but this pass wires only the dynamic-range fact. Everything else keeps
+ * emitting [Source].
+ */
+internal enum class FactState {
+    /** No live session to compare against: the detail screens, and pre-play. */
+    Source,
+
+    /** The session is delivering and this device is rendering exactly this. */
+    Active,
+
+    /** Something weaker is on screen; [MediaFact.activeLabel] names it. */
+    Downgraded,
+}
+
 internal data class MediaFact(
     val kind: MediaFactKind,
     val label: String,
     val accessibilityLabel: String = label,
+    val state: FactState = FactState.Source,
+    /** What is really on screen, when [state] is [FactState.Downgraded]. */
+    val activeLabel: String? = null,
 )
 
 /** Compact media facts using Google's Material icons rather than emoji. */
 @Composable
 internal fun MediaFactChip(fact: MediaFact, modifier: Modifier = Modifier) {
-    val color = LocalContentColor.current.copy(alpha = 0.78f)
+    // A downgraded chip keeps its border and dims its content — the same "off"
+    // treatment as the web player's `.vbadge.off`, so the row reads at a glance
+    // as "these are lit, that one isn't".
+    val alpha = if (fact.state == FactState.Downgraded) 0.45f else 0.78f
+    val color = LocalContentColor.current.copy(alpha = alpha)
     Row(
         modifier = modifier
-            .border(0.5.dp, color.copy(alpha = 0.34f), CircleShape)
+            .border(0.5.dp, color.copy(alpha = alpha * 0.44f), CircleShape)
             .padding(horizontal = 6.dp, vertical = 2.dp)
             .clearAndSetSemantics { contentDescription = fact.accessibilityLabel },
         horizontalArrangement = Arrangement.spacedBy(4.dp),
@@ -54,16 +83,31 @@ internal fun MediaFactChip(fact: MediaFact, modifier: Modifier = Modifier) {
             modifier = Modifier.size(14.dp),
         )
         Text(
-            text = fact.label,
+            text = fact.chipText,
             color = color,
             style = MaterialTheme.typography.labelSmall,
         )
     }
 }
 
-internal fun playerMediaFacts(file: MediaFileDto?, audio: AudioTrack?): List<MediaFact> = buildList {
+/** The arrow rides inside the one chip — never a second chip beside it. */
+internal val MediaFact.chipText: String
+    get() = if (state == FactState.Downgraded && activeLabel != null) "$label → $activeLabel" else label
+
+/**
+ * @param delivered `delivered_dynamic_range` from the decision, overridden by
+ *   the open session's answer. Null on a server that doesn't send it — the
+ *   dynamic-range chip then stays source-only, exactly as before this feature.
+ * @param rendered [tv.plurx.app.player.renderedRange]'s verdict for this device.
+ */
+internal fun playerMediaFacts(
+    file: MediaFileDto?,
+    audio: AudioTrack?,
+    delivered: String? = null,
+    rendered: String? = null,
+): List<MediaFact> = buildList {
     resolutionFact(file)?.let(::add)
-    dynamicRangeFact(file)?.let(::add)
+    dynamicRangeFact(file, delivered, rendered)?.let(::add)
     audio?.let { audioFact(it.codec, it.channels, it.title) }?.let(::add)
 }
 
@@ -110,15 +154,67 @@ internal fun resolutionLabel(width: Long?, height: Long?): String? {
     }
 }
 
-private fun dynamicRangeFact(file: MediaFileDto?): MediaFact? {
+/**
+ * The one chip that answers two questions at once: what the file carries, and
+ * what this playback is actually putting on screen. `delivered == null` (no
+ * session, or a server that predates the field) keeps the old source-only chip.
+ */
+private fun dynamicRangeFact(
+    file: MediaFileDto?,
+    delivered: String? = null,
+    rendered: String? = null,
+): MediaFact? {
     val value = file?.hdr_format ?: file?.hdr ?: return null
-    val isDolbyVision = value.contains("dolby", ignoreCase = true) ||
-        file?.hdr.equals("dolby_vision", ignoreCase = true)
-    return if (isDolbyVision) {
-        MediaFact(MediaFactKind.DynamicRange, "DV", "Dolby Vision")
+    val source = sourceDynamicRange(file) ?: return null
+    val (label, spoken) = if (source == DynamicRange.DOLBY_VISION) {
+        "DV" to "Dolby Vision"
     } else {
-        MediaFact(MediaFactKind.DynamicRange, "HDR", value)
+        "HDR" to value
     }
+    if (delivered == null) return MediaFact(MediaFactKind.DynamicRange, label, spoken)
+
+    val onScreen = rendered ?: delivered
+    if (onScreen == source) {
+        return MediaFact(MediaFactKind.DynamicRange, label, spoken, FactState.Active)
+    }
+    val arrow = dynamicRangeLabel(onScreen)
+    return MediaFact(
+        kind = MediaFactKind.DynamicRange,
+        label = label,
+        accessibilityLabel = "$spoken, playing as $arrow",
+        state = FactState.Downgraded,
+        activeLabel = arrow,
+    )
+}
+
+/**
+ * The source's grade in the server's own vocabulary, so it compares against
+ * `delivered_dynamic_range` with string equality. `hdr_format` is the rich
+ * label ("Dolby Vision · Profile 7 (HDR10-compatible)", "HDR10+"), `hdr` the
+ * coarse one; a DV format string mentions HLG/HDR10 compatibility of its *base*
+ * layer, so Dolby Vision has to be decided first.
+ */
+internal fun sourceDynamicRange(file: MediaFileDto?): String? {
+    val hdr = file?.hdr?.takeIf { it.isNotBlank() }
+    val format = file?.hdr_format?.takeIf { it.isNotBlank() }
+    if (hdr == null && format == null) return null
+    return when {
+        hdr.equals(DynamicRange.DOLBY_VISION, ignoreCase = true) -> DynamicRange.DOLBY_VISION
+        format?.contains("dolby", ignoreCase = true) == true -> DynamicRange.DOLBY_VISION
+        hdr.equals(DynamicRange.HLG, ignoreCase = true) -> DynamicRange.HLG
+        hdr == null && format?.contains("hlg", ignoreCase = true) == true -> DynamicRange.HLG
+        hdr.equals(DynamicRange.SDR, ignoreCase = true) -> null
+        else -> DynamicRange.HDR10
+    }
+}
+
+/** How the arrow suffix and the info panel spell a grade. */
+internal fun dynamicRangeLabel(range: String?): String = when (range) {
+    DynamicRange.DOLBY_VISION -> "Dolby Vision"
+    DynamicRange.HDR10 -> "HDR10"
+    DynamicRange.HLG -> "HLG"
+    DynamicRange.SDR -> "SDR"
+    else -> range?.replace('_', ' ')?.uppercase().orEmpty().ifBlank { "Unknown" }
 }
 
 private fun preferredAudioFact(streams: List<AudioStream>): MediaFact? {

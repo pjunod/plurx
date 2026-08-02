@@ -59,6 +59,7 @@ import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -91,27 +92,32 @@ import androidx.core.util.Consumer
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.util.Locale
 import kotlin.math.roundToInt
 import tv.plurx.app.data.AudioTrack
+import tv.plurx.app.data.Caps
 import tv.plurx.app.data.Decision
 import tv.plurx.app.data.Marker
 import tv.plurx.app.data.MediaFileDto
-import tv.plurx.app.data.PlaybackQuality
+import tv.plurx.app.data.Rung
 import tv.plurx.app.data.Session
 import tv.plurx.app.data.SubTrack
 import tv.plurx.app.ui.AppViewModel
 import tv.plurx.app.ui.PlaybackTarget
+import tv.plurx.app.ui.catchingUnlessCancelled
 import tv.plurx.app.ui.components.LoadingBox
 import tv.plurx.app.ui.components.MediaFact
 import tv.plurx.app.ui.components.MediaFactChip
 import tv.plurx.app.ui.components.RequestInitialFocus
 import tv.plurx.app.ui.components.TvButton
 import tv.plurx.app.ui.components.TvIconButton
+import tv.plurx.app.ui.components.dynamicRangeLabel
 import tv.plurx.app.ui.components.formatTime
 import tv.plurx.app.ui.components.playerMediaFacts
+import tv.plurx.app.ui.components.sourceDynamicRange
 import tv.plurx.app.ui.components.tvFocusRing
 import tv.plurx.app.ui.theme.Accent
 import tv.plurx.app.ui.theme.Muted
@@ -123,6 +129,10 @@ private data class Plan(
     override val fileId: Long,
     override val playUrl: String,
     override val mode: String,
+    override val sourceHeight: Int?,
+    override val remuxNeedsAac: Boolean,
+    override val preserveDolbyVision: Boolean,
+    override val deliveredDynamicRange: String?,
     val markers: List<Marker>,
     val reasons: List<String>,
     val videoWidth: Int?,
@@ -130,6 +140,7 @@ private data class Plan(
     val source: MediaFileDto?,
     override val audio: List<AudioTrack>,
     override val subtitles: List<SubTrack>,
+    val ladder: List<Rung>,
     val declaredOffsetMs: Long?,
 ) : PlanLike
 
@@ -148,6 +159,13 @@ private suspend fun loadPlan(vm: AppViewModel, itemId: Long, fileId: Long): Plan
         fileId = fileId,
         playUrl = Session.url(decision.delivery?.url ?: decision.play_url),
         mode = mode,
+        // The decision's own reading of the source: the number every height
+        // promise is made of. The item's file row is the fallback for a
+        // server too old to send `source`.
+        sourceHeight = decision.source?.height?.toInt() ?: file?.height?.toInt(),
+        remuxNeedsAac = decision.delivery?.aac ?: decision.transcode_audio,
+        preserveDolbyVision = decision.delivery?.preserve_dolby_vision ?: false,
+        deliveredDynamicRange = decision.delivered_dynamic_range,
         markers = decision.markers,
         reasons = decision.reasons,
         videoWidth = file?.width?.toInt(),
@@ -155,8 +173,13 @@ private suspend fun loadPlan(vm: AppViewModel, itemId: Long, fileId: Long): Plan
         source = file,
         audio = decision.audio,
         subtitles = decision.subtitles,
+        ladder = decision.ladder,
         declaredOffsetMs = decision.declared_offset_ms,
     )
+} catch (cancelled: CancellationException) {
+    // A superseded load (Retry, or a new file) unwinding. Returning null here
+    // would report "Couldn't start playback" for the attempt that replaced it.
+    throw cancelled
 } catch (_: Exception) {
     null
 }
@@ -246,7 +269,12 @@ fun PlayerScreen(
     var failed by remember(itemId, fileId) { mutableStateOf(false) }
     var generation by remember(itemId, fileId) { mutableIntStateOf(0) }
     var resumeAt by remember(itemId, fileId) { mutableLongStateOf(startMs) }
+    // Survives the plan, like the A/V correction beside it: a quality change
+    // reloads the plan and rebuilds the controller, and the viewer's audio and
+    // subtitle picks must come back with them.
     var playbackAudioOffset by remember(itemId, fileId) { mutableLongStateOf(0) }
+    var playbackAudio by remember(itemId, fileId) { mutableStateOf<Long?>(null) }
+    var playbackSubtitle by remember(itemId, fileId) { mutableStateOf<SubtitleChoice?>(null) }
 
     ImmersivePlaybackEffect()
 
@@ -258,7 +286,11 @@ fun PlayerScreen(
 
     Box(Modifier.fillMaxSize().background(Color.Black)) {
         when {
-            failed -> PlaybackFailed(onExit)
+            failed -> PlaybackFailed(
+                message = "Couldn't start playback.",
+                onRetry = { generation++ },
+                onExit = onExit,
+            )
             plan == null -> {
                 LoadingBox()
                 BackChip(onExit)
@@ -270,6 +302,10 @@ fun PlayerScreen(
                 startMs = resumeAt,
                 audioOffsetMs = playbackAudioOffset,
                 onAudioOffsetChanged = { playbackAudioOffset = it },
+                retainedAudio = playbackAudio,
+                onAudioChanged = { playbackAudio = it },
+                retainedSubtitle = playbackSubtitle,
+                onSubtitleChanged = { playbackSubtitle = SubtitleChoice(it) },
                 onReload = { position ->
                     resumeAt = position
                     plan = null
@@ -326,16 +362,35 @@ private fun ImmersivePlaybackEffect() {
     }
 }
 
+/**
+ * A real failure state. The rescue in [Controller] has already been spent by
+ * the time this shows, so the viewer gets the reason and a way out — never a
+ * frozen black surface with a stream that will not come back.
+ */
 @Composable
-private fun PlaybackFailed(onExit: () -> Unit) {
+private fun PlaybackFailed(
+    message: String,
+    onRetry: (() -> Unit)?,
+    onExit: () -> Unit,
+) {
+    val retryFocusRequester = remember { FocusRequester() }
+    RequestInitialFocus(retryFocusRequester, enabled = onRetry != null)
     Column(
         Modifier.fillMaxSize(),
         verticalArrangement = Arrangement.Center,
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        Text("Couldn't start playback.", color = Color.White)
+        Text(message, color = Color.White)
         Spacer(Modifier.size(12.dp))
-        TvButton(onClick = onExit) { Text("Back") }
+        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            if (onRetry != null) {
+                TvButton(
+                    onClick = onRetry,
+                    modifier = Modifier.focusRequester(retryFocusRequester),
+                ) { Text("Retry") }
+            }
+            TvButton(onClick = onExit) { Text("Back") }
+        }
     }
 }
 
@@ -347,6 +402,10 @@ private fun PlayerContent(
     startMs: Long,
     audioOffsetMs: Long,
     onAudioOffsetChanged: (Long) -> Unit,
+    retainedAudio: Long?,
+    onAudioChanged: (Long) -> Unit,
+    retainedSubtitle: SubtitleChoice?,
+    onSubtitleChanged: (Long?) -> Unit,
     onReload: (Long) -> Unit,
     onPlayNext: (PlaybackTarget) -> Unit,
     onExit: () -> Unit,
@@ -358,20 +417,26 @@ private fun PlayerContent(
         context.packageManager.hasSystemFeature(PackageManager.FEATURE_PICTURE_IN_PICTURE)
     val scope = rememberCoroutineScope()
     val preferences by vm.preferences.collectAsStateWithLifecycle()
-    var playFailed by remember { mutableStateOf(false) }
+    var playFailure by remember { mutableStateOf<String?>(null) }
     val controller = remember(plan) {
         Controller(
             context,
             buildPlayer(context, vm),
             plan,
-            vm.caps(),
+            vm.playbackCaps,
             vm,
             scope,
             initialAudioOffsetMs = audioOffsetMs,
-            onError = { playFailed = true },
+            subtitleLanguage = vm.subLang,
+            retainedAudio = retainedAudio,
+            retainedSubtitle = retainedSubtitle,
+            onError = { playFailure = it },
         )
     }
     val surfaceFocusRequester = remember { FocusRequester() }
+    // Which grades this panel can show. Probed once per playback: it is a
+    // property of the cable, and this screen owns one HDMI route for its life.
+    val displayHdrTypes = remember(context) { Caps.displayHdrTypes(context) }
 
     var positionMs by remember { mutableLongStateOf(startMs) }
     var scrubbing by remember { mutableStateOf(false) }
@@ -410,7 +475,14 @@ private fun PlayerContent(
         }
     }
 
-    DisposableEffect(controller, preferences.autoplayNext) {
+    // Keyed on the controller alone. Keying it on the preference too meant
+    // toggling "Autoplay next episode" mid-play disposed the effect,
+    // released the live player, and re-registered on the corpse — restarting
+    // the episode at its original position. The listener reads the current
+    // value instead of being rebuilt for it.
+    val autoplayNext by rememberUpdatedState(preferences.autoplayNext)
+    val playNext by rememberUpdatedState(onPlayNext)
+    DisposableEffect(controller) {
         val listener = object : Player.Listener {
             override fun onIsPlayingChanged(playing: Boolean) {
                 isPlaying = playing
@@ -422,12 +494,12 @@ private fun PlayerContent(
                 if (state == Player.STATE_ENDED) {
                     vm.postProgress(itemId, plan.durationMs, plan.durationMs)
                     controlsVisible = true
-                    if (preferences.autoplayNext && !findingNext) {
+                    if (autoplayNext && !findingNext) {
                         findingNext = true
                         scope.launch {
-                            val next = runCatching { vm.nextEpisode(itemId) }.getOrNull()
+                            val next = catchingUnlessCancelled { vm.nextEpisode(itemId) }.getOrNull()
                             findingNext = false
-                            if (next != null) onPlayNext(next)
+                            if (next != null) playNext(next)
                         }
                     }
                 }
@@ -563,8 +635,12 @@ private fun PlayerContent(
         }
     }
 
-    if (playFailed) {
-        PlaybackFailed(onExit)
+    playFailure?.let { message ->
+        PlaybackFailed(
+            message = message,
+            onRetry = { onReload(controller.realPosition()) },
+            onExit = onExit,
+        )
         return
     }
 
@@ -658,9 +734,16 @@ private fun PlayerContent(
                 isPlaying = isPlaying,
                 requestInitialFocus = panel == null,
                 mediaFacts = playerMediaFacts(
-                    plan.source,
-                    plan.audio.firstOrNull { it.index == controller.selectedAudio }
+                    file = plan.source,
+                    audio = plan.audio.firstOrNull { it.index == controller.selectedAudio }
                         ?: plan.audio.firstOrNull { it.default },
+                    delivered = controller.deliveredRange,
+                    rendered = renderedRange(
+                        delivered = controller.deliveredRange,
+                        decoderMime = controller.player.videoFormat?.sampleMimeType,
+                        decoderColorTransfer = controller.player.videoFormat?.colorInfo?.colorTransfer,
+                        hdrTypes = displayHdrTypes,
+                    ),
                 ),
                 onBack = onExit,
                 onPlayPause = { controller.playPause(); poke() },
@@ -692,15 +775,17 @@ private fun PlayerContent(
                 player = controller.player,
                 serverAudio = plan.audio,
                 serverSubtitles = plan.subtitles,
+                planMode = plan.mode,
                 serverControlledAudio = controller.deliveryMode != "direct",
                 selectedServerAudio = controller.selectedAudio,
                 selectedServerSubtitle = controller.selectedSubtitle,
-                onServerAudio = { controller.switchAudio(it); panel = null; poke() },
-                onServerSubtitle = { controller.switchSubtitle(it); panel = null; poke() },
+                onServerAudio = { onAudioChanged(it); controller.switchAudio(it); panel = null; poke() },
+                onServerSubtitle = { onSubtitleChanged(it); controller.switchSubtitle(it); panel = null; poke() },
                 onDismiss = { panel = null; poke() },
             )
             PlayerPanel.Settings -> PlayerSettings(
                 vm = vm,
+                qualityOptions = qualityOptions(plan.ladder),
                 audioOffsetMs = controller.audioOffsetMs,
                 declaredOffsetMs = plan.declaredOffsetMs,
                 currentPosition = controller::realPosition,
@@ -715,6 +800,7 @@ private fun PlayerContent(
                 plan = plan,
                 controller = controller,
                 positionMs = positionMs,
+                displayHdrTypes = displayHdrTypes,
                 onDismiss = { panel = null; poke() },
             )
             null -> Unit
@@ -846,6 +932,7 @@ internal fun Controls(
 @Composable
 private fun PlayerSettings(
     vm: AppViewModel,
+    qualityOptions: List<QualityOption>,
     audioOffsetMs: Long,
     declaredOffsetMs: Long?,
     currentPosition: () -> Long,
@@ -859,9 +946,12 @@ private fun PlayerSettings(
     RequestInitialFocus(initialFocusRequester)
     PlayerPanelSurface("Playback settings", onDismiss) {
         Text("Quality", color = Muted, style = MaterialTheme.typography.labelMedium)
-        PlaybackQuality.entries.forEach { quality ->
+        // The rungs are the server's, filtered to what this source can feed —
+        // a 1080p file never offers to upscale itself to 4K.
+        qualityOptions.forEach { option ->
+            val quality = option.quality
             PanelRow(
-                label = quality.label,
+                label = option.label,
                 selected = preferences.playbackQuality == quality,
                 modifier = if (preferences.playbackQuality == quality) {
                     Modifier.focusRequester(initialFocusRequester)
@@ -897,12 +987,19 @@ private fun PlayerSettings(
 }
 
 @Composable
-private fun PlayerInfo(plan: Plan, controller: Controller, positionMs: Long, onDismiss: () -> Unit) {
+private fun PlayerInfo(
+    plan: Plan,
+    controller: Controller,
+    positionMs: Long,
+    displayHdrTypes: Set<Int>,
+    onDismiss: () -> Unit,
+) {
     val player = controller.player
     val selectedAudio = player.audioFormat?.let(::audioLabel)
         ?: plan.audio.firstOrNull { it.index == controller.selectedAudio }?.let(::serverAudioLabel)
         ?: plan.audio.firstOrNull { it.default }?.let(::serverAudioLabel)
-    val selectedSubtitle = selectedSubtitleLabel(player, plan.subtitles, controller.selectedSubtitle)
+    val selectedSubtitle =
+        selectedSubtitleLabel(player, plan.subtitles, controller.selectedSubtitle, plan.mode)
     PlaybackInfoOverlay(
         details = PlaybackInfoDetails(
             title = plan.title,
@@ -917,6 +1014,17 @@ private fun PlayerInfo(plan: Plan, controller: Controller, positionMs: Long, onD
             sourceAudio = sourceAudioSummary(plan.source),
             playingVideo = videoFormatSummary(player.videoFormat),
             playingAudio = selectedAudio,
+            dynamicRange = dynamicRangeSummary(
+                source = sourceDynamicRange(plan.source),
+                delivered = controller.deliveredRange,
+                rendered = renderedRange(
+                    delivered = controller.deliveredRange,
+                    decoderMime = player.videoFormat?.sampleMimeType,
+                    decoderColorTransfer = player.videoFormat?.colorInfo?.colorTransfer,
+                    hdrTypes = displayHdrTypes,
+                ),
+                reasons = plan.reasons,
+            ),
             subtitles = selectedSubtitle,
             encoder = controller.encoder,
             audioSync = controller.audioOffsetMs.takeIf { it != 0L }?.let(::offsetLabel),
@@ -938,6 +1046,7 @@ internal data class PlaybackInfoDetails(
     val sourceAudio: String? = null,
     val playingVideo: String? = null,
     val playingAudio: String? = null,
+    val dynamicRange: String? = null,
     val subtitles: String = "Off",
     val encoder: String? = null,
     val audioSync: String? = null,
@@ -1029,6 +1138,7 @@ internal fun PlaybackInfoOverlay(
 
             PlaybackInfoSection("NOW PLAYING")
             details.playingVideo?.let { PlaybackInfoRow("Video", it) }
+            details.dynamicRange?.let { PlaybackInfoRow("Dynamic range", it) }
             details.playingAudio?.let { PlaybackInfoRow("Audio", it) }
             PlaybackInfoRow("Subtitles", details.subtitles)
             details.encoder?.let { PlaybackInfoRow("Encoder", it) }
@@ -1126,6 +1236,33 @@ internal fun sourceAudioSummary(file: MediaFileDto?): String? {
     return if (others > 0) "$base · +$others track${if (others == 1) "" else "s"}" else base
 }
 
+/**
+ * The info panel's "Dynamic range" row — the chip's arrow, in words, with the
+ * server's own reason for it where one exists.
+ *
+ * ```
+ * Dolby Vision (rendering)
+ * HDR10 — Dolby Vision metadata removed for this device; compatible HDR base kept
+ * SDR — tone-mapped from HDR10
+ * ```
+ */
+internal fun dynamicRangeSummary(
+    source: String?,
+    delivered: String?,
+    rendered: String?,
+    reasons: List<String>,
+): String? {
+    if (source == null) return null
+    if (delivered == null) return dynamicRangeLabel(source)
+    val onScreen = rendered ?: delivered
+    if (onScreen == source) return "${dynamicRangeLabel(source)} (rendering)"
+    val why = reasons.firstOrNull { reason ->
+        reason.contains("dolby vision", ignoreCase = true) || reason.contains("hdr", ignoreCase = true) ||
+            reason.contains("tone", ignoreCase = true)
+    } ?: "${dynamicRangeLabel(source)} source is not what this session is putting on screen"
+    return "${dynamicRangeLabel(onScreen)} — $why"
+}
+
 private fun videoFormatSummary(format: Format?): String? {
     if (format == null) return null
     val hdr = when (format.colorInfo?.colorTransfer) {
@@ -1141,13 +1278,19 @@ private fun videoFormatSummary(format: Format?): String? {
     ).joinToString(" · ").ifBlank { null }
 }
 
-private fun selectedSubtitleLabel(player: Player, serverTracks: List<SubTrack>, selectedServerTrack: Long?): String {
+private fun selectedSubtitleLabel(
+    player: Player,
+    serverTracks: List<SubTrack>,
+    selectedServerTrack: Long?,
+    planMode: String,
+): String {
     player.currentTracks.groups.filter { it.type == C.TRACK_TYPE_TEXT }.forEach { group ->
         repeat(group.length) { index ->
             if (group.isTrackSelected(index)) return subLabel(group.getTrackFormat(index))
         }
     }
-    return serverTracks.firstOrNull { it.index == selectedServerTrack }?.let(::serverSubtitleLabel) ?: "Off"
+    return serverTracks.firstOrNull { it.index == selectedServerTrack }
+        ?.let { serverSubtitleLabel(it, planMode) } ?: "Off"
 }
 
 private fun channelLabel(channels: Int): String = when (channels) {

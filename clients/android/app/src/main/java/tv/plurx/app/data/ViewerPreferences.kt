@@ -48,6 +48,11 @@ enum class HomeGrouping(val storageValue: String, val label: String) {
     }
 }
 
+/**
+ * The stored quality preference. The *menu* is built from the server's
+ * advertised ladder (see `qualityOptions`); this enum is the storage vocabulary
+ * and the fallback menu for a server too old to send one.
+ */
 enum class PlaybackQuality(val storageValue: String, val label: String) {
     Auto("auto", "Auto"),
     Original("original", "Original"),
@@ -55,7 +60,11 @@ enum class PlaybackQuality(val storageValue: String, val label: String) {
     Q1440("1440", "1440p"),
     Q1080("1080", "1080p"),
     Q720("720", "720p"),
-    Q480("480", "480p");
+    Q480("480", "480p"),
+    Q360("360", "360p");
+
+    /** The transcode rung this preference names, or null for Auto/Original. */
+    val rungHeight: Int? get() = storageValue.toIntOrNull()
 
     companion object {
         fun fromStorage(value: String?): PlaybackQuality = entries.firstOrNull {

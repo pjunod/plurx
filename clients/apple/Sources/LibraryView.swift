@@ -120,13 +120,30 @@ struct LibraryView: View {
         }
     }
 
+    /// Explicitly main-actor: the page callback below writes `@State`, and the
+    /// model it is handed to is main-actor isolated, so both ends of the
+    /// handoff live in the same isolation domain rather than crossing one.
+    @MainActor
     private func load() async {
         loading = true
         error = nil
         do {
-            items = try await model.libraryItems(collection, sort: sort)
+            // Each page paints as it arrives rather than after the last one, so
+            // a thousand-item library shows its first screenful in one round
+            // trip. `stateContent` only shows the spinner while `items` is
+            // still empty, so a pull-to-refresh over a populated grid replaces
+            // it in place instead of blanking it.
+            try await model.libraryItems(collection, sort: sort) { page in
+                items = page
+            }
         } catch {
-            self.error = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            // Same policy as Home: SwiftUI cancelling this view's task is not a
+            // failure, and a transient one over content already on screen is
+            // not worth an empty state.
+            self.error = AppModel.homeErrorMessage(
+                for: error,
+                hasCachedContent: !items.isEmpty
+            )
         }
         loading = false
     }

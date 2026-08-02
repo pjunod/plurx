@@ -29,6 +29,12 @@ struct PlayerMetadataBadge: Equatable, Identifiable {
     let symbol: String
     let mark: String?
     let accessibilityLabel: String
+    /// The badge names something the source has that this playback is not
+    /// getting. Rendered at reduced opacity on the same capsule — the fact is
+    /// still true of the file, which is why the chip stays rather than
+    /// disappearing. Trailing and defaulted so every existing construction of
+    /// this type is unchanged.
+    var dimmed: Bool = false
 
     var id: String { kind.rawValue }
 }
@@ -39,10 +45,92 @@ enum PlayerMetadataBadgeMetrics {
     static let horizontalPadding: CGFloat = 6
     static let verticalPadding: CGFloat = 2
     static let strokeWidth: CGFloat = 0.5
+    /// Readable, but plainly the "off" treatment next to a lit chip.
+    static let dimmedOpacity: Double = 0.45
 
     #if os(tvOS)
     static let fontSize: CGFloat = 16
     #endif
+}
+
+/// Source vs delivered vs rendered, for the one badge that has to answer both
+/// "what is this file?" and "what am I getting?" — MEDIA-BADGES-PLAN.md §2.
+///
+/// A reporter and nothing else. No value computed here reaches a decision, a
+/// capability query, or a session request; the badge changed, the pipeline did
+/// not (that plan's §9).
+enum DynamicRange {
+    static let dolbyVision = "dolby_vision"
+    static let hdr10 = "hdr10"
+    static let hlg = "hlg"
+    static let sdr = "sdr"
+
+    /// The coarse grade of a source in the server's own vocabulary, so a source
+    /// and `delivered_dynamic_range` compare by string equality. Both fields
+    /// are read because a file can carry only the rich `hdr_format` label.
+    static func source(hdr: String?, hdrFormat: String?) -> String? {
+        let label = hdrFormat?.trimmingCharacters(in: .whitespaces) ?? ""
+        let coarse = hdr?.trimmingCharacters(in: .whitespaces).lowercased() ?? ""
+        if coarse == dolbyVision || label.localizedCaseInsensitiveContains("dolby") {
+            return dolbyVision
+        }
+        if coarse == sdr { return nil }
+        if !coarse.isEmpty { return coarse }
+        if label.isEmpty { return nil }
+        // "HDR10+", "HDR10", "SMPTE ST 2084" — anything left that names a grade
+        // without saying HLG is a PQ grade.
+        return label.localizedCaseInsensitiveContains("hlg") ? hlg : hdr10
+    }
+
+    /// The base chip text and its spoken form, unchanged from what the overlay
+    /// has always shown for a source: the arrow suffix carries the precision.
+    static func sourceMark(_ grade: String) -> String {
+        grade == dolbyVision ? "DV" : "HDR"
+    }
+
+    static func sourceLabel(_ grade: String) -> String {
+        grade == dolbyVision ? "Dolby Vision" : "HDR"
+    }
+
+    static func shortLabel(_ grade: String) -> String {
+        switch grade {
+        case Self.dolbyVision: return "DV"
+        case Self.hdr10: return "HDR10"
+        case Self.hlg: return "HLG"
+        case Self.sdr: return "SDR"
+        default: return grade.uppercased()
+        }
+    }
+
+    static func longLabel(_ grade: String) -> String {
+        switch grade {
+        case Self.dolbyVision: return "Dolby Vision"
+        case Self.hdr10: return "HDR10"
+        case Self.hlg: return "HLG"
+        case Self.sdr: return "SDR"
+        default: return grade.uppercased()
+        }
+    }
+
+    /// What is on the panel. Delivered bits are necessary but not sufficient:
+    /// an HDR10 direct play on an SDR display is delivered HDR and rendered
+    /// SDR. `AVPlayer.eligibleForHDRPlayback` (via `Caps.displayIsHDR`) is the
+    /// documented signal and the whole of it — there is no public per-variant
+    /// introspection for HLS, and headroom polling is a stated non-goal.
+    static func rendered(delivered: String, displayHDR: Bool) -> String {
+        (delivered != sdr && !displayHDR) ? sdr : delivered
+    }
+
+    /// The server already says *why* ("Dolby Vision metadata removed for this
+    /// device; compatible HDR base kept") — better than anything invented here.
+    /// Only borrow a reason that is actually about the picture.
+    static func reason(from reasons: [String]?) -> String? {
+        reasons?.first {
+            $0.localizedCaseInsensitiveContains("dolby vision")
+                || $0.localizedCaseInsensitiveContains("hdr")
+                || $0.localizedCaseInsensitiveContains("tone")
+        }
+    }
 }
 
 /// Full-screen Apple player with an explicit on-demand transport. AVPlayer
@@ -544,9 +632,14 @@ struct PlayerView: View {
         let audio = controller.audioTracks.first { $0.index == controller.selectedAudio }
             ?? controller.audioTracks.first { $0.default }
             ?? controller.audioTracks.first
+        // Eligibility is asked here, at render time, rather than cached at
+        // launch: an Apple TV whose Dolby Vision output is turned off in
+        // Settings changes this answer while the app is running.
         let badges = Self.playbackBadges(
             source: controller.decision?.source,
-            audio: audio
+            audio: audio,
+            delivered: controller.deliveredRange,
+            displayHDR: Caps.displayIsHDR
         )
         return HStack(spacing: PlayerMetadataBadgeMetrics.rowSpacing) {
             ForEach(badges) { badge in
@@ -567,6 +660,7 @@ struct PlayerView: View {
                         lineWidth: PlayerMetadataBadgeMetrics.strokeWidth
                     )
                 }
+                .opacity(badge.dimmed ? PlayerMetadataBadgeMetrics.dimmedOpacity : 1)
                 .accessibilityElement(children: .ignore)
                 .accessibilityLabel(badge.accessibilityLabel)
             }
@@ -594,7 +688,15 @@ struct PlayerView: View {
         return hours > 0 ? "\(hours)h \(minutes)m" : "\(minutes)m"
     }
 
-    static func playbackBadges(source: SourceSummary?, audio: AudioTrack?) -> [PlayerMetadataBadge] {
+    /// `delivered`/`displayHDR` default to "no session yet, assume nothing is
+    /// being lost", which is exactly the source-only state the detail screens
+    /// and an older server both want.
+    static func playbackBadges(
+        source: SourceSummary?,
+        audio: AudioTrack?,
+        delivered: String? = nil,
+        displayHDR: Bool = true
+    ) -> [PlayerMetadataBadge] {
         var badges: [PlayerMetadataBadge] = []
         if let label = resolutionLabel(width: source?.width, height: source?.height) {
             let is4K = label == "4K"
@@ -605,14 +707,13 @@ struct PlayerView: View {
                 accessibilityLabel: label
             ))
         }
-        if let hdr = source?.hdrFormat ?? source?.hdr, !hdr.isEmpty {
-            let dolbyVision = hdr.localizedCaseInsensitiveContains("dolby vision")
-            badges.append(PlayerMetadataBadge(
-                kind: .dynamicRange,
-                symbol: "sparkles",
-                mark: dolbyVision ? "DV" : "HDR",
-                accessibilityLabel: dolbyVision ? "Dolby Vision" : "HDR"
-            ))
+        if let range = dynamicRangeBadge(
+            hdr: source?.hdr,
+            hdrFormat: source?.hdrFormat,
+            delivered: delivered,
+            displayHDR: displayHDR
+        ) {
+            badges.append(range)
         }
         if let audio, let sound = soundLabel(audio) {
             badges.append(PlayerMetadataBadge(
@@ -625,8 +726,91 @@ struct PlayerView: View {
         return badges
     }
 
-    static func playbackFacts(source: SourceSummary?, audio: AudioTrack?) -> [String] {
-        playbackBadges(source: source, audio: audio).map(\.accessibilityLabel)
+    /// The three states of MEDIA-BADGES-PLAN §2.3, as a pure function of
+    /// (source grade, delivered grade, display capability):
+    ///
+    /// - **lit** — rendered grade equals the source grade: today's chip.
+    /// - **downgraded** — they differ: the same chip, dimmed, with an arrow
+    ///   suffix naming what is actually on screen (`DV → HDR10`).
+    /// - **source-only** — `delivered` is nil (no session, or a server that
+    ///   does not report it): today's chip, unchanged.
+    ///
+    /// The badge text always starts from what the file carries, because that
+    /// claim stays true either way; what changes is whether it is being kept.
+    static func dynamicRangeBadge(
+        hdr: String?,
+        hdrFormat: String?,
+        delivered: String?,
+        displayHDR: Bool
+    ) -> PlayerMetadataBadge? {
+        guard let source = DynamicRange.source(hdr: hdr, hdrFormat: hdrFormat) else {
+            return nil
+        }
+        let lit = PlayerMetadataBadge(
+            kind: .dynamicRange,
+            symbol: "sparkles",
+            mark: DynamicRange.sourceMark(source),
+            accessibilityLabel: DynamicRange.sourceLabel(source)
+        )
+        guard let delivered, !delivered.isEmpty else { return lit }
+        let rendered = DynamicRange.rendered(delivered: delivered, displayHDR: displayHDR)
+        guard rendered != source else { return lit }
+        return PlayerMetadataBadge(
+            kind: .dynamicRange,
+            symbol: "sparkles",
+            mark: "\(DynamicRange.sourceMark(source)) → \(DynamicRange.shortLabel(rendered))",
+            accessibilityLabel:
+                "\(DynamicRange.sourceLabel(source)), playing as \(DynamicRange.longLabel(rendered))",
+            dimmed: true
+        )
+    }
+
+    /// The same three-layer truth in one sentence, for the playback-info
+    /// panel's "Dynamic range" row — the web player's equivalent row worded the
+    /// same way. Nil when there is nothing to report: an SDR source with no
+    /// session on it.
+    static func dynamicRangeSummary(
+        source: SourceSummary?,
+        delivered: String?,
+        displayHDR: Bool,
+        reasons: [String]?
+    ) -> String? {
+        let grade = DynamicRange.source(hdr: source?.hdr, hdrFormat: source?.hdrFormat)
+            ?? DynamicRange.sdr
+        guard let delivered, !delivered.isEmpty else {
+            guard grade != DynamicRange.sdr else { return nil }
+            // No session and no report: the rich source label is all there is.
+            return source?.hdrFormat ?? DynamicRange.longLabel(grade)
+        }
+        let rendered = DynamicRange.rendered(delivered: delivered, displayHDR: displayHDR)
+        let long = DynamicRange.longLabel(rendered)
+        guard rendered != grade else { return "\(long) (rendering)" }
+        let displayLoss = delivered != DynamicRange.sdr && !displayHDR
+        let note: String
+        if displayLoss {
+            note = "this display is not HDR"
+        } else if let served = DynamicRange.reason(from: reasons) {
+            note = served
+        } else if rendered == DynamicRange.sdr {
+            note = "tone-mapped from \(DynamicRange.longLabel(grade))"
+        } else {
+            note = "delivered as \(long)"
+        }
+        return "\(long) — \(note)"
+    }
+
+    static func playbackFacts(
+        source: SourceSummary?,
+        audio: AudioTrack?,
+        delivered: String? = nil,
+        displayHDR: Bool = true
+    ) -> [String] {
+        playbackBadges(
+            source: source,
+            audio: audio,
+            delivered: delivered,
+            displayHDR: displayHDR
+        ).map(\.accessibilityLabel)
     }
 
     static func soundLabel(_ track: AudioTrack) -> (mark: String, accessibilityLabel: String)? {
@@ -1109,6 +1293,16 @@ private struct PlaybackStatsView: View {
         let size = controller.presentationSize
         if size.width > 0 && size.height > 0 {
             row("Output", "\(Int(size.width))×\(Int(size.height))")
+        }
+        // The badge says it in three characters; this says it in words, with
+        // the server's own reason for the difference.
+        if let range = PlayerView.dynamicRangeSummary(
+            source: controller.decision?.source,
+            delivered: controller.deliveredRange,
+            displayHDR: Caps.displayIsHDR,
+            reasons: controller.decision?.reasons
+        ) {
+            row("Dynamic range", range)
         }
         if let bitrate = controller.observedBitrate, bitrate > 0 {
             row("Observed rate", bitRate(Int(bitrate)))

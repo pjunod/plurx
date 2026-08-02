@@ -25,6 +25,8 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusProperties
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -38,9 +40,13 @@ import tv.plurx.app.ui.components.ChoicePicker
 import tv.plurx.app.ui.components.LoadingBox
 import tv.plurx.app.ui.components.MediaRow
 import tv.plurx.app.ui.components.PosterResolutionPlacement
+import tv.plurx.app.ui.components.safeDisplayInsets
 import tv.plurx.app.ui.components.TvIconButton
 import tv.plurx.app.ui.theme.Accent
 import tv.plurx.app.ui.theme.Muted
+
+/** The "Group by" picker's place in the vertical D-pad chain. */
+private const val GROUPING_KEY = "grouping"
 
 private data class HomeCollection(
     val title: String,
@@ -74,16 +80,26 @@ fun HomeScreen(
         )
 
         when {
-            state.loading -> LoadingBox()
-            state.error != null -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            // Only a cold start gets a spinner. Once anything has arrived the
+            // shelves stay up and fill in — a refresh must never blank a
+            // dashboard the viewer is already reading, and neither must a
+            // refresh that fails.
+            !state.hasContent && state.loading -> LoadingBox()
+            !state.hasContent && state.error != null -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 Text(state.error!!, color = Muted)
             }
             else -> {
                 val collections = homeCollections(state.libraries, state.libraryItems, preferences.homeGrouping)
+                // Every vertical stop on this page, in the order a D-pad walks
+                // them. The "Group by" picker is one of them: it used to sit
+                // between the hub shelves and the library shelves while their
+                // up/down pointed straight past it at each other, so the only
+                // way to change the grouping was to have a touchscreen.
                 val visibleShelfKeys = buildList {
                     if (state.hubs.continue_watching.isNotEmpty()) add("continue")
                     if (state.hubs.next_up.isNotEmpty()) add("next")
                     if (state.hubs.recently_added.isNotEmpty()) add("recent")
+                    if (state.libraries.isNotEmpty()) add(GROUPING_KEY)
                     collections.filter { it.items.isNotEmpty() }.forEach {
                         add("collection-${it.title}")
                     }
@@ -148,7 +164,16 @@ fun HomeScreen(
                                     options = HomeGrouping.entries,
                                     optionLabel = { it.label },
                                     onSelect = vm::setHomeGrouping,
-                                    modifier = Modifier.fillMaxWidth(if (formFactor == FormFactor.Compact) 1f else .32f),
+                                    modifier = Modifier
+                                        .fillMaxWidth(if (formFactor == FormFactor.Compact) 1f else .32f)
+                                        .then(
+                                            shelfFocus[GROUPING_KEY]
+                                                ?.let { Modifier.focusRequester(it) } ?: Modifier,
+                                        )
+                                        .focusProperties {
+                                            previousShelf(GROUPING_KEY)?.let { up = it }
+                                            nextShelf(GROUPING_KEY)?.let { down = it }
+                                        },
                                 )
                             }
                         }
@@ -195,7 +220,7 @@ internal fun HomeTopBar(
     onRefresh: () -> Unit,
     onSearch: () -> Unit,
     onOpenSettings: () -> Unit,
-    safeInsets: WindowInsets = WindowInsets.statusBars,
+    safeInsets: WindowInsets = safeDisplayInsets(),
 ) {
     Row(
         Modifier

@@ -158,6 +158,7 @@ pub fn parse_probe_json(json: &Value) -> ProbeResult {
                     title: tag(stream, "title"),
                     default: disposition(stream, "default"),
                     forced: disposition(stream, "forced"),
+                    hearing_impaired: disposition(stream, "hearing_impaired"),
                 });
                 sub_i += 1;
             }
@@ -379,6 +380,48 @@ mod tests {
         assert_eq!(p.audio_streams[1].index, 1);
         assert_eq!(p.subtitle_streams.len(), 1);
         assert_eq!(p.subtitle_streams[0].language.as_deref(), Some("eng"));
+    }
+
+    /// SDH is a *disposition*, not a naming convention. Reading the flag the
+    /// muxer authored is what lets an accessibility rendition be tagged as
+    /// one when its title says nothing — and what stops the tag depending on
+    /// whoever named the track.
+    #[test]
+    fn subtitle_dispositions_include_hearing_impaired() {
+        let j = json!({
+            "streams": [
+                { "codec_type": "subtitle", "codec_name": "subrip",
+                  "disposition": { "default": 1, "forced": 0, "hearing_impaired": 1 },
+                  "tags": { "language": "eng", "title": "English" } },
+                { "codec_type": "subtitle", "codec_name": "subrip",
+                  "disposition": { "default": 0, "forced": 1 },
+                  "tags": { "language": "eng", "title": "Forced" } }
+            ]
+        });
+        let p = parse_probe_json(&j);
+        let sdh = &p.subtitle_streams[0];
+        assert!(sdh.hearing_impaired, "a bland title, an authored flag");
+        assert!(sdh.default);
+        assert!(!sdh.forced);
+        // The other track has no such key at all, which is not the same as
+        // having it set — an absent disposition is a plain "no".
+        assert!(!p.subtitle_streams[1].hearing_impaired);
+        assert!(p.subtitle_streams[1].forced);
+    }
+
+    /// A library probed before plurx read this flag keeps its stored JSON
+    /// until something re-probes it, so the field has to survive being
+    /// absent — deserializing to `false`, which routes those tracks back to
+    /// the title sniff they always used.
+    #[test]
+    fn probe_json_written_before_the_flag_existed_still_deserializes() {
+        let stored = r#"[{"index":0,"codec":"subrip","language":"eng",
+                          "title":"English SDH","default":false,"forced":false}]"#;
+        let tracks: Vec<crate::domain::SubtitleStream> =
+            serde_json::from_str(stored).expect("old probe rows still load");
+        assert_eq!(tracks.len(), 1);
+        assert!(!tracks[0].hearing_impaired);
+        assert_eq!(tracks[0].title.as_deref(), Some("English SDH"));
     }
 
     #[test]

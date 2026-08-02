@@ -34,7 +34,10 @@ struct PosterCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
             ZStack(alignment: .bottomLeading) {
-                AuthImage(path: item.poster ?? item.backdrop)
+                AuthImage(
+                    path: item.poster ?? item.backdrop,
+                    targetSize: CGSize(width: width, height: width * 1.5)
+                )
                     .frame(width: width, height: width * 1.5)
                     .clipped()
                     .background(Palette.surfaceHi)
@@ -111,7 +114,10 @@ struct LandscapeCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
             ZStack(alignment: .bottom) {
-                AuthImage(path: item.backdrop ?? item.poster)
+                AuthImage(
+                    path: item.backdrop ?? item.poster,
+                    targetSize: CGSize(width: width, height: width * 9 / 16)
+                )
                     .frame(width: width, height: width * 9 / 16)
                     .clipped()
                     .background(Palette.surfaceHi)
@@ -237,7 +243,10 @@ struct EpisodeCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             ZStack(alignment: .bottomLeading) {
-                AuthImage(path: item.backdrop ?? item.poster)
+                AuthImage(
+                    path: item.backdrop ?? item.poster,
+                    targetSize: CGSize(width: width, height: width * 9 / 16)
+                )
                     .frame(width: width, height: width * 9 / 16)
                     .clipped()
                     .background(Palette.surfaceHi)
@@ -450,7 +459,10 @@ private struct ComingSoonCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
             ZStack(alignment: .bottomLeading) {
-                AuthImage(path: entry.poster)
+                AuthImage(
+                    path: entry.poster,
+                    targetSize: CGSize(width: width, height: width * 1.5)
+                )
                     .frame(width: width, height: width * 1.5)
                     .clipped()
                     .background(Palette.surfaceHi)

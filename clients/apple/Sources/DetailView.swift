@@ -8,6 +8,7 @@ struct ItemMetadataBadge: Equatable, Identifiable {
         case runtime
         case resolution
         case video
+        case dynamicRange
     }
 
     let kind: Kind
@@ -323,7 +324,13 @@ struct DetailView: View {
                 loadError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             }
         }
-        .fullScreenCover(item: $play) { ctx in
+        .fullScreenCover(item: $play, onDismiss: {
+            // Finishing an episode changes Continue Watching and Next Up, and
+            // nothing else ever asked the server about it: leaving the player
+            // used to return to a dashboard still showing the title just
+            // watched, until the app was relaunched.
+            Task { await model.loadHome() }
+        }) { ctx in
             PlayerView(itemId: ctx.itemId, fileId: ctx.fileId, startMs: ctx.startMs,
                        durationMs: ctx.durationMs, title: ctx.title,
                        subtitle: ctx.subtitle, year: ctx.year, overview: ctx.overview,
@@ -662,7 +669,13 @@ struct DetailView: View {
                 tvSeriesBackground(item)
 
                 HStack(alignment: .top, spacing: 46) {
-                    AuthImage(path: item.poster ?? item.backdrop)
+                    AuthImage(
+                        path: item.poster ?? item.backdrop,
+                        targetSize: CGSize(
+                            width: TVSeriesDetailMetrics.posterWidth,
+                            height: TVSeriesDetailMetrics.posterHeight
+                        )
+                    )
                         .frame(
                             width: TVSeriesDetailMetrics.posterWidth,
                             height: TVSeriesDetailMetrics.posterHeight
@@ -880,6 +893,24 @@ struct DetailView: View {
                 symbol: "film.fill",
                 mark: label,
                 accessibilityLabel: label
+            ))
+        }
+        // Source-only, and deliberately so: there is no session on a detail
+        // page, so there is nothing to report a downgrade against. Android and
+        // the web detail pages have carried this badge all along; Apple's did
+        // not have one at all. Built by the player's own badge function so the
+        // two screens can never label the same file differently.
+        if let range = PlayerView.dynamicRangeBadge(
+            hdr: file?.hdr,
+            hdrFormat: file?.hdrFormat,
+            delivered: nil,
+            displayHDR: true
+        ) {
+            badges.append(ItemMetadataBadge(
+                kind: .dynamicRange,
+                symbol: range.symbol,
+                mark: range.mark,
+                accessibilityLabel: range.accessibilityLabel
             ))
         }
         return badges

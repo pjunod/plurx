@@ -275,6 +275,7 @@ mod tests {
             title: None,
             default,
             forced,
+            hearing_impaired: false,
         }
     }
     fn prefs(audio: &str, sub: &str, mode: SubMode) -> LangPrefs {

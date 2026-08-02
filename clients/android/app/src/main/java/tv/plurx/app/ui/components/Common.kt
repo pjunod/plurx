@@ -4,7 +4,7 @@ import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.focusable
+import androidx.compose.foundation.focusGroup
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -19,7 +19,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -99,8 +98,11 @@ fun PosterCard(
             .width(width)
             .scale(scale)
             .onFocusChanged { focused = it.isFocused }
+            // One focus target, not two. `clickable` is already focusable, so
+            // the trailing `focusable()` added a second, *unclickable* target
+            // in front of it: the D-pad could land on a card whose centre
+            // press then did nothing.
             .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) { onClick() }
-            .focusable()
     ) {
         Box(
             Modifier
@@ -225,25 +227,38 @@ fun MediaRow(
                 )
             }
         }
+        // The shelf, not a card, is what the neighbours point at.
+        //
+        // The requester used to ride on the card at index 0, which a `LazyRow`
+        // disposes as soon as the viewer scrolls past it — after that, every
+        // neighbour aiming `up`/`down` here was calling `requestFocus()` on a
+        // requester attached to nothing. `focusGroup` makes the row itself the
+        // target and lets Compose hand focus to whichever card is on screen,
+        // and the row survives scrolling because the row is what exists.
+        //
+        // The `up`/`down` overrides live here too: `FocusTargetNode` resolves
+        // its properties by walking ancestors, so one declaration on the
+        // container governs every card in the shelf, whether or not that card
+        // was composed when the shelf was laid out.
         LazyRow(
-            contentPadding = PaddingValues(horizontal = 20.dp),
-            horizontalArrangement = Arrangement.spacedBy(14.dp),
-        ) {
-            itemsIndexed(items, key = { _, item -> item.id }) { index, item ->
-                var cardModifier = Modifier.focusProperties {
+            modifier = Modifier
+                .testTag(shelfTestTag(title))
+                .then(rowFocusRequester?.let { Modifier.focusRequester(it) } ?: Modifier)
+                .focusGroup()
+                .focusProperties {
                     if (onViewAll != null) {
                         up = viewAllFocusRequester
                     } else if (previousRowFocusRequester != null) {
                         up = previousRowFocusRequester
                     }
                     if (nextRowFocusRequester != null) down = nextRowFocusRequester
-                }
-                if (index == 0 && rowFocusRequester != null) {
-                    cardModifier = cardModifier.focusRequester(rowFocusRequester)
-                }
+                },
+            contentPadding = PaddingValues(horizontal = 20.dp),
+            horizontalArrangement = Arrangement.spacedBy(14.dp),
+        ) {
+            items(items, key = { item -> item.id }) { item ->
                 PosterCard(
                     item,
-                    modifier = cardModifier,
                     width = posterWidth,
                     resolutionPlacement = resolutionPlacement,
                 ) { onOpen(item) }
@@ -251,6 +266,9 @@ fun MediaRow(
         }
     }
 }
+
+/** Stable handle on a shelf's scrolling row, for the D-pad focus tests. */
+internal fun shelfTestTag(title: String): String = "shelf-$title"
 
 @Composable
 fun <T> ChoicePicker(
@@ -276,8 +294,8 @@ fun <T> ChoicePicker(
                     .tvFocusRing(selectorShape, focusedScale = 1.03f)
                     .background(SurfaceHi, selectorShape)
                     .border(1.dp, Outline, selectorShape)
+                    // `clickable` carries the focus target; see PosterCard.
                     .clickable { open = true }
-                    .focusable()
                     .padding(horizontal = 16.dp, vertical = 14.dp),
             )
             DropdownMenu(expanded = open, onDismissRequest = { open = false }) {

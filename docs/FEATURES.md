@@ -44,7 +44,7 @@ anime.
   width/height, bit depth, HDR type (HDR10 / HDR10+ / HLG / Dolby Vision +
   profile/level), overall bitrate, every audio track (codec, channels,
   language, title, default), every subtitle track (codec, language, forced,
-  default), and chapters.
+  default, hearing-impaired/SDH), and chapters.
 - **Incremental rescan:** unchanged files are skipped by size + mtime, so a
   rescan of a large library is cheap. Vanished files are reconciled (the item
   reflects what's actually on disk).
@@ -283,6 +283,14 @@ decoding shows what the file is versus what your browser is actually rendering.
 - **Staged loading overlay** before the first frame: *Reading media → Starting
   the transcoder → Preparing the stream / Buffering* — so a slow start looks like
   progress, not a hang.
+- **Media badges that tell the truth about HDR and Dolby Vision.** The
+  dynamic-range chip in the play overlay always names what the *file* carries
+  ("DV P7", "HDR10", "HLG") and dims with an arrow to what you are *actually
+  getting* — `DV P7 → HDR10` when the server stripped Dolby Vision for this
+  browser, `HDR10 → SDR` on a transcode or on an SDR monitor (re-checked live,
+  so dragging the window between screens changes the badge). The stats
+  overlay's Output section spells the same thing out in a sentence, with the
+  server's reason. Detail pages still describe the file, not a session.
 - **Rich stats overlay:** Playback (method, encoder, position/duration), Source
   (codec, bit depth, HDR, resolution, bitrate, container, audio track), Now
   decoding (the browser's actual resolution, dropped frames, buffer), Network

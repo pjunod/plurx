@@ -172,6 +172,12 @@ pub struct Decision {
     pub preserve_dolby_vision: bool,
     /// Target container for remux/transcode delivery.
     pub container: &'static str,
+    /// The dynamic range this plan actually delivers — see
+    /// [`delivered_dynamic_range`]. Reported, not decided: it is a readout of
+    /// the verdict above, so the play menu's badge can say "DV P7 → HDR10"
+    /// instead of claiming the source's grade for a stripped remux. A session
+    /// created later overrides it (MEDIA-BADGES-PLAN §3.2).
+    pub delivered_dynamic_range: &'static str,
 }
 
 /// The per-dimension compatibility verdicts, shared by [`decide`] and
@@ -273,6 +279,73 @@ fn evaluate(file: &MediaFile, profile: &DeviceProfile) -> (Checks, Vec<String>) 
 /// player either understands or chokes on?
 pub fn is_dolby_vision(file: &MediaFile) -> bool {
     file.hdr.as_deref() == Some("dolby_vision")
+}
+
+/// The dynamic range of the bytes a delivery actually puts on the wire —
+/// what the viewer is *getting*, as opposed to what the file carries.
+///
+/// A reporter, never a decider: it reads a verdict that has already been
+/// made and names its dynamic-range outcome, so the badge in the play menu
+/// can stop claiming the source's grade for a tone-mapped transcode of it
+/// (MEDIA-BADGES-PLAN §2.1). The vocabulary is `MediaFile.hdr`'s plus
+/// `"sdr"`, so a client compares source against delivered with string
+/// equality.
+///
+/// The three deliveries are total:
+///
+/// - **Transcode** is always `"sdr"`. Every encoder is H.264
+///   (`transcode/encoder.rs` — libx264 `-profile:v high`, h264_nvenc/qsv/
+///   vaapi/videotoolbox, no 10-bit path) and every filter chain ends in
+///   `yuv420p`/`nv12`; an HDR source goes through the tone-map graph. The
+///   `ToneMap::None` escape hatch still lands on 8-bit `format=yuv420p`
+///   (`transcode/mod.rs`), so "sdr" stays the honest answer — washed out at
+///   worst, never a wider grade than claimed.
+/// - **Direct play / remux of a non-DV source** delivers the source's grade:
+///   the video is copied byte-for-byte.
+/// - **Direct play / remux of a DV source** either preserves the Dolby
+///   Vision configuration (`preserve_dolby_vision`) or strips it to the base
+///   layer. Under [`decide`] a strip is only reachable through
+///   `has_compatible_dv_base`, so the remux carries an "(HDR10-compatible)"
+///   or "(HLG-compatible)" marker to read the base's grade off.
+///
+/// [`decide_forced`] with [`Force::Original`] is the one arm that reaches a
+/// stripping remux outside that guarantee: it means "no video re-encode", so
+/// it copies a DV source the client cannot decode whatever `dv_handling`
+/// said. With no compatibility marker at all — a Profile 5 source, whose base
+/// layer is not an HDR10 grade in any sense — this still answers `"hdr10"`,
+/// and that over-claims. The over-claim is deliberately left rather than
+/// guessed at: narrowing it needs `dv_strippable`, a fact about the server
+/// rather than about the delivery this signature describes, and the stream in
+/// question is one no client that asked for it can play — the error path
+/// rescues it into a transcode, whose session then reports `"sdr"` for what
+/// the viewer actually got.
+pub fn delivered_dynamic_range(
+    file: &MediaFile,
+    method: PlaybackMethod,
+    preserve_dolby_vision: bool,
+) -> &'static str {
+    if method == PlaybackMethod::Transcode {
+        return "sdr";
+    }
+    match file.hdr.as_deref() {
+        Some("dolby_vision") if preserve_dolby_vision => "dolby_vision",
+        Some("dolby_vision") => {
+            if file
+                .hdr_format
+                .as_deref()
+                .is_some_and(|label| label.contains("HLG-compatible"))
+            {
+                "hlg"
+            } else {
+                "hdr10"
+            }
+        }
+        Some("hdr10") => "hdr10",
+        Some("hlg") => "hlg",
+        // An SDR source, an HDR flavour nothing downstream distinguishes
+        // (HDR10+ probes as "hdr10"), or a file nobody ever probed.
+        _ => "sdr",
+    }
 }
 
 /// Profile number from the scan's rich label (for example Profile 5 or 8).
@@ -388,6 +461,7 @@ pub fn decide(file: &MediaFile, profile: &DeviceProfile, dv_strippable: bool) ->
         transcode_audio: !c.audio_ok,
         preserve_dolby_vision,
         container: "mp4",
+        delivered_dynamic_range: delivered_dynamic_range(file, method, preserve_dolby_vision),
     }
 }
 
@@ -409,6 +483,11 @@ pub fn decide_forced(
                 transcode_audio: true,
                 preserve_dolby_vision: false,
                 container: "mp4",
+                delivered_dynamic_range: delivered_dynamic_range(
+                    file,
+                    PlaybackMethod::Transcode,
+                    false,
+                ),
             }
         }
         Force::Original => {
@@ -436,12 +515,18 @@ pub fn decide_forced(
                         .to_owned(),
                 );
             }
+            let preserve_dolby_vision = is_dolby_vision(file) && profile.allows_dolby_vision(file);
             Decision {
                 method,
                 reasons,
                 transcode_audio: !c.audio_ok,
-                preserve_dolby_vision: is_dolby_vision(file) && profile.allows_dolby_vision(file),
+                preserve_dolby_vision,
                 container: "mp4",
+                delivered_dynamic_range: delivered_dynamic_range(
+                    file,
+                    method,
+                    preserve_dolby_vision,
+                ),
             }
         }
     }
@@ -742,6 +827,138 @@ mod tests {
             .reasons
             .iter()
             .all(|reason| !reason.contains("browser")));
+    }
+
+    /// The badge's whole reason for existing: a DV disc remux says "DV P7"
+    /// while Chrome watches a tone-mapped 1080p SDR encode of it. The
+    /// decision already knows which of the three deliveries happened — this
+    /// pins that it now says so out loud, per delivery.
+    #[test]
+    fn a_dolby_vision_plan_reports_the_grade_it_actually_delivers() {
+        let mut dv = file("mkv", "hevc", "aac");
+        dv.hdr = Some("dolby_vision".to_owned());
+        dv.hdr_format = Some("Dolby Vision · Profile 7 (HDR10-compatible)".to_owned());
+        let hdr_client = |dolby: bool| {
+            caps_profile(
+                vec!["mkv".into(), "mp4".into()],
+                vec!["hevc".into(), "h264".into()],
+                vec!["aac".into()],
+                None,
+                true,
+                dolby,
+            )
+        };
+
+        // Safari decodes DV: the file goes over untouched, RPUs and all.
+        let safari = decide(&dv, &hdr_client(true), true);
+        assert_eq!(safari.method, PlaybackMethod::DirectPlay);
+        assert_eq!(safari.delivered_dynamic_range, "dolby_vision");
+
+        // Chrome on a server that can strip: the base layer survives, and
+        // the base layer is what the compatibility marker names.
+        let stripped = decide(&dv, &hdr_client(false), true);
+        assert_eq!(stripped.method, PlaybackMethod::Remux);
+        assert_eq!(
+            stripped.delivered_dynamic_range, "hdr10",
+            "an HDR10-compatible base delivers HDR10, not Dolby Vision"
+        );
+        let mut hlg_base = dv.clone();
+        hlg_base.hdr_format = Some("Dolby Vision · Profile 8 (HLG-compatible)".to_owned());
+        assert_eq!(
+            decide(&hlg_base, &hdr_client(false), true).delivered_dynamic_range,
+            "hlg",
+            "and an HLG-compatible base delivers HLG"
+        );
+
+        // Chrome on a server that cannot strip: a re-encode, which is H.264
+        // 8-bit through the tone-map graph however the source was graded.
+        let reencoded = decide(&dv, &hdr_client(false), false);
+        assert_eq!(reencoded.method, PlaybackMethod::Transcode);
+        assert_eq!(reencoded.delivered_dynamic_range, "sdr");
+    }
+
+    /// The non-DV half of the truth table. Copied video keeps whatever the
+    /// source was graded in; every transcode lands on SDR, because every
+    /// encoder in the pipeline emits H.264 8-bit.
+    #[test]
+    fn copied_video_keeps_the_sources_grade_and_a_transcode_never_does() {
+        let mut hdr10 = file("mkv", "hevc", "aac"); // MKV → container mismatch
+        hdr10.hdr = Some("hdr10".to_owned());
+        let hdr_client = caps_profile(
+            vec!["mp4".into()],
+            vec!["hevc".into()],
+            vec!["aac".into()],
+            None,
+            true,
+            false,
+        );
+        let remuxed = decide(&hdr10, &hdr_client, true);
+        assert_eq!(remuxed.method, PlaybackMethod::Remux);
+        assert_eq!(remuxed.delivered_dynamic_range, "hdr10");
+
+        // Same file, SDR display: the server tone-maps, and says so.
+        let sdr_client = caps_profile(
+            vec!["mp4".into()],
+            vec!["hevc".into()],
+            vec!["aac".into()],
+            None,
+            false,
+            false,
+        );
+        let toned = decide(&hdr10, &sdr_client, true);
+        assert_eq!(toned.method, PlaybackMethod::Transcode);
+        assert_eq!(toned.delivered_dynamic_range, "sdr");
+
+        // An SDR source is SDR wherever it goes — there is no grade to lose.
+        let plain = file("mp4", "h264", "aac");
+        assert_eq!(
+            decide(&plain, default_profile(), true).delivered_dynamic_range,
+            "sdr"
+        );
+        assert_eq!(
+            decide(&file("mkv", "h264", "ac3"), default_profile(), true).delivered_dynamic_range,
+            "sdr"
+        );
+    }
+
+    /// A manual quality pick is still a delivery, so it still has to answer.
+    /// Original honours the strip (base layer kept); Transcode overrides a
+    /// perfectly direct-playable DV file and tone-maps it.
+    #[test]
+    fn a_forced_quality_reports_the_grade_that_override_delivers() {
+        let mut dv = file("mp4", "hevc", "aac"); // container+audio both fine
+        dv.hdr = Some("dolby_vision".to_owned());
+        dv.hdr_format = Some("Dolby Vision · Profile 7 (HDR10-compatible)".to_owned());
+        let chrome = caps_profile(
+            vec!["mp4".into()],
+            vec!["hevc".into()],
+            vec!["aac".into()],
+            None,
+            true,
+            false,
+        );
+        let original = decide_forced(&dv, &chrome, Force::Original, true);
+        assert_eq!(original.method, PlaybackMethod::Remux);
+        assert_eq!(original.delivered_dynamic_range, "hdr10");
+
+        let safari = caps_profile(
+            vec!["mp4".into()],
+            vec!["hevc".into()],
+            vec!["aac".into()],
+            None,
+            true,
+            true,
+        );
+        assert_eq!(
+            decide_forced(&dv, &safari, Force::Original, true).delivered_dynamic_range,
+            "dolby_vision",
+            "Original on a client that decodes DV delivers DV"
+        );
+        assert_eq!(
+            decide_forced(&dv, &safari, Force::Transcode, true).delivered_dynamic_range,
+            "sdr",
+            "and a forced rung tone-maps the same file, direct-playable or not"
+        );
     }
 
     #[test]

@@ -34,6 +34,8 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
 import kotlinx.coroutines.delay
+import tv.plurx.app.ui.FormFactor
+import tv.plurx.app.ui.currentFormFactor
 
 internal val TvFocusVisibleKey = SemanticsPropertyKey<Boolean>("TvFocusVisible")
 internal var SemanticsPropertyReceiver.tvFocusVisible by TvFocusVisibleKey
@@ -153,9 +155,18 @@ fun TvTextButton(
  * Material buttons paint a 40dp surface inside a 48dp layout touch target. A focus modifier on the
  * button otherwise outlines that invisible outer layout, leaving a gap around the painted surface.
  * Android still expands touch hit testing; TV navigation uses the component's focus target.
+ *
+ * **Television only.** On a phone or tablet the 48dp minimum is an accessibility
+ * guarantee for fingers, and there is no focus ring to tighten because there is
+ * no D-pad — surrendering it everywhere traded a real touch target for a
+ * cosmetic fix to a ten-foot problem.
  */
 @Composable
 private fun TightTvButtonFocusBounds(content: @Composable () -> Unit) {
+    if (currentFormFactor() != FormFactor.Television) {
+        content()
+        return
+    }
     CompositionLocalProvider(
         LocalMinimumInteractiveComponentSize provides Dp.Unspecified,
         content = content,

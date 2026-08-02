@@ -51,6 +51,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 import tv.plurx.app.data.Item
 import tv.plurx.app.data.ItemDetail
@@ -66,6 +67,7 @@ import tv.plurx.app.ui.components.TvOutlinedButton
 import tv.plurx.app.ui.components.TvTextButton
 import tv.plurx.app.ui.components.formatTime
 import tv.plurx.app.ui.components.imageUrl
+import tv.plurx.app.ui.components.safeDisplayInsets
 import tv.plurx.app.ui.components.detailMediaFacts
 import tv.plurx.app.ui.components.tvFocusRing
 import tv.plurx.app.ui.theme.Accent
@@ -76,7 +78,6 @@ import tv.plurx.app.ui.theme.SurfaceHi
 
 private data class DetailLoad(
     val detail: ItemDetail? = null,
-    val seriesPlayback: EpisodePlaybackTarget? = null,
     val error: String? = null,
 )
 
@@ -92,13 +93,26 @@ fun DetailScreen(
     var refresh by remember(itemId) { mutableIntStateOf(0) }
     val load by produceState<DetailLoad?>(initialValue = null, itemId, refresh) {
         value = try {
-            val detail = vm.itemDetail(itemId)
-            DetailLoad(
-                detail = detail,
-                seriesPlayback = runCatching { vm.seriesPlayback(detail) }.getOrNull(),
-            )
+            DetailLoad(detail = vm.itemDetail(itemId))
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             DetailLoad(error = e.message ?: "Couldn't load this item")
+        }
+    }
+    // Resolving "which episode does Play mean" walks seasons and episodes
+    // serially. That is the answer to a button's *label*, not to whether the
+    // page can be drawn, so the page draws first and the button resolves
+    // behind it.
+    val detail = load?.detail
+    val seriesPlayback by produceState<EpisodePlaybackTarget?>(null, detail) {
+        val loaded = detail ?: return@produceState
+        value = try {
+            vm.seriesPlayback(loaded)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            null
         }
     }
 
@@ -114,7 +128,7 @@ fun DetailScreen(
         else -> DetailContent(
             vm = vm,
             detail = load!!.detail!!,
-            seriesPlayback = load!!.seriesPlayback,
+            seriesPlayback = seriesPlayback,
             onPlay = onPlay,
             onOpenItem = onOpenItem,
             onViewPhoto = onViewPhoto,
@@ -246,7 +260,7 @@ private fun DetailContent(
                         if (startingEpisodeId == null) {
                             startingEpisodeId = child.id
                             scope.launch {
-                                val result = runCatching { vm.episodePlayback(child) }.getOrNull()
+                                val result = catchingUnlessCancelled { vm.episodePlayback(child) }.getOrNull()
                                 startingEpisodeId = null
                                 if (result != null) {
                                     val target = result.playback
@@ -383,7 +397,7 @@ private fun Actions(
                 item {
                     TvTextButton(enabled = !changingWatch, onClick = {
                         changingWatch = true
-                        scope.launch { runCatching { vm.setWatched(item.id, true) }; changingWatch = false; onWatchedChanged() }
+                        scope.launch { catchingUnlessCancelled { vm.setWatched(item.id, true) }; changingWatch = false; onWatchedChanged() }
                     }) {
                         Icon(Icons.Filled.CheckCircle, contentDescription = null, modifier = Modifier.size(18.dp))
                         Text("  ${markWatchedLabel(item.kind)}")
@@ -394,7 +408,7 @@ private fun Actions(
                 item {
                     TvTextButton(enabled = !changingWatch, onClick = {
                         changingWatch = true
-                        scope.launch { runCatching { vm.setWatched(item.id, false) }; changingWatch = false; onWatchedChanged() }
+                        scope.launch { catchingUnlessCancelled { vm.setWatched(item.id, false) }; changingWatch = false; onWatchedChanged() }
                     }) {
                         Icon(Icons.Filled.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
                         Text("  ${markUnwatchedLabel(item.kind)}")
@@ -405,7 +419,7 @@ private fun Actions(
             item {
                 TvTextButton(enabled = !changingWatch, onClick = {
                     changingWatch = true
-                    scope.launch { runCatching { vm.setWatched(item.id, !watched) }; changingWatch = false; onWatchedChanged() }
+                    scope.launch { catchingUnlessCancelled { vm.setWatched(item.id, !watched) }; changingWatch = false; onWatchedChanged() }
                 }) {
                     Icon(
                         if (watched) Icons.Filled.Refresh else Icons.Filled.CheckCircle,
@@ -575,7 +589,7 @@ private fun markUnwatchedLabel(kind: String): String = when (kind) {
 @Composable
 internal fun DetailBackButton(
     onBack: () -> Unit,
-    safeInsets: WindowInsets = WindowInsets.statusBars,
+    safeInsets: WindowInsets = safeDisplayInsets(),
 ) {
     SafeBackButton(onBack = onBack, safeInsets = safeInsets)
 }

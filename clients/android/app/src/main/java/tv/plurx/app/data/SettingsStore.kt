@@ -67,16 +67,48 @@ class SettingsStore(private val context: Context) {
         )
     }
 
+    /**
+     * Point the app at a server the *user* chose. The only writer of a new
+     * origin, and therefore the one owner of the pairing invariant: a token
+     * belongs to the origin that issued it, so a different origin drops it in
+     * the same write. Without that, killing the app between connecting to B
+     * and logging in sends server A's bearer to server B in clear text — and
+     * A's still-valid session dies when B answers 401.
+     */
     suspend fun saveOrigin(origin: String, instanceId: String?) {
-        context.dataStore.edit {
-            it[Keys.ORIGIN] = origin
-            if (instanceId == null) it.remove(Keys.INSTANCE_ID)
-            else it[Keys.INSTANCE_ID] = instanceId
+        context.dataStore.edit { p ->
+            val kept = credentialsForNewOrigin(
+                stored = StoredCredentials(p[Keys.ORIGIN], p[Keys.TOKEN], p[Keys.USERNAME]),
+                origin = origin,
+            )
+            p[Keys.ORIGIN] = origin
+            if (instanceId == null) p.remove(Keys.INSTANCE_ID) else p[Keys.INSTANCE_ID] = instanceId
+            kept.token?.let { p[Keys.TOKEN] = it } ?: p.remove(Keys.TOKEN)
+            kept.username?.let { p[Keys.USERNAME] = it } ?: p.remove(Keys.USERNAME)
         }
     }
 
-    suspend fun saveServerIdentity(origin: String, instanceId: String?) =
-        saveOrigin(origin, instanceId)
+    /**
+     * Record where a *known* server now lives — Bonjour recovery found the
+     * same instance on a new address. The token still belongs to it, so this
+     * deliberately keeps it; that is the whole difference from [saveOrigin].
+     */
+    suspend fun saveServerIdentity(origin: String, instanceId: String?) {
+        context.dataStore.edit { p ->
+            p[Keys.ORIGIN] = origin
+            if (instanceId == null) p.remove(Keys.INSTANCE_ID) else p[Keys.INSTANCE_ID] = instanceId
+        }
+    }
+
+    /** Forget the server entirely — origin, identity, and credentials in one write. */
+    suspend fun clearServer() {
+        context.dataStore.edit { p ->
+            p.remove(Keys.ORIGIN)
+            p.remove(Keys.INSTANCE_ID)
+            p.remove(Keys.TOKEN)
+            p.remove(Keys.USERNAME)
+        }
+    }
 
     suspend fun saveSession(origin: String, token: String, username: String) {
         context.dataStore.edit { p ->
@@ -108,5 +140,29 @@ class SettingsStore(private val context: Context) {
             p[Keys.AUTO_SKIP] = value.autoSkip
             p[Keys.AUTOPLAY_NEXT] = value.autoplayNext
         }
+    }
+}
+
+/** The credential half of a persisted server record. */
+internal data class StoredCredentials(
+    val origin: String?,
+    val token: String?,
+    val username: String?,
+)
+
+/**
+ * What survives pointing the app at [origin]. Credentials survive only when
+ * the origin is unchanged; anything else is a different server, and its
+ * predecessor's bearer must never reach it.
+ */
+internal fun credentialsForNewOrigin(
+    stored: StoredCredentials,
+    origin: String,
+): StoredCredentials {
+    val sameServer = !stored.origin.isNullOrBlank() && stored.origin == origin
+    return if (sameServer) {
+        StoredCredentials(origin, stored.token, stored.username)
+    } else {
+        StoredCredentials(origin, null, null)
     }
 }

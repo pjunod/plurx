@@ -25,6 +25,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -32,6 +33,7 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import tv.plurx.app.data.Item
 import tv.plurx.app.ui.components.LoadingBox
@@ -50,7 +52,9 @@ fun SearchScreen(
     val formFactor = currentFormFactor()
     val side = formFactor.horizontalPadding()
     val posterWidth = (preferences.posterSize.widthDp * formFactor.posterScale()).dp
-    var query by remember { mutableStateOf("") }
+    // Retained across rotation and process death: retyping a query on a TV
+    // remote because the app was backgrounded is the whole reason this exists.
+    var query by rememberSaveable { mutableStateOf("") }
     var results by remember { mutableStateOf<List<Item>>(emptyList()) }
     var loading by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
@@ -67,6 +71,11 @@ fun SearchScreen(
         error = null
         try {
             results = vm.search(query)
+        } catch (cancelled: CancellationException) {
+            // The next keystroke superseding this query, not a failed search.
+            // Reporting it flashed "StandaloneCoroutine was cancelled" under
+            // the field for the length of the debounce on every fast typist.
+            throw cancelled
         } catch (e: Exception) {
             error = e.message ?: "Search failed"
         } finally {

@@ -12,10 +12,11 @@ anything it can't (MKV, DTS/TrueHD, …) is delivered as the server's on-the-fly
 HDR display at runtime and sends that to `/decision`, so the server transcodes
 only what this hardware genuinely can't play.
 
-> Status: **v0.1.0** — working development client. Browse, resume, discover,
-> and play on both iOS and tvOS. Both targets compile against the iOS/tvOS
-> 26.5 SDKs and share the same regression suite. It is not yet at full web
-> parity; the exact boundary is in [Feature parity](#feature-parity).
+> Status: **v0.2.0** (`MARKETING_VERSION` in `project.yml`) — working
+> development client. Browse, search, filter, resume, discover, and play on
+> both iOS and tvOS. Both targets compile against the iOS/tvOS 26.5 SDKs and
+> share the same regression suite. It is not yet at full web parity; the exact
+> boundary is in [Feature parity](#feature-parity).
 
 ## What works
 
@@ -23,17 +24,31 @@ only what this hardware genuinely can't play.
   host entry as a fallback. A bare host uses the standard port `32400`.
 - **Prompt for local-network access before sign-in** and hold requests while
   the iOS permission sheet is open, so first sign-in no longer fails behind it.
-- **Connect & sign in**; the session is remembered (Keychain-free
-  `UserDefaults` token) and reconnects silently on next launch.
-- **Home** with Continue Watching / Next Up / Recently Added and your libraries.
-- **Browse** libraries as a poster grid; open show → season → episode.
-- **Detail** pages with backdrop, overview, Resume / Start-over.
+- **Connect & sign in**; the bearer token lives in the **Keychain** (so a new
+  development build does not sign you out) and the session reconnects silently
+  on next launch. Address and token are written together, so changing servers
+  cannot leave the previous server's credential on disk.
+- **Home** with Continue Watching / Next Up / Recently Added and your
+  libraries. Hubs, libraries, and Coming Soon are fetched in parallel and each
+  shelf paints as it arrives; a refresh never blanks a populated dashboard, and
+  returning from the player or from the background refreshes it.
+- **Browse** libraries as a poster grid, with sort and watch-status filters —
+  including for shows and seasons, which classify from the server's watch
+  rollup. Pages paint as they arrive rather than after the last one.
+- **Search** across the library from its own tab.
+- **Detail** pages with backdrop, overview, Resume / Start-over, and a metadata
+  badge row (resolution, codec, dynamic range).
 - **On-demand player** with explicit play/pause, ±10 seconds, full-film seek,
   Skip Intro/Credits, a real runtime in iOS Now Playing instead of `LIVE`,
-  audio/subtitle/quality menus, and a playback-info panel fed by the server's
-  live encoder and delivery telemetry.
-- **Subtitles**, including bitmap formats, through reliable server burn-in.
-  Changing a subtitle restarts at the same film position.
+  audio/subtitle/quality menus, iOS Picture in Picture, and a playback-info
+  panel fed by the server's live encoder and delivery telemetry.
+- **Subtitles**: SRT/SubRip/WebVTT are selected in place as native HLS
+  renditions — no restart, no encoder, no lost HDR. PGS, VobSub, and styled
+  ASS/SSA still burn in at source height and restart at the same film position.
+  Automatic selection never starts a burn except for a forced track.
+- **Honest dynamic-range badge.** The chip names what the *file* carries; when
+  the session is delivering something else it dims and says so (`DV → HDR10`,
+  `HDR → SDR`), and the playback-info panel spells out the server's reason.
 - **Autoplay next episode**, including rollover to the next season; it is on
   by default to match the web client and can be toggled in the player or
   Settings.
@@ -105,27 +120,72 @@ subtitle design, deployment record, and remaining physical Dolby Vision failure
 are documented in
 [`docs/APPLE-NATIVE-SUBTITLES-HANDOFF.md`](../../docs/APPLE-NATIVE-SUBTITLES-HANDOFF.md).
 
+### Live validation harnesses: the fencing rule
+
+Ad-hoc "play this exact file against this exact server and watch what happens"
+harnesses are useful, and one has already broken the tree once. Any live
+validation entry point added to `Sources/` must obey all three of these, or it
+does not get added:
+
+1. **Platform- and DEBUG-fenced.** Wrap the entry point *and the view or type it
+   references* in `#if os(tvOS) && DEBUG` (or whichever platform it targets).
+   A `#if DEBUG` around the call site alone is not enough: the referenced type
+   must not exist in a Release build either, or the Release configuration stops
+   compiling. Both configurations of both schemes are part of the gate below
+   precisely because this is the failure that got shipped.
+2. **No credentials from launch arguments or the environment, ever in Release.**
+   `ProcessInfo.processInfo.arguments` and `environment` are readable by anything
+   that can launch the app; a bearer token or password arriving that way is a
+   credential in a place the Keychain exists to avoid. Inside the DEBUG fence,
+   read them if it helps; outside it, there must be no such code path at all.
+   As of this writing the tree contains no reads of either — keep it that way.
+3. **No writes to persisted settings.** The reverted `--live-scary-movie`
+   harness overrode the saved `subLang`, so running it once silently changed the
+   viewer's subtitle language for every later launch. A harness may pass its
+   overrides down as parameters; it may not put them through `SettingsStore`.
+
+The same rule is recorded as a standing non-goal in
+[CLIENTS-REMEDIATION-PLAN.md](../../docs/CLIENTS-REMEDIATION-PLAN.md) §10.
+
 ## Test
 
 The iOS and tvOS schemes run the shared XCTest source. Coverage includes origin
-and Bonjour URL normalization, authenticated media URLs, bearer headers, HLS
-request semantics, playback duration and progress, automatic subtitle
-selection, and in-place AVPlayer media selection.
+and Bonjour URL normalization, Bonjour resolution completing rather than
+hanging, authenticated media URLs, bearer headers, the origin/token write
+invariant, expired-session classification, HLS request semantics, in-place
+AVPlayer media selection, the automatic-subtitle policy and the stream-reopen
+queue, watch-status filtering for both leaves and rollup-bearing containers,
+poster downsampling, the dynamic-range badge's three states and its
+playback-info wording, and the playback duration and progress passed into
+progress reporting.
 
 ```bash
 cd clients/apple
 xcodegen generate
 
-xcodebuild -project plurx.xcodeproj -scheme plurx-iOS \
+# Debug: build and run the tests on each platform.
+xcodebuild -project plurx.xcodeproj -scheme plurx-iOS  -configuration Debug \
   -destination 'platform=iOS Simulator,name=iPhone 17 Pro' test
 
-xcodebuild -project plurx.xcodeproj -scheme plurx-tvOS \
+xcodebuild -project plurx.xcodeproj -scheme plurx-tvOS -configuration Debug \
   -destination 'platform=tvOS Simulator,name=Apple TV 4K (3rd generation)' test
+
+# Release: build only — the configuration a DEBUG-fenced harness can break
+# without any Debug build noticing. Run both, every time.
+xcodebuild -project plurx.xcodeproj -scheme plurx-iOS  -configuration Release \
+  -destination 'generic/platform=iOS Simulator' build
+
+xcodebuild -project plurx.xcodeproj -scheme plurx-tvOS -configuration Release \
+  -destination 'generic/platform=tvOS Simulator' build
 ```
 
-A passing run means both the shared Swift source and the platform-specific
-branches compile, the app launches in each simulator, and the client contracts
-above still hold. It does not replace real-device playback testing.
+Four green runs mean the shared Swift source and both platforms' conditional
+branches compile in **both** configurations, the app launches in each simulator,
+and the client contracts above still hold. It does not replace real-device
+playback testing. Substitute whatever simulator names `xcrun simctl list
+devicetypes` offers on your Xcode; the `generic/platform=…` destinations avoid
+naming one at all, and building for a simulator rather than a device keeps
+code signing out of the loop.
 
 ## How playback decides
 
@@ -151,6 +211,13 @@ server's **delivery plan**:
 - `transcode` → the same `POST` with **no height named**: Auto is the server's
   choice, because the rung depends on which encoder wins and only the create
   response knows that.
+
+Both the decision and the session response also carry
+`delivered_dynamic_range` (`dolby_vision` / `hdr10` / `hlg` / `sdr`) — what the
+bytes on the wire actually hold, as opposed to what the file holds. The player
+compares it with the source grade and with `AVPlayer.eligibleForHDRPlayback` to
+decide whether the dynamic-range badge is lit or dimmed. It is a readout only:
+nothing in the client's decision, capability, or session request reads it back.
 
 Either session starts at the resume point, carries this player's `playback_id`
 (the server's supersession key) plus a per-attempt `request_id` (so a replayed
@@ -188,17 +255,14 @@ both accepted by the server's `AuthUser` extractor.
 
 The implementation and prioritized remaining work are tracked in
 [Apple client feature parity](../../docs/APPLE-CLIENT-PARITY.md). In short,
-browse/play/resume, full-film seek, explicit transport controls, Now Playing,
-track and quality selection, playback stats, markers, and next-episode autoplay
-are present. These are still outstanding:
+browse/search/play/resume, sorting and watch filters, full-film seek, explicit
+transport controls, Now Playing, native text subtitles, track and quality
+selection, playback stats, markers, PiP, and next-episode autoplay are present.
+These are still outstanding:
 
 - **Automatic** intro/credits skipping. Manual Skip buttons are present.
-- Sidecar WebVTT rendering. Today's Apple subtitle path burns every selected
-  track for correctness, which forces a re-encode; native text subtitles should
-  eventually remain selectable without touching the video.
 - Continuous adaptive quality changes and audio-sync controls.
-- **Search**, filters/sorting, playlists, downloads/offline, **PiP**, and
-  **AirPlay** polish.
+- Playlists, downloads/offline, and **AirPlay** polish.
 - **tvOS launch storyboard** — cosmetic only (a black frame at launch), not a
   blocker for upload. The layered Brand Assets themselves are committed under
   `Resources/tvOS.xcassets` and wired up via

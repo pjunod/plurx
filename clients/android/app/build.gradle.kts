@@ -20,7 +20,14 @@ android {
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            // `material-icons-extended` alone is several thousand vector assets
+            // of which this app draws about twenty, and every library it pulls
+            // in ships code for surfaces the viewer never opens. R8 removes
+            // what nothing reaches; `shrinkResources` removes the drawables and
+            // strings that go with it. `proguard-rules.pro` had been dead
+            // configuration since the day it was written.
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
     }

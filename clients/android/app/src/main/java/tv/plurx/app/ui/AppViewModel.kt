@@ -4,6 +4,10 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -36,6 +40,7 @@ import tv.plurx.app.data.Session
 import tv.plurx.app.data.ServerDiscovery
 import tv.plurx.app.data.Server
 import tv.plurx.app.data.SettingsStore
+import tv.plurx.app.player.decisionForce
 
 /** Top-level app state: which screen the shell should show. */
 sealed interface Phase {
@@ -51,7 +56,12 @@ data class HomeState(
     val libraryItems: Map<Long, List<Item>> = emptyMap(),
     val loading: Boolean = true,
     val error: String? = null,
-)
+) {
+    /** Anything worth painting. A spinner over real content is a regression. */
+    val hasContent: Boolean
+        get() = libraries.isNotEmpty() || hubs.continue_watching.isNotEmpty() ||
+            hubs.next_up.isNotEmpty() || hubs.recently_added.isNotEmpty()
+}
 
 data class PlaybackTarget(val itemId: Long, val fileId: Long, val startMs: Long = 0)
 
@@ -102,8 +112,22 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private var api: PlurxApi? = null
     fun api(): PlurxApi = api ?: error("not connected")
 
+    /** One dashboard load at a time — a refresh replaces the one in flight. */
+    private var homeJob: Job? = null
+
+    /**
+     * The caps most recently reported to `/decision`, so a progressive remux
+     * URL asks for the stream the decision was actually made about. Never a
+     * substitute for probing: audio support is route-dependent, so every
+     * decision re-probes (see [Caps]).
+     */
+    @Volatile
+    var playbackCaps: Map<String, String> = emptyMap()
+        private set
+
     /** Runtime playback caps for this device — sent to /decision and /stream.mp4. */
-    fun caps(): Map<String, String> = Caps.query(getApplication())
+    private suspend fun caps(): Map<String, String> =
+        Caps.query(getApplication<Application>()).also { playbackCaps = it }
 
     init {
         viewModelScope.launch {
@@ -117,19 +141,28 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             when {
                 saved.origin.isNotBlank() && saved.token != null -> {
                     bindOrigin(saved.origin, saved.token)
-                    var validation = validateSavedSession { api().me() }
-                    if (validation == SavedSessionValidation.ServerUnavailable) {
-                        val recovered = rediscoverSavedServer(saved.instanceId, saved.origin)
-                        if (recovered != null) {
-                            bindOrigin(recovered.origin, saved.token)
-                            serverName = recovered.info.name
-                            settings.saveServerIdentity(
-                                recovered.origin,
-                                recovered.info.instance_id,
-                            )
-                            validation = validateSavedSession { api().me() }
+                    // Four attempts against a 20 s connect timeout, twice over
+                    // if rediscovery finds a candidate, is a splash screen that
+                    // can hold for well over a minute on a TV whose network is
+                    // still coming up. Cap the whole recovery: past this point
+                    // Home is the better place to be told, because it has a
+                    // Retry button and this does not.
+                    val validation = withTimeoutOrNull(LAUNCH_VALIDATION_TIMEOUT_MS) {
+                        var result = validateSavedSession { api().me() }
+                        if (result == SavedSessionValidation.ServerUnavailable) {
+                            val recovered = rediscoverSavedServer(saved.instanceId, saved.origin)
+                            if (recovered != null) {
+                                bindOrigin(recovered.origin, saved.token)
+                                serverName = recovered.info.name
+                                settings.saveServerIdentity(
+                                    recovered.origin,
+                                    recovered.info.instance_id,
+                                )
+                                result = validateSavedSession { api().me() }
+                            }
                         }
-                    }
+                        result
+                    } ?: SavedSessionValidation.ServerUnavailable
                     when (validation) {
                         is SavedSessionValidation.Authenticated -> {
                             currentUser = validation.user
@@ -226,21 +259,46 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /**
+     * Load the dashboard, painting each answer as it lands.
+     *
+     * The old shape was hubs → libraries → one preview request per library,
+     * strictly in series: 2 + N round trips before a single poster appeared,
+     * and the slowest library held the whole screen. All of it is issued at
+     * once now and each result is published on arrival, so first paint is the
+     * *first* response rather than the last. The state keeps whatever it
+     * already had — a refresh never blanks a populated dashboard, and a failed
+     * refresh leaves the previous content up with an error beside it.
+     */
     fun loadHome() {
+        homeJob?.cancel()
         _home.value = _home.value.copy(loading = true, error = null)
-        viewModelScope.launch {
+        homeJob = viewModelScope.launch {
             try {
-                val hubs = api().hubs()
-                val libs = api().libraries()
-                val previews = libs.associate { lib ->
-                    lib.id to api().libraryItems(lib.id, limit = 24, sort = "added").items
+                coroutineScope {
+                    val hubs = async { api().hubs() }
+                    val libraries = async { api().libraries() }
+                    val libs = libraries.await()
+                    _home.value = _home.value.copy(libraries = libs, loading = false)
+                    // Every preview at once. One library that times out costs
+                    // its own shelf, not the dashboard.
+                    val previews = libs.map { lib ->
+                        lib.id to async {
+                            catchingUnlessCancelled {
+                                api().libraryItems(lib.id, limit = 24, sort = "added").items
+                            }.getOrDefault(emptyList())
+                        }
+                    }
+                    _home.value = _home.value.copy(hubs = hubs.await(), loading = false)
+                    previews.forEach { (id, items) ->
+                        _home.value = _home.value.copy(
+                            libraryItems = _home.value.libraryItems + (id to items.await()),
+                            loading = false,
+                        )
+                    }
                 }
-                _home.value = HomeState(
-                    hubs = hubs,
-                    libraries = libs,
-                    libraryItems = previews,
-                    loading = false,
-                )
+            } catch (cancelled: CancellationException) {
+                throw cancelled
             } catch (e: Exception) {
                 _home.value = _home.value.copy(loading = false, error = e.message ?: "Failed to load")
             }
@@ -255,8 +313,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         _phase.value = Phase.NeedLogin
     }
 
+    /**
+     * Forget this server. The persisted token goes with the origin in the
+     * same write — a bearer belongs to the server that issued it, and a
+     * relaunch before the next login must not offer it to a different one.
+     */
     fun changeServer() {
         Session.token = null
+        currentUser = null
+        _home.value = HomeState()
+        viewModelScope.launch { settings.clearServer() }
         _phase.value = Phase.NeedServer
     }
 
@@ -288,24 +354,36 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     // ---- Suspend loaders used by individual screens --------------------------
 
-    suspend fun libraryItems(id: Long, sort: String = "title"): List<Item> {
-        val result = mutableListOf<Item>()
+    /**
+     * Walk a library's pages, handing each one over as it arrives.
+     *
+     * The grid used to wait for every page of a thousand-item library behind a
+     * spinner; it now paints the first page after one round trip and fills in
+     * behind. Sorting is the client's job (`sortMerged`), so the server sort is
+     * fixed and a sort change never re-fetches.
+     */
+    suspend fun libraryPages(id: Long, sort: String = "title", onPage: (List<Item>) -> Unit) {
         var offset = 0
         do {
             val page = api().libraryItems(id, limit = 200, offset = offset, sort = sort)
-            result += page.items
+            if (page.items.isNotEmpty()) onPage(page.items)
             offset += page.items.size
         } while (page.items.isNotEmpty() && offset < page.total)
-        return result
     }
 
     suspend fun search(query: String): List<Item> = api().search(query.trim()).results
 
     suspend fun itemDetail(id: Long): ItemDetail = api().item(id)
 
+    /**
+     * `force` is a verdict override, not a height: the server parses anything
+     * outside `auto|original|transcode` as Auto, so sending a bare rung meant
+     * an explicit "720p" silently did nothing. The height rides on the session
+     * create instead (`sessionHeight`).
+     */
     suspend fun decision(fileId: Long): Decision = api().decision(
         fileId,
-        caps() + ("force" to _preferences.value.playbackQuality.storageValue),
+        caps() + ("force" to decisionForce(_preferences.value.playbackQuality)),
     )
 
     suspend fun setWatched(itemId: Long, watched: Boolean): Int = if (watched) {
@@ -418,6 +496,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private suspend fun connectToOrigin(normalized: String) {
+        // In memory and on disk, the token travels with the origin: this
+        // server has not authenticated us yet, so nothing may be sent as if
+        // it had.
+        Session.token = null
+        currentUser = null
         Session.origin = normalized
         val candidate = Net.api(normalized)
         val info = candidate.server()
@@ -435,28 +518,47 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         api = Net.api(value)
     }
 
+    /**
+     * Find the saved server again after its address moved.
+     *
+     * `availableServers()` starts NSD to do it. Whoever starts multicast
+     * discovery owns stopping it, and this path is not the connect screen — no
+     * one else was ever going to — so a successful recovery used to leave the
+     * browser resolving for the rest of the process's life. The `finally` is
+     * the whole point of the function's shape.
+     */
     private suspend fun rediscoverSavedServer(
         expectedInstanceId: String?,
         savedOrigin: String,
-    ): RecoveredServer? {
+    ): RecoveredServer? = try {
+        var found: RecoveredServer? = null
         for (candidate in serverBrowser.availableServers()) {
-            val candidateOrigin = runCatching { serverBrowser.resolve(candidate) }.getOrNull()
+            val candidateOrigin = catchingUnlessCancelled { serverBrowser.resolve(candidate) }.getOrNull()
                 ?: continue
-            val info = runCatching { Net.api(candidateOrigin).server() }.getOrNull()
+            val info = catchingUnlessCancelled { Net.api(candidateOrigin).server() }.getOrNull()
                 ?: continue
             if (matchesSavedServer(info.instance_id, expectedInstanceId, savedOrigin)) {
-                return RecoveredServer(candidateOrigin, info)
+                found = RecoveredServer(candidateOrigin, info)
+                break
             }
         }
-        return null
+        found
+    } finally {
+        serverBrowser.stop()
     }
 
     private suspend fun backfillServerIdentity() {
-        val info = runCatching { api().server() }.getOrNull() ?: return
+        val info = catchingUnlessCancelled { api().server() }.getOrNull() ?: return
         serverName = info.name
         settings.saveServerIdentity(origin, info.instance_id)
     }
 }
+
+/**
+ * The longest a saved session may hold the splash screen before Home takes
+ * over. Home can retry and say why; the splash can only spin.
+ */
+private const val LAUNCH_VALIDATION_TIMEOUT_MS = 12_000L
 
 private data class RecoveredServer(val origin: String, val info: Server)
 
@@ -464,6 +566,23 @@ internal sealed interface SavedSessionValidation<out T> {
     data class Authenticated<T>(val user: T) : SavedSessionValidation<T>
     data object InvalidToken : SavedSessionValidation<Nothing>
     data object ServerUnavailable : SavedSessionValidation<Nothing>
+}
+
+/**
+ * `runCatching`, minus the bug.
+ *
+ * `runCatching` catches `Throwable`, and inside a coroutine that includes the
+ * `CancellationException` the machinery throws to unwind a cancelled job — so
+ * a screen that has already left composition keeps running, "recovers" from
+ * its own cancellation, and writes state nobody is watching. Cancellation is
+ * not a failure to handle; it is the caller saying stop.
+ */
+internal inline fun <T> catchingUnlessCancelled(block: () -> T): Result<T> = try {
+    Result.success(block())
+} catch (cancelled: CancellationException) {
+    throw cancelled
+} catch (error: Throwable) {
+    Result.failure(error)
 }
 
 /**
