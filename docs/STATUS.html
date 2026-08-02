@@ -92,13 +92,13 @@
   <header>
     <h1>plurx — Project Status</h1>
     <div class="sub">Self-hosted media server in the old-Plex spirit · explicit ledger of done vs. planned ·
-      mirrors <code>docs/ROADMAP.md</code> + <code>docs/FEATURES.md</code> @ <code>f35ada1</code> · 2026-08-02</div>
+      mirrors <code>docs/ROADMAP.md</code> + <code>docs/FEATURES.md</code> @ <code>94962b2</code> · 2026-08-02</div>
   </header>
 
   <div class="tiles">
     <div class="tile"><div class="v">v0.2.0</div><div class="l">released 2026-07-30 · main is ahead</div></div>
     <div class="tile"><div class="v">0–3 ✓</div><div class="l">core phases + 2 slices complete</div></div>
-    <div class="tile"><div class="v">3 viewers</div><div class="l">web ✓ · Android ✓ · Apple on device (build 5)</div></div>
+    <div class="tile"><div class="v">3 viewers</div><div class="l">web ✓ · Android ✓ · Apple build 6 built, not yet uploaded</div></div>
     <div class="tile"><div class="v">M2 🚧</div><div class="l">GPU tone-map — the milestone that fixes 4K</div></div>
   </div>
 
@@ -188,12 +188,12 @@
   <!-- ══════════ Native clients ══════════ -->
   <section>
     <h2>Native clients <span class="chip prog">🚧 in progress</span> <span class="ev">CLIENTS.md · *-CLIENT-PARITY.md · CLIENTS-REMEDIATION-PLAN.md · APPLE-NATIVE-SUBTITLES-PLAN.md</span></h2>
-    <div class="meter"><div class="track"><div class="fill" style="width:42%"></div></div><div class="n">Android in · Apple installed, native subs live · ports not started</div></div>
+    <div class="meter"><div class="track"><div class="fill" style="width:48%"></div></div><div class="n">Android in · Apple native subs live, M1–M3 landed in source · ports not started</div></div>
     <details open><summary>Items</summary>
       <ul class="items">
         <li class="done-item"><span class="m done">✓ done</span><span class="t">Android/Google TV (Kotlin/Media3): the web viewer surface natively — rails, grid, search, detail, delivery-plan playback, track/quality menus, markers, autoplay, per-file A/V sync, stats panel</span></li>
-        <li><span class="m partial">◐ partial</span><span class="t">Apple iOS/tvOS (Swift/AVPlayer): <b>native text subtitles shipped</b> — in-place selection, no burn, no new session; build 5 (0.2.0) installed on the physical Apple TV, server live on the fleet. Open: copied Dolby Vision master still falls back (CoreMedia <code>-12927</code>) — reviewed continuation in <code>APPLE-NATIVE-SUBTITLES-PLAN.md</code> (3 P0 fixes + the DV master ladder)</span></li>
-        <li><span class="m partial">◐ partial</span><span class="t">Clients remediation plan (written 2026-08-02): Apple subtitle portion landed via the native-subtitles branch; Android native subtitles (§5.4) and the remaining workstreams open</span></li>
+        <li><span class="m partial">◐ partial</span><span class="t">Apple iOS/tvOS (Swift/AVPlayer): <b>native text subtitles shipped</b> — in-place selection, no burn, no new session; build 5 (0.2.0) is what is installed on the physical Apple TV. <b>2026-08-02:</b> the plan's M1–M3 landed in source (branch merged to main, Route A) — the three P0s fixed and tombed, selection robustness, extraction hardening. <b>None of it is deployed or on a device yet:</b> unpushed, no ansible run, Apple build 6 not uploaded. Open: copied Dolby Vision master still falls back (CoreMedia <code>-12927</code>) — M4, whose step 0 is now runnable as <code>scripts/dv-evidence</code></span></li>
+        <li><span class="m partial">◐ partial</span><span class="t">Clients remediation plan (written 2026-08-02): the Apple subtitle portion is complete in source through M3; Android native subtitles (§5.4) and the remaining workstreams open</span></li>
         <li><span class="m todo">○ todo</span><span class="t">Tizen + webOS ports of the web core</span></li>
         <li><span class="m todo">○ todo</span><span class="t">Roku (SceneGraph) — last, leaning on the mature remux/transcode pipeline</span></li>
       </ul>
@@ -249,12 +249,14 @@
     <h2>Operator checklist (Paul) <span class="ev">the two things only you can run</span></h2>
     <ul class="items">
       <li><span class="m you">👤 Paul</span><span class="t">Perf M2 acceptance run on a box with a GPU — CI can only prove candidates fail correctly</span></li>
-      <li><span class="m you">👤 Paul</span><span class="t">Apple DV acceptance on Bedroom — native text subs verified on device (build 5); the copied-DV master fix needs the physical-TV pass (plan §5.4: 60 s + seek + resume, no <code>-12927</code>)</span></li>
+      <li><span class="m you">👤 Paul</span><span class="t"><b>Ship 2026-08-02's work:</b> <code>scripts/ship --check --push --deploy</code> (the nodes follow <code>origin/main</code>, so nothing reaches them until main is pushed), then <code>scripts/ship --apple</code> for build 6 to TestFlight</span></li>
+        <li><span class="m you">👤 Paul</span><span class="t">Apple DV acceptance on Bedroom — the copied-DV master needs the physical-TV pass (plan §5.4: 60 s + seek + resume, no <code>-12927</code>). Start with <code>scripts/dv-evidence</code>: the init segment's boxes and CoreMedia's actual error chain, which nobody has looked at</span></li>
+        <li><span class="m you">👤 Paul</span><span class="t">The two master ladder rungs are compiled in and OFF — <code>PLURX_HLS_CLOSED_CAPTIONS_NONE</code>, <code>PLURX_HLS_FORCED_AUTOSELECT</code>. One per deploy, observed on the device</span></li>
     </ul>
   </section>
 
   <footer>
-    Authoritative copies: <code>docs/ROADMAP.md</code> · <code>docs/FEATURES.md</code> · <code>CHANGELOG.md</code> in <code>pjunod/plurx</code> @ <code>f35ada1</code> ·
+    Authoritative copies: <code>docs/ROADMAP.md</code> · <code>docs/FEATURES.md</code> · <code>CHANGELOG.md</code> in <code>pjunod/plurx</code> @ <code>94962b2</code> ·
     upstream: monarr <b>v0.20.0</b> (calendar rebuilt, ADR 0016) · page generated 2026-08-02
   </footer>
 </div>
