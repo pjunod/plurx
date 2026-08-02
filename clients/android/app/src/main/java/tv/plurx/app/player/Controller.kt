@@ -797,8 +797,11 @@ internal fun serverAudioLabel(track: AudioTrack): String = listOfNotNull(
 ).distinct().joinToString(" · ").ifBlank { "Audio" }
 
 /**
- * "Burn-in" is a promise about cost, so it follows what the *session* can do:
- * a styled ASS track has text but no rendition, and burns like a bitmap.
+ * "Burn-in" is a promise about cost, so it follows what the *session* can do,
+ * via the one predicate that knows: `mov_text` and styled ASS both have text
+ * but no rendition, and on a session they burn like a bitmap. The menu never
+ * filters a track out — every track stays pickable, and the label is what
+ * tells the truth about what picking it costs.
  */
 internal fun serverSubtitleLabel(track: SubTrack, planMode: String = "transcode"): String = listOfNotNull(
     languageName(track.language),

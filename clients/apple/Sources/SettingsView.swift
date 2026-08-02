@@ -64,6 +64,21 @@ struct SettingsView: View {
                 Text("Track preferences apply when a title has more than one. Autoplay continues episodic series and can also be toggled in the player.")
             }
 
+            Section {
+                Picker("Subtitle switching", selection: Binding(
+                    get: { model.subtitleReadiness },
+                    set: { model.setSubtitleReadiness($0) }
+                )) {
+                    ForEach(SubtitleReadiness.allCases) { readiness in
+                        Text(readiness.label).tag(readiness)
+                    }
+                }
+            } header: {
+                Text("Subtitles")
+            } footer: {
+                Text("Instant keeps a title's subtitles ready from the moment it starts, so turning them on or changing language never interrupts the picture — the server prepares every play. After a short pause begins the film straight from the file and rebuilds it once, at the same moment, the first time you choose a subtitle. Applies to the next title you start.")
+            }
+
             Section("Appearance") {
                 Picker("Icon size", selection: Binding(
                     get: { model.posterSize },

@@ -216,6 +216,22 @@ bump may break compatibility and a **patch** bump never does.
   models, and the generic signatures Retrofit reads off `PlurxApi`. Line numbers
   are kept so a crash report from a viewer's TV is still readable.
 
+- **The decision says which subtitles can actually be a native HLS
+  rendition.** `SubTrackDto.text` is `!is_bitmap_subtitle` — "there is text
+  here to extract" — but the rendition path accepts a narrower set
+  (`is_native_text_subtitle`: `subrip | srt | webvtt | vtt`), so `mov_text`
+  and styled ASS/SSA arrived on the wire looking selectable and were not: an
+  explicit pick answered 400 "the selected subtitle requires burn-in", and
+  the native master had filtered them out to begin with. A 2160p WEB-DL with
+  23 `mov_text` tracks offered 23 subtitles and could publish none of them.
+  Every subtitle now also carries **`native`**, computed from the same
+  predicate the master and the session create already gate on, so the wire
+  answers both questions instead of one twice: `text` unlocks the extracted
+  WebVTT sidecar (`/files/{id}/subs/{index}.vtt`, still served for `mov_text`
+  and ASS/SSA — that is the route those tracks should take), and `native`
+  unlocks a rendition. `text` is unchanged and still means what it always
+  meant, so a client that reads only it behaves exactly as before.
+
 ### Changed
 
 - **The hot control path stops re-doing a session's whole history.** Flow
@@ -234,6 +250,63 @@ bump may break compatibility and a **patch** bump never does.
 
 ### Fixed
 
+- **A subtitle extraction could run twice, and the second run raced the
+  first's own output.** The extraction registry deduplicates by cache key, but
+  a request read the cache, missed, and only then reached the registry — and
+  an extraction that finished in that gap left nothing to find: the owner
+  renames its sidecar into place and *then* drops its registry entry, so the
+  arriving request saw an absent flight and trusted its own stale miss. It
+  became a second owner and re-ran ffmpeg over the whole source, against a
+  file already on disk, publishing over the top of it. The window is small
+  and the symptom is only a duplicated NAS read, which is why it survived:
+  the repo's own dedup test caught it about one run in three and looked
+  flaky. The decision is now made in one place under the registry lock, which
+  is the only ordering point that has both facts — the rename happens-before
+  the entry is removed, and the removal happens-before the lock is acquired,
+  so a key with no flight registered is a key whose sidecar is either visible
+  or genuinely absent. A failed extraction still leaves neither, and the next
+  request still retries it.
+
+- **Android: an MP4's subtitles were all offered and none of them worked.**
+  A 2160p WEB-DL with 23 `mov_text` tracks listed every one of them, and every
+  pick answered 400 "the selected subtitle requires burn-in". The client was
+  deciding what could be an HLS rendition from `SubTrackDto.text`, which is
+  `!is_bitmap_subtitle` — "has extractable text" — while the server decides
+  from `is_native_text_subtitle`, which excludes `mov_text` and styled ASS/SSA
+  because their authored positioning and typography do not survive WebVTT. The
+  decision now carries the server's own answer as `native` alongside `text`,
+  and the client routes on it: one predicate, consulted by the rendition
+  routing, the menu's "Burn-in" label, the cold-start policy, and the ordinal
+  that maps a stream index onto the master's rendition order — the last of
+  which was the quiet one, since counting a `mov_text` track that the master
+  never carried shifted every rendition after it and handed the viewer a
+  neighbouring language. On a session those tracks now burn, as the server
+  always intended; on direct play they stay free, read from the container.
+  Compatible both ways: `native` is nullable, and a server that predates it
+  leaves the client's codec table deciding exactly as before.
+- **A 2160p 10-bit HEVC film played in the browser as a black screen with
+  working sound, and nothing ever recovered.** Three faults in a row, each
+  harmless alone. The player asked MediaSource about a *list* of HEVC codec
+  strings and took any yes — but `hvc1.1.6.*` is Main (8-bit) and
+  `hvc1.2.4.*` is Main10, so an 8-bit-only decoder's yes to the 8-bit
+  strings routed a 10-bit source through MSE, where the decoder accepted the
+  stream and rendered nothing. `bit_depth` had been on the wire the whole
+  time and no decision read it; it does now, and a 10-bit source is asked
+  only about Main10 (which also makes the `hevc10` ladder reachable — it was
+  keyed on ffprobe's `codec_name`, which is always plain `hevc`, so it had
+  never once been selected). Then nothing rescued it: on the hls.js
+  transport a media error never reaches the `<video>` element at all, so a
+  fatal decode failure ended at a toast with a dead player — it now restarts
+  as a transcode at position, once per item, exactly as the progressive path
+  has always done, and only for media/codec failures (a network fatal is not
+  something a different encode fixes). And the guard on both rescues asked
+  `PLAYER.started`, which the first `playing` event sets — **audio alone
+  fires that**, so the rescue was disabled in precisely the
+  black-picture-with-sound case it exists for. It now asks whether the
+  decoder has actually produced frames. Nothing here changes what the server
+  is told: the browser still claims everything it claimed before, still gets
+  offered everything it was offered before, and the bit-depth check picks
+  only which *transport* carries the same bytes.
 - **Every Dolby Vision film played at the Auto rung in Chrome, and untouched
   in Safari.** A DV disc remux usually carries an HDR10-compatible base
   layer, so a browser reporting HDR support looked able to take it. Chrome
@@ -767,6 +840,47 @@ bump may break compatibility and a **patch** bump never does.
   collection's "Recently added" sort was a no-op: the client never decoded the
   `added_at` the server sends, so several shares arrived as sorted runs laid
   end to end instead of one interleaved grid.
+
+### Added
+
+- **Whether subtitles cost a session or a restart is the viewer's call now.**
+  Any file on iOS/tvOS carrying an SRT/SubRip/WebVTT track opened through a
+  copy-HLS session even when its video could have used the raw direct URL —
+  identical picture, since the video is repackaged untouched, but a server
+  session and a segmenter on every play where the web and Android clients pull
+  raw bytes. It bought something real: every text track already exists as a
+  rendition, so turning subtitles on mid-scene, changing language, and turning
+  them off again never interrupt the picture. Settings → Subtitles → **Subtitle
+  switching** now decides which of those two costs to pay. **Instant** is the
+  default and is exactly what shipped, so an install nobody touches behaves
+  identically; **After a short pause** direct-plays the file and rebuilds it as
+  a copy session at the same film position the first time a subtitle is chosen —
+  the same clean reopen a bitmap burn already takes. The choice is read once,
+  when a title starts, so changing it mid-film never rebuilds the stream under
+  the person watching; a track chosen automatically at cold start counts as in
+  use, so it is visible from the first frame; and once a text track has been
+  asked for the stream keeps its renditions for the rest of the title, because
+  dropping back to direct play would be a second restart nobody asked for. A
+  file with no native text track direct-plays under both settings — there is
+  nothing a session could publish.
+
+### Changed
+
+- **The Apple client asks the server which subtitles can be renditions instead
+  of guessing from the codec name.** `SubTrackDto` carries two booleans that
+  are easy to confuse: `text` is "there are characters in here"
+  (`!is_bitmap_subtitle`), while `native` is "this can be an HLS WebVTT
+  rendition" (`is_native_text_subtitle`). They disagree on MP4 `mov_text` and
+  on styled ASS/SSA, and it is `native` the segmenter enforces — a non-native
+  track is absent from the HLS master and an explicit pick of one is answered
+  with 400. iOS/tvOS re-derived that answer locally from a hardcoded codec
+  list. It now decodes `native` and prefers it, falling back to the codec list
+  only against a server too old to send the field, through the one property
+  every caller already reads: the master rendition ordinal, the burn test, the
+  cold-start policy, the direct-play guard, and the menu's "Burn-in" label. The
+  two lists agree today, so nothing about playback changes — the point is that
+  they can no longer drift, and that a track the server declines to publish can
+  never shift the ordinal a viewer's pick resolves to.
 
 ## [0.2.0] — 2026-07-30
 

@@ -58,7 +58,10 @@ struct PlayerReopenQueue: Equatable {
 /// supplies the controls AVPlayer withholds for a growing EVENT playlist: an
 /// explicit on-demand timeline, reliable play/pause commands, server playback
 /// telemetry, and stream restarts for audio, quality, and burn-only subtitle
-/// changes. Ordinary text subtitles switch through AVPlayer media selection.
+/// changes. Ordinary text subtitles switch through AVPlayer media selection —
+/// once the stream carries their renditions, which under
+/// `SubtitleReadiness.onDemand` is from the first selection rather than from
+/// the first frame (`needsNativeSubtitleSession`).
 @MainActor
 final class PlayerController: ObservableObject {
     let player = AVPlayer()
@@ -104,6 +107,21 @@ final class PlayerController: ObservableObject {
     /// A burn is part of the current video frames. Leaving one requires one
     /// reopen; native-to-native and native-to-Off never do.
     private var activeBurnedSubtitle: Int?
+    /// Read once, in `start`, rather than per open: a viewer who changes the
+    /// setting from another device or another tab of Settings must not have the
+    /// stream rebuilt under them mid-film. The choice a title started with is
+    /// the choice it finishes with.
+    private var subtitleReadiness: SubtitleReadiness = .instant
+    /// Sticky for this playback. Once a native text track has been asked for —
+    /// by automatic selection at cold start, or by the viewer — the stream keeps
+    /// its subtitle renditions, including after subtitles are turned off again:
+    /// dropping back to direct play would be a second restart nobody asked for,
+    /// and the next selection would only have to pay for a third.
+    private var wantsNativeSubtitleRenditions = false
+    /// True while the attached item is the raw file URL. It carries no subtitle
+    /// renditions, so the first native selection against it has to rebuild the
+    /// stream instead of switching AVPlayer's media selection in place.
+    private var isDirectPlayback = false
     /// Holds the newest seek/track intent that arrived mid-change so it wins
     /// instead of vanishing.
     private var reopenQueue = PlayerReopenQueue()
@@ -162,6 +180,9 @@ final class PlayerController: ObservableObject {
         self.fileId = fileId
         self.knownDurationMs = durationMs
         self.title = title
+        subtitleReadiness = model.subtitleReadiness
+        wantsNativeSubtitleRenditions = false
+        isDirectPlayback = false
 
         #if os(iOS)
         // iOS needs an explicit playback audio session for silent-switch and
@@ -222,8 +243,18 @@ final class PlayerController: ObservableObject {
     func selectSubtitle(_ index: Int?) {
         guard index != selectedSubtitle else { return }
         selectedSubtitle = index
-        let needsBurn = index.map { Self.subtitleRequiresBurn($0, in: subtitles) } ?? false
-        if needsBurn || activeBurnedSubtitle != nil {
+        let requiresReopen = Self.subtitleSelectionRequiresReopen(
+            index: index,
+            tracks: subtitles,
+            hasActiveBurn: activeBurnedSubtitle != nil,
+            isDirectPlayback: isDirectPlayback
+        )
+        // Set before the reopen is scheduled: the open it leads to reads this
+        // to decide it may no longer direct-play.
+        if let index, !Self.subtitleRequiresBurn(index, in: subtitles) {
+            wantsNativeSubtitleRenditions = true
+        }
+        if requiresReopen {
             Task { await reopen(at: realPositionMs()) }
         } else {
             // Selection belongs to AVPlayerItem, not the HLS session. This is
@@ -300,6 +331,13 @@ final class PlayerController: ObservableObject {
                 decision.subtitles ?? [],
                 preferredLanguage: model.subLang
             )
+            // An automatically selected native track has to be visible from the
+            // first frame, so it needs its rendition even under `.onDemand`. A
+            // forced bitmap track does not: it forces a burn transcode anyway.
+            if let index = selectedSubtitle,
+               Self.nativeSubtitleOrdinal(index, in: decision.subtitles ?? []) != nil {
+                wantsNativeSubtitleRenditions = true
+            }
             try await openAndDrain(decision: decision, at: startMs)
         } catch {
             reopenQueue.clear()
@@ -365,11 +403,16 @@ final class PlayerController: ObservableObject {
         let nativeSubtitle = selectedSubtitle.flatMap { index in
             Self.nativeSubtitleOrdinal(index, in: subtitles) == nil ? nil : index
         }
-        let hasNativeSubtitles = subtitles.contains(where: \.isNativeHLS)
+        let needsSubtitleRenditions = Self.needsNativeSubtitleSession(
+            hasNativeTextTrack: subtitles.contains(where: \.isNativeHLS),
+            readiness: subtitleReadiness,
+            subtitlesInUse: wantsNativeSubtitleRenditions
+        )
         let forceTranscode = burnSubtitle != nil || selectedHeight != nil || forceCompatibilityTranscode
         let customAudio = audioOverride != nil
         canRetryCurrentItemWithTranscode = normalMode != "transcode" && !forceTranscode && !customAudio
-        let direct = normalMode == "direct" && !forceTranscode && !customAudio && !hasNativeSubtitles
+        let direct = normalMode == "direct" && !forceTranscode && !customAudio
+            && !needsSubtitleRenditions
         let url: URL?
         var seekAfterAttach: Int?
 
@@ -450,6 +493,9 @@ final class PlayerController: ObservableObject {
             restoreAfterFailedChange(wasPlaying: wasPlaying, session: superseded)
             throw APIError.badURL
         }
+        // Committed to this stream shape. A raw-file item has no legible
+        // renditions, so `selectSubtitle` has to rebuild rather than switch.
+        isDirectPlayback = direct
         // The successor exists — only now does the predecessor go. Server-side
         // supersession has already retired it (the create carried the same
         // `playback_id`); this DELETE just hands the encoder slot back at once
@@ -660,13 +706,67 @@ final class PlayerController: ObservableObject {
         )
     }
 
+    /// Whether this open has to go through an HLS session for no reason other
+    /// than making the file's text subtitles selectable. The whole of the
+    /// `SubtitleReadiness` setting is this function; nothing else branches on
+    /// it.
+    ///
+    /// `.instant` answers yes for any file carrying a native text track, which
+    /// is the v0.2 behaviour and the default: every track exists as a rendition
+    /// before the menu is ever opened, so switching one is free. `.onDemand`
+    /// answers yes only once a native track has actually been asked for, so a
+    /// play that never touches subtitles costs the server nothing — and the
+    /// first selection pays for exactly one clean restart, the same one a burn
+    /// already performs, at the same film position.
+    ///
+    /// A file with no native text track answers no under either setting: there
+    /// is nothing a session could publish. Bitmap and styled tracks are not
+    /// native, so they cannot drag a direct-playable file into a session it
+    /// gains nothing from.
+    static func needsNativeSubtitleSession(
+        hasNativeTextTrack: Bool,
+        readiness: SubtitleReadiness,
+        subtitlesInUse: Bool
+    ) -> Bool {
+        guard hasNativeTextTrack else { return false }
+        switch readiness {
+        case .instant: return true
+        case .onDemand: return subtitlesInUse
+        }
+    }
+
+    /// Whether a subtitle selection has to rebuild the stream rather than move
+    /// AVPlayer's media selection on the item already playing.
+    ///
+    /// Three reasons, and only three: leaving a burn (it is in the video
+    /// frames), entering one, and — new with `.onDemand` — the first native
+    /// pick while direct-playing, because a raw file URL has no renditions to
+    /// select. Turning subtitles off during direct play reopens nothing; there
+    /// was never anything on.
+    static func subtitleSelectionRequiresReopen(
+        index: Int?,
+        tracks: [SubtitleTrack],
+        hasActiveBurn: Bool,
+        isDirectPlayback: Bool
+    ) -> Bool {
+        if hasActiveBurn { return true }
+        guard let index else { return false }
+        if subtitleRequiresBurn(index, in: tracks) { return true }
+        return isDirectPlayback
+    }
+
     /// Position in the HLS master rendition order. The server advertises only
-    /// native tracks and preserves source order, so this remains stable even
-    /// when bitmap and styled tracks are interleaved in the menu.
+    /// native tracks (`is_native_text_subtitle`) and preserves source order, so
+    /// this remains stable even when bitmap, `mov_text`, and styled tracks are
+    /// interleaved in the menu — provided `isNativeHLS` names the same set the
+    /// server does, which is why it prefers the server's own `native` flag.
     static func nativeSubtitleOrdinal(_ index: Int, in tracks: [SubtitleTrack]) -> Int? {
         tracks.filter(\.isNativeHLS).firstIndex(where: { $0.index == index })
     }
 
+    /// Text that is not native — `mov_text`, styled ASS/SSA — burns like a
+    /// bitmap track. Routing it to a rendition instead gets a 400 from the
+    /// create, and it is absent from the master either way.
     static func subtitleRequiresBurn(_ index: Int, in tracks: [SubtitleTrack]) -> Bool {
         tracks.first(where: { $0.index == index }).map { !$0.isNativeHLS } ?? true
     }
@@ -744,8 +844,13 @@ final class PlayerController: ObservableObject {
     /// |---|---|
     /// | Forced (disposition flag *or* "forced" in the title), any codec | apply — the one permitted auto-burn |
     /// | Default-flagged and native text (`isNativeHLS`) | apply through the free rendition path |
-    /// | Default-flagged but bitmap or styled | never automatic; explicit selection only |
+    /// | Default-flagged but bitmap, `mov_text`, or styled | never automatic; explicit selection only |
     /// | Merely the same language | never automatic |
+    ///
+    /// The native row deliberately reads `isNativeHLS` — the server's own
+    /// `native` flag where it is sent — and not the broader `text`. A
+    /// default-flagged `mov_text` track is text, is absent from the HLS master,
+    /// and 400s on an explicit pick; auto-applying it would caption nothing.
     ///
     /// The forced carve-out is the `forcedIndex` line and nothing else: delete
     /// it and automatic selection can no longer reach an encoder at all. It

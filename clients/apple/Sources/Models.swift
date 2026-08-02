@@ -172,6 +172,33 @@ enum LibraryGrouping: String, CaseIterable, Identifiable {
     var label: String { self == .category ? "Category" : "Library" }
 }
 
+/// When a title's text subtitles are made switchable, which is really a choice
+/// about who pays for a subtitle menu nobody may open.
+///
+/// - `.instant` — the v0.2 behaviour and the default. A file carrying any
+///   native text track opens through a copy-HLS session, so every track already
+///   exists as a rendition and turning subtitles on, changing language, or
+///   turning them off is an AVPlayer media selection on the item that is
+///   already playing. The cost is a server session and a segmenter on every
+///   play, even for the majority that never touch the menu.
+/// - `.onDemand` — direct-play the raw file, and rebuild it as a copy session
+///   at the same position the first time a subtitle is chosen. The cost is one
+///   restart, and only for viewers who actually use subtitles.
+///
+/// Recorded as a deliberate tradeoff in docs/APPLE-CLIENT-PARITY.md §2.
+enum SubtitleReadiness: String, CaseIterable, Identifiable {
+    case instant
+    case onDemand
+
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .instant: return "Instant"
+        case .onDemand: return "After a short pause"
+        }
+    }
+}
+
 enum PosterSize: String, CaseIterable, Identifiable {
     case small = "s"
     case medium = "m"
@@ -282,12 +309,30 @@ struct SubtitleTrack: Codable, Identifiable {
     var title: String?
     var `default`: Bool
     var forced: Bool
+    /// "Extractable text" — the server's `!is_bitmap_subtitle`. It is *not* the
+    /// rendition test: `mov_text` and styled ASS/SSA are text and still cannot
+    /// be published as WebVTT renditions. Read `isNativeHLS`, never this.
     var text: Bool
+    /// The server's own `is_native_text_subtitle` (`subrip|srt|webvtt|vtt`) —
+    /// the exact predicate that decides which tracks reach the HLS master and
+    /// which explicit picks are answered with 400. Optional because an older
+    /// server does not send it; absent falls back to the local codec check.
+    /// Defaulted and last so no existing construction site has to change.
+    var native: Bool? = nil
 
-    /// Formats the server can expose losslessly enough as an HLS WebVTT
-    /// rendition. Styled ASS/SSA remains a burn even though it contains text.
+    /// Whether this track can be exposed losslessly enough as an HLS WebVTT
+    /// rendition. Styled ASS/SSA and MP4 `mov_text` are text but not native, so
+    /// they remain burns — asking the server for them as renditions gets a 400
+    /// (`hls.rs` rejects a non-native `subtitle` on create, and the master
+    /// playlist never advertises one).
+    ///
+    /// The server's answer wins when it sends one, so this client cannot drift
+    /// from the codec list the segmenter actually enforces. The literal below
+    /// is the fallback for a server that predates the `native` field, and
+    /// mirrors `plurx_core::tracks::is_native_text_subtitle`.
     var isNativeHLS: Bool {
-        ["subrip", "srt", "webvtt", "vtt"].contains(codec.lowercased())
+        if let native { return native }
+        return ["subrip", "srt", "webvtt", "vtt"].contains(codec.lowercased())
     }
 }
 

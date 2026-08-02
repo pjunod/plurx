@@ -174,7 +174,22 @@ data class SubTrack(
     val title: String? = null,
     val default: Boolean = false,
     val forced: Boolean = false,
+    /**
+     * "Has extractable text" — `!is_bitmap_subtitle(codec)`. True for
+     * `mov_text` and for styled ASS/SSA, neither of which the server will
+     * advertise as an HLS rendition. Use [native] to decide routing.
+     */
     val text: Boolean = true,
+    /**
+     * "Can be an HLS WebVTT rendition" — the server's own
+     * `is_native_text_subtitle(codec)`. Narrower than [text]: it excludes
+     * `mov_text` and styled ASS/SSA, the two shapes the session endpoint
+     * rejects with a 400 and the master playlist never carries.
+     *
+     * Null on a server that predates the field, which is why the routing
+     * predicate keeps a codec fallback (`PlaybackPolicy.isNativeTextSubtitle`).
+     */
+    val native: Boolean? = null,
 )
 
 @Serializable

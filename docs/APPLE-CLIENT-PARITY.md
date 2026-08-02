@@ -16,7 +16,10 @@ Vision failure are recorded in
 > `-12927` rejection. The P2 comfort pass has landed in source — watch filters
 > for show libraries, incremental first paint, the ImageIO image pipeline,
 > centralized session expiry, and the delivered-dynamic-range badge (§5) — and
-> is awaiting its device run. Other P1 items below remain open.
+> is awaiting its device run. The §6.4 session tradeoff is now a Settings
+> choice, defaulting to today's behavior, and rendition eligibility now follows
+> the server's `native` flag instead of a local codec guess (§2); both are in
+> source and await the same device run. Other P1 items below remain open.
 
 ## What parity means
 
@@ -44,7 +47,7 @@ Vision failure are recorded in
 | Transport | Play/pause, ±10, full seek | Explicit play/pause, ±10, full-film slider; HLS seeks reopen at the film position; a seek or track change issued during a stream change is queued and replayed once, last writer wins, instead of being dropped | Device-verify hammered tvOS step-seeks during a quality change, and long transcodes |
 | iOS Now Playing | Not applicable | Known duration, elapsed time, pause/play/seek commands, `isLiveStream = false` | Add artwork and series/episode metadata |
 | Audio tracks | Select and restart when needed | Select and restart at the same position | Add friendlier channel/codec labels; validate TrueHD/DTS fallback |
-| Subtitles | Text WebVTT stays client-side; bitmap tracks burn in | SRT/SubRip/WebVTT use native HLS renditions; PGS, VobSub, and styled ASS/SSA retain burn-in; automatic selection never starts a burn except a forced track (see §2) | Complete the Android parity milestone and broaden physical-device coverage |
+| Subtitles | Text WebVTT stays client-side; bitmap tracks burn in | SRT/SubRip/WebVTT use native HLS renditions, chosen by the server's `native` flag rather than a local codec guess; PGS, VobSub, `mov_text`, and styled ASS/SSA retain burn-in; automatic selection never starts a burn except a forced track (see §2); the session-vs-restart tradeoff is a Settings choice defaulting to today's behavior | Complete the Android parity milestone and broaden physical-device coverage |
 | Quality | Auto adaptation, Original, explicit rungs | Server Auto plus explicit ladder rungs; a change that fails to create its session leaves the current stream playing | P1: continuous adaptation and an honest Original option when compatible |
 | Playback info | Detailed source, output, network, encoder, stalls | Source/output, dynamic range, access-log bitrate/stalls, server encode speed/ahead/delivery | Add TTFF, frame presentation rate, stall classification, and build stamp |
 | Media badges | Source badges on detail pages; source-vs-delivered dynamic range in the player | Same shape: detail pages carry resolution/codec/dynamic range source-only; the player's chip dims and names what is actually being delivered (§5) | Extend the same mechanism to audio (Atmos → AAC) and resolution (4K → rung), each with its own truth table |
@@ -75,7 +78,7 @@ modes, not merely one compatible MP4:
 This is the release gate because simulator builds cannot validate hardware
 decode, HDR, background Now Playing, multicast discovery, or a real Siri Remote.
 
-### 2. Native subtitles and the accepted session tradeoff
+### 2. Native subtitles, the session tradeoff, and who decides it
 
 Implemented for SRT/SubRip/WebVTT. The server advertises those tracks as HLS
 WebVTT renditions, including language, title, forced, default, and accessibility
@@ -84,44 +87,93 @@ text track does not replace the player item, change quality, add an FFmpeg
 subtitle filter, or encode video. Resume and seek offsets are reflected in the
 rendition segment timeline.
 
-PGS, VobSub, and styled ASS/SSA still reopen at the same film position and burn
-at source height. This is intentional: those formats cannot be represented as
-ordinary WebVTT without losing pixels or important styling.
+PGS, VobSub, MP4 `mov_text`, and styled ASS/SSA still reopen at the same film
+position and burn at source height. This is intentional: those formats cannot be
+represented as ordinary WebVTT without losing pixels, timing, or important
+styling, and the server refuses to publish them as renditions.
 
-#### The accepted tradeoff: text tracks cost a session, not a restart
+#### The session tradeoff is a setting, defaulting to today's behavior
 
-**Decision, v0.2: keep it.** Any playable file containing an SRT/SubRip/WebVTT
-track opens through a copy-HLS session even when its video could have used the
-raw direct URL. The guard is one line —
-`let direct = normalMode == "direct" && … && !hasNativeSubtitles` in
-`PlayerController.open()`.
+**Decision, v0.2: make it changeable.** The tradeoff below is real in both
+directions, so Settings → Subtitles → **Subtitle switching** decides it, and
+its default is exactly what the app has always done.
 
-*What it costs.* A server session plus a segmenter for that title, on every
-play, where the web and Android clients serve raw bytes over an HTTP range
-request. Nothing else: `copy: true` means the video is repackaged untouched, so
-resolution, HDR, Dolby Vision, and bitrate are identical to direct play, and no
-encoder is attached.
+| Setting | What a play does | What it costs |
+|---|---|---|
+| **Instant** (default) | Any file carrying an SRT/SubRip/WebVTT track opens through a copy-HLS session even when its video could have used the raw direct URL | A server session plus a segmenter for that title, on every play, where the web and Android clients serve raw bytes over an HTTP range request |
+| **After a short pause** | The same file direct-plays, and rebuilds as a copy-HLS session at the same film position the first time a subtitle is chosen | One clean restart, and only for viewers who actually use subtitles |
 
-*What it buys.* Every text track exists as an HLS rendition before the viewer
-opens the subtitle menu, so turning subtitles on, switching between two
+The whole of the setting is one pure function,
+`PlayerController.needsNativeSubtitleSession(hasNativeTextTrack:readiness:subtitlesInUse:)`;
+`open()` reads nothing else about it. A file with *no* native text track
+direct-plays under both settings — there is nothing a session could publish, so
+a PGS or `mov_text` track can never cost a direct play.
+
+*What Instant costs.* A session and a segmenter per play, and nothing else:
+`copy: true` means the video is repackaged untouched, so resolution, HDR, Dolby
+Vision, and bitrate are identical to direct play, and no encoder is attached.
+
+*What Instant buys.* Every text track exists as an HLS rendition before the
+viewer opens the subtitle menu, so turning subtitles on, switching between two
 languages, and turning them off again are all AVPlayer media selections on the
 item that is already playing. No reopen, no reseek, no black frame, no lost
 buffer. Subtitles are most often reached for *mid-scene*, after a line was
-missed — which is exactly when a restart is most expensive to the viewer.
+missed — which is exactly when a restart is most expensive to the viewer. That
+is why it remains the default.
 
-*Why it is not an accident.* The alternative was considered and declined for
-v0.2, not overlooked. A direct-play session that has no subtitle renditions
-cannot grow them: the first selection has to tear the item down and rebuild it
-as a copy session, which is the restart this design exists to avoid.
+*What the alternative gives back.* Most plays never open the subtitle menu at
+all, and on those the server does no work: the Apple client behaves like the web
+and Android clients and pulls raw bytes. The first selection takes the same
+clean reopen a bitmap burn already takes, at `realPositionMs()`, so the film
+resumes where it was.
 
-*The alternative, if Paul wants it.* **Direct-until-first-toggle**: direct-play
-the file, and reopen as a copy-HLS session the first time a subtitle is
-selected. That reclaims the session for the majority of plays where subtitles
-are never touched, at the price of one clean restart at first selection — the
-code already restarts cleanly for burns, so this is a contained change to the
-same `guard`, not a redesign. It is *not* implemented; it is an open option,
-and switching to it is a behavior change that belongs in its own commit with its
-own line in this document.
+Three rules keep the alternative from degrading into repeated restarts:
+
+- The choice is read **once, when playback starts**. Changing it mid-film never
+  rebuilds the stream under the person watching.
+- A subtitle chosen automatically at cold start (the policy below) counts as
+  in use, so an auto-applied track is visible from the first frame rather than
+  after a restart.
+- Once a text track has been asked for, the stream **keeps** its renditions for
+  the rest of the title, including after subtitles are turned off again.
+  Dropping back to direct play would be a second restart nobody asked for.
+
+Both branches are pinned by
+`testSubtitleReadinessDecidesWhetherAPlayInvolvesTheServerAtAll` and
+`testFirstSubtitleChoiceDuringDirectPlayRebuildsTheStreamOnceAndNoMore`.
+
+#### Which tracks can be a rendition: the server's `native`, not `text`
+
+`SubTrackDto` carries two booleans that are easy to confuse. `text` is
+`!is_bitmap_subtitle` — "there are characters in here". `native` is
+`is_native_text_subtitle` (`subrip|srt|webvtt|vtt`) — "this can be an HLS WebVTT
+rendition". They disagree on MP4 `mov_text` and on styled ASS/SSA, and the
+server's segmenter enforces `native`: a non-native track is absent from the HLS
+master, and an explicit pick of one is answered with 400.
+
+The Apple client used to derive that answer locally from the codec string. It
+now decodes `native` and prefers it, falling back to the local codec list only
+against a server that does not send the field — one property,
+`SubtitleTrack.isNativeHLS`, read by every site that asks "can this be a
+rendition?": the master ordinal (`nativeSubtitleOrdinal`), the burn test
+(`subtitleRequiresBurn`), the automatic-selection policy, the session guard
+above, and the "Burn-in" label in the player menu.
+
+**Nothing about Apple playback changes today**, and that is worth stating
+plainly rather than claiming a fix that did not happen. The client's hardcoded
+list and `is_native_text_subtitle` name the same four codecs, so the shape that
+motivated this — a 2160p WEB-DL MP4 with 23 `mov_text` streams, every one of
+them `text` and none of them in the HLS master — was already routed to burn-in
+by iOS/tvOS and already labelled "Burn-in" in the menu. The client that listed
+those tracks as ordinary selectable text is the one reading `text`, not this
+one.
+
+What the change buys is that the two can never diverge. The client no longer
+holds an opinion about a policy the server owns: if the segmenter ever learns to
+convert `mov_text`, or the list is corrected, Apple follows without a client
+release, and a track the server declines to publish can never shift the ordinal
+a viewer's pick resolves to. That is the same reason this client executes
+`delivery` rather than re-deriving policy from `method`.
 
 #### What automatic subtitle selection is allowed to do
 
@@ -133,7 +185,7 @@ which may, always at source height**. The whole policy is one pure function,
 |---|---|
 | Forced — disposition flag *or* "forced" in the title, any codec | apply; bitmap forced tracks are the one permitted automatic burn, at source height |
 | Default-flagged and native text (SRT/SubRip/WebVTT) | apply through the free rendition path |
-| Default-flagged but bitmap (PGS/VobSub) or styled (ASS/SSA) | never automatic — explicit selection only |
+| Default-flagged but bitmap (PGS/VobSub), `mov_text`, or styled (ASS/SSA) | never automatic — explicit selection only |
 | Merely the same language, unflagged | never automatic |
 
 The rows that decline are the substance. Before this, a 4K HDR remux whose only
@@ -142,9 +194,15 @@ transcode on every play: an encoder slot, H.264, and no HDR, for a track nobody
 had asked for. Manual selection is untouched — a viewer who picks a PGS track
 still gets a burn, at source height.
 
+"Native text" in that table means `SubtitleTrack.isNativeHLS`, which prefers the
+server's `native` flag — not the broader `text`. A default-flagged `mov_text`
+track is text and would otherwise have been auto-applied to a rendition that does
+not exist.
+
 The cross-client implementation handoff is
 [CLIENTS-REMEDIATION-PLAN.md](CLIENTS-REMEDIATION-PLAN.md), especially §5.4;
-the session tradeoff above is its §6.4 and the selection table is its §3.1.
+the session tradeoff above is its §6.4 — resolved by making it a setting rather
+than by choosing for the viewer — and the selection table is its §3.1.
 
 ### 3. Add the remaining web playback controls
 

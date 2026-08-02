@@ -31,7 +31,7 @@ for that viewer and keeps server administration out of the comparison.
 | Home-video folders and photos | Folder navigation and photo viewer |
 | Resume, restart, watched/unwatched | Detail actions and progress sync |
 | Direct, remux, HLS transcode | Media3/ExoPlayer delivery-plan execution |
-| Audio/subtitle choice | Embedded tracks are native; server text tracks arrive as HLS renditions, and only bitmap or styled tracks burn |
+| Audio/subtitle choice | Embedded tracks are native; tracks the server marks `native` arrive as HLS renditions, and everything else burns on a session |
 | Auto/original/fixed playback quality | Viewer preference and an in-player selector built from the server's advertised ladder |
 | Intro/credits markers | Manual skip or automatic skip |
 | Autoplay next episode | Ordered season/show traversal |
@@ -57,10 +57,18 @@ implemented and pinned by `PlaybackPolicyTest`:
 - Media3 switches native text tracks with `TrackSelectionOverride` and turns
   them off by disabling `C.TRACK_TYPE_TEXT`; neither action creates a new HLS
   session.
-- PGS, VobSub, and styled ASS/SSA use `subtitle_burn` at source height. Note
-  that `/decision` reports `text: true` for ASS/SSA — it is not a bitmap — but
-  the session endpoint rejects it as a native rendition and the master never
-  advertises it, so the client classifies renditions by codec, not by `text`.
+- PGS, VobSub, `mov_text`, and styled ASS/SSA use `subtitle_burn` at source
+  height. `/decision` reports `text: true` for `mov_text` and ASS/SSA — neither
+  is a bitmap — but the session endpoint rejects both as native renditions and
+  the master never advertises them. The client therefore routes on
+  `SubTrackDto.native` (the server's own `is_native_text_subtitle`), falling
+  back to a codec table only for a server that predates the field, and never on
+  `text`. A 2160p WEB-DL MP4 with 23 `mov_text` tracks is what the distinction
+  costs when it is missing: every track offered, every explicit pick a 400.
+- On direct play those same tracks are free — the player reads the container's
+  own track, and `/files/{id}/subs/{index}.vtt` would extract either format if
+  asked, since that endpoint turns away only bitmaps
+  (`plurxd/src/http/stream.rs:770`). Only a *session* has to burn them.
 - Viewer-language automatic selection treats a forced disposition and a
   case-insensitive `Forced` title as equivalent signals. For file 5615 with
   English preferences, subtitle index 2 wins over the Italian container

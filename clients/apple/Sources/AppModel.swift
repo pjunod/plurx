@@ -31,6 +31,7 @@ final class AppModel: ObservableObject {
     @Published var subLang: String
     @Published var autoplay: Bool
     @Published var posterSize: PosterSize
+    @Published var subtitleReadiness: SubtitleReadiness
 
     /// Starts as the app launches so iOS asks for local-network access before
     /// a person reaches Connect or Sign in. ConnectView observes this object
@@ -54,6 +55,7 @@ final class AppModel: ObservableObject {
         subLang = settings.subLang
         autoplay = settings.autoplay
         posterSize = settings.posterSize
+        subtitleReadiness = settings.subtitleReadiness
         libraryGrouping = settings.libraryGrouping
         discovery.start()
         Task {
@@ -410,6 +412,14 @@ final class AppModel: ObservableObject {
     func setAutoplay(_ enabled: Bool) {
         autoplay = enabled
         settings.autoplay = enabled
+    }
+
+    /// A change takes effect on the next title. `PlayerController` reads this
+    /// once, when playback starts, so flipping the setting mid-film never
+    /// rebuilds the stream under the person watching it.
+    func setSubtitleReadiness(_ readiness: SubtitleReadiness) {
+        subtitleReadiness = readiness
+        settings.subtitleReadiness = readiness
     }
 
     func setLibraryGrouping(_ grouping: LibraryGrouping) {

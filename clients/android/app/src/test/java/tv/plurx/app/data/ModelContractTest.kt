@@ -7,9 +7,14 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import tv.plurx.app.player.isNativeTextSubtitle
 
 class ModelContractTest {
-    private val json = Json { ignoreUnknownKeys = true }
+    // The wire Json, restated: `Net` builds it with exactly these two.
+    private val json = Json {
+        ignoreUnknownKeys = true
+        explicitNulls = false
+    }
 
     @Test
     fun itemAcceptsTheFullWebViewerShape() {
@@ -174,6 +179,74 @@ class ModelContractTest {
         assertTrue(burn.contains("\"subtitle_burn\":4"))
         assertTrue(burn.contains("\"height\":2160"))
         assertFalse(burn.contains("native_subtitles"))
+    }
+
+    @Test
+    fun subtitleTracksCarryBothTextAndTheServersNativeVerdict() {
+        // The two flags are different questions and the server sends both:
+        // `text` is "has extractable text" (!is_bitmap_subtitle), `native` is
+        // "can be an HLS rendition" (is_native_text_subtitle). They disagree
+        // on mov_text and on styled ASS/SSA.
+        val decision = json.decodeFromString<Decision>(
+            """{
+              "file_id": 5615, "method": "transcode", "play_url": "/stream.mp4",
+              "subtitles": [
+                {"index": 0, "codec": "subrip", "text": true, "native": true},
+                {"index": 1, "codec": "mov_text", "text": true, "native": false},
+                {"index": 2, "codec": "ass", "text": true, "native": false},
+                {"index": 3, "codec": "hdmv_pgs_subtitle", "text": false, "native": false}
+              ]
+            }""".trimIndent(),
+        )
+        val (srt, movText, ass, pgs) = decision.subtitles
+
+        assertEquals(true, srt.native)
+        assertTrue(srt.text)
+        // The whole reason the field exists: text and native disagree here.
+        assertTrue(movText.text)
+        assertEquals(false, movText.native)
+        assertTrue(ass.text)
+        assertEquals(false, ass.native)
+        assertFalse(pgs.text)
+        assertEquals(false, pgs.native)
+
+        // And the routing predicate takes the server at its word.
+        assertTrue(isNativeTextSubtitle(srt))
+        assertFalse(isNativeTextSubtitle(movText))
+        assertFalse(isNativeTextSubtitle(ass))
+        assertFalse(isNativeTextSubtitle(pgs))
+    }
+
+    @Test
+    fun aServerWithoutNativeStillDecodesAndFallsBackToTheCodec() {
+        // The field is new. An older server omits it, the track still decodes,
+        // and `native` stays null so the client's codec table decides.
+        val decision = json.decodeFromString<Decision>(
+            """{
+              "file_id": 1, "method": "remux", "play_url": "/stream.mp4",
+              "subtitles": [
+                {"index": 0, "codec": "subrip", "text": true},
+                {"index": 1, "codec": "mov_text", "text": true}
+              ]
+            }""".trimIndent(),
+        )
+        val (srt, movText) = decision.subtitles
+
+        assertNull(srt.native)
+        assertNull(movText.native)
+        assertTrue(isNativeTextSubtitle(srt))
+        assertFalse(isNativeTextSubtitle(movText))
+
+        // An explicit JSON null is the same absence (`explicitNulls = false`
+        // on the wire Json, and a nullable field with a null default here).
+        assertNull(
+            json.decodeFromString<Decision>(
+                """{
+                  "file_id": 1, "method": "remux", "play_url": "/s.mp4",
+                  "subtitles": [{"index": 0, "codec": "subrip", "native": null}]
+                }""".trimIndent(),
+            ).subtitles.single().native,
+        )
     }
 
     @Test

@@ -23,6 +23,7 @@ struct SettingsStore {
         static let audioLang = "plurx.audioLang"
         static let subLang = "plurx.subLang"
         static let autoplay = "plurx.autoplay"
+        static let subtitleReadiness = "plurx.subtitleReadiness"
         static let libraryGrouping = "plurx.libraryGrouping"
         static let posterSize = "plurx.posterSize"
     }
@@ -75,6 +76,15 @@ struct SettingsStore {
     var autoplay: Bool {
         get { defaults.object(forKey: Key.autoplay) as? Bool ?? true }
         nonmutating set { defaults.set(newValue, forKey: Key.autoplay) }
+    }
+    /// Defaults to `.instant`, which is what the app has always done: an
+    /// unchanged install behaves exactly as before.
+    var subtitleReadiness: SubtitleReadiness {
+        get {
+            SubtitleReadiness(rawValue: defaults.string(forKey: Key.subtitleReadiness) ?? "")
+                ?? .instant
+        }
+        nonmutating set { defaults.set(newValue.rawValue, forKey: Key.subtitleReadiness) }
     }
     var libraryGrouping: LibraryGrouping {
         get {

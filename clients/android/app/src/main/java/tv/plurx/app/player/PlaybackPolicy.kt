@@ -28,8 +28,12 @@ import tv.plurx.app.data.SubTrack
  * |---|---|
  * | Forced (flag or "forced" in the title), any codec | apply — the one permitted auto-burn |
  * | Default-flagged, native text | apply, via the free path |
- * | Default-flagged, bitmap or styled | **not** applied; explicit selection only |
+ * | Default-flagged, bitmap or non-native text (`mov_text`, styled ASS/SSA) | **not** applied; explicit selection only |
  * | Merely the same language | never |
+ *
+ * "Native text" is [isNativeTextSubtitle], not `SubTrack.text` — a
+ * default-flagged `mov_text` track is text the server will not put in a
+ * playlist, so auto-applying it would start a burn.
  *
  * To withdraw the carve-out, delete the forced branch: a forced bitmap track
  * then needs an explicit pick like any other burn.
@@ -48,18 +52,28 @@ internal fun automaticSubtitleIndex(tracks: List<SubTrack>, subtitleLanguage: St
 
 /**
  * Can this track be delivered as a WebVTT rendition, rather than drawn into
- * the picture?
+ * the picture? The single owner of that question: [subtitleRoute],
+ * [nativeSubtitleOrdinal], and the §3.1 policy above all ask it here, so the
+ * menu, the routing, and the rendition ordinals can never disagree.
  *
  * **Not** the same question as `SubTrack.text`. The decision's `text` flag is
- * `!is_bitmap_subtitle` (`plurxd/src/http/stream.rs:419`), so an ASS/SSA track
- * arrives with `text = true` — but the session endpoint rejects it with a 400
- * (`plurxd/src/http/hls.rs:209`, `is_native_text_subtitle`) and the master
- * playlist never advertises it, because authored positioning, typefaces, and
- * karaoke effects do not survive the conversion. Styled text burns with the
- * bitmaps; this predicate is the client's copy of that same rule.
+ * `!is_bitmap_subtitle` (`plurxd/src/http/stream.rs:419`) — "has extractable
+ * text" — so `mov_text` and styled ASS/SSA both arrive with `text = true`.
+ * But the session endpoint rejects them with a 400 (`plurxd/src/http/hls.rs:209`,
+ * `is_native_text_subtitle`) and the master playlist never advertises them,
+ * because authored positioning, typefaces, and karaoke effects do not survive
+ * the conversion. The gap is not theoretical: a 2160p WEB-DL MP4 with 23
+ * `mov_text` tracks offers every one of them on `text` alone, and every
+ * explicit pick is a 400.
+ *
+ * `SubTrack.native` **is** that server-side predicate, sent alongside `text`,
+ * so prefer it whenever the server said anything. The codec table below is the
+ * fallback for a server that predates the field — the same list as
+ * `plurx-core/src/tracks.rs:144`, and the only reason this client still
+ * restates a server rule at all.
  */
 internal fun isNativeTextSubtitle(track: SubTrack): Boolean =
-    track.text && track.codec.lowercase(Locale.US) in NATIVE_TEXT_SUBTITLE_CODECS
+    track.native ?: (track.text && track.codec.lowercase(Locale.US) in NATIVE_TEXT_SUBTITLE_CODECS)
 
 private val NATIVE_TEXT_SUBTITLE_CODECS = setOf("subrip", "srt", "webvtt", "vtt")
 
@@ -101,8 +115,14 @@ internal enum class SubtitleRoute {
 
 /**
  * Direct play renders any text the container carries, styling included, so
- * ASS/SSA is free there. A server session cannot advertise it as a rendition
- * (see [isNativeTextSubtitle]), so there it burns with the bitmaps.
+ * `mov_text` and ASS/SSA are free there — the player reads the container's own
+ * track, and `/files/{id}/subs/{index}.vtt` can extract either if it has to
+ * (that endpoint turns away only bitmaps, `plurxd/src/http/stream.rs:770`).
+ * A server session cannot advertise them as renditions (see
+ * [isNativeTextSubtitle]), so there they burn with the bitmaps.
+ *
+ * The invariant this table exists to hold: a track that is `text` but not
+ * native is **never** [SubtitleRoute.NativeRendition].
  */
 internal fun subtitleRoute(track: SubTrack?, planMode: String): SubtitleRoute = when {
     track == null -> SubtitleRoute.Off
@@ -115,8 +135,10 @@ internal fun subtitleRoute(track: SubTrack?, planMode: String): SubtitleRoute = 
 /**
  * Position of an absolute subtitle-stream index in the HLS master's rendition
  * order. The server advertises only native-text tracks and preserves source
- * order, so this stays stable even when bitmap tracks are interleaved between
- * them in the menu.
+ * order, so this stays stable even when bitmap or `mov_text` tracks are
+ * interleaved between them in the menu. Counting by the wrong predicate here
+ * does not fail loudly — it silently shifts every rendition after the first
+ * `mov_text` or ASS track, and the viewer gets the neighbouring language.
  */
 internal fun nativeSubtitleOrdinal(index: Long, tracks: List<SubTrack>): Int? =
     tracks.filter(::isNativeTextSubtitle).indexOfFirst { it.index == index }.takeIf { it >= 0 }

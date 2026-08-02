@@ -416,6 +416,248 @@ final class AppleClientTests: XCTestCase {
         XCTAssertFalse(PlayerController.subtitleRequiresBurn(3, in: tracks))
     }
 
+    /// Both halves of the Settings toggle, which is the only thing that reads
+    /// `SubtitleReadiness`. `.instant` is the shipped default and must keep
+    /// answering exactly as the old `!hasNativeSubtitles` guard did.
+    @MainActor
+    func testSubtitleReadinessDecidesWhetherAPlayInvolvesTheServerAtAll() {
+        // `.instant`: a native text track anywhere in the file is enough, and
+        // it is enough before anyone has opened the subtitle menu.
+        XCTAssertTrue(PlayerController.needsNativeSubtitleSession(
+            hasNativeTextTrack: true,
+            readiness: .instant,
+            subtitlesInUse: false
+        ))
+        XCTAssertTrue(PlayerController.needsNativeSubtitleSession(
+            hasNativeTextTrack: true,
+            readiness: .instant,
+            subtitlesInUse: true
+        ))
+
+        // `.onDemand`: the same file direct-plays until a native track is
+        // actually asked for. This is the play the server never hears about.
+        XCTAssertFalse(PlayerController.needsNativeSubtitleSession(
+            hasNativeTextTrack: true,
+            readiness: .onDemand,
+            subtitlesInUse: false
+        ))
+        XCTAssertTrue(
+            PlayerController.needsNativeSubtitleSession(
+                hasNativeTextTrack: true,
+                readiness: .onDemand,
+                subtitlesInUse: true
+            ),
+            "once a text track is in use the reopen has to be a session, or there is nothing to select"
+        )
+
+        // No native text track: neither setting can invent renditions, so a
+        // PGS-only or mov_text-only file direct-plays under both. This row is
+        // why a bitmap track cannot cost a direct play.
+        for readiness in SubtitleReadiness.allCases {
+            XCTAssertFalse(PlayerController.needsNativeSubtitleSession(
+                hasNativeTextTrack: false,
+                readiness: readiness,
+                subtitlesInUse: false
+            ))
+            XCTAssertFalse(PlayerController.needsNativeSubtitleSession(
+                hasNativeTextTrack: false,
+                readiness: readiness,
+                subtitlesInUse: true
+            ))
+        }
+    }
+
+    /// A fresh install, and an install that has never touched the new control,
+    /// must both behave exactly as v0.2 shipped.
+    func testSubtitleReadinessDefaultsToTodaysBehaviorAndPersistsAChange() throws {
+        let suite = "tv.plurx.tests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let fresh = SettingsStore(defaults: defaults)
+        XCTAssertEqual(fresh.subtitleReadiness, .instant)
+
+        // An unreadable or future value falls back to the default rather than
+        // silently changing how titles open.
+        defaults.set("something-else", forKey: "plurx.subtitleReadiness")
+        XCTAssertEqual(SettingsStore(defaults: defaults).subtitleReadiness, .instant)
+
+        fresh.subtitleReadiness = .onDemand
+        XCTAssertEqual(SettingsStore(defaults: defaults).subtitleReadiness, .onDemand)
+    }
+
+    /// Which subtitle selections have to rebuild the stream. Under `.onDemand`
+    /// the first native pick during direct play is a new member of that set —
+    /// a raw file URL has no renditions to select — and it takes the same clean
+    /// reopen a burn already takes, at `realPositionMs()`.
+    @MainActor
+    func testFirstSubtitleChoiceDuringDirectPlayRebuildsTheStreamOnceAndNoMore() {
+        let tracks = [
+            SubtitleTrack(
+                index: 0, codec: "subrip", language: "eng", title: "English",
+                default: false, forced: false, text: true
+            ),
+            SubtitleTrack(
+                index: 1, codec: "hdmv_pgs_subtitle", language: "eng", title: "PGS",
+                default: false, forced: false, text: false
+            ),
+        ]
+
+        // Direct play, nothing burned: the first native pick is the restart.
+        XCTAssertTrue(PlayerController.subtitleSelectionRequiresReopen(
+            index: 0, tracks: tracks, hasActiveBurn: false, isDirectPlayback: true
+        ))
+        // Turning subtitles off during direct play restarts nothing — there was
+        // never anything on.
+        XCTAssertFalse(PlayerController.subtitleSelectionRequiresReopen(
+            index: nil, tracks: tracks, hasActiveBurn: false, isDirectPlayback: true
+        ))
+        // Once the copy session exists, every further text switch is free
+        // again: this is the second-and-later selection, and it must not
+        // reopen.
+        XCTAssertFalse(PlayerController.subtitleSelectionRequiresReopen(
+            index: 0, tracks: tracks, hasActiveBurn: false, isDirectPlayback: false
+        ))
+
+        // The pre-existing reasons are untouched: entering a burn, and leaving
+        // one, still reopen whatever the delivery mode.
+        XCTAssertTrue(PlayerController.subtitleSelectionRequiresReopen(
+            index: 1, tracks: tracks, hasActiveBurn: false, isDirectPlayback: false
+        ))
+        XCTAssertTrue(PlayerController.subtitleSelectionRequiresReopen(
+            index: nil, tracks: tracks, hasActiveBurn: true, isDirectPlayback: false
+        ))
+        XCTAssertTrue(PlayerController.subtitleSelectionRequiresReopen(
+            index: 0, tracks: tracks, hasActiveBurn: true, isDirectPlayback: false
+        ))
+        // An index the decision never listed is treated as a burn, as before.
+        XCTAssertTrue(PlayerController.subtitleSelectionRequiresReopen(
+            index: 99, tracks: tracks, hasActiveBurn: false, isDirectPlayback: false
+        ))
+    }
+
+    /// The 23-`mov_text` MP4: every track is `text`, none is `native`. Before
+    /// the server sent `native`, the codec list happened to agree — the point
+    /// of this test is that the client now takes the server's answer, so the
+    /// two can never disagree about which tracks are in the HLS master.
+    func testServerNativeFlagDecidesRenditionsAndOverridesTheLocalCodecGuess() throws {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+
+        let movText = try decoder.decode(SubtitleTrack.self, from: Data(#"""
+        {"index":0,"codec":"mov_text","language":"eng","title":"English",
+         "default":true,"forced":false,"text":true,"native":false}
+        """#.utf8))
+        XCTAssertTrue(movText.text, "mov_text is extractable text")
+        XCTAssertFalse(movText.isNativeHLS, "…and still cannot be an HLS rendition")
+
+        // A server that predates the field decodes to nil and falls back to the
+        // local codec check, which is what shipped.
+        let legacy = try decoder.decode(SubtitleTrack.self, from: Data(#"""
+        {"index":1,"codec":"subrip","language":"eng","default":false,
+         "forced":false,"text":true}
+        """#.utf8))
+        XCTAssertNil(legacy.native)
+        XCTAssertTrue(legacy.isNativeHLS)
+
+        // And where the two could disagree, the server wins in both directions:
+        // a codec this client has never heard of that the server can publish,
+        // and a codec it would have published that the server will not.
+        let serverSaysYes = try decoder.decode(SubtitleTrack.self, from: Data(#"""
+        {"index":2,"codec":"stl","default":false,"forced":false,
+         "text":true,"native":true}
+        """#.utf8))
+        XCTAssertTrue(serverSaysYes.isNativeHLS)
+        let serverSaysNo = try decoder.decode(SubtitleTrack.self, from: Data(#"""
+        {"index":3,"codec":"subrip","default":false,"forced":false,
+         "text":true,"native":false}
+        """#.utf8))
+        XCTAssertFalse(serverSaysNo.isNativeHLS)
+    }
+
+    /// Ordinals and the §3.1 automatic policy must read the *same* notion of
+    /// "can be a rendition", or a `mov_text` or ASS track silently shifts the
+    /// rendition a viewer's pick resolves to and AVPlayer captions the wrong
+    /// language.
+    @MainActor
+    func testTextButNotNativeTracksBurnAndNeverShiftARenditionOrdinal() {
+        let tracks = [
+            SubtitleTrack(
+                index: 0, codec: "mov_text", language: "eng", title: "English",
+                default: true, forced: false, text: true, native: false
+            ),
+            SubtitleTrack(
+                index: 1, codec: "ass", language: "eng", title: "Signs",
+                default: false, forced: false, text: true, native: false
+            ),
+            SubtitleTrack(
+                index: 2, codec: "subrip", language: "eng", title: "English SDH",
+                default: false, forced: false, text: true, native: true
+            ),
+            SubtitleTrack(
+                index: 3, codec: "hdmv_pgs_subtitle", language: "eng", title: "PGS",
+                default: false, forced: false, text: false, native: false
+            ),
+            SubtitleTrack(
+                index: 4, codec: "webvtt", language: "fre", title: "Français",
+                default: false, forced: false, text: true, native: true
+            ),
+        ]
+
+        // Only the two native tracks are in the master, in source order. If
+        // `text` were the test, the mov_text and ASS tracks would count too:
+        // index 2 would resolve to rendition 2 and index 4 to rendition 3, of a
+        // master that carries exactly two — so the viewer's pick would land on
+        // the wrong track or on nothing at all.
+        XCTAssertEqual(PlayerController.nativeSubtitleOrdinal(2, in: tracks), 0)
+        XCTAssertEqual(PlayerController.nativeSubtitleOrdinal(4, in: tracks), 1)
+        XCTAssertNil(PlayerController.nativeSubtitleOrdinal(0, in: tracks))
+        XCTAssertNil(PlayerController.nativeSubtitleOrdinal(1, in: tracks))
+        XCTAssertNil(PlayerController.nativeSubtitleOrdinal(3, in: tracks))
+
+        // Text-but-not-native routes to burn rather than to a rendition that
+        // would be answered with 400.
+        XCTAssertTrue(PlayerController.subtitleRequiresBurn(0, in: tracks))
+        XCTAssertTrue(PlayerController.subtitleRequiresBurn(1, in: tracks))
+        XCTAssertFalse(PlayerController.subtitleRequiresBurn(2, in: tracks))
+
+        // §3.1: a default-flagged `mov_text` track is not a permitted cold
+        // start. Index 0 is default-flagged and English; taking it would ask
+        // for a rendition the master does not contain. Nothing else here is
+        // flagged, so automatic selection declines entirely — which is the
+        // whole rule, not a failure.
+        XCTAssertNil(PlayerController.automaticSubtitleIndex(tracks, preferredLanguage: "eng"))
+
+        // The same file with the native track flagged instead: now automatic
+        // selection has something free to take.
+        let flagged = [
+            SubtitleTrack(
+                index: 0, codec: "mov_text", language: "eng", title: "English",
+                default: false, forced: false, text: true, native: false
+            ),
+            SubtitleTrack(
+                index: 2, codec: "subrip", language: "eng", title: "English SDH",
+                default: true, forced: false, text: true, native: true
+            ),
+        ]
+        XCTAssertEqual(PlayerController.automaticSubtitleIndex(flagged, preferredLanguage: "eng"), 2)
+
+        // The forced carve-out is unchanged and still reaches a burn: a forced
+        // `mov_text` track is dialogue the film needs, so it burns at source
+        // height rather than being dropped.
+        let forcedMovText = [
+            SubtitleTrack(
+                index: 0, codec: "mov_text", language: "eng", title: "Forced",
+                default: true, forced: true, text: true, native: false
+            ),
+        ]
+        XCTAssertEqual(
+            PlayerController.automaticSubtitleIndex(forcedMovText, preferredLanguage: "eng"),
+            0
+        )
+        XCTAssertTrue(PlayerController.subtitleRequiresBurn(0, in: forcedMovText))
+    }
+
     func testOriginNormalizationAcceptsHostnamesAndRemovesTrailingSlashes() {
         XCTAssertEqual(AppModel.normalizeOrigin("  media-box:32400///  "), "http://media-box:32400")
         XCTAssertEqual(AppModel.normalizeOrigin("media-box"), "http://media-box:32400")

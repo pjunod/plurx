@@ -16,7 +16,8 @@ private fun sub(
     default: Boolean = false,
     forced: Boolean = false,
     text: Boolean = true,
-) = SubTrack(index, codec, language, title, default, forced, text)
+    native: Boolean? = null,
+) = SubTrack(index, codec, language, title, default, forced, text, native)
 
 class PlaybackPolicyTest {
 
@@ -102,9 +103,40 @@ class PlaybackPolicyTest {
     }
 
     @Test
+    fun movTextHasNoRenditionEither() {
+        // The MP4 trap, and the one that actually bit: a 2160p WEB-DL with 23
+        // `mov_text` tracks. `/decision` calls every one of them text=true (it
+        // is not a bitmap), the master advertises none of them, and an
+        // explicit rendition pick is a 400 "requires burn-in".
+        val movText = sub(1, codec = "mov_text")
+
+        assertEquals(SubtitleRoute.Burn, subtitleRoute(movText, "remux"))
+        assertEquals(SubtitleRoute.Burn, subtitleRoute(movText, "transcode"))
+        // Direct play reads the container's own track — free, and the sidecar
+        // endpoint would extract it too, since it turns away only bitmaps.
+        assertEquals(SubtitleRoute.EmbeddedText, subtitleRoute(movText, "direct"))
+        // And a default flag on one is not an invitation to burn.
+        assertNull(automaticSubtitleIndex(listOf(sub(0, codec = "mov_text", default = true)), "eng"))
+    }
+
+    @Test
+    fun theThreeSubtitleClassesRouteToThreeDifferentPlaces() {
+        // One table, one assertion per class, on a session plan.
+        assertEquals(SubtitleRoute.NativeRendition, subtitleRoute(sub(0, codec = "subrip"), "transcode"))
+        assertEquals(SubtitleRoute.Burn, subtitleRoute(sub(1, codec = "mov_text"), "transcode"))
+        assertEquals(SubtitleRoute.Burn, subtitleRoute(sub(2, codec = "ass"), "transcode"))
+        assertEquals(
+            SubtitleRoute.Burn,
+            subtitleRoute(sub(3, codec = "hdmv_pgs_subtitle", text = false), "transcode"),
+        )
+    }
+
+    @Test
     fun renditionOrdinalCountsOnlyTheNativeTextTracks() {
-        // Absolute stream indexes 0,1,2,3 with bitmaps interleaved: the HLS
-        // master carries only the text ones, in source order.
+        // Absolute stream indexes with bitmaps and non-native text
+        // interleaved: the HLS master carries only the native ones, in source
+        // order. Anything else counted here shifts every rendition after it,
+        // and the viewer silently gets the neighbouring language.
         val tracks = listOf(
             sub(0, codec = "hdmv_pgs_subtitle", text = false),
             sub(1),
@@ -112,13 +144,52 @@ class PlaybackPolicyTest {
             // Styled text is not in the master either, so it must not shift
             // the ordinals of the tracks that are.
             sub(3, codec = "ass"),
-            sub(4),
+            // Neither is mov_text, for all that it is text.
+            sub(4, codec = "mov_text"),
+            sub(5),
         )
         assertEquals(0, nativeSubtitleOrdinal(1, tracks))
-        assertEquals(1, nativeSubtitleOrdinal(4, tracks))
+        assertEquals(1, nativeSubtitleOrdinal(5, tracks))
         assertNull(nativeSubtitleOrdinal(0, tracks))
         assertNull(nativeSubtitleOrdinal(3, tracks))
+        assertNull(nativeSubtitleOrdinal(4, tracks))
         assertNull(nativeSubtitleOrdinal(9, tracks))
+    }
+
+    // ---- §2.3 the server owns the notion; the codec table is the fallback ---
+
+    @Test
+    fun theServersNativeFlagOutranksTheClientsCodecTable() {
+        // The point of decoding `native`: the server can change its mind about
+        // a codec without a client release. A codec this client would call
+        // native, that the server says is not — and the reverse.
+        val serverSaysNo = sub(1, codec = "subrip", native = false)
+        assertEquals(SubtitleRoute.Burn, subtitleRoute(serverSaysNo, "transcode"))
+        assertNull(automaticSubtitleIndex(listOf(sub(0, native = false, default = true)), "eng"))
+
+        val serverSaysYes = sub(2, codec = "some_future_text_codec", native = true)
+        assertEquals(SubtitleRoute.NativeRendition, subtitleRoute(serverSaysYes, "transcode"))
+        assertEquals(
+            0L,
+            automaticSubtitleIndex(
+                listOf(sub(0, codec = "some_future_text_codec", native = true, default = true)),
+                "eng",
+            ),
+        )
+
+        // And the ordinals follow the same answer, not the codec.
+        val tracks = listOf(serverSaysNo, serverSaysYes, sub(3))
+        assertEquals(0, nativeSubtitleOrdinal(2, tracks))
+        assertEquals(1, nativeSubtitleOrdinal(3, tracks))
+        assertNull(nativeSubtitleOrdinal(1, tracks))
+    }
+
+    @Test
+    fun anOlderServerWithoutTheNativeFlagFallsBackToTheCodecTable() {
+        // Every `sub()` above omits `native`; this pins that the omission is
+        // the codec table's job and not a crash or a blanket "no".
+        assertEquals(SubtitleRoute.NativeRendition, subtitleRoute(sub(0, native = null), "remux"))
+        assertEquals(SubtitleRoute.Burn, subtitleRoute(sub(1, codec = "mov_text", native = null), "remux"))
     }
 
     // ---- §5.3 / §3.2 force and heights -------------------------------------
