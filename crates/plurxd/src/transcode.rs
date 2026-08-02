@@ -1185,15 +1185,16 @@ fn copied_hls_codecs(
     file: &plurx_core::domain::MediaFile,
     audio_index: Option<i64>,
     options: CopySessionOptions,
+    probe_json: Option<&str>,
 ) -> String {
     let video = match file.video_codec.as_deref() {
         Some("hevc" | "h265")
             if options.preserve_dolby_vision && file.hdr.as_deref() == Some("dolby_vision") =>
         {
-            "dvh1"
+            dolby_vision_hls_codec(probe_json).unwrap_or_else(|| "dvh1".to_owned())
         }
-        Some("hevc" | "h265") => "hvc1",
-        _ => "avc1",
+        Some("hevc" | "h265") => "hvc1".to_owned(),
+        _ => "avc1".to_owned(),
     };
     let audio = if options.transcode_audio {
         "mp4a.40.2"
@@ -1201,6 +1202,31 @@ fn copied_hls_codecs(
         copied_audio_codec(file, audio_index)
     };
     format!("{video},{audio}")
+}
+
+/// AVPlayer accepts a media playlist without codec metadata, but a
+/// multivariant playlist has to describe Dolby Vision with its RFC 6381
+/// profile and level. A bare `dvh1` makes an otherwise playable copied stream
+/// fail during asset preparation. The scanner keeps ffprobe's DOVI
+/// configuration record verbatim, so use the exact values that are also
+/// carried by the remuxed sample entry.
+fn dolby_vision_hls_codec(probe_json: Option<&str>) -> Option<String> {
+    let probe: serde_json::Value = serde_json::from_str(probe_json?).ok()?;
+    let video = probe.get("streams")?.as_array()?.iter().find(|stream| {
+        stream.get("codec_type").and_then(|value| value.as_str()) == Some("video")
+    })?;
+    let dovi = video
+        .get("side_data_list")?
+        .as_array()?
+        .iter()
+        .find(|side| {
+            side.get("side_data_type")
+                .and_then(|value| value.as_str())
+                .is_some_and(|kind| kind.contains("DOVI") || kind.contains("Dolby Vision"))
+        })?;
+    let profile = dovi.get("dv_profile")?.as_u64()?;
+    let level = dovi.get("dv_level")?.as_u64()?;
+    Some(format!("dvh1.{profile:02}.{level:02}"))
 }
 
 pub struct StartInfo {
@@ -3327,6 +3353,7 @@ impl TranscodeManager {
             .await
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "file not found".to_owned())?;
+        let probe_json = self.store.get_file_probe_json(file_id).await.ok().flatten();
         file.audio_offset_ms = if file.audio_streams.is_empty() {
             0
         } else {
@@ -3448,7 +3475,7 @@ impl TranscodeManager {
             user_name: user_name.to_owned(),
             playback_id: playback_id.to_owned(),
             start_seconds,
-            hls_codecs: copied_hls_codecs(&file, audio_override, options),
+            hls_codecs: copied_hls_codecs(&file, audio_override, options, probe_json.as_deref()),
             target_height: file.height.unwrap_or(0),
             encoder_label: Mutex::new("copy"),
             started_unix: std::time::SystemTime::now()
@@ -4877,8 +4904,11 @@ mod tests {
                     transcode_audio: false,
                     preserve_dolby_vision: true,
                 },
+                Some(
+                    r#"{"streams":[{"codec_type":"video","side_data_list":[{"side_data_type":"DOVI configuration record","dv_profile":8,"dv_level":6}]}]}"#,
+                ),
             ),
-            "dvh1,ec-3"
+            "dvh1.08.06,ec-3"
         );
         assert_eq!(
             copied_hls_codecs(
@@ -4888,6 +4918,7 @@ mod tests {
                     transcode_audio: true,
                     preserve_dolby_vision: false,
                 },
+                None,
             ),
             "hvc1,mp4a.40.2"
         );
