@@ -161,6 +161,19 @@ final class AppleClientTests: XCTestCase {
     }
 
     @MainActor
+    func testApplePlayerRecreatesAnInterruptedServerSessionAfterThreeFailures() {
+        XCTAssertFalse(PlayerController.shouldRecoverInterruptedSession(
+            consecutiveStatusFailures: 1
+        ))
+        XCTAssertFalse(PlayerController.shouldRecoverInterruptedSession(
+            consecutiveStatusFailures: 2
+        ))
+        XCTAssertTrue(PlayerController.shouldRecoverInterruptedSession(
+            consecutiveStatusFailures: 3
+        ))
+    }
+
+    @MainActor
     func testAutomaticSubtitlesFollowViewerLanguageNotContainerDefault() {
         let tracks = [
             SubtitleTrack(

@@ -52,6 +52,7 @@ final class PlayerController: ObservableObject {
     private var endObserver: NSObjectProtocol?
     private var itemStatusObservation: NSKeyValueObservation?
     private var statusTask: Task<Void, Never>?
+    private var recoveryTask: Task<Void, Never>?
     private var started = false
     private var sessionId: String?
     private var lastReportedMs = 0
@@ -205,6 +206,8 @@ final class PlayerController: ObservableObject {
         itemStatusObservation = nil
         statusTask?.cancel()
         statusTask = nil
+        recoveryTask?.cancel()
+        recoveryTask = nil
         let position = realPositionMs()
         player.pause()
         isPlaying = false
@@ -370,12 +373,71 @@ final class PlayerController: ObservableObject {
     private func startStatusPolling() {
         statusTask?.cancel()
         statusTask = Task { [weak self] in
+            var consecutiveFailures = 0
             while !Task.isCancelled {
                 guard let self, let sessionId = self.sessionId, let model = self.model else { return }
-                self.sessionStatus = try? await model.hlsStatus(sessionId)
+                do {
+                    self.sessionStatus = try await model.hlsStatus(sessionId)
+                    consecutiveFailures = 0
+                } catch {
+                    consecutiveFailures += 1
+                    if Self.shouldRecoverInterruptedSession(
+                        consecutiveStatusFailures: consecutiveFailures
+                    ) {
+                        self.scheduleInterruptedSessionRecovery(expectedSessionId: sessionId)
+                        return
+                    }
+                }
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
             }
         }
+    }
+
+    private func scheduleInterruptedSessionRecovery(expectedSessionId: String) {
+        guard started,
+              sessionId == expectedSessionId,
+              !isChangingStream,
+              recoveryTask == nil
+        else { return }
+
+        recoveryTask = Task { [weak self] in
+            await self?.recoverInterruptedSession(expectedSessionId: expectedSessionId)
+        }
+    }
+
+    private func recoverInterruptedSession(expectedSessionId: String) async {
+        defer { recoveryTask = nil }
+        guard started,
+              sessionId == expectedSessionId,
+              let decision
+        else { return }
+
+        let resumeMs = realPositionMs()
+        var lastError: Error?
+        for attempt in 0..<4 {
+            if attempt > 0 {
+                do {
+                    try await Task.sleep(for: .seconds(1 << (attempt - 1)))
+                } catch {
+                    return
+                }
+            }
+            guard started else { return }
+
+            playbackError = "The stream was interrupted. Reconnecting…"
+            do {
+                try await open(decision: decision, at: resumeMs)
+                return
+            } catch {
+                lastError = error
+                fail(error)
+            }
+        }
+
+        failed = true
+        playbackError = lastError.map {
+            ($0 as? LocalizedError)?.errorDescription ?? $0.localizedDescription
+        } ?? PlaybackPreparationError.failed.localizedDescription
     }
 
     private func fail(_ error: Error) {
@@ -470,6 +532,10 @@ final class PlayerController: ObservableObject {
         alreadyAttempted: Bool
     ) -> Bool {
         canRetry && !alreadyAttempted
+    }
+
+    static func shouldRecoverInterruptedSession(consecutiveStatusFailures: Int) -> Bool {
+        consecutiveStatusFailures >= 3
     }
 
     private func report(_ position: Int) {
