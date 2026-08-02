@@ -557,6 +557,7 @@ struct DetailView: View {
             .frame(height: TVPlayableDetailMetrics.heroHeight)
             .clipped()
             .containerRelativeFrame(.vertical, alignment: .center)
+            .tvNavigationFocusSection()
 
             if let children = detail.children, !children.isEmpty {
                 MediaRow(title: childrenHeading(item.kind), items: children)
@@ -728,10 +729,7 @@ struct DetailView: View {
             }
             .frame(height: TVSeriesDetailMetrics.headerHeight)
             .clipped()
-            // Treat the full-width header as a focus target. Without this, the
-            // focus engine cannot find the narrower action buttons when moving
-            // up from episodes at the far-right end of the horizontal shelf.
-            .focusSection()
+            .tvNavigationFocusSection()
 
             if !children.isEmpty {
                 MediaRow(

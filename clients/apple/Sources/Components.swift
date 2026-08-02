@@ -1,5 +1,19 @@
 import SwiftUI
 
+extension View {
+    /// Makes the full visual band participate in directional focus searches on
+    /// tvOS. This prevents focus from getting trapped when neighboring shelves
+    /// or headers have different horizontal extents.
+    @ViewBuilder
+    func tvNavigationFocusSection() -> some View {
+        #if os(tvOS)
+        self.focusSection()
+        #else
+        self
+        #endif
+    }
+}
+
 #if os(tvOS)
 let screenHPad: CGFloat = 64
 private let shelfPosterWidth: CGFloat = 190
@@ -355,6 +369,7 @@ struct MediaRow: View {
                 }
             }
             .padding(.vertical, 10)
+            .tvNavigationFocusSection()
         }
     }
 
@@ -431,6 +446,7 @@ struct ComingSoonRow: View {
                 }
             }
             .padding(.vertical, 10)
+            .tvNavigationFocusSection()
         }
     }
 
