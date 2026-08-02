@@ -196,9 +196,15 @@ pub async fn create(
             }
         })?;
     let playlist_url = if native_subtitles {
+        // Give the multivariant playlist its own path. AVPlayer caches HLS
+        // resources by URL and can otherwise conflate `index.m3u8?native=1`
+        // with the child `index.m3u8` media playlist referenced by that
+        // master. Keep the query form in `playlist` for clients holding an
+        // older session response, but new sessions use the unambiguous path.
+        let master = format!("/api/v1/hls/{}/master.m3u8", info.session_id);
         match native_subtitle {
-            Some(index) => format!("{}?native=1&subtitle={index}", info.playlist_url),
-            None => format!("{}?native=1", info.playlist_url),
+            Some(index) => format!("{master}?subtitle={index}"),
+            None => master,
         }
     } else {
         info.playlist_url
@@ -324,8 +330,9 @@ async fn session_file(
 
 /// GET /api/v1/hls/:session/index.m3u8 — capability auth (see module docs).
 ///
-/// Existing clients receive the historical media playlist. Apple opts into a
-/// master playlist with native subtitle renditions through `?native=1`.
+/// Existing clients receive the historical media playlist. The `?native=1`
+/// form remains as a compatibility bridge for Apple sessions created before
+/// the dedicated master-playlist path existed.
 pub async fn playlist(
     State(state): State<AppState>,
     AxPath(session): AxPath<String>,
@@ -334,6 +341,21 @@ pub async fn playlist(
     if query.native != Some(1) {
         return video_playlist(State(state), AxPath(session)).await;
     }
+    let (_, file) = session_file(&state, &session).await?;
+    Ok(playlist_response(
+        master_playlist(&file, query.subtitle).into_bytes(),
+    ))
+}
+
+/// The multivariant playlist used by Apple clients for native subtitles.
+///
+/// It has a distinct path from the child media playlist so AVPlayer cannot
+/// collapse the two resources when applying URL-query cache normalization.
+pub async fn master_playlist_response(
+    State(state): State<AppState>,
+    AxPath(session): AxPath<String>,
+    Query(query): Query<PlaylistQuery>,
+) -> Result<Response, ApiError> {
     let (_, file) = session_file(&state, &session).await?;
     Ok(playlist_response(
         master_playlist(&file, query.subtitle).into_bytes(),
@@ -588,10 +610,9 @@ fn master_playlist(file: &MediaFile, selected: Option<i64>) -> String {
         out.push_str(",SUBTITLES=\"subs\"");
     }
     out.push('\n');
-    // Resolve back to the historical media-playlist URL without carrying the
-    // master's `native=1` query. AVPlayer accepts the exact same copied fMP4
-    // when reached through this stable session URL, while treating a second
-    // synthetic child path as a different (and incompatible) asset.
+    // Resolve to the historical media-playlist URL. The master itself lives
+    // at `master.m3u8`, so this child path is unambiguous without relying on
+    // query-string distinctions in AVPlayer's HLS resource cache.
     out.push_str("index.m3u8\n");
     out
 }
