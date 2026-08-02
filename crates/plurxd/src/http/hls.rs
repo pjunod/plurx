@@ -334,15 +334,9 @@ pub async fn playlist(
     if query.native != Some(1) {
         return video_playlist(State(state), AxPath(session)).await;
     }
-    let (context, file) = session_file(&state, &session).await?;
+    let (_, file) = session_file(&state, &session).await?;
     Ok(playlist_response(
-        master_playlist(
-            &file,
-            query.subtitle,
-            &context.codecs,
-            context.supplemental_codecs.as_deref(),
-        )
-        .into_bytes(),
+        master_playlist(&file, query.subtitle).into_bytes(),
     ))
 }
 
@@ -535,12 +529,7 @@ fn subtitle_characteristics(track: &SubtitleStream) -> Option<&'static str> {
         )
 }
 
-fn master_playlist(
-    file: &MediaFile,
-    selected: Option<i64>,
-    primary_codecs: &str,
-    compatible_enhancement: Option<&str>,
-) -> String {
+fn master_playlist(file: &MediaFile, selected: Option<i64>) -> String {
     let native: Vec<(usize, &SubtitleStream)> = file
         .subtitle_streams
         .iter()
@@ -595,23 +584,6 @@ fn master_playlist(
     }
     let bandwidth = file.bitrate.unwrap_or(25_000_000).max(128_000);
     out.push_str(&format!("#EXT-X-STREAM-INF:BANDWIDTH={bandwidth}"));
-    // A backward-compatible Dolby Vision copy is carried in an `hvc1` base
-    // sample entry. State that base explicitly so AVPlayer chooses the same
-    // decoder path for the multivariant asset that it uses for the child
-    // media playlist. Do not advertise SUPPLEMENTAL-CODECS here: older tvOS
-    // builds reject that otherwise-valid attribute before fetching the child.
-    if let Some(enhancement) = compatible_enhancement {
-        out.push_str(&format!(",CODECS=\"{primary_codecs}\""));
-        if let (Some(width), Some(height)) = (file.width, file.height) {
-            out.push_str(&format!(",RESOLUTION={width}x{height}"));
-        }
-        let video_range = if enhancement.ends_with("/db4h") {
-            "HLG"
-        } else {
-            "PQ"
-        };
-        out.push_str(&format!(",VIDEO-RANGE={video_range},CLOSED-CAPTIONS=NONE"));
-    }
     if !native.is_empty() {
         out.push_str(",SUBTITLES=\"subs\"");
     }
@@ -949,18 +921,11 @@ mod tests {
             sub("subrip", "eng", "Regular", false, false),
             sub("webvtt", "eng", "SDH", false, false),
         ]);
-        let master = master_playlist(
-            &file,
-            Some(2),
-            "hvc1.2.4.L150.B0,ec-3",
-            Some("dvh1.08.06/db1p"),
-        );
+        let master = master_playlist(&file, Some(2));
 
         assert!(master.starts_with("#EXTM3U\n#EXT-X-VERSION:7\n"));
-        assert!(master.contains(
-            "#EXT-X-STREAM-INF:BANDWIDTH=40000000,CODECS=\"hvc1.2.4.L150.B0,ec-3\",RESOLUTION=3840x2160,VIDEO-RANGE=PQ,CLOSED-CAPTIONS=NONE,SUBTITLES=\"subs\""
-        ));
-        assert!(!master.contains("SUPPLEMENTAL-CODECS"));
+        assert!(master.contains("#EXT-X-STREAM-INF:BANDWIDTH=40000000,SUBTITLES=\"subs\""));
+        assert!(!master.contains("CODECS="));
         assert!(!master.contains("#EXT-X-INDEPENDENT-SEGMENTS"));
         assert!(master.contains("NAME=\"English · Forced\",LANGUAGE=\"en\",DEFAULT=NO,AUTOSELECT=YES,FORCED=YES,URI=\"subs/2/index.m3u8\""));
         assert!(master.contains(
@@ -977,11 +942,11 @@ mod tests {
             sub("subrip", "eng", "Regular", false, false),
             sub("webvtt", "eng", "Alternate", false, false),
         ]);
-        let master = master_playlist(&file, None, "avc1.640032,mp4a.40.2", None);
+        let master = master_playlist(&file, None);
         assert!(!master.contains("CODECS="));
         assert_eq!(master.matches("AUTOSELECT=NO").count(), 2);
 
-        let selected = master_playlist(&file, Some(1), "avc1.640032,mp4a.40.2", None);
+        let selected = master_playlist(&file, Some(1));
         assert!(selected
             .contains("NAME=\"English · Alternate\",LANGUAGE=\"en\",DEFAULT=YES,AUTOSELECT=YES"));
     }
@@ -995,7 +960,7 @@ mod tests {
             sub("ass", "eng", "Styled Signs", false, false),
             sub("ssa", "eng", "Styled Dialogue", false, false),
         ]);
-        let master = master_playlist(&file, None, "avc1.640032,mp4a.40.2", None);
+        let master = master_playlist(&file, None);
         assert!(master.contains("subs/0/index.m3u8"));
         for index in 1..=4 {
             assert!(!master.contains(&format!("subs/{index}/index.m3u8")));
