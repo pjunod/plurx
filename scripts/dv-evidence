@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+#
+# Step 0 of the copied-Dolby-Vision ladder (docs/APPLE-NATIVE-SUBTITLES-PLAN.md
+# §5.4): capture the evidence nobody has looked at yet.
+#
+# The symptom is narrow and strange. A copy session's child media playlist
+# plays on the device. The SAME session, reached through the native master,
+# fails with CoreMedia -12927. Five ladder rungs have been tried against that
+# gap by changing the master; none of them looked at the bytes the master
+# points AT, or at what AVPlayer actually said. This script collects both, so
+# rung six is chosen from evidence instead of from the next plausible idea.
+#
+# It is read-only. It creates a session, fetches its playlist and init
+# segment, dumps the boxes, and stops the session again. It never writes to
+# the media library and never changes server configuration.
+#
+# Usage:
+#   scripts/dv-evidence --server http://nynuc:8080 --token <bearer> --file 5615
+#   scripts/dv-evidence -s http://nynuc:8080 -t "$PLURX_TOKEN" -f 5615 -o ./ev
+#
+# Then, on the Apple TV, play the two URLs this prints and capture the device
+# log (the script tells you the exact predicate). Attach the whole output
+# directory to the ladder note.
+
+set -euo pipefail
+
+SERVER=""
+TOKEN=""
+FILE_ID=""
+START="0"
+OUT=""
+
+die() { printf '%s\n' "$*" >&2; exit 1; }
+
+usage() {
+  sed -n '3,26p' "$0" | sed 's/^# \{0,1\}//'
+  exit "${1:-0}"
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -s|--server) SERVER="${2:-}"; shift 2 ;;
+    -t|--token)  TOKEN="${2:-}"; shift 2 ;;
+    -f|--file)   FILE_ID="${2:-}"; shift 2 ;;
+    --start)     START="${2:-}"; shift 2 ;;
+    -o|--out)    OUT="${2:-}"; shift 2 ;;
+    -h|--help)   usage 0 ;;
+    *) die "unknown argument: $1 (try --help)" ;;
+  esac
+done
+
+[ -n "$SERVER" ]  || die "--server is required (e.g. http://nynuc:8080)"
+[ -n "$TOKEN" ]   || die "--token is required (a bearer token for an account that can play)"
+[ -n "$FILE_ID" ] || die "--file is required (the media file id; the DV regression case is 5615)"
+
+SERVER="${SERVER%/}"
+command -v curl >/dev/null || die "curl is required"
+command -v ffprobe >/dev/null || die "ffprobe is required (jellyfin-ffmpeg's is fine)"
+
+if [ -z "$OUT" ]; then
+  OUT="dv-evidence-${FILE_ID}-$(date -u +%Y%m%dT%H%M%SZ)"
+fi
+mkdir -p "$OUT"
+printf 'writing evidence to %s\n\n' "$OUT"
+
+api() {
+  curl -fsS -H "Authorization: Bearer $TOKEN" "$@"
+}
+
+# --- 0. What the server thinks this file is -------------------------------
+# The decision is the input to everything below: which codec, which HDR
+# format, whether DV is being preserved. A ladder rung argued from a guess
+# about the source is worth nothing.
+printf '· decision\n'
+api "$SERVER/api/v1/files/$FILE_ID/decision" > "$OUT/decision.json" \
+  || die "could not read the decision — check --server and --token"
+
+# --- 1. Create a copy session, DV preserved, native subtitles on ----------
+# Exactly the shape the Apple client sends on the failing path
+# (docs/APPLE-NATIVE-SUBTITLES-PLAN.md §3.1).
+printf '· create session\n'
+api -X POST -H 'Content-Type: application/json' \
+  -d "{\"playback_id\":\"dv-evidence\",\"start\":$START,\"copy\":true,\"preserve_dolby_vision\":true,\"native_subtitles\":true}" \
+  "$SERVER/api/v1/files/$FILE_ID/hls/sessions" > "$OUT/session.json"
+
+SESSION="$(sed -n 's/.*"session_id":"\([^"]*\)".*/\1/p' "$OUT/session.json")"
+[ -n "$SESSION" ] || die "no session_id in the create response: $(cat "$OUT/session.json")"
+printf '  session %s\n' "$SESSION"
+
+cleanup() {
+  curl -fsS -X DELETE "$SERVER/api/v1/hls/$SESSION" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+BASE="$SERVER/api/v1/hls/$SESSION"
+
+# --- 2. The two playlists, byte for byte ----------------------------------
+# The master and the child are the two halves of the puzzle: the child plays,
+# the master does not, and every rung so far has been a guess about which
+# attribute of the master is responsible. Keep both, verbatim.
+printf '· playlists\n'
+curl -fsS "$BASE/index.m3u8?native=1" > "$OUT/master.m3u8"
+curl -fsS "$BASE/index.m3u8"          > "$OUT/media.m3u8"
+
+# --- 3. The init segment, and its boxes -----------------------------------
+# THE artifact nobody has examined. What matters, in order:
+#   · is the sample entry `hvc1` or `dvh1`
+#   · is there a `dvcC`/`dvvC` box beside it, and what profile/level/flags
+#   · what the `hvcC` itself declares (profile, tier, level, constraint bytes)
+# A master that advertises one thing while the init declares another is the
+# most economical explanation of -12927 that has not been ruled out.
+printf '· init segment + boxes\n'
+if curl -fsS -o "$OUT/init.mp4" "$BASE/init.mp4"; then
+  ffprobe -v error -show_streams -show_format -print_format json \
+    "$OUT/init.mp4" > "$OUT/init.ffprobe.json" 2>"$OUT/init.ffprobe.err" || true
+  # Box structure. `-v trace` is the only way ffmpeg will name the boxes it
+  # walks; noisy on purpose, and the noise is the data.
+  ffprobe -v trace -i "$OUT/init.mp4" > "$OUT/init.boxes.txt" 2>&1 || true
+  # A plain hex window over the head catches what the parsers skip: the
+  # four-character codes are readable in the ASCII column.
+  if command -v xxd >/dev/null; then
+    xxd -l 4096 "$OUT/init.mp4" > "$OUT/init.hex.txt"
+  fi
+  printf '  sample entries seen:'
+  for box in hvc1 dvh1 hev1 dvhe dvcC dvvC hvcC; do
+    if grep -qa "$box" "$OUT/init.mp4"; then printf ' %s' "$box"; fi
+  done
+  printf '\n'
+else
+  printf '  no init.mp4 — this session is not fMP4; note that, it is itself evidence\n' \
+    | tee "$OUT/init.missing.txt"
+fi
+
+# --- 4. The first media segment -------------------------------------------
+FIRST="$(grep -v '^#' "$OUT/media.m3u8" | grep -v '^[[:space:]]*$' | head -1 || true)"
+if [ -n "$FIRST" ]; then
+  printf '· first segment (%s)\n' "$FIRST"
+  curl -fsS -o "$OUT/$FIRST" "$BASE/$FIRST" || true
+  if [ -f "$OUT/init.mp4" ] && [ -f "$OUT/$FIRST" ]; then
+    cat "$OUT/init.mp4" "$OUT/$FIRST" > "$OUT/joined.mp4"
+    ffprobe -v error -show_streams -show_frames -read_intervals '%+#2' \
+      -print_format json "$OUT/joined.mp4" > "$OUT/joined.ffprobe.json" 2>&1 || true
+  fi
+fi
+
+# --- 5. What to do on the device ------------------------------------------
+cat > "$OUT/DEVICE-STEPS.md" <<STEPS
+# Device half of the evidence capture
+
+Session \`$SESSION\` on \`$SERVER\` (file $FILE_ID). Sessions are reaped on
+idle, so do this now — if it has gone, re-run the script.
+
+The two URLs differ ONLY by the query. That is the whole experiment: the
+same session, the same bytes, one reached through the master and one not.
+
+1. Fails today (master-wrapped):
+   $BASE/index.m3u8?native=1
+2. Plays today (direct child):
+   $BASE/index.m3u8
+
+On a Mac with the Apple TV paired for development:
+
+    log stream --device --style compact \\
+      --predicate 'subsystem == "com.apple.coremedia" OR process == "mediaplaybackd" OR eventMessage CONTAINS "-12927"'
+
+Start the stream, play URL 1, let it fail, then play URL 2. Save the whole
+log next to this file as \`device.log\`.
+
+What to look for, in order:
+- the FIRST error CoreMedia reports, not the last — -12927 is often the
+  surfaced consequence of an earlier parse or format refusal
+- whether the failure happens before or after the init segment is fetched
+  (cross-check against the server log for this session id)
+- whether AVPlayer fetched the subtitle child playlist at all
+
+Then compare against \`init.boxes.txt\` here: if the init declares a sample
+entry or a dvcC/dvvC shape the master does not describe, that mismatch is
+the next rung — and it is a rung about the INIT, which is a part of the
+problem the ladder has not touched yet.
+STEPS
+
+printf '\ndone.\n'
+printf 'next: %s\n' "$OUT/DEVICE-STEPS.md"
+printf 'the session is being released now; re-run when you are at the device.\n'

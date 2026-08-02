@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+#
+# One command per target for the things only Paul's Mac can do.
+#
+# The agent sessions that write this code run in a Linux sandbox with no
+# Xcode, no Android SDK, and no route to the LAN, so the last mile — push,
+# deploy, build, install — is always manual. This script exists so "manual"
+# means one invocation with a visible plan, not a checklist reconstructed
+# from a chat log.
+#
+# Everything is opt-in and everything prints what it will do first. Nothing
+# here force-pushes, rewrites history, or deploys without saying which nodes.
+#
+# Usage:
+#   scripts/ship --check                 # the CI gate, locally, on the pin
+#   scripts/ship --push                  # push main + the working branch
+#   scripts/ship --deploy                # ansible → every plurx node
+#   scripts/ship --apple                 # archive + upload the Apple build
+#   scripts/ship --android               # assemble + install to attached devices
+#   scripts/ship --all                   # check, push, deploy, apple, android
+#   scripts/ship --deploy --dry-run      # print the commands, run nothing
+#
+# Ladder rungs for the DV investigation (docs/APPLE-NATIVE-SUBTITLES-PLAN.md
+# §5.4) — ONE per deploy, then observe on the device:
+#   scripts/ship --deploy --rung closed-captions
+#   scripts/ship --deploy --rung forced-autoselect
+#   scripts/ship --deploy --rung none        # back to the shipped shape
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ANSIBLE_DIR="${PLURX_ANSIBLE_DIR:-$HOME/code/ansible/media}"
+
+DO_CHECK=0; DO_PUSH=0; DO_DEPLOY=0; DO_APPLE=0; DO_ANDROID=0
+DRY=0; RUNG=""
+
+say()  { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
+note() { printf '    %s\n' "$*"; }
+die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+
+run() {
+  printf '    $ %s\n' "$*"
+  if [ "$DRY" -eq 0 ]; then "$@"; fi
+}
+
+usage() { sed -n '3,30p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --check)   DO_CHECK=1; shift ;;
+    --push)    DO_PUSH=1; shift ;;
+    --deploy)  DO_DEPLOY=1; shift ;;
+    --apple)   DO_APPLE=1; shift ;;
+    --android) DO_ANDROID=1; shift ;;
+    --all)     DO_CHECK=1; DO_PUSH=1; DO_DEPLOY=1; DO_APPLE=1; DO_ANDROID=1; shift ;;
+    --rung)    RUNG="${2:-}"; shift 2 ;;
+    --dry-run) DRY=1; shift ;;
+    -h|--help) usage 0 ;;
+    *) die "unknown argument: $1 (try --help)" ;;
+  esac
+done
+
+if [ $((DO_CHECK + DO_PUSH + DO_DEPLOY + DO_APPLE + DO_ANDROID)) -eq 0 ]; then
+  usage 1
+fi
+
+cd "$ROOT"
+[ "$DRY" -eq 1 ] && say "DRY RUN — printing commands, running none"
+
+# --- the gate --------------------------------------------------------------
+# Same three commands CI runs, on the pinned toolchain. `rust-toolchain.toml`
+# pins 1.97.1 for a reason (a floating "stable" fails CI on new lints with no
+# code change), and homebrew's cargo has been ahead of the override on this
+# machine before — so this asks cargo what it actually is and says so.
+if [ "$DO_CHECK" -eq 1 ]; then
+  say "gate"
+  note "$(cargo --version) · $(rustc --version)"
+  case "$(rustc --version)" in
+    *1.97.1*) ;;
+    *) note "WARNING: not the pinned 1.97.1 — CI may disagree with this run" ;;
+  esac
+  run cargo fmt --all -- --check
+  run cargo clippy --workspace --all-targets -- -D warnings
+  run cargo test --workspace --no-fail-fast
+fi
+
+# --- push ------------------------------------------------------------------
+if [ "$DO_PUSH" -eq 1 ]; then
+  say "push"
+  BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+  note "on branch $BRANCH"
+  git --no-pager log --oneline origin/main..main 2>/dev/null | sed 's/^/    main ahead: /' || true
+  run git push origin main
+  if [ "$BRANCH" != "main" ]; then
+    run git push origin "$BRANCH"
+  fi
+fi
+
+# --- deploy ----------------------------------------------------------------
+# The ansible repo lives outside this one and has NO git remote: its inventory
+# commits (nodes pinned to origin/main, nuc3 added) exist only on this
+# machine. Worth saying out loud at every deploy, because "it is deployed"
+# and "it is committed somewhere durable" are not the same sentence here.
+if [ "$DO_DEPLOY" -eq 1 ]; then
+  say "deploy"
+  [ -d "$ANSIBLE_DIR" ] || die "no ansible dir at $ANSIBLE_DIR (set PLURX_ANSIBLE_DIR)"
+  note "playbooks: $ANSIBLE_DIR (a repo with no remote — its inventory lives only here)"
+  note "nodes follow origin/main, so push first or you will deploy the old tree"
+  note "nuc4's port is held by Plex; that is accepted, not a failure"
+
+  # The rung is a per-deploy environment change on the nodes. This script
+  # cannot set it for you, and pretending otherwise would be worse than
+  # saying so: the ansible repo is not in this tree, so whether its role
+  # templates arbitrary environment into the unit is not knowable from here.
+  # What IS knowable is exactly which variables the server reads, so print
+  # them, and refuse to deploy a rung until the playbook is wired to carry
+  # it — a rung that silently did not take would be read as "the rung
+  # didn't help", which is the one wrong conclusion this ladder cannot
+  # afford.
+  if [ -n "$RUNG" ]; then
+    case "$RUNG" in
+      none)              CC=0; FA=0; LABEL="the shipped master shape" ;;
+      closed-captions)   CC=1; FA=0; LABEL="CLOSED-CAPTIONS=NONE on the variant" ;;
+      forced-autoselect) CC=0; FA=1; LABEL="AUTOSELECT=YES on forced renditions" ;;
+      *) die "unknown rung '$RUNG' (none | closed-captions | forced-autoselect)" ;;
+    esac
+    note ""
+    note "rung: $LABEL — ONE change this deploy"
+    note "the nodes must run plurxd with exactly:"
+    note "  PLURX_HLS_CLOSED_CAPTIONS_NONE=$CC"
+    note "  PLURX_HLS_FORCED_AUTOSELECT=$FA"
+    note "set that where the node's environment lives (systemd: Environment= in"
+    note "plurxd.service, per deploy/plurxd.service; compose: the environment: block"
+    note "in deploy/docker-compose.yml), or add it to the ansible role once and"
+    note "drive it from a group_var."
+    note ""
+    if [ "$DRY" -eq 0 ]; then
+      printf '    wired the playbook to carry those two variables? [y/N] '
+      read -r reply
+      case "$reply" in
+        y|Y|yes|YES) ;;
+        *) die "stopping — deploy the rung only when the env change actually reaches the nodes" ;;
+      esac
+    fi
+    note "after this deploy: play file 5615 on Bedroom, write down what happened,"
+    note "and change exactly one thing before the next one."
+  fi
+  run ansible-playbook -i "$ANSIBLE_DIR/inventory.yml" "$ANSIBLE_DIR/deploy.yml"
+fi
+
+# --- Apple -----------------------------------------------------------------
+if [ "$DO_APPLE" -eq 1 ]; then
+  say "apple"
+  command -v xcodebuild >/dev/null || die "no xcodebuild — this target needs Xcode"
+  cd "$ROOT/clients/apple"
+  BUILD="$(sed -n 's/.*CURRENT_PROJECT_VERSION: *"\{0,1\}\([0-9][0-9]*\)"\{0,1\}.*/\1/p' project.yml | head -1)"
+  note "build number $BUILD (TestFlight refuses a repeat, so this must exceed the last upload)"
+  if command -v xcodegen >/dev/null; then run xcodegen generate; fi
+  run xcodebuild -scheme Plurx -destination 'generic/platform=tvOS' \
+    -archivePath "$ROOT/target/apple/Plurx-tvOS.xcarchive" archive
+  run xcodebuild -scheme Plurx -destination 'generic/platform=iOS' \
+    -archivePath "$ROOT/target/apple/Plurx-iOS.xcarchive" archive
+  note "then: Xcode → Organizer → Distribute App → App Store Connect (or xcrun altool)"
+  note "the simulator suites are the other half of the gate for client changes:"
+  note "  xcodebuild test -scheme Plurx -destination 'platform=tvOS Simulator,name=Apple TV'"
+  cd "$ROOT"
+fi
+
+# --- Android ---------------------------------------------------------------
+if [ "$DO_ANDROID" -eq 1 ]; then
+  say "android"
+  cd "$ROOT/clients/android"
+  [ -x ./gradlew ] || die "no gradlew in clients/android"
+  run ./gradlew assembleRelease
+  if command -v adb >/dev/null; then
+    DEVICES="$(adb devices | awk 'NR>1 && $2=="device" {print $1}')"
+    if [ -z "$DEVICES" ]; then
+      note "no attached devices — build only"
+    else
+      for d in $DEVICES; do
+        note "installing to $d"
+        run adb -s "$d" install -r app/build/outputs/apk/release/app-release.apk
+      done
+    fi
+  else
+    note "no adb on PATH — build only"
+  fi
+  cd "$ROOT"
+fi
+
+say "done"
