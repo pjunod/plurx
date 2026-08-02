@@ -288,6 +288,7 @@ pub async fn status(
 pub struct PlaylistQuery {
     pub native: Option<u8>,
     pub subtitle: Option<i64>,
+    pub diagnostic: Option<String>,
 }
 
 fn playlist_response(bytes: Vec<u8>) -> Response {
@@ -335,20 +336,27 @@ pub async fn playlist(
         return video_playlist(State(state), AxPath(session)).await;
     }
     let (context, file) = session_file(&state, &session).await?;
+    let (primary_codecs, supplemental_codecs) = match query.diagnostic.as_deref() {
+        Some("base-only") => (context.codecs.as_str(), None),
+        Some("dv-direct") => ("dvh1.08.06,ec-3", None),
+        Some("base-short") => (
+            "hvc1.2.4.L150.B0,ec-3",
+            context.supplemental_codecs.as_deref(),
+        ),
+        _ => (
+            context.codecs.as_str(),
+            context.supplemental_codecs.as_deref(),
+        ),
+    };
     tracing::info!(
         session_id = %session,
         file_id = file.id,
         subtitle = query.subtitle,
+        diagnostic = query.diagnostic.as_deref().unwrap_or(""),
         "serving native HLS master playlist"
     );
     Ok(playlist_response(
-        master_playlist(
-            &file,
-            query.subtitle,
-            &context.codecs,
-            context.supplemental_codecs.as_deref(),
-        )
-        .into_bytes(),
+        master_playlist(&file, query.subtitle, primary_codecs, supplemental_codecs).into_bytes(),
     ))
 }
 
