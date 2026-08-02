@@ -742,8 +742,8 @@ fn slice_webvtt(
         };
         lines[line_index] = format!(
             "{} --> {}{}",
-            format_vtt_timestamp(start.max(segment_start)),
-            format_vtt_timestamp(end.min(segment_end)),
+            format_vtt_timestamp(start.max(segment_start) - segment_start),
+            format_vtt_timestamp(end.min(segment_end) - segment_start),
             settings
         );
         shifted.push(lines.join("\n"));
@@ -752,12 +752,16 @@ fn slice_webvtt(
         .first_mut()
         .filter(|header| header.starts_with("WEBVTT"))
     {
-        if !header
+        let timestamp = ((segment_start.max(0.0) * 90_000.0).round() as u64) % (1_u64 << 33);
+        let mut lines: Vec<String> = header
             .lines()
-            .any(|line| line.starts_with("X-TIMESTAMP-MAP="))
-        {
-            header.push_str("\nX-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:0");
-        }
+            .filter(|line| !line.starts_with("X-TIMESTAMP-MAP="))
+            .map(str::to_owned)
+            .collect();
+        lines.push(format!(
+            "X-TIMESTAMP-MAP=MPEGTS:{timestamp},LOCAL:00:00:00.000"
+        ));
+        *header = lines.join("\n");
     }
     let mut out = shifted.join("\n\n");
     out.push_str("\n\n");
@@ -961,14 +965,15 @@ mod tests {
 
         let source = b"WEBVTT\n\n00:00:01.000 --> 00:00:02.000\npast\n\ncue-id\n00:00:09.000 --> 00:00:11.000 align:start\ncrossing\n\n00:00:15.250 --> 00:00:16.500\nfuture\n";
         let first = String::from_utf8(slice_webvtt(source, 10.0, 0.0, 4.0)).expect("utf8");
-        assert!(first.contains("X-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:0"));
+        assert!(first.contains("X-TIMESTAMP-MAP=MPEGTS:0,LOCAL:00:00:00.000"));
         assert!(!first.contains("past"));
         assert!(first.contains("00:00:00.000 --> 00:00:01.000 align:start"));
         assert!(!first.contains("future"));
 
         let second = String::from_utf8(slice_webvtt(source, 10.0, 4.0, 10.0)).expect("utf8");
+        assert!(second.contains("X-TIMESTAMP-MAP=MPEGTS:360000,LOCAL:00:00:00.000"));
         assert!(!second.contains("crossing"));
-        assert!(second.contains("00:00:05.250 --> 00:00:06.500"));
+        assert!(second.contains("00:00:01.250 --> 00:00:02.500"));
 
         let finished = subtitle_media_playlist(
             b"#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXTINF:4.0,\nseg00000.m4s\n#EXT-X-ENDLIST\n",
