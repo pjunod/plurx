@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use plurx_core::domain::MediaFile;
 
@@ -19,6 +20,58 @@ use crate::ffmpeg::ffmpeg_bin;
 /// far a trim takes it. WebVTT files are normally only kilobytes.
 const MAX_ENTRIES: usize = 256;
 const TRIM_TO: usize = 224;
+
+/// How long one extraction may run before it is abandoned and its ffmpeg
+/// killed. A cold extraction is a full-source read: on a large MKV over a
+/// congested NAS that has legitimately taken ~180 s, so the bound is set well
+/// clear of it — 10 minutes is over three times the worst honest case, which
+/// means nothing that would have succeeded is cut off, while a wedged child
+/// (a stalled mount that never returns bytes and never errors) can no longer
+/// park every waiter forever.
+const EXTRACTION_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// How long a failure is remembered. AVPlayer asks for a VTT segment roughly
+/// every segment duration (~6 s), and before this memo each of those requests
+/// relaunched a full-source read of a file that had just failed. Two minutes
+/// turns that storm into one attempt per window — about a twentieth of the
+/// scans — while still being short enough that fixing the cause (remounting
+/// the NAS, replacing the file) is picked up inside a viewer's patience
+/// rather than needing a restart.
+const NEGATIVE_TTL: Duration = Duration::from_secs(120);
+
+/// Failures remembered at once. A memo is a path, a deadline and a short
+/// message, so the cap is about refusing unbounded growth rather than saving
+/// bytes: a library full of broken tracks must not turn the memo into a leak.
+const MAX_NEGATIVE_ENTRIES: usize = 128;
+
+/// The largest sidecar publish will accept. Real WebVTT is kilobytes — a
+/// dense SDH track for a three-hour film lands near 200 KB — and this file is
+/// re-read whole for every subtitle segment request, so the cap is chosen to
+/// stay cheap to re-read while leaving two orders of magnitude of headroom
+/// above anything legitimate. Above it the track is pathological (a
+/// mislabelled stream, a runaway conversion) and is refused rather than
+/// allowed to fill the cache directory.
+const MAX_SIDECAR_BYTES: u64 = 8 * 1024 * 1024;
+
+/// The bounds an extraction runs under. Held in one struct so tests can shrink
+/// all three to something a suite can prove in milliseconds, while production
+/// keeps the constants above.
+#[derive(Clone, Copy)]
+struct ExtractionLimits {
+    timeout: Duration,
+    negative_ttl: Duration,
+    max_sidecar_bytes: u64,
+}
+
+impl Default for ExtractionLimits {
+    fn default() -> Self {
+        Self {
+            timeout: EXTRACTION_TIMEOUT,
+            negative_ttl: NEGATIVE_TTL,
+            max_sidecar_bytes: MAX_SIDECAR_BYTES,
+        }
+    }
+}
 
 /// The stable path for one source fingerprint and subtitle stream.
 pub fn vtt_path(dir: &Path, file: &MediaFile, index: i64) -> PathBuf {
@@ -41,6 +94,65 @@ fn extractions() -> &'static Extractions {
     EXTRACTIONS.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
 }
 
+/// Why a cache key failed, and when that answer stops being reused.
+struct NegativeMemo {
+    why: String,
+    expires_at: tokio::time::Instant,
+}
+
+type NegativeMemos = tokio::sync::Mutex<HashMap<PathBuf, NegativeMemo>>;
+
+fn negative_memos() -> &'static NegativeMemos {
+    static MEMOS: OnceLock<NegativeMemos> = OnceLock::new();
+    MEMOS.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
+}
+
+/// The remembered failure for a key, if one is still inside its window. The
+/// clock is tokio's, so a paused-clock test moves it without waiting.
+async fn remembered_failure(cached: &Path) -> Option<String> {
+    let memos = negative_memos().lock().await;
+    let memo = memos.get(cached)?;
+    if memo.expires_at > tokio::time::Instant::now() {
+        Some(memo.why.clone())
+    } else {
+        None
+    }
+}
+
+/// Remember a failure, evicting to stay under the cap: expired entries first,
+/// since they are already dead weight, and only then the memo closest to
+/// expiry — the one whose loss costs the fewest avoided rescans.
+async fn remember_failure(cached: &Path, why: &str, ttl: Duration) {
+    let mut memos = negative_memos().lock().await;
+    let now = tokio::time::Instant::now();
+    if memos.len() >= MAX_NEGATIVE_ENTRIES {
+        memos.retain(|_, memo| memo.expires_at > now);
+    }
+    while memos.len() >= MAX_NEGATIVE_ENTRIES {
+        let Some(soonest) = memos
+            .iter()
+            .min_by_key(|(_, memo)| memo.expires_at)
+            .map(|(path, _)| path.clone())
+        else {
+            break;
+        };
+        memos.remove(&soonest);
+    }
+    memos.insert(
+        cached.to_owned(),
+        NegativeMemo {
+            why: why.to_owned(),
+            expires_at: now + ttl,
+        },
+    );
+}
+
+/// A published sidecar is the truth about a key; any memory of it failing is
+/// stale the moment that happens.
+async fn forget_failure(cached: &Path) {
+    negative_memos().lock().await.remove(cached);
+}
+
 /// Return a cached WebVTT sidecar, extracting it atomically on a miss.
 pub async fn ensure_vtt(dir: &Path, file: &MediaFile, index: i64) -> Result<PathBuf, String> {
     ensure_vtt_with(dir, file, index, |tmp, file, index| async move {
@@ -49,14 +161,29 @@ pub async fn ensure_vtt(dir: &Path, file: &MediaFile, index: i64) -> Result<Path
     .await
 }
 
-/// One extraction per cache key. The extraction itself lives in an owned
-/// task, rather than in the HTTP request awaiting it: if AVPlayer times out or
-/// a client cancels, ffmpeg still publishes the completed sidecar and every
-/// concurrent waiter observes that same result.
+/// The production seam: default bounds, injected extractor.
 async fn ensure_vtt_with<F, Fut>(
     dir: &Path,
     file: &MediaFile,
     index: i64,
+    extract: F,
+) -> Result<PathBuf, String>
+where
+    F: FnOnce(PathBuf, MediaFile, i64) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<(), String>> + Send + 'static,
+{
+    ensure_vtt_bounded(dir, file, index, ExtractionLimits::default(), extract).await
+}
+
+/// One extraction per cache key. The extraction itself lives in an owned
+/// task, rather than in the HTTP request awaiting it: if AVPlayer times out or
+/// a client cancels, ffmpeg still publishes the completed sidecar and every
+/// concurrent waiter observes that same result.
+async fn ensure_vtt_bounded<F, Fut>(
+    dir: &Path,
+    file: &MediaFile,
+    index: i64,
+    limits: ExtractionLimits,
     extract: F,
 ) -> Result<PathBuf, String>
 where
@@ -75,6 +202,14 @@ where
         let mut active = extractions().lock().await;
         if let Some(flight) = active.get(&cached) {
             (Arc::clone(flight), false)
+        } else if let Some(why) = remembered_failure(&cached).await {
+            // Consulted under the flight lock, and written before the flight
+            // is removed, so a caller arriving in the gap between a failure
+            // publishing and its flight disappearing sees one of the two —
+            // never neither, which is what would relaunch the scan. An
+            // in-flight extraction always outranks the memo: it may be the
+            // attempt that succeeds.
+            return Err(why);
         } else {
             let flight = Arc::new(Extraction {
                 result: tokio::sync::Mutex::new(None),
@@ -99,14 +234,28 @@ where
                 "extracting embedded text subtitle to the sidecar cache"
             );
             let result =
-                publish_extraction(&dir, &cached_for_task, &tmp, &file, index, extract).await;
-            if result.is_ok() {
-                tracing::info!(
-                    file_id = file.id,
-                    index,
-                    elapsed_ms = started.elapsed().as_millis(),
-                    "text subtitle sidecar cached"
-                );
+                publish_extraction(&dir, &cached_for_task, &tmp, &file, index, limits, extract)
+                    .await;
+            match &result {
+                Ok(_) => {
+                    tracing::info!(
+                        file_id = file.id,
+                        index,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "text subtitle sidecar cached"
+                    );
+                    forget_failure(&cached_for_task).await;
+                }
+                Err(why) => {
+                    tracing::warn!(
+                        file_id = file.id,
+                        index,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        why,
+                        "text subtitle extraction failed; suppressing retries for now"
+                    );
+                    remember_failure(&cached_for_task, why, limits.negative_ttl).await;
+                }
             }
             *flight_for_task.result.lock().await = Some(result);
             extractions().lock().await.remove(&cached_for_task);
@@ -132,6 +281,11 @@ async fn extract_vtt(tmp: &Path, file: &MediaFile, index: i64) -> Result<(), Str
         .args(["-map", &format!("0:s:{index}"), "-f", "webvtt"])
         .arg(tmp)
         .stdin(std::process::Stdio::null())
+        // The timeout in `publish_extraction` bounds this by dropping the
+        // future; without `kill_on_drop` that drop would merely stop waiting
+        // and leave the wedged ffmpeg holding the stalled mount open. This is
+        // what makes the bound an actual kill.
+        .kill_on_drop(true)
         .output()
         .await
         .map_err(|e| format!("spawning subtitle extraction: {e}"))?;
@@ -148,15 +302,41 @@ async fn publish_extraction<F, Fut>(
     tmp: &Path,
     file: &MediaFile,
     index: i64,
+    limits: ExtractionLimits,
     extract: F,
 ) -> Result<PathBuf, String>
 where
     F: FnOnce(PathBuf, MediaFile, i64) -> Fut,
     Fut: Future<Output = Result<(), String>>,
 {
-    if let Err(e) = extract(tmp.to_owned(), file.clone(), index).await {
+    // A timeout here rather than around the whole task: expiring drops the
+    // extractor future (killing its child) while this frame still owns the
+    // temp file and can delete it, so a wedge leaves the cache dir as clean as
+    // an ordinary failure does.
+    let extracted =
+        match tokio::time::timeout(limits.timeout, extract(tmp.to_owned(), file.clone(), index))
+            .await
+        {
+            Ok(extracted) => extracted,
+            Err(_) => Err(format!(
+                "subtitle extraction timed out after {}s",
+                limits.timeout.as_secs()
+            )),
+        };
+    if let Err(e) = extracted {
         let _ = tokio::fs::remove_file(tmp).await;
         return Err(e);
+    }
+    // Checked before the rename, so an oversized sidecar is never visible
+    // under its cache name: publishing it would commit the daemon to re-reading
+    // it for every segment request until the cache is trimmed.
+    let size = tokio::fs::metadata(tmp).await.map(|m| m.len()).unwrap_or(0);
+    if size > limits.max_sidecar_bytes {
+        let _ = tokio::fs::remove_file(tmp).await;
+        return Err(format!(
+            "subtitle sidecar is {size} bytes, above the {} byte cap",
+            limits.max_sidecar_bytes
+        ));
     }
     match tokio::fs::rename(&tmp, &cached).await {
         Ok(()) => {}
@@ -306,6 +486,185 @@ mod tests {
             assert!(
                 !entry.file_name().to_string_lossy().starts_with(".tmp-"),
                 "a completed extraction must not remain unpublished"
+            );
+        }
+    }
+
+    /// Real time, deliberately: the bounds under test are injected small, so
+    /// the suite proves them in milliseconds without a paused clock — which
+    /// here would be a trap, since every task in this test parks in file IO
+    /// and the runtime would leap straight to the extraction deadline.
+    fn wedged_limits() -> ExtractionLimits {
+        ExtractionLimits {
+            timeout: Duration::from_millis(150),
+            negative_ttl: Duration::from_secs(60),
+            ..ExtractionLimits::default()
+        }
+    }
+
+    /// P1-4: a stalled NAS read used to park every waiter forever on
+    /// `notified()`, and each following segment request relaunched the same
+    /// doomed multi-GB scan. Both waiters must come back with a bounded error,
+    /// and the request after them must be answered from the memo.
+    #[tokio::test]
+    async fn a_wedged_extraction_times_out_and_the_failure_is_memoized() {
+        let dir = tempfile::tempdir().expect("cache");
+        let file = media_file(dir.path().join("source.mkv"));
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+
+        let first = {
+            let dir = dir.path().to_owned();
+            let file = file.clone();
+            let runs = Arc::clone(&runs);
+            tokio::spawn(async move {
+                ensure_vtt_bounded(&dir, &file, 0, wedged_limits(), move |_, _, _| async move {
+                    runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let _ = started_tx.send(());
+                    // The wedge: an ffmpeg that never returns and never errors.
+                    tokio::time::sleep(Duration::from_secs(3_600)).await;
+                    Ok(())
+                })
+                .await
+            })
+        };
+        started_rx.await.expect("extraction started");
+
+        // Joins the same flight, the way a second segment request would.
+        let second = {
+            let dir = dir.path().to_owned();
+            let file = file.clone();
+            let runs = Arc::clone(&runs);
+            tokio::spawn(async move {
+                ensure_vtt_bounded(&dir, &file, 0, wedged_limits(), move |_, _, _| async move {
+                    runs.fetch_add(100, std::sync::atomic::Ordering::SeqCst);
+                    Err("a deduplicated runner must never execute".into())
+                })
+                .await
+            })
+        };
+
+        for waiter in [first, second] {
+            let observed = tokio::time::timeout(Duration::from_secs(10), waiter)
+                .await
+                .expect("a wedged producer must not park its waiters")
+                .expect("waiter task");
+            let why = observed.expect_err("a wedged extraction cannot publish");
+            assert!(
+                why.contains("timed out"),
+                "waiters observe the bounded error, got {why}"
+            );
+        }
+
+        // The memo is written before the flight is dropped, so by the time a
+        // waiter has its answer a fresh request is already covered.
+        let runs_for_repeat = Arc::clone(&runs);
+        let repeat = ensure_vtt_bounded(
+            dir.path(),
+            &file,
+            0,
+            wedged_limits(),
+            move |_, _, _| async move {
+                runs_for_repeat.fetch_add(100, std::sync::atomic::Ordering::SeqCst);
+                Err("a memoized failure must not relaunch the scan".into())
+            },
+        )
+        .await;
+        assert!(repeat.is_err(), "the memo answers with the same failure");
+        assert_eq!(
+            runs.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one scan per memo window, not one per request"
+        );
+        forget_failure(&vtt_path(dir.path(), &file, 0)).await;
+    }
+
+    /// The other side of the TTL comparison: an expired memo must not become a
+    /// permanent tomb for a track whose cause has since been fixed, and the
+    /// success that follows must clear it outright rather than leave a corpse
+    /// in the map.
+    #[tokio::test]
+    async fn an_expired_memo_relaunches_and_success_clears_it() {
+        let dir = tempfile::tempdir().expect("cache");
+        let file = media_file(dir.path().join("source.mkv"));
+        let key = vtt_path(dir.path(), &file, 0);
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // A zero TTL is a memo that is written and already expired: the
+        // deterministic version of "the window has passed", with no wall clock
+        // in the test.
+        let expired = ExtractionLimits {
+            negative_ttl: Duration::ZERO,
+            ..ExtractionLimits::default()
+        };
+
+        let runs_for_failure = Arc::clone(&runs);
+        let failed = ensure_vtt_bounded(dir.path(), &file, 0, expired, move |_, _, _| async move {
+            runs_for_failure.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err("no such stream".into())
+        })
+        .await;
+        assert!(failed.is_err(), "the first attempt fails");
+        assert!(
+            negative_memos().lock().await.contains_key(&key),
+            "the failure was memoized, expired or not"
+        );
+
+        let runs_for_success = Arc::clone(&runs);
+        let published =
+            ensure_vtt_bounded(dir.path(), &file, 0, expired, move |tmp, _, _| async move {
+                runs_for_success.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::fs::write(tmp, "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhello\n")
+                    .await
+                    .map_err(|e| e.to_string())
+            })
+            .await
+            .expect("an expired memo cannot block a working extraction");
+
+        assert_eq!(published, key);
+        assert_eq!(
+            runs.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the expired memo let the second attempt run"
+        );
+        assert!(
+            !negative_memos().lock().await.contains_key(&key),
+            "a published sidecar invalidates the memo"
+        );
+    }
+
+    /// P2-4: the sidecar is re-read whole for every segment request, so a
+    /// pathological track must be refused at publish — and refused the way any
+    /// other failure is, leaving neither a cache entry nor a temp file.
+    #[tokio::test]
+    async fn an_oversized_sidecar_is_rejected_and_leaves_no_file() {
+        let dir = tempfile::tempdir().expect("cache");
+        let file = media_file(dir.path().join("source.mkv"));
+        let limits = ExtractionLimits {
+            max_sidecar_bytes: 64,
+            negative_ttl: Duration::ZERO,
+            ..ExtractionLimits::default()
+        };
+
+        let why = ensure_vtt_bounded(dir.path(), &file, 0, limits, |tmp, _, _| async move {
+            tokio::fs::write(tmp, "WEBVTT\n".to_string() + &"x".repeat(4_096))
+                .await
+                .map_err(|e| e.to_string())
+        })
+        .await
+        .expect_err("an oversized sidecar is not publishable");
+        assert!(why.contains("cap"), "the error names the cap, got {why}");
+
+        assert!(
+            tokio::fs::metadata(vtt_path(dir.path(), &file, 0))
+                .await
+                .is_err(),
+            "a rejected sidecar must never appear under its cache name"
+        );
+        let mut entries = tokio::fs::read_dir(dir.path()).await.expect("read cache");
+        while let Some(entry) = entries.next_entry().await.expect("entry") {
+            assert!(
+                !entry.file_name().to_string_lossy().starts_with(".tmp-"),
+                "and its temp file must be gone too"
             );
         }
     }
