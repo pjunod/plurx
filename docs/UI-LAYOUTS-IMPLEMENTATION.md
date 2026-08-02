@@ -1,642 +1,512 @@
 # UI layouts & themes — implementation plan for the accepted slice
 
-**Status:** ready to build · **Executes:**
-[UI-LAYOUTS-PLAN.md](UI-LAYOUTS-PLAN.md) as amended by
-[UI-LAYOUTS-REVIEW.md](UI-LAYOUTS-REVIEW.md) · **Written:** 2026-08-02,
-amended same day — server changes are now permitted under the
-multi-consumer rule in §3.6 (Paul's direction; supersedes the review's
-client-only stance), and §9 defines the parallel execution model ·
-**Verified against:** branch `docs/ui-layouts-proposals` @ `7fc1796`
-(whose web app is main's — blob `d541671`)
+**Status:** G0 · G1 · T1 built and proven, G2 partial (home) — see
+[UI-LAYOUTS-STATUS.md](UI-LAYOUTS-STATUS.md) for ground truth ·
+**Executes:** [UI-LAYOUTS-PLAN.md](UI-LAYOUTS-PLAN.md) as amended by
+[UI-LAYOUTS-REVIEW.md](UI-LAYOUTS-REVIEW.md) · **Written:** 2026-08-02;
+v2 same day (server changes permitted, §3.6); v3 same day (§9 execution
+model + the three-surface contrast bar); **v4 same day — folds the
+build's status findings
+(STATUS.md §3.1–3.8): migration slot corrected to v13, the piecewise
+library seam, S2 rebuilt around the existing `playstart` hook, S3's
+backfill cost named, `--accent2-ink`, and the completed §7 inventory** ·
+**Verified against:** `feat/ui-layouts` @ `4ada24c` (code) + `3530ee6`
+(status doc)
 
-This is the build order for the implementing agent. Read
+This is the build order for the implementing agent. Reading order:
 [UI-LAYOUTS-PLAN.md](UI-LAYOUTS-PLAN.md) for what everything looks like
-(and open `docs/mockups/` in a browser), then
-[UI-LAYOUTS-REVIEW.md](UI-LAYOUTS-REVIEW.md) for why the web track is
-narrower than the proposal, then work THIS document gate by gate. Every
-review finding cited here was independently re-verified against the code
-on 2026-08-02 — DTO shapes, session telemetry, genre storage, client
-theme infrastructure, and every contrast ratio (the review's numbers
-reproduced exactly). File/line anchors are against the blobs named above;
-re-verify anchors at build time, the structure moves. This document
-itself passed a fresh-context adversarial coherence review before
-handoff; keep that habit at every gate (§9.3).
+(open `docs/mockups/` in a browser) → [UI-LAYOUTS-REVIEW.md](UI-LAYOUTS-REVIEW.md)
+for why the web track is narrower than the proposal →
+[UI-LAYOUTS-STATUS.md](UI-LAYOUTS-STATUS.md) for what is already built
+and proven → THIS document, gate by gate. Claims in earlier versions
+were re-verified against code; v4 additionally verified the status
+doc's §3 findings (migration count and assert, `playstart` seam,
+`SessionKind::Copy`, `progressive::Streams`, every contrast number).
+File/line anchors move; re-verify at build time.
 
 **Standing instructions.** Work gate by gate; a gate is not done until
 its acceptance list passes. Server work is allowed only inside the S
 milestones and only under §3.6's rules — if a web gate seems to need a
 server change that isn't an S milestone, stop and flag it rather than
-building it. §9 says what may run in parallel and what must not —
-above all: ONE agent owns `index.html` at a time. When a mockup and
-this document disagree, this document wins; mockups illustrate
-structure, they are not pixel law.
+building it. §9 says what may run in parallel and what must not — above
+all: ONE agent owns `index.html` at a time. When a mockup and this
+document disagree, this document wins; when this document and
+STATUS.md's measured findings disagree, the measurement wins and this
+document gets amended, as v4 just did.
 
 ---
 
-## 1. The slice
-
-Two tracks. The **web track** proves the layout system; the **server
-track** adds the small set of server capabilities that more than one
-layout needs.
+## 1. The slice, and where it stands
 
 ```
-web track (serial):    G0 → G1 → G2 → T1 → G3 → G4 → G5 → G6
+web track (serial):    G0 ✔ → G1 ✔ → G2 ◐(home) → G2b → T1 ✔* → G3 → G4 → G5 → G6
 server track (parallel
-after G1, any order):  S1 · S2 · S3
+after G1, any order):  S1 · S2 · S3            (none started)
 
-entry conditions:      G5 needs G3-continue + S1 + S2
-                       G6 needs S3 (+ §8 box 8 confirmed)
+entry conditions:      G3 needs G2b            G5 needs G3-continue + S1 + S2
+                       G6 needs S3 + §8 box 8
 ```
 
-S milestones are Rust-side and start any time after G1, in any order,
-concurrently with web gates (§9.2). Their *server-side* acceptance is
-self-contained; each also names UI consumer checks, which attach to the
-first web merge point where that UI exists (G2's plex for S1/S3's plex
-checks, the activity page for S2) — an S milestone is "merged" when its
-server acceptance passes and "closed" when its consumer checks pass.
+\* T1 ran ahead of G2's completion (themes are layout-independent) and
+shipped Paper + Tide on the box-2 recommendation — §8 ratifies.
+G2's landed half proved the thesis: plex adds **zero** new
+card/rail/grid builders and zero extra requests; 136 CSS rules scoped
+under `[data-layout=plex]`. Defend that property at every later gate.
 
 Still NOT in this plan: `archive` (candidate post-G6 gate, §8 box 3),
 native clients (separate plans, §5.2), per-layout theme memory, README
 changes before the pilot is accepted.
 
-Branch: create `feat/ui-layouts` from `docs/ui-layouts-proposals` (it is
-main `2e0435f` + docs-only commits, so it merges back clean). Web work
-lives in `crates/plurxd/src/web/index.html` — `include_str!`-embedded,
-so every change needs `cargo build` + restart, and the Rust gate cannot
-see JS errors: extract each `<script>` and `node --check` it, every
-commit (project memory Rule 4e). Server work follows the repo's own
-conventions (§3.6) and the full `make check` gate.
+Branch: `feat/ui-layouts` (exists, @ `4ada24c`+). Web work lives in
+`crates/plurxd/src/web/index.html` — `include_str!`-embedded, so every
+change needs `cargo build` + restart. Tooling now exists and is the
+law: `make web-check` (`scripts/js-check` = node --check every embedded
+script · `scripts/contrast-check` with `scripts/contrast-allow.txt`,
+where an allowlisted pair that starts passing is a BUILD ERROR — the
+file can only shrink) and `make ui-baseline` (`--self-host` is the
+provable mode; compare runs at the SAME `--out` path — the seeded
+library path renders on Settings, so different paths false-positive).
 
-## 2. Review checklist → decisions
+## 2. Status findings → what v4 changed
 
-The review left boxes unchecked; this section answers them. Items marked
-**[PAUL]** are collected in §8. Everything else is decided — §8 boxes
-6–8 do not reopen decisions, they tune the scope of G5/G6 (telemetry
-visibility, play-log, schedule defaults) and have recommended defaults
-that hold if unanswered.
+[UI-LAYOUTS-STATUS.md](UI-LAYOUTS-STATUS.md) §3 raised eight issues;
+every one is resolved here. Cite by status number.
 
-| Review box | Decision |
-|---|---|
-| Correct Amber/Giallo/Silver light tokens | Adopted, reviewer's values, re-verified (§3.4). Additional fixes of ours, from holding the stricter three-surface bar (bg + panel + panel2): Amber-dark `--bad` `#e5534b` → `#ee7168` (old value measured 4.25:1 on panel, 3.89:1 on panel2); Silver-light `--good` → `#467353`; Paper-light `--good` → `#25724c`. |
-| One global theme for M1 | Yes. `plurx_theme` stays the single global key. A layout's signature theme renders as a *recommendation row* in the menu ("Plex looks best in Amber — switch?"), never an automatic mutation. The per-layout-memory JSON schema from the review is recorded in §3.3 as deferred, not built. |
-| Deck: API proposal or reduced telemetry | **The review's option 1, now that server work is allowed:** S1 (list media facts) + S2 (playback registry) give Deck real data, and Deck ships as designed at G5. The review's core demand — no faked telemetry, no N+1 — is preserved in the S acceptance lists. Boxes 6–7 tune its visibility and history scope. |
-| Guide: metadata/schedule/D-pad contract | S3 supplies genres (verified: they aren't just unexposed — TMDB enrichment never persists them; the only genre handling in the tree is NFO `<genre>`→tags for home media). The schedule and input contracts are no longer open research questions: G6 specifies concrete defaults, awaiting the single confirm in §8 box 8. |
-| Split web/Android/Apple milestones | Yes. This plan is web + server only. §5.2 seeds the two client plans with verified starting states (`ViewerColors` on Android; static forced-dark `Palette` on Apple). |
-| Second layout after the pilot | **[PAUL]** §8 box 1 — Theater (default recommendation) vs Spine. |
-| Archive Home experiment | **[PAUL]** §8 box 3. Data-feasible today (`recorded_at`/`added_at` both live on `ItemDto`) — no server work needed. |
-| Paper + Tide themes | **[PAUL]** §8 box 2. Recommendation: adopt in T1 — verified all-pairs on all three surfaces in both modes (with the one `--good` hardening above), and they fill real gaps (a light-first theme; a calm color family). |
+| Status § | Finding | v4 resolution |
+|---|---|---|
+| 3.1 | plan said migration v8; repo is at v12 with an assert | §3.6 rule 3 corrected: **v13**, bump the `assert_eq!(version, 12…)` literal, and the `ITEM_COLS`/`ITEM_COL_COUNT = 23` positional-offset trap recorded for S3 |
+| 3.2 | genre backfill can't recompute from stored data — it re-hits TMDB | S3 rewritten: forced re-enrich, settings-gated, rate-paced, resumable; movies ride the existing details call, shows map `genre_ids` via one cached genre-list call per media type |
+| 3.3 | white badge label on `--accent2` fails in 3 new themes | §3.4 adds optional **`--accent2-ink`** (default `--btn-ink`); values below. `--accent2` itself is a gradient end, not a text token — do not "fix" it |
+| 3.4 | `--panel2` is a text surface; two proposal values failed there | v3 had already moved §3.4 to the three-surface bar (the status doc quotes v2's two-surface text); v4 syncs the one value the build derived differently — shipped paper-light `--good` `#26724c` |
+| 3.5 | §7 was incomplete (9 unlisted failures) and one claim false | §7 rewritten as the complete 16-pair inventory with classification + all-surface fix values; "dark variants pass" retracted (noirr-dark button ink measures 3.91:1) |
+| 3.6 | library route is an incremental renderer; whole-body seam would regress scroll | §3.2 now defines TWO seam shapes; library uses the piecewise contract in G2b |
+| 3.7 | +60–90 KB estimate already consumed by one layout + themes | G3 re-baselines the envelope and must answer the single-file question deliberately |
+| 3.8 | activity copy is wrong today; S2 was speced against a misreading | S2 rebuilt on `playstart::note_playback_started`, client playback id + idle expiry for direct play, listing the existing `progressive::Streams` and `SessionKind::Copy`; fixes the copy at the same time |
+
+Assumptions the build made without ticked boxes (status §6) are
+ratified or reversed in §8 — including the build's two self-judged
+status-token hardenings (silver-light and paper-light `--good`), which
+§3.4 adopts and box 2's ratification covers. Nothing else in this
+table is open.
 
 ## 3. The contract
 
-### 3.1 Registry, persistence, capability (G1)
+### 3.1 Registry, persistence, capability (shipped in G1)
 
-Mirror the shipped theme machinery exactly — `THEMES` /
-`applyTheme()` / `themeMenuHtml()` sit at [index.html:826/854/1294]
-(main blob; re-verify):
+As built: `LAYOUTS` sits beside `THEMES` in the `<head>` pre-paint
+script carrying `{name, surfaces}` only; the body script attaches
+`.chrome` and `.views` to the same objects. **A new layout MUST add its
+`{name, surfaces}` stub to the `<head>` object** — without it,
+`applyLayout()` can't resolve the stored id, `data-layout` stays
+`classic`, and every scoped CSS rule silently fails to match (it
+debugs like a stylesheet that didn't load; this bit the plex port).
+`surfaceClass()` decides desktop · mobile · tv from viewport/input,
+never UA strings. Unknown/unsupported ids fall back to classic
+silently. Deck declares desktop + tablet only.
+
+### 3.2 The seam — two shapes, not one
+
+**Whole-body routes** (home — shipped; item detail — G2b):
+
+```
+hash route ─▶ loadHome() ─▶ page model ─▶ LAYOUTS[cur].views.home(page)
+               (fetches)    (plain data)        (body HTML)
+                                                     │
+                                                     ▼
+                                             shared wiring
+```
+
+**Incremental routes** (library — G2b). `libraryView()` fetches pages
+in a loop and redraws `#libbody` / `#libpager` / `#librail` /
+`#libcount` piecewise so a large library never resets scroll position.
+A `body(model) → html` contract would replace the whole body per batch
+and reintroduce that regression. The library contract is therefore
+region-shaped:
 
 ```js
-const LAYOUTS = {
-  classic: { name: "Classic", surfaces: ["desktop","mobile","tv"] },
-  plex:    { name: "Plex",    surfaces: ["desktop","mobile","tv"] },
-  // later entries declare only the surfaces they support (deck declares
-  // desktop + tablet only); the menu never offers a layout the current
-  // surface can't run.
-};
-localStorage.plurx_layout      // absent or unknown id → "classic"
-<html data-layout="plex">      // set pre-paint, same <head> script that
-                               // runs applyTheme() — a layout applied
-                               // after first paint flashes classic chrome
+LAYOUTS[cur].views.library = {
+  shell(model),   // rendered once: chrome-fitting frame + region mounts
+  items(model),   // re-rendered per arriving batch into its region
+  count(model),   // cheap header/pager region
+}
 ```
 
-Rules: unknown/unsupported stored id falls back to `classic` silently
-(never an error, never shown as selectable); the appearance popover gains
-a "Layout" section above "Theme"; the choice is per-browser like themes.
-`surfaces` is decided from viewport/input class, one function, no user
-agent sniffing.
+The loader drives regions as batches land; scroll position is owned by
+the region container and never rebuilt. Any future incremental route
+(search, if converted) uses the same shape.
 
-### 3.2 The page-model seam (G1–G2, route by route)
-
-Today each view owns the whole sequence — fetch, assemble, replace
-`#main`, wire — e.g. home builds hub rails inline ([index.html:1623])
-inside its view function, and the router (`render()`,
-[index.html:5987]) just dispatches. A layout registry bolted around
-those functions would duplicate fetches or reach into globals. Split
-each converted route at one seam:
-
-```
-hash route
-   │
-   ▼
-loadPage(route)  ──▶  page model (plain object)  ──▶  LAYOUTS[cur].render(page)
-     (fetches;              (no DOM, no HTML)            (chrome + body HTML)
-      unchanged                                              │
-      API calls)                                             ▼
-                                                   shared behavior wiring
-```
-
-Page model sketch (grow it as routes convert; keep it JSON-plain):
-
-```js
-// home
-{ kind:"home", hubs:{ continue:[ItemCard...], next_up:[...],
-  recent:[{library, items:[...]}] }, scan: {...} }
-// library
-{ kind:"library", library:{id,name,kind,count}, items:[...], sort, filter }
-// item
-{ kind:"item", item:{...}, files:[FileDto...], origin }
-```
-
-Conversion order: Home (G1, proves the seam under `classic`), then
-library, then item detail (G2). Activity, settings, search, auth, and
-the player stay on their existing renderers behind the layout chrome
-until a gate explicitly converts them (G5 uses activity's data via S2;
-the page body stays where it is). The one shared card partial keeps
-serving every layout, parameterized by CSS (`--w`, label visibility), as
-the mockups already demonstrate.
-
-**Invariant:** converting a route must not change its network behavior.
-Acceptance uses request logs: same endpoints, same counts, before and
-after, per route. (S milestones change this invariant deliberately and
-say so in their own acceptance lists; web-only gates may not.)
+Two ported disciplines from the build, now contract: (1) loaders
+reproduce the original fetch sequencing exactly — tidying sequencing
+is a performance change and ships as its own commit with its own
+justification, never inside a seam refactor (the request-log invariant
+enforces this); (2) plex introduced zero new card/rail/grid builders —
+G4–G6 layouts hold the same line; a second card function is how five
+layouts become five applications.
 
 ### 3.3 Theme contract additions
 
-Token set unchanged from the proposal (§2.3 there), plus:
+Unchanged from v3 (darkOnly · reduced-motion · forced-colors · one
+global theme key; per-layout memory schema recorded-not-built), plus
+one addition in §3.4: `--accent2-ink`.
 
-- `darkOnly: true` (Void, VHS): appearance=light keeps the theme dark and
-  the menu says so inline. No silent fallback to another theme.
-- **Reduced motion:** every decorative animation — cursor blink, skeleton
-  shimmer, VHS tracking bars, hover zooms, theater fades — sits behind
-  `@media (prefers-reduced-motion: no-preference)`. The information the
-  motion carried (working/idle, loading) must remain visible statically.
-- **Forced colors:** selection, focus, and progress use system colors
-  under `forced-colors: active`; verify the player progress bar and the
-  poster focus ring specifically.
-- Theme choice stays ONE global key. If per-layout memory ever returns,
-  it is the review's versioned map (`{"v":1,"classic":"noirr",...}`,
-  unknown ids ignored independently) — recorded here so nobody invents a
-  second format, not scheduled.
+### 3.4 Final token values (validated, synced to shipped code)
 
-### 3.4 Final token values (validated)
+The contract bar: every text-bearing token pair ≥4.5:1 against **all
+three surfaces** (`--bg`, `--panel`, `--panel2`), btn-ink against
+accent, and — new — `--accent2-ink` against `--accent2` where a theme
+sets it. `scripts/contrast-check` enforces exactly this;
+`--suggest` prints nearest passing values, so nobody hand-computes.
+`--accent2` alone is NOT a text token (two uses, both gradient ends —
+status §3.3); auditing it as ink is the wrong test and stays out of
+the check.
 
-Every value below was machine-checked ≥4.5:1 on 2026-08-02 for
-text/muted/prose/accent/good/warn/bad against **all three surfaces**
-(`--bg`, `--panel`, `--panel2`) and btn-ink against accent. That
-three-surface bar is the contract (status and accent text render on
-cards and hover rows, not just the page background). Re-run after any
-edit — the check is ~20 lines of python (WCAG relative luminance); land
-it as `scripts/contrast-check` in G2 so it stays runnable, with an
-explicit allowlist file for §8-box-4 waivers so a waived shipped pair is
-a recorded decision, not a silent failure.
+Shipped and correct (T1): Amber (dark `--bad` `#ee7168`; light
+`#8b5e00`/`#246b49`/`#bd332d`), Giallo light `#7f4e00`/`#2c734d`,
+Silver light `#765f28` warn + `#467353` good, Void, VHS, Paper (light
+`--good` **`#26724c`** — the shipped value; the build hardened the
+review's `#287a51` independently and landed one channel-step from v3's
+`#25724c`; the shipped value stands), Tide. Full tables: proposal §4.2 + review §"Reviewer additions" +
+`scripts/themes-proposed.json` (machine-readable, now the canonical
+value source for future ports).
 
-**Amber** (plex signature) — dark unchanged from the proposal EXCEPT
-`--bad`; light replaces the proposal's failed values:
+**`--accent2-ink`** — label ink for accent2-filled badges. Default:
+the theme's `--btn-ink`. Themes whose accent2 is light set a dark ink;
+the theme's own `--bg` measures excellently and keeps the badge
+on-brand:
 
-| token | dark | light |
-|---|---|---|
-| bg / panel / panel2 | `#191a1d` / `#212327` / `#2a2d32` | `#f3f4f6` / `#ffffff` / `#e9ebee` |
-| line | `#383c43` | `#d5d9de` |
-| text / muted / prose | `#eceef0` / `#9aa0a7` / `#c9cdd2` | `#1e2124` / `#5f666d` / `#3a4046` |
-| accent / accent2 | `#e5a00d` / `#cc7b19` | **`#8b5e00`** / `#a95f16` |
-| good / bad / warn | `#52b788` / **`#ee7168`** / `#f2c14e` | **`#246b49`** / **`#bd332d`** / `#8a6116` |
-| radius / btn-ink | `8px` / `#1c1303` | `8px` / `#ffffff` |
+| theme | accent2 | accent2-ink | ratio |
+|---|---|---|---:|
+| VHS dark | `#26e2ff` | `#140d22` | 12.07 |
+| Tide dark | `#d6b56d` | `#071412` | 9.56 |
+| Paper dark | `#e58b84` | `#171715` | 7.14 |
 
-Note: light-mode gold buttons keep the gold FILL only at large/bold
-sizes; normal-weight accent text uses `#8b5e00`. If the fill reads muddy
-in G2 screenshots, darken the fill, never lighten the ink.
-
-**Giallo** — dark unchanged; light: accent `#a8720c`→**`#7f4e00`**, good
-`#35855c`→**`#2c734d`**; everything else per the proposal table.
-
-**Silver** — dark unchanged; light: warn `#8a7442`→**`#765f28`**, good
-`#4a7a58`→**`#467353`** (panel2 hardening).
-
-**Void, VHS** — unchanged from the proposal (dark-only; all pairs pass).
-
-**Paper, Tide** — if adopted (§8 box 2), the review's tables
-(UI-LAYOUTS-REVIEW.md §"Reviewer additions") with ONE amendment:
-Paper-light `--good` `#287a51`→**`#25724c`** (4.09:1 on panel2 as
-published; the reviewer validated primary backgrounds only). Signature
-pairings recorded there (Paper↔Spine, Tide↔Archive) are recommendations
-only until those layouts exist.
+The check measures every theme's *effective* badge ink — the token if
+set, else `--btn-ink` — against that theme's `--accent2`; a theme
+whose default ink fails must set `--accent2-ink`. That is how "all
+other themes pass" stays a checked fact rather than a claim.
 
 ### 3.5 Boundary (who owns what)
 
-Adopt the review's corrected table verbatim — it replaces the proposal's
-"structure vs paint" slogan:
+Unchanged from v3 — the review's corrected table stands: layouts own
+scaffold/composition/density/surfaces; themes own
+palette/type/texture/lockup; accessibility preferences own
+motion/contrast/scaling. Every combination stays legible and operable.
 
-| Axis | Owns | Must not own |
-|---|---|---|
-| Layout | navigation scaffold · page composition · density · information hierarchy · supported surfaces | palette values · semantic status meaning · playback behavior |
-| Theme | palette · type family · corner/shadow treatment · decorative texture · brand lockup | DOM order · route availability · hidden information · input behavior |
-| Accessibility preference | reduced motion · increased contrast · text scaling · forced-colors | brand identity · saved layout selection |
+### 3.6 Server-work contract
 
-Every layout × theme combination must stay legible and operable; it need
-not be equally pretty.
+Rules 1, 2, 4, 5 unchanged from v3 (≥2 consumers with a non-deck
+consumer check · additive DTOs/params only · routes/player/façade/auth
+untouched, admin gating never widened as a side effect · full
+`make check --no-fail-fast` + TMPDIR-symlink run for scan-adjacent
+code). Rule 3 corrected per status §3.1:
 
-### 3.6 Server-work contract (the rule that replaced "no server changes")
-
-Server changes are welcome when they are sensible and serve more than
-one layout's function (Paul, 2026-08-02). Concretely, every S milestone:
-
-1. **Names at least two consumers, and closes with a non-deck consumer
-   check** — the rule is enforced by acceptance, not by intention. A
-   change that only one layout would ever read does not belong in the S
-   track.
-2. **Is additive at the API surface.** New DTO fields are optional
-   (`skip_serializing_if` / defaulted), new query params are optional,
-   no existing field changes meaning or type. The native clients parse
-   these DTOs today; verify Android's decoder ignores unknown fields
-   before shipping the first additive change (one test, then trust it).
-3. **Follows the repo's storage conventions:** logic in `plurx-core`
-   behind the `Store` trait; SQLite STRICT; migrations append-only
-   (next slot is **v8**; v6/v7 precedents show the shape, including the
-   per-migration `foreign_keys` handling); pure decision functions live
-   beside their loops and carry the tests.
-4. **Does not touch:** hash routes, the player/projection pipeline, the
-   Plex-compat façade (it must never see new fields it could trip on —
-   the façade builds its own responses; verify, don't assume), or auth
-   semantics. Admin-gated data stays admin-gated unless §8 box 6 says
-   otherwise — a layout never widens visibility as a side effect.
-5. **Passes the full gate:** `make check` with `--no-fail-fast`, plus
-   the TMPDIR-symlink run for anything touching scan/paths (project
-   memory Rule 4c).
+3. **Storage conventions:** logic in `plurx-core` behind the `Store`
+   trait; SQLite STRICT; migrations append-only — **the next slot is
+   v13**, and the version assert
+   (`store/sqlite/mod.rs`, `assert_eq!(version, 12, …)`) is bumped to
+   13 in the same commit, deliberately. If a migration adds a column to
+   `items`, `ITEM_COLS` / `ITEM_COL_COUNT` (= 23 today) are positional
+   offsets used by `continue_watching` / `next_up` / `recently_added` /
+   `search_items` — add the column AND bump the count or those queries
+   silently misread. Pure decision functions live beside their loops
+   and carry the tests.
 
 ## 4. Gates
 
-### G0 — freeze the classic baseline
+### G0 — baseline harness ✔ (done)
 
-Build `scripts/ui-baseline`: drives the running server with headless
-chromium (`/opt/pw-browsers/.../chrome` in the sandbox; local Playwright
-on the Mac), captures Home · library · category · search · item detail ·
-activity · settings · auth · player-open at 1280×860 and 390×780, dark
-noirr, plus a tab-order dump (sequence of focused element descriptors)
-per route. Output to `target/ui-baseline/<name>.png` + `focus.json` —
-gitignored; the SCRIPT is committed, goldens are regenerated from the
-pre-change commit whenever needed.
+Shipped as `scripts/ui-baseline` (`make ui-baseline`): self-hosted
+throwaway `plurxd`, seeded deterministic library, frozen page clock,
+timestamps rewritten backwards, server restarted after seeding, motion
+off, 9 routes × 2 viewports + tab-order dump. Proven: 7 consecutive
+runs byte-identical. Operational rule inherited by every later gate:
+compare runs at the same `--out`; `--base-url` mode is smoke-only, not
+byte-exact.
 
-**Accept:** two consecutive runs on an unchanged tree are pixel-identical
-(deterministic enough to trust); the script exits nonzero on any route
-that fails to render.
+### G1 — registry with zero pixel change ✔ (done)
 
-### G1 — registry with zero pixel change
+All 18 captures byte-identical pre/post. The registry, seam (home),
+menu section, and fallbacks are live per §3.1/§3.2.
 
-`LAYOUTS` registry + `plurx_layout` + `data-layout` pre-paint + menu
-section + capability filter (§3.1); Home converted to the page-model seam
-(§3.2) with `classic` as the only complete layout.
+### G2 — plex pilot, home ✔ · G2b — complete the pilot (next web work)
 
-**Accept:** `ui-baseline` output byte-identical to G0 under `classic`
-(menu screenshot excepted — capture it as a new golden); unknown stored
-layout falls back to classic; Home request log unchanged; `node --check`
-clean; `make check` green.
+G2's landed half: plex chrome + Home through the seam, Amber both
+modes, zero new components, zero request-log drift, classic untouched.
 
-### G2 — the Plex pilot
+**G2b scope:** convert library (piecewise contract, §3.2) and item
+detail (whole-body) under plex — A–Z scrubber, `Library/Collections/
+Categories` tabs (Categories greys out until S3), backdrop detail —
+plus the four defects the build logged (status §5):
 
-Plex chrome (sidebar per the proposal §3.2 + mockups), Home, one library
-route, one item-detail route through the seam; library and detail loaders
-extracted in the process (classic consumes the same loaders). Amber
-dark + light with §3.4 values. Corner unwatched flags, hub rows, A–Z
-scrubber, backdrop detail — per mockup structure. (The library List
-toggle may ship disabled or grid-only here; it becomes real when S1
-lands — do not fake its columns from detail fetches.)
+- library List/Grid toggle ships greyed like Categories — it goes
+  live via S1's consumer check, never via faked columns.
+- corner unwatched flag: scope by item kind (`card()` gains a kind
+  class); home-video folders and photos never flag.
+- A–Z scroll-spy anchors to the layout's own header, not `header.top`
+  (plex has none).
+- TV surface hides Settings/admin affordances (the proposal's
+  no-admin-on-TV rule).
+- `PLEX_NAV` re-derives after `invalidateLibs()` — sidebar counts must
+  not go stale until the next Home render.
 
-**Accept:**
-- Full route matrix operable under plex — unconverted routes (activity,
-  settings, search) render their existing bodies inside plex chrome.
-- Libraries with 0, 1, and 200+ items; items with no art, long titles,
-  missing year; non-admin user (no Settings in sidebar).
-- Keyboard-only pass of home → library → detail → play with visible
-  non-color focus; hover-only affordances (play circle, captions) have
-  keyboard/touch equivalents.
-- Light mode screenshot sweep: no hardcoded-dark boxes (the 2026-07-22
-  scar); `scripts/contrast-check` passes on §3.4 values.
-- Reduced-motion and forced-colors behaviors per §3.3.
-- Request-log invariant per route; `ui-baseline` under classic still
-  byte-identical (plex must not leak into classic).
-- Screenshots regenerated for `docs/mockups`-style states → G3 evidence.
-- Any S milestone already merged: its pending consumer checks run here.
+**Accept:** everything from v3's G2 list (route matrix under plex ·
+0/1/200+ item libraries · missing-art/long-title/no-year items ·
+non-admin user · keyboard-only pass with visible non-color focus ·
+hover affordances have keyboard/touch equivalents · light-mode sweep,
+no hardcoded-dark boxes · reduced-motion + forced-colors ·
+request-log invariant · classic byte-identical) — PLUS: library scroll
+position survives batch arrival AND layout switching; the four defects
+above have regression captures; one manual smoke of home/library/
+detail in Safari and Firefox on the Mac (the harness is
+Chromium-only — status §5 — so cross-engine stays a human check for
+now) and one VoiceOver spot pass of the plex sidebar and cards.
 
-### T1 — the theme catalogue
+### T1 — theme catalogue ✔ (done, pending §8 ratification)
 
-After G2. Add Giallo, Silver, Void, VHS (+ Paper, Tide per §8 box 2) with
-§3.4 values; `darkOnly` plumbed; midnight-only menu note; VHS tracking
-skeletons + chromatic wordmark; Silver's quiet status tints; grain where
-specified. If §8 box 4 adopts shipped-theme fixes, re-verify §7's
-candidate values against all three surfaces first (they were computed
-against `--bg` only) and apply in the same commit set.
+Seven themes shipped including Paper + Tide (box 2 assumed yes —
+ratify or delete two `THEMES` entries). Contrast enforcement live with
+the 36-entry allowlist; shrink-only semantics. §7 debt intentionally
+NOT applied (brand calls — box 4).
 
-**Accept:** `scripts/contrast-check` passes every §3.4 pair on all three
-surfaces — plus §7 values if adopted, with any box-4 waivers recorded in
-the check's allowlist file (a waived pair is a listed decision, never a
-silent failure); theme × {classic, plex} × mode matrix screenshotted
-with zero console errors; reduced-motion kills VHS tracking animation;
-`docs/mockups/themes.html` regenerated to match shipped values (mockups
-must not drift from code).
+### S1 — media facts on the library list (server) — unchanged from v3
 
-### S1 — media facts on the library list (server)
+Aggregated optional `media` block, one join/group query, `?facts=1`
+opt-in, `delivered_dynamic_range` vocabulary shared with
+[MEDIA-BADGES-PLAN.md](MEDIA-BADGES-PLAN.md). Consumers: plex List
+mode (G2b's toggle) · deck (G5) · card badges. Acceptance as v3
+(no N+1 · ≤15% latency · byte-identical without the param · tolerant
+Android decoder verified · consumer check closes against G2b's
+library).
 
-The facts already exist — `files` table columns feed `FileDto`
-([media.rs FILE_COLS selects], [dto.rs:182]); the browse list just never
-aggregates them. Add an optional aggregated block per item on the
-library list response, computed in one query (join/group on `files`, no
-per-item fan-out), requested via an optional query param so unchanged
-clients pay nothing:
+### S2 — playback attribution registry (server) — rebuilt per status §3.8
 
-```jsonc
-// ItemDto, additive, only when ?facts=1 (name at build time)
-"media": { "files": 2, "bytes": 75800000000, "video": "HEVC",
-           "height": 2160, "dr": "DV", "audio": "TrueHD 7.1",
-           "container": "MKV" }
-```
+The ground truth is better than v3 assumed: HLS **copy** remuxes
+already hold real sessions (`SessionKind::Copy`,
+[transcode.rs:1237], enum at :1212; re-verify); progressive remux
+already has a registry
+(`progressive::Streams`, [progressive.rs:109]) that is simply never
+listed; only true direct play has no server record. And all three
+delivery methods already pass through ONE existing seam on the way to
+starting: **`playstart::note_playback_started`**
+([playstart.rs:124]). Build S2 there:
 
-`dr` MUST use the same source-vs-delivered vocabulary as
-[MEDIA-BADGES-PLAN.md](MEDIA-BADGES-PLAN.md) (`delivered_dynamic_range`
-contract) — one HDR labeling system in this codebase, not two. Photos
-and folder items skip the block.
+- Give the seam an end: registry entries keyed by a client-supplied
+  playback id — `/stream.mp4` already accepts one
+  ([stream.rs:918]) — with idle expiry driven by the existing
+  progress-beacon cadence. NEVER one-request-one-session: direct play
+  is a storm of ranged 206s ([stream.rs:1105]) and would show phantom
+  viewers.
+- List what exists: fold `progressive::Streams` (promote `len()` and
+  iteration out of `#[cfg(test)]`) and `SessionKind::Copy` into one
+  activity array with `method: direct | remux | hls-copy | transcode`.
+- **Fix the lie at the merge, not in the worktree:** the activity
+  page's "Only transcodes hold a server session — direct play and
+  remux flow straight through" ([index.html:5192]) is half-wrong
+  today and fully wrong after S2. The one-line copy replacement is
+  part of S2's *consumer-check commit*, made by the `index.html`
+  owner when S2 merges — never edited from the S2 worktree (§9's
+  single-owner rule).
 
-**Consumers (≥2):** plex library List mode (G2's disabled toggle turns
-on) · deck's table (G5) · richer card badges for every layout per the
-badges plan.
+Consumers: Activity page in every layout · deck footer/spec sheets
+(G5) · optional plex "now playing" later. **Accept (server-side):**
+direct-play start visible within one beacon interval, expiry within
+the chosen idle timeout; progressive and copy entries appear/disappear
+with their streams; transcode entries unchanged; expiry logic is a
+pure tested function. **Consumer check:** Activity shows all four
+method labels under classic and plex; the old copy string is gone.
 
-**Accept (server-side, self-contained):** one SQL query serves a
-210-item library page (log proves no N+1); list latency within 15% of
-pre-S1 measurement on the same library; response without `?facts=1` is
-byte-identical to pre-S1; Android decoder verified tolerant of the new
-field; badge vocabulary cross-checked against MEDIA-BADGES-PLAN.md.
-**Consumer check (closes at the first web merge point with G2):** plex
-List mode renders codec/DR/size columns from the list response alone.
+### S3 — genres (server, migration v13) — cost named per status §3.2
 
-### S2 — playback attribution registry (server)
+No stored TMDB payload exists to recompute from (`tmdb::Match` carries
+nine fields, none genres), and enriched items are `metadata_at`-stamped
+— invisible to `items_needing_metadata`. **The backfill is therefore a
+forced re-enrich that re-hits TMDB once per title.** Spec:
 
-An in-memory registry in `plurxd` state of every active delivery —
-direct play, remux (`stream.mp4` pipes), and HLS transcode — each entry
-`{user, client, item, method, started_at, progress?}`. Today only
-transcodes are visible (`activity_detail` →
-`transcode.list_sessions()`, [system.rs:1121]); direct/remux are
-invisible, which is how a GPU-class resource question became a design
-rule in the first place. Register on `/decision` + stream open; expire
-on the existing progress-beacon heartbeat going quiet (pick the timeout
-from the beacon interval, not a guess). Exposed as an additive array on
-the activity response. No schema change; a persistent play-history LOG
-is explicitly out of scope unless §8 box 7 opts in.
+- Migration v13 (append-only; bump the assert; mind
+  `ITEM_COLS`/`ITEM_COL_COUNT` if touching `items` — §3.6).
+- Forward path: persist genres at enrich time. Movies: the existing
+  details call already returns them — zero extra requests. Shows: the
+  search result carries `genre_ids`; resolve via `/genre/tv/list`
+  (and `/genre/movie/list` for completeness) fetched ONCE per run and
+  cached — never a per-title second round-trip. AniList genres map in
+  for anime.
+- Backfill: settings-gated (the `backfill_hdr_format` precedent for
+  the gate, NOT for the mechanism — that one recomputed from stored
+  probe_json; this one calls out), paced to TMDB's public rate
+  ceiling, resumable (stamp progress; a crash or 429 resumes, never
+  restarts), and reported in the refresh report per the
+  errors-and-problems convention (per-title failures leave genres
+  empty and NOTE it — no invisible errors).
+- Additive `genres` on item DTOs; optional server-side `?genre=`
+  filter on library items.
 
-**Consumers (≥2):** the Activity page in every layout (method column:
-direct · remux · transcode) · deck's status footer and spec sheets (G5)
-· optional later: plex sidebar "now playing".
+**Accept (server-side):** enrich of a new movie/show persists genres
+with zero/one extra API calls respectively (the cached list call);
+backfill over a seeded catalogue is resumable mid-run and its report
+counts backfilled/failed/skipped; `?genre=` filters with a test.
+**Consumer check:** plex Genre pill + Categories tab work end-to-end
+(G2b greyed → live), theater chips at G4 if Theater is chosen.
 
-**Accept (server-side):** a direct-play start appears in the activity
-response within one beacon interval and expires within the chosen
-timeout after stop; a remux pipe appears and disappears with the
-request; transcode entries unchanged; pure expiry/decision logic is a
-tested function beside its loop (repo convention). **Consumer check
-(closes at the first web merge point):** the Activity page shows all
-three methods — under classic, and under plex chrome once G2 exists.
+### G3 — did the abstraction pay for itself? (entry: G2b)
 
-### S3 — genres for catalog media (server, migration v8)
+Four of five numbers are already collected (status §4): zero
+duplicated components, zero extra requests, +65.9 KB for one layout +
+seven themes, zero real regressions (one false positive, documented).
+Remaining: price one real shared-card change under both layouts.
 
-Verified: no genre data exists server-side for movies/TV — TMDB
-enrichment does not persist genres; NFO `<genre>` folds into home-media
-tags only (`scan/nfo.rs`). Add: migration **v8** (append-only, STRICT)
-storing genres per item (JSON-array column or join table — decide at
-build against query needs; stop-and-flag if it grows past this); TMDB
-enrichment persists genre names on match (AniList genres map in for
-anime); metadata refresh backfills; additive `genres` on item DTOs;
-optional `genre` filter param on the library-items query, filtered
-server-side.
+Two deliberate calls the record must make, not bury:
 
-**Consumers (≥2):** plex library Genre filter pill + Categories tab
-(drawn in the accepted mockups, currently impossible) · theater's chip
-bar (same) · guide's `MOVIES · <genre>` channels (G6) · search later.
+1. **Re-baseline the size envelope.** v3's +60–90 KB total is spent.
+   New estimate: G2b's library/detail conversions +15–25 KB; theater
+   +35–55 KB; deck and guide +60–90 KB each (own body builders per
+   route). Trajectory from the shipped 646.6 KB: **~820–910 KB by
+   G6**.
+2. **Single file: continue or split?** If split, the shape is several
+   `include_str!` assets served by `plurxd` (per-layout JS/CSS chunks)
+   — still zero build step, still one binary. Deciding at G3 is cheap;
+   reopening at G6 is not.
 
-**Accept (server-side):** refresh backfills genres for TMDB-matched
-items (count reported in the refresh report per the errors-and-problems
-convention); `?genre=` filters server-side with a test; `EnrichReport`
-notes items that matched but returned no genres (log-only is fine — do
-not resurrect the UI-invisible errors gap knowingly). **Consumer check
-(closes at the first web merge point with G2):** the plex Genre filter
-pill works end-to-end.
+**Accept:** `docs/UI-LAYOUTS-G3-DECISION.md` names its evidence and
+answers both calls; one independent fresh-context assessment
+accompanies the implementer's metrics (§9.3); if "revise", the
+revision lands before G4/G5 start.
 
-### G3 — did the abstraction pay for itself?
+### G4 — one second layout (entry: G3 continue)
 
-Write `docs/UI-LAYOUTS-G3-DECISION.md` (one page): duplicated markup
-count, extra requests (must be zero on web-only routes), index.html size
-delta vs the +60–90 KB estimate, route regressions caught by
-`ui-baseline`, and the cost in files/lines of one shared card fix
-applied under both layouts. Verdict: continue · revise the contract ·
-stop. Per §9.3, one independent fresh-context assessment accompanies the
-implementer's own metrics — two perspectives total, no panel.
+Unchanged from v3: §8 box 1 chooses (Theater default); Theater's
+hero-selection rules and artwork budget as written (hero reuses the
+page-model backdrop, progressive over accent wash, interactive ≤110%
+of classic home's G0 timing); Spine has no blockers beyond the seam.
+Theater's library view uses the piecewise contract from §3.2.
 
-**Accept:** the verdict names its evidence; if "revise", the revision
-lands before G4/G5 start.
+**Accept:** v3's list + the timing bound measured by `ui-baseline`.
 
-### G4 — one second layout
+### G5 — deck (entry: G3 continue + S1 + S2) — unchanged from v3
 
-Per §8 box 1 (Theater default). Entry conditions: G3 said continue; for
-Theater — hero-selection rules (newest in-progress → newest added
-fallback, playable video only) and the artwork budget defined here: the
-hero uses the backdrop already fetched for the page model (no extra
-hero-only endpoint), painted progressively over the accent-wash
-placeholder, and decorative art never blocks first interaction — hero
-route must be interactive within 110% of classic home's G0 timing.
-Spine has no blockers beyond the seam. Deck and Guide are not choices
-here — they have their own gates.
+Operator console as designed; table fed by S1 only; footer fed by S2 +
+scan poll; admin-gated tiles degrade for non-admins (box 6); history
+from existing data (box 7); desktop + tablet only; keyboard map; a11y
+re-run with real table semantics.
 
-**Accept:** no business-logic fork; no layout-specific fetch outside its
-registered loader; the G2 acceptance list re-run for the new layout;
-the timing bound above measured by `ui-baseline`.
+### G6 — guide (entry: S3 + §8 box 8) — unchanged from v3
 
-### G5 — deck, as designed (entry: G3 continue + S1 + S2)
-
-The operator console per the proposal §3.4 and mockups: mono rail,
-stat-tile home, **table library view** fed entirely by S1 (client-side
-sort), spec-sheet detail (FileDto is already rich enough), persistent
-status footer fed by S2 + the scan poll, keyboard map (`/` `j/k`
-`enter` `w`). Disk/uptime tiles read `/system` and therefore render for
-admins only unless §8 box 6 opens a reduced household view — the footer
-degrades gracefully for non-admins (scan + sessions only). The detail
-history section renders from existing watch/progress data; a device+
-method play-log exists only if §8 box 7 says so (via S2's extension).
-
-**Accept:** 210-item table from ONE list request (request log); footer
-live-updates during a scan and shows all three delivery methods; a
-non-admin sees no admin-gated numbers and no broken tiles; desktop +
-tablet only (capability filter hides deck on TV and phone-class
-surfaces — a phone list variant may follow later, matching §3.1's
-registry entry); keyboard map works; G2's a11y list re-run (tables get
-real semantics — sortable headers announced).
-
-### G6 — guide (entry: S3 + §8 box 8 confirmed)
-
-The review asked for a schedule/input contract; here it is — concrete
-defaults, one confirm box:
-
-- **Seed:** the viewing device's local calendar date (`YYYY-MM-DD`).
-  Two devices may show different schedules; the guide is presentation,
-  not shared state.
-- **Slots are presentation.** Enter always plays from the user's saved
-  position (or 0:00). No faux-live mid-item starts.
-- **Missing runtime:** 45-minute block for episodes, 2-hour for movies.
-- **Episode order:** the next-up ordering; season gaps skipped silently.
-- **Data budget:** channels derive from already-fetched hubs plus at
-  most one library page (≤100 items) per channel; never a full-library
-  crawl.
-- **Stability:** the schedule is fixed per device-day (seeded PRNG);
-  only the CONTINUE channel re-flows with watch progress.
-- **Input:** every action has a D-pad path and an on-screen label;
-  number keys and color buttons are enhancements only.
-- Channels at launch: CONTINUE · `MOVIES · <genre>` (S3) · deepest-show
-  marathon · RECENTLY ADDED · per-library rows where present · SHUFFLE.
-  Home-replacement only; browse/detail/settings stay classic-shelled.
-
-**Accept:** same-day determinism test (two renders, identical schedule);
-every cell plays on enter/click; D-pad-only TV pass; genre channels
-sourced from S3 (no client-side genre guessing); non-home routes visibly
-classic-shelled; VHS pairing screenshotted for the docs.
+Schedule/input defaults as specified (device-local date seed ·
+slots-are-presentation · 45m/2h fallbacks · ≤1 library page per
+channel · fixed per device-day · D-pad path + label for everything);
+launch channels including `MOVIES · <genre>` from S3; home-replacement
+only. Acceptance as v3.
 
 ## 5. Still deferred
 
-### 5.1 Archive (reviewer's candidate)
+### 5.1 Archive — post-G6 gate if §8 box 3 says yes (no server work).
 
-No server work needed (`recorded_at`/`added_at` ship on `ItemDto`, v6).
-If §8 box 3 is yes, it slots in as a post-G6 gate of G4's shape, using
-the review's Captured/Added and "Date unknown" rules as written.
-
-### 5.2 Native clients (separate plans, later)
-
-Verified starting states: Android has `ViewerColors` (3 themes × 2
-modes) composed with Material `ColorScheme`
-([clients/android/.../ui/theme/Theme.kt:22-84]) — extend by GENERATING
-`ViewerColors` from a canonical token file, then navigation scaffolds
-one form factor at a time. Apple has a static noirr `Palette` and
-forces dark ([clients/apple/Sources/Theme.swift:5],
-[PlurxApp.swift:11]) — theme infrastructure (selection, persistence,
-environment injection, light appearance) is foundation work before any
-catalogue. One canonical token source generating web/Kotlin/Swift is
-required before either port; extract it as the first task of the
-Android plan. S1/S2/S3 responses are additive, so current clients keep
-working untouched.
+### 5.2 Native clients — separate plans; starting states verified
+(Android `ViewerColors` 3×2; Apple static forced-dark `Palette`).
+`scripts/themes-proposed.json` now exists and becomes the seed of the
+canonical token source those plans require. S1/S2/S3 stay additive, so
+current clients keep working untouched.
 
 ## 6. Guardrails
 
-- **Server changes only inside S milestones, under §3.6.** The
-  multi-consumer rule is the law: if only one layout would read it, it
-  doesn't ship. (This replaces the earlier blanket "no server changes"
-  — Paul's call, 2026-08-02.)
-- **No route changes, no player changes, no façade changes.** Hash
-  routes, projection mode, player internals, and the Plex-compat façade
-  stay untouched by both tracks.
-- **Classic's pixels are frozen** through G1 and byte-checked at every
-  web gate after.
-- **Theme ids are permanent.** `classic`/`terminal`/`noirr` keep
-  working; additions are additive; no renames.
-- **Migrations append-only, DTOs additive-only** (§3.6). Old clients
-  must never notice the S track happened.
-- **Two index.html lineages are in flight** — the Codex agent's branch
-  (`codex/fix-dolby-vision-quality`) carries its own +75/−22 to the same
-  file. Coordinate merge order per §8 box 5; keep layout diffs surgical
-  (new functions + scoped CSS blocks, minimal edits inside existing
-  functions) so the eventual merge is mechanical.
-- **Strings render `${APP_NAME}`** (`"cinemarr"`, [index.html:819]) —
-  never the literal "plurx".
-- **Mockups are reference, not law**; when shipped values change (T1),
-  regenerate the mockup/theme-sheet stills so docs don't drift.
+Unchanged from v3, with one addition and one sharpening:
 
-## 7. Shipped-theme contrast findings (out of review scope, ours)
+- Server changes only inside S milestones, under §3.6 (multi-consumer
+  rule; Paul's call, 2026-08-02).
+- No route, player, or façade changes; classic byte-frozen; theme ids
+  permanent; migrations append-only, DTOs additive-only.
+- Two `index.html` lineages in flight (codex branch, +75/−22) — §8
+  box 5; keep layout diffs surgical.
+- `${APP_NAME}` everywhere; mockups are reference, not law; regenerate
+  stills when shipped values change.
+- **NEW — the allowlist is shrink-only.** `scripts/contrast-allow.txt`
+  entries that start passing fail the build until deleted. Nobody adds
+  an entry without a §8-box-4-class decision behind it.
+- **Sharpened — "classic byte-frozen" binds the LAYOUT track.**
+  S-milestone consumer changes (the activity method column and copy
+  fix, S1's List-mode columns) legitimately alter classic's pixels;
+  their consumer-check commits regenerate the affected `ui-baseline`
+  goldens and say so. Any classic diff outside an S consumer-check
+  commit remains a regression.
+- **Sharpened:** "byte-identical" comparisons only at the same
+  `--out` path (status §1's trap), and `--self-host` is the only
+  provable mode.
 
-Extending the reviewer's audit to the three SHIPPED light themes found
-failures they politely left alone. Minimal darkened values that pass
-4.5:1, computed against each theme's `--bg` — **if adopted (§8 box 4),
-re-verify against all three surfaces per §3.4 before freezing; expect a
-further point of darkening on some**:
+## 7. Shipped-theme contrast debt — the complete inventory
 
-| Shipped pair | Now | Passing fix (bg-only) |
-|---|---:|---|
-| Classic light accent `#2f6fe0` | 4.38:1 | `#2e6cdb` (4.57) |
-| noirr matinee warn `#a3742b` | 3.59:1 | `#8c6324` (4.66) |
-| noirr matinee good `#35855c` | 3.92:1 | `#307a54` (4.53) |
-| noirr matinee bad `#c96442` | 3.40:1 | `#a85337` (4.62) |
-| Terminal light accent `#6e7f00` | 3.65:1 | `#606f00` (4.54) |
-| Terminal light good `#859900` | 2.62:1 | `#5f6e00` (4.61) |
-| Terminal light warn `#b58900` | 2.62:1 | `#826200` (4.64) |
+Status §3.5 proved v3's table was less than half the story (7 of 16
+`--bg`-only failures listed, and a false "dark variants pass" claim —
+noirr-dark's white button ink on crimson measures **3.91:1**). This
+table replaces it. All 36 current failures live in
+`scripts/contrast-allow.txt`; fixing = changing the value AND deleting
+the line. Fix values below pass ALL THREE surfaces (recomputed for v4;
+`contrast-check --suggest` reproduces them).
 
-Caveats that make this §8 box 4 rather than an automatic fix: the matinee
-values are kit-exact (`brand/tokens.css`) — changing them is a brand
-decision and the kit file changes in the same commit; Terminal-light is
-faithful Solarized, whose dim statuses are the aesthetic — fixing
-statuses (which carry meaning) while waiving the accent is a defensible
-middle; waived pairs go in the contrast-check allowlist (T1). Dark
-variants of all three shipped themes pass.
+| Shipped pair | Now (bg) | Class | All-surface fix |
+|---|---:|---|---|
+| Classic-l accent `#2f6fe0` | 4.38 | brand accent | `#2d69d6` |
+| Classic-l good `#1a9d5a` | 3.26 | **status** | `#147d47` |
+| Classic-l bad `#d64550` | 4.06 | **status** | `#c23e48` |
+| Terminal-l accent `#6e7f00` | 3.65 | brand accent (Solarized) | `#5b6900` ¹ |
+| Terminal-l good `#859900` | 2.62 | **status** | `#5c6900` ¹ |
+| Terminal-l warn `#b58900` | 2.62 | **status** | `#7d5e00` |
+| Terminal-l bad `#dc322f` | 3.77 | **status** | `#ba2a27` |
+| Terminal-l muted `#657b83` | 3.64 | text (Solarized-faithful) | via `--suggest` if fixed |
+| Terminal-l prose `#586e75` | 4.39 | text (Solarized-faithful) | via `--suggest` if fixed |
+| Terminal-l btn-ink on accent | 4.14 | button ink | darkens with accent fix |
+| matinee warn `#a3742b` | 3.59 | **status** (kit-exact) | `#8d6425` ² |
+| matinee good `#35855c` | 3.92 | **status** (kit-exact) | `#307a54` ² |
+| matinee bad `#c96442` | 3.40 | **status** (kit-exact) | `#aa5438` ² |
+| noirr-d btn-ink `#fff` on `#e5484d` | 3.91 | button ink (brand) | brand call ³ |
+| noirr-d / terminal-l `--accent2` pairs | 2.2–3.0 | not a text token | none — wrong test (§3.4) |
 
-## 8. Open boxes for Paul
+¹ Solarized's accent and green sit at near-identical luminance; after
+darkening they land one channel-step apart. Keeping them tellable
+apart is a HUE decision — nobody invents it silently (box 4 note).
+² Kit-exact: `brand/tokens.css` changes in the same commit — brand
+call. ³ Button labels are 14–15 px semibold — under WCAG that is not
+"large text", but a 3:1 large-text waiver is the defensible brand
+position if box 4 keeps the crimson; record it in the allowlist either
+way.
 
-1. **Second layout at G4:** ☐ Theater (recommended — TV-facing, and it
-   exercises the hero/immersion path the clients need) · ☐ Spine
-   (recommended if desktop browsing is the next surface)
-2. **Adopt Paper + Tide in T1:** ☐ yes (recommended) · ☐ later
-3. **Archive as a post-G6 gate:** ☐ yes · ☐ park
-4. **Fix shipped light-theme contrast (§7):** ☐ all · ☐ statuses only,
-   waive brand accents (recommended) · ☐ leave shipped themes alone
-5. **Merge order:** ☐ land `codex/fix-dolby-vision-quality` to main
-   before starting (cleanest index.html story) · ☐ start
-   `feat/ui-layouts` now and merge carefully later (recommended if the
-   codex branch is still weeks out)
-6. **Deck telemetry for non-admins:** ☐ admin-only disk/uptime,
-   household sees scan + sessions (recommended — matches the current
-   admin gating) · ☐ add a reduced household status endpoint in S2
-7. **Play-history log** (who played what, when, how — deck's history
-   table wants it): ☐ existing watch/progress data only (recommended
-   for now) · ☐ add a persistent play log as an S2 extension (new
-   table; its own retention decision)
-8. **G6 schedule defaults** (device-local date seed · slots-as-
-   presentation · 45m/2h fallbacks · fixed per device-day): ☐ as
-   specified (recommended) · edits: ____________
+**Box 4's "statuses only" option now means exactly:** apply the eight
+**status** rows (classic 2, terminal 3, matinee 3), matinee being a
+knowing brand-kit edit; waive the rest into the allowlist with this
+section as the recorded reason.
 
-Boxes 1, 2, 4, and 5 shape the web track; box 3 adds a post-G6 gate;
-boxes 6–8 tune G5/G6 and their recommended defaults hold if unanswered.
-Tick 1–5, hand the branch to the implementing agent, and G0 starts the
-same day; the S track can begin right after G1 in parallel.
+## 8. Open boxes for Paul — now mostly ratifications
+
+The build ran ahead on recommended defaults (status §6). Boxes 1–5
+ratify or reverse; 6–8 still gate G5/G6.
+
+1. **Second layout at G4:** ☐ Theater (assumed, recommended) · ☐ Spine
+   — nothing built yet; free to change.
+2. **Paper + Tide:** ☐ ratify (SHIPPED in T1, recommended) · ☐ reverse
+   (delete two `THEMES` entries).
+3. **Archive as a post-G6 gate:** ☐ yes · ☐ park (assumed parked).
+4. **Shipped-theme contrast (§7):** ☐ statuses only (recommended — the
+   eight bold rows; includes knowingly editing matinee kit values) ·
+   ☐ all incl. brand accents · ☐ leave as allowlisted debt.
+   Sub-call if terminal is touched: accept accent≈green luminance or
+   shift hue — ☐ accept · ☐ shift.
+5. **Merge order vs codex branch:** ☐ ratify started-now (assumed;
+   recommended) · ☐ pause until codex lands to main.
+6. **Deck telemetry for non-admins:** ☐ admin-only disk/uptime
+   (recommended) · ☐ reduced household status endpoint in S2.
+7. **Play-history log:** ☐ existing data only (recommended) · ☐ S2
+   extension table.
+8. **G6 schedule defaults:** ☐ as specified (recommended) · edits: ___
 
 ## 9. Execution model — agents and parallelism
 
-Parallelism is welcome where it rearranges the serial work; fan-out that
-multiplies the work needs a named reason (Paul's constraint: don't
-substantially exceed what serial execution would cost). Three rules
-cover this plan:
-
-### 9.1 One owner for index.html — the web track is serial by physics
-
-The entire web app is one embedded file. Two agents editing it
-concurrently guarantees conflicts (and a third lineage already looms —
-§6, codex branch). Therefore: web gates run in order, exactly one agent
-holds `index.html` at a time, and no web gate starts before the previous
-one's acceptance passes. Parallelism *within* a web gate is fine when it
-touches disjoint files: `scripts/ui-baseline`, `scripts/contrast-check`,
-and docs/mockup regeneration can be built by side agents while the main
-agent edits the SPA.
-
-### 9.2 The S track is the parallel lane
-
-S1/S2/S3 are mutually independent and independent of the web pilot's
-code: S1 lives in `store/sqlite/media.rs` + the list handler + `dto.rs`;
-S2 in `plurxd` state + `http/system.rs` + stream/decision touchpoints;
-S3 in migrations + enrichment + `dto.rs` + the items query. Run them as
-separate agents in **isolated worktrees**, concurrently with each other
-and with the web gates, each passing the full §3.6 gate in its own
-worktree before merging into `feat/ui-layouts`. Merge serially, any
-order. The only shared file is `dto.rs` (S1 and S3 both add an optional
-field) — additive on both sides, trivial merge, but land them as
-separate commits, never interleaved in one.
-
-### 9.3 Fresh eyes at gate boundaries — one verifier, not a panel
-
-Every gate's acceptance list is executed by an agent that did not write
-the code, reading only the gate's acceptance section and the artifacts
-(baseline diffs, request logs, screenshots, contrast output). Author
-blindness is the point; this document itself was corrected by exactly
-such a pass. One verifier per gate. The only place two perspectives are
-warranted is G3, where the plan already demands an independent
-assessment beside the implementer's metrics. Never spawn redundant
-multi-agent reviews of the same artifact beyond that — and prefer a
-script over an agent wherever the check is mechanical (screenshot
-matrices, contrast sweeps, route walks): scripts are cheaper,
-deterministic, and re-runnable at every later gate for free.
+Unchanged from v3, and now proven in practice (the build's own
+verification shape produced STATUS.md §3 — exactly the fresh-eyes
+yield §9.3 predicts). Three rules: (1) one owner of `index.html` at a
+time — web gates serial; side agents only on disjoint files
+(`scripts/*`, docs, mockup regeneration). (2) S1/S2/S3 run as parallel
+agents in isolated worktrees, each passing the full §3.6 gate before a
+serial merge; `dto.rs` is the only shared file (additive on all sides,
+separate commits). (3) One fresh-context verifier per gate boundary
+reading only the acceptance list + artifacts; two perspectives at G3
+only; scripts over agents for anything mechanical. G2b's library
+conversion belongs to the `index.html` owner — the piecewise seam is
+not a parallelizable edit.
