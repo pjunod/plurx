@@ -5,9 +5,11 @@ The iOS/tvOS app should reach viewer parity without duplicating browser-only
 server administration. This document records the boundary so “parity” means a
 testable set of behaviors rather than a general impression.
 
-> Status: the P0 playback blockers are implemented in source and compile for
-> both iOS and tvOS. Real-device playback validation is still required before
-> calling them shipped. P1 and P2 items below remain open.
+> Status: the native text-subtitle path is implemented, covered on both Apple
+> simulator targets, and deployed server-side. The physical Apple TV accepts
+> the native WebVTT master and selects the requested rendition; the exact
+> copied-Dolby-Vision regression file still falls back after a CoreMedia
+> `-12927` rejection. Other P1 and P2 items below remain open.
 
 ## What parity means
 
@@ -30,19 +32,19 @@ testable set of behaviors rather than a general impression.
 | Local-network permission | Browser permission model | Bonjour starts before auth; URL requests wait while the iOS prompt is open | Add UI that distinguishes Denied from multicast unavailable |
 | Session | Local login and remembered token | Local login and silent reconnect | Move bearer token from `UserDefaults` to Keychain |
 | Home and browse | Hubs, libraries, hierarchy | Hubs, libraries, show → season → episode | Sorting, filters, denser iPad/tvOS layouts |
-| Search | Global search | Missing | P1: add API-backed search to the root navigation |
+| Search | Global search | Native API-backed search | Improve keyboard, history, and tvOS focus polish |
 | Playback decision | Runtime caps, server delivery plan | Runtime VideoToolbox/display caps; executes `delivery` | Real-device codec/HDR matrix, especially Dolby Vision profiles |
 | Transport | Play/pause, ±10, full seek | Explicit play/pause, ±10, full-film slider; HLS seeks reopen at the film position | Validate rapid/overlapping seek cancellation and long transcodes |
 | iOS Now Playing | Not applicable | Known duration, elapsed time, pause/play/seek commands, `isLiveStream = false` | Add artwork and series/episode metadata |
 | Audio tracks | Select and restart when needed | Select and restart at the same position | Add friendlier channel/codec labels; validate TrueHD/DTS fallback |
-| Subtitles | Text WebVTT stays client-side; bitmap tracks burn in | Every selected track burns in for correctness | P1: make text WebVTT selectable without video re-encode; retain burn-in for PGS/VobSub |
+| Subtitles | Text WebVTT stays client-side; bitmap tracks burn in | SRT/SubRip/WebVTT use native HLS renditions; PGS, VobSub, and styled ASS/SSA retain burn-in | Complete the Android parity milestone and broaden physical-device coverage |
 | Quality | Auto adaptation, Original, explicit rungs | Server Auto plus explicit ladder rungs | P1: continuous adaptation and an honest Original option when compatible |
 | Playback info | Detailed source, output, network, encoder, stalls | Source/output, access-log bitrate/stalls, server encode speed/ahead/delivery | Add TTFF, frame presentation rate, stall classification, and build stamp |
 | Intro/credits | Manual and automatic skip | Manual marker button | P1: persisted auto-skip and next-episode handling for end credits |
 | Autoplay | Next episode, then next season; default on | Same traversal and default | Add a cancelable countdown and “Up Next” metadata |
 | Audio sync | Persisted per-file ±ms correction | Missing | P1: expose the existing server offset endpoint and restart at position |
 | Progress/Trakt | Periodic and final progress | Every 10 seconds, exit, and natural end | Verify app interruption/background transitions |
-| PiP/AirPlay | Browser/platform dependent | AVPlayer foundation only; no product-level controls or QA | P1: explicit PiP/AirPlay affordances and remote-device session tests |
+| PiP/AirPlay | Browser/platform dependent | Explicit iOS PiP controls on the AVPlayer surface | Add AirPlay affordances and remote-device session tests |
 | Offline/downloads | Missing | Missing | P2, only if product scope expands beyond server-connected playback |
 | Accessibility | Browser semantics and keyboard controls | SwiftUI labels and tvOS focus basics | P2: VoiceOver, Dynamic Type, Reduce Motion, contrast, and focus audit |
 
@@ -65,18 +67,28 @@ modes, not merely one compatible MP4:
 This is the release gate because simulator builds cannot validate hardware
 decode, HDR, background Now Playing, multicast discovery, or a real Siri Remote.
 
-### 2. Remove unnecessary subtitle transcodes
+### 2. Native subtitles and the accepted session tradeoff
 
-The correctness-first Apple implementation burns all selected subtitles. It
-works for every format, but a text track should not consume an encoder or alter
-the video. The durable design is an HLS master playlist with WebVTT subtitle
-renditions for text tracks and server burn-in only for bitmap tracks. Direct
-play needs either the same HLS wrapper or an AVFoundation composition that can
-present the external track. Keep one user-facing menu across both paths.
+Implemented for SRT/SubRip/WebVTT. The server advertises those tracks as HLS
+WebVTT renditions, including language, title, forced, default, and accessibility
+metadata. AVPlayer selects and disables the renditions in place, so switching a
+text track does not replace the player item, change quality, add an FFmpeg
+subtitle filter, or encode video. Resume and seek offsets are reflected in the
+rendition segment timeline.
 
-Acceptance: English SRT/ASS/VTT can be toggled instantly, does not create a
-transcode session, keeps style/position where supported, and still aligns after
-a resume or server-side seek.
+PGS, VobSub, and styled ASS/SSA still reopen at the same film position and burn
+at source height. This is intentional: those formats cannot be represented as
+ordinary WebVTT without losing pixels or important styling.
+
+For v0.2, a playable file containing native text tracks opens through a copy-HLS
+session even if its video could otherwise use the raw direct URL. That makes all
+text tracks available before the viewer opens the subtitle menu and permits
+restart-free toggles. The cost is a segmenter session for that title. A future
+direct-until-first-toggle design may remove that cost, but the first subtitle
+selection would necessarily reopen playback.
+
+The cross-client implementation handoff is
+[CLIENTS-REMEDIATION-PLAN.md](CLIENTS-REMEDIATION-PLAN.md), especially §5.4.
 
 ### 3. Add the remaining web playback controls
 

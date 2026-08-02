@@ -4,6 +4,12 @@ The Android client is the native plurx **viewer** for phones, foldables,
 tablets, Android TV, and Google TV. This page records what “web parity” means
 for that viewer and keeps server administration out of the comparison.
 
+> Status: broad viewer parity exists, but playback-contract parity with the
+> Apple client is incomplete. In particular, Android still burns and restarts
+> for server-controlled text subtitles. The build-ready handoff is
+> [CLIENTS-REMEDIATION-PLAN.md](CLIENTS-REMEDIATION-PLAN.md), beginning with
+> §5; native subtitle parity is §5.4.
+
 ## Viewer surface
 
 | Web viewer capability | Android implementation |
@@ -17,7 +23,7 @@ for that viewer and keeps server administration out of the comparison.
 | Home-video folders and photos | Folder navigation and photo viewer |
 | Resume, restart, watched/unwatched | Detail actions and progress sync |
 | Direct, remux, HLS transcode | Media3/ExoPlayer delivery-plan execution |
-| Audio/subtitle choice | Native plus server-selected track menu |
+| Audio/subtitle choice | Embedded tracks are native; server-controlled text still burns and reopens (parity work §5.4) |
 | Auto/original/fixed playback quality | Viewer preference and in-player selector |
 | Intro/credits markers | Manual skip or automatic skip |
 | Autoplay next episode | Ordered season/show traversal |
@@ -29,6 +35,32 @@ for that viewer and keeps server administration out of the comparison.
 Android also adds platform-native behavior that the browser does not provide:
 MediaSession integration, picture-in-picture, immersive playback, hardware
 media keys, and D-pad focus states.
+
+## Apple parity handoff
+
+The gap is large enough to keep out of the Apple subtitle release. The detailed
+handoff in [CLIENTS-REMEDIATION-PLAN.md](CLIENTS-REMEDIATION-PLAN.md) pins the
+wire contracts, exact files, milestones, tests, hardware matrix, rollout
+evidence, and non-goals for a separate implementation session.
+
+The subtitle milestone must preserve these outcomes:
+
+- SRT/SubRip/WebVTT sends `native_subtitles = true`, `subtitle = <index>`,
+  and no `subtitle_burn`; the selected quality and video recipe do not change.
+- Media3 switches native text tracks with `TrackSelectionOverride` and turns
+  them off by disabling `C.TRACK_TYPE_TEXT`; neither action creates a new HLS
+  session.
+- PGS, VobSub, and styled ASS/SSA use `subtitle_burn` at source height.
+- Viewer-language automatic selection treats a forced disposition and a
+  case-insensitive `Forced` title as equivalent signals. For file 5615 with
+  English preferences, subtitle index 2 wins over the Italian container
+  default.
+- The shared authenticated OkHttp data source fetches capability playlist and
+  WebVTT URLs. Session `start_seconds`, VOD state, resume, and seek handling
+  retain the source timeline.
+
+Do not side-load `/files/{id}/subs/{index}.vtt` into an offset HLS session: the
+whole-file endpoint has no resume offset and would make cue timing incorrect.
 
 ## Administrative boundary
 

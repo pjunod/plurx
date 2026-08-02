@@ -1277,8 +1277,11 @@ fn dolby_vision_hls_config(probe_json: Option<&str>) -> Option<DolbyVisionHlsCon
 fn hevc_hls_codec(probe_json: Option<&str>) -> Option<String> {
     let video = video_probe_stream(probe_json)?;
     let (profile, compatibility) = match video.get("profile")?.as_str()? {
-        "Main" => (1, "60000000"),
-        "Main 10" => (2, "20000000"),
+        // RFC 6381 writes HEVC compatibility flags in reverse bit order.
+        // Apple's HLS appendix consequently spells these `1.6` and `2.4`,
+        // not the raw ffprobe/HEVC bit masks `60000000` and `20000000`.
+        "Main" => (1, "6"),
+        "Main 10" => (2, "4"),
         _ => return None,
     };
     let level = video.get("level")?.as_u64()?;
@@ -4989,7 +4992,7 @@ mod tests {
                 ),
             ),
             (
-                "hvc1.2.20000000.L150.B0,ec-3".to_owned(),
+                "hvc1.2.4.L150.B0,ec-3".to_owned(),
                 Some("dvh1.08.06/db1p".to_owned())
             )
         );

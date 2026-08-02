@@ -1,9 +1,10 @@
 # Clients remediation plan — restore trust, then raise the quality ceiling
 
-**Status:** ready to build · **Executes:**
+**Status:** ready for a dedicated parity implementation session · **Executes:**
 [CLIENTS-CODE-REVIEW.md](CLIENTS-CODE-REVIEW.md) §10 as amended by
 [CLIENTS-CODE-REVIEW-ASSESSMENT.md](CLIENTS-CODE-REVIEW-ASSESSMENT.md) ·
-**Verified against:** `97176881e` + working tree, 2026-08-02 ·
+**Verified against:** Apple subtitle work through `97176881e`, deployed server
+hardening through `f93a54ac3`, and the working tree at `2d693e5d4`, 2026-08-02 ·
 **Written:** 2026-08-02
 
 This is the build document. The review holds the evidence, the assessment
@@ -13,6 +14,12 @@ re-verified against the tree at `97176881e` on 2026-08-02 before it earned a
 milestone here. If a claim below conflicts with what you find in the code,
 the code wins: re-verify, then flag the drift in your commit message rather
 than silently improvising.
+
+**Start the Android/Apple parity session at §5.** Section 5 is one ordered
+Android playback-negotiation arc; §5.4 is the direct counterpart to the native
+Apple subtitle release. Sections 4, 6, and 7 cover the remaining bidirectional
+behavior and lifecycle gaps. Do not reimplement the Apple subtitle server arc:
+its wire contract is already deployed and is pinned in §2.3.
 
 **How to work.** Milestones are numbered `§4.1`-style and ordered within
 each section; sections 4–6 are independent workstreams and may interleave,
