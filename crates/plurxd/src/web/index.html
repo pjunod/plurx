@@ -1250,6 +1250,286 @@
     [data-layout=plex] .px-tabs{border-top:1px solid CanvasText}
     [data-layout=plex] .px-foot{border-top:1px solid CanvasText}
   }
+  /* ====================== plex layout — G2b additions =======================
+     Appended to the existing plex block. Nothing here restates a G2 rule; the
+     G2 rules this file depends on being ABOVE it are:
+       [data-layout=plex] .hero{margin:-24px -28px 22px}   (and the narrow one)
+       [data-layout=plex] h2.section{...}                  (flex, sentence case)
+       [data-layout=plex] .azbar{right:8px}
+       the focus-ring list, the reduced-motion block, the forced-colours block
+     Same rules as before, same reasons:
+       - structural colour is a token mix over --panel/--bg/--accent/--line,
+         never a literal hex. The catalogue is now ten themes × light/dark
+         (classic, terminal, noirr, amber, giallo, silver, void, vhs, paper,
+         tide) and one hardcoded dark hex is a black box on five of them.
+       - every transition is inside prefers-reduced-motion:no-preference, and
+         nothing is only legible while it moves.
+       - every selector is scoped under [data-layout=plex].
+     ========================================================================= */
+
+  /* Screen-reader-only text. Used by the disabled tabs/toggle so the reason
+     they are dead is not a mouse-only tooltip. */
+  [data-layout=plex] .px-sr{
+    position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;
+    clip:rect(0 0 0 0);clip-path:inset(50%);white-space:nowrap;border:0}
+
+  /* ---- library: Library / Collections / Categories ----------------------- */
+  [data-layout=plex] .px-ltabs{
+    display:flex;align-items:flex-end;gap:4px;margin:2px 2px 14px;
+    border-bottom:1px solid var(--line);flex-wrap:wrap}
+  [data-layout=plex] .px-ltab{
+    display:inline-flex;align-items:center;gap:7px;
+    padding:8px 12px 9px;margin-bottom:-1px;
+    font:600 13.5px/1.2 var(--font);color:var(--muted);
+    border-bottom:2px solid transparent}
+  [data-layout=plex] a.px-ltab:hover{color:var(--text)}
+  /* Selected: an underline AND a weight AND a colour. Three signals, because
+     the underline is the only one that survives forced colours and the only
+     one that reads for someone who cannot separate accent from muted. */
+  [data-layout=plex] .px-ltab.on{
+    color:var(--text);font-weight:700;border-bottom-color:var(--accent)}
+  /* Not ready. Grey is the least of it: the cursor says no, the "soon" chip
+     says why in one word, title= and .px-sr say why in a sentence, and the
+     element is a <span> so there is nothing to press or tab to. */
+  [data-layout=plex] .px-ltab.off,
+  [data-layout=plex] .px-vt.off{
+    color:color-mix(in srgb, var(--muted) 62%, transparent);
+    cursor:not-allowed;user-select:none}
+  [data-layout=plex] .px-soon{
+    font:700 9px/1 var(--font-mono);letter-spacing:.1em;text-transform:uppercase;
+    padding:3px 5px;border-radius:999px;
+    color:var(--muted);
+    background:color-mix(in srgb, var(--panel2) 70%, transparent);
+    border:1px dashed color-mix(in srgb, var(--muted) 45%, transparent)}
+
+  /* ---- library: toolbar -------------------------------------------------- */
+  /* The shipped .libbar is a space-between row; plex keeps that and only
+     tightens it against the tab strip above, which now carries the page
+     identity the bar used to have to. */
+  [data-layout=plex] .px-libbar{margin-top:0}
+  [data-layout=plex] .px-libbar .row{gap:8px;flex-wrap:wrap;align-items:center}
+  [data-layout=plex] .px-libbar #libcount{white-space:nowrap}
+  /* Grid / List. A segmented control in shape, but only one segment is a
+     state and the other is disabled — see .px-ltab.off above. */
+  [data-layout=plex] .px-view{
+    display:inline-flex;align-items:center;gap:2px;margin-right:6px;
+    padding:2px;border:1px solid var(--line);
+    border-radius:max(0px, calc(var(--radius) - 4px));
+    background:color-mix(in srgb, var(--panel2) 55%, transparent)}
+  [data-layout=plex] .px-vt{
+    display:inline-flex;align-items:center;gap:6px;padding:5px 10px;
+    font:600 12.5px/1 var(--font);color:var(--muted);
+    border-radius:max(0px, calc(var(--radius) - 6px))}
+  [data-layout=plex] .px-vt.on{
+    color:var(--text);background:var(--panel);
+    box-shadow:0 1px 2px color-mix(in srgb, var(--bg) 55%, transparent)}
+  [data-layout=plex] .px-vt .px-soon{font-size:8.5px;padding:2px 4px}
+
+  /* ---- library: the grid row and the A–Z scrubber ------------------------
+     #libbody and #librail are siblings the SHELL owns. The loader only ever
+     rewrites their innerHTML, so the row — and the document scroll position
+     with it — survives every batch. #libbody is not itself a scroller: the
+     window is, exactly as in classic, which is what keeps the shipped
+     scroll-spy (one window listener) and alphaJump()'s scrollIntoView working
+     and keeps the pager reachable. */
+  [data-layout=plex] .px-libwrap{display:block}
+  [data-layout=plex] .px-libwrap>#libbody{min-width:0}
+  /* An empty rail is a real state (a non-title sort, or a library whose titles
+     all start with the same letter) and an empty flex item still eats the gap. */
+  [data-layout=plex] .px-librail:empty{display:none}
+  @media (min-width:900px){
+    [data-layout=plex] .px-libwrap{display:flex;align-items:flex-start;gap:12px}
+    [data-layout=plex] .px-libwrap>#libbody{flex:1 1 auto}
+    /* The rail moves out of the viewport gutter and onto the right edge of the
+       CONTENT — plex's own idiom, and it stops the scrubber from floating over
+       the pager and the page footer on a short library. Sticky rather than
+       fixed so it rides with the grid it describes. */
+    [data-layout=plex] .px-librail{
+      flex:0 0 auto;position:sticky;top:14px;z-index:15}
+    [data-layout=plex] .px-librail .azbar{
+      position:static;transform:none;top:auto;right:auto;
+      background:color-mix(in srgb, var(--panel) 78%, var(--bg));
+      border:1px solid var(--line);
+      border-radius:max(0px, calc(var(--radius) - 2px))}
+  }
+  /* The active letter ships as white-on-accent, which is a guess about the
+     accent that is wrong on the light themes whose accent is pale. --btn-ink
+     is the token that means "text on an accent fill" and every theme sets it. */
+  [data-layout=plex] .azbar button.active{color:var(--btn-ink)}
+
+  /* ---- detail: the backdrop hero ---------------------------------------- */
+  /* The backdrop fills the hero rather than the shipped fixed 360px. Both were
+     tried: a fixed height overflows the hero on a page with little metadata
+     (the scrim's last stop is opaque --bg, so it painted over the first version
+     card — caught in the harness, not reasoned about), and clipping it with
+     overflow:hidden leaves a hard edge where the picture stops. Tying it to
+     the hero's own box means the fade always lands exactly on the seam.
+     .herobg keeps its shipped mask, opacity and the noirr grain overlay. */
+  [data-layout=plex] .px-hero .herobg{height:100%}
+  /* The scrim. A --bg mix, so on Paper-light or Silver-light it LIGHTENS the
+     bottom of the backdrop into the page instead of painting the black band
+     that the 2026-07-22 regression shipped. Three stops: a flat wash for
+     legibility, the fade into the page, and a soft left edge under the poster. */
+  [data-layout=plex] .px-scrim{
+    position:absolute;inset:0;pointer-events:none;
+    background:
+      linear-gradient(180deg,
+        color-mix(in srgb, var(--bg) 18%, transparent) 0%,
+        color-mix(in srgb, var(--bg) 62%, transparent) 58%,
+        var(--bg) 100%),
+      linear-gradient(90deg,
+        color-mix(in srgb, var(--bg) 45%, transparent) 0%,
+        transparent 62%)}
+  /* No backdrop, no scrim: a gradient to --bg over --bg is invisible work, and
+     on the themes with a --shadow token it is a faint band for no reason. */
+  [data-layout=plex] .px-hero.px-noart .px-scrim{display:none}
+  [data-layout=plex] .px-hero .dwrap{
+    grid-template-columns:212px minmax(0,1fr);gap:32px;
+    padding:38px 28px 26px;max-width:1240px;margin:0}
+  [data-layout=plex] .px-hero .poster{border-radius:var(--radius)}
+  /* Oversized title, and it has to survive a 68-character one: anywhere-break
+     rather than a clip, because a detail page that hides half its own title is
+     worse than a page with a three-line heading. */
+  [data-layout=plex] .px-hero .dhead h1{
+    font-size:clamp(26px,3.6vw,44px);line-height:1.04;letter-spacing:-.02em;
+    font-weight:800;margin:6px 0 12px;overflow-wrap:anywhere}
+  /* The kicker plex puts above the title: the item's kind, which classic
+     carries as a pill in the middle of the metadata row. */
+  [data-layout=plex] .px-kick{
+    font:700 11px/1 var(--font-mono);letter-spacing:.18em;text-transform:uppercase;
+    color:var(--accent);margin:14px 0 0}
+  /* Metadata as pills. The shipped .chips is a plain flex row of bare spans;
+     plex gives each span the .pill treatment without touching the markup. */
+  [data-layout=plex] .px-hero .chips>span{
+    padding:3px 11px;border-radius:999px;
+    border:1px solid color-mix(in srgb, var(--line) 90%, var(--text));
+    background:color-mix(in srgb, var(--panel) 60%, transparent);
+    color:var(--text)}
+  [data-layout=plex] .px-hero .chips{margin-top:2px}
+  [data-layout=plex] .px-hero .px-tags{margin-top:8px}
+  [data-layout=plex] .px-hero .px-tags>span{
+    color:var(--muted);background:transparent;
+    border-style:dashed}
+  [data-layout=plex] .px-hero .overview{max-width:64ch}
+  /* The Play lockup: a pill, weightier, with a bloom in the theme accent (the
+     "amber Play" of §3.2 is the Amber theme's --accent — no colour is spelled
+     out here, so every theme gets its own). */
+  [data-layout=plex] .px-hero .btnplay{
+    border-radius:999px;padding:12px 26px;font-weight:750;font-size:15.5px;
+    box-shadow:0 6px 20px color-mix(in srgb, var(--accent) 34%, transparent)}
+  [data-layout=plex] .px-hero .actions .ghost{border-radius:999px;padding:10px 18px}
+  [data-layout=plex] .px-hero .actions{margin-top:22px}
+  /* Admin buttons ride inside the h1, which is now up to 44px — button{font:
+     inherit} would blow them up to match. .sm sets 13px; this pins the line
+     box so a two-button h1 does not become three lines tall. */
+  [data-layout=plex] .px-hero .dhead h1 .ghost.sm{
+    font-size:13px;line-height:1.2;vertical-align:middle;font-weight:600}
+
+  /* ---- detail: everything below the hero -------------------------------- */
+  /* Version cards, episode lists and children grids get the full width here
+     rather than the hero's text column. */
+  [data-layout=plex] .px-detail{max-width:1240px;margin:0;padding:0 8px 8px}
+  [data-layout=plex] .px-detail>h2.section:first-child{margin-top:4px}
+  [data-layout=plex] .px-detail .version{
+    border-radius:max(0px, calc(var(--radius) - 1px));
+    background:color-mix(in srgb, var(--panel) 88%, var(--bg))}
+  [data-layout=plex] .px-detail .eplist{border-radius:max(0px, calc(var(--radius) - 1px))}
+  [data-layout=plex] .px-photo{display:block;margin:4px 0 0}
+
+  /* ============================ television =================================
+     Same test surfaceClass() uses for "tv" — this is the query the G2 block
+     already uses, repeated verbatim so the two can never disagree.
+
+     No admin surfaces on a television (proposal rule, and the plan's TV mockup
+     caption: "no admin anywhere"). This is a media query and not a JS branch
+     for the same reason the rest of the layout is: it is a statement about the
+     surface, it updates live, and it cannot go stale behind a render.
+     display:none also takes each of these out of the tab order, so a D-pad
+     cannot land on one — which `visibility` or an opacity trick would not.
+
+     What is hidden: the sidebar Settings row, the Settings entry in the
+     account popover, the Edit / Refresh-artwork buttons on a detail page, the
+     Reanalyze button in an unprobed-file note, and the "Add one in Settings"
+     link in the empty-home state. What is NOT hidden, and is flagged in
+     NOTES §5: the admin-only file PATHS that classicItemBody and .problem
+     print. Those are disclosures rather than affordances, they are gated on
+     ME.is_admin inside shipped helpers, and blanking them from CSS would
+     leave the sentence around them dangling. */
+  @media (pointer:none), (hover:none) and (pointer:coarse) and (min-width:1280px){
+    [data-layout=plex] .px-nav a[href="#/settings"],
+    [data-layout=plex] .px-admin,
+    [data-layout=plex] .unprobed button,
+    [data-layout=plex] .empty a[href="#/settings"],
+    /* Couples to profileMenuHtml()'s shipped markup: the Settings entry is the
+       one button in the popover whose handler routes to #/settings. */
+    [data-layout=plex] #profilemenu button[onclick*="#/settings"]{display:none}
+    /* The tab strip and the toolbar are readable from a sofa or they are not
+       there at all. */
+    [data-layout=plex] .px-ltab{font-size:16px;padding:10px 16px 11px}
+    [data-layout=plex] .px-vt{font-size:15px}
+    [data-layout=plex] .px-hero .dwrap{padding:44px 40px 30px}
+  }
+
+  /* ============================= narrow / phone ============================ */
+  @media (max-width:899px){
+    [data-layout=plex] .px-ltabs{
+      margin:0 0 12px;gap:2px;flex-wrap:nowrap;overflow-x:auto;
+      scrollbar-width:none;-webkit-overflow-scrolling:touch}
+    [data-layout=plex] .px-ltabs::-webkit-scrollbar{display:none}
+    [data-layout=plex] .px-ltab{white-space:nowrap;padding:9px 10px}
+    [data-layout=plex] .px-libbar .row{gap:6px}
+    /* Below 900px the rail is the shipped viewport-edge scrubber again (the
+       min-width:900px block above simply does not apply), so the row is a
+       plain block and #librail contributes nothing to the flow. */
+    [data-layout=plex] .px-hero .dwrap{padding:22px 14px 18px;gap:18px}
+    [data-layout=plex] .px-hero .dhead h1{font-size:clamp(22px,6.4vw,30px)}
+    [data-layout=plex] .px-hero .btnplay{width:100%;justify-content:center}
+    [data-layout=plex] .px-detail{padding:0}
+  }
+  @media (max-width:720px){
+    /* .dwrap collapses to one column at 720px (shipped), and a 212px poster
+       above a 30px title reads as a card, not a hero. */
+    [data-layout=plex] .px-hero .dwrap{grid-template-columns:minmax(0,1fr)}
+    [data-layout=plex] .px-hero .poster{max-width:148px}
+  }
+
+  /* ============================ reduced motion ============================= */
+  @media (prefers-reduced-motion: no-preference){
+    [data-layout=plex] .px-ltab{transition:color .12s ease-out, border-color .12s ease-out}
+    [data-layout=plex] .px-hero .btnplay{transition:box-shadow .14s ease-out, transform .12s ease-out}
+    [data-layout=plex] .px-hero .btnplay:hover{transform:translateY(-1px)}
+  }
+
+  /* ============================ forced colours =============================
+     The three new pieces of state that are carried by colour and would
+     otherwise vanish: the selected tab, the disabled controls, and the
+     scrubber's in-flow frame. */
+  @media (forced-colors: active){
+    [data-layout=plex] .px-ltabs{border-bottom:1px solid CanvasText}
+    [data-layout=plex] .px-ltab.on{border-bottom:3px solid Highlight;color:CanvasText}
+    /* GrayText is the system colour that MEANS disabled, and the only one a
+       forced-colours user's own palette maps to that idea. */
+    [data-layout=plex] .px-ltab.off,
+    [data-layout=plex] .px-vt.off{color:GrayText}
+    [data-layout=plex] .px-soon{border:1px dashed GrayText;color:GrayText}
+    [data-layout=plex] .px-view{border:1px solid CanvasText}
+    [data-layout=plex] .px-vt.on{border:1px solid Highlight}
+    [data-layout=plex] .px-librail .azbar{border:1px solid CanvasText;background:Canvas}
+    [data-layout=plex] .azbar button.active{
+      background:Highlight;color:HighlightText;forced-color-adjust:none}
+    [data-layout=plex] .azbar .off{color:GrayText}
+    /* The backdrop is a background IMAGE, which forced colours does not
+       repaint — it survives as the one author-coloured thing on the page, with
+       an oversized title sitting on it. Chromium's text backplate keeps that
+       legible, but a backplate behind every line of a synopsis is not reading;
+       the picture is decoration, so it goes, and the scrim with it. */
+    [data-layout=plex] .px-hero .herobg,
+    [data-layout=plex] .px-scrim{display:none}
+    /* The pills are not decoration — without a border they collapse into a
+       run-on line of words. */
+    [data-layout=plex] .px-hero .chips>span{border:1px solid CanvasText;background:Canvas}
+    [data-layout=plex] .px-kick{color:CanvasText}
+  }
 </style>
 <script>
 // Theme engine. Runs in <head> before first paint so there's no flash of the
@@ -1468,8 +1748,29 @@ const tok = u => u + (u.includes("?")?"&":"?") + "token=" + encodeURIComponent(T
 // pages that otherwise wouldn't fetch it (an item page has to know whether its
 // library is a home library before it offers an edit button).
 let LIBS_CACHE=null;
-async function libsCached(){ if(!LIBS_CACHE) LIBS_CACHE=await api("/libraries"); return LIBS_CACHE; }
-function invalidateLibs(){ LIBS_CACHE=null; }
+// Filling the cache is a change to the library list too, not just clearing it.
+// Chrome paints before a route fetches, so on a cold load — someone opening an
+// item deep-link in a new tab — a layout whose navigation is derived from this
+// list draws it empty and would never hear that the answer had arrived. Same
+// hook as invalidateLibs(); it fires on the transition either way.
+async function libsCached(){
+  if(!LIBS_CACHE){
+    LIBS_CACHE=await api("/libraries");
+    const L=LAYOUTS[layoutId()];
+    if(L&&L.libsChanged) L.libsChanged();
+  }
+  return LIBS_CACHE;
+}
+// Dropping the cache is only half the job: a layout may hold its own view
+// DERIVED from that list (plex's sidebar), and a derived cache nobody
+// invalidates repaints the library you just deleted. The hook is generic and
+// optional — classic defines none — so one layout's variable never has to
+// appear in a function every layout calls.
+function invalidateLibs(){
+  LIBS_CACHE=null;
+  const L=LAYOUTS[layoutId()];
+  if(L&&L.libsChanged) L.libsChanged();
+}
 function toast(msg){ const t=document.getElementById("toast"); t.textContent=msg; t.classList.add("show"); setTimeout(()=>t.classList.remove("show"),2200); }
 // Short browser label for diagnostics. Order matters: Edge's UA contains
 // "Chrome"+"Safari"; Chrome's contains "Safari" — so test most-specific first.
@@ -2274,7 +2575,13 @@ async function viewHome(){
 // anything it does not supply falls through to classic's, so a new layout is
 // only as big as the parts it actually changes.
 LAYOUTS.classic.chrome=classicChrome;
-LAYOUTS.classic.views={home:classicHomeBody};
+LAYOUTS.classic.views={
+  home:classicHomeBody,
+  item:classicItemBody,
+  // Region-shaped rather than a single function: library is the app's one
+  // incremental route (§3.2) and its regions are redrawn independently.
+  library:{shell:classicLibraryShell, items:classicLibraryItems, count:classicLibraryCount},
+};
 // Resolve through the active layout, then classic. Two lookups rather than one
 // because a layout that only redefines Home must still get the classic body for
 // every route it has not converted — a missing renderer is normal, not an error.
@@ -2286,6 +2593,16 @@ function layoutView(name, page){
   const L=LAYOUTS[layoutId()];
   const fn=(L&&L.views&&L.views[name])||LAYOUTS.classic.views[name];
   return fn(page);
+}
+// Region resolution for incremental routes. Falls back per REGION, not per
+// view: a layout that only wants its own shell (to move the A-Z rail mount, or
+// to add a tab strip) inherits classic's items and count untouched, which is
+// the difference between overriding a detail and reimplementing a route.
+function layoutRegion(name, region, model){
+  const L=LAYOUTS[layoutId()];
+  const own=L&&L.views&&L.views[name];
+  const fn=(own&&own[region])||LAYOUTS.classic.views[name][region];
+  return fn(model);
 }
 // Classic's Home body — byte-for-byte the markup this app has always emitted.
 // It is the zero-diff baseline every other layout is measured against, so this
@@ -2535,6 +2852,56 @@ async function eachItemPage(libIds, sort, gen, onBatch){
 // which libraries they read and what their controls re-invoke — and a grid that
 // pages correctly in one of them and not the other is exactly the kind of
 // difference nobody notices until a library gets big.
+// Classic's library shell: the sort/filter/per-page bar, the page head, and
+// the three region mounts. Rendered ONCE per entry — see the note on the
+// piecewise contract above libraryView().
+function classicLibraryShell(m){
+  const sort=m.sort;
+  const bar=`<div class="libbar">
+    <div class="row">
+      <span class="lbl">Sort</span>
+      <select onchange="LIB_SORT=this.value;${m.reload}">
+        ${libOpt("title","Title (A–Z)",sort)}${libOpt("added","Recently added",sort)}${libOpt("recorded","Date recorded",sort)}${libOpt("year","Year",sort)}${libOpt("resolution","Resolution",sort)}</select>
+      <span class="lbl" style="margin-left:8px">Show</span>
+      <select onchange="LIB_FILTER=this.value;${m.reload}">
+        ${libOpt("all","Everything",LIB_FILTER)}${libOpt("unwatched","Unwatched",LIB_FILTER)}${libOpt("inprogress","In progress",LIB_FILTER)}${libOpt("watched","Watched",LIB_FILTER)}</select>
+      <span class="lbl" style="margin-left:8px">Per page</span>
+      <select onchange="setPerPage(this.value);libGoPage(0)">
+        ${LIB_SIZES.map(n=>libOpt(String(n),String(n),String(LIB_PER))).join("")}${libOpt("all","All",String(LIB_PER))}</select>
+    </div>
+    <span class="muted" id="libcount" style="font-size:13px"></span></div>`;
+  const head=pageHead([{href:"#/",label:"Home"},{label:m.title}],m.title);
+  return `${head}${bar}<div id="libbody"><div class="empty">Loading…</div></div>`+
+    `<div id="libpager"></div><div id="librail"></div>`;
+}
+// The items region. Re-rendered per arriving batch into #libbody, which is why
+// it must never include the scroll container itself.
+function classicLibraryItems(m){
+  return m.items.length
+    ? (m.sort==="resolution"? resSections(m.items) : grid(m.items))
+    : (m.done? `<div class="empty">Nothing matches this filter.</div>`
+             : `<div class="empty">Loading…</div>`);
+}
+// The count region. While loading it says so rather than showing a number about
+// to change — a count that ticks upward reads as items appearing from nowhere.
+function classicLibraryCount(m){
+  return !m.done
+    ? `<span class="muted">loading… ${m.loaded}${m.total?` of ${m.total}`:""}</span>`
+    : m.pages>1
+      ? `${m.from+1}–${m.from+m.items.length} of ${m.shown}${m.shown!==m.total?` (${m.total} in all)`:""}`
+      : m.shown!==m.total
+        ? `${m.shown} of ${m.total} items`
+        : `${m.shown} item${m.shown===1?'':'s'}`;
+}
+// The shared body of both library views: a sort/filter bar, a grid that grows
+// as pages land, and an A–Z rail.
+//
+// This is the app's one INCREMENTAL route, and that is why it uses the
+// region-shaped seam (§3.2) rather than home's single body builder. Pages
+// arrive in a loop and only the regions that changed are rewritten; a
+// `body(model) → html` contract would replace the whole body on every batch
+// and throw away the reader's scroll position each time a page landed, which
+// is precisely the behaviour the piecewise draw exists to avoid.
 async function libraryView(o){
   layoutChrome("home",`<div class="empty">Loading…</div>`);
   const gen=++LIB_LOAD;
@@ -2543,24 +2910,9 @@ async function libraryView(o){
   // Paging itself does not come through here; `libGoPage` redraws in place.
   LIB_PAGE_AT=0;
   const sort=o.sort;
-  const bar=`<div class="libbar">
-    <div class="row">
-      <span class="lbl">Sort</span>
-      <select onchange="LIB_SORT=this.value;${o.reload}">
-        ${libOpt("title","Title (A–Z)",sort)}${libOpt("added","Recently added",sort)}${libOpt("recorded","Date recorded",sort)}${libOpt("year","Year",sort)}${libOpt("resolution","Resolution",sort)}</select>
-      <span class="lbl" style="margin-left:8px">Show</span>
-      <select onchange="LIB_FILTER=this.value;${o.reload}">
-        ${libOpt("all","Everything",LIB_FILTER)}${libOpt("unwatched","Unwatched",LIB_FILTER)}${libOpt("inprogress","In progress",LIB_FILTER)}${libOpt("watched","Watched",LIB_FILTER)}</select>
-      <span class="lbl" style="margin-left:8px">Per page</span>
-      <select onchange="setPerPage(this.value);libGoPage(0)">
-        ${LIB_SIZES.map(n=>libOpt(String(n),String(n),String(LIB_PER))).join("")}${libOpt("all","All",String(LIB_PER))}</select>
-    </div>
-    <span class="muted" id="libcount" style="font-size:13px"></span></div>`;
   setOrigin(o.href,o.title);
-  const head=pageHead([{href:"#/",label:"Home"},{label:o.title}],o.title);
   document.getElementById("main").innerHTML=
-    `${head}${bar}<div id="libbody"><div class="empty">Loading…</div></div>`+
-    `<div id="libpager"></div><div id="librail"></div>`;
+    layoutRegion("library","shell",{kind:"library",title:o.title,href:o.href,sort,reload:o.reload});
 
   let all=[], total=0;
   const draw=(done)=>{
@@ -2580,27 +2932,22 @@ async function libraryView(o){
     const from=LIB_PER==="all"?0:LIB_PAGE_AT*LIB_PER;
     const page=LIB_PER==="all"?items:items.slice(from, from+LIB_PER);
 
-    body.innerHTML = page.length
-      ? (sort==="resolution"? resSections(page) : grid(page))
-      : (done? `<div class="empty">Nothing matches this filter.</div>`
-             : `<div class="empty">Loading…</div>`);
+    // One model, three regions. `loaded` is the raw arrival count and `shown`
+    // the count after filtering — the loading line reports the former because
+    // it is describing progress, not results.
+    const m={kind:"library", title:o.title, href:o.href, sort, filter:LIB_FILTER,
+      per:LIB_PER, pageAt:LIB_PAGE_AT, pages, from, items:page,
+      loaded:all.length, shown, total, done, reload:o.reload};
+    body.innerHTML=layoutRegion("library","items",m);
     const pager=document.getElementById("libpager");
     if(pager) pager.innerHTML = done? pagerHtml(shown) : "";
-    // The A–Z rail maps to what is on screen, so it describes this page.
+    // The A–Z rail maps to what is on screen, so it describes this page. Its
+    // mount is placed by the shell, so a layout that wants it on the right edge
+    // moves the mount rather than reimplementing the rail.
     const rail=document.getElementById("librail");
     if(rail) rail.innerHTML=alphaRailHtml(page);
     const count=document.getElementById("libcount");
-    if(count){
-      // While loading, say so rather than showing a number about to change —
-      // a count that ticks upward reads as items appearing from nowhere.
-      count.innerHTML = !done
-        ? `<span class="muted">loading… ${all.length}${total?` of ${total}`:""}</span>`
-        : pages>1
-          ? `${from+1}–${from+page.length} of ${shown}${shown!==total?` (${total} in all)`:""}`
-          : shown!==total
-            ? `${shown} of ${total} items`
-            : `${shown} item${shown===1?'':'s'}`;
-    }
+    if(count) count.innerHTML=layoutRegion("library","count",m);
     tagAlpha(page);
   };
 
@@ -2767,21 +3114,44 @@ function episodeRow(ep){
 // Set by an episode-row play button so the target item auto-plays on arrival.
 let AUTOPLAY=null;
 
-async function viewItem(id){
-  layoutChrome("home",`<div class="empty">Loading…</div>`);
+// Item detail is a whole-body route (§3.2): one fetch, one model, one render.
+// The file-to-item mapping is registered here rather than in a renderer — the
+// player resolves it later regardless of which layout drew the page, so it is
+// data, not presentation, and a layout that forgot to do it would break
+// playback rather than just look different.
+async function loadItem(id){
   const [d, libs]=await Promise.all([api(`/items/${id}`), libsCached()]);
   const it=d.item;
   const lib=libs.find(l=>l.id===it.library_id);
-  // Metadata editing is a home-library affair: elsewhere the provider agent
-  // owns the fields and would overwrite a hand edit on the next refresh.
-  const editable = ME&&ME.is_admin&&lib&&lib.kind==="home";
+  d.files.forEach(f=>ITEM_FOR_FILE[f.id]=Number(id));
+  return {kind:"item", id:Number(id), item:it, files:d.files,
+    ancestors:d.ancestors||[], children:d.children||[], lib,
+    // Metadata editing is a home-library affair: elsewhere the provider agent
+    // owns the fields and would overwrite a hand edit on the next refresh.
+    editable: !!(ME&&ME.is_admin&&lib&&lib.kind==="home")};
+}
+async function viewItem(id){
+  layoutChrome("home",`<div class="empty">Loading…</div>`);
+  const page=await loadItem(id);
+  document.getElementById("main").innerHTML=layoutView("item",page);
+  // One-click play from an episode list lands here and starts immediately.
+  if(AUTOPLAY===Number(id)){
+    AUTOPLAY=null;
+    const it=page.item, pf=page.files.find(f=>f.available);
+    if(pf){ const r=it.watch&&it.watch.position_ms>3000&&!it.watch.watched?it.watch.position_ms:0;
+      play(pf.id, it.title, r, pf.duration_ms||0, playerMeta(it, page.ancestors)); }
+  }
+}
+// Classic's item body — byte-for-byte what this app has always emitted.
+function classicItemBody(p){
+  const d={files:p.files, ancestors:p.ancestors, children:p.children};
+  const it=p.item, id=p.id, editable=p.editable;
   // Offered on every item, not only the ones that look broken: an admin who
   // wants a different poster than the one that landed has no other way to ask
   // for it short of refreshing the whole library.
   const artBtn = ME&&ME.is_admin
     ? ` <button class="ghost sm" title="Re-fetch this item's poster and backdrop" aria-label="Refresh artwork" onclick="refreshArtwork(${it.id},this)">⟳ Refresh artwork</button>`
     : '';
-  d.files.forEach(f=>ITEM_FOR_FILE[f.id]=Number(id));
 
   // Breadcrumb trail: Home / <list you came from> / Show / Season / …, every
   // level clickable. The middle entry is what makes "back" return to the full
@@ -2874,7 +3244,7 @@ async function viewItem(id){
   }
 
   const bg=it.backdrop?`<div class="herobg" style="background-image:url(${esc(tok(it.backdrop))})"></div>`:'';
-  document.getElementById("main").innerHTML=`<div class="hero">${bg}
+  return `<div class="hero">${bg}
     <div class="dwrap">
       <div class="poster">${artHtml(it)}</div>
       <div class="dhead">${crumbs}<h1>${esc(it.title)}${editable?` <button class="ghost sm" title="Edit details" aria-label="Edit details" onclick='openEdit(${esc(JSON.stringify(it))})'>✎ Edit</button>`:''}${artBtn}</h1>
@@ -2884,14 +3254,6 @@ async function viewItem(id){
         ${it.overview?`<p class="overview">${esc(it.overview)}</p>`:''}
         ${body}</div>
     </div></div>`;
-
-  // One-click play from an episode list lands here and starts immediately.
-  if(AUTOPLAY===Number(id)){
-    AUTOPLAY=null;
-    const pf=d.files.find(f=>f.available);
-    if(pf){ const r=it.watch&&it.watch.position_ms>3000&&!it.watch.watched?it.watch.position_ms:0;
-      play(pf.id, it.title, r, pf.duration_ms||0, playerMeta(it, d.ancestors)); }
-  }
 }
 
 // ---- edit details (home libraries, admin) ---------------------------------
@@ -7011,6 +7373,314 @@ LAYOUTS.plex={name:"Plex", surfaces:["desktop","mobile","tv"], chrome:plexChrome
 // The tidier fix is a {name,surfaces} stub for plex in the <head> registry
 // beside classic's, which is where the pre-paint pass expects to find it —
 // that is an edit to the <head> script, outside this fragment.
+
+// ---- layout: plex — G2b: item detail, library, and the three logged defects
+//
+// Paste into the body <script>, after the G2 plex block (it extends the same
+// LAYOUTS.plex object) and before boot().
+//
+// What this file deliberately does NOT contain, same as the G2 drop: a card
+// renderer, a rail renderer, a grid renderer, an escape function, or a fetch.
+// Both new views are compositions of shipped helpers — pageHead, artHtml,
+// specBadges, specBlock, unprobedNote, watchControls, episodeRow, grid,
+// playerMeta, fmtDur, endsAt, esc — wearing plex CSS. A second card function
+// is how five layouts become five apps.
+//
+// Two seam shapes, per §3.2:
+//   views.item     whole-body     (page) -> html for #main
+//   views.library  region-shaped  {shell, items, count}, resolved PER REGION
+// plex overrides `shell` only. `items` and `count` are inherited from classic
+// untouched, because plex does not differ from classic about what a grid of
+// posters or the word "items" is — see NOTES §3.
+
+// ---------------------------------------------------------------------------
+// 1. stickyFloor — where the layout's own chrome stops and content begins.
+// ---------------------------------------------------------------------------
+// The A–Z scroll-spy asks "which letter is at the top of the reading area?" and
+// needs a viewport y to measure against. classic answers with header.top's
+// bottom; plex has no header.top on desktop, so the shipped fallback (56px)
+// highlights a letter a row too late.
+//
+// plex has three shapes and this returns the truth for each:
+//   desktop  the sidebar is a full-height column BESIDE the content and
+//            nothing is pinned above the grid           -> 0
+//   narrow   the same element re-flows into a sticky top header (the CSS at
+//            max-width:899px)                           -> its measured bottom
+//   tv       the sidebar is a fixed full-height rail on the LEFT -> 0
+//
+// Measured, not a constant and not a media-query branch: the narrow header
+// wraps to two or three rows depending on whether the status pill and the
+// Get-app button are in it, so the only honest answer is the element's own
+// rect. It is also the same answer whether the window was resized or the page
+// re-rendered, which a JS surface branch would not be.
+function plexStickyFloor(){
+  const side=document.querySelector(".px-side");
+  if(!side) return 0;                                  // chrome not painted yet
+  const r=side.getBoundingClientRect();
+  const vh=window.innerHeight||0;
+  // A full-height element is the desktop column or the TV rail: it is beside
+  // the content, not above it, so it floors nothing.
+  if(!vh || r.height>=vh*0.6) return 0;
+  // A short band that is not pinned to the top edge is not acting as chrome
+  // above the content either (it has scrolled away, or it is hidden).
+  if(r.top>2 || r.bottom<=0) return 0;
+  return Math.max(0, r.bottom);
+}
+
+// ---------------------------------------------------------------------------
+// 2. PLEX_NAV staleness after invalidateLibs()  (logged defect, NOTES §5.7)
+// ---------------------------------------------------------------------------
+// invalidateLibs() is the app's single "the library list changed" signal —
+// renaming, adding or deleting a library in Settings all call it and then
+// re-enter viewSettings(), which calls layoutChrome() and therefore
+// plexFillNav(). Everything needed to repaint already happens; the only thing
+// missing is that PLEX_NAV, a cache DERIVED from the home model, is not part of
+// what gets invalidated, so the sidebar repaints from a list that still
+// contains the library you just deleted.
+//
+// The mechanism is the one the app just grew for stickyFloor: ask the layout if
+// it defines a hook. `LAYOUTS[cur].libsChanged()` is the sibling of
+// `LAYOUTS[cur].stickyFloor()` — optional, absent on classic, and it keeps
+// layout-specific names out of shared code (the alternative, `PLEX_NAV=null`
+// inside invalidateLibs(), puts one layout's variable in a function every
+// layout calls). See NOTES §4 for the two other candidates and why not.
+function plexLibsChanged(){
+  PLEX_NAV=null;        // the derived cache, not the source
+  plexFillNav();        // idempotent by construction — safe here and again on render
+}
+
+// ---------------------------------------------------------------------------
+// 4. Library — shell only (items and count are inherited from classic)
+// ---------------------------------------------------------------------------
+// The shell is rendered ONCE per entry into #main and owns the frame: page
+// head, the Library/Collections/Categories tabs, the toolbar, and the three
+// region mounts (#libbody, #libpager, #librail). It must never be re-rendered
+// per batch, and #libbody's contents — not #libbody itself — are what the
+// loader replaces as pages land. That is the whole reason this route is
+// region-shaped: a 200-item library redraws its grid five or six times while
+// loading, and a body(model) contract would take the reader's scroll position
+// with it every time.
+//
+// plex moves the A–Z rail out of the viewport gutter and into the content row
+// (mount placement, not a reimplementation — the rail markup is still
+// alphaRailHtml()'s), which is the mount-moving the seam exists to allow.
+//
+// The scroller stays the WINDOW, as in classic. Making #libbody an
+// `overflow:auto` box would satisfy a literal reading of "#libbody is the thing
+// that scrolls", but it would silently kill the shipped scroll-spy (one window
+// listener, and scroll events do not bubble), and it would make the page head
+// and the pager unreachable while reading the grid. What the contract is
+// actually protecting is that the scroll CONTAINER survives a batch, and it
+// does: the container is the document, the shell is not rebuilt, and only
+// #libbody's innerHTML changes. Proven in the harness, not asserted — NOTES §8.
+
+// Why a tab or a control is dead, in plain words, in one place. These strings
+// are user-facing: they say what is missing and when it arrives, because a tab
+// that looks live and does nothing is worse than one that admits it isn't
+// ready.
+const PLEX_WHY_COLLECTIONS="Collections don’t exist on the server yet — there is nothing behind this tab to list. It arrives when the server learns what a collection is.";
+const PLEX_WHY_CATEGORIES="Categories needs genre data — coming with the metadata milestone.";
+const PLEX_WHY_LIST="List view needs the codec, HDR, audio and size columns, and the library response doesn’t carry them yet — coming with the browse-data milestone. Asking for them per row would be one request per item, so it stays off until the list itself carries them.";
+
+// A control that is visibly, announcedly and structurally not ready.
+//  - a <span>, so it is not focusable and not an action: there is nothing to
+//    press and nothing to land on with Tab
+//  - aria-disabled, so anything that does reach it is told
+//  - a "soon" chip, so "disabled" is not carried by grey alone
+//  - the reason in title= for the pointer, and in a visually-hidden span for
+//    everyone who never sees a tooltip
+function plexSoon(cls, label, why){
+  return `<span class="${cls} off" aria-disabled="true" title="${esc(why)}">`
+    +`${esc(label)}<span class="px-soon" aria-hidden="true">soon</span>`
+    +`<span class="px-sr"> — ${esc(why)}</span></span>`;
+}
+
+function plexLibraryShell(m){
+  const sort=m.sort;
+  // Library is the live tab and is the page you are on, so it is an <a> to
+  // this same route with aria-current — not a button that re-fetches.
+  const tabs=`<nav class="px-ltabs" aria-label="Library views">
+      <a class="px-ltab on" href="${esc(m.href)}" aria-current="page">Library</a>
+      ${plexSoon("px-ltab","Collections",PLEX_WHY_COLLECTIONS)}
+      ${plexSoon("px-ltab","Categories",PLEX_WHY_CATEGORIES)}
+    </nav>`;
+  // Grid is not a button either: it is the only view, so it is a state, not a
+  // choice. Making it pressable would promise a toggle that has one position.
+  const view=`<span class="px-view" role="group" aria-label="View">
+      <span class="px-vt on" aria-current="true"><span aria-hidden="true">▦</span> Grid</span>
+      ${plexSoon("px-vt","☰ List",PLEX_WHY_LIST)}
+    </span>`;
+  // The selects are classic's, verbatim, including the onchange strings: they
+  // are behaviour, and a layout that retypes them is a layout that can get
+  // them subtly wrong. The wrapper keeps the shipped `libbar` class because
+  // libGoPage() scrolls `#main .libbar` into view after a page change.
+  const bar=`<div class="libbar px-libbar">
+    <div class="row">
+      ${view}
+      <span class="lbl">Sort</span>
+      <select aria-label="Sort" onchange="LIB_SORT=this.value;${m.reload}">
+        ${libOpt("title","Title (A–Z)",sort)}${libOpt("added","Recently added",sort)}${libOpt("recorded","Date recorded",sort)}${libOpt("year","Year",sort)}${libOpt("resolution","Resolution",sort)}</select>
+      <span class="lbl" style="margin-left:8px">Show</span>
+      <select aria-label="Show" onchange="LIB_FILTER=this.value;${m.reload}">
+        ${libOpt("all","Everything",LIB_FILTER)}${libOpt("unwatched","Unwatched",LIB_FILTER)}${libOpt("inprogress","In progress",LIB_FILTER)}${libOpt("watched","Watched",LIB_FILTER)}</select>
+      <span class="lbl" style="margin-left:8px">Per page</span>
+      <select aria-label="Per page" onchange="setPerPage(this.value);libGoPage(0)">
+        ${LIB_SIZES.map(n=>libOpt(String(n),String(n),String(LIB_PER))).join("")}${libOpt("all","All",String(LIB_PER))}</select>
+    </div>
+    <span class="muted" id="libcount"></span></div>`;
+  const head=pageHead([{href:"#/",label:"Home"},{label:m.title}],m.title);
+  // #libbody and #librail are siblings in a row: that is how the scrubber gets
+  // to the right edge of the grid instead of the right edge of the window.
+  // #libpager sits outside the row so it stays centred under the grid.
+  return `${head}${tabs}${bar}`
+    +`<div class="px-libwrap">`
+    +`<div id="libbody"><div class="empty">Loading…</div></div>`
+    +`<div class="px-librail" id="librail"></div>`
+    +`</div><div id="libpager"></div>`;
+}
+
+// ---------------------------------------------------------------------------
+// 5. Item detail — whole body
+// ---------------------------------------------------------------------------
+// Same model, same branches, same helpers as classicItemBody, re-composed as
+// an art-forward hero: full-width backdrop under a scrim, poster + oversized
+// title, metadata as pills, accent Play lockup (§3.2). Every branch classic
+// has is here — photo, playable file, missing file, multiple versions, season
+// episode list, children grid, empty folder, rollup chips, tags, watch
+// controls, the edit and refresh-artwork admin buttons, breadcrumbs.
+//
+// The one structural difference: classic puts EVERYTHING inside the hero's
+// text column, so a 26-episode list renders in a 1fr column beside a poster.
+// plex splits the page at the natural seam — the hero carries identity and the
+// play lockup, and the detail below it (version cards, episode list, children
+// grid) gets the full width. Nothing moves between the two that changes what
+// is on the page; the file-missing warning stays WITH the play lockup because
+// it is the answer to "can I play this", not a footnote.
+function plexItemBody(p){
+  const d={files:p.files, ancestors:p.ancestors, children:p.children};
+  const it=p.item, id=p.id, editable=p.editable;
+
+  // Admin affordances. px-admin is the hook the TV surface hides them with —
+  // see the television block in styles.css and NOTES §5.
+  const artBtn = ME&&ME.is_admin
+    ? ` <button class="ghost sm px-admin" title="Re-fetch this item's poster and backdrop" aria-label="Refresh artwork" onclick="refreshArtwork(${it.id},this)">⟳ Refresh artwork</button>`
+    : '';
+  const editBtn = editable
+    ? ` <button class="ghost sm px-admin" title="Edit details" aria-label="Edit details" onclick='openEdit(${esc(JSON.stringify(it))})'>✎ Edit</button>`
+    : '';
+
+  const trail=[{href:"#/",label:"Home"}]
+    .concat(NAV_ORIGIN?[{href:NAV_ORIGIN.href,label:NAV_ORIGIN.label}]:[])
+    .concat((d.ancestors||[]).map(a=>({href:`#/item/${a.id}`,label:a.title})))
+    .concat([{label:it.title}]);
+  const crumbs=pageHead(trail);
+
+  const best=d.files[0];
+  const multi=d.files.length>1;
+  const runtime=it.runtime_ms||(best&&best.duration_ms);
+
+  // Pills. Identical content to classic's chips with one move: the KIND rides
+  // above the title as the kicker ("MOVIE", "EPISODE") the way plex labels a
+  // detail page, instead of sitting in the middle of the pill row. It is moved,
+  // never dropped — an item with a kind still says so on the page.
+  const chips=[];
+  if(it.recorded_at){ chips.push(`<span>${esc(fmtDate(it.recorded_at))}</span>`); }
+  if(it.kind==='show'){
+    const ys=(d.children||[]).map(c=>airYear(c.air_date)).filter(Boolean);
+    if(it.year) ys.push(it.year);
+    const y0=airYear(it.air_date); if(y0) ys.push(y0);
+    if(ys.length){ const lo=Math.min(...ys), hi=Math.max(...ys); chips.push(`<span>${lo}${hi>lo?'–'+hi:''}</span>`); }
+  } else if(it.kind==='season'){
+    const y=it.year||airYear(it.air_date); if(y) chips.push(`<span>${y}</span>`);
+  } else if(it.year){ chips.push(`<span>${it.year}</span>`); }
+  if(runtime) chips.push(`<span>${fmtDur(runtime)}</span>`);
+  if(it.rollup&&it.rollup.leaves){
+    const r=it.rollup;
+    chips.push(`<span>${r.watched===r.leaves?`all ${r.leaves} watched`:`${r.watched} of ${r.leaves} watched`}</span>`);
+  }
+  const kick = it.kind ? `<div class="px-kick">${esc(it.kind)}</div>` : '';
+  // Video badges show once: in the hero for a single version; per-version
+  // below when there are several.
+  const heroBadges = (best && !multi) ? specBadges(best) : "";
+
+  // `acts` lands in the hero (the play lockup and anything that answers "can I
+  // play this"); `rest` lands below it at full width.
+  let acts="", rest="";
+  if(it.kind==='photo'){
+    // A photo is a picture, not a playback session.
+    PHOTO_SET=[{id:it.id,title:it.title,recorded_at:it.recorded_at}];
+    acts=`<div class="actions"><button class="btnplay" onclick="openLightbox(${it.id})">View full size</button></div>`;
+    rest=`<img class="art px-photo" style="aspect-ratio:auto;max-height:60vh;width:auto;border-radius:var(--radius);cursor:zoom-in"
+           src="${esc(photoUrl(it.id,'thumb'))}" alt="" onclick="openLightbox(${it.id})">`;
+  } else if(d.files.length){
+    const pmeta=playerMeta(it, d.ancestors);
+    const resume=it.watch&&it.watch.position_ms>3000&&!it.watch.watched?it.watch.position_ms:0;
+    const watchBtn=watchControls(it);
+    const playable=d.files.find(f=>f.available);
+    if(playable){
+      acts=`<div class="actions">
+        <button class="btnplay" onclick='play(${playable.id},${esc(JSON.stringify(it.title))},${resume},${playable.duration_ms||0},${esc(JSON.stringify(pmeta))})'>▶ ${resume?`Resume · ${fmtDur(resume)}`:'Play'}</button>
+        ${resume?`<button class="ghost" onclick='play(${playable.id},${esc(JSON.stringify(it.title))},0,${playable.duration_ms||0},${esc(JSON.stringify(pmeta))})'>Start over</button>`:''}
+        ${watchBtn}</div>`;
+      const pdur=playable.duration_ms||runtime||0, prem=resume?Math.max(0,pdur-resume):pdur, pend=endsAt(prem);
+      if(prem) acts+=`<div class="playinfo">${resume?fmtDur(prem)+" left":fmtDur(prem)}${pend?" · ends ~"+pend:""}</div>`;
+    } else {
+      // `mp`, not `p`: classic can shadow its page argument here because it
+      // never uses it again. This function's `p` is still live.
+      const mp=best.missing_path;
+      acts=`<div class="filemissing">⚠ This file is missing on the server, so it can’t be played — its library path may be unmounted, moved, or renamed${ME.is_admin&&mp?`:<br><code>${esc(mp)}</code>`:'.'}</div><div class="actions">${watchBtn}</div>`;
+    }
+    rest=d.files.map(v=>{
+      const miss=!v.available;
+      const header=(multi||miss)
+        ? `<div class="vh"><span class="vbadges">${specBadges(v)||`<span class="vt">${esc(v.filename)}</span>`}${miss?'<span class="missbadge">missing</span>':''}</span>${(!miss&&multi)?`<button class="ghost sm" onclick='play(${v.id},${esc(JSON.stringify(it.title))},${resume},${v.duration_ms||0},${esc(JSON.stringify(pmeta))})'>▶ Play</button>`:''}</div>`
+        : '';
+      return `<div class="version">${header}${specBlock(v)}${miss&&ME.is_admin&&v.missing_path?`<div class="problem">${esc(v.missing_path)}</div>`:''}${unprobedNote(v,it.id)}</div>`;
+    }).join("");
+  } else if(d.children.length && d.children[0].kind==='episode'){
+    const a=watchControls(it);
+    if(a) acts=`<div class="actions">${a}</div>`;
+    rest=`<h2 class="section">${d.children.length} episode${d.children.length>1?'s':''}</h2>
+      <div class="eplist">${d.children.map(episodeRow).join("")}</div>`;
+  } else if(d.children.length){
+    const label = it.kind==='folder'? 'Contents'
+                : d.children[0].kind==='season'? 'Seasons' : 'Episodes';
+    const a=watchControls(it);
+    if(a) acts=`<div class="actions">${a}</div>`;
+    rest=`<h2 class="section">${label}</h2>${grid(d.children)}`;
+  } else if(it.kind==='folder'){
+    rest=`<div class="empty">This folder is empty.</div>`;
+  }
+
+  // The backdrop is the shipped .herobg (mask, opacity and the noirr grain
+  // treatment all keep working); .px-scrim is plex's extra wash, and it is a
+  // --bg mix, so on a light theme it lightens rather than painting a black
+  // band across a white page.
+  const bg=it.backdrop?`<div class="herobg" style="background-image:url(${esc(tok(it.backdrop))})"></div>`:'';
+  return `<div class="hero px-hero${it.backdrop?'':' px-noart'}">${bg}
+    <div class="px-scrim" aria-hidden="true"></div>
+    <div class="dwrap">
+      <div class="poster">${artHtml(it)}</div>
+      <div class="dhead">${crumbs}${kick}
+        <h1>${esc(it.title)}${editBtn}${artBtn}</h1>
+        ${chips.length?`<div class="chips">${chips.join("")}</div>`:''}
+        ${(it.tags&&it.tags.length)?`<div class="chips px-tags">${it.tags.map(t=>`<span>${esc(t)}</span>`).join("")}</div>`:''}
+        ${heroBadges?`<div class="vbadges" style="margin-top:10px">${heroBadges}</div>`:''}
+        ${it.overview?`<p class="overview">${esc(it.overview)}</p>`:''}
+        ${acts}</div>
+    </div></div>${rest?`<div class="px-detail">${rest}</div>`:''}`;
+}
+
+// ---- registration ---------------------------------------------------------
+// Extends the object the G2 block registered; `views` already exists there,
+// but the guard makes the paste order one less thing to get wrong.
+LAYOUTS.plex.views = LAYOUTS.plex.views || {};
+LAYOUTS.plex.views.item = plexItemBody;
+// Region-shaped, and deliberately partial: `items` and `count` fall through to
+// classic per region, which is what the per-region fallback is for.
+LAYOUTS.plex.views.library = {shell:plexLibraryShell};
+LAYOUTS.plex.stickyFloor = plexStickyFloor;
+LAYOUTS.plex.libsChanged = plexLibsChanged;
 
 // ---- router ---------------------------------------------------------------
 // One page-scoped poller at a time; routing away always clears it.
