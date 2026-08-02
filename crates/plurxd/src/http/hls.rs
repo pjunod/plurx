@@ -334,9 +334,9 @@ pub async fn playlist(
     if query.native != Some(1) {
         return video_playlist(State(state), AxPath(session)).await;
     }
-    let (_, file) = session_file(&state, &session).await?;
+    let (context, file) = session_file(&state, &session).await?;
     Ok(playlist_response(
-        master_playlist(&file, query.subtitle).into_bytes(),
+        master_playlist(&file, query.subtitle, &context.codecs).into_bytes(),
     ))
 }
 
@@ -503,7 +503,7 @@ fn subtitle_characteristics(track: &SubtitleStream) -> Option<&'static str> {
         )
 }
 
-fn master_playlist(file: &MediaFile, selected: Option<i64>) -> String {
+fn master_playlist(file: &MediaFile, selected: Option<i64>, primary_codecs: &str) -> String {
     let native: Vec<(usize, &SubtitleStream)> = file
         .subtitle_streams
         .iter()
@@ -546,10 +546,12 @@ fn master_playlist(file: &MediaFile, selected: Option<i64>) -> String {
     }
     let bandwidth = file.bitrate.unwrap_or(25_000_000).max(128_000);
     if native.is_empty() {
-        out.push_str(&format!("#EXT-X-STREAM-INF:BANDWIDTH={bandwidth}\n"));
+        out.push_str(&format!(
+            "#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},CODECS=\"{primary_codecs}\"\n"
+        ));
     } else {
         out.push_str(&format!(
-            "#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},SUBTITLES=\"subs\"\n"
+            "#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},CODECS=\"{primary_codecs},wvtt\",SUBTITLES=\"subs\"\n"
         ));
     }
     out.push_str("video.m3u8\n");
@@ -593,9 +595,6 @@ fn format_vtt_timestamp(seconds: f64) -> String {
 }
 
 fn shift_webvtt(bytes: &[u8], offset_seconds: f64) -> Vec<u8> {
-    if offset_seconds <= 0.0 {
-        return bytes.to_vec();
-    }
     let normalized = String::from_utf8_lossy(bytes)
         .replace("\r\n", "\n")
         .replace('\r', "\n");
@@ -631,6 +630,17 @@ fn shift_webvtt(bytes: &[u8], offset_seconds: f64) -> Vec<u8> {
             settings
         );
         shifted.push(lines.join("\n"));
+    }
+    if let Some(header) = shifted
+        .first_mut()
+        .filter(|header| header.starts_with("WEBVTT"))
+    {
+        if !header
+            .lines()
+            .any(|line| line.starts_with("X-TIMESTAMP-MAP="))
+        {
+            header.push_str("\nX-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:0");
+        }
     }
     let mut out = shifted.join("\n\n");
     out.push_str("\n\n");
@@ -778,9 +788,11 @@ mod tests {
             sub("subrip", "eng", "Regular", false, false),
             sub("webvtt", "eng", "SDH", false, false),
         ]);
-        let master = master_playlist(&file, Some(2));
+        let master = master_playlist(&file, Some(2), "dvh1,ec-3");
 
-        assert!(master.contains("#EXT-X-STREAM-INF:BANDWIDTH=40000000,SUBTITLES=\"subs\""));
+        assert!(master.contains(
+            "#EXT-X-STREAM-INF:BANDWIDTH=40000000,CODECS=\"dvh1,ec-3,wvtt\",SUBTITLES=\"subs\""
+        ));
         assert!(master.contains("NAME=\"English · Forced\",LANGUAGE=\"en\",DEFAULT=YES,AUTOSELECT=YES,FORCED=YES,URI=\"subs/2/index.m3u8\""));
         assert!(master.contains(
             "NAME=\"Italian · Forced\",LANGUAGE=\"it\",DEFAULT=NO,AUTOSELECT=YES,FORCED=YES"
@@ -796,10 +808,10 @@ mod tests {
             sub("subrip", "eng", "Regular", false, false),
             sub("webvtt", "eng", "Alternate", false, false),
         ]);
-        let master = master_playlist(&file, None);
+        let master = master_playlist(&file, None, "avc1,mp4a.40.2");
         assert_eq!(master.matches("AUTOSELECT=NO").count(), 2);
 
-        let selected = master_playlist(&file, Some(1));
+        let selected = master_playlist(&file, Some(1), "avc1,mp4a.40.2");
         assert!(selected
             .contains("NAME=\"English · Alternate\",LANGUAGE=\"en\",DEFAULT=YES,AUTOSELECT=YES"));
     }
@@ -813,7 +825,7 @@ mod tests {
             sub("ass", "eng", "Styled Signs", false, false),
             sub("ssa", "eng", "Styled Dialogue", false, false),
         ]);
-        let master = master_playlist(&file, None);
+        let master = master_playlist(&file, None, "avc1,mp4a.40.2");
         assert!(master.contains("subs/0/index.m3u8"));
         for index in 1..=4 {
             assert!(!master.contains(&format!("subs/{index}/index.m3u8")));
@@ -829,6 +841,7 @@ mod tests {
 
         let source = b"WEBVTT\n\n00:00:01.000 --> 00:00:02.000\npast\n\ncue-id\n00:00:09.000 --> 00:00:11.000 align:start\ncrossing\n\n00:00:15.250 --> 00:00:16.500\nfuture\n";
         let shifted = String::from_utf8(shift_webvtt(source, 10.0)).expect("utf8");
+        assert!(shifted.contains("X-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:0"));
         assert!(!shifted.contains("past"));
         assert!(shifted.contains("00:00:00.000 --> 00:00:01.000 align:start"));
         assert!(shifted.contains("00:00:05.250 --> 00:00:06.500"));
