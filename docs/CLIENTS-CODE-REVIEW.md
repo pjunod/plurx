@@ -3,7 +3,8 @@
 **Reviewed:** 2026-08-02
 **Scope:** `clients/android` and `clients/apple` at commit `f8655c166` plus
 the working tree (two uncommitted Apple files: `PlurxApp.swift`,
-`PlayerController.swift`)
+`PlayerController.swift`). §11 additionally reviews the two server commits
+that landed after that snapshot (`ab5438ca2`, `a2f5239f9`).
 **Outcome:** review only; no code was changed
 
 This review complements [PLAYBACK.md](PLAYBACK.md) (the delivery contract the
@@ -190,7 +191,8 @@ WebVTT renditions inside the HLS master (`native_subtitles` +
 extraction (`GET /files/{id}/subs/{idx}`, cached server-side); and burn-in
 (`subtitle_burn`, a video transcode). The web player uses `<track>` VTT for
 text and burn for bitmap; the Apple client uses native renditions for
-SRT/VTT and burn for bitmap/styled; **the Android client burns everything.**
+SRT/VTT (machinery hardened right after this review's snapshot — §11) and
+burn for bitmap/styled; **the Android client burns everything.**
 
 ### 3.1 Android: selecting any server-listed subtitle restarts playback as a transcode at the Auto rung — HIGH (quality)
 
@@ -754,3 +756,91 @@ Worth naming, because the fix list above shouldn't read as the whole story:
 After P1, re-run the device matrix with a DV P7 title, a DV P8 title, a
 TrueHD Atmos title over an AVR, and a PGS-subbed 4K remux on both
 platforms — those four are the cases this review predicts will change.
+
+---
+
+## 11. Addendum (2026-08-02) — the two commits that landed after the snapshot
+
+While this review was being written, two server-side commits landed on the
+same branch, both in §3's territory: the native-subtitle machinery the
+Apple client executes. They are reviewed here at the same depth. Neither
+changes any client-side finding or the §10 order — and both belong to
+exactly the class §9 said code reading cannot reach: AVPlayer rejecting a
+master playlist is invisible until a real device plays it, which is
+evidently where these came from.
+
+### 11.1 `ab5438ca2` — Make HLS subtitle autoselection valid. Sound.
+
+**What it does:** enforces RFC 8216's rendition-group uniqueness rule.
+Every `AUTOSELECT=YES` member of the `subs` group must be unique by
+(LANGUAGE, FORCED, CHARACTERISTICS); AVPlayer rejects the whole master
+when two plain same-language tracks collide — the common two-English-SRT
+mux, which previously made the entire native path fail on device.
+Duplicate tuples now emit `AUTOSELECT=NO` (still listed, still manually
+selectable), the client-selected track carries `DEFAULT=YES` which forces
+`AUTOSELECT=YES` (`autoselect = default || tuple_copies == 1` — the rule's
+own precondition), and SDH/CC tracks gain the standard accessibility
+`CHARACTERISTICS` pair. The tuple count is self-inclusive, so a selected
+duplicate stays valid while its twin goes manual — checked against each
+combination. Two focused tests pin the behavior.
+
+**Consequences and one follow-up:** duplicate plain tracks no longer
+OS-autoselect — plurx-driven selection (`DEFAULT` via `?subtitle=`) is
+unaffected, and the code comment says so; deliberate. The SDH detection
+sniffs titles ("sdh", "closed caption", …) because `SubtitleStream`
+(`domain.rs:301-308`) doesn't carry ffprobe's
+`disposition.hearing_impaired` — LOW: add the disposition to the probe and
+demote the title sniff to a fallback.
+
+### 11.2 `a2f5239f9` — Advertise complete native subtitle codecs. Sound; three edges worth one more pass.
+
+**What it does:** the native master's `#EXT-X-STREAM-INF` now carries a
+`CODECS` attribute — the primary rendition's formats plus `,wvtt` when
+subtitle renditions are present, which AVPlayer requires before it will
+play an otherwise-valid copy. Sessions record `hls_codecs`: copy sessions
+derive it from the file (`dvh1` when DV is preserved, `hvc1` for HEVC,
+`avc1` otherwise; audio maps the copied codec, or `mp4a.40.2` when the
+session transcodes audio), transcode and cached sessions are hardcoded
+`avc1,mp4a.40.2` (correct — that chain is H.264+AAC). Separately,
+`shift_webvtt` now always stamps
+`X-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:0` into the VTT header, so cue
+times sync to the media timeline at zero offset too.
+
+**Verified while reviewing:** `dvh1` agrees with the sample entry the copy
+pipeline actually muxes (`-tag:v dvh1` for preserved DV,
+`plurx-core/src/transcode/mod.rs:285-289`, asserted by its tests);
+`"dolby_vision"` is the domain's real `hdr` vocabulary (`domain.rs:325`);
+and the now-unconditional VTT rewrite preserves non-cue blocks — the block
+loop pushes NOTE/STYLE blocks through untouched — so removing the
+zero-offset early-return loses nothing.
+
+**The edges** — none block today's consumers (only the Apple client
+requests `?native=1`, and AVPlayer parses these strings leniently):
+
+- MEDIUM (latent, nearest-term real case): the video arm falls through
+  everything non-HEVC to `avc1`. An AV1 copy session — an AV1 MKV on
+  hardware whose caps claim `av1` (A17-class iPhones today) — would
+  advertise `avc1` over `av01` samples: actively wrong metadata on the
+  newest devices. Add an `av01` arm before AV1-capable hardware meets the
+  native path.
+- LOW-MEDIUM: the strings are bare FourCCs, not RFC 6381 (`avc1` without
+  `.PPCCLL`; `hvc1`/`dvh1` without profile.tier.level). AVPlayer
+  tolerates; `mediastreamvalidator` will flag it; and any future consumer
+  that feeds `CODECS` into an `isTypeSupported`-class check breaks —
+  Chromium rejects a bare `hvc1`. The probe already holds
+  profile/bit-depth/level, so full strings are derivable when convenient.
+- LOW: `copied_audio_codec`'s `_ → mp4a.40.2` mislabels a genuinely copied
+  FLAC/Opus/DTS track. Unreachable from current clients (none both claims
+  those codecs and takes the copy path) — worth a comment saying so, or it
+  bites silently when one does. (Nit, same file: the header stamp keys on
+  `starts_with("WEBVTT")`, so a BOM'd VTT would skip it; ffmpeg-extracted
+  VTT carries no BOM, unreachable today.)
+
+### 11.3 Standing state after the addendum
+
+Both commits carry their own unit tests and were gated natively if the
+pre-commit hook ran (the bridge cannot run `make check`; this addendum is
+a reading, not a build). The working tree still carries the two
+uncommitted scaffolding files, so §6.6 — the iOS build break — remains the
+first P0, and nothing here reorders §10. The three §11.2 edges slot into
+P2.
