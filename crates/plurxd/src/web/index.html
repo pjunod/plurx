@@ -1042,7 +1042,11 @@ function playbackContext(){
 async function probeDecode(){
   const p=PLAYER; if(!p) return;
   const src=p.source||{};
-  const codec=MSE_VIDEO[String(src.video_codec||"").toLowerCase()];
+  // Same ladder the transport choice uses, for the same reason: `codec[0]` is
+  // what gets asked about, and on a 10-bit source the honest question is the
+  // Main10 one. Asking a Main (8-bit) string about a Main10 file would have
+  // this diagnostic report a decoder that is not the one doing the work.
+  const codec=MSE_VIDEO[mseCodecKey(src.video_codec, src.bit_depth)];
   if(!codec || !navigator.mediaCapabilities || !navigator.mediaCapabilities.decodingInfo) return;
   const v=document.getElementById("video");
   const cfg={
@@ -2647,8 +2651,11 @@ function attachHls(video, playlistUrl, startAt){
     // reason, a decode error, or simply nothing arriving. Reporting them as
     // one event would leave the M0 buffer question unanswerable.
     hls.on(Hls.Events.ERROR,(_,d)=>{
-      if(d.details===Hls.ErrorDetails.BUFFER_FULL_ERROR){ reportBufferLimit("quota", d); return; }
-      if(d.details===Hls.ErrorDetails.BUFFER_APPEND_ERROR){ reportBufferLimit("append", d); return; }
+      // Counted here, but a FATAL one still falls through to the rescue below:
+      // hls.js gives up on a segment after `appendErrorMaxRetry`, and a buffer
+      // failure that has become terminal is a dead player, not a statistic.
+      if(d.details===Hls.ErrorDetails.BUFFER_FULL_ERROR){ reportBufferLimit("quota", d); if(!d.fatal) return; }
+      if(d.details===Hls.ErrorDetails.BUFFER_APPEND_ERROR){ reportBufferLimit("append", d); if(!d.fatal) return; }
       if(!d.fatal){
         // The stall family names its mechanism — bufferStalledError,
         // bufferNudgeOnStall, bufferSeekOverHole — and this handler used to
@@ -2673,6 +2680,39 @@ function attachHls(video, playlistUrl, startAt){
       }
       console.warn("[cinemarr] hls.js fatal",d.type,d.details);
       clientLog(Object.assign({level:"error",event:"hls_fatal",detail:d.type,message:d.details}, playbackContext()));
+      // The rescue the progressive path has had all along.
+      //
+      // On this transport the <video> element's own `error` never fires for a
+      // media failure: hls.js owns the MediaSource, consumes the failure, and
+      // reports it here — so a copy stream this browser's decoder will not
+      // take used to end at a toast with the player dead. A fatal media/codec
+      // error IS terminal (hls.js retries nothing further unless the app calls
+      // recoverMediaError, and a decoder that refused these samples refuses
+      // them again), so restart the playback as a transcode at position.
+      //
+      // Same guards as the <video> rescue, and for the same reasons: only a
+      // copy path is rescuable — a transcode already IS the fallback, and
+      // re-opening one on its own error is the infinite loop — and only once
+      // per item, via the `triedFallback` flag those two share. It lives on
+      // PLAYER, which a seek mutates in place and a new item replaces, so
+      // "once" means once per item and not once per stream. Network fatals are
+      // deliberately left alone: a different encode does not fix an
+      // unreachable server, and re-encoding a title because the wifi dropped
+      // is the "downgrade on a guess" this whole change refuses to do.
+      const isMedia=(Hls.ErrorTypes && d.type===Hls.ErrorTypes.MEDIA_ERROR)
+                    || /codec|decode|parsing/i.test(String(d.details||""));
+      if(isMedia && PLAYER && !PLAYER.triedFallback
+         && (PLAYER.method==='remux' || PLAYER.method==='direct_play')){
+        PLAYER.triedFallback=true;
+        clientLog(Object.assign({level:"warn",event:"stream_rejected",detail:d.type,
+          message:"hls.js could not decode the "+PLAYER.method.replace('_',' ')+" stream ("+d.details+") — re-encoding"},
+          playbackContext()));
+        setLoading(true,"Stream rejected — switching to transcode…",
+          "this browser's decoder refused the copied stream ("+d.details+"); re-encoding instead");
+        startTranscodeFallback("stream-rejected",
+          "the browser refused the "+PLAYER.method.replace('_',' ')+" stream ("+d.details+") — re-encoded instead");
+        return;
+      }
       setLoading(true,"Playback failed to start ("+d.details+").","the server couldn't build this stream — see Settings → Logs");
       toast("Playback failed ("+d.details+")");
     });
@@ -3126,9 +3166,18 @@ function setupAirplay(video){
 // the source's: Chrome answers "no" to a level it cannot decode, so asking
 // only about L153 (4K) would reject a 1080p file it would have played fine.
 // Any accepted variant proves the *decoder* exists, which is the question.
+//
+// The HEVC ladders are split by bit depth because the profile in the string is
+// the ONLY place a decoder's answer distinguishes them: `hvc1.1.6.*` is Main
+// (8-bit) and `hvc1.2.4.*` is Main10. A browser with an 8-bit-only HEVC
+// decoder says yes to the Main strings and no to the Main10 ones — so a ladder
+// containing both, asked with `.some()`, passes a 10-bit source on the
+// strength of an 8-bit yes. That is a stream MediaSource accepts and the
+// decoder then renders as nothing: black picture, working sound, no error.
 const MSE_VIDEO = {
   hevc:["hvc1.2.4.L153.B0","hvc1.1.6.L153.B0","hvc1.2.4.L120.B0","hvc1.1.6.L120.B0"],
   h265:["hvc1.2.4.L153.B0","hvc1.1.6.L153.B0","hvc1.2.4.L120.B0","hvc1.1.6.L120.B0"],
+  // Main10 only. Selected by bit depth, not by codec name — see mseCodecKey.
   hevc10:["hvc1.2.4.L153.B0","hvc1.2.4.L120.B0"],
   h264:["avc1.640033","avc1.640029","avc1.4d401f"],
   avc:["avc1.640033","avc1.640029","avc1.4d401f"],
@@ -3138,6 +3187,23 @@ const MSE_VIDEO = {
 const MSE_AUDIO = {
   aac:"mp4a.40.2", ac3:"ac-3", eac3:"ec-3", opus:"opus", flac:"flac", mp3:"mp4a.40.34",
 };
+// Which ladder describes THIS source.
+//
+// `video_codec` is ffprobe's `codec_name`, which is always plain "hevc" — it
+// never carries the profile, so the `hevc10` ladder above was unreachable and
+// every 10-bit file was asked about with the 8-bit strings in the list. The
+// depth is on the wire (`SourceSummary.bit_depth`) and was read by the badges
+// and by nothing that made a decision. It is read here now.
+//
+// An absent depth keeps today's ladder deliberately: unknown is not 10-bit,
+// and guessing upward would push 8-bit sources off MSE on browsers that have
+// always played them.
+function mseCodecKey(srcCodec, bitDepth){
+  const c=String(srcCodec||"").toLowerCase();
+  const d=Number(bitDepth)||0;
+  if(d>=10 && (c==="hevc"||c==="h265"||c==="hevc10")) return "hevc10";
+  return c;
+}
 // Will this browser take the copy-video stream through MediaSource?
 //
 // Asked because `<video src>` and MSE are different code paths with different
@@ -3146,9 +3212,13 @@ const MSE_AUDIO = {
 // stream into a black one. Video and audio are asked about together, in one
 // string, because that is exactly what hls.js will ask — checking them apart
 // passes pairs the browser will not accept as a pair.
-function mseCanTake(srcCodec, audioCodec){
+//
+// This picks the TRANSPORT, and nothing else: the same bytes either way, and
+// nothing here is ever told to the server. A no sends the remux down the
+// progressive path, which is where the `<video>` error handler's rescue lives.
+function mseCanTake(srcCodec, audioCodec, bitDepth){
   if(!(window.MediaSource && MediaSource.isTypeSupported)) return false;
-  const v=MSE_VIDEO[String(srcCodec||"").toLowerCase()];
+  const v=MSE_VIDEO[mseCodecKey(srcCodec, bitDepth)];
   if(!v) return false;                       // unknown codec: do not gamble
   const a=MSE_AUDIO[String(audioCodec||"").toLowerCase()];
   if(!a) return false;
@@ -3170,7 +3240,7 @@ function segmentedRemuxOk(decision, video){
   // when the browser can't take the source, so ask about what arrives.
   const track=(decision.audio||[]).find(a=>a.default) || (decision.audio||[])[0];
   const audio=decision.transcode_audio? "aac" : (track&&track.codec);
-  return mseCanTake(src.video_codec, audio);
+  return mseCanTake(src.video_codec, audio, src.bit_depth);
 }
 // Catch the hitch itself, frame by frame.
 //
@@ -3850,6 +3920,45 @@ function stopPlayerTimers(){
 // actual stream URL and turn the blank overlay into a specific verdict:
 // blocked-by-extension vs server-error vs reaches-browser-but-won't-decode.
 function clearStall(){ if(PLAYER&&PLAYER.stallTimer){ clearTimeout(PLAYER.stallTimer); PLAYER.stallTimer=null; } }
+// Does this stream have a video track at all?
+//
+// `videoWidth` answers it once the element has decoded a frame or read the
+// init segment; before that, the decision's own source summary does. A file
+// with neither is the audio-only case, and it must not be held to a frame
+// count it can never produce.
+function streamHasVideo(p, v){
+  if(v && (v.videoWidth>0 || v.videoHeight>0)) return true;
+  const s=(p&&p.source)||{};
+  return !!(s.video_codec || s.width || s.height);
+}
+// Is this playback ACTUALLY underway — as in, is there a picture?
+//
+// `PLAYER.started` is set by the first `playing` event, and audio alone fires
+// it. That is the whole shape of the 2160p Main10 incident: E-AC-3 played,
+// `started` went true, and the two rescues that exist both read it as "we are
+// fine, do not churn" — so a stream the decoder was rendering as nothing sat
+// black for the length of the film with a working scrubber.
+//
+// Decoded frames are the signal, from the browser's own counter: it is the one
+// number that separates "the decoder produced pictures" from "the pipeline is
+// running". `totalVideoFrames` counts DECODED frames rather than presented
+// ones (Safari decodes ahead in bursts — see the stats panel), which is
+// exactly right here: anything above zero means the decoder took the stream,
+// and the black-screen case is a hard zero.
+//
+// Two deliberate fallbacks, both to today's behaviour rather than to a rescue:
+// audio-only content has no frames to count and is judged by `started` as
+// before, and a browser that does not implement getVideoPlaybackQuality is
+// judged by whether a picture exists at all. Neither guesses a failure.
+function playbackIsReal(){
+  const p=PLAYER; if(!p || !p.started) return false;
+  const v=document.getElementById("video");
+  if(!streamHasVideo(p, v)) return true;     // audio-only: `playing` IS the answer
+  if(!v) return true;
+  let q=null; try{ q=v.getVideoPlaybackQuality&&v.getVideoPlaybackQuality(); }catch(e){}
+  if(q && typeof q.totalVideoFrames==="number") return q.totalVideoFrames>0;
+  return v.videoWidth>0;                     // no counter: do not rescue on a guess
+}
 // Rescue path: the browser rejected a remux/direct stream outright, so restart
 // this playback as a server transcode (guaranteed-compatible H.264/AAC HLS).
 async function startTranscodeFallback(reason, note){
@@ -4254,7 +4363,11 @@ function wirePlayer(){
     const err=v.error, code=err?err.code:0, msg=(err&&err.message)||"";
     const src=(v.currentSrc||"").split("?")[0];
     console.warn("[cinemarr] video error",{code,msg,method:PLAYER&&PLAYER.method,src});
-    if(!PLAYER || PLAYER.started){ setLoading(false); return; }
+    // `playbackIsReal()` and not `PLAYER.started`: the guard means "we already
+    // got real playback going, don't churn", and audio alone used to satisfy
+    // it — which disabled this rescue in precisely the black-picture-with-
+    // sound case it exists for.
+    if(!PLAYER || playbackIsReal()){ setLoading(false); return; }
     const names={1:"aborted",2:"network error",3:"the browser's decoder failed",4:"format not supported by this browser"};
     if((PLAYER.method==='remux'||PLAYER.method==='direct_play') && !PLAYER.triedFallback){
       PLAYER.triedFallback=true;
@@ -4484,6 +4597,25 @@ const LANGS={eng:"English",en:"English",jpn:"Japanese",ja:"Japanese",spa:"Spanis
   chi:"Chinese",zho:"Chinese",zh:"Chinese",hin:"Hindi",ara:"Arabic",nld:"Dutch",swe:"Swedish",pol:"Polish",und:"Unknown"};
 function langName(c){ return c?(LANGS[c.toLowerCase()]||c.toUpperCase()):null; }
 function audioLabelMenu(a,i){ return (langName(a.language)||("Track "+(i+1)))+(a.channels?" · "+fmtChannels(a.channels):"")+(a.title?" · "+a.title:""); }
+// Which subtitle tracks this player has to have BURNED into the picture.
+//
+// `text` is the right field here and `native` is not, and the difference is a
+// functional regression waiting to be introduced. The server sends both, and
+// they answer different questions: `native` (= subrip/srt/webvtt/vtt) is the
+// narrow set that converts cleanly enough to be published as a WebVTT HLS
+// *rendition*, while `text` (= not a bitmap) is everything that can be
+// extracted as text at all — which also covers mov_text and styled ASS/SSA.
+//
+// This player has no rendition path. It never asks for `?native=1`, and every
+// text track it shows arrives from the sidecar `/api/v1/files/{id}/subs/{n}`,
+// whose only server-side gate is `is_bitmap_subtitle` and whose extraction is
+// a plain `ffmpeg -map 0:s:N -f webvtt` — mov_text and ASS both come back as
+// cues. Asking `native` here would route those to a burn instead: a session
+// restart, a re-encode, and a subtitle nobody can switch off, for tracks that
+// work today. So `native` is consulted where a rendition is requested, of
+// which there is no site in this player, and an absent `native` (older
+// server) changes nothing anywhere.
+function subNeedsBurn(s){ return !!s && s.text===false; }
 // A bitmap track is labelled as one. Selecting it restarts the stream as a
 // transcode, and somebody choosing between two English tracks deserves to know
 // which one costs that — the alternative is an unexplained pause and a picture
@@ -4492,7 +4624,7 @@ function subLabelMenu(s){
   return (langName(s.language)||("Subtitle "+(s.index+1)))
     +(s.forced?" (forced)":"")
     +(s.title?" · "+s.title:"")
-    +(s.text===false?" · burned in":"");
+    +(subNeedsBurn(s)?" · burned in":"");
 }
 function setupTrackMenus(){
   const ab=document.getElementById("audiobtn"), sb=document.getElementById("subsbtn"), m=document.getElementById("pmenu");
@@ -4726,7 +4858,7 @@ async function setSub(index){
   // transcode, and a new one, because the burn is baked in. Everything else
   // here is the text path, which stays local and free.
   const want=(me.subs||[]).find(x=>x.index===index);
-  if(index>=0 && want && want.text===false) return burnSub(index);
+  if(index>=0 && subNeedsBurn(want)) return burnSub(index);
   if(me.burnedSub!=null){
     // Leaving a burned track behind: the picture still has it drawn on, so
     // "off" also has to be a restart.
