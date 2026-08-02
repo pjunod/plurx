@@ -536,7 +536,11 @@ fn master_playlist(file: &MediaFile, selected: Option<i64>, primary_codecs: &str
         .enumerate()
         .filter(|(_, track)| is_native_text_subtitle(&track.codec))
         .collect();
-    let mut out = String::from("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n");
+    // Copy/remux sessions can contain open GOPs, so the video rendition does
+    // not promise independently decodable segments. The master must not make
+    // that stronger claim on its behalf: AVPlayer acts on it at a resume
+    // boundary and can reject an otherwise playable copied HEVC/DV stream.
+    let mut out = String::from("#EXTM3U\n#EXT-X-VERSION:7\n");
     for (index, track) in &native {
         // The query describes this player's selection. No selected index is
         // an explicit Off, not permission to resurrect a foreign-language
@@ -914,6 +918,7 @@ mod tests {
         assert!(master.contains(
             "#EXT-X-STREAM-INF:BANDWIDTH=40000000,CODECS=\"dvh1,ec-3,wvtt\",SUBTITLES=\"subs\""
         ));
+        assert!(!master.contains("#EXT-X-INDEPENDENT-SEGMENTS"));
         assert!(master.contains("NAME=\"English · Forced\",LANGUAGE=\"en\",DEFAULT=YES,AUTOSELECT=YES,FORCED=YES,URI=\"subs/2/index.m3u8\""));
         assert!(master.contains(
             "NAME=\"Italian · Forced\",LANGUAGE=\"it\",DEFAULT=NO,AUTOSELECT=YES,FORCED=YES"
