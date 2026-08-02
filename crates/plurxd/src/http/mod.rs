@@ -119,12 +119,23 @@ pub fn router(state: AppState) -> Router {
         // id is the client's own playback id, so the check is that the asker
         // owns the stream.
         .route("/stream/{id}/status", get(stream::stream_status))
-        .route("/files/{id}/subs/{index}", get(stream::subtitles_vtt))
+        // The final segment accepts both `0` (legacy) and `0.vtt` (the
+        // documented sidecar URL); the handler validates the suffix/index.
+        .route("/files/{id}/subs/{subtitle}", get(stream::subtitles_vtt))
         // Creating a stream spawns a process and supersedes its predecessor,
         // so it is a POST. The GET is a deprecated bridge over the same path.
         .route("/files/{id}/hls/sessions", post(hls::create))
         .route("/files/{id}/hls/start", get(hls::start))
         .route("/hls/{session}/index.m3u8", get(hls::playlist))
+        .route("/hls/{session}/video.m3u8", get(hls::video_playlist))
+        .route(
+            "/hls/{session}/subs/{index}/index.m3u8",
+            get(hls::subtitle_playlist),
+        )
+        .route(
+            "/hls/{session}/subs/{index}/subtitle.vtt",
+            get(hls::subtitle_vtt),
+        )
         // Before the `{segment}` catch-all in intent, though the router
         // prefers the static segment regardless of registration order.
         .route("/hls/{session}/status", get(hls::status))
@@ -3710,7 +3721,7 @@ mod tests {
 
         let (status, body) = body_of(
             &app,
-            get_q(&format!("/api/v1/files/{file}/subs/0?token={admin}")),
+            get_q(&format!("/api/v1/files/{file}/subs/0.vtt?token={admin}")),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -3885,6 +3896,103 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::OK);
         assert!(body["session_id"].is_string());
+
+        // Apple opts into a master playlist whose child subtitle URLs are
+        // authenticated by the unguessable session capability. AVPlayer adds
+        // no bearer header to these autonomous requests.
+        let (st, native) = call(
+            &app,
+            post(
+                &format!("/api/v1/files/{}/hls/sessions", s.file),
+                Some(&admin),
+                json!({
+                    "playback_id": "apple-native-subs",
+                    "request_id": "native-subs-attempt",
+                    "start": 10.0,
+                    "copy": true,
+                    "native_subtitles": true,
+                    "subtitle": 0
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{native}");
+        let session = native["session_id"].as_str().expect("session");
+        let expected_playlist = format!("/api/v1/hls/{session}/index.m3u8?native=1&subtitle=0");
+        assert_eq!(
+            native["playlist_url"].as_str(),
+            Some(expected_playlist.as_str())
+        );
+
+        let (status, master) = body_of(
+            &app,
+            get_q(&format!(
+                "/api/v1/hls/{session}/index.m3u8?native=1&subtitle=0"
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let master = String::from_utf8(master).expect("master utf8");
+        assert!(master.contains("TYPE=SUBTITLES"), "{master}");
+        assert!(master.contains("LANGUAGE=\"en\",DEFAULT=YES"), "{master}");
+        assert!(master.contains("subs/0/index.m3u8"), "{master}");
+
+        let (status, subtitle_playlist) = body_of(
+            &app,
+            get_q(&format!("/api/v1/hls/{session}/subs/0/index.m3u8")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(String::from_utf8_lossy(&subtitle_playlist).contains("#EXTINF:8990.000"));
+
+        // Seed the extraction cache so the handler test can focus on the
+        // capability and timeline mapping rather than the placeholder MP4.
+        let file = state
+            .store
+            .get_file(s.file)
+            .await
+            .expect("file read")
+            .expect("file");
+        tokio::fs::create_dir_all(&state.subs_dir)
+            .await
+            .expect("subs dir");
+        let cached = crate::subtitles::vtt_path(&state.subs_dir, &file, 0);
+        tokio::fs::write(
+            cached,
+            "WEBVTT\n\n00:00:09.000 --> 00:00:11.000\ncrossing\n\n00:00:15.000 --> 00:00:16.000\nafter\n",
+        )
+        .await
+        .expect("cached VTT");
+        let (status, shifted) = body_of(
+            &app,
+            get_q(&format!("/api/v1/hls/{session}/subs/0/subtitle.vtt")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let shifted = String::from_utf8(shifted).expect("VTT utf8");
+        assert!(
+            shifted.contains("00:00:00.000 --> 00:00:01.000"),
+            "{shifted}"
+        );
+        assert!(
+            shifted.contains("00:00:05.000 --> 00:00:06.000"),
+            "{shifted}"
+        );
+
+        // The old file-id route is still bearer protected; only URLs rooted
+        // in the live session capability are headerless.
+        assert_eq!(
+            status_of(&app, get_q(&format!("/api/v1/files/{}/subs/0", s.file))).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            status_of(
+                &app,
+                get_q("/api/v1/hls/not-the-capability/subs/0/index.m3u8")
+            )
+            .await,
+            StatusCode::NOT_FOUND
+        );
     }
 
     #[tokio::test]

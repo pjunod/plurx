@@ -17,6 +17,9 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
+use plurx_core::domain::{MediaFile, SubtitleStream};
+use plurx_core::tracks::is_native_text_subtitle;
+
 use super::error::ApiError;
 use super::extract::AuthUser;
 use crate::state::AppState;
@@ -79,6 +82,13 @@ pub struct CreateSession {
     /// cannot render itself — a bitmap track (PGS/VobSub) has no text to send,
     /// so the only way to show it is to draw it into the frames.
     pub subtitle_burn: Option<i64>,
+    /// Advertise the source's lossless WebVTT-convertible tracks in an HLS
+    /// master playlist. Native Apple clients opt in; older HLS consumers keep
+    /// receiving the media playlist shape they already understand.
+    pub native_subtitles: Option<bool>,
+    /// Initially selected native rendition. This changes only HLS metadata,
+    /// never the video recipe or the encoder choice.
+    pub subtitle: Option<i64>,
     pub start: Option<f64>,
     pub audio: Option<i64>,
     /// Copy the source video into HLS rather than re-encoding it.
@@ -137,7 +147,8 @@ pub async fn create(
     // The source height answers three things now: Auto, the ladder in the
     // response, and the snap's source-height escape. One read, from the read
     // pool.
-    let source_height = state.store.get_file(id).await?.and_then(|f| f.height);
+    let source = state.store.get_file(id).await?;
+    let source_height = source.as_ref().and_then(|f| f.height);
     let height = match req.height {
         // Auto: the server's own choice already lands where it means to —
         // snapping it would re-decide policy (a 900p source deliberately
@@ -151,6 +162,21 @@ pub async fn create(
         Some(h) => crate::transcode::snap_height(h),
     }
     .clamp(crate::transcode::MIN_HEIGHT, crate::transcode::MAX_HEIGHT);
+    let native_subtitles = req.native_subtitles == Some(true);
+    let native_subtitle = req.subtitle.filter(|s| *s >= 0);
+    if native_subtitles {
+        if let Some(index) = native_subtitle {
+            let track = source
+                .as_ref()
+                .and_then(|f| f.subtitle_streams.get(index as usize))
+                .ok_or_else(|| ApiError::BadRequest("unknown native subtitle track".into()))?;
+            if !is_native_text_subtitle(&track.codec) {
+                return Err(ApiError::BadRequest(
+                    "the selected subtitle requires burn-in".into(),
+                ));
+            }
+        }
+    }
     let request = req.into_request(id, height);
     // A session being created is playback beginning — the honest moment for
     // the scrobble that used to fire from `/decision`.
@@ -169,9 +195,17 @@ pub async fn create(
                 ApiError::Internal(e)
             }
         })?;
+    let playlist_url = if native_subtitles {
+        match native_subtitle {
+            Some(index) => format!("{}?native=1&subtitle={index}", info.playlist_url),
+            None => format!("{}?native=1", info.playlist_url),
+        }
+    } else {
+        info.playlist_url
+    };
     Ok(Json(StartResponse {
         session_id: info.session_id,
-        playlist_url: info.playlist_url,
+        playlist_url,
         duration_ms: info.duration_ms,
         start_seconds: info.start_seconds,
         encoder: info.encoder.to_owned(),
@@ -216,6 +250,8 @@ pub async fn start(
         request_id: None,
         height: q.height,
         subtitle_burn: None, // the deprecated GET bridge never offered a burn
+        native_subtitles: None,
+        subtitle: None,
         start: q.start,
         audio: q.audio,
         copy: Some(q.copy == Some(1)),
@@ -248,17 +284,14 @@ pub async fn status(
         .ok_or(ApiError::NotFound("transcode session"))
 }
 
-/// GET /api/v1/hls/:session/index.m3u8 — capability auth (see module docs).
-pub async fn playlist(
-    State(state): State<AppState>,
-    AxPath(session): AxPath<String>,
-) -> Result<Response, ApiError> {
-    let bytes = state
-        .transcode
-        .playlist(&session)
-        .await
-        .ok_or(ApiError::NotFound("transcode session"))?;
-    Ok((
+#[derive(Default, Deserialize)]
+pub struct PlaylistQuery {
+    pub native: Option<u8>,
+    pub subtitle: Option<i64>,
+}
+
+fn playlist_response(bytes: Vec<u8>) -> Response {
+    (
         StatusCode::OK,
         [
             (
@@ -269,7 +302,309 @@ pub async fn playlist(
         ],
         bytes,
     )
+        .into_response()
+}
+
+async fn session_file(
+    state: &AppState,
+    session: &str,
+) -> Result<(crate::transcode::HlsContext, MediaFile), ApiError> {
+    let context = state
+        .transcode
+        .hls_context(session)
+        .await
+        .ok_or(ApiError::NotFound("transcode session"))?;
+    let file = state
+        .store
+        .get_file(context.file_id)
+        .await?
+        .ok_or(ApiError::NotFound("file"))?;
+    Ok((context, file))
+}
+
+/// GET /api/v1/hls/:session/index.m3u8 — capability auth (see module docs).
+///
+/// Existing clients receive the historical media playlist. Apple opts into a
+/// master playlist with native subtitle renditions through `?native=1`.
+pub async fn playlist(
+    State(state): State<AppState>,
+    AxPath(session): AxPath<String>,
+    Query(query): Query<PlaylistQuery>,
+) -> Result<Response, ApiError> {
+    if query.native != Some(1) {
+        return video_playlist(State(state), AxPath(session)).await;
+    }
+    let (_, file) = session_file(&state, &session).await?;
+    Ok(playlist_response(
+        master_playlist(&file, query.subtitle).into_bytes(),
+    ))
+}
+
+/// The video rendition referenced by the native-subtitle HLS master.
+pub async fn video_playlist(
+    State(state): State<AppState>,
+    AxPath(session): AxPath<String>,
+) -> Result<Response, ApiError> {
+    let bytes = state
+        .transcode
+        .playlist(&session)
+        .await
+        .ok_or(ApiError::NotFound("transcode session"))?;
+    Ok(playlist_response(bytes))
+}
+
+/// One native WebVTT rendition's media playlist. The VTT is a single VOD
+/// segment spanning the remaining source timeline; selection is infrequent,
+/// and keeping one cached sidecar avoids re-reading a large MKV per HLS video
+/// segment.
+pub async fn subtitle_playlist(
+    State(state): State<AppState>,
+    AxPath((session, index)): AxPath<(String, i64)>,
+) -> Result<Response, ApiError> {
+    let (context, file) = session_file(&state, &session).await?;
+    let track = file
+        .subtitle_streams
+        .get(index as usize)
+        .ok_or(ApiError::NotFound("subtitle track"))?;
+    if !is_native_text_subtitle(&track.codec) {
+        return Err(ApiError::BadRequest(
+            "this subtitle requires burn-in".into(),
+        ));
+    }
+    Ok(playlist_response(
+        subtitle_media_playlist(file.duration_ms, context.start_seconds).into_bytes(),
+    ))
+}
+
+/// Capability-authenticated VTT data for AVPlayer's autonomous child fetch.
+/// Cues are shifted onto the session-relative video timeline, so a session
+/// opened at a resume/seek offset still presents captions at the right frame.
+pub async fn subtitle_vtt(
+    State(state): State<AppState>,
+    AxPath((session, index)): AxPath<(String, i64)>,
+) -> Result<Response, ApiError> {
+    let (context, file) = session_file(&state, &session).await?;
+    let track = file
+        .subtitle_streams
+        .get(index as usize)
+        .ok_or(ApiError::NotFound("subtitle track"))?;
+    if !is_native_text_subtitle(&track.codec) {
+        return Err(ApiError::BadRequest(
+            "this subtitle requires burn-in".into(),
+        ));
+    }
+    let cached = crate::subtitles::ensure_vtt(&state.subs_dir, &file, index)
+        .await
+        .map_err(|why| {
+            tracing::warn!(
+                file_id = file.id,
+                index,
+                "subtitle extraction failed: {why}"
+            );
+            ApiError::Internal("subtitle extraction failed".into())
+        })?;
+    let bytes = tokio::fs::read(cached)
+        .await
+        .map_err(|e| ApiError::Internal(format!("reading extracted subtitles: {e}")))?;
+    tracing::info!(
+        session_id = %session,
+        file_id = file.id,
+        index,
+        codec = %track.codec,
+        language = track.language.as_deref().unwrap_or("und"),
+        title = track.title.as_deref().unwrap_or(""),
+        start_seconds = context.start_seconds,
+        "serving native HLS WebVTT subtitle"
+    );
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/vtt; charset=utf-8"),
+            (header::CACHE_CONTROL, "private, max-age=3600"),
+        ],
+        shift_webvtt(&bytes, context.start_seconds),
+    )
         .into_response())
+}
+
+fn quoted(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| match c {
+            '"' => '\'',
+            '\r' | '\n' => ' ',
+            other => other,
+        })
+        .collect()
+}
+
+fn language_tag(raw: Option<&str>) -> &str {
+    match raw.unwrap_or("und").to_ascii_lowercase().as_str() {
+        "eng" => "en",
+        "ita" => "it",
+        "jpn" => "ja",
+        "spa" => "es",
+        "fre" | "fra" => "fr",
+        "ger" | "deu" => "de",
+        "por" => "pt",
+        "kor" => "ko",
+        "chi" | "zho" => "zh",
+        "rus" => "ru",
+        _ => raw.unwrap_or("und"),
+    }
+}
+
+fn language_name(raw: Option<&str>) -> &str {
+    match language_tag(raw) {
+        "en" => "English",
+        "it" => "Italian",
+        "ja" => "Japanese",
+        "es" => "Spanish",
+        "fr" => "French",
+        "de" => "German",
+        "pt" => "Portuguese",
+        "ko" => "Korean",
+        "zh" => "Chinese",
+        "ru" => "Russian",
+        other => other,
+    }
+}
+
+fn subtitle_name(track: &SubtitleStream, ordinal: usize) -> String {
+    let language = language_name(track.language.as_deref());
+    match track
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(title) if language != "und" => format!("{language} · {title}"),
+        Some(title) => title.to_owned(),
+        None if language != "und" => language.to_owned(),
+        None => format!("Subtitle {}", ordinal + 1),
+    }
+}
+
+fn track_is_forced(track: &SubtitleStream) -> bool {
+    track.forced
+        || track
+            .title
+            .as_deref()
+            .is_some_and(|title| title.to_ascii_lowercase().contains("forced"))
+}
+
+fn master_playlist(file: &MediaFile, selected: Option<i64>) -> String {
+    let native: Vec<(usize, &SubtitleStream)> = file
+        .subtitle_streams
+        .iter()
+        .enumerate()
+        .filter(|(_, track)| is_native_text_subtitle(&track.codec))
+        .collect();
+    let mut out = String::from("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n");
+    for (index, track) in &native {
+        // The query describes this player's selection. No selected index is
+        // an explicit Off, not permission to resurrect a foreign-language
+        // container default behind the client's back.
+        let default = selected.is_some_and(|pick| pick == *index as i64);
+        out.push_str(&format!(
+            "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"{}\",LANGUAGE=\"{}\",DEFAULT={},AUTOSELECT=YES,FORCED={},URI=\"subs/{index}/index.m3u8\"\n",
+            quoted(&subtitle_name(track, *index)),
+            quoted(language_tag(track.language.as_deref())),
+            if default { "YES" } else { "NO" },
+            if track_is_forced(track) { "YES" } else { "NO" },
+        ));
+    }
+    let bandwidth = file.bitrate.unwrap_or(25_000_000).max(128_000);
+    if native.is_empty() {
+        out.push_str(&format!("#EXT-X-STREAM-INF:BANDWIDTH={bandwidth}\n"));
+    } else {
+        out.push_str(&format!(
+            "#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},SUBTITLES=\"subs\"\n"
+        ));
+    }
+    out.push_str("video.m3u8\n");
+    out
+}
+
+fn subtitle_media_playlist(duration_ms: Option<i64>, start_seconds: f64) -> String {
+    let total = duration_ms.unwrap_or(24 * 60 * 60 * 1000).max(1) as f64 / 1000.0;
+    let remaining = (total - start_seconds.max(0.0)).max(0.001);
+    format!(
+        "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:{}\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXTINF:{remaining:.3},\nsubtitle.vtt\n#EXT-X-ENDLIST\n",
+        remaining.ceil() as u64
+    )
+}
+
+fn parse_vtt_timestamp(raw: &str) -> Option<f64> {
+    let fields: Vec<&str> = raw.trim().split(':').collect();
+    let (hours, minutes, seconds) = match fields.as_slice() {
+        [minutes, seconds] => (
+            0.0,
+            minutes.parse::<f64>().ok()?,
+            seconds.parse::<f64>().ok()?,
+        ),
+        [hours, minutes, seconds] => (
+            hours.parse::<f64>().ok()?,
+            minutes.parse::<f64>().ok()?,
+            seconds.parse::<f64>().ok()?,
+        ),
+        _ => return None,
+    };
+    Some(hours * 3600.0 + minutes * 60.0 + seconds)
+}
+
+fn format_vtt_timestamp(seconds: f64) -> String {
+    let millis = (seconds.max(0.0) * 1000.0).round() as u64;
+    let hours = millis / 3_600_000;
+    let minutes = millis / 60_000 % 60;
+    let seconds = millis / 1000 % 60;
+    let millis = millis % 1000;
+    format!("{hours:02}:{minutes:02}:{seconds:02}.{millis:03}")
+}
+
+fn shift_webvtt(bytes: &[u8], offset_seconds: f64) -> Vec<u8> {
+    if offset_seconds <= 0.0 {
+        return bytes.to_vec();
+    }
+    let normalized = String::from_utf8_lossy(bytes)
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+    let mut shifted = Vec::new();
+    for block in normalized.split("\n\n") {
+        let mut lines: Vec<String> = block.lines().map(str::to_owned).collect();
+        let Some((line_index, start, end, settings)) =
+            lines.iter().enumerate().find_map(|(line_index, line)| {
+                let (left, right) = line.split_once("-->")?;
+                let right = right.trim_start();
+                let end_token = right.split_whitespace().next()?;
+                let start = parse_vtt_timestamp(left)?;
+                let end = parse_vtt_timestamp(end_token)?;
+                let settings = right[end_token.len()..].trim_start().to_owned();
+                Some((line_index, start, end, settings))
+            })
+        else {
+            shifted.push(block.to_owned());
+            continue;
+        };
+        if end <= offset_seconds {
+            continue;
+        }
+        let settings = if settings.is_empty() {
+            String::new()
+        } else {
+            format!(" {settings}")
+        };
+        lines[line_index] = format!(
+            "{} --> {}{}",
+            format_vtt_timestamp((start - offset_seconds).max(0.0)),
+            format_vtt_timestamp(end - offset_seconds),
+            settings
+        );
+        shifted.push(lines.join("\n"));
+    }
+    let mut out = shifted.join("\n\n");
+    out.push_str("\n\n");
+    out.into_bytes()
 }
 
 /// GET /api/v1/hls/:session/:segment — capability auth (see module docs).
@@ -316,6 +651,48 @@ pub async fn segment(
 mod tests {
     use super::*;
 
+    fn hls_file(subtitle_streams: Vec<SubtitleStream>) -> MediaFile {
+        MediaFile {
+            id: 5615,
+            item_id: 1,
+            path: "/media/Scary Movie.mkv".into(),
+            size: 19_000_000_000,
+            mtime: 1,
+            duration_ms: Some(120_000),
+            container: Some("mkv".into()),
+            video_codec: Some("hevc".into()),
+            video_profile: None,
+            width: Some(3840),
+            height: Some(2160),
+            bit_depth: Some(10),
+            hdr: Some("dolby_vision".into()),
+            hdr_format: Some("Dolby Vision".into()),
+            bitrate: Some(40_000_000),
+            audio_streams: vec![],
+            subtitle_streams,
+            scanned_at: 0,
+            audio_offset_ms: 0,
+            probed: true,
+        }
+    }
+
+    fn sub(
+        codec: &str,
+        language: &str,
+        title: &str,
+        default: bool,
+        forced: bool,
+    ) -> SubtitleStream {
+        SubtitleStream {
+            index: 0,
+            codec: codec.into(),
+            language: Some(language.into()),
+            title: Some(title.into()),
+            default,
+            forced,
+        }
+    }
+
     #[test]
     fn playback_audio_offset_is_bounded_and_carried_by_the_session() {
         let request = CreateSession {
@@ -323,6 +700,8 @@ mod tests {
             request_id: Some("attempt".into()),
             height: None,
             subtitle_burn: None,
+            native_subtitles: None,
+            subtitle: None,
             start: Some(12.0),
             audio: None,
             copy: Some(false),
@@ -334,5 +713,79 @@ mod tests {
 
         assert_eq!(request.audio_offset_ms, 15_000);
         assert_eq!(request.file_id, 7);
+    }
+
+    #[test]
+    fn bitmap_fallback_still_carries_an_explicit_burn_request() {
+        let request = CreateSession {
+            playback_id: "apple-bitmap".into(),
+            request_id: None,
+            height: Some(2160),
+            subtitle_burn: Some(5),
+            native_subtitles: Some(true),
+            subtitle: None,
+            start: None,
+            audio: None,
+            copy: None,
+            aac: None,
+            preserve_dolby_vision: None,
+            audio_offset_ms: None,
+        }
+        .into_request(5615, 2160);
+        assert_eq!(request.subtitle_burn, Some(5));
+        assert!(matches!(
+            request.kind,
+            crate::transcode::SessionKind::Transcode { height: 2160 }
+        ));
+    }
+
+    #[test]
+    fn native_hls_master_advertises_selection_language_names_and_forced_metadata() {
+        let file = hls_file(vec![
+            sub("subrip", "ita", "Forced", true, true),
+            sub("subrip", "ita", "Regular", false, false),
+            sub("subrip", "eng", "Forced", false, false),
+            sub("subrip", "eng", "Regular", false, false),
+            sub("webvtt", "eng", "SDH", false, false),
+        ]);
+        let master = master_playlist(&file, Some(2));
+
+        assert!(master.contains("#EXT-X-STREAM-INF:BANDWIDTH=40000000,SUBTITLES=\"subs\""));
+        assert!(master.contains("NAME=\"English · Forced\",LANGUAGE=\"en\",DEFAULT=YES,AUTOSELECT=YES,FORCED=YES,URI=\"subs/2/index.m3u8\""));
+        assert!(master.contains(
+            "NAME=\"Italian · Forced\",LANGUAGE=\"it\",DEFAULT=NO,AUTOSELECT=YES,FORCED=YES"
+        ));
+        assert!(master.contains("NAME=\"English · Regular\",LANGUAGE=\"en\",DEFAULT=NO"));
+        assert!(master.ends_with("video.m3u8\n"));
+    }
+
+    #[test]
+    fn bitmap_and_styled_subtitles_stay_out_of_native_renditions() {
+        let file = hls_file(vec![
+            sub("subrip", "eng", "Regular", false, false),
+            sub("hdmv_pgs_subtitle", "eng", "PGS", false, false),
+            sub("dvd_subtitle", "eng", "VobSub", false, false),
+            sub("ass", "eng", "Styled Signs", false, false),
+            sub("ssa", "eng", "Styled Dialogue", false, false),
+        ]);
+        let master = master_playlist(&file, None);
+        assert!(master.contains("subs/0/index.m3u8"));
+        for index in 1..=4 {
+            assert!(!master.contains(&format!("subs/{index}/index.m3u8")));
+        }
+    }
+
+    #[test]
+    fn subtitle_playlist_and_vtt_are_shifted_to_a_resume_timeline() {
+        let playlist = subtitle_media_playlist(Some(120_000), 30.0);
+        assert!(playlist.contains("#EXT-X-TARGETDURATION:90"));
+        assert!(playlist.contains("#EXTINF:90.000,"));
+        assert!(playlist.ends_with("subtitle.vtt\n#EXT-X-ENDLIST\n"));
+
+        let source = b"WEBVTT\n\n00:00:01.000 --> 00:00:02.000\npast\n\ncue-id\n00:00:09.000 --> 00:00:11.000 align:start\ncrossing\n\n00:00:15.250 --> 00:00:16.500\nfuture\n";
+        let shifted = String::from_utf8(shift_webvtt(source, 10.0)).expect("utf8");
+        assert!(!shifted.contains("past"));
+        assert!(shifted.contains("00:00:00.000 --> 00:00:01.000 align:start"));
+        assert!(shifted.contains("00:00:05.250 --> 00:00:06.500"));
     }
 }
