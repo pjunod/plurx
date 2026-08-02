@@ -469,6 +469,21 @@ pub trait WatchStore: Send + Sync + 'static {
     /// watched. A playable item is its own leaf, so this answers for movies
     /// too — a movie is 1/1 or 0/1.
     async fn watch_rollup(&self, user_id: i64, item_id: i64) -> Result<WatchRollup, StoreError>;
+    /// [`WatchStore::watch_rollup`] for a whole page of containers, in one
+    /// query.
+    ///
+    /// A library grid needs this for every show and season it paints, and a
+    /// rollup is a recursive walk: doing it per card is an N+1 that grows
+    /// with the season count, not the page size. Same contract as the single
+    /// version, including the answer for a container holding nothing playable
+    /// — every requested id gets an entry, `0/0` if its subtree has no
+    /// leaves, so a caller never has to guess whether a missing key means
+    /// "empty" or "not asked".
+    async fn watch_rollups(
+        &self,
+        user_id: i64,
+        ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, WatchRollup>, StoreError>;
     async fn continue_watching(
         &self,
         user_id: i64,

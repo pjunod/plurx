@@ -18,6 +18,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use plurx_core::domain::{MediaFile, SubtitleStream};
+use plurx_core::playback::PlaybackMethod;
 use plurx_core::tracks::is_native_text_subtitle;
 
 use super::error::ApiError;
@@ -57,6 +58,14 @@ pub struct StartResponse {
     /// menu and the Auto controller move between, so the client never
     /// hardcodes them (ADAPTIVE-QUALITY.md Phase 1).
     pub ladder: Vec<crate::transcode::Rung>,
+    /// What dynamic range the bytes of *this session* carry
+    /// (`"dolby_vision" | "hdr10" | "hlg" | "sdr"`). It overrides the
+    /// decision's answer the moment the session attaches, because a burn or
+    /// a manually-picked rung forces a transcode the decision never promised
+    /// (MEDIA-BADGES-PLAN §3.2). Absent when the source file vanished from
+    /// the store mid-request: the client keeps whatever it had.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivered_dynamic_range: Option<&'static str>,
 }
 
 /// Everything a client must say to open a stream.
@@ -133,6 +142,33 @@ impl CreateSession {
     }
 }
 
+/// The dynamic range this session puts on the wire, read off the session it
+/// actually built rather than the decision that suggested it — a burn or a
+/// forced rung produces a transcode `/decision` never promised, and the
+/// badge has to follow the session (MEDIA-BADGES-PLAN §3.2).
+///
+/// `None` only when the source row could not be loaded; there is nothing
+/// honest to say about a file we cannot see.
+fn session_delivered_dynamic_range(
+    source: Option<&MediaFile>,
+    kind: &crate::transcode::SessionKind,
+) -> Option<&'static str> {
+    use crate::transcode::SessionKind;
+    let file = source?;
+    // One helper for both wire fields, so the decision and the session can
+    // never disagree about the same delivery.
+    let (method, preserve) = match kind {
+        SessionKind::Copy {
+            preserve_dolby_vision,
+            ..
+        } => (PlaybackMethod::Remux, *preserve_dolby_vision),
+        SessionKind::Transcode { .. } => (PlaybackMethod::Transcode, false),
+    };
+    Some(plurx_core::playback::delivered_dynamic_range(
+        file, method, preserve,
+    ))
+}
+
 /// POST /api/v1/files/:id/hls/sessions — create a stream, or recover the one
 /// an identical request already created.
 pub async fn create(
@@ -178,6 +214,7 @@ pub async fn create(
         }
     }
     let request = req.into_request(id, height);
+    let delivered = session_delivered_dynamic_range(source.as_ref(), &request.kind);
     // A session being created is playback beginning — the honest moment for
     // the scrobble that used to fire from `/decision`.
     crate::playstart::note_playback_started(&state, user.id, id);
@@ -211,6 +248,7 @@ pub async fn create(
         encoder: info.encoder.to_owned(),
         vod: info.vod,
         ladder: crate::transcode::ladder(source_height),
+        delivered_dynamic_range: delivered,
     }))
 }
 
@@ -519,14 +557,32 @@ fn track_is_forced(track: &SubtitleStream) -> bool {
             .is_some_and(|title| title.to_ascii_lowercase().contains("forced"))
 }
 
+/// The Apple accessibility `CHARACTERISTICS` for an SDH / hard-of-hearing
+/// rendition — the tag that lets a viewer who needs captions find them by
+/// what they *do* rather than by what someone happened to name them.
+///
+/// The container's own `hearing_impaired` disposition answers first: it is
+/// the authored fact, and it is right even for a track called "English 2".
+/// The title sniff stays as the fallback, because a library probed before
+/// plurx read that disposition has nothing else to go on and re-probing is
+/// manual — so the naming convention keeps working exactly as it did.
 fn subtitle_characteristics(track: &SubtitleStream) -> Option<&'static str> {
+    const ACCESSIBILITY: &str =
+        "public.accessibility.transcribes-spoken-dialog,public.accessibility.describes-music-and-sound";
+    if track.hearing_impaired {
+        return Some(ACCESSIBILITY);
+    }
     let title = track.title.as_deref()?.to_ascii_lowercase();
-    ["sdh", "closed caption", "closed-caption", "hard of hearing", "non udenti"]
-        .iter()
-        .any(|marker| title.contains(marker))
-        .then_some(
-            "public.accessibility.transcribes-spoken-dialog,public.accessibility.describes-music-and-sound",
-        )
+    [
+        "sdh",
+        "closed caption",
+        "closed-caption",
+        "hard of hearing",
+        "non udenti",
+    ]
+    .iter()
+    .any(|marker| title.contains(marker))
+    .then_some(ACCESSIBILITY)
 }
 
 fn master_playlist(file: &MediaFile, selected: Option<i64>) -> String {
@@ -863,6 +919,7 @@ mod tests {
             title: Some(title.into()),
             default,
             forced,
+            hearing_impaired: false,
         }
     }
 
@@ -912,6 +969,42 @@ mod tests {
         ));
     }
 
+    /// The session's answer is the one that wins once playback attaches, so
+    /// it has to be read off the session that was built — not off the
+    /// decision that suggested one. A DV remux the client can take delivers
+    /// Dolby Vision; the same file behind a rung or a burn delivers SDR,
+    /// because the encoder tone-maps it.
+    #[test]
+    fn a_session_reports_the_dynamic_range_of_the_stream_it_just_built() {
+        let file = hls_file(vec![]);
+        let copy = |preserve: bool| crate::transcode::SessionKind::Copy {
+            aac: false,
+            preserve_dolby_vision: preserve,
+        };
+        assert_eq!(
+            session_delivered_dynamic_range(Some(&file), &copy(true)),
+            Some("dolby_vision")
+        );
+        // Stripped: what reaches the client is the compatible base layer.
+        let mut base = file.clone();
+        base.hdr_format = Some("Dolby Vision · Profile 7 (HDR10-compatible)".into());
+        assert_eq!(
+            session_delivered_dynamic_range(Some(&base), &copy(false)),
+            Some("hdr10")
+        );
+        assert_eq!(
+            session_delivered_dynamic_range(
+                Some(&file),
+                &crate::transcode::SessionKind::Transcode { height: 1080 }
+            ),
+            Some("sdr"),
+            "every transcode is H.264 8-bit, whatever the source carried"
+        );
+        // A file that vanished from the store mid-request says nothing at
+        // all rather than guessing; the client keeps what it had.
+        assert_eq!(session_delivered_dynamic_range(None, &copy(true)), None);
+    }
+
     #[test]
     fn native_hls_master_advertises_selection_language_names_and_forced_metadata() {
         let file = hls_file(vec![
@@ -934,6 +1027,53 @@ mod tests {
         assert!(master.contains("NAME=\"English · Regular\",LANGUAGE=\"en\",DEFAULT=NO"));
         assert!(master.contains("NAME=\"English · SDH\",LANGUAGE=\"en\",DEFAULT=NO,AUTOSELECT=YES,FORCED=NO,CHARACTERISTICS=\"public.accessibility.transcribes-spoken-dialog,public.accessibility.describes-music-and-sound\""));
         assert!(master.ends_with("index.m3u8\n"));
+    }
+
+    /// Who gets the accessibility tag: the muxer's answer first, the track's
+    /// name only as a fallback. The fallback is not decoration — files
+    /// probed before plurx read the disposition carry `false` for it, and
+    /// re-probing is a manual scan, so the naming convention is still the
+    /// only signal an existing library has.
+    #[test]
+    fn sdh_renditions_are_tagged_from_the_disposition_before_the_title() {
+        let accessibility = "CHARACTERISTICS=\"public.accessibility.transcribes-spoken-dialog,public.accessibility.describes-music-and-sound\"";
+        let flagged = SubtitleStream {
+            hearing_impaired: true,
+            ..sub("subrip", "eng", "English", false, false)
+        };
+        assert!(subtitle_characteristics(&flagged).is_some());
+
+        let file = hls_file(vec![
+            flagged,
+            sub("subrip", "eng", "English SDH", false, false),
+            sub("subrip", "eng", "Regular", false, false),
+        ]);
+        let master = master_playlist(&file, None);
+        assert_eq!(
+            master.matches(accessibility).count(),
+            2,
+            "the flagged track and the named one, and only those: {master}"
+        );
+        let line = |name: &str| {
+            master
+                .lines()
+                .find(|line| line.contains(&format!("NAME=\"{name}\"")))
+                .unwrap_or_else(|| panic!("no rendition named {name} in {master}"))
+        };
+        assert!(
+            line("English · English").contains(accessibility),
+            "the disposition tags a track its title says nothing about"
+        );
+        assert!(line("English · English SDH").contains(accessibility));
+        assert!(!line("English · Regular").contains(accessibility));
+
+        // A track with no title at all is not an accessibility track by
+        // default — silence is not a claim.
+        let untitled = SubtitleStream {
+            title: None,
+            ..sub("subrip", "eng", "", false, false)
+        };
+        assert_eq!(subtitle_characteristics(&untitled), None);
     }
 
     #[test]

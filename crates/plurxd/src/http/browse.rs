@@ -104,6 +104,20 @@ pub async fn list_items(
         .map(|i| i.id)
         .collect();
     let counts = state.store.child_counts(&folder_ids).await?;
+    // Containers carry no watch row of their own, so a grid filtering by
+    // "Watched"/"In progress" has nothing to filter a show on — the state
+    // lives on its episodes, which aren't in this response. One batched
+    // rollup query per page answers it for every container at once; the
+    // per-card version would be an N+1 over a recursive walk. Gated by kind
+    // exactly as `item_detail` gates its single rollup; leaves keep `watch`
+    // only, which already tells the whole truth about them.
+    let container_ids: Vec<i64> = page
+        .items
+        .iter()
+        .filter(|i| matches!(i.kind, ItemKind::Show | ItemKind::Season | ItemKind::Folder))
+        .map(|i| i.id)
+        .collect();
+    let rollups = state.store.watch_rollups(user.id, &container_ids).await?;
     let items = page
         .items
         .into_iter()
@@ -111,10 +125,12 @@ pub async fn list_items(
             let w = watch.get(&item.id).copied();
             let res = heights.get(&item.id).copied();
             let count = counts.get(&item.id).copied();
+            let rollup = rollups.get(&item.id).copied();
             ItemDto::from(item)
                 .with_watch(w)
                 .with_resolution(res)
                 .with_child_count(count)
+                .with_rollup(rollup)
         })
         .collect();
     Ok(Json(ItemListResponse {

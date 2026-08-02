@@ -92,6 +92,58 @@ The three outcomes and what they cost:
 `reasons[]` names every dimension that failed, so the stats overlay can explain
 itself. An empty `reasons[]` means direct play.
 
+## Dynamic range — source, delivered, rendered
+
+A badge built from the source probe answers "what is this file?" while the
+viewer is asking "what am I getting?" — which is how a Dolby Vision disc
+remux came to show a full-colour "DV P7" over a tone-mapped SDR transcode of
+itself. Three layers, one owner each:
+
+| Layer | Question | Owner |
+|---|---|---|
+| Source | What does the file carry? | server probe (`MediaFile.hdr` / `hdr_format`) |
+| Delivered | What grade is in the bytes this session sends? | server (`delivered_dynamic_range`) |
+| Rendered | Is the display actually showing that grade? | client (display/decoder APIs) |
+
+**Delivered** rides on both responses a client already reads, with the same
+vocabulary as `MediaFile.hdr` plus `"sdr"`, so a client compares source
+against delivered with string equality:
+
+- `GET /files/{id}/decision` → `delivered_dynamic_range` (always present),
+  describing the plan as decided.
+- `POST /files/{id}/hls/sessions` → `delivered_dynamic_range` (nullable; the
+  key is omitted when the source row could not be read), describing the
+  session actually created. It **overrides** the decision's value the moment
+  a session attaches — a burn or a manually-picked rung produces a transcode
+  the decision never promised.
+
+Both come from one function, `plurx_core::playback::delivered_dynamic_range`,
+so the two answers cannot drift. It is a reporter, not a decider: the three
+deliveries are total, and the values fall out of what the pipeline already
+does.
+
+```
+ direct play ────────────────▶ the source's grade, untouched
+ remux / copy ─┬─ preserve DV ▶ dolby_vision   (dvh1 tag, RPUs kept)
+               ├─ strip DV ───▶ the base layer: "(HLG-compatible)" → hlg,
+               │                else → hdr10
+               └─ non-DV ─────▶ the source's grade (the video is copied)
+ transcode ──────────────────▶ sdr, always (H.264 8-bit + tone-map)
+```
+
+A client combines that with the strongest *local* signal it has — the display
+is HDR-capable, and where a platform exposes it, the decoder confirming what
+it engaged — and renders one of three badge states:
+
+| State | Condition | Rendering |
+|---|---|---|
+| **lit** | rendered == source grade | the full-colour chip (gold DV / teal HDR) |
+| **downgraded** | rendered ≠ source grade | chip dimmed, arrow suffix names what is on screen (`DV P7 → HDR10`) |
+| **source-only** | no active session (detail screens) | the source's chip, undimmed |
+
+An older client never reads the field; a newer one treats an absent field as
+"unknown" and falls back to the source-only chip. Nothing breaks either way.
+
 ## Delivery — the client's transport choice
 
 A verdict names *what* to send; the client still has to pick *how*, because a

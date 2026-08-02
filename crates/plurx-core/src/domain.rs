@@ -305,6 +305,15 @@ pub struct SubtitleStream {
     pub title: Option<String>,
     pub default: bool,
     pub forced: bool,
+    /// The container's `hearing_impaired` disposition — SDH / closed
+    /// captions, the track that also transcribes the door slam.
+    ///
+    /// `#[serde(default)]` because probe JSON stored before this field
+    /// existed has no key for it, and a library is not re-probed just
+    /// because plurx learned to read one more flag: an old row deserializes
+    /// as `false` and falls back to the title sniff it always used.
+    #[serde(default)]
+    pub hearing_impaired: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
