@@ -912,6 +912,11 @@ struct Session {
     /// subtitle master must advertise these alongside `wvtt`; omitting the
     /// referenced formats makes AVPlayer reject an otherwise playable copy.
     hls_codecs: String,
+    /// Backward-compatible enhancement carried by the video samples, such as
+    /// Dolby Vision Profile 8.1 over an HDR10 HEVC base layer. Apple requires
+    /// this outside CODECS so clients that only understand the base can still
+    /// select the variant.
+    hls_supplemental_codecs: Option<String>,
     target_height: i64,
     /// The encoder actually running *now*. Mutable because the
     /// hardware->software fallback replaces the process inside one session,
@@ -1159,6 +1164,7 @@ pub struct HlsContext {
     pub file_id: i64,
     pub start_seconds: f64,
     pub codecs: String,
+    pub supplemental_codecs: Option<String>,
 }
 
 fn audio_track(
@@ -1186,12 +1192,24 @@ fn copied_hls_codecs(
     audio_index: Option<i64>,
     options: CopySessionOptions,
     probe_json: Option<&str>,
-) -> String {
+) -> (String, Option<String>) {
+    let mut supplemental = None;
     let video = match file.video_codec.as_deref() {
         Some("hevc" | "h265")
             if options.preserve_dolby_vision && file.hdr.as_deref() == Some("dolby_vision") =>
         {
-            dolby_vision_hls_codec(probe_json).unwrap_or_else(|| "dvh1".to_owned())
+            match dolby_vision_hls_config(probe_json) {
+                Some(config) if config.profile == 8 && config.compatibility_id == Some(1) => {
+                    supplemental = Some(format!("{}/db1p", config.codec));
+                    hevc_hls_codec(probe_json).unwrap_or_else(|| "hvc1".to_owned())
+                }
+                Some(config) if config.profile == 8 && config.compatibility_id == Some(4) => {
+                    supplemental = Some(format!("{}/db4h", config.codec));
+                    hevc_hls_codec(probe_json).unwrap_or_else(|| "hvc1".to_owned())
+                }
+                Some(config) => config.codec,
+                None => "dvh1".to_owned(),
+            }
         }
         Some("hevc" | "h265") => "hvc1".to_owned(),
         _ => "avc1".to_owned(),
@@ -1201,7 +1219,7 @@ fn copied_hls_codecs(
     } else {
         copied_audio_codec(file, audio_index)
     };
-    format!("{video},{audio}")
+    (format!("{video},{audio}"), supplemental)
 }
 
 /// AVPlayer accepts a media playlist without codec metadata, but a
@@ -1210,11 +1228,25 @@ fn copied_hls_codecs(
 /// fail during asset preparation. The scanner keeps ffprobe's DOVI
 /// configuration record verbatim, so use the exact values that are also
 /// carried by the remuxed sample entry.
-fn dolby_vision_hls_codec(probe_json: Option<&str>) -> Option<String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DolbyVisionHlsConfig {
+    codec: String,
+    profile: u64,
+    compatibility_id: Option<u64>,
+}
+
+fn video_probe_stream(probe_json: Option<&str>) -> Option<serde_json::Value> {
     let probe: serde_json::Value = serde_json::from_str(probe_json?).ok()?;
-    let video = probe.get("streams")?.as_array()?.iter().find(|stream| {
-        stream.get("codec_type").and_then(|value| value.as_str()) == Some("video")
-    })?;
+    probe
+        .get("streams")?
+        .as_array()?
+        .iter()
+        .find(|stream| stream.get("codec_type").and_then(|value| value.as_str()) == Some("video"))
+        .cloned()
+}
+
+fn dolby_vision_hls_config(probe_json: Option<&str>) -> Option<DolbyVisionHlsConfig> {
+    let video = video_probe_stream(probe_json)?;
     let dovi = video
         .get("side_data_list")?
         .as_array()?
@@ -1226,7 +1258,33 @@ fn dolby_vision_hls_codec(probe_json: Option<&str>) -> Option<String> {
         })?;
     let profile = dovi.get("dv_profile")?.as_u64()?;
     let level = dovi.get("dv_level")?.as_u64()?;
-    Some(format!("dvh1.{profile:02}.{level:02}"))
+    Some(DolbyVisionHlsConfig {
+        codec: format!("dvh1.{profile:02}.{level:02}"),
+        profile,
+        compatibility_id: dovi
+            .get("dv_bl_signal_compatibility_id")
+            .and_then(serde_json::Value::as_u64),
+    })
+}
+
+/// RFC 6381 HEVC identifier for the HDR10/HLG base layer used by a
+/// backward-compatible Dolby Vision stream. The sources plurx copies are
+/// Main/Main10, and ffprobe's numeric `level` is already the value RFC 6381
+/// places after the tier letter (for example 150 for HEVC level 5.0).
+fn hevc_hls_codec(probe_json: Option<&str>) -> Option<String> {
+    let video = video_probe_stream(probe_json)?;
+    let profile = match video.get("profile")?.as_str()? {
+        "Main" => 1,
+        "Main 10" => 2,
+        _ => return None,
+    };
+    let level = video.get("level")?.as_u64()?;
+    let tier = if video.get("tier").and_then(serde_json::Value::as_str) == Some("High") {
+        'H'
+    } else {
+        'L'
+    };
+    Some(format!("hvc1.{profile}.4.{tier}{level}.B0"))
 }
 
 pub struct StartInfo {
@@ -2019,6 +2077,7 @@ impl TranscodeManager {
             playback_id: playback_id.to_owned(),
             start_seconds: 0.0,
             hls_codecs: "avc1,mp4a.40.2".into(),
+            hls_supplemental_codecs: None,
             target_height: opts.target_height,
             encoder_label: Mutex::new("cached"),
             started_unix: std::time::SystemTime::now()
@@ -3044,6 +3103,7 @@ impl TranscodeManager {
             playback_id: playback_id.to_owned(),
             start_seconds,
             hls_codecs: "avc1,mp4a.40.2".into(),
+            hls_supplemental_codecs: None,
             target_height,
             encoder_label: Mutex::new(encoder.label()),
             started_unix: std::time::SystemTime::now()
@@ -3464,6 +3524,8 @@ impl TranscodeManager {
             (child, None)
         };
 
+        let (hls_codecs, hls_supplemental_codecs) =
+            copied_hls_codecs(&file, audio_override, options, probe_json.as_deref());
         let session = Arc::new(Session {
             dir: dir.clone(),
             child: Mutex::new(Some(child)),
@@ -3475,7 +3537,8 @@ impl TranscodeManager {
             user_name: user_name.to_owned(),
             playback_id: playback_id.to_owned(),
             start_seconds,
-            hls_codecs: copied_hls_codecs(&file, audio_override, options, probe_json.as_deref()),
+            hls_codecs,
+            hls_supplemental_codecs,
             target_height: file.height.unwrap_or(0),
             encoder_label: Mutex::new("copy"),
             started_unix: std::time::SystemTime::now()
@@ -3673,6 +3736,7 @@ impl TranscodeManager {
             file_id: session.file_id,
             start_seconds: session.start_seconds,
             codecs: session.hls_codecs.clone(),
+            supplemental_codecs: session.hls_supplemental_codecs.clone(),
         })
     }
 
@@ -4905,10 +4969,13 @@ mod tests {
                     preserve_dolby_vision: true,
                 },
                 Some(
-                    r#"{"streams":[{"codec_type":"video","side_data_list":[{"side_data_type":"DOVI configuration record","dv_profile":8,"dv_level":6}]}]}"#,
+                    r#"{"streams":[{"codec_type":"video","profile":"Main 10","level":150,"side_data_list":[{"side_data_type":"DOVI configuration record","dv_profile":8,"dv_level":6,"dv_bl_signal_compatibility_id":1}]}]}"#
                 ),
             ),
-            "dvh1.08.06,ec-3"
+            (
+                "hvc1.2.4.L150.B0,ec-3".to_owned(),
+                Some("dvh1.08.06/db1p".to_owned())
+            )
         );
         assert_eq!(
             copied_hls_codecs(
@@ -4920,7 +4987,7 @@ mod tests {
                 },
                 None,
             ),
-            "hvc1,mp4a.40.2"
+            ("hvc1,mp4a.40.2".to_owned(), None)
         );
     }
 
@@ -4948,6 +5015,7 @@ mod tests {
             playback_id: "pb-test".into(),
             start_seconds: 0.0,
             hls_codecs: "avc1,mp4a.40.2".into(),
+            hls_supplemental_codecs: None,
             target_height: 720,
             encoder_label: Mutex::new("test"),
             started_unix: 0,
@@ -5584,6 +5652,7 @@ mod tests {
             playback_id: "pb-watchdog".into(),
             start_seconds: 0.0,
             hls_codecs: "avc1,mp4a.40.2".into(),
+            hls_supplemental_codecs: None,
             target_height: 1080,
             encoder_label: Mutex::new("test"),
             started_unix: 0,
