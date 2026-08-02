@@ -1,0 +1,85 @@
+# Known contrast failures — the debt scripts/contrast-check is allowed to carry.
+#
+# The gate exists to catch the next regression, not to relitigate the last one.
+# The three SHIPPED themes (classic, terminal, noirr) carry contrast failures
+# that predate the theme catalogue work and whose fix is a brand decision, not
+# an engineering one; with no allowlist the gate would fail on day one for debt
+# nobody has agreed to pay, and a gate that always fails is a gate everybody
+# learns to skip. So: every pair named below is measured, is still below
+# 4.50:1, and is waived — everything NOT named still fails the build.
+#
+# Every line here is technical debt, not an exemption on principle. Nothing in
+# this file says a pair is fine; it says the decision to fix it is open. That
+# decision is §8 box 4 of docs/UI-LAYOUTS-IMPLEMENTATION.md ("Fix shipped
+# light-theme contrast": all · statuses only, waive brand accents · leave them
+# alone), and §7 of the same document already carries the exact darkened values
+# that pass. When the box is ticked, this file shrinks accordingly.
+#
+# A LINE THAT HAS STARTED PASSING IS AN ERROR — delete it, do not leave it.
+# contrast-check re-measures every entry and fails the run if one of them now
+# clears the bar, because an allowlist nobody prunes stops being a record of
+# what is owed and becomes a list of lies. Same for a line naming a theme,
+# mode, token or surface that does not exist: that is a typo silently waiving
+# nothing (or worse, something else).
+#
+# Syntax: one pair per line, `<theme> <mode> <fg-token> on <bg-surface>`, with
+# names exactly as they appear in the THEMES table. No ratios, deliberately —
+# a number in this file would go stale the moment anyone nudged a value, and
+# the tool measures the real one on every run anyway.
+#
+# Regenerate the measurements (not this file) with:
+#   scripts/contrast-check --from-index crates/plurxd/src/web/index.html \
+#       --foregrounds='--text,--muted,--prose,--accent,--good,--warn,--bad'
+# --accent2 is absent from that list and from this file on purpose: it is not a
+# text token here (two uses, both the far end of a gradient), so measuring it
+# as ink on a page is the wrong test. Dark variants of all three themes pass
+# except the one noirr button below; the seven catalogue themes pass outright.
+
+# classic / light — neither kit-exact nor a period reproduction: just values
+# that were never measured. The easiest group to simply fix (§7: --accent
+# #2f6fe0 -> #2e6cdb), and the first that should leave this file.
+classic light --accent on --bg
+classic light --accent on --panel2
+classic light --good on --bg
+classic light --good on --panel
+classic light --good on --panel2
+classic light --warn on --panel2
+classic light --bad on --bg
+classic light --bad on --panel
+classic light --bad on --panel2
+
+# terminal / light — faithful Solarized, whose dim statuses ARE the aesthetic;
+# darkening them makes the theme stop being the thing it is imitating. Fixing
+# the statuses (which carry meaning) while waiving the accent is the defensible
+# middle, and that is what §8 box 4 has to choose between.
+terminal light --muted on --bg
+terminal light --muted on --panel
+terminal light --muted on --panel2
+terminal light --prose on --bg
+terminal light --prose on --panel2
+terminal light --accent on --bg
+terminal light --accent on --panel
+terminal light --accent on --panel2
+terminal light --good on --bg
+terminal light --good on --panel
+terminal light --good on --panel2
+terminal light --warn on --bg
+terminal light --warn on --panel
+terminal light --warn on --panel2
+terminal light --bad on --bg
+terminal light --bad on --panel
+terminal light --bad on --panel2
+terminal light --btn-ink on --accent
+
+# noirr — the brand theme; matinee (light) and the crimson button ink are
+# kit-exact values from brand/tokens.css, so changing one is a brand decision
+# and the kit file changes in the same commit. Not ours to fix unilaterally.
+noirr dark --btn-ink on --accent
+noirr light --good on --bg
+noirr light --good on --panel
+noirr light --warn on --bg
+noirr light --warn on --panel
+noirr light --warn on --panel2
+noirr light --bad on --bg
+noirr light --bad on --panel
+noirr light --bad on --panel2

@@ -81,6 +81,27 @@ playback-smoke-firefox: ## Run the playback smoke matrix in Firefox (needs gecko
 playback-full: ## Run every fixture x quality plus playback restart cases
 	@scripts/playback-lab run --suite full
 
+## ---- web UI baseline ---------------------------------------------------
+
+# The layout work rearranges one 6000-line file with no component tests under
+# it. `ui-baseline` photographs the shipped UI so a refactor can be *shown* to
+# have changed nothing. The goldens are not committed: regenerate them from the
+# pre-change commit, keep the directory, and re-run afterwards.
+.PHONY: ui-baseline
+ui-baseline: ## Capture the deterministic UI screenshot + tab-order baseline
+	@scripts/ui-baseline --self-host
+
+# `make check` cannot see either of these. index.html is include_str!-embedded,
+# so a JS syntax error in it compiles, links, passes every Rust test, and then
+# serves a blank page; and the theme tables are data, so a token pair that
+# fails contrast is not a type error anywhere. Run this on any web change.
+.PHONY: web-check
+web-check: ## Syntax-check the embedded JS and contrast-check every shipped theme
+	@scripts/js-check
+	@scripts/contrast-check --from-index crates/plurxd/src/web/index.html \
+		--foregrounds='--text,--muted,--prose,--accent,--good,--warn,--bad' \
+		--allow scripts/contrast-allow.txt
+
 ## ---- packaging & setup -------------------------------------------------
 
 # What a build from this tree stamps into the binary. Keep in step with

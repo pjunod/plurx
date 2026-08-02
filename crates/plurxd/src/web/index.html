@@ -806,6 +806,450 @@
   [data-theme=noirr] .pspin{width:16px;height:30px;border:0;border-radius:2px;background:var(--accent);animation:noirrblink 1.15s steps(1,end) infinite;
     box-shadow:0 0 12px var(--glow),0 0 34px var(--glow)}
   [data-theme=noirr] .activity .spin{width:8px;height:13px;border:0;border-radius:1px;background:var(--accent);animation:noirrblink 1.15s steps(1,end) infinite}
+  /* ======================= catalogue theme treatments ======================
+     Palette values live in THEMES; only the treatments a palette cannot carry
+     live here. All of it is scoped to one [data-theme=…], so a theme this
+     file has never heard of renders as plain tokens rather than as a mistake. */
+  /* The midnight-only marker in the theme menu, and the same sentence in the
+     appearance menu. Small, muted, and always a WORD — a dark-only theme that
+     signalled itself with a colour would be invisible to the people the
+     constraint most affects. */
+  .amnote{font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin-left:8px;opacity:.85}
+  .amwarn{font-size:11px;color:var(--muted);padding:4px 10px 8px;line-height:1.35}
+  /* Giallo — noirr's structural treatment carried over, because Giallo is the
+     kit's amber showtime rather than a separate design. Grain is louder and
+     the glow is warmer; everything else is inherited from the tokens. */
+  [data-theme=giallo] .card,[data-theme=giallo] .version,[data-theme=giallo] .filebox,[data-theme=giallo] .amenu,[data-theme=giallo] .toast{box-shadow:var(--shadow)}
+  [data-theme=giallo] .hero::before,[data-theme=giallo] .center::before{content:"";position:absolute;inset:0;pointer-events:none;z-index:1;opacity:var(--grain,0);
+    background-image:radial-gradient(circle at 1px 1px, rgba(255,225,170,.55) 0.5px, transparent 0.5px);background-size:3px 3px}
+  [data-theme=giallo][data-mode=dark] .poster:hover{box-shadow:0 0 0 1px var(--accent),0 0 18px var(--glow)}
+  /* Silver — the discipline theme. Status colours are quietly tinted rather
+     than grey, and every status pill keeps its word, so meaning survives even
+     where the tint is nearly invisible. Focus is a ring plus a lift, never a
+     hue: on a monochrome palette a colour-only focus ring is no ring at all. */
+  [data-theme=silver] .poster:focus-visible,[data-theme=silver] .card:focus-visible{outline:2px solid var(--accent);outline-offset:2px;transform:translateY(-2px)}
+  /* Void — true black. Borders carry every edge because there is no shadow to
+     see against #000, and the panels are close enough in value that losing the
+     border would merge them into one undifferentiated field. */
+  [data-theme=void] .card,[data-theme=void] .version,[data-theme=void] .filebox,[data-theme=void] .amenu,[data-theme=void] .toast,[data-theme=void] .poster{border:1px solid var(--line);box-shadow:none}
+  /* VHS — the wordmark gets the chromatic double-shadow (magenta left, cyan
+     right), the same trick a misaligned tape head plays on a title card. */
+  [data-theme=vhs] .logo{text-shadow:-1.5px 0 var(--accent),1.5px 0 var(--accent2)}
+  [data-theme=vhs] .card,[data-theme=vhs] .amenu,[data-theme=vhs] .toast{box-shadow:var(--shadow)}
+  /* VHS loading language: chunky tracking bars instead of a spinner.
+     The bars ANIMATE only where motion is welcome; the static rule below is
+     the fallback, and it is a rule rather than an absence because "loading" is
+     information — if it only existed as movement, reduced-motion users would
+     see a blank box and read it as "nothing here". */
+  [data-theme=vhs] .pspin{width:52px;height:16px;border:0;border-radius:2px;
+    background:repeating-linear-gradient(180deg,var(--accent) 0 3px,transparent 3px 6px);opacity:.85}
+  @media (prefers-reduced-motion: no-preference){
+    [data-theme=vhs] .pspin{background-size:100% 12px;animation:vhstrack .9s linear infinite}
+    @keyframes vhstrack{from{background-position:0 0}to{background-position:0 12px}}
+  }
+  /* Paper — deliberately plain: no grain, no glow, no animated brand. The
+     rule that earns its keep is the reading measure, because an editorial
+     theme whose prose runs the full width of a 1400px column is not one. */
+  [data-theme=paper] .overview,[data-theme=paper] .prose{max-width:68ch}
+  /* ============================ plex layout =================================
+     Structure only. Every rule is scoped under [data-layout=plex] so nothing
+     here can reach classic — the G2 gate diffs classic's rendered baseline and
+     a single unscoped selector fails it.
+
+     Colour rule, without exception: structural surfaces are token mixes
+     (color-mix over --panel/--bg/--accent), never literal hex. On 2026-07-22 a
+     set of hardcoded dark hexes shipped and every light theme grew black
+     boxes; the mixes below are the reason one stylesheet survives 3 themes ×
+     light/dark. The only literal colours in this file are inside
+     @media(forced-colors:active), where system keywords are the required
+     spelling.
+
+     Layout is driven by width media queries rather than surfaceClass(): the
+     chrome emits the sidebar AND the bottom tab bar on every surface and CSS
+     decides which is real. A dragged window then changes shape live, with no
+     re-render and no stale JS branch — the same reason the shipped app decides
+     poster columns with auto-fill instead of measuring in script.
+     ========================================================================= */
+
+  /* ---- shell ------------------------------------------------------------ */
+  [data-layout=plex] .px-shell{display:flex;min-height:100dvh;align-items:flex-start}
+  /* The sidebar is a fixed column that never scrolls with the page: it is the
+     one thing on screen that must stay reachable while a 200-item grid scrolls
+     past it. height is 100dvh (not vh) so a phone's collapsing URL bar cannot
+     leave the footer chip stranded below the fold. */
+  [data-layout=plex] .px-side{
+    flex:0 0 236px;width:236px;align-self:stretch;
+    position:sticky;top:0;height:100dvh;
+    display:flex;flex-direction:column;
+    background:color-mix(in srgb, var(--panel) 72%, var(--bg));
+    border-right:1px solid var(--line);
+    z-index:20}
+  /* Three bands: a pinned head (wordmark + search), a scrolling middle (the
+     library list, which is the only part that can grow without bound), and a
+     pinned foot. The scroller is the MIDDLE band and not the whole aside on
+     purpose — `overflow-y:auto` on an element clips its absolutely-positioned
+     descendants, and the theme/appearance/account popovers live in the foot. */
+  [data-layout=plex] .px-head{flex:0 0 auto;padding:14px 12px 10px}
+  [data-layout=plex] .px-scroll{flex:1 1 auto;min-height:0;overflow-y:auto;padding:0 8px 8px;
+    scrollbar-width:thin;scrollbar-color:color-mix(in srgb,var(--text) 22%,transparent) transparent}
+  [data-layout=plex] .px-foot{flex:0 0 auto;padding:8px 10px 12px;display:flex;flex-direction:column;gap:8px;
+    border-top:1px solid var(--line)}
+
+  /* main is the shipped `main{max-width:1400px;margin:0 auto}` rule with the
+     centring removed: inside a flex row a centred max-width block leaves a gap
+     against the sidebar that reads as a rendering fault. min-width:0 is load
+     bearing — without it a wide rail refuses to shrink and pushes the sidebar
+     off screen (flex items default to min-width:auto). */
+  [data-layout=plex] main#main{flex:1 1 auto;min-width:0;max-width:none;margin:0;padding:24px 28px 72px}
+
+  /* ---- sidebar: wordmark + search --------------------------------------- */
+  [data-layout=plex] .px-brand{display:flex;align-items:center;gap:10px;padding:2px 4px 12px}
+  [data-layout=plex] .px-brand .logo{font-size:21px}
+  /* .search ships as `max-width:240px`, sized for a header row. In a 236px
+     column it has to take the full width or it reads as a broken input. */
+  [data-layout=plex] .px-head .search{max-width:none;width:100%;padding:8px 11px}
+
+  /* ---- sidebar: navigation rows ----------------------------------------- */
+  [data-layout=plex] .px-nav{display:flex;flex-direction:column;gap:1px}
+  [data-layout=plex] .px-nav a{
+    display:flex;align-items:center;gap:11px;padding:8px 10px;
+    border-radius:max(0px, calc(var(--radius) - 4px));
+    border-left:3px solid transparent;          /* the active marker's gutter, always reserved */
+    color:var(--muted);font-weight:500;font-size:14px;line-height:1.3;min-width:0}
+  [data-layout=plex] .px-nav a .px-ico{flex:none;width:17px;height:17px;opacity:.85}
+  /* Library names are user data and routinely longer than the column. One
+     line, clipped, with the count pinned right — a wrapped name pushes the
+     count onto its own line and the list stops scanning as a list. */
+  [data-layout=plex] .px-nav a .px-lbl{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  [data-layout=plex] .px-nav a .px-n{flex:none;font:11px var(--font-mono);color:var(--muted);opacity:.8}
+  [data-layout=plex] .px-nav a:hover{background:var(--panel2);color:var(--text)}
+  /* Selection is a tint AND a 3px edge bar AND a weight change. Three signals
+     because tint alone disappears under forced colours and for anyone who
+     cannot separate the accent from the panel behind it. */
+  [data-layout=plex] .px-nav a.on{
+    background:color-mix(in srgb, var(--accent) 16%, transparent);
+    border-left-color:var(--accent);color:var(--text);font-weight:600}
+  [data-layout=plex] .px-nav a.on .px-ico{color:var(--accent);opacity:1}
+  [data-layout=plex] .px-nav a.on .px-n{color:var(--text);opacity:.9}
+  [data-layout=plex] .px-sec{
+    font:600 10px/1 var(--font-mono);letter-spacing:.16em;text-transform:uppercase;
+    color:var(--muted);opacity:.75;padding:16px 13px 6px}
+  /* The library block is filled asynchronously and is genuinely empty until
+     then (and permanently empty for a server with no libraries). :empty keeps
+     a "LIBRARIES" heading from sitting over nothing — the heading lives inside
+     the filled container precisely so it can vanish with its contents. */
+  [data-layout=plex] #pxlibs:empty{display:none}
+
+  /* ---- sidebar: footer (scan status, controls, account) ------------------ */
+  /* pollActivity() writes this pill and sets display:flex inline when the
+     server is busy; here it only has to survive a 212px-wide column, so it
+     wraps its text instead of forcing the sidebar to scroll sideways. */
+  [data-layout=plex] .px-foot .activity{white-space:normal;line-height:1.35;border-radius:10px;padding:6px 10px}
+  [data-layout=plex] .px-ctl{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+  [data-layout=plex] .px-pop{position:relative}
+  /* The popovers ship anchored below their button (`top:38px`). In a footer
+     that is off the bottom of the screen, so they open upward and left-align
+     to the column. */
+  [data-layout=plex] .px-foot .amenu{top:auto;bottom:calc(100% + 6px);right:auto;left:0;min-width:200px}
+  [data-layout=plex] .px-user{display:flex;align-items:center;gap:8px}
+  [data-layout=plex] .px-user .profile{flex:1 1 auto;min-width:0;justify-content:flex-start;
+    background:transparent;border-color:transparent}
+  [data-layout=plex] .px-user .profile:hover{background:var(--panel2);border-color:var(--line)}
+  [data-layout=plex] .px-user .pname{max-width:none;flex:1 1 auto;text-align:left}
+  [data-layout=plex] .px-user .pavatar{width:26px;height:26px;font-size:12px}
+
+  /* ---- focus: one visible ring on every interactive thing in the shell ---
+     The shipped stylesheet only rings a handful of player controls, so plex
+     brings its own. outline (a shape that was not there before) rather than a
+     colour swap, because a keyboard user who cannot see the accent still has
+     to be able to walk home → library → detail → play. */
+  [data-layout=plex] .px-nav a:focus-visible,
+  [data-layout=plex] .px-tab:focus-visible,
+  [data-layout=plex] .px-seeall:focus-visible,
+  [data-layout=plex] .px-sheetx:focus-visible,
+  [data-layout=plex] .poster:focus-visible,
+  [data-layout=plex] .px-side button:focus-visible,
+  [data-layout=plex] .px-side input:focus-visible{
+    outline:2px solid var(--accent);outline-offset:2px;border-radius:8px}
+  [data-layout=plex] .poster:focus-visible{outline-offset:3px;border-color:var(--accent)}
+
+  /* ---- cards: plex vocabulary over the shipped card() -------------------
+     card() is not forked. Everything below is the same markup wearing plex
+     paint, which is the whole thesis of the layout split: one card component,
+     five shells. */
+
+  /* Unwatched corner flag. Derived from the markup card() already emits —
+     no ✓ badge and no progress bar means nothing has been played — because
+     the alternative was a second card function. :has() is a hard requirement
+     for the rule, hence the @supports guard: on a browser without it the flag
+     simply does not appear and nothing else breaks.
+     Known limitation: a home-video FOLDER card carries no watch state either,
+     so it gets flagged too. Fixing that needs a kind class on .poster from
+     card(), which is shipped code and outside this layout's remit. */
+  @supports selector(:has(*)){
+    [data-layout=plex] .poster:not(:has(.badge)):not(:has(.prog)):not(:has(.soonwhen)):not(:has(.art.sq)) .artbox::after{
+      content:"";position:absolute;top:0;right:0;width:26px;height:26px;pointer-events:none;
+      background:var(--accent);clip-path:polygon(100% 0, 100% 100%, 0 0)}
+  }
+  /* Hover play circle. Decorative: the whole card has always been the click
+     target, so the circle announces the action rather than owning it. It is
+     revealed by :focus-visible as well as :hover so a keyboard user gets the
+     same announcement, and it is permanently visible (scrim-free) where there
+     is no hover at all. */
+  [data-layout=plex] .poster .artbox::before{
+    content:"▶";position:absolute;inset:0;z-index:1;pointer-events:none;
+    display:grid;place-items:center;
+    font-size:15px;line-height:44px;text-indent:3px;
+    color:var(--btn-ink);
+    background:
+      radial-gradient(circle at 50% 50%, var(--accent) 0 22px, transparent 22px),
+      color-mix(in srgb, var(--bg) 42%, transparent);
+    opacity:0}
+  @media (hover:hover){
+    [data-layout=plex] .poster:hover .artbox::before{opacity:1}
+  }
+  [data-layout=plex] .poster:focus-visible .artbox::before,
+  [data-layout=plex] .poster:active .artbox::before{opacity:1}
+  /* Touch: no hover event will ever arrive, so the affordance is drawn at
+     rest — smaller, and without the dark wash that would fight the artwork on
+     every card in the grid. */
+  @media (hover:none){
+    [data-layout=plex] .poster .artbox::before{
+      opacity:.6;font-size:11px;
+      background:radial-gradient(circle at 50% 50%, var(--accent) 0 13px, transparent 13px)}
+  }
+  /* The shipped .poster lift is a transform on every hover; plex keeps it but
+     swaps the border flash for an inset accent outline (Plex's own idiom) so
+     the card edge does not appear to grow by a pixel. */
+  [data-layout=plex] .poster:hover{border-color:color-mix(in srgb, var(--accent) 60%, var(--line))}
+  [data-layout=plex] .poster .artbox{overflow:hidden;border-radius:max(0px, calc(var(--radius) - 5px)) max(0px, calc(var(--radius) - 5px)) 0 0}
+
+  /* ---- home: section headers and hub rows ------------------------------- */
+  /* Plex hub titles are quiet sentence case with the "see all" on the right,
+     not classic's uppercase rules-and-borders. Flex here is compatible with
+     .ressection, which already relies on it. */
+  [data-layout=plex] h2.section{
+    display:flex;align-items:center;gap:10px;
+    font-size:15px;font-weight:650;letter-spacing:0;text-transform:none;
+    border-top:0;padding-top:0;margin:24px 2px 12px}
+  [data-layout=plex] h2.section:first-child{margin-top:6px}
+  [data-layout=plex] .px-seeall{
+    margin-left:auto;display:inline-flex;align-items:center;gap:6px;
+    font:500 12px var(--font);letter-spacing:0;text-transform:none;color:var(--muted)}
+  [data-layout=plex] .px-seeall::after{content:"›";font-size:15px;line-height:1}
+  [data-layout=plex] .px-seeall:hover{color:var(--accent)}
+  /* The count rides the link rather than the heading: "Movies · See all 210"
+     puts the number next to the thing that acts on it. */
+  [data-layout=plex] .px-seeall .px-n{font:11px var(--font-mono);opacity:.85}
+  [data-layout=plex] .libbar{margin-top:26px}
+
+  /* ---- classic bodies rendered inside plex chrome -----------------------
+     Library, category, search, item, activity and settings are not converted
+     at G2: they emit their shipped markup into plex's #main. The rules below
+     exist only where a shipped rule assumed classic's page box. */
+  /* Both bleed to the edge with negative margins sized for classic's
+     `main{padding:22px 20px}`. Under plex's 24/28 they would leave a 8px lip
+     on one side and overhang on the other. */
+  [data-layout=plex] .hero{margin:-24px -28px 22px}
+  [data-layout=plex] .getapp{margin:0 0 18px}
+  /* The A–Z scrubber is fixed to the viewport edge, which is correct here too;
+     it only needs to clear plex's wider gutter. */
+  [data-layout=plex] .azbar{right:8px}
+
+  /* ---- bottom tabs (declared for every surface, shown only when narrow) -- */
+  [data-layout=plex] .px-tabs{display:none}
+  [data-layout=plex] .px-sheetx{display:none}
+
+  /* =========================== narrow / phone ==============================
+     899px is not a guess: surfaceClass() calls a coarse pointer under 900px
+     "mobile", so every device the app treats as a phone is inside this query —
+     and a mouse-driven window dragged this narrow gets the same shape, which
+     is the point of doing it in CSS. The sidebar is not hidden; it is
+     re-flowed into the phone header the app already ships (wordmark + controls
+     on row 1, search full width below), so the search box stays in exactly one
+     place in the DOM and #q is never duplicated. */
+  @media (max-width:899px){
+    [data-layout=plex] .px-shell{display:block}
+    [data-layout=plex] .px-side{
+      position:sticky;top:0;width:auto;height:auto;flex:none;
+      flex-direction:row;flex-wrap:wrap;align-items:center;gap:8px;
+      padding:10px 14px;border-right:0;border-bottom:1px solid var(--line);
+      /* Opaque, and deliberately NOT backdrop-filtered like the shipped phone
+         header: a filter on this element would make it the containing block
+         for its own position:fixed descendants, and the library sheet below is
+         one — it would render as a 140px flap under the header instead of a
+         full-screen panel. The mix of two opaque tokens is already opaque, so
+         the blur bought nothing anyway. */
+      background:color-mix(in srgb, var(--bg) 88%, var(--panel))}
+    /* display:contents dissolves the two band wrappers so their children
+       become items of the header row directly — the alternative is a second
+       markup path for phones, which is how layouts start forking. */
+    [data-layout=plex] .px-head,[data-layout=plex] .px-foot{display:contents}
+    [data-layout=plex] .px-brand{order:1;padding:0}
+    [data-layout=plex] .px-ctl{order:2;margin-left:auto;gap:6px}
+    [data-layout=plex] .px-user{order:3;flex:none}
+    [data-layout=plex] .px-user .pname{display:none}     /* matches the shipped phone header */
+    [data-layout=plex] .px-head .search{order:4;flex-basis:100%}
+    [data-layout=plex] .px-foot .activity{order:5;flex-basis:100%}
+    [data-layout=plex] .px-foot .amenu{top:calc(100% + 6px);bottom:auto;right:0;left:auto}
+    /* The library list becomes a full-screen sheet behind the Libraries tab.
+       Full screen rather than a drawer so there is no "outside" to mis-tap,
+       and it closes itself on navigation because routing rebuilds the chrome. */
+    [data-layout=plex] .px-scroll{display:none}
+    [data-layout=plex] .px-shell.px-open .px-scroll{
+      display:block;position:fixed;inset:0;z-index:40;
+      background:var(--bg);padding:14px 14px 90px;overflow-y:auto}
+    [data-layout=plex] .px-shell.px-open .px-sheetx{
+      display:inline-flex;align-items:center;justify-content:center;
+      position:fixed;top:10px;right:12px;z-index:41;width:38px;height:38px;font-size:17px}
+    [data-layout=plex] main#main{padding:16px 14px 96px}
+    [data-layout=plex] .hero{margin:-16px -14px 18px}
+    /* Bottom tabs. Fixed, safe-area aware — an iPhone home indicator otherwise
+       sits on top of the Activity tab. */
+    [data-layout=plex] .px-tabs{
+      display:flex;position:fixed;left:0;right:0;bottom:0;z-index:45;
+      background:color-mix(in srgb, var(--panel) 92%, var(--bg));
+      border-top:1px solid var(--line);
+      padding-bottom:env(safe-area-inset-bottom,0px)}
+    [data-layout=plex] .px-tab{
+      flex:1 1 0;min-width:0;display:flex;flex-direction:column;align-items:center;gap:3px;
+      padding:8px 4px 7px;border:0;background:transparent;
+      color:var(--muted);font:500 10.5px/1.2 var(--font);
+      border-top:2px solid transparent;margin-top:-1px}
+    [data-layout=plex] .px-tab .px-ico{width:20px;height:20px}
+    /* Same rule as the sidebar: tint plus an edge plus weight, never colour
+       alone. */
+    [data-layout=plex] .px-tab.on{color:var(--text);font-weight:700;border-top-color:var(--accent);
+      background:color-mix(in srgb, var(--accent) 12%, transparent)}
+    [data-layout=plex] .px-tab.on .px-ico{color:var(--accent)}
+    /* pollActivity() toggles html.working when the server is busy. A dot on
+       the Activity tab carries that fact to a phone, where the status pill has
+       been pushed off the header by the search box. */
+    [data-layout=plex] .px-tabs .px-tab[data-tab=activity]{position:relative}
+    /* Both attributes live on <html>, so this is one compound selector, not a
+       descendant pair — the usual mistake here renders nothing at all. */
+    html.working[data-layout=plex] .px-tabs .px-tab[data-tab=activity]::after{
+      content:"";position:absolute;top:7px;right:calc(50% - 15px);
+      width:7px;height:7px;border-radius:50%;background:var(--accent)}
+    [data-layout=plex] .azbar{right:2px}
+  }
+
+  /* ============================== television ===============================
+     Same test surfaceClass() uses for "tv": no pointing device at all, or a
+     coarse hoverless pointer on a very wide screen (a remote driving a
+     cursor). The sidebar collapses to an icon rail and expands over the
+     content on focus — it is fixed, not sticky, so expanding never reflows the
+     grid behind it (a D-pad user watching every poster jump sideways as focus
+     enters the rail is the failure this prevents). Labels stay in the DOM
+     while collapsed, clipped rather than display:none, so a screen reader and
+     the focus order still see them. */
+  @media (pointer:none), (hover:none) and (pointer:coarse) and (min-width:1280px){
+    [data-layout=plex] .px-side{position:fixed;left:0;top:0;bottom:0;height:100dvh;width:76px;flex-basis:76px}
+    [data-layout=plex] main#main{margin-left:76px;padding:30px 40px 90px;font-size:16px}
+    [data-layout=plex] .px-side .px-lbl,
+    [data-layout=plex] .px-side .px-n,
+    [data-layout=plex] .px-side .px-sec,
+    [data-layout=plex] .px-side .pname,
+    [data-layout=plex] .px-side .activity,
+    [data-layout=plex] .px-head .search{
+      opacity:0;width:0;height:0;overflow:hidden;padding:0;margin:0;border:0;flex-basis:0}
+    [data-layout=plex] .px-brand .logo{font-size:0}
+    [data-layout=plex] .px-brand .logo::first-letter{font-size:24px}
+    [data-layout=plex] .px-nav a{justify-content:center;gap:0}
+    [data-layout=plex] .px-side:hover,[data-layout=plex] .px-side:focus-within{
+      width:264px;flex-basis:264px;box-shadow:0 0 40px color-mix(in srgb, var(--bg) 70%, transparent)}
+    [data-layout=plex] .px-side:hover .px-lbl,[data-layout=plex] .px-side:focus-within .px-lbl,
+    [data-layout=plex] .px-side:hover .px-n,[data-layout=plex] .px-side:focus-within .px-n,
+    [data-layout=plex] .px-side:hover .px-sec,[data-layout=plex] .px-side:focus-within .px-sec,
+    [data-layout=plex] .px-side:hover .pname,[data-layout=plex] .px-side:focus-within .pname,
+    [data-layout=plex] .px-side:hover .activity,[data-layout=plex] .px-side:focus-within .activity,
+    [data-layout=plex] .px-side:hover .search,[data-layout=plex] .px-side:focus-within .search{
+      opacity:1;width:auto;height:auto;flex-basis:auto;overflow:visible}
+    [data-layout=plex] .px-side:hover .px-sec,[data-layout=plex] .px-side:focus-within .px-sec{padding:16px 13px 6px}
+    [data-layout=plex] .px-side:hover .search,[data-layout=plex] .px-side:focus-within .search{padding:8px 11px;border-width:1px}
+    [data-layout=plex] .px-side:hover .activity,[data-layout=plex] .px-side:focus-within .activity{padding:6px 10px}
+    [data-layout=plex] .px-side:hover .px-nav a,[data-layout=plex] .px-side:focus-within .px-nav a{justify-content:flex-start;gap:11px}
+    [data-layout=plex] .px-side:hover .px-brand .logo,[data-layout=plex] .px-side:focus-within .px-brand .logo{font-size:21px}
+    /* …and put the initial back to the size of the rest of the wordmark, or an
+       expanded rail spells the product name with an oversized first letter. */
+    [data-layout=plex] .px-side:hover .px-brand .logo::first-letter,
+    [data-layout=plex] .px-side:focus-within .px-brand .logo::first-letter{font-size:inherit}
+    /* 10-foot focus: a 2px hairline is invisible from a sofa. */
+    [data-layout=plex] .px-nav a:focus-visible,[data-layout=plex] .poster:focus-visible{outline-width:4px;outline-offset:4px}
+  }
+
+  /* ============================ reduced motion =============================
+     Every animation in this layout is decorative and every one of them is
+     opt-in here. The information each carries is present without it: the play
+     circle still appears (it just does not fade), the rail still expands (it
+     just does not slide), the hover lift still marks the card under the
+     pointer (via the border tint, which is not animated). */
+  @media (prefers-reduced-motion: no-preference){
+    [data-layout=plex] .poster .artbox::before{transition:opacity .14s ease-out}
+    [data-layout=plex] .px-nav a{transition:background-color .12s ease-out, color .12s ease-out}
+    [data-layout=plex] .px-side{transition:width .16s ease-out, flex-basis .16s ease-out}
+    [data-layout=plex] .px-seeall{transition:color .12s ease-out}
+  }
+  /* The shipped .poster rule animates transform unconditionally; plex cannot
+     edit it, so it opts out here for anyone who asked for less motion. The
+     hover state stays legible because the border tint above does not move. */
+  @media (prefers-reduced-motion: reduce){
+    [data-layout=plex] .poster{transition:none}
+    [data-layout=plex] .poster:hover{transform:none}
+  }
+
+  /* ============================ forced colours =============================
+     In forced-colors mode the UA replaces author colours wholesale, which
+     silently erases anything that carried meaning as a tint: the selected
+     library, the focus ring, the unwatched flag and the resume bar. System
+     keywords are the sanctioned way to put them back, so each one is restated
+     against Highlight / CanvasText here. */
+  @media (forced-colors: active){
+    [data-layout=plex] .px-side{border-right:1px solid CanvasText}
+    /* The idle rows reserve their marker with a transparent left border, and
+       forced colours repaints EVERY border in the element's forced colour —
+       so without this each row grows a LinkText bar and the selected row stops
+       being the one with a bar. Canvas paints the gutter as background. */
+    [data-layout=plex] .px-nav a{border-left-color:Canvas}
+    /* forced-color-adjust:none on the selected row is not an opt-out of forced
+       colours — every colour it then uses is a system keyword. It is there to
+       stop Chromium painting its text "backplate" (a Canvas-coloured rectangle
+       it puts behind text sitting on an author background) which lands black
+       ink on a black plate on top of Highlight and erases the label of the one
+       row the user is on. */
+    [data-layout=plex] .px-nav a.on,
+    [data-layout=plex] .px-tab.on{forced-color-adjust:none}
+    [data-layout=plex] .px-nav a.on{background:Highlight;color:HighlightText;border-left-color:Highlight}
+    [data-layout=plex] .px-nav a.on .px-ico,
+    [data-layout=plex] .px-nav a.on .px-n{color:HighlightText}
+    [data-layout=plex] .px-tab.on{background:Highlight;color:HighlightText;border-top-color:Highlight}
+    [data-layout=plex] .px-tab.on .px-ico{color:HighlightText}
+    [data-layout=plex] .px-nav a:focus-visible,
+    [data-layout=plex] .px-tab:focus-visible,
+    [data-layout=plex] .px-seeall:focus-visible,
+    [data-layout=plex] .px-sheetx:focus-visible,
+    [data-layout=plex] .poster:focus-visible,
+    [data-layout=plex] .px-side button:focus-visible,
+    [data-layout=plex] .px-side input:focus-visible{outline:3px solid Highlight;outline-offset:2px}
+    /* The flag is a clip-path so the shape survives; only its fill needs
+       restating. forced-color-adjust:none keeps the UA from flattening it back
+       to Canvas, which would leave an invisible triangle. The :not() chain is
+       repeated verbatim rather than simplified: the rule that paints the flag
+       carries four class selectors of specificity, and a shorter selector here
+       loses to it and leaves the triangle in the theme accent. */
+    [data-layout=plex] .poster:not(:has(.badge)):not(:has(.prog)):not(:has(.soonwhen)):not(:has(.art.sq)) .artbox::after{
+      background:Highlight;forced-color-adjust:none}
+    /* Progress is a 5px bar whose fill and track both collapse to the same
+       system colour otherwise — i.e. "how far in am I" disappears entirely. */
+    [data-layout=plex] .poster .prog{background:Canvas;border:1px solid CanvasText;forced-color-adjust:none}
+    [data-layout=plex] .poster .prog>i{background:Highlight;box-shadow:none;forced-color-adjust:none}
+    /* The play circle is drawn with a radial gradient, which forced colours
+       does not repaint — it would render as a grey blob over the art. Drop the
+       fill and keep the glyph, which is text and is repainted correctly. */
+    [data-layout=plex] .poster .artbox::before{background:none;color:CanvasText}
+    [data-layout=plex] .px-tabs{border-top:1px solid CanvasText}
+    [data-layout=plex] .px-foot{border-top:1px solid CanvasText}
+  }
 </style>
 <script>
 // Theme engine. Runs in <head> before first paint so there's no flash of the
@@ -839,6 +1283,72 @@ const THEMES={
       "--glow":"rgba(229,72,77,.35)","--shadow":"0 4px 14px rgba(0,0,0,.5)","--grain":".045"},
     light:{"--bg":"#f2efe8","--panel":"#faf8f2","--panel2":"#ffffff","--line":"rgba(24,22,20,.12)","--text":"#1a1a1e","--muted":"#5d5c63","--accent":"#c2343a","--accent2":"#8e1c22","--good":"#35855c","--bad":"#c96442","--warn":"#a3742b","--radius":"10px","--btn-ink":"#ffffff","--prose":"#33312e","--font":FONT_INTER,"--font-mono":FONT_MONO,
       "--glow":"rgba(194,52,58,.16)","--shadow":"0 2px 10px rgba(25,20,15,.12)","--grain":".03"}},
+  // ---- the catalogue (UI-LAYOUTS-IMPLEMENTATION.md T1) --------------------
+  // Every value below is a contract value: machine-checked at or above 4.5:1
+  // for text/muted/prose/accent/good/warn/bad against --bg, --panel AND
+  // --panel2, and for --btn-ink against --accent. `scripts/contrast-check`
+  // re-runs the whole matrix; run it after touching any line in this object.
+  //
+  // --accent2 is deliberately outside that check. It is not a text token in
+  // this app: it appears exactly twice, both times as the far end of a
+  // gradient (the wordmark at .logo, and the badge below it), so measuring it
+  // as ink on a page is the wrong test. What does matter for it is the white
+  // label on that badge — noted per theme where it is tight.
+
+  // Amber — charcoal + gold, the signature of the plex layout. The light
+  // accent/good/bad are NOT the mockup's values: those measured 2.73 / 3.92 /
+  // 4.49 and are replaced here by the review's corrected set. Dark --bad is
+  // ours: #e5534b passes on --bg but lands at 4.25 / 3.89 on the panels, and
+  // status text mostly lives on cards.
+  amber:{name:"Amber",
+    dark:{"--bg":"#191a1d","--panel":"#212327","--panel2":"#2a2d32","--line":"#383c43","--text":"#eceef0","--muted":"#9aa0a7","--accent":"#e5a00d","--accent2":"#cc7b19","--good":"#52b788","--bad":"#ee7168","--warn":"#f2c14e","--radius":"8px","--btn-ink":"#1c1303","--prose":"#c9cdd2","--font":FONT_UI,"--font-mono":FONT_SYS_MONO},
+    light:{"--bg":"#f3f4f6","--panel":"#ffffff","--panel2":"#e9ebee","--line":"#d5d9de","--text":"#1e2124","--muted":"#5f666d","--accent":"#8b5e00","--accent2":"#a95f16","--good":"#246b49","--bad":"#bd332d","--warn":"#8a6116","--radius":"8px","--btn-ink":"#ffffff","--prose":"#3a4046","--font":FONT_UI,"--font-mono":FONT_SYS_MONO}},
+  // Giallo — the kit's reserved amber showtime. noirr's structure, amber heat,
+  // grain a notch louder. Crimson is *correct* as the error colour here:
+  // giallo posters are yellow and red.
+  giallo:{name:"Giallo",
+    dark:{"--bg":"#0c0a06","--panel":"#14100a","--panel2":"#1c160d","--line":"rgba(240,200,120,.10)","--text":"#f2e9d8","--muted":"#a89c85","--accent":"#e8a33d","--accent2":"#8a5a14","--good":"#5fb582","--bad":"#e5484d","--warn":"#c9723a","--radius":"10px","--btn-ink":"#1a1002","--prose":"#d6ccb8","--font":FONT_INTER,"--font-mono":FONT_MONO,
+      "--glow":"rgba(232,163,61,.30)","--shadow":"0 4px 14px rgba(0,0,0,.55)","--grain":".055"},
+    light:{"--bg":"#f5eed9","--panel":"#fbf7ea","--panel2":"#ffffff","--line":"rgba(90,70,30,.14)","--text":"#241d10","--muted":"#6e6350","--accent":"#7f4e00","--accent2":"#7c4a05","--good":"#2c734d","--bad":"#b23a35","--warn":"#8a6116","--radius":"10px","--btn-ink":"#ffffff","--prose":"#4a4233","--font":FONT_INTER,"--font-mono":FONT_MONO,
+      "--glow":"rgba(168,114,12,.14)","--shadow":"0 2px 10px rgba(60,45,15,.14)","--grain":".035"}},
+  // Silver — the kit's reserved B&W showtime. White is the accent at night,
+  // ink is the accent by day. The statuses stay quietly tinted rather than
+  // grey: a fully monochrome "failed" is an accessibility lie, because colour
+  // is then the only channel that ever carried the meaning and it is gone.
+  // Light --good is #467353, not the proposal's #4a7a58 — that one measured
+  // 4.13 on --panel2, which is where pills and chips actually sit.
+  silver:{name:"Silver",
+    dark:{"--bg":"#0a0a0b","--panel":"#131315","--panel2":"#1b1b1e","--line":"rgba(255,255,255,.10)","--text":"#f2f2f2","--muted":"#9a9a9e","--accent":"#e8e8ea","--accent2":"#8a8a8f","--good":"#9fbfa8","--bad":"#d09088","--warn":"#c9b48c","--radius":"6px","--btn-ink":"#0a0a0b","--prose":"#cfcfd3","--font":FONT_INTER,"--font-mono":FONT_MONO},
+    light:{"--bg":"#f4f4f2","--panel":"#ffffff","--panel2":"#eaeae7","--line":"rgba(20,20,20,.14)","--text":"#141416","--muted":"#66666a","--accent":"#1a1a1c","--accent2":"#5a5a5f","--good":"#467353","--bad":"#a05248","--warn":"#765f28","--radius":"6px","--btn-ink":"#ffffff","--prose":"#3a3a3e","--font":FONT_INTER,"--font-mono":FONT_MONO}},
+  // Void — true black for OLED, and dark-only: an OLED theme that turns itself
+  // into a white page on a light toggle is not the same product. Borders do
+  // the structural work (--shadow:none — a shadow on #000 is invisible), and
+  // the accent is electric so one colour still reads at minimum brightness.
+  void:{name:"Void", darkOnly:true,
+    dark:{"--bg":"#000000","--panel":"#0a0a0a","--panel2":"#131313","--line":"rgba(255,255,255,.13)","--text":"#e8e8e8","--muted":"#8a8a8a","--accent":"#4cc2ff","--accent2":"#2f6fe0","--good":"#34d399","--bad":"#f87171","--warn":"#fbbf24","--radius":"12px","--btn-ink":"#001018","--prose":"#c6c6c6","--font":FONT_UI,"--font-mono":FONT_MONO,
+      "--shadow":"none"}},
+  // VHS — tracking-line synthwave, dark-only for the same reason as Void.
+  // Magenta accent with a cyan accent2: the one theme whose wordmark gradient
+  // runs magenta to cyan. Its loading language is chunky tracking bars rather
+  // than a shimmer — see [data-theme=vhs] in the stylesheet, and note that the
+  // bars sit behind prefers-reduced-motion with a static bar as the fallback,
+  // because "loading" is information and must not depend on movement.
+  vhs:{name:"VHS", darkOnly:true,
+    dark:{"--bg":"#140d22","--panel":"#1d1430","--panel2":"#291c42","--line":"rgba(255,120,220,.16)","--text":"#f4e9ff","--muted":"#a78fc7","--accent":"#ff4fd8","--accent2":"#26e2ff","--good":"#3ddc97","--bad":"#ff5c7a","--warn":"#ffb454","--radius":"14px","--btn-ink":"#22041c","--prose":"#d9c9ee","--font":FONT_INTER,"--font-mono":FONT_MONO,
+      "--glow":"rgba(255,79,216,.35)","--shadow":"0 4px 18px rgba(0,0,0,.55)"}},
+  // Paper — light-first editorial: warm stock, graphite text, ink-blue accent.
+  // Its dark mode is a reading room, not an inverted white page. No grain, no
+  // glow, no animated brand treatment, on purpose. Light --good is #26724c
+  // rather than the review's #287a51 (4.09 on --panel2).
+  paper:{name:"Paper",
+    dark:{"--bg":"#171715","--panel":"#201f1c","--panel2":"#2a2823","--line":"#454139","--text":"#f2eee6","--muted":"#aaa49a","--accent":"#9db2ff","--accent2":"#e58b84","--good":"#6fc49a","--bad":"#ff8a80","--warn":"#e2c36f","--radius":"6px","--btn-ink":"#101322","--prose":"#d6d0c6","--font":FONT_INTER,"--font-mono":FONT_MONO},
+    light:{"--bg":"#f4f0e8","--panel":"#fffdf8","--panel2":"#e9e2d7","--line":"#c8bfb2","--text":"#1f2328","--muted":"#5f625f","--accent":"#3451b2","--accent2":"#a33a3a","--good":"#26724c","--bad":"#b3261e","--warn":"#765c00","--radius":"6px","--btn-ink":"#ffffff","--prose":"#3d4248","--font":FONT_INTER,"--font-mono":FONT_MONO}},
+  // Tide — sea-glass green on deep blue-green with a sand secondary. It exists
+  // because the catalogue was otherwise red, gold, blue and magenta, with no
+  // calm colour family anywhere in it, and it works in both appearances.
+  tide:{name:"Tide",
+    dark:{"--bg":"#071412","--panel":"#0d1e1b","--panel2":"#142a25","--line":"#2a4841","--text":"#e4f2ed","--muted":"#93aaa2","--accent":"#73d6b1","--accent2":"#d6b56d","--good":"#6fd39f","--bad":"#ff8a80","--warn":"#e5c875","--radius":"10px","--btn-ink":"#052019","--prose":"#c8dcd5","--font":FONT_INTER,"--font-mono":FONT_MONO},
+    light:{"--bg":"#edf4f0","--panel":"#fbfdfa","--panel2":"#dfeae4","--line":"#bccfc5","--text":"#14201c","--muted":"#586a62","--accent":"#176b54","--accent2":"#8a631a","--good":"#196b48","--bad":"#b33a32","--warn":"#735b0b","--radius":"10px","--btn-ink":"#ffffff","--prose":"#34473f","--font":FONT_INTER,"--font-mono":FONT_MONO}},
 };
 // Favicons: the noirr theme wears the kit icon (icon-a — n + cursor, midnight
 // in both showtimes); everything else gets a neutral play mark.
@@ -856,7 +1366,12 @@ function applyTheme(){
   try{ id=localStorage.getItem("plurx_theme"); app=localStorage.getItem("plurx_appearance"); }catch(e){}
   if(!THEMES[id]) id="classic";
   const theme=THEMES[id];
-  const mode=resolveMode(app||"auto");
+  // A dark-only theme (Void, VHS) keeps its midnight palette whatever the
+  // appearance toggle says, and the theme menu says so inline rather than
+  // leaving the toggle looking broken. The rejected alternative — falling back
+  // to a different theme in light mode — swaps the whole personality of the UI
+  // on a control that claims to change brightness.
+  const mode=theme.darkOnly?"dark":resolveMode(app||"auto");
   const vars=theme[mode]||theme.dark;
   const root=document.documentElement;
   // drop vars the previous theme set that this one doesn't (e.g. noirr's --glow)
@@ -878,6 +1393,50 @@ const POSTER_SIZES=[["s","Small","120px"],["m","Medium","150px"],["l","Large","1
 function posterSize(){ let v="s"; try{ v=localStorage.getItem("plurx_iconsize")||"s"; }catch(e){} return POSTER_SIZES.some(s=>s[0]===v)?v:"s"; }
 function applyPosterSize(){ const s=POSTER_SIZES.find(x=>x[0]===posterSize()); document.documentElement.style.setProperty("--poster", s?s[2]:"150px"); }
 applyPosterSize();
+// Layout engine. A layout is structure — where navigation lives, how a page is
+// composed, how dense it is. A theme is paint. The two stay orthogonal because
+// components only ever read tokens, so every theme works on every layout.
+//
+// Declared here, in the <head>, for the same reason applyTheme() runs here: a
+// layout applied after first paint flashes the classic chrome and then jumps.
+// This object carries only what the pre-paint pass needs — a display name and
+// the surfaces the layout can actually run on. The renderers are attached to
+// these same objects by the body script (see "layout renderers" there), which
+// is why nothing here dereferences .views.
+const LAYOUTS={
+  classic:{name:"Classic", surfaces:["desktop","mobile","tv"]},
+  plex:{name:"Plex", surfaces:["desktop","mobile","tv"]},
+};
+// Which kind of surface this browser is, from viewport and input capability —
+// never a user-agent string. UA sniffing is wrong the moment someone resizes a
+// window, and TV browsers misreport their UA as a matter of routine.
+function surfaceClass(){
+  const mq=q=>{ try{ return !!(window.matchMedia&&window.matchMedia(q).matches); }catch(e){ return false; } };
+  // No pointing device at all means a D-pad: a television or a set-top box.
+  if(mq("(pointer: none)")) return "tv";
+  const coarse=mq("(pointer: coarse)"), noHover=mq("(hover: none)");
+  const w=window.innerWidth||1280;
+  // A coarse pointer with no hover on a very wide viewport is a remote driving
+  // a cursor, not a phone — nobody holds a 1280px-wide touchscreen.
+  if(coarse&&noHover&&w>=1280) return "tv";
+  if(coarse&&w<900) return "mobile";
+  return "desktop";
+}
+// The layout in force right now. Two independent fallbacks, both silent and
+// both to classic: an id we don't ship (a preference written by a newer build,
+// or a hand-edited localStorage), and an id this surface can't run (deck on a
+// phone). A stale preference must open a familiar app, never a blank shell.
+function layoutId(){
+  let id=null; try{ id=localStorage.getItem("plurx_layout"); }catch(e){}
+  const L=LAYOUTS[id];
+  if(!L) return "classic";
+  if(L.surfaces&&L.surfaces.indexOf(surfaceClass())<0) return "classic";
+  return id;
+}
+// Layouts scope their structural CSS under [data-layout=…] — the same shape the
+// themes use for [data-theme=…]. Setting it before first paint is the point.
+function applyLayout(){ document.documentElement.dataset.layout=layoutId(); }
+applyLayout();
 try{ document.title=APP_NAME; }catch(e){}
 if(window.matchMedia){ try{ window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change",()=>{ if((localStorage.getItem("plurx_appearance")||"auto")==="auto") applyTheme(); }); }catch(e){} }
 </script>
@@ -1248,7 +1807,7 @@ function renderLogin(){
 }
 
 // ---- chrome ---------------------------------------------------------------
-function chrome(active, inner){
+function classicChrome(active, inner){
   const admin = ME&&ME.is_admin ? `<a href="#/settings" class="${active==='settings'?'active':''}">Settings</a>`:"";
   const getapp = installAvailable() ? `<button class="ghost sm getappbtn" onclick="showInstall()" title="Install the plurx app">Get app</button>` : "";
   document.getElementById("app").innerHTML=`
@@ -1293,13 +1852,45 @@ function getQ(){ const m=location.hash.match(/^#\/search\/(.*)$/); return m?deco
 // Auto-skip is a playback preference and lives on the player, not here.
 function themeMenuHtml(){
   let theme="classic"; try{ theme=localStorage.getItem("plurx_theme")||"classic"; }catch(e){}
-  const themes=Object.keys(THEMES).map(id=>`<button class="${theme===id?'sel':''}" onclick="setTheme('${id}')">${esc(THEMES[id].name)}</button>`).join("");
-  return `<div class="amsec">Theme</div>${themes}`;
+  const themes=Object.keys(THEMES).map(id=>{
+    // The midnight-only marker rides on the entry itself, so the constraint is
+    // legible before the choice is made — not discovered afterwards when the
+    // appearance toggle appears to do nothing.
+    const only=THEMES[id].darkOnly?`<span class="amnote">midnight only</span>`:"";
+    return `<button class="${theme===id?'sel':''}" onclick="setTheme('${id}')">${esc(THEMES[id].name)}${only}</button>`;
+  }).join("");
+  return `${layoutMenuHtml()}<div class="amsec">Theme</div>${themes}`;
+}
+// Layout sits above Theme in the same popover: structure first, then paint.
+// Only layouts this surface can actually run are offered — an entry the device
+// would silently fall back from is worse than no entry, because the user picks
+// it, nothing changes, and the menu goes on claiming it is selected.
+function layoutMenuHtml(){
+  const cur=layoutId(), here=surfaceClass();
+  const btns=Object.keys(LAYOUTS).filter(id=>{
+    const s=LAYOUTS[id].surfaces;
+    return !s||s.indexOf(here)>=0;
+  }).map(id=>`<button class="${cur===id?'sel':''}" onclick="setLayout('${id}')">${esc(LAYOUTS[id].name)}</button>`).join("");
+  return `<div class="amsec">Layout</div>${btns}`;
+}
+// A layout change repaints everything, chrome included — unlike a theme, which
+// only swaps CSS variables on an already-painted page. render() is the honest
+// way to do that: it re-runs the current route through the new layout.
+function setLayout(id){
+  try{ localStorage.setItem("plurx_layout",id); }catch(e){}
+  applyLayout();
+  render();
 }
 function appMenuHtml(){
   let app="auto"; try{ app=localStorage.getItem("plurx_appearance")||"auto"; }catch(e){}
   const modes=[["auto","Auto (system)"],["light","Light"],["dark","Dark"]].map(([v,l])=>`<button class="${app===v?'sel':''}" onclick="setAppearance('${v}')">${l}</button>`).join("");
-  return `<div class="amsec">Appearance</div>${modes}`;
+  // If the current theme pins itself to midnight, say so here too. Without
+  // this the control silently does nothing and the only available conclusion
+  // is that the app is broken.
+  let cur="classic"; try{ cur=localStorage.getItem("plurx_theme")||"classic"; }catch(e){}
+  const t=THEMES[cur];
+  const note=(t&&t.darkOnly)?`<div class="amwarn">${esc(t.name)} is a midnight-only theme — it stays dark whichever you pick.</div>`:"";
+  return `<div class="amsec">Appearance</div>${modes}${note}`;
 }
 function closeMenus(except){ ["thememenu","appmenu","sizemenu","profilemenu"].forEach(idn=>{ if(idn!==except){ const m=document.getElementById(idn); if(m) m.classList.remove("on"); } }); }
 function toggleThemeMenu(e){ if(e) e.stopPropagation(); closeMenus("thememenu"); const m=document.getElementById("thememenu"); if(!m) return;
@@ -1609,28 +2200,42 @@ function groupToggleHtml(group){
     <select onchange="setHomeGroup(this.value)">${libOpt("category","Category",group)}${libOpt("share","Share name",group)}</select>
   </div></div>`;
 }
-async function viewHome(){
-  chrome("home", `<div id="hubs"><div class="empty">Loading…</div></div>`);
+// ---- the page-model seam --------------------------------------------------
+// Every converted route splits in two: a loader that fetches and returns a
+// plain JSON-shaped object (no DOM, no HTML), and a layout renderer that turns
+// that object into markup. Shared behaviour wiring runs after, once, for every
+// layout.
+//
+//   hash route ─▶ loadPage(route) ─▶ page model ─▶ LAYOUTS[cur].views.x(page)
+//                    (fetches)      (plain data)      (body HTML)
+//                                                          │
+//                                                          ▼
+//                                                  shared wiring
+//
+// Why the split rather than a chrome callback around the existing views: the
+// views own the whole sequence today — install chrome, fetch, assemble, replace
+// #main, wire. A registry wrapped around that either fetches twice or has each
+// layout renderer reaching into route-specific globals. Route by route, Home
+// first; activity, settings, search, auth and the player keep their existing
+// renderers behind the layout chrome until a gate converts them.
+//
+// The hard rule for a conversion: it must not change the route's network
+// behaviour. Same endpoints, same counts, same order, before and after — which
+// is why loadHome() reproduces the original's awkward sequencing (one awaited
+// batch per category, or one awaited request per share) rather than tidying it
+// into a single Promise.all. Tidying it would be a performance change smuggled
+// in under a refactor, and it would show up as a diff in the request log the
+// gate compares.
+async function loadHome(){
   // coming-soon is fetched with the rest but never allowed to fail the page:
   // it depends on another application, and the home screen must not.
   const [libs, hubs, soon] = await Promise.all([
     api("/libraries"), api("/hubs"),
     api("/coming-soon").catch(()=>({configured:false,entries:[]})),
   ]);
-  let html=installBannerHtml();
-  // The first two rails pass watchCtx: those rows are about where you are in
-  // something, so the card carries "23m left" / "watched Tuesday".
-  if(hubs.continue_watching.length){ html+=rail("Continue watching", hubs.continue_watching.map(i=>card(i,true)).join("")); }
-  if(hubs.next_up && hubs.next_up.length){ html+=rail("Next up", hubs.next_up.map(i=>card(i,true)).join("")); }
-  if(hubs.recently_added.length){ html+=rail("Recently added", hubs.recently_added.map(i=>card(i)).join("")); }
-  // Coming soon: what monarr expects. Absent entirely when nothing is paired
-  // or monarr had nothing to say — an empty rail is worse than no rail.
-  if(soon && soon.entries && soon.entries.length){
-    html+=rail("Coming soon", soon.entries.map(comingCard).join(""));
-  }
+  const group=homeGroup();
+  const sections=[];
   if(libs.length){
-    const group=homeGroup();
-    html+=groupToggleHtml(group);
     if(group==="category"){
       // Bucket libraries by category, keeping Movies before TV before others.
       const order=[], byKey={};
@@ -1639,23 +2244,73 @@ async function viewHome(){
       for(const key of order){
         const g=byKey[key];
         const pages=await Promise.all(g.libs.map(l=>api(`/libraries/${l.id}/items?limit=24&sort=added`)));
-        const items=[].concat(...pages.map(p=>p.items)).slice(0,24);
-        const total=pages.reduce((n,p)=>n+(p.total||0),0);
-        // One share in this category → link straight to it; several → merged category page.
-        const href = g.libs.length===1 ? `#/library/${g.libs[0].id}` : `#/category/${encodeURIComponent(key)}`;
-        html+=`<h2 class="section">${esc(g.cat.name)} <a class="muted" style="font-size:12px" href="${href}">· view all (${total})</a></h2>${grid(items)}`;
+        sections.push({
+          key,
+          name:g.cat.name,
+          items:[].concat(...pages.map(p=>p.items)).slice(0,24),
+          total:pages.reduce((n,p)=>n+(p.total||0),0),
+          // One share in this category → link straight to it; several → merged category page.
+          href:g.libs.length===1 ? `#/library/${g.libs[0].id}` : `#/category/${encodeURIComponent(key)}`,
+        });
       }
     } else {
       for(const lib of libs){
         const page=await api(`/libraries/${lib.id}/items?limit=24&sort=added`);
-        html+=`<h2 class="section">${esc(lib.name)} <a class="muted" style="font-size:12px" href="#/library/${lib.id}">· view all (${page.total})</a></h2>${grid(page.items)}`;
+        sections.push({key:String(lib.id), name:lib.name, items:page.items, total:page.total, href:`#/library/${lib.id}`});
       }
+    }
+  }
+  return {kind:"home", hubs, soon, libs, group, sections};
+}
+async function viewHome(){
+  layoutChrome("home", `<div id="hubs"><div class="empty">Loading…</div></div>`);
+  const page=await loadHome();
+  document.getElementById("main").innerHTML=layoutView("home",page)||`<div class="empty">Nothing here yet.</div>`;
+  wireRails();
+}
+// ---- layout renderers -----------------------------------------------------
+// Attached to the registry declared in the <head> script. A layout supplies a
+// chrome() (the shell) and a views map (one body builder per converted route);
+// anything it does not supply falls through to classic's, so a new layout is
+// only as big as the parts it actually changes.
+LAYOUTS.classic.chrome=classicChrome;
+LAYOUTS.classic.views={home:classicHomeBody};
+// Resolve through the active layout, then classic. Two lookups rather than one
+// because a layout that only redefines Home must still get the classic body for
+// every route it has not converted — a missing renderer is normal, not an error.
+function layoutChrome(active, inner){
+  const L=LAYOUTS[layoutId()];
+  return (L&&L.chrome?L.chrome:classicChrome)(active, inner);
+}
+function layoutView(name, page){
+  const L=LAYOUTS[layoutId()];
+  const fn=(L&&L.views&&L.views[name])||LAYOUTS.classic.views[name];
+  return fn(page);
+}
+// Classic's Home body — byte-for-byte the markup this app has always emitted.
+// It is the zero-diff baseline every other layout is measured against, so this
+// function changes only when the shipped app is meant to change.
+function classicHomeBody(p){
+  let html=installBannerHtml();
+  // The first two rails pass watchCtx: those rows are about where you are in
+  // something, so the card carries "23m left" / "watched Tuesday".
+  if(p.hubs.continue_watching.length){ html+=rail("Continue watching", p.hubs.continue_watching.map(i=>card(i,true)).join("")); }
+  if(p.hubs.next_up && p.hubs.next_up.length){ html+=rail("Next up", p.hubs.next_up.map(i=>card(i,true)).join("")); }
+  if(p.hubs.recently_added.length){ html+=rail("Recently added", p.hubs.recently_added.map(i=>card(i)).join("")); }
+  // Coming soon: what monarr expects. Absent entirely when nothing is paired
+  // or monarr had nothing to say — an empty rail is worse than no rail.
+  if(p.soon && p.soon.entries && p.soon.entries.length){
+    html+=rail("Coming soon", p.soon.entries.map(comingCard).join(""));
+  }
+  if(p.libs.length){
+    html+=groupToggleHtml(p.group);
+    for(const s of p.sections){
+      html+=`<h2 class="section">${esc(s.name)} <a class="muted" style="font-size:12px" href="${s.href}">· view all (${s.total})</a></h2>${grid(s.items)}`;
     }
   } else {
     html+=`<div class="empty">No libraries yet.${ME.is_admin?' Add one in <a href="#/settings">Settings</a>.':''}</div>`;
   }
-  document.getElementById("main").innerHTML=html||`<div class="empty">Nothing here yet.</div>`;
-  wireRails();
+  return html;
 }
 // One rail: a heading, and a strip with an arrow at each end.
 //
@@ -1881,7 +2536,7 @@ async function eachItemPage(libIds, sort, gen, onBatch){
 // pages correctly in one of them and not the other is exactly the kind of
 // difference nobody notices until a library gets big.
 async function libraryView(o){
-  chrome("home",`<div class="empty">Loading…</div>`);
+  layoutChrome("home",`<div class="empty">Loading…</div>`);
   const gen=++LIB_LOAD;
   // Every entry here is a fresh listing — a different library, a new sort, a
   // new filter — and page 3 of a list you have just reordered is not a place.
@@ -1973,7 +2628,7 @@ async function viewLibrary(id){
 async function viewCategory(key){
   const libs=(await libsCached()).filter(l=>libCategory(l).key===key);
   if(!libs.length){
-    chrome("home",`<div class="empty">No libraries in this category.</div>`);
+    layoutChrome("home",`<div class="empty">No libraries in this category.</div>`);
     return;
   }
   const cat=libCategory(libs[0]);
@@ -1995,7 +2650,7 @@ async function viewCategory(key){
   });
 }
 async function viewSearch(q){
-  chrome("home",`<div class="empty">Searching…</div>`);
+  layoutChrome("home",`<div class="empty">Searching…</div>`);
   const r=await api(`/search?q=${encodeURIComponent(q)}`);
   setOrigin(`#/search/${encodeURIComponent(q)}`,`Search “${q}”`);
   const head=pageHead([{href:"#/",label:"Home"},{label:`Search “${q}”`}],`Results for “${q}”`);
@@ -2113,7 +2768,7 @@ function episodeRow(ep){
 let AUTOPLAY=null;
 
 async function viewItem(id){
-  chrome("home",`<div class="empty">Loading…</div>`);
+  layoutChrome("home",`<div class="empty">Loading…</div>`);
   const [d, libs]=await Promise.all([api(`/items/${id}`), libsCached()]);
   const it=d.item;
   const lib=libs.find(l=>l.id===it.library_id);
@@ -5152,7 +5807,7 @@ const ITEM_FOR_FILE={};
 // Where the header pill lands: live streams (with a stop for admins),
 // per-library scan state, and the Trakt story — refreshed every 3s.
 async function viewActivity(){
-  chrome("activity", `<div class="empty">Loading…</div>`);
+  layoutChrome("activity", `<div class="empty">Loading…</div>`);
   await renderActivityBody();
   setPageTimer(renderActivityBody, 3000);
 }
@@ -5267,7 +5922,7 @@ function statusText(st){
 let SETTINGS=null, TRAKT=null, TRAKT_EDIT=false;
 async function viewSettings(){
   if(!ME.is_admin){ location.hash="#/"; return; }
-  chrome("settings",`<div class="empty">Loading…</div>`);
+  layoutChrome("settings",`<div class="empty">Loading…</div>`);
   const [libs,settings,status,sys,users,trakt]=await Promise.all([
     api("/libraries"),api("/settings"),api("/scan/status"),api("/system"),api("/users"),
     api("/trakt/status").catch(()=>null)]);
@@ -5979,6 +6634,383 @@ async function delUser(id, name){
   if(!confirm(`Delete ${name}? Their watch history is removed. Media files are untouched.`)) return;
   try{ await api(`/users/${id}`,{method:"DELETE"}); toast("User deleted"); viewSettings(); }catch(e){ toast(e.message); }
 }
+
+// ---- layout: plex ---------------------------------------------------------
+// The Plex Web shell, ported to the shipped app's parts rather than rebuilt:
+// a fixed left sidebar (wordmark, search, Home, the libraries with counts,
+// Activity/Settings under a divider, scan status and the account chip pinned
+// to the bottom), and a Home made of hub rows.
+//
+// What this file deliberately does NOT contain: a card renderer, a rail
+// renderer, a grid renderer, an escape function or a fetch. Home is composed
+// out of card()/rail()/grid()/comingCard()/installBannerHtml()/groupToggleHtml()
+// exactly as classicHomeBody() composes it — the difference between the two
+// layouts is which of those go in which order and what CSS does to them. A
+// second card function is how five layouts become five apps, which is the one
+// outcome the layout split exists to prevent.
+
+// Sidebar iconography. One 24×24 stroked set, drawn with currentColor so a row
+// tints with its label instead of needing a second colour rule, and inline
+// rather than a sprite because this app ships as a single file with no asset
+// pipeline to hang a sprite off.
+const PLEX_GLYPHS={
+  home:'<path d="M3 11l9-8 9 8M5 10v10h14V10"/>',
+  film:'<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 4v16M17 4v16M3 9h4M3 15h4M17 9h4M17 15h4"/>',
+  tv:'<rect x="3" y="5" width="18" height="12" rx="2"/><path d="M8 21h8M12 17v4"/>',
+  cam:'<rect x="2" y="7" width="13" height="10" rx="2"/><path d="M15 10l7-3v10l-7-3z"/>',
+  anime:'<path d="M12 3l2.4 5.2 5.6.6-4.2 3.8 1.2 5.6-5-2.9-5 2.9 1.2-5.6L4 8.8l5.6-.6z"/>',
+  folder:'<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
+  stack:'<rect x="3" y="4" width="7" height="7" rx="1.5"/><rect x="14" y="4" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="6" rx="1.5"/><rect x="14" y="14" width="7" height="6" rx="1.5"/>',
+  search:'<circle cx="11" cy="11" r="7"/><path d="M20 20l-3.4-3.4"/>',
+  act:'<path d="M3 12h4l3-8 4 16 3-8h4"/>',
+  gear:'<circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M19.1 4.9L17 7M7 17l-2.1 2.1"/>',
+};
+// aria-hidden because every icon here sits next to its own text label; an
+// unlabelled decorative SVG announced by a screen reader is noise. focusable
+// is the legacy-Edge guard that keeps SVGs out of the tab order.
+function plexIcon(name){
+  return `<svg class="px-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"`
+    +` stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">`
+    +(PLEX_GLYPHS[name]||PLEX_GLYPHS.folder)+`</svg>`;
+}
+// Both spellings on purpose: LibraryDto.kind is plural ("movies"/"shows"/
+// "home") while libCategory() hands back singular section keys ("movie" /
+// "show" / "home"), and the sidebar is fed from whichever of the two is
+// available. Anything unrecognised gets the folder, never a blank gutter.
+function plexLibGlyph(kind, anime){
+  if(anime) return "anime";
+  if(kind==="movie"||kind==="movies") return "film";
+  if(kind==="show"||kind==="shows") return "tv";
+  if(kind==="home") return "cam";
+  return "folder";
+}
+
+// ---- the sidebar's data problem -------------------------------------------
+// The sidebar wants library names and item counts on every route, but chrome
+// is synchronous (classicChrome is, and the router calls it the same way) and
+// it may not fetch: the gate compares the request log per route, so a chrome
+// that pulls /libraries on the item page is a failure even though the data is
+// harmless. So the shell is painted from whatever is already in memory and
+// filled in afterwards, the same shape pollActivity() uses for the status pill
+// — render the container, fill it when the answer exists, be safe to run twice.
+//
+// Two sources, best first:
+//   PLEX_NAV    the home page model, which carries names, hrefs AND counts,
+//               already grouped the way the user chose (category or share).
+//   LIBS_CACHE  whatever a previously-visited item/library/category page left
+//               behind. Names and hrefs, no counts. Read directly and never
+//               through libsCached(), which fetches when cold.
+// Cold first paint (a hard reload straight onto any route) has neither, and
+// the sidebar renders with Home, Manage and the footer but no Libraries
+// section at all — not a spinner and not a skeleton, because a heading over
+// two grey bars is a claim about content we have not got. On the home route
+// the gap closes as soon as loadHome() resolves; on other routes it closes on
+// the next navigation that populates LIBS_CACHE.
+let PLEX_NAV=null;
+
+function plexNavFromHome(p){
+  const byId={};
+  for(const l of (p.libs||[])) byId[String(l.id)]={kind:l.kind, anime:!!l.anime};
+  // Section keys are library ids under "share" grouping and category keys
+  // under "category" grouping; the lookup covers the first and the fallthrough
+  // to s.key covers the second.
+  const secs=(p.sections||[]).map(s=>{
+    const lib=byId[String(s.key)];
+    return {name:s.name, href:s.href, count:s.total,
+            glyph:plexLibGlyph(lib?lib.kind:s.key, lib?lib.anime:false)};
+  });
+  // An empty array is an answer ("this server has no libraries"), not a miss,
+  // so it is stored as one — otherwise the stale LIBS_CACHE fallback below
+  // would resurrect libraries the user just deleted.
+  PLEX_NAV = secs.length ? secs : (p.libs||[]).map(l=>({
+    name:l.name, href:`#/library/${l.id}`, count:null, glyph:plexLibGlyph(l.kind, l.anime)}));
+}
+function plexNavItems(){
+  if(PLEX_NAV) return PLEX_NAV;
+  if(LIBS_CACHE) return LIBS_CACHE.map(l=>({
+    name:l.name, href:`#/library/${l.id}`, count:null, glyph:plexLibGlyph(l.kind, l.anime)}));
+  return null;
+}
+function plexNavHtml(){
+  const items=plexNavItems();
+  if(!items||!items.length) return "";
+  const here=location.hash||"#/";
+  const rows=items.map(it=>{
+    // Exact-match highlight. An item page does not light its library up,
+    // matching what classic's top nav does with the same information.
+    const on = here===it.href;
+    return `<a href="${esc(it.href)}" class="${on?"on":""}"${on?' aria-current="page"':""}>`
+      +plexIcon(it.glyph)
+      // title= as well as the text: the label is clipped to one line, so a
+      // library called "Kids — French dubs (external drive)" is otherwise
+      // unreadable at 236px with no way to see the rest.
+      +`<span class="px-lbl" title="${esc(it.name)}">${esc(it.name)}</span>`
+      +(it.count==null?"":`<span class="px-n">${esc(String(it.count))}</span>`)
+      +`</a>`;
+  }).join("");
+  return `<div class="px-sec">Libraries</div><nav class="px-nav">${rows}</nav>`;
+}
+// Idempotent by construction: it replaces the container's contents from the
+// current best source, so calling it from chrome and again from the home body
+// (and again on the next render) can only ever converge.
+function plexFillNav(){
+  const box=document.getElementById("pxlibs");
+  if(box) box.innerHTML=plexNavHtml();
+}
+
+// ---- one-time wiring ------------------------------------------------------
+// Two things the shipped markup cannot give a keyboard user, installed once
+// per session and guarded so they can never touch another layout.
+//
+// A poster is a <div onclick=…>: clickable, but not focusable and not
+// operable from the keyboard. The G2 acceptance list requires walking
+// home → library → detail → play with a visible ring, so plex adds tabindex
+// and a role to every card the app renders, including the ones on routes it
+// has not converted (library, search, item). A MutationObserver rather than a
+// call at the end of each view because plex does not own those views.
+//
+// The layoutId() guard is the important line: switching layout re-runs
+// render(), which repaints classic's DOM under the same live observer. Without
+// the check, classic would start emitting posters carrying tabindex — a diff
+// in the byte-identical baseline the gate re-checks after every layout lands.
+let PLEX_WIRED=false;
+function plexEnhanceCards(){
+  if(layoutId()!=="plex") return;
+  for(const el of document.querySelectorAll(".poster[onclick]:not([tabindex])")){
+    el.setAttribute("tabindex","0");
+    // Cards that navigate are links; the photo cards call openLightbox() and
+    // are buttons. Announcing every card as a link would promise a page that
+    // a lightbox never delivers.
+    el.setAttribute("role", /location\.hash/.test(el.getAttribute("onclick")||"") ? "link" : "button");
+  }
+}
+function plexWireOnce(){
+  if(PLEX_WIRED) return;
+  PLEX_WIRED=true;
+  document.addEventListener("keydown",e=>{
+    if(layoutId()!=="plex") return;
+    // The player and the lightbox own the keyboard while they are up; both of
+    // the shipped handlers guard on that and this one has to agree, or Esc
+    // closes a sheet nobody can see instead of the video.
+    const modal=document.getElementById("modal");
+    if(lightboxOpen()||(modal&&modal.classList.contains("open"))) return;
+    if(e.key==="Escape"){
+      const shell=document.getElementById("pxshell");
+      if(shell&&shell.classList.contains("px-open")){ e.preventDefault(); plexToggleLibs(); }
+      return;
+    }
+    const el=e.target;
+    if(!el||!el.classList||!el.classList.contains("poster")) return;
+    // Enter and Space are what a role=link/button promises. "Spacebar" is the
+    // legacy key name older WebKit still reports.
+    if(e.key!=="Enter"&&e.key!==" "&&e.key!=="Spacebar") return;
+    e.preventDefault();          // Space would otherwise page the grid down
+    el.click();                  // fires the inline handler card() emitted
+  });
+  // #app itself is never replaced (every view assigns to its innerHTML), so
+  // one observer on it outlives every route change.
+  const app=document.getElementById("app");
+  if(app&&window.MutationObserver) new MutationObserver(plexEnhanceCards).observe(app,{childList:true,subtree:true});
+  plexEnhanceCards();
+}
+
+// ---- phone: the library sheet and the search tab --------------------------
+// The bottom tab bar exists in the DOM on every surface and CSS decides
+// whether it is visible, so a resized window changes shape without a
+// re-render. Two of the four tabs are routes; these are the other two.
+//
+// "Libraries" has no route to point at — there is no #/libraries index — so it
+// reveals the sidebar's own library list as a full-screen sheet. Full screen
+// rather than a drawer because a drawer has an "outside" to mis-tap on a phone,
+// and it reuses the same nav element rather than a phone-only copy of it.
+// Nothing has to close the sheet on navigation: routing repaints the chrome
+// and the class goes with it.
+function plexToggleLibs(e){
+  if(e){ e.preventDefault(); e.stopPropagation(); }
+  const shell=document.getElementById("pxshell"); if(!shell) return;
+  const open=!shell.classList.contains("px-open");
+  shell.classList.toggle("px-open",open);
+  const btn=document.querySelector('.px-tab[data-tab="libs"]');
+  if(btn) btn.setAttribute("aria-expanded",open?"true":"false");
+  // The page behind a full-screen sheet must not scroll under it — the same
+  // lock openLightbox() takes, released the same way.
+  document.body.style.overflow=open?"hidden":"";
+  // Focus follows the sheet, or a keyboard user is left tabbing through a
+  // panel that is no longer on screen.
+  const target=open?document.querySelector("#pxnav .px-nav a"):btn;
+  if(target&&target.focus) target.focus();
+}
+// The search field is the sidebar's, which on a phone is the header's. The tab
+// puts the caret in it rather than routing anywhere, so there is exactly one
+// #q in the document and getQ()/the debounce wiring keep working untouched.
+function plexFocusSearch(e){
+  if(e){ e.preventDefault(); }
+  const shell=document.getElementById("pxshell");
+  if(shell&&shell.classList.contains("px-open")) plexToggleLibs();   // the sheet covers the header
+  const q=document.getElementById("q");
+  if(q){ q.focus(); try{ q.select(); }catch(err){} }
+}
+// Two of the four are anchors and two are buttons, which is the honest markup:
+// a tab that routes is a link and a tab that opens a panel is a button, and
+// the difference is what a screen reader announces.
+function plexTabsHtml(active, homeOn){
+  const on=b=>b?' class="px-tab on" aria-current="page"':' class="px-tab"';
+  return `<nav class="px-tabs" aria-label="Sections">
+    <a href="#/" data-tab="home"${on(homeOn)}>${plexIcon("home")}<span>Home</span></a>
+    <button type="button" data-tab="libs" class="px-tab" aria-expanded="false" aria-controls="pxnav" onclick="plexToggleLibs(event)">${plexIcon("stack")}<span>Libraries</span></button>
+    <button type="button" data-tab="search" class="px-tab" onclick="plexFocusSearch(event)">${plexIcon("search")}<span>Search</span></button>
+    <a href="#/activity" data-tab="activity"${on(active==="activity")}>${plexIcon("act")}<span>Activity</span></a>
+  </nav>`;
+}
+
+// ---- chrome ---------------------------------------------------------------
+// Same contract as classicChrome(): assign #app, produce <main id="main"> with
+// `inner` inside it, wire the 300 ms search debounce, end with pollActivity().
+// The header's controls all move into the sidebar footer and every one of them
+// calls the shipped popover functions — toggleThemeMenu / toggleAppearanceMenu
+// / toggleSizeMenu / toggleProfileMenu — rather than a plex copy of them, so
+// the layout picker inside the theme menu keeps working from inside plex and a
+// change to any of those menus lands in both layouts at once.
+function plexChrome(active, inner){
+  const hash=location.hash||"#/";
+  // Library, category and search routes all call layoutChrome("home", …), so
+  // `active==="home"` alone would light Home up while the user is looking at a
+  // library that has its own row two lines below it. In a sidebar that lists
+  // the libraries, Home means the home page.
+  const homeOn = active==="home" && (hash==="#/"||hash==="#"||hash==="");
+  // Settings appears for admins only, and nowhere else in the shell — the
+  // acceptance list checks a non-admin sees no Settings anywhere in the
+  // sidebar. (The account popover applies the same test to its own entry.)
+  const admin = ME&&ME.is_admin
+    ? `<a href="#/settings" class="${active==="settings"?"on":""}"${active==="settings"?' aria-current="page"':""}>`
+      +plexIcon("gear")+`<span class="px-lbl">Settings</span></a>`
+    : "";
+  // ${APP_NAME}, never the literal product name — the shipped header's title
+  // attribute still says "plurx" here; that is a bug this layout does not copy.
+  const getapp = installAvailable()
+    ? `<button class="ghost sm getappbtn" onclick="showInstall()" title="Install the ${APP_NAME} app">Get app</button>` : "";
+  document.getElementById("app").innerHTML=`
+   <div class="px-shell" id="pxshell">
+     <aside class="px-side">
+       <div class="px-head">
+         <div class="px-brand"><a href="#/" class="logo">${APP_NAME}</a></div>
+         <input class="search" id="q" placeholder="Search…" aria-label="Search ${APP_NAME}" value="${esc(getQ())}">
+       </div>
+       <div class="px-scroll" id="pxnav">
+         <button class="ghost sm px-sheetx" type="button" aria-label="Close libraries" onclick="plexToggleLibs(event)">✕</button>
+         <nav class="px-nav" aria-label="Main">
+           <a href="#/" class="${homeOn?"on":""}"${homeOn?' aria-current="page"':""}>${plexIcon("home")}<span class="px-lbl">Home</span></a>
+         </nav>
+         <div id="pxlibs"></div>
+         <div class="px-sec">Manage</div>
+         <nav class="px-nav" aria-label="Manage">
+           <a href="#/activity" class="${active==="activity"?"on":""}"${active==="activity"?' aria-current="page"':""}>${plexIcon("act")}<span class="px-lbl">Activity</span></a>
+           ${admin}
+         </nav>
+       </div>
+       <div class="px-foot">
+         <span class="activity" id="activity" onclick="location.hash='#/activity'"></span>
+         <div class="px-ctl">
+           <div class="px-pop">
+             <button class="ghost sm" onclick="toggleThemeMenu(event)" title="Theme &amp; layout" aria-label="Theme and layout"><span class="tsw"></span></button>
+             <div class="amenu" id="thememenu"></div>
+           </div>
+           <div class="px-pop">
+             <button class="ghost sm" onclick="toggleAppearanceMenu(event)" title="Light / dark" aria-label="Light or dark">◐</button>
+             <div class="amenu" id="appmenu"></div>
+           </div>
+           <div class="px-pop">
+             <button class="ghost sm sizebtn" onclick="toggleSizeMenu(event)" title="Icon size" style="display:inline-flex;align-items:center;gap:6px">
+               <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor" aria-hidden="true"><rect x="0" y="0" width="5" height="5" rx="1"/><rect x="7" y="0" width="5" height="5" rx="1"/><rect x="0" y="7" width="5" height="5" rx="1"/><rect x="7" y="7" width="5" height="5" rx="1"/></svg><span>Size</span>
+             </button>
+             <div class="amenu" id="sizemenu"></div>
+           </div>
+           ${getapp}
+         </div>
+         <div class="px-user">
+           <div class="px-pop" style="flex:1;min-width:0;display:flex">
+             <button class="ghost sm profile" onclick="toggleProfileMenu(event)" title="Account">
+               <span class="pavatar">${esc((ME&&ME.username?ME.username[0]:"?").toUpperCase())}</span><span class="pname">${esc(ME?ME.username:"")}</span><span class="caret">▾</span>
+             </button>
+             <div class="amenu" id="profilemenu"></div>
+           </div>
+         </div>
+       </div>
+     </aside>
+     <main id="main">${inner}</main>
+     ${plexTabsHtml(active, homeOn)}
+   </div>`;
+  // Synchronous fill from whatever is cached; the home body calls it again
+  // with the real thing a moment later.
+  plexFillNav();
+  const q=document.getElementById("q");
+  let t; q.addEventListener("input",()=>{ clearTimeout(t); t=setTimeout(()=>{ location.hash= q.value?("#/search/"+encodeURIComponent(q.value)):"#/"; },300); });
+  plexWireOnce();
+  pollActivity();
+}
+
+// ---- home -----------------------------------------------------------------
+// Same model, same helpers, different composition. The one structural change
+// from classic is that a library section is a hub ROW with a "See all" rather
+// than a wall of grid — that row, repeated per library, is what the plex
+// sidebar shell is built around, and it is the difference between a home page
+// you scan and a home page you scroll.
+//
+// Hub headings keep the shipped wording ("Continue watching", "Next up") and
+// not Plex's ("On Deck"): user-facing strings are explicitly not a layout's to
+// change, and a layout switch that renames things the user has learned is a
+// worse trade than the reference it buys.
+function plexHomeBody(p){
+  // The sidebar is outside #main, so it survives the assignment that is about
+  // to replace #main with this string — filling it here is what closes the
+  // cold-paint gap on the home route.
+  plexNavFromHome(p);
+  plexFillNav();
+
+  const hub=k=>(p.hubs&&p.hubs[k])||[];
+  let html=installBannerHtml();
+  // watchCtx on the first two rails: those rows are about where you are in
+  // something, so the card carries "23m left · ends ~10:45 PM".
+  if(hub("continue_watching").length) html+=rail("Continue watching", hub("continue_watching").map(i=>card(i,true)).join(""));
+  if(hub("next_up").length)           html+=rail("Next up",           hub("next_up").map(i=>card(i,true)).join(""));
+  if(hub("recently_added").length)    html+=rail("Recently added",    hub("recently_added").map(i=>card(i)).join(""));
+  if(p.soon&&p.soon.entries&&p.soon.entries.length) html+=rail("Coming soon", p.soon.entries.map(comingCard).join(""));
+
+  if(p.libs.length){
+    html+=groupToggleHtml(p.group);
+    for(const s of p.sections){
+      const total=s.total==null?"":`<span class="px-n">${esc(String(s.total))}</span>`;
+      // rail() interpolates its heading as HTML (classic passes plain text),
+      // which is what lets the "see all" link ride in the heading instead of
+      // needing a second rail function. Both interpolations are esc()'d.
+      const head=`${esc(s.name)}<a class="px-seeall" href="${esc(s.href)}">See all${total}</a>`;
+      // Two cases still take a grid. An empty section, because rail() on an
+      // empty row renders a heading over nothing while grid([]) renders the
+      // "Nothing here yet." card the rest of the app uses; and any section
+      // holding photos, because grid() is what populates PHOTO_SET and without
+      // it the lightbox opens on one picture and cannot page to the next.
+      const photos=s.items.some(i=>i.kind==="photo");
+      html += (!s.items.length||photos)
+        ? `<h2 class="section">${head}</h2>${grid(s.items)}`
+        : rail(head, s.items.map(i=>card(i)).join(""));
+    }
+  }else{
+    html+=`<div class="empty">No libraries yet.${ME&&ME.is_admin?' Add one in <a href="#/settings">Settings</a>.':""}</div>`;
+  }
+  return html;
+}
+
+LAYOUTS.plex={name:"Plex", surfaces:["desktop","mobile","tv"], chrome:plexChrome, views:{home:plexHomeBody}};
+// applyLayout() ran in the <head>, where the registry holds classic and
+// nothing else — so layoutId() could not recognise a stored "plex" preference
+// and left <html data-layout="classic">. Every rule in this layout's
+// stylesheet is scoped under [data-layout=plex]; without this line the plex
+// chrome renders wearing none of them, which looks exactly like a stylesheet
+// that failed to load. Re-applying here is invisible: boot() has not resolved
+// /server yet, so #app is empty and there is nothing painted to reflow.
+// The tidier fix is a {name,surfaces} stub for plex in the <head> registry
+// beside classic's, which is where the pre-paint pass expects to find it —
+// that is an edit to the <head> script, outside this fragment.
 
 // ---- router ---------------------------------------------------------------
 // One page-scoped poller at a time; routing away always clears it.
