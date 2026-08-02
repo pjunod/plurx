@@ -16,7 +16,6 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncReadExt;
 
 use plurx_core::domain::{MediaFile, SubtitleStream};
 use plurx_core::tracks::is_native_text_subtitle;
@@ -335,26 +334,9 @@ pub async fn playlist(
     if query.native != Some(1) {
         return video_playlist(State(state), AxPath(session)).await;
     }
-    let (context, file) = session_file(&state, &session).await?;
-    // A compatible Dolby Vision stream needs an exact base-layer codec in a
-    // multivariant playlist. ffprobe does not reliably expose HEVC's tier,
-    // and guessing Main Tier made the manifest say `L150` while the remuxed
-    // hvcC box said `H150`; AVPlayer quite correctly rejected that mismatch.
-    // The init segment is the canonical description of the bytes AVPlayer is
-    // about to decode, so derive the declaration from it once it is published.
-    let codecs = if context.supplemental_codecs.is_some() {
-        exact_hevc_codecs(&state, &session, &context.codecs).await
-    } else {
-        None
-    };
+    let (_, file) = session_file(&state, &session).await?;
     Ok(playlist_response(
-        master_playlist(
-            &file,
-            query.subtitle,
-            codecs.as_deref(),
-            context.supplemental_codecs.as_deref(),
-        )
-        .into_bytes(),
+        master_playlist(&file, query.subtitle).into_bytes(),
     ))
 }
 
@@ -547,83 +529,7 @@ fn subtitle_characteristics(track: &SubtitleStream) -> Option<&'static str> {
         )
 }
 
-/// Read the small initialization segment and return its exact RFC 6381 HEVC
-/// codec plus the audio codec already resolved for this session.
-async fn exact_hevc_codecs(state: &AppState, session: &str, fallback: &str) -> Option<String> {
-    let opened = state.transcode.segment(session, "init.mp4").await?;
-    // Initialization segments are normally a few KiB. Bound a corrupt or
-    // unexpected file so a playlist request can never allocate without limit.
-    let mut bytes = Vec::with_capacity(opened.len.min(64 * 1024) as usize);
-    let mut reader = opened.file.take(1024 * 1024);
-    reader.read_to_end(&mut bytes).await.ok()?;
-    let sample_entry = fallback
-        .split_once(',')
-        .map_or(fallback, |(video, _)| video);
-    let sample_entry = sample_entry.split('.').next()?;
-    let video = hevc_codec_from_init(&bytes, sample_entry)?;
-    let audio = fallback.split_once(',').map(|(_, audio)| audio.trim());
-    Some(match audio.filter(|audio| !audio.is_empty()) {
-        Some(audio) => format!("{video},{audio}"),
-        None => video,
-    })
-}
-
-/// Parse the HEVCDecoderConfigurationRecord carried by an `hvcC` box.
-///
-/// The profile-compatibility bits are stored in HEVC bitstream order and
-/// reversed for RFC 6381. Trailing zero constraint bytes are omitted, as the
-/// codec syntax requires. Parsing the muxer's output keeps profile, tier,
-/// level, and constraints in lockstep with the bytes served to AVPlayer.
-fn hevc_codec_from_init(init: &[u8], sample_entry: &str) -> Option<String> {
-    let type_at = init.windows(4).position(|window| window == b"hvcC")?;
-    let box_start = type_at.checked_sub(4)?;
-    let box_size = u32::from_be_bytes(init.get(box_start..type_at)?.try_into().ok()?) as usize;
-    let box_end = box_start.checked_add(box_size)?;
-    if box_size < 21 || box_end > init.len() {
-        return None;
-    }
-    let payload = init.get(type_at + 4..box_end)?;
-    if payload.len() < 13 || payload[0] != 1 {
-        return None;
-    }
-
-    let profile_byte = payload[1];
-    let profile_space = match profile_byte >> 6 {
-        0 => "",
-        1 => "A",
-        2 => "B",
-        3 => "C",
-        _ => return None,
-    };
-    let profile = profile_byte & 0x1f;
-    let tier = if profile_byte & 0x20 == 0 { 'L' } else { 'H' };
-    let compatibility = u32::from_be_bytes(payload.get(2..6)?.try_into().ok()?).reverse_bits();
-    let level = payload[12];
-    let constraints = payload.get(6..12)?;
-    let constraints_len = constraints
-        .iter()
-        .rposition(|byte| *byte != 0)
-        .map_or(0, |last| last + 1);
-    let constraints = constraints[..constraints_len]
-        .iter()
-        .map(|byte| format!("{byte:02X}"))
-        .collect::<String>();
-
-    let mut codec =
-        format!("{sample_entry}.{profile_space}{profile}.{compatibility:X}.{tier}{level}");
-    if !constraints.is_empty() {
-        codec.push('.');
-        codec.push_str(&constraints);
-    }
-    Some(codec)
-}
-
-fn master_playlist(
-    file: &MediaFile,
-    selected: Option<i64>,
-    codecs: Option<&str>,
-    supplemental_codecs: Option<&str>,
-) -> String {
+fn master_playlist(file: &MediaFile, selected: Option<i64>) -> String {
     let native: Vec<(usize, &SubtitleStream)> = file
         .subtitle_streams
         .iter()
@@ -678,22 +584,6 @@ fn master_playlist(
     }
     let bandwidth = file.bitrate.unwrap_or(25_000_000).max(128_000);
     out.push_str(&format!("#EXT-X-STREAM-INF:BANDWIDTH={bandwidth}"));
-    if let Some(codecs) = codecs {
-        let subtitle_codec = if native.is_empty() { "" } else { ",wvtt" };
-        out.push_str(&format!(",CODECS=\"{codecs}{subtitle_codec}\""));
-        if let Some(supplemental) = supplemental_codecs {
-            out.push_str(&format!(",SUPPLEMENTAL-CODECS=\"{supplemental}\""));
-        }
-        if let (Some(width), Some(height)) = (file.width, file.height) {
-            out.push_str(&format!(",RESOLUTION={width}x{height}"));
-        }
-        let video_range = if supplemental_codecs.is_some_and(|value| value.ends_with("/db4h")) {
-            "HLG"
-        } else {
-            "PQ"
-        };
-        out.push_str(&format!(",VIDEO-RANGE={video_range},CLOSED-CAPTIONS=NONE"));
-    }
     if !native.is_empty() {
         out.push_str(",SUBTITLES=\"subs\"");
     }
@@ -1031,17 +921,11 @@ mod tests {
             sub("subrip", "eng", "Regular", false, false),
             sub("webvtt", "eng", "SDH", false, false),
         ]);
-        let master = master_playlist(
-            &file,
-            Some(2),
-            Some("hvc1.2.4.H150.B0,ec-3"),
-            Some("dvh1.08.06/db1p"),
-        );
+        let master = master_playlist(&file, Some(2));
 
         assert!(master.starts_with("#EXTM3U\n#EXT-X-VERSION:7\n"));
-        assert!(master.contains(
-            "#EXT-X-STREAM-INF:BANDWIDTH=40000000,CODECS=\"hvc1.2.4.H150.B0,ec-3,wvtt\",SUPPLEMENTAL-CODECS=\"dvh1.08.06/db1p\",RESOLUTION=3840x2160,VIDEO-RANGE=PQ,CLOSED-CAPTIONS=NONE,SUBTITLES=\"subs\""
-        ));
+        assert!(master.contains("#EXT-X-STREAM-INF:BANDWIDTH=40000000,SUBTITLES=\"subs\""));
+        assert!(!master.contains("CODECS="));
         assert!(!master.contains("#EXT-X-INDEPENDENT-SEGMENTS"));
         assert!(master.contains("NAME=\"English · Forced\",LANGUAGE=\"en\",DEFAULT=NO,AUTOSELECT=YES,FORCED=YES,URI=\"subs/2/index.m3u8\""));
         assert!(master.contains(
@@ -1058,11 +942,11 @@ mod tests {
             sub("subrip", "eng", "Regular", false, false),
             sub("webvtt", "eng", "Alternate", false, false),
         ]);
-        let master = master_playlist(&file, None, None, None);
+        let master = master_playlist(&file, None);
         assert!(!master.contains("CODECS="));
         assert_eq!(master.matches("AUTOSELECT=NO").count(), 2);
 
-        let selected = master_playlist(&file, Some(1), None, None);
+        let selected = master_playlist(&file, Some(1));
         assert!(selected
             .contains("NAME=\"English · Alternate\",LANGUAGE=\"en\",DEFAULT=YES,AUTOSELECT=YES"));
     }
@@ -1076,26 +960,11 @@ mod tests {
             sub("ass", "eng", "Styled Signs", false, false),
             sub("ssa", "eng", "Styled Dialogue", false, false),
         ]);
-        let master = master_playlist(&file, None, None, None);
+        let master = master_playlist(&file, None);
         assert!(master.contains("subs/0/index.m3u8"));
         for index in 1..=4 {
             assert!(!master.contains(&format!("subs/{index}/index.m3u8")));
         }
-    }
-
-    #[test]
-    fn hls_codec_comes_from_the_published_hevc_configuration() {
-        // hvcC version 1, Main 10 profile, High tier, compatibility 0x20000000
-        // (RFC 6381 value 4), constraints B0, level 150. The bytes mirror the
-        // configuration emitted for regression file 5615.
-        let mut init = vec![0, 0, 0, 21];
-        init.extend_from_slice(b"hvcC");
-        init.extend_from_slice(&[1, 0x22, 0x20, 0, 0, 0, 0xB0, 0, 0, 0, 0, 0, 150]);
-
-        assert_eq!(
-            hevc_codec_from_init(&init, "hvc1").as_deref(),
-            Some("hvc1.2.4.H150.B0")
-        );
     }
 
     #[test]
