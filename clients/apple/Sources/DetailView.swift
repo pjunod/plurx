@@ -327,10 +327,56 @@ struct DetailView: View {
             PlayerView(itemId: ctx.itemId, fileId: ctx.fileId, startMs: ctx.startMs,
                        durationMs: ctx.durationMs, title: ctx.title,
                        subtitle: ctx.subtitle, year: ctx.year, overview: ctx.overview,
-                       onPlayNext: { play = $0 })
+                       onPlayNext: { play = $0 },
+                       onPlaybackStopped: { positionMs in
+                           updateVisibleProgress(
+                               itemId: ctx.itemId,
+                               positionMs: positionMs,
+                               durationMs: ctx.durationMs
+                           )
+                       })
                 .id(ctx.id)
                 .environmentObject(model)
         }
+    }
+
+    private func updateVisibleProgress(itemId: Int, positionMs: Int, durationMs: Int) {
+        guard let detail else { return }
+        self.detail = Self.detail(
+            detail,
+            applyingPositionMs: positionMs,
+            durationMs: durationMs,
+            forItemId: itemId
+        )
+    }
+
+    /// Apply the final player position to the detail snapshot that remains on
+    /// screen underneath the full-screen cover. The server receives the same
+    /// position from `PlayerController.stop()`; this local copy removes the UI
+    /// race without making dismissal wait on the network.
+    static func detail(
+        _ detail: ItemDetail,
+        applyingPositionMs positionMs: Int,
+        durationMs: Int,
+        forItemId itemId: Int
+    ) -> ItemDetail {
+        guard detail.item.id == itemId, positionMs > 0 else { return detail }
+        var item = detail.item
+        var watch = item.watch ?? Watch()
+        watch.positionMs = positionMs
+        if durationMs > 0 {
+            watch.durationMs = durationMs
+            if Double(positionMs) >= Double(durationMs) * 0.95 {
+                watch.watched = true
+            }
+        }
+        item.watch = watch
+        return ItemDetail(
+            item: item,
+            files: detail.files,
+            children: detail.children,
+            ancestors: detail.ancestors
+        )
     }
 
     @ViewBuilder

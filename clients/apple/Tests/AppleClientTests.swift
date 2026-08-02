@@ -89,6 +89,44 @@ final class AppleClientTests: XCTestCase {
         XCTAssertEqual(AppBuildInfo.label(version: nil, build: nil), "Unknown")
     }
 
+    func testDetailResumeUsesThePositionHandedBackByThePlayer() throws {
+        var item = Item(id: 7, kind: "movie", title: "Feature")
+        item.watch = Watch(positionMs: 12_000, durationMs: 7_200_000, watched: false)
+        let original = ItemDetail(item: item)
+
+        let updated = DetailView.detail(
+            original,
+            applyingPositionMs: 91_687,
+            durationMs: 7_200_000,
+            forItemId: 7
+        )
+
+        XCTAssertEqual(updated.item.watch?.positionMs, 91_687)
+        XCTAssertEqual(updated.item.watch?.durationMs, 7_200_000)
+        XCTAssertEqual(updated.item.watch?.watched, false)
+
+        let unrelated = DetailView.detail(
+            original,
+            applyingPositionMs: 300_000,
+            durationMs: 7_200_000,
+            forItemId: 8
+        )
+        XCTAssertEqual(unrelated.item.watch?.positionMs, 12_000)
+    }
+
+    func testDetailProgressReflectsTheServerWatchedThreshold() throws {
+        let original = ItemDetail(item: Item(id: 7, kind: "movie", title: "Feature"))
+
+        let updated = DetailView.detail(
+            original,
+            applyingPositionMs: 95_000,
+            durationMs: 100_000,
+            forItemId: 7
+        )
+
+        XCTAssertEqual(updated.item.watch?.watched, true)
+    }
+
     @MainActor
     func testTVSeriesPrimaryActionPrefersProgressAndSupportsSingleSeasonShapes() {
         var first = Item(id: 1, kind: "episode", title: "First")

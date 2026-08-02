@@ -65,6 +65,11 @@ struct PlayerView: View {
     var year: Int? = nil
     var overview: String? = nil
     var onPlayNext: ((PlayContext) -> Void)?
+    /// Hands the owning detail screen the last on-screen position immediately.
+    /// The server progress write is intentionally best-effort and asynchronous;
+    /// without this handoff the still-present detail view keeps rendering the
+    /// resume point it loaded before playback began.
+    var onPlaybackStopped: ((Int) -> Void)?
 
     @StateObject private var controller = PlayerController()
     @StateObject private var pictureInPicture = PictureInPictureController()
@@ -181,8 +186,10 @@ struct PlayerView: View {
             #endif
         }
         .onDisappear {
+            let stoppedAt = controller.realPositionMs()
             pictureInPicture.stop()
             controller.stop()
+            onPlaybackStopped?(stoppedAt)
         }
         .task(id: autoHideGeneration) {
             guard Self.shouldAutoHideControls(
