@@ -104,6 +104,35 @@ const LANG_ALIASES: &[&[&str]] = &[
     &["ron", "rum", "ro"],
 ];
 
+/// The BCP-47 subtag for a container's language code — what HLS `LANGUAGE=`
+/// and AVFoundation's `extendedLanguageTag` are actually specified in terms of.
+///
+/// Containers overwhelmingly spell languages in ISO 639-2 ("dut", "cze",
+/// "gre", "ita"), which is *not* a BCP-47 tag. Emitting one verbatim in a
+/// rendition line defeats every client-side language match, because the
+/// viewer's preference arrives as "nl"/"cs"/"el". The mapping deliberately
+/// reads [`LANG_ALIASES`] rather than carrying a second, smaller table of its
+/// own: that constant is already this project's one record of "these
+/// spellings mean the same language", and a duplicate of it is a divergence
+/// waiting for the day only one of them learns a new language.
+///
+/// The group's two-letter member is the BCP-47 tag — taken by *length*, not
+/// by position, because the alias groups are ordered by settings canonicality
+/// ("jpn", "ja", "jp") and the last entry is not always the standard subtag.
+/// An unknown code passes through unchanged: a wrong-looking tag a client can
+/// ignore beats inventing one.
+pub fn bcp47_tag(code: Option<&str>) -> &str {
+    let Some(raw) = code.map(str::trim).filter(|c| !c.is_empty()) else {
+        return "und";
+    };
+    let lower = raw.to_ascii_lowercase();
+    LANG_ALIASES
+        .iter()
+        .find(|group| group.contains(&lower.as_str()))
+        .and_then(|group| group.iter().find(|entry| entry.len() == 2).copied())
+        .unwrap_or(raw)
+}
+
 /// Does a stream's language tag mean the preferred language?
 pub fn lang_matches(code: &Option<String>, pref: &str) -> bool {
     let Some(code) = code else { return false };
@@ -390,5 +419,28 @@ mod tests {
             assert!(!is_native_text_subtitle(codec), "{codec}");
             assert!(subtitle_requires_burn(codec), "{codec}");
         }
+    }
+    #[test]
+    fn bcp47_tags_come_from_the_alias_table() {
+        // ISO 639-2/B is what containers actually write, and it is not a
+        // BCP-47 tag — a client matching the viewer's "nl" against "dut"
+        // never matches.
+        assert_eq!(bcp47_tag(Some("dut")), "nl");
+        assert_eq!(bcp47_tag(Some("nld")), "nl");
+        assert_eq!(bcp47_tag(Some("cze")), "cs");
+        assert_eq!(bcp47_tag(Some("gre")), "el");
+        assert_eq!(bcp47_tag(Some("rum")), "ro");
+        assert_eq!(bcp47_tag(Some("eng")), "en");
+        // Taken by LENGTH, not by position: the Japanese group ends in "jp",
+        // which is a country code, not a language subtag.
+        assert_eq!(bcp47_tag(Some("jpn")), "ja");
+        assert_eq!(bcp47_tag(Some("jp")), "ja");
+        // Already a tag, any case.
+        assert_eq!(bcp47_tag(Some("EN")), "en");
+        // Unknown passes through rather than becoming a guess; absent and
+        // blank both mean undetermined.
+        assert_eq!(bcp47_tag(Some("xyz")), "xyz");
+        assert_eq!(bcp47_tag(None), "und");
+        assert_eq!(bcp47_tag(Some("  ")), "und");
     }
 }
