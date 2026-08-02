@@ -353,15 +353,14 @@ pub async fn video_playlist(
     Ok(playlist_response(bytes))
 }
 
-/// One native WebVTT rendition's media playlist. The VTT is a single VOD
-/// segment spanning the remaining source timeline; selection is infrequent,
-/// and keeping one cached sidecar avoids re-reading a large MKV per HLS video
-/// segment.
+/// One native WebVTT rendition's media playlist. Its segments mirror the
+/// video rendition so AVPlayer sees matching playlist types and timelines.
+/// Every child resource is still cut from the one cached sidecar.
 pub async fn subtitle_playlist(
     State(state): State<AppState>,
     AxPath((session, index)): AxPath<(String, i64)>,
 ) -> Result<Response, ApiError> {
-    let (context, file) = session_file(&state, &session).await?;
+    let (_, file) = session_file(&state, &session).await?;
     let track = file
         .subtitle_streams
         .get(index as usize)
@@ -371,17 +370,23 @@ pub async fn subtitle_playlist(
             "this subtitle requires burn-in".into(),
         ));
     }
+    let video = state
+        .transcode
+        .playlist(&session)
+        .await
+        .ok_or(ApiError::NotFound("transcode session"))?;
     Ok(playlist_response(
-        subtitle_media_playlist(file.duration_ms, context.start_seconds).into_bytes(),
+        subtitle_media_playlist(&video).into_bytes(),
     ))
 }
 
 /// Capability-authenticated VTT data for AVPlayer's autonomous child fetch.
-/// Cues are shifted onto the session-relative video timeline, so a session
-/// opened at a resume/seek offset still presents captions at the right frame.
+/// Each resource mirrors one video segment's time window. Cues are shifted
+/// onto the session-relative video timeline, so a session opened at a
+/// resume/seek offset still presents captions at the right frame.
 pub async fn subtitle_vtt(
     State(state): State<AppState>,
-    AxPath((session, index)): AxPath<(String, i64)>,
+    AxPath((session, index, segment)): AxPath<(String, i64, String)>,
 ) -> Result<Response, ApiError> {
     let (context, file) = session_file(&state, &session).await?;
     let track = file
@@ -393,6 +398,22 @@ pub async fn subtitle_vtt(
             "this subtitle requires burn-in".into(),
         ));
     }
+    let sequence = segment
+        .strip_prefix("seg")
+        .and_then(|value| value.strip_suffix(".vtt"))
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or(ApiError::NotFound("subtitle segment"))?;
+    let video = state
+        .transcode
+        .playlist(&session)
+        .await
+        .ok_or(ApiError::NotFound("transcode session"))?;
+    let timeline = subtitle_timeline(&video);
+    let window = timeline
+        .segments
+        .iter()
+        .find(|window| window.sequence == sequence)
+        .ok_or(ApiError::NotFound("subtitle segment"))?;
     let cached = crate::subtitles::ensure_vtt(&state.subs_dir, &file, index)
         .await
         .map_err(|why| {
@@ -422,7 +443,12 @@ pub async fn subtitle_vtt(
             (header::CONTENT_TYPE, "text/vtt; charset=utf-8"),
             (header::CACHE_CONTROL, "private, max-age=3600"),
         ],
-        shift_webvtt(&bytes, context.start_seconds),
+        slice_webvtt(
+            &bytes,
+            context.start_seconds,
+            window.start_seconds,
+            window.end_seconds,
+        ),
     )
         .into_response())
 }
@@ -558,13 +584,97 @@ fn master_playlist(file: &MediaFile, selected: Option<i64>, primary_codecs: &str
     out
 }
 
-fn subtitle_media_playlist(duration_ms: Option<i64>, start_seconds: f64) -> String {
-    let total = duration_ms.unwrap_or(24 * 60 * 60 * 1000).max(1) as f64 / 1000.0;
-    let remaining = (total - start_seconds.max(0.0)).max(0.001);
-    format!(
-        "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:{}\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXTINF:{remaining:.3},\nsubtitle.vtt\n#EXT-X-ENDLIST\n",
-        remaining.ceil() as u64
-    )
+#[derive(Debug, Clone, PartialEq)]
+struct SubtitleWindow {
+    sequence: u64,
+    start_seconds: f64,
+    end_seconds: f64,
+    duration: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct SubtitleTimeline {
+    target_duration: u64,
+    media_sequence: u64,
+    playlist_type: Option<String>,
+    endlist: bool,
+    segments: Vec<SubtitleWindow>,
+}
+
+fn subtitle_timeline(video_playlist: &[u8]) -> SubtitleTimeline {
+    let text = String::from_utf8_lossy(video_playlist);
+    let mut target_duration = 1;
+    let mut media_sequence = 0;
+    let mut playlist_type = None;
+    let mut pending_duration = None;
+    let mut durations = Vec::new();
+    let mut endlist = false;
+    for line in text.lines().map(str::trim) {
+        if let Some(value) = line.strip_prefix("#EXT-X-TARGETDURATION:") {
+            target_duration = value.parse().unwrap_or(1).max(1);
+        } else if let Some(value) = line.strip_prefix("#EXT-X-MEDIA-SEQUENCE:") {
+            media_sequence = value.parse().unwrap_or(0);
+        } else if let Some(value) = line.strip_prefix("#EXT-X-PLAYLIST-TYPE:") {
+            playlist_type = Some(value.to_owned());
+        } else if let Some(value) = line.strip_prefix("#EXTINF:") {
+            pending_duration = value
+                .split_once(',')
+                .map_or(value, |(duration, _)| duration)
+                .parse::<f64>()
+                .ok();
+        } else if line == "#EXT-X-ENDLIST" {
+            endlist = true;
+        } else if !line.is_empty() && !line.starts_with('#') {
+            if let Some(duration) = pending_duration.take().filter(|value| *value > 0.0) {
+                durations.push(duration);
+            }
+        }
+    }
+
+    let mut start_seconds = 0.0;
+    let segments = durations
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, duration)| {
+            let end_seconds = start_seconds + duration;
+            let window = SubtitleWindow {
+                sequence: media_sequence + ordinal as u64,
+                start_seconds,
+                end_seconds,
+                duration,
+            };
+            start_seconds = end_seconds;
+            window
+        })
+        .collect();
+    SubtitleTimeline {
+        target_duration,
+        media_sequence,
+        playlist_type,
+        endlist,
+        segments,
+    }
+}
+
+fn subtitle_media_playlist(video_playlist: &[u8]) -> String {
+    let timeline = subtitle_timeline(video_playlist);
+    let mut out = format!(
+        "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:{}\n#EXT-X-MEDIA-SEQUENCE:{}\n",
+        timeline.target_duration, timeline.media_sequence
+    );
+    if let Some(kind) = &timeline.playlist_type {
+        out.push_str(&format!("#EXT-X-PLAYLIST-TYPE:{kind}\n"));
+    }
+    for window in &timeline.segments {
+        out.push_str(&format!(
+            "#EXTINF:{:.6},\nseg{:05}.vtt\n",
+            window.duration, window.sequence
+        ));
+    }
+    if timeline.endlist {
+        out.push_str("#EXT-X-ENDLIST\n");
+    }
+    out
 }
 
 fn parse_vtt_timestamp(raw: &str) -> Option<f64> {
@@ -594,7 +704,12 @@ fn format_vtt_timestamp(seconds: f64) -> String {
     format!("{hours:02}:{minutes:02}:{seconds:02}.{millis:03}")
 }
 
-fn shift_webvtt(bytes: &[u8], offset_seconds: f64) -> Vec<u8> {
+fn slice_webvtt(
+    bytes: &[u8],
+    offset_seconds: f64,
+    segment_start: f64,
+    segment_end: f64,
+) -> Vec<u8> {
     let normalized = String::from_utf8_lossy(bytes)
         .replace("\r\n", "\n")
         .replace('\r', "\n");
@@ -615,7 +730,9 @@ fn shift_webvtt(bytes: &[u8], offset_seconds: f64) -> Vec<u8> {
             shifted.push(block.to_owned());
             continue;
         };
-        if end <= offset_seconds {
+        let start = start - offset_seconds;
+        let end = end - offset_seconds;
+        if end <= segment_start || start >= segment_end {
             continue;
         }
         let settings = if settings.is_empty() {
@@ -625,8 +742,8 @@ fn shift_webvtt(bytes: &[u8], offset_seconds: f64) -> Vec<u8> {
         };
         lines[line_index] = format!(
             "{} --> {}{}",
-            format_vtt_timestamp((start - offset_seconds).max(0.0)),
-            format_vtt_timestamp(end - offset_seconds),
+            format_vtt_timestamp(start.max(segment_start)),
+            format_vtt_timestamp(end.min(segment_end)),
             settings
         );
         shifted.push(lines.join("\n"));
@@ -833,17 +950,29 @@ mod tests {
     }
 
     #[test]
-    fn subtitle_playlist_and_vtt_are_shifted_to_a_resume_timeline() {
-        let playlist = subtitle_media_playlist(Some(120_000), 30.0);
-        assert!(playlist.contains("#EXT-X-TARGETDURATION:90"));
-        assert!(playlist.contains("#EXTINF:90.000,"));
-        assert!(playlist.ends_with("subtitle.vtt\n#EXT-X-ENDLIST\n"));
+    fn subtitle_playlist_and_vtt_mirror_video_segments_at_resume_timeline() {
+        let video = b"#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:EVENT\n#EXTINF:4.000000,\nseg00000.m4s\n#EXTINF:6.000000,\nseg00001.m4s\n";
+        let playlist = subtitle_media_playlist(video);
+        assert!(playlist.contains("#EXT-X-TARGETDURATION:6"));
+        assert!(playlist.contains("#EXT-X-PLAYLIST-TYPE:EVENT"));
+        assert!(playlist.contains("#EXTINF:4.000000,\nseg00000.vtt"));
+        assert!(playlist.contains("#EXTINF:6.000000,\nseg00001.vtt"));
+        assert!(!playlist.contains("#EXT-X-ENDLIST"));
 
         let source = b"WEBVTT\n\n00:00:01.000 --> 00:00:02.000\npast\n\ncue-id\n00:00:09.000 --> 00:00:11.000 align:start\ncrossing\n\n00:00:15.250 --> 00:00:16.500\nfuture\n";
-        let shifted = String::from_utf8(shift_webvtt(source, 10.0)).expect("utf8");
-        assert!(shifted.contains("X-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:0"));
-        assert!(!shifted.contains("past"));
-        assert!(shifted.contains("00:00:00.000 --> 00:00:01.000 align:start"));
-        assert!(shifted.contains("00:00:05.250 --> 00:00:06.500"));
+        let first = String::from_utf8(slice_webvtt(source, 10.0, 0.0, 4.0)).expect("utf8");
+        assert!(first.contains("X-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:0"));
+        assert!(!first.contains("past"));
+        assert!(first.contains("00:00:00.000 --> 00:00:01.000 align:start"));
+        assert!(!first.contains("future"));
+
+        let second = String::from_utf8(slice_webvtt(source, 10.0, 4.0, 10.0)).expect("utf8");
+        assert!(!second.contains("crossing"));
+        assert!(second.contains("00:00:05.250 --> 00:00:06.500"));
+
+        let finished = subtitle_media_playlist(
+            b"#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXTINF:4.0,\nseg00000.m4s\n#EXT-X-ENDLIST\n",
+        );
+        assert!(finished.ends_with("seg00000.vtt\n#EXT-X-ENDLIST\n"));
     }
 }
