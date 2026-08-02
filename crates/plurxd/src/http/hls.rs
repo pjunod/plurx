@@ -288,6 +288,7 @@ pub async fn status(
 pub struct PlaylistQuery {
     pub native: Option<u8>,
     pub subtitle: Option<i64>,
+    pub diagnostic: Option<String>,
 }
 
 fn playlist_response(bytes: Vec<u8>) -> Response {
@@ -334,9 +335,19 @@ pub async fn playlist(
     if query.native != Some(1) {
         return video_playlist(State(state), AxPath(session)).await;
     }
-    let (context, file) = session_file(&state, &session).await?;
+    let (context, mut file) = session_file(&state, &session).await?;
+    let mut codecs = context.codecs;
+    match query.diagnostic.as_deref() {
+        Some("no-subs") => file.subtitle_streams.clear(),
+        Some("base-hevc") => {
+            if let Some((_, audio)) = codecs.split_once(',') {
+                codecs = format!("hvc1.2.4.L150.B0,{audio}");
+            }
+        }
+        _ => {}
+    }
     Ok(playlist_response(
-        master_playlist(&file, query.subtitle, &context.codecs).into_bytes(),
+        master_playlist(&file, query.subtitle, &codecs).into_bytes(),
     ))
 }
 
