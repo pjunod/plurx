@@ -504,6 +504,13 @@ final class AppleClientTests: XCTestCase {
         XCTAssertNil(PlayerView.nowPlayingInfoCueLabel(showingInfo: true))
     }
 
+    #if os(tvOS)
+    func testTVBackAlwaysStopsPlaybackInsteadOfOnlyHidingControls() {
+        XCTAssertEqual(PlayerView.exitAction(controlsVisible: true), .stopPlayback)
+        XCTAssertEqual(PlayerView.exitAction(controlsVisible: false), .stopPlayback)
+    }
+    #endif
+
     func testDetailViewportAndBodyNeverOutgrowTheirAvailableWidth() {
         for availableWidth: CGFloat in [320, 390, 430, 744, 1_366] {
             let controller = UIHostingController(rootView: DetailViewportFrame {

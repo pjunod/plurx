@@ -1,9 +1,14 @@
 import SwiftUI
 
 #if os(tvOS)
+enum PlayerExitAction: Equatable {
+    case stopPlayback
+}
+
 private enum PlayerControl: Hashable {
     case reveal
     case close
+    case stop
     case progress
     case marker
     case skipBack
@@ -64,6 +69,11 @@ struct PlayerView: View {
     var subtitle: String? = nil
     var year: Int? = nil
     var overview: String? = nil
+    /// The detail screen owns the full-screen cover, so it also owns the
+    /// authoritative way to close it. This avoids asking an environment
+    /// DismissAction to choose between the cover and the surrounding
+    /// NavigationStack.
+    var onStop: (() -> Void)? = nil
     var onPlayNext: ((PlayContext) -> Void)?
     /// Hands the owning detail screen the last on-screen position immediately.
     /// The server progress write is intentionally best-effort and asynchronous;
@@ -228,10 +238,9 @@ struct PlayerView: View {
             if controlsVisible { restartAutoHideTimer() }
         }
         .onExitCommand {
-            if controlsVisible {
-                hideControls()
-            } else {
-                dismiss()
+            switch Self.exitAction(controlsVisible: controlsVisible) {
+            case .stopPlayback:
+                exitPlayback()
             }
         }
         #endif
@@ -247,6 +256,23 @@ struct PlayerView: View {
         changingStream: Bool
     ) -> Bool {
         visible && !scrubbing && !changingStream
+    }
+
+    #if os(tvOS)
+    /// Back/Menu is an escape command, regardless of whether the transient
+    /// controls happen to be visible. Hiding chrome first can make the remote
+    /// appear broken while the movie keeps playing.
+    static func exitAction(controlsVisible _: Bool) -> PlayerExitAction {
+        .stopPlayback
+    }
+    #endif
+
+    private func exitPlayback() {
+        if let onStop {
+            onStop()
+        } else {
+            dismiss()
+        }
     }
 
     private func toggleControls() {
@@ -309,7 +335,7 @@ struct PlayerView: View {
                     .foregroundColor(Palette.muted)
                     .multilineTextAlignment(.center)
             }
-            Button("Close") { dismiss() }
+            Button("Close") { exitPlayback() }
                 .buttonStyle(.borderedProminent)
                 .tint(Palette.accent)
                 #if os(tvOS)
@@ -323,7 +349,7 @@ struct PlayerView: View {
 
     #if os(iOS)
     private var closeButton: some View {
-        Button { dismiss() } label: {
+        Button { exitPlayback() } label: {
             Image(systemName: "xmark.circle.fill")
                 .font(.largeTitle)
                 .foregroundStyle(.white.opacity(0.9))
@@ -699,6 +725,9 @@ struct PlayerView: View {
 
     private var transportControlGroup: some View {
         HStack(spacing: 8) {
+            #if os(tvOS)
+            stopButton
+            #endif
             skipBackButton
             playPauseButton
             skipForwardButton
@@ -709,6 +738,19 @@ struct PlayerView: View {
         .background(.black.opacity(0.14), in: RoundedRectangle(cornerRadius: 12))
         #endif
     }
+
+    #if os(tvOS)
+    private var stopButton: some View {
+        Button(action: exitPlayback) {
+            Text("EXIT")
+                .font(.system(size: 11, weight: .bold, design: .monospaced))
+        }
+        .accessibilityLabel("Stop playback and exit")
+        .buttonStyle(TVPlayerControlButtonStyle())
+        .focusEffectDisabled()
+        .focused($focusedControl, equals: .stop)
+    }
+    #endif
 
     private var playbackOptionGroup: some View {
         HStack(spacing: 8) {

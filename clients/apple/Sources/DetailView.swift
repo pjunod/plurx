@@ -333,6 +333,7 @@ struct DetailView: View {
             PlayerView(itemId: ctx.itemId, fileId: ctx.fileId, startMs: ctx.startMs,
                        durationMs: ctx.durationMs, title: ctx.title,
                        subtitle: ctx.subtitle, year: ctx.year, overview: ctx.overview,
+                       onStop: { play = nil },
                        onPlayNext: { play = $0 },
                        onPlaybackStopped: { positionMs in
                            updateVisibleProgress(
