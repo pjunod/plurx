@@ -1,9 +1,10 @@
 # UI layouts — build status and the issues a reviewer should settle
 
-**Status:** G0 · G1 · G2 · T1 built and proven · **Implements:**
-[UI-LAYOUTS-IMPLEMENTATION.md](UI-LAYOUTS-IMPLEMENTATION.md) @ `62f5b5f` ·
-**Branch:** `feat/ui-layouts` @ `4ada24c` (parent `62f5b5f`) ·
-**Written:** 2026-08-02
+**Status:** G0 · G1 · G2 · G2b · T1 built and proven · **Implements:**
+[UI-LAYOUTS-IMPLEMENTATION.md](UI-LAYOUTS-IMPLEMENTATION.md) v4 ·
+**Branch:** `feat/ui-layouts` · **Written:** 2026-08-02; amended same day
+for G2b (library + item detail converted, the four defects fixed, box 4
+applied)
 
 Companion to [UI-LAYOUTS-IMPLEMENTATION.md](UI-LAYOUTS-IMPLEMENTATION.md)
 (the build order) — this is *what actually got built, what it proved, and
@@ -25,8 +26,10 @@ debt and fails loudly if anyone lets it grow.
 |---|---|---|
 | **G0** baseline harness | done | 7 consecutive self-hosted runs byte-identical |
 | **G1** registry + seam | done | all 18 captures byte-identical, pre vs post |
-| **G2** plex pilot | done (home only) | classic still byte-identical with plex present |
+| **G2** plex pilot | done (home) | classic still byte-identical with plex present |
+| **G2b** library + detail | done | classic byte-identical through both conversions |
 | **T1** theme catalogue | done | 7 themes × all surfaces ≥4.5:1; `make web-check` green |
+| **box 4** shipped-theme statuses | applied | allowlist shrank 36 → 13 entries |
 | **S1** list media facts | not started | — |
 | **S2** playback registry | not started | — |
 | **S3** genres + migration | not started | blocked on §3.1 below |
@@ -250,7 +253,7 @@ current failures are enumerated in `scripts/contrast-allow.txt`, which
 build error** with a "delete this line" message, so the file can only
 shrink — an allowlist nobody prunes becomes a list of lies.
 
-### 3.6 Converting the library route needs a different seam shape
+### 3.6 Converting the library route needs a different seam shape — RESOLVED
 
 The plan treats library as the next route after Home. It is materially
 harder, and the difference is not obvious from the outside.
@@ -266,6 +269,12 @@ So the library seam needs a piecewise contract — something closer to
 `{shell(model), items(model), count(model)}` — rather than Home's single
 body builder. That is a real addition to §3.2's contract and it should be
 decided in the plan, not improvised at build time.
+
+**Resolved in plan v4 and built in G2b**, in exactly that shape, with
+per-*region* fallback: plex overrides `shell` only and inherits classic's
+`items` and `count`. Scroll survival was measured, not assumed — a batch
+landing with the page at `scrollY 1500` leaves it at 1500 and `#libbody`
+is the same DOM node.
 
 ### 3.7 The size estimate will not survive four more layouts
 
@@ -320,17 +329,29 @@ The decision record asks for five numbers. Four are already available.
 
 Stated plainly so nobody infers more than was built.
 
-- **plex converts Home only.** `views` exposes `home` and nothing else, so
-  library and item detail render classic's bodies inside plex chrome. §3.2's
-  library tabs, A–Z scrubber behaviour and backdrop-hero detail are **not**
-  in this drop. G2's acceptance list is therefore only partly satisfied.
-- The unwatched corner flag also flags home-video folders — `card()` needs a
-  `kind` class before that can be scoped.
-- The A–Z scroll-spy measures `header.top`, which plex does not have.
-- TV surface still shows Settings to admins; the proposal says no admin
-  surfaces on a television.
-- `PLEX_NAV` (the sidebar's library list) goes stale until the next Home
-  render after `invalidateLibs()`.
+- ~~plex converts Home only~~ — **fixed in G2b:** library (region seam) and
+  item detail (whole-body) are converted, with tabs, the right-edge A–Z
+  scrubber, and the backdrop hero. Collections, Categories and List ship
+  visibly disabled with a tooltip saying which milestone unblocks each.
+- ~~unwatched flag also flags folders~~ — **fixed:** `card()`/`homeCard()`
+  now emit `k-<kind>` and `unw` classes, so plex asks about watch state
+  instead of inferring it from absent children. The `:has()` rule and its
+  `@supports` caveat are gone.
+- ~~A–Z scroll-spy measures `header.top`~~ — **fixed:** `stickyFloor()` asks
+  the layout; classic keeps the old computation exactly.
+- ~~TV shows Settings to admins~~ — **fixed** in plex chrome.
+- ~~`PLEX_NAV` goes stale~~ — **fixed**, and one worse case found while
+  fixing it: chrome paints before a route fetches, so an item deep-link
+  opened in a fresh tab drew an empty sidebar and never heard the answer
+  arrive. `libsCached()` now fires the same `libsChanged` hook when it
+  FILLS, not only when `invalidateLibs()` clears.
+- **Still open (found in G2b):** the A–Z rail is invisible until the user
+  picks "Title (A–Z)" — `alphaRailHtml` gates on a global that starts empty;
+  shipped behaviour, but plex surfaces it most. `.filemissing` is a
+  hardcoded dark hex box on every light theme — shipped, pre-dating this
+  work, and the one remaining instance of the 2026-07-22 scar. Layout
+  switching resets library scroll to 0 (identical in classic; it is loader
+  re-entry, not the seam).
 - **Chromium only.** No Firefox, no Safari, no real TV, no screen-reader
   pass. Keyboard, reduced-motion and forced-colors were exercised in
   headless Chromium and nowhere else.
