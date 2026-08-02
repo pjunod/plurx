@@ -204,6 +204,616 @@ final class AppleClientTests: XCTestCase {
     }
 
     @MainActor
+    func testAutomaticSubtitlesNeverStartABurnForABitmapOnlyLanguageMatch() {
+        // A Blu-ray remux whose only English subtitle is a non-forced PGS.
+        // Selecting it automatically would spawn a video encoder on every
+        // single play — the exact bug this project exists to kill.
+        let tracks = [
+            SubtitleTrack(
+                index: 0, codec: "hdmv_pgs_subtitle", language: "eng", title: "English",
+                default: true, forced: false, text: false
+            ),
+            SubtitleTrack(
+                index: 1, codec: "dvd_subtitle", language: "eng", title: "Commentary",
+                default: false, forced: false, text: false
+            ),
+            SubtitleTrack(
+                index: 2, codec: "subrip", language: "ita", title: "Italiano",
+                default: false, forced: false, text: true
+            ),
+        ]
+
+        XCTAssertNil(PlayerController.automaticSubtitleIndex(tracks, preferredLanguage: "eng"))
+        XCTAssertEqual(PlayerController.automaticSubtitleIndex(tracks, preferredLanguage: "ita"), 2)
+    }
+
+    @MainActor
+    func testAutomaticSubtitlesNeverStartABurnForAStyledAssOnlyLanguageMatch() {
+        // An anime MKV whose only English tracks are ASS: styled subtitles
+        // stay burns, so automatic selection must decline them too.
+        let tracks = [
+            SubtitleTrack(
+                index: 0, codec: "ass", language: "eng", title: "Full Subtitles",
+                default: true, forced: false, text: true
+            ),
+            SubtitleTrack(
+                index: 1, codec: "ssa", language: "eng", title: "Signs & Songs",
+                default: false, forced: false, text: true
+            ),
+        ]
+
+        XCTAssertNil(PlayerController.automaticSubtitleIndex(tracks, preferredLanguage: "eng"))
+        XCTAssertTrue(PlayerController.subtitleRequiresBurn(0, in: tracks))
+    }
+
+    @MainActor
+    func testAutomaticSubtitlesStillTakeAForcedBitmapTrackAtSourceHeight() {
+        // Owner policy: automatic selection may never start a burn *except*
+        // for a forced track, which burns at the source height so the picture
+        // is not downgraded along with it.
+        let tracks = [
+            SubtitleTrack(
+                index: 0, codec: "hdmv_pgs_subtitle", language: "eng", title: "Forced",
+                default: false, forced: true, text: false
+            ),
+            SubtitleTrack(
+                index: 1, codec: "hdmv_pgs_subtitle", language: "eng", title: "English",
+                default: true, forced: false, text: false
+            ),
+        ]
+
+        XCTAssertEqual(PlayerController.automaticSubtitleIndex(tracks, preferredLanguage: "eng"), 0)
+        XCTAssertTrue(PlayerController.subtitleRequiresBurn(0, in: tracks))
+        XCTAssertEqual(
+            PlayerController.burnSessionHeight(
+                burnSubtitle: 0, mode: "remux", selectedHeight: nil, sourceHeight: 2_160
+            ),
+            2_160,
+            "an automatic forced burn keeps the source resolution"
+        )
+        XCTAssertEqual(
+            PlayerController.burnSessionHeight(
+                burnSubtitle: 0, mode: "remux", selectedHeight: 720, sourceHeight: 2_160
+            ),
+            720,
+            "an explicit viewer rung still wins"
+        )
+        XCTAssertNil(PlayerController.burnSessionHeight(
+            burnSubtitle: 0, mode: "transcode", selectedHeight: nil, sourceHeight: 2_160
+        ))
+        XCTAssertNil(PlayerController.burnSessionHeight(
+            burnSubtitle: nil, mode: "remux", selectedHeight: nil, sourceHeight: 2_160
+        ))
+    }
+
+    @MainActor
+    func testAutomaticSubtitlesKeepUntaggedTracksEligibleLikeTheServerPolicy() {
+        // The server's shared policy keeps untagged tracks eligible because a
+        // missing tag is not contrary information (plurx-core tracks.rs).
+        let tracks = [
+            SubtitleTrack(
+                index: 0, codec: "subrip", language: "ita", title: "Italiano",
+                default: true, forced: false, text: true
+            ),
+            SubtitleTrack(
+                index: 1, codec: "subrip", language: nil, title: "Forced",
+                default: false, forced: false, text: true
+            ),
+        ]
+
+        XCTAssertEqual(PlayerController.automaticSubtitleIndex(tracks, preferredLanguage: "eng"), 1)
+
+        var bitmapUntagged = tracks
+        bitmapUntagged[1] = SubtitleTrack(
+            index: 1, codec: "hdmv_pgs_subtitle", language: nil, title: "Forced",
+            default: false, forced: true, text: false
+        )
+        XCTAssertNil(
+            PlayerController.automaticSubtitleIndex(bitmapUntagged, preferredLanguage: "eng"),
+            "an untagged burn-format track is not worth a burn"
+        )
+    }
+
+    @MainActor
+    func testNativeSubtitleOptionsMatchTheServerRenditionNameNotTheOrdinal() {
+        let tracks = [
+            SubtitleTrack(
+                index: 0, codec: "hdmv_pgs_subtitle", language: "eng", title: "PGS",
+                default: false, forced: false, text: false
+            ),
+            SubtitleTrack(
+                index: 1, codec: "subrip", language: "eng", title: "Forced",
+                default: false, forced: false, text: true
+            ),
+            SubtitleTrack(
+                index: 2, codec: "subrip", language: "eng", title: "SDH",
+                default: false, forced: false, text: true
+            ),
+        ]
+        // AVFoundation put a synthesized closed-caption-shaped entry ahead of
+        // the authored renditions, so every ordinal is off by one.
+        let options = [
+            SubtitleRenditionOption(languageTag: "en", displayName: "English CC"),
+            SubtitleRenditionOption(languageTag: "en", displayName: "English · Forced"),
+            SubtitleRenditionOption(languageTag: "en", displayName: "English · SDH"),
+        ]
+
+        XCTAssertEqual(PlayerController.nativeSubtitleOrdinal(1, in: tracks), 0)
+        XCTAssertEqual(
+            PlayerController.nativeSubtitleOptionIndex(ordinal: 0, tracks: tracks, options: options),
+            1,
+            "the ordinal would have selected the phantom caption option"
+        )
+        XCTAssertEqual(
+            PlayerController.nativeSubtitleOptionIndex(ordinal: 1, tracks: tracks, options: options),
+            2
+        )
+        XCTAssertNil(
+            PlayerController.nativeSubtitleOptionIndex(ordinal: 2, tracks: tracks, options: options)
+        )
+    }
+
+    @MainActor
+    func testSubtitleRenditionNamesReplicateTheServerRule() {
+        func track(_ language: String?, _ title: String?) -> SubtitleTrack {
+            SubtitleTrack(
+                index: 0, codec: "subrip", language: language, title: title,
+                default: false, forced: false, text: true
+            )
+        }
+
+        XCTAssertEqual(
+            PlayerController.subtitleRenditionName(track("eng", "Forced"), position: 2),
+            "English · Forced"
+        )
+        XCTAssertEqual(
+            PlayerController.subtitleRenditionName(track("ita", nil), position: 1),
+            "Italian"
+        )
+        XCTAssertEqual(
+            PlayerController.subtitleRenditionName(track(nil, "Commentary"), position: 0),
+            "Commentary"
+        )
+        XCTAssertEqual(
+            PlayerController.subtitleRenditionName(track(nil, "  "), position: 3),
+            "Subtitle 4"
+        )
+        XCTAssertEqual(
+            PlayerController.subtitleRenditionName(track("swe", nil), position: 0),
+            "Swedish"
+        )
+        XCTAssertEqual(
+            PlayerController.subtitleRenditionName(track("xyz", nil), position: 0),
+            "xyz",
+            "an unmapped tag passes through exactly as the server passes it"
+        )
+        XCTAssertEqual(PlayerController.subtitleLanguageTag("fra"), "fr")
+        XCTAssertEqual(PlayerController.subtitleLanguageTag(nil), "und")
+    }
+
+    @MainActor
+    func testSubtitleLanguageReplicasCoverTheWholeSharedAliasTable() {
+        // The ten-language copy this replaced passed "dut"/"cze"/"gre"/"rum"
+        // through untranslated, so name matching did nothing at all for them —
+        // the population most exposed to a shifted ordinal.
+        XCTAssertEqual(PlayerController.subtitleLanguageTag("dut"), "nl")
+        XCTAssertEqual(PlayerController.subtitleLanguageTag("nld"), "nl")
+        XCTAssertEqual(PlayerController.subtitleLanguageTag("cze"), "cs")
+        XCTAssertEqual(PlayerController.subtitleLanguageTag("gre"), "el")
+        XCTAssertEqual(PlayerController.subtitleLanguageTag("rum"), "ro")
+        // Taken by length, not position: the Japanese group ends in "jp",
+        // which is a country code and not a language subtag.
+        XCTAssertEqual(PlayerController.subtitleLanguageTag("jpn"), "ja")
+        XCTAssertEqual(PlayerController.subtitleLanguageTag("jp"), "ja")
+        XCTAssertEqual(PlayerController.subtitleLanguageTag("EN"), "en")
+        XCTAssertEqual(PlayerController.subtitleLanguageTag("xyz"), "xyz")
+        XCTAssertEqual(PlayerController.subtitleLanguageTag("  "), "und")
+
+        XCTAssertEqual(PlayerController.subtitleLanguageName("dut"), "Dutch")
+        XCTAssertEqual(PlayerController.subtitleLanguageName("cze"), "Czech")
+        XCTAssertEqual(PlayerController.subtitleLanguageName("ell"), "Greek")
+        XCTAssertEqual(PlayerController.subtitleLanguageName("ron"), "Romanian")
+        XCTAssertEqual(PlayerController.subtitleLanguageName("nob"), "Norwegian")
+
+        // The alias table also decides viewer-language matching, so a Dutch
+        // preference has to reach a "dut"-tagged track.
+        let dutch = [
+            SubtitleTrack(
+                index: 0, codec: "subrip", language: "dut", title: nil,
+                default: false, forced: false, text: true
+            ),
+        ]
+        XCTAssertEqual(
+            PlayerController.automaticSubtitleIndex(dutch, preferredLanguage: "nl"),
+            0
+        )
+        XCTAssertEqual(PlayerController.languageSpellings("dut"), ["nl", "nld", "dut"])
+        XCTAssertEqual(PlayerController.languageSpellings("eng"), ["en", "eng"])
+        XCTAssertEqual(PlayerController.languageSpellings("xyz"), ["xyz"])
+    }
+
+    @MainActor
+    func testRenditionNamesAreDeduplicatedTheWayTheMasterDeduplicatesThem() {
+        // Two untitled English SRT tracks: RFC 8216 makes NAME unique, so the
+        // server emits "English" and "English (2)". A replica that computes
+        // only the base name resolves the second track onto the first — worse
+        // than the ordinal guess the name matching replaced.
+        let tracks = [
+            SubtitleTrack(
+                index: 0, codec: "subrip", language: "eng", title: nil,
+                default: false, forced: false, text: true
+            ),
+            SubtitleTrack(
+                index: 1, codec: "subrip", language: "eng", title: nil,
+                default: false, forced: false, text: true
+            ),
+        ]
+
+        XCTAssertEqual(
+            PlayerController.subtitleRenditionNames(tracks),
+            ["English", "English (2)"]
+        )
+
+        // A phantom closed-caption option shifts the ordinals as well, so
+        // neither positional nor base-name matching can rescue this.
+        let options = [
+            SubtitleRenditionOption(languageTag: "en", displayName: "English CC"),
+            SubtitleRenditionOption(languageTag: "en", displayName: "English"),
+            SubtitleRenditionOption(languageTag: "en", displayName: "English (2)"),
+        ]
+        XCTAssertEqual(
+            PlayerController.nativeSubtitleOptionIndex(ordinal: 0, tracks: tracks, options: options),
+            1
+        )
+        XCTAssertEqual(
+            PlayerController.nativeSubtitleOptionIndex(ordinal: 1, tracks: tracks, options: options),
+            2,
+            "the second English track must not resolve onto the first"
+        )
+
+        // Bitmap tracks are not advertised, so they take no name and shift no
+        // ordinal; positions still come from the whole subtitle list.
+        let mixed = [
+            SubtitleTrack(
+                index: 0, codec: "hdmv_pgs_subtitle", language: "eng", title: nil,
+                default: false, forced: false, text: false
+            ),
+            SubtitleTrack(
+                index: 1, codec: "subrip", language: nil, title: nil,
+                default: false, forced: false, text: true
+            ),
+        ]
+        XCTAssertEqual(PlayerController.subtitleRenditionNames(mixed), ["Subtitle 2"])
+        XCTAssertEqual(
+            PlayerController.quotedAttributeValue("He said \"go\"\nnow"),
+            "He said 'go' now"
+        )
+    }
+
+    @MainActor
+    func testForcedTitlesMatchOnWordBoundariesAndHonorNegation() {
+        // The forced arm is the only path by which automatic selection may
+        // start a burn, so an over-eager title test burns ordinary tracks.
+        XCTAssertTrue(PlayerController.titleMarksForced("Forced"))
+        XCTAssertTrue(PlayerController.titleMarksForced("English Forced"))
+        XCTAssertTrue(PlayerController.titleMarksForced("forced (signs)"))
+        XCTAssertFalse(PlayerController.titleMarksForced("Non-Forced"))
+        XCTAssertFalse(PlayerController.titleMarksForced("non forced"))
+        XCTAssertFalse(PlayerController.titleMarksForced("Not Forced"))
+        XCTAssertFalse(PlayerController.titleMarksForced("Unforced"))
+        XCTAssertFalse(PlayerController.titleMarksForced("Reinforced"))
+        XCTAssertFalse(PlayerController.titleMarksForced("Full"))
+
+        let tracks = [
+            SubtitleTrack(
+                index: 0, codec: "hdmv_pgs_subtitle", language: "eng", title: "Non-Forced",
+                default: false, forced: false, text: false
+            ),
+        ]
+        XCTAssertFalse(PlayerController.isForcedSubtitle(tracks[0]))
+        XCTAssertNil(
+            PlayerController.automaticSubtitleIndex(tracks, preferredLanguage: "eng"),
+            "a \"Non-Forced\" PGS track must not auto-burn on every play"
+        )
+
+        var flagged = tracks[0]
+        flagged.forced = true
+        XCTAssertTrue(
+            PlayerController.isForcedSubtitle(flagged),
+            "the container disposition still stands on its own"
+        )
+    }
+
+    @MainActor
+    func testAutomaticSubtitlesHonorTheServersAutoSubtitleMode() {
+        // The server's default mode is Auto: audio already speaking the
+        // preferred subtitle language leaves only the floor eligible
+        // (crates/plurx-core/src/tracks.rs `select_tracks`).
+        let full = [
+            SubtitleTrack(
+                index: 0, codec: "subrip", language: "eng", title: "Regular",
+                default: false, forced: false, text: true
+            ),
+        ]
+        XCTAssertNil(
+            PlayerController.automaticSubtitleIndex(
+                full, preferredLanguage: "eng", audioLanguage: "eng"
+            ),
+            "English audio does not need a full English subtitle track"
+        )
+        XCTAssertEqual(
+            PlayerController.automaticSubtitleIndex(
+                full, preferredLanguage: "eng", audioLanguage: "jpn"
+            ),
+            0,
+            "foreign audio still gets full subtitles"
+        )
+
+        // The floor survives the mode: a forced overlay, or the pick the
+        // server itself flagged, is offered under matching audio too.
+        let floorTracks = [
+            SubtitleTrack(
+                index: 0, codec: "subrip", language: "eng", title: "Forced",
+                default: false, forced: false, text: true
+            ),
+            SubtitleTrack(
+                index: 1, codec: "subrip", language: "eng", title: "Regular",
+                default: false, forced: false, text: true
+            ),
+        ]
+        XCTAssertEqual(
+            PlayerController.automaticSubtitleIndex(
+                floorTracks, preferredLanguage: "eng", audioLanguage: "eng"
+            ),
+            0
+        )
+        var serverPicked = floorTracks
+        serverPicked[0] = SubtitleTrack(
+            index: 0, codec: "subrip", language: "eng", title: "SDH",
+            default: true, forced: false, text: true
+        )
+        XCTAssertEqual(
+            PlayerController.automaticSubtitleIndex(
+                serverPicked, preferredLanguage: "eng", audioLanguage: "eng"
+            ),
+            0,
+            "`default` on a decision track is the server's own pick"
+        )
+    }
+
+    @MainActor
+    func testCompatibilityFallbackKeepsPositionPauseAndTheNativeSelection() {
+        // The failed item's clock reads 0, so the retry resumes from the last
+        // position the periodic observer saw, not from the dead item.
+        XCTAssertEqual(
+            PlayerController.compatibilityRetryPositionMs(lastObservedMs: 777_000),
+            777_000
+        )
+        XCTAssertEqual(PlayerController.compatibilityRetryPositionMs(lastObservedMs: -1), 0)
+
+        // A failed item has already dropped the rate to 0, so only the
+        // viewer's own intent may decide whether the retry plays.
+        XCTAssertTrue(PlayerController.reopenResumesPlayback(
+            wantsPlayback: true, hasCurrentItem: true
+        ))
+        XCTAssertFalse(
+            PlayerController.reopenResumesPlayback(wantsPlayback: false, hasCurrentItem: true),
+            "a paused viewer stays paused across the retry"
+        )
+        XCTAssertTrue(
+            PlayerController.reopenResumesPlayback(wantsPlayback: false, hasCurrentItem: false),
+            "the first attach has nothing to preserve and always starts"
+        )
+
+        let tracks = [
+            SubtitleTrack(
+                index: 0, codec: "subrip", language: "eng", title: "Regular",
+                default: false, forced: false, text: true
+            ),
+            SubtitleTrack(
+                index: 1, codec: "hdmv_pgs_subtitle", language: "eng", title: "PGS",
+                default: false, forced: false, text: false
+            ),
+        ]
+        let native = PlayerController.sessionSubtitleFields(
+            selected: 0, tracks: tracks, legacyBurn: false
+        )
+        XCTAssertEqual(native.native, 0, "the retry re-applies the native selection")
+        XCTAssertNil(native.burn, "and never turns it into a burn")
+
+        let bitmap = PlayerController.sessionSubtitleFields(
+            selected: 1, tracks: tracks, legacyBurn: false
+        )
+        XCTAssertEqual(bitmap.burn, 1)
+        XCTAssertNil(bitmap.native)
+
+        let legacy = PlayerController.sessionSubtitleFields(
+            selected: 0, tracks: tracks, legacyBurn: true
+        )
+        XCTAssertEqual(legacy.burn, 0, "only a legacy server burns a text track")
+        XCTAssertNil(legacy.native)
+
+        let off = PlayerController.sessionSubtitleFields(
+            selected: nil, tracks: tracks, legacyBurn: true
+        )
+        XCTAssertNil(off.burn)
+        XCTAssertNil(off.native)
+    }
+
+    @MainActor
+    func testSelectSubtitleRoutingReopensOnceForABurnAndStaysInPlaceForNative() {
+        let tracks = [
+            SubtitleTrack(
+                index: 0, codec: "subrip", language: "eng", title: "Forced",
+                default: false, forced: true, text: true
+            ),
+            SubtitleTrack(
+                index: 1, codec: "subrip", language: "eng", title: "Regular",
+                default: false, forced: false, text: true
+            ),
+            SubtitleTrack(
+                index: 2, codec: "hdmv_pgs_subtitle", language: "eng", title: "PGS",
+                default: false, forced: false, text: false
+            ),
+        ]
+        func route(_ index: Int?, activeBurn: Int? = nil) -> SubtitleSelectionRoute {
+            PlayerController.subtitleSelectionRoute(
+                for: index, tracks: tracks, activeBurn: activeBurn,
+                isDirectPlayback: false
+            )
+        }
+
+        XCTAssertEqual(route(0), .mediaSelection, "native → native stays in place")
+        XCTAssertEqual(route(1), .mediaSelection)
+        XCTAssertEqual(route(nil), .mediaSelection, "native → Off stays in place")
+        XCTAssertEqual(route(2), .reopen, "entering a burn costs one reopen")
+        XCTAssertEqual(
+            route(1, activeBurn: 2),
+            .reopen,
+            "burn → native costs exactly one reopen, because the burn is in the frames"
+        )
+        XCTAssertEqual(route(nil, activeBurn: 2), .reopen)
+    }
+
+    @MainActor
+    func testSubtitleSelectionChangedDuringOpenIsReconciledAfterwards() {
+        let tracks = [
+            SubtitleTrack(
+                index: 0, codec: "subrip", language: "eng", title: "Forced",
+                default: false, forced: true, text: true
+            ),
+            SubtitleTrack(
+                index: 1, codec: "subrip", language: "eng", title: "Regular",
+                default: false, forced: false, text: true
+            ),
+            SubtitleTrack(
+                index: 2, codec: "hdmv_pgs_subtitle", language: "eng", title: "PGS",
+                default: false, forced: false, text: false
+            ),
+        ]
+        func reconcile(
+            applied: Int?,
+            current: Int?,
+            activeBurn: Int? = nil,
+            direct: Bool = false
+        ) -> SubtitleSelectionRoute? {
+            PlayerController.subtitleReconciliation(
+                applied: applied,
+                current: current,
+                tracks: tracks,
+                activeBurn: activeBurn,
+                isDirectPlayback: direct
+            )
+        }
+
+        XCTAssertNil(reconcile(applied: 0, current: 0), "the stream already matches the UI")
+        XCTAssertEqual(reconcile(applied: 0, current: 1), .mediaSelection)
+        XCTAssertEqual(reconcile(applied: 1, current: nil), .mediaSelection)
+        XCTAssertEqual(reconcile(applied: nil, current: 2), .reopen)
+        XCTAssertEqual(
+            reconcile(applied: 2, current: nil, activeBurn: 2),
+            .reopen,
+            "leaving a burn always costs one reopen"
+        )
+        XCTAssertEqual(
+            reconcile(applied: nil, current: 1, direct: true),
+            .reopen,
+            "P2-7: the first native selection creates the session"
+        )
+    }
+
+    @MainActor
+    func testDirectPlaySurvivesNativeTextTracksUntilTheFirstSelection() {
+        let tracks = [
+            SubtitleTrack(
+                index: 0, codec: "subrip", language: "eng", title: "Regular",
+                default: false, forced: false, text: true
+            ),
+        ]
+
+        XCTAssertEqual(
+            PlayerController.subtitleSelectionRoute(
+                for: nil, tracks: tracks, activeBurn: nil, isDirectPlayback: true
+            ),
+            .mediaSelection,
+            "Off keeps true direct play"
+        )
+        XCTAssertEqual(
+            PlayerController.subtitleSelectionRoute(
+                for: 0, tracks: tracks, activeBurn: nil, isDirectPlayback: true
+            ),
+            .reopen
+        )
+        XCTAssertEqual(
+            PlayerController.subtitleSelectionRoute(
+                for: 0, tracks: tracks, activeBurn: nil, isDirectPlayback: false
+            ),
+            .mediaSelection
+        )
+
+        // The session that boundary creates carries the native fields, never
+        // a burn — that is what makes the one reopen worth paying.
+        let fields = PlayerController.sessionSubtitleFields(
+            selected: 0, tracks: tracks, legacyBurn: false
+        )
+        XCTAssertEqual(fields.native, 0)
+        XCTAssertNil(fields.burn)
+    }
+
+    @MainActor
+    func testLegacyBurnFallbackIsGatedOnAServerWithoutNativeSubtitles() {
+        // Every combination, because this gate is the guardrail against
+        // sending `subtitle_burn` for a track a current server calls native.
+        XCTAssertTrue(PlayerController.serverIsLegacy(
+            servesNative: false, hasSubtitleOptions: false, isDirect: false
+        ))
+        XCTAssertFalse(
+            PlayerController.serverIsLegacy(
+                servesNative: true, hasSubtitleOptions: false, isDirect: false
+            ),
+            "a server that answered with a native master is never legacy, "
+                + "however the selection failed"
+        )
+        XCTAssertFalse(PlayerController.serverIsLegacy(
+            servesNative: true, hasSubtitleOptions: true, isDirect: false
+        ))
+        XCTAssertFalse(
+            PlayerController.serverIsLegacy(
+                servesNative: false, hasSubtitleOptions: true, isDirect: false
+            ),
+            "renditions exist, so the master is current and the option lookup lost"
+        )
+        XCTAssertFalse(
+            PlayerController.serverIsLegacy(
+                servesNative: false, hasSubtitleOptions: false, isDirect: true
+            ),
+            "direct play has no create response to have judged"
+        )
+        XCTAssertFalse(PlayerController.serverIsLegacy(
+            servesNative: true, hasSubtitleOptions: false, isDirect: true
+        ))
+        XCTAssertFalse(PlayerController.serverIsLegacy(
+            servesNative: false, hasSubtitleOptions: true, isDirect: true
+        ))
+        XCTAssertFalse(PlayerController.serverIsLegacy(
+            servesNative: true, hasSubtitleOptions: true, isDirect: true
+        ))
+
+        XCTAssertTrue(PlayerController.playlistAdvertisesNativeSubtitles(
+            "/api/v1/hls/2f9c/index.m3u8?native=1&subtitle=2"
+        ))
+        XCTAssertTrue(PlayerController.playlistAdvertisesNativeSubtitles(
+            "http://media-box:32400/api/v1/hls/2f9c/index.m3u8?native=1"
+        ))
+        XCTAssertFalse(PlayerController.playlistAdvertisesNativeSubtitles(
+            "/api/v1/hls/2f9c/index.m3u8"
+        ))
+        XCTAssertFalse(PlayerController.playlistAdvertisesNativeSubtitles(
+            "/api/v1/hls/2f9c/index.m3u8?native=0"
+        ))
+    }
+
+    @MainActor
     func testNativeSubtitleSwitchingUsesAVPlayerMediaSelectionWithoutAStreamReopen() {
         let tracks = [
             SubtitleTrack(
