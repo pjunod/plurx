@@ -625,6 +625,15 @@
   .vbadge.hdr{color:#12b3a6;border-color:color-mix(in srgb,#12b3a6 48%,transparent);background:color-mix(in srgb,#12b3a6 14%,transparent)}
   .vbadge.dv{color:#c99a2b;border-color:color-mix(in srgb,#c99a2b 52%,transparent);background:color-mix(in srgb,#c99a2b 15%,transparent)}
   .vbadge.audio{color:#7f8fe0;border-color:color-mix(in srgb,#7f8fe0 46%,transparent);background:color-mix(in srgb,#7f8fe0 14%,transparent)}
+  /* Downgraded: the source grade named on the chip is NOT what is on screen.
+     Keeps the coloured border so it still reads as the same badge, drops the
+     tint, and dims the icon and the source half — the "→ SDR" suffix stays
+     legible because it is the part that is true right now. The suffix rides
+     INSIDE this chip: a second chip would be one more item in a row that
+     already wraps on phones (f07dd96), and the box is unchanged, so no row
+     grows a line. Must follow .hdr/.dv — same specificity, source order wins. */
+  .vbadge.off{background:transparent}
+  .vbadge.off .material-icon,.vbadge.off .vsrc{opacity:.45}
   .actions{display:flex;gap:10px;flex-wrap:wrap;margin:20px 0 6px}
   .btnplay{font-size:15px;padding:11px 22px}
   .overview{color:var(--prose);max-width:72ch;margin:14px 0 0}
@@ -2056,6 +2065,75 @@ function hdrChip(f){
   if(s) return {cls, text:s, full:s};                    // HDR10+ / HDR10 / HLG are already short
   if(f.hdr) return {cls, text:hdrLabel(f.hdr), full:hdrLabel(f.hdr)};
   return null; }
+// ---- dynamic range: source vs delivered vs rendered ------------------------
+// MEDIA-BADGES-PLAN.md §2. The chip above answers "what is this file?"; during
+// playback the viewer is asking "what am I getting?", and those two answers
+// differ constantly — a DV disc remux tone-mapped to an SDR H.264 transcode
+// still showed a full-colour "DV P7".
+//
+// Asked LIVE, not read from PLAY_CAPS: the probe's copy is the boot-time
+// answer the server was given, and a window dragged from an HDR laptop panel
+// to an SDR external monitor changes what is being rendered without changing
+// one thing about the session. A browser too old for matchMedia answers no —
+// which is exactly what the server was told, so the two stay consistent.
+function displayIsHdr(){
+  try{ return !!(window.matchMedia && window.matchMedia("(dynamic-range: high)").matches); }
+  catch(e){ return false; }
+}
+// The coarse grade of a source, in the server's own vocabulary, so source and
+// `delivered_dynamic_range` compare by string equality. hdrChip accepts a file
+// whose `hdr` was never set but whose `hdr_format` names a grade, so this has
+// to read both.
+function sourceDynamicRange(f){
+  const s=f.hdr_format||"";
+  if(f.hdr==='dolby_vision'||/dolby/i.test(s)) return 'dolby_vision';
+  if(f.hdr) return f.hdr;
+  if(/hlg/i.test(s)) return 'hlg';
+  return s?'hdr10':null;                                 // "HDR10+" / "HDR10"
+}
+const RANGE_SHORT={dolby_vision:'DV',hdr10:'HDR10',hlg:'HLG',sdr:'SDR'};
+const RANGE_LONG={dolby_vision:'Dolby Vision',hdr10:'HDR10',hlg:'HLG',sdr:'SDR'};
+// The server's reason string already says *why* ("Dolby Vision metadata
+// removed for this device; compatible HDR base kept") — better than anything
+// this file could invent. Only borrow one that is actually about the picture.
+function dynamicRangeReason(){
+  try{
+    if(typeof PLAYER==='undefined'||!PLAYER||!PLAYER.reasons) return null;
+    return PLAYER.reasons.find(r=>r&&/dolby vision|hdr/i.test(r))||null;
+  }catch(e){ return null; }
+}
+// Pure: (source file, delivered grade from the server, live display answer) →
+// the chip, or null when the source is SDR (no grade to report on).
+//
+//   {cls, text, base, arrow, full, aria, panel, off, source, rendered}
+//
+// `delivered` falsy — no session yet, an old server, or a session the store
+// could not resolve (§3.2) — degrades to exactly today's source-only chip.
+function dynamicRangeBadge(f, delivered, displayHdr){
+  f=f||{};
+  const chip=hdrChip(f); if(!chip) return null;
+  const source=sourceDynamicRange(f);
+  const lit={cls:chip.cls, text:chip.text, base:chip.text, arrow:null, full:chip.full,
+    aria:chip.full||chip.text, panel:RANGE_LONG[source]||chip.text,
+    off:false, source, rendered:null};
+  if(!delivered) return lit;                             // today's chip, exactly
+  // Delivered bits are necessary, not sufficient: HDR10 on an SDR monitor is
+  // delivered HDR and rendered SDR.
+  const displayLoss = delivered!=='sdr' && !displayHdr;
+  const rendered = displayLoss ? 'sdr' : delivered;
+  if(rendered===source) return {...lit, rendered, panel:`${RANGE_LONG[source]} (rendering)`};
+  const note = displayLoss ? "this display is not HDR"
+    : (dynamicRangeReason()
+      || (rendered==='sdr' ? `tone-mapped from ${RANGE_LONG[source]||'the source grade'}`
+        : source==='dolby_vision' ? "Dolby Vision removed for this browser"
+        : `delivered as ${RANGE_LONG[rendered]||rendered}`));
+  const arrow=RANGE_SHORT[rendered]||String(rendered).toUpperCase();
+  const long=RANGE_LONG[rendered]||arrow;
+  return {cls:chip.cls, text:`${chip.text} → ${arrow}`, base:chip.text, arrow,
+    full:`${chip.full} — playing as ${long} (${note})`,
+    aria:`${RANGE_LONG[source]||chip.text}, playing as ${long}`,
+    panel:`${long} — ${note}`, off:true, source, rendered};
+}
 function premiumAudio(f){ const cs=(f.audio_streams||[]).map(a=>(a.codec||'').toLowerCase());
   if(cs.some(c=>c.includes('truehd'))) return 'TrueHD';
   if(cs.some(c=>c.includes('dts'))) return 'DTS';
@@ -2088,7 +2166,14 @@ function playerFactBadges(){
   if(!PLAYER) return '';
   const s=PLAYER.source||{}, b=[];
   const r=resLabel(s.width,s.height); if(r) b.push(`<span class="vbadge res">${mediaIcon('resolution')}${r}</span>`);
-  const h=hdrChip(s); if(h) b.push(`<span class="vbadge ${h.cls}" title="${esc(h.full||h.text)}">${mediaIcon('dynamic')}${esc(h.text)}</span>`);
+  // Source vs delivered vs rendered, not source alone — this row is on screen
+  // during playback, where "what am I getting?" is the question. The detail
+  // page's specBadges() deliberately stays source-only: there is no session to
+  // report on there.
+  const h=dynamicRangeBadge(s, PLAYER.deliveredRange, displayIsHdr());
+  if(h) b.push(`<span class="vbadge ${h.cls}${h.off?' off':''}" title="${esc(h.full||h.text)}" aria-label="${
+    esc(h.aria||h.text)}">${mediaIcon('dynamic')}<span class="vsrc">${esc(h.base)}</span>${
+    h.arrow?`<span class="varrow">→ ${esc(h.arrow)}</span>`:''}</span>`);
   const au=playbackAudioChip(PLAYER.audio&&PLAYER.audio[PLAYER.curAudio]);
   if(au) b.push(`<span class="vbadge audio" title="${esc(au.full)}">${mediaIcon('audio')}${esc(au.text)}</span>`);
   return b.join('');
@@ -2393,7 +2478,7 @@ async function setWatched(id, watched){
 //  direct_play → native <video>, client-side seek/resume
 //  remux       → progressive fMP4 from ffmpeg, server fast-seek for resume
 //  transcode   → HLS via hls.js (ffmpeg tone-maps/re-encodes), offset resume
-let PLAYER={fileId:null,timer:null,offset:0,hls:null,knownDur:0,durMs:0,markers:[],source:null,started:false,idleTimer:null,autoskip:false};
+let PLAYER={fileId:null,timer:null,offset:0,hls:null,knownDur:0,durMs:0,markers:[],source:null,started:false,idleTimer:null,autoskip:false,deliveredRange:null};
 let PLAYER_WIRED=false;
 // Native HLS (`video.src = playlist.m3u8`) is for real Safari ONLY — it's what
 // makes AirPlay work (an MSE stream can't be flung to an Apple TV). The trap:
@@ -2688,6 +2773,12 @@ function attachSession(v, t, info, wantSec){
   t.sessionId=info.session_id||null;
   t.streamId=null;
   t.vod=!!info.vod;
+  // The one site every session passes through — transcode start, startCopyHls,
+  // startTranscodeFallback, the subtitle burn, rung and audio re-opens — so the
+  // badge follows the session and not the decision. Absent (an old server, or a
+  // create whose source lookup came back None) keeps whatever we had: the
+  // decision's value is still the best answer. MEDIA-BADGES-PLAN.md §3.2.
+  if(info.delivered_dynamic_range) t.deliveredRange=info.delivered_dynamic_range;
   t.probeUrl=info.playlist_url;
   const into = t.vod ? Math.max(0, wantSec||0) : 0;
   attachHls(v, info.playlist_url, into);
@@ -2726,7 +2817,10 @@ const PLAY_CAPS=(function(){
   if(can('audio/flac')||mse('audio/mp4; codecs="flac"')) ac.push("flac");
   if(can('audio/mp4; codecs="ac-3"')) ac.push("ac3");    // Safari: "maybe"; most others ""
   if(can('audio/mp4; codecs="ec-3"')) ac.push("eac3");
-  const hdrDisplay=!!(window.matchMedia && window.matchMedia("(dynamic-range: high)").matches);
+  // Asked once here because the SERVER only ever hears the boot-time answer —
+  // it rides in CAPS_Q and there is no way to re-tell it mid-session. The badge
+  // re-asks per render via the same displayIsHdr(); see its comment.
+  const hdrDisplay=displayIsHdr();
   const hdr=hdrDisplay && (vc.includes("hevc")||vc.includes("av1"));
   // Dolby Vision, asked separately from HDR because the two answers differ
   // and the difference is a whole class of failure. A DV disc remux usually
@@ -2743,8 +2837,10 @@ const PLAY_CAPS=(function(){
   const dvProfiles=[];
   if(dvCan("05.06")) dvProfiles.push(5);
   if(dvCan("08.07")) dvProfiles.push(8);
+  // `hdrDisplay` is exposed (it is not part of CAPS_Q) so the badge layer can
+  // see what the server was told, separately from what is true right now.
   return {vcodec:vc.join(","), acodec:ac.join(","), container:"mp4,webm,mov", hdr:hdr?1:0,
-    dv:dvProfiles.length?1:0, dvprofile:dvProfiles.join(",")};
+    dv:dvProfiles.length?1:0, dvprofile:dvProfiles.join(","), hdrDisplay};
 })();
 const CAPS_Q=`vcodec=${PLAY_CAPS.vcodec}&acodec=${PLAY_CAPS.acodec}&container=${PLAY_CAPS.container}&hdr=${PLAY_CAPS.hdr}&dv=${PLAY_CAPS.dv}&dvprofile=${PLAY_CAPS.dvprofile}`;
 
@@ -2905,6 +3001,11 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
     reasons:(decision.reasons||[]), title, meta:meta||null, decodeRescued:false,
     transcodeAudio:!!decision.transcode_audio,
     preserveDolbyVision:!!decision.preserve_dolby_vision, copyHls:false,
+    // What grade the DECISION plans to put on the wire. A session overrides it
+    // the moment one attaches (a burn or a forced rung transcodes something the
+    // decision never promised); direct play has no session, so this stands for
+    // the whole playback. MEDIA-BADGES-PLAN.md §3.2.
+    deliveredRange:decision.delivered_dynamic_range||null,
     playStartedAt:clickedAt, ttffMs:null, stalls:0, sessionId:null, streamId:null, health:null,
     attemptId:null, attemptReason:null, bufferLimits:null,
     waitAt:null, waitRunway:null, stallsByKind:null, burnedSub:null, vod:false, };
@@ -5020,6 +5121,12 @@ function updateStats(){
     , "Source")+
     sec(
     `<div><b>Resolution</b>${tgtRes}</div>`+
+    // The chip says it in three characters and an arrow; this says it in a
+    // sentence, with the server's own reason. Same pure function, same parts —
+    // the two can never drift into disagreeing. Absent for an SDR source:
+    // there is no grade to have an opinion about.
+    (()=>{ const d=dynamicRangeBadge(PLAYER.source||{}, PLAYER.deliveredRange, displayIsHdr());
+      return d?`<div><b>Dynamic range</b><span${d.off?' class="muted"':''}>${esc(d.panel)}</span></div>`:''; })()+
     `<div><b>Dropped</b>${dropped} frames</div>`+
     (fps!=null?(()=>{
       const h=PLAYER.hitches, want=(v.playbackRate||1);
