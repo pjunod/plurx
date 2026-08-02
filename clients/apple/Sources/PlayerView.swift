@@ -1047,7 +1047,7 @@ struct PlayerView: View {
         var parts = [track.title, languageName(track.language), track.codec.uppercased()]
             .compactMap { $0 }
         if track.forced { parts.append("Forced") }
-        if !track.text { parts.append("Burn-in") }
+        if !track.isNativeHLS { parts.append("Burn-in") }
         return parts.joined(separator: " · ")
     }
 
@@ -1135,7 +1135,8 @@ private struct PlaybackStatsView: View {
         }
         if let subtitle = controller.selectedSubtitle,
            let track = controller.subtitles.first(where: { $0.index == subtitle }) {
-            row("Subtitles", (track.title ?? track.language?.uppercased() ?? "Track \(subtitle + 1)") + " · burned in")
+            let delivery = track.isNativeHLS ? "native WebVTT" : "burned in"
+            row("Subtitles", (track.title ?? track.language?.uppercased() ?? "Track \(subtitle + 1)") + " · \(delivery)")
         }
     }
 

@@ -22,7 +22,8 @@ private enum PlaybackPreparationError: LocalizedError {
 /// Drives one AVPlayer and executes the server-owned delivery plan. It also
 /// supplies the controls AVPlayer withholds for a growing EVENT playlist: an
 /// explicit on-demand timeline, reliable play/pause commands, server playback
-/// telemetry, and stream restarts for subtitle/audio/quality changes.
+/// telemetry, and stream restarts for audio, quality, and burn-only subtitle
+/// changes. Ordinary text subtitles switch through AVPlayer media selection.
 @MainActor
 final class PlayerController: ObservableObject {
     let player = AVPlayer()
@@ -59,6 +60,9 @@ final class PlayerController: ObservableObject {
     private var canRetryCurrentItemWithTranscode = false
     private var compatibilityFallbackAttempted = false
     private var forceCompatibilityTranscode = false
+    /// A burn is part of the current video frames. Leaving one requires one
+    /// reopen; native-to-native and native-to-Off never do.
+    private var activeBurnedSubtitle: Int?
     /// Stable for this player instance. Server-side supersession uses it to
     /// replace this player's own stream without touching another device.
     private let playbackId = UUID().uuidString
@@ -75,7 +79,7 @@ final class PlayerController: ObservableObject {
     }
 
     var methodLabel: String {
-        if selectedSubtitle != nil { return "Transcode · subtitle burn-in" }
+        if activeBurnedSubtitle != nil { return "Transcode · subtitle burn-in" }
         if selectedHeight != nil { return "Transcode · \(selectedHeight!)p" }
         let mode = decision?.delivery?.mode ?? Self.legacyMode(decision?.method ?? "")
         switch mode {
@@ -174,7 +178,15 @@ final class PlayerController: ObservableObject {
     func selectSubtitle(_ index: Int?) {
         guard index != selectedSubtitle else { return }
         selectedSubtitle = index
-        Task { await reopen(at: realPositionMs()) }
+        let needsBurn = index.map { Self.subtitleRequiresBurn($0, in: subtitles) } ?? false
+        if needsBurn || activeBurnedSubtitle != nil {
+            Task { await reopen(at: realPositionMs()) }
+        } else {
+            // Selection belongs to AVPlayerItem, not the HLS session. This is
+            // the no-restart path that preserves video copy, HDR, position,
+            // and the viewer's selected quality.
+            Task { await applyNativeSubtitleSelection(index, to: player.currentItem) }
+        }
     }
 
     func selectAudio(_ index: Int) {
@@ -277,14 +289,22 @@ final class PlayerController: ObservableObject {
         }
 
         let normalMode = decision.delivery?.mode ?? Self.legacyMode(decision.method)
-        let forceTranscode = selectedSubtitle != nil || selectedHeight != nil || forceCompatibilityTranscode
+        let burnSubtitle = selectedSubtitle.flatMap { index in
+            Self.subtitleRequiresBurn(index, in: subtitles) ? index : nil
+        }
+        let nativeSubtitle = selectedSubtitle.flatMap { index in
+            Self.nativeSubtitleOrdinal(index, in: subtitles) == nil ? nil : index
+        }
+        let hasNativeSubtitles = subtitles.contains(where: \.isNativeHLS)
+        let forceTranscode = burnSubtitle != nil || selectedHeight != nil || forceCompatibilityTranscode
         let customAudio = audioOverride != nil
         canRetryCurrentItemWithTranscode = normalMode != "transcode" && !forceTranscode && !customAudio
-        let direct = normalMode == "direct" && !forceTranscode && !customAudio
+        let direct = normalMode == "direct" && !forceTranscode && !customAudio && !hasNativeSubtitles
         let url: URL?
         var seekAfterAttach: Int?
 
         if direct {
+            activeBurnedSubtitle = nil
             baseMs = 0
             usesDirectTimeline = true
             isVOD = true
@@ -293,21 +313,24 @@ final class PlayerController: ObservableObject {
             url = Session.shared.mediaURL(decision.delivery?.url ?? decision.playUrl)
             if startMs > 0 { seekAfterAttach = startMs }
         } else {
-            let copy = !forceTranscode && (normalMode == "remux" || customAudio)
+            let copy = !forceTranscode
+                && (normalMode == "direct" || normalMode == "remux" || customAudio)
             let chosenAudio = audioOverride
             let aac = copy ? needsAAC(audioIndex: chosenAudio, decision: decision)
                 : nil
             // A subtitle burn on a file the device could otherwise take keeps
             // source resolution. A genuine transcode still lets server Auto
             // choose its rung unless the viewer selected one explicitly.
-            let burnHeight = selectedSubtitle != nil && normalMode != "transcode"
+            let burnHeight = burnSubtitle != nil && normalMode != "transcode"
                 ? decision.source?.height : nil
             let body = CreateSessionRequest(
                 playbackId: playbackId,
                 height: selectedHeight ?? burnHeight,
                 start: Double(startMs) / 1000.0,
                 audio: chosenAudio,
-                subtitleBurn: selectedSubtitle,
+                subtitleBurn: burnSubtitle,
+                nativeSubtitles: true,
+                subtitle: nativeSubtitle,
                 copy: copy ? true : nil,
                 aac: copy ? aac : nil,
                 preserveDolbyVision: copy ? (decision.preserveDolbyVision ?? false) : nil
@@ -319,6 +342,7 @@ final class PlayerController: ObservableObject {
                 return
             }
             sessionId = hls.sessionId
+            activeBurnedSubtitle = burnSubtitle
             encoder = hls.encoder
             isVOD = hls.vod ?? false
             usesDirectTimeline = isVOD
@@ -351,6 +375,7 @@ final class PlayerController: ObservableObject {
         player.play()
         isPlaying = true
         if let seekAfterAttach { try await seekWhenReady(item, ms: seekAfterAttach) }
+        await applyNativeSubtitleSelection(nativeSubtitle, to: item)
         player.play()
         currentMs = startMs
         failed = false
@@ -505,6 +530,44 @@ final class PlayerController: ObservableObject {
             toleranceBefore: .zero,
             toleranceAfter: .zero
         )
+    }
+
+    /// Position in the HLS master rendition order. The server advertises only
+    /// native tracks and preserves source order, so this remains stable even
+    /// when bitmap and styled tracks are interleaved in the menu.
+    static func nativeSubtitleOrdinal(_ index: Int, in tracks: [SubtitleTrack]) -> Int? {
+        tracks.filter(\.isNativeHLS).firstIndex(where: { $0.index == index })
+    }
+
+    static func subtitleRequiresBurn(_ index: Int, in tracks: [SubtitleTrack]) -> Bool {
+        tracks.first(where: { $0.index == index }).map { !$0.isNativeHLS } ?? true
+    }
+
+    /// Pure media-selection step used by the AVPlayer adapter and XCTest. A
+    /// successful result means the video item stays in place; the closure gets
+    /// nil for Off or the native rendition ordinal for a selected track.
+    @discardableResult
+    static func applyNativeSubtitleSelection(
+        _ index: Int?,
+        tracks: [SubtitleTrack],
+        select: (Int?) -> Void
+    ) -> Bool {
+        guard let index else {
+            select(nil)
+            return true
+        }
+        guard let ordinal = nativeSubtitleOrdinal(index, in: tracks) else { return false }
+        select(ordinal)
+        return true
+    }
+
+    private func applyNativeSubtitleSelection(_ index: Int?, to item: AVPlayerItem?) async {
+        guard let item, player.currentItem === item else { return }
+        guard let group = try? await item.asset.loadMediaSelectionGroup(for: .legible) else { return }
+        _ = Self.applyNativeSubtitleSelection(index, tracks: subtitles) { ordinal in
+            let option = ordinal.flatMap { group.options.indices.contains($0) ? group.options[$0] : nil }
+            item.select(option, in: group)
+        }
     }
 
     private func applyLanguagePrefs(audio: String, sub: String) {

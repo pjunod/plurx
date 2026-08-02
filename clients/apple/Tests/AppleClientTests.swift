@@ -181,6 +181,10 @@ final class AppleClientTests: XCTestCase {
                 index: 3, codec: "subrip", language: "eng", title: "Regular",
                 default: false, forced: false, text: true
             ),
+            SubtitleTrack(
+                index: 4, codec: "subrip", language: "eng", title: "SDH",
+                default: false, forced: false, text: true
+            ),
         ]
 
         XCTAssertEqual(
@@ -197,6 +201,54 @@ final class AppleClientTests: XCTestCase {
         XCTAssertNil(
             PlayerController.automaticSubtitleIndex(tracks, preferredLanguage: "off")
         )
+    }
+
+    @MainActor
+    func testNativeSubtitleSwitchingUsesAVPlayerMediaSelectionWithoutAStreamReopen() {
+        let tracks = [
+            SubtitleTrack(
+                index: 0, codec: "subrip", language: "eng", title: "Forced",
+                default: true, forced: true, text: true
+            ),
+            SubtitleTrack(
+                index: 1, codec: "hdmv_pgs_subtitle", language: "eng", title: "PGS",
+                default: false, forced: false, text: false
+            ),
+            SubtitleTrack(
+                index: 2, codec: "ass", language: "eng", title: "Styled",
+                default: false, forced: false, text: true
+            ),
+            SubtitleTrack(
+                index: 3, codec: "webvtt", language: "eng", title: "Regular",
+                default: false, forced: false, text: true
+            ),
+        ]
+        var selectedOrdinals: [Int?] = []
+
+        XCTAssertTrue(PlayerController.applyNativeSubtitleSelection(
+            3,
+            tracks: tracks,
+            select: { selectedOrdinals.append($0) }
+        ))
+        XCTAssertEqual(selectedOrdinals.count, 1)
+        XCTAssertEqual(selectedOrdinals[0], 1, "bitmap/styled tracks are absent from HLS order")
+
+        XCTAssertTrue(PlayerController.applyNativeSubtitleSelection(
+            nil,
+            tracks: tracks,
+            select: { selectedOrdinals.append($0) }
+        ))
+        XCTAssertEqual(selectedOrdinals.count, 2)
+        XCTAssertNil(selectedOrdinals[1], "Off deselects the AVPlayer option in place")
+
+        XCTAssertFalse(PlayerController.applyNativeSubtitleSelection(
+            1,
+            tracks: tracks,
+            select: { _ in XCTFail("PGS must use the burn/reopen fallback") }
+        ))
+        XCTAssertTrue(PlayerController.subtitleRequiresBurn(1, in: tracks))
+        XCTAssertTrue(PlayerController.subtitleRequiresBurn(2, in: tracks))
+        XCTAssertFalse(PlayerController.subtitleRequiresBurn(3, in: tracks))
     }
 
     func testOriginNormalizationAcceptsHostnamesAndRemovesTrailingSlashes() {
@@ -327,6 +379,28 @@ final class AppleClientTests: XCTestCase {
         XCTAssertNotNil(json["request_id"] as? String)
         XCTAssertNil(json["height"])
         XCTAssertEqual(PlurxAPI.playbackPreparationTimeout, 180)
+    }
+
+    func testNativeSubtitleRequestDoesNotAskForBurnOrQualityChange() throws {
+        let request = CreateSessionRequest(
+            playbackId: "player-native-subs",
+            start: 3_600,
+            subtitleBurn: nil,
+            nativeSubtitles: true,
+            subtitle: 2,
+            copy: true
+        )
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let json = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: encoder.encode(request)) as? [String: Any]
+        )
+
+        XCTAssertEqual(json["native_subtitles"] as? Bool, true)
+        XCTAssertEqual(json["subtitle"] as? Int, 2)
+        XCTAssertNil(json["subtitle_burn"])
+        XCTAssertNil(json["height"], "subtitle selection must preserve Auto quality")
+        XCTAssertEqual(json["copy"] as? Bool, true)
     }
 
     func testAppleCapsDescribeDolbyVisionProfilesWithoutDeprecatedHDRAPI() {

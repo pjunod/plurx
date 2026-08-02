@@ -268,6 +268,12 @@ struct SubtitleTrack: Codable, Identifiable {
     var `default`: Bool
     var forced: Bool
     var text: Bool
+
+    /// Formats the server can expose losslessly enough as an HLS WebVTT
+    /// rendition. Styled ASS/SSA remains a burn even though it contains text.
+    var isNativeHLS: Bool {
+        ["subrip", "srt", "webvtt", "vtt"].contains(codec.lowercased())
+    }
 }
 
 struct QualityRung: Codable, Identifiable {
@@ -355,10 +361,12 @@ struct CreateSessionRequest: Codable {
     var height: Int?
     var start: Double?
     var audio: Int?
-    /// A subtitle stream the server must draw into the video. The Apple
-    /// client uses this for both bitmap and text tracks until AVPlayer can be
-    /// given plurx's external WebVTT sidecar as a selectable media option.
+    /// A bitmap or styled-text subtitle the server must draw into the video.
     var subtitleBurn: Int?
+    /// Ask for an HLS master containing native WebVTT subtitle renditions.
+    var nativeSubtitles: Bool?
+    /// The initial native media-selection option. It does not alter video.
+    var subtitle: Int?
     /// Copy the source video into HLS untouched (the remux plan).
     var copy: Bool?
     /// With `copy`: re-encode the audio the client can't take.
