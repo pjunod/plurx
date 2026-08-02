@@ -335,10 +335,11 @@ pub async fn playlist(
     if query.native != Some(1) {
         return video_playlist(State(state), AxPath(session)).await;
     }
-    let (context, file) = session_file(&state, &session).await?;
+    let (context, mut file) = session_file(&state, &session).await?;
     let (primary_codecs, supplemental_codecs) = match query.diagnostic.as_deref() {
         Some("base-only") => (context.codecs.as_str(), None),
         Some("dv-direct") => ("dvh1.08.06,ec-3", None),
+        Some("no-subs") => ("dvh1.08.06,ec-3", None),
         Some("base-short") => (
             "hvc1.2.4.L150.B0,ec-3",
             context.supplemental_codecs.as_deref(),
@@ -355,6 +356,9 @@ pub async fn playlist(
         diagnostic = query.diagnostic.as_deref().unwrap_or(""),
         "serving native HLS master playlist"
     );
+    if query.diagnostic.as_deref() == Some("no-subs") {
+        file.subtitle_streams.clear();
+    }
     Ok(playlist_response(
         master_playlist(&file, query.subtitle, primary_codecs, supplemental_codecs).into_bytes(),
     ))
