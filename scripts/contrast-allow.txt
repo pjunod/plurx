@@ -40,13 +40,7 @@
 # #2f6fe0 -> #2e6cdb), and the first that should leave this file.
 classic light --accent on --bg
 classic light --accent on --panel2
-classic light --good on --bg
-classic light --good on --panel
-classic light --good on --panel2
 classic light --warn on --panel2
-classic light --bad on --bg
-classic light --bad on --panel
-classic light --bad on --panel2
 
 # terminal / light — faithful Solarized, whose dim statuses ARE the aesthetic;
 # darkening them makes the theme stop being the thing it is imitating. Fixing
@@ -60,26 +54,9 @@ terminal light --prose on --panel2
 terminal light --accent on --bg
 terminal light --accent on --panel
 terminal light --accent on --panel2
-terminal light --good on --bg
-terminal light --good on --panel
-terminal light --good on --panel2
-terminal light --warn on --bg
-terminal light --warn on --panel
-terminal light --warn on --panel2
-terminal light --bad on --bg
-terminal light --bad on --panel
-terminal light --bad on --panel2
 terminal light --btn-ink on --accent
 
 # noirr — the brand theme; matinee (light) and the crimson button ink are
 # kit-exact values from brand/tokens.css, so changing one is a brand decision
 # and the kit file changes in the same commit. Not ours to fix unilaterally.
 noirr dark --btn-ink on --accent
-noirr light --good on --bg
-noirr light --good on --panel
-noirr light --warn on --bg
-noirr light --warn on --panel
-noirr light --warn on --panel2
-noirr light --bad on --bg
-noirr light --bad on --panel
-noirr light --bad on --panel2
