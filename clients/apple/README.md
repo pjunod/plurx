@@ -115,7 +115,10 @@ wait for the choice instead of failing underneath the prompt. If access was
 denied, re-enable plurx under **Settings → Privacy & Security → Local Network**.
 
 Both targets share everything under `Sources/`; `project.yml` is the single place
-that defines them (bundle id `tv.plurx.app`, deployment target 17.0).
+that defines them (bundle id `tv.plurx.app`, deployment target 17.0). The native
+subtitle design, deployment record, and remaining physical Dolby Vision failure
+are documented in
+[`docs/APPLE-NATIVE-SUBTITLES-HANDOFF.md`](../../docs/APPLE-NATIVE-SUBTITLES-HANDOFF.md).
 
 ### Live validation harnesses: the fencing rule
 
@@ -146,13 +149,14 @@ The same rule is recorded as a standing non-goal in
 
 ## Test
 
-The iOS and tvOS schemes run the same unit-test target. It covers origin and
-Bonjour URL normalization, Bonjour resolution completing rather than hanging,
-authenticated media URLs, bearer headers, the origin/token write invariant,
-expired-session classification, HLS request semantics, the automatic-subtitle
-policy and the stream-reopen queue, watch-status filtering for both leaves and
-rollup-bearing containers, poster downsampling, the dynamic-range badge's three
-states and its playback-info wording, and the playback duration passed into
+The iOS and tvOS schemes run the shared XCTest source. Coverage includes origin
+and Bonjour URL normalization, Bonjour resolution completing rather than
+hanging, authenticated media URLs, bearer headers, the origin/token write
+invariant, expired-session classification, HLS request semantics, in-place
+AVPlayer media selection, the automatic-subtitle policy and the stream-reopen
+queue, watch-status filtering for both leaves and rollup-bearing containers,
+poster downsampling, the dynamic-range badge's three states and its
+playback-info wording, and the playback duration and progress passed into
 progress reporting.
 
 ```bash

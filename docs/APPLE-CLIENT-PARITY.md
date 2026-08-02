@@ -5,6 +5,10 @@ The iOS/tvOS app should reach viewer parity without duplicating browser-only
 server administration. This document records the boundary so “parity” means a
 testable set of behaviors rather than a general impression.
 
+The implementation history, deployment evidence, and unresolved copied-Dolby-
+Vision failure are recorded in
+[APPLE-NATIVE-SUBTITLES-HANDOFF.md](APPLE-NATIVE-SUBTITLES-HANDOFF.md).
+
 > Status: the native text-subtitle path is implemented, covered on both Apple
 > simulator targets, and deployed server-side. The physical Apple TV accepts
 > the native WebVTT master and selects the requested rendition; the exact
