@@ -281,11 +281,28 @@ pub fn hevc_copy_bsf_for_client(
     }
 }
 
-/// HEVC sample-entry tag for the copy output. `hvc1` promises ordinary HEVC;
-/// a preserved Dolby Vision stream must remain `dvh1` or AVPlayer never
-/// engages its Dolby Vision pipeline even when the RPU metadata survived.
+/// HEVC sample-entry tag for the copy output.
+///
+/// Dolby Vision Profiles 8.1 and 8.4 are backward-compatible enhancements of
+/// HDR10 and HLG. Apple's HLS/ISOBMFF contract requires those streams to keep
+/// the compatible `hvc1` base sample entry; the Dolby Vision profile is
+/// advertised separately by `SUPPLEMENTAL-CODECS`. Non-compatible Dolby
+/// Vision (such as Profile 5) remains `dvh1` when it is preserved.
 pub fn hevc_copy_tag(hdr: Option<&str>, preserve_dolby_vision: bool) -> &'static str {
-    if hdr == Some("dolby_vision") && preserve_dolby_vision {
+    hevc_copy_tag_for_format(hdr, None, preserve_dolby_vision)
+}
+
+/// Format-aware sample-entry choice for segmented copies, whose source model
+/// includes the richer HDR compatibility label.
+pub fn hevc_copy_tag_for_format(
+    hdr: Option<&str>,
+    hdr_format: Option<&str>,
+    preserve_dolby_vision: bool,
+) -> &'static str {
+    let compatible_base = hdr_format.is_some_and(|format| {
+        format.contains("HDR10-compatible") || format.contains("HLG-compatible")
+    });
+    if hdr == Some("dolby_vision") && preserve_dolby_vision && !compatible_base {
         "dvh1"
     } else {
         "hvc1"
@@ -1051,7 +1068,14 @@ fn copy_input_args(
     // is commonly `hev1`, which renders black. Harmless if already hvc1.
     if matches!(source.video_codec.as_deref(), Some("hevc" | "h265")) {
         args.push("-tag:v".into());
-        args.push(hevc_copy_tag(source.hdr.as_deref(), preserve_dolby_vision).into());
+        args.push(
+            hevc_copy_tag_for_format(
+                source.hdr.as_deref(),
+                source.hdr_format.as_deref(),
+                preserve_dolby_vision,
+            )
+            .into(),
+        );
         // FFmpeg's MOV muxer guards dvcC/dvvC behind `unofficial`. Without
         // this, it keeps the Dolby Vision RPUs and writes a `dvh1` sample
         // entry but silently omits the decoder configuration box. A media
@@ -1716,10 +1740,29 @@ mod tests {
         .join(" ");
         assert!(dv7.contains("-bsf:v dovi_rpu=strip=1,filter_units=remove_types=32-34|62-63"));
 
-        // A profile the client explicitly accepts keeps both its Dolby Vision
-        // sample entry and RPU/EL units. This is the path AVPlayer needs to
-        // engage Dolby Vision rather than silently receiving HDR10.
+        // A backward-compatible profile the client accepts keeps its hvc1
+        // base sample entry and its RPU/EL units. Apple uses the base entry
+        // together with supplemental codec signaling to engage Dolby Vision.
+        let mut compatible_dv = file(Some("dolby_vision"));
+        compatible_dv.hdr_format = Some("Dolby Vision · Profile 8 (HDR10-compatible)".into());
         let preserved = hls_copy_args_with_dolby_vision(
+            &compatible_dv,
+            0.0,
+            None,
+            true,
+            Pacing::unpaced(),
+            DolbyVisionCopyOptions::new(true, true),
+            "/tmp/s",
+        )
+        .join(" ");
+        assert!(preserved.contains("-tag:v hvc1"));
+        assert!(preserved.contains("-strict unofficial"));
+        assert!(preserved.contains("-bsf:v filter_units=remove_types=32-34"));
+        assert!(!preserved.contains("62-63"));
+        assert!(!preserved.contains("dovi_rpu=strip=1"));
+        assert!(!dv7.contains("-strict unofficial"));
+
+        let profile5 = hls_copy_args_with_dolby_vision(
             &file(Some("dolby_vision")),
             0.0,
             None,
@@ -1729,12 +1772,7 @@ mod tests {
             "/tmp/s",
         )
         .join(" ");
-        assert!(preserved.contains("-tag:v dvh1"));
-        assert!(preserved.contains("-strict unofficial"));
-        assert!(preserved.contains("-bsf:v filter_units=remove_types=32-34"));
-        assert!(!preserved.contains("62-63"));
-        assert!(!preserved.contains("dovi_rpu=strip=1"));
-        assert!(!dv7.contains("-strict unofficial"));
+        assert!(profile5.contains("-tag:v dvh1"));
 
         // H.264 copies are untouched: they are not on the stuttering path and
         // avc1 + in-band parameter sets plays everywhere today.
