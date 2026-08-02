@@ -581,7 +581,7 @@ fn master_playlist(file: &MediaFile, selected: Option<i64>, primary_codecs: &str
         ));
     } else {
         out.push_str(&format!(
-            "#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},CODECS=\"{primary_codecs},wvtt\",SUBTITLES=\"subs\"\n"
+            "#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},CODECS=\"{primary_codecs}\",SUBTITLES=\"subs\"\n"
         ));
     }
     out.push_str("video.m3u8\n");
@@ -916,7 +916,7 @@ mod tests {
         let master = master_playlist(&file, Some(2), "dvh1,ec-3");
 
         assert!(master.contains(
-            "#EXT-X-STREAM-INF:BANDWIDTH=40000000,CODECS=\"dvh1,ec-3,wvtt\",SUBTITLES=\"subs\""
+            "#EXT-X-STREAM-INF:BANDWIDTH=40000000,CODECS=\"dvh1,ec-3\",SUBTITLES=\"subs\""
         ));
         assert!(!master.contains("#EXT-X-INDEPENDENT-SEGMENTS"));
         assert!(master.contains("NAME=\"English · Forced\",LANGUAGE=\"en\",DEFAULT=YES,AUTOSELECT=YES,FORCED=YES,URI=\"subs/2/index.m3u8\""));
