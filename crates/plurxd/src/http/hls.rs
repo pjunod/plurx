@@ -335,6 +335,12 @@ pub async fn playlist(
         return video_playlist(State(state), AxPath(session)).await;
     }
     let (context, file) = session_file(&state, &session).await?;
+    tracing::info!(
+        session_id = %session,
+        file_id = file.id,
+        subtitle = query.subtitle,
+        "serving native HLS master playlist"
+    );
     Ok(playlist_response(
         master_playlist(
             &file,
@@ -356,6 +362,11 @@ pub async fn video_playlist(
         .playlist(&session)
         .await
         .ok_or(ApiError::NotFound("transcode session"))?;
+    tracing::info!(
+        session_id = %session,
+        bytes = bytes.len(),
+        "serving HLS video playlist"
+    );
     Ok(playlist_response(bytes))
 }
 
@@ -381,6 +392,12 @@ pub async fn subtitle_playlist(
         .playlist(&session)
         .await
         .ok_or(ApiError::NotFound("transcode session"))?;
+    tracing::info!(
+        session_id = %session,
+        file_id = file.id,
+        index,
+        "serving native HLS subtitle playlist"
+    );
     Ok(playlist_response(
         subtitle_media_playlist(&video).into_bytes(),
     ))
@@ -437,6 +454,7 @@ pub async fn subtitle_vtt(
         session_id = %session,
         file_id = file.id,
         index,
+        sequence,
         codec = %track.codec,
         language = track.language.as_deref().unwrap_or("und"),
         title = track.title.as_deref().unwrap_or(""),
@@ -812,6 +830,12 @@ pub async fn segment(
         .segment(&session, &seg)
         .await
         .ok_or(ApiError::NotFound("segment"))?;
+    tracing::info!(
+        session_id = %session,
+        segment = %seg,
+        bytes = opened.len,
+        "serving HLS video resource"
+    );
     // MPEG-TS segments (transcode) vs fMP4 init/segments (copy-video path).
     let content_type = if seg.ends_with(".ts") {
         "video/mp2t"
