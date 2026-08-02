@@ -138,6 +138,23 @@ pub fn is_bitmap_subtitle(codec: &str) -> bool {
     )
 }
 
+/// True when an embedded subtitle can be converted losslessly enough to a
+/// native HLS WebVTT rendition. ASS/SSA deliberately stay out: their authored
+/// positioning, typefaces, and karaoke effects do not survive WebVTT.
+pub fn is_native_text_subtitle(codec: &str) -> bool {
+    matches!(
+        codec.to_lowercase().as_str(),
+        "subrip" | "srt" | "webvtt" | "vtt"
+    )
+}
+
+/// Formats which still have to be drawn into the video for Apple HLS clients.
+/// That includes bitmap tracks and styled text formats whose presentation
+/// would be materially changed by WebVTT conversion.
+pub fn subtitle_requires_burn(codec: &str) -> bool {
+    !is_native_text_subtitle(codec)
+}
+
 fn default_or_first(audio: &[AudioStream]) -> Option<i64> {
     audio
         .iter()
@@ -361,5 +378,17 @@ mod tests {
         assert!(is_bitmap_subtitle("dvd_subtitle"));
         assert!(!is_bitmap_subtitle("subrip"));
         assert!(!is_bitmap_subtitle("ass"));
+    }
+
+    #[test]
+    fn native_hls_text_and_burn_fallback_are_distinct() {
+        for codec in ["subrip", "srt", "webvtt", "VTT"] {
+            assert!(is_native_text_subtitle(codec), "{codec}");
+            assert!(!subtitle_requires_burn(codec), "{codec}");
+        }
+        for codec in ["ass", "ssa", "hdmv_pgs_subtitle", "dvd_subtitle"] {
+            assert!(!is_native_text_subtitle(codec), "{codec}");
+            assert!(subtitle_requires_burn(codec), "{codec}");
+        }
     }
 }

@@ -755,8 +755,13 @@ pub async fn set_audio_offset(
 pub async fn subtitles_vtt(
     _user: AuthUser,
     State(state): State<AppState>,
-    AxPath((id, index)): AxPath<(i64, i64)>,
+    AxPath((id, subtitle)): AxPath<(i64, String)>,
 ) -> Result<Response, ApiError> {
+    let index = subtitle
+        .strip_suffix(".vtt")
+        .unwrap_or(&subtitle)
+        .parse::<i64>()
+        .map_err(|_| ApiError::NotFound("subtitle track"))?;
     let file = load_file(&state, id).await?;
     let stream = file
         .subtitle_streams

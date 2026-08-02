@@ -1147,6 +1147,15 @@ pub struct SegmentFile {
     pub len: u64,
 }
 
+/// The source timeline behind one capability-authenticated HLS session.
+/// Subtitle child requests resolve this instead of accepting a file id from
+/// the URL, so one session capability can never be used to read another file.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HlsContext {
+    pub file_id: i64,
+    pub start_seconds: f64,
+}
+
 pub struct StartInfo {
     pub session_id: String,
     pub playlist_url: String,
@@ -1733,8 +1742,8 @@ impl TranscodeManager {
     ) -> Tracks {
         // Prefer original (Japanese) audio + subs when the file is dual-audio
         // anime-style (REQ-SUB-2), and honour the server-wide language
-        // preferences otherwise. Burn the chosen text subtitle, since an HLS
-        // transcode delivers a single flat stream.
+        // preferences otherwise. Native WebVTT-capable tracks remain media
+        // renditions; only bitmap/styled fallbacks are drawn into the video.
         let prefer_original = file
             .audio_streams
             .iter()
@@ -1756,6 +1765,11 @@ impl TranscodeManager {
             prefer_original
                 .then_some(selection.subtitle_index)
                 .flatten()
+                .filter(|idx| {
+                    file.subtitle_streams
+                        .get(*idx as usize)
+                        .is_some_and(|s| plurx_core::tracks::subtitle_requires_burn(&s.codec))
+                })
         });
         Tracks {
             audio_index: audio_override.or(selection.audio_index),
@@ -3573,6 +3587,15 @@ impl TranscodeManager {
         let session = self.sessions.lock().await.get(session_id).cloned()?;
         *session.last_access.lock().await = Instant::now();
         Some(session)
+    }
+
+    /// Resolve the source and resume base attached to a live HLS capability.
+    pub async fn hls_context(&self, session_id: &str) -> Option<HlsContext> {
+        let session = self.touch(session_id).await?;
+        Some(HlsContext {
+            file_id: session.file_id,
+            start_seconds: session.start_seconds,
+        })
     }
 
     /// Read the current media playlist for a session.
