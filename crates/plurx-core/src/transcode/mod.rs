@@ -937,6 +937,23 @@ pub fn hls_args(
     args.push("-b:a".into());
     args.push(format!("{}k", opts.audio_bitrate_kbps));
 
+    // Start the MPEG-TS timeline at zero.
+    //
+    // ffmpeg's mpegts muxer defaults to `muxpreload 0.5` + `muxdelay 0.7`, so
+    // the first video PTS in segment 0 lands at ~1.4 s (measured, this exact
+    // argument list, ffmpeg 6.1: 1.480 PTS / 1.400 DTS before, 0.080 / 0.000
+    // after). Nothing in the video path cared — the player seeks by playlist
+    // time — but the native subtitle slicer anchors each WebVTT segment with
+    // `X-TIMESTAMP-MAP=MPEGTS:{segment_start × 90000}`, i.e. it asserts that
+    // segment 0 begins at PTS 0. That assertion was false by 1.4 s, and every
+    // native cue on a transcode session rendered 1.4 s early. Fixing the map
+    // instead would encode a muxer default into the subtitle path; making the
+    // assertion true is the smaller, truer change.
+    args.push("-muxdelay".into());
+    args.push("0".into());
+    args.push("-muxpreload".into());
+    args.push("0".into());
+
     // HLS muxer.
     args.extend(
         [
@@ -978,6 +995,68 @@ pub fn hls_args(
 /// tracks out of sync. Copy sessions therefore use `-noaccurate_seek` so both
 /// tracks retain the same preroll and `-avoid_negative_ts make_zero` can shift
 /// them onto one shared output timeline.
+/// ffprobe arguments that answer the one question a copy session cannot
+/// answer from its own request: **where does its timeline actually begin in
+/// the source?**
+///
+/// A copy session seeks with `-noaccurate_seek` (see below), so the media it
+/// emits starts at the keyframe *preceding* the requested offset, and
+/// `-avoid_negative_ts make_zero` then relabels that keyframe as t=0. The
+/// requested start and the real origin therefore differ by anything from zero
+/// to a full GOP — 1–6 s on a 4K film — and anything computed against the
+/// requested start (subtitle cue shifts, most of all) is wrong by exactly that
+/// much.
+///
+/// `-read_intervals "{start}%+#4"` makes ffprobe perform the same backward
+/// seek the demuxer will, then read four packets: no decoding, no scan, one
+/// seek and a handful of packets even on a 19 GB remux over a NAS.
+pub fn keyframe_probe_args(source_path: &str, start_seconds: f64) -> Vec<String> {
+    vec![
+        "-hide_banner".into(),
+        "-v".into(),
+        "error".into(),
+        "-select_streams".into(),
+        "v:0".into(),
+        "-show_entries".into(),
+        "packet=pts_time,dts_time,flags".into(),
+        "-read_intervals".into(),
+        format!("{start_seconds:.3}%+#4"),
+        "-of".into(),
+        "csv=p=0".into(),
+        source_path.to_owned(),
+    ]
+}
+
+/// The source-timeline origin implied by [`keyframe_probe_args`] output.
+///
+/// Prefers the first keyframe packet's decode timestamp, because that is the
+/// value `-avoid_negative_ts make_zero` subtracts to build the output
+/// timeline; the presentation timestamp is the fallback for a demuxer that
+/// reports no DTS. `None` means the probe said nothing usable, and the caller
+/// should fall back to the requested start — which is today's behaviour, so a
+/// failed probe is no worse than not probing.
+pub fn parse_keyframe_origin(stdout: &str) -> Option<f64> {
+    let rows = stdout.lines().filter_map(|line| {
+        let mut fields = line.trim().split(',');
+        let pts = fields.next()?.trim();
+        let dts = fields.next()?.trim();
+        let flags = fields.next().unwrap_or("").trim();
+        let timestamp = dts
+            .parse::<f64>()
+            .ok()
+            .or_else(|| pts.parse::<f64>().ok())?;
+        Some((timestamp, flags.contains('K')))
+    });
+    let mut first = None;
+    for (timestamp, keyframe) in rows {
+        if keyframe {
+            return Some(timestamp.max(0.0));
+        }
+        first.get_or_insert(timestamp.max(0.0));
+    }
+    first
+}
+
 pub fn copy_input_seek_args(start_seconds: f64) -> Vec<String> {
     if start_seconds <= 0.0 {
         return Vec::new();
@@ -2124,5 +2203,242 @@ mod tests {
         assert!(!joined.contains("-hwaccel qsv")); // software decode
         assert!(!joined.contains("hwdownload"));
         assert!(joined.contains("h264_qsv")); // hardware encode
+    }
+
+    // ---- The tomb for P0-2 and P0-3 ------------------------------------
+    //
+    // Both of those defects lived in the gap between what the argument-shape
+    // tests assert and what the muxers actually emit: the arguments were
+    // exactly as intended, and the bytes that came out did not start where
+    // every consumer of them assumed. Nothing short of producing a session
+    // and measuring it can close that gap, so these tests run ffmpeg.
+
+    fn ffmpeg() -> String {
+        std::env::var("PLURX_FFMPEG").unwrap_or_else(|_| "ffmpeg".into())
+    }
+
+    fn ffprobe() -> String {
+        std::env::var("PLURX_FFPROBE").unwrap_or_else(|_| "ffprobe".into())
+    }
+
+    /// A real clip with a deliberately LONG GOP, because a short-GOP fixture
+    /// hides P0-2: when every second is a keyframe, the requested start and
+    /// the keyframe before it are never far enough apart to notice.
+    fn write_long_gop_clip(path: &std::path::Path, seconds: u32, gop_seconds: u32) {
+        let fps = 25;
+        let status = std::process::Command::new(ffmpeg())
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                &format!("testsrc2=size=192x108:rate={fps}:duration={seconds}"),
+                "-f",
+                "lavfi",
+                "-i",
+                &format!("sine=frequency=440:duration={seconds}"),
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-g",
+                &(fps * gop_seconds).to_string(),
+                "-keyint_min",
+                &(fps * gop_seconds).to_string(),
+                "-sc_threshold",
+                "0",
+                "-c:a",
+                "aac",
+                "-shortest",
+                "-y",
+            ])
+            .arg(path)
+            .status();
+        assert!(
+            status.map(|s| s.success()).unwrap_or(false),
+            "fixture encode failed — this test needs a working ffmpeg"
+        );
+    }
+
+    /// First video packet timestamps of a produced artefact, `(pts, dts)`.
+    fn first_packet_times(path: &std::path::Path) -> (f64, f64) {
+        let out = std::process::Command::new(ffprobe())
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "packet=pts_time,dts_time",
+                "-read_intervals",
+                "%+#1",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(path)
+            .output()
+            .expect("ffprobe the produced segment");
+        let text = String::from_utf8_lossy(&out.stdout);
+        let row = text.lines().next().unwrap_or_default();
+        let mut fields = row.split(',');
+        let pts = fields
+            .next()
+            .unwrap_or("")
+            .trim()
+            .parse()
+            .unwrap_or(f64::NAN);
+        let dts = fields
+            .next()
+            .unwrap_or("")
+            .trim()
+            .parse()
+            .unwrap_or(f64::NAN);
+        (pts, dts)
+    }
+
+    fn run_ffmpeg(args: &[String]) {
+        let out = std::process::Command::new(ffmpeg())
+            .args(args)
+            .output()
+            .expect("run the produced argument list");
+        assert!(
+            out.status.success(),
+            "ffmpeg refused the produced arguments: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// P0-3's tomb. The subtitle slicer anchors segment 0 with
+    /// `X-TIMESTAMP-MAP=MPEGTS:0`, so segment 0 has to actually begin at PTS
+    /// 0. ffmpeg's mpegts defaults (`muxpreload` 0.5 + `muxdelay` 0.7) put it
+    /// at ~1.4 s instead, and every native cue on a transcode session
+    /// rendered that much early. Measured, not asserted from the flag list:
+    /// the flag list was never the thing that was wrong.
+    #[test]
+    fn a_transcode_session_starts_its_mpegts_timeline_at_zero() {
+        let dir = tempfile::tempdir().expect("work dir");
+        let src = dir.path().join("clip.mp4");
+        write_long_gop_clip(&src, 20, 5);
+
+        let mut source = file(None);
+        source.path = src.clone();
+        source.width = Some(192);
+        source.height = Some(108);
+        source.hdr = None;
+        let out_dir = dir.path().join("tx");
+        std::fs::create_dir_all(&out_dir).expect("out dir");
+        let opts = TranscodeOptions {
+            target_height: 108,
+            start_seconds: 12.3,
+            tone_map: ToneMap::None,
+            ..Default::default()
+        };
+        run_ffmpeg(&hls_args(
+            &source,
+            Encoder::Software,
+            &opts,
+            Pacing::unpaced(),
+            &out_dir.to_string_lossy(),
+        ));
+
+        let (pts, dts) = first_packet_times(&out_dir.join("seg00000.ts"));
+        // One frame of slack at 25 fps, and not a millisecond more: the whole
+        // point is that `MPEGTS:0` is a true statement about these bytes.
+        assert!(
+            dts.abs() <= 0.04 && pts.abs() <= 0.08,
+            "segment 0 begins at pts {pts} / dts {dts}, so X-TIMESTAMP-MAP=MPEGTS:0 is a lie \
+             and every native cue renders that much early"
+        );
+    }
+
+    /// P0-2's tomb. A copy session seeks with `-noaccurate_seek`, so the
+    /// media it emits begins at the keyframe BEFORE the requested start, and
+    /// a cue shift computed from the request leads the picture by the
+    /// difference. The probe has to find that keyframe, and the produced
+    /// stream has to agree with it.
+    #[test]
+    fn a_copy_session_begins_at_the_keyframe_before_the_requested_start() {
+        let dir = tempfile::tempdir().expect("work dir");
+        let src = dir.path().join("clip.mp4");
+        // 5 s GOPs, so a start of 12.3 s is 2.3 s past its keyframe.
+        write_long_gop_clip(&src, 30, 5);
+        let requested = 12.3;
+
+        // What the probe says.
+        let probe = std::process::Command::new(ffprobe())
+            .args(keyframe_probe_args(&src.to_string_lossy(), requested))
+            .output()
+            .expect("probe the source");
+        assert!(
+            probe.status.success(),
+            "probe failed: {}",
+            String::from_utf8_lossy(&probe.stderr)
+        );
+        let origin = parse_keyframe_origin(&String::from_utf8_lossy(&probe.stdout))
+            .expect("the probe found a keyframe");
+        assert!(
+            origin < requested - 1.0,
+            "a 5 s-GOP fixture must put the keyframe well before a 12.3 s start, got {origin}"
+        );
+
+        // What the session actually produces. The honest measure is how much
+        // media comes out: a copy that begins at the keyframe emits
+        // `duration - origin` seconds, not `duration - requested`.
+        let mut source = file(None);
+        source.path = src.clone();
+        source.width = Some(192);
+        source.height = Some(108);
+        source.video_codec = Some("h264".into());
+        source.hdr = None;
+        source.audio_streams = vec![crate::domain::AudioStream {
+            index: 0,
+            codec: "aac".into(),
+            channels: Some(1),
+            default: true,
+            ..Default::default()
+        }];
+        let out_dir = dir.path().join("cp");
+        std::fs::create_dir_all(&out_dir).expect("out dir");
+        run_ffmpeg(&hls_copy_args(
+            &source,
+            requested,
+            None,
+            false,
+            Pacing::unpaced(),
+            false,
+            &out_dir.to_string_lossy(),
+        ));
+
+        let playlist =
+            std::fs::read_to_string(out_dir.join("index.m3u8")).expect("copy session playlist");
+        let produced: f64 = playlist
+            .lines()
+            .filter_map(|line| line.strip_prefix("#EXTINF:"))
+            .filter_map(|value| {
+                value
+                    .split_once(',')
+                    .map_or(value, |(duration, _)| duration)
+                    .parse::<f64>()
+                    .ok()
+            })
+            .sum();
+        let from_origin = 30.0 - origin;
+        assert!(
+            (produced - from_origin).abs() < 0.5,
+            "the session produced {produced}s of media; beginning at the probed origin \
+             ({origin}s) predicts {from_origin}s. If it instead matches {}s, the media \
+             begins at the REQUEST and the probe is wrong; if neither, the seek changed.",
+            30.0 - requested
+        );
+        // And the defect restated as the assertion that would have failed
+        // before the fix: shifting cues by the request rather than the origin
+        // moves every one of them this far off the picture.
+        assert!(
+            requested - origin > 1.0,
+            "this fixture must actually exercise the lead, got {}s",
+            requested - origin
+        );
     }
 }

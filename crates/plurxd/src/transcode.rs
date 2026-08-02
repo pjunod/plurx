@@ -908,6 +908,15 @@ struct Session {
     /// Where this session's timeline begins in the source, so a recovered
     /// (idempotent) create reports the same offset the first one did.
     start_seconds: f64,
+    /// Where the session's media *actually* begins in the source, which is
+    /// not always what was asked for. A transcode seeks accurately and starts
+    /// exactly at `start_seconds`; a copy session seeks with
+    /// `-noaccurate_seek` and therefore begins at the keyframe before it, up
+    /// to a full GOP earlier. Anything that maps a source timestamp onto this
+    /// session's timeline has to subtract THIS, not the request — subtitle
+    /// cues did the latter and led the picture by up to six seconds on 4K
+    /// film GOPs.
+    media_origin_seconds: f64,
     /// RFC 6381 sample types present in the primary HLS rendition. A native
     /// subtitle master must advertise these; omitting or abbreviating the
     /// referenced formats makes AVPlayer reject an otherwise playable copy.
@@ -1163,8 +1172,71 @@ pub struct SegmentFile {
 pub struct HlsContext {
     pub file_id: i64,
     pub start_seconds: f64,
+    /// The source timestamp that this session's media calls t=0. See
+    /// `Session::media_origin_seconds` — subtitle cue shifting uses this, and
+    /// using `start_seconds` instead is the P0-2 defect.
+    pub media_origin_seconds: f64,
     pub codecs: String,
     pub supplemental_codecs: Option<String>,
+}
+
+/// How long a media-origin probe may take before the session gives up on it.
+///
+/// This runs on the session-creation path, so it is in front of the viewer.
+/// A seek plus four packets is milliseconds on any healthy source; a source
+/// that cannot answer that quickly is a source whose session is about to have
+/// much larger problems, and the fallback (the requested start) is exactly
+/// what this code used unconditionally before.
+const MEDIA_ORIGIN_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Where a copy session's media actually begins in the source.
+///
+/// See [`plurx_core::transcode::keyframe_probe_args`] for why the requested
+/// start is not the answer. Every failure path returns `start_seconds`, which
+/// is both the old behaviour and the correct answer whenever the requested
+/// offset happens to land on a keyframe.
+async fn probe_media_origin(source_path: &std::path::Path, start_seconds: f64) -> f64 {
+    if start_seconds <= 0.0 {
+        return 0.0;
+    }
+    let args =
+        plurx_core::transcode::keyframe_probe_args(&source_path.to_string_lossy(), start_seconds);
+    let probe = tokio::process::Command::new(crate::ffmpeg::ffprobe_bin())
+        .args(&args)
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    let Ok(Ok(out)) = tokio::time::timeout(MEDIA_ORIGIN_PROBE_TIMEOUT, probe).await else {
+        tracing::warn!(
+            start_seconds,
+            "media-origin probe did not answer; subtitle cues fall back to the requested start"
+        );
+        return start_seconds;
+    };
+    if !out.status.success() {
+        tracing::warn!(
+            start_seconds,
+            "media-origin probe failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        return start_seconds;
+    }
+    let origin =
+        plurx_core::transcode::parse_keyframe_origin(&String::from_utf8_lossy(&out.stdout))
+            // A keyframe *after* the requested start would mean the demuxer
+            // seeked forward, which `-noaccurate_seek` does not do. Treat it as a
+            // probe that misread rather than moving cues the wrong way.
+            .filter(|origin| *origin <= start_seconds + 0.001)
+            .unwrap_or(start_seconds);
+    if (origin - start_seconds).abs() > 0.05 {
+        tracing::info!(
+            start_seconds,
+            origin,
+            lead_seconds = start_seconds - origin,
+            "copy session begins at the preceding keyframe; subtitle cues shift by the origin"
+        );
+    }
+    origin
 }
 
 fn audio_track(
@@ -2095,6 +2167,8 @@ impl TranscodeManager {
             user_name: user_name.to_owned(),
             playback_id: playback_id.to_owned(),
             start_seconds: 0.0,
+            // A cache hit is the whole stream from the beginning.
+            media_origin_seconds: 0.0,
             hls_codecs: "avc1.640034,mp4a.40.2".into(),
             hls_supplemental_codecs: None,
             target_height: opts.target_height,
@@ -3121,6 +3195,9 @@ impl TranscodeManager {
             user_name: user_name.to_owned(),
             playback_id: playback_id.to_owned(),
             start_seconds,
+            // A transcode seeks accurately, so its media begins exactly where
+            // it was asked to: no probe, no discrepancy to resolve.
+            media_origin_seconds: start_seconds,
             hls_codecs: "avc1.640034,mp4a.40.2".into(),
             hls_supplemental_codecs: None,
             target_height,
@@ -3543,6 +3620,11 @@ impl TranscodeManager {
             (child, None)
         };
 
+        // Deliberately after the spawn: ffmpeg is already opening the source
+        // while this runs, so the probe costs the viewer nothing it was not
+        // already waiting for.
+        let media_origin_seconds = probe_media_origin(&file.path, start_seconds).await;
+
         let (hls_codecs, hls_supplemental_codecs) =
             copied_hls_codecs(&file, audio_override, options, probe_json.as_deref());
         let session = Arc::new(Session {
@@ -3556,6 +3638,7 @@ impl TranscodeManager {
             user_name: user_name.to_owned(),
             playback_id: playback_id.to_owned(),
             start_seconds,
+            media_origin_seconds,
             hls_codecs,
             hls_supplemental_codecs,
             target_height: file.height.unwrap_or(0),
@@ -3754,6 +3837,7 @@ impl TranscodeManager {
         Some(HlsContext {
             file_id: session.file_id,
             start_seconds: session.start_seconds,
+            media_origin_seconds: session.media_origin_seconds,
             codecs: session.hls_codecs.clone(),
             supplemental_codecs: session.hls_supplemental_codecs.clone(),
         })
@@ -5048,6 +5132,7 @@ mod tests {
             user_name: "paul".into(),
             playback_id: "pb-test".into(),
             start_seconds: 0.0,
+            media_origin_seconds: 0.0,
             hls_codecs: "avc1.640034,mp4a.40.2".into(),
             hls_supplemental_codecs: None,
             target_height: 720,
@@ -5685,6 +5770,7 @@ mod tests {
             user_name: "paul".into(),
             playback_id: "pb-watchdog".into(),
             start_seconds: 0.0,
+            media_origin_seconds: 0.0,
             hls_codecs: "avc1.640034,mp4a.40.2".into(),
             hls_supplemental_codecs: None,
             target_height: 1080,
