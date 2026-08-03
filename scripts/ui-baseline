@@ -63,6 +63,7 @@ import os
 import shutil
 import signal
 import socket
+from urllib.parse import urlparse
 import sqlite3
 import subprocess
 import sys
@@ -672,6 +673,20 @@ def tab_order(page, stops):
 def capture_route(pw_context, base_url, name, route, width, height, args, out_dir):
     page = pw_context.new_page()
     problems = []
+    # The request log. Four documents cite a "request-log invariant" — converting
+    # a route, or wearing a different layout, must not change which endpoints it
+    # calls or how many times — and until now nothing measured it. A layout that
+    # quietly fetches is the single failure the whole seam exists to prevent, and
+    # it is invisible in a screenshot: the page looks right and costs twice.
+    #
+    # Method + path only, query string dropped: ids and paging offsets are
+    # fixture-dependent and would make the log a second golden nobody can read.
+    # Sorted and counted rather than kept in order, because Promise.all settles
+    # in whatever order the network feels like and an ordering diff would be
+    # noise, not signal.
+    api_calls = []
+    page.on("request", lambda r: api_calls.append(
+        f"{r.method} {urlparse(r.url).path}") if "/api/" in urlparse(r.url).path else None)
     # Console errors and uncaught exceptions are collected for the whole visit,
     # not sampled at the end: an error thrown during boot is exactly the kind
     # this gate exists to catch, and it is long gone by the time we screenshot.
@@ -722,7 +737,10 @@ def capture_route(pw_context, base_url, name, route, width, height, args, out_di
         focus = tab_order(page, args.tab_stops)
         if problems:
             raise Fail(f"{name}: " + "; ".join(problems[:5]))
-        return focus
+        counted = {}
+        for call in api_calls:
+            counted[call] = counted.get(call, 0) + 1
+        return focus, dict(sorted(counted.items()))
     finally:
         page.close()
 
@@ -732,6 +750,7 @@ def run_capture(base_url, token, routes, args, out_dir):
 
     executable = find_browser(args.browser)
     focus_dump = {}
+    request_dump = {}
     failures = []
     with sync_playwright() as pw:
         browser = pw.chromium.launch(
@@ -819,7 +838,7 @@ def run_capture(base_url, token, routes, args, out_dir):
                     )
                     key = f"{name}@{width}x{height}"
                     try:
-                        focus_dump[key] = capture_route(
+                        focus_dump[key], request_dump[key] = capture_route(
                             context, base_url, name, route, width, height, args, out_dir)
                         print(f"OK      {key}", flush=True)
                     except Exception as e:  # noqa: BLE001 — every failure is a gate failure
@@ -829,7 +848,7 @@ def run_capture(base_url, token, routes, args, out_dir):
                         context.close()
         finally:
             browser.close()
-    return focus_dump, failures
+    return focus_dump, request_dump, failures
 
 
 # ---- entry point ----------------------------------------------------------
@@ -995,10 +1014,12 @@ def main(argv):
             routes = discover_routes(base_url, token, args)
 
         print(f"CAPTURE {base_url} -> {out_dir}", flush=True)
-        focus, failures = run_capture(base_url, token, routes, args, out_dir)
+        focus, requests, failures = run_capture(base_url, token, routes, args, out_dir)
 
         # sort_keys + a trailing newline so the file is diffable and stable
         # whatever order the routes were captured in.
+        (out_dir / "requests.json").write_text(
+            json.dumps(requests, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         (out_dir / "focus.json").write_text(
             json.dumps(focus, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
 
