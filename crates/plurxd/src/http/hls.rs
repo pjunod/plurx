@@ -387,9 +387,9 @@ pub async fn playlist(
     if query.native != Some(1) {
         return video_playlist(State(state), AxPath(session)).await;
     }
-    let (_, file) = session_file(&state, &session).await?;
+    let (context, file) = session_file(&state, &session).await?;
     Ok(playlist_response(
-        master_playlist(&file, query.subtitle).into_bytes(),
+        master_playlist(&file, query.subtitle, &context).into_bytes(),
     ))
 }
 
@@ -727,11 +727,20 @@ impl MasterRungs {
     }
 }
 
-fn master_playlist(file: &MediaFile, selected: Option<i64>) -> String {
-    master_playlist_with(file, selected, MasterRungs::active())
+fn master_playlist(
+    file: &MediaFile,
+    selected: Option<i64>,
+    context: &crate::transcode::HlsContext,
+) -> String {
+    master_playlist_with(file, selected, context, MasterRungs::active())
 }
 
-fn master_playlist_with(file: &MediaFile, selected: Option<i64>, rungs: MasterRungs) -> String {
+fn master_playlist_with(
+    file: &MediaFile,
+    selected: Option<i64>,
+    context: &crate::transcode::HlsContext,
+    rungs: MasterRungs,
+) -> String {
     let native: Vec<(usize, &SubtitleStream)> = file
         .subtitle_streams
         .iter()
@@ -795,6 +804,42 @@ fn master_playlist_with(file: &MediaFile, selected: Option<i64>, rungs: MasterRu
     }
     let bandwidth = file.bitrate.unwrap_or(25_000_000).max(128_000);
     out.push_str(&format!("#EXT-X-STREAM-INF:BANDWIDTH={bandwidth}"));
+    // HDR is not self-describing at the HLS selection layer. Apple requires
+    // VIDEO-RANGE so AVPlayer knows that this is a PQ/HLG variant before it
+    // opens the HEVC init segment, and CODECS identifies the exact Main10
+    // profile/level it is being asked to decode. Omitting both made the same
+    // otherwise-valid HDR10 fMP4 fail during asset preparation on tvOS while
+    // the H.264 compatibility retry opened as SDR.
+    //
+    // Keep the attributes off SDR/transcoded variants. `file.hdr` describes
+    // the source, while an H.264 session from that source has already been
+    // tone-mapped; the video codec in the session context distinguishes those
+    // bytes from the copied HEVC HDR bytes.
+    let video_codec = context.codecs.split(',').next().unwrap_or_default();
+    let hevc = ["hvc1", "hev1", "dvh1", "dvhe"]
+        .iter()
+        .any(|prefix| video_codec.starts_with(prefix));
+    let video_range = if hevc {
+        match file.hdr.as_deref() {
+            Some("dolby_vision" | "hdr10" | "hdr10_plus") => Some("PQ"),
+            Some("hlg") => Some("HLG"),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    if let Some(video_range) = video_range {
+        out.push_str(&format!(
+            ",VIDEO-RANGE={video_range},CODECS=\"{}\"",
+            quoted(&context.codecs)
+        ));
+        if let Some(supplemental) = context.supplemental_codecs.as_deref() {
+            out.push_str(&format!(
+                ",SUPPLEMENTAL-CODECS=\"{}\"",
+                quoted(supplemental)
+            ));
+        }
+    }
     // Ladder rung: the variant carries no CLOSED-CAPTIONS attribute, and
     // Apple's authoring rules say a variant with no captions must say so.
     // Absent it, AVFoundation is entitled to synthesise a phantom
@@ -1083,6 +1128,23 @@ mod tests {
         }
     }
 
+    fn hls_context(
+        codecs: &str,
+        supplemental_codecs: Option<&str>,
+    ) -> crate::transcode::HlsContext {
+        crate::transcode::HlsContext {
+            file_id: 5615,
+            start_seconds: 0.0,
+            media_origin_seconds: 0.0,
+            codecs: codecs.into(),
+            supplemental_codecs: supplemental_codecs.map(str::to_owned),
+        }
+    }
+
+    fn sdr_context() -> crate::transcode::HlsContext {
+        hls_context("avc1.640034,mp4a.40.2", None)
+    }
+
     fn sub(
         codec: &str,
         language: &str,
@@ -1184,6 +1246,31 @@ mod tests {
     }
 
     #[test]
+    fn hdr_master_declares_the_range_and_exact_session_codecs() {
+        let file = hls_file(vec![]);
+        let stripped = hls_context("hvc1.2.4.L150.B0,mp4a.40.2", None);
+        let master = master_playlist(&file, None, &stripped);
+        assert!(master.contains(
+            "#EXT-X-STREAM-INF:BANDWIDTH=40000000,VIDEO-RANGE=PQ,\
+             CODECS=\"hvc1.2.4.L150.B0,mp4a.40.2\""
+        ));
+
+        let compatible_dv = hls_context("hvc1.2.4.L150.B0,ec-3", Some("dvh1.08.10/db1p"));
+        let master = master_playlist(&file, None, &compatible_dv);
+        assert!(master.contains("VIDEO-RANGE=PQ"));
+        assert!(master.contains("CODECS=\"hvc1.2.4.L150.B0,ec-3\""));
+        assert!(master.contains("SUPPLEMENTAL-CODECS=\"dvh1.08.10/db1p\""));
+
+        // The source is still marked HDR when a compatibility retry has
+        // already tone-mapped it. The H.264 session context must keep that
+        // master SDR instead of advertising a range the bytes no longer have.
+        let transcoded = hls_context("avc1.640034,mp4a.40.2", None);
+        let master = master_playlist(&file, None, &transcoded);
+        assert!(!master.contains("VIDEO-RANGE="));
+        assert!(!master.contains("CODECS="));
+    }
+
+    #[test]
     fn native_hls_master_advertises_selection_language_names_and_forced_metadata() {
         let file = hls_file(vec![
             sub("subrip", "ita", "Forced", true, true),
@@ -1192,7 +1279,7 @@ mod tests {
             sub("subrip", "eng", "Regular", false, false),
             sub("webvtt", "eng", "SDH", false, false),
         ]);
-        let master = master_playlist(&file, Some(2));
+        let master = master_playlist(&file, Some(2), &sdr_context());
 
         assert!(master.starts_with("#EXTM3U\n#EXT-X-VERSION:7\n"));
         assert!(master.contains("#EXT-X-STREAM-INF:BANDWIDTH=40000000,SUBTITLES=\"subs\""));
@@ -1226,7 +1313,7 @@ mod tests {
             sub("subrip", "eng", "English SDH", false, false),
             sub("subrip", "eng", "Regular", false, false),
         ]);
-        let master = master_playlist(&file, None);
+        let master = master_playlist(&file, None, &sdr_context());
         assert_eq!(
             master.matches(accessibility).count(),
             2,
@@ -1260,11 +1347,11 @@ mod tests {
             sub("subrip", "eng", "Regular", false, false),
             sub("webvtt", "eng", "Alternate", false, false),
         ]);
-        let master = master_playlist(&file, None);
+        let master = master_playlist(&file, None, &sdr_context());
         assert!(!master.contains("CODECS="));
         assert_eq!(master.matches("AUTOSELECT=NO").count(), 2);
 
-        let selected = master_playlist(&file, Some(1));
+        let selected = master_playlist(&file, Some(1), &sdr_context());
         assert!(selected
             .contains("NAME=\"English · Alternate\",LANGUAGE=\"en\",DEFAULT=YES,AUTOSELECT=YES"));
     }
@@ -1283,7 +1370,7 @@ mod tests {
             // must not carry a rendition this path cannot slice.
             sub("mov_text", "eng", "MP4 Timed Text", false, false),
         ]);
-        let master = master_playlist(&file, None);
+        let master = master_playlist(&file, None, &sdr_context());
         assert!(master.contains("subs/0/index.m3u8"));
         for index in 1..=5 {
             assert!(!master.contains(&format!("subs/{index}/index.m3u8")));
@@ -1421,7 +1508,7 @@ mod tests {
                 hearing_impaired: false,
             },
         ]);
-        let master = master_playlist_with(&file, None, MasterRungs::default());
+        let master = master_playlist_with(&file, None, &sdr_context(), MasterRungs::default());
         assert_eq!(master.matches("NAME=\"English\"").count(), 1, "{master}");
         assert!(master.contains("NAME=\"English (2)\""), "{master}");
     }
@@ -1438,7 +1525,7 @@ mod tests {
             false,
             false,
         )]);
-        let master = master_playlist_with(&file, None, MasterRungs::default());
+        let master = master_playlist_with(&file, None, &sdr_context(), MasterRungs::default());
         let line = master
             .lines()
             .find(|line| line.starts_with("#EXT-X-MEDIA:"))
@@ -1469,7 +1556,7 @@ mod tests {
         // Default: the shape that plays on the device today. Two forced
         // tracks share a language, so RFC 8216's uniqueness rule keeps them
         // manually selectable.
-        let shipped = master_playlist_with(&file, None, MasterRungs::default());
+        let shipped = master_playlist_with(&file, None, &sdr_context(), MasterRungs::default());
         assert!(!shipped.contains("CLOSED-CAPTIONS"), "{shipped}");
         assert_eq!(shipped.matches("AUTOSELECT=NO").count(), 2, "{shipped}");
         assert!(!shipped.contains("CODECS="), "{shipped}");
@@ -1478,6 +1565,7 @@ mod tests {
         let captions = master_playlist_with(
             &file,
             None,
+            &sdr_context(),
             MasterRungs {
                 closed_captions_none: true,
                 ..MasterRungs::default()
@@ -1495,6 +1583,7 @@ mod tests {
         let forced = master_playlist_with(
             &file,
             None,
+            &sdr_context(),
             MasterRungs {
                 forced_autoselect: true,
                 ..MasterRungs::default()
