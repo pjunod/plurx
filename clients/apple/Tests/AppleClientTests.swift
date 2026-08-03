@@ -1525,6 +1525,18 @@ final class AppleClientTests: XCTestCase {
         XCTAssertEqual(json["copy"] as? Bool, true)
     }
 
+    func testHDRSessionsUseThePhysicalDeviceCompatibleMediaPlaylist() {
+        XCTAssertFalse(PlayerController.shouldRequestNativeSubtitleMaster(sourceHDR: "hdr10"))
+        XCTAssertFalse(
+            PlayerController.shouldRequestNativeSubtitleMaster(sourceHDR: "dolby_vision")
+        )
+        XCTAssertFalse(PlayerController.shouldRequestNativeSubtitleMaster(sourceHDR: "HLG"))
+
+        XCTAssertTrue(PlayerController.shouldRequestNativeSubtitleMaster(sourceHDR: nil))
+        XCTAssertTrue(PlayerController.shouldRequestNativeSubtitleMaster(sourceHDR: ""))
+        XCTAssertTrue(PlayerController.shouldRequestNativeSubtitleMaster(sourceHDR: "sdr"))
+    }
+
     func testAppleCapsKeepGenericHDRSeparateFromDolbyVision() {
         func dictionary(_ query: [URLQueryItem]) -> [String: String] {
             Dictionary(uniqueKeysWithValues: query.compactMap { item in
