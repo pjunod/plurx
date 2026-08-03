@@ -2121,9 +2121,9 @@ function authShell(title, sub, fields, btn, onsubmit){
 // contents are already gone.
 function renderSetup(){
   authShell("Welcome","Create your admin account to get started.",
-    `<label>Username</label><input id="u" autocomplete="username" required>
-     <label>Password</label><input id="p" type="password" autocomplete="new-password" required placeholder="at least 8 characters">
-     <label>Confirm password</label><input id="p2" type="password" autocomplete="new-password" required placeholder="type it again">`,
+    `<label for="u">Username</label><input id="u" autocomplete="username" required>
+     <label for="p">Password</label><input id="p" type="password" autocomplete="new-password" required placeholder="at least 8 characters">
+     <label for="p2">Confirm password</label><input id="p2" type="password" autocomplete="new-password" required placeholder="type it again">`,
     "Create account", async()=>{
       if(u.value.trim()==="") throw new Error("Pick a username.");
       if(p.value.length<8) throw new Error("Password must be at least 8 characters.");
@@ -2134,8 +2134,8 @@ function renderSetup(){
 }
 function renderLogin(){
   authShell("Sign in","Welcome back.",
-    `<label>Username</label><input id="u" autocomplete="username" required>
-     <label>Password</label><input id="p" type="password" autocomplete="current-password" required>
+    `<label for="u">Username</label><input id="u" autocomplete="username" required>
+     <label for="p">Password</label><input id="p" type="password" autocomplete="current-password" required>
      <details class="connectqr"><summary>Connect an app with a QR code</summary>
        <img src="/connect.svg?origin=${encodeURIComponent(location.origin)}" alt="QR code for ${esc(location.origin)}">
        <p>Scan this from the ${APP_NAME} iPhone, iPad, or Android app to add this server.</p>
@@ -2157,7 +2157,7 @@ function classicChrome(active, inner){
      <nav><a href="#/" class="${active==='home'?'active':''}">Home</a><a href="#/activity" class="${active==='activity'?'active':''}">Activity</a>${admin}</nav>
      <span class="spacer"></span>
      <span class="activity" id="activity" onclick="location.hash='#/activity'"></span>
-     <input class="search" id="q" placeholder="Search…" value="${esc(getQ())}">
+     <input class="search" id="q" placeholder="Search…" aria-label="Search ${APP_NAME}" value="${esc(getQ())}">
      <div class="topctl">
        <div style="position:relative">
          <button class="ghost sm" onclick="toggleThemeMenu(event)" title="Theme"><span class="tsw"></span></button>
@@ -6844,9 +6844,9 @@ function librariesPanel(libs,status,settings){
       <table><thead><tr><th>Name</th><th>Kind</th><th>Paths</th><th>Status</th><th></th></tr></thead>
       <tbody>${rows}</tbody></table>
       <h2 class="section">Add library</h2>
-      <div class="row"><input id="ln" placeholder="Name" style="max-width:180px">
+      <div class="row"><input id="ln" placeholder="Name" aria-label="Library name" style="max-width:180px">
         <select id="lk" style="max-width:170px"><option value="movies">Movies</option><option value="shows">TV Shows</option><option value="anime">Anime</option><option value="home">Home videos &amp; photos</option></select>
-        <input id="lp" placeholder="/path/to/media (comma-separated)"></div>
+        <input id="lp" placeholder="/path/to/media (comma-separated)" aria-label="Media paths"></div>
       <div class="hint">Paths are as the <b>server process</b> sees them — running in Docker, that's the path inside the container (e.g. <code>/media/movies</code>), which must be mounted in your compose file.</div>
       <div class="err" id="lerr"></div>
       <button style="margin-top:12px" onclick="addLib()">Add & scan</button>

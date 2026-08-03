@@ -39,6 +39,9 @@ android {
         buildConfig = true
         compose = true
     }
+    sourceSets {
+        getByName("test").resources.srcDir("../../../tests/contracts")
+    }
 }
 
 dependencies {

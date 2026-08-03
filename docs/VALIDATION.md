@@ -22,6 +22,7 @@ make validate-plan     # explain what the staged change selects; run nothing
 make validate-staged   # validate the staged change before committing
 make validate          # validate every point with the normal local profile
 make validate-full     # include browser, client, and packaging checks
+make validate-nightly  # exhaustive playback, recovery, bounds, and packaging
 ```
 
 Use `make validate-staged` during ordinary work. Use `make validate` when the
@@ -45,18 +46,20 @@ Every point has six pieces:
 | `contract` | The behavior that must remain true |
 | `paths` | Repository globs that can affect the behavior |
 | `checks` | Commands that produce evidence for the contract |
-| `depends_on` | Other contracts that this behavior needs in order to work |
+| `depends_on` | Provider contracts whose changes can cascade into this consumer |
 
-One file may affect several points. A change to the embedded web player, for
-example, selects `web.experience` directly and pulls in its server, playback,
-library, and core dependencies. Shared checks run once, even when six points
-ask for the same Rust gate.
+One file may affect several points. Impact walks **from provider to consumer**:
+a change to the core media model selects the server and every client that
+consumes it. A change confined to the embedded web player selects
+`web.experience`, but does not rerun upstream database and server contracts as
+though the browser supplied them. Shared checks run once even when several
+selected points ask for the same gate.
 
 ```text
  changed paths
       │
       ▼
- direct point matches ──▶ dependency closure
+ direct point matches ──▶ downstream consumer closure
       │                         │
       └────────────┬────────────┘
                    ▼
@@ -75,9 +78,10 @@ adds checks; a bad path mapping cannot quietly make ordinary tests disappear.
 
 | Profile | Intended use | Additional evidence |
 |---|---|---|
-| `commit` | Pre-commit and ordinary local work | Web syntax/contrast on web changes; structural layout when its golden and Playwright exist |
-| `ci` | Linux gate selected from the event diff | Catalog contract · Rust gate · web syntax/contrast · Android unit/lint when affected |
-| `full` | Before a risky merge or release | Browser playback · web layout · Apple simulators · Android unit/lint · container build |
+| `commit` | Pre-commit and ordinary local work | Mandatory Rust/catalog baseline; shared API wire check; web syntax, contrast, golden, and accessibility when affected |
+| `ci` | Pull requests and `main` | Impact-selected Linux contracts plus dedicated Apple and Android simulator jobs |
+| `full` | Before a risky merge or release | Browser playback; both native-client suites; Android device tests when an explicit disposable device is selected; container startup/restart |
+| `nightly` | Scheduled deep regression search | Exhaustive playback and restart matrix; interrupted-production recovery; resource bounds; all runnable full checks |
 
 The `commit` profile permits explicitly optional checks to skip when a laptop
 lacks their tooling. The skip is printed and recorded; it is not reported as a
@@ -86,7 +90,10 @@ on that platform. A platform mismatch remains a skip because Linux cannot run
 XCTest, regardless of strictness.
 
 CI fetches full Git history and selects from the pull-request base or previous
-push. If that commit is absent or invalid, it runs every point. This makes the
+push. If that commit is absent or invalid, it runs every point. Dedicated
+macOS and Android-emulator jobs run the native suites because a Linux platform
+skip is evidence of an unavailable environment, not evidence that the client
+works. The scheduled workflow runs the `nightly` profile. This makes impact
 optimization fail open: a bad diff base costs time; it never suppresses tests.
 
 ## The UI golden — a saved answer key, not a magic test
@@ -109,6 +116,12 @@ layout, route, and viewport, it records portable structural facts:
 - the keyboard tab order;
 - the API method and path calls made while rendering; and
 - the registered layouts and the surfaces on which they are allowed.
+
+The same browser pass also fails on deterministic accessibility defects:
+duplicate IDs, broken ARIA references, unnamed interactive controls, and
+images with no `alt` contract. Those rules are direct assertions, not saved in
+the golden; the golden preserves the larger structure and keyboard/request
+behavior after those assertions pass.
 
 It deliberately excludes pixels, timestamps, local paths, and arbitrary page
 text. Pixel rendering changes with the browser, fonts, and machine, so
@@ -134,11 +147,12 @@ Never regenerate the golden merely to make a failure disappear. Rewriting the
 expected answer without reviewing the diff turns the check into an automatic
 approval of whatever the application did.
 
-The repository does not currently contain `tests/ui-structure.golden`, so the
-validator reports `web-layout` as **skipped: missing evidence**, not passed.
-The intended one-time activation is below. It runs a real browser sweep and
-therefore needs Python Playwright with Chromium, `ffmpeg`, and a buildable
-`plurxd`; expect it to take minutes rather than seconds.
+The repository contains the activated `tests/ui-structure.golden`: 36 captures
+across every registered layout, route, and desktop/mobile viewport. A check
+rebuilds `plurxd` first so it cannot accidentally serve an old embedded web
+app, then runs a real browser sweep. It needs Python Playwright with Chromium,
+`ffmpeg`, and a buildable `plurxd`; expect it to take minutes rather than
+seconds.
 
 ```bash
 make ui-golden          # capture the current reviewed UI as the answer key
@@ -146,9 +160,8 @@ git diff -- tests/ui-structure.golden
 make ui-check           # prove a fresh capture matches it
 ```
 
-Once that file is reviewed and committed, ordinary web validation can enforce
-it. Until then, JavaScript syntax and theme contrast still run, but structural
-UI drift is an explicit coverage gap.
+`make ui-golden` is only for an intentional reviewed UI change. Ordinary local
+and CI runs use `make ui-check`; they never rewrite their own expected answer.
 
 ## Run it — plan first when the impact is surprising
 
@@ -163,10 +176,11 @@ make validate-plan                                         # staged plan, no che
 make validate-staged                                       # staged commit profile
 make validate                                              # commit profile, every point
 make validate-full                                         # every runnable deep check
+make validate-nightly                                      # exhaustive scheduled tier
 ```
 
 **How to read the plan:** `because path:...` is a direct match;
-`because dependency:...` was pulled in by another selected point. “No check in
+`because consumer:...` was pulled downstream from a changed provider. “No check in
 this profile” means the contract is known but its evidence belongs to a deeper
 or platform-specific profile. It does not mean the point passed.
 
@@ -213,7 +227,7 @@ Checks are declared once and reused:
 id = "search-contract"
 title = "Search API contract cases"
 command = "cargo test -p plurxd http::search::tests -- --nocapture"
-profiles = ["commit", "ci", "full"]
+profiles = ["commit", "ci", "full", "nightly"]
 requires = ["cargo"]
 missing = "fail"
 timeout_seconds = 120
@@ -237,17 +251,29 @@ target is exact: 100% of `settings.audit_paths` must match at least one point,
 and 100% of points must name at least one valid check. This is catalog
 coverage, not a claim that every behavior is exhaustively tested.
 
-## Initial inventory — where evidence is strong and where it is not
+## Current inventory — what is actually validated
 
 | Functionality point | Commit / CI evidence | Full-profile addition |
 |---|---|---|
-| `core.media` · `server.api` · `library.catalog` · `identity.access` · `watch-state.sync` · `plex.compatibility` | Workspace Rust tests, formatting, and clippy | Same gate; add a focused check when a regression escapes it |
-| `playback.pipeline` | Rust decision, delivery, and session tests | Risk-weighted real-browser playback matrix |
-| `web.experience` | JavaScript syntax and theme contrast; local structural check when available | Structural sweep across every registered layout |
-| `apple.client` | XCTest is registered; Linux CI records the platform skip instead of a pass | Shared XCTest source on iOS and tvOS simulators |
-| `android.client` | JVM unit tests and Android lint run in CI when affected | Same checks in the pinned build image |
-| `operations.packaging` | Rust build/version tests | Release container image build |
-| `validation.framework` | Catalog schema, dependency, glob, selection, and audit tests | Same contract |
+| `core.media` | Workspace Rust tests, formatting, and clippy | Scheduled resource-bound checks reach downstream consumers |
+| `persistence.upgrades` | Focused historical migrations, reopen persistence, and refusal of future schemas | Same focused contract |
+| `server.api` · `api.contract` | Seeded read/write journeys plus one canonical JSON fixture checked against live Rust responses and decoded by Swift and Kotlin | Native simulator suites exercise their decoders too |
+| `library.catalog` · `metadata.enrichment` | Scan, browse, matching, retry, and user-owned metadata tests | Downstream browser/client surfaces run when a provider changes |
+| `identity.access` | Focused anonymous/viewer/admin/scoped-key boundaries | Same contract across native client suites |
+| `playback.pipeline` | Rust decision, delivery, stream, HLS, and session tests | Risk-weighted browser matrix; nightly exhaustive quality/restart and interruption recovery |
+| `watch-state.sync` | Seeded progress/watched/settings journey plus store and Trakt tests | Same journey through deeper consumers |
+| `plex.compatibility` | Plex discovery, metadata, media, playback, and timeline tests | Browser playback when shared delivery changes |
+| `web.experience` | JavaScript syntax, theme contrast, 36-capture structural golden, keyboard/request invariants, and accessibility smoke | Same deterministic browser sweep |
+| `apple.client` | Dedicated iOS and tvOS simulator CI, sharing one XCTest source | Local/full simulator run on macOS |
+| `android.client` | JVM models/policies and lint plus dedicated instrumented Compose/TV-focus CI | Explicit disposable-device run for `full` |
+| `operations.packaging` | Release builds and image build in CI | Image must start non-root, become healthy/ready, expose metrics, restart, and keep its instance identity |
+| `validation.framework` | Catalog schema, cycles, duplicate IDs, glob/audit coverage, staged renames, cascade selection, timeout/fail-fast, and report tests | Same contract |
+
+The cross-client fixture is `tests/contracts/native-api.json`. It is not a
+second server implementation: Rust compares representative keys and JSON types
+with live handler responses, while Swift and Kotlin decode the same bytes with
+their production models. Adding a field remains compatible; renaming a field
+or changing its type fails at the consumer boundary where the drift matters.
 
 Line coverage remains a diagnostic badge, not the acceptance target. A high
 line percentage can execute code without asserting its behavior; the catalog

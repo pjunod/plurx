@@ -1,0 +1,96 @@
+#!/bin/sh
+set -eu
+
+image="${1:-plurx/plurxd:latest}"
+name="plurx-validation-$$"
+scratch="$(mktemp -d "${TMPDIR:-/tmp}/plurx-container-smoke.XXXXXX")"
+# The image deliberately runs as an unprivileged user. The host-created test
+# directory belongs to the caller, so make this one disposable directory
+# writable by the container before asking it to create its database.
+chmod 0777 "$scratch"
+
+cleanup() {
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  # The service correctly creates state as its unprivileged container UID,
+  # which may not match the host runner's UID. Make the disposable bind
+  # contents removable before the host deletes the scratch directory.
+  docker run --rm \
+    --user 0:0 \
+    --entrypoint /bin/sh \
+    --volume "$scratch:/scratch" \
+    "$image" \
+    -c 'chmod -R a+rwX /scratch' >/dev/null 2>&1 || true
+  case "$scratch" in
+    */plurx-container-smoke.*) rm -rf -- "$scratch" ;;
+  esac
+}
+trap cleanup EXIT HUP INT TERM
+
+container_user="$(docker image inspect --format '{{.Config.User}}' "$image")"
+if [ "$container_user" != "plurx" ]; then
+  echo "container user is '$container_user', expected 'plurx'" >&2
+  exit 1
+fi
+
+docker create \
+  --name "$name" \
+  --publish 127.0.0.1:0:32400 \
+  --volume "$scratch:/var/lib/plurx" \
+  "$image" >/dev/null
+docker start "$name" >/dev/null
+
+binding="$(docker port "$name" 32400/tcp | head -n 1)"
+if [ -z "$binding" ]; then
+  docker logs "$name" >&2 || true
+  echo "container published no host port for 32400/tcp" >&2
+  exit 1
+fi
+port="${binding##*:}"
+base="http://127.0.0.1:$port"
+
+attempt=0
+until curl -fsS "$base/readyz" >/dev/null 2>&1; do
+  attempt=$((attempt + 1))
+  if [ "$attempt" -ge 60 ]; then
+    docker logs "$name" >&2 || true
+    echo "container did not become ready at $base within 60 seconds" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+curl -fsS "$base/healthz" | grep -q .
+curl -fsS "$base/metrics" | grep -q '^# HELP'
+before="$(curl -fsS "$base/api/v1/server")"
+instance_before="$(printf '%s' "$before" | sed -n 's/.*"instance_id":"\([^"]*\)".*/\1/p')"
+test -n "$instance_before"
+
+docker stop --time 10 "$name" >/dev/null
+docker start "$name" >/dev/null
+# An ephemeral published port is assigned when the container starts and Docker
+# Desktop may choose a new one after a stop/start cycle. Re-resolve it rather
+# than mistaking a changed host port for a failed application restart.
+binding="$(docker port "$name" 32400/tcp | head -n 1)"
+if [ -z "$binding" ]; then
+  docker logs "$name" >&2 || true
+  echo "container published no host port for 32400/tcp after restart" >&2
+  exit 1
+fi
+port="${binding##*:}"
+base="http://127.0.0.1:$port"
+attempt=0
+until curl -fsS "$base/readyz" >/dev/null 2>&1; do
+  attempt=$((attempt + 1))
+  if [ "$attempt" -ge 60 ]; then
+    docker logs "$name" >&2 || true
+    echo "container did not become ready after restart" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+after="$(curl -fsS "$base/api/v1/server")"
+instance_after="$(printf '%s' "$after" | sed -n 's/.*"instance_id":"\([^"]*\)".*/\1/p')"
+test "$instance_before" = "$instance_after"
+
+echo "container smoke passed: non-root user, health/readiness/metrics, stable instance $instance_after"

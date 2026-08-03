@@ -1,0 +1,42 @@
+name: validation nightly
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  deep-validation:
+    name: playback, recovery, bounds, clients, UI, and packaging
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install media and browser prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          python3 -m pip install playwright
+          python3 -m playwright install --with-deps chromium
+      - name: Run every scheduled validation
+        run: make validate-nightly
+      - name: Upload validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-validation-evidence
+          path: |
+            target/validation
+            target/playback-lab
+            target/ui-baseline
+          if-no-files-found: warn
+          retention-days: 14

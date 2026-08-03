@@ -401,6 +401,77 @@ DOM_JS = """
 }
 """
 
+# A compact accessibility smoke check alongside the structural golden. This is
+# intentionally a set of deterministic, high-signal DOM invariants rather than
+# a claim of standards certification: automated checks cannot judge whether an
+# accessible name is good, but they can reliably catch a control with no name,
+# a broken ARIA reference, a duplicate id, or an image with no alt contract.
+A11Y_JS = """
+(roots) => {
+  const rootElements = roots.map(sel => document.querySelector(sel)).filter(Boolean);
+  const inScope = (el) => rootElements.some(root => root === el || root.contains(el));
+  const visible = (el) => {
+    const style = getComputedStyle(el);
+    return style.display !== "none" && style.visibility !== "hidden"
+      && el.getAttribute("aria-hidden") !== "true";
+  };
+  const name = (el) => {
+    const labelled = (el.getAttribute("aria-labelledby") || "").trim();
+    if (labelled) {
+      const value = labelled.split(/\\s+/).map(id => document.getElementById(id))
+        .filter(Boolean).map(node => node.textContent || "").join(" ").trim();
+      if (value) return value;
+    }
+    const explicit = el.getAttribute("aria-label") || el.getAttribute("title")
+      || el.getAttribute("alt") || "";
+    if (explicit.trim()) return explicit.trim();
+    if (el.id) {
+      const label = Array.from(document.querySelectorAll("label"))
+        .find(candidate => candidate.htmlFor === el.id);
+      if (label && (label.textContent || "").trim()) return label.textContent.trim();
+    }
+    const wrappingLabel = el.closest("label");
+    if (wrappingLabel && (wrappingLabel.textContent || "").trim()) {
+      return wrappingLabel.textContent.trim();
+    }
+    return (el.textContent || "").replace(/\\s+/g, " ").trim();
+  };
+  const describe = (el) => {
+    let out = el.tagName.toLowerCase();
+    if (el.id) out += "#" + el.id;
+    if (el.classList.length) out += "." + Array.from(el.classList).slice(0, 3).join(".");
+    return out;
+  };
+  const failures = [];
+  const ids = new Map();
+  for (const el of document.querySelectorAll("[id]")) {
+    if (!el.id) continue;
+    ids.set(el.id, (ids.get(el.id) || 0) + 1);
+  }
+  for (const [id, count] of ids) if (count > 1) failures.push(`duplicate id #${id} (${count})`);
+
+  const references = ["aria-controls", "aria-describedby", "aria-labelledby", "aria-owns"];
+  for (const el of document.querySelectorAll(references.map(a => `[${a}]`).join(","))) {
+    if (!inScope(el)) continue;
+    for (const attr of references) {
+      for (const id of (el.getAttribute(attr) || "").trim().split(/\\s+/).filter(Boolean)) {
+        if (!document.getElementById(id)) failures.push(`${describe(el)} ${attr} missing #${id}`);
+      }
+    }
+  }
+
+  const interactive = "button,a[href],input,select,textarea,[role=button],[role=link]," +
+    "[role=checkbox],[role=radio],[role=switch],[role=menuitem],[role=tab],[role=slider]";
+  for (const el of document.querySelectorAll(interactive)) {
+    if (inScope(el) && visible(el) && !name(el)) failures.push(`${describe(el)} has no accessible name`);
+  }
+  for (const el of document.querySelectorAll("img")) {
+    if (inScope(el) && visible(el) && !el.hasAttribute("alt")) failures.push(`${describe(el)} has no alt`);
+  }
+  return Array.from(new Set(failures)).sort();
+}
+"""
+
 
 class Fail(Exception):
     """A route did not render. Collected, reported, and turned into exit 1."""
@@ -543,9 +614,11 @@ class SelfHost:
                 raise Fail(f"no such server binary: {path}")
             return path
         path = ROOT / "target" / "debug" / "plurxd"
-        if not path.exists():
-            print("BUILD   cargo build -p plurxd", flush=True)
-            subprocess.run(["cargo", "build", "-p", "plurxd"], cwd=ROOT, check=True)
+        # A binary merely existing says nothing about whether it contains this
+        # tree's embedded HTML. Cargo's incremental no-op is cheap; serving a
+        # stale binary can bless the exact pre-change UI as the new golden.
+        print("BUILD   cargo build -p plurxd", flush=True)
+        subprocess.run(["cargo", "build", "-p", "plurxd"], cwd=ROOT, check=True)
         return path
 
     def spawn(self):
@@ -1032,6 +1105,9 @@ def capture_route(pw_context, base_url, name, route, args, shot, layout_id):
         freeze_timers(page)
         roots = ["#app"] + (["#modal"] if route.get("player") else [])
         dom = page.evaluate(DOM_JS, roots)
+        accessibility = page.evaluate(A11Y_JS, roots)
+        if accessibility:
+            raise Fail(f"{name}: accessibility: " + "; ".join(accessibility[:10]))
         focus = tab_order(page, args.tab_stops)
         # The walk left a focus ring and a scrolled rail behind it; the picture
         # is of the page at rest, so put it back before the shutter.
@@ -1346,7 +1422,12 @@ def structure_lines(result, args, out_dir):
 
     def text(s):
         """A focus label: app text, so scrub it, THEN cut it (see FOCUS_JS)."""
-        return scrub(str(s), sub)[:FOCUS_LABEL_CHARS].replace("|", "¦").replace("\n", " ")
+        return (
+            scrub(str(s), sub)[:FOCUS_LABEL_CHARS]
+            .replace("|", "¦")
+            .replace("\n", " ")
+            .rstrip()
+        )
 
     lines = []
     # Meta first (`*` sorts before every layout id): the registry itself is

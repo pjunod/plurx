@@ -1,7 +1,7 @@
 version = 1
 
 [settings]
-profiles = ["commit", "ci", "full"]
+profiles = ["commit", "ci", "full", "nightly"]
 artifact_dir = "target/validation"
 always_checks = ["catalog-contract", "rust-gate"]
 audit_paths = [
@@ -26,7 +26,7 @@ audit_exclude = []
 id = "catalog-contract"
 title = "Validation runner contract"
 command = "python3 -m unittest discover -s tests/validation -p 'test_*.py'"
-profiles = ["commit", "ci", "full"]
+profiles = ["commit", "ci", "full", "nightly"]
 requires = ["python3"]
 missing = "fail"
 timeout_seconds = 60
@@ -35,7 +35,7 @@ timeout_seconds = 60
 id = "rust-gate"
 title = "Rust format, lint, and workspace tests"
 command = "make check"
-profiles = ["commit", "ci", "full"]
+profiles = ["commit", "ci", "full", "nightly"]
 requires = ["cargo", "make"]
 missing = "fail"
 timeout_seconds = 1800
@@ -44,7 +44,7 @@ timeout_seconds = 1800
 id = "web-static"
 title = "Embedded JavaScript and theme contrast"
 command = "make web-check"
-profiles = ["commit", "ci", "full"]
+profiles = ["commit", "ci", "full", "nightly"]
 requires = ["python3"]
 missing = "fail"
 timeout_seconds = 120
@@ -53,7 +53,7 @@ timeout_seconds = 120
 id = "web-layout"
 title = "Every web layout against the structural golden"
 command = "make ui-check"
-profiles = ["commit", "full"]
+profiles = ["commit", "ci", "full", "nightly"]
 requires = ["python3", "ffmpeg"]
 requires_files = ["tests/ui-structure.golden"]
 preflight = "python3 -c 'import playwright'"
@@ -65,7 +65,7 @@ timeout_seconds = 1800
 id = "playback-smoke"
 title = "Risk-weighted browser playback matrix"
 command = "make playback-smoke"
-profiles = ["full"]
+profiles = ["full", "nightly"]
 platforms = ["darwin", "linux"]
 requires = ["cargo", "ffmpeg", "node"]
 missing = "skip"
@@ -74,15 +74,8 @@ timeout_seconds = 3600
 [[checks]]
 id = "apple-simulators"
 title = "Shared iOS and tvOS XCTest suite"
-command = """
-cd clients/apple && \
-xcodegen generate && \
-xcodebuild -project plurx.xcodeproj -scheme plurx-iOS \
-  -destination \"${APPLE_IOS_SIM:-platform=iOS Simulator,name=iPhone 17 Pro}\" test && \
-xcodebuild -project plurx.xcodeproj -scheme plurx-tvOS \
-  -destination \"${APPLE_TVOS_SIM:-platform=tvOS Simulator,name=Apple TV 4K (3rd generation)}\" test
-"""
-profiles = ["ci", "full"]
+command = "make apple-test"
+profiles = ["ci", "full", "nightly"]
 platforms = ["darwin"]
 requires = ["xcodebuild", "xcodegen"]
 missing = "skip"
@@ -95,21 +88,97 @@ command = """
 mkdir -p target/validation/buildx && \
 BUILDX_CONFIG=target/validation/buildx make android-test
 """
-profiles = ["ci", "full"]
+profiles = ["ci", "full", "nightly"]
 platforms = ["darwin", "linux"]
 requires = ["docker"]
 missing = "skip"
 timeout_seconds = 3600
 
 [[checks]]
-id = "container-image"
-title = "Release container image build"
-command = "mkdir -p target/validation/buildx && BUILDX_CONFIG=target/validation/buildx make docker"
+id = "android-device"
+title = "Android and Google TV instrumented UI tests"
+command = "make android-instrumentation"
 profiles = ["full"]
 platforms = ["darwin", "linux"]
-requires = ["docker"]
+requires = ["adb", "docker"]
+preflight = "test -n \"$PLURX_ANDROID_SERIAL\""
 missing = "skip"
 timeout_seconds = 3600
+
+[[checks]]
+id = "container-runtime"
+title = "Release container startup, health, and restart smoke"
+command = "mkdir -p target/validation/buildx && BUILDX_CONFIG=target/validation/buildx make container-smoke"
+profiles = ["full", "nightly"]
+platforms = ["darwin", "linux"]
+requires = ["curl", "docker"]
+missing = "skip"
+timeout_seconds = 3600
+
+[[checks]]
+id = "api-wire"
+title = "Live native API matches the shared Rust/Swift/Kotlin fixture"
+command = "cargo test -p plurxd http::tests::shared_native_api_fixture_uses_the_servers_live_wire_keys -- --exact"
+profiles = ["commit", "ci", "full", "nightly"]
+requires = ["cargo"]
+missing = "fail"
+timeout_seconds = 300
+
+[[checks]]
+id = "database-upgrades"
+title = "SQLite upgrade and downgrade-safety contract"
+command = "cargo test -p plurx-core store::sqlite::tests:: -- --nocapture"
+profiles = ["ci", "full", "nightly"]
+requires = ["cargo"]
+missing = "fail"
+timeout_seconds = 300
+
+[[checks]]
+id = "security-boundaries"
+title = "Authentication, administration, and scoped-key boundaries"
+command = "cargo test -p plurxd http::tests::auth_is_required_and_admin_enforced -- --exact && cargo test -p plurxd http::tests::only_an_admin_manages_keys -- --exact && cargo test -p plurxd http::tests::the_scan_route_takes_a_key_and_only_a_key -- --exact"
+profiles = ["ci", "full", "nightly"]
+requires = ["cargo"]
+missing = "fail"
+timeout_seconds = 600
+
+[[checks]]
+id = "user-journey"
+title = "Seeded browse, playback-decision, progress, and settings journeys"
+command = "cargo test -p plurxd seeded_ -- --nocapture"
+profiles = ["ci", "full", "nightly"]
+requires = ["cargo"]
+missing = "fail"
+timeout_seconds = 600
+
+[[checks]]
+id = "playback-recovery"
+title = "Interrupted playback production resumes without losing media"
+command = "cargo test -p plurxd transcode::tests::a_preempted_producer_resumes_without_losing_picture -- --exact --nocapture"
+profiles = ["nightly"]
+platforms = ["darwin", "linux"]
+requires = ["cargo", "ffmpeg"]
+missing = "fail"
+timeout_seconds = 1800
+
+[[checks]]
+id = "resource-bounds"
+title = "Session registries, hardware slots, and memory work stay bounded"
+command = "cargo test -p plurxd cannot_grow_the_registry_without_bound -- --nocapture && cargo test -p plurxd transcode::tests::concurrent_starts_cannot_exceed_the_hardware_slot_cap -- --exact --nocapture"
+profiles = ["nightly"]
+requires = ["cargo"]
+missing = "fail"
+timeout_seconds = 600
+
+[[checks]]
+id = "playback-exhaustive"
+title = "Every browser playback fixture, quality, and restart case"
+command = "make playback-full"
+profiles = ["nightly"]
+platforms = ["darwin", "linux"]
+requires = ["cargo", "ffmpeg", "node"]
+missing = "fail"
+timeout_seconds = 7200
 
 [[points]]
 id = "core.media"
@@ -118,21 +187,49 @@ contract = "The core model classifies media and persists its durable state witho
 paths = [
   "Cargo.lock",
   "Cargo.toml",
-  "crates/plurx-core/**",
+  "crates/plurx-core/Cargo.toml",
+  "crates/plurx-core/src/{config,domain,error,lib,testfixtures}.rs",
+  "crates/plurx-core/src/store/mod.rs",
+  "crates/plurx-core/src/store/sqlite/cache.rs",
   "rust-toolchain.toml",
 ]
 checks = ["rust-gate"]
+
+[[points]]
+id = "persistence.upgrades"
+title = "Persistent database compatibility"
+contract = "Existing libraries upgrade without losing data, and a newer unsupported database is refused instead of corrupted."
+paths = ["crates/plurx-core/src/store/sqlite/mod.rs"]
+checks = ["rust-gate", "database-upgrades"]
+depends_on = ["core.media"]
 
 [[points]]
 id = "server.api"
 title = "Native server API and runtime"
 contract = "The single server binary exposes stable native endpoints and coordinates background work safely."
 paths = [
-  "crates/plurxd/**",
+  "crates/plurxd/Cargo.toml",
+  "crates/plurxd/src/{cachekeep,logbuf,main,schedule,state,storeprobe}.rs",
+  "crates/plurxd/src/http/{dto,error,extract,mod,system}.rs",
   "plurx.example.toml",
 ]
-checks = ["rust-gate"]
-depends_on = ["core.media"]
+checks = ["rust-gate", "api-wire", "user-journey"]
+depends_on = ["core.media", "persistence.upgrades"]
+
+[[points]]
+id = "api.contract"
+title = "Shared native API wire contract"
+contract = "The server, Apple clients, and Android clients decode the same representative JSON without field-name or type drift."
+paths = [
+  "tests/contracts/native-api.json",
+  "crates/plurxd/src/http/{dto,mod}.rs",
+  "clients/apple/Sources/{API,Models}.swift",
+  "clients/apple/Tests/AppleClientTests.swift",
+  "clients/android/app/src/main/java/tv/plurx/app/data/**",
+  "clients/android/app/src/test/java/tv/plurx/app/data/ModelContractTest.kt",
+]
+checks = ["api-wire", "apple-simulators", "android-jvm"]
+depends_on = ["server.api"]
 
 [[points]]
 id = "library.catalog"
@@ -150,6 +247,18 @@ checks = ["rust-gate"]
 depends_on = ["core.media", "server.api"]
 
 [[points]]
+id = "metadata.enrichment"
+title = "Metadata matching and enrichment"
+contract = "Local and remote metadata improve catalog records deterministically, retry safely, and never overwrite stronger user-owned facts."
+paths = [
+  "crates/plurx-core/src/metadata/**",
+  "crates/plurxd/src/http/items.rs",
+  "docs/METADATA*.md",
+]
+checks = ["rust-gate"]
+depends_on = ["core.media", "server.api", "library.catalog"]
+
+[[points]]
 id = "identity.access"
 title = "Accounts, tokens, and authorization boundaries"
 contract = "Only authenticated users can cross protected API and media boundaries, with admin operations kept separate."
@@ -159,7 +268,7 @@ paths = [
   "crates/plurxd/src/http/{auth,keys,users}.rs",
   "docs/SECURITY.md",
 ]
-checks = ["rust-gate"]
+checks = ["rust-gate", "security-boundaries"]
 depends_on = ["core.media", "server.api"]
 
 [[points]]
@@ -180,7 +289,7 @@ paths = [
   "scripts/playback-lab",
   "tests/playback/**",
 ]
-checks = ["rust-gate", "playback-smoke"]
+checks = ["rust-gate", "playback-smoke", "playback-recovery", "resource-bounds", "playback-exhaustive"]
 depends_on = ["core.media", "server.api", "library.catalog"]
 
 [[points]]
@@ -193,8 +302,8 @@ paths = [
   "crates/plurxd/src/{trakt,watched}.rs",
   "crates/plurxd/src/http/{trakt,watch}.rs",
 ]
-checks = ["rust-gate"]
-depends_on = ["core.media", "server.api"]
+checks = ["rust-gate", "user-journey"]
+depends_on = ["core.media", "server.api", "library.catalog"]
 
 [[points]]
 id = "plex.compatibility"
@@ -205,7 +314,7 @@ paths = [
   "crates/plurxd/src/http/plex.rs",
 ]
 checks = ["rust-gate"]
-depends_on = ["server.api", "playback.pipeline"]
+depends_on = ["server.api", "api.contract", "playback.pipeline"]
 
 [[points]]
 id = "web.experience"
@@ -223,7 +332,7 @@ paths = [
   "tests/ui-structure.golden",
 ]
 checks = ["rust-gate", "web-static", "web-layout"]
-depends_on = ["server.api", "playback.pipeline"]
+depends_on = ["server.api", "api.contract", "identity.access", "metadata.enrichment", "playback.pipeline"]
 
 [[points]]
 id = "apple.client"
@@ -231,15 +340,15 @@ title = "Native iOS and tvOS clients"
 contract = "The Apple clients preserve the shared API, navigation, preferences, and playback policies on both platforms."
 paths = ["clients/apple/**"]
 checks = ["apple-simulators"]
-depends_on = ["server.api", "playback.pipeline"]
+depends_on = ["server.api", "api.contract", "identity.access", "metadata.enrichment", "playback.pipeline"]
 
 [[points]]
 id = "android.client"
 title = "Native Android and Google TV clients"
 contract = "The Android clients preserve API models, TV focus, preferences, and Media3 playback policy."
 paths = ["clients/android/**"]
-checks = ["android-jvm"]
-depends_on = ["server.api", "playback.pipeline"]
+checks = ["android-jvm", "android-device"]
+depends_on = ["server.api", "api.contract", "identity.access", "metadata.enrichment", "playback.pipeline"]
 
 [[points]]
 id = "operations.packaging"
@@ -253,8 +362,9 @@ paths = [
   "crates/plurxd/build.rs",
   "crates/plurxd/src/version.rs",
   "scripts/{bench,dv-evidence,gop-census,mkpgs,perf-report,ship}",
+  "scripts/container-smoke",
 ]
-checks = ["rust-gate", "container-image"]
+checks = ["rust-gate", "container-runtime", "resource-bounds"]
 depends_on = ["server.api"]
 
 [[points]]

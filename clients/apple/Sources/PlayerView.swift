@@ -233,8 +233,7 @@ struct PlayerView: View {
             }
 
             if controller.isChangingStream {
-                ProgressView()
-                    .controlSize(.large)
+                streamChangeProgress
                     .tint(.white)
                     .padding(18)
                     .background(.ultraThinMaterial, in: Circle())
@@ -391,6 +390,15 @@ struct PlayerView: View {
         }
     }
     #endif
+
+    @ViewBuilder
+    private var streamChangeProgress: some View {
+        #if os(iOS)
+        ProgressView().controlSize(.large)
+        #else
+        ProgressView()
+        #endif
+    }
 
     private var failureView: some View {
         VStack(spacing: 14) {
