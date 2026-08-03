@@ -1004,11 +1004,9 @@
      Known limitation: a home-video FOLDER card carries no watch state either,
      so it gets flagged too. Fixing that needs a kind class on .poster from
      card(), which is shipped code and outside this layout's remit. */
-  @supports selector(:has(*)){
-    [data-layout=plex] .poster:not(:has(.badge)):not(:has(.prog)):not(:has(.soonwhen)):not(:has(.art.sq)) .artbox::after{
-      content:"";position:absolute;top:0;right:0;width:26px;height:26px;pointer-events:none;
-      background:var(--accent);clip-path:polygon(100% 0, 100% 100%, 0 0)}
-  }
+  [data-layout=plex] .poster.unw .artbox::after{
+    content:"";position:absolute;top:0;right:0;width:26px;height:26px;pointer-events:none;
+    background:var(--accent);clip-path:polygon(100% 0, 100% 100%, 0 0)}
   /* Hover play circle. Decorative: the whole card has always been the click
      target, so the circle announces the action rather than owning it. It is
      revealed by :focus-visible as well as :hover so a keyboard user gets the
@@ -1255,7 +1253,7 @@
        repeated verbatim rather than simplified: the rule that paints the flag
        carries four class selectors of specificity, and a shorter selector here
        loses to it and leaves the triangle in the theme accent. */
-    [data-layout=plex] .poster:not(:has(.badge)):not(:has(.prog)):not(:has(.soonwhen)):not(:has(.art.sq)) .artbox::after{
+    [data-layout=plex] .poster.unw .artbox::after{
       background:Highlight;forced-color-adjust:none}
     /* Progress is a 5px bar whose fill and track both collapse to the same
        system colour otherwise — i.e. "how far in am I" disappears entirely. */
@@ -2350,7 +2348,13 @@ function card(it, watchCtx){
   const pct = progressPct(it.watch);
   const watched = it.watch&&it.watch.watched? `<span class="badge">✓</span>`:"";
   const prog = pct>0&&pct<100? `<div class="prog"><i style="width:${pct}%"></i></div>`:"";
-  return `<div class="poster" onclick="location.hash='#/item/${it.id}'">
+  // Watch state and item kind as classes, so a layout that marks unwatched
+  // titles can ask a question instead of inferring the answer from which
+  // children happen to be absent. The :not(:has(.badge)):not(:has(.prog))…
+  // chain this replaces was both fragile and wrong: a folder card has no watch
+  // state either, so it got flagged as unwatched.
+  const cls = `poster k-${esc(it.kind||"item")}${(!watched&&!prog)?" unw":""}`;
+  return `<div class="${cls}" onclick="location.hash='#/item/${it.id}'">
     <div class="artbox">${img}${dur}${watched}</div><div class="meta"><div class="t">${esc(main)}</div><div class="s"><span class="stxt">${sub}</span>${resb}</div>${watchLine(it,watchCtx)}</div>${prog}</div>`;
 }
 // Folder and photo cards. A folder opens its page; a photo opens the lightbox
@@ -2360,11 +2364,11 @@ function homeCard(it){
   if(it.kind==='folder'){
     const n=it.child_count;
     const sub=n==null? "Folder" : `${n} item${n===1?'':'s'}`;
-    return `<div class="poster" onclick="location.hash='#/item/${it.id}'">
+    return `<div class="poster k-folder" onclick="location.hash='#/item/${it.id}'">
       <div class="artbox">${artHtml(it)}</div>
       <div class="meta"><div class="t">${esc(it.title)}</div><div class="s"><span class="stxt">${esc(sub)}</span></div></div></div>`;
   }
-  return `<div class="poster" onclick="openLightbox(${it.id})">
+  return `<div class="poster k-photo" onclick="openLightbox(${it.id})">
     <div class="artbox">${artHtml(it,'sq')}</div>
     <div class="meta"><div class="t">${esc(it.title)}</div><div class="s"><span class="stxt">${esc(fmtDate(it.recorded_at))}</span></div></div></div>`;
 }
@@ -2800,14 +2804,23 @@ function tagAlpha(items){
   for(let i=0;i<cards.length&&i<items.length;i++) cards[i].dataset.alpha=alphaBucket(items[i]);
   updateAzActive();                                         // set the initial highlight
 }
+// Where the page's fixed chrome stops and content begins. The layout owns this
+// number: classic has a sticky top header, plex has a sidebar and no top bar at
+// all, and a hardcoded `header.top` lookup silently measures nothing under plex
+// — the A–Z rail then highlights a letter that is already scrolled past.
+function stickyFloor(){
+  const L=LAYOUTS[layoutId()];
+  if(L&&L.stickyFloor) return L.stickyFloor();
+  const h=document.querySelector("header.top");
+  return h?h.getBoundingClientRect().bottom:56;
+}
 function alphaJump(L){ const t=document.querySelector('#main .grid [data-alpha="'+L+'"]'); if(t) t.scrollIntoView({behavior:"smooth",block:"start"}); }
 // Scroll-spy: highlight the letter whose posters sit at the top of the viewport
 // as you scroll. One persistent, rAF-throttled window listener drives whatever
 // rail is on screen (no-op when none), so it survives view swaps replacing #main.
 function azCurrentBucket(){
   const g=document.querySelector("#main .grid"); if(!g) return null;
-  const h=document.querySelector("header.top");
-  const line=(h?h.getBoundingClientRect().bottom:56)+6;     // just under the sticky header
+  const line=stickyFloor()+6;                              // just under the sticky header
   const cards=g.children;
   for(let i=0;i<cards.length;i++){ if(cards[i].getBoundingClientRect().bottom>line) return cards[i].dataset.alpha||null; }
   return null;

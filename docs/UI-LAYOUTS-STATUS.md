@@ -339,6 +339,17 @@ Stated plainly so nobody infers more than was built.
   `@supports` caveat are gone.
 - ~~A–Z scroll-spy measures `header.top`~~ — **fixed:** `stickyFloor()` asks
   the layout; classic keeps the old computation exactly.
+
+  **These two, and only these two, were claimed fixed in G2b and were not.**
+  A verification script was still running in the background when the edit was
+  made, and its final step copied a pre-edit snapshot back over `index.html`.
+  The two later fixes in the same area survived because they were written
+  after that script finished, which is exactly why the loss was invisible:
+  the file *looked* edited. Caught while collecting G3's evidence, by
+  grepping the shipped file for the classes rather than trusting this
+  document. Re-applied and re-verified. The lesson is cheap and worth
+  writing down: never edit a file a background job is swapping, and verify a
+  claim against the artifact, not against the note that says you made it.
 - ~~TV shows Settings to admins~~ — **fixed** in plex chrome.
 - ~~`PLEX_NAV` goes stale~~ — **fixed**, and one worse case found while
   fixing it: chrome paints before a route fetches, so an item deep-link
