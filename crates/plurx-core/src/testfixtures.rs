@@ -199,6 +199,7 @@ pub fn pipe(kind: &str) -> Vec<u8> {
             "-movflags",
             "frag_keyframe+empty_moov+default_base_moof+delay_moov",
         ])
+        .args(["-use_editlist", "0"])
         .args(["-f", "mp4", "pipe:1"]);
     let bytes = run(&mut cmd);
     let tmp = out.with_extension("tmp");
@@ -209,7 +210,10 @@ pub fn pipe(kind: &str) -> Vec<u8> {
 
 /// Where [`pipe`] caches its output, for tests that hand the path to ffprobe.
 pub fn pipe_path(kind: &str) -> PathBuf {
-    fixture_dir().join(format!("{kind}.pipe.mp4"))
+    // Keep the cache key tied to the authored timeline. Older fixture files
+    // contain movie edit lists and therefore expose different first-frame
+    // timestamps even though their decoded pictures are identical.
+    fixture_dir().join(format!("{kind}.edit-free.pipe.mp4"))
 }
 
 /// The `open-gop` source with chapters attached.
