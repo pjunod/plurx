@@ -1790,6 +1790,20 @@ final class AppleClientTests: XCTestCase {
         XCTAssertGreaterThan(PlayerMetadataBadgeMetrics.dimmedOpacity, 0.2)
     }
 
+    func testInitialHlsSessionCarriesTheDecisionsAudioTrack() {
+        XCTAssertEqual(
+            PlayerController.sessionAudioIndex(explicit: nil, selected: 2),
+            2,
+            "cold start must carry the track whose checkmark the decision supplied"
+        )
+        XCTAssertEqual(
+            PlayerController.sessionAudioIndex(explicit: 3, selected: 2),
+            3,
+            "a viewer's manual selection must still win on a reopen"
+        )
+        XCTAssertNil(PlayerController.sessionAudioIndex(explicit: nil, selected: nil))
+    }
+
     /// The playback-info panel says the same thing in a sentence, and prefers
     /// the server's own reason over anything the client could invent.
     func testDynamicRangePanelRowExplainsWhyTheGradeChanged() {
