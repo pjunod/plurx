@@ -2384,8 +2384,8 @@ final class AppleClientTests: XCTestCase {
             from: Data(#"{"id":2,"kind":"movie","title":"TRON: Ares","year":2025,"resolution":2160,"watch":{"position_ms":300000,"duration_ms":7200000}}"#.utf8)
         )
 
-        XCTAssertEqual(cardShelfMetadata(episode), "S4 E2 · 44m left")
-        XCTAssertEqual(cardShelfMetadata(movie), "2025 · 115m left")
+        XCTAssertEqual(cardShelfMetadata(episode), "S4 E2  44m left")
+        XCTAssertEqual(cardShelfMetadata(movie), "2025  115m left")
         XCTAssertEqual(resolutionLabel(movie.resolution), "4K")
         XCTAssertFalse(cardShelfMetadata(movie).contains("4K"))
         XCTAssertFalse(cardShelfMetadata(episode).contains("TV"))
@@ -2420,7 +2420,7 @@ final class AppleClientTests: XCTestCase {
             from: Data(#"{"id":2,"kind":"movie","title":"TRON: Ares","year":2025,"watch":{"position_ms":300000,"duration_ms":7200000}}"#.utf8)
         )
 
-        XCTAssertEqual(continueWatchingDetail(episode), "S4 E2 · Fray")
+        XCTAssertEqual(continueWatchingDetail(episode), "S4 E2  Fray")
         XCTAssertEqual(continueWatchingTimeRemaining(episode), "44m left")
         XCTAssertEqual(continueWatchingDetail(movie), "2025")
         XCTAssertEqual(continueWatchingTimeRemaining(movie), "115m left")
