@@ -341,6 +341,7 @@ pub async fn status(
 pub struct PlaylistQuery {
     pub native: Option<u8>,
     pub subtitle: Option<i64>,
+    pub diagnostic: Option<String>,
 }
 
 fn playlist_response(bytes: Vec<u8>) -> Response {
@@ -387,9 +388,20 @@ pub async fn playlist(
     if query.native != Some(1) {
         return video_playlist(State(state), AxPath(session)).await;
     }
-    let (_, file) = session_file(&state, &session).await?;
+    let (_, mut file) = session_file(&state, &session).await?;
+    let selected = match query.diagnostic.as_deref() {
+        Some("minimal") => {
+            file.subtitle_streams.clear();
+            None
+        }
+        Some("one-sub") => {
+            file.subtitle_streams.truncate(1);
+            None
+        }
+        _ => query.subtitle,
+    };
     Ok(playlist_response(
-        master_playlist(&file, query.subtitle).into_bytes(),
+        master_playlist(&file, selected).into_bytes(),
     ))
 }
 
@@ -722,8 +734,7 @@ impl MasterRungs {
         static ACTIVE: std::sync::OnceLock<MasterRungs> = std::sync::OnceLock::new();
         *ACTIVE.get_or_init(|| MasterRungs {
             closed_captions_none: Self::enabled("PLURX_HLS_CLOSED_CAPTIONS_NONE"),
-            // Physical Apple TV canary: exercise this ladder rung alone.
-            forced_autoselect: true,
+            forced_autoselect: Self::enabled("PLURX_HLS_FORCED_AUTOSELECT"),
         })
     }
 }
