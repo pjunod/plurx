@@ -709,8 +709,8 @@ fn parse_stbl(payload: &[u8], track: &mut Track) -> Result<(), Fmp4Error> {
 /// sample. That is enough for an elementary-stream decoder, but not for Apple
 /// HLS: AVPlayer decides whether a `VIDEO-RANGE=PQ` variant is supported from
 /// its initialization segment. Copy the original prefix-SEI NAL units into
-/// the `hvcC` record, exactly as authored, while leaving every media sample
-/// untouched.
+/// the `hvcC` record, exactly as authored, and add Apple's recommended
+/// `mdcv`/`clli` sample-entry boxes while leaving every media sample untouched.
 ///
 /// Returns `true` when the init segment changed. Non-HEVC streams, streams
 /// without the metadata, real Dolby Vision sample entries, and already-rich
@@ -743,7 +743,16 @@ pub fn promote_hdr10_static_metadata(init: &mut Init, first: &Fragment) -> Resul
     let present = hvcc_hdr10_sei_types(record)?;
     let mut additions = Vec::new();
     let mut covered = present;
-    for nal in candidate_nals {
+    let mut mastering = None;
+    let mut content_light = None;
+    for &nal in &candidate_nals {
+        for (kind, payload) in hdr10_sei_messages(nal) {
+            match kind {
+                137 if mastering.is_none() => mastering = Some(payload),
+                144 if content_light.is_none() => content_light = Some(payload),
+                _ => {}
+            }
+        }
         let types = hdr10_sei_types(nal);
         if types.iter().all(|kind| covered.contains(kind)) {
             continue;
@@ -755,43 +764,84 @@ pub fn promote_hdr10_static_metadata(init: &mut Init, first: &Fragment) -> Resul
         }
         additions.push(nal);
     }
-    if additions.is_empty() {
-        return Ok(false);
-    }
     if additions.len() > u16::MAX as usize {
         return Err(Fmp4Error::Unsupported(
             "too many HDR10 prefix-SEI NAL units for hvcC".into(),
         ));
     }
 
-    let mut array = Vec::new();
-    // array_completeness=0: these are the decoder-wide static records, not a
-    // claim that no other per-picture prefix SEIs occur in the samples.
-    array.push(39);
-    array.extend_from_slice(&(additions.len() as u16).to_be_bytes());
-    for nal in additions {
-        let len = u16::try_from(nal.len()).map_err(|_| {
-            Fmp4Error::Unsupported("an HDR10 prefix-SEI NAL exceeds hvcC's u16 length".into())
-        })?;
-        array.extend_from_slice(&len.to_be_bytes());
-        array.extend_from_slice(nal);
+    let mut changed = false;
+    let mut hvcc_delta = 0usize;
+    if !additions.is_empty() {
+        let mut array = Vec::new();
+        // array_completeness=0: these are the decoder-wide static records,
+        // not a claim that no other per-picture prefix SEIs occur in samples.
+        array.push(39);
+        array.extend_from_slice(&(additions.len() as u16).to_be_bytes());
+        for nal in additions {
+            let len = u16::try_from(nal.len()).map_err(|_| {
+                Fmp4Error::Unsupported("an HDR10 prefix-SEI NAL exceeds hvcC's u16 length".into())
+            })?;
+            array.extend_from_slice(&len.to_be_bytes());
+            array.extend_from_slice(nal);
+        }
+
+        let arrays_offset = location.payload.start + 22;
+        let arrays = init.bytes[arrays_offset];
+        if arrays == u8::MAX {
+            return Err(Fmp4Error::Unsupported(
+                "hvcC already declares 255 NAL arrays".into(),
+            ));
+        }
+        hvcc_delta = array.len();
+        let insert_at = location.payload.end;
+        init.bytes.splice(insert_at..insert_at, array);
+        init.bytes[arrays_offset] = arrays + 1;
+        for &box_at in &location.ancestors {
+            grow_box(&mut init.bytes, box_at, hvcc_delta)?;
+        }
+        changed = true;
     }
 
-    let arrays_offset = location.payload.start + 22;
-    let arrays = init.bytes[arrays_offset];
-    if arrays == u8::MAX {
-        return Err(Fmp4Error::Unsupported(
-            "hvcC already declares 255 NAL arrays".into(),
-        ));
+    // Apple recommends explicit sample-entry atoms even though the same SEIs
+    // in hvcC are a valid fallback. Carry both forms: older AVFoundation
+    // versions have been observed consulting the atoms while deciding whether
+    // a PQ HLS variant is supported, before they instantiate the decoder.
+    let mut static_boxes = Vec::new();
+    if !location.has_mdcv {
+        if let Some(payload) = mastering.filter(|payload| payload.len() == 24) {
+            static_boxes.extend_from_slice(&mp4_box(b"mdcv", &payload)?);
+        }
     }
-    let delta = array.len();
-    let insert_at = location.payload.end;
-    init.bytes.splice(insert_at..insert_at, array);
-    init.bytes[arrays_offset] = arrays + 1;
-    for box_at in location.ancestors {
-        grow_box(&mut init.bytes, box_at, delta)?;
+    if !location.has_clli {
+        if let Some(payload) = content_light.filter(|payload| payload.len() == 4) {
+            static_boxes.extend_from_slice(&mp4_box(b"clli", &payload)?);
+        }
     }
-    Ok(true)
+    if !static_boxes.is_empty() {
+        let delta = static_boxes.len();
+        let insert_at = location.sample_entry_end + hvcc_delta;
+        init.bytes.splice(insert_at..insert_at, static_boxes);
+        // Skip hvcC itself; grow the visual sample entry and every container.
+        for &box_at in &location.ancestors[1..] {
+            grow_box(&mut init.bytes, box_at, delta)?;
+        }
+        changed = true;
+    }
+    Ok(changed)
+}
+
+fn mp4_box(kind: &[u8; 4], payload: &[u8]) -> Result<Vec<u8>, Fmp4Error> {
+    let size = payload
+        .len()
+        .checked_add(8)
+        .and_then(|size| u32::try_from(size).ok())
+        .ok_or_else(|| Fmp4Error::Unsupported("HDR10 metadata box exceeds u32".into()))?;
+    let mut out = Vec::with_capacity(size as usize);
+    out.extend_from_slice(&size.to_be_bytes());
+    out.extend_from_slice(kind);
+    out.extend_from_slice(payload);
+    Ok(out)
 }
 
 fn first_video_sample<'a>(fragment: &'a Fragment, video: &Track) -> Option<&'a [u8]> {
@@ -835,6 +885,15 @@ fn hdr10_prefix_sei_nals(sample: &[u8], length_size: u8) -> Vec<&[u8]> {
 
 /// HDR10 static-metadata payload types carried by one HEVC SEI NAL.
 fn hdr10_sei_types(nal: &[u8]) -> Vec<u16> {
+    hdr10_sei_messages(nal)
+        .into_iter()
+        .map(|(kind, _)| kind)
+        .collect()
+}
+
+/// HDR10 messages and their unescaped big-endian payloads from one HEVC SEI
+/// NAL. The payload bytes are exactly what the `mdcv`/`clli` boxes carry.
+fn hdr10_sei_messages(nal: &[u8]) -> Vec<(u16, Vec<u8>)> {
     if nal.len() < 3 {
         return Vec::new();
     }
@@ -872,8 +931,8 @@ fn hdr10_sei_types(nal: &[u8]) -> Vec<u16> {
         if end > rbsp.len() {
             break;
         }
-        if matches!(kind, 137 | 144) && !found.contains(&kind) {
-            found.push(kind);
+        if matches!(kind, 137 | 144) && !found.iter().any(|(seen, _)| *seen == kind) {
+            found.push((kind, rbsp[pos..end].to_vec()));
         }
         pos = end;
     }
@@ -900,6 +959,9 @@ struct BoxAt {
 
 struct HvcCLocation {
     payload: Range<usize>,
+    sample_entry_end: usize,
+    has_mdcv: bool,
+    has_clli: bool,
     /// hvcC first, then every enclosing box through moov.
     ancestors: Vec<BoxAt>,
 }
@@ -951,6 +1013,9 @@ fn locate_hvcc(bytes: &[u8]) -> Result<Option<HvcCLocation>, Fmp4Error> {
             }
             return Ok(Some(HvcCLocation {
                 payload,
+                sample_entry_end: extra_end,
+                has_mdcv: find_child(bytes, extra_start..extra_end, b"mdcv")?.is_some(),
+                has_clli: find_child(bytes, extra_start..extra_end, b"clli")?.is_some(),
                 ancestors: vec![
                     hvcc_at, entry_at, stsd_at, stbl_at, minf_at, mdia_at, trak_at, moov_at,
                 ],
@@ -2346,11 +2411,14 @@ mod tests {
         let feed = pipe("open-gop");
         let (mut init, _, _) = read_all(&feed);
         let video = init.video().expect("HEVC video").clone();
-        // HEVC prefix-SEI NALs. The payloads are intentionally tiny because
-        // this test exercises placement and identity, not the semantics of
-        // the mastering values themselves.
-        let mastering = [0x4e, 0x01, 137, 1, 0, 0x80];
-        let content_light = [0x4e, 0x01, 144, 1, 0, 0x80];
+        // HEVC prefix-SEI NALs with the exact payload lengths standardized for
+        // the mdcv (24 bytes) and clli (4 bytes) sample-entry boxes.
+        let mut mastering = vec![0x4e, 0x01, 137, 24];
+        mastering.extend_from_slice(&[0; 24]);
+        mastering.push(0x80);
+        let mut content_light = vec![0x4e, 0x01, 144, 4];
+        content_light.extend_from_slice(&[0; 4]);
+        content_light.push(0x80);
         let vcl = [0x26, 0x01, 0x80];
         let fragment = fragment_with_first_video_sample(
             video.id,
@@ -2368,6 +2436,8 @@ mod tests {
             hvcc_hdr10_sei_types(&init.bytes[location.payload]).expect("reading enriched hvcC");
         types.sort_unstable();
         assert_eq!(types, vec![137, 144]);
+        assert!(location.has_mdcv, "the recommended mdcv box is absent");
+        assert!(location.has_clli, "the recommended clli box is absent");
 
         // Every enclosing box size was grown consistently: the ordinary
         // reader must still accept the complete initialization segment.
