@@ -38,7 +38,9 @@ composes those same targets and records which behavior contracts they cover.
 ```bash
 make            # list every target
 make run        # serve http://localhost:32400
-make check      # catalog + fmt-check + clippy + test  (mandatory baseline)
+make check      # history + operations + catalog + Rust gate (mandatory baseline)
+make history-check # every corrective commit has current evidence
+make operations-check # deploy, CI, container, and ship contracts
 make validate-help # explain profiles, normal workflow, and the UI golden
 make validate-plan # show what the staged diff selects without running checks
 make validate-staged # validate only the staged change (normal local loop)
