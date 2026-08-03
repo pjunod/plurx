@@ -13,7 +13,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use plurx_core::domain::MediaFile;
 use plurx_core::playback::{self, Decision};
-use plurx_core::tracks::is_bitmap_subtitle;
+use plurx_core::tracks::{is_bitmap_subtitle, is_native_text_subtitle};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
@@ -244,6 +244,21 @@ pub struct SubTrackDto {
     /// Text subs convert to WebVTT for a selectable `<track>`; bitmap subs
     /// (PGS/VobSub) can't and are only burnable via transcode.
     pub text: bool,
+    /// Can this track become a native HLS WebVTT rendition?
+    ///
+    /// NOT the same question as `text`, and the difference has bitten every
+    /// client that assumed it was: ASS/SSA carry text, so `text` is true, but
+    /// their authored positioning and typefaces do not survive WebVTT
+    /// conversion — so the master never advertises them and
+    /// `POST …/hls/sessions` rejects one with "the selected subtitle requires
+    /// burn-in". A client that routes on `text` therefore asks for a session
+    /// the server refuses, and the natural recovery from that refusal is the
+    /// burn this whole arc exists to avoid.
+    ///
+    /// Computed by the same `is_native_text_subtitle` the HLS master and that
+    /// 400 use, so there is one classifier rather than a copy of the codec
+    /// list in each client. Additive: older clients ignore it.
+    pub native: bool,
 }
 
 /// A compact description of the source file's video, for the stats overlay's
@@ -417,6 +432,7 @@ fn sub_tracks(file: &MediaFile) -> Vec<SubTrackDto> {
             default: s.default,
             forced: s.forced,
             text: !is_bitmap_subtitle(&s.codec),
+            native: is_native_text_subtitle(&s.codec),
         })
         .collect()
 }
@@ -1561,5 +1577,70 @@ mod tests {
                 .is_none(),
             "a null probe must stay null — the repair job keys on it"
         );
+    }
+
+    #[test]
+    fn native_is_not_the_same_question_as_text() {
+        fn sub(codec: &str) -> plurx_core::domain::SubtitleStream {
+            plurx_core::domain::SubtitleStream {
+                index: 0,
+                codec: codec.into(),
+                ..Default::default()
+            }
+        }
+        let file = MediaFile {
+            id: 1,
+            item_id: 1,
+            path: "/media/anime.mkv".into(),
+            size: 1,
+            mtime: 1,
+            duration_ms: Some(1_000),
+            container: Some("mkv".into()),
+            video_codec: Some("hevc".into()),
+            video_profile: None,
+            width: Some(1920),
+            height: Some(1080),
+            bit_depth: Some(8),
+            hdr: None,
+            hdr_format: None,
+            bitrate: Some(1_000),
+            audio_streams: vec![],
+            subtitle_streams: vec![
+                sub("subrip"),
+                sub("ass"),
+                sub("ssa"),
+                sub("hdmv_pgs_subtitle"),
+                sub("webvtt"),
+            ],
+            scanned_at: 0,
+            audio_offset_ms: 0,
+            probed: true,
+        };
+        let tracks = sub_tracks(&file);
+
+        // SRT and WebVTT: text, and servable as a rendition.
+        assert!(tracks[0].text && tracks[0].native);
+        assert!(tracks[4].text && tracks[4].native);
+
+        // The trap. ASS/SSA carry text, so `text` is true — but their authored
+        // styling does not survive WebVTT, the master never advertises them,
+        // and `POST …/hls/sessions` rejects one. A client routing on `text`
+        // asks for a session the server refuses, and the natural recovery from
+        // that refusal is a burn.
+        assert!(tracks[1].text, "ASS carries text");
+        assert!(!tracks[1].native, "ASS cannot be a native rendition");
+        assert!(tracks[2].text && !tracks[2].native, "SSA likewise");
+
+        // Bitmap is neither, and always was.
+        assert!(!tracks[3].text && !tracks[3].native);
+
+        // And the field agrees with the classifier the master and the 400 use,
+        // rather than being a second opinion about the same codecs.
+        for (track, source) in tracks.iter().zip(&file.subtitle_streams) {
+            assert_eq!(
+                track.native,
+                plurx_core::tracks::is_native_text_subtitle(&source.codec)
+            );
+        }
     }
 }
