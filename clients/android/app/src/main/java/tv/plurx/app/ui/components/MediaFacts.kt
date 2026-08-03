@@ -1,5 +1,6 @@
 package tv.plurx.app.ui.components
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Row
@@ -12,16 +13,17 @@ import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.Tv
 import androidx.compose.material3.Icon
-import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.text.font.FontWeight
 import tv.plurx.app.data.AudioStream
 import tv.plurx.app.data.AudioTrack
 import tv.plurx.app.data.DynamicRange
@@ -66,12 +68,13 @@ internal fun MediaFactChip(fact: MediaFact, modifier: Modifier = Modifier) {
     // A downgraded chip keeps its border and dims its content — the same "off"
     // treatment as the web player's `.vbadge.off`, so the row reads at a glance
     // as "these are lit, that one isn't".
-    val alpha = if (fact.state == FactState.Downgraded) 0.45f else 0.78f
-    val color = LocalContentColor.current.copy(alpha = alpha)
+    val alpha = if (fact.state == FactState.Downgraded) 0.45f else 1f
+    val color = fact.brandColor.copy(alpha = alpha)
     Row(
         modifier = modifier
-            .border(0.5.dp, color.copy(alpha = alpha * 0.44f), CircleShape)
-            .padding(horizontal = 6.dp, vertical = 2.dp)
+            .background(color.copy(alpha = 0.12f), CircleShape)
+            .border(0.5.dp, color.copy(alpha = 0.5f), CircleShape)
+            .padding(horizontal = 7.dp, vertical = 3.dp)
             .clearAndSetSemantics { contentDescription = fact.accessibilityLabel },
         horizontalArrangement = Arrangement.spacedBy(4.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -80,12 +83,13 @@ internal fun MediaFactChip(fact: MediaFact, modifier: Modifier = Modifier) {
             imageVector = fact.icon,
             contentDescription = null,
             tint = color,
-            modifier = Modifier.size(14.dp),
+            modifier = Modifier.size(13.dp),
         )
         Text(
             text = fact.chipText,
             color = color,
             style = MaterialTheme.typography.labelSmall,
+            fontWeight = FontWeight.Bold,
         )
     }
 }
@@ -129,8 +133,26 @@ private val MediaFact.icon: ImageVector
         MediaFactKind.Audio -> Icons.Filled.GraphicEq
     }
 
+private val MediaFact.brandColor: Color
+    get() = when (kind) {
+        MediaFactKind.Resolution -> Color(0xFF66A8FF)
+        MediaFactKind.Video -> Color(0xFFABB6CA)
+        MediaFactKind.DynamicRange -> if (label.startsWith("DV")) {
+            Color(0xFFE7B94D)
+        } else {
+            Color(0xFF62CBBE)
+        }
+        MediaFactKind.Audio -> Color(0xFFA9B5FF)
+    }
+
 private fun resolutionFact(file: MediaFileDto?): MediaFact? {
     val label = resolutionLabel(file?.width, file?.height) ?: return null
+    return MediaFact(MediaFactKind.Resolution, label, label.lowercase())
+}
+
+/** A lightweight resolution badge for an item before its full media file is loaded. */
+internal fun itemResolutionFact(height: Long?): MediaFact? {
+    val label = resolutionLabel(null, height) ?: return null
     return MediaFact(MediaFactKind.Resolution, label, label.lowercase())
 }
 

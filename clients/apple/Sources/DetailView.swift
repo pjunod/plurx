@@ -26,26 +26,78 @@ struct ItemMetadataBadgeRow: View {
         #if os(tvOS)
         badgeContent
         #else
-        ScrollView(.horizontal, showsIndicators: false) {
-            badgeContent
+        let mediaBadges = badges.filter(Self.usesStyledMediaBadge(_:))
+        let plainFacts = badges.filter { !Self.usesStyledMediaBadge($0) }
+        VStack(alignment: .leading, spacing: 6) {
+            if !mediaBadges.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(mediaBadges) { badge in
+                            IOSWebMediaBadge(badge: badge)
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .clipped()
+            }
+
+            if !plainFacts.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 13) {
+                        ForEach(plainFacts) { badge in
+                            Text(Self.compactLabel(for: badge))
+                                .lineLimit(1)
+                                .accessibilityLabel(badge.accessibilityLabel)
+                        }
+                    }
+                    .font(.system(size: 12, weight: .medium, design: .rounded))
+                    .foregroundStyle(Palette.onBg.opacity(0.7))
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .clipped()
+            }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .clipped()
         #endif
     }
 
+    #if os(iOS)
+    static func compactLabel(for badge: ItemMetadataBadge) -> String {
+        if badge.kind == .resolution, badge.mark == nil {
+            return badge.accessibilityLabel
+        }
+        guard let mark = badge.mark else { return badge.accessibilityLabel }
+        if badge.kind == .runtime {
+            return mark
+                .replacingOccurrences(of: " hr ", with: "h ")
+                .replacingOccurrences(of: " hr", with: "h")
+                .replacingOccurrences(of: " min", with: "m")
+        }
+        return mark
+    }
+
+    static func usesStyledMediaBadge(_ badge: ItemMetadataBadge) -> Bool {
+        switch badge.kind {
+        case .resolution, .video, .dynamicRange:
+            return true
+        case .series, .episode, .year, .runtime:
+            return false
+        }
+    }
+    #endif
+
+    #if os(tvOS)
     private var badgeContent: some View {
-        HStack(spacing: badgeSpacing) {
+        HStack(spacing: 9) {
             ForEach(badges) { badge in
-                HStack(spacing: badgeContentSpacing) {
+                HStack(spacing: 6) {
                     Image(systemName: badge.symbol)
                     if let mark = badge.mark {
                         Text(mark)
                             .fontWeight(.semibold)
                     }
                 }
-                .padding(.horizontal, badgeHorizontalPadding)
-                .padding(.vertical, badgeVerticalPadding)
+                .padding(.horizontal, 9)
+                .padding(.vertical, 5)
                 .background(Palette.surfaceHi.opacity(0.84), in: Capsule())
                 .overlay {
                     Capsule().stroke(Palette.outline.opacity(0.72), lineWidth: 0.5)
@@ -54,47 +106,129 @@ struct ItemMetadataBadgeRow: View {
                 .accessibilityLabel(badge.accessibilityLabel)
             }
         }
-        #if os(tvOS)
         .font(.system(size: 19, weight: .medium, design: .rounded))
-        #else
-        .font(.system(.caption, design: .rounded).weight(.medium))
-        .padding(.horizontal, 1)
-        #endif
         .foregroundColor(Palette.onBg.opacity(0.86))
     }
+    #endif
+}
 
-    private var badgeSpacing: CGFloat {
-        #if os(tvOS)
-        return 9
-        #else
-        return 7
-        #endif
+#if os(iOS)
+struct IOSWebMediaBadge: View {
+    let badge: ItemMetadataBadge
+
+    var body: some View {
+        HStack(spacing: 4) {
+            IOSWebMediaGlyph(kind: badge.kind)
+                .frame(width: 12, height: 12)
+            Text(ItemMetadataBadgeRow.compactLabel(for: badge).uppercased())
+                .font(.system(size: 10, weight: .bold, design: .rounded))
+                .tracking(0.3)
+        }
+        .foregroundStyle(tint)
+        .padding(.horizontal, 6)
+        .padding(.vertical, 3)
+        .background(tint.opacity(0.14), in: Capsule())
+        .overlay {
+            Capsule().stroke(tint.opacity(0.46), lineWidth: 0.75)
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(badge.accessibilityLabel)
     }
 
-    private var badgeContentSpacing: CGFloat {
-        #if os(tvOS)
-        return 6
-        #else
-        return 4
-        #endif
-    }
-
-    private var badgeHorizontalPadding: CGFloat {
-        #if os(tvOS)
-        return 9
-        #else
-        return 7
-        #endif
-    }
-
-    private var badgeVerticalPadding: CGFloat {
-        #if os(tvOS)
-        return 5
-        #else
-        return 4
-        #endif
+    private var tint: Color {
+        switch badge.kind {
+        case .resolution:
+            return Color(red: 0.40, green: 0.66, blue: 1.0)
+        case .video:
+            return Palette.muted
+        case .dynamicRange:
+            return badge.accessibilityLabel.localizedCaseInsensitiveContains("Dolby")
+                ? Color(red: 0.79, green: 0.60, blue: 0.17)
+                : Color(red: 0.07, green: 0.70, blue: 0.65)
+        default:
+            return Palette.onBg
+        }
     }
 }
+
+/// A compact native rendering of the self-hosted Material glyphs used by the
+/// web client. Drawing them locally keeps both clients visually related without
+/// adding an icon font or network dependency to the Apple app.
+private struct IOSWebMediaGlyph: View {
+    let kind: ItemMetadataBadge.Kind
+
+    var body: some View {
+        Canvas { context, size in
+            let scale = min(size.width, size.height) / 24
+            context.scaleBy(x: scale, y: scale)
+
+            switch kind {
+            case .resolution:
+                var screen = Path()
+                screen.addRoundedRect(
+                    in: CGRect(x: 1.5, y: 3.5, width: 21, height: 15),
+                    cornerSize: CGSize(width: 1.8, height: 1.8)
+                )
+                context.stroke(screen, with: .foreground, lineWidth: 1.8)
+
+                var stand = Path()
+                stand.move(to: CGPoint(x: 8, y: 22))
+                stand.addLine(to: CGPoint(x: 16, y: 22))
+                stand.move(to: CGPoint(x: 12, y: 18.5))
+                stand.addLine(to: CGPoint(x: 12, y: 22))
+                context.stroke(stand, with: .foreground, lineWidth: 1.8)
+
+            case .video:
+                var clapper = Path()
+                clapper.addRoundedRect(
+                    in: CGRect(x: 2, y: 7.5, width: 20, height: 13),
+                    cornerSize: CGSize(width: 2, height: 2)
+                )
+                clapper.move(to: CGPoint(x: 2, y: 4))
+                clapper.addLine(to: CGPoint(x: 21, y: 4))
+                clapper.addLine(to: CGPoint(x: 22, y: 8))
+                clapper.addLine(to: CGPoint(x: 3, y: 8))
+                clapper.closeSubpath()
+                context.fill(clapper, with: .foreground)
+
+                for x in stride(from: CGFloat(6), through: 18, by: 6) {
+                    var cut = Path()
+                    cut.move(to: CGPoint(x: x - 2, y: 4))
+                    cut.addLine(to: CGPoint(x: x, y: 8))
+                    context.stroke(cut, with: .color(Palette.bg), lineWidth: 1.4)
+                }
+
+            case .dynamicRange:
+                context.fill(Self.sparkle(center: CGPoint(x: 9, y: 12), outer: 8, inner: 2.5), with: .foreground)
+                context.fill(Self.sparkle(center: CGPoint(x: 19, y: 5), outer: 4, inner: 1.3), with: .foreground)
+                context.fill(Self.sparkle(center: CGPoint(x: 19, y: 19), outer: 4, inner: 1.3), with: .foreground)
+
+            default:
+                break
+            }
+        }
+    }
+
+    private static func sparkle(center: CGPoint, outer: CGFloat, inner: CGFloat) -> Path {
+        var path = Path()
+        let points = [
+            CGPoint(x: center.x, y: center.y - outer),
+            CGPoint(x: center.x + inner, y: center.y - inner),
+            CGPoint(x: center.x + outer, y: center.y),
+            CGPoint(x: center.x + inner, y: center.y + inner),
+            CGPoint(x: center.x, y: center.y + outer),
+            CGPoint(x: center.x - inner, y: center.y + inner),
+            CGPoint(x: center.x - outer, y: center.y),
+            CGPoint(x: center.x - inner, y: center.y - inner),
+        ]
+        guard let first = points.first else { return path }
+        path.move(to: first)
+        points.dropFirst().forEach { path.addLine(to: $0) }
+        path.closeSubpath()
+        return path
+    }
+}
+#endif
 
 /// Clickable ancestors for a detail page. The server returns these outermost
 /// first, so an episode naturally reads "Show / Season" and a season reads
@@ -231,11 +365,12 @@ enum DetailLayoutMetrics {
 /// the useful controls below the fold. Control heights remain comfortably
 /// tappable while their typography and visual chrome stay restrained.
 enum IOSDetailMetrics {
-    static let compactHeroHeight: CGFloat = 220
+    static let compactHeroHeight: CGFloat = 285
     static let regularHeroHeight: CGFloat = 360
     static let contentOverlap: CGFloat = 28
-    static let primaryControlHeight: CGFloat = 50
+    static let primaryControlHeight: CGFloat = 46
     static let secondaryControlHeight: CGFloat = 44
+    static let iconControlSize: CGFloat = 46
     static let controlCornerRadius: CGFloat = 13
 }
 
@@ -285,6 +420,57 @@ private struct IOSDetailSecondaryActionButtonStyle: ButtonStyle {
             }
             .contentShape(Rectangle())
             .scaleEffect(configuration.isPressed ? 0.98 : 1)
+            .opacity(configuration.isPressed ? 0.72 : 1)
+            .animation(.easeOut(duration: 0.1), value: configuration.isPressed)
+    }
+}
+
+private struct IOSDetailIconActionButtonStyle: ButtonStyle {
+    let selected: Bool
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 16, weight: .semibold))
+            .foregroundStyle(selected ? Palette.accent : Palette.onBg.opacity(0.82))
+            .frame(width: IOSDetailMetrics.iconControlSize, height: IOSDetailMetrics.iconControlSize)
+            .background(
+                selected ? Palette.accent.opacity(0.13) : Palette.surfaceHi.opacity(0.88),
+                in: Circle()
+            )
+            .overlay {
+                Circle().stroke(
+                    selected ? Palette.accent.opacity(0.36) : Palette.outline.opacity(0.9),
+                    lineWidth: 0.75
+                )
+            }
+            .contentShape(Circle())
+            .scaleEffect(configuration.isPressed ? 0.94 : 1)
+            .opacity(configuration.isPressed ? 0.72 : 1)
+            .animation(.easeOut(duration: 0.1), value: configuration.isPressed)
+    }
+}
+
+private struct IOSDetailLabeledActionButtonStyle: ButtonStyle {
+    let selected: Bool
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 12, weight: .semibold, design: .rounded))
+            .foregroundStyle(selected ? Palette.accent : Palette.onBg.opacity(0.82))
+            .frame(minWidth: 82, minHeight: IOSDetailMetrics.iconControlSize)
+            .padding(.horizontal, 7)
+            .background(
+                selected ? Palette.accent.opacity(0.13) : Palette.surfaceHi.opacity(0.88),
+                in: Capsule()
+            )
+            .overlay {
+                Capsule().stroke(
+                    selected ? Palette.accent.opacity(0.36) : Palette.outline.opacity(0.9),
+                    lineWidth: 0.75
+                )
+            }
+            .contentShape(Capsule())
+            .scaleEffect(configuration.isPressed ? 0.96 : 1)
             .opacity(configuration.isPressed ? 0.72 : 1)
             .animation(.easeOut(duration: 0.1), value: configuration.isPressed)
     }
@@ -521,9 +707,173 @@ struct DetailView: View {
             tvPlayableContent(detail)
         }
         #else
-        standardContent(detail)
+        if horizontalSizeClass == .compact {
+            mobileContent(detail)
+        } else {
+            standardContent(detail)
+        }
         #endif
     }
+
+    #if os(iOS)
+    /// Phone detail is a single poster-like composition: identity lives in the
+    /// artwork, then playback, progress, and summary follow in a compact rhythm.
+    /// This intentionally avoids the old "image, heading, pills, button stack"
+    /// structure.
+    private func mobileContent(_ detail: ItemDetail) -> some View {
+        let item = detail.item
+        let ancestors = detail.ancestors ?? []
+        let file = detail.files?.first
+        let durationMs = file?.durationMs ?? item.runtimeMs
+        let resumeMs = item.watch?.positionMs ?? 0
+        let nearlyDone = (durationMs ?? 0) > 0
+            && Double(resumeMs) > Double(durationMs!) * 0.95
+        let canResume = resumeMs > 3000 && !nearlyDone
+
+        return VStack(alignment: .leading, spacing: 0) {
+            ZStack(alignment: .bottomLeading) {
+                AuthImage(path: item.backdrop ?? item.poster)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .clipped()
+
+                LinearGradient(
+                    stops: [
+                        .init(color: .black.opacity(0.08), location: 0),
+                        .init(color: Palette.bg.opacity(0.08), location: 0.42),
+                        .init(color: Palette.bg.opacity(0.76), location: 0.72),
+                        .init(color: Palette.bg, location: 1)
+                    ],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+
+                DetailBodyFrame {
+                    VStack(alignment: .leading, spacing: 7) {
+                        if !ancestors.isEmpty {
+                            DetailBreadcrumb(ancestors: ancestors)
+                        }
+
+                        Text(item.title)
+                            .font(.system(size: 29, weight: .heavy, design: .rounded))
+                            .foregroundStyle(Palette.onBg)
+                            .lineLimit(2)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .shadow(color: .black.opacity(0.7), radius: 10, y: 3)
+
+                        ItemMetadataBadgeRow(badges: Self.itemMetadataBadges(
+                            item,
+                            file: file,
+                            durationMs: durationMs,
+                            includeSeries: ancestors.isEmpty
+                        ))
+                    }
+                }
+                .padding(.bottom, 16)
+            }
+            .frame(maxWidth: .infinity)
+            .frame(height: IOSDetailMetrics.compactHeroHeight)
+            .clipped()
+            .accessibilityElement(children: .contain)
+
+            DetailBodyFrame {
+                VStack(alignment: .leading, spacing: 14) {
+                    mobileProgress(
+                        durationMs: durationMs ?? 0,
+                        resumeMs: resumeMs,
+                        canResume: canResume
+                    )
+
+                    mobileActions(
+                        detail,
+                        file: file,
+                        durationMs: durationMs ?? 0,
+                        resumeMs: resumeMs,
+                        canResume: canResume
+                    )
+
+                    if let actionError {
+                        Text(actionError)
+                            .font(.caption)
+                            .foregroundStyle(Palette.accent)
+                    }
+
+                    if let overview = item.overview, !overview.isEmpty {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("ABOUT")
+                                .font(.system(size: 10, weight: .bold, design: .rounded))
+                                .tracking(1.5)
+                                .foregroundStyle(Palette.accent.opacity(0.9))
+                            Text(overview)
+                                .font(.subheadline)
+                                .foregroundStyle(Palette.onBg.opacity(0.76))
+                                .lineSpacing(3)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        .padding(.top, 3)
+                    }
+                }
+            }
+            .padding(.top, 10)
+
+            if let children = detail.children, !children.isEmpty {
+                MediaRow(title: childrenHeading(item.kind), items: children)
+                    .padding(.top, 18)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.bottom, 30)
+    }
+
+    @ViewBuilder
+    private func mobileProgress(durationMs: Int, resumeMs: Int, canResume: Bool) -> some View {
+        if canResume, durationMs > 0 {
+            VStack(spacing: 6) {
+                GeometryReader { geometry in
+                    ZStack(alignment: .leading) {
+                        Capsule().fill(Palette.surfaceHi)
+                        Capsule()
+                            .fill(Palette.accent)
+                            .frame(
+                                width: max(
+                                    5,
+                                    geometry.size.width * Self.resumeFraction(
+                                        positionMs: resumeMs,
+                                        durationMs: durationMs
+                                    )
+                                )
+                            )
+                    }
+                }
+                .frame(height: 3)
+
+                HStack {
+                    Text(formatTime(resumeMs))
+                    Spacer()
+                    Text(Self.compactRuntimeLabel(durationMs))
+                }
+                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                .foregroundStyle(Palette.muted)
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(
+                "\(formatTime(resumeMs)) of \(Self.compactRuntimeLabel(durationMs)) watched"
+            )
+        }
+    }
+
+    static func resumeFraction(positionMs: Int, durationMs: Int) -> CGFloat {
+        guard durationMs > 0 else { return 0 }
+        return min(1, max(0, CGFloat(positionMs) / CGFloat(durationMs)))
+    }
+
+    static func compactRuntimeLabel(_ durationMs: Int) -> String {
+        let totalMinutes = max(1, durationMs / 60_000)
+        let hours = totalMinutes / 60
+        let minutes = totalMinutes % 60
+        if hours == 0 { return "\(minutes)m" }
+        return minutes == 0 ? "\(hours)h" : "\(hours)h \(minutes)m"
+    }
+    #endif
 
     private func standardContent(_ detail: ItemDetail) -> some View {
         let item = detail.item
@@ -1136,9 +1486,9 @@ struct DetailView: View {
     }
 
     #if os(iOS)
-    /// A single strong playback control carries the hierarchy. Resume-related
-    /// and watch-state actions share one quiet row instead of forming a stack
-    /// of equally loud full-width pills.
+    /// Playback stays dominant while the two secondary commands collapse to
+    /// familiar, accessible icon controls. Nothing on the phone needs a second
+    /// row of large text buttons.
     @ViewBuilder
     private func mobileActions(
         _ detail: ItemDetail,
@@ -1169,7 +1519,7 @@ struct DetailView: View {
             }
             .frame(maxWidth: hasPlayback ? .infinity : 220, alignment: .leading)
         } else {
-            VStack(alignment: .leading, spacing: 9) {
+            HStack(spacing: 10) {
                 if let file, item.isPlayable {
                     resumeButton(
                         item: item,
@@ -1180,15 +1530,50 @@ struct DetailView: View {
                     )
                 }
 
-                HStack(spacing: 9) {
-                    if let file, item.isPlayable, canResume {
-                        startOverButton(item: item, file: file, durationMs: durationMs)
-                    }
-                    watchButton(detail)
+                if let file, item.isPlayable, canResume {
+                    mobileStartOverButton(item: item, file: file, durationMs: durationMs)
                 }
-                .frame(maxWidth: hasSecondaryPair ? .infinity : 190, alignment: .leading)
+
+                mobileWatchButton(detail)
             }
+            .frame(maxWidth: hasPlayback || hasSecondaryPair ? .infinity : nil, alignment: .leading)
         }
+    }
+
+    private func mobileStartOverButton(
+        item: Item,
+        file: MediaFile,
+        durationMs: Int
+    ) -> some View {
+        Button {
+            play = PlayContext(
+                itemId: item.id,
+                fileId: file.id,
+                startMs: 0,
+                durationMs: durationMs,
+                title: item.title,
+                subtitle: playbackSubtitle(item),
+                year: item.year,
+                overview: item.overview
+            )
+        } label: {
+            Image(systemName: "arrow.counterclockwise")
+        }
+        .buttonStyle(IOSDetailIconActionButtonStyle(selected: false))
+        .accessibilityLabel("Start over")
+    }
+
+    private func mobileWatchButton(_ detail: ItemDetail) -> some View {
+        let watched = isWatched(detail.item)
+        return Button {
+            Task { await toggleWatched(detail.item, watched: watched) }
+        } label: {
+            Label("Watched", systemImage: watched ? "checkmark.circle.fill" : "checkmark.circle")
+                .lineLimit(1)
+        }
+        .buttonStyle(IOSDetailLabeledActionButtonStyle(selected: watched))
+        .disabled(watchBusy)
+        .accessibilityLabel(watched ? "Mark unwatched" : "Mark watched")
     }
     #endif
 

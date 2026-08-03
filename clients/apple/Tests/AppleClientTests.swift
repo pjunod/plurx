@@ -2079,16 +2079,65 @@ final class AppleClientTests: XCTestCase {
         }
     }
 
-    func testPhoneDetailKeepsArtworkAndControlsCompactButTappable() {
-        XCTAssertLessThanOrEqual(IOSDetailMetrics.compactHeroHeight, 230)
-        XCTAssertGreaterThan(IOSDetailMetrics.contentOverlap, 0)
+    func testPhoneDetailUsesAnIntegratedHeroAndCompactControls() {
+        XCTAssertGreaterThanOrEqual(IOSDetailMetrics.compactHeroHeight, 260)
+        XCTAssertLessThanOrEqual(IOSDetailMetrics.compactHeroHeight, 300)
         XCTAssertGreaterThanOrEqual(IOSDetailMetrics.primaryControlHeight, 44)
-        XCTAssertLessThanOrEqual(IOSDetailMetrics.primaryControlHeight, 52)
+        XCTAssertLessThanOrEqual(IOSDetailMetrics.primaryControlHeight, 48)
         XCTAssertGreaterThanOrEqual(IOSDetailMetrics.secondaryControlHeight, 44)
-        XCTAssertLessThan(
-            IOSDetailMetrics.secondaryControlHeight,
-            IOSDetailMetrics.primaryControlHeight
+        XCTAssertEqual(IOSDetailMetrics.iconControlSize, 46)
+    }
+
+    func testPhoneMetadataUsesCompactTextWithoutMediaPictograms() {
+        let badges = [
+            ItemMetadataBadge(
+                kind: .year,
+                symbol: "calendar",
+                mark: "2025",
+                accessibilityLabel: "2025"
+            ),
+            ItemMetadataBadge(
+                kind: .runtime,
+                symbol: "clock.fill",
+                mark: "1 hr 58 min",
+                accessibilityLabel: "1 hr 58 min"
+            ),
+            ItemMetadataBadge(
+                kind: .resolution,
+                symbol: "4k.tv.fill",
+                mark: nil,
+                accessibilityLabel: "4K"
+            ),
+        ]
+
+        XCTAssertEqual(
+            badges.map(ItemMetadataBadgeRow.compactLabel(for:)),
+            ["2025", "1h 58m", "4K"]
         )
+        XCTAssertEqual(
+            badges.map(ItemMetadataBadgeRow.usesStyledMediaBadge(_:)),
+            [false, false, true]
+        )
+    }
+
+    func testPhoneResumeProgressIsClampedAndRuntimeIsTerse() {
+        XCTAssertEqual(DetailView.compactRuntimeLabel(7_080_000), "1h 58m")
+        XCTAssertEqual(DetailView.resumeFraction(positionMs: -1, durationMs: 100), 0)
+        XCTAssertEqual(DetailView.resumeFraction(positionMs: 25, durationMs: 100), 0.25)
+        XCTAssertEqual(DetailView.resumeFraction(positionMs: 200, durationMs: 100), 1)
+    }
+
+    func testPhoneHomeUsesOneCompactContinueFeature() {
+        let first = Item(id: 1, kind: "movie", title: "First")
+        let second = Item(id: 2, kind: "movie", title: "Second")
+
+        XCTAssertTrue(HomeLayoutPolicy.usesFeaturedHero)
+        XCTAssertEqual(
+            HomeLayoutPolicy.continueWatchingShelfItems([first, second]).map(\.id),
+            [2]
+        )
+        XCTAssertLessThanOrEqual(HomeHeroMetrics.compactHeight, 250)
+        XCTAssertGreaterThanOrEqual(HomeHeroMetrics.cornerRadius, 16)
     }
     #endif
 
