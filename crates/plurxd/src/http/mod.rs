@@ -3356,6 +3356,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shared_native_api_fixture_uses_the_servers_live_wire_keys() {
+        const FIXTURE: &str = include_str!("../../../../tests/contracts/native-api.json");
+
+        fn assert_pointers(contract: &Value, live: &Value, pointers: &[&str]) {
+            for pointer in pointers {
+                let expected = contract
+                    .pointer(pointer)
+                    .unwrap_or_else(|| panic!("contract fixture has no {pointer}"));
+                let actual = live
+                    .pointer(pointer)
+                    .unwrap_or_else(|| panic!("live response has no {pointer}: {live}"));
+                if !actual.is_null() {
+                    assert_eq!(
+                        std::mem::discriminant(expected),
+                        std::mem::discriminant(actual),
+                        "wire type changed at {pointer}: fixture={expected}, live={actual}"
+                    );
+                }
+            }
+        }
+
+        let contract: Value = serde_json::from_str(FIXTURE).expect("native API fixture JSON");
+        let (app, state) = test_state();
+        let admin = setup_admin(&app).await;
+        let seeded = seed_content(&state).await;
+
+        let (_, server) = call(&app, get("/api/v1/server", None)).await;
+        assert_pointers(
+            &contract["server"],
+            &server,
+            &[
+                "/setup_required",
+                "/name",
+                "/version",
+                "/build",
+                "/instance_id",
+            ],
+        );
+
+        let (_, detail) = call(
+            &app,
+            get(&format!("/api/v1/items/{}", seeded.ep), Some(&admin)),
+        )
+        .await;
+        assert_pointers(
+            &contract["item_detail"],
+            &detail,
+            &[
+                "/item/id",
+                "/item/library_id",
+                "/item/kind",
+                "/item/title",
+                "/item/added_at",
+                "/item/updated_at",
+                "/item/tags",
+                "/item/genres",
+                "/files/0/id",
+                "/files/0/filename",
+                "/files/0/video_codec",
+                "/files/0/audio_streams",
+                "/files/0/subtitle_streams",
+                "/files/0/available",
+                "/files/0/probed",
+                "/children",
+                "/ancestors",
+            ],
+        );
+
+        let (_, page) = call(
+            &app,
+            get(
+                &format!("/api/v1/libraries/{}/items", seeded.lib),
+                Some(&admin),
+            ),
+        )
+        .await;
+        assert_pointers(
+            &contract["page"],
+            &page,
+            &["/items", "/total", "/offset", "/limit"],
+        );
+
+        let (_, decision) = call(
+            &app,
+            get(
+                &format!(
+                    "/api/v1/files/{}/decision?vcodec=h264,hevc&acodec=aac&container=mp4&hdr=1",
+                    seeded.file
+                ),
+                Some(&admin),
+            ),
+        )
+        .await;
+        assert_pointers(
+            &contract["decision"],
+            &decision,
+            &[
+                "/file_id",
+                "/method",
+                "/play_url",
+                "/delivery/mode",
+                "/source/container",
+                "/reasons",
+                "/audio",
+                "/subtitles",
+                "/markers",
+                "/ladder",
+                "/audio_offset_ms",
+                "/delivered_dynamic_range",
+            ],
+        );
+    }
+
+    #[tokio::test]
     async fn seeded_write_surface() {
         let (app, state) = test_state();
         let admin = setup_admin(&app).await;

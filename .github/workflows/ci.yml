@@ -31,6 +31,10 @@ jobs:
       # is an absent dependency rather than anything wrong with the tree.
       - name: Install ffmpeg
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Install the deterministic UI browser
+        run: |
+          python3 -m pip install playwright
+          python3 -m playwright install --with-deps chromium
       # The catalog always includes `make check`, then adds checks selected by
       # the impact graph: web syntax/contrast for web changes and Android
       # unit/lint for Android changes. A missing or all-zero event base falls
@@ -53,6 +57,52 @@ jobs:
         with:
           name: validation-evidence
           path: target/validation
+          if-no-files-found: warn
+
+  apple:
+    name: Apple iOS + tvOS tests
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select the pinned Xcode and install the project generator
+        run: |
+          sudo xcode-select -s /Applications/Xcode_16.4.app
+          brew install xcodegen
+      - name: Run the shared XCTest suite on both platforms
+        env:
+          APPLE_IOS_SIM: platform=iOS Simulator,name=iPhone 16 Pro,OS=18.5
+          APPLE_TVOS_SIM: platform=tvOS Simulator,name=Apple TV 4K (3rd generation),OS=18.5
+        run: make apple-test
+
+  android-device:
+    name: Android instrumented UI tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Enable emulator acceleration
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Build app and instrumentation APKs in the pinned toolchain
+        run: make android-instrumentation-build
+      - name: Run the Compose and TV focus suite on a disposable emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_7_pro
+          script: PLURX_ANDROID_SERIAL="emulator-${EMULATOR_PORT}" make android-instrumentation-run
+      - name: Upload Android test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-instrumentation-reports
+          path: |
+            clients/android/app/build/reports/androidTests
+            clients/android/app/build/outputs/androidTest-results
           if-no-files-found: warn
 
   coverage:
@@ -194,9 +244,9 @@ jobs:
           build-args: |
             PLURX_BUILD_REF=${{ github.ref_name }}
 
-  # PR / branch smoke test that the image builds, without publishing.
+  # PR / branch smoke test that the image both builds and runs, without publishing.
   docker:
-    name: docker build
+    name: docker runtime smoke
     runs-on: ubuntu-latest
     needs: check
     if: "!startsWith(github.ref, 'refs/tags/v')"
@@ -207,5 +257,8 @@ jobs:
         with:
           context: .
           push: false
+          load: true
           platforms: linux/amd64
           tags: plurx/plurxd:ci
+      - name: Start, probe, restart, and re-probe the image
+        run: scripts/container-smoke plurx/plurxd:ci

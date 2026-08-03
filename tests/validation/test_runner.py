@@ -5,6 +5,7 @@ import dataclasses
 import io
 import json
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
@@ -12,6 +13,7 @@ import xml.etree.ElementTree as ET
 from validation.runner import (
     CatalogError,
     CheckResult,
+    changed_paths,
     execute_checks,
     glob_regex,
     lint_catalog,
@@ -74,14 +76,20 @@ class CatalogCase(unittest.TestCase):
         self.assertIsNotNone(pattern.match("web/player/app.js"))
         self.assertIsNone(pattern.match("web/player/app.css"))
 
-    def test_selection_expands_dependencies_and_deduplicates_checks(self):
+    def test_provider_change_expands_consumers_and_deduplicates_checks(self):
         catalog = self.load()
-        selection = select_points(catalog, ("web/player/app.js",))
+        selection = select_points(catalog, ("src/domain.py",))
         self.assertEqual(selection.point_ids, ("core", "web"))
+        self.assertEqual(selection.reasons["web"], ("consumer:core",))
         self.assertEqual(
             tuple(check.id for check in selected_checks(catalog, selection, "full")),
             ("baseline", "browser"),
         )
+
+    def test_consumer_change_does_not_point_upstream(self):
+        catalog = self.load()
+        selection = select_points(catalog, ("web/player/app.js",))
+        self.assertEqual(selection.point_ids, ("web",))
 
     def test_profile_keeps_mandatory_baseline_when_slow_check_is_ineligible(self):
         catalog = self.load()
@@ -95,6 +103,27 @@ class CatalogCase(unittest.TestCase):
         catalog = self.load(CATALOG.replace('checks = ["browser", "baseline"]', 'checks = ["missing"]'))
         errors = lint_catalog(catalog, audit=False)
         self.assertIn("point web references unknown check missing", errors)
+
+    def test_lint_rejects_duplicate_ids_and_dependency_cycles(self):
+        duplicate = self.load(CATALOG + """
+
+[[points]]
+id = "core"
+title = "Duplicate core"
+contract = "This must be rejected."
+paths = ["duplicate/**"]
+checks = ["baseline"]
+""")
+        self.assertIn("duplicate point id: core", lint_catalog(duplicate, audit=False))
+
+        cycle_text = CATALOG.replace(
+            'paths = ["src/**"]\nchecks = ["baseline"]',
+            'paths = ["src/**"]\nchecks = ["baseline"]\ndepends_on = ["web"]',
+        )
+        cycle = self.load(cycle_text)
+        self.assertTrue(
+            any(error.startswith("point dependency cycle:") for error in lint_catalog(cycle, audit=False))
+        )
 
     def test_unknown_named_point_is_an_error(self):
         catalog = self.load()
@@ -130,6 +159,41 @@ class CatalogCase(unittest.TestCase):
         self.assertEqual(optional[0].status, "skipped")
         self.assertEqual(strict[0].status, "failed")
         self.assertIn("missing files", optional[0].message)
+
+    def test_staged_path_resolution_handles_added_and_renamed_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Validation Test"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "validation@example.invalid"], cwd=root, check=True)
+            original = root / "old name.txt"
+            original.write_text("old\n", encoding="utf-8")
+            subprocess.run(["git", "add", "old name.txt"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "seed"], cwd=root, check=True)
+            original.rename(root / "new name.txt")
+            (root / "added.txt").write_text("new\n", encoding="utf-8")
+            subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+
+            self.assertEqual(changed_paths(root, "staged"), ("added.txt", "new name.txt"))
+
+    def test_timeout_and_fail_fast_are_recorded_as_failures(self):
+        catalog = self.load()
+        timeout = dataclasses.replace(
+            catalog.check_map["baseline"],
+            command="python3 -c 'import time; time.sleep(2)'",
+            timeout_seconds=1,
+        )
+        never = catalog.check_map["browser"]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with contextlib.redirect_stdout(io.StringIO()):
+                results = execute_checks(
+                    (timeout, never), root, root / "artifacts", strict=True, fail_fast=True
+                )
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].status, "failed")
+        self.assertEqual(results[0].returncode, 124)
+        self.assertIn("timed out", results[0].output)
 
     def test_reports_preserve_point_status_and_parse_as_junit(self):
         catalog = self.load()

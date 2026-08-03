@@ -196,6 +196,8 @@ make check        # catalog + fmt-check + clippy + test — mandatory baseline
 make validate-help # explain the validation workflow and UI golden
 make validate-staged # validate the functionality points in the staged diff
 make validate     # point-aware local gate; adds checks for non-Rust surfaces
+make validate-full # browser, native clients, device (opt-in), and container runtime
+make validate-nightly # exhaustive playback/recovery/resource-bound tier
 make hooks        # validate functionality points affected by each staged commit
 make playback-smoke # real-browser matrix; Chrome default, Safari/Edge/Firefox targets available
 ```

@@ -22,6 +22,13 @@ private struct LayoutFramePreferenceKey: PreferenceKey {
     }
 }
 
+private struct NativeAPIContractFixture: Decodable {
+    let server: ServerInfo
+    let itemDetail: ItemDetail
+    let page: Page
+    let decision: Decision
+}
+
 private extension View {
     func reportLayoutWidth() -> some View {
         background {
@@ -78,6 +85,27 @@ final class AppleClientTests: XCTestCase {
         Session.shared.origin = ""
         Session.shared.token = nil
         super.tearDown()
+    }
+
+    func testSharedNativeAPIFixtureDecodesWithoutConsumerDrift() throws {
+        let fixtureURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("tests/contracts/native-api.json")
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let fixture = try decoder.decode(
+            NativeAPIContractFixture.self,
+            from: Data(contentsOf: fixtureURL)
+        )
+
+        XCTAssertEqual(fixture.server.name, "Contract server")
+        XCTAssertEqual(fixture.itemDetail.item.title, "The Contract")
+        XCTAssertEqual(fixture.page.items?.first?.rollup?.leaves, 20)
+        XCTAssertEqual(fixture.decision.delivery?.mode, "remux")
+        XCTAssertEqual(fixture.decision.deliveredDynamicRange, "dolby_vision")
     }
 
     func testAppVersionLabelIncludesThePackageBuild() {
@@ -219,13 +247,14 @@ final class AppleClientTests: XCTestCase {
     /// the deleted `?? matching.first` tail used to buy.
     @MainActor
     func testAutomaticSubtitlePolicyPinsAllFourRowsOfTheSubtitleRule() {
-        // Row 1 — forced, whatever the codec. A forced PGS is the one burn
+        // Row 1 — a forced track selected by the server (the `default` wire
+        // flag is its pick), whatever the codec. A forced PGS is the one burn
         // automatic selection is allowed to start, because a film whose foreign
         // dialogue is unsubtitled is not watchable at all.
         let forcedBitmap = [
             SubtitleTrack(
                 index: 0, codec: "hdmv_pgs_subtitle", language: "eng", title: "Forced",
-                default: false, forced: true, text: false
+                default: true, forced: true, text: false
             ),
             SubtitleTrack(
                 index: 1, codec: "subrip", language: "eng", title: "Regular",
@@ -233,7 +262,7 @@ final class AppleClientTests: XCTestCase {
             ),
         ]
         XCTAssertEqual(
-            PlayerController.automaticSubtitleIndex(forcedBitmap, preferredLanguage: "eng"),
+            PlayerController.automaticSubtitleIndex(forcedBitmap),
             0,
             "forced-PGS is the one permitted automatic burn"
         )
@@ -242,12 +271,12 @@ final class AppleClientTests: XCTestCase {
         let titleOnlyForcedBitmap = [
             SubtitleTrack(
                 index: 0, codec: "hdmv_pgs_subtitle", language: "eng", title: "Forced Narrative",
-                default: false, forced: false, text: false
+                default: true, forced: false, text: false
             ),
         ]
         XCTAssertTrue(PlayerController.isForcedSubtitle(titleOnlyForcedBitmap[0]))
         XCTAssertEqual(
-            PlayerController.automaticSubtitleIndex(titleOnlyForcedBitmap, preferredLanguage: "eng"),
+            PlayerController.automaticSubtitleIndex(titleOnlyForcedBitmap),
             0
         )
 
@@ -260,7 +289,7 @@ final class AppleClientTests: XCTestCase {
             ),
         ]
         XCTAssertEqual(
-            PlayerController.automaticSubtitleIndex(defaultText, preferredLanguage: "eng"),
+            PlayerController.automaticSubtitleIndex(defaultText),
             0
         )
 
@@ -273,7 +302,7 @@ final class AppleClientTests: XCTestCase {
             ),
         ]
         XCTAssertNil(
-            PlayerController.automaticSubtitleIndex(defaultBitmapOnly, preferredLanguage: "eng"),
+            PlayerController.automaticSubtitleIndex(defaultBitmapOnly),
             "a default-flagged bitmap track must never cold-start a burn transcode"
         )
         let defaultStyled = [
@@ -283,7 +312,7 @@ final class AppleClientTests: XCTestCase {
             ),
         ]
         XCTAssertNil(
-            PlayerController.automaticSubtitleIndex(defaultStyled, preferredLanguage: "eng"),
+            PlayerController.automaticSubtitleIndex(defaultStyled),
             "styled ASS cannot become a WebVTT rendition, so it burns — never automatically"
         )
 
@@ -307,9 +336,7 @@ final class AppleClientTests: XCTestCase {
             ),
         ]
         XCTAssertNil(
-            PlayerController.automaticSubtitleIndex(
-                unflaggedText, preferredLanguage: "eng", audioLanguage: "eng"
-            )
+            PlayerController.automaticSubtitleIndex(unflaggedText)
         )
         let unflaggedBitmapOnly = [
             SubtitleTrack(
@@ -318,23 +345,19 @@ final class AppleClientTests: XCTestCase {
             ),
         ]
         XCTAssertNil(
-            PlayerController.automaticSubtitleIndex(
-                unflaggedBitmapOnly, preferredLanguage: "eng", audioLanguage: "eng"
-            ),
+            PlayerController.automaticSubtitleIndex(unflaggedBitmapOnly),
             "unflagged English PGS only: cold start must attach no encoder"
         )
 
-        // The language guard survives the rewrite: a flagged Italian default
-        // never captions an English-audio film.
+        // Language policy belongs to the server. If it marks this Italian
+        // native track as the selection, the client applies that answer.
         let italianDefault = [
             SubtitleTrack(
                 index: 0, codec: "subrip", language: "ita", title: "Italiano",
                 default: true, forced: false, text: true
             ),
         ]
-        XCTAssertNil(
-            PlayerController.automaticSubtitleIndex(italianDefault, preferredLanguage: "eng")
-        )
+        XCTAssertEqual(PlayerController.automaticSubtitleIndex(italianDefault), 0)
     }
 
     /// The no-overlap guard stays (two replacements share a `playback_id`), but
@@ -1253,9 +1276,7 @@ final class AppleClientTests: XCTestCase {
         // whole rule, not a failure. English audio, so the server's Auto mode
         // leaves only the floor eligible and the unflagged native SDH track is
         // not it.
-        XCTAssertNil(PlayerController.automaticSubtitleIndex(
-            tracks, preferredLanguage: "eng", audioLanguage: "eng"
-        ))
+        XCTAssertNil(PlayerController.automaticSubtitleIndex(tracks))
 
         // The same file with the native track flagged instead: now automatic
         // selection has something free to take.
@@ -1269,7 +1290,7 @@ final class AppleClientTests: XCTestCase {
                 default: true, forced: false, text: true, native: true
             ),
         ]
-        XCTAssertEqual(PlayerController.automaticSubtitleIndex(flagged, preferredLanguage: "eng"), 2)
+        XCTAssertEqual(PlayerController.automaticSubtitleIndex(flagged), 2)
 
         // The forced carve-out is unchanged and still reaches a burn: a forced
         // `mov_text` track is dialogue the film needs, so it burns at source
@@ -1281,7 +1302,7 @@ final class AppleClientTests: XCTestCase {
             ),
         ]
         XCTAssertEqual(
-            PlayerController.automaticSubtitleIndex(forcedMovText, preferredLanguage: "eng"),
+            PlayerController.automaticSubtitleIndex(forcedMovText),
             0
         )
         XCTAssertTrue(PlayerController.subtitleRequiresBurn(0, in: forcedMovText))
@@ -2404,7 +2425,7 @@ final class AppleClientTests: XCTestCase {
     /// that ceiling with its aspect intact — the whole reason a tvOS
     /// `.extraLarge` grid stops decoding megabytes per cell.
     func testPosterArtworkDecodesDownToTheCellThatWillDrawIt() throws {
-        let format = UIGraphicsImageRendererFormat.preferredFormat()
+        let format = UIGraphicsImageRendererFormat.preferred()
         format.scale = 1
         let renderer = UIGraphicsImageRenderer(
             size: CGSize(width: 400, height: 600),

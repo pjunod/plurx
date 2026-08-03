@@ -378,16 +378,7 @@ def select_points(catalog: Catalog, paths: tuple[str, ...]) -> Selection:
         if matched:
             reasons[point.id] = [f"path:{path}" for path in matched]
 
-    queue = list(reasons)
-    while queue:
-        point_id = queue.pop(0)
-        for dependency in catalog.point_map[point_id].depends_on:
-            reason = f"dependency:{point_id}"
-            if dependency not in reasons:
-                reasons[dependency] = [reason]
-                queue.append(dependency)
-            elif reason not in reasons[dependency]:
-                reasons[dependency].append(reason)
+    _expand_consumers(catalog, reasons)
 
     ordered = tuple(point.id for point in catalog.points if point.id in reasons)
     return Selection(
@@ -410,18 +401,35 @@ def select_named(catalog: Catalog, point_ids: tuple[str, ...]) -> Selection:
     if unknown:
         raise CatalogError("unknown functionality point(s): " + ", ".join(unknown))
     reasons = {point_id: ["explicit"] for point_id in point_ids}
-    queue = list(point_ids)
-    while queue:
-        point_id = queue.pop(0)
-        for dependency in catalog.point_map[point_id].depends_on:
-            reason = f"dependency:{point_id}"
-            if dependency not in reasons:
-                reasons[dependency] = [reason]
-                queue.append(dependency)
-            elif reason not in reasons[dependency]:
-                reasons[dependency].append(reason)
+    _expand_consumers(catalog, reasons)
     ordered = tuple(point.id for point in catalog.points if point.id in reasons)
     return Selection(ordered, {key: tuple(reasons[key]) for key in ordered}, ())
+
+
+def _expand_consumers(catalog: Catalog, reasons: dict[str, list[str]]) -> None:
+    """Add every consumer that can be affected by an already-selected point.
+
+    ``A depends_on B`` means a change to B can break A. Impact therefore walks
+    the reverse edge, from the changed provider to its consumers. Walking from
+    A to B instead only retests providers when a leaf changes and misses the
+    cascade this catalog exists to expose.
+    """
+
+    consumers: dict[str, list[str]] = {point.id: [] for point in catalog.points}
+    for point in catalog.points:
+        for dependency in point.depends_on:
+            consumers[dependency].append(point.id)
+
+    queue = list(reasons)
+    while queue:
+        provider_id = queue.pop(0)
+        for consumer_id in consumers[provider_id]:
+            reason = f"consumer:{provider_id}"
+            if consumer_id not in reasons:
+                reasons[consumer_id] = [reason]
+                queue.append(consumer_id)
+            elif reason not in reasons[consumer_id]:
+                reasons[consumer_id].append(reason)
 
 
 def selected_checks(
