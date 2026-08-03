@@ -16,6 +16,7 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncReadExt;
 
 use plurx_core::domain::{MediaFile, SubtitleStream};
 use plurx_core::playback::PlaybackMethod;
@@ -399,6 +400,7 @@ pub async fn playlist(
         return video_playlist(State(state), AxPath(session)).await;
     }
     let (context, file) = session_file(&state, &session).await?;
+    let context = exact_hls_context(&state, &session, context).await;
     Ok(playlist_response(
         master_playlist(&file, query.subtitle, &context).into_bytes(),
     ))
@@ -415,6 +417,7 @@ pub async fn master_playlist_response(
     Query(query): Query<PlaylistQuery>,
 ) -> Result<Response, ApiError> {
     let (context, file) = session_file(&state, &session).await?;
+    let context = exact_hls_context(&state, &session, context).await;
     Ok(playlist_response(
         master_playlist_diagnostic(&file, query.subtitle, &context, query.diagnostic.as_deref())
             .into_bytes(),
@@ -558,6 +561,91 @@ fn quoted(value: &str) -> String {
 /// matching for every language the copy had not learned.
 fn language_tag(raw: Option<&str>) -> &str {
     plurx_core::tracks::bcp47_tag(raw)
+}
+
+/// Replace the scanner's best-effort HEVC tier with the exact declaration
+/// carried by the HLS initialization segment.
+///
+/// ffprobe records Main/Main10 and level in the library row but commonly
+/// omits the tier. Guessing Main tier then advertises `L150` for a High-tier
+/// `hvcC` record (`H150`), and AVPlayer treats the only HDR variant as
+/// unsupported. The init segment is the canonical description of the bytes
+/// this session actually publishes, including any Dolby Vision stripping.
+async fn exact_hls_context(
+    state: &AppState,
+    session: &str,
+    mut context: crate::transcode::HlsContext,
+) -> crate::transcode::HlsContext {
+    let fallback_video = context.codecs.split(',').next().unwrap_or_default();
+    let Some(sample_entry) = ["hvc1", "hev1", "dvh1", "dvhe"]
+        .into_iter()
+        .find(|entry| fallback_video.starts_with(entry))
+    else {
+        return context;
+    };
+    let Some(opened) = state.transcode.segment(session, "init.mp4").await else {
+        return context;
+    };
+    // Initialization segments are a few KiB. Bound malformed input so a
+    // playlist request can never allocate without limit.
+    let mut init = Vec::with_capacity(opened.len.min(64 * 1024) as usize);
+    let mut reader = opened.file.take(1024 * 1024);
+    if reader.read_to_end(&mut init).await.is_err() {
+        return context;
+    }
+    let Some(video) = hevc_codec_from_init(&init, sample_entry) else {
+        return context;
+    };
+    context.codecs = match context.codecs.split_once(',') {
+        Some((_, audio)) if !audio.trim().is_empty() => format!("{video},{}", audio.trim()),
+        _ => video,
+    };
+    context
+}
+
+/// RFC 6381 identifier from the HEVCDecoderConfigurationRecord in `hvcC`.
+fn hevc_codec_from_init(init: &[u8], sample_entry: &str) -> Option<String> {
+    let type_at = init.windows(4).position(|window| window == b"hvcC")?;
+    let box_start = type_at.checked_sub(4)?;
+    let box_size = u32::from_be_bytes(init.get(box_start..type_at)?.try_into().ok()?) as usize;
+    let box_end = box_start.checked_add(box_size)?;
+    if box_size < 21 || box_end > init.len() {
+        return None;
+    }
+    let payload = init.get(type_at + 4..box_end)?;
+    if payload.len() < 13 || payload[0] != 1 {
+        return None;
+    }
+
+    let profile_byte = payload[1];
+    let profile_space = match profile_byte >> 6 {
+        0 => "",
+        1 => "A",
+        2 => "B",
+        3 => "C",
+        _ => return None,
+    };
+    let profile = profile_byte & 0x1f;
+    let tier = if profile_byte & 0x20 == 0 { 'L' } else { 'H' };
+    let compatibility = u32::from_be_bytes(payload.get(2..6)?.try_into().ok()?).reverse_bits();
+    let level = payload[12];
+    let constraints = payload.get(6..12)?;
+    let constraints_len = constraints
+        .iter()
+        .rposition(|byte| *byte != 0)
+        .map_or(0, |last| last + 1);
+    let constraints = constraints[..constraints_len]
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<String>();
+
+    let mut codec =
+        format!("{sample_entry}.{profile_space}{profile}.{compatibility:X}.{tier}{level}");
+    if !constraints.is_empty() {
+        codec.push('.');
+        codec.push_str(&constraints);
+    }
+    Some(codec)
 }
 
 /// The human half of a rendition's `NAME`. Display names are a presentation
@@ -1411,6 +1499,22 @@ mod tests {
         assert!(hdr.contains("VIDEO-RANGE=PQ"));
         assert!(hdr.contains("CODECS=\"hvc1.2.4.L150.B0,ec-3\""));
         assert!(hdr.ends_with("index.m3u8\n"));
+    }
+
+    #[test]
+    fn hevc_codec_uses_the_published_profile_tier_level_and_constraints() {
+        // hvcC version 1, Main 10, High tier, compatibility 0x20000000
+        // (RFC 6381 reverse-bit value 4), constraint B0, level 150. This is
+        // the header carried by the live HDR regression file's init segment.
+        let mut init = vec![0, 0, 0, 21];
+        init.extend_from_slice(b"hvcC");
+        init.extend_from_slice(&[1, 0x22, 0x20, 0, 0, 0, 0xB0, 0, 0, 0, 0, 0, 150]);
+
+        assert_eq!(
+            hevc_codec_from_init(&init, "hvc1").as_deref(),
+            Some("hvc1.2.4.H150.B0")
+        );
+        assert!(hevc_codec_from_init(&init[..12], "hvc1").is_none());
     }
 
     /// Who gets the accessibility tag: the muxer's answer first, the track's
