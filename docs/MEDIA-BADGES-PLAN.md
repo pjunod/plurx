@@ -124,7 +124,7 @@ the honest formula is server-delivered ∧ display-capable.
 |---|---|---|
 | Web | `matchMedia("(dynamic-range: high)")`, read live at render time (the window can move between monitors) | none — browsers expose nothing per-stream; the server value stands |
 | Android | `Display.getHdrCapabilities().supportedHdrTypes` — `HDR_TYPE_HDR10`/`HLG`/`DOLBY_VISION` (the probe `Caps.displayIsHdr` already wraps this) | ExoPlayer `player.videoFormat`: `colorInfo.colorTransfer` = ST2084/HLG confirms PQ/HLG in the decoded stream; `sampleMimeType == MimeTypes.VIDEO_DOLBY_VISION` confirms the DV decoder engaged. Already read by the info panel (`videoFormatSummary`, PlayerScreen.kt ~1131) |
-| Apple | `AVPlayer.eligibleForHDRPlayback` (Caps.swift already uses it as the device's HDR/DV gate) | none public for HLS variants — do NOT try to introspect the active variant; the dvh1-tagged master + eligibility is the contract (`hevc_copy_tag` doc comment: dvh1 or AVPlayer never engages its DV pipeline) |
+| Apple | `AVPlayer.eligibleForHDRPlayback` gates HDR; the deprecated-but-present `AVPlayer.availableHDRModes` DV bit distinguishes a DV output from HDR10 on OS 26, whose replacement is only generic | none public for HLS variants — do NOT try to introspect the active variant; the `SUPPLEMENTAL-CODECS` DV master + eligibility/mode intersection is the contract |
 
 The rendered verdict, uniformly:
 
@@ -142,7 +142,7 @@ function `(source_grade, rendered_grade)`:
 | State | Condition | Visual | Example |
 |---|---|---|---|
 | **lit** | rendered == source grade | today's full-colour chip (gold DV / teal HDR) | `DV P7` |
-| **downgraded** | rendered ≠ source grade | chip dimmed, arrow suffix names what's on screen | `DV P7 → HDR10`, `HDR10 → SDR` |
+| **different grade** | rendered ≠ source grade | source half dimmed; arrow suffix stays lit and names what's on screen | `DV P7 → HDR10`, `HDR10 → SDR` |
 | **source-only** | no active session (detail screens) | today's rendering, unchanged (M5 adds capability dimming) | `DV P7` |
 
 The `DV P7` in that last column is the **web** chip. The profile number is
@@ -152,8 +152,10 @@ Read every `DV Px` in this document as "the source-grade mark, whatever
 this client spells it"; the arrow suffix is the same vocabulary
 everywhere.
 
-DV downgraded to HDR10 keeps HDR colouring on the suffix concept simple:
-the whole chip dims to the "off" treatment and the suffix is plain text.
+DV delivered as HDR10 separates capability from function: the unavailable
+source half dims, while `→ HDR10` remains fully lit because HDR is working.
+The same split applies to SDR, where the bright suffix truthfully reports the
+rendered result rather than implying that the source capability is active.
 Accessibility labels spell it out: "Dolby Vision, playing as HDR10". The
 hover/long-press detail (web `title`, info panels elsewhere) carries the
 server's reason string, which already says *why* ("Dolby Vision metadata
@@ -522,15 +524,17 @@ receives a `dvh1`-tagged copy). Everything funnels through
    builder — `playbackBadges(source:audio:delivered:displayHDR:)` with
    defaults (`delivered: String? = nil, displayHDR: Bool = true`) so the
    existing tests keep compiling, then update them. `PlayerMetadataBadge`
-   gains `var dimmed: Bool = false`; the dynamic-range badge computes
+   gains `var renderedMark: String? = nil` plus `var dimmed: Bool = false`;
+   the dynamic-range badge computes
    rendered = `displayHDR ? delivered : "sdr"` (with
    `AVPlayer.eligibleForHDRPlayback` passed from the view), compares
-   against the source grade, and on mismatch sets `dimmed` and
-   `mark = "DV → HDR10"`-style text with the spelled-out
-   `accessibilityLabel`. Rendering: dimmed badges drop to ~0.45 opacity on
-   the existing capsule. Do not reach for `UIScreen.currentEDRHeadroom` or
-   `AVDisplayManager` — eligibility is the documented, stable signal;
-   headroom polling is listed in §9 as a non-goal.
+   against the source grade, and on mismatch keeps `mark = "DV"`, sets
+   `renderedMark = "HDR10"`, dims only the icon/source group to ~0.45, and
+   leaves `→ HDR10` fully lit inside the existing capsule. The spelled-out
+   `accessibilityLabel` remains "Dolby Vision, playing as HDR10". Do not
+   reach for `UIScreen.currentEDRHeadroom` or `AVDisplayManager` — eligibility
+   is the documented, stable signal; headroom polling is listed in §9 as a
+   non-goal.
 4. **Stats panel**: add a "Dynamic range" row to `outputRows` from
    `controller.deliveredRange` + eligibility, sentence-style like the web's.
 5. **Detail parity** (`DetailView.swift`): `itemMetadataBadges` today has

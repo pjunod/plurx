@@ -16,6 +16,7 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncReadExt;
 
 use plurx_core::domain::{MediaFile, SubtitleStream};
 use plurx_core::playback::PlaybackMethod;
@@ -248,9 +249,15 @@ pub async fn create(
             }
         })?;
     let playlist_url = if native_subtitles {
+        // Give the multivariant playlist its own path. AVPlayer caches HLS
+        // resources by URL and can otherwise conflate `index.m3u8?native=1`
+        // with the child `index.m3u8` media playlist referenced by that
+        // master. Keep the query form in `playlist` for clients holding an
+        // older session response, but new sessions use the unambiguous path.
+        let master = format!("/api/v1/hls/{}/master.m3u8", info.session_id);
         match native_subtitle {
-            Some(index) => format!("{}?native=1&subtitle={index}", info.playlist_url),
-            None => format!("{}?native=1", info.playlist_url),
+            Some(index) => format!("{master}?subtitle={index}"),
+            None => master,
         }
     } else {
         info.playlist_url
@@ -341,6 +348,10 @@ pub async fn status(
 pub struct PlaylistQuery {
     pub native: Option<u8>,
     pub subtitle: Option<i64>,
+    /// Temporary physical-device isolation mode for the Apple HDR master.
+    /// The session UUID remains the capability; these modes only remove
+    /// declarations from the playlist and never expose another resource.
+    pub diagnostic: Option<String>,
 }
 
 fn playlist_response(bytes: Vec<u8>) -> Response {
@@ -362,7 +373,7 @@ async fn session_file(
     state: &AppState,
     session: &str,
 ) -> Result<(crate::transcode::HlsContext, MediaFile), ApiError> {
-    let context = state
+    let mut context = state
         .transcode
         .hls_context(session)
         .await
@@ -372,13 +383,45 @@ async fn session_file(
         .get_file(context.file_id)
         .await?
         .ok_or(ApiError::NotFound("file"))?;
+    context.frame_rate = state
+        .store
+        .get_file_probe_json(context.file_id)
+        .await?
+        .as_deref()
+        .and_then(video_frame_rate);
     Ok((context, file))
+}
+
+/// Maximum frame rate from ffprobe's persisted source description.
+///
+/// Fractions are kept until the playlist is rendered so NTSC rates retain
+/// their 24000/1001 or 30000/1001 meaning. `avg_frame_rate` is preferred;
+/// `r_frame_rate` is the fallback for older probe output.
+fn video_frame_rate(probe_json: &str) -> Option<f64> {
+    fn fraction(raw: &str) -> Option<f64> {
+        let (numerator, denominator) = raw.split_once('/')?;
+        let numerator = numerator.parse::<f64>().ok()?;
+        let denominator = denominator.parse::<f64>().ok()?;
+        let rate = numerator / denominator;
+        (rate.is_finite() && rate > 0.0).then_some(rate)
+    }
+
+    let probe: serde_json::Value = serde_json::from_str(probe_json).ok()?;
+    let stream = probe
+        .get("streams")?
+        .as_array()?
+        .iter()
+        .find(|stream| stream.get("codec_type").and_then(|v| v.as_str()) == Some("video"))?;
+    ["avg_frame_rate", "r_frame_rate"]
+        .into_iter()
+        .find_map(|key| stream.get(key).and_then(|v| v.as_str()).and_then(fraction))
 }
 
 /// GET /api/v1/hls/:session/index.m3u8 — capability auth (see module docs).
 ///
-/// Existing clients receive the historical media playlist. Apple opts into a
-/// master playlist with native subtitle renditions through `?native=1`.
+/// Existing clients receive the historical media playlist. The `?native=1`
+/// form remains as a compatibility bridge for Apple sessions created before
+/// the dedicated master-playlist path existed.
 pub async fn playlist(
     State(state): State<AppState>,
     AxPath(session): AxPath<String>,
@@ -387,9 +430,28 @@ pub async fn playlist(
     if query.native != Some(1) {
         return video_playlist(State(state), AxPath(session)).await;
     }
-    let (_, file) = session_file(&state, &session).await?;
+    let (context, file) = session_file(&state, &session).await?;
+    let context = exact_hls_context(&state, &session, context).await;
     Ok(playlist_response(
-        master_playlist(&file, query.subtitle).into_bytes(),
+        master_playlist(&file, query.subtitle, &context).into_bytes(),
+    ))
+}
+
+/// The multivariant playlist used by Apple clients for native subtitles and
+/// HDR variant signaling.
+///
+/// It has a distinct path from the child media playlist so AVPlayer cannot
+/// collapse the two resources when applying URL-query cache normalization.
+pub async fn master_playlist_response(
+    State(state): State<AppState>,
+    AxPath(session): AxPath<String>,
+    Query(query): Query<PlaylistQuery>,
+) -> Result<Response, ApiError> {
+    let (context, file) = session_file(&state, &session).await?;
+    let context = exact_hls_context(&state, &session, context).await;
+    Ok(playlist_response(
+        master_playlist_diagnostic(&file, query.subtitle, &context, query.diagnostic.as_deref())
+            .into_bytes(),
     ))
 }
 
@@ -530,6 +592,91 @@ fn quoted(value: &str) -> String {
 /// matching for every language the copy had not learned.
 fn language_tag(raw: Option<&str>) -> &str {
     plurx_core::tracks::bcp47_tag(raw)
+}
+
+/// Replace the scanner's best-effort HEVC tier with the exact declaration
+/// carried by the HLS initialization segment.
+///
+/// ffprobe records Main/Main10 and level in the library row but commonly
+/// omits the tier. Guessing Main tier then advertises `L150` for a High-tier
+/// `hvcC` record (`H150`), and AVPlayer treats the only HDR variant as
+/// unsupported. The init segment is the canonical description of the bytes
+/// this session actually publishes, including any Dolby Vision stripping.
+async fn exact_hls_context(
+    state: &AppState,
+    session: &str,
+    mut context: crate::transcode::HlsContext,
+) -> crate::transcode::HlsContext {
+    let fallback_video = context.codecs.split(',').next().unwrap_or_default();
+    let Some(sample_entry) = ["hvc1", "hev1", "dvh1", "dvhe"]
+        .into_iter()
+        .find(|entry| fallback_video.starts_with(entry))
+    else {
+        return context;
+    };
+    let Some(opened) = state.transcode.segment(session, "init.mp4").await else {
+        return context;
+    };
+    // Initialization segments are a few KiB. Bound malformed input so a
+    // playlist request can never allocate without limit.
+    let mut init = Vec::with_capacity(opened.len.min(64 * 1024) as usize);
+    let mut reader = opened.file.take(1024 * 1024);
+    if reader.read_to_end(&mut init).await.is_err() {
+        return context;
+    }
+    let Some(video) = hevc_codec_from_init(&init, sample_entry) else {
+        return context;
+    };
+    context.codecs = match context.codecs.split_once(',') {
+        Some((_, audio)) if !audio.trim().is_empty() => format!("{video},{}", audio.trim()),
+        _ => video,
+    };
+    context
+}
+
+/// RFC 6381 identifier from the HEVCDecoderConfigurationRecord in `hvcC`.
+fn hevc_codec_from_init(init: &[u8], sample_entry: &str) -> Option<String> {
+    let type_at = init.windows(4).position(|window| window == b"hvcC")?;
+    let box_start = type_at.checked_sub(4)?;
+    let box_size = u32::from_be_bytes(init.get(box_start..type_at)?.try_into().ok()?) as usize;
+    let box_end = box_start.checked_add(box_size)?;
+    if box_size < 21 || box_end > init.len() {
+        return None;
+    }
+    let payload = init.get(type_at + 4..box_end)?;
+    if payload.len() < 13 || payload[0] != 1 {
+        return None;
+    }
+
+    let profile_byte = payload[1];
+    let profile_space = match profile_byte >> 6 {
+        0 => "",
+        1 => "A",
+        2 => "B",
+        3 => "C",
+        _ => return None,
+    };
+    let profile = profile_byte & 0x1f;
+    let tier = if profile_byte & 0x20 == 0 { 'L' } else { 'H' };
+    let compatibility = u32::from_be_bytes(payload.get(2..6)?.try_into().ok()?).reverse_bits();
+    let level = payload[12];
+    let constraints = payload.get(6..12)?;
+    let constraints_len = constraints
+        .iter()
+        .rposition(|byte| *byte != 0)
+        .map_or(0, |last| last + 1);
+    let constraints = constraints[..constraints_len]
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<String>();
+
+    let mut codec =
+        format!("{sample_entry}.{profile_space}{profile}.{compatibility:X}.{tier}{level}");
+    if !constraints.is_empty() {
+        codec.push('.');
+        codec.push_str(&constraints);
+    }
+    Some(codec)
 }
 
 /// The human half of a rendition's `NAME`. Display names are a presentation
@@ -727,11 +874,86 @@ impl MasterRungs {
     }
 }
 
-fn master_playlist(file: &MediaFile, selected: Option<i64>) -> String {
-    master_playlist_with(file, selected, MasterRungs::active())
+fn master_playlist(
+    file: &MediaFile,
+    selected: Option<i64>,
+    context: &crate::transcode::HlsContext,
+) -> String {
+    master_playlist_with_shape(
+        file,
+        selected,
+        context,
+        MasterRungs::active(),
+        MasterShape::default(),
+    )
 }
 
-fn master_playlist_with(file: &MediaFile, selected: Option<i64>, rungs: MasterRungs) -> String {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MasterShape {
+    subtitles: bool,
+    codecs: bool,
+    video_range: bool,
+}
+
+impl Default for MasterShape {
+    fn default() -> Self {
+        Self {
+            subtitles: true,
+            codecs: true,
+            video_range: true,
+        }
+    }
+}
+
+fn master_playlist_diagnostic(
+    file: &MediaFile,
+    selected: Option<i64>,
+    context: &crate::transcode::HlsContext,
+    diagnostic: Option<&str>,
+) -> String {
+    let shape = match diagnostic {
+        Some("video-only") => MasterShape {
+            subtitles: false,
+            codecs: false,
+            video_range: false,
+        },
+        Some("video-only-codecs") => MasterShape {
+            subtitles: false,
+            codecs: true,
+            video_range: false,
+        },
+        Some("video-only-range") => MasterShape {
+            subtitles: false,
+            codecs: false,
+            video_range: true,
+        },
+        Some("video-only-hdr") => MasterShape {
+            subtitles: false,
+            codecs: true,
+            video_range: true,
+        },
+        _ => MasterShape::default(),
+    };
+    master_playlist_with_shape(file, selected, context, MasterRungs::active(), shape)
+}
+
+#[cfg(test)]
+fn master_playlist_with(
+    file: &MediaFile,
+    selected: Option<i64>,
+    context: &crate::transcode::HlsContext,
+    rungs: MasterRungs,
+) -> String {
+    master_playlist_with_shape(file, selected, context, rungs, MasterShape::default())
+}
+
+fn master_playlist_with_shape(
+    file: &MediaFile,
+    selected: Option<i64>,
+    context: &crate::transcode::HlsContext,
+    rungs: MasterRungs,
+    shape: MasterShape,
+) -> String {
     let native: Vec<(usize, &SubtitleStream)> = file
         .subtitle_streams
         .iter()
@@ -745,6 +967,9 @@ fn master_playlist_with(file: &MediaFile, selected: Option<i64>, rungs: MasterRu
     // boundary and can reject an otherwise playable copied HEVC/DV stream.
     let mut out = String::from("#EXTM3U\n#EXT-X-VERSION:7\n");
     for (ordinal, (index, track)) in native.iter().enumerate() {
+        if !shape.subtitles {
+            break;
+        }
         // The query describes this player's selection. No selected index is
         // an explicit Off, not permission to resurrect a foreign-language
         // container default behind the client's back.
@@ -794,7 +1019,54 @@ fn master_playlist_with(file: &MediaFile, selected: Option<i64>, rungs: MasterRu
         ));
     }
     let bandwidth = file.bitrate.unwrap_or(25_000_000).max(128_000);
-    out.push_str(&format!("#EXT-X-STREAM-INF:BANDWIDTH={bandwidth}"));
+    out.push_str(&format!(
+        "#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},AVERAGE-BANDWIDTH={bandwidth}"
+    ));
+    if let (Some(width), Some(height)) = (file.width, file.height) {
+        if width > 0 && height > 0 {
+            out.push_str(&format!(",RESOLUTION={width}x{height}"));
+        }
+    }
+    if let Some(frame_rate) = context
+        .frame_rate
+        .filter(|rate| rate.is_finite() && *rate > 0.0)
+    {
+        out.push_str(&format!(",FRAME-RATE={frame_rate:.3}"));
+    }
+    // HDR is not self-describing at HLS's variant-selection layer. Apple
+    // requires VIDEO-RANGE before it opens the HEVC init segment, and CODECS
+    // must name the exact Main10 profile/level carried by this session. The
+    // source flag alone is not sufficient: an H.264 session from the same HDR
+    // source has already been tone-mapped, so its master must remain SDR.
+    let video_codec = context.codecs.split(',').next().unwrap_or_default();
+    let hevc = ["hvc1", "hev1", "dvh1", "dvhe"]
+        .iter()
+        .any(|prefix| video_codec.starts_with(prefix));
+    let video_range = if hevc {
+        match file.hdr.as_deref() {
+            Some("dolby_vision" | "hdr10" | "hdr10_plus") => Some("PQ"),
+            Some("hlg") => Some("HLG"),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    if let Some(video_range) = video_range {
+        if shape.video_range {
+            out.push_str(&format!(",VIDEO-RANGE={video_range}"));
+        }
+        if shape.codecs {
+            out.push_str(&format!(",CODECS=\"{}\"", quoted(&context.codecs)));
+        }
+        if shape.codecs {
+            if let Some(supplemental) = context.supplemental_codecs.as_deref() {
+                out.push_str(&format!(
+                    ",SUPPLEMENTAL-CODECS=\"{}\"",
+                    quoted(supplemental)
+                ));
+            }
+        }
+    }
     // Ladder rung: the variant carries no CLOSED-CAPTIONS attribute, and
     // Apple's authoring rules say a variant with no captions must say so.
     // Absent it, AVFoundation is entitled to synthesise a phantom
@@ -804,14 +1076,13 @@ fn master_playlist_with(file: &MediaFile, selected: Option<i64>, rungs: MasterRu
     if rungs.closed_captions_none {
         out.push_str(",CLOSED-CAPTIONS=NONE");
     }
-    if !native.is_empty() {
+    if shape.subtitles && !native.is_empty() {
         out.push_str(",SUBTITLES=\"subs\"");
     }
     out.push('\n');
-    // Resolve back to the historical media-playlist URL without carrying the
-    // master's `native=1` query. AVPlayer accepts the exact same copied fMP4
-    // when reached through this stable session URL, while treating a second
-    // synthetic child path as a different (and incompatible) asset.
+    // Resolve to the historical media-playlist URL. The master itself lives
+    // at `master.m3u8`, so this child path is unambiguous without relying on
+    // query-string distinctions in AVPlayer's HLS resource cache.
     out.push_str("index.m3u8\n");
     out
 }
@@ -1024,12 +1295,7 @@ pub async fn segment(
         .segment(&session, &seg)
         .await
         .ok_or(ApiError::NotFound("segment"))?;
-    // MPEG-TS segments (transcode) vs fMP4 init/segments (copy-video path).
-    let content_type = if seg.ends_with(".ts") {
-        "video/mp2t"
-    } else {
-        "video/mp4"
-    };
+    let content_type = segment_content_type(&seg);
     Ok((
         StatusCode::OK,
         [
@@ -1054,9 +1320,31 @@ pub async fn segment(
         .into_response())
 }
 
+/// MIME types from Apple's HLS authoring profile. An initialization section
+/// is an MP4 file, while each `.m4s` resource is an ISO BMFF media segment.
+/// Labeling both as `video/mp4` makes the bytes decodable in isolation but can
+/// cause AVPlayer's multivariant validator to reject the rendition before it
+/// ever opens the decoder.
+fn segment_content_type(name: &str) -> &'static str {
+    if name.ends_with(".ts") {
+        "video/mp2t"
+    } else if name.ends_with(".m4s") {
+        "video/iso.segment"
+    } else {
+        "video/mp4"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fmp4_media_segments_use_the_iso_segment_mime_type() {
+        assert_eq!(segment_content_type("init.mp4"), "video/mp4");
+        assert_eq!(segment_content_type("seg00000.m4s"), "video/iso.segment");
+        assert_eq!(segment_content_type("seg00000.ts"), "video/mp2t");
+    }
 
     fn hls_file(subtitle_streams: Vec<SubtitleStream>) -> MediaFile {
         MediaFile {
@@ -1081,6 +1369,37 @@ mod tests {
             audio_offset_ms: 0,
             probed: true,
         }
+    }
+
+    fn hls_context(
+        codecs: &str,
+        supplemental_codecs: Option<&str>,
+    ) -> crate::transcode::HlsContext {
+        crate::transcode::HlsContext {
+            file_id: 5615,
+            start_seconds: 0.0,
+            media_origin_seconds: 0.0,
+            codecs: codecs.into(),
+            supplemental_codecs: supplemental_codecs.map(str::to_owned),
+            frame_rate: Some(24_000.0 / 1_001.0),
+        }
+    }
+
+    fn sdr_context() -> crate::transcode::HlsContext {
+        hls_context("avc1.640034,mp4a.40.2", None)
+    }
+
+    #[test]
+    fn source_probe_preserves_fractional_video_frame_rate() {
+        let probe = r#"{
+            "streams": [
+                {"codec_type":"audio", "avg_frame_rate":"0/0"},
+                {"codec_type":"video", "avg_frame_rate":"24000/1001", "r_frame_rate":"24/1"}
+            ]
+        }"#;
+        let rate = video_frame_rate(probe).expect("frame rate");
+        assert!((rate - 23.976).abs() < 0.001, "{rate}");
+        assert!(video_frame_rate("not json").is_none());
     }
 
     fn sub(
@@ -1192,10 +1511,13 @@ mod tests {
             sub("subrip", "eng", "Regular", false, false),
             sub("webvtt", "eng", "SDH", false, false),
         ]);
-        let master = master_playlist(&file, Some(2));
+        let master = master_playlist(&file, Some(2), &sdr_context());
 
         assert!(master.starts_with("#EXTM3U\n#EXT-X-VERSION:7\n"));
-        assert!(master.contains("#EXT-X-STREAM-INF:BANDWIDTH=40000000,SUBTITLES=\"subs\""));
+        assert!(master.contains(
+            "#EXT-X-STREAM-INF:BANDWIDTH=40000000,AVERAGE-BANDWIDTH=40000000,\
+             RESOLUTION=3840x2160,FRAME-RATE=23.976,SUBTITLES=\"subs\""
+        ));
         assert!(!master.contains("CODECS="));
         assert!(!master.contains("#EXT-X-INDEPENDENT-SEGMENTS"));
         assert!(master.contains("NAME=\"English · Forced\",LANGUAGE=\"en\",DEFAULT=NO,AUTOSELECT=YES,FORCED=YES,URI=\"subs/2/index.m3u8\""));
@@ -1205,6 +1527,73 @@ mod tests {
         assert!(master.contains("NAME=\"English · Regular\",LANGUAGE=\"en\",DEFAULT=NO"));
         assert!(master.contains("NAME=\"English · SDH\",LANGUAGE=\"en\",DEFAULT=NO,AUTOSELECT=YES,FORCED=NO,CHARACTERISTICS=\"public.accessibility.transcribes-spoken-dialog,public.accessibility.describes-music-and-sound\""));
         assert!(master.ends_with("index.m3u8\n"));
+    }
+
+    #[test]
+    fn hdr_master_declares_the_range_and_exact_session_codecs() {
+        let file = hls_file(vec![]);
+        let stripped = hls_context("hvc1.2.4.L150.B0,mp4a.40.2", None);
+        let master = master_playlist(&file, None, &stripped);
+        assert!(master.contains(
+            "#EXT-X-STREAM-INF:BANDWIDTH=40000000,AVERAGE-BANDWIDTH=40000000,\
+             RESOLUTION=3840x2160,FRAME-RATE=23.976,VIDEO-RANGE=PQ,\
+             CODECS=\"hvc1.2.4.L150.B0,mp4a.40.2\""
+        ));
+
+        let compatible_dv = hls_context("hvc1.2.4.L150.B0,ec-3", Some("dvh1.08.10/db1p"));
+        let master = master_playlist(&file, None, &compatible_dv);
+        assert!(master.contains("VIDEO-RANGE=PQ"));
+        assert!(master.contains("CODECS=\"hvc1.2.4.L150.B0,ec-3\""));
+        assert!(master.contains("SUPPLEMENTAL-CODECS=\"dvh1.08.10/db1p\""));
+
+        // A tone-mapped session keeps its source's HDR library metadata, but
+        // its H.264 bytes and master are SDR.
+        let transcoded = hls_context("avc1.640034,mp4a.40.2", None);
+        let master = master_playlist(&file, None, &transcoded);
+        assert!(!master.contains("VIDEO-RANGE="));
+        assert!(!master.contains("CODECS="));
+    }
+
+    #[test]
+    fn hdr_diagnostics_isolate_master_attributes_without_changing_the_child() {
+        let file = hls_file(vec![sub("subrip", "eng", "Forced", true, false)]);
+        let context = hls_context("hvc1.2.4.L150.B0,ec-3", None);
+
+        let minimal = master_playlist_diagnostic(&file, None, &context, Some("video-only"));
+        assert_eq!(
+            minimal,
+            "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-STREAM-INF:BANDWIDTH=40000000,AVERAGE-BANDWIDTH=40000000,RESOLUTION=3840x2160,FRAME-RATE=23.976\nindex.m3u8\n"
+        );
+
+        let range = master_playlist_diagnostic(&file, None, &context, Some("video-only-range"));
+        assert!(range.contains("FRAME-RATE=23.976,VIDEO-RANGE=PQ\n"));
+        assert!(!range.contains("CODECS="));
+        assert!(!range.contains("SUBTITLES="));
+
+        let codecs = master_playlist_diagnostic(&file, None, &context, Some("video-only-codecs"));
+        assert!(codecs.contains("CODECS=\"hvc1.2.4.L150.B0,ec-3\""));
+        assert!(!codecs.contains("VIDEO-RANGE="));
+
+        let hdr = master_playlist_diagnostic(&file, None, &context, Some("video-only-hdr"));
+        assert!(hdr.contains("VIDEO-RANGE=PQ"));
+        assert!(hdr.contains("CODECS=\"hvc1.2.4.L150.B0,ec-3\""));
+        assert!(hdr.ends_with("index.m3u8\n"));
+    }
+
+    #[test]
+    fn hevc_codec_uses_the_published_profile_tier_level_and_constraints() {
+        // hvcC version 1, Main 10, High tier, compatibility 0x20000000
+        // (RFC 6381 reverse-bit value 4), constraint B0, level 150. This is
+        // the header carried by the live HDR regression file's init segment.
+        let mut init = vec![0, 0, 0, 21];
+        init.extend_from_slice(b"hvcC");
+        init.extend_from_slice(&[1, 0x22, 0x20, 0, 0, 0, 0xB0, 0, 0, 0, 0, 0, 150]);
+
+        assert_eq!(
+            hevc_codec_from_init(&init, "hvc1").as_deref(),
+            Some("hvc1.2.4.H150.B0")
+        );
+        assert!(hevc_codec_from_init(&init[..12], "hvc1").is_none());
     }
 
     /// Who gets the accessibility tag: the muxer's answer first, the track's
@@ -1226,7 +1615,7 @@ mod tests {
             sub("subrip", "eng", "English SDH", false, false),
             sub("subrip", "eng", "Regular", false, false),
         ]);
-        let master = master_playlist(&file, None);
+        let master = master_playlist(&file, None, &sdr_context());
         assert_eq!(
             master.matches(accessibility).count(),
             2,
@@ -1260,11 +1649,11 @@ mod tests {
             sub("subrip", "eng", "Regular", false, false),
             sub("webvtt", "eng", "Alternate", false, false),
         ]);
-        let master = master_playlist(&file, None);
+        let master = master_playlist(&file, None, &sdr_context());
         assert!(!master.contains("CODECS="));
         assert_eq!(master.matches("AUTOSELECT=NO").count(), 2);
 
-        let selected = master_playlist(&file, Some(1));
+        let selected = master_playlist(&file, Some(1), &sdr_context());
         assert!(selected
             .contains("NAME=\"English · Alternate\",LANGUAGE=\"en\",DEFAULT=YES,AUTOSELECT=YES"));
     }
@@ -1283,7 +1672,7 @@ mod tests {
             // must not carry a rendition this path cannot slice.
             sub("mov_text", "eng", "MP4 Timed Text", false, false),
         ]);
-        let master = master_playlist(&file, None);
+        let master = master_playlist(&file, None, &sdr_context());
         assert!(master.contains("subs/0/index.m3u8"));
         for index in 1..=5 {
             assert!(!master.contains(&format!("subs/{index}/index.m3u8")));
@@ -1421,7 +1810,7 @@ mod tests {
                 hearing_impaired: false,
             },
         ]);
-        let master = master_playlist_with(&file, None, MasterRungs::default());
+        let master = master_playlist_with(&file, None, &sdr_context(), MasterRungs::default());
         assert_eq!(master.matches("NAME=\"English\"").count(), 1, "{master}");
         assert!(master.contains("NAME=\"English (2)\""), "{master}");
     }
@@ -1438,7 +1827,7 @@ mod tests {
             false,
             false,
         )]);
-        let master = master_playlist_with(&file, None, MasterRungs::default());
+        let master = master_playlist_with(&file, None, &sdr_context(), MasterRungs::default());
         let line = master
             .lines()
             .find(|line| line.starts_with("#EXT-X-MEDIA:"))
@@ -1469,7 +1858,7 @@ mod tests {
         // Default: the shape that plays on the device today. Two forced
         // tracks share a language, so RFC 8216's uniqueness rule keeps them
         // manually selectable.
-        let shipped = master_playlist_with(&file, None, MasterRungs::default());
+        let shipped = master_playlist_with(&file, None, &sdr_context(), MasterRungs::default());
         assert!(!shipped.contains("CLOSED-CAPTIONS"), "{shipped}");
         assert_eq!(shipped.matches("AUTOSELECT=NO").count(), 2, "{shipped}");
         assert!(!shipped.contains("CODECS="), "{shipped}");
@@ -1478,6 +1867,7 @@ mod tests {
         let captions = master_playlist_with(
             &file,
             None,
+            &sdr_context(),
             MasterRungs {
                 closed_captions_none: true,
                 ..MasterRungs::default()
@@ -1485,7 +1875,9 @@ mod tests {
         );
         assert!(
             captions.contains(
-                "#EXT-X-STREAM-INF:BANDWIDTH=40000000,CLOSED-CAPTIONS=NONE,SUBTITLES=\"subs\""
+                "#EXT-X-STREAM-INF:BANDWIDTH=40000000,AVERAGE-BANDWIDTH=40000000,\
+                 RESOLUTION=3840x2160,FRAME-RATE=23.976,CLOSED-CAPTIONS=NONE,\
+                 SUBTITLES=\"subs\""
             ),
             "{captions}"
         );
@@ -1495,6 +1887,7 @@ mod tests {
         let forced = master_playlist_with(
             &file,
             None,
+            &sdr_context(),
             MasterRungs {
                 forced_autoselect: true,
                 ..MasterRungs::default()

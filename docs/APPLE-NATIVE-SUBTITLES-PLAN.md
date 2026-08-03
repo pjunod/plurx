@@ -1,7 +1,9 @@
 # Apple native subtitles — continuation plan: the review verdict and the road to a green DV master
 
-**Status:** M1 · M2 · M3 landed 2026-08-02, committed locally and **not
-pushed, deployed, or built for a device**; M4 (`-12927`) and M5 open ·
+**Status:** historical continuation plan; M1–M3 landed 2026-08-02 and M4's
+copied-Dolby path was resolved on physical Apple TV 2026-08-03. The OS 26
+client had suppressed its still-valid format-specific DV mode, so the server
+was deliberately stripping the RPU before AVPlayer saw it. ·
 **Landing route:** A (§4.1) · **Continues:**
 [APPLE-NATIVE-SUBTITLES-HANDOFF.md](APPLE-NATIVE-SUBTITLES-HANDOFF.md) §8 ·
 **Reviewed:** branch `agent/native-apple-subtitles` tip `f35ada1` against

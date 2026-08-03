@@ -48,10 +48,10 @@ plan live in [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) and
 [docs/CLIENTS.md](docs/CLIENTS.md), with
 [docs/APPLE-NATIVE-SUBTITLES-HANDOFF.md](docs/APPLE-NATIVE-SUBTITLES-HANDOFF.md)
 recording what the Apple native-subtitle work shipped, why each choice was
-made, and the one copied Dolby Vision file a physical Apple TV still refuses,
+made, and the copied-Dolby failure that was resolved on physical hardware,
 and [docs/APPLE-NATIVE-SUBTITLES-PLAN.md](docs/APPLE-NATIVE-SUBTITLES-PLAN.md)
-carrying it forward — an independent review of that implementation, the
-defects in priority order, and the milestones that finish the arc; the trust
+preserving the independent review, remediation history, and physical-device
+acceptance trail; the trust
 model — who can reach what, and what plurx leaves to the reverse proxy — in
 [docs/SECURITY.md](docs/SECURITY.md);
 deploy recipes in [deploy/README.md](deploy/README.md). What the version numbers

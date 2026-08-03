@@ -1525,18 +1525,6 @@ final class AppleClientTests: XCTestCase {
         XCTAssertEqual(json["copy"] as? Bool, true)
     }
 
-    func testHDRSessionsUseThePhysicalDeviceCompatibleMediaPlaylist() {
-        XCTAssertFalse(PlayerController.shouldRequestNativeSubtitleMaster(sourceHDR: "hdr10"))
-        XCTAssertFalse(
-            PlayerController.shouldRequestNativeSubtitleMaster(sourceHDR: "dolby_vision")
-        )
-        XCTAssertFalse(PlayerController.shouldRequestNativeSubtitleMaster(sourceHDR: "HLG"))
-
-        XCTAssertTrue(PlayerController.shouldRequestNativeSubtitleMaster(sourceHDR: nil))
-        XCTAssertTrue(PlayerController.shouldRequestNativeSubtitleMaster(sourceHDR: ""))
-        XCTAssertTrue(PlayerController.shouldRequestNativeSubtitleMaster(sourceHDR: "sdr"))
-    }
-
     func testAppleCapsKeepGenericHDRSeparateFromDolbyVision() {
         func dictionary(_ query: [URLQueryItem]) -> [String: String] {
             Dictionary(uniqueKeysWithValues: query.compactMap { item in
@@ -1729,20 +1717,22 @@ final class AppleClientTests: XCTestCase {
         // Downgraded by the server: an unclaimed profile takes the strip path,
         // which delivers the compatible HDR10 base.
         let stripped = try badge("hdr10")
-        XCTAssertEqual(stripped.mark, "DV → HDR10")
+        XCTAssertEqual(stripped.mark, "DV")
+        XCTAssertEqual(stripped.renderedMark, "HDR10")
+        XCTAssertEqual(stripped.displayMark, "DV → HDR10")
         XCTAssertEqual(stripped.accessibilityLabel, "Dolby Vision, playing as HDR10")
-        XCTAssertTrue(stripped.dimmed)
+        XCTAssertTrue(stripped.dimmed, "only the unavailable DV half is subdued")
 
         // Downgraded by the transcode: a burn or a picked rung is H.264 8-bit.
         let transcoded = try badge("sdr")
-        XCTAssertEqual(transcoded.mark, "DV → SDR")
+        XCTAssertEqual(transcoded.displayMark, "DV → SDR")
         XCTAssertTrue(transcoded.dimmed)
 
         // Downgraded by the display: delivered bits are necessary, not
         // sufficient. This is the whole of what the client is allowed to know
         // about rendering — no headroom polling, no variant introspection.
         let sdrPanel = try badge("dolby_vision", displayHDR: false)
-        XCTAssertEqual(sdrPanel.mark, "DV → SDR")
+        XCTAssertEqual(sdrPanel.displayMark, "DV → SDR")
         XCTAssertTrue(sdrPanel.dimmed)
 
         // A plain HDR10 source keeps the terse base mark and reports its own
@@ -1750,7 +1740,7 @@ final class AppleClientTests: XCTestCase {
         let hdr10 = try XCTUnwrap(PlayerView.dynamicRangeBadge(
             hdr: "hdr10", hdrFormat: "HDR10", delivered: "sdr", displayHDR: true
         ))
-        XCTAssertEqual(hdr10.mark, "HDR → SDR")
+        XCTAssertEqual(hdr10.displayMark, "HDR → SDR")
         XCTAssertEqual(hdr10.accessibilityLabel, "HDR, playing as SDR")
         XCTAssertNil(PlayerView.dynamicRangeBadge(
             hdr: nil, hdrFormat: nil, delivered: "sdr", displayHDR: true
@@ -1780,7 +1770,7 @@ final class AppleClientTests: XCTestCase {
         let downgraded = PlayerView.playbackBadges(
             source: source, audio: audio, delivered: "sdr", displayHDR: true
         )
-        XCTAssertEqual(downgraded.map(\.mark), [nil, "DV → SDR", "ATMOS 7.1"])
+        XCTAssertEqual(downgraded.map(\.displayMark), [nil, "DV → SDR", "ATMOS 7.1"])
         XCTAssertEqual(downgraded.map(\.dimmed), [false, true, false])
         XCTAssertEqual(
             downgraded.map(\.symbol),

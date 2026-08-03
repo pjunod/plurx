@@ -1,24 +1,26 @@
 # Apple native subtitles — what shipped, why, and what remains
 
-**Status:** native text subtitles deployed · **Server:** `0.2.0` (`787eaa6`) ·
-**Apple app:** `0.2.0` (5) · **Written:** 2026-08-02
+**Status:** native text subtitles deployed · copied Dolby Vision resolved on
+physical Apple TV 2026-08-03 · **Written:** 2026-08-02 · **Resolved:**
+2026-08-03
 
 Companion to [APPLE-CLIENT-PARITY.md](APPLE-CLIENT-PARITY.md), which owns the
 viewer parity matrix, and
 [CLIENTS-REMEDIATION-PLAN.md](CLIENTS-REMEDIATION-PLAN.md), which owns the
 cross-client implementation plan. Read this document first when continuing the
 subtitle or Dolby Vision work. It records what changed, why each choice was
-made, what was actually tested and deployed, and the one important result that
-is still not green.
+made, what was actually tested and deployed, and the original red result. The
+2026-08-03 resolution supersedes that historical failure: the OS 26 client had
+stopped advertising DV even though `availableHDRModes` still reported it.
 
 The short version: ordinary SRT/SubRip/WebVTT subtitles are native AVPlayer HLS
 renditions now. They do not cause subtitle burn-in, a video encoder, a quality
-change, or a new session when switched. Scary Movie still does **not** retain
-Dolby Vision end to end on the physical Apple TV: AVPlayer rejects the copied
-Dolby Vision multivariant stream and the client falls back to compatibility
-transcoding.
+change, or a new session when switched. Scary Movie now retains Dolby Vision
+end to end on the physical Apple TV: the client advertises DV only when both
+generic HDR eligibility and the current output's DV mode agree, the server
+preserves the RPU, and AVPlayer opens the standards-labeled master.
 
-## 1. Outcome — native subtitles shipped; copied Dolby Vision did not
+## 1. Outcome — native subtitles and copied Dolby Vision shipped
 
 - [x] SRT, SubRip, and WebVTT tracks are advertised as native HLS WebVTT
   renditions.
@@ -38,15 +40,14 @@ transcoding.
   request being cancelled.
 - [x] Apple build number 5 was tested on both simulator platforms and installed
   in place on Bedroom.
-- [~] File 5615 reaches the correct server-side copy/native-subtitle path, but
-  the physical Apple TV rejects the copied Dolby Vision master with CoreMedia
-  `-12927` and falls back to transcoding.
+- [x] File 5615 reaches the server-side copy/native-subtitle path on Bedroom,
+  keeps its Dolby Vision RPU, publishes `SUPPLEMENTAL-CODECS`, and reaches
+  AVPlayer `readyToPlay` on the physical Apple TV.
 - [ ] Android still needs the native subtitle client work in
   [ANDROID-CLIENT-PARITY.md](ANDROID-CLIENT-PARITY.md).
 
-`Native subtitles work` and `Dolby Vision works` are separate claims. The first
-is supported by tests and live logs. The second is not yet true for the
-regression file.
+`Native subtitles work` and `Dolby Vision works` remain separate claims. Both
+are now supported by tests plus live physical-device evidence.
 
 ## 2. Why this changed — subtitle choice was accidentally a video decision
 
