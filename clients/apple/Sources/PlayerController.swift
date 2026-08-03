@@ -54,6 +54,103 @@ struct PlayerReopenQueue: Equatable {
     mutating func clear() { pendingMs = nil }
 }
 
+/// The film-time target of an interactive seek. AVPlayer's clock is not a
+/// safe place to accumulate remote presses: a growing HLS session is replaced
+/// for every seek, and while that replacement is in flight the old item's
+/// local clock and the new session's film-time base briefly coexist. Keeping
+/// the latest target here makes ten presses mean ten steps, regardless of
+/// which item AVPlayer happens to expose between them.
+struct PlayerSeekState: Equatable {
+    private(set) var pendingMs: Int?
+    private(set) var generation = 0
+
+    mutating func absolute(_ requestedMs: Int, durationMs: Int) -> (target: Int, generation: Int) {
+        generation &+= 1
+        let target = Self.clamp(requestedMs, durationMs: durationMs)
+        pendingMs = target
+        return (target, generation)
+    }
+
+    mutating func relative(
+        by deltaMs: Int,
+        observedMs: Int,
+        durationMs: Int
+    ) -> (target: Int, generation: Int) {
+        absolute((pendingMs ?? observedMs) + deltaMs, durationMs: durationMs)
+    }
+
+    /// Only the newest native AVPlayer seek may clear the optimistic target.
+    /// An older completion can arrive after AVPlayer cancels it for a newer
+    /// seek and must not snap the progress bar backward.
+    @discardableResult
+    mutating func complete(generation expected: Int) -> Bool {
+        guard expected == generation else { return false }
+        pendingMs = nil
+        return true
+    }
+
+    /// Live HLS seeks are serialized by `PlayerReopenQueue`; the final open in
+    /// that drain clears the target it actually attached.
+    mutating func completeReopen(at positionMs: Int) {
+        if pendingMs == positionMs { pendingMs = nil }
+    }
+
+    mutating func clear() { pendingMs = nil }
+
+    private static func clamp(_ requestedMs: Int, durationMs: Int) -> Int {
+        let upper = durationMs > 0 ? max(0, durationMs - 2_000) : Int.max
+        return min(max(0, requestedMs), upper)
+    }
+}
+
+enum PlaybackStallAction: Equatable {
+    case none
+    case nudge
+    case reopen
+}
+
+/// Wall-clock sampling policy for AVPlayer's silent-wait failure mode. A
+/// temporary buffer wait gets room to recover on its own; only sustained lack
+/// of film-time progress rebuilds the item, which is the in-player equivalent
+/// of the back-out-and-play-again workaround.
+struct PlaybackStallDetector: Equatable {
+    private(set) var lastPositionMs: Int?
+    private(set) var stagnantChecks = 0
+
+    mutating func sample(positionMs: Int, shouldMonitor: Bool) -> PlaybackStallAction {
+        guard shouldMonitor else {
+            reset()
+            return .none
+        }
+        guard let lastPositionMs else {
+            self.lastPositionMs = positionMs
+            return .none
+        }
+
+        // Ordinary playback advances much farther than this between the
+        // two-second samples. A backwards discontinuity means an item/seek
+        // changed under the monitor and establishes a new baseline too.
+        if positionMs >= lastPositionMs + 250 || positionMs < lastPositionMs - 250 {
+            self.lastPositionMs = positionMs
+            stagnantChecks = 0
+            return .none
+        }
+
+        stagnantChecks += 1
+        if stagnantChecks >= 6 {
+            self.lastPositionMs = positionMs
+            stagnantChecks = 0
+            return .reopen
+        }
+        return stagnantChecks == 3 ? .nudge : .none
+    }
+
+    mutating func reset() {
+        lastPositionMs = nil
+        stagnantChecks = 0
+    }
+}
+
 /// One entry of an AVPlayer legible media-selection group, reduced to the two
 /// attributes the server actually authored (`LANGUAGE` and `NAME`). Keeping the
 /// matching rule off AVFoundation types is what makes it testable.
@@ -112,6 +209,7 @@ final class PlayerController: ObservableObject {
     private var endObserver: NSObjectProtocol?
     private var itemStatusObservation: NSKeyValueObservation?
     private var statusTask: Task<Void, Never>?
+    private var recoveryTask: Task<Void, Never>?
     private var started = false
     private var sessionId: String?
     private var lastReportedMs = 0
@@ -139,6 +237,10 @@ final class PlayerController: ObservableObject {
     /// Holds the newest seek/track intent that arrived mid-change so it wins
     /// instead of vanishing.
     private var reopenQueue = PlayerReopenQueue()
+    /// Optimistic absolute film position for an interactive seek. It is also
+    /// the base for the next relative press until the newest seek lands.
+    private var seekState = PlayerSeekState()
+    private var stallDetector = PlaybackStallDetector()
     /// Evidence that this server understands `native_subtitles`: its create
     /// response handed back a native master query. A server predating the
     /// feature returns the plain playlist URL and advertises no subtitle
@@ -215,6 +317,7 @@ final class PlayerController: ObservableObject {
         self.itemId = itemId
         self.fileId = fileId
         self.knownDurationMs = durationMs
+        self.currentMs = max(0, startMs)
         self.title = title
         subtitleReadiness = model.subtitleReadiness
         wantsNativeSubtitleRenditions = false
@@ -245,12 +348,17 @@ final class PlayerController: ObservableObject {
         player.appliesMediaSelectionCriteriaAutomatically = false
         player.automaticallyWaitsToMinimizeStalling = true
         addPeriodicObserver()
+        startPlaybackRecoveryMonitor()
 
         Task { await load(startMs: startMs) }
     }
 
     func togglePlayPause() {
-        if player.timeControlStatus == .playing || player.rate > 0 {
+        // A buffering player reports `.waitingToPlayAtSpecifiedRate` and rate
+        // zero even though Play is still the viewer's intent. Keying this
+        // control from the intent prevents a wait from masquerading as a user
+        // pause (and from turning a pause press into another play request).
+        if wantsPlayback {
             player.pause()
             isPlaying = false
             wantsPlayback = false
@@ -264,7 +372,12 @@ final class PlayerController: ObservableObject {
     }
 
     func skip(seconds: Double) {
-        seek(toMs: realPositionMs() + Int(seconds * 1000))
+        let request = seekState.relative(
+            by: Int(seconds * 1000),
+            observedMs: positionForPlaybackIntent(),
+            durationMs: knownDurationMs
+        )
+        issueSeek(to: request.target, generation: request.generation)
     }
 
     func skipActiveMarker() {
@@ -273,16 +386,26 @@ final class PlayerController: ObservableObject {
     }
 
     func seek(toMs requested: Int) {
-        let upper = knownDurationMs > 0 ? max(0, knownDurationMs - 2_000) : Int.max
-        let target = min(max(0, requested), upper)
+        let request = seekState.absolute(requested, durationMs: knownDurationMs)
+        issueSeek(to: request.target, generation: request.generation)
+    }
+
+    private func issueSeek(to target: Int, generation: Int) {
+        // Move the visible timeline immediately. The old implementation left
+        // it on the paused predecessor for the whole server round trip, which
+        // made tvOS look as though the progress command had not worked.
+        currentMs = target
+        stallDetector.reset()
+        let requiresReopen = isChangingStream || !(usesDirectTimeline || isVOD)
         Task {
-            if usesDirectTimeline || isVOD {
+            if !requiresReopen {
                 _ = await player.seek(
                     to: CMTime(seconds: Double(target) / 1000.0, preferredTimescale: 600),
                     toleranceBefore: .zero,
                     toleranceAfter: .zero
                 )
-                currentMs = target
+                guard seekState.complete(generation: generation) else { return }
+                currentMs = realPositionMs()
                 updateNowPlaying()
             } else {
                 await reopen(at: target)
@@ -311,7 +434,7 @@ final class PlayerController: ObservableObject {
     private func applySubtitleSelection(_ index: Int?, route: SubtitleSelectionRoute) async {
         switch route {
         case .reopen:
-            await reopen(at: realPositionMs())
+            await reopen(at: positionForPlaybackIntent())
         case .mediaSelection:
             // Selection belongs to AVPlayerItem, not the HLS session. This is
             // the no-restart path that preserves video copy, HDR, position,
@@ -324,13 +447,22 @@ final class PlayerController: ObservableObject {
         guard index != selectedAudio else { return }
         selectedAudio = index
         audioOverride = index
-        Task { await reopen(at: realPositionMs()) }
+        Task { await reopen(at: positionForPlaybackIntent()) }
     }
 
     func selectQuality(_ height: Int?) {
         guard height != selectedHeight else { return }
         selectedHeight = height
-        Task { await reopen(at: realPositionMs()) }
+        Task { await reopen(at: positionForPlaybackIntent()) }
+    }
+
+    /// Film position that a new viewer command should build on. Between
+    /// commands the live AVPlayer clock is most precise; during a seek or
+    /// replacement, only the optimistic target / last published film time is
+    /// in the right timeline.
+    private func positionForPlaybackIntent() -> Int {
+        if let pending = seekState.pendingMs { return pending }
+        return isChangingStream ? currentMs : realPositionMs()
     }
 
     /// Report the final position and hand any encoder back immediately.
@@ -348,6 +480,10 @@ final class PlayerController: ObservableObject {
         itemStatusObservation = nil
         statusTask?.cancel()
         statusTask = nil
+        recoveryTask?.cancel()
+        recoveryTask = nil
+        stallDetector.reset()
+        seekState.clear()
         let position = realPositionMs()
         player.pause()
         isPlaying = false
@@ -390,9 +526,16 @@ final class PlayerController: ObservableObject {
             selectedSubtitle = model.subLang == "off"
                 ? nil
                 : Self.automaticSubtitleIndex(decision.subtitles ?? [])
-            try await open(decision: decision, at: startMs)
+            // Use the same drain as later replacements. A remote command can
+            // arrive while the decision request or first item is preparing;
+            // opening directly here left that command stranded in the reopen
+            // queue forever. A command issued before the decision arrived is
+            // already represented by `seekState.pendingMs`.
+            let initialPosition = seekState.pendingMs ?? startMs
+            try await openAndDrain(decision: decision, at: initialPosition)
         } catch {
             reopenQueue.clear()
+            seekState.clear()
             fail(error)
         }
     }
@@ -413,6 +556,8 @@ final class PlayerController: ObservableObject {
             try await openAndDrain(decision: decision, at: next)
         } catch {
             reopenQueue.clear()
+            seekState.clear()
+            currentMs = realPositionMs()
             fail(error)
         }
     }
@@ -435,7 +580,10 @@ final class PlayerController: ObservableObject {
             // owning open clears — belongs to that newer attempt, so the queued
             // request is its to drain and not this loop's.
             guard !isChangingStream else { return }
-            guard let trailing = reopenQueue.takePending() else { return }
+            guard let trailing = reopenQueue.takePending() else {
+                seekState.completeReopen(at: next)
+                return
+            }
             next = trailing
         }
     }
@@ -504,11 +652,12 @@ final class PlayerController: ObservableObject {
             && nativeSubtitle == nil && !needsSubtitleRenditions
         let url: URL?
         var seekAfterAttach: Int?
+        var nextBaseMs = 0
 
         if direct {
             activeBurnedSubtitle = nil
             isDirectPlayback = true
-            baseMs = 0
+            nextBaseMs = 0
             usesDirectTimeline = true
             isVOD = true
             encoder = nil
@@ -588,10 +737,10 @@ final class PlayerController: ObservableObject {
             usesDirectTimeline = isVOD
             if knownDurationMs <= 0 { knownDurationMs = hls.durationMs ?? 0 }
             if isVOD {
-                baseMs = 0
+                nextBaseMs = 0
                 if startMs > 0 { seekAfterAttach = startMs }
             } else {
-                baseMs = Int((hls.startSeconds ?? Double(startMs) / 1000.0) * 1000)
+                nextBaseMs = Int((hls.startSeconds ?? Double(startMs) / 1000.0) * 1000)
             }
             url = Session.shared.url(hls.playlistUrl)
             startStatusPolling()
@@ -630,6 +779,11 @@ final class PlayerController: ObservableObject {
         observeEnd(of: item)
         observeStatus(of: item)
         player.replaceCurrentItem(with: item)
+        // Publish the new local-to-film mapping only once the new item is the
+        // one whose clock `realPositionMs()` reads. Updating it during session
+        // creation mixed the predecessor's local time into the successor's
+        // base and was the source of the apparently random seek jumps.
+        baseMs = nextBaseMs
         // Start loading/playing immediately. Previously a resume point gated
         // this call behind item readiness and could leave tvOS permanently
         // presenting a stopped transport. That regression is why a paused
@@ -660,6 +814,7 @@ final class PlayerController: ObservableObject {
         }
         isPlaying = resumesPlayback
         currentMs = startMs
+        stallDetector.reset()
         failed = false
         isChangingStream = false
         updateNowPlaying()
@@ -728,6 +883,44 @@ final class PlayerController: ObservableObject {
         }
     }
 
+    /// AVPlayer normally resumes a short network wait itself. Some tvOS
+    /// builds, however, remain indefinitely in the waiting state with a valid
+    /// item and never produce a hard failure notification. Sample the film
+    /// clock independently of AVPlayer's periodic observer (which stops firing
+    /// when that clock stops), nudge after roughly six seconds, and rebuild the
+    /// item after roughly twelve seconds of genuine no-progress.
+    private func startPlaybackRecoveryMonitor() {
+        recoveryTask?.cancel()
+        recoveryTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(2))
+                guard !Task.isCancelled, let self else { return }
+                let shouldMonitor = self.started
+                    && self.wantsPlayback
+                    && !self.finished
+                    && !self.failed
+                    && !self.isChangingStream
+                    && self.seekState.pendingMs == nil
+                    && self.player.currentItem != nil
+                let position = self.realPositionMs()
+                switch self.stallDetector.sample(
+                    positionMs: position,
+                    shouldMonitor: shouldMonitor
+                ) {
+                case .none:
+                    break
+                case .nudge:
+                    self.player.play()
+                    if self.preferredRate != 1 { self.player.rate = self.preferredRate }
+                    self.isPlaying = true
+                case .reopen:
+                    self.currentMs = position
+                    await self.reopen(at: position)
+                }
+            }
+        }
+    }
+
     private func fail(_ error: Error) {
         isChangingStream = false
         failed = player.currentItem == nil || error is PlaybackPreparationError
@@ -748,12 +941,16 @@ final class PlayerController: ObservableObject {
         timeObserver = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self else { return }
-                self.currentMs = self.realPositionMs()
-                self.isPlaying = self.player.timeControlStatus == .playing
+                // Keep an interactive target on screen while its item is being
+                // prepared. Reading the predecessor here was the visible snap
+                // back after a progress-bar or skip-button command.
+                if self.seekState.pendingMs == nil && !self.isChangingStream {
+                    self.currentMs = self.realPositionMs()
+                }
                 // The last rate the viewer was genuinely playing at, so a
                 // pause at 1.5× is restored as 1.5× and not as the 0 the
                 // transport reports while paused (P2-5).
-                if self.isPlaying && self.player.rate > 0 {
+                if self.player.timeControlStatus == .playing && self.player.rate > 0 {
                     self.preferredRate = self.player.rate
                 }
                 self.updateNowPlaying()

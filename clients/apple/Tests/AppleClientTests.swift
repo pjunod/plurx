@@ -411,6 +411,67 @@ final class AppleClientTests: XCTestCase {
         XCTAssertNil(afterClear)
     }
 
+    func testRelativeSeeksAccumulateFromTheLatestTargetAndClampToTheFilm() {
+        var state = PlayerSeekState()
+
+        let first = state.relative(by: 10_000, observedMs: 60_000, durationMs: 120_000)
+        let second = state.relative(by: 10_000, observedMs: 60_200, durationMs: 120_000)
+        let third = state.relative(by: -10_000, observedMs: 60_400, durationMs: 120_000)
+
+        XCTAssertEqual(first.target, 70_000)
+        XCTAssertEqual(second.target, 80_000, "the old AVPlayer clock cannot swallow a second press")
+        XCTAssertEqual(third.target, 70_000, "back steps from the optimistic target too")
+        XCTAssertEqual(state.pendingMs, 70_000)
+
+        XCTAssertFalse(
+            state.complete(generation: first.generation),
+            "a cancelled native seek cannot clear a newer target"
+        )
+        XCTAssertEqual(state.pendingMs, 70_000)
+        XCTAssertTrue(state.complete(generation: third.generation))
+        XCTAssertNil(state.pendingMs)
+
+        XCTAssertEqual(
+            state.absolute(-50_000, durationMs: 120_000).target,
+            0
+        )
+        XCTAssertEqual(
+            state.absolute(999_000, durationMs: 120_000).target,
+            118_000
+        )
+    }
+
+    func testLiveSeekTargetClearsOnlyAfterTheAttachedReopen() {
+        var state = PlayerSeekState()
+        _ = state.absolute(90_000, durationMs: 600_000)
+
+        state.completeReopen(at: 60_000)
+        XCTAssertEqual(state.pendingMs, 90_000)
+
+        state.completeReopen(at: 90_000)
+        XCTAssertNil(state.pendingMs)
+    }
+
+    func testStallDetectorIgnoresPausesAndRecoversOnlyAfterSustainedNoProgress() {
+        var detector = PlaybackStallDetector()
+
+        XCTAssertEqual(detector.sample(positionMs: 10_000, shouldMonitor: false), .none)
+        XCTAssertEqual(detector.sample(positionMs: 10_000, shouldMonitor: true), .none)
+        XCTAssertEqual(detector.sample(positionMs: 12_000, shouldMonitor: true), .none)
+
+        XCTAssertEqual(detector.sample(positionMs: 12_000, shouldMonitor: true), .none)
+        XCTAssertEqual(detector.sample(positionMs: 12_000, shouldMonitor: true), .none)
+        XCTAssertEqual(detector.sample(positionMs: 12_000, shouldMonitor: true), .nudge)
+        XCTAssertEqual(detector.sample(positionMs: 12_000, shouldMonitor: true), .none)
+        XCTAssertEqual(detector.sample(positionMs: 12_000, shouldMonitor: true), .none)
+        XCTAssertEqual(detector.sample(positionMs: 12_000, shouldMonitor: true), .reopen)
+
+        // A deliberate pause resets the wall-clock evidence rather than
+        // letting it carry into the next press of Play.
+        XCTAssertEqual(detector.sample(positionMs: 12_000, shouldMonitor: false), .none)
+        XCTAssertEqual(detector.sample(positionMs: 12_000, shouldMonitor: true), .none)
+    }
+
     @MainActor
     func testAutomaticSubtitlesVetoANonForcedBitmapPick() {
         // A Blu-ray remux whose English subtitle is a non-forced PGS. Honoring
