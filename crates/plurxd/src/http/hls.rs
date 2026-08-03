@@ -388,7 +388,7 @@ pub async fn playlist(
     if query.native != Some(1) {
         return video_playlist(State(state), AxPath(session)).await;
     }
-    let (_, mut file) = session_file(&state, &session).await?;
+    let (context, mut file) = session_file(&state, &session).await?;
     let selected = match query.diagnostic.as_deref() {
         Some("minimal") => {
             file.subtitle_streams.clear();
@@ -400,9 +400,44 @@ pub async fn playlist(
         }
         _ => query.subtitle,
     };
-    Ok(playlist_response(
-        master_playlist(&file, selected).into_bytes(),
-    ))
+    let master = match query.diagnostic.as_deref() {
+        Some(
+            mode @ ("minimal-codecs" | "minimal-range" | "minimal-resolution"
+            | "minimal-video-only" | "minimal-short" | "minimal-video-path"),
+        ) => diagnostic_minimal_master(&file, &context, mode),
+        _ => master_playlist(&file, selected),
+    };
+    Ok(playlist_response(master.into_bytes()))
+}
+
+fn diagnostic_minimal_master(
+    file: &MediaFile,
+    context: &crate::transcode::HlsContext,
+    mode: &str,
+) -> String {
+    let bandwidth = file.bitrate.unwrap_or(25_000_000).max(128_000);
+    let codecs = match mode {
+        "minimal-video-only" => context.codecs.split(',').next().unwrap_or(&context.codecs),
+        "minimal-short" => "hvc1,ec-3",
+        _ => &context.codecs,
+    };
+    let mut variant = format!(
+        "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},CODECS=\"{codecs}\""
+    );
+    if matches!(mode, "minimal-range" | "minimal-resolution") {
+        variant.push_str(",VIDEO-RANGE=PQ");
+    }
+    if mode == "minimal-resolution" {
+        if let (Some(width), Some(height)) = (file.width, file.height) {
+            variant.push_str(&format!(",RESOLUTION={width}x{height}"));
+        }
+    }
+    let child = if mode == "minimal-video-path" {
+        "video.m3u8"
+    } else {
+        "index.m3u8"
+    };
+    format!("{variant}\n{child}\n")
 }
 
 /// The video rendition referenced by the native-subtitle HLS master.
