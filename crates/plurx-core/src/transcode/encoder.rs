@@ -18,6 +18,16 @@ pub enum Encoder {
 
 impl Encoder {
     /// The ffmpeg H.264 encoder name.
+    ///
+    /// **Every arm is H.264 8-bit, and something outside this file depends on
+    /// that.** [`crate::playback::delivered_dynamic_range`] returns `"sdr"`
+    /// for every transcode without looking at anything — no encoder, no
+    /// filter chain, no source grade — because there is no rung here that
+    /// can carry a wider one, and the badge on every client is built from
+    /// that answer. Add an HEVC or AV1 arm and the badge starts calling an
+    /// HDR transcode SDR, silently, on all three clients at once. The
+    /// coupling has no compiler to enforce it, so it has a test instead:
+    /// `every_encoder_is_h264_because_the_badge_hard_codes_sdr`.
     pub fn video_codec(self) -> &'static str {
         match self {
             Encoder::Software => "libx264",
@@ -518,6 +528,11 @@ mod tests {
         assert_eq!(Encoder::Vaapi.video_codec(), "h264_vaapi");
     }
 
+    /// Every variant, and the list every "for every encoder" test below
+    /// iterates. A variant missing from here is a variant nothing checks —
+    /// [`every_encoder_is_h264_because_the_badge_hard_codes_sdr`] carries the
+    /// exhaustive match that stops this file compiling until you come back
+    /// and add it.
     const ALL: [Encoder; 5] = [
         Encoder::Software,
         Encoder::Nvenc,
@@ -528,6 +543,57 @@ mod tests {
 
     fn has(v: &[String], needle: &str) -> bool {
         v.iter().any(|s| s == needle)
+    }
+
+    /// The badge on every client says a transcode is SDR, and this is the
+    /// only thing that makes that true.
+    ///
+    /// [`crate::playback::delivered_dynamic_range`] returns `"sdr"` for
+    /// `PlaybackMethod::Transcode` unconditionally — it never reads the
+    /// encoder, the filter chain, or the source's grade. That is correct
+    /// today for exactly one reason: all five encoders are H.264 8-bit, and
+    /// every filter chain ends in `yuv420p`/`nv12`, so no transcode this
+    /// crate can produce carries HDR whatever the source was. Nothing
+    /// structural holds that; a 10-bit or HDR-capable rung would be a
+    /// perfectly reasonable change to make and would leave every badge on
+    /// every HDR transcode lying, on web, Android and Apple at once, with no
+    /// failure anywhere to say so.
+    ///
+    /// So it fails here, at CI time, with the instructions in the message.
+    /// The `match` is what makes a new variant unmissable — it is exhaustive,
+    /// so adding one stops this file compiling until it is named here, and
+    /// naming it here is what puts it in front of the assertion.
+    #[test]
+    fn every_encoder_is_h264_because_the_badge_hard_codes_sdr() {
+        for encoder in ALL {
+            let codec = match encoder {
+                Encoder::Software
+                | Encoder::Nvenc
+                | Encoder::Qsv
+                | Encoder::Vaapi
+                | Encoder::VideoToolbox => encoder.video_codec(),
+            };
+            assert!(
+                codec == "libx264" || codec.starts_with("h264_"),
+                "{encoder:?} encodes `{codec}`, which is not H.264.\n\
+                 \n\
+                 This test is not about encoder names. `delivered_dynamic_range`\n\
+                 (plurx-core/src/playback/mod.rs) returns \"sdr\" for EVERY\n\
+                 transcode without inspecting anything, and every client's\n\
+                 dynamic-range badge is built from that answer. It is only\n\
+                 correct while every rung is H.264 8-bit and every filter chain\n\
+                 ends in yuv420p/nv12.\n\
+                 \n\
+                 If you are adding an HEVC, AV1 or 10-bit rung, that hard-coded\n\
+                 \"sdr\" has to go first: teach `delivered_dynamic_range` what\n\
+                 this encoder actually emits (it already takes the file, so it\n\
+                 can carry the source grade through a passthrough rung), extend\n\
+                 the truth model in docs/MEDIA-BADGES-PLAN.md §2.1, and then\n\
+                 widen this assertion to whatever the new set is. Do not delete\n\
+                 it — a badge that lies is a bug nobody reports, because the\n\
+                 picture still plays."
+            );
+        }
     }
 
     #[test]
