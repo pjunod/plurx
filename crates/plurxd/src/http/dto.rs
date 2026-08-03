@@ -108,11 +108,18 @@ pub struct MediaDto {
     pub video: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub height: Option<i64>,
-    /// Source dynamic range: "DV" | "HDR10+" | "HDR10" | "HLG". Absent for
-    /// SDR. What is on disk, never a promise about what will be delivered —
-    /// the play path decides that per client, per display.
+    /// Source dynamic range, spelled as `FileDto.hdr` spells it:
+    /// `dolby_vision` | `hdr10` | `hlg`, absent for SDR. What is on disk,
+    /// never a promise about what will be delivered — the play path decides
+    /// that per client, per display, and reports it as
+    /// `delivered_dynamic_range`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub dr: Option<String>,
+    pub hdr: Option<String>,
+    /// The rich label for the same file, verbatim from the probe. Paired with
+    /// the token exactly as `FileDto` pairs them: code compares the token,
+    /// each client words the label however that platform words it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hdr_format: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -126,7 +133,8 @@ impl From<MediaFacts> for MediaDto {
             bytes: f.bytes,
             video: f.video,
             height: f.height,
-            dr: f.dr,
+            hdr: f.hdr,
+            hdr_format: f.hdr_format,
             audio: f.audio,
             container: f.container,
         }

@@ -1284,7 +1284,7 @@ mod tests {
         assert_eq!(f.bytes, 75_800_000_000, "bytes is the sum, not the max");
         assert_eq!(f.height, Some(2160));
         assert_eq!(f.video.as_deref(), Some("HEVC"));
-        assert_eq!(f.dr.as_deref(), Some("DV"));
+        assert_eq!(f.hdr.as_deref(), Some("dolby_vision"));
         assert_eq!(f.audio.as_deref(), Some("TrueHD 7.1"));
         assert_eq!(f.container.as_deref(), Some("MKV"));
         // The same number the resolution badge shows, from the same rule.
