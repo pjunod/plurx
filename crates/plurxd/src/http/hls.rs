@@ -373,7 +373,7 @@ async fn session_file(
     state: &AppState,
     session: &str,
 ) -> Result<(crate::transcode::HlsContext, MediaFile), ApiError> {
-    let context = state
+    let mut context = state
         .transcode
         .hls_context(session)
         .await
@@ -383,7 +383,38 @@ async fn session_file(
         .get_file(context.file_id)
         .await?
         .ok_or(ApiError::NotFound("file"))?;
+    context.frame_rate = state
+        .store
+        .get_file_probe_json(context.file_id)
+        .await?
+        .as_deref()
+        .and_then(video_frame_rate);
     Ok((context, file))
+}
+
+/// Maximum frame rate from ffprobe's persisted source description.
+///
+/// Fractions are kept until the playlist is rendered so NTSC rates retain
+/// their 24000/1001 or 30000/1001 meaning. `avg_frame_rate` is preferred;
+/// `r_frame_rate` is the fallback for older probe output.
+fn video_frame_rate(probe_json: &str) -> Option<f64> {
+    fn fraction(raw: &str) -> Option<f64> {
+        let (numerator, denominator) = raw.split_once('/')?;
+        let numerator = numerator.parse::<f64>().ok()?;
+        let denominator = denominator.parse::<f64>().ok()?;
+        let rate = numerator / denominator;
+        (rate.is_finite() && rate > 0.0).then_some(rate)
+    }
+
+    let probe: serde_json::Value = serde_json::from_str(probe_json).ok()?;
+    let stream = probe
+        .get("streams")?
+        .as_array()?
+        .iter()
+        .find(|stream| stream.get("codec_type").and_then(|v| v.as_str()) == Some("video"))?;
+    ["avg_frame_rate", "r_frame_rate"]
+        .into_iter()
+        .find_map(|key| stream.get(key).and_then(|v| v.as_str()).and_then(fraction))
 }
 
 /// GET /api/v1/hls/:session/index.m3u8 — capability auth (see module docs).
@@ -988,7 +1019,20 @@ fn master_playlist_with_shape(
         ));
     }
     let bandwidth = file.bitrate.unwrap_or(25_000_000).max(128_000);
-    out.push_str(&format!("#EXT-X-STREAM-INF:BANDWIDTH={bandwidth}"));
+    out.push_str(&format!(
+        "#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},AVERAGE-BANDWIDTH={bandwidth}"
+    ));
+    if let (Some(width), Some(height)) = (file.width, file.height) {
+        if width > 0 && height > 0 {
+            out.push_str(&format!(",RESOLUTION={width}x{height}"));
+        }
+    }
+    if let Some(frame_rate) = context
+        .frame_rate
+        .filter(|rate| rate.is_finite() && *rate > 0.0)
+    {
+        out.push_str(&format!(",FRAME-RATE={frame_rate:.3}"));
+    }
     // HDR is not self-describing at HLS's variant-selection layer. Apple
     // requires VIDEO-RANGE before it opens the HEVC init segment, and CODECS
     // must name the exact Main10 profile/level carried by this session. The
@@ -1337,11 +1381,25 @@ mod tests {
             media_origin_seconds: 0.0,
             codecs: codecs.into(),
             supplemental_codecs: supplemental_codecs.map(str::to_owned),
+            frame_rate: Some(24_000.0 / 1_001.0),
         }
     }
 
     fn sdr_context() -> crate::transcode::HlsContext {
         hls_context("avc1.640034,mp4a.40.2", None)
+    }
+
+    #[test]
+    fn source_probe_preserves_fractional_video_frame_rate() {
+        let probe = r#"{
+            "streams": [
+                {"codec_type":"audio", "avg_frame_rate":"0/0"},
+                {"codec_type":"video", "avg_frame_rate":"24000/1001", "r_frame_rate":"24/1"}
+            ]
+        }"#;
+        let rate = video_frame_rate(probe).expect("frame rate");
+        assert!((rate - 23.976).abs() < 0.001, "{rate}");
+        assert!(video_frame_rate("not json").is_none());
     }
 
     fn sub(
@@ -1456,7 +1514,10 @@ mod tests {
         let master = master_playlist(&file, Some(2), &sdr_context());
 
         assert!(master.starts_with("#EXTM3U\n#EXT-X-VERSION:7\n"));
-        assert!(master.contains("#EXT-X-STREAM-INF:BANDWIDTH=40000000,SUBTITLES=\"subs\""));
+        assert!(master.contains(
+            "#EXT-X-STREAM-INF:BANDWIDTH=40000000,AVERAGE-BANDWIDTH=40000000,\
+             RESOLUTION=3840x2160,FRAME-RATE=23.976,SUBTITLES=\"subs\""
+        ));
         assert!(!master.contains("CODECS="));
         assert!(!master.contains("#EXT-X-INDEPENDENT-SEGMENTS"));
         assert!(master.contains("NAME=\"English · Forced\",LANGUAGE=\"en\",DEFAULT=NO,AUTOSELECT=YES,FORCED=YES,URI=\"subs/2/index.m3u8\""));
@@ -1474,7 +1535,8 @@ mod tests {
         let stripped = hls_context("hvc1.2.4.L150.B0,mp4a.40.2", None);
         let master = master_playlist(&file, None, &stripped);
         assert!(master.contains(
-            "#EXT-X-STREAM-INF:BANDWIDTH=40000000,VIDEO-RANGE=PQ,\
+            "#EXT-X-STREAM-INF:BANDWIDTH=40000000,AVERAGE-BANDWIDTH=40000000,\
+             RESOLUTION=3840x2160,FRAME-RATE=23.976,VIDEO-RANGE=PQ,\
              CODECS=\"hvc1.2.4.L150.B0,mp4a.40.2\""
         ));
 
@@ -1500,11 +1562,11 @@ mod tests {
         let minimal = master_playlist_diagnostic(&file, None, &context, Some("video-only"));
         assert_eq!(
             minimal,
-            "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-STREAM-INF:BANDWIDTH=40000000\nindex.m3u8\n"
+            "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-STREAM-INF:BANDWIDTH=40000000,AVERAGE-BANDWIDTH=40000000,RESOLUTION=3840x2160,FRAME-RATE=23.976\nindex.m3u8\n"
         );
 
         let range = master_playlist_diagnostic(&file, None, &context, Some("video-only-range"));
-        assert!(range.contains("BANDWIDTH=40000000,VIDEO-RANGE=PQ\n"));
+        assert!(range.contains("FRAME-RATE=23.976,VIDEO-RANGE=PQ\n"));
         assert!(!range.contains("CODECS="));
         assert!(!range.contains("SUBTITLES="));
 
@@ -1813,7 +1875,9 @@ mod tests {
         );
         assert!(
             captions.contains(
-                "#EXT-X-STREAM-INF:BANDWIDTH=40000000,CLOSED-CAPTIONS=NONE,SUBTITLES=\"subs\""
+                "#EXT-X-STREAM-INF:BANDWIDTH=40000000,AVERAGE-BANDWIDTH=40000000,\
+                 RESOLUTION=3840x2160,FRAME-RATE=23.976,CLOSED-CAPTIONS=NONE,\
+                 SUBTITLES=\"subs\""
             ),
             "{captions}"
         );

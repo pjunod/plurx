@@ -1189,6 +1189,9 @@ pub struct HlsContext {
     pub media_origin_seconds: f64,
     pub codecs: String,
     pub supplemental_codecs: Option<String>,
+    /// Maximum video frame rate from the source probe. Apple requires this on
+    /// every video variant in a multivariant playlist.
+    pub frame_rate: Option<f64>,
 }
 
 /// How long a media-origin probe may take before the session gives up on it.
@@ -3888,6 +3891,7 @@ impl TranscodeManager {
             media_origin_seconds: session.media_origin_seconds,
             codecs: session.hls_codecs.clone(),
             supplemental_codecs: session.hls_supplemental_codecs.clone(),
+            frame_rate: None,
         })
     }
 
