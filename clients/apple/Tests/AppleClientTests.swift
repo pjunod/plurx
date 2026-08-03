@@ -2078,6 +2078,18 @@ final class AppleClientTests: XCTestCase {
             window.isHidden = true
         }
     }
+
+    func testPhoneDetailKeepsArtworkAndControlsCompactButTappable() {
+        XCTAssertLessThanOrEqual(IOSDetailMetrics.compactHeroHeight, 230)
+        XCTAssertGreaterThan(IOSDetailMetrics.contentOverlap, 0)
+        XCTAssertGreaterThanOrEqual(IOSDetailMetrics.primaryControlHeight, 44)
+        XCTAssertLessThanOrEqual(IOSDetailMetrics.primaryControlHeight, 52)
+        XCTAssertGreaterThanOrEqual(IOSDetailMetrics.secondaryControlHeight, 44)
+        XCTAssertLessThan(
+            IOSDetailMetrics.secondaryControlHeight,
+            IOSDetailMetrics.primaryControlHeight
+        )
+    }
     #endif
 
     func testEpisodeBreadcrumbLinksToTheShowAndSeasonInOrder() {

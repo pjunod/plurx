@@ -35,17 +35,17 @@ struct ItemMetadataBadgeRow: View {
     }
 
     private var badgeContent: some View {
-        HStack(spacing: 9) {
+        HStack(spacing: badgeSpacing) {
             ForEach(badges) { badge in
-                HStack(spacing: 6) {
+                HStack(spacing: badgeContentSpacing) {
                     Image(systemName: badge.symbol)
                     if let mark = badge.mark {
                         Text(mark)
                             .fontWeight(.semibold)
                     }
                 }
-                .padding(.horizontal, 9)
-                .padding(.vertical, 5)
+                .padding(.horizontal, badgeHorizontalPadding)
+                .padding(.vertical, badgeVerticalPadding)
                 .background(Palette.surfaceHi.opacity(0.84), in: Capsule())
                 .overlay {
                     Capsule().stroke(Palette.outline.opacity(0.72), lineWidth: 0.5)
@@ -57,9 +57,42 @@ struct ItemMetadataBadgeRow: View {
         #if os(tvOS)
         .font(.system(size: 19, weight: .medium, design: .rounded))
         #else
-        .font(.system(.callout, design: .rounded))
+        .font(.system(.caption, design: .rounded).weight(.medium))
+        .padding(.horizontal, 1)
         #endif
         .foregroundColor(Palette.onBg.opacity(0.86))
+    }
+
+    private var badgeSpacing: CGFloat {
+        #if os(tvOS)
+        return 9
+        #else
+        return 7
+        #endif
+    }
+
+    private var badgeContentSpacing: CGFloat {
+        #if os(tvOS)
+        return 6
+        #else
+        return 4
+        #endif
+    }
+
+    private var badgeHorizontalPadding: CGFloat {
+        #if os(tvOS)
+        return 9
+        #else
+        return 7
+        #endif
+    }
+
+    private var badgeVerticalPadding: CGFloat {
+        #if os(tvOS)
+        return 5
+        #else
+        return 4
+        #endif
     }
 }
 
@@ -115,8 +148,8 @@ private struct DetailBreadcrumbLinkStyle: ButtonStyle {
         #else
         configuration.label
             .foregroundStyle(Palette.accent)
-            .padding(.horizontal, 6)
-            .padding(.vertical, 4)
+            .padding(.horizontal, 2)
+            .padding(.vertical, 2)
             .opacity(configuration.isPressed ? 0.66 : 1)
         #endif
     }
@@ -167,7 +200,7 @@ private extension View {
         #if os(tvOS)
         self.font(.system(size: 20, weight: .semibold, design: .rounded))
         #else
-        self.font(.system(.subheadline, design: .rounded).weight(.semibold))
+        self.font(.system(.caption, design: .rounded).weight(.semibold))
         #endif
     }
 }
@@ -192,6 +225,71 @@ enum DetailLayoutMetrics {
         min(maximumBodyWidth, max(0, viewportWidth - (2 * screenHPad)))
     }
 }
+
+#if os(iOS)
+/// The phone detail page keeps its artwork cinematic without letting it push
+/// the useful controls below the fold. Control heights remain comfortably
+/// tappable while their typography and visual chrome stay restrained.
+enum IOSDetailMetrics {
+    static let compactHeroHeight: CGFloat = 220
+    static let regularHeroHeight: CGFloat = 360
+    static let contentOverlap: CGFloat = 28
+    static let primaryControlHeight: CGFloat = 50
+    static let secondaryControlHeight: CGFloat = 44
+    static let controlCornerRadius: CGFloat = 13
+}
+
+private struct IOSDetailPrimaryActionButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .foregroundStyle(.white)
+            .frame(maxWidth: .infinity, minHeight: IOSDetailMetrics.primaryControlHeight)
+            .background(
+                Palette.accent,
+                in: RoundedRectangle(
+                    cornerRadius: IOSDetailMetrics.controlCornerRadius,
+                    style: .continuous
+                )
+            )
+            .shadow(color: Palette.accent.opacity(0.18), radius: 10, y: 4)
+            .contentShape(Rectangle())
+            .scaleEffect(configuration.isPressed ? 0.985 : 1)
+            .opacity(configuration.isPressed ? 0.84 : 1)
+            .animation(.easeOut(duration: 0.1), value: configuration.isPressed)
+    }
+}
+
+private struct IOSDetailSecondaryActionButtonStyle: ButtonStyle {
+    let selected: Bool
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .foregroundStyle(selected ? Palette.accent : Palette.onBg.opacity(0.78))
+            .frame(maxWidth: .infinity, minHeight: IOSDetailMetrics.secondaryControlHeight)
+            .background(
+                selected ? Palette.accent.opacity(0.12) : Palette.surfaceHi.opacity(0.82),
+                in: RoundedRectangle(
+                    cornerRadius: IOSDetailMetrics.controlCornerRadius - 2,
+                    style: .continuous
+                )
+            )
+            .overlay {
+                RoundedRectangle(
+                    cornerRadius: IOSDetailMetrics.controlCornerRadius - 2,
+                    style: .continuous
+                )
+                .stroke(
+                    selected ? Palette.accent.opacity(0.32) : Palette.outline.opacity(0.9),
+                    lineWidth: 0.75
+                )
+            }
+            .contentShape(Rectangle())
+            .scaleEffect(configuration.isPressed ? 0.98 : 1)
+            .opacity(configuration.isPressed ? 0.72 : 1)
+            .animation(.easeOut(duration: 0.1), value: configuration.isPressed)
+    }
+}
+#endif
 
 private struct DetailViewportWidthKey: EnvironmentKey {
     static let defaultValue: CGFloat? = nil
@@ -270,6 +368,9 @@ struct DetailView: View {
 
     @EnvironmentObject var model: AppModel
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    #if os(iOS)
+    @Environment(\.dismiss) private var dismiss
+    #endif
     let itemId: Int
     @State private var detail: ItemDetail?
     @State private var play: PlayContext?
@@ -282,26 +383,51 @@ struct DetailView: View {
     #endif
 
     var body: some View {
-        DetailViewportFrame {
-            Group {
-                if let detail {
-                    content(detail)
-                } else if let loadError {
-                    ContentUnavailableView(
-                        "Couldn't load this title",
-                        systemImage: "exclamationmark.triangle",
-                        description: Text(loadError)
-                    )
-                    .frame(maxWidth: .infinity).padding(.top, 80)
-                } else {
-                    ProgressView().tint(Palette.accent)
+        ZStack(alignment: .topLeading) {
+            DetailViewportFrame {
+                Group {
+                    if let detail {
+                        content(detail)
+                    } else if let loadError {
+                        ContentUnavailableView(
+                            "Couldn't load this title",
+                            systemImage: "exclamationmark.triangle",
+                            description: Text(loadError)
+                        )
                         .frame(maxWidth: .infinity).padding(.top, 80)
+                    } else {
+                        ProgressView().tint(Palette.accent)
+                            .frame(maxWidth: .infinity).padding(.top, 80)
+                    }
                 }
             }
+
+            #if os(iOS)
+            Button {
+                dismiss()
+            } label: {
+                Image(systemName: "chevron.left")
+                    .font(.system(size: 17, weight: .semibold))
+                    .foregroundStyle(Palette.onBg)
+                    .frame(width: 40, height: 40)
+                    .background(.ultraThinMaterial, in: Circle())
+                    .overlay {
+                        Circle().stroke(.white.opacity(0.12), lineWidth: 0.5)
+                    }
+                    .shadow(color: .black.opacity(0.3), radius: 9, y: 3)
+            }
+            .buttonStyle(.plain)
+            .frame(width: 44, height: 44)
+            .contentShape(Rectangle())
+            .padding(.leading, 14)
+            .padding(.top, 8)
+            .accessibilityLabel("Back")
+            #endif
         }
         .background(Palette.bg.ignoresSafeArea())
         #if os(iOS)
-        .navigationBarTitleDisplayMode(.inline)
+        .toolbar(.hidden, for: .navigationBar)
+        .toolbar(.hidden, for: .tabBar)
         #endif
         .task(id: itemId) {
             do {
@@ -414,16 +540,22 @@ struct DetailView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .clipped()
                 LinearGradient(
-                    colors: [.clear, Palette.bg],
-                    startPoint: .top, endPoint: .bottom
+                    stops: [
+                        .init(color: .clear, location: 0.34),
+                        .init(color: Palette.bg.opacity(0.38), location: 0.7),
+                        .init(color: Palette.bg, location: 1)
+                    ],
+                    startPoint: .top,
+                    endPoint: .bottom
                 )
             }
             .frame(maxWidth: .infinity)
             .frame(height: heroHeight)
             .clipped()
+            .accessibilityHidden(true)
 
             DetailBodyFrame {
-                VStack(alignment: .leading, spacing: 12) {
+                VStack(alignment: .leading, spacing: 10) {
                     if !ancestors.isEmpty {
                         DetailBreadcrumb(ancestors: ancestors)
                     }
@@ -432,7 +564,7 @@ struct DetailView: View {
                         #if os(tvOS)
                         .font(.system(size: 54, weight: .bold))
                         #else
-                        .font(.largeTitle.bold())
+                        .font(.system(.title, design: .rounded).weight(.bold))
                         #endif
                         .foregroundColor(Palette.onBg)
                         .lineLimit(nil)
@@ -445,6 +577,16 @@ struct DetailView: View {
                         includeSeries: ancestors.isEmpty
                     ))
 
+                    #if os(iOS)
+                    mobileActions(
+                        detail,
+                        file: file,
+                        durationMs: durationMs ?? 0,
+                        resumeMs: resumeMs,
+                        canResume: canResume
+                    )
+                    .padding(.top, 6)
+                    #else
                     if let file, item.isPlayable {
                         playbackActions(
                             item: item,
@@ -457,6 +599,7 @@ struct DetailView: View {
                     }
 
                     watchButton(detail)
+                    #endif
 
                     if let actionError {
                         Text(actionError)
@@ -466,19 +609,23 @@ struct DetailView: View {
 
                     if let overview = item.overview, !overview.isEmpty {
                         Text(overview)
-                            .font(.body)
+                            .font(.callout)
                             .foregroundColor(Palette.onBg.opacity(0.78))
-                            .lineSpacing(4)
+                            .lineSpacing(3)
                             .fixedSize(horizontal: false, vertical: true)
-                            .padding(.top, 8)
+                            .padding(.top, 6)
                     }
                 }
             }
+            #if os(iOS)
+            .padding(.top, -IOSDetailMetrics.contentOverlap)
+            #else
             .padding(.top, 8)
+            #endif
 
             if let children = detail.children, !children.isEmpty {
                 MediaRow(title: childrenHeading(item.kind), items: children)
-                    .padding(.top, 14)
+                    .padding(.top, 18)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -942,14 +1089,18 @@ struct DetailView: View {
                 watched ? "Mark unwatched" : "Mark watched",
                 systemImage: watched ? "checkmark.circle.fill" : "checkmark.circle"
             )
+            #if os(tvOS)
             .font(.system(.body, design: .monospaced))
+            #else
+            .font(.subheadline.weight(.semibold))
+            .lineLimit(1)
+            #endif
         }
         #if os(tvOS)
         .buttonStyle(TVReadableButtonStyle(prominent: watched))
         .fixedSize()
         #else
-        .buttonStyle(.bordered)
-        .tint(watched ? Palette.accent : Palette.muted)
+        .buttonStyle(IOSDetailSecondaryActionButtonStyle(selected: watched))
         #endif
         .disabled(watchBusy)
     }
@@ -978,9 +1129,68 @@ struct DetailView: View {
         #if os(tvOS)
         return 520
         #else
-        return horizontalSizeClass == .regular ? 430 : 270
+        return horizontalSizeClass == .regular
+            ? IOSDetailMetrics.regularHeroHeight
+            : IOSDetailMetrics.compactHeroHeight
         #endif
     }
+
+    #if os(iOS)
+    /// A single strong playback control carries the hierarchy. Resume-related
+    /// and watch-state actions share one quiet row instead of forming a stack
+    /// of equally loud full-width pills.
+    @ViewBuilder
+    private func mobileActions(
+        _ detail: ItemDetail,
+        file: MediaFile?,
+        durationMs: Int,
+        resumeMs: Int,
+        canResume: Bool
+    ) -> some View {
+        let item = detail.item
+        let hasPlayback = file != nil && item.isPlayable
+        let hasSecondaryPair = hasPlayback && canResume
+
+        if horizontalSizeClass == .regular {
+            HStack(spacing: 10) {
+                if let file, item.isPlayable {
+                    resumeButton(
+                        item: item,
+                        file: file,
+                        durationMs: durationMs,
+                        resumeMs: resumeMs,
+                        canResume: canResume
+                    )
+                    if canResume {
+                        startOverButton(item: item, file: file, durationMs: durationMs)
+                    }
+                }
+                watchButton(detail)
+            }
+            .frame(maxWidth: hasPlayback ? .infinity : 220, alignment: .leading)
+        } else {
+            VStack(alignment: .leading, spacing: 9) {
+                if let file, item.isPlayable {
+                    resumeButton(
+                        item: item,
+                        file: file,
+                        durationMs: durationMs,
+                        resumeMs: resumeMs,
+                        canResume: canResume
+                    )
+                }
+
+                HStack(spacing: 9) {
+                    if let file, item.isPlayable, canResume {
+                        startOverButton(item: item, file: file, durationMs: durationMs)
+                    }
+                    watchButton(detail)
+                }
+                .frame(maxWidth: hasSecondaryPair ? .infinity : 190, alignment: .leading)
+            }
+        }
+    }
+    #endif
 
     @ViewBuilder
     private func playbackActions(
@@ -1023,7 +1233,7 @@ struct DetailView: View {
         resumeMs: Int,
         canResume: Bool
     ) -> some View {
-        let button = PrimaryButton(title: canResume ? "▶  Resume · \(formatTime(resumeMs))" : "▶  Play") {
+        let action = {
             play = PlayContext(
                 itemId: item.id,
                 fileId: file.id,
@@ -1036,9 +1246,28 @@ struct DetailView: View {
             )
         }
         #if os(tvOS)
+        let button = PrimaryButton(
+            title: canResume ? "▶  Resume · \(formatTime(resumeMs))" : "▶  Play",
+            action: action
+        )
         button.focused($tvFocusedAction, equals: .primaryAction)
         #else
-        button
+        Button(action: action) {
+            HStack(spacing: 8) {
+                Image(systemName: "play.fill")
+                    .font(.system(size: 12, weight: .bold))
+                Text(canResume ? "Resume" : "Play")
+                if canResume {
+                    Text(formatTime(resumeMs))
+                        .font(.system(.caption, design: .monospaced).weight(.semibold))
+                        .foregroundStyle(.white.opacity(0.72))
+                }
+            }
+            .font(.subheadline.weight(.semibold))
+            .lineLimit(1)
+        }
+        .buttonStyle(IOSDetailPrimaryActionButtonStyle())
+        .accessibilityLabel(canResume ? "Resume from \(formatTime(resumeMs))" : "Play")
         #endif
     }
 
@@ -1055,13 +1284,19 @@ struct DetailView: View {
                 overview: item.overview
             )
         } label: {
+            #if os(tvOS)
             Text("Start over")
                 .font(.system(.body, design: .monospaced))
+            #else
+            Label("Start over", systemImage: "arrow.counterclockwise")
+                .font(.subheadline.weight(.semibold))
+                .lineLimit(1)
+            #endif
         }
         #if os(tvOS)
         .buttonStyle(TVReadableButtonStyle(prominent: false))
         #else
-        .buttonStyle(IOSFullWidthActionButtonStyle(prominent: false))
+        .buttonStyle(IOSDetailSecondaryActionButtonStyle(selected: false))
         #endif
     }
 
