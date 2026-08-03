@@ -58,12 +58,18 @@
   @media(max-width:640px){
     header.top{flex-wrap:wrap;gap:8px;padding:10px 14px}
     .top .spacer{display:none}
-    .logo{order:1;font-size:19px}
-    .topctl{order:2;margin-left:auto;gap:6px}
-    .top nav{order:3;flex-basis:100%;justify-content:space-between;flex-wrap:nowrap;gap:2px}
-    .top nav a{flex:1;text-align:center;padding:8px 6px}
-    .search{order:4;flex-basis:100%;max-width:none;width:100%}
-    .activity{order:5;flex-basis:100%}
+    /* Scoped to header.top, not global. .logo, .search, .topctl and .activity
+       all appear in other layouts' chrome, and an unscoped `order:` reached in
+       and reshuffled a bar it was never written for — found when theater's
+       phone chrome came out in classic's order. A rule that names a component
+       has to name the container it belongs to, or every later layout inherits
+       a phone layout nobody designed for it. */
+    header.top .logo{order:1;font-size:19px}
+    header.top .topctl{order:2;margin-left:auto;gap:6px}
+    header.top nav{order:3;flex-basis:100%;justify-content:space-between;flex-wrap:nowrap;gap:2px}
+    header.top nav a{flex:1;text-align:center;padding:8px 6px}
+    header.top .search{order:4;flex-basis:100%;max-width:none;width:100%}
+    header.top .activity{order:5;flex-basis:100%}
     .getappbtn{display:none}          /* the install banner already covers this on phones */
     .sizebtn span{display:none}       /* icon-only to save width */
     main{padding:16px 14px 60px}
@@ -1560,6 +1566,651 @@
     [data-layout=plex] .px-hero .chips>span{border:1px solid CanvasText;background:Canvas}
     [data-layout=plex] .px-kick{color:CanvasText}
   }
+/* ========================== theater layout =================================
+   G4. Paste into the stylesheet block of crates/plurxd/src/web/index.html,
+   after the plex layout block and just before the closing style tag. (Written
+   without the literal closing tag on purpose: inside a raw-text element that
+   sequence ends the stylesheet, and the rest of this file then renders as a
+   wall of visible prose. Found the hard way in this gate's harness.)
+
+   Structure only. EVERY selector in this file is scoped under
+   [data-layout=theater] — one unscoped rule reaches classic, and
+   `scripts/ui-baseline --check` now sweeps every registered layout and
+   compares a structural golden, so an unscoped rule fails the gate on a
+   layout it was never meant to touch.
+
+   Colour rule, without exception: structural surfaces are token mixes
+   (color-mix over --bg / --panel / --panel2 / --accent), never literal hex.
+   On 2026-07-22 a set of hardcoded dark hexes shipped and every light theme
+   grew black boxes. Ten themes x light/dark ship today and a full-bleed hero
+   with a scrim is the single highest-risk surface in the app for that bug:
+   the mockup's `linear-gradient(180deg,rgba(0,0,0,.55),transparent)` top bar
+   is exactly the defect, and it is NOT reproduced here. Every scrim stop
+   below is a --bg mix, so the wash darkens on a dark palette and lightens on
+   a light one, and on Void (--bg #000) it degrades to a true-black fade
+   rather than a grey band. The only literal colours in this file are inside
+   @media (forced-colors: active), where system keywords are the required
+   spelling.
+
+   Shape is decided by width/pointer media queries rather than by
+   surfaceClass() in JS: theaterChrome() emits the desktop nav AND the phone
+   pill bar on every surface and CSS decides which is real, so a dragged
+   window changes shape live with no re-render and no stale JS branch.
+
+   Two geometry variables carry the whole layout so the fixed bar, the
+   negative hero margins and the sticky chip bar can never disagree:
+     --th-top   the height of the fixed top bar
+     --th-gut   the page gutter
+   ========================================================================= */
+
+[data-layout=theater]{--th-top:64px; --th-gut:34px; --th-lead:74px}
+
+/* ---- shell ------------------------------------------------------------ */
+/* main is the full width of the window: this layout has no measure. The lead
+   padding clears the fixed bar; the art-fronted views cancel it with a
+   matching negative margin (the pattern classic's .hero already uses), which
+   is what lets a hero run under a translucent bar with no JS. */
+[data-layout=theater] main#main{
+  max-width:none; margin:0; padding:var(--th-lead) var(--th-gut) 96px}
+
+/* The bar. Fixed, not sticky: sticky would occupy layout space at the top of
+   the document and push the hero down, and the whole point of theater is that
+   the art starts at pixel row 0 and the chrome floats on it.
+
+   The background is a two-stop --bg mix rather than a solid: over artwork it
+   reads as a fade (the "translucent top bar that fades over art" of plan
+   §3.3), over a plain page it reads as the page. backdrop-filter is a
+   progressive enhancement — where it is unsupported the mix alone still
+   separates the bar from the art. */
+[data-layout=theater] .th-top{
+  position:fixed; top:0; left:0; right:0; z-index:30;
+  display:flex; align-items:center; gap:20px;
+  min-height:var(--th-top); padding:0 var(--th-gut);
+  background:linear-gradient(180deg,
+    color-mix(in srgb, var(--bg) 78%, transparent) 0%,
+    color-mix(in srgb, var(--bg) 52%, transparent) 55%,
+    transparent 100%);
+  -webkit-backdrop-filter:blur(10px) saturate(1.05);
+  backdrop-filter:blur(10px) saturate(1.05)}
+/* Every label in the bar may sit on arbitrary artwork, so each one carries a
+   halo in the PAGE background colour. On a dark theme that is a dark glow
+   behind light text; on a light theme a light glow behind dark text. Same
+   declaration, opposite effect, which is the only way one rule survives ten
+   palettes. */
+[data-layout=theater] .th-top .logo,
+[data-layout=theater] .th-nav a,
+[data-layout=theater] .th-top .pname{
+  text-shadow:0 1px 10px color-mix(in srgb, var(--bg) 82%, transparent)}
+[data-layout=theater] .th-top .logo{font-size:19px}
+[data-layout=theater] .th-nav{display:flex; gap:4px; align-items:center}
+[data-layout=theater] .th-nav a{
+  padding:7px 12px; border-radius:999px; color:var(--muted); font-weight:600; font-size:14px;
+  letter-spacing:.01em}
+[data-layout=theater] .th-nav a:hover{
+  color:var(--text); background:color-mix(in srgb, var(--text) 10%, transparent)}
+/* Current page: tint AND weight AND a dot. Never colour alone — Silver's
+   accent is near-white at night and near-black by day, so a colour-only
+   "current" state is invisible in one of its two modes. */
+[data-layout=theater] .th-nav a.on{
+  color:var(--text); font-weight:700;
+  background:color-mix(in srgb, var(--accent) 20%, transparent)}
+[data-layout=theater] .th-nav a.on::after{
+  content:""; display:block; width:5px; height:5px; margin:3px auto -6px;
+  border-radius:50%; background:var(--accent)}
+[data-layout=theater] .th-top .spacer{flex:1}
+[data-layout=theater] .th-top .search{
+  max-width:210px;
+  background:color-mix(in srgb, var(--panel2) 72%, transparent);
+  border-color:color-mix(in srgb, var(--text) 20%, transparent)}
+[data-layout=theater] .th-ctl{display:flex; align-items:center; gap:14px}
+[data-layout=theater] .th-pop{position:relative}
+/* The shipped .activity pill is display:none until pollActivity() fills it;
+   in the bar it needs to sit on art like everything else. */
+[data-layout=theater] .th-top .activity{
+  background:color-mix(in srgb, var(--panel2) 78%, transparent)}
+/* The bar's ghost buttons are on art too — the shipped --panel2 fill is
+   opaque and reads as a chip, which is what we want; only the border needs
+   lifting so it does not vanish on a bright frame. */
+[data-layout=theater] .th-ctl .ghost{
+  border-color:color-mix(in srgb, var(--text) 18%, var(--line))}
+
+/* The phone pill nav. Present in the DOM on every surface, revealed by the
+   narrow query below — see the shell comment. */
+[data-layout=theater] .th-pills{display:none}
+
+/* ---- focus, on a bar that floats over artwork ------------------------------
+   This is theater's one genuinely new accessibility problem and it does not
+   inherit a solution: a 2px accent outline on a translucent bar is drawn
+   against whatever frame of whatever film happens to be behind it, so its
+   contrast is not a property of the theme at all.
+
+   The fix is three channels, none of them colour on its own:
+     1. an accent outline (the shipped focus vocabulary),
+     2. a HALO in --bg painted behind the outline via box-shadow, which gives
+        the ring a known-contrast plate no matter what the art is doing, and
+     3. an opaque backing plate on the focused control itself, so its LABEL is
+        legible and not only its border.
+   Because the halo and the plate are --bg mixes they invert with the palette,
+   and because they are geometry (a ring and a filled box) they survive
+   forced-colors, where the block at the end of this file restates them. */
+[data-layout=theater] .th-top a:focus-visible,
+[data-layout=theater] .th-top button:focus-visible,
+[data-layout=theater] .th-top input:focus-visible,
+[data-layout=theater] .th-pills a:focus-visible,
+[data-layout=theater] .th-hero a:focus-visible,
+[data-layout=theater] .th-hero button:focus-visible,
+[data-layout=theater] .th-chips select:focus-visible,
+[data-layout=theater] .poster:focus-visible{
+  outline:3px solid var(--accent); outline-offset:2px;
+  box-shadow:0 0 0 6px color-mix(in srgb, var(--bg) 88%, transparent)}
+[data-layout=theater] .th-top a:focus-visible,
+[data-layout=theater] .th-pills a:focus-visible{
+  color:var(--text);
+  background:color-mix(in srgb, var(--bg) 92%, var(--panel))}
+[data-layout=theater] .poster:focus-visible{border-color:var(--accent)}
+/* Focus inside the hero lands on art, so the hero's own buttons get the plate
+   treatment too — a ghost button over a bright frame is otherwise a ring
+   round an unreadable word. */
+[data-layout=theater] .th-hero .ghost:focus-visible{
+  background:color-mix(in srgb, var(--bg) 90%, var(--panel)); color:var(--text)}
+
+/* ---- the hero ------------------------------------------------------------
+   Full-bleed: the negative margin cancels main's gutter and lead padding so
+   the art reaches all four edges of the window and passes under the bar.
+
+   The element carries a token gradient as its OWN background and the backdrop
+   image rides in a child on top of it. That is the artwork budget from the
+   gate, in two parts: the wash is painted at first paint from tokens (nothing
+   to load, so the hero is never a blank rectangle while a JPEG decodes), and
+   an item with no backdrop at all — most home media, and every photo library
+   — simply keeps the wash instead of falling back to a blown-up poster,
+   which would be a second full-resolution fetch AND a 2:3 image stretched to
+   21:9. */
+[data-layout=theater] .th-hero{
+  position:relative; overflow:hidden;
+  margin:calc(-1 * var(--th-lead)) calc(-1 * var(--th-gut)) 0;
+  padding:calc(var(--th-top) + 26px) var(--th-gut) 34px;
+  min-height:64vh; display:flex; align-items:flex-end;
+  background:
+    radial-gradient(120% 120% at 78% 12%,
+      color-mix(in srgb, var(--accent) 26%, transparent) 0%, transparent 62%),
+    linear-gradient(150deg,
+      color-mix(in srgb, var(--accent2, var(--accent)) 16%, var(--panel)) 0%,
+      var(--bg) 72%)}
+/* The backdrop. background-image on a div, exactly like the shipped .herobg,
+   so it is ONE request for ONE URL and the item's own detail page reuses the
+   same cached bytes when you click through. The mask lets the wash beneath
+   show at the bottom edge, which is what makes the picture dissolve into the
+   page rather than stop at a line. */
+/* The mask stops are written against --text rather than the shipped .herobg's
+   #000 / rgba(0,0,0,.55). A mask uses ONLY the alpha channel, so the colour is
+   arbitrary and both spellings render identically — but "no literal hex
+   outside forced-colors" is a grep, not a judgement call, and a hex that is
+   provably harmless still has to be explained to every future reader and every
+   future gate. --text is opaque in all twenty palettes, so it is a free
+   opaque carrier. */
+[data-layout=theater] .th-hero .th-bg{
+  position:absolute; inset:0; background-size:cover; background-position:center 22%;
+  -webkit-mask-image:linear-gradient(180deg, var(--text) 0%, var(--text) 46%,
+    color-mix(in srgb, var(--text) 55%, transparent) 78%, transparent 100%);
+  mask-image:linear-gradient(180deg, var(--text) 0%, var(--text) 46%,
+    color-mix(in srgb, var(--text) 55%, transparent) 78%, transparent 100%)}
+/* The scrim. Two gradients, every stop a --bg mix:
+     vertical   dims under the bar, clears the middle so the picture is
+                actually visible, then closes to solid --bg at the floor so
+                the hero and the rails below it are one surface;
+     horizontal backs the text column on the left and releases by 78%.
+   On a light theme these mixes LIGHTEN, so the text column sits on a pale
+   wash and --text stays legible; on Void every stop resolves toward #000 and
+   the fade is true black. That is the whole reason there is not a single
+   rgba(0,0,0,x) in this file. */
+[data-layout=theater] .th-hero .th-scrim{
+  position:absolute; inset:0; pointer-events:none;
+  background:
+    linear-gradient(180deg,
+      color-mix(in srgb, var(--bg) 62%, transparent) 0%,
+      color-mix(in srgb, var(--bg) 14%, transparent) 34%,
+      color-mix(in srgb, var(--bg) 84%, transparent) 80%,
+      var(--bg) 100%),
+    linear-gradient(90deg,
+      color-mix(in srgb, var(--bg) 88%, transparent) 0%,
+      color-mix(in srgb, var(--bg) 46%, transparent) 46%,
+      transparent 78%)}
+[data-layout=theater] .th-hero .th-fg{position:relative; z-index:1; max-width:min(660px,88%)}
+/* Uppercase micro-label, the rail heading's voice at hero scale. */
+[data-layout=theater] .th-kick{
+  font:700 11px/1 var(--font-mono); letter-spacing:.22em; text-transform:uppercase;
+  color:var(--accent); margin:0 0 12px}
+[data-layout=theater] .th-title{
+  margin:0 0 10px; font-weight:800; line-height:1.02; letter-spacing:-.015em;
+  font-size:clamp(30px, 4.4vw, 54px);
+  /* Very long titles are a named degenerate state: three lines, then ellipsis,
+     so a 90-character home-video filename cannot push the buttons off screen. */
+  display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; overflow:hidden;
+  text-shadow:0 2px 22px color-mix(in srgb, var(--bg) 78%, transparent)}
+[data-layout=theater] .th-meta{
+  display:flex; gap:14px; align-items:center; flex-wrap:wrap;
+  font:13px var(--font-mono); color:var(--muted);
+  text-shadow:0 1px 10px color-mix(in srgb, var(--bg) 80%, transparent)}
+[data-layout=theater] .th-desc{
+  color:var(--prose); margin:12px 0 0; max-width:56ch;
+  display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; overflow:hidden;
+  text-shadow:0 1px 10px color-mix(in srgb, var(--bg) 80%, transparent)}
+[data-layout=theater] .th-hero .actions{margin:20px 0 0}
+[data-layout=theater] .th-hero .btnplay{border-radius:999px; padding:12px 26px}
+/* The pill treatment is for the LOCKUP only. Scoped to .actions because the
+   admin buttons ride in the <h1> — Refresh artwork is a `.ghost.sm` and an
+   unscoped rule here made it the same size as Play, which is a lie about what
+   the page is for. */
+[data-layout=theater] .th-hero .actions .ghost{
+  border-radius:999px; padding:12px 22px;
+  background:color-mix(in srgb, var(--panel2) 62%, transparent);
+  border-color:color-mix(in srgb, var(--text) 26%, transparent)}
+[data-layout=theater] .th-hero h1 .ghost.sm{
+  border-radius:999px; vertical-align:middle;
+  background:color-mix(in srgb, var(--panel2) 70%, transparent)}
+/* The hero's own progress bar: the one thing on the page that says "you are
+   58 minutes in", drawn as geometry so it survives forced colours. */
+[data-layout=theater] .th-hprog{
+  position:relative; width:min(300px,60%); height:4px; margin:16px 0 0;
+  border-radius:999px; background:color-mix(in srgb, var(--text) 24%, transparent)}
+[data-layout=theater] .th-hprog>i{
+  display:block; height:100%; border-radius:999px; background:var(--accent)}
+
+/* ---- rails ---------------------------------------------------------------
+   card() is not forked and neither is rail() or grid(). Everything below is
+   the same markup wearing theater's vocabulary: uppercase micro-labels,
+   larger posters, captions on hover. That is the thesis the G4 gate exists to
+   test, and a second card function is how five layouts become five apps. */
+[data-layout=theater] .th-rails{position:relative; padding:22px 0 0}
+[data-layout=theater] h2.section{
+  border-top:0; padding-top:0; margin:30px 2px 12px;
+  font-size:12px; font-weight:700; letter-spacing:.16em; text-transform:uppercase;
+  color:var(--muted)}
+[data-layout=theater] h2.section:first-child{margin-top:6px}
+
+/* Larger posters. Note the variable: the SHIPPED name is --poster (set on
+   <html> by applyPosterSize() from the user's icon-size preference), not the
+   mockup's --w. Multiplying it rather than replacing it is deliberate — a
+   layout that hardcodes a poster width silently overrides a preference the
+   user set in the menu that is still on screen. Read on a DESCENDANT, so
+   there is no self-reference and no custom-property cycle. */
+[data-layout=theater] .th-rails .rowscroll{
+  grid-auto-columns:calc(var(--poster,120px) * 1.34); gap:20px}
+[data-layout=theater] .th-grid .grid,
+[data-layout=theater] .th-rails .grid{
+  grid-template-columns:repeat(auto-fill,minmax(calc(var(--poster,120px) * 1.34),1fr));
+  gap:22px 20px}
+
+/* Cards, theater vocabulary. The card is edgeless here: the artwork is the
+   object and the panel border round it is exactly the density theater is
+   spending.
+
+   The flex column is not cosmetic. The shipped .prog bar is absolutely
+   positioned against the CARD, which in classic is fine because the caption
+   is opaque and the bar sits on the bottom edge of a solid box. Here the card
+   is transparent and the caption is invisible at rest, so the bar floated in
+   a gap below the artwork with nothing under it, reading as a stray line
+   rather than as this film's progress. Ordering the three children puts it
+   back where it belongs — directly under the picture it describes — with no
+   change to card(). */
+[data-layout=theater] .poster{
+  background:transparent; border-color:transparent; border-radius:calc(var(--radius) + 2px);
+  display:flex; flex-direction:column}
+[data-layout=theater] .poster .artbox{order:1}
+[data-layout=theater] .poster .prog{order:2; position:static; height:4px; margin-top:4px;
+  border-radius:999px; background:color-mix(in srgb, var(--text) 24%, transparent)}
+[data-layout=theater] .poster .prog>i{border-radius:999px}
+[data-layout=theater] .poster .meta{order:3}
+[data-layout=theater] .poster .artbox{
+  overflow:hidden; border-radius:calc(var(--radius) + 2px);
+  box-shadow:0 6px 20px color-mix(in srgb, var(--bg) 70%, transparent)}
+[data-layout=theater] .poster:hover{
+  border-color:transparent}
+[data-layout=theater] .poster:hover .artbox{
+  box-shadow:0 14px 34px color-mix(in srgb, var(--bg) 78%, transparent),
+             0 0 0 2px color-mix(in srgb, var(--accent) 70%, transparent)}
+[data-layout=theater] .poster .meta{padding:9px 2px 4px}
+
+/* Hover captions.
+   Captions are hidden at REST and revealed on hover / focus-within, which is
+   the immersive-wall look plan §3.3 asks for. Three constraints on that:
+
+   1. It is opacity, never display or visibility. The text stays in the
+      accessibility tree and in the DOM digest, and the box keeps its height,
+      so nothing reflows when a caption appears and the structural golden sees
+      the same tree it always did.
+   2. It is inside @media (hover:hover) and (pointer:fine) ONLY. On touch and
+      on a television there is no hover, so there is no "at rest" state a
+      caption could hide in — those surfaces keep every caption visible. The
+      television block below re-asserts that.
+   3. Watch state does NOT live in the caption. The progress bar (.prog), the
+      watched tick (.badge) and the duration chip are on the artwork, outside
+      .meta, so what the card says about where you are in something is visible
+      statically whatever the pointer is doing.
+   This is a deliberate, logged density trade — see NOTES §7. */
+@media (hover:hover) and (pointer:fine){
+  [data-layout=theater] .th-rails .poster .meta,
+  [data-layout=theater] .th-grid .poster .meta{opacity:.0}
+  [data-layout=theater] .th-rails .poster:hover .meta,
+  [data-layout=theater] .th-rails .poster:focus-visible .meta,
+  [data-layout=theater] .th-rails .poster:focus-within .meta,
+  [data-layout=theater] .th-grid .poster:hover .meta,
+  [data-layout=theater] .th-grid .poster:focus-visible .meta,
+  [data-layout=theater] .th-grid .poster:focus-within .meta{opacity:1}
+  /* …and a card with NO artwork keeps its caption at rest, always. The
+     initials tile identifies nothing — hiding the only text on a card whose
+     picture is two letters on a flat fill leaves a wall of blank rectangles,
+     which is the "no art" degenerate state, not a design. */
+  [data-layout=theater] .poster:has(.art.ph) .meta{opacity:1}
+}
+
+/* ---- library: the floating filter-chip bar -------------------------------
+   The controls are classic's three <select>s, re-emitted verbatim by
+   theaterLibraryShell() including their onchange strings — behaviour is not a
+   layout's to retype. What is a layout's is the shape, so here they are
+   painted as pills in a bar that floats under the top chrome.
+
+   Sticky at exactly --th-top so it comes to rest against the fixed bar rather
+   than under it or in front of it. The gradient tail is what makes the grid
+   dissolve as it scrolls beneath instead of clipping on a hard edge. */
+[data-layout=theater] .th-chips{
+  position:sticky; top:var(--th-top); z-index:25;
+  display:flex; gap:10px; align-items:center; flex-wrap:wrap;
+  margin:0 calc(-1 * var(--th-gut)) 6px; padding:12px var(--th-gut) 16px;
+  background:linear-gradient(180deg, var(--bg) 62%, transparent)}
+[data-layout=theater] .th-chips .lbl{
+  font:600 10.5px/1 var(--font-mono); letter-spacing:.14em; text-transform:uppercase;
+  color:var(--muted); margin:0}
+[data-layout=theater] .th-chips select{
+  width:auto; min-width:0; border-radius:999px; padding:7px 14px; font-size:13px;
+  background:color-mix(in srgb, var(--panel2) 88%, var(--bg));
+  border:1px solid color-mix(in srgb, var(--text) 16%, var(--line)); color:var(--text)}
+[data-layout=theater] .th-chips select:hover{
+  border-color:color-mix(in srgb, var(--accent) 55%, var(--line))}
+[data-layout=theater] .th-chips .th-cpair{display:inline-flex; align-items:center; gap:7px}
+[data-layout=theater] .th-chips #libcount{
+  margin-left:auto; font:12px var(--font-mono); color:var(--muted)}
+[data-layout=theater] .th-grid{padding:6px 0 0}
+/* The A–Z rail is a fixed gutter element; it only needs to clear theater's
+   wider gutter. Its mount is placed by the shell — the rail markup is still
+   alphaRailHtml()'s. */
+[data-layout=theater] .azbar{right:10px}
+
+/* ---- item detail: full-screen backdrop, facts in the lower third ---------
+   Same hero element, taller, and the facts sit at the bottom because that is
+   where the eye ends up after the picture. min-height is the viewport less
+   the lead, so the backdrop owns the first screen and the version cards /
+   episode list begin below the fold. */
+[data-layout=theater] .th-detail{min-height:calc(100vh - 40px); align-items:flex-end}
+/* An item with NO backdrop reserves no screen for one. min-height is an
+   artwork budget and there is no artwork: a season with only a poster would
+   otherwise open on two thirds of a screen of empty wash, which on a light
+   theme is indistinguishable from a page that failed to load. The home hero
+   keeps presence (it is the featured item) but stops short of full-bleed. */
+[data-layout=theater] .th-hero.th-noart{min-height:44vh}
+[data-layout=theater] .th-detail.th-noart{min-height:auto}
+[data-layout=theater] .th-detail .th-fg{max-width:min(820px,92%)}
+[data-layout=theater] .th-detail .pagehead{margin-bottom:16px}
+[data-layout=theater] .th-detail .crumbs,
+[data-layout=theater] .th-detail .pgback{
+  text-shadow:0 1px 10px color-mix(in srgb, var(--bg) 82%, transparent)}
+[data-layout=theater] .th-detail .pgback{
+  background:color-mix(in srgb, var(--panel) 76%, transparent)}
+[data-layout=theater] .th-detail h1{
+  margin:0 0 10px; font-weight:800; line-height:1.04; letter-spacing:-.015em;
+  font-size:clamp(26px, 3.6vw, 46px);
+  text-shadow:0 2px 22px color-mix(in srgb, var(--bg) 78%, transparent)}
+[data-layout=theater] .th-detail .chips{
+  font:13px var(--font-mono);
+  text-shadow:0 1px 10px color-mix(in srgb, var(--bg) 80%, transparent)}
+[data-layout=theater] .th-detail .chips>span{
+  background:color-mix(in srgb, var(--panel2) 60%, transparent);
+  border:1px solid color-mix(in srgb, var(--text) 16%, transparent);
+  border-radius:999px; padding:3px 11px}
+[data-layout=theater] .th-detail .overview{
+  max-width:64ch; margin:14px 0 0;
+  display:-webkit-box; -webkit-line-clamp:4; -webkit-box-orient:vertical; overflow:hidden;
+  text-shadow:0 1px 10px color-mix(in srgb, var(--bg) 80%, transparent)}
+[data-layout=theater] .th-detail .vbadges{margin-top:12px}
+[data-layout=theater] .th-detail .playinfo{
+  text-shadow:0 1px 10px color-mix(in srgb, var(--bg) 80%, transparent)}
+/* The poster rides beside the facts. Small, because the backdrop is already
+   doing the work of identifying the film; it is here because a season or a
+   folder often has no backdrop at all and the wash alone identifies nothing. */
+[data-layout=theater] .th-dposter{
+  flex:0 0 auto; width:150px; align-self:flex-end; margin-right:26px;
+  border-radius:var(--radius); overflow:hidden;
+  box-shadow:0 14px 40px color-mix(in srgb, var(--bg) 76%, transparent)}
+[data-layout=theater] .th-dposter .art{aspect-ratio:2/3; width:100%; object-fit:cover; display:block}
+[data-layout=theater] .th-dwrap{
+  position:relative; z-index:1; display:flex; align-items:flex-end; width:100%}
+/* Everything under the fold — version cards, episode list, children grid —
+   gets the full width, the same split plex made. Nothing MOVES between the
+   two that changes what is on the page. */
+[data-layout=theater] .th-rest{padding:34px 0 0}
+[data-layout=theater] .th-rest .eplist,
+[data-layout=theater] .th-rest .version{
+  background:color-mix(in srgb, var(--panel) 88%, var(--bg))}
+
+/* ---- classic bodies rendered inside theater chrome -----------------------
+   Activity, Settings, Search and Auth are unconverted: they emit their
+   shipped markup into theater's #main. Two rules keep them from looking
+   broken in a wider gutter. */
+[data-layout=theater] .getapp{margin:0 0 20px}
+/* classic's item hero would otherwise re-apply its own -22px/-20px margins
+   inside theater's gutter and leave a lip. Theater converts the item route,
+   so this only fires if a future route reuses .hero. */
+[data-layout=theater] .hero:not(.th-hero){margin:0 0 22px}
+
+/* ============================ narrow / phone ==============================
+   899px because surfaceClass() calls a coarse pointer under 900px "mobile",
+   so every device the app treats as a phone is inside this query — and a
+   mouse-driven window dragged this narrow gets the same shape, which is the
+   point of doing it in CSS rather than in a JS branch.
+
+   Per plan §2.5 the phone expression is "full-bleed hero + floating pill
+   nav": the bar keeps the wordmark, the search field and the controls in one
+   row, and navigation drops to a floating pill group at the bottom. There is
+   exactly one #q in the document either way — the search field never moves in
+   the DOM, only in the flexbox. */
+@media (max-width:899px){
+  [data-layout=theater]{--th-top:56px; --th-gut:14px; --th-lead:64px}
+  [data-layout=theater] main#main{padding-bottom:104px}
+  [data-layout=theater] .th-top{gap:10px}
+  /* Explicit order on all three, because the SHIPPED phone header rules at
+     max-width:640px are unscoped — `.logo{order:1}` and `.search{order:4}`
+     reach inside this bar and reorder it, while .th-ctl (order:0) jumped to
+     the front. A layout that inherits half an order is a layout whose header
+     rearranges itself at 640px for no reason anyone can see. */
+  [data-layout=theater] .th-top .logo{font-size:16px; flex:0 0 auto; order:1}
+  [data-layout=theater] .th-nav{display:none}
+  [data-layout=theater] .th-top .spacer{display:none}
+  [data-layout=theater] .th-top .search{flex:1 1 auto; min-width:0; max-width:none; order:2}
+  [data-layout=theater] .th-ctl{gap:8px; flex:0 0 auto; order:3}
+  [data-layout=theater] .th-top .activity{display:none}
+  [data-layout=theater] .th-hero{min-height:56vh; padding-bottom:26px}
+  [data-layout=theater] .th-hero .th-fg{max-width:100%}
+  [data-layout=theater] .th-detail{min-height:auto; padding-bottom:30px}
+  [data-layout=theater] .th-dposter{width:104px; margin-right:16px}
+  /* Floating pill nav. Fixed and safe-area aware — an iPhone home indicator
+     otherwise sits on top of it. */
+  [data-layout=theater] .th-pills{
+    display:flex; position:fixed; z-index:45; left:50%; transform:translateX(-50%);
+    bottom:calc(14px + env(safe-area-inset-bottom,0px));
+    gap:4px; padding:5px; border-radius:999px;
+    background:color-mix(in srgb, var(--panel) 92%, var(--bg));
+    border:1px solid color-mix(in srgb, var(--text) 14%, var(--line));
+    box-shadow:0 10px 30px color-mix(in srgb, var(--bg) 72%, transparent)}
+  [data-layout=theater] .th-pills a{
+    padding:9px 18px; border-radius:999px; font-size:13px; font-weight:600; color:var(--muted)}
+  [data-layout=theater] .th-pills a.on{
+    color:var(--text); font-weight:700;
+    background:color-mix(in srgb, var(--accent) 24%, transparent);
+    box-shadow:inset 0 0 0 1px color-mix(in srgb, var(--accent) 60%, transparent)}
+  /* html.working is on <html>, so this is one compound selector, not a
+     descendant pair — the usual mistake here renders nothing at all. */
+  html.working[data-layout=theater] .th-pills a[data-tab=activity]{position:relative}
+  html.working[data-layout=theater] .th-pills a[data-tab=activity]::after{
+    content:""; position:absolute; top:5px; right:9px; width:6px; height:6px;
+    border-radius:50%; background:var(--accent)}
+  [data-layout=theater] .th-chips{gap:8px; padding:10px var(--th-gut) 12px}
+  [data-layout=theater] .th-chips #libcount{margin-left:0; flex-basis:100%}
+  [data-layout=theater] .azbar{right:2px}
+}
+
+/* ============================== television ================================
+   The same test surfaceClass() uses for "tv": no pointing device at all, or a
+   coarse hoverless pointer on a very wide screen (a remote driving a cursor).
+
+   Per plan §2.5 and brand/NOIRR_PLAYER.md: one quiet nav row, the focused
+   title owns the upper half, no admin surfaces on the television, and focus
+   is ALWAYS scale + ring + depth together — never colour alone, so Silver
+   (whose accent is near-white at night) keeps a visible focus. */
+@media (pointer:none), (hover:none) and (pointer:coarse) and (min-width:1280px){
+  [data-layout=theater]{--th-top:76px; --th-gut:56px; --th-lead:88px}
+  [data-layout=theater] main#main{font-size:17px; padding-bottom:120px}
+  /* Quiet: no search box and no controls competing with the picture. They are
+     hidden, not removed, so the DOM and the focus order are the same document
+     on every surface and a resized window needs no re-render. */
+  [data-layout=theater] .th-top .search,
+  [data-layout=theater] .th-top .activity,
+  [data-layout=theater] .th-ctl,
+  [data-layout=theater] .th-pills{display:none}
+  [data-layout=theater] .th-nav{display:flex; gap:10px}
+  [data-layout=theater] .th-nav a{font-size:17px; padding:10px 18px}
+  /* Admin surfaces do not belong on a television — you do not reanalyze a
+     file with a remote. The hook is a class the renderers put on every admin
+     control, so this is one rule rather than one per button. */
+  [data-layout=theater] .th-admin{display:none}
+  /* The hero owns the upper half. */
+  [data-layout=theater] .th-hero{min-height:52vh}
+  [data-layout=theater] .th-detail{min-height:62vh}
+  [data-layout=theater] .th-title{font-size:clamp(38px,3.8vw,58px)}
+  /* Captions are never hidden here: there is no hover on a television, so
+     there would be no way to reveal them. The rule below out-specifies the
+     hover block above, which is already gated on (hover:hover). */
+  [data-layout=theater] .poster .meta{opacity:1}
+  /* Ten-foot focus: SCALE + RING + DEPTH, three independent channels.
+     z-index so the grown card is not clipped by its neighbours; the ring's
+     halo is a --bg mix so it works on a bright frame and on a black one. */
+  [data-layout=theater] .poster:focus-visible{
+    transform:scale(1.07); z-index:3;
+    outline:4px solid var(--accent); outline-offset:5px;
+    box-shadow:0 22px 52px color-mix(in srgb, var(--bg) 72%, transparent),
+               0 0 0 9px color-mix(in srgb, var(--bg) 78%, transparent)}
+  [data-layout=theater] .th-top a:focus-visible,
+  [data-layout=theater] .th-hero button:focus-visible,
+  [data-layout=theater] .th-hero a:focus-visible{
+    outline-width:4px; outline-offset:4px; transform:scale(1.04)}
+  [data-layout=theater] .eprow:focus-visible{
+    outline:4px solid var(--accent); outline-offset:-2px;
+    background:color-mix(in srgb, var(--accent) 14%, var(--panel2))}
+}
+
+/* ============================ reduced motion ==============================
+   Theater is the motion-heaviest design in the catalogue — bar fade, hero
+   wash, hover zooms, caption reveals — and every one of those is decorative,
+   so every one of them is OPT-IN here.
+
+   What each motion communicates is present without it: the caption still
+   appears on hover (it just does not fade in), the card under the pointer is
+   still marked (by the accent ring on .artbox, which is not animated), the
+   focused card on a television is still scaled and ringed (a transform
+   applied without a transition is still a transform). Nothing in this layout
+   carries information in movement alone. */
+@media (prefers-reduced-motion: no-preference){
+  [data-layout=theater] .poster .meta{transition:opacity .15s ease-out}
+  [data-layout=theater] .poster .artbox{transition:box-shadow .16s ease-out}
+  [data-layout=theater] .th-nav a,
+  [data-layout=theater] .th-pills a{transition:background-color .13s ease-out, color .13s ease-out}
+  [data-layout=theater] .th-chips select{transition:border-color .13s ease-out}
+  [data-layout=theater] .poster:focus-visible{transition:transform .14s ease-out}
+}
+/* The shipped .poster rule animates `transform` unconditionally and theater
+   cannot edit it, so it opts out here for anyone who asked for less motion.
+   The hover state stays legible because the ring above does not move. */
+@media (prefers-reduced-motion: reduce){
+  [data-layout=theater] .poster{transition:none}
+  [data-layout=theater] .poster:hover{transform:none}
+}
+
+/* ============================ forced colours ==============================
+   In forced-colors mode the UA replaces author colours wholesale, which
+   silently erases everything in this layout that carried meaning as a tint:
+   the current nav item, the focus halo, the filter chips, the hero progress
+   bar and the card's resume bar. System keywords are the sanctioned way to
+   put them back, so each one is restated against Highlight / CanvasText. */
+@media (forced-colors: active){
+  /* The bar's translucency is a colour effect and does not survive; give it a
+     real edge so it stops being an invisible band over the content. */
+  [data-layout=theater] .th-top{
+    background:Canvas; border-bottom:1px solid CanvasText;
+    -webkit-backdrop-filter:none; backdrop-filter:none}
+  /* forced-color-adjust:none on the current item is not an opt-out — every
+     colour it then uses is a system keyword. It is there to stop Chromium
+     painting its text "backplate" (a Canvas-coloured rectangle behind text
+     that sits on an author background), which lands Canvas ink on Highlight
+     and erases the label of the one item the user is on. */
+  [data-layout=theater] .th-nav a.on,
+  [data-layout=theater] .th-pills a.on{
+    forced-color-adjust:none; background:Highlight; color:HighlightText}
+  [data-layout=theater] .th-nav a.on::after{background:HighlightText}
+  [data-layout=theater] .th-top a:focus-visible,
+  [data-layout=theater] .th-top button:focus-visible,
+  [data-layout=theater] .th-top input:focus-visible,
+  [data-layout=theater] .th-pills a:focus-visible,
+  [data-layout=theater] .th-hero a:focus-visible,
+  [data-layout=theater] .th-hero button:focus-visible,
+  [data-layout=theater] .th-chips select:focus-visible,
+  [data-layout=theater] .poster:focus-visible{
+    outline:3px solid Highlight; outline-offset:2px; box-shadow:none}
+  /* A backdrop is a background IMAGE, which forced colours does not repaint —
+     it would survive as the one author-coloured thing on the page, with an
+     oversized title on top of it. Chromium's backplate keeps a heading
+     legible, but a backplate behind every line of a synopsis is not reading.
+     The picture is decoration, so it goes, and the scrim and the wash with
+     it. */
+  [data-layout=theater] .th-hero{background:Canvas}
+  [data-layout=theater] .th-hero .th-bg,
+  [data-layout=theater] .th-hero .th-scrim{display:none}
+  /* …and with the picture gone the height reserved FOR the picture is a
+     screenful of nothing above the facts. min-height is an artwork budget,
+     so it goes with the artwork. */
+  [data-layout=theater] .th-hero,
+  [data-layout=theater] .th-detail{min-height:auto; padding-top:calc(var(--th-top) + 18px)}
+  /* Every text shadow in this layout exists to separate ink from artwork.
+     With the artwork gone they are noise, and a shadow is not repainted. */
+  [data-layout=theater] .th-top .logo,
+  [data-layout=theater] .th-nav a,
+  [data-layout=theater] .th-title,
+  [data-layout=theater] .th-meta,
+  [data-layout=theater] .th-desc,
+  [data-layout=theater] .th-detail h1,
+  [data-layout=theater] .th-detail .chips,
+  [data-layout=theater] .th-detail .overview,
+  [data-layout=theater] .th-detail .playinfo,
+  [data-layout=theater] .th-detail .crumbs,
+  [data-layout=theater] .th-detail .pgback{text-shadow:none}
+  /* Chips read as a run-on line of words without a border. */
+  [data-layout=theater] .th-detail .chips>span{border:1px solid CanvasText; background:Canvas}
+  [data-layout=theater] .th-chips select{border:1px solid CanvasText}
+  /* Progress is "how far in am I", and both the fill and the track otherwise
+     collapse to the same system colour — i.e. it disappears entirely. */
+  [data-layout=theater] .th-hprog{
+    background:Canvas; border:1px solid CanvasText; forced-color-adjust:none}
+  [data-layout=theater] .th-hprog>i{background:Highlight; forced-color-adjust:none}
+  [data-layout=theater] .poster .prog{
+    background:Canvas; border:1px solid CanvasText; forced-color-adjust:none}
+  [data-layout=theater] .poster .prog>i{background:Highlight; box-shadow:none; forced-color-adjust:none}
+  /* The card is edgeless by design in this layout, and "edgeless" in forced
+     colours is "invisible". Give the artwork its box back. */
+  [data-layout=theater] .poster .artbox{box-shadow:none; outline:1px solid CanvasText}
+  /* A caption that can only be revealed by a colour effect is a caption that
+     is gone. Show them all. */
+  [data-layout=theater] .poster .meta{opacity:1}
+  [data-layout=theater] .th-pills{background:Canvas; border:1px solid CanvasText}
+}
 </style>
 <script>
 // Theme engine. Runs in <head> before first paint so there's no flash of the
@@ -1716,6 +2367,7 @@ applyPosterSize();
 const LAYOUTS={
   classic:{name:"Classic", surfaces:["desktop","mobile","tv"]},
   plex:{name:"Plex", surfaces:["desktop","mobile","tv"]},
+  theater:{name:"Theater", surfaces:["desktop","mobile","tv"]},
 };
 // Which kind of surface this browser is, from viewport and input capability —
 // never a user-agent string. UA sniffing is wrong the moment someone resizes a
@@ -3317,8 +3969,43 @@ async function loadItem(id){
   const it=d.item;
   const lib=libs.find(l=>l.id===it.library_id);
   d.files.forEach(f=>ITEM_FOR_FILE[f.id]=Number(id));
-  return {kind:"item", id:Number(id), item:it, files:d.files,
-    ancestors:d.ancestors||[], children:d.children||[], lib,
+  const files=d.files, children=d.children||[], ancestors=d.ancestors||[];
+  const best=files[0], multi=files.length>1;
+  const runtime=it.runtime_ms||(best&&best.duration_ms)||0;
+  // Resume threshold in ONE place. Three seconds is "you actually started it"
+  // rather than "you tapped it"; it appears on the button label, on the start-
+  // over affordance and in the autoplay path, and a layout that rounded it
+  // differently would offer to resume something the player restarts.
+  const resume=it.watch&&it.watch.position_ms>3000&&!it.watch.watched?it.watch.position_ms:0;
+  // The years a container spans, gathered from its seasons' air dates plus its
+  // own. A show wears a range; a season wears one year; everything else wears
+  // its year. Derived here because it is a fact about the item, not a choice
+  // about how to draw it.
+  let years=null;
+  if(it.kind==='show'){
+    const ys=children.map(c=>airYear(c.air_date)).filter(Boolean);
+    if(it.year) ys.push(it.year);
+    const y0=airYear(it.air_date); if(y0) ys.push(y0);
+    if(ys.length) years={from:Math.min(...ys), to:Math.max(...ys)};
+  } else if(it.kind==='season'){
+    const y=it.year||airYear(it.air_date); if(y) years={from:y,to:y};
+  } else if(it.year){ years={from:it.year,to:it.year}; }
+  // What this page IS, so a body builder switches on a name instead of
+  // re-deriving the same cascade of length checks. `folder` covers both the
+  // empty folder and the mirrored one, distinguished by children.length.
+  const shape = it.kind==='photo' ? "photo"
+    : files.length ? "versions"
+    : (children.length && children[0].kind==='episode') ? "episodes"
+    : children.length ? "children"
+    : it.kind==='folder' ? "folder" : "empty";
+  return {kind:"item", id:Number(id), item:it, files, ancestors, children, lib,
+    best, multi, runtime, resume, years, shape,
+    // The one file a Play button should reach for, and the label for the
+    // children grid — both were computed identically in two bodies.
+    playable: files.find(f=>f.available)||null,
+    childLabel: it.kind==='folder' ? 'Contents'
+      : (children[0]&&children[0].kind==='season') ? 'Seasons' : 'Episodes',
+    meta: playerMeta(it, ancestors),
     // Metadata editing is a home-library affair: elsewhere the provider agent
     // owns the fields and would overwrite a hand edit on the next refresh.
     editable: !!(ME&&ME.is_admin&&lib&&lib.kind==="home")};
@@ -3331,9 +4018,10 @@ async function viewItem(id){
   // One-click play from an episode list lands here and starts immediately.
   if(AUTOPLAY===Number(id)){
     AUTOPLAY=null;
-    const it=page.item, pf=page.files.find(f=>f.available);
-    if(pf){ const r=it.watch&&it.watch.position_ms>3000&&!it.watch.watched?it.watch.position_ms:0;
-      play(pf.id, it.title, r, pf.duration_ms||0, playerMeta(it, page.ancestors)); }
+    // Same file, same resume point, same metadata the buttons would have used:
+    // the autoplay path is a third caller of the model, not a third derivation.
+    const it=page.item, pf=page.playable;
+    if(pf) play(pf.id, it.title, page.resume, pf.duration_ms||0, page.meta);
   }
 }
 // Classic's item body — byte-for-byte what this app has always emitted.
@@ -3356,21 +4044,10 @@ function classicItemBody(p){
     .concat([{label:it.title}]);
   const crumbs=pageHead(trail);
 
-  const best=d.files[0];
-  const multi=d.files.length>1;
-  const runtime=it.runtime_ms||(best&&best.duration_ms);
+  const best=p.best, multi=p.multi, runtime=p.runtime;
   const chips=[];
   if(it.recorded_at){ chips.push(`<span>${esc(fmtDate(it.recorded_at))}</span>`); }
-  if(it.kind==='show'){
-    // A show wears the span of years it aired, gathered from its seasons'
-    // air dates (plus its own first-air year).
-    const ys=(d.children||[]).map(c=>airYear(c.air_date)).filter(Boolean);
-    if(it.year) ys.push(it.year);
-    const y0=airYear(it.air_date); if(y0) ys.push(y0);
-    if(ys.length){ const lo=Math.min(...ys), hi=Math.max(...ys); chips.push(`<span>${lo}${hi>lo?'–'+hi:''}</span>`); }
-  } else if(it.kind==='season'){
-    const y=it.year||airYear(it.air_date); if(y) chips.push(`<span>${y}</span>`);
-  } else if(it.year){ chips.push(`<span>${it.year}</span>`); }
+  if(p.years){ const y=p.years; chips.push(`<span>${y.from}${y.to>y.from?'–'+y.to:''}</span>`); }
   if(runtime) chips.push(`<span>${fmtDur(runtime)}</span>`);
   if(it.kind) chips.push(`<span>${esc(it.kind)}</span>`);
   // A container has no watch flag of its own, so say what it's made of:
@@ -3384,21 +4061,20 @@ function classicItemBody(p){
   const heroBadges = (best && !multi) ? specBadges(best) : "";
 
   let body="";
-  if(it.kind==='photo'){
+  if(p.shape==="photo"){
     // A photo is a picture, not a playback session: show it, and let a click
     // open the same full-screen view the grid uses.
     PHOTO_SET=[{id:it.id,title:it.title,recorded_at:it.recorded_at}];
     body+=`<div class="actions"><button class="btnplay" onclick="openLightbox(${it.id})">View full size</button></div>
       <img class="art" style="aspect-ratio:auto;max-height:60vh;width:auto;border-radius:var(--radius);cursor:zoom-in"
            src="${esc(photoUrl(it.id,'thumb'))}" alt="" onclick="openLightbox(${it.id})">`;
-  } else if(d.files.length){
+  } else if(p.shape==="versions"){
     // Movie / episode: play the best *available* version + labeled specs.
     // The player's info panel is fed from here — the detail response is the only
     // place that carries the synopsis and the show/season ancestry together.
-    const pmeta=playerMeta(it, d.ancestors);
-    const resume=it.watch&&it.watch.position_ms>3000&&!it.watch.watched?it.watch.position_ms:0;
+    const pmeta=p.meta, resume=p.resume;
     const watchBtn=watchControls(it);
-    const playable=d.files.find(f=>f.available);
+    const playable=p.playable;
     if(playable){
       body+=`<div class="actions">
         <button class="btnplay" onclick='play(${playable.id},${esc(JSON.stringify(it.title))},${resume},${playable.duration_ms||0},${esc(JSON.stringify(pmeta))})'>▶ ${resume?`Resume · ${fmtDur(resume)}`:'Play'}</button>
@@ -3420,20 +4096,20 @@ function classicItemBody(p){
         : '';
       return `<div class="version">${header}${specBlock(v)}${miss&&ME.is_admin&&v.missing_path?`<div class="problem">${esc(v.missing_path)}</div>`:''}${unprobedNote(v,it.id)}</div>`;
     }).join("");
-  } else if(d.children.length && d.children[0].kind==='episode'){
+  } else if(p.shape==="episodes"){
     // Season: episodes as a list.
     const acts=watchControls(it);
     body+=`${acts?`<div class="actions">${acts}</div>`:''}
       <h2 class="section" style="margin:18px 0 0">${d.children.length} episode${d.children.length>1?'s':''}</h2>
       <div class="eplist">${d.children.map(episodeRow).join("")}</div>`;
-  } else if(d.children.length){
+  } else if(p.shape==="children"){
     // Show, season, or a mirrored folder: children as a grid.
     const label = it.kind==='folder'? 'Contents'
-                : d.children[0].kind==='season'? 'Seasons' : 'Episodes';
+                : p.childLabel==='Seasons'? 'Seasons' : 'Episodes';
     const acts=watchControls(it);
     body+=`${acts?`<div class="actions">${acts}</div>`:''}
       <h2 class="section" style="margin:18px 0 12px">${label}</h2>${grid(d.children)}`;
-  } else if(it.kind==='folder'){
+  } else if(p.shape==="folder"){
     body+=`<div class="empty">This folder is empty.</div>`;
   }
 
@@ -7963,17 +8639,16 @@ function plexItemBody(p){
   // `acts` lands in the hero (the play lockup and anything that answers "can I
   // play this"); `rest` lands below it at full width.
   let acts="", rest="";
-  if(it.kind==='photo'){
+  if(p.shape==="photo"){
     // A photo is a picture, not a playback session.
     PHOTO_SET=[{id:it.id,title:it.title,recorded_at:it.recorded_at}];
     acts=`<div class="actions"><button class="btnplay" onclick="openLightbox(${it.id})">View full size</button></div>`;
     rest=`<img class="art px-photo" style="aspect-ratio:auto;max-height:60vh;width:auto;border-radius:var(--radius);cursor:zoom-in"
            src="${esc(photoUrl(it.id,'thumb'))}" alt="" onclick="openLightbox(${it.id})">`;
-  } else if(d.files.length){
-    const pmeta=playerMeta(it, d.ancestors);
-    const resume=it.watch&&it.watch.position_ms>3000&&!it.watch.watched?it.watch.position_ms:0;
+  } else if(p.shape==="versions"){
+    const pmeta=p.meta, resume=p.resume;
     const watchBtn=watchControls(it);
-    const playable=d.files.find(f=>f.available);
+    const playable=p.playable;
     if(playable){
       acts=`<div class="actions">
         <button class="btnplay" onclick='play(${playable.id},${esc(JSON.stringify(it.title))},${resume},${playable.duration_ms||0},${esc(JSON.stringify(pmeta))})'>▶ ${resume?`Resume · ${fmtDur(resume)}`:'Play'}</button>
@@ -7994,14 +8669,14 @@ function plexItemBody(p){
         : '';
       return `<div class="version">${header}${specBlock(v)}${miss&&ME.is_admin&&v.missing_path?`<div class="problem">${esc(v.missing_path)}</div>`:''}${unprobedNote(v,it.id)}</div>`;
     }).join("");
-  } else if(d.children.length && d.children[0].kind==='episode'){
+  } else if(p.shape==="episodes"){
     const a=watchControls(it);
     if(a) acts=`<div class="actions">${a}</div>`;
     rest=`<h2 class="section">${d.children.length} episode${d.children.length>1?'s':''}</h2>
       <div class="eplist">${d.children.map(episodeRow).join("")}</div>`;
-  } else if(d.children.length){
+  } else if(p.shape==="children"){
     const label = it.kind==='folder'? 'Contents'
-                : d.children[0].kind==='season'? 'Seasons' : 'Episodes';
+                : p.childLabel==='Seasons'? 'Seasons' : 'Episodes';
     const a=watchControls(it);
     if(a) acts=`<div class="actions">${a}</div>`;
     rest=`<h2 class="section">${label}</h2>${grid(d.children)}`;
@@ -8038,6 +8713,574 @@ LAYOUTS.plex.views.item = plexItemBody;
 LAYOUTS.plex.views.library = {shell:plexLibraryShell};
 LAYOUTS.plex.stickyFloor = plexStickyFloor;
 LAYOUTS.plex.libsChanged = plexLibsChanged;
+
+// ---- layout: theater — G4 ---------------------------------------------------
+//
+// Paste into the body <script> of crates/plurxd/src/web/index.html, after the
+// plex block and before the router (`let PAGE_TIMER=null;`).
+//
+// A `{name, surfaces}` stub must ALSO go into the <head> registry beside
+// classic's and plex's — see NOTES §1. Without it applyLayout() cannot resolve
+// a stored "theater" preference, <html data-layout> stays "classic", and not
+// one scoped rule in styles.css matches. It debugs like a stylesheet that
+// failed to load; it bit the plex port.
+//
+// What this file deliberately does NOT contain, same as the two drops before
+// it: a card renderer, a rail renderer, a grid renderer, an escape function,
+// or a fetch. Every view here is a composition of shipped helpers — card(),
+// rail(), grid(), comingCard(), installBannerHtml(), groupToggleHtml(),
+// specBadges(), specBlock(), unprobedNote(), episodeRow(), watchControls(),
+// pageHead(), artHtml(), photoUrl(), progressPct(), watchLine(), fmtDur(),
+// fmtDate(), endsAt(), esc(), tok(). Larger posters and hover captions are CSS
+// on that same shared card (`--poster`, `.meta` opacity), not a second card
+// function. A second card function is how five layouts become five apps, and
+// G4 is where that thesis gets tested.
+//
+// And it re-derives NOTHING that the page models carry. R4 landed with the G3
+// record precisely because plexItemBody re-derived ~70 lines of decisions from
+// classicItemBody — the year range, the resume threshold, the playable file,
+// the version-header rule, the children label. theaterItemBody switches on
+// `p.shape` and reads `p.resume` / `p.playable` / `p.meta` / `p.years` /
+// `p.runtime` / `p.childLabel` / `p.best` / `p.multi` / `p.editable`. Where a
+// decision is still missing from the model it is rendered AND logged as a
+// model gap in NOTES §5 rather than quietly re-derived a third time.
+//
+// Three seam shapes, per §3.2:
+//   chrome         (active, inner) -> assigns #app
+//   views.item     whole-body      (page) -> html for #main
+//   views.home     whole-body      (page) -> html for #main
+//   views.library  region-shaped   {shell}, resolved PER REGION; `items` and
+//                  `count` are inherited from classic untouched, because
+//                  theater does not differ from classic about what a grid of
+//                  posters or the word "items" is.
+
+// ---------------------------------------------------------------------------
+// 1. Chrome — a translucent bar over the art
+// ---------------------------------------------------------------------------
+// Same contract as classicChrome() and plexChrome(): assign #app, produce
+// <main id="main"> with `inner` inside it, wire the 300 ms search debounce,
+// end with pollActivity().
+//
+// The bar is fixed and floats ON the content rather than above it (styles.css
+// cancels main's lead padding inside the hero), which is the one structural
+// thing theater does that neither other layout does.
+//
+// Navigation is emitted TWICE and CSS decides which copy is real: the desktop
+// row (.th-nav) and the phone's floating pill group (.th-pills), per plan
+// §2.5. Same reason plex emits its sidebar and its tab bar on every surface —
+// a window dragged narrow changes shape live, with no re-render and no stale
+// JS branch. Both copies are anchors, both carry aria-current, and the two
+// never disagree because they are built from one list.
+//
+// Every control in the bar calls the SHIPPED popover functions —
+// toggleThemeMenu / toggleAppearanceMenu / toggleSizeMenu / toggleProfileMenu
+// — rather than a theater copy of them, so the layout picker inside the theme
+// menu keeps working from inside theater and a change to any of those menus
+// lands in all three layouts at once.
+function theaterNavItems(active){
+  const hash=location.hash||"#/";
+  // Library, category and search routes all call layoutChrome("home", …), so
+  // `active==="home"` alone would light Home while the user is looking at a
+  // library. Home means the home page.
+  const homeOn = active==="home" && (hash==="#/"||hash==="#"||hash==="");
+  const items=[{tab:"home", href:"#/", label:"Home", on:homeOn},
+               {tab:"activity", href:"#/activity", label:"Activity", on:active==="activity"}];
+  // Settings appears for admins only, and nowhere else in the shell — a
+  // non-admin sees no Settings anywhere in theater's chrome. (The account
+  // popover applies the same test to its own entry.)
+  if(ME&&ME.is_admin) items.push({tab:"settings", href:"#/settings", label:"Settings", on:active==="settings"});
+  return items;
+}
+function theaterNavHtml(active){
+  return theaterNavItems(active).map(i=>
+    `<a href="${i.href}" data-tab="${i.tab}" class="${i.on?"on":""}"${i.on?' aria-current="page"':""}>${esc(i.label)}</a>`
+  ).join("");
+}
+function theaterChrome(active, inner){
+  // ${APP_NAME}, never the literal product name — the shipped header's title
+  // attribute still says "plurx" here; that is a bug this layout does not copy.
+  const getapp = installAvailable()
+    ? `<button class="ghost sm getappbtn" onclick="showInstall()" title="Install the ${APP_NAME} app">Get app</button>` : "";
+  document.getElementById("app").innerHTML=`
+   <header class="th-top">
+     <a href="#/" class="logo">${APP_NAME}</a>
+     <nav class="th-nav" aria-label="Main">${theaterNavHtml(active)}</nav>
+     <span class="spacer"></span>
+     <span class="activity" id="activity" onclick="location.hash='#/activity'"></span>
+     <input class="search" id="q" placeholder="Search…" aria-label="Search ${APP_NAME}" value="${esc(getQ())}">
+     <div class="th-ctl">
+       <div class="th-pop">
+         <button class="ghost sm" onclick="toggleThemeMenu(event)" title="Theme &amp; layout" aria-label="Theme and layout"><span class="tsw"></span></button>
+         <div class="amenu" id="thememenu"></div>
+       </div>
+       <div class="th-pop">
+         <button class="ghost sm" onclick="toggleAppearanceMenu(event)" title="Light / dark" aria-label="Light or dark">◐</button>
+         <div class="amenu" id="appmenu"></div>
+       </div>
+       <div class="th-pop">
+         <button class="ghost sm sizebtn" onclick="toggleSizeMenu(event)" title="Icon size" style="display:inline-flex;align-items:center;gap:6px">
+           <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor" aria-hidden="true"><rect x="0" y="0" width="5" height="5" rx="1"/><rect x="7" y="0" width="5" height="5" rx="1"/><rect x="0" y="7" width="5" height="5" rx="1"/><rect x="7" y="7" width="5" height="5" rx="1"/></svg><span>Size</span>
+         </button>
+         <div class="amenu" id="sizemenu"></div>
+       </div>
+       ${getapp}
+       <div class="th-pop">
+         <button class="ghost sm profile" onclick="toggleProfileMenu(event)" title="Account">
+           <span class="pavatar">${esc((ME&&ME.username?ME.username[0]:"?").toUpperCase())}</span><span class="pname">${esc(ME?ME.username:"")}</span><span class="caret">▾</span>
+         </button>
+         <div class="amenu" id="profilemenu"></div>
+       </div>
+     </div>
+   </header>
+   <main id="main">${inner}</main>
+   <nav class="th-pills" aria-label="Sections">${theaterNavHtml(active)}</nav>`;
+  const q=document.getElementById("q");
+  let t; q.addEventListener("input",()=>{ clearTimeout(t); t=setTimeout(()=>{ location.hash= q.value?("#/search/"+encodeURIComponent(q.value)):"#/"; },300); });
+  theaterWireOnce();
+  pollActivity();
+}
+
+// ---------------------------------------------------------------------------
+// 2. The hero — which item, and why that one
+// ---------------------------------------------------------------------------
+// Plan §3.3 and the G4 entry conditions: the hero is your actual
+// continue-watching item, not a promo; it falls back to the newest
+// recently-added when the continue hub is empty; and it is PLAYABLE VIDEO
+// ONLY — never a folder, a photo, or a show/season container. Home video and
+// photo libraries still render as folders and grids below; they just never
+// front the page.
+//
+// Derived from the home model with no extra fetch: `p.hubs.continue_watching`
+// and `p.hubs.recently_added` are already on the page model, already ordered
+// newest-first by the server, and this function only filters and takes the
+// first survivor. Two hub arrays in, one item out.
+//
+// `next_up` is deliberately NOT a source. It is what you have not started, and
+// a hero captioned "continue watching" pointing at an episode you have never
+// seen is a lie about your own history; when nothing is in progress the honest
+// alternative is "new in your library", which is what the fallback says.
+const THEATER_HERO_KINDS={movie:1, episode:1, video:1};
+function theaterHeroPick(p){
+  const hubs=(p&&p.hubs)||{};
+  const ok=it=>!!it && THEATER_HERO_KINDS[it.kind]===1;
+  // Array order IS recency — the server returns both hubs newest-first, and
+  // re-sorting them here would be this layout inventing an opinion about data
+  // it does not own.
+  const cont=(hubs.continue_watching||[]).filter(ok)[0];
+  // "Resume" vs "Play" comes from WHICH HUB the item came from, never from a
+  // position threshold recomputed here. The 3-second resume rule lives in
+  // exactly one place — loadItem()'s `resume` — and the continue-watching hub
+  // is the server's own answer to "what am I in the middle of". A layout that
+  // rounded that threshold differently would offer to resume something the
+  // player then restarts, which is the class of bug R4 exists to end.
+  if(cont) return {item:cont, kick:"Continue watching", resuming:true};
+  const fresh=(hubs.recently_added||[]).filter(ok)[0];
+  if(fresh) return {item:fresh, kick:"New in your library", resuming:false};
+  // Nothing playable anywhere: a photo-only server, a brand-new install, a
+  // library of folders. The home body degrades to rails with no hero rather
+  // than throwing or fronting a folder.
+  return null;
+}
+function theaterHeroHtml(pick){
+  const it=pick.item;
+  // The backdrop the model already carries, and nothing else. artHtml() would
+  // reach for `poster` first, which is a 2:3 image and the WRONG picture for a
+  // 21:9 band — and on the cards below it is already being loaded at card
+  // size, so using it here would be a second full-resolution decode of an
+  // image the page has in another size. One URL, one request, and it is the
+  // same URL the item's own detail page uses, so clicking through is a cache
+  // hit rather than a fresh load.
+  //
+  // No backdrop — which is most home media, most episodes, and every photo —
+  // degrades to the token-mixed wash painted by .th-hero itself. Nothing to
+  // load, nothing to wait for, and it is a --bg/--accent mix so it is on-theme
+  // in all twenty palettes rather than a grey rectangle.
+  const bg=it.backdrop
+    ? `<div class="th-bg" style="background-image:url(${esc(tok(it.backdrop))})" aria-hidden="true"></div>` : "";
+  // The kicker carries the show name for an episode, so the headline can be
+  // the episode's own title without card()'s show-title swap being copied
+  // here — see NOTES §5.6.
+  const kick = it.kind==='episode' && it.show_title
+    ? `${pick.kick} · ${it.show_title}` : pick.kick;
+
+  const bits=[];
+  if(it.kind==='episode' && (it.season_number!=null||it.episode_number!=null))
+    bits.push(`<span>S${it.season_number||0}E${it.episode_number||0}</span>`);
+  if(it.kind==='video' && it.recorded_at) bits.push(`<span>${esc(fmtDate(it.recorded_at))}</span>`);
+  else if(it.year) bits.push(`<span>${esc(String(it.year))}</span>`);
+  // watchLine() is the shipped "23m left · ends ~10:45 PM" helper and it owns
+  // the position threshold itself, so the hero gets the same sentence the
+  // Continue-watching cards get, from the same code. It returns "" for a
+  // finished item, which is correct: nothing to say.
+  const left=watchLine(it, true);
+
+  const pct=progressPct(it.watch);
+  const prog = pct>0&&pct<100
+    ? `<div class="th-hprog" role="progressbar" aria-label="Progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(pct)}"><i style="width:${pct}%"></i></div>` : "";
+
+  // The primary action plays. It does not reimplement play(): it sets the
+  // shipped AUTOPLAY handoff and navigates, which is exactly what an episode
+  // row's ▶ button does. viewItem() then starts the file loadItem() picked, at
+  // the position loadItem() computed, with the metadata loadItem() built — so
+  // the hero needs no file id, no resume value and no /items/N fetch of its
+  // own, and the request log for the home route is unchanged.
+  const label = pick.resuming ? "▶ Resume" : "▶ Play";
+  return `<section class="th-hero${bg?'':' th-noart'}" aria-label="Featured">${bg}
+    <div class="th-scrim" aria-hidden="true"></div>
+    <div class="th-fg">
+      <div class="th-kick">${esc(kick)}</div>
+      <h1 class="th-title">${esc(it.title)}</h1>
+      <div class="th-meta">${bits.join("")}${left}</div>
+      ${it.overview?`<p class="th-desc">${esc(it.overview)}</p>`:""}
+      ${prog}
+      <div class="actions">
+        <button class="btnplay" onclick="AUTOPLAY=${it.id};location.hash='#/item/${it.id}'">${label}</button>
+        <button class="ghost" onclick="location.hash='#/item/${it.id}'">ⓘ Details</button>
+      </div>
+    </div>
+  </section>`;
+}
+
+// ---------------------------------------------------------------------------
+// 3. Home
+// ---------------------------------------------------------------------------
+// Same model, same helpers, different composition: one hero, then rails under
+// uppercase micro-labels. Hub headings keep the shipped wording ("Continue
+// watching", "Next up") and not a cinema rename — user-facing strings are
+// explicitly not a layout's to change, and a layout switch that renames things
+// the user has learned is a worse trade than the reference it buys.
+function theaterHomeBody(p){
+  const hub=k=>(p.hubs&&p.hubs[k])||[];
+  const pick=theaterHeroPick(p);
+  // The hero is emitted FIRST and outside .th-rails: styles.css cancels main's
+  // gutter and lead padding on it so it runs full-bleed under the fixed bar.
+  // With no hero, main's own padding already clears the bar and the page
+  // simply starts with the install banner — the empty-continue-hub and
+  // empty-server paths are the same code path, not a special case.
+  let html = pick ? theaterHeroHtml(pick) : "";
+  let body = installBannerHtml();
+
+  // watchCtx on the first two rails: those rows are about where you are in
+  // something, so the card carries "23m left · ends ~10:45 PM".
+  if(hub("continue_watching").length) body+=rail("Continue watching", hub("continue_watching").map(i=>card(i,true)).join(""));
+  if(hub("next_up").length)           body+=rail("Next up",           hub("next_up").map(i=>card(i,true)).join(""));
+  if(hub("recently_added").length)    body+=rail("Recently added",    hub("recently_added").map(i=>card(i)).join(""));
+  // Coming soon: absent entirely when nothing is paired or monarr had nothing
+  // to say — an empty rail is worse than no rail.
+  if(p.soon&&p.soon.entries&&p.soon.entries.length) body+=rail("Coming soon", p.soon.entries.map(comingCard).join(""));
+
+  if(p.libs.length){
+    body+=groupToggleHtml(p.group);
+    for(const s of p.sections){
+      const head=`${esc(s.name)} <a class="muted" style="font-size:12px" href="${esc(s.href)}">· view all (${esc(String(s.total))})</a>`;
+      // Two cases still take a grid rather than a rail, both inherited from
+      // the plex drop's reasoning. An EMPTY section, because rail() on an
+      // empty row renders a heading over nothing while grid([]) renders the
+      // "Nothing here yet." card the rest of the app uses; and any section
+      // holding PHOTOS, because grid() is what populates PHOTO_SET and
+      // without it the lightbox opens on one picture and cannot page to the
+      // next.
+      const photos=s.items.some(i=>i.kind==="photo");
+      body += (!s.items.length||photos)
+        ? `<h2 class="section">${head}</h2>${grid(s.items)}`
+        : rail(head, s.items.map(i=>card(i)).join(""));
+    }
+  } else {
+    body+=`<div class="empty">No libraries yet.${ME&&ME.is_admin?' Add one in <a href="#/settings">Settings</a>.':""}</div>`;
+  }
+  return html+`<div class="th-rails">${body}</div>`;
+}
+
+// ---------------------------------------------------------------------------
+// 4. Library — shell only (items and count are inherited from classic)
+// ---------------------------------------------------------------------------
+// The shell is rendered ONCE per entry into #main and owns the frame: page
+// head, the floating filter-chip bar, and the three region mounts (#libbody,
+// #libpager, #librail). It must never be re-rendered per batch, and #libbody's
+// CONTENTS — not #libbody itself — are what the loader replaces as pages land.
+// That is the whole reason this route is region-shaped: a 200-item library
+// redraws its grid five or six times while loading, and a body(model) contract
+// would take the reader's scroll position with it every time.
+//
+// The scroller stays the WINDOW, as in classic and plex. Making #libbody an
+// overflow:auto box would satisfy a literal reading of "#libbody is the thing
+// that scrolls" and would silently kill the shipped scroll-spy (one window
+// listener; scroll events do not bubble).
+//
+// The chips ARE classic's three <select>s, re-emitted verbatim including their
+// onchange strings — behaviour is not a layout's to retype, and a layout that
+// retypes it is a layout that can get it subtly wrong. The pill shape is CSS.
+// The `libbar` class stays on the bar because libGoPage() scrolls
+// `#main .libbar` into view after a page change; dropping it would leave
+// paging silently unanchored, which is a defect nobody would see in a
+// screenshot.
+function theaterLibraryShell(m){
+  const sort=m.sort;
+  const head=pageHead([{href:"#/",label:"Home"},{label:m.title}],m.title);
+  const bar=`<div class="libbar th-chips">
+      <span class="th-cpair"><span class="lbl">Sort</span>
+        <select aria-label="Sort" onchange="LIB_SORT=this.value;${m.reload}">
+          ${libOpt("title","Title (A–Z)",sort)}${libOpt("added","Recently added",sort)}${libOpt("recorded","Date recorded",sort)}${libOpt("year","Year",sort)}${libOpt("resolution","Resolution",sort)}</select></span>
+      <span class="th-cpair"><span class="lbl">Show</span>
+        <select aria-label="Show" onchange="LIB_FILTER=this.value;${m.reload}">
+          ${libOpt("all","Everything",LIB_FILTER)}${libOpt("unwatched","Unwatched",LIB_FILTER)}${libOpt("inprogress","In progress",LIB_FILTER)}${libOpt("watched","Watched",LIB_FILTER)}</select></span>
+      <span class="th-cpair"><span class="lbl">Per page</span>
+        <select aria-label="Per page" onchange="setPerPage(this.value);libGoPage(0)">
+          ${LIB_SIZES.map(n=>libOpt(String(n),String(n),String(LIB_PER))).join("")}${libOpt("all","All",String(LIB_PER))}</select></span>
+      <span class="muted" id="libcount"></span></div>`;
+  return `${head}${bar}<div class="th-grid"><div id="libbody"><div class="empty">Loading…</div></div></div>`
+    +`<div id="libpager"></div><div id="librail"></div>`;
+}
+
+// ---------------------------------------------------------------------------
+// 5. Item detail — full-screen backdrop, facts in the lower third
+// ---------------------------------------------------------------------------
+// Every branch classic has is here — photo, playable file, missing file,
+// multiple versions, season episode list, children grid, empty folder, rollup
+// chips, tags, watch controls, the edit and refresh-artwork admin buttons,
+// breadcrumbs — and every one of them is selected by `p.shape` rather than by
+// re-running classic's cascade of length checks.
+//
+// The structural difference from classic: classic puts EVERYTHING inside the
+// hero's text column, so a 26-episode list renders in a 1fr column beside a
+// poster. Theater splits at the natural seam — the backdrop screen carries
+// identity and the play lockup, and the detail below it (version cards,
+// episode list, children grid) gets the full width. Nothing moves between the
+// two that changes what is on the page; the file-missing warning stays WITH
+// the play lockup because it is the answer to "can I play this", not a
+// footnote.
+function theaterItemBody(p){
+  const it=p.item;
+
+  // Admin affordances. .th-admin is the hook the television surface hides them
+  // with (styles.css) — you do not reanalyze a file with a remote.
+  const artBtn = ME&&ME.is_admin
+    ? ` <button class="ghost sm th-admin" title="Re-fetch this item's poster and backdrop" aria-label="Refresh artwork" onclick="refreshArtwork(${it.id},this)">⟳ Refresh artwork</button>`
+    : '';
+  // `p.editable` — the model's answer, not a re-test of admin + library kind.
+  const editBtn = p.editable
+    ? ` <button class="ghost sm th-admin" title="Edit details" aria-label="Edit details" onclick='openEdit(${esc(JSON.stringify(it))})'>✎ Edit</button>`
+    : '';
+
+  const trail=[{href:"#/",label:"Home"}]
+    .concat(NAV_ORIGIN?[{href:NAV_ORIGIN.href,label:NAV_ORIGIN.label}]:[])
+    .concat((p.ancestors||[]).map(a=>({href:`#/item/${a.id}`,label:a.title})))
+    .concat([{label:it.title}]);
+  const crumbs=pageHead(trail);
+
+  // The kicker: kind above the title, the way a cinema detail page labels
+  // itself, with the year range beside it. `p.years` is the MODEL's range —
+  // gathered from the seasons' air dates plus the item's own — and is not
+  // recomputed here. That single field is 12 lines of duplicated cascade in
+  // classicItemBody and plexItemBody, and it is the headline example in the
+  // G3 record of the abstraction failing one layer down.
+  const yrs = p.years ? `${p.years.from}${p.years.to>p.years.from?'–'+p.years.to:''}` : '';
+  const kick=[it.kind?esc(it.kind):'', yrs].filter(Boolean).join(' · ');
+
+  const chips=[];
+  if(it.recorded_at) chips.push(`<span>${esc(fmtDate(it.recorded_at))}</span>`);
+  if(p.runtime) chips.push(`<span>${esc(fmtDur(p.runtime))}</span>`);
+  // A container has no watch flag of its own, so say what it is made of:
+  // "3 of 10 watched" is the thing the mark-watched buttons act on. This
+  // sentence is a DECISION and it is now written out for the third time in
+  // this file's history — NOTES §5.1 asks for `p.rollupLabel`.
+  if(it.rollup&&it.rollup.leaves){
+    const r=it.rollup;
+    chips.push(`<span>${r.watched===r.leaves?`all ${r.leaves} watched`:`${r.watched} of ${r.leaves} watched`}</span>`);
+  }
+  // Video badges show once: on the backdrop screen for a single version,
+  // per-version below when there are several, so nothing is duplicated.
+  // `p.best` and `p.multi` are the model's; the RULE that combines them is
+  // not — NOTES §5.2.
+  const heroBadges = (p.best && !p.multi) ? specBadges(p.best) : "";
+
+  // `acts` lands on the backdrop screen (the play lockup and anything that
+  // answers "can I play this"); `rest` lands below it at full width.
+  let acts="", rest="";
+  if(p.shape==="photo"){
+    // A photo is a picture, not a playback session: show it, and let a click
+    // open the same full-screen view the grid uses.
+    PHOTO_SET=[{id:it.id,title:it.title,recorded_at:it.recorded_at}];
+    acts=`<div class="actions"><button class="btnplay" onclick="openLightbox(${it.id})">View full size</button></div>`;
+    rest=`<img class="art th-photo" style="aspect-ratio:auto;max-height:64vh;width:auto;border-radius:var(--radius);cursor:zoom-in"
+           src="${esc(photoUrl(it.id,'thumb'))}" alt="" onclick="openLightbox(${it.id})">`;
+  } else if(p.shape==="versions"){
+    // Movie / episode / clip: play the best AVAILABLE version, plus labelled
+    // specs. `p.playable` and `p.resume` and `p.meta` are all the model's —
+    // the file pick, the 3-second threshold and the player's info payload are
+    // decided once, in loadItem(), for every layout.
+    const pmeta=p.meta, resume=p.resume, playable=p.playable;
+    const watchBtn=watchControls(it);
+    if(playable){
+      acts=`<div class="actions">
+        <button class="btnplay" onclick='play(${playable.id},${esc(JSON.stringify(it.title))},${resume},${playable.duration_ms||0},${esc(JSON.stringify(pmeta))})'>▶ ${resume?`Resume · ${fmtDur(resume)}`:'Play'}</button>
+        ${resume?`<button class="ghost" onclick='play(${playable.id},${esc(JSON.stringify(it.title))},0,${playable.duration_ms||0},${esc(JSON.stringify(pmeta))})'>Start over</button>`:''}
+        ${watchBtn}</div>`;
+      const pdur=playable.duration_ms||p.runtime||0, prem=resume?Math.max(0,pdur-resume):pdur, pend=endsAt(prem);
+      if(prem) acts+=`<div class="playinfo">${resume?fmtDur(prem)+" left":fmtDur(prem)}${pend?" · ends ~"+pend:""}</div>`;
+    } else {
+      // `mp`, not `p`: classic can shadow its page argument here because it
+      // never uses it again. This function's `p` is still live.
+      const mp=p.best?p.best.missing_path:null;
+      acts=`<div class="filemissing">⚠ This file is missing on the server, so it can’t be played — its library path may be unmounted, moved, or renamed${ME.is_admin&&mp?`:<br><code>${esc(mp)}</code>`:'.'}</div><div class="actions">${watchBtn}</div>`;
+    }
+    rest=p.files.map(v=>{
+      const miss=!v.available;
+      // Header (badges + per-version play) only when there are several
+      // versions to tell apart, or when a file is missing. A single version is
+      // already badged on the backdrop screen, so its block is just the spec
+      // detail. Third copy of that rule — NOTES §5.2.
+      const header=(p.multi||miss)
+        ? `<div class="vh"><span class="vbadges">${specBadges(v)||`<span class="vt">${esc(v.filename)}</span>`}${miss?'<span class="missbadge">missing</span>':''}</span>${(!miss&&p.multi)?`<button class="ghost sm" onclick='play(${v.id},${esc(JSON.stringify(it.title))},${resume},${v.duration_ms||0},${esc(JSON.stringify(pmeta))})'>▶ Play</button>`:''}</div>`
+        : '';
+      return `<div class="version">${header}${specBlock(v)}${miss&&ME.is_admin&&v.missing_path?`<div class="problem">${esc(v.missing_path)}</div>`:''}${unprobedNote(v,it.id)}</div>`;
+    }).join("");
+  } else if(p.shape==="episodes"){
+    const a=watchControls(it);
+    if(a) acts=`<div class="actions">${a}</div>`;
+    rest=`<h2 class="section">${p.children.length} episode${p.children.length>1?'s':''}</h2>
+      <div class="eplist">${p.children.map(episodeRow).join("")}</div>`;
+  } else if(p.shape==="children"){
+    const a=watchControls(it);
+    if(a) acts=`<div class="actions">${a}</div>`;
+    // `p.childLabel` straight, with no folder re-test on top of it: the model
+    // already answers 'Contents' for a folder, 'Seasons' for a show and
+    // 'Episodes' otherwise. classic and plex both wrap it in a ternary that
+    // recomputes the folder case the model had already handled.
+    rest=`<h2 class="section">${esc(p.childLabel)}</h2>${grid(p.children)}`;
+  } else if(p.shape==="folder"){
+    rest=`<div class="empty">This folder is empty.</div>`;
+  }
+  // p.shape==="empty" falls through with nothing below the fold, as classic
+  // does: an item with no files, no children and no folder kind has nothing
+  // truthful to put there.
+
+  const bg=it.backdrop
+    ? `<div class="th-bg" style="background-image:url(${esc(tok(it.backdrop))})" aria-hidden="true"></div>` : "";
+  return `<div class="th-hero th-detail${bg?'':' th-noart'}">${bg}
+    <div class="th-scrim" aria-hidden="true"></div>
+    <div class="th-dwrap">
+      <div class="th-dposter">${artHtml(it)}</div>
+      <div class="th-fg">${crumbs}
+        ${kick?`<div class="th-kick">${kick}</div>`:''}
+        <h1>${esc(it.title)}${editBtn}${artBtn}</h1>
+        ${chips.length?`<div class="chips">${chips.join("")}</div>`:''}
+        ${(it.tags&&it.tags.length)?`<div class="chips th-tags">${it.tags.map(t=>`<span>${esc(t)}</span>`).join("")}</div>`:''}
+        ${heroBadges?`<div class="vbadges">${heroBadges}</div>`:''}
+        ${it.overview?`<p class="overview">${esc(it.overview)}</p>`:''}
+        ${acts}</div>
+    </div></div>${rest?`<div class="th-rest">${rest}</div>`:''}`;
+}
+
+// ---------------------------------------------------------------------------
+// 6. stickyFloor — where the layout's own chrome stops and content begins
+// ---------------------------------------------------------------------------
+// The A–Z scroll-spy asks "which letter is at the top of the reading area?"
+// and needs a viewport y to measure against. classic answers with
+// header.top's bottom; theater has no header.top at all, so the shipped
+// fallback (56px) is a constant that happens to be close on a desktop and
+// wrong everywhere else.
+//
+// Theater floors content with TWO stacked bands on the library route: the
+// fixed top bar, and the sticky filter-chip bar that comes to rest against it.
+// Both are measured rather than read off the --th-top/--th-gut constants,
+// because the chip bar wraps to two rows on a narrow window and a television
+// runs a taller bar — and a measurement is the same answer whether the window
+// was resized or the page re-rendered, which a media-query branch in JS is
+// not.
+function theaterStickyFloor(){
+  let floor=0;
+  const top=document.querySelector(".th-top");
+  if(top){
+    const r=top.getBoundingClientRect();
+    // A bar that has scrolled away or is hidden floors nothing. The theater
+    // bar is position:fixed so this is normally always true, but the phone
+    // query and any future variant are covered by the measurement rather than
+    // by an assumption.
+    if(r.bottom>0 && r.top<=2) floor=Math.max(floor, r.bottom);
+  }
+  const chips=document.querySelector(".th-chips");
+  if(chips){
+    const r=chips.getBoundingClientRect();
+    // Only when the chip bar is actually PINNED — while it is still in normal
+    // flow further down the page it is content, not chrome, and counting it
+    // would push the spy line most of a screen down.
+    if(r.bottom>0 && r.top<=floor+2) floor=Math.max(floor, r.bottom);
+  }
+  return floor;
+}
+
+// ---------------------------------------------------------------------------
+// 7. One-time wiring: keyboard- and D-pad-operable cards
+// ---------------------------------------------------------------------------
+// A poster is a <div onclick=…>: clickable, but not focusable and not operable
+// from the keyboard. Theater is the TV flagship (plan §2.5) — without this
+// there is no D-pad path through the app at all, and the ten-foot focus
+// treatment in styles.css has nothing to attach to. A MutationObserver rather
+// than a call at the end of each view because theater does not own the
+// activity, settings or search views.
+//
+// The layoutId() guard is the important line: switching layout re-runs
+// render(), which repaints classic's DOM under the same live observer. Without
+// the check, classic would start emitting posters carrying tabindex — a diff
+// in the structural golden the gate re-checks after every layout lands.
+//
+// This is a near-copy of plexWireOnce()/plexEnhanceCards() and it should not
+// be. NOTES §5.5 asks for it to move into shared wiring behind a per-layout
+// flag before G5 — at five layouts it is five copies of the same observer.
+let THEATER_WIRED=false;
+function theaterEnhanceCards(){
+  if(layoutId()!=="theater") return;
+  for(const el of document.querySelectorAll(".poster[onclick]:not([tabindex])")){
+    el.setAttribute("tabindex","0");
+    // Cards that navigate are links; the photo cards call openLightbox() and
+    // are buttons. Announcing every card as a link would promise a page that a
+    // lightbox never delivers.
+    el.setAttribute("role", /location\.hash/.test(el.getAttribute("onclick")||"") ? "link" : "button");
+  }
+}
+function theaterWireOnce(){
+  if(THEATER_WIRED) return;
+  THEATER_WIRED=true;
+  document.addEventListener("keydown",e=>{
+    if(layoutId()!=="theater") return;
+    // The player and the lightbox own the keyboard while they are up; both of
+    // the shipped handlers guard on that and this one has to agree.
+    const modal=document.getElementById("modal");
+    if(lightboxOpen()||(modal&&modal.classList.contains("open"))) return;
+    const el=e.target;
+    if(!el||!el.classList||!el.classList.contains("poster")) return;
+    // Enter and Space are what a role=link/button promises. "Spacebar" is the
+    // legacy key name older WebKit still reports.
+    if(e.key!=="Enter"&&e.key!==" "&&e.key!=="Spacebar") return;
+    e.preventDefault();          // Space would otherwise page the grid down
+    el.click();                  // fires the inline handler card() emitted
+  });
+  // #app itself is never replaced (every view assigns to its innerHTML), so
+  // one observer on it outlives every route change.
+  const app=document.getElementById("app");
+  if(app&&window.MutationObserver) new MutationObserver(theaterEnhanceCards).observe(app,{childList:true,subtree:true});
+  theaterEnhanceCards();
+}
+
+// ---- registration ---------------------------------------------------------
+// `surfaces` includes tv: theater is the flagship television layout (§2.5).
+// `library` is region-shaped and deliberately partial — `items` and `count`
+// fall through to classic PER REGION, which is what the per-region fallback is
+// for and the difference between overriding a detail and reimplementing a
+// route.
+LAYOUTS.theater={name:"Theater", surfaces:["desktop","mobile","tv"],
+  chrome: theaterChrome,
+  views: {home: theaterHomeBody, item: theaterItemBody,
+          library: {shell: theaterLibraryShell}},
+  stickyFloor: theaterStickyFloor};
+// applyLayout() ran in the <head>, where the registry may not yet know this
+// id. Re-applying here is invisible — boot() has not resolved /server yet, so
+// #app is empty and there is nothing painted to reflow — and it is a belt to
+// the <head> stub's braces, not a replacement for it: layoutMenuHtml() and
+// ui-baseline's REGISTRY_JS both read LAYOUTS, but only the <head> copy runs
+// before first paint.
+applyLayout();
 
 // ---- router ---------------------------------------------------------------
 // One page-scoped poller at a time; routing away always clears it.
