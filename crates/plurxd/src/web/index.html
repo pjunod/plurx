@@ -6207,12 +6207,22 @@ async function renderActivityBody(){
   if(location.hash!=="#/activity") return;
   let d; try{ d=await api("/activity/detail"); }
   catch(e){ const m=document.getElementById("main"); if(m) m.innerHTML=`<div class="empty">${esc(e.message)}</div>`; return; }
-  const rows=d.sessions.map(se=>`<tr>
-    <td><b><a href="#/item/${se.item_id}">${esc(se.item_title)}</a></b></td>
-    <td>${esc(se.user_name)}</td>
-    <td>transcode · ${se.target_height}p · ${esc(se.encoder)}</td>
-    <td class="muted">${fmtAgo(se.started_unix)}${se.idle_seconds>30?` · idle ${Math.round(se.idle_seconds)}s`:''}</td>
-    <td style="text-align:right">${ME&&ME.is_admin?`<button class="ghost sm" onclick="stopSession(${esc(JSON.stringify(se.id))})">Stop</button>`:''}</td></tr>`).join("");
+  // S2's consumer check. This table read `d.sessions`, which is the transcode
+  // manager's list — so it showed transcodes and HLS copy-remuxes (mislabelled
+  // as transcodes) and missed direct play and progressive remux entirely. It
+  // now reads `d.deliveries`, which is every active delivery with its method
+  // recorded rather than inferred: the `encoder` label says "cached" on a cache
+  // hit and is rewritten by the hardware-to-software fallback, so a copy remux
+  // read off that string would relabel itself mid-play.
+  const dels=d.deliveries||d.sessions.map(se=>({method:"transcode",user:se.user_name,item_id:se.item_id,
+    title:se.item_title,started_unix:se.started_unix,idle_seconds:se.idle_seconds,session_id:se.id,
+    target_height:se.target_height,encoder:se.encoder}));
+  const rows=dels.map(de=>`<tr>
+    <td><b><a href="#/item/${de.item_id}">${esc(de.title)}</a></b></td>
+    <td>${esc(de.user)}</td>
+    <td>${esc(de.method)}${de.session_id&&de.target_height?` · ${de.target_height}p`:''}${de.session_id&&de.encoder?` · ${esc(de.encoder)}`:''}</td>
+    <td class="muted">${fmtAgo(de.started_unix)}${de.idle_seconds>30?` · idle ${Math.round(de.idle_seconds)}s`:''}</td>
+    <td style="text-align:right">${(ME&&ME.is_admin&&de.session_id)?`<button class="ghost sm" onclick="stopSession(${esc(JSON.stringify(de.session_id))})">Stop</button>`:''}</td></tr>`).join("");
   const scans=d.scans.map(sc=>`<tr><td style="width:200px"><b>${esc(sc.library)}</b></td><td class="muted">${statusText(sc.status)}</td></tr>`).join("");
   const t=d.trakt||{};
   const trakt = t.configured
@@ -6234,9 +6244,9 @@ async function renderActivityBody(){
   const m=document.getElementById("main"); if(!m) return;
   m.innerHTML=`
     <h2 class="section" style="margin-top:6px">Now playing</h2>
-    ${d.sessions.length
+    ${dels.length
       ? `<table><thead><tr><th>Title</th><th>User</th><th>Stream</th><th>Started</th><th></th></tr></thead><tbody>${rows}</tbody></table>`
-      : `<div class="empty">Nothing streaming right now. Only transcodes hold a server session — direct play and remux flow straight through.</div>`}
+      : `<div class="empty">Nothing streaming right now. Every delivery is listed here — direct play, remux and both HLS kinds.</div>`}
     <h2 class="section">Pre-transcoding</h2>
     ${produce}
     <h2 class="section">Library</h2>

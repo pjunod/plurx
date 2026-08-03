@@ -163,6 +163,14 @@ pub struct Item {
     /// from never-tried, and the retry sweep has nothing to key on.
     pub artwork_attempted_at: Option<i64>,
     pub artwork_error: Option<String>,
+    /// Provider genres ("Action", "Science Fiction"), in the provider's own
+    /// order. A JSON array in SQLite, exactly like `tags` — migration v13
+    /// records why this is a column and not a join table.
+    ///
+    /// Empty is not "unknown". An item nobody has enriched and a film the
+    /// provider files under nothing both read as `[]`; `metadata_at` is what
+    /// says whether a provider has answered at all.
+    pub genres: Vec<String>,
 }
 
 /// What the scanner knows when it first sees a file — enough to place the
@@ -198,6 +206,14 @@ pub struct MetadataPatch {
     /// Labels to set (home libraries). `None` leaves them alone; an empty
     /// vector is not a clear — use [`ItemEdit`] for that.
     pub tags: Option<Vec<String>>,
+    /// Genres from the provider. `None` leaves the stored list alone, which
+    /// is what every patch that is not an enrichment must do: a Trakt
+    /// backfill or a caller-supplied id has no opinion about genres, and
+    /// `Some(vec![])` from one of those would erase a good list.
+    ///
+    /// A provider that answers with no genres therefore sends `None`, not
+    /// `Some(vec![])` — same rule `tags` follows, for the same reason.
+    pub genres: Option<Vec<String>>,
     /// "A provider answered for this item" — stamps `metadata_at`, which is
     /// what takes the item out of the enrichment queue.
     ///
@@ -240,6 +256,7 @@ impl MetadataPatch {
             && self.backdrop_path.is_none()
             && self.recorded_at.is_none()
             && self.tags.is_none()
+            && self.genres.is_none()
             && !self.enriched
             && self.artwork.is_none()
     }

@@ -153,8 +153,23 @@ pub async fn create(
     .clamp(crate::transcode::MIN_HEIGHT, crate::transcode::MAX_HEIGHT);
     let request = req.into_request(id, height);
     // A session being created is playback beginning — the honest moment for
-    // the scrobble that used to fire from `/decision`.
-    crate::playstart::note_playback_started(&state, user.id, id);
+    // the scrobble that used to fire from `/decision`. The method is the one
+    // this request settled on rather than one read back off an encoder label:
+    // `encoder` says "cached" on a cache hit and changes under a
+    // hardware→software fallback, so a copy-remux inferred from it could
+    // report itself as a transcode.
+    let method = match request.kind {
+        crate::transcode::SessionKind::Copy { .. } => crate::delivery::Method::HlsCopy,
+        crate::transcode::SessionKind::Transcode { .. } => crate::delivery::Method::Transcode,
+    };
+    crate::playstart::note_playback_started(
+        &state,
+        user.id,
+        &user.username,
+        id,
+        method,
+        Some(&request.playback_id),
+    );
     let info = state
         .transcode
         .create_session(&request, &user.username)

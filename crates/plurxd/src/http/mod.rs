@@ -1576,6 +1576,209 @@ mod tests {
         );
     }
 
+    /// `?genre=` narrows the grid on the server, and narrows `total` with it.
+    ///
+    /// The failure this rules out is the easy half-implementation: filter the
+    /// page but count the library. The grid would then say "48 items", show
+    /// three, and paginate into empty screens — which reads as a broken
+    /// server rather than as a filter that works.
+    #[tokio::test]
+    async fn a_genre_filter_narrows_the_grid_and_its_total_on_the_server() {
+        use plurx_core::domain::{ItemKind, LibraryKind, MetadataPatch, NewItem, NewLibrary};
+
+        let (app, state) = test_app_with_state();
+        let admin = setup_admin(&app).await;
+        let lib = state
+            .store
+            .create_library(&NewLibrary {
+                name: "Movies".into(),
+                kind: LibraryKind::Movies,
+                paths: vec![],
+                anime: false,
+            })
+            .await
+            .expect("library");
+
+        for (title, genres) in [
+            ("Heat", vec!["Action", "Crime"]),
+            ("Alien", vec!["Horror", "Science Fiction"]),
+            ("Aliens", vec!["Action", "Science Fiction"]),
+            ("Paddington", vec![]),
+        ] {
+            let id = state
+                .store
+                .insert_item(&NewItem {
+                    library_id: lib.id,
+                    kind: ItemKind::Movie,
+                    parent_id: None,
+                    title: title.into(),
+                    year: None,
+                    season_number: None,
+                    episode_number: None,
+                })
+                .await
+                .expect("item");
+            if !genres.is_empty() {
+                state
+                    .store
+                    .apply_metadata(
+                        id,
+                        &MetadataPatch {
+                            genres: Some(genres.iter().map(|g| (*g).to_owned()).collect()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("genres");
+            }
+        }
+
+        let page = |uri: String| {
+            let app = app.clone();
+            let admin = admin.clone();
+            async move {
+                let (status, body) = call(&app, get(&uri, Some(&admin))).await;
+                assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+                let titles: Vec<String> = body["items"]
+                    .as_array()
+                    .expect("items")
+                    .iter()
+                    .map(|i| i["title"].as_str().expect("title").to_owned())
+                    .collect();
+                (titles, body["total"].as_i64().expect("total"))
+            }
+        };
+
+        // No parameter is byte-for-byte the old behaviour.
+        let (all, total) = page(format!("/api/v1/libraries/{}/items", lib.id)).await;
+        assert_eq!(all.len(), 4);
+        assert_eq!(total, 4);
+
+        let (action, total) =
+            page(format!("/api/v1/libraries/{}/items?genre=Action", lib.id)).await;
+        assert_eq!(action, vec!["Aliens".to_owned(), "Heat".to_owned()]);
+        assert_eq!(
+            total, 2,
+            "the total must be the filtered total, not the library's"
+        );
+
+        // Case-insensitive: the value comes off a URL somebody typed.
+        let (lower, _) = page(format!(
+            "/api/v1/libraries/{}/items?genre=science%20fiction",
+            lib.id
+        ))
+        .await;
+        assert_eq!(lower, vec!["Alien".to_owned(), "Aliens".to_owned()]);
+
+        // Substrings must not match, or "Action" would drag in "Action &
+        // Adventure" and the facet counts would stop adding up.
+        let (partial, total) = page(format!("/api/v1/libraries/{}/items?genre=Act", lib.id)).await;
+        assert!(partial.is_empty(), "got {partial:?}");
+        assert_eq!(total, 0);
+
+        // A genre nobody has is an empty page, not an error.
+        let (none, total) = page(format!("/api/v1/libraries/{}/items?genre=Polka", lib.id)).await;
+        assert!(none.is_empty());
+        assert_eq!(total, 0);
+
+        // Blank means "no filter", not "the genre named empty string".
+        let (blank, total) = page(format!("/api/v1/libraries/{}/items?genre=%20", lib.id)).await;
+        assert_eq!(blank.len(), 4);
+        assert_eq!(total, 4);
+
+        // And the additive DTO field is on every item, always present.
+        let (_, body) = call(
+            &app,
+            get(&format!("/api/v1/libraries/{}/items", lib.id), Some(&admin)),
+        )
+        .await;
+        for item in body["items"].as_array().expect("items") {
+            assert!(
+                item["genres"].is_array(),
+                "every item DTO carries genres, empty rather than absent: {item}"
+            );
+        }
+    }
+
+    /// Arming the backfill rewinds its cursor.
+    ///
+    /// The failure this prevents is quiet and permanent: an operator disarms a
+    /// run half way (or a run ends with titles it could not reach), arms it
+    /// again later expecting those titles to be retried, and instead the pass
+    /// resumes past them and reports success having done nothing.
+    #[tokio::test]
+    async fn arming_the_genre_backfill_rewinds_its_cursor() {
+        use plurx_core::store::keys;
+
+        let (app, state) = test_app_with_state();
+        let admin = setup_admin(&app).await;
+
+        // Off by default. An upgrade must not start re-fetching a catalogue.
+        let (status, body) = call(&app, get("/api/v1/settings", Some(&admin))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["genre_backfill"], json!(false));
+
+        // Pretend a previous run got half way and stopped.
+        state
+            .store
+            .put_setting(keys::GENRE_BACKFILL_CURSOR, "4242")
+            .await
+            .expect("cursor");
+
+        let (status, body) = call(
+            &app,
+            put(
+                "/api/v1/settings",
+                Some(&admin),
+                json!({ "genre_backfill": true }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["genre_backfill"], json!(true));
+        assert_eq!(
+            state
+                .store
+                .get_setting(keys::GENRE_BACKFILL_CURSOR)
+                .await
+                .expect("setting")
+                .as_deref(),
+            Some("0"),
+            "arming must start from the top, or the titles the last run \
+             skipped are skipped forever"
+        );
+
+        // Disarming leaves the cursor alone: a run stopped part way should be
+        // resumable by arming it again *without* redoing what it finished, if
+        // that is what the operator wants — the rewind is the arm's doing, so
+        // it happens at a moment they chose.
+        state
+            .store
+            .put_setting(keys::GENRE_BACKFILL_CURSOR, "99")
+            .await
+            .expect("cursor");
+        let (status, body) = call(
+            &app,
+            put(
+                "/api/v1/settings",
+                Some(&admin),
+                json!({ "genre_backfill": false }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["genre_backfill"], json!(false));
+        assert_eq!(
+            state
+                .store
+                .get_setting(keys::GENRE_BACKFILL_CURSOR)
+                .await
+                .expect("setting")
+                .as_deref(),
+            Some("99")
+        );
+    }
+
     #[tokio::test]
     async fn an_unknown_request_id_is_a_404() {
         let app = test_app();
@@ -3143,7 +3346,7 @@ mod tests {
         let (st, w) = call(
             &app,
             post(
-                &format!("/api/v1/items/{}/progress", s.movie),
+                &format!("/api/v1/items/{}/progress", s.ep),
                 Some(&admin),
                 json!({ "position_ms": 1000, "duration_ms": 9_000_000 }),
             ),
@@ -3482,7 +3685,9 @@ mod tests {
 
         // The id is the client's own playback id rather than a capability, so
         // it is guessable by construction — ownership is what protects it.
-        let (_stream, _guard) = state.streams.register("pb-1-s1", 9999, 42, 4.0);
+        let (_stream, _guard) = state
+            .streams
+            .register("pb-1-s1", 9999, "someone-else", 42, 4.0);
         assert_eq!(
             call(&app, get("/api/v1/stream/pb-1-s1/status", Some(&admin)))
                 .await
@@ -3495,6 +3700,251 @@ mod tests {
                 .await
                 .0,
             StatusCode::UNAUTHORIZED
+        );
+    }
+
+    /// The registry is filled from the detached task the delivery seam
+    /// spawns, because the request that triggers it is busy writing a film to
+    /// a socket. Wait for it the way the activity page does — by looking again
+    /// — rather than by sleeping a guessed interval and hoping.
+    async fn settled_deliveries(app: &Router, token: &str, want: usize) -> Vec<Value> {
+        for _ in 0..200 {
+            let (_, page) = call(app, get("/api/v1/activity/detail", Some(token))).await;
+            let rows = page["deliveries"].as_array().cloned().unwrap_or_default();
+            if rows.len() >= want {
+                return rows;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let (_, page) = call(app, get("/api/v1/activity/detail", Some(token))).await;
+        page["deliveries"].as_array().cloned().unwrap_or_default()
+    }
+
+    fn ranged(uri: &str, from: u64, to: u64) -> Request<Body> {
+        Request::builder()
+            .uri(uri)
+            .header("range", format!("bytes={from}-{to}"))
+            .body(Body::empty())
+            .expect("req")
+    }
+
+    /// Direct play is a *storm* of ranged 206s, not a connection: a seeking
+    /// browser makes dozens of short requests against one file. One row per
+    /// request would put a dozen phantom viewers on the activity page for one
+    /// person on one sofa, which is the whole reason the registry is keyed by
+    /// the player rather than the request.
+    #[tokio::test]
+    async fn a_direct_play_is_one_viewer_however_many_ranges_it_takes() {
+        let (app, state) = test_state();
+        let admin = setup_admin(&app).await;
+        let s = seed_content(&state).await;
+
+        let uri = format!("/api/v1/files/{}/direct?token={admin}", s.file);
+        for from in 0..12u64 {
+            let status = app
+                .clone()
+                .oneshot(ranged(&uri, from, from + 1))
+                .await
+                .expect("r")
+                .status();
+            assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        }
+
+        let began = std::time::Instant::now();
+        let rows = settled_deliveries(&app, &admin, 1).await;
+        let visible_in = began.elapsed();
+        eprintln!("direct play visible {visible_in:?} after the last range request");
+        assert!(
+            visible_in < crate::delivery::BEACON_INTERVAL,
+            "a start must show up inside one beacon, not on the next one: {visible_in:?}"
+        );
+        assert_eq!(rows.len(), 1, "twelve requests, one viewer: {rows:?}");
+        assert_eq!(rows[0]["method"], "direct");
+        // `seed_content` re-upserts this path onto the episode, so the file's
+        // item is "The Target" — the title is resolved from the file, not
+        // assumed from whatever created it.
+        assert_eq!(rows[0]["title"], "The Target");
+        assert_eq!(rows[0]["user"], "paul");
+        assert_eq!(rows[0]["file_id"], s.file);
+        assert!(
+            rows[0]["session_id"].is_null(),
+            "direct play holds no session — that is the point"
+        );
+
+        // And nothing was invented on the old array to say so.
+        let (_, page) = call(&app, get("/api/v1/activity/detail", Some(&admin))).await;
+        assert!(
+            page["sessions"].as_array().expect("sessions").is_empty(),
+            "the sessions array still means HLS sessions: {page}"
+        );
+
+        // Two beats of silence is a quiet player, not a gone one.
+        state
+            .direct_plays
+            .backdate(crate::delivery::BEACON_INTERVAL * 2);
+        assert_eq!(
+            settled_deliveries(&app, &admin, 1).await.len(),
+            1,
+            "a missed beacon must not evict somebody who is still watching"
+        );
+        // The rest of the timeout, with no beacon and no range request, is a
+        // closed tab — which announces nothing, so silence is all there is.
+        state
+            .direct_plays
+            .backdate(crate::delivery::IDLE_TIMEOUT - crate::delivery::BEACON_INTERVAL * 2);
+        let (_, page) = call(&app, get("/api/v1/activity/detail", Some(&admin))).await;
+        assert!(
+            page["deliveries"].as_array().expect("array").is_empty(),
+            "expired after the idle timeout: {page}"
+        );
+
+        // The progress beacon alone keeps a paused player listed — it has
+        // buffered the rest of the film and will not fetch another byte.
+        let status = app
+            .clone()
+            .oneshot(ranged(&uri, 0, 1))
+            .await
+            .expect("r")
+            .status();
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(settled_deliveries(&app, &admin, 1).await.len(), 1);
+        state
+            .direct_plays
+            .backdate(crate::delivery::IDLE_TIMEOUT - std::time::Duration::from_secs(1));
+        let (st, _) = call(
+            &app,
+            post(
+                &format!("/api/v1/items/{}/progress", s.ep),
+                Some(&admin),
+                json!({ "position_ms": 60_000, "duration_ms": 9_000_000 }),
+            ),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        state
+            .direct_plays
+            .backdate(std::time::Duration::from_secs(2));
+        let (_, page) = call(&app, get("/api/v1/activity/detail", Some(&admin))).await;
+        assert_eq!(
+            page["deliveries"].as_array().expect("array").len(),
+            1,
+            "the beacon reset the clock a range request never would have: {page}"
+        );
+    }
+
+    /// All four routes at once, each under its own name, from the three places
+    /// that actually know: the transcode manager, the progressive registry,
+    /// and the direct-play registry that S2 added because nothing else held
+    /// one. Each row disappears the way its delivery ends.
+    #[tokio::test]
+    async fn every_delivery_method_is_listed_under_its_own_name() {
+        crate::transcode::require_ffmpeg();
+        let (app, state) = test_state();
+        let admin = setup_admin(&app).await;
+        let s = seed_content(&state).await;
+        // Two software sessions coexist below; on a 2-core runner the
+        // machine-derived pool would refuse the second and fail this test for
+        // a reason that has nothing to do with what it is testing.
+        state
+            .store
+            .put_setting(plurx_core::store::keys::SW_POOL_THREADS, "64")
+            .await
+            .expect("pool headroom");
+
+        // 1. direct — a range request, no session anywhere.
+        let status = app
+            .clone()
+            .oneshot(ranged(
+                &format!("/api/v1/files/{}/direct?token={admin}", s.file),
+                0,
+                3,
+            ))
+            .await
+            .expect("r")
+            .status();
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+
+        // 2. remux — the response body owns the registration, so holding the
+        // response is holding the stream open, exactly as a player does.
+        let remux = app
+            .clone()
+            .oneshot(get(
+                &format!("/api/v1/files/{}/stream.mp4?stream=pb-remux", s.file),
+                Some(&admin),
+            ))
+            .await
+            .expect("r");
+        assert_eq!(remux.status(), StatusCode::OK);
+
+        // 3 & 4. the two HLS kinds, which differ only in what ffmpeg is asked
+        // to do — and never in the encoder label, which is why the method is
+        // recorded rather than inferred.
+        let (st, copy) = call(
+            &app,
+            post(
+                &format!("/api/v1/files/{}/hls/sessions", s.file),
+                Some(&admin),
+                json!({ "playback_id": "pb-copy", "copy": true }),
+            ),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{copy}");
+        let (st, tx) = call(
+            &app,
+            post(
+                &format!("/api/v1/files/{}/hls/sessions", s.file),
+                Some(&admin),
+                json!({ "playback_id": "pb-transcode", "height": 720 }),
+            ),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{tx}");
+
+        let rows = settled_deliveries(&app, &admin, 4).await;
+        let mut methods: Vec<&str> = rows
+            .iter()
+            .map(|r| r["method"].as_str().unwrap_or("?"))
+            .collect();
+        methods.sort_unstable();
+        assert_eq!(
+            methods,
+            ["direct", "hls-copy", "remux", "transcode"],
+            "four routes, four names: {rows:?}"
+        );
+        for row in &rows {
+            assert_eq!(row["user"], "paul", "{row}");
+            assert_eq!(row["title"], "The Target", "{row}");
+            assert_eq!(row["file_id"], s.file, "{row}");
+        }
+        // Only the two that really are sessions carry a session id, and they
+        // are the two the old array has always listed.
+        let with_session = rows.iter().filter(|r| !r["session_id"].is_null()).count();
+        assert_eq!(with_session, 2, "{rows:?}");
+        let (_, page) = call(&app, get("/api/v1/activity/detail", Some(&admin))).await;
+        let sessions = page["sessions"].as_array().expect("sessions");
+        assert_eq!(sessions.len(), 2, "unchanged in meaning: {page}");
+        assert!(
+            sessions[0].get("encoder").is_some() && sessions[0].get("user_name").is_some(),
+            "and unchanged in shape: {page}"
+        );
+
+        // Each row ends the way its delivery does. The two sessions when they
+        // are stopped...
+        for id in [&copy["session_id"], &tx["session_id"]] {
+            let id = id.as_str().expect("session id");
+            assert!(state.transcode.stop_session(id, "test").await);
+        }
+        // ...the remux when its body is dropped, which is the same moment
+        // `kill_on_drop` takes its ffmpeg down...
+        drop(remux);
+        // ...and the direct play only when it goes quiet, because nothing
+        // about it ever ends.
+        state.direct_plays.backdate(crate::delivery::IDLE_TIMEOUT);
+
+        let (_, page) = call(&app, get("/api/v1/activity/detail", Some(&admin))).await;
+        assert!(
+            page["deliveries"].as_array().expect("array").is_empty(),
+            "everything went with the thing that was delivering it: {page}"
         );
     }
 
@@ -4119,6 +4569,317 @@ mod tests {
             .await
             .0,
             StatusCode::BAD_REQUEST
+        );
+    }
+
+    /// Seed one movie with two versions: the 2160p Dolby Vision remux and the
+    /// 720p copy. Returns (library id, item id).
+    async fn seed_two_version_movie(state: &AppState) -> (i64, i64) {
+        use plurx_core::domain::{
+            AudioStream, ItemKind, LibraryKind, NewItem, NewLibrary, ProbeResult,
+        };
+        let lib = state
+            .store
+            .create_library(&NewLibrary {
+                name: "Movies".into(),
+                kind: LibraryKind::Movies,
+                paths: vec![std::path::PathBuf::from("/media/movies")],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+        let item = state
+            .store
+            .insert_item(&NewItem {
+                library_id: lib.id,
+                kind: ItemKind::Movie,
+                parent_id: None,
+                title: "Blade Runner 2049".into(),
+                year: Some(2017),
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("item");
+        state
+            .store
+            .upsert_file(
+                item,
+                "/media/movies/Blade Runner 2049 (2017) 2160p.mkv",
+                69_000_000_000,
+                1,
+                &ProbeResult {
+                    duration_ms: Some(9_780_000),
+                    container: Some("mkv".into()),
+                    video_codec: Some("hevc".into()),
+                    width: Some(3840),
+                    height: Some(2160),
+                    bit_depth: Some(10),
+                    hdr: Some("dolby_vision".into()),
+                    hdr_format: Some("Dolby Vision · Profile 7 (HDR10-compatible)".into()),
+                    bitrate: Some(56_000_000),
+                    audio_streams: vec![AudioStream {
+                        index: 0,
+                        codec: "truehd".into(),
+                        channels: Some(8),
+                        language: Some("eng".into()),
+                        title: None,
+                        default: true,
+                    }],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("file a");
+        state
+            .store
+            .upsert_file(
+                item,
+                "/media/movies/Blade Runner 2049 (2017) 720p.mp4",
+                6_800_000_000,
+                1,
+                &ProbeResult {
+                    duration_ms: Some(9_780_000),
+                    container: Some("mp4".into()),
+                    video_codec: Some("h264".into()),
+                    width: Some(1280),
+                    height: Some(720),
+                    bitrate: Some(5_000_000),
+                    audio_streams: vec![AudioStream {
+                        index: 0,
+                        codec: "aac".into(),
+                        channels: Some(2),
+                        language: Some("eng".into()),
+                        title: None,
+                        default: true,
+                    }],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("file b");
+        (lib.id, item)
+    }
+
+    async fn raw_body(app: &Router, uri: &str, token: &str) -> String {
+        let resp = app
+            .clone()
+            .oneshot(get(uri, Some(token)))
+            .await
+            .expect("resp");
+        assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+        let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+        String::from_utf8(bytes.to_vec()).expect("utf-8")
+    }
+
+    /// The pre-S1 library-list body, captured from the build before the
+    /// `media` block existed and frozen here as a literal. Only the two epoch
+    /// stamps are substituted, and they come from the store rather than from
+    /// the response, so nothing in this golden is derived from the code it
+    /// judges. Every byte of shape — key order, which optional fields appear,
+    /// the absence of `media` — is pre-S1's.
+    const PRE_S1_LIST_BODY: &str = concat!(
+        r#"{"items":[{"id":1,"library_id":1,"kind":"movie","parent_id":null,"#,
+        r#""title":"Blade Runner 2049","year":2017,"overview":null,"#,
+        r#""season_number":null,"episode_number":null,"air_date":null,"#,
+        r#""runtime_ms":null,"added_at":{added},"updated_at":{updated},"#,
+        // S3 landed `genres` on ItemDto after this golden was captured. It is
+        // additive on its own terms (always present, empty rather than absent,
+        // and covered by S3's own tests), so the baseline this test defends
+        // moved by exactly that one field. Updating the golden is the correct
+        // resolution; deleting the test would not be. Anything else appearing
+        // here is what it is still watching for.
+        r#""recorded_at":null,"tags":[],"genres":[],"tmdb_id":null,"imdb_id":null,"#,
+        r#""poster":null,"backdrop":null,"resolution":2160}],"#,
+        r#""total":1,"offset":0,"limit":60}"#,
+    );
+
+    /// Additive means additive: a client that does not ask for facts gets the
+    /// bytes it got before S1 shipped, not "the same JSON modulo a null". A
+    /// new key — even `"media":null` — is a parse error in the strict decoders
+    /// on the tolerant-Android side of the fleet, so this is checked as bytes,
+    /// not as a `serde_json::Value` comparison that would forgive it.
+    #[tokio::test]
+    async fn library_list_without_facts_is_byte_identical_to_pre_s1() {
+        let (app, state) = test_app_with_state();
+        let token = setup_admin(&app).await;
+        let (lib, item) = seed_two_version_movie(&state).await;
+        let stamped = state
+            .store
+            .get_item(item)
+            .await
+            .expect("get")
+            .expect("item");
+        let expected = PRE_S1_LIST_BODY
+            .replace("{added}", &stamped.added_at.to_string())
+            .replace("{updated}", &stamped.updated_at.to_string());
+
+        let plain = raw_body(&app, &format!("/api/v1/libraries/{lib}/items"), &token).await;
+        assert_eq!(plain, expected, "the default list body moved");
+        // Explicitly off, and a value that is not the opt-in: same bytes. The
+        // param is a switch, not a hint.
+        for uri in [
+            format!("/api/v1/libraries/{lib}/items?facts=0"),
+            format!("/api/v1/libraries/{lib}/items?sort=title&facts=0"),
+        ] {
+            assert_eq!(raw_body(&app, &uri, &token).await, expected, "{uri}");
+        }
+    }
+
+    /// With the param: one block per playable item, aggregated across every
+    /// version — and removing that block from the bytes gives back the pre-S1
+    /// response exactly, which is what "additive" has to mean.
+    #[tokio::test]
+    async fn facts_block_aggregates_every_version_of_an_item() {
+        let (app, state) = test_app_with_state();
+        let token = setup_admin(&app).await;
+        let (lib, item) = seed_two_version_movie(&state).await;
+        let stamped = state
+            .store
+            .get_item(item)
+            .await
+            .expect("get")
+            .expect("item");
+        let expected = PRE_S1_LIST_BODY
+            .replace("{added}", &stamped.added_at.to_string())
+            .replace("{updated}", &stamped.updated_at.to_string());
+
+        let body = raw_body(
+            &app,
+            &format!("/api/v1/libraries/{lib}/items?facts=1"),
+            &token,
+        )
+        .await;
+        // The 4K DV remux is the item's face; the 720p copy still counts
+        // toward files and bytes. A 720p answer here would be the library
+        // reading as worse than it is.
+        let block = concat!(
+            r#""media":{"files":2,"bytes":75800000000,"video":"HEVC","height":2160,"#,
+            r#""dr":"DV","audio":"TrueHD 7.1","container":"MKV"}"#,
+        );
+        assert!(body.contains(block), "no aggregate block in {body}");
+        assert_eq!(
+            body.replace(&format!(",{block}"), ""),
+            expected,
+            "the facts response is more than pre-S1 plus the block"
+        );
+    }
+
+    /// Photos and folders have nothing to badge — a photo has no codec or
+    /// dynamic range, and a folder's bytes are its children's, not its own.
+    /// They must come back bare even with the param on, so a client can use
+    /// "has a media block" as "this is playable".
+    #[tokio::test]
+    async fn facts_skip_photos_and_folders() {
+        use plurx_core::domain::{ItemKind, LibraryKind, NewItem, NewLibrary, ProbeResult};
+        let (app, state) = test_app_with_state();
+        let token = setup_admin(&app).await;
+        let lib = state
+            .store
+            .create_library(&NewLibrary {
+                name: "Home".into(),
+                kind: LibraryKind::Home,
+                paths: vec![std::path::PathBuf::from("/media/home")],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+        let new = |kind, title: &str| NewItem {
+            library_id: lib.id,
+            kind,
+            parent_id: None,
+            title: title.to_owned(),
+            year: None,
+            season_number: None,
+            episode_number: None,
+        };
+        let folder = state
+            .store
+            .insert_item(&new(ItemKind::Folder, "2019"))
+            .await
+            .expect("folder");
+        let photo = state
+            .store
+            .insert_item(&new(ItemKind::Photo, "IMG_4021"))
+            .await
+            .expect("photo");
+        let video = state
+            .store
+            .insert_item(&new(ItemKind::Video, "Beach day"))
+            .await
+            .expect("video");
+        // The photo has a file, so "no block" cannot be an accident of having
+        // nothing to aggregate — it is the kind filter doing its job.
+        state
+            .store
+            .upsert_file(
+                photo,
+                "/media/home/IMG_4021.jpg",
+                4_200_000,
+                1,
+                &ProbeResult {
+                    container: Some("jpg".into()),
+                    width: Some(4032),
+                    height: Some(3024),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("photo file");
+        state
+            .store
+            .upsert_file(
+                video,
+                "/media/home/Beach day.mp4",
+                120_000_000,
+                1,
+                &ProbeResult {
+                    container: Some("mp4".into()),
+                    video_codec: Some("h264".into()),
+                    width: Some(1920),
+                    height: Some(1080),
+                    bitrate: Some(8_000_000),
+                    audio_streams: vec![plurx_core::domain::AudioStream {
+                        index: 0,
+                        codec: "aac".into(),
+                        channels: Some(2),
+                        language: None,
+                        title: None,
+                        default: true,
+                    }],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("video file");
+
+        let (status, body) = call(
+            &app,
+            get(
+                &format!("/api/v1/libraries/{}/items?facts=1", lib.id),
+                Some(&token),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let by_id = |id: i64| -> Value {
+            body["items"]
+                .as_array()
+                .expect("items")
+                .iter()
+                .find(|i| i["id"] == json!(id))
+                .cloned()
+                .expect("item on the page")
+        };
+        assert_eq!(by_id(folder)["media"], Value::Null, "folder got a block");
+        assert_eq!(by_id(photo)["media"], Value::Null, "photo got a block");
+        assert_eq!(
+            by_id(video)["media"],
+            json!({
+                "files": 1, "bytes": 120_000_000, "video": "H.264",
+                "height": 1080, "audio": "AAC 2.0", "container": "MP4"
+            }),
+            "an SDR home video should carry no dr key at all"
         );
     }
 }

@@ -212,6 +212,7 @@ mod tests {
             nfo_seeded_at: None,
             artwork_attempted_at: None,
             artwork_error: None,
+            genres: Vec::new(),
         }
     }
 

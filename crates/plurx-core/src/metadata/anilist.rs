@@ -19,6 +19,7 @@ query ($search: String) {
     title { romaji english native }
     description(asHtml: false)
     seasonYear
+    genres
     coverImage { extraLarge large }
     bannerImage
   }
@@ -35,6 +36,15 @@ pub struct AniMatch {
     /// Absolute image URLs (AniList serves full URLs, unlike TMDB).
     pub cover_url: Option<String>,
     pub banner_url: Option<String>,
+    /// AniList's own genre vocabulary ("Action", "Slice of Life"), which
+    /// overlaps TMDB's without matching it. Not translated: an anime library
+    /// is enriched entirely from AniList, so its genre facets are internally
+    /// consistent, and a hand-written mapping table would be a second thing
+    /// to keep current for no reader's benefit.
+    ///
+    /// Free — `genres` is one more field on the search query that already
+    /// runs, so this costs no request at all, not even a cached one.
+    pub genres: Vec<String>,
 }
 
 pub struct AniListClient {
@@ -148,6 +158,17 @@ fn parse_media(media: Option<&Value>) -> Option<AniMatch> {
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
             .map(str::to_owned),
+        genres: media
+            .get("genres")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|g| g.as_str())
+                    .filter(|g| !g.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default(),
     })
 }
 
