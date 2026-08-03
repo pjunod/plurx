@@ -228,7 +228,9 @@ struct PlayerView: View {
 
             if controller.isChangingStream {
                 ProgressView()
+                    #if os(iOS)
                     .controlSize(.large)
+                    #endif
                     .tint(.white)
                     .padding(18)
                     .background(.ultraThinMaterial, in: Circle())
