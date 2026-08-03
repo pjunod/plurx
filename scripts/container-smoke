@@ -11,6 +11,15 @@ chmod 0777 "$scratch"
 
 cleanup() {
   docker rm -f "$name" >/dev/null 2>&1 || true
+  # The service correctly creates state as its unprivileged container UID,
+  # which may not match the host runner's UID. Make the disposable bind
+  # contents removable before the host deletes the scratch directory.
+  docker run --rm \
+    --user 0:0 \
+    --entrypoint /bin/sh \
+    --volume "$scratch:/scratch" \
+    "$image" \
+    -c 'chmod -R a+rwX /scratch' >/dev/null 2>&1 || true
   case "$scratch" in
     */plurx-container-smoke.*) rm -rf -- "$scratch" ;;
   esac
