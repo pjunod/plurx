@@ -75,6 +75,7 @@ stat -c '%g' /dev/dri/renderD128           # the render group id for group_add
 | Scan finds 0 files | The path isn't what the **server** sees — match the Docker mount |
 | Won't play, "file missing" | The share is unmounted; remount (plurx refuses a dead player on purpose) |
 | `pull access denied` | Build from source: `docker compose up -d --build` |
+| TCP 32400 already in use | `PLURX_HTTP_PORT=<n>` in `deploy/.env`; use that port in the client address |
 | GDM port conflict | `PLURX_GDM_PORT=<n>` (a running Plex owns 32414) |
 | Playback is software, you set `qsv` | Read `plurxd::transcode` logs; usually a `/dev/dri`/driver gap |
 

@@ -27,14 +27,20 @@ struct PlayerMetadataBadge: Equatable, Identifiable {
 
     let kind: Kind
     let symbol: String
+    /// The source grade (or the whole terse label for non-HDR badges).
     let mark: String?
     let accessibilityLabel: String
-    /// The badge names something the source has that this playback is not
-    /// getting. Rendered at reduced opacity on the same capsule — the fact is
-    /// still true of the file, which is why the chip stays rather than
-    /// disappearing. Trailing and defaulted so every existing construction of
-    /// this type is unchanged.
+    /// The grade actually rendering when it differs from `mark`. Keeping this
+    /// separate lets the badge dim the unavailable source capability while
+    /// leaving the functioning result (`→ HDR10`) fully lit, like the web UI.
+    var renderedMark: String? = nil
+    /// Only the icon/source half is subdued when `renderedMark` is present.
     var dimmed: Bool = false
+
+    var displayMark: String? {
+        guard let renderedMark else { return mark }
+        return [mark, "→ \(renderedMark)"].compactMap { $0 }.joined(separator: " ")
+    }
 
     var id: String { kind.rawValue }
 }
@@ -652,10 +658,17 @@ struct PlayerView: View {
         return HStack(spacing: PlayerMetadataBadgeMetrics.rowSpacing) {
             ForEach(badges) { badge in
                 HStack(spacing: PlayerMetadataBadgeMetrics.contentSpacing) {
-                    Image(systemName: badge.symbol)
-                        .imageScale(.small)
-                    if let mark = badge.mark {
-                        Text(mark)
+                    HStack(spacing: PlayerMetadataBadgeMetrics.contentSpacing) {
+                        Image(systemName: badge.symbol)
+                            .imageScale(.small)
+                        if let mark = badge.mark {
+                            Text(mark)
+                                .fontWeight(.semibold)
+                        }
+                    }
+                    .opacity(badge.dimmed ? PlayerMetadataBadgeMetrics.dimmedOpacity : 1)
+                    if let renderedMark = badge.renderedMark {
+                        Text("→ \(renderedMark)")
                             .fontWeight(.semibold)
                     }
                 }
@@ -668,7 +681,6 @@ struct PlayerView: View {
                         lineWidth: PlayerMetadataBadgeMetrics.strokeWidth
                     )
                 }
-                .opacity(badge.dimmed ? PlayerMetadataBadgeMetrics.dimmedOpacity : 1)
                 .accessibilityElement(children: .ignore)
                 .accessibilityLabel(badge.accessibilityLabel)
             }
@@ -738,8 +750,9 @@ struct PlayerView: View {
     /// (source grade, delivered grade, display capability):
     ///
     /// - **lit** — rendered grade equals the source grade: today's chip.
-    /// - **downgraded** — they differ: the same chip, dimmed, with an arrow
-    ///   suffix naming what is actually on screen (`DV → HDR10`).
+    /// - **different grade** — they differ: the source half dims and the arrow
+    ///   suffix names what is actually on screen (`DV → HDR10`) at full
+    ///   brightness, matching the web player's capability/function split.
     /// - **source-only** — `delivered` is nil (no session, or a server that
     ///   does not report it): today's chip, unchanged.
     ///
@@ -766,9 +779,10 @@ struct PlayerView: View {
         return PlayerMetadataBadge(
             kind: .dynamicRange,
             symbol: "sparkles",
-            mark: "\(DynamicRange.sourceMark(source)) → \(DynamicRange.shortLabel(rendered))",
+            mark: DynamicRange.sourceMark(source),
             accessibilityLabel:
                 "\(DynamicRange.sourceLabel(source)), playing as \(DynamicRange.longLabel(rendered))",
+            renderedMark: DynamicRange.shortLabel(rendered),
             dimmed: true
         )
     }

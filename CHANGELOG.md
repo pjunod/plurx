@@ -408,6 +408,18 @@ bump may break compatibility and a **patch** bump never does.
 
 ### Fixed
 
+- **Coming Soon no longer leaves not-yet-local titles with blank cards.** The
+  calendar already carried each item's provider poster path, but plurx threw
+  that field away and only showed artwork when the same title could be
+  resolved to an existing local library item. Future films and series sourced
+  through TVmaze therefore stayed on initials, and refreshing library artwork
+  could not help because those rows were not missing library art — some did
+  not exist in plurx yet. Local artwork still wins; otherwise plurxd now
+  downloads the TMDB, TVmaze, or Open Library poster into its own cache before
+  returning the rail. Provider URLs remain server-side, downloads are
+  de-duplicated and bounded, and the host/redirect allowlist keeps the calendar
+  from becoming an SSRF surface.
+
 - **A subtitle extraction could run twice, and the second run raced the
   first's own output.** The extraction registry deduplicates by cache key, but
   a request read the cache, missed, and only then reached the registry — and

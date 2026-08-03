@@ -74,8 +74,11 @@ only what this hardware genuinely can't play.
   ASS/SSA still burn in at source height and restart at the same film position.
   Automatic selection never starts a burn except for a forced track.
 - **Honest dynamic-range badge.** The chip names what the *file* carries; when
-  the session is delivering something else it dims and says so (`DV → HDR10`,
-  `HDR → SDR`), and the playback-info panel spells out the server's reason.
+  the session is delivering something else, its source half dims while the
+  rendered result stays legible (`DV → HDR10`, `HDR → SDR`). The split answers
+  both questions at once: which source capability was unavailable, and which
+  dynamic range is functioning on screen. The playback-info panel spells out
+  the server's reason.
 - **Autoplay next episode**, including rollover to the next season; it is on
   by default to match the web client and can be toggled in the player or
   Settings.
@@ -222,7 +225,13 @@ code signing out of the loop.
   decode for them.
 - **Audio**: `aac, ac3, eac3, alac, mp3` (AVPlayer's set — DTS/TrueHD excluded).
 - **Container**: `mp4, mov, m4v` (what AVPlayer direct-plays).
-- **HDR**: on when the display advertises any HDR mode.
+- **HDR**: on when `AVPlayer.eligibleForHDRPlayback` says the current output
+  path can present HDR.
+- **Dolby Vision**: profiles 5 and 8 only, and only when the generic HDR gate
+  is open and `AVPlayer.availableHDRModes` names Dolby Vision for the current
+  device/display path. Apple deprecated that format-specific property in OS
+  26 without providing a format-specific replacement; it remains the signal
+  that prevents an HDR10-only HDMI path from being over-claimed as DV.
 
 On play the client calls `GET /files/{id}/decision?<caps>` and executes the
 server's **delivery plan**:
@@ -247,8 +256,9 @@ Both the decision and the session response also carry
 `delivered_dynamic_range` (`dolby_vision` / `hdr10` / `hlg` / `sdr`) — what the
 bytes on the wire actually hold, as opposed to what the file holds. The player
 compares it with the source grade and with `AVPlayer.eligibleForHDRPlayback` to
-decide whether the dynamic-range badge is lit or dimmed. It is a readout only:
-nothing in the client's decision, capability, or session request reads it back.
+dim the unavailable source half while keeping the rendered result fully lit.
+It is a readout only: nothing in the client's decision, capability, or session
+request reads it back.
 
 Either session starts at the resume point, carries this player's `playback_id`
 (the server's supersession key) plus a per-attempt `request_id` (so a replayed
@@ -291,23 +301,15 @@ The implementation and prioritized remaining work are tracked in
 browse/search/play/resume, sorting and watch filters, full-film seek, explicit
 transport controls, Now Playing, native text subtitles, track and quality
 selection, playback stats, markers, PiP, and next-episode autoplay are present.
-These are still outstanding:
+Copied Dolby Vision is green on the physical Bedroom Apple TV: the client
+selects DV from the current output's format modes, the server preserves the
+RPU, the master advertises `SUPPLEMENTAL-CODECS`, and AVPlayer reaches
+`readyToPlay`. These are still outstanding:
 
 - **Automatic** intro/credits skipping. Manual Skip buttons are present.
-- **Copied Dolby Vision on a physical Apple TV.** The server prepares the
-  copy correctly and the child video playlist plays on its own, but AVPlayer
-  rejects the same stream reached through the multivariant master with
-  CoreMedia `-12927` and the client falls back to a compatibility transcode —
-  so that one file loses Dolby Vision. This is the arc's one open failure;
-  the investigation, including two master experiments an operator can enable
-  one per deploy, is
-  [docs/APPLE-NATIVE-SUBTITLES-PLAN.md](../../docs/APPLE-NATIVE-SUBTITLES-PLAN.md)
-  §5.4.
 - Continuous adaptive quality changes and audio-sync controls.
 - Filters/sorting, playlists, downloads/offline, and **AirPlay** polish.
   Search and iOS **PiP** are present.
-- Continuous adaptive quality changes and audio-sync controls.
-- Playlists, downloads/offline, and **AirPlay** polish.
 - **tvOS launch storyboard** — cosmetic only (a black frame at launch), not a
   blocker for upload. The layered Brand Assets themselves are committed under
   `Resources/tvOS.xcassets` and wired up via

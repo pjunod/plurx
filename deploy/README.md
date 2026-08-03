@@ -15,7 +15,9 @@ $EDITOR docker-compose.override.yml   # your media mounts (host:container:ro), y
 cd .. && make docker-up                  # builds from source; stamps the commit into the build
 ```
 
-Open `http://<host>:32400` and create your admin account. Library paths in
+Open `http://<host>:32400` and create your admin account. If Plex still owns
+TCP 32400, set `PLURX_HTTP_PORT` in `.env` and use that port instead.
+Library paths in
 the web UI are the *container-side* paths (e.g. `/media/movies`). For
 hardware transcode, uncomment the GPU block in your override (Intel/AMD via
 `/dev/dri`, NVIDIA via the container toolkit). If another service (a
@@ -23,12 +25,13 @@ still-running Plex) owns UDP 32414, set `PLURX_GDM_PORT` in `.env`
 (see `.env.example`).
 
 The base Compose stack keeps `plurxd` on ordinary Docker networking and
-publishes TCP 32400 plus UDP 32414. Your override may therefore attach it to an
-external network such as `media`. A separate `plurx-discovery` companion uses
-host networking only for Bonjour `_plurx._tcp`; it reads the server identity
-through published port 32400 and advertises the host's LAN address. That split
-keeps automatic iPhone, iPad, Apple TV, and Android discovery without moving
-the media server off the networks its peer services use.
+publishes TCP `PLURX_HTTP_PORT` (32400 by default) plus UDP 32414. Your
+override may therefore attach it to an external network such as `media`. A
+separate `plurx-discovery` companion uses host networking only for Bonjour
+`_plurx._tcp`; it reads the server identity through the selected published
+port and advertises that port with the host's LAN address. That split keeps
+automatic iPhone, iPad, Apple TV, and Android discovery without moving the
+media server off the networks its peer services use.
 
 When `PLURX_SERVER_NAME` is still the default `plurx`, the companion advertises
 the Docker host name plus its LAN address, so a picker says
@@ -40,7 +43,7 @@ Do not add `network_mode: host` to `plurxd`. Compose forbids one service from
 declaring both host networking and `networks`, so doing that recreates the
 configuration error the companion is designed to avoid. If the Docker host
 cannot provide host networking, the server still works at
-`http://<host>:32400`, but native clients must use manual entry.
+`http://<host>:<PLURX_HTTP_PORT>`, but native clients must use manual entry.
 
 ### Project name
 

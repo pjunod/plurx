@@ -126,6 +126,10 @@ pub fn router(state: AppState) -> Router {
         // so it is a POST. The GET is a deprecated bridge over the same path.
         .route("/files/{id}/hls/sessions", post(hls::create))
         .route("/files/{id}/hls/start", get(hls::start))
+        .route(
+            "/hls/{session}/master.m3u8",
+            get(hls::master_playlist_response),
+        )
         .route("/hls/{session}/index.m3u8", get(hls::playlist))
         .route("/hls/{session}/video.m3u8", get(hls::video_playlist))
         .route(
@@ -901,14 +905,13 @@ mod tests {
         );
     }
 
-    /// The rail shows the show's poster plurx already has.
+    /// The rail prefers the show's poster plurx already has.
     ///
-    /// The entries used to be text-only, because the calendar carries no
-    /// artwork and plurx made no attempt to find any. It does not need to
-    /// fetch one: a series whose next episode is airing is a series you
-    /// already have, so the poster is sitting in the artwork cache — and it
-    /// is resolved by TMDB id, never by title, for the same reason every
-    /// other seam in this integration is.
+    /// A series whose next episode is airing often already has a poster in
+    /// plurx. That copy wins over monarr's provider reference, and it is
+    /// resolved by TMDB id, never by title, for the same reason every other
+    /// seam in this integration is. Entries without either source still fall
+    /// back to initials rather than borrowing an unrelated local poster.
     #[tokio::test]
     async fn the_rail_wears_the_artwork_plurx_already_has() {
         use axum::routing::get as axget;
@@ -923,7 +926,8 @@ mod tests {
                     // Not in the library: nothing local to wear.
                     { "date": "2026-08-02", "kind": "movie", "mediaItemId": 8,
                       "title": "Some Film", "detail": "", "hasFile": false,
-                      "tmdbId": 999999 },
+                      "tmdbId": 999999,
+                      "posterPath": "https://static.tvmaze.com/poster.jpg" },
                     // No ids at all: must not match the first row of its kind.
                     { "date": "2026-08-03", "kind": "movie", "mediaItemId": 9,
                       "title": "Nameless", "detail": "", "hasFile": false }
@@ -975,6 +979,13 @@ mod tests {
             )
             .await
             .expect("patch");
+        std::fs::create_dir_all(&state.artwork_dir).expect("artwork dir");
+        std::fs::write(state.artwork_dir.join("show.jpg"), b"show poster").expect("show poster");
+        let provider_url =
+            reqwest::Url::parse("https://static.tvmaze.com/poster.jpg").expect("provider URL");
+        let provider_file = super::comingsoon::artwork_cache_filename(&provider_url);
+        std::fs::write(state.artwork_dir.join(&provider_file), b"future poster")
+            .expect("provider poster");
         // A movie that also holds TMDB 1399. The id spaces are separate, so
         // this must NOT be picked for the episode row.
         let decoy = state
@@ -1024,9 +1035,10 @@ mod tests {
         );
         assert_eq!(e[0]["item_id"], show, "and click through to the show");
 
-        assert!(
-            e[1].get("poster").is_none(),
-            "a film that is not in the library has no local artwork to wear: {body}"
+        assert_eq!(
+            e[1]["poster"],
+            format!("/api/v1/images/{provider_file}"),
+            "a film not yet in the library uses monarr's cached provider art: {body}"
         );
         assert!(e[1].get("item_id").is_none());
 
@@ -4527,6 +4539,10 @@ mod tests {
             StatusCode::NOT_FOUND
         );
         assert_eq!(
+            status_of(&app, get_q("/api/v1/hls/nosuchsession/master.m3u8")).await,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
             status_of(&app, get_q("/api/v1/hls/nosuchsession/seg00000.ts")).await,
             StatusCode::NOT_FOUND
         );
@@ -4573,7 +4589,7 @@ mod tests {
         // silently disappearing from every create.
         assert_eq!(native["delivered_dynamic_range"], "sdr", "{native}");
         let session = native["session_id"].as_str().expect("session");
-        let expected_playlist = format!("/api/v1/hls/{session}/index.m3u8?native=1&subtitle=0");
+        let expected_playlist = format!("/api/v1/hls/{session}/master.m3u8?subtitle=0");
         assert_eq!(
             native["playlist_url"].as_str(),
             Some(expected_playlist.as_str())
@@ -4581,9 +4597,7 @@ mod tests {
 
         let (status, master) = body_of(
             &app,
-            get_q(&format!(
-                "/api/v1/hls/{session}/index.m3u8?native=1&subtitle=0"
-            )),
+            get_q(&format!("/api/v1/hls/{session}/master.m3u8?subtitle=0")),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -4591,6 +4605,18 @@ mod tests {
         assert!(master.contains("TYPE=SUBTITLES"), "{master}");
         assert!(master.contains("LANGUAGE=\"en\",DEFAULT=YES"), "{master}");
         assert!(master.contains("subs/0/index.m3u8"), "{master}");
+
+        // Sessions returned before the dedicated path was introduced remain
+        // playable for their lifetime through the query-form bridge.
+        let (legacy_status, legacy_master) = body_of(
+            &app,
+            get_q(&format!(
+                "/api/v1/hls/{session}/index.m3u8?native=1&subtitle=0"
+            )),
+        )
+        .await;
+        assert_eq!(legacy_status, StatusCode::OK);
+        assert_eq!(legacy_master, master.as_bytes());
 
         let (status, subtitle_playlist) = body_of(
             &app,

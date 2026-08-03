@@ -28,6 +28,8 @@ mdns-sd = { workspace = true }
 uuid = { workspace = true }
 reqwest = { workspace = true }
 qrcode = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
 # `fixtures` builds plurx-core's shared media-fixture helper for the copyseg

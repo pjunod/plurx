@@ -531,15 +531,6 @@ final class PlayerController: ObservableObject {
             )
             let aac = copy ? needsAAC(audioIndex: chosenAudio, decision: decision)
                 : nil
-            // AVPlayer rejects the server's multivariant wrapper around an
-            // otherwise valid HDR media playlist on physical Apple TV
-            // (CoreMedia -12927). Request the proven media-playlist shape for
-            // HDR sources. SDR keeps native HLS subtitle renditions; choosing
-            // a text subtitle on this HDR path falls back to the existing
-            // burn-in recovery instead of sacrificing playback entirely.
-            let nativeSubtitleMaster = Self.shouldRequestNativeSubtitleMaster(
-                sourceHDR: decision.source?.hdr
-            )
             let body = CreateSessionRequest(
                 playbackId: playbackId,
                 height: Self.burnSessionHeight(
@@ -551,7 +542,7 @@ final class PlayerController: ObservableObject {
                 start: Double(startMs) / 1000.0,
                 audio: chosenAudio,
                 subtitleBurn: burnSubtitle,
-                nativeSubtitles: nativeSubtitleMaster,
+                nativeSubtitles: true,
                 subtitle: nativeSubtitle,
                 copy: copy ? true : nil,
                 aac: copy ? aac : nil,
@@ -1351,16 +1342,6 @@ final class PlayerController: ObservableObject {
         case .instant: return true
         case .onDemand: return subtitlesInUse
         }
-    }
-
-    /// Apple's HDR decoder accepts the session's media playlist directly but
-    /// rejects the same stream behind the native-subtitle multivariant master.
-    /// The server omits `hdr` for SDR; accepting the explicit legacy spelling
-    /// keeps this safe against older decision responses too.
-    nonisolated static func shouldRequestNativeSubtitleMaster(sourceHDR: String?) -> Bool {
-        guard let sourceHDR else { return true }
-        let normalized = sourceHDR.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return normalized.isEmpty || normalized == "sdr"
     }
 
     /// What one subtitle selection costs. A burn — or leaving one — replaces

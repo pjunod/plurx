@@ -2502,10 +2502,10 @@ function installBannerHtml(){
 // A coming-soon card.
 //
 // There is still nothing to PLAY — the file does not exist yet — but there is
-// something to show: plurx already holds the poster for any series whose next
-// episode is airing, resolved server-side by TMDB/IMDb id rather than fetched
-// from monarr. A title not in the library gets the same initials tile the
-// grids use.
+// something to show. The server prefers a local poster resolved by external
+// id, then downloads and caches the provider poster path monarr supplied. The
+// browser only ever sees plurx's image route; a title whose provider named no
+// poster gets the same initials tile the grids use.
 //
 // It clicks through to the item when there is one, and is inert when there is
 // not: a card that navigates nowhere is worse than one that plainly cannot.
