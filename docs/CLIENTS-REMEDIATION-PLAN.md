@@ -1,11 +1,38 @@
 # Clients remediation plan — restore trust, then raise the quality ceiling
 
-**Status:** ready for a dedicated parity implementation session · **Executes:**
-[CLIENTS-CODE-REVIEW.md](CLIENTS-CODE-REVIEW.md) §10 as amended by
-[CLIENTS-CODE-REVIEW-ASSESSMENT.md](CLIENTS-CODE-REVIEW-ASSESSMENT.md) ·
+**Status:** **landed** — every milestone implemented, none device-verified ·
+**Executes:** [CLIENTS-CODE-REVIEW.md](CLIENTS-CODE-REVIEW.md) §10 as amended
+by [CLIENTS-CODE-REVIEW-ASSESSMENT.md](CLIENTS-CODE-REVIEW-ASSESSMENT.md) ·
 **Verified against:** Apple subtitle work through `97176881e`, deployed server
 hardening through `f93a54ac3`, and the working tree at `2d693e5d4`, 2026-08-02 ·
 **Written:** 2026-08-02
+
+**Where it landed** (branch `clients/remediation`):
+
+| Commit | Milestones |
+|---|---|
+| `0fa0aff` | §8.1–§8.3 server enablers, plus MEDIA-BADGES M1 |
+| `3ea2321` | MEDIA-BADGES M2 (web player) |
+| `7f4950f` | §4.2, §4.3, §4.5, §5.1–§5.6, §7.1–§7.6, plus MEDIA-BADGES M3 |
+| `a6643f7` | §4.1, §4.3, §4.4, §6.1–§6.4, §7.2–§7.4, §7.6, plus MEDIA-BADGES M4 |
+| `35ec4c2` | §7.1's focus graph — the half of it that `7f4950f` got wrong (§7.1) |
+| `006c489` | the `native` subtitle field this plan's §2.3 misdescribed, and the sidecar re-extraction race |
+| `5d5deff` | web MSE transport keyed on bit depth, and the rescue the hls.js transport never had |
+| `d3328bc` | both clients route subtitles by `native`; Apple's §6.4 tradeoff becomes a setting |
+
+**Still outstanding: device verification.** Everything above passes the
+platform gates in §9.5 and none of it has been run on hardware. The Apple
+targets have never been compiled — there is no macOS in the environment they
+were written in. `ShelfFocusTest` has never executed, the shrunk release APK
+has never been installed, and every "on device" acceptance in §9.4's matrix
+is unrun. §3.3's ledger and §9.3 stay open until it is.
+
+**Corrections.** Where a claim below turned out to be wrong, the claim is
+kept and corrected in place (marked **Corrected**) rather than rewritten
+away — the preamble's "if a claim conflicts with the code, the code wins"
+cuts both ways, and a plan that quietly reads as though it had always been
+right teaches nobody what the code actually says. The §2.3 subtitle
+correction is the important one: that misreading shipped a bug.
 
 This is the build document. The review holds the evidence, the assessment
 holds the argument about which conclusions deserve work; every finding both
@@ -155,10 +182,38 @@ Response (`DecisionResponse`, `stream.rs:321+`): flattened verdict +
 `delivery` (execute this, not `method`), `source`
 (`SourceSummary`: `width`, `height`, `hdr`, `bit_depth`, `bitrate` — **the
 source-height promise reads `source.height` from here**), `audio[]`,
-`subtitles[]` (`SubTrackDto.text` = server-computed
-`is_native_text_subtitle`: `subrip|srt|webvtt|vtt`,
-`plurx-core/src/tracks.rs:144-148`), `markers[]`, `ladder[]`
+`subtitles[]` (`SubTrackDto` — two flags, below), `markers[]`, `ladder[]`
 (`transcode::Rung { height, total_kbps, peak_kbps }`, top rung first).
+
+**Corrected `006c489` / `d3328bc`. This paragraph used to say
+`SubTrackDto.text` was the server-computed `is_native_text_subtitle`
+(`subrip|srt|webvtt|vtt`). It never was, and the misreading shipped a
+bug.** `text` is `!is_bitmap_subtitle(&s.codec)`
+(`crates/plurxd/src/http/stream.rs:435`). The two predicates disagree on
+`mov_text` and on styled ASS/SSA: those arrive `text: true`, are filtered
+out of the master, and 400 when asked for by index. A 2160p WEB-DL in the
+library with 23 `mov_text` tracks therefore offered 23 subtitles and could
+publish none of them. Every subtitle now carries **both** flags, and they
+answer two different questions:
+
+| Field | Predicate | What it unlocks |
+|---|---|---|
+| `text` | `!is_bitmap_subtitle` (`plurx-core/src/tracks.rs:134-139`) | **There is extractable text here.** The WebVTT sidecar `GET /files/{id}/subs/{index}.vtt` (which turns away bitmaps and nothing else, `stream.rs:787`), a `<track>` on a direct/remux `<video>`, and a pre-extracted burn. |
+| `native` | `is_native_text_subtitle`: `subrip\|srt\|webvtt\|vtt` (`plurx-core/src/tracks.rs:144-149`) | **This can be published as an HLS rendition.** The same predicate that puts the `EXT-X-MEDIA` line in the master and that `POST /files/{id}/hls/sessions` enforces on an explicit `subtitle` pick (`hls.rs:209`). |
+
+> **The distinction, in one sentence, so it cannot be misread again:**
+> `text` says the server can *hand you the words*, `native` says the server
+> can *publish them as a rendition* — so anything session-shaped gates on
+> `native`, and only a sidecar or a burn may gate on `text`.
+
+`text && !native` is a real and common shape (`mov_text`, ASS/SSA), not an
+edge case, and it is the only shape the two flags exist to separate.
+Bitmap tracks are `text: false, native: false`; `native: true` implies
+`text: true` and nothing implies the reverse. A client older than `006c489`
+sees no `native` at all and falls back to restating the codec list
+(Android `PlaybackPolicy.isNativeTextSubtitle`, Apple
+`SubtitleTrack.isNativeHLS`) — the only reason either client still repeats
+a server rule.
 
 **`POST /api/v1/files/{id}/hls/sessions`** — body `CreateSession`
 (`crates/plurxd/src/http/hls.rs:70-105`): `playback_id` (stable per player
@@ -193,6 +248,12 @@ side-loading, for session-based modes.
 (`store/sqlite/watch.rs:275`). Both clients' show-library watch filters
 stay broken until §8.1 lands.
 
+**Landed `0fa0aff`:** `list_items` now attaches the same rollup for
+container kinds, from one batched recursive CTE per page
+(`browse.rs:120`, `Store::watch_rollups`, `store/sqlite/watch.rs:299`).
+The paragraph above describes the tree before that commit; §7.2's client
+half went in with `7f4950f` (Android) and `a6643f7` (Apple).
+
 ---
 
 ## 3. Standing rules — read before any milestone
@@ -208,9 +269,18 @@ Concretely, for *automatic* (cold-start) selection on both platforms:
 | Track shape | Automatic behavior |
 |---|---|
 | Forced (disposition flag *or* "forced" in title), any codec | Auto-apply. Text → native/free; bitmap → **the one permitted auto-burn**, at source height. |
-| Default-flagged, native text (`text == true`) | Auto-apply via the free path (rendition / embedded track). Never a burn. |
+| Default-flagged, native text (`native == true`) | Auto-apply via the free path (rendition / embedded track). Never a burn. |
 | Default-flagged, bitmap or styled | **Not** auto-applied. Explicit selection only (which may burn, at source height). |
 | Merely same-language (`?? matching.first`) | Never auto-applied. This tail is deleted (§6.1). |
+
+**Corrected:** the "native text" row read `text == true` when this plan was
+written, which is the wrong predicate — §2.3. A default-flagged `mov_text`
+track is `text: true, native: false`, so that row as written would have
+auto-applied it and taken a 400 on every session-mode play. The shipped
+policy functions ask `native` — both are spelled `automaticSubtitleIndex`,
+in Android's `PlaybackPolicy.kt` and Apple's `PlayerController.swift` — and
+the row above now says what they do. The forced row is unchanged: forced
+applies whatever the codec, which is the carve-out.
 
 Implement the policy as one pure, unit-tested function per platform so the
 whole table is one screen of code and Paul can flip the carve-out with one
@@ -462,7 +532,7 @@ hardened all weekend:**
      (embedded tracks already surface in `TrackMenu`; unify so the server
      row and the embedded row are one row, selected by language+index
      match rather than shown twice).
-   - `track.text && mode ∈ {remux, transcode}` → an HLS session with
+   - `track.native && mode ∈ {remux, transcode}` → an HLS session with
      `native_subtitles = true`, `subtitle = index` (absolute stream
      index, §2.3): for a remux-class plan send `copy = true` (+
      `aac` per `delivery`'s audio verdict, `preserve_dolby_vision` if the
@@ -470,7 +540,18 @@ hardened all weekend:**
      plan it's the same session as today plus the rendition flags. Video
      recipe unchanged in both — the server comment guarantees `subtitle`
      "changes only HLS metadata, never the video recipe."
-   - `!track.text` → burn as today, `height` per §5.3.
+   - `!track.native` (bitmap, *and* `text && !native`: `mov_text`,
+     ASS/SSA) → burn as today, `height` per §5.3.
+
+   **Corrected:** the two session-mode bullets read `track.text` /
+   `!track.text` when this plan was written, inheriting §2.3's misreading.
+   `text` is not the rendition predicate, so as written they would have
+   routed every `mov_text` and ASS/SSA track into `native_subtitles` and
+   collected a 400 per pick. The invariant the shipped
+   `PlaybackPolicy.subtitleRoute` table exists to hold: **a track that is
+   `text` but not `native` is never a `NativeRendition`.** Direct play is
+   the exception and stays on `text` — the container's own track renders
+   with its styling intact, and the sidecar can extract it.
 3. **Rendition control:** the returned `playlist_url` carries
    `?native=1&subtitle=N`, which sets `DEFAULT=YES` on the chosen
    non-forced rendition — the *initial* selection needs nothing more. For
@@ -531,11 +612,24 @@ concatenation.
 `total_kbps` for labels) + Auto + Original, falling back to the enum only
 when `ladder` is empty (old server); the *stored preference* keeps its
 enum values — §5.3's mapping already translates. Add
-`added_at: String? = null` to `Item` and make the merged "added" sort
+`added_at: Long? = null` to `Item` and make the merged "added" sort
 interleave by it, as Apple already does.
-**Acceptance:** a 1080p source shows no 2160/1440 rows; "Added" sort on a
-merged collection interleaves by recency (unit-testable — the sort is a
-pure function over decoded items).
+**Acceptance:** the menu offers only rungs the source can feed; "Added"
+sort on a merged collection interleaves by recency (unit-testable — the
+sort is a pure function over decoded items).
+
+**Corrected `7f4950f`, two things.** (1) `added_at` is an **`i64`** —
+epoch seconds (`plurx-core/src/domain.rs:143`) — not a `String`; the
+Android field is `Long?`. (2) The ladder is
+`[360, 480, 720, 1080]` (`crates/plurxd/src/transcode.rs:4222`) and no
+ladder anywhere ever contains 2160 or 1440: 4K rungs are deliberately
+absent, and above-ladder heights exist only as explicit
+Original/forced-burn requests. So the acceptance's original wording ("a
+1080p source shows no 2160/1440 rows") named the wrong hazard — those rows
+could only ever have come from the client's own enum, which is exactly
+what this milestone deletes as the menu's source. The real drift ran the
+other way: the enum had no 360 value, and one had to be added for the
+ladder's bottom rung to be storable.
 
 ---
 
@@ -616,6 +710,15 @@ same `guard` — flag, don't assume.
 **Acceptance:** the parity doc names the tradeoff and its why; no code
 change unless Paul opts for the alternative.
 
+**Landed differently (`a6643f7` wrote the doc, `d3328bc` added the code).**
+Both branches are defensible and neither is defensible *for everyone*, so
+the choice moved into Settings rather than staying in the source:
+`SubtitleReadiness.instant` is the default and is exactly the v0.2
+behaviour, and `.onDemand` direct-plays and rebuilds at the same film
+position on the first subtitle pick — the clean reopen a bitmap burn
+already takes. One pure function, read when a title starts, both branches
+pinned by tests. APPLE-CLIENT-PARITY.md §2 still carries the reasoning.
+
 ---
 
 ## 7. P2 — comfort, performance, hygiene
@@ -629,14 +732,46 @@ Per §3.3 and the assessment's explicit order for this one: write the
 instrumented repro before the fix — an androidTest that scrolls a shelf's
 `LazyRow` until the first card disposes, then walks focus down and back
 up (the review predicts `FocusRequester is not initialized` or a dead
-press, `ui/components/Common.kt:233-243`). Then restructure: attach
-requesters to row containers (`focusGroup` per shelf) instead of specific
-cards; make the "Group by" picker reachable (`HomeScreen.kt:139-155`);
+press, `ui/components/Common.kt:233-243`). Then restructure: attach the
+**`FocusRequester`** to each row container (`focusGroup` per shelf)
+instead of to a specific card, and leave the **`focusProperties` block on
+the cards**; make the "Group by" picker reachable (`HomeScreen.kt:139-155`);
 collapse the `.clickable(...).focusable()` doubled targets
 (`Common.kt:102-103,279-281`). **Acceptance:** the repro test passes
 against the fix and fails against the old graph (run it once on the
 pre-fix commit to prove it bites); a physical D-pad walk of a 30-item
 shelf reaches every neighbor and the picker.
+
+**Corrected `35ec4c2`. The instruction above used to say only "attach
+requesters to row containers (`focusGroup` per shelf) instead of specific
+cards", and `7f4950f` read that as covering the `focusProperties` block
+too — which produced a fix that was silently dead.** The two halves of a
+shelf's focus wiring live in different places, and they have to:
+
+- **The requester belongs on the container.** On the card at index 0 it is
+  disposed the moment the viewer scrolls past it, and every neighbour
+  aiming at the shelf then calls `requestFocus()` on a requester bound to
+  nothing (`IllegalStateException: FocusRequester is not initialized`).
+  The row survives scrolling because the row is what exists.
+- **The `up`/`down` overrides cannot follow it out there.** A card's
+  `FocusTargetNode.fetchFocusProperties` compiles to
+  `visitSelfAndAncestors(FocusProperties, untilType = FocusTarget)` — the
+  walk stops at the **first ancestor focus target**. `LazyRow` carries
+  `Modifier.scrollable`, and `ScrollableNode` delegates a
+  `FocusTargetModifierNode(Focusability.Never)`, which sits between the
+  cards and anything the caller hangs on the row. A `focusProperties`
+  block declared on the `LazyRow` is therefore **invisible to every card
+  inside it**. It costs nothing on the card, because what it points at is
+  the neighbour's *container*, and containers do not dispose.
+
+The vertical axis had the same defect and a worse failure mode — a custom
+up/down destination bypasses spatial focus search, and with it the
+mechanism that composes out-of-window lazy items during a search, so a
+scrolled-away shelf threw rather than no-opping. The shelf list is a
+`Column` with `verticalScroll` for that reason, with the revisit threshold
+named in a comment. `ShelfFocusTest` presses actual D-pad keys instead of
+calling `requestFocus()`, which bypassed the resolution under test and
+passed either way; it has still never executed, per the header.
 
 ### 7.2 Watch filters for show libraries (client half — needs §8.1)
 
@@ -650,6 +785,9 @@ already applies elsewhere. Android's `Item` already decodes `rollup`;
 Apple's model needs the field. **Acceptance:** a TV library with one
 finished show, one half-watched, one untouched filters into the right
 three buckets on both platforms.
+
+**Corrected `a6643f7`:** Apple's `Item` already carried `rollup` too —
+only the classification was missing on either platform.
 
 ### 7.3 First-paint parallelism and the library spinner
 
@@ -771,6 +909,16 @@ reader doesn't hunt for a consumer that isn't there. (2)
 FLAC/Opus/DTS — unreachable from current clients; one comment saying so
 (review §11.2 asked for exactly this). **Acceptance:** comments exist;
 no behavior change; `make check` green.
+
+**Corrected `0fa0aff`: that arm is *not* unreachable.** The web player
+claims `flac` and `opus` whenever the browser does, and Safari takes the
+copy-HLS path, so a FLAC-in-MKV remux reaches it today and is labelled
+AAC. It is harmless for a different reason than the review gave — the
+native master carries no `CODECS` attribute since `97176881e`, so the
+wrong label is written to nothing at all. That is also why it stays
+recorded rather than fixed: a fix landed now is untestable through any
+wire output, and it wants doing in the same change as whatever starts
+reading the result.
 
 ---
 

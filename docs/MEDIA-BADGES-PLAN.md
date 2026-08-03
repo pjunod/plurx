@@ -1,10 +1,21 @@
 # Media badges — the play menu tells the truth about HDR and Dolby Vision
 
-**Status:** ready to build · **Executes:** Paul's 2026-08-02 ask ("make the
+**Status:** **landed** @ `0fa0aff` (M1, server) · `3ea2321` (M2, web) ·
+`7f4950f` (M3, Android) · `a6643f7` (M4, Apple), on branch
+`clients/remediation`. M5 is not built. **Device verification is
+outstanding**: §11's matrix has not been run on any hardware, and the Apple
+client has never been compiled — there is no macOS in the environment M4 was
+written in. · **Executes:** Paul's 2026-08-02 ask ("make the
 play menu media info indicative of both what the media is supposed to have
 and what is successfully being used by the client … explicitly if HDR or
 Dolby Vision is there, and if it's being rendered") · **Written:** 2026-08-02
 against working tree `97176881e` on branch `codex/fix-dolby-vision-quality`
+
+Claims this plan got wrong are corrected in place and marked **Corrected**,
+with the commit that disproved them, rather than quietly rewritten: the plan
+is a record of what was believed as well as an instruction, and the code is
+what won. Every correction below was re-verified against the tree, not
+against the commit message that reported it.
 
 Read §2 (the truth model) and §3 (the contract) before writing any code —
 every milestone hangs off the one new wire field defined there. Work
@@ -88,6 +99,19 @@ a stripped remux always has "(HDR10-compatible)" or "(HLG-compatible)" in
 `hdr_format`. A DV source without a compatible base re-encodes instead —
 which is the `sdr` branch.
 
+**Corrected `0fa0aff`: the flowchart above has one hole, and it is in that
+last sentence.** `decide_forced(Force::Original)` means "no video
+re-encode", so it copies a DV source the client cannot decode whatever
+`dv_handling` said — including a Profile 5 source, whose base layer is not
+an HDR10 grade in any sense. The helper answers `"hdr10"` there and
+over-claims. The over-claim is deliberately left rather than guessed at:
+narrowing it needs `dv_strippable`, a fact about the *server* rather than
+about the delivery the helper's signature describes, and the stream in
+question is one no client that asked for it can play — the error path
+rescues it into a transcode, whose session then reports `"sdr"` for what
+the viewer actually got. The reasoning is on the helper's doc comment so
+the next reader meets it there and not here.
+
 ### 2.2 Rendered — what each client can honestly claim
 
 Delivered bits are necessary but not sufficient: an HDR10 direct-play on an
@@ -120,6 +144,13 @@ function `(source_grade, rendered_grade)`:
 | **lit** | rendered == source grade | today's full-colour chip (gold DV / teal HDR) | `DV P7` |
 | **downgraded** | rendered ≠ source grade | chip dimmed, arrow suffix names what's on screen | `DV P7 → HDR10`, `HDR10 → SDR` |
 | **source-only** | no active session (detail screens) | today's rendering, unchanged (M5 adds capability dimming) | `DV P7` |
+
+The `DV P7` in that last column is the **web** chip. The profile number is
+a web-only refinement — `hdrChip` regexes it out of `hdr_format`, and
+Android and Apple both label the chip `DV` from the coarse grade alone.
+Read every `DV Px` in this document as "the source-grade mark, whatever
+this client spells it"; the arrow suffix is the same vocabulary
+everywhere.
 
 DV downgraded to HDR10 keeps HDR colouring on the suffix concept simple:
 the whole chip dims to the "off" treatment and the suffix is plain text.
@@ -196,6 +227,10 @@ source file (`state.store.get_file(id)`) and builds
   (~660, ~809) and `ui/DetailScreen.kt` (~451). `data/Models.kt`:
   `Decision` **has no** `preserve_dolby_vision` and `HlsStart` **has no**
   `vod`/`ladder` — this plan adds only what badges need (§6).
+  **Corrected `7f4950f`: all three exist now.** They were true absences
+  when this was written; CLIENTS-REMEDIATION-PLAN §5.4/§5.5/§5.6 added them
+  in the same commit as M3, which is why §6.1's "resist back-filling them"
+  is moot — that milestone landed with them already there.
   `data/Caps.kt::displayIsHdr(context)` is private. Info panel:
   `PlayerInfo` → `videoFormatSummary(format)` already maps
   `colorInfo.colorTransfer` to "HDR10 / PQ"/"HLG" (~1131).
@@ -282,11 +317,15 @@ flatten gives for free.
 
 1. Add the helper from §3.3, `pub`, next to `is_dolby_vision`.
 2. Add `pub delivered_dynamic_range: &'static str` to `Decision`, and
-   populate it at the end of `decide()` and in **all three** arms of
-   `decide_forced()` (`Force::Transcode` → `"sdr"` via the helper;
-   `Force::Original` computes with its own method + preserve flag). The
-   serde derive on `Decision` puts it on `DecisionResponse` via the
-   existing flatten.
+   populate it at the end of `decide()` and in **both arms of
+   `decide_forced()` that construct a `Decision`** (`Force::Transcode` →
+   `"sdr"` via the helper; `Force::Original` computes with its own method +
+   preserve flag). The serde derive on `Decision` puts it on
+   `DecisionResponse` via the existing flatten.
+   **Corrected `0fa0aff`:** this step said "**all three** arms".
+   `decide_forced` does have three arms, but `Force::Auto` delegates
+   straight to `decide` and constructs nothing — there are only two
+   `Decision` literals to populate, and `decide`'s own is the third.
 3. `hls.rs::create()`: compute from the already-loaded `source` and the
    `SessionKind` it just built —
    `Copy { preserve_dolby_vision, .. }` → helper with
@@ -376,6 +415,17 @@ working — it reports the fallback the session actually took. Do not
 "fix" the badge to hide it; when the parser bug is fixed the arrow retreats
 to "→ HDR10" (and to lit on Safari) with zero badge changes.
 
+**Corrected `5d5deff`: the rescue this paragraph assumes did not exist on
+the transport it describes.** A media failure under hls.js never reaches
+the `<video>` element — hls.js owns the MediaSource and consumes it — so a
+refused copy stream ended at a toast and a dead player, not at a transcode.
+The rescue the progressive path always had now exists on the hls.js path
+too (copy verdicts only, once per item, media/codec fatals only), which is
+what makes "DV Px → SDR" the badge the viewer actually sees rather than the
+badge on a stream that stopped. The same commit stopped routing 10-bit
+HEVC through MSE on an 8-bit decoder's yes, which is the black-picture case
+that produced no error at all.
+
 **Acceptance:** node syntax check + case table green; manually: Safari on
 an HDR Mac playing 6045 shows `DV P8` lit; Chrome shows `DV P8 → SDR`
 today; the info panel row matches the chip in both.
@@ -388,6 +438,16 @@ for every Android session. The badge will therefore show `DV → HDR10` (or
 `→ SDR` on a transcode) on every DV file until that punch-list item lands —
 **correct behaviour, not a defect of this feature**. Do not implement DV
 caps here; the badge lights up by itself when that ships.
+
+**Corrected `7f4950f`: Android DV caps are implemented.** M3 and
+CLIENTS-REMEDIATION-PLAN §5.1 landed in the same commit, so the "do not
+implement them here" fence never had a second agent on the other side of
+it — see §9's non-goal, corrected the same way. `Caps.kt` now probes
+`MediaCodecList` for `video/dolby-vision`, maps the profile constants, and
+claims the intersection with the panel's `HdrCapabilities`, never claiming
+profile 7. The badge therefore lights on a device that claims a profile the
+file carries, and the paragraph above describes only what a device that
+claims nothing still sees.
 
 1. **Models** (`data/Models.kt`): add `val delivered_dynamic_range: String?
    = null` to `Decision` and to `HlsStart`. Nothing else — resist back-
@@ -433,8 +493,14 @@ caps here; the badge lights up by itself when that ships.
 **Acceptance:** `./gradlew :app:testDebugUnitTest` green (MediaFactsTest +
 a `renderedRange` table + ModelContractTest decoding the new field); on an
 Android TV with an HDR panel, 6041 plays with the chip reading
-`DV P7 → HDR10` (copy session) and the info row naming the strip; force a
-rung → chip flips to `DV P7 → SDR` live.
+`DV → HDR10` (copy session) and the info row naming the strip; force a
+rung → chip flips to `DV → SDR` live.
+
+**Corrected:** the acceptance said `DV P7 → HDR10`. The Android mark is
+`"DV"` — `dynamicRangeFact` labels the chip from the *coarse* grade and has
+never carried a profile number. Only the web chip does, because `hdrChip`
+regexes the profile out of `hdr_format`; the arrow suffix is the same
+vocabulary on all three clients.
 
 ## 7. M4 — Apple
 
@@ -477,10 +543,17 @@ receives a `dvh1`-tagged copy). Everything funnels through
 **Acceptance:** `xcodegen && xcodebuild test` on Paul's box (the cloud
 sandbox cannot build Apple targets — keep every new rule inside the static
 funcs so the test target carries the logic); on an Apple TV 4K with a DV
-display, 6045 (P8) shows `DV P8` lit in the play overlay; with the TV's
+display, 6045 (P8) shows `DV` lit in the play overlay; with the TV's
 Dolby Vision output disabled (Settings → Video and Audio → Format), the
-same badge reads `DV P8 → HDR10`-or-`→ SDR` per what
+same badge reads `DV → HDR10`-or-`→ SDR` per what
 `eligibleForHDRPlayback` then reports.
+
+**Corrected `a6643f7`:** this acceptance said `DV P8`. The Apple mark has
+never carried a profile number — `DynamicRange.sourceMark` answers `"DV"`
+or `"HDR"` and nothing else, so the prose overstated what this client
+renders. Same for Android (§6); the web chip is the only one that spells
+the profile, and it gets it from a regex over `hdr_format`, not from
+anything this plan added.
 
 ## 8. M5 (optional) — capability dimming on the detail screens
 
@@ -503,6 +576,11 @@ if M1–M4 land clean; it touches three more surfaces for a softer claim.
 - **Do not implement Android DV caps** (`dv`/`dvprofile` in Caps.kt) — it's
   an existing punch-list item being worked on this branch by another agent;
   doing it here collides. The badge is designed to be correct without it.
+  **Corrected `7f4950f`: they are implemented** — M3 and
+  CLIENTS-REMEDIATION-PLAN §5.1 landed together, so there was no other
+  agent to collide with. The guardrail's *point* survives: the badge was
+  built to be correct without them, and it did not change when they
+  arrived.
 - **Do not add audio or resolution states in this pass.** The `FactState`/
   `dimmed`/`off` mechanics are deliberately generic; wiring Atmos→AAC and
   4K→rung truthfulness is a follow-up with its own truth table (audio
@@ -540,7 +618,8 @@ if M1–M4 land clean; it touches three more surfaces for a softer claim.
   `docs/PLAYBACK.md`, note the two new wire fields wherever
   `DecisionResponse`/`StartResponse` are documented, a line in
   `docs/FEATURES.md`, and a `CHANGELOG.md` entry. Mark this plan's Status
-  line "landed @ <sha>" when it merges.
+  line "landed @ <sha>" when it merges — **done**, and it took four shas
+  rather than one because the milestones landed per client.
 
 ## 11. Acceptance matrix — the two films that started all of this
 
@@ -554,11 +633,21 @@ overlay after M1–M4; ✱ marks cells that flip when known open items land.
 | Safari, HDR Mac | 6045: `DV P8` lit · 6041: `DV P7 → HDR10` | web probe asks only profiles 5/8 (`dvCan("05.06")`/`("08.07")`), so P8 preserves and P7 strips to its base |
 | Chrome, HDR display | `DV Px → SDR` ✱ | strip-remux refused (open MSE parser bug) → transcode rescue; becomes `→ HDR10` when the parser bug is fixed |
 | Chrome, SDR display | `DV Px → SDR` | server tone-maps (hdr=0 caps) |
-| Android TV, HDR panel | `DV Px → HDR10` ✱ | no dv caps sent → server strips; goes lit for supported profiles when the dv-caps punch-list item lands |
-| Apple TV 4K, DV output on | 6045: `DV P8` lit · 6041: `DV P7 → HDR10` | Caps.swift sends `dvprofile=5,8`; P8 → dvh1 copy engages the DV pipeline, P7 is not claimed → strip |
-| Apple TV 4K, forced 1080p rung | `DV Px → SDR` | transcode session; badge follows the session, not the decision |
+| Android TV, HDR panel | 6041: `DV → HDR10` · 6045 on a DV-claiming panel: `DV` lit | `Caps.kt` now sends `dvprofile` for the profiles the decoder lists and the panel shows, never 7 — so P8 preserves where the device claims it and P7 always strips |
+| Apple TV 4K, DV output on | 6045: `DV` lit · 6041: `DV → HDR10` | Caps.swift sends `dvprofile=5,8`; P8 → dvh1 copy engages the DV pipeline, P7 is not claimed → strip |
+| Apple TV 4K, forced 1080p rung | `DV → SDR` | transcode session; badge follows the session, not the decision |
 | Any client, HDR10 (non-DV) source, HDR display, remux/direct | `HDR10` lit | video copied untouched |
 | Any client, HDR10 source, transcode for bitrate/subs burn | `HDR10 → SDR` | every transcode tone-maps to H.264 8-bit |
 
+**Corrected:** the Android and Apple rows spelled the mark `DV Px`. Only
+the web chip carries a profile number (`hdrChip` regexes it out of
+`hdr_format`); Android's `dynamicRangeFact` and Apple's
+`DynamicRange.sourceMark` both answer `"DV"`. The Safari and Chrome rows
+are the web player and keep theirs. The Android row's ✱ is also spent —
+`7f4950f` shipped the dv-caps item it was waiting on (§6).
+
 If a cell disagrees with the shipped behaviour, the bug is in the feature,
 not the matrix — the matrix restates §2.1, which restates the pipeline.
+**None of these cells has been observed.** Every one of them is a
+prediction until someone runs the two films on the hardware named in the
+row; the Status line says so, and so does this.

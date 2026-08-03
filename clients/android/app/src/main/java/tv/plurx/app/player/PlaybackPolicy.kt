@@ -57,7 +57,7 @@ internal fun automaticSubtitleIndex(tracks: List<SubTrack>, subtitleLanguage: St
  * menu, the routing, and the rendition ordinals can never disagree.
  *
  * **Not** the same question as `SubTrack.text`. The decision's `text` flag is
- * `!is_bitmap_subtitle` (`plurxd/src/http/stream.rs:419`) — "has extractable
+ * `!is_bitmap_subtitle` (`plurxd/src/http/stream.rs:435`) — "has extractable
  * text" — so `mov_text` and styled ASS/SSA both arrive with `text = true`.
  * But the session endpoint rejects them with a 400 (`plurxd/src/http/hls.rs:209`,
  * `is_native_text_subtitle`) and the master playlist never advertises them,
@@ -117,7 +117,7 @@ internal enum class SubtitleRoute {
  * Direct play renders any text the container carries, styling included, so
  * `mov_text` and ASS/SSA are free there — the player reads the container's own
  * track, and `/files/{id}/subs/{index}.vtt` can extract either if it has to
- * (that endpoint turns away only bitmaps, `plurxd/src/http/stream.rs:770`).
+ * (that endpoint turns away only bitmaps, `plurxd/src/http/stream.rs:787`).
  * A server session cannot advertise them as renditions (see
  * [isNativeTextSubtitle]), so there they burn with the bitmaps.
  *
