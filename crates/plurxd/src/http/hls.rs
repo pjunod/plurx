@@ -853,11 +853,13 @@ fn master_playlist_with(
         out.push_str(",SUBTITLES=\"subs\"");
     }
     out.push('\n');
-    // Resolve back to the historical media-playlist URL without carrying the
-    // master's `native=1` query. AVPlayer accepts the exact same copied fMP4
-    // when reached through this stable session URL, while treating a second
-    // synthetic child path as a different (and incompatible) asset.
-    out.push_str("index.m3u8\n");
+    // Resolve back to the historical media-playlist URL and explicitly clear
+    // the master's `native=1` query. A same-path relative reference is allowed
+    // to inherit URL state inside AVFoundation; that turns the variant back
+    // into this master, and the recursive asset fails as an unsupported URL.
+    // Keep the stable session path (a synthetic child path has also failed on
+    // real hardware), but make the media branch unambiguous.
+    out.push_str("index.m3u8?native=0\n");
     out
 }
 
@@ -1291,7 +1293,7 @@ mod tests {
         ));
         assert!(master.contains("NAME=\"English · Regular\",LANGUAGE=\"en\",DEFAULT=NO"));
         assert!(master.contains("NAME=\"English · SDH\",LANGUAGE=\"en\",DEFAULT=NO,AUTOSELECT=YES,FORCED=NO,CHARACTERISTICS=\"public.accessibility.transcribes-spoken-dialog,public.accessibility.describes-music-and-sound\""));
-        assert!(master.ends_with("index.m3u8\n"));
+        assert!(master.ends_with("index.m3u8?native=0\n"));
     }
 
     /// Who gets the accessibility tag: the muxer's answer first, the track's
