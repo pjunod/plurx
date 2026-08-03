@@ -115,4 +115,8 @@ services:
       # The companion reads the server through the host-published port, then
       # advertises that same port to native clients over Bonjour.
       PLURX_DISCOVERY_SERVER_URL: "http://127.0.0.1:${PLURX_HTTP_PORT:-32400}"
+      # The image healthcheck reads PLURX_BIND. Because this container uses the
+      # host network, point its probe at the same published server port instead
+      # of the image default (which may still belong to Plex).
+      PLURX_BIND: "127.0.0.1:${PLURX_HTTP_PORT:-32400}"
     command: ["advertise"]
