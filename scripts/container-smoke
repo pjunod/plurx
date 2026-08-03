@@ -4,9 +4,22 @@ set -eu
 image="${1:-plurx/plurxd:latest}"
 name="plurx-validation-$$"
 scratch="$(mktemp -d "${TMPDIR:-/tmp}/plurx-container-smoke.XXXXXX")"
+# The image deliberately runs as an unprivileged user. The host-created test
+# directory belongs to the caller, so make this one disposable directory
+# writable by the container before asking it to create its database.
+chmod 0777 "$scratch"
 
 cleanup() {
   docker rm -f "$name" >/dev/null 2>&1 || true
+  # The service correctly creates state as its unprivileged container UID,
+  # which may not match the host runner's UID. Make the disposable bind
+  # contents removable before the host deletes the scratch directory.
+  docker run --rm \
+    --user 0:0 \
+    --entrypoint /bin/sh \
+    --volume "$scratch:/scratch" \
+    "$image" \
+    -c 'chmod -R a+rwX /scratch' >/dev/null 2>&1 || true
   case "$scratch" in
     */plurx-container-smoke.*) rm -rf -- "$scratch" ;;
   esac
@@ -21,12 +34,17 @@ fi
 
 docker create \
   --name "$name" \
-  --publish 127.0.0.1::32400 \
+  --publish 127.0.0.1:0:32400 \
   --volume "$scratch:/var/lib/plurx" \
   "$image" >/dev/null
 docker start "$name" >/dev/null
 
 binding="$(docker port "$name" 32400/tcp | head -n 1)"
+if [ -z "$binding" ]; then
+  docker logs "$name" >&2 || true
+  echo "container published no host port for 32400/tcp" >&2
+  exit 1
+fi
 port="${binding##*:}"
 base="http://127.0.0.1:$port"
 
@@ -53,6 +71,11 @@ docker start "$name" >/dev/null
 # Desktop may choose a new one after a stop/start cycle. Re-resolve it rather
 # than mistaking a changed host port for a failed application restart.
 binding="$(docker port "$name" 32400/tcp | head -n 1)"
+if [ -z "$binding" ]; then
+  docker logs "$name" >&2 || true
+  echo "container published no host port for 32400/tcp after restart" >&2
+  exit 1
+fi
 port="${binding##*:}"
 base="http://127.0.0.1:$port"
 attempt=0
