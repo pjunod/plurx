@@ -1251,12 +1251,7 @@ pub async fn segment(
         .segment(&session, &seg)
         .await
         .ok_or(ApiError::NotFound("segment"))?;
-    // MPEG-TS segments (transcode) vs fMP4 init/segments (copy-video path).
-    let content_type = if seg.ends_with(".ts") {
-        "video/mp2t"
-    } else {
-        "video/mp4"
-    };
+    let content_type = segment_content_type(&seg);
     Ok((
         StatusCode::OK,
         [
@@ -1281,9 +1276,31 @@ pub async fn segment(
         .into_response())
 }
 
+/// MIME types from Apple's HLS authoring profile. An initialization section
+/// is an MP4 file, while each `.m4s` resource is an ISO BMFF media segment.
+/// Labeling both as `video/mp4` makes the bytes decodable in isolation but can
+/// cause AVPlayer's multivariant validator to reject the rendition before it
+/// ever opens the decoder.
+fn segment_content_type(name: &str) -> &'static str {
+    if name.ends_with(".ts") {
+        "video/mp2t"
+    } else if name.ends_with(".m4s") {
+        "video/iso.segment"
+    } else {
+        "video/mp4"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fmp4_media_segments_use_the_iso_segment_mime_type() {
+        assert_eq!(segment_content_type("init.mp4"), "video/mp4");
+        assert_eq!(segment_content_type("seg00000.m4s"), "video/iso.segment");
+        assert_eq!(segment_content_type("seg00000.ts"), "video/mp2t");
+    }
 
     fn hls_file(subtitle_streams: Vec<SubtitleStream>) -> MediaFile {
         MediaFile {
