@@ -1525,17 +1525,56 @@ final class AppleClientTests: XCTestCase {
         XCTAssertEqual(json["copy"] as? Bool, true)
     }
 
-    func testAppleCapsDescribeDolbyVisionProfilesWithoutDeprecatedHDRAPI() {
-        let caps = Dictionary(uniqueKeysWithValues: Caps.query().compactMap { item in
+    func testAppleCapsKeepGenericHDRSeparateFromDolbyVision() {
+        func dictionary(_ query: [URLQueryItem]) -> [String: String] {
+            Dictionary(uniqueKeysWithValues: query.compactMap { item in
+                item.value.map { (item.name, $0) }
+            })
+        }
+
+        // This is the tvOS failure that used to become an SDR compatibility
+        // transcode: HDR10 output made the client claim Dolby Vision too.
+        let hdrOnly = dictionary(Caps.query(
+            hevc: true,
+            av1: false,
+            displayHDR: true,
+            dolbyVision: false
+        ))
+        XCTAssertEqual(hdrOnly["hdr"], "1")
+        XCTAssertEqual(hdrOnly["dv"], "0")
+        XCTAssertEqual(hdrOnly["dvprofile"], "")
+        XCTAssertEqual(hdrOnly["vcodec"], "h264,hevc")
+
+        let dolbyVision = dictionary(Caps.query(
+            hevc: true,
+            av1: true,
+            displayHDR: true,
+            dolbyVision: true
+        ))
+        XCTAssertEqual(dolbyVision["hdr"], "1")
+        XCTAssertEqual(dolbyVision["dv"], "1")
+        XCTAssertEqual(dolbyVision["dvprofile"], "5,8")
+        XCTAssertEqual(dolbyVision["vcodec"], "h264,hevc,av1")
+
+        // A DV-capable display without the required hardware decoder is not a
+        // playable DV path and must not be advertised as one.
+        let noHEVC = dictionary(Caps.query(
+            hevc: false,
+            av1: false,
+            displayHDR: true,
+            dolbyVision: true
+        ))
+        XCTAssertEqual(noHEVC["hdr"], "1")
+        XCTAssertEqual(noHEVC["dv"], "0")
+        XCTAssertEqual(noHEVC["dvprofile"], "")
+
+        // The runtime path still spells every field for old and new servers.
+        let runtime = Dictionary(uniqueKeysWithValues: Caps.query().compactMap { item in
             item.value.map { (item.name, $0) }
         })
-
-        XCTAssertNotNil(caps["hdr"])
-        XCTAssertNotNil(caps["dv"])
-        XCTAssertNotNil(caps["dvprofile"])
-        if caps["dv"] == "1" {
-            XCTAssertEqual(caps["dvprofile"], "5,8")
-        }
+        XCTAssertNotNil(runtime["hdr"])
+        XCTAssertNotNil(runtime["dv"])
+        XCTAssertNotNil(runtime["dvprofile"])
     }
 
     func testPictureInPictureCommandStartsStopsAndWaitsForAvailability() {

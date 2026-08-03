@@ -10,31 +10,52 @@ import VideoToolbox
 /// decode where present — so MKV or DTS files come back as HLS instead.
 enum Caps {
     static func query() -> [URLQueryItem] {
-        var vcodec = ["h264"]
         let hevc = VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC)
+        let av1 = VTIsHardwareDecodeSupported(kCMVideoCodecType_AV1)
+        return query(
+            hevc: hevc,
+            av1: av1,
+            displayHDR: displayIsHDR,
+            dolbyVision: dolbyVisionIsAvailable
+        )
+    }
+
+    /// Pure spelling of the wire capabilities. Keeping AVFoundation outside
+    /// this half makes the important distinction regression-testable: a
+    /// display may support HDR10 without supporting Dolby Vision.
+    static func query(
+        hevc: Bool,
+        av1: Bool,
+        displayHDR: Bool,
+        dolbyVision: Bool
+    ) -> [URLQueryItem] {
+        var vcodec = ["h264"]
         if hevc { vcodec.append("hevc") }
-        if VTIsHardwareDecodeSupported(kCMVideoCodecType_AV1) { vcodec.append("av1") }
+        if av1 { vcodec.append("av1") }
         // AVPlayer handles these audio codecs; DTS / TrueHD are deliberately out.
         let acodec = ["aac", "ac3", "eac3", "alac", "mp3"]
         // Containers AVPlayer will direct-play from a progressive URL.
         let container = ["mp4", "mov", "m4v"]
+        let supportsDolbyVision = hevc && displayHDR && dolbyVision
 
         return [
             URLQueryItem(name: "vcodec", value: vcodec.joined(separator: ",")),
             URLQueryItem(name: "acodec", value: acodec.joined(separator: ",")),
             URLQueryItem(name: "container", value: container.joined(separator: ",")),
-            URLQueryItem(name: "hdr", value: displayIsHDR ? "1" : "0"),
-            // The former profile-specific HDR API was removed in iOS/tvOS 26.
-            // Apple's replacement is the display-aware eligibility signal;
-            // with hardware HEVC it is the supported
-            // public capability check for AVPlayer's HDR/Dolby Vision path.
+            URLQueryItem(name: "hdr", value: displayHDR ? "1" : "0"),
+            // Generic HDR eligibility must not be promoted into a Dolby
+            // Vision claim. On an HDR10-only output that overclaim makes the
+            // server preserve DV metadata, AVPlayer rejects the stream, and
+            // the compatibility retry needlessly tone-maps it all the way to
+            // SDR. A conservative DV=0 lets the server expose the untouched
+            // HDR10-compatible base instead.
             // Profile 5 and 8 are advertised explicitly so the server never
             // mistakes support for those delivery profiles as support for
             // Blu-ray Profile 7.
-            URLQueryItem(name: "dv", value: dolbyVisionSupported(hevc: hevc) ? "1" : "0"),
+            URLQueryItem(name: "dv", value: supportsDolbyVision ? "1" : "0"),
             URLQueryItem(
                 name: "dvprofile",
-                value: dolbyVisionSupported(hevc: hevc) ? "5,8" : ""
+                value: supportsDolbyVision ? "5,8" : ""
             ),
         ]
     }
@@ -52,7 +73,15 @@ enum Caps {
         AVPlayer.eligibleForHDRPlayback
     }
 
-    private static func dolbyVisionSupported(hevc: Bool) -> Bool {
-        hevc && displayIsHDR
+    /// The format-specific signal is the only public API that can distinguish
+    /// a Dolby Vision output from an HDR10-only one. Apple deprecated it in
+    /// iOS/tvOS 26 in favor of generic HDR eligibility, which deliberately
+    /// does not name a format. On those releases there is no truthful public
+    /// DV claim to send, so stay conservative and retain compatible HDR10.
+    private static var dolbyVisionIsAvailable: Bool {
+        if #available(iOS 26.0, tvOS 26.0, *) {
+            return false
+        }
+        return AVPlayer.availableHDRModes.contains(.dolbyVision)
     }
 }
