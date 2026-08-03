@@ -347,6 +347,10 @@ pub async fn status(
 pub struct PlaylistQuery {
     pub native: Option<u8>,
     pub subtitle: Option<i64>,
+    /// Temporary physical-device isolation mode for the Apple HDR master.
+    /// The session UUID remains the capability; these modes only remove
+    /// declarations from the playlist and never expose another resource.
+    pub diagnostic: Option<String>,
 }
 
 fn playlist_response(bytes: Vec<u8>) -> Response {
@@ -412,7 +416,8 @@ pub async fn master_playlist_response(
 ) -> Result<Response, ApiError> {
     let (context, file) = session_file(&state, &session).await?;
     Ok(playlist_response(
-        master_playlist(&file, query.subtitle, &context).into_bytes(),
+        master_playlist_diagnostic(&file, query.subtitle, &context, query.diagnostic.as_deref())
+            .into_bytes(),
     ))
 }
 
@@ -755,14 +760,80 @@ fn master_playlist(
     selected: Option<i64>,
     context: &crate::transcode::HlsContext,
 ) -> String {
-    master_playlist_with(file, selected, context, MasterRungs::active())
+    master_playlist_with_shape(
+        file,
+        selected,
+        context,
+        MasterRungs::active(),
+        MasterShape::default(),
+    )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MasterShape {
+    subtitles: bool,
+    codecs: bool,
+    video_range: bool,
+}
+
+impl Default for MasterShape {
+    fn default() -> Self {
+        Self {
+            subtitles: true,
+            codecs: true,
+            video_range: true,
+        }
+    }
+}
+
+fn master_playlist_diagnostic(
+    file: &MediaFile,
+    selected: Option<i64>,
+    context: &crate::transcode::HlsContext,
+    diagnostic: Option<&str>,
+) -> String {
+    let shape = match diagnostic {
+        Some("video-only") => MasterShape {
+            subtitles: false,
+            codecs: false,
+            video_range: false,
+        },
+        Some("video-only-codecs") => MasterShape {
+            subtitles: false,
+            codecs: true,
+            video_range: false,
+        },
+        Some("video-only-range") => MasterShape {
+            subtitles: false,
+            codecs: false,
+            video_range: true,
+        },
+        Some("video-only-hdr") => MasterShape {
+            subtitles: false,
+            codecs: true,
+            video_range: true,
+        },
+        _ => MasterShape::default(),
+    };
+    master_playlist_with_shape(file, selected, context, MasterRungs::active(), shape)
+}
+
+#[cfg(test)]
 fn master_playlist_with(
     file: &MediaFile,
     selected: Option<i64>,
     context: &crate::transcode::HlsContext,
     rungs: MasterRungs,
+) -> String {
+    master_playlist_with_shape(file, selected, context, rungs, MasterShape::default())
+}
+
+fn master_playlist_with_shape(
+    file: &MediaFile,
+    selected: Option<i64>,
+    context: &crate::transcode::HlsContext,
+    rungs: MasterRungs,
+    shape: MasterShape,
 ) -> String {
     let native: Vec<(usize, &SubtitleStream)> = file
         .subtitle_streams
@@ -777,6 +848,9 @@ fn master_playlist_with(
     // boundary and can reject an otherwise playable copied HEVC/DV stream.
     let mut out = String::from("#EXTM3U\n#EXT-X-VERSION:7\n");
     for (ordinal, (index, track)) in native.iter().enumerate() {
+        if !shape.subtitles {
+            break;
+        }
         // The query describes this player's selection. No selected index is
         // an explicit Off, not permission to resurrect a foreign-language
         // container default behind the client's back.
@@ -846,15 +920,19 @@ fn master_playlist_with(
         None
     };
     if let Some(video_range) = video_range {
-        out.push_str(&format!(
-            ",VIDEO-RANGE={video_range},CODECS=\"{}\"",
-            quoted(&context.codecs)
-        ));
-        if let Some(supplemental) = context.supplemental_codecs.as_deref() {
-            out.push_str(&format!(
-                ",SUPPLEMENTAL-CODECS=\"{}\"",
-                quoted(supplemental)
-            ));
+        if shape.video_range {
+            out.push_str(&format!(",VIDEO-RANGE={video_range}"));
+        }
+        if shape.codecs {
+            out.push_str(&format!(",CODECS=\"{}\"", quoted(&context.codecs)));
+        }
+        if shape.codecs {
+            if let Some(supplemental) = context.supplemental_codecs.as_deref() {
+                out.push_str(&format!(
+                    ",SUPPLEMENTAL-CODECS=\"{}\"",
+                    quoted(supplemental)
+                ));
+            }
         }
     }
     // Ladder rung: the variant carries no CLOSED-CAPTIONS attribute, and
@@ -866,7 +944,7 @@ fn master_playlist_with(
     if rungs.closed_captions_none {
         out.push_str(",CLOSED-CAPTIONS=NONE");
     }
-    if !native.is_empty() {
+    if shape.subtitles && !native.is_empty() {
         out.push_str(",SUBTITLES=\"subs\"");
     }
     out.push('\n');
@@ -1307,6 +1385,32 @@ mod tests {
         let master = master_playlist(&file, None, &transcoded);
         assert!(!master.contains("VIDEO-RANGE="));
         assert!(!master.contains("CODECS="));
+    }
+
+    #[test]
+    fn hdr_diagnostics_isolate_master_attributes_without_changing_the_child() {
+        let file = hls_file(vec![sub("subrip", "eng", "Forced", true, false)]);
+        let context = hls_context("hvc1.2.4.L150.B0,ec-3", None);
+
+        let minimal = master_playlist_diagnostic(&file, None, &context, Some("video-only"));
+        assert_eq!(
+            minimal,
+            "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-STREAM-INF:BANDWIDTH=40000000\nindex.m3u8\n"
+        );
+
+        let range = master_playlist_diagnostic(&file, None, &context, Some("video-only-range"));
+        assert!(range.contains("BANDWIDTH=40000000,VIDEO-RANGE=PQ\n"));
+        assert!(!range.contains("CODECS="));
+        assert!(!range.contains("SUBTITLES="));
+
+        let codecs = master_playlist_diagnostic(&file, None, &context, Some("video-only-codecs"));
+        assert!(codecs.contains("CODECS=\"hvc1.2.4.L150.B0,ec-3\""));
+        assert!(!codecs.contains("VIDEO-RANGE="));
+
+        let hdr = master_playlist_diagnostic(&file, None, &context, Some("video-only-hdr"));
+        assert!(hdr.contains("VIDEO-RANGE=PQ"));
+        assert!(hdr.contains("CODECS=\"hvc1.2.4.L150.B0,ec-3\""));
+        assert!(hdr.ends_with("index.m3u8\n"));
     }
 
     /// Who gets the accessibility tag: the muxer's answer first, the track's
