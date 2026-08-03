@@ -905,14 +905,13 @@ mod tests {
         );
     }
 
-    /// The rail shows the show's poster plurx already has.
+    /// The rail prefers the show's poster plurx already has.
     ///
-    /// The entries used to be text-only, because the calendar carries no
-    /// artwork and plurx made no attempt to find any. It does not need to
-    /// fetch one: a series whose next episode is airing is a series you
-    /// already have, so the poster is sitting in the artwork cache — and it
-    /// is resolved by TMDB id, never by title, for the same reason every
-    /// other seam in this integration is.
+    /// A series whose next episode is airing often already has a poster in
+    /// plurx. That copy wins over monarr's provider reference, and it is
+    /// resolved by TMDB id, never by title, for the same reason every other
+    /// seam in this integration is. Entries without either source still fall
+    /// back to initials rather than borrowing an unrelated local poster.
     #[tokio::test]
     async fn the_rail_wears_the_artwork_plurx_already_has() {
         use axum::routing::get as axget;
@@ -927,7 +926,8 @@ mod tests {
                     // Not in the library: nothing local to wear.
                     { "date": "2026-08-02", "kind": "movie", "mediaItemId": 8,
                       "title": "Some Film", "detail": "", "hasFile": false,
-                      "tmdbId": 999999 },
+                      "tmdbId": 999999,
+                      "posterPath": "https://static.tvmaze.com/poster.jpg" },
                     // No ids at all: must not match the first row of its kind.
                     { "date": "2026-08-03", "kind": "movie", "mediaItemId": 9,
                       "title": "Nameless", "detail": "", "hasFile": false }
@@ -979,6 +979,13 @@ mod tests {
             )
             .await
             .expect("patch");
+        std::fs::create_dir_all(&state.artwork_dir).expect("artwork dir");
+        std::fs::write(state.artwork_dir.join("show.jpg"), b"show poster").expect("show poster");
+        let provider_url =
+            reqwest::Url::parse("https://static.tvmaze.com/poster.jpg").expect("provider URL");
+        let provider_file = super::comingsoon::artwork_cache_filename(&provider_url);
+        std::fs::write(state.artwork_dir.join(&provider_file), b"future poster")
+            .expect("provider poster");
         // A movie that also holds TMDB 1399. The id spaces are separate, so
         // this must NOT be picked for the episode row.
         let decoy = state
@@ -1028,9 +1035,10 @@ mod tests {
         );
         assert_eq!(e[0]["item_id"], show, "and click through to the show");
 
-        assert!(
-            e[1].get("poster").is_none(),
-            "a film that is not in the library has no local artwork to wear: {body}"
+        assert_eq!(
+            e[1]["poster"],
+            format!("/api/v1/images/{provider_file}"),
+            "a film not yet in the library uses monarr's cached provider art: {body}"
         );
         assert!(e[1].get("item_id").is_none());
 
