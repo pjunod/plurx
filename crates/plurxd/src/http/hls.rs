@@ -721,9 +721,9 @@ impl MasterRungs {
     fn active() -> Self {
         static ACTIVE: std::sync::OnceLock<MasterRungs> = std::sync::OnceLock::new();
         *ACTIVE.get_or_init(|| MasterRungs {
+            closed_captions_none: Self::enabled("PLURX_HLS_CLOSED_CAPTIONS_NONE"),
             // Physical Apple TV canary: exercise this ladder rung alone.
-            closed_captions_none: true,
-            forced_autoselect: Self::enabled("PLURX_HLS_FORCED_AUTOSELECT"),
+            forced_autoselect: true,
         })
     }
 }
@@ -1196,9 +1196,7 @@ mod tests {
         let master = master_playlist(&file, Some(2));
 
         assert!(master.starts_with("#EXTM3U\n#EXT-X-VERSION:7\n"));
-        assert!(master.contains(
-            "#EXT-X-STREAM-INF:BANDWIDTH=40000000,CLOSED-CAPTIONS=NONE,SUBTITLES=\"subs\""
-        ));
+        assert!(master.contains("#EXT-X-STREAM-INF:BANDWIDTH=40000000,SUBTITLES=\"subs\""));
         assert!(!master.contains("CODECS="));
         assert!(!master.contains("#EXT-X-INDEPENDENT-SEGMENTS"));
         assert!(master.contains("NAME=\"English · Forced\",LANGUAGE=\"en\",DEFAULT=NO,AUTOSELECT=YES,FORCED=YES,URI=\"subs/2/index.m3u8\""));
