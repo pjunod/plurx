@@ -161,21 +161,23 @@ final class AppleClientTests: XCTestCase {
     }
 
     @MainActor
-    func testAutomaticSubtitlesFollowViewerLanguageNotContainerDefault() {
+    func testAutomaticSubtitlesApplyTheServersPickInsteadOfRederivingIt() {
+        // The Scary Movie shape, as the decision hands it over: the server ran
+        // `select_tracks` and stamped `default` on exactly the track it chose,
+        // so the muxer's own Italian default is already gone from the wire.
+        // The client applies that answer and does not re-derive one.
         let tracks = [
             SubtitleTrack(
                 index: 0, codec: "subrip", language: "ita", title: "Forced",
-                default: true, forced: true, text: true
+                default: false, forced: true, text: true
             ),
             SubtitleTrack(
                 index: 1, codec: "subrip", language: "ita", title: "Regular",
                 default: false, forced: false, text: true
             ),
-            // This is the affected Scary Movie shape: the mux retained the
-            // English Forced title but omitted its forced disposition.
             SubtitleTrack(
                 index: 2, codec: "subrip", language: "eng", title: "Forced",
-                default: false, forced: false, text: true
+                default: true, forced: false, text: true
             ),
             SubtitleTrack(
                 index: 3, codec: "subrip", language: "eng", title: "Regular",
@@ -187,27 +189,36 @@ final class AppleClientTests: XCTestCase {
             ),
         ]
 
-        XCTAssertEqual(
-            PlayerController.automaticSubtitleIndex(tracks, preferredLanguage: "eng"),
-            2
+        XCTAssertEqual(PlayerController.automaticSubtitleIndex(tracks), 2)
+
+        // No pick at all — the server's Auto mode under matching audio, or an
+        // operator's Off — selects nothing. The client has no fallback rule of
+        // its own to reach past that with.
+        let unpicked = tracks.map { track -> SubtitleTrack in
+            var copy = track
+            copy.default = false
+            return copy
+        }
+        XCTAssertNil(PlayerController.automaticSubtitleIndex(unpicked))
+
+        // Anything the server can choose is applied, including a track in
+        // another language or with no language tag at all: those are its
+        // rules — dual-audio anime, untagged eligibility, the subtitle mode —
+        // and this client no longer keeps a second copy of them.
+        var untagged = unpicked
+        untagged[1] = SubtitleTrack(
+            index: 1, codec: "subrip", language: nil, title: nil,
+            default: true, forced: false, text: true
         )
-        XCTAssertEqual(
-            PlayerController.automaticSubtitleIndex(tracks, preferredLanguage: "en-US"),
-            2
-        )
-        XCTAssertNil(
-            PlayerController.automaticSubtitleIndex(tracks, preferredLanguage: "spa")
-        )
-        XCTAssertNil(
-            PlayerController.automaticSubtitleIndex(tracks, preferredLanguage: "off")
-        )
+        XCTAssertEqual(PlayerController.automaticSubtitleIndex(untagged), 1)
     }
 
     @MainActor
-    func testAutomaticSubtitlesNeverStartABurnForABitmapOnlyLanguageMatch() {
-        // A Blu-ray remux whose only English subtitle is a non-forced PGS.
-        // Selecting it automatically would spawn a video encoder on every
-        // single play — the exact bug this project exists to kill.
+    func testAutomaticSubtitlesVetoANonForcedBitmapPick() {
+        // A Blu-ray remux whose English subtitle is a non-forced PGS. Honoring
+        // that pick would spawn a video encoder on every single play — the
+        // exact bug this project exists to kill — so the client vetoes it and
+        // leaves the viewer to ask for it by hand.
         let tracks = [
             SubtitleTrack(
                 index: 0, codec: "hdmv_pgs_subtitle", language: "eng", title: "English",
@@ -217,20 +228,17 @@ final class AppleClientTests: XCTestCase {
                 index: 1, codec: "dvd_subtitle", language: "eng", title: "Commentary",
                 default: false, forced: false, text: false
             ),
-            SubtitleTrack(
-                index: 2, codec: "subrip", language: "ita", title: "Italiano",
-                default: false, forced: false, text: true
-            ),
         ]
 
-        XCTAssertNil(PlayerController.automaticSubtitleIndex(tracks, preferredLanguage: "eng"))
-        XCTAssertEqual(PlayerController.automaticSubtitleIndex(tracks, preferredLanguage: "ita"), 2)
+        XCTAssertNil(PlayerController.automaticSubtitleIndex(tracks))
+        XCTAssertTrue(PlayerController.subtitleRequiresBurn(0, in: tracks))
     }
 
     @MainActor
-    func testAutomaticSubtitlesNeverStartABurnForAStyledAssOnlyLanguageMatch() {
-        // An anime MKV whose only English tracks are ASS: styled subtitles
-        // stay burns, so automatic selection must decline them too.
+    func testAutomaticSubtitlesVetoAStyledAssPick() {
+        // An anime MKV whose picked track is ASS: styled subtitles stay burns
+        // because WebVTT cannot carry their authored presentation, so the veto
+        // covers them too even though they are text.
         let tracks = [
             SubtitleTrack(
                 index: 0, codec: "ass", language: "eng", title: "Full Subtitles",
@@ -242,7 +250,7 @@ final class AppleClientTests: XCTestCase {
             ),
         ]
 
-        XCTAssertNil(PlayerController.automaticSubtitleIndex(tracks, preferredLanguage: "eng"))
+        XCTAssertNil(PlayerController.automaticSubtitleIndex(tracks))
         XCTAssertTrue(PlayerController.subtitleRequiresBurn(0, in: tracks))
     }
 
@@ -254,15 +262,15 @@ final class AppleClientTests: XCTestCase {
         let tracks = [
             SubtitleTrack(
                 index: 0, codec: "hdmv_pgs_subtitle", language: "eng", title: "Forced",
-                default: false, forced: true, text: false
+                default: true, forced: true, text: false
             ),
             SubtitleTrack(
                 index: 1, codec: "hdmv_pgs_subtitle", language: "eng", title: "English",
-                default: true, forced: false, text: false
+                default: false, forced: false, text: false
             ),
         ]
 
-        XCTAssertEqual(PlayerController.automaticSubtitleIndex(tracks, preferredLanguage: "eng"), 0)
+        XCTAssertEqual(PlayerController.automaticSubtitleIndex(tracks), 0)
         XCTAssertTrue(PlayerController.subtitleRequiresBurn(0, in: tracks))
         XCTAssertEqual(
             PlayerController.burnSessionHeight(
@@ -287,31 +295,47 @@ final class AppleClientTests: XCTestCase {
     }
 
     @MainActor
-    func testAutomaticSubtitlesKeepUntaggedTracksEligibleLikeTheServerPolicy() {
-        // The server's shared policy keeps untagged tracks eligible because a
-        // missing tag is not contrary information (plurx-core tracks.rs).
-        let tracks = [
-            SubtitleTrack(
-                index: 0, codec: "subrip", language: "ita", title: "Italiano",
-                default: true, forced: false, text: true
-            ),
-            SubtitleTrack(
-                index: 1, codec: "subrip", language: nil, title: "Forced",
-                default: false, forced: false, text: true
-            ),
-        ]
+    func testNativeClassificationComesFromTheServerWithACodecFallback() throws {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        func track(_ json: String) throws -> SubtitleTrack {
+            try decoder.decode(SubtitleTrack.self, from: Data(json.utf8))
+        }
 
-        XCTAssertEqual(PlayerController.automaticSubtitleIndex(tracks, preferredLanguage: "eng"), 1)
+        // The server answers directly, and its answer wins — `text` is not the
+        // same question, which is what has bitten every client that assumed it
+        // was: ASS carries text and is still a burn.
+        let styled = try track(
+            #"{"index":0,"codec":"ass","default":false,"forced":false,"text":true,"native":false}"#
+        )
+        XCTAssertFalse(styled.isNativeHLS)
+        XCTAssertTrue(styled.text)
+        XCTAssertTrue(PlayerController.subtitleRequiresBurn(0, in: [styled]))
 
-        var bitmapUntagged = tracks
-        bitmapUntagged[1] = SubtitleTrack(
-            index: 1, codec: "hdmv_pgs_subtitle", language: nil, title: "Forced",
-            default: false, forced: true, text: false
+        // A format this client's own list does not know is still native when
+        // the server says so — one classifier, so the client cannot ask for a
+        // session the server would refuse.
+        let futureText = try track(
+            #"{"index":1,"codec":"mov_text","default":false,"forced":false,"text":true,"native":true}"#
         )
-        XCTAssertNil(
-            PlayerController.automaticSubtitleIndex(bitmapUntagged, preferredLanguage: "eng"),
-            "an untagged burn-format track is not worth a burn"
+        XCTAssertTrue(futureText.isNativeHLS)
+
+        // A server predating the field degrades exactly as it does today.
+        let legacy = try track(
+            #"{"index":2,"codec":"subrip","default":false,"forced":false,"text":true}"#
         )
+        XCTAssertNil(legacy.native)
+        XCTAssertTrue(legacy.isNativeHLS)
+        let legacyBitmap = try track(
+            #"{"index":3,"codec":"hdmv_pgs_subtitle","default":false,"forced":false,"text":false}"#
+        )
+        XCTAssertFalse(legacyBitmap.isNativeHLS)
+
+        // And the veto reads the same answer: a server-picked track the server
+        // itself classifies burn-only is not auto-selected.
+        var picked = styled
+        picked.default = true
+        XCTAssertNil(PlayerController.automaticSubtitleIndex([picked]))
     }
 
     @MainActor
@@ -415,8 +439,8 @@ final class AppleClientTests: XCTestCase {
         XCTAssertEqual(PlayerController.subtitleLanguageName("ron"), "Romanian")
         XCTAssertEqual(PlayerController.subtitleLanguageName("nob"), "Norwegian")
 
-        // The alias table also decides viewer-language matching, so a Dutch
-        // preference has to reach a "dut"-tagged track.
+        // The alias table also decides which advertised rendition a track
+        // resolves onto, so a "dut"-tagged track has to match a "nl" option.
         let dutch = [
             SubtitleTrack(
                 index: 0, codec: "subrip", language: "dut", title: nil,
@@ -424,8 +448,15 @@ final class AppleClientTests: XCTestCase {
             ),
         ]
         XCTAssertEqual(
-            PlayerController.automaticSubtitleIndex(dutch, preferredLanguage: "nl"),
-            0
+            PlayerController.nativeSubtitleOptionIndex(
+                ordinal: 0,
+                tracks: dutch,
+                options: [
+                    SubtitleRenditionOption(languageTag: "en", displayName: "English"),
+                    SubtitleRenditionOption(languageTag: "nl", displayName: "Dutch"),
+                ]
+            ),
+            1
         )
         XCTAssertEqual(PlayerController.languageSpellings("dut"), ["nl", "nld", "dut"])
         XCTAssertEqual(PlayerController.languageSpellings("eng"), ["en", "eng"])
@@ -492,8 +523,9 @@ final class AppleClientTests: XCTestCase {
 
     @MainActor
     func testForcedTitlesMatchOnWordBoundariesAndHonorNegation() {
-        // The forced arm is the only path by which automatic selection may
-        // start a burn, so an over-eager title test burns ordinary tracks.
+        // A forced track is the veto's one exception, so it is the only path
+        // by which automatic selection may start a burn: an over-eager title
+        // test hands that exception to ordinary tracks.
         XCTAssertTrue(PlayerController.titleMarksForced("Forced"))
         XCTAssertTrue(PlayerController.titleMarksForced("English Forced"))
         XCTAssertTrue(PlayerController.titleMarksForced("forced (signs)"))
@@ -504,15 +536,17 @@ final class AppleClientTests: XCTestCase {
         XCTAssertFalse(PlayerController.titleMarksForced("Reinforced"))
         XCTAssertFalse(PlayerController.titleMarksForced("Full"))
 
+        // The server picked this one, and the veto still refuses it: a title
+        // that only mentions being *not* forced buys no exception.
         let tracks = [
             SubtitleTrack(
                 index: 0, codec: "hdmv_pgs_subtitle", language: "eng", title: "Non-Forced",
-                default: false, forced: false, text: false
+                default: true, forced: false, text: false
             ),
         ]
         XCTAssertFalse(PlayerController.isForcedSubtitle(tracks[0]))
         XCTAssertNil(
-            PlayerController.automaticSubtitleIndex(tracks, preferredLanguage: "eng"),
+            PlayerController.automaticSubtitleIndex(tracks),
             "a \"Non-Forced\" PGS track must not auto-burn on every play"
         )
 
@@ -522,62 +556,10 @@ final class AppleClientTests: XCTestCase {
             PlayerController.isForcedSubtitle(flagged),
             "the container disposition still stands on its own"
         )
-    }
-
-    @MainActor
-    func testAutomaticSubtitlesHonorTheServersAutoSubtitleMode() {
-        // The server's default mode is Auto: audio already speaking the
-        // preferred subtitle language leaves only the floor eligible
-        // (crates/plurx-core/src/tracks.rs `select_tracks`).
-        let full = [
-            SubtitleTrack(
-                index: 0, codec: "subrip", language: "eng", title: "Regular",
-                default: false, forced: false, text: true
-            ),
-        ]
-        XCTAssertNil(
-            PlayerController.automaticSubtitleIndex(
-                full, preferredLanguage: "eng", audioLanguage: "eng"
-            ),
-            "English audio does not need a full English subtitle track"
-        )
         XCTAssertEqual(
-            PlayerController.automaticSubtitleIndex(
-                full, preferredLanguage: "eng", audioLanguage: "jpn"
-            ),
+            PlayerController.automaticSubtitleIndex([flagged]),
             0,
-            "foreign audio still gets full subtitles"
-        )
-
-        // The floor survives the mode: a forced overlay, or the pick the
-        // server itself flagged, is offered under matching audio too.
-        let floorTracks = [
-            SubtitleTrack(
-                index: 0, codec: "subrip", language: "eng", title: "Forced",
-                default: false, forced: false, text: true
-            ),
-            SubtitleTrack(
-                index: 1, codec: "subrip", language: "eng", title: "Regular",
-                default: false, forced: false, text: true
-            ),
-        ]
-        XCTAssertEqual(
-            PlayerController.automaticSubtitleIndex(
-                floorTracks, preferredLanguage: "eng", audioLanguage: "eng"
-            ),
-            0
-        )
-        var serverPicked = floorTracks
-        serverPicked[0] = SubtitleTrack(
-            index: 0, codec: "subrip", language: "eng", title: "SDH",
-            default: true, forced: false, text: true
-        )
-        XCTAssertEqual(
-            PlayerController.automaticSubtitleIndex(
-                serverPicked, preferredLanguage: "eng", audioLanguage: "eng"
-            ),
-            0,
-            "`default` on a decision track is the server's own pick"
+            "a genuinely forced pick keeps the burn carve-out"
         )
     }
 

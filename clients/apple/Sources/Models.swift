@@ -268,11 +268,22 @@ struct SubtitleTrack: Codable, Identifiable {
     var `default`: Bool
     var forced: Bool
     var text: Bool
+    /// The server's own answer to "can this become a native HLS WebVTT
+    /// rendition?", computed by the same classifier the HLS master and the
+    /// create-time rejection use. Absent from servers that predate the field.
+    var native: Bool?
 
     /// Formats the server can expose losslessly enough as an HLS WebVTT
     /// rendition. Styled ASS/SSA remains a burn even though it contains text.
+    ///
+    /// The server answers this directly now, so ask it rather than re-deriving
+    /// it: one classifier means a client cannot request a session the server
+    /// will refuse, and the natural recovery from that refusal is the burn
+    /// this whole arc exists to avoid. The codec list survives only as the
+    /// fallback for a server that omits the field, and it is deliberately the
+    /// same list, so such a server degrades exactly as it does today.
     var isNativeHLS: Bool {
-        ["subrip", "srt", "webvtt", "vtt"].contains(codec.lowercased())
+        native ?? ["subrip", "srt", "webvtt", "vtt"].contains(codec.lowercased())
     }
 }
 

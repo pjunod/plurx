@@ -315,19 +315,15 @@ final class PlayerController: ObservableObject {
             if knownDurationMs <= 0 { knownDurationMs = decision.source?.durationMs ?? 0 }
             // `default` on a decision track is the server's own shared-policy
             // pick, not the muxer's flag (crates/plurxd http/stream.rs
-            // overwrites it from `select_tracks`), so the audio it names is
-            // the audio that will actually play.
-            let chosenAudio = decision.audio?.first(where: { $0.default })
-            selectedAudio = chosenAudio?.index
-            // Container defaults describe the muxer's primary language, not
-            // this viewer. Choose only within the preferred language, prefer a
-            // forced/narrative track before a full subtitle track, and honor
-            // the server's Auto rule against the audio language.
-            selectedSubtitle = Self.automaticSubtitleIndex(
-                decision.subtitles ?? [],
-                preferredLanguage: model.subLang,
-                audioLanguage: chosenAudio?.language
-            )
+            // overwrites both lists from `select_tracks`).
+            selectedAudio = decision.audio?.first(where: { $0.default })?.index
+            // "Off" in this device's settings is the viewer saying never, so
+            // it is honored before the server's pick is even looked at. It is
+            // the viewer's instruction rather than a second copy of the
+            // selection rule, which lives on the server alone.
+            selectedSubtitle = model.subLang == "off"
+                ? nil
+                : Self.automaticSubtitleIndex(decision.subtitles ?? [])
             try await open(decision: decision, at: startMs)
         } catch {
             fail(error)
@@ -1004,58 +1000,30 @@ final class PlayerController: ObservableObject {
         return [tag] + group.filter { $0 != tag }
     }
 
-    /// Pick the subtitle the player may enable automatically. Never fall back
-    /// to a flagged container default in another language: an Italian-first
-    /// mux can otherwise burn Italian captions while English audio is playing.
-    /// Some release muxes omit the forced disposition and retain only a
-    /// "Forced" title, so both signals are meaningful.
+    /// The subtitle the player may enable automatically: **the one the server
+    /// already chose**, subject to one veto.
     ///
-    /// Owner policy (plan §3.3, decided 2026-08-02): **automatic selection
-    /// must never start a burn — except a forced track, which may, always at
-    /// source height.** Every arm below other than the forced language match
-    /// is therefore restricted to native-HLS formats, and a language whose
-    /// only matches are PGS/VobSub/ASS selects nothing at all rather than
-    /// silently spawning a video encoder on every play (P0-1).
+    /// Choosing is the server's job (decided by Paul on 2026-08-03).
+    /// `/decision` runs the shared `select_tracks` — anime dual-audio, the
+    /// language preferences, and the subtitle mode Auto/Always/Off — and then
+    /// stamps `default: true` on exactly the track it picked
+    /// (crates/plurxd/src/http/stream.rs, decision handler). `default` on a
+    /// decision track is therefore the server's answer and not the muxer's
+    /// flag. This client used to re-derive the same rule from its own
+    /// language settings, which is how it came to behave as `Always` against a
+    /// server set to `Auto`: the rule lived in three languages and drifted.
     ///
-    /// `audioLanguage` is the language of the audio track that is about to
-    /// play. The server's shared policy defaults to `SubMode::Auto`
-    /// (crates/plurx-core/src/tracks.rs `select_tracks`), where audio already
-    /// speaking the preferred subtitle language leaves only the floor — a
-    /// forced overlay or a flagged default — eligible. Ignoring that was a
-    /// real divergence: it turned on a full English subtitle track under
-    /// English audio on every play, which is also what made P2-7's direct-play
-    /// survival worthless in the common case.
-    static func automaticSubtitleIndex(
-        _ tracks: [SubtitleTrack],
-        preferredLanguage: String,
-        audioLanguage: String? = nil
-    ) -> Int? {
-        guard preferredLanguage.lowercased() != "off" else { return nil }
-        // A blank preference must not resolve to nil and thereby match every
-        // *untagged* track through the language arms, whose forced test is
-        // format-agnostic — that is the one place a burn can start.
-        guard let preferred = languageCode(preferredLanguage) else { return nil }
-        let audioSpeaksPreferred = audioLanguage.map { languageCode($0) == preferred } ?? false
-        let matching = tracks.filter { languageCode($0.language) == preferred }
-        // P2-9: the server's shared policy keeps untagged tracks eligible
-        // ("Untagged tracks remain eligible", crates/plurx-core/src/tracks.rs
-        // `forced_or_default`), because a missing tag is not contrary
-        // information. Mirror that, after every genuine language match, and
-        // only for native formats: a track that is neither known to be in the
-        // viewer's language nor cheap to show is not worth a burn.
-        let untagged = tracks.filter { $0.language == nil || languageCode($0.language) == nil }
-        if let forced = matching.first(where: { isForcedSubtitle($0) })?.index { return forced }
-        if let flagged = matching.first(where: { $0.default && $0.isNativeHLS })?.index {
-            return flagged
-        }
-        if !audioSpeaksPreferred,
-           let first = matching.first(where: { $0.isNativeHLS })?.index {
-            return first
-        }
-        if let forced = untagged.first(where: { isForcedSubtitle($0) && $0.isNativeHLS })?.index {
-            return forced
-        }
-        return untagged.first(where: { $0.default && $0.isNativeHLS })?.index
+    /// What stays here is a veto, not a policy — a statement about what this
+    /// client can do rather than about which subtitle the viewer wants:
+    /// **automatic selection must never start a burn, except for a forced
+    /// track, which may, always at source height** (owner policy, plan §3.3).
+    /// A server that picks a non-forced PGS/VobSub/ASS track gets nothing
+    /// selected rather than a video encoder on every play (P0-1); the viewer
+    /// can still choose it by hand, which is the viewer asking.
+    static func automaticSubtitleIndex(_ tracks: [SubtitleTrack]) -> Int? {
+        guard let picked = tracks.first(where: { $0.default }) else { return nil }
+        guard picked.isNativeHLS || isForcedSubtitle(picked) else { return nil }
+        return picked.index
     }
 
     /// Both signals are meaningful: file 5615's English forced track carries
