@@ -1174,14 +1174,11 @@ pub struct SegmentFile {
 /// Subtitle child requests resolve this instead of accepting a file id from
 /// the URL, so one session capability can never be used to read another file.
 ///
-/// **`codecs` and `supplemental_codecs` currently have no consumer.** They
-/// were built for `CODECS` / `SUPPLEMENTAL-CODECS` attributes on the native
-/// HLS master; that whole shape was tried against real AVPlayer hardware on
-/// 2026-08-01/02 and deliberately reverted — the master now carries no codec
-/// claims at all and AVPlayer inspects the published init segment instead (a
-/// test pins `!master.contains("CODECS=")`). The machinery stays because it
-/// is correct and re-deriving it is the expensive part; this note exists so
-/// the next reader does not hunt for a consumer that is not there.
+/// `codecs` and `supplemental_codecs` describe the exact formats in the
+/// session's primary rendition. The native Apple master uses them only for
+/// HDR variants: Apple requires the exact Main10/Dolby declaration alongside
+/// `VIDEO-RANGE`, while leaving SDR masters codec-neutral preserves the broad
+/// compatibility established by physical-device testing.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HlsContext {
     pub file_id: i64,
