@@ -44,8 +44,19 @@ fmt-check: ## Verify formatting without changing files
 lint: ## Clippy across the workspace, warnings are errors
 	$(CARGO) clippy --workspace --all-targets -- -D warnings
 
+.PHONY: rust-check
+rust-check: fmt-check lint test ## Rust format, lint, and workspace tests
+
+.PHONY: history-check
+history-check: ## Verify every corrective commit has current regression evidence
+	@scripts/history-audit --report target/validation/history.json
+
+.PHONY: operations-check
+operations-check: ## Verify deploy, CI, container, and client shipping contracts
+	@python3 -m unittest discover -s tests/operations -p 'test_*.py'
+
 .PHONY: check
-check: validation-lint fmt-check lint test ## Catalog + fmt + lint + test — the baseline gate
+check: validation-lint history-check operations-check rust-check ## History + operations + catalog + Rust baseline
 
 ## ---- functionality-point validation -----------------------------------
 
@@ -63,6 +74,8 @@ validate-help: ## Explain the validation workflow and UI golden commands
 	  '  make validate-full    Add browser, client, and packaging checks' \
 	  '  make validate-nightly Exhaustive playback, recovery, bounds, and packaging' \
 	  '  make validation-lint  Check the catalog and path ownership only' \
+	  '  make history-check    Map every corrective commit to current evidence' \
+	  '  make operations-check Pin deploy, CI, container, and ship contracts' \
 	  '' \
 	  'UI structure uses a reviewed answer key, tests/ui-structure.golden:' \
 	  '  make ui-check         Compare structure and enforce accessibility invariants' \

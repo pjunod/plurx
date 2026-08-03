@@ -3,7 +3,7 @@ version = 1
 [settings]
 profiles = ["commit", "ci", "full", "nightly"]
 artifact_dir = "target/validation"
-always_checks = ["catalog-contract", "rust-gate"]
+always_checks = ["catalog-contract", "history-regressions", "rust-gate"]
 audit_paths = [
   ".dockerignore",
   ".github/workflows/**",
@@ -32,9 +32,27 @@ missing = "fail"
 timeout_seconds = 60
 
 [[checks]]
+id = "history-regressions"
+title = "Historical corrective commits have current validation evidence"
+command = "scripts/history-audit --report target/validation/history.json"
+profiles = ["commit", "ci", "full", "nightly"]
+requires = ["git", "python3"]
+missing = "fail"
+timeout_seconds = 120
+
+[[checks]]
+id = "operations-contract"
+title = "Deploy, CI, container, and client shipping contracts"
+command = "python3 -m unittest discover -s tests/operations -p 'test_*.py'"
+profiles = ["commit", "ci", "full", "nightly"]
+requires = ["bash", "make", "python3", "sh"]
+missing = "fail"
+timeout_seconds = 120
+
+[[checks]]
 id = "rust-gate"
 title = "Rust format, lint, and workspace tests"
-command = "make check"
+command = "make rust-check"
 profiles = ["commit", "ci", "full", "nightly"]
 requires = ["cargo", "make"]
 missing = "fail"
@@ -223,7 +241,7 @@ contract = "The server, Apple clients, and Android clients decode the same repre
 paths = [
   "tests/contracts/native-api.json",
   "crates/plurxd/src/http/{dto,mod}.rs",
-  "clients/apple/Sources/{API,Models}.swift",
+  "clients/apple/Sources/{PlurxAPI,Models}.swift",
   "clients/apple/Tests/AppleClientTests.swift",
   "clients/android/app/src/main/java/tv/plurx/app/data/**",
   "clients/android/app/src/test/java/tv/plurx/app/data/ModelContractTest.kt",
@@ -331,7 +349,7 @@ paths = [
   "scripts/ui-baseline",
   "tests/ui-structure.golden",
 ]
-checks = ["rust-gate", "web-static", "web-layout"]
+checks = ["rust-gate", "web-static", "web-layout", "playback-smoke", "playback-exhaustive"]
 depends_on = ["server.api", "api.contract", "identity.access", "metadata.enrichment", "playback.pipeline"]
 
 [[points]]
@@ -363,8 +381,9 @@ paths = [
   "crates/plurxd/src/version.rs",
   "scripts/{bench,dv-evidence,gop-census,mkpgs,perf-report,ship}",
   "scripts/container-smoke",
+  "tests/operations/**",
 ]
-checks = ["rust-gate", "container-runtime", "resource-bounds"]
+checks = ["rust-gate", "operations-contract", "container-runtime", "resource-bounds"]
 depends_on = ["server.api"]
 
 [[points]]
@@ -376,8 +395,9 @@ paths = [
   "Makefile",
   "docs/VALIDATION.md",
   "scripts/pre-commit",
+  "scripts/history-audit",
   "scripts/validate",
   "tests/validation/**",
   "validation/**",
 ]
-checks = ["catalog-contract"]
+checks = ["catalog-contract", "history-regressions", "operations-contract"]

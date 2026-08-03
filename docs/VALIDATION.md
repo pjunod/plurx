@@ -30,10 +30,12 @@ working tree is complicated or path selection itself is in doubt. Use
 `make validate-full` before a risky merge or release; it can take longer and
 some checks need browsers, simulators, Docker, or client toolchains.
 
-`make check` is still the mandatory portable baseline: catalog lint, Rust
-formatting, clippy, and the Rust test suite. A validation run always includes
-that baseline and then adds checks for affected surfaces that Rust cannot see,
-such as embedded JavaScript, browser structure, or Android code.
+`make check` is the mandatory portable repository baseline: catalog lint,
+historical regression coverage, operations source contracts, Rust formatting,
+clippy, and the Rust test suite. Point-aware validation always includes the
+catalog, history audit, and Rust gate, then adds checks for affected surfaces
+that Rust cannot see, such as embedded JavaScript, browser structure, Android
+code, or release packaging.
 
 ## The contract — promise, impact, evidence
 
@@ -70,9 +72,10 @@ selected points ask for the same gate.
 ```
 
 Path selection never suppresses the baseline. `catalog-contract` and
-`rust-gate` are `always_checks`, so every commit-profile or CI-profile run
-still validates the catalog and executes `make check`. Impact selection only
-adds checks; a bad path mapping cannot quietly make ordinary tests disappear.
+`history-regressions`, and `rust-gate` are `always_checks`, so every
+commit-profile or CI-profile run still validates the catalog and history and
+executes `make rust-check`. Impact selection only adds checks; a bad path
+mapping cannot quietly make ordinary tests disappear.
 
 ## Profiles — fast by default, deep when the environment can prove more
 
@@ -177,6 +180,8 @@ make validate-staged                                       # staged commit profi
 make validate                                              # commit profile, every point
 make validate-full                                         # every runnable deep check
 make validate-nightly                                      # exhaustive scheduled tier
+make history-check                                         # every past fix has evidence
+make operations-check                                      # deploy/CI/ship contracts
 ```
 
 **How to read the plan:** `because path:...` is a direct match;
@@ -199,6 +204,46 @@ make hooks        # copies scripts/pre-commit into .git/hooks/pre-commit
 The hook uses the staged diff, not unstaged experiments beside it. It still
 runs the mandatory baseline on every commit, then adds any point-specific
 commit checks.
+
+## Historical fixes — every scar names the check that guards it
+
+Path ownership answers which promise a change can affect; it does not prove
+that the checks reproduce bugs already encountered. `make history-check`
+closes that gap by walking every non-merge corrective commit reachable from
+`HEAD`—including conventional `fix` commits, plain-English correction verbs,
+compatibility corrections, and `perf` fixes—and requiring one of two forms of
+evidence:
+
+- the fixing commit added or changed a surviving test or assertion; or
+- [`validation/regressions.toml`](../validation/regressions.toml) explicitly
+  maps the commit to a current functionality point and runnable check.
+
+The explicit mapping is for checks whose evidence lives outside the fixing
+patch: both Apple platforms compiling, a real container completing its
+non-root lifecycle, the browser playback matrix, or the UI structural sweep.
+It is not an exemption. Unknown commits, checks, and points fail; duplicate
+claims fail; and a new corrective commit with neither a test nor a mapping
+fails the baseline.
+
+```bash
+make history-check
+# history ok: 234 corrective commits · 159 direct test changes ·
+#             66 explicit current-check mappings · 9 non-runtime corrections
+```
+
+The exact counts grow with the repository. Read the result as a partition:
+every corrective commit must have direct test evidence, an explicit executable
+check mapping, or a reason proving that it changed only documentation,
+comments, or ignored generated state. The three counts must sum to the number
+audited. The machine-readable inventory is written to
+`target/validation/history.json`, including the subject, functionality points,
+and coverage route for every commit.
+
+Operations get a second, focused layer because several real failures were
+valid shell/YAML that pointed at the wrong target. `make operations-check`
+pins the Compose project and state mount, configurable HTTP/discovery ports,
+discovery networking, build stamp, real Apple/Android ship targets, concrete
+CI simulators, container port/state/cleanup behavior, and copy-video reporting.
 
 ## Add a functionality point — define the behavior before its command
 
@@ -263,11 +308,11 @@ coverage, not a claim that every behavior is exhaustively tested.
 | `playback.pipeline` | Rust decision, delivery, stream, HLS, and session tests | Risk-weighted browser matrix; nightly exhaustive quality/restart and interruption recovery |
 | `watch-state.sync` | Seeded progress/watched/settings journey plus store and Trakt tests | Same journey through deeper consumers |
 | `plex.compatibility` | Plex discovery, metadata, media, playback, and timeline tests | Browser playback when shared delivery changes |
-| `web.experience` | JavaScript syntax, theme contrast, 36-capture structural golden, keyboard/request invariants, and accessibility smoke | Same deterministic browser sweep |
+| `web.experience` | JavaScript syntax, theme contrast, 36-capture structural golden, keyboard/request invariants, and accessibility smoke | Risk-weighted shipped-player matrix; nightly exhaustive quality and restart cases |
 | `apple.client` | Dedicated iOS and tvOS simulator CI, sharing one XCTest source | Local/full simulator run on macOS |
 | `android.client` | JVM models/policies and lint plus dedicated instrumented Compose/TV-focus CI | Explicit disposable-device run for `full` |
-| `operations.packaging` | Release builds and image build in CI | Image must start non-root, become healthy/ready, expose metrics, restart, and keep its instance identity |
-| `validation.framework` | Catalog schema, cycles, duplicate IDs, glob/audit coverage, staged renames, cascade selection, timeout/fail-fast, and report tests | Same contract |
+| `operations.packaging` | Compose, CI, ship-target, port, state, build-stamp, and report contracts plus release builds | Image must start non-root, become healthy/ready, expose metrics, restart, keep its instance identity, and clean up |
+| `validation.framework` | Catalog schema, historical-fix coverage, cycles, duplicate IDs, glob/audit coverage, staged renames, cascade selection, timeout/fail-fast, and report tests | Same contract |
 
 The cross-client fixture is `tests/contracts/native-api.json`. It is not a
 second server implementation: Rust compares representative keys and JSON types
@@ -288,6 +333,7 @@ Every run writes under `target/validation/`:
 | `report.json` | Which points were selected, why, their profile coverage, and each check result |
 | `junit.xml` | CI-ingestible pass, failure, and skip cases |
 | `logs/<check>.log` | Complete combined output for the check command |
+| `history.json` | Every corrective commit and whether direct tests or an explicit current check cover it |
 
 CI uploads that directory even when a check fails. Read `report.json` first to
 find the affected promise, then the named log to diagnose the failing layer.
@@ -297,7 +343,9 @@ find the affected promise, then the named log to diagnose the failing layer.
 - **It does not infer behavior from code.** Humans define the contract and its
   path boundary; the audit only prevents governed files from having no owner.
 - **It does not replace focused regression tests.** A point routes tests. The
-  test itself must still reproduce the bug and assert the intended result.
+  test itself should reproduce the bug and assert the intended result. The
+  historical ledger is reserved for evidence that necessarily lives in a
+  platform, browser, or runtime check outside the fixing patch.
 - **It does not make hardware interchangeable.** Browser playback, simulators,
   and JVM tests cannot prove Dolby Vision on a physical Apple TV or TV remote
   focus on every Android device. Keep those device observations explicit.

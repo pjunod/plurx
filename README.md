@@ -192,7 +192,9 @@ reason.
 ```bash
 git clone https://github.com/pjunod/plurx && cd plurx
 make run          # build + serve http://localhost:32400  (cargo run -p plurxd)
-make check        # catalog + fmt-check + clippy + test — mandatory baseline
+make check        # history + operations + catalog + Rust — mandatory baseline
+make history-check # audit every corrective commit against current evidence
+make operations-check # pin deploy, CI, container, and ship contracts
 make validate-help # explain the validation workflow and UI golden
 make validate-staged # validate the functionality points in the staged diff
 make validate     # point-aware local gate; adds checks for non-Rust surfaces
