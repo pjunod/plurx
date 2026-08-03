@@ -12,3 +12,4 @@ local.properties
 app/build/
 build/
 .gradle-docker/
+.gradle-validation/

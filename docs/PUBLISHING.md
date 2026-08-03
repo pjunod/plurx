@@ -275,24 +275,14 @@ before you need it.
 
 ### 5.1 What has to change in the repo first
 
-Both of these are real blockers, not polish:
+The target-SDK gap is closed. `clients/android/app/build.gradle.kts` now pins
+`compileSdk`/`targetSdk` **37** (Android 17), ahead of the August 2026 API 36
+Play requirement. The pinned JDK 25 / AGP 9.3.1 / SDK 37.0 image is documented
+in [clients/android/README.md](../clients/android/README.md), and
+`make android-test` proves its JVM suite and lint in that image.
 
-**Target API 36.** `clients/android/app/build.gradle.kts` pins
-`compileSdk`/`targetSdk` **35**. From **31 August 2026**, new apps and updates
-must target **Android 16 (API 36)**; Android TV apps must target at least API
-34. Since one APK serves phones and TV here, API 36 is the number. An extension
-to 1 November 2026 can be requested from the Play Console.
-
-This is not a one-line change. `compileSdk` must be ≥ `targetSdk`, and
-`compileSdk 36` is beyond what AGP 8.7.2 supports — so the whole pinned
-toolchain moves with it: AGP, and the `platforms;android-36` /
-`build-tools;36.0.0` packages named in
-[clients/android/README.md](../clients/android/README.md) and baked into
-`clients/android/Dockerfile` (rebuild the image with `make android-image`
-afterwards, or the Docker build keeps using the old SDK). Budget an afternoon
-and a full re-test on a TV device, not a one-line diff.
-
-**A release signing config.** `build.gradle.kts` defines no `signingConfigs`,
+One real blocker remains, not polish: **a release signing config.**
+`build.gradle.kts` defines no `signingConfigs`,
 so `assembleRelease` produces an unsigned or debug-signed artifact that Play
 refuses. Generate an upload key, keep it out of git, and enrol in **Play App
 Signing** so Google holds the distribution key — losing an upload key is

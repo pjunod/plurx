@@ -1,0 +1,273 @@
+version = 1
+
+[settings]
+profiles = ["commit", "ci", "full"]
+artifact_dir = "target/validation"
+always_checks = ["catalog-contract", "rust-gate"]
+audit_paths = [
+  ".dockerignore",
+  ".github/workflows/**",
+  "Cargo.lock",
+  "Cargo.toml",
+  "Dockerfile",
+  "Makefile",
+  "clients/**",
+  "crates/**",
+  "deploy/**",
+  "plurx.example.toml",
+  "rust-toolchain.toml",
+  "scripts/**",
+  "tests/**",
+  "validation/**",
+]
+audit_exclude = []
+
+[[checks]]
+id = "catalog-contract"
+title = "Validation runner contract"
+command = "python3 -m unittest discover -s tests/validation -p 'test_*.py'"
+profiles = ["commit", "ci", "full"]
+requires = ["python3"]
+missing = "fail"
+timeout_seconds = 60
+
+[[checks]]
+id = "rust-gate"
+title = "Rust format, lint, and workspace tests"
+command = "make check"
+profiles = ["commit", "ci", "full"]
+requires = ["cargo", "make"]
+missing = "fail"
+timeout_seconds = 1800
+
+[[checks]]
+id = "web-static"
+title = "Embedded JavaScript and theme contrast"
+command = "make web-check"
+profiles = ["commit", "ci", "full"]
+requires = ["python3"]
+missing = "fail"
+timeout_seconds = 120
+
+[[checks]]
+id = "web-layout"
+title = "Every web layout against the structural golden"
+command = "make ui-check"
+profiles = ["commit", "full"]
+requires = ["python3", "ffmpeg"]
+requires_files = ["tests/ui-structure.golden"]
+preflight = "python3 -c 'import playwright'"
+missing = "skip"
+skip_if_env = ["PLURX_SKIP_UI_BASELINE"]
+timeout_seconds = 1800
+
+[[checks]]
+id = "playback-smoke"
+title = "Risk-weighted browser playback matrix"
+command = "make playback-smoke"
+profiles = ["full"]
+platforms = ["darwin", "linux"]
+requires = ["cargo", "ffmpeg", "node"]
+missing = "skip"
+timeout_seconds = 3600
+
+[[checks]]
+id = "apple-simulators"
+title = "Shared iOS and tvOS XCTest suite"
+command = """
+cd clients/apple && \
+xcodegen generate && \
+xcodebuild -project plurx.xcodeproj -scheme plurx-iOS \
+  -destination \"${APPLE_IOS_SIM:-platform=iOS Simulator,name=iPhone 17 Pro}\" test && \
+xcodebuild -project plurx.xcodeproj -scheme plurx-tvOS \
+  -destination \"${APPLE_TVOS_SIM:-platform=tvOS Simulator,name=Apple TV 4K (3rd generation)}\" test
+"""
+profiles = ["ci", "full"]
+platforms = ["darwin"]
+requires = ["xcodebuild", "xcodegen"]
+missing = "skip"
+timeout_seconds = 3600
+
+[[checks]]
+id = "android-jvm"
+title = "Android JVM unit tests and lint"
+command = """
+mkdir -p target/validation/buildx && \
+BUILDX_CONFIG=target/validation/buildx make android-test
+"""
+profiles = ["ci", "full"]
+platforms = ["darwin", "linux"]
+requires = ["docker"]
+missing = "skip"
+timeout_seconds = 3600
+
+[[checks]]
+id = "container-image"
+title = "Release container image build"
+command = "mkdir -p target/validation/buildx && BUILDX_CONFIG=target/validation/buildx make docker"
+profiles = ["full"]
+platforms = ["darwin", "linux"]
+requires = ["docker"]
+missing = "skip"
+timeout_seconds = 3600
+
+[[points]]
+id = "core.media"
+title = "Media facts, persistence, and domain rules"
+contract = "The core model classifies media and persists its durable state without corrupting existing libraries."
+paths = [
+  "Cargo.lock",
+  "Cargo.toml",
+  "crates/plurx-core/**",
+  "rust-toolchain.toml",
+]
+checks = ["rust-gate"]
+
+[[points]]
+id = "server.api"
+title = "Native server API and runtime"
+contract = "The single server binary exposes stable native endpoints and coordinates background work safely."
+paths = [
+  "crates/plurxd/**",
+  "plurx.example.toml",
+]
+checks = ["rust-gate"]
+depends_on = ["core.media"]
+
+[[points]]
+id = "library.catalog"
+title = "Library discovery and catalog maintenance"
+contract = "Scans find supported media, update existing items idempotently, and preserve user-owned files."
+paths = [
+  "crates/plurx-core/src/scan/**",
+  "crates/plurx-core/src/store/sqlite/library.rs",
+  "crates/plurx-core/src/store/sqlite/media.rs",
+  "crates/plurxd/src/http/{browse,comingsoon,images,items,libraries,photos,scan}.rs",
+  "docs/FEATURES.md",
+  "docs/REQUIREMENTS.md",
+]
+checks = ["rust-gate"]
+depends_on = ["core.media", "server.api"]
+
+[[points]]
+id = "identity.access"
+title = "Accounts, tokens, and authorization boundaries"
+contract = "Only authenticated users can cross protected API and media boundaries, with admin operations kept separate."
+paths = [
+  "crates/plurx-core/src/auth.rs",
+  "crates/plurx-core/src/store/sqlite/{apikeys,users}.rs",
+  "crates/plurxd/src/http/{auth,keys,users}.rs",
+  "docs/SECURITY.md",
+]
+checks = ["rust-gate"]
+depends_on = ["core.media", "server.api"]
+
+[[points]]
+id = "playback.pipeline"
+title = "Playback decision, delivery, and presentation"
+contract = "Every supported source reaches a client through the intended direct, remux, copy, or transcode path and keeps presenting media."
+paths = [
+  "crates/plurx-core/src/fmp4.rs",
+  "crates/plurx-core/src/mediafacts.rs",
+  "crates/plurx-core/src/playback/**",
+  "crates/plurx-core/src/tracks.rs",
+  "crates/plurx-core/src/transcode/**",
+  "crates/plurxd/src/{admission,copyseg,delivery,ffmpeg,meter,pipeprobe,playstart,produce,progressive,subtitles,transcode}.rs",
+  "crates/plurxd/src/http/{hls,stream}.rs",
+  "docs/PLAYBACK*.md",
+  "docs/STUTTER-4K.md",
+  "scripts/dv-evidence",
+  "scripts/playback-lab",
+  "tests/playback/**",
+]
+checks = ["rust-gate", "playback-smoke"]
+depends_on = ["core.media", "server.api", "library.catalog"]
+
+[[points]]
+id = "watch-state.sync"
+title = "Watch state and external history sync"
+contract = "Progress, watched state, and Trakt synchronization converge without losing newer user activity."
+paths = [
+  "crates/plurx-core/src/store/sqlite/{outbox,trakt,watch}.rs",
+  "crates/plurx-core/src/trakt.rs",
+  "crates/plurxd/src/{trakt,watched}.rs",
+  "crates/plurxd/src/http/{trakt,watch}.rs",
+]
+checks = ["rust-gate"]
+depends_on = ["core.media", "server.api"]
+
+[[points]]
+id = "plex.compatibility"
+title = "Plex-compatible discovery and API surface"
+contract = "Direct-connection Plex clients receive compatible discovery, metadata, playback, and timeline responses."
+paths = [
+  "crates/plurx-compat-plex/**",
+  "crates/plurxd/src/http/plex.rs",
+]
+checks = ["rust-gate"]
+depends_on = ["server.api", "playback.pipeline"]
+
+[[points]]
+id = "web.experience"
+title = "Embedded web player and administration UI"
+contract = "The shipped one-file web app remains syntactically valid, readable in every theme, and structurally stable across layouts."
+paths = [
+  "brand/tokens.css",
+  "crates/plurxd/src/http/web.rs",
+  "crates/plurxd/src/web/**",
+  "docs/UI-*.md",
+  "scripts/contrast-*",
+  "scripts/js-check",
+  "scripts/themes-proposed.json",
+  "scripts/ui-baseline",
+  "tests/ui-structure.golden",
+]
+checks = ["rust-gate", "web-static", "web-layout"]
+depends_on = ["server.api", "playback.pipeline"]
+
+[[points]]
+id = "apple.client"
+title = "Native iOS and tvOS clients"
+contract = "The Apple clients preserve the shared API, navigation, preferences, and playback policies on both platforms."
+paths = ["clients/apple/**"]
+checks = ["apple-simulators"]
+depends_on = ["server.api", "playback.pipeline"]
+
+[[points]]
+id = "android.client"
+title = "Native Android and Google TV clients"
+contract = "The Android clients preserve API models, TV focus, preferences, and Media3 playback policy."
+paths = ["clients/android/**"]
+checks = ["android-jvm"]
+depends_on = ["server.api", "playback.pipeline"]
+
+[[points]]
+id = "operations.packaging"
+title = "Build, deploy, and release artifacts"
+contract = "Every supported installation path builds the same stamped server and keeps its runtime configuration explicit."
+paths = [
+  ".dockerignore",
+  ".github/workflows/**",
+  "Dockerfile",
+  "deploy/**",
+  "crates/plurxd/build.rs",
+  "crates/plurxd/src/version.rs",
+  "scripts/{bench,dv-evidence,gop-census,mkpgs,perf-report,ship}",
+]
+checks = ["rust-gate", "container-image"]
+depends_on = ["server.api"]
+
+[[points]]
+id = "validation.framework"
+title = "Functionality-point catalog and automation"
+contract = "Every governed source file maps to a named point, every point maps to a runnable check, and every run leaves machine-readable evidence."
+paths = [
+  ".github/workflows/**",
+  "Makefile",
+  "docs/VALIDATION.md",
+  "scripts/pre-commit",
+  "scripts/validate",
+  "tests/validation/**",
+  "validation/**",
+]
+checks = ["catalog-contract"]

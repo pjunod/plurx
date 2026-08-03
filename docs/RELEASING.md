@@ -73,7 +73,12 @@ CI passes the tag name automatically when it publishes an image.
    and add the two link definitions at the bottom. Write entries for people
    running the server, not for people reading the diff.
 
-4. **Run the gate.** `make check` — the same fmt, clippy, and test run CI does.
+4. **Run the gates.** `scripts/validate run --profile ci --all --strict` is the
+   exact all-points CI contract: catalog, fmt, clippy, tests, embedded
+   JavaScript, theme contrast, and Android unit/lint. Then run
+   `make validate-full` for browser and container checks available on this
+   machine; every unavailable check is recorded as a skip rather than disguised
+   as a pass.
 
 5. **Commit, tag, push.**
 
