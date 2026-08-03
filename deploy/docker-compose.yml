@@ -63,7 +63,9 @@ services:
     # overrides commonly attach plurxd to an external media network, and
     # Compose forbids combining `networks` with `network_mode: host`.
     ports:
-      - "32400:32400"                          # HTTP API + web app
+      # Keep the container port stable for peer containers. Move only the host
+      # side when another service (usually Plex) still owns TCP 32400.
+      - "${PLURX_HTTP_PORT:-32400}:32400"      # HTTP API + web app
       # GDM discovery for Plex clients. Discovery only works on host port
       # 32414; if something else owns it (a still-running Plex), set
       # PLURX_GDM_PORT in .env to park it elsewhere until Plex retires.
@@ -95,7 +97,7 @@ services:
 
   # Keep only multicast discovery on the host network. The actual server stays
   # on its ordinary/external Compose networks, including a host override's
-  # `media` network, and remains reachable here through published port 32400.
+  # `media` network, and remains reachable through the published HTTP port.
   # Splitting these roles avoids Compose's forbidden `network_mode` +
   # `networks` combination while making Bonjour visible to phones and TVs.
   plurx-discovery:
@@ -109,4 +111,8 @@ services:
     depends_on:
       plurxd:
         condition: service_healthy
+    environment:
+      # The companion reads the server through the host-published port, then
+      # advertises that same port to native clients over Bonjour.
+      PLURX_DISCOVERY_SERVER_URL: "http://127.0.0.1:${PLURX_HTTP_PORT:-32400}"
     command: ["advertise"]
