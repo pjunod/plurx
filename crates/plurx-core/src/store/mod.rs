@@ -27,6 +27,7 @@ use crate::domain::{
 };
 // RecentItem is reused for next-up (episode + show title).
 use crate::error::StoreError;
+use crate::mediafacts::MediaFacts;
 
 /// Well-known settings keys. Keys are dotted, lowercase, and owned by the
 /// module that writes them.
@@ -94,6 +95,27 @@ pub mod keys {
     /// *look*, this decides how often any one item is *tried*, and a
     /// permanently art-less item should cost one request a day, not 48.
     pub const ARTWORK_RETRY_BACKOFF_SECS: i64 = 24 * 60 * 60;
+    /// Arm the one-off genre backfill: "1" runs it, "done" is what the pass
+    /// writes when it finishes, anything else (including absent, the default)
+    /// is off.
+    ///
+    /// Opt-in, unlike the artwork retry, and the difference is what the two
+    /// jobs cost. The artwork sweep repairs a hole the server left, from data
+    /// it already has. This one re-hits the provider once per title, because
+    /// nothing is stored to recompute genres from — and v9 records what
+    /// happens when an upgrade decides on its own to re-fetch every library
+    /// in the world. So an operator arms it, sees it finish, and it disarms
+    /// itself.
+    pub const GENRE_BACKFILL: &str = "genres.backfill";
+    /// The highest item id the backfill has finished with, stamped after
+    /// every single title.
+    ///
+    /// This IS the resumability. A crash, a restart or a 429 resumes at the
+    /// next id instead of paying for the whole catalogue a second time, and
+    /// the stamp is durable because the failure being designed against is the
+    /// host rebooting mid-run — an in-memory cursor dies with the process
+    /// that owns it, exactly as v10 says of retry backoff.
+    pub const GENRE_BACKFILL_CURSOR: &str = "genres.backfill_cursor";
     /// Scan every library once, shortly after the server starts. "1" enables
     /// it; absent or anything else is off. For a server that was powered down
     /// while files landed — otherwise it waits out a whole interval (or, with
@@ -283,13 +305,35 @@ pub trait MediaStore: Send + Sync + 'static {
     // --- browse ---
     async fn get_item(&self, id: i64) -> Result<Option<Item>, StoreError>;
     async fn get_item_children(&self, parent_id: i64) -> Result<Vec<Item>, StoreError>;
+    /// One page of a library's grid, optionally narrowed to a single genre.
+    ///
+    /// The genre is matched against the item's stored list (migration v13),
+    /// case-insensitively; `None` is the unfiltered query verbatim. It is a
+    /// WHERE clause rather than a second code path on purpose — a filtered
+    /// page that sorted or counted differently from an unfiltered one is the
+    /// bug this shape cannot have.
+    async fn list_top_items_in_genre(
+        &self,
+        library_id: i64,
+        sort: ItemSort,
+        offset: i64,
+        limit: i64,
+        genre: Option<&str>,
+    ) -> Result<ItemPage, StoreError>;
+    /// The unfiltered grid: every caller that had no opinion about genres
+    /// before this existed and still has none. Provided rather than
+    /// implemented so adding the parameter could not quietly change what any
+    /// of them asks for.
     async fn list_top_items(
         &self,
         library_id: i64,
         sort: ItemSort,
         offset: i64,
         limit: i64,
-    ) -> Result<ItemPage, StoreError>;
+    ) -> Result<ItemPage, StoreError> {
+        self.list_top_items_in_genre(library_id, sort, offset, limit, None)
+            .await
+    }
     async fn recently_added(
         &self,
         library_id: Option<i64>,
@@ -343,6 +387,23 @@ pub trait MediaStore: Send + Sync + 'static {
         library_id: Option<i64>,
         retry_after_secs: i64,
     ) -> Result<Vec<Item>, StoreError>;
+    /// Movies and shows with no genres yet, in ascending id order, starting
+    /// strictly after `after_id` — the genre backfill's input.
+    ///
+    /// It cannot reuse [`items_needing_metadata`](Self::items_needing_metadata):
+    /// every item this is for is already `metadata_at`-stamped and therefore
+    /// invisible to that query, which is the whole reason a backfill exists.
+    ///
+    /// Ordered by id and cut at `after_id` because that pair IS the
+    /// resumability: the caller stamps the last id it finished, and a crash,
+    /// a restart or a 429 resumes from there instead of paying for the
+    /// catalogue twice. A `LIMIT` rather than the whole list so one pass is
+    /// bounded work against a rate-limited API.
+    async fn items_missing_genres(
+        &self,
+        after_id: i64,
+        limit: i64,
+    ) -> Result<Vec<Item>, StoreError>;
     /// Apply a hand edit — distinct from [`apply_metadata`](Self::apply_metadata)
     /// because an edit must be able to *clear* a field. Returns the updated
     /// item, or `None` if the id doesn't exist.
@@ -387,6 +448,19 @@ pub trait MediaStore: Send + Sync + 'static {
         &self,
         ids: &[i64],
     ) -> Result<std::collections::HashMap<i64, i64>, StoreError>;
+    /// Aggregated media facts per item, for the given item ids — the opt-in
+    /// `media` block on the library list.
+    ///
+    /// One statement for the whole page, exactly like `item_max_heights`: this
+    /// feeds a list, so a per-item lookup is a 200-round-trip page render, and
+    /// the obvious alternative (load every file of every item and reduce in
+    /// Rust) is that same fan-out wearing a different hat. Items with no files
+    /// are absent from the map rather than present-and-empty — the caller
+    /// decorates what it got and leaves the rest bare.
+    async fn item_media_facts(
+        &self,
+        ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, MediaFacts>, StoreError>;
     /// Persist a manual A/V sync correction for one file (0 clears it).
     async fn set_file_audio_offset(&self, file_id: i64, offset_ms: i64) -> Result<(), StoreError>;
     /// The raw ffprobe JSON captured at scan time (for the declared per-stream

@@ -6,6 +6,7 @@ use plurx_core::domain::{
     AudioStream, InProgressItem, Item, ItemKind, Library, MediaFile, RecentItem, SubtitleStream,
     User, WatchRollup, WatchState,
 };
+use plurx_core::mediafacts::MediaFacts;
 use serde::Serialize;
 
 /// Build the API URL for a cached artwork filename.
@@ -55,6 +56,10 @@ pub struct ItemDto {
     pub recorded_at: Option<String>,
     /// Free-form labels (home libraries).
     pub tags: Vec<String>,
+    /// Provider genres ("Action", "Science Fiction"). Always present, empty
+    /// when unknown — a client that predates this field ignores it, and one
+    /// that knows about it never has to distinguish "absent" from "none".
+    pub genres: Vec<String>,
     pub tmdb_id: Option<i64>,
     pub imdb_id: Option<String>,
     pub poster: Option<String>,
@@ -64,6 +69,13 @@ pub struct ItemDto {
     /// group into resolution sections. `None` for shows and where unknown.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolution: Option<i64>,
+    /// Aggregated facts about the files behind this item — codec, dynamic
+    /// range, audio, size on disk. Only populated on the library list, and
+    /// only when the caller asked (`?facts=1`). Absent otherwise, so a client
+    /// that never heard of this field gets the byte-for-byte response it got
+    /// before the field existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media: Option<MediaDto>,
     /// How many items a folder holds — the "12 items" line on a folder card.
     /// Only populated on grids, and only for folders.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -78,6 +90,47 @@ pub struct ItemDto {
     /// label a "mark watched / unwatched" control from.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rollup: Option<RollupDto>,
+}
+
+/// The `media` block: what a list row can say about an item's files without
+/// asking for them one item at a time.
+///
+/// `files`/`bytes` cover every file; the rest describe the item's *best* file
+/// and only that file — the rule, and the reason a union would be a lie, is
+/// on [`plurx_core::mediafacts::MediaFacts`]. Null fields are dropped rather
+/// than serialized: this is badge material, absent means "no badge", and a
+/// grid of 200 items should not carry 200 rows of nulls.
+#[derive(Serialize)]
+pub struct MediaDto {
+    pub files: i64,
+    pub bytes: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height: Option<i64>,
+    /// Source dynamic range: "DV" | "HDR10+" | "HDR10" | "HLG". Absent for
+    /// SDR. What is on disk, never a promise about what will be delivered —
+    /// the play path decides that per client, per display.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dr: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container: Option<String>,
+}
+
+impl From<MediaFacts> for MediaDto {
+    fn from(f: MediaFacts) -> Self {
+        MediaDto {
+            files: f.files,
+            bytes: f.bytes,
+            video: f.video,
+            height: f.height,
+            dr: f.dr,
+            audio: f.audio,
+            container: f.container,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -113,11 +166,13 @@ impl From<Item> for ItemDto {
             updated_at: item.updated_at,
             recorded_at: item.recorded_at,
             tags: item.tags,
+            genres: item.genres,
             tmdb_id: item.tmdb_id,
             imdb_id: item.imdb_id,
             poster: image_url(&item.poster_path),
             backdrop: image_url(&item.backdrop_path),
             resolution: None,
+            media: None,
             child_count: None,
             show_title: None,
             watch: None,
@@ -150,6 +205,13 @@ impl ItemDto {
 
     pub fn with_resolution(mut self, resolution: Option<i64>) -> Self {
         self.resolution = resolution;
+        self
+    }
+
+    /// Opt-in decoration, like `with_resolution`: nothing calls this unless a
+    /// request asked for facts, so the default response shape is untouched.
+    pub fn with_media(mut self, facts: Option<MediaFacts>) -> Self {
+        self.media = facts.map(Into::into);
         self
     }
 

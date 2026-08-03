@@ -38,6 +38,7 @@ import androidx.media3.common.Format
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.common.TrackGroup
 import androidx.media3.common.TrackSelectionOverride
 import androidx.media3.common.Tracks
 import androidx.media3.common.util.UnstableApi
@@ -64,17 +65,9 @@ import java.util.Locale
 import java.util.UUID
 
 /**
- * How this player is currently getting bytes. Distinct from the *label* the
- * UI shows ([Controller.deliveryMode]) because a copy-HLS session is a remux
- * to the viewer and a session to the code: the video stream is untouched, but
- * seeks, subtitles, and teardown all go through the session machinery.
- */
-private enum class Transport { Direct, ProgressiveRemux, Session }
-
-/**
  * A subtitle selection the viewer actually made, where `null` inside means
  * "Off". Distinct from no wrapper at all, which means nobody has chosen yet
- * and the §3.1 automatic policy still applies.
+ * and the server's own pick still applies.
  */
 @JvmInline
 value class SubtitleChoice(val index: Long?)
@@ -89,12 +82,17 @@ value class SubtitleChoice(val index: Long?)
  *    which never re-encodes video — a tone-map or downscale verdict shipped
  *    the copied source anyway). A seek opens a session at the new offset,
  *    like the web player, and the old one is released with a DELETE rather
- *    than left to the server's idle reaper — unless the session is `vod`,
- *    in which case the whole stream is on disk and the player just seeks.
+ *    than left to the server's idle reaper — unless the session is `vod`, in
+ *    which case the whole stream is already on disk and the player just seeks.
  *
- * A text subtitle also opens a session on remux/transcode plans, but a *copy*
- * one that advertises HLS text renditions: the video recipe never changes, so
- * an SRT on a 4K HDR remux costs neither an encoder slot nor its HDR.
+ * There is exactly one piece of mutable transport state here, and it is
+ * [subtitleDelivery]: where the current subtitle selection is being carried
+ * (`SubtitlePolicy.kt`). Everything else — direct or session, copy or
+ * re-encode, what the info panel calls it — is *derived* from that plus
+ * [planMode], so two answers about the same stream cannot drift apart. A
+ * subtitle also opens a session on remux/transcode plans, but a *copy* one
+ * advertising HLS text renditions: the video recipe never changes, so an SRT
+ * on a 4K HDR remux costs neither an encoder slot nor its HDR.
  *
  * Either way [realPosition] reports the true timeline position (base + player
  * pos), which is what gets scrobbled.
@@ -108,7 +106,6 @@ class Controller(
     private val vm: AppViewModel,
     private val scope: CoroutineScope,
     initialAudioOffsetMs: Long = 0,
-    subtitleLanguage: String = "off",
     retainedAudio: Long? = null,
     retainedSubtitle: SubtitleChoice? = null,
     private val onError: (String) -> Unit = {},
@@ -116,29 +113,61 @@ class Controller(
     var audioOffsetMs: Long = initialAudioOffsetMs.coerceIn(-15_000, 15_000)
         private set
 
-    private var transport = planTransport()
-
-    /** A session that copies the source video rather than re-encoding it. */
-    private var sessionCopiesVideo = false
     private var baseMs = 0L
 
     // A quality change rebuilds the plan and this controller. The viewer's
     // track choices belong to the *playback*, not to the controller, so they
     // come in from the screen — picking 720p used to silently drop you back to
-    // the default audio track and the automatic subtitle.
+    // the default audio track and the server's automatic subtitle.
     var selectedAudio: Long? =
         retainedAudio?.takeIf { index -> plan.audio.any { it.index == index } }
             ?: plan.audio.firstOrNull { it.default }?.index
         private set
 
-    /** Absolute subtitle-stream index, or null for Off. */
+    /**
+     * Absolute subtitle-stream index, or null for Off.
+     *
+     * With no retained choice this is the server's pick: `/decision` runs
+     * `select_tracks` and stamps `default` on exactly one track or none, and
+     * [autoSubtitleSelection] applies that rather than re-deriving a policy of
+     * our own — re-deriving is how a client ends up behaving as subtitle mode
+     * `Always` against a server configured for `Auto`.
+     */
     var selectedSubtitle: Long? = when {
-        retainedSubtitle == null -> automaticSubtitleIndex(plan.subtitles, subtitleLanguage)
+        retainedSubtitle == null -> autoSubtitleSelection(plan.subtitles)
         // "Off" is a choice; only a track that vanished falls back to policy.
         retainedSubtitle.index == null -> null
         else -> retainedSubtitle.index.takeIf { index -> plan.subtitles.any { it.index == index } }
     }
         private set
+
+    /**
+     * One compatibility rescue per item (PLAYBACK.md's error fallback). A
+     * second failure — or a failure in an already-transcoded mode — is a real
+     * failure and says so.
+     */
+    private var compatibilityRescueUsed = false
+
+    /** Set by the rescue: this playback must re-encode, whatever the plan said. */
+    private var forceCompatibilityTranscode = false
+
+    /**
+     * The delivery this plan would use with no subtitle in play. A manual A/V
+     * correction is only expressible by the remuxer, so it moves direct play
+     * one step down even before subtitles are considered; the compatibility
+     * rescue moves everything to a transcode, because "the device refused
+     * these bytes" is exactly a demand for different ones.
+     */
+    private val planMode: String
+        get() = when {
+            forceCompatibilityTranscode -> "transcode"
+            audioOffsetMs != 0L && plan.mode == "direct" -> "remux"
+            else -> plan.mode
+        }
+
+    /** How that selection is being carried — see `SubtitlePolicy.kt`. */
+    private var subtitleDelivery: SubtitleDelivery =
+        subtitleRoute(trackFor(selectedSubtitle), planMode, SubtitleDelivery.Plan).delivery
 
     /**
      * The dynamic range the *current* delivery puts on the wire, as the server
@@ -154,13 +183,22 @@ class Controller(
     var deliveredRange: String? by mutableStateOf(plan.deliveredDynamicRange)
         private set
 
-    /** The label the info panel and the track menu read. */
-    val deliveryMode: String get() = when {
-        transport == Transport.Direct -> "direct"
-        transport == Transport.ProgressiveRemux -> "remux"
-        sessionCopiesVideo -> "remux"
-        else -> "transcode"
-    }
+    /**
+     * What the stats overlay and the menu call this. A native-rendition
+     * session on a direct or remux verdict is still a remux — the video is
+     * copied; only the playlist gained a subtitle group.
+     */
+    val deliveryMode: String
+        get() = when (subtitleDelivery) {
+            SubtitleDelivery.Burn -> "transcode"
+            SubtitleDelivery.NativeSession -> if (planMode == "transcode") "transcode" else "remux"
+            SubtitleDelivery.Plan -> planMode
+        }
+
+    /** True while the original file is being read directly, base timeline = 0. */
+    private val directTransport: Boolean
+        get() = subtitleDelivery == SubtitleDelivery.Plan && planMode == "direct"
+
     var encoder: String? = null
         private set
 
@@ -175,46 +213,40 @@ class Controller(
     /** Only the newest asynchronous session request may replace the player. */
     private var sessionRequestVersion = 0L
 
-    /** The whole stream is on disk: seek in place instead of reopening. */
+    /**
+     * The open session is the whole stream on disk (a pre-transcode cache
+     * hit): its timeline starts at zero, so it seeks in place rather than
+     * churning a server session per scrub.
+     */
     private var sessionIsVod = false
 
-    /** The open session advertises this source's text tracks as renditions. */
-    private var sessionHasNativeSubtitles = false
-
     /**
-     * The track the *open* session is drawing into the picture, if any. Read
-     * rather than recomputed from [selectedSubtitle], which by then already
-     * describes the selection being moved to.
+     * A text selection that still has to be applied to the player.
+     *
+     * Renditions and embedded tracks only exist once the source has been
+     * prepared and its tracks published, and a forced rendition is always
+     * `DEFAULT=NO` (crates/plurxd/src/http/hls.rs — Apple's authoring rules
+     * make DEFAULT=YES mean something stronger than FORCED=YES), so the
+     * playlist's own metadata can never be relied on to select one. Arm the
+     * intent here and let [listener] land it whenever the tracks turn up.
      */
-    private var sessionBurnedSubtitle: Long? = null
-
-    /**
-     * One compatibility rescue per item (PLAYBACK.md's error fallback). A
-     * second failure — or a failure in an already-transcoded mode — is a real
-     * failure and says so.
-     */
-    private var compatibilityRescueUsed = false
-
-    /** Set by the rescue: this session must re-encode, whatever the plan said. */
-    private var forceCompatibilityTranscode = false
-
-    /**
-     * The rendition/embedded ordinal to enable once ExoPlayer publishes the
-     * tracks. Forced renditions are always `DEFAULT=NO` and duplicate
-     * same-language tracks are `AUTOSELECT=NO` server-side, so the chosen
-     * track is never selected for us — the client always says which.
-     */
-    private var pendingTextOrdinal: Int? = null
+    private var textSelectionArmed = false
 
     private val listener = object : Player.Listener {
         override fun onPlayerError(error: PlaybackException) {
             when (playbackErrorAction(deliveryMode, compatibilityRescueUsed)) {
                 PlaybackErrorAction.RetryAsCompatibilityTranscode -> {
+                    // Read the position before the mode moves: which timeline
+                    // the player is on depends on the delivery about to change.
+                    val position = realPosition()
                     compatibilityRescueUsed = true
                     forceCompatibilityTranscode = true
-                    val position = realPosition()
-                    transport = Transport.Session
-                    openSession(position)
+                    // `planMode` is a transcode now, and that can move the
+                    // selection's route with it: an embedded track on a
+                    // directly-played file has to become a rendition.
+                    subtitleDelivery =
+                        subtitleRoute(trackFor(selectedSubtitle), planMode, subtitleDelivery).delivery
+                    restartAt(position)
                 }
                 PlaybackErrorAction.Fail -> onError(
                     error.errorCodeName.let { "Playback stopped ($it)." },
@@ -222,55 +254,36 @@ class Controller(
             }
         }
 
-        override fun onTracksChanged(tracks: Tracks) {
-            applyPendingTextSelection()
-        }
+        override fun onTracksChanged(tracks: Tracks) = applyTextSelection()
     }
 
     init {
         player.addListener(listener)
     }
 
-    /**
-     * The transport this plan wants with no subtitle asking for anything. A
-     * direct plan under a manual A/V correction wants the progressive remux
-     * instead: only `stream.mp4` and a session take `audio_offset_ms`.
-     */
-    private fun planTransport(): Transport = when {
-        plan.mode == "direct" && audioOffsetMs != 0L -> Transport.ProgressiveRemux
-        plan.mode == "direct" -> Transport.Direct
-        plan.mode == "remux" -> Transport.ProgressiveRemux
-        else -> Transport.Session
-    }
-
-    fun startAt(ms: Long) {
-        // Cold start: a forced or default-flagged text track may already be
-        // selected by the §3.1 policy, and it decides the session's shape.
-        if (selectedSubtitle != null && subtitleRoute(track(selectedSubtitle), plan.mode) != SubtitleRoute.EmbeddedText) {
-            transport = Transport.Session
-        }
-        restartAt(ms.coerceAtLeast(0))
-    }
+    fun startAt(ms: Long) = restartAt(ms.coerceAtLeast(0))
 
     fun realPosition(): Long {
         val pos = player.currentPosition.coerceAtLeast(0)
-        return if (transport == Transport.Direct || sessionIsVod) pos else baseMs + pos
+        return if (directTransport || sessionIsVod) pos else baseMs + pos
     }
 
     fun seekTo(targetMs: Long) {
         val t = targetMs.coerceIn(0, if (plan.durationMs > 0) plan.durationMs else Long.MAX_VALUE)
-        when (transport) {
-            Transport.Direct -> player.seekTo(t)
-            Transport.ProgressiveRemux -> {
+        when {
+            directTransport -> player.seekTo(t)
+            subtitleDelivery == SubtitleDelivery.Plan && planMode == "remux" -> {
                 leaveSessionPlayback()
                 baseMs = t
                 player.setMediaItem(MediaItem.fromUri(remuxUri(t)))
                 player.prepare()
                 player.playWhenReady = true
+                armTextSelection()
             }
             // A cached session holds the whole stream: native seeking, no
             // session churn. A live one can't be range-sought, so it reopens.
-            Transport.Session -> if (sessionIsVod) player.seekTo(t) else openSession(t)
+            sessionIsVod -> player.seekTo(t)
+            else -> openSession(t)
         }
     }
 
@@ -294,50 +307,32 @@ class Controller(
     }
 
     /**
-     * Route a subtitle selection to the cheapest place that can show it
-     * (§5.4): the player's own tracks for direct play, an HLS text rendition
-     * for a server session, and the encoder only for tracks with no text to
-     * send. Switching between two renditions of a live session never creates
-     * a new one.
+     * Show subtitle stream [index], or nothing when it is null.
+     *
+     * The routing lives in [subtitleRoute]; all this does is carry the answer.
+     * The point of the split is that every arm below used to be one arm — a
+     * burn — so an SRT on a 4K HDR remux paid for a full re-encode to show a
+     * track the server can hand over as a WebVTT rendition for free.
      */
     fun switchSubtitle(index: Long?) {
+        val track = index?.let(::trackFor)
+        // An index the decision never listed cannot be routed, and guessing
+        // here means guessing "burn". Ignore it instead.
+        if (index != null && track == null) return
+        // Read the position before the state moves: which timeline the player
+        // is on depends on the delivery about to change.
         val position = realPosition()
-        val route = subtitleRoute(track(index), plan.mode)
+        val route = subtitleRoute(track, planMode, subtitleDelivery)
         selectedSubtitle = index
-        when (route) {
-            SubtitleRoute.Off -> {
-                disableTextTracks()
-                // A burn has to be left behind — the subtitles are in the
-                // pixels. Renditions just switch off, so a native session
-                // (or any transport the plan already wanted) stays put.
-                if (transport != planTransport() || sessionBurnedSubtitle != null) {
-                    transport = planTransport()
-                    restartAt(position)
-                }
-            }
-            SubtitleRoute.EmbeddedText -> {
-                if (transport != planTransport()) {
-                    transport = planTransport()
-                    restartAt(position)
-                }
-                selectTextOrdinal(embeddedSubtitleOrdinal(index))
-            }
-            SubtitleRoute.NativeRendition -> {
-                val ordinal = nativeSubtitleOrdinal(index!!, plan.subtitles)
-                if (transport == Transport.Session && sessionHasNativeSubtitles) {
-                    // Same session, different rendition — metadata only, and
-                    // no new encoder. A session advertising renditions is by
-                    // construction not a burn.
-                    selectTextOrdinal(ordinal)
-                } else {
-                    transport = Transport.Session
-                    restartAt(position)
-                }
-            }
-            SubtitleRoute.Burn -> {
-                transport = Transport.Session
-                restartAt(position)
-            }
+        subtitleDelivery = route.delivery
+        if (route.reopen) {
+            restartAt(position)
+        } else {
+            // No reopen means the same media item, so its tracks are already
+            // published and this lands now — which is what makes switching
+            // between two text tracks cost nothing.
+            armTextSelection()
+            applyTextSelection()
         }
     }
 
@@ -345,44 +340,43 @@ class Controller(
     fun setAudioOffset(offsetMs: Long) {
         val position = realPosition()
         audioOffsetMs = offsetMs.coerceIn(-15_000, 15_000)
-        // Only `stream.mp4` and a session carry a correction, so a direct play
-        // moves to the progressive remux — and back, when it returns to zero.
-        if (transport != Transport.Session) transport = planTransport()
+        // The correction can move a direct play onto the remuxer, and the
+        // remuxer's progressive stream carries no subtitle tracks — so the
+        // current selection has to be re-routed, not just replayed.
+        subtitleDelivery =
+            subtitleRoute(trackFor(selectedSubtitle), planMode, subtitleDelivery).delivery
         restartAt(position)
     }
 
-    private fun track(index: Long?): SubTrack? =
-        index?.let { i -> plan.subtitles.firstOrNull { it.index == i } }
-
-    /** True when the current selection has no text to send and must be drawn in. */
-    private fun burningSubtitle(): Boolean =
-        subtitleRoute(track(selectedSubtitle), plan.mode) == SubtitleRoute.Burn
-
     private fun restartAt(positionMs: Long) {
-        when (transport) {
-            Transport.Direct -> {
+        when {
+            subtitleDelivery != SubtitleDelivery.Plan -> openSession(positionMs)
+            planMode == "direct" -> {
                 leaveSessionPlayback()
                 player.setMediaItem(MediaItem.fromUri(plan.playUrl), positionMs)
                 player.prepare()
                 player.playWhenReady = true
-                selectTextOrdinal(embeddedSubtitleOrdinal(selectedSubtitle))
+                armTextSelection()
             }
-            Transport.ProgressiveRemux -> {
+            planMode == "remux" -> {
                 leaveSessionPlayback()
                 baseMs = positionMs
                 player.setMediaItem(MediaItem.fromUri(remuxUri(positionMs)))
                 player.prepare()
                 player.playWhenReady = true
+                armTextSelection()
             }
-            Transport.Session -> openSession(positionMs)
+            else -> openSession(positionMs)
         }
     }
 
     /**
-     * Open a session at `ms`, releasing the one it replaces. `height` carries
-     * §3.2's promise: a burn or Quality = Original sends the source's own
-     * height (which the server passes through unsnapped), an explicit rung
-     * sends the rung, and true Auto sends nothing at all.
+     * Open an HLS session at `ms`, releasing the one it replaces. A seek is a
+     * new session, exactly as the web player does it — unless the server
+     * answers `vod`, which is the whole stream already on disk and seeks in
+     * place. What kind of session — copy or transcode, renditions or a burn —
+     * is [subtitleSessionBody]'s answer, so the shape of every request this
+     * client sends is unit-tested rather than assembled inline.
      */
     private fun openSession(ms: Long) {
         val requestVersion = ++sessionRequestVersion
@@ -390,40 +384,9 @@ class Controller(
         sessionId = null
         encoder = null
         sessionIsVod = false
-        sessionHasNativeSubtitles = false
-        sessionBurnedSubtitle = null
-
-        val burn = burningSubtitle()
-        val nativeTrack = selectedSubtitle
-            ?.takeIf { !burn && track(it)?.let(::isNativeTextSubtitle) == true }
-        // A remux verdict keeps its copied video unless the rescue forced a
-        // re-encode; a transcode verdict always re-encodes.
-        val copy = plan.mode == "remux" && !forceCompatibilityTranscode && !burn
-        sessionCopiesVideo = copy
-
         scope.launch {
             val hls = try {
-                vm.createHlsSession(
-                    plan.fileId,
-                    CreateSessionReq(
-                        playback_id = playbackId,
-                        request_id = UUID.randomUUID().toString(),
-                        start = ms / 1000.0,
-                        height = sessionHeight(
-                            quality = vm.preferences.value.playbackQuality,
-                            burningSubtitle = burn,
-                            sourceHeight = plan.sourceHeight,
-                        ),
-                        audio = selectedAudio?.toInt(),
-                        subtitle_burn = selectedSubtitle?.toInt()?.takeIf { burn },
-                        native_subtitles = true.takeIf { nativeTrack != null },
-                        subtitle = nativeTrack?.toInt(),
-                        audio_offset_ms = audioOffsetMs.takeIf { it != 0L },
-                        copy = true.takeIf { copy },
-                        aac = plan.remuxNeedsAac.takeIf { copy },
-                        preserve_dolby_vision = plan.preserveDolbyVision.takeIf { copy },
-                    ),
-                )
+                vm.createHlsSession(plan.fileId, sessionBody(ms))
             } catch (cancelled: CancellationException) {
                 // The screen left composition (or a newer request superseded
                 // this one) — the caller saying stop, not the server failing.
@@ -447,8 +410,6 @@ class Controller(
             encoder = hls.encoder
             sessionIsVod = hls.vod
             hls.delivered_dynamic_range?.let { deliveredRange = it }
-            sessionHasNativeSubtitles = nativeTrack != null
-            sessionBurnedSubtitle = selectedSubtitle?.takeIf { burn }
             // A cached session is the whole stream on disk: its timeline
             // starts at zero and the player seeks, exactly like direct play.
             baseMs = if (hls.vod) 0L else (hls.start_seconds * 1000).toLong()
@@ -456,8 +417,92 @@ class Controller(
             player.setMediaItem(MediaItem.fromUri(Session.url(hls.playlist_url)), startPositionMs)
             player.prepare()
             player.playWhenReady = true
-            selectTextOrdinal(nativeTrack?.let { nativeSubtitleOrdinal(it, plan.subtitles) })
+            armTextSelection()
         }
+    }
+
+    internal fun sessionBody(ms: Long): CreateSessionReq = subtitleSessionBody(
+        playbackId = playbackId,
+        requestId = UUID.randomUUID().toString(),
+        startSeconds = ms / 1000.0,
+        delivery = subtitleDelivery,
+        subtitleIndex = selectedSubtitle,
+        // A transcode verdict is the only one that forbids copying the video;
+        // direct and remux verdicts both mean the source stream is playable
+        // as-is, which is what makes the native-rendition session free. The
+        // compatibility rescue turns `planMode` into a transcode precisely so
+        // it lands here — the copy is the thing the device just refused.
+        copyableVideo = planMode != "transcode",
+        aac = plan.aac,
+        preserveDolbyVision = plan.preserveDolbyVision,
+        audioIndex = selectedAudio,
+        audioOffsetMs = audioOffsetMs,
+        quality = vm.preferences.value.playbackQuality,
+        sourceHeight = plan.sourceHeight,
+    )
+
+    private fun trackFor(index: Long?): SubTrack? =
+        index?.let { i -> plan.subtitles.firstOrNull { it.index == i } }
+
+    /**
+     * Record that the current selection still has to reach the player.
+     *
+     * Deliberately does not try to apply it: right after `prepare()` the only
+     * tracks on hand may still be the departing item's, and an override
+     * naming a track group that is about to disappear would be dropped
+     * silently — with the intent already marked as delivered. [listener]
+     * lands it against the tracks that actually arrive.
+     */
+    private fun armTextSelection() {
+        textSelectionArmed = true
+    }
+
+    private fun applyTextSelection() {
+        if (!textSelectionArmed) return
+        val index = selectedSubtitle
+        // Off, and a burn, are the same instruction to the renderer: show no
+        // text track. A burn's cues are already in the picture, and letting
+        // ExoPlayer's own language preference pick something here would put a
+        // second subtitle policy in front of the one the server decided.
+        if (index == null || subtitleDelivery == SubtitleDelivery.Burn) {
+            textSelectionArmed = false
+            player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
+                .clearOverridesOfType(C.TRACK_TYPE_TEXT)
+                .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
+                .build()
+            return
+        }
+        val ordinal = if (subtitleDelivery == SubtitleDelivery.NativeSession) {
+            nativeSubtitleOrdinal(index, plan.subtitles)
+        } else {
+            embeddedTextTrackIndex(index, plan.subtitles, embeddedTextLanguages())
+        }
+        // Nothing to select yet — the media is still being prepared, or this
+        // source genuinely lacks the track. Stay armed; onTracksChanged retries.
+        val target = ordinal?.let(::textTrackAt) ?: return
+        textSelectionArmed = false
+        player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
+            .setOverrideForType(TrackSelectionOverride(target.first, target.second))
+            .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false)
+            .build()
+    }
+
+    /** The player's text tracks flattened in publication order. */
+    private fun embeddedTextLanguages(): List<String?> =
+        player.currentTracks.groups
+            .filter { it.type == C.TRACK_TYPE_TEXT }
+            .flatMap { group -> (0 until group.length).map { group.getTrackFormat(it).language } }
+
+    private fun textTrackAt(ordinal: Int): Pair<TrackGroup, Int>? {
+        var seen = 0
+        for (group in player.currentTracks.groups) {
+            if (group.type != C.TRACK_TYPE_TEXT) continue
+            for (i in 0 until group.length) {
+                if (seen == ordinal) return group.mediaTrackGroup to i
+                seen++
+            }
+        }
+        return null
     }
 
     private fun leaveSessionPlayback() {
@@ -466,46 +511,9 @@ class Controller(
         sessionId = null
         encoder = null
         sessionIsVod = false
-        sessionHasNativeSubtitles = false
-        sessionBurnedSubtitle = null
-        sessionCopiesVideo = false
         // Back on the plan's own delivery, so back to the plan's own grade —
         // otherwise a chip would keep reporting the session that just ended.
         deliveredRange = plan.deliveredDynamicRange
-    }
-
-    /**
-     * Position of this absolute subtitle-stream index among the container's
-     * own text tracks. Direct play surfaces every subtitle stream in source
-     * order, so the absolute index is the ordinal.
-     */
-    private fun embeddedSubtitleOrdinal(index: Long?): Int? = index?.toInt()
-
-    private fun selectTextOrdinal(ordinal: Int?) {
-        pendingTextOrdinal = ordinal
-        if (ordinal == null) disableTextTracks() else applyPendingTextSelection()
-    }
-
-    private fun disableTextTracks() {
-        pendingTextOrdinal = null
-        player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
-            .clearOverridesOfType(C.TRACK_TYPE_TEXT)
-            .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
-            .build()
-    }
-
-    /**
-     * Tracks arrive after `prepare()`, so the selection waits for them. The
-     * ordinal indexes the text groups in the order the server published them.
-     */
-    private fun applyPendingTextSelection() {
-        val ordinal = pendingTextOrdinal ?: return
-        val groups = player.currentTracks.groups.filter { it.type == C.TRACK_TYPE_TEXT }
-        val group = groups.getOrNull(ordinal) ?: return
-        player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
-            .setOverrideForType(TrackSelectionOverride(group.mediaTrackGroup, 0))
-            .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false)
-            .build()
     }
 
     private fun remuxUri(ms: Long): String {
@@ -542,13 +550,18 @@ interface PlanLike {
     val audio: List<AudioTrack>
     val subtitles: List<SubTrack>
 
-    /** `DecisionResponse.source.height` — every height promise is made of it. */
+    /**
+     * `DecisionResponse.source.height`. The height a session must send back
+     * whenever its own height is a promise rather than a rung — a burn, or
+     * Quality = Original — so a 4K burn stays 2160-tall instead of restarting
+     * at the server's Auto rung (§3.2).
+     */
     val sourceHeight: Int?
 
-    /** `delivery.aac`: a copy session must re-encode audio this client can't take. */
-    val remuxNeedsAac: Boolean
+    /** `delivery.aac`: a copy session must re-encode the audio. */
+    val aac: Boolean
 
-    /** `delivery.preserve_dolby_vision`: keep DV signalling through the copy. */
+    /** `delivery.preserve_dolby_vision`: the copy keeps the DV layer. */
     val preserveDolbyVision: Boolean
 
     /** `decision.delivered_dynamic_range`: the badge's starting truth. */
@@ -566,10 +579,11 @@ fun buildPlayer(context: Context, vm: AppViewModel): ExoPlayer {
             // buys nothing and some handset decoders refuse the mode outright.
             // Media3 falls back to normal playback when the device says no.
             .setTunnelingEnabled(isTelevision(context))
-            // Text selection is the §3.1 policy's job, not the selector's:
-            // a preferred language here re-enables the "merely same language"
-            // tail the rule deletes, and the server's own renditions are
-            // deliberately DEFAULT=NO/AUTOSELECT=NO so the client must choose.
+            // Text selection is the server's policy, carried by [Controller] —
+            // not the selector's: a preferred language here re-enables the
+            // "merely the same language" tail that policy deletes, and the
+            // server's own renditions are deliberately DEFAULT=NO/AUTOSELECT=NO
+            // so the client must say which.
             .setPreferredTextLanguage(null)
             .setSelectUndeterminedTextLanguage(false)
             .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
@@ -608,7 +622,6 @@ fun TrackMenu(
     player: ExoPlayer,
     serverAudio: List<AudioTrack>,
     serverSubtitles: List<SubTrack>,
-    planMode: String,
     serverControlledAudio: Boolean,
     selectedServerAudio: Long?,
     selectedServerSubtitle: Long?,
@@ -677,51 +690,63 @@ fun TrackMenu(
                 }
             }
 
-            // One row per subtitle track, never two. The server's list and the
-            // player's text tracks describe the same streams — on a session
-            // they are literally the renditions of those tracks — so the
-            // server's list wins whenever it has one, and the controller
-            // routes each pick to the cheapest place that can show it.
-            val embeddedText = if (serverSubtitles.isEmpty()) text else emptyList()
-            if (embeddedText.isNotEmpty() || serverSubtitles.isNotEmpty()) {
+            // One row per subtitle, whichever way it will be delivered.
+            //
+            // These used to be two lists — the decision's tracks and whatever
+            // ExoPlayer had demuxed — so on direct play every track appeared
+            // twice, and the two rows behaved differently: one switched the
+            // embedded track, the other started a burn. The decision's list is
+            // the authoritative one (it names every track, carries the absolute
+            // stream index the server routes on, and knows which are servable
+            // as renditions), so it is the only list shown when it exists. The
+            // player's own groups remain the fallback for a source the server
+            // told us nothing about.
+            if (text.isNotEmpty() || serverSubtitles.isNotEmpty()) {
                 Text("Subtitles", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(top = 14.dp, bottom = 4.dp))
+                val serverOwnsSubtitles = serverSubtitles.isNotEmpty()
                 TrackRow(
                     label = "Off",
-                    selected = selectedServerSubtitle == null && tracks.isTypeSelected(C.TRACK_TYPE_TEXT).not(),
+                    selected = selectedServerSubtitle == null &&
+                        (serverOwnsSubtitles || !tracks.isTypeSelected(C.TRACK_TYPE_TEXT)),
                     enabled = true,
                     modifier = initialFocusModifier(enabled = true),
                 ) {
-                    player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
-                        .clearOverridesOfType(C.TRACK_TYPE_TEXT)
-                        .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
-                        .build()
+                    if (!serverOwnsSubtitles) {
+                        player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
+                            .clearOverridesOfType(C.TRACK_TYPE_TEXT)
+                            .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
+                            .build()
+                    }
                     onServerSubtitle(null)
                     onDismiss()
                 }
-                embeddedText.forEach { group ->
-                    for (i in 0 until group.length) {
-                        val enabled = group.isTrackSupported(i)
+                if (serverOwnsSubtitles) {
+                    serverSubtitles.forEach { track ->
                         TrackRow(
-                            label = subLabel(group.getTrackFormat(i)),
-                            selected = group.isTrackSelected(i),
-                            enabled = enabled,
-                            modifier = initialFocusModifier(enabled),
-                        ) {
-                            player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
-                                .setOverrideForType(TrackSelectionOverride(group.mediaTrackGroup, i))
-                                .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false)
-                                .build()
-                            onDismiss()
+                            label = serverSubtitleLabel(track),
+                            selected = selectedServerSubtitle == track.index,
+                            enabled = true,
+                            modifier = initialFocusModifier(enabled = true),
+                        ) { onServerSubtitle(track.index); onDismiss() }
+                    }
+                } else {
+                    text.forEach { group ->
+                        for (i in 0 until group.length) {
+                            val enabled = group.isTrackSupported(i)
+                            TrackRow(
+                                label = subLabel(group.getTrackFormat(i)),
+                                selected = group.isTrackSelected(i),
+                                enabled = enabled,
+                                modifier = initialFocusModifier(enabled),
+                            ) {
+                                player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
+                                    .setOverrideForType(TrackSelectionOverride(group.mediaTrackGroup, i))
+                                    .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false)
+                                    .build()
+                                onDismiss()
+                            }
                         }
                     }
-                }
-                serverSubtitles.forEach { track ->
-                    TrackRow(
-                        label = serverSubtitleLabel(track, planMode),
-                        selected = selectedServerSubtitle == track.index,
-                        enabled = true,
-                        modifier = initialFocusModifier(enabled = true),
-                    ) { onServerSubtitle(track.index) }
                 }
             }
 
@@ -796,18 +821,14 @@ internal fun serverAudioLabel(track: AudioTrack): String = listOfNotNull(
     track.codec.uppercase(),
 ).distinct().joinToString(" · ").ifBlank { "Audio" }
 
-/**
- * "Burn-in" is a promise about cost, so it follows what the *session* can do,
- * via the one predicate that knows: `mov_text` and styled ASS both have text
- * but no rendition, and on a session they burn like a bitmap. The menu never
- * filters a track out — every track stays pickable, and the label is what
- * tells the truth about what picking it costs.
- */
-internal fun serverSubtitleLabel(track: SubTrack, planMode: String = "transcode"): String = listOfNotNull(
+internal fun serverSubtitleLabel(track: SubTrack): String = listOfNotNull(
     languageName(track.language),
     track.title,
-    if (track.forced) "Forced" else null,
-    if (subtitleRoute(track, planMode) == SubtitleRoute.Burn) "Burn-in" else null,
+    if (isForcedSubtitle(track)) "Forced" else null,
+    // "Burn-in" is a warning about cost, so it follows the question that
+    // actually decides cost: can the server serve this as a rendition? ASS/SSA
+    // carry text and still burn, which `text` alone would have hidden.
+    if (!track.isNativeHls) "Burn-in" else null,
 ).distinct().joinToString(" · ").ifBlank { "Subtitle" }
 
 internal fun languageName(code: String?): String? {

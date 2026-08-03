@@ -905,6 +905,11 @@ struct Session {
     user_name: String,
     /// The player instance that owns this session — the supersession key.
     playback_id: String,
+    /// Re-encoding the picture, or only repackaging it. Immutable, unlike
+    /// `encoder_label`: what this session *is* does not change when the
+    /// encoder behind it does, and the activity page must not relabel a copy
+    /// as a transcode because a fallback fired or a cache hit answered.
+    method: crate::delivery::Method,
     /// Where this session's timeline begins in the source, so a recovered
     /// (idempotent) create reports the same offset the first one did.
     start_seconds: f64,
@@ -2189,6 +2194,10 @@ impl TranscodeManager {
             item_title: item_title.to_owned(),
             user_name: user_name.to_owned(),
             playback_id: playback_id.to_owned(),
+            // A cache hit only ever answers a transcode request (`serve_cached`
+            // is reached from the transcode path alone); the encoder label goes to
+            // "cached" here, which is exactly why the method is not read off it.
+            method: crate::delivery::Method::Transcode,
             start_seconds: 0.0,
             // A cache hit is the whole stream from the beginning.
             media_origin_seconds: 0.0,
@@ -3217,6 +3226,7 @@ impl TranscodeManager {
             item_title,
             user_name: user_name.to_owned(),
             playback_id: playback_id.to_owned(),
+            method: crate::delivery::Method::Transcode,
             start_seconds,
             // A transcode seeks accurately, so its media begins exactly where
             // it was asked to: no probe, no discrepancy to resolve.
@@ -3660,6 +3670,7 @@ impl TranscodeManager {
             item_title,
             user_name: user_name.to_owned(),
             playback_id: playback_id.to_owned(),
+            method: crate::delivery::Method::HlsCopy,
             start_seconds,
             media_origin_seconds,
             hls_codecs,
@@ -3810,14 +3821,22 @@ impl TranscodeManager {
         self.sessions.lock().await.len()
     }
 
-    /// Everything the activity page shows about live sessions.
-    pub async fn list_sessions(&self) -> Vec<SessionInfo> {
+    /// Every live session, paired with how it is really delivering.
+    ///
+    /// The pair is what the activity array needs and `SessionInfo` cannot
+    /// give it: a copy-remux and a transcode are the same struct, and the one
+    /// field that ever hinted at the difference — `encoder` — is a label, not
+    /// a kind. It reads "cached" on a cache hit and is *rewritten* under the
+    /// hardware→software fallback, so a page inferring the method from it
+    /// would relabel a stream mid-play. The method is fixed when the session
+    /// is created and never moves.
+    pub async fn list_deliveries(&self) -> Vec<(SessionInfo, crate::delivery::Method)> {
         let sessions = self.sessions.lock().await;
         let mut out = Vec::with_capacity(sessions.len());
         for (id, s) in sessions.iter() {
-            out.push(session_info(id, s).await);
+            out.push((session_info(id, s).await, s.method));
         }
-        out.sort_by_key(|s| s.started_unix);
+        out.sort_by_key(|(s, _)| s.started_unix);
         out
     }
 
@@ -5154,6 +5173,7 @@ mod tests {
             item_title: "T".into(),
             user_name: "paul".into(),
             playback_id: "pb-test".into(),
+            method: crate::delivery::Method::Transcode,
             start_seconds: 0.0,
             media_origin_seconds: 0.0,
             hls_codecs: "avc1.640034,mp4a.40.2".into(),
@@ -5792,6 +5812,7 @@ mod tests {
             item_title: "Watchdog Fixture".into(),
             user_name: "paul".into(),
             playback_id: "pb-watchdog".into(),
+            method: crate::delivery::Method::Transcode,
             start_seconds: 0.0,
             media_origin_seconds: 0.0,
             hls_codecs: "avc1.640034,mp4a.40.2".into(),
@@ -6774,7 +6795,7 @@ mod tests {
         // No hardware caps → software encoder.
         assert_eq!(mgr.encoder().await, Encoder::Software);
         assert_eq!(mgr.active_sessions().await, 0);
-        assert!(mgr.list_sessions().await.is_empty());
+        assert!(mgr.list_deliveries().await.is_empty());
 
         // Settings feed the language prefs.
         store.put_setting(keys::AUDIO_LANG, "jpn").await.expect("s");
@@ -6800,9 +6821,10 @@ mod tests {
             .expect("start");
         assert_eq!(info.encoder, "software (x264)");
         assert_eq!(mgr.active_sessions().await, 1);
-        let sessions = mgr.list_sessions().await;
+        let sessions = mgr.list_deliveries().await;
         assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].user_name, "paul");
+        assert_eq!(sessions[0].0.user_name, "paul");
+        assert_eq!(sessions[0].1, crate::delivery::Method::Transcode);
         assert!(mgr.stop_session(&info.session_id, "test").await);
         assert_eq!(mgr.active_sessions().await, 0);
 
@@ -6822,7 +6844,18 @@ mod tests {
             .await
             .expect("start_copy");
         assert_eq!(info.encoder, "copy");
+        // The two HLS kinds share a struct and are told apart structurally,
+        // never by the encoder label: that label goes to "cached" on a cache
+        // hit and is rewritten by the hardware→software fallback, either of
+        // which would have a copy-remux reporting itself as a transcode.
+        let copies = mgr.list_deliveries().await;
+        assert_eq!(copies.len(), 1);
+        assert_eq!(copies[0].1, crate::delivery::Method::HlsCopy);
         assert!(mgr.stop_session(&info.session_id, "test").await);
+        assert!(
+            mgr.list_deliveries().await.is_empty(),
+            "and the row goes with the session"
+        );
     }
 
     /// Seeking must not leave the old session running. Before this, every seek

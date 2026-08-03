@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""Syntax-check the JavaScript embedded in the web UI.
+
+Why this exists: `crates/plurxd/src/web/index.html` is pulled into the binary
+with `include_str!`, so the Rust gate never parses it. A stray brace in that
+file compiles, links, passes `cargo test`, and then breaks the entire UI at
+runtime with a blank page. `make check` cannot see it; this can.
+
+It extracts every inline `<script>` block (external `src=` blocks are skipped —
+they are vendored libraries, not ours) and runs `node --check` on each. Exits
+nonzero on the first failure, printing node's own message with the line number
+translated back to the line number *in the HTML file*, because a parser error
+at "line 812" of an extracted fragment is useless when you are looking at a
+6000-line document.
+
+    scripts/js-check                       # checks the shipped index.html
+    scripts/js-check path/to/other.html    # or any other file
+"""
+
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+DEFAULT = Path(__file__).resolve().parent.parent / "crates/plurxd/src/web/index.html"
+
+# Non-greedy so each <script>…</script> pair matches on its own; DOTALL because
+# the bodies are multi-line. `src=` blocks have no body worth checking.
+BLOCK = re.compile(r"<script(?P<attrs>[^>]*)>(?P<body>.*?)</script>", re.DOTALL | re.IGNORECASE)
+
+
+def main(argv: list[str]) -> int:
+    path = Path(argv[1]) if len(argv) > 1 else DEFAULT
+    if not path.is_file():
+        print(f"js-check: no such file: {path}", file=sys.stderr)
+        return 2
+
+    text = path.read_text(encoding="utf-8")
+    checked = 0
+    failed = 0
+
+    for m in BLOCK.finditer(text):
+        if "src=" in m.group("attrs"):
+            continue
+        body = m.group("body")
+        if not body.strip():
+            continue
+        # Line number of the <script> tag itself, so offsets can be reported
+        # against the HTML file rather than against the fragment.
+        tag_line = text.count("\n", 0, m.start("body")) + 1
+
+        # `node --check` parses as a script (not a module), which is what a
+        # browser does with a plain <script>. It catches exactly the class of
+        # error that matters here: anything that stops the parser dead.
+        with tempfile.NamedTemporaryFile("w", suffix=".js", encoding="utf-8", delete=False) as fh:
+            fh.write(body)
+            tmp = fh.name
+        try:
+            proc = subprocess.run(
+                ["node", "--check", tmp], capture_output=True, text=True, check=False
+            )
+        finally:
+            Path(tmp).unlink(missing_ok=True)
+
+        checked += 1
+        if proc.returncode != 0:
+            failed += 1
+            err = proc.stderr or proc.stdout
+            # node reports "<tmpfile>:LINE" — rewrite to the real coordinates.
+            def fix(mm: "re.Match[str]") -> str:
+                return f"{path}:{tag_line + int(mm.group(1)) - 1}"
+
+            err = re.sub(re.escape(tmp) + r":(\d+)", fix, err)
+            print(f"js-check: FAIL — inline <script> starting at {path}:{tag_line}", file=sys.stderr)
+            print(err.rstrip(), file=sys.stderr)
+
+    if not checked:
+        print(f"js-check: no inline <script> blocks found in {path}", file=sys.stderr)
+        return 2
+    if failed:
+        print(f"js-check: {failed} of {checked} inline script block(s) failed", file=sys.stderr)
+        return 1
+    print(f"js-check: {checked} inline script block(s) OK — {path}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

@@ -130,7 +130,7 @@ private data class Plan(
     override val playUrl: String,
     override val mode: String,
     override val sourceHeight: Int?,
-    override val remuxNeedsAac: Boolean,
+    override val aac: Boolean,
     override val preserveDolbyVision: Boolean,
     override val deliveredDynamicRange: String?,
     val markers: List<Marker>,
@@ -162,8 +162,8 @@ private suspend fun loadPlan(vm: AppViewModel, itemId: Long, fileId: Long): Plan
         // The decision's own reading of the source: the number every height
         // promise is made of. The item's file row is the fallback for a
         // server too old to send `source`.
-        sourceHeight = decision.source?.height?.toInt() ?: file?.height?.toInt(),
-        remuxNeedsAac = decision.delivery?.aac ?: decision.transcode_audio,
+        sourceHeight = (decision.source?.height ?: file?.height)?.toInt(),
+        aac = decision.delivery?.aac ?: decision.transcode_audio,
         preserveDolbyVision = decision.delivery?.preserve_dolby_vision ?: false,
         deliveredDynamicRange = decision.delivered_dynamic_range,
         markers = decision.markers,
@@ -427,7 +427,6 @@ private fun PlayerContent(
             vm,
             scope,
             initialAudioOffsetMs = audioOffsetMs,
-            subtitleLanguage = vm.subLang,
             retainedAudio = retainedAudio,
             retainedSubtitle = retainedSubtitle,
             onError = { playFailure = it },
@@ -775,7 +774,6 @@ private fun PlayerContent(
                 player = controller.player,
                 serverAudio = plan.audio,
                 serverSubtitles = plan.subtitles,
-                planMode = plan.mode,
                 serverControlledAudio = controller.deliveryMode != "direct",
                 selectedServerAudio = controller.selectedAudio,
                 selectedServerSubtitle = controller.selectedSubtitle,
@@ -999,7 +997,7 @@ private fun PlayerInfo(
         ?: plan.audio.firstOrNull { it.index == controller.selectedAudio }?.let(::serverAudioLabel)
         ?: plan.audio.firstOrNull { it.default }?.let(::serverAudioLabel)
     val selectedSubtitle =
-        selectedSubtitleLabel(player, plan.subtitles, controller.selectedSubtitle, plan.mode)
+        selectedSubtitleLabel(player, plan.subtitles, controller.selectedSubtitle)
     PlaybackInfoOverlay(
         details = PlaybackInfoDetails(
             title = plan.title,
@@ -1282,15 +1280,17 @@ private fun selectedSubtitleLabel(
     player: Player,
     serverTracks: List<SubTrack>,
     selectedServerTrack: Long?,
-    planMode: String,
 ): String {
+    // The controller's selection is the truth now that one menu row covers
+    // both deliveries: a burnt track has no selected text track to read back,
+    // and a rendition's own label is the less informative of the two.
+    serverTracks.firstOrNull { it.index == selectedServerTrack }?.let { return serverSubtitleLabel(it) }
     player.currentTracks.groups.filter { it.type == C.TRACK_TYPE_TEXT }.forEach { group ->
         repeat(group.length) { index ->
             if (group.isTrackSelected(index)) return subLabel(group.getTrackFormat(index))
         }
     }
-    return serverTracks.firstOrNull { it.index == selectedServerTrack }
-        ?.let { serverSubtitleLabel(it, planMode) } ?: "Off"
+    return "Off"
 }
 
 private fun channelLabel(channels: Int): String = when (channels) {

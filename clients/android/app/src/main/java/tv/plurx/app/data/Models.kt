@@ -174,23 +174,39 @@ data class SubTrack(
     val title: String? = null,
     val default: Boolean = false,
     val forced: Boolean = false,
-    /**
-     * "Has extractable text" — `!is_bitmap_subtitle(codec)`. True for
-     * `mov_text` and for styled ASS/SSA, neither of which the server will
-     * advertise as an HLS rendition. Use [native] to decide routing.
-     */
+    /** Not a bitmap. True for ASS/SSA, which are still unservable as WebVTT. */
     val text: Boolean = true,
     /**
-     * "Can be an HLS WebVTT rendition" — the server's own
-     * `is_native_text_subtitle(codec)`. Narrower than [text]: it excludes
-     * `mov_text` and styled ASS/SSA, the two shapes the session endpoint
-     * rejects with a 400 and the master playlist never carries.
-     *
-     * Null on a server that predates the field, which is why the routing
-     * predicate keeps a codec fallback (`PlaybackPolicy.isNativeTextSubtitle`).
+     * The server's own answer to "can this become a native HLS rendition?"
+     * (`SubTrackDto.native`, crates/plurxd/src/http/stream.rs). Absent on
+     * servers that predate the field — read [isNativeHls], never this.
      */
     val native: Boolean? = null,
-)
+) {
+    /**
+     * Route on this, not on [text]. The two questions differ for exactly one
+     * family and the difference is expensive: ASS/SSA carry text, so [text] is
+     * true, but their authored positioning does not survive WebVTT conversion,
+     * the master never advertises them, and `POST …/hls/sessions` answers a
+     * native request for one with "the selected subtitle requires burn-in".
+     *
+     * When the server didn't answer (an older build omits the field) we fall
+     * back to the classification this client could already make. `false` would
+     * be the safe-looking default and is the wrong one: it would burn every
+     * SRT on every 4K remux — the bug this milestone exists to remove — against
+     * servers that serve renditions perfectly well. `text` alone would be too
+     * eager the other way and ask an old server to serve an ASS rendition, so
+     * the styled formats are excluded here. That codec list is the one place
+     * this client duplicates the server's classifier, and it is consulted only
+     * when the server declined to classify.
+     */
+    val isNativeHls: Boolean
+        get() = native ?: (text && codec.lowercase().trim() !in STYLED_SUBTITLE_CODECS)
+
+    private companion object {
+        val STYLED_SUBTITLE_CODECS = setOf("ass", "ssa")
+    }
+}
 
 @Serializable
 data class Marker(
@@ -213,16 +229,20 @@ data class Delivery(
     val url: String? = null, // direct: the file; remux: progressive fMP4
     val sessions_url: String? = null, // POST target for an HLS session
     val aac: Boolean = false, // remux over HLS: re-encode the audio
-    /** Keep Dolby Vision signalling through a copy session (remux verdicts). */
+    /**
+     * Remux only: keep Dolby Vision signaling through the copy. Carried on a
+     * copy session create so a subtitle selection can't quietly cost the
+     * stream its DV layer — the server decided this, the client repeats it.
+     */
     val preserve_dolby_vision: Boolean = false,
 )
 
 /**
- * Source facts as the *decision* read them. `height` is the number every
- * height promise is made of: a subtitle burn or Quality = Original sends this
- * back on the session create, and the server passes `height == source.height`
- * through unsnapped (`hls.rs`, "the source's own height is the
- * Original/forced-burn promise").
+ * `DecisionResponse.source` — what the file actually is. `height` is the one
+ * the player owes back to the server whenever its own height is a *promise*
+ * rather than a transcode rung (a burn, or Quality = Original): §3.2 of
+ * docs/CLIENTS-REMEDIATION-PLAN.md, and `hls.rs`'s "the source's own height
+ * is the Original/forced-burn promise" escape from ladder snapping.
  */
 @Serializable
 data class SourceSummary(
@@ -239,9 +259,9 @@ data class SourceSummary(
 )
 
 /**
- * One advertised rung of the server's quality ladder, top rung first and
- * already filtered to what the source can feed — so the client's quality menu
- * stops hardcoding heights the source cannot reach.
+ * One advertised rung of the server's quality ladder (`transcode::Rung`), top
+ * rung first and already filtered to what the source can feed — so the client's
+ * quality menu stops hardcoding heights the source cannot reach.
  */
 @Serializable
 data class Rung(
@@ -283,11 +303,13 @@ data class HlsStart(
     val start_seconds: Double = 0.0,
     val encoder: String? = null,
     /**
-     * The whole stream is already on disk (a pre-transcode cache hit). Treat
-     * it like direct play: `start_seconds` is 0 and the client seeks, rather
-     * than opening a fresh session per seek.
+     * The whole stream is already on disk (a pre-transcode cache hit), so it
+     * behaves like direct play: `start_seconds` is 0 and the client seeks.
+     * Defaults false because a server that omits it has no such cache to
+     * promise — §5.5 consumes this.
      */
     val vod: Boolean = false,
+    /** The rungs this source can feed, top first — §5.6's quality menu. */
     val ladder: List<Rung> = emptyList(),
     /**
      * What *this session* delivers, which overrides the decision's answer the
@@ -299,10 +321,10 @@ data class HlsStart(
 )
 
 /**
- * Body for `POST /files/{id}/hls/sessions`. A null `height` selects the
- * server's Auto rung — the rung depends on which encoder wins, and only the
- * create response knows that. (`Net`'s Json has `explicitNulls = false`, so
- * nulls are genuinely absent on the wire.)
+ * Body for `POST /files/{id}/hls/sessions`. `height` stays null on purpose:
+ * omitting it selects the server's Auto rung — the rung depends on which
+ * encoder wins, and only the create response knows that. (`Net`'s Json has
+ * `explicitNulls = false`, so nulls are genuinely absent on the wire.)
  */
 @Serializable
 data class CreateSessionReq(
@@ -314,26 +336,27 @@ data class CreateSessionReq(
     val start: Double? = null,
     val audio: Int? = null,
     /**
-     * Burn a track into the picture. Only for the ones with no text to send —
-     * a bitmap (PGS/VobSub) or a styled ASS/SSA track. Costs the stream its
-     * encoder slot, its resolution promise, and its HDR, so a text track must
-     * never come through here.
+     * Draw a subtitle into the frames. Only for tracks with no text to send —
+     * a bitmap (PGS/VobSub) or a styled one the server won't serve as WebVTT.
      */
     val subtitle_burn: Int? = null,
     /**
-     * Advertise this source's WebVTT-convertible tracks as HLS renditions.
-     * Changes only playlist metadata, never the video recipe.
+     * Advertise the source's WebVTT-convertible tracks as HLS renditions in
+     * the master playlist. Changes only HLS metadata, never the video recipe,
+     * so it composes with `copy` — which is the entire point of §5.4.
      */
     val native_subtitles: Boolean? = null,
     /**
-     * Initially selected native rendition — the **absolute** subtitle-stream
-     * index, not an ordinal among the text-only ones.
+     * The initially selected native rendition: the **absolute** subtitle
+     * stream index (`SubTrack.index`), not an ordinal among native tracks.
+     * The server rejects a non-native index here with a 400.
      */
     val subtitle: Int? = null,
     /** Manual A/V correction for this playback only; positive delays audio. */
     val audio_offset_ms: Long? = null,
     val copy: Boolean? = null,
     val aac: Boolean? = null,
+    /** With `copy`: the decision said this client can take the source's DV. */
     val preserve_dolby_vision: Boolean? = null,
 )
 

@@ -379,6 +379,62 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE items ADD COLUMN artwork_error TEXT;
     CREATE INDEX idx_items_missing_artwork ON items(artwork_attempted_at)
         WHERE poster_path IS NULL;",
+    // v13: what a title *is* — genres, as a JSON array on the item.
+    //
+    // No server-side genre data has ever existed for catalogue media. TMDB
+    // has returned `genres` on every `/movie/{id}` details call plurx has
+    // ever made and the field was read straight past; the only `<genre>`
+    // handling in the tree folds an NFO's genres into a *home* library's
+    // free-form `tags`, which is a different fact wearing the same clothes.
+    // So this is new storage, not a migration of anything that exists.
+    //
+    // A JSON array on `items`, NOT an `item_genres` join table — and the join
+    // table is genuinely the faster shape for the query that motivated this,
+    // `?genre=` on the library grid. Measured on a seeded catalogue (three
+    // genres per title, 18 distinct, a third of the paged library matching):
+    // with 6.7k items in the library the filtered first page costs 3.2 ms
+    // unfiltered / 7.5 ms via `json_each` / 1.4 ms via an indexed join; at
+    // 67k it is 47 / 100 / 25 ms. The join wins because it narrows *before*
+    // the sort, where `json_each` roughly doubles a partition scan that was
+    // happening anyway. Three reasons that outlast those milliseconds say
+    // column regardless:
+    //
+    //   1. The filter is not the dominant consumer — *displaying* genres is.
+    //      Every card, detail page, hub row and search hit wants them, and a
+    //      column rides along in `ITEM_COLS` for free and, more to the point,
+    //      uniformly. A join table means a per-endpoint batch lookup
+    //      (`item_max_heights`'s shape), which is exactly how `resolution`
+    //      came to be populated on some responses and quietly absent from
+    //      others — and a client cannot tell that apart from "this film has
+    //      no genres".
+    //   2. It would be the first table in the schema to reference `items` for
+    //      *content* rather than state, and v6 is the standing lesson about
+    //      what that costs: rebuilding `items` (SQLite cannot alter a CHECK,
+    //      and that will happen again) means every child reasoned about under
+    //      `foreign_keys = OFF`, plus a rename that rewrites child FK
+    //      references. One more child is one more way for that day to eat a
+    //      library.
+    //   3. `tags` is already a JSON list of strings on this row, seeded from
+    //      the same NFO element. Storing the neighbouring fact a second,
+    //      different way is a tax every future reader pays.
+    //
+    // Revisit if a real library makes the filtered page slow. The number to
+    // beat is the *unfiltered* page on that same library, not zero: both scan
+    // the same partition and sort it in a temp B-tree, so the filter moves
+    // the constant, never the class.
+    //
+    // NOT NULL DEFAULT '[]', like `tags`: "the provider named no genres" and
+    // "nobody has asked yet" are deliberately not distinguished here, because
+    // `metadata_at` already answers the second one, and a nullable second
+    // flavour of empty would be a third state with no reader.
+    //
+    // Not backfilled by this migration. There is no stored provider payload
+    // to recompute from (`tmdb::Match` carries nine fields, none of them
+    // genres), so filling these costs one API call per title — work an
+    // operator arms deliberately (`genres.backfill`), never something an
+    // upgrade starts on its own. v9 records what an upgrade that re-fetches a
+    // whole catalogue looks like from TMDB's side.
+    "ALTER TABLE items ADD COLUMN genres TEXT NOT NULL DEFAULT '[]';",
 ];
 
 /// Column list matching [`item_from_row`]. Prefix with a table alias via
@@ -386,11 +442,18 @@ const MIGRATIONS: &[&str] = &[
 const ITEM_COLS: &str = "id, library_id, kind, parent_id, title, sort_title, year, overview, \
      tmdb_id, imdb_id, season_number, episode_number, air_date, runtime_ms, \
      poster_path, backdrop_path, added_at, updated_at, recorded_at, tags, nfo_seeded_at, \
-     artwork_attempted_at, artwork_error";
+     artwork_attempted_at, artwork_error, genres";
 
 /// How many columns [`ITEM_COLS`] selects — the offset of the first column a
 /// query appends after it. Keep in step with [`ITEM_COLS`].
-const ITEM_COL_COUNT: usize = 23;
+///
+/// `continue_watching`, `next_up`, `recently_added` and `search_items` all
+/// select `ITEM_COLS` and then append their own trailing columns, which they
+/// read at `ITEM_COL_COUNT + n`. Adding a column here without bumping this
+/// makes all four read the *new* column as if it were their first appended
+/// one — no error, no type failure when both are TEXT, just a show title that
+/// is quietly a JSON array of genres. Add and bump together, always.
+const ITEM_COL_COUNT: usize = 24;
 
 /// `ITEM_COLS` qualified with a table alias (e.g. `i.id, i.library_id, ...`).
 fn item_cols(alias: &str) -> String {
@@ -415,6 +478,7 @@ fn item_from_row(row: &Row<'_>, base: usize) -> rusqlite::Result<Item> {
     let kind = ItemKind::parse(&kind_raw)
         .ok_or_else(|| conversion_err(base + 2, format!("unknown item kind `{kind_raw}`")))?;
     let tags_json: String = row.get(base + 19)?;
+    let genres_json: String = row.get(base + 23)?;
     Ok(Item {
         id: row.get(base)?,
         library_id: row.get(base + 1)?,
@@ -440,6 +504,8 @@ fn item_from_row(row: &Row<'_>, base: usize) -> rusqlite::Result<Item> {
         nfo_seeded_at: row.get(base + 20)?,
         artwork_attempted_at: row.get(base + 21)?,
         artwork_error: row.get(base + 22)?,
+        genres: serde_json::from_str(&genres_json)
+            .map_err(|e| conversion_err(base + 23, format!("genres: {e}")))?,
     })
 }
 
@@ -758,7 +824,8 @@ impl SettingsStore for SqliteStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{MediaStore, SettingsStore};
+    use crate::domain::MetadataPatch;
+    use crate::store::{MediaStore, SettingsStore, WatchStore};
 
     /// The §3.2 pair: a write on the writer connection is visible to the
     /// read pool at once (WAL read-your-writes across connections), and a
@@ -942,7 +1009,7 @@ mod tests {
             .expect("version");
         assert_eq!(version, MIGRATIONS.len() as i64);
         assert_eq!(
-            version, 12,
+            version, 13,
             "a new migration must be a deliberate bump, not a surprise — \
              the list is append-only and every entry is one somebody shipped"
         );
@@ -1044,6 +1111,136 @@ mod tests {
             [],
         )
         .expect("home items");
+    }
+
+    /// v13 adds a column to `items`, which is the migration shape with a
+    /// silent failure mode: `ITEM_COLS` and `ITEM_COL_COUNT` are positional,
+    /// and four queries select `ITEM_COLS` and then read their own trailing
+    /// columns at `ITEM_COL_COUNT + n`. Get the count wrong and none of them
+    /// errors — `search_items` simply starts reporting a JSON array of genres
+    /// as the show title, because both are TEXT.
+    ///
+    /// So this checks the upgrade twice over: the row survives with the new
+    /// column defaulted, and every consumer of the positional offsets still
+    /// reads what it meant to.
+    #[tokio::test]
+    async fn v13_adds_genres_without_shifting_the_positional_readers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("plurx.db");
+        {
+            let conn = Connection::open(&db).expect("raw open");
+            for (index, sql) in MIGRATIONS.iter().enumerate().take(12) {
+                conn.execute_batch(&format!("BEGIN;\n{sql}\nCOMMIT;"))
+                    .unwrap_or_else(|e| panic!("v{}: {e}", index + 1));
+            }
+            conn.pragma_update(None, "user_version", 12)
+                .expect("version");
+            conn.execute_batch(
+                "INSERT INTO users (id, username, password_hash, is_admin)
+                     VALUES (1, 'paul', 'hash', 1);
+                 INSERT INTO libraries (id, name, kind, paths, anime)
+                     VALUES (1, 'TV', 'shows', '[\"/media/tv\"]', 0);
+                 INSERT INTO items (id, library_id, kind, parent_id, title, sort_title,
+                                    tags, metadata_at, poster_path)
+                     VALUES (10, 1, 'show', NULL, 'Severance', 'severance', '[\"x\"]', 1, NULL),
+                            (11, 1, 'season', 10, 'Season 1', 'season 1', '[]', 1, 'season.jpg'),
+                            (12, 1, 'episode', 11, 'Good News', 'good news', '[]', 1, NULL);
+                 INSERT INTO files (id, item_id, path, size, mtime)
+                     VALUES (100, 12, '/media/tv/s01e01.mkv', 42, 7);
+                 INSERT INTO watch_state (user_id, item_id, position_ms, watched)
+                     VALUES (1, 12, 61000, 0);",
+            )
+            .expect("seed v12");
+        }
+
+        // Open through the real binary path — this applies v13.
+        let store = SqliteStore::open(&db).expect("migrate");
+        let conn = Connection::open(&db).expect("raw reopen");
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .expect("version");
+        assert_eq!(version, 13, "v13 must have applied");
+
+        // The new column defaults, and the neighbouring JSON list is untouched.
+        let (genres, tags): (String, String) = conn
+            .query_row("SELECT genres, tags FROM items WHERE id = 10", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .expect("columns");
+        assert_eq!((genres.as_str(), tags.as_str()), ("[]", "[\"x\"]"));
+
+        let item = store.get_item(10).await.expect("get").expect("show");
+        assert!(item.genres.is_empty(), "an upgraded row has no genres yet");
+        assert_eq!(item.tags, vec!["x".to_owned()]);
+
+        // The four positional readers. Each appends its own columns after
+        // `ITEM_COLS`; a stale `ITEM_COL_COUNT` makes them read the genres
+        // column instead, with no error to notice.
+        store
+            .apply_metadata(
+                10,
+                &MetadataPatch {
+                    genres: Some(vec!["Drama".into(), "Mystery".into()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("patch genres");
+
+        let recent = store.recently_added(Some(1), 10).await.expect("recent");
+        let episode = recent
+            .iter()
+            .find(|r| r.item.id == 12)
+            .expect("the episode is on the rail");
+        assert_eq!(
+            episode.show_title.as_deref(),
+            Some("Severance"),
+            "recently_added must read the show title, not the genres column"
+        );
+        assert_eq!(episode.season_poster.as_deref(), Some("season.jpg"));
+
+        let hits = store.search_items("severance", 10).await.expect("search");
+        assert!(!hits.is_empty(), "the show is still findable");
+        assert!(
+            hits.iter()
+                .all(|h| h.show_title.is_none() || h.show_title.as_deref() == Some("Severance")),
+            "search_items must read the show title, not the genres column: {:?}",
+            hits.iter()
+                .map(|h| h.show_title.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            hits.iter()
+                .find(|h| h.item.id == 10)
+                .map(|h| h.item.genres.clone()),
+            Some(vec!["Drama".to_owned(), "Mystery".to_owned()]),
+            "and it must read the genres themselves as genres"
+        );
+
+        let in_progress = store.continue_watching(1, 10).await.expect("continue");
+        let entry = in_progress
+            .iter()
+            .find(|r| r.item.id == 12)
+            .expect("the part-watched episode");
+        assert_eq!(
+            entry.show_title.as_deref(),
+            Some("Severance"),
+            "continue_watching must read the show title, not the genres column"
+        );
+        assert_eq!(
+            entry.state.position_ms, 61000,
+            "and its watch state after that"
+        );
+        assert_eq!(entry.season_poster.as_deref(), Some("season.jpg"));
+
+        let next = store.next_up(1, 10).await.expect("next up");
+        for r in &next {
+            assert!(
+                r.show_title.is_none() || r.show_title.as_deref() == Some("Severance"),
+                "next_up must read the show title, not the genres column: {:?}",
+                r.show_title
+            );
+        }
     }
 
     #[tokio::test]

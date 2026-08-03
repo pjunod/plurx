@@ -53,6 +53,18 @@ pub struct ListQuery {
     pub sort: Option<String>,
     pub offset: Option<i64>,
     pub limit: Option<i64>,
+    /// `1` adds the aggregated `media` block to each playable item. Opt-in
+    /// because it costs one more (still page-wide) query and a few hundred
+    /// bytes a row: the clients that want spec columns ask for them, and
+    /// everyone else keeps the response they already parse, byte for byte.
+    pub facts: Option<u8>,
+    /// Narrow the grid to one genre. Absent (the default) is the whole
+    /// library, byte for byte what this endpoint returned before the
+    /// parameter existed. Matched case-insensitively against the item's
+    /// stored genres; an unknown genre is an empty page and a `total` of 0,
+    /// not an error — the client asked a well-formed question and the answer
+    /// is "nothing".
+    pub genre: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -81,9 +93,12 @@ pub async fn list_items(
     let offset = q.offset.unwrap_or(0).max(0);
     let limit = clamp_limit(q.limit);
 
+    // Trimmed and emptied-to-None so `?genre=` and `?genre=%20` mean the same
+    // thing as omitting it, rather than "the genre whose name is one space".
+    let genre = q.genre.as_deref().map(str::trim).filter(|g| !g.is_empty());
     let page = state
         .store
-        .list_top_items(library_id, sort, offset, limit)
+        .list_top_items_in_genre(library_id, sort, offset, limit, genre)
         .await?;
     let watch = watch_lookup(&state, user.id, &page.items).await?;
     // Per-item resolution so the grid can badge/section it. Home videos carry
@@ -96,6 +111,16 @@ pub async fn list_items(
         .map(|i| i.id)
         .collect();
     let heights = state.store.item_max_heights(&badged).await?;
+    // Codec/HDR/audio/size for the same set of items, and only when asked.
+    // One query for the page, never one per item: `badged` is already the
+    // page's playable ids, so this is a second constant-cost lookup, not a
+    // fan-out. Photos and folders are not in `badged` — a photo has no codec
+    // to name and a folder has no files of its own.
+    let mut facts = if q.facts == Some(1) {
+        state.store.item_media_facts(&badged).await?
+    } else {
+        HashMap::new()
+    };
     // Folder cards say how much is inside them.
     let folder_ids: Vec<i64> = page
         .items
@@ -122,13 +147,15 @@ pub async fn list_items(
         .items
         .into_iter()
         .map(|item| {
+            let rollup = rollups.get(&item.id).copied();
             let w = watch.get(&item.id).copied();
             let res = heights.get(&item.id).copied();
             let count = counts.get(&item.id).copied();
-            let rollup = rollups.get(&item.id).copied();
+            let media = facts.remove(&item.id);
             ItemDto::from(item)
                 .with_watch(w)
                 .with_resolution(res)
+                .with_media(media)
                 .with_child_count(count)
                 .with_rollup(rollup)
         })

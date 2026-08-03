@@ -39,8 +39,28 @@ bump may break compatibility and a **patch** bump never does.
   because that is what a forced track is for. PGS, VobSub, and styled ASS/SSA
   still burn and still reopen at the same film position, deliberately: they
   are positioned bitmaps and authored styling, and plain WebVTT would lose
-  them. Android still burns every server-side subtitle; its native path is
-  tracked in [docs/ANDROID-CLIENT-PARITY.md](docs/ANDROID-CLIENT-PARITY.md).
+  them.
+
+- **And the Android app now does the same thing.** Choosing a text subtitle
+  there used to send `subtitle_burn` too, which on a 4K HDR remux cost the
+  stream its resolution *and* its HDR for a track the server hands over free.
+  Android now takes the same WebVTT renditions the Apple apps do: on a
+  direct-played file the selection happens inside the player with no server
+  involved at all, and on a remuxed or transcoded one it opens a session
+  whose video recipe is untouched. Switching between two text tracks changes
+  nothing on the server. Bitmap and styled tracks still burn, at source
+  height, and the subtitle menu no longer lists a track twice on direct play.
+
+- **One place decides which subtitle comes on by itself.** The server already
+  worked this out — it honours anime dual-audio rules, the configured
+  audio/subtitle languages, and the subtitle mode (Auto, Always, Off) — and
+  said so in the playback decision, but each app then re-derived the rule from
+  scratch and reached its own answer. An app set up against a server whose
+  subtitle mode was Auto behaved as if it were Always. Both apps now apply
+  the server's choice. They keep exactly one rule of their own, and it is a
+  refusal rather than a preference: an app will not start a burn on its own
+  initiative for a track that is not forced, whatever the server picked,
+  because a burn is a re-encode and nobody asked for one.
 
 - **Point an app at this server by scanning a code.** The web sign-in screen
   now offers a QR code of the server's own address, and the iOS and Android
@@ -59,6 +79,15 @@ bump may break compatibility and a **patch** bump never does.
   with real icons and given their own accessibility text, so picking between
   two versions of a title stops being a guess about which one is the remux.
 
+- **The playback decision says whether a subtitle can be served as a
+  rendition.** Its `text` field only ever meant "not a bitmap", so ASS and SSA
+  came back as text even though their authored styling cannot survive
+  conversion to WebVTT and the server refuses to serve them as one. Each app
+  was carrying its own copy of the codec list to work around it. The decision
+  now carries `native` alongside `text`, computed by the same rule the HLS
+  master and that refusal use, so there is one answer instead of three.
+  Additive — older apps ignore it.
+
 - **Two HLS master experiments ship compiled in and off by default.**
   `PLURX_HLS_CLOSED_CAPTIONS_NONE=1` adds `CLOSED-CAPTIONS=NONE` to the
   variant; `PLURX_HLS_FORCED_AUTOSELECT=1` puts `AUTOSELECT=YES` on forced
@@ -69,6 +98,59 @@ bump may break compatibility and a **patch** bump never does.
   and failed on the device: enable one per deploy, watch the device, then
   keep it or drop it. Full description in
   [docs/OPERATIONS.md](docs/OPERATIONS.md#the-two-hls-master-experiments).
+- **The library list can carry each item's media facts, in one query.** A
+  browse response used to say only how tall an item's best file is; codec,
+  dynamic range, audio, container and size lived on `FileDto`, which only the
+  item-detail response returns — so anything wanting spec columns on a grid
+  had to fetch every item. `GET /api/v1/libraries/:id/items?facts=1` now adds
+  an aggregated `media` block per playable item
+  (`{files, bytes, video, height, dr, audio, container}`), computed for the
+  whole page in a single windowed query over `files` rather than one lookup
+  per card. `files` and `bytes` cover every version of the item; the rest
+  describe its best one — greatest height, then bitrate — so a 2160p Dolby
+  Vision remux beside a 720p copy reads as 2160p and never as a union of
+  files no single copy could play. `dr` speaks the badge vocabulary the
+  clients already print (`DV`, `HDR10+`, `HDR10`, `HLG`) and states what is
+  on disk, not what will be delivered. Without the parameter the response is
+  byte for byte what it was, so no existing client pays for the block.
+- **The activity page can see every viewer, not just the transcoding
+  ones.** `GET /api/v1/activity/detail` grows a `deliveries` array beside
+  the existing `sessions` — which is unchanged, in shape and in meaning —
+  listing everything in flight with a `method` of `direct`, `remux`,
+  `hls-copy` or `transcode`. Two of those were already tracked and simply
+  never listed: an HLS copy-remux has always been a real session, and a
+  progressive `/stream.mp4` remux has always been a registered stream (now
+  registered whether or not the client asks for telemetry, so a native
+  client that sends no stream id is still visible). Direct play had no
+  record at all and now gets one, keyed by the *player* rather than the
+  request — a seeking browser makes dozens of ranged requests for one film,
+  and one row each would have shown a dozen phantom viewers per person. A
+  direct play appears within a beacon and disappears after 30s of silence
+  (three missed progress beacons), because a closed tab announces nothing.
+- **Genres, server-side at last — and the backfill to fill them in.** Nothing
+  in plurx has ever stored a genre for catalogue media: TMDB has returned them
+  on every `/movie/{id}` call the server ever made and the field was read
+  straight past, and the only `<genre>` handling in the tree folded an NFO's
+  into a *home* library's free-form tags. Items now carry a `genres` list
+  (schema v13, a JSON array on the row exactly like `tags`), filled at
+  enrichment time and exposed as an additive `genres` field on every item the
+  API returns. It costs nothing to collect: a movie's genres come out of the
+  details call the match already makes, and a TV library's come from ONE
+  cached `/genre/tv/list` fetch per run rather than a second round-trip per
+  series. AniList supplies its own for anime libraries, free, on the search
+  query that was already running. Library grids take an optional `?genre=` —
+  filtered server-side, case-insensitively, with `total` filtered to match so
+  paging stays honest.
+
+  Libraries enriched before this have no genres, and nothing stored can
+  produce them, so filling them in means asking the provider again once per
+  title. That is an opt-in job (`genres.backfill` on the settings page), never
+  something an upgrade starts on its own: it is paced well under TMDB's public
+  rate ceiling, stamps its progress after every single title so a reboot or a
+  rate limit resumes rather than restarts, disarms itself when it reaches the
+  end of the catalogue, and reports what it backfilled, failed and skipped —
+  with every failure named, because a backfill that half-finishes in silence
+  is worse than one that never ran.
 - **The server says which dynamic range a delivery actually carries.** Every
   client's HDR/DV badge was built from the source probe alone, because the one
   fact that would let it be honest — what grade is in the bytes this session

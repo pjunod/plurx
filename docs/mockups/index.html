@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cinemarr — UI layout & theme mockups</title>
+<style>
+  *{box-sizing:border-box}
+  body{margin:0;min-height:100vh;background:#08080a;color:#c9c9d2;display:grid;place-items:center;
+    font:15px/1.6 system-ui,-apple-system,'Segoe UI',Roboto,sans-serif}
+  main{max-width:640px;padding:40px 24px}
+  h1{font:700 26px/1.2 ui-monospace,Menlo,monospace;color:#ededf2;margin:0 0 4px}
+  h1 i{font-style:normal;color:#e5484d}
+  .sub{color:#8b8b96;margin:0 0 26px;font-size:14px}
+  a.card{display:block;padding:16px 18px;margin:10px 0;border:1px solid #26262e;border-radius:12px;
+    background:#101016;color:inherit;text-decoration:none}
+  a.card:hover{border-color:#4a4a58;background:#14141c}
+  a.card b{color:#ededf2;font-size:15.5px}
+  a.card span{display:block;color:#8b8b96;font-size:13px;margin-top:3px}
+  .foot{margin-top:24px;color:#5c5c66;font-size:12.5px;font-family:ui-monospace,Menlo,monospace}
+</style>
+</head>
+<body>
+<main>
+  <h1>cinemarr ui mockups<i>_</i></h1>
+  <p class="sub">Layout &amp; theme proposals for review — every title and poster is fictional.
+    The written proposal lives in <code>docs/UI-LAYOUTS-PLAN.md</code>.</p>
+  <a class="card" href="web.html"><b>web.html — the five web layouts</b>
+    <span>classic · plex · theater · deck · guide, × 8 themes × dark/light, × home/library/detail</span></a>
+  <a class="card" href="tv.html"><b>tv.html — the 10-foot layouts</b>
+    <span>plex rail · theater · guide · classic-on-TV, in a 16:9 frame — arrow keys move the focus ring</span></a>
+  <a class="card" href="mobile.html"><b>mobile.html — phones &amp; tablets</b>
+    <span>all five layouts as phone screens, plus the tablet/iPadOS sidebar variant</span></a>
+  <a class="card" href="themes.html"><b>themes.html — the theme sheet</b>
+    <span>3 shipped + 5 proposed themes on one page, dark &amp; light, with component samples</span></a>
+  <a class="card" href="review-additions.html"><b>review-additions.html — independent review designs</b>
+    <span>Spine + Archive layouts, Paper + Tide themes, and links to the implementation critique</span></a>
+  <p class="foot">open these files in any browser — no server, no build, no network</p>
+</main>
+</body>
+</html>

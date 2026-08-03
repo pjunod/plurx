@@ -507,9 +507,15 @@ mod tests {
         first.abort();
         release.add_permits(1);
 
-        let published = tokio::time::timeout(std::time::Duration::from_secs(2), second)
+        // A LIVENESS bound, not a latency one: the assertion is that an
+        // aborted waiter does not strand the extraction, and any finite
+        // deadline proves that. Two seconds did not — this suite runs on
+        // 2-core CI runners, and a loaded box missed it while the code was
+        // perfectly correct. Generous enough to never lie, short enough that
+        // a genuine hang still fails the run instead of hanging it.
+        let published = tokio::time::timeout(std::time::Duration::from_secs(30), second)
             .await
-            .expect("background extraction publishes promptly")
+            .expect("an aborted waiter must not strand the extraction")
             .expect("waiter task")
             .expect("published VTT");
         assert_eq!(

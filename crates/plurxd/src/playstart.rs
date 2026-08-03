@@ -13,6 +13,8 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use crate::delivery::{Key, Method};
+
 /// How long a successful stat is trusted.
 ///
 /// Short on purpose. This is not a claim that the file still exists — only
@@ -121,12 +123,41 @@ impl StartNotifier {
 /// Fire-and-forget: the work (resolving the item, reading resume position,
 /// calling Trakt) happens in a detached task, because the caller is in the
 /// middle of serving a stream and must not wait for any of it.
-pub fn note_playback_started(state: &crate::state::AppState, user_id: i64, file_id: i64) {
+/// `method` is taken from every caller, not only from the one that gets
+/// recorded: which routes need a registry entry of their own is a decision
+/// [`crate::delivery`] makes once, and passing the method here is what stops a
+/// fifth delivery route from being added without answering it.
+///
+/// `playback_id` is the client's own id for its player, where it sends one. It
+/// is not a capability and is trusted for nothing but grouping — the worst a
+/// guessed id does is merge two of the guesser's own rows.
+pub fn note_playback_started(
+    state: &crate::state::AppState,
+    user_id: i64,
+    user_name: &str,
+    file_id: i64,
+    method: Method,
+    playback_id: Option<&str>,
+) {
+    let registry_key = method
+        .needs_registry()
+        .then(|| Key::new(user_id, file_id, playback_id));
+    let user_name = user_name.to_owned();
     let state = state.clone();
     tokio::spawn(async move {
         let Ok(Some(file)) = state.store.get_file(file_id).await else {
             return;
         };
+        // Ahead of the dedup claim, not behind it. The claim exists to
+        // announce one start per play; the registry wants to hear about every
+        // request, because that repetition is the heartbeat keeping a live
+        // viewer on the activity page. Recorded behind the claim, an entry
+        // would be written once and then expire under somebody still watching.
+        if let Some(key) = registry_key {
+            state
+                .direct_plays
+                .record(key, &user_name, file_id, file.item_id);
+        }
         if !state.starts.claim(user_id, file.item_id) {
             return;
         }

@@ -7,7 +7,6 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
-import tv.plurx.app.player.isNativeTextSubtitle
 
 class ModelContractTest {
     // The wire Json, restated: `Net` builds it with exactly these two.
@@ -211,10 +210,10 @@ class ModelContractTest {
         assertEquals(false, pgs.native)
 
         // And the routing predicate takes the server at its word.
-        assertTrue(isNativeTextSubtitle(srt))
-        assertFalse(isNativeTextSubtitle(movText))
-        assertFalse(isNativeTextSubtitle(ass))
-        assertFalse(isNativeTextSubtitle(pgs))
+        assertTrue(srt.isNativeHls)
+        assertFalse(movText.isNativeHls)
+        assertFalse(ass.isNativeHls)
+        assertFalse(pgs.isNativeHls)
     }
 
     @Test
@@ -226,16 +225,30 @@ class ModelContractTest {
               "file_id": 1, "method": "remux", "play_url": "/stream.mp4",
               "subtitles": [
                 {"index": 0, "codec": "subrip", "text": true},
-                {"index": 1, "codec": "mov_text", "text": true}
+                {"index": 1, "codec": "mov_text", "text": true},
+                {"index": 2, "codec": "ass", "text": true},
+                {"index": 3, "codec": "hdmv_pgs_subtitle", "text": false}
               ]
             }""".trimIndent(),
         )
-        val (srt, movText) = decision.subtitles
+        val (srt, movText, ass, pgs) = decision.subtitles
 
         assertNull(srt.native)
         assertNull(movText.native)
-        assertTrue(isNativeTextSubtitle(srt))
-        assertFalse(isNativeTextSubtitle(movText))
+        // With no verdict from the server, `isNativeHls` falls back to "has
+        // text, and is not one of the styled formats". A server that predates
+        // the field is one that serves an SRT rendition perfectly well, so
+        // guessing "no" here would burn every text track on every remux — the
+        // bug this milestone exists to remove. `mov_text` is the cost of that
+        // choice: an old server may answer the rendition request with a 400,
+        // which is a recoverable request, where an unnecessary burn is a
+        // 4K re-encode nobody asked for.
+        assertTrue(srt.isNativeHls)
+        assertTrue(movText.isNativeHls)
+        // Styled text and bitmaps still fall out: ASS by the codec list, PGS
+        // because it carries no text at all.
+        assertFalse(ass.isNativeHls)
+        assertFalse(pgs.isNativeHls)
 
         // An explicit JSON null is the same absence (`explicitNulls = false`
         // on the wire Json, and a nullable field with a null default here).

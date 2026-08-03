@@ -46,6 +46,11 @@ const MAX_PER_USER: usize = 8;
 #[derive(Debug)]
 pub struct Stream {
     pub user_id: i64,
+    /// Who to name on the activity page. Carried rather than looked up at read
+    /// time because the id is all this registry otherwise holds, and turning a
+    /// number into a name would put a store read on a page that re-polls every
+    /// couple of seconds.
+    pub user_name: String,
     pub file_id: i64,
     /// The pace this remux was started at, in multiples of realtime (`0` =
     /// unpaced). Without it a reader cannot tell a server sitting at its speed
@@ -123,11 +128,13 @@ impl Streams {
         self: &Arc<Self>,
         id: &str,
         user_id: i64,
+        user_name: &str,
         file_id: i64,
         readrate: f64,
     ) -> (Arc<Stream>, StreamGuard) {
         let stream = Arc::new(Stream {
             user_id,
+            user_name: user_name.to_owned(),
             file_id,
             readrate,
             progress: Arc::new(Progress::new()),
@@ -184,10 +191,47 @@ impl Streams {
         }
     }
 
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.live.lock().expect("streams mutex").len()
+    /// Every live remux, for the activity page.
+    ///
+    /// This registry always knew who was streaming; nothing had ever asked it
+    /// to say so — `status` answers about one id, to its owner, and there was
+    /// no way to enumerate. Listing is a plain read of the same map, so an
+    /// entry appears and disappears exactly with its `StreamGuard`: there is
+    /// no second lifetime here to fall out of step with the first.
+    ///
+    /// Ordered newest first so a page that re-polls does not reshuffle.
+    pub fn list(&self) -> Vec<StreamListing> {
+        let live = self.live.lock().expect("streams mutex");
+        let mut out: Vec<StreamListing> = live
+            .iter()
+            .map(|(id, s)| StreamListing {
+                id: id.clone(),
+                user_name: s.user_name.clone(),
+                file_id: s.file_id,
+                started_unix: s.started_unix,
+                delivered_bytes: s.delivery.total_bytes(),
+                delivered_bps: s.delivery.recent_bps().map(|b| b * 8),
+                delivered_idle_ms: s.delivery.idle_for_ms(),
+            })
+            .collect();
+        out.sort_by(|a, b| b.started_unix.cmp(&a.started_unix).then(a.id.cmp(&b.id)));
+        out
     }
+}
+
+/// One live remux as the activity page sees it — who, what, since when.
+/// Deliberately not [`StreamInfo`]: that is the player's own health overlay
+/// for its own stream, and encoder speeds belong to the viewer of that stream
+/// rather than to a list of who is watching.
+#[derive(Debug, Clone)]
+pub struct StreamListing {
+    pub id: String,
+    pub user_name: String,
+    pub file_id: i64,
+    pub started_unix: i64,
+    pub delivered_bytes: i64,
+    pub delivered_bps: Option<i64>,
+    pub delivered_idle_ms: i64,
 }
 
 /// Deregisters its stream when dropped. Held by the response body, so it
@@ -211,7 +255,7 @@ mod tests {
     #[test]
     fn a_stream_is_visible_to_its_owner_and_gone_when_dropped() {
         let streams = Streams::new();
-        let (stream, guard) = streams.register("pb-1", 7, 42, 4.0);
+        let (stream, guard) = streams.register("pb-1", 7, "paul", 42, 4.0);
         stream.delivery.note(2_000_000);
 
         let info = streams.status("pb-1", 7).expect("owner sees it");
@@ -227,7 +271,7 @@ mod tests {
 
         drop(guard);
         assert!(streams.status("pb-1", 7).is_none(), "deregistered on drop");
-        assert_eq!(streams.len(), 0);
+        assert_eq!(streams.list().len(), 0);
     }
 
     #[test]
@@ -236,23 +280,23 @@ mod tests {
         // playback id. Two entries would mean the overlay could read the dead
         // one's frozen numbers.
         let streams = Streams::new();
-        let (first, g1) = streams.register("pb-1", 7, 42, 4.0);
+        let (first, g1) = streams.register("pb-1", 7, "paul", 42, 4.0);
         first.delivery.note(999);
-        let (_second, _g2) = streams.register("pb-1", 7, 42, 4.0);
-        assert_eq!(streams.len(), 1);
+        let (_second, _g2) = streams.register("pb-1", 7, "paul", 42, 4.0);
+        assert_eq!(streams.list().len(), 1);
         assert_eq!(
             streams.status("pb-1", 7).expect("live").delivered_bytes,
             0,
             "the new stream's counters, not the old one's"
         );
         drop(g1); // the superseded guard must not take the live entry with it
-        assert_eq!(streams.len(), 1);
+        assert_eq!(streams.list().len(), 1);
         assert!(
             streams.status("pb-1", 7).is_some(),
             "the replacement survives"
         );
         drop(_g2);
-        assert_eq!(streams.len(), 0);
+        assert_eq!(streams.list().len(), 0);
     }
 
     #[test]
@@ -260,10 +304,10 @@ mod tests {
         let streams = Streams::new();
         let mut guards = Vec::new();
         for n in 0..(MAX_PER_USER + 4) {
-            let (_s, g) = streams.register(&format!("pb-{n}"), 7, 42, 4.0);
+            let (_s, g) = streams.register(&format!("pb-{n}"), 7, "paul", 42, 4.0);
             guards.push(g);
         }
-        assert_eq!(streams.len(), MAX_PER_USER);
+        assert_eq!(streams.list().len(), MAX_PER_USER);
         assert!(streams.status("pb-0", 7).is_none(), "oldest evicted first");
         assert!(streams.status("pb-11", 7).is_some(), "newest kept");
     }

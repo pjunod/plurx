@@ -251,14 +251,20 @@ pub struct SubTrackDto {
     /// `native`. A `mov_text` or ASS/SSA track is `text: true, native: false`:
     /// the sidecar works, the rendition does not.
     pub text: bool,
-    /// **This track can be published as a native HLS subtitle rendition.**
-    /// True only for the codecs the rendition path actually accepts
-    /// (`plurx_core::tracks::is_native_text_subtitle`: `subrip|srt|webvtt|
-    /// vtt`) — the same predicate that puts an `EXT-X-MEDIA` line in the
-    /// master and that `POST /files/{id}/hls/sessions` enforces on an
-    /// explicit `subtitle` pick. Anything else (`mov_text`, ASS/SSA, bitmap)
-    /// is absent from the master and 400s if asked for by index, so a client
-    /// choosing a session-mode subtitle must gate on `native`, not on `text`.
+    /// Can this track become a native HLS WebVTT rendition?
+    ///
+    /// NOT the same question as `text`, and the difference has bitten every
+    /// client that assumed it was: ASS/SSA carry text, so `text` is true, but
+    /// their authored positioning and typefaces do not survive WebVTT
+    /// conversion — so the master never advertises them and
+    /// `POST …/hls/sessions` rejects one with "the selected subtitle requires
+    /// burn-in". A client that routes on `text` therefore asks for a session
+    /// the server refuses, and the natural recovery from that refusal is the
+    /// burn this whole arc exists to avoid.
+    ///
+    /// Computed by the same `is_native_text_subtitle` the HLS master and that
+    /// 400 use, so there is one classifier rather than a copy of the codec
+    /// list in each client. Additive: older clients ignore it.
     pub native: bool,
 }
 
@@ -818,18 +824,42 @@ fn vtt_response(bytes: Vec<u8>) -> Response {
         .into_response()
 }
 
+/// What a direct play may say about itself. Additive and optional: every
+/// client that exists today sends none of it and is served exactly as before.
+#[derive(Deserialize)]
+pub struct DirectQuery {
+    /// The player's own stream id, spelled the same as `/stream.mp4`'s so a
+    /// client learns one name. It groups the *range storm* — a seeking browser
+    /// makes dozens of 206 requests for one film, and without an id from the
+    /// player they are grouped by file instead, which merges two simultaneous
+    /// plays of one title by one person into one row. Merging is the safe
+    /// error; the other direction puts phantom viewers on the activity page.
+    pub stream: Option<String>,
+}
+
 /// GET /api/v1/files/:id/direct — raw file with HTTP range support.
 pub async fn direct(
     AuthUser(user): AuthUser,
     State(state): State<AppState>,
     AxPath(id): AxPath<i64>,
+    Query(q): Query<DirectQuery>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let file = load_file(&state, id).await?;
     let served = serve_file_range(&file.path, &headers).await;
     match &served {
-        // Bytes are going out: this is the moment playback is real.
-        Ok(_) => crate::playstart::note_playback_started(&state, user.id, id),
+        // Bytes are going out: this is the moment playback is real. Every
+        // request in the storm reports, and the registry collapses them — the
+        // repetition is what keeps a live viewer listed, since a direct play
+        // has no session to end and a closed tab announces nothing.
+        Ok(_) => crate::playstart::note_playback_started(
+            &state,
+            user.id,
+            &user.username,
+            id,
+            crate::delivery::Method::Direct,
+            q.stream.as_deref(),
+        ),
         // The open failed, so whatever the availability cache believes is
         // wrong — the unmounted-share case, arriving as it actually arrives.
         Err(_) => state.availability.forget(id),
@@ -898,7 +928,14 @@ pub async fn stream_mp4(
     } else {
         q.audio_offset_ms.unwrap_or(0).clamp(-15_000, 15_000)
     };
-    crate::playstart::note_playback_started(&state, user.id, id);
+    crate::playstart::note_playback_started(
+        &state,
+        user.id,
+        &user.username,
+        id,
+        crate::delivery::Method::Remux,
+        q.stream.as_deref(),
+    );
     let decision = q.caps().decide(&file, dv_strippable(&state));
     let audio = q.audio.unwrap_or(0).max(0);
     // Copy HEVC gets an `hvc1` tag so Safari's <video> accepts the fMP4 (an
@@ -916,11 +953,25 @@ pub async fn stream_mp4(
     // makes as soon as the overlay opens, possibly before a frame lands — finds
     // the stream rather than a 404 it would have to distinguish from a
     // finished one.
-    let tracked = q
+    //
+    // Registration is unconditional now, where it used to happen only for a
+    // client that supplied an id. The id still decides whether *status* is
+    // reachable — a server-minted one is never guessed, so nothing can ask
+    // after it — but the registry is also what the activity page lists, and a
+    // remux that skipped it was a viewer nobody could see. The Android client
+    // sends no `stream=` on `/stream.mp4` at all.
+    let sid = q
         .stream
         .as_deref()
+        .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(|sid| state.streams.register(sid, user.id, id, readrate));
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("srv-{}", uuid::Uuid::new_v4()));
+    let tracked = Some(
+        state
+            .streams
+            .register(&sid, user.id, &user.username, id, readrate),
+    );
     remux(RemuxSpec {
         path: &file.path,
         start: q.start,
@@ -1580,83 +1631,67 @@ mod tests {
         );
     }
 
-    /// `text` and `native` answer different questions and a client that reads
-    /// one for the other gets a 400 or an empty subtitle menu. Three classes
-    /// pin the whole contract:
-    ///
-    /// * `subrip` — extractable *and* publishable as an HLS rendition.
-    /// * `mov_text` — extractable only. Every MP4 WEB-DL carries these, so
-    ///   this is the row that matters: `text: true` is what lets a client
-    ///   offer the sidecar, and `native: false` is what stops it asking for a
-    ///   rendition `master_playlist` never wrote and `create_session` refuses.
-    /// * `hdmv_pgs_subtitle` — a picture: neither. Burn-in only.
-    ///
-    /// ASS/SSA rides with `mov_text` for the opposite reason (WebVTT would
-    /// throw away its authored typography), and lands in the same place.
     #[test]
-    fn sub_tracks_separate_extractable_text_from_publishable_renditions() {
-        fn stream(index: i64, codec: &str) -> plurx_core::domain::SubtitleStream {
+    fn native_is_not_the_same_question_as_text() {
+        fn sub(codec: &str) -> plurx_core::domain::SubtitleStream {
             plurx_core::domain::SubtitleStream {
-                index,
+                index: 0,
                 codec: codec.into(),
-                language: Some("eng".into()),
                 ..Default::default()
             }
         }
         let file = MediaFile {
             id: 1,
             item_id: 1,
-            path: "/media/heat.mp4".into(),
+            path: "/media/anime.mkv".into(),
             size: 1,
             mtime: 1,
-            duration_ms: None,
-            container: Some("mp4".into()),
+            duration_ms: Some(1_000),
+            container: Some("mkv".into()),
             video_codec: Some("hevc".into()),
             video_profile: None,
-            width: None,
-            height: None,
-            bit_depth: None,
+            width: Some(1920),
+            height: Some(1080),
+            bit_depth: Some(8),
             hdr: None,
             hdr_format: None,
-            bitrate: None,
+            bitrate: Some(1_000),
             audio_streams: vec![],
             subtitle_streams: vec![
-                stream(0, "subrip"),
-                stream(1, "mov_text"),
-                stream(2, "ass"),
-                stream(3, "ssa"),
-                stream(4, "hdmv_pgs_subtitle"),
+                sub("subrip"),
+                sub("ass"),
+                sub("ssa"),
+                sub("hdmv_pgs_subtitle"),
+                sub("webvtt"),
             ],
             scanned_at: 0,
             audio_offset_ms: 0,
             probed: true,
         };
-
         let tracks = sub_tracks(&file);
-        let flags: Vec<(bool, bool)> = tracks.iter().map(|t| (t.text, t.native)).collect();
-        assert_eq!(
-            flags,
-            vec![
-                (true, true),   // subrip: sidecar and rendition
-                (true, false),  // mov_text: sidecar only
-                (true, false),  // ass: sidecar only
-                (true, false),  // ssa: sidecar only
-                (false, false), // PGS: burn-in only
-            ]
-        );
-        // `native` is exactly the predicate the rendition path gates on, so a
-        // track the DTO calls native is a track the master will carry.
-        for track in &tracks {
+
+        // SRT and WebVTT: text, and servable as a rendition.
+        assert!(tracks[0].text && tracks[0].native);
+        assert!(tracks[4].text && tracks[4].native);
+
+        // The trap. ASS/SSA carry text, so `text` is true — but their authored
+        // styling does not survive WebVTT, the master never advertises them,
+        // and `POST …/hls/sessions` rejects one. A client routing on `text`
+        // asks for a session the server refuses, and the natural recovery from
+        // that refusal is a burn.
+        assert!(tracks[1].text, "ASS carries text");
+        assert!(!tracks[1].native, "ASS cannot be a native rendition");
+        assert!(tracks[2].text && !tracks[2].native, "SSA likewise");
+
+        // Bitmap is neither, and always was.
+        assert!(!tracks[3].text && !tracks[3].native);
+
+        // And the field agrees with the classifier the master and the 400 use,
+        // rather than being a second opinion about the same codecs.
+        for (track, source) in tracks.iter().zip(&file.subtitle_streams) {
             assert_eq!(
                 track.native,
-                plurx_core::tracks::is_native_text_subtitle(&track.codec),
-                "{}",
-                track.codec
-            );
-            assert!(
-                !track.native || track.text,
-                "a publishable rendition is always extractable text: {}",
-                track.codec
+                plurx_core::tracks::is_native_text_subtitle(&source.codec)
             );
         }
     }

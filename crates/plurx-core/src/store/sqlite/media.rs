@@ -14,6 +14,7 @@ use crate::domain::{
     MediaShape, MetadataPatch, NewItem, ProbeResult, RecentItem,
 };
 use crate::error::StoreError;
+use crate::mediafacts::{FactsRow, MediaFacts};
 use crate::store::MediaStore;
 
 /// Build an FTS5 MATCH expression from free text: quoted tokens, prefix
@@ -280,13 +281,15 @@ impl MediaStore for SqliteStore {
         .await
     }
 
-    async fn list_top_items(
+    async fn list_top_items_in_genre(
         &self,
         library_id: i64,
         sort: ItemSort,
         offset: i64,
         limit: i64,
+        genre: Option<&str>,
     ) -> Result<ItemPage, StoreError> {
+        let genre = genre.map(str::to_owned);
         self.with_conn(move |conn| {
             let order = match sort {
                 ItemSort::Title => "sort_title ASC",
@@ -302,18 +305,36 @@ impl MediaStore for SqliteStore {
             // (home libraries) whatever sits directly under a root.
             const TOP: &str = "(kind IN ('movie','show') \
                  OR (kind IN ('folder','video','photo') AND parent_id IS NULL))";
+            // Genres are a JSON array (migration v13), so membership is a
+            // `json_each` scan rather than an index probe. Written as
+            // "no filter asked, OR the array contains it" in ONE clause so
+            // the count and the page cannot drift: a total computed without
+            // the filter and a page computed with it is a grid that paginates
+            // into empty screens.
+            //
+            // NOCASE because the value arrives from a URL a human or a client
+            // typed, and "science fiction" meaning nothing while "Science
+            // Fiction" works is not a distinction anybody asked for. ASCII-only
+            // folding, which is all TMDB's genre vocabulary needs.
+            const GENRE: &str = "(?4 IS NULL OR EXISTS ( \
+                 SELECT 1 FROM json_each(items.genres) WHERE value = ?4 COLLATE NOCASE))";
+            // The two zeros fill ?2/?3 (offset and limit), which the count
+            // does not use — the genre clause is shared verbatim with the page
+            // query below and therefore has to keep its ?4. Sharing the string
+            // is the point: two hand-written copies of "does this item have
+            // this genre" is how a total stops agreeing with its page.
             let total: i64 = conn.query_row(
-                &format!("SELECT COUNT(*) FROM items WHERE library_id = ?1 AND {TOP}"),
-                params![library_id],
+                &format!("SELECT COUNT(*) FROM items WHERE library_id = ?1 AND {TOP} AND {GENRE}"),
+                params![library_id, 0, 0, genre],
                 |row| row.get(0),
             )?;
             let mut stmt = conn.prepare(&format!(
                 "SELECT {ITEM_COLS} FROM items
-                 WHERE library_id = ?1 AND {TOP}
+                 WHERE library_id = ?1 AND {TOP} AND {GENRE}
                  ORDER BY {order} LIMIT ?3 OFFSET ?2"
             ))?;
             let items = stmt
-                .query_map(params![library_id, offset, limit], |row| {
+                .query_map(params![library_id, offset, limit, genre], |row| {
                     item_from_row(row, 0)
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -421,6 +442,12 @@ impl MediaStore for SqliteStore {
                 .map(serde_json::to_string)
                 .transpose()
                 .map_err(|e| StoreError::Database(e.to_string()))?;
+            let genres = patch
+                .genres
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|e| StoreError::Database(e.to_string()))?;
             conn.execute(
                 "UPDATE items SET
                      title = COALESCE(?2, title),
@@ -435,6 +462,11 @@ impl MediaStore for SqliteStore {
                      backdrop_path = COALESCE(?11, backdrop_path),
                      recorded_at = COALESCE(?12, recorded_at),
                      tags = COALESCE(?13, tags),
+                     -- Add-or-replace like the rest, which is why the patch
+                     -- sends NULL rather than '[]' when a provider named no
+                     -- genres: an empty list here would let a Trakt backfill
+                     -- or a caller-supplied id erase a good one.
+                     genres = COALESCE(?17, genres),
                      -- Sticky: once a provider has answered, a later patch
                      -- that does not claim to be enrichment (caller-supplied
                      -- ids, a Trakt backfill) must not un-mark the item.
@@ -470,6 +502,7 @@ impl MediaStore for SqliteStore {
                         Some(ArtworkAttempt::Failed(why)) => Some(why.as_str()),
                         _ => None,
                     },
+                    genres,
                 ],
             )?;
             Ok(())
@@ -632,6 +665,40 @@ impl MediaStore for SqliteStore {
                 .query_map(params![library_id, retry_after_secs.max(0)], |row| {
                     item_from_row(row, 0)
                 })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(items)
+        })
+        .await
+    }
+
+    async fn items_missing_genres(
+        &self,
+        after_id: i64,
+        limit: i64,
+    ) -> Result<Vec<Item>, StoreError> {
+        self.with_conn(move |conn| {
+            // Home libraries are excluded for the same reason
+            // `items_needing_metadata` excludes them: there is no provider to
+            // ask about "Christmas 2019.mp4", and their genre-shaped facts
+            // already live in `tags` where the NFO put them.
+            //
+            // `metadata_at IS NOT NULL` — this is deliberately only the
+            // *already enriched*. An item nobody has enriched yet is the
+            // ordinary enrichment queue's work and will get genres there for
+            // free; taking it here too would race that pass and spend a
+            // second request on it.
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {i} FROM items i
+                 JOIN libraries l ON l.id = i.library_id AND l.kind != 'home'
+                 WHERE i.kind IN ('movie','show')
+                   AND i.genres = '[]'
+                   AND i.metadata_at IS NOT NULL
+                   AND i.id > ?1
+                 ORDER BY i.id LIMIT ?2",
+                i = item_cols("i")
+            ))?;
+            let items = stmt
+                .query_map(params![after_id, limit.max(0)], |row| item_from_row(row, 0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(items)
         })
@@ -948,6 +1015,81 @@ impl MediaStore for SqliteStore {
         .await
     }
 
+    async fn item_media_facts(&self, ids: &[i64]) -> Result<HashMap<i64, MediaFacts>, StoreError> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        // Same inline IN-list as `item_max_heights`, for the same reason: our
+        // own row ids, and a bound list needs a statement per arity.
+        let list = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+        self.with_conn(move |conn| {
+            // ONE statement for the whole page. The window functions do both
+            // halves of the aggregation rule documented on `MediaFacts`:
+            // COUNT/SUM describe every file of the item, ROW_NUMBER picks the
+            // single best file whose columns describe it. Ordering: height
+            // first, so this can never disagree with the `resolution` badge's
+            // MAX(height); then bitrate (a remux beats a re-encode at equal
+            // height); then size and id purely so equal versions resolve the
+            // same way on every render instead of flickering.
+            //
+            // NULL heights sort last via COALESCE rather than being filtered
+            // out — an unprobed file is still a file, and dropping it here
+            // would make `files`/`bytes` understate what is on the volume.
+            let mut stmt = conn.prepare(&format!(
+                "WITH ranked AS (
+                     SELECT item_id,
+                            COUNT(*)  OVER (PARTITION BY item_id) AS n_files,
+                            SUM(size) OVER (PARTITION BY item_id) AS total_bytes,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY item_id
+                                ORDER BY COALESCE(height, 0) DESC,
+                                         COALESCE(bitrate, 0) DESC,
+                                         size DESC,
+                                         id ASC) AS pick,
+                            container, video_codec, height, hdr, hdr_format,
+                            audio_streams
+                     FROM files
+                     WHERE item_id IN ({list})
+                 )
+                 SELECT item_id, n_files, total_bytes, container, video_codec,
+                        height, hdr, hdr_format, audio_streams
+                 FROM ranked WHERE pick = 1"
+            ))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    let audio_json: String = row.get(8)?;
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        FactsRow {
+                            files: row.get(1)?,
+                            bytes: row.get(2)?,
+                            container: row.get(3)?,
+                            video_codec: row.get(4)?,
+                            height: row.get(5)?,
+                            hdr: row.get(6)?,
+                            hdr_format: row.get(7)?,
+                            // The one thing this SQL cannot aggregate:
+                            // `audio_streams` is a JSON TEXT column, so the
+                            // summary is a pass in Rust over rows already
+                            // fetched — still one query, still no second trip.
+                            //
+                            // Tolerant on purpose, unlike `file_from_row`:
+                            // this decorates a grid, so unreadable JSON in one
+                            // row costs that row its audio badge, never the
+                            // whole page its 200.
+                            audio: serde_json::from_str(&audio_json).unwrap_or_default(),
+                        },
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows
+                .into_iter()
+                .map(|(id, row)| (id, MediaFacts::from(row)))
+                .collect())
+        })
+        .await
+    }
+
     async fn library_file_paths(&self, library_id: i64) -> Result<Vec<(i64, PathBuf)>, StoreError> {
         self.with_conn(move |conn| {
             let mut stmt = conn.prepare(
@@ -1039,6 +1181,293 @@ mod tests {
         NewLibrary, ProbeResult,
     };
     use crate::store::{LibraryStore, MediaStore, SqliteStore};
+
+    /// One item, two versions: the 2160p Dolby Vision remux and the 720p copy
+    /// someone kept for a phone. The block must read as the library actually
+    /// is — a 720p answer here is the exact failure the aggregation rule (see
+    /// `MediaFacts`) exists to prevent — while `files`/`bytes` still count
+    /// both, because both are on the volume.
+    #[tokio::test]
+    async fn media_facts_describe_the_best_version_and_count_them_all() {
+        let store = SqliteStore::open_in_memory().expect("open");
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "Movies".into(),
+                kind: LibraryKind::Movies,
+                paths: vec![PathBuf::from("/media")],
+                anime: false,
+            })
+            .await
+            .expect("lib")
+            .id;
+        let item = store
+            .insert_item(&NewItem {
+                library_id: lib,
+                kind: ItemKind::Movie,
+                parent_id: None,
+                title: "Blade Runner 2049".into(),
+                year: Some(2017),
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("item");
+        // Deliberately inserted worst-first: a "first row wins" bug would pass
+        // if the good version happened to be first.
+        store
+            .upsert_file(
+                item,
+                "/media/BR2049 720p.mp4",
+                6_800_000_000,
+                1,
+                &ProbeResult {
+                    container: Some("mp4".into()),
+                    video_codec: Some("h264".into()),
+                    width: Some(1280),
+                    height: Some(720),
+                    bitrate: Some(5_000_000),
+                    audio_streams: vec![AudioStream {
+                        index: 0,
+                        codec: "aac".into(),
+                        channels: Some(2),
+                        language: Some("eng".into()),
+                        title: None,
+                        default: true,
+                    }],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("720p");
+        store
+            .upsert_file(
+                item,
+                "/media/BR2049 2160p.mkv",
+                69_000_000_000,
+                1,
+                &ProbeResult {
+                    container: Some("mkv".into()),
+                    video_codec: Some("hevc".into()),
+                    width: Some(3840),
+                    height: Some(2160),
+                    bit_depth: Some(10),
+                    hdr: Some("dolby_vision".into()),
+                    hdr_format: Some("Dolby Vision \u{b7} Profile 7 (HDR10-compatible)".into()),
+                    bitrate: Some(56_000_000),
+                    audio_streams: vec![
+                        AudioStream {
+                            index: 0,
+                            codec: "truehd".into(),
+                            channels: Some(8),
+                            language: Some("eng".into()),
+                            title: None,
+                            default: true,
+                        },
+                        AudioStream {
+                            index: 1,
+                            codec: "eac3".into(),
+                            channels: Some(6),
+                            language: Some("eng".into()),
+                            title: Some("Commentary".into()),
+                            default: false,
+                        },
+                    ],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("2160p");
+
+        let facts = store.item_media_facts(&[item]).await.expect("facts");
+        let f = facts.get(&item).expect("item is in the map");
+        assert_eq!(f.files, 2);
+        assert_eq!(f.bytes, 75_800_000_000, "bytes is the sum, not the max");
+        assert_eq!(f.height, Some(2160));
+        assert_eq!(f.video.as_deref(), Some("HEVC"));
+        assert_eq!(f.dr.as_deref(), Some("DV"));
+        assert_eq!(f.audio.as_deref(), Some("TrueHD 7.1"));
+        assert_eq!(f.container.as_deref(), Some("MKV"));
+        // The same number the resolution badge shows, from the same rule.
+        let heights = store.item_max_heights(&[item]).await.expect("heights");
+        assert_eq!(f.height, heights.get(&item).copied());
+    }
+
+    /// Equal heights: the remux (higher bitrate) is the item's face, and an
+    /// item with no files at all is absent from the map rather than present
+    /// with zeroes — "no files" and "a file of nothing" are different answers.
+    #[tokio::test]
+    async fn media_facts_break_ties_on_bitrate_and_skip_fileless_items() {
+        let store = SqliteStore::open_in_memory().expect("open");
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "Movies".into(),
+                kind: LibraryKind::Movies,
+                paths: vec![PathBuf::from("/media")],
+                anime: false,
+            })
+            .await
+            .expect("lib")
+            .id;
+        let new = |title: &str| NewItem {
+            library_id: lib,
+            kind: ItemKind::Movie,
+            parent_id: None,
+            title: title.to_owned(),
+            year: Some(2024),
+            season_number: None,
+            episode_number: None,
+        };
+        let item = store.insert_item(&new("Dune")).await.expect("item");
+        let empty = store.insert_item(&new("Ghost")).await.expect("empty");
+        for (path, codec, bitrate, size) in [
+            (
+                "/media/Dune x264.mkv",
+                "h264",
+                12_000_000,
+                20_000_000_000i64,
+            ),
+            ("/media/Dune remux.mkv", "hevc", 68_000_000, 60_000_000_000),
+        ] {
+            store
+                .upsert_file(
+                    item,
+                    path,
+                    size,
+                    1,
+                    &ProbeResult {
+                        container: Some("mkv".into()),
+                        video_codec: Some(codec.into()),
+                        width: Some(3840),
+                        height: Some(2160),
+                        bitrate: Some(bitrate),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("file");
+        }
+
+        let facts = store.item_media_facts(&[item, empty]).await.expect("facts");
+        assert_eq!(
+            facts.get(&item).expect("dune").video.as_deref(),
+            Some("HEVC")
+        );
+        assert!(
+            !facts.contains_key(&empty),
+            "an item with no files must not fabricate a block"
+        );
+        // No ids at all: no query, no map, no panic.
+        assert!(store.item_media_facts(&[]).await.expect("none").is_empty());
+    }
+
+    /// The N+1 check, measured rather than asserted: sqlite's own statement
+    /// trace counts what the page really executed. A 200-item page is the
+    /// biggest one `MAX_LIMIT` allows, and it must cost exactly what a 2-item
+    /// page costs — one statement — or the library grid degrades into 200
+    /// round trips the moment someone scrolls.
+    #[tokio::test]
+    async fn media_facts_cost_one_statement_whatever_the_page_size() {
+        use rusqlite::trace::{TraceEvent, TraceEventCodes};
+        use std::sync::{LazyLock, Mutex};
+
+        static TRACED: LazyLock<Mutex<Vec<String>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+        fn record(event: TraceEvent<'_>) {
+            if let TraceEvent::Stmt(_, sql) = event {
+                if let Ok(mut log) = TRACED.lock() {
+                    log.push(sql.to_owned());
+                }
+            }
+        }
+
+        let store = SqliteStore::open_in_memory().expect("open");
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "Movies".into(),
+                kind: LibraryKind::Movies,
+                paths: vec![PathBuf::from("/media")],
+                anime: false,
+            })
+            .await
+            .expect("lib")
+            .id;
+        let mut ids = Vec::new();
+        for n in 0..200 {
+            let item = store
+                .insert_item(&NewItem {
+                    library_id: lib,
+                    kind: ItemKind::Movie,
+                    parent_id: None,
+                    title: format!("Film {n}"),
+                    year: Some(2024),
+                    season_number: None,
+                    episode_number: None,
+                })
+                .await
+                .expect("item");
+            // Two files each: the fan-out this measurement is guarding against
+            // would be per file, not just per item.
+            for (suffix, height) in [("2160p.mkv", 2160), ("720p.mp4", 720)] {
+                store
+                    .upsert_file(
+                        item,
+                        &format!("/media/Film {n} {suffix}"),
+                        1_000_000_000 + i64::from(height),
+                        1,
+                        &ProbeResult {
+                            container: Some("mkv".into()),
+                            video_codec: Some("hevc".into()),
+                            height: Some(i64::from(height)),
+                            bitrate: Some(20_000_000),
+                            audio_streams: vec![AudioStream {
+                                index: 0,
+                                codec: "truehd".into(),
+                                channels: Some(8),
+                                language: Some("eng".into()),
+                                title: None,
+                                default: true,
+                            }],
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("file");
+            }
+            ids.push(item);
+        }
+
+        let measure = |ids: Vec<i64>| {
+            let store = &store;
+            async move {
+                TRACED.lock().expect("log").clear();
+                {
+                    let conn = store.conn.lock().expect("conn");
+                    conn.trace_v2(TraceEventCodes::SQLITE_TRACE_STMT, Some(record));
+                }
+                let facts = store.item_media_facts(&ids).await.expect("facts");
+                {
+                    let conn = store.conn.lock().expect("conn");
+                    conn.trace_v2(TraceEventCodes::SQLITE_TRACE_STMT, None);
+                }
+                let statements = TRACED.lock().expect("log").clone();
+                (facts.len(), statements)
+            }
+        };
+
+        let (two, small) = measure(ids[..2].to_vec()).await;
+        assert_eq!(two, 2);
+        let (all, big) = measure(ids.clone()).await;
+        assert_eq!(all, 200, "every item on the page got its block");
+        assert_eq!(
+            big.len(),
+            small.len(),
+            "statement count grew with the page: {big:#?}"
+        );
+        assert_eq!(
+            big.len(),
+            1,
+            "the page cost more than one statement: {big:#?}"
+        );
+    }
 
     /// The census PERF-PLAN §5 is waiting on, against rows whose answer is
     /// known by construction. The arithmetic is trivial; the SQL is not, and

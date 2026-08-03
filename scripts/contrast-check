@@ -1,0 +1,771 @@
+#!/usr/bin/env python3
+"""WCAG 2.x contrast checker for plurx theme token tables.
+
+See --help for why this exists and what it does not prove.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+
+# --------------------------------------------------------------------------
+# the token contract
+# --------------------------------------------------------------------------
+
+FOREGROUNDS = ["--text", "--muted", "--prose", "--accent", "--accent2",
+               "--good", "--bad", "--warn"]
+BACKGROUNDS = ["--bg", "--panel", "--panel2"]
+DEFAULT_THRESHOLD = 4.5
+
+# The bar an --allow file is written against. An allowlist entry waives a PAIR,
+# not a ratio, so it must survive the threshold moving: raising --threshold must
+# not turn a still-broken pair into a "you fixed it, delete the line" error, and
+# lowering it must not manufacture one either. Staleness is therefore judged at
+# max(--threshold, this) -- an entry is only stale when the pair clears both the
+# run's bar and the bar the file was written against.
+ALLOW_BASELINE = DEFAULT_THRESHOLD
+
+# The opaque canvas an alpha-carrying *background* token is composited over
+# when it is the bottom-most surface. Themes paint --bg over the page, so in
+# practice this only matters for pathological token tables.
+CANVAS = {"dark": (0.0, 0.0, 0.0), "light": (255.0, 255.0, 255.0)}
+
+
+# --------------------------------------------------------------------------
+# color
+# --------------------------------------------------------------------------
+
+class ColorError(ValueError):
+    pass
+
+
+_RGB_FN = re.compile(
+    r"^rgba?\(\s*([0-9.]+%?)\s*[, ]\s*([0-9.]+%?)\s*[, ]\s*([0-9.]+%?)"
+    r"\s*(?:[,/]\s*([0-9.]+%?)\s*)?\)$", re.I)
+
+
+def _chan(tok: str) -> float:
+    """One 0-255 channel from '255' or '100%'."""
+    if tok.endswith("%"):
+        return float(tok[:-1]) * 255.0 / 100.0
+    return float(tok)
+
+
+def _alpha(tok: str | None) -> float:
+    if tok is None:
+        return 1.0
+    if tok.endswith("%"):
+        return float(tok[:-1]) / 100.0
+    return float(tok)
+
+
+def parse_color(value: str) -> tuple[float, float, float, float]:
+    """'#rgb' | '#rrggbb' | '#rrggbbaa' | 'rgb()' | 'rgba()' -> (r,g,b,a).
+
+    r/g/b are 0-255 floats, a is 0-1. Note '.10' parses as 0.10 — CSS lets you
+    drop the leading zero and this project's themes do exactly that
+    (rgba(255,255,255,.10) for --line).
+    """
+    v = value.strip()
+    if v.startswith("#"):
+        h = v[1:]
+        if len(h) in (3, 4):
+            h = "".join(c * 2 for c in h)
+        if len(h) not in (6, 8) or not re.fullmatch(r"[0-9a-fA-F]+", h):
+            raise ColorError(f"bad hex color: {value!r}")
+        r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+        a = int(h[6:8], 16) / 255.0 if len(h) == 8 else 1.0
+        return (float(r), float(g), float(b), a)
+    m = _RGB_FN.match(v)
+    if m:
+        return (_chan(m.group(1)), _chan(m.group(2)), _chan(m.group(3)),
+                _alpha(m.group(4)))
+    raise ColorError(f"unsupported color syntax: {value!r}")
+
+
+def composite(fg: tuple[float, float, float, float],
+              bg: tuple[float, float, float]) -> tuple[float, float, float]:
+    """Simple (non-premultiplied) source-over compositing in sRGB space.
+
+    This is what a browser does for an opaque backdrop: the blend happens on
+    the encoded 0-255 values, not on linearized light. Measuring an rgba token
+    as if it were opaque overstates its contrast; compositing first is the
+    only honest way to score e.g. rgba(255,255,255,.10) hairlines.
+    """
+    a = fg[3]
+    return tuple(fg[i] * a + bg[i] * (1.0 - a) for i in range(3))
+
+
+def _lin(c: float) -> float:
+    c = c / 255.0
+    return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+
+
+def luminance(rgb: tuple[float, float, float]) -> float:
+    """WCAG 2.x relative luminance."""
+    r, g, b = (_lin(c) for c in rgb)
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def contrast(a: tuple[float, float, float],
+             b: tuple[float, float, float]) -> float:
+    la, lb = luminance(a), luminance(b)
+    if lb > la:
+        la, lb = lb, la
+    return (la + 0.05) / (lb + 0.05)
+
+
+def hexs(rgb) -> str:
+    return "#" + "".join("%02x" % max(0, min(255, int(round(c))))
+                         for c in rgb[:3])
+
+
+# --------------------------------------------------------------------------
+# theme sources
+# --------------------------------------------------------------------------
+
+def _slice_object_literal(src: str, start: int) -> str:
+    """Return src[start:] up to and including the brace matching src[start].
+
+    Skips over string literals and // and /* */ comments so the braces inside
+    them cannot unbalance the scan. Deliberately not a JS parser — just enough
+    for an object literal of string/const values.
+    """
+    depth = 0
+    i = start
+    n = len(src)
+    while i < n:
+        c = src[i]
+        if c in "\"'`":
+            q = c
+            i += 1
+            while i < n:
+                if src[i] == "\\":
+                    i += 2
+                    continue
+                if src[i] == q:
+                    break
+                i += 1
+        elif c == "/" and i + 1 < n and src[i + 1] == "/":
+            i = src.find("\n", i)
+            if i == -1:
+                break
+        elif c == "/" and i + 1 < n and src[i + 1] == "*":
+            j = src.find("*/", i + 2)
+            i = j + 1 if j != -1 else n
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return src[start:i + 1]
+        i += 1
+    raise SystemExit("could not find the end of the THEMES object literal")
+
+
+def load_from_index(path: str) -> dict:
+    """Parse `const THEMES={...}` out of the shipped index.html.
+
+    Located by pattern, never by line number. Evaluated with node (v22) so the
+    literal's own syntax — trailing commas, comments, FONT_* const references —
+    is honored by a real JS engine instead of a regex that would quietly get it
+    wrong.
+    """
+    with open(path, "r", encoding="utf-8") as fh:
+        src = fh.read()
+    m = re.search(r"\bconst\s+THEMES\s*=\s*\{", src)
+    if not m:
+        raise SystemExit(f"no `const THEMES={{` found in {path}")
+    literal = _slice_object_literal(src, m.end() - 1)
+    # THEMES references the FONT_* consts; carry them over verbatim.
+    fonts = re.findall(r"^const\s+FONT_[A-Z_0-9]+\s*=.*?;\s*$", src,
+                       re.M | re.S)
+    js = "\n".join(fonts) + "\nconst THEMES=" + literal + \
+         ";\nprocess.stdout.write(JSON.stringify(THEMES));\n"
+    node = os.environ.get("NODE", "node")
+    with tempfile.NamedTemporaryFile("w", suffix=".mjs", delete=False,
+                                     encoding="utf-8") as tf:
+        tf.write(js)
+        tmp = tf.name
+    try:
+        out = subprocess.run([node, tmp], capture_output=True, text=True)
+    except FileNotFoundError:
+        os.unlink(tmp)
+        raise SystemExit(f"`{node}` not found; needed to evaluate the THEMES "
+                         f"literal from {path} (set $NODE to override)")
+    os.unlink(tmp)
+    if out.returncode != 0:
+        raise SystemExit("node failed to evaluate the THEMES literal:\n"
+                         + out.stderr.strip())
+    return json.loads(out.stdout)
+
+
+def load_from_json(path: str) -> dict:
+    with open(path, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    if not isinstance(data, dict):
+        raise SystemExit(f"{path}: expected an object of theme-id -> theme")
+    # keys starting with _ are file-level notes, not themes
+    return {k: v for k, v in data.items() if not k.startswith("_")}
+
+
+# --------------------------------------------------------------------------
+# the allowlist
+# --------------------------------------------------------------------------
+
+def parse_allow(path: str) -> list[dict]:
+    """Read a file of known-and-accepted failing pairs. One pair per line:
+
+        <theme> <mode> <fg-token> on <bg-surface>
+
+    e.g. `classic light --accent on --bg`, or `terminal light --btn-ink on
+    --accent`, or (only under --line-surfaces) `noirr light --text on
+    --line@--panel`. Blank lines and `#` comments are skipped; a trailing
+    `# note` on an entry is skipped too.
+
+    Four fields, always in that order, plus a literal `on` that is REQUIRED:
+    it makes a line read as the sentence the failure output prints, and it
+    makes a transposed line fail loudly at parse time instead of silently
+    waiving some other pair. Every field is exact -- theme id, mode, and token
+    names as they appear in the THEMES table -- so `grep terminal` or `grep -c
+    -- --good` over this file answers "what is still owed" without a parser.
+
+    No ratio appears anywhere, by design. A recorded ratio would go stale the
+    moment anyone nudged a value, and a waiver that lies about how bad the
+    thing it waives is, is worse than no waiver at all.
+    """
+    entries: list[dict] = []
+    seen: dict[tuple, int] = {}
+    with open(path, "r", encoding="utf-8") as fh:
+        for n, raw in enumerate(fh, 1):
+            line = raw.split("#", 1)[0].strip()
+            if not line:
+                continue
+            f = line.split()
+            if len(f) != 5 or f[3] != "on":
+                raise SystemExit(
+                    "%s:%d: want `<theme> <mode> <fg> on <bg>`, got %r"
+                    % (path, n, line))
+            theme, mode, fg, bg = f[0], f[1], f[2], f[4]
+            if mode not in ("dark", "light"):
+                raise SystemExit("%s:%d: mode must be dark|light, got %r"
+                                 % (path, n, mode))
+            if not fg.startswith("--") or not bg.startswith("--"):
+                raise SystemExit("%s:%d: token names must start with `--` "
+                                 "(got %r on %r)" % (path, n, fg, bg))
+            key = (theme, mode, fg, bg)
+            if key in seen:
+                raise SystemExit("%s:%d: duplicate entry, already named on "
+                                 "line %d: %s" % (path, n, seen[key], line))
+            seen[key] = n
+            entries.append({"theme": theme, "mode": mode, "fg": fg, "bg": bg,
+                            "key": key, "line": n, "text": line, "file": path})
+    return entries
+
+
+def allow_target_missing(entry: dict, themes: dict, overrides: dict) -> str | None:
+    """Why this entry names a pair that cannot exist, or None if it can.
+
+    Typo protection, and it runs against the UNFILTERED theme table: `--only
+    classic` narrows what gets measured, it does not make every terminal line
+    in the allowlist a typo. --set overrides are folded in first, so a token
+    invented on the command line counts as existing exactly while it does.
+    """
+    theme, mode, fg, bg = entry["theme"], entry["mode"], entry["fg"], entry["bg"]
+    if theme not in themes:
+        return "no such theme (have: %s)" % ", ".join(sorted(themes))
+    t = themes[theme][0] if isinstance(themes[theme], tuple) else themes[theme]
+    if mode == "light" and t.get("darkOnly"):
+        return "theme is darkOnly; it has no light mode"
+    vars_ = t.get(mode)
+    if not vars_:
+        return "theme has no %s token table" % mode
+    vars_ = dict(vars_)
+    vars_.update(overrides.get(None, {}))
+    vars_.update(overrides.get(mode, {}))
+    if fg == "--btn-ink":
+        if "--btn-ink" not in vars_ or "--accent" not in vars_:
+            return "theme/mode has no --btn-ink or no --accent"
+        if bg != "--accent":
+            return "--btn-ink is only ever checked against --accent, not %s" % bg
+        return None
+    if fg not in vars_:
+        return "no such foreground token in %s %s" % (theme, mode)
+    base = bg.split("@", 1)[1] if bg.startswith("--line@") else bg
+    if bg.startswith("--line@") and "--line" not in vars_:
+        return "theme/mode has no --line token"
+    if base not in vars_:
+        return "no such background surface in %s %s" % (theme, mode)
+    return None
+
+
+class Surface:
+    __slots__ = ("label", "rgb", "composited", "src")
+
+    def __init__(self, label, rgb, composited, src):
+        self.label = label
+        self.rgb = rgb
+        self.composited = composited
+        self.src = src
+
+
+def surfaces_for(vars_: dict, mode: str, line_surfaces: bool,
+                 backgrounds=None) -> list[Surface]:
+    base = CANVAS[mode]
+    out = []
+    for name in (backgrounds or BACKGROUNDS):
+        if name not in vars_:
+            continue
+        c = parse_color(vars_[name])
+        rgb = composite(c, base) if c[3] < 1.0 else c[:3]
+        out.append(Surface(name, rgb, c[3] < 1.0, vars_[name]))
+    if line_surfaces and "--line" in vars_:
+        ln = parse_color(vars_["--line"])
+        for s in list(out):
+            rgb = composite(ln, s.rgb)
+            out.append(Surface("--line@%s" % s.label, rgb, ln[3] < 1.0,
+                               vars_["--line"]))
+    return out
+
+
+def check_mode(vars_: dict, mode: str, threshold: float, line_surfaces: bool,
+               foregrounds=None, backgrounds=None) -> tuple[list[dict], int, dict]:
+    """Return (failures, pairs_checked, measured).
+
+    `measured` maps (fg_token, bg_label) -> ratio for every pair this call
+    actually looked at. The allowlist needs it: to tell a stale entry from a
+    still-failing one you have to know the ratio of the pairs that PASSED, and
+    to tell "not exercised by this run" from either you have to know which
+    pairs were looked at at all.
+    """
+    surfaces = surfaces_for(vars_, mode, line_surfaces, backgrounds)
+    fails = []
+    measured: dict[tuple[str, str], float] = {}
+    pairs = 0
+
+    def record(fg_name, fg_val, fg_rgba, surf):
+        nonlocal pairs
+        pairs += 1
+        fg_rgb = composite(fg_rgba, surf.rgb) if fg_rgba[3] < 1.0 else fg_rgba[:3]
+        r = contrast(fg_rgb, surf.rgb)
+        measured[(fg_name, surf.label)] = r
+        if r + 5e-9 < threshold:
+            fails.append({
+                "fg": fg_name, "fg_value": fg_val, "fg_rgb": hexs(fg_rgb),
+                "bg": surf.label, "bg_value": surf.src, "bg_rgb": hexs(surf.rgb),
+                "ratio": r,
+                "composited": bool(fg_rgba[3] < 1.0 or surf.composited),
+                "fg_alpha": bool(fg_rgba[3] < 1.0),
+            })
+
+    for fg in (foregrounds or FOREGROUNDS):
+        if fg not in vars_:
+            continue
+        c = parse_color(vars_[fg])
+        for surf in surfaces:
+            record(fg, vars_[fg], c, surf)
+
+    if "--btn-ink" in vars_ and "--accent" in vars_:
+        acc = parse_color(vars_["--accent"])
+        acc_rgb = composite(acc, CANVAS[mode]) if acc[3] < 1.0 else acc[:3]
+        record("--btn-ink", vars_["--btn-ink"], parse_color(vars_["--btn-ink"]),
+               Surface("--accent", acc_rgb, acc[3] < 1.0, vars_["--accent"]))
+
+    return fails, pairs, measured
+
+
+def suggest(fg_value: str, vars_: dict, mode: str, threshold: float,
+            line_surfaces: bool, backgrounds=None) -> tuple[str, float] | None:
+    """Nearest passing value along a darken (light mode) / lighten (dark mode)
+    ramp against EVERY surface this theme/mode checks. Hue is preserved by
+    scaling the linear-light channels toward black or toward white.
+    """
+    surfaces = surfaces_for(vars_, mode, line_surfaces, backgrounds)
+    if not surfaces:
+        return None
+    base = parse_color(fg_value)
+    target_dark = mode == "light"
+    for step in range(1, 1001):
+        t = step / 1000.0
+        if target_dark:
+            cand = tuple(c * (1.0 - t) for c in base[:3])
+        else:
+            cand = tuple(c + (255.0 - c) * t for c in base[:3])
+        cand = tuple(round(c) for c in cand)
+        worst = min(contrast(composite((cand[0], cand[1], cand[2], base[3]), s.rgb)
+                             if base[3] < 1.0 else cand, s.rgb)
+                    for s in surfaces)
+        if worst + 5e-9 >= threshold:
+            return hexs(cand), worst
+    return None
+
+
+# --------------------------------------------------------------------------
+# cli
+# --------------------------------------------------------------------------
+
+EPILOG = """\
+why this exists
+  On 2026-07-22 a regression shipped hardcoded dark hex values into the web UI
+  instead of theme tokens. On the dark themes nobody noticed; on every LIGHT
+  theme those surfaces rendered as black boxes. The rule that came out of it is
+  "token-mixed structural colors only, never a hardcoded hex" -- and this script
+  is the machine half of that rule: it re-measures every theme's own tokens so a
+  palette can never claim a contrast ratio it does not have.
+
+what this does NOT prove
+  This checks TOKEN-to-BACKGROUND pairs only: the eight foreground tokens
+  against --bg/--panel/--panel2, and --btn-ink against --accent. A green run
+  does not mean every component state is legible. It says nothing about
+  disabled/hover/focus/selected states, text over posters, artwork or gradient
+  scrims, opacity applied in CSS rather than in the token, placeholder and
+  skeleton shades, focus rings, or anything drawn with a hardcoded color
+  (which, being outside the token table, is invisible to this tool -- and a
+  hardcoded color was the original bug). Screenshot sweeps in both appearances
+  remain mandatory.
+
+alpha
+  rgba() tokens are composited over the surface they sit on BEFORE measuring.
+  Several themes use rgba(255,255,255,.10) for --line; scoring that as opaque
+  white would be a lie. Composited pairs are flagged with [composited] in the
+  output. --line-surfaces additionally treats --line, composited over each
+  panel, as a background surface in its own right (index.html paints
+  `background:var(--line)` in two places, so it is one).
+
+the allowlist (--allow)
+  A gate that fails on day one for debt nobody has agreed to pay is a gate that
+  gets ignored, and an ignored gate catches no regressions. --allow names the
+  pairs already known to fail -- one `<theme> <mode> <fg> on <bg>` per line, no
+  ratios (see scripts/contrast-allow.txt). Those are reported in their own
+  section, counted separately, and do not fail the run; anything else still
+  does. Three things keep the file from rotting into a list of lies: an entry
+  naming a pair that does not exist is an error, an entry whose pair has
+  STARTED PASSING is an error telling you to delete the line (someone fixed a
+  colour; the file should shrink), and a run whose filters skip an entry says
+  so rather than pretending it was checked. --threshold interacts the obvious
+  way: an entry waives a pair, not a ratio, so it silences that pair at
+  whatever bar you set, but it only counts as fixed once the pair clears both
+  your bar and the 4.50 the file was written against -- lowering the bar can
+  never tell you to delete a line you still owe.
+
+examples
+  scripts/contrast-check --from-index crates/plurxd/src/web/index.html
+  scripts/contrast-check --from-json scripts/themes-proposed.json --line-surfaces
+  scripts/contrast-check --from-index ... --only classic --set light:--accent=#2e6cdb
+  scripts/contrast-check --from-index ... --allow scripts/contrast-allow.txt
+  scripts/contrast-check --ratio '#2f6fe0' '#f6f7f9'
+"""
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="contrast-check",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="WCAG 2.x contrast check for plurx theme token tables. "
+                    "Exits nonzero if any checked pair is below threshold.",
+        epilog=EPILOG)
+    ap.add_argument("--from-index", metavar="PATH", action="append", default=[],
+                    help="parse the shipped `const THEMES={...}` out of an "
+                         "index.html (located by pattern, evaluated with node)")
+    ap.add_argument("--from-json", metavar="PATH", action="append", default=[],
+                    help="load candidate themes from a JSON file "
+                         "{id:{name,darkOnly?,dark:{...},light:{...}}}")
+    ap.add_argument("--only", metavar="THEME", action="append", default=[],
+                    help="restrict to this theme id (repeatable)")
+    ap.add_argument("--mode", choices=["dark", "light"], action="append",
+                    default=[], help="restrict to this mode (repeatable)")
+    ap.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD,
+                    metavar="N", help="minimum ratio (default 4.5, normal text)")
+    ap.add_argument("--foregrounds", metavar="LIST",
+                    help="comma-separated foreground tokens to check "
+                         "(default: %s)" % ",".join(FOREGROUNDS))
+    ap.add_argument("--backgrounds", metavar="LIST",
+                    help="comma-separated background surfaces to check "
+                         "(default: %s)" % ",".join(BACKGROUNDS))
+    ap.add_argument("--allow", metavar="PATH",
+                    help="file of known-and-accepted failing pairs "
+                         "(`<theme> <mode> <fg> on <bg>` per line); they are "
+                         "reported separately and do not fail the run, but an "
+                         "entry that no longer fails, or names a pair that "
+                         "does not exist, does")
+    ap.add_argument("--no-btn-ink", action="store_true",
+                    help="skip the --btn-ink vs --accent pair")
+    ap.add_argument("--line-surfaces", action="store_true",
+                    help="also check against --line composited over each panel")
+    ap.add_argument("--set", metavar="[MODE:]TOKEN=VALUE", action="append",
+                    default=[], help="override a token before checking, e.g. "
+                                     "--set light:--accent=#2e6cdb")
+    ap.add_argument("--all", action="store_true",
+                    help="print every pair, not just failures")
+    ap.add_argument("--suggest", action="store_true",
+                    help="for each failing token, propose the nearest value "
+                         "that passes every surface in that theme/mode")
+    ap.add_argument("--json", dest="as_json", action="store_true",
+                    help="emit machine-readable results")
+    ap.add_argument("--ratio", nargs=2, metavar=("FG", "BG"),
+                    help="print one ratio and exit (FG may be rgba(); it is "
+                         "composited over BG)")
+    args = ap.parse_args(argv)
+
+    if args.ratio:
+        fg = parse_color(args.ratio[0])
+        bg = parse_color(args.ratio[1])
+        if bg[3] < 1.0:
+            print("note: BG has alpha; compositing it over opaque white",
+                  file=sys.stderr)
+            bg_rgb = composite(bg, (255.0, 255.0, 255.0))
+        else:
+            bg_rgb = bg[:3]
+        fg_rgb = composite(fg, bg_rgb) if fg[3] < 1.0 else fg[:3]
+        note = "  [composited]" if fg[3] < 1.0 or bg[3] < 1.0 else ""
+        print("%s on %s -> %.2f:1%s" % (hexs(fg_rgb), hexs(bg_rgb),
+                                        contrast(fg_rgb, bg_rgb), note))
+        return 0
+
+    if not args.from_index and not args.from_json:
+        ap.error("need at least one of --from-index / --from-json")
+
+    themes: dict = {}
+    for p in args.from_index:
+        for k, v in load_from_index(p).items():
+            themes[k] = (v, p)
+    for p in args.from_json:
+        for k, v in load_from_json(p).items():
+            themes[k] = (v, p)
+
+    # Kept before --only narrows the run: the allowlist is validated against
+    # every theme the sources define, not just the ones this invocation checks.
+    all_themes = dict(themes)
+
+    if args.only:
+        missing = [t for t in args.only if t not in themes]
+        if missing:
+            raise SystemExit("no such theme(s): %s (have: %s)"
+                             % (", ".join(missing), ", ".join(sorted(themes))))
+        themes = {k: v for k, v in themes.items() if k in args.only}
+
+    overrides: dict[str | None, dict] = {}
+    for s in args.set:
+        if "=" not in s:
+            ap.error("--set wants [MODE:]TOKEN=VALUE, got %r" % s)
+        key, val = s.split("=", 1)
+        mode = None
+        if ":" in key:
+            mode, key = key.split(":", 1)
+        overrides.setdefault(mode, {})[key.strip()] = val.strip()
+
+    fgs = ([t.strip() for t in args.foregrounds.split(",")]
+           if args.foregrounds else list(FOREGROUNDS))
+    bgs = ([t.strip() for t in args.backgrounds.split(",")]
+           if args.backgrounds else list(BACKGROUNDS))
+
+    allow = parse_allow(args.allow) if args.allow else []
+    allow_by_key = {e["key"]: e for e in allow}
+    unknown = []
+    for e in allow:
+        why = allow_target_missing(e, all_themes, overrides)
+        if why:
+            unknown.append((e, why))
+
+    modes = args.mode or ["dark", "light"]
+    results = []
+    total_fail = 0
+    total_known = 0
+    total_pairs = 0
+    measured_all: dict[tuple, float] = {}
+
+    for tid, (theme, src) in themes.items():
+        dark_only = bool(theme.get("darkOnly"))
+        for mode in modes:
+            if mode == "light" and dark_only:
+                results.append({"theme": tid, "mode": mode, "skipped":
+                                "darkOnly", "fails": [], "pairs": 0})
+                continue
+            vars_ = theme.get(mode)
+            if not vars_:
+                continue
+            vars_ = dict(vars_)
+            vars_.update(overrides.get(None, {}))
+            vars_.update(overrides.get(mode, {}))
+            v_chk = dict(vars_)
+            if args.no_btn_ink:
+                v_chk.pop("--btn-ink", None)
+            fails, pairs, measured = check_mode(v_chk, mode, args.threshold,
+                                                args.line_surfaces, fgs, bgs)
+            for (fg_n, bg_n), ratio in measured.items():
+                measured_all[(tid, mode, fg_n, bg_n)] = ratio
+            # A failure named by the allowlist is debt, not news: it moves to
+            # its own bucket and stops counting against the exit code.
+            known = [f for f in fails
+                     if (tid, mode, f["fg"], f["bg"]) in allow_by_key]
+            if known:
+                kset = {id(f) for f in known}
+                fails = [f for f in fails if id(f) not in kset]
+            if args.suggest:
+                for f in fails + known:
+                    s = suggest(f["fg_value"], vars_, mode, args.threshold,
+                                args.line_surfaces, bgs)
+                    f["suggest"] = {"value": s[0], "worst": s[1]} if s else None
+            all_pairs = None
+            if args.all:
+                all_pairs = []
+                surfaces = surfaces_for(vars_, mode, args.line_surfaces, bgs)
+                for fg in fgs:
+                    if fg not in vars_:
+                        continue
+                    c = parse_color(vars_[fg])
+                    for surf in surfaces:
+                        rgb = composite(c, surf.rgb) if c[3] < 1.0 else c[:3]
+                        all_pairs.append((fg, vars_[fg], surf.label,
+                                          hexs(surf.rgb),
+                                          contrast(rgb, surf.rgb),
+                                          c[3] < 1.0 or surf.composited))
+                if "--btn-ink" in v_chk and "--accent" in vars_:
+                    acc = parse_color(vars_["--accent"])
+                    acc_rgb = composite(acc, CANVAS[mode]) if acc[3] < 1.0 else acc[:3]
+                    ink = parse_color(vars_["--btn-ink"])
+                    ink_rgb = composite(ink, acc_rgb) if ink[3] < 1.0 else ink[:3]
+                    all_pairs.append(("--btn-ink", vars_["--btn-ink"],
+                                      "--accent", hexs(acc_rgb),
+                                      contrast(ink_rgb, acc_rgb),
+                                      ink[3] < 1.0 or acc[3] < 1.0))
+            results.append({"theme": tid, "mode": mode, "source": src,
+                            "fails": fails, "known": known, "pairs": pairs,
+                            "all": all_pairs})
+            total_fail += len(fails)
+            total_known += len(known)
+            total_pairs += pairs
+
+    # The allowlist audits itself. An entry whose pair now clears the bar is an
+    # error, not a quiet no-op: someone fixed a colour, and this is the only
+    # cheap moment to make the file shrink instead of accumulating lies.
+    stale = []
+    unexercised = []
+    stale_bar = max(args.threshold, ALLOW_BASELINE)
+    for e in allow:
+        if any(e is u[0] for u in unknown):
+            continue
+        if e["key"] not in measured_all:
+            unexercised.append(e)
+            continue
+        r = measured_all[e["key"]]
+        if r + 5e-9 >= stale_bar:
+            stale.append((e, r))
+
+    allow_bad = bool(stale or unknown)
+
+    if args.as_json:
+        print(json.dumps(
+            {"threshold": args.threshold, "results": results,
+             "failures": total_fail, "known": total_known,
+             "pairs": total_pairs,
+             "allow": ({"file": args.allow,
+                        "entries": len(allow),
+                        "stale": [dict(e[0], ratio=e[1]) for e in stale],
+                        "unknown": [dict(e, reason=w) for e, w in unknown],
+                        "unexercised": unexercised}
+                       if args.allow else None)},
+            indent=2, default=str))
+        return 1 if (total_fail or allow_bad) else 0
+
+    print("contrast-check  threshold %.2f:1  surfaces %s%s"
+          % (args.threshold, "/".join(bgs),
+             " + --line composited" if args.line_surfaces else ""))
+    print("=" * 78)
+    for r in results:
+        head = "%-10s %-5s" % (r["theme"], r["mode"])
+        if r.get("skipped"):
+            print("%s  -- skipped (darkOnly)" % head)
+            continue
+        nknown = len(r.get("known") or [])
+        if r["fails"]:
+            print("%s  %2d/%d FAIL%s"
+                  % (head, len(r["fails"]), r["pairs"],
+                     "  (+%d known)" % nknown if nknown else ""))
+        elif nknown:
+            print("%s  %d pairs  PASS  (%d known, see below)"
+                  % (head, r["pairs"], nknown))
+        else:
+            print("%s  %d pairs  PASS" % (head, r["pairs"]))
+        if r.get("all"):
+            for fg, fgv, bg, bgv, ratio, comp in r["all"]:
+                print("      %-10s %-22s on %-14s %-9s %6.2f  %s%s"
+                      % (fg, fgv, bg, bgv, ratio,
+                         "ok " if ratio + 5e-9 >= args.threshold else "FAIL",
+                         "  [composited]" if comp else ""))
+        else:
+            for f in r["fails"]:
+                extra = ""
+                if f["fg_alpha"]:
+                    extra = "  [fg composited -> %s]" % f["fg_rgb"]
+                elif f["composited"]:
+                    extra = "  [bg composited]"
+                print("      %-10s %-22s on %-14s %-9s %6.2f%s"
+                      % (f["fg"], f["fg_value"], f["bg"], f["bg_rgb"],
+                         f["ratio"], extra))
+                if "suggest" in f:
+                    s = f["suggest"]
+                    print("        -> suggest %s (worst %.2f across all surfaces)"
+                          % (s["value"], s["worst"]) if s else
+                          "        -> no passing value on this ramp")
+    if total_known:
+        print("-" * 78)
+        print("known failures -- %s -- not counted against the gate" % args.allow)
+        for r in results:
+            for f in (r.get("known") or []):
+                print("      %-9s %-5s %-10s %-22s on %-14s %-9s %6.2f"
+                      % (r["theme"], r["mode"], f["fg"], f["fg_value"],
+                         f["bg"], f["bg_rgb"], f["ratio"]))
+                if "suggest" in f:
+                    s = f["suggest"]
+                    print("        -> suggest %s (worst %.2f across all surfaces)"
+                          % (s["value"], s["worst"]) if s else
+                          "        -> no passing value on this ramp")
+
+    if unexercised:
+        print("-" * 78)
+        print("%d allowlist entr%s not exercised by this run's filters "
+              "(neither waived nor audited):"
+              % (len(unexercised), "y" if len(unexercised) == 1 else "ies"))
+        for e in unexercised:
+            print("      %s:%d: %s" % (e["file"], e["line"], e["text"]))
+
+    if unknown:
+        print("-" * 78)
+        print("ERROR: %d allowlist entr%s name a pair that does not exist:"
+              % (len(unknown), "y" if len(unknown) == 1 else "ies"))
+        for e, why in unknown:
+            print("      %s:%d: %s" % (e["file"], e["line"], e["text"]))
+            print("        -> %s" % why)
+
+    if stale:
+        print("-" * 78)
+        print("ERROR: %d allowlist entr%s no longer failing at %.2f:1 -- "
+              "DELETE THE LINE:" % (len(stale), "y" if len(stale) == 1 else "ies",
+                                    stale_bar))
+        for e, r in stale:
+            print("      %s:%d: %s" % (e["file"], e["line"], e["text"]))
+            print("        -> now %.2f:1; this pair passes, so delete this "
+                  "line from %s" % (r, e["file"]))
+
+    print("=" * 78)
+    tail = ""
+    if args.allow:
+        tail = ", %d known (%d entr%s in %s)" % (
+            total_known, len(allow), "y" if len(allow) == 1 else "ies",
+            args.allow)
+    print("%d pair(s) checked, %d failing%s" % (total_pairs, total_fail, tail))
+    if allow_bad:
+        print("allowlist is out of date: %d stale, %d bogus"
+              % (len(stale), len(unknown)))
+    return 1 if (total_fail or allow_bad) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

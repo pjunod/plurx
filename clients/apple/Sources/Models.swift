@@ -314,26 +314,22 @@ struct SubtitleTrack: Codable, Identifiable {
     /// rendition test: `mov_text` and styled ASS/SSA are text and still cannot
     /// be published as WebVTT renditions. Read `isNativeHLS`, never this.
     var text: Bool
-    /// The server's own `is_native_text_subtitle` (`subrip|srt|webvtt|vtt`) —
-    /// the exact predicate that decides which tracks reach the HLS master and
-    /// which explicit picks are answered with 400. Optional because an older
-    /// server does not send it; absent falls back to the local codec check.
-    /// Defaulted and last so no existing construction site has to change.
-    var native: Bool? = nil
+    /// The server's own answer to "can this become a native HLS WebVTT
+    /// rendition?", computed by the same classifier the HLS master and the
+    /// create-time rejection use. Absent from servers that predate the field.
+    var native: Bool?
 
-    /// Whether this track can be exposed losslessly enough as an HLS WebVTT
-    /// rendition. Styled ASS/SSA and MP4 `mov_text` are text but not native, so
-    /// they remain burns — asking the server for them as renditions gets a 400
-    /// (`hls.rs` rejects a non-native `subtitle` on create, and the master
-    /// playlist never advertises one).
+    /// Formats the server can expose losslessly enough as an HLS WebVTT
+    /// rendition. Styled ASS/SSA remains a burn even though it contains text.
     ///
-    /// The server's answer wins when it sends one, so this client cannot drift
-    /// from the codec list the segmenter actually enforces. The literal below
-    /// is the fallback for a server that predates the `native` field, and
-    /// mirrors `plurx_core::tracks::is_native_text_subtitle`.
+    /// The server answers this directly now, so ask it rather than re-deriving
+    /// it: one classifier means a client cannot request a session the server
+    /// will refuse, and the natural recovery from that refusal is the burn
+    /// this whole arc exists to avoid. The codec list survives only as the
+    /// fallback for a server that omits the field, and it is deliberately the
+    /// same list, so such a server degrades exactly as it does today.
     var isNativeHLS: Bool {
-        if let native { return native }
-        return ["subrip", "srt", "webvtt", "vtt"].contains(codec.lowercased())
+        native ?? ["subrip", "srt", "webvtt", "vtt"].contains(codec.lowercased())
     }
 }
 

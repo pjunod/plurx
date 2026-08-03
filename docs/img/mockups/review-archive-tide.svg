@@ -1,0 +1,159 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1000"
+     viewBox="0 0 1600 1000" role="img"
+     aria-label="Archive chronological mixed-media layout in the Tide dark theme">
+  <defs>
+    <linearGradient id="lake" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#173d47"/>
+      <stop offset="0.52" stop-color="#2f7771"/>
+      <stop offset="1" stop-color="#d6b56d"/>
+    </linearGradient>
+    <linearGradient id="road" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#315c62"/>
+      <stop offset="1" stop-color="#102422"/>
+    </linearGradient>
+    <linearGradient id="poster" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1f4a42"/>
+      <stop offset="0.7" stop-color="#142a25"/>
+      <stop offset="1" stop-color="#8a631a"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="10" stdDeviation="14"
+                    flood-color="#000" flood-opacity="0.32"/>
+    </filter>
+    <style>
+      .ui{font-family:Inter,system-ui,-apple-system,"Segoe UI",sans-serif}
+      .mono{font-family:"SFMono-Regular",Menlo,Consolas,monospace}
+      .text{fill:#e4f2ed}.muted{fill:#93aaa2}.accent{fill:#73d6b1}
+      .small{font-size:13px}.meta{font-size:14px}.body{font-size:16px}
+      .label{font-size:12px;font-weight:700;letter-spacing:1.8px}
+      .title{font-size:34px;font-weight:730;letter-spacing:-0.6px}
+      .group{font-size:22px;font-weight:700}
+    </style>
+  </defs>
+
+  <rect width="1600" height="1000" fill="#071412"/>
+  <rect width="1600" height="76" fill="#0d1e1b"/>
+  <line x1="0" y1="76" x2="1600" y2="76" stroke="#2a4841"/>
+
+  <g class="ui">
+    <text x="32" y="47" class="text" font-size="23" font-weight="760">cinemarr</text>
+    <rect x="149" y="25" width="78" height="27" rx="6" fill="#142a25"
+          stroke="#2a4841"/>
+    <text x="162" y="43" class="mono accent small">ARCHIVE</text>
+
+    <text x="302" y="47" class="text body">Home</text>
+    <text x="376" y="47" class="muted body">Movies</text>
+    <text x="457" y="47" class="muted body">Shows</text>
+    <text x="530" y="47" class="muted body">Home video</text>
+    <text x="641" y="47" class="muted body">Photos</text>
+
+    <rect x="1130" y="18" width="300" height="41" rx="8" fill="#071412"
+          stroke="#2a4841"/>
+    <text x="1152" y="44" class="muted body">Search your archive</text>
+    <circle cx="1495" cy="38" r="19" fill="#73d6b1"/>
+    <text x="1488" y="44" fill="#052019" font-size="15" font-weight="750">P</text>
+    <text x="1524" y="44" class="text body">paul</text>
+
+    <!-- header -->
+    <text x="88" y="138" class="accent label">YOUR LIBRARY, BY WHEN IT HAPPENED</text>
+    <text x="88" y="183" class="title text">August 2026</text>
+    <text x="88" y="215" class="muted body">Home video and photos use captured time. Catalog titles use added time.</text>
+
+    <rect x="1120" y="134" width="190" height="42" rx="8" fill="#142a25"
+          stroke="#2a4841"/>
+    <rect x="1124" y="138" width="91" height="34" rx="6" fill="#73d6b1"/>
+    <text x="1140" y="160" fill="#052019" class="small" font-weight="750">Captured</text>
+    <text x="1236" y="160" class="muted small">Added</text>
+    <rect x="1322" y="134" width="190" height="42" rx="8" fill="#142a25"
+          stroke="#2a4841"/>
+    <text x="1343" y="160" class="text small">Month</text>
+    <text x="1404" y="160" class="muted small">Year</text>
+    <text x="1466" y="160" class="muted small">All</text>
+
+    <!-- vertical date rail -->
+    <line x1="173" y1="282" x2="173" y2="930" stroke="#2a4841" stroke-width="2"/>
+    <circle cx="173" cy="292" r="8" fill="#73d6b1"/>
+    <circle cx="173" cy="638" r="7" fill="#071412" stroke="#73d6b1" stroke-width="2"/>
+    <circle cx="173" cy="918" r="7" fill="#071412" stroke="#2a4841" stroke-width="2"/>
+
+    <text x="88" y="288" class="accent label">SAT 02</text>
+    <text x="88" y="310" class="muted small">today</text>
+    <text x="88" y="634" class="text label">MON 28</text>
+    <text x="88" y="656" class="muted small">5 days ago</text>
+    <text x="88" y="914" class="text label">DATE ?</text>
+    <text x="88" y="936" class="muted small">unknown</text>
+
+    <!-- first date group -->
+    <text x="212" y="286" class="group text">Saturday, August 2</text>
+    <text x="212" y="311" class="muted meta">Lake Weekend · 16 photos · 3 videos</text>
+
+    <g filter="url(#shadow)">
+      <rect x="212" y="333" width="590" height="264" rx="12" fill="url(#lake)"/>
+    </g>
+    <circle cx="507" cy="451" r="38" fill="#071412" opacity="0.78"/>
+    <path d="M497 430 L497 472 L527 451 Z" fill="#73d6b1"/>
+    <rect x="230" y="350" width="104" height="28" rx="6" fill="#071412" opacity="0.72"/>
+    <text x="245" y="369" class="mono text small">VIDEO · 3:42</text>
+    <text x="237" y="555" fill="#fff" font-size="24" font-weight="720">Dock at sunset</text>
+    <text x="237" y="580" fill="#fff" opacity="0.8" class="small">captured 7:18 PM · iPhone · 4K</text>
+
+    <!-- photo mosaic -->
+    <rect x="824" y="333" width="330" height="160" rx="12" fill="#204b50"/>
+    <path d="M824 470 L930 380 L1016 445 L1085 397 L1154 470 L1154 493 L824 493 Z"
+          fill="#73d6b1" opacity="0.42"/>
+    <circle cx="1088" cy="372" r="28" fill="#d6b56d" opacity="0.85"/>
+    <rect x="1174" y="333" width="338" height="160" rx="12" fill="#153431"/>
+    <path d="M1174 493 L1248 408 L1324 462 L1418 374 L1512 454 L1512 493 Z"
+          fill="#315f57"/>
+    <rect x="824" y="511" width="215" height="86" rx="10" fill="#1e5148"/>
+    <rect x="1058" y="511" width="215" height="86" rx="10" fill="#4c5f42"/>
+    <rect x="1292" y="511" width="220" height="86" rx="10" fill="#6f5830"/>
+    <rect x="1398" y="543" width="96" height="37" rx="8" fill="#071412" opacity="0.76"/>
+    <text x="1419" y="567" class="text" font-size="14" font-weight="700">+12 photos</text>
+
+    <!-- second date group -->
+    <text x="212" y="633" class="group text">Monday, July 28</text>
+    <text x="212" y="658" class="muted meta">Recently added · Movies</text>
+
+    <rect x="212" y="680" width="250" height="220" rx="12" fill="url(#poster)"
+          stroke="#2a4841"/>
+    <text x="234" y="711" class="mono" fill="#e5c875" font-size="12"
+          letter-spacing="1.5">2025 · DRAMA</text>
+    <path d="M212 900 L212 790 L380 680 L462 680 L462 900 Z" fill="#0d1e1b" opacity="0.5"/>
+    <text x="234" y="853" class="text" font-size="29" font-weight="760">Grain</text>
+    <text x="234" y="881" class="muted small">added 2h ago · unwatched</text>
+
+    <rect x="482" y="680" width="250" height="220" rx="12" fill="#102927"
+          stroke="#2a4841"/>
+    <circle cx="607" cy="786" r="72" fill="#73d6b1" opacity="0.11"/>
+    <circle cx="607" cy="786" r="42" fill="#73d6b1" opacity="0.13"/>
+    <text x="504" y="711" class="mono muted" font-size="12" letter-spacing="1.5">2019 · MYSTERY</text>
+    <text x="504" y="853" class="text" font-size="25" font-weight="720">The Silent Reel</text>
+    <text x="504" y="881" class="muted small">added yesterday · watched</text>
+
+    <rect x="752" y="680" width="250" height="220" rx="12" fill="#162c29"
+          stroke="#2a4841"/>
+    <rect x="845" y="680" width="62" height="220" fill="#d6b56d"/>
+    <text x="774" y="711" class="mono muted" font-size="12" letter-spacing="1.5">2022 · THRILLER</text>
+    <text x="774" y="853" fill="#fff" font-size="25" font-weight="720">Cold Copy</text>
+    <text x="774" y="881" class="muted small">added Monday · 4K</text>
+
+    <!-- context card -->
+    <rect x="1032" y="680" width="480" height="220" rx="12" fill="#0d1e1b"
+          stroke="#2a4841"/>
+    <text x="1060" y="716" class="accent label">WHY THIS DATE</text>
+    <text x="1060" y="753" class="text" font-size="20" font-weight="680">Three catalog titles arrived together.</text>
+    <text x="1060" y="783" class="muted body">Archive groups by added time here because movies</text>
+    <text x="1060" y="808" class="muted body">have no captured date. The control above says so.</text>
+    <rect x="1060" y="840" width="145" height="40" rx="7" fill="#73d6b1"/>
+    <text x="1084" y="866" fill="#052019" font-size="14" font-weight="750">Browse Movies</text>
+    <rect x="1218" y="840" width="142" height="40" rx="7" fill="#142a25"
+          stroke="#2a4841"/>
+    <text x="1242" y="866" class="text" font-size="14" font-weight="650">Open activity</text>
+
+    <!-- footer -->
+    <line x1="212" y1="949" x2="1512" y2="949" stroke="#2a4841"/>
+    <text x="212" y="976" class="mono muted small">captured / added stays explicit · missing dates never pretend to be recent</text>
+    <text x="1512" y="976" class="mono accent small" text-anchor="end">TIDE · DARK</text>
+  </g>
+</svg>

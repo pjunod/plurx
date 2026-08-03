@@ -4,6 +4,15 @@ The Android client is the native plurx **viewer** for phones, foldables,
 tablets, Android TV, and Google TV. This page records what “web parity” means
 for that viewer and keeps server administration out of the comparison.
 
+> Status (2026-08-02): native text subtitles landed — Android takes the same
+> WebVTT renditions the Apple client does, selects them in place on a
+> direct-played file, and opens a video-recipe-preserving session on a remux
+> or transcode. Burn is now reserved for bitmap and styled tracks. **Not yet
+> verified on hardware:** the §5.4 acceptance cases (no video encoder on a 4K
+> HDR remux, PGS burn at 2160, a forced track auto-shown on a remux, no new
+> session when toggling two text tracks) still need a device pass. The rest of
+> the remediation handoff is
+> [CLIENTS-REMEDIATION-PLAN.md](CLIENTS-REMEDIATION-PLAN.md) §5.
 > Status: viewer parity exists and both the playback-negotiation arc
 > ([CLIENTS-REMEDIATION-PLAN.md](CLIENTS-REMEDIATION-PLAN.md) §4.2–§4.5,
 > §5.1–§5.6) and the P2 pass (§7.1–§7.3, §7.5, §7.6) have landed: Dolby Vision
