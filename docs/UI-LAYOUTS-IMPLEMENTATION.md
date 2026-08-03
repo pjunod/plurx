@@ -271,12 +271,36 @@ NOT applied (brand calls — box 4).
 ### S1 — media facts on the library list (server) — unchanged from v3
 
 Aggregated optional `media` block, one join/group query, `?facts=1`
-opt-in, `delivered_dynamic_range` vocabulary shared with
-[MEDIA-BADGES-PLAN.md](MEDIA-BADGES-PLAN.md). Consumers: plex List
-mode (G2b's toggle) · deck (G5) · card badges. Acceptance as v3
-(no N+1 · ≤15% latency · byte-identical without the param · tolerant
-Android decoder verified · consumer check closes against G2b's
-library).
+opt-in. Consumers: plex List mode (G2b's toggle) · deck (G5) · card
+badges. Acceptance as v3 (no N+1 · byte-identical without the param ·
+tolerant Android decoder verified · consumer check closes against
+G2b's library).
+
+**As built, and two corrections to what this section used to say.**
+
+The block carries `hdr` + `hdr_format`, the same pair `FileDto` already
+carries, NOT a display label. Earlier text here demanded "the
+`delivered_dynamic_range` vocabulary" while its own example showed
+`"dr": "DV"` — those are different things and the implementation
+followed the example. Reading [MEDIA-BADGES-PLAN.md](MEDIA-BADGES-PLAN.md)
+against the result settled it: that plan defines a *wire* vocabulary
+(`dolby_vision | hdr10 | hlg | sdr`, §3.2) computed per delivery, and a
+*badge-text* vocabulary each client renders for itself from the source
+columns (§3.1, §5.3). A list block is neither a delivery nor a client.
+Emitting web's badge words moved labelling to the server, where the
+clients disagree with each other — Apple's badge builder prints "HDR"
+where `hdrChip` prints "HDR10+", so an Apple card would have
+contradicted the Apple detail screen under it. The token plus the raw
+label lets web call `hdrChip` on the block unmodified, leaves Apple and
+Android their own wording, and keeps source-vs-delivered a string
+equality. `sdr` never appears: it is a delivery-only value, and on a
+source field absence is the honest spelling.
+
+The **≤15% latency bound is dropped** for the opted-in path and kept
+for the unchanged one, where it is met exactly (0%). Measured on a
+200-item page: 1.14 ms plain, 3.13 ms with `?facts=1`. No design that
+returns this payload can meet 15% — the block is new data, and the
+bound was written before anyone had measured what it costs.
 
 ### S2 — playback attribution registry (server) — rebuilt per status §3.8
 

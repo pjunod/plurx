@@ -233,7 +233,14 @@
     font-size:10px;font-weight:700;line-height:1;border:0;border-radius:4px;background:transparent}
   .azbar button{color:var(--muted);cursor:pointer}
   .azbar button:hover{color:var(--text);background:var(--panel2)}
-  .azbar button.active{color:#fff;background:var(--accent);box-shadow:0 0 8px color-mix(in srgb,var(--accent) 55%,transparent)}
+  /* --btn-ink, not #fff: this is ink on an accent fill, which is exactly the
+     pair --btn-ink exists to name, and a pale accent (Silver's near-white, the
+     light themes' golds) turns a hardcoded white into white-on-white. It was
+     briefly patched layout-locally instead, which is how one application
+     quietly becomes two — the shared rule keeps the defect and each layout
+     grows its own correction. contrast-check audits the THEMES table and can
+     never see a literal in a CSS rule, so this class of bug has no gate. */
+  .azbar button.active{color:var(--btn-ink);background:var(--accent);box-shadow:0 0 8px color-mix(in srgb,var(--accent) 55%,transparent)}
   .azbar .off{color:var(--line)}
   @media(max-width:520px){ .azbar{gap:0;padding:5px 2px} .azbar button,.azbar .off{height:13px;width:15px} }
   .badge{position:absolute;top:8px;right:8px;width:24px;height:24px;display:grid;place-items:center;
@@ -1005,19 +1012,16 @@
      paint, which is the whole thesis of the layout split: one card component,
      five shells. */
 
-  /* Unwatched corner flag. Derived from the markup card() already emits —
-     no ✓ badge and no progress bar means nothing has been played — because
-     the alternative was a second card function. :has() is a hard requirement
-     for the rule, hence the @supports guard: on a browser without it the flag
-     simply does not appear and nothing else breaks.
-     Known limitation: a home-video FOLDER card carries no watch state either,
-     so it gets flagged too. Fixing that needs a kind class on .poster from
-     card(), which is shipped code and outside this layout's remit. */
-  @supports selector(:has(*)){
-    [data-layout=plex] .poster:not(:has(.badge)):not(:has(.prog)):not(:has(.soonwhen)):not(:has(.art.sq)) .artbox::after{
-      content:"";position:absolute;top:0;right:0;width:26px;height:26px;pointer-events:none;
-      background:var(--accent);clip-path:polygon(100% 0, 100% 100%, 0 0)}
-  }
+  /* Unwatched corner flag, from the class card() puts on the card rather than
+     from the absence of its children. The first version asked
+     :not(:has(.badge)):not(:has(.prog))… — which needed an @supports guard (no
+     flag at all on a browser without :has()) and was wrong anyway, because a
+     home-video FOLDER has no watch state either and got flagged as unwatched.
+     Asking `.unw` costs one class in shared code and answers correctly on
+     every browser. */
+  [data-layout=plex] .poster.unw .artbox::after{
+    content:"";position:absolute;top:0;right:0;width:26px;height:26px;pointer-events:none;
+    background:var(--accent);clip-path:polygon(100% 0, 100% 100%, 0 0)}
   /* Hover play circle. Decorative: the whole card has always been the click
      target, so the circle announces the action rather than owning it. It is
      revealed by :focus-visible as well as :hover so a keyboard user gets the
@@ -1264,7 +1268,7 @@
        repeated verbatim rather than simplified: the rule that paints the flag
        carries four class selectors of specificity, and a shorter selector here
        loses to it and leaves the triangle in the theme accent. */
-    [data-layout=plex] .poster:not(:has(.badge)):not(:has(.prog)):not(:has(.soonwhen)):not(:has(.art.sq)) .artbox::after{
+    [data-layout=plex] .poster.unw .artbox::after{
       background:Highlight;forced-color-adjust:none}
     /* Progress is a 5px bar whose fill and track both collapse to the same
        system colour otherwise — i.e. "how far in am I" disappears entirely. */
@@ -1382,7 +1386,6 @@
   /* The active letter ships as white-on-accent, which is a guess about the
      accent that is wrong on the light themes whose accent is pale. --btn-ink
      is the token that means "text on an accent fill" and every theme sets it. */
-  [data-layout=plex] .azbar button.active{color:var(--btn-ink)}
 
   /* ---- detail: the backdrop hero ---------------------------------------- */
   /* The backdrop fills the hero rather than the shipped fixed 360px. Both were
@@ -2363,7 +2366,13 @@ function card(it, watchCtx){
   const pct = progressPct(it.watch);
   const watched = it.watch&&it.watch.watched? `<span class="badge">✓</span>`:"";
   const prog = pct>0&&pct<100? `<div class="prog"><i style="width:${pct}%"></i></div>`:"";
-  return `<div class="poster" onclick="location.hash='#/item/${it.id}'">
+  // Watch state and item kind as classes, so a layout that marks unwatched
+  // titles can ask a question instead of inferring the answer from which
+  // children happen to be absent. The :not(:has(.badge)):not(:has(.prog))…
+  // chain this replaces was both fragile and wrong: a folder card has no watch
+  // state either, so it got flagged as unwatched.
+  const cls = `poster k-${esc(it.kind||"item")}${(!watched&&!prog)?" unw":""}`;
+  return `<div class="${cls}" onclick="location.hash='#/item/${it.id}'">
     <div class="artbox">${img}${dur}${watched}</div><div class="meta"><div class="t">${esc(main)}</div><div class="s"><span class="stxt">${sub}</span>${resb}</div>${watchLine(it,watchCtx)}</div>${prog}</div>`;
 }
 // Folder and photo cards. A folder opens its page; a photo opens the lightbox
@@ -2373,11 +2382,11 @@ function homeCard(it){
   if(it.kind==='folder'){
     const n=it.child_count;
     const sub=n==null? "Folder" : `${n} item${n===1?'':'s'}`;
-    return `<div class="poster" onclick="location.hash='#/item/${it.id}'">
+    return `<div class="poster k-folder" onclick="location.hash='#/item/${it.id}'">
       <div class="artbox">${artHtml(it)}</div>
       <div class="meta"><div class="t">${esc(it.title)}</div><div class="s"><span class="stxt">${esc(sub)}</span></div></div></div>`;
   }
-  return `<div class="poster" onclick="openLightbox(${it.id})">
+  return `<div class="poster k-photo" onclick="openLightbox(${it.id})">
     <div class="artbox">${artHtml(it,'sq')}</div>
     <div class="meta"><div class="t">${esc(it.title)}</div><div class="s"><span class="stxt">${esc(fmtDate(it.recorded_at))}</span></div></div></div>`;
 }
@@ -2806,12 +2815,27 @@ function alphaRailHtml(items, sort){
     present.has(L)?`<button data-l="${L}" onclick="alphaJump('${L}')" title="Jump to ${L==='#'?'0–9':L}">${L}</button>`
                  :`<span class="off">${L}</span>`).join("")+`</div>`;
 }
-function tagAlpha(items){
-  if(LIB_SORT!=="title") return;
+function tagAlpha(items, sort){
+  // The effective sort, for the same reason alphaRailHtml takes it: LIB_SORT is
+  // "" until the user touches the select, while sortFor() has already resolved
+  // that to "title". Reading the global here after fixing the rail's own test
+  // left the rail rendered and inert — every letter drawn, no card tagged,
+  // alphaJump finding nothing. One feature, two call sites, one of them fixed.
+  if((sort!==undefined?sort:LIB_SORT)!=="title") return;
   const g=document.querySelector("#main .grid"); if(!g) return;
   const cards=g.children;                                    // grid renders items[i] 1:1
   for(let i=0;i<cards.length&&i<items.length;i++) cards[i].dataset.alpha=alphaBucket(items[i]);
   updateAzActive();                                         // set the initial highlight
+}
+// Where the page's fixed chrome stops and content begins. The layout owns this
+// number: classic has a sticky top header, plex has a sidebar and no top bar at
+// all, and a hardcoded `header.top` lookup silently measures nothing under plex
+// — the A–Z rail then highlights a letter that is already scrolled past.
+function stickyFloor(){
+  const L=LAYOUTS[layoutId()];
+  if(L&&L.stickyFloor) return L.stickyFloor();
+  const h=document.querySelector("header.top");
+  return h?h.getBoundingClientRect().bottom:56;
 }
 function alphaJump(L){ const t=document.querySelector('#main .grid [data-alpha="'+L+'"]'); if(t) t.scrollIntoView({behavior:"smooth",block:"start"}); }
 // Scroll-spy: highlight the letter whose posters sit at the top of the viewport
@@ -2819,8 +2843,7 @@ function alphaJump(L){ const t=document.querySelector('#main .grid [data-alpha="
 // rail is on screen (no-op when none), so it survives view swaps replacing #main.
 function azCurrentBucket(){
   const g=document.querySelector("#main .grid"); if(!g) return null;
-  const h=document.querySelector("header.top");
-  const line=(h?h.getBoundingClientRect().bottom:56)+6;     // just under the sticky header
+  const line=stickyFloor()+6;                              // just under the sticky header
   const cards=g.children;
   for(let i=0;i<cards.length;i++){ if(cards[i].getBoundingClientRect().bottom>line) return cards[i].dataset.alpha||null; }
   return null;
@@ -3006,7 +3029,7 @@ async function libraryView(o){
     if(rail) rail.innerHTML=alphaRailHtml(page, sort);
     const count=document.getElementById("libcount");
     if(count) count.innerHTML=layoutRegion("library","count",m);
-    tagAlpha(page);
+    tagAlpha(page, sort);
   };
 
   const complete=await eachItemPage(o.libIds, sort, gen, (batch, t)=>{
@@ -8036,6 +8059,11 @@ async function render(){
     else if(h==="#/activity") await viewActivity();
     else if(h==="#/admin"||h==="#/settings") await viewSettings();
     else await viewHome();
+    // Converted routes restore at the moment their content lands; this catches
+    // the ones that do not, and — because it is consume-once — guarantees a
+    // pending offset never survives the route that was on screen when it was
+    // armed. Without it, switching layout on Settings scrolled the NEXT page.
+    restoreScroll();
   }catch(e){
     if(e.message!=="unauthorized"){ const m=document.getElementById("main"); if(m) m.innerHTML=`<div class="empty">${esc(e.message)}</div>`; else toast(e.message); }
   }

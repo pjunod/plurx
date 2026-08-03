@@ -5309,7 +5309,7 @@ mod tests {
         // reading as worse than it is.
         let block = concat!(
             r#""media":{"files":2,"bytes":75800000000,"video":"HEVC","height":2160,"#,
-            r#""dr":"DV","audio":"TrueHD 7.1","container":"MKV"}"#,
+            r#""hdr":"dolby_vision","hdr_format":"Dolby Vision · Profile 7 (HDR10-compatible)","audio":"TrueHD 7.1","container":"MKV"}"#,
         );
         assert!(body.contains(block), "no aggregate block in {body}");
         assert_eq!(
@@ -5433,7 +5433,7 @@ mod tests {
                 "files": 1, "bytes": 120_000_000, "video": "H.264",
                 "height": 1080, "audio": "AAC 2.0", "container": "MP4"
             }),
-            "an SDR home video should carry no dr key at all"
+            "an SDR home video should carry no hdr key at all"
         );
     }
 }

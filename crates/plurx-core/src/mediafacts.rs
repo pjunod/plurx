@@ -64,10 +64,17 @@ pub struct MediaFacts {
     /// Best file's height in pixels — equal to the list's `resolution` by
     /// construction, since both are the maximum height over the item's files.
     pub height: Option<i64>,
-    /// Best file's **source** dynamic range: "DV" | "HDR10+" | "HDR10" |
-    /// "HLG", absent for SDR. See [`dynamic_range`] — this is what is stored,
-    /// never a promise about what a given client will be sent.
-    pub dr: Option<String>,
+    /// Best file's coarse HDR type, spelled exactly as `MediaFile.hdr` and
+    /// `FileDto.hdr` spell it: `dolby_vision` | `hdr10` | `hlg`, absent for
+    /// SDR. A token, not a label — see the module note on why this block
+    /// stopped rendering words.
+    pub hdr: Option<String>,
+    /// Best file's rich HDR label as `detect_hdr_format` wrote it ("HDR10+",
+    /// "Dolby Vision · Profile 7 (HDR10-compatible)"), verbatim, absent when
+    /// unprobed or SDR. Carried alongside the token for the same reason
+    /// `FileDto` carries both: the token is what code compares, the label is
+    /// what a client may choose to print.
+    pub hdr_format: Option<String>,
     /// Best file's headline audio track: "TrueHD 7.1", "DTS 5.1", "AAC 2.0".
     pub audio: Option<String>,
     /// Best file's container, upper-cased: "MKV", "MP4".
@@ -81,7 +88,13 @@ impl From<FactsRow> for MediaFacts {
             bytes: row.bytes,
             video: video_codec_label(row.video_codec.as_deref()),
             height: row.height,
-            dr: dynamic_range(row.hdr.as_deref(), row.hdr_format.as_deref()),
+            hdr: hdr_token(row.hdr.as_deref(), row.hdr_format.as_deref()),
+            hdr_format: row
+                .hdr_format
+                .as_deref()
+                .map(str::trim)
+                .filter(|f| !f.is_empty())
+                .map(str::to_owned),
             audio: audio_label(&row.audio),
             container: container_label(row.container.as_deref()),
         }
@@ -107,27 +120,36 @@ fn video_codec_label(codec: Option<&str>) -> Option<String> {
     )
 }
 
-/// The dynamic range **the file was mastered in**, as the terse token
-/// `hdrChip` already prints.
+/// The dynamic range **the file was mastered in**, as the coarse token
+/// `detect_hdr` writes and every other DTO in this codebase carries.
 ///
 /// This is a source fact, not a delivery one. plurx routinely delivers a
 /// Dolby Vision source as its HDR10 base layer (an ffmpeg without `dovi_rpu`
 /// cannot even strip the configuration — see `plurxd/src/ffmpeg.rs`), and a
 /// client with no HDR display gets tone-mapped SDR. A list badge cannot know
 /// any of that: it is drawn before a client, a display or a decision exists.
-/// So `dr` says what is on disk and the play path keeps owning what is sent.
+/// So this says what is on disk and the play path keeps owning what is sent.
+/// `delivered_dynamic_range` (MEDIA-BADGES-PLAN.md §3.2) is the other half of
+/// that pair, and it lives on `/decision` and `/hls/sessions` where a decision
+/// actually exists — never here.
 ///
-/// The Dolby Vision profile suffix (`hdrChip`'s "DV P7") is deliberately left
-/// off: the profile is a per-file playability detail that belongs next to the
-/// file it describes, and at page scale it is noise.
+/// **This used to return a display label** ("DV", "HDR10+") because it was
+/// ported from the web app's `hdrChip`. That was wrong, and subtly: it moved
+/// labelling from the clients to the server, and the clients do not agree
+/// about wording. Apple's badge builder prints "HDR" where `hdrChip` prints
+/// "HDR10+", so an Apple grid card fed by this block would have contradicted
+/// the Apple detail screen beneath it — the two-vocabularies drift this
+/// module exists to prevent, introduced by the module preventing it. Emitting
+/// the token plus the raw label instead means web can call `hdrChip` on this
+/// block unmodified, Apple and Android keep their own wording, and a
+/// source-vs-delivered comparison is string equality, as §3.2 intends.
 ///
-/// **Multiple files**: there is no aggregate label here and this function does
+/// **Multiple files**: there is no aggregate token here and this function does
 /// not invent one. An item with a DV version and an HDR10 version reports the
 /// dynamic range of its best file, because the whole block describes that one
 /// file (see [`MediaFacts`]). Naming the union — "DV+HDR10", "mixed" — would
-/// be a second HDR vocabulary, which is exactly what the badge contract
-/// forbids.
-fn dynamic_range(hdr: Option<&str>, hdr_format: Option<&str>) -> Option<String> {
+/// be a value outside the closed set §3.2 defines.
+fn hdr_token(hdr: Option<&str>, hdr_format: Option<&str>) -> Option<String> {
     let coarse = hdr.map(str::trim).filter(|h| !h.is_empty());
     let rich = hdr_format.map(str::trim).filter(|f| !f.is_empty());
     // Dolby Vision from either column: the coarse one is what the decision
@@ -137,16 +159,21 @@ fn dynamic_range(hdr: Option<&str>, hdr_format: Option<&str>) -> Option<String> 
             .map(|f| f.to_lowercase().contains("dolby"))
             .unwrap_or(false)
     {
-        return Some("DV".to_owned());
+        return Some("dolby_vision".to_owned());
     }
-    // HDR10+ / HDR10 / HLG are already badge-length in the rich column.
-    if let Some(rich) = rich {
-        return Some(rich.to_owned());
+    if let Some(c) = coarse {
+        return Some(c.to_lowercase());
     }
-    match coarse? {
-        "hdr10" => Some("HDR10".to_owned()),
-        "hlg" => Some("HLG".to_owned()),
-        other => Some(other.to_uppercase()),
+    // Coarse column missing — a file probed before the v4 migration backfilled
+    // it. Recover the token from the rich label rather than dropping the badge;
+    // detect_hdr_format's non-DV range is exactly these two.
+    let r = rich?.to_lowercase();
+    if r.starts_with("hdr10") {
+        Some("hdr10".to_owned())
+    } else if r.starts_with("hlg") {
+        Some("hlg".to_owned())
+    } else {
+        None
     }
 }
 
@@ -274,39 +301,64 @@ mod tests {
         assert_eq!(video_codec_label(None), None);
     }
 
-    /// The whole point of the `dr` field: one vocabulary, the client's. A DV
-    /// file is "DV" whichever column says so, and the profile never leaks in.
+    /// One vocabulary, and it is the wire's, not any client's. A DV file is
+    /// `dolby_vision` whichever column says so; HDR10+ collapses to the same
+    /// `hdr10` token `detect_hdr` writes, and the "+" survives in the label
+    /// beside it rather than in a token nothing else in the codebase speaks.
     #[test]
-    fn dynamic_range_speaks_only_the_badge_vocabulary() {
+    fn hdr_token_speaks_the_wire_vocabulary_not_a_badge_one() {
         assert_eq!(
-            dynamic_range(
+            hdr_token(
                 Some("dolby_vision"),
                 Some("Dolby Vision · Profile 7 (HDR10-compatible)")
             )
             .as_deref(),
-            Some("DV")
+            Some("dolby_vision")
         );
         // Coarse column missing (a file probed before v4's backfill ran).
         assert_eq!(
-            dynamic_range(None, Some("Dolby Vision")).as_deref(),
-            Some("DV")
+            hdr_token(None, Some("Dolby Vision")).as_deref(),
+            Some("dolby_vision")
         );
         // Rich column missing (a file probed before v4 existed at all).
         assert_eq!(
-            dynamic_range(Some("dolby_vision"), None).as_deref(),
-            Some("DV")
+            hdr_token(Some("dolby_vision"), None).as_deref(),
+            Some("dolby_vision")
+        );
+        // HDR10+ is not a token. detect_hdr never writes one, so neither do we.
+        assert_eq!(
+            hdr_token(Some("hdr10"), Some("HDR10+")).as_deref(),
+            Some("hdr10")
         );
         assert_eq!(
-            dynamic_range(Some("hdr10"), Some("HDR10+")).as_deref(),
-            Some("HDR10+")
+            hdr_token(Some("hdr10"), Some("HDR10")).as_deref(),
+            Some("hdr10")
         );
-        assert_eq!(
-            dynamic_range(Some("hdr10"), Some("HDR10")).as_deref(),
-            Some("HDR10")
-        );
-        assert_eq!(dynamic_range(Some("hlg"), None).as_deref(), Some("HLG"));
-        assert_eq!(dynamic_range(None, None), None);
-        assert_eq!(dynamic_range(Some(""), Some("")), None);
+        assert_eq!(hdr_token(Some("hlg"), None).as_deref(), Some("hlg"));
+        // Token recovered from the label alone, both non-DV shapes.
+        assert_eq!(hdr_token(None, Some("HDR10+")).as_deref(), Some("hdr10"));
+        assert_eq!(hdr_token(None, Some("HLG")).as_deref(), Some("hlg"));
+        assert_eq!(hdr_token(None, None), None);
+        assert_eq!(hdr_token(Some(""), Some("")), None);
+    }
+
+    /// The pairing is the point: the token is what code compares against
+    /// `delivered_dynamic_range`, the label is what a client prints. Dropping
+    /// either would push one platform into inventing the other.
+    #[test]
+    fn the_label_rides_along_verbatim_beside_the_token() {
+        let facts = MediaFacts::from(FactsRow {
+            files: 1,
+            bytes: 1,
+            container: None,
+            video_codec: None,
+            height: None,
+            hdr: Some("hdr10".into()),
+            hdr_format: Some("HDR10+".into()),
+            audio: vec![],
+        });
+        assert_eq!(facts.hdr.as_deref(), Some("hdr10"));
+        assert_eq!(facts.hdr_format.as_deref(), Some("HDR10+"));
     }
 
     #[test]
@@ -376,7 +428,8 @@ mod tests {
                 bytes: 75_800_000_000,
                 video: Some("HEVC".into()),
                 height: Some(2160),
-                dr: Some("DV".into()),
+                hdr: Some("dolby_vision".into()),
+                hdr_format: Some("Dolby Vision · Profile 7 (HDR10-compatible)".into()),
                 audio: Some("TrueHD 7.1".into()),
                 container: Some("MKV".into()),
             }
@@ -396,7 +449,8 @@ mod tests {
         assert_eq!(facts.files, 1);
         assert_eq!(facts.bytes, 4_200_000_000);
         assert_eq!(facts.video, None);
-        assert_eq!(facts.dr, None);
+        assert_eq!(facts.hdr, None);
+        assert_eq!(facts.hdr_format, None);
         assert_eq!(facts.audio, None);
         assert_eq!(facts.container, None);
     }
