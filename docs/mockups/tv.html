@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cinemarr — 10-foot (TV) layout mockups</title>
+<style>
+  *{box-sizing:border-box}
+  html,body{margin:0;min-height:100%}
+  body{background:#08080a;font:14px system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;color:#a9a9b4}
+  .mtoolbar{position:sticky;top:0;z-index:99;display:flex;gap:14px;align-items:center;flex-wrap:wrap;
+    padding:8px 14px;background:#0d0d11;border-bottom:1px solid #26262e;
+    font:12px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8b8b96}
+  .mtoolbar .lbl{color:#5c5c66;text-transform:uppercase;letter-spacing:.08em;font-size:10px;margin-right:2px}
+  .mtoolbar .grp{display:flex;gap:4px;align-items:center}
+  .mtoolbar button{font:inherit;background:#17171d;color:#a9a9b4;border:1px solid #2b2b34;border-radius:6px;
+    padding:4px 9px;cursor:pointer}
+  .mtoolbar button.on{background:#e8e8ef;color:#101014;border-color:#e8e8ef;font-weight:600}
+  .mtoolbar .note{margin-left:auto;color:#55555f}
+  #wrap{display:grid;place-items:center;padding:18px}
+  #frame{position:relative;width:min(96vw,1280px);aspect-ratio:16/9;border-radius:10px;overflow:hidden;
+    outline:6px solid #1a1a20;box-shadow:0 20px 60px rgba(0,0,0,.6)}
+  #tv{position:absolute;top:0;left:0;width:1280px;height:720px;transform-origin:0 0;
+    background:var(--bg);color:var(--text);font-family:var(--font)}
+  #tv a{color:inherit;text-decoration:none}
+
+  /* focus ring — scale+ring+depth together (color-independent) */
+  .f{transition:transform .12s ease-out}
+  .f.foc{transform:scale(1.07);z-index:5;position:relative;
+    outline:3px solid #fff;outline-offset:3px;box-shadow:0 10px 30px rgba(0,0,0,.6)}
+
+  .tag{font:600 11px/1 var(--font-mono);letter-spacing:.04em;padding:3px 7px;border-radius:4px;
+    border:1px solid var(--line);color:var(--muted)}
+  .tag.hi{color:var(--accent);border-color:color-mix(in srgb,var(--accent) 45%,var(--line))}
+  .tag.dv{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 45%,var(--line))}
+  .btn{border:0;border-radius:8px;padding:10px 20px;background:var(--accent);color:var(--btn-ink);
+    font:600 16px var(--font)}
+  .btn.ghost{background:color-mix(in srgb,var(--panel2) 70%,transparent);color:var(--text);
+    border:1px solid var(--line)}
+  .card{flex:none;cursor:pointer}
+  .card .art{position:relative;border-radius:8px;overflow:hidden;background:#101014}
+  .card .cap{padding:6px 2px 0;font-size:14px;font-weight:600;white-space:nowrap;overflow:hidden;
+    text-overflow:ellipsis}
+  .card .cap small{display:block;font:11.5px var(--font-mono);color:var(--muted);font-weight:400}
+  .ty{position:absolute;inset:0;display:flex;padding:9%;pointer-events:none}
+  .ty .big{align-self:flex-end;font-weight:800;line-height:1.02;color:#fff;text-transform:uppercase;
+    font-size:var(--fs,15px)}
+  .ty .serif{align-self:flex-end;font-family:Georgia,serif;color:#fff;line-height:1.05;font-size:var(--fs,15px)}
+  .ty .monoTL{align-self:flex-start;font:600 10px/1.4 var(--font-mono);color:rgba(255,255,255,.85);
+    letter-spacing:.14em;border-top:1px solid rgba(255,255,255,.5);padding-top:5px;width:60%}
+  .ty .kick{position:absolute;top:7%;left:9%;font:600 7.5px/1 var(--font-mono);letter-spacing:.2em;
+    color:rgba(255,255,255,.55);text-transform:uppercase}
+  .prog{position:absolute;left:0;right:0;bottom:0;height:5px;background:rgba(0,0,0,.5)}
+  .prog i{display:block;height:100%;background:var(--accent)}
+  .rail{display:flex;gap:18px;overflow:hidden;padding:6px 4px 8px}
+  .rt{font:600 13px var(--font);letter-spacing:.1em;text-transform:uppercase;color:var(--muted);
+    margin:10px 0 6px}
+
+  /* plex-tv: icon rail that expands on focus */
+  .ptv{display:flex;height:100%}
+  .ptv .rail-nav{width:76px;flex:none;display:flex;flex-direction:column;gap:6px;align-items:center;
+    padding:22px 0;background:linear-gradient(90deg,color-mix(in srgb,var(--panel) 92%,#000),
+    color-mix(in srgb,var(--panel) 55%,var(--bg)));border-right:1px solid var(--line)}
+  .ptv .rail-nav .it{width:46px;height:46px;border-radius:10px;display:grid;place-items:center;
+    color:var(--muted);font-size:19px}
+  .ptv .rail-nav .it.on{background:color-mix(in srgb,var(--accent) 20%,transparent);color:var(--accent)}
+  .ptv .rail-nav .avatar{margin-top:auto;width:38px;height:38px;border-radius:50%;
+    background:linear-gradient(135deg,var(--accent),var(--accent2));display:grid;place-items:center;
+    color:var(--btn-ink);font-weight:700}
+  .ptv main{flex:1;min-width:0;padding:26px 34px;overflow:hidden}
+  .ptv .top{display:flex;align-items:center;gap:14px;margin-bottom:8px}
+  .ptv .top h1{margin:0;font-size:24px}
+  .ptv .clock{margin-left:auto;font:600 15px var(--font-mono);color:var(--muted)}
+
+  /* theater-tv */
+  .ttv{position:relative;height:100%;overflow:hidden}
+  .ttv .bg{position:absolute;inset:0}
+  .ttv .scrim{position:absolute;inset:0;background:
+    linear-gradient(180deg,rgba(0,0,0,.25),transparent 25%,var(--bg) 92%),
+    linear-gradient(90deg,color-mix(in srgb,var(--bg) 85%,transparent),transparent 62%)}
+  .ttv nav{position:relative;display:flex;gap:26px;padding:20px 40px;font-size:16px;
+    color:rgba(255,255,255,.65)}
+  .ttv nav .on{color:#fff;border-bottom:2px solid var(--accent);padding-bottom:3px}
+  .ttv nav .wm{margin-right:12px}
+  .ttv .fg{position:relative;padding:8px 40px;max-width:600px}
+  .ttv .kick{font:600 11px var(--font-mono);letter-spacing:.22em;text-transform:uppercase;color:var(--accent)}
+  .ttv h1{font-size:44px;margin:8px 0 6px;line-height:1;font-weight:800;color:#fff}
+  .ttv .meta{display:flex;gap:12px;align-items:center;font:13px var(--font-mono);color:var(--muted)}
+  .ttv p{color:rgba(255,255,255,.82);max-width:520px;font-size:15px}
+  .ttv .rails{position:absolute;left:0;right:0;bottom:0;padding:0 40px 22px}
+
+  /* guide-tv */
+  .gtv{height:100%;padding:20px 26px;font-family:var(--font-mono);display:flex;flex-direction:column}
+  .gtv .hdr{display:flex;gap:18px;align-items:center;margin-bottom:12px}
+  .gtv .hdr .scr{position:relative;width:300px;aspect-ratio:16/9;border-radius:8px;overflow:hidden;flex:none}
+  .gtv .hdr .scr::after{content:"";position:absolute;inset:0;
+    background:repeating-linear-gradient(180deg,rgba(0,0,0,.18) 0 2px,transparent 2px 4px)}
+  .gtv .hdr .inf{min-width:0}
+  .gtv .hdr .now{font-size:10px;letter-spacing:.22em;color:var(--accent)}
+  .gtv .hdr h1{margin:2px 0;font-size:26px;font-family:var(--font);color:var(--text)}
+  .gtv .hdr .ep{color:var(--muted);font-size:12px}
+  .gtv .clock{margin-left:auto;align-self:flex-start;font:700 18px var(--font-mono);color:var(--muted)}
+  .g-ruler{display:flex;padding-left:150px;color:var(--muted);font-size:11px;margin-bottom:5px}
+  .g-ruler span{flex:1}
+  .g-ruler span:first-child{color:var(--accent);font-weight:700}
+  .g-rows{display:flex;flex-direction:column;gap:5px;flex:1}
+  .g-row{display:flex;gap:5px;flex:1;min-height:0}
+  .g-chn{flex:none;width:145px;display:flex;gap:8px;align-items:center;padding:0 10px;
+    background:var(--panel);border:1px solid var(--line);border-radius:6px}
+  .g-chn .num{font-weight:700;font-size:14px;color:var(--accent)}
+  .g-chn .nm{font-size:10px;letter-spacing:.05em;color:var(--text)}
+  .g-cells{flex:1;display:flex;gap:5px;min-width:0}
+  .g-cell{position:relative;border:1px solid var(--line);border-radius:6px;background:var(--panel2);
+    padding:5px 10px;overflow:hidden;display:flex;flex-direction:column;justify-content:center}
+  .g-cell b{font-size:12px;font-family:var(--font);color:var(--text);white-space:nowrap;overflow:hidden;
+    text-overflow:ellipsis}
+  .g-cell span{font-size:9.5px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .g-cell .gp{position:absolute;left:0;bottom:0;height:3px;background:var(--accent)}
+  .gtv .keys{display:flex;gap:20px;margin-top:10px;font-size:11px;color:var(--muted);align-items:center}
+  .gtv .keys .k{display:inline-flex;gap:6px;align-items:center}
+  .gtv .keys .cbtn{width:10px;height:10px;border-radius:50%;display:inline-block}
+
+  /* classic-tv */
+  .ctv{height:100%;padding:18px 30px;overflow:hidden}
+  .ctv .top{display:flex;gap:16px;align-items:center;padding-bottom:12px;border-bottom:1px solid var(--line)}
+  .ctv .top nav{display:flex;gap:6px}
+  .ctv .top nav a{padding:7px 12px;color:var(--muted);border-bottom:2px solid transparent}
+  .ctv .top nav a.on{color:var(--text);border-bottom-color:var(--accent)}
+  .ctv .scan{margin-left:auto;font:11.5px var(--font-mono);color:var(--muted);
+    border:1px solid var(--line);border-radius:999px;padding:5px 12px;background:var(--panel)}
+
+  .wm{font-weight:800;font-size:19px;letter-spacing:.5px;
+    background:linear-gradient(90deg,var(--accent),var(--accent2));
+    -webkit-background-clip:text;background-clip:text;color:transparent;white-space:nowrap}
+  [data-theme=noirr] .wm,[data-theme=giallo] .wm{background:none;color:var(--text);
+    font:700 18px var(--font-mono);letter-spacing:-.02em}
+  [data-theme=noirr] .wm .t,[data-theme=giallo] .wm .t{display:none}
+  [data-theme=noirr] .wm::before{content:"noirr"}
+  [data-theme=giallo] .wm::before{content:"cinemarr"}
+  [data-theme=noirr] .wm::after,[data-theme=giallo] .wm::after{content:"";display:inline-block;width:10px;
+    height:3px;margin-left:4px;background:var(--accent);border-radius:1px;vertical-align:-2px}
+</style>
+</head>
+<body>
+<div class="mtoolbar" id="bar"></div>
+<div id="wrap"><div id="frame"><div id="tv"></div></div></div>
+<script>
+"use strict";
+const STATE={layout:"plex",theme:"amber"};
+const FONT_SANS="'Inter',system-ui,-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif";
+const FONT_SYS="system-ui,-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif";
+const FONT_MONO="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace";
+const THEMES={
+  classic:{name:"Classic",bg:"#0e0f13",panel:"#171922",panel2:"#1e2230",line:"#2a2f3e",text:"#e8eaf0",
+    muted:"#9aa2b4",accent:"#6ea8fe",accent2:"#8b7cf6",warn:"#fbbf24",btnInk:"#07101f",font:FONT_SYS,mono:FONT_MONO},
+  terminal:{name:"Terminal",bg:"#050705",panel:"#0b100b",panel2:"#111a12",line:"#1e3020",text:"#c9e8c0",
+    muted:"#7a9670",accent:"#3fe170",accent2:"#2aa858",warn:"#d9c25a",btnInk:"#041508",font:FONT_MONO,mono:FONT_MONO},
+  noirr:{name:"noirr",bg:"#0a0a0c",panel:"#101014",panel2:"#16161b",line:"rgba(255,255,255,.08)",
+    text:"#ededef",muted:"#9a9aa3",accent:"#e5484d",accent2:"#8e1c22",warn:"#d9a05b",btnInk:"#ffffff",
+    font:FONT_SANS,mono:FONT_MONO},
+  amber:{name:"Amber",bg:"#191a1d",panel:"#212327",panel2:"#2a2d32",line:"#383c43",text:"#eceef0",
+    muted:"#9aa0a7",accent:"#e5a00d",accent2:"#cc7b19",warn:"#f2c14e",btnInk:"#1c1303",font:FONT_SYS,mono:FONT_MONO},
+  giallo:{name:"Giallo",bg:"#0c0a06",panel:"#14100a",panel2:"#1c160d",line:"rgba(240,200,120,.10)",
+    text:"#f2e9d8",muted:"#a89c85",accent:"#e8a33d",accent2:"#8a5a14",warn:"#c9723a",btnInk:"#1a1002",
+    font:FONT_SANS,mono:FONT_MONO},
+  silver:{name:"Silver",bg:"#0a0a0b",panel:"#131315",panel2:"#1b1b1e",line:"rgba(255,255,255,.10)",
+    text:"#f2f2f2",muted:"#9a9a9e",accent:"#e8e8ea",accent2:"#8a8a8f",warn:"#c9b48c",btnInk:"#0a0a0b",
+    font:FONT_SANS,mono:FONT_MONO},
+  void:{name:"Void",bg:"#000000",panel:"#0a0a0a",panel2:"#131313",line:"rgba(255,255,255,.13)",
+    text:"#e8e8e8",muted:"#8a8a8a",accent:"#4cc2ff",accent2:"#2f6fe0",warn:"#fbbf24",btnInk:"#001018",
+    font:FONT_SYS,mono:FONT_MONO},
+  vhs:{name:"VHS",bg:"#140d22",panel:"#1d1430",panel2:"#291c42",line:"rgba(255,120,220,.16)",
+    text:"#f4e9ff",muted:"#a78fc7",accent:"#ff4fd8",accent2:"#26e2ff",warn:"#ffb454",btnInk:"#22041c",
+    font:FONT_SYS,mono:FONT_MONO},
+};
+const LAYOUTS={plex:"Plex (rail)",theater:"Theater",guide:"Guide",classic:"Classic (web app)"};
+const M=(t,y,g,o)=>Object.assign({t,y,g},o||{});
+const IT={
+  sc:M("Static City",2024,"neo-noir",{prog:41,s:3,h:355,desc:"A blackout traps a fixer and a stranger on the same stalled train; by dawn only one story survives."}),
+  da:M("Dead Air",2024,"drama",{ep:"Signal Lost · S2E7",prog:63,s:5,h:190}),
+  nh:M("Neon Harvest",2023,"sci-fi",{prog:78,s:4,h:95}),
+  sd:M("Skip Distance",2023,"drama",{ep:"Signal Lost · S2E8",s:5,h:200}),
+  gr:M("Grain",2025,"drama",{s:0,h:215}),
+  sr:M("The Silent Reel",2019,"mystery",{s:1,h:225}),
+  me:M("Meridian",2022,"thriller",{s:2,h:45}),
+  ns:M("Nightshift",2020,"crime",{s:2,h:48}),
+  af:M("Aftertaste",2024,"comedy",{s:0,h:170}),
+  lp:M("Last Projection",2021,"thriller",{s:3,h:20}),
+  vb:M("Vantablack",2023,"horror",{s:5,h:260}),
+  tl:M("Tail Light",2025,"road",{s:4,h:10}),
+  rs:M("Redline Sky",2021,"anime",{ep:"24 episodes",s:4,h:15}),
+  pl:M("Paper Lanterns",2023,"anime",{ep:"12 episodes",s:0,h:28}),
+  cc:M("Cold Copy",2024,"thriller",{ep:"Season 1",s:2,h:210}),
+  nd:M("Night Desk",2022,"drama",{ep:"Season 3",s:3,h:250}),
+};
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+function artBG(it){
+  const h=it.h,s=it.s;
+  if(s===0)return `linear-gradient(118deg,hsl(${h} 32% 30%) 0 55%,hsl(${(h+120)%360} 30% 24%) 55.2% 100%)`;
+  if(s===1)return `radial-gradient(circle at 50% 38%, hsl(${h} 75% 55%) 0 18%, transparent 46%),linear-gradient(180deg,hsl(${(h+30)%360} 35% 16%),hsl(${h} 40% 8%))`;
+  if(s===2)return `linear-gradient(90deg,transparent 0 43%,hsl(${h} 85% 60% / .95) 43% 57%,transparent 57%),linear-gradient(180deg,hsl(${h} 25% 10%),hsl(${(h+40)%360} 30% 5%))`;
+  if(s===3)return `linear-gradient(160deg,hsl(${h} 28% 34%),hsl(${h} 34% 12%) 70%)`;
+  if(s===4)return `repeating-linear-gradient(180deg,hsl(${h} 45% 26%) 0 3px,hsl(${h} 50% 12%) 3px 6px),linear-gradient(180deg,transparent,hsl(${h} 40% 6%) 85%)`;
+  return `linear-gradient(200deg,hsl(${h} 18% 20%),hsl(${(h+15)%360} 22% 9%) 75%)`;
+}
+function ty(it,fs){
+  const k=`<span class="kick">${it.y} · ${esc(it.g)}</span>`;
+  if(it.s===0||it.s===2)return k+`<span class="big" style="--fs:${fs}px">${esc(it.t)}</span>`;
+  if(it.s===1||it.s===3)return `<span class="serif" style="--fs:${fs}px">${esc(it.t)}</span>`;
+  if(it.s===4)return `<span class="big" style="--fs:${fs}px">${esc(it.t)}</span>`;
+  return `<span class="monoTL">${esc(it.t.toLowerCase())}</span>`;
+}
+function tvcard(it,w,wide,foc,fs){
+  return `<div class="card f${foc?" foc":""}" style="width:${w}px">
+    <div class="art" style="aspect-ratio:${wide?"16/9":"2/3"};background:${artBG(it)}">
+      <div class="ty">${ty(it,fs||15)}</div>
+      ${it.prog?`<div class="prog"><i style="width:${it.prog}%"></i></div>`:""}
+    </div>
+    <div class="cap">${esc(it.t)}<small>${esc(it.ep||it.y)}</small></div></div>`;
+}
+
+function plexTV(){
+  const nav=["⌂","⌕","🎬","📺","✦","⚙"].map((s,i)=>`<span class="it${i===0?" on":""}">${s}</span>`).join("");
+  return `<div class="ptv">
+    <div class="rail-nav"><span class="it" style="font-weight:800;color:var(--accent)">c_</span>${nav}
+      <span class="avatar">P</span></div>
+    <main>
+      <div class="top"><h1>Home</h1><span class="clock">9:41 PM</span></div>
+      <div class="rt">Continue Watching</div>
+      <div class="rail">${[IT.sc,IT.da,IT.nh,IT.sd].map((x,i)=>tvcard(x,286,true,i===0,17)).join("")}</div>
+      <div class="rt" style="margin-top:14px">Recently Added in Movies</div>
+      <div class="rail">${[IT.gr,IT.sr,IT.me,IT.vb,IT.tl,IT.af,IT.lp,IT.ns].map(x=>tvcard(x,138,false,false,12)).join("")}</div>
+    </main></div>`;
+}
+function theaterTV(){
+  const it=IT.sc;
+  return `<div class="ttv">
+    <div class="bg" style="background:${artBG(it)}"></div><div class="scrim"></div>
+    <nav><span class="wm"><span class="t">cinemarr</span></span>
+      <span class="on">home</span><span>movies</span><span>shows</span><span>anime</span><span>search</span>
+      <span style="margin-left:auto;font:600 14px var(--font-mono);color:rgba(255,255,255,.6)">9:41</span></nav>
+    <div class="fg">
+      <div class="kick">continue watching</div>
+      <h1>${esc(it.t)}</h1>
+      <div class="meta"><span>${it.y}</span><span>2h 22m</span><span>${esc(it.g)}</span>
+        <span class="tag hi">4K</span><span class="tag dv">DV</span><span class="tag">TRUEHD</span></div>
+      <p>${esc(it.desc)}</p>
+      <div style="display:flex;gap:10px">
+        <button class="btn f foc">▶ Resume · 58m</button>
+        <button class="btn ghost f">Details</button></div>
+    </div>
+    <div class="rails">
+      <div class="rt">Continue</div>
+      <div class="rail">${[IT.da,IT.nh,IT.sd,IT.cc].map(x=>tvcard(x,252,true,false,15)).join("")}</div>
+    </div></div>`;
+}
+function guideTV(){
+  const cell=(it,fl,sel,pr)=>`<div class="g-cell f${sel?" foc":""}" style="flex:${fl}">
+    <b>${esc(it.t)}</b><span>${esc(it.ep||it.y+" · "+it.g)}</span>
+    ${pr?`<i class="gp" style="width:${pr}%"></i>`:""}</div>`;
+  const row=(n,nm,cells)=>`<div class="g-row"><div class="g-chn"><span class="num">${n}</span>
+    <span class="nm">${nm}</span></div><div class="g-cells">${cells}</div></div>`;
+  return `<div class="gtv">
+    <div class="hdr">
+      <div class="scr" style="background:${artBG(IT.da)}"></div>
+      <div class="inf"><div class="now">now showing</div><h1>Dead Air</h1>
+        <div class="ep">Signal Lost · S2E7 · 42m · 63% watched · CH 03</div></div>
+      <span class="clock">21:41</span></div>
+    <div class="g-ruler"><span>NOW</span><span>+30</span><span>+60</span><span>+90</span></div>
+    <div class="g-rows">
+      ${row("01","CONTINUE",cell(IT.sc,2,false,41)+cell(IT.da,1.4,false,63)+cell(IT.nh,1,false,78))}
+      ${row("02","MOVIES · NOIR",cell(IT.sr,1.6)+cell(IT.lp,1.2)+cell(IT.ns,1.2))}
+      ${row("03","SIGNAL LOST",cell(IT.da,1,true,63)+cell(IT.sd,1)+cell(M("Dead Reckoning",2023,"drama",{ep:"Signal Lost · S2E9"}),1))}
+      ${row("04","RECENTLY ADDED",cell(IT.gr,1.4)+cell(IT.tl,1)+cell(IT.vb,1.2))}
+      ${row("05","ANIME",cell(IT.rs,1.2)+cell(IT.pl,1)+cell(IT.rs,1))}
+      ${row("06","SHUFFLE",cell(IT.af,1)+cell(IT.me,1.2)+cell(IT.sr,1))}
+    </div>
+    <div class="keys">
+      <span class="k"><span class="cbtn" style="background:#e5484d"></span>details</span>
+      <span class="k"><span class="cbtn" style="background:#5fb582"></span>watch</span>
+      <span class="k"><span class="cbtn" style="background:#d9a05b"></span>shuffle</span>
+      <span class="k"><span class="cbtn" style="background:#6ea8fe"></span>classic home</span>
+      <span style="margin-left:auto">↑↓ channel · ←→ time · 0–9 jump</span></div></div>`;
+}
+function classicTV(){
+  return `<div class="ctv">
+    <div class="top"><span class="wm"><span class="t">cinemarr</span></span>
+      <nav><a class="on f foc">Home</a><a class="f">Activity</a><a class="f">Settings</a></nav>
+      <span class="scan">Scanning Movies · 86%</span></div>
+    <div class="rt" style="margin-top:14px">continue watching</div>
+    <div class="rail">${[IT.sc,IT.da,IT.nh].map(x=>tvcard(x,158,false,false,13)).join("")}</div>
+    <div class="rt">recently added</div>
+    <div class="rail">${[IT.gr,IT.sr,IT.me,IT.ns,IT.af,IT.lp,IT.vb].map(x=>tvcard(x,158,false,false,13)).join("")}</div>
+  </div>`;
+}
+const RENDER={plex:plexTV,theater:theaterTV,guide:guideTV,classic:classicTV};
+
+function applyTheme(){
+  const v=THEMES[STATE.theme];const tv=document.getElementById("tv");
+  const map={"--bg":v.bg,"--panel":v.panel,"--panel2":v.panel2,"--line":v.line,"--text":v.text,
+    "--muted":v.muted,"--accent":v.accent,"--accent2":v.accent2,"--warn":v.warn,"--btn-ink":v.btnInk,
+    "--font":v.font,"--font-mono":v.mono};
+  for(const k in map)tv.style.setProperty(k,map[k]);
+  document.documentElement.dataset.theme=STATE.theme;
+}
+function fit(){
+  const f=document.getElementById("frame");
+  document.getElementById("tv").style.transform=`scale(${f.clientWidth/1280})`;
+}
+function bar(){
+  const b=(k,id,nm)=>`<button class="${STATE[k]===id?"on":""}" onclick="setS('${k}','${id}')">${nm}</button>`;
+  document.getElementById("bar").innerHTML=`
+    <div class="grp"><span class="lbl">tv layout</span>${Object.keys(RENDER).map(k=>b("layout",k,LAYOUTS[k])).join("")}</div>
+    <div class="grp"><span class="lbl">theme</span>${Object.keys(THEMES).map(k=>b("theme",k,THEMES[k].name)).join("")}</div>
+    <span class="note">10-foot mockups · arrow keys move focus · fictional library</span>`;
+}
+function setS(k,v){STATE[k]=v;render();}
+function render(){bar();applyTheme();document.getElementById("tv").innerHTML=RENDER[STATE.layout]();fit();}
+window.addEventListener("resize",fit);
+/* D-pad simulation: arrows move the .foc ring to the geometrically nearest .f */
+window.addEventListener("keydown",e=>{
+  const dirs={ArrowLeft:[-1,0],ArrowRight:[1,0],ArrowUp:[0,-1],ArrowDown:[0,1]};
+  if(!dirs[e.key])return;e.preventDefault();
+  const els=[...document.querySelectorAll("#tv .f")];if(!els.length)return;
+  const cur=document.querySelector("#tv .f.foc")||els[0];
+  const cr=cur.getBoundingClientRect(),[dx,dy]=dirs[e.key];
+  let best=null,bd=1e9;
+  for(const el of els){ if(el===cur)continue;const r=el.getBoundingClientRect();
+    const vx=(r.left+r.right)/2-(cr.left+cr.right)/2, vy=(r.top+r.bottom)/2-(cr.top+cr.bottom)/2;
+    if(dx&&Math.sign(vx)!==dx)continue; if(dy&&Math.sign(vy)!==dy)continue;
+    const d=Math.abs(dx?vx:vy)+2.5*Math.abs(dx?vy:vx);
+    if(d<bd){bd=d;best=el;} }
+  if(best){cur.classList.remove("foc");best.classList.add("foc");}
+});
+window.addEventListener("DOMContentLoaded",render);
+</script>
+</body>
+</html>

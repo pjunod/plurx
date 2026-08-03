@@ -6,6 +6,7 @@ use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use plurx_core::auth;
+use plurx_core::metadata::genres::GenreBackfillReport;
 use plurx_core::store::keys;
 use serde::{Deserialize, Serialize};
 
@@ -627,6 +628,21 @@ pub struct SettingsDto {
     pub cache_used_bytes: i64,
     /// Scan every library once, ~30s after the server starts.
     pub scan_on_startup: bool,
+    /// Is the one-off genre backfill armed? It disarms itself when it reaches
+    /// the end of the catalogue, so this reads `false` again afterwards.
+    ///
+    /// Off by default and opt-in, unlike the artwork retry: it re-hits the
+    /// provider once per title because nothing stored can produce a genre
+    /// (see migration v13), and an upgrade that started that on its own is
+    /// the failure v9 documents.
+    pub genre_backfill: bool,
+    /// What the last backfill pass did, or `None` if none has run since boot.
+    /// Reported here rather than in the per-library scan status because the
+    /// backfill walks item ids, not libraries — and because this page is
+    /// where an operator armed it, so it is where they will look for whether
+    /// it worked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub genre_backfill_last: Option<GenreBackfillReport>,
 }
 
 async fn settings_dto(state: &AppState) -> Result<SettingsDto, ApiError> {
@@ -735,6 +751,11 @@ async fn settings_dto(state: &AppState) -> Result<SettingsDto, ApiError> {
         .get_setting(keys::JOB_SCAN_ON_STARTUP)
         .await?
         .is_some_and(|v| v.trim() == "1");
+    let genre_backfill = state
+        .store
+        .get_setting(keys::GENRE_BACKFILL)
+        .await?
+        .is_some_and(|v| v.trim() == "1");
     Ok(SettingsDto {
         tmdb_configured: !tmdb_api_key.is_empty(),
         tmdb_api_key,
@@ -768,6 +789,8 @@ async fn settings_dto(state: &AppState) -> Result<SettingsDto, ApiError> {
         cache_max_gb,
         cache_used_bytes,
         scan_on_startup,
+        genre_backfill,
+        genre_backfill_last: state.jobs.last_genre_backfill().await,
     })
 }
 
@@ -813,6 +836,8 @@ pub struct UpdateSettings {
     pub cache_produce_mins: Option<i64>,
     pub cache_max_gb: Option<i64>,
     pub scan_on_startup: Option<bool>,
+    /// Arm or disarm the one-off genre backfill.
+    pub genre_backfill: Option<bool>,
 }
 
 /// PUT /api/v1/settings (admin)
@@ -998,6 +1023,24 @@ pub async fn update_settings(
             .put_setting(keys::JOB_SCAN_ON_STARTUP, if on { "1" } else { "0" })
             .await?;
     }
+    if let Some(on) = req.genre_backfill {
+        // Arming rewinds the cursor. A pass that finished left it at 0 and
+        // disarmed itself, so this normally changes nothing; it matters for
+        // the operator who disarms a run half way and arms it again later,
+        // expecting the titles it already failed on to be retried rather than
+        // skipped forever because the cursor is past them.
+        if on {
+            state
+                .store
+                .put_setting(keys::GENRE_BACKFILL_CURSOR, "0")
+                .await?;
+        }
+        state
+            .store
+            .put_setting(keys::GENRE_BACKFILL, if on { "1" } else { "0" })
+            .await?;
+        tracing::info!(armed = on, "genre backfill");
+    }
     Ok(Json(settings_dto(&state).await?))
 }
 
@@ -1114,6 +1157,147 @@ pub async fn activity(
     Ok(Json(activities))
 }
 
+/// One live delivery, whatever route it takes to the screen.
+///
+/// A new array rather than fields grafted onto `sessions`: that array means
+/// "HLS sessions" to every native client parsing it today, and two of the four
+/// rows here are not sessions at all.
+#[derive(Serialize)]
+pub struct Delivery {
+    /// `direct` · `remux` · `hls-copy` · `transcode`.
+    pub method: &'static str,
+    /// Who is watching. Exactly what `sessions[].user_name` has always
+    /// carried on this endpoint — see the handler's note on who may look. This
+    /// array names no one a `sessions` row would not have named.
+    pub user: String,
+    pub file_id: i64,
+    pub item_id: i64,
+    pub title: String,
+    pub started_unix: i64,
+    /// Seconds since this delivery last showed a sign of life: `last_access`
+    /// for a session, the last byte handed over for a remux, and for a direct
+    /// play the last range request or progress beacon — which is the clock the
+    /// idle expiry runs on.
+    pub idle_seconds: u64,
+    /// The `sessions` row this is the same stream as, where one exists, so a
+    /// page can show one line per viewer and still reach the encoder detail.
+    pub session_id: Option<String>,
+    /// Bytes handed to this client, where anything counts them. Direct play
+    /// counts nothing: `serve_file_range` hands a file to axum and never sees
+    /// the bytes leave, and metering it would mean wrapping every 206 body.
+    pub delivered_bytes: Option<i64>,
+    pub delivered_bps: Option<i64>,
+}
+
+/// Everything currently being delivered, from the three places that know.
+///
+/// Deliberately a join at read time rather than one registry. The two session
+/// registries own exact lifetimes — a reap, a `StreamGuard` drop — and their
+/// locks disagree by necessity: `TranscodeManager` uses an async mutex because
+/// its holders await, `progressive::Streams` a sync one because a `Drop`
+/// deregisters and a `Drop` cannot await. Merging them would have forced one
+/// answer onto the other. Here, in an async handler, both can simply be read.
+async fn deliveries(state: &AppState) -> (Vec<crate::transcode::SessionInfo>, Vec<Delivery>) {
+    let sessions = state.transcode.list_deliveries().await;
+    let mut out: Vec<Delivery> = sessions
+        .iter()
+        .map(|(s, method)| Delivery {
+            method: method.as_str(),
+            user: s.user_name.clone(),
+            file_id: s.file_id,
+            item_id: s.item_id,
+            title: s.item_title.clone(),
+            started_unix: s.started_unix,
+            idle_seconds: s.idle_seconds,
+            session_id: Some(s.id.clone()),
+            delivered_bytes: Some(s.delivered_bytes),
+            delivered_bps: s.delivered_bps,
+        })
+        .collect();
+
+    // The two routes that hold no session. Titles are resolved here rather
+    // than carried in the registries: a registry that stored a title would go
+    // stale against a rename, and this page is polled by an admin looking at a
+    // handful of rows, not by every player.
+    let mut titles: HashMap<i64, String> = HashMap::new();
+    let mut item_of_file: HashMap<i64, i64> = HashMap::new();
+    for stream in state.streams.list() {
+        let item_id = match item_of_file.get(&stream.file_id) {
+            Some(id) => *id,
+            None => {
+                let id = state
+                    .store
+                    .get_file(stream.file_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|f| f.item_id)
+                    .unwrap_or(0);
+                item_of_file.insert(stream.file_id, id);
+                id
+            }
+        };
+        out.push(Delivery {
+            method: crate::delivery::Method::Remux.as_str(),
+            user: stream.user_name,
+            file_id: stream.file_id,
+            item_id,
+            title: title_of(state, item_id, &mut titles).await,
+            started_unix: stream.started_unix,
+            // A remux is one pipe with no `last_access` of its own; how long
+            // since a byte left it is the same question.
+            idle_seconds: (stream.delivered_idle_ms.max(0) / 1_000) as u64,
+            session_id: None,
+            delivered_bytes: Some(stream.delivered_bytes),
+            delivered_bps: stream.delivered_bps,
+        });
+    }
+    for play in state.direct_plays.list() {
+        out.push(Delivery {
+            method: crate::delivery::Method::Direct.as_str(),
+            user: play.user_name,
+            file_id: play.file_id,
+            item_id: play.item_id,
+            title: title_of(state, play.item_id, &mut titles).await,
+            started_unix: play.started_unix,
+            idle_seconds: play.idle_seconds,
+            session_id: None,
+            delivered_bytes: None,
+            delivered_bps: None,
+        });
+    }
+    // Newest first, with a total order so a two-second poll does not reshuffle
+    // rows that started in the same second.
+    out.sort_by(|a, b| {
+        b.started_unix
+            .cmp(&a.started_unix)
+            .then(a.method.cmp(b.method))
+            .then(a.file_id.cmp(&b.file_id))
+            .then(a.user.cmp(&b.user))
+    });
+    (sessions.into_iter().map(|(s, _)| s).collect(), out)
+}
+
+/// An item's title, read once per request however many rows want it.
+async fn title_of(state: &AppState, item_id: i64, seen: &mut HashMap<i64, String>) -> String {
+    if let Some(title) = seen.get(&item_id) {
+        return title.clone();
+    }
+    let title = state
+        .store
+        .get_item(item_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|i| i.title)
+        // A file whose item was deleted mid-play is still a delivery in
+        // progress; the row belongs on the page with an honest gap in it
+        // rather than being dropped for want of a name.
+        .unwrap_or_default();
+    seen.insert(item_id, title.clone());
+    title
+}
+
 /// GET /api/v1/activity/detail — the activity page: live playback sessions,
 /// per-library scan state, and the Trakt sync story, all in one shape. Any
 /// authenticated user may look (it's their household server); the stop action
@@ -1122,7 +1306,10 @@ pub async fn activity_detail(
     _user: AuthUser,
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let sessions = state.transcode.list_sessions().await;
+    // `sessions` is untouched — native clients parse it — and `deliveries` is
+    // the superset beside it: the same HLS sessions plus the two routes that
+    // were never listed at all.
+    let (sessions, deliveries) = deliveries(&state).await;
     let names: HashMap<i64, String> = state
         .store
         .list_libraries()
@@ -1158,6 +1345,7 @@ pub async fn activity_detail(
         });
     Ok(Json(serde_json::json!({
         "sessions": sessions,
+        "deliveries": deliveries,
         "scans": scans,
         "producing": state.jobs.producing_now().await,
         "trakt": {

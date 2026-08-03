@@ -37,6 +37,29 @@ pub struct Match {
     /// TMDB-relative image paths (e.g. `/abc.jpg`); resolve with [`image_url`].
     pub poster_path: Option<String>,
     pub backdrop_path: Option<String>,
+    /// Genre names, in TMDB's own order. Empty means "this response carried
+    /// none" — not "TMDB says this title has none". Nothing downstream needs
+    /// that distinction and nothing here pretends to make it.
+    pub genres: Vec<String>,
+}
+
+/// Which of TMDB's two genre vocabularies an id belongs to. They are separate
+/// lists with overlapping numbering and different names ("Action & Adventure"
+/// is TV-only, id 10759 is "Action & Adventure" on TV and nothing on film), so
+/// resolving against the wrong one mislabels a library instead of failing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GenreKind {
+    Movie,
+    Tv,
+}
+
+impl GenreKind {
+    fn path(self) -> &'static str {
+        match self {
+            GenreKind::Movie => "/genre/movie/list",
+            GenreKind::Tv => "/genre/tv/list",
+        }
+    }
 }
 
 /// One season's metadata: its own presentation plus its episodes.
@@ -67,7 +90,29 @@ pub struct TmdbClient {
     base: String,
     /// Image CDN base (defaults to [`IMAGE_BASE`]).
     image_base: String,
+    /// TMDB's two genre id→name dictionaries, fetched at most ONCE each per
+    /// client and therefore at most once per enrichment run.
+    ///
+    /// This is the whole reason shows cost one extra request instead of one
+    /// per title. A TV *search* result carries `genre_ids` and nothing else,
+    /// so the names have to come from somewhere; the somewhere must not be a
+    /// second round-trip per show, or a 2,000-episode library's refresh
+    /// doubles its request count to learn eighteen strings.
+    ///
+    /// A fetch that fails caches the *empty* map rather than staying unset.
+    /// Leaving it unset would retry per title, which is precisely the shape
+    /// this exists to prevent — and the failure mode of an unreachable
+    /// endpoint would then be "hammer it once per show".
+    genres: std::collections::HashMap<GenreKind, tokio::sync::OnceCell<GenreIndex>>,
+    /// Set when a vocabulary fetch failed, so the caller can say so once in
+    /// its report instead of every title saying nothing. Without this the
+    /// failure is invisible from outside: each show still matches, still gets
+    /// its poster, and just quietly has no genres.
+    genre_index_failed: std::sync::atomic::AtomicBool,
 }
+
+/// TMDB genre ids to names, for one vocabulary.
+type GenreIndex = std::collections::HashMap<i64, String>;
 
 impl TmdbClient {
     pub fn new(api_key: impl Into<String>) -> Self {
@@ -79,6 +124,13 @@ impl TmdbClient {
                 .unwrap_or_default(),
             base: API_BASE.to_owned(),
             image_base: IMAGE_BASE.to_owned(),
+            genres: [
+                (GenreKind::Movie, tokio::sync::OnceCell::new()),
+                (GenreKind::Tv, tokio::sync::OnceCell::new()),
+            ]
+            .into_iter()
+            .collect(),
+            genre_index_failed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -159,6 +211,50 @@ impl TmdbClient {
         Err(MetadataError::Http("retries exhausted".to_owned()))
     }
 
+    /// One TMDB genre vocabulary as id→name, fetched at most once per client.
+    ///
+    /// Costs one request the first time either kind is asked for and zero
+    /// thereafter, including across every title in a run. A failure is cached
+    /// as an empty index on purpose: see [`TmdbClient::genres`] — the
+    /// alternative retries per title, which is the cost this method exists to
+    /// avoid, paid at its worst moment.
+    async fn genre_index(&self, kind: GenreKind) -> &GenreIndex {
+        // The map is built with both keys in `new`, so the fallback is
+        // unreachable; a `unwrap` here would be a panic in a metadata path
+        // for a bug that cannot happen, which is a bad trade.
+        static EMPTY: std::sync::OnceLock<GenreIndex> = std::sync::OnceLock::new();
+        let Some(cell) = self.genres.get(&kind) else {
+            return EMPTY.get_or_init(GenreIndex::new);
+        };
+        cell.get_or_init(|| async {
+            match self.get(kind.path(), &[]).await {
+                Ok(body) => {
+                    let index = parse_genre_index(&body);
+                    tracing::debug!(?kind, count = index.len(), "fetched tmdb genre list");
+                    index
+                }
+                Err(e) => {
+                    tracing::error!(?kind, error = %e, "tmdb genre list unavailable; \
+                         titles matched by search will be stored without genres");
+                    self.genre_index_failed
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    GenreIndex::new()
+                }
+            }
+        })
+        .await
+    }
+
+    /// Did a genre-vocabulary fetch fail during this client's life?
+    ///
+    /// One flag for the whole run, because that is the shape of the failure:
+    /// the list is fetched once, so it fails once, and everything matched by
+    /// search afterwards is affected equally. A caller reports it once.
+    pub fn genre_index_failed(&self) -> bool {
+        self.genre_index_failed
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Search movies and return the best match (title + year aware).
     pub async fn find_movie(
         &self,
@@ -175,7 +271,10 @@ impl TmdbClient {
             return Ok(None);
         };
         let id = best.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
-        // Details call fills runtime + imdb_id, absent from search results.
+        // Details call fills runtime + imdb_id, absent from search results —
+        // and genres, which have been in this response all along and were
+        // read straight past. A movie's genres therefore cost zero requests:
+        // there is no branch here to add, only a field to stop discarding.
         let details = self.get(&format!("/movie/{id}"), &[]).await?;
         Ok(Some(movie_match(id, best, &details)))
     }
@@ -196,7 +295,19 @@ impl TmdbClient {
             return Ok(None);
         };
         let id = best.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
-        Ok(Some(show_match(id, best)))
+        let mut m = show_match(id, best);
+        // A TV search result names genres by id only, so this is the one
+        // enrichment path that cannot get them free. Resolved against the
+        // once-per-run cached vocabulary rather than a `/tv/{id}` details
+        // call: one request for the whole run instead of one per series.
+        if m.genres.is_empty() {
+            let ids = genre_ids(best);
+            if !ids.is_empty() {
+                let index = self.genre_index(GenreKind::Tv).await;
+                m.genres = ids.iter().filter_map(|id| index.get(id).cloned()).collect();
+            }
+        }
+        Ok(Some(m))
     }
 
     /// Search movies and return the candidates in TMDB's own relevance order,
@@ -215,9 +326,25 @@ impl TmdbClient {
             query.push(("year", y.to_string()));
         }
         let body = self.get("/search/movie", &query).await?;
-        Ok(candidates(&body, limit, |id, v| {
-            movie_match(id, v, &Value::Null)
-        }))
+        let mut found = candidates(&body, limit, |id, v| movie_match(id, v, &Value::Null));
+        // The film vocabulary's one caller. Enrichment never needs it — a
+        // movie's details response carries genre names outright — but the
+        // picker builds its candidates from search results, which carry ids.
+        // One request for the whole picker session, cached like the TV one;
+        // a human choosing between two films with the same title is exactly
+        // who genres help.
+        if found.iter().any(|m| m.genres.is_empty()) {
+            let ids = candidate_genre_ids(&body, limit);
+            if ids.iter().any(|g| !g.is_empty()) {
+                let index = self.genre_index(GenreKind::Movie).await;
+                for (m, ids) in found.iter_mut().zip(ids) {
+                    if m.genres.is_empty() {
+                        m.genres = ids.iter().filter_map(|id| index.get(id).cloned()).collect();
+                    }
+                }
+            }
+        }
+        Ok(found)
     }
 
     /// Search shows and return the candidates, as
@@ -233,7 +360,19 @@ impl TmdbClient {
             query.push(("first_air_date_year", y.to_string()));
         }
         let body = self.get("/search/tv", &query).await?;
-        Ok(candidates(&body, limit, show_match))
+        let mut found = candidates(&body, limit, show_match);
+        if found.iter().any(|m| m.genres.is_empty()) {
+            let ids = candidate_genre_ids(&body, limit);
+            if ids.iter().any(|g| !g.is_empty()) {
+                let index = self.genre_index(GenreKind::Tv).await;
+                for (m, ids) in found.iter_mut().zip(ids) {
+                    if m.genres.is_empty() {
+                        m.genres = ids.iter().filter_map(|id| index.get(id).cloned()).collect();
+                    }
+                }
+            }
+        }
+        Ok(found)
     }
 
     /// Fetch one movie by TMDB id. This is the authoritative path — a manual
@@ -423,6 +562,53 @@ fn str_opt(v: &Value, key: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Genre NAMES from a response that carries the full objects — every
+/// `/movie/{id}`, `/tv/{id}` and `/genre/*/list` body does. Search results do
+/// not; they carry [`genre_ids`].
+fn genre_names(v: &Value) -> Vec<String> {
+    v.get("genres")
+        .and_then(|g| g.as_array())
+        .map(|arr| arr.iter().filter_map(|g| str_opt(g, "name")).collect())
+        .unwrap_or_default()
+}
+
+/// Genre IDS from a search result. Needs [`TmdbClient::genre_index`] to become
+/// names; on its own it is a list of integers no client can render.
+fn genre_ids(v: &Value) -> Vec<i64> {
+    v.get("genre_ids")
+        .and_then(|g| g.as_array())
+        .map(|arr| arr.iter().filter_map(|g| g.as_i64()).collect())
+        .unwrap_or_default()
+}
+
+/// Per-candidate genre ids from a search response, aligned with what
+/// [`candidates`] produces from the same body — same filter, same order, same
+/// cap. Zipping two lists built by different rules is how a picker ends up
+/// showing one film's genres under another's title.
+fn candidate_genre_ids(body: &Value, limit: usize) -> Vec<Vec<i64>> {
+    let Some(results) = body.get("results").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    results
+        .iter()
+        .filter(|v| v.get("id").and_then(|x| x.as_i64()).is_some())
+        .take(limit)
+        .map(genre_ids)
+        .collect()
+}
+
+/// `/genre/{kind}/list` into id→name.
+fn parse_genre_index(body: &Value) -> GenreIndex {
+    body.get("genres")
+        .and_then(|g| g.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|g| Some((g.get("id")?.as_i64()?, str_opt(g, "name")?)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn movie_match(id: i64, search: &Value, details: &Value) -> Match {
     Match {
         tmdb_id: id,
@@ -438,6 +624,11 @@ fn movie_match(id: i64, search: &Value, details: &Value) -> Match {
         air_date: str_opt(search, "release_date"),
         poster_path: str_opt(search, "poster_path"),
         backdrop_path: str_opt(search, "backdrop_path"),
+        // From `details`, where the full objects live. `movie_by_id` passes
+        // the details body as both arguments, so it is covered too; only the
+        // picker's `Value::Null` details leaves this empty, and that path
+        // fills it from the id vocabulary afterwards.
+        genres: genre_names(details),
     }
 }
 
@@ -452,6 +643,10 @@ fn show_match(id: i64, search: &Value) -> Match {
         air_date: str_opt(search, "first_air_date"),
         poster_path: str_opt(search, "poster_path"),
         backdrop_path: str_opt(search, "backdrop_path"),
+        // Empty from a search result (it only has `genre_ids`), populated
+        // from a `/tv/{id}` details body. `show_by_id` therefore costs
+        // nothing extra; `find_show` resolves the ids itself.
+        genres: genre_names(search),
     }
 }
 

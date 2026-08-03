@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cinemarr — mobile & tablet layout mockups</title>
+<style>
+  *{box-sizing:border-box}
+  html,body{margin:0;min-height:100%}
+  body{background:#08080a;font:14px system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;color:#a9a9b4}
+  .mtoolbar{position:sticky;top:0;z-index:99;display:flex;gap:14px;align-items:center;flex-wrap:wrap;
+    padding:8px 14px;background:#0d0d11;border-bottom:1px solid #26262e;
+    font:12px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#8b8b96}
+  .mtoolbar .lbl{color:#5c5c66;text-transform:uppercase;letter-spacing:.08em;font-size:10px;margin-right:2px}
+  .mtoolbar .grp{display:flex;gap:4px;align-items:center}
+  .mtoolbar button{font:inherit;background:#17171d;color:#a9a9b4;border:1px solid #2b2b34;border-radius:6px;
+    padding:4px 9px;cursor:pointer}
+  .mtoolbar button.on{background:#e8e8ef;color:#101014;border-color:#e8e8ef;font-weight:600}
+  .mtoolbar .note{margin-left:auto;color:#55555f}
+  #stage{display:flex;gap:30px;flex-wrap:wrap;justify-content:center;align-items:flex-start;padding:26px 18px 50px}
+  .dev{display:flex;flex-direction:column;gap:10px;align-items:center}
+  .dev .cap{font:12px ui-monospace,Menlo,monospace;color:#6e6e78;text-align:center;max-width:280px}
+  .dev .cap b{color:#b9b9c4;display:block;font-size:12.5px}
+  .phone{width:280px;aspect-ratio:390/800;border-radius:30px;border:7px solid #1c1c22;overflow:hidden;
+    position:relative;background:var(--bg);color:var(--text);font-family:var(--font);
+    box-shadow:0 18px 44px rgba(0,0,0,.55)}
+  .tablet{width:660px;aspect-ratio:4/3;border-radius:18px;border:8px solid #1c1c22;overflow:hidden;
+    position:relative;background:var(--bg);color:var(--text);font-family:var(--font);
+    box-shadow:0 18px 44px rgba(0,0,0,.55)}
+  .notch{position:absolute;top:7px;left:50%;transform:translateX(-50%);width:86px;height:18px;
+    border-radius:10px;background:#0a0a0c;z-index:50}
+  .scr{position:absolute;inset:0;overflow:hidden;display:flex;flex-direction:column}
+
+  .tag{font:600 8.5px/1 var(--font-mono);letter-spacing:.04em;padding:2px 5px;border-radius:3px;
+    border:1px solid var(--line);color:var(--muted)}
+  .tag.hi{color:var(--accent);border-color:color-mix(in srgb,var(--accent) 45%,var(--line))}
+  .tag.dv{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 45%,var(--line))}
+  .btn{border:0;border-radius:8px;padding:7px 13px;background:var(--accent);color:var(--btn-ink);
+    font:600 11.5px var(--font)}
+  .btn.ghost{background:color-mix(in srgb,var(--panel2) 75%,transparent);color:var(--text);
+    border:1px solid var(--line)}
+  .art{position:relative;border-radius:7px;overflow:hidden;background:#101014}
+  .art .ty{position:absolute;inset:0;display:flex;padding:9%}
+  .ty .big{align-self:flex-end;font-weight:800;line-height:1.03;color:#fff;text-transform:uppercase;
+    font-size:var(--fs,10px)}
+  .ty .serif{align-self:flex-end;font-family:Georgia,serif;color:#fff;line-height:1.05;font-size:var(--fs,10px)}
+  .ty .monoTL{align-self:flex-start;font:600 7px/1.4 var(--font-mono);color:rgba(255,255,255,.85);
+    letter-spacing:.13em;border-top:1px solid rgba(255,255,255,.5);padding-top:4px;width:64%}
+  .prog{position:absolute;left:0;right:0;bottom:0;height:3px;background:rgba(0,0,0,.5)}
+  .prog i{display:block;height:100%;background:var(--accent)}
+  .rt{font:600 10px var(--font);letter-spacing:.09em;text-transform:uppercase;color:var(--muted);
+    margin:10px 12px 6px}
+  .hrail{display:flex;gap:8px;overflow:hidden;padding:0 12px}
+  .pgrid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;padding:0 12px}
+  .cap2{font-size:9.5px;font-weight:600;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .cap2 small{display:block;font:8px var(--font-mono);color:var(--muted);font-weight:400}
+  .wm{font-weight:800;font-size:14px;background:linear-gradient(90deg,var(--accent),var(--accent2));
+    -webkit-background-clip:text;background-clip:text;color:transparent}
+  [data-theme=noirr] .wm{background:none;color:var(--text);font:700 13px var(--font-mono)}
+  [data-theme=noirr] .wm .t{display:none}
+  [data-theme=noirr] .wm::before{content:"noirr"}
+  [data-theme=noirr] .wm::after{content:"";display:inline-block;width:8px;height:2.5px;margin-left:3px;
+    background:var(--accent);border-radius:1px;vertical-align:-1.5px}
+  [data-theme=terminal] .wm{background:none;color:var(--text);font:700 12px var(--font-mono)}
+  [data-theme=terminal] .wm::before{content:":~$ "}
+  [data-theme=terminal] .phone *,[data-theme=terminal] .tablet *{border-radius:0 !important}
+
+  /* bottom tab bar (plex phone) */
+  .tabs{margin-top:auto;display:flex;border-top:1px solid var(--line);
+    background:color-mix(in srgb,var(--panel) 88%,transparent);backdrop-filter:blur(8px);padding:7px 4px 10px}
+  .tabs span{flex:1;text-align:center;font-size:8.5px;color:var(--muted);display:flex;flex-direction:column;
+    gap:3px;align-items:center}
+  .tabs span i{font-style:normal;font-size:15px;line-height:1}
+  .tabs span.on{color:var(--accent)}
+  /* floating pill (theater phone) */
+  .pillnav{position:absolute;left:50%;transform:translateX(-50%);bottom:12px;display:flex;gap:2px;
+    background:rgba(10,10,14,.72);backdrop-filter:blur(8px);border:1px solid rgba(255,255,255,.14);
+    border-radius:999px;padding:4px}
+  .pillnav span{padding:5px 11px;border-radius:999px;font-size:9.5px;color:rgba(255,255,255,.75)}
+  .pillnav span.on{background:var(--accent);color:var(--btn-ink);font-weight:700}
+  /* deck list */
+  .drow{display:flex;gap:8px;align-items:center;padding:5px 10px;border-bottom:1px solid
+    color-mix(in srgb,var(--line) 55%,transparent);font:10px var(--font-mono)}
+  .drow .th{width:20px;height:30px;border-radius:2px;flex:none}
+  .drow .tt{flex:1;min-width:0}
+  .drow .tt b{display:block;font:600 10.5px var(--font);color:var(--text);white-space:nowrap;
+    overflow:hidden;text-overflow:ellipsis}
+  .drow .tt span{color:var(--muted);font-size:8.5px}
+  .drow .sz{color:var(--muted);font-size:8.5px}
+  /* guide phone rows */
+  .gch{display:flex;gap:8px;padding:7px 10px;border-bottom:1px solid color-mix(in srgb,var(--line) 55%,transparent)}
+  .gch .num{font:700 12px var(--font-mono);color:var(--accent);width:20px;flex:none;padding-top:1px}
+  .gch .b{flex:1;min-width:0}
+  .gch .b .nm{font:600 9px var(--font-mono);letter-spacing:.07em;color:var(--muted)}
+  .gch .b .now{font:600 11px var(--font);color:var(--text);white-space:nowrap;overflow:hidden;
+    text-overflow:ellipsis;margin:2px 0 1px}
+  .gch .b .nxt{font:8.5px var(--font-mono);color:var(--muted);white-space:nowrap;overflow:hidden;
+    text-overflow:ellipsis}
+  .gch .b .gp{height:2.5px;background:var(--panel2);border-radius:2px;margin-top:4px;overflow:hidden}
+  .gch .b .gp i{display:block;height:100%;background:var(--accent)}
+
+  /* tablet plex shell */
+  .tb-shell{display:flex;height:100%}
+  .tb-side{width:168px;flex:none;border-right:1px solid var(--line);padding:12px 8px;display:flex;
+    flex-direction:column;gap:2px;background:color-mix(in srgb,var(--panel) 72%,var(--bg));font-size:11px}
+  .tb-side a{display:flex;gap:8px;align-items:center;padding:6px 8px;border-radius:7px;color:var(--muted)}
+  .tb-side a.on{background:color-mix(in srgb,var(--accent) 16%,transparent);color:var(--text)}
+  .tb-side .sec{font:600 7.5px var(--font-mono);letter-spacing:.15em;text-transform:uppercase;
+    color:var(--muted);opacity:.75;padding:10px 8px 4px}
+  .tb-side .n{margin-left:auto;font:8.5px var(--font-mono);color:var(--muted)}
+  .tb-main{flex:1;min-width:0;padding:12px 14px;overflow:hidden}
+</style>
+</head>
+<body>
+<div class="mtoolbar" id="bar"></div>
+<div id="stage"></div>
+<script>
+"use strict";
+const STATE={theme:"noirr",mode:"dark"};
+const FONT_SANS="'Inter',system-ui,-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif";
+const FONT_SYS="system-ui,-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif";
+const FONT_MONO="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace";
+const THEMES={
+  classic:{name:"Classic",
+    dark:{bg:"#0e0f13",panel:"#171922",panel2:"#1e2230",line:"#2a2f3e",text:"#e8eaf0",muted:"#9aa2b4",accent:"#6ea8fe",accent2:"#8b7cf6",warn:"#fbbf24",btnInk:"#07101f",font:FONT_SYS,mono:FONT_MONO},
+    light:{bg:"#f6f7f9",panel:"#ffffff",panel2:"#eef1f6",line:"#dde2ea",text:"#1a1d24",muted:"#5b6472",accent:"#2f6fe0",accent2:"#6d5bd0",warn:"#b45309",btnInk:"#ffffff",font:FONT_SYS,mono:FONT_MONO}},
+  terminal:{name:"Terminal",
+    dark:{bg:"#050705",panel:"#0b100b",panel2:"#111a12",line:"#1e3020",text:"#c9e8c0",muted:"#7a9670",accent:"#3fe170",accent2:"#2aa858",warn:"#d9c25a",btnInk:"#041508",font:FONT_MONO,mono:FONT_MONO},
+    light:{bg:"#eee8d5",panel:"#fdf6e3",panel2:"#e6dfc8",line:"#d5cdb4",text:"#073642",muted:"#657b83",accent:"#6e7f00",accent2:"#268bd2",warn:"#b58900",btnInk:"#fdf6e3",font:FONT_MONO,mono:FONT_MONO}},
+  noirr:{name:"noirr",
+    dark:{bg:"#0a0a0c",panel:"#101014",panel2:"#16161b",line:"rgba(255,255,255,.08)",text:"#ededef",muted:"#9a9aa3",accent:"#e5484d",accent2:"#8e1c22",warn:"#d9a05b",btnInk:"#ffffff",font:FONT_SANS,mono:FONT_MONO},
+    light:{bg:"#f2efe8",panel:"#faf8f2",panel2:"#ffffff",line:"rgba(24,22,20,.12)",text:"#1a1a1e",muted:"#5d5c63",accent:"#c2343a",accent2:"#8e1c22",warn:"#a3742b",btnInk:"#ffffff",font:FONT_SANS,mono:FONT_MONO}},
+  amber:{name:"Amber",
+    dark:{bg:"#191a1d",panel:"#212327",panel2:"#2a2d32",line:"#383c43",text:"#eceef0",muted:"#9aa0a7",accent:"#e5a00d",accent2:"#cc7b19",warn:"#f2c14e",btnInk:"#1c1303",font:FONT_SYS,mono:FONT_MONO},
+    light:{bg:"#f3f4f6",panel:"#ffffff",panel2:"#e9ebee",line:"#d5d9de",text:"#1e2124",muted:"#5f666d",accent:"#c8880a",accent2:"#a95f16",warn:"#8a6116",btnInk:"#ffffff",font:FONT_SYS,mono:FONT_MONO}},
+  giallo:{name:"Giallo",
+    dark:{bg:"#0c0a06",panel:"#14100a",panel2:"#1c160d",line:"rgba(240,200,120,.10)",text:"#f2e9d8",muted:"#a89c85",accent:"#e8a33d",accent2:"#8a5a14",warn:"#c9723a",btnInk:"#1a1002",font:FONT_SANS,mono:FONT_MONO},
+    light:{bg:"#f5eed9",panel:"#fbf7ea",panel2:"#ffffff",line:"rgba(90,70,30,.14)",text:"#241d10",muted:"#6e6350",accent:"#a8720c",accent2:"#7c4a05",warn:"#8a6116",btnInk:"#ffffff",font:FONT_SANS,mono:FONT_MONO}},
+  silver:{name:"Silver",
+    dark:{bg:"#0a0a0b",panel:"#131315",panel2:"#1b1b1e",line:"rgba(255,255,255,.10)",text:"#f2f2f2",muted:"#9a9a9e",accent:"#e8e8ea",accent2:"#8a8a8f",warn:"#c9b48c",btnInk:"#0a0a0b",font:FONT_SANS,mono:FONT_MONO},
+    light:{bg:"#f4f4f2",panel:"#ffffff",panel2:"#eaeae7",line:"rgba(20,20,20,.14)",text:"#141416",muted:"#66666a",accent:"#1a1a1c",accent2:"#5a5a5f",warn:"#8a7442",btnInk:"#ffffff",font:FONT_SANS,mono:FONT_MONO}},
+  void:{name:"Void",darkOnly:true,
+    dark:{bg:"#000000",panel:"#0a0a0a",panel2:"#131313",line:"rgba(255,255,255,.13)",text:"#e8e8e8",muted:"#8a8a8a",accent:"#4cc2ff",accent2:"#2f6fe0",warn:"#fbbf24",btnInk:"#001018",font:FONT_SYS,mono:FONT_MONO}},
+  vhs:{name:"VHS",darkOnly:true,
+    dark:{bg:"#140d22",panel:"#1d1430",panel2:"#291c42",line:"rgba(255,120,220,.16)",text:"#f4e9ff",muted:"#a78fc7",accent:"#ff4fd8",accent2:"#26e2ff",warn:"#ffb454",btnInk:"#22041c",font:FONT_SYS,mono:FONT_MONO}},
+};
+const M=(t,y,g,o)=>Object.assign({t,y,g},o||{});
+const IT=[
+  M("Static City",2024,"neo-noir",{prog:41,s:3,h:355}),
+  M("Dead Air",2024,"drama",{ep:"Signal Lost · S2E7",prog:63,s:5,h:190}),
+  M("Neon Harvest",2023,"sci-fi",{prog:78,s:4,h:95}),
+  M("Grain",2025,"drama",{s:0,h:215}),
+  M("The Silent Reel",2019,"mystery",{s:1,h:225}),
+  M("Meridian",2022,"thriller",{s:2,h:45}),
+  M("Nightshift",2020,"crime",{s:2,h:48}),
+  M("Aftertaste",2024,"comedy",{s:0,h:170}),
+  M("Last Projection",2021,"thriller",{s:3,h:20}),
+  M("Vantablack",2023,"horror",{s:5,h:260}),
+  M("Tail Light",2025,"road",{s:4,h:10}),
+  M("Redline Sky",2021,"anime",{s:4,h:15}),
+];
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+function artBG(it){
+  const h=it.h,s=it.s;
+  if(s===0)return `linear-gradient(118deg,hsl(${h} 32% 30%) 0 55%,hsl(${(h+120)%360} 30% 24%) 55.2% 100%)`;
+  if(s===1)return `radial-gradient(circle at 50% 38%, hsl(${h} 75% 55%) 0 18%, transparent 46%),linear-gradient(180deg,hsl(${(h+30)%360} 35% 16%),hsl(${h} 40% 8%))`;
+  if(s===2)return `linear-gradient(90deg,transparent 0 43%,hsl(${h} 85% 60% / .95) 43% 57%,transparent 57%),linear-gradient(180deg,hsl(${h} 25% 10%),hsl(${(h+40)%360} 30% 5%))`;
+  if(s===3)return `linear-gradient(160deg,hsl(${h} 28% 34%),hsl(${h} 34% 12%) 70%)`;
+  if(s===4)return `repeating-linear-gradient(180deg,hsl(${h} 45% 26%) 0 3px,hsl(${h} 50% 12%) 3px 6px),linear-gradient(180deg,transparent,hsl(${h} 40% 6%) 85%)`;
+  return `linear-gradient(200deg,hsl(${h} 18% 20%),hsl(${(h+15)%360} 22% 9%) 75%)`;
+}
+function ty(it,fs){
+  if(it.s===5)return `<span class="monoTL">${esc(it.t.toLowerCase())}</span>`;
+  if(it.s===1||it.s===3)return `<span class="serif" style="--fs:${fs}px">${esc(it.t)}</span>`;
+  return `<span class="big" style="--fs:${fs}px">${esc(it.t)}</span>`;
+}
+const pcard=(it,w,wide,fs)=>`<div style="width:${w}px;flex:none">
+  <div class="art" style="aspect-ratio:${wide?"16/9":"2/3"};background:${artBG(it)}">
+    <div class="ty">${ty(it,fs||10)}</div>
+    ${it.prog?`<div class="prog"><i style="width:${it.prog}%"></i></div>`:""}</div>
+  <div class="cap2">${esc(it.t)}<small>${esc(it.ep||it.y)}</small></div></div>`;
+
+/* ---------- phones ---------- */
+function phClassic(){
+  return `<div class="scr">
+    <div style="padding:26px 12px 8px;border-bottom:1px solid var(--line)">
+      <div style="display:flex;gap:8px;align-items:center">
+        <span class="wm"><span class="t">cinemarr</span></span>
+        <span style="margin-left:auto;font:10px var(--font-mono);color:var(--muted)">paul</span>
+        <span style="font-size:11px">◐</span></div>
+      <div style="display:flex;gap:10px;margin-top:8px;font-size:11px;color:var(--muted)">
+        <span style="color:var(--text);border-bottom:2px solid var(--accent);padding-bottom:3px">Home</span>
+        <span>Activity</span><span>Settings</span>
+        <input style="margin-left:auto;width:96px;font:inherit;background:var(--panel2);
+          border:1px solid var(--line);color:var(--text);border-radius:6px;padding:3px 7px" placeholder="Search…"></div>
+    </div>
+    <div style="overflow:hidden;flex:1">
+      <div class="rt">continue watching</div>
+      <div class="hrail">${[IT[0],IT[1],IT[2]].map(x=>pcard(x,86,false,9)).join("")}</div>
+      <div class="rt">recently added</div>
+      <div class="pgrid">${[IT[3],IT[4],IT[5],IT[6],IT[7],IT[8]].map(x=>pcard(x,"100%",false,9)).join("")}</div>
+    </div></div>`;
+}
+function phPlex(){
+  const it=IT[0];
+  return `<div class="scr">
+    <div style="padding:28px 12px 6px;display:flex;align-items:center;gap:8px">
+      <b style="font-size:15px">Home</b>
+      <span style="margin-left:auto;font-size:12px;color:var(--muted)">⇆</span>
+      <span style="width:20px;height:20px;border-radius:50%;background:linear-gradient(135deg,var(--accent),var(--accent2));
+        display:grid;place-items:center;font:700 9px var(--font);color:var(--btn-ink)">P</span></div>
+    <div style="overflow:hidden;flex:1">
+      <div class="rt" style="margin-top:4px">Continue Watching</div>
+      <div class="hrail">${[IT[0],IT[1],IT[2]].map(x=>pcard(x,150,true,10)).join("")}</div>
+      <div class="rt">Recently Added in Movies</div>
+      <div class="pgrid">${[IT[3],IT[4],IT[5],IT[9],IT[10],IT[7]].map(x=>pcard(x,"100%",false,9)).join("")}</div>
+    </div>
+    <div class="tabs">
+      <span class="on"><i>⌂</i>Home</span><span><i>▤</i>Libraries</span>
+      <span><i>⌕</i>Search</span><span><i>≋</i>Activity</span></div></div>`;
+}
+function phTheater(){
+  const it=IT[0];
+  return `<div class="scr">
+    <div style="position:relative;height:47%;flex:none;background:${artBG(it)}">
+      <div style="position:absolute;inset:0;background:linear-gradient(180deg,rgba(0,0,0,.25),transparent 30%,var(--bg) 96%)"></div>
+      <div style="position:absolute;left:12px;right:12px;bottom:8px">
+        <div style="font:600 7.5px var(--font-mono);letter-spacing:.2em;color:var(--accent);text-transform:uppercase">continue watching</div>
+        <div style="font-size:21px;font-weight:800;color:#fff;line-height:1.05;margin:3px 0 5px">${esc(it.t)}</div>
+        <div style="display:flex;gap:5px;align-items:center;margin-bottom:7px">
+          <span class="tag hi">4K</span><span class="tag dv">DV</span>
+          <span style="font:8.5px var(--font-mono);color:rgba(255,255,255,.75)">2024 · 2h 22m</span></div>
+        <div style="display:flex;gap:6px"><button class="btn">▶ Resume</button>
+          <button class="btn ghost">Details</button></div>
+      </div></div>
+    <div style="overflow:hidden;flex:1;padding-bottom:40px">
+      <div class="rt">Continue</div>
+      <div class="hrail">${[IT[1],IT[2]].map(x=>pcard(x,140,true,10)).join("")}</div>
+      <div class="rt">New</div>
+      <div class="hrail">${[IT[3],IT[4],IT[5],IT[9]].map(x=>pcard(x,84,false,9)).join("")}</div>
+    </div>
+    <div class="pillnav"><span class="on">Home</span><span>Browse</span><span>Search</span></div></div>`;
+}
+function phDeck(){
+  const rows=[IT[0],IT[2],IT[3],IT[5],IT[9],IT[10],IT[4],IT[8]].map((x,i)=>`<div class="drow">
+    <span class="th" style="background:${artBG(x)}"></span>
+    <span class="tt"><b>${esc(x.t)}</b><span>${x.y} · ${i%2?"1080p · H.264":"4K · HEVC"}${i%3===0?" · DV":""}</span></span>
+    <span class="sz">${(9+i*5.7).toFixed(1)}G</span>
+    ${x.prog?`<span class="tag hi">${x.prog}%</span>`:(i%3===0?'<span style="color:var(--accent);font-size:9px">✓</span>':'<span style="color:var(--muted);font-size:9px">·</span>')}
+  </div>`).join("");
+  return `<div class="scr" style="font-family:var(--font-mono)">
+    <div style="padding:27px 10px 7px;border-bottom:1px solid var(--line)">
+      <div style="display:flex;gap:6px;align-items:baseline">
+        <b style="font-size:12px">movies</b>
+        <span style="font-size:8.5px;color:var(--muted)">210 · 3.1 TB</span>
+        <span style="margin-left:auto;font-size:8.5px;color:var(--accent)">table</span>
+        <span style="font-size:8.5px;color:var(--muted)">grid</span></div>
+      <div style="display:flex;gap:4px;margin-top:6px">
+        <span class="tag hi">unwatched</span><span class="tag">4k</span><span class="tag hi">dv</span>
+        <span class="tag">hevc</span><span class="tag">+ filter</span></div></div>
+    <div style="flex:1;overflow:hidden">${rows}</div>
+    <div style="border-top:1px solid var(--line);background:var(--panel);padding:6px 10px 9px;
+      display:flex;gap:10px;font-size:8px;color:var(--muted)">
+      <span><span style="color:var(--accent)">▮</span> scan 86%</span>
+      <span>2 sessions</span><span>disk 71%</span>
+      <span style="margin-left:auto">/ search</span></div></div>`;
+}
+function phGuide(){
+  const ch=(n,nm,now,nxt,pr)=>`<div class="gch"><span class="num">${n}</span>
+    <div class="b"><div class="nm">${nm}</div><div class="now">${esc(now)}</div>
+    <div class="nxt">next · ${esc(nxt)}</div>${pr?`<div class="gp"><i style="width:${pr}%"></i></div>`:""}</div></div>`;
+  return `<div class="scr" style="font-family:var(--font-mono)">
+    <div style="padding:27px 12px 8px">
+      <div style="font-size:8px;letter-spacing:.2em;color:var(--accent)">NOW SHOWING · CH 03</div>
+      <div style="position:relative;margin-top:6px;aspect-ratio:16/9;border-radius:8px;overflow:hidden;
+        background:${artBG(IT[1])}">
+        <div style="position:absolute;inset:0;background:repeating-linear-gradient(180deg,rgba(0,0,0,.16) 0 2px,transparent 2px 4px)"></div>
+        <span style="position:absolute;left:8px;bottom:6px;font:700 10px var(--font-mono);color:#fff">DEAD AIR · S2E7</span>
+      </div></div>
+    <div style="flex:1;overflow:hidden">
+      ${ch("01","CONTINUE","Static City","Dead Air · S2E7",41)}
+      ${ch("02","MOVIES · NOIR","The Silent Reel","Last Projection")}
+      ${ch("03","SIGNAL LOST","Dead Air · S2E7","Skip Distance · S2E8",63)}
+      ${ch("04","RECENTLY ADDED","Grain","Tail Light")}
+      ${ch("05","ANIME","Redline Sky","Paper Lanterns")}
+      ${ch("06","SHUFFLE","Aftertaste","Meridian")}
+    </div>
+    <div style="border-top:1px solid var(--line);padding:6px 12px 9px;font-size:8px;color:var(--muted);
+      display:flex;gap:10px"><span>▲▼ channel</span><span>tap · watch</span>
+      <span style="margin-left:auto;color:var(--accent)">g · classic</span></div></div>`;
+}
+/* ---------- tablet (plex layout, desktop-class) ---------- */
+function tabPlex(){
+  return `<div class="tb-shell">
+    <aside class="tb-side">
+      <span class="wm" style="padding:2px 8px 8px"><span class="t">cinemarr</span></span>
+      <a class="on">⌂ Home</a>
+      <div class="sec">Libraries</div>
+      <a>▤ Movies<span class="n">210</span></a><a>▢ TV Shows<span class="n">58</span></a>
+      <a>✦ Anime<span class="n">24</span></a><a>▣ Home Video<span class="n">112</span></a>
+      <div class="sec">Manage</div>
+      <a>≋ Activity</a><a>⚙ Settings</a>
+      <div style="margin-top:auto;font:8.5px var(--font-mono);color:var(--muted);padding:6px 8px;
+        border:1px solid var(--line);border-radius:7px;background:var(--panel2)">
+        <span style="color:var(--accent)">▮</span> Scanning · 86%</div>
+    </aside>
+    <div class="tb-main">
+      <div class="rt" style="margin:0 0 6px">Continue Watching</div>
+      <div class="hrail" style="padding:0">${[IT[0],IT[1],IT[2]].map(x=>pcard(x,152,true,10)).join("")}</div>
+      <div class="rt" style="margin:10px 0 6px">Recently Added in Movies</div>
+      <div class="hrail" style="padding:0">${[IT[3],IT[4],IT[5],IT[9],IT[10]].map(x=>pcard(x,86,false,9)).join("")}</div>
+      <div class="rt" style="margin:10px 0 6px">Recently Added in TV</div>
+      <div class="hrail" style="padding:0">${[IT[1],IT[11],IT[6],IT[7],IT[8]].map(x=>pcard(x,86,false,9)).join("")}</div>
+    </div></div>`;
+}
+
+const DEVICES=[
+  {cap:"<b>classic</b>current responsive web app — header wraps, rails stack",render:phClassic,cls:"phone"},
+  {cap:"<b>plex</b>bottom tabs (Home · Libraries · Search · Activity), art-forward rails",render:phPlex,cls:"phone"},
+  {cap:"<b>theater</b>full-bleed hero, floating pill nav, chrome disappears",render:phTheater,cls:"phone"},
+  {cap:"<b>deck</b>dense list + always-on filters + status strip",render:phDeck,cls:"phone"},
+  {cap:"<b>guide</b>vertical channel list — now / next per channel",render:phGuide,cls:"phone"},
+  {cap:"<b>plex on iPadOS / tablets</b>desktop-class sidebar returns at tablet width (Android tablets identical)",render:tabPlex,cls:"tablet"},
+];
+function bar(){
+  const b=(k,id,nm)=>`<button class="${STATE[k]===id?"on":""}" onclick="setS('${k}','${id}')">${nm}</button>`;
+  const th=THEMES[STATE.theme];
+  const note=(th.darkOnly&&STATE.mode==="light")?` · ${th.name} is midnight-only — showing dark`:"";
+  document.getElementById("bar").innerHTML=`
+    <div class="grp"><span class="lbl">theme</span>${Object.keys(THEMES).map(k=>b("theme",k,THEMES[k].name)).join("")}</div>
+    <div class="grp"><span class="lbl">mode</span>${b("mode","dark","Dark")}${b("mode","light","Light")}</div>
+    <span class="note">phone + tablet mockups — fictional library${note}</span>`;
+}
+function setS(k,v){STATE[k]=v;render();}
+function render(){
+  bar();
+  const th=THEMES[STATE.theme];
+  const v=th[th.darkOnly?"dark":STATE.mode]||th.dark;
+  document.documentElement.dataset.theme=STATE.theme;
+  const vars=`--bg:${v.bg};--panel:${v.panel};--panel2:${v.panel2};--line:${v.line};--text:${v.text};
+    --muted:${v.muted};--accent:${v.accent};--accent2:${v.accent2};--warn:${v.warn};--btn-ink:${v.btnInk};
+    --font:${v.font};--font-mono:${v.mono}`;
+  document.getElementById("stage").innerHTML=DEVICES.map(d=>`
+    <div class="dev"><div class="${d.cls}" style="${vars}">
+      ${d.cls==="phone"?'<div class="notch"></div>':""}${d.render()}</div>
+      <div class="cap">${d.cap}</div></div>`).join("");
+}
+window.addEventListener("DOMContentLoaded",render);
+</script>
+</body>
+</html>

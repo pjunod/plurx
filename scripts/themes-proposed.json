@@ -1,0 +1,140 @@
+{
+  "_comment": [
+    "Candidate theme token tables for scripts/contrast-check --from-json.",
+    "NOT shipped. The shipped tables live in crates/plurxd/src/web/index.html.",
+    "Sources, transcribed exactly:",
+    "  Amber, Giallo, Silver, Void, VHS  -- docs/UI-LAYOUTS-PLAN.md S4.2",
+    "  Paper, Tide                       -- docs/UI-LAYOUTS-REVIEW.md 'Reviewer additions'",
+    "  with the corrections from docs/UI-LAYOUTS-IMPLEMENTATION.md S3.4 applied",
+    "  (marked CORRECTED below)."
+  ],
+
+  "amber": {
+    "name": "Amber",
+    "dark": {
+      "--bg": "#191a1d", "--panel": "#212327", "--panel2": "#2a2d32",
+      "--line": "#383c43",
+      "--text": "#eceef0", "--muted": "#9aa0a7", "--prose": "#c9cdd2",
+      "--accent": "#e5a00d", "--accent2": "#cc7b19",
+      "--good": "#52b788", "--bad": "#ee7168", "--warn": "#f2c14e",
+      "--radius": "8px", "--btn-ink": "#1c1303"
+    },
+    "light": {
+      "--bg": "#f3f4f6", "--panel": "#ffffff", "--panel2": "#e9ebee",
+      "--line": "#d5d9de",
+      "--text": "#1e2124", "--muted": "#5f666d", "--prose": "#3a4046",
+      "--accent": "#8b5e00", "--accent2": "#a95f16",
+      "--good": "#246b49", "--bad": "#bd332d", "--warn": "#8a6116",
+      "--radius": "8px", "--btn-ink": "#ffffff"
+    }
+  },
+
+  "giallo": {
+    "name": "Giallo",
+    "dark": {
+      "--bg": "#0c0a06", "--panel": "#14100a", "--panel2": "#1c160d",
+      "--line": "rgba(240,200,120,.10)",
+      "--text": "#f2e9d8", "--muted": "#a89c85", "--prose": "#d6ccb8",
+      "--accent": "#e8a33d", "--accent2": "#8a5a14",
+      "--glow": "rgba(232,163,61,.30)",
+      "--good": "#5fb582", "--bad": "#e5484d", "--warn": "#c9723a",
+      "--radius": "10px", "--btn-ink": "#1a1002"
+    },
+    "light": {
+      "--bg": "#f5eed9", "--panel": "#fbf7ea", "--panel2": "#ffffff",
+      "--line": "rgba(90,70,30,.14)",
+      "--text": "#241d10", "--muted": "#6e6350", "--prose": "#4a4233",
+      "--accent": "#7f4e00", "--accent2": "#7c4a05",
+      "--glow": "rgba(168,114,12,.14)",
+      "--good": "#2c734d", "--bad": "#b23a35", "--warn": "#8a6116",
+      "--radius": "10px", "--btn-ink": "#ffffff"
+    }
+  },
+
+  "silver": {
+    "name": "Silver",
+    "dark": {
+      "--bg": "#0a0a0b", "--panel": "#131315", "--panel2": "#1b1b1e",
+      "--line": "rgba(255,255,255,.10)",
+      "--text": "#f2f2f2", "--muted": "#9a9a9e", "--prose": "#cfcfd3",
+      "--accent": "#e8e8ea", "--accent2": "#8a8a8f",
+      "--good": "#9fbfa8", "--bad": "#d09088", "--warn": "#c9b48c",
+      "--radius": "6px", "--btn-ink": "#0a0a0b"
+    },
+    "light": {
+      "--bg": "#f4f4f2", "--panel": "#ffffff", "--panel2": "#eaeae7",
+      "--line": "rgba(20,20,20,.14)",
+      "--text": "#141416", "--muted": "#66666a", "--prose": "#3a3a3e",
+      "--accent": "#1a1a1c", "--accent2": "#5a5a5f",
+      "--good": "#4a7a58", "--bad": "#a05248", "--warn": "#765f28",
+      "--radius": "6px", "--btn-ink": "#ffffff"
+    }
+  },
+
+  "void": {
+    "name": "Void",
+    "darkOnly": true,
+    "dark": {
+      "--bg": "#000000", "--panel": "#0a0a0a", "--panel2": "#131313",
+      "--line": "rgba(255,255,255,.13)",
+      "--text": "#e8e8e8", "--muted": "#8a8a8a", "--prose": "#c6c6c6",
+      "--accent": "#4cc2ff", "--accent2": "#2f6fe0",
+      "--good": "#34d399", "--bad": "#f87171", "--warn": "#fbbf24",
+      "--radius": "12px", "--btn-ink": "#001018"
+    }
+  },
+
+  "vhs": {
+    "name": "VHS",
+    "darkOnly": true,
+    "dark": {
+      "--bg": "#140d22", "--panel": "#1d1430", "--panel2": "#291c42",
+      "--line": "rgba(255,120,220,.16)",
+      "--text": "#f4e9ff", "--muted": "#a78fc7", "--prose": "#d9c9ee",
+      "--accent": "#ff4fd8", "--accent2": "#26e2ff",
+      "--glow": "rgba(255,79,216,.35)",
+      "--good": "#3ddc97", "--bad": "#ff5c7a", "--warn": "#ffb454",
+      "--radius": "14px", "--btn-ink": "#22041c"
+    }
+  },
+
+  "paper": {
+    "name": "Paper",
+    "light": {
+      "--bg": "#f4f0e8", "--panel": "#fffdf8", "--panel2": "#e9e2d7",
+      "--line": "#c8bfb2",
+      "--text": "#1f2328", "--muted": "#5f625f", "--prose": "#3d4248",
+      "--accent": "#3451b2", "--accent2": "#a33a3a",
+      "--good": "#287a51", "--bad": "#b3261e", "--warn": "#765c00",
+      "--radius": "6px", "--btn-ink": "#ffffff"
+    },
+    "dark": {
+      "--bg": "#171715", "--panel": "#201f1c", "--panel2": "#2a2823",
+      "--line": "#454139",
+      "--text": "#f2eee6", "--muted": "#aaa49a", "--prose": "#d6d0c6",
+      "--accent": "#9db2ff", "--accent2": "#e58b84",
+      "--good": "#6fc49a", "--bad": "#ff8a80", "--warn": "#e2c36f",
+      "--radius": "6px", "--btn-ink": "#101322"
+    }
+  },
+
+  "tide": {
+    "name": "Tide",
+    "light": {
+      "--bg": "#edf4f0", "--panel": "#fbfdfa", "--panel2": "#dfeae4",
+      "--line": "#bccfc5",
+      "--text": "#14201c", "--muted": "#586a62", "--prose": "#34473f",
+      "--accent": "#176b54", "--accent2": "#8a631a",
+      "--good": "#196b48", "--bad": "#b33a32", "--warn": "#735b0b",
+      "--radius": "10px", "--btn-ink": "#ffffff"
+    },
+    "dark": {
+      "--bg": "#071412", "--panel": "#0d1e1b", "--panel2": "#142a25",
+      "--line": "#2a4841",
+      "--text": "#e4f2ed", "--muted": "#93aaa2", "--prose": "#c8dcd5",
+      "--accent": "#73d6b1", "--accent2": "#d6b56d",
+      "--good": "#6fd39f", "--bad": "#ff8a80", "--warn": "#e5c875",
+      "--radius": "10px", "--btn-ink": "#052019"
+    }
+  }
+}

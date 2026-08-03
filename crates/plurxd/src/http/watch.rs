@@ -43,6 +43,14 @@ pub async fn progress(
         .store
         .put_progress(user.id, id, position, req.duration_ms)
         .await?;
+    // This beat is also the heartbeat for a direct play (`crate::delivery`).
+    // It is the only signal that reaches the server from a player which has
+    // stopped fetching: a viewer who paused with the rest of the film already
+    // buffered makes no further range requests, and without this would drop
+    // off the activity page while still sitting in front of it. In-memory and
+    // synchronous — a hash lookup, not a store read — because every open
+    // player in the house arrives here every few seconds.
+    state.direct_plays.touch_item(user.id, id);
     // Feed the Trakt scrobbler (fire-and-forget; a beat every ~5s while the
     // player is open, and the watched flip triggers the scrobble stop).
     let pct = match watch.duration_ms.filter(|d| *d > 0) {

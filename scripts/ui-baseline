@@ -1,0 +1,937 @@
+#!/usr/bin/env python3
+"""Pixel + focus-order baseline of the shipped web UI (gate G0 of the layouts plan).
+
+The whole web UI is one file — `crates/plurxd/src/web/index.html` — and the
+layout work coming after this gate rearranges it. There is no component test
+to lean on and no design system to diff, so the only honest way to say "this
+refactor changed nothing" is to photograph the app before and after and prove
+the photographs are identical. That is what this script produces.
+
+    scripts/ui-baseline --self-host
+    scripts/ui-baseline --base-url http://nynuc:32400 --token "$PLURX_TOKEN"
+
+`--self-host` boots a throwaway plurxd on a scratch data dir, seeds it with a
+tiny generated library (ffmpeg, deterministic bytes, cached between runs),
+rewrites every timestamp in its database to fixed constants, and drives that.
+That is the mode CI and a pre-change/post-change comparison use. Pointing
+`--base-url` at a real server captures the same routes against real content —
+useful on Paul's Mac, but the goldens are then only comparable to other runs
+against the same server with the same library.
+
+Output (all under `--out`, default `target/ui-baseline/`, already covered by
+the `/target` line in .gitignore — the SCRIPT is the committed artefact, the
+goldens are regenerated from the pre-change commit whenever they are needed):
+
+    <route>@<width>x<height>.png    one screenshot per route per viewport
+    focus.json                      tab-order dump keyed "<route>@<w>x<h>"
+
+The gate fails (exit 1) if any route fails to render — a non-2xx document
+response, an uncaught page error, a console error, or an empty `#main`/`#app`.
+
+Determinism is the point. Everything the app derives from the wall clock, the
+timezone, the locale, an animation, a font hint, a device pixel ratio or a
+lazily-decoded image is pinned below, each with a comment saying which drift it
+prevents. Two consecutive runs on an unchanged tree must be byte-identical; if
+they are not, the gate is worthless and the difference is a bug in this file,
+not something to paper over with a tolerance.
+
+`--self-test-fail` deliberately breaks one route so the nonzero exit can be
+demonstrated without hand-editing the app. It exists so the gate's own failure
+path stays tested; a green run never touches it.
+
+Known residuals — things a golden is legitimately tied to, so compare like with
+like and regenerate rather than argue with a diff:
+
+  * The checkout path. Settings prints a library's paths verbatim, and the
+    seeded library lives under `<repo>/target/ui-baseline/media`. Two clones in
+    different directories produce different Settings screenshots.
+  * The host. Chromium's rasteriser and the bundled build both move with the
+    image; goldens do not travel between the sandbox and a Mac.
+  * `--base-url`. A live server's own timestamps are not frozen (only the page
+    clock is), so "3 min ago" on a real Activity page still ticks. That mode is
+    for eyeballing a real library, not for a byte-exact gate; `--self-host` is
+    the mode that is provably deterministic.
+  * The player's stats overlay (`ⓘ Stats`) is never opened: it prints live
+    timing in milliseconds and nothing would make it stand still.
+"""
+
+import argparse
+import calendar
+import hashlib
+import json
+import os
+import shutil
+import signal
+import socket
+import sqlite3
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+
+# The instant the page believes it is. Everything relative the UI renders
+# ("3d ago", "ends ~12:00 PM", a user's join date) is measured from here, and
+# the seeded database is written *backwards* from it, so the two agree. A fixed
+# absolute instant rather than "now minus something": "now" is what makes two
+# runs differ in the first place.
+FROZEN_EPOCH = calendar.timegm(time.strptime("2025-06-15T12:00:00", "%Y-%m-%dT%H:%M:%S"))
+
+# Seeded-library constants. Every one of these is rendered somewhere (library
+# names and paths in Settings, usernames in the header and Settings → Users),
+# so they are named here rather than generated — a mkdtemp path would put a
+# different string on screen every run.
+SEED_USER = "baseline"
+SEED_PASSWORD = "baseline-password"
+
+# The fixture corpus. Tiny on purpose: nothing on screen cares how big the
+# picture is, and CI pays for every encode. Durations differ per title so the
+# runtime column and the resume arithmetic have something real to show.
+#
+# `codec` picks the encoder: "h264" is what a real library is full of, and
+# "vp9" is the one pair (VP9 + Opus) the headless Chromium in the sandbox can
+# actually decode — the player route needs a file that genuinely plays, so
+# exactly one fixture is VP9.
+FIXTURES = [
+    ("movies", "Heat (1995)/Heat (1995).mp4", "h264", 12),
+    ("movies", "Blade Runner (1982)/Blade Runner (1982).mp4", "h264", 9),
+    ("more-movies", "The Signal (2021)/The Signal (2021).webm", "vp9", 6),
+    ("more-movies", "Signal Fire (2003)/Signal Fire (2003).mp4", "h264", 7),
+    ("shows", "Signal Hill (2019)/Season 01/Signal Hill - S01E01 - Cold Open.mp4", "h264", 5),
+    ("shows", "Signal Hill (2019)/Season 01/Signal Hill - S01E02 - The Handoff.mp4", "h264", 4),
+]
+
+# Two shares in the *same* category, so Home's "movies · view all" resolves to
+# the merged `#/category/movie` page rather than short-circuiting to the single
+# library — the category route has to have a reason to exist.
+LIBRARIES = [
+    ("Movies", "movies", "movies"),
+    ("More Movies", "movies", "more-movies"),
+    ("TV Shows", "shows", "shows"),
+]
+
+VIEWPORTS = [(1280, 860), (390, 780)]
+
+# Animation, transition and caret are killed with a stylesheet rather than with
+# a wait: a wait only makes the odds better. `caret-color` matters because the
+# search box on the search route holds a caret that blinks at 500ms — a coin
+# flip on every capture. `scroll-behavior` because the rails scroll smoothly,
+# and a screenshot taken mid-glide is a different picture every time.
+FREEZE_CSS = """
+*, *::before, *::after {
+  animation: none !important;
+  animation-duration: 0s !important;
+  animation-delay: 0s !important;
+  transition: none !important;
+  transition-duration: 0s !important;
+  transition-delay: 0s !important;
+  caret-color: transparent !important;
+  scroll-behavior: auto !important;
+}
+"""
+
+# Installed as an init script so it runs before the app's first line. Two jobs:
+#
+#  1. Freeze the clock. The app formats "just now", "3d ago", "ends ~12:00 PM"
+#     and a user's join date straight off Date.now()/new Date(); without this
+#     the same DOM renders differently one minute later. `new Date(x)` with an
+#     argument is left alone — parsing an air date must still work.
+#  2. Inject FREEZE_CSS at document-start, so no frame is ever painted with
+#     transitions live. Adding it after load would leave the first paint (and
+#     any capture racing it) animated.
+#
+# Math.random is *not* stubbed: the app uses it for playback/request ids that
+# never reach the screen, and replacing it would be lying about the real app.
+FREEZE_JS = """
+(() => {
+  const FROZEN = __FROZEN_MS__;
+  const Real = Date;
+  class Frozen extends Real {
+    constructor(...args) { if (args.length === 0) super(FROZEN); else super(...args); }
+    static now() { return FROZEN; }
+  }
+  Frozen.parse = Real.parse;
+  Frozen.UTC = Real.UTC;
+  window.Date = Frozen;
+
+  // An init script runs before the parser has produced <html>, so there is
+  // nothing to append to on the first call — hence the null guard and the two
+  // later attempts. The earliest one that finds a root wins; the id makes the
+  // rest no-ops.
+  const style = () => {
+    const root = document.head || document.documentElement;
+    if (!root || document.getElementById("ui-baseline-freeze")) return;
+    const el = document.createElement("style");
+    el.id = "ui-baseline-freeze";
+    el.textContent = __FREEZE_CSS__;
+    root.appendChild(el);
+  };
+  style();
+  document.addEventListener("readystatechange", style);
+  document.addEventListener("DOMContentLoaded", style);
+})();
+"""
+
+# Descriptor for one focused element. Order of preference for the label is
+# aria-label, then title, then the element's own trimmed text — the same order
+# a screen reader resolves, so the dump reads like the thing being tested.
+# Deliberately excludes `value`, `href` and anything else that carries an id or
+# a typed string: a tab order must not change because a database handed out a
+# different primary key.
+FOCUS_JS = """
+() => {
+  const el = document.activeElement;
+  if (!el || el === document.body || el === document.documentElement) return null;
+  const tag = el.tagName.toLowerCase();
+  const id = el.id ? "#" + el.id : "";
+  const cls = el.classList.length ? "." + Array.from(el.classList).join(".") : "";
+  let label = el.getAttribute("aria-label") || el.getAttribute("title") || "";
+  if (!label) label = (el.innerText || el.textContent || "");
+  if (!label && el.placeholder) label = el.placeholder;
+  label = label.replace(/\\s+/g, " ").trim().slice(0, 60);
+  return tag + id + cls + (label ? ' "' + label + '"' : "");
+}
+"""
+
+
+class Fail(Exception):
+    """A route did not render. Collected, reported, and turned into exit 1."""
+
+
+# ---- environment ----------------------------------------------------------
+
+
+def find_browser(explicit):
+    """Path to a headless Chromium, or None to let Playwright resolve its own.
+
+    The sandbox ships browsers under PLAYWRIGHT_BROWSERS_PATH with a build
+    number in the directory name (`chromium-1194`), and that number moves every
+    time the image is rebuilt — hence a glob rather than the literal path.
+    On a Mac there is a normal `playwright install` cache and Playwright finds
+    it without help, so falling through to None is the right answer there.
+    """
+    if explicit:
+        return explicit
+    root = Path(os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "/opt/pw-browsers"))
+    if not root.is_dir():
+        return None
+    # Full `chrome` before `headless_shell`: the shell build is missing pieces
+    # the player route needs (media decode among them), and a route that cannot
+    # play is a route this gate cannot photograph.
+    for pattern in ("chromium-*/chrome-linux/chrome", "chromium_headless_shell-*/chrome-linux/headless_shell"):
+        found = sorted(root.glob(pattern))
+        if found:
+            return str(found[-1])
+    return None
+
+
+def free_port(preferred):
+    """`preferred` if it is free, else whatever the kernel hands out.
+
+    The port never reaches the screen, so a fallback cannot cost determinism —
+    but a hard failure on a busy port would cost a run.
+    """
+    with socket.socket() as s:
+        try:
+            s.bind(("127.0.0.1", preferred))
+            return preferred
+        except OSError:
+            pass
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def api(base, path, token=None, method="GET", body=None, timeout=60):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(base.rstrip("/") + "/api/v1" + path, data=data, method=method)
+    if data:
+        req.add_header("content-type", "application/json")
+    if token:
+        req.add_header("authorization", "Bearer " + token)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            payload = r.read()
+            return json.loads(payload or b"null")
+    except urllib.error.HTTPError as e:
+        raise Fail(f"{method} {path} -> {e.code}: {e.read().decode(errors='replace')[:200]}")
+
+
+# ---- fixture media --------------------------------------------------------
+
+
+def generate_media(media_dir, ffmpeg):
+    """Build the fixture corpus once and reuse it forever after.
+
+    Cached, exactly as `plurx_core::testfixtures` caches its own: an encoder is
+    only *mostly* reproducible across versions and thread counts, and this gate
+    cannot afford "mostly". Reusing the bytes makes the question moot — two runs
+    read the same file. The stamp carries the recipe, so changing a duration or
+    a codec below regenerates rather than silently keeping stale media.
+    """
+    recipe = hashlib.sha256(json.dumps(FIXTURES, sort_keys=True).encode()).hexdigest()[:16]
+    stamp = media_dir / ".recipe"
+    if stamp.is_file() and stamp.read_text().strip() == recipe:
+        return
+    if media_dir.exists():
+        shutil.rmtree(media_dir)
+    for share, rel, codec, seconds in FIXTURES:
+        out = media_dir / share / rel
+        out.parent.mkdir(parents=True, exist_ok=True)
+        cmd = [
+            ffmpeg, "-y", "-v", "error", "-nostdin",
+            # `testsrc2` paints a running timecode, which is what makes a paused
+            # frame in the player screenshot legible as "we seeked to 2.000s".
+            "-f", "lavfi", "-i", f"testsrc2=size=320x180:rate=24:duration={seconds}",
+            "-f", "lavfi", "-i", f"sine=frequency=440:sample_rate=48000:duration={seconds}",
+        ]
+        if codec == "vp9":
+            cmd += ["-c:v", "libvpx-vp9", "-b:v", "300k", "-deadline", "realtime",
+                    "-cpu-used", "8", "-g", "24", "-c:a", "libopus"]
+        else:
+            cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-g", "24", "-c:a", "aac"]
+        # -threads 1 so a regeneration on a 4-core laptop and a 64-core builder
+        # produce the same bytes; slice-threaded x264 does not.
+        #
+        # `-bitexact` here rather than before the inputs (where it would only
+        # configure the demuxers): the Matroska muxer stamps a random SegmentUID
+        # and TrackUID into every WebM it writes, so two encodes of byte-identical
+        # video differ in their header. This zeroes them, and drops the encoder
+        # version string, so a *regenerated* corpus matches a cached one instead
+        # of merely being equivalent to it.
+        cmd += ["-threads", "1", "-fflags", "+bitexact", "-flags", "+bitexact",
+                "-pix_fmt", "yuv420p", "-ac", "2", "-shortest", str(out)]
+        subprocess.run(cmd, check=True)
+    stamp.write_text(recipe + "\n")
+
+
+# ---- the throwaway server -------------------------------------------------
+
+
+class SelfHost:
+    """Boot, seed, freeze and serve a plurxd nobody else is using."""
+
+    def __init__(self, args):
+        self.args = args
+        self.root = Path(args.out).resolve() / "selfhost"
+        self.data_dir = self.root / "data"
+        # Media lives outside the wiped data dir: it is the expensive part and
+        # it never changes. The path itself is rendered (Settings shows a
+        # library's paths verbatim), so it is derived from the repo root rather
+        # than from a temp dir — same checkout, same string on screen.
+        self.media_dir = Path(args.out).resolve() / "media"
+        self.config = self.root / "plurx.toml"
+        self.log = self.root / "plurxd.log"
+        self.port = free_port(args.port)
+        self.base_url = f"http://127.0.0.1:{self.port}"
+        self.proc = None
+        self.token = None
+        self.routes = {}
+
+    def server_bin(self):
+        if self.args.server_bin:
+            path = Path(self.args.server_bin).resolve()
+            if not path.exists():
+                raise Fail(f"no such server binary: {path}")
+            return path
+        path = ROOT / "target" / "debug" / "plurxd"
+        if not path.exists():
+            print("BUILD   cargo build -p plurxd", flush=True)
+            subprocess.run(["cargo", "build", "-p", "plurxd"], cwd=ROOT, check=True)
+        return path
+
+    def spawn(self):
+        handle = open(self.log, "a")
+        # start_new_session so a Ctrl-C in the terminal does not race us to the
+        # child: this script stops it explicitly, in `stop`.
+        self.proc = subprocess.Popen(
+            [str(self.server_bin()), "--config", str(self.config), "run"],
+            cwd=ROOT, stdout=handle, stderr=handle, stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            env={**os.environ, "PLURX_LOG": "info", "TZ": "UTC"},
+        )
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            if self.proc.poll() is not None:
+                raise Fail(f"plurxd exited {self.proc.returncode}; see {self.log}")
+            try:
+                with urllib.request.urlopen(self.base_url + "/healthz", timeout=1) as r:
+                    if r.status == 200:
+                        return
+            except Exception:
+                time.sleep(0.2)
+        raise Fail(f"plurxd never became healthy; see {self.log}")
+
+    def stop(self):
+        if not self.proc or self.proc.poll() is not None:
+            return
+        self.proc.send_signal(signal.SIGTERM)
+        try:
+            self.proc.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            self.proc.wait(timeout=10)
+
+    def start(self):
+        generate_media(self.media_dir, self.args.ffmpeg)
+        # The database is rebuilt from scratch every run. Reusing it would carry
+        # last run's ids, scan results and watch rows into this one, and the
+        # first divergence would be invisible until a screenshot moved.
+        if self.root.exists():
+            shutil.rmtree(self.root)
+        self.data_dir.mkdir(parents=True)
+        self.config.write_text(
+            "# Written by scripts/ui-baseline --self-host. Throwaway.\n"
+            f'[server]\nname = "plurx"\nbind = "127.0.0.1:{self.port}"\n\n'
+            f'[storage]\ndata_dir = "{self.data_dir}"\n'
+        )
+        self.spawn()
+        self.seed()
+        # Restart *after* seeding, and after the timestamps are rewritten. The
+        # scan result the server keeps in memory carries the wall-clock instant
+        # the scan finished, and Settings and Activity both render it as
+        # "· just now" / "· 2m ago" — a stopwatch running against the capture.
+        # A fresh process has no such memory, and reads the frozen database.
+        self.stop()
+        self.freeze_database()
+        self.spawn()
+        self.discover()
+
+    def seed(self):
+        self.token = api(self.base_url, "/setup", method="POST",
+                         body={"username": SEED_USER, "password": SEED_PASSWORD})["token"]
+        libs = []
+        for name, kind, share in LIBRARIES:
+            libs.append(api(self.base_url, "/libraries", self.token, "POST", {
+                "name": name, "kind": kind,
+                "paths": [str(self.media_dir / share)], "anime": False,
+            }))
+        deadline = time.time() + 300
+        while time.time() < deadline:
+            status = api(self.base_url, "/scan/status", self.token)
+            done = [status.get(str(l["id"])) for l in libs]
+            if all(s and not s["running"] and s.get("last_scan") for s in done):
+                break
+            time.sleep(0.4)
+        else:
+            raise Fail("the seeded libraries never finished scanning")
+
+        by_title = {}
+        for lib in libs:
+            page = api(self.base_url, f"/libraries/{lib['id']}/items?limit=200&sort=title", self.token)
+            for item in page["items"]:
+                by_title[item["title"]] = item
+        # Watch state, so Home has a "Continue watching" and a "Next up" rail
+        # and the item page has a Resume button — three more relative-time
+        # renderings under test, and the difference between photographing the
+        # app and photographing an empty one.
+        heat = by_title.get("Heat")
+        if heat:
+            api(self.base_url, f"/items/{heat['id']}/progress", self.token, "POST",
+                {"position_ms": 7000, "duration_ms": 12000})
+        listing = api(self.base_url, f"/libraries/{libs[2]['id']}/items?limit=200&sort=title", self.token)
+        shows = [i for i in listing["items"] if i["kind"] == "show"]
+        if shows:
+            # show -> seasons -> episodes: the listing only returns shows, so
+            # the first episode takes two more hops to reach.
+            detail = api(self.base_url, f"/items/{shows[0]['id']}", self.token)
+            first = None
+            for season in detail.get("children") or []:
+                kids = api(self.base_url, f"/items/{season['id']}", self.token).get("children") or []
+                if kids:
+                    first = sorted(kids, key=lambda e: (e.get("episode_number") or 0))[0]
+                    break
+            if first:
+                # Past the 95% mark, so the store flips it watched and "Next up"
+                # advances to episode two — the state a real library is in.
+                api(self.base_url, f"/items/{first['id']}/progress", self.token, "POST",
+                    {"position_ms": 4900, "duration_ms": 5000})
+        self.libs = libs
+
+    def freeze_database(self):
+        """Rewrite every stored instant to a constant, backwards from FROZEN_EPOCH.
+
+        The page clock is frozen separately; this is the other half. Freezing
+        only the page would render "in 3 days" for a library scanned after the
+        frozen instant, and freezing only the database would still leave the
+        page measuring from a moving now. Ordering is assigned by title rather
+        than by row id: ids come out of the scan in readdir order, which is a
+        filesystem property, and a tie in added_at would let two runs sort
+        "Recently added" differently.
+        """
+        db = sqlite3.connect(self.data_dir / "plurx.db")
+        try:
+            base = FROZEN_EPOCH - 3 * 86400
+            rows = list(db.execute(
+                "SELECT id FROM items ORDER BY title, season_number, episode_number, id"))
+            for n, (item_id,) in enumerate(rows):
+                stamp = base - n * 3600
+                db.execute("UPDATE items SET added_at = ?, updated_at = ? WHERE id = ?",
+                           (stamp, stamp, item_id))
+            db.execute("UPDATE files SET scanned_at = ?", (base,))
+            db.execute("UPDATE watch_state SET updated_at = ?", (base + 3600,))
+            db.execute("UPDATE users SET created_at = ?", (FROZEN_EPOCH - 30 * 86400,))
+            db.execute("UPDATE tokens SET created_at = ?, last_seen_at = ?",
+                       (FROZEN_EPOCH - 30 * 86400, FROZEN_EPOCH - 30 * 86400))
+            db.execute("UPDATE settings SET updated_at = ?", (FROZEN_EPOCH - 30 * 86400,))
+            db.execute("UPDATE libraries SET created_at = ?, last_scan_at = ?",
+                       (FROZEN_EPOCH - 30 * 86400, base))
+            db.commit()
+        finally:
+            db.close()
+
+    def discover(self):
+        self.routes = discover_routes(self.base_url, self.token, self.args,
+                                      preferred_library=self.libs[0]["id"],
+                                      preferred_item="Heat",
+                                      preferred_player="The Signal",
+                                      preferred_query="signal")
+
+
+# ---- route table ----------------------------------------------------------
+
+
+# What Playwright's Chromium can decode. It is built without the proprietary
+# codecs, so H.264/AAC — which is most of a real library, and what the server
+# transcodes *to* — plays nowhere in it. The player route therefore needs a
+# source in this set, or nothing ever reaches a decoded frame and the route
+# times out rather than failing with a reason. A `--browser` pointed at a real
+# Chrome or Edge decodes more than this; `--player-item` is the override for
+# that case.
+BROWSER_VIDEO_CODECS = {"vp9", "vp8", "av1", "av01", "theora"}
+# How many item detail lookups the player-item search is allowed. A real
+# library has thousands of titles and this runs before the first screenshot;
+# past a few dozen misses, asking the operator for --player-item is faster than
+# walking the catalogue.
+PLAYABLE_SEARCH_LIMIT = 40
+
+
+def pick_playable(base_url, token, items, preferred):
+    """An item the capture browser stands a chance of actually decoding."""
+    if preferred and preferred in items:
+        return items[preferred]["id"]
+    for title in sorted(items)[:PLAYABLE_SEARCH_LIMIT]:
+        detail = api(base_url, f"/items/{items[title]['id']}", token)
+        for f in detail.get("files") or []:
+            if f.get("available") and (f.get("video_codec") or "").lower() in BROWSER_VIDEO_CODECS:
+                return items[title]["id"]
+    # Not fatal here: a `--browser` with the proprietary codecs will play the
+    # fallback fine, and only the player route suffers if it cannot.
+    print("warn:   no VP9/AV1 title found for the player route — if it times out, "
+          "pass --player-item with something this browser can decode", file=sys.stderr)
+    return items[sorted(items)[0]]["id"]
+
+
+def discover_routes(base_url, token, args, preferred_library=None, preferred_item=None,
+                    preferred_player=None, preferred_query=None):
+    """Resolve the nine routes against whatever server we were pointed at.
+
+    Ids are looked up rather than hardcoded so `--base-url` works against a real
+    library. The ids themselves never appear in a screenshot — only in the hash
+    — so a server whose ids differ still produces comparable pictures for the
+    same content.
+    """
+    libs = api(base_url, "/libraries", token)
+    if not libs:
+        raise Fail("the server has no libraries — nothing to photograph")
+    library_id = args.library or preferred_library or sorted(l["id"] for l in libs)[0]
+    lib = next((l for l in libs if l["id"] == library_id), libs[0])
+    category = {"movies": "movie", "shows": "show", "home": "home"}.get(lib["kind"], lib["kind"])
+
+    items = {}
+    for l in libs:
+        for item in api(base_url, f"/libraries/{l['id']}/items?limit=200&sort=title", token)["items"]:
+            items.setdefault(item["title"], item)
+    if not items:
+        raise Fail("the server's libraries are empty — nothing to photograph")
+
+    def pick(preferred):
+        if preferred and preferred in items:
+            return items[preferred]["id"]
+        return items[sorted(items)[0]]["id"]
+
+    item_id = args.item or pick(preferred_item)
+    player_id = args.player_item or pick_playable(base_url, token, items, preferred_player)
+    query = args.search_query or preferred_query or sorted(items)[0].split()[0].lower()
+
+    return {
+        "home": {"hash": "#/"},
+        "library": {"hash": f"#/library/{library_id}"},
+        "category": {"hash": f"#/category/{category}"},
+        "search": {"hash": f"#/search/{query}"},
+        "item": {"hash": f"#/item/{item_id}"},
+        "activity": {"hash": "#/activity"},
+        "settings": {"hash": "#/settings"},
+        # No token in localStorage, so `boot()` falls through to the sign-in
+        # card. The only route whose container is #app: there is no #main
+        # until somebody is signed in.
+        "auth": {"hash": "#/", "anonymous": True, "container": "#app"},
+        "player": {"hash": f"#/item/{player_id}", "player": True},
+    }
+
+
+# ---- capture --------------------------------------------------------------
+
+
+def settle(page):
+    """Everything that must be true before the shutter opens."""
+    # Fonts first: the app embeds its faces as data URLs, so this resolves
+    # immediately — but "immediately" is not "already", and a capture that beats
+    # it renders a fallback face at different metrics.
+    page.evaluate("() => document.fonts.ready")
+    # `decode()` rather than `complete`: a cached image reports complete before
+    # it is decodable, and Chromium paints nothing for it.
+    page.evaluate("""async () => {
+      await Promise.all(Array.from(document.images).map(i => i.decode().catch(() => {})));
+    }""")
+    # The rails remember a horizontal scroll offset per element and the page a
+    # vertical one; both survive a hash change within the same document.
+    page.evaluate("""() => {
+      window.scrollTo(0, 0);
+      document.querySelectorAll('.rowscroll, .logbox').forEach(el => { el.scrollLeft = 0; el.scrollTop = 0; });
+    }""")
+    # Two rAFs: the first lands in the frame currently being built, the second
+    # is the first frame that can contain everything above.
+    page.evaluate("() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))")
+
+
+def open_player(page, timeout_ms):
+    """Open the player on the item page and park it on one exact frame.
+
+    The player is the one route with a moving picture in it, and no amount of
+    settling makes a playing video deterministic. So it is stopped rather than
+    waited on: play for real (a real decision, a real stream — nothing here is
+    stubbed), then pause and seek to a fixed offset. `testsrc2` paints its own
+    timecode, so the parked frame is the same picture on every run, and the
+    transport reads 0:02 because it genuinely is at two seconds.
+    """
+    page.click("#main button.btnplay", timeout=timeout_ms)
+    # readyState 3 (HAVE_FUTURE_DATA) means the decoder has the frame — before
+    # that a seek lands wherever the demuxer happens to be.
+    try:
+        page.wait_for_function(
+            "() => { const v = document.getElementById('video'); return v && v.readyState >= 3; }",
+            timeout=timeout_ms)
+    except Exception:
+        # Overwhelmingly this is a codec the capture browser cannot decode, and
+        # a bare "wait_for_function timed out" sends the reader looking in the
+        # wrong place. Report what the player itself said.
+        state = page.evaluate("""() => {
+          const t = document.getElementById('ploadText');
+          const s = document.getElementById('ploadSub');
+          return ((t && t.textContent) || '') + ((s && s.textContent) ? ' — ' + s.textContent : '');
+        }""")
+        raise Fail("the player never produced a decodable frame"
+                   + (f" (player says: {state.strip()})" if state.strip() else "")
+                   + " — pass --player-item with a title this browser can decode")
+    page.evaluate("""async () => {
+      const v = document.getElementById('video');
+      v.pause();
+      await new Promise(r => { v.addEventListener('seeked', r, { once: true }); v.currentTime = 2.0; });
+      // The chrome auto-hides after 2.6s of playing. It cannot re-hide while
+      // paused (the idle timer checks), but it may already have hidden during
+      // start-up, so the class is cleared explicitly.
+      const p = document.getElementById('player');
+      if (p) p.classList.remove('idle');
+    }""")
+    # The toast the player raises on a state change fades on its own timer.
+    # Waiting it out is cheaper than deciding whether it is "supposed" to be
+    # in the picture — either answer is fine, only a race is not.
+    page.wait_for_function(
+        "() => { const t = document.getElementById('toast'); return !t || !t.classList.contains('on'); }",
+        timeout=timeout_ms)
+
+
+def tab_order(page, stops):
+    """Press Tab from a known start and record who takes focus, in order.
+
+    Runs after the screenshot: focusing an element gives it a focus ring, and a
+    ring in the golden would make the picture depend on the dump.
+    """
+    page.evaluate("""() => {
+      // A known start: whatever the page focused on load is discarded, so the
+      // first Tab always lands on the first tabbable element in DOM order.
+      if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
+    }""")
+    seen = []
+    for _ in range(stops):
+        page.keyboard.press("Tab")
+        descriptor = page.evaluate(FOCUS_JS)
+        if descriptor is None:
+            # Focus left the document — the tab ring wrapped through the
+            # browser's own chrome. That is the end of the page's order.
+            seen.append("<wrap>")
+            break
+        seen.append(descriptor)
+    return seen
+
+
+def capture_route(pw_context, base_url, name, route, width, height, args, out_dir):
+    page = pw_context.new_page()
+    problems = []
+    # Console errors and uncaught exceptions are collected for the whole visit,
+    # not sampled at the end: an error thrown during boot is exactly the kind
+    # this gate exists to catch, and it is long gone by the time we screenshot.
+    page.on("console", lambda m: problems.append(f"console.{m.type}: {m.text}") if m.type == "error" else None)
+    page.on("pageerror", lambda e: problems.append(f"pageerror: {e}"))
+    try:
+        response = page.goto(base_url + "/" + route["hash"], wait_until="networkidle",
+                             timeout=args.timeout)
+        if response is not None and not response.ok:
+            raise Fail(f"{name}: document responded {response.status}")
+
+        if args.self_test_fail == "http" and name == args.self_test_route:
+            page.goto(base_url + "/definitely-not-a-page", wait_until="domcontentloaded")
+            raise Fail(f"{name}: document responded 404")
+
+        container = route.get("container", "#main")
+        page.wait_for_selector(container, state="attached", timeout=args.timeout)
+        # The app polls activity every 4s and the activity page re-renders every
+        # 3s. Rather than stubbing either — the baseline has to be of the real
+        # app — the capture waits out more than one full period, so it always
+        # lands on the same steady state instead of on whichever half of the
+        # cycle happened to be showing.
+        page.wait_for_timeout(args.settle_ms)
+        if route.get("player"):
+            open_player(page, args.timeout)
+
+        if args.self_test_fail and name == args.self_test_route:
+            if args.self_test_fail == "console":
+                page.evaluate("() => console.error('ui-baseline self test')")
+            elif args.self_test_fail == "pageerror":
+                page.evaluate("() => { setTimeout(() => { throw new Error('ui-baseline self test'); }, 0); }")
+            elif args.self_test_fail == "empty":
+                page.evaluate("(sel) => { document.querySelector(sel).innerHTML = ''; }", container)
+            page.wait_for_timeout(200)
+
+        settle(page)
+
+        empty = page.evaluate("""(sel) => {
+          const el = document.querySelector(sel);
+          if (!el) return true;
+          return el.childElementCount === 0 && !(el.textContent || '').trim();
+        }""", container)
+        if empty:
+            raise Fail(f"{name}: {container} rendered empty")
+
+        shot = out_dir / f"{name}@{width}x{height}.png"
+        page.screenshot(path=str(shot), full_page=not args.viewport_only)
+        focus = tab_order(page, args.tab_stops)
+        if problems:
+            raise Fail(f"{name}: " + "; ".join(problems[:5]))
+        return focus
+    finally:
+        page.close()
+
+
+def run_capture(base_url, token, routes, args, out_dir):
+    from playwright.sync_api import sync_playwright
+
+    executable = find_browser(args.browser)
+    focus_dump = {}
+    failures = []
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(
+            executable_path=executable,
+            args=[
+                # No sandbox because this runs as root in a container; harmless
+                # on a Mac, where Playwright's own Chromium is already unsandboxed
+                # for automation.
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                # Software rendering only. A GPU raster path differs per host and
+                # per driver, which is precisely the kind of "identical tree,
+                # different pixels" this gate must not have.
+                "--disable-gpu",
+                # A scrollbar appears on some routes and not others, and its
+                # width shifts the whole content box. Hiding it removes a
+                # difference that is about content length, not layout.
+                "--hide-scrollbars",
+                "--force-device-scale-factor=1",
+                "--force-color-profile=srgb",
+                # Font rasterisation: hinting and subpixel positioning are both
+                # host-configurable, and LCD text bakes the subpixel order of a
+                # display into the PNG.
+                "--font-render-hinting=none",
+                "--disable-lcd-text",
+                "--disable-font-subpixel-positioning",
+                # A backgrounded renderer throttles timers, so the app's pollers
+                # fire late and the "settled" state is not the settled state.
+                "--disable-background-timer-throttling",
+                "--disable-renderer-backgrounding",
+                "--disable-backgrounding-occluded-windows",
+                "--lang=en-US",
+            ],
+        )
+        try:
+            for width, height in VIEWPORTS:
+                for name, route in routes.items():
+                    context = browser.new_context(
+                        viewport={"width": width, "height": height},
+                        # Retina would double every pixel and hide nothing; 1 is
+                        # also the only ratio that is the same on both machines.
+                        device_scale_factor=1,
+                        locale="en-US",
+                        timezone_id="UTC",
+                        # The app asks matchMedia for both of these. Pinning them
+                        # stops the host's own accessibility and appearance
+                        # settings from leaking into the picture.
+                        reduced_motion="reduce",
+                        color_scheme="dark",
+                    )
+                    context.add_init_script(
+                        FREEZE_JS.replace("__FROZEN_MS__", str(FROZEN_EPOCH * 1000))
+                                 .replace("__FREEZE_CSS__", json.dumps(FREEZE_CSS))
+                    )
+                    # Every UI preference the app persists is written before the
+                    # app's first line: theme, light/dark, poster size, Home
+                    # grouping, page size, Settings tab. Any one of them left at
+                    # "whatever the default is today" would silently redecorate
+                    # the baseline the day that default changes.
+                    prefs = {
+                        # The layout is a baseline dimension exactly like the
+                        # theme: the same routes have to be photographed under
+                        # every layout, and a layout applied after first paint
+                        # would capture the wrong chrome.
+                        "plurx_layout": args.layout,
+                        "plurx_theme": args.theme,
+                        "plurx_appearance": args.appearance,
+                        "plurx_iconsize": "s",
+                        "plurx_home_group": "category",
+                        "plurx_settings_tab": "libraries",
+                        "plurx_quality": "auto",
+                        "plurx_playerinfo": "1",
+                        "plurx_autoskip": "0",
+                        "plurx_autonext": "1",
+                        # The install banner is dismissible and its state is
+                        # sticky; pinning it dismissed keeps Home's first row
+                        # from depending on the browser's PWA opinion.
+                        "plurx_getapp_dismissed": "1",
+                    }
+                    if not route.get("anonymous"):
+                        prefs["plurx_token"] = token
+                    context.add_init_script(
+                        "(() => { try { const p = %s; for (const k in p) localStorage.setItem(k, p[k]); } catch (e) {} })();"
+                        % json.dumps(prefs)
+                    )
+                    key = f"{name}@{width}x{height}"
+                    try:
+                        focus_dump[key] = capture_route(
+                            context, base_url, name, route, width, height, args, out_dir)
+                        print(f"OK      {key}", flush=True)
+                    except Exception as e:  # noqa: BLE001 — every failure is a gate failure
+                        failures.append(f"{key}: {e}")
+                        print(f"FAIL    {key}: {e}", flush=True)
+                    finally:
+                        context.close()
+        finally:
+            browser.close()
+    return focus_dump, failures
+
+
+# ---- entry point ----------------------------------------------------------
+
+
+def parse_args(argv):
+    p = argparse.ArgumentParser(
+        prog="scripts/ui-baseline",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=__doc__,
+    )
+    p.add_argument("--self-host", action="store_true",
+                   help="boot a throwaway plurxd with a seeded library and drive that")
+    p.add_argument("--base-url", help="capture an already-running server instead")
+    p.add_argument("--token", help="bearer token for --base-url (localStorage.plurx_token)")
+    p.add_argument("--out", default=str(ROOT / "target" / "ui-baseline"),
+                   help="output directory (default: target/ui-baseline)")
+    p.add_argument("--layout", default="classic", help="localStorage.plurx_layout (default: classic)")
+    p.add_argument("--theme", default="noirr", help="localStorage.plurx_theme (default: noirr)")
+    p.add_argument("--appearance", default="dark",
+                   help="localStorage.plurx_appearance (default: dark)")
+    p.add_argument("--viewport-only", action="store_true",
+                   help="capture the viewport instead of the full scrollable page")
+    p.add_argument("--tab-stops", type=int, default=60,
+                   help="how many times to press Tab per route (default: 60)")
+    p.add_argument("--settle-ms", type=int, default=4500,
+                   help="quiet period before the shutter, in ms — must exceed the 4s "
+                        "activity poll so the capture never lands mid-cycle (default: 4500)")
+    p.add_argument("--timeout", type=int, default=45000, help="per-step timeout in ms")
+    p.add_argument("--browser", help="path to a Chromium binary (default: find one, else Playwright's)")
+    p.add_argument("--server-bin", help="plurxd binary for --self-host (default: target/debug/plurxd)")
+    p.add_argument("--ffmpeg", default=os.environ.get("PLURX_FFMPEG", "ffmpeg"),
+                   help="ffmpeg used to build the fixture media")
+    p.add_argument("--port", type=int, default=39247, help="--self-host port, if free")
+    p.add_argument("--keep-server", action="store_true",
+                   help="leave the throwaway server running so you can poke at it")
+    p.add_argument("--library", type=int, help="library id for the library route")
+    p.add_argument("--item", type=int, help="item id for the item-detail route")
+    p.add_argument("--player-item", type=int, help="item id for the player route")
+    p.add_argument("--search-query", help="query for the search route")
+    p.add_argument("--self-test-fail", choices=["console", "pageerror", "empty", "http"],
+                   help="deliberately break one route to prove the gate exits nonzero")
+    p.add_argument("--self-test-route", default="home",
+                   help="which route --self-test-fail breaks (default: home)")
+    args = p.parse_args(argv)
+    if not args.self_host and not args.base_url:
+        p.error("pass --self-host, or --base-url (with --token) for a running server")
+    if args.base_url and not args.token:
+        p.error("--base-url needs --token: every route but auth is behind a login")
+    return args
+
+
+def main(argv):
+    # TZ before anything else, and before the server is spawned: SQLite's
+    # unixepoch(), the daemon's own formatting and Python's own time all read
+    # it, and a machine in Europe/London would otherwise produce a different
+    # baseline from the same code.
+    os.environ["TZ"] = "UTC"
+    time.tzset()
+
+    args = parse_args(argv)
+    out_dir = Path(args.out).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    # Stale PNGs from a previous route table would sit beside the new ones and
+    # quietly pass a hash comparison nobody re-derived.
+    for old in out_dir.glob("*.png"):
+        old.unlink()
+
+    host = None
+    try:
+        if args.self_host:
+            host = SelfHost(args)
+            host.start()
+            base_url, token, routes = host.base_url, host.token, host.routes
+        else:
+            base_url, token = args.base_url.rstrip("/"), args.token
+            routes = discover_routes(base_url, token, args)
+
+        print(f"CAPTURE {base_url} -> {out_dir}", flush=True)
+        focus, failures = run_capture(base_url, token, routes, args, out_dir)
+
+        # sort_keys + a trailing newline so the file is diffable and stable
+        # whatever order the routes were captured in.
+        (out_dir / "focus.json").write_text(
+            json.dumps(focus, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
+
+        if failures:
+            print("\nFAILED routes:", file=sys.stderr)
+            for line in failures:
+                print("  " + line, file=sys.stderr)
+            return 1
+        print(f"\n{len(focus)} routes captured, no console or page errors.")
+        return 0
+    except Fail as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    finally:
+        if host and not args.keep_server:
+            host.stop()
+        elif host:
+            print(f"server left running at {host.base_url} (token {host.token})")
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

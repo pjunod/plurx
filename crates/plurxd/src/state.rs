@@ -8,6 +8,7 @@ use std::time::Instant;
 
 use plurx_core::domain::{Library, LibraryKind, MetadataPatch};
 use plurx_core::error::StoreError;
+use plurx_core::metadata::genres::GenreBackfillReport;
 use plurx_core::metadata::local::LocalArtReport;
 use plurx_core::metadata::{self, AniListClient, EnrichReport, TmdbClient};
 use plurx_core::scan::{self, PlacedFile, ScanProgress, ScanReport, TargetError, TargetedScan};
@@ -111,6 +112,11 @@ pub struct AppState {
     /// Live telemetry for progressive `/stream.mp4` remuxes, which are not
     /// transcode sessions and so have nowhere else to report from.
     pub streams: Arc<crate::progressive::Streams>,
+    /// Deliveries that keep no record of themselves — direct play. The other
+    /// three routes are listed from the machinery that already owns their
+    /// lifetimes, so this holds only what would otherwise be invisible; see
+    /// [`crate::delivery`].
+    pub direct_plays: Arc<crate::delivery::DirectPlays>,
     pub started_at: Instant,
 }
 
@@ -171,6 +177,7 @@ impl AppState {
             availability: Arc::new(crate::playstart::AvailabilityCache::new()),
             starts: Arc::new(crate::playstart::StartNotifier::new()),
             streams: crate::progressive::Streams::new(),
+            direct_plays: crate::delivery::DirectPlays::new(),
             started_at: Instant::now(),
         }
     }
@@ -348,6 +355,15 @@ pub struct JobManager {
     now_producing: Mutex<Option<ProducingNow>>,
     /// Set to ask the running pass to stop after the title it is on.
     stop_producing: std::sync::atomic::AtomicBool,
+    /// A genre-backfill pass is running. Same reasoning as `producing`: the
+    /// question is "may another one start", not "wait for this one" — two
+    /// passes would read the same cursor, fetch the same titles and double
+    /// the request count for nothing.
+    backfilling_genres: std::sync::atomic::AtomicBool,
+    /// What the last genre-backfill pass did. Server-wide rather than per
+    /// library because the backfill is: it walks item ids, not libraries.
+    /// Surfaced on the settings page, which is where an operator armed it.
+    last_genre_backfill: Mutex<Option<GenreBackfillReport>>,
 }
 
 /// The title a producer pass is working on, and why it chose it.
@@ -361,6 +377,18 @@ pub struct ProducingNow {
     /// 1-based position within this pass, and how many it means to attempt.
     pub index: usize,
     pub total: usize,
+}
+
+/// Clears [`JobManager::backfilling_genres`] however the pass ends, panic
+/// included. A flag left set by an early return is a job that never runs
+/// again until the process restarts, and this one has no interval to make
+/// that visible.
+struct GenreBackfillGuard(Arc<JobManager>);
+
+impl Drop for GenreBackfillGuard {
+    fn drop(&mut self) {
+        self.0.backfilling_genres.store(false, Ordering::Relaxed);
+    }
 }
 
 /// Clears [`JobManager::producing`] however the pass ends — including the ways
@@ -472,7 +500,14 @@ impl JobManager {
             producing: std::sync::atomic::AtomicBool::new(false),
             now_producing: Mutex::new(None),
             stop_producing: std::sync::atomic::AtomicBool::new(false),
+            backfilling_genres: std::sync::atomic::AtomicBool::new(false),
+            last_genre_backfill: Mutex::new(None),
         }
+    }
+
+    /// What the last genre-backfill pass did, if one has run since boot.
+    pub async fn last_genre_backfill(&self) -> Option<GenreBackfillReport> {
+        self.last_genre_backfill.lock().await.clone()
     }
 
     /// What the pre-transcode pass is working on, or `None` if none is.
@@ -1127,7 +1162,57 @@ impl JobManager {
                 }
             }
         }
+
+        // Not a `DueJob`: there is no interval to decide about. It runs on
+        // every tick while it is armed and stops by disarming itself, which
+        // is the whole of its schedule — putting that through `due_jobs`
+        // would be a scheduling decision that isn't one.
+        if metadata::genres::is_armed(self.store.as_ref()).await {
+            let state = Arc::clone(self);
+            tokio::spawn(async move { state.genre_backfill_pass().await });
+        }
         Ok(())
+    }
+
+    /// One paced, resumable pass of the genre backfill (S3).
+    ///
+    /// Spawned rather than run inline for the reason the producer is: a pass
+    /// is up to [`metadata::genres::BATCH`] paced provider calls, and the tick
+    /// it would otherwise block is what starts scans and sweeps. The guard is
+    /// what makes "every tick" safe — a pass still going when the next minute
+    /// arrives is not joined by a second one reading the same cursor.
+    async fn genre_backfill_pass(self: Arc<Self>) {
+        if self.backfilling_genres.swap(true, Ordering::Relaxed) {
+            tracing::debug!("a genre backfill pass is already running; skipping this one");
+            return;
+        }
+        let _guard = GenreBackfillGuard(Arc::clone(&self));
+
+        // No key configured is not a reason to skip the pass: anime libraries
+        // enrich from AniList, which needs none, and those titles are exactly
+        // as entitled to genres as the rest.
+        let tmdb = match self.store.get_setting(keys::TMDB_API_KEY).await {
+            Ok(Some(key)) if !key.is_empty() => Some(TmdbClient::new(key)),
+            Ok(_) => None,
+            Err(e) => {
+                tracing::warn!(error = %e, "genre backfill: reading TMDB key");
+                None
+            }
+        };
+        let anilist = AniListClient::new();
+        let report = metadata::genres::backfill_pass(
+            self.store.as_ref(),
+            tmdb.as_ref(),
+            &anilist,
+            metadata::genres::PACE,
+        )
+        .await;
+        if let Some(report) = report {
+            for problem in &report.problems {
+                tracing::error!(problem = %problem, "genre backfill problem");
+            }
+            *self.last_genre_backfill.lock().await = Some(report);
+        }
     }
 
     /// One producer pass: sweep the cache back under budget, work out what

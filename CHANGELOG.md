@@ -98,6 +98,59 @@ bump may break compatibility and a **patch** bump never does.
   and failed on the device: enable one per deploy, watch the device, then
   keep it or drop it. Full description in
   [docs/OPERATIONS.md](docs/OPERATIONS.md#the-two-hls-master-experiments).
+- **The library list can carry each item's media facts, in one query.** A
+  browse response used to say only how tall an item's best file is; codec,
+  dynamic range, audio, container and size lived on `FileDto`, which only the
+  item-detail response returns — so anything wanting spec columns on a grid
+  had to fetch every item. `GET /api/v1/libraries/:id/items?facts=1` now adds
+  an aggregated `media` block per playable item
+  (`{files, bytes, video, height, dr, audio, container}`), computed for the
+  whole page in a single windowed query over `files` rather than one lookup
+  per card. `files` and `bytes` cover every version of the item; the rest
+  describe its best one — greatest height, then bitrate — so a 2160p Dolby
+  Vision remux beside a 720p copy reads as 2160p and never as a union of
+  files no single copy could play. `dr` speaks the badge vocabulary the
+  clients already print (`DV`, `HDR10+`, `HDR10`, `HLG`) and states what is
+  on disk, not what will be delivered. Without the parameter the response is
+  byte for byte what it was, so no existing client pays for the block.
+- **The activity page can see every viewer, not just the transcoding
+  ones.** `GET /api/v1/activity/detail` grows a `deliveries` array beside
+  the existing `sessions` — which is unchanged, in shape and in meaning —
+  listing everything in flight with a `method` of `direct`, `remux`,
+  `hls-copy` or `transcode`. Two of those were already tracked and simply
+  never listed: an HLS copy-remux has always been a real session, and a
+  progressive `/stream.mp4` remux has always been a registered stream (now
+  registered whether or not the client asks for telemetry, so a native
+  client that sends no stream id is still visible). Direct play had no
+  record at all and now gets one, keyed by the *player* rather than the
+  request — a seeking browser makes dozens of ranged requests for one film,
+  and one row each would have shown a dozen phantom viewers per person. A
+  direct play appears within a beacon and disappears after 30s of silence
+  (three missed progress beacons), because a closed tab announces nothing.
+- **Genres, server-side at last — and the backfill to fill them in.** Nothing
+  in plurx has ever stored a genre for catalogue media: TMDB has returned them
+  on every `/movie/{id}` call the server ever made and the field was read
+  straight past, and the only `<genre>` handling in the tree folded an NFO's
+  into a *home* library's free-form tags. Items now carry a `genres` list
+  (schema v13, a JSON array on the row exactly like `tags`), filled at
+  enrichment time and exposed as an additive `genres` field on every item the
+  API returns. It costs nothing to collect: a movie's genres come out of the
+  details call the match already makes, and a TV library's come from ONE
+  cached `/genre/tv/list` fetch per run rather than a second round-trip per
+  series. AniList supplies its own for anime libraries, free, on the search
+  query that was already running. Library grids take an optional `?genre=` —
+  filtered server-side, case-insensitively, with `total` filtered to match so
+  paging stays honest.
+
+  Libraries enriched before this have no genres, and nothing stored can
+  produce them, so filling them in means asking the provider again once per
+  title. That is an opt-in job (`genres.backfill` on the settings page), never
+  something an upgrade starts on its own: it is paced well under TMDB's public
+  rate ceiling, stamps its progress after every single title so a reboot or a
+  rate limit resumes rather than restarts, disarms itself when it reaches the
+  end of the catalogue, and reports what it backfilled, failed and skipped —
+  with every failure named, because a backfill that half-finishes in silence
+  is worse than one that never ran.
 
 - **Software transcodes are admitted against a CPU budget, and spend it
   explicitly.** Software sessions used to bypass admission entirely: each

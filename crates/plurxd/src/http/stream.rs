@@ -817,18 +817,42 @@ fn vtt_response(bytes: Vec<u8>) -> Response {
         .into_response()
 }
 
+/// What a direct play may say about itself. Additive and optional: every
+/// client that exists today sends none of it and is served exactly as before.
+#[derive(Deserialize)]
+pub struct DirectQuery {
+    /// The player's own stream id, spelled the same as `/stream.mp4`'s so a
+    /// client learns one name. It groups the *range storm* — a seeking browser
+    /// makes dozens of 206 requests for one film, and without an id from the
+    /// player they are grouped by file instead, which merges two simultaneous
+    /// plays of one title by one person into one row. Merging is the safe
+    /// error; the other direction puts phantom viewers on the activity page.
+    pub stream: Option<String>,
+}
+
 /// GET /api/v1/files/:id/direct — raw file with HTTP range support.
 pub async fn direct(
     AuthUser(user): AuthUser,
     State(state): State<AppState>,
     AxPath(id): AxPath<i64>,
+    Query(q): Query<DirectQuery>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let file = load_file(&state, id).await?;
     let served = serve_file_range(&file.path, &headers).await;
     match &served {
-        // Bytes are going out: this is the moment playback is real.
-        Ok(_) => crate::playstart::note_playback_started(&state, user.id, id),
+        // Bytes are going out: this is the moment playback is real. Every
+        // request in the storm reports, and the registry collapses them — the
+        // repetition is what keeps a live viewer listed, since a direct play
+        // has no session to end and a closed tab announces nothing.
+        Ok(_) => crate::playstart::note_playback_started(
+            &state,
+            user.id,
+            &user.username,
+            id,
+            crate::delivery::Method::Direct,
+            q.stream.as_deref(),
+        ),
         // The open failed, so whatever the availability cache believes is
         // wrong — the unmounted-share case, arriving as it actually arrives.
         Err(_) => state.availability.forget(id),
@@ -897,7 +921,14 @@ pub async fn stream_mp4(
     } else {
         q.audio_offset_ms.unwrap_or(0).clamp(-15_000, 15_000)
     };
-    crate::playstart::note_playback_started(&state, user.id, id);
+    crate::playstart::note_playback_started(
+        &state,
+        user.id,
+        &user.username,
+        id,
+        crate::delivery::Method::Remux,
+        q.stream.as_deref(),
+    );
     let decision = q.caps().decide(&file, dv_strippable(&state));
     let audio = q.audio.unwrap_or(0).max(0);
     // Copy HEVC gets an `hvc1` tag so Safari's <video> accepts the fMP4 (an
@@ -915,11 +946,25 @@ pub async fn stream_mp4(
     // makes as soon as the overlay opens, possibly before a frame lands — finds
     // the stream rather than a 404 it would have to distinguish from a
     // finished one.
-    let tracked = q
+    //
+    // Registration is unconditional now, where it used to happen only for a
+    // client that supplied an id. The id still decides whether *status* is
+    // reachable — a server-minted one is never guessed, so nothing can ask
+    // after it — but the registry is also what the activity page lists, and a
+    // remux that skipped it was a viewer nobody could see. The Android client
+    // sends no `stream=` on `/stream.mp4` at all.
+    let sid = q
         .stream
         .as_deref()
+        .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(|sid| state.streams.register(sid, user.id, id, readrate));
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("srv-{}", uuid::Uuid::new_v4()));
+    let tracked = Some(
+        state
+            .streams
+            .register(&sid, user.id, &user.username, id, readrate),
+    );
     remux(RemuxSpec {
         path: &file.path,
         start: q.start,

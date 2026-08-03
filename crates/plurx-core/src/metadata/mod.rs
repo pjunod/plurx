@@ -6,6 +6,7 @@
 //! so a library keeps working offline once enriched (REQ-META-4).
 
 pub mod anilist;
+pub mod genres;
 pub mod local;
 pub mod tmdb;
 
@@ -27,12 +28,52 @@ const POSTER_SIZE: &str = "w500";
 const BACKDROP_SIZE: &str = "original";
 const STILL_SIZE: &str = "original";
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+/// Cap on the problem lines one pass records, mirroring `ScanReport`'s: past
+/// it only a trailing summary is added. A refresh of a library whose provider
+/// is down would otherwise put one line per title into an HTTP response.
+const MAX_PROBLEMS: usize = 40;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct EnrichReport {
     pub matched: usize,
     pub unmatched: usize,
     pub episodes_matched: usize,
     pub errors: usize,
+    /// Human-readable problems, under the same contract
+    /// `ScanReport::problems` carries: an `errors` count with nothing to click
+    /// on is a dead end for whoever has to fix the library.
+    ///
+    /// It also carries failures that belong to no single title — chiefly
+    /// "TMDB's genre vocabulary could not be fetched", which leaves every show
+    /// in the pass without genres while every other field lands perfectly.
+    /// Absent a line here that is invisible: the counts all read as success
+    /// and the genre facets are simply, silently, empty.
+    pub problems: Vec<String>,
+}
+
+impl EnrichReport {
+    /// Record a problem, capped. Use this for anything that also bumps
+    /// `errors` — never push directly, or the cap stops holding.
+    fn note(&mut self, problem: String) {
+        match self.problems.len().cmp(&MAX_PROBLEMS) {
+            std::cmp::Ordering::Less => self.problems.push(problem),
+            std::cmp::Ordering::Equal => self.problems.push(
+                "…and more not listed — see the server log (Settings → System) \
+                 for every one"
+                    .to_owned(),
+            ),
+            std::cmp::Ordering::Greater => {}
+        }
+    }
+}
+
+/// A provider's genres as a patch field: `None` when it named none.
+///
+/// `Some(vec![])` is a *clear* to `apply_metadata`, and a provider that simply
+/// has no genres for a title must not wipe a list an earlier, better-informed
+/// pass stored. Same add-or-replace rule every other patch field follows.
+fn genre_patch(genres: Vec<String>) -> Option<Vec<String>> {
+    (!genres.is_empty()).then_some(genres)
 }
 
 /// Enrich every movie/show still lacking a TMDB id in the given library (or
@@ -54,6 +95,7 @@ pub async fn enrich_library(
     if let Err(e) = tokio::fs::create_dir_all(artwork_dir).await {
         tracing::error!(dir = %artwork_dir.display(), error = %e, "cannot create artwork dir");
         report.errors += 1;
+        report.note(format!("cannot create `{}`: {e}", artwork_dir.display()));
         return report;
     }
 
@@ -62,6 +104,7 @@ pub async fn enrich_library(
         Err(e) => {
             tracing::error!(error = %e, "listing items needing metadata");
             report.errors += 1;
+            report.note(format!("cannot list items needing metadata: {e}"));
             return report;
         }
     };
@@ -111,6 +154,9 @@ pub async fn enrich_library(
                         artwork: poster.attempt.clone(),
                         poster_path: poster.file,
                         backdrop_path: backdrop.file,
+                        // Free: the details call this lookup already made
+                        // carries them. No branch, no second request.
+                        genres: genre_patch(m.genres),
                         enriched: true,
                         ..Default::default()
                     };
@@ -120,8 +166,9 @@ pub async fn enrich_library(
                 }
                 Ok(None) => report.unmatched += 1,
                 Err(e) => {
-                    tracing::warn!(title = %item.title, error = %e, "movie lookup failed");
+                    tracing::error!(title = %item.title, error = %e, "movie lookup failed");
                     report.errors += 1;
+                    report.note(format!("`{}`: movie lookup failed: {e}", item.title));
                 }
             },
             ItemKind::Show => match show_lookup(tmdb, &item, known).await {
@@ -154,6 +201,11 @@ pub async fn enrich_library(
                         artwork: poster.attempt.clone(),
                         poster_path: poster.file,
                         backdrop_path: backdrop.file,
+                        // A show matched by id got these from its details
+                        // body; one matched by search got them from the
+                        // once-per-run genre vocabulary. Either way this is
+                        // the only place either lands.
+                        genres: genre_patch(m.genres),
                         enriched: true,
                         ..Default::default()
                     };
@@ -165,12 +217,29 @@ pub async fn enrich_library(
                 }
                 Ok(None) => report.unmatched += 1,
                 Err(e) => {
-                    tracing::warn!(title = %item.title, error = %e, "show lookup failed");
+                    tracing::error!(title = %item.title, error = %e, "show lookup failed");
                     report.errors += 1;
+                    report.note(format!("`{}`: show lookup failed: {e}", item.title));
                 }
             },
             _ => {}
         }
+    }
+
+    // Once, at the end, not once per show. The vocabulary is fetched a single
+    // time, so it fails a single time, and every title matched by search
+    // afterwards is affected identically — a line per title would be forty
+    // copies of one fact. Counted as an error too: the pass really did fail
+    // to record something it was asked to record, and a green report with
+    // empty genre facets is exactly the invisible failure this forbids.
+    if tmdb.genre_index_failed() {
+        report.errors += 1;
+        report.note(
+            "TMDB's genre list could not be fetched, so shows matched by title \
+             in this pass were stored without genres — re-run the refresh once \
+             TMDB is reachable"
+                .to_owned(),
+        );
     }
 
     tracing::info!(
@@ -246,6 +315,7 @@ pub async fn enrich_anime_library(
     if let Err(e) = tokio::fs::create_dir_all(artwork_dir).await {
         tracing::error!(dir = %artwork_dir.display(), error = %e, "cannot create artwork dir");
         report.errors += 1;
+        report.note(format!("cannot create `{}`: {e}", artwork_dir.display()));
         return report;
     }
     let items = match store
@@ -256,6 +326,7 @@ pub async fn enrich_anime_library(
         Err(e) => {
             tracing::error!(error = %e, "listing anime needing metadata");
             report.errors += 1;
+            report.note(format!("cannot list anime needing metadata: {e}"));
             return report;
         }
     };
@@ -289,6 +360,9 @@ pub async fn enrich_anime_library(
                     artwork: poster.attempt.clone(),
                     poster_path: poster.file,
                     backdrop_path: backdrop.file,
+                    // AniList's own vocabulary, and free — `genres` is one
+                    // more field on the search query that already runs.
+                    genres: genre_patch(m.genres),
                     // AniList never yields a TMDB id, so before `metadata_at`
                     // existed an anime show was re-matched on every single
                     // scan — the id-is-the-marker rule had no id to read.
@@ -301,8 +375,9 @@ pub async fn enrich_anime_library(
             }
             Ok(None) => report.unmatched += 1,
             Err(e) => {
-                tracing::warn!(title = %item.title, error = %e, "anilist lookup failed");
+                tracing::error!(title = %item.title, error = %e, "anilist lookup failed");
                 report.errors += 1;
+                report.note(format!("`{}`: anilist lookup failed: {e}", item.title));
             }
         }
     }
@@ -406,8 +481,9 @@ async fn enrich_episodes(
     let episodes = match store.episodes_for_show(show_id).await {
         Ok(eps) => eps,
         Err(e) => {
-            tracing::warn!(error = %e, "listing episodes");
+            tracing::error!(error = %e, "listing episodes");
             report.errors += 1;
+            report.note(format!("cannot list episodes of item {show_id}: {e}"));
             return;
         }
     };
@@ -434,8 +510,9 @@ async fn enrich_episodes(
         let remote = match tmdb.season_detail(show_tmdb_id, season_number).await {
             Ok(detail) => detail,
             Err(e) => {
-                tracing::warn!(season = season_number, error = %e, "season fetch failed");
+                tracing::error!(season = season_number, error = %e, "season fetch failed");
                 report.errors += 1;
+                report.note(format!("season {season_number} fetch failed: {e}"));
                 continue;
             }
         };
@@ -511,8 +588,9 @@ async fn apply(
     match store.apply_metadata(item_id, &patch).await {
         Ok(()) => true,
         Err(e) => {
-            tracing::warn!(item_id, error = %e, "applying metadata");
+            tracing::error!(item_id, error = %e, "applying metadata");
             report.errors += 1;
+            report.note(format!("cannot store metadata for item {item_id}: {e}"));
             false
         }
     }
@@ -763,6 +841,294 @@ mod tests {
                 }),
             )
             .fallback(get(|| async { vec![0u8, 1, 2, 3] }))
+    }
+
+    /// TMDB with genres on both sides of the split: a movie's details body
+    /// carries them outright, a TV *search* result carries only ids. Every
+    /// endpoint counts its callers, because the cost is the whole point of
+    /// the design and an assertion is the only thing that keeps it true.
+    #[allow(clippy::type_complexity)]
+    fn genre_counting_mock() -> (axum::Router, Vec<(&'static str, Arc<AtomicUsize>)>) {
+        use axum::routing::get;
+        use axum::Json;
+        let counters: Vec<(&'static str, Arc<AtomicUsize>)> = [
+            "search/movie",
+            "movie/details",
+            "search/tv",
+            "genre/tv/list",
+            "genre/movie/list",
+        ]
+        .into_iter()
+        .map(|k| (k, Arc::new(AtomicUsize::new(0))))
+        .collect();
+        let c = |name: &str| -> Arc<AtomicUsize> {
+            counters
+                .iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| v.clone())
+                .expect("counter")
+        };
+        let (search_movie, movie_details) = (c("search/movie"), c("movie/details"));
+        let (search_tv, tv_list, movie_list) =
+            (c("search/tv"), c("genre/tv/list"), c("genre/movie/list"));
+        let router = axum::Router::new()
+            .route(
+                "/search/movie",
+                get(move || {
+                    let hits = search_movie.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        // Search results name genres by id only — for movies
+                        // this is never read, because the details call below
+                        // has the names and is made anyway.
+                        Json(json!({ "results": [
+                            { "id": 603, "title": "The Matrix", "release_date": "1999-03-30",
+                              "genre_ids": [28, 878], "poster_path": "/mp.jpg" }
+                        ]}))
+                    }
+                }),
+            )
+            .route(
+                "/movie/603",
+                get(move || {
+                    let hits = movie_details.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({
+                            "runtime": 136, "imdb_id": "tt0133093",
+                            "genres": [{ "id": 28, "name": "Action" },
+                                       { "id": 878, "name": "Science Fiction" }]
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/search/tv",
+                get(move || {
+                    let hits = search_tv.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({ "results": [
+                            { "id": 42, "name": "Severance", "first_air_date": "2022-02-18",
+                              "genre_ids": [18, 9648], "poster_path": "/sp.jpg" }
+                        ]}))
+                    }
+                }),
+            )
+            .route(
+                "/genre/tv/list",
+                get(move || {
+                    let hits = tv_list.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({ "genres": [{ "id": 18, "name": "Drama" },
+                                                { "id": 9648, "name": "Mystery" }]}))
+                    }
+                }),
+            )
+            .route(
+                "/genre/movie/list",
+                get(move || {
+                    let hits = movie_list.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({ "genres": [] }))
+                    }
+                }),
+            )
+            .fallback(get(|| async { vec![0u8, 1, 2, 3] }));
+        (router, counters)
+    }
+
+    /// S3's cost contract, asserted rather than assumed: a movie's genres are
+    /// free and a library of shows costs ONE extra request between all of
+    /// them.
+    ///
+    /// The failure this forbids is the obvious implementation — resolving a
+    /// show's `genre_ids` with a `/tv/{id}` details call — which is correct,
+    /// invisible in any single test, and doubles the request count of every
+    /// TV refresh forever.
+    #[tokio::test]
+    async fn genres_cost_a_movie_nothing_and_a_whole_run_of_shows_one_call() {
+        let store = SqliteStore::open_in_memory().expect("open");
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "L".into(),
+                kind: LibraryKind::Movies,
+                paths: vec![],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+        let mut movies = Vec::new();
+        let mut shows = Vec::new();
+        for n in 0..2 {
+            movies.push(
+                store
+                    .insert_item(&NewItem {
+                        library_id: lib.id,
+                        kind: ItemKind::Movie,
+                        parent_id: None,
+                        title: format!("matrix {n}"),
+                        year: Some(1999),
+                        season_number: None,
+                        episode_number: None,
+                    })
+                    .await
+                    .expect("movie"),
+            );
+            shows.push(
+                store
+                    .insert_item(&NewItem {
+                        library_id: lib.id,
+                        kind: ItemKind::Show,
+                        parent_id: None,
+                        title: format!("severance {n}"),
+                        year: None,
+                        season_number: None,
+                        episode_number: None,
+                    })
+                    .await
+                    .expect("show"),
+            );
+        }
+
+        let (mock, counters) = genre_counting_mock();
+        let count = |name: &str| -> usize {
+            counters
+                .iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| v.load(Ordering::SeqCst))
+                .expect("counter")
+        };
+        let base = serve(mock).await;
+        let tmdb = TmdbClient::new("k").with_base(&base, &base);
+        let art = tempfile::tempdir().expect("tmp");
+
+        let report = enrich_library(&store, &tmdb, art.path(), Some(lib.id), false, None).await;
+        assert_eq!(report.matched, 4, "two movies and two shows");
+        assert_eq!(report.errors, 0, "problems: {:?}", report.problems);
+
+        for id in &movies {
+            let m = store.get_item(*id).await.expect("get").expect("movie");
+            assert_eq!(
+                m.genres,
+                vec!["Action".to_owned(), "Science Fiction".to_owned()],
+                "a movie's genres come out of the details call it already makes"
+            );
+        }
+        for id in &shows {
+            let s = store.get_item(*id).await.expect("get").expect("show");
+            assert_eq!(
+                s.genres,
+                vec!["Drama".to_owned(), "Mystery".to_owned()],
+                "a show's genre ids resolve against the cached vocabulary"
+            );
+        }
+
+        // The cost accounting. Two movies: one search + one details each, and
+        // not one request more than before genres existed.
+        assert_eq!(count("search/movie"), 2);
+        assert_eq!(count("movie/details"), 2);
+        assert_eq!(
+            count("genre/movie/list"),
+            0,
+            "a movie must never trigger a vocabulary fetch — its details \
+             response already names its genres"
+        );
+        // Two shows: one search each, and ONE list call shared between them.
+        assert_eq!(count("search/tv"), 2);
+        assert_eq!(
+            count("genre/tv/list"),
+            1,
+            "the TV vocabulary is fetched once per run, not once per show"
+        );
+    }
+
+    /// A vocabulary fetch that fails must not be silent, must not be retried
+    /// per title, and must not fail the titles themselves. All three, because
+    /// each was a plausible way to build it.
+    #[tokio::test]
+    async fn a_missing_genre_vocabulary_is_reported_once_and_costs_one_request() {
+        use axum::routing::get;
+        use axum::Json;
+        let store = SqliteStore::open_in_memory().expect("open");
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "L".into(),
+                kind: LibraryKind::Shows,
+                paths: vec![],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+        for n in 0..3 {
+            store
+                .insert_item(&NewItem {
+                    library_id: lib.id,
+                    kind: ItemKind::Show,
+                    parent_id: None,
+                    title: format!("severance {n}"),
+                    year: None,
+                    season_number: None,
+                    episode_number: None,
+                })
+                .await
+                .expect("show");
+        }
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let list_hits = attempts.clone();
+        let app = axum::Router::new()
+            .route(
+                "/search/tv",
+                get(|| async {
+                    Json(json!({ "results": [
+                        { "id": 42, "name": "Severance", "first_air_date": "2022-02-18",
+                          "genre_ids": [18], "poster_path": "/sp.jpg" }
+                    ]}))
+                }),
+            )
+            .route(
+                "/genre/tv/list",
+                get(move || {
+                    let hits = list_hits.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        axum::http::StatusCode::NOT_FOUND
+                    }
+                }),
+            )
+            .fallback(get(|| async { vec![0u8, 1, 2, 3] }));
+        let base = serve(app).await;
+        let tmdb = TmdbClient::new("k").with_base(&base, &base);
+        let art = tempfile::tempdir().expect("tmp");
+
+        let report = enrich_library(&store, &tmdb, art.path(), Some(lib.id), false, None).await;
+        assert_eq!(
+            report.matched, 3,
+            "every show still matched and got a poster"
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "a failed vocabulary fetch is cached as empty — three shows must \
+             not mean three attempts"
+        );
+        assert_eq!(
+            report.errors, 1,
+            "the pass really did fail to record something it was asked to"
+        );
+        assert_eq!(
+            report.problems.len(),
+            1,
+            "one line for one failure, not one per show: {:?}",
+            report.problems
+        );
+        assert!(
+            report.problems[0].contains("genre list"),
+            "the problem must say what went wrong: {:?}",
+            report.problems
+        );
     }
 
     /// The P4 acceptance case: a title a search would plausibly get wrong,
