@@ -345,13 +345,21 @@ Stated plainly so nobody infers more than was built.
   opened in a fresh tab drew an empty sidebar and never heard the answer
   arrive. `libsCached()` now fires the same `libsChanged` hook when it
   FILLS, not only when `invalidateLibs()` clears.
-- **Still open (found in G2b):** the A–Z rail is invisible until the user
-  picks "Title (A–Z)" — `alphaRailHtml` gates on a global that starts empty;
-  shipped behaviour, but plex surfaces it most. `.filemissing` is a
-  hardcoded dark hex box on every light theme — shipped, pre-dating this
-  work, and the one remaining instance of the 2026-07-22 scar. Layout
-  switching resets library scroll to 0 (identical in classic; it is loader
-  re-entry, not the seam).
+- ~~A–Z rail invisible until "Title (A–Z)" is picked~~ — **fixed:**
+  `alphaRailHtml` read the stored preference (`LIB_SORT`, empty until the
+  user touches the select) instead of the effective sort `sortFor()`
+  resolves, so it hid the rail on exactly the libraries it is for. This is
+  the one intentional classic pixel change on the branch: `library` and
+  `category` captures and `focus.json` move because the rail now appears;
+  the other 14 are untouched. Goldens regenerated deliberately.
+- ~~`.filemissing` is a hardcoded dark box on light themes~~ — **fixed**
+  with token mixes; the last instance of the 2026-07-22 scar is gone.
+- ~~Layout switching resets library scroll~~ — **fixed:** `setLayout()`
+  records the offset and each converted route restores it once, after
+  paint. Consume-once, so an actual navigation still lands at the top.
+- **Still open:** cross-engine and screen-reader verification. The harness
+  is Chromium-only, so Safari, Firefox and a VoiceOver pass need a human on
+  a Mac. Nothing else on this branch is unverified.
 - **Chromium only.** No Firefox, no Safari, no real TV, no screen-reader
   pass. Keyboard, reduced-motion and forced-colors were exercised in
   headless Chromium and nowhere else.

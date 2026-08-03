@@ -639,8 +639,15 @@
   .epmeta{color:var(--muted);font-size:12px;margin-top:3px;display:flex;gap:8px;flex-wrap:wrap;align-items:center}
   .epov{color:var(--muted);font-size:12.5px;margin-top:6px;max-width:80ch;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
   .epwatched{color:var(--good)}
-  .filemissing{margin-top:16px;background:#2a1416;border:1px solid #5a2a2e;color:#f7b6ba;border-radius:10px;padding:12px 14px;font-size:13px}
-  .filemissing code{background:rgba(0,0,0,.3);padding:1px 5px;border-radius:4px;font-size:12px}
+  /* Token-mixed, not hardcoded: these three hexes were dark-theme values and
+     rendered as a black box on every light theme — the last surviving instance
+     of the 2026-07-22 scar. The ink is --text rather than --bad because the
+     warning is a paragraph to read; the status colour does its work in the
+     border and the ⚠ glyph, which is a shape and survives any palette. */
+  .filemissing{margin-top:16px;background:color-mix(in srgb, var(--bad) 10%, var(--panel));
+    border:1px solid color-mix(in srgb, var(--bad) 45%, var(--line));color:var(--text);
+    border-radius:10px;padding:12px 14px;font-size:13px}
+  .filemissing code{background:color-mix(in srgb, var(--text) 12%, transparent);padding:1px 5px;border-radius:4px;font-size:12px}
   /* Amber, not red: the file is in the library and it plays — what's missing is
      what plurx knows about it. Mixed against the panel colour the way `.setwarn`
      is, so it reads right in both themes instead of being a dark box in a light
@@ -2177,8 +2184,23 @@ function layoutMenuHtml(){
 // A layout change repaints everything, chrome included — unlike a theme, which
 // only swaps CSS variables on an already-painted page. render() is the honest
 // way to do that: it re-runs the current route through the new layout.
+// Where the reader was, carried across a re-render that is not a navigation.
+// Consume-once: a scroll position restored on a route the user actually
+// navigated to would be worse than the reset it replaces.
+let PENDING_SCROLL=null;
+function restoreScroll(){
+  if(PENDING_SCROLL===null) return;
+  const y=PENDING_SCROLL; PENDING_SCROLL=null;
+  // After the frame that painted the content, or there is nothing to scroll
+  // through yet and the browser clamps the offset to zero.
+  requestAnimationFrame(()=>requestAnimationFrame(()=>window.scrollTo(0,y)));
+}
 function setLayout(id){
   try{ localStorage.setItem("plurx_layout",id); }catch(e){}
+  // A layout switch is a change of clothes, not a change of place: the same
+  // route with the same content is about to be rebuilt from scratch, and
+  // dumping the reader at the top of a 200-item library is a real loss.
+  PENDING_SCROLL=window.scrollY||0;
   applyLayout();
   render();
 }
@@ -2568,6 +2590,7 @@ async function viewHome(){
   const page=await loadHome();
   document.getElementById("main").innerHTML=layoutView("home",page)||`<div class="empty">Nothing here yet.</div>`;
   wireRails();
+  restoreScroll();
 }
 // ---- layout renderers -----------------------------------------------------
 // Attached to the registry declared in the <head> script. A layout supplies a
@@ -2739,8 +2762,13 @@ function matchWatch(it,f){
 // letter buckets line up with the order the list is actually in.
 function sortKey(t){ const s=(t||"").toLowerCase(); for(const a of ["the ","a ","an "]){ if(s.startsWith(a)&&s.length>a.length) return s.slice(a.length); } return s; }
 function alphaBucket(it){ const c=sortKey(it&&it.title)[0]||""; return (c>="a"&&c<="z")?c.toUpperCase():"#"; }
-function alphaRailHtml(items){
-  if(LIB_SORT!=="title") return "";                          // rail only maps to A–Z order
+function alphaRailHtml(items, sort){
+  // The EFFECTIVE sort, not the stored preference. LIB_SORT is "" until the
+  // user touches the select, while sortFor() resolves that to "title" for
+  // every non-home library — so reading the global here hid the rail on
+  // exactly the libraries it is for, until someone re-picked the sort that
+  // was already in force. Callers pass what they actually rendered.
+  if((sort!==undefined?sort:LIB_SORT)!=="title") return "";  // rail only maps to A–Z order
   const present=new Set((items||[]).map(alphaBucket));
   if(present.size<2) return "";                              // pointless with one bucket
   const letters=["#"].concat("ABCDEFGHIJKLMNOPQRSTUVWXYZ".split(""));
@@ -2945,7 +2973,7 @@ async function libraryView(o){
     // mount is placed by the shell, so a layout that wants it on the right edge
     // moves the mount rather than reimplementing the rail.
     const rail=document.getElementById("librail");
-    if(rail) rail.innerHTML=alphaRailHtml(page);
+    if(rail) rail.innerHTML=alphaRailHtml(page, sort);
     const count=document.getElementById("libcount");
     if(count) count.innerHTML=layoutRegion("library","count",m);
     tagAlpha(page);
@@ -2958,6 +2986,7 @@ async function libraryView(o){
   });
   if(LIB_LOAD!==gen) return;
   draw(complete);
+  restoreScroll();
 }
 
 async function viewLibrary(id){
@@ -3134,6 +3163,7 @@ async function viewItem(id){
   layoutChrome("home",`<div class="empty">Loading…</div>`);
   const page=await loadItem(id);
   document.getElementById("main").innerHTML=layoutView("item",page);
+  restoreScroll();
   // One-click play from an episode list lands here and starts immediately.
   if(AUTOPLAY===Number(id)){
     AUTOPLAY=null;
