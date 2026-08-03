@@ -75,13 +75,15 @@ enum Caps {
 
     /// The format-specific signal is the only public API that can distinguish
     /// a Dolby Vision output from an HDR10-only one. Apple deprecated it in
-    /// iOS/tvOS 26 in favor of generic HDR eligibility, which deliberately
-    /// does not name a format. On those releases there is no truthful public
-    /// DV claim to send, so stay conservative and retain compatible HDR10.
+    /// iOS/tvOS 26 in favor of generic HDR eligibility, but that replacement
+    /// deliberately does not name a format. The old property remains present
+    /// and display-aware on 26, so use its DV bit as a compatibility signal and
+    /// still require `displayIsHDR` in `query` before making the wire claim.
+    ///
+    /// Do not replace this with `eligibleForHDRPlayback` alone: that promotes
+    /// an HDR10-only HDMI path to Dolby Vision and can hand AVPlayer a stream
+    /// its current display cannot present.
     private static var dolbyVisionIsAvailable: Bool {
-        if #available(iOS 26.0, tvOS 26.0, *) {
-            return false
-        }
         return AVPlayer.availableHDRModes.contains(.dolbyVision)
     }
 }

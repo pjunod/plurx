@@ -124,7 +124,7 @@ the honest formula is server-delivered ∧ display-capable.
 |---|---|---|
 | Web | `matchMedia("(dynamic-range: high)")`, read live at render time (the window can move between monitors) | none — browsers expose nothing per-stream; the server value stands |
 | Android | `Display.getHdrCapabilities().supportedHdrTypes` — `HDR_TYPE_HDR10`/`HLG`/`DOLBY_VISION` (the probe `Caps.displayIsHdr` already wraps this) | ExoPlayer `player.videoFormat`: `colorInfo.colorTransfer` = ST2084/HLG confirms PQ/HLG in the decoded stream; `sampleMimeType == MimeTypes.VIDEO_DOLBY_VISION` confirms the DV decoder engaged. Already read by the info panel (`videoFormatSummary`, PlayerScreen.kt ~1131) |
-| Apple | `AVPlayer.eligibleForHDRPlayback` (Caps.swift already uses it as the device's HDR/DV gate) | none public for HLS variants — do NOT try to introspect the active variant; the dvh1-tagged master + eligibility is the contract (`hevc_copy_tag` doc comment: dvh1 or AVPlayer never engages its DV pipeline) |
+| Apple | `AVPlayer.eligibleForHDRPlayback` gates HDR; the deprecated-but-present `AVPlayer.availableHDRModes` DV bit distinguishes a DV output from HDR10 on OS 26, whose replacement is only generic | none public for HLS variants — do NOT try to introspect the active variant; the `SUPPLEMENTAL-CODECS` DV master + eligibility/mode intersection is the contract |
 
 The rendered verdict, uniformly:
 
