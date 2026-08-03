@@ -873,9 +873,8 @@ pub async fn direct(
 pub struct StreamQuery {
     /// Start offset in seconds (used for resume; remux fast-seeks the input).
     pub start: Option<f64>,
-    /// Which audio stream to map (`a:{audio}`); default 0. Lets the client
-    /// switch audio language — a non-default pick forces a remux so the chosen
-    /// track is the one in the MP4.
+    /// Which audio stream to map (`a:{audio}`). An explicit viewer choice wins;
+    /// when omitted, the same language policy as `/decision` supplies it.
     pub audio: Option<i64>,
     // Same runtime-caps fields as `/decision`, so the remux copies the audio
     // when the browser can play it (vs. re-encoding to AAC needlessly).
@@ -897,6 +896,28 @@ pub struct StreamQuery {
     pub stream: Option<String>,
     /// Manual A/V correction for this playback only (positive delays audio).
     pub audio_offset_ms: Option<i64>,
+}
+
+/// The track a progressive remux must carry. This is intentionally the same
+/// rule used by `/decision` and HLS sessions: older clients are allowed to omit
+/// `audio`, but that must never mean "ffmpeg's first stream" when the UI's
+/// server-selected default is a different language.
+fn remux_audio_index(
+    audio: &[plurx_core::domain::AudioStream],
+    audio_override: Option<i64>,
+    prefs: &plurx_core::tracks::LangPrefs,
+) -> i64 {
+    if let Some(index) = audio_override.filter(|index| *index >= 0) {
+        return index;
+    }
+    let prefer_original = audio
+        .iter()
+        .any(|track| matches!(track.language.as_deref(), Some("jpn" | "ja" | "jp")))
+        && audio.len() > 1;
+    plurx_core::tracks::select_tracks(audio, &[], prefer_original, prefs)
+        .audio_index
+        .unwrap_or(0)
+        .max(0)
 }
 
 impl StreamQuery {
@@ -937,7 +958,8 @@ pub async fn stream_mp4(
         q.stream.as_deref(),
     );
     let decision = q.caps().decide(&file, dv_strippable(&state));
-    let audio = q.audio.unwrap_or(0).max(0);
+    let prefs = state.transcode.lang_prefs().await;
+    let audio = remux_audio_index(&file.audio_streams, q.audio, &prefs);
     // Copy HEVC gets an `hvc1` tag so Safari's <video> accepts the fMP4 (an
     // `hev1`-tagged MKV copy otherwise plays audio-only / black in Safari).
     let hevc = matches!(file.video_codec.as_deref(), Some("hevc" | "h265"));
@@ -1385,6 +1407,32 @@ fn is_progress_line(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remux_omission_uses_the_preferred_audio_instead_of_stream_zero() {
+        use plurx_core::domain::AudioStream;
+
+        let track = |index: i64, language: &str, default: bool| AudioStream {
+            index,
+            codec: "eac3".into(),
+            channels: Some(6),
+            language: Some(language.into()),
+            title: None,
+            default,
+        };
+        // Scary Movie's shape: the mux calls Italian default, while the server
+        // preference and `/decision` select English stream 2.
+        let audio = vec![
+            track(0, "ita", true),
+            track(1, "ita", true),
+            track(2, "eng", false),
+            track(3, "eng", false),
+        ];
+        let prefs = plurx_core::tracks::LangPrefs::default();
+
+        assert_eq!(remux_audio_index(&audio, None, &prefs), 2);
+        assert_eq!(remux_audio_index(&audio, Some(3), &prefs), 3);
+    }
 
     #[test]
     fn explicit_dolby_vision_profiles_override_the_legacy_all_profiles_bit() {

@@ -520,7 +520,15 @@ final class PlayerController: ObservableObject {
         } else {
             let copy = !forceTranscode
                 && (normalMode == "direct" || normalMode == "remux" || customAudio)
-            let chosenAudio = audioOverride
+            // The checkmark comes from `/decision`'s shared-policy pick. Carry
+            // that exact track into the initial session too: relying on an
+            // omitted audio field made copy-video HLS fall back to the muxer's
+            // first stream, so the UI could say English while Italian played.
+            // A viewer's later explicit choice remains the stronger value.
+            let chosenAudio = Self.sessionAudioIndex(
+                explicit: audioOverride,
+                selected: selectedAudio
+            )
             let aac = copy ? needsAAC(audioIndex: chosenAudio, decision: decision)
                 : nil
             let body = CreateSessionRequest(
@@ -1158,6 +1166,12 @@ final class PlayerController: ObservableObject {
 
     private func bcp47(_ code: String) -> [String] {
         Self.languageSpellings(code)
+    }
+
+    /// The audio index an HLS session must carry. `selected` is the server's
+    /// automatic answer from `/decision`; `explicit` is a later viewer choice.
+    nonisolated static func sessionAudioIndex(explicit: Int?, selected: Int?) -> Int? {
+        explicit ?? selected
     }
 
     /// Every spelling of a language preference AVFoundation might have to

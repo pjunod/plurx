@@ -965,7 +965,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
 name = "plurx-compat-plex"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "axum",
  "http-body-util",
@@ -976,7 +976,7 @@ dependencies = [
 
 [[package]]
 name = "plurx-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "argon2",
  "async-trait",
@@ -1002,7 +1002,7 @@ dependencies = [
 
 [[package]]
 name = "plurxd"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "axum",

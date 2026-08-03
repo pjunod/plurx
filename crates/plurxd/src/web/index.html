@@ -3857,6 +3857,14 @@ function transcodeOpts(startSec, audioIndex){
   if(PLAYER && PLAYER.aoffset) o.audio_offset_ms=PLAYER.aoffset;
   return o;
 }
+// The track whose checkmark `/decision` supplied. Every cold-start transport
+// carries it explicitly; otherwise progressive remuxes fall back to stream 0
+// while the menu continues to claim the preferred language is playing.
+function selectedAudioIndex(player){
+  const p=player||PLAYER;
+  const track=p&&p.audio&&p.audio[p.curAudio];
+  return track?track.index:0;
+}
 async function openSession(fileId, opts){
   const body=Object.assign({playback_id:PLAYBACK_ID, request_id:newRequestId()}, opts||{});
   // A null height is the *absence* of a request, not a request for nothing:
@@ -4124,6 +4132,7 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
   newAttempt(PENDING_ATTEMPT_REASON || (startSec>0?"resume":"cold-start"));
   PENDING_ATTEMPT_REASON=null;
   if(PLAYER.curAudio<0) PLAYER.curAudio=0;
+  const initialAudio=selectedAudioIndex(PLAYER);
   setupAirplay(video);
   setupTrackMenus();
   renderPlayerInfo();
@@ -4138,7 +4147,7 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
   if(decision.method==='transcode'){
     // Transcode: start an HLS session (server re-encodes + tone-maps).
     setLoading(true,"Starting the transcoder…",transcodeReason(decision));
-    let info; try{ info=await openSession(fileId,transcodeOpts(startSec));}catch(e){ setLoading(false); toast(e.message); return closePlayer(); }
+    let info; try{ info=await openSession(fileId,transcodeOpts(startSec,initialAudio));}catch(e){ setLoading(false); toast(e.message); return closePlayer(); }
     const from=attachSession(video, PLAYER, info, startSec);
     setLoading(true,"Preparing the stream…",(PLAYER.encoder?("encoder: "+PLAYER.encoder+" — "):"")+
       (PLAYER.vod?"already transcoded — playing from the cache":"buffering the first segments"));
@@ -4164,7 +4173,10 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
     catch(e){ setLoading(false); toast(e.message); return closePlayer(); }
   } else {
     // Direct play, or remux for a browser that plays progressive fMP4 (Chrome).
-    const isRemux = decision.method!=='direct_play';
+    // A raw direct-play file gives the browser control of its mux defaults, not
+    // the server's language choice. If the preferred track is not stream zero,
+    // use the remuxer so the requested track is the only one delivered.
+    const isRemux = decision.method!=='direct_play' || initialAudio!==0;
     setLoading(true,isRemux?"Preparing the stream…":"Loading…",
       isRemux?"remuxing to a browser-friendly container":"direct play — no conversion needed");
     // Remux carries the same caps so the server copies the audio when the
@@ -4174,8 +4186,12 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
     // on Chrome entirely.
     let url;
     if(isRemux){
+      if(decision.method==='direct_play') PLAYER.method='remux';
       PLAYER.offset=startSec;
-      url=remuxUrl(decision.play_url, null, startSec);
+      const base=decision.method==='direct_play'
+        ? `/api/v1/files/${fileId}/stream.mp4`
+        : decision.play_url;
+      url=remuxUrl(base, initialAudio, startSec);
       PLAYER.probeUrl=decision.play_url; armStall(startSec);
     } else { url=tok(decision.play_url); }
     video.src=url;
@@ -4202,7 +4218,7 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
 // has since been superseded must not attach, or two hls.js instances end up
 // pulling two server sessions at once. Returns false when it bailed.
 async function startCopyHls(v, startSec, live){
-  const track=PLAYER.audio[PLAYER.curAudio]; const aidx=track?track.index:0;
+  const aidx=selectedAudioIndex(PLAYER);
   const info=await openSession(PLAYER.fileId,{copy:true,aac:!!PLAYER.transcodeAudio,
     preserve_dolby_vision:!!PLAYER.preserveDolbyVision,start:startSec||0,audio:aidx,
     audio_offset_ms:PLAYER.aoffset||0});
@@ -5049,7 +5065,7 @@ async function startTranscodeFallback(reason, note){
   // both arrive here meaning something else entirely.
   if(reason==="stream-rejected") me.refusedOriginal=true;
   teardownHls();
-  let info; try{ info=await openSession(me.fileId,transcodeOpts(startSec));}catch(e){ if(live()){ setLoading(false); toast(e.message); } return; }
+  let info; try{ info=await openSession(me.fileId,transcodeOpts(startSec,selectedAudioIndex(me)));}catch(e){ if(live()){ setLoading(false); toast(e.message); } return; }
   if(!live()) return;   // closed the player, or seeked / switched audio meanwhile
   me.method='transcode'; me.copyHls=false;
   // A silent switch is a lie of omission. Without this the overlay keeps the

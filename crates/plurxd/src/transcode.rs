@@ -3545,6 +3545,15 @@ impl TranscodeManager {
         } else {
             audio_offset_ms.clamp(-15_000, 15_000)
         };
+        // Copy-video sessions and transcodes must interpret an omitted audio
+        // override identically. `/decision` marks the shared-policy pick as
+        // default, so silently falling back to ffmpeg's first stream here can
+        // make the player show English while the session carries (for example)
+        // an Italian container default. An explicit viewer choice still wins.
+        let audio_index = self
+            .select_tracks(&file, audio_override, None)
+            .await
+            .audio_index;
         let item_title = self
             .store
             .get_item(file.item_id)
@@ -3572,7 +3581,7 @@ impl TranscodeManager {
             transcode::hls_copy_args_with_dolby_vision(
                 &file,
                 start_seconds,
-                audio_override,
+                audio_index,
                 options.transcode_audio,
                 pacing,
                 transcode::DolbyVisionCopyOptions::new(have_dovi, options.preserve_dolby_vision),
@@ -3594,7 +3603,7 @@ impl TranscodeManager {
             let args = transcode::copy_pipe_args_with_dolby_vision(
                 &file,
                 start_seconds,
-                audio_override,
+                audio_index,
                 options.transcode_audio,
                 pacing,
                 have_dovi,
@@ -3656,7 +3665,7 @@ impl TranscodeManager {
         let media_origin_seconds = probe_media_origin(&file.path, start_seconds).await;
 
         let (hls_codecs, hls_supplemental_codecs) =
-            copied_hls_codecs(&file, audio_override, options, probe_json.as_deref());
+            copied_hls_codecs(&file, audio_index, options, probe_json.as_deref());
         let session = Arc::new(Session {
             dir: dir.clone(),
             child: Mutex::new(Some(child)),
@@ -3751,7 +3760,7 @@ impl TranscodeManager {
                         let args = transcode::hls_copy_args_with_dolby_vision(
                             &file,
                             start_seconds,
-                            audio_override,
+                            audio_index,
                             options.transcode_audio,
                             pacing,
                             transcode::DolbyVisionCopyOptions::new(
