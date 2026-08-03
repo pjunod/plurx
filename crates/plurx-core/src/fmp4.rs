@@ -116,6 +116,11 @@ pub struct Track {
     /// fragment and using it drifts the playlist against the media.
     pub timescale: u32,
     pub codec: Option<VideoCodec>,
+    /// The sample entry carries a Dolby Vision decoder configuration (`dvcC`
+    /// or `dvvC`). This is distinct from an `hvc1` base layer: ffmpeg may strip
+    /// the Dolby configuration and RPUs while leaving the file-level `dby1`
+    /// compatible brand behind.
+    pub dolby_vision_config: bool,
     /// Bytes of the length prefix on each NAL unit inside a sample, from
     /// `hvcC`/`avcC`. Zero when the track has no such record.
     pub nal_length_size: u8,
@@ -566,6 +571,7 @@ fn parse_trak(payload: &[u8]) -> Result<Track, Fmp4Error> {
         kind: TrackKind::Other,
         timescale: 0,
         codec: None,
+        dolby_vision_config: false,
         nal_length_size: 0,
         default_sample_duration: 0,
         default_sample_size: 0,
@@ -664,6 +670,9 @@ fn parse_stbl(payload: &[u8], track: &mut Track) -> Result<(), Fmp4Error> {
             for (h2, s2, e2) in children(extra)? {
                 let rec = &extra[s2..e2];
                 match (h2.kind(), codec) {
+                    (b"dvcC" | b"dvvC", _) => {
+                        track.dolby_vision_config = true;
+                    }
                     (b"hvcC", VideoCodec::Hevc) => {
                         // Byte 21 of the HEVCDecoderConfigurationRecord packs
                         // lengthSizeMinusOne into its low two bits.
@@ -1890,6 +1899,7 @@ mod tests {
         let video = init.video().expect("a video track");
         assert_eq!(video.kind, TrackKind::Video);
         assert_eq!(video.codec, Some(VideoCodec::Hevc));
+        assert!(!video.dolby_vision_config);
         assert_eq!(video.nal_length_size, 4, "hvcC lengthSizeMinusOne");
         assert!(video.timescale > 0);
         assert!(init

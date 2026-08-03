@@ -290,7 +290,7 @@ pub async fn run<R: AsyncRead + Unpin>(
                 }
             };
             match unit {
-                Unit::Init(init) => {
+                Unit::Init(mut init) => {
                     let Some(video) = init.video() else {
                         return Outcome::Unsupported("the pipe's moov has no video track".into());
                     };
@@ -314,12 +314,14 @@ pub async fn run<R: AsyncRead + Unpin>(
                             odd.id, odd.timescale
                         ));
                     }
+                    let video_timescale = video.timescale;
+                    sanitize_stale_dolby_brand(&mut init);
                     let policy = fmp4::CutPolicy::new(
                         limits.floor_seconds,
                         limits.first_floor_seconds,
                         limits.max_bytes,
                         limits.max_seconds,
-                        video.timescale,
+                        video_timescale,
                     );
                     if let Err(e) = out.write_init(&init).await {
                         return Outcome::Unsupported(format!("writing init.mp4: {e}"));
@@ -384,6 +386,40 @@ pub async fn run<R: AsyncRead + Unpin>(
     // and an ENDLIST there would tell the player the film ends early.
     let complete = reader.saw_trailer() || reader.buffered() == 0;
     finish(segmenter, &mut out, session_id, complete).await
+}
+
+/// Remove a Dolby Vision file-type claim after ffmpeg has removed the Dolby
+/// configuration and RPUs from the video sample entry.
+///
+/// ffmpeg 7.1's `dovi_rpu=strip=1` correctly removes `dvcC`/`dvvC` and the RPU
+/// NALs, but movenc has already copied `dby1` into `ftyp` by the time the
+/// bitstream filter's output parameters reach it. AVPlayer treats that as a
+/// contradictory initialization segment and fails the item immediately. The
+/// base layer is ordinary `hvc1` HDR10, so replace only the stale file-type
+/// brand with the ISO fragmented-MP4 brand already used by this muxer. A real
+/// Dolby Vision sample entry keeps its brand untouched.
+fn sanitize_stale_dolby_brand(init: &mut Init) -> bool {
+    if init.video().is_none_or(|video| video.dolby_vision_config) {
+        return false;
+    }
+
+    let bytes = &mut init.bytes;
+    if bytes.len() < 16 || &bytes[4..8] != b"ftyp" {
+        return false;
+    }
+    let size = u32::from_be_bytes(bytes[0..4].try_into().expect("four-byte ftyp size")) as usize;
+    if size < 16 || size > bytes.len() || !(size - 16).is_multiple_of(4) {
+        return false;
+    }
+
+    let mut changed = false;
+    for offset in std::iter::once(8).chain((16..size).step_by(4)) {
+        if &bytes[offset..offset + 4] == b"dby1" {
+            bytes[offset..offset + 4].copy_from_slice(b"iso6");
+            changed = true;
+        }
+    }
+    changed
 }
 
 async fn finish(
@@ -470,7 +506,7 @@ pub fn supports(video_codec: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use plurx_core::fmp4::CutReason;
+    use plurx_core::fmp4::{CutReason, Track, VideoCodec};
     use plurx_core::testfixtures::pipe;
     use std::path::Path;
 
@@ -509,6 +545,42 @@ mod tests {
             .collect();
         names.sort();
         names
+    }
+
+    fn init_with_dolby_brand(dolby_vision_config: bool) -> Init {
+        // The exact `ftyp` shape jellyfin-ffmpeg 7.1 writes after
+        // dovi_rpu=strip=1: ordinary ISO brands plus the stale dby1 claim.
+        let bytes = Vec::from(&b"\0\0\0\x20ftypiso5\0\0\x02\0iso5iso6dby1mp41"[..]);
+        assert_eq!(bytes.len(), 32);
+        Init {
+            bytes,
+            tracks: vec![Track {
+                id: 1,
+                kind: TrackKind::Video,
+                timescale: 24_000,
+                codec: Some(VideoCodec::Hevc),
+                dolby_vision_config,
+                nal_length_size: 4,
+                default_sample_duration: 0,
+                default_sample_size: 0,
+                default_sample_flags: 0,
+            }],
+        }
+    }
+
+    #[test]
+    fn stripped_dolby_vision_init_drops_the_stale_dby1_brand() {
+        let mut init = init_with_dolby_brand(false);
+        assert!(sanitize_stale_dolby_brand(&mut init));
+        assert!(!init.bytes.windows(4).any(|fourcc| fourcc == b"dby1"));
+        assert_eq!(&init.bytes[24..28], b"iso6");
+    }
+
+    #[test]
+    fn preserved_dolby_vision_init_keeps_its_dby1_brand() {
+        let mut init = init_with_dolby_brand(true);
+        assert!(!sanitize_stale_dolby_brand(&mut init));
+        assert!(init.bytes.windows(4).any(|fourcc| fourcc == b"dby1"));
     }
 
     /// The whole point, end to end: given a source that offers clean cut
