@@ -1,13 +1,28 @@
 #!/usr/bin/env python3
-"""Pixel + focus-order baseline of the shipped web UI (gate G0 of the layouts plan).
+"""Structural + pixel baseline of the shipped web UI, swept over every layout.
 
 The whole web UI is one file — `crates/plurxd/src/web/index.html` — and the
-layout work coming after this gate rearranges it. There is no component test
-to lean on and no design system to diff, so the only honest way to say "this
-refactor changed nothing" is to photograph the app before and after and prove
-the photographs are identical. That is what this script produces.
+layout arc rearranges it. There is no component test to lean on and no design
+system to diff, so the only honest way to say "this refactor changed nothing"
+is to photograph the app before and after and prove the photographs are
+identical. That was G0's contract, and G3 found two holes in it (see
+docs/UI-LAYOUTS-G3-DECISION.md §3 and §5/R1):
 
-    scripts/ui-baseline --self-host
+  * it captured and exited — the comparison was a `sha256sum` a human ran by
+    hand, so nothing ever failed;
+  * it photographed exactly ONE `(layout, theme, appearance)` triple, so a
+    regression that only manifests under a non-default layout was invisible.
+    Two real `plex` fixes were silently reverted and shipped as done, and this
+    harness passed them: from `classic`'s point of view a plex-only fix is a
+    correct no-op. Coverage shrank as the arc succeeded — 1 of 2 layouts then,
+    1 of 5 by G6.
+
+So this script now sweeps every registered layout and it compares.
+
+    scripts/ui-baseline --self-host              # capture into --out
+    scripts/ui-baseline --self-host --check      # capture, then FAIL on drift
+    scripts/ui-baseline --self-host --update     # rewrite the committed golden
+    scripts/ui-baseline --self-host --baseline target/ui-baseline-before
     scripts/ui-baseline --base-url http://nynuc:32400 --token "$PLURX_TOKEN"
 
 `--self-host` boots a throwaway plurxd on a scratch data dir, seeds it with a
@@ -15,42 +30,98 @@ tiny generated library (ffmpeg, deterministic bytes, cached between runs),
 rewrites every timestamp in its database to fixed constants, and drives that.
 That is the mode CI and a pre-change/post-change comparison use. Pointing
 `--base-url` at a real server captures the same routes against real content —
-useful on Paul's Mac, but the goldens are then only comparable to other runs
+useful on Paul's Mac, but the results are then only comparable to other runs
 against the same server with the same library.
 
-Output (all under `--out`, default `target/ui-baseline/`, already covered by
-the `/target` line in .gitignore — the SCRIPT is the committed artefact, the
-goldens are regenerated from the pre-change commit whenever they are needed):
+---- the two tiers, and why there are two ---------------------------------
 
-    <route>@<width>x<height>.png    one screenshot per route per viewport
-    focus.json                      tab-order dump keyed "<route>@<w>x<h>"
+A PNG hash is host-dependent (Chromium build, rasteriser, font stack) and
+path-dependent (Settings prints a library's paths verbatim, and the seeded
+library lives under `--out`). A committed pixel manifest would therefore fail
+on every machine that is not the one that wrote it, and the only way to keep
+it green is to stop believing it. So the golden is split:
+
+  PORTABLE TIER — committed, enforced everywhere including CI.
+    `tests/ui-structure.golden` holds, per layout × route × viewport: the
+    structural DOM digest (see DOM_JS), the tab-order dump, and the API
+    request log. None of it contains a pixel, a path, a timestamp or a free
+    string, so it is the same file on a Mac, in the sandbox and on a CI
+    runner. This is the tier that catches what pixels miss and what the two
+    lost fixes were: a class that stopped being emitted, a control that lost
+    `aria-disabled`, a card that lost `tabindex`, a rail that renders but tags
+    nothing.
+
+  PIXEL TIER — never committed.
+    `pixels.txt` in `--out` holds one sha256 per PNG. It is compared only
+    against a previous LOCAL run, via `--baseline <dir>`, as a before/after
+    check on a refactor by one person on one machine. Committing it would be
+    committing a fact about a laptop.
+
+---- output ---------------------------------------------------------------
+
+All under `--out` (default `target/ui-baseline/`, covered by the `/target`
+line in .gitignore):
+
+    <layout>/<route>@<width>x<height>.png   one screenshot per capture
+    structure.txt      the portable tier, exactly as `--update` would commit it
+    pixels.txt         sha256 per PNG — the local-only tier
+    focus.json         tab-order dump, kept because it reads better than the
+    requests.json      flat golden when you are debugging one route
 
 The gate fails (exit 1) if any route fails to render — a non-2xx document
-response, an uncaught page error, a console error, or an empty `#main`/`#app`.
+response, an uncaught page error, a console error, or an empty `#main`/`#app` —
+and, under `--check`, if the portable tier differs from the committed golden.
+
+---- layouts and surfaces -------------------------------------------------
+
+The layout list comes from `Object.keys(LAYOUTS)` evaluated IN THE PAGE, never
+from parsing the HTML. The registry is the authority; a parsed copy drifts the
+first time someone registers a layout in a shape the parser did not anticipate,
+and it drifts silently, which is the exact failure mode R1 exists to end.
+
+Each layout declares the `surfaces` it can run on, and `layoutId()` falls back
+to `classic` on a surface a layout does not declare. So the sweep asks the page
+what surface each viewport actually is (`surfaceClass()`), skips the pairs the
+app would refuse, and — for the pairs it does capture — asserts that
+`layoutId()` came back as the layout requested. Photographing a fallback under
+the name of the thing that fell back is worse than not photographing it.
 
 Determinism is the point. Everything the app derives from the wall clock, the
 timezone, the locale, an animation, a font hint, a device pixel ratio or a
 lazily-decoded image is pinned below, each with a comment saying which drift it
-prevents. Two consecutive runs on an unchanged tree must be byte-identical; if
-they are not, the gate is worthless and the difference is a bug in this file,
-not something to paper over with a tolerance.
+prevents. Two consecutive `--check` runs on an unchanged tree must both pass,
+and so must a run at a different `--out` path; if they do not, the gate is
+worthless and the difference is a bug in this file, not something to paper over
+with a tolerance.
 
 `--self-test-fail` deliberately breaks one route so the nonzero exit can be
 demonstrated without hand-editing the app. It exists so the gate's own failure
 path stays tested; a green run never touches it.
 
-Known residuals — things a golden is legitimately tied to, so compare like with
-like and regenerate rather than argue with a diff:
+Known residuals — things the PIXEL tier is legitimately tied to, so compare
+like with like and regenerate rather than argue with a diff. None of these
+touch the portable tier; that is what makes the portable tier committable:
 
   * The checkout path. Settings prints a library's paths verbatim, and the
-    seeded library lives under `<repo>/target/ui-baseline/media`. Two clones in
-    different directories produce different Settings screenshots.
+    seeded library lives under `<out>/media`. Two runs at different `--out`
+    paths produce different Settings screenshots. (The portable tier records
+    the presence of that text, never its content, and scrubs any absolute path
+    that reaches a focus label — see `scrub()`.)
   * The host. Chromium's rasteriser and the bundled build both move with the
-    image; goldens do not travel between the sandbox and a Mac.
+    image; PNG hashes do not travel between the sandbox and a Mac.
+  * Two captures — `plex/item@1280x860` and `plex/library@1280x860` — still
+    move between two runs of an unchanged tree in the sandbox, roughly one run
+    in two. Measured, not assumed: 34 of 36 are stable. Both are plex desktop
+    routes with rails, so the suspect is the same scroll/arrow interaction the
+    `--rest-ms` wait tamed elsewhere. They are named here rather than chased
+    because the pixel tier is a human-judged before/after aid and not a gate;
+    if it ever becomes one, this is the bug to fix first. The portable tier is
+    stable on all 36.
   * `--base-url`. A live server's own timestamps are not frozen (only the page
-    clock is), so "3 min ago" on a real Activity page still ticks. That mode is
-    for eyeballing a real library, not for a byte-exact gate; `--self-host` is
-    the mode that is provably deterministic.
+    clock is), so "3 min ago" on a real Activity page still ticks, and a real
+    library changes the DOM digest too. That mode is for eyeballing a real
+    library, not for a gate; `--self-host` is the mode that is provably
+    deterministic, and `--check` refuses to run against anything else.
   * The player's stats overlay (`ⓘ Stats`) is never opened: it prints live
     timing in milliseconds and nothing would make it stand still.
 """
@@ -60,6 +131,7 @@ import calendar
 import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -73,6 +145,12 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+
+# The committed half of the golden. Lives under tests/ rather than target/
+# precisely because it is portable: nothing in it is a pixel, a path or a
+# clock, so the same bytes are correct on every machine and a drift in it is a
+# reviewable line in a pull request rather than a rumour about a laptop.
+GOLDEN = ROOT / "tests" / "ui-structure.golden"
 
 # The instant the page believes it is. Everything relative the UI renders
 # ("3d ago", "ends ~12:00 PM", a user's join date) is measured from here, and
@@ -114,7 +192,19 @@ LIBRARIES = [
     ("TV Shows", "shows", "shows"),
 ]
 
-VIEWPORTS = [(1280, 860), (390, 780)]
+# The two viewports, and whether the browser reports a touch pointer at each.
+#
+# `touch` is not decoration. `surfaceClass()` decides "mobile" from
+# `(pointer: coarse)` AND width, not from width alone, so a 390px viewport with
+# a mouse resolves to *desktop* — and a layout that declares no `mobile`
+# surface would then be captured at 390x780 anyway, under a name the app never
+# used. Emulating touch at the narrow viewport makes the surface the app
+# resolves match the surface this table claims to be photographing, which is
+# what makes the `surfaces` filter below mean anything at all.
+VIEWPORTS = [
+    {"width": 1280, "height": 860, "touch": False},
+    {"width": 390, "height": 780, "touch": True},
+]
 
 # Animation, transition and caret are killed with a stylesheet rather than with
 # a wait: a wait only makes the odds better. `caret-color` matters because the
@@ -182,6 +272,12 @@ FREEZE_JS = """
 # Deliberately excludes `value`, `href` and anything else that carries an id or
 # a typed string: a tab order must not change because a database handed out a
 # different primary key.
+#
+# The label is NOT truncated here. It used to be cut to 60 characters in the
+# page, and a label that contains a filesystem path would then have been cut at
+# a different character for every `--out` — so the committed golden would carry
+# the LENGTH of somebody's checkout path. Python scrubs first and truncates
+# after (see `focus_label`); 400 is only a guard against a pathological label.
 FOCUS_JS = """
 () => {
   const el = document.activeElement;
@@ -192,8 +288,116 @@ FOCUS_JS = """
   let label = el.getAttribute("aria-label") || el.getAttribute("title") || "";
   if (!label) label = (el.innerText || el.textContent || "");
   if (!label && el.placeholder) label = el.placeholder;
-  label = label.replace(/\\s+/g, " ").trim().slice(0, 60);
+  label = label.replace(/\\s+/g, " ").trim().slice(0, 400);
   return tag + id + cls + (label ? ' "' + label + '"' : "");
+}
+"""
+
+# The layout registry, read from the page rather than from the file.
+#
+# `LAYOUTS` is a top-level `const` in the <head> script, so it is a global
+# lexical binding — visible to an evaluated function, absent from `window`.
+# `plex` (and every layout after it) attaches its renderers to that same object
+# from the body script, which is why this must run against a fully parsed
+# document rather than against the HTML source. Parsing index.html for a layout
+# list would produce a second, lagging copy of the authority; this cannot lag.
+REGISTRY_JS = """
+() => ({
+  layouts: Object.keys(LAYOUTS).map(id => ({
+    id,
+    name: (LAYOUTS[id] && LAYOUTS[id].name) || id,
+    surfaces: ((LAYOUTS[id] && LAYOUTS[id].surfaces) || []).slice().sort(),
+  })),
+  surface: surfaceClass(),
+})
+"""
+
+# The structural DOM digest: what the page IS, with everything a pixel hash is
+# tied to removed.
+#
+# This is the tier that catches the failures §3 of the G3 record describes and
+# a screenshot cannot: a class that stopped being emitted, a control that lost
+# `aria-disabled`, a card that lost `tabindex`, a rail that renders but tags
+# nothing. Each of those is a semantic change behind pixels that either look
+# fine or differ for a hundred unrelated reasons at once.
+#
+# Every element in the given roots becomes one line, `parent > self`, and equal
+# lines are COUNTED rather than listed. Counting is what keeps the golden
+# reviewable: six cards in a grid are one line reading `6`, so losing `unw` on
+# all six shows up as one removed line and one added line instead of twelve.
+# The single level of parent context is the cheapest structure worth keeping —
+# it distinguishes a poster in a rail from a poster in a grid, so a card that
+# moves between regions is not silently equivalent.
+#
+# What each descriptor carries, and what it deliberately does not:
+#
+#   in   tag, id, sorted class list, `role`, `tabindex`, the enumerated ARIA
+#        states (below), `disabled`/`hidden`, and a bare `text` flag when the
+#        element has non-whitespace text of its own.
+#   out  free text content, `style`, `href`, `src`, `value`, `onclick`, and the
+#        VALUE of any free-string ARIA attribute (`aria-label` on a card is a
+#        title; `aria-valuenow` on the seek bar is a clock). Those are recorded
+#        as `aria-label=*` — present or absent, never what they said.
+#
+# The exclusions are not squeamishness, they are the portability requirement:
+# the Settings page prints a library's filesystem path, which is different at
+# every `--out`, and a digest that carried text could never be committed.
+# Classes are sorted because `classList` order is source order, and source
+# order is a diff nobody should have to read.
+DOM_JS = """
+(roots) => {
+  // ARIA attributes whose values are a closed set — a state, not a string.
+  // These are the ones worth asserting on: `aria-disabled` going missing is
+  // exactly the class of regression that ships looking correct.
+  const ARIA_VAL = ["aria-disabled", "aria-current", "aria-expanded", "aria-selected",
+                    "aria-checked", "aria-pressed", "aria-hidden", "aria-modal",
+                    "aria-live", "aria-level", "aria-orientation", "aria-haspopup",
+                    "aria-multiselectable", "aria-readonly", "aria-required",
+                    "aria-invalid", "aria-busy", "aria-valuemin", "aria-valuemax"];
+  const desc = (el) => {
+    const tag = el.tagName.toLowerCase();
+    let s = tag;
+    if (el.id) s += "#" + el.id;
+    // Array.from(): classList is a DOMTokenList, and SVG elements carry one
+    // too (their `className` is an SVGAnimatedString and would stringify to
+    // "[object SVGAnimatedString]").
+    const cls = Array.from(el.classList).sort();
+    if (cls.length) s += "." + cls.join(".");
+    const bits = [];
+    if (el.hasAttribute("role")) bits.push("role=" + el.getAttribute("role"));
+    if (el.hasAttribute("tabindex")) bits.push("tabindex=" + el.getAttribute("tabindex"));
+    for (const a of ARIA_VAL) if (el.hasAttribute(a)) bits.push(a + "=" + el.getAttribute(a));
+    for (const n of el.getAttributeNames().filter(
+           n => n.startsWith("aria-") && ARIA_VAL.indexOf(n) < 0).sort())
+      bits.push(n + "=*");
+    if (el.hasAttribute("disabled")) bits.push("disabled");
+    if (el.hasAttribute("hidden")) bits.push("hidden");
+    // `type` on a form control changes what the control IS, and it is a closed
+    // set, so it belongs here in a way `value` never could. Only when the
+    // attribute is actually written: `el.type` would report the DEFAULT for
+    // every untyped button in the app, which is a fact about the HTML spec
+    // rather than about this codebase, on several hundred lines of golden.
+    if (el.hasAttribute("type")) bits.push("type=" + el.getAttribute("type"));
+    // Own text only, not descendant text: otherwise every ancestor of a label
+    // reports `text` and the flag stops distinguishing anything.
+    let own = "";
+    for (const n of el.childNodes) if (n.nodeType === 3) own += n.nodeValue;
+    if (own.trim()) bits.push("text");
+    if (bits.length) s += "[" + bits.join(" ") + "]";
+    return s;
+  };
+  const out = {};
+  const walk = (el, parent) => {
+    const self = desc(el);
+    const key = parent + " > " + self;
+    out[key] = (out[key] || 0) + 1;
+    for (const c of el.children) walk(c, self);
+  };
+  // "^" for a root's own line, so the roots are distinguishable from each
+  // other and a root that failed to render at all is one obviously-missing
+  // line rather than a silently smaller file.
+  for (const sel of roots) { const el = document.querySelector(sel); if (el) walk(el, "^"); }
+  return out;
 }
 """
 
@@ -577,6 +781,16 @@ def discover_routes(base_url, token, args, preferred_library=None, preferred_ite
 # ---- capture --------------------------------------------------------------
 
 
+# A numeric path segment is a row id, and a row id is a fact about this run's
+# database rather than about the app. `/api/v1/libraries/3/items` and
+# `/api/v1/libraries/1/items` are the same assertion.
+API_ID_RE = re.compile(r"/\d+(?=/|$)")
+
+
+def api_path(path):
+    return API_ID_RE.sub("/<id>", path)
+
+
 def settle(page):
     """Everything that must be true before the shutter opens."""
     # Fonts first: the app embeds its faces as data URLs, so this resolves
@@ -646,11 +860,56 @@ def open_player(page, timeout_ms):
         timeout=timeout_ms)
 
 
+def freeze_timers(page):
+    """Stop every pending timer, so the page cannot repaint under the recorders.
+
+    The app polls activity every 4s and re-renders on the answer. A re-render
+    that lands in the middle of the tab walk — which is ~30 round trips, so it
+    happens — either destroys the element focus was about to reach (one stop
+    silently missing) or blows focus back to <body> (the walk reads that as
+    "wrapped" and stops early). Both were observed, on the same route, on two
+    consecutive runs of this script, and both are the harness moving rather than
+    the app: the answer to "what is tabbable here" must not depend on which side
+    of a poll the shutter closed.
+
+    Called after `--settle-ms` has already bought the steady state, so nothing
+    still-pending is load work: what is left is the pollers, and the pollers can
+    only move the page away from the state that was settled for.
+
+    Chromium hands out timer ids from one increasing pool per document, so the
+    id of a timer created now is an upper bound on every id issued before it.
+    Clearing the whole range is blunt and complete; enumerating them is not
+    possible from script.
+    """
+    page.evaluate("""() => {
+      const top = setTimeout(() => {}, 0);
+      for (let i = 0; i <= top; i++) { clearTimeout(i); clearInterval(i); }
+    }""")
+
+
+# Undo everything a tab walk did to the page: the focus ring, and the rails and
+# document it scrolled while walking. Run before the shutter, so the picture is
+# still of the page at rest.
+UNWALK_JS = """
+() => {
+  if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
+  window.scrollTo(0, 0);
+  document.querySelectorAll('.rowscroll, .logbox').forEach(el => { el.scrollLeft = 0; el.scrollTop = 0; });
+}
+"""
+
+
 def tab_order(page, stops):
     """Press Tab from a known start and record who takes focus, in order.
 
-    Runs after the screenshot: focusing an element gives it a focus ring, and a
-    ring in the golden would make the picture depend on the dump.
+    The rail scroll is reset before every press, not once at the start. Focusing
+    a card scrolls its rail, and the rail's own arrows are shown by a class the
+    scroll handler toggles (`.railbox.can-l/.can-r`) — so walking the page
+    changes which elements are tabbable AS IT WALKS, and whether Tab reached the
+    right-hand arrow before the rail scrolled past needing it came out different
+    on consecutive runs of an unchanged tree. Resetting first means every press
+    resolves against a rail at rest, which is also the only state a reader of
+    this dump could reasonably picture.
     """
     page.evaluate("""() => {
       // A known start: whatever the page focused on load is discarded, so the
@@ -659,6 +918,9 @@ def tab_order(page, stops):
     }""")
     seen = []
     for _ in range(stops):
+        page.evaluate("""() => {
+          document.querySelectorAll('.rowscroll').forEach(el => { el.scrollLeft = 0; });
+        }""")
         page.keyboard.press("Tab")
         descriptor = page.evaluate(FOCUS_JS)
         if descriptor is None:
@@ -670,7 +932,7 @@ def tab_order(page, stops):
     return seen
 
 
-def capture_route(pw_context, base_url, name, route, width, height, args, out_dir):
+def capture_route(pw_context, base_url, name, route, args, shot, layout_id):
     page = pw_context.new_page()
     problems = []
     # The request log. Four documents cite a "request-log invariant" — converting
@@ -679,14 +941,22 @@ def capture_route(pw_context, base_url, name, route, width, height, args, out_di
     # quietly fetches is the single failure the whole seam exists to prevent, and
     # it is invisible in a screenshot: the page looks right and costs twice.
     #
-    # Method + path only, query string dropped: ids and paging offsets are
-    # fixture-dependent and would make the log a second golden nobody can read.
+    # Method + path only, query string dropped and numeric path segments
+    # replaced: ids and paging offsets are fixture-dependent and would make the
+    # log a second golden nobody can read. The ids are not incidental noise, they
+    # are actively wrong to record — the seeded database is rebuilt every run and
+    # item ids come out of the scan in readdir order, so `GET /api/v1/items/6`
+    # and `GET /api/v1/items/7` are the same request about the same film on two
+    # runs an hour apart. (Observed: the first --check on an unchanged tree
+    # reported twelve request "drifts" that were entirely this.) The invariant is
+    # WHICH endpoints a route calls and HOW MANY times, never which row.
+    #
     # Sorted and counted rather than kept in order, because Promise.all settles
     # in whatever order the network feels like and an ordering diff would be
     # noise, not signal.
     api_calls = []
     page.on("request", lambda r: api_calls.append(
-        f"{r.method} {urlparse(r.url).path}") if "/api/" in urlparse(r.url).path else None)
+        f"{r.method} {api_path(urlparse(r.url).path)}") if "/api/" in urlparse(r.url).path else None)
     # Console errors and uncaught exceptions are collected for the whole visit,
     # not sampled at the end: an error thrown during boot is exactly the kind
     # this gate exists to catch, and it is long gone by the time we screenshot.
@@ -704,6 +974,17 @@ def capture_route(pw_context, base_url, name, route, width, height, args, out_di
 
         container = route.get("container", "#main")
         page.wait_for_selector(container, state="attached", timeout=args.timeout)
+        # The layout the app actually resolved, not the one localStorage asked
+        # for. `layoutId()` falls back to classic on a surface a layout does not
+        # declare, and the sweep already skipped those pairs — so a mismatch
+        # here means this script's model of surface resolution is wrong, and
+        # every capture after it would be filed under a layout that never ran.
+        # Loud is the only safe answer; a fallback photographed under the name
+        # of the thing that fell back is worse than no photograph.
+        got = page.evaluate("() => layoutId()")
+        if got != layout_id:
+            raise Fail(f"{name}: asked for layout {layout_id!r}, the app resolved {got!r} "
+                       "— its `surfaces` and this viewport disagree")
         # The app polls activity every 4s and the activity page re-renders every
         # 3s. Rather than stubbing either — the baseline has to be of the real
         # app — the capture waits out more than one full period, so it always
@@ -732,17 +1013,178 @@ def capture_route(pw_context, base_url, name, route, width, height, args, out_di
         if empty:
             raise Fail(f"{name}: {container} rendered empty")
 
-        shot = out_dir / f"{name}@{width}x{height}.png"
-        page.screenshot(path=str(shot), full_page=not args.viewport_only)
+        # Order matters here, and it is the opposite of the obvious one.
+        #
+        # A full-page screenshot resizes the viewport to the document to capture
+        # below the fold, and Chromium does not restore the context's TOUCH
+        # emulation afterwards. So a page that reported `(hover: none)` before
+        # the shutter reports `(hover: hover)` after it — and the rail arrows,
+        # which are `display:none` outside `@media(hover:hover)`, become
+        # tabbable elements that a phone would never have. Measuring after the
+        # shutter measured a device that does not exist, and did it about half
+        # the time. Everything that must describe THIS surface therefore runs
+        # first, and the shutter is last.
+        #
+        # `#modal` is added only for the player route — it holds the player
+        # chrome, which is static markup outside `#app`, and adding it
+        # everywhere would repeat ninety identical lines in thirty-six captures
+        # to assert nothing.
+        freeze_timers(page)
+        roots = ["#app"] + (["#modal"] if route.get("player") else [])
+        dom = page.evaluate(DOM_JS, roots)
         focus = tab_order(page, args.tab_stops)
+        # The walk left a focus ring and a scrolled rail behind it; the picture
+        # is of the page at rest, so put it back before the shutter.
+        #
+        # The wait is not padding. Resetting `scrollLeft` fires a scroll event,
+        # and the app's handler toggles `.railbox.can-l/.can-r` — which is what
+        # shows or hides the rail arrows. Scroll events are delivered at a frame
+        # boundary, so a screenshot taken straight after the reset catches the
+        # arrows in whichever state the race left them: nine of thirty-six
+        # captures moved between two runs of an unchanged tree until this was
+        # here, all of them rail routes.
+        page.evaluate(UNWALK_JS)
+        page.wait_for_timeout(args.rest_ms)
+        settle(page)
+        page.screenshot(path=str(shot), full_page=not args.viewport_only)
         if problems:
             raise Fail(f"{name}: " + "; ".join(problems[:5]))
         counted = {}
         for call in api_calls:
             counted[call] = counted.get(call, 0) + 1
-        return focus, dict(sorted(counted.items()))
+        return focus, dict(sorted(counted.items())), dom
     finally:
         page.close()
+
+
+def context_prefs(args, layout_id, token, route):
+    """Every UI preference the app persists, written before the app's first line.
+
+    Theme, light/dark, poster size, Home grouping, page size, Settings tab. Any
+    one of them left at "whatever the default is today" would silently
+    redecorate the baseline the day that default changes.
+    """
+    prefs = {
+        # The layout is a baseline dimension exactly like the theme: the same
+        # routes have to be photographed under every layout, and a layout
+        # applied after first paint would capture the wrong chrome.
+        "plurx_layout": layout_id,
+        "plurx_theme": args.theme,
+        "plurx_appearance": args.appearance,
+        "plurx_iconsize": "s",
+        "plurx_home_group": "category",
+        "plurx_settings_tab": "libraries",
+        "plurx_quality": "auto",
+        "plurx_playerinfo": "1",
+        "plurx_autoskip": "0",
+        "plurx_autonext": "1",
+        # The install banner is dismissible and its state is sticky; pinning it
+        # dismissed keeps Home's first row from depending on the browser's PWA
+        # opinion.
+        "plurx_getapp_dismissed": "1",
+    }
+    if not route.get("anonymous"):
+        prefs["plurx_token"] = token
+    return prefs
+
+
+def new_context(browser, args, vp, layout_id, token, route):
+    """One browsing context, pinned on every axis that could move a capture."""
+    context = browser.new_context(
+        viewport={"width": vp["width"], "height": vp["height"]},
+        # Touch capability drives `surfaceClass()`; see VIEWPORTS. `is_mobile`
+        # is deliberately NOT set: it turns on viewport-meta emulation and an
+        # overlay scrollbar, which changes the picture for reasons that have
+        # nothing to do with the layout under test.
+        has_touch=vp["touch"],
+        # Retina would double every pixel and hide nothing; 1 is also the only
+        # ratio that is the same on both machines.
+        device_scale_factor=1,
+        locale="en-US",
+        timezone_id="UTC",
+        # The app asks matchMedia for both of these. Pinning them stops the
+        # host's own accessibility and appearance settings from leaking into
+        # the picture.
+        reduced_motion="reduce",
+        color_scheme="dark",
+    )
+    context.add_init_script(
+        FREEZE_JS.replace("__FROZEN_MS__", str(FROZEN_EPOCH * 1000))
+                 .replace("__FREEZE_CSS__", json.dumps(FREEZE_CSS))
+    )
+    context.add_init_script(
+        "(() => { try { const p = %s; for (const k in p) localStorage.setItem(k, p[k]); } catch (e) {} })();"
+        % json.dumps(context_prefs(args, layout_id, token, route))
+    )
+    return context
+
+
+def read_registry(browser, base_url, token, args):
+    """Ask the running app which layouts exist, and what each viewport IS.
+
+    One page load per viewport, before any capture, for two answers that cannot
+    be derived anywhere else honestly: `Object.keys(LAYOUTS)` with each layout's
+    declared `surfaces`, and the `surfaceClass()` this viewport resolves to.
+    Both come from the page because both are the app's own decisions — a copy of
+    either kept in this file would be right until the day it silently was not,
+    which is the failure R1 exists to end.
+    """
+    layouts = None
+    surfaces = {}
+    probe = {"hash": "#/"}
+    for vp in VIEWPORTS:
+        context = new_context(browser, args, vp, "classic", token, probe)
+        try:
+            page = context.new_page()
+            page.goto(base_url + "/#/", wait_until="networkidle", timeout=args.timeout)
+            # The <head> registry only carries `classic`; every later layout
+            # attaches itself from the body script. Waiting for #app to have
+            # content is waiting for that script to have finished.
+            page.wait_for_selector("#app", state="attached", timeout=args.timeout)
+            info = page.evaluate(REGISTRY_JS)
+            surfaces[vp_key(vp)] = info["surface"]
+            if layouts is None:
+                layouts = info["layouts"]
+            page.close()
+        finally:
+            context.close()
+    return layouts, surfaces
+
+
+def vp_key(vp):
+    return f"{vp['width']}x{vp['height']}"
+
+
+def plan(layouts, surfaces, routes, wanted):
+    """Every (layout, viewport, route) triple this app would actually render.
+
+    A layout is skipped at a viewport whose surface it does not declare, because
+    `layoutId()` would fall back to classic there and the capture would be a
+    duplicate of classic filed under the wrong name — which is precisely the
+    "the harness answered the question it was asked" failure of §3. Skips are
+    printed, not swallowed: a layout that quietly captures nothing is a layout
+    with no gate.
+    """
+    known = {L["id"]: L for L in layouts}
+    if wanted == ["all"]:
+        chosen = sorted(known)
+    else:
+        missing = [w for w in wanted if w not in known]
+        if missing:
+            raise Fail(f"no such layout(s): {', '.join(missing)} — the app registers "
+                       f"{', '.join(sorted(known))}")
+        chosen = sorted(dict.fromkeys(wanted))
+    triples, skipped = [], []
+    for layout_id in chosen:
+        for vp in VIEWPORTS:
+            surface = surfaces[vp_key(vp)]
+            if surface not in known[layout_id]["surfaces"]:
+                skipped.append(f"{layout_id} @ {vp_key(vp)}: layout declares no "
+                               f"{surface!r} surface")
+                continue
+            for name, route in routes.items():
+                triples.append((layout_id, vp, name, route))
+    return triples, skipped
 
 
 def run_capture(base_url, token, routes, args, out_dir):
@@ -751,6 +1193,8 @@ def run_capture(base_url, token, routes, args, out_dir):
     executable = find_browser(args.browser)
     focus_dump = {}
     request_dump = {}
+    dom_dump = {}
+    pixels = {}
     failures = []
     with sync_playwright() as pw:
         browser = pw.chromium.launch(
@@ -786,69 +1230,283 @@ def run_capture(base_url, token, routes, args, out_dir):
             ],
         )
         try:
-            for width, height in VIEWPORTS:
-                for name, route in routes.items():
-                    context = browser.new_context(
-                        viewport={"width": width, "height": height},
-                        # Retina would double every pixel and hide nothing; 1 is
-                        # also the only ratio that is the same on both machines.
-                        device_scale_factor=1,
-                        locale="en-US",
-                        timezone_id="UTC",
-                        # The app asks matchMedia for both of these. Pinning them
-                        # stops the host's own accessibility and appearance
-                        # settings from leaking into the picture.
-                        reduced_motion="reduce",
-                        color_scheme="dark",
-                    )
-                    context.add_init_script(
-                        FREEZE_JS.replace("__FROZEN_MS__", str(FROZEN_EPOCH * 1000))
-                                 .replace("__FREEZE_CSS__", json.dumps(FREEZE_CSS))
-                    )
-                    # Every UI preference the app persists is written before the
-                    # app's first line: theme, light/dark, poster size, Home
-                    # grouping, page size, Settings tab. Any one of them left at
-                    # "whatever the default is today" would silently redecorate
-                    # the baseline the day that default changes.
-                    prefs = {
-                        # The layout is a baseline dimension exactly like the
-                        # theme: the same routes have to be photographed under
-                        # every layout, and a layout applied after first paint
-                        # would capture the wrong chrome.
-                        "plurx_layout": args.layout,
-                        "plurx_theme": args.theme,
-                        "plurx_appearance": args.appearance,
-                        "plurx_iconsize": "s",
-                        "plurx_home_group": "category",
-                        "plurx_settings_tab": "libraries",
-                        "plurx_quality": "auto",
-                        "plurx_playerinfo": "1",
-                        "plurx_autoskip": "0",
-                        "plurx_autonext": "1",
-                        # The install banner is dismissible and its state is
-                        # sticky; pinning it dismissed keeps Home's first row
-                        # from depending on the browser's PWA opinion.
-                        "plurx_getapp_dismissed": "1",
-                    }
-                    if not route.get("anonymous"):
-                        prefs["plurx_token"] = token
-                    context.add_init_script(
-                        "(() => { try { const p = %s; for (const k in p) localStorage.setItem(k, p[k]); } catch (e) {} })();"
-                        % json.dumps(prefs)
-                    )
-                    key = f"{name}@{width}x{height}"
-                    try:
-                        focus_dump[key], request_dump[key] = capture_route(
-                            context, base_url, name, route, width, height, args, out_dir)
-                        print(f"OK      {key}", flush=True)
-                    except Exception as e:  # noqa: BLE001 — every failure is a gate failure
-                        failures.append(f"{key}: {e}")
-                        print(f"FAIL    {key}: {e}", flush=True)
-                    finally:
-                        context.close()
+            layouts, surfaces = read_registry(browser, base_url, token, args)
+            print("LAYOUTS " + ", ".join(f"{L['id']} ({'/'.join(L['surfaces'])})"
+                                         for L in layouts), flush=True)
+            print("SURFACE " + ", ".join(f"{k}={v}" for k, v in sorted(surfaces.items())),
+                  flush=True)
+            triples, skipped = plan(layouts, surfaces, routes, args.layout)
+            for line in skipped:
+                print(f"SKIP    {line}", flush=True)
+            # Last run's PNGs for these layouts, removed before this run writes
+            # any: a stale capture from a route table that no longer exists
+            # would sit beside the new ones and quietly pass a hash comparison
+            # nobody re-derived. Scoped to the layout directories so the cached
+            # `media/` corpus and the `selfhost/` data dir survive.
+            for layout_id in sorted({t[0] for t in triples}):
+                shutil.rmtree(out_dir / layout_id, ignore_errors=True)
+                (out_dir / layout_id).mkdir(parents=True, exist_ok=True)
+
+            for layout_id, vp, name, route in triples:
+                context = new_context(browser, args, vp, layout_id, token, route)
+                key = f"{layout_id}|{name}@{vp_key(vp)}"
+                shot = out_dir / layout_id / f"{name}@{vp_key(vp)}.png"
+                try:
+                    focus_dump[key], request_dump[key], dom_dump[key] = capture_route(
+                        context, base_url, name, route, args, shot, layout_id)
+                    pixels[key] = hashlib.sha256(shot.read_bytes()).hexdigest()
+                    print(f"OK      {key}", flush=True)
+                except Exception as e:  # noqa: BLE001 — every failure is a gate failure
+                    failures.append(f"{key}: {e}")
+                    print(f"FAIL    {key}: {e}", flush=True)
+                finally:
+                    context.close()
         finally:
             browser.close()
-    return focus_dump, request_dump, failures
+    return {
+        "layouts": layouts,
+        "surfaces": surfaces,
+        "focus": focus_dump,
+        "requests": request_dump,
+        "dom": dom_dump,
+        "pixels": pixels,
+        "failures": failures,
+    }
+
+
+# ---- the portable golden --------------------------------------------------
+
+
+# Absolute paths that reach a rendered string. Settings prints a library's
+# paths verbatim, and the seeded library lives under `--out` — so the same tree
+# checked out twice, or run twice at different `--out` values, would produce
+# two different goldens and the committed one would be a fact about one
+# directory.
+#
+# The catch-all is not there to handle the paths we know about (those are named
+# in `path_tokens` and replaced first, longest-first so `<out>/media` wins over
+# `<out>`). It is there so a path we did NOT anticipate cannot quietly make the
+# golden machine-specific. A false positive costs a slightly vaguer golden line
+# — the Settings placeholder `/path/to/media` reads `<path>` and nobody is
+# worse off; a false negative costs everyone else a red gate they cannot fix.
+#
+# No space in the character class: a label like "Light / dark" must survive, and
+# the real paths this run can produce are already named above.
+ABS_PATH_RE = re.compile(r"(?:[A-Za-z]:)?[/\\](?:[\w.@+-]+[/\\]){2,}[\w.@+-]*")
+
+
+def scrub(text, replacements):
+    """Remove anything host- or path-dependent from a rendered STRING.
+
+    Applied to free text only — a focus label. Not to a DOM signature or a
+    request path: `/api/v1/libraries` looks exactly like a filesystem path to
+    any regex, and scrubbing it would delete the request-log invariant (R2)
+    while appearing to work.
+    """
+    for needle, token in replacements:
+        if needle:
+            text = text.replace(str(needle), token)
+    return ABS_PATH_RE.sub("<path>", text)
+
+
+def path_tokens(args, out_dir):
+    """The concrete strings this run knows are local to this machine."""
+    return [
+        (str(Path(out_dir).resolve() / "media"), "<media>"),
+        (str(Path(out_dir).resolve()), "<out>"),
+        (str(ROOT), "<root>"),
+        (str(Path.home()), "<home>"),
+    ]
+
+
+# How much of a focus label survives into the golden. Enough to tell two
+# controls apart, little enough that a long description is not three lines of
+# diff; applied AFTER scrubbing, so the cut never lands inside a path.
+FOCUS_LABEL_CHARS = 60
+
+
+def structure_lines(result, args, out_dir):
+    """The portable tier as sorted `layout|capture|kind|key|value` lines.
+
+    One logical fact per line, so a reviewer reads a pull request diff instead
+    of a whole file: a lost `unw` class is one `-` and one `+`, naming the
+    layout, the route, the viewport and the selector. JSON would nest the same
+    facts three levels deep and turn every change into a re-indented block.
+
+    `|` is the separator and `value` is the last field, so only the first four
+    fields must avoid it; a `|` that reaches a key is escaped rather than
+    trusted, because a focus label is app text and app text is not this
+    script's to promise anything about.
+    """
+    sub = path_tokens(args, out_dir)
+
+    def key(s):
+        """A DOM signature or a request path: structural, never free text."""
+        return str(s).replace("|", "¦").replace("\n", " ")
+
+    def text(s):
+        """A focus label: app text, so scrub it, THEN cut it (see FOCUS_JS)."""
+        return scrub(str(s), sub)[:FOCUS_LABEL_CHARS].replace("|", "¦").replace("\n", " ")
+
+    lines = []
+    # Meta first (`*` sorts before every layout id): the registry itself is
+    # under test. A layout added without regenerating the golden, or a layout
+    # whose `surfaces` changed, is then a one-line diff at the top of the file
+    # rather than three hundred lines of captures further down that nobody
+    # traces back to a cause.
+    for L in result["layouts"]:
+        lines.append(f"*|*|layout|{key(L['id'])}|{' '.join(L['surfaces'])}")
+    for vp, surface in sorted(result["surfaces"].items()):
+        lines.append(f"*|*|surface|{key(vp)}|{surface}")
+
+    for cap, dom in result["dom"].items():
+        layout, capture = cap.split("|", 1)
+        for sig, count in dom.items():
+            lines.append(f"{layout}|{capture}|dom|{key(sig)}|{count}")
+    for cap, focus in result["focus"].items():
+        layout, capture = cap.split("|", 1)
+        # Zero-padded so the tab ORDER survives a lexicographic sort — an
+        # order that sorts 10 before 2 is not an order.
+        for n, descriptor in enumerate(focus):
+            lines.append(f"{layout}|{capture}|focus|{n:03d}|{text(descriptor)}")
+    for cap, requests in result["requests"].items():
+        layout, capture = cap.split("|", 1)
+        for call, count in requests.items():
+            lines.append(f"{layout}|{capture}|req|{key(call)}|{count}")
+    return sorted(lines)
+
+
+GOLDEN_HEADER = """\
+# plurx UI structural golden — the portable tier of scripts/ui-baseline.
+#
+#   regenerate   scripts/ui-baseline --self-host --update
+#   verify       make ui-check
+#
+# COMMITTED ON PURPOSE, and pixel-free on purpose. A PNG hash depends on the
+# Chromium build, the rasteriser and the path the fixture library sits at, so a
+# committed pixel manifest is red on every machine but the one that wrote it.
+# Everything below is a fact about the DOM the app builds, and is therefore the
+# same on a Mac, in the sandbox and on a CI runner. Pixel hashes stay in
+# target/ui-baseline/pixels.txt and are compared with --baseline, never here.
+#
+# Format, one fact per line:
+#
+#   <layout>|<route>@<w>x<h>|<kind>|<key>|<value>
+#
+#   layout   dark|light etc. are NOT dimensions here — one theme, every layout.
+#            `*` marks a fact about the registry rather than about a capture.
+#   kind     layout   a registered layout and the surfaces it declares
+#            surface  which surfaceClass() a viewport resolves to
+#            dom      a structural signature `parent > self`, and how many of
+#                     them the route rendered. Tags, ids, sorted classes, role,
+#                     tabindex, ARIA state and a bare `text` flag — never text
+#                     content, inline style, href, src or value.
+#            focus    the Nth tab stop, zero-padded so the order sorts
+#            req      an API call the route made, method + path, and how often
+#
+# Regeneration must be a deliberate act with a diff, never a side effect of a
+# normal run — that is why `--update` exists and why a plain run writes only
+# into target/. If this file changed and you did not mean it to, the app
+# changed.
+"""
+
+
+def write_golden(path, lines):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(GOLDEN_HEADER + "\n".join(lines) + "\n", encoding="utf-8")
+
+
+def parse_golden(text):
+    """Golden text to {(layout, capture, kind, key): value}, comments dropped."""
+    out = {}
+    for raw in text.splitlines():
+        if not raw or raw.startswith("#"):
+            continue
+        parts = raw.split("|", 4)
+        if len(parts) != 5:
+            raise Fail(f"malformed golden line (expected 5 |-separated fields): {raw[:120]}")
+        out[tuple(parts[:4])] = parts[4]
+    return out
+
+
+def diff_golden(want, got, limit):
+    """A per-key report of what moved, grouped so a human can act on it.
+
+    Grouped by (layout, capture) because that is the unit somebody debugs: the
+    first question about a drift is always "which layout, which route, which
+    viewport", and a flat list of five hundred keys answers it last. A capture
+    that is wholly absent on one side collapses to a single line — a new layout
+    must not print three hundred additions and bury the one fact that matters.
+    """
+    want_caps = {k[:2] for k in want}
+    got_caps = {k[:2] for k in got}
+    report, changed = [], 0
+
+    for cap in sorted(want_caps - got_caps):
+        report.append(f"  - {cap[0]} | {cap[1]}: captured in the golden, MISSING from this run")
+        changed += 1
+    for cap in sorted(got_caps - want_caps):
+        report.append(f"  + {cap[0]} | {cap[1]}: captured by this run, ABSENT from the golden")
+        changed += 1
+
+    shared = want_caps & got_caps
+    for cap in sorted(shared):
+        w = {k[2:]: v for k, v in want.items() if k[:2] == cap}
+        g = {k[2:]: v for k, v in got.items() if k[:2] == cap}
+        rows = []
+        for k in sorted(set(w) | set(g)):
+            if k not in g:
+                rows.append(f"      - {k[0]:5} {k[1]}   was {w[k]}")
+            elif k not in w:
+                rows.append(f"      + {k[0]:5} {k[1]}   now {g[k]}")
+            elif w[k] != g[k]:
+                rows.append(f"      ~ {k[0]:5} {k[1]}   {w[k]} -> {g[k]}")
+        if rows:
+            changed += len(rows)
+            report.append(f"  {cap[0]} | {cap[1]}")
+            report.extend(rows)
+
+    truncated = []
+    if len(report) > limit:
+        truncated = report[:limit] + [f"  … {len(report) - limit} more lines "
+                                      "(raise --diff-lines to see them all)"]
+    return changed, (truncated or report)
+
+
+def compare_pixels(pixels, baseline_dir):
+    """Which captures moved since a previous LOCAL run. Never a committed check.
+
+    The pixel tier answers one question — "I refactored; did any picture
+    change?" — and it can only answer it between two runs on one machine. So it
+    is a directory you point at, not a file in git; there is no way to make a
+    PNG hash mean the same thing on two hosts, and pretending otherwise is how
+    a gate gets muted.
+    """
+    ref = Path(baseline_dir).resolve() / "pixels.txt"
+    if not ref.is_file():
+        raise Fail(f"--baseline {baseline_dir}: no pixels.txt there — that directory is "
+                   "not a previous ui-baseline run")
+    was = {}
+    for line in ref.read_text(encoding="utf-8").splitlines():
+        if line and not line.startswith("#"):
+            digest, _, key = line.partition("  ")
+            was[key] = digest
+    moved, added, gone = [], [], []
+    for key in sorted(set(was) | set(pixels)):
+        if key not in was:
+            added.append(key)
+        elif key not in pixels:
+            gone.append(key)
+        elif was[key] != pixels[key]:
+            moved.append(key)
+    return moved, added, gone
+
+
+def write_pixels(path, pixels):
+    # `sha256sum`-compatible ("<digest>  <name>"), so the file can be checked
+    # with the tool everybody already reaches for, and diffed as plain text.
+    path.write_text("".join(f"{v}  {k}\n" for k, v in sorted(pixels.items())),
+                    encoding="utf-8")
 
 
 # ---- entry point ----------------------------------------------------------
@@ -866,7 +1524,22 @@ def parse_args(argv):
     p.add_argument("--token", help="bearer token for --base-url (localStorage.plurx_token)")
     p.add_argument("--out", default=str(ROOT / "target" / "ui-baseline"),
                    help="output directory (default: target/ui-baseline)")
-    p.add_argument("--layout", default="classic", help="localStorage.plurx_layout (default: classic)")
+    p.add_argument("--layout", default="all",
+                   help="comma-separated layout ids, or 'all' — every layout the app "
+                        "registers at runtime (default: all)")
+    p.add_argument("--check", action="store_true",
+                   help="capture, then compare the portable tier against the committed "
+                        "golden and exit nonzero on any drift")
+    p.add_argument("--update", action="store_true",
+                   help="rewrite the committed golden (%s) — a deliberate act with a diff"
+                        % GOLDEN.relative_to(ROOT))
+    p.add_argument("--golden", default=str(GOLDEN),
+                   help=f"the committed golden to check against (default: {GOLDEN.relative_to(ROOT)})")
+    p.add_argument("--baseline",
+                   help="a previous run's --out directory; additionally compare the PIXEL "
+                        "tier against it and report which captures moved")
+    p.add_argument("--diff-lines", type=int, default=120,
+                   help="how many drift lines --check prints before truncating (default: 120)")
     p.add_argument("--theme", default="noirr", help="localStorage.plurx_theme (default: noirr)")
     p.add_argument("--appearance", default="dark",
                    help="localStorage.plurx_appearance (default: dark)")
@@ -877,6 +1550,9 @@ def parse_args(argv):
     p.add_argument("--settle-ms", type=int, default=4500,
                    help="quiet period before the shutter, in ms — must exceed the 4s "
                         "activity poll so the capture never lands mid-cycle (default: 4500)")
+    p.add_argument("--rest-ms", type=int, default=250,
+                   help="quiet period between undoing the tab walk and the shutter, in ms "
+                        "— long enough for the rails' scroll handler to have run (default: 250)")
     p.add_argument("--timeout", type=int, default=45000, help="per-step timeout in ms")
     p.add_argument("--browser", help="path to a Chromium binary (default: find one, else Playwright's)")
     p.add_argument("--server-bin", help="plurxd binary for --self-host (default: target/debug/plurxd)")
@@ -898,6 +1574,20 @@ def parse_args(argv):
         p.error("pass --self-host, or --base-url (with --token) for a running server")
     if args.base_url and not args.token:
         p.error("--base-url needs --token: every route but auth is behind a login")
+    if args.check and args.update:
+        p.error("--check and --update are opposites: one asserts the golden, the other "
+                "replaces it")
+    # A golden is only meaningful against the fixture library it was written
+    # from. A real server has different titles, different counts and a different
+    # DOM, so --check against --base-url would fail for reasons that are not
+    # regressions, every time — and a gate that always fails is a gate that gets
+    # deleted.
+    if (args.check or args.update) and not args.self_host:
+        p.error("--check/--update need --self-host: the golden is written against the "
+                "seeded fixture library, and a real server has different content")
+    args.layout = [s.strip() for s in args.layout.split(",") if s.strip()]
+    if not args.layout:
+        p.error("--layout needs at least one id, or 'all'")
     return args
 
 
@@ -972,6 +1662,30 @@ def preflight(args):
         if not args.base_url:
             problems.append("neither --self-host nor --base-url given; there is nothing to capture")
 
+    # Knowable before anything is captured, and each one costs a three-minute
+    # sweep if it is discovered afterwards instead.
+    if args.check and not Path(args.golden).is_file():
+        problems.append(
+            f"--check but no golden at {args.golden}\n"
+            "      scripts/ui-baseline --self-host --update   (then review the diff and commit it)"
+        )
+    if args.update and not Path(args.golden).parent.is_dir():
+        problems.append(f"--update but {Path(args.golden).parent} does not exist")
+    if args.baseline and not (Path(args.baseline) / "pixels.txt").is_file():
+        problems.append(
+            f"--baseline {args.baseline} has no pixels.txt — it is not a previous run's --out\n"
+            f"      scripts/ui-baseline --self-host --out {args.baseline}   (before your change)"
+        )
+    # This run overwrites its own pixels.txt, so pointing --baseline at --out
+    # compares a run against itself and reports "identical" whatever happened —
+    # the one answer that is never information.
+    if args.baseline and Path(args.baseline).resolve() == Path(args.out).resolve():
+        problems.append(
+            "--baseline and --out are the same directory; this run would overwrite the\n"
+            "      reference before comparing against it. Capture the BEFORE state into a\n"
+            "      second directory: scripts/ui-baseline --self-host --out target/ui-before"
+        )
+
     if problems:
         raise Fail(
             "preflight failed, nothing was run:\n  - " + "\n  - ".join(problems)
@@ -998,8 +1712,10 @@ def main(argv):
         return 1
     out_dir = Path(args.out).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    # Stale PNGs from a previous route table would sit beside the new ones and
-    # quietly pass a hash comparison nobody re-derived.
+    # Legacy layout of this directory: before the sweep, PNGs sat at the top
+    # level rather than under <layout>/. Left behind they are stale pictures
+    # beside live ones. (The per-layout directories are cleared in run_capture,
+    # once the app has said which layouts exist.)
     for old in out_dir.glob("*.png"):
         old.unlink()
 
@@ -1014,22 +1730,73 @@ def main(argv):
             routes = discover_routes(base_url, token, args)
 
         print(f"CAPTURE {base_url} -> {out_dir}", flush=True)
-        focus, requests, failures = run_capture(base_url, token, routes, args, out_dir)
+        started = time.time()
+        result = run_capture(base_url, token, routes, args, out_dir)
 
         # sort_keys + a trailing newline so the file is diffable and stable
-        # whatever order the routes were captured in.
+        # whatever order the routes were captured in. These two are kept beside
+        # the flat golden because they are what somebody actually reads when
+        # debugging ONE route; the golden is what a reviewer reads.
         (out_dir / "requests.json").write_text(
-            json.dumps(requests, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            json.dumps(result["requests"], indent=2, sort_keys=True) + "\n", encoding="utf-8")
         (out_dir / "focus.json").write_text(
-            json.dumps(focus, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
+            json.dumps(result["focus"], indent=2, sort_keys=True, ensure_ascii=False) + "\n")
+        write_pixels(out_dir / "pixels.txt", result["pixels"])
 
+        failures = result["failures"]
         if failures:
-            print("\nFAILED routes:", file=sys.stderr)
+            print("\nFAILED captures:", file=sys.stderr)
             for line in failures:
                 print("  " + line, file=sys.stderr)
+            # Deliberately before any comparison: a golden written from a run
+            # with a broken route would bake the breakage in, and a --check
+            # against a partial run would report drift that is really an
+            # absence. Fail on the capture, fix that, then talk about the diff.
             return 1
-        print(f"\n{len(focus)} routes captured, no console or page errors.")
-        return 0
+
+        lines = structure_lines(result, args, out_dir)
+        (out_dir / "structure.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        print(f"\n{len(result['focus'])} captures in {time.time() - started:.0f}s "
+              f"({len(lines)} structural facts), no console or page errors.")
+
+        status = 0
+        if args.update:
+            write_golden(Path(args.golden), lines)
+            print(f"UPDATE  {args.golden} — review the diff before committing it.")
+        elif args.check:
+            want = parse_golden(Path(args.golden).read_text(encoding="utf-8"))
+            got = parse_golden("\n".join(lines))
+            changed, report = diff_golden(want, got, args.diff_lines)
+            if changed:
+                print(f"\nDRIFT   {changed} structural facts differ from {args.golden}:",
+                      file=sys.stderr)
+                for line in report:
+                    print(line, file=sys.stderr)
+                print("\n  If this change is intended: scripts/ui-baseline --self-host "
+                      "--update, then commit the golden with it.", file=sys.stderr)
+                status = 1
+            else:
+                print(f"CHECK   {len(want)} structural facts match {args.golden}.")
+
+        if args.baseline:
+            moved, added, gone = compare_pixels(result["pixels"], args.baseline)
+            if moved or added or gone:
+                print(f"\nPIXELS  vs {args.baseline}:")
+                for key in moved:
+                    print(f"  ~ {key} moved")
+                for key in added:
+                    print(f"  + {key} is new")
+                for key in gone:
+                    print(f"  - {key} is gone")
+                # Not a gate: a moved pixel is the QUESTION "did you mean that?",
+                # and only a human looking at the two PNGs can answer it. Making
+                # it exit 1 would make every intended visual change a red run.
+                print(f"  {len(moved)} moved, {len(added)} new, {len(gone)} gone — "
+                      "open the PNGs in both directories to judge them.")
+            else:
+                print(f"\nPIXELS  identical to {args.baseline} "
+                      f"({len(result['pixels'])} captures).")
+        return status
     except Fail as e:
         print(f"error: {e}", file=sys.stderr)
         return 1

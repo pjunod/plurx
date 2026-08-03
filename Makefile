@@ -84,12 +84,32 @@ playback-full: ## Run every fixture x quality plus playback restart cases
 ## ---- web UI baseline ---------------------------------------------------
 
 # The layout work rearranges one 6000-line file with no component tests under
-# it. `ui-baseline` photographs the shipped UI so a refactor can be *shown* to
-# have changed nothing. The goldens are not committed: regenerate them from the
-# pre-change commit, keep the directory, and re-run afterwards.
+# it. `ui-baseline` photographs the shipped UI — every registered layout, nine
+# routes, two viewports — so a refactor can be *shown* to have changed nothing.
+#
+# Two tiers, and the difference is the whole design (see the script's header,
+# and docs/UI-LAYOUTS-G3-DECISION.md §5/R1). The STRUCTURAL tier —
+# tests/ui-structure.golden — is committed and enforced by `ui-check`, because
+# nothing in it is a pixel, a path or a clock, so it is the same file on every
+# machine. The PIXEL tier stays in target/: a PNG hash depends on the Chromium
+# build and on where the fixture library sits on disk, so committing it would
+# commit a fact about one laptop and go red on every other.
 .PHONY: ui-baseline
-ui-baseline: ## Capture the deterministic UI screenshot + tab-order baseline
+ui-baseline: ## Capture the UI baseline for every layout (both tiers, into target/)
 	@scripts/ui-baseline --self-host
+
+# The gate. Fails on any structural drift and prints which layout, which route,
+# which viewport and which key moved. This is what pre-commit and CI run.
+.PHONY: ui-check
+ui-check: ## Sweep every layout and fail if the structural golden moved
+	@scripts/ui-baseline --self-host --check
+
+# Regenerating the golden is a deliberate act that shows up in a git diff, never
+# a side effect of a normal run — a golden that rewrites itself asserts nothing.
+# Run this when you MEANT to change the UI, then read the diff before committing.
+.PHONY: ui-golden
+ui-golden: ## Rewrite tests/ui-structure.golden after an intended UI change
+	@scripts/ui-baseline --self-host --update
 
 # `make check` cannot see either of these. index.html is include_str!-embedded,
 # so a JS syntax error in it compiles, links, passes every Rust test, and then
