@@ -1,72 +1,14 @@
 #!/bin/sh
-# plurx pre-commit hook — keeps main green by running the same gate as CI.
+# plurx pre-commit hook — validates the behavior affected by the staged diff.
 # Install with `make hooks`. Bypass a single commit with `git commit --no-verify`.
 #
-# Runs against your working tree (what you're about to commit). Kept to the
-# fast path: fmt-check, clippy, and the test suite all finish in seconds on a
-# warm build; the first run after a pull may compile more.
+# The functionality catalog always runs the baseline Rust gate, then adds
+# surface checks selected by changed paths. Missing optional browser tooling is
+# reported as a skip and CI still runs the required portable profile.
 set -e
 
-if ! command -v cargo >/dev/null 2>&1; then
-    echo "pre-commit: cargo not found on PATH — skipping checks." >&2
-    exit 0
-fi
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$ROOT"
 
-echo "pre-commit: make check (fmt-check + clippy + test)…"
-make check
-
-# ---- the web UI gate ------------------------------------------------------
-#
-# `make check` cannot see the web UI at all: index.html is include_str!-embedded,
-# so a JS error in it compiles, links, passes every Rust test and then serves a
-# blank page. `make ui-check` sweeps every registered layout and compares the
-# structural golden — see docs/UI-LAYOUTS-G3-DECISION.md §5/R1 for the two real
-# fixes that shipped reverted because nothing did this.
-#
-# Two rules, both learned the hard way and both mirroring how the cargo gate
-# above behaves:
-#
-#  1. Only when the UI changed. The sweep takes minutes — it boots a server,
-#     seeds a library and drives 36 browser captures — and a commit that
-#     touches only Rust cannot move it. An unconditional multi-minute hook is a
-#     hook everybody runs with --no-verify, which is the same as not having one.
-#  2. Missing tooling SKIPS, loudly; it never fails the commit. Playwright and
-#     its Chromium are not part of this repo's toolchain and not everyone has
-#     them; blocking a commit on a machine that physically cannot run the check
-#     would teach the whole team to bypass the hook. CI has the tools and is
-#     unconditional, so the assertion is never actually lost — see the
-#     `ui-check` job in .github/workflows/ci.yml.
-UI_PATHS='crates/plurxd/src/web/'
-if [ -n "$PLURX_SKIP_UI_BASELINE" ]; then
-    echo "pre-commit: PLURX_SKIP_UI_BASELINE set — skipping the UI baseline." >&2
-elif git diff --cached --name-only --diff-filter=ACMR | grep -q "^$UI_PATHS"; then
-    ui_missing=""
-    command -v python3 >/dev/null 2>&1 || ui_missing="python3"
-    if [ -z "$ui_missing" ]; then
-        python3 -c 'import playwright' >/dev/null 2>&1 || ui_missing="the python 'playwright' module"
-    fi
-    command -v ffmpeg >/dev/null 2>&1 || ui_missing="${ui_missing:-ffmpeg}"
-    # A golden that does not exist yet is the same class of problem as a missing
-    # tool: nothing to compare against, and failing the commit would only teach
-    # people to pass --no-verify. It is separated from the tooling case because
-    # the fix is different and one command long.
-    if [ -z "$ui_missing" ] && [ ! -f tests/ui-structure.golden ]; then
-        echo "pre-commit: ***** UI BASELINE SKIPPED *****" >&2
-        echo "pre-commit: tests/ui-structure.golden does not exist, so there is" >&2
-        echo "pre-commit: nothing to compare this change against. To create it:" >&2
-        echo "pre-commit:   make ui-golden   (then review the diff and commit it)" >&2
-        ui_missing="skip"
-    fi
-    if [ -n "$ui_missing" ] && [ "$ui_missing" != "skip" ]; then
-        # Loud, and it names the fix: a silent skip is indistinguishable from a
-        # pass, and this is the gate whose whole history is passing by accident.
-        echo "pre-commit: ***** UI BASELINE SKIPPED *****" >&2
-        echo "pre-commit: $ui_missing is not available, and $UI_PATHS is in this commit." >&2
-        echo "pre-commit: nothing checked the web UI. CI will. To check it here:" >&2
-        echo "pre-commit:   pip install playwright && python3 -m playwright install chromium" >&2
-        echo "pre-commit:   apt install ffmpeg   |   brew install ffmpeg" >&2
-    elif [ -z "$ui_missing" ]; then
-        echo "pre-commit: make ui-check (every layout, structural golden)…"
-        make ui-check
-    fi
-fi
+echo "pre-commit: validating functionality points selected by the staged diff…"
+scripts/validate run --profile commit --staged

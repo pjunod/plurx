@@ -28,6 +28,10 @@ for running it day to day and reading every status and log line it shows you, wi
 [docs/CHEATSHEET.md](docs/CHEATSHEET.md) as the copy-paste quickstart beside it.
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) has the diagrams and the founding
 decisions (why one binary clusters without external infra), and
+[docs/VALIDATION.md](docs/VALIDATION.md) explains the functionality-point
+catalog — how a changed path selects behavior contracts, which checks run at
+commit, CI, and full depth, and how to add a regression without losing it —
+then
 [docs/PLAYBACK.md](docs/PLAYBACK.md) traces the end-to-end path a file takes to
 become a stream — every direct/remux/transcode fork and the per-browser
 transport choice behind it. [docs/PLAYBACK-TESTING.md](docs/PLAYBACK-TESTING.md)
@@ -176,19 +180,23 @@ copy-paste commands, in order, plus a table of where everything lives.
 
 ## Development
 
-Rust is the only toolchain to install — the repo pins the exact rustc, clippy,
-and rustfmt in [`rust-toolchain.toml`](rust-toolchain.toml), so `rustup` fetches
-the right versions on your first build. Local and CI stay identical, which is
-why a green `make check` locally means green in CI. The one thing `rustup`
-can't supply is `ffmpeg`/`ffprobe` — keep them on `PATH`, not only for anything
-that scans or plays but for `make check` itself, whose transcode and stream
-tests spawn ffmpeg for real. CI installs them for the same reason.
+The repo pins the exact rustc, clippy, and rustfmt in
+[`rust-toolchain.toml`](rust-toolchain.toml), so `rustup` fetches the right
+versions on your first build. Functionality-point validation also needs Python
+3.11+; its standard-library TOML parser is the only Python dependency. The one
+thing neither toolchain supplies is `ffmpeg`/`ffprobe` — keep them on `PATH`,
+not only for anything that scans or plays but for the Rust gate itself, whose
+transcode and stream tests spawn ffmpeg for real. CI installs them for the same
+reason.
 
 ```bash
 git clone https://github.com/pjunod/plurx && cd plurx
 make run          # build + serve http://localhost:32400  (cargo run -p plurxd)
-make check        # fmt-check + clippy + test — the CI gate, the single quality bar
-make hooks        # install a pre-commit hook that runs `make check` before each commit
+make check        # catalog + fmt-check + clippy + test — mandatory baseline
+make validate-help # explain the validation workflow and UI golden
+make validate-staged # validate the functionality points in the staged diff
+make validate     # point-aware local gate; adds checks for non-Rust surfaces
+make hooks        # validate functionality points affected by each staged commit
 make playback-smoke # real-browser matrix; Chrome default, Safari/Edge/Firefox targets available
 ```
 

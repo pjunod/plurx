@@ -4,6 +4,7 @@ app/build/
 build/
 .gradle/
 .gradle-docker/
+.gradle-validation/
 *.apk
 .idea/
 local.properties

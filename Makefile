@@ -1,9 +1,11 @@
 # plurx developer tasks. `make` or `make help` lists everything.
-# CI runs the same targets a developer does, so "green locally" means
-# "green in CI" — there is no second, hidden set of commands.
+# CI enters through `scripts/validate`, which composes the same Make targets a
+# developer runs. `make validate` is the ordinary local entry point; `make
+# check` remains the portable baseline inside it.
 
 CARGO ?= cargo
 ANDROID_IMAGE ?= plurx-android-build
+ANDROID_PLATFORM ?= linux/amd64
 ANDROID_DATA_DIR ?=
 
 .DEFAULT_GOAL := help
@@ -32,7 +34,7 @@ fmt: ## Auto-format all code
 test: ## Run the test suite
 	$(CARGO) test --workspace
 
-## ---- gates (what CI enforces) -----------------------------------------
+## ---- baseline gates ----------------------------------------------------
 
 .PHONY: fmt-check
 fmt-check: ## Verify formatting without changing files
@@ -43,7 +45,49 @@ lint: ## Clippy across the workspace, warnings are errors
 	$(CARGO) clippy --workspace --all-targets -- -D warnings
 
 .PHONY: check
-check: fmt-check lint test ## fmt-check + lint + test — the full gate CI runs
+check: validation-lint fmt-check lint test ## Catalog + fmt + lint + test — the baseline gate
+
+## ---- functionality-point validation -----------------------------------
+
+# `make check` remains the mandatory baseline. The validator sits above it:
+# the catalog maps changed paths to named behavior contracts and adds the
+# surface-specific checks that ordinary Rust compilation cannot see.
+.PHONY: validate-help
+validate-help: ## Explain the validation workflow and UI golden commands
+	@printf '%s\n' \
+	  'Functionality-point validation maps changed files to user-visible promises.' \
+	  '' \
+	  '  make validate-plan    Explain what the staged change selects; run nothing' \
+	  '  make validate-staged  Validate the staged change (the normal local loop)' \
+	  '  make validate         Validate every point with the commit profile' \
+	  '  make validate-full    Add browser, client, and packaging checks' \
+	  '  make validation-lint  Check the catalog and path ownership only' \
+	  '' \
+	  'UI structure uses a reviewed answer key, tests/ui-structure.golden:' \
+	  '  make ui-check         Compare the current UI structure with that answer' \
+	  '  make ui-golden        Rewrite the answer after an intentional UI change' \
+	  '' \
+	  'Details: docs/VALIDATION.md'
+
+.PHONY: validation-lint
+validation-lint: ## Verify every governed file maps to a valid functionality point
+	@scripts/validate lint
+
+.PHONY: validate-plan
+validate-plan: ## Explain which points and checks the staged diff selects
+	@scripts/validate plan --profile commit --staged
+
+.PHONY: validate
+validate: ## Run the commit-profile checks for every functionality point
+	@scripts/validate run --profile commit --all
+
+.PHONY: validate-staged
+validate-staged: ## Run the commit-profile checks selected by the staged diff
+	@scripts/validate run --profile commit --staged
+
+.PHONY: validate-full
+validate-full: ## Run extended browser, client, and packaging validations
+	@scripts/validate run --profile full --all
 
 .PHONY: coverage
 coverage: ## Line coverage (installs cargo-llvm-cov on first run); writes lcov.info
@@ -84,22 +128,25 @@ playback-full: ## Run every fixture x quality plus playback restart cases
 ## ---- web UI baseline ---------------------------------------------------
 
 # The layout work rearranges one 6000-line file with no component tests under
-# it. `ui-baseline` photographs the shipped UI — every registered layout, nine
+# it. `ui-baseline` captures the shipped UI — every registered layout, nine
 # routes, two viewports — so a refactor can be *shown* to have changed nothing.
 #
 # Two tiers, and the difference is the whole design (see the script's header,
 # and docs/UI-LAYOUTS-G3-DECISION.md §5/R1). The STRUCTURAL tier —
-# tests/ui-structure.golden — is committed and enforced by `ui-check`, because
-# nothing in it is a pixel, a path or a clock, so it is the same file on every
-# machine. The PIXEL tier stays in target/: a PNG hash depends on the Chromium
-# build and on where the fixture library sits on disk, so committing it would
-# commit a fact about one laptop and go red on every other.
+# tests/ui-structure.golden — is a reviewed answer key designed to be committed
+# and enforced by `ui-check`. Nothing in it is a pixel, a path or a clock, so
+# it is the same file on every machine. It has not been committed yet, so
+# validation reports the missing evidence as a skip. The PIXEL tier stays in
+# target/: a PNG hash depends on the Chromium build and on where the fixture
+# library sits on disk, so committing it would commit a fact about one laptop
+# and go red on every other.
 .PHONY: ui-baseline
 ui-baseline: ## Capture the UI baseline for every layout (both tiers, into target/)
 	@scripts/ui-baseline --self-host
 
 # The gate. Fails on any structural drift and prints which layout, which route,
-# which viewport and which key moved. This is what pre-commit and CI run.
+# which viewport and which key moved. The commit profile runs it when its golden
+# and tooling exist; promote it to CI after the golden is committed.
 .PHONY: ui-check
 ui-check: ## Sweep every layout and fail if the structural golden moved
 	@scripts/ui-baseline --self-host --check
@@ -181,24 +228,34 @@ release-check: ## Verify the tree is ready to tag the current version
 	  && { echo "tag v$(VERSION) already exists — bump the version in Cargo.toml"; exit 1; } || true
 	@grep -q '^## \[$(VERSION)\]' CHANGELOG.md \
 	  || { echo "CHANGELOG.md has no '## [$(VERSION)]' section"; exit 1; }
-	@$(MAKE) --no-print-directory check
+	@scripts/validate run --profile ci --all --strict
 	@echo "Ready: git tag -a v$(VERSION) -m 'v$(VERSION)' && git push && git push --tags"
 
 .PHONY: hooks
-hooks: ## Install the git pre-commit hook (runs `make check`)
+hooks: ## Install the functionality-point pre-commit validator
 	@mkdir -p .git/hooks
 	@install -m 0755 scripts/pre-commit .git/hooks/pre-commit
-	@echo "Installed .git/hooks/pre-commit — bypass a run with 'git commit --no-verify'."
+	@echo "Installed .git/hooks/pre-commit — it runs make validate-staged."
+	@echo "Bypass one run with 'git commit --no-verify'."
 
 ## ---- android client ----------------------------------------------------
 
 .PHONY: android-image
 android-image: ## Build the pinned Android build-env image (JDK 25 + SDK)
-	docker build -t $(ANDROID_IMAGE) clients/android
+	docker build --platform $(ANDROID_PLATFORM) -t $(ANDROID_IMAGE) clients/android
+
+.PHONY: android-test
+android-test: android-image ## Run Android JVM unit tests + lint in the pinned image
+	docker run --rm --platform $(ANDROID_PLATFORM) \
+	  -u $$(id -u):$$(id -g) -e HOME=/tmp \
+	  -e GRADLE_USER_HOME=/workspace/clients/android/.gradle-validation \
+	  -v "$(CURDIR)":/workspace -w /workspace/clients/android \
+	  $(ANDROID_IMAGE) ./gradlew --no-daemon testDebugUnitTest lintDebug
 
 .PHONY: android
 android: android-image ## Build the Android debug APK in Docker (no host JDK/SDK)
 	docker run --rm \
+	  --platform $(ANDROID_PLATFORM) \
 	  -u $$(id -u):$$(id -g) -e HOME=/tmp \
 	  -e GRADLE_USER_HOME=/workspace/clients/android/.gradle-docker \
 	  -v "$(CURDIR)":/workspace -w /workspace/clients/android \

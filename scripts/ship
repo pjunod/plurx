@@ -12,7 +12,7 @@
 # here force-pushes, rewrites history, or deploys without saying which nodes.
 #
 # Usage:
-#   scripts/ship --check                 # the CI gate, locally, on the pin
+#   scripts/ship --check                 # the portable CI profile, locally
 #   scripts/ship --push                  # push main + the working branch
 #   scripts/ship --deploy                # ansible → every plurx node
 #   scripts/ship --apple                 # archive + upload the Apple build
@@ -68,10 +68,12 @@ cd "$ROOT"
 [ "$DRY" -eq 1 ] && say "DRY RUN — printing commands, running none"
 
 # --- the gate --------------------------------------------------------------
-# Same three commands CI runs, on the pinned toolchain. `rust-toolchain.toml`
-# pins 1.97.1 for a reason (a floating "stable" fails CI on new lints with no
-# code change), and homebrew's cargo has been ahead of the override on this
-# machine before — so this asks cargo what it actually is and says so.
+# The same portable profile CI runs, on the pinned toolchain. It includes the
+# catalog contract and web-static checks around the baseline fmt, clippy, and
+# test commands. `rust-toolchain.toml` pins 1.97.1 for a reason (a floating
+# "stable" fails CI on new lints with no code change), and homebrew's cargo has
+# been ahead of the override on this machine before — so this asks cargo what it
+# actually is and says so.
 if [ "$DO_CHECK" -eq 1 ]; then
   say "gate"
   note "$(cargo --version) · $(rustc --version)"
@@ -79,9 +81,7 @@ if [ "$DO_CHECK" -eq 1 ]; then
     *1.97.1*) ;;
     *) note "WARNING: not the pinned 1.97.1 — CI may disagree with this run" ;;
   esac
-  run cargo fmt --all -- --check
-  run cargo clippy --workspace --all-targets -- -D warnings
-  run cargo test --workspace --no-fail-fast
+  run scripts/validate run --profile ci --all --strict
 fi
 
 # --- push ------------------------------------------------------------------
