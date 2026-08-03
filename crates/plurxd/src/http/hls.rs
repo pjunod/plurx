@@ -481,9 +481,15 @@ pub async fn subtitle_vtt(
             (header::CONTENT_TYPE, "text/vtt; charset=utf-8"),
             (header::CACHE_CONTROL, "private, max-age=3600"),
         ],
+        // The session's MEDIA origin, not the offset that was requested. A
+        // copy session seeks with `-noaccurate_seek`, so its timeline begins
+        // at the keyframe before the requested start — shifting cues by the
+        // request made them lead the picture by up to a whole GOP (1–6 s on a
+        // 4K film) on every resumed or seeked copy session, which is the
+        // flagship Apple path.
         slice_webvtt(
             &bytes,
-            context.start_seconds,
+            context.media_origin_seconds,
             window.start_seconds,
             window.end_seconds,
         ),
@@ -502,22 +508,19 @@ fn quoted(value: &str) -> String {
         .collect()
 }
 
+/// BCP-47 for the `LANGUAGE=` attribute. One line, because the knowledge of
+/// which spellings mean the same language belongs to `plurx_core::tracks` —
+/// this module used to keep a ten-language copy of it, which silently passed
+/// "dut"/"cze"/"gre" through as non-BCP-47 and defeated viewer-language
+/// matching for every language the copy had not learned.
 fn language_tag(raw: Option<&str>) -> &str {
-    match raw.unwrap_or("und").to_ascii_lowercase().as_str() {
-        "eng" => "en",
-        "ita" => "it",
-        "jpn" => "ja",
-        "spa" => "es",
-        "fre" | "fra" => "fr",
-        "ger" | "deu" => "de",
-        "por" => "pt",
-        "kor" => "ko",
-        "chi" | "zho" => "zh",
-        "rus" => "ru",
-        _ => raw.unwrap_or("und"),
-    }
+    plurx_core::tracks::bcp47_tag(raw)
 }
 
+/// The human half of a rendition's `NAME`. Display names are a presentation
+/// concern, so they live here rather than in core — but the set is kept in
+/// step with the alias table `language_tag` reads, so a language that matches
+/// never renders as a bare three-letter code.
 fn language_name(raw: Option<&str>) -> &str {
     match language_tag(raw) {
         "en" => "English",
@@ -530,6 +533,23 @@ fn language_name(raw: Option<&str>) -> &str {
         "ko" => "Korean",
         "zh" => "Chinese",
         "ru" => "Russian",
+        "hi" => "Hindi",
+        "ar" => "Arabic",
+        "nl" => "Dutch",
+        "sv" => "Swedish",
+        "pl" => "Polish",
+        "no" => "Norwegian",
+        "da" => "Danish",
+        "fi" => "Finnish",
+        "tr" => "Turkish",
+        "th" => "Thai",
+        "vi" => "Vietnamese",
+        "uk" => "Ukrainian",
+        "cs" => "Czech",
+        "el" => "Greek",
+        "he" => "Hebrew",
+        "hu" => "Hungarian",
+        "ro" => "Romanian",
         other => other,
     }
 }
@@ -549,12 +569,52 @@ fn subtitle_name(track: &SubtitleStream, ordinal: usize) -> String {
     }
 }
 
+/// Does a track *title* declare the track forced?
+///
+/// Title-based detection is contract, not cleanup fodder: file 5615's forced
+/// Italian track carries `disposition.forced = false` and the title "Forced",
+/// and that regression case is why this exists at all (handoff §3.4).
+///
+/// But a substring test is too eager. "Non-Forced" and "Unforced" are real
+/// titles, and classifying them FORCED=YES hides an ordinary subtitle track
+/// from Apple's subtitle menu entirely — a forced rendition is only offered
+/// when the presentation language matches. So: match "forced" on word
+/// boundaries, and reject it when the preceding word negates it. "Unforced"
+/// falls out for free, because the `n` in front of it is not a boundary.
+fn title_marks_forced(title: &str) -> bool {
+    let lower = title.to_ascii_lowercase();
+    let mut rest = lower.as_str();
+    let mut consumed = 0usize;
+    while let Some(at) = rest.find("forced") {
+        let start = consumed + at;
+        let end = start + "forced".len();
+        let before = lower[..start].chars().next_back();
+        let after = lower[end..].chars().next();
+        let bounded =
+            !before.is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric);
+        if bounded && !negated_before(&lower[..start]) {
+            return true;
+        }
+        consumed = end;
+        rest = &lower[end..];
+    }
+    false
+}
+
+/// The word immediately before a "forced" occurrence, when it turns the claim
+/// around. Separators are skipped, so "non-forced", "non forced" and
+/// "not forced" are all caught by the same rule.
+fn negated_before(prefix: &str) -> bool {
+    let trimmed = prefix.trim_end_matches(|c: char| !c.is_alphanumeric());
+    let word = trimmed
+        .rsplit(|c: char| !c.is_alphanumeric())
+        .next()
+        .unwrap_or("");
+    matches!(word, "non" | "not" | "no" | "never")
+}
+
 fn track_is_forced(track: &SubtitleStream) -> bool {
-    track.forced
-        || track
-            .title
-            .as_deref()
-            .is_some_and(|title| title.to_ascii_lowercase().contains("forced"))
+    track.forced || track.title.as_deref().is_some_and(title_marks_forced)
 }
 
 /// The Apple accessibility `CHARACTERISTICS` for an SDH / hard-of-hearing
@@ -585,19 +645,91 @@ fn subtitle_characteristics(track: &SubtitleStream) -> Option<&'static str> {
     .then_some(ACCESSIBILITY)
 }
 
+/// Rendition `NAME`s, made unique.
+///
+/// RFC 8216 §4.3.4.1 makes NAME a MUST-unique quoted string within a group,
+/// and two same-language untitled tracks otherwise both render as "English".
+/// AVFoundation is entitled to merge them, and the client resolves options by
+/// name — so a duplicate is not a cosmetic wart, it is the client selecting
+/// the wrong track or none at all. Disambiguate by occurrence, leaving the
+/// first one alone so the common single-track case reads naturally.
+fn unique_subtitle_names(native: &[(usize, &SubtitleStream)]) -> Vec<String> {
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    native
+        .iter()
+        .map(|(index, track)| {
+            let base = subtitle_name(track, *index);
+            let count = seen.entry(base.clone()).or_insert(0);
+            *count += 1;
+            match *count {
+                1 => base,
+                n => format!("{base} ({n})"),
+            }
+        })
+        .collect()
+}
+
+/// Candidate master-playlist changes from the §5.4 ladder, each off by
+/// default and enabled one at a time for one deploy.
+///
+/// Every master regression in this arc passed unit tests and failed on the
+/// physical device, so the device is the only oracle and the ladder exists to
+/// keep exactly one variable moving per deploy. These are compiled in but
+/// inert until an operator sets the variable, which is what lets a rung be
+/// tried, observed on Bedroom, and either kept or dropped without another
+/// build. Once a rung is accepted, delete the flag and make it unconditional.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct MasterRungs {
+    /// `CLOSED-CAPTIONS=NONE` on the variant. Apple's authoring rules ask for
+    /// it, and it also stops AVFoundation synthesising a phantom
+    /// closed-caption option into the `.legible` group.
+    closed_captions_none: bool,
+    /// `AUTOSELECT=YES` on forced renditions, which Apple's authoring rules
+    /// require and this master currently withholds when two forced tracks
+    /// share a language.
+    forced_autoselect: bool,
+}
+
+impl MasterRungs {
+    fn enabled(name: &str) -> bool {
+        std::env::var(name).is_ok_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+    }
+
+    /// Read once: an operator sets these before plurxd starts, and a master
+    /// that could change shape between two fetches of the same session is a
+    /// worse problem than any rung solves.
+    fn active() -> Self {
+        static ACTIVE: std::sync::OnceLock<MasterRungs> = std::sync::OnceLock::new();
+        *ACTIVE.get_or_init(|| MasterRungs {
+            closed_captions_none: Self::enabled("PLURX_HLS_CLOSED_CAPTIONS_NONE"),
+            forced_autoselect: Self::enabled("PLURX_HLS_FORCED_AUTOSELECT"),
+        })
+    }
+}
+
 fn master_playlist(file: &MediaFile, selected: Option<i64>) -> String {
+    master_playlist_with(file, selected, MasterRungs::active())
+}
+
+fn master_playlist_with(file: &MediaFile, selected: Option<i64>, rungs: MasterRungs) -> String {
     let native: Vec<(usize, &SubtitleStream)> = file
         .subtitle_streams
         .iter()
         .enumerate()
         .filter(|(_, track)| is_native_text_subtitle(&track.codec))
         .collect();
+    let names = unique_subtitle_names(&native);
     // Copy/remux sessions can contain open GOPs, so the video rendition does
     // not promise independently decodable segments. The master must not make
     // that stronger claim on its behalf: AVPlayer acts on it at a resume
     // boundary and can reject an otherwise playable copied HEVC/DV stream.
     let mut out = String::from("#EXTM3U\n#EXT-X-VERSION:7\n");
-    for (index, track) in &native {
+    for (ordinal, (index, track)) in native.iter().enumerate() {
         // The query describes this player's selection. No selected index is
         // an explicit Off, not permission to resurrect a foreign-language
         // container default behind the client's back.
@@ -624,13 +756,21 @@ fn master_playlist(file: &MediaFile, selected: Option<i64>) -> String {
                     && subtitle_characteristics(other) == characteristics
             })
             .count();
-        let autoselect = default || tuple_copies == 1;
+        // Ladder rung (P2-11): Apple's authoring rules say a forced rendition
+        // is AUTOSELECT=YES — the player is meant to reach it on its own when
+        // the presentation language matches. Today two forced tracks sharing
+        // a language both come out AUTOSELECT=NO, because RFC 8216's
+        // uniqueness rule is written in terms of AUTOSELECT=YES members and
+        // AVPlayer has been observed rejecting a whole master over it. The
+        // two rules genuinely conflict; only the device settles which one it
+        // enforces, so this is a rung and not a fix.
+        let autoselect = default || tuple_copies == 1 || (rungs.forced_autoselect && forced);
         let characteristics = characteristics
             .map(|value| format!(",CHARACTERISTICS=\"{value}\""))
             .unwrap_or_default();
         out.push_str(&format!(
             "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"{}\",LANGUAGE=\"{}\",DEFAULT={},AUTOSELECT={},FORCED={}{},URI=\"subs/{index}/index.m3u8\"\n",
-            quoted(&subtitle_name(track, *index)),
+            quoted(&names[ordinal]),
             quoted(language_tag(track.language.as_deref())),
             if default { "YES" } else { "NO" },
             if autoselect { "YES" } else { "NO" },
@@ -640,6 +780,15 @@ fn master_playlist(file: &MediaFile, selected: Option<i64>) -> String {
     }
     let bandwidth = file.bitrate.unwrap_or(25_000_000).max(128_000);
     out.push_str(&format!("#EXT-X-STREAM-INF:BANDWIDTH={bandwidth}"));
+    // Ladder rung: the variant carries no CLOSED-CAPTIONS attribute, and
+    // Apple's authoring rules say a variant with no captions must say so.
+    // Absent it, AVFoundation is entitled to synthesise a phantom
+    // closed-caption option into the `.legible` group — which shifts every
+    // option ordinal underneath it. Correct HLS authoring, and untested on
+    // the device, which is exactly what a rung is.
+    if rungs.closed_captions_none {
+        out.push_str(",CLOSED-CAPTIONS=NONE");
+    }
     if !native.is_empty() {
         out.push_str(",SUBTITLES=\"subs\"");
     }
@@ -808,10 +957,24 @@ fn slice_webvtt(
         } else {
             format!(" {settings}")
         };
+        // A cue that outlives this segment keeps its AUTHORED end time. It
+        // used to be clipped to the segment boundary and re-emitted, clipped
+        // again, into the next one — so a line of dialogue spanning a 6 s
+        // boundary was torn in half and flickered at the seam, and its
+        // authored duration was destroyed in both halves. The cue is now
+        // emitted whole in every segment window it intersects; a player that
+        // sees the same cue twice reconciles it by identity, and worst case
+        // draws the same text over the same interval twice, which is
+        // invisible. Only the leading edge is still clamped, and only because
+        // it has to be: cue times in this scheme are segment-local and WebVTT
+        // has no way to spell a negative one. (Carrying session-absolute cue
+        // times with X-TIMESTAMP-MAP anchored at 0 would remove that last
+        // clamp — it is a change to a wire shape the device has already
+        // validated, so it belongs on the §5.4 ladder, not here.)
         lines[line_index] = format!(
             "{} --> {}{}",
             format_vtt_timestamp(start.max(segment_start) - segment_start),
-            format_vtt_timestamp(end.min(segment_end) - segment_start),
+            format_vtt_timestamp(end - segment_start),
             settings
         );
         shifted.push(lines.join("\n"));
@@ -1138,5 +1301,233 @@ mod tests {
             b"#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXTINF:4.0,\nseg00000.m4s\n#EXT-X-ENDLIST\n",
         );
         assert!(finished.ends_with("seg00000.vtt\n#EXT-X-ENDLIST\n"));
+    }
+
+    #[test]
+    fn forced_detection_reads_words_not_substrings() {
+        // The contract case: disposition says nothing, the title says Forced.
+        assert!(track_is_forced(&sub(
+            "subrip", "ita", "Forced", false, false
+        )));
+        assert!(track_is_forced(&sub(
+            "subrip",
+            "eng",
+            "English (Forced)",
+            false,
+            false
+        )));
+        assert!(track_is_forced(&sub(
+            "subrip",
+            "eng",
+            "forced signs",
+            false,
+            false
+        )));
+        // Disposition alone is still enough.
+        assert!(track_is_forced(&sub(
+            "subrip", "eng", "Regular", false, true
+        )));
+
+        // The bug: a substring test hid these tracks from Apple's subtitle
+        // menu entirely, because a forced rendition is only offered when the
+        // presentation language matches.
+        assert!(!track_is_forced(&sub(
+            "subrip",
+            "eng",
+            "Non-Forced",
+            false,
+            false
+        )));
+        assert!(!track_is_forced(&sub(
+            "subrip",
+            "eng",
+            "non forced",
+            false,
+            false
+        )));
+        assert!(!track_is_forced(&sub(
+            "subrip",
+            "eng",
+            "Not Forced",
+            false,
+            false
+        )));
+        assert!(!track_is_forced(&sub(
+            "subrip", "eng", "Unforced", false, false
+        )));
+        assert!(!track_is_forced(&sub(
+            "subrip",
+            "eng",
+            "Reinforced Audio",
+            false,
+            false
+        )));
+    }
+
+    #[test]
+    fn language_tags_come_from_the_shared_alias_table() {
+        // The ten this module used to know.
+        assert_eq!(language_tag(Some("eng")), "en");
+        assert_eq!(language_tag(Some("zho")), "zh");
+        // And the ones it did not, which used to reach AVPlayer as
+        // non-BCP-47 codes no viewer preference could ever match.
+        assert_eq!(language_tag(Some("dut")), "nl");
+        assert_eq!(language_tag(Some("cze")), "cs");
+        assert_eq!(language_tag(Some("gre")), "el");
+        assert_eq!(language_tag(Some("rum")), "ro");
+        assert_eq!(language_name(Some("cze")), "Czech");
+        // Unknown stays unknown rather than becoming a guess.
+        assert_eq!(language_tag(Some("xyz")), "xyz");
+        assert_eq!(language_tag(None), "und");
+    }
+
+    #[test]
+    fn rendition_names_are_unique_within_the_group() {
+        // Two untitled English tracks: RFC 8216 §4.3.4.1 makes NAME
+        // MUST-unique, and the client resolves options by name — so a
+        // duplicate is the client picking the wrong track, not a wart.
+        let file = hls_file(vec![
+            SubtitleStream {
+                index: 0,
+                codec: "subrip".into(),
+                language: Some("eng".into()),
+                title: None,
+                default: false,
+                forced: false,
+                hearing_impaired: false,
+            },
+            SubtitleStream {
+                index: 1,
+                codec: "subrip".into(),
+                language: Some("eng".into()),
+                title: None,
+                default: false,
+                forced: false,
+                hearing_impaired: false,
+            },
+        ]);
+        let master = master_playlist_with(&file, None, MasterRungs::default());
+        assert_eq!(master.matches("NAME=\"English\"").count(), 1, "{master}");
+        assert!(master.contains("NAME=\"English (2)\""), "{master}");
+    }
+
+    #[test]
+    fn rendition_attributes_survive_hostile_titles() {
+        // A quoted-string attribute has no escape, so a quote, a comma or a
+        // line break in a title is not a formatting problem — it is a
+        // playlist that no longer parses.
+        let file = hls_file(vec![sub(
+            "subrip",
+            "eng",
+            "The \"Good\" One, v2\r\nsecond line",
+            false,
+            false,
+        )]);
+        let master = master_playlist_with(&file, None, MasterRungs::default());
+        let line = master
+            .lines()
+            .find(|line| line.starts_with("#EXT-X-MEDIA:"))
+            .expect("a rendition line");
+        assert_eq!(
+            line.matches('"').count() % 2,
+            0,
+            "unbalanced quotes: {line}"
+        );
+        assert!(!line.contains("\"Good\""), "{line}");
+        assert!(line.contains("URI=\"subs/0/index.m3u8\""), "{line}");
+        assert_eq!(
+            master
+                .lines()
+                .filter(|l| l.starts_with("#EXT-X-MEDIA:"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn ladder_rungs_are_inert_until_an_operator_lights_them() {
+        let file = hls_file(vec![
+            sub("subrip", "ita", "Forced", false, true),
+            sub("subrip", "ita", "Forced Signs", false, true),
+        ]);
+
+        // Default: the shape that plays on the device today. Two forced
+        // tracks share a language, so RFC 8216's uniqueness rule keeps them
+        // manually selectable.
+        let shipped = master_playlist_with(&file, None, MasterRungs::default());
+        assert!(!shipped.contains("CLOSED-CAPTIONS"), "{shipped}");
+        assert_eq!(shipped.matches("AUTOSELECT=NO").count(), 2, "{shipped}");
+        assert!(!shipped.contains("CODECS="), "{shipped}");
+
+        // Rung 1, alone.
+        let captions = master_playlist_with(
+            &file,
+            None,
+            MasterRungs {
+                closed_captions_none: true,
+                ..MasterRungs::default()
+            },
+        );
+        assert!(
+            captions.contains(
+                "#EXT-X-STREAM-INF:BANDWIDTH=40000000,CLOSED-CAPTIONS=NONE,SUBTITLES=\"subs\""
+            ),
+            "{captions}"
+        );
+        assert_eq!(captions.matches("AUTOSELECT=NO").count(), 2, "{captions}");
+
+        // Rung 2, alone.
+        let forced = master_playlist_with(
+            &file,
+            None,
+            MasterRungs {
+                forced_autoselect: true,
+                ..MasterRungs::default()
+            },
+        );
+        assert!(!forced.contains("CLOSED-CAPTIONS"), "{forced}");
+        assert_eq!(forced.matches("AUTOSELECT=YES").count(), 2, "{forced}");
+    }
+
+    #[test]
+    fn a_cue_spanning_a_segment_boundary_keeps_its_authored_end() {
+        // 6 s windows; the cue runs 5.0 → 8.0, straddling the boundary.
+        let source = b"WEBVTT\n\nspan\n00:00:05.000 --> 00:00:08.000\ncrossing\n";
+        let first = String::from_utf8(slice_webvtt(source, 0.0, 0.0, 6.0)).expect("utf8");
+        let second = String::from_utf8(slice_webvtt(source, 0.0, 6.0, 12.0)).expect("utf8");
+
+        // It appears in both windows it intersects...
+        assert!(first.contains("crossing"), "{first}");
+        assert!(second.contains("crossing"), "{second}");
+        // ...and the copy in the first window runs to its AUTHORED end rather
+        // than being cut off at the boundary. Clipping it there is what tore
+        // a line of dialogue in half and flickered at every 6 s seam.
+        assert!(first.contains("00:00:05.000 --> 00:00:08.000"), "{first}");
+        // The trailing copy still starts at the window edge, because cue
+        // times in this scheme are segment-local and WebVTT cannot spell a
+        // negative one. Its identifier is what lets a player reconcile the
+        // two.
+        assert!(second.contains("00:00:00.000 --> 00:00:02.000"), "{second}");
+        assert!(second.contains("span"), "{second}");
+    }
+
+    #[test]
+    fn cue_shifting_is_relative_to_the_media_origin_not_the_request() {
+        // The P0-2 shape, as the slicer sees it: a copy session asked to
+        // start at 12.3 s whose media actually begins at the 10 s keyframe.
+        // A cue authored at 14.0 s belongs 4.0 s into the session, not 1.7.
+        let source = b"WEBVTT\n\n00:00:14.000 --> 00:00:16.000\nline\n";
+        let correct = String::from_utf8(slice_webvtt(source, 10.0, 0.0, 6.0)).expect("utf8");
+        assert!(
+            correct.contains("00:00:04.000 --> 00:00:06.000"),
+            "{correct}"
+        );
+
+        let by_request = String::from_utf8(slice_webvtt(source, 12.3, 0.0, 6.0)).expect("utf8");
+        assert!(by_request.contains("00:00:01.700"), "{by_request}");
+        assert!(
+            !by_request.contains("00:00:04.000 -->"),
+            "shifting by the request leads the picture by the seek's distance from its keyframe"
+        );
     }
 }

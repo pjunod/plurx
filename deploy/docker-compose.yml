@@ -80,6 +80,12 @@ services:
       # companion below owns Bonjour so this container does not publish a
       # duplicate service on the private `media` bridge.
       PLURX_MDNS_ADVERTISE: "false"
+      # HLS master experiments for the copied-Dolby-Vision investigation
+      # (docs/APPLE-NATIVE-SUBTITLES-PLAN.md §5.4). Enable ONE per deploy and
+      # watch a real Apple TV: every master regression in that arc passed the
+      # unit tests and failed on the device.
+      # PLURX_HLS_CLOSED_CAPTIONS_NONE: "1"
+      # PLURX_HLS_FORCED_AUTOSELECT: "1"
     volumes:
       # The database and everything else that must survive a rebuild. Create
       # it first, owned by the same uid the container runs as:

@@ -175,15 +175,16 @@ enum LibraryGrouping: String, CaseIterable, Identifiable {
 /// When a title's text subtitles are made switchable, which is really a choice
 /// about who pays for a subtitle menu nobody may open.
 ///
-/// - `.instant` — the v0.2 behaviour and the default. A file carrying any
-///   native text track opens through a copy-HLS session, so every track already
-///   exists as a rendition and turning subtitles on, changing language, or
-///   turning them off is an AVPlayer media selection on the item that is
-///   already playing. The cost is a server session and a segmenter on every
-///   play, even for the majority that never touch the menu.
-/// - `.onDemand` — direct-play the raw file, and rebuild it as a copy session
-///   at the same position the first time a subtitle is chosen. The cost is one
-///   restart, and only for viewers who actually use subtitles.
+/// - `.instant` — the v0.2 behaviour. A file carrying any native text track
+///   opens through a copy-HLS session, so every track already exists as a
+///   rendition and turning subtitles on, changing language, or turning them off
+///   is an AVPlayer media selection on the item that is already playing. The
+///   cost is a server session and a segmenter on every play, even for the
+///   majority that never touch the menu.
+/// - `.onDemand` — the default (Paul, 2026-08-02). Direct-play the raw file,
+///   and rebuild it as a copy session at the same position the first time a
+///   subtitle is chosen. The cost is one restart, and only for viewers who
+///   actually use subtitles.
 ///
 /// Recorded as a deliberate tradeoff in docs/APPLE-CLIENT-PARITY.md §2.
 enum SubtitleReadiness: String, CaseIterable, Identifiable {

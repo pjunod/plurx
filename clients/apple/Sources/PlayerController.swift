@@ -54,14 +54,29 @@ struct PlayerReopenQueue: Equatable {
     mutating func clear() { pendingMs = nil }
 }
 
+/// One entry of an AVPlayer legible media-selection group, reduced to the two
+/// attributes the server actually authored (`LANGUAGE` and `NAME`). Keeping the
+/// matching rule off AVFoundation types is what makes it testable.
+struct SubtitleRenditionOption: Equatable {
+    var languageTag: String?
+    var displayName: String
+}
+
+/// What one subtitle selection costs: media selection inside the current item,
+/// or a replacement server session.
+enum SubtitleSelectionRoute: Equatable {
+    case mediaSelection
+    case reopen
+}
+
 /// Drives one AVPlayer and executes the server-owned delivery plan. It also
 /// supplies the controls AVPlayer withholds for a growing EVENT playlist: an
 /// explicit on-demand timeline, reliable play/pause commands, server playback
 /// telemetry, and stream restarts for audio, quality, and burn-only subtitle
 /// changes. Ordinary text subtitles switch through AVPlayer media selection —
-/// once the stream carries their renditions, which under
-/// `SubtitleReadiness.onDemand` is from the first selection rather than from
-/// the first frame (`needsNativeSubtitleSession`).
+/// once the stream carries their renditions, which under the default
+/// `SubtitleReadiness.onDemand` is from the first selection rather than from the
+/// first frame (`needsNativeSubtitleSession`).
 @MainActor
 final class PlayerController: ObservableObject {
     let player = AVPlayer()
@@ -111,20 +126,41 @@ final class PlayerController: ObservableObject {
     /// setting from another device or another tab of Settings must not have the
     /// stream rebuilt under them mid-film. The choice a title started with is
     /// the choice it finishes with.
-    private var subtitleReadiness: SubtitleReadiness = .instant
+    private var subtitleReadiness: SubtitleReadiness = .onDemand
     /// Sticky for this playback. Once a native text track has been asked for —
     /// by automatic selection at cold start, or by the viewer — the stream keeps
     /// its subtitle renditions, including after subtitles are turned off again:
     /// dropping back to direct play would be a second restart nobody asked for,
     /// and the next selection would only have to pay for a third.
     private var wantsNativeSubtitleRenditions = false
-    /// True while the attached item is the raw file URL. It carries no subtitle
-    /// renditions, so the first native selection against it has to rebuild the
-    /// stream instead of switching AVPlayer's media selection in place.
+    /// True while the player is on the raw file instead of an HLS session.
+    /// P2-7: the first native subtitle selection has to create the session.
     private var isDirectPlayback = false
     /// Holds the newest seek/track intent that arrived mid-change so it wins
     /// instead of vanishing.
     private var reopenQueue = PlayerReopenQueue()
+    /// Evidence that this server understands `native_subtitles`: its create
+    /// response handed back a native master query. A server predating the
+    /// feature returns the plain playlist URL and advertises no subtitle
+    /// group, and only that combination may use the legacy burn fallback.
+    private var serverServesNativeSubtitles = false
+    /// Set only once a server has proved it predates `native_subtitles`: its
+    /// text tracks then go back through the pre-branch burn path.
+    private var forceLegacySubtitleBurn = false
+    /// Identifies the newest `open()`. An older attempt that wakes from its
+    /// awaits afterwards must not replace the item, clear the transition
+    /// state, or report its own failure over the newer one's (P2-6).
+    private var openGeneration = 0
+    /// The transport the viewer asked for, which is not what AVPlayer reports
+    /// while it buffers or after an item fails. Reopens restore this.
+    private var wantsPlayback = true
+    /// The last rate the player was genuinely playing at, so a viewer paused
+    /// at 1.5× resumes at 1.5× rather than at the 0 the transport reports
+    /// while paused (P2-5).
+    private var preferredRate: Float = 1
+    /// The viewer's audio language, kept because this controller now performs
+    /// media selection itself instead of leaving it to AVPlayer criteria.
+    private var audioLanguage = "eng"
     /// Stable for this player instance. Server-side supersession uses it to
     /// replace this player's own stream without touching another device.
     private let playbackId = UUID().uuidString
@@ -182,7 +218,6 @@ final class PlayerController: ObservableObject {
         self.title = title
         subtitleReadiness = model.subtitleReadiness
         wantsNativeSubtitleRenditions = false
-        isDirectPlayback = false
 
         #if os(iOS)
         // iOS needs an explicit playback audio session for silent-switch and
@@ -194,8 +229,20 @@ final class PlayerController: ObservableObject {
         installRemoteCommands()
         #endif
 
-        applyLanguagePrefs(audio: model.audioLang, sub: model.subLang)
-        player.appliesMediaSelectionCriteriaAutomatically = true
+        audioLanguage = model.audioLang
+        // P2-8, taking the plan's second option: own media selection outright.
+        // Leaving automatic criteria on lets AVPlayer enable a legible
+        // rendition from the master's AUTOSELECT/DEFAULT metadata and the
+        // system caption preference as soon as the item loads — before the
+        // explicit selection lands — which puts a text track on top of a
+        // burned-in one for the first seconds of a burn session. Emptying the
+        // legible criteria is not enough, because those two sources remain.
+        // The plan's first option (apply the selection before `play()`) was
+        // rejected: the selection needs an await, and gating the first
+        // `play()` behind item readiness is the tvOS transport regression
+        // recorded in `open`. Owning selection means owning audio too, which
+        // `applyPreferredAudioSelection` does per item.
+        player.appliesMediaSelectionCriteriaAutomatically = false
         player.automaticallyWaitsToMinimizeStalling = true
         addPeriodicObserver()
 
@@ -206,9 +253,12 @@ final class PlayerController: ObservableObject {
         if player.timeControlStatus == .playing || player.rate > 0 {
             player.pause()
             isPlaying = false
+            wantsPlayback = false
         } else {
             player.play()
+            if preferredRate != 1 { player.rate = preferredRate }
             isPlaying = true
+            wantsPlayback = true
         }
         updateNowPlaying()
     }
@@ -243,24 +293,30 @@ final class PlayerController: ObservableObject {
     func selectSubtitle(_ index: Int?) {
         guard index != selectedSubtitle else { return }
         selectedSubtitle = index
-        let requiresReopen = Self.subtitleSelectionRequiresReopen(
-            index: index,
+        let route = Self.subtitleSelectionRoute(
+            for: index,
             tracks: subtitles,
-            hasActiveBurn: activeBurnedSubtitle != nil,
+            activeBurn: activeBurnedSubtitle,
             isDirectPlayback: isDirectPlayback
         )
         // Set before the reopen is scheduled: the open it leads to reads this
-        // to decide it may no longer direct-play.
+        // to decide it may no longer direct-play, and it stays set for the rest
+        // of the title, so turning subtitles off again costs no second restart.
         if let index, !Self.subtitleRequiresBurn(index, in: subtitles) {
             wantsNativeSubtitleRenditions = true
         }
-        if requiresReopen {
-            Task { await reopen(at: realPositionMs()) }
-        } else {
+        Task { await applySubtitleSelection(index, route: route) }
+    }
+
+    private func applySubtitleSelection(_ index: Int?, route: SubtitleSelectionRoute) async {
+        switch route {
+        case .reopen:
+            await reopen(at: realPositionMs())
+        case .mediaSelection:
             // Selection belongs to AVPlayerItem, not the HLS session. This is
             // the no-restart path that preserves video copy, HDR, position,
             // and the viewer's selected quality.
-            Task { await applyNativeSubtitleSelection(index, to: player.currentItem) }
+            await applyNativeSubtitleSelection(index, to: player.currentItem)
         }
     }
 
@@ -323,13 +379,20 @@ final class PlayerController: ObservableObject {
             let decision = try await model.decision(fileId: fileId)
             self.decision = decision
             if knownDurationMs <= 0 { knownDurationMs = decision.source?.durationMs ?? 0 }
-            selectedAudio = decision.audio?.first(where: { $0.default })?.index
+            // `default` on a decision track is the server's own shared-policy
+            // pick, not the muxer's flag (crates/plurxd http/stream.rs
+            // overwrites it from `select_tracks`), so the audio it names is
+            // the audio that will actually play.
+            let chosenAudio = decision.audio?.first(where: { $0.default })
+            selectedAudio = chosenAudio?.index
             // Container defaults describe the muxer's primary language, not
-            // this viewer. Choose only within the preferred language and
-            // prefer a forced/narrative track before a full subtitle track.
+            // this viewer. Choose only within the preferred language, prefer a
+            // forced/narrative track before a full subtitle track, and honor
+            // the server's Auto rule against the audio language.
             selectedSubtitle = Self.automaticSubtitleIndex(
                 decision.subtitles ?? [],
-                preferredLanguage: model.subLang
+                preferredLanguage: model.subLang,
+                audioLanguage: chosenAudio?.language
             )
             // An automatically selected native track has to be visible from the
             // first frame, so it needs its rendition even under `.onDemand`. A
@@ -348,9 +411,11 @@ final class PlayerController: ObservableObject {
     private func reopen(at position: Int) async {
         // A growing EVENT playlist can momentarily announce its current end,
         // and several UI actions can also request a restart. Never overlap two
-        // server-session replacements (see `PlayerReopenQueue`) — but never
-        // discard one either: a request that lands mid-change is remembered and
-        // replayed as the single trailing reopen.
+        // server-session replacements (see `PlayerReopenQueue`) — they share a
+        // playback ID, so the newer request intentionally removes the older
+        // session and can otherwise strand AVPlayer on a URL the server has
+        // just deleted — but never discard one either: a request that lands
+        // mid-change is remembered and replayed as the single trailing reopen.
         guard let decision, started else { return }
         guard let next = reopenQueue.request(position, changeInFlight: isChangingStream) else {
             return
@@ -376,6 +441,11 @@ final class PlayerController: ObservableObject {
                 reopenQueue.clear()
                 return
             }
+            // A newer `open()` superseded this one while it ran (P2-6). The
+            // transition — and with it `isChangingStream`, which only the
+            // owning open clears — belongs to that newer attempt, so the queued
+            // request is its to drain and not this loop's.
+            guard !isChangingStream else { return }
             guard let trailing = reopenQueue.takePending() else { return }
             next = trailing
         }
@@ -383,41 +453,72 @@ final class PlayerController: ObservableObject {
 
     private func open(decision: Decision, at startMs: Int) async throws {
         guard let model, started else { return }
-        let wasPlaying = isPlaying
+        openGeneration &+= 1
+        let generation = openGeneration
         isChangingStream = true
         failed = false
         playbackError = nil
+        // P2-5: a reopen must not un-pause a viewer who paused before changing
+        // audio, quality, or a burned subtitle — and must not pause one whose
+        // player merely happens to be stopped right now, which is the state a
+        // buffering item and a failed item both present.
+        let resumesPlayback = Self.reopenResumesPlayback(
+            wantsPlayback: wantsPlayback,
+            hasCurrentItem: player.currentItem != nil
+        )
+        let resumeRate = preferredRate
+        // What `restoreAfterFailedChange` has to put back if no successor comes
+        // into existence: a stream that is still worth watching, and the
+        // viewer's own transport intent rather than the player's observed
+        // state, which reads as paused while an item buffers (P2-5).
+        let wasPlaying = wantsPlayback && player.currentItem != nil
         player.pause()
         // The session this open replaces. It is retired only once its successor
         // exists: releasing first meant a failed create left the viewer's item
-        // pointing at a playlist this client had just deleted — buffered runway,
-        // then a stall, with `fail()` deliberately quiet because an item still
-        // existed. Its telemetry poll stops now; the session itself does not.
+        // pointing at a playlist this client had just deleted — buffered
+        // runway, then a stall, with `fail()` deliberately quiet because an
+        // item still existed. Its telemetry poll stops now; the session itself
+        // does not.
         let superseded = sessionId
         stopStatusPolling()
 
         let normalMode = decision.delivery?.mode ?? Self.legacyMode(decision.method)
-        let burnSubtitle = selectedSubtitle.flatMap { index in
-            Self.subtitleRequiresBurn(index, in: subtitles) ? index : nil
-        }
-        let nativeSubtitle = selectedSubtitle.flatMap { index in
-            Self.nativeSubtitleOrdinal(index, in: subtitles) == nil ? nil : index
-        }
+        // Captured once: `selectedSubtitle` may change while the awaits below
+        // run, and the difference is reconciled when this open completes (P1-2).
+        let requestedSubtitle = selectedSubtitle
+        let subtitleFields = Self.sessionSubtitleFields(
+            selected: requestedSubtitle,
+            tracks: subtitles,
+            legacyBurn: forceLegacySubtitleBurn
+        )
+        let burnSubtitle = subtitleFields.burn
+        let nativeSubtitle = subtitleFields.native
+        let forceTranscode = burnSubtitle != nil || selectedHeight != nil || forceCompatibilityTranscode
+        let customAudio = audioOverride != nil
+        // Whether this open has to be a session for no reason other than making
+        // the file's text subtitles selectable. Sticky once true, so leaving
+        // subtitles again does not buy a second restart.
         let needsSubtitleRenditions = Self.needsNativeSubtitleSession(
             hasNativeTextTrack: subtitles.contains(where: \.isNativeHLS),
             readiness: subtitleReadiness,
             subtitlesInUse: wantsNativeSubtitleRenditions
         )
-        let forceTranscode = burnSubtitle != nil || selectedHeight != nil || forceCompatibilityTranscode
-        let customAudio = audioOverride != nil
         canRetryCurrentItemWithTranscode = normalMode != "transcode" && !forceTranscode && !customAudio
+        // P2-7, decided by Paul on 2026-08-02 (plan §2.5): stay direct until
+        // the first native selection. Merely *having* native text tracks no
+        // longer abolishes true direct play — every such file used to become a
+        // copy session, and on Bedroom that path degrades to a compatibility
+        // transcode. Entering the session is deferred to the moment a native
+        // subtitle is actually chosen, which costs exactly one reopen there
+        // (routed explicitly by `subtitleSelectionRoute`).
         let direct = normalMode == "direct" && !forceTranscode && !customAudio
-            && !needsSubtitleRenditions
+            && nativeSubtitle == nil && !needsSubtitleRenditions
         let url: URL?
         var seekAfterAttach: Int?
 
         if direct {
             activeBurnedSubtitle = nil
+            isDirectPlayback = true
             baseMs = 0
             usesDirectTimeline = true
             isVOD = true
@@ -433,14 +534,14 @@ final class PlayerController: ObservableObject {
             let chosenAudio = audioOverride
             let aac = copy ? needsAAC(audioIndex: chosenAudio, decision: decision)
                 : nil
-            // A subtitle burn on a file the device could otherwise take keeps
-            // source resolution. A genuine transcode still lets server Auto
-            // choose its rung unless the viewer selected one explicitly.
-            let burnHeight = burnSubtitle != nil && normalMode != "transcode"
-                ? decision.source?.height : nil
             let body = CreateSessionRequest(
                 playbackId: playbackId,
-                height: selectedHeight ?? burnHeight,
+                height: Self.burnSessionHeight(
+                    burnSubtitle: burnSubtitle,
+                    mode: normalMode,
+                    selectedHeight: selectedHeight,
+                    sourceHeight: decision.source?.height
+                ),
                 start: Double(startMs) / 1000.0,
                 audio: chosenAudio,
                 subtitleBurn: burnSubtitle,
@@ -454,6 +555,10 @@ final class PlayerController: ObservableObject {
             do {
                 hls = try await model.createHlsSession(fileId: fileId, body: body)
             } catch {
+                // A superseded attempt must not report its own failure over
+                // the newer open's state (P2-6), and must not put back a stream
+                // the newer open has already taken ownership of.
+                if isSuperseded(generation) { return }
                 // Nothing came into existence to replace the current stream, so
                 // nothing about it changes: same session, same player item,
                 // telemetry running again, and playing if it was. The caller
@@ -461,12 +566,18 @@ final class PlayerController: ObservableObject {
                 restoreAfterFailedChange(wasPlaying: wasPlaying, session: superseded)
                 throw error
             }
+            guard !isSuperseded(generation) else {
+                await model.endHlsSession(hls.sessionId)
+                return
+            }
             guard started else {
                 await model.endHlsSession(hls.sessionId)
                 isChangingStream = false
                 return
             }
             sessionId = hls.sessionId
+            isDirectPlayback = false
+            serverServesNativeSubtitles = Self.playlistAdvertisesNativeSubtitles(hls.playlistUrl)
             activeBurnedSubtitle = burnSubtitle
             encoder = hls.encoder
             // The session that exists overrides the plan that was decided: a
@@ -493,15 +604,15 @@ final class PlayerController: ObservableObject {
             restoreAfterFailedChange(wasPlaying: wasPlaying, session: superseded)
             throw APIError.badURL
         }
-        // Committed to this stream shape. A raw-file item has no legible
-        // renditions, so `selectSubtitle` has to rebuild rather than switch.
-        isDirectPlayback = direct
+        // Nothing backs a direct play, and `superseded` still names the session
+        // being replaced — so it is safe to forget here and released below.
+        if direct { sessionId = nil }
         // The successor exists — only now does the predecessor go. Server-side
         // supersession has already retired it (the create carried the same
         // `playback_id`); this DELETE just hands the encoder slot back at once
         // rather than at the idle reaper's convenience.
-        if direct { sessionId = nil }
         await release(session: superseded)
+        guard !isSuperseded(generation) else { return }
         // That DELETE is a network round trip, so the viewer can leave during
         // it. Attaching an item and calling `play()` after `stop()` has run
         // would resurrect a player nobody is watching — and with the background
@@ -524,17 +635,58 @@ final class PlayerController: ObservableObject {
         player.replaceCurrentItem(with: item)
         // Start loading/playing immediately. Previously a resume point gated
         // this call behind item readiness and could leave tvOS permanently
-        // presenting a stopped transport.
+        // presenting a stopped transport. That regression is why a paused
+        // reopen still calls `play()` here rather than betting that an item
+        // reaches `.readyToPlay` at rate 0 on every shipping tvOS: prepare
+        // first, honor the pause immediately when nothing has to be waited
+        // for, and otherwise as soon as the resume seek lands.
         player.play()
-        isPlaying = true
-        if let seekAfterAttach { try await seekWhenReady(item, ms: seekAfterAttach) }
+        if !resumesPlayback && seekAfterAttach == nil { player.pause() }
+        isPlaying = resumesPlayback
+        if let seekAfterAttach {
+            do {
+                try await seekWhenReady(item, ms: seekAfterAttach)
+            } catch {
+                if isSuperseded(generation) { return }
+                throw error
+            }
+        }
+        await applyPreferredAudioSelection(to: item)
         await applyNativeSubtitleSelection(nativeSubtitle, to: item)
-        player.play()
+        guard !isSuperseded(generation) else { return }
+        if resumesPlayback {
+            player.play()
+            // Restore the rate the viewer was last actually playing at (P2-5).
+            if resumeRate != 1 { player.rate = resumeRate }
+        } else {
+            player.pause()
+        }
+        isPlaying = resumesPlayback
         currentMs = startMs
         failed = false
         isChangingStream = false
         updateNowPlaying()
+        // P1-2: `reopen()` queues rather than overlaps an in-flight open, and
+        // this open applied the selection it captured at entry, so a track
+        // picked during a cold extraction would otherwise show a checkmark
+        // forever while the stream renders the old choice — a media-selection
+        // switch queues nothing, because it never asked for a reopen. Apply
+        // whatever the viewer last chose.
+        if let route = Self.subtitleReconciliation(
+            applied: requestedSubtitle,
+            current: selectedSubtitle,
+            tracks: subtitles,
+            activeBurn: activeBurnedSubtitle,
+            isDirectPlayback: isDirectPlayback
+        ) {
+            await applySubtitleSelection(selectedSubtitle, route: route)
+        }
     }
+
+    /// True when a newer `open()` has taken ownership of the player. The older
+    /// attempt then returns without replacing the item, clearing
+    /// `isChangingStream`, or reporting its own failure (P2-6).
+    private func isSuperseded(_ generation: Int) -> Bool { generation != openGeneration }
 
     /// Stop polling the session being left behind. The session itself survives
     /// this call — it is retired by `release(session:)` once its replacement
@@ -562,6 +714,8 @@ final class PlayerController: ObservableObject {
         if session != nil { startStatusPolling() }
         if wasPlaying {
             player.play()
+            // Restore the rate the viewer was last actually playing at (P2-5).
+            if preferredRate != 1 { player.rate = preferredRate }
             isPlaying = true
         }
     }
@@ -599,6 +753,12 @@ final class PlayerController: ObservableObject {
                 guard let self else { return }
                 self.currentMs = self.realPositionMs()
                 self.isPlaying = self.player.timeControlStatus == .playing
+                // The last rate the viewer was genuinely playing at, so a
+                // pause at 1.5× is restored as 1.5× and not as the 0 the
+                // transport reports while paused (P2-5).
+                if self.isPlaying && self.player.rate > 0 {
+                    self.preferredRate = self.player.rate
+                }
                 self.updateNowPlaying()
                 if self.isPlaying && self.currentMs - self.lastReportedMs >= 10_000 {
                     self.lastReportedMs = self.currentMs
@@ -621,14 +781,18 @@ final class PlayerController: ObservableObject {
                       !self.isChangingStream,
                       self.player.currentItem === item
                 else { return }
-                self.isPlaying = false
                 let endedAt = self.realPositionMs()
                 // A growing EVENT playlist can momentarily end before the
                 // title does. Only hand autoplay a genuine film/episode end.
                 if self.knownDurationMs > 0 && endedAt < self.knownDurationMs - 15_000 {
+                    // The viewer did not pause — the playlist merely announced
+                    // its current end — and `wantsPlayback` still says so, so
+                    // this continuation keeps playing.
                     await self.reopen(at: endedAt)
                     return
                 }
+                self.isPlaying = false
+                self.wantsPlayback = false
                 self.currentMs = self.knownDurationMs > 0 ? self.knownDurationMs : endedAt
                 self.report(self.currentMs)
                 self.updateNowPlaying()
@@ -651,11 +815,20 @@ final class PlayerController: ObservableObject {
                     self.canRetryCurrentItemWithTranscode = false
                     self.isChangingStream = false
                     self.playbackError = "The original stream could not open. Retrying a compatible stream…"
-                    await self.reopen(at: self.realPositionMs())
+                    // P2-6: this item is already dead, so its `currentTime()`
+                    // is 0 or invalid and a VOD/direct retry would silently
+                    // restart the film at 0:00. The last position the periodic
+                    // observer saw is the truthful retry point. The transport
+                    // intent survives in `wantsPlayback`, so a viewer who was
+                    // paused when the item failed stays paused.
+                    await self.reopen(
+                        at: Self.compatibilityRetryPositionMs(lastObservedMs: self.currentMs)
+                    )
                     return
                 }
                 self.player.pause()
                 self.isPlaying = false
+                self.wantsPlayback = false
                 self.isChangingStream = false
                 self.failed = true
                 self.playbackError = item.error?.localizedDescription
@@ -706,67 +879,13 @@ final class PlayerController: ObservableObject {
         )
     }
 
-    /// Whether this open has to go through an HLS session for no reason other
-    /// than making the file's text subtitles selectable. The whole of the
-    /// `SubtitleReadiness` setting is this function; nothing else branches on
-    /// it.
-    ///
-    /// `.instant` answers yes for any file carrying a native text track, which
-    /// is the v0.2 behaviour and the default: every track exists as a rendition
-    /// before the menu is ever opened, so switching one is free. `.onDemand`
-    /// answers yes only once a native track has actually been asked for, so a
-    /// play that never touches subtitles costs the server nothing — and the
-    /// first selection pays for exactly one clean restart, the same one a burn
-    /// already performs, at the same film position.
-    ///
-    /// A file with no native text track answers no under either setting: there
-    /// is nothing a session could publish. Bitmap and styled tracks are not
-    /// native, so they cannot drag a direct-playable file into a session it
-    /// gains nothing from.
-    static func needsNativeSubtitleSession(
-        hasNativeTextTrack: Bool,
-        readiness: SubtitleReadiness,
-        subtitlesInUse: Bool
-    ) -> Bool {
-        guard hasNativeTextTrack else { return false }
-        switch readiness {
-        case .instant: return true
-        case .onDemand: return subtitlesInUse
-        }
-    }
-
-    /// Whether a subtitle selection has to rebuild the stream rather than move
-    /// AVPlayer's media selection on the item already playing.
-    ///
-    /// Three reasons, and only three: leaving a burn (it is in the video
-    /// frames), entering one, and — new with `.onDemand` — the first native
-    /// pick while direct-playing, because a raw file URL has no renditions to
-    /// select. Turning subtitles off during direct play reopens nothing; there
-    /// was never anything on.
-    static func subtitleSelectionRequiresReopen(
-        index: Int?,
-        tracks: [SubtitleTrack],
-        hasActiveBurn: Bool,
-        isDirectPlayback: Bool
-    ) -> Bool {
-        if hasActiveBurn { return true }
-        guard let index else { return false }
-        if subtitleRequiresBurn(index, in: tracks) { return true }
-        return isDirectPlayback
-    }
-
     /// Position in the HLS master rendition order. The server advertises only
-    /// native tracks (`is_native_text_subtitle`) and preserves source order, so
-    /// this remains stable even when bitmap, `mov_text`, and styled tracks are
-    /// interleaved in the menu — provided `isNativeHLS` names the same set the
-    /// server does, which is why it prefers the server's own `native` flag.
+    /// native tracks and preserves source order, so this remains stable even
+    /// when bitmap and styled tracks are interleaved in the menu.
     static func nativeSubtitleOrdinal(_ index: Int, in tracks: [SubtitleTrack]) -> Int? {
         tracks.filter(\.isNativeHLS).firstIndex(where: { $0.index == index })
     }
 
-    /// Text that is not native — `mov_text`, styled ASS/SSA — burns like a
-    /// bitmap track. Routing it to a rendition instead gets a 400 from the
-    /// create, and it is absent from the master either way.
     static func subtitleRequiresBurn(_ index: Int, in tracks: [SubtitleTrack]) -> Bool {
         tracks.first(where: { $0.index == index }).map { !$0.isNativeHLS } ?? true
     }
@@ -789,30 +908,253 @@ final class PlayerController: ObservableObject {
         return true
     }
 
-    private func applyNativeSubtitleSelection(_ index: Int?, to item: AVPlayerItem?) async {
-        guard let item, player.currentItem === item else { return }
-        guard let group = try? await item.asset.loadMediaSelectionGroup(for: .legible) else { return }
-        _ = Self.applyNativeSubtitleSelection(index, tracks: subtitles) { ordinal in
-            let option = ordinal.flatMap { group.options.indices.contains($0) ? group.options[$0] : nil }
-            item.select(option, in: group)
+    /// Which position in the legible group's subtitle options carries native
+    /// rendition `ordinal`. Positional mapping is a bet with no contractual
+    /// basis: AVFoundation may merge same-`NAME` entries and may synthesize a
+    /// closed-caption option, and either event shifts every ordinal. Match the
+    /// `LANGUAGE`/`NAME` pair the server actually authored first, and keep the
+    /// ordinal only as the last resort (P1-1).
+    static func nativeSubtitleOptionIndex(
+        ordinal: Int,
+        tracks: [SubtitleTrack],
+        options: [SubtitleRenditionOption]
+    ) -> Int? {
+        let natives = tracks.filter(\.isNativeHLS)
+        guard natives.indices.contains(ordinal) else { return nil }
+        let track = natives[ordinal]
+        let names = subtitleRenditionNames(tracks)
+        guard names.indices.contains(ordinal) else { return nil }
+        let name = quotedAttributeValue(names[ordinal])
+        let tag = languageCode(subtitleLanguageTag(track.language))
+        if let match = options.firstIndex(where: {
+            $0.displayName == name && languageCode($0.languageTag) == tag
+        }) {
+            return match
+        }
+        if let match = options.firstIndex(where: { $0.displayName == name }) { return match }
+        let sameLanguage = options.indices.filter { languageCode(options[$0].languageTag) == tag }
+        if sameLanguage.count == 1 { return sameLanguage[0] }
+        return options.indices.contains(ordinal) ? ordinal : nil
+    }
+
+    /// Every rendition `NAME` the master advertises, in master order — the
+    /// replica of `unique_subtitle_names` in crates/plurxd/src/http/hls.rs.
+    ///
+    /// RFC 8216 makes NAME unique within a group, so the server disambiguates
+    /// repeats by occurrence ("English", "English (2)"). Replicating only the
+    /// base name would make two untitled same-language tracks collide and the
+    /// second one resolve onto the first — worse than the ordinal guess this
+    /// matching replaced.
+    static func subtitleRenditionNames(_ tracks: [SubtitleTrack]) -> [String] {
+        var seen: [String: Int] = [:]
+        var names: [String] = []
+        for (position, track) in tracks.enumerated() where track.isNativeHLS {
+            let base = subtitleRenditionName(track, position: position)
+            let count = (seen[base] ?? 0) + 1
+            seen[base] = count
+            names.append(count == 1 ? base : "\(base) (\(count))")
+        }
+        return names
+    }
+
+    /// Replica of the server's `quoted`: `NAME` is an HLS quoted-string, so
+    /// characters that cannot appear in one are rewritten before emission and
+    /// a title containing them reaches AVFoundation already rewritten.
+    static func quotedAttributeValue(_ value: String) -> String {
+        String(value.map { character -> Character in
+            switch character {
+            case "\"": return "'"
+            case "\r", "\n": return " "
+            default: return character
+            }
+        })
+    }
+
+    /// Replica of the server's `subtitle_name` (crates/plurxd/src/http/hls.rs)
+    /// — the base `NAME` for the track at `position` in the decision's
+    /// subtitle list, before de-duplication. The separator is U+00B7 MIDDLE
+    /// DOT with one space on either side, exactly as the server emits it.
+    static func subtitleRenditionName(_ track: SubtitleTrack, position: Int) -> String {
+        let language = subtitleLanguageName(track.language)
+        let title = track.title?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let title, !title.isEmpty {
+            return language == "und" ? title : "\(language) · \(title)"
+        }
+        return language == "und" ? "Subtitle \(position + 1)" : language
+    }
+
+    /// Replica of the server's `language_tag`, which is one line delegating to
+    /// `plurx_core::tracks::bcp47_tag`: absent or blank is "und", any spelling
+    /// the alias table knows becomes its two-letter member (taken by length,
+    /// because the groups are ordered by settings canonicality), and an
+    /// unknown code passes through unchanged.
+    static func subtitleLanguageTag(_ raw: String?) -> String {
+        let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !trimmed.isEmpty else { return "und" }
+        let lower = trimmed.lowercased()
+        return languageAliases.first(where: { $0.contains(lower) })?
+            .first(where: { $0.count == 2 }) ?? trimmed
+    }
+
+    /// Replica of the server's `language_name`: the display half of `NAME`,
+    /// kept in step with the alias table so a language that matches never
+    /// renders as a bare three-letter code.
+    static func subtitleLanguageName(_ raw: String?) -> String {
+        switch subtitleLanguageTag(raw) {
+        case "en": return "English"
+        case "it": return "Italian"
+        case "ja": return "Japanese"
+        case "es": return "Spanish"
+        case "fr": return "French"
+        case "de": return "German"
+        case "pt": return "Portuguese"
+        case "ko": return "Korean"
+        case "zh": return "Chinese"
+        case "ru": return "Russian"
+        case "hi": return "Hindi"
+        case "ar": return "Arabic"
+        case "nl": return "Dutch"
+        case "sv": return "Swedish"
+        case "pl": return "Polish"
+        case "no": return "Norwegian"
+        case "da": return "Danish"
+        case "fi": return "Finnish"
+        case "tr": return "Turkish"
+        case "th": return "Thai"
+        case "vi": return "Vietnamese"
+        case "uk": return "Ukrainian"
+        case "cs": return "Czech"
+        case "el": return "Greek"
+        case "he": return "Hebrew"
+        case "hu": return "Hungarian"
+        case "ro": return "Romanian"
+        case let other: return other
         }
     }
 
-    private func applyLanguagePrefs(audio: String, sub: String) {
-        player.setMediaSelectionCriteria(
-            AVPlayerMediaSelectionCriteria(
-                preferredLanguages: bcp47(audio),
-                preferredMediaCharacteristics: nil
-            ),
-            forMediaCharacteristic: .audible
+    /// Guardrail (plan §6.4): sending `subtitle_burn` for a track a current
+    /// server classifies native recreates the exact bug this arc removed, so
+    /// the P1-3 fallback needs positive evidence that the server predates
+    /// `native_subtitles` — a create response with no native master query
+    /// *and* an asset advertising no subtitle rendition at all. A selection
+    /// that merely failed is not evidence, and direct play never qualifies:
+    /// there is no create response to have judged.
+    static func serverIsLegacy(
+        servesNative: Bool,
+        hasSubtitleOptions: Bool,
+        isDirect: Bool
+    ) -> Bool {
+        !servesNative && !hasSubtitleOptions && !isDirect
+    }
+
+    /// A server that predates native subtitles hands back the plain session
+    /// playlist; a current one carries the native master query. This is the
+    /// evidence the P1-3 legacy fallback is gated on.
+    static func playlistAdvertisesNativeSubtitles(_ playlistUrl: String) -> Bool {
+        guard let items = URLComponents(string: playlistUrl)?.queryItems else { return false }
+        return items.contains { $0.name == "native" && $0.value != "0" }
+    }
+
+    private func applyNativeSubtitleSelection(_ index: Int?, to item: AVPlayerItem?) async {
+        guard let item, player.currentItem === item else { return }
+        let group = try? await item.asset.loadMediaSelectionGroup(for: .legible)
+        guard started, player.currentItem === item else { return }
+        if let group, selectNativeSubtitle(index, in: group, of: item) { return }
+        // Off never fails: without a legible group nothing is being rendered.
+        guard let index else { return }
+        // "Has a legible group" is not "advertises subtitle renditions".
+        // AVFoundation may synthesise a closed-caption option into `.legible`
+        // for a variant that carries no CLOSED-CAPTIONS attribute, so a legacy
+        // master can hand back a non-empty group with no subtitles in it.
+        let hasSubtitleOptions = group?.options.contains { $0.mediaType == .subtitle } ?? false
+        await recoverFromFailedNativeSelection(
+            index,
+            item: item,
+            hasSubtitleOptions: hasSubtitleOptions
         )
-        player.setMediaSelectionCriteria(
-            AVPlayerMediaSelectionCriteria(
-                preferredLanguages: sub == "off" ? [] : bcp47(sub),
-                preferredMediaCharacteristics: nil
-            ),
-            forMediaCharacteristic: .legible
+    }
+
+    /// False when the selection could not be resolved onto a real option.
+    private func selectNativeSubtitle(
+        _ index: Int?,
+        in group: AVMediaSelectionGroup,
+        of item: AVPlayerItem
+    ) -> Bool {
+        // Only subtitle options are ours: AVFoundation can also expose a
+        // closed-caption option that no rendition in the master authored.
+        let options = group.options.filter { $0.mediaType == .subtitle }
+        let descriptors = options.map {
+            SubtitleRenditionOption(
+                languageTag: $0.extendedLanguageTag,
+                displayName: $0.displayName
+            )
+        }
+        var resolved = false
+        let eligible = Self.applyNativeSubtitleSelection(index, tracks: subtitles) { ordinal in
+            guard let ordinal else {
+                item.select(nil, in: group)
+                resolved = true
+                return
+            }
+            guard let position = Self.nativeSubtitleOptionIndex(
+                ordinal: ordinal,
+                tracks: subtitles,
+                options: descriptors
+            ), options.indices.contains(position) else { return }
+            item.select(options[position], in: group)
+            resolved = true
+        }
+        return eligible && resolved
+    }
+
+    /// P1-3: the selection did not land. Never leave state claiming a track
+    /// the player is not rendering — either burn it (legacy servers only) or
+    /// say so and drop the checkmark.
+    private func recoverFromFailedNativeSelection(
+        _ index: Int,
+        item: AVPlayerItem,
+        hasSubtitleOptions: Bool
+    ) async {
+        // The item itself failing is the status observer's story, not ours.
+        guard item.status != .failed, selectedSubtitle == index else { return }
+        let serverIsLegacy = Self.serverIsLegacy(
+            servesNative: serverServesNativeSubtitles,
+            hasSubtitleOptions: hasSubtitleOptions,
+            isDirect: isDirectPlayback
         )
+        let isText = subtitles.first(where: { $0.index == index })?.text ?? false
+        if serverIsLegacy && isText {
+            forceLegacySubtitleBurn = true
+            let position = realPositionMs()
+            if isChangingStream {
+                // Called from inside `open()`, which `reopen()` refuses to
+                // overlap. Run the burn once this open has finished.
+                Task { [weak self] in await self?.reopen(at: position) }
+            } else {
+                await reopen(at: position)
+            }
+            return
+        }
+        selectedSubtitle = nil
+        playbackError = "That subtitle track could not be turned on."
+    }
+
+    /// The audible half of owning media selection (P2-8). An HLS session
+    /// carries one muxed audio track — the server already chose it, and
+    /// `selectAudio` reopens to change it — but a direct-play file can carry
+    /// several, and with automatic criteria off nothing else would honor the
+    /// viewer's language there. Best effort: no match leaves AVPlayer's own
+    /// default in place, which is what mismatched criteria used to produce.
+    private func applyPreferredAudioSelection(to item: AVPlayerItem) async {
+        guard audioOverride == nil else { return }
+        guard let group = try? await item.asset.loadMediaSelectionGroup(for: .audible),
+              started, player.currentItem === item else { return }
+        let preferred = AVMediaSelectionGroup.mediaSelectionOptions(
+            from: group.options,
+            filteredAndSortedAccordingToPreferredLanguages: bcp47(audioLanguage)
+        )
+        guard let option = preferred.first else { return }
+        item.select(option, in: group)
     }
 
     #if os(iOS)
@@ -826,68 +1168,280 @@ final class PlayerController: ObservableObject {
     #endif
 
     private func bcp47(_ code: String) -> [String] {
-        let map = [
-            "eng": "en", "jpn": "ja", "spa": "es", "fre": "fr",
-            "ger": "de", "ita": "it", "por": "pt", "kor": "ko",
-            "chi": "zh", "rus": "ru", "hin": "hi", "ara": "ar",
-        ]
-        if let two = map[code] { return [two, code] }
-        return [code]
+        Self.languageSpellings(code)
     }
 
-    /// The whole automatic-subtitle policy, in one pure function.
+    /// Every spelling of a language preference AVFoundation might have to
+    /// match, BCP-47 tag first. Derived from the shared alias table rather
+    /// than a third private copy of it — the twelve-language copy this
+    /// replaced could not match a Dutch, Czech, Greek, or Romanian asset.
+    static func languageSpellings(_ code: String) -> [String] {
+        let lower = code.lowercased()
+        guard let group = languageAliases.first(where: { $0.contains(lower) }) else {
+            return [code]
+        }
+        let tag = group.first(where: { $0.count == 2 }) ?? lower
+        return [tag] + group.filter { $0 != tag }
+    }
+
+    /// Pick the subtitle the player may enable automatically. Never fall back
+    /// to a flagged container default in another language: an Italian-first
+    /// mux can otherwise burn Italian captions while English audio is playing.
+    /// Some release muxes omit the forced disposition and retain only a
+    /// "Forced" title, so both signals are meaningful.
     ///
-    /// > Automatic selection must never start a burn — except a forced track,
-    /// > which may, always at source height.
+    /// Owner policy (plan §3.3, decided 2026-08-02): **automatic selection
+    /// must never start a burn — except a forced track, which may, always at
+    /// source height.** Every arm below other than the forced language match
+    /// is therefore restricted to native-HLS formats, and a language whose
+    /// only matches are PGS/VobSub/ASS selects nothing at all rather than
+    /// silently spawning a video encoder on every play (P0-1).
     ///
-    /// | Track shape | Automatic behavior |
-    /// |---|---|
-    /// | Forced (disposition flag *or* "forced" in the title), any codec | apply — the one permitted auto-burn |
-    /// | Default-flagged and native text (`isNativeHLS`) | apply through the free rendition path |
-    /// | Default-flagged but bitmap, `mov_text`, or styled | never automatic; explicit selection only |
-    /// | Merely the same language | never automatic |
-    ///
-    /// The native row deliberately reads `isNativeHLS` — the server's own
-    /// `native` flag where it is sent — and not the broader `text`. A
-    /// default-flagged `mov_text` track is text, is absent from the HLS master,
-    /// and 400s on an explicit pick; auto-applying it would caption nothing.
-    ///
-    /// The forced carve-out is the `forcedIndex` line and nothing else: delete
-    /// it and automatic selection can no longer reach an encoder at all. It
-    /// exists because a forced track marks dialogue the film is unintelligible
-    /// without, so refusing it by default trades a comprehension failure for an
-    /// encoder slot. A burn that does start here carries source height already
-    /// (see `burnHeight` in `open`).
-    ///
-    /// Language is filtered first in every row: never fall back to a flagged
-    /// container default in another language, because an Italian-first mux can
-    /// otherwise caption an English-audio film in Italian. Some release muxes
-    /// omit the forced disposition and retain only a "Forced" title, so both
-    /// signals are meaningful.
-    ///
-    /// Manual selection is untouched by any of this — a viewer who picks a PGS
-    /// track still gets a burn, at source height.
+    /// `audioLanguage` is the language of the audio track that is about to
+    /// play. The server's shared policy defaults to `SubMode::Auto`
+    /// (crates/plurx-core/src/tracks.rs `select_tracks`), where audio already
+    /// speaking the preferred subtitle language leaves only the floor — a
+    /// forced overlay or a flagged default — eligible. Ignoring that was a
+    /// real divergence: it turned on a full English subtitle track under
+    /// English audio on every play, which is also what made P2-7's direct-play
+    /// survival worthless in the common case.
     static func automaticSubtitleIndex(
         _ tracks: [SubtitleTrack],
-        preferredLanguage: String
+        preferredLanguage: String,
+        audioLanguage: String? = nil
     ) -> Int? {
         guard preferredLanguage.lowercased() != "off" else { return nil }
-        let matching = tracks.filter {
-            languageCode($0.language) == languageCode(preferredLanguage)
+        // A blank preference must not resolve to nil and thereby match every
+        // *untagged* track through the language arms, whose forced test is
+        // format-agnostic — that is the one place a burn can start.
+        guard let preferred = languageCode(preferredLanguage) else { return nil }
+        let audioSpeaksPreferred = audioLanguage.map { languageCode($0) == preferred } ?? false
+        let matching = tracks.filter { languageCode($0.language) == preferred }
+        // P2-9: the server's shared policy keeps untagged tracks eligible
+        // ("Untagged tracks remain eligible", crates/plurx-core/src/tracks.rs
+        // `forced_or_default`), because a missing tag is not contrary
+        // information. Mirror that, after every genuine language match, and
+        // only for native formats: a track that is neither known to be in the
+        // viewer's language nor cheap to show is not worth a burn.
+        let untagged = tracks.filter { $0.language == nil || languageCode($0.language) == nil }
+        if let forced = matching.first(where: { isForcedSubtitle($0) })?.index { return forced }
+        if let flagged = matching.first(where: { $0.default && $0.isNativeHLS })?.index {
+            return flagged
         }
-        if let forcedIndex = matching.first(where: { isForcedSubtitle($0) })?.index {
-            return forcedIndex
+        if !audioSpeaksPreferred,
+           let first = matching.first(where: { $0.isNativeHLS })?.index {
+            return first
         }
-        return matching.first(where: { $0.default && $0.isNativeHLS })?.index
+        if let forced = untagged.first(where: { isForcedSubtitle($0) && $0.isNativeHLS })?.index {
+            return forced
+        }
+        return untagged.first(where: { $0.default && $0.isNativeHLS })?.index
     }
 
-    /// Forced-ness has two signals because muxes disagree about which to set.
+    /// Both signals are meaningful: file 5615's English forced track carries
+    /// `forced=false` and only the title says so.
     static func isForcedSubtitle(_ track: SubtitleTrack) -> Bool {
-        track.forced || track.title?.localizedCaseInsensitiveContains("forced") == true
+        track.forced || (track.title.map { titleMarksForced($0) } ?? false)
     }
 
-    /// Collapse the common ISO 639-1 and 639-2/B spellings used by settings
-    /// and ffprobe into the same comparison key.
+    /// Replica of the server's `title_marks_forced` (crates/plurxd/src/http/
+    /// hls.rs). A substring test is too eager: "Non-Forced" and "Unforced" are
+    /// real titles, and here the forced arm is the *only* path by which
+    /// automatic selection may start a burn, so an over-eager test burns an
+    /// ordinary PGS track on every play. Match "forced" on word boundaries and
+    /// reject it when the preceding word negates it; "Unforced" and
+    /// "Reinforced" fall out for free because the letter in front of them is
+    /// not a boundary. Plain "Forced" keeps working — that is 5615's contract.
+    static func titleMarksForced(_ title: String) -> Bool {
+        let lower = title.lowercased()
+        var searchStart = lower.startIndex
+        while let found = lower.range(of: "forced", range: searchStart..<lower.endIndex) {
+            let boundedBefore = found.lowerBound == lower.startIndex
+                || !isAlphanumeric(lower[lower.index(before: found.lowerBound)])
+            let boundedAfter = found.upperBound == lower.endIndex
+                || !isAlphanumeric(lower[found.upperBound])
+            if boundedBefore, boundedAfter,
+               !negatedBefore(String(lower[lower.startIndex..<found.lowerBound])) {
+                return true
+            }
+            searchStart = found.upperBound
+        }
+        return false
+    }
+
+    /// Replica of the server's `negated_before`: the word immediately in front
+    /// of a "forced" occurrence, when it turns the claim around. Separators are
+    /// skipped, so "non-forced", "non forced", and "not forced" share a rule.
+    private static func negatedBefore(_ prefix: String) -> Bool {
+        let word = prefix
+            .split(whereSeparator: { !isAlphanumeric($0) })
+            .last
+            .map(String.init) ?? ""
+        return ["non", "not", "no", "never"].contains(word)
+    }
+
+    private static func isAlphanumeric(_ character: Character) -> Bool {
+        character.isLetter || character.isNumber
+    }
+
+    /// A subtitle burn on a file the device could otherwise take keeps source
+    /// resolution — that is the carve-out which lets an automatically selected
+    /// forced bitmap track burn without also downgrading the picture. A
+    /// genuine transcode still lets server Auto choose its rung unless the
+    /// viewer selected one explicitly.
+    static func burnSessionHeight(
+        burnSubtitle: Int?,
+        mode: String,
+        selectedHeight: Int?,
+        sourceHeight: Int?
+    ) -> Int? {
+        if let selectedHeight { return selectedHeight }
+        guard burnSubtitle != nil, mode != "transcode" else { return nil }
+        return sourceHeight
+    }
+
+    /// The `subtitle_burn` / `subtitle` pair one selection puts on the wire.
+    /// A native text track never becomes a burn — including on the
+    /// compatibility-transcode retry, which keeps the selection it had — and
+    /// the two fields are never sent together.
+    static func sessionSubtitleFields(
+        selected: Int?,
+        tracks: [SubtitleTrack],
+        legacyBurn: Bool
+    ) -> (burn: Int?, native: Int?) {
+        guard let selected else { return (nil, nil) }
+        // A legacy server (P1-3) advertises no native renditions at all, so
+        // its text tracks return to the pre-branch burn path.
+        if legacyBurn || subtitleRequiresBurn(selected, in: tracks) {
+            return (selected, nil)
+        }
+        return (nil, nativeSubtitleOrdinal(selected, in: tracks) == nil ? nil : selected)
+    }
+
+    /// Whether a reopen comes back playing. The first attach has no item yet
+    /// and always starts; otherwise the viewer's own intent decides, which is
+    /// deliberately not the player's observed state — a buffering player
+    /// reports `.waitingToPlay` and a failed item has already dropped its rate
+    /// to 0, so both would read as "paused" during exactly the reopens P2-5
+    /// and P2-6 are about.
+    static func reopenResumesPlayback(wantsPlayback: Bool, hasCurrentItem: Bool) -> Bool {
+        !hasCurrentItem || wantsPlayback
+    }
+
+    /// The film position a compatibility retry resumes from. The failed item's
+    /// own clock reads 0 or invalid, so the last position the periodic
+    /// observer saw is the only truthful one (P2-6).
+    static func compatibilityRetryPositionMs(lastObservedMs: Int) -> Int {
+        max(lastObservedMs, 0)
+    }
+
+    /// Whether this open has to go through an HLS session for no reason other
+    /// than making the file's text subtitles selectable. The whole of the
+    /// `SubtitleReadiness` setting is this function; nothing else branches on
+    /// it.
+    ///
+    /// `.onDemand` is the default (Paul, 2026-08-02, plan §2.5): a file with
+    /// native text tracks direct-plays until one is actually asked for, so a
+    /// play that never touches subtitles costs the server nothing and keeps
+    /// true direct play — and the first selection pays for exactly one clean
+    /// restart, the same one a burn already performs, at the same film
+    /// position. `.instant` answers yes for any file carrying a native text
+    /// track, which is the v0.2 behaviour: every track exists as a rendition
+    /// before the menu is ever opened, so switching one is free.
+    ///
+    /// `subtitlesInUse` is sticky for the title, so turning subtitles back off
+    /// does not drop the stream to direct play and charge the next selection a
+    /// second restart.
+    ///
+    /// A file with no native text track answers no under either setting: there
+    /// is nothing a session could publish. Bitmap and styled tracks are not
+    /// native, so they cannot drag a direct-playable file into a session it
+    /// gains nothing from.
+    static func needsNativeSubtitleSession(
+        hasNativeTextTrack: Bool,
+        readiness: SubtitleReadiness,
+        subtitlesInUse: Bool
+    ) -> Bool {
+        guard hasNativeTextTrack else { return false }
+        switch readiness {
+        case .instant: return true
+        case .onDemand: return subtitlesInUse
+        }
+    }
+
+    /// What one subtitle selection costs. A burn — or leaving one — replaces
+    /// the video frames, and P2-7's direct-play → session boundary needs the
+    /// session to exist before a native rendition can be selected at all.
+    static func subtitleSelectionRoute(
+        for index: Int?,
+        tracks: [SubtitleTrack],
+        activeBurn: Int?,
+        isDirectPlayback: Bool
+    ) -> SubtitleSelectionRoute {
+        let needsBurn = index.map { subtitleRequiresBurn($0, in: tracks) } ?? false
+        let leavesDirectPlay = isDirectPlayback && index != nil
+        return needsBurn || activeBurn != nil || leavesDirectPlay ? .reopen : .mediaSelection
+    }
+
+    /// P1-2: what an `open()` still owes the viewer when it completes. The
+    /// selection it applied was captured before its awaits, so a track chosen
+    /// during a cold extraction has to be applied afterwards; nil means the
+    /// stream already matches the selection the UI is showing.
+    static func subtitleReconciliation(
+        applied: Int?,
+        current: Int?,
+        tracks: [SubtitleTrack],
+        activeBurn: Int?,
+        isDirectPlayback: Bool
+    ) -> SubtitleSelectionRoute? {
+        guard applied != current else { return nil }
+        return subtitleSelectionRoute(
+            for: current,
+            tracks: tracks,
+            activeBurn: activeBurn,
+            isDirectPlayback: isDirectPlayback
+        )
+    }
+
+    /// ISO 639-1 / 639-2/B / 639-2/T spellings that mean the same language,
+    /// mirrored group for group from `LANG_ALIASES` in
+    /// crates/plurx-core/src/tracks.rs. The smaller copy this replaced knew
+    /// twelve languages, so "dut"/"cze"/"gre"/"rum" never matched a viewer's
+    /// "nl"/"cs"/"el"/"ro" — the same divergence plan §2.5's P2-2 filed
+    /// against the server's own duplicate table.
+    private static let languageAliases: [[String]] = [
+        ["eng", "en"],
+        ["jpn", "ja", "jp"],
+        ["spa", "es"],
+        ["fre", "fra", "fr"],
+        ["ger", "deu", "de"],
+        ["ita", "it"],
+        ["por", "pt"],
+        ["rus", "ru"],
+        ["kor", "ko"],
+        ["chi", "zho", "zh"],
+        ["hin", "hi"],
+        ["ara", "ar"],
+        ["nld", "dut", "nl"],
+        ["swe", "sv"],
+        ["pol", "pl"],
+        ["nor", "nob", "no"],
+        ["dan", "da"],
+        ["fin", "fi"],
+        ["tur", "tr"],
+        ["tha", "th"],
+        ["vie", "vi"],
+        ["ukr", "uk"],
+        ["ces", "cze", "cs"],
+        ["ell", "gre", "el"],
+        ["heb", "he"],
+        ["hun", "hu"],
+        ["ron", "rum", "ro"],
+    ]
+
+    /// Collapse the spellings used by settings, ffprobe, and AVFoundation's
+    /// `extendedLanguageTag` into the same comparison key. Region subtags are
+    /// dropped ("en-US" is English) before the alias lookup.
     private static func languageCode(_ raw: String?) -> String? {
         guard let raw else { return nil }
         let code = raw
@@ -896,12 +1450,9 @@ final class PlayerController: ObservableObject {
             .split(separator: "-")
             .first
             .map(String.init) ?? ""
-        let aliases = [
-            "eng": "en", "jpn": "ja", "spa": "es", "fre": "fr", "fra": "fr",
-            "ger": "de", "deu": "de", "ita": "it", "por": "pt", "kor": "ko",
-            "chi": "zh", "zho": "zh", "rus": "ru", "hin": "hi", "ara": "ar",
-        ]
-        return aliases[code] ?? (code.isEmpty ? nil : code)
+        guard !code.isEmpty else { return nil }
+        return languageAliases.first(where: { $0.contains(code) })?
+            .first(where: { $0.count == 2 }) ?? code
     }
 
     private static func legacyMode(_ method: String) -> String {
@@ -928,6 +1479,7 @@ final class PlayerController: ObservableObject {
             Task { @MainActor in
                 self?.player.play()
                 self?.isPlaying = true
+                self?.wantsPlayback = true
                 self?.updateNowPlaying()
             }
             return .success
@@ -936,6 +1488,7 @@ final class PlayerController: ObservableObject {
             Task { @MainActor in
                 self?.player.pause()
                 self?.isPlaying = false
+                self?.wantsPlayback = false
                 self?.updateNowPlaying()
             }
             return .success

@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>plurx — Project Status</title>
+<style>
+  :root {
+    color-scheme: light;
+    --page:        #f9f9f7;
+    --surface:     #fcfcfb;
+    --ink:         #0b0b0b;
+    --ink-2:       #52514e;
+    --muted:       #898781;
+    --grid:        #e1e0d9;
+    --border:      rgba(11,11,11,0.10);
+    --meter:       #2a78d6;
+    --good:        #0ca30c;
+    --good-text:   #006300;
+    --warn:        #fab219;
+    --warn-text:   #8a5f00;
+    --neutral:     #c3c2b7;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      color-scheme: dark;
+      --page:        #0d0d0d;
+      --surface:     #1a1a19;
+      --ink:         #ffffff;
+      --ink-2:       #c3c2b7;
+      --muted:       #898781;
+      --grid:        #2c2c2a;
+      --border:      rgba(255,255,255,0.10);
+      --meter:       #3987e5;
+      --good:        #0ca30c;
+      --good-text:   #0ca30c;
+      --warn:        #fab219;
+      --warn-text:   #fab219;
+      --neutral:     #383835;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--page); color: var(--ink);
+    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  .wrap { max-width: 880px; margin: 0 auto; padding: 28px 20px 60px; }
+  header h1 { font-size: 22px; margin: 0 0 2px; }
+  header .sub { color: var(--ink-2); font-size: 13px; }
+  header .sub code { color: var(--muted); }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin: 22px 0; }
+  .tile { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; }
+  .tile .v { font-size: 26px; font-weight: 650; letter-spacing: -0.01em; }
+  .tile .l { color: var(--ink-2); font-size: 12px; margin-top: 2px; }
+
+  section { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px 18px; margin: 14px 0; }
+  section h2 { font-size: 15px; margin: 0; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  section h2 .ev { color: var(--muted); font-weight: 400; font-size: 12px; margin-left: auto; }
+  section p.blurb { color: var(--ink-2); font-size: 13px; margin: 10px 0 0; }
+
+  .chip { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; font-weight: 600;
+          border-radius: 999px; padding: 2px 9px; border: 1px solid var(--border); color: var(--ink-2); }
+  .chip.done { color: var(--good-text); border-color: color-mix(in srgb, var(--good) 45%, transparent); }
+  .chip.prog { color: var(--warn-text); border-color: color-mix(in srgb, var(--warn) 55%, transparent); }
+  .chip.next { color: var(--ink); }
+  .chip.new  { color: var(--meter); border-color: color-mix(in srgb, var(--meter) 45%, transparent); }
+
+  .meter { display: flex; align-items: center; gap: 10px; margin: 10px 0 4px; }
+  .meter .track { flex: 1; height: 8px; background: var(--grid); border-radius: 4px; overflow: hidden; }
+  .meter .fill  { height: 100%; background: var(--meter); border-radius: 4px 0 0 4px; }
+  .meter .fill.full { border-radius: 4px; }
+  .meter .n { color: var(--ink-2); font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+
+  ul.items { list-style: none; margin: 10px 0 0; padding: 0; }
+  ul.items li { display: flex; gap: 9px; padding: 4px 0; align-items: baseline; }
+  ul.items li + li { border-top: 1px solid color-mix(in srgb, var(--grid) 55%, transparent); }
+  .m { flex: none; width: 74px; font-size: 11px; font-weight: 650; display: inline-flex; align-items: center; gap: 4px; }
+  .m.done    { color: var(--good-text); }
+  .m.partial { color: color-mix(in srgb, var(--warn) 70%, var(--ink)); }
+  .m.todo    { color: var(--muted); }
+  .m.you     { color: var(--ink-2); }
+  li .t { color: var(--ink-2); }
+  li.done-item .t { color: var(--ink); }
+  details summary { cursor: pointer; color: var(--ink-2); font-size: 12.5px; margin-top: 8px; user-select: none; }
+  footer { color: var(--muted); font-size: 12px; margin-top: 26px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>plurx — Project Status</h1>
+    <div class="sub">Self-hosted media server in the old-Plex spirit · explicit ledger of done vs. planned ·
+      mirrors <code>docs/ROADMAP.md</code> + <code>docs/FEATURES.md</code> @ <code>94962b2</code> · 2026-08-02</div>
+  </header>
+
+  <div class="tiles">
+    <div class="tile"><div class="v">v0.2.0</div><div class="l">released 2026-07-30 · main is ahead</div></div>
+    <div class="tile"><div class="v">0–3 ✓</div><div class="l">core phases + 2 slices complete</div></div>
+    <div class="tile"><div class="v">3 viewers</div><div class="l">web ✓ · Android ✓ · Apple build 6 built, not yet uploaded</div></div>
+    <div class="tile"><div class="v">M2 🚧</div><div class="l">GPU tone-map — the milestone that fixes 4K</div></div>
+  </div>
+
+  <!-- ══════════ Phases 0–2 ══════════ -->
+  <section>
+    <h2>Phases 0–2 — the old-Plex kernel <span class="chip done">✓ complete</span> <span class="ev">exit criteria verified per phase</span></h2>
+    <div class="meter"><div class="track"><div class="fill full" style="width:100%"></div></div><div class="n">11 / 11 items</div></div>
+    <details><summary>Items</summary>
+      <ul class="items">
+        <li class="done-item"><span class="m done">✓ done</span><span class="t">Workspace (<code>plurxd</code>, <code>plurx-core</code>, <code>plurx-compat-plex</code>), CI amd64+arm64, Docker; <code>Store</code> trait from the first commit so HA is a backend swap</span></li>
+        <li class="done-item"><span class="m done">✓ done</span><span class="t">Scanner v1: Plex/Jellyfin + scene naming, ffprobe inspection, incremental rescan by size+mtime, vanished-file reconcile</span></li>
+        <li class="done-item"><span class="m done">✓ done</span><span class="t">Metadata v1: TMDB agent (title+year), artwork caching, offline-safe with no key</span></li>
+        <li class="done-item"><span class="m done">✓ done</span><span class="t">Native API v1: Argon2id local accounts + tokens + first-run setup, browse/hubs, FTS5 search, watch progress + scrobble</span></li>
+        <li class="done-item"><span class="m done">✓ done</span><span class="t">Playback v1: decision engine + data-driven device profiles, direct play, on-the-fly MKV→fMP4 remux, trustworthy resume</span></li>
+        <li class="done-item"><span class="m done">✓ done</span><span class="t">Web app v1: embedded SPA — login/setup, grids, in-modal player, continue-watching, admin</span></li>
+        <li class="done-item"><span class="m done">✓ done</span><span class="t">Transcode pipeline: NVENC/QSV/VA-API/VideoToolbox + x264 fallback, bitrate ladder, HDR→SDR tone-map, sub burn-in, HLS lifecycle + reaper</span></li>
+        <li class="done-item"><span class="m done">✓ done</span><span class="t">Audio policies: downmix + per-profile codec handling</span></li>
+        <li class="done-item"><span class="m done">✓ done</span><span class="t">Anime: AniList agent (no key), absolute numbering, dual-audio default-track rules</span></li>
+        <li class="done-item"><span class="m done">✓ done</span><span class="t">Plex-compat Tier 1: GDM responder + PMS endpoint subset, validated end-to-end with python-plexapi</span></li>
+        <li class="done-item"><span class="m done">✓ done</span><span class="t">Ops v1: Prometheus <code>/metrics</code>, structured logs, config + env, Docker/Compose, systemd, Unraid templates</span></li>
+      </ul>
+    </details>
+  </section>
+
+  <!-- ══════════ Phase 3 ══════════ -->
+  <section>
+    <h2>Phase 3 — cluster spike <span class="chip done">✓ decision made</span> <span class="ev">PHASE3-SPIKE.md</span></h2>
+    <div class="meter"><div class="track"><div class="fill full" style="width:100%"></div></div><div class="n">3 / 3 items</div></div>
+    <details><summary>Items</summary>
+      <ul class="items">
+        <li class="done-item"><span class="m done">✓ done</span><span class="t">Store backend decided: <b>hiqlite 0.14</b> — live node ran migration + raft insert + typed read-back; openraft fallback not needed</span></li>
+        <li class="done-item"><span class="m done">✓ done</span><span class="t">Deterministic segments measured (CFR, sparse-keyframe, VFR): any node produces a valid segment N, byte-identical across runs</span></li>
+        <li class="done-item"><span class="m done">✓ done</span><span class="t">Failover contract scoped: restart-at-position is the clean primary design; <code>EXT-X-DISCONTINUITY</code> only at a failover</span></li>
+      </ul>
+    </details>
+  </section>
+
+  <!-- ══════════ Home video ══════════ -->
+  <section>
+    <h2>Home video &amp; photos <span class="chip done">✓ complete</span> <span class="ev">HOMEVIDEO-PLAN.md</span></h2>
+    <div class="meter"><div class="track"><div class="fill full" style="width:100%"></div></div><div class="n">6 / 6 items</div></div>
+    <details><summary>Items</summary>
+      <ul class="items">
+        <li class="done-item"><span class="m done">✓ done</span><span class="t">Migration v6: kind CHECKs dropped, <code>recorded_at</code>/<code>tags</code>/<code>nfo_seeded_at</code>, FTS over tags, FK-checked migration runner</span></li>
+        <li class="done-item"><span class="m done">✓ done</span><span class="t">Scanner <code>home</code> arm: folder mirroring, filename-verbatim titles, recorded-date ladder, folder-chain pruning</span></li>
+        <li class="done-item"><span class="m done">✓ done</span><span class="t">NFO as a one-time seed (Kodi dialect) — never re-read, never written</span></li>
+        <li class="done-item"><span class="m done">✓ done</span><span class="t">Photos: EXIF dates, thumbnails, range-served originals, lightbox; excluded from Recently added</span></li>
+        <li class="done-item"><span class="m done">✓ done</span><span class="t">Local artwork wins; ffmpeg frame-grab fallback; folders inherit a child's poster</span></li>
+        <li class="done-item"><span class="m done">✓ done</span><span class="t">Editing: <code>PATCH /api/v1/items/:id</code> (admin, home libraries only) + edit modal</span></li>
+      </ul>
+    </details>
+  </section>
+
+  <!-- ══════════ Integrations ══════════ -->
+  <section>
+    <h2>Integrations — plurx's side of the monarr pipeline <span class="chip done">✓ complete</span> <span class="ev">INTEGRATION-PLAN.md · FEATURES.md §11</span></h2>
+    <div class="meter"><div class="track"><div class="fill full" style="width:100%"></div></div><div class="n">6 / 6 items</div></div>
+    <p class="blurb">Exit proven: monarr finishes an import and the file is in the library seconds later, carrying the ids monarr already knew, one <code>correlation_id</code> traceable across both apps.</p>
+    <details><summary>Items</summary>
+      <ul class="items">
+        <li class="done-item"><span class="m done">✓ done</span><span class="t">Migration v8 — scoped API keys: <code>plx_…</code>, SHA-256 at rest, shown once, scope list, admin CRUD (a credential that is not a user)</span></li>
+        <li class="done-item"><span class="m done">✓ done</span><span class="t">Targeted scan: <code>scan_path</code> indexes one path and <b>never prunes</b> — the property whose absence would eat a library</span></li>
+        <li class="done-item"><span class="m done">✓ done</span><span class="t"><code>POST /api/v1/scan</code>: longest-root resolution, 200 + placed items, 202 + <code>request_id</code> when busy (queued, not dropped), pollable</span></li>
+        <li class="done-item"><span class="m done">✓ done</span><span class="t">Scheduled reconcile scans — the slow sweep under the fast path, catching what nobody announced</span></li>
+        <li class="done-item"><span class="m done">✓ done</span><span class="t">Migration v9 — enrich by id: a supplied id skips the title search (the step that can be wrong); <code>metadata_at</code> replaces "has an id" as the marker</span></li>
+        <li class="done-item"><span class="m done">✓ done</span><span class="t">Coming-soon rail: <code>GET /api/v1/coming-soon</code> proxies monarr's calendar server-side (the key never reaches a browser), 15-min cache, home rail — unaffected by monarr's v0.20.0 calendar rebuild, which was additive</span></li>
+      </ul>
+    </details>
+  </section>
+
+  <!-- ══════════ Performance ══════════ -->
+  <section>
+    <h2>Performance — start latency, 4K, pre-cache <span class="chip prog">🚧 in progress</span> <span class="ev">PERF-PLAN.md · STUTTER-4K.md · SEGMENTER-PLAN.md</span></h2>
+    <div class="meter"><div class="track"><div class="fill" style="width:58%"></div></div><div class="n">3½ / 6 milestones</div></div>
+    <details open><summary>Items</summary>
+      <ul class="items">
+        <li class="done-item"><span class="m done">✓ done</span><span class="t">M0 telemetry (encode speed, TTFF/stall beacons, session status), burst-then-hold pacing, ahead-window suspend, progress-aware watchdog <span style="color:var(--muted)">(2026-07-28)</span></span></li>
+        <li class="done-item"><span class="m done">✓ done</span><span class="t">M1: fixture-matrix benchmark, 2-s segments, bounded rate control on every encoder family, Auto = min(source, 1080) on hardware; measured: CPU tone-map costs ¼ of pipeline throughput at 4K</span></li>
+        <li class="done-item"><span class="m done">✓ done</span><span class="t">GOP-aware segmenter BUILT (M0–M6, 2026-07-30): plurx cuts the copy path's own segments at clean cuts — the one-drop-per-boundary residual is now bounded by source density (<code>scripts/gop-census</code> measures it); DV P7 signaling fix CONFIRMED (VideoToolbox flipped software → hardware)</span></li>
+        <li><span class="m partial">◐ partial</span><span class="t">M2 GPU tone-map — the milestone that actually fixes 4K: candidate graphs as a type, boot probe vs real HDR10, per-session routing, runtime downgrade, capped hardware admission with a measured-safe-software ladder, CPU-budget software admission — all in. <b>Remaining: the acceptance run, which needs a box with a GPU.</b></span></li>
+        <li><span class="m todo">○ todo</span><span class="t">M3 — the pre-transcode cache</span></li>
+        <li><span class="m todo">○ todo</span><span class="t">M4 — cluster transcode: placement, restart-at-boundary failover, distributed pre-caching (this <i>is</i> Phase 4's transcode chapter; waits for its plumbing)</span></li>
+      </ul>
+    </details>
+  </section>
+
+  <!-- ══════════ Native clients ══════════ -->
+  <section>
+    <h2>Native clients <span class="chip prog">🚧 in progress</span> <span class="ev">CLIENTS.md · *-CLIENT-PARITY.md · CLIENTS-REMEDIATION-PLAN.md · APPLE-NATIVE-SUBTITLES-PLAN.md</span></h2>
+    <div class="meter"><div class="track"><div class="fill" style="width:48%"></div></div><div class="n">Android in · Apple native subs live, M1–M3 landed in source · ports not started</div></div>
+    <details open><summary>Items</summary>
+      <ul class="items">
+        <li class="done-item"><span class="m done">✓ done</span><span class="t">Android/Google TV (Kotlin/Media3): the web viewer surface natively — rails, grid, search, detail, delivery-plan playback, track/quality menus, markers, autoplay, per-file A/V sync, stats panel</span></li>
+        <li><span class="m partial">◐ partial</span><span class="t">Apple iOS/tvOS (Swift/AVPlayer): <b>native text subtitles shipped</b> — in-place selection, no burn, no new session; build 5 (0.2.0) is what is installed on the physical Apple TV. <b>2026-08-02:</b> the plan's M1–M3 landed in source (branch merged to main, Route A) — the three P0s fixed and tombed, selection robustness, extraction hardening. <b>None of it is deployed or on a device yet:</b> unpushed, no ansible run, Apple build 6 not uploaded. Open: copied Dolby Vision master still falls back (CoreMedia <code>-12927</code>) — M4, whose step 0 is now runnable as <code>scripts/dv-evidence</code></span></li>
+        <li><span class="m partial">◐ partial</span><span class="t">Clients remediation plan (written 2026-08-02): the Apple subtitle portion is complete in source through M3; Android native subtitles (§5.4) and the remaining workstreams open</span></li>
+        <li><span class="m todo">○ todo</span><span class="t">Tizen + webOS ports of the web core</span></li>
+        <li><span class="m todo">○ todo</span><span class="t">Roku (SceneGraph) — last, leaning on the mature remux/transcode pipeline</span></li>
+      </ul>
+    </details>
+  </section>
+
+  <!-- ══════════ Phase 4 ══════════ -->
+  <section>
+    <h2>Phase 4 — HA for real <span class="chip next">next major phase</span> <span class="ev">spike done · hiqlite decided</span></h2>
+    <div class="meter"><div class="track"><div class="fill" style="width:0%"></div></div><div class="n">0 / 5 items</div></div>
+    <p class="blurb">The demo that defines the project: pull the power on a node mid-movie; playback resumes within seconds; zero loss of settings or watch state; a 3-node cluster from the README in under 10 minutes.</p>
+    <details><summary>Items</summary>
+      <ul class="items">
+        <li><span class="m todo">○ todo</span><span class="t">Cluster membership: join tokens, node add/remove, health, single logical server identity</span></li>
+        <li><span class="m todo">○ todo</span><span class="t">Replication classes wired: durable (users/settings/metadata/watch state) + ephemeral (sessions) + leader-scheduled scanner singleton</span></li>
+        <li><span class="m todo">○ todo</span><span class="t">Streaming failover: client node-list + retry (web first), session takeover; VIP/keepalived + k8s patterns documented</span></li>
+        <li><span class="m todo">○ todo</span><span class="t">Helm chart (3-replica StatefulSet, anti-affinity), rolling upgrades, cluster admin UI</span></li>
+        <li><span class="m todo">○ todo</span><span class="t">Failure drills as CI-able tests: kill leader mid-transcode, kill follower mid-scan, netsplit, disk-full node</span></li>
+      </ul>
+    </details>
+  </section>
+
+  <!-- ══════════ Upstream: monarr calendar ══════════ -->
+  <section>
+    <h2>monarr's calendar rebuild — the new fields are live <span class="chip done">✓ upstream shipped</span> <span class="ev">monarr v0.20.0 · ADR 0016 · 2026-08-02</span></h2>
+    <p class="blurb">monarr rebuilt the calendar plurx proxies, with plurx named as the protected consumer — and it held: <b>the rail needed no change and got none</b>. What is new is optional, so the work below is plurx choosing to use it, not plurx catching up.</p>
+    <ul class="items">
+      <li class="done-item"><span class="m done">✓ held</span><span class="t">Compatibility kept, verified upstream: <code>date</code>/<code>detail</code>/<code>tmdbId</code>/<code>imdbId</code> are byte-identical, and monarr's pre-existing API test passed <b>unedited</b> — that test not changing is the proof</span></li>
+      <li class="done-item"><span class="m done">✓ live</span><span class="t"><code>airDateUtc</code> — the real air instant (TVmaze show schedule, composed per date so DST is right). <b>Absent</b> whenever the schedule is unknown: streaming originals, films and books stay date-only, deliberately — never a guessed midnight</span></li>
+      <li class="done-item"><span class="m done">✓ live</span><span class="t"><code>network</code>, <code>seasonNumber</code>/<code>episodeNumber</code>/<code>episodeTitle</code>, <code>runtime</code>, <code>monitored</code> — structured fields, so cards need never parse the <code>detail</code> string again</span></li>
+      <li class="done-item"><span class="m done">✓ live</span><span class="t"><code>posterPath</code> — available, but plurx's recorded decision stands (INTEGRATION.md §3): artwork resolves from <b>plurx's own</b> cache by id, because a series with an episode airing is a series plurx already holds. At most this becomes the fallback for a film not yet in the library</span></li>
+      <li><span class="m todo">○ next</span><span class="t">plurx-side follow-up, now unblocked (small): show the time on timed cards, sort within a day (date-only first, then by time), and use the structured episode fields instead of <code>detail</code></span></li>
+      <li><span class="m todo">○ later</span><span class="t">Watched-push to monarr (master plan §11.1) — decisions settled 2026-07-27: per-user with usernames, off by default, prefer-upgrades for watched shows, <b>nothing may ever delete a file as a side effect</b>. Not started; plurx's first outbound push (needs its own small delivery queue)</span></li>
+    </ul>
+  </section>
+
+  <!-- ══════════ Backlog ══════════ -->
+  <section>
+    <h2>Backlog &amp; standing deferrals <span class="chip later">unordered</span></h2>
+    <details><summary>Items</summary>
+      <ul class="items">
+        <li><span class="m todo">○ todo</span><span class="t">Adaptive quality: brain-in-the-client design written (ADAPTIVE-QUALITY.md); foundations shipped (quality menu 07-23, bounded rate control 07-28); the adaptation loop itself unbuilt</span></li>
+        <li><span class="m todo">○ todo</span><span class="t">Media badges — the play menu tells the truth about HDR/DV (MEDIA-BADGES-PLAN.md, ready to build, 2026-08-02 ask)</span></li>
+        <li><span class="m todo">○ todo</span><span class="t">Live inotify watching — off the critical path: scheduled + targeted scans cover both "said so" and "didn't"</span></li>
+        <li><span class="m todo">○ todo</span><span class="t">2.x deferrals: TVDB agent, collections, playlists, bitmap-sub burn-in, TrueNAS app, composite/PKC contract tests</span></li>
+        <li><span class="m todo">○ todo</span><span class="t">Phase 6 bets: ASS/SSA in clients, OIDC, parental controls, trickplay, theme music, <b>Jellyfin-compat façade spike</b> (the legitimate route to Infuse), NAS packages, music/photos revisit</span></li>
+      </ul>
+    </details>
+  </section>
+
+  <!-- ══════════ Operator ══════════ -->
+  <section>
+    <h2>Operator checklist (Paul) <span class="ev">the two things only you can run</span></h2>
+    <ul class="items">
+      <li><span class="m you">👤 Paul</span><span class="t">Perf M2 acceptance run on a box with a GPU — CI can only prove candidates fail correctly</span></li>
+      <li><span class="m you">👤 Paul</span><span class="t"><b>Ship 2026-08-02's work:</b> <code>scripts/ship --check --push --deploy</code> (the nodes follow <code>origin/main</code>, so nothing reaches them until main is pushed), then <code>scripts/ship --apple</code> for build 6 to TestFlight</span></li>
+        <li><span class="m you">👤 Paul</span><span class="t">Apple DV acceptance on Bedroom — the copied-DV master needs the physical-TV pass (plan §5.4: 60 s + seek + resume, no <code>-12927</code>). Start with <code>scripts/dv-evidence</code>: the init segment's boxes and CoreMedia's actual error chain, which nobody has looked at</span></li>
+        <li><span class="m you">👤 Paul</span><span class="t">The two master ladder rungs are compiled in and OFF — <code>PLURX_HLS_CLOSED_CAPTIONS_NONE</code>, <code>PLURX_HLS_FORCED_AUTOSELECT</code>. One per deploy, observed on the device</span></li>
+    </ul>
+  </section>
+
+  <footer>
+    Authoritative copies: <code>docs/ROADMAP.md</code> · <code>docs/FEATURES.md</code> · <code>CHANGELOG.md</code> in <code>pjunod/plurx</code> @ <code>94962b2</code> ·
+    upstream: monarr <b>v0.20.0</b> (calendar rebuilt, ADR 0016) · page generated 2026-08-02
+  </footer>
+</div>
+</body>
+</html>

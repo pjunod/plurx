@@ -1,9 +1,11 @@
 # Apple native subtitles — continuation plan: the review verdict and the road to a green DV master
 
-**Status:** ready to execute · **Continues:**
+**Status:** M1 · M2 · M3 landed 2026-08-02, committed locally and **not
+pushed, deployed, or built for a device**; M4 (`-12927`) and M5 open ·
+**Landing route:** A (§4.1) · **Continues:**
 [APPLE-NATIVE-SUBTITLES-HANDOFF.md](APPLE-NATIVE-SUBTITLES-HANDOFF.md) §8 ·
 **Reviewed:** branch `agent/native-apple-subtitles` tip `f35ada1` against
-production `787eaa6` · **Written:** 2026-08-02
+production `787eaa6` · **Written:** 2026-08-02 · **Updated:** 2026-08-02
 
 Read the [handoff](APPLE-NATIVE-SUBTITLES-HANDOFF.md) first — it records what
 shipped, why each choice was made, and what the live server proved. This
@@ -48,6 +50,13 @@ bearing for §4:
    exist only on this branch — and any *server* fix committed only here
    (§2's P0-2, P0-3) cannot reach the fleet, because Ansible pins every node
    to `origin/main`.
+
+**This table describes the topology at review time, before Route A.** On
+2026-08-02 the branch was merged into `main` (§4) and M1–M3 landed on top, so
+local `main` now carries the client work, the docs, and the server fixes.
+What has not changed is the last row's consequence: none of it is pushed.
+`origin/main` is still `787eaa6` — what every node follows, and what every
+node is still running.
 
 The branch history contains duplicated commit pairs (same subject and
 timestamp, different hashes — e.g. `9d012db`/`6e0d137`, `ab8988d`/`3ce4153`).
@@ -232,11 +241,37 @@ milestone whose files they touch.
 | P2-4 | `hls.rs:427-429` + `subtitles.rs` | Whole cached VTT re-read + re-parsed per segment request, no size cap on the sidecar → cap accepted sidecar size at publish; consider a parsed cue index per (file, index) |
 | P2-5 | `PlayerController.swift:373-379` | Every reopen force-resumes (`player.play()`), un-pausing a paused viewer on burn switch / audio change / compat fallback → capture and restore `isPlaying` + rate |
 | P2-6 | `PlayerController.swift:480,508-533` | Compat fallback reads a dead item's `currentTime()` (0/invalid) → VOD/direct items that fail pre-seek restart at 0:00; the superseded `open()` can also overwrite `playbackError` late → retry from last observed `currentMs`; fence the superseded open |
-| P2-7 | `PlayerController.swift:302` | `direct = … && !hasNativeSubtitles` abolishes true direct play whenever any native track exists, even with subs Off forever — every such play becomes a copy session, and on Bedroom today that path degrades to compat transcode (`-12927`) → decision required: keep (in-place selection needs the session master) and document, or stay direct until first native selection and accept one reopen at that boundary. Flag to Paul with the tradeoff; don't decide silently |
+| P2-7 | `PlayerController.swift:302` | `direct = … && !hasNativeSubtitles` abolishes true direct play whenever any native track exists, even with subs Off forever — every such play becomes a copy session, and on Bedroom today that path degrades to compat transcode (`-12927`) → **decided by Paul 2026-08-02: stay direct until the first native selection**, accepting one reopen at that boundary. Landed in M1 (§5.1); see §2.5.1 |
 | P2-8 | `PlayerController.swift:133,581-587` | `appliesMediaSelectionCriteriaAutomatically = true` + legible criteria lets AVPlayer auto-enable a rendition before the explicit selection lands: transient double subtitles on burn sessions whose file also has same-language text → apply selection before `play()`, or own selection fully with criteria off |
 | P2-9 | `PlayerController.swift:621-647` | Untagged-language tracks are never auto-selectable (`languageCode(nil)` ≠ pref), diverging from the server's shared policy ("untagged tracks remain eligible", `tracks.rs:178`) → decide and align both sides; failure direction today is safe (no subtitle) |
 | P2-10 | `crates/plurxd/src/web/index.html:1256` | "Scan this from the **Plurx** iPhone…" hardcodes the brand in user-facing text; this tree brands as `${APP_NAME}` ("cinemarr") → interpolate APP_NAME. (`.connectqr img` background `#fff` is a deliberate QR quiet zone — keep, comment it) |
 | P2-11 | `hls.rs:563-571` | Two forced tracks in one language both get FORCED=YES + AUTOSELECT=NO; Apple's authoring rules require AUTOSELECT=YES on forced renditions → candidate rung for the §5.4 ladder, not a direct change |
+
+### 2.5.1 The P2-7 decision — direct play survives a file that has text tracks
+
+**Decided by Paul on 2026-08-02.** The two options were real and the choice
+was not obvious, so both sides are recorded here rather than only the winner.
+
+- **Keep the session always.** In-place selection needs the session master, so
+  every text track is selectable the instant the menu opens and no selection
+  ever reopens. The cost: a file the device could have played untouched
+  becomes a copy session on every play, whether or not subtitles are ever
+  turned on — and on Bedroom that path degrades further, to a compatibility
+  transcode, through the still-open `-12927` failure. Direct play is
+  principle 2 of the project's README, and this quietly abolished it for a
+  large fraction of the library.
+- **Stay direct until the first native selection** (chosen). A file whose
+  video the device can take plays untouched; entering a session is deferred
+  to the moment a native subtitle is actually chosen. The cost is exactly one
+  reopen, at that boundary, paid only by viewers who turn subtitles on.
+
+Implemented at `PlayerController.swift`'s `open()`: `direct` now tests
+`nativeSubtitle == nil` — the *requested* native track — rather than whether
+the file has any native track at all, and the transition is routed explicitly
+by `subtitleSelectionRoute` instead of falling out of a general reopen.
+
+**Revisit this after M4.** The degradation half of the argument disappears
+once the copied DV master plays on Bedroom. The direct-play half does not.
 
 ### 2.6 Tests the suite is missing
 
@@ -324,21 +359,43 @@ the user asking); the policy governs what the player does on its own.
 ### 3.4 Versions, changelog, release path
 
 Workspace `0.2.0` (single source: root `Cargo.toml` `[workspace.package]`);
-Apple `0.2.0` build `5` (`clients/apple/project.yml`); Android `0.2.0`
-versionCode `3` (`build.gradle.kts`). **`CHANGELOG.md` `[Unreleased]` has no
-entry for any of this arc** — native renditions, in-place Apple selection,
-QR connect, version stamps, MediaFacts — on either branch or main; that debt
-lands with M5. Per [RELEASING.md](RELEASING.md): entries describe what an
-operator sees, not the diff; at release this arc is a backwards-compatible
-feature set → minor bump `0.2.0 → 0.3.0`, tag `v0.3.0` (CI refuses a tag
-that disagrees with Cargo.toml). Next store uploads: Apple build ≥ 6,
-Android versionCode ≥ 4.
+Apple `0.2.0` build `6` (`clients/apple/project.yml`, raised from `5` on
+2026-08-02 — not yet built or uploaded); Android `0.2.0` versionCode `3`
+(`build.gradle.kts`).
 
-## 4. Landing route — decide at kickoff
+**The changelog debt is paid** (2026-08-02): `CHANGELOG.md` `[Unreleased]`
+now carries this arc — native renditions and in-place Apple selection, QR
+connect, client version stamps, Android MediaFacts, the extraction bounds,
+and the two off-by-default master experiments. Per
+[RELEASING.md](RELEASING.md) the entries describe what an operator sees, not
+the diff, so the timing, naming, and language-tag defects fixed on 2026-08-02
+are folded into the feature entry rather than listed as fixes: they were
+never in a release, and an operator upgrading from `0.2.0` only ever sees the
+finished behavior.
 
-Paul delegated this decision to the executing agent (2026-08-02). Decide it
-first, announce it, record why. The facts in §1.1 make either route cheap;
-they do not make them equal.
+**The release itself is Paul's call.** Nothing here bumps `Cargo.toml` or
+dates a heading. At release this arc is a backwards-compatible feature set →
+minor bump `0.2.0 → 0.3.0`, tag `v0.3.0` (CI refuses a tag that disagrees
+with `Cargo.toml`). Next store uploads: Apple build ≥ 6, Android versionCode
+≥ 4.
+
+## 4. Landing route — decided: Route A
+
+**Route A was taken on 2026-08-02**: the branch was merged into `main`, and
+milestone work continues from there. The deciding argument is §4.2's
+"against" — P0-2 and P0-3 are wrong on the live fleet *today*, and Ansible
+pins every node to `origin/main`, so any route that leaves them on a feature
+branch leaves the fleet broken for the length of the DV investigation. §1.1's
+strict-superset audit is what made the merge safe to take in one step.
+
+Nothing about that merge is published yet. The commits are local on
+`agent/native-apple-subtitles` and on `main`; **Paul pushes**, then runs the
+ansible playbooks, then builds the Apple client. Until he does, the fleet is
+still serving `787eaa6` and Bedroom is still running Apple build 5.
+
+Paul delegated this decision to the executing agent (2026-08-02). The facts in
+§1.1 made either route cheap; they did not make them equal. Both are kept
+below because the reasoning is what justifies the choice.
 
 ```
             origin/main 787eaa6 ──── deployed (ansible pins nodes here)
@@ -401,7 +458,7 @@ feature/fix units as you go; update
 [CHANGELOG.md](../CHANGELOG.md) `[Unreleased]` and the status page
 (`docs/STATUS.html`) in the same commits as the behavior they describe.
 
-### 5.1 M1 — policy and timing correctness (P0-1..3)
+### 5.1 M1 — policy and timing correctness (P0-1..3) — **landed 2026-08-02**
 
 Fix the three P0s together with their tombs from §2.6: the auto-selection
 format constraint (keeping the forced-at-source-height carve-out), the
@@ -410,13 +467,40 @@ measured-first-PTS test class. Server fixes reach `origin/main` per §4 and
 deploy to the fleet via the ansible playbooks; client fix ships in the next
 TestFlight build (≥ 6).
 
+**What actually landed.** P0-1: the `default` and `first` arms of automatic
+selection are constrained to `isNativeHLS`, and the forced arm stays
+format-agnostic and still sends `decision.source.height`. P0-2: the session's
+real media origin is probed at create time
+(`plurx_core::transcode::keyframe_probe_args` + `parse_keyframe_origin`),
+carried as `media_origin_seconds` on the session and on `HlsContext`, and the
+slicer shifts cues by it instead of by `start_seconds`. P0-3: `hls_args`
+carries `-muxdelay 0 -muxpreload 0`. P2-7 landed here too, by Paul's decision
+(§2.5.1), because it lives in the same `open()` branch as P0-1's fixture work.
+
+Both P0 tombs are measured against a produced session rather than asserted
+from a flag list — `a_transcode_session_starts_its_mpegts_timeline_at_zero`
+and `a_copy_session_begins_at_the_keyframe_before_the_requested_start` in
+`plurx-core`, plus `cue_shifting_is_relative_to_the_media_origin_not_the_request`
+in `hls.rs`. Client side:
+`testAutomaticSubtitlesNeverStartABurnForABitmapOnlyLanguageMatch`,
+…`ForAStyledAssOnlyLanguageMatch`,
+`testAutomaticSubtitlesStillTakeAForcedBitmapTrackAtSourceHeight`, and
+`testDirectPlaySurvivesNativeTextTracksUntilTheFirstSelection`.
+
 **Acceptance:** new tests green in the gate; on a resumed 4K copy session
 with native subs, a cue's text and its dialogue are in sync at the seek
 point (observable on Bedroom or simulator against a real file); an
 auto-selection XCTest proves a non-forced PGS-only language match selects
 nothing.
 
-### 5.2 M2 — selection robustness (P1-1..3)
+**Acceptance status:** every test the milestone owed exists in the tree, named
+above. **The device half is not met**: nothing is pushed, no node has been
+redeployed, and no Apple build has been produced, so no cue has been watched
+against dialogue on real hardware. The fleet still runs `787eaa6`, which has
+both timing defects. Until Paul pushes and deploys, M1 is correct in the tree
+and absent from every running server.
+
+### 5.2 M2 — selection robustness (P1-1..3) — **landed 2026-08-02**
 
 Client-side option matching by language+name replica (positional only as
 fallback), post-open selection reconciliation, legible-group failure
@@ -424,21 +508,78 @@ fallback; server-side NAME de-duplication. Add §2.6's validation, Off,
 routing, and escaping tests. `CLOSED-CAPTIONS=NONE` goes on the §5.4 ladder
 list, not here.
 
+**What actually landed.** P1-1: `unique_subtitle_names` de-duplicates `NAME`
+within the group ("English (2)"), and the client's
+`nativeSubtitleOptionIndex` matches on `LANGUAGE` + `NAME` against
+`subtitleRenditionName` — a replica of the server's `subtitle_name`,
+middle-dot separator included — degrading through name-only, then
+sole-same-language, and only then to the ordinal. P1-2: `open()` captures the
+selection it entered with and reconciles against `selectedSubtitle` when it
+completes, so a track picked during a cold extraction is applied rather than
+left as a checkmark over the old stream. P1-3: a failed selection never keeps
+the checkmark; the legacy burn fallback is gated on positive evidence that the
+server predates `native_subtitles` (no native master query *and* no subtitle
+group at all), which is what keeps guardrail §6.4 intact. P2-1 (forced word
+boundaries), P2-2 (`bcp47_tag` from the shared alias table), and P2-10 came
+along in the same files.
+
+Tests: `rendition_names_are_unique_within_the_group`,
+`duplicate_manual_renditions_do_not_violate_hls_autoselect_uniqueness`,
+`rendition_attributes_survive_hostile_titles`,
+`forced_detection_reads_words_not_substrings`,
+`language_tags_come_from_the_shared_alias_table`;
+`testNativeSubtitleOptionsMatchTheServerRenditionNameNotTheOrdinal`,
+`testSubtitleRenditionNamesReplicateTheServerRule`,
+`testSubtitleSelectionChangedDuringOpenIsReconciledAfterwards`,
+`testLegacyBurnFallbackIsGatedOnAServerWithoutNativeSubtitles`.
+
 **Acceptance:** gate + simulator suites green including the new tests; a
 two-untitled-English-tracks fixture selects the right track through the
 client mapping; killing the server mid-open leaves no lying checkmark.
 
-### 5.3 M3 — extraction hardening (P1-4, P2-4)
+**Acceptance status:** the cases the milestone owed exist as tests, named
+above, and the simulator is a fair oracle for them — nothing in M2 is a
+hardware-decode or HDR claim. What is *not* recorded here is a green run: the
+gate and both simulator suites are the committing session's to run and report,
+and no result from this tree is written down yet.
+
+### 5.3 M3 — extraction hardening (P1-4, P2-4) — **landed 2026-08-02**
 
 Producer timeout + failure memo with TTL; sidecar size cap at publish;
 internal-boundary cue duplication (P2-3) while you are in the slicer.
+
+**What actually landed,** in `crates/plurxd/src/subtitles.rs`: extraction is
+bounded at `EXTRACTION_TIMEOUT` = 600 s with `kill_on_drop(true)`, so the
+bound is a real process kill and not merely a stopped wait — 600 s is over
+three times the worst honest cold extraction (~180 s over a congested NAS),
+chosen so nothing that would have succeeded is cut off. Failures are memoized
+for `NEGATIVE_TTL` = 120 s, capped at `MAX_NEGATIVE_ENTRIES` = 128 so a
+library of broken tracks cannot turn the memo into a leak; at ~6 s between
+AVPlayer's segment requests that is roughly a twentieth of the scans a failing
+track used to cost. `MAX_SIDECAR_BYTES` = 8 MiB is checked **before** the
+rename, so an oversized sidecar is never visible in the cache. The three
+bounds live in one `ExtractionLimits` struct precisely so tests can shrink
+them to milliseconds. P2-3 landed in the slicer:
+`a_cue_spanning_a_segment_boundary_keeps_its_authored_end`.
 
 **Acceptance:** a test where the producer wedges (fake ffmpeg sleeping)
 times out, waiters get a bounded error, and a repeat request within the TTL
 does not relaunch extraction; boundary-spanning cue appears whole in both
 segments.
 
-### 5.4 M4 — make the copied DV master physically playable (`-12927`)
+**Acceptance status:** the tests exist, including
+`an_oversized_sidecar_is_rejected_and_leaves_no_file` and the zero-TTL case
+that proves an expired memo does not become permanent. As with M1/M2, a green
+gate run is not recorded in this tree.
+
+### 5.4 M4 — make the copied DV master physically playable (`-12927`) — **open**
+
+**Nothing in M4 has been attempted.** Step 0's evidence has not been captured:
+no `init.mp4` has been fetched from a live 5615 session, no boxes dumped, no
+CoreMedia error chain captured from the device. `-12927` is exactly where the
+handoff left it. What M1–M3 changed for this milestone is only that the two
+candidate rungs below now *exist* as flags — off by default, unobserved, and
+therefore untested in the only sense that counts here.
 
 The handoff's §8.1 ladder stands. Two amendments from this review:
 
@@ -460,6 +601,19 @@ compliance item). One change per deploy, device-observed, exactly like the
 rest of the ladder. Unit tests prove syntax; only Bedroom proves
 acceptance.
 
+Both rungs are **built and off by default** as of 2026-08-02, each behind an
+environment variable an operator sets per deploy:
+`PLURX_HLS_CLOSED_CAPTIONS_NONE=1` and `PLURX_HLS_FORCED_AUTOSELECT=1`. They
+are read once at startup (`MasterRungs::active`), because a master that
+changed shape between two fetches of the same session would be a worse
+problem than either rung solves. The default-off behavior is pinned by
+`ladder_rungs_are_inert_until_an_operator_lights_them`.
+Enabling both at once forfeits the experiment:
+a master that then plays does not say which change did it. Operator-facing
+description lives in [OPERATIONS.md](OPERATIONS.md#the-two-hls-master-experiments).
+Being compiled in is not evidence of anything — neither rung has been enabled
+on a node or observed on a device.
+
 **Acceptance:** the handoff's own bar, verbatim — Bedroom plays file 5615
 from the native master ≥ 60 s, seeks, resumes, no `-12927`, no
 compatibility fallback; then §8.2's DV-proof list (display path reports
@@ -467,7 +621,7 @@ Dolby Vision; track 2 → 3 → Off in place with no new session and no new
 FFmpeg process). Revisit P2-7 (direct-play abolition) after this lands —
 the degradation it causes on Bedroom disappears when the master plays.
 
-### 5.5 M5 — hardware matrix, docs, release
+### 5.5 M5 — hardware matrix, docs, release — **docs done, matrix and release open**
 
 Run the release gate from
 [APPLE-CLIENT-PARITY.md](APPLE-CLIENT-PARITY.md) on iPhone and Apple TV
@@ -475,22 +629,45 @@ Run the release gate from
 seek · audio switch · autoplay). Then pay the documentation debt in the
 same series of commits:
 
-- `APPLE-CLIENT-PARITY.md` §1 item 4 still says text-subtitle selection
-  "restarts at the same position" — contradicted by its own §2; fix it and
-  the release-gate case it feeds.
-- Root `README.md`'s reading path links none of the five client docs; add
-  the handoff (and this plan) with a clause each.
-- `CHANGELOG.md` `[Unreleased]` entries per §3.4; release `0.3.0` when
-  Paul calls it.
-- `docs/STATUS.html`: Apple tile/section and operator checklist still said
-  "P0 in source, not yet shipped" — refreshed 2026-08-02 alongside this
-  plan; keep it current as milestones land.
-- Apple build ≥ 6 to TestFlight; Android versionCode ≥ 4 when its parity
-  work ships (out of scope here, §7).
+- [x] `APPLE-CLIENT-PARITY.md` §1 item 4 said text-subtitle selection
+  "restarts at the same position" — contradicted by its own §2. Rewritten
+  2026-08-02 to split text (in place) from PGS (reopen at position), to name
+  the one restart that does exist (the first native selection on a file that
+  was direct-playing), and its §2 now records the P2-7 decision. Its status
+  blockquote states which server the fleet is actually running.
+- [x] Root `README.md`'s reading path linked none of the five client docs;
+  the handoff and this plan were added with a clause each, 2026-08-02. The
+  other three client docs are review/remediation working documents and were
+  deliberately left out of a newcomer's reading path.
+- [x] `CHANGELOG.md` `[Unreleased]` entries per §3.4, written 2026-08-02.
+  **Release `0.3.0` is not done and is Paul's call** — no version bumped, no
+  heading dated.
+- [x] `clients/apple/README.md` corrected 2026-08-02: the "changing a
+  subtitle restarts playback" line, the `v0.1.0` status stamp, the
+  direct-play description, and three items listed as missing that had already
+  shipped (Keychain token storage, search, iOS PiP).
+- [x] `OPERATIONS.md` + `CHEATSHEET.md` document the two §5.4 ladder
+  variables, 2026-08-02.
+- [ ] `docs/STATUS.html` — **not updated: the file is not in the working tree
+  the 2026-08-02 documentation pass ran against.** The status page arrived
+  with §1.1's status-page commit on local `main`; no copy exists under
+  `docs/`, so it could not be read, and rewriting a page whose structure and
+  generation conventions were unavailable would have clobbered the real one.
+  Refresh it from a tree that has it: it needs the M1–M3 landings, the fact
+  that none of this is pushed or deployed, and the still-open `-12927`.
+- [ ] Apple build ≥ 6 to TestFlight; Android versionCode ≥ 4 when its parity
+  work ships (out of scope here, §7). `project.yml` says build `6`, but
+  nothing has been built or uploaded.
 
 **Acceptance:** matrix results recorded in the parity doc; docs above
 updated in the same PR/commits as their behavior; CHANGELOG entry exists
 for every user-visible change this plan shipped.
+
+**Acceptance status:** the documentation clause is met except for
+`STATUS.html`. **The hardware matrix has not been run at all** — it cannot
+be, since no Apple build 6 exists and no node carries the server fixes. The
+parity doc's matrix rows therefore describe the tree, not a device, and say
+so.
 
 ## 6. Guardrails — what this pass must not do
 

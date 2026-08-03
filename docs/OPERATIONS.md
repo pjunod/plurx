@@ -59,6 +59,37 @@ path in `PLURX_CONFIG`). Every key has an env override:
 | `PLURX_MDNS_ADVERTISE` | — | `true` | Run Bonjour inside the server process; Compose sets this to `false` because its host-network companion advertises instead |
 | `PLURX_DISCOVERY_SERVER_URL` | — | `http://127.0.0.1:32400` | Server URL read by `plurxd advertise`; normally only the Compose companion uses it |
 | `PLURX_LOG` | — | `info` | Log filter (`tracing` EnvFilter syntax, e.g. `plurxd=debug`) |
+| `PLURX_HLS_CLOSED_CAPTIONS_NONE` | — | off | **Experiment.** Adds `CLOSED-CAPTIONS=NONE` to the HLS variant. Set `1` to enable |
+| `PLURX_HLS_FORCED_AUTOSELECT` | — | off | **Experiment.** Puts `AUTOSELECT=YES` on forced subtitle renditions. Set `1` to enable |
+
+### The two HLS master experiments
+
+These two are not tuning knobs, they are a ladder — candidate changes to the
+HLS multivariant playlist, compiled in but inert until you set one, so a rung
+can be tried, watched, and kept or dropped without another build. Both are
+Apple authoring-rules items and both are candidates for the one open failure
+in the Apple native-subtitle work: a physical Apple TV rejecting a copied
+Dolby Vision master with CoreMedia `-12927`
+([docs/APPLE-NATIVE-SUBTITLES-PLAN.md](APPLE-NATIVE-SUBTITLES-PLAN.md) §5.4).
+
+| Var | What it adds | Why it might matter |
+|---|---|---|
+| `PLURX_HLS_CLOSED_CAPTIONS_NONE` | `CLOSED-CAPTIONS=NONE` on the variant | Apple's authoring rules ask for it, and it stops AVFoundation synthesising a phantom closed-caption option into the legible group — a phantom option shifts every rendition ordinal |
+| `PLURX_HLS_FORCED_AUTOSELECT` | `AUTOSELECT=YES` on forced renditions | Apple's authoring rules require it on forced renditions; this master withholds it when two forced tracks share a language |
+
+**How to run them: one per deploy, and let the device decide.** Set exactly one
+variable, restart plurxd, and play the affected title on the actual Apple TV.
+Both are read once at startup, because a master that changed shape between two
+fetches of the same session would be a worse problem than either rung solves.
+Never enable both at once — a master that then plays tells you nothing about
+which change did it.
+
+**The device is the only oracle here.** Every master regression in this arc so
+far passed the unit tests and failed on physical hardware, and one of them
+(`ed38ea9`, deriving exact codec data from the init segment) had to be reverted
+in production. A green `make check` says the playlist is syntactically what was
+intended; it does not say AVPlayer will accept it. Treat an unobserved rung as
+untested, and turn it back off if the device does not visibly improve.
 
 ## Ports
 

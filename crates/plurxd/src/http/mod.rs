@@ -3986,7 +3986,16 @@ mod tests {
                 json!({
                     "playback_id": "apple-native-subs",
                     "request_id": "native-subs-attempt",
-                    "start": 10.0,
+                    // Deliberately NOT on a keyframe. The fixture above is
+                    // 10 fps with `-g 20`, so its keyframes are every 2 s and
+                    // a copy session asked for 10.5 s actually begins at
+                    // 10.0 s — `-noaccurate_seek` seeks backwards and
+                    // `-avoid_negative_ts make_zero` calls that keyframe t=0.
+                    // A start that lands exactly on a keyframe (which 10.0
+                    // did) makes this test pass whether cues are shifted by
+                    // the request or by the media origin, which is how the
+                    // half-second lead below shipped.
+                    "start": 10.5,
                     "copy": true,
                     "native_subtitles": true,
                     "subtitle": 0
@@ -4061,9 +4070,20 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         let shifted = String::from_utf8(shifted).expect("VTT utf8");
+        // The cue is authored 9.000 → 11.000. The session's media begins at
+        // the 10.0 s keyframe, so it belongs at −1.000 → 1.000 and is emitted
+        // from the window edge to 1.000. Shifting by the REQUESTED 10.5 s
+        // instead would end it at 0.500 — the whole of P0-2, at this
+        // fixture's two-second GOP. On a 4K film's GOP the same mistake is
+        // seconds of visible lead.
         assert!(
             shifted.contains("00:00:00.000 --> 00:00:01.000"),
-            "{shifted}"
+            "cues must be shifted by the session's media origin, not by the \
+             requested start:\n{shifted}"
+        );
+        assert!(
+            !shifted.contains("--> 00:00:00.500"),
+            "cues are being shifted by the requested start (P0-2):\n{shifted}"
         );
         assert!(shifted.contains("X-TIMESTAMP-MAP=MPEGTS:0,LOCAL:00:00:00.000"));
 
@@ -4088,6 +4108,209 @@ mod tests {
             )
             .await,
             StatusCode::NOT_FOUND
+        );
+    }
+
+    /// A file whose subtitle list can express every native-subtitle refusal:
+    /// an English SRT that converts cleanly, an Italian SRT flagged as the
+    /// *container* default (the track route-level Off must never resurrect),
+    /// a PGS bitmap and a styled ASS track — neither of which can become a
+    /// WebVTT rendition. `seed_content` deliberately keeps one English SRT and
+    /// other tests pin that shape, so this stands up its own library, and its
+    /// own real (if tiny) clip, because the session routes need a source
+    /// ffmpeg can actually open.
+    ///
+    /// The clip carries no subtitle data — nothing here extracts cues, it all
+    /// stops at validation — so the tracks live in the probe only.
+    async fn seed_mixed_subtitles(state: &AppState) -> i64 {
+        use plurx_core::domain::{
+            AudioStream, ItemKind, LibraryKind, NewItem, NewLibrary, ProbeResult, SubtitleStream,
+        };
+
+        let lib = state
+            .store
+            .create_library(&NewLibrary {
+                name: "Mixed subs".into(),
+                kind: LibraryKind::Movies,
+                paths: vec![std::path::PathBuf::from("/media")],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+        let movie = state
+            .store
+            .insert_item(&NewItem {
+                library_id: lib.id,
+                kind: ItemKind::Movie,
+                parent_id: None,
+                title: "Il Sorpasso".into(),
+                year: None,
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("movie");
+
+        let dir = std::env::temp_dir().join(format!("plurx-mixedsubs-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("mixed.mp4");
+        let made = std::process::Command::new(crate::ffmpeg::ffmpeg_bin())
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=64x64:r=10:d=8",
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=channel_layout=stereo:sample_rate=48000",
+                "-t",
+                "8",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-g",
+                "20",
+                "-c:a",
+                "aac",
+            ])
+            .arg(&path)
+            .output()
+            .expect("spawn ffmpeg");
+        assert!(
+            made.status.success(),
+            "mixed-subtitle fixture encode failed: {}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+
+        let probe = ProbeResult {
+            duration_ms: Some(8_000),
+            container: Some("mp4".into()),
+            video_codec: Some("h264".into()),
+            width: Some(64),
+            height: Some(64),
+            bit_depth: Some(8),
+            bitrate: Some(400_000),
+            audio_streams: vec![AudioStream {
+                index: 0,
+                codec: "aac".into(),
+                channels: Some(2),
+                language: Some("eng".into()),
+                default: true,
+                ..Default::default()
+            }],
+            subtitle_streams: vec![
+                SubtitleStream {
+                    index: 0,
+                    codec: "subrip".into(),
+                    language: Some("eng".into()),
+                    ..Default::default()
+                },
+                // The container's own default, in a language nobody asked
+                // for. §3.3: never a fallback.
+                SubtitleStream {
+                    index: 1,
+                    codec: "subrip".into(),
+                    language: Some("ita".into()),
+                    default: true,
+                    ..Default::default()
+                },
+                SubtitleStream {
+                    index: 2,
+                    codec: "hdmv_pgs_subtitle".into(),
+                    language: Some("eng".into()),
+                    ..Default::default()
+                },
+                SubtitleStream {
+                    index: 3,
+                    codec: "ass".into(),
+                    language: Some("eng".into()),
+                    title: Some("Signs & Songs".into()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        state
+            .store
+            .upsert_file(movie, &path.to_string_lossy(), 8_888, 3, &probe)
+            .await
+            .expect("file")
+    }
+
+    /// A native selection the server cannot serve must die at `create`, before
+    /// an encoder exists — the handoff's "server validation still rejects"
+    /// claim, which nothing tested. Two refusals are owed: an index off the end
+    /// of the decision's subtitle list, and an index naming a track whose
+    /// pixels (PGS) or styling (ASS) cannot survive conversion to WebVTT. The
+    /// error text is asserted too, because a 400 for the wrong reason (a
+    /// malformed body, say) would otherwise pass this test.
+    #[tokio::test]
+    async fn hls_create_rejects_native_subtitle_indices_it_cannot_serve() {
+        crate::transcode::require_ffmpeg();
+        let (app, state) = test_state();
+        let admin = setup_admin(&app).await;
+        let file = seed_mixed_subtitles(&state).await;
+
+        for (index, why) in [
+            (9_i64, "unknown native subtitle track"),
+            (2, "the selected subtitle requires burn-in"),
+            (3, "the selected subtitle requires burn-in"),
+        ] {
+            let (status, body) = call(
+                &app,
+                post(
+                    &format!("/api/v1/files/{file}/hls/sessions"),
+                    Some(&admin),
+                    json!({
+                        "playback_id": "native-validation",
+                        "copy": true,
+                        "native_subtitles": true,
+                        "subtitle": index
+                    }),
+                ),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "native subtitle {index} cannot become a WebVTT rendition and \
+                 must be refused before an encoder is spawned: {body}"
+            );
+            assert_eq!(
+                body["error"].as_str(),
+                Some(why),
+                "the 400 for native subtitle {index} must say why it was \
+                 refused, or the client cannot tell a bad index from a bad \
+                 request: {body}"
+            );
+        }
+
+        // The control: the same request with a convertible track is accepted,
+        // so the refusals above are about the subtitle index and nothing else.
+        let (status, body) = call(
+            &app,
+            post(
+                &format!("/api/v1/files/{file}/hls/sessions"),
+                Some(&admin),
+                json!({
+                    "playback_id": "native-validation",
+                    "copy": true,
+                    "native_subtitles": true,
+                    "subtitle": 0
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a text track that converts must still be accepted: {body}"
         );
     }
 

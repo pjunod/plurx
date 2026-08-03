@@ -78,6 +78,8 @@
   main>.versionstamp{margin:34px 0 -42px}
   .connectqr{margin-top:14px;border-top:1px solid var(--line);padding-top:12px;text-align:center}
   .connectqr summary{cursor:pointer;color:var(--muted);font-size:13px;font-weight:600}
+  /* The white background is the QR quiet zone, not a theme slip: a dark-mode
+     card behind a transparent code is unreadable to every scanner. Keep it. */
   .connectqr img{display:block;width:220px;max-width:100%;height:auto;margin:12px auto 8px;background:#fff;border-radius:10px}
   .connectqr p{font-size:11.5px;line-height:1.45;margin:6px 0;color:var(--muted)}
 
@@ -1266,7 +1268,7 @@ function renderLogin(){
      <label>Password</label><input id="p" type="password" autocomplete="current-password" required>
      <details class="connectqr"><summary>Connect an app with a QR code</summary>
        <img src="/connect.svg?origin=${encodeURIComponent(location.origin)}" alt="QR code for ${esc(location.origin)}">
-       <p>Scan this from the Plurx iPhone, iPad, or Android app to add this server.</p>
+       <p>Scan this from the ${APP_NAME} iPhone, iPad, or Android app to add this server.</p>
        <p>The code contains only the server address. Sign in inside the app with your usual account.</p>
      </details>`,
     "Sign in", async()=>{

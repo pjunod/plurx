@@ -77,12 +77,14 @@ struct SettingsStore {
         get { defaults.object(forKey: Key.autoplay) as? Bool ?? true }
         nonmutating set { defaults.set(newValue, forKey: Key.autoplay) }
     }
-    /// Defaults to `.instant`, which is what the app has always done: an
-    /// unchanged install behaves exactly as before.
+    /// Defaults to `.onDemand` (Paul, 2026-08-02): a title direct-plays until a
+    /// subtitle is actually chosen, so the majority of plays that never open the
+    /// menu cost no server session at all. `.instant` remains available for
+    /// viewers who would rather pay that up front than take one restart.
     var subtitleReadiness: SubtitleReadiness {
         get {
             SubtitleReadiness(rawValue: defaults.string(forKey: Key.subtitleReadiness) ?? "")
-                ?? .instant
+                ?? .onDemand
         }
         nonmutating set { defaults.set(newValue.rawValue, forKey: Key.subtitleReadiness) }
     }
