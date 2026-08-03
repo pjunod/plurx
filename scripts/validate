@@ -1,0 +1,14 @@
+#!/usr/bin/env python3
+"""Repository entry point for the functionality-point validator."""
+
+from pathlib import Path
+import sys
+
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from validation.runner import main  # noqa: E402
+
+
+raise SystemExit(main())

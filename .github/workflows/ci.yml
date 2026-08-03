@@ -11,10 +11,14 @@ env:
 
 jobs:
   check:
-    name: fmt + clippy + test
+    name: functionality points (CI profile)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The validator compares the event base with HEAD. Full history keeps
+          # that base available after force-pushes and on long-lived branches.
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@1.97.1
         with:
           components: rustfmt, clippy
@@ -27,8 +31,29 @@ jobs:
       # is an absent dependency rather than anything wrong with the tree.
       - name: Install ffmpeg
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
-      # Same gate a developer runs locally (Makefile), so CI never diverges.
-      - run: make check
+      # The catalog always includes `make check`, then adds checks selected by
+      # the impact graph: web syntax/contrast for web changes and Android
+      # unit/lint for Android changes. A missing or all-zero event base falls
+      # back to every point; shared checks are deduplicated by the runner.
+      - name: Validate functionality points
+        env:
+          VALIDATION_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if [ -n "$VALIDATION_BASE" ] \
+            && git cat-file -e "$VALIDATION_BASE^{commit}" 2>/dev/null; then
+            scripts/validate run --profile ci \
+              --changed-from "$VALIDATION_BASE" --strict
+          else
+            echo "No usable event base; validating every functionality point."
+            scripts/validate run --profile ci --all --strict
+          fi
+      - name: Upload validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-evidence
+          path: target/validation
+          if-no-files-found: warn
 
   coverage:
     name: coverage

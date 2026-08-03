@@ -1,9 +1,11 @@
 # Reproducible Android build environment — JDK 25 + the exact SDK this app pins.
 # The image is the toolchain only; the source is bind-mounted at run time (see
 # `make android`), so the same image builds any revision without a rebuild.
+# The image is linux/amd64 on every host because AGP's Linux AAPT2 distribution
+# is x86-64; Docker Desktop emulates it on Apple Silicon.
 #
-#   docker build -t plurx-android-build clients/android
-#   docker run --rm -u $(id -u):$(id -g) -e HOME=/tmp \
+#   docker build --platform linux/amd64 -t plurx-android-build clients/android
+#   docker run --rm --platform linux/amd64 -u $(id -u):$(id -g) -e HOME=/tmp \
 #     -v "$PWD":/workspace -w /workspace/clients/android \
 #     plurx-android-build ./gradlew --no-daemon :app:assembleDebug
 #
@@ -21,7 +23,7 @@ RUN apt-get update \
 
 # Android command-line tools (pinned build; bump CLT_VERSION to move it). The
 # bundle must live at $ANDROID_HOME/cmdline-tools/latest for sdkmanager to work.
-ARG CLT_VERSION=11076708
+ARG CLT_VERSION=15859902
 RUN mkdir -p "${ANDROID_HOME}/cmdline-tools" \
     && curl -fsSL "https://dl.google.com/android/repository/commandlinetools-linux-${CLT_VERSION}_latest.zip" -o /tmp/clt.zip \
     && unzip -q /tmp/clt.zip -d "${ANDROID_HOME}/cmdline-tools" \
@@ -30,10 +32,13 @@ RUN mkdir -p "${ANDROID_HOME}/cmdline-tools" \
 
 ENV PATH="${ANDROID_HOME}/cmdline-tools/latest/bin:${ANDROID_HOME}/platform-tools:${PATH}"
 
-# The exact packages the app pins (compileSdk 37 / build-tools 36.0.0). Accepting
-# the licenses non-interactively is required for an unattended build.
+# The exact packages the app uses. Android 17 is published as platform 37.0 on
+# the preview channel; `android-37` is not a package name. AGP 9.3.1 still
+# invokes build-tools 36 for this project, while 37 is the platform-matched
+# toolset, so both are present and Gradle never mutates the image at runtime.
+# Accepting the licenses non-interactively is required for an unattended build.
 RUN yes | sdkmanager --licenses > /dev/null \
-    && sdkmanager --install "platform-tools" "platforms;android-37" "build-tools;36.0.0" > /dev/null \
+    && sdkmanager --channel=3 --install "platform-tools" "platforms;android-37.0" "build-tools;36.0.0" "build-tools;37.0.0" > /dev/null \
     # World-read/write so a build run as an arbitrary host UID (`-u $(id -u)`, so
     # the APK lands host-owned) can read the SDK and, if AGP ever needs to, write
     # to it. This is a throwaway build container, not a runtime image.

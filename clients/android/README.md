@@ -107,7 +107,10 @@ the container runs as your UID (`-u $(id -u)`), so nothing is left root-owned.
 First run pulls the base image + SDK and downloads the Gradle deps; later runs
 reuse the cached image and a `clients/android/.gradle-docker` cache.
 `make android-image` rebuilds just the image (e.g. after bumping the SDK). Needs
-the Docker daemon running and outbound internet on the first build.
+the Docker daemon running and outbound internet on the first build. The image
+is deliberately `linux/amd64`: AGP's Linux AAPT2 is x86-64, so Docker Desktop
+emulates the same image on Apple Silicon that GitHub's Linux runner uses
+natively.
 
 ### Manually — host JDK 25 + Android SDK
 
@@ -120,14 +123,15 @@ export JAVA_HOME=/usr/lib/jvm/java-25-openjdk-amd64
 
 # 2. Android command-line tools — must end up at cmdline-tools/latest/
 mkdir -p ~/android-sdk/cmdline-tools && cd ~/android-sdk/cmdline-tools
-curl -fsSL https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -o clt.zip
+curl -fsSL https://dl.google.com/android/repository/commandlinetools-linux-15859902_latest.zip -o clt.zip
 unzip -q clt.zip && mv cmdline-tools latest && rm clt.zip
 export ANDROID_HOME=$HOME/android-sdk
 export PATH=$ANDROID_HOME/cmdline-tools/latest/bin:$PATH
 
-# 3. the exact packages this app pins (compileSdk 37 / build-tools 36.0.0)
+# 3. the exact packages this app pins (Android 17 platform 37.0)
 yes | sdkmanager --licenses
-sdkmanager "platform-tools" "platforms;android-37" "build-tools;36.0.0"
+sdkmanager --channel=3 "platform-tools" "platforms;android-37.0" \
+  "build-tools;36.0.0" "build-tools;37.0.0"
 
 # 4. build (from clients/android/)
 cd ~/plurx/clients/android && ./gradlew :app:assembleDebug
