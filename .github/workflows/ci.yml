@@ -67,11 +67,19 @@ jobs:
       - name: Select the pinned Xcode and install the project generator
         run: |
           sudo xcode-select -s /Applications/Xcode_16.4.app
+          sudo xcodebuild -runFirstLaunch
           brew install xcodegen
+          ios_id=$(xcrun simctl create \
+            "plurx CI iPhone" \
+            com.apple.CoreSimulator.SimDeviceType.iPhone-16-Pro \
+            com.apple.CoreSimulator.SimRuntime.iOS-18-5)
+          tvos_id=$(xcrun simctl create \
+            "plurx CI Apple TV" \
+            com.apple.CoreSimulator.SimDeviceType.Apple-TV-4K-3rd-generation-4K \
+            com.apple.CoreSimulator.SimRuntime.tvOS-18-5)
+          echo "APPLE_IOS_SIM=platform=iOS Simulator,id=$ios_id" >> "$GITHUB_ENV"
+          echo "APPLE_TVOS_SIM=platform=tvOS Simulator,id=$tvos_id" >> "$GITHUB_ENV"
       - name: Run the shared XCTest suite on both platforms
-        env:
-          APPLE_IOS_SIM: platform=iOS Simulator,name=iPhone 16 Pro,OS=18.5
-          APPLE_TVOS_SIM: platform=tvOS Simulator,name=Apple TV 4K (3rd generation),OS=18.5
         run: make apple-test
 
   android-device:
