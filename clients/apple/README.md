@@ -74,8 +74,11 @@ only what this hardware genuinely can't play.
   ASS/SSA still burn in at source height and restart at the same film position.
   Automatic selection never starts a burn except for a forced track.
 - **Honest dynamic-range badge.** The chip names what the *file* carries; when
-  the session is delivering something else it dims and says so (`DV → HDR10`,
-  `HDR → SDR`), and the playback-info panel spells out the server's reason.
+  the session is delivering something else, its source half dims while the
+  rendered result stays legible (`DV → HDR10`, `HDR → SDR`). The split answers
+  both questions at once: which source capability was unavailable, and which
+  dynamic range is functioning on screen. The playback-info panel spells out
+  the server's reason.
 - **Autoplay next episode**, including rollover to the next season; it is on
   by default to match the web client and can be toggled in the player or
   Settings.
@@ -247,8 +250,9 @@ Both the decision and the session response also carry
 `delivered_dynamic_range` (`dolby_vision` / `hdr10` / `hlg` / `sdr`) — what the
 bytes on the wire actually hold, as opposed to what the file holds. The player
 compares it with the source grade and with `AVPlayer.eligibleForHDRPlayback` to
-decide whether the dynamic-range badge is lit or dimmed. It is a readout only:
-nothing in the client's decision, capability, or session request reads it back.
+dim the unavailable source half while keeping the rendered result fully lit.
+It is a readout only: nothing in the client's decision, capability, or session
+request reads it back.
 
 Either session starts at the resume point, carries this player's `playback_id`
 (the server's supersession key) plus a per-attempt `request_id` (so a replayed
