@@ -128,6 +128,9 @@ private data class Plan(
     val videoWidth: Int?,
     val videoHeight: Int?,
     val source: MediaFileDto?,
+    override val sourceHeight: Int?,
+    override val aac: Boolean,
+    override val preserveDolbyVision: Boolean,
     override val audio: List<AudioTrack>,
     override val subtitles: List<SubTrack>,
     val declaredOffsetMs: Long?,
@@ -153,6 +156,11 @@ private suspend fun loadPlan(vm: AppViewModel, itemId: Long, fileId: Long): Plan
         videoWidth = file?.width?.toInt(),
         videoHeight = file?.height?.toInt(),
         source = file,
+        // The decision's own `source` is the authority for the height promise;
+        // the item's file row is the fallback for a server that predates it.
+        sourceHeight = (decision.source?.height ?: file?.height)?.toInt(),
+        aac = decision.delivery?.aac ?: decision.transcode_audio,
+        preserveDolbyVision = decision.delivery?.preserve_dolby_vision ?: false,
         audio = decision.audio,
         subtitles = decision.subtitles,
         declaredOffsetMs = decision.declared_offset_ms,
@@ -1142,12 +1150,16 @@ private fun videoFormatSummary(format: Format?): String? {
 }
 
 private fun selectedSubtitleLabel(player: Player, serverTracks: List<SubTrack>, selectedServerTrack: Long?): String {
+    // The controller's selection is the truth now that one menu row covers
+    // both deliveries: a burnt track has no selected text track to read back,
+    // and a rendition's own label is the less informative of the two.
+    serverTracks.firstOrNull { it.index == selectedServerTrack }?.let { return serverSubtitleLabel(it) }
     player.currentTracks.groups.filter { it.type == C.TRACK_TYPE_TEXT }.forEach { group ->
         repeat(group.length) { index ->
             if (group.isTrackSelected(index)) return subLabel(group.getTrackFormat(index))
         }
     }
-    return serverTracks.firstOrNull { it.index == selectedServerTrack }?.let(::serverSubtitleLabel) ?: "Off"
+    return "Off"
 }
 
 private fun channelLabel(channels: Int): String = when (channels) {
