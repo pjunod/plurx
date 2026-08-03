@@ -441,6 +441,20 @@ stays 2160-tall (§9.4).
 
 ### 5.4 Rebuild subtitles around native text — burn only bitmap
 
+> **Landed 2026-08-02**, with one correction to item 4 below. Not yet verified
+> on hardware — the acceptance cases at the end of this section are the device
+> pass that remains. Item 4 as written asks for the §3.1 policy function
+> ported from Apple; that is superseded. `/decision` already runs
+> `select_tracks` and stamps `default` on its pick, so both clients now apply
+> the server's choice and keep only a veto of their own — never auto-start a
+> burn for a non-forced track. A ported policy would have been a second,
+> differently-configured policy standing in front of the server's, which is
+> exactly the drift that made the Apple client behave as `Always` against a
+> server set to `Auto`. Also note item 2 routes on the decision's new `native`
+> field, not on `text`: `text` merely means "not a bitmap" and is true for
+> ASS/SSA, which the server refuses to serve as renditions.
+
+
 **Files:** `player/Controller.kt` (`switchSubtitle` `:164-173`,
 `openSession` `:207-244`), `data/Models.kt` (`CreateSessionReq:228-241`,
 `HlsStart:213-219`), `player/PlayerScreen.kt` (`TrackMenu`).

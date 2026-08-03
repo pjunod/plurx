@@ -39,8 +39,28 @@ bump may break compatibility and a **patch** bump never does.
   because that is what a forced track is for. PGS, VobSub, and styled ASS/SSA
   still burn and still reopen at the same film position, deliberately: they
   are positioned bitmaps and authored styling, and plain WebVTT would lose
-  them. Android still burns every server-side subtitle; its native path is
-  tracked in [docs/ANDROID-CLIENT-PARITY.md](docs/ANDROID-CLIENT-PARITY.md).
+  them.
+
+- **And the Android app now does the same thing.** Choosing a text subtitle
+  there used to send `subtitle_burn` too, which on a 4K HDR remux cost the
+  stream its resolution *and* its HDR for a track the server hands over free.
+  Android now takes the same WebVTT renditions the Apple apps do: on a
+  direct-played file the selection happens inside the player with no server
+  involved at all, and on a remuxed or transcoded one it opens a session
+  whose video recipe is untouched. Switching between two text tracks changes
+  nothing on the server. Bitmap and styled tracks still burn, at source
+  height, and the subtitle menu no longer lists a track twice on direct play.
+
+- **One place decides which subtitle comes on by itself.** The server already
+  worked this out — it honours anime dual-audio rules, the configured
+  audio/subtitle languages, and the subtitle mode (Auto, Always, Off) — and
+  said so in the playback decision, but each app then re-derived the rule from
+  scratch and reached its own answer. An app set up against a server whose
+  subtitle mode was Auto behaved as if it were Always. Both apps now apply
+  the server's choice. They keep exactly one rule of their own, and it is a
+  refusal rather than a preference: an app will not start a burn on its own
+  initiative for a track that is not forced, whatever the server picked,
+  because a burn is a re-encode and nobody asked for one.
 
 - **Point an app at this server by scanning a code.** The web sign-in screen
   now offers a QR code of the server's own address, and the iOS and Android
@@ -58,6 +78,15 @@ bump may break compatibility and a **patch** bump never does.
   compact chips for resolution, video codec, dynamic range, and audio, drawn
   with real icons and given their own accessibility text, so picking between
   two versions of a title stops being a guess about which one is the remux.
+
+- **The playback decision says whether a subtitle can be served as a
+  rendition.** Its `text` field only ever meant "not a bitmap", so ASS and SSA
+  came back as text even though their authored styling cannot survive
+  conversion to WebVTT and the server refuses to serve them as one. Each app
+  was carrying its own copy of the codec list to work around it. The decision
+  now carries `native` alongside `text`, computed by the same rule the HLS
+  master and that refusal use, so there is one answer instead of three.
+  Additive — older apps ignore it.
 
 - **Two HLS master experiments ship compiled in and off by default.**
   `PLURX_HLS_CLOSED_CAPTIONS_NONE=1` adds `CLOSED-CAPTIONS=NONE` to the

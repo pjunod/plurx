@@ -701,13 +701,13 @@ with its reason:
 
 ## 7. Non-goals — deliberately out of scope
 
-- **Android native-subtitle parity.** Planned, owned by
-  [CLIENTS-REMEDIATION-PLAN.md](CLIENTS-REMEDIATION-PLAN.md) §5.4 — Media3
-  text-track overrides against the same wire contract and classification;
-  its acceptance is written there ("selecting an SRT on a 4K HDR remux
-  starts no video encoder and keeps HDR … toggling between two text tracks
-  does not create a new server session"). Implement it in its own session;
-  do not copy AVPlayer idioms sideways.
+- **Android native-subtitle parity.** *Was* a non-goal for this pass; it
+  landed separately on 2026-08-02 against the same wire contract and the same
+  classification, and its acceptance
+  ([CLIENTS-REMEDIATION-PLAN.md](CLIENTS-REMEDIATION-PLAN.md) §5.4) still
+  needs a hardware pass. Auto-selection moved to the server in the same
+  change, so neither client re-derives that policy any more.
+
 - **Media badges.** Separate arc, separate plan
   ([MEDIA-BADGES-PLAN.md](MEDIA-BADGES-PLAN.md)); the only contact point is
   that both read the same track metadata.
