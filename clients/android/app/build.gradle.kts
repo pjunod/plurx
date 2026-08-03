@@ -13,8 +13,8 @@ android {
         // 23 covers phones and the vast majority of Android TV / Google TV boxes.
         minSdk = 23
         targetSdk = 37
-        versionCode = 3
-        versionName = "0.2.0"
+        versionCode = 4
+        versionName = "0.2.1"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
@@ -38,6 +38,9 @@ android {
     buildFeatures {
         buildConfig = true
         compose = true
+    }
+    sourceSets {
+        getByName("test").resources.srcDir("../../../tests/contracts")
     }
 }
 

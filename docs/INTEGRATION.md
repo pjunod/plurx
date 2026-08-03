@@ -307,15 +307,23 @@ below — in a container setup, the URL is only half the problem.
 
 **Where you see it.** Home → the **Coming soon** rail.
 
-**Artwork comes from plurx, not from monarr.** Each entry carries the item's
-TMDB/IMDb ids — the SHOW's, for an episode — and plurx resolves them against
-its own library. A series whose next episode is airing is a series you already
-have, so the poster is already in the artwork cache; proxying an image out of
-another application to display art plurx is holding anyway would be a network
-surface for no gain. A film not yet in the library resolves to nothing and gets
-the same initials tile the grids use. Resolution happens **after** the 15-minute
-cache read, so a title that finished scanning two minutes ago has its picture
-immediately rather than at the end of the quarter-hour.
+**Artwork is served by plurx, even before the title arrives.** Each entry
+carries the item's external ids and provider poster path — the SHOW's, for an
+episode. plurx first resolves the ids against its own library and uses that
+cached poster when it exists. Otherwise it downloads monarr's provider path
+from TMDB, TVmaze, or Open Library into the same artwork cache. The browser and
+native apps therefore call only plurx; they never receive the provider URL.
+Unknown hosts, non-HTTPS absolute URLs, redirects outside those three hosts,
+non-image responses, and files larger than 15 MiB are rejected, because a peer
+calendar must not become an SSRF or unbounded-download surface. Repeated
+episodes share one cached file, and at most four distinct posters download at
+once so a full four-week rail does not serialize its network waits.
+
+Local resolution and provider-cache checks happen **after** the 15-minute
+calendar cache read. A show that finished scanning two minutes ago therefore
+switches to its library poster immediately, while a future film or a TVmaze
+series outside plurx's TMDB id space still gets the art monarr already knows.
+Only an entry whose provider named no poster falls back to initials.
 
 **How to verify.**
 

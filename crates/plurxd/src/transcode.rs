@@ -1174,14 +1174,11 @@ pub struct SegmentFile {
 /// Subtitle child requests resolve this instead of accepting a file id from
 /// the URL, so one session capability can never be used to read another file.
 ///
-/// **`codecs` and `supplemental_codecs` currently have no consumer.** They
-/// were built for `CODECS` / `SUPPLEMENTAL-CODECS` attributes on the native
-/// HLS master; that whole shape was tried against real AVPlayer hardware on
-/// 2026-08-01/02 and deliberately reverted — the master now carries no codec
-/// claims at all and AVPlayer inspects the published init segment instead (a
-/// test pins `!master.contains("CODECS=")`). The machinery stays because it
-/// is correct and re-deriving it is the expensive part; this note exists so
-/// the next reader does not hunt for a consumer that is not there.
+/// `codecs` and `supplemental_codecs` describe the exact formats in the
+/// session's primary rendition. The native Apple master uses them only for
+/// HDR variants: Apple requires the exact Main10/Dolby declaration alongside
+/// `VIDEO-RANGE`, while leaving SDR masters codec-neutral preserves the broad
+/// compatibility established by physical-device testing.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HlsContext {
     pub file_id: i64,
@@ -1192,6 +1189,9 @@ pub struct HlsContext {
     pub media_origin_seconds: f64,
     pub codecs: String,
     pub supplemental_codecs: Option<String>,
+    /// Maximum video frame rate from the source probe. Apple requires this on
+    /// every video variant in a multivariant playlist.
+    pub frame_rate: Option<f64>,
 }
 
 /// How long a media-origin probe may take before the session gives up on it.
@@ -3548,6 +3548,15 @@ impl TranscodeManager {
         } else {
             audio_offset_ms.clamp(-15_000, 15_000)
         };
+        // Copy-video sessions and transcodes must interpret an omitted audio
+        // override identically. `/decision` marks the shared-policy pick as
+        // default, so silently falling back to ffmpeg's first stream here can
+        // make the player show English while the session carries (for example)
+        // an Italian container default. An explicit viewer choice still wins.
+        let audio_index = self
+            .select_tracks(&file, audio_override, None)
+            .await
+            .audio_index;
         let item_title = self
             .store
             .get_item(file.item_id)
@@ -3575,7 +3584,7 @@ impl TranscodeManager {
             transcode::hls_copy_args_with_dolby_vision(
                 &file,
                 start_seconds,
-                audio_override,
+                audio_index,
                 options.transcode_audio,
                 pacing,
                 transcode::DolbyVisionCopyOptions::new(have_dovi, options.preserve_dolby_vision),
@@ -3597,7 +3606,7 @@ impl TranscodeManager {
             let args = transcode::copy_pipe_args_with_dolby_vision(
                 &file,
                 start_seconds,
-                audio_override,
+                audio_index,
                 options.transcode_audio,
                 pacing,
                 have_dovi,
@@ -3659,7 +3668,7 @@ impl TranscodeManager {
         let media_origin_seconds = probe_media_origin(&file.path, start_seconds).await;
 
         let (hls_codecs, hls_supplemental_codecs) =
-            copied_hls_codecs(&file, audio_override, options, probe_json.as_deref());
+            copied_hls_codecs(&file, audio_index, options, probe_json.as_deref());
         let session = Arc::new(Session {
             dir: dir.clone(),
             child: Mutex::new(Some(child)),
@@ -3754,7 +3763,7 @@ impl TranscodeManager {
                         let args = transcode::hls_copy_args_with_dolby_vision(
                             &file,
                             start_seconds,
-                            audio_override,
+                            audio_index,
                             options.transcode_audio,
                             pacing,
                             transcode::DolbyVisionCopyOptions::new(
@@ -3882,6 +3891,7 @@ impl TranscodeManager {
             media_origin_seconds: session.media_origin_seconds,
             codecs: session.hls_codecs.clone(),
             supplemental_codecs: session.hls_supplemental_codecs.clone(),
+            frame_rate: None,
         })
     }
 

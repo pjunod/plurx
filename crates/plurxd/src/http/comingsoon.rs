@@ -11,14 +11,18 @@
 //! which is the default: a plurx that has never heard of monarr behaves
 //! exactly as it did.
 
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::State;
 use axum::Json;
+use futures_util::stream::{self, StreamExt};
 use plurx_core::domain::ItemKind;
 use plurx_core::store::keys;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 use super::error::ApiError;
@@ -36,6 +40,17 @@ const CACHE_TTL: Duration = Duration::from_secs(15 * 60);
 /// How far ahead to look. Four weeks is the horizon a "coming soon" rail is
 /// for; past that it is a calendar, and monarr already has one of those.
 const HORIZON_DAYS: i64 = 28;
+
+/// Bound one provider image before it reaches memory or disk. Posters are
+/// normally hundreds of kilobytes; 15 MiB leaves room for an extravagant
+/// source image without allowing a calendar entry to become an unbounded
+/// download.
+const MAX_ARTWORK_BYTES: u64 = 15 * 1024 * 1024;
+
+/// A home load may discover several new titles at once. Fetch a small batch
+/// in parallel so one slow provider does not serialize the whole rail, while
+/// keeping the request count low enough to remain polite to those providers.
+const ARTWORK_DOWNLOAD_CONCURRENCY: usize = 4;
 
 /// One thing monarr expects. Deliberately a subset of monarr's own
 /// `CalendarEntry`: `mediaItemId` is monarr's id and means nothing here, and
@@ -58,19 +73,18 @@ pub struct ComingSoon {
     pub tmdb_id: Option<i64>,
     #[serde(skip_serializing)]
     pub imdb_id: Option<String>,
-    /// plurx's own artwork for this title, when it is already in the library.
-    ///
-    /// Resolved by id against the local library rather than fetched from
-    /// monarr: for a show whose next episode is airing, plurx already has the
-    /// poster cached, and proxying an image out of another application to
-    /// display art we are holding anyway would be a new network surface for
-    /// no gain. A film not yet in the library has no local artwork, and the
-    /// card falls back to initials rather than pretending.
+    /// Artwork served from plurx's own cache. A local library poster wins;
+    /// otherwise plurx downloads the provider path monarr named and keeps the
+    /// browser/native app off that external network surface.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub poster: Option<String>,
     /// The local item, so the card can be clicked through.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub item_id: Option<i64>,
+    /// The provider artwork reference from monarr. It is input to the local
+    /// cache only and is never handed to a client.
+    #[serde(skip)]
+    source_poster: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -86,6 +100,27 @@ struct MonarrEntry {
     tmdb_id: Option<i64>,
     #[serde(default, rename = "imdbId")]
     imdb_id: Option<String>,
+    /// TMDB-relative for films/most shows; HTTPS for provider-chain shows and
+    /// books. The downloader below accepts only the providers monarr uses.
+    #[serde(default, rename = "posterPath")]
+    poster_path: Option<String>,
+}
+
+impl From<MonarrEntry> for ComingSoon {
+    fn from(e: MonarrEntry) -> Self {
+        ComingSoon {
+            date: e.date,
+            kind: e.kind,
+            title: e.title,
+            detail: e.detail,
+            has_file: e.has_file,
+            tmdb_id: e.tmdb_id,
+            imdb_id: e.imdb_id,
+            poster: None,
+            item_id: None,
+            source_poster: e.poster_path.filter(|p| !p.trim().is_empty()),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -333,7 +368,7 @@ pub async fn coming_soon(
     if let Some(entries) = state.coming_soon.get().await {
         return Ok(Json(ComingSoonResponse {
             configured: true,
-            entries: with_local_artwork(&state, entries).await,
+            entries: with_artwork(&state, entries).await,
         }));
     }
 
@@ -347,18 +382,19 @@ pub async fn coming_soon(
     state.coming_soon.put(entries.clone()).await;
     Ok(Json(ComingSoonResponse {
         configured: true,
-        entries: with_local_artwork(&state, entries).await,
+        entries: with_artwork(&state, entries).await,
     }))
 }
 
-/// Attach plurx's own poster to every entry it can resolve by id.
+/// Attach a locally served poster to every entry whose provider named one.
 ///
 /// Done AFTER the cache read, not before it: the cache holds monarr's answer
 /// for fifteen minutes, and artwork resolved into it would be frozen there
 /// too — so a show that finished scanning two minutes ago would stay
-/// pictureless for the rest of the quarter-hour. A handful of indexed lookups
-/// per request is the cheaper mistake.
-async fn with_local_artwork(state: &AppState, entries: Vec<ComingSoon>) -> Vec<ComingSoon> {
+/// pictureless for the rest of the quarter-hour. Local library artwork wins;
+/// provider artwork is the fallback for titles that have not arrived yet or
+/// series identified outside TMDB's id space.
+async fn with_artwork(state: &AppState, entries: Vec<ComingSoon>) -> Vec<ComingSoon> {
     let mut out = Vec::with_capacity(entries.len());
     for mut e in entries {
         // An episode's artwork is its SHOW's — an episode's own id is not what
@@ -380,11 +416,18 @@ async fn with_local_artwork(state: &AppState, entries: Vec<ComingSoon>) -> Vec<C
             .await
         {
             Ok(Some(item)) => {
-                e.poster = item
-                    .poster_path
-                    .as_ref()
-                    .map(|f| format!("/api/v1/images/{f}"));
                 e.item_id = Some(item.id);
+                if let Some(filename) = item.poster_path.as_deref() {
+                    // A stale database path must not suppress the provider
+                    // fallback. This can happen after an artwork volume is
+                    // replaced independently of the database volume.
+                    let present = tokio::fs::metadata(state.artwork_dir.join(filename))
+                        .await
+                        .is_ok_and(|m| m.is_file() && m.len() > 0);
+                    if present {
+                        e.poster = Some(format!("/api/v1/images/{filename}"));
+                    }
+                }
             }
             Ok(None) => {}
             Err(err) => {
@@ -395,7 +438,220 @@ async fn with_local_artwork(state: &AppState, entries: Vec<ComingSoon>) -> Vec<C
         }
         out.push(e);
     }
+
+    // One poster can appear several times in the four-week window (successive
+    // episodes of one show). De-duplicate before starting network work, then
+    // fetch distinct images concurrently without changing the entry order.
+    let mut sources = BTreeMap::<String, reqwest::Url>::new();
+    for entry in &out {
+        if entry.poster.is_some() {
+            continue;
+        }
+        if let Some(source) = entry.source_poster.as_deref() {
+            if let Some(url) = calendar_artwork_url(source) {
+                sources.entry(source.to_owned()).or_insert(url);
+            } else {
+                tracing::warn!(
+                    target: "plurxd::integrate",
+                    title = %entry.title,
+                    "coming-soon artwork source is not an approved provider URL"
+                );
+            }
+        }
+    }
+    if sources.is_empty() {
+        return out;
+    }
+
+    let client = match calendar_artwork_client() {
+        Ok(client) => client,
+        Err(err) => {
+            tracing::warn!(target: "plurxd::integrate", error = %err,
+                "coming-soon artwork client could not be built");
+            return out;
+        }
+    };
+    let artwork_dir = state.artwork_dir.clone();
+    let downloaded = stream::iter(sources)
+        .map(|(source, url)| {
+            let client = client.clone();
+            let artwork_dir = artwork_dir.clone();
+            async move {
+                let result = cache_artwork_url(&client, &artwork_dir, &url).await;
+                (source, result)
+            }
+        })
+        .buffered(ARTWORK_DOWNLOAD_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+
+    let mut cached = HashMap::<String, String>::new();
+    for (source, result) in downloaded {
+        match result {
+            Ok(filename) => {
+                cached.insert(source, filename);
+            }
+            Err(err) => tracing::warn!(
+                target: "plurxd::integrate",
+                error = %err,
+                "coming-soon artwork download failed"
+            ),
+        }
+    }
+    for entry in &mut out {
+        if entry.poster.is_some() {
+            continue;
+        }
+        if let Some(filename) = entry
+            .source_poster
+            .as_ref()
+            .and_then(|source| cached.get(source))
+        {
+            entry.poster = Some(format!("/api/v1/images/{filename}"));
+        }
+    }
     out
+}
+
+/// Turn monarr's provider artwork reference into the one URL plurx may fetch.
+///
+/// The allowlist is the SSRF boundary. monarr normally sends a TMDB-relative
+/// path, but provider-chain shows and books carry absolute TVmaze/Open Library
+/// URLs. Accepting arbitrary absolute URLs from a peer would let that peer
+/// make plurxd probe private services, so only those three public artwork
+/// hosts are valid, on standard HTTPS.
+fn calendar_artwork_url(source: &str) -> Option<reqwest::Url> {
+    let source = source.trim();
+    let raw = if source.starts_with('/') && !source.starts_with("//") {
+        format!("https://image.tmdb.org/t/p/w500{source}")
+    } else {
+        source.to_owned()
+    };
+    let url = reqwest::Url::parse(&raw).ok()?;
+    approved_artwork_url(&url).then_some(url)
+}
+
+fn approved_artwork_url(url: &reqwest::Url) -> bool {
+    url.scheme() == "https"
+        && url.port_or_known_default() == Some(443)
+        && url.username().is_empty()
+        && url.password().is_none()
+        && matches!(
+            url.host_str(),
+            Some("image.tmdb.org" | "static.tvmaze.com" | "covers.openlibrary.org")
+        )
+}
+
+fn calendar_artwork_client() -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .user_agent(concat!("plurx/", env!("CARGO_PKG_VERSION")))
+        // Redirects are checked against the same allowlist. Without this, an
+        // approved public host could redirect the downloader to a private
+        // address and step around the boundary above.
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if approved_artwork_url(attempt.url()) {
+                attempt.follow()
+            } else {
+                attempt.stop()
+            }
+        }))
+        .build()
+}
+
+pub(super) fn artwork_cache_filename(url: &reqwest::Url) -> String {
+    let digest = Sha256::digest(url.as_str().as_bytes());
+    let extension = Path::new(url.path())
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .filter(|e| matches!(e.as_str(), "jpg" | "jpeg" | "png" | "webp"))
+        .map(|e| if e == "jpeg" { "jpg".to_owned() } else { e })
+        .unwrap_or_else(|| "jpg".to_owned());
+    format!("coming-soon-{}.{}", hex::encode(&digest[..12]), extension)
+}
+
+/// Download one already-approved URL into the local artwork cache. This
+/// helper deliberately accepts a parsed URL without re-validating it so its
+/// file/cache behavior can be tested against a loopback HTTP server; every
+/// production caller reaches it through [`calendar_artwork_url`].
+async fn cache_artwork_url(
+    client: &reqwest::Client,
+    artwork_dir: &Path,
+    url: &reqwest::Url,
+) -> Result<String, String> {
+    tokio::fs::create_dir_all(artwork_dir)
+        .await
+        .map_err(|e| format!("create artwork directory: {e}"))?;
+    let filename = artwork_cache_filename(url);
+    let destination = artwork_dir.join(&filename);
+    if tokio::fs::metadata(&destination)
+        .await
+        .is_ok_and(|m| m.is_file() && m.len() > 0)
+    {
+        return Ok(filename);
+    }
+
+    let response = client
+        .get(url.clone())
+        .send()
+        .await
+        .map_err(|e| format!("request: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!("provider returned {}", response.status()));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_ARTWORK_BYTES)
+    {
+        return Err(format!("image exceeds {MAX_ARTWORK_BYTES} bytes"));
+    }
+    let is_image = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.to_ascii_lowercase().starts_with("image/"));
+    if !is_image {
+        return Err("provider response is not an image".to_owned());
+    }
+    let mut body = response.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.map_err(|e| format!("read image: {e}"))?;
+        if bytes.len() as u64 + chunk.len() as u64 > MAX_ARTWORK_BYTES {
+            return Err(format!("image exceeds {MAX_ARTWORK_BYTES} bytes"));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    if bytes.is_empty() {
+        return Err("provider returned an empty image".to_owned());
+    }
+
+    // Rename only after the complete response is on disk. The image route
+    // therefore sees either the previous complete file or the new complete
+    // file, never a half-written JPEG while two home requests overlap.
+    let temporary: PathBuf = artwork_dir.join(format!(".{filename}.{}.part", uuid::Uuid::new_v4()));
+    if let Err(err) = tokio::fs::write(&temporary, &bytes).await {
+        let _ = tokio::fs::remove_file(&temporary).await;
+        return Err(format!("write image: {err}"));
+    }
+    match tokio::fs::rename(&temporary, &destination).await {
+        Ok(()) => Ok(filename),
+        Err(_)
+            if tokio::fs::metadata(&destination)
+                .await
+                .is_ok_and(|m| m.is_file() && m.len() > 0) =>
+        {
+            // Another request won the same race. Its complete file is the
+            // desired result; our private temporary file is expendable.
+            let _ = tokio::fs::remove_file(&temporary).await;
+            Ok(filename)
+        }
+        Err(err) => {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            Err(format!("install image: {err}"))
+        }
+    }
 }
 
 async fn fetch(url: &str, key: &str) -> Result<Vec<ComingSoon>, String> {
@@ -424,18 +680,102 @@ async fn fetch(url: &str, key: &str) -> Result<Vec<ComingSoon>, String> {
         return Err(format!("monarr returned {}", resp.status()));
     }
     let raw: Vec<MonarrEntry> = resp.json().await.map_err(|e| e.to_string())?;
-    Ok(raw
-        .into_iter()
-        .map(|e| ComingSoon {
-            date: e.date,
-            kind: e.kind,
-            title: e.title,
-            detail: e.detail,
-            has_file: e.has_file,
-            tmdb_id: e.tmdb_id,
-            imdb_id: e.imdb_id,
-            poster: None,
-            item_id: None,
-        })
-        .collect())
+    Ok(raw.into_iter().map(ComingSoon::from).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::header;
+    use axum::response::IntoResponse;
+    use axum::routing::get;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn monarr_poster_is_cache_input_not_public_api() {
+        let raw: MonarrEntry = serde_json::from_value(json!({
+            "date": "2026-08-04",
+            "kind": "episode",
+            "title": "Lucky",
+            "detail": "S01E05",
+            "hasFile": false,
+            "posterPath": "https://static.tvmaze.com/uploads/images/medium_portrait/1/2.jpg"
+        }))
+        .expect("calendar entry");
+        let entry = ComingSoon::from(raw);
+        assert!(entry
+            .source_poster
+            .as_deref()
+            .is_some_and(|p| p.contains("tvmaze")));
+
+        let public = serde_json::to_value(entry).expect("serialize");
+        assert!(public.get("source_poster").is_none());
+        assert!(public.get("posterPath").is_none());
+    }
+
+    #[test]
+    fn calendar_artwork_accepts_only_monarrs_public_providers() {
+        assert_eq!(
+            calendar_artwork_url("/poster.jpg").expect("tmdb").as_str(),
+            "https://image.tmdb.org/t/p/w500/poster.jpg"
+        );
+        assert!(calendar_artwork_url(
+            "https://static.tvmaze.com/uploads/images/medium_portrait/1/2.jpg"
+        )
+        .is_some());
+        assert!(calendar_artwork_url("https://covers.openlibrary.org/b/id/1-L.jpg").is_some());
+
+        assert!(calendar_artwork_url("http://image.tmdb.org/poster.jpg").is_none());
+        assert!(calendar_artwork_url("https://example.com/poster.jpg").is_none());
+        assert!(calendar_artwork_url("https://image.tmdb.org:8443/poster.jpg").is_none());
+        assert!(calendar_artwork_url("https://user@image.tmdb.org/poster.jpg").is_none());
+    }
+
+    #[tokio::test]
+    async fn calendar_artwork_is_downloaded_once_then_reused() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let seen = requests.clone();
+        let app = axum::Router::new().route(
+            "/poster.jpg",
+            get(move || {
+                let seen = seen.clone();
+                async move {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    (
+                        [(header::CONTENT_TYPE, "image/jpeg")],
+                        b"jpeg bytes".to_vec(),
+                    )
+                        .into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = reqwest::Url::parse(&format!(
+            "http://{}/poster.jpg",
+            listener.local_addr().expect("addr")
+        ))
+        .expect("url");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let artwork = tempfile::tempdir().expect("artwork");
+        let client = reqwest::Client::builder().build().expect("client");
+        let first = cache_artwork_url(&client, artwork.path(), &url)
+            .await
+            .expect("first download");
+        let second = cache_artwork_url(&client, artwork.path(), &url)
+            .await
+            .expect("cache hit");
+
+        assert_eq!(first, second);
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            std::fs::read(artwork.path().join(first)).expect("file"),
+            b"jpeg bytes"
+        );
+    }
 }

@@ -2773,9 +2773,9 @@ function authShell(title, sub, fields, btn, onsubmit){
 // contents are already gone.
 function renderSetup(){
   authShell("Welcome","Create your admin account to get started.",
-    `<label>Username</label><input id="u" autocomplete="username" required>
-     <label>Password</label><input id="p" type="password" autocomplete="new-password" required placeholder="at least 8 characters">
-     <label>Confirm password</label><input id="p2" type="password" autocomplete="new-password" required placeholder="type it again">`,
+    `<label for="u">Username</label><input id="u" autocomplete="username" required>
+     <label for="p">Password</label><input id="p" type="password" autocomplete="new-password" required placeholder="at least 8 characters">
+     <label for="p2">Confirm password</label><input id="p2" type="password" autocomplete="new-password" required placeholder="type it again">`,
     "Create account", async()=>{
       if(u.value.trim()==="") throw new Error("Pick a username.");
       if(p.value.length<8) throw new Error("Password must be at least 8 characters.");
@@ -2786,8 +2786,8 @@ function renderSetup(){
 }
 function renderLogin(){
   authShell("Sign in","Welcome back.",
-    `<label>Username</label><input id="u" autocomplete="username" required>
-     <label>Password</label><input id="p" type="password" autocomplete="current-password" required>
+    `<label for="u">Username</label><input id="u" autocomplete="username" required>
+     <label for="p">Password</label><input id="p" type="password" autocomplete="current-password" required>
      <details class="connectqr"><summary>Connect an app with a QR code</summary>
        <img src="/connect.svg?origin=${encodeURIComponent(location.origin)}" alt="QR code for ${esc(location.origin)}">
        <p>Scan this from the ${APP_NAME} iPhone, iPad, or Android app to add this server.</p>
@@ -2809,7 +2809,7 @@ function classicChrome(active, inner){
      <nav><a href="#/" class="${active==='home'?'active':''}">Home</a><a href="#/activity" class="${active==='activity'?'active':''}">Activity</a>${admin}</nav>
      <span class="spacer"></span>
      <span class="activity" id="activity" onclick="location.hash='#/activity'"></span>
-     <input class="search" id="q" placeholder="Search…" value="${esc(getQ())}">
+     <input class="search" id="q" placeholder="Search…" aria-label="Search ${APP_NAME}" value="${esc(getQ())}">
      <div class="topctl">
        <div style="position:relative">
          <button class="ghost sm" onclick="toggleThemeMenu(event)" title="Theme"><span class="tsw"></span></button>
@@ -3154,10 +3154,10 @@ function installBannerHtml(){
 // A coming-soon card.
 //
 // There is still nothing to PLAY — the file does not exist yet — but there is
-// something to show: plurx already holds the poster for any series whose next
-// episode is airing, resolved server-side by TMDB/IMDb id rather than fetched
-// from monarr. A title not in the library gets the same initials tile the
-// grids use.
+// something to show. The server prefers a local poster resolved by external
+// id, then downloads and caches the provider poster path monarr supplied. The
+// browser only ever sees plurx's image route; a title whose provider named no
+// poster gets the same initials tile the grids use.
 //
 // It clicks through to the item when there is one, and is inert when there is
 // not: a card that navigates nowhere is worse than one that plainly cannot.
@@ -4533,6 +4533,14 @@ function transcodeOpts(startSec, audioIndex){
   if(PLAYER && PLAYER.aoffset) o.audio_offset_ms=PLAYER.aoffset;
   return o;
 }
+// The track whose checkmark `/decision` supplied. Every cold-start transport
+// carries it explicitly; otherwise progressive remuxes fall back to stream 0
+// while the menu continues to claim the preferred language is playing.
+function selectedAudioIndex(player){
+  const p=player||PLAYER;
+  const track=p&&p.audio&&p.audio[p.curAudio];
+  return track?track.index:0;
+}
 async function openSession(fileId, opts){
   const body=Object.assign({playback_id:PLAYBACK_ID, request_id:newRequestId()}, opts||{});
   // A null height is the *absence* of a request, not a request for nothing:
@@ -4800,6 +4808,7 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
   newAttempt(PENDING_ATTEMPT_REASON || (startSec>0?"resume":"cold-start"));
   PENDING_ATTEMPT_REASON=null;
   if(PLAYER.curAudio<0) PLAYER.curAudio=0;
+  const initialAudio=selectedAudioIndex(PLAYER);
   setupAirplay(video);
   setupTrackMenus();
   renderPlayerInfo();
@@ -4814,7 +4823,7 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
   if(decision.method==='transcode'){
     // Transcode: start an HLS session (server re-encodes + tone-maps).
     setLoading(true,"Starting the transcoder…",transcodeReason(decision));
-    let info; try{ info=await openSession(fileId,transcodeOpts(startSec));}catch(e){ setLoading(false); toast(e.message); return closePlayer(); }
+    let info; try{ info=await openSession(fileId,transcodeOpts(startSec,initialAudio));}catch(e){ setLoading(false); toast(e.message); return closePlayer(); }
     const from=attachSession(video, PLAYER, info, startSec);
     setLoading(true,"Preparing the stream…",(PLAYER.encoder?("encoder: "+PLAYER.encoder+" — "):"")+
       (PLAYER.vod?"already transcoded — playing from the cache":"buffering the first segments"));
@@ -4840,7 +4849,10 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
     catch(e){ setLoading(false); toast(e.message); return closePlayer(); }
   } else {
     // Direct play, or remux for a browser that plays progressive fMP4 (Chrome).
-    const isRemux = decision.method!=='direct_play';
+    // A raw direct-play file gives the browser control of its mux defaults, not
+    // the server's language choice. If the preferred track is not stream zero,
+    // use the remuxer so the requested track is the only one delivered.
+    const isRemux = decision.method!=='direct_play' || initialAudio!==0;
     setLoading(true,isRemux?"Preparing the stream…":"Loading…",
       isRemux?"remuxing to a browser-friendly container":"direct play — no conversion needed");
     // Remux carries the same caps so the server copies the audio when the
@@ -4850,8 +4862,12 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
     // on Chrome entirely.
     let url;
     if(isRemux){
+      if(decision.method==='direct_play') PLAYER.method='remux';
       PLAYER.offset=startSec;
-      url=remuxUrl(decision.play_url, null, startSec);
+      const base=decision.method==='direct_play'
+        ? `/api/v1/files/${fileId}/stream.mp4`
+        : decision.play_url;
+      url=remuxUrl(base, initialAudio, startSec);
       PLAYER.probeUrl=decision.play_url; armStall(startSec);
     } else { url=tok(decision.play_url); }
     video.src=url;
@@ -4878,7 +4894,7 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
 // has since been superseded must not attach, or two hls.js instances end up
 // pulling two server sessions at once. Returns false when it bailed.
 async function startCopyHls(v, startSec, live){
-  const track=PLAYER.audio[PLAYER.curAudio]; const aidx=track?track.index:0;
+  const aidx=selectedAudioIndex(PLAYER);
   const info=await openSession(PLAYER.fileId,{copy:true,aac:!!PLAYER.transcodeAudio,
     preserve_dolby_vision:!!PLAYER.preserveDolbyVision,start:startSec||0,audio:aidx,
     audio_offset_ms:PLAYER.aoffset||0});
@@ -5725,7 +5741,7 @@ async function startTranscodeFallback(reason, note){
   // both arrive here meaning something else entirely.
   if(reason==="stream-rejected") me.refusedOriginal=true;
   teardownHls();
-  let info; try{ info=await openSession(me.fileId,transcodeOpts(startSec));}catch(e){ if(live()){ setLoading(false); toast(e.message); } return; }
+  let info; try{ info=await openSession(me.fileId,transcodeOpts(startSec,selectedAudioIndex(me)));}catch(e){ if(live()){ setLoading(false); toast(e.message); } return; }
   if(!live()) return;   // closed the player, or seeked / switched audio meanwhile
   me.method='transcode'; me.copyHls=false;
   // A silent switch is a lie of omission. Without this the overlay keeps the
@@ -7504,9 +7520,9 @@ function librariesPanel(libs,status,settings){
       <table><thead><tr><th>Name</th><th>Kind</th><th>Paths</th><th>Status</th><th></th></tr></thead>
       <tbody>${rows}</tbody></table>
       <h2 class="section">Add library</h2>
-      <div class="row"><input id="ln" placeholder="Name" style="max-width:180px">
+      <div class="row"><input id="ln" placeholder="Name" aria-label="Library name" style="max-width:180px">
         <select id="lk" style="max-width:170px"><option value="movies">Movies</option><option value="shows">TV Shows</option><option value="anime">Anime</option><option value="home">Home videos &amp; photos</option></select>
-        <input id="lp" placeholder="/path/to/media (comma-separated)"></div>
+        <input id="lp" placeholder="/path/to/media (comma-separated)" aria-label="Media paths"></div>
       <div class="hint">Paths are as the <b>server process</b> sees them — running in Docker, that's the path inside the container (e.g. <code>/media/movies</code>), which must be mounted in your compose file.</div>
       <div class="err" id="lerr"></div>
       <button style="margin-top:12px" onclick="addLib()">Add & scan</button>

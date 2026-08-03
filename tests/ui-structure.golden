@@ -55,7 +55,7 @@ classic|activity@1280x860|dom|div.card > p.muted[text]|1
 classic|activity@1280x860|dom|div.topctl > div|4
 classic|activity@1280x860|dom|header.top > a.logo[text]|1
 classic|activity@1280x860|dom|header.top > div.topctl|1
-classic|activity@1280x860|dom|header.top > input#q.search|1
+classic|activity@1280x860|dom|header.top > input#q.search[aria-label=*]|1
 classic|activity@1280x860|dom|header.top > nav|1
 classic|activity@1280x860|dom|header.top > span#activity.activity|1
 classic|activity@1280x860|dom|header.top > span.spacer|1
@@ -70,7 +70,7 @@ classic|activity@1280x860|focus|000|a.logo "cinemarr"
 classic|activity@1280x860|focus|001|a "home"
 classic|activity@1280x860|focus|002|a.active "activity"
 classic|activity@1280x860|focus|003|a "settings"
-classic|activity@1280x860|focus|004|input#q.search "Search…"
+classic|activity@1280x860|focus|004|input#q.search "Search cinemarr"
 classic|activity@1280x860|focus|005|button.ghost.sm "Theme"
 classic|activity@1280x860|focus|006|button.ghost.sm "Light / dark"
 classic|activity@1280x860|focus|007|button.ghost.sm.sizebtn "Icon size"
@@ -102,7 +102,7 @@ classic|activity@390x780|dom|div.card > p.muted[text]|1
 classic|activity@390x780|dom|div.topctl > div|4
 classic|activity@390x780|dom|header.top > a.logo[text]|1
 classic|activity@390x780|dom|header.top > div.topctl|1
-classic|activity@390x780|dom|header.top > input#q.search|1
+classic|activity@390x780|dom|header.top > input#q.search[aria-label=*]|1
 classic|activity@390x780|dom|header.top > nav|1
 classic|activity@390x780|dom|header.top > span#activity.activity|1
 classic|activity@390x780|dom|header.top > span.spacer|1
@@ -117,7 +117,7 @@ classic|activity@390x780|focus|000|a.logo "cinemarr"
 classic|activity@390x780|focus|001|a "home"
 classic|activity@390x780|focus|002|a.active "activity"
 classic|activity@390x780|focus|003|a "settings"
-classic|activity@390x780|focus|004|input#q.search "Search…"
+classic|activity@390x780|focus|004|input#q.search "Search cinemarr"
 classic|activity@390x780|focus|005|button.ghost.sm "Theme"
 classic|activity@390x780|focus|006|button.ghost.sm "Light / dark"
 classic|activity@390x780|focus|007|button.ghost.sm.sizebtn "Icon size"
@@ -221,7 +221,7 @@ classic|category@1280x860|dom|div.s > span.stxt[text]|4
 classic|category@1280x860|dom|div.topctl > div|4
 classic|category@1280x860|dom|header.top > a.logo[text]|1
 classic|category@1280x860|dom|header.top > div.topctl|1
-classic|category@1280x860|dom|header.top > input#q.search|1
+classic|category@1280x860|dom|header.top > input#q.search[aria-label=*]|1
 classic|category@1280x860|dom|header.top > nav|1
 classic|category@1280x860|dom|header.top > span#activity.activity|1
 classic|category@1280x860|dom|header.top > span.spacer|1
@@ -238,7 +238,7 @@ classic|category@1280x860|focus|000|a.logo "cinemarr"
 classic|category@1280x860|focus|001|a.active "home"
 classic|category@1280x860|focus|002|a "activity"
 classic|category@1280x860|focus|003|a "settings"
-classic|category@1280x860|focus|004|input#q.search "Search…"
+classic|category@1280x860|focus|004|input#q.search "Search cinemarr"
 classic|category@1280x860|focus|005|button.ghost.sm "Theme"
 classic|category@1280x860|focus|006|button.ghost.sm "Light / dark"
 classic|category@1280x860|focus|007|button.ghost.sm.sizebtn "Icon size"
@@ -306,7 +306,7 @@ classic|category@390x780|dom|div.s > span.stxt[text]|4
 classic|category@390x780|dom|div.topctl > div|4
 classic|category@390x780|dom|header.top > a.logo[text]|1
 classic|category@390x780|dom|header.top > div.topctl|1
-classic|category@390x780|dom|header.top > input#q.search|1
+classic|category@390x780|dom|header.top > input#q.search[aria-label=*]|1
 classic|category@390x780|dom|header.top > nav|1
 classic|category@390x780|dom|header.top > span#activity.activity|1
 classic|category@390x780|dom|header.top > span.spacer|1
@@ -323,7 +323,7 @@ classic|category@390x780|focus|000|a.logo "cinemarr"
 classic|category@390x780|focus|001|a.active "home"
 classic|category@390x780|focus|002|a "activity"
 classic|category@390x780|focus|003|a "settings"
-classic|category@390x780|focus|004|input#q.search "Search…"
+classic|category@390x780|focus|004|input#q.search "Search cinemarr"
 classic|category@390x780|focus|005|button.ghost.sm "Theme"
 classic|category@390x780|focus|006|button.ghost.sm "Light / dark"
 classic|category@390x780|focus|007|button.ghost.sm.sizebtn "Icon size"
@@ -396,7 +396,7 @@ classic|home@1280x860|dom|div.topctl > div|4
 classic|home@1280x860|dom|h2.section[text] > a.muted[text]|2
 classic|home@1280x860|dom|header.top > a.logo[text]|1
 classic|home@1280x860|dom|header.top > div.topctl|1
-classic|home@1280x860|dom|header.top > input#q.search|1
+classic|home@1280x860|dom|header.top > input#q.search[aria-label=*]|1
 classic|home@1280x860|dom|header.top > nav|1
 classic|home@1280x860|dom|header.top > span#activity.activity|1
 classic|home@1280x860|dom|header.top > span.spacer|1
@@ -412,7 +412,7 @@ classic|home@1280x860|focus|000|a.logo "cinemarr"
 classic|home@1280x860|focus|001|a.active "home"
 classic|home@1280x860|focus|002|a "activity"
 classic|home@1280x860|focus|003|a "settings"
-classic|home@1280x860|focus|004|input#q.search "Search…"
+classic|home@1280x860|focus|004|input#q.search "Search cinemarr"
 classic|home@1280x860|focus|005|button.ghost.sm "Theme"
 classic|home@1280x860|focus|006|button.ghost.sm "Light / dark"
 classic|home@1280x860|focus|007|button.ghost.sm.sizebtn "Icon size"
@@ -485,7 +485,7 @@ classic|home@390x780|dom|div.topctl > div|4
 classic|home@390x780|dom|h2.section[text] > a.muted[text]|2
 classic|home@390x780|dom|header.top > a.logo[text]|1
 classic|home@390x780|dom|header.top > div.topctl|1
-classic|home@390x780|dom|header.top > input#q.search|1
+classic|home@390x780|dom|header.top > input#q.search[aria-label=*]|1
 classic|home@390x780|dom|header.top > nav|1
 classic|home@390x780|dom|header.top > span#activity.activity|1
 classic|home@390x780|dom|header.top > span.spacer|1
@@ -502,7 +502,7 @@ classic|home@390x780|focus|000|a.logo "cinemarr"
 classic|home@390x780|focus|001|a.active "home"
 classic|home@390x780|focus|002|a "activity"
 classic|home@390x780|focus|003|a "settings"
-classic|home@390x780|focus|004|input#q.search "Search…"
+classic|home@390x780|focus|004|input#q.search "Search cinemarr"
 classic|home@390x780|focus|005|button.ghost.sm "Theme"
 classic|home@390x780|focus|006|button.ghost.sm "Light / dark"
 classic|home@390x780|focus|007|button.ghost.sm.sizebtn "Icon size"
@@ -567,7 +567,7 @@ classic|item@1280x860|dom|dl.specs > dt[text]|3
 classic|item@1280x860|dom|h1[text] > button.ghost.sm[aria-label=* text]|1
 classic|item@1280x860|dom|header.top > a.logo[text]|1
 classic|item@1280x860|dom|header.top > div.topctl|1
-classic|item@1280x860|dom|header.top > input#q.search|1
+classic|item@1280x860|dom|header.top > input#q.search[aria-label=*]|1
 classic|item@1280x860|dom|header.top > nav|1
 classic|item@1280x860|dom|header.top > span#activity.activity|1
 classic|item@1280x860|dom|header.top > span.spacer|1
@@ -582,7 +582,7 @@ classic|item@1280x860|focus|000|a.logo "cinemarr"
 classic|item@1280x860|focus|001|a.active "home"
 classic|item@1280x860|focus|002|a "activity"
 classic|item@1280x860|focus|003|a "settings"
-classic|item@1280x860|focus|004|input#q.search "Search…"
+classic|item@1280x860|focus|004|input#q.search "Search cinemarr"
 classic|item@1280x860|focus|005|button.ghost.sm "Theme"
 classic|item@1280x860|focus|006|button.ghost.sm "Light / dark"
 classic|item@1280x860|focus|007|button.ghost.sm.sizebtn "Icon size"
@@ -647,7 +647,7 @@ classic|item@390x780|dom|dl.specs > dt[text]|3
 classic|item@390x780|dom|h1[text] > button.ghost.sm[aria-label=* text]|1
 classic|item@390x780|dom|header.top > a.logo[text]|1
 classic|item@390x780|dom|header.top > div.topctl|1
-classic|item@390x780|dom|header.top > input#q.search|1
+classic|item@390x780|dom|header.top > input#q.search[aria-label=*]|1
 classic|item@390x780|dom|header.top > nav|1
 classic|item@390x780|dom|header.top > span#activity.activity|1
 classic|item@390x780|dom|header.top > span.spacer|1
@@ -662,7 +662,7 @@ classic|item@390x780|focus|000|a.logo "cinemarr"
 classic|item@390x780|focus|001|a.active "home"
 classic|item@390x780|focus|002|a "activity"
 classic|item@390x780|focus|003|a "settings"
-classic|item@390x780|focus|004|input#q.search "Search…"
+classic|item@390x780|focus|004|input#q.search "Search cinemarr"
 classic|item@390x780|focus|005|button.ghost.sm "Theme"
 classic|item@390x780|focus|006|button.ghost.sm "Light / dark"
 classic|item@390x780|focus|007|button.ghost.sm.sizebtn "Icon size"
@@ -728,7 +728,7 @@ classic|library@1280x860|dom|div.s > span.stxt[text]|2
 classic|library@1280x860|dom|div.topctl > div|4
 classic|library@1280x860|dom|header.top > a.logo[text]|1
 classic|library@1280x860|dom|header.top > div.topctl|1
-classic|library@1280x860|dom|header.top > input#q.search|1
+classic|library@1280x860|dom|header.top > input#q.search[aria-label=*]|1
 classic|library@1280x860|dom|header.top > nav|1
 classic|library@1280x860|dom|header.top > span#activity.activity|1
 classic|library@1280x860|dom|header.top > span.spacer|1
@@ -745,7 +745,7 @@ classic|library@1280x860|focus|000|a.logo "cinemarr"
 classic|library@1280x860|focus|001|a.active "home"
 classic|library@1280x860|focus|002|a "activity"
 classic|library@1280x860|focus|003|a "settings"
-classic|library@1280x860|focus|004|input#q.search "Search…"
+classic|library@1280x860|focus|004|input#q.search "Search cinemarr"
 classic|library@1280x860|focus|005|button.ghost.sm "Theme"
 classic|library@1280x860|focus|006|button.ghost.sm "Light / dark"
 classic|library@1280x860|focus|007|button.ghost.sm.sizebtn "Icon size"
@@ -812,7 +812,7 @@ classic|library@390x780|dom|div.s > span.stxt[text]|2
 classic|library@390x780|dom|div.topctl > div|4
 classic|library@390x780|dom|header.top > a.logo[text]|1
 classic|library@390x780|dom|header.top > div.topctl|1
-classic|library@390x780|dom|header.top > input#q.search|1
+classic|library@390x780|dom|header.top > input#q.search[aria-label=*]|1
 classic|library@390x780|dom|header.top > nav|1
 classic|library@390x780|dom|header.top > span#activity.activity|1
 classic|library@390x780|dom|header.top > span.spacer|1
@@ -829,7 +829,7 @@ classic|library@390x780|focus|000|a.logo "cinemarr"
 classic|library@390x780|focus|001|a.active "home"
 classic|library@390x780|focus|002|a "activity"
 classic|library@390x780|focus|003|a "settings"
-classic|library@390x780|focus|004|input#q.search "Search…"
+classic|library@390x780|focus|004|input#q.search "Search cinemarr"
 classic|library@390x780|focus|005|button.ghost.sm "Theme"
 classic|library@390x780|focus|006|button.ghost.sm "Light / dark"
 classic|library@390x780|focus|007|button.ghost.sm.sizebtn "Icon size"
@@ -941,7 +941,7 @@ classic|player@1280x860|dom|dl.specs > dt[text]|3
 classic|player@1280x860|dom|h1[text] > button.ghost.sm[aria-label=* text]|1
 classic|player@1280x860|dom|header.top > a.logo[text]|1
 classic|player@1280x860|dom|header.top > div.topctl|1
-classic|player@1280x860|dom|header.top > input#q.search|1
+classic|player@1280x860|dom|header.top > input#q.search[aria-label=*]|1
 classic|player@1280x860|dom|header.top > nav|1
 classic|player@1280x860|dom|header.top > span#activity.activity|1
 classic|player@1280x860|dom|header.top > span.spacer|1
@@ -958,7 +958,7 @@ classic|player@1280x860|focus|001|button#qualbtn.pbtn "Playback quality"
 classic|player@1280x860|focus|002|button#syncbtn.pbtn "Audio sync adjustment"
 classic|player@1280x860|focus|003|button#statsbtn.pbtn "Playback info (i)"
 classic|player@1280x860|focus|004|button#skipbtn.pbtn "Auto-skip intro & credits"
-classic|player@1280x860|focus|005|button#autonextbtn.pbtn.on "Auto-play the next episode when 
+classic|player@1280x860|focus|005|button#autonextbtn.pbtn.on "Auto-play the next episode when
 classic|player@1280x860|focus|006|button.pbtn "Close (Esc)"
 classic|player@1280x860|focus|007|button#pbplay.picon "Play"
 classic|player@1280x860|focus|008|button.picon.nudge "Back 10 seconds"
@@ -1070,7 +1070,7 @@ classic|player@390x780|dom|dl.specs > dt[text]|3
 classic|player@390x780|dom|h1[text] > button.ghost.sm[aria-label=* text]|1
 classic|player@390x780|dom|header.top > a.logo[text]|1
 classic|player@390x780|dom|header.top > div.topctl|1
-classic|player@390x780|dom|header.top > input#q.search|1
+classic|player@390x780|dom|header.top > input#q.search[aria-label=*]|1
 classic|player@390x780|dom|header.top > nav|1
 classic|player@390x780|dom|header.top > span#activity.activity|1
 classic|player@390x780|dom|header.top > span.spacer|1
@@ -1087,7 +1087,7 @@ classic|player@390x780|focus|001|button#qualbtn.pbtn "Playback quality"
 classic|player@390x780|focus|002|button#syncbtn.pbtn "Audio sync adjustment"
 classic|player@390x780|focus|003|button#statsbtn.pbtn "Playback info (i)"
 classic|player@390x780|focus|004|button#skipbtn.pbtn "Auto-skip intro & credits"
-classic|player@390x780|focus|005|button#autonextbtn.pbtn.on "Auto-play the next episode when 
+classic|player@390x780|focus|005|button#autonextbtn.pbtn.on "Auto-play the next episode when
 classic|player@390x780|focus|006|button.pbtn "Close (Esc)"
 classic|player@390x780|focus|007|button#pbplay.picon "Play"
 classic|player@390x780|focus|008|div#pseek.pseek "Seek"
@@ -1140,7 +1140,7 @@ classic|search@1280x860|dom|div.s > span.stxt[text]|3
 classic|search@1280x860|dom|div.topctl > div|4
 classic|search@1280x860|dom|header.top > a.logo[text]|1
 classic|search@1280x860|dom|header.top > div.topctl|1
-classic|search@1280x860|dom|header.top > input#q.search|1
+classic|search@1280x860|dom|header.top > input#q.search[aria-label=*]|1
 classic|search@1280x860|dom|header.top > nav|1
 classic|search@1280x860|dom|header.top > span#activity.activity|1
 classic|search@1280x860|dom|header.top > span.spacer|1
@@ -1153,7 +1153,7 @@ classic|search@1280x860|focus|000|a.logo "cinemarr"
 classic|search@1280x860|focus|001|a.active "home"
 classic|search@1280x860|focus|002|a "activity"
 classic|search@1280x860|focus|003|a "settings"
-classic|search@1280x860|focus|004|input#q.search "Search…"
+classic|search@1280x860|focus|004|input#q.search "Search cinemarr"
 classic|search@1280x860|focus|005|button.ghost.sm "Theme"
 classic|search@1280x860|focus|006|button.ghost.sm "Light / dark"
 classic|search@1280x860|focus|007|button.ghost.sm.sizebtn "Icon size"
@@ -1202,7 +1202,7 @@ classic|search@390x780|dom|div.s > span.stxt[text]|3
 classic|search@390x780|dom|div.topctl > div|4
 classic|search@390x780|dom|header.top > a.logo[text]|1
 classic|search@390x780|dom|header.top > div.topctl|1
-classic|search@390x780|dom|header.top > input#q.search|1
+classic|search@390x780|dom|header.top > input#q.search[aria-label=*]|1
 classic|search@390x780|dom|header.top > nav|1
 classic|search@390x780|dom|header.top > span#activity.activity|1
 classic|search@390x780|dom|header.top > span.spacer|1
@@ -1215,7 +1215,7 @@ classic|search@390x780|focus|000|a.logo "cinemarr"
 classic|search@390x780|focus|001|a.active "home"
 classic|search@390x780|focus|002|a "activity"
 classic|search@390x780|focus|003|a "settings"
-classic|search@390x780|focus|004|input#q.search "Search…"
+classic|search@390x780|focus|004|input#q.search "Search cinemarr"
 classic|search@390x780|focus|005|button.ghost.sm "Theme"
 classic|search@390x780|focus|006|button.ghost.sm "Light / dark"
 classic|search@390x780|focus|007|button.ghost.sm.sizebtn "Icon size"
@@ -1257,8 +1257,8 @@ classic|settings@1280x860|dom|div.hint[text] > b[text]|8
 classic|settings@1280x860|dom|div.hint[text] > code[text]|1
 classic|settings@1280x860|dom|div.paths > span.pathchip[text]|3
 classic|settings@1280x860|dom|div.row > button.ghost.sm[text]|2
-classic|settings@1280x860|dom|div.row > input#ln|1
-classic|settings@1280x860|dom|div.row > input#lp|1
+classic|settings@1280x860|dom|div.row > input#ln[aria-label=*]|1
+classic|settings@1280x860|dom|div.row > input#lp[aria-label=*]|1
 classic|settings@1280x860|dom|div.row > select#lk|1
 classic|settings@1280x860|dom|div.row > span.muted[text]|1
 classic|settings@1280x860|dom|div.row.setrow > button.ghost.sm[text]|2
@@ -1272,7 +1272,7 @@ classic|settings@1280x860|dom|div.setwarn[text] > b[text]|2
 classic|settings@1280x860|dom|div.topctl > div|4
 classic|settings@1280x860|dom|header.top > a.logo[text]|1
 classic|settings@1280x860|dom|header.top > div.topctl|1
-classic|settings@1280x860|dom|header.top > input#q.search|1
+classic|settings@1280x860|dom|header.top > input#q.search[aria-label=*]|1
 classic|settings@1280x860|dom|header.top > nav|1
 classic|settings@1280x860|dom|header.top > span#activity.activity|1
 classic|settings@1280x860|dom|header.top > span.spacer|1
@@ -1341,7 +1341,7 @@ classic|settings@1280x860|focus|000|a.logo "cinemarr"
 classic|settings@1280x860|focus|001|a "home"
 classic|settings@1280x860|focus|002|a "activity"
 classic|settings@1280x860|focus|003|a.active "settings"
-classic|settings@1280x860|focus|004|input#q.search "Search…"
+classic|settings@1280x860|focus|004|input#q.search "Search cinemarr"
 classic|settings@1280x860|focus|005|button.ghost.sm "Theme"
 classic|settings@1280x860|focus|006|button.ghost.sm "Light / dark"
 classic|settings@1280x860|focus|007|button.ghost.sm.sizebtn "Icon size"
@@ -1374,9 +1374,9 @@ classic|settings@1280x860|focus|033|button.ghost.sm "Scan"
 classic|settings@1280x860|focus|034|button.ghost.sm "Re-fetch all metadata & artwork (incl. seas
 classic|settings@1280x860|focus|035|button.ghost.sm "Edit"
 classic|settings@1280x860|focus|036|button.ghost.sm "Delete"
-classic|settings@1280x860|focus|037|input#ln "Name"
+classic|settings@1280x860|focus|037|input#ln "Library name"
 classic|settings@1280x860|focus|038|select#lk "Movies TV Shows Anime Home videos & photos"
-classic|settings@1280x860|focus|039|input#lp "<path> (comma-separated)"
+classic|settings@1280x860|focus|039|input#lp "Media paths"
 classic|settings@1280x860|focus|040|button "Add & scan"
 classic|settings@1280x860|focus|041|select#job-probe "Re-run ffprobe on files whose media detail
 classic|settings@1280x860|focus|042|select#job-art "Re-fetch posters for items a provider matche
@@ -1426,8 +1426,8 @@ classic|settings@390x780|dom|div.hint[text] > b[text]|8
 classic|settings@390x780|dom|div.hint[text] > code[text]|1
 classic|settings@390x780|dom|div.paths > span.pathchip[text]|3
 classic|settings@390x780|dom|div.row > button.ghost.sm[text]|2
-classic|settings@390x780|dom|div.row > input#ln|1
-classic|settings@390x780|dom|div.row > input#lp|1
+classic|settings@390x780|dom|div.row > input#ln[aria-label=*]|1
+classic|settings@390x780|dom|div.row > input#lp[aria-label=*]|1
 classic|settings@390x780|dom|div.row > select#lk|1
 classic|settings@390x780|dom|div.row > span.muted[text]|1
 classic|settings@390x780|dom|div.row.setrow > button.ghost.sm[text]|2
@@ -1441,7 +1441,7 @@ classic|settings@390x780|dom|div.setwarn[text] > b[text]|2
 classic|settings@390x780|dom|div.topctl > div|4
 classic|settings@390x780|dom|header.top > a.logo[text]|1
 classic|settings@390x780|dom|header.top > div.topctl|1
-classic|settings@390x780|dom|header.top > input#q.search|1
+classic|settings@390x780|dom|header.top > input#q.search[aria-label=*]|1
 classic|settings@390x780|dom|header.top > nav|1
 classic|settings@390x780|dom|header.top > span#activity.activity|1
 classic|settings@390x780|dom|header.top > span.spacer|1
@@ -1510,7 +1510,7 @@ classic|settings@390x780|focus|000|a.logo "cinemarr"
 classic|settings@390x780|focus|001|a "home"
 classic|settings@390x780|focus|002|a "activity"
 classic|settings@390x780|focus|003|a.active "settings"
-classic|settings@390x780|focus|004|input#q.search "Search…"
+classic|settings@390x780|focus|004|input#q.search "Search cinemarr"
 classic|settings@390x780|focus|005|button.ghost.sm "Theme"
 classic|settings@390x780|focus|006|button.ghost.sm "Light / dark"
 classic|settings@390x780|focus|007|button.ghost.sm.sizebtn "Icon size"
@@ -1543,9 +1543,9 @@ classic|settings@390x780|focus|033|button.ghost.sm "Scan"
 classic|settings@390x780|focus|034|button.ghost.sm "Re-fetch all metadata & artwork (incl. seas
 classic|settings@390x780|focus|035|button.ghost.sm "Edit"
 classic|settings@390x780|focus|036|button.ghost.sm "Delete"
-classic|settings@390x780|focus|037|input#ln "Name"
+classic|settings@390x780|focus|037|input#ln "Library name"
 classic|settings@390x780|focus|038|select#lk "Movies TV Shows Anime Home videos & photos"
-classic|settings@390x780|focus|039|input#lp "<path> (comma-separated)"
+classic|settings@390x780|focus|039|input#lp "Media paths"
 classic|settings@390x780|focus|040|button "Add & scan"
 classic|settings@390x780|focus|041|select#job-probe "Re-run ffprobe on files whose media detail
 classic|settings@390x780|focus|042|select#job-art "Re-fetch posters for items a provider matche
@@ -2909,7 +2909,7 @@ plex|player@1280x860|focus|001|button#qualbtn.pbtn "Playback quality"
 plex|player@1280x860|focus|002|button#syncbtn.pbtn "Audio sync adjustment"
 plex|player@1280x860|focus|003|button#statsbtn.pbtn "Playback info (i)"
 plex|player@1280x860|focus|004|button#skipbtn.pbtn "Auto-skip intro & credits"
-plex|player@1280x860|focus|005|button#autonextbtn.pbtn.on "Auto-play the next episode when 
+plex|player@1280x860|focus|005|button#autonextbtn.pbtn.on "Auto-play the next episode when
 plex|player@1280x860|focus|006|button.pbtn "Close (Esc)"
 plex|player@1280x860|focus|007|button#pbplay.picon "Play"
 plex|player@1280x860|focus|008|button.picon.nudge "Back 10 seconds"
@@ -3071,7 +3071,7 @@ plex|player@390x780|focus|005|button#qualbtn.pbtn "Playback quality"
 plex|player@390x780|focus|006|button#syncbtn.pbtn "Audio sync adjustment"
 plex|player@390x780|focus|007|button#statsbtn.pbtn "Playback info (i)"
 plex|player@390x780|focus|008|button#skipbtn.pbtn "Auto-skip intro & credits"
-plex|player@390x780|focus|009|button#autonextbtn.pbtn.on "Auto-play the next episode when 
+plex|player@390x780|focus|009|button#autonextbtn.pbtn.on "Auto-play the next episode when
 plex|player@390x780|focus|010|button.pbtn "Close (Esc)"
 plex|player@390x780|focus|011|button#pbplay.picon "Play"
 plex|player@390x780|focus|012|div#pseek.pseek "Seek"
@@ -3321,8 +3321,8 @@ plex|settings@1280x860|dom|div.px-pop > div#sizemenu.amenu|1
 plex|settings@1280x860|dom|div.px-pop > div#thememenu.amenu|1
 plex|settings@1280x860|dom|div.px-user > div.px-pop|1
 plex|settings@1280x860|dom|div.row > button.ghost.sm[text]|2
-plex|settings@1280x860|dom|div.row > input#ln|1
-plex|settings@1280x860|dom|div.row > input#lp|1
+plex|settings@1280x860|dom|div.row > input#ln[aria-label=*]|1
+plex|settings@1280x860|dom|div.row > input#lp[aria-label=*]|1
 plex|settings@1280x860|dom|div.row > select#lk|1
 plex|settings@1280x860|dom|div.row > span.muted[text]|1
 plex|settings@1280x860|dom|div.row.setrow > button.ghost.sm[text]|2
@@ -3437,9 +3437,9 @@ plex|settings@1280x860|focus|033|button.ghost.sm "Scan"
 plex|settings@1280x860|focus|034|button.ghost.sm "Re-fetch all metadata & artwork (incl. seas
 plex|settings@1280x860|focus|035|button.ghost.sm "Edit"
 plex|settings@1280x860|focus|036|button.ghost.sm "Delete"
-plex|settings@1280x860|focus|037|input#ln "Name"
+plex|settings@1280x860|focus|037|input#ln "Library name"
 plex|settings@1280x860|focus|038|select#lk "Movies TV Shows Anime Home videos & photos"
-plex|settings@1280x860|focus|039|input#lp "<path> (comma-separated)"
+plex|settings@1280x860|focus|039|input#lp "Media paths"
 plex|settings@1280x860|focus|040|button "Add & scan"
 plex|settings@1280x860|focus|041|select#job-probe "Re-run ffprobe on files whose media detail
 plex|settings@1280x860|focus|042|select#job-art "Re-fetch posters for items a provider matche
@@ -3516,8 +3516,8 @@ plex|settings@390x780|dom|div.px-pop > div#sizemenu.amenu|1
 plex|settings@390x780|dom|div.px-pop > div#thememenu.amenu|1
 plex|settings@390x780|dom|div.px-user > div.px-pop|1
 plex|settings@390x780|dom|div.row > button.ghost.sm[text]|2
-plex|settings@390x780|dom|div.row > input#ln|1
-plex|settings@390x780|dom|div.row > input#lp|1
+plex|settings@390x780|dom|div.row > input#ln[aria-label=*]|1
+plex|settings@390x780|dom|div.row > input#lp[aria-label=*]|1
 plex|settings@390x780|dom|div.row > select#lk|1
 plex|settings@390x780|dom|div.row > span.muted[text]|1
 plex|settings@390x780|dom|div.row.setrow > button.ghost.sm[text]|2
@@ -3629,9 +3629,9 @@ plex|settings@390x780|focus|030|button.ghost.sm "Scan"
 plex|settings@390x780|focus|031|button.ghost.sm "Re-fetch all metadata & artwork (incl. seas
 plex|settings@390x780|focus|032|button.ghost.sm "Edit"
 plex|settings@390x780|focus|033|button.ghost.sm "Delete"
-plex|settings@390x780|focus|034|input#ln "Name"
+plex|settings@390x780|focus|034|input#ln "Library name"
 plex|settings@390x780|focus|035|select#lk "Movies TV Shows Anime Home videos & photos"
-plex|settings@390x780|focus|036|input#lp "<path> (comma-separated)"
+plex|settings@390x780|focus|036|input#lp "Media paths"
 plex|settings@390x780|focus|037|button "Add & scan"
 plex|settings@390x780|focus|038|select#job-probe "Re-run ffprobe on files whose media detail
 plex|settings@390x780|focus|039|select#job-art "Re-fetch posters for items a provider matche
@@ -4672,7 +4672,7 @@ theater|player@1280x860|focus|001|button#qualbtn.pbtn "Playback quality"
 theater|player@1280x860|focus|002|button#syncbtn.pbtn "Audio sync adjustment"
 theater|player@1280x860|focus|003|button#statsbtn.pbtn "Playback info (i)"
 theater|player@1280x860|focus|004|button#skipbtn.pbtn "Auto-skip intro & credits"
-theater|player@1280x860|focus|005|button#autonextbtn.pbtn.on "Auto-play the next episode when 
+theater|player@1280x860|focus|005|button#autonextbtn.pbtn.on "Auto-play the next episode when
 theater|player@1280x860|focus|006|button.pbtn "Close (Esc)"
 theater|player@1280x860|focus|007|button#pbplay.picon "Play"
 theater|player@1280x860|focus|008|button.picon.nudge "Back 10 seconds"
@@ -4808,7 +4808,7 @@ theater|player@390x780|focus|004|button#qualbtn.pbtn "Playback quality"
 theater|player@390x780|focus|005|button#syncbtn.pbtn "Audio sync adjustment"
 theater|player@390x780|focus|006|button#statsbtn.pbtn "Playback info (i)"
 theater|player@390x780|focus|007|button#skipbtn.pbtn "Auto-skip intro & credits"
-theater|player@390x780|focus|008|button#autonextbtn.pbtn.on "Auto-play the next episode when 
+theater|player@390x780|focus|008|button#autonextbtn.pbtn.on "Auto-play the next episode when
 theater|player@390x780|focus|009|button.pbtn "Close (Esc)"
 theater|player@390x780|focus|010|button#pbplay.picon "Play"
 theater|player@390x780|focus|011|div#pseek.pseek "Seek"
@@ -4979,8 +4979,8 @@ theater|settings@1280x860|dom|div.hint[text] > b[text]|8
 theater|settings@1280x860|dom|div.hint[text] > code[text]|1
 theater|settings@1280x860|dom|div.paths > span.pathchip[text]|3
 theater|settings@1280x860|dom|div.row > button.ghost.sm[text]|2
-theater|settings@1280x860|dom|div.row > input#ln|1
-theater|settings@1280x860|dom|div.row > input#lp|1
+theater|settings@1280x860|dom|div.row > input#ln[aria-label=*]|1
+theater|settings@1280x860|dom|div.row > input#lp[aria-label=*]|1
 theater|settings@1280x860|dom|div.row > select#lk|1
 theater|settings@1280x860|dom|div.row > span.muted[text]|1
 theater|settings@1280x860|dom|div.row.setrow > button.ghost.sm[text]|2
@@ -5106,9 +5106,9 @@ theater|settings@1280x860|focus|033|button.ghost.sm "Scan"
 theater|settings@1280x860|focus|034|button.ghost.sm "Re-fetch all metadata & artwork (incl. seas
 theater|settings@1280x860|focus|035|button.ghost.sm "Edit"
 theater|settings@1280x860|focus|036|button.ghost.sm "Delete"
-theater|settings@1280x860|focus|037|input#ln "Name"
+theater|settings@1280x860|focus|037|input#ln "Library name"
 theater|settings@1280x860|focus|038|select#lk "Movies TV Shows Anime Home videos & photos"
-theater|settings@1280x860|focus|039|input#lp "<path> (comma-separated)"
+theater|settings@1280x860|focus|039|input#lp "Media paths"
 theater|settings@1280x860|focus|040|button "Add & scan"
 theater|settings@1280x860|focus|041|select#job-probe "Re-run ffprobe on files whose media detail
 theater|settings@1280x860|focus|042|select#job-art "Re-fetch posters for items a provider matche
@@ -5151,8 +5151,8 @@ theater|settings@390x780|dom|div.hint[text] > b[text]|8
 theater|settings@390x780|dom|div.hint[text] > code[text]|1
 theater|settings@390x780|dom|div.paths > span.pathchip[text]|3
 theater|settings@390x780|dom|div.row > button.ghost.sm[text]|2
-theater|settings@390x780|dom|div.row > input#ln|1
-theater|settings@390x780|dom|div.row > input#lp|1
+theater|settings@390x780|dom|div.row > input#ln[aria-label=*]|1
+theater|settings@390x780|dom|div.row > input#lp[aria-label=*]|1
 theater|settings@390x780|dom|div.row > select#lk|1
 theater|settings@390x780|dom|div.row > span.muted[text]|1
 theater|settings@390x780|dom|div.row.setrow > button.ghost.sm[text]|2
@@ -5275,9 +5275,9 @@ theater|settings@390x780|focus|030|button.ghost.sm "Scan"
 theater|settings@390x780|focus|031|button.ghost.sm "Re-fetch all metadata & artwork (incl. seas
 theater|settings@390x780|focus|032|button.ghost.sm "Edit"
 theater|settings@390x780|focus|033|button.ghost.sm "Delete"
-theater|settings@390x780|focus|034|input#ln "Name"
+theater|settings@390x780|focus|034|input#ln "Library name"
 theater|settings@390x780|focus|035|select#lk "Movies TV Shows Anime Home videos & photos"
-theater|settings@390x780|focus|036|input#lp "<path> (comma-separated)"
+theater|settings@390x780|focus|036|input#lp "Media paths"
 theater|settings@390x780|focus|037|button "Add & scan"
 theater|settings@390x780|focus|038|select#job-probe "Re-run ffprobe on files whose media detail
 theater|settings@390x780|focus|039|select#job-art "Re-fetch posters for items a provider matche

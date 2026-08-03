@@ -32,23 +32,34 @@ open http://localhost:32400                  # first launch = setup screen
 
 ## 2. Day to day (development)
 
-All developer tasks go through the `Makefile` — CI runs the same targets, so
-"green locally" means "green in CI".
+All developer tasks go through the `Makefile`. The functionality-point runner
+composes those same targets and records which behavior contracts they cover.
 
 ```bash
 make            # list every target
 make run        # serve http://localhost:32400
-make check      # fmt-check + clippy + test  (the CI gate — the single quality bar)
+make check      # history + operations + catalog + Rust gate (mandatory baseline)
+make history-check # every corrective commit has current evidence
+make operations-check # deploy, CI, container, and ship contracts
+make validate-help # explain profiles, normal workflow, and the UI golden
+make validate-plan # show what the staged diff selects without running checks
+make validate-staged # validate only the staged change (normal local loop)
+make validate   # commit profile for every functionality point
+make validate-full # browser + client + packaging checks where tools exist
 make test       # just the tests
 make coverage   # line coverage via cargo-llvm-cov → lcov.info
-make hooks      # install a pre-commit hook that runs `make check`
+make hooks      # validate points selected by each staged commit
 make docker     # build the container image
 ```
 
-`make check` is the single source of truth: `make hooks` wires it into a
-pre-commit hook so a commit can't land unless it passes (bypass one commit with
-`git commit --no-verify`). Pushing a version tag (`git tag v0.1.0 && git push
---tags`) builds and publishes a multi-arch image to `ghcr.io/pjunod/plurx`.
+`make check` is the mandatory baseline inside every standard validation run.
+`make hooks` wires `make validate-staged` into pre-commit, so affected non-Rust
+surfaces receive their own checks too (bypass one commit with
+`git commit --no-verify`). [VALIDATION.md](VALIDATION.md) explains point
+selection, evidence, and why the UI “golden” is a reviewed structural answer
+key rather than a screenshot. Pushing a version tag
+(`git tag v0.1.0 && git push --tags`) builds and publishes a multi-arch image
+to `ghcr.io/pjunod/plurx`.
 
 ## 3. When something's off (quick triage)
 
@@ -66,6 +77,7 @@ stat -c '%g' /dev/dri/renderD128           # the render group id for group_add
 | Scan finds 0 files | The path isn't what the **server** sees — match the Docker mount |
 | Won't play, "file missing" | The share is unmounted; remount (plurx refuses a dead player on purpose) |
 | `pull access denied` | Build from source: `docker compose up -d --build` |
+| TCP 32400 already in use | `PLURX_HTTP_PORT=<n>` in `deploy/.env`; use that port in the client address |
 | GDM port conflict | `PLURX_GDM_PORT=<n>` (a running Plex owns 32414) |
 | Playback is software, you set `qsv` | Read `plurxd::transcode` logs; usually a `/dev/dri`/driver gap |
 

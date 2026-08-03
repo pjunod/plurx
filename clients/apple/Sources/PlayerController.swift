@@ -520,18 +520,17 @@ final class PlayerController: ObservableObject {
         } else {
             let copy = !forceTranscode
                 && (normalMode == "direct" || normalMode == "remux" || customAudio)
-            let chosenAudio = audioOverride
+            // The checkmark comes from `/decision`'s shared-policy pick. Carry
+            // that exact track into the initial session too: relying on an
+            // omitted audio field made copy-video HLS fall back to the muxer's
+            // first stream, so the UI could say English while Italian played.
+            // A viewer's later explicit choice remains the stronger value.
+            let chosenAudio = Self.sessionAudioIndex(
+                explicit: audioOverride,
+                selected: selectedAudio
+            )
             let aac = copy ? needsAAC(audioIndex: chosenAudio, decision: decision)
                 : nil
-            // AVPlayer rejects the server's multivariant wrapper around an
-            // otherwise valid HDR media playlist on physical Apple TV
-            // (CoreMedia -12927). Request the proven media-playlist shape for
-            // HDR sources. SDR keeps native HLS subtitle renditions; choosing
-            // a text subtitle on this HDR path falls back to the existing
-            // burn-in recovery instead of sacrificing playback entirely.
-            let nativeSubtitleMaster = Self.shouldRequestNativeSubtitleMaster(
-                sourceHDR: decision.source?.hdr
-            )
             let body = CreateSessionRequest(
                 playbackId: playbackId,
                 height: Self.burnSessionHeight(
@@ -543,7 +542,7 @@ final class PlayerController: ObservableObject {
                 start: Double(startMs) / 1000.0,
                 audio: chosenAudio,
                 subtitleBurn: burnSubtitle,
-                nativeSubtitles: nativeSubtitleMaster,
+                nativeSubtitles: true,
                 subtitle: nativeSubtitle,
                 copy: copy ? true : nil,
                 aac: copy ? aac : nil,
@@ -1169,6 +1168,12 @@ final class PlayerController: ObservableObject {
         Self.languageSpellings(code)
     }
 
+    /// The audio index an HLS session must carry. `selected` is the server's
+    /// automatic answer from `/decision`; `explicit` is a later viewer choice.
+    nonisolated static func sessionAudioIndex(explicit: Int?, selected: Int?) -> Int? {
+        explicit ?? selected
+    }
+
     /// Every spelling of a language preference AVFoundation might have to
     /// match, BCP-47 tag first. Derived from the shared alias table rather
     /// than a third private copy of it — the twelve-language copy this
@@ -1337,16 +1342,6 @@ final class PlayerController: ObservableObject {
         case .instant: return true
         case .onDemand: return subtitlesInUse
         }
-    }
-
-    /// Apple's HDR decoder accepts the session's media playlist directly but
-    /// rejects the same stream behind the native-subtitle multivariant master.
-    /// The server omits `hdr` for SDR; accepting the explicit legacy spelling
-    /// keeps this safe against older decision responses too.
-    nonisolated static func shouldRequestNativeSubtitleMaster(sourceHDR: String?) -> Bool {
-        guard let sourceHDR else { return true }
-        let normalized = sourceHDR.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return normalized.isEmpty || normalized == "sdr"
     }
 
     /// What one subtitle selection costs. A burn — or leaving one — replaces

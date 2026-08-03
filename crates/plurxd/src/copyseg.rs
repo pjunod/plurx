@@ -246,6 +246,10 @@ pub async fn run<R: AsyncRead + Unpin>(
 ) -> Outcome {
     let mut reader = FragmentReader::new();
     let mut out = SessionDir::new(dir, limits.publish_gate_secs);
+    // Hold the initialization segment until the first video sample arrives.
+    // ffmpeg may put HDR10's static SEIs only in that sample; Apple needs the
+    // same records in hvcC before it will accept a PQ HLS variant.
+    let mut pending_init: Option<(Init, fmp4::CutPolicy)> = None;
     let mut segmenter: Option<Segmenter> = None;
     let mut buf = vec![0u8; READ_CHUNK];
     let mut warned_memory = false;
@@ -323,14 +327,34 @@ pub async fn run<R: AsyncRead + Unpin>(
                         limits.max_seconds,
                         video_timescale,
                     );
-                    if let Err(e) = out.write_init(&init).await {
-                        return Outcome::Unsupported(format!("writing init.mp4: {e}"));
-                    }
-                    segmenter = Some(Segmenter::new(init, policy));
+                    pending_init = Some((init, policy));
                 }
                 Unit::Fragment(fragment) => {
+                    if segmenter.is_none() {
+                        let Some((mut init, policy)) = pending_init.take() else {
+                            return Outcome::Unsupported(
+                                "a fragment arrived before the moov".into(),
+                            );
+                        };
+                        match fmp4::promote_hdr10_static_metadata(&mut init, &fragment) {
+                            Ok(true) => tracing::info!(
+                                session = %session_id,
+                                "promoted HDR10 static metadata into the HLS init segment"
+                            ),
+                            Ok(false) => {}
+                            Err(e) => {
+                                return Outcome::Unsupported(format!(
+                                    "preparing the HLS init segment: {e}"
+                                ));
+                            }
+                        }
+                        if let Err(e) = out.write_init(&init).await {
+                            return Outcome::Unsupported(format!("writing init.mp4: {e}"));
+                        }
+                        segmenter = Some(Segmenter::new(init, policy));
+                    }
                     let Some(seg) = segmenter.as_mut() else {
-                        return Outcome::Unsupported("a fragment arrived before the moov".into());
+                        unreachable!("the first fragment constructs the segmenter");
                     };
                     match seg.push(fragment) {
                         Ok(Some(published)) => {
@@ -385,6 +409,9 @@ pub async fn run<R: AsyncRead + Unpin>(
     // truncated fragment left in hand means the child was killed mid-write,
     // and an ENDLIST there would tell the player the film ends early.
     let complete = reader.saw_trailer() || reader.buffered() == 0;
+    if segmenter.is_none() && pending_init.is_some() {
+        return Outcome::Unsupported("the pipe ended before its first media fragment".into());
+    }
     finish(segmenter, &mut out, session_id, complete).await
 }
 

@@ -1,0 +1,172 @@
+{
+  "server": {
+    "setup_required": false,
+    "name": "Contract server",
+    "version": "0.2.1",
+    "build": "contract-fixture",
+    "instance_id": "00000000-0000-4000-8000-000000000001",
+    "future_server_field": true
+  },
+  "item_detail": {
+    "item": {
+      "id": 42,
+      "library_id": 7,
+      "kind": "episode",
+      "parent_id": 11,
+      "title": "The Contract",
+      "year": 2026,
+      "overview": "One fixture, every native consumer.",
+      "season_number": 1,
+      "episode_number": 2,
+      "air_date": "2026-08-03",
+      "runtime_ms": 2700000,
+      "added_at": 1785733200,
+      "updated_at": 1785733260,
+      "recorded_at": null,
+      "tags": ["contract"],
+      "genres": ["Drama"],
+      "tmdb_id": 1234,
+      "imdb_id": "tt0001234",
+      "poster": "/api/v1/images/contract-poster.jpg",
+      "backdrop": "/api/v1/images/contract-backdrop.jpg",
+      "resolution": 2160,
+      "show_title": "Contract Show",
+      "watch": {
+        "position_ms": 12000,
+        "duration_ms": 2700000,
+        "watched": false,
+        "updated_at": 1785733260
+      }
+    },
+    "files": [
+      {
+        "id": 9,
+        "filename": "contract.mkv",
+        "size": 1048576,
+        "duration_ms": 2700000,
+        "container": "mkv",
+        "video_codec": "hevc",
+        "video_profile": "Main 10",
+        "width": 3840,
+        "height": 2160,
+        "bit_depth": 10,
+        "hdr": "dolby_vision",
+        "hdr_format": "Dolby Vision · Profile 7 (HDR10-compatible)",
+        "bitrate": 24000000,
+        "audio_streams": [
+          {
+            "index": 1,
+            "codec": "truehd",
+            "channels": 8,
+            "language": "eng",
+            "title": "Atmos",
+            "default": true
+          }
+        ],
+        "subtitle_streams": [
+          {
+            "index": 2,
+            "codec": "subrip",
+            "language": "eng",
+            "title": "English",
+            "default": true,
+            "forced": false
+          }
+        ],
+        "available": true,
+        "probed": true
+      }
+    ],
+    "children": [],
+    "ancestors": []
+  },
+  "page": {
+    "items": [
+      {
+        "id": 90,
+        "library_id": 7,
+        "kind": "show",
+        "title": "Half watched",
+        "added_at": 1785733200,
+        "updated_at": 1785733260,
+        "tags": [],
+        "genres": ["Drama"],
+        "rollup": {
+          "leaves": 20,
+          "watched": 9
+        }
+      }
+    ],
+    "total": 1,
+    "offset": 0,
+    "limit": 50
+  },
+  "decision": {
+    "file_id": 9,
+    "method": "remux",
+    "play_url": "/api/v1/files/9/stream.mp4",
+    "delivery": {
+      "mode": "remux",
+      "url": "/api/v1/files/9/stream.mp4",
+      "sessions_url": "/api/v1/files/9/hls/sessions",
+      "aac": true,
+      "preserve_dolby_vision": true
+    },
+    "source": {
+      "container": "mkv",
+      "video_codec": "hevc",
+      "video_profile": "Main 10",
+      "width": 3840,
+      "height": 2160,
+      "bit_depth": 10,
+      "hdr": "dolby_vision",
+      "hdr_format": "Dolby Vision · Profile 7 (HDR10-compatible)",
+      "bitrate": 24000000,
+      "duration_ms": 2700000
+    },
+    "reasons": ["container mkv unsupported", "audio codec truehd unsupported"],
+    "transcode_audio": true,
+    "audio": [
+      {
+        "index": 1,
+        "codec": "truehd",
+        "channels": 8,
+        "language": "eng",
+        "title": "Atmos",
+        "default": true
+      }
+    ],
+    "subtitles": [
+      {
+        "index": 2,
+        "codec": "subrip",
+        "language": "eng",
+        "title": "English",
+        "default": true,
+        "forced": false,
+        "text": true,
+        "native": true
+      }
+    ],
+    "markers": [
+      {
+        "kind": "intro",
+        "label": "Skip intro",
+        "start_ms": 1000,
+        "end_ms": 3000,
+        "chapter": false
+      }
+    ],
+    "ladder": [
+      {
+        "height": 1080,
+        "total_kbps": 8192,
+        "peak_kbps": 12416
+      }
+    ],
+    "audio_offset_ms": 50,
+    "declared_offset_ms": -21,
+    "delivered_dynamic_range": "dolby_vision",
+    "future_decision_field": "ignored by older clients"
+  }
+}

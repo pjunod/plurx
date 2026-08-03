@@ -499,7 +499,10 @@ exactly as it did before, on scheduled and manual scans alone.
   whole library, which is exactly why it stays on the server. Unpaired, the
   rail is absent rather than empty; a monarr that is down leaves it absent
   too, because the home screen must not depend on another application being
-  up.
+  up. Cards prefer artwork already in the local library; titles that have not
+  arrived yet use monarr's provider poster path, which plurxd downloads into
+  its own cache before returning the rail. Clients never call TMDB, TVmaze, or
+  Open Library themselves.
 
 - **Watch state → monarr**, *off by default*. When enabled (Settings →
   monarr), finishing something — the 95% crossing or an explicit mark —

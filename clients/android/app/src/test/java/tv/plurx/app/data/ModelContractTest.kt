@@ -1,5 +1,6 @@
 package tv.plurx.app.data
 
+import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.encodeToString
 import org.junit.Assert.assertEquals
@@ -8,11 +9,33 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
+@Serializable
+private data class NativeApiContractFixture(
+    val server: Server,
+    val item_detail: ItemDetail,
+    val page: Page,
+    val decision: Decision,
+)
+
 class ModelContractTest {
     // The wire Json, restated: `Net` builds it with exactly these two.
     private val json = Json {
         ignoreUnknownKeys = true
         explicitNulls = false
+    }
+
+    @Test
+    fun sharedNativeApiFixtureDecodesWithoutConsumerDrift() {
+        val wire = checkNotNull(javaClass.classLoader?.getResource("native-api.json")) {
+            "tests/contracts/native-api.json is not on the JVM test classpath"
+        }.readText()
+        val fixture = json.decodeFromString<NativeApiContractFixture>(wire)
+
+        assertEquals("Contract server", fixture.server.name)
+        assertEquals("The Contract", fixture.item_detail.item.title)
+        assertEquals(20L, fixture.page.items.single().rollup!!.leaves)
+        assertEquals("remux", fixture.decision.delivery!!.mode)
+        assertEquals("dolby_vision", fixture.decision.delivered_dynamic_range)
     }
 
     @Test

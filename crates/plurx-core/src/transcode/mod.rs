@@ -1212,6 +1212,12 @@ fn copy_input_args(
 /// reasons: an input seek leaves the first packet's timestamp wherever the
 /// keyframe was, and a fragmented MP4 whose timeline does not start at zero is
 /// a stream players disagree about.
+///
+/// Apple HLS deliberately does not use edit lists for fragmented MP4
+/// compatibility. Generic MP4 muxing otherwise writes `edts`/`elst` boxes to
+/// express the seek preroll; AVPlayer accepts that file directly but rejects
+/// the same rendition during multivariant HLS validation. Keep the normalized
+/// fragment decode times and suppress those movie-level edits.
 pub fn copy_pipe_args(
     source: &MediaFile,
     start_seconds: f64,
@@ -1255,6 +1261,8 @@ pub fn copy_pipe_args_with_dolby_vision(
             "make_zero",
             "-movflags",
             "frag_keyframe+empty_moov+default_base_moof+delay_moov",
+            "-use_editlist",
+            "0",
             "-f",
             "mp4",
             "pipe:1",
@@ -1928,6 +1936,16 @@ mod tests {
         assert!(copy_input_seek_args(-1.0).is_empty());
     }
 
+    #[test]
+    fn copy_pipe_uses_the_edit_free_apple_hls_timeline() {
+        let args = copy_pipe_args(&file(None), 30.0, None, false, Pacing::unpaced(), false);
+        let option = args
+            .iter()
+            .position(|arg| arg == "-use_editlist")
+            .expect("Apple HLS edit-list policy");
+        assert_eq!(args.get(option + 1).map(String::as_str), Some("0"));
+    }
+
     /// Exercise the actual ffmpeg boundary that exposed the bug: the seek is
     /// between video keyframes and audio is re-encoded. The first timestamps
     /// must still land together rather than leaving silence until the exact
@@ -1948,6 +1966,12 @@ mod tests {
             Pacing::unpaced(),
             false,
         )));
+        assert!(
+            !bytes
+                .windows(4)
+                .any(|window| window == b"edts" || window == b"elst"),
+            "Apple HLS copy output must not carry movie edit lists"
+        );
         let output = tempfile::Builder::new()
             .suffix(".mp4")
             .tempfile()
