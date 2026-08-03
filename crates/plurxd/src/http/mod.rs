@@ -126,6 +126,10 @@ pub fn router(state: AppState) -> Router {
         // so it is a POST. The GET is a deprecated bridge over the same path.
         .route("/files/{id}/hls/sessions", post(hls::create))
         .route("/files/{id}/hls/start", get(hls::start))
+        .route(
+            "/hls/{session}/master.m3u8",
+            get(hls::master_playlist_response),
+        )
         .route("/hls/{session}/index.m3u8", get(hls::playlist))
         .route("/hls/{session}/video.m3u8", get(hls::video_playlist))
         .route(
@@ -4413,6 +4417,10 @@ mod tests {
             StatusCode::NOT_FOUND
         );
         assert_eq!(
+            status_of(&app, get_q("/api/v1/hls/nosuchsession/master.m3u8")).await,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
             status_of(&app, get_q("/api/v1/hls/nosuchsession/seg00000.ts")).await,
             StatusCode::NOT_FOUND
         );
@@ -4459,7 +4467,7 @@ mod tests {
         // silently disappearing from every create.
         assert_eq!(native["delivered_dynamic_range"], "sdr", "{native}");
         let session = native["session_id"].as_str().expect("session");
-        let expected_playlist = format!("/api/v1/hls/{session}/index.m3u8?native=1&subtitle=0");
+        let expected_playlist = format!("/api/v1/hls/{session}/master.m3u8?subtitle=0");
         assert_eq!(
             native["playlist_url"].as_str(),
             Some(expected_playlist.as_str())
@@ -4467,9 +4475,7 @@ mod tests {
 
         let (status, master) = body_of(
             &app,
-            get_q(&format!(
-                "/api/v1/hls/{session}/index.m3u8?native=1&subtitle=0"
-            )),
+            get_q(&format!("/api/v1/hls/{session}/master.m3u8?subtitle=0")),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -4477,6 +4483,18 @@ mod tests {
         assert!(master.contains("TYPE=SUBTITLES"), "{master}");
         assert!(master.contains("LANGUAGE=\"en\",DEFAULT=YES"), "{master}");
         assert!(master.contains("subs/0/index.m3u8"), "{master}");
+
+        // Sessions returned before the dedicated path was introduced remain
+        // playable for their lifetime through the query-form bridge.
+        let (legacy_status, legacy_master) = body_of(
+            &app,
+            get_q(&format!(
+                "/api/v1/hls/{session}/index.m3u8?native=1&subtitle=0"
+            )),
+        )
+        .await;
+        assert_eq!(legacy_status, StatusCode::OK);
+        assert_eq!(legacy_master, master.as_bytes());
 
         let (status, subtitle_playlist) = body_of(
             &app,
