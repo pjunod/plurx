@@ -82,7 +82,7 @@ mapping cannot quietly make ordinary tests disappear.
 | Profile | Intended use | Additional evidence |
 |---|---|---|
 | `commit` | Pre-commit and ordinary local work | Mandatory Rust/catalog baseline; shared API wire check; web syntax, contrast, golden, and accessibility when affected |
-| `ci` | Pull requests and `main` | Impact-selected Linux contracts plus dedicated Apple and Android simulator jobs |
+| `ci` | Pull requests and `main` | Impact-selected Linux contracts plus parallel browser, Apple, Android, build, and container jobs when their surfaces can change |
 | `full` | Before a risky merge or release | Browser playback; both native-client suites; Android device tests when an explicit disposable device is selected; container startup/restart |
 | `nightly` | Scheduled deep regression search | Exhaustive playback and restart matrix; interrupted-production recovery; resource bounds; all runnable full checks |
 
@@ -92,12 +92,30 @@ pass. `--strict` turns missing tools or files into failures for checks selected
 on that platform. A platform mismatch remains a skip because Linux cannot run
 XCTest, regardless of strictness.
 
-CI fetches full Git history and selects from the pull-request base or previous
-push. If that commit is absent or invalid, it runs every point. Dedicated
-macOS and Android-emulator jobs run the native suites because a Linux platform
-skip is evidence of an unavailable environment, not evidence that the client
-works. The scheduled workflow runs the `nightly` profile. This makes impact
-optimization fail open: a bad diff base costs time; it never suppresses tests.
+CI fetches full Git history and selects from the pull-request base. The
+portable catalog, history, Rust, and focused Linux contracts remain one
+baseline job. Browser layout, Android JVM, Apple simulator, Android device,
+release-build, and container checks run as parallel jobs only when the diff can
+affect their contracts. Coverage runs after merge on `main`, where its badge is
+published; a pull request does not rerun the Rust suite merely to discard the
+number.
+
+The impact graph selects browser and native unit suites. Explicit path owners
+select the narrower environment checks: Android application and build files
+justify an emulator; Rust and toolchain files justify cross-target release
+builds; server, image, Compose, and lifecycle files justify the container
+smoke test. A server contract change can still fan out to every consuming
+client without pretending that server-only code changed Android focus
+behavior.
+
+`PR validation gate` waits for every selected job and accepts an unselected
+job only when GitHub records it as skipped. Configure that aggregate as the
+required branch-protection check; individual jobs remain visible evidence but
+do not make an unrelated surface part of every merge. Pushes and tags enable
+all surfaces, and an absent or invalid pull-request base also enables all
+jobs. Impact optimization therefore fails open: a bad diff base costs time;
+it never suppresses tests. The scheduled workflow still runs the `nightly`
+profile.
 
 ## The UI golden — a saved answer key, not a magic test
 
@@ -150,7 +168,7 @@ Never regenerate the golden merely to make a failure disappear. Rewriting the
 expected answer without reviewing the diff turns the check into an automatic
 approval of whatever the application did.
 
-The repository contains the activated `tests/ui-structure.golden`: 36 captures
+The repository contains the activated `tests/ui-structure.golden`: 54 captures
 across every registered layout, route, and desktop/mobile viewport. A check
 rebuilds `plurxd` first so it cannot accidentally serve an old embedded web
 app, then runs a real browser sweep. It needs Python Playwright with Chromium,

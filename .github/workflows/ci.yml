@@ -9,7 +9,36 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
+  # Resolve the PR diff once. Expensive jobs consume these outputs in parallel;
+  # pushes and tags deliberately enable every surface.
+  scope:
+    name: validation scope
+    runs-on: ubuntu-latest
+    outputs:
+      apple: ${{ steps.scope.outputs.apple }}
+      android_jvm: ${{ steps.scope.outputs.android_jvm }}
+      android_device: ${{ steps.scope.outputs.android_device }}
+      web_layout: ${{ steps.scope.outputs.web_layout }}
+      release_build: ${{ steps.scope.outputs.release_build }}
+      container: ${{ steps.scope.outputs.container }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Select affected CI surfaces
+        id: scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          VALIDATION_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          python3 -m validation.ci_scope \
+            --event "$EVENT_NAME" --base "$VALIDATION_BASE" >> "$GITHUB_OUTPUT"
+
   check:
     name: functionality points (CI profile)
     runs-on: ubuntu-latest
@@ -31,17 +60,14 @@ jobs:
       # is an absent dependency rather than anything wrong with the tree.
       - name: Install ffmpeg
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
-      - name: Install the deterministic UI browser
-        run: |
-          python3 -m pip install playwright
-          python3 -m playwright install --with-deps chromium
-      # The catalog always includes `make check`, then adds checks selected by
-      # the impact graph: web syntax/contrast for web changes and Android
-      # unit/lint for Android changes. A missing or all-zero event base falls
-      # back to every point; shared checks are deduplicated by the runner.
+      # Keep the portable baseline and focused Linux contracts in this job.
+      # Browser and Android JVM checks are selected by the same impact graph,
+      # but delegated to parallel jobs below instead of serializing the gate.
       - name: Validate functionality points
         env:
           VALIDATION_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          PLURX_SKIP_UI_BASELINE: 1
+          PLURX_SKIP_ANDROID_JVM: 1
         run: |
           if [ -n "$VALIDATION_BASE" ] \
             && git cat-file -e "$VALIDATION_BASE^{commit}" 2>/dev/null; then
@@ -59,8 +85,42 @@ jobs:
           path: target/validation
           if-no-files-found: warn
 
+  web_layout:
+    name: web layout and accessibility
+    needs: scope
+    if: needs.scope.outputs.web_layout == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: web-layout
+      - name: Install media and browser prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          python3 -m pip install playwright
+          python3 -m playwright install --with-deps chromium
+      - name: Check every affected web layout
+        run: make ui-check
+
+  android_jvm:
+    name: Android JVM tests and lint
+    needs: scope
+    if: needs.scope.outputs.android_jvm == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run unit tests and lint in the pinned Android toolchain
+        run: |
+          mkdir -p target/validation/buildx
+          BUILDX_CONFIG=target/validation/buildx make android-test
+
   apple:
     name: Apple iOS + tvOS tests
+    needs: scope
+    if: needs.scope.outputs.apple == 'true'
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
@@ -82,8 +142,10 @@ jobs:
       - name: Run the shared XCTest suite on both platforms
         run: make apple-test
 
-  android-device:
+  android_device:
     name: Android instrumented UI tests
+    needs: scope
+    if: needs.scope.outputs.android_device == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -117,6 +179,9 @@ jobs:
     name: coverage
     runs-on: ubuntu-latest
     needs: check
+    # PR coverage was a second run of the Rust suite whose result was discarded;
+    # the badge is published only from the merged main branch.
+    if: github.ref == 'refs/heads/main'
     # Self-hosted coverage badge — no codecov.io account or token. Measure line
     # coverage, write a shields.io endpoint JSON, and (on main only) force-push it
     # to an orphan `badges` branch that shields renders from raw.githubusercontent.
@@ -165,7 +230,8 @@ jobs:
   build:
     name: release build (${{ matrix.target }})
     runs-on: ubuntu-latest
-    needs: check
+    needs: scope
+    if: needs.scope.outputs.release_build == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -256,8 +322,8 @@ jobs:
   docker:
     name: docker runtime smoke
     runs-on: ubuntu-latest
-    needs: check
-    if: "!startsWith(github.ref, 'refs/tags/v')"
+    needs: scope
+    if: needs.scope.outputs.container == 'true' && !startsWith(github.ref, 'refs/tags/v')
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
@@ -270,3 +336,40 @@ jobs:
           tags: plurx/plurxd:ci
       - name: Start, probe, restart, and re-probe the image
         run: scripts/container-smoke plurx/plurxd:ci
+
+  # Configure this as the single required PR check. A conditional job is valid
+  # when it either passed or was skipped because its surface was unaffected.
+  pr_gate:
+    name: PR validation gate
+    if: always() && github.event_name == 'pull_request'
+    needs:
+      - scope
+      - check
+      - web_layout
+      - android_jvm
+      - apple
+      - android_device
+      - build
+      - docker
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every selected job to pass
+        env:
+          SCOPE_RESULT: ${{ needs.scope.result }}
+          CHECK_RESULT: ${{ needs.check.result }}
+          WEB_LAYOUT_RESULT: ${{ needs.web_layout.result }}
+          ANDROID_JVM_RESULT: ${{ needs.android_jvm.result }}
+          APPLE_RESULT: ${{ needs.apple.result }}
+          ANDROID_DEVICE_RESULT: ${{ needs.android_device.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          DOCKER_RESULT: ${{ needs.docker.result }}
+        run: |
+          for result in \
+            "$SCOPE_RESULT" "$CHECK_RESULT" "$WEB_LAYOUT_RESULT" \
+            "$ANDROID_JVM_RESULT" "$APPLE_RESULT" "$ANDROID_DEVICE_RESULT" \
+            "$BUILD_RESULT" "$DOCKER_RESULT"; do
+            case "$result" in
+              success|skipped) ;;
+              *) echo "A selected validation job ended with: $result"; exit 1 ;;
+            esac
+          done

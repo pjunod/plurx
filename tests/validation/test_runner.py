@@ -10,6 +10,7 @@ import tempfile
 import unittest
 import xml.etree.ElementTree as ET
 
+from validation.ci_scope import all_scope, scope_for_paths
 from validation.runner import (
     CatalogError,
     CheckResult,
@@ -24,6 +25,9 @@ from validation.runner import (
     selected_checks,
     write_reports,
 )
+
+
+ROOT = Path(__file__).resolve().parents[2]
 
 
 CATALOG = """
@@ -90,6 +94,46 @@ class CatalogCase(unittest.TestCase):
         catalog = self.load()
         selection = select_points(catalog, ("web/player/app.js",))
         self.assertEqual(selection.point_ids, ("web",))
+
+    def test_apple_ui_test_change_does_not_select_web_layout(self):
+        catalog = load_catalog(ROOT / "validation/points.toml")
+        selection = select_points(
+            catalog, ("clients/apple/Tests/AppleClientTests.swift",)
+        )
+        check_ids = {
+            check.id for check in selected_checks(catalog, selection, profile="ci")
+        }
+
+        self.assertIn("apple-simulators", check_ids)
+        self.assertNotIn("web-layout", check_ids)
+
+    def test_ci_scope_keeps_expensive_jobs_on_their_affected_surfaces(self):
+        catalog = load_catalog(ROOT / "validation/points.toml")
+
+        operations = scope_for_paths(
+            catalog, ("scripts/ship", "tests/operations/test_contracts.py")
+        )
+        self.assertFalse(any(operations.values()))
+
+        android = scope_for_paths(
+            catalog,
+            ("clients/android/app/src/main/java/tv/plurx/app/player/PlayerScreen.kt",),
+        )
+        self.assertTrue(android["android_jvm"])
+        self.assertTrue(android["android_device"])
+        self.assertFalse(android["web_layout"])
+        self.assertFalse(android["release_build"])
+        self.assertFalse(android["container"])
+
+        server = scope_for_paths(catalog, ("crates/plurxd/src/http/stream.rs",))
+        self.assertTrue(server["apple"])
+        self.assertTrue(server["android_jvm"])
+        self.assertTrue(server["web_layout"])
+        self.assertTrue(server["release_build"])
+        self.assertTrue(server["container"])
+        self.assertFalse(server["android_device"])
+
+        self.assertTrue(all(all_scope().values()))
 
     def test_profile_keeps_mandatory_baseline_when_slow_check_is_ineligible(self):
         catalog = self.load()

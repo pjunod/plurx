@@ -132,6 +132,26 @@ esac
         self.assertIn('APPLE_TVOS_SIM=platform=tvOS Simulator,id=$tvos_id', workflow)
         self.assertLess(workflow.index("xcrun simctl create"), workflow.index("run: make apple-test"))
 
+    def test_pr_ci_selects_expensive_surfaces_and_has_one_aggregate_gate(self):
+        workflow = read(".github/workflows/ci.yml")
+
+        self.assertIn("python3 -m validation.ci_scope", workflow)
+        self.assertIn("name: PR validation gate", workflow)
+        self.assertIn("PLURX_SKIP_UI_BASELINE: 1", workflow)
+        self.assertIn("PLURX_SKIP_ANDROID_JVM: 1", workflow)
+        self.assertIn("if: needs.scope.outputs.apple == 'true'", workflow)
+        self.assertIn("if: needs.scope.outputs.android_device == 'true'", workflow)
+        self.assertIn("if: needs.scope.outputs.web_layout == 'true'", workflow)
+        self.assertIn("if: needs.scope.outputs.release_build == 'true'", workflow)
+        self.assertIn("needs: scope", workflow)
+        self.assertNotIn("github.event_name == 'pull_request' && github.ref == 'refs/heads/main'", workflow)
+
+        coverage = workflow.split("  coverage:", 1)[1].split("\n  build:", 1)[0]
+        self.assertIn("if: github.ref == 'refs/heads/main'", coverage)
+
+        docker = workflow.split("  docker:", 1)[1].split("\n  pr_gate:", 1)[0]
+        self.assertNotIn("needs: check", docker)
+
     def test_container_smoke_keeps_non_root_state_port_and_cleanup_contracts(self):
         smoke = read("scripts/container-smoke")
         subprocess.run(["sh", "-n", str(ROOT / "scripts/container-smoke")], check=True)
