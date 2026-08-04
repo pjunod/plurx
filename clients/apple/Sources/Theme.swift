@@ -1,15 +1,110 @@
 import SwiftUI
+import UIKit
 
-/// noirr palette — the ink-dark base and signal-red accent shared with the web
-/// and Android clients.
+extension ViewerAppearance {
+    var preferredColorScheme: ColorScheme? {
+        switch self {
+        case .system: return nil
+        case .light: return .light
+        case .dark: return .dark
+        }
+    }
+}
+
+extension ViewerTheme {
+    var fontDesign: Font.Design {
+        self == .terminal ? .monospaced : .default
+    }
+}
+
+private struct PaletteValues {
+    let bg: UInt32
+    let surface: UInt32
+    let surfaceHi: UInt32
+    let accent: UInt32
+    let buttonInk: UInt32
+    let onBg: UInt32
+    let muted: UInt32
+    let outline: UInt32
+}
+
+private extension UIColor {
+    convenience init(rgb: UInt32) {
+        self.init(
+            red: CGFloat((rgb >> 16) & 0xFF) / 255,
+            green: CGFloat((rgb >> 8) & 0xFF) / 255,
+            blue: CGFloat(rgb & 0xFF) / 255,
+            alpha: 1
+        )
+    }
+}
+
+/// The three native palettes shared with Android. UIKit's dynamic provider
+/// resolves light/dark from the effective trait collection, while the selected
+/// theme comes from the same device-local preference that AppModel publishes.
 enum Palette {
-    static let bg = Color(red: 0x0A / 255, green: 0x0A / 255, blue: 0x0C / 255)
-    static let surface = Color(red: 0x14 / 255, green: 0x14 / 255, blue: 0x18 / 255)
-    static let surfaceHi = Color(red: 0x1C / 255, green: 0x1C / 255, blue: 0x22 / 255)
-    static let accent = Color(red: 0xE5 / 255, green: 0x48 / 255, blue: 0x4D / 255)
-    static let onBg = Color(red: 0xEC / 255, green: 0xEC / 255, blue: 0xEF / 255)
-    static let muted = Color(red: 0x8A / 255, green: 0x8A / 255, blue: 0x94 / 255)
-    static let outline = Color(red: 0x2A / 255, green: 0x2A / 255, blue: 0x31 / 255)
+    static var bg: Color { adaptive(\.bg) }
+    static var surface: Color { adaptive(\.surface) }
+    static var surfaceHi: Color { adaptive(\.surfaceHi) }
+    static var accent: Color { adaptive(\.accent) }
+    static var buttonInk: Color { adaptive(\.buttonInk) }
+    static var onBg: Color { adaptive(\.onBg) }
+    static var muted: Color { adaptive(\.muted) }
+    static var outline: Color { adaptive(\.outline) }
+
+    /// Playback stays true black in every theme and appearance. These surfaces
+    /// sit over the movie, not the app's room chrome.
+    static let playerChrome = Color(red: 0x0A / 255, green: 0x0A / 255, blue: 0x0C / 255)
+
+    private static func adaptive(_ keyPath: KeyPath<PaletteValues, UInt32>) -> Color {
+        Color(uiColor: UIColor { traits in
+            let stored = UserDefaults.standard.string(forKey: "plurx.theme")
+            let theme = ViewerTheme(rawValue: stored ?? "") ?? .noirr
+            let values = values(theme: theme, dark: traits.userInterfaceStyle != .light)
+            return UIColor(rgb: values[keyPath: keyPath])
+        })
+    }
+
+    private static func values(theme: ViewerTheme, dark: Bool) -> PaletteValues {
+        switch (theme, dark) {
+        case (.classic, true):
+            return PaletteValues(
+                bg: 0x0E0F13, surface: 0x171922, surfaceHi: 0x1E2230,
+                accent: 0x6EA8FE, buttonInk: 0x0E0F13, onBg: 0xE8EAF0,
+                muted: 0x9AA2B4, outline: 0x2A2F3E
+            )
+        case (.classic, false):
+            return PaletteValues(
+                bg: 0xF6F7F9, surface: 0xFFFFFF, surfaceHi: 0xEEF1F6,
+                accent: 0x2F6FE0, buttonInk: 0xFFFFFF, onBg: 0x1A1D24,
+                muted: 0x5B6472, outline: 0xDDE2EA
+            )
+        case (.terminal, true):
+            return PaletteValues(
+                bg: 0x050705, surface: 0x0B100B, surfaceHi: 0x111A12,
+                accent: 0x3FE170, buttonInk: 0x041508, onBg: 0xC9E8C0,
+                muted: 0x7A9670, outline: 0x1E3020
+            )
+        case (.terminal, false):
+            return PaletteValues(
+                bg: 0xEEE8D5, surface: 0xFDF6E3, surfaceHi: 0xE6DFC8,
+                accent: 0x6E7F00, buttonInk: 0xFDF6E3, onBg: 0x073642,
+                muted: 0x657B83, outline: 0xD5CDB4
+            )
+        case (.noirr, true):
+            return PaletteValues(
+                bg: 0x0A0A0C, surface: 0x101014, surfaceHi: 0x16161B,
+                accent: 0xE5484D, buttonInk: 0x0A0A0C, onBg: 0xEDEDEF,
+                muted: 0x9A9AA3, outline: 0x29292E
+            )
+        case (.noirr, false):
+            return PaletteValues(
+                bg: 0xF2EFE8, surface: 0xFAF8F2, surfaceHi: 0xFFFFFF,
+                accent: 0xC2343A, buttonInk: 0xFFFFFF, onBg: 0x1A1A1E,
+                muted: 0x5D5C63, outline: 0xDEDAD2
+            )
+        }
+    }
 }
 
 #if os(tvOS)
@@ -21,7 +116,7 @@ struct TVReadableButtonStyle: ButtonStyle {
     let prominent: Bool
 
     static func foregroundColor(prominent: Bool, focused: Bool) -> Color {
-        prominent ? Palette.bg : Palette.onBg
+        prominent ? Palette.buttonInk : Palette.onBg
     }
 
     static func backgroundColor(prominent: Bool, focused: Bool) -> Color {
@@ -76,7 +171,7 @@ struct TVReadableButtonStyle: ButtonStyle {
 /// NavigationLink's label and background identically, leaving only an empty
 /// accent-colored capsule. This style owns that contrast pair explicitly.
 struct TVShelfActionButtonStyle: ButtonStyle {
-    static func foregroundColor(focused: Bool) -> Color { Palette.bg }
+    static func foregroundColor(focused: Bool) -> Color { Palette.buttonInk }
     static func backgroundColor(focused: Bool) -> Color { Palette.accent }
 
     func makeBody(configuration: Configuration) -> Body {
@@ -135,7 +230,7 @@ struct TVPlayerControlButtonStyle: ButtonStyle {
                     height: TVPlayerControlButtonStyle.height
                 )
                 .background(
-                    Palette.bg.opacity(isFocused ? 0.9 : 0.68),
+                    Palette.playerChrome.opacity(isFocused ? 0.9 : 0.68),
                     in: RoundedRectangle(cornerRadius: 11, style: .continuous)
                 )
                 .overlay {

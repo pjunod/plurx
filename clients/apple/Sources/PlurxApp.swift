@@ -8,7 +8,8 @@ struct PlurxApp: App {
         WindowGroup {
             RootView()
                 .environmentObject(model)
-                .preferredColorScheme(.dark)
+                .preferredColorScheme(model.appearance.preferredColorScheme)
+                .fontDesign(model.theme.fontDesign)
                 .tint(Palette.accent)
         }
     }
