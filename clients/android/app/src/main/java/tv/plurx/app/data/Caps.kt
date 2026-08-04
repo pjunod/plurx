@@ -6,6 +6,7 @@ import android.content.Context
 import android.hardware.display.DisplayManager
 import android.media.MediaCodecList
 import android.os.Build
+import android.util.Log
 import android.view.Display
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
@@ -30,6 +31,7 @@ import kotlinx.coroutines.withContext
 object Caps {
 
     private const val DOLBY_VISION_MIME = "video/dolby-vision"
+    private const val LOG_TAG = "plurx-capabilities"
 
     suspend fun query(context: Context): Map<String, String> = withContext(Dispatchers.IO) {
         probe(context)
@@ -57,22 +59,33 @@ object Caps {
 
         val hdrTypes = displayHdrTypes(context)
         val hdr = displayIsHdr(hdrTypes) && (video.contains("hevc") || video.contains("av1"))
+        val rawDolbyVisionProfiles = if (DOLBY_VISION_MIME in decoderMimes) {
+            decoderDolbyVisionProfiles(codecs)
+        } else {
+            emptyList()
+        }
+        val dolbyVisionProfiles = dolbyVisionProfiles(rawDolbyVisionProfiles)
         val dolbyVision = dolbyVisionCaps(
-            profiles = if (DOLBY_VISION_MIME in decoderMimes) {
-                dolbyVisionProfiles(decoderDolbyVisionProfiles(codecs))
-            } else {
-                emptyList()
-            },
+            profiles = dolbyVisionProfiles,
             displaySupportsDolbyVision = HdrType.DOLBY_VISION in hdrTypes,
         )
 
-        return mapOf(
+        val result = mapOf(
+            "client" to "android",
+            "device" to Build.MODEL,
             "vcodec" to video.joinToString(","),
             "acodec" to audio.joinToString(","),
             // ExoPlayer plays these containers natively (MKV/TS included).
             "container" to "mkv,mp4,webm,mov,ts",
             "hdr" to if (hdr) "1" else "0",
         ) + dolbyVision
+        Log.i(
+            LOG_TAG,
+            "model=${Build.MODEL} hdrTypes=${hdrTypes.sorted()} " +
+                "rawDvProfiles=${rawDolbyVisionProfiles.sorted()} " +
+                "claimedDvProfiles=$dolbyVisionProfiles caps=$result",
+        )
+        return result
     }
 
     /** Raw `video/dolby-vision` profile constants this device's decoders list. */

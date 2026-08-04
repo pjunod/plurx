@@ -281,7 +281,7 @@ final class PlayerController: ObservableObject {
     var methodLabel: String {
         if activeBurnedSubtitle != nil { return "Transcode · subtitle burn-in" }
         if selectedHeight != nil { return "Transcode · \(selectedHeight!)p" }
-        let mode = decision?.delivery?.mode ?? Self.legacyMode(decision?.method ?? "")
+        let mode = decision.map(Self.playbackMode) ?? "transcode"
         switch mode {
         case "direct": return "Direct play"
         case "remux": return "Remux · HLS"
@@ -619,7 +619,8 @@ final class PlayerController: ObservableObject {
         let superseded = sessionId
         stopStatusPolling()
 
-        let normalMode = decision.delivery?.mode ?? Self.legacyMode(decision.method)
+        let normalMode = Self.playbackMode(decision)
+        let preserveDolbyVision = Self.shouldPreserveDolbyVision(decision)
         // Captured once: `selectedSubtitle` may change while the awaits below
         // run, and the difference is reconciled when this open completes (P1-2).
         let requestedSubtitle = selectedSubtitle
@@ -695,7 +696,7 @@ final class PlayerController: ObservableObject {
                 subtitle: nativeSubtitle,
                 copy: copy ? true : nil,
                 aac: copy ? aac : nil,
-                preserveDolbyVision: copy ? (decision.preserveDolbyVision ?? false) : nil
+                preserveDolbyVision: copy ? preserveDolbyVision : nil
             )
             let hls: HlsStart
             do {
@@ -1627,12 +1628,38 @@ final class PlayerController: ObservableObject {
             .first(where: { $0.count == 2 }) ?? code
     }
 
-    private static func legacyMode(_ method: String) -> String {
+    private nonisolated static func legacyMode(_ method: String) -> String {
         switch method {
         case "direct_play": return "direct"
         case "remux": return "remux"
         default: return "transcode"
         }
+    }
+
+    /// AVPlayer can accept a supported Dolby Vision Profile 5/8 decoder
+    /// configuration from a progressive MP4, advance its clock, and still
+    /// render a black video plane. Normalize every server-approved direct DV
+    /// stream through copy-video HLS. This also protects clients talking to a
+    /// server that predates the `dvhls=1` capability and still answers direct.
+    nonisolated static func playbackMode(_ decision: Decision) -> String {
+        let mode = decision.delivery?.mode ?? legacyMode(decision.method)
+        guard mode == "direct", decision.source?.hdr?.lowercased() == "dolby_vision" else {
+            return mode
+        }
+        return "remux"
+    }
+
+    /// Prefer the server's explicit preservation verdict. A legacy direct-DV
+    /// answer is also safe to preserve: the server only returns direct after
+    /// matching the exact profiles this client advertises (5 and 8).
+    nonisolated static func shouldPreserveDolbyVision(_ decision: Decision) -> Bool {
+        if let preserve = decision.delivery?.preserveDolbyVision
+            ?? decision.preserveDolbyVision {
+            return preserve
+        }
+        let serverMode = decision.delivery?.mode ?? legacyMode(decision.method)
+        return serverMode == "direct"
+            && decision.source?.hdr?.lowercased() == "dolby_vision"
     }
 
     #if os(iOS)

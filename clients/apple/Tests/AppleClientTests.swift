@@ -1625,6 +1625,7 @@ final class AppleClientTests: XCTestCase {
         XCTAssertEqual(hdrOnly["hdr"], "1")
         XCTAssertEqual(hdrOnly["dv"], "0")
         XCTAssertEqual(hdrOnly["dvprofile"], "")
+        XCTAssertEqual(hdrOnly["dvhls"], "1")
         XCTAssertEqual(hdrOnly["vcodec"], "h264,hevc")
 
         let dolbyVision = dictionary(Caps.query(
@@ -1636,6 +1637,7 @@ final class AppleClientTests: XCTestCase {
         XCTAssertEqual(dolbyVision["hdr"], "1")
         XCTAssertEqual(dolbyVision["dv"], "1")
         XCTAssertEqual(dolbyVision["dvprofile"], "5,8")
+        XCTAssertEqual(dolbyVision["dvhls"], "1")
         XCTAssertEqual(dolbyVision["vcodec"], "h264,hevc,av1")
 
         // A DV-capable display without the required hardware decoder is not a
@@ -1654,9 +1656,17 @@ final class AppleClientTests: XCTestCase {
         let runtime = Dictionary(uniqueKeysWithValues: Caps.query().compactMap { item in
             item.value.map { (item.name, $0) }
         })
+        print("PLURX_CAPABILITIES \(runtime)")
         XCTAssertNotNil(runtime["hdr"])
         XCTAssertNotNil(runtime["dv"])
         XCTAssertNotNil(runtime["dvprofile"])
+        XCTAssertEqual(runtime["client"], "apple")
+        XCTAssertNotEqual(runtime["device"], "")
+        if runtime["dv"] == "1" {
+            XCTAssertEqual(runtime["hdr"], "1")
+            XCTAssertEqual(runtime["dvprofile"], "5,8")
+            XCTAssertTrue(runtime["vcodec"]?.split(separator: ",").contains("hevc") == true)
+        }
     }
 
     func testPictureInPictureCommandStartsStopsAndWaitsForAvailability() {
@@ -1971,6 +1981,25 @@ final class AppleClientTests: XCTestCase {
         {"session_id":"s2","playlist_url":"/hls/s2/master.m3u8"}
         """#.utf8))
         XCTAssertNil(legacy.deliveredDynamicRange)
+    }
+
+    /// Servers from before the Apple DV transport hint can approve Profile 8
+    /// as progressive direct play. AVPlayer then advances with audio while the
+    /// video plane stays black. The client must losslessly repackage that same
+    /// video as HLS and retain its DV metadata.
+    func testLegacyDirectDolbyVisionIsNormalizedToPreservingHls() throws {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let decision = try decoder.decode(Decision.self, from: Data(#"""
+        {"file_id":5657,"method":"direct_play",
+         "play_url":"/api/v1/files/5657/direct",
+         "source":{"container":"mp4","video_codec":"hevc",
+                   "hdr":"dolby_vision",
+                   "hdr_format":"Dolby Vision · Profile 8 (HDR10-compatible)"}}
+        """#.utf8))
+
+        XCTAssertEqual(PlayerController.playbackMode(decision), "remux")
+        XCTAssertTrue(PlayerController.shouldPreserveDolbyVision(decision))
     }
 
     /// The detail page had no dynamic-range badge at all, while Android and the
