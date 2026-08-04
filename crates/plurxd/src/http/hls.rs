@@ -449,6 +449,21 @@ pub async fn master_playlist_response(
 ) -> Result<Response, ApiError> {
     let (context, file) = session_file(&state, &session).await?;
     let context = exact_hls_context(&state, &session, context).await;
+    // Apple's multivariant eligibility check rejects UHD Blu-ray-style HEVC
+    // High-tier declarations before VideoToolbox sees bytes it can decode.
+    // With no native text renditions, the wrapper buys this session nothing:
+    // serve the same proven fMP4 media playlist from this capability URL and
+    // let AVPlayer inspect the authoritative hvcC/Dolby Vision records in the
+    // initialization segment. Bitmap/styled subtitles already use burn-in, so
+    // they do not depend on a multivariant subtitle group.
+    if query.diagnostic.is_none() && should_serve_high_tier_media_playlist(&file, &context) {
+        tracing::info!(
+            session_id = %session,
+            codecs = %context.codecs,
+            "serving high-tier HEVC through the direct media-playlist envelope"
+        );
+        return video_playlist(State(state), AxPath(session)).await;
+    }
     Ok(playlist_response(
         master_playlist_diagnostic(&file, query.subtitle, &context, query.diagnostic.as_deref())
             .into_bytes(),
@@ -695,6 +710,34 @@ fn hevc_codec_from_init(init: &[u8], sample_entry: &str) -> Option<String> {
         codec.push_str(&constraints);
     }
     Some(codec)
+}
+
+/// Whether an Apple HDR master should collapse to its media rendition.
+///
+/// This is deliberately narrower than "HDR": Main-tier HDR/Dolby Vision and
+/// every session with native text renditions keep the authored multivariant
+/// playlist. The workaround applies only to the High-tier codec declaration
+/// AVPlayer rejects and only when removing the wrapper loses no rendition.
+fn should_serve_high_tier_media_playlist(
+    file: &MediaFile,
+    context: &crate::transcode::HlsContext,
+) -> bool {
+    let has_native_subtitles = file
+        .subtitle_streams
+        .iter()
+        .any(|track| is_native_text_subtitle(&track.codec));
+    if file.hdr.is_none() || has_native_subtitles {
+        return false;
+    }
+    let video = context.codecs.split(',').next().unwrap_or_default();
+    let mut fields = video.split('.');
+    let sample_entry = fields.next().unwrap_or_default();
+    matches!(sample_entry, "hvc1" | "hev1" | "dvh1" | "dvhe")
+        && fields.any(|field| {
+            field.strip_prefix('H').is_some_and(|level| {
+                !level.is_empty() && level.bytes().all(|byte| byte.is_ascii_digit())
+            })
+        })
 }
 
 /// The human half of a rendition's `NAME`. Display names are a presentation
@@ -1609,6 +1652,47 @@ mod tests {
         assert!(hdr.contains("VIDEO-RANGE=PQ"));
         assert!(hdr.contains("CODECS=\"hvc1.2.4.L150.B0,ec-3\""));
         assert!(hdr.ends_with("index.m3u8\n"));
+    }
+
+    #[test]
+    fn high_tier_hevc_without_native_subtitles_uses_the_media_playlist() {
+        let bitmap_only = hls_file(vec![sub(
+            "hdmv_pgs_subtitle",
+            "eng",
+            "English",
+            false,
+            false,
+        )]);
+        let shawshank = hls_context("hvc1.2.4.H153.90,mp4a.40.2", None);
+        assert!(should_serve_high_tier_media_playlist(
+            &bitmap_only,
+            &shawshank
+        ));
+
+        let main_tier = hls_context("hvc1.2.4.L153.B0,mp4a.40.2", None);
+        assert!(!should_serve_high_tier_media_playlist(
+            &bitmap_only,
+            &main_tier
+        ));
+
+        let mut sdr_high_tier = bitmap_only.clone();
+        sdr_high_tier.hdr = None;
+        assert!(!should_serve_high_tier_media_playlist(
+            &sdr_high_tier,
+            &shawshank
+        ));
+
+        let native_text = hls_file(vec![sub("subrip", "eng", "English", false, false)]);
+        assert!(!should_serve_high_tier_media_playlist(
+            &native_text,
+            &shawshank
+        ));
+
+        let high_profile_h264 = hls_context("avc1.640034,mp4a.40.2", None);
+        assert!(!should_serve_high_tier_media_playlist(
+            &bitmap_only,
+            &high_profile_h264
+        ));
     }
 
     #[test]
