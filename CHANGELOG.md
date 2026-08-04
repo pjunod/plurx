@@ -408,6 +408,13 @@ bump may break compatibility and a **patch** bump never does.
 
 ### Fixed
 
+- **Apple playback info now stays open when the transport controls fade.**
+  iPhone, iPad, and Apple TV used one visibility state for both overlays, so
+  the four-second control timer also dismissed the readout a viewer had opened
+  to watch. The controls and readout now have independent lifetimes; the
+  readout remains visible until it is explicitly closed, matching Android and
+  the web player.
+
 - **Coming Soon no longer leaves not-yet-local titles with blank cards.** The
   calendar already carried each item's provider poster path, but plurx threw
   that field away and only showed artwork when the same title could be

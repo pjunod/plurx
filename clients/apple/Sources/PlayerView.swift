@@ -59,6 +59,11 @@ enum PlayerMetadataBadgeMetrics {
     #endif
 }
 
+struct PlayerOverlayVisibility: Equatable {
+    let controls: Bool
+    let playbackInfo: Bool
+}
+
 /// Source vs delivered vs rendered, for the one badge that has to answer both
 /// "what is this file?" and "what am I getting?" — MEDIA-BADGES-PLAN.md §2.
 ///
@@ -213,23 +218,31 @@ struct PlayerView: View {
 
             if controller.failed {
                 failureView
-            } else if shouldShowControls {
-                VStack(spacing: 0) {
-                    HStack(alignment: .top) {
-                        #if os(iOS)
-                        closeButton
-                        #endif
-                        Spacer()
-                        if showStats {
-                            PlaybackStatsView(controller: controller)
-                                .transition(.opacity.combined(with: .move(edge: .trailing)))
+            } else {
+                if overlayVisibility.controls {
+                    VStack(spacing: 0) {
+                        HStack(alignment: .top) {
+                            #if os(iOS)
+                            closeButton
+                            #endif
+                            Spacer()
                         }
+                        Spacer()
+                        playbackControls
                     }
-                    Spacer()
-                    playbackControls
+                    .padding(20)
+                    .transition(.opacity)
                 }
-                .padding(20)
-                .transition(.opacity)
+
+                if overlayVisibility.playbackInfo {
+                    PlaybackStatsView(
+                        controller: controller,
+                        onDismiss: dismissPlaybackInfo
+                    )
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+                    .padding(20)
+                    .transition(.opacity.combined(with: .move(edge: .trailing)))
+                }
             }
 
             if controller.isChangingStream {
@@ -320,7 +333,9 @@ struct PlayerView: View {
             if controlsVisible { restartAutoHideTimer() }
         }
         .onExitCommand {
-            if controlsVisible {
+            if showStats {
+                dismissPlaybackInfo()
+            } else if controlsVisible {
                 hideControls()
             } else {
                 dismiss()
@@ -329,8 +344,21 @@ struct PlayerView: View {
         #endif
     }
 
-    private var shouldShowControls: Bool {
-        controlsVisible
+    private var overlayVisibility: PlayerOverlayVisibility {
+        Self.overlayVisibility(
+            controlsVisible: controlsVisible,
+            playbackInfoVisible: showStats
+        )
+    }
+
+    static func overlayVisibility(
+        controlsVisible: Bool,
+        playbackInfoVisible: Bool
+    ) -> PlayerOverlayVisibility {
+        PlayerOverlayVisibility(
+            controls: controlsVisible,
+            playbackInfo: playbackInfoVisible
+        )
     }
 
     static func shouldAutoHideControls(
@@ -344,12 +372,7 @@ struct PlayerView: View {
     private func toggleControls() {
         #if os(iOS)
         withAnimation(.easeInOut(duration: 0.2)) {
-            if controlsVisible {
-                controlsVisible = false
-                showStats = false
-            } else {
-                controlsVisible = true
-            }
+            controlsVisible.toggle()
         }
         restartAutoHideTimer()
         #endif
@@ -368,7 +391,6 @@ struct PlayerView: View {
         guard controlsVisible else { return }
         withAnimation(.easeOut(duration: 0.2)) {
             controlsVisible = false
-            showStats = false
         }
         #if os(tvOS)
         focusedControl = nil
@@ -376,6 +398,15 @@ struct PlayerView: View {
             await Task.yield()
             if !controlsVisible { focusedControl = .reveal }
         }
+        #endif
+    }
+
+    private func dismissPlaybackInfo() {
+        withAnimation { showStats = false }
+        #if os(tvOS)
+        revealControlsFromRemote()
+        #else
+        revealControls()
         #endif
     }
 
@@ -1225,13 +1256,25 @@ struct PlayerView: View {
 /// whether the link or the encoder is actually falling behind.
 private struct PlaybackStatsView: View {
     @ObservedObject var controller: PlayerController
+    let onDismiss: () -> Void
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 7) {
-                Text("Playback info")
-                    .font(.system(.headline, design: .monospaced))
-                    .foregroundColor(.white)
+                HStack(spacing: 10) {
+                    Text("Playback info")
+                        .font(.system(.headline, design: .monospaced))
+                        .foregroundColor(.white)
+                    Spacer()
+                    #if os(iOS)
+                    Button(action: onDismiss) {
+                        Image(systemName: "xmark")
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundColor(.white.opacity(0.72))
+                    .accessibilityLabel("Close playback info")
+                    #endif
+                }
                 Divider().overlay(Palette.outline)
                 row("Method", controller.methodLabel)
                 row("Position", "\(formatTime(controller.currentMs)) / \(formatTime(controller.knownDurationMs))")
