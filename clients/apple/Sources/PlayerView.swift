@@ -1693,6 +1693,12 @@ private struct PlaybackStatsView: View {
     @ObservedObject var controller: PlayerController
     let onDismiss: () -> Void
 
+    /// This panel floats over the video, so its contrast must not follow the
+    /// app's light/dark palette. A fixed dark surface keeps the white copy
+    /// readable in every appearance and over both bright and dark frames.
+    private let panelSurface = Palette.playerChrome.opacity(0.96)
+    private let labelColor = Color.white.opacity(0.82)
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 7) {
@@ -1723,7 +1729,7 @@ private struct PlaybackStatsView: View {
             .padding(14)
         }
         .frame(maxWidth: 430, maxHeight: 430)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
+        .background(panelSurface, in: RoundedRectangle(cornerRadius: 12))
     }
 
     @ViewBuilder
@@ -1788,7 +1794,7 @@ private struct PlaybackStatsView: View {
     private func row(_ label: String, _ value: String) -> some View {
         HStack(alignment: .top, spacing: 10) {
             Text(label)
-                .foregroundColor(Palette.muted)
+                .foregroundColor(labelColor)
                 .frame(width: 100, alignment: .leading)
             Text(value)
                 .foregroundColor(.white)

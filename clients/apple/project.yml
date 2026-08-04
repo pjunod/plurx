@@ -38,7 +38,7 @@ targets:
     info:
       path: Support/iOS-Info.plist
       properties:
-        CFBundleDisplayName: plurx
+        CFBundleDisplayName: Noirr Cinema
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         UILaunchScreen: {}
@@ -64,8 +64,8 @@ targets:
           NSAllowsArbitraryLoads: true
         # Without this iOS silently refuses connections to 192.168.x.x —
         # a functional bug, not paperwork.
-        NSLocalNetworkUsageDescription: "plurx connects to your media server on your local network."
-        NSCameraUsageDescription: "plurx scans a QR code containing your media server address."
+        NSLocalNetworkUsageDescription: "Cinema connects to your media server on your local network."
+        NSCameraUsageDescription: "Cinema scans a QR code containing your media server address."
         # Browsing is also the permission preflight: it makes iOS ask before a
         # login request can race the system sheet. The value must match the
         # service plurxd publishes through DNS-SD.
@@ -91,7 +91,7 @@ targets:
     info:
       path: Support/tvOS-Info.plist
       properties:
-        CFBundleDisplayName: plurx
+        CFBundleDisplayName: Noirr Cinema
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         UIBackgroundModes:
@@ -99,7 +99,7 @@ targets:
         # Same reasoning as iOS above — docs/PUBLISHING.md §4.
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
-        NSLocalNetworkUsageDescription: "plurx connects to your media server on your local network."
+        NSLocalNetworkUsageDescription: "Cinema connects to your media server on your local network."
         NSBonjourServices:
           - _plurx._tcp
         ITSAppUsesNonExemptEncryption: false

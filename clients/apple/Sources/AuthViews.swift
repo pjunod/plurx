@@ -58,7 +58,7 @@ private struct AuthScaffold<Content: View>: View {
 
     var body: some View {
         VStack(spacing: 16) {
-            Text("plurx")
+            Text("cinema")
                 .font(.system(size: 44, weight: .bold, design: .monospaced))
                 .foregroundColor(Palette.accent)
             Text(subtitle)
@@ -94,7 +94,7 @@ struct ConnectView: View {
             if discovery.servers.isEmpty {
                 HStack(spacing: 10) {
                     if discovery.isSearching { ProgressView().tint(Palette.accent) }
-                    Text(discovery.isSearching ? "Looking for plurx…" : "No servers found")
+                    Text(discovery.isSearching ? "Looking for Cinema…" : "No servers found")
                         .font(.system(.callout, design: .monospaced))
                         .foregroundColor(Palette.muted)
                 }
@@ -108,7 +108,7 @@ struct ConnectView: View {
                                     .foregroundColor(Palette.accent)
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(server.name).fontWeight(.semibold)
-                                    Text("plurx server")
+                                    Text("Cinema server")
                                         .font(.caption)
                                         .foregroundColor(Palette.muted)
                                 }
@@ -206,7 +206,7 @@ struct ConnectView: View {
             QRCodeScannerView { payload in
                 showQRScanner = false
                 guard let scannedOrigin = ConnectionCode.origin(from: payload) else {
-                    qrError = "That QR code doesn't contain a valid plurx server address."
+                    qrError = "That QR code doesn't contain a valid Cinema server address."
                     return
                 }
                 qrError = nil

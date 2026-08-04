@@ -12,7 +12,7 @@ private enum PlaybackPreparationError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .timedOut:
-            return "The video took too long to prepare. Check that the Plurx server is reachable."
+            return "The video took too long to prepare. Check that the Cinema server is reachable."
         case .failed:
             return "The video stream could not be prepared. Check the server and try again."
         }

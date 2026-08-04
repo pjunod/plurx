@@ -51,7 +51,7 @@ struct SearchView: View {
             ContentUnavailableView(
                 "Find something to watch",
                 systemImage: "magnifyingglass",
-                description: Text("Search across every library share on this plurx server.")
+                description: Text("Search across every library share on this Cinema server.")
             )
             .frame(maxWidth: .infinity)
         } else if hasSearched && results.isEmpty {
