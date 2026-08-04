@@ -285,6 +285,11 @@ client therefore publishes the known title duration and `isLiveStream = false`
 to iOS Now Playing, provides its own transport, and implements non-native seeks
 by reopening the same stream at the requested film position. Faking an HLS VOD
 playlist would truncate the movie; the client-side timeline is the safe fix.
+Growing copy and transcode items also request a 60-second forward buffer. That
+is the client half of the server's 120-second retention contract: 60 seconds
+ahead · 30 seconds behind · 30 seconds for a retry. Leaving AVPlayer at its
+automatic buffer choice let its download frontier outrun that contract, so the
+server could prune a fetched segment before AVPlayer presented or retried it.
 
 ## Project layout
 

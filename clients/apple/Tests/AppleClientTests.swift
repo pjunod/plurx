@@ -1,3 +1,4 @@
+import AVFoundation
 import Darwin
 import Foundation
 import SwiftUI
@@ -544,6 +545,24 @@ final class AppleClientTests: XCTestCase {
         // letting it carry into the next press of Play.
         XCTAssertEqual(detector.sample(positionMs: 12_000, shouldMonitor: false), .none)
         XCTAssertEqual(detector.sample(positionMs: 12_000, shouldMonitor: true), .none)
+    }
+
+    @MainActor
+    func testGrowingHLSSessionStaysInsideTheServerRetentionContract() {
+        let item = AVPlayerItem(url: URL(fileURLWithPath: "/dev/null"))
+
+        PlayerController.configureBuffering(item, growingHLS: true)
+        XCTAssertEqual(
+            item.preferredForwardBufferDuration,
+            PlayerController.growingHLSForwardBufferSeconds
+        )
+
+        PlayerController.configureBuffering(item, growingHLS: false)
+        XCTAssertEqual(
+            item.preferredForwardBufferDuration,
+            0,
+            "direct and completed-VOD items keep AVPlayer's normal buffering policy"
+        )
     }
 
     @MainActor

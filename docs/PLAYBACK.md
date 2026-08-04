@@ -110,6 +110,7 @@ one.
 | `apple.transport-and-dv` | AVPlayer direct vs HLS | Execute the server mode, except normalize even a legacy direct Dolby Vision answer through preserving copy HLS. Overrides, audio changes, and subtitle needs decide whether that session copies or transcodes. | XCTest for legacy direct-DV normalization |
 | `apple.compatibility-fallback` | Apple startup decode/stall recovery | Before real playback, a preserved DV stream with an HDR10/HLG base strips to that base first; only the next failure uses the universal transcode. Each rescue is once and resumes the last truthful film position. | XCTest recovery ladder |
 | `apple.established-hdr-recovery` | Interruption after HDR rendered | Once the item has advanced for ≥5 s, a stall or item failure reconnects the same HDR delivery once. An immediate repeat stops visibly instead of falling through to the SDR compatibility transcode. | XCTest established-delivery guard |
+| `apple.hls-buffer-window` | Growing HLS forward buffer | AVPlayer requests 60 s ahead on live copy/transcode sessions, matching the server's 60 s forward-fetch allowance inside its 120 s retention window. Direct files and completed cached HLS keep AVPlayer's default. | XCTest item-configuration guard |
 | `apple.quality-session` | Picked rung vs Auto/burn height | A picked rung forces a transcode at that height. An otherwise-copyable subtitle burn preserves source height; an ordinary Auto transcode leaves the encoder-aware rung to the server. | XCTest source/rung/burn height matrix |
 | `apple.subtitle-route` | Media selection vs reopen | Native rendition switches stay inside AVPlayer once the session exists. Entering from direct, selecting/leaving a burn, or changing a burn reopens. Bitmap/styled tracks burn; ordinary native text does not. | XCTest route matrix |
 | `apple.hdr-subtitle-guard` | Burn-only subtitle on HDR | PGS and styled tracks are refused while the current delivery is DV, HDR10, or HLG, with a non-fatal notice. Native text still selects, and SDR playback may still burn. | XCTest subtitle/dynamic-range matrix |
@@ -567,11 +568,12 @@ covering the other.
 ## Non-goals & known limits
 
 - **HLS session disk.** An HLS session's playlist grows for its whole life, so
-  the reaper prunes segments more than ~60 s behind the playhead — on both the
-  transcode and copy paths — keyed off the highest segment the client has
-  fetched. Ahead of the playhead, the suspend window bounds the other end, so
-  a session's directory now holds roughly
-  `hls_ahead_max_secs + 60 s` of content whatever the encoder's speed. One
+  the reaper keeps 120 s behind the download frontier — on both the transcode
+  and copy paths — while web and Apple players limit their forward fetch to
+  60 s. The other 60 s covers back-buffering and a retry. Ahead of that
+  frontier, the suspend window bounds the other end, so a session's directory
+  now holds roughly `hls_ahead_max_secs + 120 s` of content whatever the
+  encoder's speed. One
   residual remains: the prune is disk-only — the playlist keeps listing pruned
   entries, which is safe precisely because every seek starts a fresh session
   rather than scrubbing back into a deleted window.
