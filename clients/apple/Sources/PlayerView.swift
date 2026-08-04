@@ -273,6 +273,38 @@ struct PlayerOverlayVisibility: Equatable {
     let playbackInfo: Bool
 }
 
+#if os(iOS)
+/// The landscape/iPad transport keeps its fixed control groups at the edges
+/// and gives every remaining point to the timeline. Keeping this as a real
+/// layout boundary prevents a `fixedSize` measurement from becoming the
+/// selected row's final width inside `ViewThatFits`.
+struct PlayerTouchWideRow<Transport: View, Timeline: View, Options: View>: View {
+    let transport: Transport
+    let timeline: Timeline
+    let options: Options
+
+    init(
+        @ViewBuilder transport: () -> Transport,
+        @ViewBuilder timeline: () -> Timeline,
+        @ViewBuilder options: () -> Options
+    ) {
+        self.transport = transport()
+        self.timeline = timeline()
+        self.options = options()
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            transport
+            timeline
+                .layoutPriority(1)
+            options
+        }
+        .frame(maxWidth: .infinity)
+    }
+}
+#endif
+
 /// Source vs delivered vs rendered, for the one badge that has to answer both
 /// "what is this file?" and "what am I getting?" — MEDIA-BADGES-PLAN.md §2.
 ///
@@ -1090,17 +1122,18 @@ struct PlayerView: View {
     /// over two rows only when a portrait phone cannot fit it safely.
     private var touchPlaybackRows: some View {
         ViewThatFits(in: .horizontal) {
-            HStack(spacing: 8) {
+            PlayerTouchWideRow {
                 transportControlGroup
+            } timeline: {
                 if controller.knownDurationMs > 0 {
                     playbackTimeLabel(Int(isScrubbing ? scrubMs : Double(controller.currentMs)))
                     touchProgressSlider
                         .frame(minWidth: 100)
                     playbackTimeLabel(controller.knownDurationMs)
                 }
+            } options: {
                 playbackOptionGroup
             }
-            .fixedSize(horizontal: true, vertical: false)
 
             VStack(alignment: .leading, spacing: 8) {
                 if controller.knownDurationMs > 0 {
