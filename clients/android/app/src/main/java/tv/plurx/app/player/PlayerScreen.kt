@@ -237,6 +237,21 @@ internal fun playerBackAction(panelOpen: Boolean, controlsVisible: Boolean): Pla
     else -> PlayerBackAction.ExitPlayback
 }
 
+/**
+ * Directional playback shortcuts only own the bare video surface. Visible
+ * controls keep normal D-pad focus navigation.
+ */
+internal fun playerSeekDeltaMs(keyCode: Int, controlsVisible: Boolean): Long? {
+    if (controlsVisible) return null
+    return when (keyCode) {
+        KeyEvent.KEYCODE_DPAD_LEFT -> -10_000L
+        KeyEvent.KEYCODE_DPAD_RIGHT -> 10_000L
+        KeyEvent.KEYCODE_DPAD_DOWN -> -30_000L
+        KeyEvent.KEYCODE_DPAD_UP -> 30_000L
+        else -> null
+    }
+}
+
 private const val MAX_PIP_ASPECT_RATIO = 2.39
 
 /** Returns an Android-supported PiP aspect ratio, using 16:9 when media metadata is unusable. */
@@ -692,6 +707,14 @@ private fun PlayerContent(
             .focusable()
             .onPreviewKeyEvent { event ->
                 if (event.nativeKeyEvent.action != KeyEvent.ACTION_DOWN) return@onPreviewKeyEvent false
+                val seekDelta = playerSeekDeltaMs(
+                    keyCode = event.nativeKeyEvent.keyCode,
+                    controlsVisible = controlsVisible,
+                )
+                if (seekDelta != null) {
+                    controller.seekTo(controller.realPosition() + seekDelta)
+                    return@onPreviewKeyEvent true
+                }
                 when (event.nativeKeyEvent.keyCode) {
                     KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> {
                         controller.playPause()
@@ -712,18 +735,12 @@ private fun PlayerContent(
                     KeyEvent.KEYCODE_MEDIA_FAST_FORWARD -> {
                         controller.seekTo(controller.realPosition() + 10_000); poke(); true
                     }
-                    KeyEvent.KEYCODE_DPAD_LEFT -> if (!controlsVisible) {
-                        controller.seekTo(controller.realPosition() - 10_000); poke(); true
-                    } else {
-                        poke(); false
-                    }
-                    KeyEvent.KEYCODE_DPAD_RIGHT -> if (!controlsVisible) {
-                        controller.seekTo(controller.realPosition() + 10_000); poke(); true
-                    } else {
-                        poke(); false
-                    }
-                    KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN -> {
-                        if (controlsVisible) poke()
+                    KeyEvent.KEYCODE_DPAD_LEFT,
+                    KeyEvent.KEYCODE_DPAD_RIGHT,
+                    KeyEvent.KEYCODE_DPAD_UP,
+                    KeyEvent.KEYCODE_DPAD_DOWN,
+                    -> {
+                        poke()
                         false
                     }
                     else -> false

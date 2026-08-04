@@ -1,6 +1,8 @@
 package tv.plurx.app.player
 
+import android.view.KeyEvent
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Test
 import tv.plurx.app.data.AudioStream
 import tv.plurx.app.data.MediaFileDto
@@ -11,6 +13,19 @@ class PlayerPolicyTest {
         assertEquals(PlayerBackAction.ClosePanel, playerBackAction(panelOpen = true, controlsVisible = false))
         assertEquals(PlayerBackAction.HideControls, playerBackAction(panelOpen = false, controlsVisible = true))
         assertEquals(PlayerBackAction.ExitPlayback, playerBackAction(panelOpen = false, controlsVisible = false))
+    }
+
+    @Test
+    fun directionalSeeksUseShortHorizontalAndLongVerticalSteps() {
+        assertEquals(-10_000L, playerSeekDeltaMs(KeyEvent.KEYCODE_DPAD_LEFT, controlsVisible = false))
+        assertEquals(10_000L, playerSeekDeltaMs(KeyEvent.KEYCODE_DPAD_RIGHT, controlsVisible = false))
+        assertEquals(-30_000L, playerSeekDeltaMs(KeyEvent.KEYCODE_DPAD_DOWN, controlsVisible = false))
+        assertEquals(30_000L, playerSeekDeltaMs(KeyEvent.KEYCODE_DPAD_UP, controlsVisible = false))
+        assertNull(playerSeekDeltaMs(KeyEvent.KEYCODE_DPAD_CENTER, controlsVisible = false))
+        assertNull(
+            "visible controls retain D-pad focus navigation",
+            playerSeekDeltaMs(KeyEvent.KEYCODE_DPAD_RIGHT, controlsVisible = true),
+        )
     }
 
     @Test

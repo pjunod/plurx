@@ -508,6 +508,13 @@ final class AppleClientTests: XCTestCase {
         )
     }
 
+    func testDirectionalSeeksUseShortHorizontalAndLongVerticalSteps() {
+        XCTAssertEqual(PlayerSeekDirection.left.seconds, -10)
+        XCTAssertEqual(PlayerSeekDirection.right.seconds, 10)
+        XCTAssertEqual(PlayerSeekDirection.down.seconds, -30)
+        XCTAssertEqual(PlayerSeekDirection.up.seconds, 30)
+    }
+
     func testLiveSeekTargetClearsOnlyAfterTheAttachedReopen() {
         var state = PlayerSeekState()
         _ = state.absolute(90_000, durationMs: 600_000)
