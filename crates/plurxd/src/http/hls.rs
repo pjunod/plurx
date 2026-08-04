@@ -485,6 +485,7 @@ pub async fn subtitle_playlist(
             "this subtitle requires burn-in".into(),
         ));
     }
+    crate::subtitles::warm_vtt(&state.subs_dir, &file, index).await;
     let video = state
         .transcode
         .playlist(&session)
@@ -529,34 +530,51 @@ pub async fn subtitle_vtt(
         .iter()
         .find(|window| window.sequence == sequence)
         .ok_or(ApiError::NotFound("subtitle segment"))?;
-    let cached = crate::subtitles::ensure_vtt(&state.subs_dir, &file, index)
-        .await
-        .map_err(|why| {
-            tracing::warn!(
+    let cached = crate::subtitles::vtt_path(&state.subs_dir, &file, index);
+    let (bytes, cache_control) = match tokio::fs::read(&cached).await {
+        Ok(bytes) => {
+            tracing::info!(
+                session_id = %session,
                 file_id = file.id,
                 index,
-                "subtitle extraction failed: {why}"
+                codec = %track.codec,
+                language = track.language.as_deref().unwrap_or("und"),
+                title = track.title.as_deref().unwrap_or(""),
+                start_seconds = context.start_seconds,
+                "serving native HLS WebVTT subtitle"
             );
-            ApiError::Internal("subtitle extraction failed".into())
-        })?;
-    let bytes = tokio::fs::read(cached)
-        .await
-        .map_err(|e| ApiError::Internal(format!("reading extracted subtitles: {e}")))?;
-    tracing::info!(
-        session_id = %session,
-        file_id = file.id,
-        index,
-        codec = %track.codec,
-        language = track.language.as_deref().unwrap_or("und"),
-        title = track.title.as_deref().unwrap_or(""),
-        start_seconds = context.start_seconds,
-        "serving native HLS WebVTT subtitle"
-    );
+            (bytes, "private, max-age=3600")
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // AVPlayer gives a subtitle segment only about two seconds to
+            // answer and blocks the muxed video while it waits. Extracting an
+            // embedded text track is a full-source scan that can legitimately
+            // take minutes on a large MKV over a NAS, so awaiting `ensure_vtt`
+            // here turns healthy Dolby Vision, HDR and H.264 streams into a
+            // black screen. Publish a syntactically valid empty segment now
+            // and let the deduplicated cache extraction finish independently.
+            // `no-store` lets a player retry this window once the sidecar is
+            // ready instead of pinning the temporary empty answer.
+            crate::subtitles::warm_vtt(&state.subs_dir, &file, index).await;
+            tracing::debug!(
+                session_id = %session,
+                file_id = file.id,
+                index,
+                "serving an empty subtitle segment while its sidecar cache warms"
+            );
+            (b"WEBVTT\n\n".to_vec(), "no-store")
+        }
+        Err(error) => {
+            return Err(ApiError::Internal(format!(
+                "reading extracted subtitles: {error}"
+            )));
+        }
+    };
     Ok((
         StatusCode::OK,
         [
             (header::CONTENT_TYPE, "text/vtt; charset=utf-8"),
-            (header::CACHE_CONTROL, "private, max-age=3600"),
+            (header::CACHE_CONTROL, cache_control),
         ],
         // The session's MEDIA origin, not the offset that was requested. A
         // copy session seeks with `-noaccurate_seek`, so its timeline begins
