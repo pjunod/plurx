@@ -79,7 +79,23 @@ struct SettingsView: View {
                 Text("Instant keeps a title's subtitles ready from the moment it starts, so turning them on or changing language never interrupts the picture — the server prepares every play. After a short pause begins the film straight from the file and rebuilds it once, at the same moment, the first time you choose a subtitle. Applies to the next title you start.")
             }
 
-            Section("Appearance") {
+            Section {
+                Picker("Theme", selection: Binding(
+                    get: { model.theme },
+                    set: { model.setTheme($0) }
+                )) {
+                    ForEach(ViewerTheme.allCases) { theme in
+                        Text(theme.label).tag(theme)
+                    }
+                }
+                Picker("Appearance", selection: Binding(
+                    get: { model.appearance },
+                    set: { model.setAppearance($0) }
+                )) {
+                    ForEach(ViewerAppearance.allCases) { appearance in
+                        Text(appearance.label).tag(appearance)
+                    }
+                }
                 Picker("Icon size", selection: Binding(
                     get: { model.posterSize },
                     set: { model.setPosterSize($0) }
@@ -88,6 +104,18 @@ struct SettingsView: View {
                         Text(size.label).tag(size)
                     }
                 }
+                Picker("Home layout", selection: Binding(
+                    get: { model.libraryGrouping },
+                    set: { model.setLibraryGrouping($0) }
+                )) {
+                    ForEach(LibraryGrouping.allCases) { grouping in
+                        Text(grouping.label).tag(grouping)
+                    }
+                }
+            } header: {
+                Text("Appearance")
+            } footer: {
+                Text("Theme and room brightness are independent. Home layout groups shelves by media category or by individual library.")
             }
 
             Section("Account") {
@@ -102,7 +130,10 @@ struct SettingsView: View {
             }
         }
         .navigationTitle("Settings")
+        .tint(Palette.accent)
+        .background(Palette.bg)
         #if os(iOS)
+        .scrollContentBackground(.hidden)
         .navigationBarTitleDisplayMode(.inline)
         #endif
     }

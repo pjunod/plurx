@@ -12,12 +12,12 @@ anything it can't (MKV, DTS/TrueHD, …) is delivered as the server's on-the-fly
 HDR display at runtime and sends that to `/decision`, so the server transcodes
 only what this hardware genuinely can't play.
 
-> Status: **v0.2.0**, build `6` in [`project.yml`](project.yml) — working
+> Status: **v0.2.2**, build `10` in [`project.yml`](project.yml) — working
 > development client. Browse, resume, discover, and play on both iOS and
 > tvOS. Both targets compile against the iOS/tvOS 26.5 SDKs and share the
-> same regression suite. Build 6 carries the 2026-08-02 subtitle-selection
-> and playback-state fixes and **has not been built, installed, or uploaded
-> to TestFlight**; build `5` is what is installed on the Bedroom Apple TV.
+> same regression suite. Build 10 carries the 2026-08-03 Dolby Vision stall
+> recovery and appearance-settings fixes and is installed on the paired
+> iPhones, iPads, and Bedroom Apple TV. It has not been uploaded to TestFlight.
 > It is not yet at full web parity; the exact boundary is in
 > [Feature parity](#feature-parity).
 
@@ -251,6 +251,13 @@ server's **delivery plan**:
 - `transcode` → the same `POST` with **no height named**: Auto is the server's
   choice, because the rung depends on which encoder wins and only the create
   response knows that.
+
+Dolby Vision is preserved on the first attempt. If an HDR10- or HLG-compatible
+Profile 8 title produces no film-time progress for roughly 12 seconds, the
+client retries once with only the Dolby Vision metadata removed. The 10-bit
+HEVC base picture and HDR grade remain intact; a full compatibility transcode
+is reserved for a second failure. A normally playing Dolby Vision stream never
+enters this recovery ladder.
 
 Both the decision and the session response also carry
 `delivered_dynamic_range` (`dolby_vision` / `hdr10` / `hlg` / `sdr`) — what the

@@ -553,7 +553,7 @@ struct PlayerView: View {
         .padding(.vertical, 8)
         .frame(maxWidth: 980, alignment: .leading)
         .background(
-            Palette.bg.opacity(0.68),
+            Palette.playerChrome.opacity(0.68),
             in: RoundedRectangle(cornerRadius: 8, style: .continuous)
         )
         .accessibilityElement(children: .combine)
@@ -592,7 +592,7 @@ struct PlayerView: View {
                 .padding(.horizontal, TVPlayerChromeMetrics.headerHorizontalInset)
                 .padding(.vertical, TVPlayerChromeMetrics.headerVerticalInset)
                 .background(
-                    Palette.bg.opacity(0.68),
+                    Palette.playerChrome.opacity(0.68),
                     in: RoundedRectangle(cornerRadius: 8, style: .continuous)
                 )
                 .layoutPriority(1)

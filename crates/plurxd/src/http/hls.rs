@@ -965,7 +965,18 @@ fn master_playlist_with_shape(
     // not promise independently decodable segments. The master must not make
     // that stronger claim on its behalf: AVPlayer acts on it at a resume
     // boundary and can reject an otherwise playable copied HEVC/DV stream.
-    let mut out = String::from("#EXTM3U\n#EXT-X-VERSION:7\n");
+    // SUPPLEMENTAL-CODECS was introduced at HLS compatibility version 10.
+    // Advertising it from a version-7 master makes AVPlayer reject the
+    // otherwise valid Profile 8.1/8.4 rendition during item preparation, and
+    // the Apple client then takes its final H.264/SDR compatibility fallback.
+    // Keep ordinary masters at version 7; only the enhanced-codec declaration
+    // needs the newer contract.
+    let compatibility_version = if shape.codecs && context.supplemental_codecs.is_some() {
+        10
+    } else {
+        7
+    };
+    let mut out = format!("#EXTM3U\n#EXT-X-VERSION:{compatibility_version}\n");
     for (ordinal, (index, track)) in native.iter().enumerate() {
         if !shape.subtitles {
             break;
@@ -1534,6 +1545,7 @@ mod tests {
         let file = hls_file(vec![]);
         let stripped = hls_context("hvc1.2.4.L150.B0,mp4a.40.2", None);
         let master = master_playlist(&file, None, &stripped);
+        assert!(master.starts_with("#EXTM3U\n#EXT-X-VERSION:7\n"));
         assert!(master.contains(
             "#EXT-X-STREAM-INF:BANDWIDTH=40000000,AVERAGE-BANDWIDTH=40000000,\
              RESOLUTION=3840x2160,FRAME-RATE=23.976,VIDEO-RANGE=PQ,\
@@ -1542,6 +1554,7 @@ mod tests {
 
         let compatible_dv = hls_context("hvc1.2.4.L150.B0,ec-3", Some("dvh1.08.10/db1p"));
         let master = master_playlist(&file, None, &compatible_dv);
+        assert!(master.starts_with("#EXTM3U\n#EXT-X-VERSION:10\n"));
         assert!(master.contains("VIDEO-RANGE=PQ"));
         assert!(master.contains("CODECS=\"hvc1.2.4.L150.B0,ec-3\""));
         assert!(master.contains("SUPPLEMENTAL-CODECS=\"dvh1.08.10/db1p\""));

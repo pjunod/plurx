@@ -109,6 +109,12 @@ enum PlaybackStallAction: Equatable {
     case reopen
 }
 
+enum PlaybackCompatibilityFallback: Equatable {
+    case none
+    case hdrBase
+    case transcode
+}
+
 /// Wall-clock sampling policy for AVPlayer's silent-wait failure mode. A
 /// temporary buffer wait gets room to recover on its own; only sustained lack
 /// of film-time progress rebuilds the item, which is the in-player equivalent
@@ -214,6 +220,9 @@ final class PlayerController: ObservableObject {
     private var sessionId: String?
     private var lastReportedMs = 0
     private var usesDirectTimeline = false
+    private var canRetryCurrentItemWithHDRBase = false
+    private var dolbyVisionFallbackAttempted = false
+    private var forceCompatibleHDRBase = false
     private var canRetryCurrentItemWithTranscode = false
     private var compatibilityFallbackAttempted = false
     private var forceCompatibilityTranscode = false
@@ -321,6 +330,12 @@ final class PlayerController: ObservableObject {
         self.title = title
         subtitleReadiness = model.subtitleReadiness
         wantsNativeSubtitleRenditions = false
+        canRetryCurrentItemWithHDRBase = false
+        dolbyVisionFallbackAttempted = false
+        forceCompatibleHDRBase = false
+        canRetryCurrentItemWithTranscode = false
+        compatibilityFallbackAttempted = false
+        forceCompatibilityTranscode = false
 
         #if os(iOS)
         // iOS needs an explicit playback audio session for silent-switch and
@@ -621,6 +636,7 @@ final class PlayerController: ObservableObject {
 
         let normalMode = Self.playbackMode(decision)
         let preserveDolbyVision = Self.shouldPreserveDolbyVision(decision)
+            && !forceCompatibleHDRBase
         // Captured once: `selectedSubtitle` may change while the awaits below
         // run, and the difference is reconciled when this open completes (P1-2).
         let requestedSubtitle = selectedSubtitle
@@ -642,6 +658,7 @@ final class PlayerController: ObservableObject {
             subtitlesInUse: wantsNativeSubtitleRenditions
         )
         canRetryCurrentItemWithTranscode = normalMode != "transcode" && !forceTranscode && !customAudio
+        canRetryCurrentItemWithHDRBase = false
         // P2-7, decided by Paul on 2026-08-02 (plan §2.5): stay direct until
         // the first native selection. Merely *having* native text tracks no
         // longer abolishes true direct play — every such file used to become a
@@ -670,6 +687,9 @@ final class PlayerController: ObservableObject {
         } else {
             let copy = !forceTranscode
                 && (normalMode == "direct" || normalMode == "remux" || customAudio)
+            canRetryCurrentItemWithHDRBase = copy
+                && preserveDolbyVision
+                && Self.hasCompatibleDolbyVisionBase(decision.source?.hdrFormat)
             // The checkmark comes from `/decision`'s shared-policy pick. Carry
             // that exact track into the initial session too: relying on an
             // omitted audio field made copy-video HLS fall back to the muxer's
@@ -904,10 +924,11 @@ final class PlayerController: ObservableObject {
                     && self.seekState.pendingMs == nil
                     && self.player.currentItem != nil
                 let position = self.realPositionMs()
-                switch self.stallDetector.sample(
+                let stallAction = self.stallDetector.sample(
                     positionMs: position,
                     shouldMonitor: shouldMonitor
-                ) {
+                )
+                switch stallAction {
                 case .none:
                     break
                 case .nudge:
@@ -916,6 +937,7 @@ final class PlayerController: ObservableObject {
                     self.isPlaying = true
                 case .reopen:
                     self.currentMs = position
+                    if await self.retryWithNextCompatibilityFallback(at: position) { continue }
                     await self.reopen(at: position)
                 }
             }
@@ -1001,25 +1023,15 @@ final class PlayerController: ObservableObject {
             guard item.status == .failed else { return }
             Task { @MainActor in
                 guard let self, self.player.currentItem === item else { return }
-                if Self.shouldRetryWithCompatibilityTranscode(
-                    canRetry: self.canRetryCurrentItemWithTranscode,
-                    alreadyAttempted: self.compatibilityFallbackAttempted
-                ), self.started {
-                    self.compatibilityFallbackAttempted = true
-                    self.forceCompatibilityTranscode = true
-                    self.canRetryCurrentItemWithTranscode = false
-                    self.isChangingStream = false
-                    self.playbackError = "The original stream could not open. Retrying a compatible stream…"
+                if self.started {
                     // P2-6: this item is already dead, so its `currentTime()`
                     // is 0 or invalid and a VOD/direct retry would silently
                     // restart the film at 0:00. The last position the periodic
                     // observer saw is the truthful retry point. The transport
                     // intent survives in `wantsPlayback`, so a viewer who was
                     // paused when the item failed stays paused.
-                    await self.reopen(
-                        at: Self.compatibilityRetryPositionMs(lastObservedMs: self.currentMs)
-                    )
-                    return
+                    let position = Self.compatibilityRetryPositionMs(lastObservedMs: self.currentMs)
+                    if await self.retryWithNextCompatibilityFallback(at: position) { return }
                 }
                 self.player.pause()
                 self.isPlaying = false
@@ -1037,6 +1049,60 @@ final class PlayerController: ObservableObject {
         alreadyAttempted: Bool
     ) -> Bool {
         canRetry && !alreadyAttempted
+    }
+
+    static func nextCompatibilityFallback(
+        canRetryWithHDRBase: Bool,
+        hdrBaseAlreadyAttempted: Bool,
+        canRetryWithTranscode: Bool,
+        transcodeAlreadyAttempted: Bool
+    ) -> PlaybackCompatibilityFallback {
+        if canRetryWithHDRBase && !hdrBaseAlreadyAttempted { return .hdrBase }
+        if shouldRetryWithCompatibilityTranscode(
+            canRetry: canRetryWithTranscode,
+            alreadyAttempted: transcodeAlreadyAttempted
+        ) {
+            return .transcode
+        }
+        return .none
+    }
+
+    /// Profile 8.1/8.4 sources carry a complete HDR base picture beneath
+    /// their Dolby Vision metadata. If VideoToolbox silently rejects that
+    /// title's RPU/configuration, the server can strip only the DV layer and
+    /// keep the same 10-bit HEVC picture instead of tone-mapping to SDR.
+    static func hasCompatibleDolbyVisionBase(_ hdrFormat: String?) -> Bool {
+        let format = hdrFormat?.lowercased() ?? ""
+        return format.contains("hdr10-compatible") || format.contains("hlg-compatible")
+    }
+
+    /// Advance through the least-destructive recovery ladder. A compatible
+    /// DV source first becomes HDR10/HLG without a video encode; only a second
+    /// failure falls back to the existing universal transcode.
+    private func retryWithNextCompatibilityFallback(at position: Int) async -> Bool {
+        switch Self.nextCompatibilityFallback(
+            canRetryWithHDRBase: canRetryCurrentItemWithHDRBase,
+            hdrBaseAlreadyAttempted: dolbyVisionFallbackAttempted,
+            canRetryWithTranscode: canRetryCurrentItemWithTranscode,
+            transcodeAlreadyAttempted: compatibilityFallbackAttempted
+        ) {
+        case .none:
+            return false
+        case .hdrBase:
+            dolbyVisionFallbackAttempted = true
+            forceCompatibleHDRBase = true
+            canRetryCurrentItemWithHDRBase = false
+            isChangingStream = false
+            playbackError = "Dolby Vision did not start. Retrying the HDR10-compatible picture…"
+        case .transcode:
+            compatibilityFallbackAttempted = true
+            forceCompatibilityTranscode = true
+            canRetryCurrentItemWithTranscode = false
+            isChangingStream = false
+            playbackError = "The compatible stream did not start. Retrying a universal stream…"
+        }
+        await reopen(at: position)
+        return true
     }
 
     private func report(_ position: Int) {

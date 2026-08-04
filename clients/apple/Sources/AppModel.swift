@@ -30,6 +30,8 @@ final class AppModel: ObservableObject {
     @Published var audioLang: String
     @Published var subLang: String
     @Published var autoplay: Bool
+    @Published var theme: ViewerTheme
+    @Published var appearance: ViewerAppearance
     @Published var posterSize: PosterSize
     @Published var subtitleReadiness: SubtitleReadiness
 
@@ -54,6 +56,8 @@ final class AppModel: ObservableObject {
         audioLang = settings.audioLang
         subLang = settings.subLang
         autoplay = settings.autoplay
+        theme = settings.theme
+        appearance = settings.appearance
         posterSize = settings.posterSize
         subtitleReadiness = settings.subtitleReadiness
         libraryGrouping = settings.libraryGrouping
@@ -420,6 +424,18 @@ final class AppModel: ObservableObject {
     func setSubtitleReadiness(_ readiness: SubtitleReadiness) {
         subtitleReadiness = readiness
         settings.subtitleReadiness = readiness
+    }
+
+    func setTheme(_ theme: ViewerTheme) {
+        // Write before publishing so adaptive UIKit colors resolve the new
+        // palette during the SwiftUI redraw triggered by this assignment.
+        settings.theme = theme
+        self.theme = theme
+    }
+
+    func setAppearance(_ appearance: ViewerAppearance) {
+        settings.appearance = appearance
+        self.appearance = appearance
     }
 
     func setLibraryGrouping(_ grouping: LibraryGrouping) {
