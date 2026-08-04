@@ -452,10 +452,11 @@ pub async fn master_playlist_response(
     // Apple's multivariant eligibility check rejects UHD Blu-ray-style HEVC
     // High-tier declarations before VideoToolbox sees bytes it can decode.
     // With no native text renditions, the wrapper buys this session nothing:
-    // serve the same proven fMP4 media playlist from this capability URL and
-    // let AVPlayer inspect the authoritative hvcC/Dolby Vision records in the
-    // initialization segment. Bitmap/styled subtitles already use burn-in, so
-    // they do not depend on a multivariant subtitle group.
+    // serve the same proven fMP4 media playlist from this capability URL. The
+    // initialization-segment response translates the tier declaration into
+    // the Apple eligibility envelope without changing the coded picture.
+    // Bitmap/styled subtitles already use burn-in, so they do not depend on a
+    // multivariant subtitle group.
     if query.diagnostic.is_none() && should_serve_high_tier_media_playlist(&file, &context) {
         tracing::info!(
             session_id = %session,
@@ -738,6 +739,49 @@ fn should_serve_high_tier_media_playlist(
                 !level.is_empty() && level.bytes().all(|byte| byte.is_ascii_digit())
             })
         })
+}
+
+/// Clear the HEVC High-tier declaration AVPlayer rejects for otherwise
+/// hardware-decodable HDR copy sessions.
+///
+/// Tier changes decoder throughput limits, not the coded picture or decoder
+/// tools. Relabeling only the generated initialization record lets the bytes
+/// reach VideoToolbox instead of failing AVPlayer's HLS preparation step. This
+/// is deliberately limited to the same HDR/no-native-rendition sessions whose
+/// master is collapsed above.
+fn normalize_high_tier_hevc_init(file: &MediaFile, init: &mut [u8]) -> bool {
+    if file.hdr.is_none()
+        || file
+            .subtitle_streams
+            .iter()
+            .any(|track| is_native_text_subtitle(&track.codec))
+    {
+        return false;
+    }
+    let Some(type_at) = init.windows(4).position(|window| window == b"hvcC") else {
+        return false;
+    };
+    let Some(box_start) = type_at.checked_sub(4) else {
+        return false;
+    };
+    let Some(size_bytes) = init.get(box_start..type_at) else {
+        return false;
+    };
+    let Ok(size_bytes) = size_bytes.try_into() else {
+        return false;
+    };
+    let box_size = u32::from_be_bytes(size_bytes) as usize;
+    let Some(box_end) = box_start.checked_add(box_size) else {
+        return false;
+    };
+    let Some(payload) = init.get_mut(type_at + 4..box_end) else {
+        return false;
+    };
+    if box_size < 21 || payload.len() < 13 || payload[0] != 1 || payload[1] & 0x20 == 0 {
+        return false;
+    }
+    payload[1] &= !0x20;
+    true
 }
 
 /// The human half of a rendition's `NAME`. Display names are a presentation
@@ -1368,6 +1412,36 @@ pub async fn segment(
         .await
         .ok_or(ApiError::NotFound("segment"))?;
     let content_type = segment_content_type(&seg);
+    if seg == "init.mp4" && opened.len <= 1024 * 1024 {
+        let mut init = Vec::with_capacity(opened.len.min(64 * 1024) as usize);
+        opened
+            .file
+            .take(1024 * 1024)
+            .read_to_end(&mut init)
+            .await
+            .map_err(|error| ApiError::Internal(error.to_string()))?;
+        if let Ok((_, file)) = session_file(&state, &session).await {
+            if normalize_high_tier_hevc_init(&file, &mut init) {
+                tracing::info!(
+                    session_id = %session,
+                    "translated the HEVC High-tier initialization record for Apple HLS"
+                );
+            }
+        }
+        return Ok((
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, content_type.to_owned()),
+                (header::CONTENT_LENGTH, init.len().to_string()),
+                (
+                    header::CACHE_CONTROL,
+                    "private, max-age=3600, immutable".to_owned(),
+                ),
+            ],
+            init,
+        )
+            .into_response());
+    }
     Ok((
         StatusCode::OK,
         [
@@ -1693,6 +1767,36 @@ mod tests {
             &bitmap_only,
             &high_profile_h264
         ));
+    }
+
+    #[test]
+    fn high_tier_hdr_init_is_relabelled_for_apple_hls() {
+        let file = hls_file(vec![sub(
+            "hdmv_pgs_subtitle",
+            "eng",
+            "English",
+            false,
+            false,
+        )]);
+        // hvcC version 1, Main 10, High tier, compatibility 4, level 153.
+        let mut init = vec![0, 0, 0, 21];
+        init.extend_from_slice(b"hvcC");
+        init.extend_from_slice(&[1, 0x22, 0x20, 0, 0, 0, 0x90, 0, 0, 0, 0, 0, 153]);
+        assert_eq!(
+            hevc_codec_from_init(&init, "hvc1").as_deref(),
+            Some("hvc1.2.4.H153.90")
+        );
+        assert!(normalize_high_tier_hevc_init(&file, &mut init));
+        assert_eq!(
+            hevc_codec_from_init(&init, "hvc1").as_deref(),
+            Some("hvc1.2.4.L153.90")
+        );
+        assert!(!normalize_high_tier_hevc_init(&file, &mut init));
+
+        let mut sdr = file;
+        sdr.hdr = None;
+        init[9] |= 0x20;
+        assert!(!normalize_high_tier_hevc_init(&sdr, &mut init));
     }
 
     #[test]
