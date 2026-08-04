@@ -2,10 +2,9 @@
 #
 # One command per target for the things Paul's Mac controls.
 #
-# Server and mobile deployment both run through Ansible. The server playbook
-# remains in the local infrastructure repo; the mobile playbook is versioned
-# with the clients it ships, while the infrastructure inventory names the
-# controller and its devices.
+# Server and mobile deployment both run through the private Ansible repository.
+# Plurx owns this entry point and passes its checkout path to infrastructure;
+# Ansible owns the playbooks, controller inventory, and device contract.
 #
 # Everything is opt-in and everything prints what it will do first. Nothing
 # here force-pushes, rewrites history, or deploys without saying which nodes.
@@ -98,15 +97,13 @@ if [ "$DO_PUSH" -eq 1 ]; then
 fi
 
 # --- deploy ----------------------------------------------------------------
-# The ansible repo lives outside this one and has NO git remote: its inventory
-# commits (nodes pinned to origin/main, nuc3 added) exist only on this
-# machine. Worth saying out loud at every deploy, because "it is deployed"
-# and "it is committed somewhere durable" are not the same sentence here.
+# The private Ansible repo lives outside this one. Its playbooks are versioned,
+# while its production inventory remains local and uncommitted.
 if [ "$DO_DEPLOY" -eq 1 ]; then
   say "deploy"
   [ -d "$ANSIBLE_DIR" ] || die "no ansible dir at $ANSIBLE_DIR (set PLURX_ANSIBLE_DIR)"
   [ -f "$ANSIBLE_INVENTORY" ] || die "no ansible inventory at $ANSIBLE_INVENTORY (set PLURX_ANSIBLE_INVENTORY)"
-  note "playbooks: $ANSIBLE_DIR (a repo with no remote — its inventory lives only here)"
+  note "playbooks: $ANSIBLE_DIR (private repo; production inventory stays local)"
   note "nodes follow origin/main, so push first or you will deploy the old tree"
   note "nuc4's port is held by Plex; that is accepted, not a failure"
 
@@ -159,6 +156,7 @@ if [ $((DO_APPLE + DO_ANDROID)) -gt 0 ]; then
   say "mobile"
   if [ "$DRY" -eq 0 ]; then
     command -v ansible-playbook >/dev/null || die "no ansible-playbook in PATH"
+    [ -f "$ANSIBLE_DIR/mobile.yml" ] || die "no mobile playbook at $ANSIBLE_DIR/mobile.yml (set PLURX_ANSIBLE_DIR)"
     [ -f "$ANSIBLE_INVENTORY" ] || die "no ansible inventory at $ANSIBLE_INVENTORY (set PLURX_ANSIBLE_INVENTORY)"
     if [ -n "$MOBILE_VARS_FILE" ]; then
       [ -f "$MOBILE_VARS_FILE" ] || die "no mobile vars file at $MOBILE_VARS_FILE"
@@ -175,7 +173,7 @@ if [ $((DO_APPLE + DO_ANDROID)) -gt 0 ]; then
   MOBILE_ARGS=(
     ansible-playbook
     -i "$ANSIBLE_INVENTORY"
-    "$ROOT/deploy/ansible/mobile.yml"
+    "$ANSIBLE_DIR/mobile.yml"
     --tags "$MOBILE_TAGS"
     -e "plurx_repo=$ROOT"
   )
