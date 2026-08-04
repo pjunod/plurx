@@ -6,7 +6,7 @@
 //! subtitle endpoint always uses it, and burned transcodes reuse it for simple
 //! text codecs whose authored styling is not lost by WebVTT conversion.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -92,6 +92,17 @@ type Extractions = tokio::sync::Mutex<HashMap<PathBuf, Arc<Extraction>>>;
 fn extractions() -> &'static Extractions {
     static EXTRACTIONS: OnceLock<Extractions> = OnceLock::new();
     EXTRACTIONS.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
+}
+
+/// Detached warmers by cache key. `ensure_vtt` already deduplicates the actual
+/// ffmpeg extraction; this smaller registry also deduplicates the tasks waiting
+/// on it, so a player reloading an EVENT subtitle playlist cannot accumulate a
+/// new ten-minute waiter on every refresh.
+type Warmups = tokio::sync::Mutex<HashSet<PathBuf>>;
+
+fn warmups() -> &'static Warmups {
+    static WARMUPS: OnceLock<Warmups> = OnceLock::new();
+    WARMUPS.get_or_init(|| tokio::sync::Mutex::new(HashSet::new()))
 }
 
 /// Why a cache key failed, and when that answer stops being reused.
@@ -211,6 +222,30 @@ pub async fn ensure_vtt(dir: &Path, file: &MediaFile, index: i64) -> Result<Path
         extract_vtt(&tmp, &file, index).await
     })
     .await
+}
+
+/// Start materialising a sidecar without holding the caller open.
+///
+/// Native HLS uses this before returning an empty cold-cache segment. AVPlayer
+/// blocks the muxed video behind subtitle segment I/O and gives that I/O about
+/// two seconds, while a real extraction may scan a multi-gigabyte source for
+/// minutes. One detached warmer per key lets playback begin immediately and
+/// lets later segments pick up the finished captions.
+pub async fn warm_vtt(dir: &Path, file: &MediaFile, index: i64) {
+    let cached = vtt_path(dir, file, index);
+    if tokio::fs::metadata(&cached).await.is_ok() {
+        return;
+    }
+    if !warmups().lock().await.insert(cached.clone()) {
+        return;
+    }
+
+    let dir = dir.to_owned();
+    let file = file.clone();
+    tokio::spawn(async move {
+        let _ = ensure_vtt(&dir, &file, index).await;
+        warmups().lock().await.remove(&cached);
+    });
 }
 
 /// The production seam: default bounds, injected extractor.

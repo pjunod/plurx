@@ -4635,6 +4635,28 @@ mod tests {
         );
         assert!(subtitle_playlist.contains("#EXT-X-ENDLIST"));
 
+        // A cold embedded subtitle is a full-file extraction. AVPlayer gives
+        // each VTT segment only about two seconds and holds the video in
+        // `AVPlayerWaitingToMinimizeStallsReason` when that request does not
+        // answer, so the segment route must return a valid empty window while
+        // the sidecar warms instead of awaiting the scan.
+        let (status, cold) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            body_of(
+                &app,
+                get_q(&format!("/api/v1/hls/{session}/subs/0/seg00000.vtt")),
+            ),
+        )
+        .await
+        .expect("a cold subtitle segment must answer before AVPlayer's deadline");
+        assert_eq!(status, StatusCode::OK);
+        let cold = String::from_utf8(cold).expect("cold VTT utf8");
+        assert!(cold.starts_with("WEBVTT"), "{cold}");
+        assert!(
+            cold.contains("X-TIMESTAMP-MAP=MPEGTS:0,LOCAL:00:00:00.000"),
+            "the empty answer still has to align with its video segment: {cold}"
+        );
+
         // Seed the extraction cache so the handler test can focus on the
         // capability and timeline mapping rather than the placeholder MP4.
         let file = state
