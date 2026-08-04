@@ -189,6 +189,50 @@ final class AppleClientTests: XCTestCase {
     }
 
     @MainActor
+    func testApplePlayerFallsBackFromDolbyVisionToHDRBeforeSDR() {
+        XCTAssertTrue(PlayerController.hasCompatibleDolbyVisionBase(
+            "Dolby Vision · Profile 8 (HDR10-compatible)"
+        ))
+        XCTAssertTrue(PlayerController.hasCompatibleDolbyVisionBase(
+            "Dolby Vision · Profile 8 (HLG-compatible)"
+        ))
+        XCTAssertFalse(PlayerController.hasCompatibleDolbyVisionBase(
+            "Dolby Vision · Profile 5"
+        ))
+
+        XCTAssertEqual(
+            PlayerController.nextCompatibilityFallback(
+                canRetryWithHDRBase: true,
+                hdrBaseAlreadyAttempted: false,
+                canRetryWithTranscode: true,
+                transcodeAlreadyAttempted: false
+            ),
+            .hdrBase,
+            "Profile 8.1 keeps its 10-bit HDR base before any video encode"
+        )
+        XCTAssertEqual(
+            PlayerController.nextCompatibilityFallback(
+                canRetryWithHDRBase: false,
+                hdrBaseAlreadyAttempted: true,
+                canRetryWithTranscode: true,
+                transcodeAlreadyAttempted: false
+            ),
+            .transcode,
+            "a failed HDR-base retry may still use the universal fallback"
+        )
+        XCTAssertEqual(
+            PlayerController.nextCompatibilityFallback(
+                canRetryWithHDRBase: false,
+                hdrBaseAlreadyAttempted: true,
+                canRetryWithTranscode: false,
+                transcodeAlreadyAttempted: true
+            ),
+            .none,
+            "the recovery ladder cannot loop either compatibility attempt"
+        )
+    }
+
+    @MainActor
     func testAutomaticSubtitlesApplyTheServersPickInsteadOfRederivingIt() {
         // The Scary Movie shape, as the decision hands it over: the server ran
         // `select_tracks` and stamped `default` on exactly the track it chose,
