@@ -482,11 +482,11 @@ mod tests {
             .expect("a cursor must be stamped before the pass ends")
             .parse()
             .expect("numeric cursor");
-        // Everything is measured from the CURSOR, not from how many rows
-        // happen to have genres: the two differ for one instant per title
-        // (between the patch landing and the stamp landing), and a test that
-        // equates them is a test that fails on a busy machine for a reason
-        // that has nothing to do with the behaviour.
+        // The cursor is the durable resume point. Cancellation can also land
+        // in the small window after the next title's genres are stored but
+        // before its cursor stamp lands. In that case the store is one title
+        // ahead of the cursor, and the resume query correctly skips that
+        // already-patched title instead of fetching it again.
         let done_first = ids
             .iter()
             .position(|id| *id == cursor)
@@ -497,11 +497,12 @@ mod tests {
             "the interruption must land mid-run, not before or after it: \
              {done_first} of {TITLES} done, cursor {cursor}"
         );
-        assert_eq!(
-            with_genres(&store, &ids).await,
-            done_first,
-            "every title behind the cursor has its genres, and none ahead of \
-             it does"
+        let stored_first = with_genres(&store, &ids).await;
+        assert!(
+            (done_first..=done_first + 1).contains(&stored_first),
+            "every title behind the cursor has its genres, and at most the \
+             one being stamped may be ahead of it: cursor covers {done_first}, \
+             store has {stored_first}"
         );
 
         let before_resume = hits.lock().expect("hits").len();
@@ -516,7 +517,7 @@ mod tests {
         );
         assert_eq!(
             report.backfilled,
-            TITLES as usize - done_first,
+            TITLES as usize - stored_first,
             "it does the rest, and only the rest"
         );
         assert_eq!(with_genres(&store, &ids).await, TITLES as usize);
@@ -525,7 +526,7 @@ mod tests {
         // cursor — not one before it, not one twice.
         let fetched = hits.lock().expect("hits").clone();
         let resumed: Vec<i64> = fetched[before_resume..].to_vec();
-        let expected: Vec<i64> = (done_first as i64..TITLES).map(|n| BASE_ID + n).collect();
+        let expected: Vec<i64> = (stored_first as i64..TITLES).map(|n| BASE_ID + n).collect();
         assert_eq!(
             resumed, expected,
             "a resumed backfill re-fetches nothing behind its cursor; the \
