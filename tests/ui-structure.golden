@@ -66,11 +66,11 @@ classic|activity@1280x860|dom|nav > a.active[text]|1
 classic|activity@1280x860|dom|nav > a[text]|2
 classic|activity@1280x860|dom|p.muted[text] > a[text]|1
 classic|activity@1280x860|dom|svg[aria-hidden=true] > rect|4
-classic|activity@1280x860|focus|000|a.logo "cinemarr"
+classic|activity@1280x860|focus|000|a.logo "cinema"
 classic|activity@1280x860|focus|001|a "home"
 classic|activity@1280x860|focus|002|a.active "activity"
 classic|activity@1280x860|focus|003|a "settings"
-classic|activity@1280x860|focus|004|input#q.search "Search cinemarr"
+classic|activity@1280x860|focus|004|input#q.search "Search cinema"
 classic|activity@1280x860|focus|005|button.ghost.sm "Theme"
 classic|activity@1280x860|focus|006|button.ghost.sm "Light / dark"
 classic|activity@1280x860|focus|007|button.ghost.sm.sizebtn "Icon size"
@@ -113,11 +113,11 @@ classic|activity@390x780|dom|nav > a.active[text]|1
 classic|activity@390x780|dom|nav > a[text]|2
 classic|activity@390x780|dom|p.muted[text] > a[text]|1
 classic|activity@390x780|dom|svg[aria-hidden=true] > rect|4
-classic|activity@390x780|focus|000|a.logo "cinemarr"
+classic|activity@390x780|focus|000|a.logo "cinema"
 classic|activity@390x780|focus|001|a "home"
 classic|activity@390x780|focus|002|a.active "activity"
 classic|activity@390x780|focus|003|a "settings"
-classic|activity@390x780|focus|004|input#q.search "Search cinemarr"
+classic|activity@390x780|focus|004|input#q.search "Search cinema"
 classic|activity@390x780|focus|005|button.ghost.sm "Theme"
 classic|activity@390x780|focus|006|button.ghost.sm "Light / dark"
 classic|activity@390x780|focus|007|button.ghost.sm.sizebtn "Icon size"
@@ -234,11 +234,11 @@ classic|category@1280x860|dom|nav > a.active[text]|1
 classic|category@1280x860|dom|nav > a[text]|2
 classic|category@1280x860|dom|select > option[text]|14
 classic|category@1280x860|dom|svg[aria-hidden=true] > rect|4
-classic|category@1280x860|focus|000|a.logo "cinemarr"
+classic|category@1280x860|focus|000|a.logo "cinema"
 classic|category@1280x860|focus|001|a.active "home"
 classic|category@1280x860|focus|002|a "activity"
 classic|category@1280x860|focus|003|a "settings"
-classic|category@1280x860|focus|004|input#q.search "Search cinemarr"
+classic|category@1280x860|focus|004|input#q.search "Search cinema"
 classic|category@1280x860|focus|005|button.ghost.sm "Theme"
 classic|category@1280x860|focus|006|button.ghost.sm "Light / dark"
 classic|category@1280x860|focus|007|button.ghost.sm.sizebtn "Icon size"
@@ -319,11 +319,11 @@ classic|category@390x780|dom|nav > a.active[text]|1
 classic|category@390x780|dom|nav > a[text]|2
 classic|category@390x780|dom|select > option[text]|14
 classic|category@390x780|dom|svg[aria-hidden=true] > rect|4
-classic|category@390x780|focus|000|a.logo "cinemarr"
+classic|category@390x780|focus|000|a.logo "cinema"
 classic|category@390x780|focus|001|a.active "home"
 classic|category@390x780|focus|002|a "activity"
 classic|category@390x780|focus|003|a "settings"
-classic|category@390x780|focus|004|input#q.search "Search cinemarr"
+classic|category@390x780|focus|004|input#q.search "Search cinema"
 classic|category@390x780|focus|005|button.ghost.sm "Theme"
 classic|category@390x780|focus|006|button.ghost.sm "Light / dark"
 classic|category@390x780|focus|007|button.ghost.sm.sizebtn "Icon size"
@@ -408,11 +408,11 @@ classic|home@1280x860|dom|nav > a.active[text]|1
 classic|home@1280x860|dom|nav > a[text]|2
 classic|home@1280x860|dom|select > option[text]|2
 classic|home@1280x860|dom|svg[aria-hidden=true] > rect|4
-classic|home@1280x860|focus|000|a.logo "cinemarr"
+classic|home@1280x860|focus|000|a.logo "cinema"
 classic|home@1280x860|focus|001|a.active "home"
 classic|home@1280x860|focus|002|a "activity"
 classic|home@1280x860|focus|003|a "settings"
-classic|home@1280x860|focus|004|input#q.search "Search cinemarr"
+classic|home@1280x860|focus|004|input#q.search "Search cinema"
 classic|home@1280x860|focus|005|button.ghost.sm "Theme"
 classic|home@1280x860|focus|006|button.ghost.sm "Light / dark"
 classic|home@1280x860|focus|007|button.ghost.sm.sizebtn "Icon size"
@@ -498,11 +498,11 @@ classic|home@390x780|dom|nav > a.active[text]|1
 classic|home@390x780|dom|nav > a[text]|2
 classic|home@390x780|dom|select > option[text]|2
 classic|home@390x780|dom|svg[aria-hidden=true] > rect|4
-classic|home@390x780|focus|000|a.logo "cinemarr"
+classic|home@390x780|focus|000|a.logo "cinema"
 classic|home@390x780|focus|001|a.active "home"
 classic|home@390x780|focus|002|a "activity"
 classic|home@390x780|focus|003|a "settings"
-classic|home@390x780|focus|004|input#q.search "Search cinemarr"
+classic|home@390x780|focus|004|input#q.search "Search cinema"
 classic|home@390x780|focus|005|button.ghost.sm "Theme"
 classic|home@390x780|focus|006|button.ghost.sm "Light / dark"
 classic|home@390x780|focus|007|button.ghost.sm.sizebtn "Icon size"
@@ -578,11 +578,11 @@ classic|item@1280x860|dom|span.codec.vbadge[text] > svg.material-icon[aria-hidde
 classic|item@1280x860|dom|span.res.vbadge[text] > svg.material-icon[aria-hidden=true]|1
 classic|item@1280x860|dom|svg.material-icon[aria-hidden=true] > path|2
 classic|item@1280x860|dom|svg[aria-hidden=true] > rect|4
-classic|item@1280x860|focus|000|a.logo "cinemarr"
+classic|item@1280x860|focus|000|a.logo "cinema"
 classic|item@1280x860|focus|001|a.active "home"
 classic|item@1280x860|focus|002|a "activity"
 classic|item@1280x860|focus|003|a "settings"
-classic|item@1280x860|focus|004|input#q.search "Search cinemarr"
+classic|item@1280x860|focus|004|input#q.search "Search cinema"
 classic|item@1280x860|focus|005|button.ghost.sm "Theme"
 classic|item@1280x860|focus|006|button.ghost.sm "Light / dark"
 classic|item@1280x860|focus|007|button.ghost.sm.sizebtn "Icon size"
@@ -658,11 +658,11 @@ classic|item@390x780|dom|span.codec.vbadge[text] > svg.material-icon[aria-hidden
 classic|item@390x780|dom|span.res.vbadge[text] > svg.material-icon[aria-hidden=true]|1
 classic|item@390x780|dom|svg.material-icon[aria-hidden=true] > path|2
 classic|item@390x780|dom|svg[aria-hidden=true] > rect|4
-classic|item@390x780|focus|000|a.logo "cinemarr"
+classic|item@390x780|focus|000|a.logo "cinema"
 classic|item@390x780|focus|001|a.active "home"
 classic|item@390x780|focus|002|a "activity"
 classic|item@390x780|focus|003|a "settings"
-classic|item@390x780|focus|004|input#q.search "Search cinemarr"
+classic|item@390x780|focus|004|input#q.search "Search cinema"
 classic|item@390x780|focus|005|button.ghost.sm "Theme"
 classic|item@390x780|focus|006|button.ghost.sm "Light / dark"
 classic|item@390x780|focus|007|button.ghost.sm.sizebtn "Icon size"
@@ -741,11 +741,11 @@ classic|library@1280x860|dom|nav > a.active[text]|1
 classic|library@1280x860|dom|nav > a[text]|2
 classic|library@1280x860|dom|select > option[text]|14
 classic|library@1280x860|dom|svg[aria-hidden=true] > rect|4
-classic|library@1280x860|focus|000|a.logo "cinemarr"
+classic|library@1280x860|focus|000|a.logo "cinema"
 classic|library@1280x860|focus|001|a.active "home"
 classic|library@1280x860|focus|002|a "activity"
 classic|library@1280x860|focus|003|a "settings"
-classic|library@1280x860|focus|004|input#q.search "Search cinemarr"
+classic|library@1280x860|focus|004|input#q.search "Search cinema"
 classic|library@1280x860|focus|005|button.ghost.sm "Theme"
 classic|library@1280x860|focus|006|button.ghost.sm "Light / dark"
 classic|library@1280x860|focus|007|button.ghost.sm.sizebtn "Icon size"
@@ -825,11 +825,11 @@ classic|library@390x780|dom|nav > a.active[text]|1
 classic|library@390x780|dom|nav > a[text]|2
 classic|library@390x780|dom|select > option[text]|14
 classic|library@390x780|dom|svg[aria-hidden=true] > rect|4
-classic|library@390x780|focus|000|a.logo "cinemarr"
+classic|library@390x780|focus|000|a.logo "cinema"
 classic|library@390x780|focus|001|a.active "home"
 classic|library@390x780|focus|002|a "activity"
 classic|library@390x780|focus|003|a "settings"
-classic|library@390x780|focus|004|input#q.search "Search cinemarr"
+classic|library@390x780|focus|004|input#q.search "Search cinema"
 classic|library@390x780|focus|005|button.ghost.sm "Theme"
 classic|library@390x780|focus|006|button.ghost.sm "Light / dark"
 classic|library@390x780|focus|007|button.ghost.sm.sizebtn "Icon size"
@@ -1149,11 +1149,11 @@ classic|search@1280x860|dom|main#main > div.pagehead|1
 classic|search@1280x860|dom|nav > a.active[text]|1
 classic|search@1280x860|dom|nav > a[text]|2
 classic|search@1280x860|dom|svg[aria-hidden=true] > rect|4
-classic|search@1280x860|focus|000|a.logo "cinemarr"
+classic|search@1280x860|focus|000|a.logo "cinema"
 classic|search@1280x860|focus|001|a.active "home"
 classic|search@1280x860|focus|002|a "activity"
 classic|search@1280x860|focus|003|a "settings"
-classic|search@1280x860|focus|004|input#q.search "Search cinemarr"
+classic|search@1280x860|focus|004|input#q.search "Search cinema"
 classic|search@1280x860|focus|005|button.ghost.sm "Theme"
 classic|search@1280x860|focus|006|button.ghost.sm "Light / dark"
 classic|search@1280x860|focus|007|button.ghost.sm.sizebtn "Icon size"
@@ -1211,11 +1211,11 @@ classic|search@390x780|dom|main#main > div.pagehead|1
 classic|search@390x780|dom|nav > a.active[text]|1
 classic|search@390x780|dom|nav > a[text]|2
 classic|search@390x780|dom|svg[aria-hidden=true] > rect|4
-classic|search@390x780|focus|000|a.logo "cinemarr"
+classic|search@390x780|focus|000|a.logo "cinema"
 classic|search@390x780|focus|001|a.active "home"
 classic|search@390x780|focus|002|a "activity"
 classic|search@390x780|focus|003|a "settings"
-classic|search@390x780|focus|004|input#q.search "Search cinemarr"
+classic|search@390x780|focus|004|input#q.search "Search cinema"
 classic|search@390x780|focus|005|button.ghost.sm "Theme"
 classic|search@390x780|focus|006|button.ghost.sm "Light / dark"
 classic|search@390x780|focus|007|button.ghost.sm.sizebtn "Icon size"
@@ -1337,11 +1337,11 @@ classic|settings@1280x860|dom|tr#librow-3 > td.muted|1
 classic|settings@1280x860|dom|tr#librow-3 > td.row.rowactions|1
 classic|settings@1280x860|dom|tr#librow-3 > td[text]|1
 classic|settings@1280x860|dom|tr#librow-3 > td|1
-classic|settings@1280x860|focus|000|a.logo "cinemarr"
+classic|settings@1280x860|focus|000|a.logo "cinema"
 classic|settings@1280x860|focus|001|a "home"
 classic|settings@1280x860|focus|002|a "activity"
 classic|settings@1280x860|focus|003|a.active "settings"
-classic|settings@1280x860|focus|004|input#q.search "Search cinemarr"
+classic|settings@1280x860|focus|004|input#q.search "Search cinema"
 classic|settings@1280x860|focus|005|button.ghost.sm "Theme"
 classic|settings@1280x860|focus|006|button.ghost.sm "Light / dark"
 classic|settings@1280x860|focus|007|button.ghost.sm.sizebtn "Icon size"
@@ -1506,11 +1506,11 @@ classic|settings@390x780|dom|tr#librow-3 > td.muted|1
 classic|settings@390x780|dom|tr#librow-3 > td.row.rowactions|1
 classic|settings@390x780|dom|tr#librow-3 > td[text]|1
 classic|settings@390x780|dom|tr#librow-3 > td|1
-classic|settings@390x780|focus|000|a.logo "cinemarr"
+classic|settings@390x780|focus|000|a.logo "cinema"
 classic|settings@390x780|focus|001|a "home"
 classic|settings@390x780|focus|002|a "activity"
 classic|settings@390x780|focus|003|a.active "settings"
-classic|settings@390x780|focus|004|input#q.search "Search cinemarr"
+classic|settings@390x780|focus|004|input#q.search "Search cinema"
 classic|settings@390x780|focus|005|button.ghost.sm "Theme"
 classic|settings@390x780|focus|006|button.ghost.sm "Light / dark"
 classic|settings@390x780|focus|007|button.ghost.sm.sizebtn "Icon size"
@@ -1626,8 +1626,8 @@ plex|activity@1280x860|dom|svg.px-ico[aria-hidden=true] > circle|2
 plex|activity@1280x860|dom|svg.px-ico[aria-hidden=true] > path|6
 plex|activity@1280x860|dom|svg.px-ico[aria-hidden=true] > rect|4
 plex|activity@1280x860|dom|svg[aria-hidden=true] > rect|4
-plex|activity@1280x860|focus|000|a.logo "cinemarr"
-plex|activity@1280x860|focus|001|input#q.search "Search cinemarr"
+plex|activity@1280x860|focus|000|a.logo "cinema"
+plex|activity@1280x860|focus|001|input#q.search "Search cinema"
 plex|activity@1280x860|focus|002|a "Home"
 plex|activity@1280x860|focus|003|a.on "Activity"
 plex|activity@1280x860|focus|004|a "Settings"
@@ -1702,8 +1702,8 @@ plex|activity@390x780|dom|svg.px-ico[aria-hidden=true] > circle|2
 plex|activity@390x780|dom|svg.px-ico[aria-hidden=true] > path|6
 plex|activity@390x780|dom|svg.px-ico[aria-hidden=true] > rect|4
 plex|activity@390x780|dom|svg[aria-hidden=true] > rect|4
-plex|activity@390x780|focus|000|a.logo "cinemarr"
-plex|activity@390x780|focus|001|input#q.search "Search cinemarr"
+plex|activity@390x780|focus|000|a.logo "cinema"
+plex|activity@390x780|focus|001|input#q.search "Search cinema"
 plex|activity@390x780|focus|002|button.ghost.sm "Theme and layout"
 plex|activity@390x780|focus|003|button.ghost.sm "Light or dark"
 plex|activity@390x780|focus|004|button.ghost.sm.sizebtn "Icon size"
@@ -1862,8 +1862,8 @@ plex|category@1280x860|dom|svg.px-ico[aria-hidden=true] > circle|2
 plex|category@1280x860|dom|svg.px-ico[aria-hidden=true] > path|9
 plex|category@1280x860|dom|svg.px-ico[aria-hidden=true] > rect|7
 plex|category@1280x860|dom|svg[aria-hidden=true] > rect|4
-plex|category@1280x860|focus|000|a.logo "cinemarr"
-plex|category@1280x860|focus|001|input#q.search "Search cinemarr"
+plex|category@1280x860|focus|000|a.logo "cinema"
+plex|category@1280x860|focus|001|input#q.search "Search cinema"
 plex|category@1280x860|focus|002|a "Home"
 plex|category@1280x860|focus|003|a "More Movies"
 plex|category@1280x860|focus|004|a "Movies"
@@ -1993,8 +1993,8 @@ plex|category@390x780|dom|svg.px-ico[aria-hidden=true] > circle|2
 plex|category@390x780|dom|svg.px-ico[aria-hidden=true] > path|9
 plex|category@390x780|dom|svg.px-ico[aria-hidden=true] > rect|7
 plex|category@390x780|dom|svg[aria-hidden=true] > rect|4
-plex|category@390x780|focus|000|a.logo "cinemarr"
-plex|category@390x780|focus|001|input#q.search "Search cinemarr"
+plex|category@390x780|focus|000|a.logo "cinema"
+plex|category@390x780|focus|001|input#q.search "Search cinema"
 plex|category@390x780|focus|002|button.ghost.sm "Theme and layout"
 plex|category@390x780|focus|003|button.ghost.sm "Light or dark"
 plex|category@390x780|focus|004|button.ghost.sm.sizebtn "Icon size"
@@ -2119,8 +2119,8 @@ plex|home@1280x860|dom|svg.px-ico[aria-hidden=true] > circle|2
 plex|home@1280x860|dom|svg.px-ico[aria-hidden=true] > path|8
 plex|home@1280x860|dom|svg.px-ico[aria-hidden=true] > rect|6
 plex|home@1280x860|dom|svg[aria-hidden=true] > rect|4
-plex|home@1280x860|focus|000|a.logo "cinemarr"
-plex|home@1280x860|focus|001|input#q.search "Search cinemarr"
+plex|home@1280x860|focus|000|a.logo "cinema"
+plex|home@1280x860|focus|001|input#q.search "Search cinema"
 plex|home@1280x860|focus|002|a.on "Home"
 plex|home@1280x860|focus|003|a "Movies 4"
 plex|home@1280x860|focus|004|a "TV Shows 1"
@@ -2254,8 +2254,8 @@ plex|home@390x780|dom|svg.px-ico[aria-hidden=true] > circle|2
 plex|home@390x780|dom|svg.px-ico[aria-hidden=true] > path|8
 plex|home@390x780|dom|svg.px-ico[aria-hidden=true] > rect|6
 plex|home@390x780|dom|svg[aria-hidden=true] > rect|4
-plex|home@390x780|focus|000|a.logo "cinemarr"
-plex|home@390x780|focus|001|input#q.search "Search cinemarr"
+plex|home@390x780|focus|000|a.logo "cinema"
+plex|home@390x780|focus|001|input#q.search "Search cinema"
 plex|home@390x780|focus|002|button.ghost.sm "Theme and layout"
 plex|home@390x780|focus|003|button.ghost.sm "Light or dark"
 plex|home@390x780|focus|004|button.ghost.sm.sizebtn "Icon size"
@@ -2375,8 +2375,8 @@ plex|item@1280x860|dom|svg.px-ico[aria-hidden=true] > circle|2
 plex|item@1280x860|dom|svg.px-ico[aria-hidden=true] > path|9
 plex|item@1280x860|dom|svg.px-ico[aria-hidden=true] > rect|7
 plex|item@1280x860|dom|svg[aria-hidden=true] > rect|4
-plex|item@1280x860|focus|000|a.logo "cinemarr"
-plex|item@1280x860|focus|001|input#q.search "Search cinemarr"
+plex|item@1280x860|focus|000|a.logo "cinema"
+plex|item@1280x860|focus|001|input#q.search "Search cinema"
 plex|item@1280x860|focus|002|a "Home"
 plex|item@1280x860|focus|003|a "More Movies"
 plex|item@1280x860|focus|004|a "Movies"
@@ -2487,8 +2487,8 @@ plex|item@390x780|dom|svg.px-ico[aria-hidden=true] > circle|2
 plex|item@390x780|dom|svg.px-ico[aria-hidden=true] > path|9
 plex|item@390x780|dom|svg.px-ico[aria-hidden=true] > rect|7
 plex|item@390x780|dom|svg[aria-hidden=true] > rect|4
-plex|item@390x780|focus|000|a.logo "cinemarr"
-plex|item@390x780|focus|001|input#q.search "Search cinemarr"
+plex|item@390x780|focus|000|a.logo "cinema"
+plex|item@390x780|focus|001|input#q.search "Search cinema"
 plex|item@390x780|focus|002|button.ghost.sm "Theme and layout"
 plex|item@390x780|focus|003|button.ghost.sm "Light or dark"
 plex|item@390x780|focus|004|button.ghost.sm.sizebtn "Icon size"
@@ -2612,8 +2612,8 @@ plex|library@1280x860|dom|svg.px-ico[aria-hidden=true] > circle|2
 plex|library@1280x860|dom|svg.px-ico[aria-hidden=true] > path|9
 plex|library@1280x860|dom|svg.px-ico[aria-hidden=true] > rect|7
 plex|library@1280x860|dom|svg[aria-hidden=true] > rect|4
-plex|library@1280x860|focus|000|a.logo "cinemarr"
-plex|library@1280x860|focus|001|input#q.search "Search cinemarr"
+plex|library@1280x860|focus|000|a.logo "cinema"
+plex|library@1280x860|focus|001|input#q.search "Search cinema"
 plex|library@1280x860|focus|002|a "Home"
 plex|library@1280x860|focus|003|a "More Movies"
 plex|library@1280x860|focus|004|a.on "Movies"
@@ -2743,8 +2743,8 @@ plex|library@390x780|dom|svg.px-ico[aria-hidden=true] > circle|2
 plex|library@390x780|dom|svg.px-ico[aria-hidden=true] > path|9
 plex|library@390x780|dom|svg.px-ico[aria-hidden=true] > rect|7
 plex|library@390x780|dom|svg[aria-hidden=true] > rect|4
-plex|library@390x780|focus|000|a.logo "cinemarr"
-plex|library@390x780|focus|001|input#q.search "Search cinemarr"
+plex|library@390x780|focus|000|a.logo "cinema"
+plex|library@390x780|focus|001|input#q.search "Search cinema"
 plex|library@390x780|focus|002|button.ghost.sm "Theme and layout"
 plex|library@390x780|focus|003|button.ghost.sm "Light or dark"
 plex|library@390x780|focus|004|button.ghost.sm.sizebtn "Icon size"
@@ -3156,8 +3156,8 @@ plex|search@1280x860|dom|svg.px-ico[aria-hidden=true] > circle|2
 plex|search@1280x860|dom|svg.px-ico[aria-hidden=true] > path|6
 plex|search@1280x860|dom|svg.px-ico[aria-hidden=true] > rect|4
 plex|search@1280x860|dom|svg[aria-hidden=true] > rect|4
-plex|search@1280x860|focus|000|a.logo "cinemarr"
-plex|search@1280x860|focus|001|input#q.search "Search cinemarr"
+plex|search@1280x860|focus|000|a.logo "cinema"
+plex|search@1280x860|focus|001|input#q.search "Search cinema"
 plex|search@1280x860|focus|002|a "Home"
 plex|search@1280x860|focus|003|a "Activity"
 plex|search@1280x860|focus|004|a "Settings"
@@ -3244,8 +3244,8 @@ plex|search@390x780|dom|svg.px-ico[aria-hidden=true] > circle|2
 plex|search@390x780|dom|svg.px-ico[aria-hidden=true] > path|6
 plex|search@390x780|dom|svg.px-ico[aria-hidden=true] > rect|4
 plex|search@390x780|dom|svg[aria-hidden=true] > rect|4
-plex|search@390x780|focus|000|a.logo "cinemarr"
-plex|search@390x780|focus|001|input#q.search "Search cinemarr"
+plex|search@390x780|focus|000|a.logo "cinema"
+plex|search@390x780|focus|001|input#q.search "Search cinema"
 plex|search@390x780|focus|002|button.ghost.sm "Theme and layout"
 plex|search@390x780|focus|003|button.ghost.sm "Light or dark"
 plex|search@390x780|focus|004|button.ghost.sm.sizebtn "Icon size"
@@ -3400,8 +3400,8 @@ plex|settings@1280x860|dom|tr#librow-3 > td.muted|1
 plex|settings@1280x860|dom|tr#librow-3 > td.row.rowactions|1
 plex|settings@1280x860|dom|tr#librow-3 > td[text]|1
 plex|settings@1280x860|dom|tr#librow-3 > td|1
-plex|settings@1280x860|focus|000|a.logo "cinemarr"
-plex|settings@1280x860|focus|001|input#q.search "Search cinemarr"
+plex|settings@1280x860|focus|000|a.logo "cinema"
+plex|settings@1280x860|focus|001|input#q.search "Search cinema"
 plex|settings@1280x860|focus|002|a "Home"
 plex|settings@1280x860|focus|003|a "Activity"
 plex|settings@1280x860|focus|004|a.on "Settings"
@@ -3595,8 +3595,8 @@ plex|settings@390x780|dom|tr#librow-3 > td.muted|1
 plex|settings@390x780|dom|tr#librow-3 > td.row.rowactions|1
 plex|settings@390x780|dom|tr#librow-3 > td[text]|1
 plex|settings@390x780|dom|tr#librow-3 > td|1
-plex|settings@390x780|focus|000|a.logo "cinemarr"
-plex|settings@390x780|focus|001|input#q.search "Search cinemarr"
+plex|settings@390x780|focus|000|a.logo "cinema"
+plex|settings@390x780|focus|001|input#q.search "Search cinema"
 plex|settings@390x780|focus|002|button.ghost.sm "Theme and layout"
 plex|settings@390x780|focus|003|button.ghost.sm "Light or dark"
 plex|settings@390x780|focus|004|button.ghost.sm.sizebtn "Icon size"
@@ -3690,11 +3690,11 @@ theater|activity@1280x860|dom|nav.th-pills[aria-label=*] > a.on[aria-current=pag
 theater|activity@1280x860|dom|nav.th-pills[aria-label=*] > a[text]|2
 theater|activity@1280x860|dom|p.muted[text] > a[text]|1
 theater|activity@1280x860|dom|svg[aria-hidden=true] > rect|4
-theater|activity@1280x860|focus|000|a.logo "cinemarr"
+theater|activity@1280x860|focus|000|a.logo "cinema"
 theater|activity@1280x860|focus|001|a "Home"
 theater|activity@1280x860|focus|002|a.on "Activity"
 theater|activity@1280x860|focus|003|a "Settings"
-theater|activity@1280x860|focus|004|input#q.search "Search cinemarr"
+theater|activity@1280x860|focus|004|input#q.search "Search cinema"
 theater|activity@1280x860|focus|005|button.ghost.sm "Theme and layout"
 theater|activity@1280x860|focus|006|button.ghost.sm "Light or dark"
 theater|activity@1280x860|focus|007|button.ghost.sm.sizebtn "Icon size"
@@ -3740,8 +3740,8 @@ theater|activity@390x780|dom|nav.th-pills[aria-label=*] > a.on[aria-current=page
 theater|activity@390x780|dom|nav.th-pills[aria-label=*] > a[text]|2
 theater|activity@390x780|dom|p.muted[text] > a[text]|1
 theater|activity@390x780|dom|svg[aria-hidden=true] > rect|4
-theater|activity@390x780|focus|000|a.logo "cinemarr"
-theater|activity@390x780|focus|001|input#q.search "Search cinemarr"
+theater|activity@390x780|focus|000|a.logo "cinema"
+theater|activity@390x780|focus|001|input#q.search "Search cinema"
 theater|activity@390x780|focus|002|button.ghost.sm "Theme and layout"
 theater|activity@390x780|focus|003|button.ghost.sm "Light or dark"
 theater|activity@390x780|focus|004|button.ghost.sm.sizebtn "Icon size"
@@ -3863,11 +3863,11 @@ theater|category@1280x860|dom|select[aria-label=*] > option[text]|14
 theater|category@1280x860|dom|span.th-cpair > select[aria-label=*]|3
 theater|category@1280x860|dom|span.th-cpair > span.lbl[text]|3
 theater|category@1280x860|dom|svg[aria-hidden=true] > rect|4
-theater|category@1280x860|focus|000|a.logo "cinemarr"
+theater|category@1280x860|focus|000|a.logo "cinema"
 theater|category@1280x860|focus|001|a "Home"
 theater|category@1280x860|focus|002|a "Activity"
 theater|category@1280x860|focus|003|a "Settings"
-theater|category@1280x860|focus|004|input#q.search "Search cinemarr"
+theater|category@1280x860|focus|004|input#q.search "Search cinema"
 theater|category@1280x860|focus|005|button.ghost.sm "Theme and layout"
 theater|category@1280x860|focus|006|button.ghost.sm "Light or dark"
 theater|category@1280x860|focus|007|button.ghost.sm.sizebtn "Icon size"
@@ -3954,8 +3954,8 @@ theater|category@390x780|dom|select[aria-label=*] > option[text]|14
 theater|category@390x780|dom|span.th-cpair > select[aria-label=*]|3
 theater|category@390x780|dom|span.th-cpair > span.lbl[text]|3
 theater|category@390x780|dom|svg[aria-hidden=true] > rect|4
-theater|category@390x780|focus|000|a.logo "cinemarr"
-theater|category@390x780|focus|001|input#q.search "Search cinemarr"
+theater|category@390x780|focus|000|a.logo "cinema"
+theater|category@390x780|focus|001|input#q.search "Search cinema"
 theater|category@390x780|focus|002|button.ghost.sm "Theme and layout"
 theater|category@390x780|focus|003|button.ghost.sm "Light or dark"
 theater|category@390x780|focus|004|button.ghost.sm.sizebtn "Icon size"
@@ -4061,11 +4061,11 @@ theater|home@1280x860|dom|section.th-hero.th-noart[aria-label=*] > div.th-fg|1
 theater|home@1280x860|dom|section.th-hero.th-noart[aria-label=*] > div.th-scrim[aria-hidden=true]|1
 theater|home@1280x860|dom|select > option[text]|2
 theater|home@1280x860|dom|svg[aria-hidden=true] > rect|4
-theater|home@1280x860|focus|000|a.logo "cinemarr"
+theater|home@1280x860|focus|000|a.logo "cinema"
 theater|home@1280x860|focus|001|a.on "Home"
 theater|home@1280x860|focus|002|a "Activity"
 theater|home@1280x860|focus|003|a "Settings"
-theater|home@1280x860|focus|004|input#q.search "Search cinemarr"
+theater|home@1280x860|focus|004|input#q.search "Search cinema"
 theater|home@1280x860|focus|005|button.ghost.sm "Theme and layout"
 theater|home@1280x860|focus|006|button.ghost.sm "Light or dark"
 theater|home@1280x860|focus|007|button.ghost.sm.sizebtn "Icon size"
@@ -4179,8 +4179,8 @@ theater|home@390x780|dom|section.th-hero.th-noart[aria-label=*] > div.th-fg|1
 theater|home@390x780|dom|section.th-hero.th-noart[aria-label=*] > div.th-scrim[aria-hidden=true]|1
 theater|home@390x780|dom|select > option[text]|2
 theater|home@390x780|dom|svg[aria-hidden=true] > rect|4
-theater|home@390x780|focus|000|a.logo "cinemarr"
-theater|home@390x780|focus|001|input#q.search "Search cinemarr"
+theater|home@390x780|focus|000|a.logo "cinema"
+theater|home@390x780|focus|001|input#q.search "Search cinema"
 theater|home@390x780|focus|002|button.ghost.sm "Theme and layout"
 theater|home@390x780|focus|003|button.ghost.sm "Light or dark"
 theater|home@390x780|focus|004|button.ghost.sm.sizebtn "Icon size"
@@ -4276,11 +4276,11 @@ theater|item@1280x860|dom|span.codec.vbadge[text] > svg.material-icon[aria-hidde
 theater|item@1280x860|dom|span.res.vbadge[text] > svg.material-icon[aria-hidden=true]|1
 theater|item@1280x860|dom|svg.material-icon[aria-hidden=true] > path|2
 theater|item@1280x860|dom|svg[aria-hidden=true] > rect|4
-theater|item@1280x860|focus|000|a.logo "cinemarr"
+theater|item@1280x860|focus|000|a.logo "cinema"
 theater|item@1280x860|focus|001|a "Home"
 theater|item@1280x860|focus|002|a "Activity"
 theater|item@1280x860|focus|003|a "Settings"
-theater|item@1280x860|focus|004|input#q.search "Search cinemarr"
+theater|item@1280x860|focus|004|input#q.search "Search cinema"
 theater|item@1280x860|focus|005|button.ghost.sm "Theme and layout"
 theater|item@1280x860|focus|006|button.ghost.sm "Light or dark"
 theater|item@1280x860|focus|007|button.ghost.sm.sizebtn "Icon size"
@@ -4360,8 +4360,8 @@ theater|item@390x780|dom|span.codec.vbadge[text] > svg.material-icon[aria-hidden
 theater|item@390x780|dom|span.res.vbadge[text] > svg.material-icon[aria-hidden=true]|1
 theater|item@390x780|dom|svg.material-icon[aria-hidden=true] > path|2
 theater|item@390x780|dom|svg[aria-hidden=true] > rect|4
-theater|item@390x780|focus|000|a.logo "cinemarr"
-theater|item@390x780|focus|001|input#q.search "Search cinemarr"
+theater|item@390x780|focus|000|a.logo "cinema"
+theater|item@390x780|focus|001|input#q.search "Search cinema"
 theater|item@390x780|focus|002|button.ghost.sm "Theme and layout"
 theater|item@390x780|focus|003|button.ghost.sm "Light or dark"
 theater|item@390x780|focus|004|button.ghost.sm.sizebtn "Icon size"
@@ -4445,11 +4445,11 @@ theater|library@1280x860|dom|select[aria-label=*] > option[text]|14
 theater|library@1280x860|dom|span.th-cpair > select[aria-label=*]|3
 theater|library@1280x860|dom|span.th-cpair > span.lbl[text]|3
 theater|library@1280x860|dom|svg[aria-hidden=true] > rect|4
-theater|library@1280x860|focus|000|a.logo "cinemarr"
+theater|library@1280x860|focus|000|a.logo "cinema"
 theater|library@1280x860|focus|001|a "Home"
 theater|library@1280x860|focus|002|a "Activity"
 theater|library@1280x860|focus|003|a "Settings"
-theater|library@1280x860|focus|004|input#q.search "Search cinemarr"
+theater|library@1280x860|focus|004|input#q.search "Search cinema"
 theater|library@1280x860|focus|005|button.ghost.sm "Theme and layout"
 theater|library@1280x860|focus|006|button.ghost.sm "Light or dark"
 theater|library@1280x860|focus|007|button.ghost.sm.sizebtn "Icon size"
@@ -4533,8 +4533,8 @@ theater|library@390x780|dom|select[aria-label=*] > option[text]|14
 theater|library@390x780|dom|span.th-cpair > select[aria-label=*]|3
 theater|library@390x780|dom|span.th-cpair > span.lbl[text]|3
 theater|library@390x780|dom|svg[aria-hidden=true] > rect|4
-theater|library@390x780|focus|000|a.logo "cinemarr"
-theater|library@390x780|focus|001|input#q.search "Search cinemarr"
+theater|library@390x780|focus|000|a.logo "cinema"
+theater|library@390x780|focus|001|input#q.search "Search cinema"
 theater|library@390x780|focus|002|button.ghost.sm "Theme and layout"
 theater|library@390x780|focus|003|button.ghost.sm "Light or dark"
 theater|library@390x780|focus|004|button.ghost.sm.sizebtn "Icon size"
@@ -4871,11 +4871,11 @@ theater|search@1280x860|dom|main#main > div.pagehead|1
 theater|search@1280x860|dom|nav.th-nav[aria-label=*] > a[text]|3
 theater|search@1280x860|dom|nav.th-pills[aria-label=*] > a[text]|3
 theater|search@1280x860|dom|svg[aria-hidden=true] > rect|4
-theater|search@1280x860|focus|000|a.logo "cinemarr"
+theater|search@1280x860|focus|000|a.logo "cinema"
 theater|search@1280x860|focus|001|a "Home"
 theater|search@1280x860|focus|002|a "Activity"
 theater|search@1280x860|focus|003|a "Settings"
-theater|search@1280x860|focus|004|input#q.search "Search cinemarr"
+theater|search@1280x860|focus|004|input#q.search "Search cinema"
 theater|search@1280x860|focus|005|button.ghost.sm "Theme and layout"
 theater|search@1280x860|focus|006|button.ghost.sm "Light or dark"
 theater|search@1280x860|focus|007|button.ghost.sm.sizebtn "Icon size"
@@ -4937,8 +4937,8 @@ theater|search@390x780|dom|main#main > div.pagehead|1
 theater|search@390x780|dom|nav.th-nav[aria-label=*] > a[text]|3
 theater|search@390x780|dom|nav.th-pills[aria-label=*] > a[text]|3
 theater|search@390x780|dom|svg[aria-hidden=true] > rect|4
-theater|search@390x780|focus|000|a.logo "cinemarr"
-theater|search@390x780|focus|001|input#q.search "Search cinemarr"
+theater|search@390x780|focus|000|a.logo "cinema"
+theater|search@390x780|focus|001|input#q.search "Search cinema"
 theater|search@390x780|focus|002|button.ghost.sm "Theme and layout"
 theater|search@390x780|focus|003|button.ghost.sm "Light or dark"
 theater|search@390x780|focus|004|button.ghost.sm.sizebtn "Icon size"
@@ -5069,11 +5069,11 @@ theater|settings@1280x860|dom|tr#librow-3 > td.muted|1
 theater|settings@1280x860|dom|tr#librow-3 > td.row.rowactions|1
 theater|settings@1280x860|dom|tr#librow-3 > td[text]|1
 theater|settings@1280x860|dom|tr#librow-3 > td|1
-theater|settings@1280x860|focus|000|a.logo "cinemarr"
+theater|settings@1280x860|focus|000|a.logo "cinema"
 theater|settings@1280x860|focus|001|a "Home"
 theater|settings@1280x860|focus|002|a "Activity"
 theater|settings@1280x860|focus|003|a.on "Settings"
-theater|settings@1280x860|focus|004|input#q.search "Search cinemarr"
+theater|settings@1280x860|focus|004|input#q.search "Search cinema"
 theater|settings@1280x860|focus|005|button.ghost.sm "Theme and layout"
 theater|settings@1280x860|focus|006|button.ghost.sm "Light or dark"
 theater|settings@1280x860|focus|007|button.ghost.sm.sizebtn "Icon size"
@@ -5241,8 +5241,8 @@ theater|settings@390x780|dom|tr#librow-3 > td.muted|1
 theater|settings@390x780|dom|tr#librow-3 > td.row.rowactions|1
 theater|settings@390x780|dom|tr#librow-3 > td[text]|1
 theater|settings@390x780|dom|tr#librow-3 > td|1
-theater|settings@390x780|focus|000|a.logo "cinemarr"
-theater|settings@390x780|focus|001|input#q.search "Search cinemarr"
+theater|settings@390x780|focus|000|a.logo "cinema"
+theater|settings@390x780|focus|001|input#q.search "Search cinema"
 theater|settings@390x780|focus|002|button.ghost.sm "Theme and layout"
 theater|settings@390x780|focus|003|button.ghost.sm "Light or dark"
 theater|settings@390x780|focus|004|button.ghost.sm.sizebtn "Icon size"
