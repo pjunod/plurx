@@ -2,8 +2,31 @@ package tv.plurx.app.player
 
 import org.junit.Assert.assertEquals
 import org.junit.Test
+import tv.plurx.app.data.Item
 
 class PlaybackInfoTest {
+    @Test
+    fun playMenuCarriesTheWebMetadataHierarchy() {
+        val episode = Item(
+            id = 7,
+            kind = "episode",
+            title = "The Return",
+            show_title = "Example Show",
+            season_number = 2,
+            episode_number = 5,
+        )
+
+        assertEquals("Example Show   ·   S2E5", playerSubtitle(episode))
+        assertEquals(
+            "Example Show   ·   S2E5   ·   The Return",
+            playerHeading(episode.title, playerSubtitle(episode)),
+        )
+        assertEquals("Jun 10, 2026", playerDateLabel("2026-06-10", 2025))
+        assertEquals("2025", playerDateLabel(null, 2025))
+        assertEquals("1h 53m", playerRuntimeLabel(6_780_000))
+        assertEquals("Jun 10, 2026   ·   1h 53m", playerContextLine("Jun 10, 2026", "1h 53m"))
+    }
+
     @Test
     fun videoHealthSummarizesRenderedAndDroppedFrames() {
         assertEquals(

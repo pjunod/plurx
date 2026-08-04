@@ -157,6 +157,7 @@ struct PlayerView: View {
     let title: String
     var subtitle: String? = nil
     var year: Int? = nil
+    var airDate: String? = nil
     var overview: String? = nil
     var onPlayNext: ((PlayContext) -> Void)?
     /// Hands the owning detail screen the last on-screen position immediately.
@@ -168,7 +169,6 @@ struct PlayerView: View {
     @StateObject private var controller = PlayerController()
     @StateObject private var pictureInPicture = PictureInPictureController()
     @State private var showStats = false
-    @State private var showNowPlayingInfo = false
     @State private var findingNext = false
     @State private var isScrubbing = false
     @State private var scrubMs = 0.0
@@ -302,7 +302,6 @@ struct PlayerView: View {
         .onChange(of: controller.isPlaying) { _, _ in revealControls() }
         .onChange(of: controller.isChangingStream) { _, _ in revealControls() }
         .onChange(of: showStats) { _, _ in restartAutoHideTimer() }
-        .onChange(of: showNowPlayingInfo) { _, _ in restartAutoHideTimer() }
         .onChange(of: isScrubbing) { _, _ in restartAutoHideTimer() }
         .onChange(of: controller.finished) { _, finished in
             guard finished, model.autoplay else { return }
@@ -370,7 +369,6 @@ struct PlayerView: View {
         withAnimation(.easeOut(duration: 0.2)) {
             controlsVisible = false
             showStats = false
-            showNowPlayingInfo = false
         }
         #if os(tvOS)
         focusedControl = nil
@@ -435,19 +433,36 @@ struct PlayerView: View {
     #endif
 
     private var playbackControls: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            #if os(tvOS)
+        VStack(alignment: .leading, spacing: 8) {
             playbackInfoHeader
-            #else
-            playbackInfoHeader
-            #endif
 
+            if let marker = controller.activeMarker {
+                #if os(tvOS)
+                HStack {
+                    Spacer(minLength: 0)
+                    markerButton(marker)
+                        .fixedSize(horizontal: true, vertical: false)
+                }
+                #else
+                markerButton(marker)
+                #endif
+            }
+
+            #if os(tvOS)
+            HStack(spacing: 12) {
+                transportControlGroup
+                if controller.knownDurationMs > 0 {
+                    playbackTimeLabel(controller.currentMs)
+                    tvProgressBar
+                        .layoutPriority(1)
+                    playbackTimeLabel(controller.knownDurationMs)
+                }
+                playbackOptionGroup
+            }
+            #else
             if controller.knownDurationMs > 0 {
                 HStack(spacing: 10) {
                     playbackTimeLabel(Int(isScrubbing ? scrubMs : Double(controller.currentMs)))
-                    #if os(tvOS)
-                    tvProgressBar
-                    #else
                     Slider(
                         value: Binding(
                             get: { isScrubbing ? scrubMs : Double(controller.currentMs) },
@@ -465,35 +480,11 @@ struct PlayerView: View {
                         }
                     )
                     .tint(Palette.accent)
-                    #endif
                     playbackTimeLabel(controller.knownDurationMs)
                 }
                 .font(.system(.caption, design: .monospaced))
                 .foregroundColor(.white)
             }
-
-            if let marker = controller.activeMarker {
-                #if os(tvOS)
-                HStack {
-                    Spacer(minLength: 0)
-                    markerButton(marker)
-                        .fixedSize(horizontal: true, vertical: false)
-                }
-                #else
-                markerButton(marker)
-                #endif
-            }
-
-            #if os(tvOS)
-            expandedControlRow
-            if showNowPlayingInfo {
-                nowPlayingInfoSection
-                    .transition(.opacity.combined(with: .move(edge: .bottom)))
-            } else if let cue = Self.nowPlayingInfoCueLabel(showingInfo: showNowPlayingInfo) {
-                nowPlayingInfoCue(cue)
-                    .transition(.opacity)
-            }
-            #else
             ViewThatFits(in: .horizontal) {
                 expandedControlRow
                     .fixedSize(horizontal: true, vertical: false)
@@ -519,60 +510,30 @@ struct PlayerView: View {
         #endif
     }
 
-    #if os(tvOS)
-    private func nowPlayingInfoCue(_ label: String) -> some View {
-        Label(label, systemImage: "chevron.down")
-            .font(.system(size: 13, weight: .bold, design: .monospaced))
-            .foregroundStyle(.white.opacity(0.72))
-            .padding(.horizontal, 9)
-            .padding(.vertical, 3)
-            .background(.black.opacity(0.48), in: Capsule())
-            .overlay {
-                Capsule().stroke(.white.opacity(0.16), lineWidth: 0.5)
-            }
-            .frame(maxWidth: .infinity)
-            .accessibilityLabel("Press Down for information about what is playing")
-    }
-
-    private var nowPlayingInfoSection: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            Text("NOW PLAYING")
-                .font(.system(
-                    size: TVPlayerChromeMetrics.infoHeadingFontSize,
-                    weight: .bold,
-                    design: .monospaced
-                ))
-                .foregroundStyle(Palette.accent)
-            Text(Self.nowPlayingSummary(overview))
-                .font(.system(size: TVPlayerChromeMetrics.infoBodyFontSize, weight: .regular))
-                .foregroundStyle(.white.opacity(0.88))
-                .lineLimit(TVPlayerChromeMetrics.infoLineLimit)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 8)
-        .frame(maxWidth: 980, alignment: .leading)
-        .background(
-            Palette.playerChrome.opacity(0.68),
-            in: RoundedRectangle(cornerRadius: 8, style: .continuous)
-        )
-        .accessibilityElement(children: .combine)
-    }
-
-    private func revealNowPlayingInfo() {
-        guard controlsVisible else { return }
-        withAnimation(.easeOut(duration: 0.18)) { showNowPlayingInfo = true }
-        restartAutoHideTimer()
-    }
-    #endif
-
     static func nowPlayingSummary(_ overview: String?) -> String {
         let summary = overview?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return summary.isEmpty ? "No description available." : summary
     }
 
-    static func nowPlayingInfoCueLabel(showingInfo: Bool) -> String? {
-        showingInfo ? nil : "INFO"
+    static func playbackDateLabel(airDate: String?, year: Int?) -> String? {
+        let raw = airDate?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !raw.isEmpty {
+            let parser = DateFormatter()
+            parser.calendar = Calendar(identifier: .gregorian)
+            parser.locale = Locale(identifier: "en_US_POSIX")
+            parser.timeZone = TimeZone(secondsFromGMT: 0)
+            parser.dateFormat = "yyyy-MM-dd"
+            if let date = parser.date(from: String(raw.prefix(10))) {
+                let display = DateFormatter()
+                display.calendar = parser.calendar
+                display.locale = Locale(identifier: "en_US_POSIX")
+                display.timeZone = parser.timeZone
+                display.setLocalizedDateFormatFromTemplate("MMM d, yyyy")
+                return display.string(from: date)
+            }
+            return raw
+        }
+        return year.map(String.init)
     }
 
     private func playbackTimeLabel(_ milliseconds: Int) -> some View {
@@ -586,64 +547,55 @@ struct PlayerView: View {
     }
 
     private var playbackInfoHeader: some View {
-        #if os(tvOS)
-        HStack(alignment: .firstTextBaseline, spacing: 18) {
-            playbackIdentity
-                .padding(.horizontal, TVPlayerChromeMetrics.headerHorizontalInset)
-                .padding(.vertical, TVPlayerChromeMetrics.headerVerticalInset)
-                .background(
-                    Palette.playerChrome.opacity(0.68),
-                    in: RoundedRectangle(cornerRadius: 8, style: .continuous)
-                )
-                .layoutPriority(1)
-            Spacer(minLength: 18)
-            playbackFacts
-                .fixedSize(horizontal: true, vertical: false)
-        }
-        .frame(maxWidth: .infinity)
-        #else
         VStack(alignment: .leading, spacing: 7) {
-            playbackIdentity
-            playbackFacts
-        }
-        #endif
-    }
-
-    private var playbackIdentity: some View {
-        let contextParts = [subtitle, year.map(String.init), runtimeLabel]
-            .compactMap { $0 }
-            .filter { !$0.isEmpty }
-
-        #if os(tvOS)
-        let context = contextParts.joined(separator: "   ·   ")
-        return (
-            Text(title)
-                .font(.system(size: 26, weight: .semibold))
-                .foregroundColor(.white)
-            + Text(context.isEmpty ? "" : "   ·   \(context)")
-                .font(.system(size: 22, design: .monospaced))
-                .foregroundColor(.white.opacity(0.76))
-        )
-        .lineLimit(1)
-        #else
-        return VStack(alignment: .leading, spacing: 3) {
-            Text(title)
-                .font(.headline.bold())
+            Text(playbackHeading)
+                #if os(tvOS)
+                .font(.system(size: 30, weight: .bold))
+                #else
+                .font(.title3.bold())
+                #endif
                 .foregroundColor(.white)
                 .lineLimit(1)
 
-            if !contextParts.isEmpty {
-                HStack(spacing: 12) {
-                    ForEach(contextParts, id: \.self) { fact in
-                        Text(fact)
-                    }
-                }
+            playbackFacts
+
+            if !playbackContext.isEmpty {
+                Text(playbackContext.joined(separator: "   ·   "))
+                #if os(tvOS)
+                .font(.system(size: 21, weight: .medium, design: .rounded))
+                #else
                 .font(.system(.caption, design: .rounded).weight(.medium))
+                #endif
                 .foregroundColor(.white.opacity(0.7))
                 .lineLimit(1)
             }
+
+            Text(Self.nowPlayingSummary(overview))
+                #if os(tvOS)
+                .font(.system(size: TVPlayerChromeMetrics.infoBodyFontSize, weight: .regular))
+                .lineLimit(3)
+                #else
+                .font(.callout)
+                .lineLimit(2)
+                #endif
+                .foregroundStyle(.white.opacity(0.88))
+                .fixedSize(horizontal: false, vertical: true)
         }
-        #endif
+        .frame(maxWidth: 1_180, alignment: .leading)
+        .accessibilityElement(children: .combine)
+    }
+
+    private var playbackHeading: String {
+        [subtitle, title]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: "   ·   ")
+    }
+
+    private var playbackContext: [String] {
+        [Self.playbackDateLabel(airDate: airDate, year: year), runtimeLabel]
+            .compactMap { $0 }
+            .filter { !$0.isEmpty }
     }
 
     private var playbackFacts: some View {
@@ -900,11 +852,6 @@ struct PlayerView: View {
             Spacer(minLength: 8)
             playbackOptionGroup
         }
-        #if os(tvOS)
-        .onMoveCommand { direction in
-            if direction == .down { revealNowPlayingInfo() }
-        }
-        #endif
     }
 
     private var transportControlGroup: some View {
