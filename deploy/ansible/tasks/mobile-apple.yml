@@ -1,0 +1,104 @@
+---
+- name: Resolve Apple deployment settings
+  ansible.builtin.set_fact:
+    apple_upload: "{{ plurx_apple_upload | default(true) | bool }}"
+    apple_key_id: >-
+      {{ plurx_apple_key_id |
+         default(lookup('env', 'ASC_KEY_ID'), true) }}
+    apple_issuer_id: >-
+      {{ plurx_apple_issuer_id |
+         default(lookup('env', 'ASC_ISSUER_ID'), true) }}
+    apple_ios_simulator: >-
+      {{ plurx_apple_ios_simulator |
+         default(lookup('env', 'APPLE_IOS_SIM') |
+                 default('platform=iOS Simulator,name=iPhone 17 Pro', true),
+                 true) }}
+    apple_tvos_simulator: >-
+      {{ plurx_apple_tvos_simulator |
+         default(lookup('env', 'APPLE_TVOS_SIM') |
+                 default('platform=tvOS Simulator,name=Apple TV 4K (3rd generation)',
+                         true), true) }}
+    apple_targets:
+      - scheme: plurx-iOS
+        platform: iOS
+      - scheme: plurx-tvOS
+        platform: tvOS
+
+- name: Resolve the Apple private key path
+  ansible.builtin.set_fact:
+    apple_private_key: >-
+      {{ (plurx_apple_private_key |
+          default('~/.appstoreconnect/private_keys/AuthKey_' ~
+                  apple_key_id ~ '.p8', true)) | expanduser }}
+
+- name: Resolve optional Xcode API authentication
+  ansible.builtin.set_fact:
+    apple_xcode_authentication: >-
+      {{ ['-authenticationKeyPath', apple_private_key,
+          '-authenticationKeyID', apple_key_id,
+          '-authenticationKeyIssuerID', apple_issuer_id]
+         if apple_key_id | length > 0 and apple_issuer_id | length > 0
+         else [] }}
+
+- name: Validate App Store Connect authentication
+  when: apple_upload
+  block:
+    - name: Check the App Store Connect private key
+      ansible.builtin.stat:
+        path: "{{ apple_private_key }}"
+      register: apple_private_key_file
+
+    - name: Refuse an unauthenticated TestFlight upload
+      ansible.builtin.assert:
+        that:
+          - apple_key_id | length > 0
+          - apple_issuer_id | length > 0
+          - apple_private_key_file.stat.isreg | default(false)
+        fail_msg: >-
+          TestFlight upload needs ASC_KEY_ID, ASC_ISSUER_ID, and
+          {{ apple_private_key }} on the controller. Set
+          `plurx_apple_upload=false` only when an archive/export without an
+          upload is intentional.
+
+- name: Generate the Apple project
+  ansible.builtin.command:
+    argv:
+      - xcodegen
+      - generate
+    chdir: "{{ mobile_repo }}/clients/apple"
+  changed_when: true
+
+- name: Test the iOS app
+  ansible.builtin.command:
+    argv:
+      - xcodebuild
+      - -project
+      - plurx.xcodeproj
+      - -scheme
+      - plurx-iOS
+      - -destination
+      - "{{ apple_ios_simulator }}"
+      - test
+    chdir: "{{ mobile_repo }}/clients/apple"
+  changed_when: false
+
+- name: Test the tvOS app
+  ansible.builtin.command:
+    argv:
+      - xcodebuild
+      - -project
+      - plurx.xcodeproj
+      - -scheme
+      - plurx-tvOS
+      - -destination
+      - "{{ apple_tvos_simulator }}"
+      - test
+    chdir: "{{ mobile_repo }}/clients/apple"
+  changed_when: false
+
+- name: Archive, export, and upload each Apple platform
+  ansible.builtin.include_tasks: mobile-apple-target.yml
+  loop: "{{ apple_targets }}"
+  loop_control:
+    loop_var: apple_target
+    label: "{{ apple_target.scheme }}"
