@@ -134,6 +134,13 @@ test = "tests/playback/web-policy.test.js"
 test_anchor = "a rejected cheap stream gets one compatibility transcode"
 
 [[decisions]]
+id = "web.hdr-subtitle-guard"
+source = "crates/plurxd/src/web/playback-policy.js"
+source_anchor = "function subtitleBurnAction("
+test = "tests/playback/web-policy.test.js"
+test_anchor = "HDR subtitle burns keep the current delivery instead"
+
+[[decisions]]
 id = "web.decode-rescue"
 source = "crates/plurxd/src/web/playback-policy.js"
 source_anchor = "function decodeMarginVerdict("
@@ -155,6 +162,13 @@ test = "clients/apple/Tests/AppleClientTests.swift"
 test_anchor = "testApplePlayerFallsBackFromDolbyVisionToHDRBeforeSDR"
 
 [[decisions]]
+id = "apple.established-hdr-recovery"
+source = "clients/apple/Sources/PlayerController.swift"
+source_anchor = "static func shouldPreserveEstablishedHDRDelivery("
+test = "clients/apple/Tests/AppleClientTests.swift"
+test_anchor = "testEstablishedHDRRecoveryNeverChoosesTheSDRFallback"
+
+[[decisions]]
 id = "apple.quality-session"
 source = "clients/apple/Sources/PlayerController.swift"
 source_anchor = "static func burnSessionHeight("
@@ -169,6 +183,13 @@ test = "clients/apple/Tests/AppleClientTests.swift"
 test_anchor = "testSelectSubtitleRoutingReopensOnceForABurnAndStaysInPlaceForNative"
 
 [[decisions]]
+id = "apple.hdr-subtitle-guard"
+source = "clients/apple/Sources/PlayerController.swift"
+source_anchor = "static func subtitleBurnWouldDiscardHDR("
+test = "clients/apple/Tests/AppleClientTests.swift"
+test_anchor = "testHDRSubtitleGuardKeepsTheCurrentPictureForBurnOnlyTracks"
+
+[[decisions]]
 id = "android.capability-profile"
 source = "clients/android/app/src/main/java/tv/plurx/app/data/CapsPolicy.kt"
 source_anchor = "internal fun dolbyVisionCaps("
@@ -181,6 +202,13 @@ source = "clients/android/app/src/main/java/tv/plurx/app/player/PlaybackPolicy.k
 source_anchor = "internal fun playbackErrorAction("
 test = "clients/android/app/src/test/java/tv/plurx/app/player/PlaybackPolicyTest.kt"
 test_anchor = "dolbyVisionDirectPlayGetsAContainerRescueBeforeTheSdrLastResort"
+
+[[decisions]]
+id = "android.established-hdr-recovery"
+source = "clients/android/app/src/main/java/tv/plurx/app/player/PlaybackPolicy.kt"
+source_anchor = "internal fun playbackErrorAction("
+test = "clients/android/app/src/test/java/tv/plurx/app/player/PlaybackPolicyTest.kt"
+test_anchor = "establishedHdrRetriesTheSameDeliveryAndNeverFallsThroughToSdr"
 
 [[decisions]]
 id = "android.manual-quality"
@@ -202,3 +230,10 @@ source = "clients/android/app/src/main/java/tv/plurx/app/player/SubtitlePolicy.k
 source_anchor = "internal fun subtitleRoute("
 test = "clients/android/app/src/test/java/tv/plurx/app/player/SubtitlePolicyTest.kt"
 test_anchor = "bitmapAndStyledTracksBurnInEveryMode"
+
+[[decisions]]
+id = "android.hdr-subtitle-guard"
+source = "clients/android/app/src/main/java/tv/plurx/app/player/SubtitlePolicy.kt"
+source_anchor = "internal fun subtitleBurnWouldDiscardHdr("
+test = "clients/android/app/src/test/java/tv/plurx/app/player/SubtitlePolicyTest.kt"
+test_anchor = "hdrSubtitleGuardKeepsTheCurrentPictureForBurnOnlyTracks"

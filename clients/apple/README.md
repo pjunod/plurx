@@ -12,12 +12,12 @@ anything it can't (MKV, DTS/TrueHD, …) is delivered as the server's on-the-fly
 HDR display at runtime and sends that to `/decision`, so the server transcodes
 only what this hardware genuinely can't play.
 
-> Status: **v0.2.2**, build `13` in [`project.yml`](project.yml) — working
+> Status: **v0.2.2**, build `19` in [`project.yml`](project.yml) — working
 > development client. Browse, resume, discover, and play on both iOS and
 > tvOS. Both targets compile against the iOS/tvOS 26.5 SDKs and share the
-> same regression suite. Build 13 carries the 2026-08-04 unified native
-> playback menus, playback-info persistence fix, Dolby Vision stall recovery,
-> and appearance-settings fixes. It is installed on the paired iPhones, iPads,
+> same regression suite. Build 19 keeps established HDR through transport
+> recovery and refuses burn-only subtitle selections that would replace it
+> with SDR. It is ready for the paired iPhones, iPads,
 > and Bedroom Apple TV, but has not been uploaded to TestFlight.
 > It is not yet at full web parity; the exact boundary is in
 > [Feature parity](#feature-parity).
@@ -47,11 +47,11 @@ only what this hardware genuinely can't play.
   Off, applies inside the running player item — no restart, no new session,
   no quality change, and no video encoder — and the cues stay with the
   picture through a resume and a seek. Bitmap and styled formats (PGS,
-  VobSub, ASS/SSA) still burn in server-side and reopen at the same film
-  position, because positioned bitmap planes and authored styling do not
-  survive conversion to plain WebVTT. Automatic selection never starts a
-  burn on its own; a forced track is the one exception, and it burns at
-  source height.
+  VobSub, ASS/SSA) can burn in server-side on an SDR delivery and reopen at
+  the same film position, because positioned bitmap planes and authored
+  styling do not survive conversion to plain WebVTT. While DV, HDR10, or HLG
+  is playing, the app refuses that selection with a visible notice instead of
+  silently replacing the picture with the server's SDR burn pipeline.
 - **Connect & sign in**; the bearer token lives in the **Keychain** (so a new
   development build does not sign you out) and the session reconnects silently
   on next launch. Address and token are written together, so changing servers
@@ -72,8 +72,8 @@ only what this hardware genuinely can't play.
   panel fed by the server's live encoder and delivery telemetry.
 - **Subtitles**: SRT/SubRip/WebVTT are selected in place as native HLS
   renditions — no restart, no encoder, no lost HDR. PGS, VobSub, and styled
-  ASS/SSA still burn in at source height and restart at the same film position.
-  Automatic selection never starts a burn except for a forced track.
+  ASS/SSA burn in at source height only when the current delivery is SDR. An
+  HDR selection is refused without changing the running stream.
 - **Honest dynamic-range badge.** The chip names what the *file* carries; when
   the session is delivering something else, its source half dims while the
   rendered result stays legible (`DV → HDR10`, `HDR → SDR`). The split answers
@@ -257,12 +257,14 @@ server's **delivery plan**:
   choice, because the rung depends on which encoder wins and only the create
   response knows that.
 
-Dolby Vision is preserved on the first attempt. If an HDR10- or HLG-compatible
-Profile 8 title produces no film-time progress for roughly 12 seconds, the
-client retries once with only the Dolby Vision metadata removed. The 10-bit
-HEVC base picture and HDR grade remain intact; a full compatibility transcode
-is reserved for a second failure. A normally playing Dolby Vision stream never
-enters this recovery ladder.
+Dolby Vision is preserved on the first attempt. Before real playback, if an
+HDR10- or HLG-compatible Profile 8 title produces no film-time progress for
+roughly 12 seconds, the client retries once with only the Dolby Vision metadata
+removed. The 10-bit HEVC base picture and HDR grade remain intact; a full
+compatibility transcode is reserved for a second startup failure. Once an HDR
+item has advanced for at least five seconds, a later interruption reconnects
+the same HDR delivery once and then stops visibly on an immediate repeat — it
+never hides a transport fault by switching established playback to SDR.
 
 Both the decision and the session response also carry
 `delivered_dynamic_range` (`dolby_vision` / `hdr10` / `hlg` / `sdr`) — what the

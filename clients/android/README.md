@@ -19,8 +19,9 @@ feeding an AVR keeps lossless TrueHD instead of a 256 kb/s AAC downmix: the box
 has no TrueHD decoder, the receiver does, and the claim follows the route. It is
 recomputed on every decision, because unplugging HDMI changes the answer.
 
-> Status: **v0.2.2**, build `6` — native viewer parity across phone, foldable,
-> and TV. Build 6 carries the 2026-08-04 unified native playback menus.
+> Status: **v0.2.2**, build `9` — native viewer parity across phone, foldable,
+> and TV. Build 9 keeps established HDR through recovery and refuses burn-only
+> subtitle selections that would replace it with SDR.
 > Server administration remains in the web app; the viewing, discovery, and
 > playback surfaces are native here. The capability matrix is in
 > [Android client parity](../../docs/ANDROID-CLIENT-PARITY.md).
@@ -63,16 +64,16 @@ recomputed on every decision, because unplugging HDMI changes the answer.
   - **Subtitles cost what they should.** SRT and WebVTT arrive as native HLS
     text renditions — no encoder, no lost resolution, no lost HDR — and
     switching between two of them never restarts the stream. Only tracks with
-    no text to send (PGS, VobSub, styled ASS/SSA) are burned in, and a burn
-    always carries the source's own height. A forced track auto-shows; a
-    merely-same-language one never does.
+    no text to send (PGS, VobSub, styled ASS/SSA) burn in only on SDR, always
+    at the source's own height. While HDR is playing, the app refuses that
+    selection with a transient notice and leaves the stream untouched.
   - Quality is **Auto, Original, and the rungs the server advertises for this
     source**, so a 1080p file stops offering to upscale itself. Plus persistent
     A/V sync correction, auto-skip, autoplay-next, playback decision details,
     media sessions, and picture-in-picture on supported devices.
-  - A stream the device refuses gets **one** automatic rescue — reopened as a
-    guaranteed-compatible transcode at the current position. A second failure
-    is a visible error with Retry and Back, never a frozen black surface.
+  - Before a frame renders, a stream the device refuses gets **one** automatic
+    compatibility rescue. Once HDR has rendered, a later error reconnects the
+    same delivery once; a repeat is visible instead of silently becoming SDR.
   - Progress is reported back to the server every 10s and on pause/exit, which drives your
     watch state and the server-side **Trakt** scrobble.
 - **Viewer preferences** remember theme, appearance, poster size, home

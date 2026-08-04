@@ -665,6 +665,11 @@ private fun PlayerContent(
             delay(500)
         }
     }
+    LaunchedEffect(controller.playbackNotice) {
+        val notice = controller.playbackNotice ?: return@LaunchedEffect
+        delay(5_000)
+        if (controller.playbackNotice == notice) controller.clearPlaybackNotice()
+    }
     LaunchedEffect(controller) {
         while (true) {
             delay(10_000)
@@ -842,7 +847,11 @@ private fun PlayerContent(
                 selectedServerAudio = controller.selectedAudio,
                 selectedServerSubtitle = controller.selectedSubtitle,
                 onServerAudio = { onAudioChanged(it); controller.switchAudio(it); panel = null; poke() },
-                onServerSubtitle = { onSubtitleChanged(it); controller.switchSubtitle(it); panel = null; poke() },
+                onServerSubtitle = {
+                    if (controller.switchSubtitle(it)) onSubtitleChanged(it)
+                    panel = null
+                    poke()
+                },
                 onDismiss = { panel = null; poke() },
             )
             PlayerPanel.Settings -> PlayerSettings(
@@ -866,6 +875,19 @@ private fun PlayerContent(
                 onDismiss = { panel = null; poke() },
             )
             null -> Unit
+        }
+
+        controller.playbackNotice?.let { notice ->
+            Text(
+                text = notice,
+                color = Color.White,
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = 24.dp, start = 40.dp, end = 40.dp)
+                    .background(Color.Black.copy(alpha = 0.82f), MaterialTheme.shapes.medium)
+                    .padding(horizontal = 14.dp, vertical = 10.dp),
+            )
         }
     }
 }

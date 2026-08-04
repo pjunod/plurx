@@ -53,6 +53,34 @@ class PlaybackPolicyTest {
         assertEquals(PlaybackErrorAction.Fail, playbackErrorAction("transcode", false, true, true))
     }
 
+    @Test
+    fun establishedHdrRetriesTheSameDeliveryAndNeverFallsThroughToSdr() {
+        assertEquals(
+            PlaybackErrorAction.RetrySameHDRDelivery,
+            playbackErrorAction(
+                deliveryMode = "remux",
+                preservesDolbyVision = false,
+                remuxRescueAlreadyUsed = false,
+                transcodeRescueAlreadyUsed = false,
+                deliveredRange = "hdr10",
+                establishedPlayback = true,
+                sameHdrRetryAlreadyUsed = false,
+            ),
+        )
+        assertEquals(
+            PlaybackErrorAction.Fail,
+            playbackErrorAction(
+                deliveryMode = "remux",
+                preservesDolbyVision = false,
+                remuxRescueAlreadyUsed = false,
+                transcodeRescueAlreadyUsed = false,
+                deliveredRange = "hdr10",
+                establishedPlayback = true,
+                sameHdrRetryAlreadyUsed = true,
+            ),
+        )
+    }
+
     // ---- §5.6 the menu is the server's ladder ------------------------------
 
     @Test

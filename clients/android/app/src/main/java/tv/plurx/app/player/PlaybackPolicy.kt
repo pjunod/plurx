@@ -40,6 +40,9 @@ internal fun decisionForce(quality: PlaybackQuality): String = when (quality) {
 // ---- §4.2 The fidelity-preserving compatibility ladder ----------------------
 
 internal enum class PlaybackErrorAction {
+    /** Real HDR has already rendered: reconnect without changing its recipe. */
+    RetrySameHDRDelivery,
+
     /** Keep the video/DV intact but give the decoder a normalized MP4 envelope. */
     RetryAsDolbyVisionRemux,
 
@@ -61,7 +64,15 @@ internal fun playbackErrorAction(
     preservesDolbyVision: Boolean,
     remuxRescueAlreadyUsed: Boolean,
     transcodeRescueAlreadyUsed: Boolean,
+    deliveredRange: String? = null,
+    establishedPlayback: Boolean = false,
+    sameHdrRetryAlreadyUsed: Boolean = false,
 ): PlaybackErrorAction = when {
+    establishedPlayback &&
+        deliveredRange?.lowercase() in setOf("dolby_vision", "hdr10", "hlg") &&
+        !sameHdrRetryAlreadyUsed -> PlaybackErrorAction.RetrySameHDRDelivery
+    establishedPlayback && deliveredRange?.lowercase() in
+        setOf("dolby_vision", "hdr10", "hlg") -> PlaybackErrorAction.Fail
     deliveryMode == "direct" && preservesDolbyVision && !remuxRescueAlreadyUsed ->
         PlaybackErrorAction.RetryAsDolbyVisionRemux
     deliveryMode in setOf("direct", "remux") && !transcodeRescueAlreadyUsed ->
