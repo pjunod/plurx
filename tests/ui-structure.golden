@@ -31,6 +31,7 @@
 # changed.
 *|*|layout|classic|desktop mobile tv
 *|*|layout|plex|desktop mobile tv
+*|*|layout|theater|desktop mobile tv
 *|*|surface|1280x860|desktop
 *|*|surface|390x780|mobile
 classic|activity@1280x860|dom|^ > div#app|1
@@ -3654,3 +3655,1648 @@ plex|settings@390x780|req|GET /api/v1/settings|1
 plex|settings@390x780|req|GET /api/v1/system|1
 plex|settings@390x780|req|GET /api/v1/trakt/status|3
 plex|settings@390x780|req|GET /api/v1/users|1
+theater|activity@1280x860|dom|^ > div#app|1
+theater|activity@1280x860|dom|button.ghost.profile.sm > span.caret[text]|1
+theater|activity@1280x860|dom|button.ghost.profile.sm > span.pavatar[text]|1
+theater|activity@1280x860|dom|button.ghost.profile.sm > span.pname[text]|1
+theater|activity@1280x860|dom|button.ghost.sizebtn.sm > span[text]|1
+theater|activity@1280x860|dom|button.ghost.sizebtn.sm > svg[aria-hidden=true]|1
+theater|activity@1280x860|dom|button.ghost.sm[aria-label=*] > span.tsw|1
+theater|activity@1280x860|dom|div#app > header.th-top|1
+theater|activity@1280x860|dom|div#app > main#main|1
+theater|activity@1280x860|dom|div#app > nav.th-pills[aria-label=*]|1
+theater|activity@1280x860|dom|div.card > p.muted[text]|1
+theater|activity@1280x860|dom|div.th-ctl > div.th-pop|4
+theater|activity@1280x860|dom|div.th-pop > button.ghost.profile.sm|1
+theater|activity@1280x860|dom|div.th-pop > button.ghost.sizebtn.sm|1
+theater|activity@1280x860|dom|div.th-pop > button.ghost.sm[aria-label=* text]|1
+theater|activity@1280x860|dom|div.th-pop > button.ghost.sm[aria-label=*]|1
+theater|activity@1280x860|dom|div.th-pop > div#appmenu.amenu|1
+theater|activity@1280x860|dom|div.th-pop > div#profilemenu.amenu|1
+theater|activity@1280x860|dom|div.th-pop > div#sizemenu.amenu|1
+theater|activity@1280x860|dom|div.th-pop > div#thememenu.amenu|1
+theater|activity@1280x860|dom|header.th-top > a.logo[text]|1
+theater|activity@1280x860|dom|header.th-top > div.th-ctl|1
+theater|activity@1280x860|dom|header.th-top > input#q.search[aria-label=*]|1
+theater|activity@1280x860|dom|header.th-top > nav.th-nav[aria-label=*]|1
+theater|activity@1280x860|dom|header.th-top > span#activity.activity|1
+theater|activity@1280x860|dom|header.th-top > span.spacer|1
+theater|activity@1280x860|dom|main#main > div.card|1
+theater|activity@1280x860|dom|main#main > div.empty[text]|3
+theater|activity@1280x860|dom|main#main > h2.section[text]|4
+theater|activity@1280x860|dom|nav.th-nav[aria-label=*] > a.on[aria-current=page text]|1
+theater|activity@1280x860|dom|nav.th-nav[aria-label=*] > a[text]|2
+theater|activity@1280x860|dom|nav.th-pills[aria-label=*] > a.on[aria-current=page text]|1
+theater|activity@1280x860|dom|nav.th-pills[aria-label=*] > a[text]|2
+theater|activity@1280x860|dom|p.muted[text] > a[text]|1
+theater|activity@1280x860|dom|svg[aria-hidden=true] > rect|4
+theater|activity@1280x860|focus|000|a.logo "cinemarr"
+theater|activity@1280x860|focus|001|a "Home"
+theater|activity@1280x860|focus|002|a.on "Activity"
+theater|activity@1280x860|focus|003|a "Settings"
+theater|activity@1280x860|focus|004|input#q.search "Search cinemarr"
+theater|activity@1280x860|focus|005|button.ghost.sm "Theme and layout"
+theater|activity@1280x860|focus|006|button.ghost.sm "Light or dark"
+theater|activity@1280x860|focus|007|button.ghost.sm.sizebtn "Icon size"
+theater|activity@1280x860|focus|008|button.ghost.sm.profile "Account"
+theater|activity@1280x860|focus|009|a "Settings"
+theater|activity@1280x860|focus|010|<wrap>
+theater|activity@1280x860|req|GET /api/v1/activity/detail|2
+theater|activity@1280x860|req|GET /api/v1/activity|2
+theater|activity@1280x860|req|GET /api/v1/me|1
+theater|activity@1280x860|req|GET /api/v1/server|1
+theater|activity@390x780|dom|^ > div#app|1
+theater|activity@390x780|dom|button.ghost.profile.sm > span.caret[text]|1
+theater|activity@390x780|dom|button.ghost.profile.sm > span.pavatar[text]|1
+theater|activity@390x780|dom|button.ghost.profile.sm > span.pname[text]|1
+theater|activity@390x780|dom|button.ghost.sizebtn.sm > span[text]|1
+theater|activity@390x780|dom|button.ghost.sizebtn.sm > svg[aria-hidden=true]|1
+theater|activity@390x780|dom|button.ghost.sm[aria-label=*] > span.tsw|1
+theater|activity@390x780|dom|div#app > header.th-top|1
+theater|activity@390x780|dom|div#app > main#main|1
+theater|activity@390x780|dom|div#app > nav.th-pills[aria-label=*]|1
+theater|activity@390x780|dom|div.card > p.muted[text]|1
+theater|activity@390x780|dom|div.th-ctl > div.th-pop|4
+theater|activity@390x780|dom|div.th-pop > button.ghost.profile.sm|1
+theater|activity@390x780|dom|div.th-pop > button.ghost.sizebtn.sm|1
+theater|activity@390x780|dom|div.th-pop > button.ghost.sm[aria-label=* text]|1
+theater|activity@390x780|dom|div.th-pop > button.ghost.sm[aria-label=*]|1
+theater|activity@390x780|dom|div.th-pop > div#appmenu.amenu|1
+theater|activity@390x780|dom|div.th-pop > div#profilemenu.amenu|1
+theater|activity@390x780|dom|div.th-pop > div#sizemenu.amenu|1
+theater|activity@390x780|dom|div.th-pop > div#thememenu.amenu|1
+theater|activity@390x780|dom|header.th-top > a.logo[text]|1
+theater|activity@390x780|dom|header.th-top > div.th-ctl|1
+theater|activity@390x780|dom|header.th-top > input#q.search[aria-label=*]|1
+theater|activity@390x780|dom|header.th-top > nav.th-nav[aria-label=*]|1
+theater|activity@390x780|dom|header.th-top > span#activity.activity|1
+theater|activity@390x780|dom|header.th-top > span.spacer|1
+theater|activity@390x780|dom|main#main > div.card|1
+theater|activity@390x780|dom|main#main > div.empty[text]|3
+theater|activity@390x780|dom|main#main > h2.section[text]|4
+theater|activity@390x780|dom|nav.th-nav[aria-label=*] > a.on[aria-current=page text]|1
+theater|activity@390x780|dom|nav.th-nav[aria-label=*] > a[text]|2
+theater|activity@390x780|dom|nav.th-pills[aria-label=*] > a.on[aria-current=page text]|1
+theater|activity@390x780|dom|nav.th-pills[aria-label=*] > a[text]|2
+theater|activity@390x780|dom|p.muted[text] > a[text]|1
+theater|activity@390x780|dom|svg[aria-hidden=true] > rect|4
+theater|activity@390x780|focus|000|a.logo "cinemarr"
+theater|activity@390x780|focus|001|input#q.search "Search cinemarr"
+theater|activity@390x780|focus|002|button.ghost.sm "Theme and layout"
+theater|activity@390x780|focus|003|button.ghost.sm "Light or dark"
+theater|activity@390x780|focus|004|button.ghost.sm.sizebtn "Icon size"
+theater|activity@390x780|focus|005|button.ghost.sm.profile "Account"
+theater|activity@390x780|focus|006|a "Settings"
+theater|activity@390x780|focus|007|a "Home"
+theater|activity@390x780|focus|008|a.on "Activity"
+theater|activity@390x780|focus|009|a "Settings"
+theater|activity@390x780|focus|010|<wrap>
+theater|activity@390x780|req|GET /api/v1/activity/detail|2
+theater|activity@390x780|req|GET /api/v1/activity|2
+theater|activity@390x780|req|GET /api/v1/me|1
+theater|activity@390x780|req|GET /api/v1/server|1
+theater|auth@1280x860|dom|^ > div#app|1
+theater|auth@1280x860|dom|details.connectqr > img|1
+theater|auth@1280x860|dom|details.connectqr > p[text]|2
+theater|auth@1280x860|dom|details.connectqr > summary[text]|1
+theater|auth@1280x860|dom|div#app > div.center|1
+theater|auth@1280x860|dom|div.center > form#af.auth.card|1
+theater|auth@1280x860|dom|form#af.auth.card > button#ab[text]|1
+theater|auth@1280x860|dom|form#af.auth.card > details.connectqr|1
+theater|auth@1280x860|dom|form#af.auth.card > div#aerr.err|1
+theater|auth@1280x860|dom|form#af.auth.card > div.logo[text]|1
+theater|auth@1280x860|dom|form#af.auth.card > div.versionstamp[text]|1
+theater|auth@1280x860|dom|form#af.auth.card > h1[text]|1
+theater|auth@1280x860|dom|form#af.auth.card > input#p[type=password]|1
+theater|auth@1280x860|dom|form#af.auth.card > input#u|1
+theater|auth@1280x860|dom|form#af.auth.card > label[text]|2
+theater|auth@1280x860|dom|form#af.auth.card > p.muted[text]|1
+theater|auth@1280x860|focus|000|input#u
+theater|auth@1280x860|focus|001|input#p
+theater|auth@1280x860|focus|002|summary "Connect an app with a QR code"
+theater|auth@1280x860|focus|003|button#ab "Sign in"
+theater|auth@1280x860|focus|004|<wrap>
+theater|auth@1280x860|req|GET /api/v1/server|1
+theater|auth@390x780|dom|^ > div#app|1
+theater|auth@390x780|dom|details.connectqr > img|1
+theater|auth@390x780|dom|details.connectqr > p[text]|2
+theater|auth@390x780|dom|details.connectqr > summary[text]|1
+theater|auth@390x780|dom|div#app > div.center|1
+theater|auth@390x780|dom|div.center > form#af.auth.card|1
+theater|auth@390x780|dom|form#af.auth.card > button#ab[text]|1
+theater|auth@390x780|dom|form#af.auth.card > details.connectqr|1
+theater|auth@390x780|dom|form#af.auth.card > div#aerr.err|1
+theater|auth@390x780|dom|form#af.auth.card > div.logo[text]|1
+theater|auth@390x780|dom|form#af.auth.card > div.versionstamp[text]|1
+theater|auth@390x780|dom|form#af.auth.card > h1[text]|1
+theater|auth@390x780|dom|form#af.auth.card > input#p[type=password]|1
+theater|auth@390x780|dom|form#af.auth.card > input#u|1
+theater|auth@390x780|dom|form#af.auth.card > label[text]|2
+theater|auth@390x780|dom|form#af.auth.card > p.muted[text]|1
+theater|auth@390x780|focus|000|input#u
+theater|auth@390x780|focus|001|input#p
+theater|auth@390x780|focus|002|summary "Connect an app with a QR code"
+theater|auth@390x780|focus|003|button#ab "Sign in"
+theater|auth@390x780|focus|004|<wrap>
+theater|auth@390x780|req|GET /api/v1/server|1
+theater|category@1280x860|dom|^ > div#app|1
+theater|category@1280x860|dom|button.ghost.profile.sm > span.caret[text]|1
+theater|category@1280x860|dom|button.ghost.profile.sm > span.pavatar[text]|1
+theater|category@1280x860|dom|button.ghost.profile.sm > span.pname[text]|1
+theater|category@1280x860|dom|button.ghost.sizebtn.sm > span[text]|1
+theater|category@1280x860|dom|button.ghost.sizebtn.sm > svg[aria-hidden=true]|1
+theater|category@1280x860|dom|button.ghost.sm[aria-label=*] > span.tsw|1
+theater|category@1280x860|dom|div#app > header.th-top|1
+theater|category@1280x860|dom|div#app > main#main|1
+theater|category@1280x860|dom|div#app > nav.th-pills[aria-label=*]|1
+theater|category@1280x860|dom|div#libbody > div.grid|1
+theater|category@1280x860|dom|div#librail > div.azbar[aria-label=*]|1
+theater|category@1280x860|dom|div.artbox > div.art.ph[text]|4
+theater|category@1280x860|dom|div.azbar[aria-label=*] > button.active[text]|1
+theater|category@1280x860|dom|div.azbar[aria-label=*] > button[text]|2
+theater|category@1280x860|dom|div.azbar[aria-label=*] > span.off[text]|24
+theater|category@1280x860|dom|div.crumbs > a[text]|1
+theater|category@1280x860|dom|div.crumbs > span.cur[text]|1
+theater|category@1280x860|dom|div.crumbs > span.sep[text]|1
+theater|category@1280x860|dom|div.grid > div.k-movie.poster.unw[role=link tabindex=0]|3
+theater|category@1280x860|dom|div.grid > div.k-movie.poster[role=link tabindex=0]|1
+theater|category@1280x860|dom|div.k-movie.poster.unw[role=link tabindex=0] > div.artbox|3
+theater|category@1280x860|dom|div.k-movie.poster.unw[role=link tabindex=0] > div.meta|3
+theater|category@1280x860|dom|div.k-movie.poster[role=link tabindex=0] > div.artbox|1
+theater|category@1280x860|dom|div.k-movie.poster[role=link tabindex=0] > div.meta|1
+theater|category@1280x860|dom|div.k-movie.poster[role=link tabindex=0] > div.prog|1
+theater|category@1280x860|dom|div.libbar.th-chips > span#libcount.muted[text]|1
+theater|category@1280x860|dom|div.libbar.th-chips > span.th-cpair|3
+theater|category@1280x860|dom|div.meta > div.s|4
+theater|category@1280x860|dom|div.meta > div.t[text]|4
+theater|category@1280x860|dom|div.pagehead > div.phnav|1
+theater|category@1280x860|dom|div.pagehead > h2.phtitle[text]|1
+theater|category@1280x860|dom|div.phnav > a.pgback[aria-label=* text]|1
+theater|category@1280x860|dom|div.phnav > div.crumbs|1
+theater|category@1280x860|dom|div.prog > i|1
+theater|category@1280x860|dom|div.s > span.resbadge.resgrad[text]|4
+theater|category@1280x860|dom|div.s > span.stxt[text]|4
+theater|category@1280x860|dom|div.th-ctl > div.th-pop|4
+theater|category@1280x860|dom|div.th-grid > div#libbody|1
+theater|category@1280x860|dom|div.th-pop > button.ghost.profile.sm|1
+theater|category@1280x860|dom|div.th-pop > button.ghost.sizebtn.sm|1
+theater|category@1280x860|dom|div.th-pop > button.ghost.sm[aria-label=* text]|1
+theater|category@1280x860|dom|div.th-pop > button.ghost.sm[aria-label=*]|1
+theater|category@1280x860|dom|div.th-pop > div#appmenu.amenu|1
+theater|category@1280x860|dom|div.th-pop > div#profilemenu.amenu|1
+theater|category@1280x860|dom|div.th-pop > div#sizemenu.amenu|1
+theater|category@1280x860|dom|div.th-pop > div#thememenu.amenu|1
+theater|category@1280x860|dom|header.th-top > a.logo[text]|1
+theater|category@1280x860|dom|header.th-top > div.th-ctl|1
+theater|category@1280x860|dom|header.th-top > input#q.search[aria-label=*]|1
+theater|category@1280x860|dom|header.th-top > nav.th-nav[aria-label=*]|1
+theater|category@1280x860|dom|header.th-top > span#activity.activity|1
+theater|category@1280x860|dom|header.th-top > span.spacer|1
+theater|category@1280x860|dom|main#main > div#libpager|1
+theater|category@1280x860|dom|main#main > div#librail|1
+theater|category@1280x860|dom|main#main > div.libbar.th-chips|1
+theater|category@1280x860|dom|main#main > div.pagehead|1
+theater|category@1280x860|dom|main#main > div.th-grid|1
+theater|category@1280x860|dom|nav.th-nav[aria-label=*] > a[text]|3
+theater|category@1280x860|dom|nav.th-pills[aria-label=*] > a[text]|3
+theater|category@1280x860|dom|select[aria-label=*] > option[text]|14
+theater|category@1280x860|dom|span.th-cpair > select[aria-label=*]|3
+theater|category@1280x860|dom|span.th-cpair > span.lbl[text]|3
+theater|category@1280x860|dom|svg[aria-hidden=true] > rect|4
+theater|category@1280x860|focus|000|a.logo "cinemarr"
+theater|category@1280x860|focus|001|a "Home"
+theater|category@1280x860|focus|002|a "Activity"
+theater|category@1280x860|focus|003|a "Settings"
+theater|category@1280x860|focus|004|input#q.search "Search cinemarr"
+theater|category@1280x860|focus|005|button.ghost.sm "Theme and layout"
+theater|category@1280x860|focus|006|button.ghost.sm "Light or dark"
+theater|category@1280x860|focus|007|button.ghost.sm.sizebtn "Icon size"
+theater|category@1280x860|focus|008|button.ghost.sm.profile "Account"
+theater|category@1280x860|focus|009|a.pgback "Back to Home"
+theater|category@1280x860|focus|010|a "Home"
+theater|category@1280x860|focus|011|select "Sort"
+theater|category@1280x860|focus|012|select "Show"
+theater|category@1280x860|focus|013|select "Per page"
+theater|category@1280x860|focus|014|div.poster.k-movie.unw "BR Blade Runner 1982 180p"
+theater|category@1280x860|focus|015|div.poster.k-movie "H Heat 1995 180p"
+theater|category@1280x860|focus|016|div.poster.k-movie.unw "TS The Signal 2021 180p"
+theater|category@1280x860|focus|017|div.poster.k-movie.unw "SF Signal Fire 2003 180p"
+theater|category@1280x860|focus|018|button.active "Jump to B"
+theater|category@1280x860|focus|019|button "Jump to H"
+theater|category@1280x860|focus|020|button "Jump to S"
+theater|category@1280x860|focus|021|<wrap>
+theater|category@1280x860|req|GET /api/v1/activity|2
+theater|category@1280x860|req|GET /api/v1/libraries/<id>/items|2
+theater|category@1280x860|req|GET /api/v1/libraries|1
+theater|category@1280x860|req|GET /api/v1/me|1
+theater|category@1280x860|req|GET /api/v1/server|1
+theater|category@390x780|dom|^ > div#app|1
+theater|category@390x780|dom|button.ghost.profile.sm > span.caret[text]|1
+theater|category@390x780|dom|button.ghost.profile.sm > span.pavatar[text]|1
+theater|category@390x780|dom|button.ghost.profile.sm > span.pname[text]|1
+theater|category@390x780|dom|button.ghost.sizebtn.sm > span[text]|1
+theater|category@390x780|dom|button.ghost.sizebtn.sm > svg[aria-hidden=true]|1
+theater|category@390x780|dom|button.ghost.sm[aria-label=*] > span.tsw|1
+theater|category@390x780|dom|div#app > header.th-top|1
+theater|category@390x780|dom|div#app > main#main|1
+theater|category@390x780|dom|div#app > nav.th-pills[aria-label=*]|1
+theater|category@390x780|dom|div#libbody > div.grid|1
+theater|category@390x780|dom|div#librail > div.azbar[aria-label=*]|1
+theater|category@390x780|dom|div.artbox > div.art.ph[text]|4
+theater|category@390x780|dom|div.azbar[aria-label=*] > button.active[text]|1
+theater|category@390x780|dom|div.azbar[aria-label=*] > button[text]|2
+theater|category@390x780|dom|div.azbar[aria-label=*] > span.off[text]|24
+theater|category@390x780|dom|div.crumbs > a[text]|1
+theater|category@390x780|dom|div.crumbs > span.cur[text]|1
+theater|category@390x780|dom|div.crumbs > span.sep[text]|1
+theater|category@390x780|dom|div.grid > div.k-movie.poster.unw[role=link tabindex=0]|3
+theater|category@390x780|dom|div.grid > div.k-movie.poster[role=link tabindex=0]|1
+theater|category@390x780|dom|div.k-movie.poster.unw[role=link tabindex=0] > div.artbox|3
+theater|category@390x780|dom|div.k-movie.poster.unw[role=link tabindex=0] > div.meta|3
+theater|category@390x780|dom|div.k-movie.poster[role=link tabindex=0] > div.artbox|1
+theater|category@390x780|dom|div.k-movie.poster[role=link tabindex=0] > div.meta|1
+theater|category@390x780|dom|div.k-movie.poster[role=link tabindex=0] > div.prog|1
+theater|category@390x780|dom|div.libbar.th-chips > span#libcount.muted[text]|1
+theater|category@390x780|dom|div.libbar.th-chips > span.th-cpair|3
+theater|category@390x780|dom|div.meta > div.s|4
+theater|category@390x780|dom|div.meta > div.t[text]|4
+theater|category@390x780|dom|div.pagehead > div.phnav|1
+theater|category@390x780|dom|div.pagehead > h2.phtitle[text]|1
+theater|category@390x780|dom|div.phnav > a.pgback[aria-label=* text]|1
+theater|category@390x780|dom|div.phnav > div.crumbs|1
+theater|category@390x780|dom|div.prog > i|1
+theater|category@390x780|dom|div.s > span.resbadge.resgrad[text]|4
+theater|category@390x780|dom|div.s > span.stxt[text]|4
+theater|category@390x780|dom|div.th-ctl > div.th-pop|4
+theater|category@390x780|dom|div.th-grid > div#libbody|1
+theater|category@390x780|dom|div.th-pop > button.ghost.profile.sm|1
+theater|category@390x780|dom|div.th-pop > button.ghost.sizebtn.sm|1
+theater|category@390x780|dom|div.th-pop > button.ghost.sm[aria-label=* text]|1
+theater|category@390x780|dom|div.th-pop > button.ghost.sm[aria-label=*]|1
+theater|category@390x780|dom|div.th-pop > div#appmenu.amenu|1
+theater|category@390x780|dom|div.th-pop > div#profilemenu.amenu|1
+theater|category@390x780|dom|div.th-pop > div#sizemenu.amenu|1
+theater|category@390x780|dom|div.th-pop > div#thememenu.amenu|1
+theater|category@390x780|dom|header.th-top > a.logo[text]|1
+theater|category@390x780|dom|header.th-top > div.th-ctl|1
+theater|category@390x780|dom|header.th-top > input#q.search[aria-label=*]|1
+theater|category@390x780|dom|header.th-top > nav.th-nav[aria-label=*]|1
+theater|category@390x780|dom|header.th-top > span#activity.activity|1
+theater|category@390x780|dom|header.th-top > span.spacer|1
+theater|category@390x780|dom|main#main > div#libpager|1
+theater|category@390x780|dom|main#main > div#librail|1
+theater|category@390x780|dom|main#main > div.libbar.th-chips|1
+theater|category@390x780|dom|main#main > div.pagehead|1
+theater|category@390x780|dom|main#main > div.th-grid|1
+theater|category@390x780|dom|nav.th-nav[aria-label=*] > a[text]|3
+theater|category@390x780|dom|nav.th-pills[aria-label=*] > a[text]|3
+theater|category@390x780|dom|select[aria-label=*] > option[text]|14
+theater|category@390x780|dom|span.th-cpair > select[aria-label=*]|3
+theater|category@390x780|dom|span.th-cpair > span.lbl[text]|3
+theater|category@390x780|dom|svg[aria-hidden=true] > rect|4
+theater|category@390x780|focus|000|a.logo "cinemarr"
+theater|category@390x780|focus|001|input#q.search "Search cinemarr"
+theater|category@390x780|focus|002|button.ghost.sm "Theme and layout"
+theater|category@390x780|focus|003|button.ghost.sm "Light or dark"
+theater|category@390x780|focus|004|button.ghost.sm.sizebtn "Icon size"
+theater|category@390x780|focus|005|button.ghost.sm.profile "Account"
+theater|category@390x780|focus|006|a.pgback "Back to Home"
+theater|category@390x780|focus|007|a "Home"
+theater|category@390x780|focus|008|select "Sort"
+theater|category@390x780|focus|009|select "Show"
+theater|category@390x780|focus|010|select "Per page"
+theater|category@390x780|focus|011|div.poster.k-movie.unw "BR Blade Runner 1982 180p"
+theater|category@390x780|focus|012|div.poster.k-movie "H Heat 1995 180p"
+theater|category@390x780|focus|013|div.poster.k-movie.unw "TS The Signal 2021 180p"
+theater|category@390x780|focus|014|div.poster.k-movie.unw "SF Signal Fire 2003 180p"
+theater|category@390x780|focus|015|button.active "Jump to B"
+theater|category@390x780|focus|016|button "Jump to H"
+theater|category@390x780|focus|017|button "Jump to S"
+theater|category@390x780|focus|018|a "Home"
+theater|category@390x780|focus|019|a "Activity"
+theater|category@390x780|focus|020|a "Settings"
+theater|category@390x780|focus|021|<wrap>
+theater|category@390x780|req|GET /api/v1/activity|2
+theater|category@390x780|req|GET /api/v1/libraries/<id>/items|2
+theater|category@390x780|req|GET /api/v1/libraries|1
+theater|category@390x780|req|GET /api/v1/me|1
+theater|category@390x780|req|GET /api/v1/server|1
+theater|home@1280x860|dom|^ > div#app|1
+theater|home@1280x860|dom|button.ghost.profile.sm > span.caret[text]|1
+theater|home@1280x860|dom|button.ghost.profile.sm > span.pavatar[text]|1
+theater|home@1280x860|dom|button.ghost.profile.sm > span.pname[text]|1
+theater|home@1280x860|dom|button.ghost.sizebtn.sm > span[text]|1
+theater|home@1280x860|dom|button.ghost.sizebtn.sm > svg[aria-hidden=true]|1
+theater|home@1280x860|dom|button.ghost.sm[aria-label=*] > span.tsw|1
+theater|home@1280x860|dom|div#app > header.th-top|1
+theater|home@1280x860|dom|div#app > main#main|1
+theater|home@1280x860|dom|div#app > nav.th-pills[aria-label=*]|1
+theater|home@1280x860|dom|div.actions > button.btnplay[text]|1
+theater|home@1280x860|dom|div.actions > button.ghost[text]|1
+theater|home@1280x860|dom|div.artbox > div.art.ph[text]|12
+theater|home@1280x860|dom|div.artbox > span.badge[text]|1
+theater|home@1280x860|dom|div.k-episode.poster.unw[role=link tabindex=0] > div.artbox|1
+theater|home@1280x860|dom|div.k-episode.poster.unw[role=link tabindex=0] > div.meta|1
+theater|home@1280x860|dom|div.k-episode.poster[role=link tabindex=0] > div.artbox|1
+theater|home@1280x860|dom|div.k-episode.poster[role=link tabindex=0] > div.meta|1
+theater|home@1280x860|dom|div.k-episode.poster[role=link tabindex=0] > div.prog|1
+theater|home@1280x860|dom|div.k-movie.poster.unw[role=link tabindex=0] > div.artbox|6
+theater|home@1280x860|dom|div.k-movie.poster.unw[role=link tabindex=0] > div.meta|6
+theater|home@1280x860|dom|div.k-movie.poster[role=link tabindex=0] > div.artbox|3
+theater|home@1280x860|dom|div.k-movie.poster[role=link tabindex=0] > div.meta|3
+theater|home@1280x860|dom|div.k-movie.poster[role=link tabindex=0] > div.prog|3
+theater|home@1280x860|dom|div.k-show.poster.unw[role=link tabindex=0] > div.artbox|1
+theater|home@1280x860|dom|div.k-show.poster.unw[role=link tabindex=0] > div.meta|1
+theater|home@1280x860|dom|div.libbar > div.row|1
+theater|home@1280x860|dom|div.meta > div.cleft[text]|1
+theater|home@1280x860|dom|div.meta > div.s|12
+theater|home@1280x860|dom|div.meta > div.t[text]|12
+theater|home@1280x860|dom|div.prog > i|4
+theater|home@1280x860|dom|div.railbox > button.l.railarrow[aria-label=* text]|5
+theater|home@1280x860|dom|div.railbox > button.r.railarrow[aria-label=* text]|5
+theater|home@1280x860|dom|div.railbox > div.rowscroll|5
+theater|home@1280x860|dom|div.row > select|1
+theater|home@1280x860|dom|div.row > span.lbl[text]|1
+theater|home@1280x860|dom|div.rowscroll > div.k-episode.poster.unw[role=link tabindex=0]|1
+theater|home@1280x860|dom|div.rowscroll > div.k-episode.poster[role=link tabindex=0]|1
+theater|home@1280x860|dom|div.rowscroll > div.k-movie.poster.unw[role=link tabindex=0]|6
+theater|home@1280x860|dom|div.rowscroll > div.k-movie.poster[role=link tabindex=0]|3
+theater|home@1280x860|dom|div.rowscroll > div.k-show.poster.unw[role=link tabindex=0]|1
+theater|home@1280x860|dom|div.s > span.resbadge.resgrad[text]|9
+theater|home@1280x860|dom|div.s > span.stxt[text]|12
+theater|home@1280x860|dom|div.th-ctl > div.th-pop|4
+theater|home@1280x860|dom|div.th-fg > div.actions|1
+theater|home@1280x860|dom|div.th-fg > div.th-hprog[role=progressbar aria-valuemin=0 aria-valuemax=100 aria-label=* aria-valuenow=*]|1
+theater|home@1280x860|dom|div.th-fg > div.th-kick[text]|1
+theater|home@1280x860|dom|div.th-fg > div.th-meta|1
+theater|home@1280x860|dom|div.th-fg > h1.th-title[text]|1
+theater|home@1280x860|dom|div.th-hprog[role=progressbar aria-valuemin=0 aria-valuemax=100 aria-label=* aria-valuenow=*] > i|1
+theater|home@1280x860|dom|div.th-meta > div.cleft[text]|1
+theater|home@1280x860|dom|div.th-meta > span[text]|1
+theater|home@1280x860|dom|div.th-pop > button.ghost.profile.sm|1
+theater|home@1280x860|dom|div.th-pop > button.ghost.sizebtn.sm|1
+theater|home@1280x860|dom|div.th-pop > button.ghost.sm[aria-label=* text]|1
+theater|home@1280x860|dom|div.th-pop > button.ghost.sm[aria-label=*]|1
+theater|home@1280x860|dom|div.th-pop > div#appmenu.amenu|1
+theater|home@1280x860|dom|div.th-pop > div#profilemenu.amenu|1
+theater|home@1280x860|dom|div.th-pop > div#sizemenu.amenu|1
+theater|home@1280x860|dom|div.th-pop > div#thememenu.amenu|1
+theater|home@1280x860|dom|div.th-rails > div.libbar|1
+theater|home@1280x860|dom|div.th-rails > div.railbox|5
+theater|home@1280x860|dom|div.th-rails > h2.section[text]|5
+theater|home@1280x860|dom|h2.section[text] > a.muted[text]|2
+theater|home@1280x860|dom|header.th-top > a.logo[text]|1
+theater|home@1280x860|dom|header.th-top > div.th-ctl|1
+theater|home@1280x860|dom|header.th-top > input#q.search[aria-label=*]|1
+theater|home@1280x860|dom|header.th-top > nav.th-nav[aria-label=*]|1
+theater|home@1280x860|dom|header.th-top > span#activity.activity|1
+theater|home@1280x860|dom|header.th-top > span.spacer|1
+theater|home@1280x860|dom|main#main > div.th-rails|1
+theater|home@1280x860|dom|main#main > section.th-hero.th-noart[aria-label=*]|1
+theater|home@1280x860|dom|nav.th-nav[aria-label=*] > a.on[aria-current=page text]|1
+theater|home@1280x860|dom|nav.th-nav[aria-label=*] > a[text]|2
+theater|home@1280x860|dom|nav.th-pills[aria-label=*] > a.on[aria-current=page text]|1
+theater|home@1280x860|dom|nav.th-pills[aria-label=*] > a[text]|2
+theater|home@1280x860|dom|section.th-hero.th-noart[aria-label=*] > div.th-fg|1
+theater|home@1280x860|dom|section.th-hero.th-noart[aria-label=*] > div.th-scrim[aria-hidden=true]|1
+theater|home@1280x860|dom|select > option[text]|2
+theater|home@1280x860|dom|svg[aria-hidden=true] > rect|4
+theater|home@1280x860|focus|000|a.logo "cinemarr"
+theater|home@1280x860|focus|001|a.on "Home"
+theater|home@1280x860|focus|002|a "Activity"
+theater|home@1280x860|focus|003|a "Settings"
+theater|home@1280x860|focus|004|input#q.search "Search cinemarr"
+theater|home@1280x860|focus|005|button.ghost.sm "Theme and layout"
+theater|home@1280x860|focus|006|button.ghost.sm "Light or dark"
+theater|home@1280x860|focus|007|button.ghost.sm.sizebtn "Icon size"
+theater|home@1280x860|focus|008|button.ghost.sm.profile "Account"
+theater|home@1280x860|focus|009|button.btnplay "▶ Resume"
+theater|home@1280x860|focus|010|button.ghost "ⓘ Details"
+theater|home@1280x860|focus|011|div.poster.k-movie "H Heat 1995 180p 5s left · ends ~12:00 P
+theater|home@1280x860|focus|012|div.poster.k-episode.unw "TH Signal Hill S1E2 · The Handoff"
+theater|home@1280x860|focus|013|div.poster.k-movie.unw "BR Blade Runner 1982 180p"
+theater|home@1280x860|focus|014|div.poster.k-episode "CO ✓ Signal Hill S1E1 · Cold Open"
+theater|home@1280x860|focus|015|div.poster.k-movie "H Heat 1995 180p"
+theater|home@1280x860|focus|016|div.poster.k-movie.unw "SF Signal Fire 2003 180p"
+theater|home@1280x860|focus|017|div.poster.k-movie.unw "TS The Signal 2021 180p"
+theater|home@1280x860|focus|018|select "Category Share name"
+theater|home@1280x860|focus|019|a.muted "· VIEW ALL (4)"
+theater|home@1280x860|focus|020|div.poster.k-movie.unw "SF Signal Fire 2003 180p"
+theater|home@1280x860|focus|021|div.poster.k-movie.unw "TS The Signal 2021 180p"
+theater|home@1280x860|focus|022|div.poster.k-movie.unw "BR Blade Runner 1982 180p"
+theater|home@1280x860|focus|023|div.poster.k-movie "H Heat 1995 180p"
+theater|home@1280x860|focus|024|a.muted "· VIEW ALL (1)"
+theater|home@1280x860|focus|025|div.poster.k-show.unw "SH Signal Hill 2019"
+theater|home@1280x860|focus|026|<wrap>
+theater|home@1280x860|req|GET /api/v1/activity|2
+theater|home@1280x860|req|GET /api/v1/coming-soon|1
+theater|home@1280x860|req|GET /api/v1/hubs|1
+theater|home@1280x860|req|GET /api/v1/libraries/<id>/items|3
+theater|home@1280x860|req|GET /api/v1/libraries|1
+theater|home@1280x860|req|GET /api/v1/me|1
+theater|home@1280x860|req|GET /api/v1/server|1
+theater|home@390x780|dom|^ > div#app|1
+theater|home@390x780|dom|button.ghost.profile.sm > span.caret[text]|1
+theater|home@390x780|dom|button.ghost.profile.sm > span.pavatar[text]|1
+theater|home@390x780|dom|button.ghost.profile.sm > span.pname[text]|1
+theater|home@390x780|dom|button.ghost.sizebtn.sm > span[text]|1
+theater|home@390x780|dom|button.ghost.sizebtn.sm > svg[aria-hidden=true]|1
+theater|home@390x780|dom|button.ghost.sm[aria-label=*] > span.tsw|1
+theater|home@390x780|dom|div#app > header.th-top|1
+theater|home@390x780|dom|div#app > main#main|1
+theater|home@390x780|dom|div#app > nav.th-pills[aria-label=*]|1
+theater|home@390x780|dom|div.actions > button.btnplay[text]|1
+theater|home@390x780|dom|div.actions > button.ghost[text]|1
+theater|home@390x780|dom|div.artbox > div.art.ph[text]|12
+theater|home@390x780|dom|div.artbox > span.badge[text]|1
+theater|home@390x780|dom|div.can-r.railbox > button.l.railarrow[aria-label=* text]|2
+theater|home@390x780|dom|div.can-r.railbox > button.r.railarrow[aria-label=* text]|2
+theater|home@390x780|dom|div.can-r.railbox > div.rowscroll|2
+theater|home@390x780|dom|div.k-episode.poster.unw[role=link tabindex=0] > div.artbox|1
+theater|home@390x780|dom|div.k-episode.poster.unw[role=link tabindex=0] > div.meta|1
+theater|home@390x780|dom|div.k-episode.poster[role=link tabindex=0] > div.artbox|1
+theater|home@390x780|dom|div.k-episode.poster[role=link tabindex=0] > div.meta|1
+theater|home@390x780|dom|div.k-episode.poster[role=link tabindex=0] > div.prog|1
+theater|home@390x780|dom|div.k-movie.poster.unw[role=link tabindex=0] > div.artbox|6
+theater|home@390x780|dom|div.k-movie.poster.unw[role=link tabindex=0] > div.meta|6
+theater|home@390x780|dom|div.k-movie.poster[role=link tabindex=0] > div.artbox|3
+theater|home@390x780|dom|div.k-movie.poster[role=link tabindex=0] > div.meta|3
+theater|home@390x780|dom|div.k-movie.poster[role=link tabindex=0] > div.prog|3
+theater|home@390x780|dom|div.k-show.poster.unw[role=link tabindex=0] > div.artbox|1
+theater|home@390x780|dom|div.k-show.poster.unw[role=link tabindex=0] > div.meta|1
+theater|home@390x780|dom|div.libbar > div.row|1
+theater|home@390x780|dom|div.meta > div.cleft[text]|1
+theater|home@390x780|dom|div.meta > div.s|12
+theater|home@390x780|dom|div.meta > div.t[text]|12
+theater|home@390x780|dom|div.prog > i|4
+theater|home@390x780|dom|div.railbox > button.l.railarrow[aria-label=* text]|3
+theater|home@390x780|dom|div.railbox > button.r.railarrow[aria-label=* text]|3
+theater|home@390x780|dom|div.railbox > div.rowscroll|3
+theater|home@390x780|dom|div.row > select|1
+theater|home@390x780|dom|div.row > span.lbl[text]|1
+theater|home@390x780|dom|div.rowscroll > div.k-episode.poster.unw[role=link tabindex=0]|1
+theater|home@390x780|dom|div.rowscroll > div.k-episode.poster[role=link tabindex=0]|1
+theater|home@390x780|dom|div.rowscroll > div.k-movie.poster.unw[role=link tabindex=0]|6
+theater|home@390x780|dom|div.rowscroll > div.k-movie.poster[role=link tabindex=0]|3
+theater|home@390x780|dom|div.rowscroll > div.k-show.poster.unw[role=link tabindex=0]|1
+theater|home@390x780|dom|div.s > span.resbadge.resgrad[text]|9
+theater|home@390x780|dom|div.s > span.stxt[text]|12
+theater|home@390x780|dom|div.th-ctl > div.th-pop|4
+theater|home@390x780|dom|div.th-fg > div.actions|1
+theater|home@390x780|dom|div.th-fg > div.th-hprog[role=progressbar aria-valuemin=0 aria-valuemax=100 aria-label=* aria-valuenow=*]|1
+theater|home@390x780|dom|div.th-fg > div.th-kick[text]|1
+theater|home@390x780|dom|div.th-fg > div.th-meta|1
+theater|home@390x780|dom|div.th-fg > h1.th-title[text]|1
+theater|home@390x780|dom|div.th-hprog[role=progressbar aria-valuemin=0 aria-valuemax=100 aria-label=* aria-valuenow=*] > i|1
+theater|home@390x780|dom|div.th-meta > div.cleft[text]|1
+theater|home@390x780|dom|div.th-meta > span[text]|1
+theater|home@390x780|dom|div.th-pop > button.ghost.profile.sm|1
+theater|home@390x780|dom|div.th-pop > button.ghost.sizebtn.sm|1
+theater|home@390x780|dom|div.th-pop > button.ghost.sm[aria-label=* text]|1
+theater|home@390x780|dom|div.th-pop > button.ghost.sm[aria-label=*]|1
+theater|home@390x780|dom|div.th-pop > div#appmenu.amenu|1
+theater|home@390x780|dom|div.th-pop > div#profilemenu.amenu|1
+theater|home@390x780|dom|div.th-pop > div#sizemenu.amenu|1
+theater|home@390x780|dom|div.th-pop > div#thememenu.amenu|1
+theater|home@390x780|dom|div.th-rails > div.can-r.railbox|2
+theater|home@390x780|dom|div.th-rails > div.libbar|1
+theater|home@390x780|dom|div.th-rails > div.railbox|3
+theater|home@390x780|dom|div.th-rails > h2.section[text]|5
+theater|home@390x780|dom|h2.section[text] > a.muted[text]|2
+theater|home@390x780|dom|header.th-top > a.logo[text]|1
+theater|home@390x780|dom|header.th-top > div.th-ctl|1
+theater|home@390x780|dom|header.th-top > input#q.search[aria-label=*]|1
+theater|home@390x780|dom|header.th-top > nav.th-nav[aria-label=*]|1
+theater|home@390x780|dom|header.th-top > span#activity.activity|1
+theater|home@390x780|dom|header.th-top > span.spacer|1
+theater|home@390x780|dom|main#main > div.th-rails|1
+theater|home@390x780|dom|main#main > section.th-hero.th-noart[aria-label=*]|1
+theater|home@390x780|dom|nav.th-nav[aria-label=*] > a.on[aria-current=page text]|1
+theater|home@390x780|dom|nav.th-nav[aria-label=*] > a[text]|2
+theater|home@390x780|dom|nav.th-pills[aria-label=*] > a.on[aria-current=page text]|1
+theater|home@390x780|dom|nav.th-pills[aria-label=*] > a[text]|2
+theater|home@390x780|dom|section.th-hero.th-noart[aria-label=*] > div.th-fg|1
+theater|home@390x780|dom|section.th-hero.th-noart[aria-label=*] > div.th-scrim[aria-hidden=true]|1
+theater|home@390x780|dom|select > option[text]|2
+theater|home@390x780|dom|svg[aria-hidden=true] > rect|4
+theater|home@390x780|focus|000|a.logo "cinemarr"
+theater|home@390x780|focus|001|input#q.search "Search cinemarr"
+theater|home@390x780|focus|002|button.ghost.sm "Theme and layout"
+theater|home@390x780|focus|003|button.ghost.sm "Light or dark"
+theater|home@390x780|focus|004|button.ghost.sm.sizebtn "Icon size"
+theater|home@390x780|focus|005|button.ghost.sm.profile "Account"
+theater|home@390x780|focus|006|button.btnplay "▶ Resume"
+theater|home@390x780|focus|007|button.ghost "ⓘ Details"
+theater|home@390x780|focus|008|div.poster.k-movie "H Heat 1995 180p 5s left · ends ~12:00 P
+theater|home@390x780|focus|009|div.poster.k-episode.unw "TH Signal Hill S1E2 · The Handoff"
+theater|home@390x780|focus|010|div.poster.k-movie.unw "BR Blade Runner 1982 180p"
+theater|home@390x780|focus|011|div.poster.k-episode "CO ✓ Signal Hill S1E1 · Cold Open"
+theater|home@390x780|focus|012|div.poster.k-movie "H Heat 1995 180p"
+theater|home@390x780|focus|013|div.poster.k-movie.unw "SF Signal Fire 2003 180p"
+theater|home@390x780|focus|014|div.poster.k-movie.unw "TS The Signal 2021 180p"
+theater|home@390x780|focus|015|select "Category Share name"
+theater|home@390x780|focus|016|a.muted "· VIEW ALL (4)"
+theater|home@390x780|focus|017|div.poster.k-movie.unw "SF Signal Fire 2003 180p"
+theater|home@390x780|focus|018|div.poster.k-movie.unw "TS The Signal 2021 180p"
+theater|home@390x780|focus|019|div.poster.k-movie.unw "BR Blade Runner 1982 180p"
+theater|home@390x780|focus|020|div.poster.k-movie "H Heat 1995 180p"
+theater|home@390x780|focus|021|a.muted "· VIEW ALL (1)"
+theater|home@390x780|focus|022|div.poster.k-show.unw "SH Signal Hill 2019"
+theater|home@390x780|focus|023|a.on "Home"
+theater|home@390x780|focus|024|a "Activity"
+theater|home@390x780|focus|025|a "Settings"
+theater|home@390x780|focus|026|<wrap>
+theater|home@390x780|req|GET /api/v1/activity|2
+theater|home@390x780|req|GET /api/v1/coming-soon|1
+theater|home@390x780|req|GET /api/v1/hubs|1
+theater|home@390x780|req|GET /api/v1/libraries/<id>/items|3
+theater|home@390x780|req|GET /api/v1/libraries|1
+theater|home@390x780|req|GET /api/v1/me|1
+theater|home@390x780|req|GET /api/v1/server|1
+theater|item@1280x860|dom|^ > div#app|1
+theater|item@1280x860|dom|button.ghost.profile.sm > span.caret[text]|1
+theater|item@1280x860|dom|button.ghost.profile.sm > span.pavatar[text]|1
+theater|item@1280x860|dom|button.ghost.profile.sm > span.pname[text]|1
+theater|item@1280x860|dom|button.ghost.sizebtn.sm > span[text]|1
+theater|item@1280x860|dom|button.ghost.sizebtn.sm > svg[aria-hidden=true]|1
+theater|item@1280x860|dom|button.ghost.sm[aria-label=*] > span.tsw|1
+theater|item@1280x860|dom|div#app > header.th-top|1
+theater|item@1280x860|dom|div#app > main#main|1
+theater|item@1280x860|dom|div#app > nav.th-pills[aria-label=*]|1
+theater|item@1280x860|dom|div.actions > button.btnplay[text]|1
+theater|item@1280x860|dom|div.actions > button.ghost.sm[text]|1
+theater|item@1280x860|dom|div.actions > button.ghost[text]|1
+theater|item@1280x860|dom|div.chips > span[text]|1
+theater|item@1280x860|dom|div.crumbs > a[text]|1
+theater|item@1280x860|dom|div.crumbs > span.cur[text]|1
+theater|item@1280x860|dom|div.crumbs > span.sep[text]|1
+theater|item@1280x860|dom|div.pagehead > div.phnav|1
+theater|item@1280x860|dom|div.phnav > a.pgback[aria-label=* text]|1
+theater|item@1280x860|dom|div.phnav > div.crumbs|1
+theater|item@1280x860|dom|div.th-ctl > div.th-pop|4
+theater|item@1280x860|dom|div.th-detail.th-hero.th-noart > div.th-dwrap|1
+theater|item@1280x860|dom|div.th-detail.th-hero.th-noart > div.th-scrim[aria-hidden=true]|1
+theater|item@1280x860|dom|div.th-dposter > div.art.ph[text]|1
+theater|item@1280x860|dom|div.th-dwrap > div.th-dposter|1
+theater|item@1280x860|dom|div.th-dwrap > div.th-fg|1
+theater|item@1280x860|dom|div.th-fg > div.actions|1
+theater|item@1280x860|dom|div.th-fg > div.chips|1
+theater|item@1280x860|dom|div.th-fg > div.pagehead|1
+theater|item@1280x860|dom|div.th-fg > div.playinfo[text]|1
+theater|item@1280x860|dom|div.th-fg > div.th-kick[text]|1
+theater|item@1280x860|dom|div.th-fg > div.vbadges|1
+theater|item@1280x860|dom|div.th-fg > h1[text]|1
+theater|item@1280x860|dom|div.th-pop > button.ghost.profile.sm|1
+theater|item@1280x860|dom|div.th-pop > button.ghost.sizebtn.sm|1
+theater|item@1280x860|dom|div.th-pop > button.ghost.sm[aria-label=* text]|1
+theater|item@1280x860|dom|div.th-pop > button.ghost.sm[aria-label=*]|1
+theater|item@1280x860|dom|div.th-pop > div#appmenu.amenu|1
+theater|item@1280x860|dom|div.th-pop > div#profilemenu.amenu|1
+theater|item@1280x860|dom|div.th-pop > div#sizemenu.amenu|1
+theater|item@1280x860|dom|div.th-pop > div#thememenu.amenu|1
+theater|item@1280x860|dom|div.th-rest > div.version|1
+theater|item@1280x860|dom|div.vbadges > span.codec.vbadge[text]|1
+theater|item@1280x860|dom|div.vbadges > span.res.vbadge[text]|1
+theater|item@1280x860|dom|div.version > dl.specs|1
+theater|item@1280x860|dom|dl.specs > dd.fn[text]|1
+theater|item@1280x860|dom|dl.specs > dd[text]|2
+theater|item@1280x860|dom|dl.specs > dt[text]|3
+theater|item@1280x860|dom|h1[text] > button.ghost.sm.th-admin[aria-label=* text]|1
+theater|item@1280x860|dom|header.th-top > a.logo[text]|1
+theater|item@1280x860|dom|header.th-top > div.th-ctl|1
+theater|item@1280x860|dom|header.th-top > input#q.search[aria-label=*]|1
+theater|item@1280x860|dom|header.th-top > nav.th-nav[aria-label=*]|1
+theater|item@1280x860|dom|header.th-top > span#activity.activity|1
+theater|item@1280x860|dom|header.th-top > span.spacer|1
+theater|item@1280x860|dom|main#main > div.th-detail.th-hero.th-noart|1
+theater|item@1280x860|dom|main#main > div.th-rest|1
+theater|item@1280x860|dom|nav.th-nav[aria-label=*] > a[text]|3
+theater|item@1280x860|dom|nav.th-pills[aria-label=*] > a[text]|3
+theater|item@1280x860|dom|span.codec.vbadge[text] > svg.material-icon[aria-hidden=true]|1
+theater|item@1280x860|dom|span.res.vbadge[text] > svg.material-icon[aria-hidden=true]|1
+theater|item@1280x860|dom|svg.material-icon[aria-hidden=true] > path|2
+theater|item@1280x860|dom|svg[aria-hidden=true] > rect|4
+theater|item@1280x860|focus|000|a.logo "cinemarr"
+theater|item@1280x860|focus|001|a "Home"
+theater|item@1280x860|focus|002|a "Activity"
+theater|item@1280x860|focus|003|a "Settings"
+theater|item@1280x860|focus|004|input#q.search "Search cinemarr"
+theater|item@1280x860|focus|005|button.ghost.sm "Theme and layout"
+theater|item@1280x860|focus|006|button.ghost.sm "Light or dark"
+theater|item@1280x860|focus|007|button.ghost.sm.sizebtn "Icon size"
+theater|item@1280x860|focus|008|button.ghost.sm.profile "Account"
+theater|item@1280x860|focus|009|a.pgback "Back to Home"
+theater|item@1280x860|focus|010|a "Home"
+theater|item@1280x860|focus|011|button.ghost.sm.th-admin "Refresh artwork"
+theater|item@1280x860|focus|012|button.btnplay "▶ Resume · 7s"
+theater|item@1280x860|focus|013|button.ghost "Start over"
+theater|item@1280x860|focus|014|button.ghost.sm "Mark watched"
+theater|item@1280x860|focus|015|<wrap>
+theater|item@1280x860|req|GET /api/v1/activity|2
+theater|item@1280x860|req|GET /api/v1/items/<id>|1
+theater|item@1280x860|req|GET /api/v1/libraries|1
+theater|item@1280x860|req|GET /api/v1/me|1
+theater|item@1280x860|req|GET /api/v1/server|1
+theater|item@390x780|dom|^ > div#app|1
+theater|item@390x780|dom|button.ghost.profile.sm > span.caret[text]|1
+theater|item@390x780|dom|button.ghost.profile.sm > span.pavatar[text]|1
+theater|item@390x780|dom|button.ghost.profile.sm > span.pname[text]|1
+theater|item@390x780|dom|button.ghost.sizebtn.sm > span[text]|1
+theater|item@390x780|dom|button.ghost.sizebtn.sm > svg[aria-hidden=true]|1
+theater|item@390x780|dom|button.ghost.sm[aria-label=*] > span.tsw|1
+theater|item@390x780|dom|div#app > header.th-top|1
+theater|item@390x780|dom|div#app > main#main|1
+theater|item@390x780|dom|div#app > nav.th-pills[aria-label=*]|1
+theater|item@390x780|dom|div.actions > button.btnplay[text]|1
+theater|item@390x780|dom|div.actions > button.ghost.sm[text]|1
+theater|item@390x780|dom|div.actions > button.ghost[text]|1
+theater|item@390x780|dom|div.chips > span[text]|1
+theater|item@390x780|dom|div.crumbs > a[text]|1
+theater|item@390x780|dom|div.crumbs > span.cur[text]|1
+theater|item@390x780|dom|div.crumbs > span.sep[text]|1
+theater|item@390x780|dom|div.pagehead > div.phnav|1
+theater|item@390x780|dom|div.phnav > a.pgback[aria-label=* text]|1
+theater|item@390x780|dom|div.phnav > div.crumbs|1
+theater|item@390x780|dom|div.th-ctl > div.th-pop|4
+theater|item@390x780|dom|div.th-detail.th-hero.th-noart > div.th-dwrap|1
+theater|item@390x780|dom|div.th-detail.th-hero.th-noart > div.th-scrim[aria-hidden=true]|1
+theater|item@390x780|dom|div.th-dposter > div.art.ph[text]|1
+theater|item@390x780|dom|div.th-dwrap > div.th-dposter|1
+theater|item@390x780|dom|div.th-dwrap > div.th-fg|1
+theater|item@390x780|dom|div.th-fg > div.actions|1
+theater|item@390x780|dom|div.th-fg > div.chips|1
+theater|item@390x780|dom|div.th-fg > div.pagehead|1
+theater|item@390x780|dom|div.th-fg > div.playinfo[text]|1
+theater|item@390x780|dom|div.th-fg > div.th-kick[text]|1
+theater|item@390x780|dom|div.th-fg > div.vbadges|1
+theater|item@390x780|dom|div.th-fg > h1[text]|1
+theater|item@390x780|dom|div.th-pop > button.ghost.profile.sm|1
+theater|item@390x780|dom|div.th-pop > button.ghost.sizebtn.sm|1
+theater|item@390x780|dom|div.th-pop > button.ghost.sm[aria-label=* text]|1
+theater|item@390x780|dom|div.th-pop > button.ghost.sm[aria-label=*]|1
+theater|item@390x780|dom|div.th-pop > div#appmenu.amenu|1
+theater|item@390x780|dom|div.th-pop > div#profilemenu.amenu|1
+theater|item@390x780|dom|div.th-pop > div#sizemenu.amenu|1
+theater|item@390x780|dom|div.th-pop > div#thememenu.amenu|1
+theater|item@390x780|dom|div.th-rest > div.version|1
+theater|item@390x780|dom|div.vbadges > span.codec.vbadge[text]|1
+theater|item@390x780|dom|div.vbadges > span.res.vbadge[text]|1
+theater|item@390x780|dom|div.version > dl.specs|1
+theater|item@390x780|dom|dl.specs > dd.fn[text]|1
+theater|item@390x780|dom|dl.specs > dd[text]|2
+theater|item@390x780|dom|dl.specs > dt[text]|3
+theater|item@390x780|dom|h1[text] > button.ghost.sm.th-admin[aria-label=* text]|1
+theater|item@390x780|dom|header.th-top > a.logo[text]|1
+theater|item@390x780|dom|header.th-top > div.th-ctl|1
+theater|item@390x780|dom|header.th-top > input#q.search[aria-label=*]|1
+theater|item@390x780|dom|header.th-top > nav.th-nav[aria-label=*]|1
+theater|item@390x780|dom|header.th-top > span#activity.activity|1
+theater|item@390x780|dom|header.th-top > span.spacer|1
+theater|item@390x780|dom|main#main > div.th-detail.th-hero.th-noart|1
+theater|item@390x780|dom|main#main > div.th-rest|1
+theater|item@390x780|dom|nav.th-nav[aria-label=*] > a[text]|3
+theater|item@390x780|dom|nav.th-pills[aria-label=*] > a[text]|3
+theater|item@390x780|dom|span.codec.vbadge[text] > svg.material-icon[aria-hidden=true]|1
+theater|item@390x780|dom|span.res.vbadge[text] > svg.material-icon[aria-hidden=true]|1
+theater|item@390x780|dom|svg.material-icon[aria-hidden=true] > path|2
+theater|item@390x780|dom|svg[aria-hidden=true] > rect|4
+theater|item@390x780|focus|000|a.logo "cinemarr"
+theater|item@390x780|focus|001|input#q.search "Search cinemarr"
+theater|item@390x780|focus|002|button.ghost.sm "Theme and layout"
+theater|item@390x780|focus|003|button.ghost.sm "Light or dark"
+theater|item@390x780|focus|004|button.ghost.sm.sizebtn "Icon size"
+theater|item@390x780|focus|005|button.ghost.sm.profile "Account"
+theater|item@390x780|focus|006|a.pgback "Back to Home"
+theater|item@390x780|focus|007|a "Home"
+theater|item@390x780|focus|008|button.ghost.sm.th-admin "Refresh artwork"
+theater|item@390x780|focus|009|button.btnplay "▶ Resume · 7s"
+theater|item@390x780|focus|010|button.ghost "Start over"
+theater|item@390x780|focus|011|button.ghost.sm "Mark watched"
+theater|item@390x780|focus|012|a "Home"
+theater|item@390x780|focus|013|a "Activity"
+theater|item@390x780|focus|014|a "Settings"
+theater|item@390x780|focus|015|<wrap>
+theater|item@390x780|req|GET /api/v1/activity|2
+theater|item@390x780|req|GET /api/v1/items/<id>|1
+theater|item@390x780|req|GET /api/v1/libraries|1
+theater|item@390x780|req|GET /api/v1/me|1
+theater|item@390x780|req|GET /api/v1/server|1
+theater|library@1280x860|dom|^ > div#app|1
+theater|library@1280x860|dom|button.ghost.profile.sm > span.caret[text]|1
+theater|library@1280x860|dom|button.ghost.profile.sm > span.pavatar[text]|1
+theater|library@1280x860|dom|button.ghost.profile.sm > span.pname[text]|1
+theater|library@1280x860|dom|button.ghost.sizebtn.sm > span[text]|1
+theater|library@1280x860|dom|button.ghost.sizebtn.sm > svg[aria-hidden=true]|1
+theater|library@1280x860|dom|button.ghost.sm[aria-label=*] > span.tsw|1
+theater|library@1280x860|dom|div#app > header.th-top|1
+theater|library@1280x860|dom|div#app > main#main|1
+theater|library@1280x860|dom|div#app > nav.th-pills[aria-label=*]|1
+theater|library@1280x860|dom|div#libbody > div.grid|1
+theater|library@1280x860|dom|div#librail > div.azbar[aria-label=*]|1
+theater|library@1280x860|dom|div.artbox > div.art.ph[text]|2
+theater|library@1280x860|dom|div.azbar[aria-label=*] > button.active[text]|1
+theater|library@1280x860|dom|div.azbar[aria-label=*] > button[text]|1
+theater|library@1280x860|dom|div.azbar[aria-label=*] > span.off[text]|25
+theater|library@1280x860|dom|div.crumbs > a[text]|1
+theater|library@1280x860|dom|div.crumbs > span.cur[text]|1
+theater|library@1280x860|dom|div.crumbs > span.sep[text]|1
+theater|library@1280x860|dom|div.grid > div.k-movie.poster.unw[role=link tabindex=0]|1
+theater|library@1280x860|dom|div.grid > div.k-movie.poster[role=link tabindex=0]|1
+theater|library@1280x860|dom|div.k-movie.poster.unw[role=link tabindex=0] > div.artbox|1
+theater|library@1280x860|dom|div.k-movie.poster.unw[role=link tabindex=0] > div.meta|1
+theater|library@1280x860|dom|div.k-movie.poster[role=link tabindex=0] > div.artbox|1
+theater|library@1280x860|dom|div.k-movie.poster[role=link tabindex=0] > div.meta|1
+theater|library@1280x860|dom|div.k-movie.poster[role=link tabindex=0] > div.prog|1
+theater|library@1280x860|dom|div.libbar.th-chips > span#libcount.muted[text]|1
+theater|library@1280x860|dom|div.libbar.th-chips > span.th-cpair|3
+theater|library@1280x860|dom|div.meta > div.s|2
+theater|library@1280x860|dom|div.meta > div.t[text]|2
+theater|library@1280x860|dom|div.pagehead > div.phnav|1
+theater|library@1280x860|dom|div.pagehead > h2.phtitle[text]|1
+theater|library@1280x860|dom|div.phnav > a.pgback[aria-label=* text]|1
+theater|library@1280x860|dom|div.phnav > div.crumbs|1
+theater|library@1280x860|dom|div.prog > i|1
+theater|library@1280x860|dom|div.s > span.resbadge.resgrad[text]|2
+theater|library@1280x860|dom|div.s > span.stxt[text]|2
+theater|library@1280x860|dom|div.th-ctl > div.th-pop|4
+theater|library@1280x860|dom|div.th-grid > div#libbody|1
+theater|library@1280x860|dom|div.th-pop > button.ghost.profile.sm|1
+theater|library@1280x860|dom|div.th-pop > button.ghost.sizebtn.sm|1
+theater|library@1280x860|dom|div.th-pop > button.ghost.sm[aria-label=* text]|1
+theater|library@1280x860|dom|div.th-pop > button.ghost.sm[aria-label=*]|1
+theater|library@1280x860|dom|div.th-pop > div#appmenu.amenu|1
+theater|library@1280x860|dom|div.th-pop > div#profilemenu.amenu|1
+theater|library@1280x860|dom|div.th-pop > div#sizemenu.amenu|1
+theater|library@1280x860|dom|div.th-pop > div#thememenu.amenu|1
+theater|library@1280x860|dom|header.th-top > a.logo[text]|1
+theater|library@1280x860|dom|header.th-top > div.th-ctl|1
+theater|library@1280x860|dom|header.th-top > input#q.search[aria-label=*]|1
+theater|library@1280x860|dom|header.th-top > nav.th-nav[aria-label=*]|1
+theater|library@1280x860|dom|header.th-top > span#activity.activity|1
+theater|library@1280x860|dom|header.th-top > span.spacer|1
+theater|library@1280x860|dom|main#main > div#libpager|1
+theater|library@1280x860|dom|main#main > div#librail|1
+theater|library@1280x860|dom|main#main > div.libbar.th-chips|1
+theater|library@1280x860|dom|main#main > div.pagehead|1
+theater|library@1280x860|dom|main#main > div.th-grid|1
+theater|library@1280x860|dom|nav.th-nav[aria-label=*] > a[text]|3
+theater|library@1280x860|dom|nav.th-pills[aria-label=*] > a[text]|3
+theater|library@1280x860|dom|select[aria-label=*] > option[text]|14
+theater|library@1280x860|dom|span.th-cpair > select[aria-label=*]|3
+theater|library@1280x860|dom|span.th-cpair > span.lbl[text]|3
+theater|library@1280x860|dom|svg[aria-hidden=true] > rect|4
+theater|library@1280x860|focus|000|a.logo "cinemarr"
+theater|library@1280x860|focus|001|a "Home"
+theater|library@1280x860|focus|002|a "Activity"
+theater|library@1280x860|focus|003|a "Settings"
+theater|library@1280x860|focus|004|input#q.search "Search cinemarr"
+theater|library@1280x860|focus|005|button.ghost.sm "Theme and layout"
+theater|library@1280x860|focus|006|button.ghost.sm "Light or dark"
+theater|library@1280x860|focus|007|button.ghost.sm.sizebtn "Icon size"
+theater|library@1280x860|focus|008|button.ghost.sm.profile "Account"
+theater|library@1280x860|focus|009|a.pgback "Back to Home"
+theater|library@1280x860|focus|010|a "Home"
+theater|library@1280x860|focus|011|select "Sort"
+theater|library@1280x860|focus|012|select "Show"
+theater|library@1280x860|focus|013|select "Per page"
+theater|library@1280x860|focus|014|div.poster.k-movie.unw "BR Blade Runner 1982 180p"
+theater|library@1280x860|focus|015|div.poster.k-movie "H Heat 1995 180p"
+theater|library@1280x860|focus|016|button.active "Jump to B"
+theater|library@1280x860|focus|017|button "Jump to H"
+theater|library@1280x860|focus|018|<wrap>
+theater|library@1280x860|req|GET /api/v1/activity|2
+theater|library@1280x860|req|GET /api/v1/libraries/<id>/items|1
+theater|library@1280x860|req|GET /api/v1/libraries|1
+theater|library@1280x860|req|GET /api/v1/me|1
+theater|library@1280x860|req|GET /api/v1/server|1
+theater|library@390x780|dom|^ > div#app|1
+theater|library@390x780|dom|button.ghost.profile.sm > span.caret[text]|1
+theater|library@390x780|dom|button.ghost.profile.sm > span.pavatar[text]|1
+theater|library@390x780|dom|button.ghost.profile.sm > span.pname[text]|1
+theater|library@390x780|dom|button.ghost.sizebtn.sm > span[text]|1
+theater|library@390x780|dom|button.ghost.sizebtn.sm > svg[aria-hidden=true]|1
+theater|library@390x780|dom|button.ghost.sm[aria-label=*] > span.tsw|1
+theater|library@390x780|dom|div#app > header.th-top|1
+theater|library@390x780|dom|div#app > main#main|1
+theater|library@390x780|dom|div#app > nav.th-pills[aria-label=*]|1
+theater|library@390x780|dom|div#libbody > div.grid|1
+theater|library@390x780|dom|div#librail > div.azbar[aria-label=*]|1
+theater|library@390x780|dom|div.artbox > div.art.ph[text]|2
+theater|library@390x780|dom|div.azbar[aria-label=*] > button.active[text]|1
+theater|library@390x780|dom|div.azbar[aria-label=*] > button[text]|1
+theater|library@390x780|dom|div.azbar[aria-label=*] > span.off[text]|25
+theater|library@390x780|dom|div.crumbs > a[text]|1
+theater|library@390x780|dom|div.crumbs > span.cur[text]|1
+theater|library@390x780|dom|div.crumbs > span.sep[text]|1
+theater|library@390x780|dom|div.grid > div.k-movie.poster.unw[role=link tabindex=0]|1
+theater|library@390x780|dom|div.grid > div.k-movie.poster[role=link tabindex=0]|1
+theater|library@390x780|dom|div.k-movie.poster.unw[role=link tabindex=0] > div.artbox|1
+theater|library@390x780|dom|div.k-movie.poster.unw[role=link tabindex=0] > div.meta|1
+theater|library@390x780|dom|div.k-movie.poster[role=link tabindex=0] > div.artbox|1
+theater|library@390x780|dom|div.k-movie.poster[role=link tabindex=0] > div.meta|1
+theater|library@390x780|dom|div.k-movie.poster[role=link tabindex=0] > div.prog|1
+theater|library@390x780|dom|div.libbar.th-chips > span#libcount.muted[text]|1
+theater|library@390x780|dom|div.libbar.th-chips > span.th-cpair|3
+theater|library@390x780|dom|div.meta > div.s|2
+theater|library@390x780|dom|div.meta > div.t[text]|2
+theater|library@390x780|dom|div.pagehead > div.phnav|1
+theater|library@390x780|dom|div.pagehead > h2.phtitle[text]|1
+theater|library@390x780|dom|div.phnav > a.pgback[aria-label=* text]|1
+theater|library@390x780|dom|div.phnav > div.crumbs|1
+theater|library@390x780|dom|div.prog > i|1
+theater|library@390x780|dom|div.s > span.resbadge.resgrad[text]|2
+theater|library@390x780|dom|div.s > span.stxt[text]|2
+theater|library@390x780|dom|div.th-ctl > div.th-pop|4
+theater|library@390x780|dom|div.th-grid > div#libbody|1
+theater|library@390x780|dom|div.th-pop > button.ghost.profile.sm|1
+theater|library@390x780|dom|div.th-pop > button.ghost.sizebtn.sm|1
+theater|library@390x780|dom|div.th-pop > button.ghost.sm[aria-label=* text]|1
+theater|library@390x780|dom|div.th-pop > button.ghost.sm[aria-label=*]|1
+theater|library@390x780|dom|div.th-pop > div#appmenu.amenu|1
+theater|library@390x780|dom|div.th-pop > div#profilemenu.amenu|1
+theater|library@390x780|dom|div.th-pop > div#sizemenu.amenu|1
+theater|library@390x780|dom|div.th-pop > div#thememenu.amenu|1
+theater|library@390x780|dom|header.th-top > a.logo[text]|1
+theater|library@390x780|dom|header.th-top > div.th-ctl|1
+theater|library@390x780|dom|header.th-top > input#q.search[aria-label=*]|1
+theater|library@390x780|dom|header.th-top > nav.th-nav[aria-label=*]|1
+theater|library@390x780|dom|header.th-top > span#activity.activity|1
+theater|library@390x780|dom|header.th-top > span.spacer|1
+theater|library@390x780|dom|main#main > div#libpager|1
+theater|library@390x780|dom|main#main > div#librail|1
+theater|library@390x780|dom|main#main > div.libbar.th-chips|1
+theater|library@390x780|dom|main#main > div.pagehead|1
+theater|library@390x780|dom|main#main > div.th-grid|1
+theater|library@390x780|dom|nav.th-nav[aria-label=*] > a[text]|3
+theater|library@390x780|dom|nav.th-pills[aria-label=*] > a[text]|3
+theater|library@390x780|dom|select[aria-label=*] > option[text]|14
+theater|library@390x780|dom|span.th-cpair > select[aria-label=*]|3
+theater|library@390x780|dom|span.th-cpair > span.lbl[text]|3
+theater|library@390x780|dom|svg[aria-hidden=true] > rect|4
+theater|library@390x780|focus|000|a.logo "cinemarr"
+theater|library@390x780|focus|001|input#q.search "Search cinemarr"
+theater|library@390x780|focus|002|button.ghost.sm "Theme and layout"
+theater|library@390x780|focus|003|button.ghost.sm "Light or dark"
+theater|library@390x780|focus|004|button.ghost.sm.sizebtn "Icon size"
+theater|library@390x780|focus|005|button.ghost.sm.profile "Account"
+theater|library@390x780|focus|006|a.pgback "Back to Home"
+theater|library@390x780|focus|007|a "Home"
+theater|library@390x780|focus|008|select "Sort"
+theater|library@390x780|focus|009|select "Show"
+theater|library@390x780|focus|010|select "Per page"
+theater|library@390x780|focus|011|div.poster.k-movie.unw "BR Blade Runner 1982 180p"
+theater|library@390x780|focus|012|div.poster.k-movie "H Heat 1995 180p"
+theater|library@390x780|focus|013|button.active "Jump to B"
+theater|library@390x780|focus|014|button "Jump to H"
+theater|library@390x780|focus|015|a "Home"
+theater|library@390x780|focus|016|a "Activity"
+theater|library@390x780|focus|017|a "Settings"
+theater|library@390x780|focus|018|<wrap>
+theater|library@390x780|req|GET /api/v1/activity|2
+theater|library@390x780|req|GET /api/v1/libraries/<id>/items|1
+theater|library@390x780|req|GET /api/v1/libraries|1
+theater|library@390x780|req|GET /api/v1/me|1
+theater|library@390x780|req|GET /api/v1/server|1
+theater|player@1280x860|dom|^ > div#app|1
+theater|player@1280x860|dom|^ > div#modal.modal.open|1
+theater|player@1280x860|dom|button.ghost.profile.sm > span.caret[text]|1
+theater|player@1280x860|dom|button.ghost.profile.sm > span.pavatar[text]|1
+theater|player@1280x860|dom|button.ghost.profile.sm > span.pname[text]|1
+theater|player@1280x860|dom|button.ghost.sizebtn.sm > span[text]|1
+theater|player@1280x860|dom|button.ghost.sizebtn.sm > svg[aria-hidden=true]|1
+theater|player@1280x860|dom|button.ghost.sm[aria-label=*] > span.tsw|1
+theater|player@1280x860|dom|div#app > header.th-top|1
+theater|player@1280x860|dom|div#app > main#main|1
+theater|player@1280x860|dom|div#app > nav.th-pills[aria-label=*]|1
+theater|player@1280x860|dom|div#modal.modal.open > div#player.player|1
+theater|player@1280x860|dom|div#pbar.pbar > div#playTitle.ptitle[text]|1
+theater|player@1280x860|dom|div#pbar.pbar > div.row|1
+theater|player@1280x860|dom|div#pinfo.pinfo > div.pifacts.vbadges|1
+theater|player@1280x860|dom|div#pinfo.pinfo > div.pimeta[text]|1
+theater|player@1280x860|dom|div#pinfo.pinfo > h3[text]|1
+theater|player@1280x860|dom|div#player.player > div#pbar.pbar|1
+theater|player@1280x860|dom|div#player.player > div#pinfo.pinfo|1
+theater|player@1280x860|dom|div#player.player > div#ploading.ploading|1
+theater|player@1280x860|dom|div#player.player > div#pmenu.pmenu|1
+theater|player@1280x860|dom|div#player.player > div#pskip.pskip|1
+theater|player@1280x860|dom|div#player.player > div#ptransport.ptransport|1
+theater|player@1280x860|dom|div#player.player > div#statsov.statsov|1
+theater|player@1280x860|dom|div#player.player > video#video|1
+theater|player@1280x860|dom|div#ploading.ploading > div#ploadAct.ploadAct|1
+theater|player@1280x860|dom|div#ploading.ploading > div#ploadSub.ploadSub[text]|1
+theater|player@1280x860|dom|div#ploading.ploading > div#ploadText.ploadText[text]|1
+theater|player@1280x860|dom|div#ploading.ploading > div.pspin|1
+theater|player@1280x860|dom|div#pseek.pseek[role=slider tabindex=0 aria-valuemin=0 aria-valuemax=100 aria-label=* aria-valuenow=* aria-valuetext=*] > div#pseekbuf.pseek-buf[aria-hidden=true]|1
+theater|player@1280x860|dom|div#pseek.pseek[role=slider tabindex=0 aria-valuemin=0 aria-valuemax=100 aria-label=* aria-valuenow=* aria-valuetext=*] > div#pseekfill.pseek-fill[aria-hidden=true]|1
+theater|player@1280x860|dom|div#pseek.pseek[role=slider tabindex=0 aria-valuemin=0 aria-valuemax=100 aria-label=* aria-valuenow=* aria-valuetext=*] > div#pseekthumb.pseek-thumb[aria-hidden=true]|1
+theater|player@1280x860|dom|div#ptransport.ptransport > button#pbaudio.paud.picon[aria-label=* text]|1
+theater|player@1280x860|dom|div#ptransport.ptransport > button#pbfs.picon[aria-label=* text]|1
+theater|player@1280x860|dom|div#ptransport.ptransport > button#pbinfo.on.picon[aria-label=* text]|1
+theater|player@1280x860|dom|div#ptransport.ptransport > button#pbpip.picon[aria-label=* text]|1
+theater|player@1280x860|dom|div#ptransport.ptransport > button#pbplay.picon[aria-label=* text]|1
+theater|player@1280x860|dom|div#ptransport.ptransport > button#pbsubs.pcc.picon[aria-label=* text]|1
+theater|player@1280x860|dom|div#ptransport.ptransport > button.nudge.picon[aria-label=* text]|2
+theater|player@1280x860|dom|div#ptransport.ptransport > div#pseek.pseek[role=slider tabindex=0 aria-valuemin=0 aria-valuemax=100 aria-label=* aria-valuenow=* aria-valuetext=*]|1
+theater|player@1280x860|dom|div#ptransport.ptransport > span#ptcur.ptime[aria-hidden=true text]|1
+theater|player@1280x860|dom|div#ptransport.ptransport > span#ptdur.ptime[aria-hidden=true text]|1
+theater|player@1280x860|dom|div#statsov.statsov > div#statsbody.statsbody|1
+theater|player@1280x860|dom|div#statsov.statsov > div.statshd|1
+theater|player@1280x860|dom|div.actions > button.btnplay[text]|1
+theater|player@1280x860|dom|div.actions > button.ghost.sm[text]|1
+theater|player@1280x860|dom|div.chips > span[text]|1
+theater|player@1280x860|dom|div.crumbs > a[text]|1
+theater|player@1280x860|dom|div.crumbs > span.cur[text]|1
+theater|player@1280x860|dom|div.crumbs > span.sep[text]|1
+theater|player@1280x860|dom|div.pagehead > div.phnav|1
+theater|player@1280x860|dom|div.phnav > a.pgback[aria-label=* text]|1
+theater|player@1280x860|dom|div.phnav > div.crumbs|1
+theater|player@1280x860|dom|div.pifacts.vbadges > span.audio.vbadge[text]|1
+theater|player@1280x860|dom|div.pifacts.vbadges > span.res.vbadge[text]|1
+theater|player@1280x860|dom|div.row > button#apbtn.pbtn[text]|1
+theater|player@1280x860|dom|div.row > button#audiobtn.pbtn[text]|1
+theater|player@1280x860|dom|div.row > button#autonextbtn.on.pbtn[text]|1
+theater|player@1280x860|dom|div.row > button#qualbtn.pbtn[text]|1
+theater|player@1280x860|dom|div.row > button#skipbtn.pbtn[text]|1
+theater|player@1280x860|dom|div.row > button#statsbtn.pbtn[text]|1
+theater|player@1280x860|dom|div.row > button#subsbtn.pbtn[text]|1
+theater|player@1280x860|dom|div.row > button#syncbtn.pbtn[text]|1
+theater|player@1280x860|dom|div.row > button.pbtn[text]|1
+theater|player@1280x860|dom|div.statshd > button.statsx[aria-label=* text]|1
+theater|player@1280x860|dom|div.statshd > span[text]|1
+theater|player@1280x860|dom|div.th-ctl > div.th-pop|4
+theater|player@1280x860|dom|div.th-detail.th-hero.th-noart > div.th-dwrap|1
+theater|player@1280x860|dom|div.th-detail.th-hero.th-noart > div.th-scrim[aria-hidden=true]|1
+theater|player@1280x860|dom|div.th-dposter > div.art.ph[text]|1
+theater|player@1280x860|dom|div.th-dwrap > div.th-dposter|1
+theater|player@1280x860|dom|div.th-dwrap > div.th-fg|1
+theater|player@1280x860|dom|div.th-fg > div.actions|1
+theater|player@1280x860|dom|div.th-fg > div.chips|1
+theater|player@1280x860|dom|div.th-fg > div.pagehead|1
+theater|player@1280x860|dom|div.th-fg > div.playinfo[text]|1
+theater|player@1280x860|dom|div.th-fg > div.th-kick[text]|1
+theater|player@1280x860|dom|div.th-fg > div.vbadges|1
+theater|player@1280x860|dom|div.th-fg > h1[text]|1
+theater|player@1280x860|dom|div.th-pop > button.ghost.profile.sm|1
+theater|player@1280x860|dom|div.th-pop > button.ghost.sizebtn.sm|1
+theater|player@1280x860|dom|div.th-pop > button.ghost.sm[aria-label=* text]|1
+theater|player@1280x860|dom|div.th-pop > button.ghost.sm[aria-label=*]|1
+theater|player@1280x860|dom|div.th-pop > div#appmenu.amenu|1
+theater|player@1280x860|dom|div.th-pop > div#profilemenu.amenu|1
+theater|player@1280x860|dom|div.th-pop > div#sizemenu.amenu|1
+theater|player@1280x860|dom|div.th-pop > div#thememenu.amenu|1
+theater|player@1280x860|dom|div.th-rest > div.version|1
+theater|player@1280x860|dom|div.vbadges > span.codec.vbadge[text]|1
+theater|player@1280x860|dom|div.vbadges > span.res.vbadge[text]|1
+theater|player@1280x860|dom|div.version > dl.specs|1
+theater|player@1280x860|dom|dl.specs > dd.fn[text]|1
+theater|player@1280x860|dom|dl.specs > dd[text]|2
+theater|player@1280x860|dom|dl.specs > dt[text]|3
+theater|player@1280x860|dom|h1[text] > button.ghost.sm.th-admin[aria-label=* text]|1
+theater|player@1280x860|dom|header.th-top > a.logo[text]|1
+theater|player@1280x860|dom|header.th-top > div.th-ctl|1
+theater|player@1280x860|dom|header.th-top > input#q.search[aria-label=*]|1
+theater|player@1280x860|dom|header.th-top > nav.th-nav[aria-label=*]|1
+theater|player@1280x860|dom|header.th-top > span#activity.activity|1
+theater|player@1280x860|dom|header.th-top > span.spacer|1
+theater|player@1280x860|dom|main#main > div.th-detail.th-hero.th-noart|1
+theater|player@1280x860|dom|main#main > div.th-rest|1
+theater|player@1280x860|dom|nav.th-nav[aria-label=*] > a[text]|3
+theater|player@1280x860|dom|nav.th-pills[aria-label=*] > a[text]|3
+theater|player@1280x860|dom|span.audio.vbadge[text] > svg.material-icon[aria-hidden=true]|1
+theater|player@1280x860|dom|span.codec.vbadge[text] > svg.material-icon[aria-hidden=true]|1
+theater|player@1280x860|dom|span.res.vbadge[text] > svg.material-icon[aria-hidden=true]|2
+theater|player@1280x860|dom|svg.material-icon[aria-hidden=true] > path|4
+theater|player@1280x860|dom|svg[aria-hidden=true] > rect|4
+theater|player@1280x860|focus|000|button.ghost.sm "Mark watched"
+theater|player@1280x860|focus|001|button#qualbtn.pbtn "Playback quality"
+theater|player@1280x860|focus|002|button#syncbtn.pbtn "Audio sync adjustment"
+theater|player@1280x860|focus|003|button#statsbtn.pbtn "Playback info (i)"
+theater|player@1280x860|focus|004|button#skipbtn.pbtn "Auto-skip intro & credits"
+theater|player@1280x860|focus|005|button#autonextbtn.pbtn.on "Auto-play the next episode when
+theater|player@1280x860|focus|006|button.pbtn "Close (Esc)"
+theater|player@1280x860|focus|007|button#pbplay.picon "Play"
+theater|player@1280x860|focus|008|button.picon.nudge "Back 10 seconds"
+theater|player@1280x860|focus|009|button.picon.nudge "Forward 10 seconds"
+theater|player@1280x860|focus|010|div#pseek.pseek "Seek"
+theater|player@1280x860|focus|011|button#pbinfo.picon.on "Title info"
+theater|player@1280x860|focus|012|button#pbpip.picon "Picture in picture"
+theater|player@1280x860|focus|013|button#pbfs.picon "Fullscreen"
+theater|player@1280x860|focus|014|<wrap>
+theater|player@1280x860|req|GET /api/v1/activity|2
+theater|player@1280x860|req|GET /api/v1/files/<id>/decision|1
+theater|player@1280x860|req|GET /api/v1/files/<id>/direct|1
+theater|player@1280x860|req|GET /api/v1/items/<id>|1
+theater|player@1280x860|req|GET /api/v1/libraries|1
+theater|player@1280x860|req|GET /api/v1/me|1
+theater|player@1280x860|req|GET /api/v1/server|1
+theater|player@1280x860|req|POST /api/v1/client-log|1
+theater|player@390x780|dom|^ > div#app|1
+theater|player@390x780|dom|^ > div#modal.modal.open|1
+theater|player@390x780|dom|button.ghost.profile.sm > span.caret[text]|1
+theater|player@390x780|dom|button.ghost.profile.sm > span.pavatar[text]|1
+theater|player@390x780|dom|button.ghost.profile.sm > span.pname[text]|1
+theater|player@390x780|dom|button.ghost.sizebtn.sm > span[text]|1
+theater|player@390x780|dom|button.ghost.sizebtn.sm > svg[aria-hidden=true]|1
+theater|player@390x780|dom|button.ghost.sm[aria-label=*] > span.tsw|1
+theater|player@390x780|dom|div#app > header.th-top|1
+theater|player@390x780|dom|div#app > main#main|1
+theater|player@390x780|dom|div#app > nav.th-pills[aria-label=*]|1
+theater|player@390x780|dom|div#modal.modal.open > div#player.player|1
+theater|player@390x780|dom|div#pbar.pbar > div#playTitle.ptitle[text]|1
+theater|player@390x780|dom|div#pbar.pbar > div.row|1
+theater|player@390x780|dom|div#pinfo.pinfo > div.pifacts.vbadges|1
+theater|player@390x780|dom|div#pinfo.pinfo > div.pimeta[text]|1
+theater|player@390x780|dom|div#pinfo.pinfo > h3[text]|1
+theater|player@390x780|dom|div#player.player > div#pbar.pbar|1
+theater|player@390x780|dom|div#player.player > div#pinfo.pinfo|1
+theater|player@390x780|dom|div#player.player > div#ploading.ploading|1
+theater|player@390x780|dom|div#player.player > div#pmenu.pmenu|1
+theater|player@390x780|dom|div#player.player > div#pskip.pskip|1
+theater|player@390x780|dom|div#player.player > div#ptransport.ptransport|1
+theater|player@390x780|dom|div#player.player > div#statsov.statsov|1
+theater|player@390x780|dom|div#player.player > video#video|1
+theater|player@390x780|dom|div#ploading.ploading > div#ploadAct.ploadAct|1
+theater|player@390x780|dom|div#ploading.ploading > div#ploadSub.ploadSub[text]|1
+theater|player@390x780|dom|div#ploading.ploading > div#ploadText.ploadText[text]|1
+theater|player@390x780|dom|div#ploading.ploading > div.pspin|1
+theater|player@390x780|dom|div#pseek.pseek[role=slider tabindex=0 aria-valuemin=0 aria-valuemax=100 aria-label=* aria-valuenow=* aria-valuetext=*] > div#pseekbuf.pseek-buf[aria-hidden=true]|1
+theater|player@390x780|dom|div#pseek.pseek[role=slider tabindex=0 aria-valuemin=0 aria-valuemax=100 aria-label=* aria-valuenow=* aria-valuetext=*] > div#pseekfill.pseek-fill[aria-hidden=true]|1
+theater|player@390x780|dom|div#pseek.pseek[role=slider tabindex=0 aria-valuemin=0 aria-valuemax=100 aria-label=* aria-valuenow=* aria-valuetext=*] > div#pseekthumb.pseek-thumb[aria-hidden=true]|1
+theater|player@390x780|dom|div#ptransport.ptransport > button#pbaudio.paud.picon[aria-label=* text]|1
+theater|player@390x780|dom|div#ptransport.ptransport > button#pbfs.picon[aria-label=* text]|1
+theater|player@390x780|dom|div#ptransport.ptransport > button#pbinfo.on.picon[aria-label=* text]|1
+theater|player@390x780|dom|div#ptransport.ptransport > button#pbpip.picon[aria-label=* text]|1
+theater|player@390x780|dom|div#ptransport.ptransport > button#pbplay.picon[aria-label=* text]|1
+theater|player@390x780|dom|div#ptransport.ptransport > button#pbsubs.pcc.picon[aria-label=* text]|1
+theater|player@390x780|dom|div#ptransport.ptransport > button.nudge.picon[aria-label=* text]|2
+theater|player@390x780|dom|div#ptransport.ptransport > div#pseek.pseek[role=slider tabindex=0 aria-valuemin=0 aria-valuemax=100 aria-label=* aria-valuenow=* aria-valuetext=*]|1
+theater|player@390x780|dom|div#ptransport.ptransport > span#ptcur.ptime[aria-hidden=true text]|1
+theater|player@390x780|dom|div#ptransport.ptransport > span#ptdur.ptime[aria-hidden=true text]|1
+theater|player@390x780|dom|div#statsov.statsov > div#statsbody.statsbody|1
+theater|player@390x780|dom|div#statsov.statsov > div.statshd|1
+theater|player@390x780|dom|div.actions > button.btnplay[text]|1
+theater|player@390x780|dom|div.actions > button.ghost.sm[text]|1
+theater|player@390x780|dom|div.chips > span[text]|1
+theater|player@390x780|dom|div.crumbs > a[text]|1
+theater|player@390x780|dom|div.crumbs > span.cur[text]|1
+theater|player@390x780|dom|div.crumbs > span.sep[text]|1
+theater|player@390x780|dom|div.pagehead > div.phnav|1
+theater|player@390x780|dom|div.phnav > a.pgback[aria-label=* text]|1
+theater|player@390x780|dom|div.phnav > div.crumbs|1
+theater|player@390x780|dom|div.pifacts.vbadges > span.audio.vbadge[text]|1
+theater|player@390x780|dom|div.pifacts.vbadges > span.res.vbadge[text]|1
+theater|player@390x780|dom|div.row > button#apbtn.pbtn[text]|1
+theater|player@390x780|dom|div.row > button#audiobtn.pbtn[text]|1
+theater|player@390x780|dom|div.row > button#autonextbtn.on.pbtn[text]|1
+theater|player@390x780|dom|div.row > button#qualbtn.pbtn[text]|1
+theater|player@390x780|dom|div.row > button#skipbtn.pbtn[text]|1
+theater|player@390x780|dom|div.row > button#statsbtn.pbtn[text]|1
+theater|player@390x780|dom|div.row > button#subsbtn.pbtn[text]|1
+theater|player@390x780|dom|div.row > button#syncbtn.pbtn[text]|1
+theater|player@390x780|dom|div.row > button.pbtn[text]|1
+theater|player@390x780|dom|div.statshd > button.statsx[aria-label=* text]|1
+theater|player@390x780|dom|div.statshd > span[text]|1
+theater|player@390x780|dom|div.th-ctl > div.th-pop|4
+theater|player@390x780|dom|div.th-detail.th-hero.th-noart > div.th-dwrap|1
+theater|player@390x780|dom|div.th-detail.th-hero.th-noart > div.th-scrim[aria-hidden=true]|1
+theater|player@390x780|dom|div.th-dposter > div.art.ph[text]|1
+theater|player@390x780|dom|div.th-dwrap > div.th-dposter|1
+theater|player@390x780|dom|div.th-dwrap > div.th-fg|1
+theater|player@390x780|dom|div.th-fg > div.actions|1
+theater|player@390x780|dom|div.th-fg > div.chips|1
+theater|player@390x780|dom|div.th-fg > div.pagehead|1
+theater|player@390x780|dom|div.th-fg > div.playinfo[text]|1
+theater|player@390x780|dom|div.th-fg > div.th-kick[text]|1
+theater|player@390x780|dom|div.th-fg > div.vbadges|1
+theater|player@390x780|dom|div.th-fg > h1[text]|1
+theater|player@390x780|dom|div.th-pop > button.ghost.profile.sm|1
+theater|player@390x780|dom|div.th-pop > button.ghost.sizebtn.sm|1
+theater|player@390x780|dom|div.th-pop > button.ghost.sm[aria-label=* text]|1
+theater|player@390x780|dom|div.th-pop > button.ghost.sm[aria-label=*]|1
+theater|player@390x780|dom|div.th-pop > div#appmenu.amenu|1
+theater|player@390x780|dom|div.th-pop > div#profilemenu.amenu|1
+theater|player@390x780|dom|div.th-pop > div#sizemenu.amenu|1
+theater|player@390x780|dom|div.th-pop > div#thememenu.amenu|1
+theater|player@390x780|dom|div.th-rest > div.version|1
+theater|player@390x780|dom|div.vbadges > span.codec.vbadge[text]|1
+theater|player@390x780|dom|div.vbadges > span.res.vbadge[text]|1
+theater|player@390x780|dom|div.version > dl.specs|1
+theater|player@390x780|dom|dl.specs > dd.fn[text]|1
+theater|player@390x780|dom|dl.specs > dd[text]|2
+theater|player@390x780|dom|dl.specs > dt[text]|3
+theater|player@390x780|dom|h1[text] > button.ghost.sm.th-admin[aria-label=* text]|1
+theater|player@390x780|dom|header.th-top > a.logo[text]|1
+theater|player@390x780|dom|header.th-top > div.th-ctl|1
+theater|player@390x780|dom|header.th-top > input#q.search[aria-label=*]|1
+theater|player@390x780|dom|header.th-top > nav.th-nav[aria-label=*]|1
+theater|player@390x780|dom|header.th-top > span#activity.activity|1
+theater|player@390x780|dom|header.th-top > span.spacer|1
+theater|player@390x780|dom|main#main > div.th-detail.th-hero.th-noart|1
+theater|player@390x780|dom|main#main > div.th-rest|1
+theater|player@390x780|dom|nav.th-nav[aria-label=*] > a[text]|3
+theater|player@390x780|dom|nav.th-pills[aria-label=*] > a[text]|3
+theater|player@390x780|dom|span.audio.vbadge[text] > svg.material-icon[aria-hidden=true]|1
+theater|player@390x780|dom|span.codec.vbadge[text] > svg.material-icon[aria-hidden=true]|1
+theater|player@390x780|dom|span.res.vbadge[text] > svg.material-icon[aria-hidden=true]|2
+theater|player@390x780|dom|svg.material-icon[aria-hidden=true] > path|4
+theater|player@390x780|dom|svg[aria-hidden=true] > rect|4
+theater|player@390x780|focus|000|button.ghost.sm "Mark watched"
+theater|player@390x780|focus|001|a "Home"
+theater|player@390x780|focus|002|a "Activity"
+theater|player@390x780|focus|003|a "Settings"
+theater|player@390x780|focus|004|button#qualbtn.pbtn "Playback quality"
+theater|player@390x780|focus|005|button#syncbtn.pbtn "Audio sync adjustment"
+theater|player@390x780|focus|006|button#statsbtn.pbtn "Playback info (i)"
+theater|player@390x780|focus|007|button#skipbtn.pbtn "Auto-skip intro & credits"
+theater|player@390x780|focus|008|button#autonextbtn.pbtn.on "Auto-play the next episode when
+theater|player@390x780|focus|009|button.pbtn "Close (Esc)"
+theater|player@390x780|focus|010|button#pbplay.picon "Play"
+theater|player@390x780|focus|011|div#pseek.pseek "Seek"
+theater|player@390x780|focus|012|button#pbinfo.picon.on "Title info"
+theater|player@390x780|focus|013|button#pbpip.picon "Picture in picture"
+theater|player@390x780|focus|014|button#pbfs.picon "Fullscreen"
+theater|player@390x780|focus|015|<wrap>
+theater|player@390x780|req|GET /api/v1/activity|2
+theater|player@390x780|req|GET /api/v1/files/<id>/decision|1
+theater|player@390x780|req|GET /api/v1/files/<id>/direct|1
+theater|player@390x780|req|GET /api/v1/items/<id>|1
+theater|player@390x780|req|GET /api/v1/libraries|1
+theater|player@390x780|req|GET /api/v1/me|1
+theater|player@390x780|req|GET /api/v1/server|1
+theater|player@390x780|req|POST /api/v1/client-log|1
+theater|search@1280x860|dom|^ > div#app|1
+theater|search@1280x860|dom|button.ghost.profile.sm > span.caret[text]|1
+theater|search@1280x860|dom|button.ghost.profile.sm > span.pavatar[text]|1
+theater|search@1280x860|dom|button.ghost.profile.sm > span.pname[text]|1
+theater|search@1280x860|dom|button.ghost.sizebtn.sm > span[text]|1
+theater|search@1280x860|dom|button.ghost.sizebtn.sm > svg[aria-hidden=true]|1
+theater|search@1280x860|dom|button.ghost.sm[aria-label=*] > span.tsw|1
+theater|search@1280x860|dom|div#app > header.th-top|1
+theater|search@1280x860|dom|div#app > main#main|1
+theater|search@1280x860|dom|div#app > nav.th-pills[aria-label=*]|1
+theater|search@1280x860|dom|div.artbox > div.art.ph[text]|3
+theater|search@1280x860|dom|div.crumbs > a[text]|1
+theater|search@1280x860|dom|div.crumbs > span.cur[text]|1
+theater|search@1280x860|dom|div.crumbs > span.sep[text]|1
+theater|search@1280x860|dom|div.grid > div.k-movie.poster.unw[role=link tabindex=0]|2
+theater|search@1280x860|dom|div.grid > div.k-show.poster.unw[role=link tabindex=0]|1
+theater|search@1280x860|dom|div.k-movie.poster.unw[role=link tabindex=0] > div.artbox|2
+theater|search@1280x860|dom|div.k-movie.poster.unw[role=link tabindex=0] > div.meta|2
+theater|search@1280x860|dom|div.k-show.poster.unw[role=link tabindex=0] > div.artbox|1
+theater|search@1280x860|dom|div.k-show.poster.unw[role=link tabindex=0] > div.meta|1
+theater|search@1280x860|dom|div.meta > div.s|3
+theater|search@1280x860|dom|div.meta > div.t[text]|3
+theater|search@1280x860|dom|div.pagehead > div.phnav|1
+theater|search@1280x860|dom|div.pagehead > h2.phtitle[text]|1
+theater|search@1280x860|dom|div.phnav > a.pgback[aria-label=* text]|1
+theater|search@1280x860|dom|div.phnav > div.crumbs|1
+theater|search@1280x860|dom|div.s > span.stxt[text]|3
+theater|search@1280x860|dom|div.th-ctl > div.th-pop|4
+theater|search@1280x860|dom|div.th-pop > button.ghost.profile.sm|1
+theater|search@1280x860|dom|div.th-pop > button.ghost.sizebtn.sm|1
+theater|search@1280x860|dom|div.th-pop > button.ghost.sm[aria-label=* text]|1
+theater|search@1280x860|dom|div.th-pop > button.ghost.sm[aria-label=*]|1
+theater|search@1280x860|dom|div.th-pop > div#appmenu.amenu|1
+theater|search@1280x860|dom|div.th-pop > div#profilemenu.amenu|1
+theater|search@1280x860|dom|div.th-pop > div#sizemenu.amenu|1
+theater|search@1280x860|dom|div.th-pop > div#thememenu.amenu|1
+theater|search@1280x860|dom|header.th-top > a.logo[text]|1
+theater|search@1280x860|dom|header.th-top > div.th-ctl|1
+theater|search@1280x860|dom|header.th-top > input#q.search[aria-label=*]|1
+theater|search@1280x860|dom|header.th-top > nav.th-nav[aria-label=*]|1
+theater|search@1280x860|dom|header.th-top > span#activity.activity|1
+theater|search@1280x860|dom|header.th-top > span.spacer|1
+theater|search@1280x860|dom|main#main > div.grid|1
+theater|search@1280x860|dom|main#main > div.pagehead|1
+theater|search@1280x860|dom|nav.th-nav[aria-label=*] > a[text]|3
+theater|search@1280x860|dom|nav.th-pills[aria-label=*] > a[text]|3
+theater|search@1280x860|dom|svg[aria-hidden=true] > rect|4
+theater|search@1280x860|focus|000|a.logo "cinemarr"
+theater|search@1280x860|focus|001|a "Home"
+theater|search@1280x860|focus|002|a "Activity"
+theater|search@1280x860|focus|003|a "Settings"
+theater|search@1280x860|focus|004|input#q.search "Search cinemarr"
+theater|search@1280x860|focus|005|button.ghost.sm "Theme and layout"
+theater|search@1280x860|focus|006|button.ghost.sm "Light or dark"
+theater|search@1280x860|focus|007|button.ghost.sm.sizebtn "Icon size"
+theater|search@1280x860|focus|008|button.ghost.sm.profile "Account"
+theater|search@1280x860|focus|009|a.pgback "Back to Home"
+theater|search@1280x860|focus|010|a "Home"
+theater|search@1280x860|focus|011|div.poster.k-movie.unw "SF Signal Fire 2003"
+theater|search@1280x860|focus|012|div.poster.k-show.unw "SH Signal Hill 2019"
+theater|search@1280x860|focus|013|div.poster.k-movie.unw "TS The Signal 2021"
+theater|search@1280x860|focus|014|<wrap>
+theater|search@1280x860|req|GET /api/v1/activity|2
+theater|search@1280x860|req|GET /api/v1/me|1
+theater|search@1280x860|req|GET /api/v1/search|1
+theater|search@1280x860|req|GET /api/v1/server|1
+theater|search@390x780|dom|^ > div#app|1
+theater|search@390x780|dom|button.ghost.profile.sm > span.caret[text]|1
+theater|search@390x780|dom|button.ghost.profile.sm > span.pavatar[text]|1
+theater|search@390x780|dom|button.ghost.profile.sm > span.pname[text]|1
+theater|search@390x780|dom|button.ghost.sizebtn.sm > span[text]|1
+theater|search@390x780|dom|button.ghost.sizebtn.sm > svg[aria-hidden=true]|1
+theater|search@390x780|dom|button.ghost.sm[aria-label=*] > span.tsw|1
+theater|search@390x780|dom|div#app > header.th-top|1
+theater|search@390x780|dom|div#app > main#main|1
+theater|search@390x780|dom|div#app > nav.th-pills[aria-label=*]|1
+theater|search@390x780|dom|div.artbox > div.art.ph[text]|3
+theater|search@390x780|dom|div.crumbs > a[text]|1
+theater|search@390x780|dom|div.crumbs > span.cur[text]|1
+theater|search@390x780|dom|div.crumbs > span.sep[text]|1
+theater|search@390x780|dom|div.grid > div.k-movie.poster.unw[role=link tabindex=0]|2
+theater|search@390x780|dom|div.grid > div.k-show.poster.unw[role=link tabindex=0]|1
+theater|search@390x780|dom|div.k-movie.poster.unw[role=link tabindex=0] > div.artbox|2
+theater|search@390x780|dom|div.k-movie.poster.unw[role=link tabindex=0] > div.meta|2
+theater|search@390x780|dom|div.k-show.poster.unw[role=link tabindex=0] > div.artbox|1
+theater|search@390x780|dom|div.k-show.poster.unw[role=link tabindex=0] > div.meta|1
+theater|search@390x780|dom|div.meta > div.s|3
+theater|search@390x780|dom|div.meta > div.t[text]|3
+theater|search@390x780|dom|div.pagehead > div.phnav|1
+theater|search@390x780|dom|div.pagehead > h2.phtitle[text]|1
+theater|search@390x780|dom|div.phnav > a.pgback[aria-label=* text]|1
+theater|search@390x780|dom|div.phnav > div.crumbs|1
+theater|search@390x780|dom|div.s > span.stxt[text]|3
+theater|search@390x780|dom|div.th-ctl > div.th-pop|4
+theater|search@390x780|dom|div.th-pop > button.ghost.profile.sm|1
+theater|search@390x780|dom|div.th-pop > button.ghost.sizebtn.sm|1
+theater|search@390x780|dom|div.th-pop > button.ghost.sm[aria-label=* text]|1
+theater|search@390x780|dom|div.th-pop > button.ghost.sm[aria-label=*]|1
+theater|search@390x780|dom|div.th-pop > div#appmenu.amenu|1
+theater|search@390x780|dom|div.th-pop > div#profilemenu.amenu|1
+theater|search@390x780|dom|div.th-pop > div#sizemenu.amenu|1
+theater|search@390x780|dom|div.th-pop > div#thememenu.amenu|1
+theater|search@390x780|dom|header.th-top > a.logo[text]|1
+theater|search@390x780|dom|header.th-top > div.th-ctl|1
+theater|search@390x780|dom|header.th-top > input#q.search[aria-label=*]|1
+theater|search@390x780|dom|header.th-top > nav.th-nav[aria-label=*]|1
+theater|search@390x780|dom|header.th-top > span#activity.activity|1
+theater|search@390x780|dom|header.th-top > span.spacer|1
+theater|search@390x780|dom|main#main > div.grid|1
+theater|search@390x780|dom|main#main > div.pagehead|1
+theater|search@390x780|dom|nav.th-nav[aria-label=*] > a[text]|3
+theater|search@390x780|dom|nav.th-pills[aria-label=*] > a[text]|3
+theater|search@390x780|dom|svg[aria-hidden=true] > rect|4
+theater|search@390x780|focus|000|a.logo "cinemarr"
+theater|search@390x780|focus|001|input#q.search "Search cinemarr"
+theater|search@390x780|focus|002|button.ghost.sm "Theme and layout"
+theater|search@390x780|focus|003|button.ghost.sm "Light or dark"
+theater|search@390x780|focus|004|button.ghost.sm.sizebtn "Icon size"
+theater|search@390x780|focus|005|button.ghost.sm.profile "Account"
+theater|search@390x780|focus|006|a.pgback "Back to Home"
+theater|search@390x780|focus|007|a "Home"
+theater|search@390x780|focus|008|div.poster.k-movie.unw "SF Signal Fire 2003"
+theater|search@390x780|focus|009|div.poster.k-show.unw "SH Signal Hill 2019"
+theater|search@390x780|focus|010|div.poster.k-movie.unw "TS The Signal 2021"
+theater|search@390x780|focus|011|a "Home"
+theater|search@390x780|focus|012|a "Activity"
+theater|search@390x780|focus|013|a "Settings"
+theater|search@390x780|focus|014|<wrap>
+theater|search@390x780|req|GET /api/v1/activity|2
+theater|search@390x780|req|GET /api/v1/me|1
+theater|search@390x780|req|GET /api/v1/search|1
+theater|search@390x780|req|GET /api/v1/server|1
+theater|settings@1280x860|dom|^ > div#app|1
+theater|settings@1280x860|dom|button.ghost.profile.sm > span.caret[text]|1
+theater|settings@1280x860|dom|button.ghost.profile.sm > span.pavatar[text]|1
+theater|settings@1280x860|dom|button.ghost.profile.sm > span.pname[text]|1
+theater|settings@1280x860|dom|button.ghost.sizebtn.sm > span[text]|1
+theater|settings@1280x860|dom|button.ghost.sizebtn.sm > svg[aria-hidden=true]|1
+theater|settings@1280x860|dom|button.ghost.sm[aria-label=*] > span.tsw|1
+theater|settings@1280x860|dom|div#app > header.th-top|1
+theater|settings@1280x860|dom|div#app > main#main|1
+theater|settings@1280x860|dom|div#app > nav.th-pills[aria-label=*]|1
+theater|settings@1280x860|dom|div#setbody.adminwrap > div.card|2
+theater|settings@1280x860|dom|div.card > button[text]|1
+theater|settings@1280x860|dom|div.card > div#lerr.err|1
+theater|settings@1280x860|dom|div.card > div.hint[text]|3
+theater|settings@1280x860|dom|div.card > div.row.setrow|2
+theater|settings@1280x860|dom|div.card > div.row|2
+theater|settings@1280x860|dom|div.card > div.setwarn[text]|1
+theater|settings@1280x860|dom|div.card > h2.section[text]|4
+theater|settings@1280x860|dom|div.card > table|1
+theater|settings@1280x860|dom|div.hint[text] > b[text]|8
+theater|settings@1280x860|dom|div.hint[text] > code[text]|1
+theater|settings@1280x860|dom|div.paths > span.pathchip[text]|3
+theater|settings@1280x860|dom|div.row > button.ghost.sm[text]|2
+theater|settings@1280x860|dom|div.row > input#ln[aria-label=*]|1
+theater|settings@1280x860|dom|div.row > input#lp[aria-label=*]|1
+theater|settings@1280x860|dom|div.row > select#lk|1
+theater|settings@1280x860|dom|div.row > span.muted[text]|1
+theater|settings@1280x860|dom|div.row.setrow > button.ghost.sm[text]|2
+theater|settings@1280x860|dom|div.row.setrow > label.schedpair[text]|1
+theater|settings@1280x860|dom|div.row.setrow > span.schedpair[text]|5
+theater|settings@1280x860|dom|div.sched > span.schedpair[text]|9
+theater|settings@1280x860|dom|div.settabs > button.active.settab[text]|1
+theater|settings@1280x860|dom|div.settabs > button.settab[text]|4
+theater|settings@1280x860|dom|div.setwarn[text] > a[text]|1
+theater|settings@1280x860|dom|div.setwarn[text] > b[text]|2
+theater|settings@1280x860|dom|div.th-ctl > div.th-pop|4
+theater|settings@1280x860|dom|div.th-pop > button.ghost.profile.sm|1
+theater|settings@1280x860|dom|div.th-pop > button.ghost.sizebtn.sm|1
+theater|settings@1280x860|dom|div.th-pop > button.ghost.sm[aria-label=* text]|1
+theater|settings@1280x860|dom|div.th-pop > button.ghost.sm[aria-label=*]|1
+theater|settings@1280x860|dom|div.th-pop > div#appmenu.amenu|1
+theater|settings@1280x860|dom|div.th-pop > div#profilemenu.amenu|1
+theater|settings@1280x860|dom|div.th-pop > div#sizemenu.amenu|1
+theater|settings@1280x860|dom|div.th-pop > div#thememenu.amenu|1
+theater|settings@1280x860|dom|header.th-top > a.logo[text]|1
+theater|settings@1280x860|dom|header.th-top > div.th-ctl|1
+theater|settings@1280x860|dom|header.th-top > input#q.search[aria-label=*]|1
+theater|settings@1280x860|dom|header.th-top > nav.th-nav[aria-label=*]|1
+theater|settings@1280x860|dom|header.th-top > span#activity.activity|1
+theater|settings@1280x860|dom|header.th-top > span.spacer|1
+theater|settings@1280x860|dom|label.schedpair[text] > input#job-boot[type=checkbox]|1
+theater|settings@1280x860|dom|main#main > div#setbody.adminwrap|1
+theater|settings@1280x860|dom|main#main > div.settabs|1
+theater|settings@1280x860|dom|nav.th-nav[aria-label=*] > a.on[aria-current=page text]|1
+theater|settings@1280x860|dom|nav.th-nav[aria-label=*] > a[text]|2
+theater|settings@1280x860|dom|nav.th-pills[aria-label=*] > a.on[aria-current=page text]|1
+theater|settings@1280x860|dom|nav.th-pills[aria-label=*] > a[text]|2
+theater|settings@1280x860|dom|select#cache-gb > option[text]|8
+theater|settings@1280x860|dom|select#cache-produce > option[text]|4
+theater|settings@1280x860|dom|select#job-art > option[text]|5
+theater|settings@1280x860|dom|select#job-clean > option[text]|4
+theater|settings@1280x860|dom|select#job-probe > option[text]|5
+theater|settings@1280x860|dom|select#lk > option[text]|4
+theater|settings@1280x860|dom|select#sched-ref-1 > option[text]|4
+theater|settings@1280x860|dom|select#sched-ref-2 > option[text]|4
+theater|settings@1280x860|dom|select#sched-ref-3 > option[text]|4
+theater|settings@1280x860|dom|select#sched-scan-1 > option[text]|8
+theater|settings@1280x860|dom|select#sched-scan-2 > option[text]|8
+theater|settings@1280x860|dom|select#sched-scan-3 > option[text]|8
+theater|settings@1280x860|dom|span.schedpair[text] > button.ghost.sm[text]|3
+theater|settings@1280x860|dom|span.schedpair[text] > select#cache-gb|1
+theater|settings@1280x860|dom|span.schedpair[text] > select#cache-produce|1
+theater|settings@1280x860|dom|span.schedpair[text] > select#job-art|1
+theater|settings@1280x860|dom|span.schedpair[text] > select#job-clean|1
+theater|settings@1280x860|dom|span.schedpair[text] > select#job-probe|1
+theater|settings@1280x860|dom|span.schedpair[text] > select#sched-ref-1|1
+theater|settings@1280x860|dom|span.schedpair[text] > select#sched-ref-2|1
+theater|settings@1280x860|dom|span.schedpair[text] > select#sched-ref-3|1
+theater|settings@1280x860|dom|span.schedpair[text] > select#sched-scan-1|1
+theater|settings@1280x860|dom|span.schedpair[text] > select#sched-scan-2|1
+theater|settings@1280x860|dom|span.schedpair[text] > select#sched-scan-3|1
+theater|settings@1280x860|dom|span.schedpair[text] > span.muted[text]|1
+theater|settings@1280x860|dom|svg[aria-hidden=true] > rect|4
+theater|settings@1280x860|dom|table > tbody|1
+theater|settings@1280x860|dom|table > thead|1
+theater|settings@1280x860|dom|tbody > tr#librow-1|1
+theater|settings@1280x860|dom|tbody > tr#librow-2|1
+theater|settings@1280x860|dom|tbody > tr#librow-3|1
+theater|settings@1280x860|dom|td > div.paths|3
+theater|settings@1280x860|dom|td.libname > b[text]|3
+theater|settings@1280x860|dom|td.muted > div#st-1[text]|1
+theater|settings@1280x860|dom|td.muted > div#st-2[text]|1
+theater|settings@1280x860|dom|td.muted > div#st-3[text]|1
+theater|settings@1280x860|dom|td.muted > div.sched|3
+theater|settings@1280x860|dom|td.row.rowactions > button.ghost.sm[text]|12
+theater|settings@1280x860|dom|thead > tr|1
+theater|settings@1280x860|dom|tr > th[text]|4
+theater|settings@1280x860|dom|tr > th|1
+theater|settings@1280x860|dom|tr#librow-1 > td.libname|1
+theater|settings@1280x860|dom|tr#librow-1 > td.muted|1
+theater|settings@1280x860|dom|tr#librow-1 > td.row.rowactions|1
+theater|settings@1280x860|dom|tr#librow-1 > td[text]|1
+theater|settings@1280x860|dom|tr#librow-1 > td|1
+theater|settings@1280x860|dom|tr#librow-2 > td.libname|1
+theater|settings@1280x860|dom|tr#librow-2 > td.muted|1
+theater|settings@1280x860|dom|tr#librow-2 > td.row.rowactions|1
+theater|settings@1280x860|dom|tr#librow-2 > td[text]|1
+theater|settings@1280x860|dom|tr#librow-2 > td|1
+theater|settings@1280x860|dom|tr#librow-3 > td.libname|1
+theater|settings@1280x860|dom|tr#librow-3 > td.muted|1
+theater|settings@1280x860|dom|tr#librow-3 > td.row.rowactions|1
+theater|settings@1280x860|dom|tr#librow-3 > td[text]|1
+theater|settings@1280x860|dom|tr#librow-3 > td|1
+theater|settings@1280x860|focus|000|a.logo "cinemarr"
+theater|settings@1280x860|focus|001|a "Home"
+theater|settings@1280x860|focus|002|a "Activity"
+theater|settings@1280x860|focus|003|a.on "Settings"
+theater|settings@1280x860|focus|004|input#q.search "Search cinemarr"
+theater|settings@1280x860|focus|005|button.ghost.sm "Theme and layout"
+theater|settings@1280x860|focus|006|button.ghost.sm "Light or dark"
+theater|settings@1280x860|focus|007|button.ghost.sm.sizebtn "Icon size"
+theater|settings@1280x860|focus|008|button.ghost.sm.profile "Account"
+theater|settings@1280x860|focus|009|button.settab.active "Libraries"
+theater|settings@1280x860|focus|010|button.settab "Metadata"
+theater|settings@1280x860|focus|011|button.settab "Playback"
+theater|settings@1280x860|focus|012|button.settab "Users"
+theater|settings@1280x860|focus|013|button.settab "System"
+theater|settings@1280x860|focus|014|button.ghost.sm "Scan every library for new & changed files"
+theater|settings@1280x860|focus|015|button.ghost.sm "Re-fetch metadata & artwork for every libra
+theater|settings@1280x860|focus|016|select#sched-scan-2 "How often to look for new & changed fil
+theater|settings@1280x860|focus|017|select#sched-ref-2 "How often to re-fetch metadata for every
+theater|settings@1280x860|focus|018|button.ghost.sm "Save"
+theater|settings@1280x860|focus|019|button.ghost.sm "Scan"
+theater|settings@1280x860|focus|020|button.ghost.sm "Re-fetch all metadata & artwork (incl. seas
+theater|settings@1280x860|focus|021|button.ghost.sm "Edit"
+theater|settings@1280x860|focus|022|button.ghost.sm "Delete"
+theater|settings@1280x860|focus|023|select#sched-scan-1 "How often to look for new & changed fil
+theater|settings@1280x860|focus|024|select#sched-ref-1 "How often to re-fetch metadata for every
+theater|settings@1280x860|focus|025|button.ghost.sm "Save"
+theater|settings@1280x860|focus|026|button.ghost.sm "Scan"
+theater|settings@1280x860|focus|027|button.ghost.sm "Re-fetch all metadata & artwork (incl. seas
+theater|settings@1280x860|focus|028|button.ghost.sm "Edit"
+theater|settings@1280x860|focus|029|button.ghost.sm "Delete"
+theater|settings@1280x860|focus|030|select#sched-scan-3 "How often to look for new & changed fil
+theater|settings@1280x860|focus|031|select#sched-ref-3 "How often to re-fetch metadata for every
+theater|settings@1280x860|focus|032|button.ghost.sm "Save"
+theater|settings@1280x860|focus|033|button.ghost.sm "Scan"
+theater|settings@1280x860|focus|034|button.ghost.sm "Re-fetch all metadata & artwork (incl. seas
+theater|settings@1280x860|focus|035|button.ghost.sm "Edit"
+theater|settings@1280x860|focus|036|button.ghost.sm "Delete"
+theater|settings@1280x860|focus|037|input#ln "Library name"
+theater|settings@1280x860|focus|038|select#lk "Movies TV Shows Anime Home videos & photos"
+theater|settings@1280x860|focus|039|input#lp "Media paths"
+theater|settings@1280x860|focus|040|button "Add & scan"
+theater|settings@1280x860|focus|041|select#job-probe "Re-run ffprobe on files whose media detail
+theater|settings@1280x860|focus|042|select#job-art "Re-fetch posters for items a provider matche
+theater|settings@1280x860|focus|043|select#job-clean "Delete leftover transcode working director
+theater|settings@1280x860|focus|044|input#job-boot
+theater|settings@1280x860|focus|045|button.ghost.sm "Save"
+theater|settings@1280x860|focus|046|select#cache-produce "How often to check what's worth encodi
+theater|settings@1280x860|focus|047|select#cache-gb "How much disk finished pre-transcodes may o
+theater|settings@1280x860|focus|048|button.ghost.sm "Save"
+theater|settings@1280x860|focus|049|<wrap>
+theater|settings@1280x860|req|GET /api/v1/activity|2
+theater|settings@1280x860|req|GET /api/v1/libraries|1
+theater|settings@1280x860|req|GET /api/v1/me|1
+theater|settings@1280x860|req|GET /api/v1/scan/status|3
+theater|settings@1280x860|req|GET /api/v1/server|1
+theater|settings@1280x860|req|GET /api/v1/settings|1
+theater|settings@1280x860|req|GET /api/v1/system|1
+theater|settings@1280x860|req|GET /api/v1/trakt/status|3
+theater|settings@1280x860|req|GET /api/v1/users|1
+theater|settings@390x780|dom|^ > div#app|1
+theater|settings@390x780|dom|button.ghost.profile.sm > span.caret[text]|1
+theater|settings@390x780|dom|button.ghost.profile.sm > span.pavatar[text]|1
+theater|settings@390x780|dom|button.ghost.profile.sm > span.pname[text]|1
+theater|settings@390x780|dom|button.ghost.sizebtn.sm > span[text]|1
+theater|settings@390x780|dom|button.ghost.sizebtn.sm > svg[aria-hidden=true]|1
+theater|settings@390x780|dom|button.ghost.sm[aria-label=*] > span.tsw|1
+theater|settings@390x780|dom|div#app > header.th-top|1
+theater|settings@390x780|dom|div#app > main#main|1
+theater|settings@390x780|dom|div#app > nav.th-pills[aria-label=*]|1
+theater|settings@390x780|dom|div#setbody.adminwrap > div.card|2
+theater|settings@390x780|dom|div.card > button[text]|1
+theater|settings@390x780|dom|div.card > div#lerr.err|1
+theater|settings@390x780|dom|div.card > div.hint[text]|3
+theater|settings@390x780|dom|div.card > div.row.setrow|2
+theater|settings@390x780|dom|div.card > div.row|2
+theater|settings@390x780|dom|div.card > div.setwarn[text]|1
+theater|settings@390x780|dom|div.card > h2.section[text]|4
+theater|settings@390x780|dom|div.card > table|1
+theater|settings@390x780|dom|div.hint[text] > b[text]|8
+theater|settings@390x780|dom|div.hint[text] > code[text]|1
+theater|settings@390x780|dom|div.paths > span.pathchip[text]|3
+theater|settings@390x780|dom|div.row > button.ghost.sm[text]|2
+theater|settings@390x780|dom|div.row > input#ln[aria-label=*]|1
+theater|settings@390x780|dom|div.row > input#lp[aria-label=*]|1
+theater|settings@390x780|dom|div.row > select#lk|1
+theater|settings@390x780|dom|div.row > span.muted[text]|1
+theater|settings@390x780|dom|div.row.setrow > button.ghost.sm[text]|2
+theater|settings@390x780|dom|div.row.setrow > label.schedpair[text]|1
+theater|settings@390x780|dom|div.row.setrow > span.schedpair[text]|5
+theater|settings@390x780|dom|div.sched > span.schedpair[text]|9
+theater|settings@390x780|dom|div.settabs > button.active.settab[text]|1
+theater|settings@390x780|dom|div.settabs > button.settab[text]|4
+theater|settings@390x780|dom|div.setwarn[text] > a[text]|1
+theater|settings@390x780|dom|div.setwarn[text] > b[text]|2
+theater|settings@390x780|dom|div.th-ctl > div.th-pop|4
+theater|settings@390x780|dom|div.th-pop > button.ghost.profile.sm|1
+theater|settings@390x780|dom|div.th-pop > button.ghost.sizebtn.sm|1
+theater|settings@390x780|dom|div.th-pop > button.ghost.sm[aria-label=* text]|1
+theater|settings@390x780|dom|div.th-pop > button.ghost.sm[aria-label=*]|1
+theater|settings@390x780|dom|div.th-pop > div#appmenu.amenu|1
+theater|settings@390x780|dom|div.th-pop > div#profilemenu.amenu|1
+theater|settings@390x780|dom|div.th-pop > div#sizemenu.amenu|1
+theater|settings@390x780|dom|div.th-pop > div#thememenu.amenu|1
+theater|settings@390x780|dom|header.th-top > a.logo[text]|1
+theater|settings@390x780|dom|header.th-top > div.th-ctl|1
+theater|settings@390x780|dom|header.th-top > input#q.search[aria-label=*]|1
+theater|settings@390x780|dom|header.th-top > nav.th-nav[aria-label=*]|1
+theater|settings@390x780|dom|header.th-top > span#activity.activity|1
+theater|settings@390x780|dom|header.th-top > span.spacer|1
+theater|settings@390x780|dom|label.schedpair[text] > input#job-boot[type=checkbox]|1
+theater|settings@390x780|dom|main#main > div#setbody.adminwrap|1
+theater|settings@390x780|dom|main#main > div.settabs|1
+theater|settings@390x780|dom|nav.th-nav[aria-label=*] > a.on[aria-current=page text]|1
+theater|settings@390x780|dom|nav.th-nav[aria-label=*] > a[text]|2
+theater|settings@390x780|dom|nav.th-pills[aria-label=*] > a.on[aria-current=page text]|1
+theater|settings@390x780|dom|nav.th-pills[aria-label=*] > a[text]|2
+theater|settings@390x780|dom|select#cache-gb > option[text]|8
+theater|settings@390x780|dom|select#cache-produce > option[text]|4
+theater|settings@390x780|dom|select#job-art > option[text]|5
+theater|settings@390x780|dom|select#job-clean > option[text]|4
+theater|settings@390x780|dom|select#job-probe > option[text]|5
+theater|settings@390x780|dom|select#lk > option[text]|4
+theater|settings@390x780|dom|select#sched-ref-1 > option[text]|4
+theater|settings@390x780|dom|select#sched-ref-2 > option[text]|4
+theater|settings@390x780|dom|select#sched-ref-3 > option[text]|4
+theater|settings@390x780|dom|select#sched-scan-1 > option[text]|8
+theater|settings@390x780|dom|select#sched-scan-2 > option[text]|8
+theater|settings@390x780|dom|select#sched-scan-3 > option[text]|8
+theater|settings@390x780|dom|span.schedpair[text] > button.ghost.sm[text]|3
+theater|settings@390x780|dom|span.schedpair[text] > select#cache-gb|1
+theater|settings@390x780|dom|span.schedpair[text] > select#cache-produce|1
+theater|settings@390x780|dom|span.schedpair[text] > select#job-art|1
+theater|settings@390x780|dom|span.schedpair[text] > select#job-clean|1
+theater|settings@390x780|dom|span.schedpair[text] > select#job-probe|1
+theater|settings@390x780|dom|span.schedpair[text] > select#sched-ref-1|1
+theater|settings@390x780|dom|span.schedpair[text] > select#sched-ref-2|1
+theater|settings@390x780|dom|span.schedpair[text] > select#sched-ref-3|1
+theater|settings@390x780|dom|span.schedpair[text] > select#sched-scan-1|1
+theater|settings@390x780|dom|span.schedpair[text] > select#sched-scan-2|1
+theater|settings@390x780|dom|span.schedpair[text] > select#sched-scan-3|1
+theater|settings@390x780|dom|span.schedpair[text] > span.muted[text]|1
+theater|settings@390x780|dom|svg[aria-hidden=true] > rect|4
+theater|settings@390x780|dom|table > tbody|1
+theater|settings@390x780|dom|table > thead|1
+theater|settings@390x780|dom|tbody > tr#librow-1|1
+theater|settings@390x780|dom|tbody > tr#librow-2|1
+theater|settings@390x780|dom|tbody > tr#librow-3|1
+theater|settings@390x780|dom|td > div.paths|3
+theater|settings@390x780|dom|td.libname > b[text]|3
+theater|settings@390x780|dom|td.muted > div#st-1[text]|1
+theater|settings@390x780|dom|td.muted > div#st-2[text]|1
+theater|settings@390x780|dom|td.muted > div#st-3[text]|1
+theater|settings@390x780|dom|td.muted > div.sched|3
+theater|settings@390x780|dom|td.row.rowactions > button.ghost.sm[text]|12
+theater|settings@390x780|dom|thead > tr|1
+theater|settings@390x780|dom|tr > th[text]|4
+theater|settings@390x780|dom|tr > th|1
+theater|settings@390x780|dom|tr#librow-1 > td.libname|1
+theater|settings@390x780|dom|tr#librow-1 > td.muted|1
+theater|settings@390x780|dom|tr#librow-1 > td.row.rowactions|1
+theater|settings@390x780|dom|tr#librow-1 > td[text]|1
+theater|settings@390x780|dom|tr#librow-1 > td|1
+theater|settings@390x780|dom|tr#librow-2 > td.libname|1
+theater|settings@390x780|dom|tr#librow-2 > td.muted|1
+theater|settings@390x780|dom|tr#librow-2 > td.row.rowactions|1
+theater|settings@390x780|dom|tr#librow-2 > td[text]|1
+theater|settings@390x780|dom|tr#librow-2 > td|1
+theater|settings@390x780|dom|tr#librow-3 > td.libname|1
+theater|settings@390x780|dom|tr#librow-3 > td.muted|1
+theater|settings@390x780|dom|tr#librow-3 > td.row.rowactions|1
+theater|settings@390x780|dom|tr#librow-3 > td[text]|1
+theater|settings@390x780|dom|tr#librow-3 > td|1
+theater|settings@390x780|focus|000|a.logo "cinemarr"
+theater|settings@390x780|focus|001|input#q.search "Search cinemarr"
+theater|settings@390x780|focus|002|button.ghost.sm "Theme and layout"
+theater|settings@390x780|focus|003|button.ghost.sm "Light or dark"
+theater|settings@390x780|focus|004|button.ghost.sm.sizebtn "Icon size"
+theater|settings@390x780|focus|005|button.ghost.sm.profile "Account"
+theater|settings@390x780|focus|006|button.settab.active "Libraries"
+theater|settings@390x780|focus|007|button.settab "Metadata"
+theater|settings@390x780|focus|008|button.settab "Playback"
+theater|settings@390x780|focus|009|button.settab "Users"
+theater|settings@390x780|focus|010|button.settab "System"
+theater|settings@390x780|focus|011|button.ghost.sm "Scan every library for new & changed files"
+theater|settings@390x780|focus|012|button.ghost.sm "Re-fetch metadata & artwork for every libra
+theater|settings@390x780|focus|013|select#sched-scan-2 "How often to look for new & changed fil
+theater|settings@390x780|focus|014|select#sched-ref-2 "How often to re-fetch metadata for every
+theater|settings@390x780|focus|015|button.ghost.sm "Save"
+theater|settings@390x780|focus|016|button.ghost.sm "Scan"
+theater|settings@390x780|focus|017|button.ghost.sm "Re-fetch all metadata & artwork (incl. seas
+theater|settings@390x780|focus|018|button.ghost.sm "Edit"
+theater|settings@390x780|focus|019|button.ghost.sm "Delete"
+theater|settings@390x780|focus|020|select#sched-scan-1 "How often to look for new & changed fil
+theater|settings@390x780|focus|021|select#sched-ref-1 "How often to re-fetch metadata for every
+theater|settings@390x780|focus|022|button.ghost.sm "Save"
+theater|settings@390x780|focus|023|button.ghost.sm "Scan"
+theater|settings@390x780|focus|024|button.ghost.sm "Re-fetch all metadata & artwork (incl. seas
+theater|settings@390x780|focus|025|button.ghost.sm "Edit"
+theater|settings@390x780|focus|026|button.ghost.sm "Delete"
+theater|settings@390x780|focus|027|select#sched-scan-3 "How often to look for new & changed fil
+theater|settings@390x780|focus|028|select#sched-ref-3 "How often to re-fetch metadata for every
+theater|settings@390x780|focus|029|button.ghost.sm "Save"
+theater|settings@390x780|focus|030|button.ghost.sm "Scan"
+theater|settings@390x780|focus|031|button.ghost.sm "Re-fetch all metadata & artwork (incl. seas
+theater|settings@390x780|focus|032|button.ghost.sm "Edit"
+theater|settings@390x780|focus|033|button.ghost.sm "Delete"
+theater|settings@390x780|focus|034|input#ln "Library name"
+theater|settings@390x780|focus|035|select#lk "Movies TV Shows Anime Home videos & photos"
+theater|settings@390x780|focus|036|input#lp "Media paths"
+theater|settings@390x780|focus|037|button "Add & scan"
+theater|settings@390x780|focus|038|select#job-probe "Re-run ffprobe on files whose media detail
+theater|settings@390x780|focus|039|select#job-art "Re-fetch posters for items a provider matche
+theater|settings@390x780|focus|040|select#job-clean "Delete leftover transcode working director
+theater|settings@390x780|focus|041|input#job-boot
+theater|settings@390x780|focus|042|button.ghost.sm "Save"
+theater|settings@390x780|focus|043|select#cache-produce "How often to check what's worth encodi
+theater|settings@390x780|focus|044|select#cache-gb "How much disk finished pre-transcodes may o
+theater|settings@390x780|focus|045|button.ghost.sm "Save"
+theater|settings@390x780|focus|046|a "Home"
+theater|settings@390x780|focus|047|a "Activity"
+theater|settings@390x780|focus|048|a.on "Settings"
+theater|settings@390x780|focus|049|<wrap>
+theater|settings@390x780|req|GET /api/v1/activity|2
+theater|settings@390x780|req|GET /api/v1/libraries|1
+theater|settings@390x780|req|GET /api/v1/me|1
+theater|settings@390x780|req|GET /api/v1/scan/status|3
+theater|settings@390x780|req|GET /api/v1/server|1
+theater|settings@390x780|req|GET /api/v1/settings|1
+theater|settings@390x780|req|GET /api/v1/system|1
+theater|settings@390x780|req|GET /api/v1/trakt/status|3
+theater|settings@390x780|req|GET /api/v1/users|1
