@@ -35,7 +35,7 @@ class HomeTopBarTest {
             )
         }
 
-        val brand = compose.onNodeWithText("plurx").assertIsDisplayed()
+        val brand = compose.onNodeWithText("cinema").assertIsDisplayed()
         val search = compose.onNodeWithContentDescription("Search")
             .assertIsDisplayed()
             .assertHasClickAction()

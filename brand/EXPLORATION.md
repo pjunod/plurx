@@ -1,6 +1,10 @@
-# Brand exploration — one system from wanted to watching
+# Archived brand exploration — Boundlight
 
-**Status:** direction, not a rename decision · **Written:** 2026-07-30
+**Status:** rejected and archived · **Written:** 2026-07-30
+
+> The selected suite identity is `noirr_` with the products Cinema, Curator,
+> Runner. This file remains only as decision history; do not use its names,
+> palette, or marks in current product work. See [BRAND.md](BRAND.md).
 
 Companion to [BRAND.md](BRAND.md), which records the existing `noirr`
 direction. This document tests a different premise: leave the `*arr` family

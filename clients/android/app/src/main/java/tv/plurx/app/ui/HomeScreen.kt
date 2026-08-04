@@ -399,8 +399,8 @@ internal fun HomeTopBar(
     ) {
         Text(
             when (theme) {
-                ThemeId.Classic -> "plurx"
-                ThemeId.Terminal -> ":~\$ plurx ▊"
+                ThemeId.Classic -> "cinema"
+                ThemeId.Terminal -> ":~\$ cinema ▊"
                 ThemeId.Noirr -> "noirr ▬"
             },
             color = Accent,

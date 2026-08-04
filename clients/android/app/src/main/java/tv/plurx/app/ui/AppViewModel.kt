@@ -204,7 +204,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             try {
                 connectToOrigin(normalized)
             } catch (_: Exception) {
-                _authError.value = "Couldn't reach a plurx server at $normalized"
+                _authError.value = "Couldn't reach a Cinema server at $normalized"
             } finally {
                 _busy.value = false
             }

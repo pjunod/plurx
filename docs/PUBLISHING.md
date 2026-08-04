@@ -225,7 +225,7 @@ minutes; the label is separate from, and must agree with, the privacy manifest
 in the binary (§4).
 
 **Privacy policy URL** — required even when you collect nothing. A static page
-saying "plurx sends data to the server you configure and nowhere else" is a
+saying "Cinema sends data to the server you configure and nowhere else" is a
 valid privacy policy. A **support URL** is required too; a GitHub issues page
 counts.
 
@@ -241,18 +241,19 @@ aspect for all three; these have to be captured from the Simulator.
 
 **Review notes** — the highest-leverage text box in the whole submission:
 
-> plurx is a client for a media server the user runs on their own hardware; it
+> Noirr Cinema is a client for a media server the user runs on their own hardware; it
 > ships no content of its own. A demo server has been prepared for review at
 > https://demo.example.com — username `review`, password `<…>`. The library
 > contains Creative Commons films (Blender Foundation open movies). The app
 > requires an arbitrary-loads ATS exception because home servers are commonly
 > reached over plain HTTP on a LAN or a private overlay network; see §4.
 
-**The name.** The repo currently answers to three names — `plurx` (bundle ID,
-`CFBundleDisplayName`, this repo), `cinemarr` (the web UI's `APP_NAME`), and
-`noirr` ([brand/BRAND.md](../brand/BRAND.md)). App Store Connect wants one, it
-must be globally unique, and it's awkward to change after launch. Settle this
-before reserving the name, not after.
+**The name.** The public product name is **Noirr Cinema** and the short in-app
+name is **Cinema**. The repository, product target, bundle identifier, URL
+scheme, service discovery type, and compatibility paths remain `plurx` until a
+separate migration can preserve existing installs. App Store Connect still
+requires availability and legal clearance before the name is reserved; the
+visual decision in [brand/BRAND.md](../brand/BRAND.md) is not clearance.
 
 ## 4. The store-facing keys in the repo, and what each one buys
 

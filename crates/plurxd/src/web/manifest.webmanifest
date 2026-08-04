@@ -1,7 +1,7 @@
 {
-  "name": "plurx",
-  "short_name": "plurx",
-  "description": "Your media library, everywhere.",
+  "name": "Noirr Cinema",
+  "short_name": "Cinema",
+  "description": "Your self-hosted media library, everywhere.",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",

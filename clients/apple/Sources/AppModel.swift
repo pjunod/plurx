@@ -145,7 +145,7 @@ final class AppModel: ObservableObject {
             settings.setServer(origin: normalized, instanceId: info.instanceId, token: nil)
             phase = .needLogin
         } catch {
-            authError = "Couldn't reach a plurx server at \(normalized)"
+            authError = "Couldn't reach a Cinema server at \(normalized)"
         }
     }
 

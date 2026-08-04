@@ -83,7 +83,7 @@ private fun AuthScaffold(
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(14.dp),
         ) {
-            Text("plurx", fontSize = 40.sp, color = Accent, style = MaterialTheme.typography.headlineMedium)
+            Text("cinema", fontSize = 40.sp, color = Accent, style = MaterialTheme.typography.headlineMedium)
             Text(subtitle, color = Muted, style = MaterialTheme.typography.bodyMedium)
             content()
             if (error != null) {
@@ -146,15 +146,15 @@ fun ConnectScreen(vm: AppViewModel, busy: Boolean, error: String?) {
                     Spacer(Modifier.width(10.dp))
                 }
                 Text(
-                    if (discovery.isSearching) "Looking for plurx…" else "No servers found",
+                    if (discovery.isSearching) "Looking for Cinema…" else "No servers found",
                     color = Muted,
                     style = MaterialTheme.typography.bodyMedium,
                 )
             }
         } else {
             Text(
-                if (discovery.servers.size == 1) "1 plurx server found"
-                else "${discovery.servers.size} plurx servers found",
+                if (discovery.servers.size == 1) "1 Cinema server found"
+                else "${discovery.servers.size} Cinema servers found",
                 color = Muted,
                 style = MaterialTheme.typography.labelMedium,
             )
@@ -188,7 +188,7 @@ fun ConnectScreen(vm: AppViewModel, busy: Boolean, error: String?) {
                         .addOnSuccessListener { barcode ->
                             val scannedOrigin = connectionOriginFromQr(barcode.rawValue.orEmpty())
                             if (scannedOrigin == null) {
-                                qrError = "That QR code doesn't contain a valid plurx server address."
+                                qrError = "That QR code doesn't contain a valid Cinema server address."
                             } else {
                                 url = scannedOrigin
                                 showManual = true

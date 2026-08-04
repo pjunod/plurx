@@ -153,7 +153,7 @@ private struct HomeDashboard: View {
 
     private var homeHeader: some View {
         HStack(alignment: .firstTextBaseline) {
-            Text("plurx")
+            Text("cinema")
                 .font(.system(size: 32, weight: .bold, design: .monospaced))
                 .foregroundColor(Palette.accent)
             Spacer()
@@ -248,7 +248,7 @@ private struct LibrariesDashboard: View {
                     ContentUnavailableView(
                         "Your library is empty",
                         systemImage: "rectangle.stack",
-                        description: Text("Add a library in the plurx web app, then pull to refresh.")
+                        description: Text("Add a library in the Cinema web app, then pull to refresh.")
                     )
                     .frame(maxWidth: .infinity)
                     .padding(.top, 80)

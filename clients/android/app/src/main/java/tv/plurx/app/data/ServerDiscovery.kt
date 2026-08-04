@@ -64,7 +64,7 @@ class ServerDiscovery(context: Context) {
                     nextResultId += 1
                     DiscoveredServer(
                         id = "${serviceKey(serviceInfo)}|$nextResultId",
-                        name = serviceInfo.serviceName.ifBlank { "plurx" },
+                        name = serviceInfo.serviceName.ifBlank { "Cinema" },
                         detail = serviceDetail(serviceInfo),
                         serviceKey = serviceKey(serviceInfo),
                         serviceInfo = serviceInfo,
@@ -116,7 +116,7 @@ class ServerDiscovery(context: Context) {
             synchronized(lock) { listener = null }
             updateState(
                 isSearching = false,
-                error = "Allow local-network access to find plurx servers automatically.",
+                error = "Allow local-network access to find Cinema servers automatically.",
             )
         } catch (_: RuntimeException) {
             synchronized(lock) { listener = null }
@@ -226,13 +226,13 @@ class ServerDiscovery(context: Context) {
         } else {
             null
         }
-        if (address != null) return address.hostAddress ?: "plurx server"
+        if (address != null) return address.hostAddress ?: "Cinema server"
 
         val instanceId = service.attributes["id"]
             ?.toString(Charsets.UTF_8)
             ?.trim()
             ?.takeIf { it.isNotEmpty() }
-        return instanceId?.let { "Server …${it.takeLast(6)}" } ?: "plurx server"
+        return instanceId?.let { "Server …${it.takeLast(6)}" } ?: "Cinema server"
     }
 }
 
