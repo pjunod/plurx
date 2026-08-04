@@ -1068,6 +1068,17 @@ pub fn copy_input_seek_args(start_seconds: f64) -> Vec<String> {
     ]
 }
 
+fn copy_audio_channels(source: &MediaFile, audio_index: Option<i64>) -> Option<i64> {
+    match audio_index {
+        Some(index) => source
+            .audio_streams
+            .iter()
+            .find(|stream| stream.index == index),
+        None => source.audio_streams.first(),
+    }
+    .and_then(|stream| stream.channels)
+}
+
 fn copy_input_args(
     source: &MediaFile,
     start_seconds: f64,
@@ -1184,12 +1195,25 @@ fn copy_input_args(
                 args.push(af);
             }
         }
-        // e.g. DTS/TrueHD → AAC. Keep the source channel layout (5.1 stays 5.1);
-        // a copy-video session implies a player that can take multichannel AAC.
+        // e.g. DTS/TrueHD → AAC. Six-channel disc audio is commonly tagged
+        // `5.1(side)`. ffmpeg's AAC encoder represents that layout with an
+        // in-band Program Config Element (channel_configuration=0), while its
+        // fragmented-MP4 sample entry still declares two channels. AVPlayer
+        // rejects that contradictory initialization record with CoreMedia
+        // -12848 before it opens the video. Standardize six-channel output on
+        // AAC's channel_configuration=6 layout; the rematrix only moves the
+        // surround pair from side to back labels and preserves 5.1 playback.
         args.push("-c:a".into());
         args.push("aac".into());
         args.push("-b:a".into());
-        args.push("256k".into());
+        if copy_audio_channels(source, audio_index) == Some(6) {
+            // Apple's HLS authoring recommendation for 5.1 AAC is 320 kbit/s.
+            args.push("320k".into());
+            args.push("-channel_layout:a".into());
+            args.push("5.1".into());
+        } else {
+            args.push("256k".into());
+        }
     } else {
         args.push("-c:a".into());
         args.push("copy".into());
@@ -1778,6 +1802,50 @@ mod tests {
         assert!(!joined.contains("libx264"));
         assert!(!joined.contains("scale="));
         assert!(!joined.contains("tonemap"));
+    }
+
+    #[test]
+    fn six_channel_copy_audio_uses_an_explicit_standard_aac_layout() {
+        let mut media = file(Some("dolby_vision"));
+        media.audio_streams = vec![
+            crate::domain::AudioStream {
+                index: 0,
+                codec: "ac3".into(),
+                channels: Some(2),
+                ..Default::default()
+            },
+            crate::domain::AudioStream {
+                index: 1,
+                codec: "dts".into(),
+                channels: Some(6),
+                ..Default::default()
+            },
+        ];
+
+        let surround = hls_copy_args(
+            &media,
+            0.0,
+            Some(1),
+            true,
+            Pacing::unpaced(),
+            true,
+            "/tmp/s",
+        )
+        .join(" ");
+        assert!(surround.contains("-c:a aac -b:a 320k -channel_layout:a 5.1"));
+
+        let stereo = hls_copy_args(
+            &media,
+            0.0,
+            Some(0),
+            true,
+            Pacing::unpaced(),
+            true,
+            "/tmp/s",
+        )
+        .join(" ");
+        assert!(stereo.contains("-c:a aac -b:a 256k"));
+        assert!(!stereo.contains("-channel_layout:a"));
     }
 
     /// The `hvc1` tag promises no in-band parameter sets, and a
