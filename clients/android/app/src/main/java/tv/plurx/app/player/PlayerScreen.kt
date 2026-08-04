@@ -17,6 +17,7 @@ import androidx.compose.foundation.focusable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
@@ -67,6 +68,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.semantics.contentDescription
@@ -95,6 +97,7 @@ import androidx.core.view.WindowInsetsControllerCompat
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import java.text.SimpleDateFormat
 import java.util.Locale
 import kotlin.math.roundToInt
 import tv.plurx.app.data.AudioTrack
@@ -125,6 +128,9 @@ import tv.plurx.app.ui.theme.Surface
 
 private data class Plan(
     val title: String,
+    val subtitle: String?,
+    val releaseDate: String?,
+    val overview: String?,
     override val durationMs: Long,
     override val fileId: Long,
     override val playUrl: String,
@@ -155,6 +161,9 @@ private suspend fun loadPlan(vm: AppViewModel, itemId: Long, fileId: Long): Plan
     }
     Plan(
         title = detail.item.title,
+        subtitle = playerSubtitle(detail.item),
+        releaseDate = playerDateLabel(detail.item.air_date, detail.item.year),
+        overview = detail.item.overview,
         durationMs = file?.duration_ms ?: detail.item.runtime_ms ?: 0L,
         fileId = fileId,
         playUrl = Session.url(decision.delivery?.url ?: decision.play_url),
@@ -187,6 +196,35 @@ private suspend fun loadPlan(vm: AppViewModel, itemId: Long, fileId: Long): Plan
     throw cancelled
 } catch (_: Exception) {
     null
+}
+
+internal fun playerSubtitle(item: tv.plurx.app.data.Item): String? = buildList {
+    item.show_title?.takeIf { it.isNotBlank() }?.let(::add)
+    if (item.season_number != null && item.episode_number != null) {
+        add("S${item.season_number}E${item.episode_number}")
+    }
+}.takeIf { it.isNotEmpty() }?.joinToString("   ·   ")
+
+internal fun playerDateLabel(airDate: String?, year: Int?): String? {
+    val raw = airDate?.trim().orEmpty()
+    if (raw.isNotEmpty()) {
+        val parsed = runCatching {
+            SimpleDateFormat("yyyy-MM-dd", Locale.US).apply { isLenient = false }
+                .parse(raw.take(10))
+        }.getOrNull()
+        if (parsed != null) {
+            return SimpleDateFormat("MMM d, yyyy", Locale.US).format(parsed)
+        }
+        return raw
+    }
+    return year?.toString()
+}
+
+internal fun playerRuntimeLabel(milliseconds: Long): String {
+    val totalMinutes = milliseconds / 60_000
+    val hours = totalMinutes / 60
+    val minutes = totalMinutes % 60
+    return if (hours > 0) "${hours}h ${minutes}m" else "${minutes}m"
 }
 
 private enum class PlayerPanel { Tracks, Settings, Info }
@@ -733,6 +771,10 @@ private fun PlayerContent(
         if (!isInPip && controlsVisible) {
             Controls(
                 title = plan.title,
+                subtitle = plan.subtitle,
+                releaseDate = plan.releaseDate,
+                runtimeLabel = plan.durationMs.takeIf { it > 0 }?.let(::playerRuntimeLabel),
+                overview = plan.overview,
                 positionMs = if (scrubbing) scrubPreview else positionMs,
                 durationMs = plan.durationMs,
                 isPlaying = isPlaying,
@@ -814,6 +856,10 @@ private fun PlayerContent(
 @Composable
 internal fun Controls(
     title: String,
+    subtitle: String? = null,
+    releaseDate: String? = null,
+    runtimeLabel: String? = null,
+    overview: String? = null,
     positionMs: Long,
     durationMs: Long,
     isPlaying: Boolean,
@@ -833,7 +879,7 @@ internal fun Controls(
 ) {
     val playFocusRequester = remember { FocusRequester() }
     RequestInitialFocus(playFocusRequester, enabled = requestInitialFocus)
-    Box(Modifier.fillMaxSize().background(Color(0x66000000))) {
+    Box(Modifier.fillMaxSize()) {
         Row(
             Modifier.align(Alignment.TopStart).fillMaxWidth().padding(12.dp),
             verticalAlignment = Alignment.CenterVertically,
@@ -841,14 +887,7 @@ internal fun Controls(
             TvIconButton(onClick = onBack) {
                 Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back", tint = Color.White)
             }
-            Text(
-                title,
-                color = Color.White,
-                style = MaterialTheme.typography.titleMedium,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.weight(1f),
-            )
+            Spacer(Modifier.weight(1f))
             TvIconButton(onClick = onTracks) {
                 Icon(Icons.Filled.ClosedCaption, contentDescription = "Audio and subtitles", tint = Color.White)
             }
@@ -865,71 +904,208 @@ internal fun Controls(
             }
         }
 
-        Row(
-            Modifier.align(Alignment.Center),
-            horizontalArrangement = Arrangement.spacedBy(28.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            TvIconButton(onClick = onSeekBack, modifier = Modifier.size(56.dp)) {
-                Icon(Icons.Filled.Replay10, contentDescription = "Back 10 seconds", tint = Color.White, modifier = Modifier.size(42.dp))
-            }
-            TvIconButton(
-                onClick = onPlayPause,
-                modifier = Modifier.size(76.dp).focusRequester(playFocusRequester),
-            ) {
-                Icon(
-                    if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
-                    contentDescription = if (isPlaying) "Pause" else "Play",
-                    tint = Color.White,
-                    modifier = Modifier.size(62.dp),
+        Column(
+            Modifier
+                .align(Alignment.BottomCenter)
+                .fillMaxWidth()
+                .background(
+                    Brush.verticalGradient(
+                        listOf(Color.Transparent, Color.Black.copy(alpha = 0.9f)),
+                    ),
                 )
-            }
-            TvIconButton(onClick = onSeekForward, modifier = Modifier.size(56.dp)) {
-                Icon(Icons.Filled.Forward10, contentDescription = "Forward 10 seconds", tint = Color.White, modifier = Modifier.size(42.dp))
-            }
-        }
-
-        Column(Modifier.align(Alignment.BottomCenter).fillMaxWidth().padding(horizontal = 28.dp, vertical = 22.dp)) {
+                .padding(start = 28.dp, top = 72.dp, end = 28.dp, bottom = 22.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Text(
+                playerHeading(title, subtitle),
+                color = Color.White,
+                style = MaterialTheme.typography.headlineSmall,
+                fontWeight = FontWeight.Bold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
             if (mediaFacts.isNotEmpty()) {
                 Row(
                     horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    modifier = Modifier.padding(bottom = 5.dp),
                 ) {
                     mediaFacts.forEach { fact -> MediaFactChip(fact) }
                 }
             }
-            val range = if (durationMs > 0) durationMs.toFloat() else 1f
-            Slider(
-                value = positionMs.coerceIn(0, durationMs.coerceAtLeast(0)).toFloat(),
-                onValueChange = { onScrubStart(); onScrub(it.toLong()) },
-                onValueChangeFinished = onScrubEnd,
-                valueRange = 0f..range,
-                modifier = Modifier
-                    .semantics { contentDescription = "Playback position" }
-                    .onPreviewKeyEvent { event ->
-                        val vertical = event.nativeKeyEvent.keyCode == KeyEvent.KEYCODE_DPAD_UP ||
-                            event.nativeKeyEvent.keyCode == KeyEvent.KEYCODE_DPAD_DOWN
-                        if (vertical) {
-                            if (event.nativeKeyEvent.action == KeyEvent.ACTION_DOWN) {
-                                playFocusRequester.requestFocus()
-                            }
-                            true
-                        } else {
-                            false
+
+            playerContextLine(releaseDate, runtimeLabel)?.let { context ->
+                Text(
+                    context,
+                    color = Color.White.copy(alpha = 0.74f),
+                    style = MaterialTheme.typography.bodyMedium,
+                    maxLines = 1,
+                )
+            }
+
+            overview?.trim()?.takeIf { it.isNotEmpty() }?.let { summary ->
+                Text(
+                    summary,
+                    color = Color.White.copy(alpha = 0.88f),
+                    style = MaterialTheme.typography.bodyMedium,
+                    maxLines = 3,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.widthIn(max = 980.dp),
+                )
+            }
+
+            BoxWithConstraints(Modifier.fillMaxWidth().padding(top = 4.dp)) {
+                if (maxWidth >= 700.dp) {
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        TransportButtons(
+                            isPlaying = isPlaying,
+                            playFocusRequester = playFocusRequester,
+                            onPlayPause = onPlayPause,
+                            onSeekBack = onSeekBack,
+                            onSeekForward = onSeekForward,
+                        )
+                        PlaybackTime(positionMs)
+                        PlaybackPositionSlider(
+                            positionMs = positionMs,
+                            durationMs = durationMs,
+                            playFocusRequester = playFocusRequester,
+                            onScrubStart = onScrubStart,
+                            onScrub = onScrub,
+                            onScrubEnd = onScrubEnd,
+                            modifier = Modifier.weight(1f),
+                        )
+                        PlaybackTime(durationMs)
+                    }
+                } else {
+                    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
+                            TransportButtons(
+                                isPlaying = isPlaying,
+                                playFocusRequester = playFocusRequester,
+                                onPlayPause = onPlayPause,
+                                onSeekBack = onSeekBack,
+                                onSeekForward = onSeekForward,
+                            )
                         }
-                    },
-                colors = SliderDefaults.colors(
-                    thumbColor = Accent,
-                    activeTrackColor = Accent,
-                    inactiveTrackColor = Color(0x55FFFFFF),
-                ),
-            )
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                Text(formatTime(positionMs), color = Color.White, style = MaterialTheme.typography.labelMedium)
-                Text(formatTime(durationMs), color = Color.White, style = MaterialTheme.typography.labelMedium)
+                        PlaybackPositionSlider(
+                            positionMs = positionMs,
+                            durationMs = durationMs,
+                            playFocusRequester = playFocusRequester,
+                            onScrubStart = onScrubStart,
+                            onScrub = onScrub,
+                            onScrubEnd = onScrubEnd,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            PlaybackTime(positionMs)
+                            PlaybackTime(durationMs)
+                        }
+                    }
+                }
             }
         }
     }
+}
+
+internal fun playerHeading(title: String, subtitle: String?): String =
+    listOfNotNull(subtitle?.trim()?.takeIf { it.isNotEmpty() }, title.trim())
+        .joinToString("   ·   ")
+
+internal fun playerContextLine(releaseDate: String?, runtimeLabel: String?): String? =
+    listOfNotNull(
+        releaseDate?.trim()?.takeIf { it.isNotEmpty() },
+        runtimeLabel?.trim()?.takeIf { it.isNotEmpty() },
+    ).takeIf { it.isNotEmpty() }?.joinToString("   ·   ")
+
+@Composable
+private fun TransportButtons(
+    isPlaying: Boolean,
+    playFocusRequester: FocusRequester,
+    onPlayPause: () -> Unit,
+    onSeekBack: () -> Unit,
+    onSeekForward: () -> Unit,
+) {
+    Row(
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        TvIconButton(onClick = onSeekBack, modifier = Modifier.size(48.dp)) {
+            Icon(
+                Icons.Filled.Replay10,
+                contentDescription = "Back 10 seconds",
+                tint = Color.White,
+                modifier = Modifier.size(34.dp),
+            )
+        }
+        TvIconButton(
+            onClick = onPlayPause,
+            modifier = Modifier.size(56.dp).focusRequester(playFocusRequester),
+        ) {
+            Icon(
+                if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+                contentDescription = if (isPlaying) "Pause" else "Play",
+                tint = Color.White,
+                modifier = Modifier.size(42.dp),
+            )
+        }
+        TvIconButton(onClick = onSeekForward, modifier = Modifier.size(48.dp)) {
+            Icon(
+                Icons.Filled.Forward10,
+                contentDescription = "Forward 10 seconds",
+                tint = Color.White,
+                modifier = Modifier.size(34.dp),
+            )
+        }
+    }
+}
+
+@Composable
+private fun PlaybackPositionSlider(
+    positionMs: Long,
+    durationMs: Long,
+    playFocusRequester: FocusRequester,
+    onScrubStart: () -> Unit,
+    onScrub: (Long) -> Unit,
+    onScrubEnd: () -> Unit,
+    modifier: Modifier,
+) {
+    val range = if (durationMs > 0) durationMs.toFloat() else 1f
+    Slider(
+        value = positionMs.coerceIn(0, durationMs.coerceAtLeast(0)).toFloat(),
+        onValueChange = { onScrubStart(); onScrub(it.toLong()) },
+        onValueChangeFinished = onScrubEnd,
+        valueRange = 0f..range,
+        modifier = modifier
+            .semantics { contentDescription = "Playback position" }
+            .onPreviewKeyEvent { event ->
+                val vertical = event.nativeKeyEvent.keyCode == KeyEvent.KEYCODE_DPAD_UP ||
+                    event.nativeKeyEvent.keyCode == KeyEvent.KEYCODE_DPAD_DOWN
+                if (vertical) {
+                    if (event.nativeKeyEvent.action == KeyEvent.ACTION_DOWN) {
+                        playFocusRequester.requestFocus()
+                    }
+                    true
+                } else {
+                    false
+                }
+            },
+        colors = SliderDefaults.colors(
+            thumbColor = Accent,
+            activeTrackColor = Accent,
+            inactiveTrackColor = Color(0x55FFFFFF),
+        ),
+    )
+}
+
+@Composable
+private fun PlaybackTime(milliseconds: Long) {
+    Text(
+        formatTime(milliseconds),
+        color = Color.White,
+        style = MaterialTheme.typography.labelMedium,
+    )
 }
 
 @Composable
