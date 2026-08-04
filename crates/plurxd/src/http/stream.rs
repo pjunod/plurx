@@ -112,6 +112,10 @@ fn content_type(path: &Path) -> &'static str {
 /// short names.
 #[derive(Deserialize, Default, Clone)]
 pub struct Caps {
+    /// Client family and device label, used only to correlate capability and
+    /// delivery diagnostics. They never influence the playback decision.
+    pub client: Option<String>,
+    pub device: Option<String>,
     /// Named fallback profile when no caps are reported (e.g. `web-h264`).
     pub profile: Option<String>,
     /// Video codecs the browser can decode, e.g. `h264,hevc,av1`.
@@ -133,6 +137,9 @@ pub struct Caps {
     /// e.g. `5,8`. When present this is authoritative over the legacy `dv`
     /// all-or-nothing bit.
     pub dvprofile: Option<String>,
+    /// `1` when supported DV profiles need a normalized copy-video HLS
+    /// envelope instead of raw progressive direct play.
+    pub dvhls: Option<u8>,
     /// Manual override: `auto` (default) | `original` | `transcode`.
     pub force: Option<String>,
 }
@@ -194,6 +201,7 @@ impl Caps {
                 .into_iter()
                 .filter_map(|value| value.parse::<u8>().ok())
                 .collect();
+            profile.remux_dolby_vision = self.dvhls == Some(1);
             profile
         } else {
             self.profile
@@ -612,7 +620,7 @@ async fn probe_chapters(path: &Path) -> Option<Vec<serde_json::Value>> {
 /// container=…&hdr=…&force=…` (runtime browser capabilities + quality override);
 /// native clients still pass `?profile=`.
 pub async fn decision(
-    _user: AuthUser,
+    AuthUser(user): AuthUser,
     State(state): State<AppState>,
     AxPath(id): AxPath<i64>,
     Query(q): Query<Caps>,
@@ -635,6 +643,29 @@ pub async fn decision(
         ));
     }
     let decision = q.decide(&file, dv_strippable(&state));
+
+    tracing::info!(
+        user_id = user.id,
+        username = %user.username,
+        file_id = id,
+        client = q.client.as_deref().unwrap_or("unknown"),
+        device = q.device.as_deref().unwrap_or("unknown"),
+        vcodec = q.vcodec.as_deref().unwrap_or(""),
+        acodec = q.acodec.as_deref().unwrap_or(""),
+        container = q.container.as_deref().unwrap_or(""),
+        hdr = q.hdr.unwrap_or_default(),
+        dv = q.dv.unwrap_or_default(),
+        dvprofile = q.dvprofile.as_deref().unwrap_or(""),
+        dvhls = q.dvhls.unwrap_or_default(),
+        force = q.force.as_deref().unwrap_or("auto"),
+        source_hdr = file.hdr.as_deref().unwrap_or("sdr"),
+        source_hdr_format = file.hdr_format.as_deref().unwrap_or(""),
+        method = ?decision.method,
+        delivered_dynamic_range = decision.delivered_dynamic_range,
+        preserve_dolby_vision = decision.preserve_dolby_vision,
+        reasons = ?decision.reasons,
+        "playback capability decision"
+    );
 
     let play_url = match decision.method {
         playback::PlaybackMethod::DirectPlay => format!("/api/v1/files/{id}/direct"),
@@ -878,6 +909,8 @@ pub struct StreamQuery {
     pub audio: Option<i64>,
     // Same runtime-caps fields as `/decision`, so the remux copies the audio
     // when the browser can play it (vs. re-encoding to AAC needlessly).
+    pub client: Option<String>,
+    pub device: Option<String>,
     pub profile: Option<String>,
     pub vcodec: Option<String>,
     pub acodec: Option<String>,
@@ -889,6 +922,7 @@ pub struct StreamQuery {
     /// it is exactly one that has not been taught to ask.
     pub dv: Option<u8>,
     pub dvprofile: Option<String>,
+    pub dvhls: Option<u8>,
     pub force: Option<String>,
     /// The player's own stream id, so it can ask `/stream/:id/status` how this
     /// remux is doing. Optional: an old client, curl, or an AirPlay target
@@ -923,6 +957,8 @@ fn remux_audio_index(
 impl StreamQuery {
     fn caps(&self) -> Caps {
         Caps {
+            client: self.client.clone(),
+            device: self.device.clone(),
             profile: self.profile.clone(),
             vcodec: self.vcodec.clone(),
             acodec: self.acodec.clone(),
@@ -931,6 +967,7 @@ impl StreamQuery {
             hdr: self.hdr,
             dv: self.dv,
             dvprofile: self.dvprofile.clone(),
+            dvhls: self.dvhls,
             force: self.force.clone(),
         }
     }
@@ -1445,12 +1482,14 @@ mod tests {
             // new profile list. A new server must prefer the specific list.
             dv: Some(1),
             dvprofile: Some("5,8".into()),
+            dvhls: Some(1),
             ..Default::default()
         };
 
         let profile = caps.profile();
         assert!(!profile.supports_dolby_vision);
         assert_eq!(profile.dolby_vision_profiles, vec![5, 8]);
+        assert!(profile.remux_dolby_vision);
     }
 
     /// ffmpeg's `-progress` shares stderr with its diagnostics here, because

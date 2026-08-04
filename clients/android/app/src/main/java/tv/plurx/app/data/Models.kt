@@ -279,6 +279,8 @@ data class Decision(
     val source: SourceSummary? = null,
     val reasons: List<String> = emptyList(),
     val transcode_audio: Boolean = false,
+    /** The source DV metadata survives this decision, including direct play. */
+    val preserve_dolby_vision: Boolean = false,
     val audio: List<AudioTrack> = emptyList(),
     val subtitles: List<SubTrack> = emptyList(),
     val markers: List<Marker> = emptyList(),

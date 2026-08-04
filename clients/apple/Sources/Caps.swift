@@ -1,6 +1,8 @@
 import AVFoundation
 import CoreMedia
 import Foundation
+import os
+import UIKit
 import VideoToolbox
 
 /// Runtime playback capabilities for this Apple device, sent to `/decision` so
@@ -9,15 +11,22 @@ import VideoToolbox
 /// MKV/TS), plays AAC/AC3/E-AC3 (never DTS/TrueHD), and HEVC/AV1 ride hardware
 /// decode where present — so MKV or DTS files come back as HLS instead.
 enum Caps {
+    private static let logger = Logger(subsystem: "tv.plurx.app", category: "capabilities")
+
     static func query() -> [URLQueryItem] {
         let hevc = VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC)
         let av1 = VTIsHardwareDecodeSupported(kCMVideoCodecType_AV1)
-        return query(
+        var result = query(
             hevc: hevc,
             av1: av1,
             displayHDR: displayIsHDR,
             dolbyVision: dolbyVisionIsAvailable
         )
+        result.append(URLQueryItem(name: "client", value: "apple"))
+        result.append(URLQueryItem(name: "device", value: UIDevice.current.model))
+        let snapshot = result.map { "\($0.name)=\($0.value ?? "")" }.joined(separator: " ")
+        logger.info("runtime playback capabilities: \(snapshot, privacy: .public)")
+        return result
     }
 
     /// Pure spelling of the wire capabilities. Keeping AVFoundation outside
@@ -57,6 +66,12 @@ enum Caps {
                 name: "dvprofile",
                 value: supportsDolbyVision ? "5,8" : ""
             ),
+            // AVPlayer's decoder accepts P5/P8 but raw progressive MP4 is not
+            // a reliable DV delivery envelope: it can advance with audio and
+            // report Dolby Vision while rendering black. Ask the server for a
+            // copy-video HLS remux whenever it preserves DV. No samples are
+            // re-encoded; the signaling/transport alone is normalized.
+            URLQueryItem(name: "dvhls", value: "1"),
         ]
     }
 

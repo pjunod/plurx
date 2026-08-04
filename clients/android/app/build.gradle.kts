@@ -19,6 +19,12 @@ android {
     }
 
     buildTypes {
+        create("capabilityProbe") {
+            initWith(getByName("debug"))
+            applicationIdSuffix = ".capabilityprobe"
+            versionNameSuffix = "-capability-probe"
+            matchingFallbacks += listOf("debug")
+        }
         release {
             // `material-icons-extended` alone is several thousand vector assets
             // of which this app draws about twenty, and every library it pulls

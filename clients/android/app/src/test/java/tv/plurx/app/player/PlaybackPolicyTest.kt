@@ -28,25 +28,29 @@ class PlaybackPolicyTest {
         assertEquals("transcode", decisionForce(PlaybackQuality.Q360))
     }
 
-    // ---- §4.2 the one-shot rescue ------------------------------------------
+    // ---- §4.2 the fidelity-preserving rescue ladder ------------------------
 
     @Test
-    fun oneCompatibilityRescuePerItemAndOnlyFromACheaperMode() {
+    fun dolbyVisionDirectPlayGetsAContainerRescueBeforeTheSdrLastResort() {
         assertEquals(
-            PlaybackErrorAction.RetryAsCompatibilityTranscode,
-            playbackErrorAction("direct", rescueAlreadyUsed = false),
+            PlaybackErrorAction.RetryAsDolbyVisionRemux,
+            playbackErrorAction("direct", true, false, false),
         )
         assertEquals(
             PlaybackErrorAction.RetryAsCompatibilityTranscode,
-            playbackErrorAction("remux", rescueAlreadyUsed = false),
+            playbackErrorAction("remux", true, true, false),
         )
-        // Second failure: no rescue left.
-        assertEquals(PlaybackErrorAction.Fail, playbackErrorAction("direct", true))
-        assertEquals(PlaybackErrorAction.Fail, playbackErrorAction("remux", true))
+        assertEquals(
+            PlaybackErrorAction.RetryAsCompatibilityTranscode,
+            playbackErrorAction("direct", false, false, false),
+        )
+        // Once the compatibility transcode has been tried there is no lower
+        // fidelity mode left, and retrying it would loop.
+        assertEquals(PlaybackErrorAction.Fail, playbackErrorAction("remux", true, true, true))
         // A transcode that fails has nothing cheaper to fall back to; retrying
         // it would loop.
-        assertEquals(PlaybackErrorAction.Fail, playbackErrorAction("transcode", false))
-        assertEquals(PlaybackErrorAction.Fail, playbackErrorAction("transcode", true))
+        assertEquals(PlaybackErrorAction.Fail, playbackErrorAction("transcode", true, false, false))
+        assertEquals(PlaybackErrorAction.Fail, playbackErrorAction("transcode", false, true, true))
     }
 
     // ---- §5.6 the menu is the server's ladder ------------------------------
