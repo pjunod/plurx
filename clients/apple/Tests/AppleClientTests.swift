@@ -628,6 +628,58 @@ final class AppleClientTests: XCTestCase {
     }
 
     @MainActor
+    func testHDRSubtitleGuardKeepsTheCurrentPictureForBurnOnlyTracks() {
+        let tracks = [
+            SubtitleTrack(
+                index: 0, codec: "hdmv_pgs_subtitle", language: "eng", title: "English",
+                default: false, forced: false, text: false
+            ),
+            SubtitleTrack(
+                index: 1, codec: "ass", language: "jpn", title: "Signs",
+                default: false, forced: false, text: true
+            ),
+            SubtitleTrack(
+                index: 2, codec: "subrip", language: "eng", title: "English text",
+                default: false, forced: false, text: true
+            ),
+        ]
+
+        for range in ["dolby_vision", "hdr10", "hlg"] {
+            XCTAssertTrue(PlayerController.subtitleBurnWouldDiscardHDR(
+                0, tracks: tracks, deliveredRange: range
+            ))
+            XCTAssertTrue(PlayerController.subtitleBurnWouldDiscardHDR(
+                1, tracks: tracks, deliveredRange: range
+            ))
+            XCTAssertFalse(PlayerController.subtitleBurnWouldDiscardHDR(
+                2, tracks: tracks, deliveredRange: range
+            ))
+        }
+        XCTAssertFalse(PlayerController.subtitleBurnWouldDiscardHDR(
+            0, tracks: tracks, deliveredRange: "sdr"
+        ))
+        XCTAssertFalse(PlayerController.subtitleBurnWouldDiscardHDR(
+            nil, tracks: tracks, deliveredRange: "hdr10"
+        ))
+    }
+
+    @MainActor
+    func testEstablishedHDRRecoveryNeverChoosesTheSDRFallback() {
+        XCTAssertTrue(PlayerController.shouldPreserveEstablishedHDRDelivery(
+            deliveredRange: "hdr10", establishedPlayback: true
+        ))
+        XCTAssertTrue(PlayerController.shouldPreserveEstablishedHDRDelivery(
+            deliveredRange: "dolby_vision", establishedPlayback: true
+        ))
+        XCTAssertFalse(PlayerController.shouldPreserveEstablishedHDRDelivery(
+            deliveredRange: "hdr10", establishedPlayback: false
+        ))
+        XCTAssertFalse(PlayerController.shouldPreserveEstablishedHDRDelivery(
+            deliveredRange: "sdr", establishedPlayback: true
+        ))
+    }
+
+    @MainActor
     func testNativeClassificationComesFromTheServerWithACodecFallback() throws {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase

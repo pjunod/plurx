@@ -248,6 +248,12 @@ final class PlayerController: ObservableObject {
     private var canRetryCurrentItemWithTranscode = false
     private var compatibilityFallbackAttempted = false
     private var forceCompatibilityTranscode = false
+    /// Once real playback has begun, a transport interruption is not evidence
+    /// that the device rejected HDR. Rebuild the same delivery once instead of
+    /// silently replacing a picture the viewer has already watched with SDR.
+    private var establishedPlayback = false
+    private var establishedHDRRetryAttempted = false
+    private var attachedAtPositionMs = 0
     /// A burn is part of the current video frames. Leaving one requires one
     /// reopen; native-to-native and native-to-Off never do.
     private var activeBurnedSubtitle: Int?
@@ -358,6 +364,9 @@ final class PlayerController: ObservableObject {
         canRetryCurrentItemWithTranscode = false
         compatibilityFallbackAttempted = false
         forceCompatibilityTranscode = false
+        establishedPlayback = false
+        establishedHDRRetryAttempted = false
+        attachedAtPositionMs = max(0, startMs)
 
         #if os(iOS)
         // iOS needs an explicit playback audio session for silent-switch and
@@ -452,6 +461,15 @@ final class PlayerController: ObservableObject {
 
     func selectSubtitle(_ index: Int?) {
         guard index != selectedSubtitle else { return }
+        if Self.subtitleBurnWouldDiscardHDR(
+            index,
+            tracks: subtitles,
+            deliveredRange: deliveredRange
+        ) {
+            playbackError = Self.hdrSubtitleNotice
+            return
+        }
+        playbackError = nil
         selectedSubtitle = index
         let route = Self.subtitleSelectionRoute(
             for: index,
@@ -560,9 +578,18 @@ final class PlayerController: ObservableObject {
             // it is honored before the server's pick is even looked at. It is
             // the viewer's instruction rather than a second copy of the
             // selection rule, which lives on the server alone.
-            selectedSubtitle = model.subLang == "off"
+            let automaticSubtitle = model.subLang == "off"
                 ? nil
                 : Self.automaticSubtitleIndex(decision.subtitles ?? [])
+            // A forced bitmap track may be the server's automatic pick, but a
+            // cold-start preference still must not trade an HDR plan for an
+            // SDR burn without the viewer asking. Manual selection is guarded
+            // by the same predicate in `selectSubtitle`.
+            selectedSubtitle = Self.subtitleBurnWouldDiscardHDR(
+                automaticSubtitle,
+                tracks: decision.subtitles ?? [],
+                deliveredRange: decision.deliveredDynamicRange
+            ) ? nil : automaticSubtitle
             // Use the same drain as later replacements. A remote command can
             // arrive while the decision request or first item is preparing;
             // opening directly here left that command stranded in the reopen
@@ -857,6 +884,7 @@ final class PlayerController: ObservableObject {
         }
         isPlaying = resumesPlayback
         currentMs = startMs
+        attachedAtPositionMs = startMs
         stallDetector.reset()
         failed = false
         isChangingStream = false
@@ -959,6 +987,7 @@ final class PlayerController: ObservableObject {
                     self.isPlaying = true
                 case .reopen:
                     self.currentMs = position
+                    if await self.retryEstablishedHDRDelivery(at: position) { continue }
                     if await self.retryWithNextCompatibilityFallback(at: position) { continue }
                     await self.reopen(at: position)
                 }
@@ -997,6 +1026,13 @@ final class PlayerController: ObservableObject {
                 // transport reports while paused (P2-5).
                 if self.player.timeControlStatus == .playing && self.player.rate > 0 {
                     self.preferredRate = self.player.rate
+                    if self.realPositionMs() >= self.attachedAtPositionMs + 5_000 {
+                        self.establishedPlayback = true
+                        // The most recent same-delivery recovery proved itself.
+                        // A later, independent interruption may reconnect once
+                        // too; an immediate repeated failure remains terminal.
+                        self.establishedHDRRetryAttempted = false
+                    }
                 }
                 self.updateNowPlaying()
                 if self.isPlaying && self.currentMs - self.lastReportedMs >= 10_000 {
@@ -1054,6 +1090,7 @@ final class PlayerController: ObservableObject {
                     // intent survives in `wantsPlayback`, so a viewer who was
                     // paused when the item failed stays paused.
                     let position = Self.compatibilityRetryPositionMs(lastObservedMs: self.currentMs)
+                    if await self.retryEstablishedHDRDelivery(at: position) { return }
                     if await self.retryWithNextCompatibilityFallback(at: position) { return }
                 }
                 self.player.pause()
@@ -1156,6 +1193,57 @@ final class PlayerController: ObservableObject {
     static func hasCompatibleDolbyVisionBase(_ hdrFormat: String?) -> Bool {
         let format = hdrFormat?.lowercased() ?? ""
         return format.contains("hdr10-compatible") || format.contains("hlg-compatible")
+    }
+
+    static let hdrSubtitleNotice =
+        "That subtitle requires an SDR burn-in. HDR playback was kept unchanged."
+
+    static func isHDRDelivery(_ deliveredRange: String?) -> Bool {
+        guard let range = deliveredRange?.lowercased() else { return false }
+        return ["dolby_vision", "hdr10", "hlg"].contains(range)
+    }
+
+    /// Bitmap and styled subtitles can only be drawn by the server's H.264
+    /// SDR pipeline today. Refuse that one selection while HDR is on the wire;
+    /// native text and an already-SDR delivery remain selectable as before.
+    static func subtitleBurnWouldDiscardHDR(
+        _ index: Int?,
+        tracks: [SubtitleTrack],
+        deliveredRange: String?
+    ) -> Bool {
+        guard let index, isHDRDelivery(deliveredRange) else { return false }
+        return subtitleRequiresBurn(index, in: tracks)
+    }
+
+    static func shouldPreserveEstablishedHDRDelivery(
+        deliveredRange: String?,
+        establishedPlayback: Bool
+    ) -> Bool {
+        establishedPlayback && isHDRDelivery(deliveredRange)
+    }
+
+    /// A stream that has already rendered real HDR did not fail capability
+    /// negotiation. Reconnect the same recipe once; if it immediately fails
+    /// again, stop visibly instead of hiding the transport fault behind SDR.
+    private func retryEstablishedHDRDelivery(at position: Int) async -> Bool {
+        guard Self.shouldPreserveEstablishedHDRDelivery(
+            deliveredRange: deliveredRange,
+            establishedPlayback: establishedPlayback
+        ) else { return false }
+        guard !establishedHDRRetryAttempted else {
+            player.pause()
+            isPlaying = false
+            wantsPlayback = false
+            isChangingStream = false
+            failed = true
+            playbackError =
+                "The HDR stream stopped responding. Playback was stopped instead of switching to SDR."
+            return true
+        }
+        establishedHDRRetryAttempted = true
+        isChangingStream = false
+        await reopen(at: position)
+        return true
     }
 
     /// Advance through the least-destructive recovery ladder. A compatible

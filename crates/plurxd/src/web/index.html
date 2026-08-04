@@ -6643,7 +6643,14 @@ async function setSub(index){
   // transcode, and a new one, because the burn is baked in. Everything else
   // here is the text path, which stays local and free.
   const want=(me.subs||[]).find(x=>x.index===index);
-  if(index>=0 && subNeedsBurn(want)) return burnSub(index);
+  const burnAction=PlaybackPolicy.subtitleBurnAction({
+    requiresBurn:index>=0&&subNeedsBurn(want), deliveredRange:me.deliveredRange
+  });
+  if(burnAction==="keep_hdr"){
+    toast("That subtitle requires an SDR burn-in. HDR playback was kept unchanged.");
+    return false;
+  }
+  if(burnAction==="burn"){ await burnSub(index); return true; }
   if(me.burnedSub!=null){
     // Leaving a burned track behind: the picture still has it drawn on, so
     // "off" also has to be a restart.
@@ -6748,12 +6755,13 @@ async function burnSub(index){
   toast("Subtitles: "+subLabelFor(s,index));
 }
 // Cycle Off → each track → Off (the 'c' hotkey and the CC button's long game).
-function cycleSub(){
+async function cycleSub(){
   if(!PLAYER||!PLAYER.subs||!PLAYER.subs.length) return;
   const idxs=PLAYER.subs.map(s=>s.index);
   const at=idxs.indexOf(PLAYER.curSub);
   const next=at<0?idxs[0]:(at+1>=idxs.length?-1:idxs[at+1]);
-  setSub(next);
+  const changed=await setSub(next);
+  if(changed===false) return;
   const s=PLAYER.subs.find(x=>x.index===next);
   toast("Subtitles: "+(next<0?"off":subLabelFor(s,next)));
 }

@@ -47,6 +47,19 @@ internal enum class SubtitleDelivery {
  */
 internal data class SubtitleRoute(val delivery: SubtitleDelivery, val reopen: Boolean)
 
+internal const val HDR_SUBTITLE_NOTICE =
+    "That subtitle requires an SDR burn-in. HDR playback was kept unchanged."
+
+/**
+ * The server's bitmap/styled burn pipeline is H.264 SDR. A selection must not
+ * silently replace HDR already on the wire; native text and SDR playback keep
+ * their existing routes.
+ */
+internal fun subtitleBurnWouldDiscardHdr(track: SubTrack?, deliveredRange: String?): Boolean =
+    track != null &&
+        !track.isNativeHls &&
+        deliveredRange?.lowercase(Locale.ROOT) in setOf("dolby_vision", "hdr10", "hlg")
+
 /**
  * Route one selection. [planMode] is the *effective* delivery the plan would
  * use with no subtitle at all — "direct", "remux" or "transcode" — and

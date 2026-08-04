@@ -87,6 +87,15 @@
       : "fail";
   }
 
+  function subtitleBurnAction({ requiresBurn, deliveredRange = null }) {
+    if (!requiresBurn) return "native";
+    return ["dolby_vision", "hdr10", "hlg"].includes(
+      String(deliveredRange || "").toLowerCase(),
+    )
+      ? "keep_hdr"
+      : "burn";
+  }
+
   function seekDeltaSeconds(key) {
     switch (key) {
       case "ArrowLeft":
@@ -139,6 +148,7 @@
     hlsTransport,
     initialRoute,
     fallbackAction,
+    subtitleBurnAction,
     seekDeltaSeconds,
     lostFrameRate,
     decodeMarginVerdict,

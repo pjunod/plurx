@@ -134,12 +134,23 @@ class Controller(
      * our own — re-deriving is how a client ends up behaving as subtitle mode
      * `Always` against a server configured for `Auto`.
      */
-    var selectedSubtitle: Long? = when {
-        retainedSubtitle == null -> autoSubtitleSelection(plan.subtitles)
-        // "Off" is a choice; only a track that vanished falls back to policy.
-        retainedSubtitle.index == null -> null
-        else -> retainedSubtitle.index.takeIf { index -> plan.subtitles.any { it.index == index } }
+    var selectedSubtitle: Long? = run {
+        val selected = when {
+            retainedSubtitle == null -> autoSubtitleSelection(plan.subtitles)
+            // "Off" is a choice; only a track that vanished falls back to policy.
+            retainedSubtitle.index == null -> null
+            else -> retainedSubtitle.index.takeIf { index ->
+                plan.subtitles.any { it.index == index }
+            }
+        }
+        val track = plan.subtitles.firstOrNull { it.index == selected }
+        selected.takeUnless {
+            subtitleBurnWouldDiscardHdr(track, plan.deliveredDynamicRange)
+        }
     }
+        private set
+
+    var playbackNotice: String? by mutableStateOf(null)
         private set
 
     /** A direct DV failure may use one lossless remux before the final rescue. */
@@ -153,6 +164,12 @@ class Controller(
 
     /** Set by the rescue: this playback must re-encode, whatever the plan said. */
     private var forceCompatibilityTranscode = false
+
+    /** Once a real frame rendered, a later fault is transport, not capability. */
+    private var establishedPlayback = false
+
+    /** One reconnect of the exact HDR recipe; a repeated failure is visible. */
+    private var sameHdrRetryUsed = false
 
     /**
      * The delivery this plan would use with no subtitle in play. A manual A/V
@@ -243,6 +260,9 @@ class Controller(
                 preservesDolbyVision = plan.preserveDolbyVision,
                 remuxRescueAlreadyUsed = compatibilityRemuxUsed,
                 transcodeRescueAlreadyUsed = compatibilityTranscodeUsed,
+                deliveredRange = deliveredRange,
+                establishedPlayback = establishedPlayback,
+                sameHdrRetryAlreadyUsed = sameHdrRetryUsed,
             )
             Log.w(
                 "plurx-playback",
@@ -252,6 +272,11 @@ class Controller(
                 error,
             )
             when (action) {
+                PlaybackErrorAction.RetrySameHDRDelivery -> {
+                    val position = realPosition()
+                    sameHdrRetryUsed = true
+                    restartAt(position)
+                }
                 PlaybackErrorAction.RetryAsDolbyVisionRemux -> {
                     val position = realPosition()
                     compatibilityRemuxUsed = true
@@ -277,6 +302,10 @@ class Controller(
                     error.errorCodeName.let { "Playback stopped ($it)." },
                 )
             }
+        }
+
+        override fun onRenderedFirstFrame() {
+            establishedPlayback = true
         }
 
         override fun onTracksChanged(tracks: Tracks) = applyTextSelection()
@@ -339,11 +368,16 @@ class Controller(
      * burn — so an SRT on a 4K HDR remux paid for a full re-encode to show a
      * track the server can hand over as a WebVTT rendition for free.
      */
-    fun switchSubtitle(index: Long?) {
+    fun switchSubtitle(index: Long?): Boolean {
         val track = index?.let(::trackFor)
         // An index the decision never listed cannot be routed, and guessing
         // here means guessing "burn". Ignore it instead.
-        if (index != null && track == null) return
+        if (index != null && track == null) return false
+        if (subtitleBurnWouldDiscardHdr(track, deliveredRange)) {
+            playbackNotice = HDR_SUBTITLE_NOTICE
+            return false
+        }
+        playbackNotice = null
         // Read the position before the state moves: which timeline the player
         // is on depends on the delivery about to change.
         val position = realPosition()
@@ -359,6 +393,11 @@ class Controller(
             armTextSelection()
             applyTextSelection()
         }
+        return true
+    }
+
+    fun clearPlaybackNotice() {
+        playbackNotice = null
     }
 
     /** Apply an A/V correction to this controller only and reopen in place. */

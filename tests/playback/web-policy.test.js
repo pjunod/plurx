@@ -144,6 +144,27 @@ test("a rejected cheap stream gets one compatibility transcode", () => {
   );
 });
 
+test("HDR subtitle burns keep the current delivery instead", () => {
+  for (const deliveredRange of ["dolby_vision", "hdr10", "hlg"]) {
+    assert.equal(
+      policy.subtitleBurnAction({ requiresBurn: true, deliveredRange }),
+      "keep_hdr",
+    );
+  }
+  assert.equal(
+    policy.subtitleBurnAction({ requiresBurn: true, deliveredRange: "sdr" }),
+    "burn",
+  );
+  assert.equal(
+    policy.subtitleBurnAction({ requiresBurn: true, deliveredRange: null }),
+    "burn",
+  );
+  assert.equal(
+    policy.subtitleBurnAction({ requiresBurn: false, deliveredRange: "hdr10" }),
+    "native",
+  );
+});
+
 test("directional seeks use short horizontal and long vertical steps", () => {
   assert.equal(policy.seekDeltaSeconds("ArrowLeft"), -10);
   assert.equal(policy.seekDeltaSeconds("ArrowRight"), 10);

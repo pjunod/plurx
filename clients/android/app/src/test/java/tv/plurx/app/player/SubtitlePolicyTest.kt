@@ -172,6 +172,18 @@ class SubtitlePolicyTest {
     }
 
     @Test
+    fun hdrSubtitleGuardKeepsTheCurrentPictureForBurnOnlyTracks() {
+        for (range in listOf("dolby_vision", "hdr10", "hlg")) {
+            assertTrue(subtitleBurnWouldDiscardHdr(pgs(0), range))
+            assertTrue(subtitleBurnWouldDiscardHdr(ass(1), range))
+            assertFalse(subtitleBurnWouldDiscardHdr(srt(2), range))
+        }
+        assertFalse(subtitleBurnWouldDiscardHdr(pgs(0), "sdr"))
+        assertFalse(subtitleBurnWouldDiscardHdr(pgs(0), null))
+        assertFalse(subtitleBurnWouldDiscardHdr(null, "hdr10"))
+    }
+
+    @Test
     fun theServersOwnPickIsAppliedWithoutRederivingPolicy() {
         // Two English tracks, the second flagged: policy is the server's, so
         // "first English" must not win over "the one it stamped".
