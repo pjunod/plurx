@@ -1837,15 +1837,19 @@ final class AppleClientTests: XCTestCase {
 
         XCTAssertEqual(
             PlayerView.playbackFacts(source: source, audio: audio),
-            ["4K", "Dolby Vision", "Dolby Digital Plus 5.1 channels"]
+            ["2160p", "Dolby Vision · Profile 8", "Dolby Digital Plus 5.1"]
         )
         XCTAssertEqual(
             PlayerView.playbackBadges(source: source, audio: audio).map(\.mark),
-            [nil, "DV", "DD+ 5.1"]
+            ["2160P", "DV P8", "DD+ 5.1"]
         )
         XCTAssertEqual(
-            PlayerView.playbackBadges(source: source, audio: audio).map(\.symbol),
-            ["4k.tv.fill", "sparkles", "waveform"]
+            PlayerView.playbackBadges(source: source, audio: audio).map(\.kind),
+            [.resolution, .dynamicRange, .audio]
+        )
+        XCTAssertEqual(
+            PlayerView.playbackBadges(source: source, audio: audio).map(\.tone),
+            [.resolution, .dolbyVision, .audio]
         )
         XCTAssertLessThanOrEqual(PlayerMetadataBadgeMetrics.rowSpacing, 6)
         XCTAssertLessThanOrEqual(PlayerMetadataBadgeMetrics.horizontalPadding, 6)
@@ -1867,8 +1871,23 @@ final class AppleClientTests: XCTestCase {
         scope4KSource.hdrFormat = nil
         XCTAssertEqual(
             PlayerView.playbackFacts(source: scope4KSource, audio: nil),
-            ["4K"]
+            ["2160p"]
         )
+
+        XCTAssertEqual(PlayerView.playbackResolutionLabel(width: nil, height: 1_440), "1440p")
+        XCTAssertEqual(PlayerView.playbackResolutionLabel(width: 720, height: 480), "480p")
+        XCTAssertNil(PlayerView.playbackResolutionLabel(width: nil, height: nil))
+
+        var mono = audio
+        mono.channels = 1
+        XCTAssertEqual(PlayerView.soundLabel(mono)?.mark, "DD+ MONO")
+        XCTAssertEqual(
+            PlayerView.soundLabel(mono)?.accessibilityLabel,
+            "Dolby Digital Plus Mono"
+        )
+        var sixPointOne = audio
+        sixPointOne.channels = 7
+        XCTAssertEqual(PlayerView.soundLabel(sixPointOne)?.mark, "DD+ 6.1")
     }
 
     /// The three states of MEDIA-BADGES-PLAN §2.3 on one DV Profile 8 remux.
@@ -1894,36 +1913,40 @@ final class AppleClientTests: XCTestCase {
         }
 
         // Source-only: no session yet, or a server too old to report. Exactly
-        // the chip this client has always drawn.
+        // the rich source chip the web player draws.
         let sourceOnly = try badge(nil)
-        XCTAssertEqual(sourceOnly.mark, "DV")
+        XCTAssertEqual(sourceOnly.mark, "DV P8")
+        XCTAssertEqual(sourceOnly.tone, .dolbyVision)
         XCTAssertFalse(sourceOnly.dimmed)
 
         // Lit: the copy session kept the RPUs and the display can show them.
         let lit = try badge("dolby_vision")
-        XCTAssertEqual(lit.mark, "DV")
-        XCTAssertEqual(lit.accessibilityLabel, "Dolby Vision")
+        XCTAssertEqual(lit.mark, "DV P8")
+        XCTAssertEqual(
+            lit.accessibilityLabel,
+            "Dolby Vision · Profile 8 (HDR10-compatible)"
+        )
         XCTAssertFalse(lit.dimmed)
 
         // Downgraded by the server: an unclaimed profile takes the strip path,
         // which delivers the compatible HDR10 base.
         let stripped = try badge("hdr10")
-        XCTAssertEqual(stripped.mark, "DV")
+        XCTAssertEqual(stripped.mark, "DV P8")
         XCTAssertEqual(stripped.renderedMark, "HDR10")
-        XCTAssertEqual(stripped.displayMark, "DV → HDR10")
+        XCTAssertEqual(stripped.displayMark, "DV P8 → HDR10")
         XCTAssertEqual(stripped.accessibilityLabel, "Dolby Vision, playing as HDR10")
         XCTAssertTrue(stripped.dimmed, "only the unavailable DV half is subdued")
 
         // Downgraded by the transcode: a burn or a picked rung is H.264 8-bit.
         let transcoded = try badge("sdr")
-        XCTAssertEqual(transcoded.displayMark, "DV → SDR")
+        XCTAssertEqual(transcoded.displayMark, "DV P8 → SDR")
         XCTAssertTrue(transcoded.dimmed)
 
         // Downgraded by the display: delivered bits are necessary, not
         // sufficient. This is the whole of what the client is allowed to know
         // about rendering — no headroom polling, no variant introspection.
         let sdrPanel = try badge("dolby_vision", displayHDR: false)
-        XCTAssertEqual(sdrPanel.displayMark, "DV → SDR")
+        XCTAssertEqual(sdrPanel.displayMark, "DV P8 → SDR")
         XCTAssertTrue(sdrPanel.dimmed)
 
         // A plain HDR10 source keeps the terse base mark and reports its own
@@ -1931,8 +1954,9 @@ final class AppleClientTests: XCTestCase {
         let hdr10 = try XCTUnwrap(PlayerView.dynamicRangeBadge(
             hdr: "hdr10", hdrFormat: "HDR10", delivered: "sdr", displayHDR: true
         ))
-        XCTAssertEqual(hdr10.displayMark, "HDR → SDR")
-        XCTAssertEqual(hdr10.accessibilityLabel, "HDR, playing as SDR")
+        XCTAssertEqual(hdr10.displayMark, "HDR10 → SDR")
+        XCTAssertEqual(hdr10.accessibilityLabel, "HDR10, playing as SDR")
+        XCTAssertEqual(hdr10.tone, .hdr)
         XCTAssertNil(PlayerView.dynamicRangeBadge(
             hdr: nil, hdrFormat: nil, delivered: "sdr", displayHDR: true
         ))
@@ -1956,16 +1980,19 @@ final class AppleClientTests: XCTestCase {
 
         XCTAssertEqual(
             PlayerView.playbackBadges(source: source, audio: audio).map(\.mark),
-            [nil, "DV", "ATMOS 7.1"]
+            ["2160P", "DV P7", "ATMOS 7.1"]
         )
         let downgraded = PlayerView.playbackBadges(
             source: source, audio: audio, delivered: "sdr", displayHDR: true
         )
-        XCTAssertEqual(downgraded.map(\.displayMark), [nil, "DV → SDR", "ATMOS 7.1"])
+        XCTAssertEqual(
+            downgraded.map(\.displayMark),
+            ["2160P", "DV P7 → SDR", "ATMOS 7.1"]
+        )
         XCTAssertEqual(downgraded.map(\.dimmed), [false, true, false])
         XCTAssertEqual(
-            downgraded.map(\.symbol),
-            ["4k.tv.fill", "sparkles", "waveform"]
+            downgraded.map(\.tone),
+            [.resolution, .dolbyVision, .audio]
         )
         XCTAssertLessThanOrEqual(PlayerMetadataBadgeMetrics.dimmedOpacity, 0.5)
         XCTAssertGreaterThan(PlayerMetadataBadgeMetrics.dimmedOpacity, 0.2)
@@ -2123,8 +2150,11 @@ final class AppleClientTests: XCTestCase {
         XCTAssertEqual(badges.map(\.kind), [.year, .runtime, .resolution, .video, .dynamicRange])
         let range = try XCTUnwrap(badges.last)
         XCTAssertEqual(range.symbol, "sparkles")
-        XCTAssertEqual(range.mark, "DV")
-        XCTAssertEqual(range.accessibilityLabel, "Dolby Vision")
+        XCTAssertEqual(range.mark, "DV P8")
+        XCTAssertEqual(
+            range.accessibilityLabel,
+            "Dolby Vision · Profile 8 (HDR10-compatible)"
+        )
 
         // An SDR file gains nothing, exactly as before.
         let sdr = try decoder.decode(MediaFile.self, from: Data(#"""

@@ -25,8 +25,19 @@ struct PlayerMetadataBadge: Equatable, Identifiable {
         case audio
     }
 
+    /// Mirrors the web player's `.res`, `.hdr`, `.dv`, and `.audio` badge
+    /// classes. Keeping this semantic (instead of storing a `Color`) makes the
+    /// badge contract testable and lets resolution continue following the
+    /// viewer's selected accent palette.
+    enum Tone: String, Equatable {
+        case resolution
+        case hdr
+        case dolbyVision
+        case audio
+    }
+
     let kind: Kind
-    let symbol: String
+    let tone: Tone
     /// The source grade (or the whole terse label for non-HDR badges).
     let mark: String?
     let accessibilityLabel: String
@@ -42,21 +53,203 @@ struct PlayerMetadataBadge: Equatable, Identifiable {
         return [mark, "→ \(renderedMark)"].compactMap { $0 }.joined(separator: " ")
     }
 
+    /// Detail-page metadata still uses the native SF Symbol row. Playback uses
+    /// `PlayerMetadataBadgeIcon` instead, so this compatibility mapping does
+    /// not leak the old glyphs back into the player.
+    var symbol: String {
+        switch kind {
+        case .resolution: return "tv.fill"
+        case .dynamicRange: return "sparkles"
+        case .audio: return "waveform"
+        }
+    }
+
     var id: String { kind.rawValue }
 }
 
 enum PlayerMetadataBadgeMetrics {
-    static let rowSpacing: CGFloat = 6
+    static let rowSpacing: CGFloat = 5
     static let contentSpacing: CGFloat = 4
     static let horizontalPadding: CGFloat = 6
     static let verticalPadding: CGFloat = 2
-    static let strokeWidth: CGFloat = 0.5
+    static let strokeWidth: CGFloat = 1
     /// Readable, but plainly the "off" treatment next to a lit chip.
     static let dimmedOpacity: Double = 0.45
 
     #if os(tvOS)
     static let fontSize: CGFloat = 16
+    static let iconSize: CGFloat = 19
+    static let tracking: CGFloat = 0.55
+    #else
+    static let fontSize: CGFloat = 10
+    static let iconSize: CGFloat = 13
+    static let tracking: CGFloat = 0.35
     #endif
+}
+
+private extension PlayerMetadataBadge.Tone {
+    var color: Color {
+        switch self {
+        case .resolution: return Palette.accent
+        case .hdr: return Color(red: 0x12 / 255, green: 0xB3 / 255, blue: 0xA6 / 255)
+        case .dolbyVision: return Color(red: 0xC9 / 255, green: 0x9A / 255, blue: 0x2B / 255)
+        case .audio: return Color(red: 0x7F / 255, green: 0x8F / 255, blue: 0xE0 / 255)
+        }
+    }
+
+    var fillOpacity: Double {
+        switch self {
+        case .resolution: return 0.13
+        case .hdr: return 0.14
+        case .dolbyVision: return 0.15
+        case .audio: return 0.14
+        }
+    }
+
+    var borderOpacity: Double {
+        switch self {
+        case .resolution: return 0.42
+        case .hdr: return 0.48
+        case .dolbyVision: return 0.52
+        case .audio: return 0.46
+        }
+    }
+}
+
+/// The exact self-hosted Material glyphs used by the web player. SwiftUI's SF
+/// Symbols are excellent platform icons, but they made the same media facts
+/// look unrelated across plurx clients.
+private struct PlayerMetadataBadgeIcon: Shape {
+    let kind: PlayerMetadataBadge.Kind
+
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        switch kind {
+        case .resolution:
+            path.move(to: CGPoint(x: 21, y: 3))
+            path.addLine(to: CGPoint(x: 3, y: 3))
+            path.addCurve(
+                to: CGPoint(x: 1, y: 5),
+                control1: CGPoint(x: 1.9, y: 3),
+                control2: CGPoint(x: 1, y: 3.9)
+            )
+            path.addLine(to: CGPoint(x: 1, y: 17))
+            path.addCurve(
+                to: CGPoint(x: 3, y: 19),
+                control1: CGPoint(x: 1, y: 18.1),
+                control2: CGPoint(x: 1.9, y: 19)
+            )
+            path.addLine(to: CGPoint(x: 8, y: 19))
+            path.addLine(to: CGPoint(x: 8, y: 21))
+            path.addLine(to: CGPoint(x: 16, y: 21))
+            path.addLine(to: CGPoint(x: 16, y: 19))
+            path.addLine(to: CGPoint(x: 21, y: 19))
+            path.addCurve(
+                to: CGPoint(x: 23, y: 17),
+                control1: CGPoint(x: 22.1, y: 19),
+                control2: CGPoint(x: 23, y: 18.1)
+            )
+            path.addLine(to: CGPoint(x: 23, y: 5))
+            path.addCurve(
+                to: CGPoint(x: 21, y: 3),
+                control1: CGPoint(x: 23, y: 3.9),
+                control2: CGPoint(x: 22.1, y: 3)
+            )
+            path.closeSubpath()
+            path.move(to: CGPoint(x: 21, y: 17))
+            path.addLine(to: CGPoint(x: 3, y: 17))
+            path.addLine(to: CGPoint(x: 3, y: 5))
+            path.addLine(to: CGPoint(x: 21, y: 5))
+            path.closeSubpath()
+        case .dynamicRange:
+            addPolygon([
+                (19, 9), (20.25, 6.25), (23, 5), (20.25, 3.75),
+                (19, 1), (17.75, 3.75), (15, 5), (17.75, 6.25)
+            ], to: &path)
+            addPolygon([
+                (11.5, 9.5), (9, 4), (6.5, 9.5), (1, 12),
+                (6.5, 14.5), (9, 20), (11.5, 14.5), (17, 12)
+            ], to: &path)
+            addPolygon([
+                (19, 15), (17.75, 17.75), (15, 19), (17.75, 20.25),
+                (19, 23), (20.25, 20.25), (23, 19), (20.25, 17.75)
+            ], to: &path)
+        case .audio:
+            path.addRect(CGRect(x: 3, y: 10, width: 2, height: 4))
+            path.addRect(CGRect(x: 7, y: 6, width: 2, height: 12))
+            path.addRect(CGRect(x: 11, y: 2, width: 2, height: 20))
+            path.addRect(CGRect(x: 15, y: 6, width: 2, height: 12))
+            path.addRect(CGRect(x: 19, y: 10, width: 2, height: 4))
+        }
+
+        return path.applying(CGAffineTransform(
+            a: rect.width / 24,
+            b: 0,
+            c: 0,
+            d: rect.height / 24,
+            tx: rect.minX,
+            ty: rect.minY
+        ))
+    }
+
+    private func addPolygon(
+        _ points: [(CGFloat, CGFloat)],
+        to path: inout Path
+    ) {
+        guard let first = points.first else { return }
+        path.move(to: CGPoint(x: first.0, y: first.1))
+        for point in points.dropFirst() {
+            path.addLine(to: CGPoint(x: point.0, y: point.1))
+        }
+        path.closeSubpath()
+    }
+}
+
+private struct PlayerMetadataBadgeView: View {
+    let badge: PlayerMetadataBadge
+
+    var body: some View {
+        HStack(spacing: PlayerMetadataBadgeMetrics.contentSpacing) {
+            HStack(spacing: PlayerMetadataBadgeMetrics.contentSpacing) {
+                PlayerMetadataBadgeIcon(kind: badge.kind)
+                    .fill(badge.tone.color, style: FillStyle(eoFill: true))
+                    .frame(
+                        width: PlayerMetadataBadgeMetrics.iconSize,
+                        height: PlayerMetadataBadgeMetrics.iconSize
+                    )
+                if let mark = badge.mark {
+                    Text(mark)
+                }
+            }
+            .opacity(badge.dimmed ? PlayerMetadataBadgeMetrics.dimmedOpacity : 1)
+            if let renderedMark = badge.renderedMark {
+                Text("→ \(renderedMark)")
+            }
+        }
+        .font(.system(
+            size: PlayerMetadataBadgeMetrics.fontSize,
+            weight: .bold,
+            design: .rounded
+        ))
+        .tracking(PlayerMetadataBadgeMetrics.tracking)
+        .foregroundStyle(badge.tone.color)
+        .padding(.horizontal, PlayerMetadataBadgeMetrics.horizontalPadding)
+        .padding(.vertical, PlayerMetadataBadgeMetrics.verticalPadding)
+        .background {
+            if !badge.dimmed {
+                Capsule().fill(badge.tone.color.opacity(badge.tone.fillOpacity))
+            }
+        }
+        .overlay {
+            Capsule().stroke(
+                badge.tone.color.opacity(badge.tone.borderOpacity),
+                lineWidth: PlayerMetadataBadgeMetrics.strokeWidth
+            )
+        }
+        .fixedSize(horizontal: true, vertical: false)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(badge.accessibilityLabel)
+    }
 }
 
 struct PlayerOverlayVisibility: Equatable {
@@ -93,14 +286,32 @@ enum DynamicRange {
         return label.localizedCaseInsensitiveContains("hlg") ? hlg : hdr10
     }
 
-    /// The base chip text and its spoken form, unchanged from what the overlay
-    /// has always shown for a source: the arrow suffix carries the precision.
-    static func sourceMark(_ grade: String) -> String {
-        grade == dolbyVision ? "DV" : "HDR"
+    /// The terse chip text used by the web player. Dolby Vision retains its
+    /// probed profile (`DV P8`); other HDR formats use the already-short rich
+    /// source string when one is available.
+    static func sourceMark(_ grade: String, hdrFormat: String?) -> String {
+        let rich = hdrFormat?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if grade == dolbyVision {
+            if let profile = dolbyVisionProfile(in: rich) {
+                return "DV P\(profile)"
+            }
+            return "DV"
+        }
+        return rich.isEmpty ? shortLabel(grade) : rich.uppercased()
     }
 
-    static func sourceLabel(_ grade: String) -> String {
-        grade == dolbyVision ? "Dolby Vision" : "HDR"
+    static func sourceLabel(_ grade: String, hdrFormat: String?) -> String {
+        let rich = hdrFormat?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return rich.isEmpty ? longLabel(grade) : rich
+    }
+
+    private static func dolbyVisionProfile(in label: String) -> String? {
+        guard let range = label.range(
+            of: #"profile\s*[0-9]+"#,
+            options: [.regularExpression, .caseInsensitive]
+        ) else { return nil }
+        let digits = label[range].filter { $0.isNumber }
+        return digits.isEmpty ? nil : String(digits)
     }
 
     static func shortLabel(_ grade: String) -> String {
@@ -491,37 +702,7 @@ struct PlayerView: View {
                 playbackOptionGroup
             }
             #else
-            if controller.knownDurationMs > 0 {
-                HStack(spacing: 10) {
-                    playbackTimeLabel(Int(isScrubbing ? scrubMs : Double(controller.currentMs)))
-                    Slider(
-                        value: Binding(
-                            get: { isScrubbing ? scrubMs : Double(controller.currentMs) },
-                            set: { scrubMs = $0 }
-                        ),
-                        in: 0...Double(controller.knownDurationMs),
-                        onEditingChanged: { editing in
-                            if editing {
-                                scrubMs = Double(controller.currentMs)
-                                isScrubbing = true
-                            } else {
-                                isScrubbing = false
-                                controller.seek(toMs: Int(scrubMs))
-                            }
-                        }
-                    )
-                    .tint(Palette.accent)
-                    playbackTimeLabel(controller.knownDurationMs)
-                }
-                .font(.system(.caption, design: .monospaced))
-                .foregroundColor(.white)
-            }
-            ViewThatFits(in: .horizontal) {
-                expandedControlRow
-                    .fixedSize(horizontal: true, vertical: false)
-                compactControlRow
-            }
-            .frame(maxWidth: .infinity)
+            touchPlaybackRows
             #endif
         }
         #if os(tvOS)
@@ -532,12 +713,9 @@ struct PlayerView: View {
         .frame(maxWidth: .infinity)
         #else
         .font(.body)
-        .buttonStyle(.bordered)
-        .tint(.white)
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
+        .buttonStyle(IOSPlayerControlButtonStyle())
+        .foregroundStyle(.white)
         .frame(maxWidth: .infinity)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
         #endif
     }
 
@@ -583,7 +761,7 @@ struct PlayerView: View {
                 #if os(tvOS)
                 .font(.system(size: 30, weight: .bold))
                 #else
-                .font(.title3.bold())
+                .font(.system(size: 26, weight: .bold))
                 #endif
                 .foregroundColor(.white)
                 .lineLimit(1)
@@ -595,7 +773,7 @@ struct PlayerView: View {
                 #if os(tvOS)
                 .font(.system(size: 21, weight: .medium, design: .rounded))
                 #else
-                .font(.system(.caption, design: .rounded).weight(.medium))
+                .font(.system(size: 15, weight: .medium, design: .rounded))
                 #endif
                 .foregroundColor(.white.opacity(0.7))
                 .lineLimit(1)
@@ -606,8 +784,8 @@ struct PlayerView: View {
                 .font(.system(size: TVPlayerChromeMetrics.infoBodyFontSize, weight: .regular))
                 .lineLimit(3)
                 #else
-                .font(.callout)
-                .lineLimit(2)
+                .font(.system(size: 15, weight: .regular))
+                .lineLimit(3)
                 #endif
                 .foregroundStyle(.white.opacity(0.88))
                 .fixedSize(horizontal: false, vertical: true)
@@ -644,44 +822,9 @@ struct PlayerView: View {
         )
         return HStack(spacing: PlayerMetadataBadgeMetrics.rowSpacing) {
             ForEach(badges) { badge in
-                HStack(spacing: PlayerMetadataBadgeMetrics.contentSpacing) {
-                    HStack(spacing: PlayerMetadataBadgeMetrics.contentSpacing) {
-                        Image(systemName: badge.symbol)
-                            .imageScale(.small)
-                        if let mark = badge.mark {
-                            Text(mark)
-                                .fontWeight(.semibold)
-                        }
-                    }
-                    .opacity(badge.dimmed ? PlayerMetadataBadgeMetrics.dimmedOpacity : 1)
-                    if let renderedMark = badge.renderedMark {
-                        Text("→ \(renderedMark)")
-                            .fontWeight(.semibold)
-                    }
-                }
-                .padding(.horizontal, PlayerMetadataBadgeMetrics.horizontalPadding)
-                .padding(.vertical, PlayerMetadataBadgeMetrics.verticalPadding)
-                .background(.black.opacity(0.32), in: Capsule())
-                .overlay {
-                    Capsule().stroke(
-                        .white.opacity(0.18),
-                        lineWidth: PlayerMetadataBadgeMetrics.strokeWidth
-                    )
-                }
-                .accessibilityElement(children: .ignore)
-                .accessibilityLabel(badge.accessibilityLabel)
+                PlayerMetadataBadgeView(badge: badge)
             }
         }
-        #if os(tvOS)
-        .font(.system(
-            size: PlayerMetadataBadgeMetrics.fontSize,
-            weight: .medium,
-            design: .rounded
-        ))
-        #else
-        .font(.system(.caption2, design: .rounded).weight(.medium))
-        #endif
-        .foregroundColor(.white.opacity(0.78))
     }
 
     private var runtimeLabel: String? {
@@ -705,12 +848,11 @@ struct PlayerView: View {
         displayHDR: Bool = true
     ) -> [PlayerMetadataBadge] {
         var badges: [PlayerMetadataBadge] = []
-        if let label = resolutionLabel(width: source?.width, height: source?.height) {
-            let is4K = label == "4K"
+        if let label = playbackResolutionLabel(width: source?.width, height: source?.height) {
             badges.append(PlayerMetadataBadge(
                 kind: .resolution,
-                symbol: is4K ? "4k.tv.fill" : "tv.fill",
-                mark: is4K ? nil : label.uppercased(),
+                tone: .resolution,
+                mark: label.uppercased(),
                 accessibilityLabel: label
             ))
         }
@@ -725,7 +867,7 @@ struct PlayerView: View {
         if let audio, let sound = soundLabel(audio) {
             badges.append(PlayerMetadataBadge(
                 kind: .audio,
-                symbol: "waveform",
+                tone: .audio,
                 mark: sound.mark,
                 accessibilityLabel: sound.accessibilityLabel
             ))
@@ -754,24 +896,52 @@ struct PlayerView: View {
         guard let source = DynamicRange.source(hdr: hdr, hdrFormat: hdrFormat) else {
             return nil
         }
+        let sourceMark = DynamicRange.sourceMark(source, hdrFormat: hdrFormat)
+        let sourceLabel = DynamicRange.sourceLabel(source, hdrFormat: hdrFormat)
+        let tone: PlayerMetadataBadge.Tone = source == DynamicRange.dolbyVision
+            ? .dolbyVision
+            : .hdr
         let lit = PlayerMetadataBadge(
             kind: .dynamicRange,
-            symbol: "sparkles",
-            mark: DynamicRange.sourceMark(source),
-            accessibilityLabel: DynamicRange.sourceLabel(source)
+            tone: tone,
+            mark: sourceMark,
+            accessibilityLabel: sourceLabel
         )
         guard let delivered, !delivered.isEmpty else { return lit }
         let rendered = DynamicRange.rendered(delivered: delivered, displayHDR: displayHDR)
         guard rendered != source else { return lit }
         return PlayerMetadataBadge(
             kind: .dynamicRange,
-            symbol: "sparkles",
-            mark: DynamicRange.sourceMark(source),
+            tone: tone,
+            mark: sourceMark,
             accessibilityLabel:
-                "\(DynamicRange.sourceLabel(source)), playing as \(DynamicRange.longLabel(rendered))",
+                "\(DynamicRange.longLabel(source)), playing as \(DynamicRange.longLabel(rendered))",
             renderedMark: DynamicRange.shortLabel(rendered),
             dimmed: true
         )
+    }
+
+    /// Exact port of the web player's `resLabel`: it uses both raster edges so
+    /// portrait metadata and scope-cropped masters stay in the intended tier.
+    static func playbackResolutionLabel(width: Int?, height: Int?) -> String? {
+        let validWidth = (width ?? 0) > 0 ? width ?? 0 : 0
+        let validHeight = (height ?? 0) > 0 ? height ?? 0 : 0
+        let shortEdge: Int
+        let longEdge: Int
+        if validWidth > 0, validHeight > 0 {
+            shortEdge = min(validWidth, validHeight)
+            longEdge = max(validWidth, validHeight)
+        } else {
+            shortEdge = validHeight > 0 ? validHeight : validWidth
+            longEdge = shortEdge
+        }
+        guard shortEdge > 0 else { return nil }
+        if longEdge >= 3_200 || shortEdge >= 1_700 { return "2160p" }
+        if longEdge >= 2_300 || shortEdge >= 1_300 { return "1440p" }
+        if longEdge >= 1_600 || shortEdge >= 900 { return "1080p" }
+        if longEdge >= 1_100 || shortEdge >= 650 { return "720p" }
+        if longEdge >= 700 || shortEdge >= 400 { return "480p" }
+        return "\(shortEdge)p"
     }
 
     /// The same three-layer truth in one sentence, for the playback-info
@@ -843,11 +1013,12 @@ struct PlayerView: View {
         }
         let channels: (mark: String, label: String)?
         switch track.channels {
-        case 1: channels = ("1.0", "mono")
-        case 2: channels = ("2.0", "stereo")
-        case 6: channels = ("5.1", "5.1 channels")
-        case 8: channels = ("7.1", "7.1 channels")
-        case let count?: channels = ("\(count)CH", "\(count) channels")
+        case 1: channels = ("MONO", "Mono")
+        case 2: channels = ("2.0", "2.0")
+        case 6: channels = ("5.1", "5.1")
+        case 7: channels = ("6.1", "6.1")
+        case 8: channels = ("7.1", "7.1")
+        case let count?: channels = ("\(count)CH", "\(count)ch")
         case nil: channels = nil
         }
         guard !format.mark.isEmpty else { return nil }
@@ -885,17 +1056,71 @@ struct PlayerView: View {
         }
     }
 
+    #if os(iOS)
+    /// Uses the Apple TV's single-row hierarchy whenever the touch viewport is
+    /// wide enough (iPhone landscape and iPad), with the same hierarchy split
+    /// over two rows only when a portrait phone cannot fit it safely.
+    private var touchPlaybackRows: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 8) {
+                transportControlGroup
+                if controller.knownDurationMs > 0 {
+                    playbackTimeLabel(Int(isScrubbing ? scrubMs : Double(controller.currentMs)))
+                    touchProgressSlider
+                        .frame(minWidth: 100)
+                    playbackTimeLabel(controller.knownDurationMs)
+                }
+                playbackOptionGroup
+            }
+            .fixedSize(horizontal: true, vertical: false)
+
+            VStack(alignment: .leading, spacing: 8) {
+                if controller.knownDurationMs > 0 {
+                    HStack(spacing: 10) {
+                        playbackTimeLabel(Int(isScrubbing ? scrubMs : Double(controller.currentMs)))
+                        touchProgressSlider
+                        playbackTimeLabel(controller.knownDurationMs)
+                    }
+                }
+                ViewThatFits(in: .horizontal) {
+                    expandedControlRow
+                        .fixedSize(horizontal: true, vertical: false)
+                    compactControlRow
+                }
+                .frame(maxWidth: .infinity)
+            }
+        }
+        .font(.system(.caption, design: .monospaced))
+        .foregroundColor(.white)
+    }
+
+    private var touchProgressSlider: some View {
+        Slider(
+            value: Binding(
+                get: { isScrubbing ? scrubMs : Double(controller.currentMs) },
+                set: { scrubMs = $0 }
+            ),
+            in: 0...Double(controller.knownDurationMs),
+            onEditingChanged: { editing in
+                if editing {
+                    scrubMs = Double(controller.currentMs)
+                    isScrubbing = true
+                } else {
+                    isScrubbing = false
+                    controller.seek(toMs: Int(scrubMs))
+                }
+            }
+        )
+        .tint(Palette.accent)
+    }
+    #endif
+
     private var transportControlGroup: some View {
         HStack(spacing: 8) {
             skipBackButton
             playPauseButton
             skipForwardButton
         }
-        #if os(iOS)
-        .padding(.horizontal, 5)
-        .padding(.vertical, 4)
-        .background(.black.opacity(0.14), in: RoundedRectangle(cornerRadius: 12))
-        #endif
     }
 
     private var playbackOptionGroup: some View {
@@ -907,11 +1132,6 @@ struct PlayerView: View {
             autoplayButton
             statsButton
         }
-        #if os(iOS)
-        .padding(.horizontal, 5)
-        .padding(.vertical, 4)
-        .background(.black.opacity(0.14), in: RoundedRectangle(cornerRadius: 12))
-        #endif
     }
 
     #if os(iOS)

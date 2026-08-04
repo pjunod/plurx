@@ -211,6 +211,8 @@ struct TVShelfActionButtonStyle: ButtonStyle {
 struct TVPlayerControlButtonStyle: ButtonStyle {
     static let width: CGFloat = 54
     static let height: CGFloat = 46
+    static let iconSize: CGFloat = 23
+    static let cornerRadius: CGFloat = 11
 
     func makeBody(configuration: Configuration) -> Body {
         Body(configuration: configuration)
@@ -223,7 +225,7 @@ struct TVPlayerControlButtonStyle: ButtonStyle {
 
         var body: some View {
             configuration.label
-                .font(.system(size: 23, weight: .semibold))
+                .font(.system(size: TVPlayerControlButtonStyle.iconSize, weight: .semibold))
                 .foregroundStyle(.white)
                 .frame(
                     width: TVPlayerControlButtonStyle.width,
@@ -231,10 +233,16 @@ struct TVPlayerControlButtonStyle: ButtonStyle {
                 )
                 .background(
                     Palette.playerChrome.opacity(isFocused ? 0.9 : 0.68),
-                    in: RoundedRectangle(cornerRadius: 11, style: .continuous)
+                    in: RoundedRectangle(
+                        cornerRadius: TVPlayerControlButtonStyle.cornerRadius,
+                        style: .continuous
+                    )
                 )
                 .overlay {
-                    RoundedRectangle(cornerRadius: 11, style: .continuous)
+                    RoundedRectangle(
+                        cornerRadius: TVPlayerControlButtonStyle.cornerRadius,
+                        style: .continuous
+                    )
                         .stroke(
                             isFocused ? Palette.accent.opacity(0.95) : Palette.outline.opacity(0.7),
                             lineWidth: isFocused ? 1 : 0.5
@@ -353,6 +361,33 @@ struct TVMediaCardButtonStyle: ButtonStyle {
 #endif
 
 #if os(iOS)
+/// Touch-sized counterpart to the Apple TV player control. It carries the same
+/// dark, hairline-outlined formatting without importing tvOS focus behavior.
+struct IOSPlayerControlButtonStyle: ButtonStyle {
+    static let width: CGFloat = 40
+    static let height: CGFloat = 36
+    static let iconSize: CGFloat = 17
+    static let cornerRadius: CGFloat = 9
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: Self.iconSize, weight: .semibold))
+            .foregroundStyle(.white)
+            .frame(width: Self.width, height: Self.height)
+            .background(
+                Palette.playerChrome.opacity(0.68),
+                in: RoundedRectangle(cornerRadius: Self.cornerRadius, style: .continuous)
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: Self.cornerRadius, style: .continuous)
+                    .stroke(Palette.outline.opacity(0.7), lineWidth: 0.5)
+            }
+            .scaleEffect(configuration.isPressed ? 0.97 : 1)
+            .opacity(configuration.isPressed ? 0.76 : 1)
+            .animation(.easeOut(duration: 0.08), value: configuration.isPressed)
+    }
+}
+
 /// Full-width touch actions own their complete shape. The system bordered
 /// styles add horizontal chrome outside an already-flexible label, which can
 /// paint past a compact detail column's trailing inset.
