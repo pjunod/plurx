@@ -704,6 +704,112 @@ mod tests {
         assert_eq!(decide(&hevc_mkv, &caps, true).method, PlaybackMethod::Remux);
     }
 
+    #[test]
+    fn automatic_routing_matrix_covers_every_compatibility_dimension() {
+        let baseline = file("mp4", "h264", "aac");
+        assert_eq!(
+            decide(&baseline, default_profile(), true).method,
+            PlaybackMethod::DirectPlay
+        );
+
+        let mut wrong_container = baseline.clone();
+        wrong_container.container = Some("mkv".into());
+        assert_eq!(
+            decide(&wrong_container, default_profile(), true).method,
+            PlaybackMethod::Remux
+        );
+
+        let mut wrong_audio = baseline.clone();
+        wrong_audio.audio_streams[0].codec = "dts".into();
+        let audio = decide(&wrong_audio, default_profile(), true);
+        assert_eq!(audio.method, PlaybackMethod::Remux);
+        assert!(audio.transcode_audio);
+
+        let mut corrected_sync = baseline.clone();
+        corrected_sync.audio_offset_ms = 125;
+        assert_eq!(
+            decide(&corrected_sync, default_profile(), true).method,
+            PlaybackMethod::Remux
+        );
+
+        let mut wrong_video = baseline.clone();
+        wrong_video.video_codec = Some("mpeg2video".into());
+        assert_eq!(
+            decide(&wrong_video, default_profile(), true).method,
+            PlaybackMethod::Transcode
+        );
+
+        let mut capped = default_profile().clone();
+        capped.max_height = Some(720);
+        assert_eq!(
+            decide(&baseline, &capped, true).method,
+            PlaybackMethod::Transcode
+        );
+
+        capped.max_height = None;
+        capped.max_bitrate = Some(4_000_000);
+        assert_eq!(
+            decide(&baseline, &capped, true).method,
+            PlaybackMethod::Transcode
+        );
+
+        let mut hdr = baseline.clone();
+        hdr.hdr = Some("hdr10".into());
+        assert_eq!(
+            decide(&hdr, default_profile(), true).method,
+            PlaybackMethod::Transcode
+        );
+
+        let mut unprobed_container = baseline;
+        unprobed_container.container = None;
+        assert_eq!(
+            decide(&unprobed_container, default_profile(), true).method,
+            PlaybackMethod::Remux,
+            "unknown compatibility is not permission to hand over the raw container"
+        );
+    }
+
+    #[test]
+    fn manual_quality_matrix_pins_auto_original_and_every_rung() {
+        assert_eq!(Force::parse("auto"), Force::Auto);
+        assert_eq!(Force::parse("original"), Force::Original);
+        assert_eq!(Force::parse("transcode"), Force::Transcode);
+        assert_eq!(Force::parse("future-value"), Force::Auto);
+
+        let unsupported_video = file("mp4", "hevc", "aac");
+        assert_eq!(
+            decide_forced(&unsupported_video, default_profile(), Force::Auto, true).method,
+            PlaybackMethod::Transcode
+        );
+        assert_eq!(
+            decide_forced(
+                &unsupported_video,
+                default_profile(),
+                Force::Original,
+                true
+            )
+            .method,
+            PlaybackMethod::DirectPlay,
+            "Original keeps the source bytes when its container and audio are usable; the client owns the rescue"
+        );
+
+        let incompatible_envelope = file("mkv", "hevc", "dts");
+        let original = decide_forced(
+            &incompatible_envelope,
+            default_profile(),
+            Force::Original,
+            true,
+        );
+        assert_eq!(original.method, PlaybackMethod::Remux);
+        assert!(original.transcode_audio);
+
+        let direct = file("mp4", "h264", "aac");
+        assert_eq!(
+            decide_forced(&direct, default_profile(), Force::Transcode, true).method,
+            PlaybackMethod::Transcode
+        );
+    }
+
     /// The Chrome-refuses-Dolby-Vision failure, as a decision. Both films it
     /// was found on (a P7 and a P8 disc remux, both "HDR10-compatible") were
     /// remuxed to Chrome because the client claimed HDR — and Chrome refused

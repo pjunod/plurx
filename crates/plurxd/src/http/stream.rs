@@ -1,7 +1,6 @@
-//! Media delivery: direct-play (HTTP range serving of the raw file) and remux
-//! (on-the-fly fragmented MP4 via ffmpeg `-c copy`, audio re-encoded only when
-//! the target can't take the source codec). Full video transcode is Phase 2;
-//! a Transcode verdict here still attempts a remux and says so in `/decision`.
+//! Media delivery: direct-play (HTTP range serving of the raw file), remux
+//! (on-the-fly fragmented MP4 via ffmpeg `-c copy`), and the execution plan
+//! that sends a transcode verdict to an HLS session.
 
 use std::path::Path;
 use std::process::Stdio;
@@ -347,6 +346,35 @@ pub enum DeliveryPlan {
     Transcode { sessions_url: String },
 }
 
+/// Turn the pure playback verdict into the API execution plan every client
+/// consumes. Kept pure so adding a fourth verdict cannot silently leave one
+/// client inventing its own URL or session flags.
+fn delivery_plan(file_id: i64, decision: &Decision) -> (String, DeliveryPlan) {
+    let direct_url = format!("/api/v1/files/{file_id}/direct");
+    let remux_url = format!("/api/v1/files/{file_id}/stream.mp4");
+    let sessions_url = format!("/api/v1/files/{file_id}/hls/sessions");
+    match decision.method {
+        playback::PlaybackMethod::DirectPlay => {
+            (direct_url.clone(), DeliveryPlan::Direct { url: direct_url })
+        }
+        playback::PlaybackMethod::Remux => (
+            remux_url.clone(),
+            DeliveryPlan::Remux {
+                url: remux_url,
+                sessions_url,
+                aac: decision.transcode_audio,
+                preserve_dolby_vision: decision.preserve_dolby_vision,
+            },
+        ),
+        playback::PlaybackMethod::Transcode => (
+            // Legacy clients still receive the only progressive URL in
+            // `play_url`; current clients execute `delivery` and POST HLS.
+            remux_url,
+            DeliveryPlan::Transcode { sessions_url },
+        ),
+    }
+}
+
 #[derive(Serialize)]
 pub struct DecisionResponse {
     pub file_id: i64,
@@ -667,23 +695,7 @@ pub async fn decision(
         "playback capability decision"
     );
 
-    let play_url = match decision.method {
-        playback::PlaybackMethod::DirectPlay => format!("/api/v1/files/{id}/direct"),
-        _ => format!("/api/v1/files/{id}/stream.mp4"),
-    };
-    let sessions_url = format!("/api/v1/files/{id}/hls/sessions");
-    let delivery = match decision.method {
-        playback::PlaybackMethod::DirectPlay => DeliveryPlan::Direct {
-            url: play_url.clone(),
-        },
-        playback::PlaybackMethod::Remux => DeliveryPlan::Remux {
-            url: play_url.clone(),
-            sessions_url,
-            aac: decision.transcode_audio,
-            preserve_dolby_vision: decision.preserve_dolby_vision,
-        },
-        playback::PlaybackMethod::Transcode => DeliveryPlan::Transcode { sessions_url },
-    };
+    let (play_url, delivery) = delivery_plan(id, &decision);
     // Only a remux has a transport choice to make. Direct play is already a
     // range-served file, which is the case Chrome buffers *well* — it was the
     // control in §4.3bis, at 10.8 s against the progressive path's 2.2 — and a
@@ -1444,6 +1456,48 @@ fn is_progress_line(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn planned(method: playback::PlaybackMethod) -> Decision {
+        Decision {
+            method,
+            reasons: Vec::new(),
+            transcode_audio: true,
+            preserve_dolby_vision: true,
+            container: "mp4",
+            delivered_dynamic_range: "dolby_vision",
+        }
+    }
+
+    #[test]
+    fn every_verdict_has_one_server_owned_execution_plan() {
+        let (legacy, direct) = delivery_plan(42, &planned(playback::PlaybackMethod::DirectPlay));
+        assert_eq!(legacy, "/api/v1/files/42/direct");
+        assert!(matches!(
+            direct,
+            DeliveryPlan::Direct { url } if url == "/api/v1/files/42/direct"
+        ));
+
+        let (legacy, remux) = delivery_plan(42, &planned(playback::PlaybackMethod::Remux));
+        assert_eq!(legacy, "/api/v1/files/42/stream.mp4");
+        assert!(matches!(
+            remux,
+            DeliveryPlan::Remux {
+                url,
+                sessions_url,
+                aac: true,
+                preserve_dolby_vision: true,
+            } if url == "/api/v1/files/42/stream.mp4"
+                && sessions_url == "/api/v1/files/42/hls/sessions"
+        ));
+
+        let (legacy, transcode) = delivery_plan(42, &planned(playback::PlaybackMethod::Transcode));
+        assert_eq!(legacy, "/api/v1/files/42/stream.mp4");
+        assert!(matches!(
+            transcode,
+            DeliveryPlan::Transcode { sessions_url }
+                if sessions_url == "/api/v1/files/42/hls/sessions"
+        ));
+    }
 
     #[test]
     fn remux_omission_uses_the_preferred_audio_instead_of_stream_zero() {

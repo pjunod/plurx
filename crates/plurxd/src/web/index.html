@@ -2408,9 +2408,11 @@ if(window.matchMedia){ try{ window.matchMedia("(prefers-color-scheme: dark)").ad
 <div class="modal" id="modal"><div class="player" id="player"><video id="video" autoplay playsinline x-webkit-airplay="allow"></video><div class="pbar" id="pbar"><div class="ptitle" id="playTitle"></div><div class="row"><button class="pbtn" id="audiobtn" style="display:none" onclick="toggleMenu('audio')">🔊 Audio</button><button class="pbtn" id="subsbtn" style="display:none" onclick="toggleMenu('subs')">💬 Subtitles</button><button class="pbtn" id="qualbtn" title="Playback quality" onclick="toggleMenu('quality')">◆ Quality</button><button class="pbtn" id="syncbtn" title="Audio sync adjustment" onclick="toggleMenu('sync')">⇄ Sync</button><button class="pbtn" id="statsbtn" title="Playback info (i)" onclick="toggleStats()">ⓘ Stats</button><button class="pbtn" id="skipbtn" title="Auto-skip intro & credits" onclick="togglePlayerAutoskip()">⏭ Auto-skip</button><button class="pbtn" id="autonextbtn" title="Auto-play the next episode when one finishes" onclick="togglePlayerAutonext()">▶ Autoplay</button><button class="pbtn" id="apbtn" style="display:none" title="AirPlay">📺 AirPlay</button><button class="pbtn" title="Close (Esc)" onclick="closePlayer()">✕ Close</button></div></div><div class="ptransport" id="ptransport"><button class="picon" id="pbplay" aria-label="Play" title="Play / Pause (space)" onclick="togglePlay()">▶</button><button class="picon nudge" aria-label="Back 10 seconds" title="Back 10s (←)" onclick="nudge(-10)">↺</button><button class="picon nudge" aria-label="Forward 10 seconds" title="Forward 10s (→)" onclick="nudge(10)">↻</button><span class="ptime" id="ptcur" aria-hidden="true">0:00</span><div class="pseek" id="pseek" role="slider" tabindex="0" aria-label="Seek" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-valuetext="0:00"><div class="pseek-buf" id="pseekbuf" aria-hidden="true"></div><div class="pseek-fill" id="pseekfill" aria-hidden="true"></div><div class="pseek-thumb" id="pseekthumb" aria-hidden="true"></div></div><span class="ptime" id="ptdur" aria-hidden="true">0:00</span><button class="picon paud" id="pbaudio" aria-label="Audio track" title="Audio track (a)" style="display:none" onclick="toggleMenu('audio',1)">🔊</button><button class="picon pcc" id="pbsubs" aria-label="Subtitles" title="Subtitles (c)" style="display:none" onclick="toggleMenu('subs',1)">CC</button><button class="picon" id="pbinfo" aria-label="Title info" title="Show title, synopsis & release info" onclick="togglePlayerInfo()">ⓘ</button><button class="picon" id="pbpip" aria-label="Picture in picture" title="Picture-in-picture" style="display:none" onclick="togglePip()">◲</button><button class="picon" id="pbfs" aria-label="Fullscreen" title="Fullscreen (f)" onclick="toggleFullscreen()">⛶</button></div><div class="pinfo" id="pinfo"></div><div class="pskip" id="pskip"></div><div class="ploading" id="ploading"><div class="pspin"></div><div class="ploadText" id="ploadText">Loading…</div><div class="ploadSub" id="ploadSub"></div><div class="ploadAct" id="ploadAct"></div></div><div class="statsov" id="statsov"><div class="statshd"><span>Playback info</span><button class="statsx" aria-label="Close playback info" title="Close (i)" onclick="toggleStats()">✕</button></div><div class="statsbody" id="statsbody"></div></div><div class="pmenu" id="pmenu"></div></div></div>
 <div class="toast" id="toast"></div>
 
+<script src="/assets/playback-policy.js"></script>
 <script src="/assets/hls.min.js"></script>
 <script>
 "use strict";
+const PlaybackPolicy = window.PlurxPlaybackPolicy;
 const API = "/api/v1";
 let TOKEN = localStorage.getItem("plurx_token") || null;
 let ME = null;
@@ -4240,9 +4242,11 @@ let PLAYER_WIRED=false;
 // bug). So the gate is the WebKit AirPlay API, which only Safari has, never
 // canPlayType alone. Everyone else gets hls.js (MSE), which is the tested path.
 function useNativeHls(video){
-  if(!video.canPlayType('application/vnd.apple.mpegurl')) return false;
-  if(window.WebKitPlaybackTargetAvailabilityEvent !== undefined) return true;   // real Safari/iOS
-  return !(window.Hls && Hls.isSupported());   // non-Safari: native only if hls.js can't run
+  return PlaybackPolicy.nativeHlsAvailable({
+    canPlayNativeHls:!!video.canPlayType('application/vnd.apple.mpegurl'),
+    hasWebKitPlaybackTarget:window.WebKitPlaybackTargetAvailabilityEvent !== undefined,
+    hlsJsSupported:!!(window.Hls && Hls.isSupported())
+  });
 }
 // Which HLS transport to actually use. hls.js (MSE) plays inline so OUR controls
 // + scrubber sit on top (the Chrome experience); Safari's native HLS instead
@@ -4260,7 +4264,11 @@ function streamIsHevc(){
   }
   return false;
 }
-function preferNativeHls(video){ return useNativeHls(video) && streamIsHevc(); }
+function preferNativeHls(video){
+  return PlaybackPolicy.hlsTransport({
+    nativeHls:useNativeHls(video), hevcCopy:streamIsHevc()
+  })==='native';
+}
 // One place that attaches an HLS playlist to the video element (used by start,
 // seek-restart, and audio-switch). Worker off: a wallet extension's injected
 // CSP can silently kill a blob worker; main-thread demux of one 720p stream
@@ -4449,8 +4457,13 @@ function attachHls(video, playlistUrl, startAt){
       // is the "downgrade on a guess" this whole change refuses to do.
       const isMedia=(Hls.ErrorTypes && d.type===Hls.ErrorTypes.MEDIA_ERROR)
                     || /codec|decode|parsing/i.test(String(d.details||""));
-      if(isMedia && PLAYER && !PLAYER.triedFallback
-         && (PLAYER.method==='remux' || PLAYER.method==='direct_play')){
+      const fallback=PLAYER && PlaybackPolicy.fallbackAction({
+        method:PLAYER.method,
+        alreadyTried:PLAYER.triedFallback,
+        playbackIsReal:false,
+        mediaFailure:isMedia
+      });
+      if(fallback==='transcode'){
         PLAYER.triedFallback=true;
         clientLog(Object.assign({level:"warn",event:"stream_rejected",detail:d.type,
           message:"hls.js could not decode the "+PLAYER.method.replace('_',' ')+" stream ("+d.details+") — re-encoding"},
@@ -4658,11 +4671,7 @@ const QUALITIES=[["auto","Auto"],["original","Original"],["nomse","Original · o
                  ["1080","1080p"],["720","720p"],["480","480p"]];
 function playQuality(){ try{ return localStorage.getItem("plurx_quality")||"auto"; }catch(e){ return "auto"; } }
 function qualityForce(){
-  const q=playQuality();
-  if(q==="auto") return "auto";
-  // Same server-side decision as Original: this only changes how the client
-  // carries the result.
-  return (q==="original"||q==="nomse")?"original":"transcode";
+  return PlaybackPolicy.qualityForce(playQuality());
 }
 // The viewer has asked for one continuous stream, so decline the segmented
 // transport however attractive the server thinks it is.
@@ -4672,7 +4681,7 @@ function noSegments(){ return playQuality()==="nomse"; }
 // up using, and the player only finds that out in the response to the request
 // it is about to make. So it asks for nothing and lets the server answer
 // (PERF-PLAN §4.7); the menu's explicit rungs still mean exactly themselves.
-function transcodeHeight(){ const q=playQuality(); return (q==="1080"||q==="720"||q==="480")?parseInt(q,10):null; }
+function transcodeHeight(){ return PlaybackPolicy.transcodeHeight(playQuality()); }
 // The height a transcode session should carry when the rung is not Auto's to
 // pick, or null where it is. Two cases, one principle: the rung may not
 // downgrade a resolution that was already promised.
@@ -4714,11 +4723,12 @@ function transcodeHeight(){ const q=playQuality(); return (q==="1080"||q==="720"
 // source has no height to promise, so it stays the server's choice.
 function sessionHeight(){
   const h=PLAYER&&PLAYER.source&&PLAYER.source.height;
-  if(!(h>0)) return null;
-  if(qualityForce()==="original") return h;
-  if(qualityForce()==="auto" && PLAYER.decidedMethod!=='transcode'
-     && (PLAYER.burnedSub!=null || PLAYER.refusedOriginal)) return h;
-  return null;
+  return PlaybackPolicy.sessionHeight({
+    quality:playQuality(), sourceHeight:h,
+    decidedMethod:PLAYER&&PLAYER.decidedMethod,
+    burnedSubtitle:!!(PLAYER&&PLAYER.burnedSub!=null),
+    refusedOriginal:!!(PLAYER&&PLAYER.refusedOriginal)
+  });
 }
 function qualityLabel(){ const q=playQuality(); const f=QUALITIES.find(x=>x[0]===q); return f?f[1]:"Auto"; }
 
@@ -4820,7 +4830,13 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
   const defSub=PLAYER.subs.find(s=>s.default);
   if(defSub && !skipDefaultSub && decision.method!=='transcode'){ setTimeout(()=>{ if(PLAYER.fileId===fileId) setSub(defSub.index); }, 400); }
 
-  if(decision.method==='transcode'){
+  const nativeHls=useNativeHls(video);
+  const segmentedRemux=segmentedRemuxOk(decision,video);
+  const initialRoute=PlaybackPolicy.initialRoute({
+    method:decision.method, selectedAudioIndex:initialAudio,
+    nativeHls, segmentedRemux
+  });
+  if(initialRoute==='transcode_hls'){
     // Transcode: start an HLS session (server re-encodes + tone-maps).
     setLoading(true,"Starting the transcoder…",transcodeReason(decision));
     let info; try{ info=await openSession(fileId,transcodeOpts(startSec,initialAudio));}catch(e){ setLoading(false); toast(e.message); return closePlayer(); }
@@ -4828,7 +4844,7 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
     setLoading(true,"Preparing the stream…",(PLAYER.encoder?("encoder: "+PLAYER.encoder+" — "):"")+
       (PLAYER.vod?"already transcoded — playing from the cache":"buffering the first segments"));
     armStall(from);
-  } else if(decision.method!=='direct_play' && (useNativeHls(video)||segmentedRemuxOk(decision,video))){
+  } else if(initialRoute==='copy_hls'){
     // Two different reasons to land here, same destination.
     //
     // Safari can't play a progressive fragmented-MP4 remux at all, but it plays
@@ -4841,7 +4857,7 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
     // raise (PERF-PLAN §4.3bis, measured), so any supply gap over two seconds
     // is a stall. The same bytes through MSE let hls.js hold a real buffer.
     // Identical video either way — this is a transport choice, not a rung.
-    const why=!useNativeHls(video) && decision.prefer_segmented;
+    const why=!nativeHls && decision.prefer_segmented;
     setLoading(true,"Preparing the stream…",
       why? `${why} — sending it as HLS so the player can buffer ahead`
          : "remuxing to HLS — keeping the original video");
@@ -4852,7 +4868,7 @@ async function play(fileId, title, resumeMs, knownDurMs, meta){
     // A raw direct-play file gives the browser control of its mux defaults, not
     // the server's language choice. If the preferred track is not stream zero,
     // use the remuxer so the requested track is the only one delivered.
-    const isRemux = decision.method!=='direct_play' || initialAudio!==0;
+    const isRemux = initialRoute==='progressive_remux';
     setLoading(true,isRemux?"Preparing the stream…":"Loading…",
       isRemux?"remuxing to a browser-friendly container":"direct play — no conversion needed");
     // Remux carries the same caps so the server copies the audio when the
@@ -5377,21 +5393,17 @@ const MARGIN_CLEAR_SECS=60;
 // "it went bad" rather than a second heuristic that can drift away from the
 // first. Returns null when there is not enough playback to say anything.
 function lostFrameRate(h, playedSecs){
-  if(!h || !(playedSecs>0)) return null;
-  const lost=(h.back|0)+(h.drop|0)+(h.gap|0);
-  return {lost, rate:+(lost/(playedSecs/60)).toFixed(1)};
+  return PlaybackPolicy.lostFrameRate(h, playedSecs);
 }
 // The verdict, pure so it is testable: null, or the numbers that justify a
 // rescue. The absolute floor sits beside the rate so that a single ugly
 // stretch early on cannot condemn the session on arithmetic alone.
 function decodeMarginVerdict(h, playedSecs){
-  if(!(playedSecs>=MARGIN_MIN_SECS)) return null;
-  const x=lostFrameRate(h, playedSecs);
-  if(!x || x.lost<MARGIN_MIN_LOST || x.rate<MARGIN_LOST_PER_MIN) return null;
-  // Carried for the log line and the menu, as context. Not as a reason.
-  const budgetMs=h.fps?+(1000/h.fps).toFixed(1):null;
-  return {lost:x.lost, rate:x.rate, secs:Math.round(playedSecs),
-          decodeMs:h.decodeMs==null?null:+h.decodeMs.toFixed(1), budgetMs};
+  return PlaybackPolicy.decodeMarginVerdict(h, playedSecs, {
+    lostPerMinute:MARGIN_LOST_PER_MIN,
+    minimumSeconds:MARGIN_MIN_SECS,
+    minimumLost:MARGIN_MIN_LOST
+  });
 }
 // What this DEVICE cannot decode with margin, remembered per codec+height so
 // the next Auto playback routes straight to a transcode instead of stuttering
@@ -6133,7 +6145,16 @@ function wirePlayer(){
     // sound case it exists for.
     if(!PLAYER || playbackIsReal()){ setLoading(false); return; }
     const names={1:"aborted",2:"network error",3:"the browser's decoder failed",4:"format not supported by this browser"};
-    if((PLAYER.method==='remux'||PLAYER.method==='direct_play') && !PLAYER.triedFallback){
+    const fallback=PLAYER && PlaybackPolicy.fallbackAction({
+      method:PLAYER.method,
+      alreadyTried:PLAYER.triedFallback,
+      playbackIsReal:playbackIsReal(),
+      // Preserve the current <video> behavior: all element-level failures are
+      // rejections. hls.js distinguishes network failures above and never
+      // spends an encode retry on one.
+      mediaFailure:true
+    });
+    if(fallback==='transcode'){
       PLAYER.triedFallback=true;
       clientLog({level:"warn",event:"stream_rejected",code,src,
         message:"browser refused the "+PLAYER.method.replace('_',' ')+" stream — re-encoding"});

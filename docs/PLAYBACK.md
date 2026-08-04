@@ -54,12 +54,79 @@ key to reading the code:
   will actually accept. This is the part ARCHITECTURE doesn't cover and the
   part that bites (see [the fallback](#the-error-fallback--and-the-stale-reason-trap)).
 
-## Runtime caps — what the client tells the server
+## Routing inventory — every fork has one owner and one regression pin
 
-Before the first `/decision`, the web player probes what this exact browser can
-decode and sends it as query params (`PLAY_CAPS` in `web/index.html`). The
-server folds them into an ad-hoc device profile (`caps_profile` in
-`plurx-core/src/playback`), so a file only transcodes when *this* browser
+This is the auditable map. A **routing decision** is any rule that changes the
+video bytes, container/transport, selected track, encoder/tone-map chain,
+height, or recovery path. Telemetry, UI labels, play/pause, and progress
+reporting are deliberately outside the inventory because they observe a route;
+they do not choose one.
+
+The machine-readable twin is
+[`tests/playback/routing-decisions.toml`](../tests/playback/routing-decisions.toml).
+[`test_playback_routing_inventory.py`](../tests/validation/test_playback_routing_inventory.py)
+keeps the two lists identical and fails when a source or test anchor disappears.
+That test does not pretend an anchor proves behavior: the named unit test is the
+behavioral pin. The inventory test proves every documented fork still points to
+one.
+
+<!-- playback-routing-inventory:start -->
+
+### Server — decide the bytes, recipe, and hardware path
+
+| ID | Fork | Current rule | Regression pin |
+|---|---|---|---|
+| `server.capability-profile` | Reported caps vs named profile | Runtime caps win when any codec/container cap is present; missing fields get conservative browser defaults. Otherwise use the named profile, then `web-h264`. Explicit DV profiles override the legacy all-DV bit. | Rust unit in `http/stream.rs` |
+| `server.verdict` | Direct vs remux vs transcode | Video codec, height, bitrate, or HDR failure means transcode. Container, audio, or A/V correction alone means remux. No failures means direct. Unknown container is not permission to direct-play it. | Table-driven Rust unit in `playback/mod.rs` |
+| `server.dolby-vision` | Preserve vs strip vs re-encode DV | A client-approved profile is preserved. An unsupported profile with a compatible base and `dovi_rpu` becomes a strip remux. Without both, re-encode. Apple-supported DV profiles still request a normalized copy-HLS envelope. | DV profile matrix in `playback/mod.rs` |
+| `server.manual-quality` | Auto vs Original vs a rung | Auto uses the ordinary verdict. Original never re-encodes video; it may direct or remux and lets the client rescue a rejection. Any numbered rung forces transcode. Unknown force values degrade to Auto. | Force matrix in `playback/mod.rs` |
+| `server.execution-plan` | Verdict to API action | Direct owns `/direct`; remux owns `/stream.mp4` plus a copy-session URL and flags; transcode owns the HLS-session URL. Clients execute this plan instead of rebuilding it from `method`. | Exhaustive `DeliveryPlan` Rust unit |
+| `server.segmented-remux` | Progressive vs segmented remux hint | Only remuxes are eligible. Prefer segments at source bitrate ≥40 Mb/s or storage headroom <8×; missing measurements preserve the old route. The browser must still prove MSE accepts the codecs. | Boundary units in `playback/mod.rs` |
+| `server.track-selection` | Initial audio/subtitle | Explicit viewer choice wins later. Cold start uses one shared language policy: original-language anime, configured languages, subtitle Auto/Always/Off, then container defaults. | Track-policy Rust matrix |
+| `server.subtitle-classification` | Sidecar vs rendition vs burn | Bitmap has no text route. SRT/SubRip/WebVTT may become native HLS renditions. Other text, including ASS and `mov_text`, can be extracted but not advertised as a native rendition, so session selection burns it. | Classifier Rust unit |
+| `server.session-kind` | Copy HLS vs transcode HLS | `SessionKind::Copy` preserves video and optionally converts audio/strips DV; `Transcode` runs the video recipe. A matching completed cache entry bypasses the encoder but does not change the logical kind. | Transcode-manager lifecycle unit |
+| `server.auto-rung` | Auto output height | Software follows the source up to 720p; proven hardware follows it up to 1080p. Both clamp to the source and never upscale. An explicit rung is snapped to the published ladder. | Encoder-aware async Rust unit |
+| `server.encoder` | Hardware family vs software | Honor a usable admin preference; otherwise take the first probed usable hardware encoder; software x264 is the unconditional fallback. Probe success, not advertised presence, is authority. | Every-family encoder units |
+| `server.tone-map-pipeline` | GPU graph vs CPU graph | A probed vendor graph is used only with its matching encoder and PQ HDR source. Bitmap overlay or a failed/incompatible graph declines to the recorded fallback; CPU is total. | Pipeline decision and fallback units |
+
+### Web — choose the browser transport and bounded rescues
+
+| ID | Fork | Current rule | Regression pin |
+|---|---|---|---|
+| `web.initial-route` | First browser delivery | Transcode verdict → HLS. Remux → copy HLS when Safari needs it or the server hint passes the MSE codec gate; otherwise progressive fMP4. Direct stays range-served unless a nonzero preferred audio track requires remux. | Node table over the shipped policy module |
+| `web.hls-transport` | Native HLS vs hls.js | Native capability counts only with WebKit's playback-target API, or when hls.js/MSE is unavailable. Even on Safari, native HLS is reserved for copied HEVC; other HLS uses hls.js so plurx keeps its controls and timeline. | Node native/MSE matrix |
+| `web.manual-quality` | Force and session height | Auto omits height unless a burn/refused remux must preserve a direct/remux resolution promise. Original and `nomse` preserve source height. Explicit 1080/720/480 requests that exact rung. | Node force/height matrix |
+| `web.compatibility-fallback` | Rejection to rescue | A direct/remux media rejection before real playback gets one H.264/AAC transcode. A transcode failure, a repeated failure, established playback, or an hls.js network failure does not loop into another encode. | Node fallback matrix |
+| `web.decode-rescue` | Accepted-but-choppy original | On Auto, after ≥150 s and ≥15 lost frames at ≥6/min, switch the copy/direct route to transcode. Pipeline latency is diagnostic only. Remember by codec/height unless buffer quota, and allow explicit Original/retests to clear it. | Node threshold/boundary unit |
+
+### Native clients — execute the plan without inventing a second server
+
+| ID | Fork | Current rule | Regression pin |
+|---|---|---|---|
+| `apple.transport-and-dv` | AVPlayer direct vs HLS | Execute the server mode, except normalize even a legacy direct Dolby Vision answer through preserving copy HLS. Overrides, audio changes, and subtitle needs decide whether that session copies or transcodes. | XCTest for legacy direct-DV normalization |
+| `apple.compatibility-fallback` | Apple decode/stall recovery | A preserved DV stream with an HDR10/HLG base strips to that base first; only the next failure uses the universal transcode. Each rescue is once and resumes the last truthful film position. | XCTest recovery ladder |
+| `apple.quality-session` | Picked rung vs Auto/burn height | A picked rung forces a transcode at that height. An otherwise-copyable subtitle burn preserves source height; an ordinary Auto transcode leaves the encoder-aware rung to the server. | XCTest source/rung/burn height matrix |
+| `apple.subtitle-route` | Media selection vs reopen | Native rendition switches stay inside AVPlayer once the session exists. Entering from direct, selecting/leaving a burn, or changing a burn reopens. Bitmap/styled tracks burn; ordinary native text does not. | XCTest route matrix |
+| `android.capability-profile` | Decoder/display/sink claims | Claim DV only when both decoder profile and display agree, never claim dual-layer P7, and claim passthrough audio when either the decoder or active sink can take it. | JVM capability matrix |
+| `android.compatibility-fallback` | Media3 decode recovery | Failed preserving direct DV first gets a normalized remux; any remaining direct/remux failure gets one compatibility transcode; a failed transcode is terminal. | JVM fallback matrix |
+| `android.manual-quality` | Auto/Original/rung force | Auto asks for the normal verdict, Original forbids video re-encode, and every server-advertised rung requests a transcode. The menu never invents a rung above the source. | JVM force and ladder matrix |
+| `android.session-height` | Quality/burn to session height | A burn and Original preserve source height; Auto omits height; an explicit rung sends that height. A copy session omits height because copied video cannot honor a rung. | JVM height and session-body matrix |
+| `android.subtitle-route` | Embedded vs native session vs burn | Direct embedded text stays in the plan. Remux/transcode text uses a native rendition session. Bitmap and styled tracks burn in every mode; session bodies forbid copy on a transcode verdict. | JVM subtitle and session-body matrix |
+
+<!-- playback-routing-inventory:end -->
+
+**How to read it:** start with the ID named by the behavior you are changing,
+then read its source and pin from the TOML catalog. A new rule that changes
+bytes or transport is incomplete until it has a new ID, a source anchor, a
+behavior test, and a row here. Changing an existing rule means changing its
+unit test and this prose in the same commit.
+
+## Runtime caps — what each client tells the server
+
+Before the first `/decision`, each player reports what that device can decode.
+The server folds those query parameters into an ad-hoc device profile
+(`caps_profile` in
+`plurx-core/src/playback`), so a file only transcodes when *this* device
 genuinely can't play it — not because a fixed profile guessed conservatively.
 
 | Cap | Probed with | Notes |
@@ -68,6 +135,13 @@ genuinely can't play it — not because a fixed profile guessed conservatively.
 | `acodec` | `canPlayType` | `aac`,`mp3` always; `ac3`/`eac3` where supported (Safari), `opus`/`flac` per browser. |
 | `container` | fixed | `mp4,webm,mov` — what a browser `<video>` accepts as a file. Notably **not** `mkv`. |
 | `hdr` | `matchMedia("(dynamic-range: high)")` | `1` only on an HDR display *and* an HDR-capable codec — else the server tone-maps, because HDR on an SDR screen looks washed-out. |
+| `dvprofile` | platform codec APIs | Exact Dolby Vision profiles the decoder and current display both accept. Apple and Android advertise single-layer delivery profiles, never infer P7 from generic HDR. |
+| `dvhls` | platform policy | Apple sends `1`: an approved DV stream still needs normalized copy HLS rather than a raw progressive file. Browser/Android omit it unless they need the same envelope. |
+
+The native clients use platform codec/display APIs instead of browser probes.
+Android also includes audio support exposed by the active HDMI/audio sink,
+because passthrough eligibility changes with the route. Apple limits progressive
+containers to MP4/MOV/M4V and asks the server to remux everything else into HLS.
 
 **How to read it:** the caps are why the same file behaves differently across
 browsers. A 4K HEVC/HDR MKV with DTS audio reports the *same* verdict on Chrome
@@ -168,7 +242,7 @@ The practical rule for a client: **gate a session-mode subtitle pick on
 `native`, and offer everything else with `text` through the sidecar.** A
 bitmap track (`text: false`) has neither route and only ever burns in.
 
-## Delivery — the client's transport choice
+## Web delivery — the browser's transport choice
 
 A verdict names *what* to send; the client still has to pick *how*, because a
 `<video>` element's tolerances differ by engine. The rule that matters:
@@ -201,6 +275,28 @@ The full matrix:
 (`WebKitPlaybackTargetAvailabilityEvent`), **not** `canPlayType('…mpegurl')` —
 Chrome answers "maybe" to that query but has no native HLS, so the naive gate
 would push Chrome onto a path it can't run.
+
+## Native delivery — Apple and Android execute the same plan differently
+
+Native players do not use the web transport table. They consume the same
+`delivery` object, then apply only the platform decisions the server cannot
+make.
+
+| Server plan / override | Apple AVPlayer | Android Media3 |
+|---|---|---|
+| Direct, no override | Raw `/direct`; supported DV is normalized through copy HLS | Raw `/direct` |
+| Remux, no override | Copy-video HLS; AVPlayer does not take plurx's progressive fMP4 reliably | Progressive `/stream.mp4` |
+| Transcode | HLS session | HLS session |
+| Native text subtitle needs a session | Copy HLS for a direct/remux plan; existing rendition switches stay in AVPlayer | Direct keeps an embedded text track; remux/transcode opens a native-rendition HLS session |
+| Bitmap/styled subtitle | HLS transcode with burn-in | HLS transcode with burn-in |
+| Direct + manual A/V correction | Not currently exposed by the Apple player | Progressive remux, because ffmpeg must apply the correction |
+| Finished cache hit | HLS VOD; seek in place | HLS VOD; seek in place |
+
+**How to read it:** direct/remux plans mean the source video is copyable, not
+that every platform must use the same container. A subtitle rendition or audio
+selection may move either native client into an HLS *session* while leaving the
+video a remux. Only a transcode verdict, burn, picked rung, or compatibility
+fallback authorizes different video bytes.
 
 ## Copy-video HLS — the remux path Safari can play
 
@@ -499,8 +595,22 @@ covering the other.
   remux/copy always transcodes that audio to AAC. Passthrough is a
   native-client concern (see [CLIENTS.md](CLIENTS.md)).
 
-Playback correctness is verified without ffmpeg or a browser: the decision
-engine and the ffmpeg arg builders are pure functions with unit tests
-(`plurx-core/src/playback`, `plurx-core/src/transcode`). What those tests can't
-cover — that a given browser actually plays a given stream — is exactly what the
-per-browser transport table above encodes, learned from device testing.
+Playback policy is verified without ffmpeg or a browser: the server decision,
+encoder, pipeline, and argument builders are Rust units; the web transport and
+fallback policy is a Node unit; Apple uses XCTest; Android uses JVM tests. Run
+the fast policy layer with:
+
+```bash
+cargo test -p plurx-core playback        # server verdicts and remux hint
+cargo test -p plurxd                     # execution plan and session routing
+node tests/playback/web-policy.test.js   # shipped browser policy
+make apple-test                          # Apple transport/fallback/subtitles
+make android-test                        # Android caps/fallback/subtitles
+```
+
+The inventory itself is kept honest by
+`tests/validation/test_playback_routing_inventory.py`, which runs in the commit
+gate. What those units cannot prove — that a shipping decoder actually presents
+the selected stream — belongs to the source × quality × operation playback lab
+in [PLAYBACK-TESTING.md](PLAYBACK-TESTING.md), not to another guessed codec
+table.
