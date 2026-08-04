@@ -169,6 +169,13 @@ test = "clients/apple/Tests/AppleClientTests.swift"
 test_anchor = "testEstablishedHDRRecoveryNeverChoosesTheSDRFallback"
 
 [[decisions]]
+id = "apple.hls-buffer-window"
+source = "clients/apple/Sources/PlayerController.swift"
+source_anchor = "static func configureBuffering("
+test = "clients/apple/Tests/AppleClientTests.swift"
+test_anchor = "testGrowingHLSSessionStaysInsideTheServerRetentionContract"
+
+[[decisions]]
 id = "apple.quality-session"
 source = "clients/apple/Sources/PlayerController.swift"
 source_anchor = "static func burnSessionHeight("

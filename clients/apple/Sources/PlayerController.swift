@@ -204,6 +204,21 @@ enum SubtitleSelectionRoute: Equatable {
 /// first frame (`needsNativeSubtitleSession`).
 @MainActor
 final class PlayerController: ObservableObject {
+    /// The server retains 120 seconds behind the download frontier: 60 seconds
+    /// for the client's forward fetch, 30 for back-buffering, and 30 for a
+    /// retry. AVPlayer's default of zero lets it choose the forward fetch;
+    /// once that passed the server's retention window, the reaper could delete
+    /// media the player had fetched but had not presented yet. Keep growing
+    /// HLS sessions inside the contract while leaving direct and completed-VOD
+    /// items under AVPlayer's normal policy.
+    static let growingHLSForwardBufferSeconds: TimeInterval = 60
+
+    static func configureBuffering(_ item: AVPlayerItem, growingHLS: Bool) {
+        item.preferredForwardBufferDuration = growingHLS
+            ? growingHLSForwardBufferSeconds
+            : 0
+    }
+
     let player = AVPlayer()
 
     @Published private(set) var decision: Decision?
@@ -839,6 +854,7 @@ final class PlayerController: ObservableObject {
             return
         }
         let item = AVPlayerItem(url: url)
+        Self.configureBuffering(item, growingHLS: sessionId != nil && !isVOD)
         #if os(iOS)
         // The tvOS 26 SDK exposes this setter, but some shipping Apple TV
         // runtimes do not implement it and abort on the Objective-C selector.
