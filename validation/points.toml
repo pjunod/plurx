@@ -110,6 +110,7 @@ profiles = ["ci", "full", "nightly"]
 platforms = ["darwin", "linux"]
 requires = ["docker"]
 missing = "skip"
+skip_if_env = ["PLURX_SKIP_ANDROID_JVM"]
 timeout_seconds = 3600
 
 [[checks]]
@@ -242,7 +243,6 @@ paths = [
   "tests/contracts/native-api.json",
   "crates/plurxd/src/http/{dto,mod}.rs",
   "clients/apple/Sources/{PlurxAPI,Models}.swift",
-  "clients/apple/Tests/AppleClientTests.swift",
   "clients/android/app/src/main/java/tv/plurx/app/data/**",
   "clients/android/app/src/test/java/tv/plurx/app/data/ModelContractTest.kt",
 ]

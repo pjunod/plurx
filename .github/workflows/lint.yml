@@ -9,6 +9,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+concurrency:
+  group: lint-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 # Dedicated workflow so the README can carry a granular "lint" badge separate
 # from tests/build. It runs the same fmt + clippy gate a developer runs locally
 # (`make fmt-check lint`, the lint half of `make check`), so it never diverges.
