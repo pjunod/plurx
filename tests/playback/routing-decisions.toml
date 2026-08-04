@@ -1,0 +1,183 @@
+version = 1
+
+[[decisions]]
+id = "server.capability-profile"
+source = "crates/plurxd/src/http/stream.rs"
+source_anchor = "fn profile(&self) -> playback::DeviceProfile"
+test = "crates/plurxd/src/http/stream.rs"
+test_anchor = "explicit_dolby_vision_profiles_override_the_legacy_all_profiles_bit"
+
+[[decisions]]
+id = "server.verdict"
+source = "crates/plurx-core/src/playback/mod.rs"
+source_anchor = "pub fn decide("
+test = "crates/plurx-core/src/playback/mod.rs"
+test_anchor = "automatic_routing_matrix_covers_every_compatibility_dimension"
+
+[[decisions]]
+id = "server.dolby-vision"
+source = "crates/plurx-core/src/playback/mod.rs"
+source_anchor = "fn dv_handling("
+test = "crates/plurx-core/src/playback/mod.rs"
+test_anchor = "dolby_vision_profiles_are_negotiated_individually"
+
+[[decisions]]
+id = "server.manual-quality"
+source = "crates/plurx-core/src/playback/mod.rs"
+source_anchor = "pub fn decide_forced("
+test = "crates/plurx-core/src/playback/mod.rs"
+test_anchor = "manual_quality_matrix_pins_auto_original_and_every_rung"
+
+[[decisions]]
+id = "server.execution-plan"
+source = "crates/plurxd/src/http/stream.rs"
+source_anchor = "fn delivery_plan("
+test = "crates/plurxd/src/http/stream.rs"
+test_anchor = "every_verdict_has_one_server_owned_execution_plan"
+
+[[decisions]]
+id = "server.segmented-remux"
+source = "crates/plurx-core/src/playback/mod.rs"
+source_anchor = "pub fn prefer_segmented("
+test = "crates/plurx-core/src/playback/mod.rs"
+test_anchor = "a_modest_file_on_slow_storage_still_wants_segments"
+
+[[decisions]]
+id = "server.track-selection"
+source = "crates/plurx-core/src/tracks.rs"
+source_anchor = "pub fn select_tracks("
+test = "crates/plurx-core/src/tracks.rs"
+test_anchor = "anime_prefers_japanese_audio_and_preferred_subs"
+
+[[decisions]]
+id = "server.subtitle-classification"
+source = "crates/plurx-core/src/tracks.rs"
+source_anchor = "pub fn is_native_text_subtitle("
+test = "crates/plurx-core/src/tracks.rs"
+test_anchor = "native_hls_text_and_burn_fallback_are_distinct"
+
+[[decisions]]
+id = "server.session-kind"
+source = "crates/plurxd/src/transcode.rs"
+source_anchor = "pub async fn create_session("
+test = "crates/plurxd/src/transcode.rs"
+test_anchor = "manager_reads_prefs_and_runs_session_lifecycle"
+
+[[decisions]]
+id = "server.auto-rung"
+source = "crates/plurxd/src/transcode.rs"
+source_anchor = "pub async fn auto_height("
+test = "crates/plurxd/src/transcode.rs"
+test_anchor = "auto_follows_the_source_only_when_hardware_can_carry_it"
+
+[[decisions]]
+id = "server.encoder"
+source = "crates/plurx-core/src/transcode/encoder.rs"
+source_anchor = "pub fn choose(&self, prefer: &str) -> Encoder"
+test = "crates/plurx-core/src/transcode/encoder.rs"
+test_anchor = "choose_honors_preference_then_falls_back"
+
+[[decisions]]
+id = "server.tone-map-pipeline"
+source = "crates/plurx-core/src/transcode/pipeline.rs"
+source_anchor = "pub fn for_session("
+test = "crates/plurx-core/src/transcode/pipeline.rs"
+test_anchor = "a_session_can_be_sent_back_to_the_cpu_by_what_it_is_doing"
+
+[[decisions]]
+id = "web.initial-route"
+source = "crates/plurxd/src/web/playback-policy.js"
+source_anchor = "function initialRoute("
+test = "tests/playback/web-policy.test.js"
+test_anchor = "every server verdict reaches exactly one initial web transport"
+
+[[decisions]]
+id = "web.hls-transport"
+source = "crates/plurxd/src/web/playback-policy.js"
+source_anchor = "function nativeHlsAvailable("
+test = "tests/playback/web-policy.test.js"
+test_anchor = "native HLS is Safari-only unless MSE is unavailable"
+
+[[decisions]]
+id = "web.manual-quality"
+source = "crates/plurxd/src/web/playback-policy.js"
+source_anchor = "function sessionHeight("
+test = "tests/playback/web-policy.test.js"
+test_anchor = "manual quality and rescue height preserve the viewer's promise"
+
+[[decisions]]
+id = "web.compatibility-fallback"
+source = "crates/plurxd/src/web/playback-policy.js"
+source_anchor = "function fallbackAction("
+test = "tests/playback/web-policy.test.js"
+test_anchor = "a rejected cheap stream gets one compatibility transcode"
+
+[[decisions]]
+id = "web.decode-rescue"
+source = "crates/plurxd/src/web/playback-policy.js"
+source_anchor = "function decodeMarginVerdict("
+test = "tests/playback/web-policy.test.js"
+test_anchor = "decode rescue uses lost frames over a long window, not pipeline latency"
+
+[[decisions]]
+id = "apple.transport-and-dv"
+source = "clients/apple/Sources/PlayerController.swift"
+source_anchor = "static func playbackMode(_ decision: Decision) -> String"
+test = "clients/apple/Tests/AppleClientTests.swift"
+test_anchor = "testLegacyDirectDolbyVisionIsNormalizedToPreservingHls"
+
+[[decisions]]
+id = "apple.compatibility-fallback"
+source = "clients/apple/Sources/PlayerController.swift"
+source_anchor = "static func nextCompatibilityFallback("
+test = "clients/apple/Tests/AppleClientTests.swift"
+test_anchor = "testApplePlayerFallsBackFromDolbyVisionToHDRBeforeSDR"
+
+[[decisions]]
+id = "apple.quality-session"
+source = "clients/apple/Sources/PlayerController.swift"
+source_anchor = "static func burnSessionHeight("
+test = "clients/apple/Tests/AppleClientTests.swift"
+test_anchor = "testAutomaticSubtitlesStillTakeAForcedBitmapTrackAtSourceHeight"
+
+[[decisions]]
+id = "apple.subtitle-route"
+source = "clients/apple/Sources/PlayerController.swift"
+source_anchor = "static func subtitleSelectionRoute("
+test = "clients/apple/Tests/AppleClientTests.swift"
+test_anchor = "testSelectSubtitleRoutingReopensOnceForABurnAndStaysInPlaceForNative"
+
+[[decisions]]
+id = "android.capability-profile"
+source = "clients/android/app/src/main/java/tv/plurx/app/data/CapsPolicy.kt"
+source_anchor = "internal fun dolbyVisionCaps("
+test = "clients/android/app/src/test/java/tv/plurx/app/data/CapsPolicyTest.kt"
+test_anchor = "dolbyVisionIsClaimedOnlyWhenDecoderAndDisplayBothAgree"
+
+[[decisions]]
+id = "android.compatibility-fallback"
+source = "clients/android/app/src/main/java/tv/plurx/app/player/PlaybackPolicy.kt"
+source_anchor = "internal fun playbackErrorAction("
+test = "clients/android/app/src/test/java/tv/plurx/app/player/PlaybackPolicyTest.kt"
+test_anchor = "dolbyVisionDirectPlayGetsAContainerRescueBeforeTheSdrLastResort"
+
+[[decisions]]
+id = "android.manual-quality"
+source = "clients/android/app/src/main/java/tv/plurx/app/player/PlaybackPolicy.kt"
+source_anchor = "internal fun decisionForce("
+test = "clients/android/app/src/test/java/tv/plurx/app/player/PlaybackPolicyTest.kt"
+test_anchor = "forceSaysWhatTheMenuMeans"
+
+[[decisions]]
+id = "android.session-height"
+source = "clients/android/app/src/main/java/tv/plurx/app/player/SubtitlePolicy.kt"
+source_anchor = "internal fun sessionHeight("
+test = "clients/android/app/src/test/java/tv/plurx/app/player/SubtitlePolicyTest.kt"
+test_anchor = "heightIsAPromiseForBurnsAndOriginalAndARungOtherwise"
+
+[[decisions]]
+id = "android.subtitle-route"
+source = "clients/android/app/src/main/java/tv/plurx/app/player/SubtitlePolicy.kt"
+source_anchor = "internal fun subtitleRoute("
+test = "clients/android/app/src/test/java/tv/plurx/app/player/SubtitlePolicyTest.kt"
+test_anchor = "bitmapAndStyledTracksBurnInEveryMode"

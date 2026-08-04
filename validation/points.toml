@@ -72,7 +72,7 @@ id = "web-static"
 title = "Embedded JavaScript and theme contrast"
 command = "make web-check"
 profiles = ["commit", "ci", "full", "nightly"]
-requires = ["python3"]
+requires = ["node", "python3"]
 missing = "fail"
 timeout_seconds = 120
 
@@ -310,13 +310,14 @@ paths = [
   "crates/plurx-core/src/transcode/**",
   "crates/plurxd/src/{admission,copyseg,delivery,ffmpeg,meter,pipeprobe,playstart,produce,progressive,subtitles,transcode}.rs",
   "crates/plurxd/src/http/{hls,stream}.rs",
+  "crates/plurxd/src/web/playback-policy.js",
   "docs/PLAYBACK*.md",
   "docs/STUTTER-4K.md",
   "scripts/dv-evidence",
   "scripts/playback-lab",
   "tests/playback/**",
 ]
-checks = ["rust-gate", "playback-smoke", "playback-recovery", "resource-bounds", "playback-exhaustive"]
+checks = ["rust-gate", "web-static", "playback-smoke", "playback-recovery", "resource-bounds", "playback-exhaustive"]
 depends_on = ["core.media", "server.api", "library.catalog"]
 
 [[points]]

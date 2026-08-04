@@ -15,6 +15,9 @@ use serde::Deserialize;
 use crate::state::AppState;
 
 const INDEX_HTML: &str = include_str!("../web/index.html");
+/// Pure playback-routing policy, separated from the player adapter so the
+/// decisions that change bytes or transport can run under Node unit tests.
+const PLAYBACK_POLICY_JS: &str = include_str!("../web/playback-policy.js");
 /// hls.js (bundled for the transcode playback path; keeps the single-binary,
 /// works-offline promise instead of a CDN dependency).
 const HLS_JS: &str = include_str!("../web/hls.min.js");
@@ -40,6 +43,19 @@ pub async fn hls_js() -> Response {
             (header::CACHE_CONTROL, "public, max-age=604800"),
         ],
         HLS_JS,
+    )
+        .into_response()
+}
+
+/// Serve the web player's unit-tested routing policy.
+pub async fn playback_policy_js() -> Response {
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/javascript"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        PLAYBACK_POLICY_JS,
     )
         .into_response()
 }
@@ -181,7 +197,7 @@ pub async fn fallback(uri: axum::http::Uri) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{connection_qr_svg, INDEX_HTML};
+    use super::{connection_qr_svg, INDEX_HTML, PLAYBACK_POLICY_JS};
 
     #[test]
     fn app_shell_shows_the_running_build_to_signed_in_and_signed_out_users() {
@@ -189,6 +205,18 @@ mod tests {
             INDEX_HTML.matches("Version ${esc(buildLabel())}").count(),
             2
         );
+    }
+
+    #[test]
+    fn app_shell_loads_the_tested_playback_policy_before_the_player() {
+        let policy = INDEX_HTML
+            .find("/assets/playback-policy.js")
+            .expect("policy script");
+        let player = INDEX_HTML
+            .find("const PlaybackPolicy")
+            .expect("player script");
+        assert!(policy < player);
+        assert!(PLAYBACK_POLICY_JS.contains("function initialRoute"));
     }
 
     #[test]
