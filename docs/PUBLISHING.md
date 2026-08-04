@@ -20,11 +20,12 @@ knowing what it bought.
 
 ## Ansible owns the repeatable mobile deploy
 
-The versioned playbook is
-[`deploy/ansible/mobile.yml`](../deploy/ansible/mobile.yml). It runs on the
-macOS `control` host already present in the infrastructure inventory: Android
-needs that machine's paired `adb` devices, while Apple needs its Xcode signing
-identity and App Store Connect key. Neither job belongs on a Linux media node.
+The versioned playbook is `~/code/ansible/media/mobile.yml` in the private
+[`pjunod/ansible`](https://github.com/pjunod/ansible) infrastructure repo. It
+runs on the macOS `control` host already present in that repo's inventory:
+Android needs the controller's paired `adb` devices, while Apple needs its
+Xcode signing identity and App Store Connect key. Neither job belongs on a
+Linux media node.
 
 ```text
                          ┌─ Android tests + lint + APK ─▶ physical adb devices
@@ -32,9 +33,9 @@ Ansible `control` host ──┤
                          └─ Apple tests + archives ─────▶ TestFlight upload
 ```
 
-Copy the relevant variables from
-[`inventory.example.yml`](../deploy/ansible/inventory.example.yml) into the
-production inventory's `control` host. `plurx_android_connect` pairs network
+Copy the relevant variables from `media/inventory.example.yml` in the Ansible
+repo into the production inventory's `control` host.
+`plurx_android_connect` pairs network
 endpoints before discovery · `plurx_android_serials` limits deployment to named
 adb endpoints · `plurx_android_required_serials` names the physical hardware
 that must receive the build. Required devices use the value from
@@ -73,6 +74,8 @@ scripts/ship --apple --dry-run     # print the exact invocation, change nothing
 ```
 
 `PLURX_ANSIBLE_INVENTORY=/path/inventory.yml` selects a different inventory.
+`PLURX_ANSIBLE_DIR=/path/to/ansible/media` selects a different playbook
+directory when the private repo is not checked out at `~/code/ansible`.
 `PLURX_MOBILE_VARS_FILE=/path/mobile.yml` adds an untracked vars file when the
 production inventory cannot own device settings. Set
 `plurx_apple_upload: false` only for an intentional signed archive/export run;
