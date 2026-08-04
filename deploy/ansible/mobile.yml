@@ -1,0 +1,38 @@
+---
+# Build and deploy both native client families from the macOS Ansible
+# controller. The inventory owns device identity; credentials stay in the
+# controller's environment and Keychain.
+- name: Deploy Plurx mobile clients
+  hosts: control
+  gather_facts: false
+  any_errors_fatal: true
+
+  pre_tasks:
+    - name: Resolve the Plurx checkout
+      ansible.builtin.set_fact:
+        mobile_repo: >-
+          {{ (plurx_repo | default(playbook_dir ~ '/../..')) | expanduser }}
+      tags: always
+
+    - name: Verify the Plurx checkout
+      ansible.builtin.stat:
+        path: "{{ mobile_repo }}/Cargo.toml"
+      register: mobile_repo_manifest
+      tags: always
+
+    - name: Refuse an unrelated checkout
+      ansible.builtin.assert:
+        that: mobile_repo_manifest.stat.isreg | default(false)
+        fail_msg: >-
+          {{ mobile_repo }} is not a Plurx checkout. Set `plurx_repo` in the
+          control host inventory or pass `-e plurx_repo=/absolute/path`.
+      tags: always
+
+  tasks:
+    - name: Run the Android deployment
+      ansible.builtin.import_tasks: tasks/mobile-android.yml
+      tags: android
+
+    - name: Run the Apple deployment
+      ansible.builtin.import_tasks: tasks/mobile-apple.yml
+      tags: apple

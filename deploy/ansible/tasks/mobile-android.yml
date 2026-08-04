@@ -1,0 +1,141 @@
+---
+- name: Resolve Android deployment settings
+  ansible.builtin.set_fact:
+    android_adb: >-
+      {{ plurx_android_adb |
+         default(lookup('env', 'ADB') | default('adb', true), true) }}
+    android_connect_endpoints: "{{ plurx_android_connect | default([]) }}"
+    android_selected_serials: "{{ plurx_android_serials | default([]) }}"
+    android_required_serials: >-
+      {{ plurx_android_required_serials |
+         default((lookup('env', 'PLURX_ANDROID_REQUIRED_SERIALS') |
+                  default('HA263LBP', true)).split()) }}
+    android_apk: >-
+      {{ mobile_repo }}/clients/android/app/build/outputs/apk/debug/app-debug.apk
+
+- name: Build and test the Android app
+  ansible.builtin.command:
+    argv:
+      - ./gradlew
+      - --no-daemon
+      - testDebugUnitTest
+      - :app:lintDebug
+      - :app:assembleDebug
+    chdir: "{{ mobile_repo }}/clients/android"
+  changed_when: true
+
+- name: Connect configured network Android devices
+  ansible.builtin.command:
+    argv:
+      - "{{ android_adb }}"
+      - connect
+      - "{{ item }}"
+  loop: "{{ android_connect_endpoints }}"
+  register: android_connect_results
+  changed_when: "'already connected' not in android_connect_results.stdout"
+  failed_when: >-
+    android_connect_results.rc != 0 or
+    'failed to connect' in android_connect_results.stdout | lower
+
+- name: Read connected Android devices
+  ansible.builtin.command:
+    argv:
+      - "{{ android_adb }}"
+      - devices
+  register: android_adb_devices
+  check_mode: false
+  changed_when: false
+
+- name: Resolve online physical Android endpoints
+  ansible.builtin.set_fact:
+    android_online_endpoints: >-
+      {{ android_adb_devices.stdout_lines[1:] |
+         select('match', '^.+\s+device$') |
+         map('regex_replace', '\s+device$', '') |
+         reject('match', '^emulator-') |
+         list }}
+
+- name: Select Android deployment endpoints
+  ansible.builtin.set_fact:
+    android_target_endpoints: >-
+      {{ android_selected_serials if android_selected_serials | length > 0
+         else android_online_endpoints }}
+
+- name: Refuse missing selected Android endpoints
+  ansible.builtin.assert:
+    that:
+      - android_selected_serials | difference(android_online_endpoints) | length == 0
+    fail_msg: >-
+      Selected Android endpoint(s) are not online: {{ android_selected_serials |
+      difference(android_online_endpoints) | join(', ') }}. Pair or connect them,
+      then re-run the playbook.
+  when: android_selected_serials | length > 0
+
+- name: Refuse an Android deploy with no physical devices
+  ansible.builtin.assert:
+    that: android_target_endpoints | length > 0
+    fail_msg: >-
+      adb reports no physical devices. Attach one, use `adb connect`, or set
+      `plurx_android_connect` in the control host inventory.
+
+- name: Read Android hardware serials
+  ansible.builtin.command:
+    argv:
+      - "{{ android_adb }}"
+      - -s
+      - "{{ item }}"
+      - shell
+      - getprop
+      - ro.serialno
+  loop: "{{ android_target_endpoints }}"
+  register: android_hardware_probes
+  check_mode: false
+  changed_when: false
+  failed_when: false
+
+- name: Start the unique Android device list
+  ansible.builtin.set_fact:
+    android_unique_devices: []
+
+- name: Keep each physical Android device once
+  ansible.builtin.set_fact:
+    android_unique_devices: >-
+      {{ android_unique_devices +
+         [{'endpoint': item.item,
+           'hardware_serial': item.stdout | trim | default(item.item, true)}] }}
+  loop: "{{ android_hardware_probes.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: >-
+    (item.stdout | trim | default(item.item, true)) not in
+    (android_unique_devices | map(attribute='hardware_serial') | list)
+
+- name: Resolve missing required Android devices
+  ansible.builtin.set_fact:
+    android_missing_required: >-
+      {{ android_required_serials |
+         difference(android_unique_devices |
+                    map(attribute='hardware_serial') | list) }}
+
+- name: Refuse a partial Android deployment
+  ansible.builtin.assert:
+    that: android_missing_required | length == 0
+    fail_msg: >-
+      Required Android device(s) did not receive this build:
+      {{ android_missing_required | join(', ') }}. Change
+      `plurx_android_required_serials` only when the intended deployment set
+      changes.
+
+- name: Install the Android app
+  ansible.builtin.command:
+    argv:
+      - "{{ android_adb }}"
+      - -s
+      - "{{ item.endpoint }}"
+      - install
+      - -r
+      - "{{ android_apk }}"
+  loop: "{{ android_unique_devices }}"
+  loop_control:
+    label: "{{ item.endpoint }} ({{ item.hardware_serial }})"
+  changed_when: true

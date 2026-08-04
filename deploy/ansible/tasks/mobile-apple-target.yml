@@ -1,0 +1,58 @@
+---
+- name: "Archive {{ apple_target.scheme }}"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['xcodebuild', '-project', 'plurx.xcodeproj',
+          '-scheme', apple_target.scheme,
+          '-destination', 'generic/platform=' ~ apple_target.platform,
+          '-archivePath', mobile_repo ~ '/target/apple/' ~
+                          apple_target.scheme ~ '.xcarchive',
+          '-allowProvisioningUpdates'] +
+         apple_xcode_authentication + ['archive'] }}
+    chdir: "{{ mobile_repo }}/clients/apple"
+  changed_when: true
+
+- name: "Export and upload to TestFlight | {{ apple_target.scheme }}"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['xcodebuild', '-exportArchive',
+          '-archivePath', mobile_repo ~ '/target/apple/' ~
+                          apple_target.scheme ~ '.xcarchive',
+          '-exportOptionsPlist', mobile_repo ~
+                                 '/deploy/ansible/ExportOptionsUpload.plist',
+          '-exportPath', mobile_repo ~ '/target/apple/' ~ apple_target.scheme,
+          '-allowProvisioningUpdates'] + apple_xcode_authentication }}
+    chdir: "{{ mobile_repo }}/clients/apple"
+  changed_when: true
+  when: apple_upload
+
+- name: "Export without uploading | {{ apple_target.scheme }}"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['xcodebuild', '-exportArchive',
+          '-archivePath', mobile_repo ~ '/target/apple/' ~
+                          apple_target.scheme ~ '.xcarchive',
+          '-exportOptionsPlist', mobile_repo ~
+                                 '/clients/apple/ExportOptions.plist',
+          '-exportPath', mobile_repo ~ '/target/apple/' ~ apple_target.scheme,
+          '-allowProvisioningUpdates'] + apple_xcode_authentication }}
+    chdir: "{{ mobile_repo }}/clients/apple"
+  changed_when: true
+  when: not apple_upload
+
+- name: "Find the exported package | {{ apple_target.scheme }}"
+  ansible.builtin.find:
+    paths: "{{ mobile_repo }}/target/apple/{{ apple_target.scheme }}"
+    patterns: "*.ipa"
+    file_type: file
+    recurse: false
+  register: apple_exported_packages
+  when: not apple_upload
+
+- name: "Verify the exported package | {{ apple_target.scheme }}"
+  ansible.builtin.assert:
+    that: apple_exported_packages.matched == 1
+    fail_msg: >-
+      Expected one IPA under target/apple/{{ apple_target.scheme }}, found
+      {{ apple_exported_packages.matched }}.
+  when: not apple_upload

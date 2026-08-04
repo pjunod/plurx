@@ -104,6 +104,10 @@ only what this hardware genuinely can't play.
 
 ## Build and install on your own devices
 
+TestFlight delivery is automated through the macOS Ansible controller; it
+tests both schemes, then archives and uploads each platform. See
+[`docs/PUBLISHING.md`](../../docs/PUBLISHING.md#ansible-owns-the-repeatable-mobile-deploy).
+
 ```bash
 cd clients/apple
 xcodegen generate        # writes plurx.xcodeproj from project.yml
