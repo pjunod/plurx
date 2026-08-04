@@ -212,13 +212,20 @@ checks = ["baseline"]
             subprocess.run(["git", "config", "user.email", "validation@example.invalid"], cwd=root, check=True)
             original = root / "old name.txt"
             original.write_text("old\n", encoding="utf-8")
+            deleted = root / "deleted.txt"
+            deleted.write_text("delete me\n", encoding="utf-8")
             subprocess.run(["git", "add", "old name.txt"], cwd=root, check=True)
+            subprocess.run(["git", "add", "deleted.txt"], cwd=root, check=True)
             subprocess.run(["git", "commit", "-qm", "seed"], cwd=root, check=True)
             original.rename(root / "new name.txt")
+            deleted.unlink()
             (root / "added.txt").write_text("new\n", encoding="utf-8")
             subprocess.run(["git", "add", "-A"], cwd=root, check=True)
 
-            self.assertEqual(changed_paths(root, "staged"), ("added.txt", "new name.txt"))
+            self.assertEqual(
+                changed_paths(root, "staged"),
+                ("added.txt", "deleted.txt", "new name.txt"),
+            )
 
     def test_timeout_and_fail_fast_are_recorded_as_failures(self):
         catalog = self.load()

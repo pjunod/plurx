@@ -50,6 +50,15 @@ missing = "fail"
 timeout_seconds = 120
 
 [[checks]]
+id = "mobile-version"
+title = "Changed mobile apps advance their store build numbers"
+command = "python3 -m validation.mobile_versions"
+profiles = ["commit", "ci", "full", "nightly"]
+requires = ["git", "python3"]
+missing = "fail"
+timeout_seconds = 60
+
+[[checks]]
 id = "rust-gate"
 title = "Rust format, lint, and workspace tests"
 command = "make rust-check"
@@ -351,6 +360,25 @@ paths = [
 ]
 checks = ["rust-gate", "web-static", "web-layout", "playback-smoke", "playback-exhaustive"]
 depends_on = ["server.api", "api.contract", "identity.access", "metadata.enrichment", "playback.pipeline"]
+
+[[points]]
+id = "mobile.versioning"
+title = "Mobile release versioning"
+contract = "Shipped Apple and Android changes advance their store build counters, and both marketing versions track the workspace release."
+paths = [
+  "Cargo.toml",
+  "clients/apple/Sources/**",
+  "clients/apple/Resources/**",
+  "clients/apple/project.yml",
+  "clients/android/app/src/main/**",
+  "clients/android/app/build.gradle.kts",
+  "clients/android/app/proguard-rules.pro",
+  "clients/android/build.gradle.kts",
+  "clients/android/gradle.properties",
+  "clients/android/gradle/libs.versions.toml",
+  "clients/android/settings.gradle.kts",
+]
+checks = ["mobile-version"]
 
 [[points]]
 id = "apple.client"

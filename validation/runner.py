@@ -471,11 +471,15 @@ def _missing_reason(check: Check, repo_root: Path) -> str | None:
 
 
 def _run_shell(
-    command: str, repo_root: Path, timeout_seconds: int
+    command: str,
+    repo_root: Path,
+    timeout_seconds: int,
+    environment_overrides: dict[str, str] | None = None,
 ) -> tuple[int, str, float]:
     started = time.monotonic()
     environment = os.environ.copy()
     environment["PLURX_VALIDATION"] = "1"
+    environment.update(environment_overrides or {})
     try:
         completed = subprocess.run(
             command,
@@ -504,6 +508,7 @@ def execute_checks(
     *,
     strict: bool,
     fail_fast: bool,
+    environment: dict[str, str] | None = None,
 ) -> list[CheckResult]:
     logs_dir = artifact_dir / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
@@ -528,7 +533,9 @@ def execute_checks(
 
         missing = _missing_reason(check, repo_root)
         if not missing and check.preflight:
-            code, output, _ = _run_shell(check.preflight, repo_root, 30)
+            code, output, _ = _run_shell(
+                check.preflight, repo_root, 30, environment
+            )
             if code != 0:
                 detail = output.strip().splitlines()
                 missing = "preflight failed" + (f": {detail[-1]}" if detail else "")
@@ -543,7 +550,7 @@ def execute_checks(
 
         print(f"    $ {check.command}", flush=True)
         returncode, output, seconds = _run_shell(
-            check.command, repo_root, check.timeout_seconds
+            check.command, repo_root, check.timeout_seconds, environment
         )
         log_path = logs_dir / f"{check.id}.log"
         log_path.write_text(output, encoding="utf-8")
@@ -693,9 +700,23 @@ def write_reports(
 
 def changed_paths(repo_root: Path, mode: str, base: str | None = None) -> tuple[str, ...]:
     if mode == "staged":
-        command = ["git", "diff", "--cached", "--name-only", "-z", "--diff-filter=ACMR"]
+        command = [
+            "git",
+            "diff",
+            "--cached",
+            "--name-only",
+            "-z",
+            "--diff-filter=ACMRD",
+        ]
     elif mode == "changed-from" and base:
-        command = ["git", "diff", "--name-only", "-z", "--diff-filter=ACMR", f"{base}...HEAD"]
+        command = [
+            "git",
+            "diff",
+            "--name-only",
+            "-z",
+            "--diff-filter=ACMRD",
+            f"{base}...HEAD",
+        ]
     else:
         raise CatalogError(f"unsupported change mode: {mode}")
     try:
@@ -730,6 +751,21 @@ def _selection_from_args(args: argparse.Namespace, catalog: Catalog) -> Selectio
             catalog, changed_paths(REPO_ROOT, "changed-from", args.changed_from)
         )
     return select_all(catalog)
+
+
+def _validation_environment(args: argparse.Namespace) -> dict[str, str]:
+    if args.staged:
+        return {"PLURX_VALIDATION_MODE": "staged"}
+    if args.changed_from:
+        return {
+            "PLURX_VALIDATION_MODE": "changed-from",
+            "PLURX_VALIDATION_BASE": args.changed_from,
+        }
+    if args.paths:
+        return {"PLURX_VALIDATION_MODE": "paths"}
+    if args.point:
+        return {"PLURX_VALIDATION_MODE": "point"}
+    return {"PLURX_VALIDATION_MODE": "all"}
 
 
 def print_plan(catalog: Catalog, selection: Selection, profile: str) -> None:
@@ -834,6 +870,7 @@ def main(argv: list[str] | None = None) -> int:
             artifact_dir,
             strict=args.strict,
             fail_fast=args.fail_fast,
+            environment=_validation_environment(args),
         )
         if not args.no_report:
             json_path, xml_path = write_reports(
