@@ -18,6 +18,22 @@ private enum PlayerControl: Hashable {
 }
 #endif
 
+enum PlayerSeekDirection {
+    case left
+    case right
+    case up
+    case down
+
+    var seconds: Double {
+        switch self {
+        case .left: return -10
+        case .right: return 10
+        case .up: return 30
+        case .down: return -30
+        }
+    }
+}
+
 struct PlayerMetadataBadge: Equatable, Identifiable {
     enum Kind: String, Equatable {
         case resolution
@@ -199,7 +215,7 @@ struct PlayerView: View {
                     .focusEffectDisabled()
                     .focused($focusedControl, equals: .reveal)
                     .onTapGesture { revealControlsFromRemote() }
-                    .onMoveCommand { _ in revealControlsFromRemote() }
+                    .onMoveCommand { direction in seekFromRemote(direction) }
                     .onPlayPauseCommand {
                         controller.togglePlayPause()
                         revealControlsFromRemote()
@@ -417,6 +433,18 @@ struct PlayerView: View {
             await Task.yield()
             if controlsVisible { focusedControl = .playPause }
         }
+    }
+
+    private func seekFromRemote(_ direction: MoveCommandDirection) {
+        let seekDirection: PlayerSeekDirection
+        switch direction {
+        case .left: seekDirection = .left
+        case .right: seekDirection = .right
+        case .up: seekDirection = .up
+        case .down: seekDirection = .down
+        @unknown default: return
+        }
+        controller.skip(seconds: seekDirection.seconds)
     }
     #endif
 
@@ -1063,7 +1091,7 @@ struct PlayerView: View {
     #if os(tvOS)
     /// SwiftUI's Slider is unavailable on tvOS. This focusable bar uses the
     /// Siri Remote's left/right commands to move through the same absolute
-    /// film timeline in 30-second steps. This is deliberately not a Button:
+    /// film timeline in 10-second steps. This is deliberately not a Button:
     /// tvOS adds a large white pressed/focus surround to Buttons even when the
     /// ordinary focus effect is disabled.
     private var tvProgressBar: some View {
@@ -1103,14 +1131,14 @@ struct PlayerView: View {
         .focused($focusedControl, equals: .progress)
         .onMoveCommand { direction in
             switch direction {
-            case .left: controller.skip(seconds: -30)
-            case .right: controller.skip(seconds: 30)
+            case .left: controller.skip(seconds: PlayerSeekDirection.left.seconds)
+            case .right: controller.skip(seconds: PlayerSeekDirection.right.seconds)
             case .down: focusedControl = .playPause
             default: break
             }
             revealControls()
         }
-        .accessibilityLabel("Playback position. Left or right seeks 30 seconds.")
+        .accessibilityLabel("Playback position. Left or right seeks 10 seconds.")
     }
     #endif
 

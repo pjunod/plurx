@@ -144,6 +144,14 @@ test("a rejected cheap stream gets one compatibility transcode", () => {
   );
 });
 
+test("directional seeks use short horizontal and long vertical steps", () => {
+  assert.equal(policy.seekDeltaSeconds("ArrowLeft"), -10);
+  assert.equal(policy.seekDeltaSeconds("ArrowRight"), 10);
+  assert.equal(policy.seekDeltaSeconds("ArrowDown"), -30);
+  assert.equal(policy.seekDeltaSeconds("ArrowUp"), 30);
+  assert.equal(policy.seekDeltaSeconds("Enter"), null);
+});
+
 test("decode rescue uses lost frames over a long window, not pipeline latency", () => {
   assert.equal(
     policy.decodeMarginVerdict(
