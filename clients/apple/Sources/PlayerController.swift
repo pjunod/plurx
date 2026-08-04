@@ -19,6 +19,28 @@ private enum PlaybackPreparationError: LocalizedError {
     }
 }
 
+/// One AVPlayer failure forwarded to the server's bounded client-log endpoint.
+/// Keeping this payload small and token-free makes failures visible in the
+/// ordinary server log without retaining a media capability URL.
+private struct ApplePlaybackFailureLog: Encodable {
+    let level = "error"
+    let event = "avplayer_item_failed"
+    let message: String
+    let method: String
+    let code: Int?
+    let title: String
+    let fileId: Int
+    let vcodec: String?
+    let detail: String
+    let ua = "Apple AVPlayer"
+
+    enum CodingKeys: String, CodingKey {
+        case level, event, message, method, code, title, detail, ua
+        case fileId = "file_id"
+        case vcodec
+    }
+}
+
 /// Requests that arrive while a stream replacement is in flight are remembered
 /// rather than dropped. Two replacements must never overlap — they share a
 /// `playback_id`, so the newer create intentionally removes the older session
@@ -1023,6 +1045,7 @@ final class PlayerController: ObservableObject {
             guard item.status == .failed else { return }
             Task { @MainActor in
                 guard let self, self.player.currentItem === item else { return }
+                self.reportPlaybackFailure(item)
                 if self.started {
                     // P2-6: this item is already dead, so its `currentTime()`
                     // is 0 or invalid and a VOD/direct retry would silently
@@ -1042,6 +1065,65 @@ final class PlayerController: ObservableObject {
                     ?? PlaybackPreparationError.failed.localizedDescription
             }
         }
+    }
+
+    private func reportPlaybackFailure(_ item: AVPlayerItem) {
+        let failure = item.error as NSError?
+        let event = item.errorLog()?.events.last
+        let payload = ApplePlaybackFailureLog(
+            message: failure?.localizedDescription
+                ?? PlaybackPreparationError.failed.localizedDescription,
+            method: isDirectPlayback ? "direct_play" : (encoder == "copy" ? "remux" : "transcode"),
+            code: failure?.code,
+            title: title,
+            fileId: fileId,
+            vcodec: decision?.source?.videoCodec,
+            detail: Self.playbackFailureDetail(
+                error: failure,
+                eventDomain: event?.errorDomain,
+                eventStatus: event?.errorStatusCode,
+                eventComment: event?.errorComment
+            )
+        )
+        guard let url = Session.shared.url("/api/v1/client-log"),
+              let body = try? JSONEncoder().encode(payload)
+        else { return }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.httpBody = body
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        Session.shared.authorize(&request)
+        Task {
+            _ = try? await URLSession.shared.data(for: request)
+        }
+    }
+
+    static func playbackFailureDetail(
+        error: NSError?,
+        eventDomain: String?,
+        eventStatus: Int?,
+        eventComment: String?
+    ) -> String {
+        var fields: [String] = []
+        if let error {
+            fields.append("error=\(error.domain):\(error.code)")
+            if let underlying = error.userInfo[NSUnderlyingErrorKey] as? NSError {
+                fields.append(
+                    "underlying=\(underlying.domain):\(underlying.code) \(underlying.localizedDescription)"
+                )
+            }
+        }
+        if let eventDomain, let eventStatus {
+            fields.append("event=\(eventDomain):\(eventStatus)")
+        } else if let eventDomain {
+            fields.append("event=\(eventDomain)")
+        } else if let eventStatus {
+            fields.append("event_status=\(eventStatus)")
+        }
+        if let eventComment, !eventComment.isEmpty {
+            fields.append("comment=\(eventComment)")
+        }
+        return fields.joined(separator: " · ")
     }
 
     static func shouldRetryWithCompatibilityTranscode(

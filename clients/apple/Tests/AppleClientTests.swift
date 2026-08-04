@@ -189,6 +189,29 @@ final class AppleClientTests: XCTestCase {
     }
 
     @MainActor
+    func testApplePlayerFailureDetailKeepsTheErrorChainAndHLSVerdict() {
+        let underlying = NSError(
+            domain: "CoreMediaErrorDomain",
+            code: -12927,
+            userInfo: [NSLocalizedDescriptionKey: "decoder rejected the stream"]
+        )
+        let error = NSError(
+            domain: "AVFoundationErrorDomain",
+            code: -11828,
+            userInfo: [NSUnderlyingErrorKey: underlying]
+        )
+        XCTAssertEqual(
+            PlayerController.playbackFailureDetail(
+                error: error,
+                eventDomain: "CoreMediaErrorDomain",
+                eventStatus: -12927,
+                eventComment: "Playlist codec is not supported"
+            ),
+            "error=AVFoundationErrorDomain:-11828 · underlying=CoreMediaErrorDomain:-12927 decoder rejected the stream · event=CoreMediaErrorDomain:-12927 · comment=Playlist codec is not supported"
+        )
+    }
+
+    @MainActor
     func testApplePlayerFallsBackFromDolbyVisionToHDRBeforeSDR() {
         XCTAssertTrue(PlayerController.hasCompatibleDolbyVisionBase(
             "Dolby Vision · Profile 8 (HDR10-compatible)"
