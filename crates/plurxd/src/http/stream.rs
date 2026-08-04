@@ -670,6 +670,23 @@ pub async fn decision(
                 .into(),
         ));
     }
+
+    // Select tracks before evaluating compatibility. The container's default
+    // audio is only a fallback; the execution plan must describe the codec
+    // selected by the same language policy exposed to the clients below.
+    let prefer_original = file
+        .audio_streams
+        .iter()
+        .any(|a| matches!(a.language.as_deref(), Some("jpn" | "ja" | "jp")))
+        && file.audio_streams.len() > 1;
+    let prefs = state.transcode.lang_prefs().await;
+    let selection = plurx_core::tracks::select_tracks(
+        &file.audio_streams,
+        &file.subtitle_streams,
+        prefer_original,
+        &prefs,
+    );
+    set_selected_audio_default(&mut file.audio_streams, selection.audio_index);
     let decision = q.decide(&file, dv_strippable(&state));
 
     tracing::info!(
@@ -709,27 +726,8 @@ pub async fn decision(
     };
     let markers = markers_for(&state, &file).await;
 
-    // Default-track flags: the same selection rule the transcoder burns by —
-    // anime dual-audio prefers the original + subs, everything else honors the
-    // server's language preferences (Settings → Playback defaults).
-    let prefer_original = file
-        .audio_streams
-        .iter()
-        .any(|a| matches!(a.language.as_deref(), Some("jpn" | "ja" | "jp")))
-        && file.audio_streams.len() > 1;
-    let prefs = state.transcode.lang_prefs().await;
-    let selection = plurx_core::tracks::select_tracks(
-        &file.audio_streams,
-        &file.subtitle_streams,
-        prefer_original,
-        &prefs,
-    );
-    let mut audio = audio_tracks(&file);
-    if let Some(pick) = selection.audio_index {
-        for a in &mut audio {
-            a.default = a.index == pick;
-        }
-    }
+    // DTO defaults and the verdict now come from the same selection above.
+    let audio = audio_tracks(&file);
     let mut subtitles = sub_tracks(&file);
     for s in &mut subtitles {
         s.default = selection.subtitle_index == Some(s.index);
@@ -966,6 +964,26 @@ fn remux_audio_index(
         .max(0)
 }
 
+/// Make the compatibility verdict inspect the track playback will actually
+/// carry. The scan-time default belongs to the container, but the server's
+/// language policy (or an explicit viewer choice) may select a different
+/// codec. Leaving the old default in place lets a supported E-AC-3 track make
+/// an unsupported preferred TrueHD track look copyable, and the failed MP4
+/// remux then pushes an otherwise compatible HDR picture into the SDR rescue.
+fn set_selected_audio_default(
+    audio: &mut [plurx_core::domain::AudioStream],
+    selected: Option<i64>,
+) {
+    let Some(selected) =
+        selected.filter(|selected| audio.iter().any(|track| track.index == *selected))
+    else {
+        return;
+    };
+    for track in audio {
+        track.default = track.index == selected;
+    }
+}
+
 impl StreamQuery {
     fn caps(&self) -> Caps {
         Caps {
@@ -1006,9 +1024,10 @@ pub async fn stream_mp4(
         crate::delivery::Method::Remux,
         q.stream.as_deref(),
     );
-    let decision = q.caps().decide(&file, dv_strippable(&state));
     let prefs = state.transcode.lang_prefs().await;
     let audio = remux_audio_index(&file.audio_streams, q.audio, &prefs);
+    set_selected_audio_default(&mut file.audio_streams, Some(audio));
+    let decision = q.caps().decide(&file, dv_strippable(&state));
     // Copy HEVC gets an `hvc1` tag so Safari's <video> accepts the fMP4 (an
     // `hev1`-tagged MKV copy otherwise plays audio-only / black in Safari).
     let hevc = matches!(file.video_codec.as_deref(), Some("hevc" | "h265"));
@@ -1523,6 +1542,76 @@ mod tests {
 
         assert_eq!(remux_audio_index(&audio, None, &prefs), 2);
         assert_eq!(remux_audio_index(&audio, Some(3), &prefs), 3);
+    }
+
+    #[test]
+    fn preferred_truehd_audio_is_transcoded_for_android_hdr_remux() {
+        use plurx_core::domain::AudioStream;
+
+        let mut file = MediaFile {
+            id: 5698,
+            item_id: 1,
+            path: "/movies/Michael (2026).mkv".into(),
+            size: 1,
+            mtime: 1,
+            duration_ms: Some(120_000),
+            container: Some("mkv".into()),
+            video_codec: Some("hevc".into()),
+            video_profile: Some("Main 10".into()),
+            width: Some(3840),
+            height: Some(2160),
+            bit_depth: Some(10),
+            hdr: Some("dolby_vision".into()),
+            hdr_format: Some("Dolby Vision · Profile 7 (HDR10-compatible)".into()),
+            bitrate: Some(90_892_368),
+            audio_streams: vec![
+                AudioStream {
+                    index: 0,
+                    codec: "eac3".into(),
+                    channels: Some(8),
+                    language: Some("fra".into()),
+                    title: Some("French E-AC-3".into()),
+                    default: true,
+                },
+                AudioStream {
+                    index: 3,
+                    codec: "truehd".into(),
+                    channels: Some(8),
+                    language: Some("eng".into()),
+                    title: Some("English TrueHD Atmos".into()),
+                    default: false,
+                },
+            ],
+            subtitle_streams: vec![],
+            scanned_at: 1,
+            audio_offset_ms: 0,
+            probed: true,
+        };
+        let caps = Caps {
+            vcodec: Some("h264,hevc,av1,vp9".into()),
+            acodec: Some("aac,mp3,opus,flac,ac3,eac3".into()),
+            container: Some("mp4,webm".into()),
+            hdr: Some(1),
+            dvprofile: Some("5,8".into()),
+            ..Default::default()
+        };
+        let prefs = plurx_core::tracks::LangPrefs::default();
+
+        let selected = remux_audio_index(&file.audio_streams, None, &prefs);
+        assert_eq!(selected, 3, "English preference selects the TrueHD track");
+        set_selected_audio_default(&mut file.audio_streams, Some(selected));
+        let english = caps.decide(&file, true);
+        assert_eq!(english.method, playback::PlaybackMethod::Remux);
+        assert!(english.transcode_audio, "TrueHD must become AAC in MP4");
+        assert_eq!(english.delivered_dynamic_range, "hdr10");
+        assert!(english
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("audio codec truehd unsupported")));
+
+        set_selected_audio_default(&mut file.audio_streams, Some(0));
+        let french = caps.decide(&file, true);
+        assert!(!french.transcode_audio, "the E-AC-3 alternative can copy");
     }
 
     #[test]

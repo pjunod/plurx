@@ -36,6 +36,27 @@ test = "crates/plurxd/src/http/stream.rs"
 test_anchor = "every_verdict_has_one_server_owned_execution_plan"
 
 [[decisions]]
+id = "server.selected-audio-compatibility"
+source = "crates/plurxd/src/http/stream.rs"
+source_anchor = "fn set_selected_audio_default("
+test = "crates/plurxd/src/http/stream.rs"
+test_anchor = "preferred_truehd_audio_is_transcoded_for_android_hdr_remux"
+
+[[decisions]]
+id = "server.apple-high-tier-master"
+source = "crates/plurxd/src/http/hls.rs"
+source_anchor = "fn should_serve_high_tier_media_playlist("
+test = "crates/plurxd/src/http/hls.rs"
+test_anchor = "high_tier_hevc_without_native_subtitles_uses_the_media_playlist"
+
+[[decisions]]
+id = "server.apple-high-tier-init"
+source = "crates/plurxd/src/http/hls.rs"
+source_anchor = "fn normalize_high_tier_hevc_init("
+test = "crates/plurxd/src/http/hls.rs"
+test_anchor = "high_tier_hdr_init_is_relabelled_for_apple_hls"
+
+[[decisions]]
 id = "server.segmented-remux"
 source = "crates/plurx-core/src/playback/mod.rs"
 source_anchor = "pub fn prefer_segmented("
