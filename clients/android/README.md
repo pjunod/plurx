@@ -19,7 +19,8 @@ feeding an AVR keeps lossless TrueHD instead of a 256 kb/s AAC downmix: the box
 has no TrueHD decoder, the receiver does, and the claim follows the route. It is
 recomputed on every decision, because unplugging HDMI changes the answer.
 
-> Status: **v0.2.0** — native viewer parity across phone, foldable, and TV.
+> Status: **v0.2.2**, build `6` — native viewer parity across phone, foldable,
+> and TV. Build 6 carries the 2026-08-04 unified native playback menus.
 > Server administration remains in the web app; the viewing, discovery, and
 > playback surfaces are native here. The capability matrix is in
 > [Android client parity](../../docs/ANDROID-CLIENT-PARITY.md).
