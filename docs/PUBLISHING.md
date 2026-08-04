@@ -18,6 +18,67 @@ turns that into a public listing, §5 does the same for Play. §4 explains the
 store-facing keys that land with this doc, so nobody deletes one later without
 knowing what it bought.
 
+## Ansible owns the repeatable mobile deploy
+
+The versioned playbook is
+[`deploy/ansible/mobile.yml`](../deploy/ansible/mobile.yml). It runs on the
+macOS `control` host already present in the infrastructure inventory: Android
+needs that machine's paired `adb` devices, while Apple needs its Xcode signing
+identity and App Store Connect key. Neither job belongs on a Linux media node.
+
+```text
+                         ┌─ Android tests + lint + APK ─▶ physical adb devices
+Ansible `control` host ──┤
+                         └─ Apple tests + archives ─────▶ TestFlight upload
+```
+
+Copy the relevant variables from
+[`inventory.example.yml`](../deploy/ansible/inventory.example.yml) into the
+production inventory's `control` host. `plurx_android_connect` pairs network
+endpoints before discovery · `plurx_android_serials` limits deployment to named
+adb endpoints · `plurx_android_required_serials` names the physical hardware
+that must receive the build. Required devices use the value from
+`adb shell getprop ro.serialno`, not an IP address, because the same device can
+appear over USB and Wi-Fi at once. The playbook deduplicates those endpoints
+and fails if a required device is absent; a partial push is not a successful
+deploy.
+
+The Android path deploys the signed debug APK to the controller's physical
+test devices; it does not sign or upload a Google Play release. The release
+target has no signing configuration, so store delivery remains the separate §5
+workflow instead of borrowing a development key behind the operator's back.
+
+Apple upload uses an App Store Connect API key. Keep the private key out of the
+repo at
+`~/.appstoreconnect/private_keys/AuthKey_<ASC_KEY_ID>.p8`, then export the key
+and issuer IDs in the controller's shell:
+
+```bash
+export ASC_KEY_ID="your-key-id"        # identifies the .p8 file
+export ASC_ISSUER_ID="your-issuer-id"  # App Store Connect issuer UUID
+```
+
+The values identify the credential; the `.p8` file is the credential and must
+never enter inventory or git. `xcodebuild` receives the key path directly and
+uploads during archive export, so no Apple ID password or interactive Organizer
+step remains.
+
+Run one or both deployments from the repo root:
+
+```bash
+scripts/ship --android             # test, build, and install on required devices
+scripts/ship --apple               # test, archive, and upload iOS + tvOS
+scripts/ship --apple --android     # both through one Ansible invocation
+scripts/ship --apple --dry-run     # print the exact invocation, change nothing
+```
+
+`PLURX_ANSIBLE_INVENTORY=/path/inventory.yml` selects a different inventory.
+`PLURX_MOBILE_VARS_FILE=/path/mobile.yml` adds an untracked vars file when the
+production inventory cannot own device settings. Set
+`plurx_apple_upload: false` only for an intentional signed archive/export run;
+the default is a real TestFlight upload, and an authentication or upload failure
+fails the play.
+
 ## 1. The demo server — solve this before you write any store copy
 
 An app whose entire function is "connect to a server you host" is testable only
@@ -119,45 +180,19 @@ twenty minutes to be told.
 
 ### 2.3 Archive and upload
 
-From Xcode: generate, open, pick the scheme, Product → Archive, then
-Distribute App → App Store Connect. Or headless, which is what you want once
-you've done it twice:
+The supported headless path is the Ansible deployment above:
 
 ```bash
-cd clients/apple
-xcodegen generate                                    # writes plurx.xcodeproj
-
-# iOS. For the Apple TV build, all four platform words change together:
-#   plurx-iOS → plurx-tvOS · platform=iOS → platform=tvOS · -t ios → -t appletvos
-SCHEME=plurx-iOS; PLATFORM=iOS; ALTOOL_TYPE=ios
-
-xcodebuild -project plurx.xcodeproj \
-  -scheme "$SCHEME" \
-  -destination "generic/platform=$PLATFORM" \
-  -archivePath "build/$SCHEME.xcarchive" \
-  archive                                            # signs with your team
-
-xcodebuild -exportArchive \
-  -archivePath "build/$SCHEME.xcarchive" \
-  -exportOptionsPlist ExportOptions.plist \
-  -exportPath "build/$SCHEME"                        # produces plurx.ipa
-
-xcrun altool --upload-app -f "build/$SCHEME/plurx.ipa" -t "$ALTOOL_TYPE" \
-  --apiKey "$ASC_KEY_ID" --apiIssuer "$ASC_ISSUER_ID"  # App Store Connect API key
+scripts/ship --apple
 ```
 
-`ExportOptions.plist` is three keys — `method: app-store-connect`, `teamID`,
-and `uploadSymbols: true`. The committed Team ID identifies the paid developer
-team; it is not a credential. Certificates and App Store Connect API keys remain
-in the login Keychain and environment, never in this repository.
-
-Note `altool`'s platform word for Apple TV is **`appletvos`**, not `tvos` —
-`tvos` is rejected outright, and it's the kind of typo you discover after the
-archive step, not before. Both platforms upload to the same app record.
-
-The API key (App Store Connect → Users and Access → Integrations) beats an
-Apple ID password here because it survives 2FA prompts, which is the difference
-between a scriptable upload and one that hangs waiting for a phone.
+The playbook generates the Xcode project, runs both simulator suites, archives
+both schemes, and exports each archive with `destination: upload`. The
+committed Team ID identifies the paid developer team; it is not a credential.
+Certificates stay in the login Keychain and the App Store Connect private key
+stays in the controller's private-key directory. The API key (App Store
+Connect → Users and Access → Integrations) survives 2FA prompts, which is the
+difference between automation and a job that waits for a phone.
 
 **Acceptance check:** the build appears under TestFlight → iOS Builds within
 ~15 minutes with state "Ready to Submit", and no email arrives from Apple about

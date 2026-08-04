@@ -3,6 +3,11 @@
 plurx is a single static binary (`plurxd`) plus an embedded web app. Pick the
 path that matches your setup.
 
+This document deploys the server. Native Android and Apple delivery runs from
+the macOS Ansible controller because that host owns adb pairing, Xcode signing,
+and App Store Connect authentication; see
+[`docs/PUBLISHING.md`](../docs/PUBLISHING.md#ansible-owns-the-repeatable-mobile-deploy).
+
 ## Docker / Compose (recommended for homelabs)
 
 Host-specific bits (media mounts, GPU, and shared Docker networks) live in an

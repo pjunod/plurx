@@ -165,6 +165,11 @@ signatures Retrofit reads off `PlurxApi`.
 
 ## Install
 
+For repeatable multi-device pushes, the Ansible controller builds, tests,
+deduplicates USB/Wi-Fi endpoints, and refuses to call a partial deployment
+successful. See
+[`docs/PUBLISHING.md`](../../docs/PUBLISHING.md#ansible-owns-the-repeatable-mobile-deploy).
+
 **Phone / tablet** — enable "Install unknown apps" for your file manager, copy the APK over,
 and tap it. Or over USB with developer mode on:
 
