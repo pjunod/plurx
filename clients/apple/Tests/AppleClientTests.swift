@@ -2133,6 +2133,16 @@ final class AppleClientTests: XCTestCase {
         ))
     }
 
+    func testPlaybackInfoStaysVisibleAfterControlsAutoHide() {
+        let visible = PlayerView.overlayVisibility(
+            controlsVisible: false,
+            playbackInfoVisible: true
+        )
+
+        XCTAssertFalse(visible.controls)
+        XCTAssertTrue(visible.playbackInfo)
+    }
+
     func testNowPlayingSummaryUsesLoadedOverviewAndHasAFallback() {
         XCTAssertEqual(
             PlayerView.nowPlayingSummary("  A family crosses the stars.\n"),
