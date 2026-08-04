@@ -12,12 +12,12 @@ anything it can't (MKV, DTS/TrueHD, …) is delivered as the server's on-the-fly
 HDR display at runtime and sends that to `/decision`, so the server transcodes
 only what this hardware genuinely can't play.
 
-> Status: **v0.2.0**, build `6` in [`project.yml`](project.yml) — working
+> Status: **v0.2.2**, build `9` in [`project.yml`](project.yml) — working
 > development client. Browse, resume, discover, and play on both iOS and
 > tvOS. Both targets compile against the iOS/tvOS 26.5 SDKs and share the
-> same regression suite. Build 6 carries the 2026-08-02 subtitle-selection
-> and playback-state fixes and **has not been built, installed, or uploaded
-> to TestFlight**; build `5` is what is installed on the Bedroom Apple TV.
+> same regression suite. Build 9 carries the 2026-08-03 Dolby Vision
+> compatibility and appearance-settings fixes and is installed on the paired
+> iPhones, iPads, and Bedroom Apple TV. It has not been uploaded to TestFlight.
 > It is not yet at full web parity; the exact boundary is in
 > [Feature parity](#feature-parity).
 
