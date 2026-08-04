@@ -164,7 +164,12 @@ private suspend fun loadPlan(vm: AppViewModel, itemId: Long, fileId: Long): Plan
         // server too old to send `source`.
         sourceHeight = (decision.source?.height ?: file?.height)?.toInt(),
         aac = decision.delivery?.aac ?: decision.transcode_audio,
-        preserveDolbyVision = decision.delivery?.preserve_dolby_vision ?: false,
+        // Direct delivery has no remux-specific field, but the flattened
+        // decision still says whether these exact source bytes are DV. Keep
+        // that fact so a decoder failure can try a DV-preserving MP4 remux
+        // before the final SDR compatibility transcode.
+        preserveDolbyVision = decision.delivery?.preserve_dolby_vision
+            ?: decision.preserve_dolby_vision,
         deliveredDynamicRange = decision.delivered_dynamic_range,
         markers = decision.markers,
         reasons = decision.reasons,

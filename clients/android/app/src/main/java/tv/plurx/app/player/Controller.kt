@@ -5,6 +5,7 @@ package tv.plurx.app.player
 import android.content.Context
 import android.content.res.Configuration
 import android.net.Uri
+import android.util.Log
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -141,12 +142,14 @@ class Controller(
     }
         private set
 
-    /**
-     * One compatibility rescue per item (PLAYBACK.md's error fallback). A
-     * second failure — or a failure in an already-transcoded mode — is a real
-     * failure and says so.
-     */
-    private var compatibilityRescueUsed = false
+    /** A direct DV failure may use one lossless remux before the final rescue. */
+    private var compatibilityRemuxUsed = false
+
+    /** One final H.264 compatibility transcode; failure after that is terminal. */
+    private var compatibilityTranscodeUsed = false
+
+    /** A direct DV decoder failure first gets the same video in normalized MP4. */
+    private var forceCompatibilityRemux = false
 
     /** Set by the rescue: this playback must re-encode, whatever the plan said. */
     private var forceCompatibilityTranscode = false
@@ -161,6 +164,7 @@ class Controller(
     private val planMode: String
         get() = when {
             forceCompatibilityTranscode -> "transcode"
+            forceCompatibilityRemux -> "remux"
             audioOffsetMs != 0L && plan.mode == "direct" -> "remux"
             else -> plan.mode
         }
@@ -234,12 +238,33 @@ class Controller(
 
     private val listener = object : Player.Listener {
         override fun onPlayerError(error: PlaybackException) {
-            when (playbackErrorAction(deliveryMode, compatibilityRescueUsed)) {
+            val action = playbackErrorAction(
+                deliveryMode = deliveryMode,
+                preservesDolbyVision = plan.preserveDolbyVision,
+                remuxRescueAlreadyUsed = compatibilityRemuxUsed,
+                transcodeRescueAlreadyUsed = compatibilityTranscodeUsed,
+            )
+            Log.w(
+                "plurx-playback",
+                "file=${plan.fileId} delivery=$deliveryMode preservesDv=" +
+                    "${plan.preserveDolbyVision} action=$action caps=$caps " +
+                    "error=${error.errorCodeName}",
+                error,
+            )
+            when (action) {
+                PlaybackErrorAction.RetryAsDolbyVisionRemux -> {
+                    val position = realPosition()
+                    compatibilityRemuxUsed = true
+                    forceCompatibilityRemux = true
+                    subtitleDelivery =
+                        subtitleRoute(trackFor(selectedSubtitle), planMode, subtitleDelivery).delivery
+                    restartAt(position)
+                }
                 PlaybackErrorAction.RetryAsCompatibilityTranscode -> {
                     // Read the position before the mode moves: which timeline
                     // the player is on depends on the delivery about to change.
                     val position = realPosition()
-                    compatibilityRescueUsed = true
+                    compatibilityTranscodeUsed = true
                     forceCompatibilityTranscode = true
                     // `planMode` is a transcode now, and that can move the
                     // selection's route with it: an embedded track on a

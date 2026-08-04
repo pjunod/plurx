@@ -11,12 +11,15 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
+import kotlinx.coroutines.launch
+import tv.plurx.app.data.Caps
 import tv.plurx.app.player.PlayerScreen
 import tv.plurx.app.ui.AppViewModel
 import tv.plurx.app.ui.ConnectScreen
@@ -34,6 +37,10 @@ import tv.plurx.app.ui.theme.PlurxTheme
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Keep a real-hardware capability snapshot in logcat even before sign
+        // in. Decoder/display regressions otherwise surface only as a later
+        // server transcode, after the evidence that caused it is gone.
+        lifecycleScope.launch { Caps.query(this@MainActivity) }
         setContent {
             val vm: AppViewModel = viewModel()
             val preferences by vm.preferences.collectAsStateWithLifecycle()

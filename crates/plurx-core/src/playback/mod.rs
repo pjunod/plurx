@@ -66,6 +66,7 @@ pub fn caps_profile(
         supports_hdr,
         supports_dolby_vision,
         dolby_vision_profiles: Vec::new(),
+        remux_dolby_vision: false,
     }
 }
 
@@ -122,6 +123,13 @@ pub struct DeviceProfile {
     /// AVPlayer supports specific delivery profiles, not every disc profile.
     #[serde(default)]
     pub dolby_vision_profiles: Vec<u8>,
+    /// This decoder accepts Dolby Vision through normalized HLS/fMP4 but not
+    /// reliably as the source file over a progressive range URL. Apple
+    /// AVPlayer can report a healthy P8 DV pipeline, advance the raw MP4's
+    /// timeline, and still render only black frames. A copy remux keeps every
+    /// video sample/RPU while rebuilding the delivery signaling it expects.
+    #[serde(default)]
+    pub remux_dolby_vision: bool,
 }
 
 impl DeviceProfile {
@@ -236,8 +244,12 @@ fn evaluate(file: &MediaFile, profile: &DeviceProfile) -> (Checks, Vec<String>) 
         ));
     }
 
-    let container_ok = profile.allows_container(&file.container);
-    if !container_ok {
+    let dolby_vision_needs_remux =
+        profile.remux_dolby_vision && is_dolby_vision(file) && profile.allows_dolby_vision(file);
+    let container_ok = profile.allows_container(&file.container) && !dolby_vision_needs_remux;
+    if dolby_vision_needs_remux {
+        reasons.push("Dolby Vision normalized through copy-video HLS for this device".to_owned());
+    } else if !container_ok {
         reasons.push(format!(
             "container {} not browser-native",
             file.container.as_deref().unwrap_or("unknown")
@@ -801,7 +813,7 @@ mod tests {
     #[test]
     fn dolby_vision_profiles_are_negotiated_individually() {
         let mut apple = caps_profile(
-            vec!["mp4".into()],
+            vec!["mp4".into(), "mov".into(), "m4v".into()],
             vec!["hevc".into()],
             vec!["aac".into()],
             None,
@@ -809,13 +821,46 @@ mod tests {
             false,
         );
         apple.dolby_vision_profiles = vec![5, 8];
+        apple.remux_dolby_vision = true;
+        let mut android = caps_profile(
+            vec![
+                "mkv".into(),
+                "mp4".into(),
+                "webm".into(),
+                "mov".into(),
+                "ts".into(),
+            ],
+            vec!["hevc".into()],
+            vec!["aac".into()],
+            None,
+            true,
+            false,
+        );
+        android.dolby_vision_profiles = vec![5, 8];
 
         let mut p5 = file("mp4", "hevc", "aac");
         p5.hdr = Some("dolby_vision".to_owned());
         p5.hdr_format = Some("Dolby Vision · Profile 5".to_owned());
         let supported = decide(&p5, &apple, true);
-        assert_eq!(supported.method, PlaybackMethod::DirectPlay);
+        assert_eq!(supported.method, PlaybackMethod::Remux);
         assert!(supported.preserve_dolby_vision);
+        assert_eq!(supported.delivered_dynamic_range, "dolby_vision");
+        assert!(supported
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("copy-video HLS")));
+
+        let mut p8 = file("mkv", "hevc", "aac");
+        p8.hdr = Some("dolby_vision".to_owned());
+        p8.hdr_format = Some("Dolby Vision · Profile 8 (HDR10-compatible)".to_owned());
+        let apple_p8 = decide(&p8, &apple, true);
+        assert_eq!(apple_p8.method, PlaybackMethod::Remux);
+        assert!(apple_p8.preserve_dolby_vision);
+        assert_eq!(apple_p8.delivered_dynamic_range, "dolby_vision");
+        let android_p8 = decide(&p8, &android, true);
+        assert_eq!(android_p8.method, PlaybackMethod::DirectPlay);
+        assert!(android_p8.preserve_dolby_vision);
+        assert_eq!(android_p8.delivered_dynamic_range, "dolby_vision");
 
         let mut p7 = file("mp4", "hevc", "aac");
         p7.hdr = Some("dolby_vision".to_owned());
@@ -823,10 +868,28 @@ mod tests {
         let fallback = decide(&p7, &apple, true);
         assert_eq!(fallback.method, PlaybackMethod::Remux);
         assert!(!fallback.preserve_dolby_vision);
+        assert_eq!(fallback.delivered_dynamic_range, "hdr10");
         assert!(fallback
             .reasons
             .iter()
             .all(|reason| !reason.contains("browser")));
+        let android_fallback = decide(&p7, &android, true);
+        assert_eq!(android_fallback.method, PlaybackMethod::Remux);
+        assert!(!android_fallback.preserve_dolby_vision);
+        assert_eq!(android_fallback.delivered_dynamic_range, "hdr10");
+
+        let sdr = caps_profile(
+            vec!["mkv".into(), "mp4".into()],
+            vec!["hevc".into(), "h264".into()],
+            vec!["aac".into()],
+            None,
+            false,
+            false,
+        );
+        let sdr_fallback = decide(&p8, &sdr, true);
+        assert_eq!(sdr_fallback.method, PlaybackMethod::Transcode);
+        assert!(!sdr_fallback.preserve_dolby_vision);
+        assert_eq!(sdr_fallback.delivered_dynamic_range, "sdr");
     }
 
     /// The badge's whole reason for existing: a DV disc remux says "DV P7"

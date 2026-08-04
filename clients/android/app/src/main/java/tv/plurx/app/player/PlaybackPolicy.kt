@@ -37,9 +37,12 @@ internal fun decisionForce(quality: PlaybackQuality): String = when (quality) {
     else -> "transcode"
 }
 
-// ---- §4.2 The one-shot compatibility rescue ---------------------------------
+// ---- §4.2 The fidelity-preserving compatibility ladder ----------------------
 
 internal enum class PlaybackErrorAction {
+    /** Keep the video/DV intact but give the decoder a normalized MP4 envelope. */
+    RetryAsDolbyVisionRemux,
+
     /** Reopen as a forced transcode at the current position — H.264/AAC, guaranteed. */
     RetryAsCompatibilityTranscode,
 
@@ -48,19 +51,22 @@ internal enum class PlaybackErrorAction {
 }
 
 /**
- * A stream the device refuses gets exactly one automatic rescue, and only from
- * a cheaper mode: a transcode that fails has nothing left to fall back to, and
- * retrying it would loop.
+ * A direct Dolby Vision stream first gets a lossless container rescue. Some
+ * Android decoders advertise the right profile but reject its source envelope;
+ * normalizing that to MP4 is cheaper and preserves DV. The existing H.264
+ * compatibility transcode remains the final rescue, and is attempted once.
  */
 internal fun playbackErrorAction(
     deliveryMode: String,
-    rescueAlreadyUsed: Boolean,
-): PlaybackErrorAction = if (
-    !rescueAlreadyUsed && (deliveryMode == "direct" || deliveryMode == "remux")
-) {
-    PlaybackErrorAction.RetryAsCompatibilityTranscode
-} else {
-    PlaybackErrorAction.Fail
+    preservesDolbyVision: Boolean,
+    remuxRescueAlreadyUsed: Boolean,
+    transcodeRescueAlreadyUsed: Boolean,
+): PlaybackErrorAction = when {
+    deliveryMode == "direct" && preservesDolbyVision && !remuxRescueAlreadyUsed ->
+        PlaybackErrorAction.RetryAsDolbyVisionRemux
+    deliveryMode in setOf("direct", "remux") && !transcodeRescueAlreadyUsed ->
+        PlaybackErrorAction.RetryAsCompatibilityTranscode
+    else -> PlaybackErrorAction.Fail
 }
 
 // ---- §5.6 The quality menu is the server's ladder ---------------------------
