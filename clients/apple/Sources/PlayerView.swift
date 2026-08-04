@@ -509,7 +509,7 @@ struct PlayerView: View {
         .foregroundStyle(.white)
         .frame(maxWidth: .infinity)
         #else
-        .font(.title3)
+        .font(.body)
         .buttonStyle(.bordered)
         .tint(.white)
         .padding(.horizontal, 12)
@@ -610,12 +610,12 @@ struct PlayerView: View {
     }
 
     private var playbackIdentity: some View {
-        let context = [subtitle, year.map(String.init), runtimeLabel]
+        let contextParts = [subtitle, year.map(String.init), runtimeLabel]
             .compactMap { $0 }
             .filter { !$0.isEmpty }
-            .joined(separator: "   ·   ")
 
         #if os(tvOS)
+        let context = contextParts.joined(separator: "   ·   ")
         return (
             Text(title)
                 .font(.system(size: 26, weight: .semibold))
@@ -632,11 +632,15 @@ struct PlayerView: View {
                 .foregroundColor(.white)
                 .lineLimit(1)
 
-            if !context.isEmpty {
-                Text(context)
-                    .font(.system(.caption, design: .monospaced))
-                    .foregroundColor(.white.opacity(0.7))
-                    .lineLimit(1)
+            if !contextParts.isEmpty {
+                HStack(spacing: 12) {
+                    ForEach(contextParts, id: \.self) { fact in
+                        Text(fact)
+                    }
+                }
+                .font(.system(.caption, design: .rounded).weight(.medium))
+                .foregroundColor(.white.opacity(0.7))
+                .lineLimit(1)
             }
         }
         #endif
@@ -1233,7 +1237,7 @@ struct PlayerView: View {
                 revealControls()
             } label: {
                 Label(
-                    "\(rung.height)p · \(rung.totalKbps / 1000) Mb/s",
+                    "\(rung.height)p  \(rung.totalKbps / 1000) Mb/s",
                     systemImage: controller.selectedHeight == rung.height
                         ? "checkmark"
                         : "rectangle.inset.filled"
@@ -1246,7 +1250,7 @@ struct PlayerView: View {
         [track.title, languageName(track.language), track.codec.uppercased(),
          track.channels.map { "\($0) ch" }]
             .compactMap { $0 }
-            .joined(separator: " · ")
+            .joined(separator: "  ")
     }
 
     private func subtitleLabel(_ track: SubtitleTrack) -> String {
@@ -1254,7 +1258,7 @@ struct PlayerView: View {
             .compactMap { $0 }
         if track.forced { parts.append("Forced") }
         if !track.isNativeHLS { parts.append("Burn-in") }
-        return parts.joined(separator: " · ")
+        return parts.joined(separator: "  ")
     }
 
     private func languageName(_ code: String?) -> String? {

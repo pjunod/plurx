@@ -167,10 +167,19 @@ private fun DetailContent(
 
     LazyColumn(Modifier.fillMaxSize().navigationBarsPadding()) {
         item {
-            Box(Modifier.fillMaxWidth().height(heroHeight)) {
-                NetworkImage(imageUrl(item.backdrop ?: item.poster), Modifier.fillMaxSize())
-                Box(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color(0x22000000), Bg))))
-                DetailBackButton(onBack)
+            if (formFactor == FormFactor.Compact) {
+                CompactDetailHero(
+                    item = item,
+                    file = best,
+                    durationMs = durationMs,
+                    onBack = onBack,
+                )
+            } else {
+                Box(Modifier.fillMaxWidth().height(heroHeight)) {
+                    NetworkImage(imageUrl(item.backdrop ?: item.poster), Modifier.fillMaxSize())
+                    Box(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color(0x22000000), Bg))))
+                    DetailBackButton(onBack)
+                }
             }
         }
 
@@ -188,25 +197,27 @@ private fun DetailContent(
                     )
                 }
                 Column(Modifier.weight(1f)) {
-                    if (detail.ancestors.isNotEmpty()) {
-                        AncestorBreadcrumb(
-                            ancestors = detail.ancestors,
-                            onOpenItem = onOpenItem,
+                    if (formFactor != FormFactor.Compact) {
+                        if (detail.ancestors.isNotEmpty()) {
+                            AncestorBreadcrumb(
+                                ancestors = detail.ancestors,
+                                onOpenItem = onOpenItem,
+                            )
+                        }
+                        Text(item.title, style = MaterialTheme.typography.headlineMedium)
+                        Text(
+                            metaLine(item, durationMs),
+                            color = Muted,
+                            style = MaterialTheme.typography.labelMedium,
+                            modifier = Modifier.padding(top = 4.dp),
                         )
-                    }
-                    Text(item.title, style = MaterialTheme.typography.headlineMedium)
-                    Text(
-                        metaLine(item, durationMs),
-                        color = Muted,
-                        style = MaterialTheme.typography.labelMedium,
-                        modifier = Modifier.padding(top = 4.dp),
-                    )
-                    if (item.tags.isNotEmpty()) {
-                        LazyRow(
-                            Modifier.padding(top = 10.dp),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        ) {
-                            items(item.tags) { tag -> SpecChip(tag) }
+                        if (item.tags.isNotEmpty()) {
+                            LazyRow(
+                                Modifier.padding(top = 10.dp),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                items(item.tags) { tag -> SpecChip(tag) }
+                            }
                         }
                     }
 
@@ -224,7 +235,19 @@ private fun DetailContent(
                     )
 
                     item.overview?.takeIf { it.isNotBlank() }?.let {
-                        Text(it, color = Muted, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(top = 16.dp))
+                        if (formFactor == FormFactor.Compact) {
+                            Text(
+                                "About",
+                                style = MaterialTheme.typography.titleMedium,
+                                modifier = Modifier.padding(top = 18.dp, bottom = 6.dp),
+                            )
+                        }
+                        Text(
+                            it,
+                            color = Muted,
+                            style = MaterialTheme.typography.bodyMedium,
+                            modifier = Modifier.padding(top = if (formFactor == FormFactor.Compact) 0.dp else 16.dp),
+                        )
                     }
                 }
             }
@@ -289,6 +312,85 @@ private fun DetailContent(
         }
         item { Spacer(Modifier.height(32.dp)) }
     }
+}
+
+@Composable
+private fun CompactDetailHero(
+    item: Item,
+    file: MediaFileDto?,
+    durationMs: Long?,
+    onBack: () -> Unit,
+) {
+    val progress = detailProgress(item, durationMs)
+    Box(Modifier.fillMaxWidth().height(300.dp)) {
+        NetworkImage(imageUrl(item.backdrop ?: item.poster), Modifier.fillMaxSize())
+        Box(
+            Modifier.fillMaxSize().background(
+                Brush.verticalGradient(
+                    listOf(Color(0x22000000), Color(0x44000000), Bg),
+                ),
+            ),
+        )
+        DetailBackButton(onBack)
+        Column(
+            Modifier.align(Alignment.BottomStart).fillMaxWidth().padding(horizontal = 20.dp, vertical = 16.dp),
+            verticalArrangement = Arrangement.spacedBy(7.dp),
+        ) {
+            item.show_title?.let { showTitle ->
+                Text(
+                    showTitle.uppercase(),
+                    color = Accent,
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.Bold,
+                )
+            }
+            Text(
+                item.title,
+                color = Color.White,
+                style = MaterialTheme.typography.headlineMedium,
+                fontWeight = FontWeight.ExtraBold,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+            file?.let { mediaFile ->
+                LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    items(detailMediaFacts(mediaFile), key = { it.kind }) { fact ->
+                        MediaFactChip(fact)
+                    }
+                }
+            }
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                compactDetailFacts(item, durationMs).forEach { fact ->
+                    Text(fact, color = Color.White.copy(alpha = 0.7f), style = MaterialTheme.typography.labelSmall)
+                }
+            }
+            if (progress > 0f) {
+                Box(Modifier.fillMaxWidth().height(3.dp).background(Color.White.copy(alpha = 0.18f))) {
+                    Box(Modifier.fillMaxWidth(progress).height(3.dp).background(Accent))
+                }
+            }
+        }
+    }
+}
+
+internal fun compactDetailFacts(item: Item, durationMs: Long?): List<String> = buildList {
+    if (item.kind == "episode" && item.season_number != null && item.episode_number != null) {
+        add("S${item.season_number} E${item.episode_number}")
+    }
+    item.year?.let { add(it.toString()) }
+    durationMs?.takeIf { it > 0 }?.let { add(compactRuntimeLabel(it)) }
+    addAll(item.tags.take(2))
+}
+
+private fun detailProgress(item: Item, durationMs: Long?): Float {
+    val watch = item.watch ?: return 0f
+    val position = watch.position_ms
+    val duration = watch.duration_ms ?: durationMs ?: return 0f
+    if (duration <= 0) return 0f
+    return (position.toFloat() / duration).coerceIn(0f, 1f)
 }
 
 @Composable
@@ -377,7 +479,7 @@ private fun Actions(
                     requestInitialFocus = requestInitialFocus,
                 ) {
                     Icon(Icons.Filled.PlayArrow, contentDescription = null, modifier = Modifier.size(20.dp))
-                    Text(if (canResume) "  Resume · ${formatTime(resumeMs)}" else "  Play", fontWeight = FontWeight.SemiBold)
+                    Text(if (canResume) "  Resume  ${formatTime(resumeMs)}" else "  Play", fontWeight = FontWeight.SemiBold)
                 }
             }
             if (canResume) {
@@ -507,7 +609,7 @@ private fun EpisodeRow(item: Item, side: androidx.compose.ui.unit.Dp, starting: 
                 overflow = TextOverflow.Ellipsis,
             )
             Text(
-                listOfNotNull(item.air_date, item.runtime_ms?.let(::formatTime)).joinToString("  ·  "),
+                listOfNotNull(item.air_date, item.runtime_ms?.let(::compactRuntimeLabel)).joinToString("   "),
                 color = Muted,
                 style = MaterialTheme.typography.labelMedium,
             )
@@ -535,7 +637,7 @@ private fun SpecChip(text: String, color: Color = Accent) {
 
 private fun fileSpecLine(file: MediaFileDto): String {
     val audio = file.audio_streams.joinToString(" / ") { stream ->
-        listOfNotNull(stream.codec?.uppercase(), stream.channels?.let { "${it}ch" }, stream.language).joinToString(" · ")
+        listOfNotNull(stream.codec?.uppercase(), stream.channels?.let { "${it}ch" }, stream.language).joinToString("  ")
     }
     val bits = listOfNotNull(
         file.container?.uppercase(),
@@ -543,13 +645,13 @@ private fun fileSpecLine(file: MediaFileDto): String {
         file.size.takeIf { it > 0 }?.let { "%.1f GB".format(it / 1_073_741_824.0) },
         audio.takeIf { it.isNotBlank() },
     )
-    return bits.joinToString("  ·  ")
+    return bits.joinToString("   ")
 }
 
 private fun metaLine(item: Item, durationMs: Long?): String = buildList {
     if (item.kind == "episode") {
         item.show_title?.let(::add)
-        if (item.season_number != null && item.episode_number != null) add("S${item.season_number} · E${item.episode_number}")
+        if (item.season_number != null && item.episode_number != null) add("S${item.season_number} E${item.episode_number}")
     }
     item.recorded_at?.let(::add)
     item.year?.let { add(it.toString()) }
@@ -567,7 +669,7 @@ private fun childrenHeading(kind: String): String = when (kind) {
 private fun seriesPlayLabel(target: EpisodePlaybackTarget): String {
     val episode = target.episode
     val number = if (episode.season_number != null && episode.episode_number != null) {
-        "S${episode.season_number} · E${episode.episode_number}"
+        "S${episode.season_number} E${episode.episode_number}"
     } else {
         episode.title
     }

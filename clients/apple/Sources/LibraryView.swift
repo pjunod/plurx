@@ -36,7 +36,7 @@ struct LibraryView: View {
         .background(Palette.bg.ignoresSafeArea())
         .navigationTitle(collection.title)
         #if os(iOS)
-        .navigationBarTitleDisplayMode(.large)
+        .navigationBarTitleDisplayMode(.inline)
         .refreshable { await load() }
         #endif
         .toolbar { libraryToolbar }
@@ -50,7 +50,7 @@ struct LibraryView: View {
                     .font(.system(.subheadline, design: .monospaced))
                     .foregroundColor(Palette.muted)
                 if collection.libraries.count > 1 {
-                    Text(collection.libraries.map(\.name).joined(separator: "  ·  "))
+                    Text(collection.libraries.map(\.name).joined(separator: ", "))
                         .font(.caption)
                         .foregroundColor(Palette.muted)
                         .lineLimit(2)
