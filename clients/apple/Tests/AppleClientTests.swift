@@ -2066,9 +2066,12 @@ final class AppleClientTests: XCTestCase {
         XCTAssertEqual(PlayerView.nowPlayingSummary(nil), "No description available.")
     }
 
-    func testPlayerOffersDownCueUntilNowPlayingInfoIsVisible() {
-        XCTAssertEqual(PlayerView.nowPlayingInfoCueLabel(showingInfo: false), "INFO")
-        XCTAssertNil(PlayerView.nowPlayingInfoCueLabel(showingInfo: true))
+    func testPlayerFormatsTheReleaseDateLikeTheWebOverlay() {
+        XCTAssertEqual(
+            PlayerView.playbackDateLabel(airDate: "2026-06-10", year: 2025),
+            "Jun 10, 2026"
+        )
+        XCTAssertEqual(PlayerView.playbackDateLabel(airDate: nil, year: 2025), "2025")
     }
 
     func testDetailViewportAndBodyNeverOutgrowTheirAvailableWidth() {

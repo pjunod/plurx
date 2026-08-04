@@ -622,6 +622,7 @@ final class AppModel: ObservableObject {
                 title: playable.title,
                 subtitle: nextEpisodeSubtitle(playable),
                 year: playable.year,
+                airDate: playable.airDate,
                 overview: playable.overview
             )
         }
@@ -677,6 +678,7 @@ final class AppModel: ObservableObject {
             title: playable.title,
             subtitle: nextEpisodeSubtitle(playable),
             year: playable.year,
+            airDate: playable.airDate,
             overview: playable.overview
         )
     }

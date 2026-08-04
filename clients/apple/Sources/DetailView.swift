@@ -349,6 +349,7 @@ struct PlayContext: Identifiable {
     let title: String
     var subtitle: String? = nil
     var year: Int? = nil
+    var airDate: String? = nil
     var overview: String? = nil
 }
 
@@ -645,7 +646,8 @@ struct DetailView: View {
         }) { ctx in
             PlayerView(itemId: ctx.itemId, fileId: ctx.fileId, startMs: ctx.startMs,
                        durationMs: ctx.durationMs, title: ctx.title,
-                       subtitle: ctx.subtitle, year: ctx.year, overview: ctx.overview,
+                       subtitle: ctx.subtitle, year: ctx.year, airDate: ctx.airDate,
+                       overview: ctx.overview,
                        onPlayNext: { play = $0 },
                        onPlaybackStopped: { positionMs in
                            updateVisibleProgress(
@@ -1554,6 +1556,7 @@ struct DetailView: View {
                 title: item.title,
                 subtitle: playbackSubtitle(item),
                 year: item.year,
+                airDate: item.airDate,
                 overview: item.overview
             )
         } label: {
@@ -1627,6 +1630,7 @@ struct DetailView: View {
                 title: item.title,
                 subtitle: playbackSubtitle(item),
                 year: item.year,
+                airDate: item.airDate,
                 overview: item.overview
             )
         }
@@ -1666,6 +1670,7 @@ struct DetailView: View {
                 title: item.title,
                 subtitle: playbackSubtitle(item),
                 year: item.year,
+                airDate: item.airDate,
                 overview: item.overview
             )
         } label: {
