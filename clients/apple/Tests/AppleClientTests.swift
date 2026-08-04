@@ -2220,6 +2220,55 @@ final class AppleClientTests: XCTestCase {
         XCTAssertEqual(PlayerView.playbackDateLabel(airDate: nil, year: 2025), "2025")
     }
 
+    #if os(iOS)
+    @MainActor
+    func testIPadPlaybackWideRowExpandsTheTimelineAcrossThePlayer() {
+        let viewportWidth: CGFloat = 1_366
+        let horizontalPadding: CGFloat = 20
+        var timelineWidth: CGFloat = 0
+        var rowFrame: CGRect = .null
+        let controller = UIHostingController(rootView:
+            PlayerTouchWideRow {
+                Color.clear.frame(width: 132, height: 44)
+            } timeline: {
+                Color.clear
+                    .frame(minWidth: 100, maxWidth: .infinity, minHeight: 44)
+                    .reportLayoutWidth()
+            } options: {
+                Color.clear.frame(width: 300, height: 44)
+            }
+            .reportLayoutFrame()
+            .padding(.horizontal, horizontalPadding)
+            .onPreferenceChange(LayoutWidthPreferenceKey.self) {
+                timelineWidth = $0
+            }
+            .onPreferenceChange(LayoutFramePreferenceKey.self) {
+                rowFrame = $0
+            }
+        )
+
+        controller.view.frame = CGRect(
+            origin: .zero,
+            size: CGSize(width: viewportWidth, height: 100)
+        )
+        let window = UIWindow(frame: controller.view.frame)
+        window.rootViewController = controller
+        window.makeKeyAndVisible()
+        controller.view.setNeedsLayout()
+        controller.view.layoutIfNeeded()
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.2))
+
+        XCTAssertFalse(rowFrame.isNull)
+        XCTAssertEqual(
+            rowFrame.width,
+            viewportWidth - (2 * horizontalPadding),
+            accuracy: 0.5
+        )
+        XCTAssertGreaterThan(timelineWidth, viewportWidth / 2)
+        window.isHidden = true
+    }
+    #endif
+
     func testDetailViewportAndBodyNeverOutgrowTheirAvailableWidth() {
         for availableWidth: CGFloat in [320, 390, 430, 744, 1_366] {
             let controller = UIHostingController(rootView: DetailViewportFrame {
