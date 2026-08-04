@@ -87,6 +87,21 @@
       : "fail";
   }
 
+  function seekDeltaSeconds(key) {
+    switch (key) {
+      case "ArrowLeft":
+        return -10;
+      case "ArrowRight":
+        return 10;
+      case "ArrowDown":
+        return -30;
+      case "ArrowUp":
+        return 30;
+      default:
+        return null;
+    }
+  }
+
   function lostFrameRate(hitches, playedSeconds) {
     if (!hitches || !(playedSeconds > 0)) return null;
     const lost =
@@ -124,6 +139,7 @@
     hlsTransport,
     initialRoute,
     fallbackAction,
+    seekDeltaSeconds,
     lostFrameRate,
     decodeMarginVerdict,
   });

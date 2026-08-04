@@ -6026,9 +6026,9 @@ function pbTick(){
 function pbSyncPlayIcon(){ const v=document.getElementById("video"), b=document.getElementById("pbplay");
   if(b&&v){ const paused=(v.paused||v.ended); b.textContent=paused?"▶":"❚❚"; b.setAttribute("aria-label", paused?"Play":"Pause"); } }
 function togglePlay(){ const v=document.getElementById("video"); if(!v) return; if(v.paused||v.ended) v.play().catch(()=>{}); else v.pause(); playerActivity(); }
-// ±10s nudges coalesce: accumulate against a frozen base, preview live on the
-// scrubber, and fire ONE seekTo after a short quiet — so mashing the button (or
-// holding an arrow) doesn't restart the transcode stream over and over.
+// Directional nudges coalesce: accumulate against a frozen base, preview live
+// on the scrubber, and fire ONE seekTo after a short quiet — so mashing a
+// button (or an arrow) doesn't restart the transcode stream over and over.
 let NUDGE_T=null;
 function nudge(d){
   const me=PLAYER; if(!me) return;
@@ -6096,8 +6096,8 @@ function pbWireSeek(){
     PLAYER._seekPreview=null; if(tot>0) seekTo(t); else pbTick(); };
   seek.addEventListener("pointerup",done);
   seek.addEventListener("pointercancel",()=>{ if(!drag)return; drag=false; const t=PLAYER._seekPreview; PLAYER._seekPreview=null; if(t!=null) seekTo(t); else pbTick(); });
-  // Keyboard on the focused slider: Home/End jump to start/end (arrows ±10s are
-  // handled by the global player key handler).
+  // Keyboard on the focused slider: Home/End jump to start/end (directional
+  // seeks are handled by the global player key handler).
   seek.addEventListener("keydown",e=>{
     if(e.key==='Home'){ e.preventDefault(); seekTo(0); }
     else if(e.key==='End'){ e.preventDefault(); const t=pbTotalSec(); if(t>0) seekTo(Math.max(0,t-1)); }
@@ -7211,14 +7211,14 @@ window.addEventListener("keydown",e=>{
 window.addEventListener("keydown",e=>{
   if(!document.getElementById("modal").classList.contains("open")) return;
   const typing=/^(INPUT|TEXTAREA|SELECT)$/.test((e.target.tagName||""));
+  const seekDelta=PlaybackPolicy.seekDeltaSeconds(e.key);
   // A focused control (or key auto-repeat) shouldn't also drive the hotkeys —
   // otherwise Space both activates the button and toggles play, etc.
   const onBtn=/^BUTTON$/.test((e.target.tagName||""));
   if((e.key==='i'||e.key==='I') && !typing){ e.preventDefault(); toggleStats(); }
   else if(e.key==='Escape' && !document.fullscreenElement){ closePlayer(); }
   else if(!typing && !onBtn && !e.repeat && (e.key===' '||e.key==='k'||e.key==='K')){ e.preventDefault(); togglePlay(); }
-  else if(!typing && !onBtn && !e.repeat && e.key==='ArrowLeft'){ e.preventDefault(); nudge(-10); }
-  else if(!typing && !onBtn && !e.repeat && e.key==='ArrowRight'){ e.preventDefault(); nudge(10); }
+  else if(!typing && !onBtn && !e.repeat && seekDelta!=null){ e.preventDefault(); nudge(seekDelta); }
   else if(!typing && !onBtn && (e.key==='f'||e.key==='F')){ e.preventDefault(); toggleFullscreen(); }
   else if(!typing && !onBtn && !e.repeat && (e.key==='c'||e.key==='C')){ e.preventDefault(); cycleSub(); }
 });
