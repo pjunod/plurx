@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import re
 import runpy
 import subprocess
+import tempfile
 import unittest
 
 
@@ -76,6 +78,49 @@ class OperationsContractCase(unittest.TestCase):
         self.assertIn("-scheme plurx-tvOS", ship)
         self.assertIn("testDebugUnitTest :app:lintDebug :app:assembleDebug", ship)
         self.assertIn("alias(libs.plugins.android.application)", android)
+
+    def test_ship_targets_each_physical_android_device_once(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            adb = Path(temporary) / "adb"
+            adb.write_text(
+                """#!/bin/sh
+case "$1" in
+  devices)
+    printf 'List of devices attached\\nemulator-5554\\tdevice\\nwireless-a\\tdevice\\nwireless-b\\tdevice\\nlenovo-endpoint\\tdevice\\n'
+    ;;
+  -s)
+    case "$2" in
+      wireless-a|wireless-b) printf 'DUPLICATE\\r\\n' ;;
+      lenovo-endpoint) printf 'HA263LBP\\r\\n' ;;
+      *) exit 2 ;;
+    esac
+    ;;
+  *) exit 3 ;;
+esac
+""",
+                encoding="utf-8",
+            )
+            adb.chmod(0o755)
+            environment = os.environ.copy()
+            environment["ADB"] = str(adb)
+            result = subprocess.run(
+                [str(ROOT / "scripts/ship"), "--android", "--dry-run"],
+                cwd=ROOT,
+                env=environment,
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+
+        output = result.stdout
+        self.assertIn("skipping emulator emulator-5554", output)
+        self.assertIn("installing to wireless-a (physical device DUPLICATE)", output)
+        self.assertIn(
+            "skipping duplicate endpoint wireless-b for physical device DUPLICATE", output
+        )
+        self.assertIn("installing to lenovo-endpoint (physical device HA263LBP)", output)
+        self.assertNotIn("required Android device HA263LBP is not attached", output)
 
     def test_ci_provisions_concrete_apple_devices_before_testing(self):
         workflow = read(".github/workflows/ci.yml")

@@ -30,6 +30,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ANSIBLE_DIR="${PLURX_ANSIBLE_DIR:-$HOME/code/ansible/media}"
+ANDROID_REQUIRED_SERIALS="${PLURX_ANDROID_REQUIRED_SERIALS:-HA263LBP}"
 
 DO_CHECK=0; DO_PUSH=0; DO_DEPLOY=0; DO_APPLE=0; DO_ANDROID=0
 DRY=0; RUNG=""
@@ -200,18 +201,54 @@ if [ "$DO_ANDROID" -eq 1 ]; then
   [ -x ./gradlew ] || die "no gradlew in clients/android"
   note "no host JDK/SDK? \`make android\` from the repo root builds the same APK in Docker"
   run ./gradlew testDebugUnitTest :app:lintDebug :app:assembleDebug
-  if command -v adb >/dev/null; then
-    DEVICES="$(adb devices | awk 'NR>1 && $2=="device" {print $1}')"
+  ADB_BIN="${ADB:-}"
+  if [ -z "$ADB_BIN" ] && command -v adb >/dev/null; then
+    ADB_BIN="$(command -v adb)"
+  fi
+  if [ -z "$ADB_BIN" ] && [ -n "${ANDROID_HOME:-}" ] && [ -x "$ANDROID_HOME/platform-tools/adb" ]; then
+    ADB_BIN="$ANDROID_HOME/platform-tools/adb"
+  fi
+  if [ -z "$ADB_BIN" ] && [ -x "$HOME/Library/Android/sdk/platform-tools/adb" ]; then
+    ADB_BIN="$HOME/Library/Android/sdk/platform-tools/adb"
+  fi
+
+  if [ -n "$ADB_BIN" ]; then
+    DEVICES="$("$ADB_BIN" devices | awk 'NR>1 && $2=="device" {print $1}')"
     if [ -z "$DEVICES" ]; then
       note "no attached devices — build only (pair a TV with \`adb connect <ip>:5555\`)"
     else
+      SEEN_HARDWARE_SERIALS=""
       for d in $DEVICES; do
-        note "installing to $d"
-        run adb -s "$d" install -r "$APK"
+        case "$d" in
+          emulator-*)
+            note "skipping emulator $d — physical devices only"
+            continue
+            ;;
+        esac
+
+        HARDWARE_SERIAL="$("$ADB_BIN" -s "$d" shell getprop ro.serialno 2>/dev/null | tr -d '\r' || true)"
+        [ -n "$HARDWARE_SERIAL" ] || HARDWARE_SERIAL="$d"
+        case " $SEEN_HARDWARE_SERIALS " in
+          *" $HARDWARE_SERIAL "*)
+            note "skipping duplicate endpoint $d for physical device $HARDWARE_SERIAL"
+            continue
+            ;;
+        esac
+
+        SEEN_HARDWARE_SERIALS="$SEEN_HARDWARE_SERIALS $HARDWARE_SERIAL"
+        note "installing to $d (physical device $HARDWARE_SERIAL)"
+        run "$ADB_BIN" -s "$d" install -r "$APK"
+      done
+
+      for required in $ANDROID_REQUIRED_SERIALS; do
+        case " $SEEN_HARDWARE_SERIALS " in
+          *" $required "*) ;;
+          *) note "WARNING: required Android device $required is not attached — it did not receive this push" ;;
+        esac
       done
     fi
   else
-    note "no adb on PATH — build only; the APK is at clients/android/$APK"
+    note "no adb found — set ADB or ANDROID_HOME; the APK is at clients/android/$APK"
   fi
   cd "$ROOT"
 fi
