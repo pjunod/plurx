@@ -180,7 +180,9 @@ private struct HomeDashboard: View {
 
         MediaRow(
             title: "Continue Watching",
-            items: model.hubs.continueWatching ?? [],
+            items: HomeLayoutPolicy.continueWatchingShelfItems(
+                model.hubs.continueWatching ?? []
+            ),
             style: .landscape,
             landscapeCopyStyle: HomeLayoutPolicy.continueWatchingCopyStyle
         )
@@ -213,6 +215,10 @@ enum HomeLayoutPolicy {
     static let continueWatchingCopyStyle: LandscapeCardCopyStyle = .accentPanel
     static let topLevelTabs = ["Home", "Libraries", "Search", "Settings"]
     static let showsLibraryShelvesOnHome = false
+
+    static func continueWatchingShelfItems(_ items: [Item]) -> [Item] {
+        usesFeaturedHero ? Array(items.dropFirst()) : items
+    }
 
     #if os(tvOS)
     static let usesFeaturedHero = false
@@ -270,7 +276,11 @@ private struct LibrariesDashboard: View {
     private var libraryHeading: some View {
         HStack {
             Text("Libraries")
+                #if os(tvOS)
                 .font(.title3.weight(.semibold))
+                #else
+                .font(.headline.weight(.semibold))
+                #endif
                 .foregroundColor(Palette.onBg)
             Spacer()
             Picker("Group by", selection: Binding(
@@ -297,50 +307,178 @@ private struct FeaturedHero: View {
 
     var body: some View {
         NavigationLink(value: Route.item(item.id)) {
-            ZStack(alignment: .bottomLeading) {
-                AuthImage(path: item.backdrop ?? item.poster)
-                    .frame(maxWidth: .infinity)
-                    .frame(height: heroHeight)
-                    .clipped()
-                LinearGradient(
-                    colors: [.clear, Palette.bg.opacity(0.18), Palette.bg],
-                    startPoint: .top,
-                    endPoint: .bottom
-                )
-                VStack(alignment: .leading, spacing: 8) {
-                    Text(item.showTitle ?? item.title)
-                        #if os(tvOS)
-                        .font(.system(size: 52, weight: .bold))
-                        #else
-                        .font(compact ? .title.bold() : .largeTitle.bold())
-                        #endif
-                        .foregroundColor(.white)
-                        .lineLimit(2)
-                    if item.showTitle != nil {
-                        Text(episodeSubtitleForHero(item))
-                            .font(.headline)
-                            .foregroundColor(.white.opacity(0.82))
-                            .lineLimit(1)
-                    }
-                    if !heroMetadata.isEmpty {
-                        Text(heroMetadata)
-                            .font(.system(.callout, design: .monospaced).weight(.semibold))
-                            .foregroundColor(.white.opacity(0.72))
-                            .lineLimit(1)
-                    }
-                    Label(heroAction, systemImage: "play.fill")
-                        .font(.system(.headline, design: .monospaced).weight(.bold))
-                        .foregroundColor(.white)
-                        .padding(.horizontal, 16).padding(.vertical, 10)
-                        .background(Palette.accent, in: Capsule())
-                }
-                .padding(.horizontal, screenHPad)
-                .padding(.bottom, 24)
+            #if os(iOS)
+            if compact {
+                compactHero
+            } else {
+                expansiveHero
             }
-            .clipShape(RoundedRectangle(cornerRadius: heroCornerRadius, style: .continuous))
+            #else
+            expansiveHero
+            #endif
         }
         .featuredButtonStyle()
         .accessibilityLabel("\(heroAction) \(item.title)")
+    }
+
+    #if os(iOS)
+    private var compactHero: some View {
+        ZStack(alignment: .bottomLeading) {
+            AuthImage(
+                path: item.backdrop ?? item.poster,
+                targetSize: CGSize(
+                    width: 430,
+                    height: HomeHeroMetrics.compactHeight
+                )
+            )
+            .frame(maxWidth: .infinity)
+            .frame(height: HomeHeroMetrics.compactHeight)
+            .clipped()
+
+            LinearGradient(
+                stops: [
+                    .init(color: .clear, location: 0.18),
+                    .init(color: .black.opacity(0.24), location: 0.5),
+                    .init(color: Palette.bg.opacity(0.92), location: 1)
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+
+            VStack(alignment: .leading, spacing: 7) {
+                Text("CONTINUE")
+                    .font(.system(size: 10, weight: .bold, design: .rounded))
+                    .tracking(1.7)
+                    .foregroundStyle(Palette.accent)
+
+                Text(item.showTitle ?? item.title)
+                    .font(.system(size: 25, weight: .heavy, design: .rounded))
+                    .foregroundStyle(.white)
+                    .lineLimit(1)
+                    .shadow(color: .black.opacity(0.6), radius: 8, y: 2)
+
+                if item.showTitle != nil {
+                    Text(episodeSubtitleForHero(item))
+                        .font(.subheadline.weight(.medium))
+                        .foregroundStyle(.white.opacity(0.78))
+                        .lineLimit(1)
+                }
+
+                HStack(spacing: 12) {
+                    ForEach(compactFacts, id: \.self) { fact in
+                        Text(fact)
+                    }
+                    if let resolutionBadge {
+                        IOSWebMediaBadge(badge: resolutionBadge)
+                    }
+                }
+                .font(.system(size: 12, weight: .medium, design: .rounded))
+                .foregroundStyle(.white.opacity(0.7))
+
+                if heroProgress > 0 {
+                    GeometryReader { geometry in
+                        ZStack(alignment: .leading) {
+                            Capsule().fill(.white.opacity(0.2))
+                            Capsule()
+                                .fill(Palette.accent)
+                                .frame(width: geometry.size.width * heroProgress)
+                        }
+                    }
+                    .frame(height: 3)
+                }
+
+                HStack(spacing: 10) {
+                    Label(heroAction, systemImage: "play.fill")
+                        .font(.system(size: 13, weight: .bold, design: .rounded))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 14)
+                        .frame(height: 38)
+                        .background(Palette.accent, in: Capsule())
+
+                    if let remaining = continueWatchingTimeRemaining(item) {
+                        Text(remaining)
+                            .font(.system(size: 11, weight: .medium, design: .rounded))
+                            .foregroundStyle(.white.opacity(0.58))
+                    }
+                }
+            }
+            .padding(16)
+        }
+        .frame(height: HomeHeroMetrics.compactHeight)
+        .clipShape(RoundedRectangle(cornerRadius: HomeHeroMetrics.cornerRadius, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: HomeHeroMetrics.cornerRadius, style: .continuous)
+                .stroke(.white.opacity(0.08), lineWidth: 0.5)
+        }
+        .padding(.horizontal, screenHPad)
+    }
+
+    private var compactFacts: [String] {
+        var facts: [String] = []
+        if let year = item.year { facts.append(String(year)) }
+        if let runtime = item.runtimeMs, runtime > 0 {
+            facts.append(DetailView.compactRuntimeLabel(runtime))
+        }
+        return facts
+    }
+
+    private var resolutionBadge: ItemMetadataBadge? {
+        guard let resolution = resolutionLabel(item.resolution) else { return nil }
+        return ItemMetadataBadge(
+            kind: .resolution,
+            symbol: "",
+            mark: resolution,
+            accessibilityLabel: resolution
+        )
+    }
+
+    private var heroProgress: CGFloat {
+        CGFloat(progressFraction(item.watch, runtimeMs: item.runtimeMs))
+    }
+    #endif
+
+    private var expansiveHero: some View {
+        ZStack(alignment: .bottomLeading) {
+            AuthImage(path: item.backdrop ?? item.poster)
+                .frame(maxWidth: .infinity)
+                .frame(height: heroHeight)
+                .clipped()
+            LinearGradient(
+                colors: [.clear, Palette.bg.opacity(0.18), Palette.bg],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+            VStack(alignment: .leading, spacing: 8) {
+                Text(item.showTitle ?? item.title)
+                    #if os(tvOS)
+                    .font(.system(size: 52, weight: .bold))
+                    #else
+                    .font(compact ? .title.bold() : .largeTitle.bold())
+                    #endif
+                    .foregroundColor(.white)
+                    .lineLimit(2)
+                if item.showTitle != nil {
+                    Text(episodeSubtitleForHero(item))
+                        .font(.headline)
+                        .foregroundColor(.white.opacity(0.82))
+                        .lineLimit(1)
+                }
+                if !heroMetadata.isEmpty {
+                    Text(heroMetadata)
+                        .font(.system(.callout, design: .monospaced).weight(.semibold))
+                        .foregroundColor(.white.opacity(0.72))
+                        .lineLimit(1)
+                }
+                Label(heroAction, systemImage: "play.fill")
+                    .font(.system(.headline, design: .monospaced).weight(.bold))
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 16).padding(.vertical, 10)
+                    .background(Palette.accent, in: Capsule())
+            }
+            .padding(.horizontal, screenHPad)
+            .padding(.bottom, 24)
+        }
+        .clipShape(RoundedRectangle(cornerRadius: heroCornerRadius, style: .continuous))
     }
 
     private var heroHeight: CGFloat {
@@ -377,6 +515,13 @@ private struct FeaturedHero: View {
     }
 }
 
+#if os(iOS)
+enum HomeHeroMetrics {
+    static let compactHeight: CGFloat = 238
+    static let cornerRadius: CGFloat = 18
+}
+#endif
+
 private struct EmptyLibraryCategory: View {
     let title: String
     var body: some View {
@@ -396,5 +541,5 @@ private func episodeSubtitleForHero(_ item: Item) -> String {
         parts.append("S\(season) E\(episode)")
     }
     parts.append(item.title)
-    return parts.joined(separator: " · ")
+    return parts.joined(separator: "  ")
 }

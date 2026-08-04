@@ -54,6 +54,12 @@ class MediaFactsTest {
         )
     }
 
+    @Test
+    fun lightweightItemResolutionUsesTheSameTechnicalBadgeVocabulary() {
+        assertEquals("2160P", itemResolutionFact(2_160)?.label)
+        assertEquals(MediaFactKind.Resolution, itemResolutionFact(2_160)?.kind)
+    }
+
     // ---- MEDIA-BADGES-PLAN §2.3: the three states, case by case -------------
     //
     // The same table the web player's badge is driven by, adapted to Android's

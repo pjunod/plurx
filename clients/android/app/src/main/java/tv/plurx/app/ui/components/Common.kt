@@ -79,7 +79,7 @@ fun NetworkImage(url: String?, modifier: Modifier = Modifier) {
 /**
  * A poster tile that grows and gains a red outline when focused — the D-pad
  * affordance on Android TV, and a pleasant hover on touch. For episodes it
- * shows "S1·E3", for everything else the year.
+ * shows "S1 E3", for everything else the year.
  */
 @Composable
 fun PosterCard(
@@ -179,15 +179,12 @@ fun PosterCard(
                 modifier = Modifier.weight(1f),
             )
             if (resolutionPlacement == PosterResolutionPlacement.BelowArtwork) item.resolution?.let { height ->
-                Text(
-                    resolutionLabel(height),
-                    style = MaterialTheme.typography.labelMedium,
-                    color = Muted,
-                    fontWeight = FontWeight.SemiBold,
-                    modifier = Modifier
-                        .testTag("poster-resolution-metadata")
-                        .padding(start = 6.dp),
-                )
+                itemResolutionFact(height)?.let { fact ->
+                    MediaFactChip(
+                        fact,
+                        Modifier.testTag("poster-resolution-metadata").padding(start = 6.dp),
+                    )
+                }
             }
         }
     }
@@ -339,7 +336,7 @@ fun LoadingBox(modifier: Modifier = Modifier) {
 private fun subtitleFor(item: Item): String = when {
     item.kind == "folder" && item.child_count != null -> "${item.child_count} items"
     item.kind == "episode" && item.season_number != null && item.episode_number != null ->
-        "S${item.season_number}·E${item.episode_number}"
+        "S${item.season_number} E${item.episode_number}"
     item.year != null -> item.year.toString()
     item.show_title != null -> item.show_title
     else -> item.kind.replaceFirstChar { it.uppercase() }

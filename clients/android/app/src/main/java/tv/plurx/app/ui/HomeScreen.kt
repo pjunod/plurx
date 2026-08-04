@@ -1,5 +1,7 @@
 package tv.plurx.app.ui
 
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -7,14 +9,17 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Icon
@@ -25,10 +30,13 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -39,10 +47,14 @@ import tv.plurx.app.data.Library
 import tv.plurx.app.data.ThemeId
 import tv.plurx.app.ui.components.ChoicePicker
 import tv.plurx.app.ui.components.LoadingBox
+import tv.plurx.app.ui.components.MediaFactChip
 import tv.plurx.app.ui.components.MediaRow
+import tv.plurx.app.ui.components.NetworkImage
 import tv.plurx.app.ui.components.PosterResolutionPlacement
 import tv.plurx.app.ui.components.safeDisplayInsets
 import tv.plurx.app.ui.components.TvIconButton
+import tv.plurx.app.ui.components.imageUrl
+import tv.plurx.app.ui.components.itemResolutionFact
 import tv.plurx.app.ui.theme.Accent
 import tv.plurx.app.ui.theme.Muted
 
@@ -91,13 +103,17 @@ fun HomeScreen(
             }
             else -> {
                 val collections = homeCollections(state.libraries, state.libraryItems, preferences.homeGrouping)
+                val continueShelfItems = continueWatchingShelfItems(
+                    state.hubs.continue_watching,
+                    formFactor,
+                )
                 // Every vertical stop on this page, in the order a D-pad walks
                 // them. The "Group by" picker is one of them: it used to sit
                 // between the hub shelves and the library shelves while their
                 // up/down pointed straight past it at each other, so the only
                 // way to change the grouping was to have a touchscreen.
                 val visibleShelfKeys = buildList {
-                    if (state.hubs.continue_watching.isNotEmpty()) add("continue")
+                    if (continueShelfItems.isNotEmpty()) add("continue")
                     if (state.hubs.next_up.isNotEmpty()) add("next")
                     if (state.hubs.recently_added.isNotEmpty()) add("recent")
                     if (state.libraries.isNotEmpty()) add(GROUPING_KEY)
@@ -149,9 +165,18 @@ fun HomeScreen(
                         .verticalScroll(rememberScrollState())
                         .padding(bottom = 32.dp)
                 ) {
+                    if (formFactor == FormFactor.Compact) {
+                        state.hubs.continue_watching.firstOrNull()?.let { featured ->
+                            CompactContinueHero(
+                                item = featured,
+                                side = side,
+                                onOpen = { onOpenItem(featured.id) },
+                            )
+                        }
+                    }
                     MediaRow(
                         "Continue watching",
-                        state.hubs.continue_watching,
+                        continueShelfItems,
                         posterWidth,
                         resolutionPlacement = PosterResolutionPlacement.BelowArtwork,
                         rowFocusRequester = shelfFocus["continue"],
@@ -230,6 +255,128 @@ fun HomeScreen(
             }
         }
     }
+}
+
+@Composable
+private fun CompactContinueHero(
+    item: Item,
+    side: Dp,
+    onOpen: () -> Unit,
+) {
+    val progress = compactProgress(item)
+    Box(
+        Modifier
+            .fillMaxWidth()
+            .padding(horizontal = side, vertical = 8.dp)
+            .height(238.dp)
+            .clip(MaterialTheme.shapes.large)
+            .clickable(onClick = onOpen),
+    ) {
+        NetworkImage(imageUrl(item.backdrop ?: item.poster), Modifier.fillMaxSize())
+        Box(
+            Modifier.fillMaxSize().background(
+                Brush.verticalGradient(
+                    listOf(Color.Transparent, Color(0x33000000), Color(0xF2111114)),
+                ),
+            ),
+        )
+        Column(
+            Modifier.align(Alignment.BottomStart).fillMaxWidth().padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(7.dp),
+        ) {
+            Text(
+                "CONTINUE",
+                color = Accent,
+                fontSize = 10.sp,
+                fontWeight = FontWeight.Bold,
+                letterSpacing = 1.7.sp,
+            )
+            Text(
+                item.show_title ?: item.title,
+                color = Color.White,
+                fontSize = 25.sp,
+                fontWeight = FontWeight.ExtraBold,
+                maxLines = 1,
+            )
+            if (item.show_title != null) {
+                Text(
+                    compactEpisodeSubtitle(item),
+                    color = Color.White.copy(alpha = 0.78f),
+                    style = MaterialTheme.typography.labelMedium,
+                    maxLines = 1,
+                )
+            }
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                compactHomeFacts(item).forEach { fact ->
+                    Text(fact, color = Color.White.copy(alpha = 0.7f), style = MaterialTheme.typography.labelSmall)
+                }
+                itemResolutionFact(item.resolution)?.let { MediaFactChip(it) }
+            }
+            if (progress > 0f) {
+                Box(Modifier.fillMaxWidth().height(3.dp).background(Color.White.copy(alpha = 0.2f))) {
+                    Box(Modifier.fillMaxWidth(progress).height(3.dp).background(Accent))
+                }
+            }
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Row(
+                    Modifier.background(Accent, MaterialTheme.shapes.extraLarge)
+                        .padding(horizontal = 14.dp, vertical = 9.dp),
+                    horizontalArrangement = Arrangement.spacedBy(5.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(Icons.Filled.PlayArrow, contentDescription = null, tint = Color.White, modifier = Modifier.size(18.dp))
+                    Text("Resume", color = Color.White, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Bold)
+                }
+                compactTimeRemaining(item)?.let { remaining ->
+                    Text(remaining, color = Color.White.copy(alpha = 0.58f), style = MaterialTheme.typography.labelSmall)
+                }
+            }
+        }
+    }
+}
+
+internal fun continueWatchingShelfItems(items: List<Item>, formFactor: FormFactor): List<Item> =
+    if (formFactor == FormFactor.Compact) items.drop(1) else items
+
+internal fun compactRuntimeLabel(milliseconds: Long): String {
+    val totalMinutes = milliseconds / 60_000
+    val hours = totalMinutes / 60
+    val minutes = totalMinutes % 60
+    return if (hours > 0) "${hours}h ${minutes}m" else "${minutes}m"
+}
+
+private fun compactHomeFacts(item: Item): List<String> = buildList {
+    item.year?.let { add(it.toString()) }
+    item.runtime_ms?.takeIf { it > 0 }?.let { add(compactRuntimeLabel(it)) }
+}
+
+private fun compactEpisodeSubtitle(item: Item): String = buildList {
+    if (item.season_number != null && item.episode_number != null) {
+        add("S${item.season_number} E${item.episode_number}")
+    }
+    add(item.title)
+}.joinToString("  ")
+
+private fun compactProgress(item: Item): Float {
+    val watch = item.watch ?: return 0f
+    val position = watch.position_ms
+    val duration = watch.duration_ms ?: item.runtime_ms ?: return 0f
+    if (duration <= 0) return 0f
+    return (position.toFloat() / duration).coerceIn(0f, 1f)
+}
+
+private fun compactTimeRemaining(item: Item): String? {
+    val watch = item.watch ?: return null
+    val position = watch.position_ms
+    val duration = watch.duration_ms ?: item.runtime_ms ?: return null
+    if (duration <= position) return null
+    return "${maxOf(1, (duration - position) / 60_000)}m left"
 }
 
 @Composable

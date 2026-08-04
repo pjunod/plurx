@@ -80,8 +80,19 @@ struct PosterCard: View {
                     }
                     Spacer(minLength: 4)
                     if let trailingResolution {
+                        #if os(iOS)
+                        IOSWebMediaBadge(
+                            badge: ItemMetadataBadge(
+                                kind: .resolution,
+                                symbol: "",
+                                mark: trailingResolution,
+                                accessibilityLabel: trailingResolution
+                            )
+                        )
+                        #else
                         Text(trailingResolution)
                             .font(.system(.caption2, design: .monospaced).weight(.bold))
+                        #endif
                     }
                 }
                 .frame(maxWidth: .infinity)
@@ -313,7 +324,11 @@ struct MediaRow: View {
             VStack(alignment: .leading, spacing: 12) {
                 HStack(alignment: .firstTextBaseline) {
                     Text(title)
+                        #if os(tvOS)
                         .font(.title3.weight(.semibold))
+                        #else
+                        .font(.headline.weight(.semibold))
+                        #endif
                         .foregroundColor(Palette.onBg)
                     Spacer()
                     if let destination {
@@ -406,7 +421,7 @@ private func episodeCardMeta(_ item: Item) -> String {
     if let remaining = timeRemaining(item) {
         parts.append(remaining)
     }
-    return parts.isEmpty ? "Episode" : parts.joined(separator: "   ·   ")
+    return parts.isEmpty ? "Episode" : parts.joined(separator: "   ")
 }
 
 struct ComingSoonRow: View {
@@ -417,7 +432,11 @@ struct ComingSoonRow: View {
         if !entries.isEmpty {
             VStack(alignment: .leading, spacing: 12) {
                 Text("Coming Soon")
+                    #if os(tvOS)
                     .font(.title3.weight(.semibold))
+                    #else
+                    .font(.headline.weight(.semibold))
+                    #endif
                     .foregroundColor(Palette.onBg)
                     .padding(.horizontal, screenHPad)
                 ScrollView(.horizontal, showsIndicators: false) {
@@ -533,7 +552,7 @@ func continueWatchingDetail(_ item: Item) -> String {
             parts.append("S\(season) E\(episode)")
         }
         parts.append(item.title)
-        return parts.joined(separator: " · ")
+        return parts.joined(separator: "  ")
     }
     return item.year.map(String.init) ?? ""
 }
@@ -555,7 +574,7 @@ func cardShelfMetadata(_ item: Item) -> String {
     if let remaining = timeRemaining(item) {
         parts.append(remaining)
     }
-    return parts.joined(separator: " · ")
+    return parts.joined(separator: "  ")
 }
 
 private func shortDate(_ raw: String) -> String {

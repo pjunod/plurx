@@ -29,6 +29,7 @@ struct SearchView: View {
         .background(Palette.bg.ignoresSafeArea())
         .navigationTitle("Search")
         #if os(iOS)
+        .navigationBarTitleDisplayMode(.inline)
         .searchable(text: $query, prompt: "Movies, shows, and episodes")
         #endif
         .task(id: query) { await performSearch() }
