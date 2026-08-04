@@ -18,6 +18,29 @@ private enum PlayerControl: Hashable {
 }
 #endif
 
+#if os(iOS)
+private enum PlayerOptionMenu: Hashable {
+    case audio
+    case subtitles
+    case quality
+    case more
+}
+
+private struct PlayerOptionMenuButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 9)
+            .background(
+                configuration.isPressed ? Color.white.opacity(0.12) : Color.clear,
+                in: RoundedRectangle(cornerRadius: 7)
+            )
+            .contentShape(Rectangle())
+    }
+}
+#endif
+
 enum PlayerSeekDirection {
     case left
     case right
@@ -438,6 +461,9 @@ struct PlayerView: View {
     @State private var scrubMs = 0.0
     @State private var controlsVisible = true
     @State private var autoHideGeneration = 0
+    #if os(iOS)
+    @State private var activeOptionMenu: PlayerOptionMenu?
+    #endif
     #if os(tvOS)
     @FocusState private var focusedControl: PlayerControl?
     #endif
@@ -560,14 +586,16 @@ struct PlayerView: View {
             guard Self.shouldAutoHideControls(
                 visible: controlsVisible,
                 scrubbing: isScrubbing,
-                changingStream: controller.isChangingStream
+                changingStream: controller.isChangingStream,
+                optionMenuOpen: optionMenuOpen
             ) else { return }
             try? await Task.sleep(nanoseconds: Self.controlAutoHideDelayNanoseconds)
             guard !Task.isCancelled,
                   Self.shouldAutoHideControls(
                       visible: controlsVisible,
                       scrubbing: isScrubbing,
-                      changingStream: controller.isChangingStream
+                      changingStream: controller.isChangingStream,
+                      optionMenuOpen: optionMenuOpen
                   ) else { return }
             hideControls()
         }
@@ -575,6 +603,7 @@ struct PlayerView: View {
         .onChange(of: controller.isChangingStream) { _, _ in revealControls() }
         .onChange(of: showStats) { _, _ in restartAutoHideTimer() }
         .onChange(of: isScrubbing) { _, _ in restartAutoHideTimer() }
+        .onChange(of: optionMenuOpen) { _, _ in restartAutoHideTimer() }
         .onChange(of: controller.finished) { _, finished in
             guard finished, model.autoplay else { return }
             findingNext = true
@@ -623,9 +652,25 @@ struct PlayerView: View {
     static func shouldAutoHideControls(
         visible: Bool,
         scrubbing: Bool,
-        changingStream: Bool
+        changingStream: Bool,
+        optionMenuOpen: Bool
     ) -> Bool {
-        visible && !scrubbing && !changingStream
+        visible && !scrubbing && !changingStream && !optionMenuOpen
+    }
+
+    /// A presented touch menu is hosted outside the control hierarchy. Removing
+    /// the controls therefore removes its presentation anchor and dismisses the
+    /// menu too. On tvOS, focus on a menu button is the equivalent interaction:
+    /// keep the chrome up while the viewer is opening or navigating that menu.
+    private var optionMenuOpen: Bool {
+        #if os(iOS)
+        activeOptionMenu != nil
+        #else
+        switch focusedControl {
+        case .audio, .subtitles, .quality: true
+        default: false
+        }
+        #endif
     }
 
     private func toggleControls() {
@@ -648,6 +693,9 @@ struct PlayerView: View {
 
     private func hideControls() {
         guard controlsVisible else { return }
+        #if os(iOS)
+        activeOptionMenu = nil
+        #endif
         withAnimation(.easeOut(duration: 0.2)) {
             controlsVisible = false
         }
@@ -1308,36 +1356,42 @@ struct PlayerView: View {
 
     #if os(iOS)
     private var moreMenu: some View {
-        Menu {
-            if controller.audioTracks.count > 1 {
-                Menu("Audio") { audioChoices }
-            }
-            if !controller.subtitles.isEmpty {
-                Menu("Subtitles") { subtitleChoices }
-            }
-            if !controller.qualityRungs.isEmpty {
-                Menu("Quality") { qualityChoices }
-            }
-            Divider()
-            Button {
-                model.setAutoplay(!model.autoplay)
-                revealControls()
-            } label: {
-                Label(model.autoplay ? "Turn off autoplay" : "Turn on autoplay",
-                      systemImage: "play.square.stack.fill")
-            }
-            Button {
-                withAnimation { showStats.toggle() }
-                revealControls()
-            } label: {
-                Label(showStats ? "Hide playback info" : "Playback info",
-                      systemImage: "info.circle.fill")
-            }
+        Button {
+            presentOptionMenu(.more)
         } label: {
             Image(systemName: "ellipsis.circle.fill")
         }
         .accessibilityLabel("More playback options")
-        .simultaneousGesture(TapGesture().onEnded { revealControls() })
+        .popover(isPresented: optionMenuBinding(.more), arrowEdge: .bottom) {
+            optionMenuPanel("Playback options") {
+                if controller.audioTracks.count > 1 {
+                    optionMenuSection("Audio") { audioChoices }
+                }
+                if !controller.subtitles.isEmpty {
+                    optionMenuSection("Subtitles") { subtitleChoices }
+                }
+                if !controller.qualityRungs.isEmpty {
+                    optionMenuSection("Quality") { qualityChoices }
+                }
+                Divider()
+                Button {
+                    model.setAutoplay(!model.autoplay)
+                    dismissOptionMenu()
+                    revealControls()
+                } label: {
+                    Label(model.autoplay ? "Turn off autoplay" : "Turn on autoplay",
+                          systemImage: "play.square.stack.fill")
+                }
+                Button {
+                    withAnimation { showStats.toggle() }
+                    dismissOptionMenu()
+                    revealControls()
+                } label: {
+                    Label(showStats ? "Hide playback info" : "Playback info",
+                          systemImage: "info.circle.fill")
+                }
+            }
+        }
     }
     #endif
 
@@ -1396,47 +1450,135 @@ struct PlayerView: View {
     #endif
 
     private var audioMenu: some View {
+        #if os(iOS)
+        Button {
+            presentOptionMenu(.audio)
+        } label: {
+            Image(systemName: "speaker.wave.2.fill")
+        }
+        .accessibilityLabel("Audio track")
+        .popover(isPresented: optionMenuBinding(.audio), arrowEdge: .bottom) {
+            optionMenuPanel("Audio") { audioChoices }
+        }
+        #else
         Menu { audioChoices } label: {
             Image(systemName: "speaker.wave.2.fill")
         }
         .accessibilityLabel("Audio track")
-        #if os(tvOS)
         .buttonStyle(TVPlayerControlButtonStyle())
         .focusEffectDisabled()
         .focused($focusedControl, equals: .audio)
         #endif
-    }
+        }
 
     private var subtitleMenu: some View {
+        #if os(iOS)
+        Button {
+            presentOptionMenu(.subtitles)
+        } label: {
+            Image(systemName: "captions.bubble.fill")
+                .foregroundStyle(controller.selectedSubtitle == nil ? .white : Palette.accent)
+        }
+        .accessibilityLabel("Subtitles")
+        .popover(isPresented: optionMenuBinding(.subtitles), arrowEdge: .bottom) {
+            optionMenuPanel("Subtitles") { subtitleChoices }
+        }
+        #else
         Menu { subtitleChoices } label: {
             Image(systemName: "captions.bubble.fill")
                 .foregroundStyle(controller.selectedSubtitle == nil ? .white : Palette.accent)
         }
         .accessibilityLabel("Subtitles")
-        #if os(tvOS)
         .buttonStyle(TVPlayerControlButtonStyle())
         .focusEffectDisabled()
         .focused($focusedControl, equals: .subtitles)
         #endif
-    }
+        }
 
     private var qualityMenu: some View {
+        #if os(iOS)
+        Button {
+            presentOptionMenu(.quality)
+        } label: {
+            Image(systemName: "slider.horizontal.3")
+        }
+        .accessibilityLabel("Playback quality")
+        .popover(isPresented: optionMenuBinding(.quality), arrowEdge: .bottom) {
+            optionMenuPanel("Playback quality") { qualityChoices }
+        }
+        #else
         Menu { qualityChoices } label: {
             Image(systemName: "slider.horizontal.3")
         }
         .accessibilityLabel("Playback quality")
-        #if os(tvOS)
         .buttonStyle(TVPlayerControlButtonStyle())
         .focusEffectDisabled()
         .focused($focusedControl, equals: .quality)
         #endif
+        }
+
+    #if os(iOS)
+    private func optionMenuBinding(_ menu: PlayerOptionMenu) -> Binding<Bool> {
+        Binding(
+            get: { activeOptionMenu == menu },
+            set: { presented in
+                activeOptionMenu = presented ? menu : nil
+            }
+        )
     }
+
+    private func presentOptionMenu(_ menu: PlayerOptionMenu) {
+        activeOptionMenu = menu
+        revealControls()
+    }
+
+    private func dismissOptionMenu() {
+        activeOptionMenu = nil
+    }
+
+    private func optionMenuPanel<Content: View>(
+        _ title: String,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title)
+                    .font(.headline)
+                    .padding(.horizontal, 10)
+                    .padding(.bottom, 4)
+                content()
+            }
+            .buttonStyle(PlayerOptionMenuButtonStyle())
+            .padding(8)
+        }
+        .frame(minWidth: 260, idealWidth: 320, maxWidth: 380, maxHeight: 430)
+        .presentationCompactAdaptation(.popover)
+    }
+
+    private func optionMenuSection<Content: View>(
+        _ title: String,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        Group {
+            Text(title.uppercased())
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 10)
+                .padding(.top, 4)
+            content()
+            Divider()
+        }
+    }
+    #endif
 
     @ViewBuilder
     private var audioChoices: some View {
         ForEach(controller.audioTracks) { track in
             Button {
                 controller.selectAudio(track.index)
+                #if os(iOS)
+                dismissOptionMenu()
+                #endif
                 revealControls()
             } label: {
                 Label(
@@ -1453,6 +1595,9 @@ struct PlayerView: View {
     private var subtitleChoices: some View {
         Button {
             controller.selectSubtitle(nil)
+            #if os(iOS)
+            dismissOptionMenu()
+            #endif
             revealControls()
         } label: {
             Label(
@@ -1465,6 +1610,9 @@ struct PlayerView: View {
         ForEach(controller.subtitles) { track in
             Button {
                 controller.selectSubtitle(track.index)
+                #if os(iOS)
+                dismissOptionMenu()
+                #endif
                 revealControls()
             } label: {
                 Label(
@@ -1481,6 +1629,9 @@ struct PlayerView: View {
     private var qualityChoices: some View {
         Button {
             controller.selectQuality(nil)
+            #if os(iOS)
+            dismissOptionMenu()
+            #endif
             revealControls()
         } label: {
             Label(
@@ -1493,6 +1644,9 @@ struct PlayerView: View {
         ForEach(controller.qualityRungs) { rung in
             Button {
                 controller.selectQuality(rung.height)
+                #if os(iOS)
+                dismissOptionMenu()
+                #endif
                 revealControls()
             } label: {
                 Label(

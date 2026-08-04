@@ -2179,17 +2179,26 @@ final class AppleClientTests: XCTestCase {
         XCTAssertFalse(PlayerView.shouldAutoHideControls(
             visible: true,
             scrubbing: true,
-            changingStream: false
+            changingStream: false,
+            optionMenuOpen: false
+        ))
+        XCTAssertFalse(PlayerView.shouldAutoHideControls(
+            visible: true,
+            scrubbing: false,
+            changingStream: false,
+            optionMenuOpen: true
         ))
         XCTAssertTrue(PlayerView.shouldAutoHideControls(
             visible: true,
             scrubbing: false,
-            changingStream: false
+            changingStream: false,
+            optionMenuOpen: false
         ))
         XCTAssertFalse(PlayerView.shouldAutoHideControls(
             visible: false,
             scrubbing: false,
-            changingStream: false
+            changingStream: false,
+            optionMenuOpen: false
         ))
     }
 
