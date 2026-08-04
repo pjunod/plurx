@@ -24,6 +24,8 @@ struct SettingsStore {
         static let subLang = "plurx.subLang"
         static let autoplay = "plurx.autoplay"
         static let subtitleReadiness = "plurx.subtitleReadiness"
+        static let theme = "plurx.theme"
+        static let appearance = "plurx.appearance"
         static let libraryGrouping = "plurx.libraryGrouping"
         static let posterSize = "plurx.posterSize"
     }
@@ -87,6 +89,21 @@ struct SettingsStore {
                 ?? .onDemand
         }
         nonmutating set { defaults.set(newValue.rawValue, forKey: Key.subtitleReadiness) }
+    }
+    /// Preserve the native client's established noirr-dark presentation until
+    /// a person chooses otherwise. New choices are remembered per device, like
+    /// the web and Android viewer preferences.
+    var theme: ViewerTheme {
+        get {
+            ViewerTheme(rawValue: defaults.string(forKey: Key.theme) ?? "") ?? .noirr
+        }
+        nonmutating set { defaults.set(newValue.rawValue, forKey: Key.theme) }
+    }
+    var appearance: ViewerAppearance {
+        get {
+            ViewerAppearance(rawValue: defaults.string(forKey: Key.appearance) ?? "") ?? .dark
+        }
+        nonmutating set { defaults.set(newValue.rawValue, forKey: Key.appearance) }
     }
     var libraryGrouping: LibraryGrouping {
         get {

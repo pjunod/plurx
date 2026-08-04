@@ -1174,6 +1174,38 @@ final class AppleClientTests: XCTestCase {
         XCTAssertEqual(SettingsStore(defaults: defaults).subtitleReadiness, .instant)
     }
 
+    func testNativeAppearanceSettingsPreserveTheExistingLookAndPersistChoices() throws {
+        let suite = "tv.plurx.tests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let fresh = SettingsStore(defaults: defaults)
+        XCTAssertEqual(fresh.theme, .noirr)
+        XCTAssertEqual(fresh.appearance, .dark)
+
+        defaults.set("future-theme", forKey: "plurx.theme")
+        defaults.set("future-appearance", forKey: "plurx.appearance")
+        XCTAssertEqual(SettingsStore(defaults: defaults).theme, .noirr)
+        XCTAssertEqual(SettingsStore(defaults: defaults).appearance, .dark)
+
+        fresh.theme = .terminal
+        fresh.appearance = .light
+        let restored = SettingsStore(defaults: defaults)
+        XCTAssertEqual(restored.theme, .terminal)
+        XCTAssertEqual(restored.appearance, .light)
+    }
+
+    func testNativeAppearanceChoicesMatchTheOtherNativeViewer() {
+        XCTAssertEqual(ViewerTheme.allCases.map(\.label), ["Classic", "Terminal", "noirr"])
+        XCTAssertEqual(
+            ViewerAppearance.allCases.map(\.label),
+            ["Auto (system)", "Light", "Dark"]
+        )
+        XCTAssertNil(ViewerAppearance.system.preferredColorScheme)
+        XCTAssertEqual(ViewerAppearance.light.preferredColorScheme, .light)
+        XCTAssertEqual(ViewerAppearance.dark.preferredColorScheme, .dark)
+    }
+
     /// Which subtitle selections have to rebuild the stream. Under `.onDemand`
     /// the first native pick during direct play is a new member of that set —
     /// a raw file URL has no renditions to select — and it takes the same clean

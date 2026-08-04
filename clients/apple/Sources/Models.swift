@@ -172,6 +172,38 @@ enum LibraryGrouping: String, CaseIterable, Identifiable {
     var label: String { self == .category ? "Category" : "Library" }
 }
 
+/// Native themes shared with the Android viewer. Web-only catalogue themes can
+/// be added here once their tokens and platform treatment have an Apple port.
+enum ViewerTheme: String, CaseIterable, Identifiable {
+    case classic
+    case terminal
+    case noirr
+
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .classic: return "Classic"
+        case .terminal: return "Terminal"
+        case .noirr: return "noirr"
+        }
+    }
+}
+
+enum ViewerAppearance: String, CaseIterable, Identifiable {
+    case system
+    case light
+    case dark
+
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .system: return "Auto (system)"
+        case .light: return "Light"
+        case .dark: return "Dark"
+        }
+    }
+}
+
 /// When a title's text subtitles are made switchable, which is really a choice
 /// about who pays for a subtitle menu nobody may open.
 ///
