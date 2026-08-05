@@ -717,6 +717,40 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func pgsOverlayManifest(
+        fileId: Int,
+        trackIndex: Int
+    ) async throws -> PGSOverlayManifestFetch {
+        do {
+            return try await requireAPI().pgsOverlayManifest(
+                fileId: fileId,
+                trackIndex: trackIndex
+            )
+        } catch {
+            noteAuthFailure(error)
+            throw error
+        }
+    }
+
+    func pgsOverlayObject(
+        fileId: Int,
+        trackIndex: Int,
+        generation: String,
+        path: String
+    ) async throws -> Data {
+        do {
+            return try await requireAPI().pgsOverlayObject(
+                fileId: fileId,
+                trackIndex: trackIndex,
+                generation: generation,
+                path: path
+            )
+        } catch {
+            noteAuthFailure(error)
+            throw error
+        }
+    }
+
     func createHlsSession(fileId: Int, body: CreateSessionRequest) async throws -> HlsStart {
         do {
             return try await requireAPI().createHlsSession(fileId: fileId, body: body)

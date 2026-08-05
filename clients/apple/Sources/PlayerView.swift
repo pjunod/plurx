@@ -472,7 +472,11 @@ struct PlayerView: View {
         ZStack(alignment: .topLeading) {
             Color.black.ignoresSafeArea()
 
-            PlayerSurface(player: controller.player, pictureInPicture: pictureInPicture)
+            PlayerSurface(
+                player: controller.player,
+                pictureInPicture: pictureInPicture,
+                pgsOverlay: controller.pgsOverlayWindow
+            )
                 .ignoresSafeArea()
 
             #if os(tvOS)
@@ -1305,6 +1309,7 @@ struct PlayerView: View {
 
     private var pictureInPictureButton: some View {
         Button {
+            guard controller.allowsPictureInPictureCommand() else { return }
             pictureInPicture.toggle()
             revealControls()
         } label: {
@@ -1786,7 +1791,9 @@ private struct PlaybackStatsView: View {
         }
         if let subtitle = controller.selectedSubtitle,
            let track = controller.subtitles.first(where: { $0.index == subtitle }) {
-            let delivery = track.isNativeHLS ? "native WebVTT" : "burned in"
+            let delivery = track.isPGSOverlay
+                ? (controller.pgsOverlayStatus.label ?? "PGS overlay")
+                : (track.isNativeHLS ? "native WebVTT" : "burned in")
             row("Subtitles", (track.title ?? track.language?.uppercased() ?? "Track \(subtitle + 1)") + " · \(delivery)")
         }
     }

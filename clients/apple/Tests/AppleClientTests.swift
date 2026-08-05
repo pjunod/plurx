@@ -2945,4 +2945,323 @@ final class AppleClientTests: XCTestCase {
             "The request timed out."
         )
     }
+
+    func testPGSOverlayManifestDecodesAndRejectsIdentityOrTraversalDrift() throws {
+        let generation = String(repeating: "a", count: 64)
+        let json = Data(#"""
+        {
+          "schema": 1,
+          "generation": "\#(generation)",
+          "file_id": 42,
+          "track_index": 3,
+          "kind": "pgs",
+          "timebase": "source_ms",
+          "duration_ms": 120000,
+          "cues": [{
+            "id": "c00000001",
+            "start_ms": 1000,
+            "end_ms": 2500,
+            "canvas_width": 1920,
+            "canvas_height": 1080,
+            "objects": [{
+              "image": "overlay/\#(generation)/objects/\#(generation).png",
+              "x": 240,
+              "y": 850,
+              "width": 1440,
+              "height": 180
+            }]
+          }]
+        }
+        """#.utf8)
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let manifest = try decoder.decode(PGSOverlayManifest.self, from: json)
+
+        XCTAssertNoThrow(try manifest.validated(fileId: 42, trackIndex: 3))
+        XCTAssertThrowsError(try manifest.validated(fileId: 41, trackIndex: 3))
+
+        let escaped = PGSOverlayObject(
+            image: "overlay/\(generation)/objects/../secret.png",
+            x: 0, y: 0, width: 1, height: 1
+        )
+        XCTAssertNil(PGSOverlayManifest.objectHash(
+            from: escaped.image,
+            generation: generation
+        ))
+
+        let overflowGeometry = PGSOverlayObject(
+            image: "overlay/\(generation)/objects/\(generation).png",
+            x: Int.max,
+            y: 0,
+            width: Int.max,
+            height: 1
+        )
+        let invalidGeometry = PGSOverlayManifest(
+            schema: 1,
+            generation: generation,
+            fileId: 42,
+            trackIndex: 3,
+            kind: "pgs",
+            timebase: "source_ms",
+            durationMs: 120_000,
+            cues: [PGSOverlayCue(
+                id: "c1",
+                startMs: 1_000,
+                endMs: 2_000,
+                canvasWidth: 1_920,
+                canvasHeight: 1_080,
+                objects: [overflowGeometry]
+            )]
+        )
+        XCTAssertThrowsError(try invalidGeometry.validated(fileId: 42, trackIndex: 3))
+
+        let dimensionDrift = PGSOverlayManifest(
+            schema: 1,
+            generation: generation,
+            fileId: 42,
+            trackIndex: 3,
+            kind: "pgs",
+            timebase: "source_ms",
+            durationMs: 120_000,
+            cues: [
+                PGSOverlayCue(
+                    id: "c1",
+                    startMs: 1_000,
+                    endMs: 2_000,
+                    canvasWidth: 1_920,
+                    canvasHeight: 1_080,
+                    objects: [PGSOverlayObject(
+                        image: "overlay/\(generation)/objects/\(generation).png",
+                        x: 0, y: 0, width: 100, height: 50
+                    )]
+                ),
+                PGSOverlayCue(
+                    id: "c2",
+                    startMs: 3_000,
+                    endMs: 4_000,
+                    canvasWidth: 1_920,
+                    canvasHeight: 1_080,
+                    objects: [PGSOverlayObject(
+                        image: "overlay/\(generation)/objects/\(generation).png",
+                        x: 0, y: 0, width: 101, height: 50
+                    )]
+                ),
+            ]
+        )
+        XCTAssertThrowsError(try dimensionDrift.validated(fileId: 42, trackIndex: 3))
+    }
+
+    func testPGSOverlayUsesSourceTimeWithANonZeroItemBase() {
+        XCTAssertEqual(PGSOverlayPolicy.itemTimeMs(sourceTimeMs: 93_500, baseMs: 90_000), 3_500)
+        XCTAssertEqual(PGSOverlayPolicy.itemTimeMs(sourceTimeMs: 89_000, baseMs: 90_000), -1_000)
+        XCTAssertEqual(
+            PGSOverlayPolicy.windowRange(at: 95_000, durationMs: 120_000),
+            90_000..<120_000
+        )
+        XCTAssertFalse(PGSOverlayPolicy.shouldRefresh(
+            sourceTimeMs: 95_000,
+            loadedRange: 90_000..<120_000
+        ))
+        XCTAssertTrue(PGSOverlayPolicy.shouldRefresh(
+            sourceTimeMs: 101_000,
+            loadedRange: 90_000..<120_000
+        ))
+
+        let duplicate = PGSOverlayObject(
+            image: "same", x: 0, y: 0, width: 4_096, height: 2_160
+        )
+        let cue = PGSOverlayCue(
+            id: "c1",
+            startMs: 0,
+            endMs: 1,
+            canvasWidth: 4_096,
+            canvasHeight: 2_160,
+            objects: [duplicate, duplicate]
+        )
+        XCTAssertTrue(PGSOverlayPolicy.windowFitsDecodedBudget([cue]))
+        XCTAssertFalse(PGSOverlayPolicy.windowFitsDecodedBudget([cue, PGSOverlayCue(
+            id: "c2",
+            startMs: 2,
+            endMs: 3,
+            canvasWidth: 4_096,
+            canvasHeight: 2_160,
+            objects: [PGSOverlayObject(
+                image: "different", x: 0, y: 0, width: 4_096, height: 2_160
+            ), PGSOverlayObject(
+                image: "third", x: 0, y: 0, width: 4_096, height: 2_160
+            )]
+        )]))
+    }
+
+    func testPGSOverlayLayoutMaps1080pOnto4KAndLetterboxedDestinations() {
+        let object = PGSOverlayObject(
+            image: "ignored", x: 100, y: 800, width: 500, height: 200
+        )
+        XCTAssertEqual(
+            PGSOverlayPolicy.objectFrame(
+                object,
+                canvasWidth: 1920,
+                canvasHeight: 1080,
+                destination: CGRect(x: 0, y: 0, width: 3840, height: 2160)
+            ),
+            CGRect(x: 200, y: 1600, width: 1000, height: 400)
+        )
+
+        let fourThree = PGSOverlayPolicy.objectFrame(
+            object,
+            canvasWidth: 1920,
+            canvasHeight: 1080,
+            destination: CGRect(x: 0, y: 0, width: 1024, height: 768)
+        )
+        XCTAssertEqual(fourThree.minX, 53.333, accuracy: 0.01)
+        XCTAssertEqual(fourThree.minY, 522.667, accuracy: 0.01)
+        XCTAssertEqual(fourThree.width, 266.667, accuracy: 0.01)
+        XCTAssertEqual(fourThree.height, 106.667, accuracy: 0.01)
+
+        let dvdObject = PGSOverlayObject(
+            image: "ignored", x: 0, y: 400, width: 720, height: 80
+        )
+        let anamorphic = PGSOverlayPolicy.objectFrame(
+            dvdObject,
+            canvasWidth: 720,
+            canvasHeight: 480,
+            destination: CGRect(x: 0, y: 0, width: 1920, height: 1080)
+        )
+        XCTAssertEqual(anamorphic, CGRect(x: 150, y: 900, width: 1620, height: 180))
+    }
+
+    @MainActor
+    func testPGSOverlaySelectionNeverBurnsOrReopensDirectVideo() {
+        let overlay = SubtitleTrack(
+            index: 0,
+            codec: "hdmv_pgs_subtitle",
+            language: "eng",
+            title: "PGS",
+            default: false,
+            forced: false,
+            text: false,
+            native: false,
+            overlay: "pgs-v1"
+        )
+        let native = SubtitleTrack(
+            index: 1,
+            codec: "subrip",
+            language: "eng",
+            title: "Text",
+            default: false,
+            forced: false,
+            text: true,
+            native: true,
+            overlay: nil
+        )
+        let unknown = SubtitleTrack(
+            index: 2,
+            codec: "hdmv_pgs_subtitle",
+            language: "eng",
+            title: "Future",
+            default: false,
+            forced: false,
+            text: false,
+            native: false,
+            overlay: "pgs-v2"
+        )
+        let tracks = [overlay, native, unknown]
+
+        XCTAssertTrue(PlayerController.subtitleUsesOverlay(0, in: tracks))
+        XCTAssertFalse(PlayerController.subtitleRequiresBurn(0, in: tracks))
+        XCTAssertTrue(PlayerController.subtitleRequiresBurn(2, in: tracks))
+        XCTAssertFalse(PlayerController.subtitleBurnWouldDiscardHDR(
+            0,
+            tracks: tracks,
+            deliveredRange: "dolby_vision"
+        ))
+        let fields = PlayerController.sessionSubtitleFields(
+            selected: 0,
+            tracks: tracks,
+            legacyBurn: true
+        )
+        XCTAssertNil(fields.burn)
+        XCTAssertNil(fields.native)
+        XCTAssertEqual(
+            PlayerController.subtitleSelectionRoute(
+                for: 0,
+                tracks: tracks,
+                activeBurn: nil,
+                isDirectPlayback: true
+            ),
+            .bitmapOverlay
+        )
+        XCTAssertEqual(
+            PlayerController.subtitleSelectionRoute(
+                for: nil,
+                tracks: tracks,
+                activeBurn: nil,
+                isDirectPlayback: true,
+                activeOverlay: 0
+            ),
+            .bitmapOverlay
+        )
+        XCTAssertEqual(
+            PlayerController.subtitleSelectionRoute(
+                for: 1,
+                tracks: tracks,
+                activeBurn: nil,
+                isDirectPlayback: true,
+                activeOverlay: 0
+            ),
+            .reopen
+        )
+    }
+
+    @MainActor
+    func testPGSOverlayReattachesToAReplacementPlayerItem() throws {
+        let format = UIGraphicsImageRendererFormat.preferred()
+        format.scale = 1
+        let image = UIGraphicsImageRenderer(
+            size: CGSize(width: 2, height: 2),
+            format: format
+        ).image { context in
+            UIColor.white.setFill()
+            context.fill(CGRect(x: 0, y: 0, width: 2, height: 2))
+        }
+        let object = PGSOverlayObject(
+            image: "overlay", x: 0, y: 0, width: 2, height: 2
+        )
+        let cue = PGSOverlayCue(
+            id: "c1",
+            startMs: 10_000,
+            endMs: 12_000,
+            canvasWidth: 1920,
+            canvasHeight: 1080,
+            objects: [object]
+        )
+        let window = PGSOverlayWindow(
+            revision: 7,
+            generation: String(repeating: "a", count: 64),
+            baseMs: 9_000,
+            sourceRange: 9_000..<20_000,
+            cues: [PGSOverlayRenderableCue(
+                cue: cue,
+                objects: [PGSOverlayRenderableObject(
+                    object: object,
+                    image: try XCTUnwrap(image.cgImage)
+                )]
+            )]
+        )
+        let first = AVPlayerItem(url: URL(string: "https://example.invalid/first.mp4")!)
+        let second = AVPlayerItem(url: URL(string: "https://example.invalid/second.mp4")!)
+        let surface = PlayerSurfaceView(frame: CGRect(x: 0, y: 0, width: 1920, height: 1080))
+
+        surface.applyPGSOverlay(window, to: first)
+        XCTAssertTrue(surface.hasPGSOverlay(revision: 7, item: first))
+        XCTAssertEqual(surface.pgsOverlayNodeCount, 1)
+
+        surface.applyPGSOverlay(window, to: second)
+        XCTAssertFalse(surface.hasPGSOverlay(revision: 7, item: first))
+        XCTAssertTrue(surface.hasPGSOverlay(revision: 7, item: second))
+        XCTAssertEqual(surface.pgsOverlayNodeCount, 1)
+
+        surface.applyPGSOverlay(nil, to: nil)
+        XCTAssertEqual(surface.pgsOverlayNodeCount, 0)
+    }
 }

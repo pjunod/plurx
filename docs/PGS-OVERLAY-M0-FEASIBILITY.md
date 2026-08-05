@@ -1,7 +1,8 @@
 # PGS overlay Milestone 0 — feasibility evidence
 
-**Status:** in progress; bounded parser, fuzz laboratory, and default-off
-Milestone 1 server producer complete, physical-device evidence pending ·
+**Status:** in progress; bounded parser, fuzz laboratory, default-off
+Milestone 1 server producer, and automated Apple Milestone 2 client complete;
+physical-device evidence pending ·
 **Decision:** continue the bounded FFmpeg-to-SUP architecture, do not use the
 candidate's direct MKV/M2TS path, and do not enable PGS overlay in production
 yet · **Updated:** 2026-08-04
@@ -312,11 +313,11 @@ installed developer tool rather than a shipped dependency.
 | Production files 5559 and 5698 | Partial | File 5559 cold demux was stopped at 179 seconds and 2 MiB incomplete output; file 5698 was left untouched during active playback. Repeat off-hours with progress and a deadline. |
 | Malformed-input campaign | Partial pass | 306,124 sanitizer-backed executions completed cleanly over the deterministic seed. Add controlled production seeds and a longer campaign. |
 | FFmpeg or Media3 reference comparison | Partial pass | FFmpeg 8.1.2 matches deterministic packet times and visible bounds; investigate the first-frame offset, compare RGBA/palette output, and repeat on production tracks. |
-| Apple timed-overlay prototype | Pending | Compare `AVSynchronizedLayer` with boundary observers on a physical supported device. |
+| Apple timed-overlay prototype | Automated pass; physical pending | The iOS/tvOS client uses `AVSynchronizedLayer` over `AVPlayerLayer.videoRect`; shared simulator tests cover non-zero `base_ms`, seek-window reconciliation, authored-canvas layout, selection/off, and player-item replacement. Run the timing matrix on supported physical devices. |
 | Android timed-overlay prototype | Pending | Exercise `SurfaceView`, tunneling, source-time mapping, and timeline epochs on a physical supported device. |
 | Dolby Vision/HDR preservation | Pending | Record device diagnostics and display-mode evidence before and after PGS selection. |
-| Seek, pause, rate, item replacement | Pending | Run the timing matrix and record onset/clear error against source time. |
-| PiP, AirPlay, casting, external output | Pending | Record inclusion or limitation behavior at selection time; do not infer it from the main player surface. |
+| Seek, pause, rate, item replacement | Automated partial | Source/item conversion, seek reconciliation, synchronized item timing, and item replacement are covered on both simulators. Record physical onset/clear error across play, pause, rate, and repeated scrubbing. |
+| PiP, AirPlay, casting, external output | Policy pass; physical pending | Apple blocks PiP and external playback while PGS overlay is active and explains why, without falling back to burn-in. Confirm the limitation on physical devices; Android remains pending. |
 | Cold extraction and cache measurements | Partial | Synthetic SUP numbers and the bounded 5559 attempt are recorded. Measure completed time, bytes read, peak RSS, cue count, object deduplication, and PNG size off-hours. |
 
 ## 8. Milestone 1 server evidence
@@ -338,9 +339,33 @@ off by default. The final schema is in
 | Old-client compatibility | Pass | `overlay` is omitted while disabled and on non-PGS tracks; existing `text` and `native` fields retain their meaning. |
 | Raw-SUP demux boundary | Pass for deterministic fixture | A generated SUP was muxed into Matroska, copied back out with the production FFmpeg mapping, and accepted by the bounded adapter. Production-file duration/resource evidence remains pending. |
 
-The implementation deliberately does not claim Apple/Android presentation,
-Dolby Vision preservation, PiP/external-output inclusion, or production-media
-resource acceptance. Those remain the release gates below.
+The server implementation deliberately does not claim physical Apple/Android
+presentation, Dolby Vision preservation, PiP/external-output inclusion, or
+production-media resource acceptance. The automated Apple evidence below
+narrows that list without satisfying the physical release gates.
+
+## 8.1 Milestone 2 Apple automated evidence
+
+The Apple client consumes only authenticated `pgs-v1` manifests and PNG
+objects; raw PGS never crosses into the app. It validates file and track
+identity, generation shape, monotonic non-overlapping cues, canvas/object
+bounds, and exact content-addressed object paths before rendering. Fetching is
+bounded to a five-second lookbehind and 90-second lookahead with a 96 MiB
+decoded-image cache.
+
+The player attaches an `AVSynchronizedLayer` to the current `AVPlayerItem` and
+maps authored canvas coordinates into `AVPlayerLayer.videoRect`. XCTest passes
+on both iOS and tvOS simulators for 1080p-on-4K, 4:3 letterboxing, anamorphic
+canvas mapping, non-zero `base_ms`, item replacement, selection switching, and
+Off. The route-policy regression proves a recognized PGS overlay sends neither
+the native-subtitle nor burn-in session field and does not reopen direct video.
+
+The implementation intentionally disables Picture in Picture and external
+playback while PGS overlay is selected because the custom application layer is
+not part of those output surfaces. A visible notice is preferable to silently
+burning and converting Dolby Vision/HDR to SDR. This is automated behavior
+evidence only: physical iPhone, iPad, and Apple TV timing and display-mode
+verification remain required.
 
 ## 9. Remaining parser and device work
 
@@ -402,3 +427,6 @@ to 23, and Android version code to 12. The staged server contract changes the
 shipped daemon and advances the shared marketing/workspace version to 0.2.4,
 Apple build to 24, and Android version code to 13. Later client implementation
 branches must re-read `main` and advance their affected release counters again.
+The Apple Milestone 2 branch does so at shared version 0.2.5, Apple build 25,
+and Android version code 14; the Android counter remains coordinated even
+though its renderer lands in a separate branch and PR.

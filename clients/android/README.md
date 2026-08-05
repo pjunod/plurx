@@ -19,9 +19,11 @@ feeding an AVR keeps lossless TrueHD instead of a 256 kb/s AAC downmix: the box
 has no TrueHD decoder, the receiver does, and the claim follows the route. It is
 recomputed on every decision, because unplugging HDMI changes the answer.
 
-> Status: **v0.2.2**, build `9` — native viewer parity across phone, foldable,
-> and TV. Build 9 keeps established HDR through recovery and refuses burn-only
-> subtitle selections that would replace it with SDR.
+> Status: **v0.2.5**, build `14` — native viewer parity across phone, foldable,
+> and TV. Build 14 keeps established HDR through recovery and refuses burn-only
+> subtitle selections that would replace it with SDR. The shared version and
+> store counter advance with the Apple `pgs-v1` client; Android PGS overlay is
+> still the next separately reviewed milestone.
 > Server administration remains in the web app; the viewing, discovery, and
 > playback surfaces are native here. The capability matrix is in
 > [Android client parity](../../docs/ANDROID-CLIENT-PARITY.md).

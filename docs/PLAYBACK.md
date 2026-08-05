@@ -113,8 +113,9 @@ one.
 | `apple.established-hdr-recovery` | Interruption after HDR rendered | Once the item has advanced for ≥5 s, a stall or item failure reconnects the same HDR delivery once. An immediate repeat stops visibly instead of falling through to the SDR compatibility transcode. | XCTest established-delivery guard |
 | `apple.hls-buffer-window` | Growing HLS forward buffer | AVPlayer requests 60 s ahead on live copy/transcode sessions, matching the server's 60 s forward-fetch allowance inside its 120 s retention window. Direct files and completed cached HLS keep AVPlayer's default. | XCTest item-configuration guard |
 | `apple.quality-session` | Picked rung vs Auto/burn height | A picked rung forces a transcode at that height. An otherwise-copyable subtitle burn preserves source height; an ordinary Auto transcode leaves the encoder-aware rung to the server. | XCTest source/rung/burn height matrix |
-| `apple.subtitle-route` | Media selection vs reopen | Native rendition switches stay inside AVPlayer once the session exists. Entering from direct, selecting/leaving a burn, or changing a burn reopens. Bitmap/styled tracks burn; ordinary native text does not. | XCTest route matrix |
-| `apple.hdr-subtitle-guard` | Burn-only subtitle on HDR | PGS and styled tracks are refused while the current delivery is DV, HDR10, or HLG, with a non-fatal notice. Native text still selects, and SDR playback may still burn. | XCTest subtitle/dynamic-range matrix |
+| `apple.subtitle-route` | Media selection vs reopen | Native rendition switches stay inside AVPlayer once the session exists. A recognized PGS overlay stays on the current item. Entering from direct, selecting/leaving a burn, or changing a burn reopens; other bitmap/styled tracks still burn. | XCTest route matrix |
+| `apple.hdr-subtitle-guard` | Burn-only subtitle on HDR | A recognized PGS overlay is allowed because it does not change video. Unknown overlay versions, VobSub, and styled tracks are refused while the current delivery is DV, HDR10, or HLG. Native text still selects, and SDR playback may still burn. | XCTest subtitle/dynamic-range matrix |
+| `apple.pgs-overlay` | PGS application overlay vs video mutation | Only `overlay: "pgs-v1"` selects the authenticated manifest/PNG renderer. It schedules complete compositions against the current `AVPlayerItem`, maps authored coordinates into `videoRect`, and never sends subtitle/burn session fields or reopens video. PiP and external playback are blocked while active rather than falling back to an SDR burn. | XCTest manifest, timeline, layout, item-replacement, and no-reopen policy suite |
 | `android.capability-profile` | Decoder/display/sink claims | Claim DV only when both decoder profile and display agree, never claim dual-layer P7, and claim passthrough audio when either the decoder or active sink can take it. | JVM capability matrix |
 | `android.compatibility-fallback` | Media3 startup decode recovery | Before a frame renders, failed preserving direct DV first gets a normalized remux; any remaining direct/remux failure gets one compatibility transcode; a failed transcode is terminal. | JVM fallback matrix |
 | `android.established-hdr-recovery` | Interruption after HDR rendered | Once Media3 renders a frame, a later HDR error retries the same delivery once. A repeat is terminal instead of silently becoming the SDR compatibility stream. | JVM established-delivery matrix |
@@ -258,8 +259,10 @@ unsupported, not a preparation state. VobSub and XSUB remain burn-only.
 ### PGS overlay server contract — staged and default-off
 
 The server side of `pgs-v1` is implemented behind `PLURX_PGS_OVERLAY=1` and is
-off by default while the native renderers and physical-device HDR/Dolby Vision
-acceptance remain incomplete. When off, `/decision` omits `overlay` and the
+off by default while Android rendering and physical-device HDR/Dolby Vision
+acceptance remain incomplete. Apple has an automated iOS/tvOS renderer, but
+that does not make the server capability production-ready. When off,
+`/decision` omits `overlay` and the
 overlay routes return 404. Enabling the gate changes subtitle delivery only;
 it does not select an overlay automatically and does not alter video bytes.
 
@@ -395,7 +398,8 @@ make.
 | Remux, no override | Copy-video HLS; AVPlayer does not take plurx's progressive fMP4 reliably | Progressive `/stream.mp4` |
 | Transcode | HLS session | HLS session |
 | Native text subtitle needs a session | Copy HLS for a direct/remux plan; existing rendition switches stay in AVPlayer | Direct keeps an embedded text track; remux/transcode opens a native-rendition HLS session |
-| Bitmap/styled subtitle | HLS transcode with burn-in | HLS transcode with burn-in |
+| PGS with recognized `pgs-v1` capability | Authenticated application overlay synchronized to the unchanged player item; PiP/external playback unavailable while active | Not implemented yet; retains burn/refusal behavior |
+| Other bitmap/styled subtitle | HLS transcode with burn-in on SDR; refused on HDR/DV | HLS transcode with burn-in on SDR; refused on HDR/DV |
 | Direct + manual A/V correction | Not currently exposed by the Apple player | Progressive remux, because ffmpeg must apply the correction |
 | Finished cache hit | HLS VOD; seek in place | HLS VOD; seek in place |
 
@@ -688,8 +692,9 @@ covering the other.
 - **No client-side bitrate adaptation yet.** One encode runs at a time; the
   rung is chosen at start, not adapted per segment. The design for that is
   [ADAPTIVE-QUALITY.md](ADAPTIVE-QUALITY.md).
-- **Bitmap subs (PGS/VobSub) cost a stream restart.** They can't be copied or
-  `<track>`'d — a picture has no text to send — so selecting one re-opens the
+- **Burn-only bitmap subs cost a stream restart.** VobSub and PGS without a
+  client-recognized overlay capability can't be copied or `<track>`'d — a
+  picture has no text to send — so selecting one re-opens the
   stream as a transcode with the subtitle composited into the frames, and
   turning it off restarts again — back through the decision, so the viewer
   returns to the direct play / remux (and the resolution) the burn took away.

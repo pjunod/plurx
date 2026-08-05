@@ -14,8 +14,8 @@ options:
 settings:
   base:
     SWIFT_VERSION: "5.9"
-    MARKETING_VERSION: "0.2.4"
-    CURRENT_PROJECT_VERSION: "24"
+    MARKETING_VERSION: "0.2.5"
+    CURRENT_PROJECT_VERSION: "25"
     # Paul Junod's paid Apple Developer Program team. Automatic signing creates
     # and refreshes development profiles for both platform targets.
     DEVELOPMENT_TEAM: "YHK542LK23"
