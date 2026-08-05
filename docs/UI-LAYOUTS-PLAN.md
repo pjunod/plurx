@@ -37,7 +37,7 @@ and is kept per layout so switching back restores it):
 | Layout | One sentence | Signature theme | Status |
 |---|---|---|---|
 | `classic` | The current app, unchanged, now with a name | noirr | shipped today, becomes "classic" |
-| `plex` | Old-Plex sidebar shell: pinned libraries, hub rows, poster grids | Amber (new) | proposed |
+| `catalog` | Library-first sidebar shell: pinned libraries, hub rows, poster grids | Amber (new) | proposed |
 | `theater` | Full-bleed cinematic hero, chrome that gets out of the way | noirr | proposed |
 | `deck` | Dense operator view: tables, always-on filters, status footer | Terminal | proposed |
 | `guide` | The library as a retro channel guide; replaces Home only | VHS (new) | proposed |
@@ -85,9 +85,9 @@ The shipped theme machinery ([index.html:835–891] — `THEMES`,
 time) is the template. Layouts get the identical treatment:
 
 ```
-LAYOUTS = { classic: {...}, plex: {...}, theater: {...}, deck: {...}, guide: {...} }
+LAYOUTS = { classic: {...}, catalog: {...}, theater: {...}, deck: {...}, guide: {...} }
 localStorage.plurx_layout   → "classic" when absent or unknown (safe default)
-<html data-layout="plex">   → structural CSS scopes under [data-layout=…]
+<html data-layout="catalog">   → structural CSS scopes under [data-layout=…]
 menu: the appearance popover grows a "layout" section above "theme"
 ```
 
@@ -139,7 +139,7 @@ render() ── route ──▶ view*(…)                      (data fetch, unc
 Estimated renderer matrix — "shared" means the existing renderer with
 layout-scoped CSS; "own" means a layout-specific body builder:
 
-| View | classic | plex | theater | deck | guide |
+| View | classic | catalog | theater | deck | guide |
 |---|---|---|---|---|---|
 | chrome (header/side/tabs) | shared (today's) | own | own | own | classic's |
 | home | shared | own (hubs) | own (hero) | own (tiles+tables) | own (the guide) |
@@ -165,7 +165,7 @@ environment). Layouts map to navigation scaffolds, not shared code:
 | Layout | Phone (Compose/SwiftUI) | Tablet / iPadOS | TV (tvOS / Android TV) |
 |---|---|---|---|
 | classic | top bar + stacked rails (today's clients) | same, wider grids | web-app-style top nav (today) |
-| plex | bottom tab bar (Home · Libraries · Search · Activity) | sidebar returns (desktop-class) | collapsed icon rail, expands on focus |
+| catalog | bottom tab bar (Home · Libraries · Search · Activity) | sidebar returns (desktop-class) | collapsed icon rail, expands on focus |
 | theater | full-bleed hero + floating pill nav | hero + rails | quiet top nav row, hero owns upper half |
 | deck | dense list + filter chips + status strip | two-pane list/detail | not offered on TV — falls back to classic |
 | guide | vertical channel list (now/next) | guide grid | full-screen guide grid (the natural home) |
@@ -198,55 +198,39 @@ sections) but slightly awkward — §8 offers a rename slot if it grates.
 ![classic layout, noirr theme](img/mockups/web-classic-home-noirr.png)
 *classic × noirr — the app as it ships today, now answering to a name.*
 
-### 3.2 `plex` — the sidebar shell (the one you asked for by name)
+### 3.2 `catalog` — the library-first sidebar shell
 
-**What it is:** the Plex Web shell plurx users already have in their
-muscle memory — a fixed left sidebar (wordmark, search, Home, pinned
-libraries with icons and counts, Activity/Settings under a "manage"
-divider, scan status + user chip pinned at the bottom), hub rows on
-Home, toolbar-plus-grid libraries, and backdrop-hero detail pages.
+**What it is:** a fixed left sidebar with the wordmark, search, Home,
+pinned libraries with icons and counts, Activity/Settings under a manage
+divider, scan status, and the user chip pinned at the bottom. Home uses hub
+rows, libraries use a toolbar plus grid, and detail pages use backdrop heroes.
 
-**Fidelity to Plex — what we copy, and from which Plex.** Plex is
-mid-transition: the 2018-era web app (left sidebar, hubs, A–Z scrubber)
-and the 2024–26 "new Plex experience" rewrite (bottom tabs on mobile
-since 2025-03; TV apps that briefly moved navigation to top tabs, got the
-backlash, and were remastered back toward a rail; studio title art and
-color-matched gradients on detail pages). This layout copies the *web
-sidebar* school on desktop — that is "the current plex layout" as lived
-daily — and steals the new experience's three best ideas where they fit:
+**The layout follows the content hierarchy.** Desktop keeps the full catalog
+visible, while smaller and ten-foot surfaces preserve the same destinations
+with controls suited to their input method:
 
 - **Detail pages are art-forward:** full-width backdrop under a scrim,
   poster + oversized title, metadata as pills, amber Play lockup.
 - **Mobile gets bottom tabs** (Home · Libraries · Search · Activity),
   because a sidebar on a phone is a hamburger with extra steps.
-- **TV gets a collapsed icon rail** that expands on focus — both the old
-  Plex TV pattern and where the remaster landed after top-tabs failed.
+- **TV gets a collapsed icon rail** that expands on focus, preserving space
+  for artwork without hiding the primary destinations.
 
-Plex vocabulary deliberately kept: the **unwatched corner flag** (accent
-triangle, top-right of the poster), hover play circle on cards, hub row
-titles with "see all", the library **A–Z scrubber** on the right edge,
-`Library / Collections / Categories` tabs. Plex vocabulary deliberately
-**not** copied: anything that exists because plex.tv exists — Discover /
-streaming-service rows, watchlist-first navigation, account upsell chrome.
-plurx has no cloud, so the sidebar lists *your libraries* and nothing
-else. That is the old-Plex ethos this project was founded on.
+The layout keeps the **unwatched corner flag**, hover play circle on cards,
+hub-row titles with "see all", the library **A–Z scrubber** on the right edge,
+and `Library / Collections / Categories` tabs. It does not add discovery,
+streaming-service rows, watchlist-first navigation, or account upsell chrome.
+The server has no cloud catalog, so the sidebar lists *your libraries* and
+nothing else.
 
-![plex layout home](img/mockups/web-plex-home-amber.png)
-*plex × Amber — sidebar, hub rows, corner flags, hover play.*
+[Open the interactive web mockup](mockups/web.html) and select Catalog to see
+Home, Library, and Detail with Amber or Classic-light. The mockup exercises the
+sidebar, hub rows, corner flags, hover play, filters, A–Z scrubber, backdrop
+hero, and tech-honest version rows.
 
-![plex layout library](img/mockups/web-plex-library-amber.png)
-*Library browse: view toggle, sort, filter pills, A–Z scrubber.*
-
-![plex layout detail](img/mockups/web-plex-detail-amber.png)
-*Detail: backdrop hero + poster + pills; version cards keep plurx's
-tech-honest file rows.*
-
-![plex layout, classic light theme](img/mockups/web-plex-home-classic-light.png)
-*Orthogonality check: the same plex layout wearing Classic-light.*
-
-![plex on TV](img/mockups/tv-plex-amber.png)
-*10-foot: icon rail (expands on focus), landscape continue row, poster
-rail. Clock top-right, no admin anywhere.*
+[Open the interactive TV mockup](mockups/tv.html) and select Catalog to see the
+focus-expanding icon rail, landscape continue row, poster rail, and clock. The
+TV shell exposes no admin controls.
 
 ### 3.3 `theater` — lean-back cinema, chrome optional
 
@@ -347,11 +331,9 @@ entry.*
 
 ### 4.1 Naming
 
-The gold theme is named **Amber**, not "Plex": the layout already spends
-that word (`plex` as a layout name is an in-joke that reads fine in a
-private app), and two pickers both saying "Plex" would make "plex layout
-+ Amber theme" impossible to say out loud. §8 has the override box if
-you want the joke twice.
+The gold theme remains **Amber**. Layout and theme names describe independent
+choices, so `Catalog` + `Amber` reads clearly in the picker and in support
+instructions.
 
 ### 4.2 Token sets (the contract values)
 
@@ -360,7 +342,7 @@ ship unless review amends them. Dark rows first, light rows where the
 theme has a light showtime. (Classic / Terminal / noirr are shipped and
 unchanged — their tokens live in [index.html:835–853].)
 
-**Amber — charcoal + gold. Signature of `plex`.**
+**Amber — charcoal + gold. Signature of `catalog`.**
 
 | token | dark | light |
 |---|---|---|
@@ -452,8 +434,8 @@ scanlines to chunky tracking bars.**
 ## 5. Phones and tablets, in one picture
 
 ![mobile frames](img/mockups/mobile-all-noirr.png)
-*All five layouts as phones, plus plex-on-tablet. Bottom tabs only for
-plex; theater floats a pill; deck keeps its status strip; guide becomes
+*All five layouts as phones, plus catalog-on-tablet. Bottom tabs only for
+catalog; theater floats a pill; deck keeps its status strip; guide becomes
 now/next; iPadOS gets the desktop-class sidebar back.*
 
 Rules of thumb the mockups encode: primary navigation within thumb reach
@@ -478,7 +460,7 @@ should need one.
   Zero visual change on classic. *Accept:* layout menu present; unknown
   stored value falls back to classic; `node --check` on the extracted
   script passes; every existing Playwright/layout assertion green.
-- **M2 — `plex` + Amber (web).** Sidebar chrome, hub home, library
+- **M2 — `catalog` + Amber (web).** Sidebar chrome, hub home, library
   toolbar + A–Z scrubber, backdrop detail, corner flags; Amber token set
   (both modes). *Accept:* all routes render inside the shell; light-mode
   screenshot sweep shows no hardcoded-dark boxes; docs/img regenerated
@@ -500,7 +482,7 @@ should need one.
   enter/click; non-home routes visibly fall back to classic shells.
 - **M6 — clients.** Android/Google TV first (ship order per
   [CLIENTS.md](CLIENTS.md)): extend the three web-matched themes to
-  eight, add the plex bottom-tab scaffold and TV rail; then Apple
+  eight, add the catalog bottom-tab scaffold and TV rail; then Apple
   (tvOS theater shell per the NOIRR_PLAYER decisions, iPadOS sidebar).
   *Accept:* per-platform screenshot matrix, one row per layout × theme
   the platform offers.
@@ -530,16 +512,16 @@ changes with the headless-chromium harness instead of eyeballing.
 
 Layouts — which advance to the build plan?
 
-- [ ] `plex` (recommended first — it is the one you asked for by name)
+- [x] `catalog` (selected as the first pilot)
 - [ ] `theater`
 - [ ] `deck`
 - [ ] `guide`
-- [ ] rename any of them? (`classic` layout vs Classic theme collision;
-      "plex lol" as a permanent name; bikeshed slot: ___________)
+- [ ] rename any others? (`classic` layout vs Classic theme remains the only
+      naming collision)
 
 Themes — which ship, and under what names?
 
-- [ ] Amber (or insist on calling it "Plex": ☐)
+- [ ] Amber
 - [ ] Giallo · [ ] Silver (confirm quietly-tinted status colors: ☐ yes
       ☐ make it strict B&W anyway)
 - [ ] Void (confirm midnight-only pinning: ☐)

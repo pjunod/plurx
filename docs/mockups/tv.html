@@ -56,7 +56,7 @@
   .rt{font:600 13px var(--font);letter-spacing:.1em;text-transform:uppercase;color:var(--muted);
     margin:10px 0 6px}
 
-  /* plex-tv: icon rail that expands on focus */
+  /* catalog-tv: icon rail that expands on focus */
   .ptv{display:flex;height:100%}
   .ptv .rail-nav{width:76px;flex:none;display:flex;flex-direction:column;gap:6px;align-items:center;
     padding:22px 0;background:linear-gradient(90deg,color-mix(in srgb,var(--panel) 92%,#000),
@@ -146,7 +146,7 @@
 <div id="wrap"><div id="frame"><div id="tv"></div></div></div>
 <script>
 "use strict";
-const STATE={layout:"plex",theme:"amber"};
+const STATE={layout:"catalog",theme:"amber"};
 const FONT_SANS="'Inter',system-ui,-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif";
 const FONT_SYS="system-ui,-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif";
 const FONT_MONO="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace";
@@ -173,7 +173,7 @@ const THEMES={
     text:"#f4e9ff",muted:"#a78fc7",accent:"#ff4fd8",accent2:"#26e2ff",warn:"#ffb454",btnInk:"#22041c",
     font:FONT_SYS,mono:FONT_MONO},
 };
-const LAYOUTS={plex:"Plex (rail)",theater:"Theater",guide:"Guide",classic:"Classic (web app)"};
+const LAYOUTS={catalog:"Catalog (rail)",theater:"Theater",guide:"Guide",classic:"Classic (web app)"};
 const M=(t,y,g,o)=>Object.assign({t,y,g},o||{});
 const IT={
   sc:M("Static City",2024,"neo-noir",{prog:41,s:3,h:355,desc:"A blackout traps a fixer and a stranger on the same stalled train; by dawn only one story survives."}),
@@ -219,7 +219,7 @@ function tvcard(it,w,wide,foc,fs){
     <div class="cap">${esc(it.t)}<small>${esc(it.ep||it.y)}</small></div></div>`;
 }
 
-function plexTV(){
+function catalogTV(){
   const nav=["⌂","⌕","🎬","📺","✦","⚙"].map((s,i)=>`<span class="it${i===0?" on":""}">${s}</span>`).join("");
   return `<div class="ptv">
     <div class="rail-nav"><span class="it" style="font-weight:800;color:var(--accent)">c_</span>${nav}
@@ -293,7 +293,7 @@ function classicTV(){
     <div class="rail">${[IT.gr,IT.sr,IT.me,IT.ns,IT.af,IT.lp,IT.vb].map(x=>tvcard(x,158,false,false,13)).join("")}</div>
   </div>`;
 }
-const RENDER={plex:plexTV,theater:theaterTV,guide:guideTV,classic:classicTV};
+const RENDER={catalog:catalogTV,theater:theaterTV,guide:guideTV,classic:classicTV};
 
 function applyTheme(){
   const v=THEMES[STATE.theme];const tv=document.getElementById("tv");

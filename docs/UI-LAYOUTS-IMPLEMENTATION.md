@@ -49,9 +49,9 @@ entry conditions:      G3 needs G2b            G5 needs G3-continue + S1 + S2
 
 \* T1 ran ahead of G2's completion (themes are layout-independent) and
 shipped Paper + Tide on the box-2 recommendation — §8 ratifies.
-G2's landed half proved the thesis: plex adds **zero** new
+G2's landed half proved the thesis: catalog adds **zero** new
 card/rail/grid builders and zero extra requests; 136 CSS rules scoped
-under `[data-layout=plex]`. Defend that property at every later gate.
+under `[data-layout=catalog]`. Defend that property at every later gate.
 
 Still NOT in this plan: `archive` (candidate post-G6 gate, §8 box 3),
 native clients (separate plans, §5.2), per-layout theme memory, README
@@ -99,7 +99,7 @@ script carrying `{name, surfaces}` only; the body script attaches
 `{name, surfaces}` stub to the `<head>` object** — without it,
 `applyLayout()` can't resolve the stored id, `data-layout` stays
 `classic`, and every scoped CSS rule silently fails to match (it
-debugs like a stylesheet that didn't load; this bit the plex port).
+debugs like a stylesheet that didn't load; this bit the catalog port).
 `surfaceClass()` decides desktop · mobile · tv from viewport/input,
 never UA strings. Unknown/unsupported ids fall back to classic
 silently. Deck declares desktop + tablet only.
@@ -139,7 +139,7 @@ Two ported disciplines from the build, now contract: (1) loaders
 reproduce the original fetch sequencing exactly — tidying sequencing
 is a performance change and ships as its own commit with its own
 justification, never inside a seam refactor (the request-log invariant
-enforces this); (2) plex introduced zero new card/rail/grid builders —
+enforces this); (2) catalog introduced zero new card/rail/grid builders —
 G4–G6 layouts hold the same line; a second card function is how five
 layouts become five applications.
 
@@ -228,13 +228,13 @@ byte-exact.
 All 18 captures byte-identical pre/post. The registry, seam (home),
 menu section, and fallbacks are live per §3.1/§3.2.
 
-### G2 — plex pilot, home ✔ · G2b — complete the pilot (next web work)
+### G2 — catalog pilot, home ✔ · G2b — complete the pilot (next web work)
 
-G2's landed half: plex chrome + Home through the seam, Amber both
+G2's landed half: catalog chrome + Home through the seam, Amber both
 modes, zero new components, zero request-log drift, classic untouched.
 
 **G2b scope:** convert library (piecewise contract, §3.2) and item
-detail (whole-body) under plex — A–Z scrubber, `Library/Collections/
+detail (whole-body) under catalog — A–Z scrubber, `Library/Collections/
 Categories` tabs (Categories greys out until S3), backdrop detail —
 plus the four defects the build logged (status §5):
 
@@ -243,13 +243,13 @@ plus the four defects the build logged (status §5):
 - corner unwatched flag: scope by item kind (`card()` gains a kind
   class); home-video folders and photos never flag.
 - A–Z scroll-spy anchors to the layout's own header, not `header.top`
-  (plex has none).
+  (catalog has none).
 - TV surface hides Settings/admin affordances (the proposal's
   no-admin-on-TV rule).
-- `PLEX_NAV` re-derives after `invalidateLibs()` — sidebar counts must
+- `CATALOG_NAV` re-derives after `invalidateLibs()` — sidebar counts must
   not go stale until the next Home render.
 
-**Accept:** everything from v3's G2 list (route matrix under plex ·
+**Accept:** everything from v3's G2 list (route matrix under catalog ·
 0/1/200+ item libraries · missing-art/long-title/no-year items ·
 non-admin user · keyboard-only pass with visible non-color focus ·
 hover affordances have keyboard/touch equivalents · light-mode sweep,
@@ -259,7 +259,7 @@ position survives batch arrival AND layout switching; the four defects
 above have regression captures; one manual smoke of home/library/
 detail in Safari and Firefox on the Mac (the harness is
 Chromium-only — status §5 — so cross-engine stays a human check for
-now) and one VoiceOver spot pass of the plex sidebar and cards.
+now) and one VoiceOver spot pass of the catalog sidebar and cards.
 
 ### T1 — theme catalogue ✔ (done, pending §8 ratification)
 
@@ -271,7 +271,7 @@ NOT applied (brand calls — box 4).
 ### S1 — media facts on the library list (server) — unchanged from v3
 
 Aggregated optional `media` block, one join/group query, `?facts=1`
-opt-in. Consumers: plex List mode (G2b's toggle) · deck (G5) · card
+opt-in. Consumers: catalog List mode (G2b's toggle) · deck (G5) · card
 badges. Acceptance as v3 (no N+1 · byte-identical without the param ·
 tolerant Android decoder verified · consumer check closes against
 G2b's library).
@@ -332,12 +332,12 @@ starting: **`playstart::note_playback_started`**
   single-owner rule).
 
 Consumers: Activity page in every layout · deck footer/spec sheets
-(G5) · optional plex "now playing" later. **Accept (server-side):**
+(G5) · optional catalog "now playing" later. **Accept (server-side):**
 direct-play start visible within one beacon interval, expiry within
 the chosen idle timeout; progressive and copy entries appear/disappear
 with their streams; transcode entries unchanged; expiry logic is a
 pure tested function. **Consumer check:** Activity shows all four
-method labels under classic and plex; the old copy string is gone.
+method labels under classic and catalog; the old copy string is gone.
 
 ### S3 — genres (server, migration v13) — cost named per status §3.2
 
@@ -368,7 +368,7 @@ forced re-enrich that re-hits TMDB once per title.** Spec:
 with zero/one extra API calls respectively (the cached list call);
 backfill over a seeded catalogue is resumable mid-run and its report
 counts backfilled/failed/skipped; `?genre=` filters with a test.
-**Consumer check:** plex Genre pill + Categories tab work end-to-end
+**Consumer check:** catalog Genre pill + Categories tab work end-to-end
 (G2b greyed → live), theater chips at G4 if Theater is chosen.
 
 ### G3 — did the abstraction pay for itself? (entry: G2b)

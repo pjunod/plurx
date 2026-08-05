@@ -28,14 +28,14 @@ and advance one vertical slice first.
 |---|---|---|
 | Layout × theme as two user-facing choices | Accept with a tighter contract | Composition and palette are useful axes, but themes already alter typography, radii, motion, and component treatment. |
 | `classic` | Accept | It is the compatibility baseline and safe fallback. |
-| `plex` + Amber | Advance as the first pilot | It is the clearest user benefit, has the most complete mockups, and mostly fits current endpoints. |
+| `catalog` + Amber | Advance as the first pilot | It is the clearest user benefit, has the most complete mockups, and mostly fits current endpoints. |
 | `theater` | Keep designed; build after the pilot | The design is coherent, but hero selection, artwork loading, and TV focus need real-device acceptance tests. |
 | `deck` | Split into its own feature/API proposal | Its table and footer cannot be built truthfully from the current list and activity DTOs. |
 | `guide` | Keep as an experiment | Genre channels, schedule semantics, and remote-control assumptions need decisions before this is a milestone. |
 | Five proposed themes | Advance after contrast and motion corrections | The dark variants are strong; several light accents and statuses fail normal-text contrast. |
 | One cross-platform M6 | Reject as a single milestone | Web, Android, and Apple start from different theme/navigation architectures and need separate scopes. |
 
-**Recommended first release:** layout plumbing · `classic` · `plex` · Amber
+**Recommended first release:** layout plumbing · `classic` · `catalog` · Amber
 dark/light · web only. That is enough to prove the abstraction without making
 every later idea a compatibility promise.
 
@@ -146,7 +146,7 @@ loadPage(route) ──▶ normalized page model ──▶ layout.render(page)
 ```
 
 Do this route by route, beginning with Home. Do not rewrite every screen before
-the Plex pilot proves the model. Activity, settings, auth, and the player can
+the Catalog pilot proves the model. Activity, settings, auth, and the player can
 continue using their existing renderers behind the layout shell.
 
 ### Theme persistence currently has two incompatible specifications
@@ -155,7 +155,7 @@ Section 1 says a theme choice is remembered per layout. Section 2 mirrors the
 existing single `localStorage.plurx_theme` key. Those are different products.
 
 Use one global theme in the first release. A layout's signature theme should
-be a preview/recommendation, not an automatic mutation: selecting Plex must
+be a preview/recommendation, not an automatic mutation: selecting Catalog must
 not silently replace a user's chosen noirr theme. Per-layout memory adds a
 mapping schema, migration rules, and a menu state that are not buying enough
 in M1.
@@ -163,7 +163,7 @@ in M1.
 If per-layout memory is added later, specify one versioned value such as:
 
 ```json
-{"v":1,"classic":"noirr","plex":"amber"}
+{"v":1,"classic":"noirr","catalog":"amber"}
 ```
 
 Unknown layout/theme ids are ignored independently; the global theme remains
@@ -249,9 +249,9 @@ back to Classic and are not shown as selectable.
 
 **Accept:** the G0 matrix is unchanged under `classic`.
 
-### G2 — ship the Plex web pilot
+### G2 — ship the Catalog web pilot
 
-Implement Plex Home, one library route, and one item-detail route with Amber
+Implement Catalog Home, one library route, and one item-detail route with Amber
 dark/light. Share route loaders and behavior wiring; do not fork API calls.
 
 **Accept:** the full route matrix remains operable, contrast passes, light mode
@@ -299,7 +299,7 @@ list position. It is Finder/Apple Music muscle memory applied to a media
 library, not an operator console: no disk/session telemetry and no codec table
 on the Home screen.
 
-**Why it fills a gap:** Classic/Plex repeatedly move between grid and detail;
+**Why it fills a gap:** Classic/Catalog repeatedly move between grid and detail;
 Theater intentionally trades context for immersion; Deck trades it for
 operations. Spine optimizes comparison and browsing continuity. It works with
 current library-list and item-detail endpoints and makes keyboard and large
@@ -374,13 +374,13 @@ status colors in every showtime.*
 
 - [x] Keep layout and theme as separate settings, with the corrected boundary.
 - [x] Keep `classic` as the default and unknown-value fallback.
-- [x] Advance `plex` + Amber as the web pilot.
+- [x] Advance `catalog` + Amber as the web pilot.
 - [ ] Correct Amber/Giallo/Silver light tokens before freezing values.
 - [ ] Choose one global theme for M1; defer per-layout theme memory.
 - [ ] Give Deck an API proposal or reduce its promised telemetry.
 - [ ] Define Guide's metadata, scheduling, and D-pad-only contract.
 - [ ] Split web, Android, and Apple into separate milestones.
-- [ ] After the Plex pilot, choose Theater or Spine as the second proof of the
+- [ ] After the Catalog pilot, choose Theater or Spine as the second proof of the
       renderer contract.
 - [ ] Decide whether Archive earns a Home experiment for home-video/photo
       libraries.
