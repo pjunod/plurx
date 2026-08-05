@@ -188,7 +188,7 @@ reason = "These commits only correct documentation, comments, or ignored generat
 ignore = true
 
 [[coverage]]
-commits = ["dcd0d1e4"]
-points = ["mobile.versioning"]
-checks = ["mobile-version"]
-reason = "The mobile release gate pins the shared workspace version and requires strictly increasing Apple and Android build counters."
+commits = ["e266f135"]
+points = ["validation.framework"]
+checks = ["catalog-contract", "history-regressions"]
+reason = "The validation contract and history audit verify that the stale unreachable mapping is gone and every remaining corrective commit has current evidence."

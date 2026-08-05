@@ -105,9 +105,13 @@ pub async fn scan(
     // scanning a library makes it busy.
     let episodeish = matches!(body.hint.as_deref(), Some("episode") | Some("season"))
         || body.series.as_ref().is_some_and(|s| s.tmdb.is_some());
-    let ids = body.ids.as_ref().map(|i| IdHints {
-        tmdb: i.tmdb,
-        imdb: i.imdb.clone(),
+    // A series import deliberately carries the SHOW id in `series`, with no
+    // item-level `ids` object. Keying this Option off `body.ids` alone drops
+    // exactly the hint TV imports send, leaving the targeted scan to guess
+    // from the folder name instead of using the manager's authoritative id.
+    let ids = (body.ids.is_some() || body.series.is_some()).then(|| IdHints {
+        tmdb: body.ids.as_ref().and_then(|i| i.tmdb),
+        imdb: body.ids.as_ref().and_then(|i| i.imdb.clone()),
         series_tmdb: body.series.as_ref().and_then(|s| s.tmdb),
         episodeish,
     });
