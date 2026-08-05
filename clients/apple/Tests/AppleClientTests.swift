@@ -2187,6 +2187,40 @@ final class AppleClientTests: XCTestCase {
         XCTAssertNil(legacy.deliveredDynamicRange)
     }
 
+    func testHlsMediaOriginPrefersTheActualKeyframeAndFallsBackCompatibly() throws {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+
+        let copied = try decoder.decode(HlsStart.self, from: Data(#"""
+        {"session_id":"copy","playlist_url":"/hls/copy/index.m3u8",
+         "start_seconds":10.5,"media_origin_ms":10000,"vod":false}
+        """#.utf8))
+        XCTAssertEqual(copied.mediaOriginMs, 10_000)
+        XCTAssertEqual(
+            PlayerController.sessionMediaOriginMs(copied, requestedStartMs: 10_500),
+            10_000
+        )
+
+        let legacy = try decoder.decode(HlsStart.self, from: Data(#"""
+        {"session_id":"legacy","playlist_url":"/hls/legacy/index.m3u8",
+         "start_seconds":10.5,"vod":false}
+        """#.utf8))
+        XCTAssertNil(legacy.mediaOriginMs)
+        XCTAssertEqual(
+            PlayerController.sessionMediaOriginMs(legacy, requestedStartMs: 10_500),
+            10_500
+        )
+
+        let cached = try decoder.decode(HlsStart.self, from: Data(#"""
+        {"session_id":"cached","playlist_url":"/hls/cached/index.m3u8",
+         "start_seconds":0,"media_origin_ms":123000,"vod":true}
+        """#.utf8))
+        XCTAssertEqual(
+            PlayerController.sessionMediaOriginMs(cached, requestedStartMs: 123_000),
+            0
+        )
+    }
+
     /// Servers from before the Apple DV transport hint can approve Profile 8
     /// as progressive direct play. AVPlayer then advances with audio while the
     /// video plane stays black. The client must losslessly repackage that same
