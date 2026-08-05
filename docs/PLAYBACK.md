@@ -380,7 +380,12 @@ re-break it.
 copy session; `aac=1` says the audio needs transcoding (the client already
 learned that from `decision.transcode_audio`). Everything else — playlist and
 segment serving, the idle reaper, the fail-fast watchdog — is the shared HLS
-session machinery.
+session machinery. The start response includes additive `media_origin_ms`, the
+source timestamp represented by player-local time zero. Copy sessions report
+the preceding keyframe actually selected by the demuxer; accurate transcodes
+report the requested start, and cached whole-title sessions report zero. New
+clients use this integer origin for timeline mapping and old clients continue
+to fall back to `start_seconds`.
 
 ## The error fallback — and the stale-reason trap
 
@@ -533,9 +538,14 @@ perf report are the same events server-side.
 
 - **Resume** rides the same input-seek on every path: `?start=<seconds>` on
   `/direct`/`/stream.mp4`, or `hls/start?start=…`. For HLS sessions (transcode
-  and copy) the session begins at the resume point, so the player tracks a
-  `PLAYER.offset` and reports `offset + video.currentTime` as the true position.
-  Direct play needs no offset — `currentTime` is the timeline.
+  and copy), the response reports `media_origin_ms`; clients that understand
+  it calculate `media origin + player-local time` as the true position. That
+  distinction is load-bearing for copied video: a request between keyframes
+  begins at the preceding keyframe after FFmpeg normalizes its timestamp to
+  zero. The progressive remux exposes the same value in
+  `X-Plurx-Media-Origin-Ms`; direct play needs no offset because `currentTime`
+  is already source time. Older clients, and new clients talking to an older
+  server, fall back to the requested start.
 - **Progress** posts every 5 s and on `ended` to `POST /items/{id}/progress`,
   which drives the resume bar, "Continue watching", and the server-side Trakt
   scrobble. Best-effort: a dropped beat is not surfaced.
