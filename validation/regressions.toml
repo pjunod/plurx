@@ -186,3 +186,9 @@ points = []
 checks = []
 reason = "These commits only correct documentation, comments, or ignored generated cache state; they introduce no executable behavior."
 ignore = true
+
+[[coverage]]
+commits = ["e266f135"]
+points = ["validation.framework"]
+checks = ["catalog-contract", "history-regressions"]
+reason = "The validation contract and history audit verify that the stale unreachable mapping is gone and every remaining corrective commit has current evidence."

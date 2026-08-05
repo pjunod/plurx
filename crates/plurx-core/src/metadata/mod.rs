@@ -212,8 +212,16 @@ pub async fn enrich_library(
                     if apply(store, item.id, patch, &mut report).await {
                         report.matched += 1;
                     }
-                    enrich_episodes(store, tmdb, artwork_dir, item.id, show_tmdb_id, &mut report)
-                        .await;
+                    enrich_episodes(
+                        store,
+                        tmdb,
+                        artwork_dir,
+                        item.id,
+                        show_tmdb_id,
+                        only,
+                        &mut report,
+                    )
+                    .await;
                 }
                 Ok(None) => report.unmatched += 1,
                 Err(e) => {
@@ -476,6 +484,7 @@ async fn enrich_episodes(
     artwork_dir: &Path,
     show_id: i64,
     show_tmdb_id: i64,
+    only: Option<&[i64]>,
     report: &mut EnrichReport,
 ) {
     let episodes = match store.episodes_for_show(show_id).await {
@@ -490,6 +499,12 @@ async fn enrich_episodes(
     // Group local episodes by season so each season is fetched exactly once.
     let mut by_season: BTreeMap<i32, Vec<crate::domain::Item>> = BTreeMap::new();
     for ep in episodes {
+        // A targeted import walks through its already-enriched show to reach
+        // new children. Keep that forced ancestor from turning one episode
+        // notification into a re-download of every still in every season.
+        if only.is_some_and(|ids| !ids.contains(&ep.id)) {
+            continue;
+        }
         by_season
             .entry(ep.season_number.unwrap_or(0))
             .or_default()

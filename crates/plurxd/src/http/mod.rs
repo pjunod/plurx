@@ -1553,6 +1553,62 @@ mod tests {
         );
     }
 
+    /// Monarr puts a show's id in `series`, not item-level `ids`. The receiver
+    /// used to build its IdHints Option from `ids` alone, so the authoritative
+    /// series id disappeared before the scan job ever saw it.
+    #[tokio::test]
+    async fn a_series_only_id_reaches_the_show_row() {
+        let (app, state) = test_state();
+        let admin = setup_admin(&app).await;
+        let key = scan_key(&app, &admin, json!(["scan:trigger", "status:read"])).await;
+
+        let dir = tempfile::tempdir().expect("tmp");
+        let season = dir.path().join("Severance (2022)/Season 01");
+        std::fs::create_dir_all(&season).expect("mkdir");
+        std::fs::write(season.join("Severance.S01E01.mkv"), b"x").expect("write");
+        call(
+            &app,
+            post(
+                "/api/v1/libraries",
+                Some(&admin),
+                json!({ "name": "TV", "kind": "shows", "paths": [dir.path()] }),
+            ),
+        )
+        .await;
+
+        let body = scan_and_settle(
+            &app,
+            &key,
+            json!({
+                "path": season,
+                "series": { "tmdb": 95396 },
+                "hint": "episode",
+                "source": "monarr"
+            }),
+        )
+        .await;
+        let mut item = state
+            .store
+            .get_item(body["items"][0]["item_id"].as_i64().expect("episode id"))
+            .await
+            .expect("get episode")
+            .expect("episode");
+        while let Some(parent) = item.parent_id {
+            item = state
+                .store
+                .get_item(parent)
+                .await
+                .expect("get parent")
+                .expect("parent");
+        }
+        assert_eq!(item.kind, plurx_core::domain::ItemKind::Show);
+        assert_eq!(
+            item.tmdb_id,
+            Some(95396),
+            "the series field was accepted by HTTP but dropped before apply_ids"
+        );
+    }
+
     /// A scan of one folder must not disturb the rest of the library. This is
     /// the no-prune property, asserted through the HTTP surface as well as in
     /// the core, because it is the one that would destroy data.
