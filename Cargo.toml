@@ -11,7 +11,7 @@ members = [
 # One version for the whole workspace: the crates are not published separately,
 # so a single number is what "a plurx release" means. Bump policy and the tag
 # process live in docs/RELEASING.md.
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 publish = false
 repository = "https://github.com/pjunod/plurx"
@@ -49,6 +49,10 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 argon2 = "0.5"
 sha2 = "0.10"
 hex = "0.4"
+# PNG object publication uses the already-audited primitives directly instead
+# of adding an image-processing stack to the untrusted subtitle boundary.
+flate2 = "1.1.9"
+crc32fast = "1.5.0"
 getrandom = "0.2"
 # Streaming
 bytes = "1"

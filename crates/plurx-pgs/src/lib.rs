@@ -1,8 +1,8 @@
-//! A bounded, Plurx-owned adapter around the parser under Milestone 0 review.
+//! A bounded, Plurx-owned adapter around the reviewed PGS parser.
 //!
-//! This crate is intentionally not a dependency of `plurxd`. It accepts only
-//! raw SUP streams that pass an allocation-free structural preflight. Direct
-//! MKV/M2TS parsing remains outside the reviewed boundary.
+//! It accepts only raw SUP streams that pass an allocation-free structural
+//! preflight. Direct MKV/M2TS parsing remains outside the reviewed boundary:
+//! the server demuxes one subtitle stream and this crate owns all PGS state.
 
 use libpgs::pgs::{CompositionState, OdsData, PdsData, SegmentType, SequenceFlag};
 use libpgs::{ContainerFormat, Extractor};
@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 
 /// The exact parser release whose behavior this adapter was written against.
@@ -39,6 +40,9 @@ pub struct ParserLimits {
     pub max_cached_objects: usize,
     pub max_cached_pixel_bytes: usize,
     pub max_palettes: usize,
+    /// Maximum RGBA bytes retained by [`normalize_sup`]. Fingerprint-only
+    /// inspection does not allocate this output.
+    pub max_normalized_rgba_bytes: usize,
 }
 
 impl Default for ParserLimits {
@@ -57,6 +61,7 @@ impl Default for ParserLimits {
             max_cached_objects: 1024,
             max_cached_pixel_bytes: 128 * 1024 * 1024,
             max_palettes: 64,
+            max_normalized_rgba_bytes: 256 * 1024 * 1024,
         }
     }
 }
@@ -94,6 +99,37 @@ pub struct CompositionFingerprint {
     pub sha256: String,
 }
 
+/// A complete source-time overlay track with no `libpgs` types exposed.
+///
+/// Every composition is a snapshot, not a delta. A composition with no
+/// objects is an authored clear event.
+#[derive(Debug)]
+pub struct NormalizedTrack {
+    pub report: InspectionReport,
+    pub compositions: Vec<NormalizedComposition>,
+}
+
+#[derive(Debug)]
+pub struct NormalizedComposition {
+    pub pts_90khz: u64,
+    pub start_ms: f64,
+    pub canvas_width: u16,
+    pub canvas_height: u16,
+    pub objects: Vec<NormalizedObject>,
+}
+
+#[derive(Debug)]
+pub struct NormalizedObject {
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub height: u16,
+    /// Row-major, non-premultiplied RGBA8 pixels for the authored crop.
+    pub rgba: Vec<u8>,
+    /// Stable digest of dimensions and RGBA content, before PNG encoding.
+    pub rgba_sha256: String,
+}
+
 #[derive(Debug, Error)]
 pub enum AdapterError {
     #[error("I/O error: {0}")]
@@ -104,6 +140,8 @@ pub enum AdapterError {
     Malformed(String),
     #[error("PGS safety limit exceeded: {0}")]
     Limit(String),
+    #[error("PGS normalization cancelled")]
+    Cancelled,
 }
 
 #[derive(Debug)]
@@ -147,8 +185,36 @@ pub fn inspect_sup(
     path: impl AsRef<Path>,
     limits: &ParserLimits,
 ) -> Result<InspectionReport, AdapterError> {
-    let path = path.as_ref();
-    let preflight = preflight_sup(path, limits)?;
+    Ok(process_sup(path.as_ref(), limits, false, None)?.report)
+}
+
+/// Normalize a raw SUP stream into complete, bounded RGBA compositions.
+pub fn normalize_sup(
+    path: impl AsRef<Path>,
+    limits: &ParserLimits,
+) -> Result<NormalizedTrack, AdapterError> {
+    process_sup(path.as_ref(), limits, true, None)
+}
+
+/// The server form of [`normalize_sup`], with cooperative cancellation for
+/// its hard preparation deadline. The flag is checked during preflight and at
+/// every display-set boundary, so dropping an async join handle does not leave
+/// an unbounded blocking worker behind.
+pub fn normalize_sup_cancellable(
+    path: impl AsRef<Path>,
+    limits: &ParserLimits,
+    cancelled: &AtomicBool,
+) -> Result<NormalizedTrack, AdapterError> {
+    process_sup(path.as_ref(), limits, true, Some(cancelled))
+}
+
+fn process_sup(
+    path: &Path,
+    limits: &ParserLimits,
+    retain_rgba: bool,
+    cancelled: Option<&AtomicBool>,
+) -> Result<NormalizedTrack, AdapterError> {
+    let preflight = preflight_sup(path, limits, cancelled)?;
 
     let mut extractor = Extractor::open(path)?.with_history(false);
     if extractor.format() != ContainerFormat::Sup {
@@ -179,10 +245,21 @@ pub fn inspect_sup(
         compositions: Vec::new(),
     };
     let mut state = NormalizerState::default();
+    let mut compositions = Vec::new();
+    let mut normalized_rgba_bytes = 0usize;
 
     for parsed in extractor.by_ref() {
+        check_cancelled(cancelled)?;
         let track = parsed?;
-        normalize_display_set(&track.display_set, limits, &mut state, &mut report)?;
+        normalize_display_set(
+            &track.display_set,
+            limits,
+            &mut state,
+            &mut report,
+            retain_rgba.then_some(&mut compositions),
+            &mut normalized_rgba_bytes,
+            cancelled,
+        )?;
     }
     report.parser_bytes_read = extractor.stats().bytes_read;
 
@@ -198,10 +275,25 @@ pub fn inspect_sup(
         ));
     }
 
-    Ok(report)
+    Ok(NormalizedTrack {
+        report,
+        compositions,
+    })
 }
 
-fn preflight_sup(path: &Path, limits: &ParserLimits) -> Result<PreflightReport, AdapterError> {
+fn check_cancelled(cancelled: Option<&AtomicBool>) -> Result<(), AdapterError> {
+    if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        Err(AdapterError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+fn preflight_sup(
+    path: &Path,
+    limits: &ParserLimits,
+    cancelled: Option<&AtomicBool>,
+) -> Result<PreflightReport, AdapterError> {
     let source_bytes = std::fs::metadata(path)?.len();
     if source_bytes > limits.max_sup_bytes {
         return Err(AdapterError::Limit(format!(
@@ -221,6 +313,7 @@ fn preflight_sup(path: &Path, limits: &ParserLimits) -> Result<PreflightReport, 
     let mut duplicate_timestamps = 0u64;
 
     while read_header_or_eof(&mut reader, &mut header)? {
+        check_cancelled(cancelled)?;
         if header[0..2] != PGS_MAGIC {
             return Err(AdapterError::Malformed(format!(
                 "bad segment magic at segment {}",
@@ -379,7 +472,11 @@ fn normalize_display_set(
     limits: &ParserLimits,
     state: &mut NormalizerState,
     report: &mut InspectionReport,
+    output: Option<&mut Vec<NormalizedComposition>>,
+    normalized_rgba_bytes: &mut usize,
+    cancelled: Option<&AtomicBool>,
 ) -> Result<(), AdapterError> {
+    check_cancelled(cancelled)?;
     let Some(first) = display_set.segments.first() else {
         return Err(AdapterError::Malformed("empty display set".into()));
     };
@@ -441,6 +538,7 @@ fn normalize_display_set(
         .skip(1)
         .take(display_set.segments.len().saturating_sub(2))
     {
+        check_cancelled(cancelled)?;
         match segment.segment_type {
             SegmentType::WindowDefinition => {
                 let wds = segment
@@ -495,7 +593,11 @@ fn normalize_display_set(
     composition_hasher.update(pcs.video_width.to_be_bytes());
     composition_hasher.update(pcs.video_height.to_be_bytes());
 
+    let mut normalized_objects = output
+        .as_ref()
+        .map(|_| Vec::with_capacity(pcs.objects.len()));
     for placement in &pcs.objects {
+        check_cancelled(cancelled)?;
         let object = state.objects.get(&placement.object_id).ok_or_else(|| {
             AdapterError::Malformed(format!(
                 "composition references missing object {}",
@@ -534,13 +636,43 @@ fn normalize_display_set(
             "composition object",
         )?;
 
-        let image_hash = hash_rgba_crop(object, palette, crop_x, crop_y, width, height);
+        let (image_hash, rgba) = if normalized_objects.is_some() {
+            let rgba = rgba_crop(object, palette, crop_x, crop_y, width, height);
+            *normalized_rgba_bytes =
+                normalized_rgba_bytes
+                    .checked_add(rgba.len())
+                    .ok_or_else(|| {
+                        AdapterError::Limit("normalized RGBA byte count overflowed".into())
+                    })?;
+            if *normalized_rgba_bytes > limits.max_normalized_rgba_bytes {
+                return Err(AdapterError::Limit(format!(
+                    "normalized RGBA output exceeds {} bytes",
+                    limits.max_normalized_rgba_bytes
+                )));
+            }
+            (hash_rgba(width, height, &rgba), Some(rgba))
+        } else {
+            (
+                hash_rgba_crop(object, palette, crop_x, crop_y, width, height),
+                None,
+            )
+        };
         composition_hasher.update(placement.object_id.to_be_bytes());
         composition_hasher.update(placement.x.to_be_bytes());
         composition_hasher.update(placement.y.to_be_bytes());
         composition_hasher.update(width.to_be_bytes());
         composition_hasher.update(height.to_be_bytes());
         composition_hasher.update(image_hash);
+        if let (Some(objects), Some(rgba)) = (&mut normalized_objects, rgba) {
+            objects.push(NormalizedObject {
+                x: placement.x,
+                y: placement.y,
+                width,
+                height,
+                rgba,
+                rgba_sha256: hex::encode(image_hash),
+            });
+        }
     }
 
     let object_count = pcs.objects.len();
@@ -561,6 +693,15 @@ fn normalize_display_set(
         object_count,
         sha256: hex::encode(composition_hasher.finalize()),
     });
+    if let (Some(output), Some(objects)) = (output, normalized_objects) {
+        output.push(NormalizedComposition {
+            pts_90khz: display_set.pts,
+            start_ms: display_set.pts as f64 / 90.0,
+            canvas_width: pcs.video_width,
+            canvas_height: pcs.video_height,
+            objects,
+        });
+    }
 
     Ok(())
 }
@@ -911,18 +1052,36 @@ fn hash_rgba_crop(
     width: u16,
     height: u16,
 ) -> [u8; 32] {
+    let rgba = rgba_crop(object, palette, crop_x, crop_y, width, height);
+    hash_rgba(width, height, &rgba)
+}
+
+fn hash_rgba(width: u16, height: u16, rgba: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(b"plurx-pgs-rgba-v1");
     hasher.update(width.to_be_bytes());
     hasher.update(height.to_be_bytes());
+    hasher.update(rgba);
+    hasher.finalize().into()
+}
+
+fn rgba_crop(
+    object: &StoredObject,
+    palette: &Palette,
+    crop_x: u16,
+    crop_y: u16,
+    width: u16,
+    height: u16,
+) -> Vec<u8> {
+    let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
     let stride = object.width as usize;
     for y in crop_y as usize..(crop_y + height) as usize {
         let start = y * stride + crop_x as usize;
         for index in &object.pixels[start..start + width as usize] {
-            hasher.update(palette[*index as usize]);
+            rgba.extend_from_slice(&palette[*index as usize]);
         }
     }
-    hasher.finalize().into()
+    rgba
 }
 
 fn ycrcb_to_rgba(y: u8, cr: u8, cb: u8, alpha: u8) -> [u8; 4] {
@@ -1088,6 +1247,71 @@ mod tests {
             report.compositions[1].sha256,
             "375009aa13c9613c4fa6ca3f7ed7d92a11a1332f907b449d84fc95c7932447d9"
         );
+    }
+
+    #[test]
+    fn normalized_output_is_complete_rgba_and_preserves_clear_events() {
+        let rle = encode_rle(&[1, 1, 1, 1], 2, 2).expect("encode fixture");
+        let mut bytes = display_set(vec![
+            pcs(1000, CompositionState::EpochStart, vec![placement(7)]),
+            palette(1000, 235, 128, 128),
+            object(1000, 7, 2, 2, rle),
+            PgsSegment::end_segment(90_000, 0),
+        ]);
+        bytes.extend(display_set(vec![
+            pcs(2000, CompositionState::Normal, vec![]),
+            PgsSegment::end_segment(180_000, 0),
+        ]));
+        let file = write_sup(&bytes);
+
+        let track = normalize_sup(file.path(), &ParserLimits::default()).expect("normalize SUP");
+        assert_eq!(track.compositions.len(), 2);
+        let shown = &track.compositions[0];
+        assert_eq!((shown.canvas_width, shown.canvas_height), (1920, 1080));
+        assert_eq!((shown.objects[0].x, shown.objects[0].y), (100, 100));
+        assert_eq!((shown.objects[0].width, shown.objects[0].height), (2, 2));
+        assert_eq!(shown.objects[0].rgba, [255, 255, 255, 255].repeat(4));
+        assert!(track.compositions[1].objects.is_empty());
+        assert_eq!(
+            track.report.compositions[0].sha256,
+            inspect_sup(file.path(), &ParserLimits::default())
+                .expect("inspect")
+                .compositions[0]
+                .sha256
+        );
+    }
+
+    #[test]
+    fn normalized_output_obeys_aggregate_rgba_limit() {
+        let rle = encode_rle(&[1, 1, 1, 1], 2, 2).expect("encode fixture");
+        let bytes = display_set(vec![
+            pcs(1000, CompositionState::EpochStart, vec![placement(7)]),
+            palette(1000, 235, 128, 128),
+            object(1000, 7, 2, 2, rle),
+            PgsSegment::end_segment(90_000, 0),
+        ]);
+        let file = write_sup(&bytes);
+        let limits = ParserLimits {
+            max_normalized_rgba_bytes: 15,
+            ..ParserLimits::default()
+        };
+        let error = normalize_sup(file.path(), &limits).expect_err("RGBA cap");
+        assert!(error
+            .to_string()
+            .contains("normalized RGBA output exceeds 15 bytes"));
+    }
+
+    #[test]
+    fn server_normalization_honors_cancellation_before_parsing() {
+        let bytes = display_set(vec![
+            pcs(1000, CompositionState::EpochStart, vec![]),
+            PgsSegment::end_segment(90_000, 0),
+        ]);
+        let file = write_sup(&bytes);
+        let cancelled = AtomicBool::new(true);
+        let error = normalize_sup_cancellable(file.path(), &ParserLimits::default(), &cancelled)
+            .expect_err("cancelled normalization");
+        assert!(matches!(error, AdapterError::Cancelled));
     }
 
     #[test]
@@ -1310,6 +1534,7 @@ mod tests {
             max_cached_objects: 16,
             max_cached_pixel_bytes: 1024 * 1024,
             max_palettes: 8,
+            max_normalized_rgba_bytes: 1024 * 1024,
         };
         let mut corpus = Vec::new();
         for end in 0..=base.len() {

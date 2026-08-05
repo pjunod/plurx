@@ -1050,10 +1050,17 @@ Acceptance evidence:
 - explicit PiP/AirPlay/external-output result;
 - go/no-go recommendation for the server-image architecture.
 
-No production code should depend on an unreviewed parser before this milestone
-is accepted.
+No default-on production path should parse untrusted PGS before this milestone
+is accepted. A later milestone may land behind an explicit default-off rollout
+gate so its wire contract and cache behavior can be reviewed without enabling
+subtitle selection on a deployed client.
 
 ### Milestone 1: server contract, extractor, and cache
+
+**Implementation status (0.2.4 candidate):** complete behind the default-off
+`PLURX_PGS_OVERLAY` gate. The parser boundary, API, cache, and regression tests
+have landed on the implementation branch; physical-client acceptance remains a
+Milestone 0/2/3 release gate, so this status is not production rollout approval.
 
 Work:
 
@@ -1074,6 +1081,11 @@ Acceptance evidence:
 - limit and timeout tests;
 - cache invalidation tests;
 - API compatibility test proving old track fields are unchanged.
+
+Implementation evidence is recorded in
+[PGS-OVERLAY-M0-FEASIBILITY.md](PGS-OVERLAY-M0-FEASIBILITY.md) §8. The final
+wire schema and operational bounds are documented in
+[PLAYBACK.md](PLAYBACK.md#pgs-overlay-server-contract--staged-and-default-off).
 
 ### Milestone 2: Apple client
 

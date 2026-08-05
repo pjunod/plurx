@@ -1018,7 +1018,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
 name = "plurx-compat-plex"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "axum",
  "http-body-util",
@@ -1029,7 +1029,7 @@ dependencies = [
 
 [[package]]
 name = "plurx-core"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "argon2",
  "async-trait",
@@ -1055,7 +1055,7 @@ dependencies = [
 
 [[package]]
 name = "plurx-pgs"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "hex",
  "libpgs",
@@ -1068,12 +1068,14 @@ dependencies = [
 
 [[package]]
 name = "plurxd"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "axum",
  "bytes",
  "clap",
+ "crc32fast",
+ "flate2",
  "futures-util",
  "hex",
  "http-body-util",
@@ -1082,6 +1084,7 @@ dependencies = [
  "mime_guess",
  "plurx-compat-plex",
  "plurx-core",
+ "plurx-pgs",
  "qrcode",
  "reqwest",
  "serde",

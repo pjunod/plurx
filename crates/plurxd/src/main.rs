@@ -6,6 +6,7 @@ mod ffmpeg;
 mod http;
 mod logbuf;
 mod meter;
+mod pgs_overlay;
 mod pipeprobe;
 mod playstart;
 mod produce;

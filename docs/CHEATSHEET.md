@@ -144,6 +144,7 @@ Runbook, with monarr's side too: [OPERATIONS.md](OPERATIONS.md).
 | `PLURX_LOG` | `info` | `tracing` filter (e.g. `plurxd=debug`) |
 | `PLURX_HLS_CLOSED_CAPTIONS_NONE` | off | Experiment: `CLOSED-CAPTIONS=NONE` on the HLS variant |
 | `PLURX_HLS_FORCED_AUTOSELECT` | off | Experiment: `AUTOSELECT=YES` on forced subtitle renditions |
+| `PLURX_PGS_OVERLAY` | off | Staged authenticated PGS manifest/PNG producer; not a production rollout switch until device acceptance |
 
 The last two are HLS master experiments, not settings: enable **one per
 deploy**, restart, and watch a real Apple TV — the device is the only thing

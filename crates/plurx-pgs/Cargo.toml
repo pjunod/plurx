@@ -1,14 +1,14 @@
 [package]
 name = "plurx-pgs"
-description = "Bounded PGS parser adapter for the Plurx overlay feasibility milestone"
+description = "Bounded raw-SUP parser and normalizer for Plurx PGS overlays"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
 repository.workspace = true
 
 [dependencies]
-# Milestone 0 audits this exact release. Keep the pin local to this unshipped
-# adapter; plurxd must not depend on this crate until the review is accepted.
+# Milestone 0 audited this exact release. Keep the production parser pin exact;
+# upgrades repeat the source, fuzz, RustSec, and representative-media review.
 libpgs = "=0.6.0"
 hex = { workspace = true }
 serde = { workspace = true }

@@ -78,6 +78,13 @@ test = "crates/plurx-core/src/tracks.rs"
 test_anchor = "native_hls_text_and_burn_fallback_are_distinct"
 
 [[decisions]]
+id = "server.pgs-overlay"
+source = "crates/plurxd/src/http/pgs_overlay.rs"
+source_anchor = "pub async fn manifest("
+test = "crates/plurxd/src/http/mod.rs"
+test_anchor = "pgs_overlay_contract_is_authenticated_typed_and_immutable"
+
+[[decisions]]
 id = "server.session-kind"
 source = "crates/plurxd/src/transcode.rs"
 source_anchor = "pub async fn create_session("
