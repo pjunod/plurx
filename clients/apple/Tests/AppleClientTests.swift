@@ -683,6 +683,26 @@ final class AppleClientTests: XCTestCase {
     }
 
     @MainActor
+    func testNonfatalPlaybackNoticeExpiresWithoutBecomingAPlaybackError() async {
+        let controller = PlayerController()
+
+        controller.showPlaybackNotice(
+            PlayerController.hdrSubtitleNotice,
+            duration: .milliseconds(10)
+        )
+
+        XCTAssertEqual(controller.playbackNotice, PlayerController.hdrSubtitleNotice)
+        XCTAssertNil(controller.playbackError)
+        XCTAssertFalse(controller.failed)
+
+        try? await Task.sleep(for: .milliseconds(50))
+
+        XCTAssertNil(controller.playbackNotice)
+        XCTAssertNil(controller.playbackError)
+        XCTAssertFalse(controller.failed)
+    }
+
+    @MainActor
     func testEstablishedHDRRecoveryNeverChoosesTheSDRFallback() {
         XCTAssertTrue(PlayerController.shouldPreserveEstablishedHDRDelivery(
             deliveredRange: "hdr10", establishedPlayback: true
