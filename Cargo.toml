@@ -11,7 +11,7 @@ members = [
 # One version for the whole workspace: the crates are not published separately,
 # so a single number is what "a plurx release" means. Bump policy and the tag
 # process live in docs/RELEASING.md.
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 publish = false
 repository = "https://github.com/pjunod/plurx"
