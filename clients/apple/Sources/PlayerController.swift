@@ -241,6 +241,7 @@ final class PlayerController: ObservableObject {
     @Published private(set) var isVOD = false
     @Published private(set) var failed = false
     @Published private(set) var playbackError: String?
+    @Published private(set) var playbackNotice: String?
     @Published private(set) var finished = false
     @Published private(set) var pgsOverlayWindow: PGSOverlayWindow?
     @Published private(set) var pgsOverlayStatus: PGSOverlayStatus = .off
@@ -256,6 +257,7 @@ final class PlayerController: ObservableObject {
     private var itemStatusObservation: NSKeyValueObservation?
     private var statusTask: Task<Void, Never>?
     private var recoveryTask: Task<Void, Never>?
+    private var playbackNoticeTask: Task<Void, Never>?
     private var started = false
     private var sessionId: String?
     private var lastReportedMs = 0
@@ -398,6 +400,7 @@ final class PlayerController: ObservableObject {
         establishedPlayback = false
         establishedHDRRetryAttempted = false
         attachedAtPositionMs = max(0, startMs)
+        clearPlaybackNotice()
 
         #if os(iOS)
         // iOS needs an explicit playback audio session for silent-switch and
@@ -494,7 +497,7 @@ final class PlayerController: ObservableObject {
     func selectSubtitle(_ index: Int?) {
         guard index != selectedSubtitle else { return }
         if Self.subtitleUsesOverlay(index, in: subtitles), player.isExternalPlaybackActive {
-            playbackError = Self.pgsOverlayExternalPlaybackNotice
+            showPlaybackNotice(Self.pgsOverlayExternalPlaybackNotice)
             return
         }
         if Self.subtitleBurnWouldDiscardHDR(
@@ -502,10 +505,10 @@ final class PlayerController: ObservableObject {
             tracks: subtitles,
             deliveredRange: deliveredRange
         ) {
-            playbackError = Self.hdrSubtitleNotice
+            showPlaybackNotice(Self.hdrSubtitleNotice)
             return
         }
-        playbackError = nil
+        clearPlaybackNotice()
         let activeOverlay = pgsOverlayTrackIndex
         selectedSubtitle = index
         let route = Self.subtitleSelectionRoute(
@@ -523,6 +526,31 @@ final class PlayerController: ObservableObject {
             wantsNativeSubtitleRenditions = true
         }
         Task { await applySubtitleSelection(index, route: route) }
+    }
+
+    /// Nonfatal playback feedback shares the red player banner with recovery
+    /// messages, but not their lifetime. Replacing the notice restarts its
+    /// clock; real playback failures continue through `playbackError` and the
+    /// persistent failure view.
+    func showPlaybackNotice(_ message: String, duration: Duration = .seconds(5)) {
+        playbackNoticeTask?.cancel()
+        playbackNotice = message
+        playbackNoticeTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: duration)
+            } catch {
+                return
+            }
+            guard let self, self.playbackNotice == message else { return }
+            self.playbackNotice = nil
+            self.playbackNoticeTask = nil
+        }
+    }
+
+    func clearPlaybackNotice() {
+        playbackNoticeTask?.cancel()
+        playbackNoticeTask = nil
+        playbackNotice = nil
     }
 
     private func applySubtitleSelection(_ index: Int?, route: SubtitleSelectionRoute) async {
@@ -566,6 +594,7 @@ final class PlayerController: ObservableObject {
 
     /// Report the final position and hand any encoder back immediately.
     func stop() {
+        clearPlaybackNotice()
         guard started else { return }
         started = false
         if let timeObserver {
@@ -999,7 +1028,7 @@ final class PlayerController: ObservableObject {
     /// never replace the current HDR/Dolby Vision bytes with a hidden burn.
     func allowsPictureInPictureCommand() -> Bool {
         guard !pgsOverlayIsActive else {
-            playbackError = Self.pgsOverlayExternalPlaybackNotice
+            showPlaybackNotice(Self.pgsOverlayExternalPlaybackNotice)
             return false
         }
         return true
@@ -1066,7 +1095,9 @@ final class PlayerController: ObservableObject {
                 guard self.pgsOverlaySelectionGeneration == selectionGeneration else { return }
                 self.pgsOverlayStatus = .failed(error.localizedDescription)
                 self.pgsOverlayWindow = nil
-                self.playbackError = "\(error.localizedDescription) Video playback was kept unchanged."
+                self.showPlaybackNotice(
+                    "\(error.localizedDescription) Video playback was kept unchanged."
+                )
             }
         }
     }
@@ -1178,7 +1209,9 @@ final class PlayerController: ObservableObject {
                 guard self.pgsOverlaySelectionGeneration == selectionGeneration else { return }
                 self.pgsOverlayStatus = .failed(error.localizedDescription)
                 self.pgsOverlayWindow = nil
-                self.playbackError = "\(error.localizedDescription) Video playback was kept unchanged."
+                self.showPlaybackNotice(
+                    "\(error.localizedDescription) Video playback was kept unchanged."
+                )
             }
         }
     }
@@ -1862,7 +1895,7 @@ final class PlayerController: ObservableObject {
             return
         }
         selectedSubtitle = nil
-        playbackError = "That subtitle track could not be turned on."
+        showPlaybackNotice("That subtitle track could not be turned on.")
     }
 
     /// The audible half of owning media selection (P2-8). An HLS session

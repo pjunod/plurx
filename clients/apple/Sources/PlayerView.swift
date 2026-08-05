@@ -33,7 +33,7 @@ private struct PlayerOptionMenuButtonStyle: ButtonStyle {
             .padding(.horizontal, 10)
             .padding(.vertical, 9)
             .background(
-                configuration.isPressed ? Color.white.opacity(0.12) : Color.clear,
+                configuration.isPressed ? Color.primary.opacity(0.12) : Color.clear,
                 in: RoundedRectangle(cornerRadius: 7)
             )
             .contentShape(Rectangle())
@@ -554,7 +554,9 @@ struct PlayerView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
 
-            if let error = controller.playbackError ?? pictureInPicture.errorMessage,
+            if let error = controller.playbackNotice
+                ?? controller.playbackError
+                ?? pictureInPicture.errorMessage,
                !controller.failed {
                 Text(error)
                     .font(.system(.caption, design: .monospaced))
@@ -1557,6 +1559,9 @@ struct PlayerView: View {
             .padding(8)
         }
         .frame(minWidth: 260, idealWidth: 320, maxWidth: 380, maxHeight: 430)
+        // The player chrome is always white, but a popover can use light material.
+        // Re-enter the presentation's semantic palette instead of inheriting white.
+        .foregroundStyle(.primary)
         .presentationCompactAdaptation(.popover)
     }
 
