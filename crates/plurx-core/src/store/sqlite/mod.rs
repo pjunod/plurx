@@ -12,6 +12,7 @@ mod apikeys;
 mod cache;
 mod library;
 mod media;
+mod offline;
 mod outbox;
 mod trakt;
 mod users;
@@ -435,6 +436,67 @@ const MIGRATIONS: &[&str] = &[
     // upgrade starts on its own. v9 records what an upgrade that re-fetches a
     // whole catalogue looks like from TMDB's side.
     "ALTER TABLE items ADD COLUMN genres TEXT NOT NULL DEFAULT '[]';",
+    // v14: durable, app-managed offline packages and their renewable transfer
+    // capabilities. `file_id` is intentionally not a foreign key: a rescan may
+    // replace a file row, but it must not silently delete a queued package,
+    // its lease, or the source-unavailable diagnostic the client needs.
+    // Source identity is snapshotted for the same reason.
+    //
+    // One lease per package is load-bearing. AVFoundation cannot resume an
+    // asset after its URL changes and Media3 includes child URIs in HLS cache
+    // keys. The client creates the random token and retries the same PUT; only
+    // its hash reaches this table.
+    "CREATE TABLE offline_packages (
+        id                 TEXT PRIMARY KEY,
+        request_id         TEXT NOT NULL,
+        user_id            INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        file_id            INTEGER NOT NULL,
+        node_id            TEXT NOT NULL,
+        source_path        TEXT NOT NULL,
+        source_size        INTEGER NOT NULL,
+        source_mtime       INTEGER NOT NULL,
+        recipe_hash        TEXT,
+        target_height      INTEGER NOT NULL,
+        output_width       INTEGER,
+        output_height      INTEGER,
+        audio_index        INTEGER,
+        audio_offset_ms    INTEGER NOT NULL DEFAULT 0,
+        subtitle_index     INTEGER,
+        subtitle_mode      TEXT NOT NULL
+                           CHECK (subtitle_mode IN ('none', 'native', 'burned')),
+        state              TEXT NOT NULL
+                           CHECK (state IN ('queued', 'preparing', 'ready', 'failed')),
+        phase              TEXT NOT NULL,
+        progress_millis    INTEGER NOT NULL DEFAULT 0,
+        estimated_bytes    INTEGER NOT NULL DEFAULT 0,
+        reserved_bytes     INTEGER NOT NULL DEFAULT 0,
+        actual_bytes       INTEGER,
+        duration_ms        INTEGER,
+        error_code         TEXT,
+        error_message      TEXT,
+        created_at         INTEGER NOT NULL DEFAULT (unixepoch()),
+        updated_at         INTEGER NOT NULL DEFAULT (unixepoch()),
+        last_access_at     INTEGER NOT NULL DEFAULT (unixepoch()),
+        expires_at         INTEGER NOT NULL,
+        UNIQUE (user_id, request_id)
+    ) STRICT;
+    CREATE INDEX offline_packages_queue
+        ON offline_packages(node_id, state, created_at);
+    CREATE INDEX offline_packages_recipe
+        ON offline_packages(node_id, recipe_hash, state);
+    CREATE INDEX offline_packages_user_state
+        ON offline_packages(user_id, state, updated_at);
+
+    CREATE TABLE offline_package_leases (
+        token_hash      TEXT PRIMARY KEY,
+        package_id      TEXT NOT NULL UNIQUE
+                        REFERENCES offline_packages(id) ON DELETE CASCADE,
+        created_at      INTEGER NOT NULL DEFAULT (unixepoch()),
+        last_access_at  INTEGER NOT NULL DEFAULT (unixepoch()),
+        expires_at      INTEGER NOT NULL
+    ) STRICT;
+    CREATE INDEX offline_package_leases_expiry
+        ON offline_package_leases(expires_at);",
 ];
 
 /// Column list matching [`item_from_row`]. Prefix with a table alias via
@@ -1009,7 +1071,7 @@ mod tests {
             .expect("version");
         assert_eq!(version, MIGRATIONS.len() as i64);
         assert_eq!(
-            version, 13,
+            version, 14,
             "a new migration must be a deliberate bump, not a surprise — \
              the list is append-only and every entry is one somebody shipped"
         );
@@ -1159,7 +1221,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .expect("version");
-        assert_eq!(version, 13, "v13 must have applied");
+        assert_eq!(version, MIGRATIONS.len() as i64, "all migrations applied");
 
         // The new column defaults, and the neighbouring JSON list is untouched.
         let (genres, tags): (String, String) = conn
@@ -1241,6 +1303,38 @@ mod tests {
                 r.show_title
             );
         }
+    }
+
+    #[tokio::test]
+    async fn v14_offline_packages_do_not_cascade_with_rescanned_files() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        let conn = store.conn.lock().expect("connection");
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("version");
+        assert_eq!(version, 14);
+
+        let file_foreign_keys: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_list('offline_packages') \
+                 WHERE \"table\" = 'files'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("foreign keys");
+        assert_eq!(
+            file_foreign_keys, 0,
+            "a rescan must not cascade-delete package state"
+        );
+        let package_id_unique: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_index_list('offline_package_leases') \
+                 WHERE \"unique\" = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("lease indexes");
+        assert!(package_id_unique > 0, "one stable lease per package");
     }
 
     #[tokio::test]

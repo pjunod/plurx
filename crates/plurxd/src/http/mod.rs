@@ -17,6 +17,7 @@ mod images;
 mod items;
 mod keys;
 mod libraries;
+mod offline;
 mod pgs_overlay;
 mod photos;
 mod plex;
@@ -29,7 +30,7 @@ mod watch;
 mod web;
 
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{Request, StatusCode, Uri};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post, put};
 use axum::Router;
@@ -114,6 +115,26 @@ pub fn router(state: AppState) -> Router {
         // Playback
         .route("/files/{id}/decision", get(stream::decision))
         .route("/files/{id}/audio-offset", put(stream::set_audio_offset))
+        // App-managed offline viewing. JSON/package ownership uses bearer
+        // auth; only immutable child media uses the package-scoped capability.
+        .route("/files/{id}/offline-options", get(offline::options))
+        .route("/files/{id}/offline-packages", post(offline::create))
+        .route(
+            "/offline/packages/{id}",
+            get(offline::package_status).delete(offline::delete_package),
+        )
+        .route("/offline/packages/{id}/lease", put(offline::put_lease))
+        .route(
+            "/offline/packages/{id}/complete",
+            post(offline::delete_package),
+        )
+        .route("/offline/media/{token}/master.m3u8", get(offline::master))
+        .route("/offline/media/{token}/index.m3u8", get(offline::playlist))
+        .route(
+            "/offline/media/{token}/subs/{index}/{segment}",
+            get(offline::subtitle),
+        )
+        .route("/offline/media/{token}/{segment}", get(offline::segment))
         .route("/files/{id}/direct", get(stream::direct))
         .route("/files/{id}/stream.mp4", get(stream::stream_mp4))
         .route(
@@ -198,8 +219,40 @@ pub fn router(state: AppState) -> Router {
         .nest("/api/v1", api)
         .merge(plex_routes)
         .fallback(web::fallback)
-        .layer(tower_http::trace::TraceLayer::new_for_http())
+        // Never put capability credentials or query-string tokens in a span.
+        // HLS session ids and offline media tokens are bearer credentials even
+        // though they live in the path; query strings can also contain Plex
+        // tokens. The access log only needs the redacted route-shaped target.
+        .layer(
+            tower_http::trace::TraceLayer::new_for_http().make_span_with(|request: &Request<_>| {
+                tracing::info_span!(
+                    "http_request",
+                    method = %request.method(),
+                    target = %safe_trace_target(request.uri()),
+                    version = ?request.version(),
+                )
+            }),
+        )
         .with_state(state)
+}
+
+fn safe_trace_target(uri: &Uri) -> String {
+    let mut segments = uri.path().split('/').collect::<Vec<_>>();
+    for marker in ["media", "hls"] {
+        if let Some(index) = segments.iter().position(|segment| *segment == marker) {
+            let is_capability_route = match marker {
+                "media" => index >= 2 && segments.get(index.wrapping_sub(1)) == Some(&"offline"),
+                "hls" => true,
+                _ => false,
+            };
+            if is_capability_route && index + 1 < segments.len() {
+                segments[index + 1] = "[REDACTED]";
+            }
+        }
+    }
+    // Intentionally omit the entire query rather than trying to enumerate
+    // every present and future spelling of an access token.
+    segments.join("/")
 }
 
 /// Root path: Plex clients get the capabilities container; browsers get the app.
@@ -246,6 +299,30 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+
+    #[test]
+    fn trace_targets_omit_queries_and_redact_capability_paths() {
+        let ordinary: Uri = "/api/v1/search?q=secret&X-Plex-Token=credential"
+            .parse()
+            .expect("uri");
+        assert_eq!(safe_trace_target(&ordinary), "/api/v1/search");
+
+        let offline: Uri = "/api/v1/offline/media/abcdef/master.m3u8?token=other"
+            .parse()
+            .expect("uri");
+        assert_eq!(
+            safe_trace_target(&offline),
+            "/api/v1/offline/media/[REDACTED]/master.m3u8"
+        );
+
+        let hls: Uri = "/api/v1/hls/session-secret/seg00001.ts"
+            .parse()
+            .expect("uri");
+        assert_eq!(
+            safe_trace_target(&hls),
+            "/api/v1/hls/[REDACTED]/seg00001.ts"
+        );
+    }
 
     fn test_dirs(base: &std::path::Path) -> crate::state::Dirs {
         crate::state::Dirs {
@@ -2493,6 +2570,155 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn offline_package_api_is_idempotent_owned_and_stable_before_production() {
+        use plurx_core::domain::{
+            AudioStream, ItemKind, LibraryKind, NewItem, NewLibrary, ProbeResult, SubtitleStream,
+        };
+
+        let (app, state) = test_state();
+        let admin = setup_admin(&app).await;
+        let source_dir = tempfile::tempdir().expect("source");
+        let source = source_dir.path().join("movie.mkv");
+        std::fs::write(&source, b"offline fixture").expect("source bytes");
+        let library = state
+            .store
+            .create_library(&NewLibrary {
+                name: "Offline".into(),
+                kind: LibraryKind::Movies,
+                paths: vec![source_dir.path().to_path_buf()],
+                anime: false,
+            })
+            .await
+            .expect("library");
+        let movie = state
+            .store
+            .insert_item(&NewItem {
+                library_id: library.id,
+                kind: ItemKind::Movie,
+                parent_id: None,
+                title: "Flight".into(),
+                year: None,
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("movie");
+        let file_id = state
+            .store
+            .upsert_file(
+                movie,
+                &source.to_string_lossy(),
+                15,
+                7,
+                &ProbeResult {
+                    duration_ms: Some(90_000),
+                    container: Some("mkv".into()),
+                    video_codec: Some("hevc".into()),
+                    width: Some(1920),
+                    height: Some(1080),
+                    audio_streams: vec![AudioStream {
+                        index: 0,
+                        codec: "truehd".into(),
+                        language: Some("eng".into()),
+                        default: true,
+                        ..Default::default()
+                    }],
+                    subtitle_streams: vec![
+                        SubtitleStream {
+                            index: 0,
+                            codec: "hdmv_pgs_subtitle".into(),
+                            language: Some("eng".into()),
+                            forced: true,
+                            ..Default::default()
+                        },
+                        SubtitleStream {
+                            index: 1,
+                            codec: "subrip".into(),
+                            language: Some("eng".into()),
+                            ..Default::default()
+                        },
+                    ],
+                    raw_json: Some("{}".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("file");
+
+        let (status_code, options) = call(
+            &app,
+            get(
+                &format!("/api/v1/files/{file_id}/offline-options"),
+                Some(&admin),
+            ),
+        )
+        .await;
+        assert_eq!(status_code, StatusCode::OK, "{options}");
+        assert_eq!(options["recommended_subtitle_index"], Value::Null);
+        assert_eq!(options["subtitles"][0]["offline_mode"], "unavailable");
+        assert_eq!(options["subtitles"][1]["offline_mode"], "native");
+
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let create = || {
+            post(
+                &format!("/api/v1/files/{file_id}/offline-packages"),
+                Some(&admin),
+                json!({
+                    "request_id": request_id.clone(),
+                    "height": 720,
+                    "audio_index": 0,
+                    "subtitle_index": 1
+                }),
+            )
+        };
+        let (status_code, first) = call(&app, create()).await;
+        assert_eq!(status_code, StatusCode::ACCEPTED, "{first}");
+        assert_eq!(first["state"], "queued");
+        let package_id = first["id"].as_str().expect("package id").to_owned();
+
+        let (status_code, retry) = call(&app, create()).await;
+        assert_eq!(status_code, StatusCode::ACCEPTED, "{retry}");
+        assert_eq!(retry["id"], package_id);
+
+        let (status_code, conflict) = call(
+            &app,
+            post(
+                &format!("/api/v1/files/{file_id}/offline-packages"),
+                Some(&admin),
+                json!({
+                    "request_id": request_id.clone(),
+                    "height": 480,
+                    "audio_index": 0,
+                    "subtitle_index": 1
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status_code, StatusCode::CONFLICT, "{conflict}");
+        assert_eq!(conflict["code"], "request_conflict");
+
+        let (status_code, _) = call(
+            &app,
+            get(&format!("/api/v1/offline/packages/{package_id}"), None),
+        )
+        .await;
+        assert_eq!(status_code, StatusCode::UNAUTHORIZED);
+
+        let token = "a".repeat(64);
+        let (status_code, lease) = call(
+            &app,
+            put(
+                &format!("/api/v1/offline/packages/{package_id}/lease"),
+                Some(&admin),
+                json!({ "token": token }),
+            ),
+        )
+        .await;
+        assert_eq!(status_code, StatusCode::CONFLICT, "{lease}");
+        assert_eq!(lease["code"], "package_not_ready");
+    }
+
+    #[tokio::test]
     async fn pgs_overlay_contract_is_authenticated_typed_and_immutable() {
         use plurx_core::domain::{
             ItemKind, LibraryKind, NewItem, NewLibrary, ProbeResult, SubtitleStream,
@@ -3988,6 +4214,10 @@ mod tests {
         // settings endpoint, off unless asked for.
         let (_, before) = call(&app, get("/api/v1/settings", Some(&admin))).await;
         assert_eq!(before["scan_on_startup"], false);
+        assert_eq!(before["offline_enabled"], true);
+        assert_eq!(before["offline_max_gb"], 25);
+        assert_eq!(before["offline_max_gb_per_user"], 15);
+        assert_eq!(before["offline_max_rows_per_user"], 50);
         // The artwork sweep is the one job that reads back as on before
         // anybody has touched it. A 0 here would mean a fresh install never
         // repairs a poster it failed to download.
@@ -3998,13 +4228,19 @@ mod tests {
                 "/api/v1/settings",
                 Some(&admin),
                 json!({ "scan_on_startup": true, "probe_retry_mins": 1440,
-                        "artwork_retry_mins": 0 }),
+                        "artwork_retry_mins": 0, "offline_enabled": false,
+                        "offline_max_gb": 40, "offline_max_gb_per_user": 20,
+                        "offline_max_rows_per_user": 75 }),
             ),
         )
         .await;
         assert_eq!(st, StatusCode::OK);
         assert_eq!(after["scan_on_startup"], true);
         assert_eq!(after["probe_retry_mins"], 1440);
+        assert_eq!(after["offline_enabled"], false);
+        assert_eq!(after["offline_max_gb"], 40);
+        assert_eq!(after["offline_max_gb_per_user"], 20);
+        assert_eq!(after["offline_max_rows_per_user"], 75);
         assert_eq!(
             after["artwork_retry_mins"], 0,
             "an explicit 0 must survive the default, or the job cannot be turned off"

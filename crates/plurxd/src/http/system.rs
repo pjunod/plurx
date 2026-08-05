@@ -626,6 +626,12 @@ pub struct SettingsDto {
     /// What the cache currently holds on this node, in bytes — the number that
     /// makes the budget above mean something.
     pub cache_used_bytes: i64,
+    /// App-managed offline preparation has a separate reservation budget from
+    /// the opportunistic playback cache above.
+    pub offline_enabled: bool,
+    pub offline_max_gb: i64,
+    pub offline_max_gb_per_user: i64,
+    pub offline_max_rows_per_user: i64,
     /// Scan every library once, ~30s after the server starts.
     pub scan_on_startup: bool,
     /// Is the one-off genre backfill armed? It disarms itself when it reaches
@@ -746,6 +752,38 @@ async fn settings_dto(state: &AppState) -> Result<SettingsDto, ApiError> {
         Some((_, node)) => state.store.cache_bytes(node).await.unwrap_or(0),
         None => 0,
     };
+    let offline_enabled = !matches!(
+        state
+            .store
+            .get_setting(keys::OFFLINE_ENABLED)
+            .await?
+            .as_deref(),
+        Some("0" | "false" | "off" | "no")
+    );
+    let offline_integer = |value: Option<String>, default: i64| {
+        value
+            .and_then(|value| value.trim().parse::<i64>().ok())
+            .unwrap_or(default)
+            .max(0)
+    };
+    let offline_max_gb = offline_integer(
+        state.store.get_setting(keys::OFFLINE_MAX_GB).await?,
+        super::offline::DEFAULT_GLOBAL_GB,
+    );
+    let offline_max_gb_per_user = offline_integer(
+        state
+            .store
+            .get_setting(keys::OFFLINE_MAX_GB_PER_USER)
+            .await?,
+        super::offline::DEFAULT_USER_GB,
+    );
+    let offline_max_rows_per_user = offline_integer(
+        state
+            .store
+            .get_setting(keys::OFFLINE_MAX_ROWS_PER_USER)
+            .await?,
+        super::offline::DEFAULT_USER_ROWS,
+    );
     let scan_on_startup = state
         .store
         .get_setting(keys::JOB_SCAN_ON_STARTUP)
@@ -788,6 +826,10 @@ async fn settings_dto(state: &AppState) -> Result<SettingsDto, ApiError> {
         cache_produce_mins,
         cache_max_gb,
         cache_used_bytes,
+        offline_enabled,
+        offline_max_gb,
+        offline_max_gb_per_user,
+        offline_max_rows_per_user,
         scan_on_startup,
         genre_backfill,
         genre_backfill_last: state.jobs.last_genre_backfill().await,
@@ -835,6 +877,10 @@ pub struct UpdateSettings {
     pub transcode_cleanup_mins: Option<i64>,
     pub cache_produce_mins: Option<i64>,
     pub cache_max_gb: Option<i64>,
+    pub offline_enabled: Option<bool>,
+    pub offline_max_gb: Option<i64>,
+    pub offline_max_gb_per_user: Option<i64>,
+    pub offline_max_rows_per_user: Option<i64>,
     pub scan_on_startup: Option<bool>,
     /// Arm or disarm the one-off genre backfill.
     pub genre_backfill: Option<bool>,
@@ -1016,6 +1062,43 @@ pub async fn update_settings(
             .store
             .put_setting(keys::CACHE_MAX_GB, &gb.to_string())
             .await?;
+    }
+    for (key, label, value) in [
+        (keys::OFFLINE_MAX_GB, "offline_max_gb", req.offline_max_gb),
+        (
+            keys::OFFLINE_MAX_GB_PER_USER,
+            "offline_max_gb_per_user",
+            req.offline_max_gb_per_user,
+        ),
+    ] {
+        if let Some(gb) = value {
+            if !(0..=10_240).contains(&gb) {
+                return Err(ApiError::BadRequest(format!(
+                    "{label} must be between 0 (off) and 10240"
+                )));
+            }
+            state.store.put_setting(key, &gb.to_string()).await?;
+        }
+    }
+    if let Some(rows) = req.offline_max_rows_per_user {
+        if !(0..=10_000).contains(&rows) {
+            return Err(ApiError::BadRequest(
+                "offline_max_rows_per_user must be between 0 (off) and 10000".into(),
+            ));
+        }
+        state
+            .store
+            .put_setting(keys::OFFLINE_MAX_ROWS_PER_USER, &rows.to_string())
+            .await?;
+    }
+    if let Some(on) = req.offline_enabled {
+        state
+            .store
+            .put_setting(keys::OFFLINE_ENABLED, if on { "1" } else { "0" })
+            .await?;
+        if !on {
+            state.offline.cancel_all().await;
+        }
     }
     if let Some(on) = req.scan_on_startup {
         state

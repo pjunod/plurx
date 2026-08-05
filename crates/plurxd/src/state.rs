@@ -18,6 +18,7 @@ use serde::Serialize;
 use tokio::sync::Mutex;
 
 use crate::logbuf::LogBuffer;
+use crate::offline::OfflineManager;
 use crate::schedule::{due_jobs, DueJob, GlobalSchedule};
 use crate::trakt::TraktManager;
 use crate::transcode::TranscodeManager;
@@ -82,7 +83,12 @@ pub struct Dirs {
 pub struct AppState {
     pub store: Arc<dyn Store>,
     pub server_name: String,
+    /// Stable identity of the node that owns local transcode/offline bytes.
+    pub node_id: String,
     pub artwork_dir: PathBuf,
+    /// Finished content-addressed transcodes. Offline routes never join a
+    /// request-controlled path directly to this root.
+    pub cache_dir: PathBuf,
     /// Where extracted subtitles are kept, keyed by file identity and source
     /// fingerprint — see `http::stream::subtitles_vtt`.
     pub subs_dir: PathBuf,
@@ -92,6 +98,7 @@ pub struct AppState {
     pub pgs_overlay_enabled: bool,
     pub jobs: Arc<JobManager>,
     pub transcode: Arc<TranscodeManager>,
+    pub offline: Arc<OfflineManager>,
     pub trakt: Arc<TraktManager>,
     pub system: Arc<SystemInfo>,
     pub logs: Arc<LogBuffer>,
@@ -154,9 +161,9 @@ impl AppState {
             )
             .with_dv_strippable(system.dovi_rpu)
             .with_cache(
-                cache_dir,
+                cache_dir.clone(),
                 system.ffmpeg_version.clone().unwrap_or_default(),
-                node_id,
+                node_id.clone(),
             ),
         );
         // PLURX_TRAKT_BASE overrides the API base for tests/mocks.
@@ -165,10 +172,14 @@ impl AppState {
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| plurx_core::trakt::DEFAULT_BASE.to_owned());
         let trakt = Arc::new(TraktManager::new(Arc::clone(&store), trakt_base));
+        let offline =
+            OfflineManager::new(Arc::clone(&store), Arc::clone(&transcode), node_id.clone());
         AppState {
             store,
             server_name,
+            node_id,
             artwork_dir,
+            cache_dir,
             subs_dir,
             pgs_overlay_enabled: std::env::var("PLURX_PGS_OVERLAY").is_ok_and(|value| {
                 matches!(
@@ -178,6 +189,7 @@ impl AppState {
             }),
             jobs,
             transcode,
+            offline,
             trakt,
             system: Arc::new(system),
             logs,

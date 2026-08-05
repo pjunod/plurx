@@ -20,6 +20,7 @@ struct SettingsStore {
         static let instanceId = "plurx.instanceId"
         static let token = "plurx.token"
         static let username = "plurx.username"
+        static let userId = "plurx.userId"
         static let audioLang = "plurx.audioLang"
         static let subLang = "plurx.subLang"
         static let autoplay = "plurx.autoplay"
@@ -28,6 +29,8 @@ struct SettingsStore {
         static let appearance = "plurx.appearance"
         static let libraryGrouping = "plurx.libraryGrouping"
         static let posterSize = "plurx.posterSize"
+        static let offlineQuality = "plurx.offlineQuality"
+        static let offlineNetwork = "plurx.offlineNetwork"
     }
 
     /// Read-only on purpose. Every write goes through `setServer`, which is
@@ -65,6 +68,16 @@ struct SettingsStore {
     var username: String? {
         get { defaults.string(forKey: Key.username) }
         nonmutating set { defaults.set(newValue, forKey: Key.username) }
+    }
+    var userId: Int? {
+        get {
+            guard defaults.object(forKey: Key.userId) != nil else { return nil }
+            return defaults.integer(forKey: Key.userId)
+        }
+        nonmutating set {
+            if let newValue { defaults.set(newValue, forKey: Key.userId) }
+            else { defaults.removeObject(forKey: Key.userId) }
+        }
     }
     var audioLang: String {
         get { defaults.string(forKey: Key.audioLang) ?? "eng" }
@@ -116,6 +129,20 @@ struct SettingsStore {
         get { PosterSize(rawValue: defaults.string(forKey: Key.posterSize) ?? "") ?? .medium }
         nonmutating set { defaults.set(newValue.rawValue, forKey: Key.posterSize) }
     }
+    var offlineQuality: OfflineQuality {
+        get {
+            OfflineQuality(rawValue: defaults.string(forKey: Key.offlineQuality) ?? "")
+                ?? .standard
+        }
+        nonmutating set { defaults.set(newValue.rawValue, forKey: Key.offlineQuality) }
+    }
+    var offlineNetwork: OfflineNetworkPolicy {
+        get {
+            OfflineNetworkPolicy(rawValue: defaults.string(forKey: Key.offlineNetwork) ?? "")
+                ?? .wifiOnly
+        }
+        nonmutating set { defaults.set(newValue.rawValue, forKey: Key.offlineNetwork) }
+    }
 
     /// Drop the token (sign out) but keep the origin so login stays pre-filled.
     func clearToken() {
@@ -144,6 +171,7 @@ struct SettingsStore {
         }
         guard let token else {
             clearToken()
+            userId = nil
             return
         }
         self.token = token
@@ -153,5 +181,7 @@ struct SettingsStore {
     /// identity, and bearer go together.
     func clearServer() {
         setServer(origin: "", instanceId: nil, token: nil)
+        username = nil
+        userId = nil
     }
 }

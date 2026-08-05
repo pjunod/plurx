@@ -1,5 +1,9 @@
 package tv.plurx.app.ui
 
+import android.Manifest
+import android.os.Build
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -29,6 +33,7 @@ import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Download
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -41,6 +46,7 @@ import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -75,6 +81,7 @@ import tv.plurx.app.ui.theme.Bg
 import tv.plurx.app.ui.theme.Muted
 import tv.plurx.app.ui.theme.Outline
 import tv.plurx.app.ui.theme.SurfaceHi
+import tv.plurx.app.data.offline.OfflineDownloads
 
 private data class DetailLoad(
     val detail: ItemDetail? = null,
@@ -442,8 +449,17 @@ private fun Actions(
     onWatchedChanged: () -> Unit,
 ) {
     val scope = rememberCoroutineScope()
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val offlineRecords by vm.offlineRecords.collectAsStateWithLifecycle()
+    val notificationPermission = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { /* denial is benign; Android still exposes foreground work */ }
     var changingWatch by remember { mutableStateOf(false) }
     val playable = files.firstOrNull { it.available }
+    val offline = playable?.let { file -> offlineRecords.firstOrNull {
+        it.serverInstanceId == vm.serverInstanceId && it.userId == vm.currentUserId &&
+            it.fileId == file.id
+    } }
     LazyRow(
         Modifier.padding(top = 16.dp),
         contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp),
@@ -487,6 +503,36 @@ private fun Actions(
                     TvOutlinedButton(onClick = { onPlay(item.id, playable.id, 0L) }) {
                         Icon(Icons.Filled.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
                         Text("  Start over")
+                    }
+                }
+            }
+            if (OfflineDownloads.canUse(context)) {
+                item {
+                    TvOutlinedButton(
+                        enabled = offline?.isPlayable != true,
+                        onClick = {
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+                            }
+                            when {
+                                offline == null || offline.state in setOf("failed", "missing") -> {
+                                    vm.queueOffline(item, playable)
+                                }
+                                offline.state == "paused" -> vm.resumeOffline(offline)
+                                else -> vm.removeOffline(offline)
+                            }
+                        },
+                    ) {
+                        Icon(Icons.Filled.Download, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Text(
+                            when {
+                                offline == null -> "  Download"
+                                offline.isPlayable -> "  Downloaded"
+                                offline.state == "paused" -> "  Resume download"
+                                offline.state in setOf("failed", "missing") -> "  Download again"
+                                else -> "  Cancel download"
+                            },
+                        )
                     }
                 }
             }

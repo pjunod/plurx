@@ -488,4 +488,5 @@ struct CreateSessionRequest: Codable {
 struct ProgressRequest: Codable {
     let positionMs: Int
     var durationMs: Int?
+    var recordedAt: Int? = nil
 }

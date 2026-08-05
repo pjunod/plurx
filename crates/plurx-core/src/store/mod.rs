@@ -22,7 +22,8 @@ use async_trait::async_trait;
 
 use crate::domain::{
     CachedTranscode, InProgressItem, Item, ItemEdit, ItemKind, ItemPage, ItemSort, Library,
-    MediaFile, MediaShape, MetadataPatch, NewItem, NewLibrary, ProbeResult, RecentItem, TraktAuth,
+    MediaFile, MediaShape, MetadataPatch, NewItem, NewLibrary, NewOfflinePackage,
+    OfflineCreateOutcome, OfflineLeaseOutcome, OfflinePackage, ProbeResult, RecentItem, TraktAuth,
     User, WatchRollup, WatchState,
 };
 // RecentItem is reused for next-up (episode + show title).
@@ -172,6 +173,17 @@ pub mod keys {
     /// made the trade backwards. Eviction is LRU, so what survives is what
     /// people actually come back to.
     pub const CACHE_MAX_GB: &str = "cache.max_gb";
+    /// Master kill switch for app-managed offline packages. Missing means on;
+    /// an operator can stop new admission without invalidating local copies.
+    pub const OFFLINE_ENABLED: &str = "offline.enabled";
+    /// Global and per-user reservations for pinned offline artifacts. These
+    /// are separate from the playback cache so a flight queue cannot evict
+    /// the bytes an active viewer is reading.
+    pub const OFFLINE_MAX_GB: &str = "offline.max_gb";
+    pub const OFFLINE_MAX_GB_PER_USER: &str = "offline.max_gb_per_user";
+    /// Registry hygiene, not the primary quota (bytes are). Includes failed
+    /// rows until their bounded diagnostic retention sweep removes them.
+    pub const OFFLINE_MAX_ROWS_PER_USER: &str = "offline.max_rows_per_user";
     /// How often the producer looks for something worth pre-transcoding, in
     /// minutes; "0" is off, and off is the default like every other job — an
     /// upgraded server must not start encoding overnight on its own.
@@ -514,6 +526,24 @@ pub trait WatchStore: Send + Sync + 'static {
         item_id: i64,
         position_ms: i64,
         duration_ms: Option<i64>,
+    ) -> Result<WatchState, StoreError> {
+        self.put_progress_at(user_id, item_id, position_ms, duration_ms, None)
+            .await
+    }
+    /// Record playback progress with an optional client observation time.
+    ///
+    /// `recorded_at` is used by offline clients replaying their durable final
+    /// state after reconnecting. A write older than the stored watch state is
+    /// ignored, which prevents a late phone sync from rewinding playback that
+    /// already continued on another device. Omitting it uses server time and
+    /// preserves the ordinary online-heartbeat behavior.
+    async fn put_progress_at(
+        &self,
+        user_id: i64,
+        item_id: i64,
+        position_ms: i64,
+        duration_ms: Option<i64>,
+        recorded_at: Option<i64>,
     ) -> Result<WatchState, StoreError>;
     /// Flip one item's flag and nothing else. Callers acting on something a
     /// person clicked want [`WatchStore::set_watched_tree`] instead — this is
@@ -742,9 +772,97 @@ pub trait TranscodeCacheStore: Send + Sync + 'static {
     /// a cluster the other nodes' rows keep it alive.
     async fn forget_cache_entry(&self, recipe_hash: &str, node_id: &str) -> Result<(), StoreError>;
 
-    /// Total bytes of complete local entries — what the budget is measured
-    /// against.
+    /// Complete local bytes charged to the ordinary playback-cache budget.
+    /// Offline-pinned recipes have their own admission budget and are excluded
+    /// so a flight queue cannot evict the playback cache to make room.
     async fn cache_bytes(&self, node_id: &str) -> Result<i64, StoreError>;
+}
+
+/// Durable app-managed offline packages and their one renewable capability.
+#[async_trait]
+pub trait OfflinePackageStore: Send + Sync + 'static {
+    /// Idempotency lookup, normalized-choice comparison, quota checks, and the
+    /// insert happen under one transaction. Splitting them admits a tap-loop
+    /// race even though SQLite access is mutexed per individual store call.
+    async fn create_offline_package(
+        &self,
+        package: &NewOfflinePackage,
+        max_rows_per_user: i64,
+        max_bytes_per_user: i64,
+        max_bytes_global: i64,
+    ) -> Result<OfflineCreateOutcome, StoreError>;
+
+    async fn offline_package_for_user(
+        &self,
+        package_id: &str,
+        user_id: i64,
+    ) -> Result<Option<OfflinePackage>, StoreError>;
+
+    /// Authenticated status polling renews package interest and the same lease
+    /// URL in place; it never rotates a platform downloader's cache identity.
+    async fn renew_offline_package_for_user(
+        &self,
+        package_id: &str,
+        user_id: i64,
+        expires_at: i64,
+    ) -> Result<Option<OfflinePackage>, StoreError>;
+
+    async fn reset_interrupted_offline_packages(&self, node_id: &str) -> Result<u64, StoreError>;
+
+    async fn claim_next_offline_package(
+        &self,
+        node_id: &str,
+    ) -> Result<Option<OfflinePackage>, StoreError>;
+
+    async fn requeue_offline_package(&self, package_id: &str) -> Result<bool, StoreError>;
+
+    async fn update_offline_progress(
+        &self,
+        package_id: &str,
+        phase: &str,
+        progress_millis: i64,
+    ) -> Result<bool, StoreError>;
+
+    async fn fail_offline_package(
+        &self,
+        package_id: &str,
+        phase: &str,
+        code: &str,
+        message: &str,
+    ) -> Result<bool, StoreError>;
+
+    async fn put_offline_lease(
+        &self,
+        package_id: &str,
+        user_id: i64,
+        token_hash: &str,
+        expires_at: i64,
+    ) -> Result<OfflineLeaseOutcome, StoreError>;
+
+    /// A media read both authorizes and renews the stable URL. `None` covers
+    /// wrong, revoked, expired, not-ready, and missing packages deliberately.
+    async fn offline_package_for_lease(
+        &self,
+        token_hash: &str,
+        now: i64,
+        renewed_expires_at: i64,
+    ) -> Result<Option<OfflinePackage>, StoreError>;
+
+    async fn mark_offline_package_ready(
+        &self,
+        package_id: &str,
+        recipe_hash: &str,
+        actual_bytes: i64,
+        duration_ms: i64,
+    ) -> Result<bool, StoreError>;
+
+    async fn delete_offline_package(
+        &self,
+        package_id: &str,
+        user_id: i64,
+    ) -> Result<bool, StoreError>;
+
+    async fn expire_offline_packages(&self, now: i64) -> Result<u64, StoreError>;
 }
 
 /// The full storage boundary — what plurxd holds as `Arc<dyn Store>`.
@@ -758,6 +876,7 @@ pub trait Store:
     + TraktStore
     + WatchedOutboxStore
     + TranscodeCacheStore
+    + OfflinePackageStore
     + Send
     + Sync
     + 'static
@@ -774,6 +893,7 @@ impl<T> Store for T where
         + TraktStore
         + WatchedOutboxStore
         + TranscodeCacheStore
+        + OfflinePackageStore
         + Send
         + Sync
         + 'static

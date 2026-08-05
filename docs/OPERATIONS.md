@@ -365,6 +365,32 @@ the configured pace in the stats overlay rather than as an unexplained stutter.
 Larger read sizes (`rsize=1048576` on NFS, SMB3 multichannel where the NAS
 offers it) help the burst land quickly.
 
+### Offline package storage and quotas
+
+Phone downloads are prepared under `<data_dir>/cache` beside finished
+content-addressed transcodes. Ready and in-progress offline recipes are pinned:
+ordinary playback-cache cleanup cannot evict them, and their bytes do not
+consume `cache_max_gb`. Give the data directory enough local space for both
+budgets; unlike session scratch, this cache must survive a daemon restart and
+must not live on tmpfs.
+
+The authenticated settings API exposes four operator controls:
+
+| Field | Default | Meaning |
+|---|---:|---|
+| `offline_enabled` | `true` | Kill switch. Turning it off cancels active producers at a segment boundary and leaves their durable rows queued. |
+| `offline_max_gb` | `25` | Server-wide reservation ceiling for offline packages. `0` disables the byte ceiling. |
+| `offline_max_gb_per_user` | `15` | Per-user reservation ceiling. `0` disables the byte ceiling. |
+| `offline_max_rows_per_user` | `50` | Per-user package count. `0` disables the row ceiling. |
+
+Creation reserves a conservative peak before ffmpeg starts, so a full queue is
+rejected early instead of filling the cache halfway through a title. Completed
+packages and their leases expire after seven inactive days; active media reads
+renew the same lease. Deleting a download from a signed-in profile removes the
+server package best-effort and always removes local device bytes. Look for
+`offline package ready`, `offline preparation failed`, and
+`offline expiry sweep failed` in Settings → Logs when diagnosing preparation.
+
 ## Pairing another application (monarr) — the runbook
 
 Another application can ask plurx to index exactly the folder it just wrote,

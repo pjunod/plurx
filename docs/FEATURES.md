@@ -265,6 +265,18 @@ and delivers it. Full decision logic is [ARCHITECTURE.md](ARCHITECTURE.md) §3.
   it shows why instead.
 - **AirPlay** from Safari/iOS (native HLS path so an Apple TV can fetch segments
   itself).
+- **One-tap offline viewing on iPhone, iPad, and Android phones/tablets.** Tap
+  Download on a movie or episode and the app owns the rest: the server prepares
+  a portable SDR H.264/AAC HLS package at the selected 720p or 1080p quality,
+  the platform background downloader transfers it into private app storage,
+  and Downloads plays only those local bytes with no server connection. The
+  user never chooses, opens, or manages a media file. A durable queue survives
+  server restarts, app termination, and network changes; Wi-Fi-only is the
+  default; progress recorded offline syncs after reconnect. Text subtitles can
+  travel as WebVTT; bitmap or styled subtitles that cannot survive the portable
+  package fall back to Off instead of silently changing the video. Downloads
+  remain separated by server and user profile. tvOS and Android/Google TV do
+  not expose the action in this release.
 
 **How to read it:** open the player **Stats** overlay (the ⓘ button, or press
 `i`). *Method: Direct play* is ideal. *Remux* is cheap. *Transcode · QuickSync*

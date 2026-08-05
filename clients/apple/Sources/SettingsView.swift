@@ -35,6 +35,10 @@ enum AppBuildInfo {
 
 struct SettingsView: View {
     @EnvironmentObject var model: AppModel
+    #if os(iOS)
+    @State private var confirmingSignOut = false
+    @State private var profileHasDownloads = false
+    #endif
 
     private var audioBinding: Binding<String> {
         Binding(get: { model.audioLang },
@@ -63,6 +67,31 @@ struct SettingsView: View {
             } footer: {
                 Text("Track preferences apply when a title has more than one. Autoplay continues episodic series and can also be toggled in the player.")
             }
+
+            #if os(iOS)
+            Section {
+                Picker("Download quality", selection: Binding(
+                    get: { model.offlineQuality },
+                    set: { model.setOfflineQuality($0) }
+                )) {
+                    ForEach(OfflineQuality.allCases) { quality in
+                        Text(quality.label).tag(quality)
+                    }
+                }
+                Picker("Download over", selection: Binding(
+                    get: { model.offlineNetwork },
+                    set: { model.setOfflineNetwork($0) }
+                )) {
+                    ForEach(OfflineNetworkPolicy.allCases) { policy in
+                        Text(policy.label).tag(policy)
+                    }
+                }
+            } header: {
+                Text("Downloads")
+            } footer: {
+                Text("Standard uses up to 720p and less storage. High uses up to 1080p. A network change applies to the next download.")
+            }
+            #endif
 
             Section {
                 Picker("Subtitle switching", selection: Binding(
@@ -121,7 +150,21 @@ struct SettingsView: View {
             Section("Account") {
                 LabeledContent("Signed in as", value: model.username ?? "—")
                 LabeledContent("Server", value: model.serverName ?? model.origin)
-                Button("Sign out", role: .destructive) { model.logout() }
+                Button("Sign out", role: .destructive) {
+                    #if os(iOS)
+                    Task {
+                        profileHasDownloads = await OfflineDownloadManager.shared
+                            .hasCurrentProfileDownloads()
+                        if profileHasDownloads {
+                            confirmingSignOut = true
+                        } else {
+                            model.logout()
+                        }
+                    }
+                    #else
+                    model.logout()
+                    #endif
+                }
                 Button("Change server") { model.changeServer() }
             }
 
@@ -135,6 +178,22 @@ struct SettingsView: View {
         #if os(iOS)
         .scrollContentBackground(.hidden)
         .navigationBarTitleDisplayMode(.inline)
+        .confirmationDialog(
+            "Keep this profile's downloads?",
+            isPresented: $confirmingSignOut,
+            titleVisibility: .visible
+        ) {
+            Button("Keep downloads and sign out") { model.logout() }
+            Button("Remove downloads and sign out", role: .destructive) {
+                Task {
+                    await OfflineDownloadManager.shared.removeCurrentProfile()
+                    model.logout()
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Kept downloads stay on this device and reappear when this Cinema profile signs in again.")
+        }
         #endif
     }
 }

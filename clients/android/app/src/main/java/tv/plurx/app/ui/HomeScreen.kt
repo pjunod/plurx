@@ -22,6 +22,7 @@ import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Download
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -73,6 +74,7 @@ fun HomeScreen(
     onOpenItem: (Long) -> Unit,
     onOpenCollection: (title: String, libraries: List<Library>) -> Unit,
     onSearch: () -> Unit,
+    onOpenDownloads: () -> Unit,
     onOpenSettings: () -> Unit,
 ) {
     val state by vm.home.collectAsStateWithLifecycle()
@@ -89,6 +91,7 @@ fun HomeScreen(
             side = side,
             onRefresh = vm::loadHome,
             onSearch = onSearch,
+            onOpenDownloads = onOpenDownloads,
             onOpenSettings = onOpenSettings,
         )
 
@@ -387,6 +390,7 @@ internal fun HomeTopBar(
     side: Dp,
     onRefresh: () -> Unit,
     onSearch: () -> Unit,
+    onOpenDownloads: () -> Unit = {},
     onOpenSettings: () -> Unit,
     safeInsets: WindowInsets = safeDisplayInsets(),
 ) {
@@ -416,6 +420,11 @@ internal fun HomeTopBar(
         }
         TvIconButton(onClick = onSearch) {
             Icon(Icons.Filled.Search, contentDescription = "Search", tint = Muted)
+        }
+        if (formFactor != FormFactor.Television) {
+            TvIconButton(onClick = onOpenDownloads) {
+                Icon(Icons.Filled.Download, contentDescription = "Downloads", tint = Muted)
+            }
         }
         TvIconButton(onClick = onOpenSettings) {
             Icon(Icons.Filled.Settings, contentDescription = "Settings", tint = Muted)

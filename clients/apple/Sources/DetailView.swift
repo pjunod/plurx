@@ -557,6 +557,7 @@ struct DetailView: View {
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     #if os(iOS)
     @Environment(\.dismiss) private var dismiss
+    @ObservedObject private var downloads = OfflineDownloadManager.shared
     #endif
     let itemId: Int
     @State private var detail: ItemDetail?
@@ -564,6 +565,9 @@ struct DetailView: View {
     @State private var loadError: String?
     @State private var watchBusy = false
     @State private var actionError: String?
+    #if os(iOS)
+    @State private var downloadBusy = false
+    #endif
     #if os(tvOS)
     @State private var seriesPlayback: PlayContext?
     @FocusState private var tvFocusedAction: TVDetailFocus?
@@ -1517,6 +1521,9 @@ struct DetailView: View {
                         startOverButton(item: item, file: file, durationMs: durationMs)
                     }
                 }
+                if let file, item.isPlayable {
+                    mobileDownloadButton(detail: detail, file: file, compact: false)
+                }
                 watchButton(detail)
             }
             .frame(maxWidth: hasPlayback ? .infinity : 220, alignment: .leading)
@@ -1534,6 +1541,10 @@ struct DetailView: View {
 
                 if let file, item.isPlayable, canResume {
                     mobileStartOverButton(item: item, file: file, durationMs: durationMs)
+                }
+
+                if let file, item.isPlayable {
+                    mobileDownloadButton(detail: detail, file: file, compact: true)
                 }
 
                 mobileWatchButton(detail)
@@ -1564,6 +1575,90 @@ struct DetailView: View {
         }
         .buttonStyle(IOSDetailIconActionButtonStyle(selected: false))
         .accessibilityLabel("Start over")
+    }
+
+    @ViewBuilder
+    private func mobileDownloadButton(
+        detail: ItemDetail,
+        file: MediaFile,
+        compact: Bool
+    ) -> some View {
+        let existing = downloads.items.first { $0.fileId == file.id }
+        let active = existing.map { item in
+            ![OfflineState.failed, .missing].contains(item.state)
+        } ?? false
+        let button = Button {
+            guard !downloadBusy else { return }
+            if let existing, existing.state == .paused {
+                Task { await downloads.resume(existing) }
+                return
+            }
+            if let existing,
+               [.intent, .queued, .preparing, .readyToTransfer, .downloading]
+               .contains(existing.state) {
+                Task { await downloads.remove(existing) }
+                return
+            }
+            guard existing?.isPlayable != true else { return }
+            downloadBusy = true
+            actionError = nil
+            Task {
+                do {
+                    try await downloads.queue(
+                        itemId: detail.item.id,
+                        fileId: file.id,
+                        title: detail.item.title,
+                        context: playbackSubtitle(detail.item),
+                        durationMs: file.durationMs ?? detail.item.runtimeMs,
+                        posterPath: detail.item.poster
+                    )
+                } catch {
+                    actionError = error.localizedDescription
+                }
+                downloadBusy = false
+            }
+        } label: {
+            if compact {
+                Image(systemName: downloadSymbol(existing))
+            } else {
+                Label(downloadLabel(existing), systemImage: downloadSymbol(existing))
+                    .lineLimit(1)
+            }
+        }
+        if compact {
+            button
+                .buttonStyle(IOSDetailIconActionButtonStyle(selected: active))
+                .disabled(downloadBusy || existing?.isPlayable == true)
+                .accessibilityLabel(downloadLabel(existing))
+        } else {
+            button
+                .buttonStyle(IOSDetailLabeledActionButtonStyle(selected: active))
+                .disabled(downloadBusy || existing?.isPlayable == true)
+                .accessibilityLabel(downloadLabel(existing))
+        }
+    }
+
+    private func downloadLabel(_ item: OfflineItem?) -> String {
+        guard let item else { return "Download" }
+        switch item.state {
+        case .intent, .queued: return "Queued — tap to cancel"
+        case .preparing: return "Preparing — tap to cancel"
+        case .readyToTransfer, .downloading: return "Downloading — tap to cancel"
+        case .downloaded: return "Downloaded"
+        case .paused: return "Resume download"
+        case .failed, .missing: return "Download again"
+        }
+    }
+
+    private func downloadSymbol(_ item: OfflineItem?) -> String {
+        guard let item else { return "arrow.down.circle" }
+        switch item.state {
+        case .downloaded: return "checkmark.circle.fill"
+        case .intent, .queued, .preparing: return "clock"
+        case .readyToTransfer, .downloading: return "arrow.down.circle.fill"
+        case .paused: return "play.circle"
+        case .failed, .missing: return "arrow.clockwise.circle"
+        }
     }
 
     private func mobileWatchButton(_ detail: ItemDetail) -> some View {

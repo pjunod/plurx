@@ -6,6 +6,7 @@ import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.core.booleanPreferencesKey
+import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
@@ -26,6 +27,7 @@ class SettingsStore(private val context: Context) {
         val instanceId: String? = null,
         val token: String? = null,
         val username: String? = null,
+        val userId: Long? = null,
         val audioLang: String = "eng",
         val subLang: String = "eng",
         val preferences: ViewerPreferences = ViewerPreferences(),
@@ -36,6 +38,7 @@ class SettingsStore(private val context: Context) {
         val INSTANCE_ID = stringPreferencesKey("instance_id")
         val TOKEN = stringPreferencesKey("token")
         val USERNAME = stringPreferencesKey("username")
+        val USER_ID = longPreferencesKey("user_id")
         val AUDIO_LANG = stringPreferencesKey("audio_lang")
         val SUB_LANG = stringPreferencesKey("sub_lang")
         val THEME = stringPreferencesKey("theme")
@@ -45,6 +48,8 @@ class SettingsStore(private val context: Context) {
         val PLAYBACK_QUALITY = stringPreferencesKey("playback_quality")
         val AUTO_SKIP = booleanPreferencesKey("auto_skip")
         val AUTOPLAY_NEXT = booleanPreferencesKey("autoplay_next")
+        val OFFLINE_QUALITY = stringPreferencesKey("offline_quality")
+        val OFFLINE_NETWORK = stringPreferencesKey("offline_network")
     }
 
     val flow: Flow<Saved> = context.dataStore.data.map { p ->
@@ -53,6 +58,7 @@ class SettingsStore(private val context: Context) {
             instanceId = p[Keys.INSTANCE_ID],
             token = p[Keys.TOKEN],
             username = p[Keys.USERNAME],
+            userId = p[Keys.USER_ID],
             audioLang = p[Keys.AUDIO_LANG] ?: "eng",
             subLang = p[Keys.SUB_LANG] ?: "eng",
             preferences = ViewerPreferences(
@@ -63,6 +69,8 @@ class SettingsStore(private val context: Context) {
                 playbackQuality = PlaybackQuality.fromStorage(p[Keys.PLAYBACK_QUALITY]),
                 autoSkip = p[Keys.AUTO_SKIP] ?: false,
                 autoplayNext = p[Keys.AUTOPLAY_NEXT] ?: true,
+                offlineQuality = OfflineQuality.fromStorage(p[Keys.OFFLINE_QUALITY]),
+                offlineNetwork = OfflineNetwork.fromStorage(p[Keys.OFFLINE_NETWORK]),
             ),
         )
     }
@@ -77,6 +85,7 @@ class SettingsStore(private val context: Context) {
      */
     suspend fun saveOrigin(origin: String, instanceId: String?) {
         context.dataStore.edit { p ->
+            val sameOrigin = p[Keys.ORIGIN] == origin
             val kept = credentialsForNewOrigin(
                 stored = StoredCredentials(p[Keys.ORIGIN], p[Keys.TOKEN], p[Keys.USERNAME]),
                 origin = origin,
@@ -85,6 +94,7 @@ class SettingsStore(private val context: Context) {
             if (instanceId == null) p.remove(Keys.INSTANCE_ID) else p[Keys.INSTANCE_ID] = instanceId
             kept.token?.let { p[Keys.TOKEN] = it } ?: p.remove(Keys.TOKEN)
             kept.username?.let { p[Keys.USERNAME] = it } ?: p.remove(Keys.USERNAME)
+            if (!sameOrigin) p.remove(Keys.USER_ID)
         }
     }
 
@@ -107,14 +117,16 @@ class SettingsStore(private val context: Context) {
             p.remove(Keys.INSTANCE_ID)
             p.remove(Keys.TOKEN)
             p.remove(Keys.USERNAME)
+            p.remove(Keys.USER_ID)
         }
     }
 
-    suspend fun saveSession(origin: String, token: String, username: String) {
+    suspend fun saveSession(origin: String, token: String, username: String, userId: Long) {
         context.dataStore.edit { p ->
             p[Keys.ORIGIN] = origin
             p[Keys.TOKEN] = token
             p[Keys.USERNAME] = username
+            p[Keys.USER_ID] = userId
         }
     }
 
@@ -139,6 +151,8 @@ class SettingsStore(private val context: Context) {
             p[Keys.PLAYBACK_QUALITY] = value.playbackQuality.storageValue
             p[Keys.AUTO_SKIP] = value.autoSkip
             p[Keys.AUTOPLAY_NEXT] = value.autoplayNext
+            p[Keys.OFFLINE_QUALITY] = value.offlineQuality.storageValue
+            p[Keys.OFFLINE_NETWORK] = value.offlineNetwork.storageValue
         }
     }
 }

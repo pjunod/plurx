@@ -12,11 +12,11 @@ anything it can't (MKV, DTS/TrueHD, …) is delivered as the server's on-the-fly
 HDR display at runtime and sends that to `/decision`, so the server transcodes
 only what this hardware genuinely can't play.
 
-> Status: **v0.2.6**, build `26` in [`project.yml`](project.yml) — working
+> Status: **v0.2.7**, build `29` in [`project.yml`](project.yml) — working
 > development client. Browse, resume, discover, and play on both iOS and
 > tvOS. Both targets compile against the iOS/tvOS 26.5 SDKs and share the
-> same regression suite. Build 26 carries the coordinated Android overlay
-> release; the Apple behavior introduced in build 25 remains unchanged. The
+> same regression suite. Build 29 adds app-managed offline viewing on iPhone
+> and iPad; the action remains hidden on tvOS. The
 > default-off `pgs-v1` bitmap-overlay client draws PGS over the existing Dolby
 > Vision, HDR, or SDR video
 > without changing its bytes or reopening playback. It is ready for the paired iPhones, iPads,
@@ -40,6 +40,15 @@ only what this hardware genuinely can't play.
 - **Home** with Continue Watching / Next Up / Recently Added and your libraries.
 - **Browse** libraries as a poster grid; open show → season → episode.
 - **Detail** pages with backdrop, overview, Resume / Start-over.
+- **App-managed offline viewing on iPhone and iPad.** Download queues are
+  durable, transfer through two stable `AVAssetDownloadURLSession` background
+  sessions for Wi-Fi-only and any-network policies, stay in app-private
+  storage, and resume after app termination. Downloads opens before server
+  reconnection, plays a validated local asset without making a playback
+  decision, and syncs the newest local progress timestamp after reconnect.
+  Another signed-in profile cannot play the saved title but can remove its
+  device storage from the Other Profiles section. tvOS exposes none of these
+  controls.
 - **On-demand player** with explicit play/pause, ±10 seconds, full-film seek,
   Skip Intro/Credits, a real runtime in iOS Now Playing instead of `LIVE`,
   audio/subtitle/quality menus, and a playback-info panel fed by the server's
@@ -331,8 +340,9 @@ RPU, the master advertises `SUPPLEMENTAL-CODECS`, and AVPlayer reaches
 
 - **Automatic** intro/credits skipping. Manual Skip buttons are present.
 - Continuous adaptive quality changes and audio-sync controls.
-- Filters/sorting, playlists, downloads/offline, and **AirPlay** polish.
-  Search and iOS **PiP** are present.
+- Playlists and **AirPlay** polish. Search, iOS **PiP**, and app-managed
+  iPhone/iPad offline downloads are present; the offline flow still needs the
+  physical-device acceptance recorded in the implementation plan.
 - **tvOS launch storyboard** — cosmetic only (a black frame at launch), not a
   blocker for upload. The layered Brand Assets themselves are committed under
   `Resources/tvOS.xcassets` and wired up via

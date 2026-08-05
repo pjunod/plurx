@@ -21,10 +21,26 @@ pub enum ApiError {
     /// not under any library root", which lists the roots so a path-mapping
     /// mistake between two applications diagnoses itself.
     Unprocessable(serde_json::Value),
+    /// Stable machine-readable errors for APIs whose clients need to choose a
+    /// recovery action. Existing endpoints keep their legacy `{error}` body
+    /// until their native-client contracts migrate deliberately.
+    Typed {
+        status: StatusCode,
+        code: &'static str,
+        message: String,
+    },
     Internal(String),
 }
 
 impl ApiError {
+    pub fn typed(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
+        Self::Typed {
+            status,
+            code,
+            message: message.into(),
+        }
+    }
+
     fn parts(&self) -> (StatusCode, String) {
         match self {
             ApiError::NotFound(what) => (StatusCode::NOT_FOUND, format!("{what} not found")),
@@ -36,6 +52,9 @@ impl ApiError {
             ApiError::ServiceUnavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg.clone()),
             // Handled in `into_response`, which needs the whole body.
             ApiError::Unprocessable(v) => (StatusCode::UNPROCESSABLE_ENTITY, v.to_string()),
+            ApiError::Typed {
+                status, message, ..
+            } => (*status, message.clone()),
             ApiError::Internal(msg) => {
                 // Detail is logged, not leaked to the client.
                 tracing::error!(error = %msg, "internal error");
@@ -52,6 +71,14 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         if let ApiError::Unprocessable(body) = self {
             return (StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response();
+        }
+        if let ApiError::Typed {
+            status,
+            code,
+            message,
+        } = self
+        {
+            return (status, Json(json!({ "code": code, "message": message }))).into_response();
         }
         let (status, message) = self.parts();
         (status, Json(json!({ "error": message }))).into_response()

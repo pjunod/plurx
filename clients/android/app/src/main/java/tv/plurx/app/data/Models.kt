@@ -378,7 +378,96 @@ data class CreateSessionReq(
 )
 
 @Serializable
-data class ProgressReq(val position_ms: Long, val duration_ms: Long? = null)
+data class ProgressReq(
+    val position_ms: Long,
+    val duration_ms: Long? = null,
+    val recorded_at: Long? = null,
+)
+
+@Serializable
+data class OfflineQualityOption(
+    val height: Int,
+    val label: String,
+    val estimated_bytes: Long,
+    val reserved_bytes: Long,
+)
+
+@Serializable
+data class OfflineAudioOption(
+    val index: Long,
+    val codec: String,
+    val channels: Int? = null,
+    val language: String? = null,
+    val title: String? = null,
+    val default: Boolean = false,
+)
+
+@Serializable
+data class OfflineSubtitleOption(
+    val index: Long,
+    val codec: String,
+    val language: String? = null,
+    val title: String? = null,
+    val default: Boolean = false,
+    val forced: Boolean = false,
+    val offline_mode: String,
+)
+
+@Serializable
+data class OfflineOptions(
+    val file_id: Long,
+    val qualities: List<OfflineQualityOption> = emptyList(),
+    val audio: List<OfflineAudioOption> = emptyList(),
+    val subtitles: List<OfflineSubtitleOption> = emptyList(),
+    val recommended_audio_index: Long? = null,
+    val recommended_subtitle_index: Long? = null,
+)
+
+@Serializable
+data class CreateOfflinePackageReq(
+    val request_id: String,
+    val height: Int,
+    val audio_index: Long? = null,
+    val subtitle_index: Long? = null,
+)
+
+@Serializable
+data class OfflinePackageOutput(
+    val height: Int,
+    val video_codec: String,
+    val audio_codec: String,
+    val dynamic_range: String,
+    val subtitle_mode: String,
+)
+
+@Serializable
+data class OfflinePackageFailure(val code: String, val message: String)
+
+@Serializable
+data class OfflinePackageStatus(
+    val id: String,
+    val state: String,
+    val phase: String,
+    val status_url: String,
+    val progress: Double? = null,
+    val bytes_ready: Long = 0,
+    val estimated_bytes: Long,
+    val actual_bytes: Long? = null,
+    val duration_ms: Long? = null,
+    val output: OfflinePackageOutput,
+    val error: OfflinePackageFailure? = null,
+)
+
+@Serializable
+data class OfflineLeaseReq(val token: String)
+
+@Serializable
+data class OfflineLease(
+    val manifest_url: String,
+    val expires_at: Long,
+    val bytes: Long,
+    val duration_ms: Long,
+)
 
 @Serializable
 data class MutationResult(val ok: Boolean = true, val updated: Int = 0)

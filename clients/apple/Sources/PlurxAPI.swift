@@ -85,6 +85,31 @@ struct PlurxAPI {
         return try await run(req)
     }
 
+    private func put<B: Encodable, T: Decodable>(_ path: String, body: B) async throws -> T {
+        var req = try jsonRequest(path, body: body)
+        req.httpMethod = "PUT"
+        Session.shared.authorize(&req)
+        return try await run(req)
+    }
+
+    private func deleteNoContent(_ path: String) async throws {
+        guard let url = makeURL(path) else { throw APIError.badURL }
+        var req = URLRequest(url: url)
+        req.httpMethod = "DELETE"
+        Session.shared.authorize(&req)
+        let (_, resp) = try await session.data(for: req)
+        try Self.check(resp)
+    }
+
+    private func postNoContent(_ path: String) async throws {
+        guard let url = makeURL(path) else { throw APIError.badURL }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        Session.shared.authorize(&req)
+        let (_, resp) = try await session.data(for: req)
+        try Self.check(resp)
+    }
+
     private func postNoContent<B: Encodable>(_ path: String, body: B) async throws {
         var req = try jsonRequest(path, body: body)
         Session.shared.authorize(&req)
@@ -257,10 +282,66 @@ struct PlurxAPI {
         _ = try? await session.data(for: req)
     }
 
-    func progress(itemId: Int, positionMs: Int, durationMs: Int?) async throws {
+    func offlineOptions(
+        fileId: Int,
+        audioLanguage: String,
+        subtitleLanguage: String,
+        subtitleMode: String = "auto"
+    ) async throws -> OfflineOptions {
+        try await get("files/\(fileId)/offline-options", query: [
+            URLQueryItem(name: "audio_lang", value: audioLanguage),
+            URLQueryItem(name: "subtitle_lang", value: subtitleLanguage),
+            URLQueryItem(name: "subtitle_mode", value: subtitleMode),
+        ])
+    }
+
+    func createOfflinePackage(
+        fileId: Int,
+        body: CreateOfflinePackageRequest
+    ) async throws -> OfflinePackageStatus {
+        try await post("files/\(fileId)/offline-packages", body: body)
+    }
+
+    func offlinePackage(_ packageId: String) async throws -> OfflinePackageStatus {
+        try await get("offline/packages/\(packageId)")
+    }
+
+    func putOfflineLease(
+        packageId: String,
+        token: String
+    ) async throws -> OfflineLeaseResponse {
+        try await put(
+            "offline/packages/\(packageId)/lease",
+            body: OfflineLeaseRequest(token: token)
+        )
+    }
+
+    func deleteOfflinePackage(_ packageId: String) async throws {
+        try await deleteNoContent("offline/packages/\(packageId)")
+    }
+
+    func completeOfflinePackage(_ packageId: String) async throws {
+        try await postNoContent("offline/packages/\(packageId)/complete")
+    }
+
+    func absoluteOfflineManifest(_ path: String) -> URL? {
+        guard let base = URL(string: origin) else { return nil }
+        return URL(string: path, relativeTo: base)?.absoluteURL
+    }
+
+    func progress(
+        itemId: Int,
+        positionMs: Int,
+        durationMs: Int?,
+        recordedAt: Int? = nil
+    ) async throws {
         try await postNoContent(
             "items/\(itemId)/progress",
-            body: ProgressRequest(positionMs: positionMs, durationMs: durationMs)
+            body: ProgressRequest(
+                positionMs: positionMs,
+                durationMs: durationMs,
+                recordedAt: recordedAt
+            )
         )
     }
 }

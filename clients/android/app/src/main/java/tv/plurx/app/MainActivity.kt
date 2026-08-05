@@ -21,9 +21,11 @@ import androidx.navigation.navArgument
 import kotlinx.coroutines.launch
 import tv.plurx.app.data.Caps
 import tv.plurx.app.player.PlayerScreen
+import tv.plurx.app.player.OfflinePlayerScreen
 import tv.plurx.app.ui.AppViewModel
 import tv.plurx.app.ui.ConnectScreen
 import tv.plurx.app.ui.DetailScreen
+import tv.plurx.app.ui.DownloadsScreen
 import tv.plurx.app.ui.HomeScreen
 import tv.plurx.app.ui.LibraryScreen
 import tv.plurx.app.ui.LoginScreen
@@ -79,6 +81,7 @@ private fun MainNav(vm: AppViewModel) {
                     nav.navigate("library/${libraries.joinToString(",") { it.id.toString() }}/${Uri.encode(title)}")
                 },
                 onSearch = { nav.navigate("search") },
+                onOpenDownloads = { nav.navigate("downloads") },
                 onOpenSettings = { nav.navigate("settings") },
             )
         }
@@ -128,6 +131,22 @@ private fun MainNav(vm: AppViewModel) {
         }
         composable("settings") {
             SettingsScreen(vm = vm, onBack = { nav.popBackStack() })
+        }
+        composable("downloads") {
+            DownloadsScreen(
+                vm = vm,
+                onPlay = { id -> nav.navigate("offline/$id") },
+                onBack = { nav.popBackStack() },
+            )
+        }
+        composable(
+            "offline/{id}",
+            arguments = listOf(navArgument("id") { type = NavType.StringType }),
+        ) { entry ->
+            OfflinePlayerScreen(
+                downloadId = entry.arguments!!.getString("id").orEmpty(),
+                onExit = { nav.popBackStack() },
+            )
         }
         composable(
             "player/{itemId}/{fileId}/{startMs}",

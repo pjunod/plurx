@@ -1812,6 +1812,45 @@ pub struct Produced {
     pub parts: usize,
 }
 
+/// A validated, zero-origin portable package request. Native subtitles are a
+/// presentation rendition and deliberately do not alter the video recipe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OfflineSpec {
+    pub target_height: i64,
+    pub audio_index: Option<i64>,
+    pub subtitle: OfflineSubtitle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OfflineSubtitle {
+    None,
+    Native(i64),
+    Burn(i64),
+}
+
+/// Production outcomes that a durable queue can handle without inventing an
+/// encoder failure for ordinary yielding or coalescing.
+#[derive(Debug, Clone)]
+pub enum OfflineProduceOutcome {
+    Ready(Produced),
+    Cached(Produced),
+    Yielded,
+    ClaimedElsewhere,
+}
+
+/// The policy and source shared by the cache-claim and encoder stages of one
+/// portable production attempt. Keeping these together makes it much harder
+/// for a resume path to accidentally change one input between the two stages.
+#[derive(Clone, Copy)]
+struct PortableProduction<'a> {
+    file: &'a plurx_core::domain::MediaFile,
+    opts: &'a TranscodeOptions,
+    encoder: Encoder,
+    deadline: Instant,
+    yield_to_offline: bool,
+    cancelled: Option<&'a tokio_util::sync::CancellationToken>,
+}
+
 /// Everything an earlier pass already encoded, in order.
 ///
 /// Contiguity is what makes this a simple walk: a part that produced nothing is
@@ -1941,6 +1980,11 @@ pub struct TranscodeManager {
     requests: std::sync::Mutex<HashMap<String, (String, RequestState)>>,
     /// See [`ProducerTuning`]. Always the default outside tests.
     producer: ProducerTuning,
+    /// Scheduled and user-requested cache producers share one writer. A queued
+    /// offline request asks speculative work to stop at its next published
+    /// segment boundary, then takes this gate before resuming its own claim.
+    background_producer: Mutex<()>,
+    offline_waiting: AtomicBool,
     /// Whether this daemon's ffmpeg can strip a Dolby Vision configuration —
     /// probed at boot ([`crate::ffmpeg::has_dovi_rpu`]).
     ///
@@ -1997,6 +2041,8 @@ impl TranscodeManager {
             sessions: Mutex::new(HashMap::new()),
             requests: std::sync::Mutex::new(HashMap::new()),
             producer: ProducerTuning::default(),
+            background_producer: Mutex::new(()),
+            offline_waiting: AtomicBool::new(false),
             dv_strippable: false,
             cached_limits: std::sync::RwLock::new(None),
         }
@@ -2061,6 +2107,10 @@ impl TranscodeManager {
         self.cache
             .as_ref()
             .map(|c| (c.dir.as_path(), c.node_id.as_str()))
+    }
+
+    pub fn subtitle_cache_dir(&self) -> &std::path::Path {
+        &self.subtitle_cache
     }
 
     /// This node's output identity, for naming a transcode.
@@ -2151,6 +2201,30 @@ impl TranscodeManager {
         subtitle_burn: Option<plurx_core::transcode::SubtitleBurn>,
         software_threads: Option<u32>,
     ) -> TranscodeOptions {
+        self.options_for_tone_map(
+            encoder,
+            file,
+            target_height,
+            start_seconds,
+            audio_index,
+            subtitle_burn,
+            software_threads,
+            tone_map_pref(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn options_for_tone_map(
+        &self,
+        encoder: Encoder,
+        file: &plurx_core::domain::MediaFile,
+        target_height: i64,
+        start_seconds: f64,
+        audio_index: Option<i64>,
+        subtitle_burn: Option<plurx_core::transcode::SubtitleBurn>,
+        software_threads: Option<u32>,
+        tone_map: ToneMap,
+    ) -> TranscodeOptions {
         let subtitle_file = self.subtitle_file(file, subtitle_burn.as_ref());
         TranscodeOptions {
             target_height,
@@ -2158,7 +2232,7 @@ impl TranscodeManager {
             video_bitrate_kbps: bitrate_for_height(target_height),
             audio_index,
             start_seconds,
-            tone_map: tone_map_pref(),
+            tone_map,
             // The node proved a graph; this session may still not be entitled
             // to it (HLG, non-compatible Dolby Vision, a light source, an
             // encoder it cannot feed). Deciding once, here,
@@ -2370,8 +2444,18 @@ impl TranscodeManager {
         target_height: i64,
         deadline: Instant,
     ) -> Result<Option<Produced>, String> {
-        let Some(cache) = self.cache.as_ref() else {
+        if self.cache.is_none() {
             return Ok(None);
+        }
+        if self
+            .offline_waiting
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(None);
+        }
+        let _producer = match self.background_producer.try_lock() {
+            Ok(permit) => permit,
+            Err(_) => return Ok(None),
         };
         // A background artifact is the zero-offset default shared by future
         // plays. Never bake a historical, file-persisted correction into it.
@@ -2408,30 +2492,157 @@ impl TranscodeManager {
         }
         .hash();
 
-        // Already there. Not an error and not worth a log line — the candidate
-        // list is a *prediction*, and predicting something that is already true
-        // is the system working.
-        if matches!(
-            self.store.cache_hit(&hash, &cache.node_id).await,
-            Ok(Some(_))
-        ) {
-            return Ok(None);
+        Ok(
+            match self
+                .produce_normalized(
+                    PortableProduction {
+                        file,
+                        opts: &opts,
+                        encoder,
+                        deadline,
+                        yield_to_offline: true,
+                        cancelled: None,
+                    },
+                    hash,
+                )
+                .await?
+            {
+                OfflineProduceOutcome::Ready(produced) => Some(produced),
+                OfflineProduceOutcome::Cached(_)
+                | OfflineProduceOutcome::Yielded
+                | OfflineProduceOutcome::ClaimedElsewhere => None,
+            },
+        )
+    }
+
+    /// Prepare the exact mobile package requested by an authenticated user.
+    /// Unlike speculative production, this preserves the file's A/V offset,
+    /// accepts explicit tracks, and forces SDR even on a passthrough node.
+    pub async fn ensure_offline(
+        &self,
+        file: &plurx_core::domain::MediaFile,
+        spec: &OfflineSpec,
+        deadline: Instant,
+        cancelled: &tokio_util::sync::CancellationToken,
+    ) -> Result<OfflineProduceOutcome, String> {
+        if cancelled.is_cancelled() {
+            return Ok(OfflineProduceOutcome::Yielded);
         }
+        struct Waiting<'a>(&'a AtomicBool);
+        impl Drop for Waiting<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
+        self.offline_waiting
+            .store(true, std::sync::atomic::Ordering::Release);
+        let waiting = Waiting(&self.offline_waiting);
+        let _producer = self.background_producer.lock().await;
+        drop(waiting);
+        if cancelled.is_cancelled() {
+            return Ok(OfflineProduceOutcome::Yielded);
+        }
+        let encoder = self.encoder().await;
+        let subtitle_burn = match spec.subtitle {
+            OfflineSubtitle::Burn(index) => {
+                let stream = file
+                    .subtitle_streams
+                    .iter()
+                    .find(|stream| stream.index == index)
+                    .ok_or_else(|| "offline subtitle track disappeared".to_owned())?;
+                Some(plurx_core::transcode::SubtitleBurn {
+                    subtitle_index: index,
+                    bitmap: plurx_core::tracks::is_bitmap_subtitle(&stream.codec),
+                })
+            }
+            OfflineSubtitle::None | OfflineSubtitle::Native(_) => None,
+        };
+        let opts = self.options_for_tone_map(
+            encoder,
+            file,
+            spec.target_height,
+            0.0,
+            spec.audio_index,
+            subtitle_burn,
+            None,
+            ToneMap::Zscale,
+        );
+        let mut digest = self.digest().ok_or("no cache digest")?;
+        digest.encoder = encoder;
+        let hash = Recipe {
+            digest: &digest,
+            file,
+            opts: &opts,
+            audio_copied: false,
+        }
+        .hash();
+        let outcome = self
+            .produce_normalized(
+                PortableProduction {
+                    file,
+                    opts: &opts,
+                    encoder,
+                    deadline,
+                    yield_to_offline: false,
+                    cancelled: Some(cancelled),
+                },
+                hash,
+            )
+            .await?;
+        if matches!(
+            outcome,
+            OfflineProduceOutcome::Ready(_) | OfflineProduceOutcome::Cached(_)
+        ) {
+            if let OfflineSubtitle::Native(index) = spec.subtitle {
+                crate::subtitles::ensure_vtt(&self.subtitle_cache, file, index).await?;
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// Shared content-addressed production tail. Track and eligibility policy
+    /// live above this point; claiming, resume, publication, and cache identity
+    /// live here once for scheduled and requested work.
+    async fn produce_normalized(
+        &self,
+        request: PortableProduction<'_>,
+        hash: String,
+    ) -> Result<OfflineProduceOutcome, String> {
+        let PortableProduction {
+            file,
+            opts,
+            encoder: _,
+            deadline: _,
+            yield_to_offline: _,
+            cancelled: _,
+        } = request;
+        let cache = self.cache.as_ref().ok_or("no cache configured")?;
+        if let Some(cached) = self
+            .store
+            .cache_hit(&hash, &cache.node_id)
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            let playlist =
+                tokio::fs::read_to_string(cache.dir.join(&cached.relative_dir).join("index.m3u8"))
+                    .await
+                    .map_err(|error| format!("reading cached offline playlist: {error}"))?;
+            if !playlist.contains("#EXT-X-ENDLIST") {
+                return Err("complete cache row contains a non-VOD playlist".to_owned());
+            }
+            let part = crate::produce::Part::from_playlist(&playlist);
+            return Ok(OfflineProduceOutcome::Cached(Produced {
+                recipe: hash,
+                bytes: cached.bytes,
+                duration_ms: part.duration_ms(),
+                segments: part.segments.len(),
+                parts: 0,
+            }));
+        }
+
         self.ensure_text_subtitle(file, opts.subtitle_burn.as_ref())
             .await?;
         let relative = format!("{}/{hash}", &hash[..2]);
-        // The claim is both a lock and a bookmark.
-        //
-        // A claim we did not take means somebody else owns this recipe — on
-        // another node, or in another process — and standing down is the point:
-        // two producers on one film is an hour of GPU spent twice, and the
-        // loser would publish over the winner's directory.
-        //
-        // A claim we already hold on THIS node means an earlier pass ran out of
-        // time part-way through. That is not somebody else; it is us, last
-        // night. `JobManager::producing` allows one pass at a time here, so an
-        // incomplete local claim cannot belong to a producer that is currently
-        // running — it is a bookmark, and the work behind it is resumable.
         let taken = self
             .store
             .claim_cache_entry(
@@ -2442,74 +2653,61 @@ impl TranscodeManager {
                 &relative,
             )
             .await
-            .map_err(|e| e.to_string())?;
-        // Built beside the final directory so publication is a rename within
-        // one filesystem — atomic, and the only way a half-written asset cannot
-        // be observed as a whole one. Named for the recipe rather than a fresh
-        // uuid, so the next pass can find it.
+            .map_err(|error| error.to_string())?;
         let temp = crate::cachekeep::staging_dir(&cache.dir, &hash);
         if !taken {
-            let resumable = tokio::fs::metadata(&temp).await.is_ok();
-            if !resumable {
+            if tokio::fs::metadata(&temp).await.is_err() {
                 tracing::debug!(
-                    recipe = %hash, file = file.id,
+                    recipe = %hash,
+                    file = file.id,
                     "cache entry claimed elsewhere; standing down"
                 );
-                return Ok(None);
+                return Ok(OfflineProduceOutcome::ClaimedElsewhere);
             }
             tracing::info!(
-                recipe = %hash, file = file.id,
-                "resuming a pre-transcode an earlier pass left unfinished"
+                recipe = %hash,
+                file = file.id,
+                "resuming a portable transcode left unfinished"
             );
         }
 
-        let outcome = self
-            .produce_into(&temp, file, &opts, encoder, &hash, deadline)
-            .await;
-        let published = match outcome {
-            Ok(Some(assembled)) => assembled,
+        let published = match self.produce_into(&temp, &hash, &request).await {
+            Ok(Some(published)) => published,
             Ok(None) => {
-                // Nothing publishable yet. The claim and the staged parts BOTH
-                // stay, which is what makes this resumable: the next pass finds
-                // the bookmark, reads what is already encoded and carries on
-                // from that boundary rather than from zero. A two-hour 4K film
-                // on a contended box may take several passes, and discarding
-                // the work each time would mean it never finished at all.
-                //
-                // Nothing can serve it meanwhile — a claim is not a hit — and
-                // if this node dies for good, the stale-claim sweep takes the
-                // claim and its staging together a day later.
                 self.touch_claim(&hash, &cache.node_id).await;
-                return Ok(None);
+                return Ok(OfflineProduceOutcome::Yielded);
             }
-            Err(e) => {
-                // A failure is different from an interruption: whatever is
-                // staged was produced by something that then broke, and
-                // resuming from it would build on that. Start clean next time.
+            Err(error) => {
                 let _ = tokio::fs::remove_dir_all(&temp).await;
                 let _ = self.store.forget_cache_entry(&hash, &cache.node_id).await;
-                return Err(e);
+                return Err(error);
             }
         };
 
         let final_dir = cache.dir.join(&relative);
         if let Some(parent) = final_dir.parent() {
-            let _ = tokio::fs::create_dir_all(parent).await;
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|error| format!("creating {}: {error}", parent.display()))?;
         }
         tokio::fs::rename(&temp, &final_dir)
             .await
-            .map_err(|e| format!("publishing {}: {e}", final_dir.display()))?;
+            .map_err(|error| format!("publishing {}: {error}", final_dir.display()))?;
         self.store
             .complete_cache_entry(&hash, &cache.node_id, published.bytes)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|error| error.to_string())?;
         tracing::info!(
-            recipe = %hash, file = file.id, height = target_height,
-            bytes = published.bytes, duration_s = published.duration_ms / 1000,
-            segments = published.segments, parts = published.parts,
-            "pre-transcode published"
+            recipe = %hash,
+            file = file.id,
+            height = opts.target_height,
+            bytes = published.bytes,
+            duration_s = published.duration_ms / 1000,
+            segments = published.segments,
+            parts = published.parts,
+            "portable transcode published"
         );
-        Ok(Some(Produced {
+        Ok(OfflineProduceOutcome::Ready(Produced {
             recipe: hash,
             bytes: published.bytes,
             duration_ms: published.duration_ms,
@@ -2535,12 +2733,17 @@ impl TranscodeManager {
     async fn produce_into(
         &self,
         temp: &std::path::Path,
-        file: &plurx_core::domain::MediaFile,
-        opts: &TranscodeOptions,
-        encoder: Encoder,
         hash: &str,
-        deadline: Instant,
+        request: &PortableProduction<'_>,
     ) -> Result<Option<Published>, String> {
+        let PortableProduction {
+            file,
+            opts,
+            encoder,
+            deadline,
+            yield_to_offline,
+            cancelled,
+        } = *request;
         tokio::fs::create_dir_all(temp)
             .await
             .map_err(|e| format!("creating {}: {e}", temp.display()))?;
@@ -2561,6 +2764,16 @@ impl TranscodeManager {
         let mut spawned = 0usize;
 
         while spawned < PRODUCER_MAX_PARTS {
+            if cancelled.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+                return Ok(None);
+            }
+            if yield_to_offline
+                && self
+                    .offline_waiting
+                    .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Ok(None);
+            }
             if Instant::now() >= deadline {
                 tracing::debug!(recipe = %hash, "producer out of time for this run");
                 return Ok(None);
@@ -2644,7 +2857,9 @@ impl TranscodeManager {
                 &self.runtime_cache,
             )?;
 
-            let ended = self.run_part(&mut child, deadline).await;
+            let ended = self
+                .run_part(&mut child, deadline, yield_to_offline, cancelled)
+                .await;
             drop(slot); // before anything else: a viewer is probably waiting on it
             drop(sw_hold); // and the pool share with it
             let part = read_part(&part_dir).await;
@@ -2665,6 +2880,16 @@ impl TranscodeManager {
                     // that the next part must not reuse a number with.
                     if !produced {
                         let _ = tokio::fs::remove_dir_all(&part_dir).await;
+                    }
+                    if yield_to_offline
+                        && self
+                            .offline_waiting
+                            .load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        return Ok(None);
+                    }
+                    if cancelled.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+                        return Ok(None);
                     }
                     if matches!(ended, PartEnd::Deadline) {
                         // Out of budget for this pass. Nothing is published —
@@ -2694,7 +2919,13 @@ impl TranscodeManager {
     }
 
     /// Run one part to completion, or until a viewer wants the hardware.
-    async fn run_part(&self, child: &mut Child, deadline: Instant) -> PartEnd {
+    async fn run_part(
+        &self,
+        child: &mut Child,
+        deadline: Instant,
+        yield_to_offline: bool,
+        cancelled: Option<&tokio_util::sync::CancellationToken>,
+    ) -> PartEnd {
         loop {
             match child.try_wait() {
                 Ok(Some(status)) if status.success() => return PartEnd::Finished,
@@ -2707,7 +2938,16 @@ impl TranscodeManager {
             // Checkpoint and terminate. Not SIGSTOP: a stopped ffmpeg still
             // holds the hardware codec session, so the viewer this is yielding
             // to would be blocked by a process that is doing nothing.
-            if self.admissions.live_is_waiting() {
+            if self.admissions.live_is_waiting()
+                || (yield_to_offline
+                    && self
+                        .offline_waiting
+                        .load(std::sync::atomic::Ordering::Acquire))
+            {
+                let _ = child.kill().await;
+                return PartEnd::Preempted;
+            }
+            if cancelled.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
                 let _ = child.kill().await;
                 return PartEnd::Preempted;
             }

@@ -6,6 +6,7 @@ mod ffmpeg;
 mod http;
 mod logbuf;
 mod meter;
+mod offline;
 mod pgs_overlay;
 mod pipeprobe;
 mod playstart;
@@ -335,6 +336,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
     );
     // Reap idle transcode sessions in the background.
     tokio::spawn(std::sync::Arc::clone(&state.transcode).reap_loop());
+    tokio::spawn(std::sync::Arc::clone(&state.offline).run());
 
     // What the libraries' storage reads at. Deliberately after the listener
     // would come up rather than inline with the encoder and tone-map probes:

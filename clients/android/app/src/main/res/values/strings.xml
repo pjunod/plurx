@@ -1,3 +1,4 @@
 <resources>
     <string name="app_name">Noirr Cinema</string>
+    <string name="offline_download_channel">Offline downloads</string>
 </resources>

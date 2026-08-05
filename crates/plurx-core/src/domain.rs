@@ -508,6 +508,97 @@ pub struct CachedTranscode {
     pub last_used_at: i64,
 }
 
+/// A durable request for an app-managed offline HLS package.
+///
+/// This is storage-domain state, not an HTTP DTO. In particular, errors stay
+/// as stable machine codes here and the API decides how much text to expose.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OfflinePackage {
+    pub id: String,
+    pub request_id: String,
+    pub user_id: i64,
+    pub file_id: i64,
+    pub node_id: String,
+    pub source_path: String,
+    pub source_size: i64,
+    pub source_mtime: i64,
+    pub recipe_hash: Option<String>,
+    pub target_height: i64,
+    /// Exact even-sized output frame computed with the transcoder's scaler
+    /// arithmetic. Optional only for legacy/unprobed sources.
+    pub output_width: Option<i64>,
+    pub output_height: Option<i64>,
+    pub audio_index: Option<i64>,
+    pub audio_offset_ms: i64,
+    pub subtitle_index: Option<i64>,
+    pub subtitle_mode: String,
+    pub state: String,
+    pub phase: String,
+    pub progress_millis: i64,
+    pub estimated_bytes: i64,
+    pub reserved_bytes: i64,
+    pub actual_bytes: Option<i64>,
+    pub duration_ms: Option<i64>,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub last_access_at: i64,
+    pub expires_at: i64,
+}
+
+/// Validated values inserted as one transaction with idempotency and quota
+/// checks. Source identity is copied so a rescan cannot silently retarget a
+/// queued job at different bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewOfflinePackage {
+    pub id: String,
+    pub request_id: String,
+    pub user_id: i64,
+    pub file_id: i64,
+    pub node_id: String,
+    pub source_path: String,
+    pub source_size: i64,
+    pub source_mtime: i64,
+    pub target_height: i64,
+    pub output_width: Option<i64>,
+    pub output_height: Option<i64>,
+    pub audio_index: Option<i64>,
+    pub audio_offset_ms: i64,
+    pub subtitle_index: Option<i64>,
+    pub subtitle_mode: String,
+    pub estimated_bytes: i64,
+    pub reserved_bytes: i64,
+    pub expires_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OfflineCreateOutcome {
+    Created(OfflinePackage),
+    Existing(OfflinePackage),
+    RequestConflict,
+    RowLimit { limit: i64 },
+    ByteLimit { used: i64, limit: i64 },
+    GlobalByteLimit { used: i64, limit: i64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OfflineLease {
+    pub package_id: String,
+    pub token_hash: String,
+    pub created_at: i64,
+    pub last_access_at: i64,
+    pub expires_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OfflineLeaseOutcome {
+    Created(OfflineLease),
+    Renewed(OfflineLease),
+    PackageNotReady,
+    TokenConflict,
+}
+
 /// An in-progress item for the continue-watching row.
 #[derive(Debug, Clone, Serialize)]
 pub struct InProgressItem {

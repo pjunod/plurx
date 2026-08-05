@@ -325,6 +325,7 @@ coverage, not a claim that every behavior is exhaustively tested.
 | `identity.access` | Focused anonymous/viewer/admin/scoped-key boundaries | Same contract across native client suites |
 | `playback.pipeline` | Rust decision, delivery, stream, HLS, and session tests | Risk-weighted browser matrix; nightly exhaustive quality/restart and interruption recovery |
 | `watch-state.sync` | Seeded progress/watched/settings journey plus store and Trakt tests | Same journey through deeper consumers |
+| `offline.viewing` | Store/API contracts cover ownership, quotas, stable hashed leases, expiry, package media, and recovery; Swift and Kotlin suites cover client contracts | Native simulator/device transfer restoration, cache-only playback, and disconnected physical-device evidence |
 | `plex.compatibility` | Plex discovery, metadata, media, playback, and timeline tests | Browser playback when shared delivery changes |
 | `web.experience` | JavaScript syntax, theme contrast, 36-capture structural golden, keyboard/request invariants, and accessibility smoke | Risk-weighted shipped-player matrix; nightly exhaustive quality and restart cases |
 | `apple.client` | Dedicated iOS and tvOS simulator CI, sharing one XCTest source | Local/full simulator run on macOS |

@@ -16,6 +16,10 @@ pub struct ProgressRequest {
     pub position_ms: i64,
     #[serde(default)]
     pub duration_ms: Option<i64>,
+    /// Unix seconds when an offline client observed this final state. Older
+    /// states are ignored by the store instead of rewinding newer playback.
+    #[serde(default)]
+    pub recorded_at: Option<i64>,
 }
 
 /// POST /api/v1/items/:id/progress — report playback position. Crossing 95%
@@ -41,8 +45,9 @@ pub async fn progress(
         .unwrap_or(false);
     let watch = state
         .store
-        .put_progress(user.id, id, position, req.duration_ms)
+        .put_progress_at(user.id, id, position, req.duration_ms, req.recorded_at)
         .await?;
+    let applied = req.recorded_at.is_none_or(|at| at >= watch.updated_at);
     // This beat is also the heartbeat for a direct play (`crate::delivery`).
     // It is the only signal that reaches the server from a player which has
     // stopped fetching: a viewer who paused with the rest of the film already
@@ -50,19 +55,23 @@ pub async fn progress(
     // off the activity page while still sitting in front of it. In-memory and
     // synchronous — a hash lookup, not a store read — because every open
     // player in the house arrives here every few seconds.
-    state.direct_plays.touch_item(user.id, id);
+    if req.recorded_at.is_none() {
+        state.direct_plays.touch_item(user.id, id);
+    }
     // Feed the Trakt scrobbler (fire-and-forget; a beat every ~5s while the
     // player is open, and the watched flip triggers the scrobble stop).
     let pct = match watch.duration_ms.filter(|d| *d > 0) {
         Some(dur) => (watch.position_ms as f64 / dur as f64 * 100.0).clamp(0.0, 100.0),
         None => 0.0,
     };
-    state.trakt.on_progress(user.id, id, pct, watch.watched);
+    if applied {
+        state.trakt.on_progress(user.id, id, pct, watch.watched);
+    }
     // The 95% crossing is what makes this the interesting hook: it is the
     // moment somebody finished something, without them pressing anything.
     // `put_progress` only flips `watched` on the crossing, so this fires
     // once per item rather than on every 5-second beat.
-    if watch.watched && !was_watched {
+    if applied && watch.watched && !was_watched {
         state.watched.on_watched(user.id, id).await;
     }
     Ok(Json(watch.into()))

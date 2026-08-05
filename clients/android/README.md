@@ -19,8 +19,9 @@ feeding an AVR keeps lossless TrueHD instead of a 256 kb/s AAC downmix: the box
 has no TrueHD decoder, the receiver does, and the claim follows the route. It is
 recomputed on every decision, because unplugging HDMI changes the answer.
 
-> Status: **v0.2.6**, build `15` — native viewer parity across phone, foldable,
-> and TV. Build 15 adds the default-off `pgs-v1` application overlay: Android
+> Status: **v0.2.7**, build `17` — native viewer parity across phone, foldable,
+> and TV. Build 17 adds app-managed offline viewing on phones and tablets. The
+> default-off `pgs-v1` application overlay remains available: Android
 > fetches authenticated, server-decoded PNG compositions, schedules them on the
 > source timeline, and draws them above the unchanged Dolby Vision, HDR, or SDR
 > video. Picture in Picture is unavailable while the overlay is active until
@@ -85,6 +86,15 @@ recomputed on every decision, because unplugging HDMI changes the answer.
     watch state and the server-side **Trakt** scrobble.
 - **Viewer preferences** remember theme, appearance, poster size, home
   grouping, quality, audio/subtitle language, auto-skip, and autoplay-next.
+- **App-managed offline viewing on phones and tablets.** A detail-page action
+  creates a durable server preparation request, then Media3's foreground
+  `DownloadService` transfers the prepared HLS package into one process-owned,
+  non-evicting private cache. Wi-Fi-only is the default. Downloads restores
+  queued work after process death, opens before reconnection, and uses a
+  cache-only media source whose upstream is an intentional failure source, so
+  offline playback cannot silently reach the server. Progress is recorded
+  locally and the newest timestamp per title syncs after reconnect. Android TV
+  and Google TV hide the action and route.
 - **Android TV** ships a `LEANBACK_LAUNCHER` entry and TV banner; all viewer
   controls are D-pad focusable, focused cards grow and outline, and playback
   keys seek or toggle playback without stealing visible-control navigation.
@@ -308,7 +318,8 @@ server has one administrative control plane. Remaining native-client work:
   seek opens a session at the new offset, matching the web player.
 - Resolution and audio badge states — the chip mechanics are generic, but only
   dynamic range is wired to a delivered fact today.
-- Downloads/offline and Google Cast.
+- Google Cast. Phone/tablet offline downloads are implemented and awaiting the
+  physical-device acceptance recorded in the implementation plan.
 
 ## License
 
