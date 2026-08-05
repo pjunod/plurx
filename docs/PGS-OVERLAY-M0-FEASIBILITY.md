@@ -136,7 +136,12 @@ Dependency-changing pull requests now run the official RustSec
 shipped workspace and sanitizer-only fuzz lockfiles. The workflow has no
 advisory ignores and must pass before this branch merges. This moves the scan
 to the same clean Linux environment that evaluates the committed lockfiles
-instead of depending on an untracked developer-machine installation.
+instead of depending on an untracked developer-machine installation. The first
+workspace scan used advisory database revision
+`6d7aef354b4144c1ede046034adfd00246d3b0c0` (updated 2026-08-04) and found
+RUSTSEC-2026-0194 and RUSTSEC-2026-0195 in `quick-xml` 0.38.4. This branch
+upgrades the direct dependency to the patched 0.41 line; the rerun must be
+clean before merge.
 
 The dependency is young and lightly adopted. Exact pinning is therefore
 mandatory. Any upgrade requires repeating the source audit, malformed corpus,
@@ -360,8 +365,10 @@ than silently switching to SDR.
 
 ## 10. Versioning
 
-This branch adds an unshipped Rust feasibility crate and documentation. It does
-not change Apple or Android application code, so their build counters remain at
-Apple 22 and Android 11. The shared marketing/workspace version remains 0.2.2.
-The first branch that changes either shipped app must re-read `main` and advance
-that app's build counter again.
+The fuzz harness itself adds no runtime dependency to the server or either
+client and does not enable a production playback path. The first RustSec gate
+did expose two advisories in the server's existing XML dependency, so this
+branch upgrades `quick-xml` to the patched 0.41 line. That shipped-runtime
+change advances the shared marketing/workspace version to 0.2.3, Apple build
+to 23, and Android version code to 12. The first later branch that changes a
+shipped app must re-read `main` and advance that app's build counter again.
