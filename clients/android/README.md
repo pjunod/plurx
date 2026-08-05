@@ -49,7 +49,10 @@ recomputed on every decision, because unplugging HDMI changes the answer.
     offset; **transcode** via an HLS session, released with a `DELETE` when
     playback ends. A session the server reports as `vod` — the whole stream
     already cached on disk — resumes at the saved position and seeks in place
-    instead of spawning a session per scrub.
+    instead of spawning a session per scrub. HLS sessions use the server's
+    `media_origin_ms`, while progressive remuxes read
+    `X-Plurx-Media-Origin-Ms`; both fall back to the requested start when an
+    older server omits the additive origin.
   - Custom Compose controls, a scrubber, ±10s, immersive mode,
     **Skip Intro / Skip Credits** from server markers, and native/server
     **audio / subtitle** track selection, which survive a quality change.
@@ -235,7 +238,8 @@ The interesting part lives in `data/Caps.kt` and `player/`. On play, the client:
    new position. `transcode` → `POST /files/{id}/hls/sessions` (no `height`: the Auto rung
    is the server's choice), played as HLS; a seek opens a session at the new offset and the
    old one is released with a `DELETE`, as is the session on exit. Either way the true
-   timeline position is what gets scrobbled.
+   timeline position is what gets scrobbled: HLS uses `media_origin_ms`, and progressive
+   remux uses the response's `X-Plurx-Media-Origin-Ms` after each seek.
 
 This is why the Android app transcodes so rarely compared to a browser: MKV/HEVC/etc. that a
 `<video>` tag refuses, ExoPlayer just plays.
