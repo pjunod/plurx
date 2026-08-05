@@ -167,6 +167,17 @@ pub fn is_bitmap_subtitle(codec: &str) -> bool {
     )
 }
 
+/// True only for Blu-ray Presentation Graphics streams supported by the
+/// `pgs-v1` application-overlay contract. Other bitmap formats remain burn-in
+/// only; treating every bitmap codec as PGS would hand incompatible input to
+/// the bounded SUP parser.
+pub fn is_pgs_subtitle(codec: &str) -> bool {
+    matches!(
+        codec.to_lowercase().as_str(),
+        "hdmv_pgs_subtitle" | "pgssub"
+    )
+}
+
 /// True when an embedded subtitle can be converted losslessly enough to a
 /// native HLS WebVTT rendition. ASS/SSA deliberately stay out: their authored
 /// positioning, typefaces, and karaoke effects do not survive WebVTT.
@@ -408,6 +419,9 @@ mod tests {
         assert!(is_bitmap_subtitle("dvd_subtitle"));
         assert!(!is_bitmap_subtitle("subrip"));
         assert!(!is_bitmap_subtitle("ass"));
+        assert!(is_pgs_subtitle("hdmv_pgs_subtitle"));
+        assert!(is_pgs_subtitle("PGSSUB"));
+        assert!(!is_pgs_subtitle("dvd_subtitle"));
     }
 
     #[test]

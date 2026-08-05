@@ -86,6 +86,10 @@ pub struct AppState {
     /// Where extracted subtitles are kept, keyed by file identity and source
     /// fingerprint — see `http::stream::subtitles_vtt`.
     pub subs_dir: PathBuf,
+    /// Staged rollout gate for the authenticated `pgs-v1` overlay API. The
+    /// daemon only advertises the capability when the same process will serve
+    /// it. Default-off until physical-client acceptance is complete.
+    pub pgs_overlay_enabled: bool,
     pub jobs: Arc<JobManager>,
     pub transcode: Arc<TranscodeManager>,
     pub trakt: Arc<TraktManager>,
@@ -166,6 +170,12 @@ impl AppState {
             server_name,
             artwork_dir,
             subs_dir,
+            pgs_overlay_enabled: std::env::var("PLURX_PGS_OVERLAY").is_ok_and(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            }),
             jobs,
             transcode,
             trakt,

@@ -12,6 +12,7 @@ axum = { workspace = true }
 clap = { workspace = true }
 plurx-core = { path = "../plurx-core" }
 plurx-compat-plex = { path = "../plurx-compat-plex" }
+plurx-pgs = { path = "../plurx-pgs" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
@@ -30,6 +31,8 @@ reqwest = { workspace = true }
 qrcode = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+flate2 = { workspace = true }
+crc32fast = { workspace = true }
 
 [dev-dependencies]
 # `fixtures` builds plurx-core's shared media-fixture helper for the copyseg
