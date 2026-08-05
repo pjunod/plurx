@@ -19,9 +19,12 @@ feeding an AVR keeps lossless TrueHD instead of a 256 kb/s AAC downmix: the box
 has no TrueHD decoder, the receiver does, and the claim follows the route. It is
 recomputed on every decision, because unplugging HDMI changes the answer.
 
-> Status: **v0.2.2**, build `9` — native viewer parity across phone, foldable,
-> and TV. Build 9 keeps established HDR through recovery and refuses burn-only
-> subtitle selections that would replace it with SDR.
+> Status: **v0.2.6**, build `15` — native viewer parity across phone, foldable,
+> and TV. Build 15 adds the default-off `pgs-v1` application overlay: Android
+> fetches authenticated, server-decoded PNG compositions, schedules them on the
+> source timeline, and draws them above the unchanged Dolby Vision, HDR, or SDR
+> video. Picture in Picture is unavailable while the overlay is active until
+> physical-device behavior is accepted.
 > Server administration remains in the web app; the viewing, discovery, and
 > playback surfaces are native here. The capability matrix is in
 > [Android client parity](../../docs/ANDROID-CLIENT-PARITY.md).
@@ -66,10 +69,11 @@ recomputed on every decision, because unplugging HDMI changes the answer.
     the server's reason.
   - **Subtitles cost what they should.** SRT and WebVTT arrive as native HLS
     text renditions — no encoder, no lost resolution, no lost HDR — and
-    switching between two of them never restarts the stream. Only tracks with
-    no text to send (PGS, VobSub, styled ASS/SSA) burn in only on SDR, always
-    at the source's own height. While HDR is playing, the app refuses that
-    selection with a transient notice and leaves the stream untouched.
+    switching between two of them never restarts the stream. A recognized
+    `pgs-v1` track uses authenticated PNG compositions above the unchanged
+    video. VobSub, styled ASS/SSA, and unsupported PGS versions burn only on
+    SDR, always at the source's own height; while HDR is playing, the app
+    refuses those selections and leaves the stream untouched.
   - Quality is **Auto, Original, and the rungs the server advertises for this
     source**, so a 1080p file stops offering to upscale itself. Plus persistent
     A/V sync correction, auto-skip, autoplay-next, playback decision details,

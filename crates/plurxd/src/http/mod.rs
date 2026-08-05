@@ -17,6 +17,7 @@ mod images;
 mod items;
 mod keys;
 mod libraries;
+mod pgs_overlay;
 mod photos;
 mod plex;
 mod scan;
@@ -115,6 +116,14 @@ pub fn router(state: AppState) -> Router {
         .route("/files/{id}/audio-offset", put(stream::set_audio_offset))
         .route("/files/{id}/direct", get(stream::direct))
         .route("/files/{id}/stream.mp4", get(stream::stream_mp4))
+        .route(
+            "/files/{id}/subs/{index}/overlay.json",
+            get(pgs_overlay::manifest),
+        )
+        .route(
+            "/files/{id}/subs/{index}/overlay/{generation}/objects/{object}",
+            get(pgs_overlay::object),
+        )
         // How a progressive remux is doing. Session auth, not capability: the
         // id is the client's own playback id, so the check is that the asker
         // owns the stream.
@@ -2409,6 +2418,191 @@ mod tests {
             Arc::new(crate::logbuf::LogBuffer::new(64)),
         );
         (router(state.clone()), state)
+    }
+
+    fn test_state_with_pgs_overlay() -> (Router, AppState) {
+        let store = SqliteStore::open_in_memory().expect("store");
+        let base = std::env::temp_dir().join(format!("plurx-pgs-api-{}", uuid::Uuid::new_v4()));
+        let mut state = AppState::new(
+            "test".into(),
+            Arc::new(store),
+            test_dirs(&base),
+            "test-node".into(),
+            Default::default(),
+            Default::default(),
+            Arc::new(crate::logbuf::LogBuffer::new(64)),
+        );
+        state.pgs_overlay_enabled = true;
+        (router(state.clone()), state)
+    }
+
+    #[tokio::test]
+    async fn pgs_overlay_contract_is_authenticated_typed_and_immutable() {
+        use plurx_core::domain::{
+            ItemKind, LibraryKind, NewItem, NewLibrary, ProbeResult, SubtitleStream,
+        };
+        use sha2::{Digest, Sha256};
+
+        let (app, state) = test_state_with_pgs_overlay();
+        let admin = setup_admin(&app).await;
+        let source_dir =
+            std::env::temp_dir().join(format!("plurx-pgs-source-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&source_dir).expect("source dir");
+        let source = source_dir.join("movie.mkv");
+        std::fs::write(&source, b"fixture").expect("source");
+        let library = state
+            .store
+            .create_library(&NewLibrary {
+                name: "PGS".into(),
+                kind: LibraryKind::Movies,
+                paths: vec![source_dir],
+                anime: false,
+            })
+            .await
+            .expect("library");
+        let movie = state
+            .store
+            .insert_item(&NewItem {
+                library_id: library.id,
+                kind: ItemKind::Movie,
+                parent_id: None,
+                title: "Overlay".into(),
+                year: None,
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("movie");
+        let probe = ProbeResult {
+            duration_ms: Some(10_000),
+            container: Some("mkv".into()),
+            video_codec: Some("hevc".into()),
+            subtitle_streams: vec![
+                SubtitleStream {
+                    index: 0,
+                    codec: "hdmv_pgs_subtitle".into(),
+                    ..Default::default()
+                },
+                SubtitleStream {
+                    index: 1,
+                    codec: "subrip".into(),
+                    ..Default::default()
+                },
+                SubtitleStream {
+                    index: 2,
+                    codec: "pgssub".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let file_id = state
+            .store
+            .upsert_file(movie, &source.to_string_lossy(), 7, 1, &probe)
+            .await
+            .expect("file");
+        let file = state
+            .store
+            .get_file(file_id)
+            .await
+            .expect("read file")
+            .expect("file exists");
+
+        let generation = crate::pgs_overlay::generation(&file, 0);
+        let generation_dir = crate::pgs_overlay::generation_dir(&state.subs_dir, &file, 0);
+        let objects_dir = generation_dir.join("objects");
+        std::fs::create_dir_all(&objects_dir).expect("objects");
+        let png = b"content-addressed-png-fixture";
+        let object_hash = hex::encode(Sha256::digest(png));
+        std::fs::write(objects_dir.join(format!("{object_hash}.png")), png).expect("object");
+        let seeded_manifest = json!({
+            "schema": 1,
+            "generation": generation,
+            "file_id": file_id,
+            "track_index": 0,
+            "kind": "pgs",
+            "timebase": "source_ms",
+            "duration_ms": 10000,
+            "cues": []
+        });
+        std::fs::write(
+            generation_dir.join("manifest.json"),
+            serde_json::to_vec_pretty(&seeded_manifest).expect("manifest json"),
+        )
+        .expect("manifest");
+
+        let manifest_uri = format!("/api/v1/files/{file_id}/subs/0/overlay.json");
+        assert_eq!(
+            status_of(&app, get(&manifest_uri, None)).await,
+            StatusCode::UNAUTHORIZED
+        );
+        let response = app
+            .clone()
+            .oneshot(get(&manifest_uri, Some(&admin)))
+            .await
+            .expect("manifest response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["cache-control"], "private, no-cache");
+        assert!(response.headers().get("etag").is_some());
+
+        let object_uri = format!(
+            "/api/v1/files/{file_id}/subs/0/overlay/{generation}/objects/{object_hash}.png"
+        );
+        assert_eq!(
+            status_of(&app, get(&object_uri, None)).await,
+            StatusCode::UNAUTHORIZED
+        );
+        let response = app
+            .clone()
+            .oneshot(get(&object_uri, Some(&admin)))
+            .await
+            .expect("object response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "image/png");
+        assert_eq!(
+            response.headers()["cache-control"],
+            "private, max-age=31536000, immutable"
+        );
+        assert_eq!(response.headers()["etag"], format!("\"{object_hash}\""));
+
+        assert_eq!(
+            status_of(
+                &app,
+                get(
+                    &format!(
+                        "/api/v1/files/{file_id}/subs/0/overlay/wrong/objects/{object_hash}.png"
+                    ),
+                    Some(&admin),
+                ),
+            )
+            .await,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            status_of(
+                &app,
+                get(
+                    &format!("/api/v1/files/{file_id}/subs/1/overlay.json"),
+                    Some(&admin),
+                ),
+            )
+            .await,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
+
+        // A second PGS track has no cache. Preparation is detached and the
+        // request returns promptly instead of blocking video startup.
+        let (status, body) = call(
+            &app,
+            get(
+                &format!("/api/v1/files/{file_id}/subs/2/overlay.json"),
+                Some(&admin),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(body["state"], "preparing");
+        assert_eq!(body["retry_after_ms"], 1000);
     }
 
     struct Seed {

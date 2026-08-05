@@ -14,6 +14,8 @@ pub enum ApiError {
     Unauthorized,
     Forbidden,
     Conflict(String),
+    UnsupportedMedia(String),
+    ServiceUnavailable(String),
     /// A 422 whose body carries more than a sentence — the caller needs the
     /// data to fix the request, not just to read about it. Used for "path is
     /// not under any library root", which lists the roots so a path-mapping
@@ -30,6 +32,8 @@ impl ApiError {
             ApiError::Unauthorized => (StatusCode::UNAUTHORIZED, "authentication required".into()),
             ApiError::Forbidden => (StatusCode::FORBIDDEN, "admin privileges required".into()),
             ApiError::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
+            ApiError::UnsupportedMedia(msg) => (StatusCode::UNSUPPORTED_MEDIA_TYPE, msg.clone()),
+            ApiError::ServiceUnavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg.clone()),
             // Handled in `into_response`, which needs the whole body.
             ApiError::Unprocessable(v) => (StatusCode::UNPROCESSABLE_ENTITY, v.to_string()),
             ApiError::Internal(msg) => {

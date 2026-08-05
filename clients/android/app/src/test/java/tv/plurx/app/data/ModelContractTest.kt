@@ -247,6 +247,24 @@ class ModelContractTest {
     }
 
     @Test
+    fun pgsTrackCarriesOnlyTheRecognizedOverlayCapability() {
+        val decision = json.decodeFromString<Decision>(
+            """{
+              "file_id": 47, "method": "direct_play", "play_url": "/direct",
+              "subtitles": [
+                {"index": 3, "codec": "hdmv_pgs_subtitle", "text": false,
+                 "native": false, "overlay": "pgs-v1"},
+                {"index": 4, "codec": "hdmv_pgs_subtitle", "text": false,
+                 "native": false, "overlay": "pgs-v2"}
+              ]
+            }""".trimIndent(),
+        )
+        assertTrue(decision.subtitles[0].isPgsOverlay)
+        assertFalse(decision.subtitles[1].isPgsOverlay)
+        assertEquals("pgs-v2", decision.subtitles[1].overlay)
+    }
+
+    @Test
     fun aServerWithoutNativeStillDecodesAndFallsBackToTheCodec() {
         // The field is new. An older server omits it, the track still decodes,
         // and `native` stays null so the client's codec table decides.

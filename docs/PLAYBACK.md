@@ -87,6 +87,7 @@ one.
 | `server.segmented-remux` | Progressive vs segmented remux hint | Only remuxes are eligible. Prefer segments at source bitrate ≥40 Mb/s or storage headroom <8×; missing measurements preserve the old route. The browser must still prove MSE accepts the codecs. | Boundary units in `playback/mod.rs` |
 | `server.track-selection` | Initial audio/subtitle | Explicit viewer choice wins later. Cold start uses one shared language policy: original-language anime, configured languages, subtitle Auto/Always/Off, then container defaults. | Track-policy Rust matrix |
 | `server.subtitle-classification` | Sidecar vs rendition vs burn | Bitmap has no text route. SRT/SubRip/WebVTT may become native HLS renditions. Other text, including ASS and `mov_text`, can be extracted but not advertised as a native rendition, so session selection burns it. | Classifier Rust unit |
+| `server.pgs-overlay` | PGS capability and artifact delivery | Only a PGS track receives additive `overlay: "pgs-v1"`, and only while the default-off gate is enabled. Authenticated cold manifests return preparation without blocking playback; warm manifests and content-addressed PNGs are published atomically. This does not choose or change video transport. | Auth/type/cache HTTP contract plus parser/cache Rust units |
 | `server.session-kind` | Copy HLS vs transcode HLS | `SessionKind::Copy` preserves video and optionally converts audio/strips DV; `Transcode` runs the video recipe. A matching completed cache entry bypasses the encoder but does not change the logical kind. | Transcode-manager lifecycle unit |
 | `server.live-playlist-window` | Writer history vs client window | A live writer keeps its full EVENT history internally. After retention deletes a prefix, the served playlist omits those URIs, advances `MEDIA-SEQUENCE`, and becomes a sliding media playlist. Completed cached VOD stays whole. | Rust retention/serving integration |
 | `server.auto-rung` | Auto output height | Software follows the source up to 720p; proven hardware follows it up to 1080p. Both clamp to the source and never upscale. An explicit rung is snapped to the published ladder. | Encoder-aware async Rust unit |
@@ -113,15 +114,17 @@ one.
 | `apple.established-hdr-recovery` | Interruption after HDR rendered | Once the item has advanced for ≥5 s, a stall or item failure reconnects the same HDR delivery once. An immediate repeat stops visibly instead of falling through to the SDR compatibility transcode. | XCTest established-delivery guard |
 | `apple.hls-buffer-window` | Growing HLS forward buffer | AVPlayer requests 60 s ahead on live copy/transcode sessions, matching the server's 60 s forward-fetch allowance inside its 120 s retention window. Direct files and completed cached HLS keep AVPlayer's default. | XCTest item-configuration guard |
 | `apple.quality-session` | Picked rung vs Auto/burn height | A picked rung forces a transcode at that height. An otherwise-copyable subtitle burn preserves source height; an ordinary Auto transcode leaves the encoder-aware rung to the server. | XCTest source/rung/burn height matrix |
-| `apple.subtitle-route` | Media selection vs reopen | Native rendition switches stay inside AVPlayer once the session exists. Entering from direct, selecting/leaving a burn, or changing a burn reopens. Bitmap/styled tracks burn; ordinary native text does not. | XCTest route matrix |
-| `apple.hdr-subtitle-guard` | Burn-only subtitle on HDR | PGS and styled tracks are refused while the current delivery is DV, HDR10, or HLG, with a non-fatal notice. Native text still selects, and SDR playback may still burn. | XCTest subtitle/dynamic-range matrix |
+| `apple.subtitle-route` | Media selection vs reopen | Native rendition switches stay inside AVPlayer once the session exists. A recognized PGS overlay stays on the current item. Entering from direct, selecting/leaving a burn, or changing a burn reopens; other bitmap/styled tracks still burn. | XCTest route matrix |
+| `apple.hdr-subtitle-guard` | Burn-only subtitle on HDR | A recognized PGS overlay is allowed because it does not change video. Unknown overlay versions, VobSub, and styled tracks are refused while the current delivery is DV, HDR10, or HLG. Native text still selects, and SDR playback may still burn. | XCTest subtitle/dynamic-range matrix |
+| `apple.pgs-overlay` | PGS application overlay vs video mutation | Only `overlay: "pgs-v1"` selects the authenticated manifest/PNG renderer. It schedules complete compositions against the current `AVPlayerItem`, maps authored coordinates into `videoRect`, and never sends subtitle/burn session fields or reopens video. PiP and external playback are blocked while active rather than falling back to an SDR burn. | XCTest manifest, timeline, layout, item-replacement, and no-reopen policy suite |
 | `android.capability-profile` | Decoder/display/sink claims | Claim DV only when both decoder profile and display agree, never claim dual-layer P7, and claim passthrough audio when either the decoder or active sink can take it. | JVM capability matrix |
 | `android.compatibility-fallback` | Media3 startup decode recovery | Before a frame renders, failed preserving direct DV first gets a normalized remux; any remaining direct/remux failure gets one compatibility transcode; a failed transcode is terminal. | JVM fallback matrix |
 | `android.established-hdr-recovery` | Interruption after HDR rendered | Once Media3 renders a frame, a later HDR error retries the same delivery once. A repeat is terminal instead of silently becoming the SDR compatibility stream. | JVM established-delivery matrix |
 | `android.manual-quality` | Auto/Original/rung force | Auto asks for the normal verdict, Original forbids video re-encode, and every server-advertised rung requests a transcode. The menu never invents a rung above the source. | JVM force and ladder matrix |
 | `android.session-height` | Quality/burn to session height | A burn and Original preserve source height; Auto omits height; an explicit rung sends that height. A copy session omits height because copied video cannot honor a rung. | JVM height and session-body matrix |
-| `android.subtitle-route` | Embedded vs native session vs burn | Direct embedded text stays in the plan. Remux/transcode text uses a native rendition session. Bitmap and styled tracks burn in every mode; session bodies forbid copy on a transcode verdict. | JVM subtitle and session-body matrix |
-| `android.hdr-subtitle-guard` | Burn-only subtitle on HDR | PGS and styled tracks are refused while the current delivery is DV, HDR10, or HLG, with a transient notice. Native text still selects, and SDR playback may still burn. | JVM subtitle/dynamic-range matrix |
+| `android.subtitle-route` | Embedded vs native session vs overlay vs burn | Direct embedded text stays in the plan. Remux/transcode text uses a native rendition session. Recognized PGS stays on the plan video as an application overlay; unsupported bitmap and styled tracks retain burn/refusal behavior. | JVM subtitle, overlay, and session-body matrix |
+| `android.hdr-subtitle-guard` | Burn-only subtitle on HDR | Recognized `pgs-v1` is allowed because it does not mutate video. Unsupported bitmap/styled tracks are refused while the current delivery is DV, HDR10, or HLG, with a transient notice. Native text still selects, and SDR playback may still burn. | JVM subtitle/dynamic-range matrix |
+| `android.pgs-overlay` | PGS application overlay vs video mutation | Only `overlay: "pgs-v1"` selects the bounded authenticated manifest/PNG renderer. It binary-searches source-time cues, schedules exact boundaries, maps authored coordinates into the video content rectangle, and rejects stale selection/item/window work. PiP is blocked while active rather than falling back to SDR burn-in. | JVM manifest, timeline, memory, layout, and policy suite plus Compose switch/off instrumentation |
 
 <!-- playback-routing-inventory:end -->
 
@@ -228,16 +231,18 @@ it engaged — and renders one of three badge states:
 An older client never reads the field; a newer one treats an absent field as
 "unknown" and falls back to the source-only chip. Nothing breaks either way.
 
-## Subtitles — two different questions, two different flags
+## Subtitles — three independent delivery questions
 
-Every subtitle in `/decision` carries `text` and `native`, and they are not
-the same claim. A client that reads one for the other either offers a track
-the server will refuse, or hides one it would happily serve.
+Every subtitle in `/decision` carries `text` and `native` plus an optional
+`overlay` capability. They are not interchangeable claims. A client that reads
+one for another either offers a track the server will refuse, hides a route it
+can serve, or restarts/re-encodes video that could remain untouched.
 
 | Flag | The question it answers | True when | The route it unlocks |
 |---|---|---|---|
 | `text` | Is there text here at all? | the codec isn't a bitmap (`is_bitmap_subtitle`) | `GET /files/{id}/subs/{index}.vtt` — the extracted WebVTT sidecar, and a `<track>` on a direct/remux `<video>` |
 | `native` | Can this be an HLS rendition? | `is_native_text_subtitle`: `subrip \| srt \| webvtt \| vtt` | an `EXT-X-MEDIA` line in the native master, and an accepted `subtitle` index on `POST /files/{id}/hls/sessions` |
+| `overlay` | Can the server supply an application-rendered bitmap protocol? | `"pgs-v1"` only for PGS, only while the staged server producer is enabled | the authenticated manifest and immutable PNG routes below; it never changes video transport |
 
 `native` implies `text`; the reverse is false, and the gap is the whole point
 of having two flags. **`mov_text`** — the timed text every MP4 WEB-DL carries
@@ -249,8 +254,105 @@ master, and asking for one by index is a 400 (`"the selected subtitle
 requires burn-in"`) rather than a rendition that silently plays wrong.
 
 The practical rule for a client: **gate a session-mode subtitle pick on
-`native`, and offer everything else with `text` through the sidecar.** A
-bitmap track (`text: false`) has neither route and only ever burns in.
+`native`, use `text` for the sidecar, and recognize only overlay protocol
+values the client implements.** An absent or unknown `overlay` value is
+unsupported, not a preparation state. VobSub and XSUB remain burn-only.
+
+### PGS overlay server contract — staged and default-off
+
+The server side of `pgs-v1` is implemented behind `PLURX_PGS_OVERLAY=1` and is
+off by default while physical-device HDR/Dolby Vision acceptance remains
+incomplete. Apple and Android have automated application renderers, but that
+does not make the server capability production-ready. When off,
+`/decision` omits `overlay` and the
+overlay routes return 404. Enabling the gate changes subtitle delivery only;
+it does not select an overlay automatically and does not alter video bytes.
+
+The manifest route is:
+
+```http
+GET /api/v1/files/{file_id}/subs/{stream_index}/overlay.json
+Authorization: Bearer <user-token>
+```
+
+A warm generation returns `200 application/json`, `Cache-Control: private,
+no-cache`, and a generation ETag. A cold generation starts one detached,
+capacity-bounded producer and returns immediately:
+
+```json
+{
+  "state": "preparing",
+  "retry_after_ms": 1000
+}
+```
+
+That `202` response also carries `Retry-After: 1`. The client may keep video
+playing, poll while the same selection/timeline epoch remains active, and stop
+polling without cancelling server preparation.
+
+The version 1 manifest is a source-time list of complete composition snapshots:
+
+```json
+{
+  "schema": 1,
+  "generation": "opaque-source-fingerprint",
+  "file_id": 42,
+  "track_index": 3,
+  "kind": "pgs",
+  "timebase": "source_ms",
+  "duration_ms": 7200000,
+  "cues": [
+    {
+      "id": "c00000001",
+      "start_ms": 1250,
+      "end_ms": 4810,
+      "canvas_width": 1920,
+      "canvas_height": 1080,
+      "objects": [
+        {
+          "image": "overlay/opaque-source-fingerprint/objects/abc123.png",
+          "x": 430,
+          "y": 874,
+          "width": 1060,
+          "height": 120
+        }
+      ]
+    }
+  ]
+}
+```
+
+Intervals are half-open (`start_ms <= t < end_ms`), sorted, and non-overlapping.
+Every cue is the complete active composition. Authored clears become gaps, not
+empty cues. Consecutive identical compositions and duplicate PNG content are
+coalesced by the producer. Canvas coordinates remain authored PGS coordinates;
+clients map that canvas into the current video rectangle.
+
+Each `image` value is relative to the subtitle route and resolves to:
+
+```http
+GET /api/v1/files/{file_id}/subs/{stream_index}/overlay/{generation}/objects/{sha256}.png
+Authorization: Bearer <user-token>
+```
+
+Objects return `image/png`, `Cache-Control: private,
+max-age=31536000, immutable`, and a content-hash ETag. Both routes require an
+ordinary signed-in user. A generation is derived from file id, subtitle index,
+source size/mtime, extractor version, and schema version; a replaced source or
+protocol change therefore cannot serve the previous cache.
+
+The producer demuxes the selected stream to bounded raw SUP, normalizes PGS
+state into complete RGBA snapshots, content-addresses PNG objects, validates
+the finished manifest and every referenced object, then atomically renames the
+generation directory into view. Limits include a 4096×2160 canvas, 64 objects
+per composition, 250,000 display sets, 256 MiB normalized/output bytes per
+track, a 10-minute deadline, two concurrent producers, a two-minute negative
+failure memo, and a separate 2 GiB/128-generation LRU cache budget.
+
+Route failures are stable: 404 for file/track/generation/object absence, 415
+for a non-PGS codec, 422 for malformed or over-limit PGS, 409 when the source
+changes during preparation, and 503 for temporary demux/capacity/timeout
+failure. None of those failures authorizes a silent fallback to SDR burn-in.
 
 ## Web delivery — the browser's transport choice
 
@@ -298,7 +400,8 @@ make.
 | Remux, no override | Copy-video HLS; AVPlayer does not take plurx's progressive fMP4 reliably | Progressive `/stream.mp4` |
 | Transcode | HLS session | HLS session |
 | Native text subtitle needs a session | Copy HLS for a direct/remux plan; existing rendition switches stay in AVPlayer | Direct keeps an embedded text track; remux/transcode opens a native-rendition HLS session |
-| Bitmap/styled subtitle | HLS transcode with burn-in | HLS transcode with burn-in |
+| PGS with recognized `pgs-v1` capability | Authenticated application overlay synchronized to the unchanged player item; PiP/external playback unavailable while active | Authenticated PNG composition scheduled from `realPosition()` and drawn in the video content rectangle; PiP unavailable while active |
+| Other bitmap/styled subtitle | HLS transcode with burn-in on SDR; refused on HDR/DV | HLS transcode with burn-in on SDR; refused on HDR/DV |
 | Direct + manual A/V correction | Not currently exposed by the Apple player | Progressive remux, because ffmpeg must apply the correction |
 | Finished cache hit | HLS VOD; seek in place | HLS VOD; seek in place |
 
@@ -594,8 +697,9 @@ covering the other.
 - **No client-side bitrate adaptation yet.** One encode runs at a time; the
   rung is chosen at start, not adapted per segment. The design for that is
   [ADAPTIVE-QUALITY.md](ADAPTIVE-QUALITY.md).
-- **Bitmap subs (PGS/VobSub) cost a stream restart.** They can't be copied or
-  `<track>`'d — a picture has no text to send — so selecting one re-opens the
+- **Burn-only bitmap subs cost a stream restart.** VobSub and PGS without a
+  client-recognized overlay capability can't be copied or `<track>`'d — a
+  picture has no text to send — so selecting one re-opens the
   stream as a transcode with the subtitle composited into the frames, and
   turning it off restarts again — back through the decision, so the viewer
   returns to the direct play / remux (and the resolution) the burn took away.

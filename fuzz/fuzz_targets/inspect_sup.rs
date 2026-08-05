@@ -28,6 +28,7 @@ fn fuzz_limits() -> ParserLimits {
         max_cached_objects: 256,
         max_cached_pixel_bytes: 16 * 1024 * 1024,
         max_palettes: 64,
+        max_normalized_rgba_bytes: 16 * 1024 * 1024,
     }
 }
 

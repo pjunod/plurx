@@ -182,6 +182,12 @@ data class SubTrack(
      * servers that predate the field — read [isNativeHls], never this.
      */
     val native: Boolean? = null,
+    /**
+     * Versioned application-overlay contract advertised by the server. Only
+     * `pgs-v1` is understood; an absent or future value deliberately keeps the
+     * legacy burn/refusal policy.
+     */
+    val overlay: String? = null,
 ) {
     /**
      * Route on this, not on [text]. The two questions differ for exactly one
@@ -202,6 +208,9 @@ data class SubTrack(
      */
     val isNativeHls: Boolean
         get() = native ?: (text && codec.lowercase().trim() !in STYLED_SUBTITLE_CODECS)
+
+    val isPgsOverlay: Boolean
+        get() = overlay == "pgs-v1"
 
     private companion object {
         val STYLED_SUBTITLE_CODECS = setOf("ass", "ssa")

@@ -78,6 +78,13 @@ test = "crates/plurx-core/src/tracks.rs"
 test_anchor = "native_hls_text_and_burn_fallback_are_distinct"
 
 [[decisions]]
+id = "server.pgs-overlay"
+source = "crates/plurxd/src/http/pgs_overlay.rs"
+source_anchor = "pub async fn manifest("
+test = "crates/plurxd/src/http/mod.rs"
+test_anchor = "pgs_overlay_contract_is_authenticated_typed_and_immutable"
+
+[[decisions]]
 id = "server.session-kind"
 source = "crates/plurxd/src/transcode.rs"
 source_anchor = "pub async fn create_session("
@@ -169,6 +176,13 @@ test = "clients/apple/Tests/AppleClientTests.swift"
 test_anchor = "testApplePlayerFallsBackFromDolbyVisionToHDRBeforeSDR"
 
 [[decisions]]
+id = "apple.pgs-overlay"
+source = "clients/apple/Sources/PlayerController.swift"
+source_anchor = "static func subtitleUsesOverlay("
+test = "clients/apple/Tests/AppleClientTests.swift"
+test_anchor = "testPGSOverlaySelectionNeverBurnsOrReopensDirectVideo"
+
+[[decisions]]
 id = "apple.established-hdr-recovery"
 source = "clients/apple/Sources/PlayerController.swift"
 source_anchor = "static func shouldPreserveEstablishedHDRDelivery("
@@ -243,7 +257,7 @@ id = "android.subtitle-route"
 source = "clients/android/app/src/main/java/tv/plurx/app/player/SubtitlePolicy.kt"
 source_anchor = "internal fun subtitleRoute("
 test = "clients/android/app/src/test/java/tv/plurx/app/player/SubtitlePolicyTest.kt"
-test_anchor = "bitmapAndStyledTracksBurnInEveryMode"
+test_anchor = "recognizedPgsOverlayNeverBurnsOrReopensPlanVideo"
 
 [[decisions]]
 id = "android.hdr-subtitle-guard"
@@ -251,3 +265,10 @@ source = "clients/android/app/src/main/java/tv/plurx/app/player/SubtitlePolicy.k
 source_anchor = "internal fun subtitleBurnWouldDiscardHdr("
 test = "clients/android/app/src/test/java/tv/plurx/app/player/SubtitlePolicyTest.kt"
 test_anchor = "hdrSubtitleGuardKeepsTheCurrentPictureForBurnOnlyTracks"
+
+[[decisions]]
+id = "android.pgs-overlay"
+source = "clients/android/app/src/main/java/tv/plurx/app/player/AndroidPGSOverlay.kt"
+source_anchor = "internal class AndroidPGSOverlayController("
+test = "clients/android/app/src/test/java/tv/plurx/app/player/PGSOverlayTest.kt"
+test_anchor = "timelineUsesSourcePositionAndSchedulesExactBoundaries"

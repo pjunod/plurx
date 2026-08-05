@@ -12,7 +12,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use plurx_core::domain::MediaFile;
 use plurx_core::playback::{self, Decision};
-use plurx_core::tracks::{is_bitmap_subtitle, is_native_text_subtitle};
+use plurx_core::tracks::{is_bitmap_subtitle, is_native_text_subtitle, is_pgs_subtitle};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
@@ -257,7 +257,8 @@ pub struct SubTrackDto {
     /// non-bitmap codec, so it answers exactly one question: can the server
     /// extract a WebVTT sidecar for it (`GET /files/{id}/subs/{index}.vtt`,
     /// a `<track>` on a direct/remux `<video>`)? Bitmap subs (PGS/VobSub) are
-    /// pictures, have nothing to extract, and can only be burned in.
+    /// pictures and have nothing to extract. Their non-text delivery, when
+    /// available, is described independently by `overlay` below.
     ///
     /// **`text` is not permission to ask for a native HLS rendition** — see
     /// `native`. A `mov_text` or ASS/SSA track is `text: true, native: false`:
@@ -278,6 +279,11 @@ pub struct SubTrackDto {
     /// 400 use, so there is one classifier rather than a copy of the codec
     /// list in each client. Additive: older clients ignore it.
     pub native: bool,
+    /// Optional application-overlay protocol. This remains distinct from a
+    /// native HLS text rendition and is omitted unless this process can serve
+    /// the advertised PGS contract.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overlay: Option<&'static str>,
 }
 
 /// A compact description of the source file's video, for the stats overlay's
@@ -468,7 +474,7 @@ fn audio_tracks(file: &MediaFile) -> Vec<AudioTrackDto> {
         .collect()
 }
 
-fn sub_tracks(file: &MediaFile) -> Vec<SubTrackDto> {
+fn sub_tracks(file: &MediaFile, overlay_enabled: bool) -> Vec<SubTrackDto> {
     file.subtitle_streams
         .iter()
         .enumerate()
@@ -481,6 +487,8 @@ fn sub_tracks(file: &MediaFile) -> Vec<SubTrackDto> {
             forced: s.forced,
             text: !is_bitmap_subtitle(&s.codec),
             native: is_native_text_subtitle(&s.codec),
+            overlay: (overlay_enabled && is_pgs_subtitle(&s.codec))
+                .then_some(crate::pgs_overlay::PROTOCOL),
         })
         .collect()
 }
@@ -733,7 +741,7 @@ pub async fn decision(
 
     // DTO defaults and the verdict now come from the same selection above.
     let audio = audio_tracks(&file);
-    let mut subtitles = sub_tracks(&file);
+    let mut subtitles = sub_tracks(&file, state.pgs_overlay_enabled);
     for s in &mut subtitles {
         s.default = selection.subtitle_index == Some(s.index);
     }
@@ -1917,7 +1925,7 @@ mod tests {
             audio_offset_ms: 0,
             probed: true,
         };
-        let tracks = sub_tracks(&file);
+        let tracks = sub_tracks(&file, false);
 
         // SRT and WebVTT: text, and servable as a rendition.
         assert!(tracks[0].text && tracks[0].native);
@@ -1934,6 +1942,22 @@ mod tests {
 
         // Bitmap is neither, and always was.
         assert!(!tracks[3].text && !tracks[3].native);
+
+        // Default-off and old servers remain wire-compatible: the additive
+        // field is absent rather than null.
+        let disabled = serde_json::to_value(&tracks).expect("subtitle DTOs");
+        assert!(disabled
+            .as_array()
+            .expect("array")
+            .iter()
+            .all(|track| track.get("overlay").is_none()));
+
+        let enabled = sub_tracks(&file, true);
+        assert_eq!(enabled[3].overlay, Some("pgs-v1"));
+        assert!(enabled
+            .iter()
+            .enumerate()
+            .all(|(index, track)| index == 3 || track.overlay.is_none()));
 
         // And the field agrees with the classifier the master and the 400 use,
         // rather than being a second opinion about the same codecs.

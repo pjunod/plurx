@@ -1050,10 +1050,17 @@ Acceptance evidence:
 - explicit PiP/AirPlay/external-output result;
 - go/no-go recommendation for the server-image architecture.
 
-No production code should depend on an unreviewed parser before this milestone
-is accepted.
+No default-on production path should parse untrusted PGS before this milestone
+is accepted. A later milestone may land behind an explicit default-off rollout
+gate so its wire contract and cache behavior can be reviewed without enabling
+subtitle selection on a deployed client.
 
 ### Milestone 1: server contract, extractor, and cache
+
+**Implementation status (0.2.4 candidate):** complete behind the default-off
+`PLURX_PGS_OVERLAY` gate. The parser boundary, API, cache, and regression tests
+have landed on the implementation branch; physical-client acceptance remains a
+Milestone 0/2/3 release gate, so this status is not production rollout approval.
 
 Work:
 
@@ -1075,7 +1082,20 @@ Acceptance evidence:
 - cache invalidation tests;
 - API compatibility test proving old track fields are unchanged.
 
+Implementation evidence is recorded in
+[PGS-OVERLAY-M0-FEASIBILITY.md](PGS-OVERLAY-M0-FEASIBILITY.md) §8. The final
+wire schema and operational bounds are documented in
+[PLAYBACK.md](PLAYBACK.md#pgs-overlay-server-contract--staged-and-default-off).
+
 ### Milestone 2: Apple client
+
+**Implementation status (0.2.5 candidate):** automated client implementation
+complete behind the server's default-off `PLURX_PGS_OVERLAY` capability gate.
+The renderer recognizes only `pgs-v1`; missing or unknown capability values
+retain the established burn/refusal behavior. Simulator coverage passes on iOS
+and tvOS. Physical-device timing, Dolby Vision/HDR mode evidence, and output-mode
+acceptance remain release gates, so this is not approval to enable the server
+gate by default.
 
 Work:
 
@@ -1097,6 +1117,16 @@ Acceptance evidence:
 - documented PiP and AirPlay behavior.
 
 ### Milestone 3: Android client
+
+**Implementation status (0.2.6 candidate):** automated client implementation
+complete behind the server's default-off `PLURX_PGS_OVERLAY` capability gate.
+The Android renderer recognizes only `pgs-v1`, validates and bounds the
+authenticated manifest/PNG contract, schedules complete compositions against
+`Controller.realPosition()`, and draws inside the actual video content
+rectangle. JVM and Compose instrumentation coverage are in place. Android TV
+and handheld timing, Dolby Vision/HDR mode, and PiP evidence on physical
+hardware remain release gates, so this is not approval to enable the server
+gate by default.
 
 Work:
 

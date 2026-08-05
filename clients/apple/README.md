@@ -12,12 +12,14 @@ anything it can't (MKV, DTS/TrueHD, …) is delivered as the server's on-the-fly
 HDR display at runtime and sends that to `/decision`, so the server transcodes
 only what this hardware genuinely can't play.
 
-> Status: **v0.2.2**, build `19` in [`project.yml`](project.yml) — working
+> Status: **v0.2.6**, build `26` in [`project.yml`](project.yml) — working
 > development client. Browse, resume, discover, and play on both iOS and
 > tvOS. Both targets compile against the iOS/tvOS 26.5 SDKs and share the
-> same regression suite. Build 19 keeps established HDR through transport
-> recovery and refuses burn-only subtitle selections that would replace it
-> with SDR. It is ready for the paired iPhones, iPads,
+> same regression suite. Build 26 carries the coordinated Android overlay
+> release; the Apple behavior introduced in build 25 remains unchanged. The
+> default-off `pgs-v1` bitmap-overlay client draws PGS over the existing Dolby
+> Vision, HDR, or SDR video
+> without changing its bytes or reopening playback. It is ready for the paired iPhones, iPads,
 > and Bedroom Apple TV, but has not been uploaded to TestFlight.
 > It is not yet at full web parity; the exact boundary is in
 > [Feature parity](#feature-parity).
@@ -46,12 +48,12 @@ only what this hardware genuinely can't play.
   (SRT/SubRip/WebVTT) are native HLS WebVTT renditions: selecting one, or
   Off, applies inside the running player item — no restart, no new session,
   no quality change, and no video encoder — and the cues stay with the
-  picture through a resume and a seek. Bitmap and styled formats (PGS,
-  VobSub, ASS/SSA) can burn in server-side on an SDR delivery and reopen at
-  the same film position, because positioned bitmap planes and authored
-  styling do not survive conversion to plain WebVTT. While DV, HDR10, or HLG
-  is playing, the app refuses that selection with a visible notice instead of
-  silently replacing the picture with the server's SDR burn pipeline.
+  picture through a resume and a seek. When the default-off server advertises
+  `overlay: "pgs-v1"`, PGS is fetched as authenticated, positioned PNG objects
+  and rendered in a layer synchronized to the existing player item. Selection,
+  seek, switch, and Off do not restart or re-encode the video, so Dolby Vision
+  and HDR remain on the original delivery. VobSub and styled ASS/SSA remain
+  burn-only on SDR and are refused on HDR instead of silently replacing it.
 - **Connect & sign in**; the bearer token lives in the **Keychain** (so a new
   development build does not sign you out) and the session reconnects silently
   on next launch. Address and token are written together, so changing servers
@@ -70,10 +72,10 @@ only what this hardware genuinely can't play.
   Skip Intro/Credits, a real runtime in iOS Now Playing instead of `LIVE`,
   audio/subtitle/quality menus, iOS Picture in Picture, and a playback-info
   panel fed by the server's live encoder and delivery telemetry.
-- **Subtitles**: SRT/SubRip/WebVTT are selected in place as native HLS
-  renditions — no restart, no encoder, no lost HDR. PGS, VobSub, and styled
-  ASS/SSA burn in at source height only when the current delivery is SDR. An
-  HDR selection is refused without changing the running stream.
+- **Subtitle output limits**: the custom PGS layer is part of the in-app player
+  surface, not the video frames. Picture in Picture and external playback are
+  therefore unavailable while it is active, with a visible explanation. The
+  app never falls back to an SDR burn merely to make those output modes work.
 - **Honest dynamic-range badge.** The chip names what the *file* carries; when
   the session is delivering something else, its source half dims while the
   rendered result stays legible (`DV → HDR10`, `HDR → SDR`). The split answers
@@ -191,8 +193,10 @@ invariant, expired-session classification, HLS request semantics, in-place
 AVPlayer media selection, the automatic-subtitle policy and the stream-reopen
 queue, watch-status filtering for both leaves and rollup-bearing containers,
 poster downsampling, the dynamic-range badge's three states and its
-playback-info wording, and the playback duration and progress passed into
-progress reporting.
+playback-info wording, PGS manifest/path validation, source-to-item timeline
+conversion, authored-canvas layout, item replacement, and the invariant that
+PGS selection never burns or reopens direct video, plus the playback duration
+and progress passed into progress reporting.
 
 ```bash
 cd clients/apple

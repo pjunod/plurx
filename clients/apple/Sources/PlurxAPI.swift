@@ -176,6 +176,57 @@ struct PlurxAPI {
         try await get("files/\(fileId)/decision", query: caps)
     }
 
+    func pgsOverlayManifest(
+        fileId: Int,
+        trackIndex: Int
+    ) async throws -> PGSOverlayManifestFetch {
+        guard let url = makeURL("files/\(fileId)/subs/\(trackIndex)/overlay.json") else {
+            throw APIError.badURL
+        }
+        var request = URLRequest(url: url)
+        Session.shared.authorize(&request)
+        let data: Data
+        let response: URLResponse
+        do { (data, response) = try await session.data(for: request) }
+        catch { throw Self.transportError(from: error) }
+        guard let http = response as? HTTPURLResponse else {
+            throw APIError.transport("The PGS overlay response was not HTTP.")
+        }
+        switch http.statusCode {
+        case 200:
+            return .ready(try Self.decoder.decode(PGSOverlayManifest.self, from: data))
+        case 202:
+            let preparing = try Self.decoder.decode(PGSOverlayPreparing.self, from: data)
+            guard preparing.state == "preparing" else { throw PGSOverlayError.invalidManifest }
+            return .preparing(retryAfterMs: min(max(250, preparing.retryAfterMs), 5_000))
+        default:
+            throw APIError.http(http.statusCode)
+        }
+    }
+
+    func pgsOverlayObject(
+        fileId: Int,
+        trackIndex: Int,
+        generation: String,
+        path: String
+    ) async throws -> Data {
+        guard PGSOverlayManifest.objectHash(from: path, generation: generation) != nil,
+              let url = makeURL("files/\(fileId)/subs/\(trackIndex)/\(path)")
+        else { throw PGSOverlayError.invalidManifest }
+        var request = URLRequest(url: url)
+        Session.shared.authorize(&request)
+        let data: Data
+        let response: URLResponse
+        do { (data, response) = try await session.data(for: request) }
+        catch { throw Self.transportError(from: error) }
+        try Self.check(response)
+        guard let http = response as? HTTPURLResponse,
+              http.value(forHTTPHeaderField: "Content-Type")?
+                .lowercased().hasPrefix("image/png") == true
+        else { throw PGSOverlayError.invalidImage }
+        return data
+    }
+
     /// POST rather than the deprecated GET bridge: creating a session spawns a
     /// process and kills its predecessor, and anything entitled to replay a
     /// GET could spawn a second encoder. The body carries this player's

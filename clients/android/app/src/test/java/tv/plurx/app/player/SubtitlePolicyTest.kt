@@ -20,6 +20,16 @@ class SubtitlePolicyTest {
     private fun pgs(index: Long, language: String? = "eng", default: Boolean = false, forced: Boolean = false, title: String? = null) =
         SubTrack(index = index, codec = "hdmv_pgs_subtitle", language = language, title = title, default = default, forced = forced, text = false, native = false)
 
+    private fun pgsOverlay(index: Long, default: Boolean = false) =
+        SubTrack(
+            index = index,
+            codec = "hdmv_pgs_subtitle",
+            default = default,
+            text = false,
+            native = false,
+            overlay = "pgs-v1",
+        )
+
     private fun ass(index: Long, language: String? = "jpn", default: Boolean = false) =
         SubTrack(index = index, codec = "ass", language = language, default = default, text = true, native = false)
 
@@ -94,6 +104,47 @@ class SubtitlePolicyTest {
     }
 
     @Test
+    fun recognizedPgsOverlayNeverBurnsOrReopensPlanVideo() {
+        for (mode in listOf("direct", "remux", "transcode")) {
+            assertEquals(
+                SubtitleRoute(SubtitleDelivery.BitmapOverlay, reopen = false),
+                subtitleRoute(pgsOverlay(2), mode, SubtitleDelivery.Plan),
+            )
+            assertFalse(subtitleBurnWouldDiscardHdr(pgsOverlay(2), "dolby_vision"))
+        }
+        assertEquals(
+            SubtitleRoute(SubtitleDelivery.Plan, reopen = false),
+            subtitleRoute(null, "direct", SubtitleDelivery.BitmapOverlay),
+        )
+        assertEquals(
+            SubtitleRoute(SubtitleDelivery.BitmapOverlay, reopen = false),
+            subtitleRoute(pgsOverlay(3), "direct", SubtitleDelivery.BitmapOverlay),
+        )
+        assertEquals(
+            SubtitleRoute(SubtitleDelivery.BitmapOverlay, reopen = true),
+            subtitleRoute(pgsOverlay(3), "remux", SubtitleDelivery.NativeSession),
+        )
+        assertEquals(
+            SubtitleRoute(SubtitleDelivery.NativeSession, reopen = true),
+            subtitleRoute(srt(4), "remux", SubtitleDelivery.BitmapOverlay),
+        )
+        assertEquals(
+            SubtitleRoute(SubtitleDelivery.Burn, reopen = true),
+            subtitleRoute(pgs(5), "direct", SubtitleDelivery.BitmapOverlay),
+        )
+    }
+
+    @Test
+    fun unknownOverlayVersionRetainsLegacyBurnAndHdrGuard() {
+        val future = pgs(2).copy(overlay = "pgs-v2")
+        assertEquals(
+            SubtitleDelivery.Burn,
+            subtitleRoute(future, "direct", SubtitleDelivery.Plan).delivery,
+        )
+        assertTrue(subtitleBurnWouldDiscardHdr(future, "hdr10"))
+    }
+
+    @Test
     fun changingTheBurntTrackIsAlwaysANewSession() {
         assertEquals(
             SubtitleRoute(SubtitleDelivery.Burn, reopen = true),
@@ -143,6 +194,7 @@ class SubtitlePolicyTest {
     fun aServerDefaultedNonForcedBitmapTrackDoesNotAutoBurn() {
         assertNull(autoSubtitleSelection(listOf(srt(0), pgs(1, default = true))))
         assertNull(autoSubtitleSelection(listOf(ass(2, default = true))))
+        assertEquals(3L, autoSubtitleSelection(listOf(pgsOverlay(3, default = true))))
     }
 
     @Test
@@ -265,6 +317,20 @@ class SubtitlePolicyTest {
         assertNull(body.subtitle)
         assertNull(body.subtitle_burn)
         assertNull("Auto is the server's rung to choose", body.height)
+    }
+
+    @Test
+    fun overlayCarriesNoSubtitleSessionFields() {
+        val body = subtitleSessionBody(
+            playbackId = "pb", requestId = "rq", startSeconds = 4.0,
+            delivery = SubtitleDelivery.BitmapOverlay, subtitleIndex = 3,
+            copyableVideo = true, aac = false, preserveDolbyVision = true,
+            audioIndex = 0, audioOffsetMs = 0,
+            quality = PlaybackQuality.Auto, sourceHeight = 2160,
+        )
+        assertNull(body.native_subtitles)
+        assertNull(body.subtitle)
+        assertNull(body.subtitle_burn)
     }
 
     @Test

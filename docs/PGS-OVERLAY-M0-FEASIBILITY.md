@@ -1,9 +1,11 @@
 # PGS overlay Milestone 0 — feasibility evidence
 
-**Status:** in progress; bounded parser and fuzz laboratory complete, production
-and physical-device evidence pending · **Decision:** continue the bounded SUP
-experiment, do not use the candidate's direct MKV/M2TS path, and do not enable
-PGS overlay in production yet · **Updated:** 2026-08-04
+**Status:** in progress; bounded parser, fuzz laboratory, default-off
+Milestone 1 server producer, and automated Apple Milestone 2 client complete;
+physical-device evidence pending ·
+**Decision:** continue the bounded FFmpeg-to-SUP architecture, do not use the
+candidate's direct MKV/M2TS path, and do not enable PGS overlay in production
+yet · **Updated:** 2026-08-04
 
 Companion to [PGS_OVERLAY_PLAN.md](PGS_OVERLAY_PLAN.md). This is the evidence
 ledger for that plan's Milestone 0. It distinguishes what this branch proves
@@ -12,10 +14,12 @@ Android hardware.
 
 ## 1. Review outcome
 
-`libpgs` 0.6.0 is suitable for continued feasibility work only behind the
-bounded raw-SUP adapter in [`crates/plurx-pgs`](../crates/plurx-pgs). It is not
-approved for direct parsing of untrusted Matroska or M2TS files, and the shipped
-`plurxd` binary does not depend on the adapter crate.
+`libpgs` 0.6.0 is suitable only behind the bounded raw-SUP adapter in
+[`crates/plurx-pgs`](../crates/plurx-pgs). It is not approved for direct parsing
+of untrusted Matroska or M2TS files. The staged `plurxd` producer now depends on
+that adapter, but its API capability and routes are default-off behind
+`PLURX_PGS_OVERLAY`; this does not authorize production selection or client
+rollout.
 
 The exact release passes the initial license and dependency review. The source
 audit found memory and malformed-input behavior that Plurx must not inherit
@@ -43,14 +47,16 @@ preflight, running the candidate with history disabled, validating display
 state before bitmap allocation, and using a strict Plurx-owned RLE decoder and
 normalizer. It deliberately does not wrap the candidate's MKV/M2TS readers.
 
-This is a conditional **continue**, not a production go decision.
+This is a conditional **continue** through server-contract review, not a
+production go decision.
 
 ## 2. What landed in the laboratory
 
-The new `plurx-pgs` workspace crate is an isolated feasibility surface:
+The `plurx-pgs` workspace crate remains the only raw-PGS interpretation
+surface:
 
 - `libpgs` is pinned to exactly `=0.6.0`;
-- no server or client package depends on `plurx-pgs`;
+- the staged server producer depends on it; clients never parse raw PGS;
 - only raw SUP input is accepted;
 - preflight rejects unknown segment types, truncated headers or payloads,
   incomplete display sets, backwards PTS, and configured byte/count excesses;
@@ -307,14 +313,61 @@ installed developer tool rather than a shipped dependency.
 | Production files 5559 and 5698 | Partial | File 5559 cold demux was stopped at 179 seconds and 2 MiB incomplete output; file 5698 was left untouched during active playback. Repeat off-hours with progress and a deadline. |
 | Malformed-input campaign | Partial pass | 306,124 sanitizer-backed executions completed cleanly over the deterministic seed. Add controlled production seeds and a longer campaign. |
 | FFmpeg or Media3 reference comparison | Partial pass | FFmpeg 8.1.2 matches deterministic packet times and visible bounds; investigate the first-frame offset, compare RGBA/palette output, and repeat on production tracks. |
-| Apple timed-overlay prototype | Pending | Compare `AVSynchronizedLayer` with boundary observers on a physical supported device. |
+| Apple timed-overlay prototype | Automated pass; physical pending | The iOS/tvOS client uses `AVSynchronizedLayer` over `AVPlayerLayer.videoRect`; shared simulator tests cover non-zero `base_ms`, seek-window reconciliation, authored-canvas layout, selection/off, and player-item replacement. Run the timing matrix on supported physical devices. |
 | Android timed-overlay prototype | Pending | Exercise `SurfaceView`, tunneling, source-time mapping, and timeline epochs on a physical supported device. |
 | Dolby Vision/HDR preservation | Pending | Record device diagnostics and display-mode evidence before and after PGS selection. |
-| Seek, pause, rate, item replacement | Pending | Run the timing matrix and record onset/clear error against source time. |
-| PiP, AirPlay, casting, external output | Pending | Record inclusion or limitation behavior at selection time; do not infer it from the main player surface. |
+| Seek, pause, rate, item replacement | Automated partial | Source/item conversion, seek reconciliation, synchronized item timing, and item replacement are covered on both simulators. Record physical onset/clear error across play, pause, rate, and repeated scrubbing. |
+| PiP, AirPlay, casting, external output | Policy pass; physical pending | Apple blocks PiP and external playback while PGS overlay is active and explains why, without falling back to burn-in. Confirm the limitation on physical devices; Android remains pending. |
 | Cold extraction and cache measurements | Partial | Synthetic SUP numbers and the bounded 5559 attempt are recorded. Measure completed time, bytes read, peak RSS, cue count, object deduplication, and PNG size off-hours. |
 
-## 8. Remaining parser work
+## 8. Milestone 1 server evidence
+
+The server implementation is complete behind `PLURX_PGS_OVERLAY=1` and remains
+off by default. The final schema is in
+[PLAYBACK.md](PLAYBACK.md#pgs-overlay-server-contract--staged-and-default-off).
+
+| Required evidence | State | Evidence |
+|---|---|---|
+| Complete composition normalization | Pass | `normalize_sup` emits complete positioned RGBA snapshots and explicit clear events without exposing `libpgs` types; fingerprint-only inspection retains its allocation profile. |
+| Malformed/limit behavior | Pass | Existing structural/RLE/state tests plus aggregate normalized-RGBA bounds; the 306,124-execution ASan corpus remains the parser baseline. |
+| Golden manifest/object behavior | Pass for deterministic fixture | Complete-state coalescing, authored clear gaps, content-addressed PNG deduplication, interval ordering, object existence, content hashes, and geometry are validated before publication. Representative production goldens remain part of physical acceptance. |
+| Authentication and codec typing | Pass | Route regression proves both manifest and object authentication, PGS-only 415 behavior, generation matching, and immutable object headers. |
+| Concurrency and atomicity | Pass | One producer owns a generation, peer requests receive preparation state, client cancellation cannot expose staging output, and a whole directory rename is the publication point. |
+| Deadline and retry suppression | Pass | Ten-minute producer bound, two-minute bounded negative memo, and focused injected-timeout regression. |
+| Capacity and eviction | Pass | Two concurrent generation producers, 256 MiB per-track output cap, and independent 2 GiB/128-generation access-marked LRU budget. |
+| Invalidation | Pass | Generation digest includes file id, track index, size, mtime, schema, and extractor version; focused regression changes track and source identity. |
+| Old-client compatibility | Pass | `overlay` is omitted while disabled and on non-PGS tracks; existing `text` and `native` fields retain their meaning. |
+| Raw-SUP demux boundary | Pass for deterministic fixture | A generated SUP was muxed into Matroska, copied back out with the production FFmpeg mapping, and accepted by the bounded adapter. Production-file duration/resource evidence remains pending. |
+
+The server implementation deliberately does not claim physical Apple/Android
+presentation, Dolby Vision preservation, PiP/external-output inclusion, or
+production-media resource acceptance. The automated Apple evidence below
+narrows that list without satisfying the physical release gates.
+
+## 8.1 Milestone 2 Apple automated evidence
+
+The Apple client consumes only authenticated `pgs-v1` manifests and PNG
+objects; raw PGS never crosses into the app. It validates file and track
+identity, generation shape, monotonic non-overlapping cues, canvas/object
+bounds, and exact content-addressed object paths before rendering. Fetching is
+bounded to a five-second lookbehind and 90-second lookahead with a 96 MiB
+decoded-image cache.
+
+The player attaches an `AVSynchronizedLayer` to the current `AVPlayerItem` and
+maps authored canvas coordinates into `AVPlayerLayer.videoRect`. XCTest passes
+on both iOS and tvOS simulators for 1080p-on-4K, 4:3 letterboxing, anamorphic
+canvas mapping, non-zero `base_ms`, item replacement, selection switching, and
+Off. The route-policy regression proves a recognized PGS overlay sends neither
+the native-subtitle nor burn-in session field and does not reopen direct video.
+
+The implementation intentionally disables Picture in Picture and external
+playback while PGS overlay is selected because the custom application layer is
+not part of those output surfaces. A visible notice is preferable to silently
+burning and converting Dolby Vision/HDR to SDR. This is automated behavior
+evidence only: physical iPhone, iPad, and Apple TV timing and display-mode
+verification remain required.
+
+## 9. Remaining parser and device work
 
 Before the parser decision can become a production go:
 
@@ -330,9 +383,9 @@ Before the parser decision can become a production go:
 4. Test multi-clip inputs for the `0xC0` composition state. If it occurs in
    supported media, parse PCS through the owned adapter or review a candidate
    fork rather than silently dropping a valid display set.
-5. Decide whether the production extractor uses FFmpeg-to-bounded-SUP or a
-   reviewed fork that adds limits to the container readers. The current direct
-   MKV/M2TS API is a no-go.
+5. Retain FFmpeg-to-bounded-SUP for the staged producer. Reconsider direct
+   container parsing only through a separately reviewed fork with input and
+   expansion limits; the current direct MKV/M2TS API remains a no-go.
 6. Make input identity stable across preflight and parse. The feasibility API
    detects a changed file size, but the dependency only accepts a path and
    reopens it; a production boundary must eliminate that time-of-check/time-of-use
@@ -341,7 +394,7 @@ Before the parser decision can become a production go:
    implementation PR; do not add an advisory ignore merely to turn the check
    green.
 
-## 9. Go/no-go criteria for the next review
+## 10. Go/no-go criteria for production enablement
 
 Approve Milestone 1 only if all of the following are attached to this ledger or
 its implementation PR:
@@ -356,19 +409,26 @@ its implementation PR:
 - physical Apple and Android tests show PGS while the selected video range and
   Dolby Vision/HDR presentation remain unchanged;
 - output-mode limitations are measured and disclosed;
-- no server or client production package links the parser before the review is
-  accepted.
+- `PLURX_PGS_OVERLAY` remains off in production until this evidence is accepted;
+  no client treats absent capability as permission to burn HDR/DV.
 
 Until then, the correct result for PGS on active HDR/Dolby Vision playback
 remains a visible refusal to burn, preserving the video presentation rather
 than silently switching to SDR.
 
-## 10. Versioning
+## 11. Versioning
 
 The fuzz harness itself adds no runtime dependency to the server or either
 client and does not enable a production playback path. The first RustSec gate
 did expose two advisories in the server's existing XML dependency, so this
 branch upgrades `quick-xml` to the patched 0.41 line. That shipped-runtime
-change advances the shared marketing/workspace version to 0.2.3, Apple build
-to 23, and Android version code to 12. The first later branch that changes a
-shipped app must re-read `main` and advance that app's build counter again.
+change advanced the shared marketing/workspace version to 0.2.3, Apple build
+to 23, and Android version code to 12. The staged server contract changes the
+shipped daemon and advances the shared marketing/workspace version to 0.2.4,
+Apple build to 24, and Android version code to 13. Later client implementation
+branches must re-read `main` and advance their affected release counters again.
+The Apple Milestone 2 branch does so at shared version 0.2.5, Apple build 25,
+and Android version code 14; the Android counter remains coordinated even
+though its renderer lands in a separate branch and PR. The Android Milestone 3
+branch advances the coordinated release to 0.2.6, Apple build 26, and Android
+version code 15.

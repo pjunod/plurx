@@ -191,6 +191,7 @@ struct SubtitleRenditionOption: Equatable {
 /// or a replacement server session.
 enum SubtitleSelectionRoute: Equatable {
     case mediaSelection
+    case bitmapOverlay
     case reopen
 }
 
@@ -241,6 +242,8 @@ final class PlayerController: ObservableObject {
     @Published private(set) var failed = false
     @Published private(set) var playbackError: String?
     @Published private(set) var finished = false
+    @Published private(set) var pgsOverlayWindow: PGSOverlayWindow?
+    @Published private(set) var pgsOverlayStatus: PGSOverlayStatus = .off
 
     private var baseMs = 0
     private var itemId = 0
@@ -318,6 +321,16 @@ final class PlayerController: ObservableObject {
     /// Stable for this player instance. Server-side supersession uses it to
     /// replace this player's own stream without touching another device.
     private let playbackId = UUID().uuidString
+    private var pgsOverlayTrackIndex: Int?
+    private var pgsOverlayManifest: PGSOverlayManifest?
+    private var pgsOverlayPrepareTask: Task<Void, Never>?
+    private var pgsOverlayWindowTask: Task<Void, Never>?
+    private var pgsOverlaySelectionGeneration = 0
+    private var pgsOverlayItemGeneration = 0
+    private var pgsOverlayRevision = 0
+    private var pgsOverlayImageCache: [String: CGImage] = [:]
+    private var pgsOverlayImageBytes: [String: Int] = [:]
+    private var pgsOverlayImageLRU: [String] = []
 
     #if os(iOS)
     private var remoteTargets: [(MPRemoteCommand, Any)] = []
@@ -334,12 +347,15 @@ final class PlayerController: ObservableObject {
         if activeBurnedSubtitle != nil { return "Transcode · subtitle burn-in" }
         if selectedHeight != nil { return "Transcode · \(selectedHeight!)p" }
         let mode = decision.map(Self.playbackMode) ?? "transcode"
+        let overlay = pgsOverlayTrackIndex == selectedSubtitle ? " · PGS overlay" : ""
         switch mode {
-        case "direct": return "Direct play"
-        case "remux": return "Remux · HLS"
-        default: return isVOD ? "Transcode · cached" : "Transcode"
+        case "direct": return "Direct play\(overlay)"
+        case "remux": return "Remux · HLS\(overlay)"
+        default: return (isVOD ? "Transcode · cached" : "Transcode") + overlay
         }
     }
+
+    var pgsOverlayIsActive: Bool { pgsOverlayTrackIndex == selectedSubtitle }
 
     var observedBitrate: Double? {
         player.currentItem?.accessLog()?.events.last?.observedBitrate
@@ -456,6 +472,7 @@ final class PlayerController: ObservableObject {
         // it on the paused predecessor for the whole server round trip, which
         // made tvOS look as though the progress command had not worked.
         currentMs = target
+        refreshPGSOverlayWindow(at: target, force: true)
         stallDetector.reset()
         let requiresReopen = isChangingStream || !(usesDirectTimeline || isVOD)
         Task {
@@ -476,6 +493,10 @@ final class PlayerController: ObservableObject {
 
     func selectSubtitle(_ index: Int?) {
         guard index != selectedSubtitle else { return }
+        if Self.subtitleUsesOverlay(index, in: subtitles), player.isExternalPlaybackActive {
+            playbackError = Self.pgsOverlayExternalPlaybackNotice
+            return
+        }
         if Self.subtitleBurnWouldDiscardHDR(
             index,
             tracks: subtitles,
@@ -485,13 +506,16 @@ final class PlayerController: ObservableObject {
             return
         }
         playbackError = nil
+        let activeOverlay = pgsOverlayTrackIndex
         selectedSubtitle = index
         let route = Self.subtitleSelectionRoute(
             for: index,
             tracks: subtitles,
             activeBurn: activeBurnedSubtitle,
-            isDirectPlayback: isDirectPlayback
+            isDirectPlayback: isDirectPlayback,
+            activeOverlay: activeOverlay
         )
+        updatePGSOverlaySelection(index)
         // Set before the reopen is scheduled: the open it leads to reads this
         // to decide it may no longer direct-play, and it stays set for the rest
         // of the title, so turning subtitles off again costs no second restart.
@@ -505,6 +529,11 @@ final class PlayerController: ObservableObject {
         switch route {
         case .reopen:
             await reopen(at: positionForPlaybackIntent())
+        case .bitmapOverlay:
+            // Moving from a native rendition to bitmap presentation must also
+            // turn AVPlayer's legible option off. The synchronized layer then
+            // owns the only subtitle pixels without replacing the video item.
+            await applyNativeSubtitleSelection(nil, to: player.currentItem)
         case .mediaSelection:
             // Selection belongs to AVPlayerItem, not the HLS session. This is
             // the no-restart path that preserves video copy, HDR, position,
@@ -552,6 +581,7 @@ final class PlayerController: ObservableObject {
         statusTask = nil
         recoveryTask?.cancel()
         recoveryTask = nil
+        clearPGSOverlaySelection()
         stallDetector.reset()
         seekState.clear()
         let position = realPositionMs()
@@ -605,6 +635,7 @@ final class PlayerController: ObservableObject {
                 tracks: decision.subtitles ?? [],
                 deliveredRange: decision.deliveredDynamicRange
             ) ? nil : automaticSubtitle
+            updatePGSOverlaySelection(selectedSubtitle)
             // Use the same drain as later replacements. A remote command can
             // arrive while the decision request or first item is preparing;
             // opening directly here left that command stranded in the reopen
@@ -862,12 +893,16 @@ final class PlayerController: ObservableObject {
         #endif
         observeEnd(of: item)
         observeStatus(of: item)
+        pgsOverlayItemGeneration &+= 1
+        pgsOverlayWindowTask?.cancel()
+        pgsOverlayWindow = nil
         player.replaceCurrentItem(with: item)
         // Publish the new local-to-film mapping only once the new item is the
         // one whose clock `realPositionMs()` reads. Updating it during session
         // creation mixed the predecessor's local time into the successor's
         // base and was the source of the apparently random seek jumps.
         baseMs = nextBaseMs
+        refreshPGSOverlayWindow(at: startMs, force: true)
         // Start loading/playing immediately. Previously a resume point gated
         // this call behind item readiness and could leave tvOS permanently
         // presenting a stopped transport. That regression is why a paused
@@ -957,6 +992,230 @@ final class PlayerController: ObservableObject {
         }
     }
 
+    // MARK: - PGS application overlay
+
+    /// Custom application layers are not carried by Apple's system PiP or
+    /// external playback surfaces. Refuse that output while PGS is selected;
+    /// never replace the current HDR/Dolby Vision bytes with a hidden burn.
+    func allowsPictureInPictureCommand() -> Bool {
+        guard !pgsOverlayIsActive else {
+            playbackError = Self.pgsOverlayExternalPlaybackNotice
+            return false
+        }
+        return true
+    }
+
+    private func updatePGSOverlaySelection(_ index: Int?) {
+        guard let index, Self.subtitleUsesOverlay(index, in: subtitles) else {
+            clearPGSOverlaySelection()
+            return
+        }
+        guard pgsOverlayTrackIndex != index else {
+            refreshPGSOverlayWindow(at: positionForPlaybackIntent())
+            return
+        }
+
+        clearPGSOverlaySelection()
+        pgsOverlayTrackIndex = index
+        pgsOverlayStatus = .preparing
+        // AirPlay/external display would carry only the video plane. Keep the
+        // selection local until output-specific overlay behavior is proven.
+        player.allowsExternalPlayback = false
+        pgsOverlaySelectionGeneration &+= 1
+        let selectionGeneration = pgsOverlaySelectionGeneration
+
+        pgsOverlayPrepareTask = Task { [weak self] in
+            guard let self, let model = self.model else { return }
+            do {
+                let clock = ContinuousClock()
+                let deadline = clock.now.advanced(
+                    by: .seconds(PGSOverlayPolicy.maximumPrepareSeconds)
+                )
+                while clock.now < deadline {
+                    try Task.checkCancellation()
+                    guard self.pgsOverlaySelectionGeneration == selectionGeneration,
+                          self.pgsOverlayTrackIndex == index,
+                          self.selectedSubtitle == index
+                    else { return }
+                    switch try await model.pgsOverlayManifest(
+                        fileId: self.fileId,
+                        trackIndex: index
+                    ) {
+                    case .ready(let rawManifest):
+                        let manifest = try rawManifest.validated(
+                            fileId: self.fileId,
+                            trackIndex: index
+                        )
+                        guard self.pgsOverlaySelectionGeneration == selectionGeneration else {
+                            return
+                        }
+                        self.pgsOverlayManifest = manifest
+                        self.refreshPGSOverlayWindow(
+                            at: self.positionForPlaybackIntent(),
+                            force: true
+                        )
+                        return
+                    case .preparing(let retryAfterMs):
+                        try await Task.sleep(for: .milliseconds(retryAfterMs))
+                    }
+                }
+                throw PGSOverlayError.preparationTimedOut
+            } catch is CancellationError {
+                return
+            } catch {
+                guard self.pgsOverlaySelectionGeneration == selectionGeneration else { return }
+                self.pgsOverlayStatus = .failed(error.localizedDescription)
+                self.pgsOverlayWindow = nil
+                self.playbackError = "\(error.localizedDescription) Video playback was kept unchanged."
+            }
+        }
+    }
+
+    private func clearPGSOverlaySelection() {
+        pgsOverlaySelectionGeneration &+= 1
+        pgsOverlayPrepareTask?.cancel()
+        pgsOverlayPrepareTask = nil
+        pgsOverlayWindowTask?.cancel()
+        pgsOverlayWindowTask = nil
+        pgsOverlayTrackIndex = nil
+        pgsOverlayManifest = nil
+        pgsOverlayWindow = nil
+        pgsOverlayStatus = .off
+        pgsOverlayImageCache.removeAll(keepingCapacity: false)
+        pgsOverlayImageBytes.removeAll(keepingCapacity: false)
+        pgsOverlayImageLRU.removeAll(keepingCapacity: false)
+        player.allowsExternalPlayback = true
+    }
+
+    private func refreshPGSOverlayWindow(at sourceTimeMs: Int, force: Bool = false) {
+        guard let manifest = pgsOverlayManifest,
+              let trackIndex = pgsOverlayTrackIndex,
+              selectedSubtitle == trackIndex,
+              force || PGSOverlayPolicy.shouldRefresh(
+                sourceTimeMs: sourceTimeMs,
+                loadedRange: pgsOverlayWindow?.sourceRange
+              )
+        else { return }
+
+        let sourceRange = PGSOverlayPolicy.windowRange(
+            at: sourceTimeMs,
+            durationMs: manifest.durationMs
+        )
+        let cues = Array(manifest.cues.lazy.filter {
+            $0.endMs > sourceRange.lowerBound && $0.startMs < sourceRange.upperBound
+        }.prefix(PGSOverlayPolicy.maximumScheduledCues))
+        let selectionGeneration = pgsOverlaySelectionGeneration
+        let itemGeneration = pgsOverlayItemGeneration
+        let itemBaseMs = baseMs
+        let generation = manifest.generation
+        pgsOverlayWindowTask?.cancel()
+
+        pgsOverlayWindowTask = Task { [weak self] in
+            guard let self, let model = self.model else { return }
+            do {
+                guard PGSOverlayPolicy.windowFitsDecodedBudget(cues) else {
+                    throw PGSOverlayError.memoryLimit
+                }
+                var rendered: [PGSOverlayRenderableCue] = []
+                rendered.reserveCapacity(cues.count)
+                var decodedWindowBytes = 0
+                var decodedWindowPaths: Set<String> = []
+                for cue in cues {
+                    try Task.checkCancellation()
+                    var objects: [PGSOverlayRenderableObject] = []
+                    objects.reserveCapacity(cue.objects.count)
+                    for object in cue.objects {
+                        try Task.checkCancellation()
+                        let image: CGImage
+                        if let cached = self.cachedPGSOverlayImage(object.image) {
+                            image = cached
+                        } else {
+                            let data = try await model.pgsOverlayObject(
+                                fileId: self.fileId,
+                                trackIndex: trackIndex,
+                                generation: generation,
+                                path: object.image
+                            )
+                            guard let decoded = UIImage(data: data)?.cgImage,
+                                  decoded.width == object.width,
+                                  decoded.height == object.height
+                            else { throw PGSOverlayError.invalidImage }
+                            try self.storePGSOverlayImage(decoded, for: object.image)
+                            image = decoded
+                        }
+                        if decodedWindowPaths.insert(object.image).inserted {
+                            let (bytes, overflow) = image.bytesPerRow
+                                .multipliedReportingOverflow(by: image.height)
+                            guard !overflow,
+                                  bytes > 0,
+                                  bytes <= PGSOverlayPolicy.decodedImageBudgetBytes
+                                    - decodedWindowBytes
+                            else { throw PGSOverlayError.memoryLimit }
+                            decodedWindowBytes += bytes
+                        }
+                        objects.append(PGSOverlayRenderableObject(object: object, image: image))
+                    }
+                    rendered.append(PGSOverlayRenderableCue(cue: cue, objects: objects))
+                }
+
+                guard self.pgsOverlaySelectionGeneration == selectionGeneration,
+                      self.pgsOverlayItemGeneration == itemGeneration,
+                      self.pgsOverlayTrackIndex == trackIndex,
+                      self.selectedSubtitle == trackIndex
+                else { return }
+                self.pgsOverlayRevision &+= 1
+                self.pgsOverlayWindow = PGSOverlayWindow(
+                    revision: self.pgsOverlayRevision,
+                    generation: generation,
+                    baseMs: itemBaseMs,
+                    sourceRange: sourceRange,
+                    cues: rendered
+                )
+                self.pgsOverlayStatus = .ready
+            } catch is CancellationError {
+                return
+            } catch {
+                guard self.pgsOverlaySelectionGeneration == selectionGeneration else { return }
+                self.pgsOverlayStatus = .failed(error.localizedDescription)
+                self.pgsOverlayWindow = nil
+                self.playbackError = "\(error.localizedDescription) Video playback was kept unchanged."
+            }
+        }
+    }
+
+    private func cachedPGSOverlayImage(_ key: String) -> CGImage? {
+        guard let image = pgsOverlayImageCache[key] else { return nil }
+        pgsOverlayImageLRU.removeAll(where: { $0 == key })
+        pgsOverlayImageLRU.append(key)
+        return image
+    }
+
+    private func storePGSOverlayImage(_ image: CGImage, for key: String) throws {
+        let (bytes, overflow) = image.bytesPerRow.multipliedReportingOverflow(
+            by: image.height
+        )
+        guard !overflow,
+              bytes > 0,
+              bytes <= PGSOverlayPolicy.decodedImageBudgetBytes
+        else {
+            throw PGSOverlayError.memoryLimit
+        }
+        while pgsOverlayImageBytes.values.reduce(0, +) + bytes
+            > PGSOverlayPolicy.decodedImageBudgetBytes,
+              let oldest = pgsOverlayImageLRU.first {
+            pgsOverlayImageLRU.removeFirst()
+            pgsOverlayImageCache.removeValue(forKey: oldest)
+            pgsOverlayImageBytes.removeValue(forKey: oldest)
+        }
+        guard pgsOverlayImageBytes.values.reduce(0, +) + bytes
+                <= PGSOverlayPolicy.decodedImageBudgetBytes
+        else { throw PGSOverlayError.memoryLimit }
+        pgsOverlayImageCache[key] = image
+        pgsOverlayImageBytes[key] = bytes
+        pgsOverlayImageLRU.removeAll(where: { $0 == key })
+        pgsOverlayImageLRU.append(key)
+    }
+
     private func startStatusPolling() {
         statusTask?.cancel()
         statusTask = Task { [weak self] in
@@ -1035,6 +1294,7 @@ final class PlayerController: ObservableObject {
                 if self.seekState.pendingMs == nil && !self.isChangingStream {
                     self.currentMs = self.realPositionMs()
                 }
+                self.refreshPGSOverlayWindow(at: self.currentMs)
                 // The last rate the viewer was genuinely playing at, so a
                 // pause at 1.5× is restored as 1.5× and not as the 0 the
                 // transport reports while paused (P2-5).
@@ -1211,15 +1471,17 @@ final class PlayerController: ObservableObject {
 
     static let hdrSubtitleNotice =
         "That subtitle requires an SDR burn-in. HDR playback was kept unchanged."
+    static let pgsOverlayExternalPlaybackNotice =
+        "PGS overlays stay in the app and are not available in Picture in Picture, AirPlay, or external playback. HDR playback was kept unchanged."
 
     static func isHDRDelivery(_ deliveredRange: String?) -> Bool {
         guard let range = deliveredRange?.lowercased() else { return false }
         return ["dolby_vision", "hdr10", "hlg"].contains(range)
     }
 
-    /// Bitmap and styled subtitles can only be drawn by the server's H.264
-    /// SDR pipeline today. Refuse that one selection while HDR is on the wire;
-    /// native text and an already-SDR delivery remain selectable as before.
+    /// Burn-only bitmap and styled subtitles can only be drawn by the server's
+    /// H.264 SDR pipeline. A recognized PGS application overlay is not a burn;
+    /// refuse only the selections that would actually replace HDR video.
     static func subtitleBurnWouldDiscardHDR(
         _ index: Int?,
         tracks: [SubtitleTrack],
@@ -1332,7 +1594,14 @@ final class PlayerController: ObservableObject {
     }
 
     static func subtitleRequiresBurn(_ index: Int, in tracks: [SubtitleTrack]) -> Bool {
-        tracks.first(where: { $0.index == index }).map { !$0.isNativeHLS } ?? true
+        tracks.first(where: { $0.index == index }).map {
+            !$0.isNativeHLS && !$0.isPGSOverlay
+        } ?? true
+    }
+
+    static func subtitleUsesOverlay(_ index: Int?, in tracks: [SubtitleTrack]) -> Bool {
+        guard let index else { return false }
+        return tracks.first(where: { $0.index == index })?.isPGSOverlay == true
     }
 
     /// Pure media-selection step used by the AVPlayer adapter and XCTest. A
@@ -1745,6 +2014,7 @@ final class PlayerController: ObservableObject {
         legacyBurn: Bool
     ) -> (burn: Int?, native: Int?) {
         guard let selected else { return (nil, nil) }
+        if subtitleUsesOverlay(selected, in: tracks) { return (nil, nil) }
         // A legacy server (P1-3) advertises no native renditions at all, so
         // its text tracks return to the pre-branch burn path.
         if legacyBurn || subtitleRequiresBurn(selected, in: tracks) {
@@ -1811,11 +2081,15 @@ final class PlayerController: ObservableObject {
         for index: Int?,
         tracks: [SubtitleTrack],
         activeBurn: Int?,
-        isDirectPlayback: Bool
+        isDirectPlayback: Bool,
+        activeOverlay: Int? = nil
     ) -> SubtitleSelectionRoute {
         let needsBurn = index.map { subtitleRequiresBurn($0, in: tracks) } ?? false
-        let leavesDirectPlay = isDirectPlayback && index != nil
-        return needsBurn || activeBurn != nil || leavesDirectPlay ? .reopen : .mediaSelection
+        let targetUsesOverlay = subtitleUsesOverlay(index, in: tracks)
+        let leavesDirectPlay = isDirectPlayback && index != nil && !targetUsesOverlay
+        if needsBurn || activeBurn != nil || leavesDirectPlay { return .reopen }
+        if targetUsesOverlay || (activeOverlay != nil && index == nil) { return .bitmapOverlay }
+        return .mediaSelection
     }
 
     /// P1-2: what an `open()` still owes the viewer when it completes. The
@@ -1827,14 +2101,16 @@ final class PlayerController: ObservableObject {
         current: Int?,
         tracks: [SubtitleTrack],
         activeBurn: Int?,
-        isDirectPlayback: Bool
+        isDirectPlayback: Bool,
+        activeOverlay: Int? = nil
     ) -> SubtitleSelectionRoute? {
         guard applied != current else { return nil }
         return subtitleSelectionRoute(
             for: current,
             tracks: tracks,
             activeBurn: activeBurn,
-            isDirectPlayback: isDirectPlayback
+            isDirectPlayback: isDirectPlayback,
+            activeOverlay: activeOverlay
         )
     }
 

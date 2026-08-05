@@ -131,6 +131,7 @@ final class PictureInPictureController: NSObject, ObservableObject,
 struct PlayerSurface: UIViewRepresentable {
     let player: AVPlayer
     let pictureInPicture: PictureInPictureController
+    let pgsOverlay: PGSOverlayWindow?
 
     func makeCoordinator() -> Coordinator {
         Coordinator(pictureInPicture: pictureInPicture)
@@ -139,6 +140,7 @@ struct PlayerSurface: UIViewRepresentable {
     func makeUIView(context: Context) -> PlayerSurfaceView {
         let view = PlayerSurfaceView()
         view.playerLayer.player = player
+        view.applyPGSOverlay(pgsOverlay, to: player.currentItem)
         context.coordinator.pictureInPicture.attach(to: view.playerLayer)
         return view
     }
@@ -147,6 +149,7 @@ struct PlayerSurface: UIViewRepresentable {
         if view.playerLayer.player !== player {
             view.playerLayer.player = player
         }
+        view.applyPGSOverlay(pgsOverlay, to: player.currentItem)
         context.coordinator.pictureInPicture.attach(to: view.playerLayer)
     }
 
@@ -157,6 +160,7 @@ struct PlayerSurface: UIViewRepresentable {
         // is already being destroyed. A surviving controller is reset by the
         // normal detach at the start of its next attachment.
         coordinator.pictureInPicture.detach(resetPublishedState: false)
+        view.applyPGSOverlay(nil, to: nil)
         view.playerLayer.player = nil
     }
 
@@ -170,9 +174,20 @@ struct PlayerSurface: UIViewRepresentable {
 }
 
 final class PlayerSurfaceView: UIView {
-    override class var layerClass: AnyClass { AVPlayerLayer.self }
+    let playerLayer = AVPlayerLayer()
 
-    var playerLayer: AVPlayerLayer { layer as! AVPlayerLayer }
+    private struct OverlayNode {
+        let layer: CALayer
+        let object: PGSOverlayObject
+        let canvasWidth: Int
+        let canvasHeight: Int
+    }
+
+    private var synchronizedLayer: AVSynchronizedLayer?
+    private var overlayNodes: [OverlayNode] = []
+    private var overlayRevision: Int?
+    private weak var overlayItem: AVPlayerItem?
+    private var videoRectObservation: NSKeyValueObservation?
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -180,12 +195,119 @@ final class PlayerSurfaceView: UIView {
         isUserInteractionEnabled = false
         isAccessibilityElement = false
         playerLayer.videoGravity = .resizeAspect
+        layer.addSublayer(playerLayer)
+        clipsToBounds = true
+        videoRectObservation = playerLayer.observe(\.videoRect, options: [.new]) {
+            [weak self] _, _ in
+            Task { @MainActor in self?.setNeedsLayout() }
+        }
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) {
         fatalError("init(coder:) is unavailable")
     }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        playerLayer.frame = bounds
+        let videoRect = playerLayer.videoRect
+        synchronizedLayer?.frame = videoRect
+        let destination = CGRect(origin: .zero, size: videoRect.size)
+        for node in overlayNodes {
+            node.layer.frame = PGSOverlayPolicy.objectFrame(
+                node.object,
+                canvasWidth: node.canvasWidth,
+                canvasHeight: node.canvasHeight,
+                destination: destination
+            )
+        }
+        CATransaction.commit()
+    }
+
+    func applyPGSOverlay(_ window: PGSOverlayWindow?, to item: AVPlayerItem?) {
+        guard let window, let item else {
+            detachPGSOverlay()
+            return
+        }
+        guard overlayRevision != window.revision || overlayItem !== item else {
+            setNeedsLayout()
+            return
+        }
+
+        detachPGSOverlay()
+        overlayRevision = window.revision
+        overlayItem = item
+
+        let synchronized = AVSynchronizedLayer(playerItem: item)
+        synchronized.masksToBounds = true
+        synchronizedLayer = synchronized
+        layer.addSublayer(synchronized)
+
+        for renderable in window.cues {
+            let cue = renderable.cue
+            let unclampedStart = PGSOverlayPolicy.itemTimeMs(
+                sourceTimeMs: cue.startMs,
+                baseMs: window.baseMs
+            )
+            let itemEnd = PGSOverlayPolicy.itemTimeMs(
+                sourceTimeMs: cue.endMs,
+                baseMs: window.baseMs
+            )
+            let itemStart = max(0, unclampedStart)
+            guard itemEnd > itemStart else { continue }
+
+            for object in renderable.objects {
+                let imageLayer = CALayer()
+                imageLayer.contents = object.image
+                imageLayer.contentsGravity = .resize
+                imageLayer.opacity = 0
+                imageLayer.actions = [
+                    "bounds": NSNull(),
+                    "position": NSNull(),
+                    "opacity": NSNull(),
+                ]
+
+                let visibility = CABasicAnimation(keyPath: "opacity")
+                visibility.fromValue = 1
+                visibility.toValue = 1
+                visibility.beginTime = AVCoreAnimationBeginTimeAtZero
+                    + Double(itemStart) / 1_000
+                visibility.duration = Double(itemEnd - itemStart) / 1_000
+                visibility.fillMode = .removed
+                visibility.isRemovedOnCompletion = true
+                imageLayer.add(visibility, forKey: "pgs-visibility")
+                synchronized.addSublayer(imageLayer)
+                overlayNodes.append(OverlayNode(
+                    layer: imageLayer,
+                    object: object.object,
+                    canvasWidth: cue.canvasWidth,
+                    canvasHeight: cue.canvasHeight
+                ))
+            }
+        }
+        setNeedsLayout()
+    }
+
+    private func detachPGSOverlay() {
+        synchronizedLayer?.removeFromSuperlayer()
+        synchronizedLayer = nil
+        overlayNodes.removeAll(keepingCapacity: false)
+        overlayRevision = nil
+        overlayItem = nil
+    }
+
+    /// Test seam for the item-replacement invariant. The renderer must never
+    /// leave the predecessor item's synchronized layer attached.
+    func hasPGSOverlay(revision: Int, item: AVPlayerItem) -> Bool {
+        overlayRevision == revision && overlayItem === item && synchronizedLayer != nil
+    }
+
+    var pgsOverlayNodeCount: Int { overlayNodes.count }
+
+    deinit { videoRectObservation = nil }
 
     #if os(tvOS)
     override var canBecomeFocused: Bool { false }
