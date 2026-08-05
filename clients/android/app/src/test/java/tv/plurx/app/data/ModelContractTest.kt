@@ -165,11 +165,18 @@ class ModelContractTest {
             """{
               "session_id": "s1", "playlist_url": "/hls/s1/index.m3u8?native=1&subtitle=2",
               "duration_ms": 7200000, "start_seconds": 0.0, "encoder": "cached",
-              "vod": true, "ladder": [{"height": 1080, "total_kbps": 8192, "peak_kbps": 12416}]
+              "media_origin_ms": 0, "vod": true,
+              "ladder": [{"height": 1080, "total_kbps": 8192, "peak_kbps": 12416}]
             }""".trimIndent(),
         )
         assertTrue(start.vod)
+        assertEquals(0L, start.media_origin_ms)
         assertEquals(1080, start.ladder.single().height)
+
+        val oldServer = json.decodeFromString<HlsStart>(
+            """{"session_id":"old","playlist_url":"/hls/old/index.m3u8"}""",
+        )
+        assertNull(oldServer.media_origin_ms)
     }
 
     @Test

@@ -101,7 +101,7 @@ value class SubtitleChoice(val index: Long?)
 @UnstableApi
 class Controller(
     context: Context,
-    val player: ExoPlayer,
+    builtPlayer: BuiltPlayer,
     private val plan: PlanLike,
     private val caps: Map<String, String>,
     private val vm: AppViewModel,
@@ -111,6 +111,10 @@ class Controller(
     retainedSubtitle: SubtitleChoice? = null,
     private val onError: (String) -> Unit = {},
 ) {
+    val player: ExoPlayer = builtPlayer.player
+
+    private val progressiveMediaOrigin = builtPlayer.progressiveMediaOrigin
+
     var audioOffsetMs: Long = initialAudioOffsetMs.coerceIn(-15_000, 15_000)
         private set
 
@@ -220,6 +224,10 @@ class Controller(
     private val directTransport: Boolean
         get() = subtitleDelivery == SubtitleDelivery.Plan && planMode == "direct"
 
+    /** True while Media3 is reading the live progressive remux response. */
+    private val progressiveTransport: Boolean
+        get() = subtitleDelivery == SubtitleDelivery.Plan && planMode == "remux"
+
     var encoder: String? = null
         private set
 
@@ -319,7 +327,11 @@ class Controller(
 
     fun realPosition(): Long {
         val pos = player.currentPosition.coerceAtLeast(0)
-        return if (directTransport || sessionIsVod) pos else baseMs + pos
+        return when {
+            directTransport || sessionIsVod -> pos
+            progressiveTransport -> progressiveMediaOrigin.currentOriginMs() + pos
+            else -> baseMs + pos
+        }
     }
 
     fun seekTo(targetMs: Long) {
@@ -329,7 +341,9 @@ class Controller(
             subtitleDelivery == SubtitleDelivery.Plan && planMode == "remux" -> {
                 leaveSessionPlayback()
                 baseMs = t
-                player.setMediaItem(MediaItem.fromUri(remuxUri(t)))
+                val uri = remuxUri(t)
+                progressiveMediaOrigin.begin(uri, t)
+                player.setMediaItem(MediaItem.fromUri(uri))
                 player.prepare()
                 player.playWhenReady = true
                 armTextSelection()
@@ -425,7 +439,9 @@ class Controller(
             planMode == "remux" -> {
                 leaveSessionPlayback()
                 baseMs = positionMs
-                player.setMediaItem(MediaItem.fromUri(remuxUri(positionMs)))
+                val uri = remuxUri(positionMs)
+                progressiveMediaOrigin.begin(uri, positionMs)
+                player.setMediaItem(MediaItem.fromUri(uri))
                 player.prepare()
                 player.playWhenReady = true
                 armTextSelection()
@@ -476,7 +492,7 @@ class Controller(
             hls.delivered_dynamic_range?.let { deliveredRange = it }
             // A cached session is the whole stream on disk: its timeline
             // starts at zero and the player seeks, exactly like direct play.
-            baseMs = if (hls.vod) 0L else (hls.start_seconds * 1000).toLong()
+            baseMs = sessionMediaOriginMs(hls)
             val startPositionMs = if (hls.vod) ms else 0L
             player.setMediaItem(MediaItem.fromUri(Session.url(hls.playlist_url)), startPositionMs)
             player.prepare()
@@ -633,7 +649,13 @@ interface PlanLike {
 }
 
 @UnstableApi
-fun buildPlayer(context: Context, vm: AppViewModel): ExoPlayer {
+class BuiltPlayer internal constructor(
+    val player: ExoPlayer,
+    internal val progressiveMediaOrigin: ProgressiveMediaOrigin,
+)
+
+@UnstableApi
+fun buildPlayer(context: Context, vm: AppViewModel): BuiltPlayer {
     val selector = DefaultTrackSelector(context).apply {
         parameters = buildUponParameters()
             .setPreferredAudioLanguage(vm.audioLang)
@@ -653,12 +675,14 @@ fun buildPlayer(context: Context, vm: AppViewModel): ExoPlayer {
             .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
             .build()
     }
+    val progressiveMediaOrigin = ProgressiveMediaOrigin()
     val dataSource: OkHttpDataSource.Factory = Net.dataSourceFactory()
+        .setTransferListener(progressiveMediaOrigin)
     val renderers = DefaultRenderersFactory(context)
         // A flaky hardware decoder degrades to software instead of erroring
         // into the compatibility rescue and costing the viewer a restart.
         .setEnableDecoderFallback(true)
-    return ExoPlayer.Builder(context)
+    val player = ExoPlayer.Builder(context)
         .setTrackSelector(selector)
         .setRenderersFactory(renderers)
         .setMediaSourceFactory(DefaultMediaSourceFactory(dataSource))
@@ -673,6 +697,7 @@ fun buildPlayer(context: Context, vm: AppViewModel): ExoPlayer {
         )
         .setHandleAudioBecomingNoisy(true)
         .build()
+    return BuiltPlayer(player, progressiveMediaOrigin)
 }
 
 /**

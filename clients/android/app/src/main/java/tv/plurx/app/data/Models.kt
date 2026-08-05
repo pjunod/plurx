@@ -303,6 +303,12 @@ data class HlsStart(
     val playlist_url: String,
     val duration_ms: Long? = null,
     val start_seconds: Double = 0.0,
+    /**
+     * Source timestamp represented by player-local time zero. Copy sessions
+     * can begin at the keyframe preceding [start_seconds], so this optional
+     * origin is the authoritative timeline anchor on newer servers.
+     */
+    val media_origin_ms: Long? = null,
     val encoder: String? = null,
     /**
      * The whole stream is already on disk (a pre-transcode cache hit), so it
