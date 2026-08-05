@@ -340,6 +340,10 @@ impl IntegrationMetrics {
 pub struct JobManager {
     store: Arc<dyn Store>,
     artwork_dir: PathBuf,
+    /// Test-only provider override so the targeted-scan seam can be exercised
+    /// through the real job manager without reaching the public TMDB API.
+    #[cfg(test)]
+    tmdb_base: Option<(String, String)>,
     statuses: Mutex<HashMap<i64, ScanStatus>>,
     /// Live counters for in-flight scans, sampled by `all_statuses`.
     live: Mutex<HashMap<i64, Arc<ScanProgress>>>,
@@ -502,6 +506,8 @@ impl JobManager {
         JobManager {
             store,
             artwork_dir,
+            #[cfg(test)]
+            tmdb_base: None,
             statuses: Mutex::new(HashMap::new()),
             live: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
@@ -708,7 +714,16 @@ impl JobManager {
         // full-library metadata pass.
         let placed: Vec<i64> = out.items.iter().map(|p| p.item_id).collect();
         let targets = self.enrich_targets(&placed).await;
-        let outcome = self.enrich(&library, false, Some(&targets)).await;
+        // A new episode often lands under a show that was enriched months
+        // ago. The ordinary `force = false` queue quite correctly omits that
+        // show, but episode/season enrichment is reached *through* the show,
+        // so omitting it also strands every newly placed child without art.
+        // Force only this bounded TV tree; `only` still prevents a targeted
+        // notification from becoming a whole-library refresh.
+        let refresh_existing_show = library.kind == LibraryKind::Shows && !library.anime;
+        let outcome = self
+            .enrich(&library, refresh_existing_show, Some(&targets))
+            .await;
         tracing::info!(
             target: "plurxd::integrate",
             library = req.library_id,
@@ -800,7 +815,7 @@ impl JobManager {
         } else {
             match self.store.get_setting(keys::TMDB_API_KEY).await {
                 Ok(Some(key)) if !key.is_empty() => {
-                    let tmdb = TmdbClient::new(key);
+                    let tmdb = self.tmdb_client(key);
                     outcome.enrich = Some(
                         metadata::enrich_library(
                             self.store.as_ref(),
@@ -818,6 +833,14 @@ impl JobManager {
             }
         }
         outcome
+    }
+
+    fn tmdb_client(&self, key: String) -> TmdbClient {
+        #[cfg(test)]
+        if let Some((base, image_base)) = &self.tmdb_base {
+            return TmdbClient::new(key.as_str()).with_base(base, image_base);
+        }
+        TmdbClient::new(key)
     }
 
     /// Re-fetch artwork for one item and its ancestors, ignoring every "we
@@ -1472,10 +1495,84 @@ fn error_status(message: &str) -> ScanStatus {
 mod tests {
     use super::*;
     use plurx_core::domain::{ItemKind, NewItem, NewLibrary};
-    use plurx_core::store::{LibraryStore, MediaStore, SqliteStore};
+    use plurx_core::store::{LibraryStore, MediaStore, SettingsStore, SqliteStore};
+    use serde_json::json;
+    use std::sync::atomic::AtomicUsize;
 
     fn manager(store: Arc<dyn Store>, artwork: &std::path::Path) -> Arc<JobManager> {
         Arc::new(JobManager::new(store, artwork.to_path_buf()))
+    }
+
+    fn manager_with_tmdb(
+        store: Arc<dyn Store>,
+        artwork: &std::path::Path,
+        base: &str,
+    ) -> Arc<JobManager> {
+        let mut manager = JobManager::new(store, artwork.to_path_buf());
+        manager.tmdb_base = Some((base.to_owned(), base.to_owned()));
+        Arc::new(manager)
+    }
+
+    async fn serve(app: axum::Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    fn targeted_show_tmdb(season_one_hits: Arc<AtomicUsize>) -> axum::Router {
+        use axum::routing::get;
+        use axum::Json;
+
+        axum::Router::new()
+            .route(
+                "/tv/42",
+                get(|| async {
+                    Json(json!({
+                        "id": 42,
+                        "name": "Severance",
+                        "first_air_date": "2022-02-18",
+                        "poster_path": "/show.jpg",
+                        "backdrop_path": "/backdrop.jpg"
+                    }))
+                }),
+            )
+            .route(
+                "/tv/42/season/1",
+                get(move || {
+                    let hits = Arc::clone(&season_one_hits);
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({
+                            "poster_path": "/season-1.jpg",
+                            "episodes": [{
+                                "episode_number": 1,
+                                "name": "Good News About Hell",
+                                "still_path": "/episode-1.jpg"
+                            }]
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/tv/42/season/2",
+                get(|| async {
+                    Json(json!({
+                        "poster_path": "/season-2.jpg",
+                        "episodes": [{
+                            "episode_number": 1,
+                            "name": "Hello, Ms. Cobel",
+                            "still_path": "/episode-2.jpg"
+                        }]
+                    }))
+                }),
+            )
+            // Image paths are served by the same base in this test.
+            .fallback(get(|| async { vec![0_u8, 1, 2, 3] }))
     }
 
     /// The bug this whole change exists for, in one test.
@@ -1541,6 +1638,102 @@ mod tests {
             .expect("folder");
         assert_eq!(folder.kind, ItemKind::Folder);
         assert!(folder.poster_path.is_some());
+    }
+
+    /// A show can be old while the episode is brand new. The show row is the
+    /// gateway to TMDB's season endpoint, so treating its earlier enrichment
+    /// stamp as a reason to skip it strands the new season and episode with
+    /// blank cards. This is the shape seen in the live library: movies from
+    /// the same import window had posters, episodes under known shows did not.
+    #[tokio::test]
+    async fn a_targeted_scan_enriches_new_children_of_an_existing_show() {
+        let store = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let media = tempfile::tempdir().expect("media");
+        let artwork = tempfile::tempdir().expect("artwork");
+        let show = media.path().join("Severance (2022)");
+        let season_one = show.join("Season 01");
+        std::fs::create_dir_all(&season_one).expect("mkdir s1");
+        std::fs::write(season_one.join("Severance.S01E01.mkv"), b"video").expect("episode 1");
+
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "TV".into(),
+                kind: LibraryKind::Shows,
+                paths: vec![media.path().to_path_buf()],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+        store
+            .put_setting(keys::TMDB_API_KEY, "test-key")
+            .await
+            .expect("key");
+
+        let season_one_hits = Arc::new(AtomicUsize::new(0));
+        let base = serve(targeted_show_tmdb(Arc::clone(&season_one_hits))).await;
+        let jobs = manager_with_tmdb(store.clone(), artwork.path(), &base);
+        let ids = Some(IdHints {
+            series_tmdb: Some(42),
+            episodeish: true,
+            ..Default::default()
+        });
+
+        let first = jobs
+            .request_scan(ScanRequest {
+                id: "s1".into(),
+                library_id: lib.id,
+                path: season_one,
+                ids: ids.clone(),
+                correlation_id: None,
+                source: Some("monarr".into()),
+            })
+            .await
+            .expect("first scan")
+            .expect("first ran");
+        let first_episode = store
+            .get_item(first.items[0].item_id)
+            .await
+            .expect("get first")
+            .expect("first episode");
+        assert!(first_episode.poster_path.is_some(), "initial episode art");
+
+        // The show is now metadata-stamped. A later notification for a new
+        // season must still walk through it to hydrate the newly placed rows.
+        let season_two = show.join("Season 02");
+        std::fs::create_dir_all(&season_two).expect("mkdir s2");
+        std::fs::write(season_two.join("Severance.S02E01.mkv"), b"video").expect("episode 2");
+        let second = jobs
+            .request_scan(ScanRequest {
+                id: "s2".into(),
+                library_id: lib.id,
+                path: season_two,
+                ids,
+                correlation_id: None,
+                source: Some("monarr".into()),
+            })
+            .await
+            .expect("second scan")
+            .expect("second ran");
+        let second_episode = store
+            .get_item(second.items[0].item_id)
+            .await
+            .expect("get second")
+            .expect("second episode");
+        assert!(
+            second_episode.poster_path.is_some(),
+            "a new episode under an existing show must leave the notification path with artwork"
+        );
+        let second_season = store
+            .get_item(second_episode.parent_id.expect("season"))
+            .await
+            .expect("get season")
+            .expect("second season");
+        assert!(second_season.poster_path.is_some(), "new season poster");
+        assert_eq!(
+            season_one_hits.load(Ordering::SeqCst),
+            1,
+            "the targeted retry must not re-download every existing season"
+        );
     }
 
     /// `scan_path` hands back the rows that own the *files* — episodes, not
