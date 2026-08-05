@@ -309,6 +309,7 @@ paths = [
   "crates/plurx-core/src/tracks.rs",
   "crates/plurx-core/src/transcode/**",
   "crates/plurx-pgs/**",
+  "fuzz/**",
   "crates/plurxd/src/{admission,copyseg,delivery,ffmpeg,meter,pipeprobe,playstart,produce,progressive,subtitles,transcode}.rs",
   "crates/plurxd/src/http/{hls,stream}.rs",
   "crates/plurxd/src/web/playback-policy.js",

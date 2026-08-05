@@ -1,9 +1,9 @@
 # PGS overlay Milestone 0 — feasibility evidence
 
-**Status:** in progress; parser laboratory complete, reference and physical-device
-evidence pending · **Decision:** continue the bounded SUP experiment, do not use
-the candidate's direct MKV/M2TS path, and do not enable PGS overlay in production
-yet · **Updated:** 2026-08-04
+**Status:** in progress; bounded parser and fuzz laboratory complete, production
+and physical-device evidence pending · **Decision:** continue the bounded SUP
+experiment, do not use the candidate's direct MKV/M2TS path, and do not enable
+PGS overlay in production yet · **Updated:** 2026-08-04
 
 Companion to [PGS_OVERLAY_PLAN.md](PGS_OVERLAY_PLAN.md). This is the evidence
 ledger for that plan's Milestone 0. It distinguishes what this branch proves
@@ -130,9 +130,18 @@ The cache transition is cross-checked against FFmpeg's current
 which flushes cached objects and palettes for every non-normal composition
 state.
 
-No automated RustSec scan is recorded because `cargo-audit` is not installed
-in the project toolchain. That is a remaining supply-chain check, not evidence
-that advisories are absent.
+Dependency-changing pull requests now run the official RustSec
+[`audit-check`](https://github.com/rustsec/audit-check) action through
+[`rust-audit.yml`](../.github/workflows/rust-audit.yml). Separate jobs scan the
+shipped workspace and sanitizer-only fuzz lockfiles. The workflow has no
+advisory ignores and must pass before this branch merges. This moves the scan
+to the same clean Linux environment that evaluates the committed lockfiles
+instead of depending on an untracked developer-machine installation. The first
+workspace scan used advisory database revision
+`6d7aef354b4144c1ede046034adfd00246d3b0c0` (updated 2026-08-04) and found
+RUSTSEC-2026-0194 and RUSTSEC-2026-0195 in `quick-xml` 0.38.4. This branch
+upgrades the direct dependency to the patched 0.41 line; the rerun must be
+clean before merge.
 
 The dependency is young and lightly adopted. Exact pinning is therefore
 mandatory. Any upgrade requires repeating the source audit, malformed corpus,
@@ -171,7 +180,7 @@ objects differ because they use different object identifiers even though the
 fixture geometry is the same; this keeps the composition fingerprint sensitive
 to state reuse errors.
 
-Eight focused tests currently prove:
+Twelve focused tests currently prove:
 
 - normal show and clear normalization;
 - palette update with object reuse;
@@ -180,9 +189,42 @@ Eight focused tests currently prove:
 - canvas rejection before bitmap decode;
 - truncated display-set rejection;
 - ordered handling of duplicate timestamps and rejection of backwards time;
-- preflight segment bounding before candidate assembly.
+- preflight segment bounding before candidate assembly;
+- fragmented-object reassembly before strict decode;
+- multiple simultaneous objects with authored crop rectangles;
+- explicit rejection of the unsupported `0xC0` composition state;
+- deterministic mutation of every fixture truncation and hundreds of
+  single-byte state changes without a panic.
 
-### 5.1 FFmpeg reference check
+### 5.1 Malformed-input fuzz campaign
+
+The repository now carries a sanitizer-backed cargo-fuzz target in
+[`fuzz/`](../fuzz). It sends arbitrary files through the complete bounded path:
+structural preflight · candidate SUP parsing · fragment assembly · strict RLE
+decode · palette and composition normalization. Its reduced profile caps an
+input at 1 MiB, one decoded object at 8 MiB, and retained object pixels at
+16 MiB so a generated header cannot turn the campaign into an allocation test
+of the host.
+
+The 2026-08-04 campaign used cargo-fuzz 0.13.2, libfuzzer-sys 0.4.13, and
+Rust nightly 2026-08-01 with address sanitizer. Seeded with the deterministic
+2,504-byte SUP, it completed 306,124 executions in 61 seconds with no panic,
+crash, timeout, sanitizer finding, or parser allocation failure. The final
+coverage signal was 983 edges and 2,403 features across 124 retained inputs.
+
+A first run with a 256 MiB process ceiling stopped at 6,306 executions because
+libFuzzer plus address sanitizer reached 271 MiB. Its allocation report assigned
+the two largest allocations to the libFuzzer driver, not the adapter. Repeating
+the same corpus with a 1 GiB process ceiling completed and stabilized at 449 MiB
+RSS. That distinction matters: sanitizer-process RSS is not the parser's
+reviewed object or epoch limit.
+
+This is a clean bounded campaign, not proof over every production authoring
+pattern. Production SUP tracks must join the seed corpus after their controlled
+extraction, and a longer campaign remains part of the Milestone 0 acceptance
+record.
+
+### 5.2 FFmpeg reference check
 
 FFmpeg/FFprobe 8.1.2 independently recognizes the fixture as
 `hdmv_pgs_subtitle`, reports a 1920 × 1080 canvas and a `1/90000` timebase, and
@@ -214,7 +256,7 @@ frame and `9b2c4088acb2c896d5d79adbe4b893ac` for a clear black frame. This prove
 packet timing and visible geometry for the deterministic fixture. Pixel-for-pixel
 RGBA comparison, palette effects, and production-media comparison remain open.
 
-### 5.2 Production cold-scan attempt
+### 5.3 Production cold-scan attempt
 
 A title-free measurement attempt copied subtitle index 1 from production file
 5559 to raw SUP inside the running server container. It was intentionally
@@ -244,18 +286,26 @@ cargo test -p plurx-pgs
 cargo clippy -p plurx-pgs --all-targets -- -D warnings
 ffprobe -v error -show_streams -show_packets -select_streams s:0 \
   target/pgs-m0-fixture.sup
+mkdir -p /tmp/plurx-pgs-corpus
+cp target/pgs-m0-fixture.sup /tmp/plurx-pgs-corpus/mkpgs.sup
+cd fuzz
+cargo fuzz run inspect_sup /tmp/plurx-pgs-corpus -- \
+  -max_total_time=60 -rss_limit_mb=1024 -timeout=5 -max_len=1048576
 ```
 
 The generated SUP and JSON are laboratory artifacts under `target/`; they are
-not committed media fixtures.
+not committed media fixtures. The fuzz sub-workspace pins its required nightly
+toolchain in `fuzz/rust-toolchain.toml`; `cargo-fuzz` remains an explicitly
+installed developer tool rather than a shipped dependency.
 
 ## 7. Milestone evidence matrix
 
 | Required evidence | State | Evidence or next action |
 |---|---|---|
-| Exact dependency and security assessment | Partial pass | Source, license, checksum, dependency tree, and unsafe-code scan recorded. Add RustSec scan and fuzzing. |
+| Exact dependency and security assessment | Pass when CI is green | Source, license, checksum, dependency tree, and unsafe-code scan recorded; the official RustSec action scans every dependency-changing PR with no ignores. |
 | Bounded Plurx-owned adapter | Pass for raw SUP | Exact pin, preflight, strict normalizer, limits, and focused tests are in this branch. |
 | Production files 5559 and 5698 | Partial | File 5559 cold demux was stopped at 179 seconds and 2 MiB incomplete output; file 5698 was left untouched during active playback. Repeat off-hours with progress and a deadline. |
+| Malformed-input campaign | Partial pass | 306,124 sanitizer-backed executions completed cleanly over the deterministic seed. Add controlled production seeds and a longer campaign. |
 | FFmpeg or Media3 reference comparison | Partial pass | FFmpeg 8.1.2 matches deterministic packet times and visible bounds; investigate the first-frame offset, compare RGBA/palette output, and repeat on production tracks. |
 | Apple timed-overlay prototype | Pending | Compare `AVSynchronizedLayer` with boundary observers on a physical supported device. |
 | Android timed-overlay prototype | Pending | Exercise `SurfaceView`, tunneling, source-time mapping, and timeline epochs on a physical supported device. |
@@ -268,11 +318,13 @@ not committed media fixtures.
 
 Before the parser decision can become a production go:
 
-1. Add a fuzz target for the preflight, payload parser boundary, fragment
-   assembler, and strict RLE decoder. Seed it with every malformed fixture.
-2. Add the remaining plan fixtures: object update with palette reuse, multiple
-   simultaneous objects, cropped objects, 1080p canvas on 4K video, missing
-   clear, fragment sequences, duplicate timestamps, and real palette effects.
+1. Extend the fuzz corpus with controlled production SUP tracks and run a
+   longer sanitizer campaign. The deterministic seed and mutation regression
+   remain the required fast baseline.
+2. Add the remaining plan fixtures: object update with palette reuse, 1080p
+   canvas on 4K video, missing clear, and production palette effects. Multiple
+   simultaneous objects, crop rectangles, fragment sequences, and duplicate
+   timestamps now have focused coverage.
 3. Resolve PTS wrap and define whether identical timestamps are coalesced or
    retained in file order in the eventual manifest.
 4. Test multi-clip inputs for the `0xC0` composition state. If it occurs in
@@ -285,7 +337,9 @@ Before the parser decision can become a production go:
    detects a changed file size, but the dependency only accepts a path and
    reopens it; a production boundary must eliminate that time-of-check/time-of-use
    gap.
-7. Run an automated advisory scan and record its database date.
+7. Record the RustSec action result and advisory-database revision on the
+   implementation PR; do not add an advisory ignore merely to turn the check
+   green.
 
 ## 9. Go/no-go criteria for the next review
 
@@ -311,8 +365,10 @@ than silently switching to SDR.
 
 ## 10. Versioning
 
-This branch adds an unshipped Rust feasibility crate and documentation. It does
-not change Apple or Android application code, so their build counters remain at
-Apple 22 and Android 11. The shared marketing/workspace version remains 0.2.2.
-The first branch that changes either shipped app must re-read `main` and advance
-that app's build counter again.
+The fuzz harness itself adds no runtime dependency to the server or either
+client and does not enable a production playback path. The first RustSec gate
+did expose two advisories in the server's existing XML dependency, so this
+branch upgrades `quick-xml` to the patched 0.41 line. That shipped-runtime
+change advances the shared marketing/workspace version to 0.2.3, Apple build
+to 23, and Android version code to 12. The first later branch that changes a
+shipped app must re-read `main` and advance that app's build counter again.

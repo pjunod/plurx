@@ -234,6 +234,26 @@ fn preflight_sup(path: &Path, limits: &ParserLimits) -> Result<PreflightReport, 
             )));
         }
         let payload_bytes = u16::from_be_bytes([header[11], header[12]]) as usize;
+        let mut consumed_payload_bytes = 0usize;
+
+        if kind == 0x16 {
+            if payload_bytes < 8 {
+                return Err(AdapterError::Malformed(
+                    "PCS payload is too short to carry a composition state".into(),
+                ));
+            }
+            let mut prefix = [0u8; 8];
+            reader.read_exact(&mut prefix).map_err(|_| {
+                AdapterError::Malformed("PCS payload is truncated before its state".into())
+            })?;
+            consumed_payload_bytes = prefix.len();
+            if !matches!(prefix[7], 0x00 | 0x40 | 0x80) {
+                return Err(AdapterError::Malformed(format!(
+                    "unsupported PCS composition state 0x{:02x}",
+                    prefix[7]
+                )));
+            }
+        }
 
         match kind {
             0x16 => {
@@ -292,7 +312,7 @@ fn preflight_sup(path: &Path, limits: &ParserLimits) -> Result<PreflightReport, 
                 limits.max_payload_bytes_per_display_set
             )));
         }
-        discard_exact(&mut reader, payload_bytes)?;
+        discard_exact(&mut reader, payload_bytes - consumed_payload_bytes)?;
 
         if kind == 0x80 {
             display_sets += 1;
@@ -919,10 +939,11 @@ fn ycrcb_to_rgba(y: u8, cr: u8, cb: u8, alpha: u8) -> [u8; 4] {
 mod tests {
     use super::*;
     use libpgs::pgs::{
-        encode_rle, CompositionObject, OdsData, PaletteEntry, PcsData, PdsData, PgsSegment,
-        SequenceFlag,
+        encode_rle, CompositionObject, CropInfo, OdsData, PaletteEntry, PcsData, PdsData,
+        PgsSegment, SequenceFlag,
     };
     use std::io::Write;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
 
     fn write_sup(bytes: &[u8]) -> tempfile::NamedTempFile {
         let mut file = tempfile::NamedTempFile::new().expect("temporary SUP");
@@ -979,6 +1000,45 @@ mod tests {
                 rle_data: rle,
             },
         )
+    }
+
+    fn fragmented_object(
+        pts_ms: u64,
+        id: u16,
+        width: u16,
+        height: u16,
+        rle: &[u8],
+        split: usize,
+    ) -> [PgsSegment; 2] {
+        let mut first = PgsSegment::from_ods(
+            pts_ms * 90,
+            0,
+            &OdsData {
+                id,
+                version: 0,
+                sequence: SequenceFlag::First,
+                data_length: rle.len() as u32 + 4,
+                width: Some(width),
+                height: Some(height),
+                rle_data: rle[..split].to_vec(),
+            },
+        );
+        let declared = (rle.len() as u32 + 4).to_be_bytes();
+        first.payload[4..7].copy_from_slice(&declared[1..]);
+        let last = PgsSegment::from_ods(
+            pts_ms * 90,
+            0,
+            &OdsData {
+                id,
+                version: 0,
+                sequence: SequenceFlag::Last,
+                data_length: 0,
+                width: None,
+                height: None,
+                rle_data: rle[split..].to_vec(),
+            },
+        );
+        [first, last]
     }
 
     fn placement(id: u16) -> CompositionObject {
@@ -1150,5 +1210,127 @@ mod tests {
 
         let error = inspect_sup(file.path(), &limits).expect_err("segment limit");
         assert!(error.to_string().contains("more than 1 segments"));
+    }
+
+    #[test]
+    fn fragmented_object_reassembles_before_strict_decode() {
+        let rle = encode_rle(&[1, 1, 1, 1, 1, 1, 1, 1], 4, 2).expect("encode fixture");
+        let split = rle.len() / 2;
+        assert!(split > 0 && split < rle.len());
+        let [first, last] = fragmented_object(1000, 9, 4, 2, &rle, split);
+        let bytes = display_set(vec![
+            pcs(1000, CompositionState::EpochStart, vec![placement(9)]),
+            palette(1000, 235, 128, 128),
+            first,
+            last,
+            PgsSegment::end_segment(90_000, 0),
+        ]);
+        let file = write_sup(&bytes);
+
+        let report = inspect_sup(file.path(), &ParserLimits::default()).expect("fragmented SUP");
+        assert_eq!(report.object_definitions, 2);
+        assert_eq!(report.max_object_rgba_bytes, 32);
+        assert_eq!(report.content_display_sets, 1);
+    }
+
+    #[test]
+    fn cropped_composition_hashes_multiple_objects_in_authored_order() {
+        let first_rle = encode_rle(&[1, 1, 1, 1, 1, 1, 1, 1], 4, 2).expect("first object");
+        let second_rle = encode_rle(&[1, 1, 1, 1], 2, 2).expect("second object");
+        let objects = vec![
+            CompositionObject {
+                object_id: 1,
+                window_id: 0,
+                x: 100,
+                y: 100,
+                crop: Some(CropInfo {
+                    x: 1,
+                    y: 0,
+                    width: 2,
+                    height: 2,
+                }),
+            },
+            CompositionObject {
+                object_id: 2,
+                window_id: 0,
+                x: 400,
+                y: 200,
+                crop: None,
+            },
+        ];
+        let bytes = display_set(vec![
+            pcs(1000, CompositionState::EpochStart, objects),
+            palette(1000, 235, 128, 128),
+            object(1000, 1, 4, 2, first_rle),
+            object(1000, 2, 2, 2, second_rle),
+            PgsSegment::end_segment(90_000, 0),
+        ]);
+        let file = write_sup(&bytes);
+
+        let report = inspect_sup(file.path(), &ParserLimits::default()).expect("cropped objects");
+        assert_eq!(report.max_composition_objects, 2);
+        assert_eq!(report.object_definitions, 2);
+        assert_eq!(report.compositions[0].object_count, 2);
+    }
+
+    #[test]
+    fn unsupported_multi_clip_composition_state_is_rejected_explicitly() {
+        let mut unsupported = pcs(1000, CompositionState::EpochStart, vec![]);
+        unsupported.payload[7] = 0xc0;
+        let bytes = display_set(vec![unsupported, PgsSegment::end_segment(90_000, 0)]);
+        let file = write_sup(&bytes);
+
+        let error = inspect_sup(file.path(), &ParserLimits::default())
+            .expect_err("0xc0 is outside the reviewed candidate model");
+        assert!(error
+            .to_string()
+            .contains("unsupported PCS composition state 0xc0"));
+    }
+
+    #[test]
+    fn deterministic_mutation_corpus_never_panics() {
+        let rle = encode_rle(&[1, 1, 1, 1], 2, 2).expect("encode fixture");
+        let base = display_set(vec![
+            pcs(1000, CompositionState::EpochStart, vec![placement(7)]),
+            palette(1000, 235, 128, 128),
+            object(1000, 7, 2, 2, rle),
+            PgsSegment::end_segment(90_000, 0),
+        ]);
+        let limits = ParserLimits {
+            max_sup_bytes: 64 * 1024,
+            max_display_sets: 32,
+            max_segments_per_display_set: 32,
+            max_payload_bytes_per_display_set: 64 * 1024,
+            max_canvas_width: 1920,
+            max_canvas_height: 1080,
+            max_canvas_pixels: 2_073_600,
+            max_objects_per_composition: 8,
+            max_object_rgba_bytes: 1024 * 1024,
+            max_object_rle_bytes: 64 * 1024,
+            max_cached_objects: 16,
+            max_cached_pixel_bytes: 1024 * 1024,
+            max_palettes: 8,
+        };
+        let mut corpus = Vec::new();
+        for end in 0..=base.len() {
+            corpus.push(base[..end].to_vec());
+        }
+        for offset in 0..base.len() {
+            for replacement in [0x00, 0x40, 0x80, 0xc0, 0xff] {
+                if base[offset] != replacement {
+                    let mut mutated = base.clone();
+                    mutated[offset] = replacement;
+                    corpus.push(mutated);
+                }
+            }
+        }
+
+        for (case, bytes) in corpus.iter().enumerate() {
+            let file = write_sup(bytes);
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                let _ = inspect_sup(file.path(), &limits);
+            }));
+            assert!(outcome.is_ok(), "mutation case {case} panicked");
+        }
     }
 }
