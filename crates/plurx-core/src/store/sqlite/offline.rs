@@ -12,7 +12,7 @@ use crate::store::OfflinePackageStore;
 
 const PACKAGE_COLS: &str = "id, request_id, user_id, file_id, node_id, source_path, \
     source_size, source_mtime, recipe_hash, target_height, audio_index, audio_offset_ms, \
-    output_width, output_height, subtitle_index, subtitle_mode, state, phase, progress_millis, estimated_bytes, \
+    output_width, output_height, subtitle_index, subtitle_language, subtitle_mode, state, phase, progress_millis, estimated_bytes, \
     reserved_bytes, actual_bytes, duration_ms, error_code, error_message, created_at, updated_at, \
     last_access_at, expires_at";
 
@@ -33,20 +33,21 @@ fn package_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<OfflinePackage>
         output_width: row.get(12)?,
         output_height: row.get(13)?,
         subtitle_index: row.get(14)?,
-        subtitle_mode: row.get(15)?,
-        state: row.get(16)?,
-        phase: row.get(17)?,
-        progress_millis: row.get(18)?,
-        estimated_bytes: row.get(19)?,
-        reserved_bytes: row.get(20)?,
-        actual_bytes: row.get(21)?,
-        duration_ms: row.get(22)?,
-        error_code: row.get(23)?,
-        error_message: row.get(24)?,
-        created_at: row.get(25)?,
-        updated_at: row.get(26)?,
-        last_access_at: row.get(27)?,
-        expires_at: row.get(28)?,
+        subtitle_language: row.get(15)?,
+        subtitle_mode: row.get(16)?,
+        state: row.get(17)?,
+        phase: row.get(18)?,
+        progress_millis: row.get(19)?,
+        estimated_bytes: row.get(20)?,
+        reserved_bytes: row.get(21)?,
+        actual_bytes: row.get(22)?,
+        duration_ms: row.get(23)?,
+        error_code: row.get(24)?,
+        error_message: row.get(25)?,
+        created_at: row.get(26)?,
+        updated_at: row.get(27)?,
+        last_access_at: row.get(28)?,
+        expires_at: row.get(29)?,
     })
 }
 
@@ -72,6 +73,7 @@ fn same_request(existing: &OfflinePackage, requested: &NewOfflinePackage) -> boo
         && existing.audio_index == requested.audio_index
         && existing.audio_offset_ms == requested.audio_offset_ms
         && existing.subtitle_index == requested.subtitle_index
+        && existing.subtitle_language == requested.subtitle_language
         && existing.subtitle_mode == requested.subtitle_mode
 }
 
@@ -157,11 +159,11 @@ impl OfflinePackageStore for SqliteStore {
                     id, request_id, user_id, file_id, node_id, source_path,
                     source_size, source_mtime, target_height, audio_index,
                     audio_offset_ms, output_width, output_height, subtitle_index,
-                    subtitle_mode, state, phase, estimated_bytes, reserved_bytes,
-                    expires_at
+                    subtitle_language, subtitle_mode, state, phase,
+                    estimated_bytes, reserved_bytes, expires_at
                  ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                    ?14, ?15, 'queued', 'waiting_for_encoder', ?16, ?17, ?18
+                    ?14, ?15, ?16, 'queued', 'waiting_for_encoder', ?17, ?18, ?19
                  )",
                 params![
                     requested.id,
@@ -178,6 +180,7 @@ impl OfflinePackageStore for SqliteStore {
                     requested.output_width,
                     requested.output_height,
                     requested.subtitle_index,
+                    requested.subtitle_language,
                     requested.subtitle_mode,
                     requested.estimated_bytes,
                     requested.reserved_bytes,
@@ -309,6 +312,23 @@ impl OfflinePackageStore for SqliteStore {
                  phase = 'waiting_for_encoder', updated_at = unixepoch() \
                  WHERE id = ?1 AND state = 'preparing'",
                 [id],
+            )? > 0)
+        })
+        .await
+    }
+
+    async fn set_offline_package_recipe(
+        &self,
+        package_id: &str,
+        recipe_hash: &str,
+    ) -> Result<bool, StoreError> {
+        let (id, hash) = (package_id.to_owned(), recipe_hash.to_owned());
+        self.with_conn(move |conn| {
+            Ok(conn.execute(
+                "UPDATE offline_packages SET recipe_hash = ?2, updated_at = unixepoch() \
+                 WHERE id = ?1 AND state = 'preparing' \
+                   AND (recipe_hash IS NULL OR recipe_hash = ?2)",
+                params![id, hash],
             )? > 0)
         })
         .await
@@ -465,19 +485,24 @@ impl OfflinePackageStore for SqliteStore {
                 tx.commit()?;
                 return Ok(None);
             };
-            tx.execute(
-                "UPDATE offline_package_leases \
-                 SET last_access_at = ?2, expires_at = ?3 WHERE token_hash = ?1",
-                params![hash, now, renewed_expires_at],
-            )?;
-            tx.execute(
-                "UPDATE offline_packages SET last_access_at = ?2, expires_at = ?3, \
-                 updated_at = ?2 WHERE id = ?1",
-                params![package.id, now, renewed_expires_at],
-            )?;
-            package.last_access_at = now;
-            package.updated_at = now;
-            package.expires_at = renewed_expires_at;
+            // A segment storm must not become a SQLite write storm. One touch
+            // per minute keeps a seven-day lease fresh while bounding writes
+            // independently of title length and HLS segment size.
+            if now.saturating_sub(package.last_access_at) >= 60 {
+                tx.execute(
+                    "UPDATE offline_package_leases \
+                     SET last_access_at = ?2, expires_at = ?3 WHERE token_hash = ?1",
+                    params![hash, now, renewed_expires_at],
+                )?;
+                tx.execute(
+                    "UPDATE offline_packages SET last_access_at = ?2, expires_at = ?3, \
+                     updated_at = ?2 WHERE id = ?1",
+                    params![package.id, now, renewed_expires_at],
+                )?;
+                package.last_access_at = now;
+                package.updated_at = now;
+                package.expires_at = renewed_expires_at;
+            }
             tx.commit()?;
             Ok(Some(package))
         })
@@ -549,6 +574,7 @@ mod tests {
             audio_index: Some(1),
             audio_offset_ms: 125,
             subtitle_index: Some(2),
+            subtitle_language: Some("en".to_owned()),
             subtitle_mode: "native".to_owned(),
             estimated_bytes: 400,
             reserved_bytes: 500,
@@ -649,6 +675,20 @@ mod tests {
                 .expect("rotate"),
             OfflineLeaseOutcome::TokenConflict
         );
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE offline_package_leases SET last_access_at = 200, expires_at = 1000",
+                    [],
+                )?;
+                conn.execute(
+                    "UPDATE offline_packages SET last_access_at = 200, expires_at = 1000",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("fix test clock");
 
         let served = store
             .offline_package_for_lease(&hash, 250, 400)
@@ -656,7 +696,16 @@ mod tests {
             .expect("serve")
             .expect("authorized");
         assert_eq!(served.id, package.id);
-        assert_eq!(served.expires_at, 400);
+        assert_eq!(
+            served.expires_at, 1000,
+            "a touch inside a minute is read-only"
+        );
+        let renewed = store
+            .offline_package_for_lease(&hash, 261, 1500)
+            .await
+            .expect("serve after throttle window")
+            .expect("authorized");
+        assert_eq!(renewed.expires_at, 1500);
         assert!(store
             .offline_package_for_lease(&"c".repeat(64), 250, 400)
             .await

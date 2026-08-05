@@ -1849,6 +1849,7 @@ struct PortableProduction<'a> {
     deadline: Instant,
     yield_to_offline: bool,
     cancelled: Option<&'a tokio_util::sync::CancellationToken>,
+    offline_package_id: Option<&'a str>,
 }
 
 /// Everything an earlier pass already encoded, in order.
@@ -2502,6 +2503,7 @@ impl TranscodeManager {
                         deadline,
                         yield_to_offline: true,
                         cancelled: None,
+                        offline_package_id: None,
                     },
                     hash,
                 )
@@ -2520,6 +2522,7 @@ impl TranscodeManager {
     /// accepts explicit tracks, and forces SDR even on a passthrough node.
     pub async fn ensure_offline(
         &self,
+        package_id: &str,
         file: &plurx_core::domain::MediaFile,
         spec: &OfflineSpec,
         deadline: Instant,
@@ -2576,6 +2579,18 @@ impl TranscodeManager {
             audio_copied: false,
         }
         .hash();
+        if !self
+            .store
+            .set_offline_package_recipe(package_id, &hash)
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            return if cancelled.is_cancelled() {
+                Ok(OfflineProduceOutcome::Yielded)
+            } else {
+                Err("offline package is no longer preparing".to_owned())
+            };
+        }
         let outcome = self
             .produce_normalized(
                 PortableProduction {
@@ -2585,6 +2600,7 @@ impl TranscodeManager {
                     deadline,
                     yield_to_offline: false,
                     cancelled: Some(cancelled),
+                    offline_package_id: Some(package_id),
                 },
                 hash,
             )
@@ -2594,6 +2610,10 @@ impl TranscodeManager {
             OfflineProduceOutcome::Ready(_) | OfflineProduceOutcome::Cached(_)
         ) {
             if let OfflineSubtitle::Native(index) = spec.subtitle {
+                let _ = self
+                    .store
+                    .update_offline_progress(package_id, "extracting_subtitles", 999)
+                    .await;
                 crate::subtitles::ensure_vtt(&self.subtitle_cache, file, index).await?;
             }
         }
@@ -2615,6 +2635,7 @@ impl TranscodeManager {
             deadline: _,
             yield_to_offline: _,
             cancelled: _,
+            offline_package_id,
         } = request;
         let cache = self.cache.as_ref().ok_or("no cache configured")?;
         if let Some(cached) = self
@@ -2631,6 +2652,12 @@ impl TranscodeManager {
                 return Err("complete cache row contains a non-VOD playlist".to_owned());
             }
             let part = crate::produce::Part::from_playlist(&playlist);
+            if let Some(package_id) = offline_package_id {
+                let _ = self
+                    .store
+                    .update_offline_progress(package_id, "transcoding", 999)
+                    .await;
+            }
             return Ok(OfflineProduceOutcome::Cached(Produced {
                 recipe: hash,
                 bytes: cached.bytes,
@@ -2743,6 +2770,7 @@ impl TranscodeManager {
             deadline,
             yield_to_offline,
             cancelled,
+            offline_package_id,
         } = *request;
         tokio::fs::create_dir_all(temp)
             .await
@@ -2866,6 +2894,20 @@ impl TranscodeManager {
             let produced = !part.is_empty();
             if produced {
                 parts.push(part);
+                if let (Some(package_id), Some(duration_ms)) = (
+                    offline_package_id,
+                    file.duration_ms.filter(|duration| *duration > 0),
+                ) {
+                    let completed_ms = crate::produce::resume_at_ms(&parts);
+                    let progress = completed_ms
+                        .saturating_mul(1000)
+                        .saturating_div(duration_ms)
+                        .clamp(1, 999);
+                    let _ = self
+                        .store
+                        .update_offline_progress(package_id, "transcoding", progress)
+                        .await;
+                }
             }
 
             match ended {

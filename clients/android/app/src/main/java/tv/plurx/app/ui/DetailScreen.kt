@@ -455,6 +455,7 @@ private fun Actions(
         ActivityResultContracts.RequestPermission(),
     ) { /* denial is benign; Android still exposes foreground work */ }
     var changingWatch by remember { mutableStateOf(false) }
+    var downloadError by remember(item.id) { mutableStateOf<String?>(null) }
     val playable = files.firstOrNull { it.available }
     val offline = playable?.let { file -> offlineRecords.firstOrNull {
         it.serverInstanceId == vm.serverInstanceId && it.userId == vm.currentUserId &&
@@ -516,10 +517,16 @@ private fun Actions(
                             }
                             when {
                                 offline == null || offline.state in setOf("failed", "missing") -> {
-                                    vm.queueOffline(item, playable)
+                                    downloadError = vm.queueOffline(item, playable)
                                 }
-                                offline.state == "paused" -> vm.resumeOffline(offline)
-                                else -> vm.removeOffline(offline)
+                                offline.state == "paused" -> {
+                                    downloadError = null
+                                    vm.resumeOffline(offline)
+                                }
+                                else -> {
+                                    downloadError = null
+                                    vm.removeOffline(offline)
+                                }
                             }
                         },
                     ) {
@@ -532,6 +539,15 @@ private fun Actions(
                                 offline.state in setOf("failed", "missing") -> "  Download again"
                                 else -> "  Cancel download"
                             },
+                        )
+                    }
+                }
+                downloadError?.let { message ->
+                    item {
+                        Text(
+                            message,
+                            color = MaterialTheme.colorScheme.error,
+                            style = MaterialTheme.typography.bodySmall,
                         )
                     }
                 }

@@ -5,6 +5,7 @@ package tv.plurx.app.data.offline
 import android.content.Context
 import android.content.res.Configuration
 import android.net.Uri
+import android.os.Build
 import androidx.media3.common.StreamKey
 import androidx.media3.database.StandaloneDatabaseProvider
 import androidx.media3.datasource.DefaultHttpDataSource
@@ -13,6 +14,7 @@ import androidx.media3.datasource.cache.CacheDataSource
 import androidx.media3.datasource.cache.NoOpCacheEvictor
 import androidx.media3.datasource.cache.SimpleCache
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.hls.playlist.HlsMultivariantPlaylist
 import androidx.media3.exoplayer.offline.Download
 import androidx.media3.exoplayer.offline.DownloadManager
 import androidx.media3.exoplayer.offline.DownloadRequest
@@ -300,22 +302,34 @@ object OfflineDownloads {
                 errorMessage = null,
             )
             catalog.upsert(record)
-            val streamKeys = buildList {
-                add(StreamKey(0, 0))
-                if (record.subtitleIndex != null) add(StreamKey(1, 0))
-            }
+            val streamKeys = offlineStreamKeys(record.subtitleIndex != null)
             val download = DownloadRequest.Builder(id, Uri.parse(manifest))
                 .setMimeType("application/x-mpegURL")
                 .setStreamKeys(streamKeys)
                 .setData(json.encodeToString(record).encodeToByteArray())
                 .build()
             activeApis[id] = request.api
-            DownloadService.sendAddDownload(
-                appContext,
-                PlurxDownloadService::class.java,
-                download,
-                true,
-            )
+            try {
+                DownloadService.sendAddDownload(
+                    appContext,
+                    PlurxDownloadService::class.java,
+                    download,
+                    true,
+                )
+            } catch (error: Exception) {
+                if (!isBackgroundForegroundServiceRefusal(error)) throw error
+                // Android 12+ can forbid a background foreground-service
+                // start. The lease and request remain valid; foreground
+                // catch-up will enqueue this exact ready record.
+                catalog.update(id) {
+                    it.copy(
+                        state = "ready",
+                        phase = "waiting_for_foreground",
+                        errorMessage = "Open Cinema to start this download",
+                    )
+                }
+                return
+            }
         } catch (error: IOException) {
             catalog.update(id) {
                 it.copy(
@@ -418,3 +432,14 @@ object OfflineDownloads {
 
     const val SYSTEM_TIMEOUT_REASON = 10_001
 }
+
+internal fun offlineStreamKeys(hasSubtitle: Boolean): List<StreamKey> = buildList {
+    add(StreamKey(HlsMultivariantPlaylist.GROUP_INDEX_VARIANT, 0))
+    if (hasSubtitle) {
+        add(StreamKey(HlsMultivariantPlaylist.GROUP_INDEX_SUBTITLE, 0))
+    }
+}
+
+private fun isBackgroundForegroundServiceRefusal(error: Exception): Boolean =
+    Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+        error is android.app.ForegroundServiceStartNotAllowedException

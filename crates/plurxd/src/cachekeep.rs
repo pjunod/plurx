@@ -257,19 +257,26 @@ async fn sweep_orphan_dirs(store: &Arc<dyn Store>, root: &Path, node_id: &str) -
     // under it.
     let mut known: HashSet<PathBuf> = HashSet::new();
     let mut claimed_recipes: HashSet<String> = HashSet::new();
-    let rows = store
-        .cache_by_age(node_id, i64::MAX)
-        .await
-        .unwrap_or_default();
-    let claims = store
-        .stale_cache_claims(node_id, i64::MAX)
-        .await
-        .unwrap_or_default();
-    for e in rows.iter().chain(claims.iter()) {
+    // Filesystem ownership is not eviction policy. The filtered LRU and stale
+    // queries intentionally hide offline-owned rows; using either as this
+    // keep-list turns that protection inside out and deletes the protected
+    // directories as "orphans".
+    let rows = match store.all_cache_rows(node_id).await {
+        Ok(rows) => rows,
+        Err(error) => {
+            // Ownership uncertainty must fail closed. Treating a store error
+            // as an empty keep-list would recursively delete valid media.
+            tracing::warn!(%error, "cache: could not enumerate filesystem owners; skipping orphan sweep");
+            return 0;
+        }
+    };
+    for e in &rows {
         if let Some(dir) = entry_dir(root, &e.relative_dir) {
             known.insert(dir);
         }
-        claimed_recipes.insert(e.recipe_hash.clone());
+        if !e.complete {
+            claimed_recipes.insert(e.recipe_hash.clone());
+        }
     }
 
     let Ok(mut prefixes) = tokio::fs::read_dir(root).await else {
@@ -357,7 +364,10 @@ async fn sweep_orphan_dirs(store: &Arc<dyn Store>, root: &Path, node_id: &str) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use plurx_core::domain::{ItemKind, LibraryKind, NewItem, NewLibrary, ProbeResult};
+    use plurx_core::domain::{
+        ItemKind, LibraryKind, NewItem, NewLibrary, NewOfflinePackage, OfflineCreateOutcome,
+        ProbeResult,
+    };
     use plurx_core::store::{LibraryStore, MediaStore, SqliteStore};
 
     /// The real clock. These tests are about elapsed time, so `sweep` takes
@@ -434,6 +444,52 @@ mod tests {
 
     fn root() -> tempfile::TempDir {
         tempfile::tempdir().expect("root")
+    }
+
+    async fn preparing_package(store: &Arc<dyn Store>, file: i64, recipe: &str) -> String {
+        let user = store
+            .create_user(&format!("user-{recipe}"), "hash", false)
+            .await
+            .expect("user");
+        let package = NewOfflinePackage {
+            id: format!("package-{recipe}"),
+            request_id: format!("request-{recipe}"),
+            user_id: user.id,
+            file_id: file,
+            node_id: NODE.into(),
+            source_path: "/m/Heat.mkv".into(),
+            source_size: 1,
+            source_mtime: 1,
+            target_height: 720,
+            output_width: Some(1280),
+            output_height: Some(720),
+            audio_index: None,
+            audio_offset_ms: 0,
+            subtitle_index: None,
+            subtitle_language: None,
+            subtitle_mode: "none".into(),
+            estimated_bytes: 10,
+            reserved_bytes: 20,
+            expires_at: i64::MAX,
+        };
+        assert!(matches!(
+            store
+                .create_offline_package(&package, 10, 1_000, 2_000)
+                .await
+                .expect("package"),
+            OfflineCreateOutcome::Created(_)
+        ));
+        let claimed = store
+            .claim_next_offline_package(NODE)
+            .await
+            .expect("claim package")
+            .expect("queued package");
+        assert_eq!(claimed.id, package.id);
+        assert!(store
+            .set_offline_package_recipe(&package.id, recipe)
+            .await
+            .expect("bind recipe"));
+        package.id
     }
 
     /// The budget is a ceiling and eviction stops the moment it is met — the
@@ -540,6 +596,31 @@ mod tests {
         assert!(dir.exists());
     }
 
+    #[tokio::test]
+    async fn a_published_offline_package_is_neither_evicted_nor_orphaned() {
+        let (store, file) = store().await;
+        let root = root();
+        let package_id = preparing_package(&store, file, "efready").await;
+        let dir = entry(&store, root.path(), file, "efready", 100).await;
+        assert!(store
+            .mark_offline_package_ready(&package_id, "efready", 100, 90_000)
+            .await
+            .expect("ready"));
+        store
+            .put_setting(keys::CACHE_MAX_GB, "0")
+            .await
+            .expect("zero budget");
+
+        let out = sweep(&store, root.path(), NODE, unix_now()).await;
+        assert_eq!((out.evicted, out.orphans), (0, 0));
+        assert!(dir.join("index.m3u8").exists());
+        assert!(store
+            .cache_hit("efready", NODE)
+            .await
+            .expect("hit")
+            .is_some());
+    }
+
     /// Bytes with no row are the one leak a budget cannot see: every query says
     /// there is room and the filesystem disagrees. They arrive the ordinary
     /// way — a kill between writing the directory and committing the row.
@@ -600,6 +681,28 @@ mod tests {
             staging.join("part-000/seg00000.ts").exists(),
             "an encode in progress was deleted by the housekeeping job beside it"
         );
+    }
+
+    #[tokio::test]
+    async fn offline_preparation_keeps_its_staging_directory() {
+        let (store, file) = store().await;
+        let root = root();
+        let _package_id = preparing_package(&store, file, "ghoffline").await;
+        store
+            .claim_cache_entry("ghoffline", file, 1, NODE, "gh/ghoffline")
+            .await
+            .expect("cache claim");
+        let staging = staging_dir(root.path(), "ghoffline");
+        tokio::fs::create_dir_all(staging.join("part-000"))
+            .await
+            .expect("mkdir");
+        tokio::fs::write(staging.join("part-000/seg00000.ts"), b"half a film")
+            .await
+            .expect("write");
+
+        let out = sweep(&store, root.path(), NODE, unix_now()).await;
+        assert_eq!((out.stale, out.orphans), (0, 0));
+        assert!(staging.join("part-000/seg00000.ts").exists());
     }
 
     /// …but staging that nothing claims is a producer that died. Nothing will

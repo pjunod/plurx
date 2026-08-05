@@ -459,7 +459,7 @@ final class PlayerController: ObservableObject {
         title = offline.title
         selectedHeight = offline.actualHeight
         selectedAudio = offline.audioLabel == nil ? nil : 0
-        selectedSubtitle = offline.subtitleLabel == nil ? nil : 0
+        selectedSubtitle = offline.subtitleIndex == nil ? nil : 0
         deliveredRange = "sdr"
         encoder = "offline"
         isVOD = true
@@ -480,12 +480,12 @@ final class PlayerController: ObservableObject {
         let audio = item.audioLabel.map {
             [AudioTrack(index: 0, codec: "aac", channels: nil, language: nil, title: $0, default: true)]
         }
-        let subtitles = item.subtitleLabel.map {
+        let subtitles = item.subtitleIndex.map { _ in
             [SubtitleTrack(
                 index: 0,
                 codec: "webvtt",
                 language: nil,
-                title: $0,
+                title: item.subtitleLabel ?? "Downloaded",
                 default: true,
                 forced: false,
                 text: true,

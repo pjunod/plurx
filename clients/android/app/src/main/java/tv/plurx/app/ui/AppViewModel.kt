@@ -198,6 +198,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                             if (saved.instanceId == null) backfillServerIdentity()
                             _phase.value = Phase.Ready
                             loadHome()
+                            resumeOfflineProfile()
                             syncOfflineProgress()
                         }
                         SavedSessionValidation.InvalidToken -> {
@@ -281,6 +282,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 settings.saveSession(origin, resp.token, resp.user.username, resp.user.id)
                 _phase.value = Phase.Ready
                 loadHome()
+                resumeOfflineProfile()
                 syncOfflineProgress()
             } catch (_: Exception) {
                 _authError.value = "Wrong username or password"
@@ -399,9 +401,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             OfflineDownloads.setNetworkPolicy(network)
         }
 
-    fun queueOffline(item: Item, file: MediaFileDto) {
-        val instance = serverInstanceId ?: return
-        val user = currentUserId ?: return
+    fun queueOffline(item: Item, file: MediaFileDto): String? {
+        val instance = serverInstanceId
+            ?: return "Reconnect to this Cinema server before downloading"
+        val user = currentUserId
+            ?: return "Sign in again before downloading"
         val preferences = _preferences.value
         OfflineDownloads.enqueue(
             OfflineQueueRequest(
@@ -426,6 +430,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 network = preferences.offlineNetwork,
             ),
         )
+        return null
     }
 
     fun resumeOffline(record: OfflineRecord) {
@@ -456,6 +461,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val instance = serverInstanceId ?: return
         val user = currentUserId ?: return
         OfflineDownloads.catalog.profile(instance, user).firstOrNull()?.let(::resumeOffline)
+    }
+
+    fun onForeground() {
+        if (_phase.value != Phase.Ready || api == null) return
+        resumeOfflineProfile()
+        syncOfflineProgress()
     }
 
     fun removeOffline(record: OfflineRecord) = OfflineDownloads.remove(record, api)

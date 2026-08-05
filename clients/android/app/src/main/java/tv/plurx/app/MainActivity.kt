@@ -8,9 +8,12 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavType
@@ -60,6 +63,11 @@ private fun AppRoot(vm: AppViewModel) {
     val phase by vm.phase.collectAsStateWithLifecycle()
     val busy by vm.busy.collectAsStateWithLifecycle()
     val authError by vm.authError.collectAsStateWithLifecycle()
+
+    LifecycleEventEffect(Lifecycle.Event.ON_START) { vm.onForeground() }
+    LaunchedEffect(phase) {
+        if (phase == Phase.Ready) vm.onForeground()
+    }
 
     when (phase) {
         Phase.Loading -> LoadingBox()

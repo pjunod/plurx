@@ -46,6 +46,8 @@ actor OfflineCatalog {
 
     func item(id: String) -> OfflineItem? { items[id] }
 
+    func allItems() -> [OfflineItem] { Array(items.values) }
+
     func item(serverInstanceId: String, userId: Int, fileId: Int) -> OfflineItem? {
         items.values.first {
             $0.serverInstanceId == serverInstanceId

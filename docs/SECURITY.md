@@ -76,12 +76,13 @@ header to every nested HLS request, so the capability lives in the media path:
 /api/v1/offline/media/<lease>/master.m3u8
 ```
 
-The path is a bearer credential. It has a rolling seven-day expiry, every
-successful media read renews the same stable value, and a package accepts only
-one value so a retry cannot silently rotate a transfer in progress. Package
-deletion or expiry removes the server-side capability. HTTP trace spans omit
-all query strings and replace the offline lease and live HLS session segments
-with `[REDACTED]`.
+The path is a bearer credential. It has a rolling seven-day expiry; successful
+media reads keep the same stable value alive, with renewal writes persisted at
+most once per minute so segment fetches cannot become a database write storm.
+A package accepts only one value so a retry cannot silently rotate a transfer
+in progress. Package deletion or expiry removes the server-side capability.
+HTTP trace spans omit all query strings and replace the offline lease and live
+HLS session segments with `[REDACTED]`.
 
 Offline viewing is **not DRM**. Media on the phone is protected by the
 platform application sandbox and device-at-rest controls, is kept out of

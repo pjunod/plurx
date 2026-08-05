@@ -8,6 +8,9 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import retrofit2.http.GET
+import retrofit2.http.POST
+import retrofit2.http.Query
 
 @Serializable
 private data class NativeApiContractFixture(
@@ -22,6 +25,29 @@ class ModelContractTest {
     private val json = Json {
         ignoreUnknownKeys = true
         explicitNulls = false
+    }
+
+    @Test
+    fun offlineRoutesMatchTheServerContract() {
+        val options = PlurxApi::class.java.declaredMethods.single { it.name == "offlineOptions" }
+        assertEquals(
+            "files/{id}/offline-options",
+            requireNotNull(options.getAnnotation(GET::class.java)).value,
+        )
+        assertEquals(
+            setOf("audio_lang", "subtitle_lang"),
+            options.parameterAnnotations
+                .flatMap { annotations -> annotations.filterIsInstance<Query>() }
+                .map(Query::value)
+                .toSet(),
+        )
+        val create = PlurxApi::class.java.declaredMethods.single {
+            it.name == "createOfflinePackage"
+        }
+        assertEquals(
+            "files/{id}/offline-packages",
+            requireNotNull(create.getAnnotation(POST::class.java)).value,
+        )
     }
 
     @Test

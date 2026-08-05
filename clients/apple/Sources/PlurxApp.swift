@@ -26,6 +26,7 @@ enum Route: Hashable {
 
 struct RootView: View {
     @EnvironmentObject var model: AppModel
+    @Environment(\.scenePhase) private var scenePhase
     #if os(iOS)
     @ObservedObject private var downloads = OfflineDownloadManager.shared
     #endif
@@ -62,5 +63,15 @@ struct RootView: View {
                 HomeView()
             }
         }
+        #if os(iOS)
+        .onChange(of: scenePhase) { _, phase in
+            guard phase == .active else { return }
+            Task { await downloads.resumePendingPreparation() }
+        }
+        .onChange(of: model.phase) { _, phase in
+            guard phase == .ready else { return }
+            Task { await downloads.resumePendingPreparation() }
+        }
+        #endif
     }
 }

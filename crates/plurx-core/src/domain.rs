@@ -531,6 +531,9 @@ pub struct OfflinePackage {
     pub audio_index: Option<i64>,
     pub audio_offset_ms: i64,
     pub subtitle_index: Option<i64>,
+    /// Snapshotted container language for the one native HLS rendition. The
+    /// capability route cannot depend on a file row surviving a later rescan.
+    pub subtitle_language: Option<String>,
     pub subtitle_mode: String,
     pub state: String,
     pub phase: String,
@@ -566,6 +569,7 @@ pub struct NewOfflinePackage {
     pub audio_index: Option<i64>,
     pub audio_offset_ms: i64,
     pub subtitle_index: Option<i64>,
+    pub subtitle_language: Option<String>,
     pub subtitle_mode: String,
     pub estimated_bytes: i64,
     pub reserved_bytes: i64,

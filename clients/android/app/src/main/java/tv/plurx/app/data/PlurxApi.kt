@@ -100,14 +100,14 @@ interface PlurxApi {
     @POST("items/{id}/progress")
     suspend fun progress(@Path("id") id: Long, @Body body: ProgressReq)
 
-    @GET("files/{id}/offline/options")
+    @GET("files/{id}/offline-options")
     suspend fun offlineOptions(
         @Path("id") id: Long,
-        @Query("audio_language") audioLanguage: String,
-        @Query("subtitle_language") subtitleLanguage: String,
+        @Query("audio_lang") audioLanguage: String,
+        @Query("subtitle_lang") subtitleLanguage: String,
     ): OfflineOptions
 
-    @POST("files/{id}/offline/packages")
+    @POST("files/{id}/offline-packages")
     suspend fun createOfflinePackage(
         @Path("id") id: Long,
         @Body body: CreateOfflinePackageReq,

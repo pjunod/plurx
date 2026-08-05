@@ -174,7 +174,13 @@ impl OfflineManager {
             .await;
         let outcome = self
             .transcode
-            .ensure_offline(&file, &spec, Instant::now() + PRODUCE_PASS, cancelled)
+            .ensure_offline(
+                &package.id,
+                &file,
+                &spec,
+                Instant::now() + PRODUCE_PASS,
+                cancelled,
+            )
             .await;
         match outcome {
             Ok(OfflineProduceOutcome::Ready(produced))
@@ -308,9 +314,10 @@ pub fn master_playlist(package: &OfflinePackage) -> String {
         .unwrap_or((1, 1));
     let subtitles = if package.subtitle_mode == "native" {
         package.subtitle_index.map(|index| {
+            let language = package.subtitle_language.as_deref().unwrap_or("und");
             format!(
                 "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"Downloaded\",\
-                 DEFAULT=YES,AUTOSELECT=YES,FORCED=NO,LANGUAGE=\"und\",\
+                 DEFAULT=YES,AUTOSELECT=YES,FORCED=NO,LANGUAGE=\"{language}\",\
                  URI=\"subs/{index}/index.m3u8\"\n"
             )
         })
@@ -366,6 +373,7 @@ mod tests {
             audio_index: Some(0),
             audio_offset_ms: 0,
             subtitle_index: index,
+            subtitle_language: index.map(|_| "en".to_owned()),
             subtitle_mode: mode.into(),
             state: "preparing".into(),
             phase: "transcoding".into(),
@@ -388,6 +396,7 @@ mod tests {
         let master = master_playlist(&package("native", Some(7)));
         assert!(master.contains("SUBTITLES=\"subs\""), "{master}");
         assert!(master.contains("subs/7/index.m3u8"), "{master}");
+        assert!(master.contains("LANGUAGE=\"en\""), "{master}");
         assert!(master.contains("RESOLUTION=1280x720"), "{master}");
         assert!(!master.contains("CODECS="), "{master}");
     }

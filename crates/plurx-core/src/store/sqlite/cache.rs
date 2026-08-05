@@ -162,7 +162,7 @@ impl TranscodeCacheStore for SqliteStore {
                        SELECT 1 FROM offline_packages p
                        WHERE p.recipe_hash = l.recipe_hash
                          AND p.node_id = l.node_id
-                         AND p.state IN ('preparing', 'ready')
+                         AND p.state IN ('queued', 'preparing', 'ready')
                    )
                  -- The rowid tiebreak makes eviction deterministic. Without it
                  -- a batch of entries finished in the same second sorts
@@ -211,6 +211,23 @@ impl TranscodeCacheStore for SqliteStore {
         .await
     }
 
+    async fn all_cache_rows(&self, node_id: &str) -> Result<Vec<CachedTranscode>, StoreError> {
+        let node = node_id.to_owned();
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {CACHE_COLS}
+                 FROM transcode_cache_locations l
+                 JOIN transcode_cache_recipes r ON r.recipe_hash = l.recipe_hash
+                 WHERE l.node_id = ?1"
+            ))?;
+            let rows = stmt
+                .query_map([node], cache_from_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
     async fn forget_cache_entry(&self, recipe_hash: &str, node_id: &str) -> Result<(), StoreError> {
         let (hash, node) = (recipe_hash.to_owned(), node_id.to_owned());
         self.with_conn(move |conn| {
@@ -247,7 +264,7 @@ impl TranscodeCacheStore for SqliteStore {
                        SELECT 1 FROM offline_packages p
                        WHERE p.recipe_hash = l.recipe_hash
                          AND p.node_id = l.node_id
-                         AND p.state IN ('preparing', 'ready')
+                         AND p.state IN ('queued', 'preparing', 'ready')
                    )",
                 params![node],
                 |row| row.get(0),
@@ -503,6 +520,7 @@ mod tests {
             audio_index: None,
             audio_offset_ms: 0,
             subtitle_index: None,
+            subtitle_language: None,
             subtitle_mode: "none".into(),
             estimated_bytes: 10,
             reserved_bytes: 20,
@@ -563,6 +581,7 @@ mod tests {
             audio_index: None,
             audio_offset_ms: 0,
             subtitle_index: None,
+            subtitle_language: None,
             subtitle_mode: "none".into(),
             estimated_bytes: 800,
             reserved_bytes: 1_000,

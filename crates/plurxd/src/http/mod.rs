@@ -126,7 +126,7 @@ pub fn router(state: AppState) -> Router {
         .route("/offline/packages/{id}/lease", put(offline::put_lease))
         .route(
             "/offline/packages/{id}/complete",
-            post(offline::delete_package),
+            post(offline::complete_package),
         )
         .route("/offline/media/{token}/master.m3u8", get(offline::master))
         .route("/offline/media/{token}/index.m3u8", get(offline::playlist))
@@ -2716,6 +2716,30 @@ mod tests {
         .await;
         assert_eq!(status_code, StatusCode::CONFLICT, "{lease}");
         assert_eq!(lease["code"], "package_not_ready");
+
+        assert!(state
+            .store
+            .mark_offline_package_ready(&package_id, "test-recipe", 15, 90_000)
+            .await
+            .expect("mark ready"));
+        for attempt in ["first completion", "idempotent retry"] {
+            let (status_code, body) = call(
+                &app,
+                post(
+                    &format!("/api/v1/offline/packages/{package_id}/complete"),
+                    Some(&admin),
+                    json!({}),
+                ),
+            )
+            .await;
+            assert_eq!(status_code, StatusCode::NO_CONTENT, "{attempt}: {body}");
+        }
+        assert!(state
+            .store
+            .offline_package_for_user(&package_id, 1)
+            .await
+            .expect("package lookup")
+            .is_none());
     }
 
     #[tokio::test]

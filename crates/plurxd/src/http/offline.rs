@@ -61,6 +61,19 @@ fn gib(value: i64) -> i64 {
     value.saturating_mul(1024 * 1024 * 1024)
 }
 
+fn offline_language_tag(language: Option<&str>) -> String {
+    let tag = plurx_core::tracks::bcp47_tag(language);
+    if tag.len() <= 35
+        && tag
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        tag.to_owned()
+    } else {
+        "und".to_owned()
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct OptionsQuery {
     audio_lang: Option<String>,
@@ -339,8 +352,8 @@ pub async fn create(
             "The selected audio track is not available.",
         ));
     }
-    let subtitle_mode = match request.subtitle_index {
-        None => "none",
+    let (subtitle_mode, subtitle_language) = match request.subtitle_index {
+        None => ("none", None),
         Some(index) => {
             let stream = file
                 .subtitle_streams
@@ -360,7 +373,10 @@ pub async fn create(
                     "This subtitle format cannot be included in a one-tap download yet.",
                 ));
             }
-            "native"
+            (
+                "native",
+                Some(offline_language_tag(stream.language.as_deref())),
+            )
         }
     };
 
@@ -381,6 +397,7 @@ pub async fn create(
         audio_index: request.audio_index,
         audio_offset_ms: file.audio_offset_ms,
         subtitle_index: request.subtitle_index,
+        subtitle_language,
         subtitle_mode: subtitle_mode.to_owned(),
         estimated_bytes: duration_ms
             .saturating_mul(rung.total_kbps as i64)
@@ -535,16 +552,43 @@ pub async fn delete_package(
     State(state): State<AppState>,
     AxPath(package_id): AxPath<String>,
 ) -> Result<StatusCode, ApiError> {
-    state.offline.cancel(&package_id).await;
+    release_package(&state, &package_id, user.id).await
+}
+
+/// A successful device download acknowledges that the server-side intent and
+/// pin are no longer needed. Completion deliberately has the same release
+/// effect as cancellation, but remains a named endpoint so the client action
+/// and the lifecycle contract are unambiguous.
+pub async fn complete_package(
+    AuthUser(user): AuthUser,
+    State(state): State<AppState>,
+    AxPath(package_id): AxPath<String>,
+) -> Result<StatusCode, ApiError> {
+    release_package(&state, &package_id, user.id).await
+}
+
+async fn release_package(
+    state: &AppState,
+    package_id: &str,
+    user_id: i64,
+) -> Result<StatusCode, ApiError> {
     if state
         .store
-        .delete_offline_package(&package_id, user.id)
+        .offline_package_for_user(package_id, user_id)
         .await?
+        .is_none()
     {
-        Ok(StatusCode::NO_CONTENT)
-    } else {
-        Err(ApiError::NotFound("offline package"))
+        return Ok(StatusCode::NO_CONTENT);
     }
+    state.offline.cancel(package_id).await;
+    // Release is idempotent. Returning the same result after a lost response
+    // lets clients safely retry without learning whether another user owns an
+    // opaque package id.
+    let _ = state
+        .store
+        .delete_offline_package(package_id, user_id)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn authorized_package(state: &AppState, token: &str) -> Result<OfflinePackage, ApiError> {
@@ -697,9 +741,62 @@ pub async fn subtitle(
         package.source_size,
         package.source_mtime,
     );
-    let bytes = tokio::fs::read(sidecar)
-        .await
-        .map_err(|_| ApiError::NotFound("offline subtitle"))?;
+    let bytes = match tokio::fs::read(&sidecar).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // Subtitle cache retention is independent from the offline pin.
+            // Recreate a pruned sidecar only when the file row still names the
+            // exact bytes snapshotted by this package.
+            let file = state
+                .store
+                .get_file(package.file_id)
+                .await?
+                .ok_or_else(|| {
+                    typed(
+                        StatusCode::GONE,
+                        "source_changed",
+                        "The source for this offline subtitle is no longer available.",
+                    )
+                })?;
+            let source_matches = file.path.to_string_lossy() == package.source_path
+                && file.size == package.source_size
+                && file.mtime == package.source_mtime
+                && file
+                    .subtitle_streams
+                    .iter()
+                    .any(|stream| stream.index == index && is_native_text_subtitle(&stream.codec));
+            if !source_matches {
+                return Err(typed(
+                    StatusCode::GONE,
+                    "source_changed",
+                    "The source for this offline subtitle has changed.",
+                ));
+            }
+            let recovered = crate::subtitles::ensure_vtt(&state.subs_dir, &file, index)
+                .await
+                .map_err(|message| {
+                    tracing::warn!(
+                        package_id = %package.id,
+                        subtitle_index = index,
+                        error = %message,
+                        "offline subtitle recovery failed"
+                    );
+                    typed(
+                        StatusCode::GONE,
+                        "subtitle_unavailable",
+                        "The offline subtitle could not be restored.",
+                    )
+                })?;
+            tokio::fs::read(recovered).await.map_err(|_| {
+                typed(
+                    StatusCode::GONE,
+                    "subtitle_unavailable",
+                    "The offline subtitle could not be restored.",
+                )
+            })?
+        }
+        Err(error) => return Err(ApiError::Internal(error.to_string())),
+    };
     Ok(hls_response(bytes, "text/vtt; charset=utf-8"))
 }
 
@@ -722,5 +819,12 @@ mod tests {
         assert!(!safe_ts_segment("seg0.ts"));
         assert!(!safe_ts_segment("../seg00000.ts"));
         assert!(!safe_ts_segment("seg00000.m4s"));
+    }
+
+    #[test]
+    fn offline_language_tags_are_playlist_safe() {
+        assert_eq!(offline_language_tag(Some("eng")), "en");
+        assert_eq!(offline_language_tag(Some("pt-BR")), "pt-BR");
+        assert_eq!(offline_language_tag(Some("en\"\n#EXT-X-KEY")), "und");
     }
 }

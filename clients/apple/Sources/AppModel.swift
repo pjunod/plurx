@@ -1,7 +1,7 @@
 import Combine
 import Foundation
 
-enum Phase {
+enum Phase: Equatable {
     case loading      // checking a saved session on launch
     case needServer   // no server yet, or the saved one is gone
     case needLogin    // server reachable, needs credentials

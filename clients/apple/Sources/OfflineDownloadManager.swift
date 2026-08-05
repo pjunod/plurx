@@ -4,6 +4,13 @@ import Combine
 import Foundation
 import Security
 
+private actor OfflinePreparationRegistry {
+    private var active: Set<String> = []
+
+    func begin(_ id: String) -> Bool { active.insert(id).inserted }
+    func finish(_ id: String) { active.remove(id) }
+}
+
 /// Owns the two system background HLS sessions and maps every task back to the
 /// durable local catalog. Server preparation may pause with the app; the
 /// AVFoundation transfer itself is system-owned once it starts.
@@ -23,18 +30,24 @@ final class OfflineDownloadManager: NSObject, ObservableObject {
     }()
     private let stateLock = NSLock()
     private var taskLocations: [Int: URL] = [:]
+    private var taskLocationWrites: [Int: Task<Void, Never>] = [:]
     private var backgroundCompletions: [String: () -> Void] = [:]
+    private let preparations = OfflinePreparationRegistry()
 
-    private lazy var wifiSession = makeSession(suffix: "wifi", anyNetwork: false)
-    private lazy var anyNetworkSession = makeSession(suffix: "any", anyNetwork: true)
+    private var wifiSession: AVAssetDownloadURLSession!
+    private var anyNetworkSession: AVAssetDownloadURLSession!
 
     override private init() {
         super.init()
+        // The URLSession delegate is self, so construction follows super.init;
+        // both references are then immutable in practice and cannot race on
+        // first access from a delegate callback and foreground catch-up.
+        wifiSession = makeSession(suffix: "wifi", anyNetwork: false)
+        anyNetworkSession = makeSession(suffix: "any", anyNetwork: true)
         Task {
             try? await catalog.reconcileLocalAssets()
             await refresh()
-            restoreTasks(in: wifiSession)
-            restoreTasks(in: anyNetworkSession)
+            await restoreTasks()
         }
     }
 
@@ -94,6 +107,7 @@ final class OfflineDownloadManager: NSObject, ObservableObject {
             actualHeight: nil,
             audioLabel: nil,
             subtitleLabel: nil,
+            subtitleIndex: nil,
             state: .intent,
             phase: "checking_options",
             bytesDownloaded: 0,
@@ -138,6 +152,7 @@ final class OfflineDownloadManager: NSObject, ObservableObject {
                 language: subtitle?.language,
                 title: subtitle?.title
             )
+            local.subtitleIndex = subtitle?.index
             local.state = .queued
             local.phase = "waiting_for_server"
             local.bytesTotal = quality.estimatedBytes
@@ -190,7 +205,7 @@ final class OfflineDownloadManager: NSObject, ObservableObject {
     }
 
     func resume(_ item: OfflineItem) async {
-        for session in [wifiSession, anyNetworkSession] {
+        for session in [wifiSession!, anyNetworkSession!] {
             let tasks = await allTasks(in: session)
             if let task = tasks.first(where: { $0.taskDescription == item.id }) {
                 task.resume()
@@ -214,7 +229,7 @@ final class OfflineDownloadManager: NSObject, ObservableObject {
     }
 
     func remove(_ item: OfflineItem) async {
-        for session in [wifiSession, anyNetworkSession] {
+        for session in [wifiSession!, anyNetworkSession!] {
             let tasks = await allTasks(in: session)
             tasks.filter { $0.taskDescription == item.id }.forEach { $0.cancel() }
         }
@@ -274,11 +289,20 @@ final class OfflineDownloadManager: NSObject, ObservableObject {
         stateLock.lock()
         backgroundCompletions[identifier] = completion
         stateLock.unlock()
-        _ = wifiSession
-        _ = anyNetworkSession
     }
 
     private func awaitPreparation(localId: String, api: PlurxAPI) async throws {
+        guard await preparations.begin(localId) else { return }
+        do {
+            try await pollPreparation(localId: localId, api: api)
+            await preparations.finish(localId)
+        } catch {
+            await preparations.finish(localId)
+            throw error
+        }
+    }
+
+    private func pollPreparation(localId: String, api: PlurxAPI) async throws {
         guard var local = await catalog.item(id: localId), let packageId = local.packageId else {
             return
         }
@@ -312,7 +336,7 @@ final class OfflineDownloadManager: NSObject, ObservableObject {
     }
 
     private func startTransfer(local: OfflineItem, api: PlurxAPI) async throws {
-        for session in [wifiSession, anyNetworkSession] {
+        for session in [wifiSession!, anyNetworkSession!] {
             let tasks = await allTasks(in: session)
             if let task = tasks.first(where: { $0.taskDescription == local.id }) {
                 task.resume()
@@ -326,8 +350,12 @@ final class OfflineDownloadManager: NSObject, ObservableObject {
                 return
             }
         }
-        guard let packageId = local.packageId else { return }
-        var item = local
+        // Another foreground trigger may have updated or removed this row
+        // while the task lookup was in flight. The durable row owns the stable
+        // token decision, so re-read it immediately before binding a lease.
+        guard var item = await catalog.item(id: local.id),
+              let packageId = item.packageId
+        else { return }
         let token = item.leaseToken ?? Self.randomToken()
         item.leaseToken = token
         item.updatedAt = Date()
@@ -354,11 +382,24 @@ final class OfflineDownloadManager: NSObject, ObservableObject {
         }
 
         let asset = AVURLAsset(url: manifest)
-        let selection = try await asset.load(.preferredMediaSelection)
+        let preferred = try await asset.load(.preferredMediaSelection)
+        guard let selection = preferred.mutableCopy() as? AVMutableMediaSelection else {
+            throw APIError.transport("The download media selection could not be created")
+        }
+        if item.subtitleIndex != nil {
+            guard let group = try await asset.loadMediaSelectionGroup(for: .legible),
+                  let option = group.options.first
+            else {
+                throw APIError.transport("The selected offline subtitle is unavailable")
+            }
+            // The server advertises exactly the requested rendition. Select it
+            // explicitly; the platform's preferred selection may choose none.
+            selection.select(option, in: group)
+        }
         let configuration = AVAssetDownloadConfiguration(asset: asset, title: item.title)
         configuration.primaryContentConfiguration.mediaSelections = [selection]
         configuration.auxiliaryContentConfigurations = []
-        let session = settings.offlineNetwork == .wifiOnly ? wifiSession : anyNetworkSession
+        let session = settings.offlineNetwork == .wifiOnly ? wifiSession! : anyNetworkSession!
         let task = session.makeAssetDownloadTask(downloadConfiguration: configuration)
         task.taskDescription = item.id
         item.state = .downloading
@@ -408,23 +449,33 @@ final class OfflineDownloadManager: NSObject, ObservableObject {
         )
     }
 
-    private func restoreTasks(in session: AVAssetDownloadURLSession) {
-        session.getAllTasks { [weak self] tasks in
-            guard let self else { return }
-            Task {
-                for task in tasks {
-                    guard let id = task.taskDescription,
-                          var item = await self.catalog.item(id: id),
-                          item.state != .downloaded
-                    else { continue }
-                    item.state = task.state == .suspended ? .paused : .downloading
-                    item.phase = task.state == .suspended ? "paused" : item.phase
-                    item.updatedAt = Date()
-                    try? await self.catalog.replace(item)
-                }
-                await self.refresh()
-            }
+    private func restoreTasks() async {
+        let wifiTasks = await allTasks(in: wifiSession!)
+        let anyNetworkTasks = await allTasks(in: anyNetworkSession!)
+        let tasks = wifiTasks + anyNetworkTasks
+        let activeIds = Set(tasks.compactMap(\.taskDescription))
+        for task in tasks {
+            guard let id = task.taskDescription,
+                  var item = await catalog.item(id: id),
+                  item.state != .downloaded
+            else { continue }
+            item.state = task.state == .suspended ? .paused : .downloading
+            item.phase = task.state == .suspended ? "paused" : item.phase
+            item.updatedAt = Date()
+            try? await catalog.replace(item)
         }
+        // A persisted downloading row with no background task is interrupted,
+        // not missing media and not still moving. Foreground catch-up can then
+        // resume it through the ordinary preparation path.
+        for var item in await catalog.allItems()
+            where item.state == .downloading && !activeIds.contains(item.id) {
+            item.state = .paused
+            item.phase = "paused"
+            item.errorMessage = "Download interrupted — tap Resume"
+            item.updatedAt = Date()
+            try? await catalog.replace(item)
+        }
+        await refresh()
     }
 
     private func allTasks(in session: AVAssetDownloadURLSession) async -> [URLSessionTask] {
@@ -464,9 +515,6 @@ final class OfflineDownloadManager: NSObject, ObservableObject {
     }
 
     private func rememberLocation(_ location: URL, for task: AVAssetDownloadTask) {
-        stateLock.lock()
-        taskLocations[task.taskIdentifier] = location
-        stateLock.unlock()
         guard let id = task.taskDescription,
               let relative = OfflineCatalog.relativeLocalPath(for: location)
         else { return }
@@ -474,12 +522,18 @@ final class OfflineDownloadManager: NSObject, ObservableObject {
         resourceValues.isExcludedFromBackup = true
         var protectedLocation = location
         try? protectedLocation.setResourceValues(resourceValues)
-        Task {
-            guard var item = await catalog.item(id: id) else { return }
+        stateLock.lock()
+        let priorWrite = taskLocationWrites[task.taskIdentifier]
+        let write = Task { [weak self] in
+            await priorWrite?.value
+            guard let self, var item = await self.catalog.item(id: id) else { return }
             item.localAssetRelativePath = relative
             item.updatedAt = Date()
-            try? await catalog.replace(item)
+            try? await self.catalog.replace(item)
         }
+        taskLocations[task.taskIdentifier] = location
+        taskLocationWrites[task.taskIdentifier] = write
+        stateLock.unlock()
     }
 }
 
@@ -531,8 +585,10 @@ extension OfflineDownloadManager: AVAssetDownloadDelegate {
         guard let id = task.taskDescription else { return }
         stateLock.lock()
         let location = taskLocations.removeValue(forKey: task.taskIdentifier)
+        let locationWrite = taskLocationWrites.removeValue(forKey: task.taskIdentifier)
         stateLock.unlock()
         Task {
+            await locationWrite?.value
             guard var item = await catalog.item(id: id) else { return }
             if let error {
                 item.state = .paused
@@ -540,13 +596,15 @@ extension OfflineDownloadManager: AVAssetDownloadDelegate {
                 item.errorMessage = (error as NSError).code == NSURLErrorCancelled
                     ? "Paused — tap Resume"
                     : error.localizedDescription
-                if let path = item.localAssetRelativePath {
+                let path = location.flatMap(OfflineCatalog.relativeLocalPath(for:))
+                    ?? item.localAssetRelativePath
+                if let path {
                     try? FileManager.default.removeItem(at: OfflineCatalog.localURL(for: path))
                     item.localAssetRelativePath = nil
                 }
             } else {
-                let path = item.localAssetRelativePath
-                    ?? location.flatMap(OfflineCatalog.relativeLocalPath(for:))
+                let path = location.flatMap(OfflineCatalog.relativeLocalPath(for:))
+                    ?? item.localAssetRelativePath
                 guard let path else {
                     item.state = .failed
                     item.errorMessage = "The completed download location was not saved."
@@ -558,9 +616,13 @@ extension OfflineDownloadManager: AVAssetDownloadDelegate {
                 let asset = AVURLAsset(url: localURL)
                 let duration = try? await asset.load(.duration)
                 let subtitleReady: Bool
-                if item.subtitleLabel != nil {
-                    subtitleReady = (try? await asset.loadMediaSelectionGroup(for: .legible))?
-                        .options.isEmpty == false
+                if item.subtitleIndex != nil {
+                    if let group = try? await asset.loadMediaSelectionGroup(for: .legible),
+                       let cache = asset.assetCache {
+                        subtitleReady = !cache.mediaSelectionOptions(in: group).isEmpty
+                    } else {
+                        subtitleReady = false
+                    }
                 } else {
                     subtitleReady = true
                 }

@@ -149,7 +149,10 @@ impl WatchStore for SqliteStore {
                      duration_ms = COALESCE(excluded.duration_ms, watch_state.duration_ms),
                      watched = watch_state.watched OR excluded.watched,
                      updated_at = excluded.updated_at
-                 WHERE excluded.updated_at >= watch_state.updated_at
+                 -- A dated replay must not rewind a newer device. An ordinary
+                 -- online heartbeat is authoritative now even if an imported
+                 -- clock previously left a future timestamp in this row.
+                 WHERE ?7 = 1 OR excluded.updated_at >= watch_state.updated_at
                  RETURNING position_ms, duration_ms, watched, updated_at",
                 params![
                     user_id,
@@ -157,7 +160,8 @@ impl WatchStore for SqliteStore {
                     position_ms,
                     effective,
                     watched as i64,
-                    at
+                    at,
+                    recorded_at.is_none() as i64
                 ],
                 |row| watch_from_row(row, 0),
             ).or_else(|error| {
@@ -699,6 +703,55 @@ mod tests {
             "progress never implicitly un-watches"
         );
         assert_eq!(stale_unfinished.position_ms, 98_000);
+    }
+
+    #[tokio::test]
+    async fn online_progress_bypasses_a_future_imported_clock() {
+        let store = SqliteStore::open_in_memory().expect("open");
+        let user = store.create_user("u", "h", true).await.expect("user");
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "M".into(),
+                kind: LibraryKind::Movies,
+                paths: vec![],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+        let movie = store
+            .insert_item(&NewItem {
+                library_id: lib.id,
+                kind: ItemKind::Movie,
+                parent_id: None,
+                title: "Arrival".into(),
+                year: Some(2016),
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("movie");
+        store
+            .put_progress(user.id, movie, 10_000, Some(100_000))
+            .await
+            .expect("initial");
+        let future = 4_000_000_000_i64;
+        store
+            .with_conn(move |conn| {
+                conn.execute(
+                    "UPDATE watch_state SET updated_at = ?3 WHERE user_id = ?1 AND item_id = ?2",
+                    rusqlite::params![user.id, movie, future],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("inject skew");
+
+        let current = store
+            .put_progress(user.id, movie, 40_000, Some(100_000))
+            .await
+            .expect("online heartbeat");
+        assert_eq!(current.position_ms, 40_000);
+        assert!(current.updated_at < future);
     }
 
     #[tokio::test]

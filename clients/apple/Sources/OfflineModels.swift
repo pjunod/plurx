@@ -50,6 +50,9 @@ struct OfflineItem: Codable, Identifiable, Equatable {
     var actualHeight: Int?
     var audioLabel: String?
     var subtitleLabel: String?
+    /// The server stream index is retained as a durable selected/not-selected
+    /// signal even when the container has no human-readable language or title.
+    var subtitleIndex: Int?
     var state: OfflineState
     var phase: String?
     var bytesDownloaded: Int64

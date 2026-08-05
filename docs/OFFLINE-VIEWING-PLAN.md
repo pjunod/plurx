@@ -1,7 +1,7 @@
 # Offline viewing — one-tap, app-managed downloads
 
-**Status:** reviewed · revised · implementation candidate complete · draft PR
-review and physical-device acceptance pending ·
+**Status:** reviewed · revised · implementation candidate complete · Fable
+changes reconciled on draft PR #68 · re-review and physical-device acceptance pending ·
 **Executes:** offline viewing requested 2026-08-05 · **Written:** 2026-08-05 ·
 **Revised:** 2026-08-05 against review base `2ff661da` · **Implementation
 target:** `origin/main` at `7874b37b`
@@ -508,10 +508,12 @@ POST   /api/v1/offline/packages/{id}/complete  client has a verified local copy
 DELETE /api/v1/offline/packages/{id}           cancel preparation / release lease
 ```
 
-Both require the owning user and are idempotent. Completion or cancellation
-removes this package's lease and pin, but leaves the content-addressed VOD in
-the ordinary cache for reuse and normal LRU eviction. If another package row
-references the same recipe, its lease and preparation interest remain.
+Both are owner-scoped and idempotent. Completion or cancellation immediately
+removes the durable package row, its lease, and its pin; status intentionally
+ends at that acknowledgement boundary. The operation leaves the
+content-addressed VOD in the ordinary cache for reuse and normal LRU eviction.
+If another package row references the same recipe, its lease and preparation
+interest remain.
 
 The client calls `complete` only after the platform download callback and a
 local playability check. If that acknowledgement cannot reach the server, the
@@ -542,6 +544,7 @@ CREATE TABLE offline_packages (
     audio_index        INTEGER,
     audio_offset_ms    INTEGER NOT NULL DEFAULT 0,
     subtitle_index     INTEGER,
+    subtitle_language  TEXT,
     subtitle_mode      TEXT NOT NULL
                        CHECK (subtitle_mode IN ('none', 'native', 'burned')),
     state              TEXT NOT NULL
@@ -1175,8 +1178,9 @@ Land reviewable slices:
   preemption, durable restart, and active-claim stale-sweep protection.
 - **M2c:** separate offline budget, per-user quota, pins, activity, ETA, and
   metric plumbing.
-- **Corrective cache-reader change:** protect active playback readers in a
-  separate commit with its regression test; do not defer evidence.
+- **Separate cache-reader follow-up:** the pre-existing playback-reader/LRU race
+  is not introduced by offline viewing. Keep it out of this feature diff and
+  land its own focused regression/fix before enabling offline viewing by default.
 
 **Acceptance:** prepare the synthetic HEVC/HDR + TrueHD case as 720p
 H.264/AAC/SDR while a recommended PGS selection safely becomes Off; prepare an
@@ -1256,11 +1260,12 @@ Do not chase a repository-wide line-coverage percentage. The coverage target is
 decisions, and destructive cleanup branches; framework delegate plumbing earns
 one restoration integration test rather than mocks of every callback.
 
-The current suite has three gaps this work must close: it has no durable native
+The current suite has three release-gate gaps: it has no durable native
 download-task harness, no cache-only player assertion that fails on any
 upstream access, and no server test where cache eviction races an active VOD
-reader. Add those as named regression checks rather than relying on the final
-manual flight simulation.
+reader. The reader race predates this branch and remains a separate focused
+follow-up; the two device behaviors remain physical acceptance work rather
+than reasons to widen this draft.
 
 ### 15.1 Server unit and integration coverage
 
@@ -1385,12 +1390,23 @@ Automated evidence recorded on 2026-08-05:
   tests, passed.
 - iOS and tvOS generic Debug/Release builds — passed.
 - Android `testDebugUnitTest`, `lintDebug`, and `assembleRelease` — passed.
-- `scripts/validate lint` — 17 points, 20 checks, 322 audited files.
+- `scripts/validate lint` — 17 points, 20 checks, 323 audited files.
 - The `offline.viewing` CI plan selects the store/API contract plus both native
   client suites in the correct provider-to-consumer direction.
 
-The draft is deliberately not merge-ready until review reconciles these
-remaining evidence gaps:
+Fable's first code review has been reconciled on the same unmerged draft. The
+server now separates filesystem ownership from eviction policy, binds a recipe
+before production, recovers pruned native subtitle sidecars from an unchanged
+source snapshot, reports part-boundary preparation progress, throttles lease
+touches, and lets ordinary online heartbeats override a skewed imported clock.
+Android now has route-string and subtitle-group contract tests plus foreground
+recovery for Android 12+ service-start refusal. Apple serializes preparation per
+item, explicitly selects and verifies the cached subtitle rendition, reconciles
+taskless downloads, and resumes preparation/progress sync on app foreground.
+The draft remains unmerged pending Fable's re-review.
+
+The draft is deliberately not merge-ready until Fable re-reviews the
+reconciliation and these remaining release-evidence gaps are closed:
 
 1. Physical iPhone/iPad: background transfer, system termination restoration,
    force-quit recovery, selected WebVTT, airplane-mode start and midpoint seek.
@@ -1403,9 +1419,9 @@ remaining evidence gaps:
    family in §13. Typed package states, quota settings, and diagnostic logs are
    present; the richer observability surface remains a named review follow-up.
 
-Do not merge the draft PR before those findings are reviewed. Fable feedback is
-expected to be reconciled on the same branch, with judgment calls recorded in
-the PR and this ledger updated if the contract changes.
+Do not merge the draft PR before those findings are reviewed. Any further Fable
+feedback belongs on the same branch, with judgment calls recorded in the PR and
+this ledger updated if the contract changes.
 
 ## 18. Platform references — primary documentation
 

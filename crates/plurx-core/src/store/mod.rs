@@ -767,6 +767,11 @@ pub trait TranscodeCacheStore: Send + Sync + 'static {
         older_than_unix: i64,
     ) -> Result<Vec<CachedTranscode>, StoreError>;
 
+    /// Every local cache row, complete or claimed, without eviction policy.
+    /// The filesystem orphan pass needs storage ownership facts; filtered LRU
+    /// and stale-candidate queries are deliberately the wrong truth for it.
+    async fn all_cache_rows(&self, node_id: &str) -> Result<Vec<CachedTranscode>, StoreError>;
+
     /// Forget one copy. The recipe row goes too when its last copy does: a
     /// recipe nobody has is not a fact worth keeping on a single node, and on
     /// a cluster the other nodes' rows keep it alive.
@@ -815,6 +820,15 @@ pub trait OfflinePackageStore: Send + Sync + 'static {
     ) -> Result<Option<OfflinePackage>, StoreError>;
 
     async fn requeue_offline_package(&self, package_id: &str) -> Result<bool, StoreError>;
+
+    /// Bind the content-addressed recipe as soon as production starts. The
+    /// completed cache entry must become offline-owned before subtitle
+    /// extraction and final publication can leave a gap for budget eviction.
+    async fn set_offline_package_recipe(
+        &self,
+        package_id: &str,
+        recipe_hash: &str,
+    ) -> Result<bool, StoreError>;
 
     async fn update_offline_progress(
         &self,

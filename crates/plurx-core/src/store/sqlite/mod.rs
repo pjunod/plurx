@@ -462,6 +462,7 @@ const MIGRATIONS: &[&str] = &[
         audio_index        INTEGER,
         audio_offset_ms    INTEGER NOT NULL DEFAULT 0,
         subtitle_index     INTEGER,
+        subtitle_language  TEXT,
         subtitle_mode      TEXT NOT NULL
                            CHECK (subtitle_mode IN ('none', 'native', 'burned')),
         state              TEXT NOT NULL
