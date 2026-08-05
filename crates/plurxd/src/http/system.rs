@@ -1,6 +1,7 @@
 //! Server identity, first-run setup, settings, and scan status.
 
 use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
@@ -1142,7 +1143,7 @@ pub async fn scan_status(
 /// same global indicator in every client.
 #[derive(Serialize)]
 pub struct Activity {
-    /// Machine-readable kind: "scan" | "enrich" | "stream" (more later).
+    /// Machine-readable kind: scan, enrich, stream, or offline work.
     pub kind: &'static str,
     /// Short human label, e.g. "Scanning Movies".
     pub label: String,
@@ -1150,6 +1151,104 @@ pub struct Activity {
     pub detail: Option<String>,
     /// 0–100 when a meaningful percentage exists.
     pub percent: Option<u8>,
+}
+
+#[derive(Clone, Serialize)]
+struct OfflineWork {
+    /// `prepare` or `send`; neither is a playback session.
+    kind: &'static str,
+    user: String,
+    file_id: i64,
+    item_id: Option<i64>,
+    title: String,
+    state: String,
+    phase: String,
+    target_height: i64,
+    percent: Option<u8>,
+    bytes_sent: Option<u64>,
+    bytes_total: i64,
+    started_unix: i64,
+}
+
+fn now_unix() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+async fn offline_work(state: &AppState) -> Result<Vec<OfflineWork>, ApiError> {
+    let now = now_unix();
+    let rows = state
+        .store
+        // Lease touches are deliberately throttled to one SQLite write per
+        // minute. Fetch a 65-second candidate window, then use the exact
+        // process-local response meter below to decide whether it is sending
+        // now; this preserves the write bound without a false 40-second gap.
+        .offline_activity_packages(&state.node_id, now, now.saturating_sub(65), 50)
+        .await?;
+    let users: HashMap<i64, String> = state
+        .store
+        .list_users()
+        .await?
+        .into_iter()
+        .map(|user| (user.id, user.username))
+        .collect();
+    let mut work = Vec::with_capacity(rows.len());
+    for row in rows {
+        let package = row.package;
+        let transfer_bytes = row
+            .lease_active
+            .then(|| state.offline.transfer_bytes(&package.id))
+            .flatten();
+        if package.state == "ready" && transfer_bytes.is_none() {
+            continue;
+        }
+        let file = state.store.get_file(package.file_id).await?;
+        let item_id = file.as_ref().map(|file| file.item_id);
+        let title = match item_id {
+            Some(item_id) => state
+                .store
+                .get_item(item_id)
+                .await?
+                .map(|item| item.title)
+                .unwrap_or_else(|| "Unavailable media".to_owned()),
+            None => "Unavailable media".to_owned(),
+        };
+        work.push(OfflineWork {
+            kind: if transfer_bytes.is_some() {
+                "send"
+            } else {
+                "prepare"
+            },
+            user: users
+                .get(&package.user_id)
+                .cloned()
+                .unwrap_or_else(|| "Unknown profile".to_owned()),
+            file_id: package.file_id,
+            item_id,
+            title,
+            state: package.state,
+            phase: package.phase,
+            target_height: package.target_height,
+            percent: (package.progress_millis > 0)
+                .then_some(((package.progress_millis.clamp(0, 1_000) * 100) / 1_000) as u8),
+            bytes_sent: transfer_bytes,
+            bytes_total: package.actual_bytes.unwrap_or(package.estimated_bytes),
+            started_unix: package.created_at,
+        });
+    }
+    Ok(work)
+}
+
+fn activity_bytes(bytes: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+    if bytes >= GIB {
+        format!("{:.1} GB", bytes as f64 / GIB as f64)
+    } else {
+        format!("{} MB", bytes.div_ceil(MIB))
+    }
 }
 
 /// GET /api/v1/activity — everything in flight, for the always-visible
@@ -1225,6 +1324,38 @@ pub async fn activity(
             // report a percentage and inventing one would be a lie that reads
             // like a measurement.
             percent: None,
+        });
+    }
+
+    for work in offline_work(&state).await? {
+        let sending = work.kind == "send";
+        activities.push(Activity {
+            kind: if sending {
+                "offline_send"
+            } else {
+                "offline_prepare"
+            },
+            label: if sending {
+                format!("Sending offline · {}", work.title)
+            } else {
+                format!("Preparing offline · {}", work.title)
+            },
+            detail: if sending {
+                Some(format!(
+                    "{} / {}",
+                    activity_bytes(work.bytes_sent.unwrap_or(0)),
+                    activity_bytes(work.bytes_total.max(0) as u64)
+                ))
+            } else if work.state == "queued" {
+                Some(format!("Waiting for encoder · {}p", work.target_height))
+            } else {
+                Some(format!(
+                    "{} · {}p",
+                    work.phase.replace('_', " "),
+                    work.target_height
+                ))
+            },
+            percent: (!sending).then_some(work.percent).flatten(),
         });
     }
 
@@ -1393,6 +1524,7 @@ pub async fn activity_detail(
     // the superset beside it: the same HLS sessions plus the two routes that
     // were never listed at all.
     let (sessions, deliveries) = deliveries(&state).await;
+    let offline = offline_work(&state).await?;
     let names: HashMap<i64, String> = state
         .store
         .list_libraries()
@@ -1429,6 +1561,7 @@ pub async fn activity_detail(
     Ok(Json(serde_json::json!({
         "sessions": sessions,
         "deliveries": deliveries,
+        "offline": offline,
         "scans": scans,
         "producing": state.jobs.producing_now().await,
         "trakt": {
@@ -1482,6 +1615,42 @@ pub async fn metrics(State(state): State<AppState>) -> impl axum::response::Into
         .map(|l| l.len())
         .unwrap_or(0);
     let users = state.store.count_users().await.unwrap_or(0);
+    let offline = state
+        .store
+        .offline_package_stats(&state.node_id, now_unix())
+        .await
+        .unwrap_or_default();
+    let offline_metrics = format!(
+        "# HELP plurx_offline_packages Durable offline packages by state.\n\
+         # TYPE plurx_offline_packages gauge\n\
+         plurx_offline_packages{{state=\"queued\"}} {}\n\
+         plurx_offline_packages{{state=\"preparing\"}} {}\n\
+         plurx_offline_packages{{state=\"ready\"}} {}\n\
+         plurx_offline_packages{{state=\"failed\"}} {}\n\
+         # HELP plurx_offline_bytes Package bytes by state, actual when ready and reserved otherwise.\n\
+         # TYPE plurx_offline_bytes gauge\n\
+         plurx_offline_bytes{{state=\"queued\"}} {}\n\
+         plurx_offline_bytes{{state=\"preparing\"}} {}\n\
+         plurx_offline_bytes{{state=\"ready\"}} {}\n\
+         plurx_offline_bytes{{state=\"failed\"}} {}\n\
+         # HELP plurx_offline_active_leases Unexpired leases for ready offline packages.\n\
+         # TYPE plurx_offline_active_leases gauge\n\
+         plurx_offline_active_leases {}\n\
+         # HELP plurx_cache_pinned_bytes Completed cache bytes protected by offline packages.\n\
+         # TYPE plurx_cache_pinned_bytes gauge\n\
+         plurx_cache_pinned_bytes{{reason=\"offline\"}} {}\n{}",
+        offline.queued,
+        offline.preparing,
+        offline.ready,
+        offline.failed,
+        offline.queued_bytes,
+        offline.preparing_bytes,
+        offline.ready_bytes,
+        offline.failed_bytes,
+        offline.active_leases,
+        offline.pinned_bytes,
+        state.offline.prometheus(),
+    );
 
     // Integration counters (plan P6). Scans by what asked for them, and how
     // many times another application has called in at all — the pair that
@@ -1531,7 +1700,7 @@ pub async fn metrics(State(state): State<AppState>) -> impl axum::response::Into
          # HELP plurx_users_total Registered users.\n\
          # TYPE plurx_users_total gauge\n\
          plurx_users_total {users}\n\
-         {scans}",
+         {scans}{offline_metrics}",
         version = crate::version::SEMVER,
         build = crate::version::BUILD,
     );

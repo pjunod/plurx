@@ -18,6 +18,7 @@ use sha2::{Digest, Sha256};
 
 use super::error::ApiError;
 use super::extract::AuthUser;
+use crate::offline::OfflineQuota;
 use crate::state::AppState;
 
 const PACKAGE_TTL_SECS: i64 = 7 * 24 * 60 * 60;
@@ -417,7 +418,10 @@ pub async fn create(
         .create_offline_package(&new, max_rows, max_user, max_global)
         .await?
     {
-        OfflineCreateOutcome::Created(package) => Ok((StatusCode::ACCEPTED, Json(status(package)))),
+        OfflineCreateOutcome::Created(package) => {
+            state.offline.record_request(package.target_height);
+            Ok((StatusCode::ACCEPTED, Json(status(package))))
+        }
         OfflineCreateOutcome::Existing(package) => {
             let code = if package.state == "ready" {
                 StatusCode::OK
@@ -431,21 +435,34 @@ pub async fn create(
             "request_conflict",
             "That request_id was already used with different download options.",
         )),
-        OfflineCreateOutcome::RowLimit { limit } => Err(typed(
-            StatusCode::TOO_MANY_REQUESTS,
-            "quota_exceeded",
-            format!("The offline package registry limit is {limit} items."),
-        )),
-        OfflineCreateOutcome::ByteLimit { used, limit } => Err(typed(
-            StatusCode::INSUFFICIENT_STORAGE,
-            "quota_exceeded",
-            format!("This profile has reserved {used} of {limit} offline bytes."),
-        )),
-        OfflineCreateOutcome::GlobalByteLimit { used, limit } => Err(typed(
-            StatusCode::INSUFFICIENT_STORAGE,
-            "insufficient_storage",
-            format!("The server has reserved {used} of {limit} offline bytes."),
-        )),
+        OfflineCreateOutcome::RowLimit { limit } => {
+            state.offline.record_quota_rejection(OfflineQuota::Registry);
+            Err(typed(
+                StatusCode::TOO_MANY_REQUESTS,
+                "quota_exceeded",
+                format!("The offline package registry limit is {limit} items."),
+            ))
+        }
+        OfflineCreateOutcome::ByteLimit { used, limit } => {
+            state
+                .offline
+                .record_quota_rejection(OfflineQuota::UserBytes);
+            Err(typed(
+                StatusCode::INSUFFICIENT_STORAGE,
+                "quota_exceeded",
+                format!("This profile has reserved {used} of {limit} offline bytes."),
+            ))
+        }
+        OfflineCreateOutcome::GlobalByteLimit { used, limit } => {
+            state
+                .offline
+                .record_quota_rejection(OfflineQuota::GlobalBytes);
+            Err(typed(
+                StatusCode::INSUFFICIENT_STORAGE,
+                "insufficient_storage",
+                format!("The server has reserved {used} of {limit} offline bytes."),
+            ))
+        }
     }
 }
 
@@ -552,7 +569,7 @@ pub async fn delete_package(
     State(state): State<AppState>,
     AxPath(package_id): AxPath<String>,
 ) -> Result<StatusCode, ApiError> {
-    release_package(&state, &package_id, user.id).await
+    release_package(&state, &package_id, user.id, ReleaseKind::Cancelled).await
 }
 
 /// A successful device download acknowledges that the server-side intent and
@@ -564,30 +581,42 @@ pub async fn complete_package(
     State(state): State<AppState>,
     AxPath(package_id): AxPath<String>,
 ) -> Result<StatusCode, ApiError> {
-    release_package(&state, &package_id, user.id).await
+    release_package(&state, &package_id, user.id, ReleaseKind::Completed).await
+}
+
+#[derive(Clone, Copy)]
+enum ReleaseKind {
+    Cancelled,
+    Completed,
 }
 
 async fn release_package(
     state: &AppState,
     package_id: &str,
     user_id: i64,
+    kind: ReleaseKind,
 ) -> Result<StatusCode, ApiError> {
-    if state
+    let Some(package) = state
         .store
         .offline_package_for_user(package_id, user_id)
         .await?
-        .is_none()
-    {
+    else {
         return Ok(StatusCode::NO_CONTENT);
-    }
+    };
     state.offline.cancel(package_id).await;
     // Release is idempotent. Returning the same result after a lost response
     // lets clients safely retry without learning whether another user owns an
     // opaque package id.
-    let _ = state
+    let deleted = state
         .store
         .delete_offline_package(package_id, user_id)
         .await?;
+    if deleted {
+        if matches!(kind, ReleaseKind::Cancelled) {
+            state.offline.record_cancellation(&package);
+        }
+        state.offline.forget_transfer(package_id);
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -646,7 +675,13 @@ async fn package_dir(state: &AppState, package: &OfflinePackage) -> Result<PathB
     Ok(state.cache_dir.join(relative))
 }
 
-fn hls_response(bytes: Vec<u8>, content_type: &'static str) -> Response {
+fn hls_response(
+    state: &AppState,
+    package: &OfflinePackage,
+    bytes: Vec<u8>,
+    content_type: &'static str,
+) -> Response {
+    state.offline.record_transfer(&package.id, bytes.len());
     let mut response = Body::from(bytes).into_response();
     response
         .headers_mut()
@@ -669,6 +704,8 @@ pub async fn master(
     let _ = package_dir(&state, &package).await?;
     let playlist = crate::offline::master_playlist(&package);
     Ok(hls_response(
+        &state,
+        &package,
         playlist.into_bytes(),
         "application/vnd.apple.mpegurl",
     ))
@@ -688,7 +725,12 @@ pub async fn playlist(
             "ready offline package does not contain a VOD playlist".to_owned(),
         ));
     }
-    Ok(hls_response(bytes, "application/vnd.apple.mpegurl"))
+    Ok(hls_response(
+        &state,
+        &package,
+        bytes,
+        "application/vnd.apple.mpegurl",
+    ))
 }
 
 fn safe_ts_segment(segment: &str) -> bool {
@@ -710,7 +752,7 @@ pub async fn segment(
     let bytes = tokio::fs::read(dir.join(segment))
         .await
         .map_err(|_| ApiError::NotFound("offline segment"))?;
-    Ok(hls_response(bytes, "video/mp2t"))
+    Ok(hls_response(&state, &package, bytes, "video/mp2t"))
 }
 
 pub async fn subtitle(
@@ -727,6 +769,8 @@ pub async fn subtitle(
             ApiError::Internal("ready offline package has no duration".to_owned())
         })?;
         return Ok(hls_response(
+            &state,
+            &package,
             crate::offline::subtitle_playlist(duration).into_bytes(),
             "application/vnd.apple.mpegurl",
         ));
@@ -797,7 +841,12 @@ pub async fn subtitle(
         }
         Err(error) => return Err(ApiError::Internal(error.to_string())),
     };
-    Ok(hls_response(bytes, "text/vtt; charset=utf-8"))
+    Ok(hls_response(
+        &state,
+        &package,
+        bytes,
+        "text/vtt; charset=utf-8",
+    ))
 }
 
 #[cfg(test)]

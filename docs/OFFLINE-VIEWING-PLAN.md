@@ -1108,19 +1108,35 @@ Neither appears under Watching Now. Metrics use bounded labels only:
 
 ```text
 plurx_offline_packages{state="queued|preparing|ready|failed"}
-plurx_offline_prepare_seconds{result="ok|failed|cancelled"}
+plurx_offline_bytes{state="queued|preparing|ready|failed"}
+plurx_offline_requests_total{height="360|480|720|1080"}
+plurx_offline_prepare_seconds_{bucket,sum,count}{result="ok|failed|cancelled"}
+plurx_offline_prepare_work_seconds_total{result="ok|failed|cancelled"}
+plurx_offline_prepared_media_seconds_total
 plurx_offline_prepared_bytes_total
 plurx_offline_transfer_bytes_total
+plurx_offline_cancellations_total
+plurx_offline_quota_rejections_total{reason="registry|user_bytes|global_bytes"}
 plurx_offline_active_leases
-plurx_offline_failures_total{code="..."}
-plurx_cache_pinned_bytes{reason="playback|offline"}
+plurx_offline_failures_total{code="source_unavailable|invalid_track|encoder_failed|subtitle_failed|other"}
+plurx_cache_pinned_bytes{reason="offline"}
 ```
 
-The current `/metrics` response is hand-formatted and has no counter or
-histogram abstraction. M2c adds the minimal bounded counter/histogram plumbing
-before naming these series; it does not scatter ad-hoc atomics through HTTP
-handlers. Admin surfaces also expose queue ETA, measured encode speed by source
-class, global/per-user quota use, and force-expire/disable controls.
+The follow-up implementation gives these counters and histograms one owner in
+`OfflineManager`; HTTP handlers report typed events to it rather than owning
+ad-hoc atomics. Durable package state supplies the gauges directly from an SQL
+aggregate, so a daemon restart cannot make queue or quota pressure disappear.
+The preparation histogram includes queue wait and therefore measures what a
+traveller experiences. `prepare_work_seconds_total` excludes queued time and
+accumulates work across preemption/requeue attempts; dividing its successful
+value by `prepared_media_seconds_total` gives the operator-local realtime
+factor.
+
+The authenticated activity page lists each queued/preparing package and each
+ready package whose response meter moved in the last 20 seconds. It resolves
+profile and title only for that page. Prometheus sees neither and transfer
+bytes mean bytes served, including retries, rather than a claim about unique
+device bytes.
 
 Do not label metrics with user, title, file, package, recipe, or device. Logs
 carry correlation ids for diagnosis; metrics stay bounded.
@@ -1368,9 +1384,11 @@ energy during the multi-hour cases.
 Revisit copied HEVC/HDR packages, multiple languages, season queues, smart
 downloads, and desktop/TV surfaces only after one operator can answer from
 Prometheus: preparation latency and realtime factor · requested quality mix ·
-package size · cancellation rate · offline-quota pressure · background failure
-rate · redownloads for another language. Self-hosted plurx does not assume a
-central telemetry service.
+package size · cancellation rate · offline-quota pressure. Background failure
+rate and redownloads for another language require bounded, typed client events;
+the server cannot infer either from lease traffic, so those remain explicit
+future instrumentation rather than invented counters. Self-hosted plurx does
+not assume a central telemetry service.
 
 ## 17. Implementation handoff — what the draft PR proves
 
@@ -1394,7 +1412,7 @@ Automated evidence recorded on 2026-08-05:
 - The `offline.viewing` CI plan selects the store/API contract plus both native
   client suites in the correct provider-to-consumer direction.
 
-Fable's first code review has been reconciled on the same unmerged draft. The
+Fable's first code review was reconciled on the original draft. The
 server now separates filesystem ownership from eviction policy, binds a recipe
 before production, recovers pruned native subtitle sidecars from an unchanged
 source snapshot, reports part-boundary preparation progress, throttles lease
@@ -1403,10 +1421,12 @@ Android now has route-string and subtitle-group contract tests plus foreground
 recovery for Android 12+ service-start refusal. Apple serializes preparation per
 item, explicitly selects and verifies the cached subtitle rendition, reconciles
 taskless downloads, and resumes preparation/progress sync on app foreground.
-The draft remains unmerged pending Fable's re-review.
+PR #68 merged into `main` as `2c8a8a76` on 2026-08-05 before the planned Fable
+follow-up appeared. A new draft follow-up from
+`codex/offline-viewing-follow-up` adds the operator activity rows and bounded
+Prometheus family without rewriting the merged feature history.
 
-The draft is deliberately not merge-ready until Fable re-reviews the
-reconciliation and these remaining release-evidence gaps are closed:
+The feature remains release-gated on these physical-device evidence gaps:
 
 1. Physical iPhone/iPad: background transfer, system termination restoration,
    force-quit recovery, selected WebVTT, airplane-mode start and midpoint seek.
@@ -1415,13 +1435,12 @@ reconciliation and these remaining release-evidence gaps are closed:
    pass.
 3. Same real server-prepared package transferred to both client families, then
    removed with server lease and device bytes reconciled.
-4. Operator-facing activity rows and the bounded Prometheus offline metric
-   family in §13. Typed package states, quota settings, and diagnostic logs are
-   present; the richer observability surface remains a named review follow-up.
-
-Do not merge the draft PR before those findings are reviewed. Any further Fable
-feedback belongs on the same branch, with judgment calls recorded in the PR and
-this ledger updated if the contract changes.
+The follow-up branch closes the former fourth gap: the global pill and activity
+page now show preparation/sending work, and `/metrics` exposes state, quota,
+quality, timing, byte, lease, cancellation, and bounded failure series. Do not
+merge its draft PR before review. Any further Fable feedback belongs on that
+same branch, with judgment calls recorded in the PR and this ledger updated if
+the contract changes.
 
 ## 18. Platform references — primary documentation
 

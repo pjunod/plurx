@@ -3,7 +3,9 @@
 //! JSON handlers only create intent. This loop owns the long-running work so
 //! an HTTP disconnect or daemon restart cannot abandon a traveller's queue.
 
-use std::sync::Arc;
+use std::fmt::Write as _;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::{collections::HashMap, time::SystemTime};
 
@@ -17,12 +19,312 @@ use crate::transcode::{
 const IDLE_POLL: Duration = Duration::from_secs(2);
 const PRODUCE_PASS: Duration = Duration::from_secs(6 * 60 * 60);
 const DURATION_TOLERANCE_MS: i64 = 10_000;
+const TRANSFER_ACTIVE_FOR: Duration = Duration::from_secs(20);
+const TRANSFER_SAMPLE_TTL: Duration = Duration::from_secs(2 * 60);
+const QUALITY_HEIGHTS: [i64; 4] = [360, 480, 720, 1080];
+const PREPARE_RESULTS: [&str; 3] = ["ok", "failed", "cancelled"];
+const PREPARE_BUCKETS: [u64; 7] = [60, 300, 900, 3_600, 10_800, 21_600, u64::MAX];
+const FAILURE_CODES: [&str; 5] = [
+    "source_unavailable",
+    "invalid_track",
+    "encoder_failed",
+    "subtitle_failed",
+    "other",
+];
+const QUOTA_REASONS: [&str; 3] = ["registry", "user_bytes", "global_bytes"];
+
+#[derive(Clone, Copy)]
+pub(crate) enum OfflineQuota {
+    Registry,
+    UserBytes,
+    GlobalBytes,
+}
+
+impl OfflineQuota {
+    fn index(self) -> usize {
+        match self {
+            Self::Registry => 0,
+            Self::UserBytes => 1,
+            Self::GlobalBytes => 2,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TransferSample {
+    bytes: u64,
+    last_seen: Instant,
+}
+
+/// The one owner of bounded offline counters and preparation histograms.
+///
+/// Prometheus history is intentionally process-local, like the existing scan
+/// counters. A scraper handles resets; durable package state supplies gauges.
+/// Arrays encode every permitted label value so request data can never create
+/// a new series.
+struct OfflineMetrics {
+    requests: [AtomicU64; 4],
+    quota_rejections: [AtomicU64; 3],
+    prepare_count: [AtomicU64; 3],
+    prepare_seconds: [AtomicU64; 3],
+    prepare_buckets: [[AtomicU64; 7]; 3],
+    prepare_work_millis: [AtomicU64; 3],
+    partial_work_millis: Mutex<HashMap<String, u64>>,
+    prepared_media_seconds: AtomicU64,
+    prepared_bytes: AtomicU64,
+    transfer_bytes: AtomicU64,
+    failures: [AtomicU64; 5],
+    cancellations: AtomicU64,
+    transfers: Mutex<HashMap<String, TransferSample>>,
+}
+
+impl OfflineMetrics {
+    fn new() -> Self {
+        Self {
+            requests: std::array::from_fn(|_| AtomicU64::new(0)),
+            quota_rejections: std::array::from_fn(|_| AtomicU64::new(0)),
+            prepare_count: std::array::from_fn(|_| AtomicU64::new(0)),
+            prepare_seconds: std::array::from_fn(|_| AtomicU64::new(0)),
+            prepare_buckets: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
+            prepare_work_millis: std::array::from_fn(|_| AtomicU64::new(0)),
+            partial_work_millis: Mutex::new(HashMap::new()),
+            prepared_media_seconds: AtomicU64::new(0),
+            prepared_bytes: AtomicU64::new(0),
+            transfer_bytes: AtomicU64::new(0),
+            failures: std::array::from_fn(|_| AtomicU64::new(0)),
+            cancellations: AtomicU64::new(0),
+            transfers: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn record_request(&self, height: i64) {
+        if let Some(index) = QUALITY_HEIGHTS
+            .iter()
+            .position(|candidate| *candidate == height)
+        {
+            self.requests[index].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn record_quota_rejection(&self, quota: OfflineQuota) {
+        self.quota_rejections[quota.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_prepare(&self, result: usize, package: &OfflinePackage) {
+        let seconds = elapsed_since(package.created_at);
+        self.prepare_count[result].fetch_add(1, Ordering::Relaxed);
+        self.prepare_seconds[result].fetch_add(seconds, Ordering::Relaxed);
+        let bucket = PREPARE_BUCKETS
+            .iter()
+            .position(|upper| seconds <= *upper)
+            .unwrap_or(PREPARE_BUCKETS.len() - 1);
+        self.prepare_buckets[result][bucket].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn accumulate_work(&self, package_id: &str, elapsed: Duration) {
+        let millis = elapsed.as_millis().min(u64::MAX as u128) as u64;
+        let mut partial = self
+            .partial_work_millis
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let total = partial.entry(package_id.to_owned()).or_default();
+        *total = total.saturating_add(millis);
+    }
+
+    fn finish_work(&self, result: usize, package_id: &str, elapsed: Duration) {
+        let current = elapsed.as_millis().min(u64::MAX as u128) as u64;
+        let prior = self
+            .partial_work_millis
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(package_id)
+            .unwrap_or(0);
+        self.prepare_work_millis[result]
+            .fetch_add(prior.saturating_add(current), Ordering::Relaxed);
+    }
+
+    fn forget_work(&self, package_id: &str) {
+        self.partial_work_millis
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(package_id);
+    }
+
+    fn record_ready(&self, package: &OfflinePackage, media_ms: i64, bytes: i64, elapsed: Duration) {
+        self.record_prepare(0, package);
+        self.finish_work(0, &package.id, elapsed);
+        self.prepared_media_seconds
+            .fetch_add((media_ms.max(0) as u64) / 1_000, Ordering::Relaxed);
+        self.prepared_bytes
+            .fetch_add(bytes.max(0) as u64, Ordering::Relaxed);
+    }
+
+    fn record_failure(&self, package: &OfflinePackage, code: &str, elapsed: Duration) {
+        self.record_prepare(1, package);
+        self.finish_work(1, &package.id, elapsed);
+        let index = FAILURE_CODES
+            .iter()
+            .position(|known| *known == code)
+            .unwrap_or(FAILURE_CODES.len() - 1);
+        self.failures[index].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_cancellation(&self, package: &OfflinePackage) {
+        self.cancellations.fetch_add(1, Ordering::Relaxed);
+        if matches!(package.state.as_str(), "queued" | "preparing") {
+            self.record_prepare(2, package);
+            self.finish_work(2, &package.id, Duration::ZERO);
+        }
+    }
+
+    fn record_transfer(&self, package_id: &str, bytes: usize) {
+        let bytes = bytes as u64;
+        self.transfer_bytes.fetch_add(bytes, Ordering::Relaxed);
+        let now = Instant::now();
+        let mut transfers = self
+            .transfers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        transfers.retain(|_, sample| now.duration_since(sample.last_seen) <= TRANSFER_SAMPLE_TTL);
+        let sample = transfers
+            .entry(package_id.to_owned())
+            .or_insert(TransferSample {
+                bytes: 0,
+                last_seen: now,
+            });
+        sample.bytes = sample.bytes.saturating_add(bytes);
+        sample.last_seen = now;
+    }
+
+    fn transfer_bytes(&self, package_id: &str) -> Option<u64> {
+        let transfers = self
+            .transfers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        transfers.get(package_id).and_then(|sample| {
+            (sample.last_seen.elapsed() <= TRANSFER_ACTIVE_FOR).then_some(sample.bytes)
+        })
+    }
+
+    fn forget_transfer(&self, package_id: &str) {
+        self.transfers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(package_id);
+    }
+
+    fn prometheus(&self) -> String {
+        let mut out = String::from(
+            "# HELP plurx_offline_requests_total New offline packages accepted, by quality.\n\
+             # TYPE plurx_offline_requests_total counter\n",
+        );
+        for (index, height) in QUALITY_HEIGHTS.iter().enumerate() {
+            let _ = writeln!(
+                out,
+                "plurx_offline_requests_total{{height=\"{height}\"}} {}",
+                self.requests[index].load(Ordering::Relaxed)
+            );
+        }
+        out.push_str(
+            "# HELP plurx_offline_quota_rejections_total Offline requests refused by bounded quota class.\n\
+             # TYPE plurx_offline_quota_rejections_total counter\n",
+        );
+        for (index, reason) in QUOTA_REASONS.iter().enumerate() {
+            let _ = writeln!(
+                out,
+                "plurx_offline_quota_rejections_total{{reason=\"{reason}\"}} {}",
+                self.quota_rejections[index].load(Ordering::Relaxed)
+            );
+        }
+        out.push_str(
+            "# HELP plurx_offline_prepare_seconds Time from accepted request to terminal preparation result.\n\
+             # TYPE plurx_offline_prepare_seconds histogram\n",
+        );
+        for (result_index, result) in PREPARE_RESULTS.iter().enumerate() {
+            let mut cumulative = 0;
+            for (bucket_index, upper) in PREPARE_BUCKETS.iter().enumerate() {
+                cumulative +=
+                    self.prepare_buckets[result_index][bucket_index].load(Ordering::Relaxed);
+                let le = if *upper == u64::MAX {
+                    "+Inf".to_owned()
+                } else {
+                    upper.to_string()
+                };
+                let _ = writeln!(
+                    out,
+                    "plurx_offline_prepare_seconds_bucket{{result=\"{result}\",le=\"{le}\"}} {cumulative}"
+                );
+            }
+            let _ = writeln!(
+                out,
+                "plurx_offline_prepare_seconds_sum{{result=\"{result}\"}} {}",
+                self.prepare_seconds[result_index].load(Ordering::Relaxed)
+            );
+            let _ = writeln!(
+                out,
+                "plurx_offline_prepare_seconds_count{{result=\"{result}\"}} {}",
+                self.prepare_count[result_index].load(Ordering::Relaxed)
+            );
+        }
+        out.push_str(
+            "# HELP plurx_offline_prepare_work_seconds_total Active server work spent on terminal offline preparations.\n\
+             # TYPE plurx_offline_prepare_work_seconds_total counter\n",
+        );
+        for (index, result) in PREPARE_RESULTS.iter().enumerate() {
+            let seconds = self.prepare_work_millis[index].load(Ordering::Relaxed) as f64 / 1_000.0;
+            let _ = writeln!(
+                out,
+                "plurx_offline_prepare_work_seconds_total{{result=\"{result}\"}} {seconds:.3}"
+            );
+        }
+        let _ = write!(
+            out,
+            "# HELP plurx_offline_prepared_media_seconds_total Media duration successfully prepared for offline viewing.\n\
+             # TYPE plurx_offline_prepared_media_seconds_total counter\n\
+             plurx_offline_prepared_media_seconds_total {}\n\
+             # HELP plurx_offline_prepared_bytes_total Completed offline package bytes.\n\
+             # TYPE plurx_offline_prepared_bytes_total counter\n\
+             plurx_offline_prepared_bytes_total {}\n\
+             # HELP plurx_offline_transfer_bytes_total Bytes served through offline media leases.\n\
+             # TYPE plurx_offline_transfer_bytes_total counter\n\
+             plurx_offline_transfer_bytes_total {}\n\
+             # HELP plurx_offline_cancellations_total Offline packages cancelled before device completion.\n\
+             # TYPE plurx_offline_cancellations_total counter\n\
+             plurx_offline_cancellations_total {}\n",
+            self.prepared_media_seconds.load(Ordering::Relaxed),
+            self.prepared_bytes.load(Ordering::Relaxed),
+            self.transfer_bytes.load(Ordering::Relaxed),
+            self.cancellations.load(Ordering::Relaxed),
+        );
+        out.push_str(
+            "# HELP plurx_offline_failures_total Offline preparation failures by bounded code.\n\
+             # TYPE plurx_offline_failures_total counter\n",
+        );
+        for (index, code) in FAILURE_CODES.iter().enumerate() {
+            let _ = writeln!(
+                out,
+                "plurx_offline_failures_total{{code=\"{code}\"}} {}",
+                self.failures[index].load(Ordering::Relaxed)
+            );
+        }
+        out
+    }
+}
+
+fn elapsed_since(created_at: i64) -> u64 {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    now.saturating_sub(created_at.max(0) as u64)
+}
 
 pub struct OfflineManager {
     store: Arc<dyn Store>,
     transcode: Arc<TranscodeManager>,
     node_id: String,
     active: tokio::sync::Mutex<HashMap<String, tokio_util::sync::CancellationToken>>,
+    metrics: OfflineMetrics,
 }
 
 impl OfflineManager {
@@ -36,7 +338,36 @@ impl OfflineManager {
             transcode,
             node_id,
             active: tokio::sync::Mutex::new(HashMap::new()),
+            metrics: OfflineMetrics::new(),
         })
+    }
+
+    pub(crate) fn record_request(&self, height: i64) {
+        self.metrics.record_request(height);
+    }
+
+    pub(crate) fn record_quota_rejection(&self, quota: OfflineQuota) {
+        self.metrics.record_quota_rejection(quota);
+    }
+
+    pub(crate) fn record_cancellation(&self, package: &OfflinePackage) {
+        self.metrics.record_cancellation(package);
+    }
+
+    pub(crate) fn record_transfer(&self, package_id: &str, bytes: usize) {
+        self.metrics.record_transfer(package_id, bytes);
+    }
+
+    pub(crate) fn transfer_bytes(&self, package_id: &str) -> Option<u64> {
+        self.metrics.transfer_bytes(package_id)
+    }
+
+    pub(crate) fn forget_transfer(&self, package_id: &str) {
+        self.metrics.forget_transfer(package_id);
+    }
+
+    pub(crate) fn prometheus(&self) -> String {
+        self.metrics.prometheus()
     }
 
     pub async fn run(self: Arc<Self>) {
@@ -123,6 +454,7 @@ impl OfflineManager {
         package: OfflinePackage,
         cancelled: &tokio_util::sync::CancellationToken,
     ) {
+        let work_started = Instant::now();
         let file = match self.store.get_file(package.file_id).await {
             Ok(Some(file))
                 if file.path.to_string_lossy() == package.source_path
@@ -137,13 +469,14 @@ impl OfflineManager {
                     "waiting_for_source",
                     "source_unavailable",
                     "The media file is no longer available on the server.",
+                    work_started,
                 )
                 .await;
                 return;
             }
             Err(error) => {
                 tracing::warn!(package = %package.id, %error, "offline source lookup failed");
-                self.requeue(&package).await;
+                self.requeue(&package, work_started).await;
                 return;
             }
         };
@@ -158,6 +491,7 @@ impl OfflineManager {
                     "validating",
                     "invalid_track",
                     "The selected subtitle is no longer available.",
+                    work_started,
                 )
                 .await;
                 return;
@@ -185,10 +519,11 @@ impl OfflineManager {
         match outcome {
             Ok(OfflineProduceOutcome::Ready(produced))
             | Ok(OfflineProduceOutcome::Cached(produced)) => {
-                self.publish_ready(&package, &file, produced).await
+                self.publish_ready(&package, &file, produced, work_started)
+                    .await
             }
             Ok(OfflineProduceOutcome::Yielded) | Ok(OfflineProduceOutcome::ClaimedElsewhere) => {
-                self.requeue(&package).await
+                self.requeue(&package, work_started).await
             }
             Err(error) => {
                 tracing::warn!(package = %package.id, %error, "offline preparation failed");
@@ -197,6 +532,7 @@ impl OfflineManager {
                     "transcoding",
                     "encoder_failed",
                     "The server could not prepare this download.",
+                    work_started,
                 )
                 .await;
             }
@@ -208,6 +544,7 @@ impl OfflineManager {
         package: &OfflinePackage,
         file: &plurx_core::domain::MediaFile,
         produced: Produced,
+        work_started: Instant,
     ) {
         let source_duration = file.duration_ms.unwrap_or_default();
         if produced.duration_ms <= 0
@@ -218,6 +555,7 @@ impl OfflineManager {
                 "publishing",
                 "encoder_failed",
                 "The prepared package did not contain the complete title.",
+                work_started,
             )
             .await;
             return;
@@ -233,6 +571,7 @@ impl OfflineManager {
                     "extracting_subtitles",
                     "subtitle_failed",
                     "The selected subtitle could not be included.",
+                    work_started,
                 )
                 .await;
                 return;
@@ -257,6 +596,7 @@ impl OfflineManager {
                         "extracting_subtitles",
                         "subtitle_failed",
                         "The selected subtitle could not be included.",
+                        work_started,
                     )
                     .await;
                     return;
@@ -273,13 +613,21 @@ impl OfflineManager {
             )
             .await
         {
-            Ok(true) => tracing::info!(
-                package = %package.id,
-                recipe = %produced.recipe,
-                bytes = actual_bytes,
-                duration_ms = produced.duration_ms,
-                "offline package ready"
-            ),
+            Ok(true) => {
+                self.metrics.record_ready(
+                    package,
+                    produced.duration_ms,
+                    actual_bytes,
+                    work_started.elapsed(),
+                );
+                tracing::info!(
+                    package = %package.id,
+                    recipe = %produced.recipe,
+                    bytes = actual_bytes,
+                    duration_ms = produced.duration_ms,
+                    "offline package ready"
+                )
+            }
             Ok(false) => tracing::debug!(package = %package.id, "offline package was cancelled"),
             Err(error) => {
                 tracing::warn!(package = %package.id, %error, "could not publish offline state")
@@ -287,20 +635,39 @@ impl OfflineManager {
         }
     }
 
-    async fn requeue(&self, package: &OfflinePackage) {
-        if let Err(error) = self.store.requeue_offline_package(&package.id).await {
-            tracing::warn!(package = %package.id, %error, "could not requeue offline package");
+    async fn requeue(&self, package: &OfflinePackage, work_started: Instant) {
+        match self.store.requeue_offline_package(&package.id).await {
+            Ok(true) => self
+                .metrics
+                .accumulate_work(&package.id, work_started.elapsed()),
+            Ok(false) => self.metrics.forget_work(&package.id),
+            Err(error) => {
+                tracing::warn!(package = %package.id, %error, "could not requeue offline package")
+            }
         }
         tokio::time::sleep(IDLE_POLL).await;
     }
 
-    async fn fail(&self, package: &OfflinePackage, phase: &str, code: &str, message: &str) {
-        if let Err(error) = self
+    async fn fail(
+        &self,
+        package: &OfflinePackage,
+        phase: &str,
+        code: &str,
+        message: &str,
+        work_started: Instant,
+    ) {
+        match self
             .store
             .fail_offline_package(&package.id, phase, code, message)
             .await
         {
-            tracing::warn!(package = %package.id, %error, "could not record offline failure");
+            Ok(true) => self
+                .metrics
+                .record_failure(package, code, work_started.elapsed()),
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(package = %package.id, %error, "could not record offline failure")
+            }
         }
     }
 }
@@ -407,5 +774,47 @@ mod tests {
         assert!(playlist.contains("#EXT-X-TARGETDURATION:91"));
         assert!(playlist.contains("#EXTINF:90.500000"));
         assert!(playlist.ends_with("#EXT-X-ENDLIST\n"));
+    }
+
+    #[test]
+    fn metrics_have_only_the_declared_bounded_labels() {
+        let metrics = OfflineMetrics::new();
+        let mut ready = package("none", None);
+        ready.id = "secret-package-id".into();
+        ready.created_at = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs() as i64
+            - 120;
+        metrics.record_request(720);
+        metrics.record_request(999); // An unadvertised height creates no label.
+        metrics.record_quota_rejection(OfflineQuota::GlobalBytes);
+        metrics.accumulate_work(&ready.id, Duration::from_millis(500));
+        metrics.record_ready(&ready, 90_000, 400, Duration::from_millis(1_500));
+        metrics.record_transfer(&ready.id, 123);
+
+        let mut failed = ready.clone();
+        failed.id = "another-secret".into();
+        metrics.record_failure(&failed, "unexpected_dynamic_code", Duration::from_secs(3));
+        let mut cancelled = ready.clone();
+        cancelled.state = "preparing".into();
+        metrics.record_cancellation(&cancelled);
+
+        assert_eq!(metrics.transfer_bytes(&ready.id), Some(123));
+        let text = metrics.prometheus();
+        assert!(text.contains("plurx_offline_requests_total{height=\"720\"} 1"));
+        assert!(!text.contains("height=\"999\""));
+        assert!(text.contains("plurx_offline_quota_rejections_total{reason=\"global_bytes\"} 1"));
+        assert!(text.contains("plurx_offline_prepare_seconds_count{result=\"ok\"} 1"));
+        assert!(text.contains("plurx_offline_prepare_seconds_count{result=\"failed\"} 1"));
+        assert!(text.contains("plurx_offline_prepare_seconds_count{result=\"cancelled\"} 1"));
+        assert!(text.contains("plurx_offline_prepare_work_seconds_total{result=\"ok\"} 2.000"));
+        assert!(text.contains("plurx_offline_failures_total{code=\"other\"} 1"));
+        assert!(text.contains("plurx_offline_transfer_bytes_total 123"));
+        assert!(!text.contains(&ready.id));
+        assert!(!text.contains(&failed.id));
+
+        metrics.forget_transfer(&ready.id);
+        assert_eq!(metrics.transfer_bytes(&ready.id), None);
     }
 }

@@ -7279,6 +7279,22 @@ async function renderActivityBody(){
        <p class="hint" style="margin:8px 0 0">Encoding ahead of time so the first press of play is instant. It gives the
        hardware up the moment somebody starts a stream, and stops for good after the current title if you ask it to.</p></div>`
     : `<div class="empty">Not pre-transcoding anything. A pass runs on the schedule in Settings and picks from Continue&nbsp;Watching, Next&nbsp;Up and Recently&nbsp;Added.</div>`;
+  const offline=d.offline||[];
+  const offlineRows=offline.map(ow=>{
+    const title=ow.item_id
+      ? `<a href="#/item/${ow.item_id}">${esc(ow.title)}</a>`
+      : esc(ow.title);
+    const phase=ow.kind==="send"
+      ? "Sending to device"
+      : (ow.state==="queued" ? "Waiting for encoder" : (ow.phase||"preparing").replace(/_/g," "));
+    const progress=ow.kind==="send"
+      ? `${fmtBytes(ow.bytes_sent)||"Starting"}${ow.bytes_total?` / ${fmtBytes(ow.bytes_total)}`:""}`
+      : (ow.percent!=null ? `${ow.percent}%` : "—");
+    return `<tr>
+      <td><b>${title}</b></td><td>${esc(ow.user)}</td>
+      <td>${esc(phase)} <span class="muted">· ${ow.target_height}p</span></td>
+      <td>${progress}</td><td class="muted">${fmtAgo(ow.started_unix)}</td></tr>`;
+  }).join("");
   const m=document.getElementById("main"); if(!m) return;
   m.innerHTML=`
     <h2 class="section" style="margin-top:6px">Now playing</h2>
@@ -7287,6 +7303,10 @@ async function renderActivityBody(){
       : `<div class="empty">Nothing streaming right now. Every delivery is listed here — direct play, remux and both HLS kinds.</div>`}
     <h2 class="section">Pre-transcoding</h2>
     ${produce}
+    <h2 class="section">Offline downloads</h2>
+    ${offline.length
+      ? `<table><thead><tr><th>Title</th><th>Profile</th><th>Work</th><th>Progress</th><th>Requested</th></tr></thead><tbody>${offlineRows}</tbody></table>`
+      : `<div class="empty">No offline packages are being prepared or sent right now.</div>`}
     <h2 class="section">Library</h2>
     ${d.scans.length? `<table><tbody>${scans}</tbody></table>` : `<div class="empty">No libraries yet.</div>`}
     <h2 class="section">Trakt</h2>
