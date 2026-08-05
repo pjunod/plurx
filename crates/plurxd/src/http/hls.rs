@@ -543,16 +543,11 @@ pub async fn subtitle_vtt(
         .and_then(|value| value.strip_suffix(".vtt"))
         .and_then(|value| value.parse::<u64>().ok())
         .ok_or(ApiError::NotFound("subtitle segment"))?;
-    let video = state
+    let sequence = i64::try_from(sequence).map_err(|_| ApiError::NotFound("subtitle segment"))?;
+    let (segment_start, segment_end) = state
         .transcode
-        .playlist(&session)
+        .segment_window(&session, sequence)
         .await
-        .ok_or(ApiError::NotFound("transcode session"))?;
-    let timeline = subtitle_timeline(&video);
-    let window = timeline
-        .segments
-        .iter()
-        .find(|window| window.sequence == sequence)
         .ok_or(ApiError::NotFound("subtitle segment"))?;
     let cached = crate::subtitles::vtt_path(&state.subs_dir, &file, index);
     let (bytes, cache_control) = match tokio::fs::read(&cached).await {
@@ -609,8 +604,8 @@ pub async fn subtitle_vtt(
         slice_webvtt(
             &bytes,
             context.media_origin_seconds,
-            window.start_seconds,
-            window.end_seconds,
+            segment_start,
+            segment_end,
         ),
     )
         .into_response())
@@ -1915,6 +1910,16 @@ mod tests {
         assert!(playlist.contains("#EXTINF:4.000000,\nseg00000.vtt"));
         assert!(playlist.contains("#EXTINF:6.000000,\nseg00001.vtt"));
         assert!(!playlist.contains("#EXT-X-ENDLIST"));
+
+        let sliding = subtitle_media_playlist(
+            b"#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:2\n#EXTINF:6.0,\nseg00002.m4s\n",
+        );
+        assert!(sliding.contains("#EXT-X-MEDIA-SEQUENCE:2"), "{sliding}");
+        assert!(sliding.contains("seg00002.vtt"), "{sliding}");
+        assert!(
+            !sliding.contains("#EXT-X-PLAYLIST-TYPE:EVENT"),
+            "the subtitle rendition mirrors the video's sliding shape: {sliding}"
+        );
 
         let source = b"WEBVTT\n\n00:00:01.000 --> 00:00:02.000\npast\n\ncue-id\n00:00:09.000 --> 00:00:11.000 align:start\ncrossing\n\n00:00:15.250 --> 00:00:16.500\nfuture\n";
         let first = String::from_utf8(slice_webvtt(source, 10.0, 0.0, 4.0)).expect("utf8");

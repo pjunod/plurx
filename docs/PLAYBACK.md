@@ -88,6 +88,7 @@ one.
 | `server.track-selection` | Initial audio/subtitle | Explicit viewer choice wins later. Cold start uses one shared language policy: original-language anime, configured languages, subtitle Auto/Always/Off, then container defaults. | Track-policy Rust matrix |
 | `server.subtitle-classification` | Sidecar vs rendition vs burn | Bitmap has no text route. SRT/SubRip/WebVTT may become native HLS renditions. Other text, including ASS and `mov_text`, can be extracted but not advertised as a native rendition, so session selection burns it. | Classifier Rust unit |
 | `server.session-kind` | Copy HLS vs transcode HLS | `SessionKind::Copy` preserves video and optionally converts audio/strips DV; `Transcode` runs the video recipe. A matching completed cache entry bypasses the encoder but does not change the logical kind. | Transcode-manager lifecycle unit |
+| `server.live-playlist-window` | Writer history vs client window | A live writer keeps its full EVENT history internally. After retention deletes a prefix, the served playlist omits those URIs, advances `MEDIA-SEQUENCE`, and becomes a sliding media playlist. Completed cached VOD stays whole. | Rust retention/serving integration |
 | `server.auto-rung` | Auto output height | Software follows the source up to 720p; proven hardware follows it up to 1080p. Both clamp to the source and never upscale. An explicit rung is snapped to the published ladder. | Encoder-aware async Rust unit |
 | `server.encoder` | Hardware family vs software | Honor a usable admin preference; otherwise take the first probed usable hardware encoder; software x264 is the unconditional fallback. Probe success, not advertised presence, is authority. | Every-family encoder units |
 | `server.tone-map-pipeline` | GPU graph vs CPU graph | A probed vendor graph is used only with its matching encoder and PQ HDR source. Bitmap overlay or a failed/incompatible graph declines to the recorded fallback; CPU is total. | Pipeline decision and fallback units |
@@ -336,9 +337,11 @@ ffmpeg writes one continuous fragmented stream down a pipe and
 of a keyframe a player will not discard a leading picture at, because on an
 open-GOP remux every ordinary boundary costs exactly one frame
 ([STUTTER-4K.md](STUTTER-4K.md) §5.6). Everything downstream is unchanged —
-same `init.mp4`, same `segNNNNN.m4s`, same EVENT playlist — and a stream the
-reader cannot follow falls back to ffmpeg's own muxer once, automatically, so
-the worst case is the behaviour above.
+same `init.mp4`, same `segNNNNN.m4s`, same append-only EVENT writer history —
+and a stream the reader cannot follow falls back to ffmpeg's own muxer once,
+automatically, so the worst case is the behaviour above. The HTTP view becomes
+a sliding media playlist after retention starts; the writer history stays
+complete so pacing and subtitle timing still know the real segment durations.
 
 Three details, each load-bearing:
 
@@ -577,16 +580,17 @@ covering the other.
 
 ## Non-goals & known limits
 
-- **HLS session disk.** An HLS session's playlist grows for its whole life, so
-  the reaper keeps 120 s behind the download frontier — on both the transcode
-  and copy paths — while web and Apple players limit their forward fetch to
-  60 s. The other 60 s covers back-buffering and a retry. Ahead of that
-  frontier, the suspend window bounds the other end, so a session's directory
-  now holds roughly `hls_ahead_max_secs + 120 s` of content whatever the
-  encoder's speed. One
-  residual remains: the prune is disk-only — the playlist keeps listing pruned
-  entries, which is safe precisely because every seek starts a fresh session
-  rather than scrubbing back into a deleted window.
+- **HLS session disk.** A live HLS writer's history grows for its whole life,
+  so the reaper keeps 120 s behind the download frontier — on both the
+  transcode and copy paths — while web and Apple players limit their forward
+  fetch to 60 s. The other 60 s covers back-buffering and a retry. Ahead of
+  that frontier, the suspend window bounds the other end, so a session's
+  directory holds roughly `hls_ahead_max_secs + 120 s` of content whatever
+  the encoder's speed. Once the reaper removes an older prefix, the client
+  playlist advances `MEDIA-SEQUENCE` and stops advertising those files. The
+  internal index retains duration-only history for native subtitle timing;
+  seeking outside the retained window still opens a fresh session at that
+  film position.
 - **No client-side bitrate adaptation yet.** One encode runs at a time; the
   rung is chosen at start, not adapted per segment. The design for that is
   [ADAPTIVE-QUALITY.md](ADAPTIVE-QUALITY.md).

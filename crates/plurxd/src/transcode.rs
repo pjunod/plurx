@@ -335,6 +335,21 @@ impl SegmentIndex {
             .map(|s| s.end_ms)
     }
 
+    /// The complete session-relative window for one segment. Pruned entries
+    /// stay in the index precisely so internal timelines (notably native
+    /// subtitles) do not forget how much media preceded the served window.
+    fn window_ms_of(&self, index: i64) -> Option<(i64, i64)> {
+        self.segs
+            .iter()
+            .find(|s| s.index == index)
+            .map(|s| (s.start_ms, s.end_ms))
+    }
+
+    /// First segment whose bytes are still available to a playlist client.
+    fn first_retained_index(&self) -> Option<i64> {
+        self.segs.iter().find(|s| !s.pruned).map(|s| s.index)
+    }
+
     /// Bytes of published segments lying entirely after `ms`.
     fn bytes_after_ms(&self, ms: i64) -> i64 {
         self.segs
@@ -482,6 +497,83 @@ fn parse_playlist(text: &str) -> Vec<SegmentMeta> {
         cursor_ms += duration_ms;
     }
     out
+}
+
+/// Turn the append-only writer playlist into the sliding view clients see.
+///
+/// FFmpeg and the copy segmenter keep an EVENT playlist on disk because the
+/// segment index needs the complete duration history. Retention eventually
+/// unlinks a prefix of those segment files. Serving that raw EVENT playlist
+/// after the unlink advertises media that no longer exists; AVPlayer may ask
+/// for one of those stale URIs during a playlist reload or decoder reset and
+/// stall even though the current encoder is healthy.
+///
+/// Once pruning begins, the served view drops the deleted prefix, advances
+/// `MEDIA-SEQUENCE`, and removes the EVENT declaration (EVENT playlists are
+/// append-only by contract). The raw file and in-memory index stay complete.
+fn served_live_playlist(raw: Vec<u8>, first_retained: Option<i64>) -> Vec<u8> {
+    let Some(first_retained) = first_retained.filter(|index| *index > 0) else {
+        return raw;
+    };
+    let Ok(text) = std::str::from_utf8(&raw) else {
+        return raw;
+    };
+    let lines: Vec<&str> = text.lines().collect();
+    let Some(header_end) = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("#EXTINF:"))
+    else {
+        return raw;
+    };
+
+    // Start immediately after the prior segment URI. This retains any tags
+    // attached to the first surviving segment rather than assuming EXTINF is
+    // always the first line in its block.
+    let mut next_block = header_end;
+    let mut body_start = None;
+    for (position, line) in lines.iter().enumerate().skip(header_end) {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if segment_index(line) == Some(first_retained) {
+            body_start = Some(next_block);
+            break;
+        }
+        if segment_index(line).is_some() {
+            next_block = position + 1;
+        }
+    }
+    let Some(body_start) = body_start else {
+        // The index was derived from this playlist, so disagreement means a
+        // concurrent truncate/restart. Let the next reload observe the rebuilt
+        // index instead of manufacturing a playlist from mismatched states.
+        return raw;
+    };
+
+    let mut out = String::with_capacity(text.len());
+    let mut wrote_media_sequence = false;
+    for line in &lines[..header_end] {
+        let trimmed = line.trim();
+        if trimmed == "#EXT-X-PLAYLIST-TYPE:EVENT" {
+            continue;
+        }
+        if trimmed.starts_with("#EXT-X-MEDIA-SEQUENCE:") {
+            out.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{first_retained}\n"));
+            wrote_media_sequence = true;
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if !wrote_media_sequence {
+        out.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{first_retained}\n"));
+    }
+    for line in &lines[body_start..] {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.into_bytes()
 }
 
 /// How far a session has run ahead of the client, both ways it can matter.
@@ -3930,12 +4022,30 @@ impl TranscodeManager {
                     // The playlist just told us what is published — the one
                     // moment the segment index can be refreshed for free.
                     self.flow_control(&session, session_id).await;
-                    return Some(bytes);
+                    if session.cached {
+                        return Some(bytes);
+                    }
+                    let first_retained = session.segments.lock().await.first_retained_index();
+                    return Some(served_live_playlist(bytes, first_retained));
                 }
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         None
+    }
+
+    /// Resolve one segment against the complete session timeline.
+    ///
+    /// The served media playlist becomes a sliding window after retention
+    /// starts, but subtitle cues still need the elapsed duration of the
+    /// pruned prefix. The index keeps those duration-only entries even after
+    /// their files are gone, so callers never reconstruct time from a segment
+    /// number or the shortened playlist.
+    pub async fn segment_window(&self, session_id: &str, segment_index: i64) -> Option<(f64, f64)> {
+        let session = self.touch(session_id).await?;
+        self.flow_control(&session, session_id).await;
+        let (start_ms, end_ms) = session.segments.lock().await.window_ms_of(segment_index)?;
+        Some((start_ms as f64 / 1000.0, end_ms as f64 / 1000.0))
     }
 
     /// Open a segment for streaming, waiting for ffmpeg to produce it if
@@ -4812,6 +4922,7 @@ mod tests {
         let index = SegmentIndex { segs };
         assert_eq!(index.produced_playable_end_ms(), Some(24_500));
         assert_eq!(index.end_ms_of(1), Some(14_500));
+        assert_eq!(index.window_ms_of(1), Some((4_000, 14_500)));
         assert_eq!(index.end_ms_of(9), None);
 
         // A transcode playlist, where the grid is forced and even.
@@ -4827,6 +4938,46 @@ mod tests {
         let junk = "#EXTM3U\nseg00007.ts\n#EXTINF:abc,\nseg00008.ts\n#EXTINF:2.0,\n";
         assert!(parse_playlist(junk).is_empty());
         assert!(parse_playlist("").is_empty());
+    }
+
+    /// The writer keeps an append-only EVENT history, but a client must never
+    /// be offered names retention already unlinked. This pure pin also covers
+    /// the HLS shape: a playlist that removes old entries is a sliding media
+    /// playlist, not an EVENT playlist, and its first sequence advances.
+    #[test]
+    fn served_live_playlist_advances_past_the_pruned_prefix() {
+        let raw = "#EXTM3U\n\
+                   #EXT-X-VERSION:7\n\
+                   #EXT-X-TARGETDURATION:10\n\
+                   #EXT-X-MEDIA-SEQUENCE:0\n\
+                   #EXT-X-PLAYLIST-TYPE:EVENT\n\
+                   #EXT-X-MAP:URI=\"init.mp4\"\n\
+                   #EXTINF:4.000,\n\
+                   seg00000.m4s\n\
+                   #EXTINF:10.500,\n\
+                   seg00001.m4s\n\
+                   #EXT-X-DISCONTINUITY\n\
+                   #EXTINF:6.000,\n\
+                   seg00002.m4s\n\
+                   #EXT-X-ENDLIST\n";
+
+        assert_eq!(
+            served_live_playlist(raw.as_bytes().to_vec(), Some(0)),
+            raw.as_bytes(),
+            "before pruning the client sees the writer's EVENT playlist unchanged"
+        );
+
+        let served = String::from_utf8(served_live_playlist(raw.as_bytes().to_vec(), Some(2)))
+            .expect("playlist utf8");
+        assert!(served.contains("#EXT-X-MEDIA-SEQUENCE:2"), "{served}");
+        assert!(!served.contains("#EXT-X-PLAYLIST-TYPE:EVENT"), "{served}");
+        assert!(!served.contains("seg00000.m4s"), "{served}");
+        assert!(!served.contains("seg00001.m4s"), "{served}");
+        assert!(
+            served.contains("#EXT-X-DISCONTINUITY\n#EXTINF:6.000,\nseg00002.m4s"),
+            "tags attached to the first retained segment survive: {served}"
+        );
+        assert!(served.ends_with("seg00002.m4s\n#EXT-X-ENDLIST\n"));
     }
 
     // ---- the append-oriented index (review §2.6) ----------------------------
@@ -5220,7 +5371,10 @@ mod tests {
     /// index, the retention window and the pruner are all exercised against
     /// what ffmpeg actually writes.
     async fn seeded_session_dir(dir: &std::path::Path, count: i64, secs_each: f64) {
-        let mut playlist = String::from("#EXTM3U\n#EXT-X-TARGETDURATION:4\n");
+        let mut playlist = String::from(
+            "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-MEDIA-SEQUENCE:0\n\
+             #EXT-X-PLAYLIST-TYPE:EVENT\n",
+        );
         for i in 0..count {
             playlist.push_str(&format!("#EXTINF:{secs_each:.3},\nseg{i:05}.ts\n"));
             tokio::fs::write(dir.join(format!("seg{i:05}.ts")), vec![b'x'; 1024])
@@ -5247,7 +5401,7 @@ mod tests {
             .await
             .expect("write init");
 
-        let session = test_session(p.to_path_buf());
+        let session = Arc::new(test_session(p.to_path_buf()));
         session.refresh_segments().await;
         assert_eq!(
             session.segments.lock().await.produced_playable_end_ms(),
@@ -5270,6 +5424,47 @@ mod tests {
         assert!(!p.join("seg00000.ts").exists());
         assert!(!p.join("seg00010.ts").exists());
         assert!(p.join("init.mp4").exists(), "init is never a segment");
+
+        // The writer's history remains complete for duration accounting, but
+        // the manager's HTTP-facing view advances past every deleted URI.
+        let raw = tokio::fs::read_to_string(p.join("index.m3u8"))
+            .await
+            .expect("raw playlist");
+        assert!(raw.contains("#EXT-X-PLAYLIST-TYPE:EVENT"), "{raw}");
+        assert!(raw.contains("seg00000.ts"), "{raw}");
+
+        use plurx_core::store::SqliteStore;
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let mgr = TranscodeManager::new(
+            store,
+            p.join("manager-work"),
+            EncoderCaps::default(),
+            Pipeline::Cpu,
+        );
+        mgr.sessions
+            .lock()
+            .await
+            .insert("retained-window".into(), Arc::clone(&session));
+        let served = String::from_utf8(
+            mgr.playlist("retained-window")
+                .await
+                .expect("served playlist"),
+        )
+        .expect("playlist utf8");
+        assert!(served.contains("#EXT-X-MEDIA-SEQUENCE:45"), "{served}");
+        assert!(!served.contains("#EXT-X-PLAYLIST-TYPE:EVENT"), "{served}");
+        assert!(!served.contains("seg00044.ts"), "{served}");
+        assert!(served.contains("seg00045.ts"), "{served}");
+        for name in served.lines().filter(|line| line.ends_with(".ts")) {
+            assert!(p.join(name).exists(), "served segment must exist: {name}");
+        }
+
+        // Subtitle timing still sees the discarded prefix through the full
+        // internal index: segment 45 begins at 180 seconds, not at zero.
+        assert_eq!(
+            mgr.segment_window("retained-window", 45).await,
+            Some((180.0, 184.0))
+        );
 
         // A frontier that has not yet passed the window prunes nothing.
         let fresh = tempfile::tempdir().expect("tempdir");
