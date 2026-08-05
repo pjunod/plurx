@@ -1,6 +1,8 @@
 # Dolby Vision-Safe PGS Subtitle Overlay Plan
 
-> Status: Review draft. Implementation is intentionally paused pending approval.
+> Status: Architecture approved for Milestone 0 feasibility work. Production
+> implementation and rollout remain paused until the milestone is accepted.
+> Current evidence: [PGS-OVERLAY-M0-FEASIBILITY.md](PGS-OVERLAY-M0-FEASIBILITY.md).
 >
 > Scope: Apple and Android playback clients, the plurxd subtitle service, and
 > the playback policy that selects between text renditions, bitmap overlays,
