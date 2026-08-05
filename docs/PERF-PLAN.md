@@ -478,10 +478,12 @@ with an ahead-window suspend replacing `-re` as the disk bound.
             = 120 s behind fetched_end
   ```
 
-  Deletion inside that window is forbidden; outside it, the EVENT
-  playlist's older URIs 404 by documented contract (decision 3, §8.6).
-  Acceptance includes surviving a playlist reload and a forced segment
-  retry after GC has begun, on Chrome, Safari, and AirPlay.
+  Deletion inside that window is forbidden. Outside it, the append-only EVENT
+  file remains the writer's duration history, while the served media playlist
+  removes the deleted prefix and advances `MEDIA-SEQUENCE` (decision 3,
+  §8.6). A client reload therefore never discovers a URI the server has
+  already pruned. Acceptance includes surviving a playlist reload and a
+  forced segment retry after GC has begun, on Chrome, Safari, and AirPlay.
 - **Why not just a bigger readrate?** Because unbounded ahead-writing is
   the thing `-re` was protecting against; suspend keeps the protection
   while un-linking it from the user's buffer. And why not SIGSTOP alone
@@ -1666,7 +1668,7 @@ Playlist/segment capability-URL auth is untouched — AirPlay depends on it.
 |---|---|---|
 | 1 | Client buffer policy | Seconds only (`60`/`30`), provisional; byte value stays default; M0 evidence required to change it (§4.3) |
 | 2 | Server ahead policy | Three named frontiers (§4.2); pace on playable−fetched from `EXTINF`; suspend on time **or** per-session bytes **or** global scratch; resume when all below half; retention ≥ forward-fetch + back-buffer + retry ≈ 120 s |
-| 3 | Playlist/GC contract | EVENT + documented 404s outside the retention window; deletion inside it forbidden |
+| 3 | Playlist/GC contract | ~~EVENT + documented 404s outside the retention window.~~ **Reversed 2026-08-04 after live AVPlayer evidence:** keep EVENT as the internal writer history, but serve a sliding window that omits the pruned prefix and advances `MEDIA-SEQUENCE`; deletion inside the 120 s retention window remains forbidden. A native player may revisit a playlist entry after a reload or decoder reset, so “normal forward clients will not ask again” was not a safe wire contract. |
 | 4 | ABR handoff | Visible restart (Option A) with measured p95 interruption SLO — proposed ≤2.5 s on LAN, **operator confirms**; estimate seeded across Hls instances; severe pressure jumps straight to the highest safe rung |
 | 5 | Over-capacity & fallback admission | Queue ≤5 s → *measured-safe* software recipe (recent speed ≥ ~1.2× for that pipeline class — never "720p is safe") → capacity error; cluster inserts "another node" first |
 | 6 | Cache identity | Encoder family + pipeline digest in the hash; relaxation only after per-family output contracts are proven equivalent (**operator's call** whether ever worth it) |

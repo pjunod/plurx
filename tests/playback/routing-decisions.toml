@@ -92,6 +92,13 @@ test = "crates/plurxd/src/transcode.rs"
 test_anchor = "manager_reads_prefs_and_runs_session_lifecycle"
 
 [[decisions]]
+id = "server.live-playlist-window"
+source = "crates/plurxd/src/transcode.rs"
+source_anchor = "fn served_live_playlist("
+test = "crates/plurxd/src/transcode.rs"
+test_anchor = "retention_covers_the_clients_forward_buffer"
+
+[[decisions]]
 id = "server.auto-rung"
 source = "crates/plurxd/src/transcode.rs"
 source_anchor = "pub async fn auto_height("
