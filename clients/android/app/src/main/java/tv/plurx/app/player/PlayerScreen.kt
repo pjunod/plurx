@@ -12,6 +12,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -70,12 +71,17 @@ import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -512,6 +518,15 @@ private fun PlayerContent(
     var pipAspectRatio by remember(plan) {
         mutableStateOf(calculatePipAspectRatio(plan.videoWidth ?: 0, plan.videoHeight ?: 0))
     }
+    var videoAspectRatio by remember(plan) {
+        mutableStateOf(
+            if ((plan.videoWidth ?: 0) > 0 && (plan.videoHeight ?: 0) > 0) {
+                (plan.videoWidth ?: 1).toFloat() / (plan.videoHeight ?: 1).toFloat()
+            } else {
+                16f / 9f
+            },
+        )
+    }
     var lastInteraction by remember { mutableLongStateOf(0L) }
     var lastAutoSkipped by remember(plan) { mutableLongStateOf(-1L) }
     var findingNext by remember { mutableStateOf(false) }
@@ -568,6 +583,10 @@ private fun PlayerContent(
                     videoSize.height,
                     videoSize.pixelWidthHeightRatio,
                 )
+                if (videoSize.width > 0 && videoSize.height > 0) {
+                    videoAspectRatio =
+                        videoSize.width * videoSize.pixelWidthHeightRatio / videoSize.height
+                }
             }
         }
         controller.player.addListener(listener)
@@ -586,8 +605,10 @@ private fun PlayerContent(
         return pictureInPictureParams(pipAspectRatio, sourceRect, autoEnter)
     }
 
-    DisposableEffect(componentActivity, canUsePip) {
-        if (!canUsePip || componentActivity == null) {
+    val canEnterPip = canUsePip && !controller.pgsOverlayIsActive
+
+    DisposableEffect(componentActivity, canEnterPip) {
+        if (!canEnterPip || componentActivity == null) {
             onDispose { }
         } else {
             val pipModeListener = Consumer<PictureInPictureModeChangedInfo> { info ->
@@ -609,9 +630,9 @@ private fun PlayerContent(
 
     // Android 12+ reads auto-enter from the current PiP parameters. Android 8–11
     // instead needs an explicit request when the user leaves the activity.
-    DisposableEffect(componentActivity, canUsePip, isPlaying, pipAspectRatio, playerView) {
+    DisposableEffect(componentActivity, canEnterPip, isPlaying, pipAspectRatio, playerView) {
         if (
-            !canUsePip || componentActivity == null ||
+            !canEnterPip || componentActivity == null ||
             Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
         ) {
             onDispose { }
@@ -628,8 +649,8 @@ private fun PlayerContent(
         }
     }
 
-    DisposableEffect(activity, canUsePip, isPlaying, pipAspectRatio, playerView) {
-        if (!canUsePip || activity == null) {
+    DisposableEffect(activity, canEnterPip, isPlaying, pipAspectRatio, playerView) {
+        if (!canEnterPip || activity == null) {
             onDispose { }
         } else {
             val updateParams = Runnable {
@@ -648,7 +669,7 @@ private fun PlayerContent(
     }
 
     // Do not leave automatic PiP armed after navigating away from the player.
-    DisposableEffect(activity, canUsePip) {
+    DisposableEffect(activity, canEnterPip) {
         onDispose {
             if (canUsePip && activity != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                 setPictureInPictureParams(
@@ -768,6 +789,13 @@ private fun PlayerContent(
         )
 
         if (!isInPip) {
+            PGSBitmapOverlay(
+                frame = controller.pgsOverlayFrame,
+                videoAspectRatio = videoAspectRatio,
+            )
+        }
+
+        if (!isInPip) {
             Box(
                 Modifier.fillMaxSize().focusProperties { canFocus = false }.clickable(
                     interactionSource = remember { MutableInteractionSource() },
@@ -828,11 +856,13 @@ private fun PlayerContent(
                 },
                 onPip = if (canUsePip && activity != null) {
                     {
-                        controlsVisible = false
-                        panel = null
-                        val params = currentPipParams(autoEnter = false)
-                        setPictureInPictureParams(activity, params)
-                        enterPictureInPicture(activity, params)
+                        if (controller.allowsPictureInPictureCommand()) {
+                            controlsVisible = false
+                            panel = null
+                            val params = currentPipParams(autoEnter = false)
+                            setPictureInPictureParams(activity, params)
+                            enterPictureInPicture(activity, params)
+                        }
                     }
                 } else null,
             )
@@ -888,6 +918,51 @@ private fun PlayerContent(
                     .background(Color.Black.copy(alpha = 0.82f), MaterialTheme.shapes.medium)
                     .padding(horizontal = 14.dp, vertical = 10.dp),
             )
+        }
+    }
+}
+
+/** Authored bitmap composition, above video and below every player control. */
+@Composable
+internal fun PGSBitmapOverlay(
+    frame: PGSOverlayFrame?,
+    videoAspectRatio: Float,
+    modifier: Modifier = Modifier,
+) {
+    val composition = frame ?: return
+    Canvas(
+        modifier
+            .fillMaxSize()
+            .focusProperties { canFocus = false }
+            .semantics {
+                contentDescription = "PGS subtitle overlay"
+                stateDescription = composition.cue.id
+            },
+    ) {
+        val video = PGSOverlayPolicy.videoRect(size.width, size.height, videoAspectRatio)
+        if (video.width <= 0 || video.height <= 0) return@Canvas
+        clipRect(
+            left = video.x,
+            top = video.y,
+            right = video.x + video.width,
+            bottom = video.y + video.height,
+        ) {
+            composition.objects.forEach { rendered ->
+                val destination = PGSOverlayPolicy.objectRect(
+                    object_ = rendered.object_,
+                    canvasWidth = composition.cue.canvasWidth,
+                    canvasHeight = composition.cue.canvasHeight,
+                    destination = video,
+                )
+                drawImage(
+                    image = rendered.bitmap.asImageBitmap(),
+                    dstOffset = IntOffset(destination.x.roundToInt(), destination.y.roundToInt()),
+                    dstSize = IntSize(
+                        destination.width.roundToInt().coerceAtLeast(1),
+                        destination.height.roundToInt().coerceAtLeast(1),
+                    ),
+                )
+            }
         }
     }
 }
@@ -1216,8 +1291,13 @@ private fun PlayerInfo(
     val selectedAudio = player.audioFormat?.let(::audioLabel)
         ?: plan.audio.firstOrNull { it.index == controller.selectedAudio }?.let(::serverAudioLabel)
         ?: plan.audio.firstOrNull { it.default }?.let(::serverAudioLabel)
-    val selectedSubtitle =
-        selectedSubtitleLabel(player, plan.subtitles, controller.selectedSubtitle)
+    val selectedSubtitle = selectedSubtitleLabel(
+        player,
+        plan.subtitles,
+        controller.selectedSubtitle,
+    ).let { label ->
+        controller.pgsOverlayStatus.label?.let { "$label · $it" } ?: label
+    }
     PlaybackInfoOverlay(
         details = PlaybackInfoDetails(
             title = plan.title,

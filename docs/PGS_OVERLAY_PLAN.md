@@ -1118,6 +1118,16 @@ Acceptance evidence:
 
 ### Milestone 3: Android client
 
+**Implementation status (0.2.6 candidate):** automated client implementation
+complete behind the server's default-off `PLURX_PGS_OVERLAY` capability gate.
+The Android renderer recognizes only `pgs-v1`, validates and bounds the
+authenticated manifest/PNG contract, schedules complete compositions against
+`Controller.realPosition()`, and draws inside the actual video content
+rectangle. JVM and Compose instrumentation coverage are in place. Android TV
+and handheld timing, Dolby Vision/HDR mode, and PiP evidence on physical
+hardware remain release gates, so this is not approval to enable the server
+gate by default.
+
 Work:
 
 - add overlay policy and manifest models;

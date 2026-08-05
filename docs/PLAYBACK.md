@@ -121,8 +121,9 @@ one.
 | `android.established-hdr-recovery` | Interruption after HDR rendered | Once Media3 renders a frame, a later HDR error retries the same delivery once. A repeat is terminal instead of silently becoming the SDR compatibility stream. | JVM established-delivery matrix |
 | `android.manual-quality` | Auto/Original/rung force | Auto asks for the normal verdict, Original forbids video re-encode, and every server-advertised rung requests a transcode. The menu never invents a rung above the source. | JVM force and ladder matrix |
 | `android.session-height` | Quality/burn to session height | A burn and Original preserve source height; Auto omits height; an explicit rung sends that height. A copy session omits height because copied video cannot honor a rung. | JVM height and session-body matrix |
-| `android.subtitle-route` | Embedded vs native session vs burn | Direct embedded text stays in the plan. Remux/transcode text uses a native rendition session. Bitmap and styled tracks burn in every mode; session bodies forbid copy on a transcode verdict. | JVM subtitle and session-body matrix |
-| `android.hdr-subtitle-guard` | Burn-only subtitle on HDR | PGS and styled tracks are refused while the current delivery is DV, HDR10, or HLG, with a transient notice. Native text still selects, and SDR playback may still burn. | JVM subtitle/dynamic-range matrix |
+| `android.subtitle-route` | Embedded vs native session vs overlay vs burn | Direct embedded text stays in the plan. Remux/transcode text uses a native rendition session. Recognized PGS stays on the plan video as an application overlay; unsupported bitmap and styled tracks retain burn/refusal behavior. | JVM subtitle, overlay, and session-body matrix |
+| `android.hdr-subtitle-guard` | Burn-only subtitle on HDR | Recognized `pgs-v1` is allowed because it does not mutate video. Unsupported bitmap/styled tracks are refused while the current delivery is DV, HDR10, or HLG, with a transient notice. Native text still selects, and SDR playback may still burn. | JVM subtitle/dynamic-range matrix |
+| `android.pgs-overlay` | PGS application overlay vs video mutation | Only `overlay: "pgs-v1"` selects the bounded authenticated manifest/PNG renderer. It binary-searches source-time cues, schedules exact boundaries, maps authored coordinates into the video content rectangle, and rejects stale selection/item/window work. PiP is blocked while active rather than falling back to SDR burn-in. | JVM manifest, timeline, memory, layout, and policy suite plus Compose switch/off instrumentation |
 
 <!-- playback-routing-inventory:end -->
 
@@ -259,9 +260,9 @@ unsupported, not a preparation state. VobSub and XSUB remain burn-only.
 ### PGS overlay server contract — staged and default-off
 
 The server side of `pgs-v1` is implemented behind `PLURX_PGS_OVERLAY=1` and is
-off by default while Android rendering and physical-device HDR/Dolby Vision
-acceptance remain incomplete. Apple has an automated iOS/tvOS renderer, but
-that does not make the server capability production-ready. When off,
+off by default while physical-device HDR/Dolby Vision acceptance remains
+incomplete. Apple and Android have automated application renderers, but that
+does not make the server capability production-ready. When off,
 `/decision` omits `overlay` and the
 overlay routes return 404. Enabling the gate changes subtitle delivery only;
 it does not select an overlay automatically and does not alter video bytes.
@@ -398,7 +399,7 @@ make.
 | Remux, no override | Copy-video HLS; AVPlayer does not take plurx's progressive fMP4 reliably | Progressive `/stream.mp4` |
 | Transcode | HLS session | HLS session |
 | Native text subtitle needs a session | Copy HLS for a direct/remux plan; existing rendition switches stay in AVPlayer | Direct keeps an embedded text track; remux/transcode opens a native-rendition HLS session |
-| PGS with recognized `pgs-v1` capability | Authenticated application overlay synchronized to the unchanged player item; PiP/external playback unavailable while active | Not implemented yet; retains burn/refusal behavior |
+| PGS with recognized `pgs-v1` capability | Authenticated application overlay synchronized to the unchanged player item; PiP/external playback unavailable while active | Authenticated PNG composition scheduled from `realPosition()` and drawn in the video content rectangle; PiP unavailable while active |
 | Other bitmap/styled subtitle | HLS transcode with burn-in on SDR; refused on HDR/DV | HLS transcode with burn-in on SDR; refused on HDR/DV |
 | Direct + manual A/V correction | Not currently exposed by the Apple player | Progressive remux, because ffmpeg must apply the correction |
 | Finished cache hit | HLS VOD; seek in place | HLS VOD; seek in place |

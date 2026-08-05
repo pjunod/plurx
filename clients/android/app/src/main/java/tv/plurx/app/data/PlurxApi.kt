@@ -1,5 +1,7 @@
 package tv.plurx.app.data
 
+import okhttp3.ResponseBody
+import retrofit2.Response
 import retrofit2.http.Body
 import retrofit2.http.DELETE
 import retrofit2.http.GET
@@ -54,6 +56,29 @@ interface PlurxApi {
         @Path("id") id: Long,
         @QueryMap caps: Map<String, String>,
     ): Decision
+
+    /**
+     * A cold PGS artifact answers 202 with a bounded retry hint; a warm one
+     * answers 200 with the versioned source-time manifest. The controller
+     * validates both the status payload and the complete manifest identity.
+     */
+    @GET("files/{id}/subs/{track}/overlay.json")
+    suspend fun pgsOverlayManifest(
+        @Path("id") id: Long,
+        @Path("track") track: Long,
+    ): Response<ResponseBody>
+
+    /**
+     * Immutable PNG object route. Generation and hash are validated before
+     * this method is called, so no server-provided path is interpolated here.
+     */
+    @GET("files/{id}/subs/{track}/overlay/{generation}/objects/{hash}.png")
+    suspend fun pgsOverlayObject(
+        @Path("id") id: Long,
+        @Path("track") track: Long,
+        @Path("generation") generation: String,
+        @Path("hash") hash: String,
+    ): Response<ResponseBody>
 
     /**
      * POST rather than the deprecated GET bridge: creating a session spawns a

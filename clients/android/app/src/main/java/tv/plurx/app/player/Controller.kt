@@ -39,6 +39,7 @@ import androidx.media3.common.Format
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.TrackGroup
 import androidx.media3.common.TrackSelectionOverride
 import androidx.media3.common.Tracks
@@ -157,6 +158,12 @@ class Controller(
     var playbackNotice: String? by mutableStateOf(null)
         private set
 
+    internal var pgsOverlayFrame: PGSOverlayFrame? by mutableStateOf(null)
+        private set
+
+    internal var pgsOverlayStatus: PGSOverlayStatus by mutableStateOf(PGSOverlayStatus.Off)
+        private set
+
     /** A direct DV failure may use one lossless remux before the final rescue. */
     private var compatibilityRemuxUsed = false
 
@@ -217,16 +224,20 @@ class Controller(
         get() = when (subtitleDelivery) {
             SubtitleDelivery.Burn -> "transcode"
             SubtitleDelivery.NativeSession -> if (planMode == "transcode") "transcode" else "remux"
+            SubtitleDelivery.BitmapOverlay,
             SubtitleDelivery.Plan -> planMode
         }
 
+    val pgsOverlayIsActive: Boolean
+        get() = pgsOverlayStatus != PGSOverlayStatus.Off
+
     /** True while the original file is being read directly, base timeline = 0. */
     private val directTransport: Boolean
-        get() = subtitleDelivery == SubtitleDelivery.Plan && planMode == "direct"
+        get() = subtitleDelivery.usesPlanTransport && planMode == "direct"
 
     /** True while Media3 is reading the live progressive remux response. */
     private val progressiveTransport: Boolean
-        get() = subtitleDelivery == SubtitleDelivery.Plan && planMode == "remux"
+        get() = subtitleDelivery.usesPlanTransport && planMode == "remux"
 
     var encoder: String? = null
         private set
@@ -260,6 +271,18 @@ class Controller(
      * intent here and let [listener] land it whenever the tracks turn up.
      */
     private var textSelectionArmed = false
+
+    private val pgsOverlay = AndroidPGSOverlayController(
+        api = { vm.api() },
+        scope = scope,
+        fileId = plan.fileId,
+        sourcePositionMs = ::realPosition,
+        isPlaying = { player.isPlaying },
+        playbackSpeed = { player.playbackParameters.speed },
+        onFrame = { pgsOverlayFrame = it },
+        onStatus = { pgsOverlayStatus = it },
+        onFailure = { playbackNotice = it },
+    )
 
     private val listener = object : Player.Listener {
         override fun onPlayerError(error: PlaybackException) {
@@ -317,10 +340,25 @@ class Controller(
         }
 
         override fun onTracksChanged(tracks: Tracks) = applyTextSelection()
+
+        override fun onPositionDiscontinuity(
+            oldPosition: Player.PositionInfo,
+            newPosition: Player.PositionInfo,
+            reason: Int,
+        ) = pgsOverlay.reconcile()
+
+        override fun onPlaybackParametersChanged(playbackParameters: PlaybackParameters) =
+            pgsOverlay.reconcile()
+
+        override fun onIsPlayingChanged(isPlaying: Boolean) = pgsOverlay.reconcile()
+
+        override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) =
+            pgsOverlay.itemChanged()
     }
 
     init {
         player.addListener(listener)
+        pgsOverlay.select(selectedSubtitle.takeIf { subtitleDelivery == SubtitleDelivery.BitmapOverlay })
     }
 
     fun startAt(ms: Long) = restartAt(ms.coerceAtLeast(0))
@@ -338,7 +376,7 @@ class Controller(
         val t = targetMs.coerceIn(0, if (plan.durationMs > 0) plan.durationMs else Long.MAX_VALUE)
         when {
             directTransport -> player.seekTo(t)
-            subtitleDelivery == SubtitleDelivery.Plan && planMode == "remux" -> {
+            subtitleDelivery.usesPlanTransport && planMode == "remux" -> {
                 leaveSessionPlayback()
                 baseMs = t
                 val uri = remuxUri(t)
@@ -360,6 +398,7 @@ class Controller(
     }
 
     fun release() {
+        pgsOverlay.release()
         sessionRequestVersion++
         sessionId?.let { vm.endHlsSession(it) }
         sessionId = null
@@ -398,6 +437,7 @@ class Controller(
         val route = subtitleRoute(track, planMode, subtitleDelivery)
         selectedSubtitle = index
         subtitleDelivery = route.delivery
+        pgsOverlay.select(index.takeIf { route.delivery == SubtitleDelivery.BitmapOverlay })
         if (route.reopen) {
             restartAt(position)
         } else {
@@ -414,6 +454,12 @@ class Controller(
         playbackNotice = null
     }
 
+    fun allowsPictureInPictureCommand(): Boolean {
+        if (!pgsOverlayIsActive) return true
+        playbackNotice = PGS_OVERLAY_PIP_NOTICE
+        return false
+    }
+
     /** Apply an A/V correction to this controller only and reopen in place. */
     fun setAudioOffset(offsetMs: Long) {
         val position = realPosition()
@@ -428,7 +474,7 @@ class Controller(
 
     private fun restartAt(positionMs: Long) {
         when {
-            subtitleDelivery != SubtitleDelivery.Plan -> openSession(positionMs)
+            !subtitleDelivery.usesPlanTransport -> openSession(positionMs)
             planMode == "direct" -> {
                 leaveSessionPlayback()
                 player.setMediaItem(MediaItem.fromUri(plan.playUrl), positionMs)
@@ -544,7 +590,11 @@ class Controller(
         // text track. A burn's cues are already in the picture, and letting
         // ExoPlayer's own language preference pick something here would put a
         // second subtitle policy in front of the one the server decided.
-        if (index == null || subtitleDelivery == SubtitleDelivery.Burn) {
+        if (
+            index == null ||
+            subtitleDelivery == SubtitleDelivery.Burn ||
+            subtitleDelivery == SubtitleDelivery.BitmapOverlay
+        ) {
             textSelectionArmed = false
             player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
                 .clearOverridesOfType(C.TRACK_TYPE_TEXT)
