@@ -1,0 +1,23 @@
+[package]
+name = "plurx-pgs"
+description = "Bounded PGS parser adapter for the Plurx overlay feasibility milestone"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Milestone 0 audits this exact release. Keep the pin local to this unshipped
+# adapter; plurxd must not depend on this crate until the review is accepted.
+libpgs = "=0.6.0"
+hex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

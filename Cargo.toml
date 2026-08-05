@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/plurx-core",
     "crates/plurx-compat-plex",
+    "crates/plurx-pgs",
     "crates/plurxd",
 ]
 

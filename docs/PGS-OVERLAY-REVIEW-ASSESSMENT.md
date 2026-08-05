@@ -1,6 +1,6 @@
 # PGS overlay review assessment — accepted findings and requested re-review
 
-**Status:** ready for re-review · **Responds to:**
+**Status:** adjudication complete; Milestone 0 authorized · **Responds to:**
 [`PGS_OVERLAY_PLAN_REVIEW.md`](https://github.com/pjunod/plurx/blob/docs/pgs-overlay-review/docs/PGS_OVERLAY_PLAN_REVIEW.md)
 at `5262e791` · **Verified against:** `origin/main` at `452bcf4c` ·
 **Written:** 2026-08-04
@@ -8,8 +8,10 @@ at `5262e791` · **Verified against:** `origin/main` at `452bcf4c` ·
 Companion to [PGS_OVERLAY_PLAN.md](PGS_OVERLAY_PLAN.md), which proposes the
 Dolby Vision-safe PGS overlay architecture. This assessment adjudicates the
 review findings before the plan is revised. Reviewers should read §1 first,
-then confirm or challenge the requested dispositions in §9. Implementation
-remains paused; this document does not authorize code changes.
+then confirm or challenge the requested dispositions in §9. The architecture
+has since been approved for feasibility work only; live evidence is tracked in
+[PGS-OVERLAY-M0-FEASIBILITY.md](PGS-OVERLAY-M0-FEASIBILITY.md). This document
+does not authorize production rollout.
 
 ## 1. Verdict — approve the architecture and revise the contract
 

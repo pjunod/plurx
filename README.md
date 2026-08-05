@@ -36,6 +36,11 @@ then
 become a stream — every direct/remux/transcode fork and the per-browser
 transport choice behind it. [docs/PLAYBACK-TESTING.md](docs/PLAYBACK-TESTING.md)
 turns that map into an automated source × quality × operation matrix, with
+[docs/PGS_OVERLAY_PLAN.md](docs/PGS_OVERLAY_PLAN.md) defining the proposed
+Dolby Vision-safe bitmap-subtitle path and
+[docs/PGS-OVERLAY-M0-FEASIBILITY.md](docs/PGS-OVERLAY-M0-FEASIBILITY.md)
+recording the parser, fixture, resource, and physical-device evidence required
+before that path can ship, and with
 [docs/STUTTER-4K.md](docs/STUTTER-4K.md) as the open investigation into the one
 fork that misbehaves: what is already ruled out and the experiment that ruled it
 out, so the next attempt starts where the last one stopped. If you run plurx
