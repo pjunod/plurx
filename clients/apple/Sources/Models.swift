@@ -412,6 +412,9 @@ struct HlsStart: Codable {
     let playlistUrl: String
     var durationMs: Int?
     var startSeconds: Double?
+    /// Source-timeline timestamp represented by player-local time zero.
+    /// Optional so this client remains compatible with older servers.
+    var mediaOriginMs: Int?
     var encoder: String?
     var vod: Bool?
     var ladder: [QualityRung]?

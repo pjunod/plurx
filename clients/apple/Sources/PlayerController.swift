@@ -821,11 +821,9 @@ final class PlayerController: ObservableObject {
             isVOD = hls.vod ?? false
             usesDirectTimeline = isVOD
             if knownDurationMs <= 0 { knownDurationMs = hls.durationMs ?? 0 }
+            nextBaseMs = Self.sessionMediaOriginMs(hls, requestedStartMs: startMs)
             if isVOD {
-                nextBaseMs = 0
                 if startMs > 0 { seekAfterAttach = startMs }
-            } else {
-                nextBaseMs = Int((hls.startSeconds ?? Double(startMs) / 1000.0) * 1000)
             }
             url = Session.shared.url(hls.playlistUrl)
             startStatusPolling()
@@ -1500,6 +1498,18 @@ final class PlayerController: ObservableObject {
     static func playlistAdvertisesNativeSubtitles(_ playlistUrl: String) -> Bool {
         guard let items = URLComponents(string: playlistUrl)?.queryItems else { return false }
         return items.contains { $0.name == "native" && $0.value != "0" }
+    }
+
+    /// Resolve player-local time zero onto the source timeline.
+    ///
+    /// Copy sessions can start at the keyframe before the requested seek, so
+    /// the server's integer origin wins. The older floating-point request
+    /// echo remains the compatibility fallback. Cached whole-title sessions
+    /// use direct timeline semantics and always begin at zero.
+    nonisolated static func sessionMediaOriginMs(_ hls: HlsStart, requestedStartMs: Int) -> Int {
+        if hls.vod == true { return 0 }
+        if let mediaOriginMs = hls.mediaOriginMs { return mediaOriginMs }
+        return Int((hls.startSeconds ?? Double(requestedStartMs) / 1000.0) * 1000)
     }
 
     private func applyNativeSubtitleSelection(_ index: Int?, to item: AVPlayerItem?) async {
