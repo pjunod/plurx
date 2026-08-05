@@ -60,8 +60,8 @@ classic|activity@1280x860|dom|header.top > nav|1
 classic|activity@1280x860|dom|header.top > span#activity.activity|1
 classic|activity@1280x860|dom|header.top > span.spacer|1
 classic|activity@1280x860|dom|main#main > div.card|1
-classic|activity@1280x860|dom|main#main > div.empty[text]|3
-classic|activity@1280x860|dom|main#main > h2.section[text]|4
+classic|activity@1280x860|dom|main#main > div.empty[text]|4
+classic|activity@1280x860|dom|main#main > h2.section[text]|5
 classic|activity@1280x860|dom|nav > a.active[text]|1
 classic|activity@1280x860|dom|nav > a[text]|2
 classic|activity@1280x860|dom|p.muted[text] > a[text]|1
@@ -107,8 +107,8 @@ classic|activity@390x780|dom|header.top > nav|1
 classic|activity@390x780|dom|header.top > span#activity.activity|1
 classic|activity@390x780|dom|header.top > span.spacer|1
 classic|activity@390x780|dom|main#main > div.card|1
-classic|activity@390x780|dom|main#main > div.empty[text]|3
-classic|activity@390x780|dom|main#main > h2.section[text]|4
+classic|activity@390x780|dom|main#main > div.empty[text]|4
+classic|activity@390x780|dom|main#main > h2.section[text]|5
 classic|activity@390x780|dom|nav > a.active[text]|1
 classic|activity@390x780|dom|nav > a[text]|2
 classic|activity@390x780|dom|p.muted[text] > a[text]|1
@@ -1613,8 +1613,8 @@ plex|activity@1280x860|dom|div.px-pop > div#sizemenu.amenu|1
 plex|activity@1280x860|dom|div.px-pop > div#thememenu.amenu|1
 plex|activity@1280x860|dom|div.px-user > div.px-pop|1
 plex|activity@1280x860|dom|main#main > div.card|1
-plex|activity@1280x860|dom|main#main > div.empty[text]|3
-plex|activity@1280x860|dom|main#main > h2.section[text]|4
+plex|activity@1280x860|dom|main#main > div.empty[text]|4
+plex|activity@1280x860|dom|main#main > h2.section[text]|5
 plex|activity@1280x860|dom|nav.px-nav[aria-label=*] > a.on[aria-current=page]|1
 plex|activity@1280x860|dom|nav.px-nav[aria-label=*] > a|2
 plex|activity@1280x860|dom|nav.px-tabs[aria-label=*] > a.on.px-tab[aria-current=page]|1
@@ -1689,8 +1689,8 @@ plex|activity@390x780|dom|div.px-pop > div#sizemenu.amenu|1
 plex|activity@390x780|dom|div.px-pop > div#thememenu.amenu|1
 plex|activity@390x780|dom|div.px-user > div.px-pop|1
 plex|activity@390x780|dom|main#main > div.card|1
-plex|activity@390x780|dom|main#main > div.empty[text]|3
-plex|activity@390x780|dom|main#main > h2.section[text]|4
+plex|activity@390x780|dom|main#main > div.empty[text]|4
+plex|activity@390x780|dom|main#main > h2.section[text]|5
 plex|activity@390x780|dom|nav.px-nav[aria-label=*] > a.on[aria-current=page]|1
 plex|activity@390x780|dom|nav.px-nav[aria-label=*] > a|2
 plex|activity@390x780|dom|nav.px-tabs[aria-label=*] > a.on.px-tab[aria-current=page]|1
@@ -3682,8 +3682,8 @@ theater|activity@1280x860|dom|header.th-top > nav.th-nav[aria-label=*]|1
 theater|activity@1280x860|dom|header.th-top > span#activity.activity|1
 theater|activity@1280x860|dom|header.th-top > span.spacer|1
 theater|activity@1280x860|dom|main#main > div.card|1
-theater|activity@1280x860|dom|main#main > div.empty[text]|3
-theater|activity@1280x860|dom|main#main > h2.section[text]|4
+theater|activity@1280x860|dom|main#main > div.empty[text]|4
+theater|activity@1280x860|dom|main#main > h2.section[text]|5
 theater|activity@1280x860|dom|nav.th-nav[aria-label=*] > a.on[aria-current=page text]|1
 theater|activity@1280x860|dom|nav.th-nav[aria-label=*] > a[text]|2
 theater|activity@1280x860|dom|nav.th-pills[aria-label=*] > a.on[aria-current=page text]|1
@@ -3732,8 +3732,8 @@ theater|activity@390x780|dom|header.th-top > nav.th-nav[aria-label=*]|1
 theater|activity@390x780|dom|header.th-top > span#activity.activity|1
 theater|activity@390x780|dom|header.th-top > span.spacer|1
 theater|activity@390x780|dom|main#main > div.card|1
-theater|activity@390x780|dom|main#main > div.empty[text]|3
-theater|activity@390x780|dom|main#main > h2.section[text]|4
+theater|activity@390x780|dom|main#main > div.empty[text]|4
+theater|activity@390x780|dom|main#main > h2.section[text]|5
 theater|activity@390x780|dom|nav.th-nav[aria-label=*] > a.on[aria-current=page text]|1
 theater|activity@390x780|dom|nav.th-nav[aria-label=*] > a[text]|2
 theater|activity@390x780|dom|nav.th-pills[aria-label=*] > a.on[aria-current=page text]|1
