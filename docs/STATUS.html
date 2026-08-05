@@ -92,7 +92,7 @@
   <header>
     <h1>plurx — Project Status</h1>
     <div class="sub">Self-hosted media server in the old-Plex spirit · explicit ledger of done vs. planned ·
-      mirrors <code>docs/ROADMAP.md</code> + <code>docs/FEATURES.md</code> · 2026-08-05 · draft PR #68 is unmerged</div>
+      mirrors <code>docs/ROADMAP.md</code> + <code>docs/FEATURES.md</code> · 2026-08-05 · offline viewing merged; observability follow-up is under review</div>
   </header>
 
   <div class="tiles">
@@ -232,14 +232,15 @@
 
   <!-- ══════════ Offline viewing ══════════ -->
   <section>
-    <h2>Offline viewing — app-owned travel downloads <span class="chip prog">🚧 draft re-review</span> <span class="ev">OFFLINE-VIEWING-PLAN.md · PR #68 · 2026-08-05</span></h2>
-    <div class="meter"><div class="track"><div class="fill" style="width:83%"></div></div><div class="n">implementation + first review reconciliation complete</div></div>
-    <p class="blurb">Netflix-style one-tap downloads for iPhone/iPad and Android phone/tablet. Cinema owns the opaque HLS package, artwork, progress, playback, and removal; there is no Save File or Files-app workflow. The PR stays unmerged until Fable re-reviews it.</p>
+    <h2>Offline viewing — app-owned travel downloads <span class="chip prog">🚧 physical acceptance</span> <span class="ev">OFFLINE-VIEWING-PLAN.md · PR #68 merged · 2026-08-05</span></h2>
+    <div class="meter"><div class="track"><div class="fill" style="width:91%"></div></div><div class="n">feature merged · observability follow-up in draft review</div></div>
+    <p class="blurb">Netflix-style one-tap downloads for iPhone/iPad and Android phone/tablet. Cinema owns the opaque HLS package, artwork, progress, playback, and removal; there is no Save File or Files-app workflow. PR #68 merged before the planned Fable follow-up; the new observability work remains in an unmerged draft for review.</p>
     <ul class="items">
       <li class="done-item"><span class="m done">✓ built</span><span class="t">Durable server preparation, hashed renewable package lease, quota/pin lifecycle, native WebVTT, offline-only playback, profile isolation, local progress outbox, and app-owned deletion</span></li>
       <li class="done-item"><span class="m done">✓ fixed</span><span class="t">Fable blockers reconciled: cache ownership cannot orphan ready/staging packages; recipe identity is persisted before production; Android routes + subtitle group are contract-tested; Apple explicitly selects and verifies the cached subtitle; both apps catch up on foreground</span></li>
       <li class="done-item"><span class="m done">✓ checked</span><span class="t">Full Rust baseline gate, Android JVM unit + lint suites, and iOS simulator build + XCTest suite pass on the reconciliation diff</span></li>
-      <li><span class="m todo">○ review</span><span class="t">Fable re-review on the existing draft PR; do not merge yet</span></li>
+      <li class="done-item"><span class="m done">✓ visible</span><span class="t">Authenticated activity rows now distinguish preparing from sending; Prometheus exposes fixed-label state, byte, quality, quota, latency, failure, cancellation, lease, and transfer series without titles, users, packages, recipes, or devices</span></li>
+      <li><span class="m todo">○ review</span><span class="t">Review the new <code>codex/offline-viewing-follow-up</code> draft; do not merge it yet</span></li>
       <li><span class="m you">👤 device</span><span class="t">Physical iPhone and Android flight-mode/background/process-death acceptance, including selected subtitle and midpoint seek, remains the release gate</span></li>
       <li><span class="m todo">○ separate</span><span class="t">The pre-existing active-playback-reader/LRU race stays in a focused follow-up rather than widening this feature PR</span></li>
     </ul>

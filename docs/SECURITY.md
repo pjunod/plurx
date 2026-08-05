@@ -132,7 +132,7 @@ user; management and diagnostics require admin.
 | Surface | Bar | What it exposes, and why it sits here |
 |---|---|---|
 | `/healthz` · `/readyz` | none | liveness/readiness for the proxy and orchestrators; no data |
-| `/metrics` | none | Prometheus counters — version, uptime, active-stream/user/library counts. A small deployment-shape leak; firewall it to your scrape host if that shape is sensitive |
+| `/metrics` | none | Prometheus counters and gauges — version, uptime, active-stream/user/library counts, plus offline state/bytes/timing/quality/failure totals with fixed labels. It exposes no user, title, file, package, recipe, or device label; counts still reveal deployment shape, so firewall it to your scrape host if that shape is sensitive |
 | `/server` | none | setup-required flag + feature flags, so the web app can pick first-run vs login before anyone has a token |
 | `/manifest.webmanifest` · `/icons/*` · `/assets/hls.min.js` | none | static PWA assets |
 | `/download/plurx-android.apk` | none | the client app *binary*, not user data — and a TV's Downloader/browser can't attach a token. Intentional; see [CLIENTS.md](CLIENTS.md) |

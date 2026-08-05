@@ -23,8 +23,8 @@ use async_trait::async_trait;
 use crate::domain::{
     CachedTranscode, InProgressItem, Item, ItemEdit, ItemKind, ItemPage, ItemSort, Library,
     MediaFile, MediaShape, MetadataPatch, NewItem, NewLibrary, NewOfflinePackage,
-    OfflineCreateOutcome, OfflineLeaseOutcome, OfflinePackage, ProbeResult, RecentItem, TraktAuth,
-    User, WatchRollup, WatchState,
+    OfflineActivityPackage, OfflineCreateOutcome, OfflineLeaseOutcome, OfflinePackage,
+    OfflinePackageStats, ProbeResult, RecentItem, TraktAuth, User, WatchRollup, WatchState,
 };
 // RecentItem is reused for next-up (episode + show title).
 use crate::error::StoreError;
@@ -811,6 +811,26 @@ pub trait OfflinePackageStore: Send + Sync + 'static {
         user_id: i64,
         expires_at: i64,
     ) -> Result<Option<OfflinePackage>, StoreError>;
+
+    /// Active preparation plus recently touched ready leases for the
+    /// authenticated operator page. The limit is clamped by the store so an
+    /// accidentally large caller value cannot turn polling into an unbounded
+    /// read.
+    async fn offline_activity_packages(
+        &self,
+        node_id: &str,
+        now: i64,
+        active_since: i64,
+        limit: i64,
+    ) -> Result<Vec<OfflineActivityPackage>, StoreError>;
+
+    /// Current state and quota gauges. Aggregated in SQL so `/metrics` never
+    /// has to load package rows or introduce labels from package data.
+    async fn offline_package_stats(
+        &self,
+        node_id: &str,
+        now: i64,
+    ) -> Result<OfflinePackageStats, StoreError>;
 
     async fn reset_interrupted_offline_packages(&self, node_id: &str) -> Result<u64, StoreError>;
 

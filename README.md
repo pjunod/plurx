@@ -239,9 +239,10 @@ ideal, *Remux* is cheap, *Transcode · QuickSync* means the GPU is working,
 `python-plexapi`, and Home Assistant work against the Plex-compat façade + GDM
 discovery — no plex.tv contact. See [docs/CLIENTS.md](docs/CLIENTS.md).
 
-**Operate it.** `/healthz`, `/readyz`, and Prometheus `/metrics`; a global
-activity pill shows what the server is doing on every page; Settings → Logs is a
-live, filterable log viewer. Full guide: [docs/OPERATIONS.md](docs/OPERATIONS.md).
+**Operate it.** `/healthz`, `/readyz`, and Prometheus `/metrics` (including
+bounded offline queue, timing, quota, and transfer series); a global activity
+pill shows what the server is doing on every page; Settings → Logs is a live,
+filterable log viewer. Full guide: [docs/OPERATIONS.md](docs/OPERATIONS.md).
 
 ## Layout
 

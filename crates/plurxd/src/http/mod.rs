@@ -367,6 +367,16 @@ mod tests {
         (status, value)
     }
 
+    async fn call_text(app: &Router, req: Request<Body>) -> (StatusCode, String) {
+        let resp = app.clone().oneshot(req).await.expect("response");
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+        (
+            status,
+            String::from_utf8(bytes.to_vec()).expect("UTF-8 body"),
+        )
+    }
+
     fn get(uri: &str, token: Option<&str>) -> Request<Body> {
         let mut b = Request::builder().uri(uri);
         if let Some(t) = token {
@@ -2680,6 +2690,35 @@ mod tests {
         assert_eq!(status_code, StatusCode::ACCEPTED, "{retry}");
         assert_eq!(retry["id"], package_id);
 
+        let (status_code, activity) =
+            call(&app, get("/api/v1/activity/detail", Some(&admin))).await;
+        assert_eq!(status_code, StatusCode::OK, "{activity}");
+        assert_eq!(activity["offline"][0]["kind"], "prepare");
+        assert_eq!(activity["offline"][0]["title"], "Flight");
+        assert_eq!(activity["offline"][0]["state"], "queued");
+        assert_eq!(activity["offline"][0]["user"], "paul");
+
+        let (status_code, summary) = call(&app, get("/api/v1/activity", Some(&admin))).await;
+        assert_eq!(status_code, StatusCode::OK, "{summary}");
+        assert!(summary
+            .as_array()
+            .is_some_and(|rows| rows.iter().any(|row| {
+                row["kind"] == "offline_prepare" && row["label"] == "Preparing offline · Flight"
+            })));
+
+        let (status_code, metrics) = call_text(&app, get("/metrics", None)).await;
+        assert_eq!(status_code, StatusCode::OK);
+        assert!(metrics.contains("plurx_offline_packages{state=\"queued\"} 1"));
+        assert!(metrics.contains("plurx_offline_requests_total{height=\"720\"} 1"));
+        assert!(
+            !metrics.contains("Flight"),
+            "titles must never become labels"
+        );
+        assert!(
+            !metrics.contains(&package_id),
+            "package ids must never become labels"
+        );
+
         let (status_code, conflict) = call(
             &app,
             post(
@@ -2722,6 +2761,23 @@ mod tests {
             .mark_offline_package_ready(&package_id, "test-recipe", 15, 90_000)
             .await
             .expect("mark ready"));
+        let (status_code, lease) = call(
+            &app,
+            put(
+                &format!("/api/v1/offline/packages/{package_id}/lease"),
+                Some(&admin),
+                json!({ "token": "a".repeat(64) }),
+            ),
+        )
+        .await;
+        assert_eq!(status_code, StatusCode::CREATED, "{lease}");
+        state.offline.record_transfer(&package_id, 7);
+        let (status_code, activity) =
+            call(&app, get("/api/v1/activity/detail", Some(&admin))).await;
+        assert_eq!(status_code, StatusCode::OK, "{activity}");
+        assert_eq!(activity["offline"][0]["kind"], "send");
+        assert_eq!(activity["offline"][0]["bytes_sent"], 7);
+
         for attempt in ["first completion", "idempotent retry"] {
             let (status_code, body) = call(
                 &app,
@@ -2740,6 +2796,10 @@ mod tests {
             .await
             .expect("package lookup")
             .is_none());
+        let (_, metrics) = call_text(&app, get("/metrics", None)).await;
+        assert!(metrics.contains("plurx_offline_packages{state=\"ready\"} 0"));
+        assert!(metrics.contains("plurx_offline_cancellations_total 0"));
+        assert!(metrics.contains("plurx_offline_transfer_bytes_total 7"));
     }
 
     #[tokio::test]

@@ -550,6 +550,36 @@ pub struct OfflinePackage {
     pub expires_at: i64,
 }
 
+/// One package that belongs on the operator activity surface.
+///
+/// `lease_active` is deliberately derived by the store from a recent,
+/// unexpired lease touch. It is not persisted package state: a ready package
+/// is only "sending" while a downloader is still fetching it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OfflineActivityPackage {
+    pub package: OfflinePackage,
+    pub lease_active: bool,
+}
+
+/// Fixed-cardinality offline gauges for one server node.
+///
+/// Bytes use the completed size when it exists and the conservative
+/// reservation otherwise, matching quota accounting. Named fields keep the
+/// only valid state vocabulary explicit all the way to Prometheus.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OfflinePackageStats {
+    pub queued: i64,
+    pub preparing: i64,
+    pub ready: i64,
+    pub failed: i64,
+    pub queued_bytes: i64,
+    pub preparing_bytes: i64,
+    pub ready_bytes: i64,
+    pub failed_bytes: i64,
+    pub active_leases: i64,
+    pub pinned_bytes: i64,
+}
+
 /// Validated values inserted as one transaction with idempotency and quota
 /// checks. Source identity is copied so a rescan cannot silently retarget a
 /// queued job at different bytes.

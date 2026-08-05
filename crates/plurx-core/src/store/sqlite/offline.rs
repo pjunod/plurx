@@ -5,7 +5,8 @@ use rusqlite::{params, OptionalExtension};
 
 use super::SqliteStore;
 use crate::domain::{
-    NewOfflinePackage, OfflineCreateOutcome, OfflineLease, OfflineLeaseOutcome, OfflinePackage,
+    NewOfflinePackage, OfflineActivityPackage, OfflineCreateOutcome, OfflineLease,
+    OfflineLeaseOutcome, OfflinePackage, OfflinePackageStats,
 };
 use crate::error::StoreError;
 use crate::store::OfflinePackageStore;
@@ -250,6 +251,108 @@ impl OfflinePackageStore for SqliteStore {
             )?;
             tx.commit()?;
             Ok(Some(package))
+        })
+        .await
+    }
+
+    async fn offline_activity_packages(
+        &self,
+        node_id: &str,
+        now: i64,
+        active_since: i64,
+        limit: i64,
+    ) -> Result<Vec<OfflineActivityPackage>, StoreError> {
+        let node = node_id.to_owned();
+        let limit = limit.clamp(1, 100);
+        self.with_conn(move |conn| {
+            let prefixed = PACKAGE_COLS
+                .split(", ")
+                .map(|column| format!("p.{column}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let active_lease = "EXISTS (
+                SELECT 1 FROM offline_package_leases l
+                WHERE l.package_id = p.id AND l.expires_at > ?2
+                  AND l.last_access_at >= ?3
+            )";
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {prefixed}, {active_lease} FROM offline_packages p
+                 WHERE p.node_id = ?1
+                   AND (p.state IN ('queued', 'preparing') OR {active_lease})
+                 ORDER BY CASE p.state
+                    WHEN 'preparing' THEN 0 WHEN 'queued' THEN 1 ELSE 2 END,
+                    (SELECT COALESCE(MAX(recent.last_access_at), 0)
+                     FROM offline_package_leases recent
+                     WHERE recent.package_id = p.id) DESC,
+                    p.created_at, p.id
+                 LIMIT ?4"
+            ))?;
+            let rows = stmt
+                .query_map(params![node, now, active_since, limit], |row| {
+                    Ok(OfflineActivityPackage {
+                        package: package_from_row(row)?,
+                        lease_active: row.get(30)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    async fn offline_package_stats(
+        &self,
+        node_id: &str,
+        now: i64,
+    ) -> Result<OfflinePackageStats, StoreError> {
+        let node = node_id.to_owned();
+        self.with_conn(move |conn| {
+            Ok(conn.query_row(
+                "SELECT
+                    COALESCE(SUM(state = 'queued'), 0),
+                    COALESCE(SUM(state = 'preparing'), 0),
+                    COALESCE(SUM(state = 'ready'), 0),
+                    COALESCE(SUM(state = 'failed'), 0),
+                    COALESCE(SUM(CASE WHEN state = 'queued'
+                        THEN COALESCE(actual_bytes, reserved_bytes) ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN state = 'preparing'
+                        THEN COALESCE(actual_bytes, reserved_bytes) ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN state = 'ready'
+                        THEN COALESCE(actual_bytes, reserved_bytes) ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN state = 'failed'
+                        THEN COALESCE(actual_bytes, reserved_bytes) ELSE 0 END), 0),
+                    (SELECT COUNT(*) FROM offline_package_leases l
+                     JOIN offline_packages active ON active.id = l.package_id
+                     WHERE active.node_id = ?1 AND active.state = 'ready'
+                       AND l.expires_at > ?2),
+                    (SELECT COALESCE(SUM(location.bytes), 0)
+                     FROM transcode_cache_locations location
+                     WHERE location.node_id = ?1
+                       AND location.storage_class = 'local'
+                       AND location.complete = 1
+                       AND EXISTS (
+                           SELECT 1 FROM offline_packages pinned
+                           WHERE pinned.node_id = location.node_id
+                             AND pinned.recipe_hash = location.recipe_hash
+                             AND pinned.state IN ('queued', 'preparing', 'ready')
+                       ))
+                 FROM offline_packages WHERE node_id = ?1",
+                params![node, now],
+                |row| {
+                    Ok(OfflinePackageStats {
+                        queued: row.get(0)?,
+                        preparing: row.get(1)?,
+                        ready: row.get(2)?,
+                        failed: row.get(3)?,
+                        queued_bytes: row.get(4)?,
+                        preparing_bytes: row.get(5)?,
+                        ready_bytes: row.get(6)?,
+                        failed_bytes: row.get(7)?,
+                        active_leases: row.get(8)?,
+                        pinned_bytes: row.get(9)?,
+                    })
+                },
+            )?)
         })
         .await
     }
@@ -789,5 +892,105 @@ mod tests {
                 .state,
             "queued"
         );
+    }
+
+    #[tokio::test]
+    async fn activity_and_metrics_use_fixed_state_aggregates() {
+        let store = store().await;
+        let preparing = match store
+            .create_offline_package(&request("preparing"), 10, 10_000, 20_000)
+            .await
+            .expect("preparing package")
+        {
+            OfflineCreateOutcome::Created(package) => package,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(
+            store
+                .claim_next_offline_package("node-a")
+                .await
+                .expect("claim")
+                .expect("package")
+                .id,
+            preparing.id
+        );
+
+        let ready = match store
+            .create_offline_package(&request("ready"), 10, 10_000, 20_000)
+            .await
+            .expect("ready package")
+        {
+            OfflineCreateOutcome::Created(package) => package,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert!(store
+            .mark_offline_package_ready(&ready.id, "recipe", 350, 90_000)
+            .await
+            .expect("ready"));
+        assert!(matches!(
+            store
+                .put_offline_lease(&ready.id, 1, &"a".repeat(64), 1_000)
+                .await
+                .expect("lease"),
+            OfflineLeaseOutcome::Created(_)
+        ));
+
+        let failed = match store
+            .create_offline_package(&request("failed"), 10, 10_000, 20_000)
+            .await
+            .expect("failed package")
+        {
+            OfflineCreateOutcome::Created(package) => package,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert!(store
+            .fail_offline_package(&failed.id, "transcoding", "encoder_failed", "failed")
+            .await
+            .expect("fail"));
+        store
+            .with_conn(|conn| {
+                conn.execute("UPDATE offline_package_leases SET last_access_at = 480", [])?;
+                Ok(())
+            })
+            .await
+            .expect("test clock");
+
+        let activity = store
+            .offline_activity_packages("node-a", 500, 450, 50)
+            .await
+            .expect("activity");
+        assert_eq!(activity.len(), 2, "failed packages are not live work");
+        assert_eq!(activity[0].package.id, preparing.id);
+        assert!(!activity[0].lease_active);
+        assert_eq!(activity[1].package.id, ready.id);
+        assert!(activity[1].lease_active);
+
+        let stats = store
+            .offline_package_stats("node-a", 500)
+            .await
+            .expect("stats");
+        assert_eq!(stats.queued, 0);
+        assert_eq!(stats.preparing, 1);
+        assert_eq!(stats.ready, 1);
+        assert_eq!(stats.failed, 1);
+        assert_eq!(stats.preparing_bytes, 500);
+        assert_eq!(stats.ready_bytes, 350);
+        assert_eq!(stats.failed_bytes, 500);
+        assert_eq!(stats.active_leases, 1);
+        assert_eq!(stats.pinned_bytes, 0, "no cache location was seeded");
+
+        store
+            .with_conn(|conn| {
+                conn.execute("UPDATE offline_package_leases SET last_access_at = 400", [])?;
+                Ok(())
+            })
+            .await
+            .expect("age lease");
+        let activity = store
+            .offline_activity_packages("node-a", 500, 450, 50)
+            .await
+            .expect("aged activity");
+        assert_eq!(activity.len(), 1);
+        assert_eq!(activity[0].package.id, preparing.id);
     }
 }

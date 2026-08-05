@@ -387,7 +387,8 @@ browse and play directly against plurx — validated end-to-end with
 [ARCHITECTURE.md](ARCHITECTURE.md) §5.
 
 **Operations:** `/healthz` (liveness), `/readyz` (storage reachable), Prometheus
-`/metrics` (uptime, active transcode sessions, library/user counts); structured
+`/metrics` (uptime, streams, library/user counts, and bounded offline
+queue/transfer metrics); structured
 `tracing` logs with an in-app **live log viewer** (filter by level); a **global
 activity pill** on every page showing what the server is doing right now (scan,
 metadata, streams). Config via `plurx.toml` or `PLURX_*` env. Deploy templates
@@ -449,6 +450,9 @@ page (3-second refresh) instead of dumping you into Settings.
   through without a server session and say so.
 - **Library:** per-library scan/enrich state with the same live counters as
   Settings.
+- **Offline downloads:** every package currently waiting/preparing, plus ready
+  packages whose lease is actively sending to a device. These rows stay out of
+  Now Playing because a download is server work, not a viewer.
 - **Trakt:** link state, last sync, and the last sync summary or error.
 
 ---

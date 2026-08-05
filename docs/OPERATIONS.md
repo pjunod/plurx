@@ -491,7 +491,7 @@ matter most: `plurxd::scan` (library passes), `plurxd::meta` (provider matches),
 |---|---|
 | `GET /healthz` | Liveness — the process is up |
 | `GET /readyz` | Readiness — storage is reachable (use for load-balancer health) |
-| `GET /metrics` | Prometheus text: uptime, active transcode sessions, library and user counts |
+| `GET /metrics` | Prometheus text: uptime, streams, library/user counts, and bounded offline queue, quota, timing, quality, failure, and transfer metrics |
 
 ## Hardware transcode & recent Intel GPUs
 
