@@ -1,0 +1,25 @@
+[package]
+name = "plurx-pgs-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+plurx-pgs = { path = "../crates/plurx-pgs" }
+tempfile = "3"
+
+[[bin]]
+name = "inspect_sup"
+path = "fuzz_targets/inspect_sup.rs"
+test = false
+doc = false
+bench = false
+
+# Keep sanitizer-only dependencies out of the shipped workspace and its
+# ordinary stable-toolchain gate.
+[workspace]
+members = ["."]
