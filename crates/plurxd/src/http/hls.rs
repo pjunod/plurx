@@ -50,6 +50,13 @@ pub struct StartResponse {
     pub playlist_url: String,
     pub duration_ms: Option<i64>,
     pub start_seconds: f64,
+    /// Source-timeline timestamp represented by player-local time zero.
+    ///
+    /// Additive for new clients. A copy session can start on the keyframe
+    /// before `start_seconds`, while accurate transcodes start at the
+    /// requested position. Old clients continue using `start_seconds`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_origin_ms: Option<i64>,
     pub encoder: String,
     /// The whole stream already exists on disk (a pre-transcode cache hit).
     /// The player treats it like direct play: seek by `currentTime`, and don't
@@ -267,6 +274,7 @@ pub async fn create(
         playlist_url,
         duration_ms: info.duration_ms,
         start_seconds: info.start_seconds,
+        media_origin_ms: Some((info.media_origin_seconds * 1000.0).round() as i64),
         encoder: info.encoder.to_owned(),
         vod: info.vod,
         ladder: crate::transcode::ladder(source_height),

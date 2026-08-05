@@ -4586,6 +4586,10 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::OK, "{native}");
+        assert_eq!(
+            native["media_origin_ms"], 10_000,
+            "copy-session local time zero must map to the preceding keyframe: {native}"
+        );
         // The session's own answer, on the wire: `StartResponse` skips the key
         // when it is None, so this is the only thing that would catch it
         // silently disappearing from every create.
@@ -4596,6 +4600,26 @@ mod tests {
             native["playlist_url"].as_str(),
             Some(expected_playlist.as_str())
         );
+
+        // Progressive copy has no JSON start envelope, so it exposes the same
+        // keyframe-aligned origin before attachment in a response header.
+        let progressive = app
+            .clone()
+            .oneshot(get(
+                &format!("/api/v1/files/{}/stream.mp4?start=10.5", s.file),
+                Some(&admin),
+            ))
+            .await
+            .expect("progressive response");
+        assert_eq!(progressive.status(), StatusCode::OK);
+        assert_eq!(
+            progressive
+                .headers()
+                .get(stream::MEDIA_ORIGIN_MS_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("10000")
+        );
+        drop(progressive);
 
         let (status, master) = body_of(
             &app,

@@ -1209,7 +1209,7 @@ const MEDIA_ORIGIN_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// start is not the answer. Every failure path returns `start_seconds`, which
 /// is both the old behaviour and the correct answer whenever the requested
 /// offset happens to land on a keyframe.
-async fn probe_media_origin(source_path: &std::path::Path, start_seconds: f64) -> f64 {
+pub(crate) async fn probe_media_origin(source_path: &std::path::Path, start_seconds: f64) -> f64 {
     if start_seconds <= 0.0 {
         return 0.0;
     }
@@ -1411,6 +1411,12 @@ pub struct StartInfo {
     pub playlist_url: String,
     pub duration_ms: Option<i64>,
     pub start_seconds: f64,
+    /// The source timestamp represented by player-local time zero.
+    ///
+    /// Copy sessions may begin at the keyframe before `start_seconds`; an
+    /// accurate transcode begins at the requested position, and a cached VOD
+    /// begins at zero. Clients use this value for progress and timed overlays.
+    pub media_origin_seconds: f64,
     pub encoder: &'static str,
     /// Served from the cache: every segment already exists, so this is a VOD
     /// asset rather than a stream being written.
@@ -2239,6 +2245,7 @@ impl TranscodeManager {
             // exists because the encoder had to be told where to begin; here
             // there is no encoder and nothing to tell.
             start_seconds: 0.0,
+            media_origin_seconds: 0.0,
             encoder: "cached",
             vod: true,
         })
@@ -2783,6 +2790,7 @@ impl TranscodeManager {
             session_id: session_id.to_owned(),
             duration_ms,
             start_seconds: session.start_seconds,
+            media_origin_seconds: session.media_origin_seconds,
             encoder,
             vod: session.cached,
         })
@@ -3377,6 +3385,7 @@ impl TranscodeManager {
             session_id,
             duration_ms: file.duration_ms,
             start_seconds,
+            media_origin_seconds: start_seconds,
             encoder: encoder.label(),
             vod: false,
         })
@@ -3820,6 +3829,7 @@ impl TranscodeManager {
             session_id,
             duration_ms: file.duration_ms,
             start_seconds,
+            media_origin_seconds,
             encoder: "copy",
             vod: false,
         })

@@ -7,7 +7,7 @@ use std::process::Stdio;
 
 use axum::body::Body;
 use axum::extract::{Path as AxPath, Query, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use plurx_core::domain::MediaFile;
@@ -40,6 +40,11 @@ use crate::state::AppState;
 pub(crate) const READRATE_DEFAULT: f64 = 4.0;
 /// Seconds of content delivered flat-out before the rate limit engages.
 const READRATE_BURST_SECS: f64 = 30.0;
+/// The source-timeline timestamp represented by local time zero in a
+/// progressive remux. Kept as a response header because the body is the MP4
+/// byte stream rather than a JSON session envelope.
+pub(crate) const MEDIA_ORIGIN_MS_HEADER: HeaderName =
+    HeaderName::from_static("x-plurx-media-origin-ms");
 
 /// The configured remux pace, in multiples of real time. `0` disables pacing.
 /// Admin-settable because the right answer depends on the link: a 10GbE lab
@@ -1378,6 +1383,13 @@ async fn remux(spec: RemuxSpec<'_>) -> Result<Response, ApiError> {
         .spawn()
         .map_err(|e| ApiError::Internal(format!("spawning ffmpeg: {e}")))?;
 
+    // Probe after the remux starts opening the source, matching the HLS copy
+    // path: the work overlaps instead of adding its full latency to startup.
+    // `make_zero` makes the preceding keyframe local time zero, so the
+    // requested seek is not an accurate source-time origin for copied video.
+    let media_origin_seconds =
+        crate::transcode::probe_media_origin(path, start.unwrap_or(0.0).max(0.0)).await;
+
     let (tracked_stream, guard) = match tracked {
         Some((s, g)) => (Some(s), Some(g)),
         None => (None, None),
@@ -1447,12 +1459,19 @@ async fn remux(spec: RemuxSpec<'_>) -> Result<Response, ApiError> {
             }
         });
 
-    Ok((
+    let mut response = (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "video/mp4")],
         Body::from_stream(stream),
     )
-        .into_response())
+        .into_response();
+    let media_origin_ms = (media_origin_seconds * 1000.0).round() as i64;
+    response.headers_mut().insert(
+        MEDIA_ORIGIN_MS_HEADER,
+        HeaderValue::from_str(&media_origin_ms.to_string())
+            .expect("a signed integer is a valid HTTP header value"),
+    );
+    Ok(response)
 }
 
 /// Is this stderr line one of ffmpeg's `-progress` blocks rather than a
