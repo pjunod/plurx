@@ -429,4 +429,6 @@ Apple build to 24, and Android version code to 13. Later client implementation
 branches must re-read `main` and advance their affected release counters again.
 The Apple Milestone 2 branch does so at shared version 0.2.5, Apple build 25,
 and Android version code 14; the Android counter remains coordinated even
-though its renderer lands in a separate branch and PR.
+though its renderer lands in a separate branch and PR. The Android Milestone 3
+branch advances the coordinated release to 0.2.6, Apple build 26, and Android
+version code 15.

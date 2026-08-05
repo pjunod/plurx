@@ -12,11 +12,13 @@ anything it can't (MKV, DTS/TrueHD, …) is delivered as the server's on-the-fly
 HDR display at runtime and sends that to `/decision`, so the server transcodes
 only what this hardware genuinely can't play.
 
-> Status: **v0.2.5**, build `25` in [`project.yml`](project.yml) — working
+> Status: **v0.2.6**, build `26` in [`project.yml`](project.yml) — working
 > development client. Browse, resume, discover, and play on both iOS and
 > tvOS. Both targets compile against the iOS/tvOS 26.5 SDKs and share the
-> same regression suite. Build 25 adds the default-off `pgs-v1` bitmap-overlay
-> client so PGS can be drawn over the existing Dolby Vision, HDR, or SDR video
+> same regression suite. Build 26 carries the coordinated Android overlay
+> release; the Apple behavior introduced in build 25 remains unchanged. The
+> default-off `pgs-v1` bitmap-overlay client draws PGS over the existing Dolby
+> Vision, HDR, or SDR video
 > without changing its bytes or reopening playback. It is ready for the paired iPhones, iPads,
 > and Bedroom Apple TV, but has not been uploaded to TestFlight.
 > It is not yet at full web parity; the exact boundary is in

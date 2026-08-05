@@ -37,9 +37,15 @@ internal enum class SubtitleDelivery {
     /** An HLS session opened with `native_subtitles` — the video recipe is untouched. */
     NativeSession,
 
+    /** Authenticated PNG compositions drawn above the unchanged video surface. */
+    BitmapOverlay,
+
     /** A transcode session with the track drawn into the frames. */
     Burn,
 }
+
+internal val SubtitleDelivery.usesPlanTransport: Boolean
+    get() = this == SubtitleDelivery.Plan || this == SubtitleDelivery.BitmapOverlay
 
 /**
  * [delivery] is where the selection belongs; [reopen] is whether getting there
@@ -50,6 +56,9 @@ internal data class SubtitleRoute(val delivery: SubtitleDelivery, val reopen: Bo
 internal const val HDR_SUBTITLE_NOTICE =
     "That subtitle requires an SDR burn-in. HDR playback was kept unchanged."
 
+internal const val PGS_OVERLAY_PIP_NOTICE =
+    "PGS overlays stay in the app and are not available in Picture in Picture. HDR playback was kept unchanged."
+
 /**
  * The server's bitmap/styled burn pipeline is H.264 SDR. A selection must not
  * silently replace HDR already on the wire; native text and SDR playback keep
@@ -58,6 +67,7 @@ internal const val HDR_SUBTITLE_NOTICE =
 internal fun subtitleBurnWouldDiscardHdr(track: SubTrack?, deliveredRange: String?): Boolean =
     track != null &&
         !track.isNativeHls &&
+        !track.isPgsOverlay &&
         deliveredRange?.lowercase(Locale.ROOT) in setOf("dolby_vision", "hdr10", "hlg")
 
 /**
@@ -74,6 +84,9 @@ internal fun subtitleRoute(
         // Off. Renditions and embedded text tracks both switch off in place;
         // only escaping a burn needs the stream rebuilt, which [reopen] says.
         track == null -> SubtitleDelivery.Plan
+        // A recognized overlay is an application layer. It never enters a
+        // video session and therefore never changes the current video bytes.
+        track.isPgsOverlay -> SubtitleDelivery.BitmapOverlay
         // The only thing that justifies re-encoding the picture: a track with
         // no text the client could be handed instead.
         !track.isNativeHls -> SubtitleDelivery.Burn
@@ -91,7 +104,16 @@ internal fun subtitleRoute(
     // tracks of one file — is a selection change and nothing more, which is
     // the acceptance criterion "toggling between two text tracks does not
     // create a new server session".
-    val reopen = delivery != current || delivery == SubtitleDelivery.Burn
+    val reopen = when {
+        delivery == SubtitleDelivery.Burn -> true
+        delivery == current -> false
+        // Plan <-> overlay changes only the application layer. Leaving a
+        // rendition/burn session must still restore the plan transport first.
+        delivery == SubtitleDelivery.BitmapOverlay ->
+            current != SubtitleDelivery.Plan && current != SubtitleDelivery.BitmapOverlay
+        current == SubtitleDelivery.BitmapOverlay -> delivery != SubtitleDelivery.Plan
+        else -> true
+    }
     return SubtitleRoute(delivery, reopen)
 }
 
@@ -122,7 +144,7 @@ internal fun nativeSubtitleOrdinal(index: Long, tracks: List<SubTrack>): Int? =
  */
 internal fun autoSubtitleSelection(tracks: List<SubTrack>): Long? {
     val pick = tracks.firstOrNull { it.default } ?: return null
-    if (pick.isNativeHls) return pick.index
+    if (pick.isNativeHls || pick.isPgsOverlay) return pick.index
     return pick.index.takeIf { isForcedSubtitle(pick) }
 }
 
