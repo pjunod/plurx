@@ -350,6 +350,9 @@ struct SubtitleTrack: Codable, Identifiable {
     /// rendition?", computed by the same classifier the HLS master and the
     /// create-time rejection use. Absent from servers that predate the field.
     var native: Bool?
+    /// Optional application-rendered bitmap protocol. It is deliberately
+    /// separate from `native`, which continues to mean an HLS text rendition.
+    var overlay: String?
 
     /// Formats the server can expose losslessly enough as an HLS WebVTT
     /// rendition. Styled ASS/SSA remains a burn even though it contains text.
@@ -363,6 +366,8 @@ struct SubtitleTrack: Codable, Identifiable {
     var isNativeHLS: Bool {
         native ?? ["subrip", "srt", "webvtt", "vtt"].contains(codec.lowercased())
     }
+
+    var isPGSOverlay: Bool { overlay == PGSOverlayPolicy.protocolName }
 }
 
 struct QualityRung: Codable, Identifiable {

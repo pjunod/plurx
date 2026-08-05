@@ -169,6 +169,13 @@ test = "clients/apple/Tests/AppleClientTests.swift"
 test_anchor = "testApplePlayerFallsBackFromDolbyVisionToHDRBeforeSDR"
 
 [[decisions]]
+id = "apple.pgs-overlay"
+source = "clients/apple/Sources/PlayerController.swift"
+source_anchor = "static func subtitleUsesOverlay("
+test = "clients/apple/Tests/AppleClientTests.swift"
+test_anchor = "testPGSOverlaySelectionNeverBurnsOrReopensDirectVideo"
+
+[[decisions]]
 id = "apple.established-hdr-recovery"
 source = "clients/apple/Sources/PlayerController.swift"
 source_anchor = "static func shouldPreserveEstablishedHDRDelivery("

@@ -1089,6 +1089,14 @@ wire schema and operational bounds are documented in
 
 ### Milestone 2: Apple client
 
+**Implementation status (0.2.5 candidate):** automated client implementation
+complete behind the server's default-off `PLURX_PGS_OVERLAY` capability gate.
+The renderer recognizes only `pgs-v1`; missing or unknown capability values
+retain the established burn/refusal behavior. Simulator coverage passes on iOS
+and tvOS. Physical-device timing, Dolby Vision/HDR mode evidence, and output-mode
+acceptance remain release gates, so this is not approval to enable the server
+gate by default.
+
 Work:
 
 - add overlay policy and manifest models;
