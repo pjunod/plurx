@@ -6,6 +6,7 @@ import retrofit2.http.Body
 import retrofit2.http.DELETE
 import retrofit2.http.GET
 import retrofit2.http.POST
+import retrofit2.http.PUT
 import retrofit2.http.Path
 import retrofit2.http.Query
 import retrofit2.http.QueryMap
@@ -98,5 +99,33 @@ interface PlurxApi {
 
     @POST("items/{id}/progress")
     suspend fun progress(@Path("id") id: Long, @Body body: ProgressReq)
+
+    @GET("files/{id}/offline-options")
+    suspend fun offlineOptions(
+        @Path("id") id: Long,
+        @Query("audio_lang") audioLanguage: String,
+        @Query("subtitle_lang") subtitleLanguage: String,
+    ): OfflineOptions
+
+    @POST("files/{id}/offline-packages")
+    suspend fun createOfflinePackage(
+        @Path("id") id: Long,
+        @Body body: CreateOfflinePackageReq,
+    ): OfflinePackageStatus
+
+    @GET("offline/packages/{id}")
+    suspend fun offlinePackage(@Path("id") id: String): OfflinePackageStatus
+
+    @PUT("offline/packages/{id}/lease")
+    suspend fun putOfflineLease(
+        @Path("id") id: String,
+        @Body body: OfflineLeaseReq,
+    ): OfflineLease
+
+    @DELETE("offline/packages/{id}")
+    suspend fun deleteOfflinePackage(@Path("id") id: String)
+
+    @POST("offline/packages/{id}/complete")
+    suspend fun completeOfflinePackage(@Path("id") id: String)
 
 }

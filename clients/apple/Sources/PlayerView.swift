@@ -446,6 +446,7 @@ struct PlayerView: View {
     var year: Int? = nil
     var airDate: String? = nil
     var overview: String? = nil
+    var offlineItem: OfflineItem? = nil
     var onPlayNext: ((PlayContext) -> Void)?
     /// Hands the owning detail screen the last on-screen position immediately.
     /// The server progress write is intentionally best-effort and asynchronous;
@@ -569,6 +570,20 @@ struct PlayerView: View {
             }
         }
         .task {
+            #if os(iOS)
+            if let offlineItem {
+                controller.startOffline(model: model, item: offlineItem)
+            } else {
+                controller.start(
+                    model: model,
+                    itemId: itemId,
+                    fileId: fileId,
+                    startMs: startMs,
+                    durationMs: durationMs,
+                    title: title
+                )
+            }
+            #else
             controller.start(
                 model: model,
                 itemId: itemId,
@@ -577,6 +592,7 @@ struct PlayerView: View {
                 durationMs: durationMs,
                 title: title
             )
+            #endif
             #if os(tvOS)
             try? await Task.sleep(nanoseconds: 100_000_000)
             focusedControl = .playPause
@@ -611,7 +627,7 @@ struct PlayerView: View {
         .onChange(of: isScrubbing) { _, _ in restartAutoHideTimer() }
         .onChange(of: optionMenuOpen) { _, _ in restartAutoHideTimer() }
         .onChange(of: controller.finished) { _, finished in
-            guard finished, model.autoplay else { return }
+            guard finished, model.autoplay, offlineItem == nil else { return }
             findingNext = true
             Task {
                 if let next = await model.nextEpisode(after: itemId) {

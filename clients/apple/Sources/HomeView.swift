@@ -44,6 +44,11 @@ struct HomeView: View {
             .tabItem { Label("Search", systemImage: "magnifyingglass") }
 
             NavigationStack {
+                DownloadsView()
+            }
+            .tabItem { Label("Downloads", systemImage: "arrow.down.circle") }
+
+            NavigationStack {
                 SettingsView()
             }
             .tabItem { Label("Settings", systemImage: "gearshape") }
@@ -213,7 +218,11 @@ private struct HomeDashboard: View {
 
 enum HomeLayoutPolicy {
     static let continueWatchingCopyStyle: LandscapeCardCopyStyle = .accentPanel
+    #if os(iOS)
+    static let topLevelTabs = ["Home", "Libraries", "Search", "Downloads", "Settings"]
+    #else
     static let topLevelTabs = ["Home", "Libraries", "Search", "Settings"]
+    #endif
     static let showsLibraryShelvesOnHome = false
 
     static func continueWatchingShelfItems(_ items: [Item]) -> [Item] {

@@ -2420,6 +2420,16 @@ final class AppleClientTests: XCTestCase {
     }
 
     #if os(iOS)
+    func testIOSExposesDownloadsAndUsesConservativeDefaults() {
+        XCTAssertEqual(
+            HomeLayoutPolicy.topLevelTabs,
+            ["Home", "Libraries", "Search", "Downloads", "Settings"]
+        )
+        XCTAssertEqual(OfflineQuality.standard.maximumHeight, 720)
+        XCTAssertEqual(OfflineQuality.high.maximumHeight, 1_080)
+        XCTAssertEqual(OfflineNetworkPolicy.wifiOnly.label, "Wi-Fi only")
+    }
+
     func testDetailBodyKeepsScrollableRowsAndActionsInsidePhoneInsets() throws {
         for viewportWidth: CGFloat in [393, 440] {
             let expectedBodyWidth = viewportWidth - (2 * screenHPad)

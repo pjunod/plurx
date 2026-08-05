@@ -162,6 +162,15 @@ missing = "fail"
 timeout_seconds = 300
 
 [[checks]]
+id = "offline-contract"
+title = "Offline package persistence, ownership, lease, and media boundary"
+command = "cargo test -p plurx-core store::sqlite::offline -- --nocapture && cargo test -p plurx-core v14_offline -- --nocapture && cargo test -p plurxd offline -- --nocapture"
+profiles = ["commit", "ci", "full", "nightly"]
+requires = ["cargo"]
+missing = "fail"
+timeout_seconds = 600
+
+[[checks]]
 id = "security-boundaries"
 title = "Authentication, administration, and scoped-key boundaries"
 command = "cargo test -p plurxd http::tests::auth_is_required_and_admin_enforced -- --exact && cargo test -p plurxd http::tests::only_an_admin_manages_keys -- --exact && cargo test -p plurxd http::tests::the_scan_route_takes_a_key_and_only_a_key -- --exact"
@@ -336,6 +345,36 @@ checks = ["rust-gate", "user-journey"]
 depends_on = ["core.media", "server.api", "library.catalog"]
 
 [[points]]
+id = "offline.viewing"
+title = "App-managed offline viewing"
+contract = "Authenticated users can prepare one portable VOD package, transfer it through a stable scoped lease, and play only app-owned local bytes while disconnected."
+paths = [
+  "crates/plurx-core/src/store/sqlite/offline.rs",
+  "crates/plurxd/src/offline.rs",
+  "crates/plurxd/src/http/offline.rs",
+  "docs/OFFLINE-VIEWING-PLAN.md",
+]
+checks = [
+  "offline-contract",
+  "rust-gate",
+  "database-upgrades",
+  "security-boundaries",
+  "api-wire",
+  "apple-simulators",
+  "android-jvm",
+  "android-device",
+  "playback-recovery",
+  "resource-bounds",
+]
+depends_on = [
+  "core.media",
+  "persistence.upgrades",
+  "server.api",
+  "identity.access",
+  "playback.pipeline",
+]
+
+[[points]]
 id = "plex.compatibility"
 title = "Plex-compatible discovery and API surface"
 contract = "Direct-connection Plex clients receive compatible discovery, metadata, playback, and timeline responses."
@@ -389,7 +428,7 @@ title = "Native iOS and tvOS clients"
 contract = "The Apple clients preserve the shared API, navigation, preferences, and playback policies on both platforms."
 paths = ["clients/apple/**"]
 checks = ["apple-simulators"]
-depends_on = ["server.api", "api.contract", "identity.access", "metadata.enrichment", "playback.pipeline"]
+depends_on = ["server.api", "api.contract", "identity.access", "metadata.enrichment", "playback.pipeline", "offline.viewing"]
 
 [[points]]
 id = "android.client"
@@ -397,7 +436,7 @@ title = "Native Android and Google TV clients"
 contract = "The Android clients preserve API models, TV focus, preferences, and Media3 playback policy."
 paths = ["clients/android/**"]
 checks = ["android-jvm", "android-device"]
-depends_on = ["server.api", "api.contract", "identity.access", "metadata.enrichment", "playback.pipeline"]
+depends_on = ["server.api", "api.contract", "identity.access", "metadata.enrichment", "playback.pipeline", "offline.viewing"]
 
 [[points]]
 id = "operations.packaging"

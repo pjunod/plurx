@@ -20,6 +20,8 @@ import tv.plurx.app.data.Caps
 import tv.plurx.app.data.Appearance
 import tv.plurx.app.data.HomeGrouping
 import tv.plurx.app.data.PlaybackQuality
+import tv.plurx.app.data.OfflineNetwork
+import tv.plurx.app.data.OfflineQuality
 import tv.plurx.app.data.PosterSize
 import tv.plurx.app.data.ThemeId
 import tv.plurx.app.data.User
@@ -40,6 +42,10 @@ import tv.plurx.app.data.Session
 import tv.plurx.app.data.ServerDiscovery
 import tv.plurx.app.data.Server
 import tv.plurx.app.data.SettingsStore
+import tv.plurx.app.data.MediaFileDto
+import tv.plurx.app.data.offline.OfflineDownloads
+import tv.plurx.app.data.offline.OfflineQueueRequest
+import tv.plurx.app.data.offline.OfflineRecord
 import tv.plurx.app.player.decisionForce
 
 /** Top-level app state: which screen the shell should show. */
@@ -95,6 +101,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     private val _preferences = MutableStateFlow(ViewerPreferences())
     val preferences: StateFlow<ViewerPreferences> = _preferences.asStateFlow()
+    val offlineRecords = OfflineDownloads.records
 
     var origin: String = ""
         private set
@@ -107,6 +114,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     var subLang: String = "eng"
         private set
     var currentUser: User? = null
+        private set
+    var currentUserId: Long? = null
+        private set
+    var serverInstanceId: String? = null
         private set
 
     private var api: PlurxApi? = null
@@ -134,9 +145,19 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             val saved = settings.flow.first()
             origin = saved.origin
             username = saved.username
+            currentUserId = saved.userId
+            serverInstanceId = saved.instanceId
             audioLang = saved.audioLang
             subLang = saved.subLang
             _preferences.value = saved.preferences
+
+            if (
+                OfflineDownloads.catalog.profile(saved.instanceId, saved.userId).isNotEmpty()
+            ) {
+                // Downloads is a local library. Do not hold it behind the
+                // saved server's reachability check on an airplane launch.
+                _phase.value = Phase.Ready
+            }
 
             when {
                 saved.origin.isNotBlank() && saved.token != null -> {
@@ -166,10 +187,19 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     when (validation) {
                         is SavedSessionValidation.Authenticated -> {
                             currentUser = validation.user
+                            currentUserId = validation.user.id
+                            settings.saveSession(
+                                origin,
+                                saved.token,
+                                validation.user.username,
+                                validation.user.id,
+                            )
                             username = validation.user.username
                             if (saved.instanceId == null) backfillServerIdentity()
                             _phase.value = Phase.Ready
                             loadHome()
+                            resumeOfflineProfile()
+                            syncOfflineProgress()
                         }
                         SavedSessionValidation.InvalidToken -> {
                             Session.token = null
@@ -247,10 +277,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 val resp = api().login(LoginReq(username = user.trim(), password = pass))
                 Session.token = resp.token
                 currentUser = resp.user
+                currentUserId = resp.user.id
                 username = resp.user.username
-                settings.saveSession(origin, resp.token, resp.user.username)
+                settings.saveSession(origin, resp.token, resp.user.username, resp.user.id)
                 _phase.value = Phase.Ready
                 loadHome()
+                resumeOfflineProfile()
+                syncOfflineProgress()
             } catch (_: Exception) {
                 _authError.value = "Wrong username or password"
             } finally {
@@ -305,12 +338,24 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun logout() {
-        viewModelScope.launch { settings.clearToken() }
-        Session.token = null
-        currentUser = null
-        _home.value = HomeState()
-        _phase.value = Phase.NeedLogin
+    fun logout() = logout(removeDownloads = false)
+
+    fun logoutAndRemoveDownloads() = logout(removeDownloads = true)
+
+    private fun logout(removeDownloads: Boolean) {
+        viewModelScope.launch {
+            val instance = serverInstanceId
+            val user = currentUserId
+            if (removeDownloads && instance != null && user != null) {
+                OfflineDownloads.removeProfileNow(instance, user, api())
+            }
+            settings.clearToken()
+            Session.token = null
+            currentUser = null
+            currentUserId = null
+            _home.value = HomeState()
+            _phase.value = Phase.NeedLogin
+        }
     }
 
     /**
@@ -321,6 +366,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun changeServer() {
         Session.token = null
         currentUser = null
+        currentUserId = null
+        serverInstanceId = null
         _home.value = HomeState()
         viewModelScope.launch { settings.clearServer() }
         _phase.value = Phase.NeedServer
@@ -345,6 +392,110 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun setAutoSkip(enabled: Boolean) = updatePreferences { copy(autoSkip = enabled) }
 
     fun setAutoplayNext(enabled: Boolean) = updatePreferences { copy(autoplayNext = enabled) }
+
+    fun setOfflineQuality(quality: OfflineQuality) =
+        updatePreferences { copy(offlineQuality = quality) }
+
+    fun setOfflineNetwork(network: OfflineNetwork) =
+        updatePreferences { copy(offlineNetwork = network) }.also {
+            OfflineDownloads.setNetworkPolicy(network)
+        }
+
+    fun queueOffline(item: Item, file: MediaFileDto): String? {
+        val instance = serverInstanceId
+            ?: return "Reconnect to this Cinema server before downloading"
+        val user = currentUserId
+            ?: return "Sign in again before downloading"
+        val preferences = _preferences.value
+        OfflineDownloads.enqueue(
+            OfflineQueueRequest(
+                api = api(),
+                origin = origin,
+                serverInstanceId = instance,
+                userId = user,
+                itemId = item.id,
+                fileId = file.id,
+                title = item.title,
+                context = buildList {
+                    item.show_title?.takeIf(String::isNotBlank)?.let(::add)
+                    if (item.season_number != null && item.episode_number != null) {
+                        add("S${item.season_number}E${item.episode_number}")
+                    }
+                }.takeIf(List<String>::isNotEmpty)?.joinToString(" · "),
+                posterPath = item.poster,
+                durationMs = file.duration_ms ?: item.runtime_ms,
+                audioLanguage = audioLang,
+                subtitleLanguage = subLang,
+                maximumHeight = preferences.offlineQuality.maximumHeight,
+                network = preferences.offlineNetwork,
+            ),
+        )
+        return null
+    }
+
+    fun resumeOffline(record: OfflineRecord) {
+        val instance = serverInstanceId ?: return
+        val user = currentUserId ?: return
+        val preferences = _preferences.value
+        OfflineDownloads.resumePending(
+            OfflineQueueRequest(
+                api = api(),
+                origin = origin,
+                serverInstanceId = instance,
+                userId = user,
+                itemId = record.itemId,
+                fileId = record.fileId,
+                title = record.title,
+                context = record.context,
+                posterPath = null,
+                durationMs = record.durationMs,
+                audioLanguage = audioLang,
+                subtitleLanguage = subLang,
+                maximumHeight = preferences.offlineQuality.maximumHeight,
+                network = preferences.offlineNetwork,
+            ),
+        )
+    }
+
+    fun resumeOfflineProfile() {
+        val instance = serverInstanceId ?: return
+        val user = currentUserId ?: return
+        OfflineDownloads.catalog.profile(instance, user).firstOrNull()?.let(::resumeOffline)
+    }
+
+    fun onForeground() {
+        if (_phase.value != Phase.Ready || api == null) return
+        resumeOfflineProfile()
+        syncOfflineProgress()
+    }
+
+    fun removeOffline(record: OfflineRecord) = OfflineDownloads.remove(record, api)
+
+    private fun syncOfflineProgress() {
+        val instance = serverInstanceId ?: return
+        val user = currentUserId ?: return
+        viewModelScope.launch {
+            val pending = OfflineDownloads.catalog.profile(instance, user)
+                .filter { it.pendingProgress }
+                .groupBy { it.itemId }
+                .mapNotNull { (_, records) -> records.maxByOrNull { it.progressRecordedAt ?: 0 } }
+            for (record in pending) {
+                try {
+                    api().progress(
+                        record.itemId,
+                        ProgressReq(
+                            record.positionMs,
+                            record.durationMs,
+                            record.progressRecordedAt,
+                        ),
+                    )
+                    OfflineDownloads.catalog.update(record.id) { it.copy(pendingProgress = false) }
+                } catch (_: Exception) {
+                    break
+                }
+            }
+        }
+    }
 
     private fun updatePreferences(change: ViewerPreferences.() -> ViewerPreferences) {
         val updated = _preferences.value.change()
@@ -507,6 +658,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         origin = normalized
         api = candidate
         serverName = info.name
+        serverInstanceId = info.instance_id
         settings.saveOrigin(normalized, info.instance_id)
         _phase.value = Phase.NeedLogin
     }
@@ -550,6 +702,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private suspend fun backfillServerIdentity() {
         val info = catchingUnlessCancelled { api().server() }.getOrNull() ?: return
         serverName = info.name
+        serverInstanceId = info.instance_id
         settings.saveServerIdentity(origin, info.instance_id)
     }
 }

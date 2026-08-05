@@ -8,6 +8,9 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import retrofit2.http.GET
+import retrofit2.http.POST
+import retrofit2.http.Query
 
 @Serializable
 private data class NativeApiContractFixture(
@@ -22,6 +25,29 @@ class ModelContractTest {
     private val json = Json {
         ignoreUnknownKeys = true
         explicitNulls = false
+    }
+
+    @Test
+    fun offlineRoutesMatchTheServerContract() {
+        val options = PlurxApi::class.java.declaredMethods.single { it.name == "offlineOptions" }
+        assertEquals(
+            "files/{id}/offline-options",
+            requireNotNull(options.getAnnotation(GET::class.java)).value,
+        )
+        assertEquals(
+            setOf("audio_lang", "subtitle_lang"),
+            options.parameterAnnotations
+                .flatMap { annotations -> annotations.filterIsInstance<Query>() }
+                .map(Query::value)
+                .toSet(),
+        )
+        val create = PlurxApi::class.java.declaredMethods.single {
+            it.name == "createOfflinePackage"
+        }
+        assertEquals(
+            "files/{id}/offline-packages",
+            requireNotNull(create.getAnnotation(POST::class.java)).value,
+        )
     }
 
     @Test
@@ -320,5 +346,44 @@ class ModelContractTest {
 
         assertTrue(adjusted.contains("\"audio_offset_ms\":250"))
         assertFalse(freshPlay.contains("audio_offset_ms"))
+    }
+
+    @Test
+    fun offlineContractCarriesOneExplicitPresentationAndStableLease() {
+        val options = json.decodeFromString<OfflineOptions>(
+            """{
+              "file_id": 91,
+              "qualities": [{
+                "height": 720, "label": "Standard", "estimated_bytes": 1200000,
+                "reserved_bytes": 1500000
+              }],
+              "audio": [{"index": 2, "codec": "aac", "language": "eng"}],
+              "subtitles": [{
+                "index": 5, "codec": "webvtt", "language": "eng",
+                "offline_mode": "native"
+              }],
+              "recommended_audio_index": 2, "recommended_subtitle_index": 5
+            }""".trimIndent(),
+        )
+        assertEquals(720, options.qualities.single().height)
+        assertEquals(2L, options.recommended_audio_index)
+        assertEquals("native", options.subtitles.single().offline_mode)
+
+        val ready = json.decodeFromString<OfflinePackageStatus>(
+            """{
+              "id":"pkg", "state":"ready", "phase":"complete",
+              "status_url":"/api/v1/offline/packages/pkg", "bytes_ready":1200000,
+              "estimated_bytes":1200000, "actual_bytes":1190000, "duration_ms":60000,
+              "output":{
+                "height":720, "video_codec":"h264", "audio_codec":"aac",
+                "dynamic_range":"sdr", "subtitle_mode":"native"
+              }
+            }""".trimIndent(),
+        )
+        assertEquals("h264", ready.output.video_codec)
+        assertEquals(1_190_000L, ready.actual_bytes)
+
+        val progress = json.encodeToString(ProgressReq(12_000, 60_000, 1_785_967_200))
+        assertTrue(progress.contains("\"recorded_at\":1785967200"))
     }
 }

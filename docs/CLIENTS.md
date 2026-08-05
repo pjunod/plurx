@@ -23,7 +23,17 @@ Shared across all: the server's OpenAPI-generated types, the device-profile defi
 
 **LG webOS** — Web app on Chromium (webOS 24=Cr108 → webOS 26=Cr132; older sets run Cr79/87 — the web core must budget for that floor). Solid HEVC/AV1 4K decode from web apps; MKV container OK. Dolby Vision from web apps: P5 mostly works, P8 flaky (often silently falls back) → treat HDR10 as the reliable path, DV as best-effort per profile. Dev Mode session = 1000 hours, renewable indefinitely (automatable) but lapse uninstalls dev apps; rooting via webOS Homebrew Channel is the "install once, forever" option for a personal TV.
 
-**Apple TV (tvOS)** — AVPlayer doesn't do MKV, and we don't fight it: the server's on-the-fly remux to fMP4/HLS (`-c copy`) delivers the same streams AVPlayer loves, with zero video re-encode. (Infuse ships a whole FFmpeg demux + VideoToolbox engine to avoid the server dependency — we *are* the server, so we take the cheap path; a client-side demuxer can be revisited later if offline sync ever matters.) DV: P5 is the reliable profile; audio: Apple TV never bitstreams TrueHD — profile routes TrueHD→(E)AC3/LPCM per policy. Distribution: $99/yr Apple Developer; TestFlight builds last 90 days (re-push cadence) or 1-year dev-profile installs via Xcode. **An initial iOS + tvOS implementation lives in [`clients/apple/`](../clients/apple/README.md)** — one SwiftUI/AVPlayer source tree, two targets, wired to the runtime-caps → `/decision` flow (direct-play compatible files, HLS for the MKV/DTS fallback); `xcodegen generate` builds it.
+**Apple (iOS + tvOS)** — AVPlayer doesn't do MKV, and we don't fight it: the
+server's on-the-fly remux to fMP4/HLS (`-c copy`) delivers the same streams
+AVPlayer loves, with zero video re-encode. DV P5 is the reliable profile;
+Apple TV never bitstreams TrueHD, so the profile routes TrueHD to (E)AC3 or
+LPCM. Distribution requires the Apple Developer program; TestFlight builds
+last 90 days and development profiles last one year. **The iOS + tvOS
+implementation lives in [`clients/apple/`](../clients/apple/README.md)** — one
+SwiftUI/AVPlayer source tree, two targets, wired to the runtime-caps →
+`/decision` flow. iPhone and iPad also use `AVAssetDownloadURLSession` for
+app-managed background offline downloads of server-prepared HLS; the action
+stays hidden on tvOS. `xcodegen generate` builds both targets.
 
 **Android/Google TV** — The easy one. Media3/ExoPlayer direct-plays MKV
 natively; HEVC/AV1/DV ride device decoders (Shield, 2019+ Sonys fine;
@@ -36,6 +46,11 @@ Compose APK for phones, foldables/tablets, Android TV, and Google TV, with
 search, browse, photos, watched state, three web-matched themes, and the full
 runtime-caps → `/decision` playback flow. Run
 `./gradlew :app:assembleDebug` to build it.
+
+Phones and tablets also use Media3's `DownloadService`, a non-evicting
+app-private cache, and a cache-only player for offline viewing. Android TV and
+Google TV deliberately hide offline controls; a television is expected to
+remain attached to the server and keeps the existing streaming path.
 
 **Roku** — Hardest constraints, embraced rather than fought: SceneGraph Video node only (no custom demux/decoders). Envelope: HLS/DASH preferred; HEVC 4K@40Mbps, **AVC capped 1080p/10Mbps**, AV1 only newer devices/DASH-only; DV/HDR10+ device-tier-dependent; AC3/EAC3/DTS passthrough-only with an AAC stereo fallback track required; subs TTML/WebVTT/SRT only → **PGS/VobSub must burn in server-side**. plurx's remux/transcode pipeline makes Roku a well-behaved HLS client. Distribution reality: private channels are dead (since 2022); dev mode sideloads exactly one app; beta channels last 120 days/20 users. Roku ships last, and public store certification is the eventual real path there.
 

@@ -75,7 +75,19 @@ impl Default for ExtractionLimits {
 
 /// The stable path for one source fingerprint and subtitle stream.
 pub fn vtt_path(dir: &Path, file: &MediaFile, index: i64) -> PathBuf {
-    dir.join(vtt_name(file.id, index, file.size, file.mtime))
+    vtt_path_for_identity(dir, file.id, index, file.size, file.mtime)
+}
+
+/// Resolve a published sidecar after the source file row has been replaced by
+/// a rescan. Offline packages snapshot this exact identity at request time.
+pub fn vtt_path_for_identity(
+    dir: &Path,
+    file_id: i64,
+    index: i64,
+    size: i64,
+    mtime: i64,
+) -> PathBuf {
+    dir.join(vtt_name(file_id, index, size, mtime))
 }
 
 fn vtt_name(file_id: i64, index: i64, size: i64, mtime: i64) -> String {

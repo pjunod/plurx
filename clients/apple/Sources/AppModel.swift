@@ -1,7 +1,7 @@
 import Combine
 import Foundation
 
-enum Phase {
+enum Phase: Equatable {
     case loading      // checking a saved session on launch
     case needServer   // no server yet, or the saved one is gone
     case needLogin    // server reachable, needs credentials
@@ -34,6 +34,8 @@ final class AppModel: ObservableObject {
     @Published var appearance: ViewerAppearance
     @Published var posterSize: PosterSize
     @Published var subtitleReadiness: SubtitleReadiness
+    @Published var offlineQuality: OfflineQuality
+    @Published var offlineNetwork: OfflineNetworkPolicy
 
     /// Starts as the app launches so iOS asks for local-network access before
     /// a person reaches Connect or Sign in. ConnectView observes this object
@@ -43,6 +45,7 @@ final class AppModel: ObservableObject {
 
     private(set) var origin: String
     private(set) var username: String?
+    private(set) var userId: Int?
     private(set) var serverName: String?
 
     private let settings = SettingsStore()
@@ -53,6 +56,7 @@ final class AppModel: ObservableObject {
         discovery = ServerDiscovery()
         origin = settings.origin
         username = settings.username
+        userId = settings.userId
         audioLang = settings.audioLang
         subLang = settings.subLang
         autoplay = settings.autoplay
@@ -61,6 +65,8 @@ final class AppModel: ObservableObject {
         posterSize = settings.posterSize
         subtitleReadiness = settings.subtitleReadiness
         libraryGrouping = settings.libraryGrouping
+        offlineQuality = settings.offlineQuality
+        offlineNetwork = settings.offlineNetwork
         discovery.start()
         Task {
             // Give NWBrowser a turn to enter its permission-gated operation
@@ -93,7 +99,11 @@ final class AppModel: ObservableObject {
         guard let savedToken else { phase = .needLogin; return }
         Session.shared.token = savedToken
         do {
-            username = try await requireAPI().me().username
+            let me = try await requireAPI().me()
+            username = me.username
+            userId = me.id
+            settings.username = me.username
+            settings.userId = me.id
             await backfillServerIdentityIfNeeded()
             phase = .ready
             discovery.stop()
@@ -139,6 +149,7 @@ final class AppModel: ObservableObject {
             origin = normalized
             api = a
             serverName = info.name
+            userId = nil
             // The persisted half of the same invariant. A relaunch between here
             // and the login below must not be able to hand server A's bearer to
             // server B — one write, both facts.
@@ -159,8 +170,10 @@ final class AppModel: ObservableObject {
             )
             Session.shared.token = resp.token
             username = resp.user.username
+            userId = resp.user.id
             settings.token = resp.token
             settings.username = resp.user.username
+            settings.userId = resp.user.id
             phase = .ready
             discovery.stop()
             await loadHome()
@@ -291,6 +304,8 @@ final class AppModel: ObservableObject {
     private func signOut() {
         settings.clearToken()
         Session.shared.token = nil
+        userId = nil
+        settings.userId = nil
         AuthImageCache.shared.clear()
         hubs = Hubs()
         comingSoon = []
@@ -310,6 +325,7 @@ final class AppModel: ObservableObject {
         // credential, and both copies of the credential are gone.
         settings.clearServer()
         Session.shared.token = nil
+        userId = nil
         // Artwork is cached per origin, but the bytes belong to the server that
         // served them; leaving them behind wastes memory the next server will
         // want for its own.
@@ -334,7 +350,11 @@ final class AppModel: ObservableObject {
         )
 
         do {
-            username = try await requireAPI().me().username
+            let me = try await requireAPI().me()
+            username = me.username
+            userId = me.id
+            settings.username = me.username
+            settings.userId = me.id
             phase = .ready
             discovery.stop()
             await loadHome()
@@ -446,6 +466,16 @@ final class AppModel: ObservableObject {
     func setPosterSize(_ size: PosterSize) {
         posterSize = size
         settings.posterSize = size
+    }
+
+    func setOfflineQuality(_ quality: OfflineQuality) {
+        offlineQuality = quality
+        settings.offlineQuality = quality
+    }
+
+    func setOfflineNetwork(_ policy: OfflineNetworkPolicy) {
+        offlineNetwork = policy
+        settings.offlineNetwork = policy
     }
 
     // MARK: - Screen loaders

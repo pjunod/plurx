@@ -14,9 +14,11 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.Icon
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -30,6 +32,8 @@ import tv.plurx.app.BuildConfig
 import tv.plurx.app.data.Appearance
 import tv.plurx.app.data.HomeGrouping
 import tv.plurx.app.data.PlaybackQuality
+import tv.plurx.app.data.OfflineNetwork
+import tv.plurx.app.data.OfflineQuality
 import tv.plurx.app.data.PosterSize
 import tv.plurx.app.data.ThemeId
 import tv.plurx.app.ui.components.ChoicePicker
@@ -52,10 +56,36 @@ internal fun appVersionLabel(versionName: String, versionCode: Int): String =
 @Composable
 fun SettingsScreen(vm: AppViewModel, onBack: () -> Unit) {
     val preferences by vm.preferences.collectAsStateWithLifecycle()
+    val offlineRecords by vm.offlineRecords.collectAsStateWithLifecycle()
     val formFactor = currentFormFactor()
     val side = formFactor.horizontalPadding()
     var audio by remember { mutableStateOf(LANGS.firstOrNull { it.first == vm.audioLang } ?: LANGS.first()) }
     var sub by remember { mutableStateOf(SUB_LANGS.firstOrNull { it.first == vm.subLang } ?: SUB_LANGS.first()) }
+    var confirmingSignOut by remember { mutableStateOf(false) }
+    val currentProfileHasDownloads = offlineRecords.any {
+        it.serverInstanceId == vm.serverInstanceId && it.userId == vm.currentUserId
+    }
+
+    if (confirmingSignOut) {
+        AlertDialog(
+            onDismissRequest = { confirmingSignOut = false },
+            title = { Text("Keep this profile's downloads?") },
+            text = {
+                Text("Kept downloads stay on this device and reappear when this Cinema profile signs in again.")
+            },
+            confirmButton = {
+                TextButton(onClick = vm::logout) { Text("Keep and sign out") }
+            },
+            dismissButton = {
+                Row {
+                    TextButton(onClick = { confirmingSignOut = false }) { Text("Cancel") }
+                    TextButton(onClick = vm::logoutAndRemoveDownloads) {
+                        Text("Remove and sign out")
+                    }
+                }
+            },
+        )
+    }
 
     Column(Modifier.fillMaxSize().navigationBarsPadding()) {
         SafeTopRow(
@@ -91,6 +121,26 @@ fun SettingsScreen(vm: AppViewModel, onBack: () -> Unit) {
                 PreferenceSwitch("Autoplay next episode", preferences.autoplayNext, vm::setAutoplayNext)
             }
         }
+        val downloads: @Composable () -> Unit = {
+            if (formFactor != FormFactor.Television) {
+                SettingsSection("Downloads", "Applied to new downloads on this device.") {
+                    ChoicePicker(
+                        "Quality",
+                        preferences.offlineQuality,
+                        OfflineQuality.entries,
+                        { it.label },
+                        vm::setOfflineQuality,
+                    )
+                    ChoicePicker(
+                        "Download over",
+                        preferences.offlineNetwork,
+                        OfflineNetwork.entries,
+                        { it.label },
+                        vm::setOfflineNetwork,
+                    )
+                }
+            }
+        }
 
         Column(
             Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = side, vertical = 16.dp),
@@ -99,11 +149,13 @@ fun SettingsScreen(vm: AppViewModel, onBack: () -> Unit) {
             if (formFactor == FormFactor.Compact) {
                 content()
                 playback()
+                downloads()
             } else {
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(32.dp)) {
                     Column(sectionModifier) { content() }
                     Column(sectionModifier) { playback() }
                 }
+                downloads()
             }
 
             SettingsSection("Account", null) {
@@ -113,7 +165,11 @@ fun SettingsScreen(vm: AppViewModel, onBack: () -> Unit) {
                     style = MaterialTheme.typography.bodyMedium,
                 )
                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    TvOutlinedButton(onClick = vm::logout) { Text("Sign out") }
+                    TvOutlinedButton(
+                        onClick = {
+                            if (currentProfileHasDownloads) confirmingSignOut = true else vm.logout()
+                        },
+                    ) { Text("Sign out") }
                     TvOutlinedButton(onClick = vm::changeServer) { Text("Change server") }
                 }
             }

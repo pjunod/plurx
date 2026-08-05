@@ -2,6 +2,9 @@ import SwiftUI
 
 @main
 struct PlurxApp: App {
+    #if os(iOS)
+    @UIApplicationDelegateAdaptor(OfflineAppDelegate.self) private var appDelegate
+    #endif
     @StateObject private var model = AppModel()
 
     var body: some Scene {
@@ -23,22 +26,52 @@ enum Route: Hashable {
 
 struct RootView: View {
     @EnvironmentObject var model: AppModel
+    @Environment(\.scenePhase) private var scenePhase
+    #if os(iOS)
+    @ObservedObject private var downloads = OfflineDownloadManager.shared
+    #endif
 
     var body: some View {
         ZStack {
             Palette.bg.ignoresSafeArea()
             switch model.phase {
             case .loading:
+                #if os(iOS)
+                if downloads.items.isEmpty {
+                    ProgressView().tint(Palette.accent)
+                } else {
+                    NavigationStack { DownloadsView() }
+                }
+                #else
                 ProgressView().tint(Palette.accent)
+                #endif
             case .needServer:
                 ConnectView(discovery: model.discovery)
             case .needLogin:
                 LoginView()
             case .reconnectFailed:
+                #if os(iOS)
+                if downloads.items.isEmpty {
+                    ReconnectView()
+                } else {
+                    NavigationStack { DownloadsView() }
+                }
+                #else
                 ReconnectView()
+                #endif
             case .ready:
                 HomeView()
             }
         }
+        #if os(iOS)
+        .onChange(of: scenePhase) { _, phase in
+            guard phase == .active else { return }
+            Task { await downloads.resumePendingPreparation() }
+        }
+        .onChange(of: model.phase) { _, phase in
+            guard phase == .ready else { return }
+            Task { await downloads.resumePendingPreparation() }
+        }
+        #endif
     }
 }

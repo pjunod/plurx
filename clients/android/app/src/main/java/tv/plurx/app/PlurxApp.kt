@@ -4,6 +4,7 @@ import android.app.Application
 import coil.ImageLoader
 import coil.ImageLoaderFactory
 import tv.plurx.app.data.Net
+import tv.plurx.app.data.offline.OfflineDownloads
 
 /**
  * Routes Coil's poster/backdrop loading through the same authenticated
@@ -11,6 +12,11 @@ import tv.plurx.app.data.Net
  * `/api/v1/images/…` carry the bearer token.
  */
 class PlurxApp : Application(), ImageLoaderFactory {
+    override fun onCreate() {
+        super.onCreate()
+        OfflineDownloads.initialize(this)
+    }
+
     override fun newImageLoader(): ImageLoader =
         ImageLoader.Builder(this)
             .okHttpClient(Net.client)

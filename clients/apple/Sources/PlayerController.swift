@@ -250,6 +250,9 @@ final class PlayerController: ObservableObject {
     private var itemId = 0
     private var fileId = 0
     private var title = ""
+    #if os(iOS)
+    private var offlineId: String?
+    #endif
     private var audioOverride: Int?
     private weak var model: AppModel?
     private var timeObserver: Any?
@@ -346,6 +349,12 @@ final class PlayerController: ObservableObject {
     }
 
     var methodLabel: String {
+        #if os(iOS)
+        if offlineId != nil {
+            let quality = selectedHeight.map { " · \($0)p" } ?? ""
+            return "Offline\(quality) · H.264 · AAC"
+        }
+        #endif
         if activeBurnedSubtitle != nil { return "Transcode · subtitle burn-in" }
         if selectedHeight != nil { return "Transcode · \(selectedHeight!)p" }
         let mode = decision.map(Self.playbackMode) ?? "transcode"
@@ -432,6 +441,115 @@ final class PlayerController: ObservableObject {
 
         Task { await load(startMs: startMs) }
     }
+
+    #if os(iOS)
+    /// Attach a system-managed local HLS package. This branch deliberately
+    /// constructs its decision-shaped snapshot locally and performs no API or
+    /// capability-URL work: airplane-mode playback is a first-class source,
+    /// not a remote failure fallback.
+    func startOffline(model: AppModel, item offline: OfflineItem) {
+        guard !started, let path = offline.localAssetRelativePath else { return }
+        started = true
+        self.model = model
+        offlineId = offline.id
+        itemId = offline.itemId
+        fileId = offline.fileId
+        knownDurationMs = offline.durationMs ?? 0
+        currentMs = max(0, offline.positionMs)
+        title = offline.title
+        selectedHeight = offline.actualHeight
+        selectedAudio = offline.audioLabel == nil ? nil : 0
+        selectedSubtitle = offline.subtitleIndex == nil ? nil : 0
+        deliveredRange = "sdr"
+        encoder = "offline"
+        isVOD = true
+        usesDirectTimeline = true
+        isDirectPlayback = true
+        decision = Self.offlineDecision(offline)
+        wantsPlayback = true
+        player.appliesMediaSelectionCriteriaAutomatically = false
+        player.automaticallyWaitsToMinimizeStalling = true
+        try? AVAudioSession.sharedInstance().setCategory(.playback)
+        try? AVAudioSession.sharedInstance().setActive(true)
+        installRemoteCommands()
+        addPeriodicObserver()
+        Task { await loadOffline(url: OfflineCatalog.localURL(for: path), startMs: currentMs) }
+    }
+
+    private static func offlineDecision(_ item: OfflineItem) -> Decision {
+        let audio = item.audioLabel.map {
+            [AudioTrack(index: 0, codec: "aac", channels: nil, language: nil, title: $0, default: true)]
+        }
+        let subtitles = item.subtitleIndex.map { _ in
+            [SubtitleTrack(
+                index: 0,
+                codec: "webvtt",
+                language: nil,
+                title: item.subtitleLabel ?? "Downloaded",
+                default: true,
+                forced: false,
+                text: true,
+                native: true,
+                overlay: nil
+            )]
+        }
+        return Decision(
+            fileId: item.fileId,
+            method: "offline",
+            playUrl: "",
+            delivery: Delivery(mode: "direct", url: nil, sessionsUrl: nil, aac: nil, preserveDolbyVision: nil),
+            reasons: ["Downloaded for offline viewing"],
+            transcodeAudio: false,
+            preserveDolbyVision: false,
+            source: SourceSummary(
+                container: "mpegts",
+                videoCodec: "h264",
+                videoProfile: nil,
+                width: nil,
+                height: item.actualHeight,
+                bitDepth: 8,
+                hdr: nil,
+                hdrFormat: nil,
+                bitrate: nil,
+                durationMs: item.durationMs
+            ),
+            audio: audio,
+            subtitles: subtitles,
+            markers: item.markers,
+            audioOffsetMs: 0,
+            declaredOffsetMs: 0,
+            ladder: [],
+            deliveredDynamicRange: "sdr"
+        )
+    }
+
+    private func loadOffline(url: URL, startMs: Int) async {
+        let asset = AVURLAsset(url: url)
+        guard asset.assetCache?.isPlayableOffline == true else {
+            fail(APIError.transport("Download incomplete"))
+            return
+        }
+        let item = AVPlayerItem(asset: asset)
+        Self.configureBuffering(item, growingHLS: false)
+        item.externalMetadata = [titleMetadata(title)]
+        observeEnd(of: item)
+        observeStatus(of: item)
+        player.replaceCurrentItem(with: item)
+        baseMs = 0
+        player.play()
+        if startMs > 0 {
+            do { try await seekWhenReady(item, ms: startMs) }
+            catch { fail(error); return }
+        }
+        await applyPreferredAudioSelection(to: item)
+        await applyNativeSubtitleSelection(selectedSubtitle, to: item)
+        player.play()
+        isPlaying = true
+        failed = false
+        attachedAtPositionMs = startMs
+        updateNowPlaying()
+    }
+    #endif
 
     func togglePlayPause() {
         // A buffering player reports `.waitingToPlayAtSpecifiedRate` and rate
@@ -1412,6 +1530,9 @@ final class PlayerController: ObservableObject {
     }
 
     private func reportPlaybackFailure(_ item: AVPlayerItem) {
+        #if os(iOS)
+        if offlineId != nil { return }
+        #endif
         let failure = item.error as NSError?
         let event = item.errorLog()?.events.last
         let payload = ApplePlaybackFailureLog(
@@ -1587,6 +1708,18 @@ final class PlayerController: ObservableObject {
     private func report(_ position: Int) {
         guard position > 0 else { return }
         let duration = knownDurationMs > 0 ? knownDurationMs : nil
+        #if os(iOS)
+        if let offlineId {
+            Task {
+                await OfflineDownloadManager.shared.recordProgress(
+                    id: offlineId,
+                    positionMs: position,
+                    durationMs: duration
+                )
+            }
+            return
+        }
+        #endif
         let itemId = itemId
         let model = model
         Task { await model?.reportProgress(itemId: itemId, positionMs: position, durationMs: duration) }

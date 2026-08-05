@@ -15,7 +15,7 @@ internet, read [Non-goals](#non-goals--what-plurx-does-not-defend-against)
 first: several protections you'd expect at that boundary are the proxy's job,
 not plurx's, by design.
 
-Audited 2026-07-23. Where a claim below is exhaustive, the test that keeps it
+Audited 2026-08-05. Where a claim below is exhaustive, the test that keeps it
 honest is named inline.
 
 ## Authentication — one token bar, no anonymous back doors
@@ -59,6 +59,37 @@ the same time — a timing side channel can't enumerate who has an account.
 and is checked identically; it exists only because browsers won't attach
 headers to `<img>`/`<video>` requests. Treat a URL with `?token=` as a
 credential — it grants exactly what the bearer does.
+
+## Offline media leases — one package, one narrow capability
+
+The signed-in JSON API owns package creation, status, lease issue, and
+deletion. Once a package is ready, the phone generates a 256-bit random lease
+token and presents it over the authenticated package route. The server stores
+only its SHA-256 hash. A lease opens only that package's HLS manifest,
+segments, and selected subtitle; it cannot browse the library, call a JSON
+API, read another title, or mint another lease.
+
+Native background download frameworks cannot reliably attach the account
+header to every nested HLS request, so the capability lives in the media path:
+
+```text
+/api/v1/offline/media/<lease>/master.m3u8
+```
+
+The path is a bearer credential. It has a rolling seven-day expiry; successful
+media reads keep the same stable value alive, with renewal writes persisted at
+most once per minute so segment fetches cannot become a database write storm.
+A package accepts only one value so a retry cannot silently rotate a transfer
+in progress. Package deletion or expiry removes the server-side capability.
+HTTP trace spans omit all query strings and replace the offline lease and live
+HLS session segments with `[REDACTED]`.
+
+Offline viewing is **not DRM**. Media on the phone is protected by the
+platform application sandbox and device-at-rest controls, is kept out of
+ordinary cloud backups, and is not exported to shared storage. Revoking a
+user or login token prevents new server access but cannot erase bytes already
+downloaded to a device. Uninstalling the app removes those local downloads;
+a rooted or jailbroken device can read them.
 
 ## API keys — a credential for machines, not a token for robots
 
@@ -107,6 +138,8 @@ user; management and diagnostics require admin.
 | `/download/plurx-android.apk` | none | the client app *binary*, not user data — and a TV's Downloader/browser can't attach a token. Intentional; see [CLIENTS.md](CLIENTS.md) |
 | Plex `/identity`, root capabilities | none | server discovery, so a Plex/Kodi/HA client can find plurx *before* it authenticates |
 | Browse · playback (`/files/{id}/*`) · images · watch progress · `/client-log` | signed-in user | your library, your streams, your progress — a valid token maps to a user |
+| Offline package JSON routes | signed-in owner | package creation, status, lease issue, and deletion are scoped to the user that created the package |
+| `/offline/media/{lease}/*` | package lease | only the prepared HLS package named by the hashed, expiring capability; native background transfer cannot attach the account header to nested media reads |
 | Users · library & settings mutations · `/system` · `/system/logs` · Trakt link · stop-session | admin | management and diagnostics — `AdminUser` is a token whose user carries `is_admin` |
 | API key management (`/keys`) | admin | issuing a credential is a management action; using one is not (above) |
 | Plex façade (`/library/*`, `/:/timeline`, …) | signed-in user | media bytes, metadata, and watch-state writes — requires a valid `X-Plex-Token` (a plurx token) since 2026-07-23 |

@@ -10,6 +10,20 @@ bump may break compatibility and a **patch** bump never does.
 
 ### Added
 
+- **Download a title in the native phone apps and watch it without the
+  server.** iPhone, iPad, and Android phones/tablets now have a one-tap
+  Downloads flow rather than a save-file export. plurxd durably prepares one
+  portable SDR H.264/AAC HLS package with the selected audio and supported
+  text subtitle, accounts for it under separate global/per-user quotas, and
+  serves it through a stable seven-day rolling capability whose plaintext is
+  never stored or logged. Apple hands the package to background
+  `AVAssetDownloadURLSession`; Android hands it to a foreground Media3
+  `DownloadService` backed by a non-evicting private cache. Both restore local
+  catalogs after process death, expose saved titles before server reconnect,
+  isolate them by server/user profile, play only app-owned local bytes, and
+  sync the newest timestamped progress after reconnect. tvOS, Android TV, and
+  Google TV intentionally retain streaming-only behavior.
+
 - **Choosing a text subtitle on the Apple apps is no longer a video
   decision.** Selecting an SRT/SubRip/WebVTT track used to send
   `subtitle_burn`: the server opened a fresh session and started a video

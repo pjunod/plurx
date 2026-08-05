@@ -98,12 +98,13 @@ impl WatchStore for SqliteStore {
         .await
     }
 
-    async fn put_progress(
+    async fn put_progress_at(
         &self,
         user_id: i64,
         item_id: i64,
         position_ms: i64,
         duration_ms: Option<i64>,
+        recorded_at: Option<i64>,
     ) -> Result<WatchState, StoreError> {
         self.with_conn(move |conn| {
             // The client's idea of duration is untrustworthy: progressive
@@ -138,18 +139,43 @@ impl WatchStore for SqliteStore {
                 Some(d) => (position_ms as f64 / d as f64) >= WATCHED_THRESHOLD,
                 None => false,
             };
+            let now = conn.query_row("SELECT unixepoch()", [], |row| row.get::<_, i64>(0))?;
+            let at = recorded_at.unwrap_or(now).clamp(0, now);
             let state = conn.query_row(
                 "INSERT INTO watch_state (user_id, item_id, position_ms, duration_ms, watched, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, unixepoch())
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(user_id, item_id) DO UPDATE SET
                      position_ms = excluded.position_ms,
                      duration_ms = COALESCE(excluded.duration_ms, watch_state.duration_ms),
                      watched = watch_state.watched OR excluded.watched,
-                     updated_at = unixepoch()
+                     updated_at = excluded.updated_at
+                 -- A dated replay must not rewind a newer device. An ordinary
+                 -- online heartbeat is authoritative now even if an imported
+                 -- clock previously left a future timestamp in this row.
+                 WHERE ?7 = 1 OR excluded.updated_at >= watch_state.updated_at
                  RETURNING position_ms, duration_ms, watched, updated_at",
-                params![user_id, item_id, position_ms, effective, watched as i64],
+                params![
+                    user_id,
+                    item_id,
+                    position_ms,
+                    effective,
+                    watched as i64,
+                    at,
+                    recorded_at.is_none() as i64
+                ],
                 |row| watch_from_row(row, 0),
-            )?;
+            ).or_else(|error| {
+                if matches!(error, rusqlite::Error::QueryReturnedNoRows) {
+                    conn.query_row(
+                        "SELECT position_ms, duration_ms, watched, updated_at
+                         FROM watch_state WHERE user_id = ?1 AND item_id = ?2",
+                        params![user_id, item_id],
+                        |row| watch_from_row(row, 0),
+                    )
+                } else {
+                    Err(error)
+                }
+            })?;
             Ok(state)
         })
         .await
@@ -621,6 +647,111 @@ mod tests {
             .await
             .expect("progress");
         assert_eq!(state.position_ms, 0);
+    }
+
+    #[tokio::test]
+    async fn timestamped_progress_refuses_stale_offline_replays() {
+        let store = SqliteStore::open_in_memory().expect("open");
+        let user = store.create_user("u", "h", true).await.expect("user");
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "M".into(),
+                kind: LibraryKind::Movies,
+                paths: vec![],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+        let movie = store
+            .insert_item(&NewItem {
+                library_id: lib.id,
+                kind: ItemKind::Movie,
+                parent_id: None,
+                title: "Arrival".into(),
+                year: Some(2016),
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("movie");
+
+        let first = store
+            .put_progress_at(user.id, movie, 70_000, Some(100_000), Some(200))
+            .await
+            .expect("newer progress");
+        assert_eq!(first.position_ms, 70_000);
+
+        let stale = store
+            .put_progress_at(user.id, movie, 20_000, Some(100_000), Some(100))
+            .await
+            .expect("stale progress returns current state");
+        assert_eq!(stale.position_ms, 70_000, "late replay must not rewind");
+        assert_eq!(stale.updated_at, 200);
+
+        let finished = store
+            .put_progress_at(user.id, movie, 98_000, Some(100_000), Some(300))
+            .await
+            .expect("newest progress");
+        assert!(finished.watched);
+
+        let stale_unfinished = store
+            .put_progress_at(user.id, movie, 30_000, Some(100_000), Some(250))
+            .await
+            .expect("stale unfinished progress");
+        assert!(
+            stale_unfinished.watched,
+            "progress never implicitly un-watches"
+        );
+        assert_eq!(stale_unfinished.position_ms, 98_000);
+    }
+
+    #[tokio::test]
+    async fn online_progress_bypasses_a_future_imported_clock() {
+        let store = SqliteStore::open_in_memory().expect("open");
+        let user = store.create_user("u", "h", true).await.expect("user");
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "M".into(),
+                kind: LibraryKind::Movies,
+                paths: vec![],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+        let movie = store
+            .insert_item(&NewItem {
+                library_id: lib.id,
+                kind: ItemKind::Movie,
+                parent_id: None,
+                title: "Arrival".into(),
+                year: Some(2016),
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("movie");
+        store
+            .put_progress(user.id, movie, 10_000, Some(100_000))
+            .await
+            .expect("initial");
+        let future = 4_000_000_000_i64;
+        store
+            .with_conn(move |conn| {
+                conn.execute(
+                    "UPDATE watch_state SET updated_at = ?3 WHERE user_id = ?1 AND item_id = ?2",
+                    rusqlite::params![user.id, movie, future],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("inject skew");
+
+        let current = store
+            .put_progress(user.id, movie, 40_000, Some(100_000))
+            .await
+            .expect("online heartbeat");
+        assert_eq!(current.position_ms, 40_000);
+        assert!(current.updated_at < future);
     }
 
     #[tokio::test]

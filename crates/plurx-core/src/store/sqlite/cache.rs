@@ -158,6 +158,12 @@ impl TranscodeCacheStore for SqliteStore {
                  FROM transcode_cache_locations l
                  JOIN transcode_cache_recipes r ON r.recipe_hash = l.recipe_hash
                  WHERE l.node_id = ?1 AND l.complete = 1
+                   AND NOT EXISTS (
+                       SELECT 1 FROM offline_packages p
+                       WHERE p.recipe_hash = l.recipe_hash
+                         AND p.node_id = l.node_id
+                         AND p.state IN ('queued', 'preparing', 'ready')
+                   )
                  -- The rowid tiebreak makes eviction deterministic. Without it
                  -- a batch of entries finished in the same second sorts
                  -- arbitrarily, so which one an over-budget sweep deletes
@@ -189,10 +195,33 @@ impl TranscodeCacheStore for SqliteStore {
                 "SELECT {CACHE_COLS}
                  FROM transcode_cache_locations l
                  JOIN transcode_cache_recipes r ON r.recipe_hash = l.recipe_hash
-                 WHERE l.node_id = ?1 AND l.complete = 0 AND l.last_seen_at < ?2"
+                 WHERE l.node_id = ?1 AND l.complete = 0 AND l.last_seen_at < ?2
+                   AND NOT EXISTS (
+                       SELECT 1 FROM offline_packages p
+                       WHERE p.file_id = r.file_id
+                         AND p.node_id = l.node_id
+                         AND p.state IN ('queued', 'preparing')
+                   )"
             ))?;
             let rows = stmt
                 .query_map(params![node, older_than_unix], cache_from_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    async fn all_cache_rows(&self, node_id: &str) -> Result<Vec<CachedTranscode>, StoreError> {
+        let node = node_id.to_owned();
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {CACHE_COLS}
+                 FROM transcode_cache_locations l
+                 JOIN transcode_cache_recipes r ON r.recipe_hash = l.recipe_hash
+                 WHERE l.node_id = ?1"
+            ))?;
+            let rows = stmt
+                .query_map([node], cache_from_row)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         })
@@ -228,8 +257,15 @@ impl TranscodeCacheStore for SqliteStore {
         let node = node_id.to_owned();
         self.with_conn(move |conn| {
             Ok(conn.query_row(
-                "SELECT COALESCE(SUM(bytes), 0) FROM transcode_cache_locations
-                 WHERE node_id = ?1 AND complete = 1",
+                "SELECT COALESCE(SUM(l.bytes), 0)
+                 FROM transcode_cache_locations l
+                 WHERE l.node_id = ?1 AND l.complete = 1
+                   AND NOT EXISTS (
+                       SELECT 1 FROM offline_packages p
+                       WHERE p.recipe_hash = l.recipe_hash
+                         AND p.node_id = l.node_id
+                         AND p.state IN ('queued', 'preparing', 'ready')
+                   )",
                 params![node],
                 |row| row.get(0),
             )?)
@@ -240,8 +276,13 @@ impl TranscodeCacheStore for SqliteStore {
 
 #[cfg(test)]
 mod tests {
-    use crate::domain::{ItemKind, LibraryKind, NewItem, NewLibrary, ProbeResult};
-    use crate::store::{LibraryStore, MediaStore, SqliteStore, TranscodeCacheStore};
+    use crate::domain::{
+        ItemKind, LibraryKind, NewItem, NewLibrary, NewOfflinePackage, OfflineCreateOutcome,
+        ProbeResult,
+    };
+    use crate::store::{
+        LibraryStore, MediaStore, OfflinePackageStore, SqliteStore, TranscodeCacheStore, UserStore,
+    };
 
     const NODE: &str = "node-a";
 
@@ -453,6 +494,116 @@ mod tests {
             .await
             .expect("stale")
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_active_offline_request_protects_its_resumable_claim() {
+        let store = SqliteStore::open_in_memory().expect("open");
+        let file = seed_file(&store).await;
+        let user = store.create_user("paul", "hash", true).await.expect("user");
+        store
+            .claim_cache_entry("flight", file, 1, NODE, "flight")
+            .await
+            .expect("claim");
+        let package = NewOfflinePackage {
+            id: "package".into(),
+            request_id: "request".into(),
+            user_id: user.id,
+            file_id: file,
+            node_id: NODE.into(),
+            source_path: "/m/Heat.mkv".into(),
+            source_size: 1,
+            source_mtime: 1,
+            target_height: 720,
+            output_width: Some(1280),
+            output_height: Some(720),
+            audio_index: None,
+            audio_offset_ms: 0,
+            subtitle_index: None,
+            subtitle_language: None,
+            subtitle_mode: "none".into(),
+            estimated_bytes: 10,
+            reserved_bytes: 20,
+            expires_at: i64::MAX,
+        };
+        assert!(matches!(
+            store
+                .create_offline_package(&package, 10, 1_000, 2_000)
+                .await
+                .expect("package"),
+            OfflineCreateOutcome::Created(_)
+        ));
+        assert!(store
+            .stale_cache_claims(NODE, i64::MAX)
+            .await
+            .expect("stale")
+            .is_empty());
+
+        store
+            .delete_offline_package("package", user.id)
+            .await
+            .expect("delete");
+        assert_eq!(
+            store
+                .stale_cache_claims(NODE, i64::MAX)
+                .await
+                .expect("stale")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn ready_offline_bytes_are_not_charged_to_playback_cache() {
+        let store = SqliteStore::open_in_memory().expect("open");
+        let file = seed_file(&store).await;
+        let user = store.create_user("paul", "hash", true).await.expect("user");
+        store
+            .claim_cache_entry("flight", file, 1, NODE, "flight")
+            .await
+            .expect("claim");
+        store
+            .complete_cache_entry("flight", NODE, 900)
+            .await
+            .expect("complete");
+        let package = NewOfflinePackage {
+            id: "package".into(),
+            request_id: "request".into(),
+            user_id: user.id,
+            file_id: file,
+            node_id: NODE.into(),
+            source_path: "/m/Heat.mkv".into(),
+            source_size: 1,
+            source_mtime: 1,
+            target_height: 720,
+            output_width: Some(1280),
+            output_height: Some(720),
+            audio_index: None,
+            audio_offset_ms: 0,
+            subtitle_index: None,
+            subtitle_language: None,
+            subtitle_mode: "none".into(),
+            estimated_bytes: 800,
+            reserved_bytes: 1_000,
+            expires_at: i64::MAX,
+        };
+        store
+            .create_offline_package(&package, 10, 2_000, 3_000)
+            .await
+            .expect("package");
+        store
+            .mark_offline_package_ready("package", "flight", 900, 1_000)
+            .await
+            .expect("ready");
+        assert_eq!(store.cache_bytes(NODE).await.expect("bytes"), 0);
+        assert!(store.cache_by_age(NODE, 10).await.expect("lru").is_empty());
+
+        store
+            .delete_offline_package("package", user.id)
+            .await
+            .expect("delete");
+        assert_eq!(store.cache_bytes(NODE).await.expect("bytes"), 900);
+        assert_eq!(store.cache_by_age(NODE, 10).await.expect("lru").len(), 1);
     }
 
     /// The source file going away takes its cache entries with it — the

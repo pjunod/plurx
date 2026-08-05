@@ -73,6 +73,28 @@ enum class PlaybackQuality(val storageValue: String, val label: String) {
     }
 }
 
+enum class OfflineQuality(val storageValue: String, val label: String, val maximumHeight: Int) {
+    Standard("standard", "Standard · up to 720p", 720),
+    High("high", "High · up to 1080p", 1080);
+
+    companion object {
+        fun fromStorage(value: String?): OfflineQuality = entries.firstOrNull {
+            it.storageValue == value
+        } ?: Standard
+    }
+}
+
+enum class OfflineNetwork(val storageValue: String, val label: String) {
+    WifiOnly("wifi", "Wi-Fi only"),
+    Any("any", "Any network");
+
+    companion object {
+        fun fromStorage(value: String?): OfflineNetwork = entries.firstOrNull {
+            it.storageValue == value
+        } ?: WifiOnly
+    }
+}
+
 data class ViewerPreferences(
     val theme: ThemeId = ThemeId.Classic,
     val appearance: Appearance = Appearance.System,
@@ -81,4 +103,6 @@ data class ViewerPreferences(
     val playbackQuality: PlaybackQuality = PlaybackQuality.Auto,
     val autoSkip: Boolean = false,
     val autoplayNext: Boolean = true,
+    val offlineQuality: OfflineQuality = OfflineQuality.Standard,
+    val offlineNetwork: OfflineNetwork = OfflineNetwork.WifiOnly,
 )
