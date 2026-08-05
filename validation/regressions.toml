@@ -186,3 +186,9 @@ points = []
 checks = []
 reason = "These commits only correct documentation, comments, or ignored generated cache state; they introduce no executable behavior."
 ignore = true
+
+[[coverage]]
+commits = ["dcd0d1e4"]
+points = ["mobile.versioning"]
+checks = ["mobile-version"]
+reason = "The mobile release gate pins the shared workspace version and requires strictly increasing Apple and Android build counters."
