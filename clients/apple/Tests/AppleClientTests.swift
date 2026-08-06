@@ -2430,6 +2430,26 @@ final class AppleClientTests: XCTestCase {
         XCTAssertEqual(OfflineNetworkPolicy.wifiOnly.label, "Wi-Fi only")
     }
 
+    func testPlayerOptionMenuPaletteStaysReadableInLightAndDarkAppearances() {
+        for style in [UIUserInterfaceStyle.light, .dark] {
+            let traits = UITraitCollection(userInterfaceStyle: style)
+            let foreground = PlayerOptionMenuPalette.foreground.resolvedColor(with: traits)
+            let secondary = PlayerOptionMenuPalette.secondaryForeground.resolvedColor(with: traits)
+            let background = UIColor.systemBackground.resolvedColor(with: traits)
+
+            XCTAssertGreaterThanOrEqual(
+                contrastRatio(foreground, background),
+                4.5,
+                "primary labels must remain readable in \(style) mode"
+            )
+            XCTAssertGreaterThanOrEqual(
+                contrastRatio(secondary, background),
+                3,
+                "section labels must remain readable in \(style) mode"
+            )
+        }
+    }
+
     func testDetailBodyKeepsScrollableRowsAndActionsInsidePhoneInsets() throws {
         for viewportWidth: CGFloat in [393, 440] {
             let expectedBodyWidth = viewportWidth - (2 * screenHPad)
@@ -2585,6 +2605,64 @@ final class AppleClientTests: XCTestCase {
         )
         XCTAssertLessThanOrEqual(HomeHeroMetrics.compactHeight, 250)
         XCTAssertGreaterThanOrEqual(HomeHeroMetrics.cornerRadius, 16)
+    }
+
+    @MainActor
+    func testPhoneHomeHeroKeepsEqualInsetsOnBothEdges() {
+        for viewportWidth: CGFloat in [375, 430] {
+            var heroFrame: CGRect = .null
+            let controller = UIHostingController(rootView:
+                Color.clear
+                    .frame(maxWidth: .infinity, minHeight: HomeHeroMetrics.compactHeight)
+                    .reportLayoutFrame()
+                    .modifier(IOSHomeHeroLayout(compact: true))
+                    .onPreferenceChange(LayoutFramePreferenceKey.self) {
+                        heroFrame = $0
+                    }
+            )
+
+            controller.view.frame = CGRect(
+                origin: .zero,
+                size: CGSize(width: viewportWidth, height: HomeHeroMetrics.compactHeight)
+            )
+            let window = UIWindow(frame: controller.view.frame)
+            window.rootViewController = controller
+            window.makeKeyAndVisible()
+            controller.view.setNeedsLayout()
+            controller.view.layoutIfNeeded()
+            RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.1))
+
+            XCTAssertFalse(heroFrame.isNull)
+            XCTAssertEqual(heroFrame.minX, HomeHeroMetrics.horizontalInset, accuracy: 0.5)
+            XCTAssertEqual(
+                heroFrame.maxX,
+                viewportWidth - HomeHeroMetrics.horizontalInset,
+                accuracy: 0.5
+            )
+            window.isHidden = true
+        }
+    }
+
+    private func contrastRatio(_ foreground: UIColor, _ background: UIColor) -> CGFloat {
+        let lighter = max(relativeLuminance(foreground), relativeLuminance(background))
+        let darker = min(relativeLuminance(foreground), relativeLuminance(background))
+        return (lighter + 0.05) / (darker + 0.05)
+    }
+
+    private func relativeLuminance(_ color: UIColor) -> CGFloat {
+        var red: CGFloat = 0
+        var green: CGFloat = 0
+        var blue: CGFloat = 0
+        var alpha: CGFloat = 0
+        XCTAssertTrue(color.getRed(&red, green: &green, blue: &blue, alpha: &alpha))
+
+        func linear(_ component: CGFloat) -> CGFloat {
+            component <= 0.04045
+                ? component / 12.92
+                : pow((component + 0.055) / 1.055, 2.4)
+        }
+
+        return 0.2126 * linear(red) + 0.7152 * linear(green) + 0.0722 * linear(blue)
     }
     #endif
 
