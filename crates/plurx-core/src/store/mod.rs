@@ -394,10 +394,13 @@ pub trait MediaStore: Send + Sync + 'static {
     /// that is skipped. Without it an item TMDB genuinely has no art for would
     /// be re-fetched on every single cycle, forever, which is how a
     /// self-healing job turns into a rate-limit generator.
+    /// `limit` bounds one pass so a large upgrade backlog cannot monopolize
+    /// the scheduler or provider connection for hours.
     async fn items_missing_artwork(
         &self,
         library_id: Option<i64>,
         retry_after_secs: i64,
+        limit: i64,
     ) -> Result<Vec<Item>, StoreError>;
     /// Movies and shows with no genres yet, in ascending id order, starting
     /// strictly after `after_id` — the genre backfill's input.
