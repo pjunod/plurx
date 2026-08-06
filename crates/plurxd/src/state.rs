@@ -1449,7 +1449,13 @@ impl JobManager {
             let Ok(Some(library)) = self.store.get_library(library_id).await else {
                 continue;
             };
-            let outcome = self.enrich(&library, true, Some(&ids)).await;
+            // Metadata providers enter a TV tree through the show, never
+            // through a season/episode row. Carry each missing child and all
+            // of its ancestors so `enrich_library` selects the show while
+            // `enrich_episodes` remains narrowed to exactly the affected
+            // seasons and episodes.
+            let targets = self.enrich_targets(&ids).await;
+            let outcome = self.enrich(&library, true, Some(&targets)).await;
             repaired += outcome.enrich.map(|r| r.matched).unwrap_or(0);
         }
         tracing::info!(
@@ -1816,5 +1822,103 @@ mod tests {
         let artwork = tempfile::tempdir().expect("artwork");
         let jobs = manager(store.clone(), artwork.path());
         assert_eq!(jobs.sweep_artwork().await.expect("sweep"), 0);
+    }
+
+    /// Production shape: the known show has a poster and an enrichment stamp,
+    /// while a later-imported season and episode have neither artwork nor an
+    /// attempt stamp. The sweep must enter through the show and repair both
+    /// child cards; selecting the child ids without their ancestor enriches
+    /// nothing.
+    #[tokio::test]
+    async fn the_artwork_sweep_repairs_blank_tv_children() {
+        use plurx_core::domain::{ArtworkAttempt, MetadataPatch};
+
+        let store = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let artwork = tempfile::tempdir().expect("artwork");
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "TV".into(),
+                kind: LibraryKind::Shows,
+                paths: vec![],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+        store
+            .put_setting(keys::TMDB_API_KEY, "test-key")
+            .await
+            .expect("key");
+        let show = store
+            .insert_item(&NewItem {
+                library_id: lib.id,
+                kind: ItemKind::Show,
+                parent_id: None,
+                title: "Severance".into(),
+                year: Some(2022),
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("show");
+        let season = store
+            .insert_item(&NewItem {
+                library_id: lib.id,
+                kind: ItemKind::Season,
+                parent_id: Some(show),
+                title: "Season 1".into(),
+                year: None,
+                season_number: Some(1),
+                episode_number: None,
+            })
+            .await
+            .expect("season");
+        let episode = store
+            .insert_item(&NewItem {
+                library_id: lib.id,
+                kind: ItemKind::Episode,
+                parent_id: Some(season),
+                title: "Episode 1".into(),
+                year: None,
+                season_number: Some(1),
+                episode_number: Some(1),
+            })
+            .await
+            .expect("episode");
+        store
+            .apply_metadata(
+                show,
+                &MetadataPatch {
+                    tmdb_id: Some(42),
+                    poster_path: Some("existing-show.jpg".into()),
+                    enriched: true,
+                    artwork: Some(ArtworkAttempt::Stored),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("enrich show");
+
+        let season_hits = Arc::new(AtomicUsize::new(0));
+        let base = serve(targeted_show_tmdb(Arc::clone(&season_hits))).await;
+        let jobs = manager_with_tmdb(store.clone(), artwork.path(), &base);
+        assert_eq!(jobs.sweep_artwork().await.expect("sweep"), 1);
+
+        let season = store
+            .get_item(season)
+            .await
+            .expect("get season")
+            .expect("season");
+        let episode = store
+            .get_item(episode)
+            .await
+            .expect("get episode")
+            .expect("episode");
+        assert!(season.poster_path.is_some(), "season card repaired");
+        assert!(episode.poster_path.is_some(), "episode card repaired");
+        assert_eq!(
+            season_hits.load(Ordering::SeqCst),
+            1,
+            "one affected season costs one TMDB season request"
+        );
     }
 }
