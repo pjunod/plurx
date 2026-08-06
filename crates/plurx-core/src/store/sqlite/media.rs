@@ -635,6 +635,7 @@ impl MediaStore for SqliteStore {
         &self,
         library_id: Option<i64>,
         retry_after_secs: i64,
+        limit: i64,
     ) -> Result<Vec<Item>, StoreError> {
         self.with_conn(move |conn| {
             // A movie/show is eligible only after its own provider pass. A TV
@@ -657,6 +658,7 @@ impl MediaStore for SqliteStore {
                    AND (
                         (i.kind IN ('movie','show') AND i.metadata_at IS NOT NULL)
                         OR (i.kind = 'season' AND l.anime = 0
+                            AND i.season_number IS NOT NULL
                             AND parent.kind = 'show' AND parent.metadata_at IS NOT NULL)
                         OR (i.kind = 'episode' AND l.anime = 0
                             AND parent.kind = 'season'
@@ -666,13 +668,15 @@ impl MediaStore for SqliteStore {
                    AND (i.artwork_attempted_at IS NULL
                         OR i.artwork_attempted_at <= unixepoch() - ?2)
                    AND (?1 IS NULL OR i.library_id = ?1)
-                 ORDER BY i.artwork_attempted_at IS NOT NULL, i.artwork_attempted_at, i.id",
+                 ORDER BY i.artwork_attempted_at IS NOT NULL, i.artwork_attempted_at, i.id
+                 LIMIT ?3",
                 i = item_cols("i")
             ))?;
             let items = stmt
-                .query_map(params![library_id, retry_after_secs.max(0)], |row| {
-                    item_from_row(row, 0)
-                })?
+                .query_map(
+                    params![library_id, retry_after_secs.max(0), limit.max(0)],
+                    |row| item_from_row(row, 0),
+                )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(items)
         })
@@ -2318,7 +2322,7 @@ mod tests {
 
         // No backoff: the one item that was matched and has no picture.
         let due = store
-            .items_missing_artwork(None, 0)
+            .items_missing_artwork(None, 0, 100)
             .await
             .expect("missing artwork");
         assert_eq!(
@@ -2338,7 +2342,7 @@ mod tests {
         // With a backoff, the same item is skipped — it was attempted a
         // moment ago, and the point of recording that was to be able to wait.
         assert!(store
-            .items_missing_artwork(None, 3600)
+            .items_missing_artwork(None, 3600, 100)
             .await
             .expect("backoff")
             .is_empty());
@@ -2410,8 +2414,18 @@ mod tests {
             .await
             .expect("enrich show");
 
+        let first = store
+            .items_missing_artwork(Some(lib.id), 0, 1)
+            .await
+            .expect("bounded artwork");
+        assert_eq!(
+            first.iter().map(|item| item.id).collect::<Vec<_>>(),
+            [season],
+            "one pass honors its row budget and keeps deterministic ordering"
+        );
+
         let due = store
-            .items_missing_artwork(Some(lib.id), 0)
+            .items_missing_artwork(Some(lib.id), 0, 100)
             .await
             .expect("missing artwork");
         assert_eq!(
@@ -2419,6 +2433,148 @@ mod tests {
             [season, episode],
             "the healthy show is done, but both blank child cards need retry"
         );
+    }
+
+    /// Child eligibility is deliberately narrower than "posterless TV row":
+    /// only numbered children of an enriched, non-anime provider show can be
+    /// repaired by the TMDB route.
+    #[tokio::test]
+    async fn items_missing_artwork_excludes_children_the_provider_cannot_repair() {
+        let store = SqliteStore::open_in_memory().expect("open");
+
+        async fn create_tree(
+            store: &SqliteStore,
+            name: &str,
+            kind: LibraryKind,
+            anime: bool,
+            enriched: bool,
+        ) -> (i64, i64, i64, i64) {
+            let lib = store
+                .create_library(&NewLibrary {
+                    name: name.into(),
+                    kind,
+                    paths: vec![],
+                    anime,
+                })
+                .await
+                .expect("lib");
+            let show = store
+                .insert_item(&NewItem {
+                    library_id: lib.id,
+                    kind: ItemKind::Show,
+                    parent_id: None,
+                    title: format!("{name} Show"),
+                    year: None,
+                    season_number: None,
+                    episode_number: None,
+                })
+                .await
+                .expect("show");
+            let season = store
+                .insert_item(&NewItem {
+                    library_id: lib.id,
+                    kind: ItemKind::Season,
+                    parent_id: Some(show),
+                    title: "Season 1".into(),
+                    year: None,
+                    season_number: Some(1),
+                    episode_number: None,
+                })
+                .await
+                .expect("season");
+            let episode = store
+                .insert_item(&NewItem {
+                    library_id: lib.id,
+                    kind: ItemKind::Episode,
+                    parent_id: Some(season),
+                    title: "Episode 1".into(),
+                    year: None,
+                    season_number: Some(1),
+                    episode_number: Some(1),
+                })
+                .await
+                .expect("episode");
+            if enriched {
+                store
+                    .apply_metadata(
+                        show,
+                        &MetadataPatch {
+                            tmdb_id: Some(42),
+                            poster_path: Some(format!("{show}-poster.jpg")),
+                            enriched: true,
+                            artwork: Some(ArtworkAttempt::Stored),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("enrich show");
+            }
+            (lib.id, show, season, episode)
+        }
+
+        let (_, _, _, anime_episode) =
+            create_tree(&store, "Anime", LibraryKind::Shows, true, true).await;
+        let (_, _, _, unenriched_episode) =
+            create_tree(&store, "Unenriched", LibraryKind::Shows, false, false).await;
+        let (_, _, _, home_episode) =
+            create_tree(&store, "Home", LibraryKind::Home, false, true).await;
+
+        let normal = store
+            .create_library(&NewLibrary {
+                name: "Malformed TV".into(),
+                kind: LibraryKind::Shows,
+                paths: vec![],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+        let show = store
+            .insert_item(&NewItem {
+                library_id: normal.id,
+                kind: ItemKind::Show,
+                parent_id: None,
+                title: "Malformed".into(),
+                year: None,
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("show");
+        let unnumbered_season = store
+            .insert_item(&NewItem {
+                library_id: normal.id,
+                kind: ItemKind::Season,
+                parent_id: Some(show),
+                title: "Unknown Season".into(),
+                year: None,
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("season");
+        store
+            .apply_metadata(
+                show,
+                &MetadataPatch {
+                    tmdb_id: Some(43),
+                    poster_path: Some("malformed-show.jpg".into()),
+                    enriched: true,
+                    artwork: Some(ArtworkAttempt::Stored),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("enrich show");
+
+        let due = store
+            .items_missing_artwork(None, 0, 100)
+            .await
+            .expect("missing artwork");
+        let ids: Vec<i64> = due.into_iter().map(|item| item.id).collect();
+        assert!(!ids.contains(&anime_episode));
+        assert!(!ids.contains(&unenriched_episode));
+        assert!(!ids.contains(&home_episode));
+        assert!(!ids.contains(&unnumbered_season));
     }
 
     /// A patch that is not about artwork must not disturb the attempt record.

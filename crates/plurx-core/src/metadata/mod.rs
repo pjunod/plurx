@@ -91,6 +91,26 @@ pub async fn enrich_library(
     force: bool,
     only: Option<&[i64]>,
 ) -> EnrichReport {
+    enrich_library_for_targets(store, tmdb, artwork_dir, library_id, force, only, only).await
+}
+
+/// Enrich a targeted TMDB tree while keeping provider-routing ancestors
+/// separate from the rows the caller actually asked to repair.
+///
+/// `routes` is handed to the store so a season or episode can enter TMDB
+/// through its show. `repairs` is the original requested set. A show present
+/// only in `routes` contributes its stable TMDB id and is otherwise left
+/// untouched: routing one blank episode must not rewrite a healthy show's
+/// title or download its poster and backdrop again.
+pub async fn enrich_library_for_targets(
+    store: &dyn Store,
+    tmdb: &TmdbClient,
+    artwork_dir: &Path,
+    library_id: Option<i64>,
+    force: bool,
+    routes: Option<&[i64]>,
+    repairs: Option<&[i64]>,
+) -> EnrichReport {
     let mut report = EnrichReport::default();
     if let Err(e) = tokio::fs::create_dir_all(artwork_dir).await {
         tracing::error!(dir = %artwork_dir.display(), error = %e, "cannot create artwork dir");
@@ -99,7 +119,10 @@ pub async fn enrich_library(
         return report;
     }
 
-    let items = match store.items_needing_metadata(library_id, force, only).await {
+    let items = match store
+        .items_needing_metadata(library_id, force, routes)
+        .await
+    {
         Ok(items) => items,
         Err(e) => {
             tracing::error!(error = %e, "listing items needing metadata");
@@ -110,6 +133,46 @@ pub async fn enrich_library(
     };
 
     for item in items {
+        let route_only = repairs.is_some_and(|ids| !ids.contains(&item.id));
+        if route_only {
+            if item.kind == ItemKind::Show {
+                // An enriched parent already has the provider identity needed
+                // to reach its seasons. Avoid even the show-details request:
+                // the ancestor is a route, not a refresh target.
+                let show_tmdb_id = if let Some(id) = item.tmdb_id {
+                    Some(id)
+                } else {
+                    let known = known_id(tmdb, &item).await;
+                    match show_lookup(tmdb, &item, known).await {
+                        Ok(Some(m)) => Some(m.tmdb_id),
+                        Ok(None) => {
+                            report.unmatched += 1;
+                            None
+                        }
+                        Err(e) => {
+                            tracing::error!(title = %item.title, error = %e, "show route lookup failed");
+                            report.errors += 1;
+                            report.note(format!("`{}`: show route lookup failed: {e}", item.title));
+                            None
+                        }
+                    }
+                };
+                if let Some(show_tmdb_id) = show_tmdb_id {
+                    enrich_episodes(
+                        store,
+                        tmdb,
+                        artwork_dir,
+                        item.id,
+                        show_tmdb_id,
+                        repairs,
+                        &mut report,
+                    )
+                    .await;
+                }
+            }
+            continue;
+        }
+
         // An id, if one is already known, before any search. This is the
         // whole point: `"Heat (1995) Directors Cut Remux"` is a title a
         // search can get wrong, and a wrong match does not stay local — it
@@ -218,7 +281,7 @@ pub async fn enrich_library(
                         artwork_dir,
                         item.id,
                         show_tmdb_id,
-                        only,
+                        repairs,
                         &mut report,
                     )
                     .await;
@@ -1392,14 +1455,14 @@ mod tests {
 
         // And the sweep will therefore come back for it.
         let due = store
-            .items_missing_artwork(Some(lib), 0)
+            .items_missing_artwork(Some(lib), 0, 100)
             .await
             .expect("sweep");
         assert_eq!(due.iter().map(|i| i.id).collect::<Vec<_>>(), [movie]);
         // But not immediately: the recorded attempt is what makes the backoff
         // possible, and a permanent 404 must not be re-fetched every cycle.
         assert!(store
-            .items_missing_artwork(Some(lib), 3600)
+            .items_missing_artwork(Some(lib), 3600, 100)
             .await
             .expect("backoff")
             .is_empty());
@@ -1436,7 +1499,7 @@ mod tests {
         assert!(m.poster_path.is_none());
         assert!(m.artwork_attempted_at.is_some());
         assert!(store
-            .items_missing_artwork(Some(lib), 3600)
+            .items_missing_artwork(Some(lib), 3600, 100)
             .await
             .expect("backoff")
             .is_empty());
