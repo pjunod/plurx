@@ -26,6 +26,8 @@ jobs:
       web_layout: ${{ steps.scope.outputs.web_layout }}
       release_build: ${{ steps.scope.outputs.release_build }}
       container: ${{ steps.scope.outputs.container }}
+      mobile_version: ${{ steps.scope.outputs.mobile_version }}
+      docs_only: ${{ steps.scope.outputs.docs_only }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -39,8 +41,47 @@ jobs:
           python3 -m validation.ci_scope \
             --event "$EVENT_NAME" --base "$VALIDATION_BASE" >> "$GITHUB_OUTPUT"
 
+  # The failure history says policy mistakes are both common and cheap to
+  # detect. Run them before provisioning Rust, browsers, simulators, emulators,
+  # cross compilers, or Docker builds, and make every expensive fan-out job in
+  # this workflow depend on this result.
+  preflight:
+    name: fast policy and contract preflight
+    needs: scope
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check mobile release hygiene first
+        if: needs.scope.outputs.mobile_version == 'true'
+        env:
+          VALIDATION_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if [ -n "$VALIDATION_BASE" ] \
+            && git cat-file -e "$VALIDATION_BASE^{commit}" 2>/dev/null; then
+            PLURX_VALIDATION_MODE=changed-from \
+              PLURX_VALIDATION_BASE="$VALIDATION_BASE" \
+              python3 -m validation.mobile_versions
+          else
+            python3 -m validation.mobile_versions
+          fi
+      - name: Audit corrective-history evidence
+        run: make history-check
+      - name: Check validation catalog and contract unit tests
+        run: |
+          make validation-lint
+          python3 -m unittest discover -s tests/validation -p 'test_*.py'
+      - name: Check CI, deploy, and shipping contracts
+        run: make operations-check
+      - name: Record the documentation-only lane
+        if: needs.scope.outputs.docs_only == 'true'
+        run: echo "Documentation-only diff; runtime and compiler surfaces are skipped."
+
   check:
     name: functionality points (CI profile)
+    needs: [scope, preflight]
+    if: needs.scope.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -87,7 +128,7 @@ jobs:
 
   web_layout:
     name: web layout and accessibility
-    needs: scope
+    needs: [scope, preflight]
     if: needs.scope.outputs.web_layout == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -107,7 +148,7 @@ jobs:
 
   android_jvm:
     name: Android JVM tests and lint
-    needs: scope
+    needs: [scope, preflight]
     if: needs.scope.outputs.android_jvm == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -119,7 +160,7 @@ jobs:
 
   apple:
     name: Apple iOS + tvOS tests
-    needs: scope
+    needs: [scope, preflight]
     if: needs.scope.outputs.apple == 'true'
     runs-on: macos-15
     steps:
@@ -144,7 +185,7 @@ jobs:
 
   android_device:
     name: Android instrumented UI tests
-    needs: scope
+    needs: [scope, preflight]
     if: needs.scope.outputs.android_device == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -230,7 +271,7 @@ jobs:
   build:
     name: release build (${{ matrix.target }})
     runs-on: ubuntu-latest
-    needs: scope
+    needs: [scope, preflight]
     if: needs.scope.outputs.release_build == 'true'
     strategy:
       fail-fast: false
@@ -322,7 +363,7 @@ jobs:
   docker:
     name: docker runtime smoke
     runs-on: ubuntu-latest
-    needs: scope
+    needs: [scope, preflight]
     if: needs.scope.outputs.container == 'true' && !startsWith(github.ref, 'refs/tags/v')
     steps:
       - uses: actions/checkout@v4
@@ -344,6 +385,7 @@ jobs:
     if: always() && github.event_name == 'pull_request'
     needs:
       - scope
+      - preflight
       - check
       - web_layout
       - android_jvm
@@ -356,6 +398,7 @@ jobs:
       - name: Require every selected job to pass
         env:
           SCOPE_RESULT: ${{ needs.scope.result }}
+          PREFLIGHT_RESULT: ${{ needs.preflight.result }}
           CHECK_RESULT: ${{ needs.check.result }}
           WEB_LAYOUT_RESULT: ${{ needs.web_layout.result }}
           ANDROID_JVM_RESULT: ${{ needs.android_jvm.result }}
@@ -365,7 +408,8 @@ jobs:
           DOCKER_RESULT: ${{ needs.docker.result }}
         run: |
           for result in \
-            "$SCOPE_RESULT" "$CHECK_RESULT" "$WEB_LAYOUT_RESULT" \
+            "$SCOPE_RESULT" "$PREFLIGHT_RESULT" "$CHECK_RESULT" \
+            "$WEB_LAYOUT_RESULT" \
             "$ANDROID_JVM_RESULT" "$APPLE_RESULT" "$ANDROID_DEVICE_RESULT" \
             "$BUILD_RESULT" "$DOCKER_RESULT"; do
             case "$result" in

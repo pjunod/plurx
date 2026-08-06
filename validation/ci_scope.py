@@ -24,6 +24,25 @@ SCOPE_KEYS = (
     "web_layout",
     "release_build",
     "container",
+    "mobile_version",
+    "docs_only",
+)
+
+# Documentation can still be executable evidence: validation unit tests pin
+# inventories and links between docs and source anchors. The regression map is
+# also allowed because it is consumed only by the history audit that remains in
+# preflight; unlike the catalog and selector code, it cannot select or suppress
+# a runtime suite. Keep the required workflow alive for these PRs, but route
+# them through fast contracts rather than compilers and environment suites.
+DOCS_ONLY_PATHS = (
+    "**/*.md",
+    ".github/**/*.md",
+    "docs/**",
+    "LICENSE",
+    "LICENSE.*",
+    "NOTICE",
+    "NOTICE.*",
+    "validation/regressions.toml",
 )
 
 # Device tests prove Android UI, focus, and packaging behavior. Server-only
@@ -68,11 +87,22 @@ CONTAINER_PATHS = (
 def all_scope() -> dict[str, bool]:
     """Fail open when a diff cannot be trusted or the event is not a PR."""
 
-    return {key: True for key in SCOPE_KEYS}
+    scope = {key: True for key in SCOPE_KEYS}
+    scope["docs_only"] = False
+    return scope
+
+
+def is_docs_only(paths: tuple[str, ...]) -> bool:
+    """Return true only when a non-empty diff cannot change shipped code."""
+
+    return bool(paths) and all(matches(path, DOCS_ONLY_PATHS) for path in paths)
 
 
 def scope_for_paths(catalog: Catalog, paths: tuple[str, ...]) -> dict[str, bool]:
     """Map changed paths to independently runnable CI surfaces."""
+
+    if is_docs_only(paths):
+        return {key: key == "docs_only" for key in SCOPE_KEYS}
 
     selection = select_points(catalog, paths)
     check_ids = {
@@ -85,6 +115,8 @@ def scope_for_paths(catalog: Catalog, paths: tuple[str, ...]) -> dict[str, bool]
         "web_layout": "web-layout" in check_ids,
         "release_build": any(matches(path, RELEASE_BUILD_PATHS) for path in paths),
         "container": any(matches(path, CONTAINER_PATHS) for path in paths),
+        "mobile_version": "mobile-version" in check_ids,
+        "docs_only": False,
     }
 
 

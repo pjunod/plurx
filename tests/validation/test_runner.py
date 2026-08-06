@@ -10,7 +10,7 @@ import tempfile
 import unittest
 import xml.etree.ElementTree as ET
 
-from validation.ci_scope import all_scope, scope_for_paths
+from validation.ci_scope import all_scope, is_docs_only, scope_for_paths
 from validation.runner import (
     CatalogError,
     CheckResult,
@@ -133,7 +133,54 @@ class CatalogCase(unittest.TestCase):
         self.assertTrue(server["container"])
         self.assertFalse(server["android_device"])
 
-        self.assertTrue(all(all_scope().values()))
+        fallback = all_scope()
+        executable_scope = (
+            value for key, value in fallback.items() if key != "docs_only"
+        )
+        self.assertTrue(all(executable_scope))
+        self.assertFalse(fallback["docs_only"])
+
+    def test_ci_scope_routes_documentation_only_diffs_to_fast_preflight(self):
+        catalog = load_catalog(ROOT / "validation/points.toml")
+
+        scope = scope_for_paths(
+            catalog,
+            (
+                "docs/OFFLINE-VIEWING-PLAN.md",
+                "docs/OFFLINE-VIEWING-REVIEW.md",
+                "docs/STATUS.html",
+                "validation/regressions.toml",
+            ),
+        )
+
+        self.assertTrue(scope["docs_only"])
+        executable_scope = (
+            value for key, value in scope.items() if key != "docs_only"
+        )
+        self.assertFalse(any(executable_scope))
+        self.assertTrue(is_docs_only((".github/PULL_REQUEST_TEMPLATE.md",)))
+
+    def test_ci_scope_does_not_treat_selector_changes_as_documentation(self):
+        catalog = load_catalog(ROOT / "validation/points.toml")
+
+        scope = scope_for_paths(
+            catalog,
+            ("docs/PLAYBACK.md", "validation/points.toml"),
+        )
+
+        self.assertFalse(scope["docs_only"])
+
+    def test_ci_scope_fails_open_for_mixed_documentation_and_code(self):
+        catalog = load_catalog(ROOT / "validation/points.toml")
+
+        scope = scope_for_paths(
+            catalog,
+            ("docs/PLAYBACK.md", "crates/plurxd/src/http/stream.rs"),
+        )
+
+        self.assertFalse(scope["docs_only"])
+        self.assertTrue(scope["release_build"])
+        self.assertTrue(scope["container"])
 
     def test_profile_keeps_mandatory_baseline_when_slow_check_is_ineligible(self):
         catalog = self.load()

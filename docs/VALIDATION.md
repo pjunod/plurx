@@ -93,12 +93,24 @@ on that platform. A platform mismatch remains a skip because Linux cannot run
 XCTest, regardless of strictness.
 
 CI fetches full Git history and selects from the pull-request base. The
-portable catalog, history, Rust, and focused Linux contracts remain one
-baseline job. Browser layout, Android JVM, Apple simulator, Android device,
+fast policy preflight runs mobile release hygiene first when applicable, then
+the history audit, catalog and validation unit tests, and operations contracts.
+Every expensive fan-out job in the main CI workflow waits for that preflight.
+A documentation-only pull request stops after those executable documentation
+contracts; it does not compile the Rust workspace or provision browsers and
+native-client environments. A documentation change may include
+`validation/regressions.toml` and keep this lane because the file is consumed
+only by the history audit that preflight already runs; selector code and
+`validation/points.toml` still take the executable-change lane.
+
+For executable changes, the portable Rust and focused Linux contracts remain
+one baseline job. Browser layout, Android JVM, Apple simulator, Android device,
 release-build, and container checks run as parallel jobs only when the diff can
 affect their contracts. Coverage runs after merge on `main`, where its badge is
 published; a pull request does not rerun the Rust suite merely to discard the
-number.
+number. [CI_TEST_OVERHAUL_PLAN.md](CI_TEST_OVERHAUL_PLAN.md) records the
+measured failure history and the remaining suite-splitting, invalidation,
+rebase-evidence, and telemetry milestones.
 
 The impact graph selects browser and native unit suites. Explicit path owners
 select the narrower environment checks: Android application and build files
