@@ -213,6 +213,63 @@ final class AppleClientTests: XCTestCase {
     }
 
     @MainActor
+    func testApplePlayerNeverTreatsBufferingOrTransportFailureAsCodecFailure() {
+        XCTAssertFalse(PlayerController.shouldMonitorSilentPlaybackStall(
+            timeControlStatus: .waitingToPlayAtSpecifiedRate
+        ))
+        XCTAssertTrue(PlayerController.shouldMonitorSilentPlaybackStall(
+            timeControlStatus: .playing
+        ))
+
+        let timeout = NSError(
+            domain: NSURLErrorDomain,
+            code: NSURLErrorTimedOut,
+            userInfo: [NSLocalizedDescriptionKey: "The request timed out."]
+        )
+        let transportFailure = NSError(
+            domain: AVFoundationErrorDomain,
+            code: AVError.unknown.rawValue,
+            userInfo: [NSUnderlyingErrorKey: timeout]
+        )
+        XCTAssertFalse(PlayerController.isCompatibilityPlaybackFailure(
+            error: transportFailure,
+            eventDomain: NSURLErrorDomain,
+            eventStatus: NSURLErrorTimedOut,
+            eventComment: "segment request timed out"
+        ))
+        XCTAssertFalse(PlayerController.isCompatibilityPlaybackFailure(
+            error: NSError(
+                domain: AVFoundationErrorDomain,
+                code: AVError.decoderTemporarilyUnavailable.rawValue,
+                userInfo: [:]
+            ),
+            eventDomain: nil,
+            eventStatus: nil,
+            eventComment: "decoder resources are temporarily unavailable"
+        ))
+    }
+
+    @MainActor
+    func testApplePlayerUsesCompatibilityFallbackOnlyForMediaRejection() {
+        let decoderFailure = NSError(
+            domain: "CoreMediaErrorDomain",
+            code: -12910,
+            userInfo: [NSLocalizedDescriptionKey: "video decoder rejected the format"]
+        )
+        let mediaFailure = NSError(
+            domain: AVFoundationErrorDomain,
+            code: AVError.fileFormatNotRecognized.rawValue,
+            userInfo: [NSUnderlyingErrorKey: decoderFailure]
+        )
+        XCTAssertTrue(PlayerController.isCompatibilityPlaybackFailure(
+            error: mediaFailure,
+            eventDomain: "CoreMediaErrorDomain",
+            eventStatus: -12910,
+            eventComment: "Playlist codec is not supported"
+        ))
+    }
+
+    @MainActor
     func testApplePlayerFallsBackFromDolbyVisionToHDRBeforeSDR() {
         XCTAssertTrue(PlayerController.hasCompatibleDolbyVisionBase(
             "Dolby Vision · Profile 8 (HDR10-compatible)"

@@ -291,6 +291,7 @@ class Controller(
                 preservesDolbyVision = plan.preserveDolbyVision,
                 remuxRescueAlreadyUsed = compatibilityRemuxUsed,
                 transcodeRescueAlreadyUsed = compatibilityTranscodeUsed,
+                mediaCompatibilityFailure = isCompatibilityPlaybackError(error.errorCode),
                 deliveredRange = deliveredRange,
                 establishedPlayback = establishedPlayback,
                 sameHdrRetryAlreadyUsed = sameHdrRetryUsed,
@@ -299,6 +300,7 @@ class Controller(
                 "plurx-playback",
                 "file=${plan.fileId} delivery=$deliveryMode preservesDv=" +
                     "${plan.preserveDolbyVision} action=$action caps=$caps " +
+                    "mediaFailure=${isCompatibilityPlaybackError(error.errorCode)} " +
                     "error=${error.errorCodeName}",
                 error,
             )
