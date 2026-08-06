@@ -64,6 +64,7 @@ internal fun playbackErrorAction(
     preservesDolbyVision: Boolean,
     remuxRescueAlreadyUsed: Boolean,
     transcodeRescueAlreadyUsed: Boolean,
+    mediaCompatibilityFailure: Boolean = true,
     deliveredRange: String? = null,
     establishedPlayback: Boolean = false,
     sameHdrRetryAlreadyUsed: Boolean = false,
@@ -73,12 +74,29 @@ internal fun playbackErrorAction(
         !sameHdrRetryAlreadyUsed -> PlaybackErrorAction.RetrySameHDRDelivery
     establishedPlayback && deliveredRange?.lowercase() in
         setOf("dolby_vision", "hdr10", "hlg") -> PlaybackErrorAction.Fail
+    !mediaCompatibilityFailure -> PlaybackErrorAction.Fail
     deliveryMode == "direct" && preservesDolbyVision && !remuxRescueAlreadyUsed ->
         PlaybackErrorAction.RetryAsDolbyVisionRemux
     deliveryMode in setOf("direct", "remux") && !transcodeRescueAlreadyUsed ->
         PlaybackErrorAction.RetryAsCompatibilityTranscode
     else -> PlaybackErrorAction.Fail
 }
+
+/**
+ * Media3 error families are intentionally disjoint: 2xxx is I/O, 3xxx is
+ * parsing, and 4xxx is decoding. Only container rejection and decoder failure
+ * can be repaired by changing the encode. Network, HTTP, timeout, manifest,
+ * and temporary resource errors stay on the current delivery.
+ */
+internal fun isCompatibilityPlaybackError(errorCode: Int): Boolean = errorCode in setOf(
+    3001, // ERROR_CODE_PARSING_CONTAINER_MALFORMED
+    3003, // ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED
+    4001, // ERROR_CODE_DECODER_INIT_FAILED
+    4002, // ERROR_CODE_DECODER_QUERY_FAILED
+    4003, // ERROR_CODE_DECODING_FAILED
+    4004, // ERROR_CODE_DECODING_FORMAT_EXCEEDS_CAPABILITIES
+    4005, // ERROR_CODE_DECODING_FORMAT_UNSUPPORTED
+)
 
 // ---- §5.6 The quality menu is the server's ladder ---------------------------
 

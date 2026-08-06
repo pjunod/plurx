@@ -81,6 +81,30 @@ class PlaybackPolicyTest {
         )
     }
 
+    @Test
+    fun transportAndBufferFailuresNeverSpendTheCompatibilityLadder() {
+        for (errorCode in listOf(1003, 2000, 2001, 2002, 2004, 3002, 3004, 4006)) {
+            assertEquals(false, isCompatibilityPlaybackError(errorCode))
+            assertEquals(
+                PlaybackErrorAction.Fail,
+                playbackErrorAction(
+                    deliveryMode = "remux",
+                    preservesDolbyVision = true,
+                    remuxRescueAlreadyUsed = false,
+                    transcodeRescueAlreadyUsed = false,
+                    mediaCompatibilityFailure = isCompatibilityPlaybackError(errorCode),
+                ),
+            )
+        }
+    }
+
+    @Test
+    fun onlyContainerAndDecoderRejectionMayChangeTheEncode() {
+        for (errorCode in listOf(3001, 3003, 4001, 4002, 4003, 4004, 4005)) {
+            assertEquals(true, isCompatibilityPlaybackError(errorCode))
+        }
+    }
+
     // ---- §5.6 the menu is the server's ladder ------------------------------
 
     @Test

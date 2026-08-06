@@ -301,6 +301,11 @@ final class PlayerController: ObservableObject {
     /// the base for the next relative press until the newest seek lands.
     private var seekState = PlayerSeekState()
     private var stallDetector = PlaybackStallDetector()
+    /// A clock freeze without an AVPlayerItem failure is not proof that the
+    /// decoder rejected the stream. Reconnect the exact delivery once; if the
+    /// replacement freezes too, stop visibly instead of walking the HDR/SDR
+    /// compatibility ladder on a guess.
+    private var silentStallRetryAttempted = false
     /// Evidence that this server understands `native_subtitles`: its create
     /// response handed back a native master query. A server predating the
     /// feature returns the plain playlist URL and advertises no subtitle
@@ -408,6 +413,7 @@ final class PlayerController: ObservableObject {
         forceCompatibilityTranscode = false
         establishedPlayback = false
         establishedHDRRetryAttempted = false
+        silentStallRetryAttempted = false
         attachedAtPositionMs = max(0, startMs)
         clearPlaybackNotice()
 
@@ -1378,12 +1384,13 @@ final class PlayerController: ObservableObject {
         }
     }
 
-    /// AVPlayer normally resumes a short network wait itself. Some tvOS
-    /// builds, however, remain indefinitely in the waiting state with a valid
-    /// item and never produce a hard failure notification. Sample the film
-    /// clock independently of AVPlayer's periodic observer (which stops firing
-    /// when that clock stops), nudge after roughly six seconds, and rebuild the
-    /// item after roughly twelve seconds of genuine no-progress.
+    /// AVPlayer normally resumes a network wait itself. Some tvOS builds can
+    /// instead freeze outside the waiting state with a valid item and no hard
+    /// failure notification. Sample the film clock independently of AVPlayer's
+    /// periodic observer (which stops firing when that clock stops), but leave
+    /// `.waitingToPlayAtSpecifiedRate` alone: buffering is not evidence that a
+    /// codec failed. A genuine silent freeze gets one same-delivery reconnect,
+    /// never an automatic change from HDR to SDR.
     private func startPlaybackRecoveryMonitor() {
         recoveryTask?.cancel()
         recoveryTask = Task { [weak self] in
@@ -1397,6 +1404,9 @@ final class PlayerController: ObservableObject {
                     && !self.isChangingStream
                     && self.seekState.pendingMs == nil
                     && self.player.currentItem != nil
+                    && Self.shouldMonitorSilentPlaybackStall(
+                        timeControlStatus: self.player.timeControlStatus
+                    )
                 let position = self.realPositionMs()
                 let stallAction = self.stallDetector.sample(
                     positionMs: position,
@@ -1412,7 +1422,16 @@ final class PlayerController: ObservableObject {
                 case .reopen:
                     self.currentMs = position
                     if await self.retryEstablishedHDRDelivery(at: position) { continue }
-                    if await self.retryWithNextCompatibilityFallback(at: position) { continue }
+                    guard !self.silentStallRetryAttempted else {
+                        self.player.pause()
+                        self.isPlaying = false
+                        self.wantsPlayback = false
+                        self.failed = true
+                        self.playbackError =
+                            "Playback stopped responding. The current picture was kept instead of switching formats."
+                        continue
+                    }
+                    self.silentStallRetryAttempted = true
                     await self.reopen(at: position)
                 }
             }
@@ -1453,6 +1472,7 @@ final class PlayerController: ObservableObject {
                     self.preferredRate = self.player.rate
                     if self.realPositionMs() >= self.attachedAtPositionMs + 5_000 {
                         self.establishedPlayback = true
+                        self.silentStallRetryAttempted = false
                         // The most recent same-delivery recovery proved itself.
                         // A later, independent interruption may reconnect once
                         // too; an immediate repeated failure remains terminal.
@@ -1516,7 +1536,13 @@ final class PlayerController: ObservableObject {
                     // paused when the item failed stays paused.
                     let position = Self.compatibilityRetryPositionMs(lastObservedMs: self.currentMs)
                     if await self.retryEstablishedHDRDelivery(at: position) { return }
-                    if await self.retryWithNextCompatibilityFallback(at: position) { return }
+                    let event = item.errorLog()?.events.last
+                    if Self.isCompatibilityPlaybackFailure(
+                        error: item.error as NSError?,
+                        eventDomain: event?.errorDomain,
+                        eventStatus: event?.errorStatusCode,
+                        eventComment: event?.errorComment
+                    ), await self.retryWithNextCompatibilityFallback(at: position) { return }
                 }
                 self.player.pause()
                 self.isPlaying = false
@@ -1596,6 +1622,83 @@ final class PlayerController: ObservableObject {
         alreadyAttempted: Bool
     ) -> Bool {
         canRetry && !alreadyAttempted
+    }
+
+    /// AVPlayer owns ordinary buffering and resumes it when enough media has
+    /// arrived. A stopped film clock while the player explicitly reports
+    /// `.waitingToPlayAtSpecifiedRate` therefore cannot be used as decoder
+    /// evidence. This applies equally to iPhone, iPad, and Apple TV.
+    static func shouldMonitorSilentPlaybackStall(
+        timeControlStatus: AVPlayer.TimeControlStatus
+    ) -> Bool {
+        timeControlStatus != .waitingToPlayAtSpecifiedRate
+    }
+
+    /// Only a media/container/decoder rejection may advance the compatibility
+    /// ladder. Timeouts, HTTP failures, and other transport errors must never
+    /// spend the HDR fallbacks merely because they happened before first frame.
+    static func isCompatibilityPlaybackFailure(
+        error: NSError?,
+        eventDomain: String?,
+        eventStatus: Int?,
+        eventComment: String?
+    ) -> Bool {
+        var chain: [NSError] = []
+        var next = error
+        while let current = next, chain.count < 8 {
+            chain.append(current)
+            next = current.userInfo[NSUnderlyingErrorKey] as? NSError
+        }
+
+        let avMediaCodes: Set<AVError.Code> = [
+            .decodeFailed,
+            .invalidSourceMedia,
+            .fileFormatNotRecognized,
+            .fileFailedToParse,
+            .decoderNotFound,
+            .incompatibleAsset,
+            .failedToParse,
+            .undecodableMediaData,
+            .formatUnsupported,
+        ]
+        if chain.contains(where: { candidate in
+            guard candidate.domain == AVFoundationErrorDomain,
+                  let code = AVError.Code(rawValue: candidate.code)
+            else { return false }
+            return avMediaCodes.contains(code)
+        }) {
+            return true
+        }
+
+        // VideoToolbox decoder failures commonly surface as an underlying
+        // CoreMedia/OSStatus error instead of an AVError.Code.
+        let decoderStatusCodes: Set<Int> = [
+            -12906, // kVTCouldNotFindVideoDecoderErr
+            -12909, // kVTVideoDecoderBadDataErr
+            -12910, // kVTVideoDecoderUnsupportedDataFormatErr
+            -12911, // kVTVideoDecoderMalfunctionErr
+            -17694, // kVTVideoDecoderReferenceMissingErr
+        ]
+        if chain.contains(where: { decoderStatusCodes.contains($0.code) })
+            || eventStatus.map(decoderStatusCodes.contains) == true {
+            return true
+        }
+
+        let diagnostic = ([eventDomain, eventComment].compactMap { $0 }
+            + chain.flatMap { [$0.domain, $0.localizedDescription] })
+            .joined(separator: " ")
+            .lowercased()
+        let mediaTerms = [
+            "decoder failed",
+            "decoder rejected",
+            "could not decode",
+            "codec is not supported",
+            "codec not supported",
+            "format is not supported",
+            "format not supported",
+            "undecodable media",
+        ]
+        return mediaTerms.contains(where: diagnostic.contains)
     }
 
     static func nextCompatibilityFallback(
