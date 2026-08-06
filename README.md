@@ -51,7 +51,9 @@ beside monarr,
 what each does, where you watch it, and the command that proves it works.
 Scope and the phased
 plan live in [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) and
-[docs/ROADMAP.md](docs/ROADMAP.md); client strategy in
+[docs/ROADMAP.md](docs/ROADMAP.md), with
+[docs/CLUSTERING-PLAN.md](docs/CLUSTERING-PLAN.md) turning Phase 4 into ordered
+milestones and acceptance checks; client strategy in
 [docs/CLIENTS.md](docs/CLIENTS.md), with
 [docs/APPLE-NATIVE-SUBTITLES-HANDOFF.md](docs/APPLE-NATIVE-SUBTITLES-HANDOFF.md)
 recording what the Apple native-subtitle work shipped, why each choice was

@@ -707,10 +707,13 @@ matching recipe for zero new bytes; unexpected filesystem exhaustion surfaces
 later as `encoder_failed`, so operators must provision the data directory for
 both playback and offline budgets.
 
-The existing playback-cache reader/eviction race remains a separate corrective
-change. Offline package pins do not protect an ordinary active playback reader;
-that follow-up needs its own regression and fix rather than riding invisibly
-inside this milestone.
+The playback-cache reader/eviction race was resolved as a separate corrective
+change on 2026-08-06. A cached HLS session now holds process-local read
+ownership on its recipe, and budget eviction claims that recipe exclusively
+before deleting its row or directory. An active reader is skipped until the
+next sweep; a lookup arriving during eviction becomes an ordinary cache miss.
+Offline package pins remain a different ownership class and are not used as
+evidence that online playback is safe.
 
 ### 7.4 Offline HLS is a separate presentation wrapper
 
@@ -1207,10 +1210,11 @@ Land reviewable slices:
   preemption, durable restart, and active-claim stale-sweep protection.
 - **M2c:** separate offline budget, per-user quota, pins, activity, ETA, and
   metric plumbing.
-- **Separate cache-reader follow-up:** the pre-existing playback-reader/LRU race
-  is not introduced or fixed by offline viewing. Keep its regression and fix
-  focused; do not count offline recipe pins as evidence that active playback
-  readers are protected.
+- **Separate cache-reader follow-up — complete 2026-08-06:** the focused
+  regression proves a zero-budget sweep skips a VOD recipe while its cached
+  session is active, then reclaims the same row and directory after the
+  session ends. Offline recipe pins remain separate from active-reader
+  ownership.
 
 **Acceptance:** prepare the synthetic HEVC/HDR + TrueHD case as 720p
 H.264/AAC/SDR while a recommended PGS selection safely becomes Off; prepare an
@@ -1290,12 +1294,13 @@ Do not chase a repository-wide line-coverage percentage. The coverage target is
 decisions, and destructive cleanup branches; framework delegate plumbing earns
 one restoration integration test rather than mocks of every callback.
 
-The current suite has three release-gate gaps: it has no durable native
-download-task harness, no cache-only player assertion that fails on any
-upstream access, and no server test where cache eviction races an active VOD
-reader. The reader race predates this feature and remains a separate focused
-follow-up; the two device behaviors remain physical acceptance work rather
-than reasons to reopen the merged implementation.
+The current suite has two release-gate gaps: it has no durable native
+download-task harness and no cache-only player assertion that fails on any
+upstream access. The former server gap is closed by
+`active_cache_playback_is_not_evicted_under_its_reader`, which holds a cached
+VOD session through a zero-budget sweep and proves the entry is reclaimed only
+after the session ends. The two device behaviors remain physical acceptance
+work rather than reasons to reopen the merged implementation.
 
 ### 15.1 Server unit and integration coverage
 

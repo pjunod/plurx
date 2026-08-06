@@ -989,6 +989,10 @@ struct Session {
     /// the way out, which is what every other session does, would destroy the
     /// cache one playback at a time.
     cached: bool,
+    /// Process-local read ownership for a finished cache entry. Kept for the
+    /// session's full lifetime so the budget sweep cannot remove its playlist
+    /// or segments while an HTTP response can still reach them.
+    _cache_reader: Option<crate::cachekeep::CacheReadGuard>,
     last_access: Mutex<Instant>,
     // -- metadata for the activity page --
     file_id: i64,
@@ -1966,6 +1970,9 @@ pub struct TranscodeManager {
     /// node with no cache root simply always misses, and every path below is
     /// written so that a miss is the ordinary case.
     cache: Option<CacheConfig>,
+    /// Shared with cache housekeeping. A row can say bytes exist, but only
+    /// this registry can say an HTTP session on this node is using them now.
+    cache_readers: crate::cachekeep::ActiveCacheReaders,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     /// Creation requests by `request_id` — reserved *before* work starts, so
     /// two concurrent creates with the same id cannot both pass the check and
@@ -2039,6 +2046,7 @@ impl TranscodeManager {
             pipeline,
             admissions: Admissions::new(),
             cache: None,
+            cache_readers: crate::cachekeep::ActiveCacheReaders::default(),
             sessions: Mutex::new(HashMap::new()),
             requests: std::sync::Mutex::new(HashMap::new()),
             producer: ProducerTuning::default(),
@@ -2086,6 +2094,10 @@ impl TranscodeManager {
             node_id,
         });
         self
+    }
+
+    pub fn cache_readers(&self) -> &crate::cachekeep::ActiveCacheReaders {
+        &self.cache_readers
     }
 
     /// Override [`ProducerTuning`]. Tests only — there is deliberately no
@@ -2326,6 +2338,15 @@ impl TranscodeManager {
         }
         .hash();
 
+        // Claim before looking at either the row or the filesystem. An
+        // eviction already in progress turns this into an ordinary miss; a
+        // successful lookup carries the guard in the Session until every
+        // response using that session is gone.
+        let Some(cache_reader) = self.cache_readers.begin_read(&hash) else {
+            tracing::debug!(recipe = %hash, file = file.id, "cache entry is being evicted");
+            return None;
+        };
+
         let hit = match self.store.cache_hit(&hash, &cache.node_id).await {
             Ok(Some(hit)) => hit,
             other => {
@@ -2361,6 +2382,7 @@ impl TranscodeManager {
             dir,
             child: Mutex::new(None),
             cached: true,
+            _cache_reader: Some(cache_reader),
             last_access: Mutex::new(Instant::now()),
             file_id: file.id,
             item_id: file.item_id,
@@ -3602,6 +3624,7 @@ impl TranscodeManager {
             dir: dir.clone(),
             child: Mutex::new(Some(child)),
             cached: false,
+            _cache_reader: None,
             last_access: Mutex::new(Instant::now()),
             file_id,
             item_id: file.item_id,
@@ -4056,6 +4079,7 @@ impl TranscodeManager {
             dir: dir.clone(),
             child: Mutex::new(Some(child)),
             cached: false,
+            _cache_reader: None,
             last_access: Mutex::new(Instant::now()),
             file_id,
             item_id: file.item_id,
@@ -5620,6 +5644,7 @@ mod tests {
             dir,
             child: Mutex::new(Some(child)),
             cached: false,
+            _cache_reader: None,
             last_access: Mutex::new(Instant::now()),
             file_id: 1,
             item_id: 1,
@@ -6303,6 +6328,7 @@ mod tests {
             dir: dir.to_path_buf(),
             child: Mutex::new(child),
             cached,
+            _cache_reader: None,
             last_access: Mutex::new(Instant::now()),
             file_id: 1,
             item_id: 1,
@@ -6702,6 +6728,73 @@ mod tests {
         assert!(
             store.cache_hit(&hash, NODE).await.expect("hit").is_some(),
             "so the next viewer hits it too"
+        );
+    }
+
+    /// Cache housekeeping and serving share one ownership registry. A budget
+    /// change may leave the cache temporarily over its ceiling, but it may
+    /// never remove a VOD playlist or segment while a viewer can still ask for
+    /// it. The next sweep reclaims the entry after that session ends.
+    #[tokio::test]
+    async fn active_cache_playback_is_not_evicted_under_its_reader() {
+        use plurx_core::store::SqliteStore;
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let file_id = seed_file(&store).await;
+        let (mgr, _work, cache) = cached_manager(&store);
+        let file = store.get_file(file_id).await.expect("get").expect("file");
+        let hash = recipe_hash_for(&mgr, &file, 1080).await;
+        let dir = seed_cache_dir(cache.path(), "ef/entry").await;
+        store
+            .claim_cache_entry(&hash, file_id, 1, NODE, "ef/entry")
+            .await
+            .expect("claim");
+        store
+            .complete_cache_entry(&hash, NODE, 1_234)
+            .await
+            .expect("complete");
+        store
+            .put_setting(keys::CACHE_MAX_GB, "0")
+            .await
+            .expect("disable cache");
+
+        let info = mgr
+            .start(file_id, 1080, 0.0, None, None, "paul", "pb-reader")
+            .await
+            .expect("cached start");
+        assert_eq!(info.encoder, "cached");
+
+        let active = crate::cachekeep::sweep_with_readers(
+            &store,
+            cache.path(),
+            NODE,
+            mgr.cache_readers(),
+            0,
+        )
+        .await;
+        assert_eq!((active.evicted, active.protected), (0, 1));
+        assert!(
+            dir.join("index.m3u8").exists(),
+            "the budget sweep removed an active viewer's playlist"
+        );
+        assert!(
+            store.cache_hit(&hash, NODE).await.expect("hit").is_some(),
+            "the active entry's row must stay with its bytes"
+        );
+
+        assert!(mgr.stop_session(&info.session_id, "test").await);
+        let idle = crate::cachekeep::sweep_with_readers(
+            &store,
+            cache.path(),
+            NODE,
+            mgr.cache_readers(),
+            1,
+        )
+        .await;
+        assert_eq!((idle.evicted, idle.protected), (1, 0));
+        assert!(!dir.exists(), "an idle over-budget entry was not reclaimed");
+        assert!(
+            store.cache_hit(&hash, NODE).await.expect("miss").is_none(),
+            "eviction removed the bytes but left a serveable row"
         );
     }
 

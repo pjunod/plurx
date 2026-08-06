@@ -122,6 +122,11 @@ through M3; M4 *is* Phase 4's transcode chapter and waits for its plumbing.
 
 ## Phase 4 — HA for real
 
+The executable handoff is
+[CLUSTERING-PLAN.md](CLUSTERING-PLAN.md): it separates node identity from the
+logical server first, then brings up the one-voter replicated store before
+membership, singleton jobs, session takeover, and failure drills.
+
 - Cluster membership: join tokens, node add/remove, health, single logical server identity
 - Replication classes wired: durable (users/settings/metadata/watch state) + ephemeral (sessions) + leader-scheduled scanner singleton
 - Streaming failover: client node-list + retry (web client first), session takeover per ARCHITECTURE §2.3; VIP/keepalived + k8s patterns documented

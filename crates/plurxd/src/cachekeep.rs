@@ -24,12 +24,101 @@
 //! is a *hit* — a viewer gets a playlist for a directory that no longer exists.
 //! This way the failure is an orphan directory, which step 3 collects.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use plurx_core::domain::CachedTranscode;
 use plurx_core::store::{keys, Store};
-use std::sync::Arc;
+
+/// Process-local ownership for finished cache entries that are being served.
+///
+/// The store records whether bytes exist; it cannot record whether an HTTP
+/// response on this node is reading them right now. Readers claim a recipe
+/// before looking it up and keep that claim for the session's lifetime.
+/// Eviction claims the same recipe exclusively before deleting anything, so
+/// lookup and removal cannot pass each other between the row check and the
+/// filesystem operation.
+#[derive(Clone, Default)]
+pub struct ActiveCacheReaders {
+    states: Arc<Mutex<HashMap<String, CacheActivity>>>,
+}
+
+#[derive(Clone, Copy)]
+enum CacheActivity {
+    Readers(usize),
+    Evicting,
+}
+
+pub struct CacheReadGuard {
+    readers: ActiveCacheReaders,
+    recipe: String,
+}
+
+struct CacheEvictionGuard {
+    readers: ActiveCacheReaders,
+    recipe: String,
+}
+
+impl ActiveCacheReaders {
+    /// Start serving one recipe, unless eviction already owns it.
+    pub fn begin_read(&self, recipe: &str) -> Option<CacheReadGuard> {
+        let mut states = self.states.lock().expect("cache reader mutex");
+        match states.get_mut(recipe) {
+            Some(CacheActivity::Readers(count)) => *count += 1,
+            Some(CacheActivity::Evicting) => return None,
+            None => {
+                states.insert(recipe.to_owned(), CacheActivity::Readers(1));
+            }
+        }
+        Some(CacheReadGuard {
+            readers: self.clone(),
+            recipe: recipe.to_owned(),
+        })
+    }
+
+    /// Claim a recipe for removal. Active readers make eviction skip it; the
+    /// next sweep will retry after their sessions end.
+    fn begin_eviction(&self, recipe: &str) -> Option<CacheEvictionGuard> {
+        let mut states = self.states.lock().expect("cache reader mutex");
+        if states.contains_key(recipe) {
+            return None;
+        }
+        states.insert(recipe.to_owned(), CacheActivity::Evicting);
+        Some(CacheEvictionGuard {
+            readers: self.clone(),
+            recipe: recipe.to_owned(),
+        })
+    }
+}
+
+impl Drop for CacheReadGuard {
+    fn drop(&mut self) {
+        let mut states = self.readers.states.lock().expect("cache reader mutex");
+        let remove = match states.get_mut(&self.recipe) {
+            Some(CacheActivity::Readers(count)) if *count > 1 => {
+                *count -= 1;
+                false
+            }
+            Some(CacheActivity::Readers(_)) => true,
+            Some(CacheActivity::Evicting) | None => {
+                debug_assert!(false, "cache reader ownership changed while held");
+                false
+            }
+        };
+        if remove {
+            states.remove(&self.recipe);
+        }
+    }
+}
+
+impl Drop for CacheEvictionGuard {
+    fn drop(&mut self) {
+        let mut states = self.readers.states.lock().expect("cache reader mutex");
+        let removed = states.remove(&self.recipe);
+        debug_assert!(matches!(removed, Some(CacheActivity::Evicting)));
+    }
+}
 
 /// How old an unfinished claim has to be before it counts as a crash rather
 /// than as work in progress.
@@ -70,6 +159,8 @@ pub struct Swept {
     pub stale: usize,
     /// Complete entries evicted to get under budget.
     pub evicted: usize,
+    /// Complete entries skipped because an active session is reading them.
+    pub protected: usize,
     /// Directories on disk that no row claimed.
     pub orphans: usize,
     pub bytes_freed: i64,
@@ -98,7 +189,13 @@ pub async fn budget_bytes(store: &Arc<dyn Store>) -> Option<i64> {
 /// [`crate::schedule::due_jobs`] takes one: the interesting cases are all about
 /// elapsed time, and a function that reads its own clock can only be tested by
 /// waiting. Here that would mean waiting a day.
-pub async fn sweep(store: &Arc<dyn Store>, root: &Path, node_id: &str, now: i64) -> Swept {
+pub async fn sweep_with_readers(
+    store: &Arc<dyn Store>,
+    root: &Path,
+    node_id: &str,
+    readers: &ActiveCacheReaders,
+    now: i64,
+) -> Swept {
     let mut out = Swept::default();
 
     // 1. Crash leftovers, before the budget: their bytes are on the same disk.
@@ -133,6 +230,10 @@ pub async fn sweep(store: &Arc<dyn Store>, root: &Path, node_id: &str, now: i64)
                     if used <= ceiling {
                         break;
                     }
+                    let Some(_eviction) = readers.begin_eviction(&entry.recipe_hash) else {
+                        out.protected += 1;
+                        continue;
+                    };
                     let bytes = entry.bytes.max(0);
                     if forget(store, root, node_id, &entry).await {
                         out.evicted += 1;
@@ -143,7 +244,14 @@ pub async fn sweep(store: &Arc<dyn Store>, root: &Path, node_id: &str, now: i64)
             }
             Err(e) => tracing::warn!(error = %e, "cache: could not list entries by age"),
         }
-        if used > ceiling {
+        if used > ceiling && out.protected > 0 {
+            tracing::warn!(
+                used,
+                ceiling,
+                protected = out.protected,
+                "cache: active playback keeps cache over budget; retrying on the next sweep"
+            );
+        } else if used > ceiling {
             // Said out loud rather than left to be inferred from a disk that
             // keeps growing. One page of evictions was not enough, which on a
             // 512-entry page means something is wrong with the sizes, not with
@@ -170,6 +278,14 @@ pub async fn sweep(store: &Arc<dyn Store>, root: &Path, node_id: &str, now: i64)
         );
     }
     out
+}
+
+/// Tests that do not model an active HTTP reader use an empty registry. The
+/// production entry points call [`sweep_with_readers`] with the transcode
+/// manager's shared registry, so there is no unprotected production sweep.
+#[cfg(test)]
+async fn sweep(store: &Arc<dyn Store>, root: &Path, node_id: &str, now: i64) -> Swept {
+    sweep_with_readers(store, root, node_id, &ActiveCacheReaders::default(), now).await
 }
 
 /// Delete an entry's bytes, then its row. Returns whether the row went.
