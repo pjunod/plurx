@@ -26,7 +26,7 @@ debt and fails loudly if anyone lets it grow.
 |---|---|---|
 | **G0** baseline harness | done | 7 consecutive self-hosted runs byte-identical |
 | **G1** registry + seam | done | all 18 captures byte-identical, pre vs post |
-| **G2** plex pilot | done (home) | classic still byte-identical with plex present |
+| **G2** catalog pilot | done (home) | classic still byte-identical with catalog present |
 | **G2b** library + detail | done | classic byte-identical through both conversions |
 | **T1** theme catalogue | done | 7 themes × all surfaces ≥4.5:1; `make web-check` green |
 | **box 4** shipped-theme statuses | applied | allowlist shrank 36 → 13 entries |
@@ -77,7 +77,7 @@ Seven files, +3109/−34.
 
 | Path | What it is |
 |---|---|
-| `crates/plurxd/src/web/index.html` | the registry, the seam, plex, 7 themes |
+| `crates/plurxd/src/web/index.html` | the registry, the seam, catalog, 7 themes |
 | `scripts/ui-baseline` | G0's harness (`make ui-baseline`) |
 | `scripts/js-check` | `node --check` on every embedded `<script>` |
 | `scripts/contrast-check` | WCAG contrast over the theme tables |
@@ -93,7 +93,7 @@ same objects. A layout applied after first paint flashes classic chrome and
 then jumps, which is why the resolution has to happen where `applyTheme()`
 happens.
 
-**The consequence, and it bit the plex port during development:** a new
+**The consequence, and it bit the catalog port during development:** a new
 layout MUST have its `{name, surfaces}` stub in the `<head>` object. Without
 it, `applyLayout()` cannot recognise the stored id, `<html>` keeps
 `data-layout="classic"`, and not one of the layout's scoped CSS rules
@@ -123,11 +123,11 @@ be a performance change smuggled in under a refactor, and it would show up
 as a diff in the request log the gate compares. If that sequencing should
 change, it should change in its own commit with its own justification.
 
-### 2.3 plex adds no components
+### 2.3 catalog adds no components
 
 No card, no rail, no grid, no fetch of its own. The difference between
-classic and plex is which shared helpers go in which order and what CSS does
-to them; 136 rules, every one scoped under `[data-layout=plex]`. This is the
+classic and catalog is which shared helpers go in which order and what CSS does
+to them; 136 rules, every one scoped under `[data-layout=catalog]`. This is the
 whole thesis of the layout split and it is worth defending in G4–G6: a
 second card function is how five layouts become five applications.
 
@@ -271,7 +271,7 @@ body builder. That is a real addition to §3.2's contract and it should be
 decided in the plan, not improvised at build time.
 
 **Resolved in plan v4 and built in G2b**, in exactly that shape, with
-per-*region* fallback: plex overrides `shell` only and inherits classic's
+per-*region* fallback: catalog overrides `shell` only and inherits classic's
 `items` and `count`. Scroll survival was measured, not assumed — a batch
 landing with the page at `scrollY 1500` leaves it at 1500 and `#libbody`
 is the same DOM node.
@@ -281,7 +281,7 @@ is the same DOM node.
 §6/G3 budgets **+60–90 KB** of source for the whole layout system.
 One layout plus seven themes already costs **+65.9 KB** (579,122 → 646,630
 bytes, +11.7%). Theater, deck and guide are each at least as structural as
-plex, and deck and guide have their own body builders for every route.
+catalog, and deck and guide have their own body builders for every route.
 
 **Recommendation:** re-baseline the estimate at G3 rather than treating the
 overrun as a failure of the abstraction — but decide deliberately whether a
@@ -319,8 +319,8 @@ The decision record asks for five numbers. Four are already available.
 
 | G3 asks | Measured |
 |---|---|
-| duplicated markup | zero shared components duplicated; plex adds 0 card/rail/grid builders |
-| extra requests | zero — request log identical per route, classic vs plex |
+| duplicated markup | zero shared components duplicated; catalog adds 0 card/rail/grid builders |
+| extra requests | zero — request log identical per route, classic vs catalog |
 | source size delta vs +60–90 KB | +65.9 KB for **one** layout + 7 themes (§3.7) |
 | route regressions caught by `ui-baseline` | harness caught 0 real, 1 false positive (the `--out` path trap, §1) |
 | cost of one shared card fix under both layouts | **not measured** — needs an actual shared-card change to price |
@@ -329,12 +329,12 @@ The decision record asks for five numbers. Four are already available.
 
 Stated plainly so nobody infers more than was built.
 
-- ~~plex converts Home only~~ — **fixed in G2b:** library (region seam) and
+- ~~catalog converts Home only~~ — **fixed in G2b:** library (region seam) and
   item detail (whole-body) are converted, with tabs, the right-edge A–Z
   scrubber, and the backdrop hero. Collections, Categories and List ship
   visibly disabled with a tooltip saying which milestone unblocks each.
 - ~~unwatched flag also flags folders~~ — **fixed:** `card()`/`homeCard()`
-  now emit `k-<kind>` and `unw` classes, so plex asks about watch state
+  now emit `k-<kind>` and `unw` classes, so catalog asks about watch state
   instead of inferring it from absent children. The `:has()` rule and its
   `@supports` caveat are gone.
 - ~~A–Z scroll-spy measures `header.top`~~ — **fixed:** `stickyFloor()` asks
@@ -350,8 +350,8 @@ Stated plainly so nobody infers more than was built.
   document. Re-applied and re-verified. The lesson is cheap and worth
   writing down: never edit a file a background job is swapping, and verify a
   claim against the artifact, not against the note that says you made it.
-- ~~TV shows Settings to admins~~ — **fixed** in plex chrome.
-- ~~`PLEX_NAV` goes stale~~ — **fixed**, and one worse case found while
+- ~~TV shows Settings to admins~~ — **fixed** in catalog chrome.
+- ~~`CATALOG_NAV` goes stale~~ — **fixed**, and one worse case found while
   fixing it: chrome paints before a route fetches, so an item deep-link
   opened in a fresh tab drew an empty sidebar and never heard the answer
   arrive. `libsCached()` now fires the same `libsChanged` hook when it
@@ -413,7 +413,7 @@ scripts/ui-baseline --self-host --out target/ui-baseline
 # then sha256sum both directories and diff the lists
 
 # capture any layout × theme combination
-scripts/ui-baseline --self-host --layout plex --theme amber --appearance light
+scripts/ui-baseline --self-host --layout catalog --theme amber --appearance light
 ```
 
 `scripts/contrast-check --suggest` prints the nearest passing value for

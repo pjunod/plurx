@@ -891,8 +891,8 @@
      rule that earns its keep is the reading measure, because an editorial
      theme whose prose runs the full width of a 1400px column is not one. */
   [data-theme=paper] .overview,[data-theme=paper] .prose{max-width:68ch}
-  /* ============================ plex layout =================================
-     Structure only. Every rule is scoped under [data-layout=plex] so nothing
+  /* ============================ catalog layout =================================
+     Structure only. Every rule is scoped under [data-layout=catalog] so nothing
      here can reach classic — the G2 gate diffs classic's rendered baseline and
      a single unscoped selector fails it.
 
@@ -912,12 +912,12 @@
      ========================================================================= */
 
   /* ---- shell ------------------------------------------------------------ */
-  [data-layout=plex] .px-shell{display:flex;min-height:100dvh;align-items:flex-start}
+  [data-layout=catalog] .px-shell{display:flex;min-height:100dvh;align-items:flex-start}
   /* The sidebar is a fixed column that never scrolls with the page: it is the
      one thing on screen that must stay reachable while a 200-item grid scrolls
      past it. height is 100dvh (not vh) so a phone's collapsing URL bar cannot
      leave the footer chip stranded below the fold. */
-  [data-layout=plex] .px-side{
+  [data-layout=catalog] .px-side{
     flex:0 0 236px;width:236px;align-self:stretch;
     position:sticky;top:0;height:100dvh;
     display:flex;flex-direction:column;
@@ -929,10 +929,10 @@
      pinned foot. The scroller is the MIDDLE band and not the whole aside on
      purpose — `overflow-y:auto` on an element clips its absolutely-positioned
      descendants, and the theme/appearance/account popovers live in the foot. */
-  [data-layout=plex] .px-head{flex:0 0 auto;padding:14px 12px 10px}
-  [data-layout=plex] .px-scroll{flex:1 1 auto;min-height:0;overflow-y:auto;padding:0 8px 8px;
+  [data-layout=catalog] .px-head{flex:0 0 auto;padding:14px 12px 10px}
+  [data-layout=catalog] .px-scroll{flex:1 1 auto;min-height:0;overflow-y:auto;padding:0 8px 8px;
     scrollbar-width:thin;scrollbar-color:color-mix(in srgb,var(--text) 22%,transparent) transparent}
-  [data-layout=plex] .px-foot{flex:0 0 auto;padding:8px 10px 12px;display:flex;flex-direction:column;gap:8px;
+  [data-layout=catalog] .px-foot{flex:0 0 auto;padding:8px 10px 12px;display:flex;flex-direction:column;gap:8px;
     border-top:1px solid var(--line)}
 
   /* main is the shipped `main{max-width:1400px;margin:0 auto}` rule with the
@@ -940,81 +940,81 @@
      against the sidebar that reads as a rendering fault. min-width:0 is load
      bearing — without it a wide rail refuses to shrink and pushes the sidebar
      off screen (flex items default to min-width:auto). */
-  [data-layout=plex] main#main{flex:1 1 auto;min-width:0;max-width:none;margin:0;padding:24px 28px 72px}
+  [data-layout=catalog] main#main{flex:1 1 auto;min-width:0;max-width:none;margin:0;padding:24px 28px 72px}
 
   /* ---- sidebar: wordmark + search --------------------------------------- */
-  [data-layout=plex] .px-brand{display:flex;align-items:center;gap:10px;padding:2px 4px 12px}
-  [data-layout=plex] .px-brand .logo{font-size:21px}
+  [data-layout=catalog] .px-brand{display:flex;align-items:center;gap:10px;padding:2px 4px 12px}
+  [data-layout=catalog] .px-brand .logo{font-size:21px}
   /* .search ships as `max-width:240px`, sized for a header row. In a 236px
      column it has to take the full width or it reads as a broken input. */
-  [data-layout=plex] .px-head .search{max-width:none;width:100%;padding:8px 11px}
+  [data-layout=catalog] .px-head .search{max-width:none;width:100%;padding:8px 11px}
 
   /* ---- sidebar: navigation rows ----------------------------------------- */
-  [data-layout=plex] .px-nav{display:flex;flex-direction:column;gap:1px}
-  [data-layout=plex] .px-nav a{
+  [data-layout=catalog] .px-nav{display:flex;flex-direction:column;gap:1px}
+  [data-layout=catalog] .px-nav a{
     display:flex;align-items:center;gap:11px;padding:8px 10px;
     border-radius:max(0px, calc(var(--radius) - 4px));
     border-left:3px solid transparent;          /* the active marker's gutter, always reserved */
     color:var(--muted);font-weight:500;font-size:14px;line-height:1.3;min-width:0}
-  [data-layout=plex] .px-nav a .px-ico{flex:none;width:17px;height:17px;opacity:.85}
+  [data-layout=catalog] .px-nav a .px-ico{flex:none;width:17px;height:17px;opacity:.85}
   /* Library names are user data and routinely longer than the column. One
      line, clipped, with the count pinned right — a wrapped name pushes the
      count onto its own line and the list stops scanning as a list. */
-  [data-layout=plex] .px-nav a .px-lbl{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  [data-layout=plex] .px-nav a .px-n{flex:none;font:11px var(--font-mono);color:var(--muted);opacity:.8}
-  [data-layout=plex] .px-nav a:hover{background:var(--panel2);color:var(--text)}
+  [data-layout=catalog] .px-nav a .px-lbl{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  [data-layout=catalog] .px-nav a .px-n{flex:none;font:11px var(--font-mono);color:var(--muted);opacity:.8}
+  [data-layout=catalog] .px-nav a:hover{background:var(--panel2);color:var(--text)}
   /* Selection is a tint AND a 3px edge bar AND a weight change. Three signals
      because tint alone disappears under forced colours and for anyone who
      cannot separate the accent from the panel behind it. */
-  [data-layout=plex] .px-nav a.on{
+  [data-layout=catalog] .px-nav a.on{
     background:color-mix(in srgb, var(--accent) 16%, transparent);
     border-left-color:var(--accent);color:var(--text);font-weight:600}
-  [data-layout=plex] .px-nav a.on .px-ico{color:var(--accent);opacity:1}
-  [data-layout=plex] .px-nav a.on .px-n{color:var(--text);opacity:.9}
-  [data-layout=plex] .px-sec{
+  [data-layout=catalog] .px-nav a.on .px-ico{color:var(--accent);opacity:1}
+  [data-layout=catalog] .px-nav a.on .px-n{color:var(--text);opacity:.9}
+  [data-layout=catalog] .px-sec{
     font:600 10px/1 var(--font-mono);letter-spacing:.16em;text-transform:uppercase;
     color:var(--muted);opacity:.75;padding:16px 13px 6px}
   /* The library block is filled asynchronously and is genuinely empty until
      then (and permanently empty for a server with no libraries). :empty keeps
      a "LIBRARIES" heading from sitting over nothing — the heading lives inside
      the filled container precisely so it can vanish with its contents. */
-  [data-layout=plex] #pxlibs:empty{display:none}
+  [data-layout=catalog] #pxlibs:empty{display:none}
 
   /* ---- sidebar: footer (scan status, controls, account) ------------------ */
   /* pollActivity() writes this pill and sets display:flex inline when the
      server is busy; here it only has to survive a 212px-wide column, so it
      wraps its text instead of forcing the sidebar to scroll sideways. */
-  [data-layout=plex] .px-foot .activity{white-space:normal;line-height:1.35;border-radius:10px;padding:6px 10px}
-  [data-layout=plex] .px-ctl{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
-  [data-layout=plex] .px-pop{position:relative}
+  [data-layout=catalog] .px-foot .activity{white-space:normal;line-height:1.35;border-radius:10px;padding:6px 10px}
+  [data-layout=catalog] .px-ctl{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+  [data-layout=catalog] .px-pop{position:relative}
   /* The popovers ship anchored below their button (`top:38px`). In a footer
      that is off the bottom of the screen, so they open upward and left-align
      to the column. */
-  [data-layout=plex] .px-foot .amenu{top:auto;bottom:calc(100% + 6px);right:auto;left:0;min-width:200px}
-  [data-layout=plex] .px-user{display:flex;align-items:center;gap:8px}
-  [data-layout=plex] .px-user .profile{flex:1 1 auto;min-width:0;justify-content:flex-start;
+  [data-layout=catalog] .px-foot .amenu{top:auto;bottom:calc(100% + 6px);right:auto;left:0;min-width:200px}
+  [data-layout=catalog] .px-user{display:flex;align-items:center;gap:8px}
+  [data-layout=catalog] .px-user .profile{flex:1 1 auto;min-width:0;justify-content:flex-start;
     background:transparent;border-color:transparent}
-  [data-layout=plex] .px-user .profile:hover{background:var(--panel2);border-color:var(--line)}
-  [data-layout=plex] .px-user .pname{max-width:none;flex:1 1 auto;text-align:left}
-  [data-layout=plex] .px-user .pavatar{width:26px;height:26px;font-size:12px}
+  [data-layout=catalog] .px-user .profile:hover{background:var(--panel2);border-color:var(--line)}
+  [data-layout=catalog] .px-user .pname{max-width:none;flex:1 1 auto;text-align:left}
+  [data-layout=catalog] .px-user .pavatar{width:26px;height:26px;font-size:12px}
 
   /* ---- focus: one visible ring on every interactive thing in the shell ---
-     The shipped stylesheet only rings a handful of player controls, so plex
+     The shipped stylesheet only rings a handful of player controls, so catalog
      brings its own. outline (a shape that was not there before) rather than a
      colour swap, because a keyboard user who cannot see the accent still has
      to be able to walk home → library → detail → play. */
-  [data-layout=plex] .px-nav a:focus-visible,
-  [data-layout=plex] .px-tab:focus-visible,
-  [data-layout=plex] .px-seeall:focus-visible,
-  [data-layout=plex] .px-sheetx:focus-visible,
-  [data-layout=plex] .poster:focus-visible,
-  [data-layout=plex] .px-side button:focus-visible,
-  [data-layout=plex] .px-side input:focus-visible{
+  [data-layout=catalog] .px-nav a:focus-visible,
+  [data-layout=catalog] .px-tab:focus-visible,
+  [data-layout=catalog] .px-seeall:focus-visible,
+  [data-layout=catalog] .px-sheetx:focus-visible,
+  [data-layout=catalog] .poster:focus-visible,
+  [data-layout=catalog] .px-side button:focus-visible,
+  [data-layout=catalog] .px-side input:focus-visible{
     outline:2px solid var(--accent);outline-offset:2px;border-radius:8px}
-  [data-layout=plex] .poster:focus-visible{outline-offset:3px;border-color:var(--accent)}
+  [data-layout=catalog] .poster:focus-visible{outline-offset:3px;border-color:var(--accent)}
 
-  /* ---- cards: plex vocabulary over the shipped card() -------------------
-     card() is not forked. Everything below is the same markup wearing plex
+  /* ---- cards: catalog vocabulary over the shipped card() -------------------
+     card() is not forked. Everything below is the same markup wearing catalog
      paint, which is the whole thesis of the layout split: one card component,
      five shells. */
 
@@ -1025,7 +1025,7 @@
      home-video FOLDER has no watch state either and got flagged as unwatched.
      Asking `.unw` costs one class in shared code and answers correctly on
      every browser. */
-  [data-layout=plex] .poster.unw .artbox::after{
+  [data-layout=catalog] .poster.unw .artbox::after{
     content:"";position:absolute;top:0;right:0;width:26px;height:26px;pointer-events:none;
     background:var(--accent);clip-path:polygon(100% 0, 100% 100%, 0 0)}
   /* Hover play circle. Decorative: the whole card has always been the click
@@ -1033,7 +1033,7 @@
      revealed by :focus-visible as well as :hover so a keyboard user gets the
      same announcement, and it is permanently visible (scrim-free) where there
      is no hover at all. */
-  [data-layout=plex] .poster .artbox::before{
+  [data-layout=catalog] .poster .artbox::before{
     content:"▶";position:absolute;inset:0;z-index:1;pointer-events:none;
     display:grid;place-items:center;
     font-size:15px;line-height:44px;text-indent:3px;
@@ -1043,59 +1043,59 @@
       color-mix(in srgb, var(--bg) 42%, transparent);
     opacity:0}
   @media (hover:hover){
-    [data-layout=plex] .poster:hover .artbox::before{opacity:1}
+    [data-layout=catalog] .poster:hover .artbox::before{opacity:1}
   }
-  [data-layout=plex] .poster:focus-visible .artbox::before,
-  [data-layout=plex] .poster:active .artbox::before{opacity:1}
+  [data-layout=catalog] .poster:focus-visible .artbox::before,
+  [data-layout=catalog] .poster:active .artbox::before{opacity:1}
   /* Touch: no hover event will ever arrive, so the affordance is drawn at
      rest — smaller, and without the dark wash that would fight the artwork on
      every card in the grid. */
   @media (hover:none){
-    [data-layout=plex] .poster .artbox::before{
+    [data-layout=catalog] .poster .artbox::before{
       opacity:.6;font-size:11px;
       background:radial-gradient(circle at 50% 50%, var(--accent) 0 13px, transparent 13px)}
   }
-  /* The shipped .poster lift is a transform on every hover; plex keeps it but
-     swaps the border flash for an inset accent outline (Plex's own idiom) so
+  /* The shipped .poster lift is a transform on every hover; catalog keeps it but
+     swaps the border flash for an inset accent outline so
      the card edge does not appear to grow by a pixel. */
-  [data-layout=plex] .poster:hover{border-color:color-mix(in srgb, var(--accent) 60%, var(--line))}
-  [data-layout=plex] .poster .artbox{overflow:hidden;border-radius:max(0px, calc(var(--radius) - 5px)) max(0px, calc(var(--radius) - 5px)) 0 0}
+  [data-layout=catalog] .poster:hover{border-color:color-mix(in srgb, var(--accent) 60%, var(--line))}
+  [data-layout=catalog] .poster .artbox{overflow:hidden;border-radius:max(0px, calc(var(--radius) - 5px)) max(0px, calc(var(--radius) - 5px)) 0 0}
 
   /* ---- home: section headers and hub rows ------------------------------- */
-  /* Plex hub titles are quiet sentence case with the "see all" on the right,
+  /* Catalog hub titles use quiet sentence case with the "see all" on the right,
      not classic's uppercase rules-and-borders. Flex here is compatible with
      .ressection, which already relies on it. */
-  [data-layout=plex] h2.section{
+  [data-layout=catalog] h2.section{
     display:flex;align-items:center;gap:10px;
     font-size:15px;font-weight:650;letter-spacing:0;text-transform:none;
     border-top:0;padding-top:0;margin:24px 2px 12px}
-  [data-layout=plex] h2.section:first-child{margin-top:6px}
-  [data-layout=plex] .px-seeall{
+  [data-layout=catalog] h2.section:first-child{margin-top:6px}
+  [data-layout=catalog] .px-seeall{
     margin-left:auto;display:inline-flex;align-items:center;gap:6px;
     font:500 12px var(--font);letter-spacing:0;text-transform:none;color:var(--muted)}
-  [data-layout=plex] .px-seeall::after{content:"›";font-size:15px;line-height:1}
-  [data-layout=plex] .px-seeall:hover{color:var(--accent)}
+  [data-layout=catalog] .px-seeall::after{content:"›";font-size:15px;line-height:1}
+  [data-layout=catalog] .px-seeall:hover{color:var(--accent)}
   /* The count rides the link rather than the heading: "Movies · See all 210"
      puts the number next to the thing that acts on it. */
-  [data-layout=plex] .px-seeall .px-n{font:11px var(--font-mono);opacity:.85}
-  [data-layout=plex] .libbar{margin-top:26px}
+  [data-layout=catalog] .px-seeall .px-n{font:11px var(--font-mono);opacity:.85}
+  [data-layout=catalog] .libbar{margin-top:26px}
 
-  /* ---- classic bodies rendered inside plex chrome -----------------------
+  /* ---- classic bodies rendered inside catalog chrome -----------------------
      Library, category, search, item, activity and settings are not converted
-     at G2: they emit their shipped markup into plex's #main. The rules below
+     at G2: they emit their shipped markup into catalog's #main. The rules below
      exist only where a shipped rule assumed classic's page box. */
   /* Both bleed to the edge with negative margins sized for classic's
-     `main{padding:22px 20px}`. Under plex's 24/28 they would leave a 8px lip
+     `main{padding:22px 20px}`. Under catalog's 24/28 they would leave a 8px lip
      on one side and overhang on the other. */
-  [data-layout=plex] .hero{margin:-24px -28px 22px}
-  [data-layout=plex] .getapp{margin:0 0 18px}
+  [data-layout=catalog] .hero{margin:-24px -28px 22px}
+  [data-layout=catalog] .getapp{margin:0 0 18px}
   /* The A–Z scrubber is fixed to the viewport edge, which is correct here too;
-     it only needs to clear plex's wider gutter. */
-  [data-layout=plex] .azbar{right:8px}
+     it only needs to clear catalog's wider gutter. */
+  [data-layout=catalog] .azbar{right:8px}
 
   /* ---- bottom tabs (declared for every surface, shown only when narrow) -- */
-  [data-layout=plex] .px-tabs{display:none}
-  [data-layout=plex] .px-sheetx{display:none}
+  [data-layout=catalog] .px-tabs{display:none}
+  [data-layout=catalog] .px-sheetx{display:none}
 
   /* =========================== narrow / phone ==============================
      899px is not a guess: surfaceClass() calls a coarse pointer under 900px
@@ -1106,8 +1106,8 @@
      on row 1, search full width below), so the search box stays in exactly one
      place in the DOM and #q is never duplicated. */
   @media (max-width:899px){
-    [data-layout=plex] .px-shell{display:block}
-    [data-layout=plex] .px-side{
+    [data-layout=catalog] .px-shell{display:block}
+    [data-layout=catalog] .px-side{
       position:sticky;top:0;width:auto;height:auto;flex:none;
       flex-direction:row;flex-wrap:wrap;align-items:center;gap:8px;
       padding:10px 14px;border-right:0;border-bottom:1px solid var(--line);
@@ -1121,54 +1121,54 @@
     /* display:contents dissolves the two band wrappers so their children
        become items of the header row directly — the alternative is a second
        markup path for phones, which is how layouts start forking. */
-    [data-layout=plex] .px-head,[data-layout=plex] .px-foot{display:contents}
-    [data-layout=plex] .px-brand{order:1;padding:0}
-    [data-layout=plex] .px-ctl{order:2;margin-left:auto;gap:6px}
-    [data-layout=plex] .px-user{order:3;flex:none}
-    [data-layout=plex] .px-user .pname{display:none}     /* matches the shipped phone header */
-    [data-layout=plex] .px-head .search{order:4;flex-basis:100%}
-    [data-layout=plex] .px-foot .activity{order:5;flex-basis:100%}
-    [data-layout=plex] .px-foot .amenu{top:calc(100% + 6px);bottom:auto;right:0;left:auto}
+    [data-layout=catalog] .px-head,[data-layout=catalog] .px-foot{display:contents}
+    [data-layout=catalog] .px-brand{order:1;padding:0}
+    [data-layout=catalog] .px-ctl{order:2;margin-left:auto;gap:6px}
+    [data-layout=catalog] .px-user{order:3;flex:none}
+    [data-layout=catalog] .px-user .pname{display:none}     /* matches the shipped phone header */
+    [data-layout=catalog] .px-head .search{order:4;flex-basis:100%}
+    [data-layout=catalog] .px-foot .activity{order:5;flex-basis:100%}
+    [data-layout=catalog] .px-foot .amenu{top:calc(100% + 6px);bottom:auto;right:0;left:auto}
     /* The library list becomes a full-screen sheet behind the Libraries tab.
        Full screen rather than a drawer so there is no "outside" to mis-tap,
        and it closes itself on navigation because routing rebuilds the chrome. */
-    [data-layout=plex] .px-scroll{display:none}
-    [data-layout=plex] .px-shell.px-open .px-scroll{
+    [data-layout=catalog] .px-scroll{display:none}
+    [data-layout=catalog] .px-shell.px-open .px-scroll{
       display:block;position:fixed;inset:0;z-index:40;
       background:var(--bg);padding:14px 14px 90px;overflow-y:auto}
-    [data-layout=plex] .px-shell.px-open .px-sheetx{
+    [data-layout=catalog] .px-shell.px-open .px-sheetx{
       display:inline-flex;align-items:center;justify-content:center;
       position:fixed;top:10px;right:12px;z-index:41;width:38px;height:38px;font-size:17px}
-    [data-layout=plex] main#main{padding:16px 14px 96px}
-    [data-layout=plex] .hero{margin:-16px -14px 18px}
+    [data-layout=catalog] main#main{padding:16px 14px 96px}
+    [data-layout=catalog] .hero{margin:-16px -14px 18px}
     /* Bottom tabs. Fixed, safe-area aware — an iPhone home indicator otherwise
        sits on top of the Activity tab. */
-    [data-layout=plex] .px-tabs{
+    [data-layout=catalog] .px-tabs{
       display:flex;position:fixed;left:0;right:0;bottom:0;z-index:45;
       background:color-mix(in srgb, var(--panel) 92%, var(--bg));
       border-top:1px solid var(--line);
       padding-bottom:env(safe-area-inset-bottom,0px)}
-    [data-layout=plex] .px-tab{
+    [data-layout=catalog] .px-tab{
       flex:1 1 0;min-width:0;display:flex;flex-direction:column;align-items:center;gap:3px;
       padding:8px 4px 7px;border:0;background:transparent;
       color:var(--muted);font:500 10.5px/1.2 var(--font);
       border-top:2px solid transparent;margin-top:-1px}
-    [data-layout=plex] .px-tab .px-ico{width:20px;height:20px}
+    [data-layout=catalog] .px-tab .px-ico{width:20px;height:20px}
     /* Same rule as the sidebar: tint plus an edge plus weight, never colour
        alone. */
-    [data-layout=plex] .px-tab.on{color:var(--text);font-weight:700;border-top-color:var(--accent);
+    [data-layout=catalog] .px-tab.on{color:var(--text);font-weight:700;border-top-color:var(--accent);
       background:color-mix(in srgb, var(--accent) 12%, transparent)}
-    [data-layout=plex] .px-tab.on .px-ico{color:var(--accent)}
+    [data-layout=catalog] .px-tab.on .px-ico{color:var(--accent)}
     /* pollActivity() toggles html.working when the server is busy. A dot on
        the Activity tab carries that fact to a phone, where the status pill has
        been pushed off the header by the search box. */
-    [data-layout=plex] .px-tabs .px-tab[data-tab=activity]{position:relative}
+    [data-layout=catalog] .px-tabs .px-tab[data-tab=activity]{position:relative}
     /* Both attributes live on <html>, so this is one compound selector, not a
        descendant pair — the usual mistake here renders nothing at all. */
-    html.working[data-layout=plex] .px-tabs .px-tab[data-tab=activity]::after{
+    html.working[data-layout=catalog] .px-tabs .px-tab[data-tab=activity]::after{
       content:"";position:absolute;top:7px;right:calc(50% - 15px);
       width:7px;height:7px;border-radius:50%;background:var(--accent)}
-    [data-layout=plex] .azbar{right:2px}
+    [data-layout=catalog] .azbar{right:2px}
   }
 
   /* ============================== television ===============================
@@ -1181,38 +1181,38 @@
      while collapsed, clipped rather than display:none, so a screen reader and
      the focus order still see them. */
   @media (pointer:none), (hover:none) and (pointer:coarse) and (min-width:1280px){
-    [data-layout=plex] .px-side{position:fixed;left:0;top:0;bottom:0;height:100dvh;width:76px;flex-basis:76px}
-    [data-layout=plex] main#main{margin-left:76px;padding:30px 40px 90px;font-size:16px}
-    [data-layout=plex] .px-side .px-lbl,
-    [data-layout=plex] .px-side .px-n,
-    [data-layout=plex] .px-side .px-sec,
-    [data-layout=plex] .px-side .pname,
-    [data-layout=plex] .px-side .activity,
-    [data-layout=plex] .px-head .search{
+    [data-layout=catalog] .px-side{position:fixed;left:0;top:0;bottom:0;height:100dvh;width:76px;flex-basis:76px}
+    [data-layout=catalog] main#main{margin-left:76px;padding:30px 40px 90px;font-size:16px}
+    [data-layout=catalog] .px-side .px-lbl,
+    [data-layout=catalog] .px-side .px-n,
+    [data-layout=catalog] .px-side .px-sec,
+    [data-layout=catalog] .px-side .pname,
+    [data-layout=catalog] .px-side .activity,
+    [data-layout=catalog] .px-head .search{
       opacity:0;width:0;height:0;overflow:hidden;padding:0;margin:0;border:0;flex-basis:0}
-    [data-layout=plex] .px-brand .logo{font-size:0}
-    [data-layout=plex] .px-brand .logo::first-letter{font-size:24px}
-    [data-layout=plex] .px-nav a{justify-content:center;gap:0}
-    [data-layout=plex] .px-side:hover,[data-layout=plex] .px-side:focus-within{
+    [data-layout=catalog] .px-brand .logo{font-size:0}
+    [data-layout=catalog] .px-brand .logo::first-letter{font-size:24px}
+    [data-layout=catalog] .px-nav a{justify-content:center;gap:0}
+    [data-layout=catalog] .px-side:hover,[data-layout=catalog] .px-side:focus-within{
       width:264px;flex-basis:264px;box-shadow:0 0 40px color-mix(in srgb, var(--bg) 70%, transparent)}
-    [data-layout=plex] .px-side:hover .px-lbl,[data-layout=plex] .px-side:focus-within .px-lbl,
-    [data-layout=plex] .px-side:hover .px-n,[data-layout=plex] .px-side:focus-within .px-n,
-    [data-layout=plex] .px-side:hover .px-sec,[data-layout=plex] .px-side:focus-within .px-sec,
-    [data-layout=plex] .px-side:hover .pname,[data-layout=plex] .px-side:focus-within .pname,
-    [data-layout=plex] .px-side:hover .activity,[data-layout=plex] .px-side:focus-within .activity,
-    [data-layout=plex] .px-side:hover .search,[data-layout=plex] .px-side:focus-within .search{
+    [data-layout=catalog] .px-side:hover .px-lbl,[data-layout=catalog] .px-side:focus-within .px-lbl,
+    [data-layout=catalog] .px-side:hover .px-n,[data-layout=catalog] .px-side:focus-within .px-n,
+    [data-layout=catalog] .px-side:hover .px-sec,[data-layout=catalog] .px-side:focus-within .px-sec,
+    [data-layout=catalog] .px-side:hover .pname,[data-layout=catalog] .px-side:focus-within .pname,
+    [data-layout=catalog] .px-side:hover .activity,[data-layout=catalog] .px-side:focus-within .activity,
+    [data-layout=catalog] .px-side:hover .search,[data-layout=catalog] .px-side:focus-within .search{
       opacity:1;width:auto;height:auto;flex-basis:auto;overflow:visible}
-    [data-layout=plex] .px-side:hover .px-sec,[data-layout=plex] .px-side:focus-within .px-sec{padding:16px 13px 6px}
-    [data-layout=plex] .px-side:hover .search,[data-layout=plex] .px-side:focus-within .search{padding:8px 11px;border-width:1px}
-    [data-layout=plex] .px-side:hover .activity,[data-layout=plex] .px-side:focus-within .activity{padding:6px 10px}
-    [data-layout=plex] .px-side:hover .px-nav a,[data-layout=plex] .px-side:focus-within .px-nav a{justify-content:flex-start;gap:11px}
-    [data-layout=plex] .px-side:hover .px-brand .logo,[data-layout=plex] .px-side:focus-within .px-brand .logo{font-size:21px}
+    [data-layout=catalog] .px-side:hover .px-sec,[data-layout=catalog] .px-side:focus-within .px-sec{padding:16px 13px 6px}
+    [data-layout=catalog] .px-side:hover .search,[data-layout=catalog] .px-side:focus-within .search{padding:8px 11px;border-width:1px}
+    [data-layout=catalog] .px-side:hover .activity,[data-layout=catalog] .px-side:focus-within .activity{padding:6px 10px}
+    [data-layout=catalog] .px-side:hover .px-nav a,[data-layout=catalog] .px-side:focus-within .px-nav a{justify-content:flex-start;gap:11px}
+    [data-layout=catalog] .px-side:hover .px-brand .logo,[data-layout=catalog] .px-side:focus-within .px-brand .logo{font-size:21px}
     /* …and put the initial back to the size of the rest of the wordmark, or an
        expanded rail spells the product name with an oversized first letter. */
-    [data-layout=plex] .px-side:hover .px-brand .logo::first-letter,
-    [data-layout=plex] .px-side:focus-within .px-brand .logo::first-letter{font-size:inherit}
+    [data-layout=catalog] .px-side:hover .px-brand .logo::first-letter,
+    [data-layout=catalog] .px-side:focus-within .px-brand .logo::first-letter{font-size:inherit}
     /* 10-foot focus: a 2px hairline is invisible from a sofa. */
-    [data-layout=plex] .px-nav a:focus-visible,[data-layout=plex] .poster:focus-visible{outline-width:4px;outline-offset:4px}
+    [data-layout=catalog] .px-nav a:focus-visible,[data-layout=catalog] .poster:focus-visible{outline-width:4px;outline-offset:4px}
   }
 
   /* ============================ reduced motion =============================
@@ -1222,17 +1222,17 @@
      just does not slide), the hover lift still marks the card under the
      pointer (via the border tint, which is not animated). */
   @media (prefers-reduced-motion: no-preference){
-    [data-layout=plex] .poster .artbox::before{transition:opacity .14s ease-out}
-    [data-layout=plex] .px-nav a{transition:background-color .12s ease-out, color .12s ease-out}
-    [data-layout=plex] .px-side{transition:width .16s ease-out, flex-basis .16s ease-out}
-    [data-layout=plex] .px-seeall{transition:color .12s ease-out}
+    [data-layout=catalog] .poster .artbox::before{transition:opacity .14s ease-out}
+    [data-layout=catalog] .px-nav a{transition:background-color .12s ease-out, color .12s ease-out}
+    [data-layout=catalog] .px-side{transition:width .16s ease-out, flex-basis .16s ease-out}
+    [data-layout=catalog] .px-seeall{transition:color .12s ease-out}
   }
-  /* The shipped .poster rule animates transform unconditionally; plex cannot
+  /* The shipped .poster rule animates transform unconditionally; catalog cannot
      edit it, so it opts out here for anyone who asked for less motion. The
      hover state stays legible because the border tint above does not move. */
   @media (prefers-reduced-motion: reduce){
-    [data-layout=plex] .poster{transition:none}
-    [data-layout=plex] .poster:hover{transform:none}
+    [data-layout=catalog] .poster{transition:none}
+    [data-layout=catalog] .poster:hover{transform:none}
   }
 
   /* ============================ forced colours =============================
@@ -1242,57 +1242,57 @@
      keywords are the sanctioned way to put them back, so each one is restated
      against Highlight / CanvasText here. */
   @media (forced-colors: active){
-    [data-layout=plex] .px-side{border-right:1px solid CanvasText}
+    [data-layout=catalog] .px-side{border-right:1px solid CanvasText}
     /* The idle rows reserve their marker with a transparent left border, and
        forced colours repaints EVERY border in the element's forced colour —
        so without this each row grows a LinkText bar and the selected row stops
        being the one with a bar. Canvas paints the gutter as background. */
-    [data-layout=plex] .px-nav a{border-left-color:Canvas}
+    [data-layout=catalog] .px-nav a{border-left-color:Canvas}
     /* forced-color-adjust:none on the selected row is not an opt-out of forced
        colours — every colour it then uses is a system keyword. It is there to
        stop Chromium painting its text "backplate" (a Canvas-coloured rectangle
        it puts behind text sitting on an author background) which lands black
        ink on a black plate on top of Highlight and erases the label of the one
        row the user is on. */
-    [data-layout=plex] .px-nav a.on,
-    [data-layout=plex] .px-tab.on{forced-color-adjust:none}
-    [data-layout=plex] .px-nav a.on{background:Highlight;color:HighlightText;border-left-color:Highlight}
-    [data-layout=plex] .px-nav a.on .px-ico,
-    [data-layout=plex] .px-nav a.on .px-n{color:HighlightText}
-    [data-layout=plex] .px-tab.on{background:Highlight;color:HighlightText;border-top-color:Highlight}
-    [data-layout=plex] .px-tab.on .px-ico{color:HighlightText}
-    [data-layout=plex] .px-nav a:focus-visible,
-    [data-layout=plex] .px-tab:focus-visible,
-    [data-layout=plex] .px-seeall:focus-visible,
-    [data-layout=plex] .px-sheetx:focus-visible,
-    [data-layout=plex] .poster:focus-visible,
-    [data-layout=plex] .px-side button:focus-visible,
-    [data-layout=plex] .px-side input:focus-visible{outline:3px solid Highlight;outline-offset:2px}
+    [data-layout=catalog] .px-nav a.on,
+    [data-layout=catalog] .px-tab.on{forced-color-adjust:none}
+    [data-layout=catalog] .px-nav a.on{background:Highlight;color:HighlightText;border-left-color:Highlight}
+    [data-layout=catalog] .px-nav a.on .px-ico,
+    [data-layout=catalog] .px-nav a.on .px-n{color:HighlightText}
+    [data-layout=catalog] .px-tab.on{background:Highlight;color:HighlightText;border-top-color:Highlight}
+    [data-layout=catalog] .px-tab.on .px-ico{color:HighlightText}
+    [data-layout=catalog] .px-nav a:focus-visible,
+    [data-layout=catalog] .px-tab:focus-visible,
+    [data-layout=catalog] .px-seeall:focus-visible,
+    [data-layout=catalog] .px-sheetx:focus-visible,
+    [data-layout=catalog] .poster:focus-visible,
+    [data-layout=catalog] .px-side button:focus-visible,
+    [data-layout=catalog] .px-side input:focus-visible{outline:3px solid Highlight;outline-offset:2px}
     /* The flag is a clip-path so the shape survives; only its fill needs
        restating. forced-color-adjust:none keeps the UA from flattening it back
        to Canvas, which would leave an invisible triangle. The :not() chain is
        repeated verbatim rather than simplified: the rule that paints the flag
        carries four class selectors of specificity, and a shorter selector here
        loses to it and leaves the triangle in the theme accent. */
-    [data-layout=plex] .poster.unw .artbox::after{
+    [data-layout=catalog] .poster.unw .artbox::after{
       background:Highlight;forced-color-adjust:none}
     /* Progress is a 5px bar whose fill and track both collapse to the same
        system colour otherwise — i.e. "how far in am I" disappears entirely. */
-    [data-layout=plex] .poster .prog{background:Canvas;border:1px solid CanvasText;forced-color-adjust:none}
-    [data-layout=plex] .poster .prog>i{background:Highlight;box-shadow:none;forced-color-adjust:none}
+    [data-layout=catalog] .poster .prog{background:Canvas;border:1px solid CanvasText;forced-color-adjust:none}
+    [data-layout=catalog] .poster .prog>i{background:Highlight;box-shadow:none;forced-color-adjust:none}
     /* The play circle is drawn with a radial gradient, which forced colours
        does not repaint — it would render as a grey blob over the art. Drop the
        fill and keep the glyph, which is text and is repainted correctly. */
-    [data-layout=plex] .poster .artbox::before{background:none;color:CanvasText}
-    [data-layout=plex] .px-tabs{border-top:1px solid CanvasText}
-    [data-layout=plex] .px-foot{border-top:1px solid CanvasText}
+    [data-layout=catalog] .poster .artbox::before{background:none;color:CanvasText}
+    [data-layout=catalog] .px-tabs{border-top:1px solid CanvasText}
+    [data-layout=catalog] .px-foot{border-top:1px solid CanvasText}
   }
-  /* ====================== plex layout — G2b additions =======================
-     Appended to the existing plex block. Nothing here restates a G2 rule; the
+  /* ====================== catalog layout — G2b additions =======================
+     Appended to the existing catalog block. Nothing here restates a G2 rule; the
      G2 rules this file depends on being ABOVE it are:
-       [data-layout=plex] .hero{margin:-24px -28px 22px}   (and the narrow one)
-       [data-layout=plex] h2.section{...}                  (flex, sentence case)
-       [data-layout=plex] .azbar{right:8px}
+       [data-layout=catalog] .hero{margin:-24px -28px 22px}   (and the narrow one)
+       [data-layout=catalog] h2.section{...}                  (flex, sentence case)
+       [data-layout=catalog] .azbar{right:8px}
        the focus-ring list, the reduced-motion block, the forced-colours block
      Same rules as before, same reasons:
        - structural colour is a token mix over --panel/--bg/--accent/--line,
@@ -1301,38 +1301,38 @@
          tide) and one hardcoded dark hex is a black box on five of them.
        - every transition is inside prefers-reduced-motion:no-preference, and
          nothing is only legible while it moves.
-       - every selector is scoped under [data-layout=plex].
+       - every selector is scoped under [data-layout=catalog].
      ========================================================================= */
 
   /* Screen-reader-only text. Used by the disabled tabs/toggle so the reason
      they are dead is not a mouse-only tooltip. */
-  [data-layout=plex] .px-sr{
+  [data-layout=catalog] .px-sr{
     position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;
     clip:rect(0 0 0 0);clip-path:inset(50%);white-space:nowrap;border:0}
 
   /* ---- library: Library / Collections / Categories ----------------------- */
-  [data-layout=plex] .px-ltabs{
+  [data-layout=catalog] .px-ltabs{
     display:flex;align-items:flex-end;gap:4px;margin:2px 2px 14px;
     border-bottom:1px solid var(--line);flex-wrap:wrap}
-  [data-layout=plex] .px-ltab{
+  [data-layout=catalog] .px-ltab{
     display:inline-flex;align-items:center;gap:7px;
     padding:8px 12px 9px;margin-bottom:-1px;
     font:600 13.5px/1.2 var(--font);color:var(--muted);
     border-bottom:2px solid transparent}
-  [data-layout=plex] a.px-ltab:hover{color:var(--text)}
+  [data-layout=catalog] a.px-ltab:hover{color:var(--text)}
   /* Selected: an underline AND a weight AND a colour. Three signals, because
      the underline is the only one that survives forced colours and the only
      one that reads for someone who cannot separate accent from muted. */
-  [data-layout=plex] .px-ltab.on{
+  [data-layout=catalog] .px-ltab.on{
     color:var(--text);font-weight:700;border-bottom-color:var(--accent)}
   /* Not ready. Grey is the least of it: the cursor says no, the "soon" chip
      says why in one word, title= and .px-sr say why in a sentence, and the
      element is a <span> so there is nothing to press or tab to. */
-  [data-layout=plex] .px-ltab.off,
-  [data-layout=plex] .px-vt.off{
+  [data-layout=catalog] .px-ltab.off,
+  [data-layout=catalog] .px-vt.off{
     color:color-mix(in srgb, var(--muted) 62%, transparent);
     cursor:not-allowed;user-select:none}
-  [data-layout=plex] .px-soon{
+  [data-layout=catalog] .px-soon{
     font:700 9px/1 var(--font-mono);letter-spacing:.1em;text-transform:uppercase;
     padding:3px 5px;border-radius:999px;
     color:var(--muted);
@@ -1340,27 +1340,27 @@
     border:1px dashed color-mix(in srgb, var(--muted) 45%, transparent)}
 
   /* ---- library: toolbar -------------------------------------------------- */
-  /* The shipped .libbar is a space-between row; plex keeps that and only
+  /* The shipped .libbar is a space-between row; catalog keeps that and only
      tightens it against the tab strip above, which now carries the page
      identity the bar used to have to. */
-  [data-layout=plex] .px-libbar{margin-top:0}
-  [data-layout=plex] .px-libbar .row{gap:8px;flex-wrap:wrap;align-items:center}
-  [data-layout=plex] .px-libbar #libcount{white-space:nowrap}
+  [data-layout=catalog] .px-libbar{margin-top:0}
+  [data-layout=catalog] .px-libbar .row{gap:8px;flex-wrap:wrap;align-items:center}
+  [data-layout=catalog] .px-libbar #libcount{white-space:nowrap}
   /* Grid / List. A segmented control in shape, but only one segment is a
      state and the other is disabled — see .px-ltab.off above. */
-  [data-layout=plex] .px-view{
+  [data-layout=catalog] .px-view{
     display:inline-flex;align-items:center;gap:2px;margin-right:6px;
     padding:2px;border:1px solid var(--line);
     border-radius:max(0px, calc(var(--radius) - 4px));
     background:color-mix(in srgb, var(--panel2) 55%, transparent)}
-  [data-layout=plex] .px-vt{
+  [data-layout=catalog] .px-vt{
     display:inline-flex;align-items:center;gap:6px;padding:5px 10px;
     font:600 12.5px/1 var(--font);color:var(--muted);
     border-radius:max(0px, calc(var(--radius) - 6px))}
-  [data-layout=plex] .px-vt.on{
+  [data-layout=catalog] .px-vt.on{
     color:var(--text);background:var(--panel);
     box-shadow:0 1px 2px color-mix(in srgb, var(--bg) 55%, transparent)}
-  [data-layout=plex] .px-vt .px-soon{font-size:8.5px;padding:2px 4px}
+  [data-layout=catalog] .px-vt .px-soon{font-size:8.5px;padding:2px 4px}
 
   /* ---- library: the grid row and the A–Z scrubber ------------------------
      #libbody and #librail are siblings the SHELL owns. The loader only ever
@@ -1369,21 +1369,21 @@
      window is, exactly as in classic, which is what keeps the shipped
      scroll-spy (one window listener) and alphaJump()'s scrollIntoView working
      and keeps the pager reachable. */
-  [data-layout=plex] .px-libwrap{display:block}
-  [data-layout=plex] .px-libwrap>#libbody{min-width:0}
+  [data-layout=catalog] .px-libwrap{display:block}
+  [data-layout=catalog] .px-libwrap>#libbody{min-width:0}
   /* An empty rail is a real state (a non-title sort, or a library whose titles
      all start with the same letter) and an empty flex item still eats the gap. */
-  [data-layout=plex] .px-librail:empty{display:none}
+  [data-layout=catalog] .px-librail:empty{display:none}
   @media (min-width:900px){
-    [data-layout=plex] .px-libwrap{display:flex;align-items:flex-start;gap:12px}
-    [data-layout=plex] .px-libwrap>#libbody{flex:1 1 auto}
+    [data-layout=catalog] .px-libwrap{display:flex;align-items:flex-start;gap:12px}
+    [data-layout=catalog] .px-libwrap>#libbody{flex:1 1 auto}
     /* The rail moves out of the viewport gutter and onto the right edge of the
-       CONTENT — plex's own idiom, and it stops the scrubber from floating over
+       CONTENT — catalog's own idiom, and it stops the scrubber from floating over
        the pager and the page footer on a short library. Sticky rather than
        fixed so it rides with the grid it describes. */
-    [data-layout=plex] .px-librail{
+    [data-layout=catalog] .px-librail{
       flex:0 0 auto;position:sticky;top:14px;z-index:15}
-    [data-layout=plex] .px-librail .azbar{
+    [data-layout=catalog] .px-librail .azbar{
       position:static;transform:none;top:auto;right:auto;
       background:color-mix(in srgb, var(--panel) 78%, var(--bg));
       border:1px solid var(--line);
@@ -1401,12 +1401,12 @@
      overflow:hidden leaves a hard edge where the picture stops. Tying it to
      the hero's own box means the fade always lands exactly on the seam.
      .herobg keeps its shipped mask, opacity and the noirr grain overlay. */
-  [data-layout=plex] .px-hero .herobg{height:100%}
+  [data-layout=catalog] .px-hero .herobg{height:100%}
   /* The scrim. A --bg mix, so on Paper-light or Silver-light it LIGHTENS the
      bottom of the backdrop into the page instead of painting the black band
      that the 2026-07-22 regression shipped. Three stops: a flat wash for
      legibility, the fade into the page, and a soft left edge under the poster. */
-  [data-layout=plex] .px-scrim{
+  [data-layout=catalog] .px-scrim{
     position:absolute;inset:0;pointer-events:none;
     background:
       linear-gradient(180deg,
@@ -1418,59 +1418,59 @@
         transparent 62%)}
   /* No backdrop, no scrim: a gradient to --bg over --bg is invisible work, and
      on the themes with a --shadow token it is a faint band for no reason. */
-  [data-layout=plex] .px-hero.px-noart .px-scrim{display:none}
-  [data-layout=plex] .px-hero .dwrap{
+  [data-layout=catalog] .px-hero.px-noart .px-scrim{display:none}
+  [data-layout=catalog] .px-hero .dwrap{
     grid-template-columns:212px minmax(0,1fr);gap:32px;
     padding:38px 28px 26px;max-width:1240px;margin:0}
-  [data-layout=plex] .px-hero .poster{border-radius:var(--radius)}
+  [data-layout=catalog] .px-hero .poster{border-radius:var(--radius)}
   /* Oversized title, and it has to survive a 68-character one: anywhere-break
      rather than a clip, because a detail page that hides half its own title is
      worse than a page with a three-line heading. */
-  [data-layout=plex] .px-hero .dhead h1{
+  [data-layout=catalog] .px-hero .dhead h1{
     font-size:clamp(26px,3.6vw,44px);line-height:1.04;letter-spacing:-.02em;
     font-weight:800;margin:6px 0 12px;overflow-wrap:anywhere}
-  /* The kicker plex puts above the title: the item's kind, which classic
+  /* The kicker catalog puts above the title: the item's kind, which classic
      carries as a pill in the middle of the metadata row. */
-  [data-layout=plex] .px-kick{
+  [data-layout=catalog] .px-kick{
     font:700 11px/1 var(--font-mono);letter-spacing:.18em;text-transform:uppercase;
     color:var(--accent);margin:14px 0 0}
   /* Metadata as pills. The shipped .chips is a plain flex row of bare spans;
-     plex gives each span the .pill treatment without touching the markup. */
-  [data-layout=plex] .px-hero .chips>span{
+     catalog gives each span the .pill treatment without touching the markup. */
+  [data-layout=catalog] .px-hero .chips>span{
     padding:3px 11px;border-radius:999px;
     border:1px solid color-mix(in srgb, var(--line) 90%, var(--text));
     background:color-mix(in srgb, var(--panel) 60%, transparent);
     color:var(--text)}
-  [data-layout=plex] .px-hero .chips{margin-top:2px}
-  [data-layout=plex] .px-hero .px-tags{margin-top:8px}
-  [data-layout=plex] .px-hero .px-tags>span{
+  [data-layout=catalog] .px-hero .chips{margin-top:2px}
+  [data-layout=catalog] .px-hero .px-tags{margin-top:8px}
+  [data-layout=catalog] .px-hero .px-tags>span{
     color:var(--muted);background:transparent;
     border-style:dashed}
-  [data-layout=plex] .px-hero .overview{max-width:64ch}
+  [data-layout=catalog] .px-hero .overview{max-width:64ch}
   /* The Play lockup: a pill, weightier, with a bloom in the theme accent (the
      "amber Play" of §3.2 is the Amber theme's --accent — no colour is spelled
      out here, so every theme gets its own). */
-  [data-layout=plex] .px-hero .btnplay{
+  [data-layout=catalog] .px-hero .btnplay{
     border-radius:999px;padding:12px 26px;font-weight:750;font-size:15.5px;
     box-shadow:0 6px 20px color-mix(in srgb, var(--accent) 34%, transparent)}
-  [data-layout=plex] .px-hero .actions .ghost{border-radius:999px;padding:10px 18px}
-  [data-layout=plex] .px-hero .actions{margin-top:22px}
+  [data-layout=catalog] .px-hero .actions .ghost{border-radius:999px;padding:10px 18px}
+  [data-layout=catalog] .px-hero .actions{margin-top:22px}
   /* Admin buttons ride inside the h1, which is now up to 44px — button{font:
      inherit} would blow them up to match. .sm sets 13px; this pins the line
      box so a two-button h1 does not become three lines tall. */
-  [data-layout=plex] .px-hero .dhead h1 .ghost.sm{
+  [data-layout=catalog] .px-hero .dhead h1 .ghost.sm{
     font-size:13px;line-height:1.2;vertical-align:middle;font-weight:600}
 
   /* ---- detail: everything below the hero -------------------------------- */
   /* Version cards, episode lists and children grids get the full width here
      rather than the hero's text column. */
-  [data-layout=plex] .px-detail{max-width:1240px;margin:0;padding:0 8px 8px}
-  [data-layout=plex] .px-detail>h2.section:first-child{margin-top:4px}
-  [data-layout=plex] .px-detail .version{
+  [data-layout=catalog] .px-detail{max-width:1240px;margin:0;padding:0 8px 8px}
+  [data-layout=catalog] .px-detail>h2.section:first-child{margin-top:4px}
+  [data-layout=catalog] .px-detail .version{
     border-radius:max(0px, calc(var(--radius) - 1px));
     background:color-mix(in srgb, var(--panel) 88%, var(--bg))}
-  [data-layout=plex] .px-detail .eplist{border-radius:max(0px, calc(var(--radius) - 1px))}
-  [data-layout=plex] .px-photo{display:block;margin:4px 0 0}
+  [data-layout=catalog] .px-detail .eplist{border-radius:max(0px, calc(var(--radius) - 1px))}
+  [data-layout=catalog] .px-photo{display:block;margin:4px 0 0}
 
   /* ============================ television =================================
      Same test surfaceClass() uses for "tv" — this is the query the G2 block
@@ -1492,48 +1492,48 @@
      ME.is_admin inside shipped helpers, and blanking them from CSS would
      leave the sentence around them dangling. */
   @media (pointer:none), (hover:none) and (pointer:coarse) and (min-width:1280px){
-    [data-layout=plex] .px-nav a[href="#/settings"],
-    [data-layout=plex] .px-admin,
-    [data-layout=plex] .unprobed button,
-    [data-layout=plex] .empty a[href="#/settings"],
+    [data-layout=catalog] .px-nav a[href="#/settings"],
+    [data-layout=catalog] .px-admin,
+    [data-layout=catalog] .unprobed button,
+    [data-layout=catalog] .empty a[href="#/settings"],
     /* Couples to profileMenuHtml()'s shipped markup: the Settings entry is the
        one button in the popover whose handler routes to #/settings. */
-    [data-layout=plex] #profilemenu button[onclick*="#/settings"]{display:none}
+    [data-layout=catalog] #profilemenu button[onclick*="#/settings"]{display:none}
     /* The tab strip and the toolbar are readable from a sofa or they are not
        there at all. */
-    [data-layout=plex] .px-ltab{font-size:16px;padding:10px 16px 11px}
-    [data-layout=plex] .px-vt{font-size:15px}
-    [data-layout=plex] .px-hero .dwrap{padding:44px 40px 30px}
+    [data-layout=catalog] .px-ltab{font-size:16px;padding:10px 16px 11px}
+    [data-layout=catalog] .px-vt{font-size:15px}
+    [data-layout=catalog] .px-hero .dwrap{padding:44px 40px 30px}
   }
 
   /* ============================= narrow / phone ============================ */
   @media (max-width:899px){
-    [data-layout=plex] .px-ltabs{
+    [data-layout=catalog] .px-ltabs{
       margin:0 0 12px;gap:2px;flex-wrap:nowrap;overflow-x:auto;
       scrollbar-width:none;-webkit-overflow-scrolling:touch}
-    [data-layout=plex] .px-ltabs::-webkit-scrollbar{display:none}
-    [data-layout=plex] .px-ltab{white-space:nowrap;padding:9px 10px}
-    [data-layout=plex] .px-libbar .row{gap:6px}
+    [data-layout=catalog] .px-ltabs::-webkit-scrollbar{display:none}
+    [data-layout=catalog] .px-ltab{white-space:nowrap;padding:9px 10px}
+    [data-layout=catalog] .px-libbar .row{gap:6px}
     /* Below 900px the rail is the shipped viewport-edge scrubber again (the
        min-width:900px block above simply does not apply), so the row is a
        plain block and #librail contributes nothing to the flow. */
-    [data-layout=plex] .px-hero .dwrap{padding:22px 14px 18px;gap:18px}
-    [data-layout=plex] .px-hero .dhead h1{font-size:clamp(22px,6.4vw,30px)}
-    [data-layout=plex] .px-hero .btnplay{width:100%;justify-content:center}
-    [data-layout=plex] .px-detail{padding:0}
+    [data-layout=catalog] .px-hero .dwrap{padding:22px 14px 18px;gap:18px}
+    [data-layout=catalog] .px-hero .dhead h1{font-size:clamp(22px,6.4vw,30px)}
+    [data-layout=catalog] .px-hero .btnplay{width:100%;justify-content:center}
+    [data-layout=catalog] .px-detail{padding:0}
   }
   @media (max-width:720px){
     /* .dwrap collapses to one column at 720px (shipped), and a 212px poster
        above a 30px title reads as a card, not a hero. */
-    [data-layout=plex] .px-hero .dwrap{grid-template-columns:minmax(0,1fr)}
-    [data-layout=plex] .px-hero .poster{max-width:148px}
+    [data-layout=catalog] .px-hero .dwrap{grid-template-columns:minmax(0,1fr)}
+    [data-layout=catalog] .px-hero .poster{max-width:148px}
   }
 
   /* ============================ reduced motion ============================= */
   @media (prefers-reduced-motion: no-preference){
-    [data-layout=plex] .px-ltab{transition:color .12s ease-out, border-color .12s ease-out}
-    [data-layout=plex] .px-hero .btnplay{transition:box-shadow .14s ease-out, transform .12s ease-out}
-    [data-layout=plex] .px-hero .btnplay:hover{transform:translateY(-1px)}
+    [data-layout=catalog] .px-ltab{transition:color .12s ease-out, border-color .12s ease-out}
+    [data-layout=catalog] .px-hero .btnplay{transition:box-shadow .14s ease-out, transform .12s ease-out}
+    [data-layout=catalog] .px-hero .btnplay:hover{transform:translateY(-1px)}
   }
 
   /* ============================ forced colours =============================
@@ -1541,34 +1541,34 @@
      otherwise vanish: the selected tab, the disabled controls, and the
      scrubber's in-flow frame. */
   @media (forced-colors: active){
-    [data-layout=plex] .px-ltabs{border-bottom:1px solid CanvasText}
-    [data-layout=plex] .px-ltab.on{border-bottom:3px solid Highlight;color:CanvasText}
+    [data-layout=catalog] .px-ltabs{border-bottom:1px solid CanvasText}
+    [data-layout=catalog] .px-ltab.on{border-bottom:3px solid Highlight;color:CanvasText}
     /* GrayText is the system colour that MEANS disabled, and the only one a
        forced-colours user's own palette maps to that idea. */
-    [data-layout=plex] .px-ltab.off,
-    [data-layout=plex] .px-vt.off{color:GrayText}
-    [data-layout=plex] .px-soon{border:1px dashed GrayText;color:GrayText}
-    [data-layout=plex] .px-view{border:1px solid CanvasText}
-    [data-layout=plex] .px-vt.on{border:1px solid Highlight}
-    [data-layout=plex] .px-librail .azbar{border:1px solid CanvasText;background:Canvas}
-    [data-layout=plex] .azbar button.active{
+    [data-layout=catalog] .px-ltab.off,
+    [data-layout=catalog] .px-vt.off{color:GrayText}
+    [data-layout=catalog] .px-soon{border:1px dashed GrayText;color:GrayText}
+    [data-layout=catalog] .px-view{border:1px solid CanvasText}
+    [data-layout=catalog] .px-vt.on{border:1px solid Highlight}
+    [data-layout=catalog] .px-librail .azbar{border:1px solid CanvasText;background:Canvas}
+    [data-layout=catalog] .azbar button.active{
       background:Highlight;color:HighlightText;forced-color-adjust:none}
-    [data-layout=plex] .azbar .off{color:GrayText}
+    [data-layout=catalog] .azbar .off{color:GrayText}
     /* The backdrop is a background IMAGE, which forced colours does not
        repaint — it survives as the one author-coloured thing on the page, with
        an oversized title sitting on it. Chromium's text backplate keeps that
        legible, but a backplate behind every line of a synopsis is not reading;
        the picture is decoration, so it goes, and the scrim with it. */
-    [data-layout=plex] .px-hero .herobg,
-    [data-layout=plex] .px-scrim{display:none}
+    [data-layout=catalog] .px-hero .herobg,
+    [data-layout=catalog] .px-scrim{display:none}
     /* The pills are not decoration — without a border they collapse into a
        run-on line of words. */
-    [data-layout=plex] .px-hero .chips>span{border:1px solid CanvasText;background:Canvas}
-    [data-layout=plex] .px-kick{color:CanvasText}
+    [data-layout=catalog] .px-hero .chips>span{border:1px solid CanvasText;background:Canvas}
+    [data-layout=catalog] .px-kick{color:CanvasText}
   }
 /* ========================== theater layout =================================
    G4. Paste into the stylesheet block of crates/plurxd/src/web/index.html,
-   after the plex layout block and just before the closing style tag. (Written
+   after the catalog layout block and just before the closing style tag. (Written
    without the literal closing tag on purpose: inside a raw-text element that
    sequence ends the stylesheet, and the rest of this file then renders as a
    wall of visible prose. Found the hard way in this gate's harness.)
@@ -1986,7 +1986,7 @@
 [data-layout=theater] .th-dwrap{
   position:relative; z-index:1; display:flex; align-items:flex-end; width:100%}
 /* Everything under the fold — version cards, episode list, children grid —
-   gets the full width, the same split plex made. Nothing MOVES between the
+   gets the full width, the same split catalog made. Nothing MOVES between the
    two that changes what is on the page. */
 [data-layout=theater] .th-rest{padding:34px 0 0}
 [data-layout=theater] .th-rest .eplist,
@@ -2256,7 +2256,7 @@ const THEMES={
   // as ink on a page is the wrong test. What does matter for it is the white
   // label on that badge — noted per theme where it is tight.
 
-  // Amber — charcoal + gold, the signature of the plex layout. The light
+  // Amber — charcoal + gold, the signature of the catalog layout. The light
   // accent/good/bad are NOT the mockup's values: those measured 2.73 / 3.92 /
   // 4.49 and are replaced here by the review's corrected set. Dark --bad is
   // ours: #e5534b passes on --bg but lands at 4.25 / 3.89 on the panels, and
@@ -2366,7 +2366,7 @@ applyPosterSize();
 // is why nothing here dereferences .views.
 const LAYOUTS={
   classic:{name:"Classic", surfaces:["desktop","mobile","tv"]},
-  plex:{name:"Plex", surfaces:["desktop","mobile","tv"]},
+  catalog:{name:"Catalog", surfaces:["desktop","mobile","tv"]},
   theater:{name:"Theater", surfaces:["desktop","mobile","tv"]},
 };
 // Which kind of surface this browser is, from viewport and input capability —
@@ -2390,6 +2390,12 @@ function surfaceClass(){
 // phone). A stale preference must open a familiar app, never a blank shell.
 function layoutId(){
   let id=null; try{ id=localStorage.getItem("plurx_layout"); }catch(e){}
+  // Earlier builds saved the retired public name as the layout id. Migrate it
+  // once so the rename does not reset an existing browser to Classic.
+  if(id==="plex"){
+    id="catalog";
+    try{ localStorage.setItem("plurx_layout",id); }catch(e){}
+  }
   const L=LAYOUTS[id];
   if(!L) return "classic";
   if(L.surfaces&&L.surfaces.indexOf(surfaceClass())<0) return "classic";
@@ -2446,7 +2452,7 @@ async function libsCached(){
   return LIBS_CACHE;
 }
 // Dropping the cache is only half the job: a layout may hold its own view
-// DERIVED from that list (plex's sidebar), and a derived cache nobody
+// DERIVED from that list (catalog's sidebar), and a derived cache nobody
 // invalidates repaints the library you just deleted. The hook is generic and
 // optional — classic defines none — so one layout's variable never has to
 // appear in a function every layout calls.
@@ -3482,8 +3488,8 @@ function tagAlpha(items, sort){
   updateAzActive();                                         // set the initial highlight
 }
 // Where the page's fixed chrome stops and content begins. The layout owns this
-// number: classic has a sticky top header, plex has a sidebar and no top bar at
-// all, and a hardcoded `header.top` lookup silently measures nothing under plex
+// number: classic has a sticky top header, catalog has a sidebar and no top bar at
+// all, and a hardcoded `header.top` lookup silently measures nothing under catalog
 // — the A–Z rail then highlights a letter that is already scrolled past.
 function stickyFloor(){
   const L=LAYOUTS[layoutId()];
@@ -8095,8 +8101,8 @@ async function delUser(id, name){
   try{ await api(`/users/${id}`,{method:"DELETE"}); toast("User deleted"); viewSettings(); }catch(e){ toast(e.message); }
 }
 
-// ---- layout: plex ---------------------------------------------------------
-// The Plex Web shell, ported to the shipped app's parts rather than rebuilt:
+// ---- layout: catalog ---------------------------------------------------------
+// The Catalog shell, composed from the shipped app's existing parts:
 // a fixed left sidebar (wordmark, search, Home, the libraries with counts,
 // Activity/Settings under a divider, scan status and the account chip pinned
 // to the bottom), and a Home made of hub rows.
@@ -8113,7 +8119,7 @@ async function delUser(id, name){
 // tints with its label instead of needing a second colour rule, and inline
 // rather than a sprite because this app ships as a single file with no asset
 // pipeline to hang a sprite off.
-const PLEX_GLYPHS={
+const CATALOG_GLYPHS={
   home:'<path d="M3 11l9-8 9 8M5 10v10h14V10"/>',
   film:'<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 4v16M17 4v16M3 9h4M3 15h4M17 9h4M17 15h4"/>',
   tv:'<rect x="3" y="5" width="18" height="12" rx="2"/><path d="M8 21h8M12 17v4"/>',
@@ -8128,16 +8134,16 @@ const PLEX_GLYPHS={
 // aria-hidden because every icon here sits next to its own text label; an
 // unlabelled decorative SVG announced by a screen reader is noise. focusable
 // is the legacy-Edge guard that keeps SVGs out of the tab order.
-function plexIcon(name){
+function catalogIcon(name){
   return `<svg class="px-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"`
     +` stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">`
-    +(PLEX_GLYPHS[name]||PLEX_GLYPHS.folder)+`</svg>`;
+    +(CATALOG_GLYPHS[name]||CATALOG_GLYPHS.folder)+`</svg>`;
 }
 // Both spellings on purpose: LibraryDto.kind is plural ("movies"/"shows"/
 // "home") while libCategory() hands back singular section keys ("movie" /
 // "show" / "home"), and the sidebar is fed from whichever of the two is
 // available. Anything unrecognised gets the folder, never a blank gutter.
-function plexLibGlyph(kind, anime){
+function catalogLibGlyph(kind, anime){
   if(anime) return "anime";
   if(kind==="movie"||kind==="movies") return "film";
   if(kind==="show"||kind==="shows") return "tv";
@@ -8155,7 +8161,7 @@ function plexLibGlyph(kind, anime){
 // — render the container, fill it when the answer exists, be safe to run twice.
 //
 // Two sources, best first:
-//   PLEX_NAV    the home page model, which carries names, hrefs AND counts,
+//   CATALOG_NAV    the home page model, which carries names, hrefs AND counts,
 //               already grouped the way the user chose (category or share).
 //   LIBS_CACHE  whatever a previously-visited item/library/category page left
 //               behind. Names and hrefs, no counts. Read directly and never
@@ -8166,9 +8172,9 @@ function plexLibGlyph(kind, anime){
 // two grey bars is a claim about content we have not got. On the home route
 // the gap closes as soon as loadHome() resolves; on other routes it closes on
 // the next navigation that populates LIBS_CACHE.
-let PLEX_NAV=null;
+let CATALOG_NAV=null;
 
-function plexNavFromHome(p){
+function catalogNavFromHome(p){
   const byId={};
   for(const l of (p.libs||[])) byId[String(l.id)]={kind:l.kind, anime:!!l.anime};
   // Section keys are library ids under "share" grouping and category keys
@@ -8177,22 +8183,22 @@ function plexNavFromHome(p){
   const secs=(p.sections||[]).map(s=>{
     const lib=byId[String(s.key)];
     return {name:s.name, href:s.href, count:s.total,
-            glyph:plexLibGlyph(lib?lib.kind:s.key, lib?lib.anime:false)};
+            glyph:catalogLibGlyph(lib?lib.kind:s.key, lib?lib.anime:false)};
   });
   // An empty array is an answer ("this server has no libraries"), not a miss,
   // so it is stored as one — otherwise the stale LIBS_CACHE fallback below
   // would resurrect libraries the user just deleted.
-  PLEX_NAV = secs.length ? secs : (p.libs||[]).map(l=>({
-    name:l.name, href:`#/library/${l.id}`, count:null, glyph:plexLibGlyph(l.kind, l.anime)}));
+  CATALOG_NAV = secs.length ? secs : (p.libs||[]).map(l=>({
+    name:l.name, href:`#/library/${l.id}`, count:null, glyph:catalogLibGlyph(l.kind, l.anime)}));
 }
-function plexNavItems(){
-  if(PLEX_NAV) return PLEX_NAV;
+function catalogNavItems(){
+  if(CATALOG_NAV) return CATALOG_NAV;
   if(LIBS_CACHE) return LIBS_CACHE.map(l=>({
-    name:l.name, href:`#/library/${l.id}`, count:null, glyph:plexLibGlyph(l.kind, l.anime)}));
+    name:l.name, href:`#/library/${l.id}`, count:null, glyph:catalogLibGlyph(l.kind, l.anime)}));
   return null;
 }
-function plexNavHtml(){
-  const items=plexNavItems();
+function catalogNavHtml(){
+  const items=catalogNavItems();
   if(!items||!items.length) return "";
   const here=location.hash||"#/";
   const rows=items.map(it=>{
@@ -8200,7 +8206,7 @@ function plexNavHtml(){
     // matching what classic's top nav does with the same information.
     const on = here===it.href;
     return `<a href="${esc(it.href)}" class="${on?"on":""}"${on?' aria-current="page"':""}>`
-      +plexIcon(it.glyph)
+      +catalogIcon(it.glyph)
       // title= as well as the text: the label is clipped to one line, so a
       // library called "Kids — French dubs (external drive)" is otherwise
       // unreadable at 236px with no way to see the rest.
@@ -8213,9 +8219,9 @@ function plexNavHtml(){
 // Idempotent by construction: it replaces the container's contents from the
 // current best source, so calling it from chrome and again from the home body
 // (and again on the next render) can only ever converge.
-function plexFillNav(){
+function catalogFillNav(){
   const box=document.getElementById("pxlibs");
-  if(box) box.innerHTML=plexNavHtml();
+  if(box) box.innerHTML=catalogNavHtml();
 }
 
 // ---- one-time wiring ------------------------------------------------------
@@ -8224,18 +8230,18 @@ function plexFillNav(){
 //
 // A poster is a <div onclick=…>: clickable, but not focusable and not
 // operable from the keyboard. The G2 acceptance list requires walking
-// home → library → detail → play with a visible ring, so plex adds tabindex
+// home → library → detail → play with a visible ring, so catalog adds tabindex
 // and a role to every card the app renders, including the ones on routes it
 // has not converted (library, search, item). A MutationObserver rather than a
-// call at the end of each view because plex does not own those views.
+// call at the end of each view because catalog does not own those views.
 //
 // The layoutId() guard is the important line: switching layout re-runs
 // render(), which repaints classic's DOM under the same live observer. Without
 // the check, classic would start emitting posters carrying tabindex — a diff
 // in the byte-identical baseline the gate re-checks after every layout lands.
-let PLEX_WIRED=false;
-function plexEnhanceCards(){
-  if(layoutId()!=="plex") return;
+let CATALOG_WIRED=false;
+function catalogEnhanceCards(){
+  if(layoutId()!=="catalog") return;
   for(const el of document.querySelectorAll(".poster[onclick]:not([tabindex])")){
     el.setAttribute("tabindex","0");
     // Cards that navigate are links; the photo cards call openLightbox() and
@@ -8244,11 +8250,11 @@ function plexEnhanceCards(){
     el.setAttribute("role", /location\.hash/.test(el.getAttribute("onclick")||"") ? "link" : "button");
   }
 }
-function plexWireOnce(){
-  if(PLEX_WIRED) return;
-  PLEX_WIRED=true;
+function catalogWireOnce(){
+  if(CATALOG_WIRED) return;
+  CATALOG_WIRED=true;
   document.addEventListener("keydown",e=>{
-    if(layoutId()!=="plex") return;
+    if(layoutId()!=="catalog") return;
     // The player and the lightbox own the keyboard while they are up; both of
     // the shipped handlers guard on that and this one has to agree, or Esc
     // closes a sheet nobody can see instead of the video.
@@ -8256,7 +8262,7 @@ function plexWireOnce(){
     if(lightboxOpen()||(modal&&modal.classList.contains("open"))) return;
     if(e.key==="Escape"){
       const shell=document.getElementById("pxshell");
-      if(shell&&shell.classList.contains("px-open")){ e.preventDefault(); plexToggleLibs(); }
+      if(shell&&shell.classList.contains("px-open")){ e.preventDefault(); catalogToggleLibs(); }
       return;
     }
     const el=e.target;
@@ -8270,8 +8276,8 @@ function plexWireOnce(){
   // #app itself is never replaced (every view assigns to its innerHTML), so
   // one observer on it outlives every route change.
   const app=document.getElementById("app");
-  if(app&&window.MutationObserver) new MutationObserver(plexEnhanceCards).observe(app,{childList:true,subtree:true});
-  plexEnhanceCards();
+  if(app&&window.MutationObserver) new MutationObserver(catalogEnhanceCards).observe(app,{childList:true,subtree:true});
+  catalogEnhanceCards();
 }
 
 // ---- phone: the library sheet and the search tab --------------------------
@@ -8285,7 +8291,7 @@ function plexWireOnce(){
 // and it reuses the same nav element rather than a phone-only copy of it.
 // Nothing has to close the sheet on navigation: routing repaints the chrome
 // and the class goes with it.
-function plexToggleLibs(e){
+function catalogToggleLibs(e){
   if(e){ e.preventDefault(); e.stopPropagation(); }
   const shell=document.getElementById("pxshell"); if(!shell) return;
   const open=!shell.classList.contains("px-open");
@@ -8303,23 +8309,23 @@ function plexToggleLibs(e){
 // The search field is the sidebar's, which on a phone is the header's. The tab
 // puts the caret in it rather than routing anywhere, so there is exactly one
 // #q in the document and getQ()/the debounce wiring keep working untouched.
-function plexFocusSearch(e){
+function catalogFocusSearch(e){
   if(e){ e.preventDefault(); }
   const shell=document.getElementById("pxshell");
-  if(shell&&shell.classList.contains("px-open")) plexToggleLibs();   // the sheet covers the header
+  if(shell&&shell.classList.contains("px-open")) catalogToggleLibs();   // the sheet covers the header
   const q=document.getElementById("q");
   if(q){ q.focus(); try{ q.select(); }catch(err){} }
 }
 // Two of the four are anchors and two are buttons, which is the honest markup:
 // a tab that routes is a link and a tab that opens a panel is a button, and
 // the difference is what a screen reader announces.
-function plexTabsHtml(active, homeOn){
+function catalogTabsHtml(active, homeOn){
   const on=b=>b?' class="px-tab on" aria-current="page"':' class="px-tab"';
   return `<nav class="px-tabs" aria-label="Sections">
-    <a href="#/" data-tab="home"${on(homeOn)}>${plexIcon("home")}<span>Home</span></a>
-    <button type="button" data-tab="libs" class="px-tab" aria-expanded="false" aria-controls="pxnav" onclick="plexToggleLibs(event)">${plexIcon("stack")}<span>Libraries</span></button>
-    <button type="button" data-tab="search" class="px-tab" onclick="plexFocusSearch(event)">${plexIcon("search")}<span>Search</span></button>
-    <a href="#/activity" data-tab="activity"${on(active==="activity")}>${plexIcon("act")}<span>Activity</span></a>
+    <a href="#/" data-tab="home"${on(homeOn)}>${catalogIcon("home")}<span>Home</span></a>
+    <button type="button" data-tab="libs" class="px-tab" aria-expanded="false" aria-controls="pxnav" onclick="catalogToggleLibs(event)">${catalogIcon("stack")}<span>Libraries</span></button>
+    <button type="button" data-tab="search" class="px-tab" onclick="catalogFocusSearch(event)">${catalogIcon("search")}<span>Search</span></button>
+    <a href="#/activity" data-tab="activity"${on(active==="activity")}>${catalogIcon("act")}<span>Activity</span></a>
   </nav>`;
 }
 
@@ -8328,10 +8334,10 @@ function plexTabsHtml(active, homeOn){
 // `inner` inside it, wire the 300 ms search debounce, end with pollActivity().
 // The header's controls all move into the sidebar footer and every one of them
 // calls the shipped popover functions — toggleThemeMenu / toggleAppearanceMenu
-// / toggleSizeMenu / toggleProfileMenu — rather than a plex copy of them, so
-// the layout picker inside the theme menu keeps working from inside plex and a
+// / toggleSizeMenu / toggleProfileMenu — rather than a catalog copy of them, so
+// the layout picker inside the theme menu keeps working from inside catalog and a
 // change to any of those menus lands in both layouts at once.
-function plexChrome(active, inner){
+function catalogChrome(active, inner){
   const hash=location.hash||"#/";
   // Library, category and search routes all call layoutChrome("home", …), so
   // `active==="home"` alone would light Home up while the user is looking at a
@@ -8343,7 +8349,7 @@ function plexChrome(active, inner){
   // sidebar. (The account popover applies the same test to its own entry.)
   const admin = ME&&ME.is_admin
     ? `<a href="#/settings" class="${active==="settings"?"on":""}"${active==="settings"?' aria-current="page"':""}>`
-      +plexIcon("gear")+`<span class="px-lbl">Settings</span></a>`
+      +catalogIcon("gear")+`<span class="px-lbl">Settings</span></a>`
     : "";
   // ${APP_NAME}, never the literal product name — the shipped header's title
   // attribute still says "plurx" here; that is a bug this layout does not copy.
@@ -8357,14 +8363,14 @@ function plexChrome(active, inner){
          <input class="search" id="q" placeholder="Search…" aria-label="Search ${APP_NAME}" value="${esc(getQ())}">
        </div>
        <div class="px-scroll" id="pxnav">
-         <button class="ghost sm px-sheetx" type="button" aria-label="Close libraries" onclick="plexToggleLibs(event)">✕</button>
+         <button class="ghost sm px-sheetx" type="button" aria-label="Close libraries" onclick="catalogToggleLibs(event)">✕</button>
          <nav class="px-nav" aria-label="Main">
-           <a href="#/" class="${homeOn?"on":""}"${homeOn?' aria-current="page"':""}>${plexIcon("home")}<span class="px-lbl">Home</span></a>
+           <a href="#/" class="${homeOn?"on":""}"${homeOn?' aria-current="page"':""}>${catalogIcon("home")}<span class="px-lbl">Home</span></a>
          </nav>
          <div id="pxlibs"></div>
          <div class="px-sec">Manage</div>
          <nav class="px-nav" aria-label="Manage">
-           <a href="#/activity" class="${active==="activity"?"on":""}"${active==="activity"?' aria-current="page"':""}>${plexIcon("act")}<span class="px-lbl">Activity</span></a>
+           <a href="#/activity" class="${active==="activity"?"on":""}"${active==="activity"?' aria-current="page"':""}>${catalogIcon("act")}<span class="px-lbl">Activity</span></a>
            ${admin}
          </nav>
        </div>
@@ -8398,34 +8404,33 @@ function plexChrome(active, inner){
        </div>
      </aside>
      <main id="main">${inner}</main>
-     ${plexTabsHtml(active, homeOn)}
+     ${catalogTabsHtml(active, homeOn)}
    </div>`;
   // Synchronous fill from whatever is cached; the home body calls it again
   // with the real thing a moment later.
-  plexFillNav();
+  catalogFillNav();
   const q=document.getElementById("q");
   let t; q.addEventListener("input",()=>{ clearTimeout(t); t=setTimeout(()=>{ location.hash= q.value?("#/search/"+encodeURIComponent(q.value)):"#/"; },300); });
-  plexWireOnce();
+  catalogWireOnce();
   pollActivity();
 }
 
 // ---- home -----------------------------------------------------------------
 // Same model, same helpers, different composition. The one structural change
 // from classic is that a library section is a hub ROW with a "See all" rather
-// than a wall of grid — that row, repeated per library, is what the plex
+// than a wall of grid — that row, repeated per library, is what the catalog
 // sidebar shell is built around, and it is the difference between a home page
 // you scan and a home page you scroll.
 //
-// Hub headings keep the shipped wording ("Continue watching", "Next up") and
-// not Plex's ("On Deck"): user-facing strings are explicitly not a layout's to
-// change, and a layout switch that renames things the user has learned is a
-// worse trade than the reference it buys.
-function plexHomeBody(p){
+// Hub headings keep the shipped wording ("Continue watching", "Next up"):
+// user-facing strings are explicitly not a layout's to change, and a layout
+// switch that renames familiar concepts would be needless churn.
+function catalogHomeBody(p){
   // The sidebar is outside #main, so it survives the assignment that is about
   // to replace #main with this string — filling it here is what closes the
   // cold-paint gap on the home route.
-  plexNavFromHome(p);
-  plexFillNav();
+  catalogNavFromHome(p);
+  catalogFillNav();
 
   const hub=k=>(p.hubs&&p.hubs[k])||[];
   let html=installBannerHtml();
@@ -8460,35 +8465,35 @@ function plexHomeBody(p){
   return html;
 }
 
-LAYOUTS.plex={name:"Plex", surfaces:["desktop","mobile","tv"], chrome:plexChrome, views:{home:plexHomeBody}};
+LAYOUTS.catalog={name:"Catalog", surfaces:["desktop","mobile","tv"], chrome:catalogChrome, views:{home:catalogHomeBody}};
 // applyLayout() ran in the <head>, where the registry holds classic and
-// nothing else — so layoutId() could not recognise a stored "plex" preference
+// nothing else — so layoutId() could not recognise a stored "catalog" preference
 // and left <html data-layout="classic">. Every rule in this layout's
-// stylesheet is scoped under [data-layout=plex]; without this line the plex
+// stylesheet is scoped under [data-layout=catalog]; without this line the catalog
 // chrome renders wearing none of them, which looks exactly like a stylesheet
 // that failed to load. Re-applying here is invisible: boot() has not resolved
 // /server yet, so #app is empty and there is nothing painted to reflow.
-// The tidier fix is a {name,surfaces} stub for plex in the <head> registry
+// The tidier fix is a {name,surfaces} stub for catalog in the <head> registry
 // beside classic's, which is where the pre-paint pass expects to find it —
 // that is an edit to the <head> script, outside this fragment.
 
-// ---- layout: plex — G2b: item detail, library, and the three logged defects
+// ---- layout: catalog — G2b: item detail, library, and the three logged defects
 //
-// Paste into the body <script>, after the G2 plex block (it extends the same
-// LAYOUTS.plex object) and before boot().
+// Paste into the body <script>, after the G2 catalog block (it extends the same
+// LAYOUTS.catalog object) and before boot().
 //
 // What this file deliberately does NOT contain, same as the G2 drop: a card
 // renderer, a rail renderer, a grid renderer, an escape function, or a fetch.
 // Both new views are compositions of shipped helpers — pageHead, artHtml,
 // specBadges, specBlock, unprobedNote, watchControls, episodeRow, grid,
-// playerMeta, fmtDur, endsAt, esc — wearing plex CSS. A second card function
+// playerMeta, fmtDur, endsAt, esc — wearing catalog CSS. A second card function
 // is how five layouts become five apps.
 //
 // Two seam shapes, per §3.2:
 //   views.item     whole-body     (page) -> html for #main
 //   views.library  region-shaped  {shell, items, count}, resolved PER REGION
-// plex overrides `shell` only. `items` and `count` are inherited from classic
-// untouched, because plex does not differ from classic about what a grid of
+// catalog overrides `shell` only. `items` and `count` are inherited from classic
+// untouched, because catalog does not differ from classic about what a grid of
 // posters or the word "items" is — see NOTES §3.
 
 // ---------------------------------------------------------------------------
@@ -8496,10 +8501,10 @@ LAYOUTS.plex={name:"Plex", surfaces:["desktop","mobile","tv"], chrome:plexChrome
 // ---------------------------------------------------------------------------
 // The A–Z scroll-spy asks "which letter is at the top of the reading area?" and
 // needs a viewport y to measure against. classic answers with header.top's
-// bottom; plex has no header.top on desktop, so the shipped fallback (56px)
+// bottom; catalog has no header.top on desktop, so the shipped fallback (56px)
 // highlights a letter a row too late.
 //
-// plex has three shapes and this returns the truth for each:
+// catalog has three shapes and this returns the truth for each:
 //   desktop  the sidebar is a full-height column BESIDE the content and
 //            nothing is pinned above the grid           -> 0
 //   narrow   the same element re-flows into a sticky top header (the CSS at
@@ -8511,7 +8516,7 @@ LAYOUTS.plex={name:"Plex", surfaces:["desktop","mobile","tv"], chrome:plexChrome
 // Get-app button are in it, so the only honest answer is the element's own
 // rect. It is also the same answer whether the window was resized or the page
 // re-rendered, which a JS surface branch would not be.
-function plexStickyFloor(){
+function catalogStickyFloor(){
   const side=document.querySelector(".px-side");
   if(!side) return 0;                                  // chrome not painted yet
   const r=side.getBoundingClientRect();
@@ -8526,25 +8531,25 @@ function plexStickyFloor(){
 }
 
 // ---------------------------------------------------------------------------
-// 2. PLEX_NAV staleness after invalidateLibs()  (logged defect, NOTES §5.7)
+// 2. CATALOG_NAV staleness after invalidateLibs()  (logged defect, NOTES §5.7)
 // ---------------------------------------------------------------------------
 // invalidateLibs() is the app's single "the library list changed" signal —
 // renaming, adding or deleting a library in Settings all call it and then
 // re-enter viewSettings(), which calls layoutChrome() and therefore
-// plexFillNav(). Everything needed to repaint already happens; the only thing
-// missing is that PLEX_NAV, a cache DERIVED from the home model, is not part of
+// catalogFillNav(). Everything needed to repaint already happens; the only thing
+// missing is that CATALOG_NAV, a cache DERIVED from the home model, is not part of
 // what gets invalidated, so the sidebar repaints from a list that still
 // contains the library you just deleted.
 //
 // The mechanism is the one the app just grew for stickyFloor: ask the layout if
 // it defines a hook. `LAYOUTS[cur].libsChanged()` is the sibling of
 // `LAYOUTS[cur].stickyFloor()` — optional, absent on classic, and it keeps
-// layout-specific names out of shared code (the alternative, `PLEX_NAV=null`
+// layout-specific names out of shared code (the alternative, `CATALOG_NAV=null`
 // inside invalidateLibs(), puts one layout's variable in a function every
 // layout calls). See NOTES §4 for the two other candidates and why not.
-function plexLibsChanged(){
-  PLEX_NAV=null;        // the derived cache, not the source
-  plexFillNav();        // idempotent by construction — safe here and again on render
+function catalogLibsChanged(){
+  CATALOG_NAV=null;        // the derived cache, not the source
+  catalogFillNav();        // idempotent by construction — safe here and again on render
 }
 
 // ---------------------------------------------------------------------------
@@ -8559,7 +8564,7 @@ function plexLibsChanged(){
 // loading, and a body(model) contract would take the reader's scroll position
 // with it every time.
 //
-// plex moves the A–Z rail out of the viewport gutter and into the content row
+// catalog moves the A–Z rail out of the viewport gutter and into the content row
 // (mount placement, not a reimplementation — the rail markup is still
 // alphaRailHtml()'s), which is the mount-moving the seam exists to allow.
 //
@@ -8576,9 +8581,9 @@ function plexLibsChanged(){
 // are user-facing: they say what is missing and when it arrives, because a tab
 // that looks live and does nothing is worse than one that admits it isn't
 // ready.
-const PLEX_WHY_COLLECTIONS="Collections don’t exist on the server yet — there is nothing behind this tab to list. It arrives when the server learns what a collection is.";
-const PLEX_WHY_CATEGORIES="Categories needs genre data — coming with the metadata milestone.";
-const PLEX_WHY_LIST="List view needs the codec, HDR, audio and size columns, and the library response doesn’t carry them yet — coming with the browse-data milestone. Asking for them per row would be one request per item, so it stays off until the list itself carries them.";
+const CATALOG_WHY_COLLECTIONS="Collections don’t exist on the server yet — there is nothing behind this tab to list. It arrives when the server learns what a collection is.";
+const CATALOG_WHY_CATEGORIES="Categories needs genre data — coming with the metadata milestone.";
+const CATALOG_WHY_LIST="List view needs the codec, HDR, audio and size columns, and the library response doesn’t carry them yet — coming with the browse-data milestone. Asking for them per row would be one request per item, so it stays off until the list itself carries them.";
 
 // A control that is visibly, announcedly and structurally not ready.
 //  - a <span>, so it is not focusable and not an action: there is nothing to
@@ -8587,26 +8592,26 @@ const PLEX_WHY_LIST="List view needs the codec, HDR, audio and size columns, and
 //  - a "soon" chip, so "disabled" is not carried by grey alone
 //  - the reason in title= for the pointer, and in a visually-hidden span for
 //    everyone who never sees a tooltip
-function plexSoon(cls, label, why){
+function catalogSoon(cls, label, why){
   return `<span class="${cls} off" aria-disabled="true" title="${esc(why)}">`
     +`${esc(label)}<span class="px-soon" aria-hidden="true">soon</span>`
     +`<span class="px-sr"> — ${esc(why)}</span></span>`;
 }
 
-function plexLibraryShell(m){
+function catalogLibraryShell(m){
   const sort=m.sort;
   // Library is the live tab and is the page you are on, so it is an <a> to
   // this same route with aria-current — not a button that re-fetches.
   const tabs=`<nav class="px-ltabs" aria-label="Library views">
       <a class="px-ltab on" href="${esc(m.href)}" aria-current="page">Library</a>
-      ${plexSoon("px-ltab","Collections",PLEX_WHY_COLLECTIONS)}
-      ${plexSoon("px-ltab","Categories",PLEX_WHY_CATEGORIES)}
+      ${catalogSoon("px-ltab","Collections",CATALOG_WHY_COLLECTIONS)}
+      ${catalogSoon("px-ltab","Categories",CATALOG_WHY_CATEGORIES)}
     </nav>`;
   // Grid is not a button either: it is the only view, so it is a state, not a
   // choice. Making it pressable would promise a toggle that has one position.
   const view=`<span class="px-view" role="group" aria-label="View">
       <span class="px-vt on" aria-current="true"><span aria-hidden="true">▦</span> Grid</span>
-      ${plexSoon("px-vt","☰ List",PLEX_WHY_LIST)}
+      ${catalogSoon("px-vt","☰ List",CATALOG_WHY_LIST)}
     </span>`;
   // The selects are classic's, verbatim, including the onchange strings: they
   // are behaviour, and a layout that retypes them is a layout that can get
@@ -8649,12 +8654,12 @@ function plexLibraryShell(m){
 //
 // The one structural difference: classic puts EVERYTHING inside the hero's
 // text column, so a 26-episode list renders in a 1fr column beside a poster.
-// plex splits the page at the natural seam — the hero carries identity and the
+// catalog splits the page at the natural seam — the hero carries identity and the
 // play lockup, and the detail below it (version cards, episode list, children
 // grid) gets the full width. Nothing moves between the two that changes what
 // is on the page; the file-missing warning stays WITH the play lockup because
 // it is the answer to "can I play this", not a footnote.
-function plexItemBody(p){
+function catalogItemBody(p){
   const d={files:p.files, ancestors:p.ancestors, children:p.children};
   const it=p.item, id=p.id, editable=p.editable;
 
@@ -8678,7 +8683,7 @@ function plexItemBody(p){
   const runtime=it.runtime_ms||(best&&best.duration_ms);
 
   // Pills. Identical content to classic's chips with one move: the KIND rides
-  // above the title as the kicker ("MOVIE", "EPISODE") the way plex labels a
+  // above the title as the kicker ("MOVIE", "EPISODE") the way catalog labels a
   // detail page, instead of sitting in the middle of the pill row. It is moved,
   // never dropped — an item with a kind still says so on the page.
   const chips=[];
@@ -8750,7 +8755,7 @@ function plexItemBody(p){
   }
 
   // The backdrop is the shipped .herobg (mask, opacity and the noirr grain
-  // treatment all keep working); .px-scrim is plex's extra wash, and it is a
+  // treatment all keep working); .px-scrim is catalog's extra wash, and it is a
   // --bg mix, so on a light theme it lightens rather than painting a black
   // band across a white page.
   const bg=it.backdrop?`<div class="herobg" style="background-image:url(${esc(tok(it.backdrop))})"></div>`:'';
@@ -8771,24 +8776,24 @@ function plexItemBody(p){
 // ---- registration ---------------------------------------------------------
 // Extends the object the G2 block registered; `views` already exists there,
 // but the guard makes the paste order one less thing to get wrong.
-LAYOUTS.plex.views = LAYOUTS.plex.views || {};
-LAYOUTS.plex.views.item = plexItemBody;
+LAYOUTS.catalog.views = LAYOUTS.catalog.views || {};
+LAYOUTS.catalog.views.item = catalogItemBody;
 // Region-shaped, and deliberately partial: `items` and `count` fall through to
 // classic per region, which is what the per-region fallback is for.
-LAYOUTS.plex.views.library = {shell:plexLibraryShell};
-LAYOUTS.plex.stickyFloor = plexStickyFloor;
-LAYOUTS.plex.libsChanged = plexLibsChanged;
+LAYOUTS.catalog.views.library = {shell:catalogLibraryShell};
+LAYOUTS.catalog.stickyFloor = catalogStickyFloor;
+LAYOUTS.catalog.libsChanged = catalogLibsChanged;
 
 // ---- layout: theater — G4 ---------------------------------------------------
 //
 // Paste into the body <script> of crates/plurxd/src/web/index.html, after the
-// plex block and before the router (`let PAGE_TIMER=null;`).
+// catalog block and before the router (`let PAGE_TIMER=null;`).
 //
 // A `{name, surfaces}` stub must ALSO go into the <head> registry beside
-// classic's and plex's — see NOTES §1. Without it applyLayout() cannot resolve
+// classic's and catalog's — see NOTES §1. Without it applyLayout() cannot resolve
 // a stored "theater" preference, <html data-layout> stays "classic", and not
 // one scoped rule in styles.css matches. It debugs like a stylesheet that
-// failed to load; it bit the plex port.
+// failed to load; it bit the catalog port.
 //
 // What this file deliberately does NOT contain, same as the two drops before
 // it: a card renderer, a rail renderer, a grid renderer, an escape function,
@@ -8802,7 +8807,7 @@ LAYOUTS.plex.libsChanged = plexLibsChanged;
 // G4 is where that thesis gets tested.
 //
 // And it re-derives NOTHING that the page models carry. R4 landed with the G3
-// record precisely because plexItemBody re-derived ~70 lines of decisions from
+// record precisely because catalogItemBody re-derived ~70 lines of decisions from
 // classicItemBody — the year range, the resume threshold, the playable file,
 // the version-header rule, the children label. theaterItemBody switches on
 // `p.shape` and reads `p.resume` / `p.playable` / `p.meta` / `p.years` /
@@ -8822,7 +8827,7 @@ LAYOUTS.plex.libsChanged = plexLibsChanged;
 // ---------------------------------------------------------------------------
 // 1. Chrome — a translucent bar over the art
 // ---------------------------------------------------------------------------
-// Same contract as classicChrome() and plexChrome(): assign #app, produce
+// Same contract as classicChrome() and catalogChrome(): assign #app, produce
 // <main id="main"> with `inner` inside it, wire the 300 ms search debounce,
 // end with pollActivity().
 //
@@ -8832,7 +8837,7 @@ LAYOUTS.plex.libsChanged = plexLibsChanged;
 //
 // Navigation is emitted TWICE and CSS decides which copy is real: the desktop
 // row (.th-nav) and the phone's floating pill group (.th-pills), per plan
-// §2.5. Same reason plex emits its sidebar and its tab bar on every surface —
+// §2.5. Same reason catalog emits its sidebar and its tab bar on every surface —
 // a window dragged narrow changes shape live, with no re-render and no stale
 // JS branch. Both copies are anchors, both carry aria-current, and the two
 // never disagree because they are built from one list.
@@ -9039,7 +9044,7 @@ function theaterHomeBody(p){
     for(const s of p.sections){
       const head=`${esc(s.name)} <a class="muted" style="font-size:12px" href="${esc(s.href)}">· view all (${esc(String(s.total))})</a>`;
       // Two cases still take a grid rather than a rail, both inherited from
-      // the plex drop's reasoning. An EMPTY section, because rail() on an
+      // the catalog drop's reasoning. An EMPTY section, because rail() on an
       // empty row renders a heading over nothing while grid([]) renders the
       // "Nothing here yet." card the rest of the app uses; and any section
       // holding PHOTOS, because grid() is what populates PHOTO_SET and
@@ -9067,7 +9072,7 @@ function theaterHomeBody(p){
 // redraws its grid five or six times while loading, and a body(model) contract
 // would take the reader's scroll position with it every time.
 //
-// The scroller stays the WINDOW, as in classic and plex. Making #libbody an
+// The scroller stays the WINDOW, as in classic and catalog. Making #libbody an
 // overflow:auto box would satisfy a literal reading of "#libbody is the thing
 // that scrolls" and would silently kill the shipped scroll-spy (one window
 // listener; scroll events do not bubble).
@@ -9137,7 +9142,7 @@ function theaterItemBody(p){
   // itself, with the year range beside it. `p.years` is the MODEL's range —
   // gathered from the seasons' air dates plus the item's own — and is not
   // recomputed here. That single field is 12 lines of duplicated cascade in
-  // classicItemBody and plexItemBody, and it is the headline example in the
+  // classicItemBody and catalogItemBody, and it is the headline example in the
   // G3 record of the abstraction failing one layer down.
   const yrs = p.years ? `${p.years.from}${p.years.to>p.years.from?'–'+p.years.to:''}` : '';
   const kick=[it.kind?esc(it.kind):'', yrs].filter(Boolean).join(' · ');
@@ -9210,7 +9215,7 @@ function theaterItemBody(p){
     if(a) acts=`<div class="actions">${a}</div>`;
     // `p.childLabel` straight, with no folder re-test on top of it: the model
     // already answers 'Contents' for a folder, 'Seasons' for a show and
-    // 'Episodes' otherwise. classic and plex both wrap it in a ternary that
+    // 'Episodes' otherwise. classic and catalog both wrap it in a ternary that
     // recomputes the folder case the model had already handled.
     rest=`<h2 class="section">${esc(p.childLabel)}</h2>${grid(p.children)}`;
   } else if(p.shape==="folder"){
@@ -9290,7 +9295,7 @@ function theaterStickyFloor(){
 // the check, classic would start emitting posters carrying tabindex — a diff
 // in the structural golden the gate re-checks after every layout lands.
 //
-// This is a near-copy of plexWireOnce()/plexEnhanceCards() and it should not
+// This is a near-copy of catalogWireOnce()/catalogEnhanceCards() and it should not
 // be. NOTES §5.5 asks for it to move into shared wiring behind a per-layout
 // flag before G5 — at five layouts it is five copies of the same observer.
 let THEATER_WIRED=false;

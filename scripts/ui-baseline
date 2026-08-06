@@ -12,8 +12,8 @@ docs/UI-LAYOUTS-G3-DECISION.md §3 and §5/R1):
     hand, so nothing ever failed;
   * it photographed exactly ONE `(layout, theme, appearance)` triple, so a
     regression that only manifests under a non-default layout was invisible.
-    Two real `plex` fixes were silently reverted and shipped as done, and this
-    harness passed them: from `classic`'s point of view a plex-only fix is a
+    Two real `catalog` fixes were silently reverted and shipped as done, and this
+    harness passed them: from `classic`'s point of view a catalog-only fix is a
     correct no-op. Coverage shrank as the arc succeeded — 1 of 2 layouts then,
     1 of 5 by G6.
 
@@ -109,9 +109,9 @@ touch the portable tier; that is what makes the portable tier committable:
     that reaches a focus label — see `scrub()`.)
   * The host. Chromium's rasteriser and the bundled build both move with the
     image; PNG hashes do not travel between the sandbox and a Mac.
-  * Two captures — `plex/item@1280x860` and `plex/library@1280x860` — still
+  * Two captures — `catalog/item@1280x860` and `catalog/library@1280x860` — still
     move between two runs of an unchanged tree in the sandbox, roughly one run
-    in two. Measured, not assumed: 34 of 36 are stable. Both are plex desktop
+    in two. Measured, not assumed: 34 of 36 are stable. Both are catalog desktop
     routes with rails, so the suspect is the same scroll/arrow interaction the
     `--rest-ms` wait tamed elsewhere. They are named here rather than chased
     because the pixel tier is a human-judged before/after aid and not a gate;
@@ -297,7 +297,7 @@ FOCUS_JS = """
 #
 # `LAYOUTS` is a top-level `const` in the <head> script, so it is a global
 # lexical binding — visible to an evaluated function, absent from `window`.
-# `plex` (and every layout after it) attaches its renderers to that same object
+# `catalog` (and every layout after it) attaches its renderers to that same object
 # from the body script, which is why this must run against a fully parsed
 # document rather than against the HTML source. Parsing index.html for a layout
 # list would produce a second, lagging copy of the authority; this cannot lag.

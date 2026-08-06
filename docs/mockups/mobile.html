@@ -65,7 +65,7 @@
   [data-theme=terminal] .wm::before{content:":~$ "}
   [data-theme=terminal] .phone *,[data-theme=terminal] .tablet *{border-radius:0 !important}
 
-  /* bottom tab bar (plex phone) */
+  /* bottom tab bar (catalog phone) */
   .tabs{margin-top:auto;display:flex;border-top:1px solid var(--line);
     background:color-mix(in srgb,var(--panel) 88%,transparent);backdrop-filter:blur(8px);padding:7px 4px 10px}
   .tabs span{flex:1;text-align:center;font-size:8.5px;color:var(--muted);display:flex;flex-direction:column;
@@ -99,7 +99,7 @@
   .gch .b .gp{height:2.5px;background:var(--panel2);border-radius:2px;margin-top:4px;overflow:hidden}
   .gch .b .gp i{display:block;height:100%;background:var(--accent)}
 
-  /* tablet plex shell */
+  /* tablet catalog shell */
   .tb-shell{display:flex;height:100%}
   .tb-side{width:168px;flex:none;border-right:1px solid var(--line);padding:12px 8px;display:flex;
     flex-direction:column;gap:2px;background:color-mix(in srgb,var(--panel) 72%,var(--bg));font-size:11px}
@@ -201,7 +201,7 @@ function phClassic(){
       <div class="pgrid">${[IT[3],IT[4],IT[5],IT[6],IT[7],IT[8]].map(x=>pcard(x,"100%",false,9)).join("")}</div>
     </div></div>`;
 }
-function phPlex(){
+function phCatalog(){
   const it=IT[0];
   return `<div class="scr">
     <div style="padding:28px 12px 6px;display:flex;align-items:center;gap:8px">
@@ -289,8 +289,8 @@ function phGuide(){
       display:flex;gap:10px"><span>▲▼ channel</span><span>tap · watch</span>
       <span style="margin-left:auto;color:var(--accent)">g · classic</span></div></div>`;
 }
-/* ---------- tablet (plex layout, desktop-class) ---------- */
-function tabPlex(){
+/* ---------- tablet (catalog layout, desktop-class) ---------- */
+function tabCatalog(){
   return `<div class="tb-shell">
     <aside class="tb-side">
       <span class="wm" style="padding:2px 8px 8px"><span class="t">cinemarr</span></span>
@@ -316,11 +316,11 @@ function tabPlex(){
 
 const DEVICES=[
   {cap:"<b>classic</b>current responsive web app — header wraps, rails stack",render:phClassic,cls:"phone"},
-  {cap:"<b>plex</b>bottom tabs (Home · Libraries · Search · Activity), art-forward rails",render:phPlex,cls:"phone"},
+  {cap:"<b>catalog</b>bottom tabs (Home · Libraries · Search · Activity), art-forward rails",render:phCatalog,cls:"phone"},
   {cap:"<b>theater</b>full-bleed hero, floating pill nav, chrome disappears",render:phTheater,cls:"phone"},
   {cap:"<b>deck</b>dense list + always-on filters + status strip",render:phDeck,cls:"phone"},
   {cap:"<b>guide</b>vertical channel list — now / next per channel",render:phGuide,cls:"phone"},
-  {cap:"<b>plex on iPadOS / tablets</b>desktop-class sidebar returns at tablet width (Android tablets identical)",render:tabPlex,cls:"tablet"},
+  {cap:"<b>catalog on iPadOS / tablets</b>desktop-class sidebar returns at tablet width (Android tablets identical)",render:tabCatalog,cls:"tablet"},
 ];
 function bar(){
   const b=(k,id,nm)=>`<button class="${STATE[k]===id?"on":""}" onclick="setS('${k}','${id}')">${nm}</button>`;
