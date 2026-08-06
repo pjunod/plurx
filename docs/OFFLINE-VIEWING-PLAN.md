@@ -1,10 +1,9 @@
 # Offline viewing — one-tap, app-managed downloads
 
-**Status:** reviewed · revised · implementation candidate complete · Fable
-changes reconciled on draft PR #68 · re-review and physical-device acceptance pending ·
+**Status:** implementation and observability merged in PRs #68–#69 · late
+Fable review audited against merged code · physical-device acceptance pending ·
 **Executes:** offline viewing requested 2026-08-05 · **Written:** 2026-08-05 ·
-**Revised:** 2026-08-05 against review base `2ff661da` · **Implementation
-target:** `origin/main` at `7874b37b`
+**Revised:** 2026-08-05 against merged `main` after PR #70
 
 Companion to [PLAYBACK.md](PLAYBACK.md) (how online delivery works),
 [CLIENTS.md](CLIENTS.md) (the native-client boundary), and
@@ -318,8 +317,9 @@ A package does not enter `ready` until all of these are true:
   not the source file's values used by today's generic HLS master.
 - The package's actual byte count includes media segments, video playlist,
   offline master, and selected VTT rendition. Readiness re-parses duration from
-  the completed playlist's `#EXTINF` entries rather than assuming a cache
-  duration column that does not exist.
+  the completed playlist's `#EXTINF` entries and persists it in
+  `offline_packages.duration_ms`; that column records the verified output and
+  is never trusted as a substitute for parsing the finished playlist.
 
 Only VOD can be saved by Apple's offline HLS APIs. A `ready` response for a
 growing playlist would therefore be a platform failure disguised as success.
@@ -343,8 +343,10 @@ names against
 {
   "file_id": 42,
   "qualities": [
-    { "height": 1080, "label": "High", "estimated_bytes": 4831838208 },
-    { "height": 720, "label": "Standard", "estimated_bytes": 2466250752 }
+    { "height": 1080, "label": "High", "estimated_bytes": 4831838208,
+      "reserved_bytes": 7200386349 },
+    { "height": 720, "label": "Standard", "estimated_bytes": 2466250752,
+      "reserved_bytes": 3651948228 }
   ],
   "audio": [
     { "index": 0, "codec": "truehd", "channels": 8,
@@ -352,9 +354,11 @@ names against
   ],
   "subtitles": [
     { "index": 2, "codec": "subrip", "language": "eng",
-      "title": "English", "default": true, "offline_mode": "native" },
+      "title": "English", "default": true, "forced": false,
+      "offline_mode": "native" },
     { "index": 3, "codec": "hdmv_pgs_subtitle", "language": "eng",
-      "title": "English SDH", "default": false, "offline_mode": "burned" }
+      "title": "English SDH", "default": false, "forced": false,
+      "offline_mode": "unavailable" }
   ],
   "recommended_audio_index": 0,
   "recommended_subtitle_index": 2
@@ -371,9 +375,11 @@ Rules:
   platform overhead separately; neither number is a storage guarantee.
 - Recommendations come from the same `select_tracks` and language preferences
   as playback. No client duplicates the language algorithm.
-- `offline_mode` is `native` for simple WebVTT-convertible text. Bitmap or
-  styled recommendations become `none`; explicit burn is deferred until the
-  UI can require confirmation. Unknown explicit selections are rejected.
+- `offline_mode` is `native` for simple WebVTT-convertible text and
+  `unavailable` for bitmap or styled tracks. Explicit burn is deferred until
+  the UI can require confirmation. Unknown explicit selections are rejected.
+- `reserved_bytes` uses the peak bitrate admission bound; `forced` preserves
+  the source subtitle disposition. Neither field is inferred by a client.
 - A missing source returns the same `409` availability explanation as
   `/decision`; an unprobed file returns `409` because package sizing and track
   selection would be guesses.
@@ -429,10 +435,11 @@ admin-only `Forbidden` text.
 
 The owning client polls while preparing. States are
 `queued · preparing · ready · failed`; phases are
-`waiting_for_encoder · transcoding · extracting_subtitles · publishing ·
-ready`. `progress` is nullable until the first complete segment, then equals
-completed presentation duration divided by source duration and never moves
-backward. `bytes_ready` counts only published/staged complete files.
+`waiting_for_encoder · waiting_for_source · validating · transcoding ·
+extracting_subtitles · publishing · ready`. `progress` is nullable until the
+first complete segment, then equals completed presentation duration divided by
+source duration and never moves backward. `bytes_ready` is zero until the
+complete cache artifact is published, then equals its verified byte count.
 
 Failure is typed:
 
@@ -453,8 +460,8 @@ Expected codes are `source_unavailable · invalid_track · insufficient_storage
 offline_disabled · quota_exceeded`. Internal ffmpeg paths and stderr do not
 cross the API.
 
-Clients poll after 1 s, then 2 s, then every 5 s. The app may stop polling in
-the background; the durable server job continues and the next GET catches up.
+Clients poll every 2 seconds. The app may stop polling in the background; the
+durable server job continues and the next GET catches up.
 
 ### 5.4 `PUT /api/v1/offline/packages/{id}/lease`
 
@@ -554,6 +561,7 @@ CREATE TABLE offline_packages (
     estimated_bytes    INTEGER NOT NULL DEFAULT 0,
     reserved_bytes     INTEGER NOT NULL DEFAULT 0,
     actual_bytes       INTEGER,
+    duration_ms        INTEGER,
     error_code         TEXT,
     error_message      TEXT,
     created_at         INTEGER NOT NULL DEFAULT (unixepoch()),
@@ -567,6 +575,8 @@ CREATE INDEX offline_packages_queue
     ON offline_packages(node_id, state, created_at);
 CREATE INDEX offline_packages_recipe
     ON offline_packages(node_id, recipe_hash, state);
+CREATE INDEX offline_packages_user_state
+    ON offline_packages(user_id, state, updated_at);
 
 CREATE TABLE offline_package_leases (
     token_hash      TEXT PRIMARY KEY,
@@ -577,8 +587,8 @@ CREATE TABLE offline_package_leases (
     expires_at      INTEGER NOT NULL
 ) STRICT;
 
-CREATE INDEX offline_package_leases_package
-    ON offline_package_leases(package_id);
+CREATE INDEX offline_package_leases_expiry
+    ON offline_package_leases(expires_at);
 ```
 
 `file_id` deliberately has no foreign key. Rescans replace file rows and must
@@ -690,15 +700,17 @@ install reserves 25 GiB globally and 15 GiB per user; operators may set either
 to zero to disable admission. Offline sweeps protect preparing, ready, and
 actively leased recipes and never evict ordinary playback cache to make room.
 
-Before accepting work, compare the conservative estimate with filesystem free
-space and the configured cache ceiling after unpinned eviction candidates. A
-package may reuse a complete matching recipe for zero new bytes. Do not delete
-another active transfer to make room.
+Version 1 admission compares the conservative estimate with the configured
+global and per-user offline ceilings. It does not measure filesystem free space
+or evict ordinary playback cache to make room. A package may reuse a complete
+matching recipe for zero new bytes; unexpected filesystem exhaustion surfaces
+later as `encoder_failed`, so operators must provision the data directory for
+both playback and offline budgets.
 
-The existing playback-cache reader/eviction race is a separate corrective
-change with its own regression test and commit. Active readers expose a recipe
-pin while segments are served so housekeeping cannot delete their directory;
-that change does not ride invisibly inside the offline milestone.
+The existing playback-cache reader/eviction race remains a separate corrective
+change. Offline package pins do not protect an ordinary active playback reader;
+that follow-up needs its own regression and fix rather than riding invisibly
+inside this milestone.
 
 ### 7.4 Offline HLS is a separate presentation wrapper
 
@@ -1075,7 +1087,8 @@ serves a lease. Silence here would imply a DRM promise plurx does not make.
 | Live playback takes encoder | Preparing pauses without losing percent | Resume from staged segment boundary after the live waiter clears. |
 | Server restarts while preparing | Preparing returns to Queued | Startup requeues durable row and resumes its claim. |
 | Source disappears | Failed · Media unavailable on server | Restore/rescan source, then Retry creates a fresh request. |
-| Server cache lacks space | Not started · Needs N GB on server | Admin frees/increases cache; no partial client task exists. |
+| Configured server offline quota is full | Not started · Offline quota exceeded | Admin increases the applicable quota or removes another package; no partial client task exists. |
+| Server filesystem fills during preparation | Failed · Download preparation failed | Admin frees server storage, then Retry. Version 1 has no up-front filesystem-capacity admission check. |
 | Device lacks space | Not started · Needs N GB on device | Remove downloads/free storage, then Retry. |
 | Wi-Fi disappears | Waiting for Wi-Fi | Platform background manager resumes under requirements. |
 | Lease nears expiry during transfer | Downloading | Media reads and status polls renew the same stable lease URL. |
@@ -1195,8 +1208,9 @@ Land reviewable slices:
 - **M2c:** separate offline budget, per-user quota, pins, activity, ETA, and
   metric plumbing.
 - **Separate cache-reader follow-up:** the pre-existing playback-reader/LRU race
-  is not introduced by offline viewing. Keep it out of this feature diff and
-  land its own focused regression/fix before enabling offline viewing by default.
+  is not introduced or fixed by offline viewing. Keep its regression and fix
+  focused; do not count offline recipe pins as evidence that active playback
+  readers are protected.
 
 **Acceptance:** prepare the synthetic HEVC/HDR + TrueHD case as 720p
 H.264/AAC/SDR while a recommended PGS selection safely becomes Off; prepare an
@@ -1279,9 +1293,9 @@ one restoration integration test rather than mocks of every callback.
 The current suite has three release-gate gaps: it has no durable native
 download-task harness, no cache-only player assertion that fails on any
 upstream access, and no server test where cache eviction races an active VOD
-reader. The reader race predates this branch and remains a separate focused
+reader. The reader race predates this feature and remains a separate focused
 follow-up; the two device behaviors remain physical acceptance work rather
-than reasons to widen this draft.
+than reasons to reopen the merged implementation.
 
 ### 15.1 Server unit and integration coverage
 
@@ -1390,9 +1404,9 @@ the server cannot infer either from lease traffic, so those remain explicit
 future instrumentation rather than invented counters. Self-hosted plurx does
 not assume a central telemetry service.
 
-## 17. Implementation handoff — what the draft PR proves
+## 17. Implementation handoff — what the merged work proves
 
-The implementation candidate now covers the durable server package and lease,
+The merged implementation covers the durable server package and lease,
 shared producer/cache rules, timestamped progress merge, iOS and Android
 catalogs/background downloaders, cache-only local playback, profile isolation,
 settings, deletion, security documentation, and validation ownership described
@@ -1412,7 +1426,7 @@ Automated evidence recorded on 2026-08-05:
 - The `offline.viewing` CI plan selects the store/API contract plus both native
   client suites in the correct provider-to-consumer direction.
 
-Fable's first code review was reconciled on the original draft. The
+Fable's first code review was reconciled on PR #68 before it merged. The
 server now separates filesystem ownership from eviction policy, binds a recipe
 before production, recovers pruned native subtitle sidecars from an unchanged
 source snapshot, reports part-boundary preparation progress, throttles lease
@@ -1422,9 +1436,8 @@ recovery for Android 12+ service-start refusal. Apple serializes preparation per
 item, explicitly selects and verifies the cached subtitle rendition, reconciles
 taskless downloads, and resumes preparation/progress sync on app foreground.
 PR #68 merged into `main` as `2c8a8a76` on 2026-08-05 before the planned Fable
-follow-up appeared. A new draft follow-up from
-`codex/offline-viewing-follow-up` adds the operator activity rows and bounded
-Prometheus family without rewriting the merged feature history.
+follow-up appeared. PR #69 then merged the operator activity rows and bounded
+Prometheus family as `1c5b1872` without rewriting the feature history.
 
 The feature remains release-gated on these physical-device evidence gaps:
 
@@ -1435,12 +1448,11 @@ The feature remains release-gated on these physical-device evidence gaps:
    pass.
 3. Same real server-prepared package transferred to both client families, then
    removed with server lease and device bytes reconciled.
-The follow-up branch closes the former fourth gap: the global pill and activity
+The follow-up closes the former fourth gap: the global pill and activity
 page now show preparation/sending work, and `/metrics` exposes state, quota,
 quality, timing, byte, lease, cancellation, and bounded failure series. Do not
-merge its draft PR before review. Any further Fable feedback belongs on that
-same branch, with judgment calls recorded in the PR and this ledger updated if
-the contract changes.
+claim physical-device evidence from those server-side signals; the three device
+gaps above remain the release gate.
 
 ## 18. Platform references — primary documentation
 

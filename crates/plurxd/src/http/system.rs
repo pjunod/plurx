@@ -1075,7 +1075,7 @@ pub async fn update_settings(
         if let Some(gb) = value {
             if !(0..=10_240).contains(&gb) {
                 return Err(ApiError::BadRequest(format!(
-                    "{label} must be between 0 (off) and 10240"
+                    "{label} must be between 0 (disables offline admission) and 10240"
                 )));
             }
             state.store.put_setting(key, &gb.to_string()).await?;
@@ -1084,7 +1084,8 @@ pub async fn update_settings(
     if let Some(rows) = req.offline_max_rows_per_user {
         if !(0..=10_000).contains(&rows) {
             return Err(ApiError::BadRequest(
-                "offline_max_rows_per_user must be between 0 (off) and 10000".into(),
+                "offline_max_rows_per_user must be between 0 (disables offline admission) and 10000"
+                    .into(),
             ));
         }
         state

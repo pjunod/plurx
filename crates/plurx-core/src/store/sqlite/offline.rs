@@ -741,6 +741,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn zero_quotas_disable_offline_admission() {
+        let store = store().await;
+        assert_eq!(
+            store
+                .create_offline_package(&request("rows-off"), 0, 1_000, 2_000)
+                .await
+                .expect("row limit"),
+            OfflineCreateOutcome::RowLimit { limit: 0 }
+        );
+        assert_eq!(
+            store
+                .create_offline_package(&request("user-bytes-off"), 10, 0, 2_000)
+                .await
+                .expect("user byte limit"),
+            OfflineCreateOutcome::ByteLimit { used: 0, limit: 0 }
+        );
+        assert_eq!(
+            store
+                .create_offline_package(&request("global-bytes-off"), 10, 1_000, 0)
+                .await
+                .expect("global byte limit"),
+            OfflineCreateOutcome::GlobalByteLimit { used: 0, limit: 0 }
+        );
+    }
+
+    #[tokio::test]
     async fn lease_is_hashed_stable_and_renewable() {
         let store = store().await;
         let package = match store

@@ -379,9 +379,9 @@ The authenticated settings API exposes four operator controls:
 | Field | Default | Meaning |
 |---|---:|---|
 | `offline_enabled` | `true` | Kill switch. Turning it off cancels active producers at a segment boundary and leaves their durable rows queued. |
-| `offline_max_gb` | `25` | Server-wide reservation ceiling for offline packages. `0` disables the byte ceiling. |
-| `offline_max_gb_per_user` | `15` | Per-user reservation ceiling. `0` disables the byte ceiling. |
-| `offline_max_rows_per_user` | `50` | Per-user package count. `0` disables the row ceiling. |
+| `offline_max_gb` | `25` | Server-wide reservation ceiling for offline packages. `0` disables offline admission. |
+| `offline_max_gb_per_user` | `15` | Per-user reservation ceiling. `0` disables offline admission. |
+| `offline_max_rows_per_user` | `50` | Per-user package count. `0` disables offline admission. |
 
 Creation reserves a conservative peak before ffmpeg starts, so a full queue is
 rejected early instead of filling the cache halfway through a title. Completed
