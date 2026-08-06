@@ -389,6 +389,11 @@ bump may break compatibility and a **patch** bump never does.
 
 ### Changed
 
+- **The library-first layout is now Catalog.** The picker, saved layout id,
+  renderer registry, CSS scopes, UI regression golden, mockups, and design
+  documents use `catalog`; browsers carrying the retired id migrate it on
+  first load, so the rename does not reset an existing choice to Classic.
+
 - **A subtitle track that cannot be extracted now fails fast and stays
   failed.** Extracting one is a full read of the source, so a wedged ffmpeg —
   a NAS mount that stops returning bytes without ever erroring — parked every

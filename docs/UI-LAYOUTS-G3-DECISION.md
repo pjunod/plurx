@@ -10,7 +10,7 @@ this is *whether it was worth building*, and what has to change before a
 second layout starts. Every number here was re-derived at the moment of
 writing; §1 says why that sentence is in this document at all.
 
-The short version: the composition thesis holds — `plex` is paint over one
+The short version: the composition thesis holds — `catalog` is paint over one
 application, not a second application — and the **verification** contract
 does not. It failed twice on the easiest layout this arc will ever build,
 and G4 doubles the surface it cannot see. Three conditions must land before
@@ -22,8 +22,8 @@ Theater starts. Two of them landed with this record.
 
 | G3 asks for | Measured |
 |---|---|
-| duplicated markup | **0** new card / rail / grid / fetch builders in `plex` |
-| extra requests | **0** — 18 route-captures, `classic` vs `plex`, identical |
+| duplicated markup | **0** new card / rail / grid / fetch builders in `catalog` |
+| extra requests | **0** — 18 route-captures, `classic` vs `catalog`, identical |
 | source size delta vs the +60–90 KB budget | **+112.0 KiB (+19.8%)** for ONE layout + seven themes |
 | route regressions caught by `ui-baseline` | **0 real, 1 false positive** — and it could not see the two that mattered (§3) |
 | cost of one shared card fix under both layouts | **24 added lines, 2 of them layout-scoped** |
@@ -42,7 +42,7 @@ than anything else here.
 
 ## 2. The abstraction, judged
 
-**It is real.** `plex` composes `card()`, `rail()`, `grid()`, `comingCard()`,
+**It is real.** `catalog` composes `card()`, `rail()`, `grid()`, `comingCard()`,
 `installBannerHtml()`, `groupToggleHtml()` and re-emits classic's `<select>`
 markup unmodified. It reuses the theme, appearance, size and profile popovers
 rather than forking them. It fetches nothing: the sidebar's data problem is
@@ -57,7 +57,7 @@ was in shared code and served both layouts at once. Under a
 five-applications-in-a-trenchcoat architecture that same fix is five edits
 and five chances to miss one.
 
-**But "zero new builders" measures the wrong layer.** `plexItemBody`
+**But "zero new builders" measures the wrong layer.** `catalogItemBody`
 re-derives roughly 70 lines from `classicItemBody`: the show/season year
 range, the resume threshold, the playable-file pick, the multi-versus-missing
 version-header rule, the Contents/Seasons/Episodes label. No component was
@@ -68,7 +68,7 @@ abstraction that holds and one that is holding.
 ### The counter-evidence worth naming
 
 One shared rule — `.azbar button.active{color:#fff}` — was defective on pale
-accents, and it was corrected with a `[data-layout=plex]` override rather
+accents, and it was corrected with a `[data-layout=catalog]` override rather
 than at the source. That is the abstraction becoming two applications by a
 route nobody was watching: the shared rule keeps the defect and each layout
 grows its own correction. Fixed at the source in this gate's commit set.
@@ -99,7 +99,7 @@ stops. It is a *conservation* check, not a *presence* check.
 
 Two G2b fixes were silently reverted by a background job and shipped as
 done. **The harness was not broken when it passed them.** A fix that only
-manifests under `plex` is, from `classic`'s point of view, a correct no-op —
+manifests under `catalog` is, from `classic`'s point of view, a correct no-op —
 the harness answered precisely the question it was asked. The error was
 treating "classic is unchanged" as a proxy for "the change landed." They are
 different assertions and only one of them was being made.
@@ -119,8 +119,8 @@ theme catalogue spent **1.2× the entire budget**. Decomposed:
 
 | Component | Bytes |
 |---|---:|
-| `plex` JS | ~41,000 (about half of it comment prose) |
-| `plex` CSS, 219 scoped rules | ~26,000 |
+| `catalog` JS | ~41,000 (about half of it comment prose) |
+| `catalog` CSS, 219 scoped rules | ~26,000 |
 | seven new theme tables + treatments | ~12,900 |
 | registry, seam, hooks | ~5,400 |
 | greyed-control machinery | ~2,400 |
@@ -128,7 +128,7 @@ theme catalogue spent **1.2× the entire budget**. Decomposed:
 So the **marginal cost of a layout is ~67 KB**, and ~48 KB of the total was
 one-time: the seam, and a theme catalogue that is now finished.
 
-**Do not scale that linearly — the correction runs upward.** `plex` is the
+**Do not scale that linearly — the correction runs upward.** `catalog` is the
 cheapest layout that will ever ship. It converted 3 of 7 routes, inherited
 the library `items`/`count` regions, the pager and the rail wholesale, added
 zero components, and left activity, settings, search and player to classic
@@ -164,7 +164,7 @@ route. Splitting by layout parallelises none of that; it converts "one owner
 of `index.html`" into "one owner of `web/`" plus a manifest to get wrong. And
 a chunk somebody forgot to register renders as a stylesheet that failed to
 load — already the hardest symptom in this codebase to debug, and the one
-that bit the `plex` port.
+that bit the `catalog` port.
 
 Trigger to revisit: Theater lands ≥40 KB of layout-scoped JS **and** two
 layout gates need to run concurrently. Split by *kind* first (`styles.css`,
@@ -174,7 +174,7 @@ tooling than exists now.
 
 ## 5. Verdict — revise, then continue
 
-Not *stop*: the seam holds, `plex` is 67 KB of paint rather than a second
+Not *stop*: the seam holds, `catalog` is 67 KB of paint rather than a second
 application, and the composition thesis survived contact at the component
 level. Not *continue* unchanged: the verification contract failed twice on
 the easiest case, and G4 doubles what it cannot see.
@@ -192,7 +192,7 @@ entry conditions for G4.
   cited in four places as the enforcer of §3.2's fetch discipline and had no
   code behind it. **Done:** `ui-baseline` now records method + path per route
   and writes `requests.json`. First run of it: 18 route-captures, `classic`
-  vs `plex`, **0 differing**. The claim was true; it just was not being
+  vs `catalog`, **0 differing**. The claim was true; it just was not being
   checked.
 - **R3 — every gate's accept list gains a presence assertion.** Not only
   "classic is unchanged" but "the new behaviour is in the artifact" — grep
@@ -200,7 +200,7 @@ entry conditions for G4.
   independent verifier reads the artifact, never the note. **Not done —
   a process change for the plan.**
 - **R4 — extend "no second card function" to route bodies.** Move the shared
-  derivation in `classicItemBody` / `plexItemBody` — chips, resume, playable
+  derivation in `classicItemBody` / `catalogItemBody` — chips, resume, playable
   file, version headers, children label — into `loadItem()`'s page model, so
   a body builder composes rather than decides. One commit now; four at G6.
   **Not done.**
