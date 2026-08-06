@@ -2100,6 +2100,10 @@ impl TranscodeManager {
         &self.cache_readers
     }
 
+    pub fn active_cache_entries(&self) -> usize {
+        self.cache_readers.active_entries()
+    }
+
     /// Override [`ProducerTuning`]. Tests only — there is deliberately no
     /// production path that reaches this, so the daemon cannot be configured
     /// into pacing a producer or into a shorter retry by accident.
@@ -2728,7 +2732,10 @@ impl TranscodeManager {
             }
             Err(error) => {
                 let _ = tokio::fs::remove_dir_all(&temp).await;
-                let _ = self.store.forget_cache_entry(&hash, &cache.node_id).await;
+                let _ = self
+                    .store
+                    .forget_cache_entry(&hash, &cache.node_id, "local")
+                    .await;
                 return Err(error);
             }
         };

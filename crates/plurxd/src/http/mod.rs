@@ -2710,6 +2710,7 @@ mod tests {
         assert_eq!(status_code, StatusCode::OK);
         assert!(metrics.contains("plurx_offline_packages{state=\"queued\"} 1"));
         assert!(metrics.contains("plurx_offline_requests_total{height=\"720\"} 1"));
+        assert!(metrics.contains("plurx_cache_protected_entries{reason=\"active_playback\"} 0"));
         assert!(
             !metrics.contains("Flight"),
             "titles must never become labels"

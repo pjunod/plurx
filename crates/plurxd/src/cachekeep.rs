@@ -26,7 +26,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use plurx_core::domain::CachedTranscode;
 use plurx_core::store::{keys, Store};
@@ -50,6 +50,12 @@ enum CacheActivity {
     Evicting,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum CacheBusy {
+    Readers,
+    Evicting,
+}
+
 pub struct CacheReadGuard {
     readers: ActiveCacheReaders,
     recipe: String,
@@ -61,9 +67,16 @@ struct CacheEvictionGuard {
 }
 
 impl ActiveCacheReaders {
+    fn lock_states(&self) -> MutexGuard<'_, HashMap<String, CacheActivity>> {
+        self.states.lock().unwrap_or_else(|poisoned| {
+            tracing::error!("cache ownership mutex was poisoned; recovering its state");
+            poisoned.into_inner()
+        })
+    }
+
     /// Start serving one recipe, unless eviction already owns it.
     pub fn begin_read(&self, recipe: &str) -> Option<CacheReadGuard> {
-        let mut states = self.states.lock().expect("cache reader mutex");
+        let mut states = self.lock_states();
         match states.get_mut(recipe) {
             Some(CacheActivity::Readers(count)) => *count += 1,
             Some(CacheActivity::Evicting) => return None,
@@ -79,44 +92,73 @@ impl ActiveCacheReaders {
 
     /// Claim a recipe for removal. Active readers make eviction skip it; the
     /// next sweep will retry after their sessions end.
-    fn begin_eviction(&self, recipe: &str) -> Option<CacheEvictionGuard> {
-        let mut states = self.states.lock().expect("cache reader mutex");
-        if states.contains_key(recipe) {
-            return None;
+    fn begin_eviction(&self, recipe: &str) -> Result<CacheEvictionGuard, CacheBusy> {
+        let mut states = self.lock_states();
+        match states.get(recipe) {
+            Some(CacheActivity::Readers(_)) => return Err(CacheBusy::Readers),
+            Some(CacheActivity::Evicting) => return Err(CacheBusy::Evicting),
+            None => {}
         }
         states.insert(recipe.to_owned(), CacheActivity::Evicting);
-        Some(CacheEvictionGuard {
+        Ok(CacheEvictionGuard {
             readers: self.clone(),
             recipe: recipe.to_owned(),
         })
+    }
+
+    /// Number of recipes protected by at least one active playback session.
+    /// Reader multiplicity stays internal; the operational question is how
+    /// many cache entries housekeeping is presently forbidden to remove.
+    pub fn active_entries(&self) -> usize {
+        self.lock_states()
+            .values()
+            .filter(|state| matches!(state, CacheActivity::Readers(_)))
+            .count()
     }
 }
 
 impl Drop for CacheReadGuard {
     fn drop(&mut self) {
-        let mut states = self.readers.states.lock().expect("cache reader mutex");
-        let remove = match states.get_mut(&self.recipe) {
-            Some(CacheActivity::Readers(count)) if *count > 1 => {
-                *count -= 1;
-                false
-            }
-            Some(CacheActivity::Readers(_)) => true,
-            Some(CacheActivity::Evicting) | None => {
-                debug_assert!(false, "cache reader ownership changed while held");
-                false
+        let mismatch = {
+            let mut states = self.readers.lock_states();
+            match states.get_mut(&self.recipe) {
+                Some(CacheActivity::Readers(count)) if *count > 1 => {
+                    *count -= 1;
+                    false
+                }
+                Some(CacheActivity::Readers(_)) => {
+                    states.remove(&self.recipe);
+                    false
+                }
+                Some(CacheActivity::Evicting) | None => true,
             }
         };
-        if remove {
-            states.remove(&self.recipe);
+        if mismatch {
+            tracing::error!(
+                recipe = %self.recipe,
+                "cache reader ownership changed while its guard was held"
+            );
         }
     }
 }
 
 impl Drop for CacheEvictionGuard {
     fn drop(&mut self) {
-        let mut states = self.readers.states.lock().expect("cache reader mutex");
-        let removed = states.remove(&self.recipe);
-        debug_assert!(matches!(removed, Some(CacheActivity::Evicting)));
+        let mismatch = {
+            let mut states = self.readers.lock_states();
+            if matches!(states.get(&self.recipe), Some(CacheActivity::Evicting)) {
+                states.remove(&self.recipe);
+                false
+            } else {
+                true
+            }
+        };
+        if mismatch {
+            tracing::error!(
+                recipe = %self.recipe,
+                "cache eviction ownership changed while its guard was held"
+            );
+        }
     }
 }
 
@@ -205,6 +247,14 @@ pub async fn sweep_with_readers(
     {
         Ok(stale) => {
             for entry in stale {
+                let _eviction = match readers.begin_eviction(&entry.recipe_hash) {
+                    Ok(guard) => guard,
+                    Err(CacheBusy::Readers) => {
+                        out.protected += 1;
+                        continue;
+                    }
+                    Err(CacheBusy::Evicting) => continue,
+                };
                 if forget(store, root, node_id, &entry).await {
                     out.stale += 1;
                     // Not added to `bytes_freed`: an incomplete row's `bytes`
@@ -230,9 +280,13 @@ pub async fn sweep_with_readers(
                     if used <= ceiling {
                         break;
                     }
-                    let Some(_eviction) = readers.begin_eviction(&entry.recipe_hash) else {
-                        out.protected += 1;
-                        continue;
+                    let _eviction = match readers.begin_eviction(&entry.recipe_hash) {
+                        Ok(guard) => guard,
+                        Err(CacheBusy::Readers) => {
+                            out.protected += 1;
+                            continue;
+                        }
+                        Err(CacheBusy::Evicting) => continue,
                     };
                     let bytes = entry.bytes.max(0);
                     if forget(store, root, node_id, &entry).await {
@@ -266,11 +320,14 @@ pub async fn sweep_with_readers(
     out.bytes_after = used;
 
     // 3. Directories nothing claims.
-    out.orphans = sweep_orphan_dirs(store, root, node_id).await;
-    if out.stale + out.evicted + out.orphans > 0 {
+    let (orphans, protected) = sweep_orphan_dirs(store, root, node_id, readers).await;
+    out.orphans = orphans;
+    out.protected += protected;
+    if out.stale + out.evicted + out.protected + out.orphans > 0 {
         tracing::info!(
             stale = out.stale,
             evicted = out.evicted,
+            protected = out.protected,
             orphans = out.orphans,
             freed = out.bytes_freed,
             used = out.bytes_after,
@@ -308,7 +365,7 @@ async fn forget(
             "cache: refusing to delete a path outside the cache root; dropping the row only"
         );
         return store
-            .forget_cache_entry(&entry.recipe_hash, node_id)
+            .forget_cache_entry(&entry.recipe_hash, node_id, &entry.storage_class)
             .await
             .is_ok();
     };
@@ -324,7 +381,10 @@ async fn forget(
             return false;
         }
     }
-    match store.forget_cache_entry(&entry.recipe_hash, node_id).await {
+    match store
+        .forget_cache_entry(&entry.recipe_hash, node_id, &entry.storage_class)
+        .await
+    {
         Ok(()) => true,
         Err(e) => {
             tracing::warn!(recipe = %entry.recipe_hash, error = %e, "cache: could not forget entry");
@@ -367,7 +427,12 @@ fn entry_dir(root: &Path, relative: &str) -> Option<PathBuf> {
 /// rule below: what keeps a staging directory alive is the *claim* on its
 /// recipe, not a published location, because a producer part-way through a
 /// two-hour film has the former and cannot have the latter.
-async fn sweep_orphan_dirs(store: &Arc<dyn Store>, root: &Path, node_id: &str) -> usize {
+async fn sweep_orphan_dirs(
+    store: &Arc<dyn Store>,
+    root: &Path,
+    node_id: &str,
+    readers: &ActiveCacheReaders,
+) -> (usize, usize) {
     // Everything a row names, as absolute paths. Both complete and claimed: a
     // producer's publish destination is claimed and must not be swept out from
     // under it.
@@ -383,7 +448,7 @@ async fn sweep_orphan_dirs(store: &Arc<dyn Store>, root: &Path, node_id: &str) -
             // Ownership uncertainty must fail closed. Treating a store error
             // as an empty keep-list would recursively delete valid media.
             tracing::warn!(%error, "cache: could not enumerate filesystem owners; skipping orphan sweep");
-            return 0;
+            return (0, 0);
         }
     };
     for e in &rows {
@@ -396,9 +461,10 @@ async fn sweep_orphan_dirs(store: &Arc<dyn Store>, root: &Path, node_id: &str) -
     }
 
     let Ok(mut prefixes) = tokio::fs::read_dir(root).await else {
-        return 0; // no cache root yet just means nothing has been produced
+        return (0, 0); // no cache root yet just means nothing has been produced
     };
     let mut removed = 0usize;
+    let mut protected = 0usize;
     let mut staging: Option<PathBuf> = None;
     while let Ok(Some(prefix)) = prefixes.next_entry().await {
         let ppath = prefix.path();
@@ -424,6 +490,19 @@ async fn sweep_orphan_dirs(store: &Arc<dyn Store>, root: &Path, node_id: &str) -
                 kept += 1;
                 continue;
             }
+            let recipe = entry.file_name().to_string_lossy().into_owned();
+            let _eviction = match readers.begin_eviction(&recipe) {
+                Ok(guard) => guard,
+                Err(CacheBusy::Readers) => {
+                    protected += 1;
+                    kept += 1;
+                    continue;
+                }
+                Err(CacheBusy::Evicting) => {
+                    kept += 1;
+                    continue;
+                }
+            };
             match tokio::fs::remove_dir_all(&path).await {
                 Ok(()) => {
                     removed += 1;
@@ -455,6 +534,18 @@ async fn sweep_orphan_dirs(store: &Arc<dyn Store>, root: &Path, node_id: &str) -
                     kept += 1;
                     continue;
                 }
+                let _eviction = match readers.begin_eviction(&name) {
+                    Ok(guard) => guard,
+                    Err(CacheBusy::Readers) => {
+                        protected += 1;
+                        kept += 1;
+                        continue;
+                    }
+                    Err(CacheBusy::Evicting) => {
+                        kept += 1;
+                        continue;
+                    }
+                };
                 let path = entry.path();
                 match tokio::fs::remove_dir_all(&path).await {
                     Ok(()) => {
@@ -474,7 +565,7 @@ async fn sweep_orphan_dirs(store: &Arc<dyn Store>, root: &Path, node_id: &str) -
             }
         }
     }
-    removed
+    (removed, protected)
 }
 
 #[cfg(test)]
@@ -764,6 +855,69 @@ mod tests {
             !root.path().join("zz").exists(),
             "an emptied prefix goes with its last entry"
         );
+    }
+
+    /// A cache row can disappear while its bytes are still being served: scan
+    /// reconciliation cascades a vanished source file through the recipe and
+    /// location tables. The orphan pass must honor the same reader ownership
+    /// as LRU eviction, then collect the bytes after the last viewer leaves.
+    #[tokio::test]
+    async fn an_active_reader_survives_row_loss_and_the_orphan_pass() {
+        let (store, file) = store().await;
+        let root = root();
+        let dir = entry(&store, root.path(), file, "aawatching", 100).await;
+        let readers = ActiveCacheReaders::default();
+        let reader = readers.begin_read("aawatching").expect("reader claim");
+        store
+            .forget_cache_entry("aawatching", NODE, "local")
+            .await
+            .expect("remove row out from under reader");
+
+        let active = sweep_with_readers(&store, root.path(), NODE, &readers, unix_now()).await;
+        assert_eq!((active.orphans, active.protected), (0, 1));
+        assert!(
+            dir.join("index.m3u8").exists(),
+            "the orphan pass deleted bytes held by an active session"
+        );
+
+        drop(reader);
+        let idle = sweep_with_readers(&store, root.path(), NODE, &readers, unix_now()).await;
+        assert_eq!((idle.orphans, idle.protected), (1, 0));
+        assert!(
+            !dir.exists(),
+            "unowned bytes survived after the reader left"
+        );
+    }
+
+    #[test]
+    fn every_reader_must_leave_before_eviction_can_claim_a_recipe() {
+        let readers = ActiveCacheReaders::default();
+        let first = readers.begin_read("recipe").expect("first reader");
+        let second = readers.begin_read("recipe").expect("second reader");
+        assert_eq!(readers.active_entries(), 1);
+
+        drop(first);
+        assert!(matches!(
+            readers.begin_eviction("recipe"),
+            Err(CacheBusy::Readers)
+        ));
+        assert_eq!(readers.active_entries(), 1);
+
+        drop(second);
+        assert_eq!(readers.active_entries(), 0);
+        assert!(readers.begin_eviction("recipe").is_ok());
+    }
+
+    #[test]
+    fn a_lookup_during_eviction_is_an_ordinary_cache_miss() {
+        let readers = ActiveCacheReaders::default();
+        let eviction = readers.begin_eviction("recipe").expect("eviction claim");
+        assert!(
+            readers.begin_read("recipe").is_none(),
+            "a lookup entered while deletion owned the recipe"
+        );
+        drop(eviction);
+        assert!(readers.begin_read("recipe").is_some());
     }
 
     /// The staging area is not a fanout prefix, and the difference is hours of

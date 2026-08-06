@@ -7,7 +7,7 @@ was deliberately stripping the RPU before AVPlayer saw it. ·
 **Landing route:** A (§4.1) · **Continues:**
 [APPLE-NATIVE-SUBTITLES-HANDOFF.md](APPLE-NATIVE-SUBTITLES-HANDOFF.md) §8 ·
 **Reviewed:** branch `agent/native-apple-subtitles` tip `f35ada1` against
-production `787eaa6` · **Written:** 2026-08-02 · **Updated:** 2026-08-02
+production `787eaa6` · **Written:** 2026-08-02 · **Updated:** 2026-08-06
 
 Read the [handoff](APPLE-NATIVE-SUBTITLES-HANDOFF.md) first — it records what
 shipped, why each choice was made, and what the live server proved. This
@@ -358,12 +358,14 @@ track, which may, at source height.** A container default in another
 language is never a fallback. Explicit user selections may burn (that is
 the user asking); the policy governs what the player does on its own.
 
-### 3.4 Versions, changelog, release path
+### 3.4 Historical version snapshot; current Apple source is build 32
 
-Workspace `0.2.0` (single source: root `Cargo.toml` `[workspace.package]`);
-Apple `0.2.0` build `6` (`clients/apple/project.yml`, raised from `5` on
-2026-08-02 — not yet built or uploaded); Android `0.2.0` versionCode `3`
-(`build.gradle.kts`).
+At this plan's 2026-08-02 cut, the workspace was `0.2.0`, Apple was build 6,
+and Android versionCode was 3. Those numbers are historical evidence, not
+release instructions. Current source is workspace `0.2.7` and Apple build 32;
+[clients/apple/README.md](../clients/apple/README.md) still records that build
+as not uploaded to TestFlight. Read [RELEASING.md](RELEASING.md) and
+[PUBLISHING.md](PUBLISHING.md) for the current release path.
 
 **The changelog debt is paid** (2026-08-02): `CHANGELOG.md` `[Unreleased]`
 now carries this arc — native renditions and in-place Apple selection, QR
@@ -375,11 +377,9 @@ are folded into the feature entry rather than listed as fixes: they were
 never in a release, and an operator upgrading from `0.2.0` only ever sees the
 finished behavior.
 
-**The release itself is Paul's call.** Nothing here bumps `Cargo.toml` or
-dates a heading. At release this arc is a backwards-compatible feature set →
-minor bump `0.2.0 → 0.3.0`, tag `v0.3.0` (CI refuses a tag that disagrees
-with `Cargo.toml`). Next store uploads: Apple build ≥ 6, Android versionCode
-≥ 4.
+**The release itself remains Paul's call.** This historical plan does not
+choose a current version or tag. The next Apple upload is build 32 or higher;
+App Store Connect requires every later upload to advance again.
 
 ## 4. Landing route — decided: Route A
 
@@ -390,10 +390,11 @@ pins every node to `origin/main`, so any route that leaves them on a feature
 branch leaves the fleet broken for the length of the DV investigation. §1.1's
 strict-superset audit is what made the merge safe to take in one step.
 
-Nothing about that merge is published yet. The commits are local on
-`agent/native-apple-subtitles` and on `main`; **Paul pushes**, then runs the
-ansible playbooks, then builds the Apple client. Until he does, the fleet is
-still serving `787eaa6` and Bedroom is still running Apple build 5.
+At the 2026-08-02 handoff, nothing about that merge was published: the fleet
+served `787eaa6` and Bedroom ran Apple build 5. The repository still contains
+no later fleet-deployment or TestFlight-upload evidence, so publishing remains
+an operator gate; do not infer today's installed build from this historical
+paragraph.
 
 Paul delegated this decision to the executing agent (2026-08-02). The facts in
 §1.1 made either route cheap; they did not make them equal. Both are kept
@@ -466,8 +467,9 @@ Fix the three P0s together with their tombs from §2.6: the auto-selection
 format constraint (keeping the forced-at-source-height carve-out), the
 copy-origin cue shift, `-muxdelay 0 -muxpreload 0`, and the
 measured-first-PTS test class. Server fixes reach `origin/main` per §4 and
-deploy to the fleet via the ansible playbooks; client fix ships in the next
-TestFlight build (≥ 6).
+deploy to the fleet via the ansible playbooks; at the time, the client fix was
+assigned to the next TestFlight build (≥ 6). Current source is build 32 and is
+still recorded as not uploaded.
 
 **What actually landed.** P0-1: the `default` and `first` arms of automatic
 selection are constrained to `isNativeHLS`, and the forced arm stays
@@ -495,12 +497,11 @@ point (observable on Bedroom or simulator against a real file); an
 auto-selection XCTest proves a non-forced PGS-only language match selects
 nothing.
 
-**Acceptance status:** every test the milestone owed exists in the tree, named
-above. **The device half is not met**: nothing is pushed, no node has been
-redeployed, and no Apple build has been produced, so no cue has been watched
-against dialogue on real hardware. The fleet still runs `787eaa6`, which has
-both timing defects. Until Paul pushes and deploys, M1 is correct in the tree
-and absent from every running server.
+**Acceptance status at the 2026-08-02 handoff:** every test the milestone owed
+existed, but no current client/server build had been published. The copied-DV
+path later passed on physical Apple TV on 2026-08-03; the wider subtitle,
+offline, and release matrix is still open, and repository deployment evidence
+still ends at `787eaa6`.
 
 ### 5.2 M2 — selection robustness (P1-1..3) — **landed 2026-08-02**
 
@@ -574,14 +575,16 @@ segments.
 that proves an expired memo does not become permanent. As with M1/M2, a green
 gate run is not recorded in this tree.
 
-### 5.4 M4 — make the copied DV master physically playable (`-12927`) — **open**
+### 5.4 M4 — copied DV physical playback — **resolved 2026-08-03**
 
-**Nothing in M4 has been attempted.** Step 0's evidence has not been captured:
-no `init.mp4` has been fetched from a live 5615 session, no boxes dumped, no
-CoreMedia error chain captured from the device. `-12927` is exactly where the
-handoff left it. What M1–M3 changed for this milestone is only that the two
-candidate rungs below now *exist* as flags — off by default, unobserved, and
-therefore untested in the only sense that counts here.
+The steps below are the historical investigation plan and are retained as the
+failure record. The copied-Dolby path was resolved on physical Apple TV on
+2026-08-03: the OS 26 client had suppressed its still-valid format-specific DV
+mode, so the server stripped the RPU before AVPlayer saw it. The current client
+advertises Dolby Vision only when generic HDR eligibility and the output's DV
+mode both agree; file 5615 reaches `readyToPlay` with its RPU preserved. See
+[APPLE-NATIVE-SUBTITLES-HANDOFF.md](APPLE-NATIVE-SUBTITLES-HANDOFF.md) §1 for
+the superseding evidence.
 
 The handoff's §8.1 ladder stands. Two amendments from this review:
 
@@ -650,26 +653,21 @@ same series of commits:
   shipped (Keychain token storage, search, iOS PiP).
 - [x] `OPERATIONS.md` + `CHEATSHEET.md` document the two §5.4 ladder
   variables, 2026-08-02.
-- [ ] `docs/STATUS.html` — **not updated: the file is not in the working tree
-  the 2026-08-02 documentation pass ran against.** The status page arrived
-  with §1.1's status-page commit on local `main`; no copy exists under
-  `docs/`, so it could not be read, and rewriting a page whose structure and
-  generation conventions were unavailable would have clobbered the real one.
-  Refresh it from a tree that has it: it needs the M1–M3 landings, the fact
-  that none of this is pushed or deployed, and the still-open `-12927`.
-- [ ] Apple build ≥ 6 to TestFlight; Android versionCode ≥ 4 when its parity
-  work ships (out of scope here, §7). `project.yml` says build `6`, but
-  nothing has been built or uploaded.
+- [x] `docs/STATUS.html` refreshed 2026-08-06 with the M1–M3 landings and the
+  2026-08-03 copied-Dolby resolution.
+- [ ] Apple build 32 to TestFlight. Android native-subtitle parity shipped in a
+  separate implementation; the remaining Android work is physical acceptance,
+  not the source milestone this historical plan assigned.
 
 **Acceptance:** matrix results recorded in the parity doc; docs above
 updated in the same PR/commits as their behavior; CHANGELOG entry exists
 for every user-visible change this plan shipped.
 
-**Acceptance status:** the documentation clause is met except for
-`STATUS.html`. **The hardware matrix has not been run at all** — it cannot
-be, since no Apple build 6 exists and no node carries the server fixes. The
-parity doc's matrix rows therefore describe the tree, not a device, and say
-so.
+**Current status (2026-08-06):** the documentation clause is met and copied
+Dolby Vision has one physical Apple TV result. Build 32 is still not recorded
+as uploaded to TestFlight, the deployment ledger still ends at server
+`787eaa6`, and the broader hardware/offline matrix remains open. The parity
+doc's matrix therefore distinguishes source completion from device evidence.
 
 ## 6. Guardrails — what this pass must not do
 

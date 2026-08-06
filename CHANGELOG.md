@@ -429,12 +429,14 @@ bump may break compatibility and a **patch** bump never does.
 
 - **A cache budget sweep can no longer delete a film while somebody is
   watching it.** Finished pre-transcodes now carry process-local read
-  ownership from the cache lookup through the HLS session's lifetime. The LRU
-  sweep claims the same recipe exclusively before removing its row or bytes:
-  an active reader is skipped until the next sweep, while a lookup arriving
-  during eviction becomes an ordinary cache miss. This closes the documented
-  reader/eviction race without treating offline pins as evidence that online
-  playback is safe.
+  ownership from the cache lookup through the HLS session's lifetime. LRU,
+  stale-claim, and orphan cleanup claim the same recipe exclusively before
+  removing its row or bytes: an active reader is skipped until the next sweep,
+  while a lookup arriving during deletion becomes an ordinary cache miss.
+  Location deletion is scoped by storage class so a stale local copy cannot
+  erase a future shared one. Metrics expose the entries temporarily protected
+  from housekeeping. This closes the documented reader/cleanup races without
+  treating offline pins as evidence that online playback is safe.
 
 - **Apple playback info now stays open when the transport controls fade.**
   iPhone, iPad, and Apple TV used one visibility state for both overlays, so

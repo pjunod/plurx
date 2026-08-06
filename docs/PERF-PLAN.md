@@ -1436,6 +1436,16 @@ running beside it. What keeps a staging directory alive is the *claim on
 its recipe*, not a published location, because a producer part-way through
 a two-hour film has the former and cannot have the latter.
 
+**The cache budget is soft only while a viewer owns the bytes.** A cached HLS
+session holds process-local ownership on its recipe. LRU, stale-claim, and
+orphan cleanup all take exclusive ownership before deleting, so a source-file
+reconcile that cascades the location row cannot turn the next segment into a
+404. Housekeeping logs `protected` on every affected sweep and
+`plurx_cache_protected_entries{reason="active_playback"}` reports the current
+number of held recipes. A non-zero value with stable free space means cleanup
+is waiting correctly; a value that never returns to zero means a session is
+not being reaped.
+
 **A software producer needs the same standing-down as a hardware one.**
 §6.2 describes yielding in terms of the slot machinery, which software
 sessions never touch. Without an explicit check, the loop spawned ffmpeg

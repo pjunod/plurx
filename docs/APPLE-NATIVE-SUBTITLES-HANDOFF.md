@@ -362,7 +362,12 @@ Foreground activation was denied by tvOS with `System is asleep - foreground
 app launch forbidden`; the app was installed correctly, but this should not be
 described as a visible foreground launch.
 
-## 8. Remaining work — make the copied DV master physically playable
+## 8. Historical remaining-work plan — copied DV was resolved 2026-08-03
+
+This section records the path that was open on 2026-08-02. It is not the
+current task list. The outcome in §1 supersedes it: the client capability
+advertisement, not the copied media, caused the fallback, and physical Apple TV
+playback reached `readyToPlay` with Dolby Vision preserved on 2026-08-03.
 
 ### 8.1 Reduce the master failure to one attribute or relationship
 

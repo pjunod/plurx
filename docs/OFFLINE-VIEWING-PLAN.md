@@ -707,13 +707,15 @@ matching recipe for zero new bytes; unexpected filesystem exhaustion surfaces
 later as `encoder_failed`, so operators must provision the data directory for
 both playback and offline budgets.
 
-The playback-cache reader/eviction race was resolved as a separate corrective
+The playback-cache reader/cleanup races were resolved as a separate corrective
 change on 2026-08-06. A cached HLS session now holds process-local read
-ownership on its recipe, and budget eviction claims that recipe exclusively
-before deleting its row or directory. An active reader is skipped until the
-next sweep; a lookup arriving during eviction becomes an ordinary cache miss.
-Offline package pins remain a different ownership class and are not used as
-evidence that online playback is safe.
+ownership on its recipe. Budget eviction, stale-claim cleanup, and the orphan
+directory pass claim that recipe exclusively before deleting its row or
+bytes. This matters when scan reconciliation cascades the row away while a
+viewer still has the directory open: the orphan pass keeps the bytes until the
+session ends. A lookup arriving during deletion becomes an ordinary cache
+miss. Offline package pins remain a different ownership class and are not used
+as evidence that online playback is safe.
 
 ### 7.4 Offline HLS is a separate presentation wrapper
 
@@ -1211,10 +1213,11 @@ Land reviewable slices:
 - **M2c:** separate offline budget, per-user quota, pins, activity, ETA, and
   metric plumbing.
 - **Separate cache-reader follow-up — complete 2026-08-06:** the focused
-  regression proves a zero-budget sweep skips a VOD recipe while its cached
-  session is active, then reclaims the same row and directory after the
-  session ends. Offline recipe pins remain separate from active-reader
-  ownership.
+  regressions prove a zero-budget sweep skips a VOD recipe while its cached
+  session is active; an orphan pass also preserves the directory after its row
+  disappears; multiple readers keep ownership until the last leaves; and a
+  lookup cannot enter while deletion owns the recipe. Offline recipe pins
+  remain separate from active-reader ownership.
 
 **Acceptance:** prepare the synthetic HEVC/HDR + TrueHD case as 720p
 H.264/AAC/SDR while a recommended PGS selection safely becomes Off; prepare an
@@ -1297,10 +1300,11 @@ one restoration integration test rather than mocks of every callback.
 The current suite has two release-gate gaps: it has no durable native
 download-task harness and no cache-only player assertion that fails on any
 upstream access. The former server gap is closed by
-`active_cache_playback_is_not_evicted_under_its_reader`, which holds a cached
-VOD session through a zero-budget sweep and proves the entry is reclaimed only
-after the session ends. The two device behaviors remain physical acceptance
-work rather than reasons to reopen the merged implementation.
+`active_cache_playback_is_not_evicted_under_its_reader` and
+`an_active_reader_survives_row_loss_and_the_orphan_pass`, which cover both
+budget eviction and row-loss/orphan cleanup. The two device behaviors remain
+physical acceptance work rather than reasons to reopen the merged
+implementation.
 
 ### 15.1 Server unit and integration coverage
 
