@@ -328,6 +328,12 @@ private struct FeaturedHero: View {
         }
         .featuredButtonStyle()
         .accessibilityLabel("\(heroAction) \(item.title)")
+        #if os(iOS)
+        // Constrain the NavigationLink itself. Padding its flexible label lets
+        // the link claim the full row first, then adds the inset outside that
+        // width and pushes the trailing corner off compact screens.
+        .modifier(IOSHomeHeroLayout(compact: compact))
+        #endif
     }
 
     #if os(iOS)
@@ -419,7 +425,6 @@ private struct FeaturedHero: View {
             RoundedRectangle(cornerRadius: HomeHeroMetrics.cornerRadius, style: .continuous)
                 .stroke(.white.opacity(0.08), lineWidth: 0.5)
         }
-        .padding(.horizontal, screenHPad)
     }
 
     private var compactFacts: [String] {
@@ -528,6 +533,15 @@ private struct FeaturedHero: View {
 enum HomeHeroMetrics {
     static let compactHeight: CGFloat = 238
     static let cornerRadius: CGFloat = 18
+    static let horizontalInset = screenHPad
+}
+
+struct IOSHomeHeroLayout: ViewModifier {
+    let compact: Bool
+
+    func body(content: Content) -> some View {
+        content.padding(.horizontal, compact ? HomeHeroMetrics.horizontalInset : 0)
+    }
 }
 #endif
 

@@ -1,5 +1,9 @@
 import SwiftUI
 
+#if os(iOS)
+import UIKit
+#endif
+
 #if os(tvOS)
 private enum PlayerControl: Hashable {
     case reveal
@@ -24,6 +28,14 @@ private enum PlayerOptionMenu: Hashable {
     case subtitles
     case quality
     case more
+}
+
+enum PlayerOptionMenuPalette {
+    /// UIKit semantic colors are intentional here. `foregroundStyle(.primary)`
+    /// would select the primary level of the player's inherited white style,
+    /// leaving white labels on a light popover.
+    static let foreground = UIColor.label
+    static let secondaryForeground = UIColor.secondaryLabel
 }
 
 private struct PlayerOptionMenuButtonStyle: ButtonStyle {
@@ -1576,8 +1588,8 @@ struct PlayerView: View {
         }
         .frame(minWidth: 260, idealWidth: 320, maxWidth: 380, maxHeight: 430)
         // The player chrome is always white, but a popover can use light material.
-        // Re-enter the presentation's semantic palette instead of inheriting white.
-        .foregroundStyle(.primary)
+        // Use an explicit color style so the popover cannot inherit that white.
+        .foregroundStyle(Color(uiColor: PlayerOptionMenuPalette.foreground))
         .presentationCompactAdaptation(.popover)
     }
 
@@ -1588,7 +1600,7 @@ struct PlayerView: View {
         Group {
             Text(title.uppercased())
                 .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(Color(uiColor: PlayerOptionMenuPalette.secondaryForeground))
                 .padding(.horizontal, 10)
                 .padding(.top, 4)
             content()
