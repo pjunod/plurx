@@ -31,7 +31,9 @@ decisions (why one binary clusters without external infra), and
 [docs/VALIDATION.md](docs/VALIDATION.md) explains the functionality-point
 catalog — how a changed path selects behavior contracts, which checks run at
 commit, CI, and full depth, and how to add a regression without losing it —
-then
+with [docs/CI_TEST_OVERHAUL_PLAN.md](docs/CI_TEST_OVERHAUL_PLAN.md) recording
+the measured failure order, docs-only lane, suite split, and safe rebase-result
+reuse roadmap. Then
 [docs/PLAYBACK.md](docs/PLAYBACK.md) traces the end-to-end path a file takes to
 become a stream — every direct/remux/transcode fork and the per-browser
 transport choice behind it. [docs/PLAYBACK-TESTING.md](docs/PLAYBACK-TESTING.md)

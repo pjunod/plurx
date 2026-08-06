@@ -118,6 +118,16 @@ class OperationsContractCase(unittest.TestCase):
         workflow = read(".github/workflows/ci.yml")
 
         self.assertIn("python3 -m validation.ci_scope", workflow)
+        self.assertIn("name: fast policy and contract preflight", workflow)
+        self.assertIn("name: Check mobile release hygiene first", workflow)
+        self.assertLess(
+            workflow.index("name: Check mobile release hygiene first"),
+            workflow.index("name: Audit corrective-history evidence"),
+        )
+        self.assertLess(
+            workflow.index("name: Audit corrective-history evidence"),
+            workflow.index("name: Check validation catalog and contract unit tests"),
+        )
         self.assertIn("name: PR validation gate", workflow)
         self.assertIn("PLURX_SKIP_UI_BASELINE: 1", workflow)
         self.assertIn("PLURX_SKIP_ANDROID_JVM: 1", workflow)
@@ -125,6 +135,9 @@ class OperationsContractCase(unittest.TestCase):
         self.assertIn("if: needs.scope.outputs.android_device == 'true'", workflow)
         self.assertIn("if: needs.scope.outputs.web_layout == 'true'", workflow)
         self.assertIn("if: needs.scope.outputs.release_build == 'true'", workflow)
+        self.assertIn("if: needs.scope.outputs.docs_only != 'true'", workflow)
+        self.assertIn("needs: [scope, preflight]", workflow)
+        self.assertIn("PREFLIGHT_RESULT: ${{ needs.preflight.result }}", workflow)
         self.assertIn("needs: scope", workflow)
         self.assertNotIn("github.event_name == 'pull_request' && github.ref == 'refs/heads/main'", workflow)
 
@@ -133,6 +146,11 @@ class OperationsContractCase(unittest.TestCase):
 
         docker = workflow.split("  docker:", 1)[1].split("\n  pr_gate:", 1)[0]
         self.assertNotIn("needs: check", docker)
+        self.assertIn("needs: [scope, preflight]", docker)
+
+        lint = read(".github/workflows/lint.yml")
+        self.assertIn("Select the documentation-only fast path", lint)
+        self.assertIn("steps.scope.outputs.docs_only != 'true'", lint)
 
     def test_container_smoke_keeps_non_root_state_port_and_cleanup_contracts(self):
         smoke = read("scripts/container-smoke")
