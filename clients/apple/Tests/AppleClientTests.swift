@@ -2520,6 +2520,21 @@ final class AppleClientTests: XCTestCase {
         XCTAssertEqual(IOSDetailMetrics.iconControlSize, 46)
     }
 
+    func testCompactDetailKeepsThePrimaryActionOnItsOwnRow() {
+        XCTAssertTrue(
+            IOSDetailActionLayout.stacksPrimaryAction(horizontalSizeClass: .compact),
+            "phone Resume text and timestamp must not share width with secondary actions"
+        )
+        XCTAssertTrue(
+            IOSDetailActionLayout.stacksPrimaryAction(horizontalSizeClass: nil),
+            "an unresolved compact environment should choose the safe stacked layout"
+        )
+        XCTAssertFalse(
+            IOSDetailActionLayout.stacksPrimaryAction(horizontalSizeClass: .regular),
+            "iPad has enough width for the established single-row layout"
+        )
+    }
+
     func testPhoneMetadataUsesCompactTextWithoutMediaPictograms() {
         let badges = [
             ItemMetadataBadge(

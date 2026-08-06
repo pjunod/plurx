@@ -22,8 +22,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Select the documentation-only fast path
+        id: scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          VALIDATION_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          python3 -m validation.ci_scope \
+            --event "$EVENT_NAME" --base "$VALIDATION_BASE" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@1.97.1
+        if: steps.scope.outputs.docs_only != 'true'
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - run: make fmt-check lint
+        if: steps.scope.outputs.docs_only != 'true'
+      - if: steps.scope.outputs.docs_only != 'true'
+        run: make fmt-check lint
+      - name: Documentation-only diff needs no Rust lint
+        if: steps.scope.outputs.docs_only == 'true'
+        run: echo "Documentation-only diff; rustfmt and clippy are not applicable."

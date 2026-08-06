@@ -375,6 +375,12 @@ enum IOSDetailMetrics {
     static let controlCornerRadius: CGFloat = 13
 }
 
+enum IOSDetailActionLayout {
+    static func stacksPrimaryAction(horizontalSizeClass: UserInterfaceSizeClass?) -> Bool {
+        horizontalSizeClass != .regular
+    }
+}
+
 private struct IOSDetailPrimaryActionButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
@@ -1492,9 +1498,9 @@ struct DetailView: View {
     }
 
     #if os(iOS)
-    /// Playback stays dominant while the two secondary commands collapse to
-    /// familiar, accessible icon controls. Nothing on the phone needs a second
-    /// row of large text buttons.
+    /// Playback stays dominant. On a compact phone it owns a full-width row so
+    /// Resume and its timestamp cannot be compressed by the secondary actions;
+    /// those familiar controls sit together beneath it. iPad keeps one row.
     @ViewBuilder
     private func mobileActions(
         _ detail: ItemDetail,
@@ -1505,9 +1511,10 @@ struct DetailView: View {
     ) -> some View {
         let item = detail.item
         let hasPlayback = file != nil && item.isPlayable
-        let hasSecondaryPair = hasPlayback && canResume
 
-        if horizontalSizeClass == .regular {
+        if !IOSDetailActionLayout.stacksPrimaryAction(
+            horizontalSizeClass: horizontalSizeClass
+        ) {
             HStack(spacing: 10) {
                 if let file, item.isPlayable {
                     resumeButton(
@@ -1528,7 +1535,7 @@ struct DetailView: View {
             }
             .frame(maxWidth: hasPlayback ? .infinity : 220, alignment: .leading)
         } else {
-            HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 10) {
                 if let file, item.isPlayable {
                     resumeButton(
                         item: item,
@@ -1539,17 +1546,20 @@ struct DetailView: View {
                     )
                 }
 
-                if let file, item.isPlayable, canResume {
-                    mobileStartOverButton(item: item, file: file, durationMs: durationMs)
-                }
+                HStack(spacing: 10) {
+                    if let file, item.isPlayable, canResume {
+                        mobileStartOverButton(item: item, file: file, durationMs: durationMs)
+                    }
 
-                if let file, item.isPlayable {
-                    mobileDownloadButton(detail: detail, file: file, compact: true)
-                }
+                    if let file, item.isPlayable {
+                        mobileDownloadButton(detail: detail, file: file, compact: true)
+                    }
 
-                mobileWatchButton(detail)
+                    mobileWatchButton(detail)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .frame(maxWidth: hasPlayback || hasSecondaryPair ? .infinity : nil, alignment: .leading)
+            .frame(maxWidth: hasPlayback ? .infinity : nil, alignment: .leading)
         }
     }
 
