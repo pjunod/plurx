@@ -86,8 +86,13 @@
   .connectqr summary{cursor:pointer;color:var(--muted);font-size:13px;font-weight:600}
   /* The white background is the QR quiet zone, not a theme slip: a dark-mode
      card behind a transparent code is unreadable to every scanner. Keep it. */
-  .connectqr img{display:block;width:220px;max-width:100%;height:auto;margin:12px auto 8px;background:#fff;border-radius:10px}
+  .connectqr img,.connectdialog img{display:block;width:220px;max-width:100%;height:auto;margin:12px auto 8px;background:#fff;border-radius:10px}
   .connectqr p{font-size:11.5px;line-height:1.45;margin:6px 0;color:var(--muted)}
+  .connectdialog{position:fixed;inset:0;z-index:70;display:grid;place-items:center;padding:20px;background:#000c}
+  .connectcard{position:relative;width:100%;max-width:380px;text-align:center;box-shadow:0 24px 80px #0009}
+  .connectcard h2{margin:0 34px 6px}
+  .connectcard p{font-size:13px;line-height:1.5;margin:6px 0;color:var(--muted)}
+  .connectcard .connectx{position:absolute;top:12px;right:12px;padding:6px 9px;background:transparent;color:var(--muted);border:0}
 
   h2.section{font-size:16px;font-weight:600;text-transform:uppercase;letter-spacing:.07em;color:var(--text);margin:26px 4px 14px;padding-top:24px;border-top:1px solid var(--line)}
   h2.section:first-child{border-top:0;padding-top:4px}
@@ -2924,17 +2929,59 @@ function toggleSizeMenu(e){ if(e) e.stopPropagation(); closeMenus("sizemenu"); c
 function setIconSize(v){ try{localStorage.setItem("plurx_iconsize",v)}catch(e){} applyPosterSize(); const m=document.getElementById("sizemenu"); if(m) m.innerHTML=sizeMenuHtml(); }
 // Account menu, anchored far-right: shows who you're signed in as, plus the
 // per-account actions (admins also get a Settings shortcut) and Sign out.
+// The server QR belongs here too: it contains no credential, and requiring a
+// person to sign out before pairing another device breaks the session they are
+// using to perform the pairing.
 function profileMenuHtml(){
   const name=ME?ME.username:"", role=ME&&ME.is_admin?"Administrator":"Signed in";
   const settings = ME&&ME.is_admin ? `<button onclick="location.hash='#/settings';closeMenus()">Settings</button>`:"";
   return `<div class="pident"><span class="pavatar">${esc((name[0]||"?").toUpperCase())}</span>`
     +`<span><b>${esc(name||"—")}</b><small>${role}</small></span></div>`
+    +`<button onclick="showConnectQr()">Show server QR code</button>`
     +settings
     +`<button onclick="logout()">Sign out</button>`;
 }
 function toggleProfileMenu(e){ if(e) e.stopPropagation(); closeMenus("profilemenu"); const m=document.getElementById("profilemenu"); if(!m) return;
   const open=!m.classList.contains("on"); m.classList.toggle("on",open); if(open) m.innerHTML=profileMenuHtml(); }
 document.addEventListener("click",()=>{ closeMenus(); });
+
+let CONNECT_RETURN_FOCUS=null, CONNECT_PREVIOUS_OVERFLOW="";
+function showConnectQr(){
+  // The menu action disappears when closeMenus() runs; return to its visible
+  // account-menu trigger, not to a now-hidden button inside the popover.
+  CONNECT_RETURN_FOCUS=document.querySelector(".profile")||document.activeElement;
+  closeMenus();
+  if(document.getElementById("connectdialog")) return;
+  CONNECT_PREVIOUS_OVERFLOW=document.body.style.overflow;
+  const dialog=document.createElement("div");
+  dialog.id="connectdialog"; dialog.className="connectdialog";
+  dialog.setAttribute("role","dialog"); dialog.setAttribute("aria-modal","true");
+  dialog.setAttribute("aria-labelledby","connecttitle");
+  dialog.innerHTML=`<div class="card connectcard">
+    <button class="connectx" type="button" aria-label="Close server QR code" onclick="closeConnectQr()">✕</button>
+    <h2 id="connecttitle">Connect mobile app</h2>
+    <p>In the ${APP_NAME} mobile app, choose <b>Scan server QR code</b>.</p>
+    <img src="/connect.svg?origin=${encodeURIComponent(location.origin)}" alt="QR code for ${esc(location.origin)}">
+    <p>This code contains only this server's address. You will sign in normally on the mobile app.</p>
+  </div>`;
+  dialog.addEventListener("click",e=>{ if(e.target===dialog) closeConnectQr(); });
+  document.body.appendChild(dialog);
+  document.body.style.overflow="hidden";
+  dialog.querySelector(".connectx").focus();
+}
+function closeConnectQr(){
+  const dialog=document.getElementById("connectdialog"); if(!dialog) return;
+  dialog.remove(); document.body.style.overflow=CONNECT_PREVIOUS_OVERFLOW;
+  const target=CONNECT_RETURN_FOCUS; CONNECT_RETURN_FOCUS=null;
+  if(target&&target.isConnected&&target.focus) target.focus();
+}
+function connectQrOpen(){ return !!document.getElementById("connectdialog"); }
+// Capture Escape before layout-specific sheet handlers so one key closes only
+// the QR dialog, never both the dialog and something behind it.
+window.addEventListener("keydown",e=>{
+  if(e.key!=="Escape"||!connectQrOpen()) return;
+  e.preventDefault(); e.stopImmediatePropagation(); closeConnectQr();
+},true);
 
 // ---- global activity indicator --------------------------------------------
 // Always-visible pill: whatever the server is doing right now (scans,
