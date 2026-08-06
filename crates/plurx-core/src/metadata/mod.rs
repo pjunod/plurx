@@ -496,6 +496,18 @@ async fn enrich_episodes(
             return;
         }
     };
+    // The season items themselves get the season's own poster + overview --
+    // a seasons grid of blank cards is what this prevents. Build this map
+    // before filtering episodes because a retry may explicitly target a
+    // season whose episode stills are already healthy.
+    let season_items: std::collections::HashMap<i32, crate::domain::Item> = store
+        .get_item_children(show_id)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|s| s.kind == ItemKind::Season)
+        .filter_map(|s| s.season_number.map(|n| (n, s)))
+        .collect();
     // Group local episodes by season so each season is fetched exactly once.
     let mut by_season: BTreeMap<i32, Vec<crate::domain::Item>> = BTreeMap::new();
     for ep in episodes {
@@ -510,16 +522,17 @@ async fn enrich_episodes(
             .or_default()
             .push(ep);
     }
-    // The season items themselves get the season's own poster + overview —
-    // a seasons grid of blank cards is what this prevents.
-    let season_items: std::collections::HashMap<i32, crate::domain::Item> = store
-        .get_item_children(show_id)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|s| s.kind == ItemKind::Season)
-        .filter_map(|s| s.season_number.map(|n| (n, s)))
-        .collect();
+    // A season can be the missing card even when every episode still exists.
+    // Keep an empty bucket for an explicitly requested season so its TMDB
+    // detail (and poster) is fetched without needlessly re-downloading a child
+    // still just to reach the endpoint.
+    if let Some(ids) = only {
+        for (season_number, season) in &season_items {
+            if ids.contains(&season.id) {
+                by_season.entry(*season_number).or_default();
+            }
+        }
+    }
 
     for (season_number, locals) in by_season {
         let remote = match tmdb.season_detail(show_tmdb_id, season_number).await {
@@ -533,7 +546,10 @@ async fn enrich_episodes(
         };
         if let Some(season_item) = season_items.get(&season_number) {
             // Skip the artwork download when the season is already enriched.
-            let needs_art = season_item.poster_path.is_none() && remote.poster_path.is_some();
+            // When TMDB offers no poster, `cache_image(None)` deliberately
+            // stamps that outcome so this season observes the daily backoff
+            // instead of being selected by every half-hour sweep forever.
+            let needs_art = season_item.poster_path.is_none();
             let poster = if needs_art {
                 cache_image(
                     tmdb,

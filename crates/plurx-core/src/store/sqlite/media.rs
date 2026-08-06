@@ -637,24 +637,32 @@ impl MediaStore for SqliteStore {
         retry_after_secs: i64,
     ) -> Result<Vec<Item>, StoreError> {
         self.with_conn(move |conn| {
-            // `metadata_at IS NOT NULL` is what makes this "the provider was
-            // asked and the poster still isn't here" rather than "this item
-            // has not been enriched yet" — the latter is the ordinary scan's
-            // job and re-doing it here would race it.
+            // A movie/show is eligible only after its own provider pass. A TV
+            // season/episode never receives `metadata_at` -- TMDB reaches it
+            // through the show -- so its enriched show is the corresponding
+            // gate. Without those two child cases the sweep can repair the
+            // show poster but silently skips the season/episode cards that
+            // motivated the job.
             //
-            // Only movies and shows: those are the kinds `enrich_library`
-            // acts on, and selecting anything else would hand the sweep work
-            // it cannot do, forever, with no attempt stamp written to make it
-            // stop. Home libraries are absent for free (they never stamp
-            // `metadata_at`) and need nothing here anyway — their artwork
-            // query already keys on `poster_path IS NULL`, which is the
-            // correct-by-construction version of the bug this repairs.
+            // Anime children are excluded: AniList enriches show artwork only,
+            // so selecting their episodes would hand the sweep work it cannot
+            // perform or stamp. Home libraries are likewise handled by their
+            // local-art query rather than this provider retry path.
             let mut stmt = conn.prepare(&format!(
                 "SELECT {i} FROM items i
                  JOIN libraries l ON l.id = i.library_id AND l.kind != 'home'
-                 WHERE i.kind IN ('movie','show')
-                   AND i.poster_path IS NULL
-                   AND i.metadata_at IS NOT NULL
+                 LEFT JOIN items parent ON parent.id = i.parent_id
+                 LEFT JOIN items grandparent ON grandparent.id = parent.parent_id
+                 WHERE i.poster_path IS NULL
+                   AND (
+                        (i.kind IN ('movie','show') AND i.metadata_at IS NOT NULL)
+                        OR (i.kind = 'season' AND l.anime = 0
+                            AND parent.kind = 'show' AND parent.metadata_at IS NOT NULL)
+                        OR (i.kind = 'episode' AND l.anime = 0
+                            AND parent.kind = 'season'
+                            AND grandparent.kind = 'show'
+                            AND grandparent.metadata_at IS NOT NULL)
+                   )
                    AND (i.artwork_attempted_at IS NULL
                         OR i.artwork_attempted_at <= unixepoch() - ?2)
                    AND (?1 IS NULL OR i.library_id = ?1)
@@ -2334,6 +2342,83 @@ mod tests {
             .await
             .expect("backoff")
             .is_empty());
+    }
+
+    /// TV children inherit their provider eligibility from the show. Seasons
+    /// and episodes never receive `metadata_at` themselves, so requiring that
+    /// field on the candidate row strands exactly the blank cards the sweep is
+    /// meant to repair.
+    #[tokio::test]
+    async fn items_missing_artwork_includes_children_of_an_enriched_show() {
+        let store = SqliteStore::open_in_memory().expect("open");
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "TV".into(),
+                kind: LibraryKind::Shows,
+                paths: vec![],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+        let show = store
+            .insert_item(&NewItem {
+                library_id: lib.id,
+                kind: ItemKind::Show,
+                parent_id: None,
+                title: "Severance".into(),
+                year: Some(2022),
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("show");
+        let season = store
+            .insert_item(&NewItem {
+                library_id: lib.id,
+                kind: ItemKind::Season,
+                parent_id: Some(show),
+                title: "Season 1".into(),
+                year: None,
+                season_number: Some(1),
+                episode_number: None,
+            })
+            .await
+            .expect("season");
+        let episode = store
+            .insert_item(&NewItem {
+                library_id: lib.id,
+                kind: ItemKind::Episode,
+                parent_id: Some(season),
+                title: "Good News About Hell".into(),
+                year: None,
+                season_number: Some(1),
+                episode_number: Some(1),
+            })
+            .await
+            .expect("episode");
+        store
+            .apply_metadata(
+                show,
+                &MetadataPatch {
+                    tmdb_id: Some(42),
+                    poster_path: Some("show.jpg".into()),
+                    enriched: true,
+                    artwork: Some(ArtworkAttempt::Stored),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("enrich show");
+
+        let due = store
+            .items_missing_artwork(Some(lib.id), 0)
+            .await
+            .expect("missing artwork");
+        assert_eq!(
+            due.iter().map(|item| item.id).collect::<Vec<_>>(),
+            [season, episode],
+            "the healthy show is done, but both blank child cards need retry"
+        );
     }
 
     /// A patch that is not about artwork must not disturb the attempt record.
