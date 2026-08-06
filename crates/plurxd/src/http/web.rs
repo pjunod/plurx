@@ -230,4 +230,21 @@ mod tests {
         assert!(connection_qr_svg("http://server.test/path").is_err());
         assert!(connection_qr_svg("").is_err());
     }
+
+    #[test]
+    fn signed_in_account_menu_can_show_the_server_qr_without_signing_out() {
+        let menu = INDEX_HTML
+            .find("function profileMenuHtml()")
+            .expect("account menu");
+        let qr_action = INDEX_HTML
+            .find("Show server QR code")
+            .expect("signed-in QR action");
+        let sign_out = INDEX_HTML[menu..]
+            .find("Sign out")
+            .map(|offset| menu + offset)
+            .expect("sign-out action");
+        assert!(menu < qr_action && qr_action < sign_out);
+        assert!(INDEX_HTML.contains("function showConnectQr()"));
+        assert!(INDEX_HTML.contains("/connect.svg?origin=${encodeURIComponent(location.origin)}"));
+    }
 }
