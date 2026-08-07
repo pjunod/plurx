@@ -231,6 +231,28 @@ checks = ["baseline"]
         self.assertTrue(matches("scripts/ship", pattern))
         self.assertFalse(matches("scripts/validate", pattern))
 
+    def test_lint_rejects_a_literal_path_that_does_not_resolve(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "present.rs").write_text("// present\n", encoding="utf-8")
+            catalog = self.load(
+                CATALOG.replace(
+                    'paths = ["src/**"]',
+                    'paths = ["present.rs", "missing.rs"]',
+                    1,
+                )
+            )
+            errors = lint_catalog(catalog, repo_root=root, audit=False)
+
+        self.assertIn(
+            "point core references missing literal path 'missing.rs'",
+            errors,
+        )
+        self.assertNotIn(
+            "point core references missing literal path 'present.rs'",
+            errors,
+        )
+
     def test_missing_optional_prerequisite_is_visible_and_strict_can_fail_it(self):
         catalog = self.load()
         check = dataclasses.replace(

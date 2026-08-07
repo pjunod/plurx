@@ -14,6 +14,8 @@
 
 mod sqlite;
 
+pub mod replicated;
+
 use std::path::PathBuf;
 
 pub use sqlite::SqliteStore;

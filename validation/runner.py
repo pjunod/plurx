@@ -235,6 +235,10 @@ def matches(path: str, patterns: tuple[str, ...]) -> bool:
     return any(glob_regex(pattern).match(normalized) for pattern in patterns)
 
 
+def _is_literal_path(pattern: str) -> bool:
+    return not any(marker in pattern for marker in ("*", "?", "{"))
+
+
 def _git_paths(repo_root: Path) -> tuple[str, ...]:
     command = [
         "git",
@@ -324,6 +328,8 @@ def lint_catalog(
                 glob_regex(pattern)
             except re.error as exc:
                 errors.append(f"{prefix} has invalid path glob {pattern!r}: {exc}")
+            if _is_literal_path(pattern) and not (repo_root / normalize_path(pattern)).is_file():
+                errors.append(f"{prefix} references missing literal path {pattern!r}")
         for check_id in point.checks:
             if check_id not in known_checks:
                 errors.append(f"{prefix} references unknown check {check_id}")

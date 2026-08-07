@@ -349,15 +349,22 @@ node ids; restarts preserve ids; the feature spike records every result in
 inside `[cluster]` while the existing unknown-key rejection for `[server]`
 continues to pass.
 
-### 6.2 M1a — extract backend parity before porting a backend
+### 6.2 M1a — add backend parity before porting a backend
 
-Move store contract tests behind an `Arc<dyn Store>` harness while SQLite is
-the only implementation. Classify interactive read-branch-write methods and
-define the replicated CAS pattern once. Rule `unixepoch()` and
-`last_insert_rowid()` out of replicated SQL.
+Add a parallel store contract suite behind an `Arc<dyn Store>` harness while
+SQLite is the only implementation; retain the deeper SQLite-specific tests.
+Classify explicit transaction boundaries and define the replicated CAS pattern
+once. Rule connection-, clock-, and RNG-dependent values out of replicated
+SQL.
 
-**Acceptance:** the extracted suite proves all 114 methods against in-memory
+**Acceptance:** the additive suite exercises all 114 methods against in-memory
 and file SQLite with no behavior change; `make check` remains the gate.
+
+The executable M1a contract is `store_contract`: each scenario receives only
+`Arc<dyn Store>`, and its name inventory fails unless every `async fn` declared
+in `src/store/mod.rs` remains represented. `store::replicated` owns the shared
+replicated-SQL policy, single-row CAS result contract, and source-pinned
+classification of every explicit production SQLite transaction boundary.
 
 ### 6.3 M1b — settings, users, and API keys on three voters
 
