@@ -58,6 +58,17 @@ operations-check: ## Verify deploy, CI, container, and client shipping contracts
 .PHONY: check
 check: validation-lint history-check operations-check rust-check ## History + operations + catalog + Rust baseline
 
+.PHONY: hiqlite-spike
+hiqlite-spike: ## Run the isolated M0 raft/SQLite semantic proof
+	$(CARGO) test --manifest-path spikes/hiqlite-m0/Cargo.toml \
+	  --test hiqlite_m0 -- --nocapture
+
+.PHONY: hiqlite-baseline
+hiqlite-baseline: ## Measure the manual M0 one-voter cost gate on a quiet host
+	$(CARGO) test --release --manifest-path spikes/hiqlite-m0/Cargo.toml \
+	  --test hiqlite_m0 \
+	  single_voter_cost_stays_inside_the_m0_budget -- --ignored --exact --nocapture
+
 ## ---- functionality-point validation -----------------------------------
 
 # `make check` remains the mandatory baseline. The validator sits above it:

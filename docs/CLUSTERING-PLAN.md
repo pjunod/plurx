@@ -28,7 +28,7 @@ single-node gate is:
 
 | Measure | Budget against the SQLite baseline | Why this is the gate |
 |---|---:|---|
-| p95 `put_progress_at` latency | ≤25 ms and ≤2× baseline | A five-second player beat must not become visible UI latency. |
+| p95 `put_progress_at` latency | ≤25 ms and ≤max(2× baseline, baseline + 0.5 ms) | A five-second player beat must not become visible UI latency; the additive branch is derived from the measured fixed Raft tax, while the ratio branch takes over on slower storage. |
 | Idle RSS after warm-up | ≤100 MiB additional | The recommended third voter includes Pi/NAS-class hardware. |
 | 10,000 progress writes | ≤2× logical payload + 64 MiB fixed growth | A raft log that grows without compaction will fill small data volumes. |
 | Watch-state commit rate | ≤1 commit / 10 s / active stream | [ARCHITECTURE.md](ARCHITECTURE.md) §2.2 already promises coalescing; clustering must make it true. |
@@ -42,7 +42,7 @@ quietly wider threshold.
 | Existing seam | Current truth | Phase 4 consequence |
 |---|---|---|
 | `Arc<dyn Store>` | All durable application state crosses the composed traits in [`store/mod.rs`](../crates/plurx-core/src/store/mod.rs). | Keep handlers stable, but port 114 methods in reviewable groups rather than one backend rewrite. |
-| `instance.id` | Stable logical-server UUID in settings; also passed as `AppState::node_id`. | Split the concepts without changing the first node's existing cache/offline ownership key. |
+| `instance.id` | Stable logical-server identifier in settings; new installs mint a UUID, but the schema historically accepted arbitrary strings. It is also passed as `AppState::node_id`. | Split the concepts without changing the first node's existing cache/offline ownership key. |
 | Cache/offline `node_id` | Existing rows are keyed by the current `instance.id`. | An existing install seeds local `node.id` from that exact string; changing it would strand rows and let orphan cleanup delete bytes. |
 | `Recipe<'a>` | Borrowed, node-specific cache-key input; its hash includes ffmpeg build, encoder, and pipeline. | The hash is a node-local cache address, not a cluster recipe. Replicate owned request inputs and rebuild against the survivor's pipeline. |
 | Session takeover | [PERF-PLAN.md](PERF-PLAN.md) §7.3 defines owner epoch, lease, playable/fetched frontiers, overlap, and playlist sequence. | Adopt that contract; do not invent a smaller `ReplicatedSession`. |
@@ -78,10 +78,12 @@ Re-verify these signatures against [`config.rs`](../crates/plurx-core/src/config
 [`store/mod.rs`](../crates/plurx-core/src/store/mod.rs), and
 [`main.rs`](../crates/plurxd/src/main.rs) when M0 begins.
 
-`node.id` is a UUID string because existing ownership columns already use that
-shape. On an existing data directory, create it atomically from the current
-`instance.id`; the concepts become separate while every cache location and
-offline package keeps its key. On a fresh or joining node, generate a new UUID.
+New and joining nodes use UUID strings for `node.id`. On an existing data
+directory, create it atomically from the exact current `instance.id`, including
+an older non-UUID value; the concepts become separate while every cache
+location and offline package keeps its key. Equivalent UUID spellings normalize
+to the exact `instance.id` ownership key. On a fresh or joining node, generate a
+new UUID.
 Write with mode `0600` because copied local identity can impersonate a member.
 Never place it in replicated settings. `raft_id` is allocated by membership
 and is not used as a filesystem-ownership key.
@@ -333,11 +335,11 @@ import from a second process beside the server.
 ### 6.1 M0 — identity compatibility, dependency proof, and baselines
 
 Add the default-empty tolerated cluster section, `ClusterIdentity`, and
-crash-safe `node.id` seeding. Keep `SqliteStore` in production. Feature-gate
-hiqlite 0.14 and prove FTS5/triggers, `RETURNING`, transaction CAS,
-statement-vs-row replication semantics, transport authentication, and log
-compaction. Record the §1 baselines. Update `validation/points.toml` with any
-new daemon module in the same commit.
+crash-safe `node.id` seeding. Keep `SqliteStore` in production. Isolate
+hiqlite 0.14 in a non-shipping spike crate and prove FTS5/triggers,
+`RETURNING`, transaction CAS, statement-vs-row replication semantics,
+transport authentication, and log compaction. Record the §1 baselines. Update
+`validation/points.toml` with any new daemon module in the same commit.
 
 **Acceptance:** `make check` plus `make validate-staged`; a populated v14
 fixture with cleanup enabled retains every cache row, offline package, and

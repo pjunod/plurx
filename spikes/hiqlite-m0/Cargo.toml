@@ -1,0 +1,18 @@
+[workspace]
+
+[package]
+name = "plurx-hiqlite-m0-spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+hiqlite = { version = "=0.14.0", default-features = false, features = ["macros", "sqlite"] }
+plurx-core = { path = "../../crates/plurx-core" }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+walkdir = "2"
+
+[lints.clippy]
+unwrap_used = "warn"

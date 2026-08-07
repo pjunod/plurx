@@ -39,7 +39,7 @@ that Phase 4 builds on. Experiments run 2026-07-19 in the dev sandbox
   - `client.txn(...)` for atomic multi-statement writes.
   - Placeholders become `$1` (from `?1`); SQL dialect is unchanged SQLite.
 - Cluster: `start_node(NodeConfig{ node_id, nodes: [Node{id, addr_raft,
-  addr_api}], data_dir, secret_raft, secret_api, enc_keys, … })`. One node
+  addr_api}], data_dir, secret_raft, secret_api, … })`. One node
   runs standalone; three form a raft cluster. hiqlite's `execute_query`,
   `self_heal`, and membership tests demonstrate writes on any node replicating
   to all, and recovery after a node drop.
@@ -56,14 +56,96 @@ scanner, metadata, and the Plex façade need no changes. Single-node mode is a
 
 ### Friction found
 
-- Config requires `enc_keys` (generate with `cryptr::EncKeys::generate()`),
-  `secret_raft`/`secret_api`, and the node list — one-time setup, surfaced in
-  plurx config and the join-token flow.
+- The node list belongs in cluster config. Encryption and Raft/API secrets do
+  not: M0 keeps them in mode-`0600` files beside `node.id`, and the join-token
+  flow transfers them without writing secret material into `plurx.toml`.
 - `query_as` uses serde `Deserialize`; `query_map` uses the `From<&mut Row>`
   mappers. plurx will use `query_map` to reuse existing mappers verbatim.
 
 **Verdict:** adopt hiqlite. Keep the `Store` trait boundary; add the raft
 backend behind it in Phase 4.
+
+### M0 compatibility proof and one-voter cost
+
+M0 reran the storage decision against the contracts the clustering review
+identified as blockers. The semantic proof is
+`make hiqlite-spike`; the optimized cost gate is `make hiqlite-baseline`.
+Both run from the standalone, non-shipping `spikes/hiqlite-m0` manifest;
+ordinary workspace builds do not resolve or compile hiqlite, and `plurxd`
+still builds and runs `SqliteStore` in M0.
+
+**Dependency audit boundary:** RustSec gates the production workspace and fuzz
+lockfiles. The spike has its own lockfile because hiqlite 0.14 currently pulls
+advisory-affected `quick-xml` 0.39.4 through an unused S3 feature and
+advisory-affected `rkyv` 0.7.46 through an unused `rust_decimal` feature. CI
+still compiles, lints, and runs the spike, but that is semantic evidence, not
+security clearance. No release target may depend on the spike; M1 must upgrade
+or patch those paths before hiqlite enters the audited workspace. No RustSec
+ignore is permitted to make that promotion green.
+
+| Contract | Observed result |
+|---|---|
+| FTS5 and triggers | A replicated insert populated the FTS table, and all three voters returned the exact title from a local FTS read. |
+| `INSERT … RETURNING` | Returned the generated id through a non-leader node; no connection-local `last_insert_rowid()` is needed. |
+| Transaction CAS | Two concurrent epoch-5 writers raced; exactly one wrote epoch 6, while the loser returned `Ok(0)`. Callers must inspect rows affected. |
+| Replication unit | hiqlite replays SQL plus bound parameters. `unixepoch()` is rejected on every voter, `CURRENT_TIMESTAMP` is accepted and can diverge, and `DEFAULT (unixepoch())` DDL succeeds before its first implicit insert fails. |
+| Transport authentication | TLS listeners started and a client with the wrong API secret could not write. The harness disables certificate verification, so certificate identity remains an M1 multi-process proof. |
+| Compaction | With a bounded semantic-test threshold, 96 writes produced both a snapshot and a purged-log position. Restart and snapshot catch-up are not proven in this process. |
+| Workspace compatibility | hiqlite 0.14 and rusqlite must share `libsqlite3-sys`; the workspace therefore moves from rusqlite 0.37 to 0.40. The full workspace suite passes on 0.40. |
+
+The semantic probe sizes the M1 port: 70 `unixepoch()` occurrences on 68
+lines, including 24 schema defaults, must become leader-computed bound values.
+No `CURRENT_TIMESTAMP`, `CURRENT_DATE`, or `CURRENT_TIME` keyword exists in the
+store today; M1 adds a CI ban before replicated SQL lands. The current SQLite
+backend also has 10 `unchecked_transaction()` sites. hiqlite's fixed `txn()`
+statement list cannot read, branch, or use `RETURNING`, so those ports need
+explicit transaction designs rather than mechanical translation.
+
+The recorded M0 cost run was taken 2026-08-07 on an Apple M3 Max MacBook Pro
+with 64 GB RAM, macOS 26.6, and the internal APFS data volume. It used the
+repo-pinned Rust 1.97.1 toolchain via
+`make CARGO='rustup run 1.97.1 cargo' hiqlite-baseline`, release optimization,
+one TLS-enabled hiqlite voter, the production 2 MiB WAL and 10,000-entry
+snapshot threshold, and 10,000 updates to one watch-state row. Latency is a
+duration read followed by an acknowledged upsert with `RETURNING`; neither
+side fsyncs each write, so this is an acknowledgment comparison, not a
+power-loss durability measurement.
+
+| Measure | SQLite | One-voter hiqlite | Gate | Result |
+|---|---:|---:|---:|---|
+| p95 progress latency | 0.041458 ms | 0.076834 ms | ≤25 ms and ≤max(2× SQLite, SQLite + 0.5 ms) | Pass |
+| Idle RSS after warm-up | — | +7,077,888 bytes (6.75 MiB) | ≤100 MiB additional | Pass |
+| Data-directory growth, 10,000 writes | 2,759,224 bytes | 8,309,777 bytes | ≤68,068,864 bytes | Pass |
+| Durable watch commits while playing | web: one / 5 s; Apple and Android: one / 10 s | Not yet active | ≤one / 10 s / stream | Known M1d blocker |
+
+The original pure-ratio gate was unstable on sub-millisecond storage because
+it treated fixed Raft overhead as proportional overhead. An earlier run
+measured a 0.235 ms fixed tax. The revised relative limit is the larger of 2×
+SQLite or SQLite + 0.5 ms: the additive branch is approximately twice that
+observed tax, while the ratio branch takes over on slower storage. On the
+recorded run the relative ceiling was 0.541458 ms and hiqlite used 14.2% of
+it; the separate 25 ms user-impact ceiling remains unchanged.
+
+Net hiqlite growth was 830.98 bytes per progress write after production-tuned
+snapshotting. At four concurrent streams for six hours per day, today's web
+five-second beat extrapolates to 13.69 MiB/day or 4.88 GiB/year; the native
+ten-second beat is 6.85 MiB/day or 2.44 GiB/year. The gate itself still permits
+39.98 GiB/year at the web rate, so passing it is not evidence that the steady
+state is acceptable for a small SD card. M1d must coalesce writes and remeasure
+post-compaction growth before the replicated store becomes production.
+
+Crash recovery, snapshot catch-up, and leader failover remain outside this M0
+in-process harness. hiqlite 0.14 uses a process-global shutdown handler, so one
+embedded voter cannot be stopped and restarted independently; M1 must use
+separate processes. The test's deliberate guard failures also surface as
+background-thread panics, which is evidence of rejection but not evidence that
+the writer remains healthy after replay failure.
+
+The watch-rate row is intentionally not marked green. The handler currently
+writes every received beat. Web sends every five seconds; the native clients
+already send every ten seconds. M1d owns the server-side coalescer, which must
+make the limit true for every client before the replicated store becomes the
+production path.
 
 ## Spike 2 — Deterministic-segment transcode failover
 

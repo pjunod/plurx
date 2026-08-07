@@ -24,8 +24,9 @@ tower-http = { version = "0.6", features = ["trace"] }
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "time", "sync", "process", "io-util", "fs"] }
 async-trait = "0.1"
-# Storage (single-node backend behind the Store trait; raft backend lands in Phase 4)
-rusqlite = { version = "0.37", features = ["bundled"] }
+# Storage (SQLite remains the only production dependency in M0; the hiqlite
+# proof has an isolated non-shipping manifest under spikes/)
+rusqlite = { version = "0.40", features = ["bundled"] }
 # Serialization / config
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

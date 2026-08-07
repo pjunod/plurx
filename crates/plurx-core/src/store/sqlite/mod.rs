@@ -679,6 +679,24 @@ impl SqliteStore {
         Self::init(Connection::open_in_memory()?)
     }
 
+    /// Count local cache/offline rows still keyed by a legacy instance id.
+    /// M0 uses this before accepting a distinct node id so rollback or a
+    /// restored database cannot silently strand and later delete those bytes.
+    pub(crate) async fn local_ownership_rows(&self, node_id: &str) -> Result<u64, StoreError> {
+        let node_id = node_id.to_owned();
+        self.with_read(move |conn| {
+            let count: i64 = conn.query_row(
+                "SELECT \
+                    (SELECT COUNT(*) FROM transcode_cache_locations WHERE node_id = ?1) + \
+                    (SELECT COUNT(*) FROM offline_packages WHERE node_id = ?1)",
+                params![node_id],
+                |row| row.get(0),
+            )?;
+            u64::try_from(count).map_err(|error| StoreError::Task(error.to_string()))
+        })
+        .await
+    }
+
     fn init(conn: Connection) -> Result<Self, StoreError> {
         // WAL for concurrent-reader friendliness on real files; in-memory
         // databases report their own journal mode, which is fine.

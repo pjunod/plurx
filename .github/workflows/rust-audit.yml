@@ -18,6 +18,10 @@ permissions:
   checks: write
 
 jobs:
+  # Release artifacts resolve from the root workspace; the standalone M0
+  # hiqlite experiment is compiled and exercised by CI but does not ship.
+  # Its dependency findings are recorded in docs/PHASE3-SPIKE.md and must be
+  # cleared before any dependency moves into this audited workspace.
   workspace:
     name: RustSec workspace advisory scan
     runs-on: ubuntu-latest

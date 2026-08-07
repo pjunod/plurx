@@ -12,6 +12,10 @@ use crate::error::ConfigError;
 /// Default HTTP port. Deliberately near — but never colliding with — the
 /// 32400-era ports ex-Plex users already have muscle memory for.
 pub const DEFAULT_PORT: u16 = 32400;
+/// Default Raft replication port, adjacent to the public HTTP API.
+pub const DEFAULT_RAFT_PORT: u16 = 32401;
+/// Default authenticated node-to-node API port.
+pub const DEFAULT_CLUSTER_API_PORT: u16 = 32402;
 
 const DEFAULT_CONFIG_PATHS: &[&str] = &["plurx.toml", "/etc/plurx/plurx.toml"];
 
@@ -20,6 +24,9 @@ const DEFAULT_CONFIG_PATHS: &[&str] = &["plurx.toml", "/etc/plurx/plurx.toml"];
 pub struct Config {
     pub server: ServerConfig,
     pub storage: StorageConfig,
+    /// Forward-compatible cluster settings. M0 reads these without changing
+    /// the production SQLite backend; later clustering releases activate them.
+    pub cluster: ClusterConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -51,6 +58,39 @@ impl Default for StorageConfig {
     fn default() -> Self {
         StorageConfig {
             data_dir: PathBuf::from("./data"),
+        }
+    }
+}
+
+/// Configuration reserved for the embedded cluster backend.
+///
+/// Unlike the surrounding config sections this intentionally tolerates
+/// unknown keys. An M0 binary must be able to read a config written by a later
+/// clustering release during rollback, while typos in the existing server and
+/// storage sections must continue to fail closed.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ClusterConfig {
+    /// Raft replication listener. It is not part of the public HTTP API.
+    pub raft_bind: SocketAddr,
+    /// Authenticated node-to-node request listener.
+    pub api_bind: SocketAddr,
+    /// Reachable address advertised to peers; empty means derive it locally.
+    pub advertise_host: String,
+    /// Single-use join-token file; empty means bootstrap/reopen one voter.
+    pub join_token_file: PathBuf,
+    /// Required network boundary when inter-node transport is not using TLS.
+    pub trusted_network: String,
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self {
+            raft_bind: SocketAddr::from(([0, 0, 0, 0], DEFAULT_RAFT_PORT)),
+            api_bind: SocketAddr::from(([0, 0, 0, 0], DEFAULT_CLUSTER_API_PORT)),
+            advertise_host: String::new(),
+            join_token_file: PathBuf::new(),
+            trusted_network: String::new(),
         }
     }
 }
@@ -119,6 +159,8 @@ mod tests {
         assert_eq!(config.server.bind.port(), DEFAULT_PORT);
         assert_eq!(config.server.name, "plurx");
         assert_eq!(config.storage.data_dir, PathBuf::from("./data"));
+        assert_eq!(config.cluster.raft_bind.port(), DEFAULT_RAFT_PORT);
+        assert_eq!(config.cluster.api_bind.port(), DEFAULT_CLUSTER_API_PORT);
     }
 
     #[test]
@@ -138,6 +180,30 @@ mod tests {
         assert_eq!(config.storage.data_dir, PathBuf::from("./data"));
 
         std::fs::write(&path, "[server]\nnmae = \"typo\"\n").expect("write config");
+        assert!(matches!(
+            Config::load(Some(&path)),
+            Err(ConfigError::Parse { .. })
+        ));
+    }
+
+    #[test]
+    fn cluster_section_tolerates_future_keys_without_weakening_existing_sections() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("plurx.toml");
+
+        std::fs::write(
+            &path,
+            "[cluster]\nraft_bind = \"127.0.0.1:42401\"\nsome_future_key = 1\n",
+        )
+        .expect("write future cluster config");
+        let config = Config::load(Some(&path)).expect("future cluster key is tolerated");
+        assert_eq!(config.cluster.raft_bind.port(), 42401);
+
+        std::fs::write(
+            &path,
+            "[cluster]\nsome_future_key = 1\n[server]\nnmae = \"typo\"\n",
+        )
+        .expect("write strict server config");
         assert!(matches!(
             Config::load(Some(&path)),
             Err(ConfigError::Parse { .. })
