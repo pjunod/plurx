@@ -775,10 +775,15 @@ pub trait TranscodeCacheStore: Send + Sync + 'static {
     /// and stale-candidate queries are deliberately the wrong truth for it.
     async fn all_cache_rows(&self, node_id: &str) -> Result<Vec<CachedTranscode>, StoreError>;
 
-    /// Forget one copy. The recipe row goes too when its last copy does: a
-    /// recipe nobody has is not a fact worth keeping on a single node, and on
-    /// a cluster the other nodes' rows keep it alive.
-    async fn forget_cache_entry(&self, recipe_hash: &str, node_id: &str) -> Result<(), StoreError>;
+    /// Forget one storage copy. The recipe row goes too when its last copy
+    /// does: a recipe nobody has is not a fact worth keeping on a single node,
+    /// and on a cluster the other nodes' rows keep it alive.
+    async fn forget_cache_entry(
+        &self,
+        recipe_hash: &str,
+        node_id: &str,
+        storage_class: &str,
+    ) -> Result<(), StoreError>;
 
     /// Complete local bytes charged to the ordinary playback-cache budget.
     /// Offline-pinned recipes have their own admission budget and are excluded

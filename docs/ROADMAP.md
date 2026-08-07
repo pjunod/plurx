@@ -109,18 +109,21 @@ through M3; M4 *is* Phase 4's transcode chapter and waits for its plumbing.
   everything. Measured on the corpus: the CPU tone-map chain costs a quarter
   of the pipeline's throughput (0.98× → 0.71× at 4K), which is what takes a
   4K HDR session below realtime.
-- 🚧 **M2 in progress** — tone-map on the GPU, the milestone that actually
-  fixes 4K. The selection half shipped 2026-07-28: candidate graphs as a
-  type, a boot probe that validates each end to end against real HDR10
-  (correct BT.709, a picture matching the CPU reference, and faster than it),
-  per-session routing, and a runtime downgrade that drops the graph before it
-  drops the encoder. Hardware-session admission followed: a capped, racing-safe
-  slot with a queue → measured-safe-software → refusal ladder, where
-  "measured-safe" means this box has clocked that class of work above realtime
-  in software, not that the output looked small. Remaining: the acceptance run,
-  which needs a box with a GPU — CI can only prove candidates fail correctly.
+- ✅ **M2 complete 2026-07-29:** GPU tone-map candidate graphs, the real-HDR
+  boot probe, per-session routing and downgrade, and racing-safe hardware
+  admission all shipped. The nynuc acceptance run measured the QSV path at
+  4.89× the CPU chain while holding the bitrate bound.
+- ✅ **M3 complete 2026-07-28:** the resumable pre-transcode producer, LRU
+  budget, viewer preemption, cache-hit VOD serving, offline-package pinning,
+  and active-reader eviction protection are shipped. Cached TTFF and seek
+  measurements remain operational evidence, not unfinished implementation.
 
 ## Phase 4 — HA for real
+
+The executable handoff is
+[CLUSTERING-PLAN.md](CLUSTERING-PLAN.md): it separates node identity from the
+logical server first, then brings up the one-voter replicated store before
+membership, singleton jobs, session takeover, and failure drills.
 
 - Cluster membership: join tokens, node add/remove, health, single logical server identity
 - Replication classes wired: durable (users/settings/metadata/watch state) + ephemeral (sessions) + leader-scheduled scanner singleton

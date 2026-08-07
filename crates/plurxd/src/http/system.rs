@@ -1616,6 +1616,7 @@ pub async fn metrics(State(state): State<AppState>) -> impl axum::response::Into
         .map(|l| l.len())
         .unwrap_or(0);
     let users = state.store.count_users().await.unwrap_or(0);
+    let active_cache_entries = state.transcode.active_cache_entries();
     let offline = state
         .store
         .offline_package_stats(&state.node_id, now_unix())
@@ -1639,7 +1640,10 @@ pub async fn metrics(State(state): State<AppState>) -> impl axum::response::Into
          plurx_offline_active_leases {}\n\
          # HELP plurx_cache_pinned_bytes Completed cache bytes protected by offline packages.\n\
          # TYPE plurx_cache_pinned_bytes gauge\n\
-         plurx_cache_pinned_bytes{{reason=\"offline\"}} {}\n{}",
+         plurx_cache_pinned_bytes{{reason=\"offline\"}} {}\n\
+         # HELP plurx_cache_protected_entries Cache entries protected from housekeeping by active playback.\n\
+         # TYPE plurx_cache_protected_entries gauge\n\
+         plurx_cache_protected_entries{{reason=\"active_playback\"}} {}\n{}",
         offline.queued,
         offline.preparing,
         offline.ready,
@@ -1650,6 +1654,7 @@ pub async fn metrics(State(state): State<AppState>) -> impl axum::response::Into
         offline.failed_bytes,
         offline.active_leases,
         offline.pinned_bytes,
+        active_cache_entries,
         state.offline.prometheus(),
     );
 

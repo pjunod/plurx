@@ -92,14 +92,14 @@
   <header>
     <h1>plurx — Project Status</h1>
     <div class="sub">Self-hosted media server in the old-Plex spirit · explicit ledger of done vs. planned ·
-      mirrors <code>docs/ROADMAP.md</code> + <code>docs/FEATURES.md</code> · 2026-08-05 · offline viewing and observability merged; physical acceptance remains</div>
+      mirrors <code>docs/ROADMAP.md</code> + <code>docs/FEATURES.md</code> · 2026-08-06 · offline viewing and observability merged; physical acceptance and publishing remain</div>
   </header>
 
   <div class="tiles">
-    <div class="tile"><div class="v">v0.2.0</div><div class="l">released 2026-07-30 · main is ahead</div></div>
+    <div class="tile"><div class="v">v0.2.7</div><div class="l">current source · release/deploy evidence pending</div></div>
     <div class="tile"><div class="v">0–3 ✓</div><div class="l">core phases + 2 slices complete</div></div>
-    <div class="tile"><div class="v">3 viewers</div><div class="l">web ✓ · Android ✓ · Apple build 6 built, not yet uploaded</div></div>
-    <div class="tile"><div class="v">M2 🚧</div><div class="l">GPU tone-map — the milestone that fixes 4K</div></div>
+    <div class="tile"><div class="v">3 viewers</div><div class="l">web ✓ · Android ✓ · Apple build 32 source, not yet uploaded</div></div>
+    <div class="tile"><div class="v">M2–M3 ✓</div><div class="l">GPU tone-map + pre-cache done · M4 clustering next</div></div>
   </div>
 
   <!-- ══════════ Phases 0–2 ══════════ -->
@@ -172,14 +172,14 @@
   <!-- ══════════ Performance ══════════ -->
   <section>
     <h2>Performance — start latency, 4K, pre-cache <span class="chip prog">🚧 in progress</span> <span class="ev">PERF-PLAN.md · STUTTER-4K.md · SEGMENTER-PLAN.md</span></h2>
-    <div class="meter"><div class="track"><div class="fill" style="width:58%"></div></div><div class="n">3½ / 6 milestones</div></div>
+    <div class="meter"><div class="track"><div class="fill" style="width:83%"></div></div><div class="n">M0–M3 + segmenter complete · M4 waits on clustering</div></div>
     <details open><summary>Items</summary>
       <ul class="items">
         <li class="done-item"><span class="m done">✓ done</span><span class="t">M0 telemetry (encode speed, TTFF/stall beacons, session status), burst-then-hold pacing, ahead-window suspend, progress-aware watchdog <span style="color:var(--muted)">(2026-07-28)</span></span></li>
         <li class="done-item"><span class="m done">✓ done</span><span class="t">M1: fixture-matrix benchmark, 2-s segments, bounded rate control on every encoder family, Auto = min(source, 1080) on hardware; measured: CPU tone-map costs ¼ of pipeline throughput at 4K</span></li>
         <li class="done-item"><span class="m done">✓ done</span><span class="t">GOP-aware segmenter BUILT (M0–M6, 2026-07-30): plurx cuts the copy path's own segments at clean cuts — the one-drop-per-boundary residual is now bounded by source density (<code>scripts/gop-census</code> measures it); DV P7 signaling fix CONFIRMED (VideoToolbox flipped software → hardware)</span></li>
-        <li><span class="m partial">◐ partial</span><span class="t">M2 GPU tone-map — the milestone that actually fixes 4K: candidate graphs as a type, boot probe vs real HDR10, per-session routing, runtime downgrade, capped hardware admission with a measured-safe-software ladder, CPU-budget software admission — all in. <b>Remaining: the acceptance run, which needs a box with a GPU.</b></span></li>
-        <li><span class="m todo">○ todo</span><span class="t">M3 — the pre-transcode cache</span></li>
+        <li class="done-item"><span class="m done">✓ done</span><span class="t">M2 GPU tone-map: candidate graphs, real-HDR boot probe, routing and downgrade, bounded hardware/software admission; accepted on nynuc at 4.89× the CPU chain</span></li>
+        <li class="done-item"><span class="m done">✓ done</span><span class="t">M3 pre-transcode cache: resumable producer, LRU budget, viewer preemption, cache-hit VOD serving; active-reader eviction protection added 2026-08-06</span></li>
         <li><span class="m todo">○ todo</span><span class="t">M4 — cluster transcode: placement, restart-at-boundary failover, distributed pre-caching (this <i>is</i> Phase 4's transcode chapter; waits for its plumbing)</span></li>
       </ul>
     </details>
@@ -188,12 +188,13 @@
   <!-- ══════════ Native clients ══════════ -->
   <section>
     <h2>Native clients <span class="chip prog">🚧 in progress</span> <span class="ev">CLIENTS.md · *-CLIENT-PARITY.md · CLIENTS-REMEDIATION-PLAN.md · APPLE-NATIVE-SUBTITLES-PLAN.md</span></h2>
-    <div class="meter"><div class="track"><div class="fill" style="width:48%"></div></div><div class="n">Android in · Apple native subs live, M1–M3 landed in source · ports not started</div></div>
+    <div class="meter"><div class="track"><div class="fill" style="width:67%"></div></div><div class="n">4 / 6 items · hardware/offline acceptance remains · ports not started</div></div>
     <details open><summary>Items</summary>
       <ul class="items">
         <li class="done-item"><span class="m done">✓ done</span><span class="t">Android/Google TV (Kotlin/Media3): the web viewer surface natively — rails, grid, search, detail, delivery-plan playback, track/quality menus, markers, autoplay, per-file A/V sync, stats panel</span></li>
-        <li><span class="m partial">◐ partial</span><span class="t">Apple iOS/tvOS (Swift/AVPlayer): <b>native text subtitles shipped</b> — in-place selection, no burn, no new session; build 5 (0.2.0) is what is installed on the physical Apple TV. <b>2026-08-02:</b> the plan's M1–M3 landed in source (branch merged to main, Route A) — the three P0s fixed and tombed, selection robustness, extraction hardening. <b>None of it is deployed or on a device yet:</b> unpushed, no ansible run, Apple build 6 not uploaded. Open: copied Dolby Vision master still falls back (CoreMedia <code>-12927</code>) — M4, whose step 0 is now runnable as <code>scripts/dv-evidence</code></span></li>
-        <li><span class="m partial">◐ partial</span><span class="t">Clients remediation plan (written 2026-08-02): the Apple subtitle portion is complete in source through M3; Android native subtitles (§5.4) and the remaining workstreams open</span></li>
+        <li class="done-item"><span class="m done">✓ source + DV device</span><span class="t">Apple iOS/tvOS (Swift/AVPlayer): cinematic details, native text subtitles, staged default-off PGS overlays, truthful delivered-range badges, stable seeking/recovery, and offline phone/tablet downloads. Copied Dolby Vision was resolved on physical Apple TV 2026-08-03; the broader hardware matrix remains an acceptance task.</span></li>
+        <li class="done-item"><span class="m done">✓ source</span><span class="t">Clients remediation plan: every milestone landed, including Android native subtitles, capability/quality fixes, Apple intent/session safety, lifecycle hardening, and cross-client regression coverage. Device verification remains separate from source completeness.</span></li>
+        <li class="done-item"><span class="m done">✓ done</span><span class="t">Media badges: server, web, Android, and Apple distinguish source from delivered HDR and Dolby Vision; optional detail-screen capability dimming remains polish</span></li>
         <li><span class="m todo">○ todo</span><span class="t">Tizen + webOS ports of the web core</span></li>
         <li><span class="m todo">○ todo</span><span class="t">Roku (SceneGraph) — last, leaning on the mature remux/transcode pipeline</span></li>
       </ul>
@@ -242,7 +243,7 @@
       <li class="done-item"><span class="m done">✓ visible</span><span class="t">Authenticated activity rows now distinguish preparing from sending; Prometheus exposes fixed-label state, byte, quality, quota, latency, failure, cancellation, lease, and transfer series without titles, users, packages, recipes, or devices</span></li>
       <li class="done-item"><span class="m done">✓ merged</span><span class="t">PR #69 adds bounded activity and metrics without user, title, package, recipe, or device labels</span></li>
       <li><span class="m you">👤 device</span><span class="t">Physical iPhone and Android flight-mode/background/process-death acceptance, including selected subtitle and midpoint seek, remains the release gate</span></li>
-      <li><span class="m todo">○ separate</span><span class="t">The pre-existing active-playback-reader/LRU race stays in a focused follow-up rather than widening this feature PR</span></li>
+      <li class="done-item"><span class="m done">✓ fixed</span><span class="t">The separate active-playback-reader/LRU race is closed: eviction skips a recipe held by a cached HLS session and reclaims it after the viewer leaves</span></li>
     </ul>
   </section>
 
@@ -252,7 +253,6 @@
     <details><summary>Items</summary>
       <ul class="items">
         <li><span class="m todo">○ todo</span><span class="t">Adaptive quality: brain-in-the-client design written (ADAPTIVE-QUALITY.md); foundations shipped (quality menu 07-23, bounded rate control 07-28); the adaptation loop itself unbuilt</span></li>
-        <li><span class="m todo">○ todo</span><span class="t">Media badges — the play menu tells the truth about HDR/DV (MEDIA-BADGES-PLAN.md, ready to build, 2026-08-02 ask)</span></li>
         <li><span class="m todo">○ todo</span><span class="t">Live inotify watching — off the critical path: scheduled + targeted scans cover both "said so" and "didn't"</span></li>
         <li><span class="m todo">○ todo</span><span class="t">2.x deferrals: TVDB agent, collections, playlists, bitmap-sub burn-in, TrueNAS app, composite/PKC contract tests</span></li>
         <li><span class="m todo">○ todo</span><span class="t">Phase 6 bets: ASS/SSA in clients, OIDC, parental controls, trickplay, theme music, <b>Jellyfin-compat façade spike</b> (the legitimate route to Infuse), NAS packages, music/photos revisit</span></li>
@@ -262,18 +262,18 @@
 
   <!-- ══════════ Operator ══════════ -->
   <section>
-    <h2>Operator checklist (Paul) <span class="ev">the two things only you can run</span></h2>
+    <h2>Operator checklist (Paul) <span class="ev">hardware evidence that source tests cannot supply</span></h2>
     <ul class="items">
-      <li><span class="m you">👤 Paul</span><span class="t">Perf M2 acceptance run on a box with a GPU — CI can only prove candidates fail correctly</span></li>
-      <li><span class="m you">👤 Paul</span><span class="t"><b>Ship 2026-08-02's work:</b> <code>scripts/ship --check --push --deploy</code> (the nodes follow <code>origin/main</code>, so nothing reaches them until main is pushed), then <code>scripts/ship --apple</code> for build 6 to TestFlight</span></li>
-        <li><span class="m you">👤 Paul</span><span class="t">Apple DV acceptance on Bedroom — the copied-DV master needs the physical-TV pass (plan §5.4: 60 s + seek + resume, no <code>-12927</code>). Start with <code>scripts/dv-evidence</code>: the init segment's boxes and CoreMedia's actual error chain, which nobody has looked at</span></li>
-        <li><span class="m you">👤 Paul</span><span class="t">The two master ladder rungs are compiled in and OFF — <code>PLURX_HLS_CLOSED_CAPTIONS_NONE</code>, <code>PLURX_HLS_FORCED_AUTOSELECT</code>. One per deploy, observed on the device</span></li>
+      <li class="done-item"><span class="m done">✓ measured</span><span class="t">Perf M2 acceptance ran on nynuc: QSV tone-map measured 4.89× the CPU chain and the bitrate bound held</span></li>
+      <li><span class="m you">👤 Paul</span><span class="t">Exercise the two default-off HLS master-ladder rungs separately — <code>PLURX_HLS_CLOSED_CAPTIONS_NONE</code> and <code>PLURX_HLS_FORCED_AUTOSELECT</code> — one per deploy, observed on a physical device</span></li>
+      <li><span class="m you">👤 Paul</span><span class="t">Publish the current server release to the node fleet and upload Apple build 32 to TestFlight; repository evidence still records the fleet at <code>787eaa6</code> and the Apple client as not uploaded</span></li>
+      <li><span class="m you">👤 Paul</span><span class="t">Run the offline-viewing physical matrix on iPhone/iPad and Android: background/process-death recovery, airplane-mode start and midpoint seek, selected subtitle, and removal reconciliation</span></li>
+      <li><span class="m you">👤 Paul</span><span class="t">Run the broader Apple/Android release matrix on current builds; simulator and source gates cannot prove HDMI, hardware decode, HDR output, or D-pad/Siri Remote behavior</span></li>
     </ul>
   </section>
 
   <footer>
-    Authoritative copies: <code>docs/ROADMAP.md</code> · <code>docs/FEATURES.md</code> · <code>CHANGELOG.md</code> in <code>pjunod/plurx</code> @ <code>94962b2</code> ·
-    upstream: monarr <b>v0.20.0</b> (calendar rebuilt, ADR 0016) · page generated 2026-08-02
+    Authoritative copies: <code>docs/ROADMAP.md</code> · <code>docs/FEATURES.md</code> · <code>CHANGELOG.md</code> · <code>docs/CLUSTERING-PLAN.md</code> · reviewed against <code>main</code> @ <code>854d575b</code> plus the 2026-08-06 cache-reader correction · page refreshed 2026-08-06
   </footer>
 </div>
 </body>

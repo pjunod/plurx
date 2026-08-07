@@ -2710,6 +2710,7 @@ mod tests {
         assert_eq!(status_code, StatusCode::OK);
         assert!(metrics.contains("plurx_offline_packages{state=\"queued\"} 1"));
         assert!(metrics.contains("plurx_offline_requests_total{height=\"720\"} 1"));
+        assert!(metrics.contains("plurx_cache_protected_entries{reason=\"active_playback\"} 0"));
         assert!(
             !metrics.contains("Flight"),
             "titles must never become labels"
@@ -2756,6 +2757,24 @@ mod tests {
         assert_eq!(status_code, StatusCode::CONFLICT, "{lease}");
         assert_eq!(lease["code"], "package_not_ready");
 
+        let cache_relative = "te/test-recipe";
+        let cache_dir = state.cache_dir.join(cache_relative);
+        tokio::fs::create_dir_all(&cache_dir)
+            .await
+            .expect("cache dir");
+        tokio::fs::write(cache_dir.join("index.m3u8"), b"#EXTM3U\n#EXT-X-ENDLIST\n")
+            .await
+            .expect("playlist");
+        state
+            .store
+            .claim_cache_entry("test-recipe", file_id, 7, &state.node_id, cache_relative)
+            .await
+            .expect("cache claim");
+        state
+            .store
+            .complete_cache_entry("test-recipe", &state.node_id, 24)
+            .await
+            .expect("complete cache");
         assert!(state
             .store
             .mark_offline_package_ready(&package_id, "test-recipe", 15, 90_000)
@@ -2771,6 +2790,22 @@ mod tests {
         )
         .await;
         assert_eq!(status_code, StatusCode::CREATED, "{lease}");
+
+        let eviction = state.transcode.begin_cache_eviction_for_test("test-recipe");
+        let (status_code, _) = call_text(
+            &app,
+            get(
+                &format!("/api/v1/offline/media/{}/index.m3u8", "a".repeat(64)),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(
+            status_code,
+            StatusCode::GONE,
+            "an offline read entered while orphan cleanup owned its recipe"
+        );
+        drop(eviction);
         state.offline.record_transfer(&package_id, 7);
         let (status_code, activity) =
             call(&app, get("/api/v1/activity/detail", Some(&admin))).await;

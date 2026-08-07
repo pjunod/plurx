@@ -15,17 +15,18 @@ use crate::store::TranscodeCacheStore;
 
 /// The columns a [`CachedTranscode`] is built from, in order. One list so a
 /// query and its row-reader cannot drift.
-const CACHE_COLS: &str = "l.recipe_hash, r.file_id, l.relative_dir, l.bytes, \
-                          l.complete, l.last_used_at";
+const CACHE_COLS: &str = "l.recipe_hash, r.file_id, l.storage_class, \
+                          l.relative_dir, l.bytes, l.complete, l.last_used_at";
 
 fn cache_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CachedTranscode> {
     Ok(CachedTranscode {
         recipe_hash: row.get(0)?,
         file_id: row.get(1)?,
-        relative_dir: row.get(2)?,
-        bytes: row.get(3)?,
-        complete: row.get::<_, i64>(4)? != 0,
-        last_used_at: row.get(5)?,
+        storage_class: row.get(2)?,
+        relative_dir: row.get(3)?,
+        bytes: row.get(4)?,
+        complete: row.get::<_, i64>(5)? != 0,
+        last_used_at: row.get(6)?,
     })
 }
 
@@ -157,7 +158,8 @@ impl TranscodeCacheStore for SqliteStore {
                 "SELECT {CACHE_COLS}
                  FROM transcode_cache_locations l
                  JOIN transcode_cache_recipes r ON r.recipe_hash = l.recipe_hash
-                 WHERE l.node_id = ?1 AND l.complete = 1
+                 WHERE l.node_id = ?1 AND l.storage_class = 'local'
+                   AND l.complete = 1
                    AND NOT EXISTS (
                        SELECT 1 FROM offline_packages p
                        WHERE p.recipe_hash = l.recipe_hash
@@ -195,7 +197,8 @@ impl TranscodeCacheStore for SqliteStore {
                 "SELECT {CACHE_COLS}
                  FROM transcode_cache_locations l
                  JOIN transcode_cache_recipes r ON r.recipe_hash = l.recipe_hash
-                 WHERE l.node_id = ?1 AND l.complete = 0 AND l.last_seen_at < ?2
+                 WHERE l.node_id = ?1 AND l.storage_class = 'local'
+                   AND l.complete = 0 AND l.last_seen_at < ?2
                    AND NOT EXISTS (
                        SELECT 1 FROM offline_packages p
                        WHERE p.file_id = r.file_id
@@ -228,14 +231,23 @@ impl TranscodeCacheStore for SqliteStore {
         .await
     }
 
-    async fn forget_cache_entry(&self, recipe_hash: &str, node_id: &str) -> Result<(), StoreError> {
-        let (hash, node) = (recipe_hash.to_owned(), node_id.to_owned());
+    async fn forget_cache_entry(
+        &self,
+        recipe_hash: &str,
+        node_id: &str,
+        storage_class: &str,
+    ) -> Result<(), StoreError> {
+        let (hash, node, class) = (
+            recipe_hash.to_owned(),
+            node_id.to_owned(),
+            storage_class.to_owned(),
+        );
         self.with_conn(move |conn| {
             let tx = conn.unchecked_transaction()?;
             tx.execute(
                 "DELETE FROM transcode_cache_locations
-                 WHERE recipe_hash = ?1 AND node_id = ?2",
-                params![hash, node],
+                 WHERE recipe_hash = ?1 AND node_id = ?2 AND storage_class = ?3",
+                params![hash, node, class],
             )?;
             // A recipe whose last copy is gone is not a fact worth keeping. On
             // a cluster the other nodes' rows hold it alive, which is exactly
@@ -259,7 +271,8 @@ impl TranscodeCacheStore for SqliteStore {
             Ok(conn.query_row(
                 "SELECT COALESCE(SUM(l.bytes), 0)
                  FROM transcode_cache_locations l
-                 WHERE l.node_id = ?1 AND l.complete = 1
+                 WHERE l.node_id = ?1 AND l.storage_class = 'local'
+                   AND l.complete = 1
                    AND NOT EXISTS (
                        SELECT 1 FROM offline_packages p
                        WHERE p.recipe_hash = l.recipe_hash
@@ -435,7 +448,7 @@ mod tests {
         assert_eq!(first[0].recipe_hash, "warm", "cold is no longer coldest");
 
         store
-            .forget_cache_entry("cold", NODE)
+            .forget_cache_entry("cold", NODE, "local")
             .await
             .expect("forget");
         assert!(store.cache_hit("cold", NODE).await.expect("hit").is_none());
@@ -451,6 +464,50 @@ mod tests {
             .await
             .expect("count");
         assert_eq!(recipes, 2, "the recipe went with its last copy");
+    }
+
+    /// Location ownership includes its storage class. A stale local claim and
+    /// a completed shared copy may legitimately coexist during clustering;
+    /// cleaning one must never erase the other just because the recipe and
+    /// node happen to match.
+    #[tokio::test]
+    async fn forgetting_one_storage_class_keeps_the_other_copy() {
+        let store = SqliteStore::open_in_memory().expect("open");
+        let file = seed_file(&store).await;
+        store
+            .claim_cache_entry("scoped", file, 1, NODE, "local/scoped")
+            .await
+            .expect("local claim");
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO transcode_cache_locations
+                         (recipe_hash, node_id, storage_class, relative_dir, complete, bytes)
+                     VALUES ('scoped', ?1, 'shared', 'shared/scoped', 1, 20)",
+                    [NODE],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("shared copy");
+
+        store
+            .forget_cache_entry("scoped", NODE, "local")
+            .await
+            .expect("forget local");
+        let rows = store.all_cache_rows(NODE).await.expect("rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].storage_class, "shared");
+        assert_eq!(rows[0].relative_dir, "shared/scoped");
+        assert_eq!(store.cache_bytes(NODE).await.expect("local bytes"), 0);
+        assert!(
+            store
+                .cache_by_age(NODE, 10)
+                .await
+                .expect("local lru")
+                .is_empty(),
+            "the local filesystem sweep must not resolve a shared path under its root"
+        );
     }
 
     /// A claim that never completed is a producer that died. Cleaning those up
