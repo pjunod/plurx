@@ -24,7 +24,7 @@ pub enum DueJob {
     Refresh(i64),
     /// Re-probe files whose media details were never read (server-wide).
     RetryProbes,
-    /// Re-fetch artwork for enriched items that still have no poster
+    /// Re-fetch artwork for enriched items whose poster or hero art is incomplete
     /// (server-wide). The sibling of [`RetryProbes`](DueJob::RetryProbes): a
     /// download that failed leaves nothing on disk for a rescan to notice, so
     /// without a job that goes looking, nothing ever tries again.
