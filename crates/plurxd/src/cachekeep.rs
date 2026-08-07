@@ -652,6 +652,8 @@ async fn sweep_orphan_dirs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use plurx_core::cluster::{open_store, StoreHandle};
+    use plurx_core::config::Config;
     use plurx_core::domain::{
         ItemKind, LibraryKind, NewItem, NewLibrary, NewOfflinePackage, OfflineCreateOutcome,
         ProbeResult,
@@ -1263,5 +1265,192 @@ mod tests {
             Swept::default()
         );
         assert!(!missing.exists(), "looking is not creating");
+    }
+
+    /// M0's compatibility fixture. Before clustering, both cache locations and
+    /// offline packages were owned by `instance.id`. Initializing `node.id`
+    /// must seed that exact value before either cleanup path runs, or the cache
+    /// directory becomes an orphan and the offline worker loses its queue.
+    #[tokio::test]
+    async fn node_identity_initialization_preserves_populated_v14_ownership_and_bytes() {
+        let data = tempfile::tempdir().expect("data dir");
+        let mut config = Config::default();
+        config.storage.data_dir = data.path().to_owned();
+        let cache_root = data.path().join("cache/transcode");
+        let entry_dir = cache_root.join("aa/aakeep");
+        let ready_id = "offline-ready";
+        let interrupted_id = "offline-interrupted";
+        let (cluster_id, user_id) = {
+            let StoreHandle { store, identity } = open_store(&config).await.expect("first open");
+            assert_eq!(
+                identity.node_id, identity.cluster_id,
+                "the first node must preserve the pre-M0 ownership key"
+            );
+
+            let library = store
+                .create_library(&NewLibrary {
+                    name: "Movies".into(),
+                    kind: LibraryKind::Movies,
+                    paths: vec![],
+                    anime: false,
+                })
+                .await
+                .expect("library");
+            let movie = store
+                .insert_item(&NewItem {
+                    library_id: library.id,
+                    kind: ItemKind::Movie,
+                    parent_id: None,
+                    title: "Heat".into(),
+                    year: Some(1995),
+                    season_number: None,
+                    episode_number: None,
+                })
+                .await
+                .expect("movie");
+            let file_id = store
+                .upsert_file(movie, "/m/Heat.mkv", 1, 1, &ProbeResult::default())
+                .await
+                .expect("file");
+            let user = store
+                .create_user("traveller", "hash", false)
+                .await
+                .expect("user");
+
+            tokio::fs::create_dir_all(&entry_dir)
+                .await
+                .expect("cache entry dir");
+            tokio::fs::write(entry_dir.join("index.m3u8"), b"durable cached bytes")
+                .await
+                .expect("cache bytes");
+            store
+                .claim_cache_entry("aakeep", file_id, 1, &identity.node_id, "aa/aakeep")
+                .await
+                .expect("cache claim");
+            store
+                .complete_cache_entry("aakeep", &identity.node_id, 20)
+                .await
+                .expect("complete cache");
+
+            let package = |id: &str, request: &str| NewOfflinePackage {
+                id: id.into(),
+                request_id: request.into(),
+                user_id: user.id,
+                file_id,
+                node_id: identity.node_id.clone(),
+                source_path: "/m/Heat.mkv".into(),
+                source_size: 1,
+                source_mtime: 1,
+                target_height: 720,
+                output_width: Some(1280),
+                output_height: Some(720),
+                audio_index: None,
+                audio_offset_ms: 0,
+                subtitle_index: None,
+                subtitle_language: None,
+                subtitle_mode: "none".into(),
+                estimated_bytes: 10,
+                reserved_bytes: 20,
+                expires_at: i64::MAX,
+            };
+
+            assert!(matches!(
+                store
+                    .create_offline_package(&package(ready_id, "request-ready"), 10, 1_000, 2_000)
+                    .await
+                    .expect("ready package"),
+                OfflineCreateOutcome::Created(_)
+            ));
+            assert_eq!(
+                store
+                    .claim_next_offline_package(&identity.node_id)
+                    .await
+                    .expect("claim ready")
+                    .expect("ready package exists")
+                    .id,
+                ready_id
+            );
+            store
+                .set_offline_package_recipe(ready_id, "aakeep")
+                .await
+                .expect("bind recipe");
+            assert!(store
+                .mark_offline_package_ready(ready_id, "aakeep", 20, 90_000)
+                .await
+                .expect("publish ready package"));
+
+            assert!(matches!(
+                store
+                    .create_offline_package(
+                        &package(interrupted_id, "request-interrupted"),
+                        10,
+                        1_000,
+                        2_000,
+                    )
+                    .await
+                    .expect("interrupted package"),
+                OfflineCreateOutcome::Created(_)
+            ));
+            assert_eq!(
+                store
+                    .claim_next_offline_package(&identity.node_id)
+                    .await
+                    .expect("claim interrupted")
+                    .expect("interrupted package exists")
+                    .id,
+                interrupted_id
+            );
+            (identity.cluster_id, user.id)
+        };
+
+        // Reopen through the real M0 path, then run both startup cleanup
+        // behaviors against the new node-local id.
+        let StoreHandle { store, identity } = open_store(&config).await.expect("restart");
+        assert_eq!(identity.cluster_id, cluster_id);
+        assert_eq!(identity.node_id, cluster_id);
+        assert_eq!(
+            store
+                .reset_interrupted_offline_packages(&identity.node_id)
+                .await
+                .expect("recover interrupted package"),
+            1
+        );
+
+        let swept = sweep_with_readers(
+            &store,
+            &cache_root,
+            &identity.node_id,
+            &ActiveCacheReaders::default(),
+            unix_now(),
+        )
+        .await;
+        assert_eq!((swept.stale, swept.evicted, swept.orphans), (0, 0, 0));
+        assert!(
+            entry_dir.join("index.m3u8").exists(),
+            "identity initialization let cache cleanup delete owned bytes"
+        );
+        assert!(store
+            .cache_hit("aakeep", &identity.node_id)
+            .await
+            .expect("cache lookup")
+            .is_some());
+        assert_eq!(
+            store
+                .offline_package_for_user(ready_id, user_id)
+                .await
+                .expect("offline lookup")
+                .expect("ready package retained")
+                .state,
+            "ready"
+        );
+        assert_eq!(
+            store
+                .claim_next_offline_package(&identity.node_id)
+                .await
+                .expect("reclaimed queue")
+                .expect("interrupted package was requeued")
+                .id,
+            interrupted_id
+        );
     }
 }

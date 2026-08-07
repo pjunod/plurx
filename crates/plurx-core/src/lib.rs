@@ -8,6 +8,7 @@
 //! assume which backend is in play. See `docs/ARCHITECTURE.md` §2.
 
 pub mod auth;
+pub mod cluster;
 pub mod config;
 pub mod domain;
 pub mod error;

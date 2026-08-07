@@ -29,10 +29,11 @@ use std::time::Duration;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
+use plurx_core::cluster::{open_store, StoreHandle};
 use plurx_core::config::Config;
 use plurx_core::domain::LibraryKind;
 use plurx_core::metadata::{self, AniListClient, TmdbClient};
-use plurx_core::store::{keys, LibraryStore, SettingsStore, SqliteStore, Store, UserStore};
+use plurx_core::store::{keys, LibraryStore, SettingsStore, SqliteStore, UserStore};
 use serde::Deserialize;
 use tracing_subscriber::EnvFilter;
 
@@ -228,17 +229,9 @@ async fn run(config: Config) -> anyhow::Result<()> {
         .with(logbuf::BufferLayer(Arc::clone(&logs)))
         .init();
 
-    std::fs::create_dir_all(&config.storage.data_dir).with_context(|| {
-        format!(
-            "creating data directory {}",
-            config.storage.data_dir.display()
-        )
-    })?;
-    let db_path = config.storage.data_dir.join("plurx.db");
-    let store: Arc<dyn Store> = Arc::new(
-        SqliteStore::open(&db_path)
-            .with_context(|| format!("opening database {}", db_path.display()))?,
-    );
+    let StoreHandle { store, identity } = open_store(&config)
+        .await
+        .with_context(|| format!("opening store in {}", config.storage.data_dir.display()))?;
 
     // Artwork cache and transcode scratch live under the data dir.
     let artwork_dir = config.storage.data_dir.join("artwork");
@@ -310,12 +303,14 @@ async fn run(config: Config) -> anyhow::Result<()> {
         dovi_rpu: crate::ffmpeg::has_dovi_rpu().await,
     };
 
-    let instance_id = store.instance_id().await?;
+    let instance_id = identity.cluster_id;
+    let node_id = identity.node_id;
     tracing::info!(
         version = crate::version::SEMVER,
         build = crate::version::BUILD,
         server_name = %config.server.name,
         %instance_id,
+        %node_id,
         data_dir = %config.storage.data_dir.display(),
         "plurxd starting"
     );
@@ -329,7 +324,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
             cache: cache_dir,
             subs: subs_dir,
         },
-        instance_id.clone(),
+        node_id,
         encoder_caps,
         system,
         logs,

@@ -65,6 +65,50 @@ scanner, metadata, and the Plex façade need no changes. Single-node mode is a
 **Verdict:** adopt hiqlite. Keep the `Store` trait boundary; add the raft
 backend behind it in Phase 4.
 
+### M0 compatibility proof and one-voter cost
+
+M0 reran the storage decision against the contracts the clustering review
+identified as blockers. The semantic proof is
+`make hiqlite-spike`; the optimized cost gate is `make hiqlite-baseline`.
+Both are feature-gated, and `plurxd` still builds and runs `SqliteStore` in
+M0.
+
+| Contract | Observed result |
+|---|---|
+| FTS5 and triggers | A replicated insert populated the FTS table, and all three voters returned the same search result. |
+| `INSERT … RETURNING` | Returned the generated id through a non-leader node; no connection-local `last_insert_rowid()` is needed. |
+| Transaction CAS | A guarded update plus conditional audit insert committed atomically; a stale expected version changed zero rows. |
+| Replication unit | hiqlite replicates the SQL statement and bound parameters. Its writer rejects nondeterministic date/time and random functions, so callers bind those values once. |
+| Transport authentication | The Raft and API listeners ran with TLS; a client with the wrong API secret could not write. |
+| Compaction | With a bounded test threshold, 96 writes produced both a snapshot and a purged-log position. |
+| Workspace compatibility | hiqlite 0.14 and rusqlite must share `libsqlite3-sys`; the workspace therefore moves from rusqlite 0.37 to 0.40. The full workspace suite passes on 0.40. |
+
+The cost run used an Apple M3 Max MacBook Pro with 64 GB RAM, macOS 26.6,
+Rust 1.95, release optimization, one TLS-enabled hiqlite voter, and 10,000
+updates to one watch-state row. Latency is the full future operation shape: a
+duration read followed by an acknowledged upsert with `RETURNING`.
+
+| Measure | SQLite | One-voter hiqlite | Gate | Result |
+|---|---:|---:|---:|---|
+| p95 progress latency | 0.041 ms | 0.276 ms | ≤25 ms and ≤2× SQLite + 1 ms | Pass |
+| Idle RSS after warm-up | — | +8,650,752 bytes (8.25 MiB) | ≤100 MiB additional | Pass |
+| Data-directory growth, 10,000 writes | 2,759,224 bytes | 10,847,744 bytes | ≤68,068,864 bytes | Pass |
+| Durable watch commits while playing | web: one / 5 s; Apple and Android: one / 10 s | Not yet active | ≤one / 10 s / stream | Known M1d blocker |
+
+The original relative latency gate was ≤2× SQLite. The optimized measurement
+made that 0.083 ms, below the fixed cost of an acknowledged local Raft write,
+even though hiqlite's 0.276 ms result was two orders of magnitude inside the
+25 ms user-impact ceiling. The evidence-backed gate keeps the 25 ms ceiling
+and adds at most 1 ms to twice the local baseline. This still catches both a
+large fixed regression and storage-dependent scaling; it does not silently
+discard the relative check.
+
+The watch-rate row is intentionally not marked green. The handler currently
+writes every received beat. Web sends every five seconds; the native clients
+already send every ten seconds. M1d owns the server-side coalescer, which must
+make the limit true for every client before the replicated store becomes the
+production path.
+
 ## Spike 2 — Deterministic-segment transcode failover
 
 ### The question

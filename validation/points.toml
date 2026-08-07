@@ -225,9 +225,10 @@ paths = [
   "Cargo.lock",
   "Cargo.toml",
   "crates/plurx-core/Cargo.toml",
-  "crates/plurx-core/src/{config,domain,error,lib,testfixtures}.rs",
+  "crates/plurx-core/src/{cluster,config,domain,error,lib,testfixtures}.rs",
   "crates/plurx-core/src/store/mod.rs",
   "crates/plurx-core/src/store/sqlite/cache.rs",
+  "crates/plurx-core/tests/hiqlite_m0.rs",
   "rust-toolchain.toml",
 ]
 checks = ["rust-gate"]

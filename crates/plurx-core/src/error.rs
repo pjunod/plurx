@@ -16,6 +16,9 @@ pub enum StoreError {
 
     #[error("storage task failed: {0}")]
     Task(String),
+
+    #[error("cluster identity error: {0}")]
+    Identity(String),
 }
 
 impl From<rusqlite::Error> for StoreError {

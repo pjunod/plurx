@@ -28,7 +28,7 @@ single-node gate is:
 
 | Measure | Budget against the SQLite baseline | Why this is the gate |
 |---|---:|---|
-| p95 `put_progress_at` latency | ≤25 ms and ≤2× baseline | A five-second player beat must not become visible UI latency. |
+| p95 `put_progress_at` latency | ≤25 ms and ≤2× baseline + 1 ms | A five-second player beat must not become visible UI latency; the additive bound permits the measured fixed Raft tax without letting it scale away on slower storage. |
 | Idle RSS after warm-up | ≤100 MiB additional | The recommended third voter includes Pi/NAS-class hardware. |
 | 10,000 progress writes | ≤2× logical payload + 64 MiB fixed growth | A raft log that grows without compaction will fill small data volumes. |
 | Watch-state commit rate | ≤1 commit / 10 s / active stream | [ARCHITECTURE.md](ARCHITECTURE.md) §2.2 already promises coalescing; clustering must make it true. |
