@@ -24,11 +24,9 @@ tower-http = { version = "0.6", features = ["trace"] }
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "time", "sync", "process", "io-util", "fs"] }
 async-trait = "0.1"
-# Storage (SQLite remains production in M0; hiqlite is feature-gated for the
-# Phase 4 semantic proof until the replicated backend slices land)
+# Storage (SQLite remains the only production dependency in M0; the hiqlite
+# proof has an isolated non-shipping manifest under spikes/)
 rusqlite = { version = "0.40", features = ["bundled"] }
-hiqlite = { version = "=0.14.0", default-features = false, features = ["macros", "sqlite"] }
-rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
 # Serialization / config
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

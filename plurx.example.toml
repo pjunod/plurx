@@ -12,12 +12,12 @@ bind = "0.0.0.0:32400"
 # Where the database and caches live. Created if missing.
 data_dir = "./data"
 
-[cluster]
+# [cluster]
 # Reserved in M0 so configs written by later clustering releases remain
-# rollback-compatible. These listeners are dormant while SQLite is the
-# production store; the values below are the future-compatible defaults.
-raft_bind = "0.0.0.0:32401"
-api_bind = "0.0.0.0:32402"
-advertise_host = ""
-join_token_file = ""
-trusted_network = ""
+# forward-compatible. Keep this dormant section commented during M0 so the
+# same file can still be read by the immediately preceding release.
+# raft_bind = "0.0.0.0:32401"
+# api_bind = "0.0.0.0:32402"
+# advertise_host = ""
+# join_token_file = ""
+# trusted_network = ""

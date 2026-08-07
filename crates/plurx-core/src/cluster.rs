@@ -26,9 +26,9 @@ pub const SINGLE_VOTER_RAFT_ID: u64 = 1;
 /// starts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClusterIdentity {
-    /// Stable logical-server UUID stored as `instance.id`.
+    /// Stable logical-server identifier stored as `instance.id`.
     pub cluster_id: String,
-    /// Stable application-node UUID stored only in `<data_dir>/node.id`.
+    /// Stable application-node identifier stored only in `<data_dir>/node.id`.
     pub node_id: String,
     /// Non-zero hiqlite membership id. M0 has exactly one voter.
     pub raft_id: u64,
@@ -55,6 +55,21 @@ pub async fn open_store(config: &Config) -> Result<StoreHandle, StoreError> {
     let sqlite = SqliteStore::open(&db_path)?;
     let cluster_id = sqlite.instance_id().await?;
     let identity = initialize_identity(&config.storage.data_dir, &cluster_id)?;
+    if identity.node_id != cluster_id {
+        let legacy_rows = sqlite.local_ownership_rows(&cluster_id).await?;
+        if legacy_rows > 0 {
+            return Err(StoreError::Identity(format!(
+                "node.id {} differs from instance.id {cluster_id}, but {legacy_rows} cache or \
+                 offline row(s) still use instance.id; refusing to strand owned bytes",
+                identity.node_id
+            )));
+        }
+        tracing::warn!(
+            node_id = %identity.node_id,
+            cluster_id,
+            "using a node-local identity distinct from instance.id"
+        );
+    }
 
     Ok(StoreHandle {
         store: Arc::new(sqlite),
@@ -72,7 +87,6 @@ pub fn initialize_identity(
     data_dir: &Path,
     cluster_id: &str,
 ) -> Result<ClusterIdentity, StoreError> {
-    validate_uuid("instance.id", cluster_id)?;
     std::fs::create_dir_all(data_dir).map_err(|error| {
         StoreError::Identity(format!(
             "creating data directory {}: {error}",
@@ -81,7 +95,7 @@ pub fn initialize_identity(
     })?;
 
     let path = data_dir.join(NODE_ID_FILENAME);
-    let node_id = match read_node_id(&path) {
+    let raw_node_id = match read_node_id(&path) {
         Ok(id) => id,
         Err(error) if error.kind() == ErrorKind::NotFound => {
             create_node_id_noclobber(data_dir, &path, cluster_id)?;
@@ -89,7 +103,7 @@ pub fn initialize_identity(
         }
         Err(error) => return Err(identity_io("reading", &path, error)),
     };
-    validate_uuid("node.id", &node_id)?;
+    let node_id = normalize_node_id(cluster_id, &raw_node_id)?;
 
     Ok(ClusterIdentity {
         cluster_id: cluster_id.to_owned(),
@@ -140,11 +154,12 @@ fn create_node_id_noclobber(
                 .permissions()
                 .mode()
                 & 0o777;
-            if mode != 0o600 {
-                return Err(StoreError::Identity(format!(
-                    "{} was created with mode {mode:o}, expected 600",
-                    temporary.display()
-                )));
+            if !mode_is_owner_only(mode) {
+                tracing::warn!(
+                    path = %temporary.display(),
+                    mode = format_args!("{mode:o}"),
+                    "cluster identity filesystem exposed group or other permissions despite requesting mode 600"
+                );
             }
         }
         drop(file);
@@ -152,6 +167,9 @@ fn create_node_id_noclobber(
         match std::fs::hard_link(&temporary, destination) {
             Ok(()) => sync_directory(data_dir),
             Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(()),
+            Err(error) if hard_links_unavailable(&error) => {
+                publish_with_rename_fallback(data_dir, &temporary, destination)
+            }
             Err(error) => Err(identity_io("publishing", destination, error)),
         }
     })();
@@ -163,6 +181,44 @@ fn create_node_id_noclobber(
         }
     }
     result
+}
+
+fn hard_links_unavailable(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        ErrorKind::PermissionDenied | ErrorKind::Unsupported
+    )
+}
+
+#[cfg(unix)]
+fn mode_is_owner_only(mode: u32) -> bool {
+    mode & 0o077 == 0
+}
+
+/// Best-effort no-clobber fallback for filesystems that cannot create hard
+/// links. A create-new destination probe elects one publisher; only that
+/// process may replace its own empty placeholder with the already-fsynced
+/// temporary file.
+fn publish_with_rename_fallback(
+    data_dir: &Path,
+    temporary: &Path,
+    destination: &Path,
+) -> Result<(), StoreError> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+
+    match options.open(destination) {
+        Ok(placeholder) => {
+            drop(placeholder);
+            std::fs::rename(temporary, destination)
+                .map_err(|error| identity_io("publishing", destination, error))?;
+            sync_directory(data_dir)
+        }
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(identity_io("reserving", destination, error)),
+    }
 }
 
 fn temporary_path(data_dir: &Path) -> PathBuf {
@@ -181,13 +237,28 @@ fn sync_directory(_path: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn validate_uuid(label: &str, value: &str) -> Result<(), StoreError> {
+fn validate_uuid(label: &str, value: &str) -> Result<uuid::Uuid, StoreError> {
     let id = uuid::Uuid::parse_str(value)
         .map_err(|error| StoreError::Identity(format!("{label} is not a UUID: {error}")))?;
     if id.is_nil() {
         return Err(StoreError::Identity(format!("{label} must not be nil")));
     }
-    Ok(())
+    Ok(id)
+}
+
+fn normalize_node_id(cluster_id: &str, node_id: &str) -> Result<String, StoreError> {
+    if node_id == cluster_id {
+        return Ok(cluster_id.to_owned());
+    }
+
+    let parsed = validate_uuid("node.id", node_id)?;
+    if uuid::Uuid::parse_str(cluster_id).is_ok_and(|cluster| cluster == parsed) {
+        // Preserve the exact legacy ownership key stored in instance.id even
+        // if an operator wrote an equivalent UUID spelling to node.id.
+        Ok(cluster_id.to_owned())
+    } else {
+        Ok(parsed.to_string())
+    }
 }
 
 fn identity_io(action: &str, path: &Path, error: std::io::Error) -> StoreError {
@@ -252,6 +323,67 @@ mod tests {
         let identity = initialize_identity(dir.path(), &cluster_id).expect("identity");
         assert_eq!(identity.cluster_id, cluster_id);
         assert_eq!(identity.node_id, node_id);
+    }
+
+    #[test]
+    fn equivalent_uuid_spellings_preserve_the_exact_legacy_ownership_key() {
+        let dir = tempfile::tempdir().expect("data dir");
+        let cluster_id = uuid::Uuid::new_v4().to_string();
+        std::fs::write(
+            dir.path().join(NODE_ID_FILENAME),
+            format!("{}\n", cluster_id.to_uppercase()),
+        )
+        .expect("preseed non-canonical node id");
+
+        let identity = initialize_identity(dir.path(), &cluster_id).expect("identity");
+        assert_eq!(identity.node_id, cluster_id);
+    }
+
+    #[test]
+    fn legacy_non_uuid_instance_ids_are_seeded_byte_for_byte() {
+        let dir = tempfile::tempdir().expect("data dir");
+        let identity = initialize_identity(dir.path(), "fixture-instance").expect("identity");
+
+        assert_eq!(identity.cluster_id, "fixture-instance");
+        assert_eq!(identity.node_id, "fixture-instance");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(NODE_ID_FILENAME)).expect("node id"),
+            "fixture-instance\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stricter_owner_only_modes_are_accepted() {
+        for mode in [0o600, 0o400, 0o200, 0o000] {
+            assert!(mode_is_owner_only(mode));
+        }
+        for mode in [0o640, 0o604, 0o666] {
+            assert!(!mode_is_owner_only(mode));
+        }
+    }
+
+    #[test]
+    fn rename_fallback_publishes_complete_bytes_without_replacing_a_winner() {
+        let dir = tempfile::tempdir().expect("data dir");
+        let temporary = dir.path().join("candidate");
+        let destination = dir.path().join(NODE_ID_FILENAME);
+        std::fs::write(&temporary, "candidate\n").expect("candidate");
+
+        publish_with_rename_fallback(dir.path(), &temporary, &destination).expect("publish");
+        assert_eq!(
+            std::fs::read_to_string(&destination).expect("published identity"),
+            "candidate\n"
+        );
+
+        let loser = dir.path().join("loser");
+        std::fs::write(&loser, "loser\n").expect("loser");
+        publish_with_rename_fallback(dir.path(), &loser, &destination)
+            .expect("existing winner is accepted");
+        assert_eq!(
+            std::fs::read_to_string(&destination).expect("preserved winner"),
+            "candidate\n"
+        );
     }
 
     #[test]

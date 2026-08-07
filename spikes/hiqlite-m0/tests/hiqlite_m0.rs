@@ -1,10 +1,8 @@
 //! M0 semantic proof for the pinned hiqlite backend.
 //!
-//! This is feature-gated because SQLite remains the production backend in M0.
-//! Run it explicitly with `make hiqlite-spike`; ordinary builds do not compile
-//! or link hiqlite yet.
-
-#![cfg(feature = "hiqlite-spike")]
+//! This has a standalone manifest because SQLite remains the production
+//! backend in M0. Run it explicitly with `make hiqlite-spike`; ordinary
+//! workspace builds do not resolve, compile, or link hiqlite.
 
 use std::borrow::Cow;
 use std::net::TcpListener;
@@ -24,7 +22,10 @@ const API_SECRET: &str = "plurx-m0-api-secret";
 async fn three_voters_prove_the_sql_and_transport_contracts() {
     let root = tempfile::tempdir().expect("hiqlite data root");
     let nodes = allocate_nodes(3);
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    // Match hiqlite's own provider choice. The feature graph also contains
+    // aws-lc-rs through its S3 dependency, so installing explicitly avoids
+    // rustls having to guess between two compiled providers.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     // hiqlite's process-global auto-certificate cell must be initialized
     // before several embedded nodes start concurrently in one test process.
     // Production runs one node per process and cannot hit this harness-only
@@ -32,9 +33,9 @@ async fn three_voters_prove_the_sql_and_transport_contracts() {
     let _ = ServerTlsConfig::server_config_self_signed("127.0.0.1").await;
 
     let (first, second, third) = tokio::join!(
-        hiqlite::start_node(node_config(root.path(), 1, nodes.clone())),
-        hiqlite::start_node(node_config(root.path(), 2, nodes.clone())),
-        hiqlite::start_node(node_config(root.path(), 3, nodes.clone())),
+        hiqlite::start_node(semantic_node_config(root.path(), 1, nodes.clone())),
+        hiqlite::start_node(semantic_node_config(root.path(), 2, nodes.clone())),
+        hiqlite::start_node(semantic_node_config(root.path(), 3, nodes.clone())),
     );
     let clients = vec![
         first.expect("start node 1"),
@@ -52,14 +53,18 @@ async fn three_voters_prove_the_sql_and_transport_contracts() {
             r#"CREATE TABLE items (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
                  title TEXT NOT NULL,
-                 version INTEGER NOT NULL DEFAULT 1,
+                 version INTEGER NOT NULL DEFAULT 5,
                  entropy INTEGER NOT NULL
              );
              CREATE VIRTUAL TABLE items_fts USING fts5(title, content='items', content_rowid='id');
              CREATE TRIGGER items_ai AFTER INSERT ON items BEGIN
                  INSERT INTO items_fts(rowid, title) VALUES (new.id, new.title);
              END;
-             CREATE TABLE audit (item_id INTEGER PRIMARY KEY, owner TEXT NOT NULL);"#,
+             CREATE TABLE audit (item_id INTEGER PRIMARY KEY, owner TEXT NOT NULL);
+             CREATE TABLE default_clock (
+                 id INTEGER PRIMARY KEY,
+                 created_at INTEGER NOT NULL DEFAULT (unixepoch())
+             );"#,
         )
         .await
         .expect("replicated schema batch");
@@ -80,7 +85,7 @@ async fn three_voters_prove_the_sql_and_transport_contracts() {
     // The FTS trigger is replay-safe for deterministic inputs and produces the
     // same derived search result on every local SQLite state machine.
     for client in &clients {
-        eventually(Duration::from_secs(10), || async {
+        let title = eventually(Duration::from_secs(10), || async {
             client
                 .query_as_one::<String, _>(
                     "SELECT title FROM items_fts WHERE items_fts MATCH $1",
@@ -91,45 +96,62 @@ async fn three_voters_prove_the_sql_and_transport_contracts() {
         })
         .await
         .expect("FTS trigger result on every voter");
+        assert_eq!(title, "Blade Runner");
     }
 
-    // txn() is atomic and can express a compare-and-set as a guarded UPDATE.
-    let applied = clients[2]
-        .txn([
-            (
-                "UPDATE items SET version = version + 1 WHERE id = $1 AND version = $2",
-                params!(item_id, 1),
-            ),
-            (
-                "INSERT INTO audit (item_id, owner) SELECT $1, $2 WHERE changes() = 1",
-                params!(item_id, "node-3"),
-            ),
-        ])
+    // Two survivors that both observed epoch 5 race to claim epoch 6. Raft
+    // serialization must admit exactly one; txn() reports the loser as Ok(0),
+    // so the production fence API must inspect rows affected.
+    let first = clients[2].txn([
+        (
+            "UPDATE items SET version = version + 1 WHERE id = $1 AND version = $2",
+            params!(item_id, 5),
+        ),
+        (
+            "INSERT INTO audit (item_id, owner) SELECT $1, $2 WHERE changes() = 1",
+            params!(item_id, "node-3"),
+        ),
+    ]);
+    let second = clients[0].txn([
+        (
+            "UPDATE items SET version = version + 1 WHERE id = $1 AND version = $2",
+            params!(item_id, 5),
+        ),
+        (
+            "INSERT INTO audit (item_id, owner) SELECT $1, $2 WHERE changes() = 1",
+            params!(item_id, "node-1"),
+        ),
+    ]);
+    let (first, second) = tokio::join!(first, second);
+    let outcomes = [
+        first.expect("first contended CAS transaction"),
+        second.expect("second contended CAS transaction"),
+    ];
+    let winners = outcomes
+        .iter()
+        .filter(|outcome| outcome[0].as_ref().is_ok_and(|rows| *rows == 1))
+        .count();
+    let losers = outcomes
+        .iter()
+        .filter(|outcome| outcome[0].as_ref().is_ok_and(|rows| *rows == 0))
+        .count();
+    assert_eq!(winners, 1, "exactly one epoch-5 writer must win");
+    assert_eq!(losers, 1, "the stale writer must report Ok(0)");
+    for client in &clients {
+        let version = eventually(Duration::from_secs(10), || async {
+            client
+                .query_as_one::<i64, _>("SELECT version FROM items WHERE id = $1", params!(item_id))
+                .await
+                .ok()
+        })
         .await
-        .expect("CAS transaction");
-    assert_eq!(applied[0].as_ref().expect("guarded update"), &1);
-    assert_eq!(applied[1].as_ref().expect("conditional audit"), &1);
+        .expect("replicated CAS result");
+        assert_eq!(version, 6);
+    }
 
-    let stale = clients[0]
-        .txn([
-            (
-                "UPDATE items SET version = version + 1 WHERE id = $1 AND version = $2",
-                params!(item_id, 1),
-            ),
-            (
-                "INSERT INTO audit (item_id, owner) SELECT $1, $2 WHERE changes() = 1",
-                params!(item_id, "stale"),
-            ),
-        ])
-        .await
-        .expect("stale CAS transaction");
-    assert_eq!(stale[0].as_ref().expect("stale update"), &0);
-    assert_eq!(stale[1].as_ref().expect("stale audit"), &0);
-
-    // hiqlite 0.14's replicated payload is the SQL statement plus parameters,
-    // not a row image. Its write connection actively replaces unixepoch(),
-    // random(), date/time, and related functions with rejecting guards. Bind
-    // the value once and prove the statement/parameter pair converges locally.
+    // Bound values converge, but that fact alone says nothing about whether
+    // statements or row images are replicated. The direct guard probes below
+    // establish the actual hiqlite 0.14 behavior.
     let entropies = local_values(&clients, item_id).await;
     assert_eq!(entropies, vec![4_242, 4_242, 4_242]);
 
@@ -181,6 +203,51 @@ async fn three_voters_prove_the_sql_and_transport_contracts() {
     })
     .await
     .expect("snapshot and log purge after bounded writes");
+
+    // hiqlite replicates SQL statements and parameters. The write connection
+    // rejects function syntax such as unixepoch() on every voter, but SQLite's
+    // CURRENT_TIMESTAMP keyword bypasses those function guards and is accepted.
+    for (index, client) in clients.iter().enumerate() {
+        let rejected = client
+            .execute(
+                "INSERT INTO audit (item_id, owner) VALUES ($1, unixepoch())",
+                params!(8_000_i64 + index as i64),
+            )
+            .await;
+        assert!(
+            rejected.is_err(),
+            "unixepoch() unexpectedly passed through voter {}",
+            index + 1
+        );
+    }
+    clients[0]
+        .execute(
+            "INSERT INTO audit (item_id, owner) VALUES ($1, CURRENT_TIMESTAMP)",
+            params!(8_100_i64),
+        )
+        .await
+        .expect("CURRENT_TIMESTAMP is an unguarded SQLite keyword in hiqlite 0.14");
+    for client in &clients {
+        let rows = eventually(Duration::from_secs(10), || async {
+            client
+                .query_as_one::<i64, _>(
+                    "SELECT COUNT(*) FROM audit WHERE item_id = $1",
+                    params!(8_100_i64),
+                )
+                .await
+                .ok()
+        })
+        .await
+        .expect("CURRENT_TIMESTAMP row on every voter");
+        assert_eq!(rows, 1);
+    }
+    let default_rejected = clients[0]
+        .execute("INSERT INTO default_clock (id) VALUES ($1)", params!(1_i64))
+        .await;
+    assert!(
+        default_rejected.is_err(),
+        "DEFAULT (unixepoch()) DDL succeeded but its implicit insert must be rejected"
+    );
 
     drop(wrong_secret);
     // hiqlite 0.14's TLS servers use axum-server, which does not expose the
@@ -261,9 +328,9 @@ async fn single_voter_cost_stays_inside_the_m0_budget() {
     let rss_before = resident_bytes().expect("read baseline RSS from ps");
     let hiqlite_root = tempfile::tempdir().expect("hiqlite baseline root");
     let nodes = allocate_nodes(1);
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let _ = ServerTlsConfig::server_config_self_signed("127.0.0.1").await;
-    let hiqlite = hiqlite::start_node(node_config(hiqlite_root.path(), 1, nodes))
+    let hiqlite = hiqlite::start_node(production_node_config(hiqlite_root.path(), 1, nodes))
         .await
         .expect("start one-voter baseline");
     tokio::time::timeout(Duration::from_secs(20), hiqlite.wait_until_healthy_db())
@@ -303,12 +370,13 @@ async fn single_voter_cost_stays_inside_the_m0_budget() {
     tokio::time::sleep(Duration::from_secs(1)).await;
     let hiqlite_growth = directory_bytes(hiqlite_root.path()).saturating_sub(hiqlite_bytes_before);
     let growth_budget = WRITES as u64 * LOGICAL_BYTES_PER_WRITE * 2 + FIXED_GROWTH_BUDGET;
-    let relative_latency_budget = sqlite_p95
-        .saturating_mul(2)
-        .saturating_add(Duration::from_millis(1));
+    let relative_latency_budget = std::cmp::max(
+        sqlite_p95.saturating_mul(2),
+        sqlite_p95.saturating_add(Duration::from_micros(500)),
+    );
 
     println!(
-        "M0_BASELINE sqlite_p95_ms={:.3} hiqlite_p95_ms={:.3} \
+        "M0_BASELINE sqlite_p95_ms={:.6} hiqlite_p95_ms={:.6} \
          sqlite_growth_bytes={sqlite_growth} hiqlite_growth_bytes={hiqlite_growth} \
          hiqlite_rss_delta_bytes={rss_delta}",
         sqlite_p95.as_secs_f64() * 1_000.0,
@@ -403,7 +471,15 @@ fn free_port() -> u16 {
         .port()
 }
 
-fn node_config(root: &std::path::Path, node_id: u64, nodes: Vec<Node>) -> NodeConfig {
+fn semantic_node_config(root: &std::path::Path, node_id: u64, nodes: Vec<Node>) -> NodeConfig {
+    let mut config = production_node_config(root, node_id, nodes);
+    // Keep snapshot/compaction observable inside the bounded semantic test.
+    config.wal_size = 8 * 1024;
+    config.raft_config = NodeConfig::default_raft_config(32);
+    config
+}
+
+fn production_node_config(root: &std::path::Path, node_id: u64, nodes: Vec<Node>) -> NodeConfig {
     let data_dir = root.join(format!("node-{node_id}"));
     std::fs::create_dir_all(&data_dir).expect("node data dir");
     NodeConfig {
@@ -418,8 +494,8 @@ fn node_config(root: &std::path::Path, node_id: u64, nodes: Vec<Node>) -> NodeCo
         tls_raft: Some(ServerTlsConfig::TlsAutoCertificates),
         tls_api: Some(ServerTlsConfig::TlsAutoCertificates),
         health_check_delay_secs: 0,
-        wal_size: 8 * 1024,
-        raft_config: NodeConfig::default_raft_config(32),
+        wal_size: 2 * 1024 * 1024,
+        raft_config: NodeConfig::default_raft_config(10_000),
         ..Default::default()
     }
 }

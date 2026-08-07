@@ -658,7 +658,10 @@ mod tests {
         ItemKind, LibraryKind, NewItem, NewLibrary, NewOfflinePackage, OfflineCreateOutcome,
         ProbeResult,
     };
-    use plurx_core::store::{LibraryStore, MediaStore, SqliteStore};
+    use plurx_core::store::{
+        LibraryStore, MediaStore, OfflinePackageStore, SettingsStore, SqliteStore,
+        TranscodeCacheStore, UserStore,
+    };
 
     /// The real clock. These tests are about elapsed time, so `sweep` takes
     /// `now` as an argument; this is only the starting point they measure from.
@@ -1280,12 +1283,10 @@ mod tests {
         let entry_dir = cache_root.join("aa/aakeep");
         let ready_id = "offline-ready";
         let interrupted_id = "offline-interrupted";
-        let (cluster_id, user_id) = {
-            let StoreHandle { store, identity } = open_store(&config).await.expect("first open");
-            assert_eq!(
-                identity.node_id, identity.cluster_id,
-                "the first node must preserve the pre-M0 ownership key"
-            );
+        let (cluster_id, user_id, file_id) = {
+            // Populate the v14 store before any M0 identity code has run.
+            let store = SqliteStore::open(&data.path().join("plurx.db")).expect("v14 store");
+            let cluster_id = store.instance_id().await.expect("instance id");
 
             let library = store
                 .create_library(&NewLibrary {
@@ -1324,11 +1325,11 @@ mod tests {
                 .await
                 .expect("cache bytes");
             store
-                .claim_cache_entry("aakeep", file_id, 1, &identity.node_id, "aa/aakeep")
+                .claim_cache_entry("aakeep", file_id, 1, &cluster_id, "aa/aakeep")
                 .await
                 .expect("cache claim");
             store
-                .complete_cache_entry("aakeep", &identity.node_id, 20)
+                .complete_cache_entry("aakeep", &cluster_id, 20)
                 .await
                 .expect("complete cache");
 
@@ -1337,7 +1338,7 @@ mod tests {
                 request_id: request.into(),
                 user_id: user.id,
                 file_id,
-                node_id: identity.node_id.clone(),
+                node_id: cluster_id.clone(),
                 source_path: "/m/Heat.mkv".into(),
                 source_size: 1,
                 source_mtime: 1,
@@ -1363,7 +1364,7 @@ mod tests {
             ));
             assert_eq!(
                 store
-                    .claim_next_offline_package(&identity.node_id)
+                    .claim_next_offline_package(&cluster_id)
                     .await
                     .expect("claim ready")
                     .expect("ready package exists")
@@ -1393,21 +1394,61 @@ mod tests {
             ));
             assert_eq!(
                 store
-                    .claim_next_offline_package(&identity.node_id)
+                    .claim_next_offline_package(&cluster_id)
                     .await
                     .expect("claim interrupted")
                     .expect("interrupted package exists")
                     .id,
                 interrupted_id
             );
-            (identity.cluster_id, user.id)
+            (cluster_id, user.id, file_id)
         };
 
-        // Reopen through the real M0 path, then run both startup cleanup
-        // behaviors against the new node-local id.
-        let StoreHandle { store, identity } = open_store(&config).await.expect("restart");
+        assert!(
+            !data.path().join("node.id").exists(),
+            "the pre-M0 fixture must not initialize M0 identity"
+        );
+
+        // Upgrade through the real M0 path, then run both startup cleanup
+        // behaviors against the newly initialized node-local id.
+        let StoreHandle { store, identity } = open_store(&config).await.expect("M0 open");
         assert_eq!(identity.cluster_id, cluster_id);
         assert_eq!(identity.node_id, cluster_id);
+        assert_eq!(
+            std::fs::read_to_string(data.path().join("node.id")).expect("node id file"),
+            format!("{cluster_id}\n")
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(data.path().join("node.id"))
+                    .expect("node id metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+
+        // Arm orphan collection with a row created for the current identity.
+        // If the upgrade picked a different id, the pre-M0 entry is now a
+        // visible orphan and this same sweep deletes it.
+        let current_entry = cache_root.join("bb/bbcurrent");
+        tokio::fs::create_dir_all(&current_entry)
+            .await
+            .expect("current cache entry dir");
+        tokio::fs::write(current_entry.join("index.m3u8"), b"current cached bytes")
+            .await
+            .expect("current cache bytes");
+        store
+            .claim_cache_entry("bbcurrent", file_id, 1, &identity.node_id, "bb/bbcurrent")
+            .await
+            .expect("current cache claim");
+        store
+            .complete_cache_entry("bbcurrent", &identity.node_id, 20)
+            .await
+            .expect("complete current cache");
         assert_eq!(
             store
                 .reset_interrupted_offline_packages(&identity.node_id)
@@ -1452,5 +1493,53 @@ mod tests {
                 .id,
             interrupted_id
         );
+    }
+
+    #[tokio::test]
+    async fn a_distinct_node_id_cannot_strand_existing_local_ownership() {
+        let data = tempfile::tempdir().expect("data dir");
+        let mut config = Config::default();
+        config.storage.data_dir = data.path().to_owned();
+        let store = SqliteStore::open(&data.path().join("plurx.db")).expect("store");
+        let cluster_id = store.instance_id().await.expect("instance id");
+        let library = store
+            .create_library(&NewLibrary {
+                name: "Movies".into(),
+                kind: LibraryKind::Movies,
+                paths: vec![],
+                anime: false,
+            })
+            .await
+            .expect("library");
+        let movie = store
+            .insert_item(&NewItem {
+                library_id: library.id,
+                kind: ItemKind::Movie,
+                parent_id: None,
+                title: "Heat".into(),
+                year: Some(1995),
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("movie");
+        let file_id = store
+            .upsert_file(movie, "/m/Heat.mkv", 1, 1, &ProbeResult::default())
+            .await
+            .expect("file");
+        store
+            .claim_cache_entry("aakeep", file_id, 1, &cluster_id, "aa/aakeep")
+            .await
+            .expect("legacy cache claim");
+        drop(store);
+
+        let distinct = uuid::Uuid::new_v4().to_string();
+        std::fs::write(data.path().join("node.id"), format!("{distinct}\n"))
+            .expect("distinct node id");
+        let error = match open_store(&config).await {
+            Ok(_) => panic!("a distinct node id must not strand legacy ownership"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("refusing to strand owned bytes"));
     }
 }
