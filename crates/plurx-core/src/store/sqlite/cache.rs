@@ -158,7 +158,8 @@ impl TranscodeCacheStore for SqliteStore {
                 "SELECT {CACHE_COLS}
                  FROM transcode_cache_locations l
                  JOIN transcode_cache_recipes r ON r.recipe_hash = l.recipe_hash
-                 WHERE l.node_id = ?1 AND l.complete = 1
+                 WHERE l.node_id = ?1 AND l.storage_class = 'local'
+                   AND l.complete = 1
                    AND NOT EXISTS (
                        SELECT 1 FROM offline_packages p
                        WHERE p.recipe_hash = l.recipe_hash
@@ -196,7 +197,8 @@ impl TranscodeCacheStore for SqliteStore {
                 "SELECT {CACHE_COLS}
                  FROM transcode_cache_locations l
                  JOIN transcode_cache_recipes r ON r.recipe_hash = l.recipe_hash
-                 WHERE l.node_id = ?1 AND l.complete = 0 AND l.last_seen_at < ?2
+                 WHERE l.node_id = ?1 AND l.storage_class = 'local'
+                   AND l.complete = 0 AND l.last_seen_at < ?2
                    AND NOT EXISTS (
                        SELECT 1 FROM offline_packages p
                        WHERE p.file_id = r.file_id
@@ -269,7 +271,8 @@ impl TranscodeCacheStore for SqliteStore {
             Ok(conn.query_row(
                 "SELECT COALESCE(SUM(l.bytes), 0)
                  FROM transcode_cache_locations l
-                 WHERE l.node_id = ?1 AND l.complete = 1
+                 WHERE l.node_id = ?1 AND l.storage_class = 'local'
+                   AND l.complete = 1
                    AND NOT EXISTS (
                        SELECT 1 FROM offline_packages p
                        WHERE p.recipe_hash = l.recipe_hash
@@ -496,6 +499,15 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].storage_class, "shared");
         assert_eq!(rows[0].relative_dir, "shared/scoped");
+        assert_eq!(store.cache_bytes(NODE).await.expect("local bytes"), 0);
+        assert!(
+            store
+                .cache_by_age(NODE, 10)
+                .await
+                .expect("local lru")
+                .is_empty(),
+            "the local filesystem sweep must not resolve a shared path under its root"
+        );
     }
 
     /// A claim that never completed is a producer that died. Cleaning those up

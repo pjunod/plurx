@@ -2100,6 +2100,13 @@ impl TranscodeManager {
         &self.cache_readers
     }
 
+    #[cfg(test)]
+    pub fn begin_cache_eviction_for_test(&self, recipe: &str) -> impl Drop {
+        self.cache_readers
+            .begin_eviction(recipe)
+            .expect("test eviction claim")
+    }
+
     pub fn active_cache_entries(&self) -> usize {
         self.cache_readers.active_entries()
     }

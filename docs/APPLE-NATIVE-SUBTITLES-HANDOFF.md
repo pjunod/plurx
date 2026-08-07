@@ -43,8 +43,9 @@ preserves the RPU, and AVPlayer opens the standards-labeled master.
 - [x] File 5615 reaches the server-side copy/native-subtitle path on Bedroom,
   keeps its Dolby Vision RPU, publishes `SUPPLEMENTAL-CODECS`, and reaches
   AVPlayer `readyToPlay` on the physical Apple TV.
-- [ ] Android still needs the native subtitle client work in
-  [ANDROID-CLIENT-PARITY.md](ANDROID-CLIENT-PARITY.md).
+- [x] Android native text subtitles shipped in
+  [CLIENTS-REMEDIATION-PLAN.md](CLIENTS-REMEDIATION-PLAN.md) §5.4; physical
+  acceptance remains.
 
 `Native subtitles work` and `Dolby Vision works` remain separate claims. Both
 are now supported by tests plus live physical-device evidence.

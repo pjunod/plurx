@@ -39,6 +39,13 @@ use plurx_core::store::{keys, Store};
 /// Eviction claims the same recipe exclusively before deleting anything, so
 /// lookup and removal cannot pass each other between the row check and the
 /// filesystem operation.
+///
+/// The key is deliberately the recipe hash rather than
+/// `(recipe_hash, node_id, storage_class)`: one manager owns one node process,
+/// and a reader of any copy must conservatively block removal of every copy
+/// that process could resolve. The safe cost is temporary over-protection;
+/// including a class here would let a future routing mismatch under-protect
+/// bytes that are actually in use.
 #[derive(Clone, Default)]
 pub struct ActiveCacheReaders {
     states: Arc<Mutex<HashMap<String, CacheActivity>>>,
@@ -48,10 +55,14 @@ pub struct ActiveCacheReaders {
 enum CacheActivity {
     Readers(usize),
     Evicting,
+    /// A recipe this process previously served. It is not protected, but it
+    /// is a positive ownership fact when the store returns an empty inventory
+    /// after the row disappeared under that reader.
+    IdleReader,
 }
 
 #[derive(Clone, Copy, Debug)]
-enum CacheBusy {
+pub(crate) enum CacheBusy {
     Readers,
     Evicting,
 }
@@ -61,7 +72,7 @@ pub struct CacheReadGuard {
     recipe: String,
 }
 
-struct CacheEvictionGuard {
+pub(crate) struct CacheEvictionGuard {
     readers: ActiveCacheReaders,
     recipe: String,
 }
@@ -80,6 +91,7 @@ impl ActiveCacheReaders {
         match states.get_mut(recipe) {
             Some(CacheActivity::Readers(count)) => *count += 1,
             Some(CacheActivity::Evicting) => return None,
+            Some(state @ CacheActivity::IdleReader) => *state = CacheActivity::Readers(1),
             None => {
                 states.insert(recipe.to_owned(), CacheActivity::Readers(1));
             }
@@ -92,11 +104,12 @@ impl ActiveCacheReaders {
 
     /// Claim a recipe for removal. Active readers make eviction skip it; the
     /// next sweep will retry after their sessions end.
-    fn begin_eviction(&self, recipe: &str) -> Result<CacheEvictionGuard, CacheBusy> {
+    pub(crate) fn begin_eviction(&self, recipe: &str) -> Result<CacheEvictionGuard, CacheBusy> {
         let mut states = self.lock_states();
         match states.get(recipe) {
             Some(CacheActivity::Readers(_)) => return Err(CacheBusy::Readers),
             Some(CacheActivity::Evicting) => return Err(CacheBusy::Evicting),
+            Some(CacheActivity::IdleReader) => {}
             None => {}
         }
         states.insert(recipe.to_owned(), CacheActivity::Evicting);
@@ -115,6 +128,13 @@ impl ActiveCacheReaders {
             .filter(|state| matches!(state, CacheActivity::Readers(_)))
             .count()
     }
+
+    /// Whether this process has positive evidence that a recipe was real.
+    /// Used only to narrow an orphan pass when the durable owner inventory is
+    /// empty; it never authorizes deletion of unrelated directories.
+    fn knows_recipe(&self, recipe: &str) -> bool {
+        self.lock_states().contains_key(recipe)
+    }
 }
 
 impl Drop for CacheReadGuard {
@@ -126,11 +146,11 @@ impl Drop for CacheReadGuard {
                     *count -= 1;
                     false
                 }
-                Some(CacheActivity::Readers(_)) => {
-                    states.remove(&self.recipe);
+                Some(state @ CacheActivity::Readers(_)) => {
+                    *state = CacheActivity::IdleReader;
                     false
                 }
-                Some(CacheActivity::Evicting) | None => true,
+                Some(CacheActivity::Evicting | CacheActivity::IdleReader) | None => true,
             }
         };
         if mismatch {
@@ -203,6 +223,8 @@ pub struct Swept {
     pub evicted: usize,
     /// Complete entries skipped because an active session is reading them.
     pub protected: usize,
+    /// Entries already owned by another sweep in this process.
+    pub in_flight: usize,
     /// Directories on disk that no row claimed.
     pub orphans: usize,
     pub bytes_freed: i64,
@@ -239,6 +261,7 @@ pub async fn sweep_with_readers(
     now: i64,
 ) -> Swept {
     let mut out = Swept::default();
+    let mut removed_claims = HashSet::new();
 
     // 1. Crash leftovers, before the budget: their bytes are on the same disk.
     match store
@@ -253,9 +276,13 @@ pub async fn sweep_with_readers(
                         out.protected += 1;
                         continue;
                     }
-                    Err(CacheBusy::Evicting) => continue,
+                    Err(CacheBusy::Evicting) => {
+                        out.in_flight += 1;
+                        continue;
+                    }
                 };
                 if forget(store, root, node_id, &entry).await {
+                    removed_claims.insert(entry.recipe_hash.clone());
                     out.stale += 1;
                     // Not added to `bytes_freed`: an incomplete row's `bytes`
                     // is whatever it was when it was claimed, which is zero.
@@ -280,15 +307,24 @@ pub async fn sweep_with_readers(
                     if used <= ceiling {
                         break;
                     }
+                    let bytes = entry.bytes.max(0);
                     let _eviction = match readers.begin_eviction(&entry.recipe_hash) {
                         Ok(guard) => guard,
                         Err(CacheBusy::Readers) => {
                             out.protected += 1;
                             continue;
                         }
-                        Err(CacheBusy::Evicting) => continue,
+                        Err(CacheBusy::Evicting) => {
+                            // A peer sweep is already changing the inventory
+                            // this pass used to compute `used`. Continuing down
+                            // the same snapshot would make both passes satisfy
+                            // the full deficit independently and over-evict.
+                            // End this pass; the peer owns the deletion and the
+                            // next scheduled sweep will reconcile any failure.
+                            out.in_flight += 1;
+                            break;
+                        }
                     };
-                    let bytes = entry.bytes.max(0);
                     if forget(store, root, node_id, &entry).await {
                         out.evicted += 1;
                         out.bytes_freed += bytes;
@@ -298,7 +334,14 @@ pub async fn sweep_with_readers(
             }
             Err(e) => tracing::warn!(error = %e, "cache: could not list entries by age"),
         }
-        if used > ceiling && out.protected > 0 {
+        if used > ceiling && out.in_flight > 0 {
+            tracing::debug!(
+                used,
+                ceiling,
+                in_flight = out.in_flight,
+                "cache: peer sweep owns an eviction; ending this budget pass"
+            );
+        } else if used > ceiling && out.protected > 0 {
             tracing::warn!(
                 used,
                 ceiling,
@@ -320,14 +363,17 @@ pub async fn sweep_with_readers(
     out.bytes_after = used;
 
     // 3. Directories nothing claims.
-    let (orphans, protected) = sweep_orphan_dirs(store, root, node_id, readers).await;
+    let (orphans, protected, in_flight) =
+        sweep_orphan_dirs(store, root, node_id, readers, &removed_claims).await;
     out.orphans = orphans;
     out.protected += protected;
-    if out.stale + out.evicted + out.protected + out.orphans > 0 {
+    out.in_flight += in_flight;
+    if out.stale + out.evicted + out.protected + out.in_flight + out.orphans > 0 {
         tracing::info!(
             stale = out.stale,
             evicted = out.evicted,
             protected = out.protected,
+            in_flight = out.in_flight,
             orphans = out.orphans,
             freed = out.bytes_freed,
             used = out.bytes_after,
@@ -432,7 +478,13 @@ async fn sweep_orphan_dirs(
     root: &Path,
     node_id: &str,
     readers: &ActiveCacheReaders,
-) -> (usize, usize) {
+    removed_claims: &HashSet<String>,
+) -> (usize, usize, usize) {
+    // The common empty-install case should not ask the store for ownership or
+    // emit an uncertainty warning. A missing root cannot contain bytes.
+    if tokio::fs::metadata(root).await.is_err() {
+        return (0, 0, 0);
+    }
     // Everything a row names, as absolute paths. Both complete and claimed: a
     // producer's publish destination is claimed and must not be swept out from
     // under it.
@@ -448,10 +500,22 @@ async fn sweep_orphan_dirs(
             // Ownership uncertainty must fail closed. Treating a store error
             // as an empty keep-list would recursively delete valid media.
             tracing::warn!(%error, "cache: could not enumerate filesystem owners; skipping orphan sweep");
-            return (0, 0);
+            return (0, 0, 0);
         }
     };
-    for e in &rows {
+    let local_rows: Vec<_> = rows
+        .iter()
+        .filter(|entry| entry.storage_class == "local")
+        .collect();
+    let inventory_complete = !local_rows.is_empty();
+    if !inventory_complete {
+        // An empty inventory is indistinguishable from a backend that returned
+        // an incomplete ownership view. Deleting the whole cache tree on that
+        // answer is not cleanup; it is data loss. Fail closed and retry after
+        // a later pass has a positive ownership fact.
+        tracing::warn!("cache: filesystem owner inventory is empty; skipping orphan sweep");
+    }
+    for e in local_rows {
         if let Some(dir) = entry_dir(root, &e.relative_dir) {
             known.insert(dir);
         }
@@ -461,10 +525,11 @@ async fn sweep_orphan_dirs(
     }
 
     let Ok(mut prefixes) = tokio::fs::read_dir(root).await else {
-        return (0, 0); // no cache root yet just means nothing has been produced
+        return (0, 0, 0); // no cache root yet just means nothing has been produced
     };
     let mut removed = 0usize;
     let mut protected = 0usize;
+    let mut in_flight = 0usize;
     let mut staging: Option<PathBuf> = None;
     while let Ok(Some(prefix)) = prefixes.next_entry().await {
         let ppath = prefix.path();
@@ -491,6 +556,13 @@ async fn sweep_orphan_dirs(
                 continue;
             }
             let recipe = entry.file_name().to_string_lossy().into_owned();
+            if !inventory_complete
+                && !readers.knows_recipe(&recipe)
+                && !removed_claims.contains(&recipe)
+            {
+                kept += 1;
+                continue;
+            }
             let _eviction = match readers.begin_eviction(&recipe) {
                 Ok(guard) => guard,
                 Err(CacheBusy::Readers) => {
@@ -499,6 +571,7 @@ async fn sweep_orphan_dirs(
                     continue;
                 }
                 Err(CacheBusy::Evicting) => {
+                    in_flight += 1;
                     kept += 1;
                     continue;
                 }
@@ -534,6 +607,13 @@ async fn sweep_orphan_dirs(
                     kept += 1;
                     continue;
                 }
+                if !inventory_complete
+                    && !readers.knows_recipe(&name)
+                    && !removed_claims.contains(&name)
+                {
+                    kept += 1;
+                    continue;
+                }
                 let _eviction = match readers.begin_eviction(&name) {
                     Ok(guard) => guard,
                     Err(CacheBusy::Readers) => {
@@ -542,6 +622,7 @@ async fn sweep_orphan_dirs(
                         continue;
                     }
                     Err(CacheBusy::Evicting) => {
+                        in_flight += 1;
                         kept += 1;
                         continue;
                     }
@@ -565,7 +646,7 @@ async fn sweep_orphan_dirs(
             }
         }
     }
-    (removed, protected)
+    (removed, protected, in_flight)
 }
 
 #[cfg(test)]
@@ -980,8 +1061,11 @@ mod tests {
     /// costing disk for no possible benefit.
     #[tokio::test]
     async fn staging_with_no_claim_behind_it_is_reclaimed() {
-        let (store, _file) = store().await;
+        let (store, file) = store().await;
         let root = root();
+        // One positive local owner makes this a complete inventory rather than
+        // the ambiguous empty-Ok case pinned separately below.
+        entry(&store, root.path(), file, "aakeep", 1).await;
         let abandoned = staging_dir(root.path(), "bbabandoned");
         tokio::fs::create_dir_all(&abandoned).await.expect("mkdir");
         tokio::fs::write(abandoned.join("seg00000.ts"), b"junk")
@@ -1097,6 +1181,73 @@ mod tests {
         assert!(
             root.path().join("aa/aastuck").exists(),
             "and the bytes are still there, so the next sweep gets another go"
+        );
+    }
+
+    /// Two sweeps use the same cold snapshot. Once one owns an entry, the
+    /// other must not walk farther and satisfy the same deficit against a
+    /// disjoint set — doing so lets two correct-looking passes empty a cache.
+    #[tokio::test]
+    async fn a_peer_eviction_ends_the_budget_pass_before_it_over_evicts() {
+        let (store, file) = store().await;
+        let root = root();
+        store
+            .put_setting(keys::CACHE_MAX_GB, "1")
+            .await
+            .expect("budget");
+        let size = (0.4 * GB as f64) as i64;
+        for hash in ["aafirst", "bbsecond", "ccthird"] {
+            entry(&store, root.path(), file, hash, size).await;
+        }
+
+        let peer_entry = store
+            .cache_by_age(NODE, 10)
+            .await
+            .expect("cold inventory")
+            .into_iter()
+            .next()
+            .expect("first cold entry");
+        let readers = ActiveCacheReaders::default();
+        let peer = readers
+            .begin_eviction(&peer_entry.recipe_hash)
+            .expect("peer sweep owns the first eviction");
+
+        let out = sweep_with_readers(&store, root.path(), NODE, &readers, unix_now()).await;
+        assert_eq!(out.evicted, 0, "the losing pass evicted a second entry");
+        assert_eq!(out.in_flight, 1);
+        assert_eq!(
+            store.cache_bytes(NODE).await.expect("bytes before peer"),
+            size * 3,
+            "the losing pass changed the peer's inventory"
+        );
+
+        drop(peer);
+        assert!(forget(&store, root.path(), NODE, &peer_entry).await);
+        assert_eq!(
+            store.cache_bytes(NODE).await.expect("bytes after peer"),
+            size * 2,
+            "one peer eviction should be exactly enough to meet the ceiling"
+        );
+    }
+
+    /// `Ok([])` is not proof that nobody owns a filesystem tree. A backend
+    /// returning an incomplete empty inventory must not turn one orphan pass
+    /// into a recursive deletion of every cached byte.
+    #[tokio::test]
+    async fn an_empty_ownership_inventory_fails_closed() {
+        let (store, _file) = store().await;
+        let root = root();
+        let orphan = root.path().join("aa/aaunverified");
+        tokio::fs::create_dir_all(&orphan).await.expect("orphan");
+        tokio::fs::write(orphan.join("seg00000.ts"), b"unverified bytes")
+            .await
+            .expect("bytes");
+
+        let out = sweep(&store, root.path(), NODE, unix_now()).await;
+        assert_eq!(out.orphans, 0);
+        assert!(
+            orphan.exists(),
+            "an empty ownership answer deleted the whole cache inventory"
         );
     }
 

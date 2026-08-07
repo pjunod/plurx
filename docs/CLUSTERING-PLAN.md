@@ -97,6 +97,10 @@ M0 adds a tolerated, default-empty `ClusterConfig` before any release requires
 its keys. Older M0 binaries therefore accept later `[cluster]` files during a
 rollback. `Config` continues rejecting typos in known top-level and server
 settings; only the cluster section is designed for versioned extension.
+`ClusterConfig` is `#[serde(default)]` without `deny_unknown_fields`;
+`Config`, `ServerConfig`, and `StorageConfig` keep their strict unknown-field
+checks. M0 pins both sides: `[cluster]\nsome_future_key = 1` loads, while the
+existing `[server]\nnmae = "typo"` rejection remains unchanged.
 
 ```toml
 [cluster]
@@ -181,6 +185,18 @@ write epoch 6: one commits the higher lease fence and the other receives
 so an old ffmpeg process cannot publish a playlist, segment location, or cache
 location after takeover.
 
+For a `session:<playback_id>` resource, the lease `fence` **is**
+`SessionOwner.owner_epoch`. There is one monotone counter per session,
+allocated by `claim_session`; `expected_owner_epoch` is compared with it in
+the same replicated transaction.
+
+In M4 the publishing surface is explicit: `upsert_item`, `claim_cache_entry`,
+`complete_cache_entry`, `forget_cache_entry`, `claim_next_offline_package`,
+`complete_offline_package`, and the scan-cursor writers gain a leading
+`lease: &Lease` parameter. A publishing method without that parameter is a
+review failure, because a check performed outside the write transaction is
+not a fence.
+
 ### 3.5 Session takeover adopts PERF-PLAN §7.3, including playlist state
 
 The canonical contract is [PERF-PLAN.md](PERF-PLAN.md) §7.3. Clustering owns
@@ -220,6 +236,14 @@ own node-local `recipe_hash`. Mixed ffmpeg/encoder fleets therefore retain
 takeover correctness but do not share cache entries unless their local digests
 match.
 
+These field names are also the canonical spelling in
+[PERF-PLAN.md](PERF-PLAN.md) §7.3. `tone_map_required = false` means the
+session started with `ToneMap::None`; `true` asks the survivor to select a
+locally valid `Zscale` or `Libplacebo` pipeline. The initial
+`TranscodeOptions::start_seconds` is deliberately not replicated: takeover
+resumes from the published and fetched frontiers, not from the session's
+original seek point.
+
 The owner renews its six-second lease and publishes both frontiers every two
 seconds. Watch progress is coalesced separately to at most one durable commit
 per 10 seconds per stream. On takeover, restart one segment before
@@ -229,6 +253,15 @@ advance `MEDIA-SEQUENCE`, emit one `EXT-X-DISCONTINUITY`, and advance
 `EXT-X-MAP`; never overwrite an init URI a client may have cached. Re-report
 `media_origin_ms` after the new keyframe snap. A playlist never names bytes no
 owner durably published.
+
+The survivor's writer starts at the replicated sequence, not at zero: both
+HLS argument builders pass `-start_number {media_sequence}`, and the copy
+segmenter names its first output with that same index. `served_live_playlist`
+continues deriving `MEDIA-SEQUENCE` from the retained filename index, which is
+then correct by construction. Whenever a prefix is dropped it also emits
+`EXT-X-DISCONTINUITY-SEQUENCE` from
+`SessionOwner.discontinuity_sequence`; otherwise pruning the failover marker
+silently renumbers every remaining discontinuity.
 
 ### 3.6 Quorum, discovery, and local bytes have explicit failure behavior
 
@@ -280,6 +313,10 @@ non-zero, and names the rollback command. File-copy rollback is supported only
 before a second member joins. After membership, restore is a quorum-aware
 cluster operation specified and drilled in M6.
 
+Only `plurxd run` may perform this import. After M2, `reset-password` and
+`refresh-metadata` refuse an unmigrated data directory instead of starting an
+import from a second process beside the server.
+
 ## 5. Requirement traceability — every HA promise has an owner
 
 | Requirement | Milestone | Acceptance evidence |
@@ -288,7 +325,7 @@ cluster operation specified and drilled in M6.
 | REQ-HA-2 · active-active API and streams | M3 · M5 | Three simultaneous streams enter through three nodes; direct, remux, and transcode continue during one-node loss. |
 | REQ-HA-3 · replicated durable/session state, embedded only | M1b–M1d · M5 | Replica table hashes match; acknowledged writes and CAS session state survive a voter loss. |
 | REQ-HA-4 · ≤10 s stream failover, zero acknowledged-write loss | M5 | Power-pull corpus proves direct/remux/transcode resume budget and monotone progress. |
-| REQ-HA-5 · one identity/name/settings surface and join token | M3 | One cluster id/name is advertised by three node-specific records; admin shows leader, lag, voters, and degraded state. |
+| REQ-HA-5 · one identity/name/settings/activity surface and join token | M3 | One cluster id/name is advertised by three node-specific records; admin shows leader, lag, voters, degraded state, and viewers from every node. |
 | REQ-HA-6 · client node lists plus VIP/k8s patterns | M5 · M6 · M7 | Web, Apple, and Android use the same retry corpus; keepalived and Service/Ingress runbooks are exercised. |
 
 ## 6. Milestones — each leaves a reviewable boundary
@@ -306,7 +343,9 @@ new daemon module in the same commit.
 fixture with cleanup enabled retains every cache row, offline package, and
 byte across identity initialization; two fresh data directories get distinct
 node ids; restarts preserve ids; the feature spike records every result in
-[PHASE3-SPIKE.md](PHASE3-SPIKE.md).
+[PHASE3-SPIKE.md](PHASE3-SPIKE.md). The config fixture accepts an unknown key
+inside `[cluster]` while the existing unknown-key rejection for `[server]`
+continues to pass.
 
 ### 6.2 M1a — extract backend parity before porting a backend
 
@@ -370,7 +409,9 @@ reconfiguration state, never supported HA.
 **Acceptance:** grow one node to three without changing `instance.id`; reject
 expired/reused tokens and public cleartext binds; advertise three distinct
 node records under one logical identity/name; remove one follower while
-preserving quorum.
+preserving quorum. The activity page aggregates direct-play and session rows
+from all healthy nodes instead of exposing only the process that answered the
+request.
 
 ### 6.8 M4 — transactional fences and materialization ownership
 
@@ -396,7 +437,11 @@ new ports or daemon files enter governed surfaces.
 including mid-segment response. Resume within 10 seconds with one
 discontinuity, correct `DISCONTINUITY-SEQUENCE`, a generation-specific fMP4
 map, monotone watch progress, and no URI whose bytes were never published.
-Run three concurrent streams entering through three different nodes.
+Across the session lifetime, no two identical segment URIs may name different
+bytes. After the failover discontinuity slides out of the live window, a
+reloading client must still observe the same discontinuity numbering for the
+remaining segments. Run three concurrent streams entering through three
+different nodes.
 
 ### 6.10 M6 — operations, backup/restore, upgrades, and drills
 

@@ -1256,7 +1256,9 @@ toward refusal for 4K and heavy-codec HDR, because §2.9 measured both
 sub-realtime in software on exactly this hardware and an optimistic guess there
 costs a viewer their whole session.
 
-**Still owed in M2:** the acceptance run below, which needs real hardware.
+**M2 acceptance completed 2026-07-29 on nynuc.** The QSV tone-map path ran at
+4.89× the CPU chain and stayed inside the measured bitrate bound. The commands
+below remain the reproducible acceptance procedure for a new driver or host.
 
 **Acceptance:** on nynuc, the M0 telemetry shows a 4K HDR10 → 1080p
 session at ≥3× (QSV graph) vs the recorded CPU baseline; a 2 h 4K HDR
@@ -1518,11 +1520,14 @@ defined per event:
 
 ```text
 SessionOwner {
-    session_id, owner_node, owner_epoch,
-    lease_expires_at,             -- 6 s lease, renewed every 2 s
-    recipe,
-    produced_playable_through,    -- §4.2's playable clock, replicated
-    fetched_through,              -- the download frontier
+    session_id, owner_node_id, owner_epoch,
+    lease_expires_at_unix_ms,      -- 6 s lease, renewed every 2 s
+    recipe: SessionRecipeInputs,
+    produced_playable_through_ms,  -- §4.2's playable clock, replicated
+    fetched_through_ms,            -- the download frontier
+    media_origin_ms,
+    media_sequence,
+    discontinuity_sequence,
 }
 
 1  trusted prefix        last segment identity + end time the dead owner
@@ -1539,6 +1544,19 @@ SessionOwner {
                          publication carries owner_epoch; a stale epoch is
                          rejected even if the old owner's ffmpeg lives on
 ```
+
+`SessionRecipeInputs` carries `file_id`, target height, video/audio rates,
+channel count, audio index, subtitle-burn identity, `tone_map_required`, and
+whether audio was copied. `tone_map_required = false` means the original
+session used `ToneMap::None`; `true` lets the survivor select the locally valid
+Zscale or Libplacebo path. The initial `start_seconds` is not takeover state:
+the two published frontiers and `media_origin_ms` define the resume point.
+
+The replacement writer starts at `media_sequence`, not ffmpeg's current
+hardcoded zero, so a URI is never reused for different bytes. When the
+failover marker slides out of the live window, the playlist still emits the
+replicated `discontinuity_sequence`; pruning a prefix must not renumber the
+remaining discontinuities.
 
 The playlist never references bytes neither owner durably published. The
 resume SLO is a **budget**, not a wish: detect (lease expiry, ≤6 s) +

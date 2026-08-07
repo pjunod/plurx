@@ -369,18 +369,29 @@ offers it) help the burst land quickly.
 
 The pre-transcode budget never wins over an active viewer. A cached HLS
 session protects its recipe from LRU, stale-claim, and orphan cleanup until the
-last reader leaves; the next sweep reclaims it. This can hold the cache above
-`cache_max_gb` temporarily, which is safer than turning the next playlist or
-segment request into a 404.
+last reader leaves; a later enabled sweep may then reclaim it. This can hold
+the cache above `cache_max_gb` temporarily, which is safer than turning the
+next playlist or segment request into a 404.
+
+Sweeps run only when `transcode_cleanup_mins` or `cache_produce_mins` is set;
+both default to `0` (off). With both off, nothing reclaims playback-cache
+entries automatically. Set at least one interval before treating “the next
+sweep” as an operational guarantee.
 
 Look for `cache: swept` in Settings → Logs. `protected > 0` means the sweep
-found bytes an active playback still owns; it should return to zero after the
-viewer leaves. The Prometheus gauge
-`plurx_cache_protected_entries{reason="active_playback"}` reports the same
-condition continuously. A persistent non-zero value with no active sessions
-means the session reaper is stuck; low free space while it is non-zero means
-stop new cache production and let the viewer finish before reducing the
-budget.
+attempted an eviction and was refused by an active reader; it is a per-sweep
+skip count. The Prometheus gauge
+`plurx_cache_protected_entries{reason="active_playback"}` instead reports every
+recipe currently held by a live cached session, whether or not housekeeping
+tried to evict it. A persistent non-zero gauge with no active sessions means
+the session reaper is stuck. Low free space plus a non-zero `protected` sweep
+count means stop new cache production and let the viewer finish before
+reducing the budget.
+
+Ownership is process-local. It coordinates handlers and housekeeping inside
+one `plurxd`; two processes pointed at the same data directory have separate
+registries and are unsupported because one can delete bytes the other is
+serving.
 
 ### Offline package storage and quotas
 

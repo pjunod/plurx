@@ -434,8 +434,11 @@ bump may break compatibility and a **patch** bump never does.
   removing its row or bytes: an active reader is skipped until the next sweep,
   while a lookup arriving during deletion becomes an ordinary cache miss.
   Location deletion is scoped by storage class so a stale local copy cannot
-  erase a future shared one. Metrics expose the entries temporarily protected
-  from housekeeping. This closes the documented reader/cleanup races without
+  erase a future shared one. The
+  `plurx_cache_protected_entries{reason="active_playback"}` gauge exposes the
+  entries temporarily protected from housekeeping. Concurrent sweeps now end
+  a losing budget pass instead of independently evicting the full deficit.
+  This closes the documented reader/cleanup races without
   treating offline pins as evidence that online playback is safe.
 
 - **Apple playback info now stays open when the transport controls fade.**
