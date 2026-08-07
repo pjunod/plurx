@@ -1189,7 +1189,14 @@ impl JobManager {
                     // producer was turned off after filling the cache still has
                     // to be able to get its disk back.
                     if let Some((root, node)) = transcode.cache_location() {
-                        crate::cachekeep::sweep(&self.store, root, node, now()).await;
+                        crate::cachekeep::sweep_with_readers(
+                            &self.store,
+                            root,
+                            node,
+                            transcode.cache_readers(),
+                            now(),
+                        )
+                        .await;
                     }
                 }
                 DueJob::ProduceCache => {
@@ -1284,7 +1291,14 @@ impl JobManager {
         // Under budget BEFORE producing, not after. Producing first would push
         // the cache over its ceiling and then evict — and the eviction is LRU,
         // so what it takes could easily be the entry just made.
-        crate::cachekeep::sweep(&self.store, root, node, now()).await;
+        crate::cachekeep::sweep_with_readers(
+            &self.store,
+            root,
+            node,
+            transcode.cache_readers(),
+            now(),
+        )
+        .await;
         if crate::cachekeep::budget_bytes(&self.store).await.is_none() {
             tracing::debug!("cache is switched off; nothing to produce");
             return;

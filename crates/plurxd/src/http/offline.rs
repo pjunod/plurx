@@ -636,7 +636,10 @@ async fn authorized_package(state: &AppState, token: &str) -> Result<OfflinePack
         })
 }
 
-async fn package_dir(state: &AppState, package: &OfflinePackage) -> Result<PathBuf, ApiError> {
+async fn package_dir(
+    state: &AppState,
+    package: &OfflinePackage,
+) -> Result<(PathBuf, crate::cachekeep::CacheReadGuard), ApiError> {
     if package.node_id != state.node_id {
         return Err(typed(
             StatusCode::NOT_FOUND,
@@ -651,6 +654,21 @@ async fn package_dir(state: &AppState, package: &OfflinePackage) -> Result<PathB
             "The offline package has not been published.",
         )
     })?;
+    // Claim the recipe before either the row lookup or the filesystem read,
+    // exactly as cached playback does. Offline leases pin ordinary LRU
+    // eviction, but they cannot prevent a source-file cascade from removing
+    // the row and exposing the directory to the orphan pass.
+    let cache_reader = state
+        .transcode
+        .cache_readers()
+        .begin_read(recipe)
+        .ok_or_else(|| {
+            typed(
+                StatusCode::GONE,
+                "package_evicted",
+                "The prepared package is being removed from the server.",
+            )
+        })?;
     let cached = state
         .store
         .cache_hit(recipe, &state.node_id)
@@ -672,7 +690,7 @@ async fn package_dir(state: &AppState, package: &OfflinePackage) -> Result<PathB
             "offline cache row contains an unsafe relative directory".to_owned(),
         ));
     }
-    Ok(state.cache_dir.join(relative))
+    Ok((state.cache_dir.join(relative), cache_reader))
 }
 
 fn hls_response(
@@ -701,7 +719,7 @@ pub async fn master(
     // The synthetic master is only valid while the immutable child recipe is
     // still present. Fail the root request coherently instead of letting the
     // downloader discover eviction one child request later.
-    let _ = package_dir(&state, &package).await?;
+    let (_dir, _cache_reader) = package_dir(&state, &package).await?;
     let playlist = crate::offline::master_playlist(&package);
     Ok(hls_response(
         &state,
@@ -716,7 +734,7 @@ pub async fn playlist(
     AxPath(token): AxPath<String>,
 ) -> Result<Response, ApiError> {
     let package = authorized_package(&state, &token).await?;
-    let dir = package_dir(&state, &package).await?;
+    let (dir, _cache_reader) = package_dir(&state, &package).await?;
     let bytes = tokio::fs::read(dir.join("index.m3u8"))
         .await
         .map_err(|_| typed(StatusCode::GONE, "package_evicted", "Playlist is missing."))?;
@@ -748,7 +766,7 @@ pub async fn segment(
         return Err(ApiError::NotFound("offline segment"));
     }
     let package = authorized_package(&state, &token).await?;
-    let dir = package_dir(&state, &package).await?;
+    let (dir, _cache_reader) = package_dir(&state, &package).await?;
     let bytes = tokio::fs::read(dir.join(segment))
         .await
         .map_err(|_| ApiError::NotFound("offline segment"))?;

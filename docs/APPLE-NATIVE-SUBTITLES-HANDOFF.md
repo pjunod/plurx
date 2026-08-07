@@ -43,8 +43,9 @@ preserves the RPU, and AVPlayer opens the standards-labeled master.
 - [x] File 5615 reaches the server-side copy/native-subtitle path on Bedroom,
   keeps its Dolby Vision RPU, publishes `SUPPLEMENTAL-CODECS`, and reaches
   AVPlayer `readyToPlay` on the physical Apple TV.
-- [ ] Android still needs the native subtitle client work in
-  [ANDROID-CLIENT-PARITY.md](ANDROID-CLIENT-PARITY.md).
+- [x] Android native text subtitles shipped in
+  [CLIENTS-REMEDIATION-PLAN.md](CLIENTS-REMEDIATION-PLAN.md) §5.4; physical
+  acceptance remains.
 
 `Native subtitles work` and `Dolby Vision works` remain separate claims. Both
 are now supported by tests plus live physical-device evidence.
@@ -362,7 +363,12 @@ Foreground activation was denied by tvOS with `System is asleep - foreground
 app launch forbidden`; the app was installed correctly, but this should not be
 described as a visible foreground launch.
 
-## 8. Remaining work — make the copied DV master physically playable
+## 8. Historical remaining-work plan — copied DV was resolved 2026-08-03
+
+This section records the path that was open on 2026-08-02. It is not the
+current task list. The outcome in §1 supersedes it: the client capability
+advertisement, not the copied media, caused the fallback, and physical Apple TV
+playback reached `readyToPlay` with Dolby Vision preserved on 2026-08-03.
 
 ### 8.1 Reduce the master failure to one attribute or relationship
 

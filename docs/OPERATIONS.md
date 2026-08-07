@@ -365,6 +365,34 @@ the configured pace in the stats overlay rather than as an unexplained stutter.
 Larger read sizes (`rsize=1048576` on NFS, SMB3 multichannel where the NAS
 offers it) help the burst land quickly.
 
+### Playback cache protection and a temporarily soft ceiling
+
+The pre-transcode budget never wins over an active viewer. A cached HLS
+session protects its recipe from LRU, stale-claim, and orphan cleanup until the
+last reader leaves; a later enabled sweep may then reclaim it. This can hold
+the cache above `cache_max_gb` temporarily, which is safer than turning the
+next playlist or segment request into a 404.
+
+Sweeps run only when `transcode_cleanup_mins` or `cache_produce_mins` is set;
+both default to `0` (off). With both off, nothing reclaims playback-cache
+entries automatically. Set at least one interval before treating “the next
+sweep” as an operational guarantee.
+
+Look for `cache: swept` in Settings → Logs. `protected > 0` means the sweep
+attempted an eviction and was refused by an active reader; it is a per-sweep
+skip count. The Prometheus gauge
+`plurx_cache_protected_entries{reason="active_playback"}` instead reports every
+recipe currently held by a live cached session, whether or not housekeeping
+tried to evict it. A persistent non-zero gauge with no active sessions means
+the session reaper is stuck. Low free space plus a non-zero `protected` sweep
+count means stop new cache production and let the viewer finish before
+reducing the budget.
+
+Ownership is process-local. It coordinates handlers and housekeeping inside
+one `plurxd`; two processes pointed at the same data directory have separate
+registries and are unsupported because one can delete bytes the other is
+serving.
+
 ### Offline package storage and quotas
 
 Phone downloads are prepared under `<data_dir>/cache` beside finished

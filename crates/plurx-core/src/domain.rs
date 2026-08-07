@@ -498,6 +498,10 @@ impl WatchRollup {
 pub struct CachedTranscode {
     pub recipe_hash: String,
     pub file_id: i64,
+    /// Which byte store owns this copy. Deletion is scoped to this value so a
+    /// stale local claim cannot remove a future shared-storage location for
+    /// the same recipe and node.
+    pub storage_class: String,
     /// Under the configured cache root — never absolute, because an absolute
     /// path is a fact about one machine's mounts and this row is meant to
     /// travel between machines that do not share them.
