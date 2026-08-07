@@ -89,79 +89,162 @@ impl fmt::Display for CasCardinalityError {
 
 impl std::error::Error for CasCardinalityError {}
 
-/// Why an existing SQLite transaction cannot be copied into hiqlite's fixed
-/// statement-list `txn()` API.
+/// Shape of one explicit production transaction boundary in the SQLite
+/// backend.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransactionShape {
     BatchWrite,
-    CompareAndSwap,
+    BranchOnRowsAffected,
     ReadBranchWrite,
     ReadExpandWrite,
-    WriteThenConditionalCleanup,
+    VerbatimBatch,
     WriteUntilStable,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TransactionMechanism {
+    RawBeginBatch,
+    RusqliteTransaction,
+}
+
+impl TransactionMechanism {
+    #[cfg(test)]
+    fn source_marker(self) -> &'static str {
+        match self {
+            Self::RawBeginBatch => "BEGIN;",
+            Self::RusqliteTransaction => "unchecked_transaction",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct InteractiveTransaction {
+pub struct SqliteTransactionSite {
+    pub module: &'static str,
     pub method: &'static str,
+    pub is_async: bool,
+    pub mechanism: TransactionMechanism,
     pub shape: TransactionShape,
 }
 
-/// Exhaustive M1a inventory of current interactive SQLite transactions.
+/// Exhaustive M1a inventory of explicit production SQLite transactions.
 ///
-/// Keeping this as code makes the redesign list reviewable beside the CAS
-/// primitive. The parity contract also pins the source-site count so a new
-/// `unchecked_transaction()` cannot arrive without being classified here.
-pub const INTERACTIVE_TRANSACTIONS: &[InteractiveTransaction] = &[
-    InteractiveTransaction {
+/// This is not the whole replicated-port work list. Untransacted
+/// read-branch-write flows, `RETURNING`, connection-local generated ids, and
+/// Rust-driven backfills remain separate audit populations. Keeping explicit
+/// boundaries here makes their port shape reviewable beside the CAS primitive.
+pub const SQLITE_TRANSACTION_SITES: &[SqliteTransactionSite] = &[
+    SqliteTransactionSite {
+        module: "watch.rs",
         method: "set_watched_tree",
+        is_async: true,
+        mechanism: TransactionMechanism::RusqliteTransaction,
         shape: TransactionShape::ReadExpandWrite,
     },
-    InteractiveTransaction {
+    SqliteTransactionSite {
+        module: "media.rs",
         method: "delete_files",
+        is_async: true,
+        mechanism: TransactionMechanism::RusqliteTransaction,
         shape: TransactionShape::BatchWrite,
     },
-    InteractiveTransaction {
+    SqliteTransactionSite {
+        module: "media.rs",
         method: "prune_empty_items",
+        is_async: true,
+        mechanism: TransactionMechanism::RusqliteTransaction,
         shape: TransactionShape::WriteUntilStable,
     },
-    InteractiveTransaction {
+    SqliteTransactionSite {
+        module: "cache.rs",
         method: "claim_cache_entry",
-        shape: TransactionShape::CompareAndSwap,
+        is_async: true,
+        mechanism: TransactionMechanism::RusqliteTransaction,
+        shape: TransactionShape::VerbatimBatch,
     },
-    InteractiveTransaction {
+    SqliteTransactionSite {
+        module: "cache.rs",
         method: "forget_cache_entry",
-        shape: TransactionShape::WriteThenConditionalCleanup,
+        is_async: true,
+        mechanism: TransactionMechanism::RusqliteTransaction,
+        shape: TransactionShape::VerbatimBatch,
     },
-    InteractiveTransaction {
+    SqliteTransactionSite {
+        module: "offline.rs",
         method: "create_offline_package",
+        is_async: true,
+        mechanism: TransactionMechanism::RusqliteTransaction,
         shape: TransactionShape::ReadBranchWrite,
     },
-    InteractiveTransaction {
+    SqliteTransactionSite {
+        module: "offline.rs",
         method: "renew_offline_package_for_user",
-        shape: TransactionShape::ReadBranchWrite,
+        is_async: true,
+        mechanism: TransactionMechanism::RusqliteTransaction,
+        shape: TransactionShape::BranchOnRowsAffected,
     },
-    InteractiveTransaction {
+    SqliteTransactionSite {
+        module: "offline.rs",
         method: "claim_next_offline_package",
+        is_async: true,
+        mechanism: TransactionMechanism::RusqliteTransaction,
         shape: TransactionShape::ReadBranchWrite,
     },
-    InteractiveTransaction {
+    SqliteTransactionSite {
+        module: "offline.rs",
         method: "put_offline_lease",
+        is_async: true,
+        mechanism: TransactionMechanism::RusqliteTransaction,
         shape: TransactionShape::ReadBranchWrite,
     },
-    InteractiveTransaction {
+    SqliteTransactionSite {
+        module: "offline.rs",
         method: "offline_package_for_lease",
+        is_async: true,
+        mechanism: TransactionMechanism::RusqliteTransaction,
+        shape: TransactionShape::ReadBranchWrite,
+    },
+    SqliteTransactionSite {
+        module: "mod.rs",
+        method: "migrate",
+        is_async: false,
+        mechanism: TransactionMechanism::RawBeginBatch,
         shape: TransactionShape::ReadBranchWrite,
     },
 ];
 
+/// hiqlite 0.14.0 `store/state_machine/sqlite/state_machine.rs:401-510`
+/// registers a panicking scalar-function stub for each name on its writer.
+#[cfg(test)]
+const HIQLITE_GUARDED_IDENTIFIERS: &[&str] = &[
+    "date",
+    "datetime",
+    "julianday",
+    "now",
+    "random",
+    "randomblob",
+    "strftime",
+    "time",
+    "timediff",
+    "unixepoch",
+];
+
 const FORBIDDEN_IDENTIFIERS: &[&str] = &[
+    "changes",
     "current_date",
     "current_time",
     "current_timestamp",
+    "date",
+    "datetime",
+    "julianday",
     "last_insert_rowid",
+    "now",
     "random",
     "randomblob",
+    "sqlite_version",
+    "strftime",
+    "time",
+    "timediff",
+    "total_changes",
     "unixepoch",
 ];
 
@@ -241,7 +324,68 @@ fn skip_block_comment(bytes: &[u8], mut index: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::path::Path;
+
     use super::*;
+
+    const SQLITE_MODULES: &[(&str, &str)] = &[
+        ("apikeys.rs", include_str!("sqlite/apikeys.rs")),
+        ("cache.rs", include_str!("sqlite/cache.rs")),
+        ("library.rs", include_str!("sqlite/library.rs")),
+        ("media.rs", include_str!("sqlite/media.rs")),
+        ("mod.rs", include_str!("sqlite/mod.rs")),
+        ("offline.rs", include_str!("sqlite/offline.rs")),
+        ("outbox.rs", include_str!("sqlite/outbox.rs")),
+        ("trakt.rs", include_str!("sqlite/trakt.rs")),
+        ("users.rs", include_str!("sqlite/users.rs")),
+        ("watch.rs", include_str!("sqlite/watch.rs")),
+    ];
+
+    fn production_source(source: &str) -> &str {
+        source
+            .split_once("\n#[cfg(test)]")
+            .map_or(source, |(code, _)| code)
+    }
+
+    fn source_for(module: &str) -> &'static str {
+        SQLITE_MODULES
+            .iter()
+            .find_map(|(name, source)| (*name == module).then_some(production_source(source)))
+            .unwrap_or_else(|| panic!("unregistered SQLite module {module}"))
+    }
+
+    fn method_source(site: &SqliteTransactionSite) -> &'static str {
+        let source = source_for(site.module);
+        let keyword = if site.is_async { "async fn" } else { "fn" };
+        let declaration = format!("    {keyword} {}(", site.method);
+        let start = source
+            .find(&declaration)
+            .unwrap_or_else(|| panic!("missing {declaration} in {}", site.module));
+        let tail = &source[start + declaration.len()..];
+        let next_async = tail.find("\n    async fn ");
+        let next_sync = tail.find("\n    fn ");
+        let end = [next_async, next_sync]
+            .into_iter()
+            .flatten()
+            .min()
+            .map_or(source.len(), |offset| start + declaration.len() + offset);
+        &source[start..end]
+    }
+
+    #[test]
+    fn replicated_sql_covers_every_hiqlite_panicking_function() {
+        let forbidden = FORBIDDEN_IDENTIFIERS
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let missing = HIQLITE_GUARDED_IDENTIFIERS
+            .iter()
+            .copied()
+            .filter(|identifier| !forbidden.contains(identifier))
+            .collect::<Vec<_>>();
+        assert!(missing.is_empty(), "hiqlite guardrail gaps: {missing:?}");
+    }
 
     #[test]
     fn replicated_sql_requires_leader_bound_values() {
@@ -275,38 +419,78 @@ mod tests {
     }
 
     #[test]
-    fn every_interactive_transaction_is_named_once() {
-        let mut methods = INTERACTIVE_TRANSACTIONS
+    fn every_sqlite_transaction_is_named_once() {
+        let mut methods = SQLITE_TRANSACTION_SITES
             .iter()
-            .map(|transaction| transaction.method)
+            .map(|site| (site.module, site.method))
             .collect::<Vec<_>>();
         let original_len = methods.len();
         methods.sort_unstable();
         methods.dedup();
         assert_eq!(methods.len(), original_len);
-        assert_eq!(methods.len(), 10);
+        assert_eq!(methods.len(), 11);
     }
 
     #[test]
     fn every_sqlite_transaction_site_is_classified() {
-        let sqlite_sources = concat!(
-            include_str!("sqlite/watch.rs"),
-            include_str!("sqlite/media.rs"),
-            include_str!("sqlite/cache.rs"),
-            include_str!("sqlite/offline.rs"),
+        let source_directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/store/sqlite");
+        let actual_modules = std::fs::read_dir(source_directory)
+            .expect("read SQLite module directory")
+            .map(|entry| entry.expect("SQLite module entry").path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "rs"))
+            .map(|path| {
+                path.file_name()
+                    .expect("SQLite module filename")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<BTreeSet<_>>();
+        let registered_modules = SQLITE_MODULES
+            .iter()
+            .map(|(module, _)| (*module).to_owned())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            actual_modules, registered_modules,
+            "register every SQLite module"
         );
 
-        assert_eq!(
-            sqlite_sources.matches("unchecked_transaction()").count(),
-            INTERACTIVE_TRANSACTIONS.len(),
-            "classify every interactive transaction before adding or removing a site",
-        );
-        for transaction in INTERACTIVE_TRANSACTIONS {
-            assert!(
-                sqlite_sources.contains(&format!("async fn {}", transaction.method)),
-                "{} is not a current SQLite transaction method",
-                transaction.method,
+        let observed = SQLITE_MODULES
+            .iter()
+            .flat_map(|(module, source)| {
+                let source = production_source(source);
+                [
+                    (
+                        (*module, TransactionMechanism::RusqliteTransaction),
+                        source
+                            .matches(TransactionMechanism::RusqliteTransaction.source_marker())
+                            .count(),
+                    ),
+                    (
+                        (*module, TransactionMechanism::RawBeginBatch),
+                        source
+                            .matches(TransactionMechanism::RawBeginBatch.source_marker())
+                            .count(),
+                    ),
+                ]
+            })
+            .filter(|(_, count)| *count > 0)
+            .collect::<BTreeMap<_, _>>();
+        let mut expected = BTreeMap::new();
+        for site in SQLITE_TRANSACTION_SITES {
+            *expected.entry((site.module, site.mechanism)).or_insert(0) += 1;
+            assert_eq!(
+                method_source(site)
+                    .matches(site.mechanism.source_marker())
+                    .count(),
+                1,
+                "{}.{} must own exactly one classified transaction boundary",
+                site.module,
+                site.method,
             );
         }
+        assert_eq!(
+            observed, expected,
+            "classify every production transaction boundary"
+        );
     }
 }

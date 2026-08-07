@@ -97,11 +97,15 @@ The semantic probe sizes the M1 port: 70 `unixepoch()` occurrences on 68
 lines, including 24 schema defaults, must become leader-computed bound values.
 No `CURRENT_TIMESTAMP`, `CURRENT_DATE`, or `CURRENT_TIME` keyword exists in the
 store today; M1 adds a CI ban before replicated SQL lands. The current SQLite
-backend also has 10 `unchecked_transaction()` sites. hiqlite's fixed `txn()`
-statement list cannot read, branch, or use `RETURNING`, so those ports need
-explicit transaction designs rather than mechanical translation. M1a keeps
-that classification executable in `store::replicated`; a source-site guard
-fails when a transaction is added or removed without updating the inventory.
+backend also has 10 `unchecked_transaction()` sites plus the raw `BEGIN` batch
+that applies schema migrations. hiqlite's fixed `txn()` statement list cannot
+read, branch, or use `RETURNING`, so seven store transactions and the migration
+path need explicit designs rather than mechanical translation; two cache
+transactions port as statement batches and one offline renewal branches on
+rows affected. M1a keeps every explicit boundary source-pinned in
+`store::replicated`. That inventory deliberately excludes untransacted
+read-branch-write flows, `RETURNING`, `last_insert_rowid()`, and Rust-driven
+backfills; those remain separate port audits.
 
 The recorded M0 cost run was taken 2026-08-07 on an Apple M3 Max MacBook Pro
 with 64 GB RAM, macOS 26.6, and the internal APFS data volume. It used the

@@ -7,6 +7,7 @@ use std::collections::BTreeSet;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use plurx_core::domain::{
     scopes, ArtworkAttempt, ItemEdit, ItemKind, ItemSort, LibraryKind, MetadataPatch, NewItem,
@@ -207,7 +208,7 @@ fn contract_inventory_matches_every_store_method() {
     assert_eq!(declared.len(), 114, "review the M1a method count");
     assert_eq!(
         covered, declared,
-        "every trait method needs a parity scenario"
+        "the declared async method name inventory changed"
     );
 }
 
@@ -229,8 +230,13 @@ async fn settings_contract_runs_through_dyn_store() {
             Some("second".to_owned()),
             "backend {backend}"
         );
-        uuid::Uuid::parse_str(&store.instance_id().await.expect("instance id"))
-            .expect("new instance ids are UUIDs");
+        let instance_id = store.instance_id().await.expect("instance id");
+        uuid::Uuid::parse_str(&instance_id).expect("new instance ids are UUIDs");
+        assert_eq!(
+            store.instance_id().await.expect("stable instance id"),
+            instance_id,
+            "backend {backend}"
+        );
     })
     .await;
 }
@@ -309,33 +315,44 @@ async fn user_contract_runs_through_dyn_store() {
 #[tokio::test]
 async fn api_key_contract_runs_through_dyn_store() {
     for_each_sqlite_backend(|store, backend| async move {
+        let expected_scopes = vec![
+            scopes::SCAN_TRIGGER.to_owned(),
+            scopes::STATUS_READ.to_owned(),
+        ];
         let key = store
-            .create_api_key(
-                "automation",
-                "key-hash",
-                &[
-                    scopes::SCAN_TRIGGER.to_owned(),
-                    scopes::STATUS_READ.to_owned(),
-                ],
-            )
+            .create_api_key("automation", "key-hash", &expected_scopes)
             .await
             .expect("create key");
-        assert_eq!(store.list_api_keys().await.expect("list").len(), 1);
-        assert_eq!(
-            store
-                .api_key_for_hash("key-hash")
-                .await
-                .expect("lookup")
-                .expect("key")
-                .id,
-            key.id,
-            "backend {backend}"
-        );
+        assert_eq!(key.scopes, expected_scopes);
+        let listed = store.list_api_keys().await.expect("list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].scopes, expected_scopes, "backend {backend}");
+        let looked_up = store
+            .api_key_for_hash("key-hash")
+            .await
+            .expect("lookup")
+            .expect("key");
+        assert_eq!(looked_up.id, key.id);
+        assert_eq!(looked_up.scopes, expected_scopes);
         store.touch_api_key(key.id).await.expect("touch");
+        assert!(store
+            .api_key_for_hash("key-hash")
+            .await
+            .expect("lookup touched key")
+            .expect("touched key")
+            .last_used_at
+            .is_some());
         assert!(store
             .set_api_key_disabled(key.id, true)
             .await
             .expect("disable"));
+        let disabled = store
+            .api_key_for_hash("key-hash")
+            .await
+            .expect("lookup disabled key")
+            .expect("disabled key");
+        assert!(disabled.disabled);
+        assert!(!disabled.allows(scopes::SCAN_TRIGGER));
         assert!(store.delete_api_key(key.id).await.expect("delete"));
     })
     .await;
@@ -391,6 +408,13 @@ async fn library_contract_runs_through_dyn_store() {
             .mark_library_scanned(scheduled.id, true)
             .await
             .expect("mark scanned");
+        let scanned = store
+            .get_library(scheduled.id)
+            .await
+            .expect("get scanned library")
+            .expect("scanned library");
+        assert!(scanned.last_scan_at.is_some());
+        assert!(scanned.last_refresh_at.is_some());
         assert_eq!(store.list_libraries().await.expect("list").len(), 1);
         assert!(
             store.delete_library(scheduled.id).await.expect("delete"),
@@ -594,34 +618,34 @@ async fn media_contract_runs_through_dyn_store() {
                 .id,
             movie
         );
-        assert!(store
+        let metadata_queue = store
             .items_needing_metadata(Some(movies.id), false, None)
             .await
-            .expect("metadata queue")
-            .iter()
-            .any(|item| item.id == empty_movie));
+            .expect("metadata queue");
+        assert!(metadata_queue.iter().any(|item| item.id == empty_movie));
+        assert!(!metadata_queue.iter().any(|item| item.id == movie));
         assert_eq!(
             store.episodes_for_show(show).await.expect("episodes").len(),
             1
         );
-        assert!(store
+        let home_artwork = store
             .items_needing_artwork(home.id, false, None)
             .await
-            .expect("home artwork")
-            .iter()
-            .any(|item| item.id == folder));
-        assert!(store
+            .expect("home artwork");
+        assert!(home_artwork.iter().any(|item| item.id == folder));
+        assert!(!home_artwork.iter().any(|item| item.id == movie));
+        let missing_artwork = store
             .items_missing_artwork(Some(movies.id), 0, 10)
             .await
-            .expect("missing artwork")
-            .iter()
-            .any(|item| item.id == movie));
-        assert!(store
+            .expect("missing artwork");
+        assert!(missing_artwork.iter().any(|item| item.id == movie));
+        assert!(!missing_artwork.iter().any(|item| item.id == show));
+        let missing_genres = store
             .items_missing_genres(0, 10)
             .await
-            .expect("missing genres")
-            .iter()
-            .any(|item| item.id == show));
+            .expect("missing genres");
+        assert!(missing_genres.iter().any(|item| item.id == show));
+        assert!(!missing_genres.iter().any(|item| item.id == movie));
         let edited = store
             .update_item_fields(
                 folder,
@@ -636,6 +660,13 @@ async fn media_contract_runs_through_dyn_store() {
             .expect("edited folder");
         assert_eq!(edited.title, "Edited Trips");
         store.set_nfo_seeded(folder).await.expect("NFO stamp");
+        assert!(store
+            .get_item(folder)
+            .await
+            .expect("get NFO-stamped item")
+            .expect("NFO-stamped item")
+            .nfo_seeded_at
+            .is_some());
 
         let movie_file = store
             .upsert_file(
@@ -727,6 +758,15 @@ async fn media_contract_runs_through_dyn_store() {
             .set_file_audio_offset(movie_file, 125)
             .await
             .expect("audio offset");
+        assert_eq!(
+            store
+                .get_file(movie_file)
+                .await
+                .expect("get offset file")
+                .expect("offset file")
+                .audio_offset_ms,
+            125
+        );
         assert!(store
             .get_file_probe_json(movie_file)
             .await
@@ -743,12 +783,13 @@ async fn media_contract_runs_through_dyn_store() {
             .expect("probe JSON")
             .expect("probe JSON")
             .contains("chapters"));
-        assert!(store
+        let missing_probes = store
             .files_missing_probe(Some(movies.id))
             .await
-            .expect("missing probes")
-            .iter()
-            .any(|file| file.id == empty_file));
+            .expect("missing probes");
+        assert!(missing_probes.iter().any(|file| file.id == empty_file));
+        assert!(!missing_probes.iter().any(|file| file.id == movie_file));
+        assert!(!missing_probes.iter().any(|file| file.id == episode_file));
         assert_eq!(
             store
                 .library_file_paths(movies.id)
@@ -763,6 +804,7 @@ async fn media_contract_runs_through_dyn_store() {
             .await
             .expect("genre page");
         assert!(genre_page.items.iter().any(|item| item.id == movie));
+        assert!(!genre_page.items.iter().any(|item| item.id == empty_movie));
         assert_eq!(
             store
                 .list_top_items(movies.id, ItemSort::Added, 0, 20)
@@ -776,12 +818,14 @@ async fn media_contract_runs_through_dyn_store() {
             .await
             .expect("recent")
             .is_empty());
-        assert!(store
-            .search_items("Contract", 20)
+        let search_ids = store
+            .search_items("backend-neutral", 20)
             .await
             .expect("search")
-            .iter()
-            .any(|item| item.item.id == movie));
+            .into_iter()
+            .map(|item| item.item.id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(search_ids, BTreeSet::from([movie]));
 
         assert_eq!(
             store
@@ -945,12 +989,12 @@ async fn watch_contract_runs_through_dyn_store() {
                 .len(),
             1
         );
-        assert!(store
+        let continuing = store
             .continue_watching(user.id, 10)
             .await
-            .expect("continue watching")
-            .iter()
-            .any(|item| item.item.id == movie));
+            .expect("continue watching");
+        assert!(continuing.iter().any(|item| item.item.id == movie));
+        assert!(!continuing.iter().any(|item| item.item.id == episodes[1]));
 
         store
             .set_watched(user.id, movie, true)
@@ -980,13 +1024,13 @@ async fn watch_contract_runs_through_dyn_store() {
             .apply_remote_watch(user.id, episodes[0], true, 1_000, Some(1_000), 10)
             .await
             .expect("remote watch");
-        assert!(
-            store
-                .next_up(user.id, 10)
-                .await
-                .expect("next up")
-                .iter()
-                .any(|item| item.item.id == episodes[1]),
+        let next_up = store.next_up(user.id, 10).await.expect("next up");
+        assert_eq!(
+            next_up
+                .into_iter()
+                .map(|item| item.item.id)
+                .collect::<Vec<_>>(),
+            vec![episodes[1]],
             "backend {backend}"
         );
     })
@@ -1053,22 +1097,52 @@ async fn trakt_contract_runs_through_dyn_store() {
             })
             .await
             .expect("put auth");
+        let linked = store
+            .get_trakt_auth(user.id)
+            .await
+            .expect("get linked auth")
+            .expect("linked auth");
+        assert_eq!(linked.access_token, "access-1");
+        assert_eq!(linked.refresh_token, "refresh-1");
+        assert_eq!(linked.expires_at, 100);
+        assert_eq!(linked.trakt_username.as_deref(), Some("contract"));
         assert_eq!(store.list_trakt_auth().await.expect("list").len(), 1);
         store
             .update_trakt_tokens(user.id, "access-2", "refresh-2", 200)
             .await
             .expect("update tokens");
+        let refreshed = store
+            .get_trakt_auth(user.id)
+            .await
+            .expect("get refreshed auth")
+            .expect("refreshed auth");
+        assert_eq!(refreshed.access_token, "access-2");
+        assert_eq!(refreshed.refresh_token, "refresh-2");
+        assert_eq!(refreshed.expires_at, 200);
         store
             .set_trakt_sync(user.id, 50, Some(r#"{"movies":{"watched_at":50}}"#))
             .await
             .expect("set sync");
-        assert!(
-            store
-                .trakt_sync_candidates(user.id)
-                .await
-                .expect("candidates")
-                .iter()
-                .any(|candidate| candidate.item_id == movie),
+        let synced = store
+            .get_trakt_auth(user.id)
+            .await
+            .expect("get synced auth")
+            .expect("synced auth");
+        assert_eq!(synced.last_sync_at, 50);
+        assert_eq!(
+            synced.last_activities.as_deref(),
+            Some(r#"{"movies":{"watched_at":50}}"#)
+        );
+        let candidates = store
+            .trakt_sync_candidates(user.id)
+            .await
+            .expect("candidates");
+        assert_eq!(
+            candidates
+                .into_iter()
+                .map(|candidate| candidate.item_id)
+                .collect::<Vec<_>>(),
+            vec![movie],
             "backend {backend}"
         );
         store.delete_trakt_auth(user.id).await.expect("delete auth");
@@ -1147,6 +1221,22 @@ async fn seed_file(store: &Arc<dyn Store>, prefix: &str) -> (i64, i64) {
     (user.id, file)
 }
 
+fn unix_seconds() -> i64 {
+    i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time after Unix epoch")
+            .as_secs(),
+    )
+    .expect("Unix time fits i64")
+}
+
+async fn wait_until_after(second: i64) {
+    while unix_seconds() <= second {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 #[tokio::test]
 async fn transcode_cache_contract_runs_through_dyn_store() {
     for_each_sqlite_backend(|store, backend| async move {
@@ -1165,10 +1255,36 @@ async fn transcode_cache_contract_runs_through_dyn_store() {
             .claim_cache_entry("recipe", file, 1, node, "bb/loser")
             .await
             .expect("duplicate claim"));
+        let claimed = store
+            .all_cache_rows(node)
+            .await
+            .expect("claimed row")
+            .pop()
+            .expect("one claimed row");
+        wait_until_after(claimed.last_used_at).await;
+        let stale_cutoff = unix_seconds();
+        assert_eq!(
+            store
+                .stale_cache_claims(node, stale_cutoff)
+                .await
+                .expect("stale claim before touch")
+                .len(),
+            1
+        );
         store
             .touch_cache_claim("recipe", node)
             .await
             .expect("touch claim");
+        assert!(store
+            .stale_cache_claims(node, i64::MIN)
+            .await
+            .expect("fresh claims")
+            .is_empty());
+        assert!(store
+            .stale_cache_claims(node, stale_cutoff)
+            .await
+            .expect("touched claim")
+            .is_empty());
         assert_eq!(
             store
                 .stale_cache_claims(node, i64::MAX)
@@ -1187,10 +1303,26 @@ async fn transcode_cache_contract_runs_through_dyn_store() {
             .await
             .expect("hit")
             .is_some());
+        let completed_at = store
+            .cache_hit("recipe", node)
+            .await
+            .expect("completed hit")
+            .expect("completed cache row")
+            .last_used_at;
+        wait_until_after(completed_at).await;
         store
             .touch_cache_entry("recipe", node)
             .await
             .expect("touch entry");
+        assert!(
+            store
+                .cache_hit("recipe", node)
+                .await
+                .expect("touched hit")
+                .expect("touched cache row")
+                .last_used_at
+                > completed_at
+        );
         assert_eq!(store.cache_by_age(node, 10).await.expect("by age").len(), 1);
         assert_eq!(store.cache_bytes(node).await.expect("bytes"), 4_096);
         store
@@ -1257,11 +1389,12 @@ async fn offline_package_contract_runs_through_dyn_store() {
             .await
             .expect("package lookup")
             .is_some());
-        assert!(store
+        let renewed = store
             .renew_offline_package_for_user(&first.id, user_id, 20_000)
             .await
             .expect("renew package")
-            .is_some());
+            .expect("renewed package");
+        assert_eq!(renewed.expires_at, 20_000);
         assert!(!store
             .offline_activity_packages("offline-node", 1, 0, 10)
             .await
@@ -1274,13 +1407,6 @@ async fn offline_package_contract_runs_through_dyn_store() {
         assert_eq!(stats.queued, 1);
         assert_eq!(
             store
-                .reset_interrupted_offline_packages("offline-node")
-                .await
-                .expect("reset"),
-            0
-        );
-        assert_eq!(
-            store
                 .claim_next_offline_package("offline-node")
                 .await
                 .expect("claim")
@@ -1288,6 +1414,27 @@ async fn offline_package_contract_runs_through_dyn_store() {
                 .id,
             first.id
         );
+        assert_eq!(
+            store
+                .reset_interrupted_offline_packages("offline-node")
+                .await
+                .expect("reset"),
+            1
+        );
+        assert_eq!(
+            store
+                .offline_package_for_user(&first.id, user_id)
+                .await
+                .expect("reset package lookup")
+                .expect("reset package")
+                .state,
+            "queued"
+        );
+        store
+            .claim_next_offline_package("offline-node")
+            .await
+            .expect("claim after reset")
+            .expect("package after reset");
         assert!(store
             .requeue_offline_package(&first.id)
             .await
@@ -1301,10 +1448,27 @@ async fn offline_package_contract_runs_through_dyn_store() {
             .set_offline_package_recipe(&first.id, "offline-recipe")
             .await
             .expect("set recipe"));
+        assert_eq!(
+            store
+                .offline_package_for_user(&first.id, user_id)
+                .await
+                .expect("recipe package lookup")
+                .expect("recipe package")
+                .recipe_hash
+                .as_deref(),
+            Some("offline-recipe")
+        );
         assert!(store
             .update_offline_progress(&first.id, "video", 500)
             .await
             .expect("progress"));
+        let progressing = store
+            .offline_package_for_user(&first.id, user_id)
+            .await
+            .expect("progress package lookup")
+            .expect("progress package");
+        assert_eq!(progressing.phase, "video");
+        assert_eq!(progressing.progress_millis, 500);
         assert!(store
             .mark_offline_package_ready(&first.id, "offline-recipe", 4_000, 7_200_000)
             .await
@@ -1338,6 +1502,17 @@ async fn offline_package_contract_runs_through_dyn_store() {
             .fail_offline_package(&failed.id, "video", "encoder", "contract failure")
             .await
             .expect("fail package"));
+        let failed_package = store
+            .offline_package_for_user(&failed.id, user_id)
+            .await
+            .expect("failed package lookup")
+            .expect("failed package");
+        assert_eq!(failed_package.state, "failed");
+        assert_eq!(failed_package.error_code.as_deref(), Some("encoder"));
+        assert_eq!(
+            failed_package.error_message.as_deref(),
+            Some("contract failure")
+        );
 
         let mut expired = offline_request("package-3", "request-3", user_id, file_id);
         expired.expires_at = 1;

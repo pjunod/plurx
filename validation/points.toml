@@ -230,8 +230,6 @@ paths = [
   "crates/plurx-core/src/store/replicated.rs",
   "crates/plurx-core/src/store/sqlite/cache.rs",
   "crates/plurx-core/tests/store_contract.rs",
-  "crates/plurx-core/tests/hiqlite_m0.rs",
-  "docs/{CLUSTERING-PLAN,PHASE3-SPIKE}.md",
   "spikes/hiqlite-m0/{Cargo.toml,Cargo.lock,src/lib.rs,tests/hiqlite_m0.rs}",
   "rust-toolchain.toml",
 ]
