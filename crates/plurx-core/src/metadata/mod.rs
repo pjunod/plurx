@@ -144,7 +144,25 @@ pub async fn enrich_library_for_targets(
                 } else {
                     let known = known_id(tmdb, &item).await;
                     match show_lookup(tmdb, &item, known).await {
-                        Ok(Some(m)) => Some(m.tmdb_id),
+                        Ok(Some(m)) => {
+                            // The ancestor is route-only, but the identity we
+                            // just resolved is durable routing state. Keeping
+                            // it avoids paying for (and risking) the same title
+                            // search on every child retry without refreshing
+                            // any of the healthy show metadata.
+                            let tmdb_id = m.tmdb_id;
+                            apply(
+                                store,
+                                item.id,
+                                MetadataPatch {
+                                    tmdb_id: Some(tmdb_id),
+                                    ..Default::default()
+                                },
+                                &mut report,
+                            )
+                            .await;
+                            Some(tmdb_id)
+                        }
                         Ok(None) => {
                             report.unmatched += 1;
                             None
@@ -580,10 +598,17 @@ async fn enrich_episodes(
         if only.is_some_and(|ids| !ids.contains(&ep.id)) {
             continue;
         }
-        by_season
-            .entry(ep.season_number.unwrap_or(0))
-            .or_default()
-            .push(ep);
+        // Unknown is not season zero. Routing a malformed episode to TMDB's
+        // Specials endpoint can overwrite it with an unrelated special that
+        // happens to share the episode number.
+        let Some(season_number) = ep.season_number else {
+            tracing::warn!(
+                item_id = ep.id,
+                "episode has no season number; skipping TMDB artwork"
+            );
+            continue;
+        };
+        by_season.entry(season_number).or_default().push(ep);
     }
     // A season can be the missing card even when every episode still exists.
     // Keep an empty bucket for an explicitly requested season so its TMDB
@@ -646,6 +671,25 @@ async fn enrich_episodes(
                 .iter()
                 .find(|r| Some(r.episode_number) == ep.episode_number)
             else {
+                // The season request succeeded, so this is a real provider
+                // outcome rather than a network/key/store failure. Record it
+                // here, where that distinction is known, so the retry sweep
+                // can back it off without fabricating an artwork attempt for
+                // paths that never reached TMDB.
+                if ep.poster_path.is_none() {
+                    apply(
+                        store,
+                        ep.id,
+                        MetadataPatch {
+                            artwork: Some(ArtworkAttempt::Failed(
+                                "the provider has no matching episode".to_owned(),
+                            )),
+                            ..Default::default()
+                        },
+                        report,
+                    )
+                    .await;
+                }
                 continue;
             };
             let still = cache_image(
@@ -863,6 +907,82 @@ mod tests {
         // A second run has nothing left needing metadata.
         let again = enrich_library(&store, &tmdb, art.path(), Some(lib.id), false, None).await;
         assert_eq!(again.matched, 0);
+    }
+
+    /// A healthy show can be only the route to one blank season. If that show
+    /// was enriched from local data and has no provider id yet, the one title
+    /// search needed to route this pass must persist its result without
+    /// refreshing the show's artwork or descriptive metadata.
+    #[tokio::test]
+    async fn route_only_show_persists_a_resolved_tmdb_id() {
+        let store = SqliteStore::open_in_memory().expect("open");
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "TV".into(),
+                kind: LibraryKind::Shows,
+                paths: vec![],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+        let show = store
+            .insert_item(&NewItem {
+                library_id: lib.id,
+                kind: ItemKind::Show,
+                parent_id: None,
+                title: "Severance".into(),
+                year: Some(2022),
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("show");
+        let season = store
+            .insert_item(&NewItem {
+                library_id: lib.id,
+                kind: ItemKind::Season,
+                parent_id: Some(show),
+                title: "Season 1".into(),
+                year: None,
+                season_number: Some(1),
+                episode_number: None,
+            })
+            .await
+            .expect("season");
+        store
+            .apply_metadata(
+                show,
+                &MetadataPatch {
+                    poster_path: Some("local-show.jpg".into()),
+                    backdrop_path: Some("local-backdrop.jpg".into()),
+                    overview: Some("Keep this copy".into()),
+                    enriched: true,
+                    artwork: Some(ArtworkAttempt::Stored),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("seed show");
+
+        let base = serve(tmdb_mock()).await;
+        let tmdb = TmdbClient::new("k").with_base(&base, &base);
+        let art = tempfile::tempdir().expect("tmp");
+        let report = enrich_library_for_targets(
+            &store,
+            &tmdb,
+            art.path(),
+            Some(lib.id),
+            true,
+            Some(&[show, season]),
+            Some(&[season]),
+        )
+        .await;
+        assert_eq!(report.errors, 0);
+        let show = store.get_item(show).await.expect("get").expect("show");
+        assert_eq!(show.tmdb_id, Some(42));
+        assert_eq!(show.poster_path.as_deref(), Some("local-show.jpg"));
+        assert_eq!(show.backdrop_path.as_deref(), Some("local-backdrop.jpg"));
+        assert_eq!(show.overview.as_deref(), Some("Keep this copy"));
     }
 
     /// A movie library with one movie in it, titled however you like.

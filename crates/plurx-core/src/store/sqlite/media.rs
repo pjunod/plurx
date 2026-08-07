@@ -637,6 +637,9 @@ impl MediaStore for SqliteStore {
         retry_after_secs: i64,
         limit: i64,
     ) -> Result<Vec<Item>, StoreError> {
+        if limit <= 0 {
+            return Ok(Vec::new());
+        }
         self.with_conn(move |conn| {
             // A movie/show is eligible only after its own provider pass. A TV
             // season/episode never receives `metadata_at` -- TMDB reaches it
@@ -654,13 +657,15 @@ impl MediaStore for SqliteStore {
                  JOIN libraries l ON l.id = i.library_id AND l.kind != 'home'
                  LEFT JOIN items parent ON parent.id = i.parent_id
                  LEFT JOIN items grandparent ON grandparent.id = parent.parent_id
-                 WHERE i.poster_path IS NULL
+                 WHERE (i.poster_path IS NULL
+                        OR (i.kind IN ('movie','show') AND i.backdrop_path IS NULL))
                    AND (
                         (i.kind IN ('movie','show') AND i.metadata_at IS NOT NULL)
                         OR (i.kind = 'season' AND l.anime = 0
                             AND i.season_number IS NOT NULL
                             AND parent.kind = 'show' AND parent.metadata_at IS NOT NULL)
                         OR (i.kind = 'episode' AND l.anime = 0
+                            AND i.season_number IS NOT NULL
                             AND parent.kind = 'season'
                             AND grandparent.kind = 'show'
                             AND grandparent.metadata_at IS NOT NULL)
@@ -668,15 +673,14 @@ impl MediaStore for SqliteStore {
                    AND (i.artwork_attempted_at IS NULL
                         OR i.artwork_attempted_at <= unixepoch() - ?2)
                    AND (?1 IS NULL OR i.library_id = ?1)
-                 ORDER BY i.artwork_attempted_at IS NOT NULL, i.artwork_attempted_at, i.id
+                 ORDER BY i.artwork_attempted_at, i.id
                  LIMIT ?3",
                 i = item_cols("i")
             ))?;
             let items = stmt
-                .query_map(
-                    params![library_id, retry_after_secs.max(0), limit.max(0)],
-                    |row| item_from_row(row, 0),
-                )?
+                .query_map(params![library_id, retry_after_secs.max(0), limit], |row| {
+                    item_from_row(row, 0)
+                })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(items)
         })
@@ -2312,6 +2316,7 @@ mod tests {
                 &MetadataPatch {
                     title: Some("Stalker".into()),
                     poster_path: Some("2-poster.jpg".into()),
+                    backdrop_path: Some("2-backdrop.jpg".into()),
                     enriched: true,
                     artwork: Some(ArtworkAttempt::Stored),
                     ..Default::default()
@@ -2338,6 +2343,16 @@ mod tests {
         );
         assert!(due[0].artwork_attempted_at.is_some());
         assert!(store.get_item(unenriched).await.expect("get").is_some());
+        assert!(store
+            .items_missing_artwork(None, 0, 0)
+            .await
+            .expect("zero limit")
+            .is_empty());
+        assert!(store
+            .items_missing_artwork(None, 0, -1)
+            .await
+            .expect("negative limit")
+            .is_empty());
 
         // With a backoff, the same item is skipped — it was attempted a
         // moment ago, and the point of recording that was to be able to wait.
@@ -2406,6 +2421,7 @@ mod tests {
                 &MetadataPatch {
                     tmdb_id: Some(42),
                     poster_path: Some("show.jpg".into()),
+                    backdrop_path: Some("show-backdrop.jpg".into()),
                     enriched: true,
                     artwork: Some(ArtworkAttempt::Stored),
                     ..Default::default()
@@ -2501,6 +2517,7 @@ mod tests {
                         &MetadataPatch {
                             tmdb_id: Some(42),
                             poster_path: Some(format!("{show}-poster.jpg")),
+                            backdrop_path: Some(format!("{show}-backdrop.jpg")),
                             enriched: true,
                             artwork: Some(ArtworkAttempt::Stored),
                             ..Default::default()
@@ -2552,12 +2569,25 @@ mod tests {
             })
             .await
             .expect("season");
+        let unnumbered_episode = store
+            .insert_item(&NewItem {
+                library_id: normal.id,
+                kind: ItemKind::Episode,
+                parent_id: Some(unnumbered_season),
+                title: "Unknown Episode".into(),
+                year: None,
+                season_number: None,
+                episode_number: Some(1),
+            })
+            .await
+            .expect("episode");
         store
             .apply_metadata(
                 show,
                 &MetadataPatch {
                     tmdb_id: Some(43),
                     poster_path: Some("malformed-show.jpg".into()),
+                    backdrop_path: Some("malformed-backdrop.jpg".into()),
                     enriched: true,
                     artwork: Some(ArtworkAttempt::Stored),
                     ..Default::default()
@@ -2575,6 +2605,54 @@ mod tests {
         assert!(!ids.contains(&unenriched_episode));
         assert!(!ids.contains(&home_episode));
         assert!(!ids.contains(&unnumbered_season));
+        assert!(!ids.contains(&unnumbered_episode));
+    }
+
+    /// Movies and shows own both a card poster and a hero backdrop. A healthy
+    /// card must not hide a failed hero download from the retry queue.
+    #[tokio::test]
+    async fn items_missing_artwork_includes_a_show_missing_only_its_backdrop() {
+        let store = SqliteStore::open_in_memory().expect("open");
+        let lib = store
+            .create_library(&NewLibrary {
+                name: "TV".into(),
+                kind: LibraryKind::Shows,
+                paths: vec![],
+                anime: false,
+            })
+            .await
+            .expect("lib");
+        let show = store
+            .insert_item(&NewItem {
+                library_id: lib.id,
+                kind: ItemKind::Show,
+                parent_id: None,
+                title: "Severance".into(),
+                year: Some(2022),
+                season_number: None,
+                episode_number: None,
+            })
+            .await
+            .expect("show");
+        store
+            .apply_metadata(
+                show,
+                &MetadataPatch {
+                    tmdb_id: Some(42),
+                    poster_path: Some("show-poster.jpg".into()),
+                    enriched: true,
+                    artwork: Some(ArtworkAttempt::Stored),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("enrich show");
+
+        let due = store
+            .items_missing_artwork(None, 0, 100)
+            .await
+            .expect("missing backdrop");
+        assert_eq!(due.iter().map(|item| item.id).collect::<Vec<_>>(), [show]);
     }
 
     /// A patch that is not about artwork must not disturb the attempt record.

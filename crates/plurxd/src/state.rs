@@ -1,12 +1,14 @@
 //! Shared application state and the background job manager.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use plurx_core::domain::{ArtworkAttempt, Item, Library, LibraryKind, MetadataPatch};
+#[cfg(test)]
+use plurx_core::domain::ArtworkAttempt;
+use plurx_core::domain::{Item, Library, LibraryKind, MetadataPatch};
 use plurx_core::error::StoreError;
 use plurx_core::metadata::genres::GenreBackfillReport;
 use plurx_core::metadata::local::LocalArtReport;
@@ -430,6 +432,13 @@ impl Drop for ArtworkRetryGuard {
     }
 }
 
+#[derive(Default)]
+struct ArtworkSweepResult {
+    repaired: usize,
+    #[cfg(test)]
+    claimed_ids: Vec<i64>,
+}
+
 /// Clears [`JobManager::producing`] however the pass ends — including the ways
 /// a `?` or a panic would leave it set forever, which would silently stop the
 /// producer for the life of the process.
@@ -464,6 +473,16 @@ const PRODUCE_WINDOW: std::time::Duration = std::time::Duration::from_secs(6 * 3
 /// Maximum posterless rows one artwork-retry pass may claim. The durable
 /// per-item attempt stamp drains a larger backlog over successive passes.
 const ARTWORK_RETRY_BATCH: i64 = 200;
+
+/// Artwork slots maintained by the automatic retry path. Seasons and
+/// episodes have one card image; movies and shows also own a hero backdrop.
+fn needs_artwork_retry(item: &Item) -> bool {
+    item.poster_path.is_none()
+        || (matches!(
+            item.kind,
+            plurx_core::domain::ItemKind::Movie | plurx_core::domain::ItemKind::Show
+        ) && item.backdrop_path.is_none())
+}
 
 /// Ids the caller already knows, so plurx does not have to guess.
 ///
@@ -761,16 +780,21 @@ impl JobManager {
                 if seen.contains(target) {
                     continue;
                 }
-                if self
-                    .store
-                    .get_item(*target)
-                    .await
-                    .ok()
-                    .flatten()
-                    .is_some_and(|item| item.poster_path.is_none())
-                {
-                    seen.insert(*target);
-                    repairs.push(*target);
+                match self.store.get_item(*target).await {
+                    Ok(Some(item)) if needs_artwork_retry(&item) => {
+                        seen.insert(*target);
+                        repairs.push(*target);
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => tracing::warn!(
+                        item_id = *target,
+                        "targeted scan ancestor disappeared before enrichment"
+                    ),
+                    Err(e) => tracing::warn!(
+                        item_id = *target,
+                        error = %e,
+                        "targeted scan could not inspect ancestor artwork"
+                    ),
                 }
             }
             repairs
@@ -808,22 +832,18 @@ impl JobManager {
         let mut targets: Vec<i64> = Vec::new();
         let mut seen: HashSet<i64> = HashSet::new();
         for id in item_ids {
-            if seen.contains(id) {
-                continue;
-            }
             let mut current = *id;
             // Depth guard, not a shape assumption: library → show → season →
             // episode is three levels, home folders can nest deeper, and a
             // cycle in parent_id would otherwise hang the request.
-            for _ in 0..8 {
-                // The first episode walks its season and show. Every sibling
-                // can stop as soon as it reaches either one: both the dedup
-                // and the database work are now proportional to distinct
-                // rows, not three reads per episode.
-                if !seen.insert(current) {
-                    break;
+            for _ in 0..16 {
+                // Deduplicate the output, not the walk. A prior start may
+                // have reached this row with too little depth budget left to
+                // reach all of its ancestors; stopping here would make the
+                // missing ancestor depend on filesystem traversal order.
+                if seen.insert(current) {
+                    targets.push(current);
                 }
-                targets.push(current);
                 match self.store.get_item(current).await {
                     Ok(Some(item)) => match item.parent_id {
                         Some(parent) => current = parent,
@@ -832,7 +852,14 @@ impl JobManager {
                     // A row that vanished between the scan and here is not
                     // worth failing the request over; it simply gets no
                     // enrichment, exactly as if it had not been placed.
-                    _ => break,
+                    Ok(None) => {
+                        tracing::warn!(item_id = current, "enrichment target disappeared");
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!(item_id = current, error = %e, "reading enrichment target");
+                        break;
+                    }
                 }
             }
         }
@@ -1492,7 +1519,7 @@ impl JobManager {
         }
     }
 
-    /// Give every enriched item that still has no poster another go.
+    /// Give every enriched item that still has incomplete artwork another go.
     ///
     /// The self-healing half of the artwork fix: §2 records *that* a download
     /// failed, this is what comes back for it. Forced, because these items
@@ -1503,23 +1530,70 @@ impl JobManager {
     /// to ask. The per-item backoff, not this interval, is what stops a
     /// permanently art-less item from being re-fetched every half hour.
     pub async fn sweep_artwork(&self) -> Result<usize, plurx_core::error::StoreError> {
-        let items = self
+        Ok(self
+            .sweep_artwork_with_backoff(keys::ARTWORK_RETRY_BACKOFF_SECS)
+            .await?
+            .repaired)
+    }
+
+    /// The retry pass with an injectable backoff for fairness tests.
+    async fn sweep_artwork_with_backoff(
+        &self,
+        retry_after_secs: i64,
+    ) -> Result<ArtworkSweepResult, plurx_core::error::StoreError> {
+        let mut items = self
             .store
-            .items_missing_artwork(None, keys::ARTWORK_RETRY_BACKOFF_SECS, ARTWORK_RETRY_BATCH)
+            .items_missing_artwork(None, retry_after_secs, ARTWORK_RETRY_BATCH)
             .await?;
         if items.is_empty() {
-            return Ok(0);
+            return Ok(ArtworkSweepResult::default());
+        }
+
+        // Never spend the tail of a batch retrying an old row while a never-
+        // attempted row is still entering the queue. SQL sorts NULL stamps
+        // first; if both classes fit in this result, take only the fresh
+        // prefix. The next pass finishes the initial backlog before normal
+        // retry rotation begins, even when tests/operators use zero backoff.
+        if items[0].artwork_attempted_at.is_none() {
+            if let Some(first_retry) = items
+                .iter()
+                .position(|item| item.artwork_attempted_at.is_some())
+            {
+                items.truncate(first_retry);
+            }
         }
         let attempted = items.len();
-        let mut by_library: HashMap<i64, Vec<Item>> = HashMap::new();
+        #[cfg(test)]
+        let claimed_ids = items.iter().map(|item| item.id).collect::<Vec<_>>();
+        // Stable library order makes partial progress and logs reproducible if
+        // one library disappears or SQLite rejects one of the later reads.
+        let mut by_library: BTreeMap<i64, Vec<Item>> = BTreeMap::new();
         for item in items {
             by_library.entry(item.library_id).or_default().push(item);
         }
         let mut repaired = 0usize;
         let mut still_missing = 0usize;
+        let mut provider_errors = 0usize;
         for (library_id, candidates) in by_library {
-            let Ok(Some(library)) = self.store.get_library(library_id).await else {
-                continue;
+            let library = match self.store.get_library(library_id).await {
+                Ok(Some(library)) => library,
+                Ok(None) => {
+                    tracing::warn!(
+                        library = library_id,
+                        candidates = candidates.len(),
+                        "artwork retry library disappeared"
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        library = library_id,
+                        candidates = candidates.len(),
+                        error = %e,
+                        "artwork retry could not read library"
+                    );
+                    continue;
+                }
             };
             // Metadata providers enter a TV tree through the show, never
             // through a season/episode row. Carry each missing child and all
@@ -1528,36 +1602,41 @@ impl JobManager {
             // seasons and episodes.
             let ids: Vec<i64> = candidates.iter().map(|item| item.id).collect();
             let targets = self.enrich_targets(&ids).await;
-            self.enrich(&library, true, Some(&targets), Some(&ids))
+            let outcome = self
+                .enrich(&library, true, Some(&targets), Some(&ids))
                 .await;
+            provider_errors += outcome.enrich.as_ref().map_or(0, |r| r.errors);
 
-            // Convergence backstop. Provider lookup can legitimately miss,
-            // a season endpoint can fail, and local numbering can name an
-            // episode TMDB does not. Every row this pass claimed must either
-            // gain a poster or gain a fresh attempt stamp; otherwise NULL is
-            // unconditionally due and the 24-hour backoff never engages.
+            // Count from persisted state, not provider-level matches: a show
+            // can be a route for twenty candidate episodes without itself
+            // being one repaired row. Attempt stamps are written only inside
+            // provider paths that know an image was requested or the provider
+            // successfully answered that no matching image/episode exists.
+            // Errors and a missing API key deliberately remain unstamped so
+            // the next scheduled pass can retry them in thirty minutes.
             for before in candidates {
-                let Some(after) = self.store.get_item(before.id).await? else {
-                    continue;
+                let after = match self.store.get_item(before.id).await {
+                    Ok(Some(after)) => after,
+                    Ok(None) => {
+                        tracing::warn!(
+                            item_id = before.id,
+                            "artwork retry candidate disappeared after enrichment"
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            item_id = before.id,
+                            error = %e,
+                            "artwork retry could not read candidate after enrichment"
+                        );
+                        continue;
+                    }
                 };
-                if after.poster_path.is_some() {
+                if !needs_artwork_retry(&after) {
                     repaired += 1;
-                    continue;
-                }
-                still_missing += 1;
-                if after.artwork_attempted_at == before.artwork_attempted_at {
-                    let reason = after.artwork_error.unwrap_or_else(|| {
-                        "artwork retry found no provider image for this item".to_owned()
-                    });
-                    self.store
-                        .apply_metadata(
-                            after.id,
-                            &MetadataPatch {
-                                artwork: Some(ArtworkAttempt::Failed(reason)),
-                                ..Default::default()
-                            },
-                        )
-                        .await?;
+                } else {
+                    still_missing += 1;
                 }
             }
         }
@@ -1565,9 +1644,14 @@ impl JobManager {
             attempted,
             repaired,
             still_missing,
+            provider_errors,
             "artwork retry sweep finished"
         );
-        Ok(repaired)
+        Ok(ArtworkSweepResult {
+            repaired,
+            #[cfg(test)]
+            claimed_ids,
+        })
     }
 
     /// A minutes-interval setting; absent, blank or unparseable reads as off.
@@ -1632,6 +1716,7 @@ mod tests {
     use super::*;
     use plurx_core::domain::{ItemKind, NewItem, NewLibrary};
     use plurx_core::store::{LibraryStore, MediaStore, SettingsStore, SqliteStore};
+    use plurx_core::transcode::Pipeline;
     use serde_json::json;
     use std::sync::atomic::AtomicUsize;
 
@@ -1719,6 +1804,52 @@ mod tests {
             .fallback(get(|| async { vec![0_u8, 1, 2, 3] }))
     }
 
+    fn empty_season_tmdb(season_hits: Arc<AtomicUsize>) -> axum::Router {
+        use axum::routing::get;
+        use axum::Json;
+
+        axum::Router::new().route(
+            "/tv/42/season/1",
+            get(move || {
+                let hits = Arc::clone(&season_hits);
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({
+                        "poster_path": "/season-1.jpg",
+                        "episodes": []
+                    }))
+                }
+            }),
+        )
+    }
+
+    fn blocking_season_tmdb(
+        season_hits: Arc<AtomicUsize>,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    ) -> axum::Router {
+        use axum::routing::get;
+        use axum::Json;
+
+        axum::Router::new().route(
+            "/tv/42/season/1",
+            get(move || {
+                let hits = Arc::clone(&season_hits);
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    entered.notify_one();
+                    release.notified().await;
+                    Json(json!({
+                        "poster_path": "/season-1.jpg",
+                        "episodes": []
+                    }))
+                }
+            }),
+        )
+    }
+
     async fn seeded_enriched_show(store: &SqliteStore) -> (i64, i64, i64) {
         let lib = store
             .create_library(&NewLibrary {
@@ -1763,6 +1894,7 @@ mod tests {
                 &MetadataPatch {
                     tmdb_id: Some(42),
                     poster_path: Some("existing-show.jpg".into()),
+                    backdrop_path: Some("existing-backdrop.jpg".into()),
                     enriched: true,
                     artwork: Some(ArtworkAttempt::Stored),
                     ..Default::default()
@@ -1771,6 +1903,39 @@ mod tests {
             .await
             .expect("enrich show");
         (lib.id, show, season)
+    }
+
+    async fn seeded_episode_backlog(store: &SqliteStore, count: usize) -> Vec<i64> {
+        let (library_id, _, season) = seeded_enriched_show(store).await;
+        store
+            .apply_metadata(
+                season,
+                &MetadataPatch {
+                    poster_path: Some("existing-season.jpg".into()),
+                    artwork: Some(ArtworkAttempt::Stored),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("healthy season");
+        let mut episodes = Vec::with_capacity(count);
+        for number in 1..=count {
+            episodes.push(
+                store
+                    .insert_item(&NewItem {
+                        library_id,
+                        kind: ItemKind::Episode,
+                        parent_id: Some(season),
+                        title: format!("Episode {number}"),
+                        year: None,
+                        season_number: Some(1),
+                        episode_number: Some(number as i32),
+                    })
+                    .await
+                    .expect("episode"),
+            );
+        }
+        episodes
     }
 
     /// The bug this whole change exists for, in one test.
@@ -1900,6 +2065,18 @@ mod tests {
             .expect("get first")
             .expect("first episode");
         assert!(first_episode.poster_path.is_some(), "initial episode art");
+        let first_season = store
+            .get_item(first_episode.parent_id.expect("first season"))
+            .await
+            .expect("get first season")
+            .expect("first season");
+        let first_show = store
+            .get_item(first_season.parent_id.expect("first show"))
+            .await
+            .expect("get first show")
+            .expect("first show");
+        assert!(first_show.poster_path.is_some(), "initial show poster");
+        assert!(first_show.backdrop_path.is_some(), "initial show backdrop");
 
         // The show is now metadata-stamped. A later notification for a new
         // season must still walk through it to hydrate the newly placed rows.
@@ -1989,6 +2166,23 @@ mod tests {
         let episode2 = new(ItemKind::Episode, Some(season), "E2").await;
         let targets = jobs.enrich_targets(&[episode, episode2]).await;
         assert_eq!(targets.iter().filter(|id| **id == show).count(), 1);
+
+        // A full 16-step walk that lands on a row seen by a later start still
+        // has not proved that row's parent was visited. The later start must
+        // continue walking rather than treating output deduplication as a
+        // traversal cutoff.
+        let mut chain = vec![show];
+        for depth in 1..=16 {
+            let parent = *chain.last().expect("parent");
+            chain.push(new(ItemKind::Folder, Some(parent), &format!("F{depth}")).await);
+        }
+        let deepest = *chain.last().expect("deepest");
+        let first_ancestor = chain[1];
+        let targets = jobs.enrich_targets(&[deepest, first_ancestor]).await;
+        assert!(
+            targets.contains(&show),
+            "a later start must finish a depth-capped ancestor walk"
+        );
     }
 
     /// The sweep with nothing to sweep must not invent work — and must not
@@ -1999,6 +2193,233 @@ mod tests {
         let artwork = tempfile::tempdir().expect("artwork");
         let jobs = manager(store.clone(), artwork.path());
         assert_eq!(jobs.sweep_artwork().await.expect("sweep"), 0);
+    }
+
+    /// The daemon owns the bound, not merely the store query. An inherited
+    /// backlog larger than one batch advances by exactly that batch and leaves
+    /// the tail due for the next scheduler tick.
+    #[tokio::test]
+    async fn the_artwork_sweep_claims_exactly_one_bounded_batch() {
+        const EXTRA: usize = 7;
+        let store = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let artwork = tempfile::tempdir().expect("artwork");
+        let episodes = seeded_episode_backlog(&store, ARTWORK_RETRY_BATCH as usize + EXTRA).await;
+        let season_hits = Arc::new(AtomicUsize::new(0));
+        let base = serve(empty_season_tmdb(Arc::clone(&season_hits))).await;
+        let jobs = manager_with_tmdb(store.clone(), artwork.path(), &base);
+
+        assert_eq!(jobs.sweep_artwork().await.expect("sweep"), 0);
+        let mut stamped = 0;
+        for id in episodes {
+            if store
+                .get_item(id)
+                .await
+                .expect("get episode")
+                .expect("episode")
+                .artwork_attempted_at
+                .is_some()
+            {
+                stamped += 1;
+            }
+        }
+        assert_eq!(stamped, ARTWORK_RETRY_BATCH as usize);
+        let due = store
+            .items_missing_artwork(
+                None,
+                keys::ARTWORK_RETRY_BACKOFF_SECS,
+                ARTWORK_RETRY_BATCH + EXTRA as i64,
+            )
+            .await
+            .expect("remaining due");
+        assert_eq!(
+            due.len(),
+            EXTRA,
+            "the unclaimed tail remains immediately due"
+        );
+        assert_eq!(season_hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// A zero backoff is an adversarial but supported setting for the store
+    /// query. Never-attempted rows must still all get one turn before an old
+    /// row is reclaimed from the head of a larger-than-batch backlog.
+    #[tokio::test]
+    async fn artwork_retry_fairness_drains_fresh_rows_before_reclaiming_any() {
+        const EXTRA: usize = 7;
+        let store = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let artwork = tempfile::tempdir().expect("artwork");
+        let episodes = seeded_episode_backlog(&store, ARTWORK_RETRY_BATCH as usize + EXTRA).await;
+        let season_hits = Arc::new(AtomicUsize::new(0));
+        let base = serve(empty_season_tmdb(Arc::clone(&season_hits))).await;
+        let jobs = manager_with_tmdb(store.clone(), artwork.path(), &base);
+
+        let first = jobs
+            .sweep_artwork_with_backoff(0)
+            .await
+            .expect("first pass");
+        let second = jobs
+            .sweep_artwork_with_backoff(0)
+            .await
+            .expect("second pass");
+        assert_eq!(first.claimed_ids.len(), ARTWORK_RETRY_BATCH as usize);
+        assert_eq!(second.claimed_ids.len(), EXTRA);
+        let first_ids: HashSet<i64> = first.claimed_ids.into_iter().collect();
+        assert!(
+            second.claimed_ids.iter().all(|id| !first_ids.contains(id)),
+            "no row is reclaimed before every never-attempted row is claimed"
+        );
+        let mut all = first_ids;
+        all.extend(second.claimed_ids);
+        assert_eq!(all.len(), episodes.len());
+        assert_eq!(season_hits.load(Ordering::SeqCst), 2);
+    }
+
+    /// A missing key or a transient provider failure made no artwork attempt.
+    /// Neither may be laundered into the 24-hour "provider has no image"
+    /// backoff; the normal half-hour scheduler should get another chance.
+    #[tokio::test]
+    async fn artwork_retry_does_not_back_off_work_that_never_reached_a_provider_result() {
+        let store = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let artwork = tempfile::tempdir().expect("artwork");
+        let episode = seeded_episode_backlog(&store, 1).await[0];
+        store
+            .put_setting(keys::TMDB_API_KEY, "")
+            .await
+            .expect("remove key");
+        let jobs = manager(store.clone(), artwork.path());
+        assert_eq!(jobs.sweep_artwork().await.expect("missing-key pass"), 0);
+        assert!(
+            store
+                .get_item(episode)
+                .await
+                .expect("get")
+                .expect("episode")
+                .artwork_attempted_at
+                .is_none(),
+            "skipping for a missing key is not an artwork attempt"
+        );
+
+        store
+            .put_setting(keys::TMDB_API_KEY, "test-key")
+            .await
+            .expect("restore key");
+        use axum::http::StatusCode;
+        use axum::routing::get;
+        let base = serve(axum::Router::new().route(
+            "/tv/42/season/1",
+            get(|| async { StatusCode::SERVICE_UNAVAILABLE }),
+        ))
+        .await;
+        let jobs = manager_with_tmdb(store.clone(), artwork.path(), &base);
+        assert_eq!(jobs.sweep_artwork().await.expect("transient pass"), 0);
+        let episode = store
+            .get_item(episode)
+            .await
+            .expect("get")
+            .expect("episode");
+        assert!(episode.artwork_attempted_at.is_none());
+        assert!(episode.artwork_error.is_none());
+        assert_eq!(
+            store
+                .items_missing_artwork(None, keys::ARTWORK_RETRY_BACKOFF_SECS, 100)
+                .await
+                .expect("still due")
+                .len(),
+            1,
+            "a transient failure remains eligible for the next scheduler pass"
+        );
+    }
+
+    /// The spawned entry point itself is single-flight. A second tick while a
+    /// provider request is blocked must return without issuing another pass.
+    #[tokio::test]
+    async fn artwork_retry_pass_is_single_flight() {
+        let store = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let artwork = tempfile::tempdir().expect("artwork");
+        seeded_episode_backlog(&store, 1).await;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let base = serve(blocking_season_tmdb(
+            Arc::clone(&hits),
+            Arc::clone(&entered),
+            Arc::clone(&release),
+        ))
+        .await;
+        let jobs = manager_with_tmdb(store, artwork.path(), &base);
+
+        let first = tokio::spawn(Arc::clone(&jobs).artwork_retry_pass());
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+            .await
+            .expect("first pass reached provider");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            Arc::clone(&jobs).artwork_retry_pass(),
+        )
+        .await
+        .expect("second pass returned");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        release.notify_waiters();
+        first.await.expect("first pass task");
+        assert!(!jobs.retrying_artwork.load(Ordering::Relaxed));
+    }
+
+    /// Dispatching a slow artwork retry must not hold the scheduler loop. The
+    /// cleanup job comes after artwork in `due_jobs`, so its persisted stamp is
+    /// direct evidence that the tick continued while TMDB was still blocked.
+    #[tokio::test]
+    async fn due_jobs_continue_while_artwork_retry_is_in_flight() {
+        let store = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let artwork = tempfile::tempdir().expect("artwork");
+        let transcode_dir = tempfile::tempdir().expect("transcode");
+        seeded_episode_backlog(&store, 1).await;
+        store
+            .put_setting(keys::JOB_TRANSCODE_CLEANUP_MINS, "15")
+            .await
+            .expect("schedule cleanup");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let base = serve(blocking_season_tmdb(
+            Arc::clone(&hits),
+            Arc::clone(&entered),
+            Arc::clone(&release),
+        ))
+        .await;
+        let jobs = manager_with_tmdb(store.clone(), artwork.path(), &base);
+        let transcode = Arc::new(TranscodeManager::new(
+            store.clone(),
+            transcode_dir.path().join("work"),
+            EncoderCaps::default(),
+            Pipeline::Cpu,
+        ));
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            jobs.run_due_jobs(&transcode),
+        )
+        .await
+        .expect("scheduler returned while artwork was blocked")
+        .expect("scheduler tick");
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+            .await
+            .expect("artwork reached provider");
+        assert!(
+            store
+                .get_setting(keys::JOB_LAST_TRANSCODE_CLEANUP)
+                .await
+                .expect("cleanup stamp")
+                .is_some(),
+            "a job ordered after artwork completed in the same tick"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        release.notify_waiters();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while jobs.retrying_artwork.load(Ordering::Relaxed) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("artwork pass finished");
     }
 
     /// Production shape: the known show has a poster and an enrichment stamp,
