@@ -48,11 +48,12 @@ that Phase 4 builds on. Experiments run 2026-07-19 in the dev sandbox
 
 ### Migration path (Phase 4)
 
-The `Store` trait is unchanged. A `HiqliteStore` implements it with
-`client.execute` / `query_map_one`, reusing the existing row mappers. Because
-everything already goes through the trait (ARCHITECTURE §2.1), plurxd, the
-scanner, metadata, and the Plex façade need no changes. Single-node mode is a
-1-voter cluster — the same code path, no "cluster edition" fork.
+The `Store` trait is unchanged. M1b begins with `HiqliteAuthStore`, which
+implements only settings, users/tokens, and API keys through
+`client.execute` / `query_map`. Its deliberately narrow type cannot satisfy
+`Arc<dyn Store>`, so plurxd remains on complete SQLite while later M1 slices
+port the other traits. Once complete, single-node mode becomes a 1-voter
+cluster on the same code path, not a separate "cluster edition" fork.
 
 ### Friction found
 
@@ -75,13 +76,19 @@ ordinary workspace builds do not resolve or compile hiqlite, and `plurxd`
 still builds and runs `SqliteStore` in M0.
 
 **Dependency audit boundary:** RustSec gates the production workspace and fuzz
-lockfiles. The spike has its own lockfile because hiqlite 0.14 currently pulls
-advisory-affected `quick-xml` 0.39.4 through an unused S3 feature and
-advisory-affected `rkyv` 0.7.46 through an unused `rust_decimal` feature. CI
-still compiles, lints, and runs the spike, but that is semantic evidence, not
-security clearance. No release target may depend on the spike; M1 must upgrade
-or patch those paths before hiqlite enters the audited workspace. No RustSec
-ignore is permitted to make that promotion green.
+lockfiles. The standalone spike retains its own lockfile, but M1b now resolves
+hiqlite 0.14 in the audited root workspace. hiqlite enables cryptr's unused S3
+path, whose `s3-simple` 0.8 dependency pinned advisory-affected `quick-xml`
+0.39.4. The root workspace vendors that small package with source unchanged
+and raises only `quick-xml` to 0.41, the first version patched for
+[RUSTSEC-2026-0195](https://rustsec.org/advisories/RUSTSEC-2026-0195.html).
+No RustSec ignore was added.
+
+The earlier record incorrectly called `rkyv` 0.7.46 advisory-affected. It is
+the first patched 0.7 release for
+[RUSTSEC-2026-0001](https://rustsec.org/advisories/RUSTSEC-2026-0001.html), and
+[RUSTSEC-2026-0122](https://rustsec.org/advisories/RUSTSEC-2026-0122.html)
+explicitly marks every version below 0.8 unaffected.
 
 | Contract | Observed result |
 |---|---|
@@ -152,6 +159,26 @@ writes every received beat. Web sends every five seconds; the native clients
 already send every ten seconds. M1d owns the server-side coalescer, which must
 make the limit true for every client before the replicated store becomes the
 production path.
+
+### M1b auth-store promotion and failure proof
+
+`make cluster-check` is the first shipping hiqlite gate. Unlike the M0
+semantic test, its voters are separate operating-system processes, so killing
+one voter actually removes its raft runtime and listeners.
+
+| Contract | M1b evidence |
+|---|---|
+| Store surface | All 23 `SettingsStore`, `UserStore`, and `ApiKeyStore` methods are implemented; the lifecycle gate exercises settings, user/admin/password/token, and scoped-key mutation and deletion. |
+| Deterministic replay | Every timestamp is computed once by the caller and bound. Generated ids use `RETURNING`. A source guard rejects clock/RNG SQL and out-of-first-appearance `$N` parameters. |
+| Replica equality | Writes enter through every embedded client; SHA-256 digests of ordered local `cluster_meta`, settings, users, tokens, and API-key dumps converge across all voters. Only the digest leaves a child process. |
+| Follower and leader loss | Fresh three-voter runs kill each role separately; a survivor regains quorum readiness and reads every acknowledged proof row before accepting another write. |
+| Compatibility | A remote consistent preflight reads schema and protocol bounds before raft startup. The gate presents an older schema and proves rejection while the live leader remains a compatible voter. |
+| Quorum readiness | `HiqliteAuthStore::ping` combines hiqlite health with a bounded consistent read. After a second loss leaves one of three voters, the process remains alive but ping fails. |
+
+This is backend evidence, not a production-store switch. `plurxd` still holds
+`Arc<dyn Store>` backed entirely by SQLite until the remaining traits and
+import path land; its live `/readyz` route therefore remains SQLite-backed in
+this slice.
 
 ## Spike 2 — Deterministic-segment transcode failover
 

@@ -14,10 +14,15 @@
 
 mod sqlite;
 
+mod hiqlite;
+
 pub mod replicated;
 
 use std::path::PathBuf;
 
+pub use self::hiqlite::{
+    ClusterCompatibility, HiqliteAuthStore, AUTH_PROTOCOL_VERSION, AUTH_SCHEMA_VERSION,
+};
 pub use sqlite::SqliteStore;
 
 use async_trait::async_trait;

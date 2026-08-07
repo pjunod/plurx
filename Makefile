@@ -69,6 +69,10 @@ hiqlite-baseline: ## Measure the manual M0 one-voter cost gate on a quiet host
 	  --test hiqlite_m0 \
 	  single_voter_cost_stays_inside_the_m0_budget -- --ignored --exact --nocapture
 
+.PHONY: cluster-check
+cluster-check: ## Run the M1b three-voter auth and failure contract
+	$(CARGO) run --locked -p plurx-cluster-check -- check
+
 ## ---- functionality-point validation -----------------------------------
 
 # `make check` remains the mandatory baseline. The validator sits above it:
