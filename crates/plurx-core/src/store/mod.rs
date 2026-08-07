@@ -73,7 +73,8 @@ pub mod keys {
     /// library; only the server-wide jobs are settings.
     pub const JOB_PROBE_RETRY_MINS: &str = "jobs.probe_retry_mins";
     pub const JOB_TRANSCODE_CLEANUP_MINS: &str = "jobs.transcode_cleanup_mins";
-    /// Re-fetch artwork for enriched items that still have no poster.
+    /// Re-fetch artwork for enriched items whose poster or hero art is still
+    /// incomplete.
     ///
     /// The one job that is **on by default** ([`ARTWORK_RETRY_DEFAULT_MINS`]),
     /// against the rule above and deliberately. Every other job is optional
@@ -386,18 +387,22 @@ pub trait MediaStore: Send + Sync + 'static {
         force: bool,
         only: Option<&[i64]>,
     ) -> Result<Vec<Item>, StoreError>;
-    /// Provider-enriched items still carrying no poster, oldest attempt first
-    /// — the retry sweep's input, and the mirror of
+    /// Provider-enriched items still carrying incomplete artwork, oldest
+    /// attempt first — the retry sweep's input, and the mirror of
     /// [`files_missing_probe`](Self::files_missing_probe).
     ///
     /// `retry_after_secs` is the backoff: an item attempted more recently than
     /// that is skipped. Without it an item TMDB genuinely has no art for would
     /// be re-fetched on every single cycle, forever, which is how a
     /// self-healing job turns into a rate-limit generator.
+    /// `limit` bounds one pass so a large upgrade backlog cannot monopolize
+    /// the scheduler or provider connection for hours. A non-positive limit
+    /// requests no work; callers must opt into an explicit positive bound.
     async fn items_missing_artwork(
         &self,
         library_id: Option<i64>,
         retry_after_secs: i64,
+        limit: i64,
     ) -> Result<Vec<Item>, StoreError>;
     /// Movies and shows with no genres yet, in ascending id order, starting
     /// strictly after `after_id` — the genre backfill's input.

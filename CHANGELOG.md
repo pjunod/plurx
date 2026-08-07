@@ -1299,6 +1299,15 @@ bump may break compatibility and a **patch** bump never does.
   not forty-eight. The sweep is **on by default** — a default of zero would ship
   the bug it exists to fix — and drains the backlog an upgrade inherits with
   nobody pressing anything.
+- **Artwork self-healing stays responsive under a large or unhealthy backlog.**
+  Retry work now runs outside the scheduler loop, admits one bounded batch at a
+  time, and gives every never-attempted row a turn before reclaiming older
+  failures. A missing API key, a provider outage, or a store read error no
+  longer fabricates a "no image" result and hides the item for 24 hours; only a
+  provider path that actually reached an artwork outcome records the daily
+  backoff. TV retries preserve healthy ancestor metadata, remember a show id
+  resolved for routing, cover hero backdrops as well as posters, and refuse to
+  route an unnumbered episode through TMDB Specials.
 - **TMDB rate limits no longer eat the rest of a scan.** A 429 or a 5xx was
   treated exactly like a 404: one attempt, permanent failure, artwork silently
   lost for every item after it, run reported as a success. Both are now retried
