@@ -91,11 +91,13 @@ regenerable thumbnail cache would be waste:
 | **Node-local, regenerable** | Transcode segment cache, image cache, thumbnails/trickplay | Local disk (optionally shared) | Free to lose |
 | **Operator-owned** | The media files themselves | Shared storage | plurx never writes media |
 
-Write rates are safe for raft: watch-state progress ticks batch to ~1 write /
-10 s / stream server-side regardless of how often the client pings; session
-state updates on segment boundaries, not per-chunk. This matters because raft
-commits every write to a quorum — a naive "save position on every timeupdate"
-would put hundreds of writes/second through consensus and melt it.
+Write rates must be safe for raft. Today each five-second client heartbeat
+still performs a watch-state read and durable write; the server-side coalescer
+that reduces this to at most one commit per 10 seconds per stream lands in
+CLUSTERING-PLAN M1d. Session state updates on segment boundaries, not
+per-chunk. This matters because raft commits every write to a quorum — a naive
+"save position on every timeupdate" would put hundreds of writes/second
+through consensus and melt it.
 
 ### 2.3 The failover mechanic — any node can serve segment N
 

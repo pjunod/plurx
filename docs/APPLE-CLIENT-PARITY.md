@@ -5,28 +5,22 @@ The iOS/tvOS app should reach viewer parity without duplicating browser-only
 server administration. This document records the boundary so “parity” means a
 testable set of behaviors rather than a general impression.
 
-The implementation history, deployment evidence, and unresolved copied-Dolby-
-Vision failure are recorded in
+The implementation history, deployment evidence, and resolved copied-Dolby-
+Vision investigation are recorded in
 [APPLE-NATIVE-SUBTITLES-HANDOFF.md](APPLE-NATIVE-SUBTITLES-HANDOFF.md).
 
-> Status (2026-08-02): the native text-subtitle path is implemented and
-> covered on both Apple simulator targets. The physical Apple TV accepts the
-> native WebVTT master and selects the requested rendition; the exact
-> copied-Dolby-Vision regression file still falls back after a CoreMedia
-> `-12927` rejection, which is the one open failure
-> ([APPLE-NATIVE-SUBTITLES-PLAN.md](APPLE-NATIVE-SUBTITLES-PLAN.md) §5.4).
-> The version deployed on the fleet is the earlier server at `787eaa6`: the
-> 2026-08-02 selection, timing, and extraction fixes are committed locally
-> only and reach a node when Paul pushes and runs the ansible playbooks,
-> which pin every node to `origin/main`. The Apple fixes need a build ≥ 6.
-> The real-hardware matrix below has not been re-run since those fixes.
-> `-12927` rejection. The P2 comfort pass has landed in source — watch filters
-> for show libraries, incremental first paint, the ImageIO image pipeline,
-> centralized session expiry, and the delivered-dynamic-range badge (§5) — and
-> is awaiting its device run. The §6.4 session tradeoff is now a Settings
-> choice, defaulting to today's behavior, and rendition eligibility now follows
-> the server's `native` flag instead of a local codec guess (§2); both are in
-> source and await the same device run. Other P1 items below remain open.
+> Status (2026-08-06): source is v0.2.7, Apple build 32. Native text
+> subtitles, the cinematic detail surface, stable seek/recovery, truthful
+> delivered-range badges, and app-managed offline viewing on iPhone/iPad have
+> landed. The default-off `pgs-v1` overlay client is staged but is not a
+> release claim until the server gate and physical matrix pass. Copied Dolby
+> Vision was resolved on the physical Apple TV 2026-08-03; the historical
+> `-12927` investigation is superseded by
+> [APPLE-NATIVE-SUBTITLES-HANDOFF.md](APPLE-NATIVE-SUBTITLES-HANDOFF.md)'s
+> resolved status. Repository evidence still says build 32 has not reached
+> TestFlight and the deployment ledger still ends at server `787eaa6`, so
+> publishing plus the broader real-hardware/offline matrix remain release
+> gates.
 
 ## What parity means
 
@@ -56,7 +50,7 @@ Vision failure are recorded in
 | Transport | Play/pause, ±10, full seek | Explicit play/pause, ±10, full-film slider; HLS seeks reopen at the film position; a seek or track change issued during a stream change is queued and replayed once, last writer wins, instead of being dropped | Device-verify hammered tvOS step-seeks during a quality change, and long transcodes |
 | iOS Now Playing | Not applicable | Known duration, elapsed time, pause/play/seek commands, `isLiveStream = false` | Add artwork and series/episode metadata |
 | Audio tracks | Select and restart when needed | Select and restart at the same position | Add friendlier channel/codec labels; validate TrueHD/DTS fallback |
-| Subtitles | Text WebVTT stays client-side; bitmap tracks burn in | SRT/SubRip/WebVTT use native HLS renditions, chosen by the server's `native` flag rather than a local codec guess; PGS, VobSub, `mov_text`, and styled ASS/SSA retain burn-in; automatic selection never starts a burn except a forced track (see §2); the session-vs-restart tradeoff is a Settings choice defaulting to today's behavior | Complete the Android parity milestone and broaden physical-device coverage |
+| Subtitles | Text WebVTT stays client-side; bitmap tracks burn in | SRT/SubRip/WebVTT use native HLS renditions, chosen by the server's `native` flag rather than a local codec guess; PGS can use the staged default-off `pgs-v1` overlay while VobSub, `mov_text`, and styled ASS/SSA retain burn-in; automatic selection never starts a burn except a forced track (see §2) | Physically verify native selection and the gated PGS overlay across iPhone/iPad and Apple TV |
 | Quality | Auto adaptation, Original, explicit rungs | Server Auto plus explicit ladder rungs; a change that fails to create its session leaves the current stream playing | P1: continuous adaptation and an honest Original option when compatible |
 | Playback info | Detailed source, output, network, encoder, stalls | Source/output, dynamic range, access-log bitrate/stalls, server encode speed/ahead/delivery | Add TTFF, frame presentation rate, stall classification, and build stamp |
 | Media badges | Source badges on detail pages; source-vs-delivered dynamic range in the player | Same shape: detail pages carry resolution/codec/dynamic range source-only; the player's chip dims and names what is actually being delivered (§5) | Extend the same mechanism to audio (Atmos → AAC) and resolution (4K → rung), each with its own truth table |
@@ -65,7 +59,7 @@ Vision failure are recorded in
 | Audio sync | Persisted per-file ±ms correction | Missing | P1: expose the existing server offset endpoint and restart at position |
 | Progress/Trakt | Periodic and final progress | Every 10 seconds, exit, and natural end | Verify app interruption/background transitions |
 | PiP/AirPlay | Browser/platform dependent | Explicit iOS PiP controls on the AVPlayer surface | Add AirPlay affordances and remote-device session tests |
-| Offline/downloads | Missing | Missing | P2, only if product scope expands beyond server-connected playback |
+| Offline/downloads | Missing | App-managed HLS packages on iPhone/iPad; durable background transfer, local-only playback, progress merge, quota/activity UI; hidden on tvOS | Physical background/process-death, airplane-mode, selected-subtitle, midpoint-seek, and removal-reconciliation matrix |
 | Accessibility | Browser semantics and keyboard controls | SwiftUI labels and tvOS focus basics | P2: VoiceOver, Dynamic Type, Reduce Motion, contrast, and focus audit |
 
 ## Recommended sequence
