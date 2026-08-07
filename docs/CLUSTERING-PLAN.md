@@ -359,6 +359,12 @@ define the replicated CAS pattern once. Rule `unixepoch()` and
 **Acceptance:** the extracted suite proves all 114 methods against in-memory
 and file SQLite with no behavior change; `make check` remains the gate.
 
+The executable M1a contract is `store_contract`: each scenario receives only
+`Arc<dyn Store>`, and its inventory test fails unless every method declared on
+the 10 store traits remains represented. `store::replicated` owns the shared
+replicated-SQL policy, single-row CAS result contract, and exhaustive
+classification of the current interactive SQLite transactions.
+
 ### 6.3 M1b — settings, users, and API keys on three voters
 
 Implement the smallest security-bearing store surface first and introduce

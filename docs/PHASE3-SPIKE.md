@@ -99,7 +99,9 @@ No `CURRENT_TIMESTAMP`, `CURRENT_DATE`, or `CURRENT_TIME` keyword exists in the
 store today; M1 adds a CI ban before replicated SQL lands. The current SQLite
 backend also has 10 `unchecked_transaction()` sites. hiqlite's fixed `txn()`
 statement list cannot read, branch, or use `RETURNING`, so those ports need
-explicit transaction designs rather than mechanical translation.
+explicit transaction designs rather than mechanical translation. M1a keeps
+that classification executable in `store::replicated`; a source-site guard
+fails when a transaction is added or removed without updating the inventory.
 
 The recorded M0 cost run was taken 2026-08-07 on an Apple M3 Max MacBook Pro
 with 64 GB RAM, macOS 26.6, and the internal APFS data volume. It used the
