@@ -110,9 +110,10 @@ one.
 | ID | Fork | Current rule | Regression pin |
 |---|---|---|---|
 | `apple.transport-and-dv` | AVPlayer direct vs HLS | Execute the server mode, except normalize even a legacy direct Dolby Vision answer through preserving copy HLS. Overrides, audio changes, and subtitle needs decide whether that session copies or transcodes. | XCTest for legacy direct-DV normalization |
-| `apple.compatibility-fallback` | Apple startup decode/stall recovery | Before real playback, a preserved DV stream with an HDR10/HLG base strips to that base first; only the next failure uses the universal transcode. Each rescue is once and resumes the last truthful film position. | XCTest recovery ladder |
+| `apple.compatibility-fallback` | Apple startup decode failure recovery | Before real playback, a preserved DV stream with an HDR10/HLG base strips to that base first; only the next media rejection uses the universal transcode. Each rescue is once and resumes the last truthful film position. | XCTest recovery ladder |
 | `apple.established-hdr-recovery` | Interruption after HDR rendered | Once the item has advanced for ≥5 s, a stall or item failure reconnects the same HDR delivery once. An immediate repeat stops visibly instead of falling through to the SDR compatibility transcode. | XCTest established-delivery guard |
-| `apple.hls-buffer-window` | Growing HLS forward buffer | AVPlayer requests 60 s ahead on live copy/transcode sessions, matching the server's 60 s forward-fetch allowance inside its 120 s retention window. Direct files and completed cached HLS keep AVPlayer's default. | XCTest item-configuration guard |
+| `apple.buffering-recovery` | Sustained wait after playback began | Once the item has advanced for ≥5 s, six stagnant two-second samples during an explicit AVPlayer buffer wait reopen the same delivery. The third sample first nudges Play; an immediate repeat stops with network-specific copy. Every reopen/terminal decision reports method, film position, and observed stall duration through the bounded client log, and none of this is codec/HDR evidence. | XCTest monitor, gating, retry-state, and beacon-payload suite |
+| `apple.hls-buffer-window` | Growing HLS forward buffer | AVPlayer prefers a 60 s buffer on live copy/transcode sessions, but a physical iPad fetched about 120 s ahead; the preference is not a cap. The server therefore retains 180 s behind the download frontier: the measured 120 s lead plus 30 s of back buffer and 30 s for retry/reload. Direct files and completed cached HLS keep AVPlayer's default. | Rust retained/pruned segment-set regression + XCTest item-configuration guard |
 | `apple.quality-session` | Picked rung vs Auto/burn height | A picked rung forces a transcode at that height. An otherwise-copyable subtitle burn preserves source height; an ordinary Auto transcode leaves the encoder-aware rung to the server. | XCTest source/rung/burn height matrix |
 | `apple.subtitle-route` | Media selection vs reopen | Native rendition switches stay inside AVPlayer once the session exists. A recognized PGS overlay stays on the current item. Entering from direct, selecting/leaving a burn, or changing a burn reopens; other bitmap/styled tracks still burn. | XCTest route matrix |
 | `apple.hdr-subtitle-guard` | Burn-only subtitle on HDR | A recognized PGS overlay is allowed because it does not change video. Unknown overlay versions, VobSub, and styled tracks are refused while the current delivery is DV, HDR10, or HLG. Native text still selects, and SDR playback may still burn. | XCTest subtitle/dynamic-range matrix |
@@ -469,11 +470,20 @@ Three details, each load-bearing:
 - **The ahead-window suspend.** Once a session is more than
   `playback.hls_ahead_max_secs` (default 180 s) of content ahead of the last
   segment the client fetched, the reaper SIGSTOPs its ffmpeg, and SIGCONTs it
-  once the viewer is within half that. This is the bound `-re` used to
-  provide, minus the part where `-re` also capped the buffer. A stopped
-  process costs nothing, resumes instantly, and — unlike a rate limit —
-  adapts to a viewer who pauses. SIGKILL works on a stopped process, so the
-  idle reaper and the admin stop button need no special case.
+  30 s below that ceiling (150 s under the default). On the physical iPad,
+  AVPlayer stopped fetching with about 95 s buffered and left the producer
+  138 s ahead; the higher release point grants one more production burst there
+  instead of waiting for the old 90 s threshold. It is a larger margin, not a
+  structural escape: if the client still does not fetch, the producer can
+  cross 150 s and become held again. The client's same-delivery reopen remains
+  the terminal recovery. Byte and global disk limits still release at half
+  because those are hard capacity bounds. Session status reports
+  `resume_below_seconds`, which the web and Apple overlays show beside a held
+  session. This is the bound `-re` used to provide, minus the part where `-re`
+  also capped the buffer. A stopped process costs nothing, resumes instantly,
+  and — unlike a rate limit — adapts to a viewer who pauses. SIGKILL works on a
+  stopped process, so the idle reaper and the admin stop button need no special
+  case.
 
 **Seek and audio-switch stay on this path.** A copy-HLS session sets
 `PLAYER.method = 'remux'` (honest — no video re-encode) and `PLAYER.copyHls =
@@ -684,12 +694,19 @@ covering the other.
 ## Non-goals & known limits
 
 - **HLS session disk.** A live HLS writer's history grows for its whole life,
-  so the reaper keeps 120 s behind the download frontier — on both the
-  transcode and copy paths — while web and Apple players limit their forward
-  fetch to 60 s. The other 60 s covers back-buffering and a retry. Ahead of
-  that frontier, the suspend window bounds the other end, so a session's
-  directory holds roughly `hls_ahead_max_secs + 120 s` of content whatever
-  the encoder's speed. Once the reaper removes an older prefix, the client
+  so the reaper keeps 180 s behind the download frontier on both the transcode
+  and copy paths. That covers the 120 s fetch lead measured on a physical iPad
+  — even though AVPlayer was given a 60 s preference — plus 30 s of back
+  buffer and 30 s for a retry or playlist reload. Ahead of that frontier, the
+  suspend window bounds the other end, so a session's directory holds roughly
+  `hls_ahead_max_secs + 180 s` of content whatever the encoder's speed. At
+  the default 180 s ahead limit this is about 360 s, up from the previous
+  300 s span (+20%). The 8 GiB global scratch cap is unchanged, continues to
+  release at half, and can therefore bind roughly one 4K session sooner; it
+  may keep a producer held until client frontiers advance. Session status
+  exposes `resume_below_seconds`, and the web and Apple overlays show it while
+  a session is held so that state is distinguishable from an encoder stall.
+  Once the reaper removes an older prefix, the client
   playlist advances `MEDIA-SEQUENCE` and stops advertising those files. The
   internal index retains duration-only history for native subtitle timing;
   seeking outside the retained window still opens a fresh session at that

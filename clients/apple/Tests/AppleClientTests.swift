@@ -612,36 +612,143 @@ final class AppleClientTests: XCTestCase {
 
     @MainActor
     func testBufferingWaitHasAnIndependentBoundedRecoveryTimer() {
-        var silent = PlaybackStallDetector()
-        var buffering = PlaybackStallDetector()
-        let status = AVPlayer.TimeControlStatus.waitingToPlayAtSpecifiedRate
+        var monitor = PlaybackRecoveryMonitor()
+        let beganAt: TimeInterval = 1_000
 
         for check in 0...6 {
-            let silentAction = silent.sample(
+            let event = monitor.sample(
                 positionMs: 30_000,
-                shouldMonitor: PlayerController.shouldMonitorSilentPlaybackStall(
-                    timeControlStatus: status
-                )
+                timeControlStatus: .waitingToPlayAtSpecifiedRate,
+                shouldMonitor: true,
+                establishedPlayback: true,
+                observedAt: beganAt + Double(check * 2)
             )
-            let bufferingAction = buffering.sample(
-                positionMs: 30_000,
-                shouldMonitor: PlayerController.shouldMonitorBufferingStall(
-                    timeControlStatus: status
-                )
-            )
-
-            XCTAssertEqual(silentAction, .none, "buffering must never become decoder evidence")
             if check == 3 {
-                XCTAssertEqual(bufferingAction, .nudge)
+                XCTAssertEqual(
+                    event,
+                    PlaybackStallEvent(
+                        kind: .buffering,
+                        action: .nudge,
+                        positionMs: 30_000,
+                        durationMs: 6_000
+                    )
+                )
             } else if check == 6 {
-                XCTAssertEqual(bufferingAction, .reopen)
+                XCTAssertEqual(
+                    event,
+                    PlaybackStallEvent(
+                        kind: .buffering,
+                        action: .reopen,
+                        positionMs: 30_000,
+                        durationMs: 12_000
+                    )
+                )
             } else {
-                XCTAssertEqual(bufferingAction, .none)
+                XCTAssertNil(event)
             }
         }
 
-        XCTAssertNil(silent.lastPositionMs)
-        XCTAssertEqual(buffering.lastPositionMs, 30_000)
+        XCTAssertNil(monitor.silentDetector.lastPositionMs)
+        XCTAssertEqual(monitor.bufferingDetector.lastPositionMs, 30_000)
+    }
+
+    @MainActor
+    func testBufferingRecoveryCannotStartBeforeTheFirstFiveSecondsPlay() {
+        var monitor = PlaybackRecoveryMonitor()
+        let beganAt: TimeInterval = 2_000
+
+        for check in 0...10 {
+            XCTAssertNil(monitor.sample(
+                positionMs: 0,
+                timeControlStatus: .waitingToPlayAtSpecifiedRate,
+                shouldMonitor: true,
+                establishedPlayback: false,
+                observedAt: beganAt + Double(check * 2)
+            ))
+        }
+        XCTAssertNil(monitor.bufferingDetector.lastPositionMs)
+
+        for check in 0...6 {
+            let event = monitor.sample(
+                positionMs: 30_000,
+                timeControlStatus: .waitingToPlayAtSpecifiedRate,
+                shouldMonitor: true,
+                establishedPlayback: true,
+                observedAt: beganAt + Double(30 + check * 2)
+            )
+            if check == 6 {
+                XCTAssertEqual(event?.kind, .buffering)
+                XCTAssertEqual(event?.action, .reopen)
+            }
+        }
+    }
+
+    @MainActor
+    func testPlaybackRecoveryPredicatesStayExclusiveAndBufferingWinsAMerge() {
+        for status in [
+            AVPlayer.TimeControlStatus.paused,
+            .waitingToPlayAtSpecifiedRate,
+            .playing,
+        ] {
+            XCTAssertNotEqual(
+                PlayerController.shouldMonitorSilentPlaybackStall(timeControlStatus: status),
+                PlayerController.shouldMonitorBufferingStall(timeControlStatus: status)
+            )
+        }
+
+        XCTAssertEqual(
+            PlaybackRecoveryMonitor.select(
+                silentAction: .reopen,
+                bufferingAction: .nudge
+            ),
+            PlaybackStallSelection(kind: .buffering, action: .nudge)
+        )
+    }
+
+    func testRepeatedBufferingRecoveryStopsWithNetworkSpecificState() {
+        var recovery = SameDeliveryStallRecoveryState()
+
+        XCTAssertEqual(recovery.next(for: .buffering), .reopen)
+        let repeated = recovery.next(for: .buffering)
+        XCTAssertEqual(repeated, .stop(PlaybackStallKind.buffering.terminalState))
+
+        let terminal = PlaybackStallKind.buffering.terminalState
+        XCTAssertFalse(terminal.isPlaying)
+        XCTAssertFalse(terminal.wantsPlayback)
+        XCTAssertTrue(terminal.failed)
+        XCTAssertEqual(
+            terminal.message,
+            "Playback could not resume after repeated buffering. Check the connection and try again."
+        )
+        XCTAssertNotEqual(terminal.message, PlaybackStallKind.silent.terminalState.message)
+    }
+
+    func testAppleBufferingStallLogCarriesPositionMethodAndDuration() throws {
+        let payload = ApplePlaybackStallLog(
+            kind: .buffering,
+            outcome: .reopen,
+            positionMs: 90_000,
+            durationMs: 12_000,
+            method: "remux",
+            title: "Fortune Feimster",
+            fileId: 42,
+            vcodec: "h264",
+            encoder: "copy"
+        )
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(payload))
+                as? [String: Any]
+        )
+
+        XCTAssertEqual(object["event"] as? String, "stall")
+        XCTAssertEqual(object["method"] as? String, "remux")
+        XCTAssertEqual(object["ms"] as? Int, 12_000)
+        XCTAssertEqual(object["file_id"] as? Int, 42)
+        XCTAssertEqual(object["encoder"] as? String, "copy")
+        XCTAssertEqual(
+            object["detail"] as? String,
+            "kind=buffering · position_ms=90000 · outcome=reopen"
+        )
     }
 
     @MainActor

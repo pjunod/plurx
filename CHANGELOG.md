@@ -427,6 +427,38 @@ bump may break compatibility and a **patch** bump never does.
 
 ### Fixed
 
+- **iPad remux playback gets a larger server-side recovery margin.**
+  Physical-device telemetry reproduced the same sequence every six
+  minutes: the server suspended ffmpeg at 186 seconds ahead; AVPlayer stopped
+  fetching with about 95 seconds buffered; and the producer remained 138
+  seconds ahead of the last download. Its old release point was half the
+  180-second window — 90 seconds — so it could not grant more media at the
+  observed no-fetch waterline. The result was a 12-second buffering wait and a
+  same-delivery reopen. Time-based suspension now releases 30 seconds below its
+  ceiling (150 seconds by default), which grants one additional production
+  burst at 138 seconds while retaining real hysteresis. This is not a
+  structural deadlock escape: without another client fetch the producer can
+  reach 186 seconds and become held again, leaving the existing same-delivery
+  reopen as the terminal recovery. Byte and global disk limits still release
+  at half. The status API and web/Apple overlays now show the time release
+  threshold beside held sessions. The same run also showed AVPlayer fetching
+  about 120 seconds ahead despite a 60-second preference, so live retention is
+  now 180 seconds: that measured lead plus 30 seconds of back buffer and 30
+  seconds for retry/reload. This grows the default per-session media span from
+  about 300 to 360 seconds, so the 8 GiB global scratch cap may bind roughly one
+  4K stream sooner. Regression tests pin the release/recurrence thresholds and
+  the retained/pruned segment boundary.
+
+- **An Apple client that remains stuck buffering now recovers visibly and
+  leaves evidence.** After a title has rendered for five seconds, a sustained
+  AVPlayer buffer wait gets one reconnect of the exact same delivery; an
+  immediate repeat stops with connection-specific copy instead of mentioning
+  a format switch that never happened. Cold-start waits remain outside the
+  watchdog so a server filling its first HLS publish window cannot trigger a
+  duplicate session. Each recovery reports its delivery method, film
+  position, and measured stall duration through the bounded client log, while
+  buffering remains ineligible for the HDR/codec fallback ladder.
+
 - **A cache budget sweep can no longer delete a film while somebody is
   watching it.** Finished pre-transcodes now carry process-local read
   ownership from the cache lookup through the HLS session's lifetime. LRU,
