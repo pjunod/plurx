@@ -308,10 +308,58 @@ struct PlayerOverlayVisibility: Equatable {
     let playbackInfo: Bool
 }
 
+enum PlayerNaturalEndAction: Equatable {
+    case dismiss
+    case findNext
+}
+
+/// Makes every exit from the full-screen player follow the same order:
+/// publish the restoring UI state, release playback resources exactly once,
+/// then leave the cover on the next main-loop turn. That turn is important on
+/// iPadOS — it gives the hosting controller a chance to restore status-bar,
+/// Home-indicator, and persistent-overlay preferences before it disappears.
+@MainActor
+final class PlayerLifecycleCoordinator: ObservableObject {
+    @Published private(set) var isTearingDown = false
+
+    private var didTeardown = false
+    private var didFinish = false
+    private var finishTask: Task<Void, Never>?
+
+    func teardown(_ cleanup: () -> Void) {
+        guard !didTeardown else { return }
+        didTeardown = true
+        cleanup()
+    }
+
+    func finish(
+        teardown cleanup: () -> Void,
+        completion: @escaping @MainActor () -> Void
+    ) {
+        guard !didFinish else { return }
+        didFinish = true
+        isTearingDown = true
+        teardown(cleanup)
+        finishTask = Task { @MainActor [weak self] in
+            await withCheckedContinuation {
+                (continuation: CheckedContinuation<Void, Never>) in
+                DispatchQueue.main.async { continuation.resume() }
+            }
+            guard self != nil, !Task.isCancelled else { return }
+            completion()
+        }
+    }
+}
+
 #if os(iOS)
 struct PlayerSystemOverlayPreferences {
     let statusBarHidden: Bool
     let persistentOverlays: Visibility
+
+    static let restoredAfterPlayback = Self(
+        statusBarHidden: false,
+        persistentOverlays: .automatic
+    )
 
     static func resolve(
         controlsVisible: Bool,
@@ -497,8 +545,10 @@ struct PlayerView: View {
 
     @StateObject private var controller = PlayerController()
     @StateObject private var pictureInPicture = PictureInPictureController()
+    @StateObject private var lifecycle = PlayerLifecycleCoordinator()
     @State private var showStats = false
     @State private var findingNext = false
+    @State private var nextEpisodeTask: Task<Void, Never>?
     @State private var isScrubbing = false
     @State private var scrubMs = 0.0
     @State private var controlsVisible = true
@@ -521,91 +571,93 @@ struct PlayerView: View {
             )
                 .ignoresSafeArea()
 
-            #if os(tvOS)
-            if !controlsVisible {
+            if !lifecycle.isTearingDown {
+                #if os(tvOS)
+                if !controlsVisible {
+                    Color.clear
+                        .contentShape(Rectangle())
+                        .ignoresSafeArea()
+                        .focusable()
+                        .focusEffectDisabled()
+                        .focused($focusedControl, equals: .reveal)
+                        .onTapGesture { revealControlsFromRemote() }
+                        .onMoveCommand { direction in seekFromRemote(direction) }
+                        .onPlayPauseCommand {
+                            controller.togglePlayPause()
+                            revealControlsFromRemote()
+                        }
+                        .accessibilityLabel("Show playback controls")
+                }
+                #endif
+
+                #if os(iOS)
                 Color.clear
                     .contentShape(Rectangle())
                     .ignoresSafeArea()
-                    .focusable()
-                    .focusEffectDisabled()
-                    .focused($focusedControl, equals: .reveal)
-                    .onTapGesture { revealControlsFromRemote() }
-                    .onMoveCommand { direction in seekFromRemote(direction) }
-                    .onPlayPauseCommand {
-                        controller.togglePlayPause()
-                        revealControlsFromRemote()
-                    }
-                    .accessibilityLabel("Show playback controls")
-            }
-            #endif
+                    .onTapGesture { toggleControls() }
+                    .accessibilityLabel("Show or hide playback controls")
+                #endif
 
-            #if os(iOS)
-            Color.clear
-                .contentShape(Rectangle())
-                .ignoresSafeArea()
-                .onTapGesture { toggleControls() }
-                .accessibilityLabel("Show or hide playback controls")
-            #endif
-
-            if controller.failed {
-                failureView
-            } else {
-                if overlayVisibility.controls {
-                    VStack(spacing: 0) {
-                        HStack(alignment: .top) {
-                            #if os(iOS)
-                            closeButton
-                            #endif
+                if controller.failed {
+                    failureView
+                } else {
+                    if overlayVisibility.controls {
+                        VStack(spacing: 0) {
+                            HStack(alignment: .top) {
+                                #if os(iOS)
+                                closeButton
+                                #endif
+                                Spacer()
+                            }
                             Spacer()
+                            playbackControls
                         }
-                        Spacer()
-                        playbackControls
+                        .padding(20)
+                        .transition(.opacity)
                     }
-                    .padding(20)
-                    .transition(.opacity)
+
+                    if overlayVisibility.playbackInfo {
+                        PlaybackStatsView(
+                            controller: controller,
+                            onDismiss: dismissPlaybackInfo
+                        )
+                        .frame(maxWidth: .infinity, alignment: .trailing)
+                        .padding(20)
+                        .transition(.opacity.combined(with: .move(edge: .trailing)))
+                    }
                 }
 
-                if overlayVisibility.playbackInfo {
-                    PlaybackStatsView(
-                        controller: controller,
-                        onDismiss: dismissPlaybackInfo
-                    )
-                    .frame(maxWidth: .infinity, alignment: .trailing)
-                    .padding(20)
-                    .transition(.opacity.combined(with: .move(edge: .trailing)))
+                if controller.isChangingStream {
+                    streamChangeProgress
+                        .tint(.white)
+                        .padding(18)
+                        .background(.ultraThinMaterial, in: Circle())
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
-            }
 
-            if controller.isChangingStream {
-                streamChangeProgress
-                    .tint(.white)
+                if findingNext {
+                    VStack(spacing: 10) {
+                        ProgressView().tint(.white)
+                        Text("Up next…")
+                            .font(.system(.callout, design: .monospaced))
+                            .foregroundColor(.white)
+                    }
                     .padding(18)
-                    .background(.ultraThinMaterial, in: Circle())
+                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
-
-            if findingNext {
-                VStack(spacing: 10) {
-                    ProgressView().tint(.white)
-                    Text("Up next…")
-                        .font(.system(.callout, design: .monospaced))
-                        .foregroundColor(.white)
                 }
-                .padding(18)
-                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
 
-            if let error = playbackBannerMessage,
-               !controller.failed {
-                Text(error)
-                    .font(.system(.caption, design: .monospaced))
-                    .foregroundColor(.white)
-                    .padding(10)
-                    .background(Palette.accent.opacity(0.9), in: RoundedRectangle(cornerRadius: 8))
-                    .frame(maxWidth: .infinity, alignment: .top)
-                    .padding(.top, 20)
-                    .padding(.horizontal, 80)
+                if let error = playbackBannerMessage,
+                   !controller.failed {
+                    Text(error)
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundColor(.white)
+                        .padding(10)
+                        .background(Palette.accent.opacity(0.9), in: RoundedRectangle(cornerRadius: 8))
+                        .frame(maxWidth: .infinity, alignment: .top)
+                        .padding(.top, 20)
+                        .padding(.horizontal, 80)
+                }
             }
         }
         .task {
@@ -638,10 +690,7 @@ struct PlayerView: View {
             #endif
         }
         .onDisappear {
-            let stoppedAt = controller.realPositionMs()
-            pictureInPicture.stop()
-            controller.stop()
-            onPlaybackStopped?(stoppedAt)
+            lifecycle.teardown(teardownPlayback)
         }
         .task(id: autoHideGeneration) {
             guard Self.shouldAutoHideControls(
@@ -666,14 +715,26 @@ struct PlayerView: View {
         .onChange(of: isScrubbing) { _, _ in restartAutoHideTimer() }
         .onChange(of: optionMenuOpen) { _, _ in restartAutoHideTimer() }
         .onChange(of: controller.finished) { _, finished in
-            guard finished, model.autoplay, offlineItem == nil else { return }
-            findingNext = true
-            Task {
-                if let next = await model.nextEpisode(after: itemId) {
-                    controller.stop()
-                    onPlayNext?(next)
-                } else {
+            guard let action = Self.naturalEndAction(
+                finished: finished,
+                autoplay: model.autoplay,
+                offline: offlineItem != nil
+            ) else { return }
+            switch action {
+            case .dismiss:
+                finishPlayback()
+            case .findNext:
+                findingNext = true
+                nextEpisodeTask?.cancel()
+                nextEpisodeTask = Task {
+                    let next = await model.nextEpisode(after: itemId)
+                    guard !Task.isCancelled, !lifecycle.isTearingDown else { return }
                     findingNext = false
+                    guard let next, let onPlayNext else {
+                        finishPlayback()
+                        return
+                    }
+                    finishPlayback { onPlayNext(next) }
                 }
             }
         }
@@ -687,7 +748,7 @@ struct PlayerView: View {
             } else if controlsVisible {
                 hideControls()
             } else {
-                dismiss()
+                finishPlayback()
             }
         }
         #endif
@@ -706,7 +767,10 @@ struct PlayerView: View {
 
     #if os(iOS)
     private var playerSystemOverlayPreferences: PlayerSystemOverlayPreferences {
-        PlayerSystemOverlayPreferences.resolve(
+        if lifecycle.isTearingDown {
+            return .restoredAfterPlayback
+        }
+        return PlayerSystemOverlayPreferences.resolve(
             controlsVisible: controlsVisible,
             // These surfaces outlive the transport's four-second timeout. Keep
             // system chrome stable while the viewer reads them, then retire it
@@ -744,6 +808,44 @@ struct PlayerView: View {
         optionMenuOpen: Bool
     ) -> Bool {
         visible && !scrubbing && !changingStream && !optionMenuOpen
+    }
+
+    static func naturalEndAction(
+        finished: Bool,
+        autoplay: Bool,
+        offline: Bool
+    ) -> PlayerNaturalEndAction? {
+        guard finished else { return nil }
+        return autoplay && !offline ? .findNext : .dismiss
+    }
+
+    /// The one teardown path for natural completion, manual Close/Menu, and
+    /// fatal-screen exits. UI state goes first so iPadOS restores system chrome
+    /// while the cover still exists; AVKit and transport resources go next.
+    private func finishPlayback(then completion: (@MainActor () -> Void)? = nil) {
+        lifecycle.finish(teardown: teardownPlayback) {
+            if let completion {
+                completion()
+            } else {
+                dismiss()
+            }
+        }
+    }
+
+    private func teardownPlayback() {
+        let stoppedAt = controller.realPositionMs()
+        nextEpisodeTask?.cancel()
+        nextEpisodeTask = nil
+        autoHideGeneration &+= 1
+        showStats = false
+        findingNext = false
+        isScrubbing = false
+        #if os(iOS)
+        activeOptionMenu = nil
+        #endif
+        pictureInPicture.detach()
+        controller.stop()
+        onPlaybackStopped?(stoppedAt)
     }
 
     /// A presented touch menu is hosted outside the control hierarchy. Removing
@@ -847,7 +949,7 @@ struct PlayerView: View {
                     .foregroundColor(Palette.muted)
                     .multilineTextAlignment(.center)
             }
-            Button("Close") { dismiss() }
+            Button("Close") { finishPlayback() }
                 .buttonStyle(.borderedProminent)
                 .tint(Palette.accent)
                 #if os(tvOS)
@@ -861,7 +963,7 @@ struct PlayerView: View {
 
     #if os(iOS)
     private var closeButton: some View {
-        Button { dismiss() } label: {
+        Button { finishPlayback() } label: {
             Image(systemName: "xmark.circle.fill")
                 .font(.largeTitle)
                 .foregroundStyle(.white.opacity(0.9))

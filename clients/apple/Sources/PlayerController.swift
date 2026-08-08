@@ -733,6 +733,7 @@ final class PlayerController: ObservableObject {
     }
 
     private func loadOffline(url: URL, startMs: Int) async {
+        guard started else { return }
         let asset = AVURLAsset(url: url)
         guard asset.assetCache?.isPlayableOffline == true else {
             fail(APIError.transport("Download incomplete"))
@@ -748,10 +749,16 @@ final class PlayerController: ObservableObject {
         player.play()
         if startMs > 0 {
             do { try await seekWhenReady(item, ms: startMs) }
-            catch { fail(error); return }
+            catch {
+                guard started, player.currentItem === item else { return }
+                fail(error)
+                return
+            }
         }
+        guard started, player.currentItem === item else { return }
         await applyPreferredAudioSelection(to: item)
         await applyNativeSubtitleSelection(selectedSubtitle, to: item)
+        guard started, player.currentItem === item else { return }
         player.play()
         isPlaying = true
         failed = false
@@ -922,8 +929,12 @@ final class PlayerController: ObservableObject {
     /// Report the final position and hand any encoder back immediately.
     func stop() {
         clearPlaybackNotice()
-        guard started else { return }
+        let wasStarted = started
         started = false
+        // Invalidate every in-flight open before any of its awaits can attach
+        // a replacement item after this teardown.
+        openGeneration &+= 1
+        reopenQueue.clear()
         if let timeObserver {
             player.removeTimeObserver(timeObserver)
             self.timeObserver = nil
@@ -938,12 +949,17 @@ final class PlayerController: ObservableObject {
         recoveryTask?.cancel()
         recoveryTask = nil
         clearPGSOverlaySelection()
+        pgsOverlayItemGeneration &+= 1
         playbackRecoveryMonitor.reset()
         seekState.clear()
         let position = realPositionMs()
         player.pause()
+        player.replaceCurrentItem(with: nil)
         isPlaying = false
-        report(position)
+        wantsPlayback = false
+        isChangingStream = false
+        sessionStatus = nil
+        if wasStarted { report(position) }
         if let sessionId {
             self.sessionId = nil
             let model = model
@@ -953,6 +969,12 @@ final class PlayerController: ObservableObject {
         removeRemoteCommands()
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
         MPNowPlayingInfoCenter.default().playbackState = .stopped
+        if wasStarted {
+            try? AVAudioSession.sharedInstance().setActive(
+                false,
+                options: .notifyOthersOnDeactivation
+            )
+        }
         #endif
     }
 
@@ -969,6 +991,7 @@ final class PlayerController: ObservableObject {
         guard let model else { return }
         do {
             let decision = try await model.decision(fileId: fileId)
+            guard started else { return }
             self.decision = decision
             if knownDurationMs <= 0 { knownDurationMs = decision.source?.durationMs ?? 0 }
             // `default` on a decision track is the server's own shared-policy
@@ -1000,6 +1023,7 @@ final class PlayerController: ObservableObject {
             let initialPosition = seekState.pendingMs ?? startMs
             try await openAndDrain(decision: decision, at: initialPosition)
         } catch {
+            guard started else { return }
             reopenQueue.clear()
             seekState.clear()
             fail(error)

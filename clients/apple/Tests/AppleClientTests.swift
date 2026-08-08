@@ -2541,6 +2541,73 @@ final class AppleClientTests: XCTestCase {
         XCTAssertTrue(visible.playbackInfo)
     }
 
+    func testNaturalPlaybackEndDismissesUnlessOnlineAutoplayCanLookForNext() {
+        XCTAssertNil(PlayerView.naturalEndAction(
+            finished: false,
+            autoplay: false,
+            offline: false
+        ))
+        XCTAssertEqual(PlayerView.naturalEndAction(
+            finished: true,
+            autoplay: false,
+            offline: false
+        ), .dismiss)
+        XCTAssertEqual(PlayerView.naturalEndAction(
+            finished: true,
+            autoplay: true,
+            offline: true
+        ), .dismiss)
+        XCTAssertEqual(PlayerView.naturalEndAction(
+            finished: true,
+            autoplay: true,
+            offline: false
+        ), .findNext)
+    }
+
+    @MainActor
+    func testPlayerFinishTearsDownBeforeDismissAndIsIdempotent() async {
+        let lifecycle = PlayerLifecycleCoordinator()
+        var events: [String] = []
+        let dismissed = expectation(description: "dismissed after teardown")
+
+        lifecycle.finish(
+            teardown: { events.append("teardown") },
+            completion: {
+                events.append("dismiss")
+                dismissed.fulfill()
+            }
+        )
+
+        XCTAssertTrue(lifecycle.isTearingDown)
+        XCTAssertEqual(events, ["teardown"])
+        await fulfillment(of: [dismissed], timeout: 1)
+        XCTAssertEqual(events, ["teardown", "dismiss"])
+
+        lifecycle.finish(
+            teardown: { events.append("duplicate teardown") },
+            completion: { events.append("duplicate dismiss") }
+        )
+        lifecycle.teardown { events.append("disappear teardown") }
+        XCTAssertEqual(events, ["teardown", "dismiss"])
+    }
+
+    @MainActor
+    func testPlayerStopReleasesTheCurrentItemEvenWhenRepeated() {
+        let controller = PlayerController()
+        let item = AVPlayerItem(url: URL(fileURLWithPath: "/dev/null"))
+        controller.player.replaceCurrentItem(with: item)
+        controller.showPlaybackNotice("Closing")
+
+        controller.stop()
+
+        XCTAssertNil(controller.player.currentItem)
+        XCTAssertNil(controller.playbackNotice)
+        XCTAssertFalse(controller.isPlaying)
+
+        controller.stop()
+        XCTAssertNil(controller.player.currentItem)
+    }
+
     #if os(iOS)
     func testIOSSystemChromeWaitsForControlsAndPersistentContentToLeave() {
         for (controlsVisible, persistentContentVisible) in [
@@ -2562,6 +2629,14 @@ final class AppleClientTests: XCTestCase {
         )
         XCTAssertTrue(idle.statusBarHidden)
         XCTAssertEqual(idle.persistentOverlays, .hidden)
+
+        XCTAssertFalse(
+            PlayerSystemOverlayPreferences.restoredAfterPlayback.statusBarHidden
+        )
+        XCTAssertEqual(
+            PlayerSystemOverlayPreferences.restoredAfterPlayback.persistentOverlays,
+            .automatic
+        )
     }
 
     @MainActor

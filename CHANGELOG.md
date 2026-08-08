@@ -427,6 +427,18 @@ bump may break compatibility and a **patch** bump never does.
 
 ### Fixed
 
+- **Playback now leaves the full-screen Apple player at a title's natural
+  end.** The AVPlayer end notification previously updated progress but only
+  reached the view when autoplay was enabled, and no-next/autoplay-off titles
+  left their cover open forever. Natural completion, manual Close/Menu, and
+  failure-screen Close now share one idempotent exit sequence: restore iPadOS
+  status-bar/Home-indicator preferences, clear player overlays and pending
+  timers, detach Picture in Picture and subtitle layers, remove observers and
+  remote commands, release the AVPlayer item/audio session/HLS session, then
+  dismiss on the following main-loop turn. Online episodic autoplay still
+  swaps to a discovered next episode; offline playback and a missing successor
+  dismiss normally.
+
 - **The full-screen iOS player now retires system chrome after its own
   overlays leave.** Noirr draws video with a custom `AVPlayerLayer`, so hiding
   the SwiftUI transport never asked iOS to hide the separate status bar or
