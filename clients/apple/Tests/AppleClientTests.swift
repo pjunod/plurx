@@ -2541,6 +2541,54 @@ final class AppleClientTests: XCTestCase {
         XCTAssertTrue(visible.playbackInfo)
     }
 
+    #if os(iOS)
+    func testIOSSystemChromeWaitsForControlsAndPersistentContentToLeave() {
+        for (controlsVisible, persistentContentVisible) in [
+            (true, false),
+            (false, true),
+            (true, true),
+        ] {
+            let active = PlayerSystemOverlayPreferences.resolve(
+                controlsVisible: controlsVisible,
+                persistentContentVisible: persistentContentVisible
+            )
+            XCTAssertFalse(active.statusBarHidden)
+            XCTAssertEqual(active.persistentOverlays, .automatic)
+        }
+
+        let idle = PlayerSystemOverlayPreferences.resolve(
+            controlsVisible: false,
+            persistentContentVisible: false
+        )
+        XCTAssertTrue(idle.statusBarHidden)
+        XCTAssertEqual(idle.persistentOverlays, .hidden)
+    }
+
+    @MainActor
+    func testIOSPlayerSystemOverlayModifierReachesHostingController() {
+        let preferences = PlayerSystemOverlayPreferences.resolve(
+            controlsVisible: false,
+            persistentContentVisible: false
+        )
+        let controller = UIHostingController(rootView:
+            Color.clear.modifier(
+                PlayerSystemOverlayModifier(preferences: preferences)
+            )
+        )
+        controller.view.frame = CGRect(x: 0, y: 0, width: 1_024, height: 768)
+        let window = UIWindow(frame: controller.view.frame)
+        window.rootViewController = controller
+        window.makeKeyAndVisible()
+        controller.view.setNeedsLayout()
+        controller.view.layoutIfNeeded()
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.2))
+
+        XCTAssertTrue(controller.prefersStatusBarHidden)
+        XCTAssertTrue(controller.prefersHomeIndicatorAutoHidden)
+        window.isHidden = true
+    }
+    #endif
+
     func testNowPlayingSummaryUsesLoadedOverviewAndHasAFallback() {
         XCTAssertEqual(
             PlayerView.nowPlayingSummary("  A family crosses the stars.\n"),
