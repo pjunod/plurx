@@ -600,11 +600,15 @@ struct AheadLimits {
 /// their release thresholds. Byte budgets release at half because they are
 /// hard disk bounds. Media time releases 30 seconds below its ceiling (never
 /// below half): a physical iPad stopped fetching with about 95 seconds still
-/// buffered, leaving the held producer 138 seconds ahead. The old 90-second
-/// release point could then never be reached because only another segment
-/// fetch moves that frontier. Thirty seconds still prevents boundary chatter,
-/// while resuming early is the safe direction — the cost is some disk, and the
-/// cost of the other error is a viewer who runs dry.
+/// buffered, leaving the held producer 138 seconds ahead. Releasing there
+/// grants one more production burst instead of waiting for the client to fetch
+/// down to the old 90-second threshold. If the client still does not fetch,
+/// the producer can cross 150 seconds and become held again; the client's
+/// same-delivery reopen remains the terminal recovery path.
+fn time_release_threshold(limit: i64) -> Option<i64> {
+    (limit > 0).then(|| limit.saturating_sub(30).max(limit / 2))
+}
+
 fn should_suspend(
     ahead: Ahead,
     global_bytes: i64,
@@ -612,9 +616,8 @@ fn should_suspend(
     currently_suspended: bool,
 ) -> bool {
     let half = |limit: i64| limit / 2;
-    let time_release = |limit: i64| limit.saturating_sub(30).max(half(limit));
     let time_limit = if currently_suspended {
-        time_release(limits.max_secs)
+        time_release_threshold(limits.max_secs).unwrap_or(limits.max_secs)
     } else {
         limits.max_secs
     };
@@ -1253,7 +1256,7 @@ impl Session {
 }
 
 /// One live session as the activity page and the stats overlay see it.
-async fn session_info(id: &str, s: &Session) -> SessionInfo {
+async fn session_info(id: &str, s: &Session, resume_below_seconds: Option<i64>) -> SessionInfo {
     let ahead = s.ahead().await;
     SessionInfo {
         id: id.to_owned(),
@@ -1269,6 +1272,7 @@ async fn session_info(id: &str, s: &Session) -> SessionInfo {
         recent_speed: s.progress.recent_speed(),
         out_time_ms: s.progress.out_time_ms(),
         ahead_seconds: ahead.map(|a| a.seconds),
+        resume_below_seconds,
         ahead_bytes: ahead.map(|a| a.bytes),
         delivered_bytes: s.delivery.total_bytes(),
         delivered_bps: s.delivery.recent_bps().map(|b| b * 8),
@@ -1567,6 +1571,9 @@ pub struct SessionInfo {
     /// hiccup gets to spend. Not measured from the playhead: the client has
     /// usually fetched further than it is showing.
     pub ahead_seconds: Option<i64>,
+    /// A held session remains held while `ahead_seconds` is above this value.
+    /// `None` means the time window is disabled; byte limits may still hold it.
+    pub resume_below_seconds: Option<i64>,
     /// The same reserve in bytes, which is what actually bounds the disk.
     pub ahead_bytes: Option<i64>,
     /// Segment bytes handed to this client since the session opened.
@@ -4279,10 +4286,11 @@ impl TranscodeManager {
     /// would relabel a stream mid-play. The method is fixed when the session
     /// is created and never moves.
     pub async fn list_deliveries(&self) -> Vec<(SessionInfo, crate::delivery::Method)> {
+        let resume_below_seconds = time_release_threshold(self.ahead_limits().await.max_secs);
         let sessions = self.sessions.lock().await;
         let mut out = Vec::with_capacity(sessions.len());
         for (id, s) in sessions.iter() {
-            out.push((session_info(id, s).await, s.method));
+            out.push((session_info(id, s, resume_below_seconds).await, s.method));
         }
         out.sort_by_key(|(s, _)| s.started_unix);
         out
@@ -4294,7 +4302,8 @@ impl TranscodeManager {
     /// alive past the idle reaper.
     pub async fn session_status(&self, session_id: &str) -> Option<SessionInfo> {
         let session = self.sessions.lock().await.get(session_id).cloned()?;
-        Some(session_info(session_id, &session).await)
+        let resume_below_seconds = time_release_threshold(self.ahead_limits().await.max_secs);
+        Some(session_info(session_id, &session, resume_below_seconds).await)
     }
 
     /// End one session now. True if it existed.
@@ -4502,11 +4511,12 @@ impl TranscodeManager {
     ///
     /// Hysteresis is deliberate: media time resumes 30 seconds below the
     /// window, while byte limits resume at half. One threshold would toggle a
-    /// session on every tick; the old half-time threshold could deadlock below
-    /// AVPlayer's no-fetch waterline. SIGKILL still works on a stopped process,
-    /// so the idle reaper and the admin stop button need no special case; a
-    /// suspended session that nobody comes back to is reaped on idle like any
-    /// other.
+    /// session on every tick; the larger release point gives a held iPad
+    /// session one more production burst at its observed no-fetch waterline.
+    /// The producer can be held again if the client remains stopped. SIGKILL
+    /// still works on a stopped process, so the idle reaper and the admin stop
+    /// button need no special case; a suspended session that nobody comes back
+    /// to is reaped on idle like any other.
     async fn apply_ahead_window(
         &self,
         session: &Session,
@@ -5200,11 +5210,13 @@ mod tests {
 
         // Let the idle clock advance, then poll status several times.
         tokio::time::sleep(Duration::from_millis(300)).await;
-        let before = mgr
-            .session_status(&info.session_id)
-            .await
-            .expect("status")
-            .idle_seconds;
+        let before = mgr.session_status(&info.session_id).await.expect("status");
+        assert_eq!(
+            before.resume_below_seconds,
+            Some(150),
+            "status exposes the release threshold needed to diagnose a held session"
+        );
+        let before = before.idle_seconds;
         for _ in 0..5 {
             assert!(mgr.session_status(&info.session_id).await.is_some());
         }
@@ -5550,6 +5562,9 @@ mod tests {
             seconds: 0,
             bytes: n,
         };
+        assert_eq!(time_release_threshold(180), Some(150));
+        assert_eq!(time_release_threshold(60), Some(30));
+        assert_eq!(time_release_threshold(0), None);
         // Running: hold once past any single window.
         assert!(!should_suspend(secs(179), 0, limits, false));
         assert!(should_suspend(secs(181), 0, limits, false));
@@ -5559,12 +5574,16 @@ mod tests {
         assert!(should_suspend(secs(10), 8_001, limits, false));
 
         // Held: time keeps a 30s gap from the ceiling. The physical iPad
-        // stopped fetching while the producer was 138s ahead, so release must
-        // happen above that no-fetch waterline instead of waiting forever for
-        // the old half-window (90s) threshold.
+        // stopped fetching while the producer was 138s ahead, so release there
+        // grants one additional production burst instead of waiting for the
+        // old half-window (90s) threshold.
         assert!(should_suspend(secs(151), 0, limits, true));
         assert!(!should_suspend(secs(150), 0, limits, true));
         assert!(!should_suspend(secs(138), 0, limits, true));
+        assert!(
+            should_suspend(secs(186), 0, limits, true),
+            "without another client fetch, the producer can hit the ceiling and hold again"
+        );
         // Byte budgets remain hard disk bounds and release only at half.
         assert!(should_suspend(secs(10), 4_001, limits, true));
         assert!(!should_suspend(secs(10), 4_000, limits, true));
@@ -5732,13 +5751,12 @@ mod tests {
             .expect("write playlist");
     }
 
-    /// Retention is measured back from the DOWNLOAD frontier and must cover
-    /// the client's forward buffer — the bug this replaced deleted media the
-    /// viewer was about to watch, because it counted segments back from the
-    /// furthest one *fetched* while the client had fetched a minute ahead of
-    /// the picture on screen.
+    /// Retention is measured back from the DOWNLOAD frontier and must leave a
+    /// reload margin behind the observed playhead. This asserts the segment set
+    /// that actually survives pruning, rather than only restating the constants
+    /// used to calculate the window.
     #[tokio::test]
-    async fn retention_covers_the_clients_forward_buffer() {
+    async fn retention_keeps_a_reload_margin_above_the_observed_fetch_lead() {
         let dir = tempfile::tempdir().expect("tempdir");
         let p = dir.path();
         // 100 segments of 4s = 400s of media.
@@ -5759,20 +5777,30 @@ mod tests {
         // The retained window must still leave 60s behind that playhead for
         // back-buffering and a retry.
         let observed_playhead_ms = 180_000;
-        session.fetched_end_ms.store(300_000, Relaxed);
+        let observed_fetched_end_ms = 300_000;
+        let required_reload_margin_ms = 60_000;
+        session
+            .fetched_end_ms
+            .store(observed_fetched_end_ms, Relaxed);
         gc_expired_segments(&session).await;
 
-        // Everything within RETENTION_SECS of the frontier survives…
-        let keep_from = 300_000 - RETENTION_SECS * 1000; // 120_000
+        // The retained/pruned segment boundary is the behavior under test.
+        // Segment 30 begins at 120s, leaving 60s behind the observed 180s
+        // playhead even though the download frontier had reached 300s.
+        let (first_retained, retained_start_ms) = {
+            let index = session.segments.lock().await;
+            let first = index.first_retained_index().expect("retained segment");
+            let (start, _) = index.window_ms_of(first).expect("retained window");
+            (first, start)
+        };
+        assert_eq!(first_retained, 30);
         assert_eq!(
-            observed_playhead_ms - keep_from,
-            (CLIENT_BACK_BUFFER_SECS + RETRY_ALLOWANCE_SECS) * 1000,
-            "the observed iPad fetch lead must not consume the reload margin"
+            observed_playhead_ms - retained_start_ms,
+            required_reload_margin_ms,
+            "the actual retained set leaves the required reload margin"
         );
-        assert!(
-            p.join(format!("seg{:05}.ts", keep_from / 4_000)).exists(),
-            "media at the retention boundary is kept"
-        );
+        assert!(!p.join("seg00029.ts").exists(), "just before the boundary");
+        assert!(p.join("seg00030.ts").exists(), "retention boundary");
         assert!(p.join("seg00074.ts").exists(), "just inside the window");
         // …and only what is older goes.
         assert!(!p.join("seg00000.ts").exists());
