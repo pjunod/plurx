@@ -12,7 +12,7 @@ anything it can't (MKV, DTS/TrueHD, …) is delivered as the server's on-the-fly
 HDR display at runtime and sends that to `/decision`, so the server transcodes
 only what this hardware genuinely can't play.
 
-> Status: **v0.2.7**, build `32` in [`project.yml`](project.yml) — working
+> Status: **v0.2.7**, build `36` in [`project.yml`](project.yml) — working
 > development client. Browse, resume, discover, and play on both iOS and
 > tvOS. Both targets compile against the iOS/tvOS 26.5 SDKs and share the
 > same regression suite. Build 29 adds app-managed offline viewing on iPhone
@@ -52,7 +52,10 @@ only what this hardware genuinely can't play.
 - **On-demand player** with explicit play/pause, ±10 seconds, full-film seek,
   Skip Intro/Credits, a real runtime in iOS Now Playing instead of `LIVE`,
   audio/subtitle/quality menus, and a playback-info panel fed by the server's
-  live encoder and delivery telemetry.
+  live encoder and delivery telemetry. In a full-screen iOS window, the status
+  bar and Home indicator remain while any player overlay is visible and retire
+  after the last overlay leaves; a windowed iPad status bar remains
+  system-owned.
 - **Subtitles**, split by what the format can survive. Text tracks
   (SRT/SubRip/WebVTT) are native HLS WebVTT renditions: selecting one, or
   Off, applies inside the running player item — no restart, no new session,
@@ -80,7 +83,10 @@ only what this hardware genuinely can't play.
 - **On-demand player** with explicit play/pause, ±10 seconds, full-film seek,
   Skip Intro/Credits, a real runtime in iOS Now Playing instead of `LIVE`,
   audio/subtitle/quality menus, iOS Picture in Picture, and a playback-info
-  panel fed by the server's live encoder and delivery telemetry.
+  panel fed by the server's live encoder and delivery telemetry. In a
+  full-screen iOS window, the status bar and Home indicator remain while any
+  player overlay is visible and retire after the last overlay leaves; a
+  windowed iPad status bar remains system-owned.
 - **Subtitle output limits**: the custom PGS layer is part of the in-app player
   surface, not the video frames. Picture in Picture and external playback are
   therefore unavailable while it is active, with a visible explanation. The
@@ -299,10 +305,12 @@ to iOS Now Playing, provides its own transport, and implements non-native seeks
 by reopening the same stream at the requested film position. Faking an HLS VOD
 playlist would truncate the movie; the client-side timeline is the safe fix.
 Growing copy and transcode items also request a 60-second forward buffer. That
-is the client half of the server's 120-second retention contract: 60 seconds
-ahead · 30 seconds behind · 30 seconds for a retry. Leaving AVPlayer at its
-automatic buffer choice let its download frontier outrun that contract, so the
-server could prune a fetched segment before AVPlayer presented or retried it.
+preference is not a cap: a physical iPad fetched about 120 seconds ahead. The
+server therefore retains 180 seconds behind the download frontier — the
+measured 120-second lead · 30 seconds of back buffer · 30 seconds for
+retry/reload. A shorter window let AVPlayer's download frontier outrun the
+contract, so the server could prune a fetched segment before AVPlayer presented
+or retried it.
 
 ## Project layout
 

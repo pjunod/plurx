@@ -427,6 +427,17 @@ bump may break compatibility and a **patch** bump never does.
 
 ### Fixed
 
+- **The full-screen iOS player now retires system chrome after its own
+  overlays leave.** Noirr draws video with a custom `AVPlayerLayer`, so hiding
+  the SwiftUI transport never asked iOS to hide the separate status bar or
+  Home indicator. In a full-screen iPhone or iPad window, both now remain while
+  controls, playback info, a failure, a notice, or recovery/next progress is
+  visible, then leave the video surface after the last player overlay fades.
+  Paused playback keeps the existing four-second fade. A windowed iPad status
+  bar remains system-owned; dismissing playback restores ordinary app chrome,
+  and tvOS is unchanged. The physical-device checklist carries the remaining
+  full-screen, Split View, Picture in Picture, and multitasking-control checks.
+
 - **iPad remux playback gets a larger server-side recovery margin.**
   Physical-device telemetry reproduced the same sequence every six
   minutes: the server suspended ffmpeg at 186 seconds ahead; AVPlayer stopped
