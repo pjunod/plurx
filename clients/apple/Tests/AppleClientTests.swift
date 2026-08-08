@@ -217,7 +217,13 @@ final class AppleClientTests: XCTestCase {
         XCTAssertFalse(PlayerController.shouldMonitorSilentPlaybackStall(
             timeControlStatus: .waitingToPlayAtSpecifiedRate
         ))
+        XCTAssertTrue(PlayerController.shouldMonitorBufferingStall(
+            timeControlStatus: .waitingToPlayAtSpecifiedRate
+        ))
         XCTAssertTrue(PlayerController.shouldMonitorSilentPlaybackStall(
+            timeControlStatus: .playing
+        ))
+        XCTAssertFalse(PlayerController.shouldMonitorBufferingStall(
             timeControlStatus: .playing
         ))
 
@@ -602,6 +608,40 @@ final class AppleClientTests: XCTestCase {
         // letting it carry into the next press of Play.
         XCTAssertEqual(detector.sample(positionMs: 12_000, shouldMonitor: false), .none)
         XCTAssertEqual(detector.sample(positionMs: 12_000, shouldMonitor: true), .none)
+    }
+
+    @MainActor
+    func testBufferingWaitHasAnIndependentBoundedRecoveryTimer() {
+        var silent = PlaybackStallDetector()
+        var buffering = PlaybackStallDetector()
+        let status = AVPlayer.TimeControlStatus.waitingToPlayAtSpecifiedRate
+
+        for check in 0...6 {
+            let silentAction = silent.sample(
+                positionMs: 30_000,
+                shouldMonitor: PlayerController.shouldMonitorSilentPlaybackStall(
+                    timeControlStatus: status
+                )
+            )
+            let bufferingAction = buffering.sample(
+                positionMs: 30_000,
+                shouldMonitor: PlayerController.shouldMonitorBufferingStall(
+                    timeControlStatus: status
+                )
+            )
+
+            XCTAssertEqual(silentAction, .none, "buffering must never become decoder evidence")
+            if check == 3 {
+                XCTAssertEqual(bufferingAction, .nudge)
+            } else if check == 6 {
+                XCTAssertEqual(bufferingAction, .reopen)
+            } else {
+                XCTAssertEqual(bufferingAction, .none)
+            }
+        }
+
+        XCTAssertNil(silent.lastPositionMs)
+        XCTAssertEqual(buffering.lastPositionMs, 30_000)
     }
 
     @MainActor

@@ -301,11 +301,17 @@ final class PlayerController: ObservableObject {
     /// the base for the next relative press until the newest seek lands.
     private var seekState = PlayerSeekState()
     private var stallDetector = PlaybackStallDetector()
+    /// Buffering is a transport condition, not decoder evidence. Keep its
+    /// wall-clock evidence separate from a silent player freeze so changing
+    /// between AVPlayer states cannot carry a nearly-triggered recovery into
+    /// the other path.
+    private var bufferingStallDetector = PlaybackStallDetector()
     /// A clock freeze without an AVPlayerItem failure is not proof that the
-    /// decoder rejected the stream. Reconnect the exact delivery once; if the
-    /// replacement freezes too, stop visibly instead of walking the HDR/SDR
-    /// compatibility ladder on a guess.
-    private var silentStallRetryAttempted = false
+    /// decoder rejected the stream. The same is true of a sustained buffering
+    /// wait. Reconnect the exact delivery once; if the replacement freezes too,
+    /// stop visibly instead of walking the HDR/SDR compatibility ladder on a
+    /// guess.
+    private var sameDeliveryStallRetryAttempted = false
     /// Evidence that this server understands `native_subtitles`: its create
     /// response handed back a native master query. A server predating the
     /// feature returns the plain playlist URL and advertises no subtitle
@@ -413,7 +419,7 @@ final class PlayerController: ObservableObject {
         forceCompatibilityTranscode = false
         establishedPlayback = false
         establishedHDRRetryAttempted = false
-        silentStallRetryAttempted = false
+        sameDeliveryStallRetryAttempted = false
         attachedAtPositionMs = max(0, startMs)
         clearPlaybackNotice()
 
@@ -601,6 +607,7 @@ final class PlayerController: ObservableObject {
         currentMs = target
         refreshPGSOverlayWindow(at: target, force: true)
         stallDetector.reset()
+        bufferingStallDetector.reset()
         let requiresReopen = isChangingStream || !(usesDirectTimeline || isVOD)
         Task {
             if !requiresReopen {
@@ -736,6 +743,7 @@ final class PlayerController: ObservableObject {
         recoveryTask = nil
         clearPGSOverlaySelection()
         stallDetector.reset()
+        bufferingStallDetector.reset()
         seekState.clear()
         let position = realPositionMs()
         player.pause()
@@ -1088,6 +1096,7 @@ final class PlayerController: ObservableObject {
         currentMs = startMs
         attachedAtPositionMs = startMs
         stallDetector.reset()
+        bufferingStallDetector.reset()
         failed = false
         isChangingStream = false
         updateNowPlaying()
@@ -1384,13 +1393,13 @@ final class PlayerController: ObservableObject {
         }
     }
 
-    /// AVPlayer normally resumes a network wait itself. Some tvOS builds can
-    /// instead freeze outside the waiting state with a valid item and no hard
-    /// failure notification. Sample the film clock independently of AVPlayer's
-    /// periodic observer (which stops firing when that clock stops), but leave
-    /// `.waitingToPlayAtSpecifiedRate` alone: buffering is not evidence that a
-    /// codec failed. A genuine silent freeze gets one same-delivery reconnect,
-    /// never an automatic change from HDR to SDR.
+    /// Sample the film clock independently of AVPlayer's periodic observer,
+    /// which stops firing when that clock stops. Silent freezes and explicit
+    /// buffering waits keep independent evidence: either may reconnect the
+    /// exact delivery after a sustained lack of progress, but buffering can
+    /// never enter the codec/HDR compatibility ladder. This restores the
+    /// in-player equivalent of closing and reopening a title without reviving
+    /// the false SDR fallbacks that originally caused buffering to be excluded.
     private func startPlaybackRecoveryMonitor() {
         recoveryTask?.cancel()
         recoveryTask = Task { [weak self] in
@@ -1404,14 +1413,23 @@ final class PlayerController: ObservableObject {
                     && !self.isChangingStream
                     && self.seekState.pendingMs == nil
                     && self.player.currentItem != nil
-                    && Self.shouldMonitorSilentPlaybackStall(
-                        timeControlStatus: self.player.timeControlStatus
-                    )
+                let timeControlStatus = self.player.timeControlStatus
                 let position = self.realPositionMs()
-                let stallAction = self.stallDetector.sample(
+                let silentAction = self.stallDetector.sample(
                     positionMs: position,
                     shouldMonitor: shouldMonitor
+                        && Self.shouldMonitorSilentPlaybackStall(
+                            timeControlStatus: timeControlStatus
+                        )
                 )
+                let bufferingAction = self.bufferingStallDetector.sample(
+                    positionMs: position,
+                    shouldMonitor: shouldMonitor
+                        && Self.shouldMonitorBufferingStall(
+                            timeControlStatus: timeControlStatus
+                        )
+                )
+                let stallAction = bufferingAction == .none ? silentAction : bufferingAction
                 switch stallAction {
                 case .none:
                     break
@@ -1421,21 +1439,32 @@ final class PlayerController: ObservableObject {
                     self.isPlaying = true
                 case .reopen:
                     self.currentMs = position
-                    if await self.retryEstablishedHDRDelivery(at: position) { continue }
-                    guard !self.silentStallRetryAttempted else {
-                        self.player.pause()
-                        self.isPlaying = false
-                        self.wantsPlayback = false
-                        self.failed = true
-                        self.playbackError =
-                            "Playback stopped responding. The current picture was kept instead of switching formats."
+                    if Self.shouldMonitorBufferingStall(timeControlStatus: timeControlStatus) {
+                        await self.retrySameDeliveryAfterStall(at: position)
                         continue
                     }
-                    self.silentStallRetryAttempted = true
-                    await self.reopen(at: position)
+                    if await self.retryEstablishedHDRDelivery(at: position) { continue }
+                    await self.retrySameDeliveryAfterStall(at: position)
                 }
             }
         }
+    }
+
+    /// One bounded transport recovery shared by buffering and non-HDR silent
+    /// freezes. It deliberately calls `reopen` directly: no capability flag or
+    /// selected format changes, so the replacement uses the identical recipe.
+    private func retrySameDeliveryAfterStall(at position: Int) async {
+        guard !sameDeliveryStallRetryAttempted else {
+            player.pause()
+            isPlaying = false
+            wantsPlayback = false
+            failed = true
+            playbackError =
+                "Playback stopped responding. The current picture was kept instead of switching formats."
+            return
+        }
+        sameDeliveryStallRetryAttempted = true
+        await reopen(at: position)
     }
 
     private func fail(_ error: Error) {
@@ -1472,7 +1501,7 @@ final class PlayerController: ObservableObject {
                     self.preferredRate = self.player.rate
                     if self.realPositionMs() >= self.attachedAtPositionMs + 5_000 {
                         self.establishedPlayback = true
-                        self.silentStallRetryAttempted = false
+                        self.sameDeliveryStallRetryAttempted = false
                         // The most recent same-delivery recovery proved itself.
                         // A later, independent interruption may reconnect once
                         // too; an immediate repeated failure remains terminal.
@@ -1632,6 +1661,16 @@ final class PlayerController: ObservableObject {
         timeControlStatus: AVPlayer.TimeControlStatus
     ) -> Bool {
         timeControlStatus != .waitingToPlayAtSpecifiedRate
+    }
+
+    /// A network wait gets its own bounded recovery timer. It is intentionally
+    /// separate from `shouldMonitorSilentPlaybackStall`: the caller routes its
+    /// recovery straight back to the same delivery and never treats it as
+    /// evidence for a codec/HDR fallback.
+    static func shouldMonitorBufferingStall(
+        timeControlStatus: AVPlayer.TimeControlStatus
+    ) -> Bool {
+        timeControlStatus == .waitingToPlayAtSpecifiedRate
     }
 
     /// Only a media/container/decoder rejection may advance the compatibility
