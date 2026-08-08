@@ -136,6 +136,7 @@ pub struct AppState {
 impl AppState {
     /// `node_id` is this server's stable id — the `node_id` a cache location
     /// is recorded against, so a cluster can tell whose copy is whose.
+    #[cfg(test)]
     pub fn new(
         server_name: String,
         store: Arc<dyn Store>,
@@ -145,13 +146,44 @@ impl AppState {
         system: SystemInfo,
         logs: Arc<LogBuffer>,
     ) -> Self {
+        Self::new_configured(
+            AppConfig {
+                server_name,
+                node_id,
+                scan_prune_percent: plurx_core::config::DEFAULT_SCAN_PRUNE_PERCENT,
+            },
+            store,
+            dirs,
+            encoder_caps,
+            system,
+            logs,
+        )
+    }
+
+    pub fn new_configured(
+        config: AppConfig,
+        store: Arc<dyn Store>,
+        dirs: Dirs,
+        encoder_caps: EncoderCaps,
+        system: SystemInfo,
+        logs: Arc<LogBuffer>,
+    ) -> Self {
+        let AppConfig {
+            server_name,
+            node_id,
+            scan_prune_percent,
+        } = config;
         let Dirs {
             artwork: artwork_dir,
             transcode: transcode_dir,
             cache: cache_dir,
             subs: subs_dir,
         } = dirs;
-        let jobs = Arc::new(JobManager::new(Arc::clone(&store), artwork_dir.clone()));
+        let jobs = Arc::new(JobManager::new_with_scan_prune_percent(
+            Arc::clone(&store),
+            artwork_dir.clone(),
+            scan_prune_percent,
+        ));
         let coming_soon = crate::http::ComingSoonCache::new();
         let watched = crate::watched::WatchedNotifier::new(Arc::clone(&store));
         let transcode = Arc::new(
@@ -205,6 +237,12 @@ impl AppState {
             started_at: Instant::now(),
         }
     }
+}
+
+pub struct AppConfig {
+    pub server_name: String,
+    pub node_id: String,
+    pub scan_prune_percent: u8,
 }
 
 /// Status of the most recent (or in-flight) scan for one library.
@@ -354,6 +392,7 @@ impl IntegrationMetrics {
 pub struct JobManager {
     store: Arc<dyn Store>,
     artwork_dir: PathBuf,
+    scan_prune_percent: u8,
     /// Test-only provider override so the targeted-scan seam can be exercised
     /// through the real job manager without reaching the public TMDB API.
     #[cfg(test)]
@@ -550,10 +589,24 @@ pub struct ScanRequestRecord {
 const MAX_REQUESTS: usize = 256;
 
 impl JobManager {
+    #[cfg(test)]
     fn new(store: Arc<dyn Store>, artwork_dir: PathBuf) -> Self {
+        Self::new_with_scan_prune_percent(
+            store,
+            artwork_dir,
+            plurx_core::config::DEFAULT_SCAN_PRUNE_PERCENT,
+        )
+    }
+
+    fn new_with_scan_prune_percent(
+        store: Arc<dyn Store>,
+        artwork_dir: PathBuf,
+        scan_prune_percent: u8,
+    ) -> Self {
         JobManager {
             store,
             artwork_dir,
+            scan_prune_percent,
             #[cfg(test)]
             tmdb_base: None,
             statuses: Mutex::new(HashMap::new()),
@@ -1124,7 +1177,13 @@ impl JobManager {
             }
         };
 
-        match scan::scan_library_with_progress(self.store.as_ref(), &library, Some(&progress)).await
+        match scan::scan_library_with_progress_and_prune_percent(
+            self.store.as_ref(),
+            &library,
+            Some(&progress),
+            self.scan_prune_percent,
+        )
+        .await
         {
             Ok(report) => status.last_scan = Some(report),
             Err(e) => {

@@ -1130,22 +1130,28 @@ impl MediaStore for SqliteStore {
         &self,
         library_id: i64,
         fingerprint: &str,
+        allow_establish: bool,
     ) -> Result<RootFingerprintStatus, StoreError> {
         let fingerprint = fingerprint.to_owned();
         self.with_conn(move |conn| {
             let inserted = conn.execute(
-                "INSERT INTO library_roots (library_id, fingerprint) VALUES (?1, ?2) \
+                "INSERT INTO library_roots (library_id, fingerprint) SELECT ?1, ?2 WHERE ?3 \
                  ON CONFLICT(library_id) DO NOTHING",
-                params![library_id, fingerprint],
+                params![library_id, fingerprint, allow_establish],
             )?;
             if inserted == 1 {
                 return Ok(RootFingerprintStatus::Established);
             }
-            let expected: String = conn.query_row(
-                "SELECT fingerprint FROM library_roots WHERE library_id = ?1",
-                params![library_id],
-                |row| row.get(0),
-            )?;
+            let expected: Option<String> = conn
+                .query_row(
+                    "SELECT fingerprint FROM library_roots WHERE library_id = ?1",
+                    params![library_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(expected) = expected else {
+                return Ok(RootFingerprintStatus::Unestablished);
+            };
             if expected == fingerprint {
                 Ok(RootFingerprintStatus::Matched)
             } else {
@@ -1179,20 +1185,11 @@ impl MediaStore for SqliteStore {
                 });
             }
 
-            let list = if ids.is_empty() {
-                "NULL".to_owned()
-            } else {
-                ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",")
-            };
-            let requested: i64 = tx.query_row(
-                &format!(
-                    "SELECT COUNT(*) FROM files f JOIN items i ON i.id = f.item_id \
-                     WHERE i.library_id = ?1 AND f.id IN ({list})"
-                ),
-                params![library_id],
-                |row| row.get(0),
-            )?;
-            let requested = requested.max(0) as u64;
+            // `gone_file_ids` is the subset of `library_file_paths` absent
+            // from the completed walk. Its cardinality is already the exact
+            // requested prune count; rejoining every id through one enormous
+            // IN list made reconciliation quadratic for large libraries.
+            let requested = ids.len() as u64;
             if requested > prune_limit {
                 return Ok(ReconcileOutcome::RefusedPrune {
                     requested,
@@ -1200,13 +1197,16 @@ impl MediaStore for SqliteStore {
                 });
             }
 
-            let deleted_files = tx.execute(
-                &format!(
-                    "DELETE FROM files WHERE id IN ({list}) AND item_id IN \
-                     (SELECT id FROM items WHERE library_id = ?1)"
-                ),
-                params![library_id],
-            )? as u64;
+            let mut deleted_files = 0_u64;
+            {
+                let mut delete = tx.prepare_cached(
+                    "DELETE FROM files WHERE id = ?1 AND item_id IN \
+                     (SELECT id FROM items WHERE library_id = ?2)",
+                )?;
+                for id in ids {
+                    deleted_files += delete.execute(params![id, library_id])? as u64;
+                }
+            }
             let mut pruned_items = 0_u64;
             pruned_items += tx.execute(
                 "DELETE FROM items WHERE library_id = ?1 \
@@ -1231,7 +1231,7 @@ impl MediaStore for SqliteStore {
                      SELECT root.id, child.id, child.kind FROM items root \
                      LEFT JOIN items child ON child.parent_id = root.id \
                      WHERE root.library_id = ?1 AND root.kind = 'folder' \
-                     UNION ALL \
+                     UNION \
                      SELECT descendants.root_id, child.id, child.kind \
                      FROM descendants JOIN items child ON child.parent_id = descendants.id \
                  ) \
@@ -1246,7 +1246,7 @@ impl MediaStore for SqliteStore {
                      SELECT root.id, child.id, child.kind FROM items root \
                      LEFT JOIN items child ON child.parent_id = root.id \
                      WHERE root.library_id = ?1 AND root.kind = 'folder' \
-                     UNION ALL \
+                     UNION \
                      SELECT descendants.root_id, child.id, child.kind \
                      FROM descendants JOIN items child ON child.parent_id = descendants.id \
                  ) \
@@ -1261,6 +1261,25 @@ impl MediaStore for SqliteStore {
                 deleted_files,
                 pruned_items,
             })
+        })
+        .await
+    }
+
+    async fn reset_library_root_fingerprint(&self, library_id: i64) -> Result<bool, StoreError> {
+        self.with_conn(move |conn| {
+            Ok(conn.execute(
+                "DELETE FROM library_roots WHERE library_id = ?1",
+                params![library_id],
+            )? == 1)
+        })
+        .await
+    }
+
+    async fn rebuild_search_index(&self) -> Result<u64, StoreError> {
+        self.with_conn(move |conn| {
+            let count: i64 = conn.query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))?;
+            conn.execute("INSERT INTO items_fts(items_fts) VALUES('rebuild')", [])?;
+            Ok(count.max(0) as u64)
         })
         .await
     }

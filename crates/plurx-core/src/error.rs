@@ -91,4 +91,7 @@ pub enum ConfigError {
 
     #[error("invalid value in ${var}: {message}")]
     Env { var: String, message: String },
+
+    #[error("invalid configuration value `{key}`: {message}")]
+    Value { key: String, message: String },
 }

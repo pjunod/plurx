@@ -1,11 +1,11 @@
 # Clustering transition — from one plurxd node to Phase 4
 
-**Status:** executing — M0 and M1a merged; M1b is under review; M1c's
-catalogue/watch backend and failure gate are implemented on the stacked branch,
-daemon activation still pending
+**Status:** executing — M0, M1a, and M1b merged; M1c's catalogue/watch backend,
+scan fences, derived-search recovery, and failure gate are under review; daemon
+activation still pending
 · **Executes:** Phase 4 from [ROADMAP.md](ROADMAP.md) and REQ-HA-1–6 from
 [REQUIREMENTS.md](REQUIREMENTS.md) · **Written:** 2026-08-06 · **Revised:**
-2026-08-07
+2026-08-08
 
 Companion to [PHASE3-SPIKE.md](PHASE3-SPIKE.md), which chose hiqlite and
 proved restart-at-boundary media behavior; [PERF-PLAN.md](PERF-PLAN.md) §7,
@@ -373,7 +373,8 @@ SQL.
 
 **Acceptance:** the additive suite exercises every method against in-memory
 and file SQLite with no behavior change; `make check` remains the gate. The
-inventory is 116 methods after M1c added the two reconciliation contracts.
+inventory is 118 methods after M1c added reconciliation, root-reset, and
+derived-search recovery contracts.
 
 The executable M1a contract is `store_contract`: each scenario receives only
 `Arc<dyn Store>`, and its name inventory fails unless every `async fn` declared
@@ -429,18 +430,23 @@ commits.
 **Backend slice delivered 2026-08-07; daemon activation remains open.**
 `HiqliteAuthStore` now also implements all library, media, and watch methods.
 Authoritative reads are quorum-consistent; search reads each voter's derived
-external-content FTS index. `reconcile_library` records root identity and puts
+contentless FTS index. A missing local index can no longer make an authoritative
+item delete fail. `reconcile_library` records root identity and puts
 the root comparison, prune budget, vanished-file delete, and empty-hierarchy
 prune in one transaction. The ordinary scanner now publishes through that
-boundary; a root mismatch or over-budget scan records an error and commits no
-delete.
+boundary with `storage.scan_prune_percent` (10% by default); a root mismatch or
+over-budget scan records an error and commits no delete. An empty first scan of
+an upgraded library cannot establish root trust. Editing paths clears the old
+identity, and the admin root-reset action covers a verified mount replacement.
 
 `make cluster-check` writes catalogue and watch state through every voter,
-compares ordered local table digests, and compares the three browse/search
-views. It then deletes voter 2's FTS rows directly, proves browse remains
-unchanged while local search empties, rebuilds from replicated `items`, and
-requires all three views to converge before the existing follower-loss and
-leader-loss cases continue. The remaining lease token is deliberately M4's
+compares ordered local table digests, and compares voter-local authoritative
+catalogue digests and search results. It then deletes voter 2's FTS
+rows directly, proves authoritative truth remains unchanged while the full
+derived-state digest and local search change, invokes the product rebuild
+contract, and requires all three views to converge before the existing
+follower-loss and leader-loss cases continue. The remaining lease token is
+deliberately M4's
 signature change: M1c owns root identity and the atomic publication boundary;
 M4 makes that same boundary reject an expired scanner.
 
@@ -552,7 +558,7 @@ mode without lowering quality or losing selected tracks.
 
 ## 8. Handoff checkpoint — M1c has catalogue evidence, not daemon activation
 
-M0 and M1a are on `main`; M1b is under review and M1c is stacked on its exact
+M0, M1a, and M1b are on `main`; M1c is under review after rebasing onto that
 head. Keep SQLite as the daemon's complete store until every trait has one
 replicated implementation and the import gate is ready. The next implementation
 boundary is M1d: Trakt/outbox, cache/offline ownership, the remaining durable

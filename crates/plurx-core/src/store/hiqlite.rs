@@ -179,6 +179,17 @@ impl HiqliteAuthStore {
         serde_json::to_string(&self.local_auth_dump().await?).map_err(database_error)
     }
 
+    /// Hash only authoritative catalogue tables from this voter. The cluster
+    /// gate uses this to prove a damaged derived FTS index cannot change truth.
+    pub async fn validation_local_catalog_truth_digest(&self) -> Result<String, StoreError> {
+        tokio::time::timeout(
+            STORE_TIMEOUT,
+            super::hiqlite_catalog::local_catalog_truth_digest(&self.client),
+        )
+        .await
+        .map_err(|_| StoreError::Database("replicated store operation timed out".to_owned()))?
+    }
+
     async fn local_auth_dump(&self) -> Result<AuthStoreDump, StoreError> {
         for sql in [
             "SELECT singleton, schema_version, protocol_min, protocol_max, migrated_at FROM cluster_meta ORDER BY singleton",

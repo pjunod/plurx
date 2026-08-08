@@ -72,6 +72,10 @@ pub fn router(state: AppState) -> Router {
         // library, and separate from GET /system so that reading the last
         // numbers is never the thing that goes and takes new ones.
         .route("/system/storage", post(system::remeasure_storage))
+        .route(
+            "/system/search-index/rebuild",
+            post(system::rebuild_search_index),
+        )
         // Any signed-in user can post a client-side playback error here so it
         // lands in the admin log (browsers that reject a stream produce no
         // server log on their own).
@@ -100,6 +104,10 @@ pub fn router(state: AppState) -> Router {
         .route("/libraries/{id}/schedule", put(libraries::set_schedule))
         .route("/libraries/{id}/scan", post(libraries::scan))
         .route("/libraries/{id}/refresh", post(libraries::refresh))
+        .route(
+            "/libraries/{id}/root-identity/reset",
+            post(libraries::reset_root_identity),
+        )
         .route("/libraries/{id}/items", get(browse::list_items))
         // Browse
         .route("/items/{id}", get(browse::item_detail).patch(items::edit))

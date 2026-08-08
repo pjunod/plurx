@@ -191,3 +191,17 @@ pub async fn refresh(
     let started = state.jobs.trigger_refresh(id).await;
     Ok(Json(ScanTriggered { started }))
 }
+
+/// POST /api/v1/libraries/:id/root-identity/reset (admin) — allow the next
+/// verified non-empty scan to establish a deliberately replaced mount.
+pub async fn reset_root_identity(
+    _admin: AdminUser,
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if state.store.get_library(id).await?.is_none() {
+        return Err(ApiError::NotFound("library"));
+    }
+    let cleared = state.store.reset_library_root_fingerprint(id).await?;
+    Ok(Json(serde_json::json!({ "ok": true, "cleared": cleared })))
+}

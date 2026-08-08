@@ -1098,7 +1098,7 @@ impl MediaStore for HiqliteAuthStore {
             .transpose()
             .map_err(database_error)?;
         let now = self.now()?;
-        self.execute(
+        let sql = format!(
             "UPDATE items SET \
                  title = CASE WHEN $1 THEN $2 ELSE title END, \
                  sort_title = CASE WHEN $1 THEN $3 ELSE sort_title END, \
@@ -1106,25 +1106,35 @@ impl MediaStore for HiqliteAuthStore {
                  recorded_at = CASE WHEN $6 THEN $7 ELSE recorded_at END, \
                  year = CASE WHEN $8 THEN $9 ELSE year END, \
                  tags = CASE WHEN $10 THEN $11 ELSE tags END, \
-                 updated_at = $12 WHERE id = $13",
-            params!(
-                edit.title.is_some(),
-                edit.title.as_deref(),
-                sort_title,
-                edit.overview.is_some(),
-                edit.overview.as_ref().and_then(|value| value.as_deref()),
-                edit.recorded_at.is_some(),
-                edit.recorded_at.as_ref().and_then(|value| value.as_deref()),
-                edit.year.is_some(),
-                edit.year.flatten(),
-                tags.is_some(),
-                tags,
-                now,
-                item_id
-            ),
+                 updated_at = $12 WHERE id = $13 RETURNING {ITEM_COLS}"
+        );
+        validate_sql(&sql)?;
+        one_item(
+            self.client
+                .execute_returning_map::<_, ItemRow>(
+                    sql,
+                    params!(
+                        edit.title.is_some(),
+                        edit.title.as_deref(),
+                        sort_title,
+                        edit.overview.is_some(),
+                        edit.overview.as_ref().and_then(|value| value.as_deref()),
+                        edit.recorded_at.is_some(),
+                        edit.recorded_at.as_ref().and_then(|value| value.as_deref()),
+                        edit.year.is_some(),
+                        edit.year.flatten(),
+                        tags.is_some(),
+                        tags,
+                        now,
+                        item_id
+                    ),
+                )
+                .await
+                .map_err(database_error)?
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(database_error)?,
         )
-        .await?;
-        self.get_item(item_id).await
     }
 
     async fn set_nfo_seeded(&self, item_id: i64) -> Result<(), StoreError> {
@@ -1451,12 +1461,14 @@ impl MediaStore for HiqliteAuthStore {
         &self,
         library_id: i64,
         fingerprint: &str,
+        allow_establish: bool,
     ) -> Result<RootFingerprintStatus, StoreError> {
         let inserted = self
             .execute(
-                "INSERT INTO library_roots (library_id, fingerprint) VALUES ($1, $2) \
+                "INSERT INTO library_roots (library_id, fingerprint) \
+                 SELECT $1, $2 WHERE $3 \
                  ON CONFLICT(library_id) DO NOTHING",
-                params!(library_id, fingerprint),
+                params!(library_id, fingerprint, allow_establish),
             )
             .await?;
         if inserted == 1 {
@@ -1472,10 +1484,10 @@ impl MediaStore for HiqliteAuthStore {
             .map_err(database_error)?
             .into_iter()
             .next()
-            .ok_or_else(|| {
-                StoreError::Database("library root identity disappeared after insert".to_owned())
-            })?
-            .fingerprint;
+            .map(|row| row.fingerprint);
+        let Some(expected) = expected else {
+            return Ok(RootFingerprintStatus::Unestablished);
+        };
         if expected == fingerprint {
             Ok(RootFingerprintStatus::Matched)
         } else {
@@ -1579,7 +1591,7 @@ impl MediaStore for HiqliteAuthStore {
                      SELECT root.id, child.id, child.kind FROM items root \
                      LEFT JOIN items child ON child.parent_id = root.id \
                      WHERE root.library_id = $1 AND root.kind = 'folder' \
-                     UNION ALL SELECT descendants.root_id, child.id, child.kind \
+                     UNION SELECT descendants.root_id, child.id, child.kind \
                      FROM descendants JOIN items child ON child.parent_id = descendants.id \
                  ) INSERT INTO scan_reconcile_items (library_id, item_id) \
                    SELECT $1, items.id FROM items \
@@ -1618,14 +1630,57 @@ impl MediaStore for HiqliteAuthStore {
             .collect::<Result<Vec<_>, _>>()
             .map_err(database_error)?;
         if results.first().copied() != Some(1) {
-            return Err(StoreError::Database(
-                "reconciliation guard changed while the Raft transaction was built".to_owned(),
-            ));
+            let expected = self
+                .client
+                .query_consistent_map::<RootFingerprintRow, _>(
+                    "SELECT fingerprint FROM library_roots WHERE library_id = $1",
+                    params!(library_id),
+                )
+                .await
+                .map_err(database_error)?
+                .into_iter()
+                .next()
+                .map(|row| row.fingerprint)
+                .unwrap_or_else(|| "<unregistered>".to_owned());
+            return Ok(ReconcileOutcome::RefusedRoot { expected });
         }
         Ok(ReconcileOutcome::Applied {
             deleted_files: results[1] as u64,
             pruned_items: results[2..=5].iter().map(|rows| *rows as u64).sum(),
         })
+    }
+
+    async fn reset_library_root_fingerprint(&self, library_id: i64) -> Result<bool, StoreError> {
+        Ok(self
+            .execute(
+                "DELETE FROM library_roots WHERE library_id = $1",
+                params!(library_id),
+            )
+            .await?
+            == 1)
+    }
+
+    async fn rebuild_search_index(&self) -> Result<u64, StoreError> {
+        let statements = [
+            ("DELETE FROM items_fts", params!()),
+            (
+                "INSERT INTO items_fts(rowid, title, overview, tags) \
+                 SELECT id, title, overview, tags FROM items",
+                params!(),
+            ),
+        ];
+        for (sql, _) in &statements {
+            validate_sql(sql)?;
+        }
+        let results = self
+            .client
+            .txn(statements)
+            .await
+            .map_err(database_error)?
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(database_error)?;
+        Ok(results.get(1).copied().unwrap_or(0) as u64)
     }
 
     async fn delete_files(&self, ids: &[i64]) -> Result<u64, StoreError> {
@@ -1648,6 +1703,7 @@ impl MediaStore for HiqliteAuthStore {
 
     async fn prune_empty_items(&self, library_id: i64) -> Result<u64, StoreError> {
         let statements = [
+            "DELETE FROM scan_reconcile_items WHERE library_id = $1",
             "DELETE FROM items WHERE library_id = $1 \
              AND kind IN ('movie','episode','video','photo') \
              AND id NOT IN (SELECT item_id FROM files)",
@@ -1661,13 +1717,19 @@ impl MediaStore for HiqliteAuthStore {
                  SELECT root.id, child.id, child.kind FROM items root \
                  LEFT JOIN items child ON child.parent_id = root.id \
                  WHERE root.library_id = $1 AND root.kind = 'folder' \
-                 UNION ALL \
+                 UNION \
                  SELECT descendants.root_id, child.id, child.kind \
                  FROM descendants JOIN items child ON child.parent_id = descendants.id \
              ) \
-             DELETE FROM items WHERE library_id = $1 AND kind = 'folder' \
-               AND NOT EXISTS (SELECT 1 FROM descendants \
-                               WHERE root_id = items.id AND kind != 'folder')",
+             INSERT INTO scan_reconcile_items (library_id, item_id) \
+               SELECT $1, items.id FROM items \
+               WHERE items.library_id = $1 AND items.kind = 'folder' \
+                 AND NOT EXISTS (SELECT 1 FROM descendants \
+                                 WHERE root_id = items.id AND kind != 'folder') \
+               ON CONFLICT(library_id, item_id) DO NOTHING",
+            "DELETE FROM items WHERE library_id = $1 AND id IN \
+                (SELECT item_id FROM scan_reconcile_items WHERE library_id = $1)",
+            "DELETE FROM scan_reconcile_items WHERE library_id = $1",
         ];
         for sql in statements {
             validate_sql(sql)?;
@@ -1677,11 +1739,13 @@ impl MediaStore for HiqliteAuthStore {
             .txn(statements.map(|sql| (sql, params!(library_id))))
             .await
             .map_err(database_error)?;
-        results.into_iter().try_fold(0_u64, |removed, result| {
-            result
-                .map(|rows| removed + rows as u64)
-                .map_err(database_error)
-        })
+        let results = results
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(database_error)?;
+        // The staging INSERT count is the exact number of folders selected;
+        // CTE DELETE row counts vary across SQLite wrappers.
+        Ok(results[1..=4].iter().map(|rows| *rows as u64).sum())
     }
 }
 
@@ -1856,7 +1920,7 @@ impl WatchStore for HiqliteAuthStore {
             )
         };
         validate_sql(&sql)?;
-        Ok(self
+        let mut changed = self
             .client
             .execute_returning_map::<_, IdRow>(sql, params!(item_id, user_id, now))
             .await
@@ -1866,7 +1930,9 @@ impl WatchStore for HiqliteAuthStore {
             .map_err(database_error)?
             .into_iter()
             .map(|row| row.id)
-            .collect())
+            .collect::<Vec<_>>();
+        changed.sort_unstable();
+        Ok(changed)
     }
 
     async fn watch_rollup(&self, user_id: i64, item_id: i64) -> Result<WatchRollup, StoreError> {

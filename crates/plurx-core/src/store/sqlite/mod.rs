@@ -507,6 +507,11 @@ const MIGRATIONS: &[&str] = &[
         fingerprint TEXT NOT NULL
     ) STRICT;
 
+    CREATE TRIGGER library_roots_paths_au AFTER UPDATE OF paths ON libraries
+    WHEN old.paths <> new.paths BEGIN
+        DELETE FROM library_roots WHERE library_id = new.id;
+    END;
+
     CREATE TABLE scan_reconcile_guards (
         library_id INTEGER PRIMARY KEY REFERENCES libraries(id) ON DELETE CASCADE
     ) STRICT;

@@ -1,6 +1,7 @@
 # plurx configuration — copy to plurx.toml (or /etc/plurx/plurx.toml).
 # Every key is optional; these are the defaults. Env vars override the file:
-#   PLURX_SERVER_NAME, PLURX_BIND, PLURX_DATA_DIR, PLURX_CONFIG, PLURX_LOG
+#   PLURX_SERVER_NAME, PLURX_BIND, PLURX_DATA_DIR,
+#   PLURX_SCAN_PRUNE_PERCENT, PLURX_CONFIG, PLURX_LOG
 
 [server]
 # Human-visible server name.
@@ -11,6 +12,9 @@ bind = "0.0.0.0:32400"
 [storage]
 # Where the database and caches live. Created if missing.
 data_dir = "./data"
+# A complete scan may remove at most this percentage of known files. Set 0 to
+# require manual cleanup; values above 100 are rejected.
+scan_prune_percent = 10
 
 # [cluster]
 # Reserved in M0 so configs written by later clustering releases remain

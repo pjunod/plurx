@@ -295,7 +295,32 @@ pub async fn scan_library_with_progress(
     library: &Library,
     progress: Option<&ScanProgress>,
 ) -> Result<ScanReport, StoreError> {
-    scan_library_with_progress_and_prune_limit(store, library, progress, u64::MAX).await
+    scan_library_with_progress_and_prune_percent(
+        store,
+        library,
+        progress,
+        crate::config::DEFAULT_SCAN_PRUNE_PERCENT,
+    )
+    .await
+}
+
+/// Scan with a deletion ceiling expressed as a share of the library's known
+/// files. Integer division rounds down so the configured percentage is a hard
+/// ceiling; zero disables automatic removal.
+pub async fn scan_library_with_progress_and_prune_percent(
+    store: &dyn Store,
+    library: &Library,
+    progress: Option<&ScanProgress>,
+    prune_percent: u8,
+) -> Result<ScanReport, StoreError> {
+    let known = store.library_file_paths(library.id).await?.len() as u64;
+    let percent = u64::from(prune_percent.min(100));
+    let prune_limit = if percent == 0 || known == 0 {
+        0
+    } else {
+        known.saturating_mul(percent) / 100
+    };
+    scan_library_with_progress_and_prune_limit(store, library, progress, prune_limit).await
 }
 
 /// Cluster-ready scan entry point. `prune_limit` is the maximum number of
@@ -310,6 +335,18 @@ pub async fn scan_library_with_progress_and_prune_limit(
 ) -> Result<ScanReport, StoreError> {
     let mut report = ScanReport::default();
     let mut seen: HashSet<String> = HashSet::new();
+    // Capture the configured path-set identity before walking. A root that
+    // vanishes mid-scan must produce one bounded refusal, not a successful
+    // walk followed by a fatal error and an immediate full retry.
+    let fingerprint = match library_root_fingerprint(&library.paths) {
+        Ok(fingerprint) => Some(fingerprint),
+        Err(error) => {
+            report.note(format!(
+                "vanished-file cleanup skipped: library root identity could not be read: {error}"
+            ));
+            None
+        }
+    };
 
     // Collect candidate files first (cheap, synchronous), then process each.
     // A root that is missing or unreadable is a loud, actionable problem — the
@@ -396,14 +433,27 @@ pub async fn scan_library_with_progress_and_prune_limit(
     // library's records over a transient mount problem.
     if walk_errors == 0 {
         let known = store.library_file_paths(library.id).await?;
+        let known_count = known.len();
         let gone: Vec<i64> = known
             .into_iter()
             .filter(|(_, p)| !seen.contains(&p.to_string_lossy().into_owned()))
             .map(|(id, _)| id)
             .collect();
-        let fingerprint = library_root_fingerprint(&library.paths)?;
+        let Some(fingerprint) = fingerprint else {
+            report.errors += 1;
+            report.note(
+                "vanished-file cleanup skipped because the root identity was unavailable"
+                    .to_owned(),
+            );
+            report.seal_problems();
+            return Ok(report);
+        };
         let root_status = store
-            .ensure_library_root_fingerprint(library.id, &fingerprint)
+            .ensure_library_root_fingerprint(
+                library.id,
+                &fingerprint,
+                known_count == 0 || (!seen.is_empty() && (gone.len() as u64) <= prune_limit),
+            )
             .await?;
         match root_status {
             RootFingerprintStatus::Established | RootFingerprintStatus::Matched => {
@@ -461,6 +511,19 @@ pub async fn scan_library_with_progress_and_prune_limit(
                         .to_owned(),
                 );
             }
+            RootFingerprintStatus::Unestablished => {
+                report.errors += 1;
+                tracing::error!(
+                    library = %library.name,
+                    observed = %fingerprint,
+                    "refusing to trust an empty first observation of an existing library"
+                );
+                report.note(
+                    "vanished-file cleanup skipped: this existing library has no recorded root \
+                     identity and the scan saw no media; verify the mount and scan again"
+                        .to_owned(),
+                );
+            }
         }
     } else {
         report.note(
@@ -508,12 +571,11 @@ pub async fn scan_library_with_progress_and_prune_limit(
 
 /// Stable identity for the configured root set.
 ///
-/// The canonical path prevents two different mount points from being treated
-/// as one. On Unix, the root inode distinguishes a replacement mounted at the
-/// same path; it intentionally omits the device number because the same NFS
-/// export may receive a different local device id on each voter. A stale view
-/// of the correct root can still carry the same identity, which is why the
-/// independent prune bound remains mandatory.
+/// The canonical path prevents two differently configured mount points from
+/// being treated as one. It deliberately omits filesystem-local inode/device
+/// identity because those values are not stable across voters for the same
+/// network export. Replacement storage mounted at the same path is therefore
+/// guarded by the independent prune bound.
 pub fn library_root_fingerprint(paths: &[std::path::PathBuf]) -> Result<String, StoreError> {
     let mut roots = Vec::with_capacity(paths.len());
     for path in paths {
@@ -523,22 +585,7 @@ pub fn library_root_fingerprint(paths: &[std::path::PathBuf]) -> Result<String, 
                 path.display()
             ))
         })?;
-        let metadata = canonical.metadata().map_err(|error| {
-            StoreError::Task(format!(
-                "cannot inspect library root `{}`: {error}",
-                canonical.display()
-            ))
-        })?;
-        let mut identity = canonical.to_string_lossy().into_owned();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            identity.push('\0');
-            identity.push_str(&metadata.ino().to_string());
-        }
-        #[cfg(not(unix))]
-        let _ = metadata;
-        roots.push(identity);
+        roots.push(canonical.to_string_lossy().into_owned());
     }
     roots.sort();
     let mut digest = Sha256::new();
@@ -1357,7 +1404,9 @@ mod tests {
 
         // Delete one file, rescan: file removed and its movie pruned.
         std::fs::remove_file(dir.path().join("Heat (1995).mkv")).expect("rm");
-        let r = scan_library(&store, &lib).await.expect("rescan2");
+        let r = scan_library_with_progress_and_prune_limit(&store, &lib, None, 1)
+            .await
+            .expect("rescan2");
         assert_eq!(r.removed_files, 1);
         assert_eq!(r.pruned_items, 1);
         let page = store
@@ -1423,7 +1472,7 @@ mod tests {
         assert!(report
             .problems
             .iter()
-            .any(|problem| problem.contains("does not match")));
+            .any(|problem| problem.contains("no recorded root identity")));
         assert!(store.get_file(file_id).await.expect("kept row").is_some());
     }
 
@@ -1448,7 +1497,9 @@ mod tests {
         // The root vanishes (unmounted NAS / wrong container path). The scan
         // must say so loudly — and must NOT delete the known files.
         drop(dir);
-        let r = scan_library(&store, &lib).await.expect("rescan");
+        let r = scan_library_with_progress_and_prune_limit(&store, &lib, None, 1)
+            .await
+            .expect("rescan");
         assert_eq!(r.errors, 1);
         assert!(
             r.problems.iter().any(|p| p.contains("does not exist")),
@@ -1827,7 +1878,9 @@ mod tests {
         assert_eq!(scan_library(&store, &lib).await.expect("scan").added, 1);
 
         std::fs::remove_file(dir.path().join("2019/Summer/Beach Trip/clip.mp4")).expect("rm");
-        let r = scan_library(&store, &lib).await.expect("rescan");
+        let r = scan_library_with_progress_and_prune_limit(&store, &lib, None, 1)
+            .await
+            .expect("rescan");
         assert_eq!(r.removed_files, 1);
         assert_eq!(
             r.pruned_items, 4,

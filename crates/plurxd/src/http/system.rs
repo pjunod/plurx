@@ -278,6 +278,19 @@ pub async fn remeasure_storage(
     Ok(Json(state.storage.read().await.clone()))
 }
 
+/// POST /api/v1/system/search-index/rebuild (admin) — recreate the derived
+/// search index from cluster-authoritative item rows on every voter.
+pub async fn rebuild_search_index(
+    _admin: AdminUser,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let indexed_items = state.store.rebuild_search_index().await?;
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "indexed_items": indexed_items
+    })))
+}
+
 #[derive(Deserialize)]
 pub struct LogsQuery {
     /// Minimum severity to include ("error" … "trace"). Default: everything

@@ -1,7 +1,7 @@
 //! Replicated libraries, media catalogue, watch state, and derived local FTS.
 //!
 //! The authoritative rows below travel through Raft. `items_fts` is an
-//! external-content index rebuilt from `items`; each voter answers search from
+//! contentless derived index rebuilt from `items`; each voter answers search from
 //! its own copy so losing and rebuilding that index cannot alter cluster truth.
 
 use std::path::PathBuf;
@@ -103,6 +103,10 @@ CREATE TABLE IF NOT EXISTS library_roots (
     library_id  INTEGER PRIMARY KEY REFERENCES libraries(id) ON DELETE CASCADE,
     fingerprint TEXT NOT NULL
 ) STRICT;
+CREATE TRIGGER IF NOT EXISTS library_roots_paths_au AFTER UPDATE OF paths ON libraries
+WHEN old.paths <> new.paths BEGIN
+    DELETE FROM library_roots WHERE library_id = new.id;
+END;
 
 CREATE TABLE IF NOT EXISTS scan_reconcile_guards (
     library_id INTEGER PRIMARY KEY REFERENCES libraries(id) ON DELETE CASCADE
@@ -115,19 +119,18 @@ CREATE TABLE IF NOT EXISTS scan_reconcile_items (
 ) STRICT;
 
 CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(
-    title, overview, tags, content='items', content_rowid='id'
+    title, overview, tags, content='', contentless_delete=1
 );
+CREATE VIRTUAL TABLE IF NOT EXISTS items_fts_vocab USING fts5vocab(items_fts, 'instance');
 CREATE TRIGGER IF NOT EXISTS items_fts_ai AFTER INSERT ON items BEGIN
     INSERT INTO items_fts(rowid, title, overview, tags)
     VALUES (new.id, new.title, new.overview, new.tags);
 END;
 CREATE TRIGGER IF NOT EXISTS items_fts_ad AFTER DELETE ON items BEGIN
-    INSERT INTO items_fts(items_fts, rowid, title, overview, tags)
-    VALUES ('delete', old.id, old.title, old.overview, old.tags);
+    DELETE FROM items_fts WHERE rowid = old.id;
 END;
 CREATE TRIGGER IF NOT EXISTS items_fts_au AFTER UPDATE OF title, overview, tags ON items BEGIN
-    INSERT INTO items_fts(items_fts, rowid, title, overview, tags)
-    VALUES ('delete', old.id, old.title, old.overview, old.tags);
+    DELETE FROM items_fts WHERE rowid = old.id;
     INSERT INTO items_fts(rowid, title, overview, tags)
     VALUES (new.id, new.title, new.overview, new.tags);
 END;
@@ -143,6 +146,16 @@ pub(super) async fn install_schema(client: &hiqlite::Client) -> Result<(), Store
 
 struct JsonValueRow {
     value: String,
+}
+
+async fn rows(client: &hiqlite::Client, sql: &'static str) -> Result<Vec<String>, StoreError> {
+    Ok(client
+        .query_map::<JsonValueRow, _>(sql, params!())
+        .await
+        .map_err(database_error)?
+        .into_iter()
+        .map(|row| row.value)
+        .collect())
 }
 
 impl From<&mut Row<'_>> for JsonValueRow {
@@ -162,20 +175,23 @@ struct CatalogDump {
     library_roots: Vec<String>,
     scan_reconcile_guards: Vec<String>,
     scan_reconcile_items: Vec<String>,
+    fts_terms: Vec<String>,
+    fts_schema: Vec<String>,
 }
 
-pub(super) async fn local_catalog_digest(client: &hiqlite::Client) -> Result<String, StoreError> {
-    async fn rows(client: &hiqlite::Client, sql: &'static str) -> Result<Vec<String>, StoreError> {
-        Ok(client
-            .query_map::<JsonValueRow, _>(sql, params!())
-            .await
-            .map_err(database_error)?
-            .into_iter()
-            .map(|row| row.value)
-            .collect())
-    }
+#[derive(Serialize)]
+struct CatalogTruthDump {
+    libraries: Vec<String>,
+    items: Vec<String>,
+    files: Vec<String>,
+    watch_state: Vec<String>,
+    library_roots: Vec<String>,
+    scan_reconcile_guards: Vec<String>,
+    scan_reconcile_items: Vec<String>,
+}
 
-    let dump = CatalogDump {
+async fn authoritative_dump(client: &hiqlite::Client) -> Result<CatalogTruthDump, StoreError> {
+    Ok(CatalogTruthDump {
         libraries: rows(
             client,
             "SELECT json_array(id, name, kind, paths, anime, created_at, \
@@ -222,6 +238,40 @@ pub(super) async fn local_catalog_digest(client: &hiqlite::Client) -> Result<Str
             client,
             "SELECT json_array(library_id, item_id) AS value \
              FROM scan_reconcile_items ORDER BY library_id, item_id",
+        )
+        .await?,
+    })
+}
+
+pub(super) async fn local_catalog_truth_digest(
+    client: &hiqlite::Client,
+) -> Result<String, StoreError> {
+    let bytes = serde_json::to_vec(&authoritative_dump(client).await?).map_err(database_error)?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+pub(super) async fn local_catalog_digest(client: &hiqlite::Client) -> Result<String, StoreError> {
+    let truth = authoritative_dump(client).await?;
+    let dump = CatalogDump {
+        libraries: truth.libraries,
+        items: truth.items,
+        files: truth.files,
+        watch_state: truth.watch_state,
+        library_roots: truth.library_roots,
+        scan_reconcile_guards: truth.scan_reconcile_guards,
+        scan_reconcile_items: truth.scan_reconcile_items,
+        fts_terms: rows(
+            client,
+            "SELECT json_array(term, doc, col, offset) AS value \
+             FROM items_fts_vocab ORDER BY term, doc, col, offset",
+        )
+        .await?,
+        fts_schema: rows(
+            client,
+            "SELECT json_array(name, type, sql) AS value FROM sqlite_master \
+             WHERE name IN ('items_fts','items_fts_vocab','items_fts_ai', \
+                            'items_fts_ad','items_fts_au','library_roots_paths_au') \
+             ORDER BY name",
         )
         .await?,
     };
