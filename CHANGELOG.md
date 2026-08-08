@@ -431,13 +431,17 @@ bump may break compatibility and a **patch** bump never does.
   end.** The AVPlayer end notification previously updated progress but only
   reached the view when autoplay was enabled, and no-next/autoplay-off titles
   left their cover open forever. Natural completion, manual Close/Menu, and
-  failure-screen Close now share one idempotent exit sequence: restore iPadOS
+  failure-screen Close now share one idempotent exit sequence: restore iOS
   status-bar/Home-indicator preferences, clear player overlays and pending
   timers, detach Picture in Picture and subtitle layers, remove observers and
   remote commands, release the AVPlayer item/audio session/HLS session, then
   dismiss on the following main-loop turn. Online episodic autoplay still
   swaps to a discovered next episode; offline playback and a missing successor
-  dismiss normally.
+  dismiss normally. An end notification with no catalog or item duration now
+  reopens the growing stream instead of treating a temporary playlist end as
+  proof that the title finished. Autoplay handoff keeps the audio session
+  active, teardown cannot re-create Picture in Picture or resurrect a stale
+  status poll, and the completion turn survives the coordinator being released.
 
 - **The full-screen iOS player now retires system chrome after its own
   overlays leave.** Noirr draws video with a custom `AVPlayerLayer`, so hiding
@@ -450,27 +454,26 @@ bump may break compatibility and a **patch** bump never does.
   and tvOS is unchanged. The physical-device checklist carries the remaining
   full-screen, Split View, Picture in Picture, and multitasking-control checks.
 
-- **iPad remux playback gets a larger server-side recovery margin.**
-  Two physical-device traces exposed the two margins the server had conflated.
-  First, AVPlayer fetched about 120 seconds ahead despite a 60-second
-  preference, so retaining only 120 seconds behind that frontier could move
-  the playlist boundary onto the playhead. Live retention is now 180 seconds:
-  the measured lead plus 30 seconds of back buffer and 30 seconds for
-  retry/reload. Second, build 36 proved that fixed time hysteresis can deadlock
-  even inside that retained window. The server suspended at its 180-second
-  ceiling; the iPad advanced only to 154 seconds ahead; and the producer stayed
-  held because its release was 150 seconds. AVPlayer polled the unchanged EVENT
-  playlist for 84 seconds, ran dry, waited 12.29 seconds, and reopened. Time
-  suspension now releases at the same 180-second ceiling that holds it, so one
-  whole-segment frontier advance immediately grants the next production
-  increment. This can yield one stop/start pair per segment near the ceiling,
-  but never one per poll because unchanged state emits no signal. Byte and
-  global disk limits still release at half. The status API and web/Apple
-  overlays show the active time release beside held sessions. The wider
-  retention grows the default per-session media span from about 300 to 360
-  seconds, so the 8 GiB global scratch cap may bind roughly one 4K stream
-  sooner. Regression tests pin the release boundary and the retained/pruned
-  segment set.
+- **HLS ahead-window holds keep the measured Apple runway and now explain
+  their active bound.** AVPlayer fetched about 120 seconds ahead despite a
+  60-second preference, so retaining only 120 seconds behind that frontier
+  could move the sliding playlist boundary onto the playhead. Live retention
+  is now 180 seconds: the measured lead plus 30 seconds of back buffer and 30
+  seconds for retry/reload. Time flow control still holds above 180 seconds and
+  releases at 150 seconds; byte and global scratch holds still release at half
+  their limits. A one-second time limit now releases at one second instead of
+  degenerating to a disabled zero threshold. Session status and the web/Apple
+  overlays identify `time`, per-session `bytes`, or `global` as the active hold
+  reason and show its matching release value. A real-segment regression proves
+  that a client frontier advance releases a held encoder, and a second test
+  pins the unchanged-state guard so playlist polls cannot re-signal ffmpeg or
+  reset the stall watchdog. This is not a structural escape when a client stops
+  fetching: already-published media remains available, and the producer may
+  remain held until the client advances. The observed iPad fetch-loop stop and
+  the EVENT-to-sliding-playlist transition remain device-capture questions, not
+  a server-threshold fix. The wider retention grows the default per-session
+  media span from about 300 to 360 seconds, so the 8 GiB global scratch cap may
+  bind roughly one 4K stream sooner.
 
 - **An Apple client that remains stuck buffering now recovers visibly and
   leaves evidence.** After a title has rendered for five seconds, a sustained

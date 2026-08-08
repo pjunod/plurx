@@ -311,6 +311,17 @@ struct PlayerOverlayVisibility: Equatable {
 enum PlayerNaturalEndAction: Equatable {
     case dismiss
     case findNext
+
+    @MainActor
+    func perform(
+        dismiss: () -> Void,
+        findNext: () -> Void
+    ) {
+        switch self {
+        case .dismiss: dismiss()
+        case .findNext: findNext()
+        }
+    }
 }
 
 /// Makes every exit from the full-screen player follow the same order:
@@ -324,7 +335,6 @@ final class PlayerLifecycleCoordinator: ObservableObject {
 
     private var didTeardown = false
     private var didFinish = false
-    private var finishTask: Task<Void, Never>?
 
     func teardown(_ cleanup: () -> Void) {
         guard !didTeardown else { return }
@@ -340,12 +350,11 @@ final class PlayerLifecycleCoordinator: ObservableObject {
         didFinish = true
         isTearingDown = true
         teardown(cleanup)
-        finishTask = Task { @MainActor [weak self] in
+        Task { @MainActor in
             await withCheckedContinuation {
                 (continuation: CheckedContinuation<Void, Never>) in
                 DispatchQueue.main.async { continuation.resume() }
             }
-            guard self != nil, !Task.isCancelled else { return }
             completion()
         }
     }
@@ -567,9 +576,24 @@ struct PlayerView: View {
             PlayerSurface(
                 player: controller.player,
                 pictureInPicture: pictureInPicture,
-                pgsOverlay: controller.pgsOverlayWindow
+                pgsOverlay: controller.pgsOverlayWindow,
+                allowsPictureInPicture: !lifecycle.isTearingDown
             )
                 .ignoresSafeArea()
+
+            #if os(tvOS)
+            if lifecycle.isTearingDown {
+                // Keep the presented cover in the focus system until the next
+                // main-loop turn dismisses it. Removing every focusable child
+                // first produces a transient "no focusable views" state.
+                Color.clear
+                    .contentShape(Rectangle())
+                    .ignoresSafeArea()
+                    .focusable()
+                    .focusEffectDisabled()
+                    .accessibilityHidden(true)
+            }
+            #endif
 
             if !lifecycle.isTearingDown {
                 #if os(tvOS)
@@ -690,14 +714,15 @@ struct PlayerView: View {
             #endif
         }
         .onDisappear {
-            lifecycle.teardown(teardownPlayback)
+            lifecycle.teardown { teardownPlayback() }
         }
         .task(id: autoHideGeneration) {
             guard Self.shouldAutoHideControls(
                 visible: controlsVisible,
                 scrubbing: isScrubbing,
                 changingStream: controller.isChangingStream,
-                optionMenuOpen: optionMenuOpen
+                optionMenuOpen: optionMenuOpen,
+                tearingDown: lifecycle.isTearingDown
             ) else { return }
             try? await Task.sleep(nanoseconds: Self.controlAutoHideDelayNanoseconds)
             guard !Task.isCancelled,
@@ -705,7 +730,8 @@ struct PlayerView: View {
                       visible: controlsVisible,
                       scrubbing: isScrubbing,
                       changingStream: controller.isChangingStream,
-                      optionMenuOpen: optionMenuOpen
+                      optionMenuOpen: optionMenuOpen,
+                      tearingDown: lifecycle.isTearingDown
                   ) else { return }
             hideControls()
         }
@@ -720,22 +746,12 @@ struct PlayerView: View {
                 autoplay: model.autoplay,
                 offline: offlineItem != nil
             ) else { return }
-            switch action {
-            case .dismiss:
-                finishPlayback()
-            case .findNext:
-                findingNext = true
-                nextEpisodeTask?.cancel()
-                nextEpisodeTask = Task {
-                    let next = await model.nextEpisode(after: itemId)
-                    guard !Task.isCancelled, !lifecycle.isTearingDown else { return }
-                    findingNext = false
-                    guard let next, let onPlayNext else {
-                        finishPlayback()
-                        return
-                    }
-                    finishPlayback { onPlayNext(next) }
-                }
+            // Leave the SwiftUI update transaction before publishing teardown
+            // state and replacing the AVPlayer item.
+            Task { @MainActor in
+                await Task.yield()
+                guard !lifecycle.isTearingDown else { return }
+                handleNaturalEnd(action)
             }
         }
         #if os(tvOS)
@@ -757,6 +773,26 @@ struct PlayerView: View {
             preferences: playerSystemOverlayPreferences
         ))
         #endif
+    }
+
+    private func handleNaturalEnd(_ action: PlayerNaturalEndAction) {
+        action.perform(
+            dismiss: { finishPlayback() },
+            findNext: {
+                findingNext = true
+                nextEpisodeTask?.cancel()
+                nextEpisodeTask = Task {
+                    let next = await model.nextEpisode(after: itemId)
+                    guard !Task.isCancelled, !lifecycle.isTearingDown else { return }
+                    findingNext = false
+                    guard let next, let onPlayNext else {
+                        finishPlayback()
+                        return
+                    }
+                    finishPlayback(continuingPlayback: true) { onPlayNext(next) }
+                }
+            }
+        )
     }
 
     private var playbackBannerMessage: String? {
@@ -805,9 +841,10 @@ struct PlayerView: View {
         visible: Bool,
         scrubbing: Bool,
         changingStream: Bool,
-        optionMenuOpen: Bool
+        optionMenuOpen: Bool,
+        tearingDown: Bool = false
     ) -> Bool {
-        visible && !scrubbing && !changingStream && !optionMenuOpen
+        visible && !scrubbing && !changingStream && !optionMenuOpen && !tearingDown
     }
 
     static func naturalEndAction(
@@ -822,8 +859,13 @@ struct PlayerView: View {
     /// The one teardown path for natural completion, manual Close/Menu, and
     /// fatal-screen exits. UI state goes first so iPadOS restores system chrome
     /// while the cover still exists; AVKit and transport resources go next.
-    private func finishPlayback(then completion: (@MainActor () -> Void)? = nil) {
-        lifecycle.finish(teardown: teardownPlayback) {
+    private func finishPlayback(
+        continuingPlayback: Bool = false,
+        then completion: (@MainActor () -> Void)? = nil
+    ) {
+        lifecycle.finish(teardown: {
+            teardownPlayback(deactivateAudioSession: !continuingPlayback)
+        }) {
             if let completion {
                 completion()
             } else {
@@ -832,7 +874,7 @@ struct PlayerView: View {
         }
     }
 
-    private func teardownPlayback() {
+    private func teardownPlayback(deactivateAudioSession: Bool = true) {
         let stoppedAt = controller.realPositionMs()
         nextEpisodeTask?.cancel()
         nextEpisodeTask = nil
@@ -844,7 +886,7 @@ struct PlayerView: View {
         activeOptionMenu = nil
         #endif
         pictureInPicture.detach()
-        controller.stop()
+        controller.stop(deactivateAudioSession: deactivateAudioSession)
         onPlaybackStopped?(stoppedAt)
     }
 
@@ -878,6 +920,7 @@ struct PlayerView: View {
     }
 
     private func restartAutoHideTimer() {
+        guard !lifecycle.isTearingDown else { return }
         autoHideGeneration &+= 1
     }
 
@@ -1973,9 +2016,7 @@ private struct PlaybackStatsView: View {
                 row("Encode speed", String(format: "%.2f×", speed))
             }
             if let ahead = status.aheadSeconds {
-                let release = (status.suspended ?? false)
-                    ? status.resumeBelowSeconds.map { " · time release ≤\($0) s" } ?? ""
-                    : ""
+                let release = holdReleaseDescription(status)
                 row("Server ahead", "\(max(0, ahead)) s\((status.suspended ?? false) ? " · held\(release)" : "")")
             }
             if let delivered = status.deliveredBps { row("Delivery rate", bitRate(delivered)) }
@@ -1987,6 +2028,20 @@ private struct PlaybackStatsView: View {
                 ? (controller.pgsOverlayStatus.label ?? "PGS overlay")
                 : (track.isNativeHLS ? "native WebVTT" : "burned in")
             row("Subtitles", (track.title ?? track.language?.uppercased() ?? "Track \(subtitle + 1)") + " · \(delivery)")
+        }
+    }
+
+    private func holdReleaseDescription(_ status: PlaybackSessionStatus) -> String {
+        guard status.suspended ?? false else { return "" }
+        switch status.holdReason {
+        case "time":
+            return status.resumeBelowSeconds.map { " · time release ≤\($0) s" } ?? ""
+        case "bytes":
+            return status.resumeBelowBytes.map { " · bytes release ≤\(byteCount($0))" } ?? ""
+        case "global":
+            return status.resumeBelowBytes.map { " · global release ≤\(byteCount($0))" } ?? ""
+        default:
+            return ""
         }
     }
 

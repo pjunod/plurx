@@ -171,6 +171,37 @@ Container Chromium without proprietary decoders remains useful as a negative
 control, not as 4K proof. [STUTTER-4K.md](STUTTER-4K.md#6-the-harnesses) records
 the scar: that browser cannot validate H.264, HEVC, or AAC.
 
+## Native Apple exits — prove teardown on the device that owns the chrome
+
+The simulator suite pins end classification, dismiss-vs-autoplay routing,
+idempotent teardown order, and completion delivery. Run both Apple targets
+before a source change lands:
+
+```bash
+xcodebuild test -project clients/apple/plurx.xcodeproj -scheme plurx-iOS \
+  -destination 'platform=iOS Simulator,name=iPad Pro 13-inch (M5)'
+xcodebuild test -project clients/apple/plurx.xcodeproj -scheme plurx-tvOS \
+  -destination 'platform=tvOS Simulator,name=Apple TV 4K (3rd generation)'
+```
+
+The simulator cannot prove system chrome, PiP, audio-session handoff, or tvOS
+focus. Build 37 therefore keeps this physical matrix as a release gate:
+
+| Scenario | Expected result | Evidence to record |
+|---|---|---|
+| Known duration · autoplay off | Natural end restores iOS chrome, releases the item/session, and dismisses once | End timestamp · detail screen visible · no player cover |
+| Unknown catalog duration · finite direct item | The item duration corroborates the end and dismissal follows the same path | Catalog duration is NULL · item duration · dismissal |
+| Unknown catalog and item duration · growing HLS | A temporary end reopens at the same film position; it never silently ejects the viewer | `knownDurationMs` · item duration · reopen position |
+| Autoplay on · successor exists | Episode N tears down once, keeps the audio session active, and episode N+1 attaches without another app sounding between them | Audio route log · successor first frame |
+| Autoplay on · no successor | The cover dismisses after teardown; “Up next” does not remain | Next lookup result · dismissal |
+| Manual Close/Menu and failure Close | Every exit restores chrome and releases observers, timers, PiP, overlays, player item, and HLS resources before dismissal | One stop callback · no live session |
+| PiP active at natural end | PiP stops and stays detached; SwiftUI does not construct a replacement controller during the dismissal turn | `attach`/`detach` breakpoint order |
+| tvOS controls hidden at natural end | The cover keeps a focusable sink until dismissal; the console has no “no focusable views” diagnostic | Focus log · DetailView focus target |
+
+Run the iPad cases in full screen and Split View, and the iPhone cases in
+portrait and landscape. A green simulator result is source evidence; this
+table is the platform evidence the release claim depends on.
+
 ## Add a regression without turning the suite into a junk drawer
 
 1. Reproduce the failure on a corpus fixture. If no fixture has the relevant

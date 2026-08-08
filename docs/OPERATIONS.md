@@ -355,13 +355,16 @@ which is not the same as ahead of what you are watching — a player fetches
 its whole forward buffer in advance, so the download frontier normally sits
 about a minute past the picture on screen. Everything plurx keeps and deletes
 is measured from that frontier with the difference allowed for, which is why
-segments survive roughly two minutes behind it rather than one.
+segments survive roughly three minutes behind it rather than one.
 
 The pause is real: at the buffer limit plurx sends the session's ffmpeg a
-`SIGSTOP` and resumes it with `SIGCONT` once you are within half the limit.
-`Settings → Activity` shows a held session, and the player's stats overlay
-(press `i`) says `held` beside how far ahead it is. A held session is healthy —
-it has built everything it is allowed to.
+`SIGSTOP`. The default time window holds above 180 seconds and resumes at 150
+seconds; per-session and global byte holds resume at half their limits.
+`Settings → Activity` and the player's stats overlay (press `i`) name the
+active `time`, `bytes`, or `global` reason and show its release value beside
+how far ahead the session is. A held session is normally healthy — it has built
+everything it is allowed to — but a `global` hold can remain until aggregate
+scratch across other sessions falls below its release point.
 
 ### Where the transcode scratch lives
 

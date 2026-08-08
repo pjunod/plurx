@@ -2529,6 +2529,13 @@ final class AppleClientTests: XCTestCase {
             changingStream: false,
             optionMenuOpen: false
         ))
+        XCTAssertFalse(PlayerView.shouldAutoHideControls(
+            visible: true,
+            scrubbing: false,
+            changingStream: false,
+            optionMenuOpen: false,
+            tearingDown: true
+        ))
     }
 
     func testPlaybackInfoStaysVisibleAfterControlsAutoHide() {
@@ -2564,6 +2571,53 @@ final class AppleClientTests: XCTestCase {
         ), .findNext)
     }
 
+    func testUnknownDurationEndReopensUntilAnEndIsCorroborated() {
+        XCTAssertEqual(PlayerController.endAction(
+            knownDurationMs: 0,
+            itemDurationMs: nil,
+            isGrowingPlaylist: true,
+            endedAt: 120_000
+        ), .reopen)
+        XCTAssertEqual(PlayerController.endAction(
+            knownDurationMs: 180_000,
+            itemDurationMs: nil,
+            isGrowingPlaylist: true,
+            endedAt: 120_000
+        ), .reopen)
+        XCTAssertEqual(PlayerController.endAction(
+            knownDurationMs: 0,
+            itemDurationMs: 180_000,
+            isGrowingPlaylist: true,
+            endedAt: 178_000
+        ), .reopen)
+        XCTAssertEqual(PlayerController.endAction(
+            knownDurationMs: 0,
+            itemDurationMs: 180_000,
+            isGrowingPlaylist: false,
+            endedAt: 178_000
+        ), .finish(durationMs: 180_000))
+        XCTAssertEqual(PlayerController.endAction(
+            knownDurationMs: 180_000,
+            itemDurationMs: nil,
+            isGrowingPlaylist: true,
+            endedAt: 178_000
+        ), .finish(durationMs: 180_000))
+    }
+
+    @MainActor
+    func testNaturalEndActionRoutesDismissAndAutoplay() {
+        var events: [String] = []
+        PlayerNaturalEndAction.dismiss.perform(
+            dismiss: { events.append("dismiss") },
+            findNext: { events.append("next") }
+        )
+        PlayerNaturalEndAction.findNext.perform(
+            dismiss: { events.append("dismiss") },
+            findNext: { events.append("next") }
+        )
+        XCTAssertEqual(events, ["dismiss", "next"])
+    }
+
     @MainActor
     func testPlayerFinishTearsDownBeforeDismissAndIsIdempotent() async {
         let lifecycle = PlayerLifecycleCoordinator()
@@ -2589,6 +2643,15 @@ final class AppleClientTests: XCTestCase {
         )
         lifecycle.teardown { events.append("disappear teardown") }
         XCTAssertEqual(events, ["teardown", "dismiss"])
+    }
+
+    @MainActor
+    func testPlayerFinishCompletionSurvivesCoordinatorRelease() async {
+        var lifecycle: PlayerLifecycleCoordinator? = PlayerLifecycleCoordinator()
+        let completed = expectation(description: "completion survives owner release")
+        lifecycle?.finish(teardown: {}, completion: { completed.fulfill() })
+        lifecycle = nil
+        await fulfillment(of: [completed], timeout: 1)
     }
 
     @MainActor

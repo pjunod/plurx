@@ -470,22 +470,27 @@ Three details, each load-bearing:
   An ffmpeg older than 5.1 has neither flag and falls back to `-re`.
 - **The ahead-window suspend.** Once a session is more than
   `playback.hls_ahead_max_secs` (default 180 s) of content ahead of the last
-  segment the client fetched, the reaper SIGSTOPs its ffmpeg. A later media
-  fetch that brings the reserve back to that same ceiling SIGCONTs it, so the
-  client's demand immediately earns the next production increment. A lower
-  fixed release point failed on the physical iPad: AVPlayer stopped at 154 s
-  ahead while the server required 150 s, then polled the unchanged EVENT
-  playlist for 84 s until playback ran dry and reopened. Matching the release
-  to the ceiling can produce one stop/start pair per client segment near the
-  boundary, but the state guard prevents signals on mere playlist polls. Byte
-  and global disk limits still release at half because those are hard capacity
-  bounds. Session status reports
-  `resume_below_seconds`, which the web and Apple overlays show beside a held
+  segment the client fetched, the request-side flow controller SIGSTOPs its
+  ffmpeg. A later media fetch that brings the reserve to 150 s or less
+  SIGCONTs it; the 30-second gap prevents a fast encoder from toggling once per
+  segment near the ceiling. Byte and global disk limits release at half because
+  those are hard capacity bounds. The 15-second reaper is a repair pass for a
+  producer nobody is requesting from, not the normal trigger. Session status
+  reports the active hold as `time`, per-session `bytes`, or `global`, plus the
+  matching release value; the web and Apple overlays show both beside a held
   session. This is the bound `-re` used to provide, minus the part where `-re`
   also capped the buffer. A stopped process costs nothing, resumes instantly,
   and — unlike a rate limit — adapts to a viewer who pauses. SIGKILL works on a
   stopped process, so the idle reaper and the admin stop button need no special
   case.
+
+  A hold is not proof that the producer starved the client. Ahead media is
+  already published in the served playlist. If AVPlayer stops fetching while
+  that reserve remains available, changing the release point produces more
+  media the client is still declining to request. The observed iPad fetch-loop
+  stop therefore remains open pending a device capture of `loadedTimeRanges`,
+  access-log segment counts, and the playlist header across the internal
+  EVENT-to-sliding-window transition.
 
 **Seek and audio-switch stay on this path.** A copy-HLS session sets
 `PLAYER.method = 'remux'` (honest — no video re-encode) and `PLAYER.copyHls =
@@ -706,8 +711,10 @@ covering the other.
   300 s span (+20%). The 8 GiB global scratch cap is unchanged, continues to
   release at half, and can therefore bind roughly one 4K session sooner; it
   may keep a producer held until client frontiers advance. Session status
-  exposes `resume_below_seconds`, and the web and Apple overlays show it while
-  a session is held so that state is distinguishable from an encoder stall.
+  exposes the active `hold_reason` plus `resume_below_seconds` or
+  `resume_below_bytes`, and the web and Apple overlays show the matching value
+  while a session is held so that state is distinguishable from an encoder
+  stall.
   Once the reaper removes an older prefix, the client
   playlist advances `MEDIA-SEQUENCE` and stops advertising those files. The
   internal index retains duration-only history for native subtitle timing;

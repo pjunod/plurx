@@ -128,9 +128,11 @@ that documented window rather than a bare constant.
 
 The review's note that the 15 s reaper is too coarse to be the primary flow
 controller is accepted in principle; the shipped hysteresis (resume at half
-the window) makes the coarseness mostly harmless, but moving the suspend
-decision onto segment-completion and frontier-advance events is cheap and
-lands with the same correction pass.
+the window at this review's cut) made the coarseness mostly harmless. The
+implemented request path now re-evaluates on playlist/index refresh and client
+frontier advance. No producer-side segment-completion callback exists; the 15 s
+reaper remains the repair path that bounds that gap, and current documentation
+states that limitation explicitly.
 
 ## 4. R9 — adopted; the race is real and narrow
 
@@ -267,9 +269,10 @@ two flagged as the operator's call:
    value requires M0 evidence that byte targeting, not browser quota, is the
    binding limit (recorded runway plateau without `BUFFER_FULL_ERROR`).
 2. **Server ahead policy:** referenced to the *fetched frontier*, named as
-   such. Media-time window 180 s high / 90 s low from `EXTINF` sums; byte
+   such. Media-time window 180 s high / 150 s low from `EXTINF` sums; byte
    ceiling settings-backed (default 2 GB/session), suspend on either bound,
-   resume when both are below low-water.
+   resume when every active bound is below its low-water. Per-session and
+   global byte limits release at half; status names which reason is binding.
 3. **Playlist/GC contract:** EVENT with documented expiring URIs; retained
    window sized from client back-buffer plus retry allowance; acceptance is
    surviving playlist reload and forced retry after GC on all three client
