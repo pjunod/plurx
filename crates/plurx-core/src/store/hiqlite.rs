@@ -1,9 +1,9 @@
-//! The first replicated store slice: settings and authentication state.
+//! The complete replicated durable-store backend.
 //!
-//! This module intentionally implements only [`SettingsStore`], [`UserStore`],
-//! and [`ApiKeyStore`]. SQLite remains the daemon's complete [`Store`](super::Store)
-//! until the later M1 slices port every remaining trait. The narrow type keeps
-//! that boundary honest: it cannot be placed behind `Arc<dyn Store>` yet.
+//! The trait implementations are split across this module and the sibling
+//! catalogue, media, and durable modules. SQLite remains the daemon's selected
+//! [`Store`](super::Store) until M2 imports existing state and activates this
+//! backend; backend completeness alone is not permission to skip that gate.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -80,7 +80,7 @@ impl ClusterCompatibility {
     };
 }
 
-/// A hiqlite client restricted to the first replicated Store slice.
+/// A hiqlite client implementing the complete replicated [`Store`](super::Store).
 #[derive(Clone)]
 pub struct HiqliteAuthStore {
     pub(super) client: Client,
@@ -88,7 +88,8 @@ pub struct HiqliteAuthStore {
 }
 
 impl HiqliteAuthStore {
-    /// Create the M1b schema on a fresh cluster and seed its logical identity.
+    /// Create the complete durable schema on a fresh cluster and seed its
+    /// logical identity.
     ///
     /// Only the bootstrap coordinator calls this. Other voters call [`open`]
     /// after the acknowledged schema write has replicated.
