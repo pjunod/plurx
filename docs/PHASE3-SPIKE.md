@@ -84,11 +84,20 @@ and raises only `quick-xml` to 0.41, the first version patched for
 [RUSTSEC-2026-0195](https://rustsec.org/advisories/RUSTSEC-2026-0195.html).
 No RustSec ignore was added.
 
-The earlier record incorrectly called `rkyv` 0.7.46 advisory-affected. It is
-the first patched 0.7 release for
-[RUSTSEC-2026-0001](https://rustsec.org/advisories/RUSTSEC-2026-0001.html), and
-[RUSTSEC-2026-0122](https://rustsec.org/advisories/RUSTSEC-2026-0122.html)
-explicitly marks every version below 0.8 unaffected.
+`rkyv` 0.7.46 fixed
+[RUSTSEC-2026-0001](https://rustsec.org/advisories/RUSTSEC-2026-0001.html),
+and versions below 0.8 were unaffected by
+[RUSTSEC-2026-0122](https://rustsec.org/advisories/RUSTSEC-2026-0122.html).
+That did not make 0.7 safe indefinitely: the later
+[RUSTSEC-2026-0235](https://rustsec.org/advisories/RUSTSEC-2026-0235.html)
+affects the 0.7 series and is patched only in rkyv 0.8.17 or newer.
+
+The affected edge is `rust_decimal`'s optional rkyv integration. Hiqlite does
+not enable it, but Cargo still records it in the root lockfile. The audited
+workspace therefore vendors `rust_decimal` 1.42.1 and removes only that
+dormant integration; compiled decimal behavior is unchanged and no RustSec
+ignore was added. The standalone M0 lockfile retains the registry package and
+remains semantic evidence only, never a release dependency.
 
 | Contract | Observed result |
 |---|---|

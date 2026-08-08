@@ -261,6 +261,7 @@ contract = "Three voters converge on one settings, user, token, and API-key stat
 paths = [
   "crates/plurx-cluster-check/**",
   "crates/plurx-core/src/store/hiqlite.rs",
+  "vendor/rust_decimal/**",
   "vendor/s3-simple/**",
 ]
 checks = ["rust-gate", "cluster-auth"]
