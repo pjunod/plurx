@@ -7,6 +7,7 @@ members = [
     "crates/plurx-pgs",
     "crates/plurxd",
 ]
+exclude = ["vendor/rust_decimal", "vendor/s3-simple"]
 
 [workspace.package]
 # One version for the whole workspace: the crates are not published separately,
@@ -81,9 +82,9 @@ unwrap_used = "warn"
 lto = "thin"
 strip = "symbols"
 
-# Keep hiqlite's unused optional dependency edges out of the audited shipping
-# lockfile without RustSec exceptions. Each vendor directory documents its
-# upstream source and exact patch.
+# Patch hiqlite's unused optional dependency edges without advisory ignores.
+# Path packages are skipped by cargo-audit, so rust-audit.yml also scans a
+# synthesized registry-provenance lockfile built by scripts/vendor-audit-lock.
 [patch.crates-io]
 s3-simple = { path = "vendor/s3-simple" }
 rust_decimal = { path = "vendor/rust_decimal" }

@@ -2188,11 +2188,13 @@ name = "plurx-cluster-check"
 version = "0.2.7"
 dependencies = [
  "anyhow",
+ "hex",
  "hiqlite",
  "plurx-core",
  "rustls",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "tokio",
 ]

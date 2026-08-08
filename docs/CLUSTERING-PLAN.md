@@ -386,7 +386,8 @@ Land schema/protocol election guards and quorum-aware `/readyz` here.
 
 **Acceptance:** writes through every node produce byte-identical table dumps
 on all replicas; kill leader and follower in separate runs; acknowledged
-writes survive; an older-schema voter refuses migration and cannot lead.
+writes survive; an older-schema process fails the remote preflight. M3 owns
+making that preflight an enforced gate on real membership and elections.
 
 **Backend slice delivered 2026-08-07; daemon activation remains open.**
 `HiqliteAuthStore` implements the 23 settings, user/token, and API-key methods
@@ -395,11 +396,16 @@ decoding. `make cluster-check` starts three separate voter processes, drives
 the lifecycle through every node, compares SHA-256 digests of ordered local
 table dumps, kills a follower and leader in fresh runs, and proves both
 acknowledged-write survival and no-quorum readiness failure. A remote
-schema/protocol preflight runs before a voter starts, so an incompatible
-process neither migrates nor participates in an election.
+schema/protocol preflight rejects an incompatible client before it starts a
+voter. The M1b harness does not dynamically add that process to membership;
+M3 must place this preflight in the join/start coordinator and prove a rejected
+node never appears in `voter_ids()`.
 
-This type intentionally cannot satisfy the complete `Store` trait yet, and
-`plurxd` therefore still drives `/readyz` through SQLite. The hiqlite
+This type intentionally cannot satisfy the complete `Store` trait yet. Its
+dependency is behind the `hiqlite-store` feature, enabled only by the cluster
+harness, so the ordinary daemon dependency closure remains unchanged until
+the full M1d/M2 activation. `plurxd` therefore still drives `/readyz` through
+SQLite. The hiqlite
 `SettingsStore::ping` is quorum-aware and is the route's eventual backend, but
 claiming the production route before the remaining store composition lands
 would create a hybrid source of truth. Full daemon activation stays with the
