@@ -9,7 +9,7 @@ The implementation history, deployment evidence, and resolved copied-Dolby-
 Vision investigation are recorded in
 [APPLE-NATIVE-SUBTITLES-HANDOFF.md](APPLE-NATIVE-SUBTITLES-HANDOFF.md).
 
-> Status (2026-08-06): source is v0.2.7, Apple build 32. Native text
+> Status (2026-08-08): source is v0.2.7, Apple build 36. Native text
 > subtitles, the cinematic detail surface, stable seek/recovery, truthful
 > delivered-range badges, and app-managed offline viewing on iPhone/iPad have
 > landed. The default-off `pgs-v1` overlay client is staged but is not a
@@ -17,7 +17,7 @@ Vision investigation are recorded in
 > Vision was resolved on the physical Apple TV 2026-08-03; the historical
 > `-12927` investigation is superseded by
 > [APPLE-NATIVE-SUBTITLES-HANDOFF.md](APPLE-NATIVE-SUBTITLES-HANDOFF.md)'s
-> resolved status. Repository evidence still says build 32 has not reached
+> resolved status. Repository evidence still says build 36 has not reached
 > TestFlight and the deployment ledger still ends at server `787eaa6`, so
 > publishing plus the broader real-hardware/offline matrix remain release
 > gates.
@@ -47,7 +47,7 @@ Vision investigation are recorded in
 | Home and browse | Hubs, libraries, hierarchy | Hubs, libraries, show → season → episode; sort and watch-status filters, with containers classified from the server's `rollup`; hubs/libraries/Coming Soon fetched in parallel, shelves and library pages published as they arrive, spinner only over an empty screen, and a refresh on player dismissal and on `scenePhase == .active` | Denser iPad/tvOS layouts; a device pass on very large libraries |
 | Search | Global search | Native API-backed search | Improve keyboard, history, and tvOS focus polish |
 | Playback decision | Runtime caps, server delivery plan | Runtime VideoToolbox/display caps; executes `delivery` | Real-device codec/HDR matrix, especially Dolby Vision profiles |
-| Transport | Play/pause, ±10, full seek | Explicit play/pause, ±10, full-film slider; HLS seeks reopen at the film position; a seek or track change issued during a stream change is queued and replayed once, last writer wins, instead of being dropped | Device-verify hammered tvOS step-seeks during a quality change, and long transcodes |
+| Transport | Play/pause, ±10, full seek | Explicit play/pause, ±10, full-film slider; HLS seeks reopen at the film position; a seek or track change issued during a stream change is queued and replayed once, last writer wins, instead of being dropped. In a full-screen iOS window, the status bar and Home indicator stay while any player overlay is visible and retire after the last one leaves; windowed iPad status bars remain system-owned. | Device-verify iPad full-screen/Split View chrome, iPhone portrait/landscape, PiP return, hammered tvOS step-seeks during a quality change, and long transcodes |
 | iOS Now Playing | Not applicable | Known duration, elapsed time, pause/play/seek commands, `isLiveStream = false` | Add artwork and series/episode metadata |
 | Audio tracks | Select and restart when needed | Select and restart at the same position | Add friendlier channel/codec labels; validate TrueHD/DTS fallback |
 | Subtitles | Text WebVTT stays client-side; bitmap tracks burn in | SRT/SubRip/WebVTT use native HLS renditions, chosen by the server's `native` flag rather than a local codec guess; PGS can use the staged default-off `pgs-v1` overlay while VobSub, `mov_text`, and styled ASS/SSA retain burn-in; automatic selection never starts a burn except a forced track (see §2) | Physically verify native selection and the gated PGS overlay across iPhone/iPad and Apple TV |
