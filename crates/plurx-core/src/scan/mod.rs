@@ -16,11 +16,12 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 use crate::domain::{Item, ItemKind, Library, LibraryKind, NewItem};
 use crate::error::StoreError;
-use crate::store::Store;
+use crate::store::{ReconcileOutcome, RootFingerprintStatus, Store};
 
 /// Container extensions we treat as playable video.
 const VIDEO_EXTS: &[&str] = &[
@@ -294,8 +295,58 @@ pub async fn scan_library_with_progress(
     library: &Library,
     progress: Option<&ScanProgress>,
 ) -> Result<ScanReport, StoreError> {
+    scan_library_with_progress_and_prune_percent(
+        store,
+        library,
+        progress,
+        crate::config::DEFAULT_SCAN_PRUNE_PERCENT,
+    )
+    .await
+}
+
+/// Scan with a deletion ceiling expressed as a share of the library's known
+/// files. Integer division rounds down so the configured percentage is a hard
+/// ceiling; zero disables automatic removal.
+pub async fn scan_library_with_progress_and_prune_percent(
+    store: &dyn Store,
+    library: &Library,
+    progress: Option<&ScanProgress>,
+    prune_percent: u8,
+) -> Result<ScanReport, StoreError> {
+    let known = store.library_file_paths(library.id).await?.len() as u64;
+    let percent = u64::from(prune_percent.min(100));
+    let prune_limit = if percent == 0 || known == 0 {
+        0
+    } else {
+        known.saturating_mul(percent) / 100
+    };
+    scan_library_with_progress_and_prune_limit(store, library, progress, prune_limit).await
+}
+
+/// Cluster-ready scan entry point. `prune_limit` is the maximum number of
+/// known file rows one completed walk may remove. A stale-but-present mount
+/// therefore cannot turn one bad view of shared storage into an unbounded
+/// cluster-wide delete.
+pub async fn scan_library_with_progress_and_prune_limit(
+    store: &dyn Store,
+    library: &Library,
+    progress: Option<&ScanProgress>,
+    prune_limit: u64,
+) -> Result<ScanReport, StoreError> {
     let mut report = ScanReport::default();
     let mut seen: HashSet<String> = HashSet::new();
+    // Capture the configured path-set identity before walking. A root that
+    // vanishes mid-scan must produce one bounded refusal, not a successful
+    // walk followed by a fatal error and an immediate full retry.
+    let fingerprint = match library_root_fingerprint(&library.paths) {
+        Ok(fingerprint) => Some(fingerprint),
+        Err(error) => {
+            report.note(format!(
+                "vanished-file cleanup skipped: library root identity could not be read: {error}"
+            ));
+            None
+        }
+    };
 
     // Collect candidate files first (cheap, synchronous), then process each.
     // A root that is missing or unreadable is a loud, actionable problem — the
@@ -382,15 +433,98 @@ pub async fn scan_library_with_progress(
     // library's records over a transient mount problem.
     if walk_errors == 0 {
         let known = store.library_file_paths(library.id).await?;
+        let known_count = known.len();
         let gone: Vec<i64> = known
             .into_iter()
             .filter(|(_, p)| !seen.contains(&p.to_string_lossy().into_owned()))
             .map(|(id, _)| id)
             .collect();
-        if !gone.is_empty() {
-            report.removed_files = store.delete_files(&gone).await? as usize;
+        let Some(fingerprint) = fingerprint else {
+            report.errors += 1;
+            report.note(
+                "vanished-file cleanup skipped because the root identity was unavailable"
+                    .to_owned(),
+            );
+            report.seal_problems();
+            return Ok(report);
+        };
+        let root_status = store
+            .ensure_library_root_fingerprint(
+                library.id,
+                &fingerprint,
+                known_count == 0 || (!seen.is_empty() && (gone.len() as u64) <= prune_limit),
+            )
+            .await?;
+        match root_status {
+            RootFingerprintStatus::Established | RootFingerprintStatus::Matched => {
+                match store
+                    .reconcile_library(library.id, &fingerprint, &gone, prune_limit)
+                    .await?
+                {
+                    ReconcileOutcome::Applied {
+                        deleted_files,
+                        pruned_items,
+                    } => {
+                        report.removed_files = deleted_files as usize;
+                        report.pruned_items = pruned_items as usize;
+                    }
+                    ReconcileOutcome::RefusedRoot { expected } => {
+                        report.errors += 1;
+                        tracing::error!(
+                            library = %library.name,
+                            expected,
+                            observed = %fingerprint,
+                            "library root identity changed during reconciliation"
+                        );
+                        report.note(
+                            "vanished-file cleanup skipped: this node's mounted media root \
+                             does not match the library identity recorded by the cluster"
+                                .to_owned(),
+                        );
+                    }
+                    ReconcileOutcome::RefusedPrune { requested, limit } => {
+                        report.errors += 1;
+                        tracing::error!(
+                            library = %library.name,
+                            requested,
+                            limit,
+                            "library reconciliation exceeded its prune bound"
+                        );
+                        report.note(format!(
+                            "vanished-file cleanup skipped: this scan would remove {requested} \
+                             files, above the configured limit of {limit}"
+                        ));
+                    }
+                }
+            }
+            RootFingerprintStatus::Mismatch { expected } => {
+                report.errors += 1;
+                tracing::error!(
+                    library = %library.name,
+                    expected,
+                    observed = %fingerprint,
+                    "library root identity does not match cluster truth"
+                );
+                report.note(
+                    "vanished-file cleanup skipped: this node's mounted media root does not \
+                     match the library identity recorded by the cluster"
+                        .to_owned(),
+                );
+            }
+            RootFingerprintStatus::Unestablished => {
+                report.errors += 1;
+                tracing::error!(
+                    library = %library.name,
+                    observed = %fingerprint,
+                    "refusing to trust an empty first observation of an existing library"
+                );
+                report.note(
+                    "vanished-file cleanup skipped: this existing library has no recorded root \
+                     identity and the scan saw no media; verify the mount and scan again"
+                        .to_owned(),
+                );
+            }
         }
-        report.pruned_items = store.prune_empty_items(library.id).await? as usize;
     } else {
         report.note(
             "vanished-file cleanup skipped: some library paths were missing or unreadable, \
@@ -433,6 +567,33 @@ pub async fn scan_library_with_progress(
         tracing::warn!(library = %library.name, "scan problem: {problem}");
     }
     Ok(report)
+}
+
+/// Stable identity for the configured root set.
+///
+/// The canonical path prevents two differently configured mount points from
+/// being treated as one. It deliberately omits filesystem-local inode/device
+/// identity because those values are not stable across voters for the same
+/// network export. Replacement storage mounted at the same path is therefore
+/// guarded by the independent prune bound.
+pub fn library_root_fingerprint(paths: &[std::path::PathBuf]) -> Result<String, StoreError> {
+    let mut roots = Vec::with_capacity(paths.len());
+    for path in paths {
+        let canonical = path.canonicalize().map_err(|error| {
+            StoreError::Task(format!(
+                "cannot fingerprint library root `{}`: {error}",
+                path.display()
+            ))
+        })?;
+        roots.push(canonical.to_string_lossy().into_owned());
+    }
+    roots.sort();
+    let mut digest = Sha256::new();
+    for root in roots {
+        digest.update((root.len() as u64).to_be_bytes());
+        digest.update(root.as_bytes());
+    }
+    Ok(hex::encode(digest.finalize()))
 }
 
 /// What a targeted scan produced.
@@ -1243,7 +1404,9 @@ mod tests {
 
         // Delete one file, rescan: file removed and its movie pruned.
         std::fs::remove_file(dir.path().join("Heat (1995).mkv")).expect("rm");
-        let r = scan_library(&store, &lib).await.expect("rescan2");
+        let r = scan_library_with_progress_and_prune_limit(&store, &lib, None, 1)
+            .await
+            .expect("rescan2");
         assert_eq!(r.removed_files, 1);
         assert_eq!(r.pruned_items, 1);
         let page = store
@@ -1252,6 +1415,65 @@ mod tests {
             .expect("list");
         assert_eq!(page.total, 1);
         assert_eq!(page.items[0].title, "The Matrix");
+    }
+
+    #[tokio::test]
+    async fn a_scan_above_its_prune_bound_commits_no_delete() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        let dir = tempfile::tempdir().expect("tmp");
+        let path = write_fake_video(dir.path(), "Heat (1995).mkv").await;
+        let lib = movie_library(&store, dir.path()).await;
+        scan_library(&store, &lib).await.expect("initial scan");
+        let file_id = store.library_file_paths(lib.id).await.expect("file paths")[0].0;
+
+        std::fs::remove_file(&path).expect("remove source");
+        let report = scan_library_with_progress_and_prune_limit(&store, &lib, None, 0)
+            .await
+            .expect("bounded scan");
+        assert_eq!(report.removed_files, 0);
+        assert_eq!(report.pruned_items, 0);
+        assert_eq!(report.errors, 1);
+        assert!(report
+            .problems
+            .iter()
+            .any(|problem| problem.contains("configured limit of 0")));
+        assert!(store.get_file(file_id).await.expect("kept row").is_some());
+    }
+
+    #[tokio::test]
+    async fn a_different_present_root_commits_no_delete() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        let original = tempfile::tempdir().expect("original root");
+        let replacement = tempfile::tempdir().expect("replacement root");
+        write_fake_video(original.path(), "Heat (1995).mkv").await;
+        let lib = movie_library(&store, original.path()).await;
+        scan_library(&store, &lib).await.expect("initial scan");
+        let file_id = store.library_file_paths(lib.id).await.expect("file paths")[0].0;
+        let replacement_library = store
+            .update_library(
+                lib.id,
+                &NewLibrary {
+                    name: lib.name.clone(),
+                    kind: lib.kind,
+                    paths: vec![replacement.path().to_path_buf()],
+                    anime: lib.anime,
+                },
+            )
+            .await
+            .expect("update root")
+            .expect("library");
+
+        let report = scan_library(&store, &replacement_library)
+            .await
+            .expect("stale-root scan");
+        assert_eq!(report.removed_files, 0);
+        assert_eq!(report.pruned_items, 0);
+        assert_eq!(report.errors, 1);
+        assert!(report
+            .problems
+            .iter()
+            .any(|problem| problem.contains("no recorded root identity")));
+        assert!(store.get_file(file_id).await.expect("kept row").is_some());
     }
 
     #[tokio::test]
@@ -1275,7 +1497,9 @@ mod tests {
         // The root vanishes (unmounted NAS / wrong container path). The scan
         // must say so loudly — and must NOT delete the known files.
         drop(dir);
-        let r = scan_library(&store, &lib).await.expect("rescan");
+        let r = scan_library_with_progress_and_prune_limit(&store, &lib, None, 1)
+            .await
+            .expect("rescan");
         assert_eq!(r.errors, 1);
         assert!(
             r.problems.iter().any(|p| p.contains("does not exist")),
@@ -1654,7 +1878,9 @@ mod tests {
         assert_eq!(scan_library(&store, &lib).await.expect("scan").added, 1);
 
         std::fs::remove_file(dir.path().join("2019/Summer/Beach Trip/clip.mp4")).expect("rm");
-        let r = scan_library(&store, &lib).await.expect("rescan");
+        let r = scan_library_with_progress_and_prune_limit(&store, &lib, None, 1)
+            .await
+            .expect("rescan");
         assert_eq!(r.removed_files, 1);
         assert_eq!(
             r.pruned_items, 4,

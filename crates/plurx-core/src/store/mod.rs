@@ -16,6 +16,10 @@ mod sqlite;
 
 #[cfg(feature = "hiqlite-store")]
 mod hiqlite;
+#[cfg(feature = "hiqlite-store")]
+mod hiqlite_catalog;
+#[cfg(feature = "hiqlite-store")]
+mod hiqlite_media;
 
 pub mod replicated;
 
@@ -515,9 +519,55 @@ pub trait MediaStore: Send + Sync + 'static {
     ) -> Result<Vec<MediaFile>, StoreError>;
     /// All known file paths in a library (for vanished-file detection).
     async fn library_file_paths(&self, library_id: i64) -> Result<Vec<(i64, PathBuf)>, StoreError>;
+    /// Establish the stable identity of the mounted roots for this library,
+    /// or compare a later scanner's observation with cluster truth.
+    async fn ensure_library_root_fingerprint(
+        &self,
+        library_id: i64,
+        fingerprint: &str,
+        allow_establish: bool,
+    ) -> Result<RootFingerprintStatus, StoreError>;
+    /// Forget a library's recorded root identity after an operator has
+    /// verified a deliberate mount/path replacement.
+    async fn reset_library_root_fingerprint(&self, library_id: i64) -> Result<bool, StoreError>;
+    /// Recreate the derived full-text index from authoritative item rows.
+    async fn rebuild_search_index(&self) -> Result<u64, StoreError>;
+    /// Atomically remove vanished files and their empty item hierarchy only
+    /// when the scanner sees the expected roots and stays within its deletion
+    /// budget. This is the M1c publication boundary; M4 adds its lease fence.
+    async fn reconcile_library(
+        &self,
+        library_id: i64,
+        root_fingerprint: &str,
+        gone_file_ids: &[i64],
+        prune_limit: u64,
+    ) -> Result<ReconcileOutcome, StoreError>;
     async fn delete_files(&self, ids: &[i64]) -> Result<u64, StoreError>;
     /// Remove items left childless/file-less after a scan. Returns rows removed.
     async fn prune_empty_items(&self, library_id: i64) -> Result<u64, StoreError>;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RootFingerprintStatus {
+    Established,
+    Matched,
+    Unestablished,
+    Mismatch { expected: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReconcileOutcome {
+    Applied {
+        deleted_files: u64,
+        pruned_items: u64,
+    },
+    RefusedRoot {
+        expected: String,
+    },
+    RefusedPrune {
+        requested: u64,
+        limit: u64,
+    },
 }
 
 #[async_trait]

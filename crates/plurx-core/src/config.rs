@@ -16,6 +16,8 @@ pub const DEFAULT_PORT: u16 = 32400;
 pub const DEFAULT_RAFT_PORT: u16 = 32401;
 /// Default authenticated node-to-node API port.
 pub const DEFAULT_CLUSTER_API_PORT: u16 = 32402;
+/// Maximum share of a library that one complete scan may remove.
+pub const DEFAULT_SCAN_PRUNE_PERCENT: u8 = 10;
 
 const DEFAULT_CONFIG_PATHS: &[&str] = &["plurx.toml", "/etc/plurx/plurx.toml"];
 
@@ -52,12 +54,16 @@ impl Default for ServerConfig {
 pub struct StorageConfig {
     /// Directory for the database and caches. Created if missing.
     pub data_dir: PathBuf,
+    /// Refuse vanished-file reconciliation above this percentage of the
+    /// library's known files. `0` disables automatic deletion.
+    pub scan_prune_percent: u8,
 }
 
 impl Default for StorageConfig {
     fn default() -> Self {
         StorageConfig {
             data_dir: PathBuf::from("./data"),
+            scan_prune_percent: DEFAULT_SCAN_PRUNE_PERCENT,
         }
     }
 }
@@ -114,6 +120,12 @@ impl Config {
             },
         };
         config.apply_env()?;
+        if config.storage.scan_prune_percent > 100 {
+            return Err(ConfigError::Value {
+                key: "storage.scan_prune_percent".to_owned(),
+                message: "must be between 0 and 100".to_owned(),
+            });
+        }
         Ok(config)
     }
 
@@ -141,6 +153,12 @@ impl Config {
         if let Some(dir) = env_var("PLURX_DATA_DIR") {
             self.storage.data_dir = PathBuf::from(dir);
         }
+        if let Some(value) = env_var("PLURX_SCAN_PRUNE_PERCENT") {
+            self.storage.scan_prune_percent = value.parse().map_err(|_| ConfigError::Env {
+                var: "PLURX_SCAN_PRUNE_PERCENT".to_owned(),
+                message: format!("`{value}` is not an integer from 0 through 100"),
+            })?;
+        }
         Ok(())
     }
 }
@@ -159,6 +177,10 @@ mod tests {
         assert_eq!(config.server.bind.port(), DEFAULT_PORT);
         assert_eq!(config.server.name, "plurx");
         assert_eq!(config.storage.data_dir, PathBuf::from("./data"));
+        assert_eq!(
+            config.storage.scan_prune_percent,
+            DEFAULT_SCAN_PRUNE_PERCENT
+        );
         assert_eq!(config.cluster.raft_bind.port(), DEFAULT_RAFT_PORT);
         assert_eq!(config.cluster.api_bind.port(), DEFAULT_CLUSTER_API_PORT);
     }
@@ -215,6 +237,17 @@ mod tests {
         assert!(matches!(
             Config::load(Some(Path::new("/nonexistent/plurx.toml"))),
             Err(ConfigError::Read { .. })
+        ));
+    }
+
+    #[test]
+    fn scan_prune_percentage_is_bounded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("plurx.toml");
+        std::fs::write(&path, "[storage]\nscan_prune_percent = 101\n").expect("write config");
+        assert!(matches!(
+            Config::load(Some(&path)),
+            Err(ConfigError::Value { key, .. }) if key == "storage.scan_prune_percent"
         ));
     }
 }
