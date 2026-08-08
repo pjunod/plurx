@@ -14,7 +14,7 @@ use plurx_core::domain::{
     NewLibrary, NewOfflinePackage, OfflineCreateOutcome, OfflineLeaseOutcome, ProbeResult,
     TraktAuth,
 };
-use plurx_core::store::{OutboxEntry, SqliteStore, Store};
+use plurx_core::store::{OutboxEntry, ReconcileOutcome, RootFingerprintStatus, SqliteStore, Store};
 
 const SETTINGS_METHODS: &[&str] = &["ping", "get_setting", "put_setting", "instance_id"];
 const USER_METHODS: &[&str] = &[
@@ -76,6 +76,10 @@ const MEDIA_METHODS: &[&str] = &[
     "merge_file_probe_chapters",
     "files_missing_probe",
     "library_file_paths",
+    "ensure_library_root_fingerprint",
+    "reset_library_root_fingerprint",
+    "rebuild_search_index",
+    "reconcile_library",
     "delete_files",
     "prune_empty_items",
 ];
@@ -205,7 +209,7 @@ fn contract_inventory_matches_every_store_method() {
     .copied()
     .collect::<BTreeSet<_>>();
 
-    assert_eq!(declared.len(), 114, "review the M1a method count");
+    assert_eq!(declared.len(), 118, "review the M1a method count");
     assert_eq!(
         covered, declared,
         "the declared async method name inventory changed"
@@ -829,12 +833,79 @@ async fn media_contract_runs_through_dyn_store() {
 
         assert_eq!(
             store
-                .delete_files(&[empty_file])
+                .ensure_library_root_fingerprint(movies.id, "contract-root", true)
                 .await
-                .expect("delete files"),
-            1
+                .expect("establish root"),
+            RootFingerprintStatus::Established
         );
-        assert!(store.prune_empty_items(movies.id).await.expect("prune") >= 1);
+        assert_eq!(
+            store
+                .ensure_library_root_fingerprint(movies.id, "contract-root", true)
+                .await
+                .expect("match root"),
+            RootFingerprintStatus::Matched
+        );
+        assert!(matches!(
+            store
+                .reconcile_library(movies.id, "stale-root", &[empty_file], 1)
+                .await
+                .expect("reject root"),
+            ReconcileOutcome::RefusedRoot { .. }
+        ));
+        assert!(store
+            .get_file(empty_file)
+            .await
+            .expect("kept file")
+            .is_some());
+        assert_eq!(
+            store
+                .reconcile_library(movies.id, "contract-root", &[empty_file], 0)
+                .await
+                .expect("reject bound"),
+            ReconcileOutcome::RefusedPrune {
+                requested: 1,
+                limit: 0
+            }
+        );
+        assert!(store
+            .get_file(empty_file)
+            .await
+            .expect("kept file")
+            .is_some());
+        assert!(matches!(
+            store
+                .reconcile_library(movies.id, "contract-root", &[empty_file], 1)
+                .await
+                .expect("bounded reconcile"),
+            ReconcileOutcome::Applied {
+                deleted_files: 1,
+                pruned_items: 1..
+            }
+        ));
+        assert!(store
+            .reset_library_root_fingerprint(movies.id)
+            .await
+            .expect("reset root"));
+        assert_eq!(
+            store
+                .ensure_library_root_fingerprint(movies.id, "contract-root", false)
+                .await
+                .expect("refuse empty root establishment"),
+            RootFingerprintStatus::Unestablished
+        );
+        assert_eq!(
+            store
+                .ensure_library_root_fingerprint(movies.id, "contract-root", true)
+                .await
+                .expect("re-establish root"),
+            RootFingerprintStatus::Established
+        );
+        assert!(store.rebuild_search_index().await.expect("rebuild search") > 0);
+        assert_eq!(store.delete_files(&[]).await.expect("empty delete"), 0);
+        let _ = store
+            .prune_empty_items(movies.id)
+            .await
+            .expect("legacy prune");
         assert!(store
             .get_file(episode_file)
             .await

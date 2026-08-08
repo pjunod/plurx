@@ -2191,6 +2191,7 @@ dependencies = [
  "hex",
  "hiqlite",
  "plurx-core",
+ "rusqlite",
  "rustls",
  "serde",
  "serde_json",

@@ -1,4 +1,4 @@
-//! Separate-process M1b cluster validation.
+//! Separate-process M1b/M1c cluster validation.
 //!
 //! hiqlite owns process-global listener and shutdown state, so an in-process
 //! three-client test cannot prove process loss. The controller starts this
@@ -14,8 +14,12 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use hiqlite::tls::ServerTlsConfig;
 use hiqlite::{Client, Node, NodeConfig};
+use plurx_core::domain::{
+    ItemKind, ItemSort, LibraryKind, MetadataPatch, NewItem, NewLibrary, ProbeResult,
+};
 use plurx_core::store::{
-    ApiKeyStore, ClusterCompatibility, HiqliteAuthStore, SettingsStore, UserStore,
+    ApiKeyStore, ClusterCompatibility, HiqliteAuthStore, LibraryStore, MediaStore,
+    ReconcileOutcome, RootFingerprintStatus, SettingsStore, UserStore, WatchStore,
     AUTH_PROTOCOL_VERSION, AUTH_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
@@ -56,7 +60,7 @@ async fn controller() -> Result<()> {
     run_failure_case(FailureTarget::Follower).await?;
     println!("cluster-check: leader loss");
     run_failure_case(FailureTarget::Leader).await?;
-    println!("cluster-check: all M1b failure contracts passed");
+    println!("cluster-check: all M1b/M1c failure contracts passed");
     Ok(())
 }
 
@@ -90,6 +94,10 @@ async fn run_failure_case(target: FailureTarget) -> Result<()> {
             .require_ok()?;
     }
     cluster.wait_for_equal_dumps().await?;
+    let catalog = cluster.wait_for_equal_catalog_views().await?;
+    if matches!(target, FailureTarget::Follower) {
+        prove_local_fts_rebuild(&mut cluster, &catalog).await?;
+    }
 
     let leader = cluster.leader().await?;
     let target_id = match target {
@@ -141,6 +149,7 @@ async fn run_failure_case(target: FailureTarget) -> Result<()> {
             bail!("ordinary store operation succeeded without quorum: {response:?}");
         }
     }
+    cluster.assert_running().await?;
 
     cluster.kill_all().await;
     Ok(())
@@ -175,6 +184,8 @@ enum Request {
     PostLossWrite { target: String },
     VerifyProof,
     Dump,
+    CatalogView,
+    RebuildSearch,
     Metrics,
     Ping,
     ReadWithoutQuorum,
@@ -191,6 +202,9 @@ enum Response {
         digest: String,
         dump: String,
     },
+    CatalogView {
+        view: CatalogView,
+    },
     Metrics {
         leader: Option<u64>,
         voters: Vec<u64>,
@@ -198,6 +212,13 @@ enum Response {
     Error {
         message: String,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct CatalogView {
+    authoritative_digest: String,
+    full_digest: String,
+    search: Vec<i64>,
 }
 
 impl Response {
@@ -276,6 +297,7 @@ impl NodeProcess {
 
 struct ClusterProcesses {
     nodes: Vec<Option<NodeProcess>>,
+    root: PathBuf,
 }
 
 impl ClusterProcesses {
@@ -290,7 +312,10 @@ impl ClusterProcesses {
             };
             nodes.push(Some(NodeProcess::spawn(&executable, &launch)?));
         }
-        let mut cluster = Self { nodes };
+        let mut cluster = Self {
+            nodes,
+            root: root.to_path_buf(),
+        };
         for node_id in 1..=specs.len() as u64 {
             cluster.node_mut(node_id)?.wait_ready().await?;
         }
@@ -326,6 +351,15 @@ impl ClusterProcesses {
             }
             *node = None;
         }
+    }
+
+    async fn assert_running(&mut self) -> Result<()> {
+        for node in self.nodes.iter_mut().flatten() {
+            if let Some(status) = node.child.try_wait()? {
+                bail!("voter {} exited unexpectedly with {status}", node.id);
+            }
+        }
+        Ok(())
     }
 
     async fn leader(&mut self) -> Result<u64> {
@@ -418,6 +452,73 @@ impl ClusterProcesses {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
+
+    async fn wait_for_equal_catalog_views(&mut self) -> Result<CatalogView> {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let mut views = Vec::new();
+            for node_id in 1..=self.nodes.len() as u64 {
+                match self.request(node_id, Request::CatalogView).await? {
+                    Response::CatalogView { view } => views.push(view),
+                    Response::Error { message } => return Err(anyhow!(message)),
+                    response => bail!("unexpected catalog response: {response:?}"),
+                }
+            }
+            if views.windows(2).all(|pair| pair[0] == pair[1]) {
+                return views
+                    .into_iter()
+                    .next()
+                    .context("catalog view set was empty");
+            }
+            if Instant::now() >= deadline {
+                bail!("browse/search views did not converge on all three voters");
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+}
+
+async fn prove_local_fts_rebuild(
+    cluster: &mut ClusterProcesses,
+    baseline: &CatalogView,
+) -> Result<()> {
+    let path = cluster
+        .root
+        .join("node-2")
+        .join("state_machine")
+        .join("db")
+        .join("auth.db");
+    let connection = rusqlite::Connection::open_with_flags(
+        &path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("open voter-2 local database at {}", path.display()))?;
+    connection
+        .busy_timeout(Duration::from_secs(5))
+        .context("set voter-2 validation busy timeout")?;
+    connection
+        .execute("DELETE FROM items_fts", [])
+        .context("delete voter-2 derived FTS rows")?;
+    let empty = match cluster.request(2, Request::CatalogView).await? {
+        Response::CatalogView { view } => view,
+        response => bail!("unexpected post-delete catalog response: {response:?}"),
+    };
+    if empty.authoritative_digest != baseline.authoritative_digest
+        || empty.full_digest == baseline.full_digest
+        || !empty.search.is_empty()
+    {
+        bail!("deleting voter-2 FTS changed truth, escaped the digest, or left search rows");
+    }
+    drop(connection);
+    cluster
+        .request(1, Request::RebuildSearch)
+        .await?
+        .require_ok()?;
+    let rebuilt = cluster.wait_for_equal_catalog_views().await?;
+    if &rebuilt != baseline {
+        bail!("voter-2 FTS rebuild did not restore the baseline view");
+    }
+    Ok(())
 }
 
 async fn start_cluster_with_port_retry(root: &Path) -> Result<(ClusterProcesses, Vec<NodeSpec>)> {
@@ -611,6 +712,13 @@ async fn handle_request(
                 dump: store.validation_local_dump().await?,
             })
         }
+        Request::CatalogView => Ok(Response::CatalogView {
+            view: catalog_view(store_ref(store)?).await?,
+        }),
+        Request::RebuildSearch => {
+            store_ref(store)?.rebuild_search_index().await?;
+            Ok(Response::Ok)
+        }
         Request::Metrics => {
             let metrics = client.metrics_db().await?;
             let mut voters = metrics.membership_config.voter_ids().collect::<Vec<_>>();
@@ -794,7 +902,136 @@ async fn exercise(store: &HiqliteAuthStore, ordinal: u64) -> Result<()> {
     {
         bail!("API key deletion failed");
     }
+
+    let library = store
+        .create_library(&NewLibrary {
+            name: format!("Cluster Movies {suffix}"),
+            kind: LibraryKind::Movies,
+            paths: vec![PathBuf::from(format!("/cluster/media/{suffix}"))],
+            anime: false,
+        })
+        .await?;
+    let movie = store
+        .insert_item(&NewItem {
+            library_id: library.id,
+            kind: ItemKind::Movie,
+            parent_id: None,
+            title: format!("Replicated Catalog Proof {suffix}"),
+            year: Some(2000 + ordinal as i32),
+            season_number: None,
+            episode_number: None,
+        })
+        .await?;
+    store
+        .apply_metadata(
+            movie,
+            &MetadataPatch {
+                overview: Some(format!("replicated browse search voter {suffix}")),
+                genres: Some(vec!["Science Fiction".to_owned()]),
+                enriched: true,
+                ..MetadataPatch::default()
+            },
+        )
+        .await?;
+    let file = store
+        .upsert_file(
+            movie,
+            &format!("/cluster/media/{suffix}/proof-{suffix}.mkv"),
+            1_000 + ordinal as i64,
+            1_700_000_000 + ordinal as i64,
+            &ProbeResult {
+                duration_ms: Some(120_000),
+                container: Some("mkv".to_owned()),
+                video_codec: Some("hevc".to_owned()),
+                width: Some(3840),
+                height: Some(2160),
+                raw_json: Some(format!(r#"{{"voter":{ordinal}}}"#)),
+                ..ProbeResult::default()
+            },
+        )
+        .await?;
+    let fingerprint = format!("root-fingerprint-{suffix}");
+    if store
+        .ensure_library_root_fingerprint(library.id, &fingerprint, true)
+        .await?
+        != RootFingerprintStatus::Established
+    {
+        bail!("new library root fingerprint was not established");
+    }
+    if !matches!(
+        store
+            .reconcile_library(library.id, "stale-root", &[file], 1)
+            .await?,
+        ReconcileOutcome::RefusedRoot { .. }
+    ) || store.get_file(file).await?.is_none()
+    {
+        bail!("stale-root reconciliation committed a prune");
+    }
+    if store
+        .reconcile_library(library.id, &fingerprint, &[file], 0)
+        .await?
+        != (ReconcileOutcome::RefusedPrune {
+            requested: 1,
+            limit: 0,
+        })
+        || store.get_file(file).await?.is_none()
+    {
+        bail!("over-budget reconciliation committed a prune");
+    }
+    let disposable_item = store
+        .insert_item(&NewItem {
+            library_id: library.id,
+            kind: ItemKind::Movie,
+            parent_id: None,
+            title: format!("Disposable Search Trigger Proof {suffix}"),
+            year: None,
+            season_number: None,
+            episode_number: None,
+        })
+        .await?;
+    let disposable_file = store
+        .upsert_file(
+            disposable_item,
+            &format!("/cluster/media/{suffix}/disposable-{suffix}.mkv"),
+            42,
+            1_700_000_100 + ordinal as i64,
+            &ProbeResult::default(),
+        )
+        .await?;
+    if !matches!(
+        store
+            .reconcile_library(library.id, &fingerprint, &[disposable_file], 1)
+            .await?,
+        ReconcileOutcome::Applied {
+            deleted_files: 1,
+            pruned_items: 1
+        }
+    ) || store.get_item(disposable_item).await?.is_some()
+    {
+        bail!("item deletion did not remove the file/item through the FTS trigger");
+    }
+    let state = store
+        .put_progress(user.id, movie, 30_000, Some(10_000))
+        .await?;
+    if state.position_ms != 30_000 || state.duration_ms != Some(120_000) || state.watched {
+        bail!("replicated watch progress did not prefer the probed duration");
+    }
     Ok(())
+}
+
+async fn catalog_view(store: &HiqliteAuthStore) -> Result<CatalogView> {
+    let mut search = store
+        .search_items("replicated browse", 100)
+        .await?
+        .into_iter()
+        .map(|row| row.item.id)
+        .collect::<Vec<_>>();
+    search.sort_unstable();
+    Ok(CatalogView {
+        authoritative_digest: store.validation_local_catalog_truth_digest().await?,
+        full_digest: store.local_dump_digest().await?,
+        search,
+    })
 }
 
 async fn verify_proof(store: &HiqliteAuthStore) -> Result<()> {
@@ -827,6 +1064,27 @@ async fn verify_proof(store: &HiqliteAuthStore) -> Result<()> {
         {
             bail!("lost acknowledged API key from node {ordinal}");
         }
+        let library = store
+            .list_libraries()
+            .await?
+            .into_iter()
+            .find(|library| library.name == format!("Cluster Movies {suffix}"))
+            .with_context(|| format!("lost acknowledged library from node {ordinal}"))?;
+        let page = store
+            .list_top_items(library.id, ItemSort::Title, 0, 10)
+            .await?;
+        if page.items.len() != 1
+            || store.files_for_item(page.items[0].id).await?.len() != 1
+            || store
+                .watch_state(user.id, page.items[0].id)
+                .await?
+                .is_none()
+        {
+            bail!("lost acknowledged media/watch state from node {ordinal}");
+        }
+    }
+    if catalog_view(store).await?.search.len() != 3 {
+        bail!("lost local FTS search rows after voter loss");
     }
     Ok(())
 }
