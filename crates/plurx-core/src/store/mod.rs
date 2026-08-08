@@ -16,6 +16,7 @@ mod sqlite;
 
 mod hiqlite;
 mod hiqlite_catalog;
+mod hiqlite_durable;
 mod hiqlite_media;
 
 pub mod replicated;

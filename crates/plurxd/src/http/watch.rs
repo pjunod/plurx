@@ -43,10 +43,23 @@ pub async fn progress(
         .await?
         .map(|w| w.watched)
         .unwrap_or(false);
-    let watch = state
-        .store
-        .put_progress_at(user.id, id, position, req.duration_ms, req.recorded_at)
-        .await?;
+    let watch = if req.recorded_at.is_some() {
+        // Imported/offline facts carry their own ordering clock and are rare,
+        // semantically complete writes rather than an active player's beat.
+        state
+            .store
+            .put_progress_at(user.id, id, position, req.duration_ms, req.recorded_at)
+            .await?
+    } else {
+        let update = state
+            .progress
+            .put(user.id, id, position, req.duration_ms)
+            .await?;
+        if !update.committed {
+            tracing::trace!(user_id = user.id, item_id = id, "coalesced progress beat");
+        }
+        update.watch
+    };
     let applied = req.recorded_at.is_none_or(|at| at >= watch.updated_at);
     // This beat is also the heartbeat for a direct play (`crate::delivery`).
     // It is the only signal that reaches the server from a player which has

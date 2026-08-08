@@ -11,6 +11,7 @@ mod pgs_overlay;
 mod pipeprobe;
 mod playstart;
 mod produce;
+mod progress;
 mod progressive;
 mod schedule;
 mod state;

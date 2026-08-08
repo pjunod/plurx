@@ -19,8 +19,8 @@ use super::{keys, ApiKeyStore, SettingsStore, UserStore};
 use crate::domain::{ApiKey, User};
 use crate::error::StoreError;
 
-pub const AUTH_SCHEMA_VERSION: i64 = 2;
-pub const AUTH_PROTOCOL_VERSION: i64 = 2;
+pub const AUTH_SCHEMA_VERSION: i64 = 3;
+pub const AUTH_PROTOCOL_VERSION: i64 = 3;
 
 const READY_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -99,6 +99,7 @@ impl HiqliteAuthStore {
             result.map_err(database_error)?;
         }
         super::hiqlite_catalog::install_schema(&client).await?;
+        super::hiqlite_durable::install_schema(&client).await?;
 
         let store = Self::with_clock(client, Arc::new(SystemClock));
         let now = store.now()?;
@@ -157,6 +158,7 @@ impl HiqliteAuthStore {
     pub async fn local_dump_digest(&self) -> Result<String, StoreError> {
         let dump = AuthStoreDump {
             catalog_digest: super::hiqlite_catalog::local_catalog_digest(&self.client).await?,
+            durable_digest: super::hiqlite_durable::local_durable_digest(&self.client).await?,
             cluster_meta: self
                 .client
                 .query_map(
@@ -681,6 +683,7 @@ fn verify_compatibility_rows(
 #[derive(Serialize)]
 struct AuthStoreDump {
     catalog_digest: String,
+    durable_digest: String,
     cluster_meta: Vec<ClusterMetaDumpRow>,
     settings: Vec<SettingDumpRow>,
     users: Vec<UserDumpRow>,

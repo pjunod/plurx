@@ -257,11 +257,12 @@ depends_on = ["core.media"]
 [[points]]
 id = "cluster.auth"
 title = "Replicated durable state"
-contract = "Three voters converge on settings, authentication, catalogue, watch, and root-safety state; local FTS rebuilds from replicated items, quorum loss fails readiness, and incompatible voters cannot participate."
+contract = "Three voters converge on settings, authentication, catalogue, watch, Trakt/outbox, cache, offline, and root-safety state; node-local paths stay owned, local FTS rebuilds from replicated items, quorum loss fails readiness, and incompatible voters cannot participate."
 paths = [
   "crates/plurx-cluster-check/**",
   "crates/plurx-core/src/store/hiqlite.rs",
   "crates/plurx-core/src/store/hiqlite_catalog.rs",
+  "crates/plurx-core/src/store/hiqlite_durable.rs",
   "crates/plurx-core/src/store/hiqlite_media.rs",
   "vendor/rust_decimal/**",
   "vendor/s3-simple/**",
@@ -368,7 +369,7 @@ contract = "Progress, watched state, and Trakt synchronization converge without 
 paths = [
   "crates/plurx-core/src/store/sqlite/{outbox,trakt,watch}.rs",
   "crates/plurx-core/src/trakt.rs",
-  "crates/plurxd/src/{trakt,watched}.rs",
+  "crates/plurxd/src/{progress,trakt,watched}.rs",
   "crates/plurxd/src/http/{trakt,watch}.rs",
 ]
 checks = ["rust-gate", "user-journey"]
