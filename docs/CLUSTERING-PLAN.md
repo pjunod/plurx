@@ -1,9 +1,10 @@
 # Clustering transition — from one plurxd node to Phase 4
 
-**Status:** revised after [CLUSTERING-PLAN-REVIEW.md](CLUSTERING-PLAN-REVIEW.md)
+**Status:** executing — M0 and M1a merged; M1b's auth-store backend and
+failure gate implemented, daemon activation still pending
 · **Executes:** Phase 4 from [ROADMAP.md](ROADMAP.md) and REQ-HA-1–6 from
 [REQUIREMENTS.md](REQUIREMENTS.md) · **Written:** 2026-08-06 · **Revised:**
-2026-08-06
+2026-08-07
 
 Companion to [PHASE3-SPIKE.md](PHASE3-SPIKE.md), which chose hiqlite and
 proved restart-at-boundary media behavior; [PERF-PLAN.md](PERF-PLAN.md) §7,
@@ -50,9 +51,13 @@ quietly wider threshold.
 | Artwork/cache bytes | Rows may replicate while bytes are local. | Missing bytes proxy to a holder and enqueue local repair; a replicated filename is not proof of a local file. |
 | Discovery | mDNS/GDM derive hostname and service name from shared identity/name. | Advertise each node under a node-specific hostname with one logical id and the full node list. |
 
-What does not exist yet: a hiqlite dependency, cluster configuration, local
-node identity, membership/join flow, transactional fencing, replicated session
-ownership, quorum self-fencing, or client failover.
+M0 now provides tolerated cluster configuration and local node identity; M1a
+provides the full backend-neutral parity inventory; and the first M1b slice
+provides a production-resolved hiqlite auth/settings backend plus a
+three-process failure harness. The daemon still opens the complete SQLite
+store. Membership/join, full-store activation, transactional fencing,
+replicated session ownership, serving self-fencing, and client failover do not
+exist yet.
 
 ## 3. Contracts — safety lives in signatures and transactions
 
@@ -334,6 +339,10 @@ import from a second process beside the server.
 
 ### 6.1 M0 — identity compatibility, dependency proof, and baselines
 
+**Delivered 2026-08-07.** PRs 82–83 establish the identity, semantic spike,
+cost record, replicated-SQL guardrails, and 114-method parity inventory this
+plan requires.
+
 Add the default-empty tolerated cluster section, `ClusterIdentity`, and
 crash-safe `node.id` seeding. Keep `SqliteStore` in production. Isolate
 hiqlite 0.14 in a non-shipping spike crate and prove FTS5/triggers,
@@ -350,6 +359,9 @@ inside `[cluster]` while the existing unknown-key rejection for `[server]`
 continues to pass.
 
 ### 6.2 M1a — add backend parity before porting a backend
+
+**Delivered 2026-08-07.** The `store_contract` inventory and
+`store::replicated` policies are the executable port boundary.
 
 Add a parallel store contract suite behind an `Arc<dyn Store>` harness while
 SQLite is the only implementation; retain the deeper SQLite-specific tests.
@@ -374,7 +386,30 @@ Land schema/protocol election guards and quorum-aware `/readyz` here.
 
 **Acceptance:** writes through every node produce byte-identical table dumps
 on all replicas; kill leader and follower in separate runs; acknowledged
-writes survive; an older-schema voter refuses migration and cannot lead.
+writes survive; an older-schema process fails the remote preflight. M3 owns
+making that preflight an enforced gate on real membership and elections.
+
+**Backend slice delivered 2026-08-07; daemon activation remains open.**
+`HiqliteAuthStore` implements the 23 settings, user/token, and API-key methods
+with bound timestamps, `RETURNING` ids, consistent reads, and fail-closed scope
+decoding. `make cluster-check` starts three separate voter processes, drives
+the lifecycle through every node, compares SHA-256 digests of ordered local
+table dumps, kills a follower and leader in fresh runs, and proves both
+acknowledged-write survival and no-quorum readiness failure. A remote
+schema/protocol preflight rejects an incompatible client before it starts a
+voter. The M1b harness does not dynamically add that process to membership;
+M3 must place this preflight in the join/start coordinator and prove a rejected
+node never appears in `voter_ids()`.
+
+This type intentionally cannot satisfy the complete `Store` trait yet. Its
+dependency is behind the `hiqlite-store` feature, enabled only by the cluster
+harness, so the ordinary daemon dependency closure remains unchanged until
+the full M1d/M2 activation. `plurxd` therefore still drives `/readyz` through
+SQLite. The hiqlite
+`SettingsStore::ping` is quorum-aware and is the route's eventual backend, but
+claiming the production route before the remaining store composition lands
+would create a hybrid source of truth. Full daemon activation stays with the
+M1d/M2 switch.
 
 ### 6.4 M1c — media plus node-local FTS
 
@@ -494,13 +529,13 @@ mode without lowering quality or losing selected tracks.
 6. **Do not call a VIP the failover implementation.** A VIP locates a process;
    replicated state, fencing, and takeover let it continue the film.
 
-## 8. Handoff checkpoint — M0 is documentation-compatible, not data-empty
+## 8. Handoff checkpoint — M1b has failure evidence, not daemon activation
 
-Start M0 on `main` with identity seeding, the tolerated empty config section,
-the feature-gated hiqlite semantic spike, and the single-node baselines. Do not
-change the production store. The populated identity fixture is mandatory:
-empty data directories cannot expose the cache/offline ownership failure this
-slice exists to prevent.
+M0 and M1a are on `main`; M1b's first backend slice is now reviewable. Keep
+SQLite as the daemon's complete store until every trait has one replicated
+implementation and the import gate is ready. The next implementation boundary
+is M1c libraries/media/watch plus node-local FTS, media-root identity, and the
+stale-root prune fence.
 
 ```bash
 make check                    # M0 and every milestone: repository baseline

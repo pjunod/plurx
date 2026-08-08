@@ -144,6 +144,22 @@ jobs:
       - name: Run the three-voter semantic proof
         run: make hiqlite-spike
 
+  cluster_auth:
+    name: hiqlite M1b auth failover
+    needs: [scope, preflight]
+    if: needs.scope.outputs.docs_only != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: hiqlite-cluster-auth
+      - name: Run separate-process replica and failure contracts
+        run: make cluster-check
+
   web_layout:
     name: web layout and accessibility
     needs: [scope, preflight]
@@ -405,6 +421,8 @@ jobs:
       - scope
       - preflight
       - check
+      - hiqlite_spike
+      - cluster_auth
       - web_layout
       - android_jvm
       - apple
@@ -418,6 +436,8 @@ jobs:
           SCOPE_RESULT: ${{ needs.scope.result }}
           PREFLIGHT_RESULT: ${{ needs.preflight.result }}
           CHECK_RESULT: ${{ needs.check.result }}
+          HIQLITE_SPIKE_RESULT: ${{ needs.hiqlite_spike.result }}
+          CLUSTER_AUTH_RESULT: ${{ needs.cluster_auth.result }}
           WEB_LAYOUT_RESULT: ${{ needs.web_layout.result }}
           ANDROID_JVM_RESULT: ${{ needs.android_jvm.result }}
           APPLE_RESULT: ${{ needs.apple.result }}
@@ -427,6 +447,7 @@ jobs:
         run: |
           for result in \
             "$SCOPE_RESULT" "$PREFLIGHT_RESULT" "$CHECK_RESULT" \
+            "$HIQLITE_SPIKE_RESULT" "$CLUSTER_AUTH_RESULT" \
             "$WEB_LAYOUT_RESULT" \
             "$ANDROID_JVM_RESULT" "$APPLE_RESULT" "$ANDROID_DEVICE_RESULT" \
             "$BUILD_RESULT" "$DOCKER_RESULT"; do

@@ -2,10 +2,12 @@
 resolver = "2"
 members = [
     "crates/plurx-core",
+    "crates/plurx-cluster-check",
     "crates/plurx-compat-plex",
     "crates/plurx-pgs",
     "crates/plurxd",
 ]
+exclude = ["vendor/rust_decimal", "vendor/s3-simple"]
 
 [workspace.package]
 # One version for the whole workspace: the crates are not published separately,
@@ -24,9 +26,10 @@ tower-http = { version = "0.6", features = ["trace"] }
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "time", "sync", "process", "io-util", "fs"] }
 async-trait = "0.1"
-# Storage (SQLite remains the only production dependency in M0; the hiqlite
-# proof has an isolated non-shipping manifest under spikes/)
+# Storage. SQLite remains the production default through M1; the M1b hiqlite
+# backend is deliberately partial until every Store trait is ported.
 rusqlite = { version = "0.40", features = ["bundled"] }
+hiqlite = { version = "=0.14.0", default-features = false, features = ["macros", "sqlite"] }
 # Serialization / config
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -78,3 +81,10 @@ unwrap_used = "warn"
 [profile.release]
 lto = "thin"
 strip = "symbols"
+
+# Patch hiqlite's unused optional dependency edges without advisory ignores.
+# Path packages are skipped by cargo-audit, so rust-audit.yml also scans a
+# synthesized registry-provenance lockfile built by scripts/vendor-audit-lock.
+[patch.crates-io]
+s3-simple = { path = "vendor/s3-simple" }
+rust_decimal = { path = "vendor/rust_decimal" }

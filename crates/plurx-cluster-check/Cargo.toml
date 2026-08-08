@@ -1,0 +1,22 @@
+[package]
+name = "plurx-cluster-check"
+description = "separate-process clustering failure harness"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+hiqlite = { workspace = true }
+hex = { workspace = true }
+plurx-core = { path = "../plurx-core", features = ["hiqlite-store"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

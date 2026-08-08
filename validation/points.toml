@@ -19,6 +19,7 @@ audit_paths = [
   "scripts/**",
   "tests/**",
   "validation/**",
+  "vendor/**",
 ]
 audit_exclude = []
 
@@ -162,6 +163,16 @@ missing = "fail"
 timeout_seconds = 300
 
 [[checks]]
+id = "cluster-auth"
+title = "Three-voter replicated settings and authentication failure contract"
+command = "make cluster-check"
+profiles = ["commit", "ci", "full", "nightly"]
+platforms = ["darwin", "linux"]
+requires = ["cargo", "make"]
+missing = "fail"
+timeout_seconds = 600
+
+[[checks]]
 id = "offline-contract"
 title = "Offline package persistence, ownership, lease, and media boundary"
 command = "cargo test -p plurx-core store::sqlite::offline -- --nocapture && cargo test -p plurx-core v14_offline -- --nocapture && cargo test -p plurxd offline -- --nocapture"
@@ -244,6 +255,20 @@ checks = ["rust-gate", "database-upgrades"]
 depends_on = ["core.media"]
 
 [[points]]
+id = "cluster.auth"
+title = "Replicated settings and authentication state"
+contract = "Three voters converge on one settings, user, token, and API-key state; quorum loss fails readiness and incompatible schema clients fail preflight."
+paths = [
+  "crates/plurx-cluster-check/**",
+  "crates/plurx-core/src/store/hiqlite.rs",
+  "scripts/vendor-audit-lock",
+  "vendor/rust_decimal/**",
+  "vendor/s3-simple/**",
+]
+checks = ["rust-gate", "cluster-auth"]
+depends_on = ["core.media", "identity.access"]
+
+[[points]]
 id = "server.api"
 title = "Native server API and runtime"
 contract = "The single server binary exposes stable native endpoints and coordinates background work safely."
@@ -304,6 +329,7 @@ contract = "Only authenticated users can cross protected API and media boundarie
 paths = [
   "crates/plurx-core/src/auth.rs",
   "crates/plurx-core/src/store/sqlite/{apikeys,users}.rs",
+  "crates/plurx-core/src/store/hiqlite.rs",
   "crates/plurxd/src/http/{auth,keys,users}.rs",
   "docs/SECURITY.md",
 ]

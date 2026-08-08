@@ -138,6 +138,11 @@ class OperationsContractCase(unittest.TestCase):
         self.assertIn("if: needs.scope.outputs.docs_only != 'true'", workflow)
         self.assertIn("needs: [scope, preflight]", workflow)
         self.assertIn("PREFLIGHT_RESULT: ${{ needs.preflight.result }}", workflow)
+        self.assertIn("HIQLITE_SPIKE_RESULT: ${{ needs.hiqlite_spike.result }}", workflow)
+        self.assertIn("CLUSTER_AUTH_RESULT: ${{ needs.cluster_auth.result }}", workflow)
+        pr_gate = workflow.split("  pr_gate:", 1)[1]
+        self.assertIn("      - hiqlite_spike", pr_gate)
+        self.assertIn("      - cluster_auth", pr_gate)
         self.assertIn("needs: scope", workflow)
         self.assertNotIn("github.event_name == 'pull_request' && github.ref == 'refs/heads/main'", workflow)
 
