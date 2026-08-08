@@ -427,6 +427,16 @@ bump may break compatibility and a **patch** bump never does.
 
 ### Fixed
 
+- **An Apple client that remains stuck buffering now recovers visibly and
+  leaves evidence.** After a title has rendered for five seconds, a sustained
+  AVPlayer buffer wait gets one reconnect of the exact same delivery; an
+  immediate repeat stops with connection-specific copy instead of mentioning
+  a format switch that never happened. Cold-start waits remain outside the
+  watchdog so a server filling its first HLS publish window cannot trigger a
+  duplicate session. Each recovery reports its delivery method, film
+  position, and measured stall duration through the bounded client log, while
+  buffering remains ineligible for the HDR/codec fallback ladder.
+
 - **A cache budget sweep can no longer delete a film while somebody is
   watching it.** Finished pre-transcodes now carry process-local read
   ownership from the cache lookup through the HLS session's lifetime. LRU,

@@ -176,6 +176,13 @@ test = "clients/apple/Tests/AppleClientTests.swift"
 test_anchor = "testApplePlayerFallsBackFromDolbyVisionToHDRBeforeSDR"
 
 [[decisions]]
+id = "apple.buffering-recovery"
+source = "clients/apple/Sources/PlayerController.swift"
+source_anchor = "struct PlaybackRecoveryMonitor: Equatable"
+test = "clients/apple/Tests/AppleClientTests.swift"
+test_anchor = "testBufferingWaitHasAnIndependentBoundedRecoveryTimer"
+
+[[decisions]]
 id = "apple.pgs-overlay"
 source = "clients/apple/Sources/PlayerController.swift"
 source_anchor = "static func subtitleUsesOverlay("
