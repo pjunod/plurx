@@ -19,8 +19,8 @@ use super::{keys, ApiKeyStore, SettingsStore, UserStore};
 use crate::domain::{ApiKey, User};
 use crate::error::StoreError;
 
-pub const AUTH_SCHEMA_VERSION: i64 = 1;
-pub const AUTH_PROTOCOL_VERSION: i64 = 1;
+pub const AUTH_SCHEMA_VERSION: i64 = 2;
+pub const AUTH_PROTOCOL_VERSION: i64 = 2;
 
 const READY_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -83,7 +83,7 @@ impl ClusterCompatibility {
 /// A hiqlite client restricted to the first replicated Store slice.
 #[derive(Clone)]
 pub struct HiqliteAuthStore {
-    client: Client,
+    pub(super) client: Client,
     clock: Arc<dyn Clock>,
 }
 
@@ -98,6 +98,7 @@ impl HiqliteAuthStore {
         for result in results {
             result.map_err(database_error)?;
         }
+        super::hiqlite_catalog::install_schema(&client).await?;
 
         let store = Self::with_clock(client, Arc::new(SystemClock));
         let now = store.now()?;
@@ -155,6 +156,7 @@ impl HiqliteAuthStore {
     /// this process; password and credential hashes never enter test logs.
     pub async fn local_dump_digest(&self) -> Result<String, StoreError> {
         let dump = AuthStoreDump {
+            catalog_digest: super::hiqlite_catalog::local_catalog_digest(&self.client).await?,
             cluster_meta: self
                 .client
                 .query_map(
@@ -208,11 +210,11 @@ impl HiqliteAuthStore {
         Self { client, clock }
     }
 
-    fn now(&self) -> Result<i64, StoreError> {
+    pub(super) fn now(&self) -> Result<i64, StoreError> {
         self.clock.now()
     }
 
-    async fn execute(
+    pub(super) async fn execute(
         &self,
         sql: &'static str,
         params: hiqlite::Params,
@@ -557,7 +559,7 @@ impl Clock for SystemClock {
     }
 }
 
-fn validate_sql(sql: &str) -> Result<(), StoreError> {
+pub(super) fn validate_sql(sql: &str) -> Result<(), StoreError> {
     ReplicatedSql::new(sql)
         .map(|_| ())
         .map_err(|error| StoreError::Database(error.to_string()))?;
@@ -627,7 +629,7 @@ fn validate_parameter_order(sql: &str) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn database_error(error: impl std::fmt::Display) -> StoreError {
+pub(super) fn database_error(error: impl std::fmt::Display) -> StoreError {
     StoreError::Database(error.to_string())
 }
 
@@ -678,6 +680,7 @@ fn verify_compatibility_rows(
 
 #[derive(Serialize)]
 struct AuthStoreDump {
+    catalog_digest: String,
     cluster_meta: Vec<ClusterMetaDumpRow>,
     settings: Vec<SettingDumpRow>,
     users: Vec<UserDumpRow>,

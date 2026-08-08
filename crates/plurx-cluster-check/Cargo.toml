@@ -10,6 +10,7 @@ repository.workspace = true
 anyhow = { workspace = true }
 hiqlite = { workspace = true }
 plurx-core = { path = "../plurx-core" }
+rusqlite = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

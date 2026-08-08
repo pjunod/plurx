@@ -498,6 +498,24 @@ const MIGRATIONS: &[&str] = &[
     ) STRICT;
     CREATE INDEX offline_package_leases_expiry
         ON offline_package_leases(expires_at);",
+    // v15: cluster-safe scan reconciliation. Root identity catches a scanner
+    // pointed at the wrong mount; the per-reconciliation guard lets a fixed
+    // transaction refuse a stale-but-present mount whose vanished-file set is
+    // larger than the configured budget before any delete commits.
+    "CREATE TABLE library_roots (
+        library_id  INTEGER PRIMARY KEY REFERENCES libraries(id) ON DELETE CASCADE,
+        fingerprint TEXT NOT NULL
+    ) STRICT;
+
+    CREATE TABLE scan_reconcile_guards (
+        library_id INTEGER PRIMARY KEY REFERENCES libraries(id) ON DELETE CASCADE
+    ) STRICT;
+
+    CREATE TABLE scan_reconcile_items (
+        library_id INTEGER NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
+        item_id    INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+        PRIMARY KEY (library_id, item_id)
+    ) STRICT;",
 ];
 
 /// Column list matching [`item_from_row`]. Prefix with a table alias via
@@ -1090,7 +1108,7 @@ mod tests {
             .expect("version");
         assert_eq!(version, MIGRATIONS.len() as i64);
         assert_eq!(
-            version, 14,
+            version, 15,
             "a new migration must be a deliberate bump, not a surprise — \
              the list is append-only and every entry is one somebody shipped"
         );
@@ -1331,7 +1349,11 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 14);
+        assert_eq!(version, MIGRATIONS.len() as i64);
+        assert!(
+            version >= 14,
+            "the offline-package migration must be present"
+        );
 
         let file_foreign_keys: i64 = conn
             .query_row(

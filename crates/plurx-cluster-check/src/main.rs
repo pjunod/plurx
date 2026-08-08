@@ -1,4 +1,4 @@
-//! Separate-process M1b cluster validation.
+//! Separate-process M1b/M1c cluster validation.
 //!
 //! hiqlite owns process-global listener and shutdown state, so an in-process
 //! three-client test cannot prove process loss. The controller starts this
@@ -14,8 +14,12 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use hiqlite::tls::ServerTlsConfig;
 use hiqlite::{Client, Node, NodeConfig};
+use plurx_core::domain::{
+    ItemKind, ItemSort, LibraryKind, MetadataPatch, NewItem, NewLibrary, ProbeResult,
+};
 use plurx_core::store::{
-    ApiKeyStore, ClusterCompatibility, HiqliteAuthStore, SettingsStore, UserStore,
+    ApiKeyStore, ClusterCompatibility, HiqliteAuthStore, LibraryStore, MediaStore,
+    ReconcileOutcome, RootFingerprintStatus, SettingsStore, UserStore, WatchStore,
     AUTH_PROTOCOL_VERSION, AUTH_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
@@ -54,7 +58,7 @@ async fn controller() -> Result<()> {
     run_failure_case(FailureTarget::Follower).await?;
     println!("cluster-check: leader loss");
     run_failure_case(FailureTarget::Leader).await?;
-    println!("cluster-check: all M1b failure contracts passed");
+    println!("cluster-check: all M1b/M1c failure contracts passed");
     Ok(())
 }
 
@@ -85,6 +89,10 @@ async fn run_failure_case(target: FailureTarget) -> Result<()> {
             .require_ok()?;
     }
     cluster.wait_for_equal_dumps().await?;
+    let catalog = cluster.wait_for_equal_catalog_views().await?;
+    if matches!(target, FailureTarget::Follower) {
+        prove_local_fts_rebuild(root.path(), &mut cluster, &catalog).await?;
+    }
 
     let leader = cluster.leader().await?;
     let target_id = match target {
@@ -167,6 +175,7 @@ enum Request {
     PostLossWrite { target: String },
     VerifyProof,
     Dump,
+    CatalogView,
     Metrics,
     Ping,
 }
@@ -180,6 +189,9 @@ enum Response {
     Dump {
         digest: String,
     },
+    CatalogView {
+        view: CatalogView,
+    },
     Metrics {
         leader: Option<u64>,
         voters: Vec<u64>,
@@ -187,6 +199,13 @@ enum Response {
     Error {
         message: String,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct CatalogView {
+    libraries: Vec<String>,
+    browse: Vec<(i64, Vec<i64>)>,
+    search: Vec<i64>,
 }
 
 impl Response {
@@ -391,6 +410,62 @@ impl ClusterProcesses {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
+
+    async fn wait_for_equal_catalog_views(&mut self) -> Result<CatalogView> {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let mut views = Vec::new();
+            for node_id in 1..=self.nodes.len() as u64 {
+                match self.request(node_id, Request::CatalogView).await? {
+                    Response::CatalogView { view } => views.push(view),
+                    Response::Error { message } => return Err(anyhow!(message)),
+                    response => bail!("unexpected catalog response: {response:?}"),
+                }
+            }
+            if views.windows(2).all(|pair| pair[0] == pair[1]) {
+                return views
+                    .into_iter()
+                    .next()
+                    .context("catalog view set was empty");
+            }
+            if Instant::now() >= deadline {
+                bail!("browse/search views did not converge on all three voters");
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+}
+
+async fn prove_local_fts_rebuild(
+    root: &Path,
+    cluster: &mut ClusterProcesses,
+    baseline: &CatalogView,
+) -> Result<()> {
+    let path = root
+        .join("node-2")
+        .join("state_machine")
+        .join("db")
+        .join("auth.db");
+    let connection = rusqlite::Connection::open(&path)
+        .with_context(|| format!("open voter-2 local database at {}", path.display()))?;
+    connection
+        .execute("DELETE FROM items_fts", [])
+        .context("delete voter-2 derived FTS rows")?;
+    let empty = match cluster.request(2, Request::CatalogView).await? {
+        Response::CatalogView { view } => view,
+        response => bail!("unexpected post-delete catalog response: {response:?}"),
+    };
+    if empty.browse != baseline.browse || !empty.search.is_empty() {
+        bail!("deleting voter-2 FTS changed browse truth or left search rows");
+    }
+    connection
+        .execute("INSERT INTO items_fts(items_fts) VALUES('rebuild')", [])
+        .context("rebuild voter-2 derived FTS rows")?;
+    let rebuilt = cluster.wait_for_equal_catalog_views().await?;
+    if &rebuilt != baseline {
+        bail!("voter-2 FTS rebuild did not restore the baseline view");
+    }
+    Ok(())
 }
 
 async fn node(launch: NodeLaunch) -> Result<()> {
@@ -468,6 +543,9 @@ async fn handle_request(
         }
         Request::Dump => Ok(Response::Dump {
             digest: store_ref(store)?.local_dump_digest().await?,
+        }),
+        Request::CatalogView => Ok(Response::CatalogView {
+            view: catalog_view(store_ref(store)?).await?,
         }),
         Request::Metrics => {
             let metrics = client.metrics_db().await?;
@@ -629,7 +707,115 @@ async fn exercise(store: &HiqliteAuthStore, ordinal: u64) -> Result<()> {
     {
         bail!("API key deletion failed");
     }
+
+    let library = store
+        .create_library(&NewLibrary {
+            name: format!("Cluster Movies {suffix}"),
+            kind: LibraryKind::Movies,
+            paths: vec![PathBuf::from(format!("/cluster/media/{suffix}"))],
+            anime: false,
+        })
+        .await?;
+    let movie = store
+        .insert_item(&NewItem {
+            library_id: library.id,
+            kind: ItemKind::Movie,
+            parent_id: None,
+            title: format!("Replicated Catalog Proof {suffix}"),
+            year: Some(2000 + ordinal as i32),
+            season_number: None,
+            episode_number: None,
+        })
+        .await?;
+    store
+        .apply_metadata(
+            movie,
+            &MetadataPatch {
+                overview: Some(format!("replicated browse search voter {suffix}")),
+                genres: Some(vec!["Science Fiction".to_owned()]),
+                enriched: true,
+                ..MetadataPatch::default()
+            },
+        )
+        .await?;
+    let file = store
+        .upsert_file(
+            movie,
+            &format!("/cluster/media/{suffix}/proof-{suffix}.mkv"),
+            1_000 + ordinal as i64,
+            1_700_000_000 + ordinal as i64,
+            &ProbeResult {
+                duration_ms: Some(120_000),
+                container: Some("mkv".to_owned()),
+                video_codec: Some("hevc".to_owned()),
+                width: Some(3840),
+                height: Some(2160),
+                raw_json: Some(format!(r#"{{"voter":{ordinal}}}"#)),
+                ..ProbeResult::default()
+            },
+        )
+        .await?;
+    let fingerprint = format!("root-fingerprint-{suffix}");
+    if store
+        .ensure_library_root_fingerprint(library.id, &fingerprint)
+        .await?
+        != RootFingerprintStatus::Established
+    {
+        bail!("new library root fingerprint was not established");
+    }
+    if !matches!(
+        store
+            .reconcile_library(library.id, "stale-root", &[file], 1)
+            .await?,
+        ReconcileOutcome::RefusedRoot { .. }
+    ) || store.get_file(file).await?.is_none()
+    {
+        bail!("stale-root reconciliation committed a prune");
+    }
+    if store
+        .reconcile_library(library.id, &fingerprint, &[file], 0)
+        .await?
+        != (ReconcileOutcome::RefusedPrune {
+            requested: 1,
+            limit: 0,
+        })
+        || store.get_file(file).await?.is_none()
+    {
+        bail!("over-budget reconciliation committed a prune");
+    }
+    let state = store
+        .put_progress(user.id, movie, 30_000, Some(10_000))
+        .await?;
+    if state.position_ms != 30_000 || state.duration_ms != Some(120_000) || state.watched {
+        bail!("replicated watch progress did not prefer the probed duration");
+    }
     Ok(())
+}
+
+async fn catalog_view(store: &HiqliteAuthStore) -> Result<CatalogView> {
+    let libraries = store.list_libraries().await?;
+    let mut browse = Vec::with_capacity(libraries.len());
+    for library in &libraries {
+        let page = store
+            .list_top_items(library.id, ItemSort::Title, 0, 100)
+            .await?;
+        browse.push((
+            library.id,
+            page.items.into_iter().map(|item| item.id).collect(),
+        ));
+    }
+    let mut search = store
+        .search_items("replicated browse", 100)
+        .await?
+        .into_iter()
+        .map(|row| row.item.id)
+        .collect::<Vec<_>>();
+    search.sort_unstable();
+    Ok(CatalogView {
+        libraries: libraries.into_iter().map(|library| library.name).collect(),
+        browse,
+        search,
+    })
 }
 
 async fn verify_proof(store: &HiqliteAuthStore) -> Result<()> {
@@ -662,6 +848,27 @@ async fn verify_proof(store: &HiqliteAuthStore) -> Result<()> {
         {
             bail!("lost acknowledged API key from node {ordinal}");
         }
+        let library = store
+            .list_libraries()
+            .await?
+            .into_iter()
+            .find(|library| library.name == format!("Cluster Movies {suffix}"))
+            .with_context(|| format!("lost acknowledged library from node {ordinal}"))?;
+        let page = store
+            .list_top_items(library.id, ItemSort::Title, 0, 10)
+            .await?;
+        if page.items.len() != 1
+            || store.files_for_item(page.items[0].id).await?.len() != 1
+            || store
+                .watch_state(user.id, page.items[0].id)
+                .await?
+                .is_none()
+        {
+            bail!("lost acknowledged media/watch state from node {ordinal}");
+        }
+    }
+    if catalog_view(store).await?.search.len() != 3 {
+        bail!("lost local FTS search rows after voter loss");
     }
     Ok(())
 }

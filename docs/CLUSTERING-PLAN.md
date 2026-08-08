@@ -1,7 +1,8 @@
 # Clustering transition — from one plurxd node to Phase 4
 
-**Status:** executing — M0 and M1a merged; M1b's auth-store backend and
-failure gate implemented, daemon activation still pending
+**Status:** executing — M0 and M1a merged; M1b is under review; M1c's
+catalogue/watch backend and failure gate are implemented on the stacked branch,
+daemon activation still pending
 · **Executes:** Phase 4 from [ROADMAP.md](ROADMAP.md) and REQ-HA-1–6 from
 [REQUIREMENTS.md](REQUIREMENTS.md) · **Written:** 2026-08-06 · **Revised:**
 2026-08-07
@@ -42,7 +43,7 @@ quietly wider threshold.
 
 | Existing seam | Current truth | Phase 4 consequence |
 |---|---|---|
-| `Arc<dyn Store>` | All durable application state crosses the composed traits in [`store/mod.rs`](../crates/plurx-core/src/store/mod.rs). | Keep handlers stable, but port 114 methods in reviewable groups rather than one backend rewrite. |
+| `Arc<dyn Store>` | All durable application state crosses the 116-method composed traits in [`store/mod.rs`](../crates/plurx-core/src/store/mod.rs). | Keep handlers stable, but port the methods in reviewable groups rather than one backend rewrite. |
 | `instance.id` | Stable logical-server identifier in settings; new installs mint a UUID, but the schema historically accepted arbitrary strings. It is also passed as `AppState::node_id`. | Split the concepts without changing the first node's existing cache/offline ownership key. |
 | Cache/offline `node_id` | Existing rows are keyed by the current `instance.id`. | An existing install seeds local `node.id` from that exact string; changing it would strand rows and let orphan cleanup delete bytes. |
 | `Recipe<'a>` | Borrowed, node-specific cache-key input; its hash includes ffmpeg build, encoder, and pipeline. | The hash is a node-local cache address, not a cluster recipe. Replicate owned request inputs and rebuild against the survivor's pipeline. |
@@ -52,10 +53,11 @@ quietly wider threshold.
 | Discovery | mDNS/GDM derive hostname and service name from shared identity/name. | Advertise each node under a node-specific hostname with one logical id and the full node list. |
 
 M0 now provides tolerated cluster configuration and local node identity; M1a
-provides the full backend-neutral parity inventory; and the first M1b slice
-provides a production-resolved hiqlite auth/settings backend plus a
+provides the full backend-neutral parity inventory; M1b provides the first
+hiqlite auth/settings backend; and M1c adds libraries, media, watch state,
+node-local FTS, and bounded root-aware reconciliation to the same
 three-process failure harness. The daemon still opens the complete SQLite
-store. Membership/join, full-store activation, transactional fencing,
+store. Membership/join, full-store activation, lease-fenced publication,
 replicated session ownership, serving self-fencing, and client failover do not
 exist yet.
 
@@ -369,8 +371,9 @@ Classify explicit transaction boundaries and define the replicated CAS pattern
 once. Rule connection-, clock-, and RNG-dependent values out of replicated
 SQL.
 
-**Acceptance:** the additive suite exercises all 114 methods against in-memory
-and file SQLite with no behavior change; `make check` remains the gate.
+**Acceptance:** the additive suite exercises every method against in-memory
+and file SQLite with no behavior change; `make check` remains the gate. The
+inventory is 116 methods after M1c added the two reconciliation contracts.
 
 The executable M1a contract is `store_contract`: each scenario receives only
 `Arc<dyn Store>`, and its name inventory fails unless every `async fn` declared
@@ -416,6 +419,24 @@ stale-but-present mount from deleting a library cluster-wide.
 **Acceptance:** all three nodes return identical browse/search results; delete
 and rebuild one node's FTS index; run a stale-root fixture and prove no prune
 commits.
+
+**Backend slice delivered 2026-08-07; daemon activation remains open.**
+`HiqliteAuthStore` now also implements all library, media, and watch methods.
+Authoritative reads are quorum-consistent; search reads each voter's derived
+external-content FTS index. `reconcile_library` records root identity and puts
+the root comparison, prune budget, vanished-file delete, and empty-hierarchy
+prune in one transaction. The ordinary scanner now publishes through that
+boundary; a root mismatch or over-budget scan records an error and commits no
+delete.
+
+`make cluster-check` writes catalogue and watch state through every voter,
+compares ordered local table digests, and compares the three browse/search
+views. It then deletes voter 2's FTS rows directly, proves browse remains
+unchanged while local search empties, rebuilds from replicated `items`, and
+requires all three views to converge before the existing follower-loss and
+leader-loss cases continue. The remaining lease token is deliberately M4's
+signature change: M1c owns root identity and the atomic publication boundary;
+M4 makes that same boundary reject an expired scanner.
 
 ### 6.5 M1d — remaining store contracts and write-rate gates
 
@@ -523,18 +544,19 @@ mode without lowering quality or losing selected tracks.
 6. **Do not call a VIP the failover implementation.** A VIP locates a process;
    replicated state, fencing, and takeover let it continue the film.
 
-## 8. Handoff checkpoint — M1b has failure evidence, not daemon activation
+## 8. Handoff checkpoint — M1c has catalogue evidence, not daemon activation
 
-M0 and M1a are on `main`; M1b's first backend slice is now reviewable. Keep
-SQLite as the daemon's complete store until every trait has one replicated
-implementation and the import gate is ready. The next implementation boundary
-is M1c libraries/media/watch plus node-local FTS, media-root identity, and the
-stale-root prune fence.
+M0 and M1a are on `main`; M1b is under review and M1c is stacked on its exact
+head. Keep SQLite as the daemon's complete store until every trait has one
+replicated implementation and the import gate is ready. The next implementation
+boundary is M1d: Trakt/outbox, cache/offline ownership, the remaining durable
+contracts, and the ten-second progress coalescer with measured write-rate
+evidence.
 
 ```bash
 make check                    # M0 and every milestone: repository baseline
 make validate-staged          # changed behavior contracts
-make cluster-check            # joins in M1b with the first three-voter slice
+make cluster-check            # M1b/M1c three-voter state, FTS, and loss gate
 cargo test -p plurx-core store::sqlite::tests:: -- --nocapture
                               # explicit local M2 database-upgrade gate
 ```

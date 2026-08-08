@@ -15,7 +15,7 @@ use crate::domain::{
 };
 use crate::error::StoreError;
 use crate::mediafacts::{FactsRow, MediaFacts};
-use crate::store::MediaStore;
+use crate::store::{MediaStore, ReconcileOutcome, RootFingerprintStatus};
 
 /// Build an FTS5 MATCH expression from free text: quoted tokens, prefix
 /// matching on the last one. Returns `None` for queries with no tokens.
@@ -1122,6 +1122,145 @@ impl MediaStore for SqliteStore {
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
+        })
+        .await
+    }
+
+    async fn ensure_library_root_fingerprint(
+        &self,
+        library_id: i64,
+        fingerprint: &str,
+    ) -> Result<RootFingerprintStatus, StoreError> {
+        let fingerprint = fingerprint.to_owned();
+        self.with_conn(move |conn| {
+            let inserted = conn.execute(
+                "INSERT INTO library_roots (library_id, fingerprint) VALUES (?1, ?2) \
+                 ON CONFLICT(library_id) DO NOTHING",
+                params![library_id, fingerprint],
+            )?;
+            if inserted == 1 {
+                return Ok(RootFingerprintStatus::Established);
+            }
+            let expected: String = conn.query_row(
+                "SELECT fingerprint FROM library_roots WHERE library_id = ?1",
+                params![library_id],
+                |row| row.get(0),
+            )?;
+            if expected == fingerprint {
+                Ok(RootFingerprintStatus::Matched)
+            } else {
+                Ok(RootFingerprintStatus::Mismatch { expected })
+            }
+        })
+        .await
+    }
+
+    async fn reconcile_library(
+        &self,
+        library_id: i64,
+        root_fingerprint: &str,
+        gone_file_ids: &[i64],
+        prune_limit: u64,
+    ) -> Result<ReconcileOutcome, StoreError> {
+        let root_fingerprint = root_fingerprint.to_owned();
+        let ids = gone_file_ids.to_vec();
+        self.with_conn(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            let expected: Option<String> = tx
+                .query_row(
+                    "SELECT fingerprint FROM library_roots WHERE library_id = ?1",
+                    params![library_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if expected.as_deref() != Some(root_fingerprint.as_str()) {
+                return Ok(ReconcileOutcome::RefusedRoot {
+                    expected: expected.unwrap_or_else(|| "<unregistered>".to_owned()),
+                });
+            }
+
+            let list = if ids.is_empty() {
+                "NULL".to_owned()
+            } else {
+                ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",")
+            };
+            let requested: i64 = tx.query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM files f JOIN items i ON i.id = f.item_id \
+                     WHERE i.library_id = ?1 AND f.id IN ({list})"
+                ),
+                params![library_id],
+                |row| row.get(0),
+            )?;
+            let requested = requested.max(0) as u64;
+            if requested > prune_limit {
+                return Ok(ReconcileOutcome::RefusedPrune {
+                    requested,
+                    limit: prune_limit,
+                });
+            }
+
+            let deleted_files = tx.execute(
+                &format!(
+                    "DELETE FROM files WHERE id IN ({list}) AND item_id IN \
+                     (SELECT id FROM items WHERE library_id = ?1)"
+                ),
+                params![library_id],
+            )? as u64;
+            let mut pruned_items = 0_u64;
+            pruned_items += tx.execute(
+                "DELETE FROM items WHERE library_id = ?1 \
+                 AND kind IN ('movie','episode','video','photo') \
+                 AND id NOT IN (SELECT item_id FROM files)",
+                params![library_id],
+            )? as u64;
+            pruned_items += tx.execute(
+                "DELETE FROM items WHERE library_id = ?1 AND kind = 'season' \
+                 AND id NOT IN (SELECT parent_id FROM items \
+                                WHERE kind = 'episode' AND parent_id IS NOT NULL)",
+                params![library_id],
+            )? as u64;
+            pruned_items += tx.execute(
+                "DELETE FROM items WHERE library_id = ?1 AND kind = 'show' \
+                 AND id NOT IN (SELECT parent_id FROM items \
+                                WHERE kind = 'season' AND parent_id IS NOT NULL)",
+                params![library_id],
+            )? as u64;
+            let empty_folders: i64 = tx.query_row(
+                "WITH RECURSIVE descendants(root_id, id, kind) AS ( \
+                     SELECT root.id, child.id, child.kind FROM items root \
+                     LEFT JOIN items child ON child.parent_id = root.id \
+                     WHERE root.library_id = ?1 AND root.kind = 'folder' \
+                     UNION ALL \
+                     SELECT descendants.root_id, child.id, child.kind \
+                     FROM descendants JOIN items child ON child.parent_id = descendants.id \
+                 ) \
+                 SELECT COUNT(*) FROM items WHERE library_id = ?1 AND kind = 'folder' \
+                   AND NOT EXISTS (SELECT 1 FROM descendants \
+                                   WHERE root_id = items.id AND kind != 'folder')",
+                params![library_id],
+                |row| row.get(0),
+            )?;
+            tx.execute(
+                "WITH RECURSIVE descendants(root_id, id, kind) AS ( \
+                     SELECT root.id, child.id, child.kind FROM items root \
+                     LEFT JOIN items child ON child.parent_id = root.id \
+                     WHERE root.library_id = ?1 AND root.kind = 'folder' \
+                     UNION ALL \
+                     SELECT descendants.root_id, child.id, child.kind \
+                     FROM descendants JOIN items child ON child.parent_id = descendants.id \
+                 ) \
+                 DELETE FROM items WHERE library_id = ?1 AND kind = 'folder' \
+                   AND NOT EXISTS (SELECT 1 FROM descendants \
+                                   WHERE root_id = items.id AND kind != 'folder')",
+                params![library_id],
+            )?;
+            pruned_items += empty_folders.max(0) as u64;
+            tx.commit()?;
+            Ok(ReconcileOutcome::Applied {
+                deleted_files,
+                pruned_items,
+            })
         })
         .await
     }
