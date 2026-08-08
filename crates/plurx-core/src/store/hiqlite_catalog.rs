@@ -1,0 +1,436 @@
+//! Replicated libraries, media catalogue, watch state, and derived local FTS.
+//!
+//! The authoritative rows below travel through Raft. `items_fts` is an
+//! external-content index rebuilt from `items`; each voter answers search from
+//! its own copy so losing and rebuilding that index cannot alter cluster truth.
+
+use std::path::PathBuf;
+
+use async_trait::async_trait;
+use hiqlite::macros::params;
+use hiqlite::Row;
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+
+use super::hiqlite::{database_error, validate_sql, HiqliteAuthStore};
+use super::LibraryStore;
+use crate::domain::{Library, LibraryKind, NewLibrary};
+use crate::error::StoreError;
+
+const CATALOG_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS libraries (
+    id                    INTEGER PRIMARY KEY,
+    name                  TEXT NOT NULL UNIQUE,
+    kind                  TEXT NOT NULL,
+    paths                 TEXT NOT NULL,
+    anime                 INTEGER NOT NULL DEFAULT 0,
+    created_at            INTEGER NOT NULL,
+    scan_interval_mins    INTEGER NOT NULL DEFAULT 0,
+    refresh_interval_mins INTEGER NOT NULL DEFAULT 0,
+    last_scan_at          INTEGER,
+    last_refresh_at       INTEGER
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS items (
+    id                   INTEGER PRIMARY KEY,
+    library_id           INTEGER NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
+    kind                 TEXT NOT NULL,
+    parent_id            INTEGER REFERENCES items(id) ON DELETE CASCADE,
+    title                TEXT NOT NULL,
+    sort_title           TEXT NOT NULL,
+    year                 INTEGER,
+    overview             TEXT,
+    tmdb_id              INTEGER,
+    imdb_id              TEXT,
+    season_number        INTEGER,
+    episode_number       INTEGER,
+    air_date             TEXT,
+    runtime_ms           INTEGER,
+    poster_path          TEXT,
+    backdrop_path        TEXT,
+    added_at             INTEGER NOT NULL,
+    updated_at           INTEGER NOT NULL,
+    recorded_at          TEXT,
+    tags                 TEXT NOT NULL DEFAULT '[]',
+    nfo_seeded_at        INTEGER,
+    metadata_at          INTEGER,
+    artwork_attempted_at INTEGER,
+    artwork_error        TEXT,
+    genres               TEXT NOT NULL DEFAULT '[]'
+) STRICT;
+CREATE INDEX IF NOT EXISTS idx_items_library_kind ON items(library_id, kind);
+CREATE INDEX IF NOT EXISTS idx_items_parent ON items(parent_id);
+CREATE INDEX IF NOT EXISTS idx_items_added ON items(added_at DESC);
+CREATE INDEX IF NOT EXISTS idx_items_missing_artwork ON items(artwork_attempted_at)
+    WHERE poster_path IS NULL;
+
+CREATE TABLE IF NOT EXISTS files (
+    id               INTEGER PRIMARY KEY,
+    item_id          INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+    path             TEXT NOT NULL UNIQUE,
+    size             INTEGER NOT NULL,
+    mtime            INTEGER NOT NULL,
+    duration_ms      INTEGER,
+    container        TEXT,
+    video_codec      TEXT,
+    video_profile    TEXT,
+    width            INTEGER,
+    height           INTEGER,
+    bit_depth        INTEGER,
+    hdr              TEXT,
+    bitrate          INTEGER,
+    audio_streams    TEXT NOT NULL DEFAULT '[]',
+    subtitle_streams TEXT NOT NULL DEFAULT '[]',
+    probe_json       TEXT,
+    scanned_at       INTEGER NOT NULL,
+    hdr_format       TEXT,
+    audio_offset_ms  INTEGER NOT NULL DEFAULT 0
+) STRICT;
+CREATE INDEX IF NOT EXISTS idx_files_item ON files(item_id);
+
+CREATE TABLE IF NOT EXISTS watch_state (
+    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    item_id     INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+    position_ms INTEGER NOT NULL DEFAULT 0,
+    duration_ms INTEGER,
+    watched     INTEGER NOT NULL DEFAULT 0,
+    updated_at  INTEGER NOT NULL,
+    PRIMARY KEY (user_id, item_id)
+) STRICT;
+CREATE INDEX IF NOT EXISTS idx_watch_updated ON watch_state(user_id, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS library_roots (
+    library_id  INTEGER PRIMARY KEY REFERENCES libraries(id) ON DELETE CASCADE,
+    fingerprint TEXT NOT NULL
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS scan_reconcile_guards (
+    library_id INTEGER PRIMARY KEY REFERENCES libraries(id) ON DELETE CASCADE
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS scan_reconcile_items (
+    library_id INTEGER NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
+    item_id    INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+    PRIMARY KEY (library_id, item_id)
+) STRICT;
+
+CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(
+    title, overview, tags, content='items', content_rowid='id'
+);
+CREATE TRIGGER IF NOT EXISTS items_fts_ai AFTER INSERT ON items BEGIN
+    INSERT INTO items_fts(rowid, title, overview, tags)
+    VALUES (new.id, new.title, new.overview, new.tags);
+END;
+CREATE TRIGGER IF NOT EXISTS items_fts_ad AFTER DELETE ON items BEGIN
+    INSERT INTO items_fts(items_fts, rowid, title, overview, tags)
+    VALUES ('delete', old.id, old.title, old.overview, old.tags);
+END;
+CREATE TRIGGER IF NOT EXISTS items_fts_au AFTER UPDATE OF title, overview, tags ON items BEGIN
+    INSERT INTO items_fts(items_fts, rowid, title, overview, tags)
+    VALUES ('delete', old.id, old.title, old.overview, old.tags);
+    INSERT INTO items_fts(rowid, title, overview, tags)
+    VALUES (new.id, new.title, new.overview, new.tags);
+END;
+"#;
+
+pub(super) async fn install_schema(client: &hiqlite::Client) -> Result<(), StoreError> {
+    validate_sql(CATALOG_SCHEMA)?;
+    for result in client.batch(CATALOG_SCHEMA).await.map_err(database_error)? {
+        result.map_err(database_error)?;
+    }
+    Ok(())
+}
+
+struct JsonValueRow {
+    value: String,
+}
+
+impl From<&mut Row<'_>> for JsonValueRow {
+    fn from(row: &mut Row<'_>) -> Self {
+        Self {
+            value: row.get("value"),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct CatalogDump {
+    libraries: Vec<String>,
+    items: Vec<String>,
+    files: Vec<String>,
+    watch_state: Vec<String>,
+    library_roots: Vec<String>,
+    scan_reconcile_guards: Vec<String>,
+    scan_reconcile_items: Vec<String>,
+}
+
+pub(super) async fn local_catalog_digest(client: &hiqlite::Client) -> Result<String, StoreError> {
+    async fn rows(client: &hiqlite::Client, sql: &'static str) -> Result<Vec<String>, StoreError> {
+        Ok(client
+            .query_map::<JsonValueRow, _>(sql, params!())
+            .await
+            .map_err(database_error)?
+            .into_iter()
+            .map(|row| row.value)
+            .collect())
+    }
+
+    let dump = CatalogDump {
+        libraries: rows(
+            client,
+            "SELECT json_array(id, name, kind, paths, anime, created_at, \
+                    scan_interval_mins, refresh_interval_mins, last_scan_at, last_refresh_at) \
+             AS value FROM libraries ORDER BY id",
+        )
+        .await?,
+        items: rows(
+            client,
+            "SELECT json_array(id, library_id, kind, parent_id, title, sort_title, year, \
+                    overview, tmdb_id, imdb_id, season_number, episode_number, air_date, \
+                    runtime_ms, poster_path, backdrop_path, added_at, updated_at, recorded_at, \
+                    tags, nfo_seeded_at, metadata_at, artwork_attempted_at, artwork_error, genres) \
+             AS value FROM items ORDER BY id",
+        )
+        .await?,
+        files: rows(
+            client,
+            "SELECT json_array(id, item_id, path, size, mtime, duration_ms, container, \
+                    video_codec, video_profile, width, height, bit_depth, hdr, bitrate, \
+                    audio_streams, subtitle_streams, probe_json, scanned_at, hdr_format, \
+                    audio_offset_ms) AS value FROM files ORDER BY id",
+        )
+        .await?,
+        watch_state: rows(
+            client,
+            "SELECT json_array(user_id, item_id, position_ms, duration_ms, watched, updated_at) \
+             AS value FROM watch_state ORDER BY user_id, item_id",
+        )
+        .await?,
+        library_roots: rows(
+            client,
+            "SELECT json_array(library_id, fingerprint) AS value \
+             FROM library_roots ORDER BY library_id",
+        )
+        .await?,
+        scan_reconcile_guards: rows(
+            client,
+            "SELECT json_array(library_id) AS value \
+             FROM scan_reconcile_guards ORDER BY library_id",
+        )
+        .await?,
+        scan_reconcile_items: rows(
+            client,
+            "SELECT json_array(library_id, item_id) AS value \
+             FROM scan_reconcile_items ORDER BY library_id, item_id",
+        )
+        .await?,
+    };
+    let bytes = serde_json::to_vec(&dump).map_err(database_error)?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+const LIB_COLS: &str = "id, name, kind, paths, anime, created_at, scan_interval_mins, \
+     refresh_interval_mins, last_scan_at, last_refresh_at";
+
+struct LibraryRow {
+    id: i64,
+    name: String,
+    kind: String,
+    paths: String,
+    anime: i64,
+    created_at: i64,
+    scan_interval_mins: i64,
+    refresh_interval_mins: i64,
+    last_scan_at: Option<i64>,
+    last_refresh_at: Option<i64>,
+}
+
+impl From<&mut Row<'_>> for LibraryRow {
+    fn from(row: &mut Row<'_>) -> Self {
+        Self {
+            id: row.get("id"),
+            name: row.get("name"),
+            kind: row.get("kind"),
+            paths: row.get("paths"),
+            anime: row.get("anime"),
+            created_at: row.get("created_at"),
+            scan_interval_mins: row.get("scan_interval_mins"),
+            refresh_interval_mins: row.get("refresh_interval_mins"),
+            last_scan_at: row.get("last_scan_at"),
+            last_refresh_at: row.get("last_refresh_at"),
+        }
+    }
+}
+
+impl TryFrom<LibraryRow> for Library {
+    type Error = StoreError;
+
+    fn try_from(row: LibraryRow) -> Result<Self, Self::Error> {
+        let kind = LibraryKind::parse(&row.kind)
+            .ok_or_else(|| StoreError::Database(format!("unknown library kind `{}`", row.kind)))?;
+        let paths: Vec<PathBuf> = serde_json::from_str(&row.paths)
+            .map_err(|error| StoreError::Database(format!("library paths: {error}")))?;
+        Ok(Self {
+            id: row.id,
+            name: row.name,
+            kind,
+            paths,
+            anime: row.anime != 0,
+            created_at: row.created_at,
+            scan_interval_mins: row.scan_interval_mins,
+            refresh_interval_mins: row.refresh_interval_mins,
+            last_scan_at: row.last_scan_at,
+            last_refresh_at: row.last_refresh_at,
+        })
+    }
+}
+
+fn paths_json(paths: &[PathBuf]) -> Result<String, StoreError> {
+    serde_json::to_string(paths).map_err(|error| StoreError::Database(error.to_string()))
+}
+
+fn one_library(rows: Vec<LibraryRow>) -> Result<Option<Library>, StoreError> {
+    rows.into_iter().next().map(TryInto::try_into).transpose()
+}
+
+fn one_returning_library(
+    rows: Vec<Result<LibraryRow, hiqlite::Error>>,
+) -> Result<Option<Library>, StoreError> {
+    one_library(
+        rows.into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(database_error)?,
+    )
+}
+
+#[async_trait]
+impl LibraryStore for HiqliteAuthStore {
+    async fn create_library(&self, library: &NewLibrary) -> Result<Library, StoreError> {
+        let now = self.now()?;
+        let paths = paths_json(&library.paths)?;
+        let sql = format!(
+            "INSERT INTO libraries (name, kind, paths, anime, created_at) \
+             VALUES ($1, $2, $3, $4, $5) RETURNING {LIB_COLS}"
+        );
+        validate_sql(&sql)?;
+        let row = self
+            .client
+            .execute_returning_map_one::<_, LibraryRow>(
+                sql,
+                params!(
+                    library.name.as_str(),
+                    library.kind.as_str(),
+                    paths,
+                    library.anime,
+                    now
+                ),
+            )
+            .await
+            .map_err(database_error)?;
+        row.try_into()
+    }
+
+    async fn update_library(
+        &self,
+        id: i64,
+        library: &NewLibrary,
+    ) -> Result<Option<Library>, StoreError> {
+        let paths = paths_json(&library.paths)?;
+        let sql = format!(
+            "UPDATE libraries SET name = $1, kind = $2, paths = $3, anime = $4 \
+             WHERE id = $5 RETURNING {LIB_COLS}"
+        );
+        validate_sql(&sql)?;
+        one_returning_library(
+            self.client
+                .execute_returning_map::<_, LibraryRow>(
+                    sql,
+                    params!(
+                        library.name.as_str(),
+                        library.kind.as_str(),
+                        paths,
+                        library.anime,
+                        id
+                    ),
+                )
+                .await
+                .map_err(database_error)?,
+        )
+    }
+
+    async fn set_library_schedule(
+        &self,
+        id: i64,
+        scan_interval_mins: i64,
+        refresh_interval_mins: i64,
+    ) -> Result<Option<Library>, StoreError> {
+        let sql = format!(
+            "UPDATE libraries SET scan_interval_mins = $1, refresh_interval_mins = $2 \
+             WHERE id = $3 RETURNING {LIB_COLS}"
+        );
+        validate_sql(&sql)?;
+        one_returning_library(
+            self.client
+                .execute_returning_map::<_, LibraryRow>(
+                    sql,
+                    params!(scan_interval_mins.max(0), refresh_interval_mins.max(0), id),
+                )
+                .await
+                .map_err(database_error)?,
+        )
+    }
+
+    async fn mark_library_scanned(&self, id: i64, refreshed: bool) -> Result<(), StoreError> {
+        let now = self.now()?;
+        self.execute(
+            "UPDATE libraries SET last_scan_at = $1, \
+             last_refresh_at = CASE WHEN $2 THEN $1 ELSE last_refresh_at END \
+             WHERE id = $3",
+            params!(now, refreshed, id),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn delete_library(&self, id: i64) -> Result<bool, StoreError> {
+        Ok(self
+            .execute("DELETE FROM libraries WHERE id = $1", params!(id))
+            .await?
+            > 0)
+    }
+
+    async fn get_library(&self, id: i64) -> Result<Option<Library>, StoreError> {
+        one_library(
+            self.client
+                .query_consistent_map::<LibraryRow, _>(
+                    format!("SELECT {LIB_COLS} FROM libraries WHERE id = $1"),
+                    params!(id),
+                )
+                .await
+                .map_err(database_error)?,
+        )
+    }
+
+    async fn list_libraries(&self) -> Result<Vec<Library>, StoreError> {
+        self.client
+            .query_consistent_map::<LibraryRow, _>(
+                format!("SELECT {LIB_COLS} FROM libraries ORDER BY name"),
+                params!(),
+            )
+            .await
+            .map_err(database_error)?
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replicated_catalog_schema_binds_every_clock_value() {
+        validate_sql(CATALOG_SCHEMA).expect("schema contains no local clock or RNG calls");
+    }
+}

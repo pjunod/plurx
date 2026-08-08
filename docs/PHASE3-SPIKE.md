@@ -189,6 +189,25 @@ This is backend evidence, not a production-store switch. `plurxd` still holds
 import path land; its live `/readyz` route therefore remains SQLite-backed in
 this slice.
 
+### M1c catalogue, local-FTS, and stale-root proof
+
+M1c keeps the same separate-process gate and adds libraries, items, files, and
+watch state. Authoritative browse reads are quorum-consistent; FTS is derived
+on each voter and search reads that local index.
+
+| Contract | M1c evidence |
+|---|---|
+| Store surface | All library, media, and watch methods are implemented on the Hiqlite type; the backend-neutral SQLite inventory is now 116 methods after adding root identity and atomic reconciliation. |
+| Replica equality | Ordered local catalogue/watch dumps join the M1b digest, and all three processes must return the same browse and search ids. |
+| Node-local FTS | The controller deletes voter 2's FTS rows directly, proves browse is unchanged and local search is empty, issues the FTS rebuild command against that voter only, and requires three-way search parity again. |
+| Root identity | The scanner hashes canonical roots plus their Unix inode identity. A different present root is an error and skips every vanished-file delete. |
+| Prune bound | Root comparison, deletion budget, vanished-file deletion, and empty-hierarchy pruning share one transaction. A zero-budget fixture keeps both file and item rows. |
+| Loss survival | The existing follower-loss and leader-loss cases now verify every acknowledged library, item, file, watch row, and rebuilt search row before accepting the post-loss write. |
+
+This still is not the daemon switch. M1d owns the remaining durable traits and
+the ten-second progress coalescer; M2 owns import and activation. M4 adds the
+lease token to the reconciliation boundary M1c made atomic.
+
 ## Spike 2 — Deterministic-segment transcode failover
 
 ### The question
