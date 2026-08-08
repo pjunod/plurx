@@ -470,15 +470,16 @@ Three details, each load-bearing:
   An ffmpeg older than 5.1 has neither flag and falls back to `-re`.
 - **The ahead-window suspend.** Once a session is more than
   `playback.hls_ahead_max_secs` (default 180 s) of content ahead of the last
-  segment the client fetched, the reaper SIGSTOPs its ffmpeg, and SIGCONTs it
-  30 s below that ceiling (150 s under the default). On the physical iPad,
-  AVPlayer stopped fetching with about 95 s buffered and left the producer
-  138 s ahead; the higher release point grants one more production burst there
-  instead of waiting for the old 90 s threshold. It is a larger margin, not a
-  structural escape: if the client still does not fetch, the producer can
-  cross 150 s and become held again. The client's same-delivery reopen remains
-  the terminal recovery. Byte and global disk limits still release at half
-  because those are hard capacity bounds. Session status reports
+  segment the client fetched, the reaper SIGSTOPs its ffmpeg. A later media
+  fetch that brings the reserve back to that same ceiling SIGCONTs it, so the
+  client's demand immediately earns the next production increment. A lower
+  fixed release point failed on the physical iPad: AVPlayer stopped at 154 s
+  ahead while the server required 150 s, then polled the unchanged EVENT
+  playlist for 84 s until playback ran dry and reopened. Matching the release
+  to the ceiling can produce one stop/start pair per client segment near the
+  boundary, but the state guard prevents signals on mere playlist polls. Byte
+  and global disk limits still release at half because those are hard capacity
+  bounds. Session status reports
   `resume_below_seconds`, which the web and Apple overlays show beside a held
   session. This is the bound `-re` used to provide, minus the part where `-re`
   also capped the buffer. A stopped process costs nothing, resumes instantly,

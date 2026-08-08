@@ -439,26 +439,26 @@ bump may break compatibility and a **patch** bump never does.
   full-screen, Split View, Picture in Picture, and multitasking-control checks.
 
 - **iPad remux playback gets a larger server-side recovery margin.**
-  Physical-device telemetry reproduced the same sequence every six
-  minutes: the server suspended ffmpeg at 186 seconds ahead; AVPlayer stopped
-  fetching with about 95 seconds buffered; and the producer remained 138
-  seconds ahead of the last download. Its old release point was half the
-  180-second window — 90 seconds — so it could not grant more media at the
-  observed no-fetch waterline. The result was a 12-second buffering wait and a
-  same-delivery reopen. Time-based suspension now releases 30 seconds below its
-  ceiling (150 seconds by default), which grants one additional production
-  burst at 138 seconds while retaining real hysteresis. This is not a
-  structural deadlock escape: without another client fetch the producer can
-  reach 186 seconds and become held again, leaving the existing same-delivery
-  reopen as the terminal recovery. Byte and global disk limits still release
-  at half. The status API and web/Apple overlays now show the time release
-  threshold beside held sessions. The same run also showed AVPlayer fetching
-  about 120 seconds ahead despite a 60-second preference, so live retention is
-  now 180 seconds: that measured lead plus 30 seconds of back buffer and 30
-  seconds for retry/reload. This grows the default per-session media span from
-  about 300 to 360 seconds, so the 8 GiB global scratch cap may bind roughly one
-  4K stream sooner. Regression tests pin the release/recurrence thresholds and
-  the retained/pruned segment boundary.
+  Two physical-device traces exposed the two margins the server had conflated.
+  First, AVPlayer fetched about 120 seconds ahead despite a 60-second
+  preference, so retaining only 120 seconds behind that frontier could move
+  the playlist boundary onto the playhead. Live retention is now 180 seconds:
+  the measured lead plus 30 seconds of back buffer and 30 seconds for
+  retry/reload. Second, build 36 proved that fixed time hysteresis can deadlock
+  even inside that retained window. The server suspended at its 180-second
+  ceiling; the iPad advanced only to 154 seconds ahead; and the producer stayed
+  held because its release was 150 seconds. AVPlayer polled the unchanged EVENT
+  playlist for 84 seconds, ran dry, waited 12.29 seconds, and reopened. Time
+  suspension now releases at the same 180-second ceiling that holds it, so one
+  whole-segment frontier advance immediately grants the next production
+  increment. This can yield one stop/start pair per segment near the ceiling,
+  but never one per poll because unchanged state emits no signal. Byte and
+  global disk limits still release at half. The status API and web/Apple
+  overlays show the active time release beside held sessions. The wider
+  retention grows the default per-session media span from about 300 to 360
+  seconds, so the 8 GiB global scratch cap may bind roughly one 4K stream
+  sooner. Regression tests pin the release boundary and the retained/pruned
+  segment set.
 
 - **An Apple client that remains stuck buffering now recovers visibly and
   leaves evidence.** After a title has rendered for five seconds, a sustained

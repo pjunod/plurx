@@ -598,15 +598,16 @@ struct AheadLimits {
 ///
 /// Any single limit is enough to suspend; resuming needs all of them below
 /// their release thresholds. Byte budgets release at half because they are
-/// hard disk bounds. Media time releases 30 seconds below its ceiling (never
-/// below half): a physical iPad stopped fetching with about 95 seconds still
-/// buffered, leaving the held producer 138 seconds ahead. Releasing there
-/// grants one more production burst instead of waiting for the client to fetch
-/// down to the old 90-second threshold. If the client still does not fetch,
-/// the producer can cross 150 seconds and become held again; the client's
-/// same-delivery reopen remains the terminal recovery path.
+/// hard disk bounds. Media time releases at its ceiling: native AVPlayer asks
+/// for whole, variable-duration segments and then waits for the EVENT playlist
+/// to advance. A lower fixed release point stranded a physical iPad at 154
+/// seconds ahead while its 150-second release remained unreachable, even
+/// though the client kept polling. Matching the hold ceiling turns each later
+/// segment fetch into permission to produce the next increment. The state
+/// comparison in `apply_ahead_window` still prevents repeat signals while
+/// neither frontier moves.
 fn time_release_threshold(limit: i64) -> Option<i64> {
-    (limit > 0).then(|| limit.saturating_sub(30).max(limit / 2))
+    (limit > 0).then_some(limit)
 }
 
 fn should_suspend(
@@ -616,11 +617,7 @@ fn should_suspend(
     currently_suspended: bool,
 ) -> bool {
     let half = |limit: i64| limit / 2;
-    let time_limit = if currently_suspended {
-        time_release_threshold(limits.max_secs).unwrap_or(limits.max_secs)
-    } else {
-        limits.max_secs
-    };
+    let time_limit = time_release_threshold(limits.max_secs).unwrap_or(limits.max_secs);
     let byte_limit = |limit: i64| {
         if currently_suspended {
             half(limit)
@@ -4509,14 +4506,17 @@ impl TranscodeManager {
     /// just-in-time server uses, and unlike a rate limit it adapts to a viewer
     /// who pauses.
     ///
-    /// Hysteresis is deliberate: media time resumes 30 seconds below the
-    /// window, while byte limits resume at half. One threshold would toggle a
-    /// session on every tick; the larger release point gives a held iPad
-    /// session one more production burst at its observed no-fetch waterline.
-    /// The producer can be held again if the client remains stopped. SIGKILL
-    /// still works on a stopped process, so the idle reaper and the admin stop
-    /// button need no special case; a suspended session that nobody comes back
-    /// to is reaped on idle like any other.
+    /// Media time resumes at the same boundary that holds it. That lets a
+    /// whole-segment client fetch immediately earn the next production
+    /// increment; the old lower release point left native AVPlayer polling an
+    /// unchanged EVENT playlist until its buffer emptied. This can yield one
+    /// stop/start pair per client segment near the ceiling, but never per poll:
+    /// `want_suspend == suspended` below suppresses a signal until a frontier
+    /// actually crosses the boundary. Byte limits retain half-window
+    /// hysteresis because they are hard disk bounds. SIGKILL still works on a
+    /// stopped process, so the idle reaper and the admin stop button need no
+    /// special case; a suspended session that nobody comes back to is reaped
+    /// on idle like any other.
     async fn apply_ahead_window(
         &self,
         session: &Session,
@@ -5213,7 +5213,7 @@ mod tests {
         let before = mgr.session_status(&info.session_id).await.expect("status");
         assert_eq!(
             before.resume_below_seconds,
-            Some(150),
+            Some(180),
             "status exposes the release threshold needed to diagnose a held session"
         );
         let before = before.idle_seconds;
@@ -5562,8 +5562,8 @@ mod tests {
             seconds: 0,
             bytes: n,
         };
-        assert_eq!(time_release_threshold(180), Some(150));
-        assert_eq!(time_release_threshold(60), Some(30));
+        assert_eq!(time_release_threshold(180), Some(180));
+        assert_eq!(time_release_threshold(60), Some(60));
         assert_eq!(time_release_threshold(0), None);
         // Running: hold once past any single window.
         assert!(!should_suspend(secs(179), 0, limits, false));
@@ -5573,16 +5573,16 @@ mod tests {
         // — several healthy 4K streams fill a disk between them.
         assert!(should_suspend(secs(10), 8_001, limits, false));
 
-        // Held: time keeps a 30s gap from the ceiling. The physical iPad
-        // stopped fetching while the producer was 138s ahead, so release there
-        // grants one additional production burst instead of waiting for the
-        // old half-window (90s) threshold.
-        assert!(should_suspend(secs(151), 0, limits, true));
-        assert!(!should_suspend(secs(150), 0, limits, true));
-        assert!(!should_suspend(secs(138), 0, limits, true));
+        // Held: time releases at the hold ceiling. Build 36 stranded native
+        // AVPlayer at 154s ahead for 84s: it polled the EVENT playlist but did
+        // not fetch enough whole segments to cross the old 150s release. At
+        // the shared boundary, its first frontier advance earns more media.
+        assert!(should_suspend(secs(181), 0, limits, true));
+        assert!(!should_suspend(secs(180), 0, limits, true));
+        assert!(!should_suspend(secs(154), 0, limits, true));
         assert!(
             should_suspend(secs(186), 0, limits, true),
-            "without another client fetch, the producer can hit the ceiling and hold again"
+            "without a client fetch, the producer stays held above the ceiling"
         );
         // Byte budgets remain hard disk bounds and release only at half.
         assert!(should_suspend(secs(10), 4_001, limits, true));

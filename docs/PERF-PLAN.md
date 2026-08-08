@@ -465,14 +465,17 @@ with an ahead-window suspend replacing `-re` as the disk bound.
   suspend when: ahead_seconds > hls_ahead_max_secs (180)
             or  ahead_bytes   > hls_ahead_max_bytes (2 GB/session)
             or  global scratch across sessions > scratch budget
-  resume  when: ahead_seconds ≤ max(half, ceiling − 30 s) (150 s default)
+  resume  when: ahead_seconds ≤ hls_ahead_max_secs (180 s default)
             and byte/global triggers are each below half their limit
   ```
 
-  The time release grants another production burst at the 138 s no-fetch
-  frontier measured on a physical iPad. It is not a structural escape: if the
-  client remains stopped, the producer can pass 150 s and become held again.
-  Client same-delivery reopen remains the terminal recovery. Session status
+  Time has no lower hysteresis. A physical iPad on build 36 advanced its
+  frontier only to 154 s ahead, then polled an unchanged EVENT playlist for
+  84 s while the server waited for the old 150 s release. Matching release to
+  the hold ceiling makes a whole-segment fetch immediately earn the next
+  production increment. That can toggle once per segment near the boundary;
+  the state guard prevents a signal on repeated polls. Byte limits keep their
+  half-window hysteresis because they are hard disk bounds. Session status
   reports the active time release as `resume_below_seconds` so operators can
   distinguish this state from an encoder stall.
 
@@ -1709,7 +1712,7 @@ Playlist/segment capability-URL auth is untouched — AirPlay depends on it.
 | # | Decision | Choice |
 |---|---|---|
 | 1 | Client buffer policy | Seconds only (`60`/`30`), provisional; byte value stays default; M0 evidence required to change it (§4.3) |
-| 2 | Server ahead policy | Three named frontiers (§4.2); pace on playable−fetched from `EXTINF`; suspend on time **or** per-session bytes **or** global scratch. **Revised 2026-08-07 after physical-iPad evidence:** time releases at max(half, ceiling−30 s), 150 s by default, while byte/global limits still release at half; this grants one more burst but can pin again without a client fetch. Retention covers the measured 120 s forward lead + back-buffer + retry ≈ 180 s. |
+| 2 | Server ahead policy | Three named frontiers (§4.2); pace on playable−fetched from `EXTINF`; suspend on time **or** per-session bytes **or** global scratch. **Revised 2026-08-08 after a build-36 physical-iPad trace:** time releases at the same 180 s ceiling that holds it, because the former 150 s threshold stranded AVPlayer at 154 s while it polled an unchanged EVENT playlist for 84 s. Byte/global limits still release at half. Retention covers the measured 120 s forward lead + back-buffer + retry ≈ 180 s. |
 | 3 | Playlist/GC contract | ~~EVENT + documented 404s outside the retention window.~~ **Reversed 2026-08-04 after live AVPlayer evidence:** keep EVENT as the internal writer history, but serve a sliding window that omits the pruned prefix and advances `MEDIA-SEQUENCE`; deletion inside the 180 s retention window remains forbidden. A native player may revisit a playlist entry after a reload or decoder reset, so “normal forward clients will not ask again” was not a safe wire contract. |
 | 4 | ABR handoff | Visible restart (Option A) with measured p95 interruption SLO — proposed ≤2.5 s on LAN, **operator confirms**; estimate seeded across Hls instances; severe pressure jumps straight to the highest safe rung |
 | 5 | Over-capacity & fallback admission | Queue ≤5 s → *measured-safe* software recipe (recent speed ≥ ~1.2× for that pipeline class — never "720p is safe") → capacity error; cluster inserts "another node" first |
