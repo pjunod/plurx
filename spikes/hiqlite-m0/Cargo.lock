@@ -2169,7 +2169,6 @@ dependencies = [
  "async-trait",
  "getrandom 0.2.17",
  "hex",
- "hiqlite",
  "kamadak-exif",
  "quick-xml 0.41.0",
  "regex",
