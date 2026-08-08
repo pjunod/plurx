@@ -1,9 +1,9 @@
-//! The first replicated store slice: settings and authentication state.
+//! The complete replicated durable-store backend.
 //!
-//! This module intentionally implements only [`SettingsStore`], [`UserStore`],
-//! and [`ApiKeyStore`]. SQLite remains the daemon's complete [`Store`](super::Store)
-//! until the later M1 slices port every remaining trait. The narrow type keeps
-//! that boundary honest: it cannot be placed behind `Arc<dyn Store>` yet.
+//! The trait implementations are split across this module and the sibling
+//! catalogue, media, and durable modules. SQLite remains the daemon's selected
+//! [`Store`](super::Store) until M2 imports existing state and activates this
+//! backend; backend completeness alone is not permission to skip that gate.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -19,8 +19,8 @@ use super::{keys, ApiKeyStore, SettingsStore, UserStore};
 use crate::domain::{ApiKey, User};
 use crate::error::StoreError;
 
-pub const AUTH_SCHEMA_VERSION: i64 = 2;
-pub const AUTH_PROTOCOL_VERSION: i64 = 2;
+pub const AUTH_SCHEMA_VERSION: i64 = 3;
+pub const AUTH_PROTOCOL_VERSION: i64 = 3;
 
 const READY_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -80,7 +80,7 @@ impl ClusterCompatibility {
     };
 }
 
-/// A hiqlite client restricted to the first replicated Store slice.
+/// A hiqlite client implementing the complete replicated [`Store`](super::Store).
 #[derive(Clone)]
 pub struct HiqliteAuthStore {
     pub(super) client: Client,
@@ -88,7 +88,8 @@ pub struct HiqliteAuthStore {
 }
 
 impl HiqliteAuthStore {
-    /// Create the M1b schema on a fresh cluster and seed its logical identity.
+    /// Create the complete durable schema on a fresh cluster and seed its
+    /// logical identity.
     ///
     /// Only the bootstrap coordinator calls this. Other voters call [`open`]
     /// after the acknowledged schema write has replicated.
@@ -99,6 +100,7 @@ impl HiqliteAuthStore {
             result.map_err(database_error)?;
         }
         super::hiqlite_catalog::install_schema(&client).await?;
+        super::hiqlite_durable::install_schema(&client).await?;
 
         let store = Self::with_clock(client, Arc::new(SystemClock));
         let now = store.now()?;
@@ -157,6 +159,7 @@ impl HiqliteAuthStore {
     pub async fn local_dump_digest(&self) -> Result<String, StoreError> {
         let dump = AuthStoreDump {
             catalog_digest: super::hiqlite_catalog::local_catalog_digest(&self.client).await?,
+            durable_digest: super::hiqlite_durable::local_durable_digest(&self.client).await?,
             cluster_meta: self
                 .client
                 .query_map(
@@ -681,6 +684,7 @@ fn verify_compatibility_rows(
 #[derive(Serialize)]
 struct AuthStoreDump {
     catalog_digest: String,
+    durable_digest: String,
     cluster_meta: Vec<ClusterMetaDumpRow>,
     settings: Vec<SettingDumpRow>,
     users: Vec<UserDumpRow>,

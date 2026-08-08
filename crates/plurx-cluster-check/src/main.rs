@@ -1,4 +1,4 @@
-//! Separate-process M1b/M1c cluster validation.
+//! Separate-process M1b/M1c/M1d cluster validation.
 //!
 //! hiqlite owns process-global listener and shutdown state, so an in-process
 //! three-client test cannot prove process loss. The controller starts this
@@ -15,12 +15,14 @@ use anyhow::{anyhow, bail, Context, Result};
 use hiqlite::tls::ServerTlsConfig;
 use hiqlite::{Client, Node, NodeConfig};
 use plurx_core::domain::{
-    ItemKind, ItemSort, LibraryKind, MetadataPatch, NewItem, NewLibrary, ProbeResult,
+    ItemKind, ItemSort, LibraryKind, MetadataPatch, NewItem, NewLibrary, NewOfflinePackage,
+    OfflineCreateOutcome, OfflineLeaseOutcome, ProbeResult, TraktAuth,
 };
 use plurx_core::store::{
     ApiKeyStore, ClusterCompatibility, HiqliteAuthStore, LibraryStore, MediaStore,
-    ReconcileOutcome, RootFingerprintStatus, SettingsStore, UserStore, WatchStore,
-    AUTH_PROTOCOL_VERSION, AUTH_SCHEMA_VERSION,
+    OfflinePackageStore, ReconcileOutcome, RootFingerprintStatus, SettingsStore, TraktStore,
+    TranscodeCacheStore, UserStore, WatchStore, WatchedOutboxStore, AUTH_PROTOCOL_VERSION,
+    AUTH_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -58,7 +60,7 @@ async fn controller() -> Result<()> {
     run_failure_case(FailureTarget::Follower).await?;
     println!("cluster-check: leader loss");
     run_failure_case(FailureTarget::Leader).await?;
-    println!("cluster-check: all M1b/M1c failure contracts passed");
+    println!("cluster-check: all M1b/M1c/M1d failure contracts passed");
     Ok(())
 }
 
@@ -732,6 +734,7 @@ async fn exercise(store: &HiqliteAuthStore, ordinal: u64) -> Result<()> {
             movie,
             &MetadataPatch {
                 overview: Some(format!("replicated browse search voter {suffix}")),
+                tmdb_id: Some(10_000 + ordinal as i64),
                 genres: Some(vec!["Science Fiction".to_owned()]),
                 enriched: true,
                 ..MetadataPatch::default()
@@ -788,6 +791,306 @@ async fn exercise(store: &HiqliteAuthStore, ordinal: u64) -> Result<()> {
         .await?;
     if state.position_ms != 30_000 || state.duration_ms != Some(120_000) || state.watched {
         bail!("replicated watch progress did not prefer the probed duration");
+    }
+
+    let trakt = TraktAuth {
+        user_id: user.id,
+        access_token: format!("trakt-access-{suffix}"),
+        refresh_token: format!("trakt-refresh-{suffix}"),
+        expires_at: 4_000_000_000,
+        trakt_username: Some(format!("trakt-{suffix}")),
+        connected_at: 1_700_000_000 + ordinal as i64,
+        last_sync_at: 0,
+        last_activities: None,
+    };
+    store.put_trakt_auth(&trakt).await?;
+    store
+        .set_trakt_sync(user.id, 1_700_000_100 + ordinal as i64, Some("{}"))
+        .await?;
+    store
+        .update_trakt_tokens(
+            user.id,
+            &format!("trakt-access-new-{suffix}"),
+            &format!("trakt-refresh-new-{suffix}"),
+            4_000_000_001,
+        )
+        .await?;
+    if store
+        .get_trakt_auth(user.id)
+        .await?
+        .is_none_or(|auth| auth.access_token != format!("trakt-access-new-{suffix}"))
+        || !store
+            .list_trakt_auth()
+            .await?
+            .iter()
+            .any(|auth| auth.user_id == user.id)
+        || !store
+            .trakt_sync_candidates(user.id)
+            .await?
+            .iter()
+            .any(|candidate| candidate.item_id == movie)
+    {
+        bail!("replicated Trakt link/candidate join failed");
+    }
+    let unlink_user = store
+        .create_user(&format!("trakt-unlink-{suffix}"), "hash", false)
+        .await?;
+    let mut unlink = trakt.clone();
+    unlink.user_id = unlink_user.id;
+    store.put_trakt_auth(&unlink).await?;
+    store.delete_trakt_auth(unlink_user.id).await?;
+    if store.get_trakt_auth(unlink_user.id).await?.is_some() {
+        bail!("replicated Trakt unlink failed");
+    }
+
+    let outbox_id = store
+        .enqueue_watched(&format!(r#"{{"item":{movie}}}"#))
+        .await?;
+    let mut outbox = store
+        .due_watched(100)
+        .await?
+        .into_iter()
+        .find(|entry| entry.id == outbox_id)
+        .context("replicated outbox entry was not due")?;
+    outbox.attempts = 1;
+    outbox.status = "ok".to_owned();
+    store.settle_watched(&outbox).await?;
+
+    let node_id = format!("node-{suffix}");
+    let recipe_hash = format!("recipe-{suffix}");
+    if !store
+        .claim_cache_entry(&recipe_hash, file, 1, &node_id, &format!("cache/{suffix}"))
+        .await?
+    {
+        bail!("first replicated cache claim was not accepted");
+    }
+    if store
+        .claim_cache_entry(
+            &recipe_hash,
+            file,
+            1,
+            &node_id,
+            &format!("cache/moved-{suffix}"),
+        )
+        .await?
+    {
+        bail!("second replicated cache claim moved an existing owner");
+    }
+    store
+        .complete_cache_entry(&recipe_hash, &node_id, 800 + ordinal as i64)
+        .await?;
+    store.touch_cache_entry(&recipe_hash, &node_id).await?;
+    if store.cache_hit(&recipe_hash, &node_id).await?.is_none()
+        || store.cache_hit(&recipe_hash, "other-node").await?.is_some()
+        || !store
+            .cache_by_age(&node_id, 100)
+            .await?
+            .iter()
+            .any(|row| row.recipe_hash == recipe_hash)
+        || !store
+            .all_cache_rows(&node_id)
+            .await?
+            .iter()
+            .any(|row| row.recipe_hash == recipe_hash)
+    {
+        bail!("replicated cache location lost node ownership");
+    }
+    let abandoned = format!("abandoned-recipe-{suffix}");
+    if !store
+        .claim_cache_entry(
+            &abandoned,
+            file,
+            1,
+            &node_id,
+            &format!("cache/abandoned-{suffix}"),
+        )
+        .await?
+    {
+        bail!("replicated abandoned cache claim was not accepted");
+    }
+    store.touch_cache_claim(&abandoned, &node_id).await?;
+    if !store
+        .stale_cache_claims(&node_id, i64::MAX)
+        .await?
+        .iter()
+        .any(|row| row.recipe_hash == abandoned)
+    {
+        bail!("replicated stale cache claim was not visible");
+    }
+    store
+        .forget_cache_entry(&abandoned, &node_id, "local")
+        .await?;
+    if store.cache_hit(&abandoned, &node_id).await?.is_some() {
+        bail!("replicated cache forget left a serveable row");
+    }
+
+    let offline = NewOfflinePackage {
+        id: format!("offline-{suffix}"),
+        request_id: format!("offline-request-{suffix}"),
+        user_id: user.id,
+        file_id: file,
+        node_id: node_id.clone(),
+        source_path: format!("/cluster/media/{suffix}/proof-{suffix}.mkv"),
+        source_size: 1_000 + ordinal as i64,
+        source_mtime: 1_700_000_000 + ordinal as i64,
+        target_height: 720,
+        output_width: Some(1280),
+        output_height: Some(720),
+        audio_index: Some(1),
+        audio_offset_ms: 0,
+        subtitle_index: None,
+        subtitle_language: None,
+        subtitle_mode: "none".to_owned(),
+        estimated_bytes: 700,
+        reserved_bytes: 900,
+        expires_at: 4_000_000_000,
+    };
+    if !matches!(
+        store
+            .create_offline_package(&offline, 10, 100_000, 1_000_000)
+            .await?,
+        OfflineCreateOutcome::Created(_)
+    ) {
+        bail!("replicated offline admission was not created");
+    }
+    if !matches!(
+        store
+            .create_offline_package(&offline, 10, 100_000, 1_000_000)
+            .await?,
+        OfflineCreateOutcome::Existing(_)
+    ) {
+        bail!("replicated offline admission was not idempotent");
+    }
+    let mut conflict = offline.clone();
+    conflict.target_height = 1080;
+    if store
+        .create_offline_package(&conflict, 10, 100_000, 1_000_000)
+        .await?
+        != OfflineCreateOutcome::RequestConflict
+    {
+        bail!("replicated offline request conflict was not detected");
+    }
+    let mut rejected = offline.clone();
+    rejected.id = format!("offline-rejected-{suffix}");
+    rejected.request_id = format!("offline-rejected-request-{suffix}");
+    if !matches!(
+        store
+            .create_offline_package(&rejected, 0, 100_000, 1_000_000)
+            .await?,
+        OfflineCreateOutcome::RowLimit { .. }
+    ) || !matches!(
+        store
+            .create_offline_package(&rejected, 10, 1, 1_000_000)
+            .await?,
+        OfflineCreateOutcome::ByteLimit { .. }
+    ) || !matches!(
+        store
+            .create_offline_package(&rejected, 10, 100_000, 1)
+            .await?,
+        OfflineCreateOutcome::GlobalByteLimit { .. }
+    ) {
+        bail!("replicated offline quota refusal contract failed");
+    }
+    if store
+        .claim_next_offline_package(&node_id)
+        .await?
+        .is_none_or(|package| package.id != offline.id)
+        || !store
+            .set_offline_package_recipe(&offline.id, &recipe_hash)
+            .await?
+        || !store
+            .update_offline_progress(&offline.id, "video", 500)
+            .await?
+        || !store
+            .mark_offline_package_ready(&offline.id, &recipe_hash, 800, 120_000)
+            .await?
+    {
+        bail!("replicated offline preparation state machine failed");
+    }
+    if !matches!(
+        store
+            .put_offline_lease(
+                &offline.id,
+                user.id,
+                &format!("offline-token-{suffix}"),
+                4_000_000_000,
+            )
+            .await?,
+        OfflineLeaseOutcome::Created(_)
+    ) || store.offline_package_stats(&node_id, 1).await?.ready != 1
+        || store.cache_bytes(&node_id).await? != 0
+    {
+        bail!("replicated offline lease/pinned-cache accounting failed");
+    }
+    if !matches!(
+        store
+            .put_offline_lease(
+                &offline.id,
+                user.id,
+                &format!("offline-token-{suffix}"),
+                4_000_000_001,
+            )
+            .await?,
+        OfflineLeaseOutcome::Renewed(_)
+    ) || store
+        .put_offline_lease(
+            &offline.id,
+            user.id,
+            &format!("offline-token-conflict-{suffix}"),
+            4_000_000_001,
+        )
+        .await?
+        != OfflineLeaseOutcome::TokenConflict
+        || store
+            .renew_offline_package_for_user(&offline.id, user.id, 4_000_000_002)
+            .await?
+            .is_none()
+        || !store
+            .offline_activity_packages(&node_id, 1, 0, 100)
+            .await?
+            .iter()
+            .any(|row| row.package.id == offline.id && row.lease_active)
+    {
+        bail!("replicated offline renewal/activity contract failed");
+    }
+
+    let mut work = offline.clone();
+    work.id = format!("offline-work-{suffix}");
+    work.request_id = format!("offline-work-request-{suffix}");
+    store
+        .create_offline_package(&work, 10, 100_000, 1_000_000)
+        .await?;
+    if store
+        .claim_next_offline_package(&node_id)
+        .await?
+        .is_none_or(|package| package.id != work.id)
+        || store.reset_interrupted_offline_packages(&node_id).await? != 1
+        || store
+            .claim_next_offline_package(&node_id)
+            .await?
+            .is_none_or(|package| package.id != work.id)
+        || !store.requeue_offline_package(&work.id).await?
+        || store
+            .claim_next_offline_package(&node_id)
+            .await?
+            .is_none_or(|package| package.id != work.id)
+        || !store
+            .fail_offline_package(&work.id, "video", "proof", "expected")
+            .await?
+        || !store.delete_offline_package(&work.id, user.id).await?
+    {
+        bail!("replicated offline recovery/failure/delete contract failed");
+    }
+
+    let mut expired = offline.clone();
+    expired.id = format!("offline-expired-{suffix}");
+    expired.request_id = format!("offline-expired-request-{suffix}");
+    expired.expires_at = 1;
+    store
+        .create_offline_package(&expired, 10, 100_000, 1_000_000)
+        .await?;
+    if store.expire_offline_packages(2).await? == 0 {
+        bail!("replicated offline expiry did not remove an expired package");
     }
     Ok(())
 }
@@ -866,6 +1169,26 @@ async fn verify_proof(store: &HiqliteAuthStore) -> Result<()> {
         {
             bail!("lost acknowledged media/watch state from node {ordinal}");
         }
+        if store.get_trakt_auth(user.id).await?.is_none()
+            || store
+                .offline_package_for_user(&format!("offline-{suffix}"), user.id)
+                .await?
+                .is_none_or(|package| package.state != "ready")
+            || store
+                .offline_package_for_lease(&format!("offline-token-{suffix}"), 1, 4_000_000_000)
+                .await?
+                .is_none()
+            || store
+                .cache_hit(&format!("recipe-{suffix}"), &format!("node-{suffix}"))
+                .await?
+                .is_none()
+        {
+            bail!("lost acknowledged Trakt/cache/offline state from node {ordinal}");
+        }
+    }
+    let (_, ok, _) = store.watched_outbox_counts().await?;
+    if ok != 3 {
+        bail!("lost acknowledged watched-outbox rows after voter loss: ok={ok}");
     }
     if catalog_view(store).await?.search.len() != 3 {
         bail!("lost local FTS search rows after voter loss");

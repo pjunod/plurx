@@ -1,8 +1,8 @@
 # Clustering transition — from one plurxd node to Phase 4
 
-**Status:** executing — M0 and M1a merged; M1b is under review; M1c's
-catalogue/watch backend and failure gate are implemented on the stacked branch,
-daemon activation still pending
+**Status:** executing — M0 and M1a merged; M1b is green under review; M1c and
+M1d are implemented on stacked branches; import and daemon activation still
+pending
 · **Executes:** Phase 4 from [ROADMAP.md](ROADMAP.md) and REQ-HA-1–6 from
 [REQUIREMENTS.md](REQUIREMENTS.md) · **Written:** 2026-08-06 · **Revised:**
 2026-08-07
@@ -54,12 +54,12 @@ quietly wider threshold.
 
 M0 now provides tolerated cluster configuration and local node identity; M1a
 provides the full backend-neutral parity inventory; M1b provides the first
-hiqlite auth/settings backend; and M1c adds libraries, media, watch state,
-node-local FTS, and bounded root-aware reconciliation to the same
-three-process failure harness. The daemon still opens the complete SQLite
-store. Membership/join, full-store activation, lease-fenced publication,
-replicated session ownership, serving self-fencing, and client failover do not
-exist yet.
+hiqlite auth/settings backend; M1c adds libraries, media, watch state,
+node-local FTS, and bounded root-aware reconciliation; and M1d completes the
+116-method store plus the progress write-rate gate. The daemon still opens the
+complete SQLite store. Import, membership/join, full-store activation,
+lease-fenced publication, replicated session ownership, serving self-fencing,
+and client failover do not exist yet.
 
 ## 3. Contracts — safety lives in signatures and transactions
 
@@ -448,6 +448,31 @@ cache ownership. Run the full parity suite against SQLite and three voters.
 latency, RSS, and growth budgets pass; offline/cache rows retain node-local
 ownership on all replicas.
 
+**Backend slice delivered 2026-08-07; daemon activation remains open.**
+`HiqliteAuthStore` now implements all 116 `Store` methods. Trakt credentials,
+the watched outbox, cache recipes and locations, offline packages, and offline
+leases use quorum-consistent reads and deterministic replicated writes. Cache
+and offline rows replicate as ownership facts while their paths and bytes stay
+node-local. Offline admission applies idempotency, per-user and global quotas,
+and row limits in one conditional statement; lease creation and renewal keep
+the durable token and ephemeral guard in one transaction.
+
+`make cluster-check` exercises every remaining method through the three
+separate voters, including conflicting cache claims, stale claims, offline
+idempotency and quota refusal, retry transitions, and lease-token conflict. It
+then carries the expanded digest through the existing follower-loss and
+leader-loss cases. The server-side progress coalescer commits the leading beat,
+replaces intermediate beats with one trailing value, and flushes that newest
+value at the ten-second boundary. A new 95% watched transition commits
+synchronously; dated offline imports remain separate ordered facts.
+
+The 2026-08-07 one-voter rerun measured 0.083333 ms p95 progress latency,
+6,832,128 bytes (6.52 MiB) additional idle RSS, and 8,309,777 bytes of data
+growth for 10,000 writes. All three cost budgets pass. Paused-time daemon tests
+prove one steady-state durable commit per ten-second stream window and the
+terminal watched exception. M2 still owns importing an existing SQLite store
+and selecting the complete hiqlite backend at startup.
+
 ### 6.6 M2 — migrate an existing install
 
 Implement §4 and make one-voter hiqlite the default only after the import gate
@@ -544,19 +569,19 @@ mode without lowering quality or losing selected tracks.
 6. **Do not call a VIP the failover implementation.** A VIP locates a process;
    replicated state, fencing, and takeover let it continue the film.
 
-## 8. Handoff checkpoint — M1c has catalogue evidence, not daemon activation
+## 8. Handoff checkpoint — M1d completes the backend, not daemon activation
 
-M0 and M1a are on `main`; M1b is under review and M1c is stacked on its exact
-head. Keep SQLite as the daemon's complete store until every trait has one
-replicated implementation and the import gate is ready. The next implementation
-boundary is M1d: Trakt/outbox, cache/offline ownership, the remaining durable
-contracts, and the ten-second progress coalescer with measured write-rate
-evidence.
+M0 and M1a are on `main`; M1b is green under review, M1c is stacked on its exact
+head, and M1d is stacked on M1c. Every trait now has one replicated
+implementation, but keep SQLite as the daemon's selected store until the import
+gate is ready. The next implementation boundary is M2: resumable v14 import,
+content-hash comparison, failure-injected recovery, and the one-voter hiqlite
+startup switch.
 
 ```bash
 make check                    # M0 and every milestone: repository baseline
 make validate-staged          # changed behavior contracts
-make cluster-check            # M1b/M1c three-voter state, FTS, and loss gate
+make cluster-check            # M1b/M1c/M1d durable state, FTS, and loss gate
 cargo test -p plurx-core store::sqlite::tests:: -- --nocapture
                               # explicit local M2 database-upgrade gate
 ```

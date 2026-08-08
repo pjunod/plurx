@@ -135,17 +135,17 @@ power-loss durability measurement.
 
 | Measure | SQLite | One-voter hiqlite | Gate | Result |
 |---|---:|---:|---:|---|
-| p95 progress latency | 0.041458 ms | 0.076834 ms | ≤25 ms and ≤max(2× SQLite, SQLite + 0.5 ms) | Pass |
-| Idle RSS after warm-up | — | +7,077,888 bytes (6.75 MiB) | ≤100 MiB additional | Pass |
-| Data-directory growth, 10,000 writes | 2,759,224 bytes | 8,309,777 bytes | ≤68,068,864 bytes | Pass |
-| Durable watch commits while playing | web: one / 5 s; Apple and Android: one / 10 s | Not yet active | ≤one / 10 s / stream | Known M1d blocker |
+| p95 progress latency | 0.051834 ms | 0.083333 ms | ≤25 ms and ≤max(2× SQLite, SQLite + 0.5 ms) | Pass |
+| Idle RSS after warm-up | — | +6,832,128 bytes (6.52 MiB) | ≤100 MiB additional | Pass |
+| Data-directory growth, 10,000 writes | 2,742,648 bytes | 8,309,777 bytes | ≤68,068,864 bytes | Pass |
+| Durable watch commits while playing | web: one / 5 s; Apple and Android: one / 10 s | leading beat plus one latest-value trailing flush / 10 s | ≤one / 10 s / stream | Pass |
 
 The original pure-ratio gate was unstable on sub-millisecond storage because
 it treated fixed Raft overhead as proportional overhead. An earlier run
 measured a 0.235 ms fixed tax. The revised relative limit is the larger of 2×
 SQLite or SQLite + 0.5 ms: the additive branch is approximately twice that
 observed tax, while the ratio branch takes over on slower storage. On the
-recorded run the relative ceiling was 0.541458 ms and hiqlite used 14.2% of
+recorded run the relative ceiling was 0.551834 ms and hiqlite used 15.1% of
 it; the separate 25 ms user-impact ceiling remains unchanged.
 
 Net hiqlite growth was 830.98 bytes per progress write after production-tuned
@@ -153,8 +153,9 @@ snapshotting. At four concurrent streams for six hours per day, today's web
 five-second beat extrapolates to 13.69 MiB/day or 4.88 GiB/year; the native
 ten-second beat is 6.85 MiB/day or 2.44 GiB/year. The gate itself still permits
 39.98 GiB/year at the web rate, so passing it is not evidence that the steady
-state is acceptable for a small SD card. M1d must coalesce writes and remeasure
-post-compaction growth before the replicated store becomes production.
+state is acceptable for a small SD card. M1d now coalesces the web client's
+five-second beat to one steady-state commit per ten seconds; M2 must preserve
+that rate when the replicated store becomes the selected production backend.
 
 Crash recovery, snapshot catch-up, and leader failover remain outside this M0
 in-process harness. hiqlite 0.14 uses a process-global shutdown handler, so one
@@ -163,11 +164,14 @@ separate processes. The test's deliberate guard failures also surface as
 background-thread panics, which is evidence of rejection but not evidence that
 the writer remains healthy after replay failure.
 
-The watch-rate row is intentionally not marked green. The handler currently
-writes every received beat. Web sends every five seconds; the native clients
-already send every ten seconds. M1d owns the server-side coalescer, which must
-make the limit true for every client before the replicated store becomes the
-production path.
+The watch-rate row is green because the daemon now owns the rate rather than
+trusting each client. The first online beat commits immediately, intermediate
+beats replace one pending value, and the newest value flushes at the
+ten-second boundary. A newly crossed 95% watched threshold commits
+synchronously so the watched notification is not delayed or lost. Dated
+offline imports also bypass coalescing because they are ordered facts, not
+active-player heartbeats. Those semantically distinct writes are outside the
+steady-state one-commit-per-window rate.
 
 ### M1b auth-store promotion and failure proof
 
@@ -204,9 +208,24 @@ on each voter and search reads that local index.
 | Prune bound | Root comparison, deletion budget, vanished-file deletion, and empty-hierarchy pruning share one transaction. A zero-budget fixture keeps both file and item rows. |
 | Loss survival | The existing follower-loss and leader-loss cases now verify every acknowledged library, item, file, watch row, and rebuilt search row before accepting the post-loss write. |
 
-This still is not the daemon switch. M1d owns the remaining durable traits and
-the ten-second progress coalescer; M2 owns import and activation. M4 adds the
-lease token to the reconciliation boundary M1c made atomic.
+### M1d complete store and write-rate proof
+
+M1d keeps the same three-process gate and completes the replicated `Store`
+surface without moving node-local media bytes into raft.
+
+| Contract | M1d evidence |
+|---|---|
+| Store surface | `HiqliteAuthStore` implements all 116 methods, adding Trakt, watched outbox, transcode cache, offline packages, and offline leases. |
+| Deterministic replay | Caller/store timestamps and `RETURNING` ids remain mandatory; the replicated-SQL source guard covers the new schema. |
+| Node ownership | Cache locations and offline packages replicate their holder id, state, and recipe facts; paths and bytes remain on the named node. |
+| Atomic admission | One conditional offline insert enforces idempotency, conflict detection, row limits, per-user bytes, and global bytes against one committed view. |
+| Lease safety | Offline claim and renewal keep the durable lease token and ephemeral guard in one transaction; a conflicting token cannot publish. |
+| Progress rate | Paused-time daemon tests prove the newest intermediate beat is the sole trailing flush at ten seconds and a new watched transition commits synchronously. |
+| Cost rerun | 0.083333 ms p95 latency, 6.52 MiB additional idle RSS, and 8,309,777 bytes growth for 10,000 raw writes all remain inside the §1 budgets. |
+| Loss survival | The follower-loss and leader-loss cases now verify the expanded durable digest and accept post-loss writes across the remaining surfaces. |
+
+This still is not the daemon switch. M2 owns import and activation. M4 adds
+the lease token to the reconciliation boundary M1c made atomic.
 
 ## Spike 2 — Deterministic-segment transcode failover
 

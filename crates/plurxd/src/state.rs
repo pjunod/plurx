@@ -108,6 +108,9 @@ pub struct AppState {
     pub coming_soon: Arc<crate::http::ComingSoonCache>,
     /// Pushes watch state to monarr when enabled (plan §11.1).
     pub watched: Arc<crate::watched::WatchedNotifier>,
+    /// Leading/trailing progress write coalescer. Every player may report as
+    /// often as it likes; durable watch commits stay bounded for Raft.
+    pub progress: Arc<crate::progress::ProgressCoalescer>,
     /// What the storage under each library actually reads at
     /// (`crate::storeprobe`). Behind a lock and not in `SystemInfo` because,
     /// unlike the encoder list, it is not a fact about the machine that is
@@ -154,6 +157,7 @@ impl AppState {
         let jobs = Arc::new(JobManager::new(Arc::clone(&store), artwork_dir.clone()));
         let coming_soon = crate::http::ComingSoonCache::new();
         let watched = crate::watched::WatchedNotifier::new(Arc::clone(&store));
+        let progress = crate::progress::ProgressCoalescer::new(Arc::clone(&store));
         let transcode = Arc::new(
             TranscodeManager::new(
                 Arc::clone(&store),
@@ -197,6 +201,7 @@ impl AppState {
             logs,
             coming_soon,
             watched,
+            progress,
             storage: Arc::new(tokio::sync::RwLock::new(Default::default())),
             availability: Arc::new(crate::playstart::AvailabilityCache::new()),
             starts: Arc::new(crate::playstart::StartNotifier::new()),
