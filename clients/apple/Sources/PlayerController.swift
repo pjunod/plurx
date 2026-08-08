@@ -41,6 +41,54 @@ private struct ApplePlaybackFailureLog: Encodable {
     }
 }
 
+/// One sustained AVPlayer clock stall forwarded before the controller either
+/// reconnects the same delivery or stops after an immediate repeat. The
+/// server's existing `stall` vocabulary renders `ms` as `stall_ms`; position
+/// and outcome stay in the bounded detail field because the endpoint has no
+/// dedicated film-position column.
+struct ApplePlaybackStallLog: Encodable {
+    let level = "warn"
+    let event = "stall"
+    let message: String
+    let method: String
+    let title: String
+    let fileId: Int
+    let vcodec: String?
+    let detail: String
+    let ms: Int
+    let encoder: String?
+    let ua = "Apple AVPlayer"
+
+    init(
+        kind: PlaybackStallKind,
+        outcome: SameDeliveryStallRecoveryOutcome,
+        positionMs: Int,
+        durationMs: Int,
+        method: String,
+        title: String,
+        fileId: Int,
+        vcodec: String?,
+        encoder: String?
+    ) {
+        message = kind == .buffering
+            ? "AVPlayer buffering wait triggered same-delivery recovery"
+            : "AVPlayer stopped advancing and triggered same-delivery recovery"
+        self.method = method
+        self.title = title
+        self.fileId = fileId
+        self.vcodec = vcodec
+        detail = "kind=\(kind.rawValue) · position_ms=\(max(0, positionMs)) · outcome=\(outcome.rawValue)"
+        ms = max(0, durationMs)
+        self.encoder = encoder
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case level, event, message, method, title, detail, ms, encoder, ua
+        case fileId = "file_id"
+        case vcodec
+    }
+}
+
 /// Requests that arrive while a stream replacement is in flight are remembered
 /// rather than dropped. Two replacements must never overlap — they share a
 /// `playback_id`, so the newer create intentionally removes the older session
@@ -131,27 +179,102 @@ enum PlaybackStallAction: Equatable {
     case reopen
 }
 
+enum PlaybackStallKind: String, Equatable {
+    case silent
+    case buffering
+
+    var terminalState: PlaybackStallTerminalState {
+        switch self {
+        case .silent:
+            return PlaybackStallTerminalState(
+                message: "Playback stopped responding after retrying the current stream."
+            )
+        case .buffering:
+            return PlaybackStallTerminalState(
+                message: "Playback could not resume after repeated buffering. Check the connection and try again."
+            )
+        }
+    }
+}
+
+struct PlaybackStallEvent: Equatable {
+    let kind: PlaybackStallKind
+    let action: PlaybackStallAction
+    let positionMs: Int
+    let durationMs: Int
+}
+
+struct PlaybackStallSelection: Equatable {
+    let kind: PlaybackStallKind
+    let action: PlaybackStallAction
+}
+
+struct PlaybackStallTerminalState: Equatable {
+    let isPlaying = false
+    let wantsPlayback = false
+    let failed = true
+    let message: String
+}
+
+enum SameDeliveryStallRecoveryOutcome: String, Equatable {
+    case reopen
+    case terminal
+}
+
+enum SameDeliveryStallRecoveryDecision: Equatable {
+    case reopen
+    case stop(PlaybackStallTerminalState)
+
+    var outcome: SameDeliveryStallRecoveryOutcome {
+        switch self {
+        case .reopen: return .reopen
+        case .stop: return .terminal
+        }
+    }
+}
+
+/// The same stream gets one reconnect. Five seconds of later film-clock
+/// progress resets this state in the controller, so a new interruption may
+/// recover while an immediate repeat stops instead of looping.
+struct SameDeliveryStallRecoveryState: Equatable {
+    private(set) var attempted = false
+
+    mutating func next(for kind: PlaybackStallKind) -> SameDeliveryStallRecoveryDecision {
+        guard !attempted else { return .stop(kind.terminalState) }
+        attempted = true
+        return .reopen
+    }
+
+    mutating func reset() { attempted = false }
+}
+
 enum PlaybackCompatibilityFallback: Equatable {
     case none
     case hdrBase
     case transcode
 }
 
-/// Wall-clock sampling policy for AVPlayer's silent-wait failure mode. A
+/// Monotonic elapsed-time sampling policy for AVPlayer's silent-wait failure mode. A
 /// temporary buffer wait gets room to recover on its own; only sustained lack
 /// of film-time progress rebuilds the item, which is the in-player equivalent
 /// of the back-out-and-play-again workaround.
 struct PlaybackStallDetector: Equatable {
     private(set) var lastPositionMs: Int?
     private(set) var stagnantChecks = 0
+    private(set) var stagnantSince: TimeInterval?
 
-    mutating func sample(positionMs: Int, shouldMonitor: Bool) -> PlaybackStallAction {
+    mutating func sample(
+        positionMs: Int,
+        shouldMonitor: Bool,
+        observedAt: TimeInterval = ProcessInfo.processInfo.systemUptime
+    ) -> PlaybackStallAction {
         guard shouldMonitor else {
             reset()
             return .none
         }
         guard let lastPositionMs else {
             self.lastPositionMs = positionMs
+            stagnantSince = observedAt
             return .none
         }
 
@@ -161,6 +284,7 @@ struct PlaybackStallDetector: Equatable {
         if positionMs >= lastPositionMs + 250 || positionMs < lastPositionMs - 250 {
             self.lastPositionMs = positionMs
             stagnantChecks = 0
+            stagnantSince = observedAt
             return .none
         }
 
@@ -173,9 +297,84 @@ struct PlaybackStallDetector: Equatable {
         return stagnantChecks == 3 ? .nudge : .none
     }
 
+    func stagnantDurationMs(at observedAt: TimeInterval) -> Int {
+        guard let stagnantSince else { return 0 }
+        return max(0, Int(((observedAt - stagnantSince) * 1_000).rounded()))
+    }
+
     mutating func reset() {
         lastPositionMs = nil
         stagnantChecks = 0
+        stagnantSince = nil
+    }
+}
+
+/// Owns both stall detectors so predicate gating, merge precedence, cause, and
+/// measured duration are one testable policy rather than parallel expressions
+/// inside an asynchronous AVPlayer loop.
+struct PlaybackRecoveryMonitor: Equatable {
+    private(set) var silentDetector = PlaybackStallDetector()
+    private(set) var bufferingDetector = PlaybackStallDetector()
+
+    @MainActor
+    mutating func sample(
+        positionMs: Int,
+        timeControlStatus: AVPlayer.TimeControlStatus,
+        shouldMonitor: Bool,
+        establishedPlayback: Bool,
+        observedAt: TimeInterval = ProcessInfo.processInfo.systemUptime
+    ) -> PlaybackStallEvent? {
+        let silentAction = silentDetector.sample(
+            positionMs: positionMs,
+            shouldMonitor: shouldMonitor
+                && PlayerController.shouldMonitorSilentPlaybackStall(
+                    timeControlStatus: timeControlStatus
+                ),
+            observedAt: observedAt
+        )
+        let bufferingAction = bufferingDetector.sample(
+            positionMs: positionMs,
+            shouldMonitor: shouldMonitor
+                && establishedPlayback
+                && PlayerController.shouldMonitorBufferingStall(
+                    timeControlStatus: timeControlStatus
+                ),
+            observedAt: observedAt
+        )
+        guard let selection = Self.select(
+            silentAction: silentAction,
+            bufferingAction: bufferingAction
+        ) else { return nil }
+        let durationMs = selection.kind == .buffering
+            ? bufferingDetector.stagnantDurationMs(at: observedAt)
+            : silentDetector.stagnantDurationMs(at: observedAt)
+        return PlaybackStallEvent(
+            kind: selection.kind,
+            action: selection.action,
+            positionMs: positionMs,
+            durationMs: durationMs
+        )
+    }
+
+    /// Buffering wins if a future predicate change accidentally enables both
+    /// legs. The current predicates are exclusive; pinning precedence keeps a
+    /// later relaxation from routing a network wait into silent/HDR recovery.
+    static func select(
+        silentAction: PlaybackStallAction,
+        bufferingAction: PlaybackStallAction
+    ) -> PlaybackStallSelection? {
+        if bufferingAction != .none {
+            return PlaybackStallSelection(kind: .buffering, action: bufferingAction)
+        }
+        if silentAction != .none {
+            return PlaybackStallSelection(kind: .silent, action: silentAction)
+        }
+        return nil
+    }
+
+    mutating func reset() {
+        silentDetector.reset()
+        bufferingDetector.reset()
     }
 }
 
@@ -205,12 +404,11 @@ enum SubtitleSelectionRoute: Equatable {
 /// first frame (`needsNativeSubtitleSession`).
 @MainActor
 final class PlayerController: ObservableObject {
-    /// The server retains 120 seconds behind the download frontier: 60 seconds
-    /// for the client's forward fetch, 30 for back-buffering, and 30 for a
-    /// retry. AVPlayer's default of zero lets it choose the forward fetch;
-    /// once that passed the server's retention window, the reaper could delete
-    /// media the player had fetched but had not presented yet. Keep growing
-    /// HLS sessions inside the contract while leaving direct and completed-VOD
+    /// The server retains 180 seconds behind the download frontier: the 120 s
+    /// forward lead measured on a physical iPad, 30 s for back-buffering, and
+    /// 30 s for retry/reload. `preferredForwardBufferDuration` is a hint, not a
+    /// cap — AVPlayer fetched twice this 60 s preference. Keep growing HLS
+    /// sessions inside that contract while leaving direct and completed-VOD
     /// items under AVPlayer's normal policy.
     static let growingHLSForwardBufferSeconds: TimeInterval = 60
 
@@ -300,18 +498,13 @@ final class PlayerController: ObservableObject {
     /// Optimistic absolute film position for an interactive seek. It is also
     /// the base for the next relative press until the newest seek lands.
     private var seekState = PlayerSeekState()
-    private var stallDetector = PlaybackStallDetector()
-    /// Buffering is a transport condition, not decoder evidence. Keep its
-    /// wall-clock evidence separate from a silent player freeze so changing
-    /// between AVPlayer states cannot carry a nearly-triggered recovery into
-    /// the other path.
-    private var bufferingStallDetector = PlaybackStallDetector()
+    private var playbackRecoveryMonitor = PlaybackRecoveryMonitor()
     /// A clock freeze without an AVPlayerItem failure is not proof that the
     /// decoder rejected the stream. The same is true of a sustained buffering
     /// wait. Reconnect the exact delivery once; if the replacement freezes too,
     /// stop visibly instead of walking the HDR/SDR compatibility ladder on a
     /// guess.
-    private var sameDeliveryStallRetryAttempted = false
+    private var sameDeliveryStallRecovery = SameDeliveryStallRecoveryState()
     /// Evidence that this server understands `native_subtitles`: its create
     /// response handed back a native master query. A server predating the
     /// feature returns the plain playlist URL and advertises no subtitle
@@ -377,6 +570,10 @@ final class PlayerController: ObservableObject {
         }
     }
 
+    private var clientLogMethod: String {
+        isDirectPlayback ? "direct_play" : (encoder == "copy" ? "remux" : "transcode")
+    }
+
     var pgsOverlayIsActive: Bool { pgsOverlayTrackIndex == selectedSubtitle }
 
     var observedBitrate: Double? {
@@ -419,7 +616,7 @@ final class PlayerController: ObservableObject {
         forceCompatibilityTranscode = false
         establishedPlayback = false
         establishedHDRRetryAttempted = false
-        sameDeliveryStallRetryAttempted = false
+        sameDeliveryStallRecovery.reset()
         attachedAtPositionMs = max(0, startMs)
         clearPlaybackNotice()
 
@@ -606,8 +803,7 @@ final class PlayerController: ObservableObject {
         // made tvOS look as though the progress command had not worked.
         currentMs = target
         refreshPGSOverlayWindow(at: target, force: true)
-        stallDetector.reset()
-        bufferingStallDetector.reset()
+        playbackRecoveryMonitor.reset()
         let requiresReopen = isChangingStream || !(usesDirectTimeline || isVOD)
         Task {
             if !requiresReopen {
@@ -742,8 +938,7 @@ final class PlayerController: ObservableObject {
         recoveryTask?.cancel()
         recoveryTask = nil
         clearPGSOverlaySelection()
-        stallDetector.reset()
-        bufferingStallDetector.reset()
+        playbackRecoveryMonitor.reset()
         seekState.clear()
         let position = realPositionMs()
         player.pause()
@@ -1095,8 +1290,7 @@ final class PlayerController: ObservableObject {
         isPlaying = resumesPlayback
         currentMs = startMs
         attachedAtPositionMs = startMs
-        stallDetector.reset()
-        bufferingStallDetector.reset()
+        playbackRecoveryMonitor.reset()
         failed = false
         isChangingStream = false
         updateNowPlaying()
@@ -1415,36 +1609,32 @@ final class PlayerController: ObservableObject {
                     && self.player.currentItem != nil
                 let timeControlStatus = self.player.timeControlStatus
                 let position = self.realPositionMs()
-                let silentAction = self.stallDetector.sample(
+                guard let stallEvent = self.playbackRecoveryMonitor.sample(
                     positionMs: position,
-                    shouldMonitor: shouldMonitor
-                        && Self.shouldMonitorSilentPlaybackStall(
-                            timeControlStatus: timeControlStatus
-                        )
-                )
-                let bufferingAction = self.bufferingStallDetector.sample(
-                    positionMs: position,
-                    shouldMonitor: shouldMonitor
-                        && Self.shouldMonitorBufferingStall(
-                            timeControlStatus: timeControlStatus
-                        )
-                )
-                let stallAction = bufferingAction == .none ? silentAction : bufferingAction
-                switch stallAction {
+                    timeControlStatus: timeControlStatus,
+                    shouldMonitor: shouldMonitor,
+                    // A first-frame wait may be the server deliberately
+                    // filling its publish gate. Recovery begins only after
+                    // this item has advanced for five seconds, which confines
+                    // buffering recovery to the mid-playback failure reported
+                    // on iPad and prevents duplicate cold-start sessions.
+                    establishedPlayback: self.establishedPlayback
+                ) else { continue }
+                switch stallEvent.action {
                 case .none:
-                    break
+                    continue
                 case .nudge:
                     self.player.play()
                     if self.preferredRate != 1 { self.player.rate = self.preferredRate }
                     self.isPlaying = true
                 case .reopen:
                     self.currentMs = position
-                    if Self.shouldMonitorBufferingStall(timeControlStatus: timeControlStatus) {
-                        await self.retrySameDeliveryAfterStall(at: position)
+                    if stallEvent.kind == .buffering {
+                        await self.retrySameDeliveryAfterStall(stallEvent)
                         continue
                     }
                     if await self.retryEstablishedHDRDelivery(at: position) { continue }
-                    await self.retrySameDeliveryAfterStall(at: position)
+                    await self.retrySameDeliveryAfterStall(stallEvent)
                 }
             }
         }
@@ -1453,18 +1643,20 @@ final class PlayerController: ObservableObject {
     /// One bounded transport recovery shared by buffering and non-HDR silent
     /// freezes. It deliberately calls `reopen` directly: no capability flag or
     /// selected format changes, so the replacement uses the identical recipe.
-    private func retrySameDeliveryAfterStall(at position: Int) async {
-        guard !sameDeliveryStallRetryAttempted else {
+    private func retrySameDeliveryAfterStall(_ event: PlaybackStallEvent) async {
+        let decision = sameDeliveryStallRecovery.next(for: event.kind)
+        reportPlaybackStall(event, outcome: decision.outcome)
+        switch decision {
+        case .reopen:
+            await reopen(at: event.positionMs)
+        case .stop(let terminal):
             player.pause()
-            isPlaying = false
-            wantsPlayback = false
-            failed = true
-            playbackError =
-                "Playback stopped responding. The current picture was kept instead of switching formats."
-            return
+            isPlaying = terminal.isPlaying
+            wantsPlayback = terminal.wantsPlayback
+            isChangingStream = false
+            failed = terminal.failed
+            playbackError = terminal.message
         }
-        sameDeliveryStallRetryAttempted = true
-        await reopen(at: position)
     }
 
     private func fail(_ error: Error) {
@@ -1501,7 +1693,7 @@ final class PlayerController: ObservableObject {
                     self.preferredRate = self.player.rate
                     if self.realPositionMs() >= self.attachedAtPositionMs + 5_000 {
                         self.establishedPlayback = true
-                        self.sameDeliveryStallRetryAttempted = false
+                        self.sameDeliveryStallRecovery.reset()
                         // The most recent same-delivery recovery proved itself.
                         // A later, independent interruption may reconnect once
                         // too; an immediate repeated failure remains terminal.
@@ -1593,7 +1785,7 @@ final class PlayerController: ObservableObject {
         let payload = ApplePlaybackFailureLog(
             message: failure?.localizedDescription
                 ?? PlaybackPreparationError.failed.localizedDescription,
-            method: isDirectPlayback ? "direct_play" : (encoder == "copy" ? "remux" : "transcode"),
+            method: clientLogMethod,
             code: failure?.code,
             title: title,
             fileId: fileId,
@@ -1605,6 +1797,31 @@ final class PlayerController: ObservableObject {
                 eventComment: event?.errorComment
             )
         )
+        postClientLog(payload)
+    }
+
+    private func reportPlaybackStall(
+        _ event: PlaybackStallEvent,
+        outcome: SameDeliveryStallRecoveryOutcome
+    ) {
+        #if os(iOS)
+        if offlineId != nil { return }
+        #endif
+        let payload = ApplePlaybackStallLog(
+            kind: event.kind,
+            outcome: outcome,
+            positionMs: event.positionMs,
+            durationMs: event.durationMs,
+            method: clientLogMethod,
+            title: title,
+            fileId: fileId,
+            vcodec: decision?.source?.videoCodec,
+            encoder: encoder
+        )
+        postClientLog(payload)
+    }
+
+    private func postClientLog<Payload: Encodable>(_ payload: Payload) {
         guard let url = Session.shared.url("/api/v1/client-log"),
               let body = try? JSONEncoder().encode(payload)
         else { return }

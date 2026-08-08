@@ -465,8 +465,16 @@ with an ahead-window suspend replacing `-re` as the disk bound.
   suspend when: ahead_seconds > hls_ahead_max_secs (180)
             or  ahead_bytes   > hls_ahead_max_bytes (2 GB/session)
             or  global scratch across sessions > scratch budget
-  resume  when: every trigger is below half its limit
+  resume  when: ahead_seconds ≤ max(half, ceiling − 30 s) (150 s default)
+            and byte/global triggers are each below half their limit
   ```
+
+  The time release grants another production burst at the 138 s no-fetch
+  frontier measured on a physical iPad. It is not a structural escape: if the
+  client remains stopped, the producer can pass 150 s and become held again.
+  Client same-delivery reopen remains the terminal recovery. Session status
+  reports the active time release as `resume_below_seconds` so operators can
+  distinguish this state from an encoder stall.
 
 - **Retention behind the frontier.** Because `fetched_end` can sit a full
   client forward-buffer past the true playhead, deleting at a fixed 60 s
@@ -474,9 +482,12 @@ with an ahead-window suspend replacing `-re` as the disk bound.
   keep-behind window is derived, not constant:
 
   ```text
-  retention ≥ client_forward_buffer (60) + back_buffer (30) + retry (30)
-            = 120 s behind fetched_end
+  retention ≥ observed_forward_fetch (120) + back_buffer (30) + retry (30)
+            = 180 s behind fetched_end
   ```
+
+  The 120 s term is physical-iPad evidence, not the configured 60 s AVPlayer
+  preference; `preferredForwardBufferDuration` is a hint rather than a cap.
 
   Deletion inside that window is forbidden. Outside it, the append-only EVENT
   file remains the writer's duration history, while the served media playlist
@@ -927,8 +938,11 @@ at 1080p where it used to give 720p.
   twice. Document in OPERATIONS: data dir local, ideally tmpfs for the
   transcode subdir on RAM-rich nodes. Session size is predictable from
   §4.2's bounds: ahead window (≈1 GB at 180 s of 45 Mb/s copy, hard-capped
-  by `hls_ahead_max_bytes`) + the ~120 s retention window behind the
-  frontier — size tmpfs from `hls_scratch_max_bytes` plus headroom.
+  by `hls_ahead_max_bytes`) + the ~180 s retention window behind the
+  frontier. At the defaults that raises the media span from about 300 s to
+  360 s (+20%), so the unchanged 8 GiB global cap may bind roughly one 4K
+  stream sooner. Its byte release threshold remains half the cap; size tmpfs
+  from `hls_scratch_max_bytes` plus headroom.
 - **NFS/SMB read-ahead.** One paragraph with mount suggestions
   (`rsize=1048576`, larger readahead for NFS; SMB3 multichannel where the
   NAS offers it) and the reminder that §4.2's burst reads at NAS speed —
@@ -1695,8 +1709,8 @@ Playlist/segment capability-URL auth is untouched — AirPlay depends on it.
 | # | Decision | Choice |
 |---|---|---|
 | 1 | Client buffer policy | Seconds only (`60`/`30`), provisional; byte value stays default; M0 evidence required to change it (§4.3) |
-| 2 | Server ahead policy | Three named frontiers (§4.2); pace on playable−fetched from `EXTINF`; suspend on time **or** per-session bytes **or** global scratch; resume when all below half; retention ≥ forward-fetch + back-buffer + retry ≈ 120 s |
-| 3 | Playlist/GC contract | ~~EVENT + documented 404s outside the retention window.~~ **Reversed 2026-08-04 after live AVPlayer evidence:** keep EVENT as the internal writer history, but serve a sliding window that omits the pruned prefix and advances `MEDIA-SEQUENCE`; deletion inside the 120 s retention window remains forbidden. A native player may revisit a playlist entry after a reload or decoder reset, so “normal forward clients will not ask again” was not a safe wire contract. |
+| 2 | Server ahead policy | Three named frontiers (§4.2); pace on playable−fetched from `EXTINF`; suspend on time **or** per-session bytes **or** global scratch. **Revised 2026-08-07 after physical-iPad evidence:** time releases at max(half, ceiling−30 s), 150 s by default, while byte/global limits still release at half; this grants one more burst but can pin again without a client fetch. Retention covers the measured 120 s forward lead + back-buffer + retry ≈ 180 s. |
+| 3 | Playlist/GC contract | ~~EVENT + documented 404s outside the retention window.~~ **Reversed 2026-08-04 after live AVPlayer evidence:** keep EVENT as the internal writer history, but serve a sliding window that omits the pruned prefix and advances `MEDIA-SEQUENCE`; deletion inside the 180 s retention window remains forbidden. A native player may revisit a playlist entry after a reload or decoder reset, so “normal forward clients will not ask again” was not a safe wire contract. |
 | 4 | ABR handoff | Visible restart (Option A) with measured p95 interruption SLO — proposed ≤2.5 s on LAN, **operator confirms**; estimate seeded across Hls instances; severe pressure jumps straight to the highest safe rung |
 | 5 | Over-capacity & fallback admission | Queue ≤5 s → *measured-safe* software recipe (recent speed ≥ ~1.2× for that pipeline class — never "720p is safe") → capacity error; cluster inserts "another node" first |
 | 6 | Cache identity | Encoder family + pipeline digest in the hash; relaxation only after per-family output contracts are proven equivalent (**operator's call** whether ever worth it) |

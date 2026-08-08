@@ -96,7 +96,7 @@ id = "server.live-playlist-window"
 source = "crates/plurxd/src/transcode.rs"
 source_anchor = "fn served_live_playlist("
 test = "crates/plurxd/src/transcode.rs"
-test_anchor = "retention_covers_the_clients_forward_buffer"
+test_anchor = "retention_keeps_a_reload_margin_above_the_observed_fetch_lead"
 
 [[decisions]]
 id = "server.auto-rung"
@@ -176,6 +176,13 @@ test = "clients/apple/Tests/AppleClientTests.swift"
 test_anchor = "testApplePlayerFallsBackFromDolbyVisionToHDRBeforeSDR"
 
 [[decisions]]
+id = "apple.buffering-recovery"
+source = "clients/apple/Sources/PlayerController.swift"
+source_anchor = "struct PlaybackRecoveryMonitor: Equatable"
+test = "clients/apple/Tests/AppleClientTests.swift"
+test_anchor = "testBufferingWaitHasAnIndependentBoundedRecoveryTimer"
+
+[[decisions]]
 id = "apple.pgs-overlay"
 source = "clients/apple/Sources/PlayerController.swift"
 source_anchor = "static func subtitleUsesOverlay("
@@ -195,6 +202,13 @@ source = "clients/apple/Sources/PlayerController.swift"
 source_anchor = "static func configureBuffering("
 test = "clients/apple/Tests/AppleClientTests.swift"
 test_anchor = "testGrowingHLSSessionStaysInsideTheServerRetentionContract"
+
+[[decisions]]
+id = "apple.player-system-chrome"
+source = "clients/apple/Sources/PlayerView.swift"
+source_anchor = ".modifier(PlayerSystemOverlayModifier("
+test = "clients/apple/Tests/AppleClientTests.swift"
+test_anchor = "testIOSPlayerSystemOverlayModifierReachesHostingController"
 
 [[decisions]]
 id = "apple.quality-session"

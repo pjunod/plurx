@@ -309,6 +309,35 @@ struct PlayerOverlayVisibility: Equatable {
 }
 
 #if os(iOS)
+struct PlayerSystemOverlayPreferences {
+    let statusBarHidden: Bool
+    let persistentOverlays: Visibility
+
+    static func resolve(
+        controlsVisible: Bool,
+        persistentContentVisible: Bool
+    ) -> Self {
+        let systemChromeVisible = controlsVisible || persistentContentVisible
+        return Self(
+            statusBarHidden: !systemChromeVisible,
+            persistentOverlays: systemChromeVisible ? .automatic : .hidden
+        )
+    }
+}
+
+struct PlayerSystemOverlayModifier: ViewModifier {
+    let preferences: PlayerSystemOverlayPreferences
+
+    func body(content: Content) -> some View {
+        content
+            // The custom AVPlayerLayer surface has no AVPlayerViewController to
+            // retire iPadOS chrome for it. Keep system chrome in the same state
+            // as the controls the viewer actually asked to show.
+            .statusBarHidden(preferences.statusBarHidden)
+            .persistentSystemOverlays(preferences.persistentOverlays)
+    }
+}
+
 /// The landscape/iPad transport keeps its fixed control groups at the edges
 /// and gives every remaining point to the timeline. Keeping this as a real
 /// layout boundary prevents a `fixedSize` measurement from becoming the
@@ -567,9 +596,7 @@ struct PlayerView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
 
-            if let error = controller.playbackNotice
-                ?? controller.playbackError
-                ?? pictureInPicture.errorMessage,
+            if let error = playbackBannerMessage,
                !controller.failed {
                 Text(error)
                     .font(.system(.caption, design: .monospaced))
@@ -664,7 +691,34 @@ struct PlayerView: View {
             }
         }
         #endif
+        #if os(iOS)
+        .modifier(PlayerSystemOverlayModifier(
+            preferences: playerSystemOverlayPreferences
+        ))
+        #endif
     }
+
+    private var playbackBannerMessage: String? {
+        controller.playbackNotice
+            ?? controller.playbackError
+            ?? pictureInPicture.errorMessage
+    }
+
+    #if os(iOS)
+    private var playerSystemOverlayPreferences: PlayerSystemOverlayPreferences {
+        PlayerSystemOverlayPreferences.resolve(
+            controlsVisible: controlsVisible,
+            // These surfaces outlive the transport's four-second timeout. Keep
+            // system chrome stable while the viewer reads them, then retire it
+            // only after the last visible player surface has gone away.
+            persistentContentVisible: showStats
+                || controller.failed
+                || controller.isChangingStream
+                || findingNext
+                || playbackBannerMessage != nil
+        )
+    }
+    #endif
 
     private var overlayVisibility: PlayerOverlayVisibility {
         Self.overlayVisibility(
@@ -1817,7 +1871,10 @@ private struct PlaybackStatsView: View {
                 row("Encode speed", String(format: "%.2f×", speed))
             }
             if let ahead = status.aheadSeconds {
-                row("Server ahead", "\(max(0, ahead)) s\((status.suspended ?? false) ? " · held" : "")")
+                let release = (status.suspended ?? false)
+                    ? status.resumeBelowSeconds.map { " · time release ≤\($0) s" } ?? ""
+                    : ""
+                row("Server ahead", "\(max(0, ahead)) s\((status.suspended ?? false) ? " · held\(release)" : "")")
             }
             if let delivered = status.deliveredBps { row("Delivery rate", bitRate(delivered)) }
             if let bytes = status.deliveredBytes { row("Delivered", byteCount(bytes)) }

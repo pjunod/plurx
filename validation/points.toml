@@ -166,7 +166,7 @@ timeout_seconds = 300
 id = "cluster-auth"
 title = "Three-voter replicated durable-state failure contract"
 command = "make cluster-check"
-profiles = ["ci", "full", "nightly"]
+profiles = ["commit", "ci", "full", "nightly"]
 platforms = ["darwin", "linux"]
 requires = ["cargo", "make"]
 missing = "fail"
@@ -257,12 +257,13 @@ depends_on = ["core.media"]
 [[points]]
 id = "cluster.auth"
 title = "Replicated durable state"
-contract = "Three voters converge on settings, authentication, catalogue, watch, and root-safety state; local FTS rebuilds from replicated items, quorum loss fails readiness, and incompatible voters cannot participate."
+contract = "Three voters converge on settings, authentication, catalogue, watch, and root-safety state; local FTS rebuilds from replicated items, quorum loss fails readiness, and incompatible schema clients fail preflight."
 paths = [
   "crates/plurx-cluster-check/**",
   "crates/plurx-core/src/store/hiqlite.rs",
   "crates/plurx-core/src/store/hiqlite_catalog.rs",
   "crates/plurx-core/src/store/hiqlite_media.rs",
+  "scripts/vendor-audit-lock",
   "vendor/rust_decimal/**",
   "vendor/s3-simple/**",
 ]

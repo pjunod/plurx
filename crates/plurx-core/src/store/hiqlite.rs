@@ -22,7 +22,7 @@ use crate::error::StoreError;
 pub const AUTH_SCHEMA_VERSION: i64 = 2;
 pub const AUTH_PROTOCOL_VERSION: i64 = 2;
 
-const READY_TIMEOUT: Duration = Duration::from_secs(3);
+const STORE_TIMEOUT: Duration = Duration::from_secs(3);
 
 const AUTH_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS cluster_meta (
@@ -64,7 +64,6 @@ CREATE TABLE IF NOT EXISTS api_keys (
     last_used_at INTEGER,
     disabled     INTEGER NOT NULL
 ) STRICT;
-CREATE INDEX IF NOT EXISTS api_keys_hash ON api_keys(key_hash);
 "#;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,7 +93,7 @@ impl HiqliteAuthStore {
     /// after the acknowledged schema write has replicated.
     pub async fn bootstrap(client: Client, instance_id: &str) -> Result<Self, StoreError> {
         validate_sql(AUTH_SCHEMA)?;
-        let results = client.batch(AUTH_SCHEMA).await.map_err(database_error)?;
+        let results = timeout_store(client.batch(AUTH_SCHEMA)).await?;
         for result in results {
             result.map_err(database_error)?;
         }
@@ -114,7 +113,20 @@ impl HiqliteAuthStore {
         store
             .verify_compatibility(ClusterCompatibility::CURRENT)
             .await?;
-        store.put_setting(keys::INSTANCE_ID, instance_id).await?;
+        let now = store.now()?;
+        store
+            .execute(
+                "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, $3) \
+                 ON CONFLICT(key) DO NOTHING",
+                params!(keys::INSTANCE_ID, instance_id, now),
+            )
+            .await?;
+        let persisted = store.instance_id().await?;
+        if persisted != instance_id {
+            return Err(StoreError::Identity(format!(
+                "cluster instance.id is {persisted}, refusing bootstrap as {instance_id}"
+            )));
+        }
         Ok(store)
     }
 
@@ -134,12 +146,12 @@ impl HiqliteAuthStore {
         remote: &Client,
         supported: ClusterCompatibility,
     ) -> Result<(), StoreError> {
-        let meta = timeout_consistent(remote.query_consistent_map::<CompatibilityRow, _>(
-            "SELECT schema_version, protocol_min, protocol_max \
-                 FROM cluster_meta WHERE singleton = 1",
-            params!(),
-        ))
-        .await?;
+        let sql = "SELECT schema_version, protocol_min, protocol_max \
+                   FROM cluster_meta WHERE singleton = 1";
+        validate_sql(sql)?;
+        let meta =
+            timeout_store(remote.query_consistent_map::<CompatibilityRow, _>(sql, params!()))
+                .await?;
         verify_compatibility_rows(meta, supported)
     }
 
@@ -155,55 +167,67 @@ impl HiqliteAuthStore {
     /// observe each voter's own applied SQLite state. Only the digest leaves
     /// this process; password and credential hashes never enter test logs.
     pub async fn local_dump_digest(&self) -> Result<String, StoreError> {
-        let dump = AuthStoreDump {
-            catalog_digest: super::hiqlite_catalog::local_catalog_digest(&self.client).await?,
-            cluster_meta: self
-                .client
-                .query_map(
-                    "SELECT singleton, schema_version, protocol_min, protocol_max, migrated_at \
-                     FROM cluster_meta ORDER BY singleton",
-                    params!(),
-                )
-                .await
-                .map_err(database_error)?,
-            settings: self
-                .client
-                .query_map(
-                    "SELECT key, value, updated_at FROM settings ORDER BY key",
-                    params!(),
-                )
-                .await
-                .map_err(database_error)?,
-            users: self
-                .client
-                .query_map(
-                    "SELECT id, username, password_hash, is_admin, created_at \
-                     FROM users ORDER BY id",
-                    params!(),
-                )
-                .await
-                .map_err(database_error)?,
-            tokens: self
-                .client
-                .query_map(
-                    "SELECT token_hash, user_id, device, created_at, last_seen_at \
-                     FROM tokens ORDER BY token_hash",
-                    params!(),
-                )
-                .await
-                .map_err(database_error)?,
-            api_keys: self
-                .client
-                .query_map(
-                    "SELECT id, name, key_hash, scopes, created_at, last_used_at, disabled \
-                     FROM api_keys ORDER BY id",
-                    params!(),
-                )
-                .await
-                .map_err(database_error)?,
-        };
+        let dump = self.local_auth_dump().await?;
         let bytes = serde_json::to_vec(&dump).map_err(database_error)?;
         Ok(hex::encode(Sha256::digest(bytes)))
+    }
+
+    /// Full validation payload used only by the separate-process gate. The
+    /// controller independently hashes it and checks known fields so replica
+    /// equality cannot certify a broken digest implementation.
+    pub async fn validation_local_dump(&self) -> Result<String, StoreError> {
+        serde_json::to_string(&self.local_auth_dump().await?).map_err(database_error)
+    }
+
+    async fn local_auth_dump(&self) -> Result<AuthStoreDump, StoreError> {
+        for sql in [
+            "SELECT singleton, schema_version, protocol_min, protocol_max, migrated_at FROM cluster_meta ORDER BY singleton",
+            "SELECT key, value, updated_at FROM settings ORDER BY key",
+            "SELECT id, username, password_hash, is_admin, created_at FROM users ORDER BY id",
+            "SELECT token_hash, user_id, device, created_at, last_seen_at FROM tokens ORDER BY token_hash",
+            "SELECT id, name, key_hash, scopes, created_at, last_used_at, disabled FROM api_keys ORDER BY id",
+        ] {
+            validate_sql(sql)?;
+        }
+        Ok(AuthStoreDump {
+            catalog_digest: tokio::time::timeout(
+                STORE_TIMEOUT,
+                super::hiqlite_catalog::local_catalog_digest(&self.client),
+            )
+            .await
+            .map_err(|_| {
+                StoreError::Database("replicated store operation timed out".to_owned())
+            })??,
+            cluster_meta: timeout_store(self.client.query_map(
+                "SELECT singleton, schema_version, protocol_min, protocol_max, migrated_at \
+                     FROM cluster_meta ORDER BY singleton",
+                params!(),
+            ))
+            .await?,
+            settings: timeout_store(self.client.query_map(
+                "SELECT key, value, updated_at FROM settings ORDER BY key",
+                params!(),
+            ))
+            .await?,
+            users: timeout_store(self.client.query_map(
+                "SELECT id, username, password_hash, is_admin, created_at \
+                     FROM users ORDER BY id",
+                params!(),
+            ))
+            .await?,
+            tokens: timeout_store(self.client.query_map(
+                "SELECT token_hash, user_id, device, created_at, last_seen_at \
+                     FROM tokens ORDER BY token_hash",
+                params!(),
+            ))
+            .await?,
+            api_keys: timeout_store(self.client.query_map(
+                "SELECT id, name, key_hash, scopes, created_at, last_used_at, disabled \
+                     FROM api_keys ORDER BY id",
+                params!(),
+            ))
+            .await?,
+        })
     }
 
     fn with_clock(client: Client, clock: Arc<dyn Clock>) -> Self {
@@ -220,10 +244,7 @@ impl HiqliteAuthStore {
         params: hiqlite::Params,
     ) -> Result<usize, StoreError> {
         validate_sql(sql)?;
-        self.client
-            .execute(sql, params)
-            .await
-            .map_err(database_error)
+        timeout_store(self.client.execute(sql, params)).await
     }
 
     async fn user_optional(
@@ -231,11 +252,9 @@ impl HiqliteAuthStore {
         sql: &'static str,
         params: hiqlite::Params,
     ) -> Result<Option<User>, StoreError> {
-        let mut rows = self
-            .client
-            .query_consistent_map::<UserRow, _>(sql, params)
-            .await
-            .map_err(database_error)?;
+        validate_sql(sql)?;
+        let mut rows =
+            timeout_store(self.client.query_consistent_map::<UserRow, _>(sql, params)).await?;
         Ok(rows.pop().map(Into::into))
     }
 
@@ -244,11 +263,12 @@ impl HiqliteAuthStore {
         sql: &'static str,
         params: hiqlite::Params,
     ) -> Result<Option<ApiKey>, StoreError> {
-        let mut rows = self
-            .client
-            .query_consistent_map::<ApiKeyRow, _>(sql, params)
-            .await
-            .map_err(database_error)?;
+        validate_sql(sql)?;
+        let mut rows = timeout_store(
+            self.client
+                .query_consistent_map::<ApiKeyRow, _>(sql, params),
+        )
+        .await?;
         Ok(rows.pop().map(Into::into))
     }
 }
@@ -256,10 +276,12 @@ impl HiqliteAuthStore {
 #[async_trait]
 impl SettingsStore for HiqliteAuthStore {
     async fn ping(&self) -> Result<(), StoreError> {
-        self.client.is_healthy_db().await.map_err(database_error)?;
-        let rows = timeout_consistent(
+        timeout_store(self.client.is_healthy_db()).await?;
+        let sql = "SELECT 1 AS healthy";
+        validate_sql(sql)?;
+        let rows = timeout_store(
             self.client
-                .query_consistent_map::<PingRow, _>("SELECT 1 AS healthy", params!()),
+                .query_consistent_map::<PingRow, _>(sql, params!()),
         )
         .await?;
         if rows.len() == 1 && rows[0].healthy == 1 {
@@ -272,14 +294,13 @@ impl SettingsStore for HiqliteAuthStore {
     }
 
     async fn get_setting(&self, key: &str) -> Result<Option<String>, StoreError> {
-        let rows = self
-            .client
-            .query_consistent_map::<SettingValueRow, _>(
-                "SELECT value FROM settings WHERE key = $1",
-                params!(key),
-            )
-            .await
-            .map_err(database_error)?;
+        let sql = "SELECT value FROM settings WHERE key = $1";
+        validate_sql(sql)?;
+        let rows = timeout_store(
+            self.client
+                .query_consistent_map::<SettingValueRow, _>(sql, params!(key)),
+        )
+        .await?;
         Ok(rows.into_iter().next().map(|row| row.value))
     }
 
@@ -305,11 +326,13 @@ impl SettingsStore for HiqliteAuthStore {
 #[async_trait]
 impl UserStore for HiqliteAuthStore {
     async fn count_users(&self) -> Result<i64, StoreError> {
-        let rows = self
-            .client
-            .query_consistent_map::<CountRow, _>("SELECT COUNT(*) AS count FROM users", params!())
-            .await
-            .map_err(database_error)?;
+        let sql = "SELECT COUNT(*) AS count FROM users";
+        validate_sql(sql)?;
+        let rows = timeout_store(
+            self.client
+                .query_consistent_map::<CountRow, _>(sql, params!()),
+        )
+        .await?;
         one_count(rows)
     }
 
@@ -325,14 +348,11 @@ impl UserStore for HiqliteAuthStore {
                    VALUES ($1, $2, $3, $4) \
                    RETURNING id, username, password_hash, is_admin, created_at";
         validate_sql(sql)?;
-        let row = self
-            .client
-            .execute_returning_map_one::<_, UserRow>(
-                sql,
-                params!(username, password_hash, is_admin, now),
-            )
-            .await
-            .map_err(database_error)?;
+        let row = timeout_store(self.client.execute_returning_map_one::<_, UserRow>(
+            sql,
+            params!(username, password_hash, is_admin, now),
+        ))
+        .await?;
         Ok(row.into())
     }
 
@@ -355,18 +375,17 @@ impl UserStore for HiqliteAuthStore {
     }
 
     async fn list_users(&self) -> Result<Vec<User>, StoreError> {
-        Ok(self
-            .client
-            .query_consistent_map::<UserRow, _>(
-                "SELECT id, username, password_hash, is_admin, created_at \
-                 FROM users ORDER BY username",
-                params!(),
-            )
-            .await
-            .map_err(database_error)?
-            .into_iter()
-            .map(Into::into)
-            .collect())
+        let sql = "SELECT id, username, password_hash, is_admin, created_at \
+                   FROM users ORDER BY username";
+        validate_sql(sql)?;
+        Ok(timeout_store(
+            self.client
+                .query_consistent_map::<UserRow, _>(sql, params!()),
+        )
+        .await?
+        .into_iter()
+        .map(Into::into)
+        .collect())
     }
 
     async fn delete_user(&self, id: i64) -> Result<bool, StoreError> {
@@ -377,14 +396,13 @@ impl UserStore for HiqliteAuthStore {
     }
 
     async fn count_admins(&self) -> Result<i64, StoreError> {
-        let rows = self
-            .client
-            .query_consistent_map::<CountRow, _>(
-                "SELECT COUNT(*) AS count FROM users WHERE is_admin = 1",
-                params!(),
-            )
-            .await
-            .map_err(database_error)?;
+        let sql = "SELECT COUNT(*) AS count FROM users WHERE is_admin = 1";
+        validate_sql(sql)?;
+        let rows = timeout_store(
+            self.client
+                .query_consistent_map::<CountRow, _>(sql, params!()),
+        )
+        .await?;
         one_count(rows)
     }
 
@@ -482,27 +500,27 @@ impl ApiKeyStore for HiqliteAuthStore {
                    VALUES ($1, $2, $3, $4, 0) \
                    RETURNING id, name, key_hash, scopes, created_at, last_used_at, disabled";
         validate_sql(sql)?;
-        let row = self
-            .client
-            .execute_returning_map_one::<_, ApiKeyRow>(sql, params!(name, key_hash, scopes, now))
-            .await
-            .map_err(database_error)?;
+        let row =
+            timeout_store(self.client.execute_returning_map_one::<_, ApiKeyRow>(
+                sql,
+                params!(name, key_hash, scopes, now),
+            ))
+            .await?;
         Ok(row.into())
     }
 
     async fn list_api_keys(&self) -> Result<Vec<ApiKey>, StoreError> {
-        Ok(self
-            .client
-            .query_consistent_map::<ApiKeyRow, _>(
-                "SELECT id, name, key_hash, scopes, created_at, last_used_at, disabled \
-                 FROM api_keys ORDER BY created_at, id",
-                params!(),
-            )
-            .await
-            .map_err(database_error)?
-            .into_iter()
-            .map(Into::into)
-            .collect())
+        let sql = "SELECT id, name, key_hash, scopes, created_at, last_used_at, disabled \
+                   FROM api_keys ORDER BY created_at, id";
+        validate_sql(sql)?;
+        Ok(timeout_store(
+            self.client
+                .query_consistent_map::<ApiKeyRow, _>(sql, params!()),
+        )
+        .await?
+        .into_iter()
+        .map(Into::into)
+        .collect())
     }
 
     async fn api_key_for_hash(&self, key_hash: &str) -> Result<Option<ApiKey>, StoreError> {
@@ -592,6 +610,21 @@ fn validate_parameter_order(sql: &str) -> Result<(), StoreError> {
                     }
                 }
             }
+            b'[' => {
+                index += 1;
+                while index < bytes.len() {
+                    if bytes[index] == b']' {
+                        if bytes.get(index + 1) == Some(&b']') {
+                            index += 2;
+                        } else {
+                            index += 1;
+                            break;
+                        }
+                    } else {
+                        index += 1;
+                    }
+                }
+            }
             b'-' if bytes.get(index + 1) == Some(&b'-') => {
                 index += 2;
                 while index < bytes.len() && !matches!(bytes[index], b'\n' | b'\r') {
@@ -612,7 +645,13 @@ fn validate_parameter_order(sql: &str) -> Result<(), StoreError> {
                 while bytes.get(index).is_some_and(u8::is_ascii_digit) {
                     index += 1;
                 }
-                let ordinal = sql[start..index]
+                let token = &sql[start..index];
+                if token.len() > 1 && token.starts_with('0') {
+                    return Err(StoreError::Database(format!(
+                        "hiqlite placeholders must use canonical $N spelling; found ${token}"
+                    )));
+                }
+                let ordinal = token
                     .parse::<u32>()
                     .map_err(|error| StoreError::Database(error.to_string()))?;
                 if ordinal == next {
@@ -622,6 +661,12 @@ fn validate_parameter_order(sql: &str) -> Result<(), StoreError> {
                         "hiqlite placeholders must first appear in order; expected ${next}, found ${ordinal}"
                     )));
                 }
+            }
+            b'$' | b'?' | b':' | b'@' => {
+                return Err(StoreError::Database(format!(
+                    "hiqlite statements may only use canonical $N placeholders; found {:?}",
+                    bytes[index] as char
+                )));
             }
             _ => index += 1,
         }
@@ -633,12 +678,12 @@ pub(super) fn database_error(error: impl std::fmt::Display) -> StoreError {
     StoreError::Database(error.to_string())
 }
 
-async fn timeout_consistent<T>(
+async fn timeout_store<T>(
     operation: impl std::future::Future<Output = Result<T, hiqlite::Error>>,
 ) -> Result<T, StoreError> {
-    tokio::time::timeout(READY_TIMEOUT, operation)
+    tokio::time::timeout(STORE_TIMEOUT, operation)
         .await
-        .map_err(|_| StoreError::Database("cluster quorum check timed out".to_owned()))?
+        .map_err(|_| StoreError::Database("replicated store operation timed out".to_owned()))?
         .map_err(database_error)
 }
 
@@ -884,6 +929,21 @@ mod tests {
             .expect("first-appearance order");
         validate_sql("SELECT '$2', id FROM users WHERE id = $1 -- $3")
             .expect("quoted and commented placeholders are data");
+        validate_sql("SELECT [$2], [a'b] FROM users WHERE id = $1")
+            .expect("bracketed identifiers are not placeholders or strings");
+
+        for unsupported in [
+            "SELECT $1, $01, $2",
+            "SELECT ?2, ?1",
+            "SELECT ? FROM users",
+            "SELECT :id FROM users",
+            "SELECT @id FROM users",
+            "SELECT $id FROM users",
+        ] {
+            validate_sql(unsupported).expect_err("unsupported placeholder spelling");
+        }
+        validate_sql("SELECT [a'b], $2, $1 FROM users")
+            .expect_err("bracket quote cannot hide misordered placeholders");
     }
 
     #[test]

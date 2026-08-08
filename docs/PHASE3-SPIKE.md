@@ -71,9 +71,11 @@ backend behind it in Phase 4.
 M0 reran the storage decision against the contracts the clustering review
 identified as blockers. The semantic proof is
 `make hiqlite-spike`; the optimized cost gate is `make hiqlite-baseline`.
-Both run from the standalone, non-shipping `spikes/hiqlite-m0` manifest;
-ordinary workspace builds do not resolve or compile hiqlite, and `plurxd`
-still builds and runs `SqliteStore` in M0.
+Both M0 probes run from the standalone, non-shipping `spikes/hiqlite-m0`
+manifest. M1b now resolves Hiqlite in the root workspace only when the
+`hiqlite-store` feature is enabled by `plurx-cluster-check`; an ordinary
+`plurxd` build excludes that feature and retains its pre-M1b dependency
+closure while it still runs `SqliteStore`.
 
 **Dependency audit boundary:** RustSec gates the production workspace and fuzz
 lockfiles. The standalone spike retains its own lockfile, but M1b now resolves
@@ -81,8 +83,12 @@ hiqlite 0.14 in the audited root workspace. hiqlite enables cryptr's unused S3
 path, whose `s3-simple` 0.8 dependency pinned advisory-affected `quick-xml`
 0.39.4. The root workspace vendors that small package with source unchanged
 and raises only `quick-xml` to 0.41, the first version patched for
-[RUSTSEC-2026-0195](https://rustsec.org/advisories/RUSTSEC-2026-0195.html).
-No RustSec ignore was added.
+[RUSTSEC-2026-0194](https://rustsec.org/advisories/RUSTSEC-2026-0194.html)
+and [RUSTSEC-2026-0195](https://rustsec.org/advisories/RUSTSEC-2026-0195.html).
+No RustSec ignore was added, but path packages are otherwise exempt from
+cargo-audit. The weekly audit job therefore synthesizes a second lockfile with
+the original registry source/checksum for both vendored releases and scans it
+mechanically via `scripts/vendor-audit-lock`.
 
 `rkyv` 0.7.46 fixed
 [RUSTSEC-2026-0001](https://rustsec.org/advisories/RUSTSEC-2026-0001.html),
@@ -92,12 +98,15 @@ That did not make 0.7 safe indefinitely: the later
 [RUSTSEC-2026-0235](https://rustsec.org/advisories/RUSTSEC-2026-0235.html)
 affects the 0.7 series and is patched only in rkyv 0.8.17 or newer.
 
-The affected edge is `rust_decimal`'s optional rkyv integration. Hiqlite does
-not enable it, but Cargo still records it in the root lockfile. The audited
+The affected edge is `rust_decimal`'s optional rkyv integration. Hiqlite and
+openraft's `byte-unit` edge resolve rust_decimal but do not enable rkyv; Cargo
+still records the optional integration in the root lockfile. The audited
 workspace therefore vendors `rust_decimal` 1.42.1 and removes only that
-dormant integration; compiled decimal behavior is unchanged and no RustSec
-ignore was added. The standalone M0 lockfile retains the registry package and
-remains semantic evidence only, never a release dependency.
+dormant build-graph integration; compiled decimal behavior is unchanged. The
+retained upstream tests/examples that name rkyv are provenance, not runnable
+workspace targets. The standalone M0 lockfile supplies the registry provenance
+used by the mechanical vendor scan and remains semantic evidence, never a
+release dependency.
 
 | Contract | Observed result |
 |---|---|
@@ -174,14 +183,17 @@ production path.
 `make cluster-check` is the first shipping hiqlite gate. Unlike the M0
 semantic test, its voters are separate operating-system processes, so killing
 one voter actually removes its raft runtime and listeners.
+It is part of the commit validation profile because the two pure
+`store::hiqlite` unit tests do not construct a client; this separate-process
+gate is the runtime exercise for the replicated methods.
 
 | Contract | M1b evidence |
 |---|---|
 | Store surface | All 23 `SettingsStore`, `UserStore`, and `ApiKeyStore` methods are implemented; the lifecycle gate exercises settings, user/admin/password/token, and scoped-key mutation and deletion. |
-| Deterministic replay | Every timestamp is computed once by the caller and bound. Generated ids use `RETURNING`. A source guard rejects clock/RNG SQL and out-of-first-appearance `$N` parameters. |
-| Replica equality | Writes enter through every embedded client; SHA-256 digests of ordered local `cluster_meta`, settings, users, tokens, and API-key dumps converge across all voters. Only the digest leaves a child process. |
+| Bound replay inputs | Every timestamp is computed once by the caller and bound; the gate proves binding, not wall-clock correctness. Generated ids use `RETURNING`. A source guard rejects clock/RNG SQL and non-canonical or out-of-first-appearance parameters. |
+| Replica equality | Writes enter through every embedded client; ordered local `cluster_meta`, settings, users, tokens, and API-key dumps converge across all voters. The controller independently hashes the returned validation rows and asserts known identity, password/admin, token-device, and enabled-scope fields, so a constant digest cannot self-certify. |
 | Follower and leader loss | Fresh three-voter runs kill each role separately; a survivor regains quorum readiness and reads every acknowledged proof row before accepting another write. |
-| Compatibility | A remote consistent preflight reads schema and protocol bounds before raft startup. The gate presents an older schema and proves rejection while the live leader remains a compatible voter. |
+| Compatibility | A remote consistent preflight rejects an older schema. M1b proves the function but does not dynamically add a candidate voter; M3 must gate real join/start before raft membership or election. |
 | Quorum readiness | `HiqliteAuthStore::ping` combines hiqlite health with a bounded consistent read. After a second loss leaves one of three voters, the process remains alive but ping fails. |
 
 This is backend evidence, not a production-store switch. `plurxd` still holds

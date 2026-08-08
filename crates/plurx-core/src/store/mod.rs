@@ -14,6 +14,7 @@
 
 mod sqlite;
 
+#[cfg(feature = "hiqlite-store")]
 mod hiqlite;
 mod hiqlite_catalog;
 mod hiqlite_media;
@@ -22,6 +23,7 @@ pub mod replicated;
 
 use std::path::PathBuf;
 
+#[cfg(feature = "hiqlite-store")]
 pub use self::hiqlite::{
     ClusterCompatibility, HiqliteAuthStore, AUTH_PROTOCOL_VERSION, AUTH_SCHEMA_VERSION,
 };

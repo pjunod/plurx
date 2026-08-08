@@ -2,15 +2,24 @@
 
 This directory is the crates.io `s3-simple` 0.8.0 package, licensed under
 Apache-2.0. Plurx carries one dependency-only patch: `quick-xml` is raised
-from 0.39 to 0.41 because RustSec marks 0.39.4 as vulnerable.
+from 0.39 to 0.41 because RustSec marks 0.39.4 as vulnerable under
+RUSTSEC-2026-0194 and RUSTSEC-2026-0195.
 
 Hiqlite 0.14 enables cryptr's S3 feature even when plurx builds hiqlite with
 only `macros` and `sqlite`. That makes this otherwise unused package part of
 the production resolution. Keeping the source unchanged and patching the
-compatible XML parser constraint avoids a RustSec exception while preserving
-the upstream API. Remove this vendor when upstream hiqlite stops enabling the
-unused path or s3-simple publishes a fixed release.
+compatible XML parser constraint avoids an advisory ignore while preserving
+the upstream API.
+
+Cargo records this package as path-sourced, which means cargo-audit skips it.
+The weekly `rust-audit.yml` job uses `scripts/vendor-audit-lock` to restore this
+exact release's registry source and checksum before a second advisory scan.
+That check must remain until this directory is removed. Remove the vendor when
+upstream hiqlite stops enabling the unused S3 path or a compatible s3-simple
+release accepts quick-xml 0.41 or newer.
 
 Source: <https://crates.io/crates/s3-simple/0.8.0>
 
-The original `LICENSE` and `README.md` are retained beside this note.
+Only `Cargo.toml` and `src/` are load-bearing in Plurx's build. The retained
+license, README, tests, examples, and benches are upstream provenance, not an
+in-place test suite; the workspace excludes this directory deliberately.
