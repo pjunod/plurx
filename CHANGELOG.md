@@ -427,6 +427,22 @@ bump may break compatibility and a **patch** bump never does.
 
 ### Fixed
 
+- **iPad remux playback no longer deadlocks against the server's ahead-window
+  hold.** Physical-device telemetry reproduced the same sequence every six
+  minutes: the server suspended ffmpeg at 186 seconds ahead; AVPlayer stopped
+  fetching with about 95 seconds buffered; and the producer remained 138
+  seconds ahead of the last download. Its old release point was half the
+  180-second window — 90 seconds — but only another fetch could move that
+  frontier, so neither side could wake the other. The result was a 12-second
+  buffering wait and a same-delivery reopen. Time-based suspension now
+  releases 30 seconds below its ceiling (150 seconds by default), above the
+  measured no-fetch waterline while retaining real hysteresis; byte and global
+  disk limits still release at half. The same run also showed AVPlayer fetching
+  about 120 seconds ahead despite a 60-second preference, so live retention is
+  now 180 seconds: that measured lead plus 30 seconds of back buffer and 30
+  seconds for retry/reload. Regression tests pin both physical-device
+  boundaries.
+
 - **An Apple client that remains stuck buffering now recovers visibly and
   leaves evidence.** After a title has rendered for five seconds, a sustained
   AVPlayer buffer wait gets one reconnect of the exact same delivery; an

@@ -66,17 +66,18 @@ const WATCHDOG_POLL: Duration = Duration::from_secs(5);
 /// pruning a full watch accumulates every segment — cheap at 720p, ~17 GB for
 /// a 4K copy. The subtlety is what to measure from. The server knows the
 /// highest segment a client has *fetched*, and a client fetches its whole
-/// forward buffer ahead of what it is showing: with a 60-second buffer the
-/// frontier sits a minute past the picture on screen. Pruning at a fixed
-/// distance behind the frontier therefore deletes media the viewer is about to
-/// watch — or is watching. Retention covers the forward buffer, the back
-/// buffer the client keeps for scrubbing, and an allowance for a retry or a
-/// playlist reload landing on something older.
-const CLIENT_FORWARD_BUFFER_SECS: i64 = 60;
+/// forward buffer ahead of what it is showing. A physical iPad running
+/// AVPlayer fetched about 120 seconds ahead even with
+/// `preferredForwardBufferDuration = 60`; that preference is not a hard cap.
+/// Pruning at a fixed distance behind the frontier therefore deletes media the
+/// viewer is about to watch — or is watching. Retention covers the observed
+/// fetch lead, the back buffer the client keeps for scrubbing, and an
+/// allowance for a retry or a playlist reload landing on something older.
+const CLIENT_FORWARD_FETCH_SECS: i64 = 120;
 const CLIENT_BACK_BUFFER_SECS: i64 = 30;
 const RETRY_ALLOWANCE_SECS: i64 = 30;
 const RETENTION_SECS: i64 =
-    CLIENT_FORWARD_BUFFER_SECS + CLIENT_BACK_BUFFER_SECS + RETRY_ALLOWANCE_SECS;
+    CLIENT_FORWARD_FETCH_SECS + CLIENT_BACK_BUFFER_SECS + RETRY_ALLOWANCE_SECS;
 /// Default pace for an HLS session's input, as a multiple of realtime, and how
 /// many seconds it may deliver flat-out first. Admin-overridable (see
 /// [`keys::HLS_READRATE`] / [`keys::HLS_BURST_SECS`]).
@@ -596,22 +597,38 @@ struct AheadLimits {
 /// held.
 ///
 /// Any single limit is enough to suspend; resuming needs all of them below
-/// half. The asymmetry is deliberate: a single threshold makes a session
-/// sitting on a boundary toggle on every evaluation, which is a stream of
-/// signals and log lines to accomplish nothing. Resuming early is the safe
-/// direction — the cost of being wrong is some disk, and the cost of the other
-/// error is a viewer who runs dry.
+/// their release thresholds. Byte budgets release at half because they are
+/// hard disk bounds. Media time releases 30 seconds below its ceiling (never
+/// below half): a physical iPad stopped fetching with about 95 seconds still
+/// buffered, leaving the held producer 138 seconds ahead. The old 90-second
+/// release point could then never be reached because only another segment
+/// fetch moves that frontier. Thirty seconds still prevents boundary chatter,
+/// while resuming early is the safe direction — the cost is some disk, and the
+/// cost of the other error is a viewer who runs dry.
 fn should_suspend(
     ahead: Ahead,
     global_bytes: i64,
     limits: AheadLimits,
     currently_suspended: bool,
 ) -> bool {
-    let divisor = if currently_suspended { 2 } else { 1 };
-    let over = |value: i64, limit: i64| limit > 0 && value > limit / divisor;
-    over(ahead.seconds, limits.max_secs)
-        || over(ahead.bytes, limits.max_bytes)
-        || over(global_bytes, limits.global_max_bytes)
+    let half = |limit: i64| limit / 2;
+    let time_release = |limit: i64| limit.saturating_sub(30).max(half(limit));
+    let time_limit = if currently_suspended {
+        time_release(limits.max_secs)
+    } else {
+        limits.max_secs
+    };
+    let byte_limit = |limit: i64| {
+        if currently_suspended {
+            half(limit)
+        } else {
+            limit
+        }
+    };
+    let over = |value: i64, limit: i64| limit > 0 && value > limit;
+    over(ahead.seconds, time_limit)
+        || over(ahead.bytes, byte_limit(limits.max_bytes))
+        || over(global_bytes, byte_limit(limits.global_max_bytes))
 }
 
 /// Apply one `key=value` line of ffmpeg's `-progress` output.
@@ -4483,11 +4500,13 @@ impl TranscodeManager {
     /// just-in-time server uses, and unlike a rate limit it adapts to a viewer
     /// who pauses.
     ///
-    /// Hysteresis is deliberate: resume at half the window rather than at the
-    /// window, or a session sitting exactly on the boundary would toggle every
-    /// tick. SIGKILL still works on a stopped process, so the idle reaper and
-    /// the admin stop button need no special case; a suspended session that
-    /// nobody comes back to is reaped on idle like any other.
+    /// Hysteresis is deliberate: media time resumes 30 seconds below the
+    /// window, while byte limits resume at half. One threshold would toggle a
+    /// session on every tick; the old half-time threshold could deadlock below
+    /// AVPlayer's no-fetch waterline. SIGKILL still works on a stopped process,
+    /// so the idle reaper and the admin stop button need no special case; a
+    /// suspended session that nobody comes back to is reaped on idle like any
+    /// other.
     async fn apply_ahead_window(
         &self,
         session: &Session,
@@ -4707,8 +4726,10 @@ fn segment_index(name: &str) -> Option<i64> {
 /// [`RETENTION_SECS`]). The previous version counted a fixed number of
 /// segments back from the furthest one fetched, which was two mistakes at
 /// once: a segment count is not a duration on the copy path, and the frontier
-/// is not where the viewer is. With a 60-second client buffer, "15 segments
-/// behind the frontier" could be *ahead* of the picture on screen.
+/// is not where the viewer is. On the physical iPad that reproduced this,
+/// AVPlayer fetched about 120 seconds ahead despite a 60-second preference;
+/// retaining only 120 seconds therefore moved the playlist start onto the
+/// playhead and left no reload margin.
 ///
 /// `init.mp4` and the playlist are never candidates — neither carries an
 /// EXTINF, so neither appears in the index.
@@ -5537,10 +5558,14 @@ mod tests {
         // — several healthy 4K streams fill a disk between them.
         assert!(should_suspend(secs(10), 8_001, limits, false));
 
-        // Held: keep holding until EVERY trigger is below half, so a session
-        // parked on a boundary doesn't toggle on every evaluation.
-        assert!(should_suspend(secs(120), 0, limits, true));
-        assert!(!should_suspend(secs(90), 0, limits, true));
+        // Held: time keeps a 30s gap from the ceiling. The physical iPad
+        // stopped fetching while the producer was 138s ahead, so release must
+        // happen above that no-fetch waterline instead of waiting forever for
+        // the old half-window (90s) threshold.
+        assert!(should_suspend(secs(151), 0, limits, true));
+        assert!(!should_suspend(secs(150), 0, limits, true));
+        assert!(!should_suspend(secs(138), 0, limits, true));
+        // Byte budgets remain hard disk bounds and release only at half.
         assert!(should_suspend(secs(10), 4_001, limits, true));
         assert!(!should_suspend(secs(10), 4_000, limits, true));
         // Time is fine but bytes are not: still held.
@@ -5729,13 +5754,21 @@ mod tests {
             Some(400_000)
         );
 
-        // The client has fetched through 300s. Its playhead may be a full
-        // forward buffer behind that.
+        // Physical-iPad regression: AVPlayer fetched through 300s while its
+        // playhead was around 180s, despite a 60s preferred forward buffer.
+        // The retained window must still leave 60s behind that playhead for
+        // back-buffering and a retry.
+        let observed_playhead_ms = 180_000;
         session.fetched_end_ms.store(300_000, Relaxed);
         gc_expired_segments(&session).await;
 
         // Everything within RETENTION_SECS of the frontier survives…
-        let keep_from = 300_000 - RETENTION_SECS * 1000; // 180_000
+        let keep_from = 300_000 - RETENTION_SECS * 1000; // 120_000
+        assert_eq!(
+            observed_playhead_ms - keep_from,
+            (CLIENT_BACK_BUFFER_SECS + RETRY_ALLOWANCE_SECS) * 1000,
+            "the observed iPad fetch lead must not consume the reload margin"
+        );
         assert!(
             p.join(format!("seg{:05}.ts", keep_from / 4_000)).exists(),
             "media at the retention boundary is kept"
@@ -5772,19 +5805,19 @@ mod tests {
                 .expect("served playlist"),
         )
         .expect("playlist utf8");
-        assert!(served.contains("#EXT-X-MEDIA-SEQUENCE:45"), "{served}");
+        assert!(served.contains("#EXT-X-MEDIA-SEQUENCE:30"), "{served}");
         assert!(!served.contains("#EXT-X-PLAYLIST-TYPE:EVENT"), "{served}");
-        assert!(!served.contains("seg00044.ts"), "{served}");
-        assert!(served.contains("seg00045.ts"), "{served}");
+        assert!(!served.contains("seg00029.ts"), "{served}");
+        assert!(served.contains("seg00030.ts"), "{served}");
         for name in served.lines().filter(|line| line.ends_with(".ts")) {
             assert!(p.join(name).exists(), "served segment must exist: {name}");
         }
 
         // Subtitle timing still sees the discarded prefix through the full
-        // internal index: segment 45 begins at 180 seconds, not at zero.
+        // internal index: segment 30 begins at 120 seconds, not at zero.
         assert_eq!(
-            mgr.segment_window("retained-window", 45).await,
-            Some((180.0, 184.0))
+            mgr.segment_window("retained-window", 30).await,
+            Some((120.0, 124.0))
         );
 
         // A frontier that has not yet passed the window prunes nothing.
