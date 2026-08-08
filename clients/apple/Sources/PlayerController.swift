@@ -404,12 +404,11 @@ enum SubtitleSelectionRoute: Equatable {
 /// first frame (`needsNativeSubtitleSession`).
 @MainActor
 final class PlayerController: ObservableObject {
-    /// The server retains 120 seconds behind the download frontier: 60 seconds
-    /// for the client's forward fetch, 30 for back-buffering, and 30 for a
-    /// retry. AVPlayer's default of zero lets it choose the forward fetch;
-    /// once that passed the server's retention window, the reaper could delete
-    /// media the player had fetched but had not presented yet. Keep growing
-    /// HLS sessions inside the contract while leaving direct and completed-VOD
+    /// The server retains 180 seconds behind the download frontier: the 120 s
+    /// forward lead measured on a physical iPad, 30 s for back-buffering, and
+    /// 30 s for retry/reload. `preferredForwardBufferDuration` is a hint, not a
+    /// cap — AVPlayer fetched twice this 60 s preference. Keep growing HLS
+    /// sessions inside that contract while leaving direct and completed-VOD
     /// items under AVPlayer's normal policy.
     static let growingHLSForwardBufferSeconds: TimeInterval = 60
 

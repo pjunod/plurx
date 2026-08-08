@@ -1817,7 +1817,10 @@ private struct PlaybackStatsView: View {
                 row("Encode speed", String(format: "%.2f×", speed))
             }
             if let ahead = status.aheadSeconds {
-                row("Server ahead", "\(max(0, ahead)) s\((status.suspended ?? false) ? " · held" : "")")
+                let release = (status.suspended ?? false)
+                    ? status.resumeBelowSeconds.map { " · time release ≤\($0) s" } ?? ""
+                    : ""
+                row("Server ahead", "\(max(0, ahead)) s\((status.suspended ?? false) ? " · held\(release)" : "")")
             }
             if let delivered = status.deliveredBps { row("Delivery rate", bitRate(delivered)) }
             if let bytes = status.deliveredBytes { row("Delivered", byteCount(bytes)) }
