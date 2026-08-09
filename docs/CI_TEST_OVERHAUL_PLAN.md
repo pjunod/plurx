@@ -178,23 +178,25 @@ T0; it cannot select or suppress a runtime suite. Selector code and
 browser, Apple, Android, cross-target, and container surfaces. An empty diff,
 unknown diff, push, or tag does not earn the shortcut.
 
-The scope also reports `mobile_version` independently. That lets CI run the
-highest-frequency policy failure before the general functionality-point job.
+The scope also reports `mobile_version` independently. That lets CI report the
+highest-frequency policy failure beside the general functionality-point and
+native-platform jobs instead of hiding their results.
 
-### 5.2 Preflight gates every expensive job
+### 5.2 Structural preflight gates every expensive job
 
-The new `fast policy and contract preflight` runs, in order:
+The `fast policy and contract preflight` runs, in order:
 
-1. mobile release versioning when the diff touches release inputs;
-2. corrective-history evidence;
-3. catalog lint and the validation-framework unit tests;
-4. CI, deploy, container, and shipping source contracts.
+1. corrective-history evidence;
+2. catalog lint and the validation-framework unit tests;
+3. CI, deploy, container, and shipping source contracts.
 
-Every expensive fan-out job in `ci.yml` has `needs: [scope, preflight]`. A
-version error therefore stops browser, simulator, emulator, cross-build,
-Docker, and complete Rust work before those environments are provisioned. The
-dependency adds a small latency tax to green code PRs; keeping preflight below
-60 seconds p95 and free of compilers is the explicit acceptance condition.
+Every expensive fan-out job in `ci.yml` has `needs: [scope, preflight]`.
+Mobile release versioning is a sibling job selected by scope and consumed only
+by the aggregate gate. A stale counter therefore fails the PR without skipping
+the Swift or Kotlin evidence the author needs before the next push. The
+structural dependency adds a small latency tax to green code PRs; keeping
+preflight below 60 seconds p95 and free of compilers is the explicit acceptance
+condition.
 
 ### 5.3 Lint reports success without compiling docs-only changes
 
@@ -215,8 +217,9 @@ Observable CI acceptance:
 
 - a docs-only PR runs `scope`, `preflight`, the lightweight lint job, and
   `PR validation gate`; the portable Rust job is skipped;
-- an Apple or Android source change with a stale build counter fails in
-  preflight before any native job starts;
+- an Apple or Android source change with a stale build counter fails the mobile
+  version job, still reports the selected native suite, and fails the aggregate
+  gate;
 - a mixed `docs/**` plus `crates/**` change does not use the docs-only lane;
 - the literal PR #67 shape—its three documentation files plus
   `validation/regressions.toml`—does use the lane, while replacing the mapping

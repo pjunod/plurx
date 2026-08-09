@@ -42,21 +42,20 @@ jobs:
           python3 -m validation.ci_scope \
             --event "$EVENT_NAME" --base "$VALIDATION_BASE" >> "$GITHUB_OUTPUT"
 
-  # The failure history says policy mistakes are both common and cheap to
-  # detect. Run them before provisioning Rust, browsers, simulators, emulators,
-  # cross compilers, or Docker builds, and make every expensive fan-out job in
-  # this workflow depend on this result.
-  preflight:
-    name: fast policy and contract preflight
+  # A stale counter must fail the aggregate gate without hiding the native test
+  # result. Run release hygiene beside preflight and the affected platform jobs
+  # rather than making it their prerequisite.
+  mobile_version:
+    name: mobile release version
     needs: scope
+    if: needs.scope.outputs.mobile_version == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 3
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Check mobile release hygiene first
-        if: needs.scope.outputs.mobile_version == 'true'
+      - name: Check mobile release hygiene
         env:
           VALIDATION_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: |
@@ -68,6 +67,20 @@ jobs:
           else
             python3 -m validation.mobile_versions
           fi
+
+  # The failure history says policy mistakes are both common and cheap to
+  # detect. Run the structural contracts before provisioning Rust, browsers,
+  # simulators, emulators, cross compilers, or Docker builds, and make every
+  # expensive fan-out job in this workflow depend on this result.
+  preflight:
+    name: fast policy and contract preflight
+    needs: scope
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Audit corrective-history evidence
         run: make history-check
       - name: Check validation catalog and contract unit tests
@@ -432,6 +445,7 @@ jobs:
     if: always() && github.event_name == 'pull_request'
     needs:
       - scope
+      - mobile_version
       - preflight
       - check
       - hiqlite_spike
@@ -448,6 +462,7 @@ jobs:
       - name: Require every selected job to pass
         env:
           SCOPE_RESULT: ${{ needs.scope.result }}
+          MOBILE_VERSION_RESULT: ${{ needs.mobile_version.result }}
           PREFLIGHT_RESULT: ${{ needs.preflight.result }}
           CHECK_RESULT: ${{ needs.check.result }}
           HIQLITE_SPIKE_RESULT: ${{ needs.hiqlite_spike.result }}
@@ -460,7 +475,8 @@ jobs:
           DOCKER_RESULT: ${{ needs.docker.result }}
         run: |
           for result in \
-            "$SCOPE_RESULT" "$PREFLIGHT_RESULT" "$CHECK_RESULT" \
+            "$SCOPE_RESULT" "$MOBILE_VERSION_RESULT" \
+            "$PREFLIGHT_RESULT" "$CHECK_RESULT" \
             "$HIQLITE_SPIKE_RESULT" "$CLUSTER_AUTH_RESULT" \
             "$WEB_LAYOUT_RESULT" \
             "$ANDROID_JVM_RESULT" "$APPLE_RESULT" "$ANDROID_DEVICE_RESULT" \

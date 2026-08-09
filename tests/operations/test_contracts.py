@@ -130,11 +130,8 @@ class OperationsContractCase(unittest.TestCase):
 
         self.assertIn("python3 -m validation.ci_scope", workflow)
         self.assertIn("name: fast policy and contract preflight", workflow)
-        self.assertIn("name: Check mobile release hygiene first", workflow)
-        self.assertLess(
-            workflow.index("name: Check mobile release hygiene first"),
-            workflow.index("name: Audit corrective-history evidence"),
-        )
+        self.assertIn("name: mobile release version", workflow)
+        self.assertIn("name: Check mobile release hygiene", workflow)
         self.assertLess(
             workflow.index("name: Audit corrective-history evidence"),
             workflow.index("name: Check validation catalog and contract unit tests"),
@@ -149,13 +146,27 @@ class OperationsContractCase(unittest.TestCase):
         self.assertIn("if: needs.scope.outputs.docs_only != 'true'", workflow)
         self.assertIn("needs: [scope, preflight]", workflow)
         self.assertIn("PREFLIGHT_RESULT: ${{ needs.preflight.result }}", workflow)
+        self.assertIn(
+            "MOBILE_VERSION_RESULT: ${{ needs.mobile_version.result }}",
+            workflow,
+        )
         self.assertIn("HIQLITE_SPIKE_RESULT: ${{ needs.hiqlite_spike.result }}", workflow)
         self.assertIn("CLUSTER_AUTH_RESULT: ${{ needs.cluster_auth.result }}", workflow)
         pr_gate = workflow.split("  pr_gate:", 1)[1]
+        self.assertIn("      - mobile_version", pr_gate)
         self.assertIn("      - hiqlite_spike", pr_gate)
         self.assertIn("      - cluster_auth", pr_gate)
         self.assertIn("needs: scope", workflow)
         self.assertNotIn("github.event_name == 'pull_request' && github.ref == 'refs/heads/main'", workflow)
+
+        mobile = workflow.split("  mobile_version:", 1)[1].split("\n  preflight:", 1)[0]
+        self.assertIn("needs: scope", mobile)
+        self.assertNotIn("needs: [scope, preflight]", mobile)
+        apple = workflow.split("\n  apple:\n", 1)[1].split(
+            "\n  android_device:\n", 1
+        )[0]
+        self.assertIn("needs: [scope, preflight]", apple)
+        self.assertNotIn("mobile_version", apple)
 
         coverage = workflow.split("  coverage:", 1)[1].split("\n  build:", 1)[0]
         self.assertIn("if: github.ref == 'refs/heads/main'", coverage)
