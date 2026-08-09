@@ -19,8 +19,8 @@ use super::{keys, ApiKeyStore, SettingsStore, UserStore};
 use crate::domain::{ApiKey, User};
 use crate::error::StoreError;
 
-pub const AUTH_SCHEMA_VERSION: i64 = 3;
-pub const AUTH_PROTOCOL_VERSION: i64 = 3;
+pub const AUTH_SCHEMA_VERSION: i64 = 4;
+pub const AUTH_PROTOCOL_VERSION: i64 = 4;
 
 const STORE_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -179,6 +179,64 @@ impl HiqliteAuthStore {
     /// equality cannot certify a broken digest implementation.
     pub async fn validation_local_dump(&self) -> Result<String, StoreError> {
         serde_json::to_string(&self.local_auth_dump().await?).map_err(database_error)
+    }
+
+    /// Clear mutable application rows between backend-neutral contract cases.
+    ///
+    /// This is deliberately outside [`Store`](super::Store): production code
+    /// must never gain a generic "erase the cluster" operation. The contract
+    /// harness keeps the three voter processes alive and serializes calls to
+    /// this validation-only helper so every scenario still starts empty.
+    #[doc(hidden)]
+    pub async fn validation_reset_contract_state(&self) -> Result<(), StoreError> {
+        let statements = [
+            "DELETE FROM offline_lease_guards",
+            "DELETE FROM offline_package_leases",
+            "DELETE FROM offline_packages",
+            "DELETE FROM transcode_cache_locations",
+            "DELETE FROM transcode_cache_recipes",
+            "DELETE FROM watched_outbox",
+            "DELETE FROM trakt_auth",
+            "DELETE FROM watch_state",
+            "DELETE FROM scan_reconcile_items",
+            "DELETE FROM scan_reconcile_guards",
+            "DELETE FROM library_roots",
+            "DELETE FROM files",
+            "DELETE FROM items",
+            "DELETE FROM libraries",
+            "DELETE FROM tokens",
+            "DELETE FROM api_keys",
+            "DELETE FROM users",
+            "DELETE FROM settings WHERE key <> $1",
+        ];
+        for sql in statements {
+            validate_sql(sql)?;
+        }
+        timeout_store(self.client.txn(vec![
+            (statements[0].to_owned(), params!()),
+            (statements[1].to_owned(), params!()),
+            (statements[2].to_owned(), params!()),
+            (statements[3].to_owned(), params!()),
+            (statements[4].to_owned(), params!()),
+            (statements[5].to_owned(), params!()),
+            (statements[6].to_owned(), params!()),
+            (statements[7].to_owned(), params!()),
+            (statements[8].to_owned(), params!()),
+            (statements[9].to_owned(), params!()),
+            (statements[10].to_owned(), params!()),
+            (statements[11].to_owned(), params!()),
+            (statements[12].to_owned(), params!()),
+            (statements[13].to_owned(), params!()),
+            (statements[14].to_owned(), params!()),
+            (statements[15].to_owned(), params!()),
+            (statements[16].to_owned(), params!()),
+            (statements[17].to_owned(), params!(keys::INSTANCE_ID)),
+        ]))
+        .await?
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(database_error)?;
+        Ok(())
     }
 
     /// Hash only authoritative catalogue tables from this voter. The cluster

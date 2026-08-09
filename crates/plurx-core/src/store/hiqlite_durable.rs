@@ -41,9 +41,11 @@ CREATE TABLE IF NOT EXISTS watched_outbox (
     status     TEXT NOT NULL CHECK (status IN ('pending', 'ok', 'failed')),
     next_at    INTEGER NOT NULL,
     created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
+    updated_at INTEGER NOT NULL,
+    claim_until INTEGER NOT NULL
 ) STRICT;
-CREATE INDEX IF NOT EXISTS watched_outbox_due ON watched_outbox(status, next_at);
+CREATE INDEX IF NOT EXISTS watched_outbox_due
+    ON watched_outbox(status, next_at, claim_until);
 
 CREATE TABLE IF NOT EXISTS transcode_cache_recipes (
     recipe_hash    TEXT PRIMARY KEY,
@@ -179,7 +181,8 @@ pub(super) async fn local_durable_digest(client: &hiqlite::Client) -> Result<Str
         watched_outbox: rows(
             client,
             "SELECT json_array(id, payload, attempts, last_error, status, next_at, \
-                    created_at, updated_at) AS value FROM watched_outbox ORDER BY id",
+                    created_at, updated_at, claim_until) AS value \
+             FROM watched_outbox ORDER BY id",
         )
         .await?,
         transcode_cache_recipes: rows(
@@ -400,20 +403,42 @@ impl TraktStore for HiqliteAuthStore {
         Ok(())
     }
 
+    async fn delete_trakt_auth_if_current(
+        &self,
+        user_id: i64,
+        expected_refresh_token: &str,
+    ) -> Result<bool, StoreError> {
+        Ok(self
+            .execute(
+                "DELETE FROM trakt_auth WHERE user_id = $1 AND refresh_token = $2",
+                params!(user_id, expected_refresh_token),
+            )
+            .await?
+            > 0)
+    }
+
     async fn update_trakt_tokens(
         &self,
         user_id: i64,
+        expected_refresh_token: &str,
         access_token: &str,
         refresh_token: &str,
         expires_at: i64,
-    ) -> Result<(), StoreError> {
-        self.execute(
-            "UPDATE trakt_auth SET access_token = $1, refresh_token = $2, expires_at = $3 \
-             WHERE user_id = $4",
-            params!(access_token, refresh_token, expires_at, user_id),
-        )
-        .await?;
-        Ok(())
+    ) -> Result<bool, StoreError> {
+        Ok(self
+            .execute(
+                "UPDATE trakt_auth SET access_token = $1, refresh_token = $2, expires_at = $3 \
+             WHERE user_id = $4 AND refresh_token = $5",
+                params!(
+                    access_token,
+                    refresh_token,
+                    expires_at,
+                    user_id,
+                    expected_refresh_token
+                ),
+            )
+            .await?
+            > 0)
     }
 
     async fn set_trakt_sync(
@@ -463,6 +488,7 @@ struct OutboxRow {
     last_error: String,
     status: String,
     next_at: i64,
+    claim_until: i64,
 }
 
 impl From<&mut Row<'_>> for OutboxRow {
@@ -474,6 +500,7 @@ impl From<&mut Row<'_>> for OutboxRow {
             last_error: row.get("last_error"),
             status: row.get("status"),
             next_at: row.get("next_at"),
+            claim_until: row.get("claim_until"),
         }
     }
 }
@@ -487,6 +514,7 @@ impl From<OutboxRow> for OutboxEntry {
             last_error: row.last_error,
             status: row.status,
             next_at: row.next_at,
+            claim_until: row.claim_until,
         }
     }
 }
@@ -495,14 +523,14 @@ impl From<OutboxRow> for OutboxEntry {
 impl WatchedOutboxStore for HiqliteAuthStore {
     async fn enqueue_watched(&self, payload: &str) -> Result<i64, StoreError> {
         let now = self.now()?;
+        let sql = "INSERT INTO watched_outbox \
+                    (payload, attempts, last_error, status, next_at, created_at, updated_at, \
+                     claim_until) \
+                 VALUES ($1, 0, '', 'pending', $2, $2, $2, 0) RETURNING id";
+        validate_sql(sql)?;
         let mut rows = self
             .client
-            .execute_returning_map::<_, IdRow>(
-                "INSERT INTO watched_outbox \
-                    (payload, attempts, last_error, status, next_at, created_at, updated_at) \
-                 VALUES ($1, 0, '', 'pending', $2, $2, $2) RETURNING id",
-                params!(payload, now),
-            )
+            .execute_returning_map::<_, IdRow>(sql, params!(payload, now))
             .await
             .map_err(database_error)?;
         rows.pop()
@@ -514,15 +542,20 @@ impl WatchedOutboxStore for HiqliteAuthStore {
 
     async fn due_watched(&self, limit: i64) -> Result<Vec<OutboxEntry>, StoreError> {
         let now = self.now()?;
+        let claim_until = now.saturating_add(60);
+        let sql = "UPDATE watched_outbox SET claim_until = $1 \
+                 WHERE id IN (SELECT id FROM watched_outbox \
+                   WHERE status = 'pending' AND next_at <= $2 AND claim_until <= $2 \
+                   ORDER BY next_at, id LIMIT $3) \
+                 RETURNING id, payload, attempts, last_error, status, next_at, claim_until";
+        validate_sql(sql)?;
         Ok(self
             .client
-            .query_consistent_map::<OutboxRow, _>(
-                "SELECT id, payload, attempts, last_error, status, next_at \
-                 FROM watched_outbox WHERE status = 'pending' AND next_at <= $1 \
-                 ORDER BY next_at, id LIMIT $2",
-                params!(now, limit.max(0)),
-            )
+            .execute_returning_map::<_, OutboxRow>(sql, params!(claim_until, now, limit))
             .await
+            .map_err(database_error)?
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
             .map_err(database_error)?
             .into_iter()
             .map(Into::into)
@@ -533,14 +566,16 @@ impl WatchedOutboxStore for HiqliteAuthStore {
         let now = self.now()?;
         self.execute(
             "UPDATE watched_outbox SET attempts = $1, last_error = $2, status = $3, \
-                 next_at = $4, updated_at = $5 WHERE id = $6",
+                 next_at = $4, updated_at = $5, claim_until = 0 \
+             WHERE id = $6 AND claim_until = $7",
             params!(
                 entry.attempts,
                 entry.last_error.as_str(),
                 entry.status.as_str(),
                 entry.next_at,
                 now,
-                entry.id
+                entry.id,
+                entry.claim_until
             ),
         )
         .await?;
@@ -551,9 +586,9 @@ impl WatchedOutboxStore for HiqliteAuthStore {
         let row = self
             .client
             .query_consistent_map::<OutboxCountsRow, _>(
-                "SELECT SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending, \
-                        SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END) AS ok, \
-                        SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed \
+                "SELECT COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0) AS pending, \
+                        COALESCE(SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END), 0) AS ok, \
+                        COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) AS failed \
                  FROM watched_outbox",
                 params!(),
             )
@@ -647,7 +682,7 @@ impl TranscodeCacheStore for HiqliteAuthStore {
     ) -> Result<Option<CachedTranscode>, StoreError> {
         Ok(self
             .client
-            .query_consistent_map::<CacheRow, _>(
+            .query_map::<CacheRow, _>(
                 format!(
                     "SELECT {CACHE_COLS} FROM transcode_cache_locations l \
                      JOIN transcode_cache_recipes r ON r.recipe_hash = l.recipe_hash \
@@ -749,7 +784,7 @@ impl TranscodeCacheStore for HiqliteAuthStore {
     ) -> Result<Vec<CachedTranscode>, StoreError> {
         Ok(cached(
             self.client
-                .query_consistent_map::<CacheRow, _>(
+                .query_map::<CacheRow, _>(
                     format!(
                         "SELECT {CACHE_COLS} FROM transcode_cache_locations l \
                          JOIN transcode_cache_recipes r ON r.recipe_hash = l.recipe_hash \
@@ -760,7 +795,7 @@ impl TranscodeCacheStore for HiqliteAuthStore {
                                AND p.state IN ('queued', 'preparing', 'ready')) \
                          ORDER BY l.last_used_at ASC, l.rowid ASC LIMIT $2"
                     ),
-                    params!(node_id, limit.max(0)),
+                    params!(node_id, limit),
                 )
                 .await
                 .map_err(database_error)?,
@@ -774,7 +809,7 @@ impl TranscodeCacheStore for HiqliteAuthStore {
     ) -> Result<Vec<CachedTranscode>, StoreError> {
         Ok(cached(
             self.client
-                .query_consistent_map::<CacheRow, _>(
+                .query_map::<CacheRow, _>(
                     format!(
                         "SELECT {CACHE_COLS} FROM transcode_cache_locations l \
                          JOIN transcode_cache_recipes r ON r.recipe_hash = l.recipe_hash \
@@ -794,7 +829,7 @@ impl TranscodeCacheStore for HiqliteAuthStore {
     async fn all_cache_rows(&self, node_id: &str) -> Result<Vec<CachedTranscode>, StoreError> {
         Ok(cached(
             self.client
-                .query_consistent_map::<CacheRow, _>(
+                .query_map::<CacheRow, _>(
                     format!(
                         "SELECT {CACHE_COLS} FROM transcode_cache_locations l \
                          JOIN transcode_cache_recipes r ON r.recipe_hash = l.recipe_hash \
@@ -844,7 +879,7 @@ impl TranscodeCacheStore for HiqliteAuthStore {
     async fn cache_bytes(&self, node_id: &str) -> Result<i64, StoreError> {
         let row = self
             .client
-            .query_consistent_map::<ScalarRow, _>(
+            .query_map::<ScalarRow, _>(
                 "SELECT COALESCE(SUM(l.bytes), 0) AS value \
                  FROM transcode_cache_locations l \
                  WHERE l.node_id = $1 AND l.storage_class = 'local' AND l.complete = 1 \
@@ -870,6 +905,22 @@ impl From<&mut Row<'_>> for ScalarRow {
     fn from(row: &mut Row<'_>) -> Self {
         Self {
             value: row.get("value"),
+        }
+    }
+}
+
+struct OfflineAdmissionRow {
+    rows: i64,
+    user_used: i64,
+    node_used: i64,
+}
+
+impl From<&mut Row<'_>> for OfflineAdmissionRow {
+    fn from(row: &mut Row<'_>) -> Self {
+        Self {
+            rows: row.get("rows"),
+            user_used: row.get("user_used"),
+            node_used: row.get("node_used"),
         }
     }
 }
@@ -1014,6 +1065,13 @@ fn same_request(existing: &OfflinePackage, requested: &NewOfflinePackage) -> boo
         && existing.subtitle_index == requested.subtitle_index
         && existing.subtitle_language == requested.subtitle_language
         && existing.subtitle_mode == requested.subtitle_mode
+        && existing.estimated_bytes == requested.estimated_bytes
+        && existing.reserved_bytes == requested.reserved_bytes
+        && existing.expires_at == requested.expires_at
+}
+
+fn exceeds_byte_limit(used: i64, reserved: i64, limit: i64) -> bool {
+    limit <= 0 || reserved < 0 || used > limit || reserved > limit - used
 }
 
 struct OfflineLeaseRow {
@@ -1119,10 +1177,7 @@ impl OfflinePackageStore for HiqliteAuthStore {
         max_bytes_global: i64,
     ) -> Result<OfflineCreateOutcome, StoreError> {
         let now = self.now()?;
-        let inserted = self
-            .client
-            .execute_returning_map::<_, OfflinePackageRow>(
-                "INSERT INTO offline_packages (id, request_id, user_id, file_id, node_id, \
+        let sql = "INSERT INTO offline_packages (id, request_id, user_id, file_id, node_id, \
                     source_path, source_size, source_mtime, target_height, audio_index, \
                     audio_offset_ms, output_width, output_height, subtitle_index, \
                     subtitle_language, subtitle_mode, state, phase, progress_millis, \
@@ -1134,128 +1189,132 @@ impl OfflinePackageStore for HiqliteAuthStore {
                      WHERE user_id = $3 AND request_id = $2) \
                    AND $21 > 0 \
                    AND (SELECT COUNT(*) FROM offline_packages WHERE user_id = $3) < $21 \
-                   AND $22 > 0 AND (SELECT COALESCE(SUM(COALESCE(actual_bytes, reserved_bytes)), 0) \
+                   AND $18 >= 0 AND $22 >= $18 \
+                   AND (SELECT COALESCE(SUM(COALESCE(actual_bytes, reserved_bytes)), 0) \
                      FROM offline_packages WHERE user_id = $3 \
-                       AND state IN ('queued', 'preparing', 'ready')) + $18 <= $22 \
-                   AND $23 > 0 AND (SELECT COALESCE(SUM(COALESCE(actual_bytes, reserved_bytes)), 0) \
-                     FROM offline_packages WHERE state IN ('queued', 'preparing', 'ready')) \
-                       + $18 <= $23 \
+                       AND state IN ('queued', 'preparing', 'ready')) <= $22 - $18 \
+                   AND $23 >= $18 \
+                   AND (SELECT COALESCE(SUM(COALESCE(actual_bytes, reserved_bytes)), 0) \
+                     FROM offline_packages WHERE node_id = $5 \
+                       AND state IN ('queued', 'preparing', 'ready')) <= $23 - $18 \
                  RETURNING id, request_id, user_id, file_id, node_id, source_path, \
                     source_size, source_mtime, recipe_hash, target_height, audio_index, \
                     audio_offset_ms, output_width, output_height, subtitle_index, \
                     subtitle_language, subtitle_mode, state, phase, progress_millis, \
                     estimated_bytes, reserved_bytes, actual_bytes, duration_ms, error_code, \
-                    error_message, created_at, updated_at, last_access_at, expires_at",
-                params!(
-                    package.id.as_str(),
-                    package.request_id.as_str(),
-                    package.user_id,
-                    package.file_id,
-                    package.node_id.as_str(),
-                    package.source_path.as_str(),
-                    package.source_size,
-                    package.source_mtime,
-                    package.target_height,
-                    package.audio_index,
-                    package.audio_offset_ms,
-                    package.output_width,
-                    package.output_height,
-                    package.subtitle_index,
-                    package.subtitle_language.as_deref(),
-                    package.subtitle_mode.as_str(),
-                    package.estimated_bytes,
-                    package.reserved_bytes,
-                    now,
-                    package.expires_at,
-                    max_rows_per_user,
-                    max_bytes_per_user,
-                    max_bytes_global
-                ),
-            )
-            .await
-            .map_err(database_error)?
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(database_error)?;
-        if let Some(created) = one_package(inserted) {
-            return Ok(OfflineCreateOutcome::Created(created));
-        }
-
-        if let Some(existing) = one_package(
-            self.client
-                .query_consistent_map::<OfflinePackageRow, _>(
-                    format!(
-                        "SELECT {PACKAGE_COLS} FROM offline_packages \
-                         WHERE user_id = $1 AND request_id = $2"
+                    error_message, created_at, updated_at, last_access_at, expires_at";
+        validate_sql(sql)?;
+        for attempt in 0..2 {
+            let inserted = self
+                .client
+                .execute_returning_map::<_, OfflinePackageRow>(
+                    sql,
+                    params!(
+                        package.id.as_str(),
+                        package.request_id.as_str(),
+                        package.user_id,
+                        package.file_id,
+                        package.node_id.as_str(),
+                        package.source_path.as_str(),
+                        package.source_size,
+                        package.source_mtime,
+                        package.target_height,
+                        package.audio_index,
+                        package.audio_offset_ms,
+                        package.output_width,
+                        package.output_height,
+                        package.subtitle_index,
+                        package.subtitle_language.as_deref(),
+                        package.subtitle_mode.as_str(),
+                        package.estimated_bytes,
+                        package.reserved_bytes,
+                        now,
+                        package.expires_at,
+                        max_rows_per_user,
+                        max_bytes_per_user,
+                        max_bytes_global
                     ),
-                    params!(package.user_id, package.request_id.as_str()),
                 )
                 .await
-                .map_err(database_error)?,
-        ) {
-            return Ok(if same_request(&existing, package) {
-                OfflineCreateOutcome::Existing(existing)
-            } else {
-                OfflineCreateOutcome::RequestConflict
-            });
-        }
+                .map_err(database_error)?
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(database_error)?;
+            if let Some(created) = one_package(inserted) {
+                return Ok(OfflineCreateOutcome::Created(created));
+            }
 
-        let rows = self
-            .client
-            .query_consistent_map::<ScalarRow, _>(
-                "SELECT COUNT(*) AS value FROM offline_packages WHERE user_id = $1",
-                params!(package.user_id),
-            )
-            .await
-            .map_err(database_error)?
-            .into_iter()
-            .next()
-            .map(|row| row.value)
-            .unwrap_or(0);
-        if max_rows_per_user <= 0 || rows >= max_rows_per_user {
-            return Ok(OfflineCreateOutcome::RowLimit {
-                limit: max_rows_per_user.max(0),
-            });
+            if let Some(existing) = one_package(
+                self.client
+                    .query_consistent_map::<OfflinePackageRow, _>(
+                        format!(
+                            "SELECT {PACKAGE_COLS} FROM offline_packages \
+                             WHERE user_id = $1 AND request_id = $2"
+                        ),
+                        params!(package.user_id, package.request_id.as_str()),
+                    )
+                    .await
+                    .map_err(database_error)?,
+            ) {
+                return Ok(if same_request(&existing, package) {
+                    OfflineCreateOutcome::Existing(existing)
+                } else {
+                    OfflineCreateOutcome::RequestConflict
+                });
+            }
+
+            let admission = self
+                .client
+                .query_consistent_map::<OfflineAdmissionRow, _>(
+                    "SELECT \
+                       (SELECT COUNT(*) FROM offline_packages WHERE user_id = $1) AS rows, \
+                       (SELECT COALESCE(SUM(COALESCE(actual_bytes, reserved_bytes)), 0) \
+                          FROM offline_packages WHERE user_id = $1 \
+                            AND state IN ('queued', 'preparing', 'ready')) AS user_used, \
+                       (SELECT COALESCE(SUM(COALESCE(actual_bytes, reserved_bytes)), 0) \
+                          FROM offline_packages WHERE node_id = $2 \
+                            AND state IN ('queued', 'preparing', 'ready')) AS node_used",
+                    params!(package.user_id, package.node_id.as_str()),
+                )
+                .await
+                .map_err(database_error)?
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    StoreError::Database("offline admission snapshot returned no row".to_owned())
+                })?;
+            if max_rows_per_user <= 0 || admission.rows >= max_rows_per_user {
+                return Ok(OfflineCreateOutcome::RowLimit {
+                    limit: max_rows_per_user.max(0),
+                });
+            }
+            if exceeds_byte_limit(
+                admission.user_used,
+                package.reserved_bytes,
+                max_bytes_per_user,
+            ) {
+                return Ok(OfflineCreateOutcome::ByteLimit {
+                    used: admission.user_used,
+                    limit: max_bytes_per_user.max(0),
+                });
+            }
+            if exceeds_byte_limit(
+                admission.node_used,
+                package.reserved_bytes,
+                max_bytes_global,
+            ) {
+                return Ok(OfflineCreateOutcome::GlobalByteLimit {
+                    used: admission.node_used,
+                    limit: max_bytes_global.max(0),
+                });
+            }
+            if attempt == 1 {
+                return Err(StoreError::Database(
+                    "offline admission changed concurrently; retry the request".to_owned(),
+                ));
+            }
         }
-        let used = self
-            .client
-            .query_consistent_map::<ScalarRow, _>(
-                "SELECT COALESCE(SUM(COALESCE(actual_bytes, reserved_bytes)), 0) AS value \
-                 FROM offline_packages WHERE user_id = $1 \
-                   AND state IN ('queued', 'preparing', 'ready')",
-                params!(package.user_id),
-            )
-            .await
-            .map_err(database_error)?
-            .into_iter()
-            .next()
-            .map(|row| row.value)
-            .unwrap_or(0);
-        if max_bytes_per_user <= 0
-            || used.saturating_add(package.reserved_bytes) > max_bytes_per_user
-        {
-            return Ok(OfflineCreateOutcome::ByteLimit {
-                used,
-                limit: max_bytes_per_user.max(0),
-            });
-        }
-        let global_used = self
-            .client
-            .query_consistent_map::<ScalarRow, _>(
-                "SELECT COALESCE(SUM(COALESCE(actual_bytes, reserved_bytes)), 0) AS value \
-                 FROM offline_packages WHERE state IN ('queued', 'preparing', 'ready')",
-                params!(),
-            )
-            .await
-            .map_err(database_error)?
-            .into_iter()
-            .next()
-            .map(|row| row.value)
-            .unwrap_or(0);
-        Ok(OfflineCreateOutcome::GlobalByteLimit {
-            used: global_used,
-            limit: max_bytes_global.max(0),
-        })
+        unreachable!("bounded offline admission loop always returns")
     }
 
     async fn offline_package_for_user(
@@ -1414,10 +1473,7 @@ impl OfflinePackageStore for HiqliteAuthStore {
         node_id: &str,
     ) -> Result<Option<OfflinePackage>, StoreError> {
         let now = self.now()?;
-        let rows = self
-            .client
-            .execute_returning_map::<_, OfflinePackageRow>(
-                "UPDATE offline_packages SET state = 'preparing', \
+        let sql = "UPDATE offline_packages SET state = 'preparing', \
                      phase = 'waiting_for_encoder', updated_at = $1 \
                  WHERE id = (SELECT id FROM offline_packages \
                      WHERE node_id = $2 AND state = 'queued' ORDER BY created_at, id LIMIT 1) \
@@ -1427,9 +1483,11 @@ impl OfflinePackageStore for HiqliteAuthStore {
                     audio_offset_ms, output_width, output_height, subtitle_index, \
                     subtitle_language, subtitle_mode, state, phase, progress_millis, \
                     estimated_bytes, reserved_bytes, actual_bytes, duration_ms, error_code, \
-                    error_message, created_at, updated_at, last_access_at, expires_at",
-                params!(now, node_id),
-            )
+                    error_message, created_at, updated_at, last_access_at, expires_at";
+        validate_sql(sql)?;
+        let rows = self
+            .client
+            .execute_returning_map::<_, OfflinePackageRow>(sql, params!(now, node_id))
             .await
             .map_err(database_error)?
             .into_iter()
@@ -1613,7 +1671,7 @@ impl OfflinePackageStore for HiqliteAuthStore {
              WHERE l.token_hash = $1 AND l.expires_at > $2 AND p.state = 'ready'",
             package_cols("p")
         );
-        let mut package = one_package(
+        let package = one_package(
             self.client
                 .query_consistent_map::<OfflinePackageRow, _>(
                     query.clone(),
@@ -1622,11 +1680,11 @@ impl OfflinePackageStore for HiqliteAuthStore {
                 .await
                 .map_err(database_error)?,
         );
-        let Some(current) = package.as_ref() else {
+        let Some(mut current) = package else {
             return Ok(None);
         };
         if now.saturating_sub(current.last_access_at) < 60 {
-            return Ok(package);
+            return Ok(Some(current));
         }
         let statements = vec![
             (
@@ -1658,13 +1716,10 @@ impl OfflinePackageStore for HiqliteAuthStore {
         if results.first().copied().unwrap_or(0) == 0 {
             return Ok(None);
         }
-        package = one_package(
-            self.client
-                .query_consistent_map::<OfflinePackageRow, _>(query, params!(token_hash, now))
-                .await
-                .map_err(database_error)?,
-        );
-        Ok(package)
+        current.last_access_at = now;
+        current.updated_at = now;
+        current.expires_at = renewed_expires_at;
+        Ok(Some(current))
     }
 
     async fn mark_offline_package_ready(

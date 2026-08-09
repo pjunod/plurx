@@ -41,6 +41,7 @@ getrandom = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 axum = { workspace = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 # `trace` (sqlite3_trace_v2) is how the page-wide lookups prove they are one
 # statement rather than one per item. Tests only — resolver 2 keeps a
 # dev-dependency's features out of the shipped build.

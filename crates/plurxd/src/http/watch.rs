@@ -43,13 +43,14 @@ pub async fn progress(
         .await?
         .map(|w| w.watched)
         .unwrap_or(false);
-    let watch = if req.recorded_at.is_some() {
+    let (watch, reported_position_ms, reported_duration_ms) = if req.recorded_at.is_some() {
         // Imported/offline facts carry their own ordering clock and are rare,
         // semantically complete writes rather than an active player's beat.
-        state
+        let watch = state
             .store
             .put_progress_at(user.id, id, position, req.duration_ms, req.recorded_at)
-            .await?
+            .await?;
+        (watch, watch.position_ms, watch.duration_ms)
     } else {
         let update = state
             .progress
@@ -58,7 +59,11 @@ pub async fn progress(
         if !update.committed {
             tracing::trace!(user_id = user.id, item_id = id, "coalesced progress beat");
         }
-        update.watch
+        (
+            update.watch,
+            update.reported_position_ms,
+            update.reported_duration_ms,
+        )
     };
     let applied = req.recorded_at.is_none_or(|at| at >= watch.updated_at);
     // This beat is also the heartbeat for a direct play (`crate::delivery`).
@@ -73,8 +78,8 @@ pub async fn progress(
     }
     // Feed the Trakt scrobbler (fire-and-forget; a beat every ~5s while the
     // player is open, and the watched flip triggers the scrobble stop).
-    let pct = match watch.duration_ms.filter(|d| *d > 0) {
-        Some(dur) => (watch.position_ms as f64 / dur as f64 * 100.0).clamp(0.0, 100.0),
+    let pct = match reported_duration_ms.filter(|d| *d > 0) {
+        Some(dur) => (reported_position_ms as f64 / dur as f64 * 100.0).clamp(0.0, 100.0),
         None => 0.0,
     };
     if applied {

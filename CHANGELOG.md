@@ -10,6 +10,22 @@ bump may break compatibility and a **patch** bump never does.
 
 ### Added
 
+- **The Phase 4 storage boundary now has a complete replicated backend and a
+  real three-voter contract gate.** M0–M1c established local node identity,
+  rollback-tolerant cluster configuration, the Hiqlite decision, replicated
+  auth/catalogue/watch state, node-local FTS, and root-safe reconciliation.
+  The M1d review branch completes all 120 `Store` methods for Trakt/outbox,
+  cache, and offline packages; runs the same `Arc<dyn Store>` scenarios against
+  memory SQLite, file SQLite, and three separate Hiqlite voters; and rechecks
+  independently hashed state after induced follower and leader loss. Trakt
+  refresh/unlink and watched delivery now use compare-and-set/claims for
+  multi-writer safety, offline admission enforces per-node byte budgets and
+  complete idempotency, and active progress is bounded to one durable commit
+  per ten-second stream window without overwriting manual or timestamped
+  writes. SQLite remains the selected production store until import,
+  envelope-encrypted Trakt credentials, node-removal cleanup, and
+  post-coalescer growth measurement land.
+
 - **Download a title in the native phone apps and watch it without the
   server.** iPhone, iPad, and Android phones/tablets now have a one-tap
   Downloads flow rather than a save-file export. plurxd durably prepares one

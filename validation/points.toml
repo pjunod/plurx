@@ -257,7 +257,7 @@ depends_on = ["core.media"]
 [[points]]
 id = "cluster.auth"
 title = "Replicated durable state"
-contract = "Three voters converge on settings, authentication, catalogue, watch, Trakt/outbox, cache, offline, and root-safety state; node-local paths stay owned, local FTS rebuilds from replicated items, quorum loss fails readiness, and incompatible voters cannot participate."
+contract = "The shared Store suite passes on SQLite and three voters; replicated path metadata retains its named owner while bytes stay node-local; local FTS rebuilds from replicated items; identity/state guards survive follower and leader loss; quorum loss fails readiness; incompatible candidates are refused."
 paths = [
   "crates/plurx-cluster-check/**",
   "crates/plurx-core/src/store/hiqlite.rs",
@@ -366,11 +366,12 @@ depends_on = ["core.media", "server.api", "library.catalog"]
 [[points]]
 id = "watch-state.sync"
 title = "Watch state and external history sync"
-contract = "Progress, watched state, and Trakt synchronization converge without losing newer user activity."
+contract = "Native and Plex progress routes share one bounded coalescer; manual and timestamped activity outranks delayed flushes; watched state and Trakt synchronization converge without losing newer user activity."
 paths = [
   "crates/plurx-core/src/store/sqlite/{outbox,trakt,watch}.rs",
   "crates/plurx-core/src/trakt.rs",
   "crates/plurxd/src/{progress,trakt,watched}.rs",
+  "crates/plurxd/src/http/mod.rs",
   "crates/plurxd/src/http/{trakt,watch}.rs",
 ]
 checks = ["rust-gate", "user-journey"]

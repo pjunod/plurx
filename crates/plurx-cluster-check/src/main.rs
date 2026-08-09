@@ -7,9 +7,11 @@
 
 use std::borrow::Cow;
 use std::net::TcpListener;
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use hiqlite::tls::ServerTlsConfig;
@@ -127,11 +129,39 @@ async fn run_failure_case(target: FailureTarget) -> Result<()> {
         )
         .await?
         .require_ok()?;
+    cluster.wait_for_equal_dumps().await?;
+    let post_loss_key = format!("post_loss.{}", format!("{target:?}").to_ascii_lowercase());
+    let post_loss_dump = match cluster.request(survivor, Request::Dump).await? {
+        Response::Dump { digest, dump } => {
+            if digest != hex::encode(Sha256::digest(dump.as_bytes())) {
+                bail!("post-loss dump digest is not anchored to the returned rows");
+            }
+            dump
+        }
+        response => bail!("unexpected post-loss dump response: {response:?}"),
+    };
+    require_dump_setting(&post_loss_dump, &post_loss_key, "acknowledged")?;
+    if cluster.wait_for_equal_catalog_views().await?.search.len() != 3 {
+        bail!("post-loss catalogue/search proof lost rows");
+    }
 
     if matches!(target, FailureTarget::Follower) {
+        let voters_before = match cluster.request(survivor, Request::Metrics).await? {
+            Response::Metrics { voters, .. } => voters,
+            response => bail!("unexpected pre-refusal metrics response: {response:?}"),
+        };
         let refused = run_incompatible_preflight(&specs).await?;
         if !refused.contains("incompatible with voter schema") {
             bail!("old-schema voter was not refused: {refused}");
+        }
+        let voters_after = match cluster.request(survivor, Request::Metrics).await? {
+            Response::Metrics { voters, .. } => voters,
+            response => bail!("unexpected post-refusal metrics response: {response:?}"),
+        };
+        if voters_after != voters_before {
+            bail!(
+                "rejected preflight changed raft membership: {voters_before:?} -> {voters_after:?}"
+            );
         }
     }
 
@@ -141,15 +171,13 @@ async fn run_failure_case(target: FailureTarget) -> Result<()> {
         .find(|node_id| *node_id != target_id && *node_id != survivor)
         .context("choose second loss")?;
     cluster.kill(second_loss).await?;
-    let response = cluster.request(survivor, Request::Ping).await?;
-    if !matches!(response, Response::Error { .. }) {
-        bail!("one voter reported ready without quorum: {response:?}");
-    }
-    for request in [Request::ReadWithoutQuorum, Request::WriteWithoutQuorum] {
+    for request in [
+        Request::Ping,
+        Request::ReadWithoutQuorum,
+        Request::WriteWithoutQuorum,
+    ] {
         let response = cluster.request(survivor, request).await?;
-        if !matches!(response, Response::Error { .. }) {
-            bail!("ordinary store operation succeeded without quorum: {response:?}");
-        }
+        require_quorum_error(response)?;
     }
     cluster.assert_running().await?;
 
@@ -233,6 +261,35 @@ impl Response {
     }
 }
 
+fn require_quorum_error(response: Response) -> Result<()> {
+    let Response::Error { message } = response else {
+        bail!("ordinary store operation succeeded without quorum: {response:?}");
+    };
+    let normalized = message.to_ascii_lowercase();
+    if !normalized.contains("quorum")
+        && !normalized.contains("timed out")
+        && !normalized.contains("raft leader")
+    {
+        bail!("store failed without quorum for an unrelated reason: {message}");
+    }
+    Ok(())
+}
+
+fn require_dump_setting(dump: &str, key: &str, expected: &str) -> Result<()> {
+    let dump: serde_json::Value = serde_json::from_str(dump)?;
+    let settings = dump
+        .get("settings")
+        .and_then(serde_json::Value::as_array)
+        .context("local dump has no settings rows")?;
+    if !settings.iter().any(|row| {
+        row.get("key").and_then(serde_json::Value::as_str) == Some(key)
+            && row.get("value").and_then(serde_json::Value::as_str) == Some(expected)
+    }) {
+        bail!("local dump is missing expected setting {key}={expected}");
+    }
+    Ok(())
+}
+
 struct NodeProcess {
     id: u64,
     child: Child,
@@ -291,7 +348,20 @@ impl NodeProcess {
     async fn kill(&mut self) -> Result<()> {
         if self.child.try_wait()?.is_none() {
             self.child.kill().await?;
-            let _ = self.child.wait().await;
+            let status = self.child.wait().await?;
+            if status.success() {
+                bail!(
+                    "voter {} exited successfully after an intentional kill",
+                    self.id
+                );
+            }
+            #[cfg(unix)]
+            if status.signal() != Some(9) {
+                bail!(
+                    "voter {} exited with unexpected status after kill: {status}",
+                    self.id
+                );
+            }
         }
         Ok(())
     }
@@ -432,6 +502,9 @@ impl ClusterProcesses {
         loop {
             let mut dumps = Vec::new();
             for node_id in 1..=self.nodes.len() as u64 {
+                if self.nodes[(node_id - 1) as usize].is_none() {
+                    continue;
+                }
                 match self.request(node_id, Request::Dump).await? {
                     Response::Dump { digest, dump } => {
                         let computed = hex::encode(Sha256::digest(dump.as_bytes()));
@@ -460,6 +533,9 @@ impl ClusterProcesses {
         loop {
             let mut views = Vec::new();
             for node_id in 1..=self.nodes.len() as u64 {
+                if self.nodes[(node_id - 1) as usize].is_none() {
+                    continue;
+                }
                 match self.request(node_id, Request::CatalogView).await? {
                     Response::CatalogView { view } => views.push(view),
                     Response::Error { message } => return Err(anyhow!(message)),
@@ -1031,26 +1107,42 @@ async fn exercise(store: &HiqliteAuthStore, ordinal: u64) -> Result<()> {
         last_activities: None,
     };
     store.put_trakt_auth(&trakt).await?;
+    let trakt_sync_at = 1_700_000_100 + ordinal as i64;
     store
-        .set_trakt_sync(user.id, 1_700_000_100 + ordinal as i64, Some("{}"))
+        .set_trakt_sync(user.id, trakt_sync_at, Some("{}"))
         .await?;
-    store
+    if !store
         .update_trakt_tokens(
             user.id,
+            &format!("trakt-refresh-{suffix}"),
             &format!("trakt-access-new-{suffix}"),
             &format!("trakt-refresh-new-{suffix}"),
             4_000_000_001,
         )
-        .await?;
-    if store
-        .get_trakt_auth(user.id)
         .await?
-        .is_none_or(|auth| auth.access_token != format!("trakt-access-new-{suffix}"))
-        || !store
-            .list_trakt_auth()
+        || store
+            .update_trakt_tokens(
+                user.id,
+                &format!("trakt-refresh-{suffix}"),
+                &format!("trakt-access-loser-{suffix}"),
+                &format!("trakt-refresh-loser-{suffix}"),
+                4_000_000_002,
+            )
             .await?
-            .iter()
-            .any(|auth| auth.user_id == user.id)
+    {
+        bail!("replicated Trakt token compare-and-set failed");
+    }
+    if store.get_trakt_auth(user.id).await?.is_none_or(|auth| {
+        auth.access_token != format!("trakt-access-new-{suffix}")
+            || auth.refresh_token != format!("trakt-refresh-new-{suffix}")
+            || auth.expires_at != 4_000_000_001
+            || auth.last_sync_at != trakt_sync_at
+            || auth.last_activities.as_deref() != Some("{}")
+    }) || !store
+        .list_trakt_auth()
+        .await?
+        .iter()
+        .any(|auth| auth.user_id == user.id)
         || !store
             .trakt_sync_candidates(user.id)
             .await?
@@ -1058,6 +1150,13 @@ async fn exercise(store: &HiqliteAuthStore, ordinal: u64) -> Result<()> {
             .any(|candidate| candidate.item_id == movie)
     {
         bail!("replicated Trakt link/candidate join failed");
+    }
+    if store
+        .delete_trakt_auth_if_current(user.id, &format!("trakt-refresh-{suffix}"))
+        .await?
+        || store.get_trakt_auth(user.id).await?.is_none()
+    {
+        bail!("stale replicated Trakt unlink deleted a refreshed credential");
     }
     let unlink_user = store
         .create_user(&format!("trakt-unlink-{suffix}"), "hash", false)
@@ -1087,6 +1186,9 @@ async fn exercise(store: &HiqliteAuthStore, ordinal: u64) -> Result<()> {
     outbox.attempts = 1;
     outbox.status = "ok".to_owned();
     store.settle_watched(&outbox).await?;
+    if store.watched_outbox_counts().await? != (0, ordinal as i64, 0) {
+        bail!("replicated watched-outbox status counts drifted");
+    }
 
     let node_id = format!("node-{suffix}");
     let recipe_hash = format!("recipe-{suffix}");
@@ -1127,6 +1229,23 @@ async fn exercise(store: &HiqliteAuthStore, ordinal: u64) -> Result<()> {
     {
         bail!("replicated cache location lost node ownership");
     }
+    let unpinned = format!("unpinned-recipe-{suffix}");
+    if !store
+        .claim_cache_entry(
+            &unpinned,
+            file,
+            1,
+            &node_id,
+            &format!("cache/unpinned-{suffix}"),
+        )
+        .await?
+    {
+        bail!("replicated unpinned cache claim was not accepted");
+    }
+    store.complete_cache_entry(&unpinned, &node_id, 123).await?;
+    if store.cache_bytes(&node_id).await? != 923 + ordinal as i64 {
+        bail!("replicated cache byte accounting omitted completed unpinned rows");
+    }
     let abandoned = format!("abandoned-recipe-{suffix}");
     if !store
         .claim_cache_entry(
@@ -1140,7 +1259,25 @@ async fn exercise(store: &HiqliteAuthStore, ordinal: u64) -> Result<()> {
     {
         bail!("replicated abandoned cache claim was not accepted");
     }
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    let stale_cutoff = unix_now()?;
+    if !store
+        .stale_cache_claims(&node_id, stale_cutoff)
+        .await?
+        .iter()
+        .any(|row| row.recipe_hash == abandoned)
+    {
+        bail!("replicated cache claim did not become stale before its heartbeat");
+    }
     store.touch_cache_claim(&abandoned, &node_id).await?;
+    if store
+        .stale_cache_claims(&node_id, stale_cutoff)
+        .await?
+        .iter()
+        .any(|row| row.recipe_hash == abandoned)
+    {
+        bail!("replicated cache heartbeat did not refresh the stale cutoff");
+    }
     if !store
         .stale_cache_claims(&node_id, i64::MAX)
         .await?
@@ -1156,6 +1293,9 @@ async fn exercise(store: &HiqliteAuthStore, ordinal: u64) -> Result<()> {
         bail!("replicated cache forget left a serveable row");
     }
 
+    let outsider = store
+        .create_user(&format!("offline-outsider-{suffix}"), "hash", false)
+        .await?;
     let offline = NewOfflinePackage {
         id: format!("offline-{suffix}"),
         request_id: format!("offline-request-{suffix}"),
@@ -1202,6 +1342,18 @@ async fn exercise(store: &HiqliteAuthStore, ordinal: u64) -> Result<()> {
     {
         bail!("replicated offline request conflict was not detected");
     }
+    if store
+        .offline_package_for_user(&offline.id, user.id)
+        .await?
+        .is_none_or(|package| {
+            package.target_height != offline.target_height
+                || package.estimated_bytes != offline.estimated_bytes
+                || package.reserved_bytes != offline.reserved_bytes
+                || package.expires_at != offline.expires_at
+        })
+    {
+        bail!("replicated request conflict mutated the accepted package");
+    }
     let mut rejected = offline.clone();
     rejected.id = format!("offline-rejected-{suffix}");
     rejected.request_id = format!("offline-rejected-request-{suffix}");
@@ -1224,6 +1376,51 @@ async fn exercise(store: &HiqliteAuthStore, ordinal: u64) -> Result<()> {
         bail!("replicated offline quota refusal contract failed");
     }
     if store
+        .offline_package_for_user(&rejected.id, user.id)
+        .await?
+        .is_some()
+    {
+        bail!("replicated quota refusal left a package row behind");
+    }
+    let wrong_node = format!("wrong-node-{suffix}");
+    let wrong_stats = store.offline_package_stats(&wrong_node, 1).await?;
+    if store
+        .claim_next_offline_package(&wrong_node)
+        .await?
+        .is_some()
+        || store
+            .reset_interrupted_offline_packages(&wrong_node)
+            .await?
+            != 0
+        || !store
+            .offline_activity_packages(&wrong_node, 1, 0, 100)
+            .await?
+            .is_empty()
+        || wrong_stats.queued != 0
+        || wrong_stats.preparing != 0
+        || wrong_stats.ready != 0
+        || wrong_stats.failed != 0
+        || store.cache_bytes(&wrong_node).await? != 0
+        || !store.cache_by_age(&wrong_node, 100).await?.is_empty()
+        || !store.all_cache_rows(&wrong_node).await?.is_empty()
+    {
+        bail!("replicated node ownership predicates accepted another node's state");
+    }
+    if store
+        .offline_package_for_user(&offline.id, outsider.id)
+        .await?
+        .is_some()
+        || store
+            .renew_offline_package_for_user(&offline.id, outsider.id, 4_000_000_003)
+            .await?
+            .is_some()
+        || store
+            .delete_offline_package(&offline.id, outsider.id)
+            .await?
+    {
+        bail!("replicated offline owner predicates exposed another user's package");
+    }
+    if store
         .claim_next_offline_package(&node_id)
         .await?
         .is_none_or(|package| package.id != offline.id)
@@ -1239,6 +1436,34 @@ async fn exercise(store: &HiqliteAuthStore, ordinal: u64) -> Result<()> {
     {
         bail!("replicated offline preparation state machine failed");
     }
+    if store
+        .mark_offline_package_ready(&offline.id, &recipe_hash, 801, 120_001)
+        .await?
+        || store.requeue_offline_package(&offline.id).await?
+        || store
+            .set_offline_package_recipe(&offline.id, "wrong-recipe")
+            .await?
+        || store
+            .update_offline_progress(&offline.id, "wrong-state", 999)
+            .await?
+        || store
+            .fail_offline_package(&offline.id, "wrong-state", "wrong", "wrong")
+            .await?
+    {
+        bail!("replicated offline terminal-state guards accepted a late mutation");
+    }
+    if store
+        .offline_package_for_user(&offline.id, user.id)
+        .await?
+        .is_none_or(|package| {
+            package.state != "ready"
+                || package.recipe_hash.as_deref() != Some(recipe_hash.as_str())
+                || package.actual_bytes != Some(800)
+                || package.duration_ms != Some(120_000)
+        })
+    {
+        bail!("replicated rejected state transitions mutated the ready package");
+    }
     if !matches!(
         store
             .put_offline_lease(
@@ -1250,9 +1475,21 @@ async fn exercise(store: &HiqliteAuthStore, ordinal: u64) -> Result<()> {
             .await?,
         OfflineLeaseOutcome::Created(_)
     ) || store.offline_package_stats(&node_id, 1).await?.ready != 1
-        || store.cache_bytes(&node_id).await? != 0
+        || store.cache_bytes(&node_id).await? != 123
     {
         bail!("replicated offline lease/pinned-cache accounting failed");
+    }
+    let wrong_lease = format!("offline-wrong-user-token-{suffix}");
+    if store
+        .put_offline_lease(&offline.id, outsider.id, &wrong_lease, 4_000_000_005)
+        .await?
+        != OfflineLeaseOutcome::PackageNotReady
+        || store
+            .offline_package_for_lease(&wrong_lease, 1, 4_000_000_005)
+            .await?
+            .is_some()
+    {
+        bail!("replicated lease ownership predicates accepted another user");
     }
     if !matches!(
         store
@@ -1324,6 +1561,9 @@ async fn exercise(store: &HiqliteAuthStore, ordinal: u64) -> Result<()> {
     if store.expire_offline_packages(2).await? == 0 {
         bail!("replicated offline expiry did not remove an expired package");
     }
+    if !store.delete_user(outsider.id).await? {
+        bail!("replicated offline outsider fixture cleanup failed");
+    }
     Ok(())
 }
 
@@ -1390,11 +1630,16 @@ async fn verify_proof(store: &HiqliteAuthStore) -> Result<()> {
         {
             bail!("lost acknowledged media/watch state from node {ordinal}");
         }
-        if store.get_trakt_auth(user.id).await?.is_none()
-            || store
-                .offline_package_for_user(&format!("offline-{suffix}"), user.id)
-                .await?
-                .is_none_or(|package| package.state != "ready")
+        if store.get_trakt_auth(user.id).await?.is_none_or(|auth| {
+            auth.access_token != format!("trakt-access-new-{suffix}")
+                || auth.refresh_token != format!("trakt-refresh-new-{suffix}")
+                || auth.expires_at != 4_000_000_001
+                || auth.last_sync_at != 1_700_000_100 + ordinal as i64
+                || auth.last_activities.as_deref() != Some("{}")
+        }) || store
+            .offline_package_for_user(&format!("offline-{suffix}"), user.id)
+            .await?
+            .is_none_or(|package| package.state != "ready")
             || store
                 .offline_package_for_lease(&format!("offline-token-{suffix}"), 1, 4_000_000_000)
                 .await?
@@ -1403,13 +1648,21 @@ async fn verify_proof(store: &HiqliteAuthStore) -> Result<()> {
                 .cache_hit(&format!("recipe-{suffix}"), &format!("node-{suffix}"))
                 .await?
                 .is_none()
+            || store
+                .cache_hit(
+                    &format!("unpinned-recipe-{suffix}"),
+                    &format!("node-{suffix}"),
+                )
+                .await?
+                .is_none()
+            || store.cache_bytes(&format!("node-{suffix}")).await? != 123
         {
             bail!("lost acknowledged Trakt/cache/offline state from node {ordinal}");
         }
     }
-    let (_, ok, _) = store.watched_outbox_counts().await?;
-    if ok != 3 {
-        bail!("lost acknowledged watched-outbox rows after voter loss: ok={ok}");
+    let counts = store.watched_outbox_counts().await?;
+    if counts != (0, 3, 0) {
+        bail!("lost acknowledged watched-outbox rows after voter loss: {counts:?}");
     }
     if catalog_view(store).await?.search.len() != 3 {
         bail!("lost local FTS search rows after voter loss");
@@ -1520,6 +1773,12 @@ fn allocate_nodes(count: u64) -> Result<Vec<NodeSpec>> {
 
 fn free_port() -> Result<u16> {
     Ok(TcpListener::bind("127.0.0.1:0")?.local_addr()?.port())
+}
+
+fn unix_now() -> Result<i64> {
+    Ok(i64::try_from(
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+    )?)
 }
 
 fn install_crypto_provider() {

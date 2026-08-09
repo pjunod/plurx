@@ -360,6 +360,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
     // anything a viewer is waiting on.
     tokio::spawn(std::sync::Arc::clone(&state.watched).run());
 
+    let progress = Arc::clone(&state.progress);
     let app = http::router(state);
     let listener = tokio::net::TcpListener::bind(config.server.bind)
         .await
@@ -455,6 +456,24 @@ async fn run(config: Config) -> anyhow::Result<()> {
             );
         }
     }
+    match tokio::time::timeout(PROGRESS_DRAIN_TIMEOUT, progress.drain()).await {
+        Ok(Ok(flushed)) if flushed > 0 => {
+            tracing::info!(
+                flushed,
+                "flushed coalesced playback progress during shutdown"
+            );
+        }
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "could not flush coalesced playback progress during shutdown");
+        }
+        Err(_) => {
+            tracing::warn!(
+                after = ?PROGRESS_DRAIN_TIMEOUT,
+                "timed out flushing coalesced playback progress during shutdown"
+            );
+        }
+    }
     if let Some(mdns) = mdns {
         if let Err(error) = mdns.shutdown() {
             tracing::warn!(%error, "Bonjour discovery shutdown failed");
@@ -467,6 +486,8 @@ async fn run(config: Config) -> anyhow::Result<()> {
 /// Comfortably inside Docker's default ten-second stop grace period, so the
 /// process gets to choose its own exit rather than being killed mid-drain.
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Leaves headroom inside Docker's ten-second stop window after HTTP drain.
+const PROGRESS_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Native plurx discovery contract. The Apple clients declare this exact type
 /// in `NSBonjourServices`, so changing it is a protocol change, not a rename.
