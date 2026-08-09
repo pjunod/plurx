@@ -87,8 +87,9 @@ Paul approved all five recommendations on 2026-08-09.
   focus mode or exact emulator dimensions and are not recorded as Fold app
   regressions.
 - **Pass — iPhone source/device suite.** An iPhone 17 Pro Max on iOS 26.6 ran
-  the complete 128-test Apple suite with zero failures. The tests themselves
-  completed in 3.215 seconds after the unlocked phone accepted the run.
+  the current Apple build-46 suite: 132 tests with zero failures. The tests
+  themselves completed in 3.225 seconds after the unlocked phone accepted the
+  run. This supersedes the earlier 128-test build-45 pass.
 
 ### Offline device acceptance
 
