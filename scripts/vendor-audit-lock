@@ -9,6 +9,12 @@ from pathlib import Path
 
 
 VENDORED = (("s3-simple", "0.8.0"), ("rust_decimal", "1.42.1"))
+RUSTSEC_PROBE = """
+[[package]]
+name = "smallvec"
+version = "0.6.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+"""
 
 
 def package_block(text: str, name: str, version: str) -> str:
@@ -61,7 +67,7 @@ def main() -> None:
     output = synthesize(
         args.root.read_text(encoding="utf-8"),
         args.registry_evidence.read_text(encoding="utf-8"),
-    )
+    ) + RUSTSEC_PROBE
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(output, encoding="utf-8")
 
