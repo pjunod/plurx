@@ -133,11 +133,12 @@ import tv.plurx.app.ui.theme.Muted
 import tv.plurx.app.ui.theme.Surface
 
 private data class Plan(
-    val title: String,
+    override val title: String,
     val subtitle: String?,
     val releaseDate: String?,
     val overview: String?,
     override val durationMs: Long,
+    override val videoCodec: String?,
     override val fileId: Long,
     override val playUrl: String,
     override val mode: String,
@@ -171,6 +172,7 @@ private suspend fun loadPlan(vm: AppViewModel, itemId: Long, fileId: Long): Plan
         releaseDate = playerDateLabel(detail.item.air_date, detail.item.year),
         overview = detail.item.overview,
         durationMs = file?.duration_ms ?: detail.item.runtime_ms ?: 0L,
+        videoCodec = decision.source?.video_codec ?: file?.video_codec,
         fileId = fileId,
         playUrl = Session.url(decision.delivery?.url ?: decision.play_url),
         mode = mode,

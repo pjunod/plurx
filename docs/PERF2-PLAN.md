@@ -215,9 +215,10 @@ Numbered because milestones cite them.
 ## 3. N0 — Telemetry becomes data
 
 **Implementation status (2026-08-09):** server storage, ingest, lifecycle
-events, metrics, readers, census fields, and the web parity slice are landed in
-source. Apple/Android parity and the named-machine acceptance runs remain and
-must not be inferred from this server milestone.
+events, metrics, readers, census fields, the web parity slice, and Android
+native telemetry parity are landed in source on their milestone branches.
+Apple parity and the named-machine acceptance runs remain and must not be
+inferred from these source milestones.
 
 **Objective:** the beacons plurx already emits become queryable rows that
 survive restart, get their server-side context attached at ingest, and

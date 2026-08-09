@@ -52,6 +52,9 @@ import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
 import androidx.media3.session.MediaSession
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import tv.plurx.app.data.CreateSessionReq
 import tv.plurx.app.data.AudioTrack
@@ -247,6 +250,10 @@ class Controller(
     /** The HLS session this player owns, if the plan opened one. */
     private var sessionId: String? = null
 
+    private val ttffTracker = PlaybackTTFFTracker()
+    private val stallTracker = BufferingStallTracker()
+    private val stallWatchdogJob: Job
+
     /** Stable for this player instance — the server's supersession key. */
     private val playbackId = UUID.randomUUID().toString()
 
@@ -286,15 +293,35 @@ class Controller(
 
     private val listener = object : Player.Listener {
         override fun onPlayerError(error: PlaybackException) {
+            val mediaCompatibilityFailure = isCompatibilityPlaybackError(error.errorCode)
             val action = playbackErrorAction(
                 deliveryMode = deliveryMode,
                 preservesDolbyVision = plan.preserveDolbyVision,
                 remuxRescueAlreadyUsed = compatibilityRemuxUsed,
                 transcodeRescueAlreadyUsed = compatibilityTranscodeUsed,
-                mediaCompatibilityFailure = isCompatibilityPlaybackError(error.errorCode),
+                mediaCompatibilityFailure = mediaCompatibilityFailure,
                 deliveredRange = deliveredRange,
                 establishedPlayback = establishedPlayback,
                 sameHdrRetryAlreadyUsed = sameHdrRetryUsed,
+            )
+            reportPlaybackEvent(
+                event = "playback_error",
+                level = "error",
+                message = error.errorCodeName,
+                code = error.errorCode,
+                detail = buildString {
+                    append("action=").append(action)
+                    append(" media_compatibility=").append(mediaCompatibilityFailure)
+                    append(" preserves_dv=").append(plan.preserveDolbyVision)
+                    append(" established=").append(establishedPlayback)
+                    if (caps.isNotEmpty()) {
+                        append(" caps=")
+                        append(
+                            caps.entries.sortedBy { it.key }
+                                .joinToString(",") { "${it.key}=${it.value}" },
+                        )
+                    }
+                },
             )
             Log.w(
                 "plurx-playback",
@@ -308,7 +335,7 @@ class Controller(
                 PlaybackErrorAction.RetrySameHDRDelivery -> {
                     val position = realPosition()
                     sameHdrRetryUsed = true
-                    restartAt(position)
+                    restartAt(position, "fallback")
                 }
                 PlaybackErrorAction.RetryAsDolbyVisionRemux -> {
                     val position = realPosition()
@@ -316,7 +343,7 @@ class Controller(
                     forceCompatibilityRemux = true
                     subtitleDelivery =
                         subtitleRoute(trackFor(selectedSubtitle), planMode, subtitleDelivery).delivery
-                    restartAt(position)
+                    restartAt(position, "fallback")
                 }
                 PlaybackErrorAction.RetryAsCompatibilityTranscode -> {
                     // Read the position before the mode moves: which timeline
@@ -329,7 +356,7 @@ class Controller(
                     // directly-played file has to become a rendition.
                     subtitleDelivery =
                         subtitleRoute(trackFor(selectedSubtitle), planMode, subtitleDelivery).delivery
-                    restartAt(position)
+                    restartAt(position, "fallback")
                 }
                 PlaybackErrorAction.Fail -> onError(
                     error.errorCodeName.let { "Playback stopped ($it)." },
@@ -339,6 +366,15 @@ class Controller(
 
         override fun onRenderedFirstFrame() {
             establishedPlayback = true
+            ttffTracker.firstFrame(monotonicNowMs())?.let { measurement ->
+                reportPlaybackEvent(
+                    event = "ttff",
+                    level = "info",
+                    message = "first frame after ${measurement.elapsedMs} ms",
+                    ms = measurement.elapsedMs,
+                    attempt = measurement.attempt,
+                )
+            }
         }
 
         override fun onTracksChanged(tracks: Tracks) = applyTextSelection()
@@ -361,9 +397,30 @@ class Controller(
     init {
         player.addListener(listener)
         pgsOverlay.select(selectedSubtitle.takeIf { subtitleDelivery == SubtitleDelivery.BitmapOverlay })
+        stallWatchdogJob = scope.launch {
+            while (isActive) {
+                stallTracker.sample(
+                    buffering = player.playbackState == Player.STATE_BUFFERING,
+                    positionMs = realPosition(),
+                    observedAtMs = monotonicNowMs(),
+                )?.let { measurement ->
+                    reportPlaybackEvent(
+                        event = "stall",
+                        level = "warn",
+                        message = "buffering playhead stagnant for ${measurement.durationMs} ms",
+                        ms = measurement.durationMs,
+                        detail = "state=buffering position_ms=${measurement.positionMs}",
+                    )
+                }
+                delay(1_000)
+            }
+        }
     }
 
-    fun startAt(ms: Long) = restartAt(ms.coerceAtLeast(0))
+    fun startAt(ms: Long) {
+        val position = ms.coerceAtLeast(0)
+        restartAt(position, if (position > 0) "resume" else "cold-start")
+    }
 
     fun realPosition(): Long {
         return realMediaPositionMs(
@@ -376,24 +433,70 @@ class Controller(
         )
     }
 
+    private fun beginPlaybackAttempt(reason: String): PlaybackAttempt {
+        stallTracker.reset()
+        return ttffTracker.begin(reason, monotonicNowMs())
+    }
+
+    private fun reportPlaybackEvent(
+        event: String,
+        level: String,
+        message: String,
+        code: Int? = null,
+        detail: String? = null,
+        ms: Long? = null,
+        attempt: PlaybackAttempt? = ttffTracker.currentAttempt(),
+    ) {
+        val currentPosition = player.currentPosition
+        val bufferedPosition = player.bufferedPosition
+        val runway = if (currentPosition >= 0 && bufferedPosition >= currentPosition) {
+            (bufferedPosition - currentPosition) / 1_000.0
+        } else {
+            null
+        }
+        postPlaybackClientLog(
+            scope,
+            PlaybackClientLog(
+                level = level,
+                event = event,
+                message = message,
+                method = if (deliveryMode == "direct") "direct_play" else deliveryMode,
+                code = code,
+                title = plan.title,
+                fileId = plan.fileId,
+                vcodec = plan.videoCodec,
+                detail = detail,
+                attempt = attempt?.id,
+                reason = attempt?.reason,
+                runway = runway,
+                ms = ms,
+                height = player.videoSize.height.takeIf { it > 0 } ?: plan.sourceHeight,
+                encoder = encoder,
+                sessionId = sessionId,
+            ),
+        )
+    }
+
     fun seekTo(targetMs: Long) {
         val t = targetMs.coerceIn(0, if (plan.durationMs > 0) plan.durationMs else Long.MAX_VALUE)
         when {
             directTransport -> player.seekTo(t)
             subtitleDelivery.usesPlanTransport && planMode == "remux" -> {
+                val attempt = beginPlaybackAttempt("seek")
                 leaveSessionPlayback()
                 baseMs = t
                 val uri = remuxUri(t)
                 progressiveMediaOrigin.begin(uri, t)
                 player.setMediaItem(MediaItem.fromUri(uri))
                 player.prepare()
+                ttffTracker.prepared(attempt)
                 player.playWhenReady = true
                 armTextSelection()
             }
             // A cached session holds the whole stream: native seeking, no
             // session churn. A live one can't be range-sought, so it reopens.
             sessionIsVod -> player.seekTo(t)
-            else -> openSession(t)
+            else -> openSession(t, beginPlaybackAttempt("seek"))
         }
     }
 
@@ -402,6 +505,7 @@ class Controller(
     }
 
     fun release() {
+        stallWatchdogJob.cancel()
         pgsOverlay.release()
         sessionRequestVersion++
         sessionId?.let { vm.endHlsSession(it) }
@@ -414,7 +518,7 @@ class Controller(
     fun switchAudio(index: Long) {
         val position = realPosition()
         selectedAudio = index
-        restartAt(position)
+        restartAt(position, "audio")
     }
 
     /**
@@ -443,7 +547,7 @@ class Controller(
         subtitleDelivery = route.delivery
         pgsOverlay.select(index.takeIf { route.delivery == SubtitleDelivery.BitmapOverlay })
         if (route.reopen) {
-            restartAt(position)
+            restartAt(position, "subtitle")
         } else {
             // No reopen means the same media item, so its tracks are already
             // published and this lands now — which is what makes switching
@@ -473,16 +577,18 @@ class Controller(
         // current selection has to be re-routed, not just replayed.
         subtitleDelivery =
             subtitleRoute(trackFor(selectedSubtitle), planMode, subtitleDelivery).delivery
-        restartAt(position)
+        restartAt(position, "audio")
     }
 
-    private fun restartAt(positionMs: Long) {
+    private fun restartAt(positionMs: Long, reason: String) {
+        val attempt = beginPlaybackAttempt(reason)
         when {
-            !subtitleDelivery.usesPlanTransport -> openSession(positionMs)
+            !subtitleDelivery.usesPlanTransport -> openSession(positionMs, attempt)
             planMode == "direct" -> {
                 leaveSessionPlayback()
                 player.setMediaItem(MediaItem.fromUri(plan.playUrl), positionMs)
                 player.prepare()
+                ttffTracker.prepared(attempt)
                 player.playWhenReady = true
                 armTextSelection()
             }
@@ -493,10 +599,11 @@ class Controller(
                 progressiveMediaOrigin.begin(uri, positionMs)
                 player.setMediaItem(MediaItem.fromUri(uri))
                 player.prepare()
+                ttffTracker.prepared(attempt)
                 player.playWhenReady = true
                 armTextSelection()
             }
-            else -> openSession(positionMs)
+            else -> openSession(positionMs, attempt)
         }
     }
 
@@ -508,7 +615,7 @@ class Controller(
      * is [subtitleSessionBody]'s answer, so the shape of every request this
      * client sends is unit-tested rather than assembled inline.
      */
-    private fun openSession(ms: Long) {
+    private fun openSession(ms: Long, attempt: PlaybackAttempt) {
         val requestVersion = ++sessionRequestVersion
         sessionId?.let { vm.endHlsSession(it) }
         sessionId = null
@@ -525,6 +632,7 @@ class Controller(
                 throw cancelled
             } catch (_: Exception) {
                 if (requestVersion == sessionRequestVersion) {
+                    ttffTracker.cancel(attempt)
                     onError("The server couldn't start this stream.")
                 }
                 return@launch
@@ -549,6 +657,7 @@ class Controller(
                 timeline.attachPositionMs,
             )
             player.prepare()
+            ttffTracker.prepared(attempt)
             player.playWhenReady = true
             armTextSelection()
         }
@@ -680,10 +789,12 @@ private fun isTelevision(context: Context): Boolean =
 
 /** Minimal view of [Plan] so the controller doesn't depend on the screen file. */
 interface PlanLike {
+    val title: String
     val fileId: Long
     val playUrl: String
     val mode: String // "direct" | "remux" | "transcode"
     val durationMs: Long
+    val videoCodec: String?
     val audio: List<AudioTrack>
     val subtitles: List<SubTrack>
 
