@@ -1857,6 +1857,62 @@ impl WatchStore for HiqliteAuthStore {
         })
     }
 
+    async fn put_progress_if_current(
+        &self,
+        user_id: i64,
+        item_id: i64,
+        expected: &WatchState,
+        position_ms: i64,
+        duration_ms: Option<i64>,
+    ) -> Result<Option<WatchState>, StoreError> {
+        let sql = "WITH input(duration_ms) AS ( \
+                       SELECT COALESCE( \
+                           (SELECT MAX(duration_ms) FROM files \
+                            WHERE item_id = $1 AND duration_ms > 0), \
+                           CASE WHEN $2 > 0 THEN $2 END) \
+                   ), normalized(position_ms, duration_ms) AS ( \
+                       SELECT CASE WHEN duration_ms IS NULL THEN MAX($3, 0) \
+                                   ELSE MIN(MAX($3, 0), duration_ms) END, duration_ms \
+                       FROM input \
+                   ) \
+                   UPDATE watch_state SET \
+                       position_ms = (SELECT position_ms FROM normalized), \
+                       duration_ms = COALESCE((SELECT duration_ms FROM normalized), duration_ms), \
+                       watched = watched OR CASE \
+                           WHEN (SELECT duration_ms FROM normalized) IS NOT NULL \
+                            AND ((SELECT position_ms FROM normalized) * 1.0 / \
+                                 (SELECT duration_ms FROM normalized)) >= 0.95 \
+                           THEN 1 ELSE 0 END, \
+                       updated_at = $4 \
+                   WHERE user_id = $5 AND item_id = $1 \
+                     AND position_ms = $6 AND duration_ms IS $7 \
+                     AND watched = $8 AND updated_at = $9 \
+                   RETURNING position_ms, duration_ms, watched, updated_at";
+        validate_sql(sql)?;
+        let rows = self
+            .client
+            .execute_returning_map::<_, WatchRow>(
+                sql,
+                params!(
+                    item_id,
+                    duration_ms,
+                    position_ms,
+                    self.now()?,
+                    user_id,
+                    expected.position_ms,
+                    expected.duration_ms,
+                    expected.watched,
+                    expected.updated_at
+                ),
+            )
+            .await
+            .map_err(database_error)?
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(database_error)?;
+        Ok(rows.into_iter().next().map(Into::into))
+    }
+
     async fn set_watched(
         &self,
         user_id: i64,

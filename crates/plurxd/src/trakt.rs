@@ -113,22 +113,55 @@ impl TraktManager {
         }
         match client.refresh(&auth.refresh_token).await {
             Ok(tok) => {
-                let _ = self
+                let updated = self
                     .store
                     .update_trakt_tokens(
                         user_id,
+                        &auth.refresh_token,
                         &tok.access_token,
                         &tok.refresh_token,
                         tok.expires_at(),
                     )
-                    .await;
-                Some(tok.access_token)
+                    .await
+                    .unwrap_or(false);
+                if updated {
+                    Some(tok.access_token)
+                } else {
+                    // Another refresh using the same rotating token won the
+                    // compare-and-set. Use the winner's credential instead of
+                    // returning a token that was deliberately not persisted.
+                    self.store
+                        .get_trakt_auth(user_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|current| current.access_token)
+                }
             }
             Err(TraktError::AuthExpired) => {
-                tracing::warn!("trakt: refresh token rejected — unlinking user {user_id}");
-                let _ = self.store.delete_trakt_auth(user_id).await;
-                *self.note.lock().await = Some("Trakt link expired — connect again".to_owned());
-                None
+                match self
+                    .store
+                    .delete_trakt_auth_if_current(user_id, &auth.refresh_token)
+                    .await
+                {
+                    Ok(true) => {
+                        tracing::warn!("trakt: refresh token rejected — unlinking user {user_id}");
+                        *self.note.lock().await =
+                            Some("Trakt link expired — connect again".to_owned());
+                        None
+                    }
+                    Ok(false) => self
+                        .store
+                        .get_trakt_auth(user_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|current| current.access_token),
+                    Err(error) => {
+                        tracing::warn!(%error, "trakt: could not classify rejected refresh token");
+                        Some(auth.access_token)
+                    }
+                }
             }
             Err(e) => {
                 // Transient (network, 5xx): keep the stale token; a request

@@ -1,9 +1,9 @@
-//! The first replicated store slice: settings and authentication state.
+//! The complete replicated durable-store backend.
 //!
-//! This module intentionally implements only [`SettingsStore`], [`UserStore`],
-//! and [`ApiKeyStore`]. SQLite remains the daemon's complete [`Store`](super::Store)
-//! until the later M1 slices port every remaining trait. The narrow type keeps
-//! that boundary honest: it cannot be placed behind `Arc<dyn Store>` yet.
+//! The trait implementations are split across this module and the sibling
+//! catalogue, media, and durable modules. SQLite remains the daemon's selected
+//! [`Store`](super::Store) until M2 imports existing state and activates this
+//! backend; backend completeness alone is not permission to skip that gate.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -19,8 +19,8 @@ use super::{keys, ApiKeyStore, SettingsStore, UserStore};
 use crate::domain::{ApiKey, User};
 use crate::error::StoreError;
 
-pub const AUTH_SCHEMA_VERSION: i64 = 2;
-pub const AUTH_PROTOCOL_VERSION: i64 = 2;
+pub const AUTH_SCHEMA_VERSION: i64 = 4;
+pub const AUTH_PROTOCOL_VERSION: i64 = 4;
 
 const STORE_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -79,7 +79,7 @@ impl ClusterCompatibility {
     };
 }
 
-/// A hiqlite client restricted to the first replicated Store slice.
+/// A hiqlite client implementing the complete replicated [`Store`](super::Store).
 #[derive(Clone)]
 pub struct HiqliteAuthStore {
     pub(super) client: Client,
@@ -87,7 +87,8 @@ pub struct HiqliteAuthStore {
 }
 
 impl HiqliteAuthStore {
-    /// Create the M1b schema on a fresh cluster and seed its logical identity.
+    /// Create the complete durable schema on a fresh cluster and seed its
+    /// logical identity.
     ///
     /// Only the bootstrap coordinator calls this. Other voters call [`open`]
     /// after the acknowledged schema write has replicated.
@@ -98,6 +99,7 @@ impl HiqliteAuthStore {
             result.map_err(database_error)?;
         }
         super::hiqlite_catalog::install_schema(&client).await?;
+        super::hiqlite_durable::install_schema(&client).await?;
 
         let store = Self::with_clock(client, Arc::new(SystemClock));
         let now = store.now()?;
@@ -179,6 +181,64 @@ impl HiqliteAuthStore {
         serde_json::to_string(&self.local_auth_dump().await?).map_err(database_error)
     }
 
+    /// Clear mutable application rows between backend-neutral contract cases.
+    ///
+    /// This is deliberately outside [`Store`](super::Store): production code
+    /// must never gain a generic "erase the cluster" operation. The contract
+    /// harness keeps the three voter processes alive and serializes calls to
+    /// this validation-only helper so every scenario still starts empty.
+    #[doc(hidden)]
+    pub async fn validation_reset_contract_state(&self) -> Result<(), StoreError> {
+        let statements = [
+            "DELETE FROM offline_lease_guards",
+            "DELETE FROM offline_package_leases",
+            "DELETE FROM offline_packages",
+            "DELETE FROM transcode_cache_locations",
+            "DELETE FROM transcode_cache_recipes",
+            "DELETE FROM watched_outbox",
+            "DELETE FROM trakt_auth",
+            "DELETE FROM watch_state",
+            "DELETE FROM scan_reconcile_items",
+            "DELETE FROM scan_reconcile_guards",
+            "DELETE FROM library_roots",
+            "DELETE FROM files",
+            "DELETE FROM items",
+            "DELETE FROM libraries",
+            "DELETE FROM tokens",
+            "DELETE FROM api_keys",
+            "DELETE FROM users",
+            "DELETE FROM settings WHERE key <> $1",
+        ];
+        for sql in statements {
+            validate_sql(sql)?;
+        }
+        timeout_store(self.client.txn(vec![
+            (statements[0].to_owned(), params!()),
+            (statements[1].to_owned(), params!()),
+            (statements[2].to_owned(), params!()),
+            (statements[3].to_owned(), params!()),
+            (statements[4].to_owned(), params!()),
+            (statements[5].to_owned(), params!()),
+            (statements[6].to_owned(), params!()),
+            (statements[7].to_owned(), params!()),
+            (statements[8].to_owned(), params!()),
+            (statements[9].to_owned(), params!()),
+            (statements[10].to_owned(), params!()),
+            (statements[11].to_owned(), params!()),
+            (statements[12].to_owned(), params!()),
+            (statements[13].to_owned(), params!()),
+            (statements[14].to_owned(), params!()),
+            (statements[15].to_owned(), params!()),
+            (statements[16].to_owned(), params!()),
+            (statements[17].to_owned(), params!(keys::INSTANCE_ID)),
+        ]))
+        .await?
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(database_error)?;
+        Ok(())
+    }
+
     /// Hash only authoritative catalogue tables from this voter. The cluster
     /// gate uses this to prove a damaged derived FTS index cannot change truth.
     pub async fn validation_local_catalog_truth_digest(&self) -> Result<String, StoreError> {
@@ -204,6 +264,14 @@ impl HiqliteAuthStore {
             catalog_digest: tokio::time::timeout(
                 STORE_TIMEOUT,
                 super::hiqlite_catalog::local_catalog_digest(&self.client),
+            )
+            .await
+            .map_err(|_| {
+                StoreError::Database("replicated store operation timed out".to_owned())
+            })??,
+            durable_digest: tokio::time::timeout(
+                STORE_TIMEOUT,
+                super::hiqlite_durable::local_durable_digest(&self.client),
             )
             .await
             .map_err(|_| {
@@ -737,6 +805,7 @@ fn verify_compatibility_rows(
 #[derive(Serialize)]
 struct AuthStoreDump {
     catalog_digest: String,
+    durable_digest: String,
     cluster_meta: Vec<ClusterMetaDumpRow>,
     settings: Vec<SettingDumpRow>,
     users: Vec<UserDumpRow>,
