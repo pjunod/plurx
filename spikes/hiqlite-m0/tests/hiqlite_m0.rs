@@ -317,6 +317,7 @@ async fn three_voters_prove_the_sql_and_transport_contracts() {
                 )
                 .await
                 .ok()
+                .filter(|rows| *rows == 1)
         })
         .await
         .expect("CURRENT_TIMESTAMP row on every voter");
