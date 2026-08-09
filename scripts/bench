@@ -11,27 +11,40 @@ and a mean hides exactly the starts people remember.
     scripts/bench fixtures                 # build the corpus (once, ~2 min)
     scripts/bench run --token TOKEN        # play everything, print the table
     scripts/bench run --only 4k-hdr10      # one fixture, while iterating
+    scripts/bench rate-control --base http://nynuc:32400 --token TOKEN \
+      --corpus scripts/perf2-rate-control-smoke-corpus.json --modes vbr \
+      --vmaf-ffmpeg ffmpeg --vmaf-model vmaf_v0.6.1 \
+      --json out/rate-control.json
 
-Needs: python3 (stdlib only), ffmpeg + ffprobe on PATH, a running plurxd with a
-library pointed at the fixture directory.
+Needs: python3 (stdlib only), ffmpeg for fixture generation, an explicit
+libvmaf-capable scoring FFmpeg for `rate-control`, and a running plurxd with a
+library pointed at the fixture directory. `rate-control` never consults the
+server's `PLURX_FFMPEG` environment setting.
 
-What it does NOT do: decode pixels. It measures what the server does — time to
-first playable segment, encode speed over the session, published-vs-fetched
-reserve, real segment bitrates — because that is where every symptom in the
-plan lives, and because a headless browser on a build server cannot decode
-H.264 anyway. Client-side runway comes from the player's own beacons; read
-those in Settings -> Logs alongside this.
+`rate-control` captures bytes from real plurxd HLS sessions, so production
+encoding always uses the server's own configured Jellyfin FFmpeg and hardware.
+A separate `--vmaf-ffmpeg` process is behavior-probed and used for scoring only:
+it decodes the captured bytes and the reference into the `libvmaf` filter, and
+never creates production playback media. No pixel analysis runs on plurx's play
+path. Client-side runway comes from the player's own beacons; read those in
+Settings -> Logs alongside the server-playback report.
 """
 
 import argparse
+import hashlib
 import json
+import math
 import os
+from pathlib import Path
+import re
 import shutil
+import socket
 import statistics
 import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 # --- the corpus -------------------------------------------------------------
@@ -86,9 +99,1146 @@ FIXTURES = {
 # realtime on most machines, and this runs once per machine.
 DURATION = 45
 
+RATE_CONTROL_SCHEMA_VERSION = 1
+RATE_CONTROL_SMOKE_MODES = ("vbr",)
+RATE_CONTROL_FULL_MODES = ("vbr", "qvbr")
+VMAF_SCORE = re.compile(r"VMAF score:\s*([^\s]+)")
+NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+SAFE_SEGMENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+SHA256SUM_LINE = re.compile(r"^([0-9a-f]{64}) [ *](.+)$")
+RATE_MODE_FIELD = "transcode_rate_mode"
+QUALITY_FIELD = "transcode_quality"
+ORIGIN_TOLERANCE_MS = 50
+MIN_CAPTURE_FREE_BYTES = 512 * 1024 * 1024
+
+
+class BenchError(RuntimeError):
+    """A benchmark contract or tool failure that belongs in the JSON result."""
+
 
 def sh(cmd, **kw):
     return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+
+def scoring_executable(requested):
+    """Resolve only the explicitly selected offline scorer.
+
+    In particular, do not inspect PLURX_FFMPEG: that variable belongs to the
+    deployed server and must never redirect this controller-side scorer.
+    """
+    found = shutil.which(requested)
+    if found is None:
+        raise BenchError(f"VMAF scoring executable not found: {requested}")
+    return str(Path(found).resolve())
+
+
+def tool_build(tool):
+    result = sh([tool, "-version"])
+    if result.returncode != 0:
+        raise BenchError(f"{tool} -version failed: {last_error(result)}")
+    return result.stdout.splitlines()[0] if result.stdout.splitlines() else tool
+
+
+def scorer_build_configuration(tool):
+    result = sh([tool, "-buildconf"])
+    if result.returncode != 0:
+        raise BenchError(f"{tool} -buildconf failed: {last_error(result)}")
+    lines = result.stdout.splitlines()
+    for index, line in enumerate(lines):
+        if line.strip().startswith("configuration:"):
+            value = line.strip()
+            if value == "configuration:" and index + 1 < len(lines):
+                value += " " + lines[index + 1].strip()
+            return value
+    return "unreported"
+
+
+def libvmaf_fingerprint(tool, probe_diagnostics):
+    result = sh([tool, "-hide_banner", "-h", "filter=libvmaf"])
+    if result.returncode != 0:
+        raise BenchError(f"cannot fingerprint scorer libvmaf filter: {last_error(result)}")
+    help_text = result.stdout or result.stderr
+    return {
+        "filter_help_sha256": hashlib.sha256(help_text.encode()).hexdigest(),
+        "probe_diagnostics": probe_diagnostics,
+    }
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def last_error(result, lines=12):
+    text = (result.stderr or result.stdout or "no diagnostic output").strip()
+    return "\n".join(text.splitlines()[-lines:])
+
+
+def positive_number(value, field_name):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        raise BenchError(f"{field_name} must be a positive number")
+    return float(value)
+
+
+def load_rate_control_corpus(path):
+    """Load fixture identity and trim only; production owns all encoder args."""
+    corpus_path = Path(path)
+    try:
+        manifest_bytes = corpus_path.read_bytes()
+        document = json.loads(manifest_bytes)
+    except (OSError, json.JSONDecodeError) as error:
+        raise BenchError(f"cannot read corpus {path}: {error}") from error
+    if not isinstance(document, dict) or document.get("version") != RATE_CONTROL_SCHEMA_VERSION:
+        raise BenchError(
+            f"corpus version must be {RATE_CONTROL_SCHEMA_VERSION}"
+        )
+    purpose = document.get("purpose")
+    if purpose not in ("vbr_smoke", "n1_acceptance"):
+        raise BenchError("corpus purpose must be 'vbr_smoke' or 'n1_acceptance'")
+
+    fixtures = document.get("fixtures")
+    if not isinstance(fixtures, list) or not fixtures:
+        raise BenchError("corpus fixtures must be a non-empty array")
+    seen = set()
+    normalized_fixtures = []
+    for index, fixture in enumerate(fixtures):
+        where = f"fixtures[{index}]"
+        if not isinstance(fixture, dict):
+            raise BenchError(f"{where} must be an object")
+        identity = fixture.get("identity")
+        if not isinstance(identity, str) or not NAME.fullmatch(identity):
+            raise BenchError(f"{where}.identity must be filename-safe")
+        if identity in seen:
+            raise BenchError(f"duplicate fixture identity {identity!r}")
+        seen.add(identity)
+        content_class = fixture.get("class")
+        if content_class not in ("easy", "hard"):
+            raise BenchError(f"{where}.class must be 'easy' or 'hard'")
+        if fixture.get("dynamic_range") != "sdr":
+            raise BenchError(f"{where}.dynamic_range must explicitly be 'sdr'")
+        filename = fixture.get("filename")
+        if not isinstance(filename, str) or Path(filename).name != filename:
+            raise BenchError(f"{where}.filename must be one server-visible filename")
+        reference = fixture.get("reference")
+        if not isinstance(reference, str) or not reference:
+            raise BenchError(f"{where}.reference must be a path")
+        resolved = (corpus_path.parent / reference).resolve()
+        if not resolved.is_file():
+            raise BenchError(f"{where}.reference does not exist: {resolved}")
+        trim = fixture.get("trim")
+        if not isinstance(trim, dict):
+            raise BenchError(f"{where}.trim must be an object")
+        start = trim.get("start_seconds")
+        if isinstance(start, bool) or not isinstance(start, (int, float)) or start < 0:
+            raise BenchError(f"{where}.trim.start_seconds must be zero or positive")
+        duration = positive_number(trim.get("duration_seconds"), f"{where}.trim.duration_seconds")
+        rung = fixture.get("rung")
+        if isinstance(rung, bool) or not isinstance(rung, int) or rung <= 0:
+            raise BenchError(f"{where}.rung must be a positive integer height")
+        stat = resolved.stat()
+        expected_sha256 = fixture.get("reference_sha256")
+        if expected_sha256 is not None:
+            if (
+                not isinstance(expected_sha256, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", expected_sha256)
+            ):
+                raise BenchError(f"{where}.reference_sha256 must be lowercase SHA-256 or null")
+        actual_sha256 = sha256_file(resolved)
+        if expected_sha256 is not None and actual_sha256 != expected_sha256:
+            raise BenchError(
+                f"{where}.reference_sha256 mismatch: expected {expected_sha256}, "
+                f"got {actual_sha256}"
+            )
+        normalized_fixtures.append({
+            "identity": identity,
+            "class": content_class,
+            "dynamic_range": "sdr",
+            "filename": filename,
+            "reference": reference,
+            "reference_path": resolved,
+            "reference_size": stat.st_size,
+            "reference_sha256": actual_sha256,
+            "reference_sha256_pinned": expected_sha256 is not None,
+            "start_seconds": float(start),
+            "duration_seconds": duration,
+            "rung": rung,
+        })
+    if purpose == "n1_acceptance":
+        unpinned = [
+            fixture["identity"]
+            for fixture in normalized_fixtures
+            if not fixture["reference_sha256_pinned"]
+        ]
+        if unpinned:
+            raise BenchError(
+                "n1_acceptance requires pinned reference_sha256 for every fixture: "
+                + ", ".join(unpinned)
+            )
+        easy = sum(fixture["class"] == "easy" for fixture in normalized_fixtures)
+        hard = sum(fixture["class"] == "hard" for fixture in normalized_fixtures)
+        if easy < 1 or hard < 1 or easy != hard:
+            raise BenchError(
+                "n1_acceptance requires nonempty, equal easy and hard fixture halves"
+            )
+    return {
+        "purpose": purpose,
+        "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+        "fixtures": normalized_fixtures,
+    }
+
+
+def load_server_sha256_manifest(path):
+    """Parse an operator-captured server sha256sum file without server API changes."""
+    manifest_path = Path(path)
+    try:
+        manifest_bytes = manifest_path.read_bytes()
+        text = manifest_bytes.decode("utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        raise BenchError(f"cannot read server SHA-256 manifest {path}: {error}") from error
+    by_filename = {}
+    for line_number, raw in enumerate(text.splitlines(), 1):
+        if not raw:
+            continue
+        match = SHA256SUM_LINE.fullmatch(raw)
+        if match is None:
+            raise BenchError(f"invalid sha256sum line {line_number} in {path}")
+        digest, server_path = match.groups()
+        filename = Path(server_path).name
+        if not NAME.fullmatch(filename):
+            raise BenchError(f"unsafe server filename on sha256sum line {line_number}")
+        if filename in by_filename:
+            raise BenchError(f"duplicate server SHA-256 entry for {filename}")
+        by_filename[filename] = digest
+    if not by_filename:
+        raise BenchError("server SHA-256 manifest has no entries")
+    return {
+        "manifest": manifest_path.name,
+        "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+        "by_filename": by_filename,
+    }
+
+
+def probe_vmaf_scorer(ffmpeg, model):
+    """Execute the scoring-only filter; filter-list and version checks lie."""
+    graph = f"[0:v][1:v]libvmaf=model=version={model}:n_subsample=1"
+    result = sh([
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "info",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=black:size=640x360:rate=1:duration=1",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=black:size=640x360:rate=1:duration=1",
+        "-lavfi",
+        graph,
+        "-frames:v",
+        "1",
+        "-f",
+        "null",
+        "-",
+    ])
+    if result.returncode != 0:
+        raise BenchError(
+            f"VMAF scorer cannot execute libvmaf model {model!r}: {last_error(result)}"
+        )
+    matches = VMAF_SCORE.findall(result.stderr)
+    if len(matches) != 1:
+        raise BenchError(
+            f"VMAF scorer behavior probe emitted {len(matches)} scores; expected exactly one"
+        )
+    try:
+        score = float(matches[0])
+    except ValueError as error:
+        raise BenchError("VMAF scorer behavior probe emitted a nonnumeric score") from error
+    if not math.isfinite(score):
+        raise BenchError("VMAF scorer behavior probe emitted a non-finite score")
+    fingerprint = []
+    for line in result.stderr.splitlines():
+        if "libvmaf" in line.lower() and "VMAF score:" not in line:
+            normalized = line.strip()
+            if normalized not in fingerprint:
+                fingerprint.append(normalized)
+    return {"score": score, "diagnostics": fingerprint[:8]}
+
+
+def score_vmaf(ffmpeg, distorted, reference, reference_start, duration, model, n_subsample):
+    """Decode captured production bytes and a trimmed reference; encode nothing."""
+    graph = (
+        f"[0:v]trim=duration={duration:.6f},setpts=PTS-STARTPTS,format=yuv420p[dist0];"
+        f"[1:v]trim=start={reference_start:.6f}:duration={duration:.6f},"
+        "setpts=PTS-STARTPTS[ref0];"
+        "[ref0][dist0]scale2ref=flags=bicubic[ref1][dist1];"
+        "[dist1]format=yuv420p[dist];[ref1]format=yuv420p[ref];"
+        f"[dist][ref]libvmaf=model=version={model}:n_subsample={n_subsample}"
+    )
+    result = sh([
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "info",
+        "-i",
+        str(distorted),
+        "-i",
+        str(reference),
+        "-lavfi",
+        graph,
+        "-an",
+        "-f",
+        "null",
+        "-",
+    ])
+    if result.returncode != 0:
+        raise BenchError(f"scoring-only VMAF failed for {distorted}: {last_error(result)}")
+    matches = VMAF_SCORE.findall(result.stderr)
+    if len(matches) != 1:
+        raise BenchError(
+            f"scoring-only libvmaf emitted {len(matches)} scores for {distorted}; "
+            "expected exactly one"
+        )
+    try:
+        score = float(matches[0])
+    except ValueError as error:
+        raise BenchError(
+            f"scoring-only libvmaf emitted a nonnumeric score for {distorted}"
+        ) from error
+    if not math.isfinite(score):
+        raise BenchError(f"scoring-only libvmaf emitted a non-finite score for {distorted}")
+    return score
+
+
+def rolling_segment_peak(segments, window_seconds):
+    """Mirror scripts/perf-report: complete served segments, complete windows."""
+    peak_kbps, peak_at = 0.0, None
+    elapsed = 0.0
+    starts = []
+    for segment in segments:
+        starts.append(elapsed)
+        elapsed += segment["duration_seconds"]
+    for left in range(len(segments)):
+        bits, seconds = 0, 0.0
+        for segment in segments[left:]:
+            bits += segment["bytes"] * 8
+            seconds += segment["duration_seconds"]
+            if seconds >= window_seconds:
+                break
+        if seconds + 1e-6 < window_seconds:
+            break
+        rate = bits / seconds / 1000
+        if rate > peak_kbps:
+            peak_kbps, peak_at = rate, starts[left]
+    if peak_at is None:
+        raise BenchError(
+            f"less than one complete {window_seconds:g}s served-segment window was captured"
+        )
+    return peak_kbps, peak_at
+
+
+def rate_limits(rung, window_seconds):
+    """Expose the binding advertised peak and a nonbinding VBV diagnostic."""
+    advertised_total = positive_number(rung.get("total_kbps"), "ladder.total_kbps")
+    advertised_peak = positive_number(rung.get("peak_kbps"), "ladder.peak_kbps")
+    # Current StartResponse rungs define total=video+audio and
+    # peak=1.5*video+audio. Solving those equations avoids a second ladder
+    # table in the harness. It is interpretation only and never creates flags.
+    nominal = 2 * (advertised_peak - advertised_total)
+    audio = advertised_total - nominal
+    if nominal <= 0 or audio < 0:
+        raise BenchError("server advertised an internally inconsistent ladder rung")
+    video_maxrate = advertised_peak - audio
+    video_bufsize = nominal * 2
+    return {
+        "advertised_total_kbps": advertised_total,
+        "derived_nominal_video_kbps": nominal,
+        "derived_audio_kbps": audio,
+        "video_maxrate_kbps": video_maxrate,
+        "video_bufsize_kbits": video_bufsize,
+        "bufsize_assumption": (
+            "scripts/perf-report diagnostic interpretation: 2x derived nominal video; "
+            "not read from StartResponse and never used to encode"
+        ),
+        "window_seconds": window_seconds,
+        "theoretical_vbv_allowance_kbps": video_maxrate + video_bufsize / window_seconds,
+        "theoretical_vbv_role": "nonbinding_diagnostic_only",
+        "advertised_peak_kbps": advertised_peak,
+        "binding_gate": "advertised_peak_kbps",
+    }
+
+
+def safe_server_url(base):
+    parsed = urllib.parse.urlsplit(base)
+    host = parsed.hostname or "unknown"
+    port = f":{parsed.port}" if parsed.port else ""
+    return f"{parsed.scheme or 'http'}://{host}{port}"
+
+
+def resolve_fixture_file_ids(api, fixtures, library_id, server_hashes=None):
+    if library_id is None:
+        libraries = api.call("/libraries")
+        if len(libraries) != 1:
+            raise BenchError("more than one library — pass --library ID")
+        library_id = libraries[0]["id"]
+    items = api.call(f"/libraries/{library_id}/items")
+    by_filename = {}
+    duplicates = set()
+    for item in items.get("items", []):
+        detail = api.call(f"/items/{item['id']}")
+        for media_file in detail.get("files", []):
+            filename = media_file.get("filename")
+            if filename in by_filename:
+                duplicates.add(filename)
+            else:
+                by_filename[filename] = media_file
+    for fixture in fixtures:
+        filename = fixture["filename"]
+        if filename in duplicates:
+            raise BenchError(f"fixture filename is ambiguous in library {library_id}: {filename}")
+        if filename not in by_filename:
+            raise BenchError(f"fixture is not in library {library_id}: {filename}")
+        server_file = by_filename[filename]
+        if "hdr" not in server_file:
+            raise BenchError(f"server dynamic-range fact is unknown for {filename}")
+        server_hdr = server_file["hdr"]
+        if server_hdr is not None and str(server_hdr).lower() != "sdr":
+            raise BenchError(f"server fixture is not SDR: {filename} hdr={server_hdr!r}")
+        if int(server_file.get("size", -1)) != fixture["reference_size"]:
+            raise BenchError(
+                f"fixture {filename} differs between controller and server: "
+                f"local {fixture['reference_size']} bytes, server {server_file.get('size')} bytes"
+            )
+        server_duration_ms = server_file.get("duration_ms")
+        required_end_ms = round(
+            (fixture["start_seconds"] + fixture["duration_seconds"]) * 1000
+        )
+        if server_duration_ms is not None and int(server_duration_ms) < required_end_ms:
+            raise BenchError(
+                f"fixture trim ends at {required_end_ms}ms but server file {filename} "
+                f"ends at {server_duration_ms}ms"
+            )
+        server_sha256 = None
+        if server_hashes is not None:
+            server_sha256 = server_hashes.get(filename)
+            if server_sha256 is None:
+                raise BenchError(f"server SHA-256 manifest is missing {filename}")
+            if server_sha256 != fixture["reference_sha256"]:
+                raise BenchError(
+                    f"server SHA-256 differs from pinned controller reference for {filename}"
+                )
+        fixture["file_id"] = server_file["id"]
+        # The browse API intentionally has no source digest. Size and media
+        # facts are therefore the strongest cross-machine identity available;
+        # the controller's full SHA-256 remains recorded separately.
+        fixture["server_file_identity"] = {
+            key: server_file.get(key)
+            for key in (
+                "id", "filename", "size", "duration_ms", "container",
+                "video_codec", "width", "height", "bit_depth", "hdr",
+            )
+        }
+        fixture["server_sha256"] = server_sha256
+    return library_id
+
+
+def active_transcodes(api):
+    value = api.call("/system").get("active_transcodes")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise BenchError("server did not report a valid active_transcodes count")
+    return value
+
+
+def require_server_idle(api, action):
+    count = active_transcodes(api)
+    if count != 0:
+        raise BenchError(
+            f"server has {count} active transcode(s) before {action}; "
+            "maintenance-node exclusivity was lost"
+        )
+
+
+def wait_for_server_idle(api, action, poll_seconds, timeout_seconds):
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        count = active_transcodes(api)
+        if count == 0:
+            return
+        if time.monotonic() >= deadline:
+            raise BenchError(
+                f"server still has {count} active transcode(s) after {action}; idle timeout"
+            )
+        time.sleep(poll_seconds)
+
+
+def capture_disk_preflight(path, fixture):
+    """Refuse a capture that could consume the controller's last free space."""
+    free = shutil.disk_usage(path).free
+    # Preflight runs before StartResponse gives us an advertised rung. A
+    # conservative 100 Mb/s estimate is intentionally not an encoder recipe.
+    estimated = math.ceil(100_000_000 / 8 * fixture["duration_seconds"])
+    required = MIN_CAPTURE_FREE_BYTES + estimated
+    if free < required:
+        raise BenchError(
+            f"insufficient controller disk for {fixture['identity']}: "
+            f"{free} bytes free, {required} required"
+        )
+    return {
+        "free_bytes_before": free,
+        "estimated_capture_bytes_with_overshoot": estimated,
+        "reserved_free_bytes": MIN_CAPTURE_FREE_BYTES,
+    }
+
+
+def cleanup_capture(capture):
+    """Remove only the generated files named in one controlled capture."""
+    playlist = capture["playlist_path"]
+    capture_dir = playlist.parent
+    for segment in capture["segments"]:
+        (capture_dir / segment["local_name"]).unlink(missing_ok=True)
+    playlist.unlink(missing_ok=True)
+    capture_dir.rmdir()
+
+
+def local_capture_playlist(path, segments):
+    target = max(1, math.ceil(max(segment["duration_seconds"] for segment in segments)))
+    lines = [
+        "#EXTM3U",
+        "#EXT-X-VERSION:3",
+        f"#EXT-X-TARGETDURATION:{target}",
+        "#EXT-X-MEDIA-SEQUENCE:0",
+        "#EXT-X-PLAYLIST-TYPE:VOD",
+    ]
+    for segment in segments:
+        lines.extend([f"#EXTINF:{segment['duration_seconds']:.6f},", segment["local_name"]])
+    lines.append("#EXT-X-ENDLIST")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def capture_live_session(
+    api,
+    fixture,
+    mode,
+    work_dir,
+    poll_seconds,
+    timeout_seconds,
+    idle_timeout_seconds,
+):
+    """Capture only bytes served by one uncached production HLS session."""
+    require_server_idle(api, f"capturing {fixture['identity']}/{mode}")
+    info = api.call(f"/files/{fixture['file_id']}/hls/sessions", "POST", {
+        "playback_id": f"bench-rate-{os.getpid()}-{mode}-{fixture['identity']}",
+        "request_id": f"bench-rate-{time.time_ns()}",
+        "height": fixture["rung"],
+        "start": fixture["start_seconds"],
+    })
+    session_id = info["session_id"]
+    capture_dir = None
+    capture_dir_created = False
+    ordered = []
+    try:
+        encoder = info.get("encoder") or "unknown"
+        if info.get("vod") or encoder == "cached":
+            raise BenchError(
+                f"{fixture['identity']}/{mode} was served from cached VOD; no production encode ran"
+            )
+        if encoder == "copy":
+            raise BenchError(f"{fixture['identity']}/{mode} copied video instead of transcoding")
+        delivered_dynamic_range = info.get("delivered_dynamic_range")
+        if delivered_dynamic_range != "sdr":
+            raise BenchError(
+                f"{fixture['identity']}/{mode} did not prove SDR delivery: "
+                f"{delivered_dynamic_range!r}"
+            )
+
+        requested_origin_ms = round(fixture["start_seconds"] * 1000)
+        origin_ms = info.get("media_origin_ms")
+        if origin_ms is None:
+            # Safe only because this function explicitly requested a transcode
+            # and rejected both copy and cached sessions above.
+            origin_ms = requested_origin_ms
+            origin_source = "manifest_start_legacy_transcode"
+        else:
+            origin_ms = int(origin_ms)
+            origin_source = "start_response.media_origin_ms"
+        if abs(origin_ms - requested_origin_ms) > ORIGIN_TOLERANCE_MS:
+            raise BenchError(
+                f"{fixture['identity']}/{mode} media_origin_ms {origin_ms} disagrees with "
+                f"manifest start {requested_origin_ms} by more than {ORIGIN_TOLERANCE_MS}ms"
+            )
+
+        rung = next(
+            (candidate for candidate in info.get("ladder", [])
+             if candidate.get("height") == fixture["rung"]),
+            None,
+        )
+        if rung is None:
+            raise BenchError(
+                f"server response did not advertise requested rung {fixture['rung']}"
+            )
+
+        capture_dir = work_dir / f"{fixture['identity']}-{mode}"
+        if capture_dir.exists():
+            raise BenchError(
+                f"capture directory already exists; remove it or choose --work-dir: {capture_dir}"
+            )
+        capture_dir.mkdir(parents=True)
+        capture_dir_created = True
+        captured = {}
+        speed_samples = []
+        status_encoders = set()
+        media_seconds = 0.0
+        started = time.monotonic()
+        deadline = started + timeout_seconds
+        while media_seconds + 1e-6 < fixture["duration_seconds"]:
+            if time.monotonic() >= deadline:
+                raise BenchError(
+                    f"{fixture['identity']}/{mode} captured {media_seconds:.3f}s before timeout"
+                )
+            playlist = api.fetch(f"/hls/{session_id}/index.m3u8").decode("utf-8", "replace")
+            for source_uri, duration in parse_playlist(playlist):
+                if source_uri in captured:
+                    continue
+                if not SAFE_SEGMENT.fullmatch(source_uri) or ".." in source_uri:
+                    raise BenchError("server playlist contained an unsafe segment URI")
+                blob = api.fetch(f"/hls/{session_id}/{source_uri}")
+                if not blob:
+                    raise BenchError(f"server returned an empty HLS segment: {source_uri}")
+                suffix = Path(source_uri).suffix if Path(source_uri).suffix else ".bin"
+                local_name = f"segment-{len(ordered):05d}{suffix}"
+                (capture_dir / local_name).write_bytes(blob)
+                segment = {
+                    "local_name": local_name,
+                    "duration_seconds": float(duration),
+                    "bytes": len(blob),
+                }
+                captured[source_uri] = segment
+                ordered.append(segment)
+                media_seconds += float(duration)
+                if media_seconds + 1e-6 >= fixture["duration_seconds"]:
+                    break
+            status = api.call(f"/hls/{session_id}/status")
+            status_encoder = status.get("encoder")
+            if not isinstance(status_encoder, str) or not status_encoder:
+                raise BenchError(
+                    f"{fixture['identity']}/{mode} status did not report encoder identity"
+                )
+            status_encoders.add(status_encoder)
+            if status_encoder != encoder:
+                raise BenchError(
+                    f"{fixture['identity']}/{mode} encoder changed from StartResponse "
+                    f"{encoder!r} to status {status_encoder!r}"
+                )
+            speed = status.get("recent_speed")
+            if speed is not None:
+                speed_samples.append(float(speed))
+            if media_seconds + 1e-6 < fixture["duration_seconds"]:
+                time.sleep(poll_seconds)
+
+        if len(ordered) < 3:
+            raise BenchError(f"{fixture['identity']}/{mode} produced fewer than three segments")
+        if status_encoders != {encoder}:
+            raise BenchError(f"{fixture['identity']}/{mode} has no stable status encoder identity")
+        playlist_path = capture_dir / "capture.m3u8"
+        local_capture_playlist(playlist_path, ordered)
+        return {
+            "encoder": encoder,
+            "status_encoder": encoder,
+            "delivered_dynamic_range": delivered_dynamic_range,
+            "media_origin_ms": origin_ms,
+            "media_origin_source": origin_source,
+            "captured_media_seconds": media_seconds,
+            "capture_wall_seconds": time.monotonic() - started,
+            "bytes": sum(segment["bytes"] for segment in ordered),
+            "segments": ordered,
+            "speed_samples": speed_samples,
+            "ladder_rung": rung,
+            "playlist_path": playlist_path,
+        }
+    except Exception:
+        if capture_dir_created and capture_dir is not None and capture_dir.is_dir():
+            for segment in ordered:
+                (capture_dir / segment["local_name"]).unlink(missing_ok=True)
+            (capture_dir / "capture.m3u8").unlink(missing_ok=True)
+            capture_dir.rmdir()
+        raise
+    finally:
+        try:
+            api.call(f"/hls/{session_id}", "DELETE")
+            wait_for_server_idle(
+                api,
+                f"deleting {fixture['identity']}/{mode}",
+                poll_seconds,
+                idle_timeout_seconds,
+            )
+        except Exception:
+            if capture_dir_created and capture_dir is not None and capture_dir.is_dir():
+                for segment in ordered:
+                    (capture_dir / segment["local_name"]).unlink(missing_ok=True)
+                (capture_dir / "capture.m3u8").unlink(missing_ok=True)
+                capture_dir.rmdir()
+            raise
+
+
+def percentile(values, percent):
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = max(0, min(len(ordered) - 1, int(round(percent / 100 * (len(ordered) - 1)))))
+    return ordered[index]
+
+
+def setting_contract(settings):
+    if RATE_MODE_FIELD not in settings or QUALITY_FIELD not in settings:
+        raise BenchError(
+            "server has no N1 rate-mode/quality settings contract; use --modes vbr on current main"
+        )
+    return {
+        "rate_field": RATE_MODE_FIELD,
+        "quality_field": QUALITY_FIELD,
+        "original_rate": settings[RATE_MODE_FIELD],
+        "original_quality": settings[QUALITY_FIELD],
+    }
+
+
+def update_rate_setting(api, contract, mode, quality=None, include_quality=False):
+    require_server_idle(api, f"setting rate-control mode to {mode}")
+    expected_rate = "bitrate" if mode == "vbr" else "quality"
+    body = {contract["rate_field"]: expected_rate}
+    if include_quality:
+        body[contract["quality_field"]] = quality
+    returned = api.call("/settings", "PUT", body)
+    if returned.get(contract["rate_field"]) != expected_rate:
+        raise BenchError(f"server did not apply requested {expected_rate} rate mode")
+    if include_quality and returned.get(contract["quality_field"]) != quality:
+        raise BenchError("server did not apply requested quality override")
+    return {
+        "requested_mode": mode,
+        "requested_settings": body,
+        "verified_settings_response": {
+            contract["rate_field"]: returned.get(contract["rate_field"]),
+            contract["quality_field"]: returned.get(contract["quality_field"]),
+        },
+        "evidence_scope": (
+            "settings_dto_acknowledgement_only; does not prove effective encoder flags or fallback"
+        ),
+    }
+
+
+def restore_rate_settings(api, contract):
+    require_server_idle(api, "restoring original rate-control settings")
+    body = {
+        contract["rate_field"]: contract["original_rate"],
+        contract["quality_field"]: contract["original_quality"],
+    }
+    returned = api.call("/settings", "PUT", body)
+    if returned.get(contract["rate_field"]) != contract["original_rate"]:
+        raise BenchError("server did not restore original rate mode")
+    if returned.get(contract["quality_field"]) != contract["original_quality"]:
+        raise BenchError("server did not restore original quality override")
+
+
+def evaluate_rate_control(fixture_rows):
+    """Apply the plan's binding advertised-peak gate and comparison gates."""
+    failures = []
+    for fixture in fixture_rows:
+        name = fixture["identity"]
+        for mode, measured in fixture["modes"].items():
+            if measured["peak_window_kbps"] > measured["limits"]["advertised_peak_kbps"]:
+                failures.append({
+                    "code": "advertised_peak_exceeded",
+                    "fixture": name,
+                    "mode": mode,
+                    "measured_kbps": round(measured["peak_window_kbps"], 3),
+                    "limit_kbps": round(measured["limits"]["advertised_peak_kbps"], 3),
+                })
+        if set(fixture["modes"]) != set(RATE_CONTROL_FULL_MODES):
+            continue
+        vbr, qvbr = fixture["modes"]["vbr"], fixture["modes"]["qvbr"]
+        if vbr["production_encoder"] != qvbr["production_encoder"]:
+            failures.append({
+                "code": "encoder_identity_mismatch",
+                "fixture": name,
+                "baseline": vbr["production_encoder"],
+                "candidate": qvbr["production_encoder"],
+            })
+        if abs(qvbr["captured_media_seconds"] - vbr["captured_media_seconds"]) > 0.050:
+            failures.append({
+                "code": "duration_mismatch",
+                "fixture": name,
+                "baseline_seconds": round(vbr["captured_media_seconds"], 6),
+                "candidate_seconds": round(qvbr["captured_media_seconds"], 6),
+            })
+        if qvbr["vmaf"] + 1e-9 < vbr["vmaf"]:
+            failures.append({
+                "code": "vmaf_regression",
+                "fixture": name,
+                "baseline": round(vbr["vmaf"], 6),
+                "candidate": round(qvbr["vmaf"], 6),
+            })
+        if fixture["class"] == "easy" and qvbr["bytes"] > vbr["bytes"]:
+            failures.append({
+                "code": "easy_bytes_regression",
+                "fixture": name,
+                "baseline": vbr["bytes"],
+                "candidate": qvbr["bytes"],
+            })
+        if qvbr["speed_p10"] is None or vbr["speed_p10"] is None:
+            failures.append({"code": "speed_missing", "fixture": name})
+        elif qvbr["speed_p10"] + 1e-9 < vbr["speed_p10"] * 0.90:
+            failures.append({
+                "code": "speed_regression",
+                "fixture": name,
+                "baseline": round(vbr["speed_p10"], 6),
+                "candidate": round(qvbr["speed_p10"], 6),
+                "minimum": round(vbr["speed_p10"] * 0.90, 6),
+            })
+    return failures
+
+
+def measured_capture(capture, fixture, scorer, model, n_subsample, rate_window):
+    peak, peak_at = rolling_segment_peak(capture["segments"], rate_window)
+    limits = rate_limits(capture["ladder_rung"], rate_window)
+    vmaf = score_vmaf(
+        scorer,
+        capture["playlist_path"],
+        fixture["reference_path"],
+        capture["media_origin_ms"] / 1000,
+        capture["captured_media_seconds"],
+        model,
+        n_subsample,
+    )
+    return {
+        "production_encoder": capture["encoder"],
+        "start_response_encoder": capture["encoder"],
+        "status_encoder": capture["status_encoder"],
+        "delivered_dynamic_range": capture["delivered_dynamic_range"],
+        "media_origin_ms": capture["media_origin_ms"],
+        "media_origin_source": capture["media_origin_source"],
+        "captured_media_seconds": round(capture["captured_media_seconds"], 6),
+        "capture_wall_seconds": round(capture["capture_wall_seconds"], 6),
+        "segment_count": len(capture["segments"]),
+        "bytes": capture["bytes"],
+        "speed_p10": percentile(capture["speed_samples"], 10),
+        "speed_p50": percentile(capture["speed_samples"], 50),
+        "vmaf": round(vmaf, 6),
+        "peak_window_kbps": round(peak, 3),
+        "peak_window_start_seconds": round(peak_at, 6),
+        "limits": limits,
+        "capture_playlist": capture["playlist_path"].name,
+    }
+
+
+def empty_rate_control_report(modes, model, n_subsample):
+    return {
+        "schema_version": RATE_CONTROL_SCHEMA_VERSION,
+        "kind": "perf2-rate-control",
+        "passed": False,
+        "modes": list(modes),
+        "corpus": None,
+        "acceptance": None,
+        "mode_settings": {},
+        "controller": {
+            "host": socket.gethostname(),
+            "role": "session_controller_and_offline_score_runner",
+        },
+        "production": None,
+        "vmaf_scorer": {
+            "role": "scoring_only_never_production_encoding",
+            "host": socket.gethostname(),
+            "path": None,
+            "sha256": None,
+            "build": None,
+            "build_configuration": None,
+            "libvmaf_fingerprint": None,
+            "model": model,
+            "n_subsample": n_subsample,
+            "behavior_probe": {"status": "not_run", "score": None},
+            "production_dependency": False,
+        },
+        "fixtures": [],
+        "failures": [],
+    }
+
+
+def rate_control_report(args, api=None):
+    selected_modes = tuple(part.strip() for part in args.modes.split(",") if part.strip())
+    if selected_modes not in (RATE_CONTROL_SMOKE_MODES, RATE_CONTROL_FULL_MODES):
+        selected_modes = tuple()
+    report = empty_rate_control_report(selected_modes, args.vmaf_model, args.vmaf_subsample)
+    if not selected_modes:
+        report["failures"].append({
+            "code": "harness_error",
+            "detail": "--modes must be vbr (current-main smoke) or vbr,qvbr (full N1)",
+        })
+        return report
+    if not NAME.fullmatch(args.vmaf_model):
+        report["failures"].append({
+            "code": "harness_error",
+            "detail": "--vmaf-model must be a model version name, not a filter expression",
+        })
+        return report
+    if args.vmaf_subsample < 1:
+        report["failures"].append({"code": "harness_error", "detail": "--vmaf-subsample must be at least 1"})
+        return report
+    if args.rate_window <= 0:
+        report["failures"].append({"code": "harness_error", "detail": "--rate-window must be positive"})
+        return report
+    if (
+        args.poll <= 0
+        or args.capture_timeout <= 0
+        or args.idle_timeout <= 0
+        or args.settings_settle < 0
+    ):
+        report["failures"].append({
+            "code": "harness_error",
+            "detail": (
+                "--poll/--capture-timeout/--idle-timeout must be positive and "
+                "--settings-settle nonnegative"
+            ),
+        })
+        return report
+
+    contract = None
+    try:
+        corpus = load_rate_control_corpus(args.corpus)
+        fixtures = corpus["fixtures"]
+        report["corpus"] = {
+            "manifest": Path(args.corpus).name,
+            "manifest_sha256": corpus["manifest_sha256"],
+            "purpose": corpus["purpose"],
+            "fixture_count": len(fixtures),
+            "server_sha256_manifest": None,
+        }
+        if selected_modes == RATE_CONTROL_FULL_MODES and corpus["purpose"] != "n1_acceptance":
+            raise BenchError(
+                "vbr,qvbr requires an n1_acceptance corpus; the checked-in corpus is smoke-only"
+            )
+        server_manifest_path = getattr(args, "server_sha256_manifest", None)
+        if selected_modes == RATE_CONTROL_FULL_MODES and not server_manifest_path:
+            raise BenchError("vbr,qvbr requires --server-sha256-manifest")
+        server_manifest = (
+            load_server_sha256_manifest(server_manifest_path)
+            if server_manifest_path
+            else None
+        )
+        if server_manifest is not None:
+            report["corpus"]["server_sha256_manifest"] = {
+                "manifest": server_manifest["manifest"],
+                "manifest_sha256": server_manifest["manifest_sha256"],
+            }
+            for fixture in fixtures:
+                server_digest = server_manifest["by_filename"].get(fixture["filename"])
+                if server_digest is None:
+                    raise BenchError(
+                        f"server SHA-256 manifest is missing {fixture['filename']}"
+                    )
+                if server_digest != fixture["reference_sha256"]:
+                    raise BenchError(
+                        "server SHA-256 differs from pinned controller reference for "
+                        + fixture["filename"]
+                    )
+        subset = bool(args.only)
+        report["acceptance"] = {
+            "eligible": (
+                selected_modes == RATE_CONTROL_FULL_MODES
+                and corpus["purpose"] == "n1_acceptance"
+                and not subset
+            ),
+            "scope": (
+                "diagnostic_subset_non_acceptance"
+                if subset
+                else (
+                    "full_n1_quantitative_comparison"
+                    if selected_modes == RATE_CONTROL_FULL_MODES
+                    else "vbr_smoke_non_acceptance"
+                )
+            ),
+            "effective_mode_evidence": (
+                "settings DTO acknowledgement plus stable encoder identity only; "
+                "N1 boot/production flag validation and forced-fallback evidence are separate"
+            ),
+        }
+        if args.only:
+            fixtures = [fixture for fixture in fixtures if fixture["identity"] == args.only]
+            if not fixtures:
+                raise BenchError(f"fixture {args.only!r} is not in the corpus")
+            report["failures"].append({
+                "code": "diagnostic_subset_not_acceptance",
+                "detail": "--only is diagnostic; it cannot produce an N1 acceptance pass",
+            })
+        scorer = scoring_executable(args.vmaf_ffmpeg)
+        probe = probe_vmaf_scorer(scorer, args.vmaf_model)
+        report["vmaf_scorer"].update({
+            "path": scorer,
+            "sha256": sha256_file(scorer),
+            "build": tool_build(scorer),
+            "build_configuration": scorer_build_configuration(scorer),
+            "libvmaf_fingerprint": libvmaf_fingerprint(scorer, probe["diagnostics"]),
+            "behavior_probe": {"status": "passed", "score": probe["score"]},
+        })
+        api = api or Api(args.base, args.token)
+        system = api.call("/system")
+        report["production"] = {
+            "role": "production_hls_encoding_by_plurxd_only",
+            "encoder_execution_host": system.get("name"),
+            "server_url": safe_server_url(args.base),
+            "server_name": system.get("name"),
+            "server_instance_id": system.get("instance_id"),
+            "plurx_version": system.get("version"),
+            "plurx_build": system.get("build"),
+            "plurx_built_at": system.get("built_at"),
+            "production_ffmpeg_path": system.get("ffmpeg"),
+            "production_ffmpeg_build": system.get("ffmpeg_version"),
+            "selected_encoder": system.get("encoder_selected"),
+            "vmaf_scorer_used_for_encoding": False,
+        }
+        system_active = system.get("active_transcodes")
+        if (
+            isinstance(system_active, bool)
+            or not isinstance(system_active, int)
+            or system_active < 0
+        ):
+            raise BenchError("server did not report a valid active_transcodes count")
+        if system_active != 0:
+            raise BenchError(
+                "server has active transcodes; stop all playback before rate-control capture"
+            )
+        resolve_fixture_file_ids(
+            api,
+            fixtures,
+            args.library,
+            server_manifest["by_filename"] if server_manifest is not None else None,
+        )
+        work_dir = Path(args.work_dir) if args.work_dir else Path(args.json).with_suffix("").with_name(
+            Path(args.json).stem + "-work"
+        )
+        work_dir.mkdir(parents=True, exist_ok=True)
+        if selected_modes == RATE_CONTROL_FULL_MODES:
+            contract = setting_contract(api.call("/settings"))
+        else:
+            report["mode_settings"]["vbr"] = {
+                "requested_mode": "vbr",
+                "requested_settings": None,
+                "verified_settings_response": None,
+                "evidence_scope": (
+                    "current-main smoke only; no N1 settings DTO and no effective-mode claim"
+                ),
+            }
+
+        for fixture in fixtures:
+            report_fixture = {
+                "identity": fixture["identity"],
+                "class": fixture["class"],
+                "declared_dynamic_range": fixture["dynamic_range"],
+                "filename": fixture["filename"],
+                "reference": fixture["reference"],
+                "reference_size": fixture["reference_size"],
+                "reference_sha256": fixture["reference_sha256"],
+                "reference_sha256_pinned": fixture["reference_sha256_pinned"],
+                "server_file_identity": fixture["server_file_identity"],
+                "server_sha256": fixture["server_sha256"],
+                "trim": {
+                    "start_seconds": fixture["start_seconds"],
+                    "duration_seconds": fixture["duration_seconds"],
+                },
+                "rung": fixture["rung"],
+                "modes": {},
+            }
+            report["fixtures"].append(report_fixture)
+
+        for mode in selected_modes:
+            if contract is not None:
+                report["mode_settings"][mode] = update_rate_setting(
+                    api,
+                    contract,
+                    mode,
+                    quality=args.quality,
+                    include_quality=mode == "qvbr" and args.quality is not None,
+                )
+                time.sleep(args.settings_settle)
+            for fixture, report_fixture in zip(fixtures, report["fixtures"]):
+                print(f"rate-control {fixture['identity']} / {mode}…", flush=True)
+                disk_preflight = capture_disk_preflight(work_dir, fixture)
+                capture = capture_live_session(
+                    api,
+                    fixture,
+                    mode,
+                    work_dir,
+                    args.poll,
+                    args.capture_timeout,
+                    args.idle_timeout,
+                )
+                try:
+                    measured = measured_capture(
+                        capture,
+                        fixture,
+                        scorer,
+                        args.vmaf_model,
+                        args.vmaf_subsample,
+                        args.rate_window,
+                    )
+                    measured["disk_preflight"] = disk_preflight
+                    measured["artifacts_retained"] = args.keep_artifacts
+                    measured["requested_mode"] = mode
+                    measured["mode_settings_evidence"] = report["mode_settings"][mode]
+                    report_fixture["modes"][mode] = measured
+                finally:
+                    if not args.keep_artifacts:
+                        cleanup_capture(capture)
+    except Exception as error:
+        detail = str(error)
+        if getattr(args, "token", None):
+            detail = detail.replace(args.token, "<redacted-token>")
+        parsed_base = urllib.parse.urlsplit(getattr(args, "base", ""))
+        for credential in (parsed_base.username, parsed_base.password):
+            if credential:
+                detail = detail.replace(credential, "<redacted-credential>")
+        report["failures"].append({"code": "harness_error", "detail": detail})
+    finally:
+        if contract is not None and api is not None:
+            try:
+                restore_rate_settings(api, contract)
+            except Exception as error:
+                detail = str(error)
+                if getattr(args, "token", None):
+                    detail = detail.replace(args.token, "<redacted-token>")
+                report["failures"].append({
+                    "code": "setting_restore_failed",
+                    "detail": detail,
+                })
+    if report["fixtures"] and not any(failure["code"] == "harness_error" for failure in report["failures"]):
+        report["failures"].extend(evaluate_rate_control(report["fixtures"]))
+    report["passed"] = not report["failures"]
+    return report
+
+
+def write_json(path, document):
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def print_rate_control(report):
+    for fixture in report.get("fixtures", []):
+        for mode, measured in fixture.get("modes", {}).items():
+            limits = measured["limits"]
+            print(
+                f"{fixture['identity']}/{mode}: bytes {measured['bytes']}; "
+                f"VMAF {measured['vmaf']:.3f}; speed p10 {measured['speed_p10']}; "
+                f"peak {measured['peak_window_kbps']:.0f} kb/s · "
+                f"VBV diagnostic {limits['theoretical_vbv_allowance_kbps']:.0f} · "
+                f"advertised binding {limits['advertised_peak_kbps']:.0f}"
+            )
+    if report.get("passed"):
+        print("PASS: captured production HLS satisfies the selected harness gates")
+    else:
+        for failure in report.get("failures", []):
+            print(f"FAIL: {failure}", file=sys.stderr)
 
 
 def build_fixture(out_dir, name, spec):
@@ -136,7 +1286,8 @@ class Api:
                 raw = r.read()
                 return json.loads(raw) if raw else None
         except urllib.error.HTTPError as e:
-            raise RuntimeError(f"{method} {path} -> {e.code} {e.read()[:200]!r}") from e
+            e.read(200)
+            raise RuntimeError(f"{method} {path} -> {e.code}") from e
 
     def fetch(self, path):
         """Raw GET against a capability URL (playlist/segment: no auth header)."""
@@ -273,7 +1424,68 @@ def main():
     r.add_argument("--seconds", type=int, default=60, help="seconds of content to consume per fixture")
     r.add_argument("--only", default=None, help="one fixture name")
 
+    rc = sub.add_parser(
+        "rate-control",
+        help="capture production HLS, then score it offline for N1",
+    )
+    rc.add_argument("--base", default="http://127.0.0.1:32400", help="production plurxd base URL")
+    rc.add_argument("--token", required=True, help="admin token; never written to the result")
+    rc.add_argument("--library", type=int, default=None, help="library id holding the fixtures")
+    rc.add_argument("--corpus", required=True, help="versioned rate-control corpus JSON")
+    rc.add_argument(
+        "--server-sha256-manifest",
+        default=None,
+        help="sha256sum output captured on the production server (required for vbr,qvbr)",
+    )
+    rc.add_argument(
+        "--modes",
+        default="vbr",
+        help="vbr for the current-main smoke; vbr,qvbr only after N1 settings exist",
+    )
+    rc.add_argument(
+        "--vmaf-ffmpeg",
+        default="ffmpeg",
+        help=(
+            "scoring-only FFmpeg with libvmaf (default: %(default)s after a behavior probe); "
+            "never used for production playback encoding"
+        ),
+    )
+    rc.add_argument("--vmaf-model", default="vmaf_v0.6.1")
+    rc.add_argument(
+        "--vmaf-subsample",
+        type=int,
+        default=1,
+        help="score every Nth frame (1 scores every frame)",
+    )
+    rc.add_argument("--json", required=True, help="stable JSON result artifact")
+    rc.add_argument("--work-dir", default=None, help="controller-side capture scratch directory")
+    rc.add_argument("--keep-artifacts", action="store_true", help="retain captured HLS after scoring")
+    rc.add_argument("--quality", type=int, default=None, help="full-mode QVBR quality override")
+    rc.add_argument("--rate-window", type=float, default=10.0, help="served-segment peak window")
+    rc.add_argument("--poll", type=float, default=0.25, help="playlist/status polling interval")
+    rc.add_argument("--capture-timeout", type=float, default=180.0, help="per-session wall timeout")
+    rc.add_argument(
+        "--idle-timeout",
+        type=float,
+        default=30.0,
+        help="seconds to prove the production server returned to zero active transcodes",
+    )
+    rc.add_argument(
+        "--settings-settle",
+        type=float,
+        default=3.0,
+        help="seconds between a full-mode settings update and capture",
+    )
+    rc.add_argument("--only", default=None, help="one fixture name")
+
     args = ap.parse_args()
+
+    if args.cmd == "rate-control":
+        result = rate_control_report(args)
+        write_json(args.json, result)
+        print_rate_control(result)
+        print(f"JSON: {args.json}")
+        return 0 if result["passed"] else 1
 
     if args.cmd == "fixtures":
         if not shutil.which("ffmpeg"):
@@ -284,7 +1496,7 @@ def main():
             build_fixture(args.dir, name, spec)
         print("\nPoint a plurx library at that directory and scan it, then:")
         print(f"  scripts/bench run --token TOKEN --height 1080")
-        return
+        return 0
 
     api = Api(args.base, args.token)
     items = api.call(f"/libraries/{args.library}/items") if args.library else None
@@ -318,7 +1530,8 @@ def main():
             print(f"  {name}: {e}")
             rows.append((name, None))
     report(rows)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

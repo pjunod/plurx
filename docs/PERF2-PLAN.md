@@ -321,6 +321,17 @@ each stall instant, joined in one record. An Android play produces a
 
 ## 4. N1 — Quality-bounded rate control
 
+**Implementation status (2026-08-09):** the live-session capture/offline-score
+rate-control harness and the legacy-VBR golden recipe fixture are implemented
+in source. Production encoding remains the deployed server's unchanged
+Jellyfin FFmpeg. A separate, explicit `--vmaf-ffmpeg` is behavior-probed and
+scores captured bytes on the controller only after the production session
+ends; it never encodes playback or becomes a live-path dependency. No scorer is
+installed or needed on nynuc or in compose: nynuc performs production encoding
+and the accepted laptop controller scorer runs afterward. No N1 encoder flags
+or settings are implemented by this slice. Only the named-machine capture/full
+comparison remains unclaimed until it is actually run.
+
 **Objective:** stop paying fixed bitrates for content that doesn't need
 them. Same encoders, same ladder heights, same caps — but the target
 becomes *quality*, and the bitrate becomes the *ceiling*. This is the
@@ -405,12 +416,23 @@ low-medium; driver variance is exactly what boot validation catches.
 **Toggle:** `transcode.rate_mode`, default off (= `bitrate`).
 
 **Acceptance (nynuc, per principle 4):** `scripts/bench` grows a
-rate-control mode first — today it deliberately does not decode pixels
-(`scripts/bench:18`), so the harness slice precedes the feature
-(review R7). Shape: `scripts/bench rate-control --corpus <fixtures>
---modes vbr,qvbr --vmaf-model vmaf_v0.6.1 --json out/rate-control.json`,
-failing nonzero when quality mode regresses VMAF or exceeds the
-advertised peak over any `bufsize` window. On that harness: quality
+rate-control mode first, so the harness slice precedes the feature (review R7).
+Production Jellyfin FFmpeg must create the real, uncached plurxd HLS sessions;
+the controller captures the served segments and, after each encode ends, an
+explicit separate scorer decodes them for VMAF offline. Shape:
+`scripts/bench rate-control --base http://nynuc:32400 --token <admin-token>
+--corpus <fixtures> --modes vbr,qvbr --vmaf-ffmpeg <scoring-only-ffmpeg>
+--server-sha256-manifest <nynuc.sha256>
+--vmaf-model vmaf_v0.6.1 --json out/rate-control.json`, failing nonzero when
+quality mode regresses VMAF or exceeds the advertised peak over any complete
+served-segment window. The theoretical VBV allowance is a nonbinding diagnostic,
+not a second contract. Full acceptance requires pinned local and server hashes,
+equal nonempty easy/hard SDR halves, full-corpus scope, maintenance-node
+exclusivity, and stable StartResponse/status encoder identity. The settings DTO
+acknowledgement is not proof that effective flags or fallback executed; N1 boot
+validation/production tests and a separate forced-fallback run supply that
+evidence. The scorer never encodes production playback, becomes
+`PLURX_FFMPEG`, joins the compose service, or enters the live path. On that harness: quality
 mode produces ≤ the bytes of bitrate mode on the easy half of the
 corpus at equal-or-better VMAF (VMAF offline only, `n_subsample` as
 needed — never in the live path, principle 7); encode speed within 10%

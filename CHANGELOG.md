@@ -27,6 +27,27 @@ bump may break compatibility and a **patch** bump never does.
 
 ### Added
 
+- **Performance II N1 gains its measurement gate before its encoder flags.**
+  `scripts/bench rate-control` now opens uncached HLS sessions on the deployed
+  plurxd, captures the segments that its production Jellyfin FFmpeg actually
+  served, and only after each encode ends scores those bytes offline with an
+  explicit, behavior-probed `--vmaf-ffmpeg`. The scorer is a separate
+  controller-side executable: it never encodes playback, becomes
+  `PLURX_FFMPEG`, joins the compose service, or enters the live path. The stable
+  JSON distinguishes server/build/encoder identity from scorer
+  path/build/hash/model; binds the local corpus and operator-captured nynuc
+  `sha256sum` manifests; proves pinned, balanced SDR fixture identity; and
+  reports bytes, VMAF, server speed, and the binding advertised peak over
+  complete served-segment windows. The theoretical VBV allowance remains a
+  labeled, nonbinding diagnostic. Full VBR/QVBR runs require maintenance-node
+  exclusivity, verify settings acknowledgements and stable session encoder
+  identity, and restore original values only after the node returns idle.
+  Current main supports a visibly non-acceptance VBR smoke. A literal golden
+  fixture still pins the current VBR recipe hash. No scorer is installed or
+  needed on nynuc or in compose: nynuc encodes and the accepted laptop scorer
+  runs afterward. Production behavior remains unchanged, and the named-machine
+  full comparison and separate forced-fallback acceptance remain unclaimed.
+
 - **Performance II N0 makes playback telemetry durable and queryable.** Client
   beacons keep their existing human log lines and additionally enter a bounded,
   node-local `playback_events` table with live session speed, runway, hold,

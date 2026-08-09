@@ -432,6 +432,138 @@ the limit is capped at 2,000. Settings → System shows a small seven-day TTFF,
 stall, and suspended-time summary. `scripts/perf-report` uses the same endpoint
 and falls back to the log ring when pointed at an older server.
 
+### Rate-control acceptance captures production, then scores offline
+
+Performance II N1 is judged on bytes created by the deployed server, not by a
+second copy of its encoder arguments. Run `scripts/bench rate-control` on a
+controller that can reach nynuc. The harness opens real plurxd HLS sessions;
+the server's configured production Jellyfin FFmpeg and hardware encoder create
+every segment. It rejects cached VOD and copy sessions, and it refuses to start
+or mutate global settings while another transcode is visible. Reserve nynuc as
+a maintenance node and stop playback for the whole run. The repeated idle
+checks catch a viewer that appears at a boundary, but no HTTP check can make the
+gap after it race-free; node exclusivity is the operational lock.
+
+The controller saves each served segment under a generated local filename,
+ends the production session, and only then invokes the explicit
+`--vmaf-ffmpeg` to decode the capture and reference for scoring. That separate
+FFmpeg is scoring-only: never set it as `PLURX_FFMPEG`, add it to the compose
+service, or make it a production/live-path dependency. Ordinary `ffmpeg` is the
+CLI default only when its requested model passes the executable `libvmaf`
+behavior probe with exactly one finite score. No scorer is installed or needed
+on nynuc or in compose. Nynuc performs production encoding; the accepted laptop
+controller scorer runs only after DELETE succeeds and `/system` confirms the
+node returned to zero active transcodes.
+
+Build and scan the standard fixtures first, make the same files available as
+local controller references, stop all playback, and run the current-main VBR
+smoke:
+
+```bash
+scripts/bench rate-control \
+  --base http://nynuc:32400 \
+  --token "$PLURX_ADMIN_TOKEN" \
+  --corpus scripts/perf2-rate-control-smoke-corpus.json \
+  --modes vbr \
+  --vmaf-ffmpeg /opt/homebrew/Cellar/ffmpeg/8.1.2_1/bin/ffmpeg \
+  --vmaf-model vmaf_v0.6.1 \
+  --json out/rate-control-vbr.json
+```
+
+After N1 adds the exact `transcode_rate_mode` and `transcode_quality` settings,
+build a full acceptance manifest. Every local reference must carry its actual
+SHA-256, `dynamic_range: sdr`, and one of equal, nonempty `easy` and `hard`
+halves. The checked-in two-fixture manifest is a VBR smoke only; it is not D5
+calibration or full acceptance.
+
+Capture server hashes from the exact files in nynuc's fixture library, then
+produce the same ordered list locally and compare it before running. Replace
+the server directory below with the library's real path; do not hash a second
+copy merely because it has the same filename:
+
+```bash
+mkdir -p out
+
+ssh nynuc \
+  'cd /path/to/nynuc/bench-media && sha256sum -- easy-a.mkv easy-b.mkv hard-a.mkv hard-b.mkv' \
+  > out/nynuc-perf2.sha256
+
+(
+  cd bench-media
+  shasum -a 256 easy-a.mkv easy-b.mkv hard-a.mkv hard-b.mkv
+) > out/laptop-perf2.sha256
+
+diff -u out/laptop-perf2.sha256 out/nynuc-perf2.sha256
+```
+
+An empty `diff` is the preflight. The harness then parses the nynuc file
+fail-closed, records its own SHA-256, and requires every server filename digest
+to equal the pinned local-reference digest. It also records the corpus
+manifest's SHA-256 and requires the server browse facts and every session to
+prove SDR. Missing/unknown HDR facts and any non-SDR delivery fail.
+
+```bash
+scripts/bench rate-control \
+  --base http://nynuc:32400 \
+  --token "$PLURX_ADMIN_TOKEN" \
+  --corpus /path/to/perf2-n1-acceptance.json \
+  --server-sha256-manifest out/nynuc-perf2.sha256 \
+  --modes vbr,qvbr \
+  --quality 22 \
+  --vmaf-ffmpeg /opt/homebrew/Cellar/ffmpeg/8.1.2_1/bin/ffmpeg \
+  --vmaf-model vmaf_v0.6.1 \
+  --json out/rate-control-full.json
+```
+
+The harness sends partial settings updates only and records the requested mode
+plus only the verified rate/quality fields from the settings response. It
+restores both original values in a `finally` path, after proving the node idle;
+if a viewer appears, it refuses the next mutation. It never writes the token,
+the full settings response, or another setting/secret to the artifact.
+
+The manifest is fixture identity, not an encoder recipe:
+
+| Manifest field | Meaning |
+|---|---|
+| `version` | Schema version; N1 begins at `1` and rejects anything else |
+| `purpose` | `vbr_smoke` or `n1_acceptance`; full `vbr,qvbr` mode refuses a smoke corpus |
+| `fixtures[].identity` / `class` | Stable safe name and `easy`/`hard`; only easy content carries the bytes-must-not-grow gate |
+| `dynamic_range` | Must be literal `sdr`; the server file fact and delivered session must agree |
+| `filename` / `reference` | Server-visible filename and the controller-local identical source; relative references resolve beside the manifest |
+| `reference_sha256` | Optional pinned lowercase SHA-256; every run records the actual local SHA, and always requires local/server byte sizes to agree |
+| `trim` | Source-timeline start and capture duration; `StartResponse.media_origin_ms` is authoritative and must agree within 50 ms |
+| `rung` | Requested production output height |
+
+The controller preflights free disk and removes each capture immediately after
+scoring. `--keep-artifacts` retains generated playlists/segments for diagnosis;
+`--work-dir` chooses scratch. `--only` is diagnostic: the JSON marks it as a
+subset, forces `passed: false`, and exits nonzero even when its measurements
+look good. A retained fixture/mode directory is never overwritten.
+`--vmaf-subsample N` scores every Nth frame, and the JSON records the value.
+
+The JSON keeps the evidence roles distinct: controller/scorer host, production
+server/build/Jellyfin-FFmpeg/encoder identity, and scoring-only FFmpeg
+path/build/configuration/hash/model/filter fingerprint. Each capture requires a
+stable status encoder matching StartResponse, and the two modes must use the
+same encoder per fixture. Peak rate uses the same complete-served-segment
+rolling windows as `scripts/perf-report`; incomplete tail windows are ignored.
+The server-advertised rung peak is the plan's sole binding peak gate. The
+theoretical `maxrate + bufsize/window` value remains in JSON as a labeled,
+nonbinding diagnostic with its inferred 2× nominal-video bufsize assumption.
+
+`passed: true` on the full comparison means QVBR did not lower VMAF, grow bytes
+on easy content, or lose more than 10% server encode speed, and neither mode
+crossed the advertised peak. Failures are explicit
+`vmaf_regression`, `easy_bytes_regression`, `speed_regression`,
+`encoder_identity_mismatch`, `advertised_peak_exceeded`, or `harness_error`.
+Missing `libvmaf` fails; it never skips quality scoring. A quantitative harness
+pass proves settings acknowledgement and measured output, not that the intended
+encoder flags or forced fallback executed. N1's production tests and boot
+validation must prove settings-to-flags behavior, and the plan's separate
+forced-fallback run must supply that evidence. TTFS is not N1 evidence. Keep
+the JSON as the PR artifact, and do not claim the named-machine full comparison
+without running it.
+
 ### Where the transcode scratch lives
 
 Session segments are written under `<data_dir>/transcode`, which is wiped at
