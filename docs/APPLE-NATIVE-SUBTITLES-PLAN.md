@@ -358,11 +358,11 @@ track, which may, at source height.** A container default in another
 language is never a fallback. Explicit user selections may burn (that is
 the user asking); the policy governs what the player does on its own.
 
-### 3.4 Historical version snapshot; current Apple source is build 45
+### 3.4 Historical version snapshot; current Apple source is build 46
 
 At this plan's 2026-08-02 cut, the workspace was `0.2.0`, Apple was build 6,
 and Android versionCode was 3. Those numbers are historical evidence, not
-release instructions. Current source is workspace `0.2.7` and Apple build 45;
+release instructions. Current source is workspace `0.2.7` and Apple build 46;
 [clients/apple/README.md](../clients/apple/README.md) still records that build
 as not uploaded to TestFlight. Read [RELEASING.md](RELEASING.md) and
 [PUBLISHING.md](PUBLISHING.md) for the current release path.
@@ -468,7 +468,7 @@ format constraint (keeping the forced-at-source-height carve-out), the
 copy-origin cue shift, `-muxdelay 0 -muxpreload 0`, and the
 measured-first-PTS test class. Server fixes reach `origin/main` per §4 and
 deploy to the fleet via the ansible playbooks; at the time, the client fix was
-assigned to the next TestFlight build (≥ 6). Current source is build 45 and is
+assigned to the next TestFlight build (≥ 6). Current source is build 46 and is
 still recorded as not uploaded.
 
 **What actually landed.** P0-1: the `default` and `first` arms of automatic
@@ -655,7 +655,7 @@ same series of commits:
   variables, 2026-08-02.
 - [x] `docs/STATUS.html` refreshed 2026-08-08 with the M1–M3 landings, the
   2026-08-03 copied-Dolby resolution, and the iOS system-chrome acceptance row.
-- [ ] Apple build 45 to TestFlight. Android native-subtitle parity shipped in a
+- [ ] Apple build 46 to TestFlight. Android native-subtitle parity shipped in a
   separate implementation; the remaining Android work is physical acceptance,
   not the source milestone this historical plan assigned.
 

@@ -20,7 +20,7 @@ bump may break compatibility and a **patch** bump never does.
   default, `0` fully disables row writes and pruning). Hiqlite voters use
   independent sidecars, never Raft, with restart and non-replication coverage.
   `scripts/perf-report` prefers the durable reader and falls back to the log
-  ring on older servers. Apple build 45 emits one authenticated TTFF beacon at
+  ring on older servers. Apple build 46 emits one authenticated TTFF beacon at
   the first advancing online frame, distinguishes cold starts from resumes,
   and rebases its film-position gate at attachment and pre-frame seeks so a
   growing copy session's keyframe origin cannot inflate the result. The beacon

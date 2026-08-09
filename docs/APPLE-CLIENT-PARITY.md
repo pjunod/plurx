@@ -9,10 +9,10 @@ The implementation history, deployment evidence, and resolved copied-Dolby-
 Vision investigation are recorded in
 [APPLE-NATIVE-SUBTITLES-HANDOFF.md](APPLE-NATIVE-SUBTITLES-HANDOFF.md).
 
-> Status (2026-08-09): source is v0.2.7, Apple build 45. Native text
+> Status (2026-08-09): source is v0.2.7, Apple build 46. Native text
 > subtitles, the cinematic detail surface, stable seek/recovery, truthful
 > delivered-range badges, and app-managed offline viewing on iPhone/iPad have
-> landed. Build 45 also emits the Performance II N0 TTFF beacon at the first
+> landed. Build 46 also emits the Performance II N0 TTFF beacon at the first
 > advancing online frame, including the live HLS session id when one exists and
 > separating cold starts from resumes; passing real-device ingest remains
 > unclaimed. The default-off `pgs-v1` overlay client
@@ -21,7 +21,7 @@ Vision investigation are recorded in
 > Vision was resolved on the physical Apple TV 2026-08-03; the historical
 > `-12927` investigation is superseded by
 > [APPLE-NATIVE-SUBTITLES-HANDOFF.md](APPLE-NATIVE-SUBTITLES-HANDOFF.md)'s
-> resolved status. Repository evidence still says build 45 has not reached
+> resolved status. Repository evidence still says build 46 has not reached
 > TestFlight and the deployment ledger still ends at server `787eaa6`, so
 > publishing plus the broader real-hardware/offline matrix remain release
 > gates.
