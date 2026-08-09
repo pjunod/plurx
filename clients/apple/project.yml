@@ -109,6 +109,8 @@ targets:
     platform: iOS
     sources:
       - path: Tests
+      - path: ../../tests/contracts/native-api.json
+        buildPhase: resources
     dependencies:
       - target: plurx-iOS
     settings:
@@ -123,6 +125,8 @@ targets:
     platform: tvOS
     sources:
       - path: Tests
+      - path: ../../tests/contracts/native-api.json
+        buildPhase: resources
     dependencies:
       - target: plurx-tvOS
     settings:

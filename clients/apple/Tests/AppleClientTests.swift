@@ -244,12 +244,12 @@ final class AppleClientTests: XCTestCase {
     }
 
     func testSharedNativeAPIFixtureDecodesWithoutConsumerDrift() throws {
-        let fixtureURL = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .appendingPathComponent("tests/contracts/native-api.json")
+        let fixtureURL = try XCTUnwrap(
+            Bundle(for: AppleClientTests.self).url(
+                forResource: "native-api",
+                withExtension: "json"
+            )
+        )
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
         let fixture = try decoder.decode(
