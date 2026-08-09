@@ -171,7 +171,7 @@
 
   <!-- ══════════ Performance ══════════ -->
   <section>
-    <h2>Performance — start latency, 4K, pre-cache <span class="chip prog">🚧 in progress</span> <span class="ev">PERF-PLAN.md · STUTTER-4K.md · SEGMENTER-PLAN.md</span></h2>
+    <h2>Performance — start latency, 4K, pre-cache <span class="chip prog">🚧 in progress</span> <span class="ev">PERF-PLAN.md · PERF2-PLAN.md · STUTTER-4K.md · SEGMENTER-PLAN.md</span></h2>
     <div class="meter"><div class="track"><div class="fill" style="width:83%"></div></div><div class="n">M0–M3 + segmenter complete · M4 waits on clustering</div></div>
     <details open><summary>Items</summary>
       <ul class="items">
@@ -181,6 +181,7 @@
         <li class="done-item"><span class="m done">✓ done</span><span class="t">M2 GPU tone-map: candidate graphs, real-HDR boot probe, routing and downgrade, bounded hardware/software admission; accepted on nynuc at 4.89× the CPU chain</span></li>
         <li class="done-item"><span class="m done">✓ done</span><span class="t">M3 pre-transcode cache: resumable producer, LRU budget, viewer preemption, cache-hit VOD serving; active-reader eviction protection added 2026-08-06</span></li>
         <li><span class="m todo">○ todo</span><span class="t">M4 — cluster transcode: placement, restart-at-boundary failover, distributed pre-caching (this <i>is</i> Phase 4's transcode chapter; waits for its plumbing)</span></li>
+        <li><span class="m todo">○ proposed</span><span class="t">Performance II plan drafted (<code>PERF2-PLAN.md</code>, 2026-08-09, review pending): telemetry-as-data, quality-targeted rate control, per-title analysis, prefix warm cache + predictive pre-warm, Auto ABR + network priors, HEVC/AV1 lanes, optional AI assistants — everything toggleable, nothing external load-bearing</span></li>
       </ul>
     </details>
   </section>
