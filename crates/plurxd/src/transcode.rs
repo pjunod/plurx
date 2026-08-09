@@ -100,6 +100,10 @@ pub(crate) const HLS_SCRATCH_MAX_BYTES_DEFAULT: i64 = 8 * 1024 * 1024 * 1024;
 /// before the settings are consulted again. The bound on how stale an
 /// admin's change can look, and the whole cost of caching it.
 const AHEAD_LIMITS_TTL: Duration = Duration::from_secs(2);
+/// Repair cadence when no client request triggers flow control first. At the
+/// default 2× pace this permits at most 30 seconds of additional production
+/// between observations; keep the arithmetic pinned below.
+const FLOW_CONTROL_REPAIR_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Live encode telemetry for one session, fed by ffmpeg's `-progress` stream.
 ///
@@ -509,13 +513,20 @@ fn parse_playlist(text: &str) -> Vec<SegmentMeta> {
 /// for one of those stale URIs during a playlist reload or decoder reset and
 /// stall even though the current encoder is healthy.
 ///
-/// Once pruning begins, the served view drops the deleted prefix, advances
-/// `MEDIA-SEQUENCE`, and removes the EVENT declaration (EVENT playlists are
-/// append-only by contract). The raw file and in-memory index stay complete.
-fn served_live_playlist(raw: Vec<u8>, first_retained: Option<i64>) -> Vec<u8> {
-    let Some(first_retained) = first_retained.filter(|index| *index > 0) else {
+/// The settings-gated experiment serves a typeless sliding shape from the
+/// first response, with an explicit zero start offset, so the same URL never
+/// mutates from EVENT to live semantics under AVPlayer. Otherwise the legacy
+/// shape changes only once pruning makes EVENT impossible to serve honestly.
+/// The raw file and in-memory index stay complete in both cases.
+fn served_live_playlist(
+    raw: Vec<u8>,
+    first_retained: Option<i64>,
+    typeless_sliding: bool,
+) -> Vec<u8> {
+    let first_retained = first_retained.filter(|index| *index > 0).unwrap_or(0);
+    if first_retained == 0 && !typeless_sliding {
         return raw;
-    };
+    }
     let Ok(text) = std::str::from_utf8(&raw) else {
         return raw;
     };
@@ -527,37 +538,46 @@ fn served_live_playlist(raw: Vec<u8>, first_retained: Option<i64>) -> Vec<u8> {
         return raw;
     };
 
-    // Start immediately after the prior segment URI. This retains any tags
-    // attached to the first surviving segment rather than assuming EXTINF is
-    // always the first line in its block.
-    let mut next_block = header_end;
-    let mut body_start = None;
-    for (position, line) in lines.iter().enumerate().skip(header_end) {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
+    let body_start = if first_retained == 0 {
+        header_end
+    } else {
+        // Start immediately after the prior segment URI. This retains any tags
+        // attached to the first surviving segment rather than assuming EXTINF
+        // is always the first line in its block.
+        let mut next_block = header_end;
+        let mut body_start = None;
+        for (position, line) in lines.iter().enumerate().skip(header_end) {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if segment_index(line) == Some(first_retained) {
+                body_start = Some(next_block);
+                break;
+            }
+            if segment_index(line).is_some() {
+                next_block = position + 1;
+            }
         }
-        if segment_index(line) == Some(first_retained) {
-            body_start = Some(next_block);
-            break;
-        }
-        if segment_index(line).is_some() {
-            next_block = position + 1;
-        }
-    }
-    let Some(body_start) = body_start else {
-        // The index was derived from this playlist, so disagreement means a
-        // concurrent truncate/restart. Let the next reload observe the rebuilt
-        // index instead of manufacturing a playlist from mismatched states.
-        return raw;
+        let Some(body_start) = body_start else {
+            // The index was derived from this playlist, so disagreement means
+            // a concurrent truncate/restart. Let the next reload observe the
+            // rebuilt index instead of manufacturing mismatched state.
+            return raw;
+        };
+        body_start
     };
 
     let mut out = String::with_capacity(text.len());
     let mut wrote_media_sequence = false;
+    let mut wrote_start = false;
     for line in &lines[..header_end] {
         let trimmed = line.trim();
         if trimmed == "#EXT-X-PLAYLIST-TYPE:EVENT" {
             continue;
+        }
+        if trimmed.starts_with("#EXT-X-START:") {
+            wrote_start = true;
         }
         if trimmed.starts_with("#EXT-X-MEDIA-SEQUENCE:") {
             out.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{first_retained}\n"));
@@ -569,6 +589,9 @@ fn served_live_playlist(raw: Vec<u8>, first_retained: Option<i64>) -> Vec<u8> {
     }
     if !wrote_media_sequence {
         out.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{first_retained}\n"));
+    }
+    if typeless_sliding && !wrote_start {
+        out.push_str("#EXT-X-START:TIME-OFFSET=0\n");
     }
     for line in &lines[body_start..] {
         out.push_str(line);
@@ -1197,6 +1220,9 @@ struct Session {
     /// rather than only the current boolean, exposes flapping after it has
     /// already resumed.
     suspend_count: AtomicU64,
+    /// Snapshot of the EVENT-to-typeless experiment at session creation. A
+    /// settings edit must never mutate one URL's playlist type mid-play.
+    typeless_sliding: bool,
     /// The first retained-prefix advance gets one operational log line. A
     /// playlist reload may observe that state hundreds of times; only the
     /// transition is evidence about the EVENT/sliding experiment.
@@ -2566,6 +2592,7 @@ impl TranscodeManager {
             delivery: Meter::new(),
             suspended: AtomicBool::new(false),
             suspend_count: AtomicU64::new(0),
+            typeless_sliding: false,
             first_slide_logged: AtomicBool::new(false),
         });
         self.sessions
@@ -3362,6 +3389,18 @@ impl TranscodeManager {
         }
     }
 
+    /// A feature switch stored in the ordinary settings table. Only the
+    /// literal value `1` enables an experiment; absent, malformed, and every
+    /// other value stay on the established path.
+    async fn bool_setting(&self, key: &str) -> bool {
+        self.store
+            .get_setting(key)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|value| value.trim() == "1")
+    }
+
     /// How an HLS session's input should be paced, given the admin settings
     /// and what this ffmpeg build supports. `for_copy` picks the pre-5.1
     /// degradation (see [`crate::ffmpeg::PacingCaps::resolve`]).
@@ -3735,6 +3774,7 @@ impl TranscodeManager {
             sw_permit.as_ref().map(|p| p.threads() as u32),
         );
         let pacing = self.pacing(false).await;
+        let typeless_sliding = self.bool_setting(keys::HLS_TYPELESS_SLIDING).await;
         let args = transcode::hls_args(&file, encoder, &opts, pacing, &dir.to_string_lossy());
         // Log the exact command — the single most useful diagnostic. It reveals
         // the decode/filter/encode pipeline actually used (e.g. whether heavy
@@ -3815,6 +3855,7 @@ impl TranscodeManager {
             delivery: Meter::new(),
             suspended: AtomicBool::new(false),
             suspend_count: AtomicU64::new(0),
+            typeless_sliding,
             first_slide_logged: AtomicBool::new(false),
         });
         self.sessions
@@ -4142,6 +4183,7 @@ impl TranscodeManager {
         // stream Safari played fine.
         let have_dovi = self.dv_strippable();
         let pacing = self.pacing(true).await;
+        let typeless_sliding = self.bool_setting(keys::HLS_TYPELESS_SLIDING).await;
         let legacy_args = || {
             transcode::hls_copy_args_with_dolby_vision(
                 &file,
@@ -4266,6 +4308,7 @@ impl TranscodeManager {
             delivery: Meter::new(),
             suspended: AtomicBool::new(false),
             suspend_count: AtomicU64::new(0),
+            typeless_sliding,
             first_slide_logged: AtomicBool::new(false),
         });
         self.sessions
@@ -4522,7 +4565,11 @@ impl TranscodeManager {
                             );
                         }
                     }
-                    return Some(served_live_playlist(bytes, first_retained));
+                    return Some(served_live_playlist(
+                        bytes,
+                        first_retained,
+                        session.typeless_sliding,
+                    ));
                 }
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -4812,7 +4859,7 @@ impl TranscodeManager {
     /// Background loop: kill and remove sessions idle beyond the timeout,
     /// prune played-past segments, and hold sessions that have run ahead.
     pub async fn reap_loop(self: Arc<Self>) {
-        let mut ticker = tokio::time::interval(Duration::from_secs(15));
+        let mut ticker = tokio::time::interval(FLOW_CONTROL_REPAIR_INTERVAL);
         loop {
             ticker.tick().await;
             let idle = Duration::from_secs(SESSION_IDLE_SECS);
@@ -5489,13 +5536,17 @@ mod tests {
                    #EXT-X-ENDLIST\n";
 
         assert_eq!(
-            served_live_playlist(raw.as_bytes().to_vec(), Some(0)),
+            served_live_playlist(raw.as_bytes().to_vec(), Some(0), false),
             raw.as_bytes(),
             "before pruning the client sees the writer's EVENT playlist unchanged"
         );
 
-        let served = String::from_utf8(served_live_playlist(raw.as_bytes().to_vec(), Some(2)))
-            .expect("playlist utf8");
+        let served = String::from_utf8(served_live_playlist(
+            raw.as_bytes().to_vec(),
+            Some(2),
+            false,
+        ))
+        .expect("playlist utf8");
         assert!(served.contains("#EXT-X-MEDIA-SEQUENCE:2"), "{served}");
         assert!(!served.contains("#EXT-X-PLAYLIST-TYPE:EVENT"), "{served}");
         assert!(!served.contains("seg00000.m4s"), "{served}");
@@ -5505,6 +5556,56 @@ mod tests {
             "tags attached to the first retained segment survive: {served}"
         );
         assert!(served.ends_with("seg00002.m4s\n#EXT-X-ENDLIST\n"));
+    }
+
+    /// The experiment's promise is not merely that EVENT disappears after a
+    /// prune; it is that one session URL presents the same typeless envelope
+    /// before and after that boundary. Only MEDIA-SEQUENCE and the retained
+    /// body are allowed to advance.
+    #[test]
+    fn typeless_sliding_playlist_keeps_one_shape_across_pruning() {
+        let raw = "#EXTM3U\n\
+                   #EXT-X-VERSION:7\n\
+                   #EXT-X-TARGETDURATION:10\n\
+                   #EXT-X-MEDIA-SEQUENCE:0\n\
+                   #EXT-X-PLAYLIST-TYPE:EVENT\n\
+                   #EXT-X-MAP:URI=\"init.mp4\"\n\
+                   #EXTINF:4.000,\n\
+                   seg00000.m4s\n\
+                   #EXTINF:4.000,\n\
+                   seg00001.m4s\n\
+                   #EXTINF:4.000,\n\
+                   seg00002.m4s\n";
+        let before =
+            String::from_utf8(served_live_playlist(raw.as_bytes().to_vec(), Some(0), true))
+                .expect("before utf8");
+        let after = String::from_utf8(served_live_playlist(raw.as_bytes().to_vec(), Some(2), true))
+            .expect("after utf8");
+
+        for playlist in [&before, &after] {
+            assert!(
+                !playlist.contains("#EXT-X-PLAYLIST-TYPE:EVENT"),
+                "{playlist}"
+            );
+            assert!(
+                playlist.contains("#EXT-X-START:TIME-OFFSET=0"),
+                "{playlist}"
+            );
+        }
+        let stable_headers = |playlist: &str| {
+            playlist
+                .lines()
+                .take_while(|line| !line.starts_with("#EXTINF:"))
+                .filter(|line| !line.starts_with("#EXT-X-MEDIA-SEQUENCE:"))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(stable_headers(&before), stable_headers(&after));
+        assert!(before.contains("#EXT-X-MEDIA-SEQUENCE:0"), "{before}");
+        assert!(after.contains("#EXT-X-MEDIA-SEQUENCE:2"), "{after}");
+        assert!(before.contains("seg00000.m4s"), "{before}");
+        assert!(!after.contains("seg00000.m4s"), "{after}");
+        assert!(after.contains("seg00002.m4s"), "{after}");
     }
 
     // ---- the append-oriented index (review §2.6) ----------------------------
@@ -5806,6 +5907,18 @@ mod tests {
         );
     }
 
+    /// A producer with no request-side evaluation can run until the repair
+    /// tick. Pin that gap at the shipped pace so a future cadence or pacing
+    /// change cannot quietly restore the observed +120-second overshoot.
+    #[test]
+    fn default_repair_cadence_bounds_time_overshoot() {
+        let overshoot =
+            (FLOW_CONTROL_REPAIR_INTERVAL.as_secs_f64() * HLS_READRATE_DEFAULT).ceil() as i64;
+        assert_eq!(FLOW_CONTROL_REPAIR_INTERVAL, Duration::from_secs(15));
+        assert_eq!(HLS_READRATE_DEFAULT, 2.0);
+        assert_eq!(overshoot, 30, "default worst-case overshoot in seconds");
+    }
+
     /// Four retention floors can sit above the old half-cap release line even
     /// after every client has fetched through the published frontier. Those
     /// bytes are real disk usage, so they still trigger the cap while running;
@@ -5969,6 +6082,7 @@ mod tests {
             delivery: Meter::new(),
             suspended: AtomicBool::new(false),
             suspend_count: AtomicU64::new(0),
+            typeless_sliding: false,
             first_slide_logged: AtomicBool::new(false),
         }
     }
@@ -6765,6 +6879,7 @@ mod tests {
             delivery: Meter::new(),
             suspended: AtomicBool::new(false),
             suspend_count: AtomicU64::new(0),
+            typeless_sliding: false,
             first_slide_logged: AtomicBool::new(false),
         })
     }

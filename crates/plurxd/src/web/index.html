@@ -7732,6 +7732,7 @@ function playbackPanel(settings){
         <div><label>Then pace at</label><select id="phr" style="width:auto;min-width:200px">${presetOpts([["1.5","1.5× — gentlest"],["2","2× — recommended"],["4","4×"],["0","Unlimited"]], settings.hls_readrate, v=>`${v}×`)}</select></div>
         <div><label>Buffer limit</label><select id="pha" style="width:auto;min-width:200px">${presetOpts([["60","1 minute"],["180","3 minutes — recommended"],["600","10 minutes"],["0","No limit — needs disk"]], settings.hls_ahead_max_secs, v=>`${v} seconds`)}</select></div>
       </div>
+      <label class="row" style="margin:16px 0 0;font-size:14px;color:var(--text)"><input type="checkbox" id="phs" ${settings.hls_typeless_sliding?'checked':''} style="width:auto;margin-right:9px"> Experimental typeless sliding HLS <span class="muted" style="font-size:12px;margin-left:6px">· applies to new sessions; use only for the iPad control comparison</span></label>
       <div class="err" id="perr"></div>
       <button style="margin-top:12px" onclick="savePlayback()">Save defaults</button></div>`;
 }
@@ -8003,7 +8004,8 @@ async function savePlayback(){
       stream_readrate:document.getElementById("prr").value,
       hls_readrate:document.getElementById("phr").value,
       hls_burst_secs:document.getElementById("phb").value,
-      hls_ahead_max_secs:document.getElementById("pha").value}});
+      hls_ahead_max_secs:document.getElementById("pha").value,
+      hls_typeless_sliding:document.getElementById("phs").checked}});
     toast("Playback defaults saved");
   }catch(e){ err.textContent=e.message; }
 }
