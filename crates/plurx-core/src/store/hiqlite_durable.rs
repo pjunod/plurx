@@ -1472,8 +1472,13 @@ impl OfflinePackageStore for HiqliteAuthStore {
         let now = self.now()?;
         let sql = "UPDATE offline_packages SET state = 'preparing', \
                      phase = 'waiting_for_encoder', updated_at = $1 \
-                 WHERE id = (SELECT id FROM offline_packages \
-                     WHERE node_id = $2 AND state = 'queued' ORDER BY created_at, id LIMIT 1) \
+                 WHERE id = (SELECT candidate.id FROM offline_packages candidate \
+                     WHERE candidate.node_id = $2 AND candidate.state = 'queued' \
+                     ORDER BY (SELECT COUNT(*) FROM offline_packages served \
+                               WHERE served.node_id = candidate.node_id \
+                                 AND served.user_id = candidate.user_id \
+                                 AND served.state != 'queued'), \
+                              candidate.created_at, candidate.id LIMIT 1) \
                    AND state = 'queued' \
                  RETURNING id, request_id, user_id, file_id, node_id, source_path, \
                     source_size, source_mtime, recipe_hash, target_height, audio_index, \

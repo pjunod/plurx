@@ -154,9 +154,19 @@ object OfflineDownloads {
     }
 
     fun resumePending(template: OfflineQueueRequest) {
-        catalog.profile(template.serverInstanceId, template.userId)
-            .filter { it.state in setOf("intent", "queued", "preparing", "ready", "paused") }
-            .forEach { record ->
+        val profile = catalog.profile(template.serverInstanceId, template.userId)
+        profile.forEach { record ->
+            // Media3 owns transfer progress across process death, but the API
+            // object that releases the server package is process-local. Bind
+            // every restored row to the now-authenticated profile before
+            // either resuming it or reflecting a completion that happened
+            // while the app was dead.
+            activeApis[record.id] = template.api
+            when {
+                record.needsServerCompletion -> scope.launch {
+                    completeServerPackage(record.id, template.api)
+                }
+                record.state in setOf("intent", "queued", "preparing", "ready", "paused") ->
                 scope.launch {
                     prepare(
                         record.id,
@@ -164,6 +174,7 @@ object OfflineDownloads {
                     )
                 }
             }
+        }
         manager.resumeDownloads()
         DownloadService.sendResumeDownloads(appContext, PlurxDownloadService::class.java, true)
     }
@@ -214,6 +225,7 @@ object OfflineDownloads {
             if (!preparationJobs.add(id)) return
         }
         try {
+            activeApis[id] = request.api
             var record = catalog.record(id) ?: return
             if (record.state == "paused" && manager.downloadIndex.getDownload(id) != null) {
                 manager.setStopReason(id, Download.STOP_REASON_NONE)
@@ -407,11 +419,20 @@ object OfflineDownloads {
             )
         }
         if (state == "completed") {
-            catalog.record(download.request.id)?.packageId?.let { packageId ->
-                activeApis.remove(download.request.id)?.let { api ->
-                    runCatching { api.completeOfflinePackage(packageId) }
-                }
-            }
+            completeServerPackage(download.request.id)
+        }
+    }
+
+    private suspend fun completeServerPackage(id: String, restoredApi: PlurxApi? = null) {
+        val record = catalog.record(id) ?: return
+        val packageId = record.packageId ?: return
+        val api = restoredApi ?: activeApis[id] ?: return
+        // Keep the binding when the foreground session is temporarily
+        // offline. A later Media3 reflection or foreground catch-up retries
+        // the idempotent completion call instead of pinning the package for
+        // its full seven-day lease.
+        if (runCatching { api.completeOfflinePackage(packageId) }.isSuccess) {
+            activeApis.remove(id, api)
         }
     }
 
@@ -432,6 +453,9 @@ object OfflineDownloads {
 
     const val SYSTEM_TIMEOUT_REASON = 10_001
 }
+
+internal val OfflineRecord.needsServerCompletion: Boolean
+    get() = state == "completed" && packageId != null
 
 internal fun offlineStreamKeys(hasSubtitle: Boolean): List<StreamKey> = buildList {
     add(StreamKey(HlsMultivariantPlaylist.GROUP_INDEX_VARIANT, 0))

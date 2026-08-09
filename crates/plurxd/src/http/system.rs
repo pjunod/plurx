@@ -1184,6 +1184,7 @@ pub struct Activity {
 
 #[derive(Clone, Serialize)]
 struct OfflineWork {
+    id: String,
     /// `prepare` or `send`; neither is a playback session.
     kind: &'static str,
     user: String,
@@ -1245,6 +1246,7 @@ async fn offline_work(state: &AppState) -> Result<Vec<OfflineWork>, ApiError> {
             None => "Unavailable media".to_owned(),
         };
         work.push(OfflineWork {
+            id: package.id.clone(),
             kind: if transfer_bytes.is_some() {
                 "send"
             } else {
@@ -1630,6 +1632,34 @@ pub async fn stop_session(
     if !stopped {
         return Err(ApiError::NotFound("session"));
     }
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// DELETE /api/v1/activity/offline/:id (admin) — cancel one visible package.
+pub async fn stop_offline_package(
+    _admin: AdminUser,
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let now = now_unix();
+    let package = state
+        .store
+        .offline_activity_packages(&state.node_id, now, now.saturating_sub(65), 50)
+        .await?
+        .into_iter()
+        .map(|row| row.package)
+        .find(|package| package.id == id)
+        .ok_or(ApiError::NotFound("offline package"))?;
+    state.offline.cancel(&id).await;
+    if !state
+        .store
+        .delete_offline_package(&id, package.user_id)
+        .await?
+    {
+        return Err(ApiError::NotFound("offline package"));
+    }
+    state.offline.record_cancellation(&package);
+    state.offline.forget_transfer(&id);
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 

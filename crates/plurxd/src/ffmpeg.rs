@@ -240,4 +240,20 @@ mod tests {
         assert_eq!(ancient.resolve(2.0, 90.0, true).args(), vec!["-re"]);
         assert!(ancient.resolve(2.0, 90.0, false).args().is_empty());
     }
+
+    #[tokio::test]
+    #[ignore = "nightly runner capability contract"]
+    async fn nightly_runner_has_ffmpeg_readrate() {
+        let caps = pacing_caps().await;
+        eprintln!(
+            "nightly ffmpeg capability: binary={} readrate={} initial_burst={}",
+            ffmpeg_bin(),
+            caps.readrate,
+            caps.initial_burst,
+        );
+        assert!(
+            caps.readrate,
+            "nightly arbitration coverage requires ffmpeg 5.1+ (-readrate)"
+        );
+    }
 }

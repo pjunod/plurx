@@ -7363,7 +7363,8 @@ async function renderActivityBody(){
     return `<tr>
       <td><b>${title}</b></td><td>${esc(ow.user)}</td>
       <td>${esc(phase)} <span class="muted">· ${ow.target_height}p</span></td>
-      <td>${progress}</td><td class="muted">${fmtAgo(ow.started_unix)}</td></tr>`;
+      <td>${progress}</td><td class="muted">${fmtAgo(ow.started_unix)}</td>
+      <td style="text-align:right">${ME&&ME.is_admin?`<button class="ghost sm" onclick="stopOfflinePackage(${esc(JSON.stringify(ow.id))})">Stop</button>`:''}</td></tr>`;
   }).join("");
   const m=document.getElementById("main"); if(!m) return;
   m.innerHTML=`
@@ -7375,7 +7376,7 @@ async function renderActivityBody(){
     ${produce}
     <h2 class="section">Offline downloads</h2>
     ${offline.length
-      ? `<table><thead><tr><th>Title</th><th>Profile</th><th>Work</th><th>Progress</th><th>Requested</th></tr></thead><tbody>${offlineRows}</tbody></table>`
+      ? `<table><thead><tr><th>Title</th><th>Profile</th><th>Work</th><th>Progress</th><th>Requested</th><th></th></tr></thead><tbody>${offlineRows}</tbody></table>`
       : `<div class="empty">No offline packages are being prepared or sent right now.</div>`}
     <h2 class="section">Library</h2>
     ${d.scans.length? `<table><tbody>${scans}</tbody></table>` : `<div class="empty">No libraries yet.</div>`}
@@ -7388,6 +7389,10 @@ async function stopSession(id){
 }
 async function stopProducer(){
   try{ const r=await api("/activity/producer",{method:"DELETE"}); toast(r.note||"Stopping"); renderActivityBody(); }
+  catch(e){ toast(e.message); }
+}
+async function stopOfflinePackage(id){
+  try{ await api(`/activity/offline/${id}`,{method:"DELETE"}); toast("Offline download stopped"); renderActivityBody(); }
   catch(e){ toast(e.message); }
 }
 

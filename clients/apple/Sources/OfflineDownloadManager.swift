@@ -526,10 +526,11 @@ final class OfflineDownloadManager: NSObject, ObservableObject {
         let priorWrite = taskLocationWrites[task.taskIdentifier]
         let write = Task { [weak self] in
             await priorWrite?.value
-            guard let self, var item = await self.catalog.item(id: id) else { return }
-            item.localAssetRelativePath = relative
-            item.updatedAt = Date()
-            try? await self.catalog.replace(item)
+            guard let self else { return }
+            _ = try? await self.catalog.update(id: id) { item in
+                item.localAssetRelativePath = relative
+                return true
+            }
         }
         taskLocations[task.taskIdentifier] = location
         taskLocationWrites[task.taskIdentifier] = write
@@ -553,14 +554,18 @@ extension OfflineDownloadManager: AVAssetDownloadDelegate {
         guard expected.isFinite, expected > 0 else { return }
         let fraction = min(1, max(0, loaded / expected))
         Task {
-            guard var item = await catalog.item(id: id) else { return }
-            item.state = .downloading
-            if let total = item.bytesTotal {
-                item.bytesDownloaded = Int64(Double(total) * fraction)
+            // A didLoad callback can be queued behind didComplete. Consult
+            // both the system task and the actor-owned terminal state before
+            // accepting it; either one is enough to prove this write is late.
+            guard assetDownloadTask.state == .running else { return }
+            let changed = try? await catalog.update(id: id) { item in
+                guard item.state == .downloading else { return false }
+                if let total = item.bytesTotal {
+                    item.bytesDownloaded = Int64(Double(total) * fraction)
+                }
+                return true
             }
-            item.updatedAt = Date()
-            try? await catalog.replace(item)
-            await refresh()
+            if changed != nil { await refresh() }
         }
     }
 
@@ -589,26 +594,31 @@ extension OfflineDownloadManager: AVAssetDownloadDelegate {
         stateLock.unlock()
         Task {
             await locationWrite?.value
-            guard var item = await catalog.item(id: id) else { return }
+            guard let snapshot = await catalog.item(id: id) else { return }
             if let error {
-                item.state = .paused
-                item.phase = "paused"
-                item.errorMessage = (error as NSError).code == NSURLErrorCancelled
-                    ? "Paused — tap Resume"
-                    : error.localizedDescription
                 let path = location.flatMap(OfflineCatalog.relativeLocalPath(for:))
-                    ?? item.localAssetRelativePath
+                    ?? snapshot.localAssetRelativePath
                 if let path {
                     try? FileManager.default.removeItem(at: OfflineCatalog.localURL(for: path))
+                }
+                _ = try? await catalog.update(id: id) { item in
+                    item.state = .paused
+                    item.phase = "paused"
+                    item.errorMessage = (error as NSError).code == NSURLErrorCancelled
+                        ? "Paused — tap Resume"
+                        : error.localizedDescription
                     item.localAssetRelativePath = nil
+                    return true
                 }
             } else {
                 let path = location.flatMap(OfflineCatalog.relativeLocalPath(for:))
-                    ?? item.localAssetRelativePath
+                    ?? snapshot.localAssetRelativePath
                 guard let path else {
-                    item.state = .failed
-                    item.errorMessage = "The completed download location was not saved."
-                    try? await catalog.replace(item)
+                    _ = try? await catalog.update(id: id) { item in
+                        item.state = .failed
+                        item.errorMessage = "The completed download location was not saved."
+                        return true
+                    }
                     await refresh()
                     return
                 }
@@ -616,7 +626,7 @@ extension OfflineDownloadManager: AVAssetDownloadDelegate {
                 let asset = AVURLAsset(url: localURL)
                 let duration = try? await asset.load(.duration)
                 let subtitleReady: Bool
-                if item.subtitleIndex != nil {
+                if snapshot.subtitleIndex != nil {
                     if let group = try? await asset.loadMediaSelectionGroup(for: .legible),
                        let cache = asset.assetCache {
                         subtitleReady = !cache.mediaSelectionOptions(in: group).isEmpty
@@ -629,11 +639,6 @@ extension OfflineDownloadManager: AVAssetDownloadDelegate {
                 if asset.assetCache?.isPlayableOffline == true,
                    let duration, duration.seconds.isFinite, duration.seconds > 0,
                    subtitleReady {
-                    item.localAssetRelativePath = path
-                    item.state = .downloaded
-                    item.phase = "downloaded"
-                    item.bytesDownloaded = item.bytesTotal ?? item.bytesDownloaded
-                    item.errorMessage = nil
                     let policy = AVMutableAssetDownloadStorageManagementPolicy()
                     policy.priority = .important
                     policy.expirationDate = Date().addingTimeInterval(10 * 365 * 24 * 60 * 60)
@@ -641,18 +646,27 @@ extension OfflineDownloadManager: AVAssetDownloadDelegate {
                         policy,
                         for: localURL
                     )
-                    if let package = item.packageId {
+                    let completed = try? await catalog.update(id: id) { item in
+                        item.localAssetRelativePath = path
+                        item.state = .downloaded
+                        item.phase = "downloaded"
+                        item.bytesDownloaded = item.bytesTotal ?? item.bytesDownloaded
+                        item.errorMessage = nil
+                        return true
+                    }
+                    if let package = completed?.packageId {
                         try? await PlurxAPI(origin: settings.origin).completeOfflinePackage(package)
                     }
                 } else {
                     try? FileManager.default.removeItem(at: localURL)
-                    item.localAssetRelativePath = nil
-                    item.state = .failed
-                    item.errorMessage = "The package is not complete enough for offline playback."
+                    _ = try? await catalog.update(id: id) { item in
+                        item.localAssetRelativePath = nil
+                        item.state = .failed
+                        item.errorMessage = "The package is not complete enough for offline playback."
+                        return true
+                    }
                 }
             }
-            item.updatedAt = Date()
-            try? await catalog.replace(item)
             await refresh()
         }
     }
