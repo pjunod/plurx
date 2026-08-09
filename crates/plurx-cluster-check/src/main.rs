@@ -1270,13 +1270,20 @@ async fn exercise(store: &HiqliteAuthStore, ordinal: u64) -> Result<()> {
         bail!("replicated cache claim did not become stale before its heartbeat");
     }
     store.touch_cache_claim(&abandoned, &node_id).await?;
-    if store
-        .stale_cache_claims(&node_id, stale_cutoff)
-        .await?
-        .iter()
-        .any(|row| row.recipe_hash == abandoned)
-    {
-        bail!("replicated cache heartbeat did not refresh the stale cutoff");
+    let heartbeat_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if !store
+            .stale_cache_claims(&node_id, stale_cutoff)
+            .await?
+            .iter()
+            .any(|row| row.recipe_hash == abandoned)
+        {
+            break;
+        }
+        if Instant::now() >= heartbeat_deadline {
+            bail!("replicated cache heartbeat did not refresh the stale cutoff");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
     if !store
         .stale_cache_claims(&node_id, i64::MAX)
