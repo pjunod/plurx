@@ -92,13 +92,13 @@
   <header>
     <h1>plurx — Project Status</h1>
     <div class="sub">Self-hosted media server in the old-Plex spirit · explicit ledger of done vs. planned ·
-      mirrors <code>docs/ROADMAP.md</code> + <code>docs/FEATURES.md</code> · 2026-08-08 · iOS player chrome source fix added; physical acceptance and publishing remain</div>
+      mirrors <code>docs/ROADMAP.md</code> + <code>docs/FEATURES.md</code> · 2026-08-08 · Apple natural-end teardown and HLS hold diagnostics added; physical acceptance and publishing remain</div>
   </header>
 
   <div class="tiles">
     <div class="tile"><div class="v">v0.2.7</div><div class="l">current source · release/deploy evidence pending</div></div>
     <div class="tile"><div class="v">0–3 ✓</div><div class="l">core phases + 2 slices complete</div></div>
-    <div class="tile"><div class="v">3 viewers</div><div class="l">web ✓ · Android ✓ · Apple build 36 source, not yet uploaded</div></div>
+    <div class="tile"><div class="v">3 viewers</div><div class="l">web ✓ · Android ✓ · Apple build 37 source, not yet uploaded</div></div>
     <div class="tile"><div class="v">M2–M3 ✓</div><div class="l">GPU tone-map + pre-cache done · M4 clustering next</div></div>
   </div>
 
@@ -175,7 +175,7 @@
     <div class="meter"><div class="track"><div class="fill" style="width:83%"></div></div><div class="n">M0–M3 + segmenter complete · M4 waits on clustering</div></div>
     <details open><summary>Items</summary>
       <ul class="items">
-        <li class="done-item"><span class="m done">✓ done</span><span class="t">M0 telemetry (encode speed, TTFF/stall beacons, session status), burst-then-hold pacing, ahead-window suspend, progress-aware watchdog <span style="color:var(--muted)">(2026-07-28)</span></span></li>
+        <li class="done-item"><span class="m done">✓ done</span><span class="t">M0 telemetry (encode speed, TTFF/stall beacons, session status), burst-then-hold pacing, ahead-window suspend, progress-aware watchdog; held sessions now name the active time, per-session byte, or global scratch reason and its release value <span style="color:var(--muted)">(updated 2026-08-08)</span></span></li>
         <li class="done-item"><span class="m done">✓ done</span><span class="t">M1: fixture-matrix benchmark, 2-s segments, bounded rate control on every encoder family, Auto = min(source, 1080) on hardware; measured: CPU tone-map costs ¼ of pipeline throughput at 4K</span></li>
         <li class="done-item"><span class="m done">✓ done</span><span class="t">GOP-aware segmenter BUILT (M0–M6, 2026-07-30): plurx cuts the copy path's own segments at clean cuts — the one-drop-per-boundary residual is now bounded by source density (<code>scripts/gop-census</code> measures it); DV P7 signaling fix CONFIRMED (VideoToolbox flipped software → hardware)</span></li>
         <li class="done-item"><span class="m done">✓ done</span><span class="t">M2 GPU tone-map: candidate graphs, real-HDR boot probe, routing and downgrade, bounded hardware/software admission; accepted on nynuc at 4.89× the CPU chain</span></li>
@@ -192,7 +192,7 @@
     <details open><summary>Items</summary>
       <ul class="items">
         <li class="done-item"><span class="m done">✓ done</span><span class="t">Android/Google TV (Kotlin/Media3): the web viewer surface natively — rails, grid, search, detail, delivery-plan playback, track/quality menus, markers, autoplay, per-file A/V sync, stats panel</span></li>
-        <li class="done-item"><span class="m done">✓ source + DV device</span><span class="t">Apple iOS/tvOS (Swift/AVPlayer): cinematic details, native text subtitles, staged default-off PGS overlays, truthful delivered-range badges, stable seeking/recovery, offline phone/tablet downloads, and full-screen iOS status-bar/Home-indicator retirement after the last player overlay leaves. Copied Dolby Vision was resolved on physical Apple TV 2026-08-03; iOS chrome and the broader hardware matrix remain acceptance tasks.</span></li>
+        <li class="done-item"><span class="m done">✓ source + DV device</span><span class="t">Apple iOS/tvOS (Swift/AVPlayer): cinematic details, native text subtitles, staged default-off PGS overlays, truthful delivered-range badges, stable seeking/recovery, offline phone/tablet downloads, natural-end dismissal through one teardown path, and full-screen iOS status-bar/Home-indicator retirement after the last player overlay leaves. Unknown-duration playlist ends reopen instead of ejecting the viewer. Copied Dolby Vision was resolved on physical Apple TV 2026-08-03; end-of-playback, iOS chrome, PiP/audio handoff, and the broader hardware matrix remain acceptance tasks.</span></li>
         <li class="done-item"><span class="m done">✓ source</span><span class="t">Clients remediation plan: every milestone landed, including Android native subtitles, capability/quality fixes, Apple intent/session safety, lifecycle hardening, and cross-client regression coverage. Device verification remains separate from source completeness.</span></li>
         <li class="done-item"><span class="m done">✓ done</span><span class="t">Media badges: server, web, Android, and Apple distinguish source from delivered HDR and Dolby Vision; optional detail-screen capability dimming remains polish</span></li>
         <li><span class="m todo">○ todo</span><span class="t">Tizen + webOS ports of the web core</span></li>
@@ -266,15 +266,15 @@
     <ul class="items">
       <li class="done-item"><span class="m done">✓ measured</span><span class="t">Perf M2 acceptance ran on nynuc: QSV tone-map measured 4.89× the CPU chain and the bitrate bound held</span></li>
       <li><span class="m you">👤 Paul</span><span class="t">Exercise the two default-off HLS master-ladder rungs separately — <code>PLURX_HLS_CLOSED_CAPTIONS_NONE</code> and <code>PLURX_HLS_FORCED_AUTOSELECT</code> — one per deploy, observed on a physical device</span></li>
-      <li><span class="m you">👤 Paul</span><span class="t">Publish the current server release to the node fleet and upload Apple build 36 to TestFlight; repository evidence still records the fleet at <code>787eaa6</code> and the Apple client as not uploaded</span></li>
-      <li><span class="m you">👤 device</span><span class="t">On Apple build 36, record the player-chrome matrix: iPad full-screen and Split View; iPhone portrait and landscape; playback info, failure, notice, pause, and PiP return. Confirm the status bar and Home indicator follow the documented policy without moving visible overlays, and record whether iPad multitasking/window controls can be retired before making that claim.</span></li>
+      <li><span class="m you">👤 Paul</span><span class="t">Publish the current server release to the node fleet and upload Apple build 37 to TestFlight; repository evidence still records the fleet at <code>787eaa6</code> and the Apple client as not uploaded</span></li>
+      <li><span class="m you">👤 device</span><span class="t">On Apple build 37, record the player-chrome and natural-end matrix: iPad full-screen and Split View; iPhone portrait and landscape; playback info, failure, notice, pause, PiP return, autoplay on/off, unknown catalog duration, background audio handoff, and tvOS focus after dismissal. Confirm the status bar and Home indicator follow the documented policy without moving visible overlays, and record whether iPad multitasking/window controls can be retired before making that claim.</span></li>
       <li><span class="m you">👤 Paul</span><span class="t">Run the offline-viewing physical matrix on iPhone/iPad and Android: background/process-death recovery, airplane-mode start and midpoint seek, selected subtitle, and removal reconciliation</span></li>
       <li><span class="m you">👤 Paul</span><span class="t">Run the broader Apple/Android release matrix on current builds; simulator and source gates cannot prove HDMI, hardware decode, HDR output, or D-pad/Siri Remote behavior</span></li>
     </ul>
   </section>
 
   <footer>
-    Authoritative copies: <code>docs/ROADMAP.md</code> · <code>docs/FEATURES.md</code> · <code>CHANGELOG.md</code> · <code>docs/CLUSTERING-PLAN.md</code> · reviewed against <code>main</code> @ <code>d25905ae</code> plus the iOS player-chrome source fix · page refreshed 2026-08-08
+    Authoritative copies: <code>docs/ROADMAP.md</code> · <code>docs/FEATURES.md</code> · <code>CHANGELOG.md</code> · <code>docs/CLUSTERING-PLAN.md</code> · reviewed against <code>origin/main</code> @ <code>5c6bfe5</code> plus the PR #91 review response · page refreshed 2026-08-08
   </footer>
 </div>
 </body>

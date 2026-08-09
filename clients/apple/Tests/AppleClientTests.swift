@@ -2529,6 +2529,13 @@ final class AppleClientTests: XCTestCase {
             changingStream: false,
             optionMenuOpen: false
         ))
+        XCTAssertFalse(PlayerView.shouldAutoHideControls(
+            visible: true,
+            scrubbing: false,
+            changingStream: false,
+            optionMenuOpen: false,
+            tearingDown: true
+        ))
     }
 
     func testPlaybackInfoStaysVisibleAfterControlsAutoHide() {
@@ -2539,6 +2546,129 @@ final class AppleClientTests: XCTestCase {
 
         XCTAssertFalse(visible.controls)
         XCTAssertTrue(visible.playbackInfo)
+    }
+
+    func testNaturalPlaybackEndDismissesUnlessOnlineAutoplayCanLookForNext() {
+        XCTAssertNil(PlayerView.naturalEndAction(
+            finished: false,
+            autoplay: false,
+            offline: false
+        ))
+        XCTAssertEqual(PlayerView.naturalEndAction(
+            finished: true,
+            autoplay: false,
+            offline: false
+        ), .dismiss)
+        XCTAssertEqual(PlayerView.naturalEndAction(
+            finished: true,
+            autoplay: true,
+            offline: true
+        ), .dismiss)
+        XCTAssertEqual(PlayerView.naturalEndAction(
+            finished: true,
+            autoplay: true,
+            offline: false
+        ), .findNext)
+    }
+
+    func testUnknownDurationEndReopensUntilAnEndIsCorroborated() {
+        XCTAssertEqual(PlayerController.endAction(
+            knownDurationMs: 0,
+            itemDurationMs: nil,
+            isGrowingPlaylist: true,
+            endedAt: 120_000
+        ), .reopen)
+        XCTAssertEqual(PlayerController.endAction(
+            knownDurationMs: 180_000,
+            itemDurationMs: nil,
+            isGrowingPlaylist: true,
+            endedAt: 120_000
+        ), .reopen)
+        XCTAssertEqual(PlayerController.endAction(
+            knownDurationMs: 0,
+            itemDurationMs: 180_000,
+            isGrowingPlaylist: true,
+            endedAt: 178_000
+        ), .reopen)
+        XCTAssertEqual(PlayerController.endAction(
+            knownDurationMs: 0,
+            itemDurationMs: 180_000,
+            isGrowingPlaylist: false,
+            endedAt: 178_000
+        ), .finish(durationMs: 180_000))
+        XCTAssertEqual(PlayerController.endAction(
+            knownDurationMs: 180_000,
+            itemDurationMs: nil,
+            isGrowingPlaylist: true,
+            endedAt: 178_000
+        ), .finish(durationMs: 180_000))
+    }
+
+    @MainActor
+    func testNaturalEndActionRoutesDismissAndAutoplay() {
+        var events: [String] = []
+        PlayerNaturalEndAction.dismiss.perform(
+            dismiss: { events.append("dismiss") },
+            findNext: { events.append("next") }
+        )
+        PlayerNaturalEndAction.findNext.perform(
+            dismiss: { events.append("dismiss") },
+            findNext: { events.append("next") }
+        )
+        XCTAssertEqual(events, ["dismiss", "next"])
+    }
+
+    @MainActor
+    func testPlayerFinishTearsDownBeforeDismissAndIsIdempotent() async {
+        let lifecycle = PlayerLifecycleCoordinator()
+        var events: [String] = []
+        let dismissed = expectation(description: "dismissed after teardown")
+
+        lifecycle.finish(
+            teardown: { events.append("teardown") },
+            completion: {
+                events.append("dismiss")
+                dismissed.fulfill()
+            }
+        )
+
+        XCTAssertTrue(lifecycle.isTearingDown)
+        XCTAssertEqual(events, ["teardown"])
+        await fulfillment(of: [dismissed], timeout: 1)
+        XCTAssertEqual(events, ["teardown", "dismiss"])
+
+        lifecycle.finish(
+            teardown: { events.append("duplicate teardown") },
+            completion: { events.append("duplicate dismiss") }
+        )
+        lifecycle.teardown { events.append("disappear teardown") }
+        XCTAssertEqual(events, ["teardown", "dismiss"])
+    }
+
+    @MainActor
+    func testPlayerFinishCompletionSurvivesCoordinatorRelease() async {
+        var lifecycle: PlayerLifecycleCoordinator? = PlayerLifecycleCoordinator()
+        let completed = expectation(description: "completion survives owner release")
+        lifecycle?.finish(teardown: {}, completion: { completed.fulfill() })
+        lifecycle = nil
+        await fulfillment(of: [completed], timeout: 1)
+    }
+
+    @MainActor
+    func testPlayerStopReleasesTheCurrentItemEvenWhenRepeated() {
+        let controller = PlayerController()
+        let item = AVPlayerItem(url: URL(fileURLWithPath: "/dev/null"))
+        controller.player.replaceCurrentItem(with: item)
+        controller.showPlaybackNotice("Closing")
+
+        controller.stop()
+
+        XCTAssertNil(controller.player.currentItem)
+        XCTAssertNil(controller.playbackNotice)
+        XCTAssertFalse(controller.isPlaying)
+
+        controller.stop()
+        XCTAssertNil(controller.player.currentItem)
     }
 
     #if os(iOS)
@@ -2562,6 +2692,14 @@ final class AppleClientTests: XCTestCase {
         )
         XCTAssertTrue(idle.statusBarHidden)
         XCTAssertEqual(idle.persistentOverlays, .hidden)
+
+        XCTAssertFalse(
+            PlayerSystemOverlayPreferences.restoredAfterPlayback.statusBarHidden
+        )
+        XCTAssertEqual(
+            PlayerSystemOverlayPreferences.restoredAfterPlayback.persistentOverlays,
+            .automatic
+        )
     }
 
     @MainActor

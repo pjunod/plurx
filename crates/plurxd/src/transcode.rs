@@ -592,29 +592,41 @@ struct AheadLimits {
     global_max_bytes: i64,
 }
 
+/// The active bound keeping an ahead-window session held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AheadHoldReason {
+    Time,
+    Bytes,
+    Global,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AheadHold {
+    reason: AheadHoldReason,
+    release_value: i64,
+}
+
 /// Whether a session should be held, given how far ahead it is, how much
 /// scratch every session is using between them, and whether it is already
 /// held.
 ///
 /// Any single limit is enough to suspend; resuming needs all of them below
 /// their release thresholds. Byte budgets release at half because they are
-/// hard disk bounds. Media time releases 30 seconds below its ceiling (never
-/// below half): a physical iPad stopped fetching with about 95 seconds still
-/// buffered, leaving the held producer 138 seconds ahead. Releasing there
-/// grants one more production burst instead of waiting for the client to fetch
-/// down to the old 90-second threshold. If the client still does not fetch,
-/// the producer can cross 150 seconds and become held again; the client's
-/// same-delivery reopen remains the terminal recovery path.
+/// hard disk bounds. Media time keeps a 30-second gap from its ceiling (never
+/// below half) so a fast encoder does not SIGSTOP/SIGCONT for every client
+/// segment near the boundary. A one-second ceiling still releases at one
+/// second rather than accidentally disabling itself at zero.
 fn time_release_threshold(limit: i64) -> Option<i64> {
-    (limit > 0).then(|| limit.saturating_sub(30).max(limit / 2))
+    (limit > 0).then(|| limit.saturating_sub(30).max(limit / 2).max(1))
 }
 
-fn should_suspend(
+fn ahead_hold(
     ahead: Ahead,
     global_bytes: i64,
     limits: AheadLimits,
     currently_suspended: bool,
-) -> bool {
+) -> Option<AheadHold> {
     let half = |limit: i64| limit / 2;
     let time_limit = if currently_suspended {
         time_release_threshold(limits.max_secs).unwrap_or(limits.max_secs)
@@ -629,9 +641,37 @@ fn should_suspend(
         }
     };
     let over = |value: i64, limit: i64| limit > 0 && value > limit;
-    over(ahead.seconds, time_limit)
-        || over(ahead.bytes, byte_limit(limits.max_bytes))
-        || over(global_bytes, byte_limit(limits.global_max_bytes))
+
+    // Capacity holds take precedence in telemetry because they cannot be
+    // cleared merely by crossing the media-time release point.
+    let global_limit = byte_limit(limits.global_max_bytes);
+    if over(global_bytes, global_limit) {
+        return Some(AheadHold {
+            reason: AheadHoldReason::Global,
+            release_value: global_limit,
+        });
+    }
+    let session_byte_limit = byte_limit(limits.max_bytes);
+    if over(ahead.bytes, session_byte_limit) {
+        return Some(AheadHold {
+            reason: AheadHoldReason::Bytes,
+            release_value: session_byte_limit,
+        });
+    }
+    over(ahead.seconds, time_limit).then_some(AheadHold {
+        reason: AheadHoldReason::Time,
+        release_value: time_limit,
+    })
+}
+
+#[cfg(test)]
+fn should_suspend(
+    ahead: Ahead,
+    global_bytes: i64,
+    limits: AheadLimits,
+    currently_suspended: bool,
+) -> bool {
+    ahead_hold(ahead, global_bytes, limits, currently_suspended).is_some()
 }
 
 /// Apply one `key=value` line of ffmpeg's `-progress` output.
@@ -1256,8 +1296,19 @@ impl Session {
 }
 
 /// One live session as the activity page and the stats overlay see it.
-async fn session_info(id: &str, s: &Session, resume_below_seconds: Option<i64>) -> SessionInfo {
+async fn session_info(
+    id: &str,
+    s: &Session,
+    limits: AheadLimits,
+    global_bytes: i64,
+) -> SessionInfo {
     let ahead = s.ahead().await;
+    let suspended = s.suspended.load(Relaxed);
+    let hold = if suspended {
+        ahead.and_then(|ahead| ahead_hold(ahead, global_bytes, limits, true))
+    } else {
+        None
+    };
     SessionInfo {
         id: id.to_owned(),
         file_id: s.file_id,
@@ -1272,12 +1323,18 @@ async fn session_info(id: &str, s: &Session, resume_below_seconds: Option<i64>) 
         recent_speed: s.progress.recent_speed(),
         out_time_ms: s.progress.out_time_ms(),
         ahead_seconds: ahead.map(|a| a.seconds),
-        resume_below_seconds,
+        hold_reason: hold.map(|hold| hold.reason),
+        resume_below_seconds: hold
+            .filter(|hold| hold.reason == AheadHoldReason::Time)
+            .map(|hold| hold.release_value),
+        resume_below_bytes: hold
+            .filter(|hold| hold.reason != AheadHoldReason::Time)
+            .map(|hold| hold.release_value),
         ahead_bytes: ahead.map(|a| a.bytes),
         delivered_bytes: s.delivery.total_bytes(),
         delivered_bps: s.delivery.recent_bps().map(|b| b * 8),
         delivered_idle_ms: s.delivery.idle_for_ms(),
-        suspended: s.suspended.load(Relaxed),
+        suspended,
     }
 }
 
@@ -1571,9 +1628,14 @@ pub struct SessionInfo {
     /// hiccup gets to spend. Not measured from the playhead: the client has
     /// usually fetched further than it is showing.
     pub ahead_seconds: Option<i64>,
-    /// A held session remains held while `ahead_seconds` is above this value.
-    /// `None` means the time window is disabled; byte limits may still hold it.
+    /// The active limit keeping this session held. Capacity reasons take
+    /// precedence when more than one limit is above its release point.
+    pub hold_reason: Option<AheadHoldReason>,
+    /// Present only for a time-held session.
     pub resume_below_seconds: Option<i64>,
+    /// Present only for a per-session or global byte hold. For `global`, this
+    /// is the release point for total live scratch across every session.
+    pub resume_below_bytes: Option<i64>,
     /// The same reserve in bytes, which is what actually bounds the disk.
     pub ahead_bytes: Option<i64>,
     /// Segment bytes handed to this client since the session opened.
@@ -4286,11 +4348,12 @@ impl TranscodeManager {
     /// would relabel a stream mid-play. The method is fixed when the session
     /// is created and never moves.
     pub async fn list_deliveries(&self) -> Vec<(SessionInfo, crate::delivery::Method)> {
-        let resume_below_seconds = time_release_threshold(self.ahead_limits().await.max_secs);
+        let limits = self.ahead_limits().await;
+        let global_bytes = self.global_live_bytes().await;
         let sessions = self.sessions.lock().await;
         let mut out = Vec::with_capacity(sessions.len());
         for (id, s) in sessions.iter() {
-            out.push((session_info(id, s, resume_below_seconds).await, s.method));
+            out.push((session_info(id, s, limits, global_bytes).await, s.method));
         }
         out.sort_by_key(|(s, _)| s.started_unix);
         out
@@ -4302,8 +4365,9 @@ impl TranscodeManager {
     /// alive past the idle reaper.
     pub async fn session_status(&self, session_id: &str) -> Option<SessionInfo> {
         let session = self.sessions.lock().await.get(session_id).cloned()?;
-        let resume_below_seconds = time_release_threshold(self.ahead_limits().await.max_secs);
-        Some(session_info(session_id, &session, resume_below_seconds).await)
+        let limits = self.ahead_limits().await;
+        let global_bytes = self.global_live_bytes().await;
+        Some(session_info(session_id, &session, limits, global_bytes).await)
     }
 
     /// End one session now. True if it existed.
@@ -4509,14 +4573,15 @@ impl TranscodeManager {
     /// just-in-time server uses, and unlike a rate limit it adapts to a viewer
     /// who pauses.
     ///
-    /// Hysteresis is deliberate: media time resumes 30 seconds below the
-    /// window, while byte limits resume at half. One threshold would toggle a
-    /// session on every tick; the larger release point gives a held iPad
-    /// session one more production burst at its observed no-fetch waterline.
-    /// The producer can be held again if the client remains stopped. SIGKILL
-    /// still works on a stopped process, so the idle reaper and the admin stop
-    /// button need no special case; a suspended session that nobody comes back
-    /// to is reaped on idle like any other.
+    /// Media time resumes 30 seconds below the ceiling (never below half), and
+    /// byte limits resume at half. The gap prevents a fast producer from
+    /// toggling once per segment near the boundary. This is not a structural
+    /// escape for a client that stops fetching: that client may leave the
+    /// producer held while already-published media remains available. The
+    /// `want_suspend == suspended` guard is load-bearing too: repeated polls
+    /// cannot re-signal the child or reset the watchdog's motion clock.
+    /// SIGKILL still works on a stopped process, so idle/admin cleanup needs no
+    /// special case.
     async fn apply_ahead_window(
         &self,
         session: &Session,
@@ -4528,7 +4593,8 @@ impl TranscodeManager {
             return; // nothing published yet — nothing to hold
         };
         let suspended = session.suspended.load(Relaxed);
-        let want_suspend = should_suspend(ahead, global_bytes, limits, suspended);
+        let hold = ahead_hold(ahead, global_bytes, limits, suspended);
+        let want_suspend = hold.is_some();
         if want_suspend == suspended {
             return;
         }
@@ -4561,6 +4627,8 @@ impl TranscodeManager {
         if want_suspend {
             tracing::debug!(
                 session = %session_id,
+                hold_reason = ?hold.map(|hold| hold.reason),
+                release_value = hold.map(|hold| hold.release_value),
                 ahead_seconds = ahead.seconds, ahead_bytes = ahead.bytes,
                 global_bytes, max_secs = limits.max_secs, max_bytes = limits.max_bytes,
                 "suspending transcode: far enough ahead of the client"
@@ -4626,8 +4694,8 @@ impl TranscodeManager {
             .sum()
     }
 
-    /// Re-evaluate one session after something changed for it: a segment
-    /// completed, or the client's frontier advanced.
+    /// Re-evaluate one session after a client request refreshes the published
+    /// index or advances the download frontier.
     ///
     /// The reaper still sweeps every 15 seconds, but as a repair loop. A
     /// window that is only checked on a 15-second tick is not a flow
@@ -4686,9 +4754,9 @@ impl TranscodeManager {
                     self.admissions.record(&class, speed);
                 }
             }
-            // Repair pass. Flow control proper runs on segment completion and
-            // frontier advance; this catches a session nobody is currently
-            // fetching from, and prunes what has fallen out of retention.
+            // Repair pass. Client requests run flow control on playlist/index
+            // refresh and frontier advance; this catches a producer that no
+            // client is currently requesting from, and prunes retention.
             for (_id, session) in &live {
                 session.refresh_segments().await;
                 gc_expired_segments(session).await;
@@ -5211,11 +5279,9 @@ mod tests {
         // Let the idle clock advance, then poll status several times.
         tokio::time::sleep(Duration::from_millis(300)).await;
         let before = mgr.session_status(&info.session_id).await.expect("status");
-        assert_eq!(
-            before.resume_below_seconds,
-            Some(150),
-            "status exposes the release threshold needed to diagnose a held session"
-        );
+        assert_eq!(before.hold_reason, None, "a running session is not held");
+        assert_eq!(before.resume_below_seconds, None);
+        assert_eq!(before.resume_below_bytes, None);
         let before = before.idle_seconds;
         for _ in 0..5 {
             assert!(mgr.session_status(&info.session_id).await.is_some());
@@ -5564,6 +5630,7 @@ mod tests {
         };
         assert_eq!(time_release_threshold(180), Some(150));
         assert_eq!(time_release_threshold(60), Some(30));
+        assert_eq!(time_release_threshold(1), Some(1));
         assert_eq!(time_release_threshold(0), None);
         // Running: hold once past any single window.
         assert!(!should_suspend(secs(179), 0, limits, false));
@@ -5573,16 +5640,14 @@ mod tests {
         // — several healthy 4K streams fill a disk between them.
         assert!(should_suspend(secs(10), 8_001, limits, false));
 
-        // Held: time keeps a 30s gap from the ceiling. The physical iPad
-        // stopped fetching while the producer was 138s ahead, so release there
-        // grants one additional production burst instead of waiting for the
-        // old half-window (90s) threshold.
+        // Held: time keeps its 30-second release gap so a fast encoder does
+        // not toggle once per client segment near the ceiling.
         assert!(should_suspend(secs(151), 0, limits, true));
         assert!(!should_suspend(secs(150), 0, limits, true));
         assert!(!should_suspend(secs(138), 0, limits, true));
         assert!(
             should_suspend(secs(186), 0, limits, true),
-            "without another client fetch, the producer can hit the ceiling and hold again"
+            "without a client fetch, the producer can remain held"
         );
         // Byte budgets remain hard disk bounds and release only at half.
         assert!(should_suspend(secs(10), 4_001, limits, true));
@@ -5606,6 +5671,28 @@ mod tests {
         };
         assert!(!should_suspend(secs(10_000), 1 << 40, off, false));
         assert!(!should_suspend(secs(10_000), 1 << 40, off, true));
+
+        assert_eq!(
+            ahead_hold(secs(151), 0, limits, true),
+            Some(AheadHold {
+                reason: AheadHoldReason::Time,
+                release_value: 150,
+            })
+        );
+        assert_eq!(
+            ahead_hold(bytes(1_001), 0, limits, true),
+            Some(AheadHold {
+                reason: AheadHoldReason::Bytes,
+                release_value: 1_000,
+            })
+        );
+        assert_eq!(
+            ahead_hold(secs(10), 4_001, limits, true),
+            Some(AheadHold {
+                reason: AheadHoldReason::Global,
+                release_value: 4_000,
+            })
+        );
     }
 
     #[test]
@@ -5749,6 +5836,45 @@ mod tests {
         tokio::fs::write(dir.join("index.m3u8"), playlist)
             .await
             .expect("write playlist");
+    }
+
+    /// Re-evaluating an unchanged running session must be a no-op. Without the
+    /// state guard, a healthy playlist poll sends SIGCONT and touches the
+    /// motion clock, which prevents the stall watchdog from ever firing.
+    #[tokio::test]
+    async fn unchanged_flow_control_state_does_not_touch_the_motion_clock() {
+        use plurx_core::store::SqliteStore;
+        let dir = tempfile::tempdir().expect("tempdir");
+        seeded_session_dir(dir.path(), 1, 4.0).await;
+        let session = test_session(dir.path().to_path_buf());
+        session.refresh_segments().await;
+        session.progress.moved_at_ms.store(-10_000, Relaxed);
+        let before = session.progress.stalled_for();
+
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let mgr = TranscodeManager::new(
+            store,
+            dir.path().join("manager-work"),
+            EncoderCaps::default(),
+            Pipeline::Cpu,
+        );
+        mgr.apply_ahead_window(
+            &session,
+            "unchanged-running",
+            AheadLimits {
+                max_secs: 180,
+                max_bytes: 2_000_000_000,
+                global_max_bytes: 8_000_000_000,
+            },
+            0,
+        )
+        .await;
+
+        assert!(!session.suspended.load(Relaxed));
+        assert!(
+            session.progress.stalled_for() >= before,
+            "an unchanged flow-control evaluation must not reset motion"
+        );
     }
 
     /// Retention is measured back from the DOWNLOAD frontier and must leave a
@@ -5927,7 +6053,7 @@ mod tests {
     /// SIGSTOP sent to the wrong pid — because every one of those looks
     /// perfectly healthy from the outside.
     #[tokio::test]
-    async fn a_running_session_reports_progress_and_answers_to_signals() {
+    async fn a_client_fetch_releases_a_held_session_and_restarts_progress() {
         super::require_ffmpeg();
         use plurx_core::store::SqliteStore;
         let media = tempfile::tempdir().expect("media dir");
@@ -5950,6 +6076,18 @@ mod tests {
         store.put_setting(keys::HLS_READRATE, "1").await.expect("s");
         store
             .put_setting(keys::HLS_BURST_SECS, "20")
+            .await
+            .expect("s");
+        store
+            .put_setting(keys::HLS_AHEAD_MAX_SECS, "1")
+            .await
+            .expect("s");
+        store
+            .put_setting(keys::HLS_AHEAD_MAX_BYTES, "0")
+            .await
+            .expect("s");
+        store
+            .put_setting(keys::HLS_SCRATCH_MAX_BYTES, "0")
             .await
             .expect("s");
 
@@ -6009,19 +6147,12 @@ mod tests {
         // A window it has already exceeded suspends it, and a suspended
         // encoder stops advancing — which is the property the watchdog relies
         // on being able to tell apart from a wedge.
-        let hold = AheadLimits {
-            max_secs: 1,
-            max_bytes: 1,
-            global_max_bytes: 0,
-        };
-        let release = AheadLimits {
-            max_secs: 0,
-            max_bytes: 0,
-            global_max_bytes: 0,
-        };
-        mgr.apply_ahead_window(&session, &info.session_id, hold, 0)
-            .await;
+        mgr.flow_control(&session, &info.session_id).await;
         assert!(session.suspended.load(Relaxed), "session was held");
+        let status = mgr.session_status(&info.session_id).await.expect("status");
+        assert_eq!(status.hold_reason, Some(AheadHoldReason::Time));
+        assert_eq!(status.resume_below_seconds, Some(1));
+        assert_eq!(status.resume_below_bytes, None);
         let frozen = session.progress.out_time_ms();
         tokio::time::sleep(Duration::from_millis(1200)).await;
         assert_eq!(
@@ -6030,10 +6161,19 @@ mod tests {
             "a suspended encoder produces nothing"
         );
 
-        // Disabling the window resumes it — and it really resumes, rather than
-        // just having a flag cleared.
-        mgr.apply_ahead_window(&session, &info.session_id, release, 0)
-            .await;
+        // Fetch the newest published segment through the real request path.
+        // That advances the download frontier, re-evaluates the same configured
+        // limit, sends SIGCONT, and restarts actual encoder progress.
+        let newest = session
+            .segments
+            .lock()
+            .await
+            .segs
+            .last()
+            .expect("published segment")
+            .name
+            .clone();
+        assert!(mgr.segment(&info.session_id, &newest).await.is_some());
         assert!(!session.suspended.load(Relaxed), "session was released");
         let moved = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
@@ -6049,8 +6189,29 @@ mod tests {
 
         // A suspended child still dies on request — SIGKILL does not need the
         // process to be scheduled, which is what makes the reaper safe.
-        mgr.apply_ahead_window(&session, &info.session_id, hold, 0)
-            .await;
+        let republished = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                session.refresh_segments().await;
+                if session.ahead().await.is_some_and(|ahead| ahead.bytes > 1) {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap_or(false);
+        assert!(republished, "the resumed encoder published another segment");
+        mgr.apply_ahead_window(
+            &session,
+            &info.session_id,
+            AheadLimits {
+                max_secs: 0,
+                max_bytes: 1,
+                global_max_bytes: 0,
+            },
+            0,
+        )
+        .await;
         assert!(session.suspended.load(Relaxed), "held again");
         assert!(mgr.stop_session(&info.session_id, "test").await);
         assert_eq!(mgr.active_sessions().await, 0);

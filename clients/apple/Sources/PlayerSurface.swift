@@ -77,7 +77,7 @@ final class PictureInPictureController: NSObject, ObservableObject,
         }
     }
 
-    func stop() {
+    private func stop() {
         if controller?.isPictureInPictureActive == true {
             controller?.stopPictureInPicture()
         }
@@ -91,8 +91,8 @@ final class PictureInPictureController: NSObject, ObservableObject,
         controller = nil
         playerLayer = nil
         if resetPublishedState {
-            isPossible = false
-            isActive = false
+            if isPossible { isPossible = false }
+            if isActive { isActive = false }
         }
     }
 
@@ -132,6 +132,7 @@ struct PlayerSurface: UIViewRepresentable {
     let player: AVPlayer
     let pictureInPicture: PictureInPictureController
     let pgsOverlay: PGSOverlayWindow?
+    let allowsPictureInPicture: Bool
 
     func makeCoordinator() -> Coordinator {
         Coordinator(pictureInPicture: pictureInPicture)
@@ -141,7 +142,9 @@ struct PlayerSurface: UIViewRepresentable {
         let view = PlayerSurfaceView()
         view.playerLayer.player = player
         view.applyPGSOverlay(pgsOverlay, to: player.currentItem)
-        context.coordinator.pictureInPicture.attach(to: view.playerLayer)
+        if allowsPictureInPicture {
+            context.coordinator.pictureInPicture.attach(to: view.playerLayer)
+        }
         return view
     }
 
@@ -150,7 +153,11 @@ struct PlayerSurface: UIViewRepresentable {
             view.playerLayer.player = player
         }
         view.applyPGSOverlay(pgsOverlay, to: player.currentItem)
-        context.coordinator.pictureInPicture.attach(to: view.playerLayer)
+        if allowsPictureInPicture {
+            context.coordinator.pictureInPicture.attach(to: view.playerLayer)
+        } else {
+            context.coordinator.pictureInPicture.detach()
+        }
     }
 
     static func dismantleUIView(_ view: PlayerSurfaceView, coordinator: Coordinator) {

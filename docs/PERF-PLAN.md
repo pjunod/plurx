@@ -455,8 +455,9 @@ with an ahead-window suspend replacing `-re` as the disk bound.
   Per-segment metadata (`index`, `start_ms`, `end_ms`, `bytes`) is
   recorded as each segment completes, derived from the playlist — never
   `index × SEGMENT_SECONDS`, which lies on variable-GOP copy sources.
-  The controller runs on segment-completion and frontier-advance events
-  (the 15 s reaper stays as the repair loop, not the flow controller):
+  Client playlist/index refreshes and frontier advances run the controller.
+  Nothing currently calls it directly when ffmpeg completes a segment; the
+  15 s reaper is the producer-side repair loop that bounds that delay:
 
   ```text
   ahead_seconds = produced_playable_end − fetched_end
@@ -469,12 +470,21 @@ with an ahead-window suspend replacing `-re` as the disk bound.
             and byte/global triggers are each below half their limit
   ```
 
-  The time release grants another production burst at the 138 s no-fetch
-  frontier measured on a physical iPad. It is not a structural escape: if the
-  client remains stopped, the producer can pass 150 s and become held again.
-  Client same-delivery reopen remains the terminal recovery. Session status
-  reports the active time release as `resume_below_seconds` so operators can
-  distinguish this state from an encoder stall.
+  Time keeps its 30-second hysteresis so a fast producer does not toggle once
+  per client segment near the boundary. A one-second configured ceiling floors
+  its release at one second rather than zero, which keeps that limit active.
+  Byte limits keep half-window hysteresis because they are hard disk bounds.
+  Session status names the active `time`, per-session `bytes`, or `global`
+  hold and reports its matching release value, so operators can distinguish a
+  capacity hold from a time hold and both from an encoder stall.
+
+  This controller bounds production; it is not a structural recovery for a
+  client that stops fetching. Ahead media is already published and visible in
+  the served playlist. A non-fetching client can leave the producer held while
+  its own available reserve drains. The physical-iPad trace therefore remains
+  a client/playlist investigation until device capture correlates server ahead,
+  `loadedTimeRanges`, access-log segment counts, and the EVENT-to-sliding header
+  transition.
 
 - **Retention behind the frontier.** Because `fetched_end` can sit a full
   client forward-buffer past the true playhead, deleting at a fixed 60 s
@@ -1709,7 +1719,7 @@ Playlist/segment capability-URL auth is untouched — AirPlay depends on it.
 | # | Decision | Choice |
 |---|---|---|
 | 1 | Client buffer policy | Seconds only (`60`/`30`), provisional; byte value stays default; M0 evidence required to change it (§4.3) |
-| 2 | Server ahead policy | Three named frontiers (§4.2); pace on playable−fetched from `EXTINF`; suspend on time **or** per-session bytes **or** global scratch. **Revised 2026-08-07 after physical-iPad evidence:** time releases at max(half, ceiling−30 s), 150 s by default, while byte/global limits still release at half; this grants one more burst but can pin again without a client fetch. Retention covers the measured 120 s forward lead + back-buffer + retry ≈ 180 s. |
+| 2 | Server ahead policy | Three named frontiers (§4.2); pace on playable−fetched from `EXTINF`; suspend on time **or** per-session bytes **or** global scratch. Time holds above 180 s and releases at 150 s; byte/global limits release at half. Status names the active reason and matching release value. Retention covers the measured 120 s forward lead + back-buffer + retry ≈ 180 s. The build-36 iPad fetch-loop stop remains a client/playlist device investigation; raising the release point did not make already-published media more fetchable. |
 | 3 | Playlist/GC contract | ~~EVENT + documented 404s outside the retention window.~~ **Reversed 2026-08-04 after live AVPlayer evidence:** keep EVENT as the internal writer history, but serve a sliding window that omits the pruned prefix and advances `MEDIA-SEQUENCE`; deletion inside the 180 s retention window remains forbidden. A native player may revisit a playlist entry after a reload or decoder reset, so “normal forward clients will not ask again” was not a safe wire contract. |
 | 4 | ABR handoff | Visible restart (Option A) with measured p95 interruption SLO — proposed ≤2.5 s on LAN, **operator confirms**; estimate seeded across Hls instances; severe pressure jumps straight to the highest safe rung |
 | 5 | Over-capacity & fallback admission | Queue ≤5 s → *measured-safe* software recipe (recent speed ≥ ~1.2× for that pipeline class — never "720p is safe") → capacity error; cluster inserts "another node" first |

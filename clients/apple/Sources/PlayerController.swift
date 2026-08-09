@@ -394,6 +394,11 @@ enum SubtitleSelectionRoute: Equatable {
     case reopen
 }
 
+enum PlayerItemEndAction: Equatable {
+    case reopen
+    case finish(durationMs: Int)
+}
+
 /// Drives one AVPlayer and executes the server-owned delivery plan. It also
 /// supplies the controls AVPlayer withholds for a growing EVENT playlist: an
 /// explicit on-demand timeline, reliable play/pause commands, server playback
@@ -416,6 +421,26 @@ final class PlayerController: ObservableObject {
         item.preferredForwardBufferDuration = growingHLS
             ? growingHLSForwardBufferSeconds
             : 0
+    }
+
+    /// AVPlayer can announce the temporary end of a growing playlist. A
+    /// server duration proves where the title ends; a finite item duration is
+    /// a safe fallback for direct/offline files whose catalog row was never
+    /// probed. With neither, reopening is safer than ejecting the viewer.
+    nonisolated static func endAction(
+        knownDurationMs: Int,
+        itemDurationMs: Int?,
+        isGrowingPlaylist: Bool,
+        endedAt: Int
+    ) -> PlayerItemEndAction {
+        let corroboratedDuration = knownDurationMs > 0
+            ? knownDurationMs
+            : isGrowingPlaylist
+                ? nil
+                : itemDurationMs.flatMap { $0 > 0 ? $0 : nil }
+        guard let durationMs = corroboratedDuration else { return .reopen }
+        guard endedAt >= durationMs - 15_000 else { return .reopen }
+        return .finish(durationMs: durationMs)
     }
 
     let player = AVPlayer()
@@ -606,6 +631,7 @@ final class PlayerController: ObservableObject {
         self.knownDurationMs = durationMs
         self.currentMs = max(0, startMs)
         self.title = title
+        finished = false
         subtitleReadiness = model.subtitleReadiness
         wantsNativeSubtitleRenditions = false
         canRetryCurrentItemWithHDRBase = false
@@ -666,6 +692,7 @@ final class PlayerController: ObservableObject {
         knownDurationMs = offline.durationMs ?? 0
         currentMs = max(0, offline.positionMs)
         title = offline.title
+        finished = false
         selectedHeight = offline.actualHeight
         selectedAudio = offline.audioLabel == nil ? nil : 0
         selectedSubtitle = offline.subtitleIndex == nil ? nil : 0
@@ -733,6 +760,7 @@ final class PlayerController: ObservableObject {
     }
 
     private func loadOffline(url: URL, startMs: Int) async {
+        guard started else { return }
         let asset = AVURLAsset(url: url)
         guard asset.assetCache?.isPlayableOffline == true else {
             fail(APIError.transport("Download incomplete"))
@@ -748,10 +776,16 @@ final class PlayerController: ObservableObject {
         player.play()
         if startMs > 0 {
             do { try await seekWhenReady(item, ms: startMs) }
-            catch { fail(error); return }
+            catch {
+                guard started, player.currentItem === item else { return }
+                fail(error)
+                return
+            }
         }
+        guard started, player.currentItem === item else { return }
         await applyPreferredAudioSelection(to: item)
         await applyNativeSubtitleSelection(selectedSubtitle, to: item)
+        guard started, player.currentItem === item else { return }
         player.play()
         isPlaying = true
         failed = false
@@ -920,10 +954,14 @@ final class PlayerController: ObservableObject {
     }
 
     /// Report the final position and hand any encoder back immediately.
-    func stop() {
+    func stop(deactivateAudioSession: Bool = true) {
         clearPlaybackNotice()
-        guard started else { return }
+        let wasStarted = started
         started = false
+        // Invalidate every in-flight open before any of its awaits can attach
+        // a replacement item after this teardown.
+        openGeneration &+= 1
+        reopenQueue.clear()
         if let timeObserver {
             player.removeTimeObserver(timeObserver)
             self.timeObserver = nil
@@ -938,21 +976,35 @@ final class PlayerController: ObservableObject {
         recoveryTask?.cancel()
         recoveryTask = nil
         clearPGSOverlaySelection()
+        pgsOverlayItemGeneration &+= 1
         playbackRecoveryMonitor.reset()
         seekState.clear()
         let position = realPositionMs()
         player.pause()
+        player.replaceCurrentItem(with: nil)
         isPlaying = false
-        report(position)
+        wantsPlayback = false
+        isChangingStream = false
+        finished = false
+        sessionStatus = nil
+        if wasStarted { report(position) }
         if let sessionId {
             self.sessionId = nil
             let model = model
             Task { await model?.endHlsSession(sessionId) }
         }
         #if os(iOS)
-        removeRemoteCommands()
-        MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
-        MPNowPlayingInfoCenter.default().playbackState = .stopped
+        if wasStarted {
+            removeRemoteCommands()
+            MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+            MPNowPlayingInfoCenter.default().playbackState = .stopped
+            if deactivateAudioSession {
+                try? AVAudioSession.sharedInstance().setActive(
+                    false,
+                    options: .notifyOthersOnDeactivation
+                )
+            }
+        }
         #endif
     }
 
@@ -969,6 +1021,7 @@ final class PlayerController: ObservableObject {
         guard let model else { return }
         do {
             let decision = try await model.decision(fileId: fileId)
+            guard started else { return }
             self.decision = decision
             if knownDurationMs <= 0 { knownDurationMs = decision.source?.durationMs ?? 0 }
             // `default` on a decision track is the server's own shared-policy
@@ -1000,6 +1053,7 @@ final class PlayerController: ObservableObject {
             let initialPosition = seekState.pendingMs ?? startMs
             try await openAndDrain(decision: decision, at: initialPosition)
         } catch {
+            guard started else { return }
             reopenQueue.clear()
             seekState.clear()
             fail(error)
@@ -1058,6 +1112,7 @@ final class PlayerController: ObservableObject {
         guard let model, started else { return }
         openGeneration &+= 1
         let generation = openGeneration
+        finished = false
         isChangingStream = true
         failed = false
         playbackError = nil
@@ -1578,10 +1633,18 @@ final class PlayerController: ObservableObject {
 
     private func startStatusPolling() {
         statusTask?.cancel()
+        guard let polledSessionId = sessionId else { return }
+        let generation = openGeneration
         statusTask = Task { [weak self] in
             while !Task.isCancelled {
-                guard let self, let sessionId = self.sessionId, let model = self.model else { return }
-                self.sessionStatus = try? await model.hlsStatus(sessionId)
+                guard let self, let model = self.model else { return }
+                let status = try? await model.hlsStatus(polledSessionId)
+                guard !Task.isCancelled,
+                      self.started,
+                      self.openGeneration == generation,
+                      self.sessionId == polledSessionId
+                else { return }
+                self.sessionStatus = status
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
             }
         }
@@ -1723,21 +1786,30 @@ final class PlayerController: ObservableObject {
                       self.player.currentItem === item
                 else { return }
                 let endedAt = self.realPositionMs()
-                // A growing EVENT playlist can momentarily end before the
-                // title does. Only hand autoplay a genuine film/episode end.
-                if self.knownDurationMs > 0 && endedAt < self.knownDurationMs - 15_000 {
+                let itemDurationSeconds = item.duration.seconds
+                let itemDurationMs = itemDurationSeconds.isFinite && itemDurationSeconds > 0
+                    ? Int(itemDurationSeconds * 1000)
+                    : nil
+                switch Self.endAction(
+                    knownDurationMs: self.knownDurationMs,
+                    itemDurationMs: itemDurationMs,
+                    isGrowingPlaylist: self.sessionId != nil,
+                    endedAt: endedAt
+                ) {
+                case .reopen:
                     // The viewer did not pause — the playlist merely announced
                     // its current end — and `wantsPlayback` still says so, so
                     // this continuation keeps playing.
                     await self.reopen(at: endedAt)
                     return
+                case .finish(let durationMs):
+                    self.isPlaying = false
+                    self.wantsPlayback = false
+                    self.currentMs = durationMs
+                    self.report(self.currentMs)
+                    self.updateNowPlaying()
+                    self.finished = true
                 }
-                self.isPlaying = false
-                self.wantsPlayback = false
-                self.currentMs = self.knownDurationMs > 0 ? self.knownDurationMs : endedAt
-                self.report(self.currentMs)
-                self.updateNowPlaying()
-                self.finished = true
             }
         }
     }
