@@ -46,6 +46,14 @@ test = "clients/apple/Tests/AppleClientTests.swift"
 test_anchor = "testPGSOverlayDisablesManualAndAutomaticPictureInPicture"
 
 [[fixes]]
+id = "apple.home-hero-edge-clipping"
+commits = ["b423fcce"]
+source = "clients/apple/Sources/HomeView.swift"
+source_anchor = "struct IOSHomeHeroCardLayout: ViewModifier"
+test = "clients/apple/Tests/AppleClientTests.swift"
+test_anchor = "testPhoneHomeHeroKeepsEqualInsetsOnBothEdges"
+
+[[fixes]]
 id = "clients.media-origin-and-seek-routing"
 commits = ["f43988d8"]
 source = "clients/android/app/src/main/java/tv/plurx/app/player/Controller.kt"

@@ -329,9 +329,8 @@ private struct FeaturedHero: View {
         .featuredButtonStyle()
         .accessibilityLabel("\(heroAction) \(item.title)")
         #if os(iOS)
-        // Constrain the NavigationLink itself. Padding its flexible label lets
-        // the link claim the full row first, then adds the inset outside that
-        // width and pushes the trailing corner off compact screens.
+        // The outer inset is applied to the link. The card itself separately
+        // accepts that finite width before its loaded artwork is clipped.
         .modifier(IOSHomeHeroLayout(compact: compact))
         #endif
     }
@@ -419,12 +418,7 @@ private struct FeaturedHero: View {
             }
             .padding(16)
         }
-        .frame(height: HomeHeroMetrics.compactHeight)
-        .clipShape(RoundedRectangle(cornerRadius: HomeHeroMetrics.cornerRadius, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: HomeHeroMetrics.cornerRadius, style: .continuous)
-                .stroke(.white.opacity(0.08), lineWidth: 0.5)
-        }
+        .modifier(IOSHomeHeroCardLayout())
     }
 
     private var compactFacts: [String] {
@@ -534,6 +528,30 @@ enum HomeHeroMetrics {
     static let compactHeight: CGFloat = 238
     static let cornerRadius: CGFloat = 18
     static let horizontalInset = screenHPad
+}
+
+struct IOSHomeHeroCardLayout: ViewModifier {
+    func body(content: Content) -> some View {
+        GeometryReader { geometry in
+            content
+                .frame(
+                    width: geometry.size.width,
+                    height: HomeHeroMetrics.compactHeight
+                )
+                .clipShape(RoundedRectangle(
+                    cornerRadius: HomeHeroMetrics.cornerRadius,
+                    style: .continuous
+                ))
+                .overlay {
+                    RoundedRectangle(
+                        cornerRadius: HomeHeroMetrics.cornerRadius,
+                        style: .continuous
+                    )
+                    .stroke(.white.opacity(0.08), lineWidth: 0.5)
+                }
+        }
+        .frame(height: HomeHeroMetrics.compactHeight)
+    }
 }
 
 struct IOSHomeHeroLayout: ViewModifier {
