@@ -1067,7 +1067,6 @@ fn same_request(existing: &OfflinePackage, requested: &NewOfflinePackage) -> boo
         && existing.subtitle_mode == requested.subtitle_mode
         && existing.estimated_bytes == requested.estimated_bytes
         && existing.reserved_bytes == requested.reserved_bytes
-        && existing.expires_at == requested.expires_at
 }
 
 fn exceeds_byte_limit(used: i64, reserved: i64, limit: i64) -> bool {
