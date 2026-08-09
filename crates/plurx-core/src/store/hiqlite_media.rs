@@ -552,6 +552,26 @@ fn id_list(ids: &[i64]) -> String {
     ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",")
 }
 
+fn reconcile_refusal(
+    expected_fingerprint: Option<&str>,
+    observed_fingerprint: &str,
+    requested: u64,
+    prune_limit: u64,
+) -> Option<ReconcileOutcome> {
+    if expected_fingerprint != Some(observed_fingerprint) {
+        Some(ReconcileOutcome::RefusedRoot {
+            expected: expected_fingerprint.unwrap_or("<unregistered>").to_owned(),
+        })
+    } else if requested > prune_limit {
+        Some(ReconcileOutcome::RefusedPrune {
+            requested,
+            limit: prune_limit,
+        })
+    } else {
+        None
+    }
+}
+
 async fn scalar(client: &TimedClient, sql: &'static str) -> Result<i64, StoreError> {
     scalar_with(client, sql.to_owned(), params!()).await
 }
@@ -1537,10 +1557,10 @@ impl MediaStore for HiqliteAuthStore {
             .into_iter()
             .next()
             .map(|row| row.fingerprint);
-        if expected.as_deref() != Some(root_fingerprint) {
-            return Ok(ReconcileOutcome::RefusedRoot {
-                expected: expected.unwrap_or_else(|| "<unregistered>".to_owned()),
-            });
+        if let Some(refusal) =
+            reconcile_refusal(expected.as_deref(), root_fingerprint, 0, prune_limit)
+        {
+            return Ok(refusal);
         }
 
         let list = if gone_file_ids.is_empty() {
@@ -1558,11 +1578,13 @@ impl MediaStore for HiqliteAuthStore {
         )
         .await?
         .max(0) as u64;
-        if requested > prune_limit {
-            return Ok(ReconcileOutcome::RefusedPrune {
-                requested,
-                limit: prune_limit,
-            });
+        if let Some(refusal) = reconcile_refusal(
+            expected.as_deref(),
+            root_fingerprint,
+            requested,
+            prune_limit,
+        ) {
+            return Ok(refusal);
         }
 
         let limit = i64::try_from(prune_limit).unwrap_or(i64::MAX);
@@ -1664,9 +1686,28 @@ impl MediaStore for HiqliteAuthStore {
                 .map_err(database_error)?
                 .into_iter()
                 .next()
-                .map(|row| row.fingerprint)
-                .unwrap_or_else(|| "<unregistered>".to_owned());
-            return Ok(ReconcileOutcome::RefusedRoot { expected });
+                .map(|row| row.fingerprint);
+            let requested = scalar_with(
+                self.client(),
+                format!(
+                    "SELECT COUNT(*) AS value FROM files f JOIN items i ON i.id = f.item_id \
+                     WHERE i.library_id = $1 AND f.id IN ({list})"
+                ),
+                params!(library_id),
+            )
+            .await?
+            .max(0) as u64;
+            if let Some(refusal) = reconcile_refusal(
+                expected.as_deref(),
+                root_fingerprint,
+                requested,
+                prune_limit,
+            ) {
+                return Ok(refusal);
+            }
+            return Err(StoreError::Database(
+                "scan reconciliation guard was already held by another operation".to_owned(),
+            ));
         }
         Ok(ReconcileOutcome::Applied {
             deleted_files: results[1] as u64,
@@ -2186,5 +2227,16 @@ mod tests {
             Some("\"the\" \"matrix\"*".to_owned())
         );
         assert_eq!(fts_query("..."), None);
+    }
+
+    #[test]
+    fn in_transaction_budget_refusal_is_not_mislabeled_as_a_root_change() {
+        assert_eq!(
+            reconcile_refusal(Some("same-root"), "same-root", 2, 1),
+            Some(ReconcileOutcome::RefusedPrune {
+                requested: 2,
+                limit: 1,
+            })
+        );
     }
 }
