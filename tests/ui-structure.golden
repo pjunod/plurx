@@ -1764,11 +1764,11 @@ catalog|settings@1280x860|dom|div#pxshell.px-shell > nav.px-tabs[aria-label=*]|1
 catalog|settings@1280x860|dom|div#setbody.adminwrap > div.card|2
 catalog|settings@1280x860|dom|div.card > button[text]|1
 catalog|settings@1280x860|dom|div.card > div#lerr.err|1
-catalog|settings@1280x860|dom|div.card > div.hint[text]|3
-catalog|settings@1280x860|dom|div.card > div.row.setrow|2
+catalog|settings@1280x860|dom|div.card > div.hint[text]|4
+catalog|settings@1280x860|dom|div.card > div.row.setrow|3
 catalog|settings@1280x860|dom|div.card > div.row|2
 catalog|settings@1280x860|dom|div.card > div.setwarn[text]|1
-catalog|settings@1280x860|dom|div.card > h2.section[text]|4
+catalog|settings@1280x860|dom|div.card > h2.section[text]|5
 catalog|settings@1280x860|dom|div.card > table|1
 catalog|settings@1280x860|dom|div.hint[text] > b[text]|8
 catalog|settings@1280x860|dom|div.hint[text] > code[text]|1
@@ -1794,9 +1794,9 @@ catalog|settings@1280x860|dom|div.row > input#ln[aria-label=*]|1
 catalog|settings@1280x860|dom|div.row > input#lp[aria-label=*]|1
 catalog|settings@1280x860|dom|div.row > select#lk|1
 catalog|settings@1280x860|dom|div.row > span.muted[text]|1
-catalog|settings@1280x860|dom|div.row.setrow > button.ghost.sm[text]|2
+catalog|settings@1280x860|dom|div.row.setrow > button.ghost.sm[text]|3
 catalog|settings@1280x860|dom|div.row.setrow > label.schedpair[text]|1
-catalog|settings@1280x860|dom|div.row.setrow > span.schedpair[text]|5
+catalog|settings@1280x860|dom|div.row.setrow > span.schedpair[text]|6
 catalog|settings@1280x860|dom|div.sched > span.schedpair[text]|9
 catalog|settings@1280x860|dom|div.settabs > button.active.settab[text]|1
 catalog|settings@1280x860|dom|div.settabs > button.settab[text]|4
@@ -1822,6 +1822,7 @@ catalog|settings@1280x860|dom|select#sched-ref-3 > option[text]|4
 catalog|settings@1280x860|dom|select#sched-scan-1 > option[text]|8
 catalog|settings@1280x860|dom|select#sched-scan-2 > option[text]|8
 catalog|settings@1280x860|dom|select#sched-scan-3 > option[text]|8
+catalog|settings@1280x860|dom|select#telemetry-retain > option[text]|6
 catalog|settings@1280x860|dom|span.schedpair[text] > button.ghost.sm[text]|3
 catalog|settings@1280x860|dom|span.schedpair[text] > select#cache-gb|1
 catalog|settings@1280x860|dom|span.schedpair[text] > select#cache-produce|1
@@ -1834,6 +1835,7 @@ catalog|settings@1280x860|dom|span.schedpair[text] > select#sched-ref-3|1
 catalog|settings@1280x860|dom|span.schedpair[text] > select#sched-scan-1|1
 catalog|settings@1280x860|dom|span.schedpair[text] > select#sched-scan-2|1
 catalog|settings@1280x860|dom|span.schedpair[text] > select#sched-scan-3|1
+catalog|settings@1280x860|dom|span.schedpair[text] > select#telemetry-retain|1
 catalog|settings@1280x860|dom|span.schedpair[text] > span.muted[text]|1
 catalog|settings@1280x860|dom|svg.px-ico[aria-hidden=true] > circle|2
 catalog|settings@1280x860|dom|svg.px-ico[aria-hidden=true] > path|6
@@ -1915,16 +1917,19 @@ catalog|settings@1280x860|focus|042|select#job-art "Re-fetch posters for items a
 catalog|settings@1280x860|focus|043|select#job-clean "Delete leftover transcode working director
 catalog|settings@1280x860|focus|044|input#job-boot
 catalog|settings@1280x860|focus|045|button.ghost.sm "Save"
-catalog|settings@1280x860|focus|046|select#cache-produce "How often to check what's worth encodi
-catalog|settings@1280x860|focus|047|select#cache-gb "How much disk finished pre-transcodes may o
-catalog|settings@1280x860|focus|048|button.ghost.sm "Save"
-catalog|settings@1280x860|focus|049|<wrap>
+catalog|settings@1280x860|focus|046|select#telemetry-retain "How long node-local playback measur
+catalog|settings@1280x860|focus|047|button.ghost.sm "Save"
+catalog|settings@1280x860|focus|048|select#cache-produce "How often to check what's worth encodi
+catalog|settings@1280x860|focus|049|select#cache-gb "How much disk finished pre-transcodes may o
+catalog|settings@1280x860|focus|050|button.ghost.sm "Save"
+catalog|settings@1280x860|focus|051|<wrap>
 catalog|settings@1280x860|req|GET /api/v1/activity|2
 catalog|settings@1280x860|req|GET /api/v1/libraries|1
 catalog|settings@1280x860|req|GET /api/v1/me|1
 catalog|settings@1280x860|req|GET /api/v1/scan/status|3
 catalog|settings@1280x860|req|GET /api/v1/server|1
 catalog|settings@1280x860|req|GET /api/v1/settings|1
+catalog|settings@1280x860|req|GET /api/v1/system/playback-events|1
 catalog|settings@1280x860|req|GET /api/v1/system|1
 catalog|settings@1280x860|req|GET /api/v1/trakt/status|3
 catalog|settings@1280x860|req|GET /api/v1/users|1
@@ -1959,11 +1964,11 @@ catalog|settings@390x780|dom|div#pxshell.px-shell > nav.px-tabs[aria-label=*]|1
 catalog|settings@390x780|dom|div#setbody.adminwrap > div.card|2
 catalog|settings@390x780|dom|div.card > button[text]|1
 catalog|settings@390x780|dom|div.card > div#lerr.err|1
-catalog|settings@390x780|dom|div.card > div.hint[text]|3
-catalog|settings@390x780|dom|div.card > div.row.setrow|2
+catalog|settings@390x780|dom|div.card > div.hint[text]|4
+catalog|settings@390x780|dom|div.card > div.row.setrow|3
 catalog|settings@390x780|dom|div.card > div.row|2
 catalog|settings@390x780|dom|div.card > div.setwarn[text]|1
-catalog|settings@390x780|dom|div.card > h2.section[text]|4
+catalog|settings@390x780|dom|div.card > h2.section[text]|5
 catalog|settings@390x780|dom|div.card > table|1
 catalog|settings@390x780|dom|div.hint[text] > b[text]|8
 catalog|settings@390x780|dom|div.hint[text] > code[text]|1
@@ -1989,9 +1994,9 @@ catalog|settings@390x780|dom|div.row > input#ln[aria-label=*]|1
 catalog|settings@390x780|dom|div.row > input#lp[aria-label=*]|1
 catalog|settings@390x780|dom|div.row > select#lk|1
 catalog|settings@390x780|dom|div.row > span.muted[text]|1
-catalog|settings@390x780|dom|div.row.setrow > button.ghost.sm[text]|2
+catalog|settings@390x780|dom|div.row.setrow > button.ghost.sm[text]|3
 catalog|settings@390x780|dom|div.row.setrow > label.schedpair[text]|1
-catalog|settings@390x780|dom|div.row.setrow > span.schedpair[text]|5
+catalog|settings@390x780|dom|div.row.setrow > span.schedpair[text]|6
 catalog|settings@390x780|dom|div.sched > span.schedpair[text]|9
 catalog|settings@390x780|dom|div.settabs > button.active.settab[text]|1
 catalog|settings@390x780|dom|div.settabs > button.settab[text]|4
@@ -2017,6 +2022,7 @@ catalog|settings@390x780|dom|select#sched-ref-3 > option[text]|4
 catalog|settings@390x780|dom|select#sched-scan-1 > option[text]|8
 catalog|settings@390x780|dom|select#sched-scan-2 > option[text]|8
 catalog|settings@390x780|dom|select#sched-scan-3 > option[text]|8
+catalog|settings@390x780|dom|select#telemetry-retain > option[text]|6
 catalog|settings@390x780|dom|span.schedpair[text] > button.ghost.sm[text]|3
 catalog|settings@390x780|dom|span.schedpair[text] > select#cache-gb|1
 catalog|settings@390x780|dom|span.schedpair[text] > select#cache-produce|1
@@ -2029,6 +2035,7 @@ catalog|settings@390x780|dom|span.schedpair[text] > select#sched-ref-3|1
 catalog|settings@390x780|dom|span.schedpair[text] > select#sched-scan-1|1
 catalog|settings@390x780|dom|span.schedpair[text] > select#sched-scan-2|1
 catalog|settings@390x780|dom|span.schedpair[text] > select#sched-scan-3|1
+catalog|settings@390x780|dom|span.schedpair[text] > select#telemetry-retain|1
 catalog|settings@390x780|dom|span.schedpair[text] > span.muted[text]|1
 catalog|settings@390x780|dom|svg.px-ico[aria-hidden=true] > circle|2
 catalog|settings@390x780|dom|svg.px-ico[aria-hidden=true] > path|6
@@ -2107,20 +2114,23 @@ catalog|settings@390x780|focus|039|select#job-art "Re-fetch posters for items a 
 catalog|settings@390x780|focus|040|select#job-clean "Delete leftover transcode working director
 catalog|settings@390x780|focus|041|input#job-boot
 catalog|settings@390x780|focus|042|button.ghost.sm "Save"
-catalog|settings@390x780|focus|043|select#cache-produce "How often to check what's worth encodi
-catalog|settings@390x780|focus|044|select#cache-gb "How much disk finished pre-transcodes may o
-catalog|settings@390x780|focus|045|button.ghost.sm "Save"
-catalog|settings@390x780|focus|046|a.px-tab "Home"
-catalog|settings@390x780|focus|047|button.px-tab "Libraries"
-catalog|settings@390x780|focus|048|button.px-tab "Search"
-catalog|settings@390x780|focus|049|a.px-tab "Activity"
-catalog|settings@390x780|focus|050|<wrap>
+catalog|settings@390x780|focus|043|select#telemetry-retain "How long node-local playback measur
+catalog|settings@390x780|focus|044|button.ghost.sm "Save"
+catalog|settings@390x780|focus|045|select#cache-produce "How often to check what's worth encodi
+catalog|settings@390x780|focus|046|select#cache-gb "How much disk finished pre-transcodes may o
+catalog|settings@390x780|focus|047|button.ghost.sm "Save"
+catalog|settings@390x780|focus|048|a.px-tab "Home"
+catalog|settings@390x780|focus|049|button.px-tab "Libraries"
+catalog|settings@390x780|focus|050|button.px-tab "Search"
+catalog|settings@390x780|focus|051|a.px-tab "Activity"
+catalog|settings@390x780|focus|052|<wrap>
 catalog|settings@390x780|req|GET /api/v1/activity|2
 catalog|settings@390x780|req|GET /api/v1/libraries|1
 catalog|settings@390x780|req|GET /api/v1/me|1
 catalog|settings@390x780|req|GET /api/v1/scan/status|3
 catalog|settings@390x780|req|GET /api/v1/server|1
 catalog|settings@390x780|req|GET /api/v1/settings|1
+catalog|settings@390x780|req|GET /api/v1/system/playback-events|1
 catalog|settings@390x780|req|GET /api/v1/system|1
 catalog|settings@390x780|req|GET /api/v1/trakt/status|3
 catalog|settings@390x780|req|GET /api/v1/users|1
@@ -3337,11 +3347,11 @@ classic|settings@1280x860|dom|div#app > main#main|1
 classic|settings@1280x860|dom|div#setbody.adminwrap > div.card|2
 classic|settings@1280x860|dom|div.card > button[text]|1
 classic|settings@1280x860|dom|div.card > div#lerr.err|1
-classic|settings@1280x860|dom|div.card > div.hint[text]|3
-classic|settings@1280x860|dom|div.card > div.row.setrow|2
+classic|settings@1280x860|dom|div.card > div.hint[text]|4
+classic|settings@1280x860|dom|div.card > div.row.setrow|3
 classic|settings@1280x860|dom|div.card > div.row|2
 classic|settings@1280x860|dom|div.card > div.setwarn[text]|1
-classic|settings@1280x860|dom|div.card > h2.section[text]|4
+classic|settings@1280x860|dom|div.card > h2.section[text]|5
 classic|settings@1280x860|dom|div.card > table|1
 classic|settings@1280x860|dom|div.hint[text] > b[text]|8
 classic|settings@1280x860|dom|div.hint[text] > code[text]|1
@@ -3351,9 +3361,9 @@ classic|settings@1280x860|dom|div.row > input#ln[aria-label=*]|1
 classic|settings@1280x860|dom|div.row > input#lp[aria-label=*]|1
 classic|settings@1280x860|dom|div.row > select#lk|1
 classic|settings@1280x860|dom|div.row > span.muted[text]|1
-classic|settings@1280x860|dom|div.row.setrow > button.ghost.sm[text]|2
+classic|settings@1280x860|dom|div.row.setrow > button.ghost.sm[text]|3
 classic|settings@1280x860|dom|div.row.setrow > label.schedpair[text]|1
-classic|settings@1280x860|dom|div.row.setrow > span.schedpair[text]|5
+classic|settings@1280x860|dom|div.row.setrow > span.schedpair[text]|6
 classic|settings@1280x860|dom|div.sched > span.schedpair[text]|9
 classic|settings@1280x860|dom|div.settabs > button.active.settab[text]|1
 classic|settings@1280x860|dom|div.settabs > button.settab[text]|4
@@ -3383,6 +3393,7 @@ classic|settings@1280x860|dom|select#sched-ref-3 > option[text]|4
 classic|settings@1280x860|dom|select#sched-scan-1 > option[text]|8
 classic|settings@1280x860|dom|select#sched-scan-2 > option[text]|8
 classic|settings@1280x860|dom|select#sched-scan-3 > option[text]|8
+classic|settings@1280x860|dom|select#telemetry-retain > option[text]|6
 classic|settings@1280x860|dom|span.schedpair[text] > button.ghost.sm[text]|3
 classic|settings@1280x860|dom|span.schedpair[text] > select#cache-gb|1
 classic|settings@1280x860|dom|span.schedpair[text] > select#cache-produce|1
@@ -3395,6 +3406,7 @@ classic|settings@1280x860|dom|span.schedpair[text] > select#sched-ref-3|1
 classic|settings@1280x860|dom|span.schedpair[text] > select#sched-scan-1|1
 classic|settings@1280x860|dom|span.schedpair[text] > select#sched-scan-2|1
 classic|settings@1280x860|dom|span.schedpair[text] > select#sched-scan-3|1
+classic|settings@1280x860|dom|span.schedpair[text] > select#telemetry-retain|1
 classic|settings@1280x860|dom|span.schedpair[text] > span.muted[text]|1
 classic|settings@1280x860|dom|svg[aria-hidden=true] > rect|4
 classic|settings@1280x860|dom|table > tbody|1
@@ -3473,16 +3485,19 @@ classic|settings@1280x860|focus|042|select#job-art "Re-fetch posters for items a
 classic|settings@1280x860|focus|043|select#job-clean "Delete leftover transcode working director
 classic|settings@1280x860|focus|044|input#job-boot
 classic|settings@1280x860|focus|045|button.ghost.sm "Save"
-classic|settings@1280x860|focus|046|select#cache-produce "How often to check what's worth encodi
-classic|settings@1280x860|focus|047|select#cache-gb "How much disk finished pre-transcodes may o
-classic|settings@1280x860|focus|048|button.ghost.sm "Save"
-classic|settings@1280x860|focus|049|<wrap>
+classic|settings@1280x860|focus|046|select#telemetry-retain "How long node-local playback measur
+classic|settings@1280x860|focus|047|button.ghost.sm "Save"
+classic|settings@1280x860|focus|048|select#cache-produce "How often to check what's worth encodi
+classic|settings@1280x860|focus|049|select#cache-gb "How much disk finished pre-transcodes may o
+classic|settings@1280x860|focus|050|button.ghost.sm "Save"
+classic|settings@1280x860|focus|051|<wrap>
 classic|settings@1280x860|req|GET /api/v1/activity|2
 classic|settings@1280x860|req|GET /api/v1/libraries|1
 classic|settings@1280x860|req|GET /api/v1/me|1
 classic|settings@1280x860|req|GET /api/v1/scan/status|3
 classic|settings@1280x860|req|GET /api/v1/server|1
 classic|settings@1280x860|req|GET /api/v1/settings|1
+classic|settings@1280x860|req|GET /api/v1/system/playback-events|1
 classic|settings@1280x860|req|GET /api/v1/system|1
 classic|settings@1280x860|req|GET /api/v1/trakt/status|3
 classic|settings@1280x860|req|GET /api/v1/users|1
@@ -3506,11 +3521,11 @@ classic|settings@390x780|dom|div#app > main#main|1
 classic|settings@390x780|dom|div#setbody.adminwrap > div.card|2
 classic|settings@390x780|dom|div.card > button[text]|1
 classic|settings@390x780|dom|div.card > div#lerr.err|1
-classic|settings@390x780|dom|div.card > div.hint[text]|3
-classic|settings@390x780|dom|div.card > div.row.setrow|2
+classic|settings@390x780|dom|div.card > div.hint[text]|4
+classic|settings@390x780|dom|div.card > div.row.setrow|3
 classic|settings@390x780|dom|div.card > div.row|2
 classic|settings@390x780|dom|div.card > div.setwarn[text]|1
-classic|settings@390x780|dom|div.card > h2.section[text]|4
+classic|settings@390x780|dom|div.card > h2.section[text]|5
 classic|settings@390x780|dom|div.card > table|1
 classic|settings@390x780|dom|div.hint[text] > b[text]|8
 classic|settings@390x780|dom|div.hint[text] > code[text]|1
@@ -3520,9 +3535,9 @@ classic|settings@390x780|dom|div.row > input#ln[aria-label=*]|1
 classic|settings@390x780|dom|div.row > input#lp[aria-label=*]|1
 classic|settings@390x780|dom|div.row > select#lk|1
 classic|settings@390x780|dom|div.row > span.muted[text]|1
-classic|settings@390x780|dom|div.row.setrow > button.ghost.sm[text]|2
+classic|settings@390x780|dom|div.row.setrow > button.ghost.sm[text]|3
 classic|settings@390x780|dom|div.row.setrow > label.schedpair[text]|1
-classic|settings@390x780|dom|div.row.setrow > span.schedpair[text]|5
+classic|settings@390x780|dom|div.row.setrow > span.schedpair[text]|6
 classic|settings@390x780|dom|div.sched > span.schedpair[text]|9
 classic|settings@390x780|dom|div.settabs > button.active.settab[text]|1
 classic|settings@390x780|dom|div.settabs > button.settab[text]|4
@@ -3552,6 +3567,7 @@ classic|settings@390x780|dom|select#sched-ref-3 > option[text]|4
 classic|settings@390x780|dom|select#sched-scan-1 > option[text]|8
 classic|settings@390x780|dom|select#sched-scan-2 > option[text]|8
 classic|settings@390x780|dom|select#sched-scan-3 > option[text]|8
+classic|settings@390x780|dom|select#telemetry-retain > option[text]|6
 classic|settings@390x780|dom|span.schedpair[text] > button.ghost.sm[text]|3
 classic|settings@390x780|dom|span.schedpair[text] > select#cache-gb|1
 classic|settings@390x780|dom|span.schedpair[text] > select#cache-produce|1
@@ -3564,6 +3580,7 @@ classic|settings@390x780|dom|span.schedpair[text] > select#sched-ref-3|1
 classic|settings@390x780|dom|span.schedpair[text] > select#sched-scan-1|1
 classic|settings@390x780|dom|span.schedpair[text] > select#sched-scan-2|1
 classic|settings@390x780|dom|span.schedpair[text] > select#sched-scan-3|1
+classic|settings@390x780|dom|span.schedpair[text] > select#telemetry-retain|1
 classic|settings@390x780|dom|span.schedpair[text] > span.muted[text]|1
 classic|settings@390x780|dom|svg[aria-hidden=true] > rect|4
 classic|settings@390x780|dom|table > tbody|1
@@ -3642,16 +3659,19 @@ classic|settings@390x780|focus|042|select#job-art "Re-fetch posters for items a 
 classic|settings@390x780|focus|043|select#job-clean "Delete leftover transcode working director
 classic|settings@390x780|focus|044|input#job-boot
 classic|settings@390x780|focus|045|button.ghost.sm "Save"
-classic|settings@390x780|focus|046|select#cache-produce "How often to check what's worth encodi
-classic|settings@390x780|focus|047|select#cache-gb "How much disk finished pre-transcodes may o
-classic|settings@390x780|focus|048|button.ghost.sm "Save"
-classic|settings@390x780|focus|049|<wrap>
+classic|settings@390x780|focus|046|select#telemetry-retain "How long node-local playback measur
+classic|settings@390x780|focus|047|button.ghost.sm "Save"
+classic|settings@390x780|focus|048|select#cache-produce "How often to check what's worth encodi
+classic|settings@390x780|focus|049|select#cache-gb "How much disk finished pre-transcodes may o
+classic|settings@390x780|focus|050|button.ghost.sm "Save"
+classic|settings@390x780|focus|051|<wrap>
 classic|settings@390x780|req|GET /api/v1/activity|2
 classic|settings@390x780|req|GET /api/v1/libraries|1
 classic|settings@390x780|req|GET /api/v1/me|1
 classic|settings@390x780|req|GET /api/v1/scan/status|3
 classic|settings@390x780|req|GET /api/v1/server|1
 classic|settings@390x780|req|GET /api/v1/settings|1
+classic|settings@390x780|req|GET /api/v1/system/playback-events|1
 classic|settings@390x780|req|GET /api/v1/system|1
 classic|settings@390x780|req|GET /api/v1/trakt/status|3
 classic|settings@390x780|req|GET /api/v1/users|1
@@ -4969,11 +4989,11 @@ theater|settings@1280x860|dom|div#app > nav.th-pills[aria-label=*]|1
 theater|settings@1280x860|dom|div#setbody.adminwrap > div.card|2
 theater|settings@1280x860|dom|div.card > button[text]|1
 theater|settings@1280x860|dom|div.card > div#lerr.err|1
-theater|settings@1280x860|dom|div.card > div.hint[text]|3
-theater|settings@1280x860|dom|div.card > div.row.setrow|2
+theater|settings@1280x860|dom|div.card > div.hint[text]|4
+theater|settings@1280x860|dom|div.card > div.row.setrow|3
 theater|settings@1280x860|dom|div.card > div.row|2
 theater|settings@1280x860|dom|div.card > div.setwarn[text]|1
-theater|settings@1280x860|dom|div.card > h2.section[text]|4
+theater|settings@1280x860|dom|div.card > h2.section[text]|5
 theater|settings@1280x860|dom|div.card > table|1
 theater|settings@1280x860|dom|div.hint[text] > b[text]|8
 theater|settings@1280x860|dom|div.hint[text] > code[text]|1
@@ -4983,9 +5003,9 @@ theater|settings@1280x860|dom|div.row > input#ln[aria-label=*]|1
 theater|settings@1280x860|dom|div.row > input#lp[aria-label=*]|1
 theater|settings@1280x860|dom|div.row > select#lk|1
 theater|settings@1280x860|dom|div.row > span.muted[text]|1
-theater|settings@1280x860|dom|div.row.setrow > button.ghost.sm[text]|2
+theater|settings@1280x860|dom|div.row.setrow > button.ghost.sm[text]|3
 theater|settings@1280x860|dom|div.row.setrow > label.schedpair[text]|1
-theater|settings@1280x860|dom|div.row.setrow > span.schedpair[text]|5
+theater|settings@1280x860|dom|div.row.setrow > span.schedpair[text]|6
 theater|settings@1280x860|dom|div.sched > span.schedpair[text]|9
 theater|settings@1280x860|dom|div.settabs > button.active.settab[text]|1
 theater|settings@1280x860|dom|div.settabs > button.settab[text]|4
@@ -5025,6 +5045,7 @@ theater|settings@1280x860|dom|select#sched-ref-3 > option[text]|4
 theater|settings@1280x860|dom|select#sched-scan-1 > option[text]|8
 theater|settings@1280x860|dom|select#sched-scan-2 > option[text]|8
 theater|settings@1280x860|dom|select#sched-scan-3 > option[text]|8
+theater|settings@1280x860|dom|select#telemetry-retain > option[text]|6
 theater|settings@1280x860|dom|span.schedpair[text] > button.ghost.sm[text]|3
 theater|settings@1280x860|dom|span.schedpair[text] > select#cache-gb|1
 theater|settings@1280x860|dom|span.schedpair[text] > select#cache-produce|1
@@ -5037,6 +5058,7 @@ theater|settings@1280x860|dom|span.schedpair[text] > select#sched-ref-3|1
 theater|settings@1280x860|dom|span.schedpair[text] > select#sched-scan-1|1
 theater|settings@1280x860|dom|span.schedpair[text] > select#sched-scan-2|1
 theater|settings@1280x860|dom|span.schedpair[text] > select#sched-scan-3|1
+theater|settings@1280x860|dom|span.schedpair[text] > select#telemetry-retain|1
 theater|settings@1280x860|dom|span.schedpair[text] > span.muted[text]|1
 theater|settings@1280x860|dom|svg[aria-hidden=true] > rect|4
 theater|settings@1280x860|dom|table > tbody|1
@@ -5115,16 +5137,19 @@ theater|settings@1280x860|focus|042|select#job-art "Re-fetch posters for items a
 theater|settings@1280x860|focus|043|select#job-clean "Delete leftover transcode working director
 theater|settings@1280x860|focus|044|input#job-boot
 theater|settings@1280x860|focus|045|button.ghost.sm "Save"
-theater|settings@1280x860|focus|046|select#cache-produce "How often to check what's worth encodi
-theater|settings@1280x860|focus|047|select#cache-gb "How much disk finished pre-transcodes may o
-theater|settings@1280x860|focus|048|button.ghost.sm "Save"
-theater|settings@1280x860|focus|049|<wrap>
+theater|settings@1280x860|focus|046|select#telemetry-retain "How long node-local playback measur
+theater|settings@1280x860|focus|047|button.ghost.sm "Save"
+theater|settings@1280x860|focus|048|select#cache-produce "How often to check what's worth encodi
+theater|settings@1280x860|focus|049|select#cache-gb "How much disk finished pre-transcodes may o
+theater|settings@1280x860|focus|050|button.ghost.sm "Save"
+theater|settings@1280x860|focus|051|<wrap>
 theater|settings@1280x860|req|GET /api/v1/activity|2
 theater|settings@1280x860|req|GET /api/v1/libraries|1
 theater|settings@1280x860|req|GET /api/v1/me|1
 theater|settings@1280x860|req|GET /api/v1/scan/status|3
 theater|settings@1280x860|req|GET /api/v1/server|1
 theater|settings@1280x860|req|GET /api/v1/settings|1
+theater|settings@1280x860|req|GET /api/v1/system/playback-events|1
 theater|settings@1280x860|req|GET /api/v1/system|1
 theater|settings@1280x860|req|GET /api/v1/trakt/status|3
 theater|settings@1280x860|req|GET /api/v1/users|1
@@ -5141,11 +5166,11 @@ theater|settings@390x780|dom|div#app > nav.th-pills[aria-label=*]|1
 theater|settings@390x780|dom|div#setbody.adminwrap > div.card|2
 theater|settings@390x780|dom|div.card > button[text]|1
 theater|settings@390x780|dom|div.card > div#lerr.err|1
-theater|settings@390x780|dom|div.card > div.hint[text]|3
-theater|settings@390x780|dom|div.card > div.row.setrow|2
+theater|settings@390x780|dom|div.card > div.hint[text]|4
+theater|settings@390x780|dom|div.card > div.row.setrow|3
 theater|settings@390x780|dom|div.card > div.row|2
 theater|settings@390x780|dom|div.card > div.setwarn[text]|1
-theater|settings@390x780|dom|div.card > h2.section[text]|4
+theater|settings@390x780|dom|div.card > h2.section[text]|5
 theater|settings@390x780|dom|div.card > table|1
 theater|settings@390x780|dom|div.hint[text] > b[text]|8
 theater|settings@390x780|dom|div.hint[text] > code[text]|1
@@ -5155,9 +5180,9 @@ theater|settings@390x780|dom|div.row > input#ln[aria-label=*]|1
 theater|settings@390x780|dom|div.row > input#lp[aria-label=*]|1
 theater|settings@390x780|dom|div.row > select#lk|1
 theater|settings@390x780|dom|div.row > span.muted[text]|1
-theater|settings@390x780|dom|div.row.setrow > button.ghost.sm[text]|2
+theater|settings@390x780|dom|div.row.setrow > button.ghost.sm[text]|3
 theater|settings@390x780|dom|div.row.setrow > label.schedpair[text]|1
-theater|settings@390x780|dom|div.row.setrow > span.schedpair[text]|5
+theater|settings@390x780|dom|div.row.setrow > span.schedpair[text]|6
 theater|settings@390x780|dom|div.sched > span.schedpair[text]|9
 theater|settings@390x780|dom|div.settabs > button.active.settab[text]|1
 theater|settings@390x780|dom|div.settabs > button.settab[text]|4
@@ -5197,6 +5222,7 @@ theater|settings@390x780|dom|select#sched-ref-3 > option[text]|4
 theater|settings@390x780|dom|select#sched-scan-1 > option[text]|8
 theater|settings@390x780|dom|select#sched-scan-2 > option[text]|8
 theater|settings@390x780|dom|select#sched-scan-3 > option[text]|8
+theater|settings@390x780|dom|select#telemetry-retain > option[text]|6
 theater|settings@390x780|dom|span.schedpair[text] > button.ghost.sm[text]|3
 theater|settings@390x780|dom|span.schedpair[text] > select#cache-gb|1
 theater|settings@390x780|dom|span.schedpair[text] > select#cache-produce|1
@@ -5209,6 +5235,7 @@ theater|settings@390x780|dom|span.schedpair[text] > select#sched-ref-3|1
 theater|settings@390x780|dom|span.schedpair[text] > select#sched-scan-1|1
 theater|settings@390x780|dom|span.schedpair[text] > select#sched-scan-2|1
 theater|settings@390x780|dom|span.schedpair[text] > select#sched-scan-3|1
+theater|settings@390x780|dom|span.schedpair[text] > select#telemetry-retain|1
 theater|settings@390x780|dom|span.schedpair[text] > span.muted[text]|1
 theater|settings@390x780|dom|svg[aria-hidden=true] > rect|4
 theater|settings@390x780|dom|table > tbody|1
@@ -5284,19 +5311,22 @@ theater|settings@390x780|focus|039|select#job-art "Re-fetch posters for items a 
 theater|settings@390x780|focus|040|select#job-clean "Delete leftover transcode working director
 theater|settings@390x780|focus|041|input#job-boot
 theater|settings@390x780|focus|042|button.ghost.sm "Save"
-theater|settings@390x780|focus|043|select#cache-produce "How often to check what's worth encodi
-theater|settings@390x780|focus|044|select#cache-gb "How much disk finished pre-transcodes may o
-theater|settings@390x780|focus|045|button.ghost.sm "Save"
-theater|settings@390x780|focus|046|a "Home"
-theater|settings@390x780|focus|047|a "Activity"
-theater|settings@390x780|focus|048|a.on "Settings"
-theater|settings@390x780|focus|049|<wrap>
+theater|settings@390x780|focus|043|select#telemetry-retain "How long node-local playback measur
+theater|settings@390x780|focus|044|button.ghost.sm "Save"
+theater|settings@390x780|focus|045|select#cache-produce "How often to check what's worth encodi
+theater|settings@390x780|focus|046|select#cache-gb "How much disk finished pre-transcodes may o
+theater|settings@390x780|focus|047|button.ghost.sm "Save"
+theater|settings@390x780|focus|048|a "Home"
+theater|settings@390x780|focus|049|a "Activity"
+theater|settings@390x780|focus|050|a.on "Settings"
+theater|settings@390x780|focus|051|<wrap>
 theater|settings@390x780|req|GET /api/v1/activity|2
 theater|settings@390x780|req|GET /api/v1/libraries|1
 theater|settings@390x780|req|GET /api/v1/me|1
 theater|settings@390x780|req|GET /api/v1/scan/status|3
 theater|settings@390x780|req|GET /api/v1/server|1
 theater|settings@390x780|req|GET /api/v1/settings|1
+theater|settings@390x780|req|GET /api/v1/system/playback-events|1
 theater|settings@390x780|req|GET /api/v1/system|1
 theater|settings@390x780|req|GET /api/v1/trakt/status|3
 theater|settings@390x780|req|GET /api/v1/users|1
