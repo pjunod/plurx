@@ -426,6 +426,17 @@ struct PlayerTouchWideRow<Transport: View, Timeline: View, Options: View>: View 
 }
 #endif
 
+/// The production marker content shared by the player and its layout tests.
+struct PlayerMarkerButtonLabel: View {
+    let title: String
+
+    var body: some View {
+        Label(title, systemImage: "forward.end.fill")
+            .font(.system(.caption, design: .monospaced))
+            .lineLimit(1)
+    }
+}
+
 /// Keeps transient playback actions compact and pinned to the trailing edge of
 /// the transport chrome at every viewport width.
 struct PlayerTrailingControlRow<Control: View>: View {
@@ -439,7 +450,9 @@ struct PlayerTrailingControlRow<Control: View>: View {
         HStack {
             Spacer(minLength: 0)
             control
+                #if os(tvOS)
                 .fixedSize(horizontal: true, vertical: false)
+                #endif
         }
         .frame(maxWidth: .infinity)
     }
@@ -1387,8 +1400,7 @@ struct PlayerView: View {
             controller.skipActiveMarker()
             revealControls()
         } label: {
-            Label(marker.label, systemImage: "forward.end.fill")
-                .font(.system(.caption, design: .monospaced))
+            PlayerMarkerButtonLabel(title: marker.label)
         }
         #if os(tvOS)
         .buttonStyle(TVReadableButtonStyle(prominent: true))
