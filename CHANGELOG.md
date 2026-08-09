@@ -10,6 +10,13 @@ bump may break compatibility and a **patch** bump never does.
 
 ### Added
 
+- **Apple artwork now survives app relaunches.** iOS and tvOS keep original
+  poster and backdrop bytes in a 256 MiB on-disk LRU, paint seven-day-fresh
+  entries before touching the network, and retain stale fallbacks for up to
+  30 days while a refresh is attempted. Artwork URL and server changes use
+  distinct cache identities, and signing out or leaving a server clears its
+  cached bytes.
+
 - **The Phase 4 storage boundary now has a complete replicated backend and a
   real three-voter contract gate.** M0–M1c established local node identity,
   rollback-tolerant cluster configuration, the Hiqlite decision, replicated
