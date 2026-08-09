@@ -12,7 +12,7 @@ anything it can't (MKV, DTS/TrueHD, …) is delivered as the server's on-the-fly
 HDR display at runtime and sends that to `/decision`, so the server transcodes
 only what this hardware genuinely can't play.
 
-> Status: **v0.2.7**, build `42` in [`project.yml`](project.yml) — working
+> Status: **v0.2.7**, build `43` in [`project.yml`](project.yml) — working
 > development client. Browse, resume, discover, and play on both iOS and
 > tvOS. Both targets compile against the iOS/tvOS 26.5 SDKs and share the
 > same regression suite. Build 29 added app-managed offline viewing on iPhone

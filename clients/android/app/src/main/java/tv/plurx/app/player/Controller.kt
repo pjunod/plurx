@@ -366,12 +366,14 @@ class Controller(
     fun startAt(ms: Long) = restartAt(ms.coerceAtLeast(0))
 
     fun realPosition(): Long {
-        val pos = player.currentPosition.coerceAtLeast(0)
-        return when {
-            directTransport || sessionIsVod -> pos
-            progressiveTransport -> progressiveMediaOrigin.currentOriginMs() + pos
-            else -> baseMs + pos
-        }
+        return realMediaPositionMs(
+            playerPositionMs = player.currentPosition,
+            directTransport = directTransport,
+            sessionIsVod = sessionIsVod,
+            progressiveTransport = progressiveTransport,
+            progressiveOriginMs = progressiveMediaOrigin.currentOriginMs(),
+            sessionBaseMs = baseMs,
+        )
     }
 
     fun seekTo(targetMs: Long) {
@@ -540,9 +542,12 @@ class Controller(
             hls.delivered_dynamic_range?.let { deliveredRange = it }
             // A cached session is the whole stream on disk: its timeline
             // starts at zero and the player seeks, exactly like direct play.
-            baseMs = sessionMediaOriginMs(hls)
-            val startPositionMs = if (hls.vod) ms else 0L
-            player.setMediaItem(MediaItem.fromUri(Session.url(hls.playlist_url)), startPositionMs)
+            val timeline = sessionPlaybackTimeline(hls, requestedStartMs = ms)
+            baseMs = timeline.baseMs
+            player.setMediaItem(
+                MediaItem.fromUri(Session.url(hls.playlist_url)),
+                timeline.attachPositionMs,
+            )
             player.prepare()
             player.playWhenReady = true
             armTextSelection()

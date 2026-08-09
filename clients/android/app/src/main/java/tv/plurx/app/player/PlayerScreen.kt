@@ -258,6 +258,20 @@ internal fun playerSeekDeltaMs(keyCode: Int, controlsVisible: Boolean): Long? {
     }
 }
 
+/** Accumulates bare-surface D-pad repeats against one frozen player position. */
+internal class HiddenSeekAccumulator(private val durationMs: Long) {
+    var pendingTargetMs: Long? = null
+        private set
+
+    fun nudge(currentPositionMs: Long, deltaMs: Long): Long {
+        val base = pendingTargetMs ?: currentPositionMs.coerceAtLeast(0L)
+        val ceiling = durationMs.takeIf { it > 0L } ?: Long.MAX_VALUE
+        return (base + deltaMs).coerceIn(0L, ceiling).also { pendingTargetMs = it }
+    }
+
+    fun consume(): Long? = pendingTargetMs.also { pendingTargetMs = null }
+}
+
 private const val MAX_PIP_ASPECT_RATIO = 2.39
 
 /** Returns an Android-supported PiP aspect ratio, using 16:9 when media metadata is unusable. */
@@ -502,6 +516,11 @@ private fun PlayerContent(
     val displayHdrTypes = remember(context) { Caps.displayHdrTypes(context) }
 
     var positionMs by remember { mutableLongStateOf(startMs) }
+    val hiddenSeekAccumulator = remember(controller, plan.durationMs) {
+        HiddenSeekAccumulator(plan.durationMs)
+    }
+    var hiddenSeekTargetMs by remember(controller) { mutableStateOf<Long?>(null) }
+    var seekHudPositionMs by remember(controller) { mutableStateOf<Long?>(null) }
     var scrubbing by remember { mutableStateOf(false) }
     var scrubPreview by remember { mutableLongStateOf(startMs) }
     var isPlaying by remember { mutableStateOf(true) }
@@ -534,6 +553,13 @@ private fun PlayerContent(
     fun poke() {
         controlsVisible = true
         lastInteraction += 1
+    }
+
+    fun nudgeHiddenSeek(deltaMs: Long) {
+        hiddenSeekAccumulator.nudge(controller.realPosition(), deltaMs).let { target ->
+            hiddenSeekTargetMs = target
+            seekHudPositionMs = target
+        }
     }
 
     BackHandler(enabled = !isInPip) {
@@ -686,6 +712,19 @@ private fun PlayerContent(
             delay(500)
         }
     }
+    LaunchedEffect(hiddenSeekTargetMs) {
+        val target = hiddenSeekTargetMs ?: return@LaunchedEffect
+        delay(300)
+        if (hiddenSeekTargetMs == target) {
+            hiddenSeekAccumulator.consume()?.let(controller::seekTo)
+            hiddenSeekTargetMs = null
+        }
+    }
+    LaunchedEffect(seekHudPositionMs) {
+        val target = seekHudPositionMs ?: return@LaunchedEffect
+        delay(1_600)
+        if (seekHudPositionMs == target) seekHudPositionMs = null
+    }
     LaunchedEffect(controller.playbackNotice) {
         val notice = controller.playbackNotice ?: return@LaunchedEffect
         delay(5_000)
@@ -738,7 +777,7 @@ private fun PlayerContent(
                     controlsVisible = controlsVisible,
                 )
                 if (seekDelta != null) {
-                    controller.seekTo(controller.realPosition() + seekDelta)
+                    nudgeHiddenSeek(seekDelta)
                     return@onPreviewKeyEvent true
                 }
                 when (event.nativeKeyEvent.keyCode) {
@@ -808,6 +847,20 @@ private fun PlayerContent(
             Column(Modifier.align(Alignment.Center), horizontalAlignment = Alignment.CenterHorizontally) {
                 CircularProgressIndicator(color = Accent)
                 if (findingNext) Text("Up next…", color = Color.White, modifier = Modifier.padding(top = 12.dp))
+            }
+        }
+
+        if (!isInPip) {
+            seekHudPositionMs?.let { target ->
+                Text(
+                    text = "Seek ${formatTime(target)}",
+                    color = Color.White,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier
+                        .align(Alignment.Center)
+                        .background(Color.Black.copy(alpha = 0.78f), MaterialTheme.shapes.medium)
+                        .padding(horizontal = 18.dp, vertical = 10.dp),
+                )
             }
         }
 

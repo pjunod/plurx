@@ -48,6 +48,26 @@ class EvidenceWorkflowCase(unittest.TestCase):
         self.assertIn("self.refreshPGSOverlayWindow(at: overlayPosition)", apple)
         self.assertEqual(server.count("prune(&root).await;"), 1)
 
+    def test_media_origin_and_remote_seek_consumption_remain_wired(self) -> None:
+        android = self.read("clients/android/app/src/main/java/tv/plurx/app/player/Controller.kt")
+        android_screen = self.read(
+            "clients/android/app/src/main/java/tv/plurx/app/player/PlayerScreen.kt"
+        )
+        apple = self.read("clients/apple/Sources/PlayerController.swift")
+        apple_view = self.read("clients/apple/Sources/PlayerView.swift")
+        hls = self.read("crates/plurxd/src/http/hls.rs")
+
+        self.assertIn("return realMediaPositionMs(", android)
+        self.assertIn("val timeline = sessionPlaybackTimeline(hls, requestedStartMs = ms)", android)
+        self.assertIn(".setTransferListener(progressiveMediaOrigin)", android)
+        self.assertIn("HiddenSeekAccumulator(plan.durationMs)", android_screen)
+        self.assertIn("hiddenSeekAccumulator.consume()?.let(controller::seekTo)", android_screen)
+        self.assertIn("nextBaseMs = Self.sessionMediaOriginMs(hls, requestedStartMs: startMs)", apple)
+
+        remote_seek = apple_view.split("private func seekFromRemote", 1)[1].split("#endif", 1)[0]
+        self.assertLess(remote_seek.index("controller.skip"), remote_seek.index("revealControlsFromRemote"))
+        self.assertIn("skipped Apple HEVC tier normalization", hls)
+
 
 if __name__ == "__main__":
     unittest.main()

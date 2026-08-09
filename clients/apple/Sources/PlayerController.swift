@@ -2597,7 +2597,7 @@ final class PlayerController: ObservableObject {
     /// use direct timeline semantics and always begin at zero.
     nonisolated static func sessionMediaOriginMs(_ hls: HlsStart, requestedStartMs: Int) -> Int {
         if hls.vod == true { return 0 }
-        if let mediaOriginMs = hls.mediaOriginMs { return mediaOriginMs }
+        if let mediaOriginMs = hls.mediaOriginMs { return max(0, mediaOriginMs) }
         return Int((hls.startSeconds ?? Double(requestedStartMs) / 1000.0) * 1000)
     }
 
