@@ -30,7 +30,7 @@ pub const HIQLITE_INCOMING_DIRNAME: &str = "hiqlite.incoming";
 pub struct PreparedSqliteImport {
     pub source_path: PathBuf,
     pub backup_path: PathBuf,
-    pub source_sha256: String,
+    pub backup_sha256: String,
     pub schema_version: i64,
 }
 
@@ -129,7 +129,7 @@ fn remove_abandoned_backup_temps(migration_dir: &Path) -> Result<(), StoreError>
         let entry = entry.map_err(|error| migration_io("reading", migration_dir, error))?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name.starts_with(&format!(".{SQLITE_FILENAME}.")) && name.ends_with(".incoming") {
+        if is_backup_temp_artifact(&name) {
             let path = entry.path();
             let metadata = std::fs::symlink_metadata(&path)
                 .map_err(|error| migration_io("inspecting", &path, error))?;
@@ -148,6 +148,16 @@ fn remove_abandoned_backup_temps(migration_dir: &Path) -> Result<(), StoreError>
         sync_directory(migration_dir)?;
     }
     Ok(())
+}
+
+fn is_backup_temp_artifact(name: &str) -> bool {
+    let Some(remainder) = name.strip_prefix(&format!(".{SQLITE_FILENAME}.")) else {
+        return false;
+    };
+    let Some((identifier, suffix)) = remainder.split_once(".incoming") else {
+        return false;
+    };
+    !identifier.is_empty() && matches!(suffix, "" | "-wal" | "-shm")
 }
 
 fn create_backup(
@@ -174,6 +184,13 @@ fn create_backup(
                 StoreError::Migration(format!("copying SQLite import source: {error}"))
             })?;
     }
+    destination
+        .pragma_update(None, "journal_mode", "DELETE")
+        .map_err(|error| {
+            StoreError::Migration(format!(
+                "canonicalizing SQLite backup journal mode: {error}"
+            ))
+        })?;
     let copied_version = read_schema_version(&destination)?;
     if copied_version != schema_version {
         return Err(StoreError::Migration(format!(
@@ -194,12 +211,12 @@ fn create_backup(
     File::open(temporary_path)
         .and_then(|file| file.sync_all())
         .map_err(|error| migration_io("syncing", temporary_path, error))?;
-    let source_sha256 = sha256_file(temporary_path)?;
-    let backup_path = migration_dir.join(format!("plurx-v{schema_version}-{source_sha256}.db"));
+    let backup_sha256 = sha256_file(temporary_path)?;
+    let backup_path = migration_dir.join(format!("plurx-v{schema_version}-{backup_sha256}.db"));
 
     if backup_path.exists() {
         let existing_sha256 = sha256_file(&backup_path)?;
-        if existing_sha256 != source_sha256 {
+        if existing_sha256 != backup_sha256 {
             return Err(StoreError::Migration(format!(
                 "existing migration backup {} does not match its content-addressed name",
                 backup_path.display()
@@ -211,7 +228,7 @@ fn create_backup(
             Ok(()) => {}
             Err(error) if backup_path.exists() => {
                 let existing_sha256 = sha256_file(&backup_path)?;
-                if existing_sha256 != source_sha256 {
+                if existing_sha256 != backup_sha256 {
                     return Err(migration_io("publishing", &backup_path, error));
                 }
                 remove_file_if_present(temporary_path)?;
@@ -224,7 +241,7 @@ fn create_backup(
     Ok(PreparedSqliteImport {
         source_path: source_path.to_owned(),
         backup_path,
-        source_sha256,
+        backup_sha256,
         schema_version,
     })
 }
@@ -304,7 +321,7 @@ mod tests {
         assert!(!incoming.exists(), "abandoned target was removed");
         assert_eq!(prepared.schema_version, SQLITE_SCHEMA_VERSION);
         assert_eq!(
-            prepared.source_sha256,
+            prepared.backup_sha256,
             sha256_file(&prepared.backup_path).expect("hash published backup")
         );
 
@@ -321,6 +338,10 @@ mod tests {
             )
             .expect("backed-up setting");
         assert_eq!(value, "committed");
+        let journal_mode: String = backup
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .expect("read backup journal mode");
+        assert_eq!(journal_mode, "delete");
     }
 
     #[test]
@@ -353,9 +374,15 @@ mod tests {
             ".{SQLITE_FILENAME}.{}.incoming",
             uuid::Uuid::new_v4()
         ));
+        let abandoned_wal = PathBuf::from(format!("{}-wal", abandoned.display()));
+        let abandoned_shm = PathBuf::from(format!("{}-shm", abandoned.display()));
         std::fs::write(&abandoned, b"partial backup").expect("abandoned backup");
+        std::fs::write(&abandoned_wal, b"partial wal").expect("abandoned backup wal");
+        std::fs::write(&abandoned_shm, b"partial shm").expect("abandoned backup shm");
         let first = prepare_sqlite_import(data.path()).expect("first backup");
         assert!(!abandoned.exists(), "abandoned backup temp was removed");
+        assert!(!abandoned_wal.exists(), "abandoned backup WAL was removed");
+        assert!(!abandoned_shm.exists(), "abandoned backup SHM was removed");
         let repeated = prepare_sqlite_import(data.path()).expect("repeated backup");
         assert_eq!(first, repeated);
 
@@ -370,12 +397,30 @@ mod tests {
         assert!(
             std::fs::read_dir(data.path().join(MIGRATION_DIRNAME))
                 .expect("migration dir")
-                .all(|entry| !entry
-                    .expect("migration entry")
-                    .file_name()
-                    .to_string_lossy()
-                    .ends_with(".incoming")),
+                .all(|entry| {
+                    let entry = entry.expect("migration entry");
+                    !is_backup_temp_artifact(&entry.file_name().to_string_lossy())
+                }),
             "no temporary backup remains"
+        );
+    }
+
+    #[test]
+    fn corrupt_content_addressed_backup_is_refused() {
+        let data = tempfile::tempdir().expect("data dir");
+        let source_path = data.path().join(SQLITE_FILENAME);
+        SqliteStore::open(&source_path).expect("source store");
+
+        let prepared = prepare_sqlite_import(data.path()).expect("first backup");
+        std::fs::write(&prepared.backup_path, b"not a SQLite backup")
+            .expect("poison published backup");
+
+        let error = prepare_sqlite_import(data.path()).expect_err("corrupt backup refused");
+        assert!(
+            error
+                .to_string()
+                .contains("does not match its content-addressed name"),
+            "unexpected error: {error}"
         );
     }
 }

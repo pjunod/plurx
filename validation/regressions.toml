@@ -205,3 +205,9 @@ points = []
 checks = []
 reason = "These commits only correct documentation, comments, record a review, or change ignored generated cache state; they introduce no executable behavior."
 ignore = true
+
+[[coverage]]
+commits = ["b11b9d9e"]
+points = ["persistence.upgrades"]
+checks = ["database-upgrades"]
+reason = "The clustering migration tests pin WAL-inclusive backup, refusal-before-mutation, abandoned staging cleanup, canonical journal mode, content-addressed reuse, and corruption rejection."

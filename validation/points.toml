@@ -250,7 +250,7 @@ checks = ["rust-gate"]
 [[points]]
 id = "persistence.upgrades"
 title = "Persistent database compatibility"
-contract = "Existing libraries upgrade without losing data; a newer unsupported database is refused without changing staging state; clustering import publishes a verified, durable SQLite backup before activation."
+contract = "Existing libraries upgrade without losing data; a newer unsupported database is refused without changing staging state; the staged import-preparation helper publishes a durable, content-addressed SQLite backup without activating clustering."
 paths = [
   "crates/plurx-core/src/cluster/migration.rs",
   "crates/plurx-core/src/store/sqlite/mod.rs",
