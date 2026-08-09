@@ -426,6 +426,25 @@ struct PlayerTouchWideRow<Transport: View, Timeline: View, Options: View>: View 
 }
 #endif
 
+/// Keeps transient playback actions compact and pinned to the trailing edge of
+/// the transport chrome at every viewport width.
+struct PlayerTrailingControlRow<Control: View>: View {
+    let control: Control
+
+    init(@ViewBuilder control: () -> Control) {
+        self.control = control()
+    }
+
+    var body: some View {
+        HStack {
+            Spacer(minLength: 0)
+            control
+                .fixedSize(horizontal: true, vertical: false)
+        }
+        .frame(maxWidth: .infinity)
+    }
+}
+
 /// Source vs delivered vs rendered, for the one badge that has to answer both
 /// "what is this file?" and "what am I getting?" — MEDIA-BADGES-PLAN.md §2.
 ///
@@ -1020,15 +1039,9 @@ struct PlayerView: View {
             playbackInfoHeader
 
             if let marker = controller.activeMarker {
-                #if os(tvOS)
-                HStack {
-                    Spacer(minLength: 0)
+                PlayerTrailingControlRow {
                     markerButton(marker)
-                        .fixedSize(horizontal: true, vertical: false)
                 }
-                #else
-                markerButton(marker)
-                #endif
             }
 
             #if os(tvOS)
@@ -1376,9 +1389,6 @@ struct PlayerView: View {
         } label: {
             Label(marker.label, systemImage: "forward.end.fill")
                 .font(.system(.caption, design: .monospaced))
-                #if os(iOS)
-                .frame(maxWidth: .infinity)
-                #endif
         }
         #if os(tvOS)
         .buttonStyle(TVReadableButtonStyle(prominent: true))
