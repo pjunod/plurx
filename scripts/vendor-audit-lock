@@ -62,6 +62,16 @@ def main() -> None:
         args.root.read_text(encoding="utf-8"),
         args.registry_evidence.read_text(encoding="utf-8"),
     )
+    # Deliberate verification probe: smallvec 0.6.9 is affected by
+    # RUSTSEC-2019-0009. This package exists only in the synthesized vendor
+    # lockfile, so the first workspace audit must stay green while the second
+    # working-directory audit turns red. This branch will never be merged.
+    output += """
+[[package]]
+name = "smallvec"
+version = "0.6.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+"""
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(output, encoding="utf-8")
 
