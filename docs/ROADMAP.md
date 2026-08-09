@@ -118,12 +118,17 @@ through M3; M4 *is* Phase 4's transcode chapter and waits for its plumbing.
   and active-reader eviction protection are shipped. Cached TTFF and seek
   measurements remain operational evidence, not unfinished implementation.
 
-## Phase 4 — HA for real
+## Phase 4 — HA for real (IN PROGRESS)
 
 The executable handoff is
 [CLUSTERING-PLAN.md](CLUSTERING-PLAN.md): it separates node identity from the
 logical server first, then brings up the one-voter replicated store before
 membership, singleton jobs, session takeover, and failure drills.
+
+M0–M1d are merged: identity, the one-/three-voter Hiqlite proofs, replicated
+auth/catalogue/media/search contracts, and the complete 120-method Store
+backend are in-tree. M2 activation is next; SQLite remains the production
+default until import and daemon selection land.
 
 - ✅ **M0 complete 2026-08-07:** local node identity, rollback-tolerant
   cluster configuration, Hiqlite decision/cost record, deterministic-SQL guard,

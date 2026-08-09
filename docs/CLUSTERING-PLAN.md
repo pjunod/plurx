@@ -4,7 +4,7 @@
 measurement, import, and daemon activation remain pending
 · **Executes:** Phase 4 from [ROADMAP.md](ROADMAP.md) and REQ-HA-1–6 from
 [REQUIREMENTS.md](REQUIREMENTS.md) · **Written:** 2026-08-06 · **Revised:**
-2026-08-08
+2026-08-09
 
 Companion to [PHASE3-SPIKE.md](PHASE3-SPIKE.md), which chose hiqlite and
 proved restart-at-boundary media behavior; [PERF-PLAN.md](PERF-PLAN.md) §7,
@@ -119,9 +119,12 @@ join_token_file = ""             # absent bootstraps/reopens one voter
 trusted_network = ""             # required if transport is not TLS
 ```
 
-`enc_keys`, `secret_raft`, and `secret_api` live in mode-`0600` files beside
-`node.id`, generated atomically. They are never logged, exposed in settings, or
-stored in replicated SQL. A single-use join token contains cluster id,
+The shipped build keeps `secret_raft` and `secret_api` in mode-`0600` files
+beside `node.id`, generated atomically. Hiqlite's `enc_keys` field is compiled
+out because plurx uses `default-features = false`; it returns only if a later
+M3 backup/dashboard design deliberately enables and threat-models that feature.
+These secrets are never logged, exposed in settings, or stored in replicated
+SQL. A single-use join token contains cluster id,
 bootstrap addresses, expiry, the new raft id, and an encrypted envelope for
 those secrets; the one-time token secret wraps the envelope and is invalidated
 after membership commits.
@@ -130,9 +133,9 @@ Trakt is the exception to the otherwise hash-only credential rows: its access
 and refresh tokens are live bearer secrets. Replicating plaintext would copy
 them into every voter database, raft WAL, snapshot, and backup, where row
 deletion cannot erase historical log entries. Before M2 may select Hiqlite,
-those columns must use envelope encryption under `enc_keys`; only ciphertext,
-key version, and non-secret metadata may enter raft. A copied voter disk must
-not be sufficient to use a household's Trakt account.
+those columns must use envelope encryption under a plurx-owned key file; only
+ciphertext, key version, and non-secret metadata may enter raft. A copied voter
+disk must not be sufficient to use a household's Trakt account.
 
 M0 must verify hiqlite 0.14's transport support. If it cannot provide TLS, the
 first clustering release is explicit: authenticated-but-cleartext inter-node

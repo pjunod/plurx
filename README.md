@@ -13,8 +13,9 @@ and live TV are out of scope on purpose (see [non-goals](#non-goals)).
 
 > **Self-hosted and pre-1.0.** plurx runs on your LAN with no cloud dependency and
 > never phones home. It mounts your media **read-only** and never writes, renames,
-> or deletes a file. Today it runs as a **single node** — the HA cluster is
-> decided and validated (Phase 3 spike) but not yet wired up (Phase 4). Treat it
+> or deletes a file. Today it runs as a **single node** — replicated Store
+> backends are merged, but cluster import and daemon activation are still Phase
+> 4 work. Treat it
 > as a capable daily driver, not a backup of your only copy.
 
 ![The plurx home screen — continue watching, next up, and recently added](docs/img/home.png)
@@ -282,11 +283,11 @@ Phases are gates — each ends with something you actually use. Full detail in
 - [~] **Playback experience.** Borderless player, staged loading, rich stats, skip
   intro/credits with auto-skip — shipped. Public ratings and multi-server
   dashboard still to come.
-- [ ] **Phase 4 — HA for real.** `HiqliteStore` behind the unchanged `Store`
-  trait, replicated sessions, client-retry failover, Helm chart, failure-drill
-  tests.
-- [ ] **Phase 5 — Native clients.** Android/Google TV → Apple TV → Tizen/webOS →
-  Roku, each with a device profile and the shared correctness corpus.
+- [~] **Phase 4 — HA for real.** Clustering M0–M1d is merged behind the
+  unchanged `Store` trait; single-node SQLite remains the production default
+  while import, activation, replicated sessions, and failover proceed.
+- [~] **Phase 5 — Native clients.** Android/Google TV and Apple iOS/tvOS clients
+  are working; Tizen/webOS and Roku have not started.
 
 ## Non-goals
 

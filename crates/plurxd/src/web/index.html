@@ -4487,7 +4487,7 @@ function attachHls(video, playlistUrl, startAt){
         }
         return;
       }
-      console.warn("[cinemarr] hls.js fatal",d.type,d.details);
+      console.warn("[cinema] hls.js fatal",d.type,d.details);
       clientLog(Object.assign({level:"error",event:"hls_fatal",detail:d.type,message:d.details}, playbackContext()));
       // The rescue the progressive path has had all along.
       //
@@ -5952,7 +5952,7 @@ async function stallDiagnose(){
       detail="A browser privacy or ad-blocker extension is the usual cause (it silently drops /stream.mp4 and /hls/ requests). Open in a private window with extensions disabled, or allowlist this site.";
     }
   }
-  console.warn("[cinemarr] playback stall diagnosis",{method:PLAYER.method,url,networkState:v&&v.networkState,readyState:v&&v.readyState,error:v&&v.error&&v.error.code,verdict});
+  console.warn("[cinema] playback stall diagnosis",{method:PLAYER.method,url,networkState:v&&v.networkState,readyState:v&&v.readyState,error:v&&v.error&&v.error.code,verdict});
   if(PLAYER.started) return;   // raced with a late start
   clientLog({level:"warn",event:"stall",src:(url||"").split("?")[0],message:verdict,detail:detail});
   setLoading(true, verdict, detail,
@@ -6191,7 +6191,7 @@ function wirePlayer(){
     clearStall();
     const err=v.error, code=err?err.code:0, msg=(err&&err.message)||"";
     const src=(v.currentSrc||"").split("?")[0];
-    console.warn("[cinemarr] video error",{code,msg,method:PLAYER&&PLAYER.method,src});
+    console.warn("[cinema] video error",{code,msg,method:PLAYER&&PLAYER.method,src});
     // `playbackIsReal()` and not `PLAYER.started`: the guard means "we already
     // got real playback going, don't churn", and audio alone used to satisfy
     // it — which disabled this rescue in precisely the black-picture-with-

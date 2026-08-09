@@ -142,6 +142,7 @@ Runbook, with monarr's side too: [OPERATIONS.md](OPERATIONS.md).
 | `PLURX_GDM_PORT` | `32414` | GDM host port |
 | `PLURX_TRAKT_BASE` | `https://api.trakt.tv` | Trakt API base (tests/mocks) |
 | `PLURX_LOG` | `info` | `tracing` filter (e.g. `plurxd=debug`) |
+| `PLURX_SCAN_PRUNE_PERCENT` | `10` | Maximum percentage of known files one scan may delete; `0` disables automatic pruning |
 | `PLURX_HLS_CLOSED_CAPTIONS_NONE` | off | Experiment: `CLOSED-CAPTIONS=NONE` on the HLS variant |
 | `PLURX_HLS_FORCED_AUTOSELECT` | off | Experiment: `AUTOSELECT=YES` on forced subtitle renditions |
 | `PLURX_PGS_OVERLAY` | off | Staged authenticated PGS manifest/PNG producer; not a production rollout switch until device acceptance |
@@ -162,8 +163,13 @@ master regression so far. Reasoning and the failure they target are in
 | `/api/v1/...` | Native JSON API (bearer token) |
 | `/api/v1/files/{id}/decision` | How a file will be served (direct / remux / transcode) + markers |
 | `/api/v1/scan` | "Index exactly this path" for another application (scoped key, `scan:trigger`) |
+| `POST /api/v1/libraries/{id}/root-identity/reset` | Accept an operator-verified replacement for a library mount |
+| `POST /api/v1/system/search-index/rebuild` | Rebuild the node-local search index (admin) |
 | `/api/v1/keys` | Mint/list/revoke scoped API keys (admin token) |
 | Plex-compat façade | `/identity`, `/library/...`, `/:/timeline`, GDM — for Kodi-family Plex clients |
+
+Offline global/per-user quota settings and accounting are in
+[OPERATIONS.md](OPERATIONS.md#offline-package-storage-and-quotas).
 
 ## Reference — player keyboard & controls
 
