@@ -183,6 +183,13 @@ test = "clients/apple/Tests/AppleClientTests.swift"
 test_anchor = "testBufferingWaitHasAnIndependentBoundedRecoveryTimer"
 
 [[decisions]]
+id = "apple.item-end"
+source = "clients/apple/Sources/PlayerController.swift"
+source_anchor = "static func endAction("
+test = "clients/apple/Tests/AppleClientTests.swift"
+test_anchor = "testUnknownDurationEndReopensUntilAnEndIsCorroborated"
+
+[[decisions]]
 id = "apple.pgs-overlay"
 source = "clients/apple/Sources/PlayerController.swift"
 source_anchor = "static func subtitleUsesOverlay("
@@ -209,6 +216,13 @@ source = "clients/apple/Sources/PlayerView.swift"
 source_anchor = ".modifier(PlayerSystemOverlayModifier("
 test = "clients/apple/Tests/AppleClientTests.swift"
 test_anchor = "testIOSPlayerSystemOverlayModifierReachesHostingController"
+
+[[decisions]]
+id = "apple.marker-control-row"
+source = "clients/apple/Sources/PlayerView.swift"
+source_anchor = "struct PlayerTrailingControlRow<Control: View>: View"
+test = "clients/apple/Tests/AppleClientTests.swift"
+test_anchor = "testSkipMarkerRowUsesProductionContentAtEveryTouchWidthAndTextSize"
 
 [[decisions]]
 id = "apple.quality-session"

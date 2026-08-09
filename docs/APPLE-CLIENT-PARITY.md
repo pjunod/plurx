@@ -9,7 +9,7 @@ The implementation history, deployment evidence, and resolved copied-Dolby-
 Vision investigation are recorded in
 [APPLE-NATIVE-SUBTITLES-HANDOFF.md](APPLE-NATIVE-SUBTITLES-HANDOFF.md).
 
-> Status (2026-08-08): source is v0.2.7, Apple build 37. Native text
+> Status (2026-08-09): source is v0.2.7, Apple build 43. Native text
 > subtitles, the cinematic detail surface, stable seek/recovery, truthful
 > delivered-range badges, and app-managed offline viewing on iPhone/iPad have
 > landed. The default-off `pgs-v1` overlay client is staged but is not a
@@ -17,7 +17,7 @@ Vision investigation are recorded in
 > Vision was resolved on the physical Apple TV 2026-08-03; the historical
 > `-12927` investigation is superseded by
 > [APPLE-NATIVE-SUBTITLES-HANDOFF.md](APPLE-NATIVE-SUBTITLES-HANDOFF.md)'s
-> resolved status. Repository evidence still says build 37 has not reached
+> resolved status. Repository evidence still says build 43 has not reached
 > TestFlight and the deployment ledger still ends at server `787eaa6`, so
 > publishing plus the broader real-hardware/offline matrix remain release
 > gates.
@@ -52,7 +52,7 @@ Vision investigation are recorded in
 | Audio tracks | Select and restart when needed | Select and restart at the same position | Add friendlier channel/codec labels; validate TrueHD/DTS fallback |
 | Subtitles | Text WebVTT stays client-side; bitmap tracks burn in | SRT/SubRip/WebVTT use native HLS renditions, chosen by the server's `native` flag rather than a local codec guess; PGS can use the staged default-off `pgs-v1` overlay while VobSub, `mov_text`, and styled ASS/SSA retain burn-in; automatic selection never starts a burn except a forced track (see §2) | Physically verify native selection and the gated PGS overlay across iPhone/iPad and Apple TV |
 | Quality | Auto adaptation, Original, explicit rungs | Server Auto plus explicit ladder rungs; a change that fails to create its session leaves the current stream playing | P1: continuous adaptation and an honest Original option when compatible |
-| Playback info | Detailed source, output, network, encoder, stalls | Source/output, dynamic range, access-log bitrate/stalls, server encode speed/ahead/delivery | Add TTFF, frame presentation rate, stall classification, and build stamp |
+| Playback info | Detailed source, output, network, encoder, stalls | Source/output, dynamic range, access-log bitrate/stalls, server encode speed/ahead/delivery; recovery actions and shorter self-recovered AVPlayer stalls reach the bounded server client log | Add TTFF, frame presentation rate, and build stamp; validate sub-threshold stall cadence on physical iPad |
 | Media badges | Source badges on detail pages; source-vs-delivered dynamic range in the player | Same shape: detail pages carry resolution/codec/dynamic range source-only; the player's chip dims and names what is actually being delivered (§5) | Extend the same mechanism to audio (Atmos → AAC) and resolution (4K → rung), each with its own truth table |
 | Intro/credits | Manual and automatic skip | Manual marker button | P1: persisted auto-skip and next-episode handling for end credits |
 | Autoplay | Next episode, then next season; default on | Same traversal and default | Add a cancelable countdown and “Up Next” metadata |

@@ -623,6 +623,9 @@ pub struct SettingsDto {
     /// disk" and that is a property of the disk, not a preference.
     pub hls_ahead_max_bytes: String,
     pub hls_scratch_max_bytes: String,
+    /// Opt-in physical-device experiment: serve new live sessions as typeless
+    /// sliding playlists from their first response. Off by default.
+    pub hls_typeless_sliding: bool,
     /// Server-wide scheduled maintenance, in minutes; 0 is off (the default).
     /// Per-library scan/refresh intervals are on the library, not here.
     pub probe_retry_mins: i64,
@@ -834,6 +837,11 @@ async fn settings_dto(state: &AppState) -> Result<SettingsDto, ApiError> {
         hls_ahead_max_secs,
         hls_ahead_max_bytes,
         hls_scratch_max_bytes,
+        hls_typeless_sliding: state
+            .store
+            .get_setting(keys::HLS_TYPELESS_SLIDING)
+            .await?
+            .is_some_and(|value| value.trim() == "1"),
         probe_retry_mins,
         artwork_retry_mins,
         transcode_cleanup_mins,
@@ -885,6 +893,7 @@ pub struct UpdateSettings {
     pub hls_ahead_max_secs: Option<String>,
     pub hls_ahead_max_bytes: Option<String>,
     pub hls_scratch_max_bytes: Option<String>,
+    pub hls_typeless_sliding: Option<bool>,
     /// Server-wide job intervals in minutes; 0 turns one off.
     pub probe_retry_mins: Option<i64>,
     pub artwork_retry_mins: Option<i64>,
@@ -937,6 +946,12 @@ pub async fn update_settings(
         state
             .store
             .put_setting(keys::MONARR_WATCHED_SYNC, if on { "1" } else { "0" })
+            .await?;
+    }
+    if let Some(on) = req.hls_typeless_sliding {
+        state
+            .store
+            .put_setting(keys::HLS_TYPELESS_SLIDING, if on { "1" } else { "0" })
             .await?;
     }
     if let Some(mode) = &req.sub_mode {
@@ -1169,6 +1184,7 @@ pub struct Activity {
 
 #[derive(Clone, Serialize)]
 struct OfflineWork {
+    id: String,
     /// `prepare` or `send`; neither is a playback session.
     kind: &'static str,
     user: String,
@@ -1230,6 +1246,7 @@ async fn offline_work(state: &AppState) -> Result<Vec<OfflineWork>, ApiError> {
             None => "Unavailable media".to_owned(),
         };
         work.push(OfflineWork {
+            id: package.id.clone(),
             kind: if transfer_bytes.is_some() {
                 "send"
             } else {
@@ -1615,6 +1632,34 @@ pub async fn stop_session(
     if !stopped {
         return Err(ApiError::NotFound("session"));
     }
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// DELETE /api/v1/activity/offline/:id (admin) — cancel one visible package.
+pub async fn stop_offline_package(
+    _admin: AdminUser,
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let now = now_unix();
+    let package = state
+        .store
+        .offline_activity_packages(&state.node_id, now, now.saturating_sub(65), 50)
+        .await?
+        .into_iter()
+        .map(|row| row.package)
+        .find(|package| package.id == id)
+        .ok_or(ApiError::NotFound("offline package"))?;
+    state.offline.cancel(&id).await;
+    if !state
+        .store
+        .delete_offline_package(&id, package.user_id)
+        .await?
+    {
+        return Err(ApiError::NotFound("offline package"));
+    }
+    state.offline.record_cancellation(&package);
+    state.offline.forget_transfer(&id);
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 

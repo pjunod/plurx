@@ -1409,13 +1409,15 @@ pub async fn segment(
     State(state): State<AppState>,
     AxPath((session, seg)): AxPath<(String, String)>,
 ) -> Result<Response, ApiError> {
+    const APPLE_INIT_REWRITE_LIMIT_BYTES: u64 = 1024 * 1024;
+
     let opened = state
         .transcode
         .segment(&session, &seg)
         .await
         .ok_or(ApiError::NotFound("segment"))?;
     let content_type = segment_content_type(&seg);
-    if seg == "init.mp4" && opened.len <= 1024 * 1024 {
+    if seg == "init.mp4" && opened.len <= APPLE_INIT_REWRITE_LIMIT_BYTES {
         let mut init = Vec::with_capacity(opened.len.min(64 * 1024) as usize);
         opened
             .file
@@ -1444,6 +1446,14 @@ pub async fn segment(
             init,
         )
             .into_response());
+    }
+    if seg == "init.mp4" && opened.len > APPLE_INIT_REWRITE_LIMIT_BYTES {
+        tracing::warn!(
+            session_id = %session,
+            init_bytes = opened.len,
+            limit_bytes = APPLE_INIT_REWRITE_LIMIT_BYTES,
+            "skipped Apple HEVC tier normalization because init.mp4 exceeds the inspection bound"
+        );
     }
     Ok((
         StatusCode::OK,

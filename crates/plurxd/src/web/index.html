@@ -4487,7 +4487,7 @@ function attachHls(video, playlistUrl, startAt){
         }
         return;
       }
-      console.warn("[cinemarr] hls.js fatal",d.type,d.details);
+      console.warn("[cinema] hls.js fatal",d.type,d.details);
       clientLog(Object.assign({level:"error",event:"hls_fatal",detail:d.type,message:d.details}, playbackContext()));
       // The rescue the progressive path has had all along.
       //
@@ -5952,7 +5952,7 @@ async function stallDiagnose(){
       detail="A browser privacy or ad-blocker extension is the usual cause (it silently drops /stream.mp4 and /hls/ requests). Open in a private window with extensions disabled, or allowlist this site.";
     }
   }
-  console.warn("[cinemarr] playback stall diagnosis",{method:PLAYER.method,url,networkState:v&&v.networkState,readyState:v&&v.readyState,error:v&&v.error&&v.error.code,verdict});
+  console.warn("[cinema] playback stall diagnosis",{method:PLAYER.method,url,networkState:v&&v.networkState,readyState:v&&v.readyState,error:v&&v.error&&v.error.code,verdict});
   if(PLAYER.started) return;   // raced with a late start
   clientLog({level:"warn",event:"stall",src:(url||"").split("?")[0],message:verdict,detail:detail});
   setLoading(true, verdict, detail,
@@ -6191,7 +6191,7 @@ function wirePlayer(){
     clearStall();
     const err=v.error, code=err?err.code:0, msg=(err&&err.message)||"";
     const src=(v.currentSrc||"").split("?")[0];
-    console.warn("[cinemarr] video error",{code,msg,method:PLAYER&&PLAYER.method,src});
+    console.warn("[cinema] video error",{code,msg,method:PLAYER&&PLAYER.method,src});
     // `playbackIsReal()` and not `PLAYER.started`: the guard means "we already
     // got real playback going, don't churn", and audio alone used to satisfy
     // it — which disabled this rescue in precisely the black-picture-with-
@@ -7028,7 +7028,8 @@ function updateStats(){
           ?` · bytes release ≤${fmtBytes(h.resume_below_bytes)}`
         :h.hold_reason==='global' && h.resume_below_bytes!=null
           ?` · global release ≤${fmtBytes(h.resume_below_bytes)}`:'';
-      srv+=`<div><b>Server ahead</b>${Math.max(0,h.ahead_seconds)} s${h.suspended?` · held${release}`:''}</div>`;
+      const transitions=h.suspend_count?` · ${h.suspend_count} suspend${h.suspend_count===1?'':'s'}`:'';
+      srv+=`<div><b>Server ahead</b>${Math.max(0,h.ahead_seconds)} s${h.suspended?` · held${release}`:''}${transitions}</div>`;
     }
     if(h.out_time_ms!=null && h.ahead_seconds==null){
       // A progressive stream has no published-media frontier to report; what
@@ -7317,12 +7318,19 @@ async function renderActivityBody(){
   const dels=d.deliveries||d.sessions.map(se=>({method:"transcode",user:se.user_name,item_id:se.item_id,
     title:se.item_title,started_unix:se.started_unix,idle_seconds:se.idle_seconds,session_id:se.id,
     target_height:se.target_height,encoder:se.encoder}));
-  const rows=dels.map(de=>`<tr>
-    <td><b><a href="#/item/${de.item_id}">${esc(de.title)}</a></b></td>
-    <td>${esc(de.user)}</td>
-    <td>${esc(de.method)}${de.session_id&&de.target_height?` · ${de.target_height}p`:''}${de.session_id&&de.encoder?` · ${esc(de.encoder)}`:''}</td>
-    <td class="muted">${fmtAgo(de.started_unix)}${de.idle_seconds>30?` · idle ${Math.round(de.idle_seconds)}s`:''}</td>
-    <td style="text-align:right">${(ME&&ME.is_admin&&de.session_id)?`<button class="ghost sm" onclick="stopSession(${esc(JSON.stringify(de.session_id))})">Stop</button>`:''}</td></tr>`).join("");
+  const sessionsById=Object.fromEntries((d.sessions||[]).map(se=>[se.id,se]));
+  const rows=dels.map(de=>{
+    const se=de.session_id?sessionsById[de.session_id]:null;
+    const flow=!se?'':se.suspended
+      ?` · held (${esc(se.hold_reason||'limit')}) · ${se.suspend_count||1} suspend${(se.suspend_count||1)===1?'':'s'}`
+      :se.suspend_count?` · ${se.suspend_count} suspend${se.suspend_count===1?'':'s'} · running`:'';
+    return `<tr>
+      <td><b><a href="#/item/${de.item_id}">${esc(de.title)}</a></b></td>
+      <td>${esc(de.user)}</td>
+      <td>${esc(de.method)}${de.session_id&&de.target_height?` · ${de.target_height}p`:''}${de.session_id&&de.encoder?` · ${esc(de.encoder)}`:''}${flow}</td>
+      <td class="muted">${fmtAgo(de.started_unix)}${de.idle_seconds>30?` · idle ${Math.round(de.idle_seconds)}s`:''}</td>
+      <td style="text-align:right">${(ME&&ME.is_admin&&de.session_id)?`<button class="ghost sm" onclick="stopSession(${esc(JSON.stringify(de.session_id))})">Stop</button>`:''}</td></tr>`;
+  }).join("");
   const scans=d.scans.map(sc=>`<tr><td style="width:200px"><b>${esc(sc.library)}</b></td><td class="muted">${statusText(sc.status)}</td></tr>`).join("");
   const t=d.trakt||{};
   const trakt = t.configured
@@ -7355,7 +7363,8 @@ async function renderActivityBody(){
     return `<tr>
       <td><b>${title}</b></td><td>${esc(ow.user)}</td>
       <td>${esc(phase)} <span class="muted">· ${ow.target_height}p</span></td>
-      <td>${progress}</td><td class="muted">${fmtAgo(ow.started_unix)}</td></tr>`;
+      <td>${progress}</td><td class="muted">${fmtAgo(ow.started_unix)}</td>
+      <td style="text-align:right">${ME&&ME.is_admin?`<button class="ghost sm" onclick="stopOfflinePackage(${esc(JSON.stringify(ow.id))})">Stop</button>`:''}</td></tr>`;
   }).join("");
   const m=document.getElementById("main"); if(!m) return;
   m.innerHTML=`
@@ -7367,7 +7376,7 @@ async function renderActivityBody(){
     ${produce}
     <h2 class="section">Offline downloads</h2>
     ${offline.length
-      ? `<table><thead><tr><th>Title</th><th>Profile</th><th>Work</th><th>Progress</th><th>Requested</th></tr></thead><tbody>${offlineRows}</tbody></table>`
+      ? `<table><thead><tr><th>Title</th><th>Profile</th><th>Work</th><th>Progress</th><th>Requested</th><th></th></tr></thead><tbody>${offlineRows}</tbody></table>`
       : `<div class="empty">No offline packages are being prepared or sent right now.</div>`}
     <h2 class="section">Library</h2>
     ${d.scans.length? `<table><tbody>${scans}</tbody></table>` : `<div class="empty">No libraries yet.</div>`}
@@ -7380,6 +7389,10 @@ async function stopSession(id){
 }
 async function stopProducer(){
   try{ const r=await api("/activity/producer",{method:"DELETE"}); toast(r.note||"Stopping"); renderActivityBody(); }
+  catch(e){ toast(e.message); }
+}
+async function stopOfflinePackage(id){
+  try{ await api(`/activity/offline/${id}`,{method:"DELETE"}); toast("Offline download stopped"); renderActivityBody(); }
   catch(e){ toast(e.message); }
 }
 
@@ -7724,6 +7737,7 @@ function playbackPanel(settings){
         <div><label>Then pace at</label><select id="phr" style="width:auto;min-width:200px">${presetOpts([["1.5","1.5× — gentlest"],["2","2× — recommended"],["4","4×"],["0","Unlimited"]], settings.hls_readrate, v=>`${v}×`)}</select></div>
         <div><label>Buffer limit</label><select id="pha" style="width:auto;min-width:200px">${presetOpts([["60","1 minute"],["180","3 minutes — recommended"],["600","10 minutes"],["0","No limit — needs disk"]], settings.hls_ahead_max_secs, v=>`${v} seconds`)}</select></div>
       </div>
+      <label class="row" style="margin:16px 0 0;font-size:14px;color:var(--text)"><input type="checkbox" id="phs" ${settings.hls_typeless_sliding?'checked':''} style="width:auto;margin-right:9px"> Experimental typeless sliding HLS <span class="muted" style="font-size:12px;margin-left:6px">· applies to new sessions; use only for the iPad control comparison</span></label>
       <div class="err" id="perr"></div>
       <button style="margin-top:12px" onclick="savePlayback()">Save defaults</button></div>`;
 }
@@ -7995,7 +8009,8 @@ async function savePlayback(){
       stream_readrate:document.getElementById("prr").value,
       hls_readrate:document.getElementById("phr").value,
       hls_burst_secs:document.getElementById("phb").value,
-      hls_ahead_max_secs:document.getElementById("pha").value}});
+      hls_ahead_max_secs:document.getElementById("pha").value,
+      hls_typeless_sliding:document.getElementById("phs").checked}});
     toast("Playback defaults saved");
   }catch(e){ err.textContent=e.message; }
 }

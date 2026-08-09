@@ -170,6 +170,11 @@ pub mod keys {
     /// one runaway session; it says nothing about several healthy ones filling
     /// the disk between them.
     pub const HLS_SCRATCH_MAX_BYTES: &str = "playback.hls_scratch_max_bytes";
+    /// Experimental Apple-facing playlist envelope. When enabled, new live
+    /// HLS sessions serve a typeless sliding playlist from their first
+    /// response instead of changing from EVENT only after retention begins.
+    /// Off by default until the physical-iPad control run is conclusive.
+    pub const HLS_TYPELESS_SLIDING: &str = "playback.hls_typeless_sliding";
     /// How many transcodes may run on the hardware encoder at once.
     ///
     /// An iGPU has one video-processing block, and two 4K sessions on it do not

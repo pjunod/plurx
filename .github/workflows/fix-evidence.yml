@@ -1,0 +1,48 @@
+name: fix evidence (opt-in)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+
+permissions:
+  contents: read
+
+jobs:
+  revert-proof:
+    name: report whether retained Rust tests reject the base implementation
+    if: contains(github.event.pull_request.labels.*.name, 'fixes-behavior')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - name: Revert production paths in a disposable clone
+        id: proof
+        continue-on-error: true
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          mapfile -t paths < <(
+            git diff --name-only "$BASE_SHA...HEAD" -- 'crates/**/*.rs' \
+              | grep -Ev '(^|/)(tests?|benches)/' \
+              | sort -u
+          )
+          if (( ${#paths[@]} == 0 )); then
+            echo "No changed Rust production paths; use the documented Swift/manual protocol." \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          scripts/prove-fix "$BASE_SHA" - "${paths[@]}"
+      - name: Publish the report-only result
+        if: always()
+        env:
+          PROOF_OUTCOME: ${{ steps.proof.outcome }}
+        run: |
+          if [[ "$PROOF_OUTCOME" == success ]]; then
+            echo "## Revert proof: discriminating test observed" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "## Revert proof: no discriminating failure observed" >> "$GITHUB_STEP_SUMMARY"
+            echo "This is report-only during the evidence-policy trial month." >> "$GITHUB_STEP_SUMMARY"
+          fi

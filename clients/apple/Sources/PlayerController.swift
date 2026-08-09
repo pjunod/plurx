@@ -89,6 +89,48 @@ struct ApplePlaybackStallLog: Encodable {
     }
 }
 
+/// AVPlayer's own access-log counter catches shorter waits that recover before
+/// the six-sample recovery ladder acts. It rides the ordinary progress cadence
+/// and keeps the same bounded, token-free client-log shape as ladder beacons.
+struct ApplePlaybackObservedStallLog: Encodable {
+    let level = "warn"
+    let event = "stall"
+    let message = "AVPlayer reported a self-recovered stall"
+    let method: String
+    let title: String
+    let fileId: Int
+    let vcodec: String?
+    let detail: String
+    let ms: Int
+    let encoder: String?
+    let ua = "Apple AVPlayer"
+
+    init(
+        delta: Int,
+        positionMs: Int,
+        stagnantDurationMs: Int,
+        method: String,
+        title: String,
+        fileId: Int,
+        vcodec: String?,
+        encoder: String?
+    ) {
+        self.method = method
+        self.title = title
+        self.fileId = fileId
+        self.vcodec = vcodec
+        detail = "kind=access_log · position_ms=\(max(0, positionMs)) · stall_delta=\(max(1, delta)) · outcome=self_recovered"
+        ms = max(0, stagnantDurationMs)
+        self.encoder = encoder
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case level, event, message, method, title, detail, ms, encoder, ua
+        case fileId = "file_id"
+        case vcodec
+    }
+}
+
 /// Requests that arrive while a stream replacement is in flight are remembered
 /// rather than dropped. Two replacements must never overlap — they share a
 /// `playback_id`, so the newer create intentionally removes the older session
@@ -248,6 +290,63 @@ struct SameDeliveryStallRecoveryState: Equatable {
     mutating func reset() { attempted = false }
 }
 
+/// Per-AVPlayerItem establishment gate. Every replacement begins unarmed and
+/// has to advance five seconds on its own clock before buffering recovery may
+/// treat a wait as a mid-playback interruption.
+struct PlayerAttachmentRecoveryState: Equatable {
+    private(set) var attachedAtPositionMs = 0
+    private(set) var establishedPlayback = false
+
+    mutating func opened(at positionMs: Int) {
+        attachedAtPositionMs = max(0, positionMs)
+        establishedPlayback = false
+    }
+
+    mutating func observe(positionMs: Int, playing: Bool) {
+        guard playing,
+              positionMs >= attachedAtPositionMs + 5_000
+        else { return }
+        establishedPlayback = true
+    }
+}
+
+struct PlaybackStallObservation: Equatable {
+    let delta: Int
+    let stagnantDurationMs: Int
+}
+
+/// Deltas AVPlayer's cumulative access-log counter and holds the detector's
+/// latest sub-threshold stagnant interval until the next 10-second progress
+/// report. A new item resets the counter because AVPlayer does too.
+struct PlaybackStallObservationState: Equatable {
+    private var lastNumberOfStalls = 0
+    private var pendingStagnantDurationMs = 0
+
+    mutating func noteRecoveredStagnation(_ durationMs: Int?) {
+        pendingStagnantDurationMs = max(pendingStagnantDurationMs, durationMs ?? 0)
+    }
+
+    mutating func take(numberOfStalls: Int?) -> PlaybackStallObservation? {
+        guard let numberOfStalls else { return nil }
+        let current = max(0, numberOfStalls)
+        let delta = current >= lastNumberOfStalls
+            ? current - lastNumberOfStalls
+            : current
+        lastNumberOfStalls = current
+        defer { pendingStagnantDurationMs = 0 }
+        guard delta > 0 else { return nil }
+        return PlaybackStallObservation(
+            delta: delta,
+            stagnantDurationMs: pendingStagnantDurationMs
+        )
+    }
+
+    mutating func reset() {
+        lastNumberOfStalls = 0
+        pendingStagnantDurationMs = 0
+    }
+}
+
 enum PlaybackCompatibilityFallback: Equatable {
     case none
     case hdrBase
@@ -262,6 +361,7 @@ struct PlaybackStallDetector: Equatable {
     private(set) var lastPositionMs: Int?
     private(set) var stagnantChecks = 0
     private(set) var stagnantSince: TimeInterval?
+    private(set) var recoveredDurationMs: Int?
 
     mutating func sample(
         positionMs: Int,
@@ -269,7 +369,8 @@ struct PlaybackStallDetector: Equatable {
         observedAt: TimeInterval = ProcessInfo.processInfo.systemUptime
     ) -> PlaybackStallAction {
         guard shouldMonitor else {
-            reset()
+            recordRecovery(at: observedAt)
+            clearSample()
             return .none
         }
         guard let lastPositionMs else {
@@ -282,6 +383,7 @@ struct PlaybackStallDetector: Equatable {
         // two-second samples. A backwards discontinuity means an item/seek
         // changed under the monitor and establishes a new baseline too.
         if positionMs >= lastPositionMs + 250 || positionMs < lastPositionMs - 250 {
+            recordRecovery(at: observedAt)
             self.lastPositionMs = positionMs
             stagnantChecks = 0
             stagnantSince = observedAt
@@ -302,10 +404,28 @@ struct PlaybackStallDetector: Equatable {
         return max(0, Int(((observedAt - stagnantSince) * 1_000).rounded()))
     }
 
-    mutating func reset() {
+    mutating func takeRecoveredDurationMs() -> Int? {
+        defer { recoveredDurationMs = nil }
+        return recoveredDurationMs
+    }
+
+    private mutating func recordRecovery(at observedAt: TimeInterval) {
+        guard stagnantChecks > 0 else { return }
+        recoveredDurationMs = max(
+            recoveredDurationMs ?? 0,
+            stagnantDurationMs(at: observedAt)
+        )
+    }
+
+    private mutating func clearSample() {
         lastPositionMs = nil
         stagnantChecks = 0
         stagnantSince = nil
+    }
+
+    mutating func reset() {
+        clearSample()
+        recoveredDurationMs = nil
     }
 }
 
@@ -315,6 +435,7 @@ struct PlaybackStallDetector: Equatable {
 struct PlaybackRecoveryMonitor: Equatable {
     private(set) var silentDetector = PlaybackStallDetector()
     private(set) var bufferingDetector = PlaybackStallDetector()
+    private var recoveredStagnantDurationMs: Int?
 
     @MainActor
     mutating func sample(
@@ -341,6 +462,12 @@ struct PlaybackRecoveryMonitor: Equatable {
                 ),
             observedAt: observedAt
         )
+        for recovered in [
+            silentDetector.takeRecoveredDurationMs(),
+            bufferingDetector.takeRecoveredDurationMs(),
+        ].compactMap({ $0 }) {
+            recoveredStagnantDurationMs = max(recoveredStagnantDurationMs ?? 0, recovered)
+        }
         guard let selection = Self.select(
             silentAction: silentAction,
             bufferingAction: bufferingAction
@@ -354,6 +481,11 @@ struct PlaybackRecoveryMonitor: Equatable {
             positionMs: positionMs,
             durationMs: durationMs
         )
+    }
+
+    mutating func takeRecoveredStagnantDurationMs() -> Int? {
+        defer { recoveredStagnantDurationMs = nil }
+        return recoveredStagnantDurationMs
     }
 
     /// Buffering wins if a future predicate change accidentally enables both
@@ -375,6 +507,7 @@ struct PlaybackRecoveryMonitor: Equatable {
     mutating func reset() {
         silentDetector.reset()
         bufferingDetector.reset()
+        recoveredStagnantDurationMs = nil
     }
 }
 
@@ -397,6 +530,11 @@ enum SubtitleSelectionRoute: Equatable {
 enum PlayerItemEndAction: Equatable {
     case reopen
     case finish(durationMs: Int)
+}
+
+enum SameDeliveryRecoveryTransport: Equatable {
+    case serverSession
+    case offlineAsset
 }
 
 /// Drives one AVPlayer and executes the server-owned delivery plan. It also
@@ -431,14 +569,21 @@ final class PlayerController: ObservableObject {
         knownDurationMs: Int,
         itemDurationMs: Int?,
         isGrowingPlaylist: Bool,
-        endedAt: Int
+        endedAt: Int,
+        previousUncorroboratedEndMs: Int? = nil
     ) -> PlayerItemEndAction {
         let corroboratedDuration = knownDurationMs > 0
             ? knownDurationMs
             : isGrowingPlaylist
                 ? nil
                 : itemDurationMs.flatMap { $0 > 0 ? $0 : nil }
-        guard let durationMs = corroboratedDuration else { return .reopen }
+        guard let durationMs = corroboratedDuration else {
+            guard !isGrowingPlaylist,
+                  let previousUncorroboratedEndMs,
+                  abs(endedAt - previousUncorroboratedEndMs) < 250
+            else { return .reopen }
+            return .finish(durationMs: max(endedAt, previousUncorroboratedEndMs))
+        }
         guard endedAt >= durationMs - 15_000 else { return .reopen }
         return .finish(durationMs: durationMs)
     }
@@ -475,6 +620,7 @@ final class PlayerController: ObservableObject {
     private var title = ""
     #if os(iOS)
     private var offlineId: String?
+    private var offlineAssetURL: URL?
     #endif
     private var audioOverride: Int?
     private weak var model: AppModel?
@@ -497,9 +643,13 @@ final class PlayerController: ObservableObject {
     /// Once real playback has begun, a transport interruption is not evidence
     /// that the device rejected HDR. Rebuild the same delivery once instead of
     /// silently replacing a picture the viewer has already watched with SDR.
-    private var establishedPlayback = false
+    private var attachmentRecovery = PlayerAttachmentRecoveryState()
     private var establishedHDRRetryAttempted = false
-    private var attachedAtPositionMs = 0
+    private var stallObservation = PlaybackStallObservationState()
+    /// A completed/VOD item with no usable catalog or AVPlayer duration gets
+    /// one reopen. A second end at the same position finishes instead of
+    /// creating an unbounded session loop. Growing playlists never set this.
+    private var lastUncorroboratedEndMs: Int?
     /// A burn is part of the current video frames. Leaving one requires one
     /// reopen; native-to-native and native-to-Off never do.
     private var activeBurnedSubtitle: Int?
@@ -625,6 +775,10 @@ final class PlayerController: ObservableObject {
     ) {
         guard !started else { return }
         started = true
+        #if os(iOS)
+        offlineId = nil
+        offlineAssetURL = nil
+        #endif
         self.model = model
         self.itemId = itemId
         self.fileId = fileId
@@ -640,10 +794,11 @@ final class PlayerController: ObservableObject {
         canRetryCurrentItemWithTranscode = false
         compatibilityFallbackAttempted = false
         forceCompatibilityTranscode = false
-        establishedPlayback = false
+        attachmentRecovery.opened(at: startMs)
         establishedHDRRetryAttempted = false
+        stallObservation.reset()
+        lastUncorroboratedEndMs = nil
         sameDeliveryStallRecovery.reset()
-        attachedAtPositionMs = max(0, startMs)
         clearPlaybackNotice()
 
         #if os(iOS)
@@ -687,6 +842,7 @@ final class PlayerController: ObservableObject {
         started = true
         self.model = model
         offlineId = offline.id
+        offlineAssetURL = OfflineCatalog.localURL(for: path)
         itemId = offline.itemId
         fileId = offline.fileId
         knownDurationMs = offline.durationMs ?? 0
@@ -703,16 +859,20 @@ final class PlayerController: ObservableObject {
         isDirectPlayback = true
         decision = Self.offlineDecision(offline)
         wantsPlayback = true
+        attachmentRecovery.opened(at: currentMs)
+        stallObservation.reset()
+        lastUncorroboratedEndMs = nil
         player.appliesMediaSelectionCriteriaAutomatically = false
         player.automaticallyWaitsToMinimizeStalling = true
         try? AVAudioSession.sharedInstance().setCategory(.playback)
         try? AVAudioSession.sharedInstance().setActive(true)
         installRemoteCommands()
         addPeriodicObserver()
+        startPlaybackRecoveryMonitor()
         Task { await loadOffline(url: OfflineCatalog.localURL(for: path), startMs: currentMs) }
     }
 
-    private static func offlineDecision(_ item: OfflineItem) -> Decision {
+    nonisolated static func offlineDecision(_ item: OfflineItem) -> Decision {
         let audio = item.audioLabel.map {
             [AudioTrack(index: 0, codec: "aac", channels: nil, language: nil, title: $0, default: true)]
         }
@@ -789,8 +949,16 @@ final class PlayerController: ObservableObject {
         player.play()
         isPlaying = true
         failed = false
-        attachedAtPositionMs = startMs
+        attachmentRecovery.opened(at: startMs)
         updateNowPlaying()
+    }
+
+    private func reloadOffline(at positionMs: Int) async {
+        guard let offlineAssetURL, started else { return }
+        isChangingStream = true
+        playbackRecoveryMonitor.reset()
+        await loadOffline(url: offlineAssetURL, startMs: positionMs)
+        isChangingStream = false
     }
     #endif
 
@@ -994,6 +1162,8 @@ final class PlayerController: ObservableObject {
             Task { await model?.endHlsSession(sessionId) }
         }
         #if os(iOS)
+        offlineId = nil
+        offlineAssetURL = nil
         if wasStarted {
             removeRemoteCommands()
             MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
@@ -1113,6 +1283,7 @@ final class PlayerController: ObservableObject {
         openGeneration &+= 1
         let generation = openGeneration
         finished = false
+        attachmentRecovery.opened(at: startMs)
         isChangingStream = true
         failed = false
         playbackError = nil
@@ -1307,6 +1478,7 @@ final class PlayerController: ObservableObject {
         pgsOverlayItemGeneration &+= 1
         pgsOverlayWindowTask?.cancel()
         pgsOverlayWindow = nil
+        stallObservation.reset()
         player.replaceCurrentItem(with: item)
         // Publish the new local-to-film mapping only once the new item is the
         // one whose clock `realPositionMs()` reads. Updating it during session
@@ -1344,7 +1516,6 @@ final class PlayerController: ObservableObject {
         }
         isPlaying = resumesPlayback
         currentMs = startMs
-        attachedAtPositionMs = startMs
         playbackRecoveryMonitor.reset()
         failed = false
         isChangingStream = false
@@ -1681,7 +1852,7 @@ final class PlayerController: ObservableObject {
                     // this item has advanced for five seconds, which confines
                     // buffering recovery to the mid-playback failure reported
                     // on iPad and prevents duplicate cold-start sessions.
-                    establishedPlayback: self.establishedPlayback
+                    establishedPlayback: self.attachmentRecovery.establishedPlayback
                 ) else { continue }
                 switch stallEvent.action {
                 case .none:
@@ -1711,6 +1882,12 @@ final class PlayerController: ObservableObject {
         reportPlaybackStall(event, outcome: decision.outcome)
         switch decision {
         case .reopen:
+            #if os(iOS)
+            if Self.recoveryTransport(hasOfflineAsset: offlineAssetURL != nil) == .offlineAsset {
+                await reloadOffline(at: event.positionMs)
+                return
+            }
+            #endif
             await reopen(at: event.positionMs)
         case .stop(let terminal):
             player.pause()
@@ -1720,6 +1897,12 @@ final class PlayerController: ObservableObject {
             failed = terminal.failed
             playbackError = terminal.message
         }
+    }
+
+    nonisolated static func recoveryTransport(
+        hasOfflineAsset: Bool
+    ) -> SameDeliveryRecoveryTransport {
+        hasOfflineAsset ? .offlineAsset : .serverSession
     }
 
     private func fail(_ error: Error) {
@@ -1748,14 +1931,22 @@ final class PlayerController: ObservableObject {
                 if self.seekState.pendingMs == nil && !self.isChangingStream {
                     self.currentMs = self.realPositionMs()
                 }
-                self.refreshPGSOverlayWindow(at: self.currentMs)
+                if let overlayPosition = PGSOverlayPolicy.periodicRefreshPosition(
+                    currentMs: self.currentMs,
+                    overlayIsActive: self.pgsOverlayIsActive
+                ) {
+                    self.refreshPGSOverlayWindow(at: overlayPosition)
+                }
                 // The last rate the viewer was genuinely playing at, so a
                 // pause at 1.5× is restored as 1.5× and not as the 0 the
                 // transport reports while paused (P2-5).
                 if self.player.timeControlStatus == .playing && self.player.rate > 0 {
                     self.preferredRate = self.player.rate
-                    if self.realPositionMs() >= self.attachedAtPositionMs + 5_000 {
-                        self.establishedPlayback = true
+                    self.attachmentRecovery.observe(
+                        positionMs: self.realPositionMs(),
+                        playing: true
+                    )
+                    if self.attachmentRecovery.establishedPlayback {
                         self.sameDeliveryStallRecovery.reset()
                         // The most recent same-delivery recovery proved itself.
                         // A later, independent interruption may reconnect once
@@ -1763,10 +1954,19 @@ final class PlayerController: ObservableObject {
                         self.establishedHDRRetryAttempted = false
                     }
                 }
+                self.stallObservation.noteRecoveredStagnation(
+                    self.playbackRecoveryMonitor.takeRecoveredStagnantDurationMs()
+                )
+                if let endedAt = self.lastUncorroboratedEndMs,
+                   self.currentMs >= endedAt + 250
+                {
+                    self.lastUncorroboratedEndMs = nil
+                }
                 self.updateNowPlaying()
                 if self.isPlaying && self.currentMs - self.lastReportedMs >= 10_000 {
                     self.lastReportedMs = self.currentMs
                     self.report(self.currentMs)
+                    self.reportObservedPlaybackStalls(at: self.currentMs)
                 }
             }
         }
@@ -1790,19 +1990,25 @@ final class PlayerController: ObservableObject {
                 let itemDurationMs = itemDurationSeconds.isFinite && itemDurationSeconds > 0
                     ? Int(itemDurationSeconds * 1000)
                     : nil
+                let isGrowingPlaylist = self.sessionId != nil && !self.isVOD
                 switch Self.endAction(
                     knownDurationMs: self.knownDurationMs,
                     itemDurationMs: itemDurationMs,
-                    isGrowingPlaylist: self.sessionId != nil,
-                    endedAt: endedAt
+                    isGrowingPlaylist: isGrowingPlaylist,
+                    endedAt: endedAt,
+                    previousUncorroboratedEndMs: self.lastUncorroboratedEndMs
                 ) {
                 case .reopen:
                     // The viewer did not pause — the playlist merely announced
                     // its current end — and `wantsPlayback` still says so, so
                     // this continuation keeps playing.
+                    if !isGrowingPlaylist, self.knownDurationMs <= 0, itemDurationMs == nil {
+                        self.lastUncorroboratedEndMs = endedAt
+                    }
                     await self.reopen(at: endedAt)
                     return
                 case .finish(let durationMs):
+                    self.lastUncorroboratedEndMs = nil
                     self.isPlaying = false
                     self.wantsPlayback = false
                     self.currentMs = durationMs
@@ -1891,6 +2097,23 @@ final class PlayerController: ObservableObject {
             encoder: encoder
         )
         postClientLog(payload)
+    }
+
+    private func reportObservedPlaybackStalls(at positionMs: Int) {
+        #if os(iOS)
+        if offlineId != nil { return }
+        #endif
+        guard let observed = stallObservation.take(numberOfStalls: stalls) else { return }
+        postClientLog(ApplePlaybackObservedStallLog(
+            delta: observed.delta,
+            positionMs: positionMs,
+            stagnantDurationMs: observed.stagnantDurationMs,
+            method: clientLogMethod,
+            title: title,
+            fileId: fileId,
+            vcodec: decision?.source?.videoCodec,
+            encoder: encoder
+        ))
     }
 
     private func postClientLog<Payload: Encodable>(_ payload: Payload) {
@@ -2089,7 +2312,7 @@ final class PlayerController: ObservableObject {
     private func retryEstablishedHDRDelivery(at position: Int) async -> Bool {
         guard Self.shouldPreserveEstablishedHDRDelivery(
             deliveredRange: deliveredRange,
-            establishedPlayback: establishedPlayback
+            establishedPlayback: attachmentRecovery.establishedPlayback
         ) else { return false }
         guard !establishedHDRRetryAttempted else {
             player.pause()
@@ -2374,7 +2597,7 @@ final class PlayerController: ObservableObject {
     /// use direct timeline semantics and always begin at zero.
     nonisolated static func sessionMediaOriginMs(_ hls: HlsStart, requestedStartMs: Int) -> Int {
         if hls.vod == true { return 0 }
-        if let mediaOriginMs = hls.mediaOriginMs { return mediaOriginMs }
+        if let mediaOriginMs = hls.mediaOriginMs { return max(0, mediaOriginMs) }
         return Int((hls.startSeconds ?? Double(requestedStartMs) / 1000.0) * 1000)
     }
 

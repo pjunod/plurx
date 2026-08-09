@@ -342,10 +342,21 @@ branch happens to be checked out locally.
 | `nuc3` | Added to inventory; healthy, server build `787eaa6` |
 | `nuc4` | Image built from `787eaa6`; service cannot bind port 32400 because Plex owns it |
 
-The Ansible changes are local commits `26d8b2b` and `1d6ac4c`. That repository
-has no configured Git remote, so those two commits could not be pushed. The
-known `nuc4` conflict was explicitly accepted and ignored; do not misreport it
-as a successful running Plurx service.
+At that 2026-08-02 cut, the Ansible changes were local commits `26d8b2b` and
+`1d6ac4c` in a repository with no configured remote. The `nuc4` port conflict
+was then explicitly accepted and the service was not running.
+
+The current fleet was re-verified from each node itself on 2026-08-09:
+
+| Node | Current result |
+|---|---|
+| `nynuc` | Healthy, v0.2.7 build `e8a910f`, SQLite schema 15, TCP 32400 |
+| `nuc4` | Healthy, v0.2.7 build `e8a910f`, SQLite schema 15, TCP 32402 / GDM UDP 32415 |
+
+Both containers report a stamped build, expose `/dev/dri`, and mount every
+media share read-only. `nuc4`'s port override is intact. The private deployment
+repository now has protected mobile-deploy contracts and routes plurx image
+builds through the stamped `make docker-up` target.
 
 ### 7.3 Bedroom Apple TV
 

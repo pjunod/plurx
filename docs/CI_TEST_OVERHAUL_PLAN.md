@@ -178,23 +178,30 @@ T0; it cannot select or suppress a runtime suite. Selector code and
 browser, Apple, Android, cross-target, and container surfaces. An empty diff,
 unknown diff, push, or tag does not earn the shortcut.
 
-The scope also reports `mobile_version` independently. That lets CI run the
-highest-frequency policy failure before the general functionality-point job.
+The aggregate workflow, scope selector, and functionality catalog are
+scheduler inputs. A change to any of those three fails open to every surface:
+routing code must not use the routing decision it is changing to skip its own
+acceptance evidence.
 
-### 5.2 Preflight gates every expensive job
+The scope also reports `mobile_version` independently. That lets CI report the
+highest-frequency policy failure beside the general functionality-point and
+native-platform jobs instead of hiding their results.
 
-The new `fast policy and contract preflight` runs, in order:
+### 5.2 Structural preflight gates every expensive job
 
-1. mobile release versioning when the diff touches release inputs;
-2. corrective-history evidence;
-3. catalog lint and the validation-framework unit tests;
-4. CI, deploy, container, and shipping source contracts.
+The `fast policy and contract preflight` runs, in order:
 
-Every expensive fan-out job in `ci.yml` has `needs: [scope, preflight]`. A
-version error therefore stops browser, simulator, emulator, cross-build,
-Docker, and complete Rust work before those environments are provisioned. The
-dependency adds a small latency tax to green code PRs; keeping preflight below
-60 seconds p95 and free of compilers is the explicit acceptance condition.
+1. corrective-history evidence;
+2. catalog lint and the validation-framework unit tests;
+3. CI, deploy, container, and shipping source contracts.
+
+Every expensive fan-out job in `ci.yml` has `needs: [scope, preflight]`.
+Mobile release versioning is a sibling job selected by scope and consumed only
+by the aggregate gate. A stale counter therefore fails the PR without skipping
+the Swift or Kotlin evidence the author needs before the next push. The
+structural dependency adds a small latency tax to green code PRs; keeping
+preflight below 60 seconds p95 and free of compilers is the explicit acceptance
+condition.
 
 ### 5.3 Lint reports success without compiling docs-only changes
 
@@ -215,8 +222,9 @@ Observable CI acceptance:
 
 - a docs-only PR runs `scope`, `preflight`, the lightweight lint job, and
   `PR validation gate`; the portable Rust job is skipped;
-- an Apple or Android source change with a stale build counter fails in
-  preflight before any native job starts;
+- an Apple or Android source change with a stale build counter fails the mobile
+  version job, still reports the selected native suite, and fails the aggregate
+  gate;
 - a mixed `docs/**` plus `crates/**` change does not use the docs-only lane;
 - the literal PR #67 shape—its three documentation files plus
   `validation/regressions.toml`—does use the lane, while replacing the mapping
@@ -574,6 +582,15 @@ split so static/golden eligibility checks precede rendering, while capture
 work remains parallel with other same-surface integration tests after T0.
 
 ### 9.3 Flake policy
+
+**Status: in effect since 2026-08-09.**
+
+Refresh the compact outcome ledger with
+`scripts/ci-flake-report --runs 30`. The committed
+[`validation/ci-flake-ledger.json`](../validation/ci-flake-ledger.json) records
+each recent CI job's first-class GitHub conclusion and duration, plus per-job
+median and p95. It is evidence for ownership and quarantine decisions, not a
+rerun mechanism.
 
 1. A failing deterministic test fails the job immediately.
 2. CI may rerun the exact test once for diagnosis, but the job remains failed

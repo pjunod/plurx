@@ -29,6 +29,7 @@ jobs:
   workspace:
     name: RustSec workspace advisory scan
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - name: Restore patched crates to registry provenance for advisory matching
@@ -48,6 +49,7 @@ jobs:
   fuzz:
     name: RustSec fuzz advisory scan
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       # v2.0.0, pinned so the security gate cannot move without review.

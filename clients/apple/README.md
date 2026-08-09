@@ -12,10 +12,10 @@ anything it can't (MKV, DTS/TrueHD, …) is delivered as the server's on-the-fly
 HDR display at runtime and sends that to `/decision`, so the server transcodes
 only what this hardware genuinely can't play.
 
-> Status: **v0.2.7**, build `37` in [`project.yml`](project.yml) — working
+> Status: **v0.2.7**, build `43` in [`project.yml`](project.yml) — working
 > development client. Browse, resume, discover, and play on both iOS and
 > tvOS. Both targets compile against the iOS/tvOS 26.5 SDKs and share the
-> same regression suite. Build 29 adds app-managed offline viewing on iPhone
+> same regression suite. Build 29 added app-managed offline viewing on iPhone
 > and iPad; the action remains hidden on tvOS. The
 > default-off `pgs-v1` bitmap-overlay client draws PGS over the existing Dolby
 > Vision, HDR, or SDR video
@@ -43,7 +43,9 @@ only what this hardware genuinely can't play.
 - **App-managed offline viewing on iPhone and iPad.** Download queues are
   durable, transfer through two stable `AVAssetDownloadURLSession` background
   sessions for Wi-Fi-only and any-network policies, stay in app-private
-  storage, and resume after app termination. Downloads opens before server
+  storage, and resume after app termination. A restored completed transfer
+  still releases its server package and quota, even when Media3 finished while
+  the process was dead. Downloads opens before server
   reconnection, plays a validated local asset without making a playback
   decision, and syncs the newest local progress timestamp after reconnect.
   Another signed-in profile cannot play the saved title but can remove its

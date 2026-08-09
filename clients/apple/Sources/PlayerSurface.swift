@@ -134,6 +134,13 @@ struct PlayerSurface: UIViewRepresentable {
     let pgsOverlay: PGSOverlayWindow?
     let allowsPictureInPicture: Bool
 
+    nonisolated static func shouldAllowPictureInPicture(
+        isTearingDown: Bool,
+        pgsOverlayIsActive: Bool
+    ) -> Bool {
+        !isTearingDown && !pgsOverlayIsActive
+    }
+
     func makeCoordinator() -> Coordinator {
         Coordinator(pictureInPicture: pictureInPicture)
     }

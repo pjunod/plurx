@@ -217,14 +217,18 @@ struct PlurxAPI {
         guard let http = response as? HTTPURLResponse else {
             throw APIError.transport("The PGS overlay response was not HTTP.")
         }
-        switch http.statusCode {
-        case 200:
+        switch PGSOverlayPolicy.manifestDisposition(http.statusCode) {
+        case .ready:
             return .ready(try Self.decoder.decode(PGSOverlayManifest.self, from: data))
-        case 202:
-            let preparing = try Self.decoder.decode(PGSOverlayPreparing.self, from: data)
-            guard preparing.state == "preparing" else { throw PGSOverlayError.invalidManifest }
-            return .preparing(retryAfterMs: min(max(250, preparing.retryAfterMs), 5_000))
-        default:
+        case .preparing where http.statusCode == 202:
+            let state = try Self.decoder.decode(PGSOverlayPreparing.self, from: data)
+            guard state.state == "preparing" else { throw PGSOverlayError.invalidManifest }
+            return .preparing(retryAfterMs: min(max(250, state.retryAfterMs), 5_000))
+        case .preparing:
+            return .preparing(retryAfterMs: PGSOverlayPolicy.retryAfterMs(
+                http.value(forHTTPHeaderField: "Retry-After")
+            ))
+        case .terminal:
             throw APIError.http(http.statusCode)
         }
     }

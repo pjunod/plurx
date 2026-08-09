@@ -45,6 +45,32 @@ const READRATE_BURST_SECS: f64 = 30.0;
 /// byte stream rather than a JSON session envelope.
 pub(crate) const MEDIA_ORIGIN_MS_HEADER: HeaderName =
     HeaderName::from_static("x-plurx-media-origin-ms");
+/// A progressive response must not wait behind the HLS copy path's full
+/// five-second media-origin budget. ffmpeg is already opening the source in
+/// parallel; after one second the requested seek is the safe historic answer.
+const PROGRESSIVE_MEDIA_ORIGIN_PROBE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(1);
+
+async fn bounded_progressive_media_origin<F>(
+    start_seconds: f64,
+    budget: std::time::Duration,
+    probe: F,
+) -> f64
+where
+    F: std::future::Future<Output = f64>,
+{
+    match tokio::time::timeout(budget, probe).await {
+        Ok(origin) => origin,
+        Err(_) => {
+            tracing::warn!(
+                start_seconds,
+                timeout_ms = budget.as_millis() as u64,
+                "progressive media-origin probe exceeded startup budget; using requested start"
+            );
+            start_seconds
+        }
+    }
+}
 
 /// The configured remux pace, in multiples of real time. `0` disables pacing.
 /// Admin-settable because the right answer depends on the link: a 10GbE lab
@@ -1395,8 +1421,13 @@ async fn remux(spec: RemuxSpec<'_>) -> Result<Response, ApiError> {
     // path: the work overlaps instead of adding its full latency to startup.
     // `make_zero` makes the preceding keyframe local time zero, so the
     // requested seek is not an accurate source-time origin for copied video.
-    let media_origin_seconds =
-        crate::transcode::probe_media_origin(path, start.unwrap_or(0.0).max(0.0)).await;
+    let start_seconds = start.unwrap_or(0.0).max(0.0);
+    let media_origin_seconds = bounded_progressive_media_origin(
+        start_seconds,
+        PROGRESSIVE_MEDIA_ORIGIN_PROBE_TIMEOUT,
+        crate::transcode::probe_media_origin(path, start_seconds),
+    )
+    .await;
 
     let (tracked_stream, guard) = match tracked {
         Some((s, g)) => (Some(s), Some(g)),
@@ -1688,6 +1719,37 @@ mod tests {
         ] {
             assert!(!is_progress_line(line), "prose: {line}");
         }
+    }
+
+    /// This is the response-start budget in isolation: an artificially cold
+    /// origin probe cannot add its full delay before the progressive body is
+    /// returned. The production call uses the pinned one-second budget; the
+    /// short test budget keeps the suite fast while exercising the same race.
+    #[tokio::test]
+    async fn delayed_origin_probe_cannot_hold_progressive_first_byte_past_budget() {
+        assert_eq!(
+            PROGRESSIVE_MEDIA_ORIGIN_PROBE_TIMEOUT,
+            std::time::Duration::from_secs(1)
+        );
+        let budget = std::time::Duration::from_millis(20);
+        let began = std::time::Instant::now();
+        let origin = bounded_progressive_media_origin(42.0, budget, async {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            40.0
+        })
+        .await;
+        assert_eq!(origin, 42.0, "timeout falls back to the requested seek");
+        assert!(
+            began.elapsed() < std::time::Duration::from_millis(100),
+            "the delayed probe held response creation for {:?}",
+            began.elapsed()
+        );
+
+        assert_eq!(
+            bounded_progressive_media_origin(42.0, budget, async { 40.0 }).await,
+            40.0,
+            "a prompt keyframe answer still reaches the response header"
+        );
     }
 
     fn headers_with_range(value: &str) -> HeaderMap {

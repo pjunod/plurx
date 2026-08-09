@@ -6,6 +6,25 @@ version = 1
 # document and therefore has no runtime behavior to validate.
 
 [[coverage]]
+commits = ["dba6c9a4", "e237c918", "78b2fb8e"]
+points = ["core.media", "library.catalog", "playback.pipeline"]
+checks = ["rust-gate"]
+reason = "The current workspace tests pin global HLS hold release, the restored prune assertion, and the small-library prune floor."
+
+[[coverage]]
+commits = [
+  "abbc4d38",
+  "724711c2",
+  "e8b569df",
+  "1d794fdc",
+  "726b640f",
+  "e926ee80",
+]
+points = ["cluster.auth"]
+checks = ["cluster-auth"]
+reason = "The three-voter replicated-store contract pins JSON identity binding, reconcile races, SQL access, timeouts, and the reviewed M1d/PR90 corrections."
+
+[[coverage]]
 commits = ["92484fa7"]
 points = ["operations.packaging"]
 checks = ["container-runtime"]

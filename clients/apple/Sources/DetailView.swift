@@ -1614,13 +1614,19 @@ struct DetailView: View {
             actionError = nil
             Task {
                 do {
+                    // Markers are authored by the playback-decision seam, not
+                    // the browse DTO. Snapshot them while online so the
+                    // downloaded payload can still expose Skip Intro/Credits
+                    // after the server is unreachable.
+                    let markers = (try? await model.decision(fileId: file.id))?.markers ?? []
                     try await downloads.queue(
                         itemId: detail.item.id,
                         fileId: file.id,
                         title: detail.item.title,
                         context: playbackSubtitle(detail.item),
                         durationMs: file.durationMs ?? detail.item.runtimeMs,
-                        posterPath: detail.item.poster
+                        posterPath: detail.item.poster,
+                        markers: markers
                     )
                 } catch {
                     actionError = error.localizedDescription

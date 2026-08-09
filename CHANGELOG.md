@@ -31,7 +31,19 @@ bump may break compatibility and a **patch** bump never does.
   per ten-second stream window without overwriting manual or timestamped
   writes. SQLite remains the selected production store until import,
   envelope-encrypted Trakt credentials, node-removal cleanup, and
-  post-coalescer growth measurement land.
+  post-coalescer growth measurement land. Operators can explicitly accept a
+  verified replacement mount through
+  `POST /api/v1/libraries/{id}/root-identity/reset` and rebuild a node's
+  derived search state through `POST /api/v1/system/search-index/rebuild`.
+
+- **A default-off PGS overlay path preserves the original video.** With
+  `PLURX_PGS_OVERLAY` enabled, authenticated manifest and immutable PNG routes
+  let the Apple and Android players draw positioned PGS cues over unchanged
+  Dolby Vision, HDR, or SDR video. Publication is bounded, durable, and
+  self-healing, HD palettes are checked against a BT.709 fixture, and a pinned
+  nightly SUP fuzzer keeps malformed inputs under pressure. This remains a
+  staged capability, not a release claim, until the physical-device matrix
+  passes.
 
 - **Download a title in the native phone apps and watch it without the
   server.** iPhone, iPad, and Android phones/tablets now have a one-tap

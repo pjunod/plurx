@@ -382,9 +382,13 @@ impl OfflinePackageStore for SqliteStore {
             let tx = conn.unchecked_transaction()?;
             let id = tx
                 .query_row(
-                    "SELECT id FROM offline_packages \
-                     WHERE node_id = ?1 AND state = 'queued' \
-                     ORDER BY created_at, id LIMIT 1",
+                    "SELECT candidate.id FROM offline_packages candidate \
+                     WHERE candidate.node_id = ?1 AND candidate.state = 'queued' \
+                     ORDER BY (SELECT COUNT(*) FROM offline_packages served \
+                               WHERE served.node_id = candidate.node_id \
+                                 AND served.user_id = candidate.user_id \
+                                 AND served.state != 'queued'), \
+                              candidate.created_at, candidate.id LIMIT 1",
                     [node],
                     |row| row.get::<_, String>(0),
                 )
@@ -664,11 +668,11 @@ mod tests {
     use crate::domain::{NewOfflinePackage, OfflineCreateOutcome, OfflineLeaseOutcome};
     use crate::store::{OfflinePackageStore, SqliteStore, UserStore};
 
-    fn request(request_id: &str) -> NewOfflinePackage {
+    fn request_for(request_id: &str, user_id: i64) -> NewOfflinePackage {
         NewOfflinePackage {
             id: format!("pkg-{request_id}"),
             request_id: request_id.to_owned(),
-            user_id: 1,
+            user_id,
             file_id: 42,
             node_id: "node-a".to_owned(),
             source_path: "/media/movie.mkv".to_owned(),
@@ -686,6 +690,10 @@ mod tests {
             reserved_bytes: 500,
             expires_at: 10_000,
         }
+    }
+
+    fn request(request_id: &str) -> NewOfflinePackage {
+        request_for(request_id, 1)
     }
 
     async fn store() -> SqliteStore {
@@ -921,6 +929,45 @@ mod tests {
                 .state,
             "queued"
         );
+    }
+
+    #[tokio::test]
+    async fn queued_users_take_turns_even_when_one_arrived_first() {
+        let store = store().await;
+        store
+            .create_user("alex", "hash", false)
+            .await
+            .expect("user");
+        for request in [
+            request_for("a-one", 1),
+            request_for("a-two", 1),
+            request_for("b-one", 2),
+            request_for("b-two", 2),
+        ] {
+            assert!(matches!(
+                store
+                    .create_offline_package(&request, 10, 10_000, 20_000)
+                    .await
+                    .expect("create"),
+                OfflineCreateOutcome::Created(_)
+            ));
+        }
+
+        let mut owners = Vec::new();
+        for turn in 0..4 {
+            let package = store
+                .claim_next_offline_package("node-a")
+                .await
+                .expect("claim")
+                .expect("queued package");
+            owners.push(package.user_id);
+            assert!(store
+                .mark_offline_package_ready(&package.id, &format!("recipe-{turn}"), 400, 90_000,)
+                .await
+                .expect("ready"));
+        }
+
+        assert_eq!(owners, [1, 2, 1, 2]);
     }
 
     #[tokio::test]

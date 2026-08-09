@@ -29,6 +29,53 @@ jobs:
           python3 -m playwright install --with-deps chromium
       - name: Run every scheduled validation
         run: make validate-nightly
+      - name: Install the PGS fuzz runner
+        run: |
+          rustup toolchain install nightly-2026-08-01 --profile minimal
+          cargo install cargo-fuzz --locked
+        timeout-minutes: 20
+      - name: Fuzz the bounded PGS parser
+        id: pgs_fuzz
+        continue-on-error: true
+        timeout-minutes: 20
+        run: cargo +nightly-2026-08-01 fuzz run inspect_sup fuzz/corpus/inspect_sup -- -max_total_time=900
+      - name: Install the mutation spot-checker
+        run: cargo install cargo-mutants --locked
+        timeout-minutes: 20
+      - name: Mutation spot-check the last seven days
+        id: mutants
+        continue-on-error: true
+        timeout-minutes: 60
+        run: |
+          mkdir -p target/mutants
+          mapfile -t changed < <(
+            git log --since=7.days --name-only --format= \
+              | grep -E '^crates/.*\.rs$' \
+              | sort -u
+          )
+          if (( ${#changed[@]} == 0 )); then
+            echo "## Mutation spot-check: no Rust files changed in seven days" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          file_args=()
+          for path in "${changed[@]}"; do
+            file_args+=(--file "$path")
+          done
+          set +e
+          cargo mutants --timeout 300 --output target/mutants "${file_args[@]}"
+          status=$?
+          set -e
+          echo "## Mutation spot-check (report-only)" >> "$GITHUB_STEP_SUMMARY"
+          echo "cargo-mutants exit status: $status" >> "$GITHUB_STEP_SUMMARY"
+          if grep -RqsE 'MISSED|TIMEOUT' target/mutants; then
+            echo "Surviving or timed-out mutants were reported; inspect the artifact." \
+              >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No surviving mutant marker was found in the report." \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit 0
       - name: Upload validation evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -38,5 +85,13 @@ jobs:
             target/validation
             target/playback-lab
             target/ui-baseline
+            target/mutants
+            fuzz/artifacts
           if-no-files-found: warn
           retention-days: 14
+      - name: Fail when the PGS fuzzer finds a crash
+        if: always() && steps.pgs_fuzz.outcome == 'failure'
+        run: |
+          echo "The bounded PGS fuzz campaign found a reproducible failure." \
+            >> "$GITHUB_STEP_SUMMARY"
+          exit 1

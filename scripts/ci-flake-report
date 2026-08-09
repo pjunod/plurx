@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+"""Record recent GitHub Actions job outcomes and durations as a small ledger."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import math
+import os
+from pathlib import Path
+import statistics
+import urllib.parse
+import urllib.request
+
+
+API_VERSION = "2022-11-28"
+
+
+def parse_time(value: str | None) -> dt.datetime | None:
+    if not value:
+        return None
+    return dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def percentile(values: list[float], percentile_value: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = max(0, math.ceil(percentile_value * len(ordered)) - 1)
+    return round(ordered[index], 3)
+
+
+class GitHub:
+    def __init__(self, api_root: str) -> None:
+        self.api_root = api_root.rstrip("/")
+        self.token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+
+    def get(self, path: str, query: dict[str, str] | None = None) -> dict[str, object]:
+        url = f"{self.api_root}/{path.lstrip('/')}"
+        if query:
+            url += "?" + urllib.parse.urlencode(query)
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "plurx-ci-flake-report",
+            "X-GitHub-Api-Version": API_VERSION,
+        }
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        request = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return json.load(response)
+
+
+def job_record(run: dict[str, object], job: dict[str, object]) -> dict[str, object]:
+    started = parse_time(job.get("started_at") if isinstance(job.get("started_at"), str) else None)
+    completed = parse_time(
+        job.get("completed_at") if isinstance(job.get("completed_at"), str) else None
+    )
+    raw_seconds = (completed - started).total_seconds() if started and completed else None
+    timestamp_anomaly = raw_seconds is not None and raw_seconds < 0
+    seconds = max(0.0, raw_seconds) if raw_seconds is not None else None
+    return {
+        "run_id": run["id"],
+        "run_attempt": run.get("run_attempt"),
+        "head_sha": run.get("head_sha"),
+        "job_id": job["id"],
+        "name": job.get("name"),
+        "conclusion": job.get("conclusion"),
+        "duration_seconds": seconds,
+        "timestamp_anomaly": timestamp_anomaly,
+    }
+
+
+def summarize(records: list[dict[str, object]]) -> list[dict[str, object]]:
+    grouped: dict[str, list[dict[str, object]]] = {}
+    for record in records:
+        grouped.setdefault(str(record["name"]), []).append(record)
+
+    summary = []
+    for name, jobs in sorted(grouped.items()):
+        conclusions = [str(job.get("conclusion") or "unknown") for job in jobs]
+        durations = [
+            float(job["duration_seconds"])
+            for job in jobs
+            if isinstance(job.get("duration_seconds"), (int, float))
+        ]
+        summary.append(
+            {
+                "name": name,
+                "observations": len(jobs),
+                "success": conclusions.count("success"),
+                "failure": conclusions.count("failure"),
+                "cancelled": conclusions.count("cancelled"),
+                "timed_out": conclusions.count("timed_out"),
+                "other": sum(
+                    conclusion
+                    not in {"success", "failure", "cancelled", "timed_out"}
+                    for conclusion in conclusions
+                ),
+                "median_seconds": round(statistics.median(durations), 3)
+                if durations
+                else None,
+                "p95_seconds": percentile(durations, 0.95),
+            }
+        )
+    return summary
+
+
+def build_ledger(
+    github: GitHub, repo: str, workflow: str, requested_runs: int
+) -> dict[str, object]:
+    runs_payload = github.get(
+        f"repos/{repo}/actions/workflows/{workflow}/runs",
+        {"status": "completed", "per_page": str(requested_runs)},
+    )
+    runs = list(runs_payload.get("workflow_runs", []))
+    records: list[dict[str, object]] = []
+    for run in runs:
+        jobs_payload = github.get(
+            f"repos/{repo}/actions/runs/{run['id']}/jobs",
+            {"filter": "all", "per_page": "100"},
+        )
+        records.extend(job_record(run, job) for job in jobs_payload.get("jobs", []))
+
+    created = [str(run["created_at"]) for run in runs if run.get("created_at")]
+    return {
+        "schema": 1,
+        "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "repository": repo,
+        "workflow": workflow,
+        "source": {
+            "completed_runs_requested": requested_runs,
+            "completed_runs_returned": len(runs),
+            "newest_created_at": max(created) if created else None,
+            "oldest_created_at": min(created) if created else None,
+        },
+        "summary": summarize(records),
+        "jobs": records,
+    }
+
+
+def encode_ledger(ledger: dict[str, object]) -> str:
+    """Keep generated diffs reviewable: one summary or job record per line."""
+
+    compact = lambda value: json.dumps(value, separators=(",", ":"))
+    lines = [
+        "{",
+        f'  "schema": {compact(ledger["schema"])},',
+        f'  "generated_at": {compact(ledger["generated_at"])},',
+        f'  "repository": {compact(ledger["repository"])},',
+        f'  "workflow": {compact(ledger["workflow"])},',
+        f'  "source": {compact(ledger["source"])},',
+        '  "summary": [',
+    ]
+    summary = list(ledger["summary"])
+    lines.extend(
+        f"    {compact(record)}{',' if index + 1 < len(summary) else ''}"
+        for index, record in enumerate(summary)
+    )
+    lines.append('  ],')
+    lines.append('  "jobs": [')
+    jobs = list(ledger["jobs"])
+    lines.extend(
+        f"    {compact(record)}{',' if index + 1 < len(jobs) else ''}"
+        for index, record in enumerate(jobs)
+    )
+    lines.extend(("  ]", "}"))
+    return "\n".join(lines) + "\n"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--repo", default="pjunod/plurx")
+    parser.add_argument("--workflow", default="ci.yml")
+    parser.add_argument("--runs", type=int, default=30)
+    parser.add_argument("--output", type=Path, default=Path("validation/ci-flake-ledger.json"))
+    parser.add_argument("--api-root", default="https://api.github.com")
+    args = parser.parse_args()
+    if not 1 <= args.runs <= 100:
+        parser.error("--runs must be between 1 and 100")
+
+    ledger = build_ledger(GitHub(args.api_root), args.repo, args.workflow, args.runs)
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(encode_ledger(ledger), encoding="utf-8")
+    print(
+        f"wrote {len(ledger['jobs'])} job observations from "
+        f"{ledger['source']['completed_runs_returned']} runs to {args.output}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

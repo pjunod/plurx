@@ -8,6 +8,12 @@ enum PGSOverlayManifestFetch {
     case ready(PGSOverlayManifest)
 }
 
+enum PGSOverlayManifestDisposition: Equatable {
+    case ready
+    case preparing
+    case terminal
+}
+
 struct PGSOverlayPreparing: Codable {
     let state: String
     let retryAfterMs: Int
@@ -152,6 +158,22 @@ enum PGSOverlayPolicy {
     static let lookAheadMs = 90_000
     static let refreshMarginMs = 20_000
     static let maximumPrepareSeconds = 600
+
+    static func manifestDisposition(_ statusCode: Int) -> PGSOverlayManifestDisposition {
+        switch statusCode {
+        case 200: .ready
+        case 202, 503: .preparing
+        default: .terminal
+        }
+    }
+
+    static func retryAfterMs(_ header: String?) -> Int {
+        min(max(250, (Int(header ?? "") ?? 1) * 1_000), 5_000)
+    }
+
+    static func periodicRefreshPosition(currentMs: Int, overlayIsActive: Bool) -> Int? {
+        overlayIsActive ? currentMs : nil
+    }
 
     static func itemTimeMs(sourceTimeMs: Int, baseMs: Int) -> Int {
         sourceTimeMs - baseMs
