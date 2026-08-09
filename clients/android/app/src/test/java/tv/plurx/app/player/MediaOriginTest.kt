@@ -30,6 +30,56 @@ class MediaOriginTest {
     }
 
     @Test
+    fun hlsSessionOriginDrivesTheControllerTimeline() {
+        val copied = HlsStart(
+            session_id = "copy",
+            playlist_url = "/hls/copy/index.m3u8",
+            start_seconds = 10.5,
+            media_origin_ms = 10_000,
+        )
+        val timeline = sessionPlaybackTimeline(copied, requestedStartMs = 10_500)
+        assertEquals(SessionPlaybackTimeline(baseMs = 10_000, attachPositionMs = 0), timeline)
+        assertEquals(
+            12_500L,
+            realMediaPositionMs(
+                playerPositionMs = 2_500,
+                directTransport = false,
+                sessionIsVod = false,
+                progressiveTransport = false,
+                progressiveOriginMs = 0,
+                sessionBaseMs = timeline.baseMs,
+            ),
+        )
+
+        val cached = copied.copy(vod = true, media_origin_ms = 123_000)
+        val cachedTimeline = sessionPlaybackTimeline(cached, requestedStartMs = 10_500)
+        assertEquals(SessionPlaybackTimeline(baseMs = 0, attachPositionMs = 10_500), cachedTimeline)
+        assertEquals(
+            10_500L,
+            realMediaPositionMs(
+                playerPositionMs = cachedTimeline.attachPositionMs,
+                directTransport = false,
+                sessionIsVod = true,
+                progressiveTransport = false,
+                progressiveOriginMs = 0,
+                sessionBaseMs = cachedTimeline.baseMs,
+            ),
+        )
+
+        assertEquals(
+            22_500L,
+            realMediaPositionMs(
+                playerPositionMs = 2_500,
+                directTransport = false,
+                sessionIsVod = false,
+                progressiveTransport = true,
+                progressiveOriginMs = 20_000,
+                sessionBaseMs = 0,
+            ),
+        )
+    }
+
+    @Test
     fun progressiveHeaderParsingIsCaseInsensitiveAndRejectsBadValues() {
         assertEquals(
             10_000L,

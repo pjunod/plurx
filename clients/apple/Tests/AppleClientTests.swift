@@ -2705,6 +2705,15 @@ final class AppleClientTests: XCTestCase {
             PlayerController.sessionMediaOriginMs(cached, requestedStartMs: 123_000),
             0
         )
+
+        let invalid = try decoder.decode(HlsStart.self, from: Data(#"""
+        {"session_id":"invalid","playlist_url":"/hls/invalid/index.m3u8",
+         "start_seconds":10.5,"media_origin_ms":-1,"vod":false}
+        """#.utf8))
+        XCTAssertEqual(
+            PlayerController.sessionMediaOriginMs(invalid, requestedStartMs: 10_500),
+            0
+        )
     }
 
     /// Servers from before the Apple DV transport hint can approve Profile 8

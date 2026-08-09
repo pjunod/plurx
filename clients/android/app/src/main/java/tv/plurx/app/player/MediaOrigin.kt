@@ -20,6 +20,37 @@ internal fun sessionMediaOriginMs(hls: HlsStart): Long = when {
     else -> 0L
 }
 
+internal data class SessionPlaybackTimeline(
+    val baseMs: Long,
+    val attachPositionMs: Long,
+)
+
+/** Map a freshly-created HLS session onto ExoPlayer's local timeline. */
+internal fun sessionPlaybackTimeline(
+    hls: HlsStart,
+    requestedStartMs: Long,
+): SessionPlaybackTimeline = SessionPlaybackTimeline(
+    baseMs = sessionMediaOriginMs(hls),
+    attachPositionMs = if (hls.vod) requestedStartMs.coerceAtLeast(0L) else 0L,
+)
+
+/** Resolve the player's local clock through the active delivery regime. */
+internal fun realMediaPositionMs(
+    playerPositionMs: Long,
+    directTransport: Boolean,
+    sessionIsVod: Boolean,
+    progressiveTransport: Boolean,
+    progressiveOriginMs: Long,
+    sessionBaseMs: Long,
+): Long {
+    val local = playerPositionMs.coerceAtLeast(0L)
+    return when {
+        directTransport || sessionIsVod -> local
+        progressiveTransport -> progressiveOriginMs.coerceAtLeast(0L) + local
+        else -> sessionBaseMs.coerceAtLeast(0L) + local
+    }
+}
+
 internal fun mediaOriginMsFromHeaders(headers: Map<String, List<String>>): Long? =
     headers.entries
         .firstOrNull { (name, _) -> name.equals(MEDIA_ORIGIN_HEADER, ignoreCase = true) }

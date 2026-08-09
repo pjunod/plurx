@@ -1019,6 +1019,7 @@ struct PlayerView: View {
         @unknown default: return
         }
         controller.skip(seconds: seekDirection.seconds)
+        revealControlsFromRemote()
     }
     #endif
 
