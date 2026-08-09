@@ -1,9 +1,11 @@
 # Performance II — better starts, steadier streams, smarter bits
 
-**Status:** proposal, awaiting review · **Extends:** [PERF-PLAN.md](PERF-PLAN.md)
+**Status:** revised v2, re-review welcome · **Extends:** [PERF-PLAN.md](PERF-PLAN.md)
 (M0–M3 shipped and accepted; M4 waits on Phase 4) and executes
 [ADAPTIVE-QUALITY.md](ADAPTIVE-QUALITY.md) Phase 2 · **Written:** 2026-08-09
-against `main` @ `e8a910f`.
+against `main` @ `e8a910f` · **Revised:** 2026-08-09 v2 — all eight findings
+of [PERF2-PLAN-REVIEW.md](PERF2-PLAN-REVIEW.md) accepted; the deltas are
+itemized in [PERF2-REVIEW-RESPONSE.md](PERF2-REVIEW-RESPONSE.md).
 
 This is the second performance arc. The first one ([PERF-PLAN.md](PERF-PLAN.md))
 took starts from ~10 s to a ~684 ms median and put the 4K tone-map on the GPU
@@ -345,34 +347,64 @@ fallback to today's VBR*, never a viewer-facing error. A family whose
 quality mode fails validation records that in the new `EncoderCaps`
 fields (§3.5) and keeps bitrate mode.
 
-### 4.3 Contract changes
+### 4.3 Contract changes — one effective identity, everywhere (review R4)
 
-- `TranscodeOptions` gains `rate_mode: RateMode` (`Bitrate` |
-  `Quality { q: u8 }`), default `Bitrate` — today's behavior.
+- **`EffectiveRateControl` is resolved before anything is hashed.**
+  Requested mode (`transcode.rate_mode`) + target quality pass through
+  validation/fallback first; what comes out — `Vbr` or `Qvbr { q }`
+  per family — is the *effective* value, and only the effective value
+  reaches ffmpeg args or a recipe. A runtime mode flip re-runs
+  validation and atomically publishes the new effective mode; a
+  session never hashes a requested-but-unvalidated value, so a
+  fallback can never cache one encoding under another's identity.
+- **One `effective_recipe()` builder feeds every path.** The tree has
+  four recipe constructors today (live lookup, speculative producer,
+  offline, tests — `transcode.rs:2430,2607,2694`); changing their
+  digest strings independently is a drift trap. They collapse into one
+  builder whose input is the normalized, validated `TranscodeOptions`
+  (rate control included; output codec joins it in N5). `rate_control`
+  moves from the manager-level `PipelineDigest` constant
+  (`recipe.rs:72`) into the per-recipe fields, since N2 makes quality
+  per-title.
+- **Legacy digest bytes are preserved exactly.** Bitrate mode keeps
+  `vbr:maxrate1.5x:bufsize2x` byte-for-byte (golden-hash fixtures pin
+  it); every effective QVBR value hashes differently (inequality
+  fixtures); the same options through live, producer, and offline
+  paths hash identically (cross-path fixture).
+- **Offline packages pin their effective recipe at creation.** A
+  package can yield and requeue mid-preparation, and
+  `set_offline_package_recipe` accepts only the original hash
+  (`store/sqlite/offline.rs:423-438`) — a hot setting change
+  mid-package would strand it. The package row persists its effective
+  recipe inputs at creation; every resume rebuilds from that snapshot,
+  never from current settings.
 - `EncoderCaps` gains per-family `quality_rc: bool` from validation.
-- `PipelineDigest`'s `rate_control` string (`recipe.rs:72`) becomes
-  mode-specific: `vbr:maxrate1.5x:bufsize2x` (unchanged for bitrate
-  mode) vs `qvbr:q{q}:maxrate1.5x:bufsize2x` — distinct hashes, so
-  cached entries from either mode stay valid and correctly separate
-  (principle 5).
 - Settings: `transcode.rate_mode` = `bitrate` (default) | `quality`;
   `transcode.quality` = an optional single override — unset means the
   family-tuned defaults the N1 acceptance run calibrates (§14 D5).
   Height-independent to start; the per-title layer is N2's job, not
   this one's.
 
-**Effort:** small — one sitting plus the nynuc run. **Risk:** low-medium;
-the risk is driver variance and it is exactly what boot validation
-catches. **Toggle:** `transcode.rate_mode`, default off (= `bitrate`).
+**Effort:** medium (review R4/R8) — the flags are a sitting; the
+effective-identity plumbing, offline snapshot, golden-hash fixtures,
+and the VMAF harness slice below are the real budget. **Risk:**
+low-medium; driver variance is exactly what boot validation catches.
+**Toggle:** `transcode.rate_mode`, default off (= `bitrate`).
 
-**Acceptance (nynuc, per principle 4):** the fixture corpus
-(`scripts/bench`) encoded both modes; quality mode produces ≤ the bytes
-of bitrate mode on the easy half of the corpus at equal-or-better VMAF
-(measured offline with `libvmaf`, `n_subsample` as needed — VMAF never
-runs in the live path, principle 7), and never exceeds the advertised
-peak over any `bufsize` window. Encode speed within 10% of bitrate mode
-on the same title. A session on a family whose driver refuses the mode
-starts and logs the fallback.
+**Acceptance (nynuc, per principle 4):** `scripts/bench` grows a
+rate-control mode first — today it deliberately does not decode pixels
+(`scripts/bench:18`), so the harness slice precedes the feature
+(review R7). Shape: `scripts/bench rate-control --corpus <fixtures>
+--modes vbr,qvbr --vmaf-model vmaf_v0.6.1 --json out/rate-control.json`,
+failing nonzero when quality mode regresses VMAF or exceeds the
+advertised peak over any `bufsize` window. On that harness: quality
+mode produces ≤ the bytes of bitrate mode on the easy half of the
+corpus at equal-or-better VMAF (VMAF offline only, `n_subsample` as
+needed — never in the live path, principle 7); encode speed within 10%
+of bitrate mode; a session on a family whose driver refuses the mode
+starts and logs the fallback. Identity: golden-hash fixtures hold the
+legacy VBR digest constant; cross-path fixtures prove
+live/producer/offline hash agreement.
 
 ---
 
@@ -435,8 +467,9 @@ migration, no new table, hiqlite mirror already carries the column.
   a clamped per-title multiplier (bounds ±30%, hard-clamped so a bad
   analysis can never halve or double a rung beyond intent) in bitrate
   mode, or a per-title quality target in N1's quality mode. All three
-  call sites of `options_for` share it automatically; the recipe hash
-  gains the applied value (§11.4, principle 5).
+  call sites of `options_for` share it automatically, and the applied
+  value rides N1's `effective_recipe()` into the hash (§11.4,
+  principle 5).
 - **Producer ranking:** `worth_producing` / `rank`
   (`produce.rs:195-233`) prefer high-complexity titles — the ones
   whose live encode is riskiest and whose cache entry buys most.
@@ -473,43 +506,82 @@ milestone, and PERF-PLAN §6.3 already named its centerpiece as the
 deliberate deferral: "prefix-only warm caches (first N minutes at the
 top rung to bridge live-session spin-up)" (`docs/PERF-PLAN.md:1416-1420`).
 
-### 6.1 Prefix entries in the M3 cache
+### 6.1 Prefix entries in the M3 cache — the seam is a protocol, not a trick
 
 The machinery is already prefix-shaped: the producer emits numbered
 parts with exact resume boundaries (`transcode.rs:2969-3073`,
 `produce::resume_at_ms` summing real EXTINFs `produce.rs:109-111`) and
 `produce::assemble` builds a playlist from any part slice
-(`produce.rs:118-155`). What's missing is *identity* and *serving*:
+(`produce.rs:118-155`). What v1 of this plan got wrong — and review R1
+proved with a live probe — is the seam: a second ffmpeg started at the
+boundary *rewrites* the playlist rather than appending
+(`-start_number` renames files; it does not touch packet timestamps),
+and both tracks' PTS restart near zero. Phase 3 said exactly this
+(seeked restarts reset PTS and need `EXT-X-DISCONTINUITY`), and the M4
+takeover contract (PERF-PLAN §7.3) already carries the full answer:
+overlap, sequence and discontinuity accounting, and an owner. A
+prefix-hydrated session is a *planned, same-node instance of that same
+takeover* — v2 specifies it as one instead of pretending it is an
+ordinary session.
 
-- **Identity:** `Recipe` gains `prefix_secs: Option<u32>`
-  (§11.4) so a prefix and a full asset are different names — today
-  they would collide, and `start_seconds` is rightly excluded
-  (`recipe.rs:141-144`) so it cannot carry this. Location rows gain
-  `covered_ms`.
+**N3.0 — the seam spike comes first (review R8).** Before any schema
+or producer change: prove the continuation recipe end to end on
+fixtures, against every enabled encoder family. The spike owns the
+four choices below, and the §6.4 packet gate is its exit criterion.
+
+The contract, per review R1–R2:
+
+- **The server owns the served playlist for hydrated sessions.** The
+  ffmpeg writer file stays ffmpeg's own; `Manager::playlist` composes
+  what clients see: the prefix's entries (from the artifact manifest,
+  immutable) + `EXT-X-DISCONTINUITY` + the writer's entries, with
+  server-managed `MEDIA-SEQUENCE` and `EXT-X-DISCONTINUITY-SEQUENCE`
+  (Apple authoring rules 8.13/8.17). The raw writer playlist is never
+  served for a hydrated session — extending the standing precedent
+  that the served view is already a rewrite (`served_live_playlist`,
+  `transcode.rs:515`). Publication is atomic: hydrate into the session
+  dir, validate against the manifest, start the continuation encoder,
+  then publish one playlist generation — the gate opens only on the
+  published generation, so no client can observe two histories.
+- **Timestamps are made monotonic, and the seam is still marked.** The
+  continuation encoder gets `-output_ts_offset covered_ms` alongside
+  `-start_number K` — the pairing ADAPTIVE-QUALITY Phase 3 specifies,
+  because they solve different problems: one offsets packet time, the
+  other only names files. The `EXT-X-DISCONTINUITY` stays regardless: a
+  fresh encoder is a new priming boundary and possibly new parameter
+  sets.
+- **Source identity is proven, not assumed (R2).** The recipe hashes
+  the DB row's (size, mtime); a file replaced in place would otherwise
+  splice old prefix bytes onto new source bytes mid-stream. Before
+  anything publishes, a fresh `stat` of the source must equal the
+  recipe's identity, and the continuation ffmpeg is spawned against
+  that verified identity. Mismatch anywhere → the prefix is discarded
+  (row invalidated) and the session proceeds as a plain live encode.
+- **A prefix is its own artifact kind (R2).** Location rows gain
+  `kind = full | prefix` — explicit, never inferred from `covered_ms`
+  at use time — plus a boundary manifest: the segment list with exact
+  per-segment EXTINF and byte sizes, summed covered duration, and the
+  container generation. The manifest is authoritative for serving; the
+  artifact's own playlist file (VOD-shaped, ENDLIST and all) is never
+  served. `cache_hit`'s `complete = 1` contract keeps meaning "safe to
+  serve *as its kind*."
+- **Hydration is all-or-nothing.** Hard-link segments into the session
+  dir when same-filesystem, else copy; the `CacheReadGuard` is held
+  from lookup to session end exactly as full hits hold it
+  (`transcode.rs:2478-2516`). Any missing segment, manifest mismatch,
+  identity failure, or continuation-spawn failure before publication →
+  fresh session, no prefix URI ever advertised (every cache read path
+  must degrade to a live transcode, PERF-PLAN §9).
 - **Production:** the producer's per-pass deadline machinery already
   stops cleanly at a boundary; a prefix job is a produce with a small
   target (`cache.prefix_secs`; off by default, §14 D3 recommends 90 s)
-  that *publishes* instead of checkpointing.
-- **Serving — hydration, not splicing.** On session create with a
-  prefix hit: create the live session dir, **hydrate** it with the
-  prefix's segments and playlist entries, and start ffmpeg at the
-  covered boundary with the segment numbering continuing from the
-  prefix (`-ss covered_ms`, `-start_number K` — the same
-  restart-at-boundary contract Phase 3 proved and M4 §7.3 depends
-  on). The publish gate (B11-class wait for transcode sessions,
-  `Manager::playlist`'s long-poll) is satisfied instantly by the
-  hydrated media; the client sees one ordinary EVENT session that
-  happens to start full. No playlist splicing across two sources, no
-  new client semantics, no VOD/live hybrid — the cached bytes simply
-  *pre-fill the same directory the encoder was about to fill*.
-  Failure degrades to today: hydration error → plain live session
-  (every cache read path must degrade to a live transcode,
-  PERF-PLAN §9).
+  that *publishes* — kind = prefix, manifest included — instead of
+  checkpointing. `prefix_secs` is in the recipe (§11.4) so a prefix
+  and a full asset are different names; `start_seconds` stays rightly
+  excluded (`recipe.rs:141-144`).
 
 Prefixes obey the same LRU/budget/sweep rules (`cachekeep.rs` phases
-1–3) and the same reader guards; `complete = 1` with `covered_ms <
-duration` is the new legal state, and `cache_hit`'s `WHERE complete = 1`
-contract keeps meaning "safe to serve."
+1–3) and the same reader guards.
 
 ### 6.2 Predictive production — event-driven rails
 
@@ -554,23 +626,60 @@ toggle, all funneling into the existing single-flight producer
   four. Pairs with the server's progress trigger having already
   warmed the prefix.
 
-**Effort:** large — the prefix identity/hydration is the invasive
-piece; triggers and shaves are small. Sequence *after* N1/N2 so
-prefixes are produced under the final recipes (a rate-mode change
-orphans every prefix by design — principle 5 — so fill the cache
-once, not twice). **Risk:** medium; bounded by hydration's
-degrade-to-live rule. **Toggles:** `cache.prefix_secs` (0 = off),
-`jobs.prewarm_on_progress`.
+### 6.4 Seam gates — packet truth before player truth (review R3)
 
-**Acceptance (nynuc + one physical Apple device):** press play on a
-prefix-cached 4K HDR transcode title — TTFF lands in the cached-VOD
-class (sub-second to first frame, measured by the N0 beacon), and the
-session transitions to live encoding at the boundary with zero stall
-beacons at the seam across 10 consecutive plays. Autoplay-next with the
-progress trigger: episode N+1 starts ≤ 2 s after N ends. An Apple HEVC
-copy session's master playlist is served without awaiting a fresh
-init.mp4 (log line proves the warm path; TTFF delta measured). Kill the
-cache mid-hydration; playback starts anyway (degrade path exercised).
+Zero stall beacons cannot prove the seam: every play could carry a
+click, a silence gap, or a duplicated frame and still beacon nothing.
+The seam is gated at the media layer first — the rule that already
+cost this repo two green-for-weeks defects: for anything about
+timestamps or muxer output, produce a stream and *measure* it.
+
+- **Packet gate**, per stream across the seam: monotonic DTS/PTS under
+  the `-output_ts_offset` contract; audio gap/overlap bounded
+  (starting bound: ≤ one AAC frame, 1024 samples — the spike may
+  tighten it); video gap/overlap bounded (starting bound: ± one frame
+  duration); EXTINF sums equal to packet reality within muxer
+  rounding.
+- **Decode gate:** decoded frames and audio around the boundary
+  compared against a single-encoder reference of the same recipe — a
+  new AAC encoder instance is a priming boundary, which is a media
+  contract, not an implementation detail.
+- **Fixture matrix:** 24000/1001 · 30000/1001 · integer rates · VFR ·
+  audio-leading-video · 44.1 kHz · 5.1-source-to-stereo. Run per
+  enabled encoder family — timestamp behavior is encoder-specific.
+- Player-level integration (stall/error-free plays) is a *separate,
+  later* gate — necessary, never sufficient.
+
+Command shapes (names may change; existence, nonzero failure on the
+stated invariants, and a stable output artifact may not):
+
+```text
+cargo test -p plurxd prefix_hydration_seam -- --nocapture
+scripts/perf2-seam-probe --all-encoders --fixtures testdata/perf2-seams
+```
+
+**Effort:** the largest item in this plan (review R8) — a two-writer
+playlist-ownership protocol plus a media-boundary correctness gate;
+the triggers and shaves stay small. Sequence *after* N1/N2 so prefixes
+are produced under final recipes (a rate-mode change orphans every
+prefix by design — principle 5 — so fill the cache once, not twice);
+N3.0's spike sequences before any N3 schema. **Risk:** medium-high,
+held by the all-or-nothing rule and the packet gates. **Toggles:**
+`cache.prefix_secs` (0 = off), `jobs.prewarm_on_progress`.
+
+**Acceptance (after the §6.4 gates pass; nynuc + one physical Apple
+device):** press play on a prefix-cached 4K HDR transcode title — TTFF
+lands in the cached-VOD class (measured by the N0 beacon), the served
+playlist carries exactly one discontinuity at the boundary, and 10
+consecutive plays produce zero stall beacons *and* pass the packet
+gate on the session's actual output. Autoplay-next with the progress
+trigger: episode N+1 starts ≤ 2 s after N ends. An Apple HEVC copy
+session's master playlist is served without awaiting a fresh init.mp4
+(log line proves the warm path; TTFF delta measured). Failure-mode
+matrix, each case distinct (review R2): source file replaced in place
+→ prefix discarded, plain live session, no corruption; cache dir
+corrupted mid-hydration → plain live session; ordinary LRU pressure →
+the held reader guard pins the entry for the session's lifetime.
 Prefix hit-rate per trigger visible in the digest (N7) or system page.
 
 ---
@@ -635,17 +744,43 @@ prediction-error cuts) and the cost here is a table:
   historically-starved client one rung down, or a proven-fast LAN
   client at the cap. Server-side, zero client changes.
 
-### 7.3 Native clients get a way down
+### 7.3 Native clients get a way down — bound, normalized, replayable (review R5)
 
-- **Apple:** the buffering-stall reopen (one-shot, then terminal —
-  B17) passes `reopen_reason=stall` on its recreate; the server steps
-  `auto_height` down one rung for that recipe. The one-shot guard
-  stays; what changes is that the one retry is no longer the *same
-  doomed recipe*.
+A bare `reopen_reason=stall` flag is not enough to make "one rung
+down" deterministic: the create body carries no prior-session binding,
+a transport retry re-normalizes against different state once the first
+attempt supersedes the old session, and Apple's reopen queue collapses
+concurrent causes last-writer-wins. The contract:
+
+- **Bound to the previous session.** The stall reopen carries
+  `previous_session_id` + a typed `reopen_reason`. The server
+  validates that session belongs to the same user/playback/file, reads
+  its *resolved* rung exactly once, and computes the target one rung
+  below. Floor: the lowest ladder rung — at the floor, one same-rung
+  retry, then the existing terminal surface. Manual-height sessions
+  are never auto-stepped — a manual pick is sticky; stepping is for
+  Auto.
+- **Normalized once, under the existing idempotency key.** The
+  resolved target is persisted under `request_id` *before* the
+  previous session is superseded — extending `claim_request`
+  (`transcode.rs:3204`), not adding a parallel retry store (the
+  review's clean-list endorses exactly this). A transport replay of
+  the same `request_id` returns the same session and target; it can
+  never step down twice or 409 on a re-normalized fingerprint.
+- **Apple carries the cause, typed, with precedence.** The reopen
+  queue (`PlayerController.swift:92-125`) gains a cause field with
+  defined merging: a user-initiated seek or track change *clears* a
+  pending stall cause (the user acted; recover normally); the
+  HDR-compatibility ladder keeps its own untouched lane; and the
+  recovery budget's scope is now stated as its definition — per
+  source-session, reset by 5 s of established playback (today's
+  mechanism, named).
 - **Android:** gains the minimal stall watchdog it lacks (position
-  stagnant ≥ 6 s while `STATE_BUFFERING` → one reopen with
-  `reopen_reason=stall`, mirroring Apple's ladder shape) — and the N0
-  beacon so its stalls exist at all.
+  stagnant ≥ 6 s while `STATE_BUFFERING` → one reopen with the same
+  typed cause) — and the N0 beacon so its stalls exist at all.
+- **Tests:** transport replay of a stall reopen; a queued seek racing
+  a stall; an audio/subtitle change during a stall; a stall at the
+  floor rung; two devices sharing a `playback_id`.
 
 ### 7.4 Flow control becomes observable
 
@@ -657,24 +792,32 @@ ahead-window in this plan — with N0's data, tuning it becomes an
 evidence question instead of a lever-guessing one (the #87→#91
 release-threshold arc is the cautionary tale).
 
-**Effort:** medium — the controller is ~120 lines plus tests
-(ADAPTIVE-QUALITY's estimate holds); priors are a table + two read
-sites; native deltas are small and ride each client's normal release.
+**Effort:** medium-large (review R8) — the controller is ~120 lines
+plus tests (ADAPTIVE-QUALITY's estimate holds) and priors are a table
++ two read sites, but the reopen normalization, the Apple queue
+semantics, and the shaping harness below are real work; native deltas
+ride each client's normal release.
 **Risk:** low-medium; a mistuned controller is a visible switch, Manual
 stays one tap away, and `off` restores today exactly. **Toggles:**
 `playback.auto_abr` (web controller, default off until the acceptance
 week), `playback.network_priors` (default off first release),
 per-client reopen behavior rides client versions.
 
-**Acceptance:** the scripted 8 → 1.5 Mb/s cliff in the existing
-playback-lab harness reaches a sustainable rung with ≤ 1 automatic
+**Acceptance:** playback-lab first grows the shaping layer it
+deliberately lacks today (PLAYBACK-TESTING.md's non-goals exclude
+WAN/Wi-Fi simulation — the harness slice precedes the feature, review
+R7). Shape: `scripts/playback-lab run --suite stall-recovery
+--network-profile 8mbps-to-1.5mbps --json out/stall-recovery.json`,
+failing nonzero when recovery misses the criteria. On it: the 8 →
+1.5 Mb/s cliff reaches a sustainable rung with ≤ 1 automatic
 restart and recovers with ≤ 1 upgrade per 60 s (ADAPTIVE-QUALITY's own
 criteria); switch-interruption p95 measured and ≤ 2.5 s on LAN; on a
 repeat session behind a throttled link, the *first* rung is already
 sustainable (priors working — `ttff` row shows no immediate downgrade);
 an Apple session stalled by throttling reopens one rung down and
-survives (device test); controller off ⇒ `playback-lab` traces
-byte-identical to today.
+survives (device test); controller off ⇒ playback-lab's normalized
+trace (UUIDs, ports, wall-clock times, temp paths scrubbed) is
+identical to today's.
 
 ---
 
@@ -688,27 +831,49 @@ budget).
 
 ### 8.1 HEVC as a JIT output rung — gated per client, opt-in
 
-- Client eligibility from the caps clients already declare per play
-  (`http/stream.rs:125`); encoder eligibility from boot caps
-  (`hevc_qsv` Gen9.5+, `hevc_vaapi`; validated the same way as N1).
+- **Eligibility travels with the create, not just the decision
+  (review R6).** `Caps` is a `GET /decision` query object today
+  (`http/stream.rs:111-149`); nothing on `POST hls/sessions` carries
+  it. The create body gains the same `Caps` (additive, optional —
+  absent means H.264), and `OutputCodec` becomes its own typed value,
+  separate from encoder *family* (`Encoder::video_codec` hard-wires
+  H.264 per family today, `encoder.rs:31-39`). The chosen codec rides
+  the request fingerprint, the effective recipe (N1's builder), the
+  `Session`, and the response.
+- Encoder eligibility from boot caps (`hevc_qsv` Gen9.5+,
+  `hevc_vaapi`; validated the same way as N1).
 - Same ladder heights; per-rung bits ×~0.65, or the same N1 quality
   target (which then simply *finds* the savings).
+- **HEVC JIT output is fMP4 — decided, not open (review R6).** Apple's
+  authoring spec (item 1.5) *requires* HEVC in fragmented MP4, and
+  Apple is the gating client, so v1's "TS or fMP4?" question is
+  answered. That is a `muxer`/`segment_policy` digest change, and it
+  reaches the producer: `produce::assemble` moves segments and writes
+  a playlist with no init-segment concept today (`produce.rs:113-155`)
+  — it gains `EXT-X-MAP`/init ownership, and every resume path proves
+  init compatibility across parts or publishes a discontinuity + new
+  map. Init/`.m4s` serving and exact `hvc1` codec-string derivation
+  already exist on the copy path (`hls.rs:634-671`) — that derivation
+  becomes the signaling contract.
+- **`CODECS` is derived from produced media, fail-closed.** Live and
+  cached transcode sessions hardcode `avc1.640034,mp4a.40.2` today
+  (`transcode.rs:2496,3739`) — HEVC bytes advertised as AVC would be
+  the bug. The master's `CODECS` comes from the actual init segment; a
+  mismatch fails the session rather than mis-signaling it.
 - **The tripwire is load-bearing:** the exhaustive
   every-encoder-is-H.264 test (`encoder.rs:566-597`) and
   `delivered_dynamic_range`'s hardcoded `"sdr"` badge contract
   ([MEDIA-BADGES-PLAN.md](MEDIA-BADGES-PLAN.md) §2.1) must be updated
   *deliberately* in the same change — output stays 8-bit SDR BT.709 in
   v1 (`pixfmt`/`colour` digest fields unchanged), so the badge answer
-  is the same; the test's job is to force this paragraph to be read.
+  is the same; codec and dynamic range remain separate fields with
+  independent assertions ("HEVC" is not a dynamic range).
+- **Predictive production without a requesting client (review R6):**
+  the producer makes H.264 entries by default; HEVC prefix/cache
+  entries are made only for `playback_id`s whose recent decisions (N0
+  data) declared HEVC decode.
 - Settings: `transcode.output_codec` = `h264` (default) | `auto`
-  (HEVC when client ∧ encoder agree, else H.264). Recipe already
-  hashes the codec via `PipelineDigest` (`recipe.rs:60-73`) — hits
-  separate cleanly.
-- MPEG-TS carries HEVC fine, but verify the segment-type contract
-  end-to-end on Apple (fMP4 vs TS for `hvc1` in *transcode* sessions —
-  today's transcode muxer line is TS, `mod.rs:958-977`; Apple's HLS
-  authoring rules prefer fMP4 for HEVC. If fMP4 is required, that is a
-  `segment_policy`/`muxer` digest change and a deliberate one).
+  (HEVC when client ∧ encoder agree, else H.264).
 
 ### 8.2 AV1 in the cache lane only — the grain dividend
 
@@ -743,14 +908,23 @@ modest, and honesty about that is part of the design).
   synthesized grain — score against the pre-grain encode
   ([Netflix/vmaf #1192](https://github.com/Netflix/vmaf/issues/1192)).
 
-**Effort:** HEVC medium (the encode is trivial; the contract/badge/muxer
-verification is the work). AV1 lane medium, after N2 (it consumes the
-analysis). **Risk:** medium — client-matrix risk, held by per-client
+**Effort:** HEVC large (review R8) — the encode is trivial; the typed
+codec model, the create-API carry, fMP4 across live/cache/offline
+paths, signaling, and the device matrix are the work. AV1 lane medium,
+after N2 (it consumes the analysis) *and* after the container work —
+prefix hydration must be container-aware before any HEVC/AV1 prefix
+exists. **Risk:** medium — client-matrix risk, held by per-client
 gating and by defaults staying off. **Toggles:**
 `transcode.output_codec` (default `h264`), `cache.av1_lane` (default
 off).
 
-**Acceptance (nynuc + physical devices, per principle 4):** an HEVC
+**Acceptance (nynuc + physical devices, per principle 4):** a
+manifest/media validation command exists first and gates the rollout
+(review R7) — shape: `scripts/perf2-hevc-validate --fixture
+testdata/perf2/hevc-sdr --device-matrix
+docs/fixtures/perf2-apple-devices.json` — checking fMP4 boxes,
+`EXT-X-MAP`, `CODECS` derived-vs-produced agreement, and
+profile/level, failing nonzero on any mismatch. On top of it: an HEVC
 transcode session plays on Chrome, Safari, the Apple TV, and Android
 with badges and stats truthful, at measured ≥30% byte reduction for
 equal VMAF on the corpus; a declaring-client session serves the AV1
@@ -758,7 +932,8 @@ cache entry and a non-declaring client the H.264 one for the same
 title (log-proven); a grain-flagged title's AV1 entry hits its VMAF
 target (scored pre-grain) at ≤60% of the H.264 entry's bytes; producer
 AV1 encode never runs while a live session waits (admission yield
-exercised).
+exercised); the feature leaves default-off only after the full device
+matrix passes.
 
 ---
 
@@ -929,24 +1104,35 @@ attribution card with a stop control (principle 3).
 `libsvtav1` (N5), `chromaprint` muxer (N7). All surfaced through
 `SystemInfo` on `/api/v1/system` for the fleet census (§3.5).
 
-### 11.4 Recipe hash changes (principle 5 — the complete list)
+### 11.4 Recipe identity (principle 5 — the complete list, review R4)
 
-- N1: `rate_control` digest string becomes mode-specific
-  (`vbr:…` unchanged | `qvbr:q{q}:…`).
+All changes flow through the single `effective_recipe()` builder
+(§4.3); nothing edits a digest string at a call site.
+
+- N1: `rate_control` moves from the manager-level `PipelineDigest`
+  constant to a per-recipe field carrying the *effective* mode —
+  legacy bytes preserved exactly for bitrate mode (`vbr:…`), distinct
+  per effective QVBR value; golden-hash + cross-path fixtures pin it.
+  Offline packages persist their effective recipe inputs at creation.
 - N2: applied per-title bias/quality value, when `transcode.per_title`
   is on (absent = no field change, so old entries stay valid).
-- N3: `prefix_secs: Option<u32>` in the recipe; `covered_ms` on
-  location rows (schema v16 alongside N0's table).
-- N5: no new field — codec/muxer already in `PipelineDigest`; an fMP4
-  muxer decision for HEVC would change the `muxer` field and must be
-  called out in its PR.
+- N3: artifact `kind = full | prefix`, `covered_ms`, and the boundary
+  manifest on location rows (schema **v17**; N0's telemetry table is
+  **v16** — unique versions per slice, review R8); `prefix_secs` in
+  the recipe.
+- N5: `OutputCodec` joins the effective recipe; the fMP4 muxer for
+  HEVC changes the `muxer`/`segment_policy` fields — its own
+  deliberate digest change, called out in its PR.
 
 ### 11.5 API deltas
 
 `DecisionResponse`/`StartResponse` gain `prior_kbps: Option<u32>`
-(N4); session create accepts `reopen_reason` (N4); `SessionInfo` gains
-`readrate` (N0); `POST /api/v1/client-log` accepts the existing field
-set unchanged (N0 is storage-side). All additive; no client is
+(N4); session create accepts `previous_session_id` + a typed
+`reopen_reason`, with the resolved target persisted under `request_id`
+before supersede (N4, review R5), and optionally the same `Caps`
+object the decision request carries (N5, review R6); `SessionInfo`
+gains `readrate` (N0); `POST /api/v1/client-log` accepts the existing
+field set unchanged (N0 is storage-side). All additive; no client is
 required to change to keep working.
 
 ---
@@ -994,12 +1180,14 @@ New to this plan:
 | Slice | Contents | Expected result |
 |---|---|---|
 | Weekend 1 | N0 (telemetry + census) | B18 answerable; distributions survive restart; Android exists in the data; fleet caps known |
-| Weekend 2 | N1 (quality RC) + N4.2 priors groundwork | 10–35% fewer bytes on typical content, boot-validated; the priors table starts filling |
-| Weekend 3 | N4 (controller + rescues + native way-down) | the cliff test passes; supply stalls act; Apple/Android stop dying at the same rung |
+| Weekend 2 | N1 harness (bench rate-control + VMAF + golden hashes), then N1 | measurement exists before the change it judges; 10–35% fewer bytes, boot-validated |
+| Weekend 3 | N4 harness (playback-lab shaping) + N4.2 priors groundwork | the cliff is reproducible on demand; the priors table starts filling |
+| Focused week | N4 (controller + normalized reopens + native way-down) | the cliff test passes; supply stalls act; Apple/Android stop dying at the same rung |
 | Focused week | N2 (analysis job + per-title) | hard titles stop starving, easy titles stop wasting; markers groundwork in place |
-| Focused week | N3 (prefix cache + prewarm + shaves) | prefix-hit TTFF in the cached class; next-episode ≤ 2 s; Apple master unblocked |
-| Weekend | N5.1 (HEVC rung) | ~30%+ byte cut for declaring clients at equal quality |
-| Background | N5.2 (AV1 lane), N6 (enhancement), N7 (assistants) | grain dividend in the cache; low-rung polish; digests/subs/markers — each independent, each optional |
+| Spike | N3.0 (seam spike: ownership, timestamps, identity, atomic publish; §6.4 gates are the exit) | the continuation protocol is proven on fixtures before any schema ships |
+| Focused week+ | N3 (prefix cache + prewarm + shaves) | prefix-hit TTFF in the cached class; next-episode ≤ 2 s; Apple master unblocked |
+| Focused week | N5.1 (OutputCodec model + fMP4 + HEVC rung) | ~30%+ byte cut for declaring clients; the container abstraction lands |
+| Background | N5.2 (AV1 lane, container-aware), N6 (enhancement), N7 (assistants) | grain dividend in the cache; low-rung polish; digests/subs/markers — each optional |
 
 Dependencies that matter: N0 before everything that learns or is
 judged (N2 calibration, N4 priors, all acceptance measurement). N1
@@ -1007,8 +1195,14 @@ judged (N2 calibration, N4 priors, all acceptance measurement). N1
 recipe-hash inputs, and recipes must be final or the cache is filled
 twice (principle 5; the prefix *plumbing* can land earlier, the fill
 waits). N2 before N5.2 (the AV1 lane consumes per-title targets and
-grain flags), and N7's marker detection rides N2's sweep. The rest is
-independent by construction; every slice leaves the tree releasable.
+grain flags), and N7's marker detection rides N2's sweep. Harness
+slices precede the milestones they judge (review R7/R8): bench
+rate-control before N1's flags, playback-lab shaping before N4's
+controller, N3.0 + the §6.4 gates before N3's schema, and the
+OutputCodec/fMP4 abstraction before N5.1 — and before any HEVC/AV1
+*prefix* exists, since hydration must be container-aware first. The
+rest is independent by construction; every slice leaves the tree
+releasable.
 
 ---
 
