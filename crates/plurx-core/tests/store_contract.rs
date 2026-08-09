@@ -699,6 +699,95 @@ async fn populated_current_sqlite_import_preserves_new_durable_rows_only() {
     );
 }
 
+#[cfg(feature = "hiqlite-store")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sqlite_import_verification_refusals_have_teeth() {
+    let _case = HIQLITE_CASE.lock().await;
+    let store = open_contract_hiqlite_store().await;
+    store
+        .validation_reset_contract_state()
+        .await
+        .expect("reset replicated verification target");
+
+    let mismatch = tempfile::tempdir().expect("identity mismatch fixture directory");
+    let mismatch_path = populated_current_import_fixture(mismatch.path());
+    rusqlite::Connection::open(&mismatch_path)
+        .expect("open identity mismatch fixture")
+        .execute(
+            "UPDATE settings SET value = 'different-cluster' WHERE key = 'instance.id'",
+            [],
+        )
+        .expect("change source identity");
+    let mismatch = prepare_sqlite_import(mismatch.path()).expect("prepare identity mismatch");
+    let identity_error = store
+        .import_sqlite_backup(
+            &mismatch.backup_path,
+            &mismatch.backup_sha256,
+            mismatch.schema_version,
+        )
+        .await
+        .expect_err("identity mismatch must refuse import");
+    assert!(matches!(
+        identity_error,
+        plurx_core::error::StoreError::Identity(_)
+    ));
+
+    let too_old = tempfile::tempdir().expect("old-schema fixture directory");
+    let too_old_path = populated_current_import_fixture(too_old.path());
+    rusqlite::Connection::open(&too_old_path)
+        .expect("open old-schema fixture")
+        .pragma_update(None, "user_version", 13)
+        .expect("mark fixture as schema v13");
+    let too_old = prepare_sqlite_import(too_old.path()).expect("prepare old-schema backup");
+    let schema_error = store
+        .import_sqlite_backup(
+            &too_old.backup_path,
+            &too_old.backup_sha256,
+            too_old.schema_version,
+        )
+        .await
+        .expect_err("schema v13 must refuse clustering import");
+    assert!(schema_error
+        .to_string()
+        .contains("supports SQLite schemas v14"));
+
+    let cycle = tempfile::tempdir().expect("item-cycle fixture directory");
+    let cycle_path = populated_current_import_fixture(cycle.path());
+    rusqlite::Connection::open(&cycle_path)
+        .expect("open item-cycle fixture")
+        .execute("UPDATE items SET parent_id = 10 WHERE id = 20", [])
+        .expect("create an FK-clean item cycle");
+    let cycle = prepare_sqlite_import(cycle.path()).expect("prepare item-cycle backup");
+    let cycle_error = store
+        .import_sqlite_backup(
+            &cycle.backup_path,
+            &cycle.backup_sha256,
+            cycle.schema_version,
+        )
+        .await
+        .expect_err("an item cycle must refuse import");
+    assert!(cycle_error.to_string().contains("parent_id cycle"));
+
+    store
+        .validation_reset_contract_state()
+        .await
+        .expect("discard partial cycle import");
+    let parity = tempfile::tempdir().expect("parity-fault fixture directory");
+    populated_current_import_fixture(parity.path());
+    let parity = prepare_sqlite_import(parity.path()).expect("prepare parity-fault backup");
+    let parity_error = store
+        .validation_import_sqlite_backup_with_parity_fault(
+            &parity.backup_path,
+            &parity.backup_sha256,
+            parity.schema_version,
+        )
+        .await
+        .expect_err("target corruption must fail parity");
+    assert!(parity_error
+        .to_string()
+        .contains("table settings failed SQLite-to-Hiqlite parity"));
+}
+
 #[test]
 fn contract_inventory_matches_every_store_method() {
     let source = include_str!("../src/store/mod.rs");

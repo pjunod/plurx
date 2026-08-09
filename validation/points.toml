@@ -252,7 +252,7 @@ checks = ["rust-gate"]
 [[points]]
 id = "persistence.upgrades"
 title = "Persistent database compatibility"
-contract = "Existing libraries upgrade without losing data; a newer unsupported database is refused without changing staging state; clustering publishes a durable content-addressed SQLite backup, imports v14 through current durable rows into a fresh Hiqlite target, rebuilds derived FTS, and returns only after exact per-table parity."
+contract = "Existing libraries upgrade without losing data; a newer unsupported database is refused without changing staging state; inert clustering machinery publishes a durable content-addressed SQLite backup and can import v14 through current durable rows into a fresh Hiqlite target, rebuild derived FTS, and return only after exact per-table parity without activating that target in plurxd."
 paths = [
   "crates/plurx-core/src/cluster/migration.rs",
   "crates/plurx-core/src/store/hiqlite_import.rs",

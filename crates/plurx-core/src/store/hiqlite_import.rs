@@ -47,8 +47,13 @@ struct TablePlan {
     columns: &'static [&'static str],
     order_by: &'static str,
     minimum_schema: i64,
-    import_filter: Option<&'static str>,
+    import_filter: Option<ImportFilter>,
     parent_first: bool,
+}
+
+#[derive(Clone, Copy)]
+enum ImportFilter {
+    ExcludeInstanceId,
 }
 
 const TABLES: &[TablePlan] = &[
@@ -57,7 +62,7 @@ const TABLES: &[TablePlan] = &[
         columns: &["key", "value", "updated_at"],
         order_by: "key",
         minimum_schema: 1,
-        import_filter: Some("key <> 'instance.id'"),
+        import_filter: Some(ImportFilter::ExcludeInstanceId),
         parent_first: false,
     },
     TablePlan {
@@ -349,6 +354,35 @@ impl HiqliteAuthStore {
         expected_sha256: &str,
         expected_schema_version: i64,
     ) -> Result<SqliteImportReport, StoreError> {
+        self.import_sqlite_backup_inner(
+            backup_path,
+            expected_sha256,
+            expected_schema_version,
+            false,
+        )
+        .await
+    }
+
+    /// Validation-only fault seam proving the per-table parity comparison is
+    /// an enforced gate rather than report decoration.
+    #[doc(hidden)]
+    pub async fn validation_import_sqlite_backup_with_parity_fault(
+        &self,
+        backup_path: &Path,
+        expected_sha256: &str,
+        expected_schema_version: i64,
+    ) -> Result<SqliteImportReport, StoreError> {
+        self.import_sqlite_backup_inner(backup_path, expected_sha256, expected_schema_version, true)
+            .await
+    }
+
+    async fn import_sqlite_backup_inner(
+        &self,
+        backup_path: &Path,
+        expected_sha256: &str,
+        expected_schema_version: i64,
+        inject_parity_fault: bool,
+    ) -> Result<SqliteImportReport, StoreError> {
         let actual_sha256 = sha256_file(backup_path)?;
         if actual_sha256 != expected_sha256 {
             return Err(import_error(format!(
@@ -384,6 +418,20 @@ impl HiqliteAuthStore {
             )));
         }
         self.verify_target_foreign_keys().await?;
+        if inject_parity_fault {
+            let changed = self
+                .client()
+                .execute(
+                    "UPDATE settings SET value = $1 WHERE key = $2",
+                    params!("corrupted-after-import", "migration.fixture"),
+                )
+                .await?;
+            if changed != 1 {
+                return Err(import_error(format!(
+                    "validation parity fault changed {changed} rows"
+                )));
+            }
+        }
 
         let mut tables = Vec::with_capacity(TABLES.len());
         let mut imported_rows = 0_u64;
@@ -421,7 +469,7 @@ impl HiqliteAuthStore {
 
     async fn verify_empty_import_target(&self) -> Result<(), StoreError> {
         for table in TABLES {
-            let filter = (table.name == "settings").then_some("key <> 'instance.id'");
+            let filter = import_filter_sql(*table);
             let rows = self.target_count(table.name, filter).await?;
             if rows != 0 {
                 return Err(import_error(format!(
@@ -479,6 +527,23 @@ impl HiqliteAuthStore {
         }
         let expected = source_count(source, table, true)?;
         let insert_sql = insert_sql(table);
+        if table.parent_first {
+            let ids = parent_first_item_ids(source)?;
+            let selected =
+                i64::try_from(ids.len()).map_err(|error| import_error(error.to_string()))?;
+            if selected != expected {
+                let unreachable = expected.saturating_sub(selected);
+                return Err(import_error(format!(
+                    "items parent graph contains {unreachable} row(s) unreachable from a root; a parent_id cycle is possible"
+                )));
+            }
+            for ids in ids.chunks(IMPORT_CHUNK_ROWS as usize) {
+                let chunk = read_item_import_chunk(source, schema_version, table, ids)?;
+                self.insert_import_chunk(table, &insert_sql, chunk).await?;
+            }
+            return Ok(());
+        }
+
         let select_sql = import_select_sql(table, schema_version);
         let mut offset = 0_i64;
         while offset < expected {
@@ -488,19 +553,7 @@ impl HiqliteAuthStore {
             }
             let chunk_len =
                 i64::try_from(chunk.len()).map_err(|error| import_error(error.to_string()))?;
-            let results = self
-                .client()
-                .txn(chunk.into_iter().map(|row| (insert_sql.clone(), row)))
-                .await?
-                .into_iter()
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(database_error)?;
-            if results.iter().any(|changed| *changed != 1) {
-                return Err(import_error(format!(
-                    "table {} import did not insert exactly one row per statement",
-                    table.name
-                )));
-            }
+            self.insert_import_chunk(table, &insert_sql, chunk).await?;
             offset += chunk_len;
         }
         if offset != expected {
@@ -512,10 +565,32 @@ impl HiqliteAuthStore {
         Ok(())
     }
 
+    async fn insert_import_chunk(
+        &self,
+        table: TablePlan,
+        insert_sql: &str,
+        chunk: Vec<hiqlite::Params>,
+    ) -> Result<(), StoreError> {
+        let results = self
+            .client()
+            .txn(chunk.into_iter().map(|row| (insert_sql.to_owned(), row)))
+            .await?
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(database_error)?;
+        if results.iter().any(|changed| *changed != 1) {
+            return Err(import_error(format!(
+                "table {} import did not insert exactly one row per statement",
+                table.name
+            )));
+        }
+        Ok(())
+    }
+
     async fn target_count(
         &self,
         table: &'static str,
-        filter: Option<&'static str>,
+        filter: Option<String>,
     ) -> Result<u64, StoreError> {
         let sql = match filter {
             Some(filter) => format!("SELECT COUNT(*) AS count FROM {table} WHERE {filter}"),
@@ -604,7 +679,7 @@ fn source_count(
     table: TablePlan,
     for_import: bool,
 ) -> Result<i64, StoreError> {
-    let filter = for_import.then_some(table.import_filter).flatten();
+    let filter = for_import.then(|| import_filter_sql(table)).flatten();
     let sql = match filter {
         Some(filter) => format!("SELECT COUNT(*) FROM {} WHERE {filter}", table.name),
         None => format!("SELECT COUNT(*) FROM {}", table.name),
@@ -615,28 +690,64 @@ fn source_count(
 }
 
 fn import_select_sql(table: TablePlan, schema_version: i64) -> String {
-    let projection = value_projection(table, schema_version, table.parent_first);
-    if table.parent_first {
-        return format!(
-            "WITH RECURSIVE import_items(id, depth) AS (\
-                 SELECT id, 0 FROM items WHERE parent_id IS NULL \
-                 UNION ALL \
-                 SELECT child.id, parent.depth + 1 FROM items AS child \
-                 JOIN import_items AS parent ON child.parent_id = parent.id\
-             ) \
-             SELECT {projection} FROM items AS source \
-             JOIN import_items AS import_order ON import_order.id = source.id \
-             ORDER BY import_order.depth, source.id LIMIT ?1 OFFSET ?2"
-        );
-    }
-    let filter = table
-        .import_filter
+    let projection = value_projection(table, schema_version, false);
+    let filter = import_filter_sql(table)
         .map(|filter| format!(" WHERE {filter}"))
         .unwrap_or_default();
     format!(
         "SELECT {projection} FROM {}{filter} ORDER BY {} LIMIT ?1 OFFSET ?2",
         table.name, table.order_by
     )
+}
+
+fn import_filter_sql(table: TablePlan) -> Option<String> {
+    table.import_filter.map(|ImportFilter::ExcludeInstanceId| {
+        format!("key <> '{}'", keys::INSTANCE_ID.replace('\'', "''"))
+    })
+}
+
+fn parent_first_item_ids(source: &Connection) -> Result<Vec<i64>, StoreError> {
+    let mut statement = source
+        .prepare(
+            "WITH RECURSIVE import_items(id, depth) AS (
+                 SELECT id, 0 FROM items WHERE parent_id IS NULL
+                 UNION ALL
+                 SELECT child.id, parent.depth + 1 FROM items AS child
+                 JOIN import_items AS parent ON child.parent_id = parent.id
+             )
+             SELECT id FROM import_items ORDER BY depth, id",
+        )
+        .map_err(|error| import_error(format!("ordering source items by parent: {error}")))?;
+    let mapped = statement
+        .query_map([], |row| row.get(0))
+        .map_err(|error| import_error(format!("ordering source items by parent: {error}")))?;
+    mapped
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| import_error(format!("ordering source items by parent: {error}")))
+}
+
+fn read_item_import_chunk(
+    source: &Connection,
+    schema_version: i64,
+    table: TablePlan,
+    ids: &[i64],
+) -> Result<Vec<hiqlite::Params>, StoreError> {
+    let projection = value_projection(table, schema_version, true);
+    let sql = format!("SELECT {projection} FROM items AS source WHERE source.id = ?1");
+    let mut statement = source
+        .prepare(&sql)
+        .map_err(|error| import_error(format!("preparing source items: {error}")))?;
+    ids.iter()
+        .map(|id| {
+            statement
+                .query_row([id], |row| {
+                    (0..table.columns.len())
+                        .map(|index| value_param(row.get_ref(index)?))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .map_err(|error| import_error(format!("reading source item {id}: {error}")))
+        })
+        .collect()
 }
 
 fn insert_sql(table: TablePlan) -> String {
@@ -686,7 +797,16 @@ fn value_param(value: ValueRef<'_>) -> rusqlite::Result<Param> {
                 )
             })?)
         }
-        ValueRef::Blob(value) => Param::Blob(value.to_vec()),
+        ValueRef::Blob(_) => {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Blob,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "BLOB import needs a deterministic parity encoding",
+                )),
+            ));
+        }
     })
 }
 

@@ -531,10 +531,12 @@ an untracked WAL sidecar beside immutable source material.
 `HiqliteAuthStore::import_sqlite_backup` accepts only a fresh bootstrapped
 target whose `instance.id` matches the source. It imports all 17 shared durable
 tables in foreign-key order and 64-row Raft transactions, preserving explicit
-ids, timestamps, nullable values, and binary values. Items load parent-first
-through a recursive source query, so numeric id order cannot violate their
-self-reference. A v14 source contributes empty scan-reconciliation tables and
-zero outbox claim deadlines; v15–v17 preserve their newer durable facts.
+ids, timestamps, nullable text, and integer values. Items compute their
+parent-first id order in one recursive source pass, then load each bounded
+chunk through indexed point reads; numeric id order cannot violate their
+self-reference, and large catalogues do not re-run and re-sort the full tree
+for every 64 rows. A v14 source contributes empty scan-reconciliation tables
+and zero outbox claim deadlines; v15–v17 preserve their newer durable facts.
 `playback_events`, `items_fts`, and `offline_lease_guards` never cross the
 boundary: telemetry is node-local, FTS is rebuilt, and the lease guard is an
 internal transaction scratch table.
@@ -544,13 +546,20 @@ the exact ordered JSON rows for every imported table, and returns the row count
 and SHA-256 for each table only after parity. The three-voter contract imports
 populated v14 and current fixtures. It covers a child id that sorts before its
 parent, nonzero current outbox claims, current scan state, checksum refusal,
-merge-style retry refusal, and source playback telemetry exclusion.
+merge-style retry refusal, identity mismatch, the v14 schema floor, cyclic
+parent refusal, injected target corruption before parity, and source playback
+telemetry exclusion.
 
 This code is deliberately inert. The next M2 slice still owns steps 2, 5, 8,
 and 9 from §4: startup quiescence, one-voter incoming-cluster lifecycle, the
 fsynced completion marker, atomic activation, failure injection at each step,
 and fallback to unchanged SQLite. Trakt credential encryption and the
-post-coalescer growth record also remain activation blockers.
+post-coalescer growth record also remain activation blockers. Before activation,
+replace whole-table target parity responses with bounded keyset pages and an
+incremental digest, then move source backup scans onto a blocking worker. The
+current single consistent response can carry hundreds of MiB of `probe_json`
+through the leader, and synchronous source scans must not occupy an async
+runtime worker during a long migration.
 
 ### 6.7 M3 — membership, secrets, discovery, and one settings surface
 
