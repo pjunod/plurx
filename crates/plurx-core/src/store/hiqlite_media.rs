@@ -537,19 +537,8 @@ fn fts_query(input: &str) -> Option<String> {
     )
 }
 
-fn id_filter(column: &str, only: Option<&[i64]>) -> Option<String> {
-    match only {
-        None => Some(String::new()),
-        Some([]) => None,
-        Some(ids) => Some(format!(
-            " AND {column} IN ({})",
-            ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",")
-        )),
-    }
-}
-
-fn id_list(ids: &[i64]) -> String {
-    ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",")
+fn ids_json(ids: &[i64]) -> Result<String, StoreError> {
+    serde_json::to_string(ids).map_err(database_error)
 }
 
 fn reconcile_refusal(
@@ -1003,9 +992,10 @@ impl MediaStore for HiqliteAuthStore {
         force: bool,
         only: Option<&[i64]>,
     ) -> Result<Vec<Item>, StoreError> {
-        let Some(narrow) = id_filter("i.id", only) else {
+        if only == Some(&[]) {
             return Ok(Vec::new());
-        };
+        }
+        let only = only.map(ids_json).transpose()?;
         items(
             self.client()
                 .query_consistent_map::<ItemRow, _>(
@@ -1014,11 +1004,12 @@ impl MediaStore for HiqliteAuthStore {
                          JOIN libraries l ON l.id = i.library_id AND l.kind != 'home' \
                          WHERE i.kind IN ('movie','show') \
                            AND ($1 = 1 OR i.metadata_at IS NULL) \
-                           AND ($2 IS NULL OR i.library_id = $2){narrow} \
+                           AND ($2 IS NULL OR i.library_id = $2) \
+                           AND ($3 IS NULL OR i.id IN (SELECT value FROM json_each($3))) \
                          ORDER BY i.id",
                         i = item_cols("i")
                     ),
-                    params!(force, library_id),
+                    params!(force, library_id, only),
                 )
                 .await
                 .map_err(database_error)?,
@@ -1048,19 +1039,21 @@ impl MediaStore for HiqliteAuthStore {
         force: bool,
         only: Option<&[i64]>,
     ) -> Result<Vec<Item>, StoreError> {
-        let Some(narrow) = id_filter("id", only) else {
+        if only == Some(&[]) {
             return Ok(Vec::new());
-        };
+        }
+        let only = only.map(ids_json).transpose()?;
         items(
             self.client()
                 .query_consistent_map::<ItemRow, _>(
                     format!(
                         "SELECT {ITEM_COLS} FROM items \
                          WHERE library_id = $1 AND kind IN ('folder','video','photo') \
-                           AND ($2 = 1 OR poster_path IS NULL){narrow} \
+                           AND ($2 = 1 OR poster_path IS NULL) \
+                           AND ($3 IS NULL OR id IN (SELECT value FROM json_each($3))) \
                          ORDER BY (kind = 'folder'), id"
                     ),
-                    params!(library_id, force),
+                    params!(library_id, force, only),
                 )
                 .await
                 .map_err(database_error)?,
@@ -1349,15 +1342,13 @@ impl MediaStore for HiqliteAuthStore {
         if ids.is_empty() {
             return Ok(HashMap::new());
         }
-        let list = id_list(ids);
+        let ids = ids_json(ids)?;
         Ok(self
             .client()
             .query_consistent_map::<ItemValueRow, _>(
-                format!(
-                    "SELECT parent_id AS item_id, COUNT(*) AS value FROM items \
-                     WHERE parent_id IN ({list}) GROUP BY parent_id"
-                ),
-                params!(),
+                "SELECT parent_id AS item_id, COUNT(*) AS value FROM items \
+                 WHERE parent_id IN (SELECT value FROM json_each($1)) GROUP BY parent_id",
+                params!(ids),
             )
             .await
             .map_err(database_error)?
@@ -1370,15 +1361,14 @@ impl MediaStore for HiqliteAuthStore {
         if ids.is_empty() {
             return Ok(HashMap::new());
         }
-        let list = id_list(ids);
+        let ids = ids_json(ids)?;
         Ok(self
             .client()
             .query_consistent_map::<ItemValueRow, _>(
-                format!(
-                    "SELECT item_id, MAX(height) AS value FROM files \
-                     WHERE height IS NOT NULL AND item_id IN ({list}) GROUP BY item_id"
-                ),
-                params!(),
+                "SELECT item_id, MAX(height) AS value FROM files \
+                 WHERE height IS NOT NULL \
+                   AND item_id IN (SELECT value FROM json_each($1)) GROUP BY item_id",
+                params!(ids),
             )
             .await
             .map_err(database_error)?
@@ -1391,11 +1381,10 @@ impl MediaStore for HiqliteAuthStore {
         if ids.is_empty() {
             return Ok(HashMap::new());
         }
-        let list = id_list(ids);
+        let ids = ids_json(ids)?;
         Ok(self.client()
             .query_consistent_map::<FactsSqlRow, _>(
-                format!(
-                    "WITH ranked AS ( \
+                "WITH ranked AS ( \
                          SELECT item_id, \
                                 COUNT(*) OVER (PARTITION BY item_id) AS files, \
                                 SUM(size) OVER (PARTITION BY item_id) AS bytes, \
@@ -1403,12 +1392,11 @@ impl MediaStore for HiqliteAuthStore {
                                     ORDER BY COALESCE(height, 0) DESC, \
                                              COALESCE(bitrate, 0) DESC, size DESC, id ASC) AS pick, \
                                 container, video_codec, height, hdr, hdr_format, audio_streams \
-                         FROM files WHERE item_id IN ({list}) \
+                         FROM files WHERE item_id IN (SELECT value FROM json_each($1)) \
                      ) \
                      SELECT item_id, files, bytes, container, video_codec, height, hdr, \
-                            hdr_format, audio_streams FROM ranked WHERE pick = 1"
-                ),
-                params!(),
+                            hdr_format, audio_streams FROM ranked WHERE pick = 1",
+                params!(ids),
             )
             .await
             .map_err(database_error)?
@@ -1563,18 +1551,14 @@ impl MediaStore for HiqliteAuthStore {
             return Ok(refusal);
         }
 
-        let list = if gone_file_ids.is_empty() {
-            "NULL".to_owned()
-        } else {
-            id_list(gone_file_ids)
-        };
+        let gone_file_ids = ids_json(gone_file_ids)?;
         let requested = scalar_with(
             self.client(),
-            format!(
-                "SELECT COUNT(*) AS value FROM files f JOIN items i ON i.id = f.item_id \
-                 WHERE i.library_id = $1 AND f.id IN ({list})"
-            ),
-            params!(library_id),
+            "SELECT COUNT(*) AS value FROM files f JOIN items i ON i.id = f.item_id \
+             WHERE i.library_id = $1 \
+               AND f.id IN (SELECT value FROM json_each($2))"
+                .to_owned(),
+            params!(library_id, &gone_file_ids),
         )
         .await?
         .max(0) as u64;
@@ -1590,23 +1574,23 @@ impl MediaStore for HiqliteAuthStore {
         let limit = i64::try_from(prune_limit).unwrap_or(i64::MAX);
         let statements: Vec<(String, hiqlite::Params)> = vec![
             (
-                format!(
-                    "INSERT INTO scan_reconcile_guards (library_id) \
+                "INSERT INTO scan_reconcile_guards (library_id) \
                      SELECT $1 WHERE EXISTS (SELECT 1 FROM library_roots \
                          WHERE library_id = $1 AND fingerprint = $2) \
                      AND (SELECT COUNT(*) FROM files f JOIN items i ON i.id = f.item_id \
-                          WHERE i.library_id = $1 AND f.id IN ({list})) <= $3 \
+                          WHERE i.library_id = $1 \
+                            AND f.id IN (SELECT value FROM json_each($3))) <= $4 \
                      ON CONFLICT(library_id) DO NOTHING"
-                ),
-                params!(library_id, root_fingerprint, limit),
+                    .to_owned(),
+                params!(library_id, root_fingerprint, &gone_file_ids, limit),
             ),
             (
-                format!(
-                    "DELETE FROM files WHERE id IN ({list}) \
-                     AND item_id IN (SELECT id FROM items WHERE library_id = $1) \
-                     AND EXISTS (SELECT 1 FROM scan_reconcile_guards WHERE library_id = $1)"
-                ),
-                params!(library_id),
+                "DELETE FROM files \
+                 WHERE item_id IN (SELECT id FROM items WHERE library_id = $1) \
+                   AND id IN (SELECT value FROM json_each($2)) \
+                   AND EXISTS (SELECT 1 FROM scan_reconcile_guards WHERE library_id = $1)"
+                    .to_owned(),
+                params!(library_id, &gone_file_ids),
             ),
             (
                 "DELETE FROM items WHERE library_id = $1 \
@@ -1689,11 +1673,11 @@ impl MediaStore for HiqliteAuthStore {
                 .map(|row| row.fingerprint);
             let requested = scalar_with(
                 self.client(),
-                format!(
-                    "SELECT COUNT(*) AS value FROM files f JOIN items i ON i.id = f.item_id \
-                     WHERE i.library_id = $1 AND f.id IN ({list})"
-                ),
-                params!(library_id),
+                "SELECT COUNT(*) AS value FROM files f JOIN items i ON i.id = f.item_id \
+                 WHERE i.library_id = $1 \
+                   AND f.id IN (SELECT value FROM json_each($2))"
+                    .to_owned(),
+                params!(library_id, &gone_file_ids),
             )
             .await?
             .max(0) as u64;
@@ -2093,22 +2077,23 @@ impl WatchStore for HiqliteAuthStore {
         if ids.is_empty() {
             return Ok(HashMap::new());
         }
-        let list = id_list(ids);
+        let ids_json = ids_json(ids)?;
         let rows = self
             .client()
             .query_consistent_map::<RollupRow, _>(
                 format!(
                     "WITH RECURSIVE tree(root, id) AS ( \
-                         SELECT id, id FROM items WHERE id IN ({list}) \
+                         SELECT id, id FROM items \
+                         WHERE id IN (SELECT value FROM json_each($1)) \
                          UNION SELECT t.root, i.id FROM items i JOIN tree t ON i.parent_id = t.id \
                      ) \
                      SELECT t.root AS root, COUNT(*) AS leaves, \
                             COALESCE(SUM(w.watched), 0) AS watched \
                      FROM tree t JOIN items i ON i.id = t.id \
-                     LEFT JOIN watch_state w ON w.item_id = i.id AND w.user_id = $1 \
+                     LEFT JOIN watch_state w ON w.item_id = i.id AND w.user_id = $2 \
                      WHERE i.kind IN ({PLAYABLE_KINDS}) GROUP BY t.root"
                 ),
-                params!(user_id),
+                params!(ids_json, user_id),
             )
             .await
             .map_err(database_error)?;
@@ -2238,5 +2223,13 @@ mod tests {
                 limit: 1,
             })
         );
+    }
+
+    #[test]
+    fn replicated_id_sets_are_bound_as_json_instead_of_inlined_sql() {
+        let source = include_str!("hiqlite_media.rs");
+        assert!(!source.contains(&["fn id", "_list"].concat()));
+        assert!(!source.contains(&["IN ({", "list})"].concat()));
+        assert_eq!(ids_json(&[3, 5, 8]).expect("JSON ids"), "[3,5,8]");
     }
 }
