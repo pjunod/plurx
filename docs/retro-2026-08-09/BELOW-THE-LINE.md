@@ -86,10 +86,9 @@ Paul approved all five recommendations on 2026-08-09.
   that framework failure. Thirteen remaining full-suite cases depend on TV
   focus mode or exact emulator dimensions and are not recorded as Fold app
   regressions.
-- **Partial — iPhone suite.** An iPhone 17 Pro Max on iOS 26.6 previously passed
-  127 source/device tests with only the old external fixture case excluded. A
-  later complete rerun did not finish while the phone was locked, so this
-  ledger does not claim a 128-test iPhone pass.
+- **Pass — iPhone source/device suite.** An iPhone 17 Pro Max on iOS 26.6 ran
+  the complete 128-test Apple suite with zero failures. The tests themselves
+  completed in 3.215 seconds after the unlocked phone accepted the run.
 
 ### Offline device acceptance
 
@@ -99,11 +98,17 @@ Paul approved all five recommendations on 2026-08-09.
   for the 1,723,040 ms episode. The client transfer and offline playback were
   not completed after the disposable test install returned the app to sign-in
   and the iPad disconnected.
-- **Not executed — Pixel production transfer.** The existing signed-in app was
-  preserved and reported an empty Downloads screen. Search reached the known
-  title, but the Fold locked before a package request could be started. No
-  active plurx scheduler job existed, so reboot-resume, the real six-hour
-  timeout, and airplane-mode playback remain unclaimed.
+- **Pass — Pixel production preparation, transfer, and process-death resume.**
+  The signed-in Pixel 10 Pro Fold requested the existing 769,817,520-byte
+  *Cunk on Britain* S1E2 package and began a real Media3 transfer. The physical
+  run exposed a build-22 lifecycle defect: after force-stop, the saved
+  Any-network choice was not reapplied and the row returned queued. Build 23
+  reapplies that policy before restoring rows. Installed over the same app
+  data, it resumed the partial transfer after both upgrade/process death and a
+  second explicit force-stop; on the second run the media cache grew from
+  207,995 KiB to 230,899 KiB and the catalog reported 25.6% downloading.
+  Package completion, airplane-mode playback, reboot resume, and the real
+  six-hour timeout remain separate physical rows.
 
 The following physical rows still require the named hardware; source and
 simulator tests are not substitutes:
