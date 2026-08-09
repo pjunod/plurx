@@ -3498,6 +3498,101 @@ final class AppleClientTests: XCTestCase {
         )
     }
 
+    func testArtworkCacheIdentityAndFreshnessFollowTheSourceURL() {
+        XCTAssertNotEqual(
+            AuthImageCache.sourceKey(origin: "http://a:32400", path: "/images/one.jpg"),
+            AuthImageCache.sourceKey(origin: "http://a:32400", path: "/images/two.jpg")
+        )
+        XCTAssertNotEqual(
+            AuthImageCache.sourceKey(origin: "http://a:32400", path: "/images/one.jpg"),
+            AuthImageCache.sourceKey(origin: "http://b:32400", path: "/images/one.jpg")
+        )
+        XCTAssertEqual(
+            AuthImageCache.sourceKey(origin: "http://a:32400", path: "https://cdn.test/a.jpg"),
+            AuthImageCache.sourceKey(origin: "http://b:32400", path: "https://cdn.test/a.jpg")
+        )
+
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        XCTAssertTrue(
+            AuthImageCache.isFresh(
+                storedAt: now.addingTimeInterval(-AuthImageCache.freshAge),
+                now: now
+            )
+        )
+        XCTAssertFalse(
+            AuthImageCache.isFresh(
+                storedAt: now.addingTimeInterval(-AuthImageCache.freshAge - 1),
+                now: now
+            )
+        )
+    }
+
+    func testArtworkDiskCacheSurvivesRecreationAndExpiresOldEntries() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("plurx-artwork-tests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let bytes = Data("persistent artwork".utf8)
+        let first = AuthImageDiskCache(
+            directory: directory,
+            byteLimit: 10_000,
+            maximumStaleAge: 30 * 24 * 60 * 60
+        )
+        await first.store(bytes, for: "http://server/images/poster.jpg", storedAt: now)
+
+        // A new cache object models the next app process opening the same
+        // Caches directory.
+        let reopened = AuthImageDiskCache(
+            directory: directory,
+            byteLimit: 10_000,
+            maximumStaleAge: 30 * 24 * 60 * 60
+        )
+        let persisted = await reopened.entry(
+            for: "http://server/images/poster.jpg",
+            now: now.addingTimeInterval(60)
+        )
+        XCTAssertEqual(persisted?.data, bytes)
+        XCTAssertEqual(persisted?.storedAt, now)
+
+        let expiredKey = "http://server/images/expired.jpg"
+        await reopened.store(
+            bytes,
+            for: expiredKey,
+            storedAt: now.addingTimeInterval(-(31 * 24 * 60 * 60))
+        )
+        let expired = await reopened.entry(for: expiredKey, now: now)
+        XCTAssertNil(expired)
+    }
+
+    func testArtworkDiskCacheEvictsTheLeastRecentlyUsedEntryAtItsByteLimit() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("plurx-artwork-lru-tests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let cache = AuthImageDiskCache(
+            directory: directory,
+            byteLimit: 3_000,
+            maximumStaleAge: 30 * 24 * 60 * 60
+        )
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let bytes = Data(repeating: 7, count: 1_200)
+        await cache.store(bytes, for: "first", storedAt: now.addingTimeInterval(-3))
+        await cache.store(bytes, for: "second", storedAt: now.addingTimeInterval(-2))
+        _ = await cache.entry(for: "first", now: now.addingTimeInterval(-1))
+        await cache.store(bytes, for: "third", storedAt: now)
+
+        let first = await cache.entry(for: "first", now: now)
+        let second = await cache.entry(for: "second", now: now)
+        let third = await cache.entry(for: "third", now: now)
+        XCTAssertNotNil(first)
+        XCTAssertNil(second)
+        XCTAssertNotNil(third)
+        XCTAssertEqual(AuthImageDiskCache.token(for: "first").count, 64)
+        XCTAssertNotEqual(
+            AuthImageDiskCache.token(for: "first"),
+            AuthImageDiskCache.token(for: "third")
+        )
+    }
+
     func testPluralServerLibraryKindsMapToNativeMovieAndTVTabs() {
         XCTAssertEqual(AppModel.canonicalLibraryKind("movies"), "movie")
         XCTAssertEqual(AppModel.canonicalLibraryKind("shows"), "show")
