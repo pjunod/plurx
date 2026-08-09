@@ -1126,10 +1126,34 @@ async fn media_contract_runs_through_dyn_store() {
         );
         assert!(store.rebuild_search_index().await.expect("rebuild search") > 0);
         assert_eq!(store.delete_files(&[]).await.expect("empty delete"), 0);
-        let _ = store
-            .prune_empty_items(movies.id)
+        let legacy_orphan = store
+            .insert_item(&NewItem {
+                library_id: movies.id,
+                kind: ItemKind::Movie,
+                parent_id: None,
+                title: "Legacy Prune Contract Orphan".into(),
+                year: Some(2022),
+                season_number: None,
+                episode_number: None,
+            })
             .await
-            .expect("legacy prune");
+            .expect("legacy prune orphan");
+        assert!(
+            store
+                .prune_empty_items(movies.id)
+                .await
+                .expect("legacy prune")
+                >= 1,
+            "backend {backend} did not report its real orphan prune"
+        );
+        assert!(
+            store
+                .get_item(legacy_orphan)
+                .await
+                .expect("get pruned orphan")
+                .is_none(),
+            "backend {backend} reported a prune without removing the fixture"
+        );
         assert!(store
             .get_file(episode_file)
             .await
