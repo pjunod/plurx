@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+"""Prove that a behavior fix's retained test distinguishes the production change."""
+
+from __future__ import annotations
+
+import argparse
+import os
+from pathlib import Path
+import shlex
+import subprocess
+import sys
+import tempfile
+
+
+def run(
+    arguments: list[str], *, cwd: Path, check: bool = False
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        arguments,
+        cwd=cwd,
+        check=check,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+
+
+def git(root: Path, *arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    return run(["git", *arguments], cwd=root, check=check)
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run a passing test from HEAD, restore named production files from a "
+            "base revision in a disposable clone, and require the same test to fail."
+        ),
+        epilog=(
+            "Rust example: scripts/prove-fix origin/main repaired_case crates/x.rs. "
+            "Swift example: scripts/prove-fix --command 'make apple-test' "
+            "origin/main - clients/apple/Sources/PlayerView.swift. The Swift run uses "
+            "the same protocol on macOS; '-' means the command has no test filter."
+        ),
+    )
+    parser.add_argument(
+        "--command",
+        help=(
+            "test command to run in the clone; {filter} is replaced with the quoted "
+            "test filter (default: cargo test --workspace {filter})"
+        ),
+    )
+    parser.add_argument(
+        "--repo",
+        type=Path,
+        default=Path.cwd(),
+        help="repository whose HEAD is under test (default: current directory)",
+    )
+    parser.add_argument("base", help="Git revision supplying the pre-fix production files")
+    parser.add_argument("test_filter", help="targeted test filter, or '-' for none")
+    parser.add_argument("paths", nargs="+", help="production paths to restore from BASE")
+    return parser.parse_args(argv)
+
+
+def command_for(arguments: argparse.Namespace) -> list[str]:
+    test_filter = "" if arguments.test_filter == "-" else arguments.test_filter
+    template = arguments.command or "cargo test --workspace {filter}"
+    if "{filter}" in template:
+        template = template.replace("{filter}", shlex.quote(test_filter))
+    elif test_filter:
+        template = f"{template} {shlex.quote(test_filter)}"
+    return ["sh", "-lc", template]
+
+
+def validate_paths(root: Path, base: str, paths: list[str]) -> None:
+    for raw in paths:
+        path = Path(raw)
+        if path.is_absolute() or ".." in path.parts:
+            raise ValueError(f"production path must be repository-relative: {raw}")
+        if raw.startswith("tests/") or "/Tests/" in raw or "/src/test/" in raw:
+            raise ValueError(f"test paths must stay at HEAD, not be restored: {raw}")
+        if git(root, "cat-file", "-e", f"{base}:{raw}", check=False).returncode != 0:
+            raise ValueError(f"base revision does not contain production path: {raw}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    arguments = parse_args(argv)
+    root = arguments.repo.resolve()
+    try:
+        root = Path(git(root, "rev-parse", "--show-toplevel").stdout.strip())
+        head = git(root, "rev-parse", "HEAD").stdout.strip()
+        base_sha = git(root, "rev-parse", f"{arguments.base}^{{commit}}").stdout.strip()
+        validate_paths(root, base_sha, arguments.paths)
+    except (OSError, subprocess.CalledProcessError, ValueError) as exc:
+        print(f"prove-fix setup failed: {exc}", file=sys.stderr)
+        return 2
+
+    test_command = command_for(arguments)
+    with tempfile.TemporaryDirectory(prefix="plurx-prove-fix-") as directory:
+        clone = Path(directory) / "repo"
+        cloned = run(
+            ["git", "clone", "--quiet", "--no-hardlinks", str(root), str(clone)],
+            cwd=root,
+        )
+        if cloned.returncode != 0:
+            print(cloned.stdout, file=sys.stderr)
+            return 2
+        git(clone, "checkout", "--quiet", "--detach", head)
+
+        environment = os.environ.copy()
+        environment.setdefault("CARGO_TERM_COLOR", "never")
+        print("prove-fix: confirming the retained test passes on HEAD", flush=True)
+        current = subprocess.run(
+            test_command,
+            cwd=clone,
+            env=environment,
+            text=True,
+        )
+        if current.returncode != 0:
+            print(
+                "prove-fix: HEAD does not pass the requested test; no regression proof exists",
+                file=sys.stderr,
+            )
+            return 2
+
+        git(clone, "checkout", "--quiet", base_sha, "--", *arguments.paths)
+        print(
+            "prove-fix: restored pre-fix production paths; the retained test must now fail",
+            flush=True,
+        )
+        reverted = subprocess.run(
+            test_command,
+            cwd=clone,
+            env=environment,
+            text=True,
+        )
+        if reverted.returncode == 0:
+            print(
+                "prove-fix: FAILED — the test stayed green after the production fix was reverted",
+                file=sys.stderr,
+            )
+            return 1
+
+    print("prove-fix: PASS — the retained test rejects the pre-fix production files")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
