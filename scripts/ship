@@ -129,8 +129,8 @@ if [ "$DO_DEPLOY" -eq 1 ]; then
     note "  PLURX_HLS_CLOSED_CAPTIONS_NONE=$CC"
     note "  PLURX_HLS_FORCED_AUTOSELECT=$FA"
     note "set that where the node's environment lives (systemd: Environment= in"
-    note "plurxd.service, per deploy/plurxd.service; compose: the environment: block"
-    note "in deploy/docker-compose.yml), or add it to the ansible role once and"
+    note "plurxd.service, per deploy/plurxd.service; compose: the untracked"
+    note "deploy/docker-compose.override.yml or deploy/.env), or add it to the ansible role once and"
     note "drive it from a group_var."
     note ""
     if [ "$DRY" -eq 0 ]; then
