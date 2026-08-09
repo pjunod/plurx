@@ -45,6 +45,14 @@ DOCS_ONLY_PATHS = (
     "validation/regressions.toml",
 )
 
+# Markdown under a shipped source tree is still a release-path change. Client
+# build counters and crate packaging rules own those trees independently of a
+# file's extension, so the documentation lane must never hide them.
+SHIPPED_SOURCE_PATHS = (
+    "clients/**",
+    "crates/**",
+)
+
 # Device tests prove Android UI, focus, and packaging behavior. Server-only
 # changes can select the Android consumer through the impact graph, but they do
 # not change those on-device contracts and therefore do not justify an emulator.
@@ -95,7 +103,11 @@ def all_scope() -> dict[str, bool]:
 def is_docs_only(paths: tuple[str, ...]) -> bool:
     """Return true only when a non-empty diff cannot change shipped code."""
 
-    return bool(paths) and all(matches(path, DOCS_ONLY_PATHS) for path in paths)
+    return bool(paths) and all(
+        matches(path, DOCS_ONLY_PATHS)
+        and not matches(path, SHIPPED_SOURCE_PATHS)
+        for path in paths
+    )
 
 
 def scope_for_paths(catalog: Catalog, paths: tuple[str, ...]) -> dict[str, bool]:

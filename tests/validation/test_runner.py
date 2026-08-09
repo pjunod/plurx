@@ -159,6 +159,8 @@ class CatalogCase(unittest.TestCase):
         )
         self.assertFalse(any(executable_scope))
         self.assertTrue(is_docs_only((".github/PULL_REQUEST_TEMPLATE.md",)))
+        self.assertFalse(is_docs_only(("clients/apple/Sources/Notes.md",)))
+        self.assertFalse(is_docs_only(("crates/plurx-core/README.md",)))
 
     def test_ci_scope_does_not_treat_selector_changes_as_documentation(self):
         catalog = load_catalog(ROOT / "validation/points.toml")
