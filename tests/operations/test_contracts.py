@@ -90,6 +90,11 @@ class OperationsContractCase(unittest.TestCase):
         self.assertIn('--tags "$MOBILE_TAGS"', ship)
         self.assertNotIn("deploy/ansible", ship)
         self.assertIn("alias(libs.plugins.android.application)", android)
+        self.assertIn("deploy/docker-compose.override.yml or deploy/.env", ship)
+        self.assertNotIn("environment: block in deploy/docker-compose.yml", ship)
+
+        deploy_readme = read("deploy/README.md")
+        self.assertIn("There is no direct-install step for the fleet", deploy_readme)
 
     def test_ship_selects_mobile_tags_and_optional_vars_file(self):
         with tempfile.TemporaryDirectory() as temporary:
