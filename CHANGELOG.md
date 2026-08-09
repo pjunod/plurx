@@ -25,7 +25,13 @@ bump may break compatibility and a **patch** bump never does.
   and rebases its film-position gate at attachment and pre-frame seeks so a
   growing copy session's keyframe origin cannot inflate the result. The beacon
   includes the live HLS session id for the ingest join; offline packages remain
-  silent.
+  silent. Android build 24 adds the native parity floor: one authenticated
+  TTFF beacon per prepared attempt, timed from before the decision request;
+  final-duration measurements for buffering stalls of at least six seconds
+  after playback is established and while play is requested; and
+  playback-error context, including the live HLS session id for the ingest
+  join. Startup, paused buffering, and seek waits do not enter the stall
+  series. Neither client changes playback recovery policy.
 
 ## [0.2.7] — 2026-08-09
 

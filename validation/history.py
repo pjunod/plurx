@@ -298,7 +298,7 @@ def audit_history(
             matches_sha = tuple(sha for sha in by_sha if sha.startswith(prefix))
             if len(matches_sha) != 1:
                 errors.append(
-                    f"{where} commit {prefix} matches {len(matches_sha)} corrective commits"
+                    f"{where} commit {prefix} matches {len(matches_sha)} audited commits"
                 )
                 continue
             sha = matches_sha[0]

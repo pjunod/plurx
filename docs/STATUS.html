@@ -92,13 +92,13 @@
   <header>
     <h1>plurx — Project Status</h1>
     <div class="sub">Self-hosted media server in the old-Plex spirit · explicit ledger of done vs. planned ·
-      mirrors <code>docs/ROADMAP.md</code> + <code>docs/FEATURES.md</code> · 2026-08-09 · retrospective work orders + tagged v0.2.7 + Apple build 46 + Android build 23; physical acceptance is partially executed</div>
+      mirrors <code>docs/ROADMAP.md</code> + <code>docs/FEATURES.md</code> · 2026-08-09 · retrospective work orders + tagged v0.2.7 + Apple build 46 + Android build 24; physical acceptance is partially executed</div>
   </header>
 
   <div class="tiles">
     <div class="tile"><div class="v">v0.2.7</div><div class="l">tagged release · fleet evidence recorded</div></div>
     <div class="tile"><div class="v">0–3 ✓</div><div class="l">core phases + 2 slices complete</div></div>
-    <div class="tile"><div class="v">3 viewers</div><div class="l">web ✓ · Android build 23 · Apple build 46 source, not yet uploaded</div></div>
+    <div class="tile"><div class="v">3 viewers</div><div class="l">web ✓ · Android build 24 source · Apple build 46 source, not yet uploaded</div></div>
     <div class="tile"><div class="v">M1d ✓</div><div class="l">replicated Store complete · M2 cluster activation next</div></div>
   </div>
 
@@ -181,7 +181,7 @@
         <li class="done-item"><span class="m done">✓ done</span><span class="t">M2 GPU tone-map: candidate graphs, real-HDR boot probe, routing and downgrade, bounded hardware/software admission; accepted on nynuc at 4.89× the CPU chain</span></li>
         <li class="done-item"><span class="m done">✓ done</span><span class="t">M3 pre-transcode cache: resumable producer, LRU budget, viewer preemption, cache-hit VOD serving; active-reader eviction protection added 2026-08-06</span></li>
         <li><span class="m todo">○ todo</span><span class="t">M4 — cluster transcode: placement, restart-at-boundary failover, distributed pre-caching (this <i>is</i> Phase 4's transcode chapter; waits for its plumbing)</span></li>
-        <li><span class="m partial">◐ N0 source</span><span class="t">Performance II v2 reviewed and ratified (2026-08-09). N0's server/storage/web slice is implemented in source: durable node-local playback rows (v17), live-session joins, lifecycle and flow-control events, bounded retention and rate limits, Prometheus series, admin reader, seven-day System card, <code>perf-report</code> table-first fallback, and fleet capability fields. Apple build 46 adds the one-shot TTFF beacon with a live-session join. Android beacon parity, nynuc behavior, physical-device evidence, restart rendering, and fleet census remain unclaimed until their separate PRs and named-machine runs.</span></li>
+        <li><span class="m partial">◐ N0 source</span><span class="t">Performance II v2 reviewed and ratified (2026-08-09). N0's server/storage/web slice is implemented in source: durable node-local playback rows (v17), live-session joins, lifecycle and flow-control events, bounded retention and rate limits, Prometheus series, admin reader, seven-day System card, <code>perf-report</code> table-first fallback, and fleet capability fields. Apple build 46 adds the one-shot TTFF beacon with a live-session join; Android build 24 adds authenticated decision-inclusive TTFF, final-duration established-playback stall measurements, and playback-error beacons with live-session identity. Two physical iPhone runs failed before first frame on the protected ahead-window/AVPlayer deadlock, so that acceptance remains explicitly unclaimed. Nynuc behavior, Android physical-device evidence, restart rendering, and fleet census also remain unclaimed until their named-machine runs.</span></li>
       </ul>
     </details>
   </section>
@@ -270,8 +270,9 @@
       <li class="done-item"><span class="m done">✓ fleet</span><span class="t">2026-08-09: nynuc and nuc4 are healthy on stamped build <code>v0.2.7-15-g83403ef</code>, SQLite schema 15; media mounts remain read-only, GPU devices are present, and nuc4 retains TCP 32402 / GDM UDP 32415</span></li>
       <li><span class="m you">👤 Paul</span><span class="t">Exercise the two default-off HLS master-ladder rungs separately — <code>PLURX_HLS_CLOSED_CAPTIONS_NONE</code> and <code>PLURX_HLS_FORCED_AUTOSELECT</code> — one per deploy, observed on a physical device</span></li>
       <li><span class="m you">👤 Paul</span><span class="t">Publish the current post-retrospective server tip to the node fleet and upload Apple build 46 to TestFlight; the verified fleet is at <code>v0.2.7-15-g83403ef</code> and the Apple client is still not uploaded</span></li>
+      <li><span class="m you">👤 device</span><span class="t">On Android build 24, play an HLS title on a physical device and verify the durable <code>ttff</code> row carries the live session join. If a controlled six-second buffering interval is available, verify it records one final-duration <code>stall</code> after playback recovers without reopening playback. Neither result is claimed from source tests.</span></li>
       <li><span class="m you">👤 device</span><span class="t">Finish the Apple build 46 player-chrome and natural-end matrix. The prior build 45 physical iPad full-screen slice passed: system chrome hid after controls auto-hid and a 1080p → 720p switch recovered in 6.932 seconds. Split View/Stage Manager, iPhone orientations, PiP return, autoplay, background audio, natural end, and tvOS focus remain.</span></li>
-      <li><span class="m you">👤 device</span><span class="t">Finish offline acceptance. The iPad request survived backgrounding and force-quit and reached a ready 769,817,520-byte server package. On a Pixel 10 Pro Fold, Android build 23 resumed that transfer after upgrade/process death, explicit force-stop, and post-reboot app restoration; it completed at 100%, and the Pixel package was released server-side. With airplane mode enabled and the temporary server route removed, local playback started and continued after a midpoint seek to 14:10 of 28:43. A selected-subtitle playback, unattended pre-launch PlatformScheduler reboot recovery, and real timeout remain.</span></li>
+      <li><span class="m you">👤 device</span><span class="t">Finish offline acceptance. The iPad request survived backgrounding and force-quit and reached a ready 769,817,520-byte server package. On a Pixel 10 Pro Fold, the installed build 23 resumed that transfer after upgrade/process death, explicit force-stop, and post-reboot app restoration; it completed at 100%, and the Pixel package was released server-side. With airplane mode enabled and the temporary server route removed, local playback started and continued after a midpoint seek to 14:10 of 28:43. A selected-subtitle playback, unattended pre-launch PlatformScheduler reboot recovery, and real timeout remain.</span></li>
       <li><span class="m you">👤 Paul</span><span class="t">Run the broader Apple/Android release matrix on current builds; simulator and source gates cannot prove HDMI, hardware decode, HDR output, or D-pad/Siri Remote behavior</span></li>
     </ul>
   </section>
