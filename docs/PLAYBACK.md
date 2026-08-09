@@ -87,9 +87,10 @@ one.
 | `server.segmented-remux` | Progressive vs segmented remux hint | Only remuxes are eligible. Prefer segments at source bitrate ≥40 Mb/s or storage headroom <8×; missing measurements preserve the old route. The browser must still prove MSE accepts the codecs. | Boundary units in `playback/mod.rs` |
 | `server.track-selection` | Initial audio/subtitle | Explicit viewer choice wins later. Cold start uses one shared language policy: original-language anime, configured languages, subtitle Auto/Always/Off, then container defaults. | Track-policy Rust matrix |
 | `server.subtitle-classification` | Sidecar vs rendition vs burn | Bitmap has no text route. SRT/SubRip/WebVTT may become native HLS renditions. Other text, including ASS and `mov_text`, can be extracted but not advertised as a native rendition, so session selection burns it. | Classifier Rust unit |
+| `server.hdr-subtitle-burn-guard` | Old-client burn request on HDR | Session creation independently refuses `subtitle_burn` for a probed DV, HDR10, or HLG source with a machine-readable 422 before playback accounting or encoder creation. SDR and unprobed sources retain burn support. There is deliberately no override: missing client-plan context is not permission to replace HDR with SDR. | Rust HTTP refusal contract plus helper matrix |
 | `server.pgs-overlay` | PGS capability and artifact delivery | Only a PGS track receives additive `overlay: "pgs-v1"`, and only while the default-off gate is enabled. Authenticated cold manifests return preparation without blocking playback; warm manifests and content-addressed PNGs are published atomically. This does not choose or change video transport. | Auth/type/cache HTTP contract plus parser/cache Rust units |
 | `server.session-kind` | Copy HLS vs transcode HLS | `SessionKind::Copy` preserves video and optionally converts audio/strips DV; `Transcode` runs the video recipe. A matching completed cache entry bypasses the encoder but does not change the logical kind. | Transcode-manager lifecycle unit |
-| `server.live-playlist-window` | Writer history vs client window | A live writer keeps its full EVENT history internally. After retention deletes a prefix, the served playlist omits those URIs, advances `MEDIA-SEQUENCE`, and becomes a sliding media playlist. Completed cached VOD stays whole. | Rust retention/serving integration |
+| `server.live-playlist-window` | Writer history vs client window | A live writer keeps its full EVENT history internally. The default served view becomes sliding only after retention deletes a prefix. The default-off iPad experiment instead serves a typeless playlist plus `EXT-X-START:TIME-OFFSET=0` from the first response, preserving one envelope across that boundary. Completed cached VOD stays whole. | Rust retention/serving integration + typeless shape-stability unit; physical-iPad comparison pending |
 | `server.auto-rung` | Auto output height | Software follows the source up to 720p; proven hardware follows it up to 1080p. Both clamp to the source and never upscale. An explicit rung is snapped to the published ladder. | Encoder-aware async Rust unit |
 | `server.encoder` | Hardware family vs software | Honor a usable admin preference; otherwise take the first probed usable hardware encoder; software x264 is the unconditional fallback. Probe success, not advertised presence, is authority. | Every-family encoder units |
 | `server.tone-map-pipeline` | GPU graph vs CPU graph | A probed vendor graph is used only with its matching encoder and PQ HDR source. Bitmap overlay or a failed/incompatible graph declines to the recorded fallback; CPU is total. | Pipeline decision and fallback units |
@@ -112,9 +113,11 @@ one.
 | `apple.transport-and-dv` | AVPlayer direct vs HLS | Execute the server mode, except normalize even a legacy direct Dolby Vision answer through preserving copy HLS. Overrides, audio changes, and subtitle needs decide whether that session copies or transcodes. | XCTest for legacy direct-DV normalization |
 | `apple.compatibility-fallback` | Apple startup decode failure recovery | Before real playback, a preserved DV stream with an HDR10/HLG base strips to that base first; only the next media rejection uses the universal transcode. Each rescue is once and resumes the last truthful film position. | XCTest recovery ladder |
 | `apple.established-hdr-recovery` | Interruption after HDR rendered | Once the item has advanced for ≥5 s, a stall or item failure reconnects the same HDR delivery once. An immediate repeat stops visibly instead of falling through to the SDR compatibility transcode. | XCTest established-delivery guard |
-| `apple.buffering-recovery` | Sustained wait after playback began | Once the item has advanced for ≥5 s, six stagnant two-second samples during an explicit AVPlayer buffer wait reopen the same delivery. The third sample first nudges Play; an immediate repeat stops with network-specific copy. Every reopen/terminal decision reports method, film position, and observed stall duration through the bounded client log, and none of this is codec/HDR evidence. | XCTest monitor, gating, retry-state, and beacon-payload suite |
+| `apple.buffering-recovery` | Sustained or self-recovered wait after playback began | Each newly opened item must advance for ≥5 s before six stagnant two-second samples during an explicit AVPlayer buffer wait may reopen the same delivery. The third sample first nudges Play; an immediate repeat stops with network-specific copy. Recovery actions report method, film position, and observed duration, while deltas from AVPlayer's access-log stall counter plus any sub-threshold stagnant interval ride the 10 s progress cadence to the same bounded client log. None of this is codec/HDR evidence. | XCTest per-item gate, monitor, retry-state, access-log delta, and beacon-payload suite; physical-iPad throttling pending |
+| `apple.item-end` | Temporary live edge vs completed item end | Only a session that is both non-VOD and still growing may reopen an uncorroborated playlist end without a bound. Direct, offline, and completed-cache items may use AVPlayer's finite duration; with no catalog or item duration, one same-position retry is allowed and the second end finishes instead of looping sessions. | XCTest duration/growing matrix + same-position retry bound |
 | `apple.hls-buffer-window` | Growing HLS forward buffer | AVPlayer prefers a 60 s buffer on live copy/transcode sessions, but a physical iPad fetched about 120 s ahead; the preference is not a cap. The server therefore retains 180 s behind the download frontier: the measured 120 s lead plus 30 s of back buffer and 30 s for retry/reload. Direct files and completed cached HLS keep AVPlayer's default. | Rust retained/pruned segment-set regression + XCTest item-configuration guard |
 | `apple.player-system-chrome` | Custom iOS full-screen player chrome | In a full-screen iOS window, the status bar and Home indicator stay available while controls, playback info, a failure, a notice, or recovery/next progress is visible. They retire only after all player surfaces leave; a windowed iPad status bar remains system-owned. | Routing inventory pins the modifier application + iOS hosting-controller propagation XCTest |
+| `apple.marker-control-row` | Marker action placement | The PlayerView call site hosts the shared one-line marker label inside `PlayerTrailingControlRow`, which owns full-width expansion and trailing placement; the button itself must not reclaim the row with a max-width frame. | XCTest shared label/row component contract; physical narrow-phone accessibility-size check pending |
 | `apple.quality-session` | Picked rung vs Auto/burn height | A picked rung forces a transcode at that height. An otherwise-copyable subtitle burn preserves source height; an ordinary Auto transcode leaves the encoder-aware rung to the server. | XCTest source/rung/burn height matrix |
 | `apple.subtitle-route` | Media selection vs reopen | Native rendition switches stay inside AVPlayer once the session exists. A recognized PGS overlay stays on the current item. Entering from direct, selecting/leaving a burn, or changing a burn reopens; other bitmap/styled tracks still burn. | XCTest route matrix |
 | `apple.hdr-subtitle-guard` | Burn-only subtitle on HDR | A recognized PGS overlay is allowed because it does not change video. Unknown overlay versions, VobSub, and styled tracks are refused while the current delivery is DV, HDR10, or HLG. Native text still selects, and SDR playback may still burn. | XCTest subtitle/dynamic-range matrix |
@@ -473,8 +476,11 @@ Three details, each load-bearing:
   segment the client fetched, the request-side flow controller SIGSTOPs its
   ffmpeg. A later media fetch that brings the reserve to 150 s or less
   SIGCONTs it; the 30-second gap prevents a fast encoder from toggling once per
-  segment near the ceiling. Byte and global disk limits release at half because
-  those are hard capacity bounds. The 15-second reaper is a repair pass for a
+  segment near the ceiling. The per-session byte limit releases at half. The
+  global limit enters on total live scratch, but releases when the drainable
+  sum of bytes ahead reaches half; retained history behind every client is
+  still real disk usage but cannot make release structurally unreachable. The
+  15-second reaper is a repair pass for a
   producer nobody is requesting from, not the normal trigger. Session status
   reports the active hold as `time`, per-session `bytes`, or `global`, plus the
   matching release value; the web and Apple overlays show both beside a held
@@ -491,6 +497,17 @@ Three details, each load-bearing:
   stop therefore remains open pending a device capture of `loadedTimeRanges`,
   access-log segment counts, and the playlist header across the internal
   EVENT-to-sliding-window transition.
+
+**Playlist-envelope decision (2026-08-09): experiment, not yet adopted.** The
+default remains the established EVENT-then-sliding behavior until the batched
+physical-iPad run compares a long control playback with the gated variant.
+Enable **Settings → Playback → Experimental typeless sliding HLS** for the
+variant; it is snapshotted when a new session opens, strips EVENT before the
+first client response, adds `EXT-X-START:TIME-OFFSET=0`, and retains that same
+header shape when `MEDIA-SEQUENCE` begins advancing. The server logs the first
+slide once with the session id, first retained index, and seconds since start;
+compare that timestamp with client stall evidence. Keep the setting off if the
+variant does not materially reduce stalls or changes AVPlayer seek behavior.
 
 **Seek and audio-switch stay on this path.** A copy-HLS session sets
 `PLAYER.method = 'remux'` (honest — no video re-encode) and `PLAYER.copyHls =
@@ -708,9 +725,10 @@ covering the other.
   suspend window bounds the other end, so a session's directory holds roughly
   `hls_ahead_max_secs + 180 s` of content whatever the encoder's speed. At
   the default 180 s ahead limit this is about 360 s, up from the previous
-  300 s span (+20%). The 8 GiB global scratch cap is unchanged, continues to
-  release at half, and can therefore bind roughly one 4K session sooner; it
-  may keep a producer held until client frontiers advance. Session status
+  300 s span (+20%). The 8 GiB global scratch cap is unchanged. It enters on
+  total scratch and releases at half based on bytes ahead across live
+  sessions, so unprunable retention floors cannot deadlock every producer.
+  Session status
   exposes the active `hold_reason` plus `resume_below_seconds` or
   `resume_below_bytes`, and the web and Apple overlays show the matching value
   while a session is held so that state is distinguishable from an encoder

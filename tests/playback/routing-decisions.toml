@@ -78,6 +78,13 @@ test = "crates/plurx-core/src/tracks.rs"
 test_anchor = "native_hls_text_and_burn_fallback_are_distinct"
 
 [[decisions]]
+id = "server.hdr-subtitle-burn-guard"
+source = "crates/plurxd/src/http/hls.rs"
+source_anchor = "fn hdr_subtitle_burn_is_refused("
+test = "crates/plurxd/src/http/mod.rs"
+test_anchor = "hls_create_refuses_hdr_subtitle_burns_at_the_server_boundary"
+
+[[decisions]]
 id = "server.pgs-overlay"
 source = "crates/plurxd/src/http/pgs_overlay.rs"
 source_anchor = "pub async fn manifest("
@@ -183,6 +190,13 @@ test = "clients/apple/Tests/AppleClientTests.swift"
 test_anchor = "testBufferingWaitHasAnIndependentBoundedRecoveryTimer"
 
 [[decisions]]
+id = "apple.item-end"
+source = "clients/apple/Sources/PlayerController.swift"
+source_anchor = "static func endAction("
+test = "clients/apple/Tests/AppleClientTests.swift"
+test_anchor = "testUnknownDurationEndReopensUntilAnEndIsCorroborated"
+
+[[decisions]]
 id = "apple.pgs-overlay"
 source = "clients/apple/Sources/PlayerController.swift"
 source_anchor = "static func subtitleUsesOverlay("
@@ -209,6 +223,13 @@ source = "clients/apple/Sources/PlayerView.swift"
 source_anchor = ".modifier(PlayerSystemOverlayModifier("
 test = "clients/apple/Tests/AppleClientTests.swift"
 test_anchor = "testIOSPlayerSystemOverlayModifierReachesHostingController"
+
+[[decisions]]
+id = "apple.marker-control-row"
+source = "clients/apple/Sources/PlayerView.swift"
+source_anchor = "struct PlayerTrailingControlRow<Control: View>: View"
+test = "clients/apple/Tests/AppleClientTests.swift"
+test_anchor = "testSkipMarkerRowUsesProductionContentAtEveryTouchWidthAndTextSize"
 
 [[decisions]]
 id = "apple.quality-session"

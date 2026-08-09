@@ -1,11 +1,10 @@
 # Clustering transition — from one plurxd node to Phase 4
 
-**Status:** executing — M0, M1a, and M1b merged; M1c's catalogue/watch backend,
-scan fences, derived-search recovery, and failure gate are under review; daemon
-activation still pending
+**Status:** executing — M0 through M1d are complete; post-coalescer growth
+measurement, import, and daemon activation remain pending
 · **Executes:** Phase 4 from [ROADMAP.md](ROADMAP.md) and REQ-HA-1–6 from
 [REQUIREMENTS.md](REQUIREMENTS.md) · **Written:** 2026-08-06 · **Revised:**
-2026-08-08
+2026-08-09
 
 Companion to [PHASE3-SPIKE.md](PHASE3-SPIKE.md), which chose hiqlite and
 proved restart-at-boundary media behavior; [PERF-PLAN.md](PERF-PLAN.md) §7,
@@ -43,7 +42,7 @@ quietly wider threshold.
 
 | Existing seam | Current truth | Phase 4 consequence |
 |---|---|---|
-| `Arc<dyn Store>` | All durable application state crosses the 116-method composed traits in [`store/mod.rs`](../crates/plurx-core/src/store/mod.rs). | Keep handlers stable, but port the methods in reviewable groups rather than one backend rewrite. |
+| `Arc<dyn Store>` | All durable application state crosses the 120-method composed traits in [`store/mod.rs`](../crates/plurx-core/src/store/mod.rs); a compile-time coercion keeps that object-safety claim executable. | Keep handlers stable, but port the methods in reviewable groups rather than one backend rewrite. |
 | `instance.id` | Stable logical-server identifier in settings; new installs mint a UUID, but the schema historically accepted arbitrary strings. It is also passed as `AppState::node_id`. | Split the concepts without changing the first node's existing cache/offline ownership key. |
 | Cache/offline `node_id` | Existing rows are keyed by the current `instance.id`. | An existing install seeds local `node.id` from that exact string; changing it would strand rows and let orphan cleanup delete bytes. |
 | `Recipe<'a>` | Borrowed, node-specific cache-key input; its hash includes ffmpeg build, encoder, and pipeline. | The hash is a node-local cache address, not a cluster recipe. Replicate owned request inputs and rebuild against the survivor's pipeline. |
@@ -54,12 +53,12 @@ quietly wider threshold.
 
 M0 now provides tolerated cluster configuration and local node identity; M1a
 provides the full backend-neutral parity inventory; M1b provides the first
-hiqlite auth/settings backend; and M1c adds libraries, media, watch state,
-node-local FTS, and bounded root-aware reconciliation to the same
-three-process failure harness. The daemon still opens the complete SQLite
-store. Membership/join, full-store activation, lease-fenced publication,
-replicated session ownership, serving self-fencing, and client failover do not
-exist yet.
+hiqlite auth/settings backend; M1c adds libraries, media, watch state,
+node-local FTS, and bounded root-aware reconciliation; and M1d completes the
+120-method store plus the progress write-rate gate. The daemon still opens the
+complete SQLite store. Import, membership/join, full-store activation,
+lease-fenced publication, replicated session ownership, serving self-fencing,
+and client failover do not exist yet.
 
 ## 3. Contracts — safety lives in signatures and transactions
 
@@ -120,12 +119,23 @@ join_token_file = ""             # absent bootstraps/reopens one voter
 trusted_network = ""             # required if transport is not TLS
 ```
 
-`enc_keys`, `secret_raft`, and `secret_api` live in mode-`0600` files beside
-`node.id`, generated atomically. They are never logged, exposed in settings, or
-stored in replicated SQL. A single-use join token contains cluster id,
+The shipped build keeps `secret_raft` and `secret_api` in mode-`0600` files
+beside `node.id`, generated atomically. Hiqlite's `enc_keys` field is compiled
+out because plurx uses `default-features = false`; it returns only if a later
+M3 backup/dashboard design deliberately enables and threat-models that feature.
+These secrets are never logged, exposed in settings, or stored in replicated
+SQL. A single-use join token contains cluster id,
 bootstrap addresses, expiry, the new raft id, and an encrypted envelope for
 those secrets; the one-time token secret wraps the envelope and is invalidated
 after membership commits.
+
+Trakt is the exception to the otherwise hash-only credential rows: its access
+and refresh tokens are live bearer secrets. Replicating plaintext would copy
+them into every voter database, raft WAL, snapshot, and backup, where row
+deletion cannot erase historical log entries. Before M2 may select Hiqlite,
+those columns must use envelope encryption under a plurx-owned key file; only
+ciphertext, key version, and non-secret metadata may enter raft. A copied voter
+disk must not be sufficient to use a household's Trakt account.
 
 M0 must verify hiqlite 0.14's transport support. If it cannot provide TLS, the
 first clustering release is explicit: authenticated-but-cleartext inter-node
@@ -342,8 +352,8 @@ import from a second process beside the server.
 ### 6.1 M0 — identity compatibility, dependency proof, and baselines
 
 **Delivered 2026-08-07.** PRs 82–83 establish the identity, semantic spike,
-cost record, replicated-SQL guardrails, and 114-method parity inventory this
-plan requires.
+cost record, replicated-SQL guardrails, and the then-114-method parity
+inventory this plan requires.
 
 Add the default-empty tolerated cluster section, `ClusterIdentity`, and
 crash-safe `node.id` seeding. Keep `SqliteStore` in production. Isolate
@@ -373,8 +383,9 @@ SQL.
 
 **Acceptance:** the additive suite exercises every method against in-memory
 and file SQLite with no behavior change; `make check` remains the gate. The
-inventory is 118 methods after M1c added reconciliation, root-reset, and
-derived-search recovery contracts.
+inventory reached 118 methods when M1c added reconciliation, root-reset, and
+derived-search recovery contracts; M1d's progress and Trakt compare-and-set
+operations bring the current boundary to 120.
 
 The executable M1a contract is `store_contract`: each scenario receives only
 `Arc<dyn Store>`, and its name inventory fails unless every `async fn` declared
@@ -460,6 +471,42 @@ cache ownership. Run the full parity suite against SQLite and three voters.
 latency, RSS, and growth budgets pass; offline/cache rows retain node-local
 ownership on all replicas.
 
+**Implementation complete; daemon activation remains open.**
+`HiqliteAuthStore` now implements all 120 `Store` methods. Trakt credentials,
+the watched outbox, cache recipes and locations, offline packages, and offline
+leases use deterministic replicated writes. Trakt refresh and unlink are
+compare-and-set operations, and watched delivery rows carry short claims so
+several voters cannot settle the same attempt over one another. Cache and
+offline rows replicate ownership, state, recipe, and path metadata; the named
+node's media, cache, and package bytes remain node-local. Offline admission
+applies complete request idempotency, row limits, per-user bytes, and a
+per-node byte budget in one conditional statement; one consistent fallback
+snapshot classifies a refusal. Lease creation and renewal keep the durable
+token and ephemeral guard in one transaction.
+
+`make cluster-check` first runs the same `Arc<dyn Store>` contract scenarios
+against memory SQLite, file SQLite, and a three-voter Hiqlite cluster. Its
+separate-process loss harness then varies user and node identity; verifies
+refused-state postconditions, cache heartbeat cutoffs, every Trakt/outbox
+field, and terminal offline-state guards; and compares independently hashed
+replica dumps both before and after follower or leader loss. The server-side
+progress coalescer commits the leading beat, replaces intermediate beats with
+one trailing value, and flushes that newest value at the ten-second boundary.
+A new 95% watched transition commits synchronously. Manual writes cannot be
+overwritten by a delayed flush, dated offline imports remain ordered facts,
+and graceful shutdown makes a bounded drain attempt.
+
+The existing raw-write cost record measures 0.083333 ms p95 progress latency,
+6,832,128 bytes (6.52 MiB) additional idle RSS, and 8,309,777 bytes of data
+growth for 10,000 direct store writes. Those values remain inside the raw §1
+budgets, but the unchanged growth number is not a post-coalescer rerun: that
+benchmark bypasses `ProgressCoalescer`. Paused-time daemon tests prove one
+steady-state durable commit per ten-second stream window and the terminal
+watched exception. Before M2 selects Hiqlite, a committed benchmark must drive
+incoming beats through the coalescer, count physical commits, compact, and
+record resulting directory growth. M2 also owns importing an existing SQLite
+store and selecting the complete backend at startup.
+
 ### 6.6 M2 — migrate an existing install
 
 Implement §4 and make one-voter hiqlite the default only after the import gate
@@ -476,6 +523,14 @@ state and starts SQLite unchanged.
 Add single-use join, add/remove, health, server-name replication, node-specific
 mDNS/GDM, and the admin membership surface. Two voters are a visible degraded
 reconfiguration state, never supported HA.
+
+Node removal must also resolve offline work owned by that node. A `preparing`
+package cannot be silently re-homed because its replicated `source_path` does
+not prove the survivor has the same mount. Before removal commits, M3 must
+either verify an equivalent source and explicitly requeue on a chosen node, or
+mark the package failed with a stable `node_removed` code so its reservation is
+released and the client can retry. Leaving it preparing until seven-day expiry
+is an activation blocker.
 
 **Acceptance:** grow one node to three without changing `instance.id`; reject
 expired/reused tokens and public cleartext binds; advertise three distinct
@@ -556,19 +611,19 @@ mode without lowering quality or losing selected tracks.
 6. **Do not call a VIP the failover implementation.** A VIP locates a process;
    replicated state, fencing, and takeover let it continue the film.
 
-## 8. Handoff checkpoint — M1c has catalogue evidence, not daemon activation
+## 8. Handoff checkpoint — M1d completes the backend, not daemon activation
 
-M0, M1a, and M1b are on `main`; M1c is under review after rebasing onto that
-head. Keep SQLite as the daemon's complete store until every trait has one
-replicated implementation and the import gate is ready. The next implementation
-boundary is M1d: Trakt/outbox, cache/offline ownership, the remaining durable
-contracts, and the ten-second progress coalescer with measured write-rate
-evidence.
+M0 through M1d are on `main`. Every trait now has one replicated
+implementation, but keep SQLite as the daemon's selected store
+until the import, credential-encryption, node-removal, and post-coalescer
+growth gates are ready. The next implementation boundary is M2: resumable v14
+import, content-hash comparison, failure-injected recovery, envelope-encrypted
+Trakt credentials, and the one-voter Hiqlite startup switch.
 
 ```bash
 make check                    # M0 and every milestone: repository baseline
 make validate-staged          # changed behavior contracts
-make cluster-check            # M1b/M1c three-voter state, FTS, and loss gate
+make cluster-check            # M1b/M1c/M1d durable state, FTS, and loss gate
 cargo test -p plurx-core store::sqlite::tests:: -- --nocapture
                               # explicit local M2 database-upgrade gate
 ```

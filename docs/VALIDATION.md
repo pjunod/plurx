@@ -84,7 +84,7 @@ mapping cannot quietly make ordinary tests disappear.
 | `commit` | Pre-commit and ordinary local work | Mandatory Rust/catalog baseline; shared API wire check; web syntax, contrast, golden, and accessibility when affected |
 | `ci` | Pull requests and `main` | Impact-selected Linux contracts plus parallel browser, Apple, Android, build, and container jobs when their surfaces can change |
 | `full` | Before a risky merge or release | Browser playback; both native-client suites; Android device tests when an explicit disposable device is selected; container startup/restart |
-| `nightly` | Scheduled deep regression search | Exhaustive playback and restart matrix; interrupted-production recovery; resource bounds; all runnable full checks |
+| `nightly` | Scheduled deep regression search | Exhaustive playback and restart matrix; interrupted-production recovery; resource bounds; all runnable full checks; a gating 15-minute PGS parser fuzz campaign; report-only mutation sampling over Rust files changed in the last seven days |
 
 The `commit` profile permits explicitly optional checks to skip when a laptop
 lacks their tooling. The skip is printed and recorded; it is not reported as a
@@ -235,6 +235,43 @@ The hook uses the staged diff, not unstaged experiments beside it. It still
 runs the mandatory baseline on every commit, then adds any point-specific
 commit checks.
 
+## Behavior fixes — prove the test distinguishes the correction
+
+A corrective pull request should leave behind at least one test that passes on
+the pull request and fails when only the production correction is restored from
+the base tree. `scripts/prove-fix` performs both runs inside a disposable local
+clone; it never rewrites the checkout in which it was invoked.
+
+```bash
+# Rust: filter one retained test and restore one or more production files.
+scripts/prove-fix origin/main repaired_case crates/plurxd/src/example.rs
+
+# Swift: use the same protocol on macOS with the shared simulator suite.
+scripts/prove-fix --command 'make apple-test' origin/main - \
+  clients/apple/Sources/PlayerView.swift
+```
+
+The first run must be green. The second run must be red after the named
+production paths are taken from the base revision. A test that stays green is
+evidence that the patch touched a test, not that the test protects the fix.
+Pull requests may opt into the first-month report-only CI job with the
+`fixes-behavior` label. It applies the protocol to changed Rust production
+files and writes the result to the job summary; Swift uses the documented
+manual command because Linux cannot run XCTest.
+
+Corrective client commits also add or update a row in
+[`tests/client-fixes.toml`](../tests/client-fixes.toml). Each row binds the
+commit to a current production symbol and a current test symbol. Removing or
+renaming either anchor fails the validation inventory. This is deliberately
+stronger than accepting any test edit in the same commit: an unrelated test
+cannot satisfy the post-review history policy.
+
+The scheduled workflow adds a second, exploratory layer. `cargo-mutants` is
+limited to Rust files changed in the previous seven days, gives each mutation
+300 seconds, and has a 60-minute job cap. Its report is uploaded from
+`target/mutants`; surviving mutants are summarized but do not fail the nightly
+workflow during the first signal-gathering month.
+
 ## Historical fixes — every scar names the check that guards it
 
 Path ownership answers which promise a change can affect; it does not prove
@@ -244,7 +281,11 @@ closes that gap by walking every non-merge corrective commit reachable from
 compatibility corrections, and `perf` fixes—and requiring one of two forms of
 evidence:
 
-- the fixing commit added or changed a surviving test or assertion; or
+- for older commits, the fixing commit added or changed a surviving test or assertion;
+- for client corrections after the review baseline, a client-fix anchor names
+  the production-to-test relationship;
+- for other runtime corrections after that baseline, an explicit regression
+  mapping or anchor names the current evidence; or
 - [`validation/regressions.toml`](../validation/regressions.toml) explicitly
   maps the commit to a current functionality point and runnable check.
 
@@ -257,14 +298,15 @@ fails the baseline.
 
 ```bash
 make history-check
-# history ok: 234 corrective commits · 159 direct test changes ·
-#             66 explicit current-check mappings · 9 non-runtime corrections
+# history ok: 288 corrective commits · 213 direct test changes ·
+#             75 explicit current-check mappings · 4 client-fix anchors ·
+#             9 non-runtime corrections
 ```
 
-The exact counts grow with the repository. Read the result as a partition:
+The exact counts grow with the repository. Read the result as a coverage audit:
 every corrective commit must have direct test evidence, an explicit executable
-check mapping, or a reason proving that it changed only documentation,
-comments, or ignored generated state. The three counts must sum to the number
+check mapping, a client-fix anchor, or a reason proving that it changed only
+documentation, comments, or ignored generated state. The evidence counts cover the number
 audited. The machine-readable inventory is written to
 `target/validation/history.json`, including the subject, functionality points,
 and coverage route for every commit.
@@ -274,6 +316,11 @@ valid shell/YAML that pointed at the wrong target. `make operations-check`
 pins the Compose project and state mount, configurable HTTP/discovery ports,
 discovery networking, build stamp, real Apple/Android ship targets, concrete
 CI simulators, container port/state/cleanup behavior, and copy-video reporting.
+
+The same operations gate extracts current mobile build claims from the Apple
+and Android READMEs, the Apple parity document, and the status page. Those
+claims must match `CURRENT_PROJECT_VERSION` and `versionCode`; advancing a
+client build without its user-facing status documents is red before a PR opens.
 
 ## Add a functionality point — define the behavior before its command
 

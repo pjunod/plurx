@@ -474,7 +474,8 @@ invariant is being smuggled into this feature.
 
 The response says the Apple build was 16, but its committed branch contains
 Apple build 17. It correctly observed Android version code 8 on that old branch.
-Current `origin/main` is Apple build 19 and Android version code 9, while the
+At this review's 2026-08-04 baseline, `origin/main` was Apple build 19 and
+Android version code 9, while the
 active branding branch has already advanced further.
 
 The revised plan should remove exact assumed starting values. Each Apple and

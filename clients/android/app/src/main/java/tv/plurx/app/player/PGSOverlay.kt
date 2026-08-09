@@ -122,6 +122,8 @@ internal enum class PGSOverlayStatus(val label: String?) {
     Failed("PGS overlay · unavailable"),
 }
 
+internal enum class PGSOverlayManifestDisposition { Ready, Preparing, Terminal }
+
 internal object PGSOverlayPolicy {
     const val maximumCanvasWidth = 4_096
     const val maximumCanvasHeight = 2_160
@@ -134,6 +136,15 @@ internal object PGSOverlayPolicy {
     const val lookAheadMs = 90_000L
     const val refreshMarginMs = 20_000L
     const val maximumPrepareMs = 10L * 60 * 1_000
+
+    fun manifestDisposition(statusCode: Int): PGSOverlayManifestDisposition = when (statusCode) {
+        200 -> PGSOverlayManifestDisposition.Ready
+        202, 503 -> PGSOverlayManifestDisposition.Preparing
+        else -> PGSOverlayManifestDisposition.Terminal
+    }
+
+    fun retryAfterMs(header: String?): Int =
+        ((header?.toIntOrNull() ?: 1) * 1_000).coerceIn(250, 5_000)
 
     fun windowAt(sourceTimeMs: Long, durationMs: Long): PGSOverlayTimeWindow {
         require(durationMs > 0)

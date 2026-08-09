@@ -25,7 +25,18 @@ SCOPE_KEYS = (
     "release_build",
     "container",
     "mobile_version",
+    "hiqlite_spike",
+    "cluster_auth",
     "docs_only",
+)
+
+# A selector or aggregate-workflow edit can change which evidence appears at
+# all. It must exercise every routed surface instead of trusting the routing it
+# is in the middle of changing.
+FULL_CI_PATHS = (
+    ".github/workflows/ci.yml",
+    "validation/ci_scope.py",
+    "validation/points.toml",
 )
 
 # Documentation can still be executable evidence: validation unit tests pin
@@ -43,6 +54,14 @@ DOCS_ONLY_PATHS = (
     "NOTICE",
     "NOTICE.*",
     "validation/regressions.toml",
+)
+
+# Markdown under a shipped source tree is still a release-path change. Client
+# build counters and crate packaging rules own those trees independently of a
+# file's extension, so the documentation lane must never hide them.
+SHIPPED_SOURCE_PATHS = (
+    "clients/**",
+    "crates/**",
 )
 
 # Device tests prove Android UI, focus, and packaging behavior. Server-only
@@ -95,7 +114,11 @@ def all_scope() -> dict[str, bool]:
 def is_docs_only(paths: tuple[str, ...]) -> bool:
     """Return true only when a non-empty diff cannot change shipped code."""
 
-    return bool(paths) and all(matches(path, DOCS_ONLY_PATHS) for path in paths)
+    return bool(paths) and all(
+        matches(path, DOCS_ONLY_PATHS)
+        and not matches(path, SHIPPED_SOURCE_PATHS)
+        for path in paths
+    )
 
 
 def scope_for_paths(catalog: Catalog, paths: tuple[str, ...]) -> dict[str, bool]:
@@ -103,11 +126,14 @@ def scope_for_paths(catalog: Catalog, paths: tuple[str, ...]) -> dict[str, bool]
 
     if is_docs_only(paths):
         return {key: key == "docs_only" for key in SCOPE_KEYS}
+    if any(matches(path, FULL_CI_PATHS) for path in paths):
+        return all_scope()
 
     selection = select_points(catalog, paths)
     check_ids = {
         check.id for check in selected_checks(catalog, selection, profile="ci")
     }
+    point_ids = set(selection.point_ids)
     return {
         "apple": "apple-simulators" in check_ids,
         "android_jvm": "android-jvm" in check_ids,
@@ -116,6 +142,8 @@ def scope_for_paths(catalog: Catalog, paths: tuple[str, ...]) -> dict[str, bool]
         "release_build": any(matches(path, RELEASE_BUILD_PATHS) for path in paths),
         "container": any(matches(path, CONTAINER_PATHS) for path in paths),
         "mobile_version": "mobile-version" in check_ids,
+        "hiqlite_spike": "core.media" in point_ids,
+        "cluster_auth": "cluster.auth" in point_ids,
         "docs_only": False,
     }
 

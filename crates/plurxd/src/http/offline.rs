@@ -621,6 +621,13 @@ async fn release_package(
 }
 
 async fn authorized_package(state: &AppState, token: &str) -> Result<OfflinePackage, ApiError> {
+    if !enabled(state).await? {
+        return Err(typed(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "offline_disabled",
+            "Offline viewing is disabled by the server administrator.",
+        ));
+    }
     let hash = token_hash(token)?;
     let now = now_unix();
     state

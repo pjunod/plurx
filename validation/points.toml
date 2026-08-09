@@ -22,6 +22,7 @@ audit_paths = [
   "vendor/**",
 ]
 audit_exclude = []
+allow_unmatched_globs = ["docs/METADATA*.md"]
 
 [[checks]]
 id = "catalog-contract"
@@ -155,8 +156,8 @@ timeout_seconds = 300
 
 [[checks]]
 id = "database-upgrades"
-title = "SQLite upgrade and downgrade-safety contract"
-command = "cargo test -p plurx-core store::sqlite::tests:: -- --nocapture"
+title = "SQLite upgrade, import staging, and downgrade-safety contract"
+command = "cargo test -p plurx-core store::sqlite::tests:: -- --nocapture && cargo test -p plurx-core cluster::migration -- --nocapture"
 profiles = ["ci", "full", "nightly"]
 requires = ["cargo"]
 missing = "fail"
@@ -166,7 +167,7 @@ timeout_seconds = 300
 id = "cluster-auth"
 title = "Three-voter replicated durable-state failure contract"
 command = "make cluster-check"
-profiles = ["commit", "ci", "full", "nightly"]
+profiles = ["commit", "full", "nightly"]
 platforms = ["darwin", "linux"]
 requires = ["cargo", "make"]
 missing = "fail"
@@ -202,7 +203,7 @@ timeout_seconds = 600
 [[checks]]
 id = "playback-recovery"
 title = "Interrupted playback production resumes without losing media"
-command = "cargo test -p plurxd transcode::tests::a_preempted_producer_resumes_without_losing_picture -- --exact --nocapture"
+command = "cargo test -p plurxd ffmpeg::tests::nightly_runner_has_ffmpeg_readrate -- --exact --ignored --nocapture && cargo test -p plurxd transcode::tests::a_preempted_producer_resumes_without_losing_picture -- --exact --nocapture"
 profiles = ["nightly"]
 platforms = ["darwin", "linux"]
 requires = ["cargo", "ffmpeg"]
@@ -249,19 +250,23 @@ checks = ["rust-gate"]
 [[points]]
 id = "persistence.upgrades"
 title = "Persistent database compatibility"
-contract = "Existing libraries upgrade without losing data, and a newer unsupported database is refused instead of corrupted."
-paths = ["crates/plurx-core/src/store/sqlite/mod.rs"]
+contract = "Existing libraries upgrade without losing data; a newer unsupported database is refused without changing staging state; the staged import-preparation helper publishes a durable, content-addressed SQLite backup without activating clustering."
+paths = [
+  "crates/plurx-core/src/cluster/migration.rs",
+  "crates/plurx-core/src/store/sqlite/mod.rs",
+]
 checks = ["rust-gate", "database-upgrades"]
 depends_on = ["core.media"]
 
 [[points]]
 id = "cluster.auth"
 title = "Replicated durable state"
-contract = "Three voters converge on settings, authentication, catalogue, watch, and root-safety state; local FTS rebuilds from replicated items, quorum loss fails readiness, and incompatible schema clients fail preflight."
+contract = "The shared Store suite passes on SQLite and three voters; replicated path metadata retains its named owner while bytes stay node-local; local FTS rebuilds from replicated items; identity/state guards survive follower and leader loss; quorum loss fails readiness; incompatible candidates are refused."
 paths = [
   "crates/plurx-cluster-check/**",
   "crates/plurx-core/src/store/hiqlite.rs",
   "crates/plurx-core/src/store/hiqlite_catalog.rs",
+  "crates/plurx-core/src/store/hiqlite_durable.rs",
   "crates/plurx-core/src/store/hiqlite_media.rs",
   "scripts/vendor-audit-lock",
   "vendor/rust_decimal/**",
@@ -365,11 +370,12 @@ depends_on = ["core.media", "server.api", "library.catalog"]
 [[points]]
 id = "watch-state.sync"
 title = "Watch state and external history sync"
-contract = "Progress, watched state, and Trakt synchronization converge without losing newer user activity."
+contract = "Native and Plex progress routes share one bounded coalescer; manual and timestamped activity outranks delayed flushes; watched state and Trakt synchronization converge without losing newer user activity."
 paths = [
   "crates/plurx-core/src/store/sqlite/{outbox,trakt,watch}.rs",
   "crates/plurx-core/src/trakt.rs",
-  "crates/plurxd/src/{trakt,watched}.rs",
+  "crates/plurxd/src/{progress,trakt,watched}.rs",
+  "crates/plurxd/src/http/mod.rs",
   "crates/plurxd/src/http/{trakt,watch}.rs",
 ]
 checks = ["rust-gate", "user-journey"]
@@ -496,8 +502,11 @@ paths = [
   "Makefile",
   "docs/VALIDATION.md",
   "scripts/pre-commit",
+  "scripts/ci-flake-report",
   "scripts/history-audit",
+  "scripts/prove-fix",
   "scripts/validate",
+  "tests/client-fixes.toml",
   "tests/validation/**",
   "validation/**",
 ]

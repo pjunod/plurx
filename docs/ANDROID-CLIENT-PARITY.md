@@ -83,8 +83,10 @@ implemented and pinned by `PlaybackPolicyTest`:
   English preferences, subtitle index 2 wins over the Italian container
   default.
 - The shared authenticated OkHttp data source fetches capability playlist and
-  WebVTT URLs. Session `start_seconds`, VOD state, resume, and seek handling
-  retain the source timeline.
+  WebVTT URLs. HLS sessions anchor to `media_origin_ms`; progressive remuxes
+  read `X-Plurx-Media-Origin-Ms`, with `start_seconds` retained only as the
+  old-server fallback. VOD state, resume, and seek handling retain that source
+  timeline.
 
 Do not side-load `/files/{id}/subs/{index}.vtt` into an offset HLS session: the
 whole-file endpoint has no resume offset and would make cue timing incorrect.

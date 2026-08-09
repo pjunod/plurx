@@ -30,6 +30,42 @@ private struct NativeAPIContractFixture: Decodable {
     let decision: Decision
 }
 
+private actor ArtworkDownloadProbe {
+    private var starts = 0
+    private var cancellations = 0
+
+    func runUntilCancelled() async -> AuthImageDownloadResult {
+        starts += 1
+        do {
+            try await Task.sleep(nanoseconds: 5_000_000_000)
+            return .success(Data())
+        } catch {
+            cancellations += 1
+            return .transientFailure
+        }
+    }
+
+    func snapshot() -> (starts: Int, cancellations: Int) {
+        (starts, cancellations)
+    }
+}
+
+private actor OfflineMutationGate {
+    private var opened = false
+    private var waiter: CheckedContinuation<Void, Never>?
+
+    func wait() async {
+        if opened { return }
+        await withCheckedContinuation { waiter = $0 }
+    }
+
+    func open() {
+        opened = true
+        waiter?.resume()
+        waiter = nil
+    }
+}
+
 private extension View {
     func reportLayoutWidth() -> some View {
         background {
@@ -82,6 +118,125 @@ private struct DetailNavigationTestHost<Content: View>: View {
 #endif
 
 final class AppleClientTests: XCTestCase {
+    func testSameDeliveryRecoveryKeepsOfflinePlaybackOnTheLocalAsset() {
+        XCTAssertEqual(
+            PlayerController.recoveryTransport(hasOfflineAsset: true),
+            .offlineAsset
+        )
+        XCTAssertEqual(
+            PlayerController.recoveryTransport(hasOfflineAsset: false),
+            .serverSession
+        )
+    }
+
+    #if os(iOS)
+    func testOfflineDecisionKeepsDownloadedIntroAndCreditsMarkers() {
+        let markers = [
+            Marker(kind: "intro", label: "Skip Intro", startMs: 1_000, endMs: 9_000),
+            Marker(kind: "credits", label: "Skip Credits", startMs: 80_000, endMs: 90_000),
+        ]
+        let item = OfflineItem(
+            id: "marked-download",
+            requestId: "request",
+            serverInstanceId: "server",
+            userId: 7,
+            itemId: 11,
+            fileId: 13,
+            packageId: "package",
+            leaseToken: nil,
+            manifestURL: nil,
+            title: "Flight",
+            context: nil,
+            durationMs: 90_000,
+            posterFile: nil,
+            requestedHeight: 720,
+            actualHeight: 720,
+            audioLabel: nil,
+            subtitleLabel: nil,
+            subtitleIndex: nil,
+            state: .downloaded,
+            phase: "downloaded",
+            bytesDownloaded: 10,
+            bytesTotal: 10,
+            localAssetRelativePath: "Offline/Flight.movpkg",
+            markers: markers,
+            positionMs: 0,
+            recordedAt: nil,
+            pendingProgress: false,
+            errorMessage: nil,
+            updatedAt: Date()
+        )
+
+        XCTAssertEqual(PlayerController.offlineDecision(item).markers, markers)
+    }
+    #endif
+
+    func testLateOfflineProgressCannotRegressACompletedCatalogItem() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("offline-catalog-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let catalog = OfflineCatalog(directory: directory)
+        let id = "ordered-download"
+        try await catalog.upsert(OfflineItem(
+            id: id,
+            requestId: "request",
+            serverInstanceId: "server",
+            userId: 7,
+            itemId: 11,
+            fileId: 13,
+            packageId: "package",
+            leaseToken: nil,
+            manifestURL: nil,
+            title: "Flight",
+            context: nil,
+            durationMs: 90_000,
+            posterFile: nil,
+            requestedHeight: 720,
+            actualHeight: 720,
+            audioLabel: nil,
+            subtitleLabel: nil,
+            subtitleIndex: nil,
+            state: .downloading,
+            phase: "downloading",
+            bytesDownloaded: 1,
+            bytesTotal: 10,
+            localAssetRelativePath: nil,
+            markers: [],
+            positionMs: 0,
+            recordedAt: nil,
+            pendingProgress: false,
+            errorMessage: nil,
+            updatedAt: Date()
+        ))
+
+        let gate = OfflineMutationGate()
+        let lateProgress = Task {
+            await gate.wait()
+            return try await catalog.update(id: id) { item in
+                guard item.state == .downloading else { return false }
+                item.bytesDownloaded = 5
+                return true
+            }
+        }
+        let completion = Task {
+            let completed = try await catalog.update(id: id) { item in
+                item.state = .downloaded
+                item.phase = "downloaded"
+                item.bytesDownloaded = item.bytesTotal ?? item.bytesDownloaded
+                return true
+            }
+            await gate.open()
+            return completed
+        }
+
+        let completed = try await completion.value
+        let staleProgress = try await lateProgress.value
+        XCTAssertNotNil(completed)
+        XCTAssertNil(staleProgress)
+        let stored = await catalog.item(id: id)
+        XCTAssertEqual(stored?.state, .downloaded)
+        XCTAssertEqual(stored?.bytesDownloaded, 10)
+    }
     override func tearDown() {
         Session.shared.origin = ""
         Session.shared.token = nil
@@ -684,6 +839,72 @@ final class AppleClientTests: XCTestCase {
     }
 
     @MainActor
+    func testEveryOpenedItemMustEstablishItsOwnBufferingRecoveryWindow() {
+        var attachment = PlayerAttachmentRecoveryState()
+        attachment.opened(at: 10_000)
+        attachment.observe(positionMs: 14_999, playing: true)
+        XCTAssertFalse(attachment.establishedPlayback)
+        attachment.observe(positionMs: 15_000, playing: true)
+        XCTAssertTrue(attachment.establishedPlayback)
+
+        attachment.opened(at: 90_000)
+        XCTAssertFalse(
+            attachment.establishedPlayback,
+            "a quality/audio/recovery open must not inherit the predecessor's gate"
+        )
+
+        var monitor = PlaybackRecoveryMonitor()
+        for check in 0...7 {
+            XCTAssertNil(monitor.sample(
+                positionMs: 90_000,
+                timeControlStatus: .waitingToPlayAtSpecifiedRate,
+                shouldMonitor: true,
+                establishedPlayback: attachment.establishedPlayback,
+                observedAt: 3_000 + Double(check * 2)
+            ))
+        }
+        XCTAssertNil(monitor.bufferingDetector.lastPositionMs)
+
+        attachment.observe(positionMs: 95_000, playing: true)
+        XCTAssertTrue(attachment.establishedPlayback)
+    }
+
+    @MainActor
+    func testSubthresholdStallIsHeldForTheNextProgressReport() {
+        var monitor = PlaybackRecoveryMonitor()
+        let beganAt: TimeInterval = 4_000
+
+        for check in 0...4 {
+            XCTAssertNotEqual(monitor.sample(
+                positionMs: 30_000,
+                timeControlStatus: .waitingToPlayAtSpecifiedRate,
+                shouldMonitor: true,
+                establishedPlayback: true,
+                observedAt: beganAt + Double(check * 2)
+            )?.action, .reopen)
+        }
+        XCTAssertNil(monitor.sample(
+            positionMs: 31_000,
+            timeControlStatus: .playing,
+            shouldMonitor: true,
+            establishedPlayback: true,
+            observedAt: beganAt + 10
+        ))
+
+        var observations = PlaybackStallObservationState()
+        observations.noteRecoveredStagnation(monitor.takeRecoveredStagnantDurationMs())
+        XCTAssertEqual(
+            observations.take(numberOfStalls: 1),
+            PlaybackStallObservation(delta: 1, stagnantDurationMs: 10_000)
+        )
+        XCTAssertNil(observations.take(numberOfStalls: 1))
+        XCTAssertEqual(
+            observations.take(numberOfStalls: 3),
+            PlaybackStallObservation(delta: 2, stagnantDurationMs: 0)
+        )
+    }
+
+    @MainActor
     func testPlaybackRecoveryPredicatesStayExclusiveAndBufferingWinsAMerge() {
         for status in [
             AVPlayer.TimeControlStatus.paused,
@@ -749,6 +970,32 @@ final class AppleClientTests: XCTestCase {
             object["detail"] as? String,
             "kind=buffering · position_ms=90000 · outcome=reopen"
         )
+    }
+
+    func testAppleObservedStallLogCarriesDeltaWithoutCapabilityData() throws {
+        let payload = ApplePlaybackObservedStallLog(
+            delta: 2,
+            positionMs: 90_000,
+            stagnantDurationMs: 8_000,
+            method: "remux",
+            title: "Fortune Feimster",
+            fileId: 42,
+            vcodec: "h264",
+            encoder: "copy"
+        )
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(payload))
+                as? [String: Any]
+        )
+
+        XCTAssertEqual(object["event"] as? String, "stall")
+        XCTAssertEqual(object["ms"] as? Int, 8_000)
+        XCTAssertEqual(
+            object["detail"] as? String,
+            "kind=access_log · position_ms=90000 · stall_delta=2 · outcome=self_recovered"
+        )
+        XCTAssertNil(object["url"])
+        XCTAssertNil(object["token"])
     }
 
     @MainActor
@@ -2085,6 +2332,21 @@ final class AppleClientTests: XCTestCase {
         )
     }
 
+    func testPGSOverlayDisablesManualAndAutomaticPictureInPicture() {
+        XCTAssertTrue(PlayerSurface.shouldAllowPictureInPicture(
+            isTearingDown: false,
+            pgsOverlayIsActive: false
+        ))
+        XCTAssertFalse(PlayerSurface.shouldAllowPictureInPicture(
+            isTearingDown: false,
+            pgsOverlayIsActive: true
+        ))
+        XCTAssertFalse(PlayerSurface.shouldAllowPictureInPicture(
+            isTearingDown: true,
+            pgsOverlayIsActive: false
+        ))
+    }
+
     func testAppDeclaresBackgroundAudioForPictureInPicture() {
         let modes = Bundle.main.object(forInfoDictionaryKey: "UIBackgroundModes") as? [String] ?? []
         XCTAssertTrue(modes.contains("audio"))
@@ -2443,6 +2705,15 @@ final class AppleClientTests: XCTestCase {
             PlayerController.sessionMediaOriginMs(cached, requestedStartMs: 123_000),
             0
         )
+
+        let invalid = try decoder.decode(HlsStart.self, from: Data(#"""
+        {"session_id":"invalid","playlist_url":"/hls/invalid/index.m3u8",
+         "start_seconds":10.5,"media_origin_ms":-1,"vod":false}
+        """#.utf8))
+        XCTAssertEqual(
+            PlayerController.sessionMediaOriginMs(invalid, requestedStartMs: 10_500),
+            0
+        )
     }
 
     /// Servers from before the Apple DV transport hint can approve Profile 8
@@ -2602,6 +2873,33 @@ final class AppleClientTests: XCTestCase {
             isGrowingPlaylist: true,
             endedAt: 178_000
         ), .finish(durationMs: 180_000))
+        XCTAssertEqual(PlayerController.endAction(
+            knownDurationMs: 0,
+            itemDurationMs: nil,
+            isGrowingPlaylist: false,
+            endedAt: 120_000
+        ), .reopen)
+        XCTAssertEqual(PlayerController.endAction(
+            knownDurationMs: 0,
+            itemDurationMs: nil,
+            isGrowingPlaylist: false,
+            endedAt: 120_000,
+            previousUncorroboratedEndMs: 120_000
+        ), .finish(durationMs: 120_000))
+        XCTAssertEqual(PlayerController.endAction(
+            knownDurationMs: 0,
+            itemDurationMs: nil,
+            isGrowingPlaylist: true,
+            endedAt: 120_000,
+            previousUncorroboratedEndMs: 120_000
+        ), .reopen, "a genuinely growing playlist may publish more media")
+        XCTAssertEqual(PlayerController.endAction(
+            knownDurationMs: 0,
+            itemDurationMs: nil,
+            isGrowingPlaylist: false,
+            endedAt: 121_000,
+            previousUncorroboratedEndMs: 120_000
+        ), .reopen, "positional progress earns a fresh bounded retry")
     }
 
     @MainActor
@@ -2637,12 +2935,21 @@ final class AppleClientTests: XCTestCase {
         await fulfillment(of: [dismissed], timeout: 1)
         XCTAssertEqual(events, ["teardown", "dismiss"])
 
+        let duplicateDismissed = expectation(description: "late completion delivered")
         lifecycle.finish(
             teardown: { events.append("duplicate teardown") },
-            completion: { events.append("duplicate dismiss") }
+            completion: {
+                events.append("duplicate dismiss")
+                duplicateDismissed.fulfill()
+            }
         )
         lifecycle.teardown { events.append("disappear teardown") }
-        XCTAssertEqual(events, ["teardown", "dismiss"])
+        await fulfillment(of: [duplicateDismissed], timeout: 1)
+        XCTAssertEqual(
+            events,
+            ["teardown", "dismiss", "duplicate dismiss"],
+            "a late caller's completion must run even though cleanup remains idempotent"
+        )
     }
 
     @MainActor
@@ -3498,6 +3805,210 @@ final class AppleClientTests: XCTestCase {
         )
     }
 
+    func testArtworkCacheIdentityAndFreshnessFollowTheSourceURL() {
+        XCTAssertNotEqual(
+            AuthImageCache.sourceKey(origin: "http://a:32400", path: "/images/one.jpg"),
+            AuthImageCache.sourceKey(origin: "http://a:32400", path: "/images/two.jpg")
+        )
+        XCTAssertNotEqual(
+            AuthImageCache.sourceKey(origin: "http://a:32400", path: "/images/one.jpg"),
+            AuthImageCache.sourceKey(origin: "http://b:32400", path: "/images/one.jpg")
+        )
+        XCTAssertEqual(
+            AuthImageCache.sourceKey(origin: "http://a:32400", path: "https://cdn.test/a.jpg"),
+            AuthImageCache.sourceKey(origin: "http://b:32400", path: "https://cdn.test/a.jpg")
+        )
+
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        XCTAssertTrue(
+            AuthImageCache.isFresh(
+                storedAt: now.addingTimeInterval(-AuthImageCache.freshAge),
+                now: now
+            )
+        )
+        XCTAssertFalse(
+            AuthImageCache.isFresh(
+                storedAt: now.addingTimeInterval(-AuthImageCache.freshAge - 1),
+                now: now
+            )
+        )
+    }
+
+    func testArtworkHTTPFailureClassificationPreservesStaleFallbacks() {
+        for status in [200, 204, 299] {
+            XCTAssertEqual(AuthImageCache.classify(statusCode: status), .success)
+        }
+        for status in [401, 403, 404, 410] {
+            XCTAssertEqual(AuthImageCache.classify(statusCode: status), .terminalFailure)
+        }
+        for status in [300, 400, 408, 429, 500, 502, 599] {
+            XCTAssertEqual(AuthImageCache.classify(statusCode: status), .transientFailure)
+        }
+    }
+
+    func testArtworkDiskCacheSurvivesRecreationAndExpiresOldEntries() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("plurx-artwork-tests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let bytes = Data("persistent artwork".utf8)
+        let first = AuthImageDiskCache(
+            directory: directory,
+            byteLimit: 10_000,
+            maximumStaleAge: 30 * 24 * 60 * 60
+        )
+        await first.store(bytes, for: "http://server/images/poster.jpg", storedAt: now)
+
+        // A new cache object models the next app process opening the same
+        // Caches directory.
+        let reopened = AuthImageDiskCache(
+            directory: directory,
+            byteLimit: 10_000,
+            maximumStaleAge: 30 * 24 * 60 * 60
+        )
+        let persisted = await reopened.entry(
+            for: "http://server/images/poster.jpg",
+            now: now.addingTimeInterval(60)
+        )
+        XCTAssertEqual(persisted?.data, bytes)
+        XCTAssertEqual(persisted?.storedAt, now)
+
+        let expiredKey = "http://server/images/expired.jpg"
+        await reopened.store(
+            bytes,
+            for: expiredKey,
+            storedAt: now.addingTimeInterval(-(31 * 24 * 60 * 60))
+        )
+        let expired = await reopened.entry(for: expiredKey, now: now)
+        XCTAssertNil(expired)
+    }
+
+    func testArtworkDiskCacheEvictsTheLeastRecentlyUsedEntryAtItsByteLimit() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("plurx-artwork-lru-tests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let cache = AuthImageDiskCache(
+            directory: directory,
+            byteLimit: 3_000,
+            maximumStaleAge: 30 * 24 * 60 * 60
+        )
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let bytes = Data(repeating: 7, count: 1_200)
+        await cache.store(bytes, for: "first", storedAt: now.addingTimeInterval(-3))
+        await cache.store(bytes, for: "second", storedAt: now.addingTimeInterval(-2))
+        _ = await cache.entry(for: "first", now: now.addingTimeInterval(-1))
+        await cache.store(bytes, for: "third", storedAt: now)
+
+        let first = await cache.entry(for: "first", now: now)
+        let second = await cache.entry(for: "second", now: now)
+        let third = await cache.entry(for: "third", now: now)
+        XCTAssertNotNil(first)
+        XCTAssertNil(second)
+        XCTAssertNotNil(third)
+        XCTAssertEqual(AuthImageDiskCache.token(for: "first").count, 64)
+        XCTAssertNotEqual(
+            AuthImageDiskCache.token(for: "first"),
+            AuthImageDiskCache.token(for: "third")
+        )
+    }
+
+    func testArtworkDiskCacheRejectsAnInflightStoreAfterClear() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("plurx-artwork-generation-tests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let cache = AuthImageDiskCache(
+            directory: directory,
+            byteLimit: 10_000,
+            maximumStaleAge: 30 * 24 * 60 * 60
+        )
+        let oldGeneration = await cache.currentGeneration()
+        await cache.removeAll()
+
+        let accepted = await cache.store(
+            Data("old server artwork".utf8),
+            for: "http://old-server/images/poster.jpg",
+            generation: oldGeneration
+        )
+
+        XCTAssertFalse(accepted)
+        let entry = await cache.entry(for: "http://old-server/images/poster.jpg")
+        XCTAssertNil(entry)
+    }
+
+    func testArtworkCacheClearIsWiredToTheDiskCache() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("plurx-artwork-clear-tests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let diskCache = AuthImageDiskCache(
+            directory: directory,
+            byteLimit: 10_000,
+            maximumStaleAge: 30 * 24 * 60 * 60
+        )
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        let cache = AuthImageCache(diskCache: diskCache, session: session)
+        let source = "http://server/images/poster.jpg"
+        await diskCache.store(Data("private artwork".utf8), for: source)
+
+        cache.clear()
+
+        var entry = await diskCache.entry(for: source)
+        for _ in 0..<100 where entry != nil {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+            entry = await diskCache.entry(for: source)
+        }
+        XCTAssertNil(entry)
+    }
+
+    func testArtworkDownloadCoalescingCancelsOnlyAfterTheLastWaiterLeaves() async {
+        let coordinator = AuthImageDownloadCoordinator()
+        let probe = ArtworkDownloadProbe()
+        let key = "http://server/images/poster.jpg"
+        let first = Task {
+            await coordinator.download(key) { await probe.runUntilCancelled() }
+        }
+
+        var waiters = 0
+        for _ in 0..<100 where waiters != 1 {
+            waiters = await coordinator.waiterCount(for: key)
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(waiters, 1)
+
+        let second = Task {
+            await coordinator.download(key) { await probe.runUntilCancelled() }
+        }
+        for _ in 0..<100 where waiters != 2 {
+            waiters = await coordinator.waiterCount(for: key)
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(waiters, 2)
+
+        first.cancel()
+        for _ in 0..<100 where waiters != 1 {
+            waiters = await coordinator.waiterCount(for: key)
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let afterFirstCancel = await probe.snapshot()
+        XCTAssertEqual(waiters, 1)
+        XCTAssertEqual(afterFirstCancel.cancellations, 0)
+
+        second.cancel()
+        let firstResult = await first.value
+        let secondResult = await second.value
+        let final = await probe.snapshot()
+        if case .transientFailure = firstResult {} else {
+            XCTFail("cancelled shared download should be transient")
+        }
+        if case .transientFailure = secondResult {} else {
+            XCTFail("cancelled shared download should be transient")
+        }
+        XCTAssertEqual(final.starts, 1)
+        XCTAssertEqual(final.cancellations, 1)
+        let finalWaiters = await coordinator.waiterCount(for: key)
+        XCTAssertEqual(finalWaiters, 0)
+    }
+
     func testPluralServerLibraryKindsMapToNativeMovieAndTVTabs() {
         XCTAssertEqual(AppModel.canonicalLibraryKind("movies"), "movie")
         XCTAssertEqual(AppModel.canonicalLibraryKind("shows"), "show")
@@ -3635,6 +4146,20 @@ final class AppleClientTests: XCTestCase {
     }
 
     func testPGSOverlayUsesSourceTimeWithANonZeroItemBase() {
+        XCTAssertEqual(
+            [503, 202, 200].map(PGSOverlayPolicy.manifestDisposition),
+            [.preparing, .preparing, .ready]
+        )
+        XCTAssertEqual(PGSOverlayPolicy.retryAfterMs("2"), 2_000)
+        XCTAssertEqual(PGSOverlayPolicy.retryAfterMs(nil), 1_000)
+        XCTAssertEqual(
+            PGSOverlayPolicy.periodicRefreshPosition(currentMs: 101_000, overlayIsActive: true),
+            101_000
+        )
+        XCTAssertNil(PGSOverlayPolicy.periodicRefreshPosition(
+            currentMs: 101_000,
+            overlayIsActive: false
+        ))
         XCTAssertEqual(PGSOverlayPolicy.itemTimeMs(sourceTimeMs: 93_500, baseMs: 90_000), 3_500)
         XCTAssertEqual(PGSOverlayPolicy.itemTimeMs(sourceTimeMs: 89_000, baseMs: 90_000), -1_000)
         XCTAssertEqual(

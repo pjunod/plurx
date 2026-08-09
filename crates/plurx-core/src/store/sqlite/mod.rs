@@ -521,7 +521,22 @@ const MIGRATIONS: &[&str] = &[
         item_id    INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
         PRIMARY KEY (library_id, item_id)
     ) STRICT;",
+    // v16: lease watched-outbox delivery across cluster voters. A worker may
+    // disappear after reading a pending row; the deadline makes the claim
+    // recoverable and also prevents a stale worker from settling a row that a
+    // surviving voter already reclaimed.
+    "ALTER TABLE watched_outbox ADD COLUMN claim_until INTEGER NOT NULL DEFAULT 0;
+    DROP INDEX watched_outbox_due;
+    CREATE INDEX watched_outbox_due
+        ON watched_outbox(status, next_at, claim_until);",
 ];
+
+/// Highest SQLite schema version this binary can read and migrate.
+///
+/// M2's import coordinator checks this before it removes abandoned staging
+/// state or writes a backup. Keeping the value derived from the append-only
+/// migration list prevents the import gate from drifting away from `open`.
+pub const SQLITE_SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
 
 /// Column list matching [`item_from_row`]. Prefix with a table alias via
 /// [`item_cols`].
@@ -784,7 +799,7 @@ impl SqliteStore {
 
     fn migrate(conn: &Connection) -> Result<(), StoreError> {
         let current: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        let target = MIGRATIONS.len() as i64;
+        let target = SQLITE_SCHEMA_VERSION;
         if current > target {
             return Err(StoreError::Migration(format!(
                 "database schema is v{current}, but this binary only knows v{target} — \
@@ -1113,7 +1128,7 @@ mod tests {
             .expect("version");
         assert_eq!(version, MIGRATIONS.len() as i64);
         assert_eq!(
-            version, 15,
+            version, 16,
             "a new migration must be a deliberate bump, not a surprise — \
              the list is append-only and every entry is one somebody shipped"
         );

@@ -8,7 +8,44 @@ bump may break compatibility and a **patch** bump never does.
 
 ## [Unreleased]
 
+## [0.2.7] — 2026-08-09
+
 ### Added
+
+- **Apple artwork now survives app relaunches.** iOS and tvOS keep original
+  poster and backdrop bytes in a 256 MiB on-disk LRU, paint seven-day-fresh
+  entries before touching the network, and retain stale fallbacks for up to
+  30 days while a refresh is attempted. Artwork URL and server changes use
+  distinct cache identities, and signing out or leaving a server clears its
+  cached bytes.
+
+- **The Phase 4 storage boundary now has a complete replicated backend and a
+  real three-voter contract gate.** M0–M1c established local node identity,
+  rollback-tolerant cluster configuration, the Hiqlite decision, replicated
+  auth/catalogue/watch state, node-local FTS, and root-safe reconciliation.
+  M1d completes all 120 `Store` methods for Trakt/outbox,
+  cache, and offline packages; runs the same `Arc<dyn Store>` scenarios against
+  memory SQLite, file SQLite, and three separate Hiqlite voters; and rechecks
+  independently hashed state after induced follower and leader loss. Trakt
+  refresh/unlink and watched delivery now use compare-and-set/claims for
+  multi-writer safety, offline admission enforces per-node byte budgets and
+  complete idempotency, and active progress is bounded to one durable commit
+  per ten-second stream window without overwriting manual or timestamped
+  writes. SQLite remains the selected production store until import,
+  envelope-encrypted Trakt credentials, node-removal cleanup, and
+  post-coalescer growth measurement land. Operators can explicitly accept a
+  verified replacement mount through
+  `POST /api/v1/libraries/{id}/root-identity/reset` and rebuild a node's
+  derived search state through `POST /api/v1/system/search-index/rebuild`.
+
+- **A default-off PGS overlay path preserves the original video.** With
+  `PLURX_PGS_OVERLAY` enabled, authenticated manifest and immutable PNG routes
+  let the Apple and Android players draw positioned PGS cues over unchanged
+  Dolby Vision, HDR, or SDR video. Publication is bounded, durable, and
+  self-healing, HD palettes are checked against a BT.709 fixture, and a pinned
+  nightly SUP fuzzer keeps malformed inputs under pressure. This remains a
+  staged capability, not a release claim, until the physical-device matrix
+  passes.
 
 - **Download a title in the native phone apps and watch it without the
   server.** iPhone, iPad, and Android phones/tablets now have a one-tap
@@ -426,6 +463,12 @@ bump may break compatibility and a **patch** bump never does.
   cache and serves the file.
 
 ### Fixed
+
+- **The server refuses an explicit subtitle burn that would discard HDR.**
+  Clients now receive a specific 422 response when they ask to burn subtitles
+  into probed Dolby Vision, HDR10, or HLG video. Playback accounting and the
+  encoder are left untouched, SDR burns continue to work, and there is no
+  override that can silently trade HDR for subtitles.
 
 - **Skip Intro and Skip Credits stay compact at every Apple player width.**
   The marker action previously accepted the full playback-control width on
@@ -1159,6 +1202,9 @@ bump may break compatibility and a **patch** bump never does.
 
 ## [0.2.0] — 2026-07-30
 
+Historical development milestone; no `v0.2.0` tag was cut. Published releases
+begin with 0.2.7.
+
 ### Added
 
 - **Big remuxes stream in segments.** A remux at or above 40 Mb/s — or one
@@ -1576,7 +1622,8 @@ bump may break compatibility and a **patch** bump never does.
 
 ## [0.1.0] — 2026-07-22
 
-First numbered release. Everything before this point was developed under the
+First numbered development milestone; no `v0.1.0` tag was cut. Everything
+before this point was developed under the
 placeholder version `0.0.1`, which never moved and never corresponded to a tag;
 the entries below describe what that work amounts to rather than reconstructing
 a hundred commits of history.
@@ -1608,6 +1655,5 @@ a hundred commits of history.
   binary is stamped with the git commit it was built from, and `/api/v1/server`
   reports both. See [docs/RELEASING.md](docs/RELEASING.md).
 
-[Unreleased]: https://github.com/pjunod/plurx/compare/v0.2.0...HEAD
-[0.2.0]: https://github.com/pjunod/plurx/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/pjunod/plurx/releases/tag/v0.1.0
+[Unreleased]: https://github.com/pjunod/plurx/compare/v0.2.7...HEAD
+[0.2.7]: https://github.com/pjunod/plurx/releases/tag/v0.2.7

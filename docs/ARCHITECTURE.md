@@ -91,13 +91,22 @@ regenerable thumbnail cache would be waste:
 | **Node-local, regenerable** | Transcode segment cache, image cache, thumbnails/trickplay | Local disk (optionally shared) | Free to lose |
 | **Operator-owned** | The media files themselves | Shared storage | plurx never writes media |
 
-Write rates must be safe for raft. Today each five-second client heartbeat
-still performs a watch-state read and durable write; the server-side coalescer
-that reduces this to at most one commit per 10 seconds per stream lands in
-CLUSTERING-PLAN M1d. Session state updates on segment boundaries, not
-per-chunk. This matters because raft commits every write to a quorum — a naive
-"save position on every timeupdate" would put hundreds of writes/second
-through consensus and melt it.
+Write rates must be safe for raft. Each active-player heartbeat still reads
+the item and durable watch state, but the M1d server coalescer now bounds
+steady-state writes to one commit per ten seconds per user/item stream. The
+first beat and a newly crossed 95% watched transition commit synchronously;
+intermediate beats replace one pending newest value. A progress response never
+pretends that pending value is durable: it returns the last committed
+`WatchState`, while the active-player soft acknowledgement means only that the
+coalescer accepted the beat. Manual unwatches and timestamped offline imports
+invalidate or outrank pending values through compare-and-set flushes. Graceful
+shutdown makes one bounded drain attempt; a storage outage can still lose an
+unflushed intermediate beat, so this endpoint is the explicit exception to an
+HTTP-level acknowledged-write durability promise. Store-method success itself
+remains durable. Session state updates on segment boundaries, not per-chunk.
+This matters because raft commits every write to a quorum — a naive "save
+position on every timeupdate" would put hundreds of writes/second through
+consensus and melt it.
 
 ### 2.3 The failover mechanic — any node can serve segment N
 

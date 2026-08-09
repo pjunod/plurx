@@ -335,6 +335,8 @@ final class PlayerLifecycleCoordinator: ObservableObject {
 
     private var didTeardown = false
     private var didFinish = false
+    private var pendingCompletions: [@MainActor () -> Void] = []
+    private var completionDrainScheduled = false
 
     func teardown(_ cleanup: () -> Void) {
         guard !didTeardown else { return }
@@ -346,16 +348,29 @@ final class PlayerLifecycleCoordinator: ObservableObject {
         teardown cleanup: () -> Void,
         completion: @escaping @MainActor () -> Void
     ) {
+        enqueueCompletion(completion)
         guard !didFinish else { return }
         didFinish = true
         isTearingDown = true
         teardown(cleanup)
+    }
+
+    /// Cleanup and the tearing-down state are write-once; completion ownership
+    /// is not. Queue every caller, including one that arrives after `didFinish`,
+    /// and deliver in order on the next main-loop turn.
+    private func enqueueCompletion(_ completion: @escaping @MainActor () -> Void) {
+        pendingCompletions.append(completion)
+        guard !completionDrainScheduled else { return }
+        completionDrainScheduled = true
         Task { @MainActor in
             await withCheckedContinuation {
                 (continuation: CheckedContinuation<Void, Never>) in
                 DispatchQueue.main.async { continuation.resume() }
             }
-            completion()
+            let completions = pendingCompletions
+            pendingCompletions.removeAll()
+            completionDrainScheduled = false
+            for completion in completions { completion() }
         }
     }
 }
@@ -609,7 +624,10 @@ struct PlayerView: View {
                 player: controller.player,
                 pictureInPicture: pictureInPicture,
                 pgsOverlay: controller.pgsOverlayWindow,
-                allowsPictureInPicture: !lifecycle.isTearingDown
+                allowsPictureInPicture: PlayerSurface.shouldAllowPictureInPicture(
+                    isTearingDown: lifecycle.isTearingDown,
+                    pgsOverlayIsActive: controller.pgsOverlayIsActive
+                )
             )
                 .ignoresSafeArea()
 
@@ -1001,6 +1019,7 @@ struct PlayerView: View {
         @unknown default: return
         }
         controller.skip(seconds: seekDirection.seconds)
+        revealControlsFromRemote()
     }
     #endif
 

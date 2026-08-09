@@ -67,6 +67,16 @@ class PGSOverlayTest {
 
     @Test
     fun timelineUsesSourcePositionAndSchedulesExactBoundaries() {
+        assertEquals(
+            listOf(
+                PGSOverlayManifestDisposition.Preparing,
+                PGSOverlayManifestDisposition.Preparing,
+                PGSOverlayManifestDisposition.Ready,
+            ),
+            listOf(503, 202, 200).map(PGSOverlayPolicy::manifestDisposition),
+        )
+        assertEquals(2_000, PGSOverlayPolicy.retryAfterMs("2"))
+        assertEquals(1_000, PGSOverlayPolicy.retryAfterMs(null))
         val cues = listOf(
             cue("one", 90_000, 93_000),
             cue("two", 95_000, 96_500),

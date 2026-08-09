@@ -150,6 +150,21 @@ impl CreateSession {
     }
 }
 
+const HDR_SUBTITLE_BURN_REFUSAL: &str =
+    "That subtitle requires an SDR burn-in. HDR playback was kept unchanged.";
+
+/// Old clients can still post `subtitle_burn` without first applying the
+/// native clients' HDR guard. Session creation has no trustworthy copy of the
+/// client's prior delivery plan, so a known HDR source must fail closed: an
+/// explicit burn is never permission to replace DV, HDR10, or HLG with SDR.
+/// SDR and unprobed sources keep the existing burn path.
+fn hdr_subtitle_burn_is_refused(source: Option<&MediaFile>, subtitle_burn: Option<i64>) -> bool {
+    subtitle_burn.is_some_and(|index| index >= 0)
+        && source.is_some_and(|file| {
+            matches!(file.hdr.as_deref(), Some("dolby_vision" | "hdr10" | "hlg"))
+        })
+}
+
 /// The dynamic range this session puts on the wire, read off the session it
 /// actually built rather than the decision that suggested it — a burn or a
 /// forced rung produces a transcode `/decision` never promised, and the
@@ -192,6 +207,12 @@ pub async fn create(
     // response, and the snap's source-height escape. One read, from the read
     // pool.
     let source = state.store.get_file(id).await?;
+    if hdr_subtitle_burn_is_refused(source.as_ref(), req.subtitle_burn) {
+        return Err(ApiError::Unprocessable(serde_json::json!({
+            "code": "hdr_subtitle_burn_refused",
+            "error": HDR_SUBTITLE_BURN_REFUSAL,
+        })));
+    }
     let source_height = source.as_ref().and_then(|f| f.height);
     let height = match req.height {
         // Auto: the server's own choice already lands where it means to —
@@ -1409,13 +1430,15 @@ pub async fn segment(
     State(state): State<AppState>,
     AxPath((session, seg)): AxPath<(String, String)>,
 ) -> Result<Response, ApiError> {
+    const APPLE_INIT_REWRITE_LIMIT_BYTES: u64 = 1024 * 1024;
+
     let opened = state
         .transcode
         .segment(&session, &seg)
         .await
         .ok_or(ApiError::NotFound("segment"))?;
     let content_type = segment_content_type(&seg);
-    if seg == "init.mp4" && opened.len <= 1024 * 1024 {
+    if seg == "init.mp4" && opened.len <= APPLE_INIT_REWRITE_LIMIT_BYTES {
         let mut init = Vec::with_capacity(opened.len.min(64 * 1024) as usize);
         opened
             .file
@@ -1444,6 +1467,14 @@ pub async fn segment(
             init,
         )
             .into_response());
+    }
+    if seg == "init.mp4" && opened.len > APPLE_INIT_REWRITE_LIMIT_BYTES {
+        tracing::warn!(
+            session_id = %session,
+            init_bytes = opened.len,
+            limit_bytes = APPLE_INIT_REWRITE_LIMIT_BYTES,
+            "skipped Apple HEVC tier normalization because init.mp4 exceeds the inspection bound"
+        );
     }
     Ok((
         StatusCode::OK,
@@ -1613,6 +1644,21 @@ mod tests {
             request.kind,
             crate::transcode::SessionKind::Transcode { height: 2160 }
         ));
+    }
+
+    #[test]
+    fn server_refuses_hdr_burns_without_blocking_sdr() {
+        let mut file = hls_file(vec![]);
+        for hdr in ["dolby_vision", "hdr10", "hlg"] {
+            file.hdr = Some(hdr.into());
+            assert!(hdr_subtitle_burn_is_refused(Some(&file), Some(5)));
+        }
+
+        file.hdr = None;
+        assert!(!hdr_subtitle_burn_is_refused(Some(&file), Some(5)));
+        assert!(!hdr_subtitle_burn_is_refused(Some(&file), Some(-1)));
+        assert!(!hdr_subtitle_burn_is_refused(Some(&file), None));
+        assert!(!hdr_subtitle_burn_is_refused(None, Some(5)));
     }
 
     /// The session's answer is the one that wins once playback attaches, so

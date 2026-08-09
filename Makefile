@@ -70,7 +70,9 @@ hiqlite-baseline: ## Measure the manual M0 one-voter cost gate on a quiet host
 	  single_voter_cost_stays_inside_the_m0_budget -- --ignored --exact --nocapture
 
 .PHONY: cluster-check
-cluster-check: ## Run the M1b/M1c three-voter state, FTS, and failure contract
+cluster-check: ## Run the M1b/M1c/M1d three-voter durable-state and failure contract
+	$(CARGO) test --locked -p plurx-core --features hiqlite-store \
+	  --test store_contract -- --test-threads=1
 	$(CARGO) run --locked -p plurx-cluster-check -- check
 
 ## ---- functionality-point validation -----------------------------------
@@ -283,6 +285,10 @@ apple-test: ## Generate the Xcode project and test the shared suite on iOS + tvO
 	cd clients/apple && xcodebuild -project plurx.xcodeproj -scheme plurx-iOS \
 	  -destination "$${APPLE_IOS_SIM:-platform=iOS Simulator,name=iPhone 17 Pro}" \
 	  CODE_SIGNING_ALLOWED=NO test
+	@if [ -n "$${APPLE_IPAD_SIM:-}" ]; then \
+	  cd clients/apple && xcodebuild -project plurx.xcodeproj -scheme plurx-iOS \
+	    -destination "$${APPLE_IPAD_SIM}" CODE_SIGNING_ALLOWED=NO test; \
+	fi
 	cd clients/apple && xcodebuild -project plurx.xcodeproj -scheme plurx-tvOS \
 	  -destination "$${APPLE_TVOS_SIM:-platform=tvOS Simulator,name=Apple TV 4K (3rd generation)}" \
 	  CODE_SIGNING_ALLOWED=NO test

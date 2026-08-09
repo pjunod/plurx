@@ -29,6 +29,16 @@ class PlayerPolicyTest {
     }
 
     @Test
+    fun fiveFastForwardPressesCommitAsOneSeek() {
+        val seeks = HiddenSeekAccumulator(durationMs = 300_000)
+        repeat(5) { seeks.nudge(currentPositionMs = 100_000, deltaMs = 10_000) }
+
+        assertEquals(150_000L, seeks.pendingTargetMs)
+        assertEquals(150_000L, seeks.consume())
+        assertNull("the quiet-timer commit consumes the whole burst", seeks.consume())
+    }
+
+    @Test
     fun playbackInfoSummarizesUsefulSourceDetails() {
         val file = MediaFileDto(
             id = 42,

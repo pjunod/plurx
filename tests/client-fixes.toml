@@ -1,0 +1,54 @@
+version = 1
+enforce_after = "e8a910f"
+
+# Client corrections need a durable bridge from the production symbol to the
+# test that rejects its regression. `commits` lets the history audit distinguish
+# that evidence from an unrelated test edit in the same patch.
+
+[[fixes]]
+id = "apple.marker-button-label"
+commits = ["b06f78b0"]
+source = "clients/apple/Sources/PlayerView.swift"
+source_anchor = "struct PlayerMarkerButtonLabel: View"
+test = "clients/apple/Tests/AppleClientTests.swift"
+test_anchor = "testSkipMarkerRowUsesProductionContentAtEveryTouchWidthAndTextSize"
+
+[[fixes]]
+id = "apple.playback-recovery-observation"
+commits = ["02cbfd1d"]
+source = "clients/apple/Sources/PlayerController.swift"
+source_anchor = "struct PlaybackStallObservationState: Equatable"
+test = "clients/apple/Tests/AppleClientTests.swift"
+test_anchor = "testSubthresholdStallIsHeldForTheNextProgressReport"
+
+[[fixes]]
+id = "apple.offline-catalog-ordering"
+commits = ["bbb7d964"]
+source = "clients/apple/Sources/OfflineCatalog.swift"
+source_anchor = "func update("
+test = "clients/apple/Tests/AppleClientTests.swift"
+test_anchor = "testLateOfflineProgressCannotRegressACompletedCatalogItem"
+
+[[fixes]]
+id = "apple.artwork-cache-generation"
+commits = ["1f347c40"]
+source = "clients/apple/Sources/AuthImage.swift"
+source_anchor = "func currentGeneration() -> UInt64"
+test = "clients/apple/Tests/AppleClientTests.swift"
+test_anchor = "testArtworkDiskCacheRejectsAnInflightStoreAfterClear"
+
+[[fixes]]
+id = "apple.pgs-overlay-pip-gating"
+commits = ["2bb32f88"]
+source = "clients/apple/Sources/PlayerSurface.swift"
+source_anchor = "shouldAllowPictureInPicture"
+test = "clients/apple/Tests/AppleClientTests.swift"
+test_anchor = "testPGSOverlayDisablesManualAndAutomaticPictureInPicture"
+
+[[fixes]]
+id = "clients.media-origin-and-seek-routing"
+commits = ["f43988d8"]
+source = "clients/android/app/src/main/java/tv/plurx/app/player/Controller.kt"
+source_anchor = "val timeline = sessionPlaybackTimeline"
+test = "clients/android/app/src/test/java/tv/plurx/app/player/MediaOriginTest.kt"
+test_anchor = "hlsSessionOriginDrivesTheControllerTimeline"

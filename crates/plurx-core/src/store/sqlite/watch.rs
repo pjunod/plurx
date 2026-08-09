@@ -181,6 +181,61 @@ impl WatchStore for SqliteStore {
         .await
     }
 
+    async fn put_progress_if_current(
+        &self,
+        user_id: i64,
+        item_id: i64,
+        expected: &WatchState,
+        position_ms: i64,
+        duration_ms: Option<i64>,
+    ) -> Result<Option<WatchState>, StoreError> {
+        let expected = *expected;
+        self.with_conn(move |conn| {
+            let known: Option<i64> = conn
+                .query_row(
+                    "SELECT duration_ms FROM files
+                     WHERE item_id = ?1 AND duration_ms IS NOT NULL AND duration_ms > 0
+                     ORDER BY duration_ms DESC LIMIT 1",
+                    params![item_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let effective = known.or(duration_ms).filter(|duration| *duration > 0);
+            let position_ms = effective
+                .map(|duration| position_ms.clamp(0, duration))
+                .unwrap_or_else(|| position_ms.max(0));
+            let watched = effective.is_some_and(|duration| {
+                (position_ms as f64 / duration as f64) >= WATCHED_THRESHOLD
+            });
+            Ok(conn
+                .query_row(
+                    "UPDATE watch_state SET
+                         position_ms = ?3,
+                         duration_ms = COALESCE(?4, duration_ms),
+                         watched = watched OR ?5,
+                         updated_at = unixepoch()
+                     WHERE user_id = ?1 AND item_id = ?2
+                       AND position_ms = ?6 AND duration_ms IS ?7
+                       AND watched = ?8 AND updated_at = ?9
+                     RETURNING position_ms, duration_ms, watched, updated_at",
+                    params![
+                        user_id,
+                        item_id,
+                        position_ms,
+                        effective,
+                        watched as i64,
+                        expected.position_ms,
+                        expected.duration_ms,
+                        expected.watched as i64,
+                        expected.updated_at,
+                    ],
+                    |row| watch_from_row(row, 0),
+                )
+                .optional()?)
+        })
+        .await
+    }
+
     async fn apply_remote_watch(
         &self,
         user_id: i64,

@@ -57,6 +57,10 @@ pub fn router(state: AppState) -> Router {
             axum::routing::delete(system::stop_session),
         )
         .route(
+            "/activity/offline/{id}",
+            axum::routing::delete(system::stop_offline_package),
+        )
+        .route(
             "/activity/producer",
             axum::routing::delete(system::stop_producer),
         )
@@ -2705,6 +2709,57 @@ mod tests {
         assert_eq!(activity["offline"][0]["title"], "Flight");
         assert_eq!(activity["offline"][0]["state"], "queued");
         assert_eq!(activity["offline"][0]["user"], "paul");
+        assert_eq!(activity["offline"][0]["id"], package_id);
+
+        let (status_code, second) = call(
+            &app,
+            post(
+                &format!("/api/v1/files/{file_id}/offline-packages"),
+                Some(&admin),
+                json!({
+                    "request_id": uuid::Uuid::new_v4().to_string(),
+                    "height": 720,
+                    "audio_index": 0,
+                    "subtitle_index": 1
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status_code, StatusCode::ACCEPTED, "{second}");
+        let second_id = second["id"].as_str().expect("second package id");
+        assert_eq!(
+            call(
+                &app,
+                delete(&format!("/api/v1/activity/offline/{second_id}"), None),
+            )
+            .await
+            .0,
+            StatusCode::UNAUTHORIZED,
+        );
+        assert_eq!(
+            call(
+                &app,
+                delete(
+                    &format!("/api/v1/activity/offline/{second_id}"),
+                    Some(&admin),
+                ),
+            )
+            .await
+            .0,
+            StatusCode::OK,
+        );
+        assert!(state
+            .store
+            .offline_package_for_user(second_id, 1)
+            .await
+            .expect("cancelled lookup")
+            .is_none());
+        assert!(state
+            .store
+            .offline_package_for_user(&package_id, 1)
+            .await
+            .expect("unrelated lookup")
+            .is_some());
 
         let (status_code, summary) = call(&app, get("/api/v1/activity", Some(&admin))).await;
         assert_eq!(status_code, StatusCode::OK, "{summary}");
@@ -2717,7 +2772,7 @@ mod tests {
         let (status_code, metrics) = call_text(&app, get("/metrics", None)).await;
         assert_eq!(status_code, StatusCode::OK);
         assert!(metrics.contains("plurx_offline_packages{state=\"queued\"} 1"));
-        assert!(metrics.contains("plurx_offline_requests_total{height=\"720\"} 1"));
+        assert!(metrics.contains("plurx_offline_requests_total{height=\"720\"} 2"));
         assert!(metrics.contains("plurx_cache_protected_entries{reason=\"active_playback\"} 0"));
         assert!(
             !metrics.contains("Flight"),
@@ -2799,6 +2854,26 @@ mod tests {
         .await;
         assert_eq!(status_code, StatusCode::CREATED, "{lease}");
 
+        state
+            .store
+            .put_setting(plurx_core::store::keys::OFFLINE_ENABLED, "0")
+            .await
+            .expect("disable offline");
+        let (status_code, disabled) = call_text(
+            &app,
+            get(
+                &format!("/api/v1/offline/media/{}/index.m3u8", "a".repeat(64)),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status_code, StatusCode::SERVICE_UNAVAILABLE, "{disabled}");
+        state
+            .store
+            .put_setting(plurx_core::store::keys::OFFLINE_ENABLED, "1")
+            .await
+            .expect("enable offline");
+
         let eviction = state.transcode.begin_cache_eviction_for_test("test-recipe");
         let (status_code, _) = call_text(
             &app,
@@ -2841,8 +2916,22 @@ mod tests {
             .is_none());
         let (_, metrics) = call_text(&app, get("/metrics", None)).await;
         assert!(metrics.contains("plurx_offline_packages{state=\"ready\"} 0"));
-        assert!(metrics.contains("plurx_offline_cancellations_total 0"));
+        assert!(metrics.contains("plurx_offline_cancellations_total 1"));
         assert!(metrics.contains("plurx_offline_transfer_bytes_total 7"));
+    }
+
+    #[tokio::test]
+    async fn pgs_overlay_routes_are_default_off() {
+        let (app, _) = test_state();
+        let admin = setup_admin(&app).await;
+        assert_eq!(
+            status_of(
+                &app,
+                get("/api/v1/files/1/subs/0/overlay.json", Some(&admin)),
+            )
+            .await,
+            StatusCode::NOT_FOUND
+        );
     }
 
     #[tokio::test]
@@ -2998,6 +3087,14 @@ mod tests {
             .await,
             StatusCode::UNSUPPORTED_MEDIA_TYPE
         );
+
+        // A power-loss-shaped published directory must not become a permanent
+        // 500. The next manifest read removes it, owns a fresh preparation,
+        // and returns the ordinary retry contract.
+        std::fs::write(generation_dir.join("manifest.json"), b"").expect("tear published manifest");
+        let (status, body) = call(&app, get(&manifest_uri, Some(&admin))).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        assert_eq!(body["state"], "preparing");
 
         // A second PGS track has no cache. Preparation is detached and the
         // request returns promptly instead of blocking video startup.
@@ -3998,7 +4095,6 @@ mod tests {
         let (app, state) = test_state();
         let admin = setup_admin(&app).await;
         let seeded = seed_content(&state).await;
-
         let (_, server) = call(&app, get("/api/v1/server", None)).await;
         assert_pointers(
             &contract["server"],
@@ -4345,6 +4441,7 @@ mod tests {
         assert_eq!(before["offline_max_gb"], 25);
         assert_eq!(before["offline_max_gb_per_user"], 15);
         assert_eq!(before["offline_max_rows_per_user"], 50);
+        assert_eq!(before["hls_typeless_sliding"], false);
         // The artwork sweep is the one job that reads back as on before
         // anybody has touched it. A 0 here would mean a fresh install never
         // repairs a poster it failed to download.
@@ -4357,7 +4454,8 @@ mod tests {
                 json!({ "scan_on_startup": true, "probe_retry_mins": 1440,
                         "artwork_retry_mins": 0, "offline_enabled": false,
                         "offline_max_gb": 40, "offline_max_gb_per_user": 20,
-                        "offline_max_rows_per_user": 75 }),
+                        "offline_max_rows_per_user": 75,
+                        "hls_typeless_sliding": true }),
             ),
         )
         .await;
@@ -4368,6 +4466,7 @@ mod tests {
         assert_eq!(after["offline_max_gb"], 40);
         assert_eq!(after["offline_max_gb_per_user"], 20);
         assert_eq!(after["offline_max_rows_per_user"], 75);
+        assert_eq!(after["hls_typeless_sliding"], true);
         assert_eq!(
             after["artwork_retry_mins"], 0,
             "an explicit 0 must survive the default, or the job cannot be turned off"
@@ -4426,6 +4525,94 @@ mod tests {
             .await
             .0,
             StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn both_progress_routes_use_the_coalescer_and_dated_writes_win() {
+        let (app, state) = test_state();
+        let admin = setup_admin(&app).await;
+        let seeded = seed_content(&state).await;
+        let user_id = state
+            .store
+            .list_users()
+            .await
+            .expect("users")
+            .into_iter()
+            .find(|user| user.is_admin)
+            .expect("admin user")
+            .id;
+
+        let api_progress = |position_ms: i64, recorded_at: Option<i64>| {
+            post(
+                &format!("/api/v1/items/{}/progress", seeded.movie),
+                Some(&admin),
+                json!({
+                    "position_ms": position_ms,
+                    "duration_ms": 9_000_000,
+                    "recorded_at": recorded_at,
+                }),
+            )
+        };
+        call(&app, api_progress(1_000, None)).await;
+        let (_, coalesced) = call(&app, api_progress(50_000, None)).await;
+        assert_eq!(
+            coalesced["position_ms"], 1_000,
+            "the HTTP body remains the coherent durable row while a beat is pending"
+        );
+        assert_eq!(
+            state
+                .store
+                .watch_state(user_id, seeded.movie)
+                .await
+                .expect("watch state")
+                .expect("watch row")
+                .position_ms,
+            1_000,
+            "the second REST beat must take the coalescer path"
+        );
+
+        let imported_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("Unix clock")
+            .as_secs() as i64;
+        call(&app, api_progress(80_000, Some(imported_at))).await;
+        state.progress.drain().await.expect("drain stale beat");
+        assert_eq!(
+            state
+                .store
+                .watch_state(user_id, seeded.movie)
+                .await
+                .expect("watch state")
+                .expect("watch row")
+                .position_ms,
+            80_000,
+            "the dated bypass must invalidate an older pending beat"
+        );
+
+        let plex = |position_ms: i64| {
+            Request::builder()
+                .uri(format!(
+                    "/:/timeline?ratingKey={}&time={position_ms}&duration=9000000",
+                    seeded.ep
+                ))
+                .header("x-plex-token", &admin)
+                .body(Body::empty())
+                .expect("Plex timeline request")
+        };
+        assert!(status_of(&app, plex(1_000)).await.is_success());
+        assert!(status_of(&app, plex(60_000)).await.is_success());
+        state.progress.drain().await.expect("drain Plex beat");
+        assert_eq!(
+            state
+                .store
+                .watch_state(user_id, seeded.ep)
+                .await
+                .expect("Plex watch state")
+                .expect("Plex watch row")
+                .position_ms,
+            60_000,
+            "the Plex timeline must share the coalescer"
         );
     }
 
@@ -5373,7 +5560,7 @@ mod tests {
     ///
     /// The clip carries no subtitle data — nothing here extracts cues, it all
     /// stops at validation — so the tracks live in the probe only.
-    async fn seed_mixed_subtitles(state: &AppState) -> i64 {
+    async fn seed_mixed_subtitles(state: &AppState, hdr: Option<&str>) -> i64 {
         use plurx_core::domain::{
             AudioStream, ItemKind, LibraryKind, NewItem, NewLibrary, ProbeResult, SubtitleStream,
         };
@@ -5445,7 +5632,9 @@ mod tests {
             video_codec: Some("h264".into()),
             width: Some(64),
             height: Some(64),
-            bit_depth: Some(8),
+            bit_depth: Some(if hdr.is_some() { 10 } else { 8 }),
+            hdr: hdr.map(str::to_owned),
+            hdr_format: hdr.map(str::to_owned),
             bitrate: Some(400_000),
             audio_streams: vec![AudioStream {
                 index: 0,
@@ -5506,7 +5695,7 @@ mod tests {
         crate::transcode::require_ffmpeg();
         let (app, state) = test_state();
         let admin = setup_admin(&app).await;
-        let file = seed_mixed_subtitles(&state).await;
+        let file = seed_mixed_subtitles(&state, None).await;
 
         for (index, why) in [
             (9_i64, "unknown native subtitle track"),
@@ -5562,6 +5751,39 @@ mod tests {
             status,
             StatusCode::OK,
             "a text track that converts must still be accepted: {body}"
+        );
+    }
+
+    /// A pre-guard client can ask the server to burn a bitmap track without
+    /// saying what video delivery it is replacing. The server must not treat
+    /// that missing context as permission to turn a known HDR source into
+    /// H.264 SDR. The refusal happens before playback accounting or ffmpeg.
+    #[tokio::test]
+    async fn hls_create_refuses_hdr_subtitle_burns_at_the_server_boundary() {
+        crate::transcode::require_ffmpeg();
+        let (app, state) = test_state();
+        let admin = setup_admin(&app).await;
+        let file = seed_mixed_subtitles(&state, Some("hdr10")).await;
+
+        let (status, body) = call(
+            &app,
+            post(
+                &format!("/api/v1/files/{file}/hls/sessions"),
+                Some(&admin),
+                json!({
+                    "playback_id": "old-client-hdr-burn",
+                    "height": 64,
+                    "subtitle_burn": 2
+                }),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["code"], "hdr_subtitle_burn_refused");
+        assert_eq!(
+            body["error"],
+            "That subtitle requires an SDR burn-in. HDR playback was kept unchanged."
         );
     }
 

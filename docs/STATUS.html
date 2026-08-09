@@ -92,14 +92,14 @@
   <header>
     <h1>plurx — Project Status</h1>
     <div class="sub">Self-hosted media server in the old-Plex spirit · explicit ledger of done vs. planned ·
-      mirrors <code>docs/ROADMAP.md</code> + <code>docs/FEATURES.md</code> · 2026-08-08 · Apple natural-end teardown and HLS hold diagnostics added; physical acceptance and publishing remain</div>
+      mirrors <code>docs/ROADMAP.md</code> + <code>docs/FEATURES.md</code> · 2026-08-09 · seek/media-origin hardening + Apple build 43 + retrospective work orders; physical acceptance and publishing remain</div>
   </header>
 
   <div class="tiles">
     <div class="tile"><div class="v">v0.2.7</div><div class="l">current source · release/deploy evidence pending</div></div>
     <div class="tile"><div class="v">0–3 ✓</div><div class="l">core phases + 2 slices complete</div></div>
-    <div class="tile"><div class="v">3 viewers</div><div class="l">web ✓ · Android ✓ · Apple build 38 source, not yet uploaded</div></div>
-    <div class="tile"><div class="v">M2–M3 ✓</div><div class="l">GPU tone-map + pre-cache done · M4 clustering next</div></div>
+    <div class="tile"><div class="v">3 viewers</div><div class="l">web ✓ · Android ✓ · Apple build 43 source, not yet uploaded</div></div>
+    <div class="tile"><div class="v">M1d ✓</div><div class="l">replicated Store complete · M2 cluster activation next</div></div>
   </div>
 
   <!-- ══════════ Phases 0–2 ══════════ -->
@@ -204,16 +204,17 @@
 
   <!-- ══════════ Phase 4 ══════════ -->
   <section>
-    <h2>Phase 4 — HA for real <span class="chip next">next major phase</span> <span class="ev">spike done · hiqlite decided</span></h2>
-    <div class="meter"><div class="track"><div class="fill" style="width:0%"></div></div><div class="n">0 / 5 items</div></div>
+    <h2>Phase 4 — HA for real <span class="chip prog">🚧 backend transition</span> <span class="ev">M0–M1d complete · M2 activation next</span></h2>
+    <div class="meter"><div class="track"><div class="fill" style="width:45%"></div></div><div class="n">5 milestones complete · activation/failover remain</div></div>
     <p class="blurb">The demo that defines the project: pull the power on a node mid-movie; playback resumes within seconds; zero loss of settings or watch state; a 3-node cluster from the README in under 10 minutes.</p>
     <details><summary>Items</summary>
       <ul class="items">
-        <li><span class="m todo">○ todo</span><span class="t">Cluster membership: join tokens, node add/remove, health, single logical server identity</span></li>
-        <li><span class="m todo">○ todo</span><span class="t">Replication classes wired: durable (users/settings/metadata/watch state) + ephemeral (sessions) + leader-scheduled scanner singleton</span></li>
-        <li><span class="m todo">○ todo</span><span class="t">Streaming failover: client node-list + retry (web first), session takeover; VIP/keepalived + k8s patterns documented</span></li>
-        <li><span class="m todo">○ todo</span><span class="t">Helm chart (3-replica StatefulSet, anti-affinity), rolling upgrades, cluster admin UI</span></li>
-        <li><span class="m todo">○ todo</span><span class="t">Failure drills as CI-able tests: kill leader mid-transcode, kill follower mid-scan, netsplit, disk-full node</span></li>
+        <li class="done-item"><span class="m done">✓ M0 + M1a</span><span class="t">Local node identity, rollback-tolerant config, Hiqlite decision/cost record, deterministic replicated-SQL policy, and the backend-neutral <code>Arc&lt;dyn Store&gt;</code> inventory merged 2026-08-07</span></li>
+        <li class="done-item"><span class="m done">✓ M1b</span><span class="t">Three-voter settings/auth/API-key backend with schema preflight, replica digests, and follower/leader/quorum-loss harness merged 2026-08-07</span></li>
+        <li class="done-item"><span class="m done">✓ M1c</span><span class="t">Libraries, media, watch state, node-local FTS, root identity, and atomic bounded reconciliation merged in PR #88 on 2026-08-08</span></li>
+        <li class="done-item"><span class="m done">✓ M1d</span><span class="t">The complete 120-method replicated store, shared three-voter contract suite, Trakt/outbox multi-writer safety, offline/cache identity checks, and bounded progress coalescing passed PR #90 review and CI; post-coalescer compacted growth remains an M2 activation measurement</span></li>
+        <li><span class="m todo">○ M2–M3</span><span class="t">Import and activate one-voter Hiqlite, envelope-encrypt replicated Trakt bearer credentials, then add join/remove/health, offline-work cleanup on removal, and singleton fencing</span></li>
+        <li><span class="m todo">○ M4–M7</span><span class="t">Session takeover, client node-list retry, VIP/Kubernetes patterns, rolling upgrades, cluster admin UI, and the physical netsplit/disk/node-loss corpus</span></li>
       </ul>
     </details>
   </section>
@@ -266,16 +267,17 @@
     <h2>Operator checklist (Paul) <span class="ev">hardware evidence that source tests cannot supply</span></h2>
     <ul class="items">
       <li class="done-item"><span class="m done">✓ measured</span><span class="t">Perf M2 acceptance ran on nynuc: QSV tone-map measured 4.89× the CPU chain and the bitrate bound held</span></li>
+      <li class="done-item"><span class="m done">✓ fleet</span><span class="t">2026-08-09: nynuc and nuc4 are healthy on stamped v0.2.7 build <code>e8a910f</code>, SQLite schema 15; media mounts remain read-only, GPU devices are present, and nuc4 retains TCP 32402 / GDM UDP 32415</span></li>
       <li><span class="m you">👤 Paul</span><span class="t">Exercise the two default-off HLS master-ladder rungs separately — <code>PLURX_HLS_CLOSED_CAPTIONS_NONE</code> and <code>PLURX_HLS_FORCED_AUTOSELECT</code> — one per deploy, observed on a physical device</span></li>
-      <li><span class="m you">👤 Paul</span><span class="t">Publish the current server release to the node fleet and upload Apple build 38 to TestFlight; repository evidence still records the fleet at <code>787eaa6</code> and the Apple client as not uploaded</span></li>
-      <li><span class="m you">👤 device</span><span class="t">On Apple build 38, record the player-chrome and natural-end matrix: iPad full-screen and Split View; iPhone portrait and landscape; playback info, failure, notice, pause, PiP return, autoplay on/off, unknown catalog duration, background audio handoff, and tvOS focus after dismissal. Confirm the status bar and Home indicator follow the documented policy without moving visible overlays, and record whether iPad multitasking/window controls can be retired before making that claim.</span></li>
+      <li><span class="m you">👤 Paul</span><span class="t">Publish the post-retrospective server tip to the node fleet and upload Apple build 43 to TestFlight; the verified fleet is currently at <code>e8a910f</code> and the Apple client is still not uploaded</span></li>
+      <li><span class="m you">👤 device</span><span class="t">On Apple build 43, record the player-chrome and natural-end matrix: iPad full-screen and Split View; iPhone portrait and landscape; playback info, failure, notice, pause, PiP return, autoplay on/off, unknown catalog duration, background audio handoff, and tvOS focus after dismissal. Confirm the status bar and Home indicator follow the documented policy without moving visible overlays, and record whether iPad multitasking/window controls can be retired before making that claim.</span></li>
       <li><span class="m you">👤 Paul</span><span class="t">Run the offline-viewing physical matrix on iPhone/iPad and Android: background/process-death recovery, airplane-mode start and midpoint seek, selected subtitle, and removal reconciliation</span></li>
       <li><span class="m you">👤 Paul</span><span class="t">Run the broader Apple/Android release matrix on current builds; simulator and source gates cannot prove HDMI, hardware decode, HDR output, or D-pad/Siri Remote behavior</span></li>
     </ul>
   </section>
 
   <footer>
-    Authoritative copies: <code>docs/ROADMAP.md</code> · <code>docs/FEATURES.md</code> · <code>CHANGELOG.md</code> · <code>docs/CLUSTERING-PLAN.md</code> · reviewed against <code>origin/main</code> @ <code>5c6bfe5</code> plus the PR #91 review response · page refreshed 2026-08-08
+    Authoritative copies: <code>docs/ROADMAP.md</code> · <code>docs/FEATURES.md</code> · <code>CHANGELOG.md</code> · <code>docs/CLUSTERING-PLAN.md</code> · retrospective assessment: <code>docs/RETRO-REVIEW-2026-08-09.md</code> (baseline <code>e8a910f</code>) · page refreshed against <code>origin/main</code> on 2026-08-09
   </footer>
 </div>
 </body>

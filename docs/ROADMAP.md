@@ -118,18 +118,39 @@ through M3; M4 *is* Phase 4's transcode chapter and waits for its plumbing.
   and active-reader eviction protection are shipped. Cached TTFF and seek
   measurements remain operational evidence, not unfinished implementation.
 
-## Phase 4 — HA for real
+## Phase 4 — HA for real (IN PROGRESS)
 
 The executable handoff is
 [CLUSTERING-PLAN.md](CLUSTERING-PLAN.md): it separates node identity from the
 logical server first, then brings up the one-voter replicated store before
 membership, singleton jobs, session takeover, and failure drills.
 
-- Cluster membership: join tokens, node add/remove, health, single logical server identity
-- Replication classes wired: durable (users/settings/metadata/watch state) + ephemeral (sessions) + leader-scheduled scanner singleton
-- Streaming failover: client node-list + retry (web client first), session takeover per ARCHITECTURE §2.3; VIP/keepalived + k8s patterns documented
-- Helm chart (3-replica StatefulSet, anti-affinity); rolling-upgrade support; cluster admin UI (node status, raft health)
-- Failure drills as CI-able integration tests: kill leader mid-transcode, kill follower mid-scan, netsplit, disk-full node
+M0–M1d are merged: identity, the one-/three-voter Hiqlite proofs, replicated
+auth/catalogue/media/search contracts, and the complete 120-method Store
+backend are in-tree. M2 activation is next; SQLite remains the production
+default until import and daemon selection land.
+
+- ✅ **M0 complete 2026-08-07:** local node identity, rollback-tolerant
+  cluster configuration, Hiqlite decision/cost record, deterministic-SQL guard,
+  and the semantic spike are merged.
+- ✅ **M1a complete 2026-08-07:** the backend-neutral `Arc<dyn Store>` contract
+  inventory and replicated transaction/CAS policy are merged.
+- ✅ **M1b complete 2026-08-07:** settings, users/tokens, and API keys replicate
+  across three voters with schema preflight, replica digests, and induced
+  follower/leader/quorum-loss coverage.
+- ✅ **M1c complete 2026-08-08:** libraries, media, watch state, node-local FTS,
+  root identity, and atomic bounded reconciliation are merged in PR #88.
+- ✅ **M1d complete 2026-08-08:** the 120-method backend, shared three-voter
+  contract factory, multi-writer Trakt/outbox safety, offline/cache identity
+  guards, and the progress coalescer passed the full PR #90 review and CI
+  sequence. Post-coalescer compacted growth remains an explicit activation
+  measurement.
+- ○ **M2–M3 next:** import and select one-voter Hiqlite, envelope-encrypt Trakt
+  bearer credentials, then add join/remove/health and singleton job fencing.
+  Removing a node must explicitly fail or safely re-home its offline work.
+- ○ **M4–M7 remain:** replicated session takeover, client node-list retry,
+  VIP/Kubernetes deployment patterns, rolling upgrades, the cluster admin UI,
+  and the physical failure-drill corpus.
 
 **Exit:** the demo that defines the project — pull the power on a node mid-movie; playback resumes within seconds; settings/watch state show zero loss; `docker compose up` a 3-node cluster from the README in under 10 minutes.
 

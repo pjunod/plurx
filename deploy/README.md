@@ -8,6 +8,12 @@ the macOS Ansible controller because that host owns adb pairing, Xcode signing,
 and App Store Connect authentication; see
 [`docs/PUBLISHING.md`](../docs/PUBLISHING.md#ansible-owns-the-repeatable-mobile-deploy).
 
+For Apple, `scripts/ship --apple` means test, archive, and upload to
+TestFlight. There is no direct-install step for the fleet: after the upload is
+accepted, each iPhone, iPad, and Apple TV installs that build through
+TestFlight. “Deploy to all Apple devices” therefore includes that explicit
+on-device install/update step.
+
 ## Docker / Compose (recommended for homelabs)
 
 Host-specific bits (media mounts, GPU, and shared Docker networks) live in an

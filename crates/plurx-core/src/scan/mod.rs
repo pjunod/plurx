@@ -318,7 +318,7 @@ pub async fn scan_library_with_progress_and_prune_percent(
     let prune_limit = if percent == 0 || known == 0 {
         0
     } else {
-        known.saturating_mul(percent) / 100
+        (known.saturating_mul(percent) / 100).max(1)
     };
     scan_library_with_progress_and_prune_limit(store, library, progress, prune_limit).await
 }
@@ -1415,6 +1415,69 @@ mod tests {
             .expect("list");
         assert_eq!(page.total, 1);
         assert_eq!(page.items[0].title, "The Matrix");
+    }
+
+    #[tokio::test]
+    async fn default_prune_percent_removes_one_missing_file_from_a_small_library() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        let dir = tempfile::tempdir().expect("tmp");
+        let mut paths = Vec::new();
+        for index in 0..5 {
+            paths.push(
+                write_fake_video(dir.path(), &format!("Small Movie {index} (2020).mkv")).await,
+            );
+        }
+        let lib = movie_library(&store, dir.path()).await;
+        scan_library(&store, &lib).await.expect("initial scan");
+
+        std::fs::remove_file(&paths[0]).expect("remove one source");
+        let report = scan_library_with_progress_and_prune_percent(
+            &store,
+            &lib,
+            None,
+            crate::config::DEFAULT_SCAN_PRUNE_PERCENT,
+        )
+        .await
+        .expect("small-library rescan");
+
+        assert_eq!(report.removed_files, 1);
+        assert_eq!(
+            store
+                .library_file_paths(lib.id)
+                .await
+                .expect("remaining files")
+                .len(),
+            4
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_prune_percent_still_refuses_automatic_removal() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        let dir = tempfile::tempdir().expect("tmp");
+        let path = write_fake_video(dir.path(), "Tiny Library (2020).mkv").await;
+        let lib = movie_library(&store, dir.path()).await;
+        scan_library(&store, &lib).await.expect("initial scan");
+
+        std::fs::remove_file(path).expect("remove source");
+        let report = scan_library_with_progress_and_prune_percent(&store, &lib, None, 0)
+            .await
+            .expect("disabled-prune rescan");
+
+        assert_eq!(report.removed_files, 0);
+        assert_eq!(report.errors, 1);
+        assert!(report
+            .problems
+            .iter()
+            .any(|problem| problem.contains("configured limit of 0")));
+        assert_eq!(
+            store
+                .library_file_paths(lib.id)
+                .await
+                .expect("kept file")
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]

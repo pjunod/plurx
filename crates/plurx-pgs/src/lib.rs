@@ -167,7 +167,21 @@ struct PendingObject {
     rle: Vec<u8>,
 }
 
-type Palette = [[u8; 4]; 256];
+#[derive(Clone, Copy, Default)]
+struct PaletteColor {
+    y: u8,
+    cr: u8,
+    cb: u8,
+    alpha: u8,
+}
+
+type Palette = [PaletteColor; 256];
+
+#[derive(Clone, Copy)]
+enum ColorMatrix {
+    Bt601,
+    Bt709,
+}
 
 #[derive(Default)]
 struct NormalizerState {
@@ -610,6 +624,7 @@ fn normalize_display_set(
                 pcs.palette_id
             ))
         })?;
+        let matrix = color_matrix(pcs.video_height);
 
         let (crop_x, crop_y, width, height) = match &placement.crop {
             Some(crop) => {
@@ -637,7 +652,7 @@ fn normalize_display_set(
         )?;
 
         let (image_hash, rgba) = if normalized_objects.is_some() {
-            let rgba = rgba_crop(object, palette, crop_x, crop_y, width, height);
+            let rgba = rgba_crop(object, palette, matrix, crop_x, crop_y, width, height);
             *normalized_rgba_bytes =
                 normalized_rgba_bytes
                     .checked_add(rgba.len())
@@ -653,7 +668,7 @@ fn normalize_display_set(
             (hash_rgba(width, height, &rgba), Some(rgba))
         } else {
             (
-                hash_rgba_crop(object, palette, crop_x, crop_y, width, height),
+                hash_rgba_crop(object, palette, matrix, crop_x, crop_y, width, height),
                 None,
             )
         };
@@ -717,10 +732,17 @@ fn apply_palette(
             limits.max_palettes
         )));
     }
-    let palette = state.palettes.entry(pds.id).or_insert([[0; 4]; 256]);
+    let palette = state
+        .palettes
+        .entry(pds.id)
+        .or_insert([PaletteColor::default(); 256]);
     for entry in pds.entries {
-        palette[entry.id as usize] =
-            ycrcb_to_rgba(entry.luminance, entry.cr, entry.cb, entry.alpha);
+        palette[entry.id as usize] = PaletteColor {
+            y: entry.luminance,
+            cr: entry.cr,
+            cb: entry.cb,
+            alpha: entry.alpha,
+        };
     }
     Ok(())
 }
@@ -1047,12 +1069,13 @@ fn validate_rect(
 fn hash_rgba_crop(
     object: &StoredObject,
     palette: &Palette,
+    matrix: ColorMatrix,
     crop_x: u16,
     crop_y: u16,
     width: u16,
     height: u16,
 ) -> [u8; 32] {
-    let rgba = rgba_crop(object, palette, crop_x, crop_y, width, height);
+    let rgba = rgba_crop(object, palette, matrix, crop_x, crop_y, width, height);
     hash_rgba(width, height, &rgba)
 }
 
@@ -1068,6 +1091,7 @@ fn hash_rgba(width: u16, height: u16, rgba: &[u8]) -> [u8; 32] {
 fn rgba_crop(
     object: &StoredObject,
     palette: &Palette,
+    matrix: ColorMatrix,
     crop_x: u16,
     crop_y: u16,
     width: u16,
@@ -1078,20 +1102,33 @@ fn rgba_crop(
     for y in crop_y as usize..(crop_y + height) as usize {
         let start = y * stride + crop_x as usize;
         for index in &object.pixels[start..start + width as usize] {
-            rgba.extend_from_slice(&palette[*index as usize]);
+            let color = palette[*index as usize];
+            rgba.extend_from_slice(&ycrcb_to_rgba(color, matrix));
         }
     }
     rgba
 }
 
-fn ycrcb_to_rgba(y: u8, cr: u8, cb: u8, alpha: u8) -> [u8; 4] {
-    let c = i32::from(y) - 16;
-    let d = i32::from(cb) - 128;
-    let e = i32::from(cr) - 128;
-    let red = ((298 * c + 409 * e + 128) >> 8).clamp(0, 255) as u8;
-    let green = ((298 * c - 100 * d - 208 * e + 128) >> 8).clamp(0, 255) as u8;
-    let blue = ((298 * c + 516 * d + 128) >> 8).clamp(0, 255) as u8;
-    [red, green, blue, alpha]
+fn color_matrix(canvas_height: u16) -> ColorMatrix {
+    if canvas_height >= 720 {
+        ColorMatrix::Bt709
+    } else {
+        ColorMatrix::Bt601
+    }
+}
+
+fn ycrcb_to_rgba(color: PaletteColor, matrix: ColorMatrix) -> [u8; 4] {
+    let c = i32::from(color.y) - 16;
+    let d = i32::from(color.cb) - 128;
+    let e = i32::from(color.cr) - 128;
+    let (red_e, green_d, green_e, blue_d) = match matrix {
+        ColorMatrix::Bt601 => (409, 100, 208, 516),
+        ColorMatrix::Bt709 => (459, 55, 136, 541),
+    };
+    let red = ((298 * c + red_e * e + 128) >> 8).clamp(0, 255) as u8;
+    let green = ((298 * c - green_d * d - green_e * e + 128) >> 8).clamp(0, 255) as u8;
+    let blue = ((298 * c + blue_d * d + 128) >> 8).clamp(0, 255) as u8;
+    [red, green, blue, color.alpha]
 }
 
 #[cfg(test)]
@@ -1109,6 +1146,27 @@ mod tests {
         file.write_all(bytes).expect("write SUP");
         file.flush().expect("flush SUP");
         file
+    }
+
+    #[test]
+    fn hd_colored_cue_matches_the_ffmpeg_bt709_rgba_fixture() {
+        // Captured from ffmpeg's limited-range BT.709 conversion of the
+        // production-cue palette sample Y=81, Cr=240, Cb=90, A=255.
+        let expected = include_str!("../fixtures/ffmpeg-bt709-colored-cue.rgba")
+            .split_whitespace()
+            .map(|part| part.parse::<u8>().expect("RGBA fixture byte"))
+            .collect::<Vec<_>>();
+        let color = PaletteColor {
+            y: 81,
+            cr: 240,
+            cb: 90,
+            alpha: 255,
+        };
+        assert_eq!(
+            ycrcb_to_rgba(color, color_matrix(1080)),
+            expected.as_slice()
+        );
+        assert_eq!(ycrcb_to_rgba(color, color_matrix(480)), [255, 0, 0, 255]);
     }
 
     fn pcs(pts_ms: u64, state: CompositionState, objects: Vec<CompositionObject>) -> PgsSegment {

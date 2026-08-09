@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import re
@@ -14,6 +15,17 @@ ROOT = Path(__file__).resolve().parents[2]
 
 def read(path: str) -> str:
     return (ROOT / path).read_text(encoding="utf-8")
+
+
+def workflow_job_blocks(path: str) -> dict[str, str]:
+    jobs = read(path).split("\njobs:\n", 1)[1]
+    starts = list(re.finditer(r"(?m)^  ([a-zA-Z0-9_-]+):\n", jobs))
+    return {
+        match.group(1): jobs[match.start() : starts[index + 1].start()]
+        if index + 1 < len(starts)
+        else jobs[match.start() :]
+        for index, match in enumerate(starts)
+    }
 
 
 class OperationsContractCase(unittest.TestCase):
@@ -78,6 +90,11 @@ class OperationsContractCase(unittest.TestCase):
         self.assertIn('--tags "$MOBILE_TAGS"', ship)
         self.assertNotIn("deploy/ansible", ship)
         self.assertIn("alias(libs.plugins.android.application)", android)
+        self.assertIn("deploy/docker-compose.override.yml or deploy/.env", ship)
+        self.assertNotIn("environment: block in deploy/docker-compose.yml", ship)
+
+        deploy_readme = read("deploy/README.md")
+        self.assertIn("There is no direct-install step for the fleet", deploy_readme)
 
     def test_ship_selects_mobile_tags_and_optional_vars_file(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -106,12 +123,20 @@ class OperationsContractCase(unittest.TestCase):
 
     def test_ci_provisions_concrete_apple_devices_before_testing(self):
         workflow = read(".github/workflows/ci.yml")
+        makefile = read("Makefile")
         self.assertIn("sudo xcodebuild -runFirstLaunch", workflow)
         self.assertEqual(workflow.count("xcrun simctl create"), 2)
         self.assertIn("SimDeviceType.iPhone-16-Pro", workflow)
+        self.assertIn("xcrun simctl list devices available -j", workflow)
+        self.assertIn('runtime.endswith("iOS-18-5")', workflow)
+        self.assertIn('device["name"].startswith("iPad")', workflow)
+        self.assertIn('device["udid"]', workflow)
         self.assertIn("SimDeviceType.Apple-TV-4K-3rd-generation-4K", workflow)
         self.assertIn('APPLE_IOS_SIM=platform=iOS Simulator,id=$ios_id', workflow)
+        self.assertIn('APPLE_IPAD_SIM=platform=iOS Simulator,id=$ipad_id', workflow)
         self.assertIn('APPLE_TVOS_SIM=platform=tvOS Simulator,id=$tvos_id', workflow)
+        self.assertIn('$${APPLE_IPAD_SIM:-}', makefile)
+        self.assertEqual(makefile.count("-scheme plurx-iOS"), 2)
         self.assertLess(workflow.index("xcrun simctl create"), workflow.index("run: make apple-test"))
 
     def test_pr_ci_selects_expensive_surfaces_and_has_one_aggregate_gate(self):
@@ -119,11 +144,8 @@ class OperationsContractCase(unittest.TestCase):
 
         self.assertIn("python3 -m validation.ci_scope", workflow)
         self.assertIn("name: fast policy and contract preflight", workflow)
-        self.assertIn("name: Check mobile release hygiene first", workflow)
-        self.assertLess(
-            workflow.index("name: Check mobile release hygiene first"),
-            workflow.index("name: Audit corrective-history evidence"),
-        )
+        self.assertIn("name: mobile release version", workflow)
+        self.assertIn("name: Check mobile release hygiene", workflow)
         self.assertLess(
             workflow.index("name: Audit corrective-history evidence"),
             workflow.index("name: Check validation catalog and contract unit tests"),
@@ -135,16 +157,33 @@ class OperationsContractCase(unittest.TestCase):
         self.assertIn("if: needs.scope.outputs.android_device == 'true'", workflow)
         self.assertIn("if: needs.scope.outputs.web_layout == 'true'", workflow)
         self.assertIn("if: needs.scope.outputs.release_build == 'true'", workflow)
+        self.assertIn("if: needs.scope.outputs.hiqlite_spike == 'true'", workflow)
+        self.assertIn("if: needs.scope.outputs.cluster_auth == 'true'", workflow)
+        self.assertIn("name: three-voter replicated store contracts", workflow)
         self.assertIn("if: needs.scope.outputs.docs_only != 'true'", workflow)
         self.assertIn("needs: [scope, preflight]", workflow)
         self.assertIn("PREFLIGHT_RESULT: ${{ needs.preflight.result }}", workflow)
+        self.assertIn(
+            "MOBILE_VERSION_RESULT: ${{ needs.mobile_version.result }}",
+            workflow,
+        )
         self.assertIn("HIQLITE_SPIKE_RESULT: ${{ needs.hiqlite_spike.result }}", workflow)
         self.assertIn("CLUSTER_AUTH_RESULT: ${{ needs.cluster_auth.result }}", workflow)
         pr_gate = workflow.split("  pr_gate:", 1)[1]
+        self.assertIn("      - mobile_version", pr_gate)
         self.assertIn("      - hiqlite_spike", pr_gate)
         self.assertIn("      - cluster_auth", pr_gate)
         self.assertIn("needs: scope", workflow)
         self.assertNotIn("github.event_name == 'pull_request' && github.ref == 'refs/heads/main'", workflow)
+
+        mobile = workflow.split("  mobile_version:", 1)[1].split("\n  preflight:", 1)[0]
+        self.assertIn("needs: scope", mobile)
+        self.assertNotIn("needs: [scope, preflight]", mobile)
+        apple = workflow.split("\n  apple:\n", 1)[1].split(
+            "\n  android_device:\n", 1
+        )[0]
+        self.assertIn("needs: [scope, preflight]", apple)
+        self.assertNotIn("mobile_version", apple)
 
         coverage = workflow.split("  coverage:", 1)[1].split("\n  build:", 1)[0]
         self.assertIn("if: github.ref == 'refs/heads/main'", coverage)
@@ -156,6 +195,63 @@ class OperationsContractCase(unittest.TestCase):
         lint = read(".github/workflows/lint.yml")
         self.assertIn("Select the documentation-only fast path", lint)
         self.assertIn("steps.scope.outputs.docs_only != 'true'", lint)
+
+        self.assertIn(
+            "cargo build --release -p plurxd --target ${{ matrix.target }}",
+            workflow,
+        )
+        self.assertNotIn(
+            "cargo build --release --workspace --target ${{ matrix.target }}",
+            workflow,
+        )
+
+    def test_release_registry_and_weekly_readiness_match_ci(self):
+        ci = read(".github/workflows/ci.yml")
+        unraid = read("deploy/unraid-plurx.xml")
+        readiness = read(".github/workflows/release-readiness.yml")
+
+        self.assertIn("images: ghcr.io/${{ github.repository }}", ci)
+        self.assertIn("<Repository>ghcr.io/pjunod/plurx:latest</Repository>", unraid)
+        self.assertIn(
+            "<Registry>https://github.com/pjunod/plurx/pkgs/container/plurx</Registry>",
+            unraid,
+        )
+        self.assertIn('cron: "41 16 * * 1"', readiness)
+        self.assertIn("run: make release-check", readiness)
+        self.assertIn("fetch-depth: 0", readiness)
+
+    def test_every_actions_job_has_an_explicit_timeout(self):
+        for path in (
+            ".github/workflows/ci.yml",
+            ".github/workflows/lint.yml",
+            ".github/workflows/release-readiness.yml",
+            ".github/workflows/rust-audit.yml",
+        ):
+            with self.subTest(path=path):
+                jobs = workflow_job_blocks(path)
+                self.assertTrue(jobs, f"{path} has no jobs")
+                missing = [
+                    name for name, block in jobs.items()
+                    if "\n    timeout-minutes:" not in block
+                ]
+                self.assertEqual([], missing, f"jobs without timeouts in {path}")
+
+    def test_ci_flake_ledger_records_real_job_outcomes_and_durations(self):
+        script = ROOT / "scripts/ci-flake-report"
+        subprocess.run([str(script), "--help"], check=True, stdout=subprocess.PIPE)
+        ledger = json.loads(read("validation/ci-flake-ledger.json"))
+
+        self.assertEqual(ledger["schema"], 1)
+        self.assertEqual(ledger["repository"], "pjunod/plurx")
+        self.assertEqual(ledger["workflow"], "ci.yml")
+        self.assertGreaterEqual(ledger["source"]["completed_runs_returned"], 1)
+        self.assertTrue(ledger["jobs"])
+        self.assertTrue(ledger["summary"])
+        for job in ledger["jobs"]:
+            self.assertIsInstance(job["conclusion"], str)
+            self.assertIsInstance(job["duration_seconds"], (int, float))
+            self.assertGreaterEqual(job["duration_seconds"], 0)
+            self.assertIsInstance(job["timestamp_anomaly"], bool)
 
     def test_container_smoke_keeps_non_root_state_port_and_cleanup_contracts(self):
         smoke = read("scripts/container-smoke")

@@ -27,7 +27,7 @@ profiles = ["commit"]
 id = "app"
 title = "Application"
 contract = "The app works."
-paths = ["src/**", "tests/**", "docs/**"]
+paths = ["src/**", "crates/**", "clients/**", "tests/**", "docs/**"]
 checks = ["baseline"]
 """
 
@@ -43,6 +43,7 @@ class HistoryAuditCase(unittest.TestCase):
             ["git", "config", "user.email", "history@example.invalid"], cwd=root, check=True
         )
         (root / "src").mkdir()
+        (root / "crates").mkdir()
         (root / "tests").mkdir()
         (root / "docs").mkdir()
         catalog_path = root / "points.toml"
@@ -157,6 +158,39 @@ class HistoryAuditCase(unittest.TestCase):
         self.assertEqual(report.errors, ())
         self.assertEqual(report.mapped_count, 0)
         self.assertEqual(report.ignored_count, 1)
+
+    def test_runtime_fix_cannot_hide_behind_an_unrelated_test_edit(self):
+        root, catalog, coverage = self.repository()
+        (root / "crates/app.rs").write_text(
+            "pub fn answer() -> u8 { 1 }\n", encoding="utf-8"
+        )
+        base = self.commit(root, "feat: seed runtime")
+        (root / "crates/app.rs").write_text(
+            "pub fn answer() -> u8 { 2 }\n", encoding="utf-8"
+        )
+        (root / "tests/unrelated.rs").write_text(
+            "#[test]\nfn unrelated() { assert_eq!(1, 1); }\n", encoding="utf-8"
+        )
+        (root / "tests/client-fixes.toml").write_text(
+            textwrap.dedent(
+                f"""
+                version = 1
+                enforce_after = "{base[:8]}"
+                """
+            ),
+            encoding="utf-8",
+        )
+        sha = self.commit(root, "Address runtime review feedback")
+
+        report = audit_history(root, catalog, coverage)
+
+        self.assertTrue(
+            any(
+                sha[:8] in error and "needs an explicit" in error
+                for error in report.errors
+            ),
+            report.errors,
+        )
 
 
 if __name__ == "__main__":
