@@ -157,6 +157,15 @@ class OperationsContractCase(unittest.TestCase):
         self.assertIn("Select the documentation-only fast path", lint)
         self.assertIn("steps.scope.outputs.docs_only != 'true'", lint)
 
+        self.assertIn(
+            "cargo build --release -p plurxd --target ${{ matrix.target }}",
+            workflow,
+        )
+        self.assertNotIn(
+            "cargo build --release --workspace --target ${{ matrix.target }}",
+            workflow,
+        )
+
     def test_container_smoke_keeps_non_root_state_port_and_cleanup_contracts(self):
         smoke = read("scripts/container-smoke")
         subprocess.run(["sh", "-n", str(ROOT / "scripts/container-smoke")], check=True)
