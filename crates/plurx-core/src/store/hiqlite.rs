@@ -6,6 +6,7 @@
 //! backend; backend completeness alone is not permission to skip that gate.
 
 use std::borrow::Cow;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -16,8 +17,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::replicated::ReplicatedSql;
-use super::{keys, ApiKeyStore, SettingsStore, UserStore};
-use crate::domain::{ApiKey, User};
+use super::telemetry::NodeLocalTelemetry;
+use super::{keys, ApiKeyStore, PlaybackTelemetryStore, SettingsStore, UserStore};
+use crate::domain::{ApiKey, PlaybackEvent, PlaybackEventQuery, User};
 use crate::error::StoreError;
 
 pub const AUTH_SCHEMA_VERSION: i64 = 4;
@@ -85,6 +87,7 @@ impl ClusterCompatibility {
 pub struct HiqliteAuthStore {
     client: TimedClient,
     clock: Arc<dyn Clock>,
+    telemetry: NodeLocalTelemetry,
 }
 
 /// The only application-facing path to hiqlite. Keeping the timeout at this
@@ -222,7 +225,11 @@ impl HiqliteAuthStore {
     ///
     /// Only the bootstrap coordinator calls this. Other voters call [`open`]
     /// after the acknowledged schema write has replicated.
-    pub async fn bootstrap(client: Client, instance_id: &str) -> Result<Self, StoreError> {
+    pub async fn bootstrap(
+        client: Client,
+        instance_id: &str,
+        telemetry_path: &Path,
+    ) -> Result<Self, StoreError> {
         validate_sql(AUTH_SCHEMA)?;
         let results = timeout_store(client.batch(AUTH_SCHEMA)).await?;
         for result in results {
@@ -231,7 +238,11 @@ impl HiqliteAuthStore {
         super::hiqlite_catalog::install_schema(&client).await?;
         super::hiqlite_durable::install_schema(&client).await?;
 
-        let store = Self::with_clock(client, Arc::new(SystemClock));
+        let store = Self::with_clock(
+            client,
+            Arc::new(SystemClock),
+            NodeLocalTelemetry::open(telemetry_path)?,
+        );
         let now = store.now()?;
         store
             .execute(
@@ -263,8 +274,12 @@ impl HiqliteAuthStore {
     }
 
     /// Open an already-bootstrapped cluster, refusing incompatible state.
-    pub async fn open(client: Client) -> Result<Self, StoreError> {
-        let store = Self::with_clock(client, Arc::new(SystemClock));
+    pub async fn open(client: Client, telemetry_path: &Path) -> Result<Self, StoreError> {
+        let store = Self::with_clock(
+            client,
+            Arc::new(SystemClock),
+            NodeLocalTelemetry::open(telemetry_path)?,
+        );
         store
             .verify_compatibility(ClusterCompatibility::CURRENT)
             .await?;
@@ -325,6 +340,7 @@ impl HiqliteAuthStore {
     /// this validation-only helper so every scenario still starts empty.
     #[doc(hidden)]
     pub async fn validation_reset_contract_state(&self) -> Result<(), StoreError> {
+        self.telemetry.clear().await?;
         let statements = [
             "DELETE FROM offline_lease_guards",
             "DELETE FROM offline_package_leases",
@@ -445,10 +461,11 @@ impl HiqliteAuthStore {
         })
     }
 
-    fn with_clock(client: Client, clock: Arc<dyn Clock>) -> Self {
+    fn with_clock(client: Client, clock: Arc<dyn Clock>, telemetry: NodeLocalTelemetry) -> Self {
         Self {
             client: TimedClient::new(client),
             clock,
+            telemetry,
         }
     }
 
@@ -491,6 +508,24 @@ impl HiqliteAuthStore {
         )
         .await?;
         Ok(rows.pop().map(Into::into))
+    }
+}
+
+#[async_trait]
+impl PlaybackTelemetryStore for HiqliteAuthStore {
+    async fn record_playback_event(&self, event: &PlaybackEvent) -> Result<i64, StoreError> {
+        self.telemetry.record(event.clone()).await
+    }
+
+    async fn prune_playback_events(&self, before_ms: i64, limit: i64) -> Result<u64, StoreError> {
+        self.telemetry.prune(before_ms, limit).await
+    }
+
+    async fn playback_events(
+        &self,
+        query: &PlaybackEventQuery,
+    ) -> Result<Vec<PlaybackEvent>, StoreError> {
+        self.telemetry.events(query.clone()).await
     }
 }
 

@@ -141,7 +141,7 @@ def node_section(out, sys_info):
         out("  M2: the probe never ran, so nothing is known about GPU tone-mapping here.")
 
 
-def log_section(out, logs, cache_settings, srv=None):
+def log_section(out, logs, cache_settings, srv=None, playback_events=None):
     """What actually ran, and what the browsers measured."""
     lines = [clean(e.get("message", "")) for e in logs]
 
@@ -298,13 +298,22 @@ def log_section(out, logs, cache_settings, srv=None):
     # whole tail. Older servers printed both as `ttff_ms`; there is nothing to
     # be done about those logs except know it.
     ttff = []
-    for l in lines:
-        m = re.search(r"\bttff_ms=(\d+)", l)
-        if m:
-            method = (re.search(r"method=(\w+)", l) or [None, "?"])[1]
-            reason = (re.search(r"attempt=[^/]*/(\S+)", l) or [None, "?"])[1]
-            ttff.append((int(m.group(1)), method, reason))
-    out("")
+    if playback_events is not None:
+        for event in playback_events:
+            if event.get("event") == "ttff" and event.get("ms") is not None:
+                ttff.append((int(event["ms"]), event.get("method") or "?",
+                             event.get("reason") or "?"))
+        out("")
+        out("playback measurement source: durable playback_events table (last 7 days)")
+    else:
+        for l in lines:
+            m = re.search(r"\bttff_ms=(\d+)", l)
+            if m:
+                method = (re.search(r"method=(\w+)", l) or [None, "?"])[1]
+                reason = (re.search(r"attempt=[^/]*/(\S+)", l) or [None, "?"])[1]
+                ttff.append((int(m.group(1)), method, reason))
+        out("")
+        out("playback measurement source: log ring fallback (server has no table endpoint)")
     out(f"playback starts measured: {len(ttff)}")
     if ttff:
         vals = sorted(v[0] for v in ttff)
@@ -394,19 +403,36 @@ def log_section(out, logs, cache_settings, srv=None):
         out("")
         out("  decode: hardware, per the browser's own mediaCapabilities verdict.")
 
-    stalls = [l for l in lines if re.search(r"client\S* stall\b", l)]
+    stalls = ([event for event in playback_events if event.get("event") == "stall"]
+              if playback_events is not None else
+              [l for l in lines if re.search(r"client\S* stall\b", l)])
     if stalls:
         kinds = {}
-        for l in stalls:
-            k = "supply" if "[supply]" in l else "decode" if "[decode]" in l else "?"
+        for stall in stalls:
+            detail = ((stall.get("detail") or "") if isinstance(stall, dict) else stall)
+            k = "supply" if "supply" in detail else "decode" if "decode" in detail else "?"
             kinds[k] = kinds.get(k, 0) + 1
         out("")
         out(f"stalls reported by clients: {len(stalls)} "
             f"({' · '.join(f'{n} {k}' for k, n in sorted(kinds.items()))})")
         if kinds.get("supply"):
             out("  supply = the client ran dry. Server or link, not the browser.")
-        for l in stalls[-8:]:
-            out("  " + l[:220])
+        for stall in stalls[-8:]:
+            if isinstance(stall, dict):
+                out("  " + json.dumps({k: stall.get(k) for k in
+                                        ("at_unix_ms", "method", "ms", "runway_ds",
+                                         "speed_recent", "ahead_seconds", "delivered_bps",
+                                         "readrate", "detail")}, separators=(",", ":")))
+            else:
+                out("  " + stall[:220])
+
+    if playback_events is not None:
+        resumes = [event for event in playback_events
+                   if event.get("event") == "resume" and event.get("ms")]
+        if resumes:
+            out("")
+            out(f"encoder holds: {len(resumes)} completed · "
+                f"{sum(int(event['ms']) for event in resumes)/1000:.1f}s suspended")
 
     produced = [l for l in lines if "pre-transcode published" in l]
     out("")
@@ -801,6 +827,11 @@ def main():
     st, logs = srv.call("/system/logs?level=debug&limit=2000")
     if not isinstance(logs, list):
         logs = []
+    since_ms = int((time.time() - 7 * 24 * 60 * 60) * 1000)
+    st, playback_events = srv.call(
+        f"/system/playback-events?since={since_ms}&limit=2000")
+    if st != 200 or not isinstance(playback_events, list):
+        playback_events = None
 
     out("=" * 72)
     out(f"plurx perf report · {datetime.now(timezone.utc).isoformat(timespec='seconds')}")
@@ -817,7 +848,8 @@ def main():
     storage_section(out, sys_info, settings if isinstance(settings, dict) else {})
     out("")
     out("-- what ran, and what it cost --------------------------------------")
-    log_section(out, logs, settings if isinstance(settings, dict) else {}, srv)
+    log_section(out, logs, settings if isinstance(settings, dict) else {}, srv,
+                playback_events)
 
     if rc_lines:
         out("")

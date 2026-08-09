@@ -731,6 +731,50 @@ pub struct MediaShape {
     pub max_bitrate: Option<i64>,
 }
 
+/// One persisted playback observation, joined with node-local server truth at
+/// ingest when the client names a live session.
+///
+/// `id = 0` means an unpersisted event; stores assign and return the durable
+/// row id. Optional columns are intentional: client and server emitters know
+/// different facts, and absence must remain distinguishable from zero.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct PlaybackEvent {
+    pub id: i64,
+    pub at_unix_ms: i64,
+    pub user_id: Option<i64>,
+    pub session_id: Option<String>,
+    pub file_id: Option<i64>,
+    pub event: String,
+    pub level: Option<String>,
+    pub method: Option<String>,
+    pub encoder: Option<String>,
+    pub height: Option<i64>,
+    pub ms: Option<i64>,
+    pub runway_ds: Option<i64>,
+    pub bandwidth_kbps: Option<i64>,
+    pub speed_recent: Option<f64>,
+    pub ahead_seconds: Option<i64>,
+    pub suspended: Option<bool>,
+    pub hold_reason: Option<String>,
+    pub delivered_bps: Option<i64>,
+    /// Effective ffmpeg input pace, as a multiple of realtime. `0` means the
+    /// session is unpaced; a legacy `-re` session records `1`.
+    pub readrate: Option<f64>,
+    pub detail: Option<String>,
+    pub attempt: Option<String>,
+    pub reason: Option<String>,
+    pub ua: Option<String>,
+    pub extra: Option<String>,
+}
+
+/// Bounded query for the operator telemetry reader.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlaybackEventQuery {
+    pub since_ms: Option<i64>,
+    pub event: Option<String>,
+    pub limit: i64,
+}
+
 /// A user's linked Trakt account (tokens + sync bookkeeping).
 #[derive(Debug, Clone)]
 pub struct TraktAuth {

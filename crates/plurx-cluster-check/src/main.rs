@@ -18,13 +18,14 @@ use hiqlite::tls::ServerTlsConfig;
 use hiqlite::{Client, Node, NodeConfig};
 use plurx_core::domain::{
     ItemKind, ItemSort, LibraryKind, MetadataPatch, NewItem, NewLibrary, NewOfflinePackage,
-    OfflineCreateOutcome, OfflineLeaseOutcome, ProbeResult, TraktAuth,
+    OfflineCreateOutcome, OfflineLeaseOutcome, PlaybackEvent, PlaybackEventQuery, ProbeResult,
+    TraktAuth,
 };
 use plurx_core::store::{
     ApiKeyStore, ClusterCompatibility, HiqliteAuthStore, LibraryStore, MediaStore,
-    OfflinePackageStore, ReconcileOutcome, RootFingerprintStatus, SettingsStore, TraktStore,
-    TranscodeCacheStore, UserStore, WatchStore, WatchedOutboxStore, AUTH_PROTOCOL_VERSION,
-    AUTH_SCHEMA_VERSION,
+    OfflinePackageStore, PlaybackTelemetryStore, ReconcileOutcome, RootFingerprintStatus,
+    SettingsStore, TraktStore, TranscodeCacheStore, UserStore, WatchStore, WatchedOutboxStore,
+    AUTH_PROTOCOL_VERSION, AUTH_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -90,6 +91,7 @@ async fn run_failure_case(target: FailureTarget) -> Result<()> {
             .require_ok()?;
     }
     cluster.wait_for_three_voters().await?;
+    prove_local_telemetry_sidecars(&mut cluster).await?;
 
     // Every voter exercises an immediate cache read after its acknowledged
     // write. Record the current leader so the harness explicitly proves that
@@ -219,6 +221,8 @@ enum Request {
     Bootstrap,
     RejectIdentityDrift,
     Open,
+    RecordLocalTelemetry { marker: String },
+    CountLocalTelemetry { marker: String },
     Exercise { ordinal: u64 },
     PostLossWrite { target: String },
     VerifyProof,
@@ -237,6 +241,9 @@ enum Response {
         node_id: u64,
     },
     Ok,
+    TelemetryCount {
+        count: usize,
+    },
     Dump {
         digest: String,
         dump: String,
@@ -251,6 +258,44 @@ enum Response {
     Error {
         message: String,
     },
+}
+
+async fn prove_local_telemetry_sidecars(cluster: &mut ClusterProcesses) -> Result<()> {
+    let marker = "voter-1-restart-proof".to_owned();
+    cluster
+        .request(
+            1,
+            Request::RecordLocalTelemetry {
+                marker: marker.clone(),
+            },
+        )
+        .await?
+        .require_ok()?;
+    for node_id in 1..=3 {
+        let expected = usize::from(node_id == 1);
+        match cluster
+            .request(
+                node_id,
+                Request::CountLocalTelemetry {
+                    marker: marker.clone(),
+                },
+            )
+            .await?
+        {
+            Response::TelemetryCount { count } if count == expected => {}
+            response => {
+                bail!("voter {node_id} local telemetry count was not {expected}: {response:?}")
+            }
+        }
+    }
+    cluster.request(1, Request::Open).await?.require_ok()?;
+    match cluster
+        .request(1, Request::CountLocalTelemetry { marker })
+        .await?
+    {
+        Response::TelemetryCount { count: 1 } => Ok(()),
+        response => bail!("voter-1 telemetry did not survive reopen: {response:?}"),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -727,12 +772,16 @@ async fn node(launch: NodeLaunch) -> Result<()> {
     })
     .await?;
 
+    let telemetry_path = launch
+        .root
+        .join(format!("node-{}", launch.node_id))
+        .join("telemetry.db");
     let mut store: Option<HiqliteAuthStore> = None;
     let stdin = tokio::io::stdin();
     let mut input = BufReader::new(stdin).lines();
     while let Some(line) = input.next_line().await? {
         let response = match serde_json::from_str::<Request>(&line) {
-            Ok(request) => handle_request(request, &client, &mut store).await,
+            Ok(request) => handle_request(request, &client, &telemetry_path, &mut store).await,
             Err(error) => Err(error.into()),
         };
         match response {
@@ -751,23 +800,52 @@ async fn node(launch: NodeLaunch) -> Result<()> {
 async fn handle_request(
     request: Request,
     client: &Client,
+    telemetry_path: &Path,
     store: &mut Option<HiqliteAuthStore>,
 ) -> Result<Response> {
     match request {
         Request::Bootstrap => {
-            *store = Some(HiqliteAuthStore::bootstrap(client.clone(), INSTANCE_ID).await?);
+            *store = Some(
+                HiqliteAuthStore::bootstrap(client.clone(), INSTANCE_ID, telemetry_path).await?,
+            );
             Ok(Response::Ok)
         }
         Request::RejectIdentityDrift => {
-            match HiqliteAuthStore::bootstrap(client.clone(), "wrong-instance-id").await {
+            match HiqliteAuthStore::bootstrap(client.clone(), "wrong-instance-id", telemetry_path)
+                .await
+            {
                 Err(error) if error.to_string().contains("refusing bootstrap") => Ok(Response::Ok),
                 Err(error) => bail!("identity drift failed for the wrong reason: {error}"),
                 Ok(_) => bail!("bootstrap overwrote the immutable cluster identity"),
             }
         }
         Request::Open => {
-            *store = Some(HiqliteAuthStore::open(client.clone()).await?);
+            *store = Some(HiqliteAuthStore::open(client.clone(), telemetry_path).await?);
             Ok(Response::Ok)
+        }
+        Request::RecordLocalTelemetry { marker } => {
+            store_ref(store)?
+                .record_playback_event(&PlaybackEvent {
+                    at_unix_ms: 1_700_000_000_000,
+                    event: "cluster_sidecar_marker".to_owned(),
+                    detail: Some(marker),
+                    ..PlaybackEvent::default()
+                })
+                .await?;
+            Ok(Response::Ok)
+        }
+        Request::CountLocalTelemetry { marker } => {
+            let count = store_ref(store)?
+                .playback_events(&PlaybackEventQuery {
+                    event: Some("cluster_sidecar_marker".to_owned()),
+                    limit: 100,
+                    ..PlaybackEventQuery::default()
+                })
+                .await?
+                .into_iter()
+                .filter(|event| event.detail.as_deref() == Some(marker.as_str()))
+                .count();
+            Ok(Response::TelemetryCount { count })
         }
         Request::Exercise { ordinal } => {
             exercise(store_ref(store)?, ordinal).await?;

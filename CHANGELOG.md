@@ -8,6 +8,20 @@ bump may break compatibility and a **patch** bump never does.
 
 ## [Unreleased]
 
+### Added
+
+- **Performance II N0 makes playback telemetry durable and queryable.** Client
+  beacons keep their existing human log lines and additionally enter a bounded,
+  node-local `playback_events` table with live session speed, runway, hold,
+  delivery-rate, and pacing context. The server records session lifecycle,
+  suspend/resume, playlist-slide, and producer-pass events; exposes an
+  admin-only reader, a seven-day System card, and bounded Prometheus playback
+  series; and prunes rows daily under `telemetry.retain_days` (30 days by
+  default, `0` fully disables row writes and pruning). Hiqlite voters use
+  independent sidecars, never Raft, with restart and non-replication coverage.
+  `scripts/perf-report` prefers the durable reader and falls back to the log
+  ring on older servers.
+
 ## [0.2.7] — 2026-08-09
 
 ### Added

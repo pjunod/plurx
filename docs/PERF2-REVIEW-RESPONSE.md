@@ -149,8 +149,9 @@ The §13 table now runs: N0 → N1 harness → N1 → N4 harness/priors → N4 �
 N2 → N3.0 spike → N3 → N5.1 (container abstraction included) → background
 lanes, with the container work explicitly before any HEVC/AV1 prefix.
 Effort labels updated per the review's table (N1 medium, N3 largest, N4
-medium-large, N5.1 large). Migration versions are unique: v16 telemetry
-(N0), v17 cache artifact kind/manifest (N3).
+medium-large, N5.1 large). Migration versions are unique. Implementation found
+that main already contained the offline-package v16 migration, so the ratified
+numbering is v17 telemetry (N0) and v18 cache artifact kind/manifest (N3).
 
 ## Retained from the review's clean list
 

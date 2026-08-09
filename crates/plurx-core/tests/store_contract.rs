@@ -26,8 +26,8 @@ use hiqlite::tls::ServerTlsConfig;
 use hiqlite::{Client, Node, NodeConfig};
 use plurx_core::domain::{
     scopes, ArtworkAttempt, ItemEdit, ItemKind, ItemSort, LibraryKind, MetadataPatch, NewItem,
-    NewLibrary, NewOfflinePackage, OfflineCreateOutcome, OfflineLeaseOutcome, ProbeResult,
-    TraktAuth,
+    NewLibrary, NewOfflinePackage, OfflineCreateOutcome, OfflineLeaseOutcome, PlaybackEvent,
+    PlaybackEventQuery, ProbeResult, TraktAuth,
 };
 #[cfg(feature = "hiqlite-store")]
 use plurx_core::store::HiqliteAuthStore;
@@ -179,6 +179,11 @@ const OFFLINE_METHODS: &[&str] = &[
     "delete_offline_package",
     "expire_offline_packages",
 ];
+const TELEMETRY_METHODS: &[&str] = &[
+    "record_playback_event",
+    "prune_playback_events",
+    "playback_events",
+];
 
 struct StoreFixture {
     name: &'static str,
@@ -228,7 +233,8 @@ where
         )
         .await
         .expect("connect contract client to three voters");
-        let store = HiqliteAuthStore::bootstrap(client, CONTRACT_INSTANCE_ID)
+        let telemetry_path = cluster._root.path().join("contract-client-telemetry.db");
+        let store = HiqliteAuthStore::bootstrap(client, CONTRACT_INSTANCE_ID, &telemetry_path)
             .await
             .expect("bootstrap contract store");
         store
@@ -427,17 +433,90 @@ fn contract_inventory_matches_every_store_method() {
         OUTBOX_METHODS,
         CACHE_METHODS,
         OFFLINE_METHODS,
+        TELEMETRY_METHODS,
     ]
     .into_iter()
     .flatten()
     .copied()
     .collect::<BTreeSet<_>>();
 
-    assert_eq!(declared.len(), 120, "review the Store method count");
+    assert_eq!(declared.len(), 123, "review the Store method count");
     assert_eq!(
         covered, declared,
         "the declared async method name inventory changed"
     );
+}
+
+#[tokio::test]
+async fn playback_telemetry_contract_runs_through_dyn_store() {
+    for_each_backend(|store, backend| async move {
+        let first = PlaybackEvent {
+            at_unix_ms: 1_700_000_000_000,
+            user_id: Some(7),
+            session_id: Some("session-a".to_owned()),
+            event: "ttff".to_owned(),
+            ms: Some(684),
+            ..PlaybackEvent::default()
+        };
+        let second = PlaybackEvent {
+            at_unix_ms: 1_700_000_001_000,
+            user_id: Some(7),
+            session_id: Some("session-a".to_owned()),
+            event: "stall".to_owned(),
+            ms: Some(4584),
+            ..PlaybackEvent::default()
+        };
+        let first_id = store
+            .record_playback_event(&first)
+            .await
+            .expect("record first telemetry row");
+        let second_id = store
+            .record_playback_event(&second)
+            .await
+            .expect("record second telemetry row");
+        assert!(first_id > 0 && second_id > first_id, "backend {backend}");
+
+        let ttff = store
+            .playback_events(&PlaybackEventQuery {
+                event: Some("ttff".to_owned()),
+                limit: 10,
+                ..PlaybackEventQuery::default()
+            })
+            .await
+            .expect("query telemetry by event");
+        assert_eq!(ttff.len(), 1, "backend {backend}");
+        assert_eq!(ttff[0].id, first_id, "backend {backend}");
+
+        let newest = store
+            .playback_events(&PlaybackEventQuery {
+                since_ms: Some(first.at_unix_ms),
+                limit: 1,
+                ..PlaybackEventQuery::default()
+            })
+            .await
+            .expect("query newest telemetry row");
+        assert_eq!(newest.len(), 1, "backend {backend}");
+        assert_eq!(newest[0].id, second_id, "backend {backend}");
+
+        assert_eq!(
+            store
+                .prune_playback_events(second.at_unix_ms, 1)
+                .await
+                .expect("bounded telemetry prune"),
+            1,
+            "backend {backend}"
+        );
+        let remaining = store
+            .playback_events(&PlaybackEventQuery {
+                limit: 10,
+                ..PlaybackEventQuery::default()
+            })
+            .await
+            .expect("query remaining telemetry");
+        assert_eq!(remaining.len(), 1, "backend {backend}");
+        assert_eq!(remaining[0].id, second_id, "backend {backend}");
+    })
+    .await;
 }
 
 #[tokio::test]
