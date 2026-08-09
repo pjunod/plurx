@@ -206,12 +206,18 @@ def _is_test_path(path: str) -> bool:
     )
 
 
-def discover_issues(root: Path, catalog: Catalog) -> tuple[IssueCommit, ...]:
+def discover_issues(
+    root: Path,
+    catalog: Catalog,
+    explicit_prefixes: tuple[str, ...] = (),
+) -> tuple[IssueCommit, ...]:
     issues: list[IssueCommit] = []
     history = _git(root, "log", "--no-merges", "--format=%H%x09%s")
     for line in history.splitlines():
         sha, subject = line.split("\t", 1)
-        if not ISSUE_RE.search(subject):
+        if not ISSUE_RE.search(subject) and not any(
+            sha.startswith(prefix) for prefix in explicit_prefixes
+        ):
             continue
         paths = tuple(
             path
@@ -257,8 +263,11 @@ def audit_history(
     client_fixes_path: Path | None = None,
 ) -> HistoryReport:
     catalog = catalog or load_catalog()
-    issues = discover_issues(root, catalog)
     entries = load_coverage(coverage_path)
+    explicit_prefixes = tuple(
+        prefix for entry in entries for prefix in entry.commits
+    )
+    issues = discover_issues(root, catalog, explicit_prefixes)
     client_fixes = load_client_fixes(
         client_fixes_path or root / "tests" / "client-fixes.toml"
     )
@@ -288,7 +297,7 @@ def audit_history(
             matches_sha = tuple(sha for sha in by_sha if sha.startswith(prefix))
             if len(matches_sha) != 1:
                 errors.append(
-                    f"{where} commit {prefix} matches {len(matches_sha)} corrective commits"
+                    f"{where} commit {prefix} matches {len(matches_sha)} audited commits"
                 )
                 continue
             sha = matches_sha[0]
