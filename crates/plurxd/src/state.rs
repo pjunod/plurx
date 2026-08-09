@@ -8,7 +8,7 @@ use std::time::Instant;
 
 #[cfg(test)]
 use plurx_core::domain::ArtworkAttempt;
-use plurx_core::domain::{Item, Library, LibraryKind, MetadataPatch};
+use plurx_core::domain::{Item, Library, LibraryKind, MetadataPatch, PlaybackEvent};
 use plurx_core::error::StoreError;
 use plurx_core::metadata::genres::GenreBackfillReport;
 use plurx_core::metadata::local::LocalArtReport;
@@ -51,6 +51,8 @@ pub struct SystemInfo {
     /// and "the driver refused the graph" are the difference between shrugging
     /// and installing a package.
     pub tone_map: crate::pipeprobe::PipelineReport,
+    /// Input-pacing flags proved against this exact ffmpeg binary at boot.
+    pub pacing: crate::ffmpeg::PacingCaps,
     /// Whether this ffmpeg can strip a Dolby Vision configuration
     /// (`dovi_rpu`, 7.1+) — probed at boot, not inferred from the version
     /// line. It decides a *verdict*, not just a filter argument: without it a
@@ -1302,6 +1304,13 @@ impl JobManager {
             last_artwork_retry: self.job_stamp(keys::JOB_LAST_ARTWORK_RETRY).await,
             transcode_cleanup_mins: self.job_interval(keys::JOB_TRANSCODE_CLEANUP_MINS).await,
             last_transcode_cleanup: self.job_stamp(keys::JOB_LAST_TRANSCODE_CLEANUP).await,
+            telemetry_retain_days: self
+                .job_interval_or(
+                    keys::TELEMETRY_RETAIN_DAYS,
+                    keys::TELEMETRY_RETAIN_DEFAULT_DAYS,
+                )
+                .await,
+            last_telemetry_prune: self.job_stamp(keys::JOB_LAST_TELEMETRY_PRUNE).await,
             cache_produce_mins: self.job_interval(keys::JOB_CACHE_PRODUCE_MINS).await,
             last_cache_produce: self.job_stamp(keys::JOB_LAST_CACHE_PRODUCE).await,
         };
@@ -1362,6 +1371,13 @@ impl JobManager {
                         .await;
                     }
                 }
+                DueJob::PruneTelemetry => {
+                    let removed = self.prune_telemetry(now()).await?;
+                    self.stamp(keys::JOB_LAST_TELEMETRY_PRUNE).await;
+                    if removed > 0 {
+                        tracing::info!(removed, "pruned aged playback telemetry");
+                    }
+                }
                 DueJob::ProduceCache => {
                     self.stamp(keys::JOB_LAST_CACHE_PRODUCE).await;
                     // Spawned rather than run inline: this one takes hours, and
@@ -1399,6 +1415,36 @@ impl JobManager {
         if let Err(e) = self.sweep_artwork().await {
             tracing::warn!(error = %e, "artwork retry sweep failed");
         }
+    }
+
+    /// Delete a bounded amount of expired telemetry. Ten small batches keep a
+    /// long-disabled node from monopolizing SQLite when retention is re-armed;
+    /// another daily pass continues the backlog without an unbounded delete.
+    async fn prune_telemetry(&self, now_secs: i64) -> Result<u64, StoreError> {
+        const BATCH: i64 = 1_000;
+        const MAX_BATCHES: usize = 10;
+        let retain_days = self
+            .job_interval_or(
+                keys::TELEMETRY_RETAIN_DAYS,
+                keys::TELEMETRY_RETAIN_DEFAULT_DAYS,
+            )
+            .await;
+        if retain_days <= 0 {
+            return Ok(0);
+        }
+        let before_ms = now_secs
+            .saturating_sub(retain_days.saturating_mul(24 * 60 * 60))
+            .saturating_mul(1_000);
+        let mut removed = 0;
+        for _ in 0..MAX_BATCHES {
+            let batch = self.store.prune_playback_events(before_ms, BATCH).await?;
+            removed += batch;
+            if batch < BATCH as u64 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        Ok(removed)
     }
 
     /// One paced, resumable pass of the genre backfill (S3).
@@ -1452,6 +1498,7 @@ impl JobManager {
     async fn produce_pass(self: Arc<Self>, transcode: Arc<TranscodeManager>) {
         use crate::produce;
         let Some((root, node)) = transcode.cache_location() else {
+            self.emit_producer_pass(0, 0, serde_json::json!({"unavailable": 1}));
             return;
         };
         // One at a time. Two passes would fight for the same slots and the
@@ -1459,6 +1506,7 @@ impl JobManager {
         // both had spawned encoders.
         if self.producing.swap(true, Ordering::Relaxed) {
             tracing::debug!("a producer pass is already running; skipping this one");
+            self.emit_producer_pass(0, 1, serde_json::json!({"already_running": 1}));
             return;
         }
         let _running = ProducingGuard(Arc::clone(&self));
@@ -1476,6 +1524,7 @@ impl JobManager {
         .await;
         if crate::cachekeep::budget_bytes(&self.store).await.is_none() {
             tracing::debug!("cache is switched off; nothing to produce");
+            self.emit_producer_pass(0, 1, serde_json::json!({"cache_off": 1}));
             return;
         }
 
@@ -1483,6 +1532,7 @@ impl JobManager {
             Ok(users) => users,
             Err(e) => {
                 tracing::warn!(error = %e, "producer: cannot list users");
+                self.emit_producer_pass(0, 1, serde_json::json!({"store_error": 1}));
                 return;
             }
         };
@@ -1535,6 +1585,7 @@ impl JobManager {
 
         let candidates = produce::rank(&rails, PRODUCE_MAX_PER_PASS);
         if candidates.is_empty() {
+            self.emit_producer_pass(0, 0, serde_json::json!({"no_candidates": 1}));
             return;
         }
         let deadline = std::time::Instant::now() + PRODUCE_WINDOW;
@@ -1544,19 +1595,30 @@ impl JobManager {
             "pre-transcode pass starting"
         );
         let total = candidates.len();
+        let mut produced = 0_u64;
+        let mut skipped = 0_u64;
+        let mut reasons = std::collections::BTreeMap::<&'static str, u64>::new();
         for (i, c) in candidates.into_iter().enumerate() {
             if std::time::Instant::now() >= deadline {
                 tracing::info!("pre-transcode pass out of time");
+                skipped += (total - i) as u64;
+                reasons.insert("deadline", (total - i) as u64);
                 break;
             }
             if self.stop_producing.load(Ordering::Relaxed) {
                 tracing::info!("pre-transcode pass stopped by request");
+                skipped += (total - i) as u64;
+                reasons.insert("stopped", (total - i) as u64);
                 break;
             }
             let Ok(Some(file)) = self.store.get_file(c.file_id).await else {
+                skipped += 1;
+                *reasons.entry("missing_file").or_default() += 1;
                 continue;
             };
             if !produce::worth_producing(&file) {
+                skipped += 1;
+                *reasons.entry("not_worth_producing").or_default() += 1;
                 continue;
             }
             // Published BEFORE the encode starts, not after it finishes. The
@@ -1581,6 +1643,7 @@ impl JobManager {
             let height = transcode.auto_height(file.height).await;
             match transcode.produce(&file, height, deadline).await {
                 Ok(Some(made)) => {
+                    produced += 1;
                     tracing::info!(
                         recipe = %made.recipe, title = %c.title, reason = c.reason, height,
                         minutes = made.duration_ms / 60_000, segments = made.segments,
@@ -1588,13 +1651,41 @@ impl JobManager {
                         "pre-transcoded"
                     );
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    skipped += 1;
+                    *reasons.entry("already_cached_or_claimed").or_default() += 1;
+                }
                 Err(e) => {
+                    skipped += 1;
+                    *reasons.entry("failed").or_default() += 1;
                     tracing::warn!(title = %c.title, error = %e, "pre-transcode failed");
                 }
             }
             self.set_producing(None).await;
         }
+        self.emit_producer_pass(produced, skipped, serde_json::json!(reasons));
+    }
+
+    fn emit_producer_pass(&self, produced: u64, skipped: u64, reasons: serde_json::Value) {
+        crate::telemetry::emit(
+            Arc::clone(&self.store),
+            PlaybackEvent {
+                at_unix_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+                    .unwrap_or(0),
+                event: "producer_pass".to_owned(),
+                extra: Some(
+                    serde_json::json!({
+                        "produced": produced,
+                        "skipped": skipped,
+                        "reasons": reasons,
+                    })
+                    .to_string(),
+                ),
+                ..PlaybackEvent::default()
+            },
+        );
     }
 
     /// Give every enriched item that still has incomplete artwork another go.
@@ -1742,14 +1833,14 @@ impl JobManager {
     /// [`job_interval`](Self::job_interval) with a different reading of
     /// "absent". A stored `0` still means off — an admin who turned a job off
     /// must not have it turned back on by a default.
-    async fn job_interval_or(&self, key: &str, default_mins: i64) -> i64 {
+    async fn job_interval_or(&self, key: &str, default_value: i64) -> i64 {
         self.store
             .get_setting(key)
             .await
             .ok()
             .flatten()
             .and_then(|v| v.trim().parse::<i64>().ok())
-            .unwrap_or(default_mins)
+            .unwrap_or(default_value)
             .max(0)
     }
 
@@ -1792,8 +1883,10 @@ fn error_status(message: &str) -> ScanStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use plurx_core::domain::{ItemKind, NewItem, NewLibrary};
-    use plurx_core::store::{LibraryStore, MediaStore, SettingsStore, SqliteStore};
+    use plurx_core::domain::{ItemKind, NewItem, NewLibrary, PlaybackEventQuery};
+    use plurx_core::store::{
+        LibraryStore, MediaStore, PlaybackTelemetryStore, SettingsStore, SqliteStore,
+    };
     use plurx_core::transcode::Pipeline;
     use serde_json::json;
     use std::sync::atomic::AtomicUsize;
@@ -2498,6 +2591,53 @@ mod tests {
         })
         .await
         .expect("artwork pass finished");
+    }
+
+    #[tokio::test]
+    async fn scheduled_telemetry_prune_is_aged_bounded_and_stamped() {
+        let store = Arc::new(SqliteStore::open_in_memory().expect("store"));
+        let now_secs = now();
+        for (name, at) in [
+            ("expired", (now_secs - 31 * 24 * 60 * 60) * 1_000),
+            ("kept", (now_secs - 29 * 24 * 60 * 60) * 1_000),
+        ] {
+            store
+                .record_playback_event(&PlaybackEvent {
+                    at_unix_ms: at,
+                    event: name.to_owned(),
+                    ..PlaybackEvent::default()
+                })
+                .await
+                .expect("seed telemetry");
+        }
+        let artwork = tempfile::tempdir().expect("artwork");
+        let transcode_dir = tempfile::tempdir().expect("transcode");
+        let jobs = manager(store.clone(), artwork.path());
+        let transcode = Arc::new(TranscodeManager::new(
+            store.clone(),
+            transcode_dir.path().join("work"),
+            EncoderCaps::default(),
+            Pipeline::Cpu,
+        ));
+
+        jobs.run_due_jobs(&transcode).await.expect("scheduler tick");
+        let events = store
+            .playback_events(&PlaybackEventQuery {
+                limit: 10,
+                ..PlaybackEventQuery::default()
+            })
+            .await
+            .expect("remaining telemetry");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, "kept");
+        assert!(
+            store
+                .get_setting(keys::JOB_LAST_TELEMETRY_PRUNE)
+                .await
+                .expect("prune stamp")
+                .is_some(),
+            "the scheduler persists the prune clock"
+        );
     }
 
     /// Production shape: the known show has a poster and an enrichment stamp,

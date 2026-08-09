@@ -69,6 +69,7 @@ pub fn router(state: AppState) -> Router {
         .route("/trakt/sync", post(trakt::sync_now))
         .route("/system", get(system::system_info))
         .route("/system/logs", get(system::logs))
+        .route("/system/playback-events", get(system::playback_events))
         // What the libraries hold, in transcoder terms — the census PERF-PLAN
         // §5 needs to say whether the GPU tone-map reaches a real library.
         .route("/system/library-shape", get(system::library_shape))
@@ -2408,6 +2409,68 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
+
+        // Persistence is asynchronous by contract: poll the admin reader, not
+        // the handler response, and prove the accepted report became a row.
+        let mut rows = serde_json::Value::Null;
+        for _ in 0..50 {
+            let (read_status, body) = call(
+                &app,
+                get(
+                    "/api/v1/system/playback-events?event=playback_failed&limit=5000",
+                    Some(&admin),
+                ),
+            )
+            .await;
+            assert_eq!(read_status, StatusCode::OK);
+            if body.as_array().is_some_and(|rows| !rows.is_empty()) {
+                rows = body;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let row = rows
+            .as_array()
+            .and_then(|rows| rows.first())
+            .expect("client log was persisted asynchronously");
+        assert_eq!(row["event"], "playback_failed");
+        assert_eq!(row["method"], "remux");
+        assert!(row["user_id"].as_i64().is_some());
+        assert!(row["speed_recent"].is_null(), "no live session was joined");
+
+        let (status, _) = call(&app, get("/api/v1/system/playback-events", None)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let (status, _) = call(
+            &app,
+            put(
+                "/api/v1/settings",
+                Some(&admin),
+                json!({ "telemetry_retain_days": 0 }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = call(
+            &app,
+            post(
+                "/api/v1/client-log",
+                Some(&admin),
+                json!({ "event": "disabled_telemetry_proof", "message": "still logs" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        let (_, body) = call(
+            &app,
+            get(
+                "/api/v1/system/playback-events?event=disabled_telemetry_proof",
+                Some(&admin),
+            ),
+        )
+        .await;
+        assert_eq!(body.as_array().map(Vec::len), Some(0));
 
         // A near-empty body is tolerated too (all fields optional).
         let (status, _) = call(&app, post("/api/v1/client-log", Some(&admin), json!({}))).await;

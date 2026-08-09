@@ -31,6 +31,8 @@ pub enum DueJob {
     RetryArtwork,
     /// Delete transcode working directories no live session owns.
     CleanupTranscode,
+    /// Delete aged node-local playback telemetry in bounded batches.
+    PruneTelemetry,
     /// Pre-transcode what somebody is likely to play next (PERF-PLAN §6.2).
     ProduceCache,
 }
@@ -45,6 +47,8 @@ pub struct GlobalSchedule {
     pub last_artwork_retry: Option<i64>,
     pub transcode_cleanup_mins: i64,
     pub last_transcode_cleanup: Option<i64>,
+    pub telemetry_retain_days: i64,
+    pub last_telemetry_prune: Option<i64>,
     pub cache_produce_mins: i64,
     pub last_cache_produce: Option<i64>,
 }
@@ -93,6 +97,9 @@ pub fn due_jobs(now: i64, libraries: &[Library], global: GlobalSchedule) -> Vec<
         global.transcode_cleanup_mins,
     ) {
         jobs.push(DueJob::CleanupTranscode);
+    }
+    if global.telemetry_retain_days > 0 && due(now, global.last_telemetry_prune, 24 * 60) {
+        jobs.push(DueJob::PruneTelemetry);
     }
     // Last, and that is deliberate rather than incidental. This is the only
     // job that competes with live playback for the hardware, so it goes behind
@@ -229,6 +236,27 @@ mod tests {
             due_jobs(NOW, &[lib(1, 60, None, 0, None)], global),
             [DueJob::Scan(1), DueJob::RetryProbes, DueJob::ProduceCache]
         );
+    }
+
+    #[test]
+    fn telemetry_retention_arms_a_daily_trailing_prune() {
+        let global = GlobalSchedule {
+            telemetry_retain_days: 30,
+            last_telemetry_prune: None,
+            cache_produce_mins: 360,
+            last_cache_produce: None,
+            ..GlobalSchedule::default()
+        };
+        assert_eq!(
+            due_jobs(NOW, &[], global),
+            [DueJob::PruneTelemetry, DueJob::ProduceCache]
+        );
+        let disabled = GlobalSchedule {
+            telemetry_retain_days: 0,
+            last_telemetry_prune: None,
+            ..GlobalSchedule::default()
+        };
+        assert!(due_jobs(NOW, &[], disabled).is_empty());
     }
 
     #[test]

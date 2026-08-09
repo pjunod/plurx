@@ -14,6 +14,7 @@ mod library;
 mod media;
 mod offline;
 mod outbox;
+mod telemetry;
 mod trakt;
 mod users;
 mod watch;
@@ -28,6 +29,7 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use super::{keys, SettingsStore};
 use crate::domain::{Item, ItemKind, MediaFile, User};
 use crate::error::StoreError;
+use crate::store::telemetry::PLAYBACK_EVENTS_SCHEMA;
 
 /// Ordered, append-only migration list. `PRAGMA user_version` tracks the last
 /// applied index + 1. Never edit an entry that has shipped — append instead.
@@ -529,6 +531,9 @@ const MIGRATIONS: &[&str] = &[
     DROP INDEX watched_outbox_due;
     CREATE INDEX watched_outbox_due
         ON watched_outbox(status, next_at, claim_until);",
+    // v17: bounded, node-local playback telemetry. No foreign keys on purpose:
+    // events outlive users/files, and retention is strictly age-based.
+    PLAYBACK_EVENTS_SCHEMA,
 ];
 
 /// Highest SQLite schema version this binary can read and migrate.
@@ -944,7 +949,7 @@ impl SettingsStore for SqliteStore {
 mod tests {
     use super::*;
     use crate::domain::MetadataPatch;
-    use crate::store::{MediaStore, SettingsStore, WatchStore};
+    use crate::store::{MediaStore, PlaybackTelemetryStore, SettingsStore, WatchStore};
 
     /// The §3.2 pair: a write on the writer connection is visible to the
     /// read pool at once (WAL read-your-writes across connections), and a
@@ -1128,7 +1133,7 @@ mod tests {
             .expect("version");
         assert_eq!(version, MIGRATIONS.len() as i64);
         assert_eq!(
-            version, 16,
+            version, 17,
             "a new migration must be a deliberate bump, not a surprise — \
              the list is append-only and every entry is one somebody shipped"
         );
@@ -1230,6 +1235,61 @@ mod tests {
             [],
         )
         .expect("home items");
+    }
+
+    #[tokio::test]
+    async fn v17_adds_playback_telemetry_without_touching_v16_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("plurx.db");
+        {
+            let conn = Connection::open(&db).expect("raw open");
+            for (index, sql) in MIGRATIONS.iter().enumerate().take(16) {
+                conn.execute_batch(&format!("BEGIN;\n{sql}\nCOMMIT;"))
+                    .unwrap_or_else(|e| panic!("v{}: {e}", index + 1));
+            }
+            conn.pragma_update(None, "user_version", 16)
+                .expect("version");
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES ('migration.proof', 'survives')",
+                [],
+            )
+            .expect("seed v16 row");
+        }
+
+        let store = SqliteStore::open(&db).expect("migrate v16 to v17");
+        assert_eq!(
+            store
+                .get_setting("migration.proof")
+                .await
+                .expect("read proof")
+                .as_deref(),
+            Some("survives")
+        );
+        let event_id = store
+            .record_playback_event(&crate::domain::PlaybackEvent {
+                at_unix_ms: 1_700_000_000_000,
+                event: "migration_proof".to_owned(),
+                ..crate::domain::PlaybackEvent::default()
+            })
+            .await
+            .expect("write v17 row");
+        assert!(event_id > 0);
+
+        let conn = Connection::open(&db).expect("raw reopen");
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("version");
+        assert_eq!(version, 17);
+        for index in ["playback_events_by_event", "playback_events_by_file"] {
+            let present: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                    [index],
+                    |row| row.get(0),
+                )
+                .expect("index lookup");
+            assert_eq!(present, 1, "missing {index}");
+        }
     }
 
     /// v13 adds a column to `items`, which is the migration shape with a

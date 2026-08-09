@@ -1,14 +1,16 @@
 //! Server identity, first-run setup, settings, and scan status.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use plurx_core::auth;
+use plurx_core::domain::{PlaybackEvent, PlaybackEventQuery};
 use plurx_core::metadata::genres::GenreBackfillReport;
-use plurx_core::store::keys;
+use plurx_core::store::{keys, Store};
 use serde::{Deserialize, Serialize};
 
 use super::auth::LoginResponse;
@@ -317,6 +319,42 @@ pub async fn logs(
     Json(state.logs.tail(&q.level, q.limit.min(2000)))
 }
 
+#[derive(Deserialize)]
+pub struct PlaybackEventsQuery {
+    pub since: Option<i64>,
+    pub event: Option<String>,
+    #[serde(default = "default_playback_event_limit")]
+    pub limit: i64,
+}
+
+fn default_playback_event_limit() -> i64 {
+    500
+}
+
+/// GET /api/v1/system/playback-events (admin) — newest node-local playback
+/// observations first. The Store applies the final 2,000-row cap too, so a
+/// future caller cannot bypass this handler's bound.
+pub async fn playback_events(
+    _admin: AdminUser,
+    State(state): State<AppState>,
+    Query(query): Query<PlaybackEventsQuery>,
+) -> Result<Json<Vec<PlaybackEvent>>, ApiError> {
+    Ok(Json(
+        state
+            .store
+            .playback_events(&bounded_playback_query(query))
+            .await?,
+    ))
+}
+
+fn bounded_playback_query(query: PlaybackEventsQuery) -> PlaybackEventQuery {
+    PlaybackEventQuery {
+        since_ms: query.since,
+        event: query.event,
+        limit: query.limit.clamp(1, 2_000),
+    }
+}
+
 /// A client-side playback problem the browser reports back to the server.
 ///
 /// Why this exists: when a browser refuses a stream — Safari rejecting a codec,
@@ -385,6 +423,10 @@ pub struct ClientLog {
     pub height: Option<i64>,
     /// Encoder the server reported for this session.
     pub encoder: Option<String>,
+    /// Live HLS session to join with node-local server telemetry. Web clients
+    /// historically call this `session`; the alias keeps that field additive.
+    #[serde(alias = "session")]
+    pub session_id: Option<String>,
 }
 
 /// Sustained rate and burst allowance for `/client-log`, in reports per minute.
@@ -394,12 +436,15 @@ pub struct ClientLog {
 /// operator opened the page to read. That is not hypothetical: a stranded
 /// hls.js instance polling a playlist that never ends fires a fatal error on a
 /// timer, and there was no bound on how many of those could pile up.
-const CLIENT_LOG_PER_MIN: u32 = 30;
+const CLIENT_LOG_USER_PER_MIN: u32 = 240;
+const CLIENT_LOG_GLOBAL_PER_MIN: u32 = 1_000;
+const CLIENT_LOG_USER_BUCKETS_MAX: usize = 4_096;
 
-/// Token bucket guarding the log ring. Global rather than per-user: the ring is
-/// global, so it's the total rate that has to be bounded.
+/// One bucket in the two-tier limiter. Per-user buckets prevent one viewer
+/// silencing another; the global bucket bounds total pressure on the log ring.
 struct LogBucket {
     tokens: f64,
+    per_minute: u32,
     /// `None` until the first report — `Instant` has no const constructor.
     last: Option<std::time::Instant>,
     /// Reports dropped since the last admitted one, so the gap is reported
@@ -416,10 +461,10 @@ impl LogBucket {
             .map(|t| now.saturating_duration_since(t).as_secs_f64())
             .unwrap_or(0.0);
         self.last = Some(now);
-        self.tokens = (self.tokens + elapsed * (CLIENT_LOG_PER_MIN as f64 / 60.0))
-            .min(CLIENT_LOG_PER_MIN as f64);
+        self.tokens =
+            (self.tokens + elapsed * (self.per_minute as f64 / 60.0)).min(self.per_minute as f64);
         if self.tokens < 1.0 {
-            self.suppressed += 1;
+            self.suppressed = self.suppressed.saturating_add(1);
             return None;
         }
         self.tokens -= 1.0;
@@ -427,20 +472,79 @@ impl LogBucket {
     }
 }
 
-static CLIENT_LOG_BUCKET: std::sync::Mutex<LogBucket> = std::sync::Mutex::new(LogBucket {
-    tokens: CLIENT_LOG_PER_MIN as f64,
-    last: None,
-    suppressed: 0,
-});
+impl LogBucket {
+    fn new(per_minute: u32) -> Self {
+        Self {
+            tokens: per_minute as f64,
+            per_minute,
+            last: None,
+            suppressed: 0,
+        }
+    }
+}
+
+struct ClientLogLimiter {
+    global: LogBucket,
+    users: HashMap<i64, LogBucket>,
+}
+
+impl ClientLogLimiter {
+    fn new() -> Self {
+        Self {
+            global: LogBucket::new(CLIENT_LOG_GLOBAL_PER_MIN),
+            users: HashMap::new(),
+        }
+    }
+
+    fn admit(&mut self, user_id: i64, now: std::time::Instant) -> Option<u64> {
+        if !self.users.contains_key(&user_id) && self.users.len() >= CLIENT_LOG_USER_BUCKETS_MAX {
+            let oldest_id = self
+                .users
+                .iter()
+                .min_by_key(|(_, bucket)| bucket.last)
+                .map(|(id, _)| *id);
+            if let Some(id) = oldest_id {
+                if let Some(evicted) = self.users.remove(&id) {
+                    self.global.suppressed =
+                        self.global.suppressed.saturating_add(evicted.suppressed);
+                }
+            }
+        }
+        let user_suppressed = self
+            .users
+            .entry(user_id)
+            .or_insert_with(|| LogBucket::new(CLIENT_LOG_USER_PER_MIN))
+            .admit(now)?;
+        match self.global.admit(now) {
+            Some(global_suppressed) => Some(user_suppressed.saturating_add(global_suppressed)),
+            None => {
+                // The global bucket counted this report. Preserve any older
+                // per-user gap that was just collected, so the next admitted
+                // report still prints every suppressed event exactly once.
+                if let Some(bucket) = self.users.get_mut(&user_id) {
+                    bucket.suppressed = bucket.suppressed.saturating_add(user_suppressed);
+                }
+                None
+            }
+        }
+    }
+}
+
+static CLIENT_LOG_LIMITER: std::sync::LazyLock<std::sync::Mutex<ClientLogLimiter>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(ClientLogLimiter::new()));
 
 /// POST /api/v1/client-log — any signed-in user. Records one browser playback
 /// error into the server log ring so it surfaces in `Settings → Logs`. Bounded
 /// by per-field clipping and by a global rate limit (this is diagnostics, not an
 /// audit trail), and tagged with the `plurxd::client` target so it's visibly a
 /// client report.
-pub async fn client_log(_user: AuthUser, Json(ev): Json<ClientLog>) -> StatusCode {
-    let suppressed = match CLIENT_LOG_BUCKET.lock() {
-        Ok(mut b) => b.admit(std::time::Instant::now()),
+pub async fn client_log(
+    AuthUser(user): AuthUser,
+    State(state): State<AppState>,
+    Json(ev): Json<ClientLog>,
+) -> StatusCode {
+    let suppressed = match CLIENT_LOG_LIMITER.lock() {
+        Ok(mut limiter) => limiter.admit(user.id, std::time::Instant::now()),
         // Fail open: a poisoned lock must not silence diagnostics.
         Err(_) => Some(0),
     };
@@ -458,7 +562,105 @@ pub async fn client_log(_user: AuthUser, Json(ev): Json<ClientLog>) -> StatusCod
     } else {
         tracing::warn!(target: "plurxd::client", "{line}");
     }
+
+    let event = client_playback_event(&ev, user.id);
+    let transcode = Arc::clone(&state.transcode);
+    let store = Arc::clone(&state.store);
+    tokio::spawn(async move {
+        let session_id = event.session_id.clone();
+        let info = match session_id.as_deref() {
+            Some(session_id) => transcode.session_status(session_id).await,
+            None => None,
+        };
+        emit_client_playback_event(store, event, info.as_ref());
+    });
     StatusCode::NO_CONTENT
+}
+
+fn join_session_truth(event: &mut PlaybackEvent, info: &crate::transcode::SessionInfo) {
+    event.file_id = Some(info.file_id);
+    event.encoder = Some(info.encoder.to_owned());
+    event.height = Some(info.target_height);
+    event.speed_recent = info.recent_speed;
+    event.ahead_seconds = info.ahead_seconds;
+    event.suspended = Some(info.suspended);
+    event.hold_reason = info.hold_reason.map(|reason| match reason {
+        crate::transcode::AheadHoldReason::Time => "time".to_owned(),
+        crate::transcode::AheadHoldReason::Bytes => "bytes".to_owned(),
+        crate::transcode::AheadHoldReason::Global => "global".to_owned(),
+    });
+    event.delivered_bps = info.delivered_bps;
+    event.readrate = Some(info.readrate);
+}
+
+fn emit_client_playback_event(
+    store: Arc<dyn Store>,
+    mut event: PlaybackEvent,
+    info: Option<&crate::transcode::SessionInfo>,
+) {
+    if let Some(info) = info {
+        join_session_truth(&mut event, info);
+    }
+    crate::telemetry::emit(store, event);
+}
+
+fn client_playback_event(ev: &ClientLog, user_id: i64) -> PlaybackEvent {
+    fn clipped(value: &Option<String>, limit: usize) -> Option<String> {
+        let value = value.as_deref()?.trim();
+        if value.is_empty() {
+            return None;
+        }
+        match value.char_indices().nth(limit) {
+            Some((index, _)) => Some(value[..index].to_owned()),
+            None => Some(value.to_owned()),
+        }
+    }
+    let mut extra = serde_json::Map::new();
+    for (key, value) in [
+        ("message", clipped(&Some(ev.message.clone()), 200)),
+        ("title", clipped(&ev.title, 120)),
+        ("vcodec", clipped(&ev.vcodec, 16)),
+        ("src", clipped(&ev.src, 160)),
+    ] {
+        if let Some(value) = value {
+            extra.insert(key.to_owned(), value.into());
+        }
+    }
+    if let Some(code) = ev.code {
+        extra.insert("code".into(), code.into());
+    }
+    if let Some(value) = ev.decode_hw {
+        extra.insert("decode_hw".into(), value.into());
+    }
+    if let Some(value) = ev.decode_smooth {
+        extra.insert("decode_smooth".into(), value.into());
+    }
+    PlaybackEvent {
+        at_unix_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+            .unwrap_or(0),
+        user_id: Some(user_id),
+        session_id: clipped(&ev.session_id, 80),
+        file_id: ev.file_id,
+        event: clipped(&Some(ev.event.clone()), 40).unwrap_or_else(|| "event".to_owned()),
+        level: clipped(&Some(ev.level.clone()), 16),
+        method: clipped(&ev.method, 16),
+        encoder: clipped(&ev.encoder, 32),
+        height: ev.height.filter(|value| *value > 0),
+        ms: ev.ms.filter(|value| *value >= 0),
+        runway_ds: ev
+            .runway
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .map(|value| (value * 10.0).round().min(i64::MAX as f64) as i64),
+        bandwidth_kbps: ev.bandwidth.filter(|value| *value > 0),
+        detail: clipped(&ev.detail, 200),
+        attempt: clipped(&ev.attempt, 24),
+        reason: clipped(&ev.reason, 24),
+        ua: clipped(&ev.ua, 24),
+        extra: (!extra.is_empty()).then(|| serde_json::Value::Object(extra).to_string()),
+        ..PlaybackEvent::default()
+    }
 }
 
 /// One client report as a log line.
@@ -643,6 +845,8 @@ pub struct SettingsDto {
     /// What the cache currently holds on this node, in bytes — the number that
     /// makes the budget above mean something.
     pub cache_used_bytes: i64,
+    /// Node-local playback event retention. Default 30 days; 0 is fully off.
+    pub telemetry_retain_days: i64,
     /// App-managed offline preparation has a separate reservation budget from
     /// the opportunistic playback cache above.
     pub offline_enabled: bool,
@@ -769,6 +973,13 @@ async fn settings_dto(state: &AppState) -> Result<SettingsDto, ApiError> {
         Some((_, node)) => state.store.cache_bytes(node).await.unwrap_or(0),
         None => 0,
     };
+    let telemetry_retain_days = state
+        .store
+        .get_setting(keys::TELEMETRY_RETAIN_DAYS)
+        .await?
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .unwrap_or(keys::TELEMETRY_RETAIN_DEFAULT_DAYS)
+        .max(0);
     let offline_enabled = !matches!(
         state
             .store
@@ -848,6 +1059,7 @@ async fn settings_dto(state: &AppState) -> Result<SettingsDto, ApiError> {
         cache_produce_mins,
         cache_max_gb,
         cache_used_bytes,
+        telemetry_retain_days,
         offline_enabled,
         offline_max_gb,
         offline_max_gb_per_user,
@@ -900,6 +1112,7 @@ pub struct UpdateSettings {
     pub transcode_cleanup_mins: Option<i64>,
     pub cache_produce_mins: Option<i64>,
     pub cache_max_gb: Option<i64>,
+    pub telemetry_retain_days: Option<i64>,
     pub offline_enabled: Option<bool>,
     pub offline_max_gb: Option<i64>,
     pub offline_max_gb_per_user: Option<i64>,
@@ -1090,6 +1303,17 @@ pub async fn update_settings(
         state
             .store
             .put_setting(keys::CACHE_MAX_GB, &gb.to_string())
+            .await?;
+    }
+    if let Some(days) = req.telemetry_retain_days {
+        if !(0..=3650).contains(&days) {
+            return Err(ApiError::BadRequest(
+                "telemetry_retain_days must be between 0 (off) and 3650".into(),
+            ));
+        }
+        state
+            .store
+            .put_setting(keys::TELEMETRY_RETAIN_DAYS, &days.to_string())
             .await?;
     }
     for (key, label, value) in [
@@ -1764,9 +1988,10 @@ pub async fn metrics(State(state): State<AppState>) -> impl axum::response::Into
          # HELP plurx_users_total Registered users.\n\
          # TYPE plurx_users_total gauge\n\
          plurx_users_total {users}\n\
-         {scans}{offline_metrics}",
+         {scans}{offline_metrics}{playback_metrics}",
         version = crate::version::SEMVER,
         build = crate::version::BUILD,
+        playback_metrics = crate::telemetry::prometheus(),
     );
     (
         [(
@@ -1804,6 +2029,7 @@ mod tests {
             encoder: None,
             decode_hw: None,
             decode_smooth: None,
+            session_id: None,
         }
     }
 
@@ -1825,6 +2051,24 @@ mod tests {
         ev.decode_smooth = Some(false);
         let line = client_log_line(&ev, 0);
         assert!(line.contains(" decode=SOFTWARE/not-smooth"), "{line}");
+    }
+
+    #[test]
+    fn session_identity_does_not_change_the_human_log_line() {
+        let mut event = beacon("ttff", 684);
+        let before = client_log_line(&event, 0);
+        event.session_id = Some("session-a".into());
+        assert_eq!(client_log_line(&event, 0), before);
+    }
+
+    #[test]
+    fn telemetry_retention_does_not_change_the_human_log_surface() {
+        let mut event = beacon("disabled_telemetry_proof", 0);
+        event.message = "still logs".into();
+        assert_eq!(
+            client_log_line(&event, 0),
+            "client disabled_telemetry_proof method=remux: still logs ms=0"
+        );
     }
 
     /// A measurement is named for what it measured.
@@ -1864,14 +2108,10 @@ mod tests {
     #[test]
     fn client_log_bucket_bounds_a_flood_and_counts_the_gap() {
         let t0 = Instant::now();
-        let mut b = LogBucket {
-            tokens: CLIENT_LOG_PER_MIN as f64,
-            last: None,
-            suppressed: 0,
-        };
+        let mut b = LogBucket::new(30);
 
         // The full burst is admitted, nothing suppressed yet.
-        for _ in 0..CLIENT_LOG_PER_MIN {
+        for _ in 0..30 {
             assert_eq!(b.admit(t0), Some(0));
         }
         // The next 500 in the same instant are dropped.
@@ -1890,7 +2130,7 @@ mod tests {
         // A long quiet period refills to the burst cap and no further: an idle
         // client can't bank hours of credit and then dump it.
         let t3 = t2 + Duration::from_secs(3600);
-        for _ in 0..CLIENT_LOG_PER_MIN {
+        for _ in 0..30 {
             assert_eq!(b.admit(t3), Some(0));
         }
         assert_eq!(b.admit(t3), None);
@@ -1901,15 +2141,149 @@ mod tests {
     #[test]
     fn client_log_bucket_passes_a_normal_trickle() {
         let mut now = Instant::now();
-        let mut b = LogBucket {
-            tokens: CLIENT_LOG_PER_MIN as f64,
-            last: None,
-            suppressed: 0,
-        };
+        let mut b = LogBucket::new(30);
         // One report every 5s for an hour: well under 30/min.
         for _ in 0..720 {
             assert_eq!(b.admit(now), Some(0));
             now += Duration::from_secs(5);
         }
+    }
+
+    #[test]
+    fn client_log_limits_are_isolated_per_user() {
+        let now = Instant::now();
+        let mut limiter = ClientLogLimiter::new();
+        for _ in 0..CLIENT_LOG_USER_PER_MIN {
+            assert_eq!(limiter.admit(1, now), Some(0));
+        }
+        assert_eq!(limiter.admit(1, now), None);
+        assert_eq!(
+            limiter.admit(2, now),
+            Some(0),
+            "one user's flood must not silence another user"
+        );
+    }
+
+    #[test]
+    fn client_log_user_bucket_registry_is_bounded() {
+        let now = Instant::now();
+        let mut limiter = ClientLogLimiter::new();
+        for user_id in 0..=CLIENT_LOG_USER_BUCKETS_MAX as i64 {
+            let _ = limiter.admit(user_id, now + Duration::from_nanos(user_id as u64));
+        }
+        assert_eq!(limiter.users.len(), CLIENT_LOG_USER_BUCKETS_MAX);
+        assert!(limiter
+            .users
+            .contains_key(&(CLIENT_LOG_USER_BUCKETS_MAX as i64)));
+        assert!(
+            !limiter.users.contains_key(&0),
+            "the oldest idle bucket was evicted"
+        );
+    }
+
+    #[test]
+    fn client_log_suppression_counts_survive_the_global_ceiling() {
+        let now = Instant::now();
+        let mut limiter = ClientLogLimiter {
+            global: LogBucket::new(1),
+            users: HashMap::from([(1, LogBucket::new(1)), (2, LogBucket::new(1))]),
+        };
+        assert_eq!(limiter.admit(1, now), Some(0));
+        assert_eq!(limiter.admit(1, now), None, "user bucket counts one drop");
+
+        let minute = now + Duration::from_secs(60);
+        assert_eq!(
+            limiter.admit(2, minute),
+            Some(0),
+            "another user consumes the refilled global token"
+        );
+        assert_eq!(
+            limiter.admit(1, minute),
+            None,
+            "user one's recovered token meets the global ceiling"
+        );
+
+        assert_eq!(
+            limiter.admit(1, minute + Duration::from_secs(60)),
+            Some(2),
+            "one per-user and one global drop are both reported"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_event_joins_and_persists_every_live_session_measurement() {
+        let store: Arc<dyn Store> = Arc::new(
+            plurx_core::store::SqliteStore::open_in_memory().expect("telemetry test store"),
+        );
+        let mut beacon = beacon("stall", 900);
+        beacon.session_id = Some("session-a".into());
+        let event = client_playback_event(&beacon, 7);
+        let info = crate::transcode::SessionInfo {
+            id: "session-a".into(),
+            file_id: 42,
+            item_id: 4,
+            item_title: "not persisted".into(),
+            user_name: "not persisted".into(),
+            target_height: 1080,
+            encoder: "qsv",
+            started_unix: 0,
+            idle_seconds: 0,
+            speed: Some(2.0),
+            recent_speed: Some(1.7),
+            out_time_ms: Some(10_000),
+            ahead_seconds: Some(34),
+            hold_reason: Some(crate::transcode::AheadHoldReason::Time),
+            resume_below_seconds: Some(30),
+            resume_below_bytes: None,
+            ahead_bytes: Some(123),
+            delivered_bytes: 456,
+            delivered_bps: Some(8_000_000),
+            delivered_idle_ms: 25,
+            readrate: 2.0,
+            suspended: true,
+            suspend_count: 1,
+        };
+        emit_client_playback_event(Arc::clone(&store), event, Some(&info));
+        let row = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(row) = store
+                    .playback_events(&PlaybackEventQuery {
+                        event: Some("stall".into()),
+                        limit: 10,
+                        ..PlaybackEventQuery::default()
+                    })
+                    .await
+                    .expect("query joined client event")
+                    .into_iter()
+                    .next()
+                {
+                    return row;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("joined client event persisted");
+        assert_eq!(row.session_id.as_deref(), Some("session-a"));
+        assert_eq!(row.file_id, Some(42));
+        assert_eq!(row.speed_recent, Some(1.7));
+        assert_eq!(row.ahead_seconds, Some(34));
+        assert_eq!(row.suspended, Some(true));
+        assert_eq!(row.hold_reason.as_deref(), Some("time"));
+        assert_eq!(row.delivered_bps, Some(8_000_000));
+        assert_eq!(row.readrate, Some(2.0));
+    }
+
+    #[test]
+    fn playback_event_reader_caps_the_requested_row_count() {
+        assert_eq!(
+            bounded_playback_query(PlaybackEventsQuery {
+                since: None,
+                event: None,
+                limit: i64::MAX,
+            })
+            .limit,
+            2_000
+        );
     }
 }
