@@ -16,6 +16,17 @@ def read(path: str) -> str:
     return (ROOT / path).read_text(encoding="utf-8")
 
 
+def workflow_job_blocks(path: str) -> dict[str, str]:
+    jobs = read(path).split("\njobs:\n", 1)[1]
+    starts = list(re.finditer(r"(?m)^  ([a-zA-Z0-9_-]+):\n", jobs))
+    return {
+        match.group(1): jobs[match.start() : starts[index + 1].start()]
+        if index + 1 < len(starts)
+        else jobs[match.start() :]
+        for index, match in enumerate(starts)
+    }
+
+
 class OperationsContractCase(unittest.TestCase):
     def test_compose_keeps_identity_data_and_host_ports_explicit(self):
         compose = read("deploy/docker-compose.yml")
@@ -165,6 +176,21 @@ class OperationsContractCase(unittest.TestCase):
             "cargo build --release --workspace --target ${{ matrix.target }}",
             workflow,
         )
+
+    def test_every_actions_job_has_an_explicit_timeout(self):
+        for path in (
+            ".github/workflows/ci.yml",
+            ".github/workflows/lint.yml",
+            ".github/workflows/rust-audit.yml",
+        ):
+            with self.subTest(path=path):
+                jobs = workflow_job_blocks(path)
+                self.assertTrue(jobs, f"{path} has no jobs")
+                missing = [
+                    name for name, block in jobs.items()
+                    if "\n    timeout-minutes:" not in block
+                ]
+                self.assertEqual([], missing, f"jobs without timeouts in {path}")
 
     def test_container_smoke_keeps_non_root_state_port_and_cleanup_contracts(self):
         smoke = read("scripts/container-smoke")
