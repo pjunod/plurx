@@ -78,6 +78,17 @@ http-body-util = "0.1"
 [workspace.lints.clippy]
 unwrap_used = "warn"
 
+# Argon2id runs ~80 times across the test suite (every seeded admin setup and
+# login), and at opt-level 0 each 19 MiB / t=2 hash costs on the order of a
+# second of pure KDF. Optimizing only the KDF crates keeps workspace code
+# fully debuggable while cutting minutes from every `cargo test` — local, CI,
+# and sandboxes alike.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
+
 [profile.release]
 lto = "thin"
 strip = "symbols"
