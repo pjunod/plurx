@@ -874,6 +874,55 @@ final class AppleClientTests: XCTestCase {
         )
     }
 
+    func testSeekRouteSeeksInsideALaterRangeInsteadOfSnappingToAnEarlierEdge() {
+        // Discontiguous windows: the target sits squarely inside the second
+        // range and must seek there natively — not snap to the first range's
+        // holdback merely because that edge's snap window also covers it.
+        XCTAssertEqual(
+            PlayerController.seekRoute(
+                targetMs: 12_000,
+                baseMs: 0,
+                usesDirectTimeline: false,
+                isVOD: false,
+                isChangingStream: false,
+                seekableRangesMs: [0...10_000, 11_000...90_000],
+                liveEdgeHoldbackMs: 1_500,
+                liveEdgeSnapWindowMs: 2_500
+            ),
+            .native(itemMs: 12_000)
+        )
+        // A target inside the interior gap between ranges reopens: that
+        // media genuinely is not in the playlist, and only the live edge —
+        // the greatest upper bound — earns the snap.
+        XCTAssertEqual(
+            PlayerController.seekRoute(
+                targetMs: 10_300,
+                baseMs: 0,
+                usesDirectTimeline: false,
+                isVOD: false,
+                isChangingStream: false,
+                seekableRangesMs: [0...10_000, 11_000...90_000],
+                liveEdgeHoldbackMs: 1_500,
+                liveEdgeSnapWindowMs: 2_500
+            ),
+            .reopen
+        )
+        // Just past the true live edge still snaps onto its holdback.
+        XCTAssertEqual(
+            PlayerController.seekRoute(
+                targetMs: 91_000,
+                baseMs: 0,
+                usesDirectTimeline: false,
+                isVOD: false,
+                isChangingStream: false,
+                seekableRangesMs: [0...10_000, 11_000...90_000],
+                liveEdgeHoldbackMs: 1_500,
+                liveEdgeSnapWindowMs: 2_500
+            ),
+            .native(itemMs: 88_500)
+        )
+    }
+
     func testSeekRouteKeepsVODAndDirectOnTheAbsoluteClockAndDefersToAChange() {
         // VOD and direct timelines are fully seekable and their local clock
         // is film time — the target passes through unmapped, whatever the

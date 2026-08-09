@@ -1074,6 +1074,14 @@ final class PlayerController: ObservableObject {
         playbackRecoveryMonitor.reset()
         await loadOffline(url: offlineAssetURL, startMs: positionMs)
         isChangingStream = false
+        // The status observer holds its fire while `isChangingStream` is up;
+        // a replacement that failed during its own load is caught here, the
+        // same re-check `open()` performs for server sessions. `loadOffline`'s
+        // own error paths have already surfaced through `fail()` — only a
+        // suppressed KVO failure needs the second look.
+        if !failed, let item = player.currentItem, item.status == .failed {
+            await handleItemFailure(item)
+        }
     }
     #endif
 
@@ -2429,13 +2437,25 @@ final class PlayerController: ObservableObject {
             return .native(itemMs: targetMs)
         }
         let local = targetMs - baseMs
+        // Exact containment first, across every advertised range: a target
+        // inside a later range must seek there, not snap to an earlier
+        // range's edge (PR #122 review: [0…10 s, 11 s…90 s] with a 12 s
+        // target belongs at 12 s, not at the first range's 8.5 s holdback).
         for range in seekableRangesMs {
             let safeUpper = range.upperBound - liveEdgeHoldbackMs
             guard safeUpper >= range.lowerBound else { continue }
             if local >= range.lowerBound && local <= safeUpper {
                 return .native(itemMs: local)
             }
-            if local > safeUpper && local <= range.upperBound + liveEdgeSnapWindowMs {
+        }
+        // Snapping applies only at the live edge — the range with the
+        // greatest upper bound — never across an interior gap, whose media
+        // genuinely is not in the playlist.
+        if let latest = seekableRangesMs.max(by: { $0.upperBound < $1.upperBound }) {
+            let safeUpper = latest.upperBound - liveEdgeHoldbackMs
+            if safeUpper >= latest.lowerBound,
+               local > safeUpper,
+               local <= latest.upperBound + liveEdgeSnapWindowMs {
                 return .native(itemMs: safeUpper)
             }
         }
