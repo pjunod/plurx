@@ -1,78 +1,146 @@
-# Below the line — decisions for Paul + deferred verification probes
+# Below the line — decisions and deferred verification probes
 
-**Baseline:** `origin/main` @ `e8a910f` · Companion to `docs/RETRO-REVIEW-2026-08-09.md` and WO-01…WO-11.
-Nothing here blocks a work order. Section 1 needs Paul, not GPT. Section 2 is P2/P3 probes the retro deliberately left out of the WOs — cheap to run opportunistically, worth recording results for.
+**Assessment baseline:** `origin/main` @ `e8a910f` · Companion to
+`docs/RETRO-REVIEW-2026-08-09.md` and WO-01…WO-11. The outcomes below record
+the post-assessment execution state through PR #123 and the physical-device
+session on 2026-08-09.
 
-## 1. Decisions that are Paul's (GPT can prepare both options, not choose)
+Nothing here reopens a work order's “Don't” section. Those entries remain
+verified fixes or refuted claims, not a second backlog.
 
-1. **Release model** (WO-10 task 2): cut 0.2.7 for real (CHANGELOG heading + first-ever tag → the publish pipeline finally runs) vs. subordinate RELEASING.md to continuous-main and retire the tag machinery. Everything downstream (registry template, `release-check` cadence) follows this choice.
-2. **PGS riders** (WO-08 decisions box): (a) add the server-side HDR-burn refusal now, or accept codec-blind `subtitle_burn` until the overlay exits staging; (b) build the one-tap "burn to SDR anyway" escape from the guard notice, or drop the idea.
-3. **EVENT-playlist fix adoption** (WO-05 task 3): after the one-iPad experiment, adopt typeless-sliding-from-first-response (it is spec-correct regardless of whether it explains the stalls) or keep EVENT and accept the mid-stream mutation.
-4. **The ten untracked `docs/PR*-REVIEW.md` files** in your working tree (WO-09): commit as the evidence trail or delete; just don't leave them untracked.
-5. *(minor)* **Offline kill-switch semantics** (WO-07 task 4): should disabling offline also cut delivery of already-ready packages, or only stop preparation? Gate or document accordingly.
+## 1. Approved decisions and resulting state
+
+Paul approved all five recommendations on 2026-08-09.
+
+1. **Yes — cut a real release.** `v0.2.7` is tagged, the changelog carries the
+   release heading, and the tag-driven publication contract has an executed
+   release to describe. `docs/RELEASING.md` remains the canonical release
+   procedure; continuous main did not replace it.
+2. **Yes — choose the guard-only PGS policy.** The server independently refuses
+   an explicit subtitle burn for probed DV, HDR10, or HLG sources. There is
+   deliberately no “burn to SDR anyway” override: an old or context-poor client
+   is not permission to discard HDR.
+3. **Yes — adopt one stable typeless-sliding envelope, subject to the device
+   comparison.** The implementation is complete and available under
+   **Settings → Playback → Experimental typeless sliding HLS**. It remains
+   default-off because the physical run did not include the required 2–5 minute
+   typeless-vs-control comparison. Approval is recorded; changing the default
+   remains evidence-gated rather than assumed from a shorter quality-switch
+   check.
+4. **Yes — retain the review evidence.** The ten review artifacts called out by
+   WO-09 (`PR79`, `PR80`, `PR81`, `PR82`, `PR83`, `PR84`, `PR88`, `PR89`,
+   `PR90`, and `PR91`) are tracked. Later PR review ledgers are tracked beside
+   them.
+5. **Yes — make the offline kill switch stop delivery.** Disabling offline now
+   cancels preparation and returns `503 offline_disabled` from leased media
+   routes for already-ready packages until the setting is re-enabled.
 
 ## 2. Deferred verification probes
 
-**Execution proofs for assumptions the merged code rests on**
+### Execution proofs for merged assumptions
 
-- **Pass — FTS5 absent delete.** The pinned three-voter hiqlite gate now
-  deletes an absent rowid from a `contentless_delete=1` table and proves the
-  neighbouring row survives. `make hiqlite-spike` is the durable check.
+- **Pass — FTS5 absent delete.** The pinned three-voter hiqlite gate deletes an
+  absent rowid from a `contentless_delete=1` table and proves the neighbouring
+  row survives. `make hiqlite-spike` is the durable check.
 - **Pass — RustSec red path.** Disposable, never-merged
   [PR #114](https://github.com/pjunod/plurx/pull/114) left the ordinary
   workspace scan green with zero vulnerabilities, then made only the
   synthesized-vendor scan fail on three critical `smallvec` 0.6.9 advisories.
   The draft and remote branch were deleted after the result was captured.
-- **Pass — hiqlite rollback.** A duplicate-key failure in statement two
-  rolled back statement one's guard-shaped insert. The same semantic gate
-  proves no row remains after the failed `txn()`.
-- **Pass — 150,000 gone ids.** The current JSON-parameter path decoded
-  150,000 ids through `json_each` in 0.007 seconds. WO-01 removed the inlined
-  `IN` list, so SQLite's host-parameter ceiling no longer applies.
+- **Pass — hiqlite rollback.** A duplicate-key failure in statement two rolled
+  back statement one's guard-shaped insert. The same semantic gate proves no
+  row remains after the failed `txn()`.
+- **Pass — 150,000 gone ids.** The current JSON-parameter path decoded 150,000
+  ids through `json_each` in 0.007 seconds. WO-01 removed the inlined `IN` list,
+  so SQLite's host-parameter ceiling no longer applies.
 
-**Playback / stall-cadence adjacents**
+### Physical playback and client evidence
 
-- **Hardware blocked — paused AVPlayer cadence.** Every registered iPad,
-  iPhone, and Apple TV was unavailable to CoreDevice on 2026-08-09. A
-  simulator cannot settle background playlist reload or the 60-second reaper.
-- **Fail — cold production PGS demux.** Track 0 from a
-  25,016,940,779-byte NAS-resident 4K HDR10 episode hit the production
-  600-second deadline at 600.08 seconds before producing a SUP file. The
-  256 MiB `-fs` bound held by construction, but cue count and PNG bytes could
-  not be measured because parser admission never began. The production M0
-  ledger records the same result.
+- **Pass — iPad source/device suite.** An iPad Pro 13-inch (M4) on iOS 26.6 ran
+  the complete 128-test Apple suite with zero failures after
+  [PR #121](https://github.com/pjunod/plurx/pull/121) bundled the shared native
+  API fixture into the device test target. Both 124-test simulator suites and
+  `make check` also passed before merge.
+- **Pass — iPad full-screen and recovery slice.** On real playback, system
+  status-bar count was zero after controls auto-hid. A 1080p → 720p quality
+  change recovered playback in 6.932 seconds, below the approximately
+  14-second bound. Server telemetry recorded the one observed subthreshold
+  stall as `outcome=self_recovered` with `stall_delta=1`.
+- **Not settled — EVENT cadence.** The recovery slice did not run a long
+  typeless session against a control session, so it does not establish whether
+  the EVENT-to-sliding mutation causes the reported 2–5 minute cadence. The
+  experimental setting remains default-off.
+- **Fail — cold production PGS demux.** Track 0 from a 25,016,940,779-byte
+  NAS-resident 4K HDR10 episode hit the production 600-second deadline at
+  600.08 seconds before producing a SUP file. The 256 MiB `-fs` bound held by
+  construction, but cue count and PNG bytes could not be measured because
+  parser admission never began. The production M0 ledger records the same
+  result.
+- **Pass with bounded scope — Pixel Fold phone checks.** A Pixel 10 Pro Fold on
+  Android 17 advertised H.264, HEVC, AV1, VP9, AAC, MP3, Opus, FLAC, AC-3,
+  E-AC-3, MKV, MP4, WebM, MOV, TS, and HDR. It did not advertise Dolby Vision.
+  Fourteen phone-applicable capability, PiP, PGS-overlay, safe-area,
+  navigation, poster, and theme checks passed. The device exposed an Android
+  17 incompatibility in Espresso 3.5.0's reflective
+  `InputManager.getInstance` path; PR #123 pins Espresso 3.7.0, which removes
+  that framework failure. Thirteen remaining full-suite cases depend on TV
+  focus mode or exact emulator dimensions and are not recorded as Fold app
+  regressions.
+- **Partial — iPhone suite.** An iPhone 17 Pro Max on iOS 26.6 previously passed
+  127 source/device tests with only the old external fixture case excluded. A
+  later complete rerun did not finish while the phone was locked, so this
+  ledger does not claim a 128-test iPhone pass.
 
-**Offline device-acceptance pass** (one session, both platforms — beyond WO-07's per-task checks)
+### Offline device acceptance
 
-- **Hardware blocked on 2026-08-09.** CoreDevice reported every registered
-  iOS/tvOS device unavailable, and ADB reported no attached Android device.
-  The acceptance rows below remain required; source and simulator tests are
-  not substitutes.
+- **Partial — iPad lifecycle.** A request for *Cunk on Britain* S1E2 survived
+  45 seconds in the background, force-quit, and relaunch; Downloads restored
+  the Preparing row. The server then published a ready 769,817,520-byte package
+  for the 1,723,040 ms episode. The client transfer and offline playback were
+  not completed after the disposable test install returned the app to sign-in
+  and the iPad disconnected.
+- **Not executed — Pixel production transfer.** The existing signed-in app was
+  preserved and reported an empty Downloads screen. Search reached the known
+  title, but the Fold locked before a package request could be started. No
+  active plurx scheduler job existed, so reboot-resume, the real six-hour
+  timeout, and airplane-mode playback remain unclaimed.
 
-- iOS 17 `didFinishDownloadingTo` vs iOS 18 `willDownloadTo` against the TS package; `AVAssetCache.isPlayableOffline` accepting TS + one-segment-VTT subtitle rendition; force-quit → relaunch restore ("tap Resume" row); download completion while backgrounded.
-- Android: `PlatformScheduler` resuming the dataSync service after reboot on targetSdk 37; `onTimeout` behavior at the real 6 h cap; fully-offline playback in airplane mode including the subtitle track; TV `uiMode` gating on real Android TV hardware.
-- Both: post-expiry re-download actually hits the server's `Cached` fast-path (transfer-only, no re-encode).
+The following physical rows still require the named hardware; source and
+simulator tests are not substitutes:
 
-**CI / ops bookkeeping**
+- iOS 17 `didFinishDownloadingTo` vs. iOS 18 `willDownloadTo` against the TS
+  package; `AVAssetCache.isPlayableOffline` accepting TS plus a one-segment-VTT
+  subtitle rendition; completed background transfer; airplane-mode start and
+  midpoint seek.
+- Android `PlatformScheduler` resume after reboot on targetSdk 37; real
+  six-hour `onTimeout`; fully offline playback including the subtitle track;
+  Android TV `uiMode` and D-pad behavior on actual TV hardware.
+- Post-expiry re-download on both platforms proving the server's `Cached`
+  transfer-only fast path without a re-encode.
+- iPad Stage Manager/Split View, tvOS focus and swipe HUD, a physical PGS
+  overlay/PiP path, and real HDR/Dolby Vision output.
 
-- **Pass — branch protection.** With explicit owner approval, main now uses
-  strict up-to-date-branch enforcement and requires only the aggregate
-  `PR validation gate`. PR #115 passed that gate before merge.
+### CI and operations bookkeeping
+
+- **Pass — branch protection.** Main uses strict up-to-date-branch enforcement
+  and requires only the aggregate `PR validation gate`. PR #121 passed that
+  gate after refreshing from main; PR #123 follows the same lane.
 - **Pass — Actions history.** The 100 completed CI runs from 2026-08-08
   00:21 UTC through 2026-08-09 14:23 UTC put fast-preflight p95 at 15 seconds
   against the 60-second budget. The three-voter contract job recorded 27
   successes, zero failures, and 14 intentional path-based skips.
-- **Pass — history audit headroom.** A local `make history-check` covered 291
-  corrective commits in 8.99 seconds; the combined CI preflight p95 remains
-  15 seconds.
-- **Pass — fleet contract.** nynuc and nuc4 report stamped v0.2.7 build
-  `e8a910f`, schema 15. Every media bind is read-only, both containers have
-  `/dev/dri`, and nuc4 retains TCP 32402 plus GDM UDP 32415. The private
-  deploy play invokes `make docker-up`, and its contract test pins that call.
-  No `backups/` directory exists yet because neither node has performed a
-  post-automation redeploy; the earlier scratch rollback drill remains the
-  executed recovery proof.
+- **Pass — history audit headroom.** The final local `make check` covered 293
+  corrective commits; the combined CI preflight p95 remains 15 seconds.
+- **Pass — fleet contract.** nynuc and nuc4 report stamped
+  `v0.2.7-15-g83403ef`, schema 15. Every media bind is read-only, both
+  containers have `/dev/dri`, and nuc4 retains TCP 32402 plus GDM UDP 32415.
+  The private deploy play invokes `make docker-up`, and its contract test pins
+  that call. No `backups/` directory exists yet because neither node has
+  performed a post-automation redeploy; the earlier scratch rollback drill
+  remains the executed recovery proof.
 
 ## 3. Explicitly not action items
 
-The master doc's §3 (strengths to keep as patterns) and §1 (gate evidence) carry no tasks. The refuted-claims ledgers live in each WO's "Don't" section — treat them as tripwires, not TODOs.
+The master doc's §3 (strengths to keep as patterns) and §1 (gate evidence)
+carry no tasks. The refuted-claims ledgers live in each WO's “Don't” section —
+treat them as tripwires, not TODOs.

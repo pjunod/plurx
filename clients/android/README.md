@@ -25,9 +25,10 @@ recomputed on every decision, because unplugging HDMI changes the answer.
 > restored completed transfer release its server-side package and quota, and
 > build 20 retries temporary PGS extraction capacity instead of abandoning the
 > subtitle selection, build 21 coalesces hidden-control seeks, restores
-> position feedback, and pins media-origin consumption, and build 22 reports
-> authenticated TTFF, six-second buffering stalls, and playback errors without
-> changing recovery policy. The
+> position feedback, and pins media-origin consumption, build 22 restores
+> on-device Compose instrumentation on Android 17 with Espresso 3.7.0, and
+> build 23 reports authenticated TTFF, six-second buffering stalls, and
+> playback errors without changing recovery policy. The
 > default-off `pgs-v1` application overlay remains available: Android
 > fetches authenticated, server-decoded PNG compositions, schedules them on the
 > source timeline, and draws them above the unchanged Dolby Vision, HDR, or SDR
