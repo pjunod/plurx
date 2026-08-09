@@ -156,8 +156,8 @@ timeout_seconds = 300
 
 [[checks]]
 id = "database-upgrades"
-title = "SQLite upgrade and downgrade-safety contract"
-command = "cargo test -p plurx-core store::sqlite::tests:: -- --nocapture"
+title = "SQLite upgrade, import staging, and downgrade-safety contract"
+command = "cargo test -p plurx-core store::sqlite::tests:: -- --nocapture && cargo test -p plurx-core cluster::migration -- --nocapture"
 profiles = ["ci", "full", "nightly"]
 requires = ["cargo"]
 missing = "fail"
@@ -250,8 +250,11 @@ checks = ["rust-gate"]
 [[points]]
 id = "persistence.upgrades"
 title = "Persistent database compatibility"
-contract = "Existing libraries upgrade without losing data, and a newer unsupported database is refused instead of corrupted."
-paths = ["crates/plurx-core/src/store/sqlite/mod.rs"]
+contract = "Existing libraries upgrade without losing data; a newer unsupported database is refused without changing staging state; the staged import-preparation helper publishes a durable, content-addressed SQLite backup without activating clustering."
+paths = [
+  "crates/plurx-core/src/cluster/migration.rs",
+  "crates/plurx-core/src/store/sqlite/mod.rs",
+]
 checks = ["rust-gate", "database-upgrades"]
 depends_on = ["core.media"]
 
