@@ -91,11 +91,20 @@ async fn run_failure_case(target: FailureTarget) -> Result<()> {
     }
     cluster.wait_for_three_voters().await?;
 
+    // Every voter exercises an immediate cache read after its acknowledged
+    // write. Record the current leader so the harness explicitly proves that
+    // at least one of those call paths ran through a non-leader.
+    let leader = cluster.leader().await?;
+    let mut exercised_follower = false;
     for ordinal in 1..=3 {
+        exercised_follower |= ordinal != leader;
         cluster
             .request(ordinal, Request::Exercise { ordinal })
             .await?
             .require_ok()?;
+    }
+    if !exercised_follower {
+        bail!("cache read-after-write proof did not exercise a follower");
     }
     cluster.wait_for_equal_dumps().await?;
     let catalog = cluster.wait_for_equal_catalog_views().await?;
@@ -1243,8 +1252,13 @@ async fn exercise(store: &HiqliteAuthStore, ordinal: u64) -> Result<()> {
         bail!("replicated unpinned cache claim was not accepted");
     }
     store.complete_cache_entry(&unpinned, &node_id, 123).await?;
-    if store.cache_bytes(&node_id).await? != 923 + ordinal as i64 {
-        bail!("replicated cache byte accounting omitted completed unpinned rows");
+    let expected_cache_bytes = 923 + ordinal as i64;
+    let cache_bytes = store.cache_bytes(&node_id).await?;
+    if cache_bytes != expected_cache_bytes {
+        bail!(
+            "replicated cache read-after-write on voter {ordinal} expected \
+             {expected_cache_bytes} bytes, found {cache_bytes}"
+        );
     }
     let abandoned = format!("abandoned-recipe-{suffix}");
     if !store

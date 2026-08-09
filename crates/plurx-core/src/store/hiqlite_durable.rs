@@ -682,7 +682,7 @@ impl TranscodeCacheStore for HiqliteAuthStore {
     ) -> Result<Option<CachedTranscode>, StoreError> {
         Ok(self
             .client
-            .query_map::<CacheRow, _>(
+            .query_consistent_map::<CacheRow, _>(
                 format!(
                     "SELECT {CACHE_COLS} FROM transcode_cache_locations l \
                      JOIN transcode_cache_recipes r ON r.recipe_hash = l.recipe_hash \
@@ -784,7 +784,7 @@ impl TranscodeCacheStore for HiqliteAuthStore {
     ) -> Result<Vec<CachedTranscode>, StoreError> {
         Ok(cached(
             self.client
-                .query_map::<CacheRow, _>(
+                .query_consistent_map::<CacheRow, _>(
                     format!(
                         "SELECT {CACHE_COLS} FROM transcode_cache_locations l \
                          JOIN transcode_cache_recipes r ON r.recipe_hash = l.recipe_hash \
@@ -809,7 +809,7 @@ impl TranscodeCacheStore for HiqliteAuthStore {
     ) -> Result<Vec<CachedTranscode>, StoreError> {
         Ok(cached(
             self.client
-                .query_map::<CacheRow, _>(
+                .query_consistent_map::<CacheRow, _>(
                     format!(
                         "SELECT {CACHE_COLS} FROM transcode_cache_locations l \
                          JOIN transcode_cache_recipes r ON r.recipe_hash = l.recipe_hash \
@@ -829,7 +829,7 @@ impl TranscodeCacheStore for HiqliteAuthStore {
     async fn all_cache_rows(&self, node_id: &str) -> Result<Vec<CachedTranscode>, StoreError> {
         Ok(cached(
             self.client
-                .query_map::<CacheRow, _>(
+                .query_consistent_map::<CacheRow, _>(
                     format!(
                         "SELECT {CACHE_COLS} FROM transcode_cache_locations l \
                          JOIN transcode_cache_recipes r ON r.recipe_hash = l.recipe_hash \
@@ -879,7 +879,7 @@ impl TranscodeCacheStore for HiqliteAuthStore {
     async fn cache_bytes(&self, node_id: &str) -> Result<i64, StoreError> {
         let row = self
             .client
-            .query_map::<ScalarRow, _>(
+            .query_consistent_map::<ScalarRow, _>(
                 "SELECT COALESCE(SUM(l.bytes), 0) AS value \
                  FROM transcode_cache_locations l \
                  WHERE l.node_id = $1 AND l.storage_class = 'local' AND l.complete = 1 \
