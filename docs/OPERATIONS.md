@@ -34,6 +34,52 @@ paths you type in the UI are **container-side** paths under Docker (e.g.
 `/media/movies`), which must be mounted in your override file. Full deploy matrix
 (Unraid, TrueNAS/k8s, ports, GPU passthrough): [`deploy/README.md`](../deploy/README.md).
 
+### Rolling back a deploy
+
+Every Ansible redeploy stops the Plurx Compose stack long enough to copy the
+closed SQLite database. The three newest copies stay on each node under
+`<PLURX_DATA>/backups/`, named
+`plurx.db.predeploy-<UTC>-<last-good-sha>.bak`. The SHA in the filename names
+the code that was running when the snapshot was taken.
+
+An older binary deliberately refuses a database migrated by a newer binary.
+Rolling back code alone therefore leaves the service crash-looping. Restore
+the matching pre-deploy database before rebuilding the older revision:
+
+```bash
+cd /path/to/plurx/deploy
+
+# Resolve the host path from the running container. Do not assume /srv/plurx;
+# deploy/.env may move it.
+data_dir="$(docker inspect plurxd --format \
+  '{{range .Mounts}}{{if eq .Destination "/var/lib/plurx"}}{{.Source}}{{end}}{{end}}')"
+test -n "$data_dir" && test "${data_dir#/}" != "$data_dir"
+
+# Stop first. Preserve the failed newer database for a possible roll-forward,
+# then restore the snapshot and remove sidecars that belong to the failed DB.
+docker compose stop
+cp -a "$data_dir/plurx.db" \
+  "$data_dir/plurx.db.failed-$(date -u +%Y%m%dT%H%M%SZ)"
+cp -a "$data_dir/backups/plurx.db.predeploy-<UTC>-<last-good-sha>.bak" \
+  "$data_dir/plurx.db"
+rm -f "$data_dir/plurx.db-wal" "$data_dir/plurx.db-shm"
+
+# Rebuild exactly the revision named by the snapshot. The Make target carries
+# its identity into the image; a bare Compose build does not.
+cd ..
+git fetch origin
+git switch --detach <last-good-sha>
+make docker-up
+
+curl -fsS http://127.0.0.1:32400/healthz
+curl -fsS http://127.0.0.1:32400/api/v1/server
+```
+
+Do not delete the failed database until the incident is resolved. A subsequent
+forward fix may need data written after the snapshot. Return the node to its
+normal protected branch only after the fixing PR is merged, then redeploy it
+through Ansible so the next pre-deploy snapshot is taken normally.
+
 ## Configuration surface
 
 Precedence, lowest to highest: **built-in defaults → TOML file → `PLURX_*` env**.
