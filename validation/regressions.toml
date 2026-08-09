@@ -149,6 +149,12 @@ checks = ["rust-gate"]
 reason = "The HLS master unit tests assert the current WebVTT codec and rendition signaling."
 
 [[coverage]]
+commits = ["668ac890"]
+points = ["playback.pipeline"]
+checks = ["rust-gate"]
+reason = "The HLS HTTP refusal contract and helper matrix pin the server-side DV/HDR10/HLG subtitle-burn guard before encoder creation."
+
+[[coverage]]
 commits = ["0f0ffa05"]
 points = ["android.client"]
 checks = ["android-device"]

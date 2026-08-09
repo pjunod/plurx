@@ -5560,7 +5560,7 @@ mod tests {
     ///
     /// The clip carries no subtitle data — nothing here extracts cues, it all
     /// stops at validation — so the tracks live in the probe only.
-    async fn seed_mixed_subtitles(state: &AppState) -> i64 {
+    async fn seed_mixed_subtitles(state: &AppState, hdr: Option<&str>) -> i64 {
         use plurx_core::domain::{
             AudioStream, ItemKind, LibraryKind, NewItem, NewLibrary, ProbeResult, SubtitleStream,
         };
@@ -5632,7 +5632,9 @@ mod tests {
             video_codec: Some("h264".into()),
             width: Some(64),
             height: Some(64),
-            bit_depth: Some(8),
+            bit_depth: Some(if hdr.is_some() { 10 } else { 8 }),
+            hdr: hdr.map(str::to_owned),
+            hdr_format: hdr.map(str::to_owned),
             bitrate: Some(400_000),
             audio_streams: vec![AudioStream {
                 index: 0,
@@ -5693,7 +5695,7 @@ mod tests {
         crate::transcode::require_ffmpeg();
         let (app, state) = test_state();
         let admin = setup_admin(&app).await;
-        let file = seed_mixed_subtitles(&state).await;
+        let file = seed_mixed_subtitles(&state, None).await;
 
         for (index, why) in [
             (9_i64, "unknown native subtitle track"),
@@ -5749,6 +5751,39 @@ mod tests {
             status,
             StatusCode::OK,
             "a text track that converts must still be accepted: {body}"
+        );
+    }
+
+    /// A pre-guard client can ask the server to burn a bitmap track without
+    /// saying what video delivery it is replacing. The server must not treat
+    /// that missing context as permission to turn a known HDR source into
+    /// H.264 SDR. The refusal happens before playback accounting or ffmpeg.
+    #[tokio::test]
+    async fn hls_create_refuses_hdr_subtitle_burns_at_the_server_boundary() {
+        crate::transcode::require_ffmpeg();
+        let (app, state) = test_state();
+        let admin = setup_admin(&app).await;
+        let file = seed_mixed_subtitles(&state, Some("hdr10")).await;
+
+        let (status, body) = call(
+            &app,
+            post(
+                &format!("/api/v1/files/{file}/hls/sessions"),
+                Some(&admin),
+                json!({
+                    "playback_id": "old-client-hdr-burn",
+                    "height": 64,
+                    "subtitle_burn": 2
+                }),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["code"], "hdr_subtitle_burn_refused");
+        assert_eq!(
+            body["error"],
+            "That subtitle requires an SDR burn-in. HDR playback was kept unchanged."
         );
     }
 
