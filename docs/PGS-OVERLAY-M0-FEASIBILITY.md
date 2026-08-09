@@ -342,7 +342,7 @@ off by default. The final schema is in
 | Capacity and eviction | Pass | Two concurrent generation producers, 256 MiB per-track output cap, and independent 2 GiB/128-generation access-marked LRU budget. |
 | Invalidation | Pass | Generation digest includes file id, track index, size, mtime, schema, and extractor version; focused regression changes track and source identity. |
 | Old-client compatibility | Pass | `overlay` is omitted while disabled and on non-PGS tracks; existing `text` and `native` fields retain their meaning. |
-| Raw-SUP demux boundary | Pass for deterministic fixture | A generated SUP was muxed into Matroska, copied back out with the production FFmpeg mapping, and accepted by the bounded adapter. FFmpeg output is capped at 256 MiB before parser admission. Production-file duration/resource evidence remains pending. |
+| Raw-SUP demux boundary | Fixture pass; production deadline fail | A generated SUP round-trips through the production FFmpeg mapping and bounded adapter. On 2026-08-09, cold demux of track 0 from a 25,016,940,779-byte NAS-resident 4K HDR10 episode hit the real 600-second deadline at 600.08 seconds before producing a SUP file. The 256 MiB cap held by construction, but cue and PNG measurements remain unavailable because parser admission never began. |
 
 The server implementation deliberately does not claim physical Apple/Android
 presentation, Dolby Vision preservation, PiP/external-output inclusion, or

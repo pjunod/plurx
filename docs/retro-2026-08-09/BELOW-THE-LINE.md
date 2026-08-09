@@ -14,25 +14,64 @@ Nothing here blocks a work order. Section 1 needs Paul, not GPT. Section 2 is P2
 ## 2. Deferred verification probes
 
 **Execution proofs for assumptions the merged code rests on**
-- FTS5 `contentless_delete=1`: prove a DELETE of an absent rowid is a no-op (one scratch rusqlite test with hiqlite's pragmas). The entire #88-E fix rests on this; the cluster gate never interleaves delete-with-missing-index.
-- Vendor RustSec gate can actually fail: seed a known advisory into the lockfile `scripts/vendor-audit-lock` synthesizes and confirm the second `audit-check` job in `rust-audit.yml` goes red (proves `working-directory` + lockfile-only scanning really scans).
-- hiqlite `txn()` rollback semantics on a mid-transaction statement error — the no-leftover-`scan_reconcile_guards`-rows assumption in reconcile.
-- Reconcile with ~100–150k gone ids on the hiqlite backend: measure the current inlined-`IN`-list ceiling (WO-01 task 5 fixes this proactively; this measures the bound being fixed).
+
+- **Pass — FTS5 absent delete.** The pinned three-voter hiqlite gate now
+  deletes an absent rowid from a `contentless_delete=1` table and proves the
+  neighbouring row survives. `make hiqlite-spike` is the durable check.
+- **Pass — RustSec red path.** Disposable, never-merged
+  [PR #114](https://github.com/pjunod/plurx/pull/114) left the ordinary
+  workspace scan green with zero vulnerabilities, then made only the
+  synthesized-vendor scan fail on three critical `smallvec` 0.6.9 advisories.
+  The draft and remote branch were deleted after the result was captured.
+- **Pass — hiqlite rollback.** A duplicate-key failure in statement two
+  rolled back statement one's guard-shaped insert. The same semantic gate
+  proves no row remains after the failed `txn()`.
+- **Pass — 150,000 gone ids.** The current JSON-parameter path decoded
+  150,000 ids through `json_each` in 0.007 seconds. WO-01 removed the inlined
+  `IN` list, so SQLite's host-parameter ceiling no longer applies.
 
 **Playback / stall-cadence adjacents**
-- AVPlayer playlist-reload cadence while **paused** >60 s against a live (non-ENDLIST) playlist — settles whether the idle reaper (60 s + 15 s tick, status polls deliberately don't touch `last_access`) contributes to the periodic-stall pattern for paused viewers.
-- PGS measurements the M0 ledger still owes: a fade-heavy production title (cue count, PNG bytes vs the 256 MiB per-track cap, whether the 422 refusal is acceptable UX) and a cold demux of a large NAS-resident file (time-to-first-manifest vs the 600 s deadline; staging-dir disk high-water — ffmpeg can write an unbounded `track.sup` before the parser cap applies).
+
+- **Hardware blocked — paused AVPlayer cadence.** Every registered iPad,
+  iPhone, and Apple TV was unavailable to CoreDevice on 2026-08-09. A
+  simulator cannot settle background playlist reload or the 60-second reaper.
+- **Fail — cold production PGS demux.** Track 0 from a
+  25,016,940,779-byte NAS-resident 4K HDR10 episode hit the production
+  600-second deadline at 600.08 seconds before producing a SUP file. The
+  256 MiB `-fs` bound held by construction, but cue count and PNG bytes could
+  not be measured because parser admission never began. The production M0
+  ledger records the same result.
 
 **Offline device-acceptance pass** (one session, both platforms — beyond WO-07's per-task checks)
+
+- **Hardware blocked on 2026-08-09.** CoreDevice reported every registered
+  iOS/tvOS device unavailable, and ADB reported no attached Android device.
+  The acceptance rows below remain required; source and simulator tests are
+  not substitutes.
+
 - iOS 17 `didFinishDownloadingTo` vs iOS 18 `willDownloadTo` against the TS package; `AVAssetCache.isPlayableOffline` accepting TS + one-segment-VTT subtitle rendition; force-quit → relaunch restore ("tap Resume" row); download completion while backgrounded.
 - Android: `PlatformScheduler` resuming the dataSync service after reboot on targetSdk 37; `onTimeout` behavior at the real 6 h cap; fully-offline playback in airplane mode including the subtitle track; TV `uiMode` gating on real Android TV hardware.
 - Both: post-expiry re-download actually hits the server's `Cached` fast-path (transfer-only, no re-encode).
 
 **CI / ops bookkeeping**
-- GitHub branch protection: confirm `pr_gate` is the sole required check (currently assumed from a ci.yml comment).
-- Actions history: preflight p95 vs the CI-overhaul 60 s budget; `cluster_auth` real flake rate since M1c (and again after #90's 3-voter contract suite lands) — feeds WO-03 task 8's flake policy.
-- `history-check` runtime grows O(all history × subprocesses) inside preflight — watch it against the budget; split or cache when it gets close.
-- While doing WO-10 task 3 on the nodes: media mounts `:ro` in each node's compose override, GPU device blocks present, nuc4's port workaround intact, and confirm the private deploy play uses `make docker-up` (else fleet builds report unstamped).
+
+- **Pass — branch protection.** With explicit owner approval, main now uses
+  strict up-to-date-branch enforcement and requires only the aggregate
+  `PR validation gate`. PR #115 passed that gate before merge.
+- **Pass — Actions history.** The 100 completed CI runs from 2026-08-08
+  00:21 UTC through 2026-08-09 14:23 UTC put fast-preflight p95 at 15 seconds
+  against the 60-second budget. The three-voter contract job recorded 27
+  successes, zero failures, and 14 intentional path-based skips.
+- **Pass — history audit headroom.** A local `make history-check` covered 291
+  corrective commits in 8.99 seconds; the combined CI preflight p95 remains
+  15 seconds.
+- **Pass — fleet contract.** nynuc and nuc4 report stamped v0.2.7 build
+  `e8a910f`, schema 15. Every media bind is read-only, both containers have
+  `/dev/dri`, and nuc4 retains TCP 32402 plus GDM UDP 32415. The private
+  deploy play invokes `make docker-up`, and its contract test pins that call.
+  No `backups/` directory exists yet because neither node has performed a
+  post-automation redeploy; the earlier scratch rollback drill remains the
+  executed recovery proof.
 
 ## 3. Explicitly not action items
 
