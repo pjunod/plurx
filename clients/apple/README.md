@@ -16,8 +16,9 @@ only what this hardware genuinely can't play.
 > development client. Browse, resume, discover, and play on both iOS and
 > tvOS. Both targets compile against the iOS/tvOS 26.5 SDKs and share the
 > same regression suite. Build 45 adds a one-shot, session-joined TTFF beacon
-> when the online player first advances; physical-device evidence remains
-> pending. Build 29 added app-managed offline viewing on iPhone and iPad; the
+> when the online player first advances, with separate cold-start and resume
+> reasons; passing physical-device evidence remains pending. Build 29 added
+> app-managed offline viewing on iPhone and iPad; the
 > action remains hidden on tvOS. The
 > default-off `pgs-v1` bitmap-overlay client draws PGS over the existing Dolby
 > Vision, HDR, or SDR video

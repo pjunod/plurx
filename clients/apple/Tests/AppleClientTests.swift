@@ -970,6 +970,37 @@ final class AppleClientTests: XCTestCase {
         ))
     }
 
+    func testAppleTTFFRebasesGrowingCopyOriginWithoutRestartingClock() {
+        var measurement = ApplePlaybackTTFFState()
+        measurement.opened(at: 90_000, observedAt: 10)
+
+        measurement.rebasePosition(at: 88_000)
+
+        XCTAssertNil(measurement.observe(
+            positionMs: 88_249,
+            playing: true,
+            observedAt: 11
+        ))
+        XCTAssertEqual(measurement.observe(
+            positionMs: 88_250,
+            playing: true,
+            observedAt: 12.5
+        ), 2_500)
+    }
+
+    func testAppleTTFFRebasesBackwardSeekBeforeFirstProgress() {
+        var measurement = ApplePlaybackTTFFState()
+        measurement.opened(at: 90_000, observedAt: 10)
+
+        measurement.rebasePosition(at: 10_000)
+
+        XCTAssertEqual(measurement.observe(
+            positionMs: 10_250,
+            playing: true,
+            observedAt: 11
+        ), 1_000)
+    }
+
     func testAppleTTFFLogCarriesSessionJoinWithoutCapabilityData() throws {
         let payload = ApplePlaybackTTFFLog(
             ms: 684,
@@ -980,7 +1011,8 @@ final class AppleClientTests: XCTestCase {
             height: 2_160,
             encoder: "copy",
             sessionId: "session-17",
-            attempt: "playback-9"
+            attempt: "playback-9",
+            reason: "resume"
         )
         let object = try XCTUnwrap(
             JSONSerialization.jsonObject(with: JSONEncoder().encode(payload))
@@ -992,7 +1024,7 @@ final class AppleClientTests: XCTestCase {
         XCTAssertEqual(object["method"] as? String, "remux")
         XCTAssertEqual(object["session_id"] as? String, "session-17")
         XCTAssertEqual(object["attempt"] as? String, "playback-9")
-        XCTAssertEqual(object["reason"] as? String, "cold-start")
+        XCTAssertEqual(object["reason"] as? String, "resume")
         XCTAssertEqual(object["file_id"] as? Int, 42)
         XCTAssertEqual(object["height"] as? Int, 2_160)
         XCTAssertNil(object["url"])

@@ -41,9 +41,10 @@ private struct ApplePlaybackFailureLog: Encodable {
     }
 }
 
-/// One cold-start time-to-first-frame measurement. The live HLS session id is
-/// carried as a typed field so the server can join this client-observed wait to
-/// the producer and pacing state that existed when the first frame arrived.
+/// One start-or-resume time-to-first-frame measurement. The live HLS session
+/// id is carried as a typed field so the server can join this client-observed
+/// wait to the producer and pacing state that existed when the first frame
+/// arrived.
 struct ApplePlaybackTTFFLog: Encodable {
     let level = "info"
     let event = "ttff"
@@ -57,7 +58,7 @@ struct ApplePlaybackTTFFLog: Encodable {
     let encoder: String?
     let sessionId: String?
     let attempt: String
-    let reason = "cold-start"
+    let reason: String
     let ua = "Apple AVPlayer"
 
     init(
@@ -69,7 +70,8 @@ struct ApplePlaybackTTFFLog: Encodable {
         height: Int?,
         encoder: String?,
         sessionId: String?,
-        attempt: String
+        attempt: String,
+        reason: String
     ) {
         self.message = "first frame after \(max(0, ms)) ms"
         self.method = method
@@ -81,6 +83,7 @@ struct ApplePlaybackTTFFLog: Encodable {
         self.encoder = encoder
         self.sessionId = sessionId
         self.attempt = attempt
+        self.reason = reason
     }
 
     enum CodingKeys: String, CodingKey {
@@ -117,6 +120,14 @@ struct ApplePlaybackTTFFState: Equatable {
         else { return nil }
         self.openedAt = nil
         return max(0, Int(((observedAt - openedAt) * 1_000).rounded()))
+    }
+
+    /// Move only the film-position gate when the attached item starts at a
+    /// keyframe before the request, or a viewer seeks before first progress.
+    /// The monotonic start remains the original wait anchor.
+    mutating func rebasePosition(at positionMs: Int) {
+        guard openedAt != nil else { return }
+        openedPositionMs = max(0, positionMs)
     }
 
     mutating func reset() {
@@ -730,6 +741,7 @@ final class PlayerController: ObservableObject {
     private var attachmentRecovery = PlayerAttachmentRecoveryState()
     private var establishedHDRRetryAttempted = false
     private var ttffMeasurement = ApplePlaybackTTFFState()
+    private var ttffReason = "cold-start"
     private var stallObservation = PlaybackStallObservationState()
     /// A completed/VOD item with no usable catalog or AVPlayer duration gets
     /// one reopen. A second end at the same position finishes instead of
@@ -879,6 +891,7 @@ final class PlayerController: ObservableObject {
         canRetryCurrentItemWithTranscode = false
         compatibilityFallbackAttempted = false
         forceCompatibilityTranscode = false
+        ttffReason = currentMs > 0 ? "resume" : "cold-start"
         ttffMeasurement.opened(at: currentMs)
         attachmentRecovery.opened(at: startMs)
         establishedHDRRetryAttempted = false
@@ -1090,6 +1103,7 @@ final class PlayerController: ObservableObject {
         // it on the paused predecessor for the whole server round trip, which
         // made tvOS look as though the progress command had not worked.
         currentMs = target
+        ttffMeasurement.rebasePosition(at: target)
         refreshPGSOverlayWindow(at: target, force: true)
         playbackRecoveryMonitor.reset()
         let requiresReopen = isChangingStream || !(usesDirectTimeline || isVOD)
@@ -1572,6 +1586,9 @@ final class PlayerController: ObservableObject {
         // creation mixed the predecessor's local time into the successor's
         // base and was the source of the apparently random seek jumps.
         baseMs = nextBaseMs
+        if seekAfterAttach == nil {
+            ttffMeasurement.rebasePosition(at: realPositionMs())
+        }
         refreshPGSOverlayWindow(at: startMs, force: true)
         // Start loading/playing immediately. Previously a resume point gated
         // this call behind item readiness and could leave tvOS permanently
@@ -1586,6 +1603,7 @@ final class PlayerController: ObservableObject {
         if let seekAfterAttach {
             do {
                 try await seekWhenReady(item, ms: seekAfterAttach)
+                ttffMeasurement.rebasePosition(at: realPositionMs())
             } catch {
                 if isSuperseded(generation) { return }
                 throw error
@@ -2192,7 +2210,8 @@ final class PlayerController: ObservableObject {
             height: height,
             encoder: encoder,
             sessionId: sessionId,
-            attempt: playbackId
+            attempt: playbackId,
+            reason: ttffReason
         ))
     }
 

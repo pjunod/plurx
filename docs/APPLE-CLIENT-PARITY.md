@@ -12,9 +12,10 @@ Vision investigation are recorded in
 > Status (2026-08-09): source is v0.2.7, Apple build 45. Native text
 > subtitles, the cinematic detail surface, stable seek/recovery, truthful
 > delivered-range badges, and app-managed offline viewing on iPhone/iPad have
-> landed. Build 44 also emits the Performance II N0 TTFF beacon at the first
-> advancing online frame, including the live HLS session id when one exists;
-> real-device ingest remains unclaimed. The default-off `pgs-v1` overlay client
+> landed. Build 45 also emits the Performance II N0 TTFF beacon at the first
+> advancing online frame, including the live HLS session id when one exists and
+> separating cold starts from resumes; passing real-device ingest remains
+> unclaimed. The default-off `pgs-v1` overlay client
 > is staged but is not a release claim until the server gate and physical
 > matrix pass. Copied Dolby
 > Vision was resolved on the physical Apple TV 2026-08-03; the historical
