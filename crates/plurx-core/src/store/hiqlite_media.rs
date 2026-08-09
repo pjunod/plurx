@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use hiqlite::macros::params;
 use hiqlite::Row;
 
-use super::hiqlite::{database_error, validate_sql, HiqliteAuthStore};
+use super::hiqlite::{database_error, validate_sql, HiqliteAuthStore, TimedClient};
 use super::{MediaStore, ReconcileOutcome, RootFingerprintStatus, WatchStore};
 use crate::domain::{
     sort_title_for, ArtworkAttempt, InProgressItem, Item, ItemEdit, ItemKind, ItemPage, ItemSort,
@@ -552,12 +552,12 @@ fn id_list(ids: &[i64]) -> String {
     ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",")
 }
 
-async fn scalar(client: &hiqlite::Client, sql: &'static str) -> Result<i64, StoreError> {
+async fn scalar(client: &TimedClient, sql: &'static str) -> Result<i64, StoreError> {
     scalar_with(client, sql.to_owned(), params!()).await
 }
 
 async fn scalar_with(
-    client: &hiqlite::Client,
+    client: &TimedClient,
     sql: String,
     params: hiqlite::Params,
 ) -> Result<i64, StoreError> {
@@ -571,10 +571,7 @@ async fn scalar_with(
         .ok_or_else(|| StoreError::Database("aggregate query returned no row".to_owned()))
 }
 
-async fn pairs(
-    client: &hiqlite::Client,
-    sql: &'static str,
-) -> Result<Vec<(String, i64)>, StoreError> {
+async fn pairs(client: &TimedClient, sql: &'static str) -> Result<Vec<(String, i64)>, StoreError> {
     let mut values: Vec<_> = client
         .query_consistent_map::<PairRow, _>(sql, params!())
         .await
@@ -599,7 +596,7 @@ impl MediaStore for HiqliteAuthStore {
             return Ok(None);
         }
         one_item(
-            self.client
+            self.client()
                 .query_consistent_map::<ItemRow, _>(
                     format!(
                         "SELECT {ITEM_COLS} FROM items WHERE kind = $1 \
@@ -621,7 +618,7 @@ impl MediaStore for HiqliteAuthStore {
         year: Option<i32>,
     ) -> Result<Option<Item>, StoreError> {
         one_item(
-            self.client
+            self.client()
                 .query_consistent_map::<ItemRow, _>(
                     format!(
                         "SELECT {ITEM_COLS} FROM items WHERE library_id = $1 \
@@ -641,7 +638,7 @@ impl MediaStore for HiqliteAuthStore {
         year: Option<i32>,
     ) -> Result<Option<Item>, StoreError> {
         one_item(
-            self.client
+            self.client()
                 .query_consistent_map::<ItemRow, _>(
                     format!(
                         "SELECT {ITEM_COLS} FROM items WHERE library_id = $1 \
@@ -662,7 +659,7 @@ impl MediaStore for HiqliteAuthStore {
         season_number: i32,
     ) -> Result<Option<Item>, StoreError> {
         one_item(
-            self.client
+            self.client()
                 .query_consistent_map::<ItemRow, _>(
                     format!(
                         "SELECT {ITEM_COLS} FROM items WHERE parent_id = $1 \
@@ -681,7 +678,7 @@ impl MediaStore for HiqliteAuthStore {
         episode_number: i32,
     ) -> Result<Option<Item>, StoreError> {
         one_item(
-            self.client
+            self.client()
                 .query_consistent_map::<ItemRow, _>(
                     format!(
                         "SELECT {ITEM_COLS} FROM items WHERE parent_id = $1 \
@@ -702,7 +699,7 @@ impl MediaStore for HiqliteAuthStore {
         title: &str,
     ) -> Result<Option<Item>, StoreError> {
         one_item(
-            self.client
+            self.client()
                 .query_consistent_map::<ItemRow, _>(
                     format!(
                         "SELECT {ITEM_COLS} FROM items WHERE library_id = $1 \
@@ -728,7 +725,7 @@ impl MediaStore for HiqliteAuthStore {
                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9) RETURNING id";
         validate_sql(sql)?;
         let row = self
-            .client
+            .client()
             .execute_returning_map_one::<_, IdRow>(
                 sql,
                 params!(
@@ -750,7 +747,7 @@ impl MediaStore for HiqliteAuthStore {
 
     async fn get_item(&self, id: i64) -> Result<Option<Item>, StoreError> {
         one_item(
-            self.client
+            self.client()
                 .query_consistent_map::<ItemRow, _>(
                     format!("SELECT {ITEM_COLS} FROM items WHERE id = $1"),
                     params!(id),
@@ -762,7 +759,7 @@ impl MediaStore for HiqliteAuthStore {
 
     async fn get_item_children(&self, parent_id: i64) -> Result<Vec<Item>, StoreError> {
         items(
-            self.client
+            self.client()
                 .query_consistent_map::<ItemRow, _>(
                     format!(
                         "SELECT {ITEM_COLS} FROM items WHERE parent_id = $1 \
@@ -798,7 +795,7 @@ impl MediaStore for HiqliteAuthStore {
         const GENRE: &str = "($2 IS NULL OR EXISTS (SELECT 1 FROM json_each(items.genres) \
              WHERE value = $2 COLLATE NOCASE))";
         let count = self
-            .client
+            .client()
             .query_consistent_map::<CountRow, _>(
                 format!(
                     "SELECT COUNT(*) AS count FROM items \
@@ -818,7 +815,7 @@ impl MediaStore for HiqliteAuthStore {
         );
         validate_sql(&page_sql)?;
         let page = items(
-            self.client
+            self.client()
                 .query_consistent_map::<ItemRow, _>(
                     page_sql,
                     params!(library_id, genre, limit, offset),
@@ -856,7 +853,7 @@ impl MediaStore for HiqliteAuthStore {
             r = item_cols("r")
         );
         recent_items(
-            self.client
+            self.client()
                 .query_consistent_map::<RecentItemRow, _>(sql, params!(library_id, limit))
                 .await
                 .map_err(database_error)?,
@@ -881,7 +878,7 @@ impl MediaStore for HiqliteAuthStore {
         // Search is deliberately local derived-state I/O, unlike authoritative
         // catalogue reads. The three-node gate proves parity and one-node rebuild.
         recent_items(
-            self.client
+            self.client()
                 .query_map::<RecentItemRow, _>(sql, params!(match_expression, limit))
                 .await
                 .map_err(database_error)?,
@@ -962,7 +959,7 @@ impl MediaStore for HiqliteAuthStore {
             return Ok(Vec::new());
         };
         items(
-            self.client
+            self.client()
                 .query_consistent_map::<ItemRow, _>(
                     format!(
                         "SELECT {i} FROM items i \
@@ -982,7 +979,7 @@ impl MediaStore for HiqliteAuthStore {
 
     async fn episodes_for_show(&self, show_id: i64) -> Result<Vec<Item>, StoreError> {
         items(
-            self.client
+            self.client()
                 .query_consistent_map::<ItemRow, _>(
                     format!(
                         "SELECT {e} FROM items e JOIN items season ON e.parent_id = season.id \
@@ -1007,7 +1004,7 @@ impl MediaStore for HiqliteAuthStore {
             return Ok(Vec::new());
         };
         items(
-            self.client
+            self.client()
                 .query_consistent_map::<ItemRow, _>(
                     format!(
                         "SELECT {ITEM_COLS} FROM items \
@@ -1033,7 +1030,7 @@ impl MediaStore for HiqliteAuthStore {
         }
         let cutoff = self.now()?.saturating_sub(retry_after_secs.max(0));
         items(
-            self.client
+            self.client()
                 .query_consistent_map::<ItemRow, _>(
                     format!(
                         "SELECT {i} FROM items i \
@@ -1068,7 +1065,7 @@ impl MediaStore for HiqliteAuthStore {
         limit: i64,
     ) -> Result<Vec<Item>, StoreError> {
         items(
-            self.client
+            self.client()
                 .query_consistent_map::<ItemRow, _>(
                     format!(
                         "SELECT {i} FROM items i \
@@ -1110,7 +1107,7 @@ impl MediaStore for HiqliteAuthStore {
         );
         validate_sql(&sql)?;
         one_item(
-            self.client
+            self.client()
                 .execute_returning_map::<_, ItemRow>(
                     sql,
                     params!(
@@ -1149,7 +1146,7 @@ impl MediaStore for HiqliteAuthStore {
 
     async fn get_file_by_path(&self, path: &str) -> Result<Option<MediaFile>, StoreError> {
         one_file(
-            self.client
+            self.client()
                 .query_consistent_map::<FileRow, _>(
                     format!("SELECT {FILE_COLS} FROM files WHERE path = $1"),
                     params!(path),
@@ -1188,7 +1185,7 @@ impl MediaStore for HiqliteAuthStore {
                      scanned_at = excluded.scanned_at RETURNING id";
         validate_sql(sql)?;
         let row = self
-            .client
+            .client()
             .execute_returning_map_one::<_, IdRow>(
                 sql,
                 params!(
@@ -1219,7 +1216,7 @@ impl MediaStore for HiqliteAuthStore {
 
     async fn get_file(&self, id: i64) -> Result<Option<MediaFile>, StoreError> {
         one_file(
-            self.client
+            self.client()
                 .query_consistent_map::<FileRow, _>(
                     format!("SELECT {FILE_COLS} FROM files WHERE id = $1"),
                     params!(id),
@@ -1231,40 +1228,40 @@ impl MediaStore for HiqliteAuthStore {
 
     async fn media_shape(&self) -> Result<MediaShape, StoreError> {
         let probed = scalar(
-            &self.client,
+            self.client(),
             "SELECT COUNT(*) AS value FROM files WHERE video_codec IS NOT NULL",
         )
         .await?;
         let unprobed = scalar(
-            &self.client,
+            self.client(),
             "SELECT COUNT(*) AS value FROM files WHERE video_codec IS NULL",
         )
         .await?;
         let hdr = pairs(
-            &self.client,
+            self.client(),
             "SELECT COALESCE(NULLIF(hdr,''),'sdr') AS label, COUNT(*) AS count \
              FROM files WHERE video_codec IS NOT NULL GROUP BY 1",
         )
         .await?;
         let hdr_4k = pairs(
-            &self.client,
+            self.client(),
             "SELECT COALESCE(NULLIF(hdr,''),'sdr') AS label, COUNT(*) AS count \
              FROM files WHERE video_codec IS NOT NULL AND height >= 1600 GROUP BY 1",
         )
         .await?;
         let codecs = pairs(
-            &self.client,
+            self.client(),
             "SELECT LOWER(video_codec) AS label, COUNT(*) AS count \
              FROM files WHERE video_codec IS NOT NULL GROUP BY 1",
         )
         .await?;
         let over_segmented_floor = scalar(
-            &self.client,
+            self.client(),
             "SELECT COUNT(*) AS value FROM files WHERE bitrate >= 40000000",
         )
         .await?;
         let max_bitrate = self
-            .client
+            .client()
             .query_consistent_map::<OptionalScalarRow, _>(
                 "SELECT MAX(bitrate) AS value FROM files",
                 params!(),
@@ -1287,7 +1284,7 @@ impl MediaStore for HiqliteAuthStore {
 
     async fn files_for_item(&self, item_id: i64) -> Result<Vec<MediaFile>, StoreError> {
         files(
-            self.client
+            self.client()
                 .query_consistent_map::<FileRow, _>(
                     format!(
                         "SELECT {FILE_COLS} FROM files WHERE item_id = $1 \
@@ -1306,7 +1303,7 @@ impl MediaStore for HiqliteAuthStore {
         }
         let list = id_list(ids);
         Ok(self
-            .client
+            .client()
             .query_consistent_map::<ItemValueRow, _>(
                 format!(
                     "SELECT parent_id AS item_id, COUNT(*) AS value FROM items \
@@ -1327,7 +1324,7 @@ impl MediaStore for HiqliteAuthStore {
         }
         let list = id_list(ids);
         Ok(self
-            .client
+            .client()
             .query_consistent_map::<ItemValueRow, _>(
                 format!(
                     "SELECT item_id, MAX(height) AS value FROM files \
@@ -1347,8 +1344,7 @@ impl MediaStore for HiqliteAuthStore {
             return Ok(HashMap::new());
         }
         let list = id_list(ids);
-        Ok(self
-            .client
+        Ok(self.client()
             .query_consistent_map::<FactsSqlRow, _>(
                 format!(
                     "WITH ranked AS ( \
@@ -1396,7 +1392,7 @@ impl MediaStore for HiqliteAuthStore {
 
     async fn get_file_probe_json(&self, file_id: i64) -> Result<Option<String>, StoreError> {
         Ok(self
-            .client
+            .client()
             .query_consistent_map::<ProbeJsonRow, _>(
                 "SELECT probe_json FROM files WHERE id = $1",
                 params!(file_id),
@@ -1427,7 +1423,7 @@ impl MediaStore for HiqliteAuthStore {
         library_id: Option<i64>,
     ) -> Result<Vec<MediaFile>, StoreError> {
         files(
-            self.client
+            self.client()
                 .query_consistent_map::<FileRow, _>(
                     format!(
                         "SELECT {FILE_COLS} FROM files WHERE probe_json IS NULL \
@@ -1444,7 +1440,7 @@ impl MediaStore for HiqliteAuthStore {
 
     async fn library_file_paths(&self, library_id: i64) -> Result<Vec<(i64, PathBuf)>, StoreError> {
         Ok(self
-            .client
+            .client()
             .query_consistent_map::<PathRow, _>(
                 "SELECT f.id AS id, f.path AS path FROM files f \
                  JOIN items i ON i.id = f.item_id WHERE i.library_id = $1",
@@ -1475,7 +1471,7 @@ impl MediaStore for HiqliteAuthStore {
             return Ok(RootFingerprintStatus::Established);
         }
         let expected = self
-            .client
+            .client()
             .query_consistent_map::<RootFingerprintRow, _>(
                 "SELECT fingerprint FROM library_roots WHERE library_id = $1",
                 params!(library_id),
@@ -1503,7 +1499,7 @@ impl MediaStore for HiqliteAuthStore {
         prune_limit: u64,
     ) -> Result<ReconcileOutcome, StoreError> {
         let expected = self
-            .client
+            .client()
             .query_consistent_map::<RootFingerprintRow, _>(
                 "SELECT fingerprint FROM library_roots WHERE library_id = $1",
                 params!(library_id),
@@ -1525,7 +1521,7 @@ impl MediaStore for HiqliteAuthStore {
             id_list(gone_file_ids)
         };
         let requested = scalar_with(
-            &self.client,
+            self.client(),
             format!(
                 "SELECT COUNT(*) AS value FROM files f JOIN items i ON i.id = f.item_id \
                  WHERE i.library_id = $1 AND f.id IN ({list})"
@@ -1622,7 +1618,7 @@ impl MediaStore for HiqliteAuthStore {
             validate_sql(sql)?;
         }
         let results = self
-            .client
+            .client()
             .txn(statements)
             .await
             .map_err(database_error)?
@@ -1631,7 +1627,7 @@ impl MediaStore for HiqliteAuthStore {
             .map_err(database_error)?;
         if results.first().copied() != Some(1) {
             let expected = self
-                .client
+                .client()
                 .query_consistent_map::<RootFingerprintRow, _>(
                     "SELECT fingerprint FROM library_roots WHERE library_id = $1",
                     params!(library_id),
@@ -1673,7 +1669,7 @@ impl MediaStore for HiqliteAuthStore {
             validate_sql(sql)?;
         }
         let results = self
-            .client
+            .client()
             .txn(statements)
             .await
             .map_err(database_error)?
@@ -1690,7 +1686,7 @@ impl MediaStore for HiqliteAuthStore {
         let sql = "DELETE FROM files WHERE id = $1";
         validate_sql(sql)?;
         let results = self
-            .client
+            .client()
             .txn(ids.iter().map(|id| (sql, params!(*id))))
             .await
             .map_err(database_error)?;
@@ -1735,7 +1731,7 @@ impl MediaStore for HiqliteAuthStore {
             validate_sql(sql)?;
         }
         let results = self
-            .client
+            .client()
             .txn(statements.map(|sql| (sql, params!(library_id))))
             .await
             .map_err(database_error)?;
@@ -1759,7 +1755,7 @@ impl WatchStore for HiqliteAuthStore {
         item_id: i64,
     ) -> Result<Option<WatchState>, StoreError> {
         Ok(self
-            .client
+            .client()
             .query_consistent_map::<WatchRow, _>(
                 "SELECT position_ms, duration_ms, watched, updated_at \
                  FROM watch_state WHERE user_id = $1 AND item_id = $2",
@@ -1782,7 +1778,7 @@ impl WatchStore for HiqliteAuthStore {
         }
         let ids_json = serde_json::to_string(item_ids).map_err(database_error)?;
         Ok(self
-            .client
+            .client()
             .query_consistent_map::<WatchMapRow, _>(
                 "SELECT w.item_id, w.position_ms, w.duration_ms, w.watched, w.updated_at \
                  FROM watch_state w JOIN json_each($1) j ON j.value = w.item_id \
@@ -1832,7 +1828,7 @@ impl WatchStore for HiqliteAuthStore {
                    RETURNING position_ms, duration_ms, watched, updated_at";
         validate_sql(sql)?;
         let returned = self
-            .client
+            .client()
             .execute_returning_map::<_, WatchRow>(
                 sql,
                 params!(
@@ -1890,7 +1886,7 @@ impl WatchStore for HiqliteAuthStore {
                    RETURNING position_ms, duration_ms, watched, updated_at";
         validate_sql(sql)?;
         let rows = self
-            .client
+            .client()
             .execute_returning_map::<_, WatchRow>(
                 sql,
                 params!(
@@ -1977,7 +1973,7 @@ impl WatchStore for HiqliteAuthStore {
         };
         validate_sql(&sql)?;
         let mut changed = self
-            .client
+            .client()
             .execute_returning_map::<_, IdRow>(sql, params!(item_id, user_id, now))
             .await
             .map_err(database_error)?
@@ -1993,7 +1989,7 @@ impl WatchStore for HiqliteAuthStore {
 
     async fn watch_rollup(&self, user_id: i64, item_id: i64) -> Result<WatchRollup, StoreError> {
         let rows = self
-            .client
+            .client()
             .query_consistent_map::<RollupRow, _>(
                 format!(
                     "WITH RECURSIVE tree(id) AS ( \
@@ -2030,7 +2026,7 @@ impl WatchStore for HiqliteAuthStore {
         }
         let list = id_list(ids);
         let rows = self
-            .client
+            .client()
             .query_consistent_map::<RollupRow, _>(
                 format!(
                     "WITH RECURSIVE tree(root, id) AS ( \
@@ -2083,7 +2079,7 @@ impl WatchStore for HiqliteAuthStore {
              ORDER BY w.updated_at DESC LIMIT $2",
             i = item_cols("i")
         );
-        self.client
+        self.client()
             .query_consistent_map::<InProgressRow, _>(sql, params!(user_id, limit))
             .await
             .map_err(database_error)?
@@ -2119,7 +2115,7 @@ impl WatchStore for HiqliteAuthStore {
             e = item_cols("e")
         );
         recent_items(
-            self.client
+            self.client()
                 .query_consistent_map::<RecentItemRow, _>(sql, params!(user_id, limit))
                 .await
                 .map_err(database_error)?,

@@ -12,7 +12,7 @@ use hiqlite::Row;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use super::hiqlite::{database_error, validate_sql, HiqliteAuthStore};
+use super::hiqlite::{database_error, timeout_store, validate_sql, HiqliteAuthStore, TimedClient};
 use super::LibraryStore;
 use crate::domain::{Library, LibraryKind, NewLibrary};
 use crate::error::StoreError;
@@ -138,7 +138,7 @@ END;
 
 pub(super) async fn install_schema(client: &hiqlite::Client) -> Result<(), StoreError> {
     validate_sql(CATALOG_SCHEMA)?;
-    for result in client.batch(CATALOG_SCHEMA).await.map_err(database_error)? {
+    for result in timeout_store(client.batch(CATALOG_SCHEMA)).await? {
         result.map_err(database_error)?;
     }
     Ok(())
@@ -148,7 +148,7 @@ struct JsonValueRow {
     value: String,
 }
 
-async fn rows(client: &hiqlite::Client, sql: &'static str) -> Result<Vec<String>, StoreError> {
+async fn rows(client: &TimedClient, sql: &'static str) -> Result<Vec<String>, StoreError> {
     Ok(client
         .query_map::<JsonValueRow, _>(sql, params!())
         .await
@@ -190,7 +190,7 @@ struct CatalogTruthDump {
     scan_reconcile_items: Vec<String>,
 }
 
-async fn authoritative_dump(client: &hiqlite::Client) -> Result<CatalogTruthDump, StoreError> {
+async fn authoritative_dump(client: &TimedClient) -> Result<CatalogTruthDump, StoreError> {
     Ok(CatalogTruthDump {
         libraries: rows(
             client,
@@ -243,14 +243,12 @@ async fn authoritative_dump(client: &hiqlite::Client) -> Result<CatalogTruthDump
     })
 }
 
-pub(super) async fn local_catalog_truth_digest(
-    client: &hiqlite::Client,
-) -> Result<String, StoreError> {
+pub(super) async fn local_catalog_truth_digest(client: &TimedClient) -> Result<String, StoreError> {
     let bytes = serde_json::to_vec(&authoritative_dump(client).await?).map_err(database_error)?;
     Ok(hex::encode(Sha256::digest(bytes)))
 }
 
-pub(super) async fn local_catalog_digest(client: &hiqlite::Client) -> Result<String, StoreError> {
+pub(super) async fn local_catalog_digest(client: &TimedClient) -> Result<String, StoreError> {
     let truth = authoritative_dump(client).await?;
     let dump = CatalogDump {
         libraries: truth.libraries,
@@ -364,7 +362,7 @@ impl LibraryStore for HiqliteAuthStore {
         );
         validate_sql(&sql)?;
         let row = self
-            .client
+            .client()
             .execute_returning_map_one::<_, LibraryRow>(
                 sql,
                 params!(
@@ -392,7 +390,7 @@ impl LibraryStore for HiqliteAuthStore {
         );
         validate_sql(&sql)?;
         one_returning_library(
-            self.client
+            self.client()
                 .execute_returning_map::<_, LibraryRow>(
                     sql,
                     params!(
@@ -420,7 +418,7 @@ impl LibraryStore for HiqliteAuthStore {
         );
         validate_sql(&sql)?;
         one_returning_library(
-            self.client
+            self.client()
                 .execute_returning_map::<_, LibraryRow>(
                     sql,
                     params!(scan_interval_mins.max(0), refresh_interval_mins.max(0), id),
@@ -451,7 +449,7 @@ impl LibraryStore for HiqliteAuthStore {
 
     async fn get_library(&self, id: i64) -> Result<Option<Library>, StoreError> {
         one_library(
-            self.client
+            self.client()
                 .query_consistent_map::<LibraryRow, _>(
                     format!("SELECT {LIB_COLS} FROM libraries WHERE id = $1"),
                     params!(id),
@@ -462,7 +460,7 @@ impl LibraryStore for HiqliteAuthStore {
     }
 
     async fn list_libraries(&self) -> Result<Vec<Library>, StoreError> {
-        self.client
+        self.client()
             .query_consistent_map::<LibraryRow, _>(
                 format!("SELECT {LIB_COLS} FROM libraries ORDER BY name"),
                 params!(),
