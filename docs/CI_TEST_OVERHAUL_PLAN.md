@@ -578,6 +578,15 @@ work remains parallel with other same-surface integration tests after T0.
 
 ### 9.3 Flake policy
 
+**Status: in effect since 2026-08-09.**
+
+Refresh the compact outcome ledger with
+`scripts/ci-flake-report --runs 30`. The committed
+[`validation/ci-flake-ledger.json`](../validation/ci-flake-ledger.json) records
+each recent CI job's first-class GitHub conclusion and duration, plus per-job
+median and p95. It is evidence for ownership and quarantine decisions, not a
+rerun mechanism.
+
 1. A failing deterministic test fails the job immediately.
 2. CI may rerun the exact test once for diagnosis, but the job remains failed
    and records `flaky-confirmed` when the retry passes.

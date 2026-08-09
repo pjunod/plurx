@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import re
@@ -210,6 +211,23 @@ class OperationsContractCase(unittest.TestCase):
                     if "\n    timeout-minutes:" not in block
                 ]
                 self.assertEqual([], missing, f"jobs without timeouts in {path}")
+
+    def test_ci_flake_ledger_records_real_job_outcomes_and_durations(self):
+        script = ROOT / "scripts/ci-flake-report"
+        subprocess.run([str(script), "--help"], check=True, stdout=subprocess.PIPE)
+        ledger = json.loads(read("validation/ci-flake-ledger.json"))
+
+        self.assertEqual(ledger["schema"], 1)
+        self.assertEqual(ledger["repository"], "pjunod/plurx")
+        self.assertEqual(ledger["workflow"], "ci.yml")
+        self.assertGreaterEqual(ledger["source"]["completed_runs_returned"], 1)
+        self.assertTrue(ledger["jobs"])
+        self.assertTrue(ledger["summary"])
+        for job in ledger["jobs"]:
+            self.assertIsInstance(job["conclusion"], str)
+            self.assertIsInstance(job["duration_seconds"], (int, float))
+            self.assertGreaterEqual(job["duration_seconds"], 0)
+            self.assertIsInstance(job["timestamp_anomaly"], bool)
 
     def test_container_smoke_keeps_non_root_state_port_and_cleanup_contracts(self):
         smoke = read("scripts/container-smoke")

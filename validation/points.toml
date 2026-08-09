@@ -499,6 +499,7 @@ paths = [
   "Makefile",
   "docs/VALIDATION.md",
   "scripts/pre-commit",
+  "scripts/ci-flake-report",
   "scripts/history-audit",
   "scripts/validate",
   "tests/validation/**",
