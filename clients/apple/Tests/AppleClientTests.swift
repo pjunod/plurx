@@ -745,6 +745,225 @@ final class AppleClientTests: XCTestCase {
         XCTAssertNil(state.pendingMs)
     }
 
+    func testClearInvalidatesOutstandingSeekGenerations() {
+        var state = PlayerSeekState()
+        let request = state.absolute(90_000, durationMs: 600_000)
+
+        state.clear()
+
+        XCTAssertNil(state.pendingMs)
+        XCTAssertFalse(
+            state.complete(generation: request.generation),
+            "a seek scheduled before stop() must not fire into the next playback"
+        )
+    }
+
+    func testSeekRoutePrefersTheNativeClockInsideTheAdvertisedWindow() {
+        // Growing HLS session that began at film-time 60 s; the served
+        // window currently spans item-local 0 s .. 90 s (film 60 s .. 150 s).
+        // A backward or short forward scrub inside it must not pay a server
+        // session teardown — it seeks the item's own clock, mapped by base.
+        let route = PlayerController.seekRoute(
+            targetMs: 100_000,
+            baseMs: 60_000,
+            usesDirectTimeline: false,
+            isVOD: false,
+            isChangingStream: false,
+            seekableRangesMs: [0...90_000]
+        )
+        XCTAssertEqual(route, .native(itemMs: 40_000))
+    }
+
+    func testSeekRouteReopensOutsideTheAdvertisedWindow() {
+        // Before the session's origin: that media was never in this playlist.
+        XCTAssertEqual(
+            PlayerController.seekRoute(
+                targetMs: 30_000,
+                baseMs: 60_000,
+                usesDirectTimeline: false,
+                isVOD: false,
+                isChangingStream: false,
+                seekableRangesMs: [0...90_000]
+            ),
+            .reopen
+        )
+        // Far past the frontier: not transcoded yet — only a reopen reaches it.
+        XCTAssertEqual(
+            PlayerController.seekRoute(
+                targetMs: 600_000,
+                baseMs: 60_000,
+                usesDirectTimeline: false,
+                isVOD: false,
+                isChangingStream: false,
+                seekableRangesMs: [0...90_000]
+            ),
+            .reopen
+        )
+        // No window yet (item still attaching, playlist unloaded): reopen.
+        XCTAssertEqual(
+            PlayerController.seekRoute(
+                targetMs: 100_000,
+                baseMs: 60_000,
+                usesDirectTimeline: false,
+                isVOD: false,
+                isChangingStream: false,
+                seekableRangesMs: []
+            ),
+            .reopen
+        )
+    }
+
+    func testSeekRouteHoldsBackFromTheLiveEdgeAndSnapsNearMisses() {
+        // Inside the window but within the holdback of its end: land at the
+        // holdback, where media already exists, instead of on the very edge.
+        XCTAssertEqual(
+            PlayerController.seekRoute(
+                targetMs: 149_800,
+                baseMs: 60_000,
+                usesDirectTimeline: false,
+                isVOD: false,
+                isChangingStream: false,
+                seekableRangesMs: [0...90_000],
+                liveEdgeHoldbackMs: 1_500,
+                liveEdgeSnapWindowMs: 2_500
+            ),
+            .native(itemMs: 88_500)
+        )
+        // Just past the edge (within the snap window): same landing — a
+        // couple of seconds is not worth a whole server session.
+        XCTAssertEqual(
+            PlayerController.seekRoute(
+                targetMs: 152_000,
+                baseMs: 60_000,
+                usesDirectTimeline: false,
+                isVOD: false,
+                isChangingStream: false,
+                seekableRangesMs: [0...90_000],
+                liveEdgeHoldbackMs: 1_500,
+                liveEdgeSnapWindowMs: 2_500
+            ),
+            .native(itemMs: 88_500)
+        )
+        // Beyond the snap window: the reopen path owns it.
+        XCTAssertEqual(
+            PlayerController.seekRoute(
+                targetMs: 153_000,
+                baseMs: 60_000,
+                usesDirectTimeline: false,
+                isVOD: false,
+                isChangingStream: false,
+                seekableRangesMs: [0...90_000],
+                liveEdgeHoldbackMs: 1_500,
+                liveEdgeSnapWindowMs: 2_500
+            ),
+            .reopen
+        )
+        // A window narrower than the holdback offers no safe landing at all.
+        XCTAssertEqual(
+            PlayerController.seekRoute(
+                targetMs: 60_500,
+                baseMs: 60_000,
+                usesDirectTimeline: false,
+                isVOD: false,
+                isChangingStream: false,
+                seekableRangesMs: [0...1_000],
+                liveEdgeHoldbackMs: 1_500,
+                liveEdgeSnapWindowMs: 2_500
+            ),
+            .reopen
+        )
+    }
+
+    func testSeekRouteSeeksInsideALaterRangeInsteadOfSnappingToAnEarlierEdge() {
+        // Discontiguous windows: the target sits squarely inside the second
+        // range and must seek there natively — not snap to the first range's
+        // holdback merely because that edge's snap window also covers it.
+        XCTAssertEqual(
+            PlayerController.seekRoute(
+                targetMs: 12_000,
+                baseMs: 0,
+                usesDirectTimeline: false,
+                isVOD: false,
+                isChangingStream: false,
+                seekableRangesMs: [0...10_000, 11_000...90_000],
+                liveEdgeHoldbackMs: 1_500,
+                liveEdgeSnapWindowMs: 2_500
+            ),
+            .native(itemMs: 12_000)
+        )
+        // A target inside the interior gap between ranges reopens: that
+        // media genuinely is not in the playlist, and only the live edge —
+        // the greatest upper bound — earns the snap.
+        XCTAssertEqual(
+            PlayerController.seekRoute(
+                targetMs: 10_300,
+                baseMs: 0,
+                usesDirectTimeline: false,
+                isVOD: false,
+                isChangingStream: false,
+                seekableRangesMs: [0...10_000, 11_000...90_000],
+                liveEdgeHoldbackMs: 1_500,
+                liveEdgeSnapWindowMs: 2_500
+            ),
+            .reopen
+        )
+        // Just past the true live edge still snaps onto its holdback.
+        XCTAssertEqual(
+            PlayerController.seekRoute(
+                targetMs: 91_000,
+                baseMs: 0,
+                usesDirectTimeline: false,
+                isVOD: false,
+                isChangingStream: false,
+                seekableRangesMs: [0...10_000, 11_000...90_000],
+                liveEdgeHoldbackMs: 1_500,
+                liveEdgeSnapWindowMs: 2_500
+            ),
+            .native(itemMs: 88_500)
+        )
+    }
+
+    func testSeekRouteKeepsVODAndDirectOnTheAbsoluteClockAndDefersToAChange() {
+        // VOD and direct timelines are fully seekable and their local clock
+        // is film time — the target passes through unmapped, whatever the
+        // advertised ranges say.
+        XCTAssertEqual(
+            PlayerController.seekRoute(
+                targetMs: 300_000,
+                baseMs: 0,
+                usesDirectTimeline: true,
+                isVOD: true,
+                isChangingStream: false,
+                seekableRangesMs: []
+            ),
+            .native(itemMs: 300_000)
+        )
+        XCTAssertEqual(
+            PlayerController.seekRoute(
+                targetMs: 300_000,
+                baseMs: 0,
+                usesDirectTimeline: false,
+                isVOD: true,
+                isChangingStream: false,
+                seekableRangesMs: []
+            ),
+            .native(itemMs: 300_000)
+        )
+        // A change in flight owns the player; the reopen queue serializes
+        // the seek behind it — even on a VOD timeline.
+        XCTAssertEqual(
+            PlayerController.seekRoute(
+                targetMs: 300_000,
+                baseMs: 0,
+                usesDirectTimeline: true,
+                isVOD: true,
+                isChangingStream: true,
+                seekableRangesMs: [0...600_000]
+            ),
+            .reopen
+        )
+    }
+
     func testStallDetectorIgnoresPausesAndRecoversOnlyAfterSustainedNoProgress() {
         var detector = PlaybackStallDetector()
 

@@ -1489,8 +1489,11 @@ struct PlayerView: View {
                     scrubMs = Double(controller.currentMs)
                     isScrubbing = true
                 } else {
-                    isScrubbing = false
+                    // Seek first: it publishes the target into
+                    // `controller.currentMs` synchronously, so the binding's
+                    // fallback never flashes the pre-scrub position.
                     controller.seek(toMs: Int(scrubMs))
+                    isScrubbing = false
                 }
             }
         )

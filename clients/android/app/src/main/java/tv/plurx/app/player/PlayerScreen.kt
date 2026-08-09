@@ -133,11 +133,12 @@ import tv.plurx.app.ui.theme.Muted
 import tv.plurx.app.ui.theme.Surface
 
 private data class Plan(
-    val title: String,
+    override val title: String,
     val subtitle: String?,
     val releaseDate: String?,
     val overview: String?,
     override val durationMs: Long,
+    override val videoCodec: String?,
     override val fileId: Long,
     override val playUrl: String,
     override val mode: String,
@@ -171,6 +172,7 @@ private suspend fun loadPlan(vm: AppViewModel, itemId: Long, fileId: Long): Plan
         releaseDate = playerDateLabel(detail.item.air_date, detail.item.year),
         overview = detail.item.overview,
         durationMs = file?.duration_ms ?: detail.item.runtime_ms ?: 0L,
+        videoCodec = decision.source?.video_codec ?: file?.video_codec,
         fileId = fileId,
         playUrl = Session.url(decision.delivery?.url ?: decision.play_url),
         mode = mode,
@@ -347,6 +349,10 @@ fun PlayerScreen(
     var failed by remember(itemId, fileId) { mutableStateOf(false) }
     var generation by remember(itemId, fileId) { mutableIntStateOf(0) }
     var resumeAt by remember(itemId, fileId) { mutableLongStateOf(startMs) }
+    var startReason by remember(itemId, fileId) {
+        mutableStateOf(if (startMs > 0) "resume" else "cold-start")
+    }
+    var attemptOpenedAtMs by remember(itemId, fileId) { mutableLongStateOf(monotonicNowMs()) }
     // Survives the plan, like the A/V correction beside it: a quality change
     // reloads the plan and rebuilds the controller, and the viewer's audio and
     // subtitle picks must come back with them.
@@ -358,6 +364,10 @@ fun PlayerScreen(
 
     LaunchedEffect(itemId, fileId, generation) {
         failed = false
+        // Anchor TTFF before the detail and decision requests. This is the
+        // Android equivalent of the web click timestamp, not merely decoder
+        // preparation latency.
+        attemptOpenedAtMs = monotonicNowMs()
         val loaded = loadPlan(vm, itemId, fileId)
         if (loaded == null) failed = true else plan = loaded
     }
@@ -366,7 +376,10 @@ fun PlayerScreen(
         when {
             failed -> PlaybackFailed(
                 message = "Couldn't start playback.",
-                onRetry = { generation++ },
+                onRetry = {
+                    startReason = "fallback"
+                    generation++
+                },
                 onExit = onExit,
             )
             plan == null -> {
@@ -378,14 +391,17 @@ fun PlayerScreen(
                 itemId = itemId,
                 plan = plan!!,
                 startMs = resumeAt,
+                startReason = startReason,
+                attemptOpenedAtMs = attemptOpenedAtMs,
                 audioOffsetMs = playbackAudioOffset,
                 onAudioOffsetChanged = { playbackAudioOffset = it },
                 retainedAudio = playbackAudio,
                 onAudioChanged = { playbackAudio = it },
                 retainedSubtitle = playbackSubtitle,
                 onSubtitleChanged = { playbackSubtitle = SubtitleChoice(it) },
-                onReload = { position ->
+                onReload = { position, reason ->
                     resumeAt = position
+                    startReason = reason
                     plan = null
                     generation++
                 },
@@ -478,13 +494,15 @@ private fun PlayerContent(
     itemId: Long,
     plan: Plan,
     startMs: Long,
+    startReason: String,
+    attemptOpenedAtMs: Long,
     audioOffsetMs: Long,
     onAudioOffsetChanged: (Long) -> Unit,
     retainedAudio: Long?,
     onAudioChanged: (Long) -> Unit,
     retainedSubtitle: SubtitleChoice?,
     onSubtitleChanged: (Long?) -> Unit,
-    onReload: (Long) -> Unit,
+    onReload: (Long, String) -> Unit,
     onPlayNext: (PlaybackTarget) -> Unit,
     onExit: () -> Unit,
 ) {
@@ -616,7 +634,7 @@ private fun PlayerContent(
             }
         }
         controller.player.addListener(listener)
-        controller.startAt(startMs)
+        controller.startAt(startMs, startReason, attemptOpenedAtMs)
         onDispose {
             vm.postProgress(itemId, controller.realPosition(), plan.durationMs)
             controller.player.removeListener(listener)
@@ -760,7 +778,7 @@ private fun PlayerContent(
     playFailure?.let { message ->
         PlaybackFailed(
             message = message,
-            onRetry = { onReload(controller.realPosition()) },
+            onRetry = { onReload(controller.realPosition(), "fallback") },
             onExit = onExit,
         )
         return
@@ -1282,7 +1300,7 @@ private fun PlayerSettings(
     audioOffsetMs: Long,
     declaredOffsetMs: Long?,
     currentPosition: () -> Long,
-    onReload: (Long) -> Unit,
+    onReload: (Long, String) -> Unit,
     onAudioOffset: (Long) -> Unit,
     onDismiss: () -> Unit,
 ) {
@@ -1307,7 +1325,7 @@ private fun PlayerSettings(
             ) {
                 val position = currentPosition()
                 vm.setPlaybackQuality(quality)
-                onReload(position)
+                onReload(position, "quality")
             }
         }
         Text("Audio sync", color = Muted, style = MaterialTheme.typography.labelMedium, modifier = Modifier.padding(top = 12.dp))

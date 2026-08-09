@@ -302,12 +302,28 @@ struct PlayerSeekState: Equatable {
         if pendingMs == positionMs { pendingMs = nil }
     }
 
-    mutating func clear() { pendingMs = nil }
+    /// Also advances the generation: a teardown must invalidate every seek
+    /// still sleeping in its coalescing pause or awaiting AVPlayer, or a
+    /// stop()-then-start() boundary (autoplay-next) lets a stale task fire
+    /// into the next playback with the previous film's target.
+    mutating func clear() {
+        pendingMs = nil
+        generation &+= 1
+    }
 
     private static func clamp(_ requestedMs: Int, durationMs: Int) -> Int {
         let upper = durationMs > 0 ? max(0, durationMs - 2_000) : Int.max
         return min(max(0, requestedMs), upper)
     }
+}
+
+/// How an interactive seek reaches its target. `native` moves the current
+/// item's own clock — instant, no server round trip; `reopen` replaces the
+/// server session at the film position, which is the only way to reach media
+/// the growing playlist has not published (or has already pruned).
+enum PlayerSeekRoute: Equatable {
+    case native(itemMs: Int)
+    case reopen
 }
 
 enum PlaybackStallAction: Equatable {
@@ -1058,6 +1074,14 @@ final class PlayerController: ObservableObject {
         playbackRecoveryMonitor.reset()
         await loadOffline(url: offlineAssetURL, startMs: positionMs)
         isChangingStream = false
+        // The status observer holds its fire while `isChangingStream` is up;
+        // a replacement that failed during its own load is caught here, the
+        // same re-check `open()` performs for server sessions. `loadOffline`'s
+        // own error paths have already surfaced through `fail()` — only a
+        // suppressed KVO failure needs the second look.
+        if !failed, let item = player.currentItem, item.status == .failed {
+            await handleItemFailure(item)
+        }
     }
     #endif
 
@@ -1106,20 +1130,66 @@ final class PlayerController: ObservableObject {
         ttffMeasurement.rebasePosition(at: target)
         refreshPGSOverlayWindow(at: target, force: true)
         playbackRecoveryMonitor.reset()
-        let requiresReopen = isChangingStream || !(usesDirectTimeline || isVOD)
+        let route = Self.seekRoute(
+            targetMs: target,
+            baseMs: baseMs,
+            usesDirectTimeline: usesDirectTimeline,
+            isVOD: isVOD,
+            isChangingStream: isChangingStream,
+            seekableRangesMs: currentItemSeekableRangesMs()
+        )
         Task {
-            if !requiresReopen {
+            switch route {
+            case .native(let itemMs):
                 _ = await player.seek(
-                    to: CMTime(seconds: Double(target) / 1000.0, preferredTimescale: 600),
+                    to: CMTime(seconds: Double(itemMs) / 1000.0, preferredTimescale: 600),
                     toleranceBefore: .zero,
                     toleranceAfter: .zero
                 )
+                // Only the newest seek may publish or escalate; an older
+                // completion arriving after AVPlayer cancelled it must not.
+                guard generation == seekState.generation else { return }
+                let landed = realPositionMs()
+                // A growing window can go stale between the route decision
+                // and the landing — AVPlayer then clamps somewhere else
+                // entirely. The reopen path is the truth for that target;
+                // `pendingMs` still names it, so the bar holds the target
+                // and the reopen drain completes it.
+                if !usesDirectTimeline, !isVOD, abs(landed - target) > 5_000 {
+                    await reopen(at: target)
+                    return
+                }
                 guard seekState.complete(generation: generation) else { return }
-                currentMs = realPositionMs()
+                currentMs = landed
                 updateNowPlaying()
-            } else {
+            case .reopen:
+                // Coalesce a burst of out-of-window commands (remote-mash,
+                // repeated scrubs) into the single newest reopen instead of
+                // one server session per press. The optimistic target is
+                // already on screen; only the newest generation survives
+                // the pause. Track/quality changes never pass through here,
+                // so their reopens stay immediate.
+                try? await Task.sleep(for: .milliseconds(350))
+                guard generation == seekState.generation else { return }
                 await reopen(at: target)
             }
+        }
+    }
+
+    /// The current item's seekable windows, in its own local clock. Empty
+    /// while no item is attached or the playlist has not loaded yet — both
+    /// route a seek to the reopen path.
+    private func currentItemSeekableRangesMs() -> [ClosedRange<Int>] {
+        guard let item = player.currentItem else { return [] }
+        return item.seekableTimeRanges.compactMap { value in
+            let range = value.timeRangeValue
+            let start = range.start.seconds
+            let duration = range.duration.seconds
+            guard start.isFinite, duration.isFinite, duration > 0 else { return nil }
+            let lower = Int(start * 1000)
+            let upper = Int((start + duration) * 1000)
+            guard upper > lower else { return nil }
+            return lower...upper
         }
     }
 
@@ -1364,6 +1434,10 @@ final class PlayerController: ObservableObject {
             try await open(decision: decision, at: next)
             guard started else {
                 reopenQueue.clear()
+                // Parity with `stop()`: nothing will complete a pending
+                // target after the viewer has left, and a stale one would
+                // freeze `currentMs` on the next playback of this view.
+                seekState.clear()
                 return
             }
             // A newer `open()` superseded this one while it ran (P2-6). The
@@ -1606,6 +1680,16 @@ final class PlayerController: ObservableObject {
                 ttffMeasurement.rebasePosition(at: realPositionMs())
             } catch {
                 if isSuperseded(generation) { return }
+                // A failed replacement surfaces here on the VOD/direct resume
+                // path before the post-open re-check below can run, and its
+                // status observer fired into the change-suppression window.
+                // Route it through the same ladder instead of a bare failure,
+                // or the compatibility fallbacks are silently lost.
+                if item.status == .failed {
+                    isChangingStream = false
+                    await handleItemFailure(item)
+                    return
+                }
                 throw error
             }
         }
@@ -1625,6 +1709,12 @@ final class PlayerController: ObservableObject {
         failed = false
         isChangingStream = false
         updateNowPlaying()
+        // The status observer holds its fire while `isChangingStream` is up,
+        // so a replacement that failed during its own attach is caught here.
+        if item.status == .failed {
+            await handleItemFailure(item)
+            return
+        }
         // P1-2: `reopen()` queues rather than overlaps an in-flight open, and
         // this open applied the selection it captured at entry, so a track
         // picked during a cold extraction would otherwise show a checkmark
@@ -2136,34 +2226,47 @@ final class PlayerController: ObservableObject {
         itemStatusObservation = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
             guard item.status == .failed else { return }
             Task { @MainActor in
-                guard let self, self.player.currentItem === item else { return }
-                self.reportPlaybackFailure(item)
-                if self.started {
-                    // P2-6: this item is already dead, so its `currentTime()`
-                    // is 0 or invalid and a VOD/direct retry would silently
-                    // restart the film at 0:00. The last position the periodic
-                    // observer saw is the truthful retry point. The transport
-                    // intent survives in `wantsPlayback`, so a viewer who was
-                    // paused when the item failed stays paused.
-                    let position = Self.compatibilityRetryPositionMs(lastObservedMs: self.currentMs)
-                    if await self.retryEstablishedHDRDelivery(at: position) { return }
-                    let event = item.errorLog()?.events.last
-                    if Self.isCompatibilityPlaybackFailure(
-                        error: item.error as NSError?,
-                        eventDomain: event?.errorDomain,
-                        eventStatus: event?.errorStatusCode,
-                        eventComment: event?.errorComment
-                    ), await self.retryWithNextCompatibilityFallback(at: position) { return }
-                }
-                self.player.pause()
-                self.isPlaying = false
-                self.wantsPlayback = false
-                self.isChangingStream = false
-                self.failed = true
-                self.playbackError = item.error?.localizedDescription
-                    ?? PlaybackPreparationError.failed.localizedDescription
+                await self?.handleItemFailure(item)
             }
         }
+    }
+
+    /// A failed item advances the recovery ladder — unless a stream change is
+    /// already replacing it. The predecessor's failure during a seek or track
+    /// change is expected noise: server-side supersession deletes its playlist
+    /// the moment the successor's create begins, so its outstanding fetches
+    /// 404 while the new session spins up. Reacting to that raced a second
+    /// open against the one in flight — flipping delivery down the SDR or
+    /// transcode ladder, or stopping playback outright, mid-seek. `open()`
+    /// re-checks the successor's own status once the change lands, so a
+    /// genuinely failed replacement is still handled.
+    private func handleItemFailure(_ item: AVPlayerItem) async {
+        guard player.currentItem === item, !isChangingStream else { return }
+        reportPlaybackFailure(item)
+        if started {
+            // P2-6: this item is already dead, so its `currentTime()`
+            // is 0 or invalid and a VOD/direct retry would silently
+            // restart the film at 0:00. The last position the periodic
+            // observer saw is the truthful retry point. The transport
+            // intent survives in `wantsPlayback`, so a viewer who was
+            // paused when the item failed stays paused.
+            let position = Self.compatibilityRetryPositionMs(lastObservedMs: currentMs)
+            if await retryEstablishedHDRDelivery(at: position) { return }
+            let event = item.errorLog()?.events.last
+            if Self.isCompatibilityPlaybackFailure(
+                error: item.error as NSError?,
+                eventDomain: event?.errorDomain,
+                eventStatus: event?.errorStatusCode,
+                eventComment: event?.errorComment
+            ), await retryWithNextCompatibilityFallback(at: position) { return }
+        }
+        player.pause()
+        isPlaying = false
+        wantsPlayback = false
+        isChangingStream = false
+        failed = true
+        playbackError = item.error?.localizedDescription
+            ?? PlaybackPreparationError.failed.localizedDescription
     }
 
     private func reportPlaybackFailure(_ item: AVPlayerItem) {
@@ -2300,6 +2403,63 @@ final class PlayerController: ObservableObject {
         alreadyAttempted: Bool
     ) -> Bool {
         canRetry && !alreadyAttempted
+    }
+
+    /// Route an interactive seek. A growing HLS session's playlist advertises
+    /// a real seekable window — everything published and not yet pruned — and
+    /// AVPlayer seeks inside it instantly. Replacing the server session is
+    /// only necessary when the target lies outside that window (not yet
+    /// transcoded, or already pruned by retention). Before this routing every
+    /// non-VOD seek was a full session teardown and create: multi-second
+    /// spinner per scrub, one server round trip per ±10 s press.
+    ///
+    /// `seekableRangesMs` is in the item's local clock; `targetMs`/`baseMs`
+    /// are film time, with `baseMs` the film position of item-local zero.
+    /// The holdback keeps a native landing short of the live edge, where no
+    /// future media exists yet; a target just past the edge snaps to the
+    /// holdback instead of paying a whole reopen for a couple of seconds.
+    nonisolated static func seekRoute(
+        targetMs: Int,
+        baseMs: Int,
+        usesDirectTimeline: Bool,
+        isVOD: Bool,
+        isChangingStream: Bool,
+        seekableRangesMs: [ClosedRange<Int>],
+        liveEdgeHoldbackMs: Int = 1_500,
+        liveEdgeSnapWindowMs: Int = 2_500
+    ) -> PlayerSeekRoute {
+        // A change in flight owns the player; the reopen queue serializes
+        // behind it. This branch also keeps the old invariant that the
+        // native leg below never runs with a nonzero base on VOD/direct.
+        if isChangingStream { return .reopen }
+        if usesDirectTimeline || isVOD {
+            // Fully seekable timelines whose local clock is film time.
+            return .native(itemMs: targetMs)
+        }
+        let local = targetMs - baseMs
+        // Exact containment first, across every advertised range: a target
+        // inside a later range must seek there, not snap to an earlier
+        // range's edge (PR #122 review: [0…10 s, 11 s…90 s] with a 12 s
+        // target belongs at 12 s, not at the first range's 8.5 s holdback).
+        for range in seekableRangesMs {
+            let safeUpper = range.upperBound - liveEdgeHoldbackMs
+            guard safeUpper >= range.lowerBound else { continue }
+            if local >= range.lowerBound && local <= safeUpper {
+                return .native(itemMs: local)
+            }
+        }
+        // Snapping applies only at the live edge — the range with the
+        // greatest upper bound — never across an interior gap, whose media
+        // genuinely is not in the playlist.
+        if let latest = seekableRangesMs.max(by: { $0.upperBound < $1.upperBound }) {
+            let safeUpper = latest.upperBound - liveEdgeHoldbackMs
+            if safeUpper >= latest.lowerBound,
+               local > safeUpper,
+               local <= latest.upperBound + liveEdgeSnapWindowMs {
+                return .native(itemMs: safeUpper)
+            }
+        }
+        return .reopen
     }
 
     /// AVPlayer owns ordinary buffering and resumes it when enough media has

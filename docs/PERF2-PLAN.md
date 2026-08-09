@@ -215,14 +215,17 @@ Numbered because milestones cite them.
 ## 3. N0 — Telemetry becomes data
 
 **Implementation status (2026-08-09):** server storage, ingest, lifecycle
-events, metrics, readers, census fields, the web parity slice, and Apple TTFF
-parity are landed in source. Android parity and the named-machine acceptance
-runs remain and must not be inferred from these source milestones.
+events, metrics, readers, census fields, the web parity slice, Apple build 46
+TTFF parity, and Android build 24 native telemetry parity are landed in
+source. Named-machine acceptance runs must not be inferred from source or
+automated gates.
 
-The 2026-08-09 physical iPhone attempt joined a live remux session but produced
-no `ttff`: the server suspended its growing EVENT playlist at 187 seconds ahead
-and AVPlayer failed it as unchanged. That is failed evidence, not acceptance;
-§7.4 keeps ahead-window policy changes outside this plan.
+The 2026-08-09 physical iPhone attempts joined live remux sessions but
+produced no `ttff`: the server suspended growing EVENT playlists at 187 and
+182 seconds ahead, and playback did not reach a first frame. That is failed
+evidence, not acceptance; §7.4 keeps ahead-window policy changes outside this
+plan. Android physical-device acceptance and all other named-machine runs
+remain unclaimed.
 
 **Objective:** the beacons plurx already emits become queryable rows that
 survive restart, get their server-side context attached at ingest, and

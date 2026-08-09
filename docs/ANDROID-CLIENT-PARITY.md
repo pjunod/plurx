@@ -26,6 +26,16 @@ for that viewer and keeps server administration out of the comparison.
 > Two acceptance checks remain device-only and unproven in CI: `ShelfFocusTest`
 > (needs a TV emulator or device) and the badge's on-screen behaviour on an HDR
 > panel.
+>
+> Performance II N0 source parity is Android build 24: the Media3 controller
+> posts authenticated `ttff`, passive six-second `stall`, and
+> `playback_error` events through the shared client, with attempt and live HLS
+> session identity. TTFF starts before the detail/decision requests. A stall is
+> emitted with its final duration only after established, requested playback
+> recovers; startup, paused buffering, and seek waits are excluded. Unit tests
+> and lint prove the wire, controller wiring, reason, and timing contracts; a
+> physical Android play producing a joined `ttff` row remains an explicit,
+> unclaimed acceptance run.
 
 ## Viewer surface
 
@@ -46,6 +56,7 @@ for that viewer and keeps server administration out of the comparison.
 | Autoplay next episode | Ordered season/show traversal |
 | A/V sync correction | Persistent per-file correction |
 | Playback decision/stats | In-player information panel, including a "Dynamic range" row |
+| Durable playback telemetry | TTFF, passive buffering-stall, and playback-error beacons with attempt/session context |
 | Source-vs-delivered media badges | Dynamic-range chip dims and names what is on screen (`DV → HDR10`) |
 | Classic, Terminal, noirr | Matching palettes, shapes, and typography |
 | System, light, dark appearance | Independent appearance preference |
