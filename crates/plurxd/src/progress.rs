@@ -472,15 +472,28 @@ mod tests {
             .expect("latest");
         assert!(!latest.committed);
         tokio::time::advance(Duration::from_secs(5)).await;
-        tokio::task::yield_now().await;
-        assert_eq!(
-            store
+        // The worker's flush crosses the blocking pool, so virtual time cannot
+        // order that durable write before this read; under load the single
+        // connection mutex is not FIFO and a one-shot read raced the UPDATE
+        // (observed as 1_000 on a saturated 2-core host). Poll until the row
+        // leaves the leading commit — bounded, so a coalescer that never
+        // flushes still fails instead of hanging, and a flush that keeps the
+        // wrong beat still fails the equality below.
+        let mut position = 1_000;
+        for _ in 0..1_000 {
+            tokio::task::yield_now().await;
+            position = store
                 .watch_state(user_id, item_id)
                 .await
                 .expect("watch")
                 .expect("row")
-                .position_ms,
-            8_000,
+                .position_ms;
+            if position != 1_000 {
+                break;
+            }
+        }
+        assert_eq!(
+            position, 8_000,
             "the trailing flush keeps the newest coalesced beat"
         );
     }
