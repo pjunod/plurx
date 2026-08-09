@@ -10,7 +10,13 @@ import tempfile
 import unittest
 import xml.etree.ElementTree as ET
 
-from validation.ci_scope import all_scope, is_docs_only, scope_for_paths
+from validation.ci_scope import (
+    all_scope,
+    is_docs_only,
+    needs_rust_gate,
+    resolve_scope,
+    scope_for_paths,
+)
 from validation.runner import (
     CatalogError,
     CheckResult,
@@ -113,7 +119,12 @@ class CatalogCase(unittest.TestCase):
         operations = scope_for_paths(
             catalog, ("scripts/ship", "tests/operations/test_contracts.py")
         )
-        self.assertFalse(any(operations.values()))
+        # Scripts feed packaging and selection behavior the cargo suite pins,
+        # so the Rust lane stays on — but no client or container surface does.
+        self.assertTrue(operations["rust"])
+        self.assertFalse(
+            any(value for key, value in operations.items() if key != "rust")
+        )
 
         android = scope_for_paths(
             catalog,
@@ -121,21 +132,29 @@ class CatalogCase(unittest.TestCase):
         )
         self.assertTrue(android["android_jvm"])
         self.assertTrue(android["android_device"])
+        self.assertFalse(android["rust"])
+        self.assertFalse(android["apple"])
         self.assertFalse(android["web_layout"])
         self.assertFalse(android["release_build"])
         self.assertFalse(android["container"])
 
+        # The pull-request lane defers the server→client fan-out to the merge
+        # queue: a server diff keeps the Rust, release, and container lanes and
+        # runs no client simulator, JVM, or layout sweep on the PR itself.
         server = scope_for_paths(catalog, ("crates/plurxd/src/http/stream.rs",))
-        self.assertTrue(server["apple"])
-        self.assertTrue(server["android_jvm"])
-        self.assertTrue(server["web_layout"])
+        self.assertTrue(server["rust"])
         self.assertTrue(server["release_build"])
         self.assertTrue(server["container"])
+        self.assertFalse(server["apple"])
+        self.assertFalse(server["android_jvm"])
+        self.assertFalse(server["web_layout"])
         self.assertFalse(server["android_device"])
         self.assertFalse(server["hiqlite_spike"])
         self.assertFalse(server["cluster_auth"])
 
         web = scope_for_paths(catalog, ("crates/plurxd/src/web/app.js",))
+        self.assertTrue(web["rust"])
+        self.assertTrue(web["web_layout"])
         self.assertFalse(web["hiqlite_spike"])
         self.assertFalse(web["cluster_auth"])
 
@@ -164,6 +183,68 @@ class CatalogCase(unittest.TestCase):
         )
         self.assertTrue(all(executable_scope))
         self.assertFalse(fallback["docs_only"])
+
+    def test_client_only_diffs_skip_the_cargo_lane_but_keep_their_own(self):
+        catalog = load_catalog(ROOT / "validation/points.toml")
+
+        apple = scope_for_paths(
+            catalog, ("clients/apple/Sources/PlayerSurface.swift",)
+        )
+        self.assertFalse(apple["rust"])
+        self.assertTrue(apple["apple"])
+        self.assertTrue(apple["mobile_version"])
+        self.assertFalse(apple["android_jvm"])
+        self.assertFalse(apple["android_device"])
+        self.assertFalse(apple["web_layout"])
+        self.assertFalse(apple["release_build"])
+        self.assertFalse(apple["container"])
+
+        # A Kotlin diff plus its own release notes is still client-only.
+        mixed = scope_for_paths(
+            catalog,
+            (
+                "clients/android/app/src/main/java/tv/plurx/app/MainActivity.kt",
+                "clients/android/README.md",
+                "docs/FEATURES.md",
+            ),
+        )
+        self.assertFalse(mixed["rust"])
+        self.assertTrue(mixed["android_jvm"])
+
+        # The one file that compiles into BOTH native clients: editing the
+        # shared wire fixture must re-run both client suites on the PR itself,
+        # and it lives under tests/, so the Rust lane runs too.
+        fixture = scope_for_paths(catalog, ("tests/contracts/native-api.json",))
+        self.assertTrue(fixture["rust"])
+        self.assertTrue(fixture["apple"])
+        self.assertTrue(fixture["android_jvm"])
+
+        self.assertTrue(needs_rust_gate(()))
+
+    def test_merge_queue_events_fail_open_into_the_full_fan_out(self):
+        for event in ("merge_group", "push"):
+            with self.subTest(event=event):
+                self.assertEqual(resolve_scope(event, None), all_scope())
+
+    def test_ci_profile_splits_the_rust_gate_and_local_profiles_keep_it_whole(self):
+        catalog = load_catalog(ROOT / "validation/points.toml")
+        selection = select_points(catalog, ("crates/plurxd/src/http/stream.rs",))
+
+        ci = {check.id for check in selected_checks(catalog, selection, "ci")}
+        self.assertIn("rust-gate-ci", ci)
+        self.assertNotIn("rust-gate", ci)
+        # These re-run binaries rust-gate-ci already executes with identical
+        # feature resolution; in CI they would be pure duplication.
+        self.assertNotIn("api-wire", ci)
+        self.assertNotIn("security-boundaries", ci)
+        self.assertNotIn("user-journey", ci)
+
+        commit = {check.id for check in selected_checks(catalog, selection, "commit")}
+        self.assertIn("rust-gate", commit)
+        self.assertNotIn("rust-gate-ci", commit)
+
+        gate = catalog.check_map["rust-gate-ci"]
+        self.assertEqual(gate.command, "make ci-rust-gate")
 
     def test_ci_scope_routes_documentation_only_diffs_to_fast_preflight(self):
         catalog = load_catalog(ROOT / "validation/points.toml")
@@ -201,6 +282,7 @@ class CatalogCase(unittest.TestCase):
             ".github/workflows/ci.yml",
             "validation/ci_scope.py",
             "validation/points.toml",
+            "validation/runner.py",
         ):
             with self.subTest(scheduler_path=scheduler_path):
                 scheduler_scope = scope_for_paths(catalog, (scheduler_path,))

@@ -3,7 +3,7 @@ version = 1
 [settings]
 profiles = ["commit", "ci", "full", "nightly"]
 artifact_dir = "target/validation"
-always_checks = ["catalog-contract", "history-regressions", "rust-gate"]
+always_checks = ["catalog-contract", "history-regressions", "rust-gate", "rust-gate-ci"]
 audit_paths = [
   ".dockerignore",
   ".github/workflows/**",
@@ -64,7 +64,22 @@ timeout_seconds = 60
 id = "rust-gate"
 title = "Rust format, lint, and workspace tests"
 command = "make rust-check"
-profiles = ["commit", "ci", "full", "nightly"]
+profiles = ["commit", "full", "nightly"]
+requires = ["cargo", "make"]
+missing = "fail"
+timeout_seconds = 1800
+
+# The CI profile splits the local gate three ways so nothing runs twice per
+# push: clippy is lint.yml's whole job, and the replicated store member is the
+# cluster_auth job's whole job — `--exclude plurx-cluster-check` keeps feature
+# unification from dragging the hiqlite stack into this build, which is also
+# what makes this suite test plurx-core with the features plurxd actually
+# ships. Local profiles keep the one-command `make rust-check` above.
+[[checks]]
+id = "rust-gate-ci"
+title = "Rust format and workspace tests (CI split: clippy in lint.yml, replicated store in cluster_auth)"
+command = "make ci-rust-gate"
+profiles = ["ci"]
 requires = ["cargo", "make"]
 missing = "fail"
 timeout_seconds = 1800
@@ -145,11 +160,14 @@ requires = ["curl", "docker"]
 missing = "skip"
 timeout_seconds = 3600
 
+# In the CI profile this exact test already runs inside rust-gate-ci — the
+# `-p plurxd` invocation resolves the same features as the excluded-member
+# workspace run, so a second process would re-execute an identical binary.
 [[checks]]
 id = "api-wire"
 title = "Live native API matches the shared Rust/Swift/Kotlin fixture"
 command = "cargo test -p plurxd http::tests::shared_native_api_fixture_uses_the_servers_live_wire_keys -- --exact"
-profiles = ["commit", "ci", "full", "nightly"]
+profiles = ["commit", "full", "nightly"]
 requires = ["cargo"]
 missing = "fail"
 timeout_seconds = 300
@@ -186,7 +204,7 @@ timeout_seconds = 600
 id = "security-boundaries"
 title = "Authentication, administration, and scoped-key boundaries"
 command = "cargo test -p plurxd http::tests::auth_is_required_and_admin_enforced -- --exact && cargo test -p plurxd http::tests::only_an_admin_manages_keys -- --exact && cargo test -p plurxd http::tests::the_scan_route_takes_a_key_and_only_a_key -- --exact"
-profiles = ["ci", "full", "nightly"]
+profiles = ["full", "nightly"]
 requires = ["cargo"]
 missing = "fail"
 timeout_seconds = 600
@@ -195,7 +213,7 @@ timeout_seconds = 600
 id = "user-journey"
 title = "Seeded browse, playback-decision, progress, and settings journeys"
 command = "cargo test -p plurxd seeded_ -- --nocapture"
-profiles = ["ci", "full", "nightly"]
+profiles = ["full", "nightly"]
 requires = ["cargo"]
 missing = "fail"
 timeout_seconds = 600

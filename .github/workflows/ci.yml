@@ -5,6 +5,12 @@ on:
     branches: [main]
     tags: ["v*"]
   pull_request:
+  # The merge queue is the enforcement point of the two-tier design: PR runs
+  # are scoped to the diff for fast iteration, and every merge_group event
+  # fails open into the full cross-surface fan-out before a commit reaches
+  # main. Adding a required check that does not run on merge_group would
+  # deadlock the queue — pr_gate reports on both events.
+  merge_group:
 
 env:
   CARGO_TERM_COLOR: always
@@ -15,12 +21,13 @@ concurrency:
 
 jobs:
   # Resolve the PR diff once. Expensive jobs consume these outputs in parallel;
-  # pushes and tags deliberately enable every surface.
+  # merge groups, pushes, and tags deliberately enable every surface.
   scope:
     name: validation scope
     runs-on: ubuntu-latest
     timeout-minutes: 2
     outputs:
+      rust: ${{ steps.scope.outputs.rust }}
       apple: ${{ steps.scope.outputs.apple }}
       android_jvm: ${{ steps.scope.outputs.android_jvm }}
       android_device: ${{ steps.scope.outputs.android_device }}
@@ -98,7 +105,9 @@ jobs:
   check:
     name: functionality points (CI profile)
     needs: [scope, preflight]
-    if: needs.scope.outputs.docs_only != 'true'
+    # Kotlin and Swift diffs compile nothing under crates/, so the cargo lane
+    # only runs when the diff can reach it; the merge queue re-runs it always.
+    if: needs.scope.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -158,6 +167,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: hiqlite-spike
+          # The spike is its own workspace with its own lockfile and target
+          # dir; without this line its 400-crate build lands outside the cache
+          # and every run pays it cold.
+          workspaces: |
+            . -> target
+            spikes/hiqlite-m0 -> spikes/hiqlite-m0/target
       - name: Compile and lint the isolated harness
         run: cargo clippy --locked --manifest-path spikes/hiqlite-m0/Cargo.toml --all-targets -- -D warnings
       - name: Run the three-voter semantic proof
@@ -192,11 +207,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: web-layout
+      # Pinned so the browser-bundle cache key below is meaningful; bump both
+      # together. A cache hit skips the ~150 MB Chromium download every run.
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-1.62.0
       - name: Install media and browser prerequisites
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg
-          python3 -m pip install playwright
+          python3 -m pip install playwright==1.62.0
           python3 -m playwright install --with-deps chromium
       - name: Check every affected web layout
         run: make ui-check
@@ -207,8 +229,38 @@ jobs:
     if: needs.scope.outputs.android_jvm == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
+      # The toolchain image only changes when its Dockerfile does, yet both
+      # Android jobs used to rebuild it from scratch — cmdline-tools plus four
+      # sdkmanager downloads — on every run. Keyed on the Dockerfile hash, a
+      # pull replaces the rebuild; any failure falls back to the local build.
+      - name: Reuse the pinned Android toolchain image from GHCR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="ghcr.io/${GITHUB_REPOSITORY,,}/android-build:$(sha256sum clients/android/Dockerfile | cut -c1-16)"
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin || true
+          if docker pull "$tag"; then
+            docker tag "$tag" plurx-android-build
+            echo "PLURX_ANDROID_IMAGE_READY=1" >> "$GITHUB_ENV"
+          else
+            make android-image \
+              && docker tag plurx-android-build "$tag" \
+              && docker push "$tag" || true
+            echo "PLURX_ANDROID_IMAGE_READY=1" >> "$GITHUB_ENV"
+          fi
+      - name: Cache Gradle dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            clients/android/.gradle-validation/caches
+            clients/android/.gradle-validation/wrapper
+          key: gradle-${{ hashFiles('clients/android/**/*.gradle*', 'clients/android/gradle/libs.versions.toml', 'clients/android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: gradle-
       - name: Run unit tests and lint in the pinned Android toolchain
         run: |
           mkdir -p target/validation/buildx
@@ -222,11 +274,24 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      # Warm Swift incrementals: the Makefile builds into
+      # clients/apple/build/DerivedData precisely so this cache can restore it.
+      # restore-keys accepts the newest prior entry when sources moved — an
+      # incremental rebuild from a near miss still beats a cold compile, and a
+      # poisoned cache only ever costs the rebuild we paid before caching.
+      - name: Cache DerivedData
+        uses: actions/cache@v4
+        with:
+          path: clients/apple/build/DerivedData
+          key: apple-dd-${{ hashFiles('clients/apple/project.yml') }}-${{ hashFiles('clients/apple/Sources/**', 'clients/apple/Tests/**') }}
+          restore-keys: |
+            apple-dd-${{ hashFiles('clients/apple/project.yml') }}-
+            apple-dd-
       - name: Select the pinned Xcode and install the project generator
         run: |
           sudo xcode-select -s /Applications/Xcode_16.4.app
           sudo xcodebuild -runFirstLaunch
-          brew install xcodegen
+          HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 brew install xcodegen
           ios_id=$(xcrun simctl create \
             "plurx CI iPhone" \
             com.apple.CoreSimulator.SimDeviceType.iPhone-16-Pro \
@@ -256,6 +321,9 @@ jobs:
     if: needs.scope.outputs.android_device == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
       - name: Enable emulator acceleration
@@ -264,8 +332,54 @@ jobs:
             | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+      - name: Reuse the pinned Android toolchain image from GHCR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="ghcr.io/${GITHUB_REPOSITORY,,}/android-build:$(sha256sum clients/android/Dockerfile | cut -c1-16)"
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin || true
+          if docker pull "$tag"; then
+            docker tag "$tag" plurx-android-build
+            echo "PLURX_ANDROID_IMAGE_READY=1" >> "$GITHUB_ENV"
+          else
+            make android-image \
+              && docker tag plurx-android-build "$tag" \
+              && docker push "$tag" || true
+            echo "PLURX_ANDROID_IMAGE_READY=1" >> "$GITHUB_ENV"
+          fi
+      - name: Cache Gradle dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            clients/android/.gradle-validation/caches
+            clients/android/.gradle-validation/wrapper
+          key: gradle-${{ hashFiles('clients/android/**/*.gradle*', 'clients/android/gradle/libs.versions.toml', 'clients/android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: gradle-
       - name: Build app and instrumentation APKs in the pinned toolchain
         run: make android-instrumentation-build
+      # Booting a cold AVD costs minutes; a cached snapshot boots in seconds.
+      # The snapshot is created once per (api-level, profile) key by a throwaway
+      # emulator run, then every later run restores it and boots with
+      # -no-snapshot-save so test runs never mutate the cached image.
+      - name: Cache the AVD snapshot
+        uses: actions/cache@v4
+        id: avd-cache
+        with:
+          path: |
+            ~/.android/avd/*
+            ~/.android/adb*
+          key: avd-35-google_apis-pixel_7_pro
+      - name: Create the AVD snapshot for caching
+        if: steps.avd-cache.outputs.cache-hit != 'true'
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_7_pro
+          force-avd-creation: false
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          script: echo "Generated AVD snapshot for caching."
       - name: Run the Compose and TV focus suite on a disposable emulator
         uses: reactivecircus/android-emulator-runner@v2
         with:
@@ -273,6 +387,8 @@ jobs:
           target: google_apis
           arch: x86_64
           profile: pixel_7_pro
+          force-avd-creation: false
+          emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           script: PLURX_ANDROID_SERIAL="emulator-${EMULATOR_PORT}" make android-instrumentation-run
       - name: Upload Android test reports
         if: always()
@@ -447,14 +563,22 @@ jobs:
           load: true
           platforms: linux/amd64
           tags: plurx/plurxd:ci
+          # The runtime stage's layers (two full ffmpeg stacks) depend only on
+          # the Dockerfile, so the GHA layer cache spares their ~150 MB of
+          # downloads on every run; the cargo builder layer still rebuilds on
+          # source changes, which is exactly the part that must.
+          cache-from: type=gha
+          cache-to: type=gha,mode=min
       - name: Start, probe, restart, and re-probe the image
         run: scripts/container-smoke plurx/plurxd:ci
 
-  # Configure this as the single required PR check. A conditional job is valid
-  # when it either passed or was skipped because its surface was unaffected.
+  # Configure this as the single required check for PRs AND the merge queue.
+  # A conditional job is valid when it either passed or was skipped because
+  # its surface was unaffected; on merge_group events nothing is skipped, so
+  # a green queue run is the full cross-surface fan-out.
   pr_gate:
     name: PR validation gate
-    if: always() && github.event_name == 'pull_request'
+    if: always() && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
     needs:
       - scope
       - mobile_version

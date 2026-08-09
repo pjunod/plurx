@@ -5,6 +5,9 @@ on:
     branches: [main]
     tags: ["v*"]
   pull_request:
+  # The CI profile's Rust gate deliberately does not run clippy — this
+  # workflow owns it — so lint must also cover the merge queue's full run.
+  merge_group:
 
 env:
   CARGO_TERM_COLOR: always
