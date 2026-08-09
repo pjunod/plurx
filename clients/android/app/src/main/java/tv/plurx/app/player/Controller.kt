@@ -250,8 +250,31 @@ class Controller(
     /** The HLS session this player owns, if the plan opened one. */
     private var sessionId: String? = null
 
-    private val ttffTracker = PlaybackTTFFTracker()
-    private val stallTracker = BufferingStallTracker()
+    private val playbackTelemetry = ControllerPlaybackTelemetry(
+        plan = plan,
+        player = object : PlaybackTelemetryPlayer {
+            override val buffering: Boolean
+                get() = player.playbackState == Player.STATE_BUFFERING
+            override val playbackRequested: Boolean
+                get() = player.playWhenReady
+            override val playerPositionMs: Long
+                get() = player.currentPosition
+            override val mediaPositionMs: Long
+                get() = realPosition()
+            override val bufferedPositionMs: Long
+                get() = player.bufferedPosition
+            override val videoHeight: Int
+                get() = player.videoSize.height
+        },
+        context = {
+            PlaybackTelemetryContext(
+                method = if (deliveryMode == "direct") "direct_play" else deliveryMode,
+                encoder = encoder,
+                sessionId = sessionId,
+            )
+        },
+        emit = { event -> postPlaybackClientLog(scope, event) },
+    )
     private val stallWatchdogJob: Job
 
     /** Stable for this player instance — the server's supersession key. */
@@ -304,7 +327,7 @@ class Controller(
                 establishedPlayback = establishedPlayback,
                 sameHdrRetryAlreadyUsed = sameHdrRetryUsed,
             )
-            reportPlaybackEvent(
+            playbackTelemetry.report(
                 event = "playback_error",
                 level = "error",
                 message = error.errorCodeName,
@@ -366,15 +389,7 @@ class Controller(
 
         override fun onRenderedFirstFrame() {
             establishedPlayback = true
-            ttffTracker.firstFrame(monotonicNowMs())?.let { measurement ->
-                reportPlaybackEvent(
-                    event = "ttff",
-                    level = "info",
-                    message = "first frame after ${measurement.elapsedMs} ms",
-                    ms = measurement.elapsedMs,
-                    attempt = measurement.attempt,
-                )
-            }
+            playbackTelemetry.firstFrame(monotonicNowMs())
         }
 
         override fun onTracksChanged(tracks: Tracks) = applyTextSelection()
@@ -399,27 +414,19 @@ class Controller(
         pgsOverlay.select(selectedSubtitle.takeIf { subtitleDelivery == SubtitleDelivery.BitmapOverlay })
         stallWatchdogJob = scope.launch {
             while (isActive) {
-                stallTracker.sample(
-                    buffering = player.playbackState == Player.STATE_BUFFERING,
-                    positionMs = realPosition(),
-                    observedAtMs = monotonicNowMs(),
-                )?.let { measurement ->
-                    reportPlaybackEvent(
-                        event = "stall",
-                        level = "warn",
-                        message = "buffering playhead stagnant for ${measurement.durationMs} ms",
-                        ms = measurement.durationMs,
-                        detail = "state=buffering position_ms=${measurement.positionMs}",
-                    )
-                }
+                playbackTelemetry.sampleStall(establishedPlayback, monotonicNowMs())
                 delay(1_000)
             }
         }
     }
 
-    fun startAt(ms: Long) {
+    fun startAt(
+        ms: Long,
+        reason: String = if (ms > 0) "resume" else "cold-start",
+        observedAtMs: Long = monotonicNowMs(),
+    ) {
         val position = ms.coerceAtLeast(0)
-        restartAt(position, if (position > 0) "resume" else "cold-start")
+        restartAt(position, reason, observedAtMs)
     }
 
     fun realPosition(): Long {
@@ -433,54 +440,21 @@ class Controller(
         )
     }
 
-    private fun beginPlaybackAttempt(reason: String): PlaybackAttempt {
-        stallTracker.reset()
-        return ttffTracker.begin(reason, monotonicNowMs())
-    }
-
-    private fun reportPlaybackEvent(
-        event: String,
-        level: String,
-        message: String,
-        code: Int? = null,
-        detail: String? = null,
-        ms: Long? = null,
-        attempt: PlaybackAttempt? = ttffTracker.currentAttempt(),
-    ) {
-        val currentPosition = player.currentPosition
-        val bufferedPosition = player.bufferedPosition
-        val runway = if (currentPosition >= 0 && bufferedPosition >= currentPosition) {
-            (bufferedPosition - currentPosition) / 1_000.0
-        } else {
-            null
-        }
-        postPlaybackClientLog(
-            scope,
-            PlaybackClientLog(
-                level = level,
-                event = event,
-                message = message,
-                method = if (deliveryMode == "direct") "direct_play" else deliveryMode,
-                code = code,
-                title = plan.title,
-                fileId = plan.fileId,
-                vcodec = plan.videoCodec,
-                detail = detail,
-                attempt = attempt?.id,
-                reason = attempt?.reason,
-                runway = runway,
-                ms = ms,
-                height = player.videoSize.height.takeIf { it > 0 } ?: plan.sourceHeight,
-                encoder = encoder,
-                sessionId = sessionId,
-            ),
-        )
+    private fun beginPlaybackAttempt(
+        reason: String,
+        observedAtMs: Long = monotonicNowMs(),
+    ): PlaybackAttempt {
+        establishedPlayback = false
+        return playbackTelemetry.begin(reason, observedAtMs)
     }
 
     fun seekTo(targetMs: Long) {
         val t = targetMs.coerceIn(0, if (plan.durationMs > 0) plan.durationMs else Long.MAX_VALUE)
         when {
-            directTransport -> player.seekTo(t)
+            directTransport -> {
+                beginPlaybackAttempt("seek")
+                player.seekTo(t)
+            }
             subtitleDelivery.usesPlanTransport && planMode == "remux" -> {
                 val attempt = beginPlaybackAttempt("seek")
                 leaveSessionPlayback()
@@ -489,13 +463,16 @@ class Controller(
                 progressiveMediaOrigin.begin(uri, t)
                 player.setMediaItem(MediaItem.fromUri(uri))
                 player.prepare()
-                ttffTracker.prepared(attempt)
+                playbackTelemetry.prepared(attempt)
                 player.playWhenReady = true
                 armTextSelection()
             }
             // A cached session holds the whole stream: native seeking, no
             // session churn. A live one can't be range-sought, so it reopens.
-            sessionIsVod -> player.seekTo(t)
+            sessionIsVod -> {
+                beginPlaybackAttempt("seek")
+                player.seekTo(t)
+            }
             else -> openSession(t, beginPlaybackAttempt("seek"))
         }
     }
@@ -547,7 +524,7 @@ class Controller(
         subtitleDelivery = route.delivery
         pgsOverlay.select(index.takeIf { route.delivery == SubtitleDelivery.BitmapOverlay })
         if (route.reopen) {
-            restartAt(position, "subtitle")
+            restartAt(position, "quality")
         } else {
             // No reopen means the same media item, so its tracks are already
             // published and this lands now — which is what makes switching
@@ -580,15 +557,19 @@ class Controller(
         restartAt(position, "audio")
     }
 
-    private fun restartAt(positionMs: Long, reason: String) {
-        val attempt = beginPlaybackAttempt(reason)
+    private fun restartAt(
+        positionMs: Long,
+        reason: String,
+        observedAtMs: Long = monotonicNowMs(),
+    ) {
+        val attempt = beginPlaybackAttempt(reason, observedAtMs)
         when {
             !subtitleDelivery.usesPlanTransport -> openSession(positionMs, attempt)
             planMode == "direct" -> {
                 leaveSessionPlayback()
                 player.setMediaItem(MediaItem.fromUri(plan.playUrl), positionMs)
                 player.prepare()
-                ttffTracker.prepared(attempt)
+                playbackTelemetry.prepared(attempt)
                 player.playWhenReady = true
                 armTextSelection()
             }
@@ -599,7 +580,7 @@ class Controller(
                 progressiveMediaOrigin.begin(uri, positionMs)
                 player.setMediaItem(MediaItem.fromUri(uri))
                 player.prepare()
-                ttffTracker.prepared(attempt)
+                playbackTelemetry.prepared(attempt)
                 player.playWhenReady = true
                 armTextSelection()
             }
@@ -632,7 +613,7 @@ class Controller(
                 throw cancelled
             } catch (_: Exception) {
                 if (requestVersion == sessionRequestVersion) {
-                    ttffTracker.cancel(attempt)
+                    playbackTelemetry.cancel(attempt)
                     onError("The server couldn't start this stream.")
                 }
                 return@launch
@@ -657,7 +638,7 @@ class Controller(
                 timeline.attachPositionMs,
             )
             player.prepare()
-            ttffTracker.prepared(attempt)
+            playbackTelemetry.prepared(attempt)
             player.playWhenReady = true
             armTextSelection()
         }

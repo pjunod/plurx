@@ -27,12 +27,15 @@ for that viewer and keeps server administration out of the comparison.
 > (needs a TV emulator or device) and the badge's on-screen behaviour on an HDR
 > panel.
 >
-> Performance II N0 source parity is Android build 22: the Media3 controller
+> Performance II N0 source parity is Android build 23: the Media3 controller
 > posts authenticated `ttff`, passive six-second `stall`, and
 > `playback_error` events through the shared client, with attempt and live HLS
-> session identity. Unit tests and lint prove the wire and one-shot timing
-> contracts; a physical Android play producing a joined `ttff` row remains an
-> explicit, unclaimed acceptance run.
+> session identity. TTFF starts before the detail/decision requests. A stall is
+> emitted with its final duration only after established, requested playback
+> recovers; startup, paused buffering, and seek waits are excluded. Unit tests
+> and lint prove the wire, controller wiring, reason, and timing contracts; a
+> physical Android play producing a joined `ttff` row remains an explicit,
+> unclaimed acceptance run.
 
 ## Viewer surface
 

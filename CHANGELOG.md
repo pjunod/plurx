@@ -20,10 +20,13 @@ bump may break compatibility and a **patch** bump never does.
   default, `0` fully disables row writes and pruning). Hiqlite voters use
   independent sidecars, never Raft, with restart and non-replication coverage.
   `scripts/perf-report` prefers the durable reader and falls back to the log
-  ring on older servers. Android build 22 adds the native parity floor: one
-  authenticated TTFF beacon per prepared attempt, passive six-second buffering
-  stall measurements, and playback-error context, including the live HLS
-  session id for the ingest join. It does not change recovery policy.
+  ring on older servers. Android build 23 adds the native parity floor: one
+  authenticated TTFF beacon per prepared attempt, timed from before the
+  decision request; final-duration measurements for buffering stalls of at
+  least six seconds after playback is established and while play is requested;
+  and playback-error context, including the live HLS session id for the ingest
+  join. Startup, paused buffering, and seek waits do not enter the stall series.
+  It does not change recovery policy.
 
 ## [0.2.7] — 2026-08-09
 

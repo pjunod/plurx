@@ -216,9 +216,11 @@ Numbered because milestones cite them.
 
 **Implementation status (2026-08-09):** server storage, ingest, lifecycle
 events, metrics, readers, census fields, the web parity slice, and Android
-native telemetry parity are landed in source on their milestone branches.
-Apple parity and the named-machine acceptance runs remain and must not be
-inferred from these source milestones.
+build 23 native telemetry parity are landed in source on their milestone
+branches. Apple parity is implemented on its separate branch, but its physical
+iPhone acceptance exposed the protected ahead-window/AVPlayer deadlock and
+remains unclaimed. All other named-machine acceptance runs likewise must not
+be inferred from source or automated gates.
 
 **Objective:** the beacons plurx already emits become queryable rows that
 survive restart, get their server-side context attached at ingest, and
