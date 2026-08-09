@@ -60,6 +60,11 @@ async fn three_voters_prove_the_sql_and_transport_contracts() {
              CREATE TRIGGER items_ai AFTER INSERT ON items BEGIN
                  INSERT INTO items_fts(rowid, title) VALUES (new.id, new.title);
              END;
+             CREATE VIRTUAL TABLE contentless_delete_probe USING fts5(
+                 title, content='', contentless_delete=1
+             );
+             INSERT INTO contentless_delete_probe(rowid, title)
+                 VALUES (1, 'existing search row');
              CREATE TABLE audit (item_id INTEGER PRIMARY KEY, owner TEXT NOT NULL);
              CREATE TABLE default_clock (
                  id INTEGER PRIMARY KEY,
@@ -98,6 +103,48 @@ async fn three_voters_prove_the_sql_and_transport_contracts() {
         .expect("FTS trigger result on every voter");
         assert_eq!(title, "Blade Runner");
     }
+
+    // M1c's contentless-delete design deliberately tolerates a voter whose
+    // derived FTS index is already missing the row deleted from the catalogue.
+    // Prove the pinned SQLite/hiqlite combination treats that delete as a
+    // no-op instead of aborting the replicated write.
+    clients[0]
+        .execute(
+            "DELETE FROM contentless_delete_probe WHERE rowid = $1",
+            params!(2_i64),
+        )
+        .await
+        .expect("deleting an absent contentless FTS row is a no-op");
+    let retained = clients[0]
+        .query_as_one::<i64, _>(
+            "SELECT COUNT(*) FROM contentless_delete_probe WHERE rowid = $1",
+            params!(1_i64),
+        )
+        .await
+        .expect("query surviving contentless FTS row");
+    assert_eq!(retained, 1);
+
+    // Reconcile carries gone ids as one JSON parameter instead of an inlined
+    // SQL IN-list. Exercise the upper end of the deferred 100k-150k probe so
+    // SQLite's host-parameter ceiling cannot silently return through this
+    // path.
+    let gone_ids = format!(
+        "[{}]",
+        (1_i64..=150_000)
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let started = Instant::now();
+    let decoded = clients[0]
+        .query_as_one::<i64, _>("SELECT COUNT(*) FROM json_each($1)", params!(&gone_ids))
+        .await
+        .expect("decode a 150,000-id reconcile parameter");
+    assert_eq!(decoded, 150_000);
+    eprintln!(
+        "150,000-id reconcile JSON parameter decoded in {:.3}s",
+        started.elapsed().as_secs_f64()
+    );
 
     // Two survivors that both observed epoch 5 race to claim epoch 6. Raft
     // serialization must admit exactly one; txn() reports the loser as Ok(0),
@@ -148,6 +195,40 @@ async fn three_voters_prove_the_sql_and_transport_contracts() {
         .expect("replicated CAS result");
         assert_eq!(version, 6);
     }
+
+    // Reconcile's guard rows rely on txn() being atomic when a later
+    // statement fails. A duplicate primary key is a deterministic
+    // mid-transaction error; the first insert must not survive it.
+    let failed_txn = clients[0]
+        .txn([
+            (
+                "INSERT INTO audit (item_id, owner) VALUES ($1, $2)",
+                params!(9_000_i64, "rollback-probe"),
+            ),
+            (
+                "INSERT INTO audit (item_id, owner) VALUES ($1, $2)",
+                params!(9_000_i64, "duplicate-must-fail"),
+            ),
+        ])
+        .await;
+    match failed_txn {
+        Ok(results) => assert!(
+            results.iter().any(Result::is_err),
+            "the duplicate-key statement unexpectedly succeeded"
+        ),
+        Err(_) => {
+            // Some hiqlite errors are lifted to the outer result; either
+            // shape is acceptable so long as the transaction is rolled back.
+        }
+    }
+    let rolled_back = clients[0]
+        .query_as_one::<i64, _>(
+            "SELECT COUNT(*) FROM audit WHERE item_id = $1",
+            params!(9_000_i64),
+        )
+        .await
+        .expect("verify failed transaction rollback");
+    assert_eq!(rolled_back, 0, "txn() left its first statement behind");
 
     // Bound values converge, but that fact alone says nothing about whether
     // statements or row images are replicated. The direct guard probes below

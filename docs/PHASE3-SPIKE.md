@@ -90,6 +90,13 @@ cargo-audit. The weekly audit job therefore synthesizes a second lockfile with
 the original registry source/checksum for both vendored releases and scans it
 mechanically via `scripts/vendor-audit-lock`.
 
+A disposable, never-merged [PR #114](https://github.com/pjunod/plurx/pull/114)
+proved that boundary on 2026-08-09. The ordinary workspace scan reported zero
+vulnerabilities, while the synthesized vendor scan alone rejected injected
+`smallvec` 0.6.9 with RUSTSEC-2019-0009, RUSTSEC-2019-0012, and
+RUSTSEC-2021-0003. The draft was closed and its remote branch deleted after the
+red-path evidence was captured.
+
 `rkyv` 0.7.46 fixed
 [RUSTSEC-2026-0001](https://rustsec.org/advisories/RUSTSEC-2026-0001.html),
 and versions below 0.8 were unaffected by
@@ -111,8 +118,11 @@ release dependency.
 | Contract | Observed result |
 |---|---|
 | FTS5 and triggers | A replicated insert populated the FTS table, and all three voters returned the exact title from a local FTS read. |
+| Contentless FTS delete | Deleting an absent rowid from a `contentless_delete=1` table succeeded as a no-op while the neighbouring row remained queryable. A voter whose derived index already lacks the row therefore does not abort the replicated catalogue delete. |
 | `INSERT … RETURNING` | Returned the generated id through a non-leader node; no connection-local `last_insert_rowid()` is needed. |
 | Transaction CAS | Two concurrent epoch-5 writers raced; exactly one wrote epoch 6, while the loser returned `Ok(0)`. Callers must inspect rows affected. |
+| Transaction rollback | A duplicate-key error in the second statement rolled back the first statement. Reconcile cannot leave its guard row behind after a later statement error. |
+| Large reconcile input | A 150,000-id JSON parameter decoded through `json_each` in 0.007 seconds. The current path uses one bound parameter and does not inherit SQLite's host-parameter ceiling. |
 | Replication unit | hiqlite replays SQL plus bound parameters. `unixepoch()` is rejected on every voter, `CURRENT_TIMESTAMP` is accepted and can diverge, and `DEFAULT (unixepoch())` DDL succeeds before its first implicit insert fails. |
 | Transport authentication | TLS listeners started and a client with the wrong API secret could not write. The harness disables certificate verification, so certificate identity remains an M1 multi-process proof. |
 | Compaction | With a bounded semantic-test threshold, 96 writes produced both a snapshot and a purged-log position. Restart and snapshot catch-up are not proven in this process. |
