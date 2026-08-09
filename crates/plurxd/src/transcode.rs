@@ -1053,6 +1053,20 @@ fn tone_map_pref() -> ToneMap {
     }
 }
 
+struct LastRequest {
+    at: Instant,
+    kind: &'static str,
+}
+
+impl LastRequest {
+    fn now(kind: &'static str) -> Self {
+        Self {
+            at: Instant::now(),
+            kind,
+        }
+    }
+}
+
 struct Session {
     dir: PathBuf,
     /// The ffmpeg producing this session's segments — `None` for a cache hit,
@@ -1072,7 +1086,10 @@ struct Session {
     /// session's full lifetime so the budget sweep cannot remove its playlist
     /// or segments while an HTTP response can still reach them.
     _cache_reader: Option<crate::cachekeep::CacheReadGuard>,
-    last_access: Mutex<Instant>,
+    /// The request that keeps this session alive. Keeping the kind beside the
+    /// clock makes an idle reap explain whether the last sign of life was a
+    /// playlist reload, a media segment, or only a subtitle/context lookup.
+    last_request: Mutex<LastRequest>,
     // -- metadata for the activity page --
     file_id: i64,
     item_id: i64,
@@ -1176,6 +1193,14 @@ struct Session {
     /// playhead. Everything that judges a session's health has to know: a
     /// suspended encoder makes no progress *on purpose*.
     suspended: AtomicBool,
+    /// Successful running→held transitions during this session. A counter,
+    /// rather than only the current boolean, exposes flapping after it has
+    /// already resumed.
+    suspend_count: AtomicU64,
+    /// The first retained-prefix advance gets one operational log line. A
+    /// playlist reload may observe that state hundreds of times; only the
+    /// transition is evidence about the EVENT/sliding experiment.
+    first_slide_logged: AtomicBool,
 }
 
 /// How far a session's published media runs ahead of the client's download
@@ -1340,7 +1365,7 @@ async fn session_info(
         target_height: s.target_height,
         encoder: *s.encoder_label.lock().await,
         started_unix: s.started_unix,
-        idle_seconds: s.last_access.lock().await.elapsed().as_secs(),
+        idle_seconds: s.last_request.lock().await.at.elapsed().as_secs(),
         speed: s.progress.speed(),
         recent_speed: s.progress.recent_speed(),
         out_time_ms: s.progress.out_time_ms(),
@@ -1357,6 +1382,7 @@ async fn session_info(
         delivered_bps: s.delivery.recent_bps().map(|b| b * 8),
         delivered_idle_ms: s.delivery.idle_for_ms(),
         suspended,
+        suspend_count: s.suspend_count.load(Relaxed),
     }
 }
 
@@ -1673,6 +1699,10 @@ pub struct SessionInfo {
     /// measurement from a memory.
     pub delivered_idle_ms: i64,
     pub suspended: bool,
+    /// Number of times this producer entered a held state. This stays visible
+    /// after resume so a flapping session cannot look healthy merely because
+    /// the activity poll landed between transitions.
+    pub suspend_count: u64,
 }
 
 /// What a client asked for, normalised. Two requests with the same
@@ -2502,7 +2532,7 @@ impl TranscodeManager {
             child: Mutex::new(None),
             cached: true,
             _cache_reader: Some(cache_reader),
-            last_access: Mutex::new(Instant::now()),
+            last_request: Mutex::new(LastRequest::now("session-start")),
             file_id: file.id,
             item_id: file.item_id,
             item_title: item_title.to_owned(),
@@ -2535,6 +2565,8 @@ impl TranscodeManager {
             sw_permit: std::sync::Mutex::new(None),
             delivery: Meter::new(),
             suspended: AtomicBool::new(false),
+            suspend_count: AtomicU64::new(0),
+            first_slide_logged: AtomicBool::new(false),
         });
         self.sessions
             .lock()
@@ -3747,7 +3779,7 @@ impl TranscodeManager {
             child: Mutex::new(Some(child)),
             cached: false,
             _cache_reader: None,
-            last_access: Mutex::new(Instant::now()),
+            last_request: Mutex::new(LastRequest::now("session-start")),
             file_id,
             item_id: file.item_id,
             item_title,
@@ -3782,6 +3814,8 @@ impl TranscodeManager {
             sw_permit: std::sync::Mutex::new(sw_permit),
             delivery: Meter::new(),
             suspended: AtomicBool::new(false),
+            suspend_count: AtomicU64::new(0),
+            first_slide_logged: AtomicBool::new(false),
         });
         self.sessions
             .lock()
@@ -4002,7 +4036,7 @@ impl TranscodeManager {
         ) {
             Ok(child) => {
                 *session.child.lock().await = Some(child);
-                *session.last_access.lock().await = Instant::now();
+                *session.last_request.lock().await = LastRequest::now("fallback-start");
                 // The activity page must stop naming the hardware
                 // encoder the moment it is no longer the one running.
                 *session.encoder_label.lock().await = retry_encoder.label();
@@ -4202,7 +4236,7 @@ impl TranscodeManager {
             child: Mutex::new(Some(child)),
             cached: false,
             _cache_reader: None,
-            last_access: Mutex::new(Instant::now()),
+            last_request: Mutex::new(LastRequest::now("session-start")),
             file_id,
             item_id: file.item_id,
             item_title,
@@ -4231,6 +4265,8 @@ impl TranscodeManager {
             sw_permit: std::sync::Mutex::new(None),
             delivery: Meter::new(),
             suspended: AtomicBool::new(false),
+            suspend_count: AtomicU64::new(0),
+            first_slide_logged: AtomicBool::new(false),
         });
         self.sessions
             .lock()
@@ -4321,7 +4357,8 @@ impl TranscodeManager {
                         ) {
                             Ok(child) => {
                                 *session.child.lock().await = Some(child);
-                                *session.last_access.lock().await = Instant::now();
+                                *session.last_request.lock().await =
+                                    LastRequest::now("fallback-start");
                                 tracing::info!(session = %sid, "fallback copy started");
                             }
                             Err(e) => {
@@ -4385,7 +4422,7 @@ impl TranscodeManager {
     }
 
     /// One session's live telemetry, for the player's stats overlay. Does not
-    /// touch `last_access`: asking how a stream is doing is not the same as
+    /// touch the last-request clock: asking how a stream is doing is not the same as
     /// fetching from it, and a status poll must not keep an abandoned session
     /// alive past the idle reaper.
     pub async fn session_status(&self, session_id: &str) -> Option<SessionInfo> {
@@ -4422,15 +4459,15 @@ impl TranscodeManager {
         true
     }
 
-    async fn touch(&self, session_id: &str) -> Option<Arc<Session>> {
+    async fn touch(&self, session_id: &str, kind: &'static str) -> Option<Arc<Session>> {
         let session = self.sessions.lock().await.get(session_id).cloned()?;
-        *session.last_access.lock().await = Instant::now();
+        *session.last_request.lock().await = LastRequest::now(kind);
         Some(session)
     }
 
     /// Resolve the source and resume base attached to a live HLS capability.
     pub async fn hls_context(&self, session_id: &str) -> Option<HlsContext> {
-        let session = self.touch(session_id).await?;
+        let session = self.touch(session_id, "hls-context").await?;
         Some(HlsContext {
             file_id: session.file_id,
             start_seconds: session.start_seconds,
@@ -4443,7 +4480,7 @@ impl TranscodeManager {
 
     /// Read the current media playlist for a session.
     pub async fn playlist(&self, session_id: &str) -> Option<Vec<u8>> {
-        let session = self.touch(session_id).await?;
+        let session = self.touch(session_id, "playlist").await?;
         let path = session.dir.join("index.m3u8");
         // Hold the request until the playlist exists. On the transcode path
         // that is a beat after ffmpeg starts; on the copy path it is the
@@ -4470,6 +4507,21 @@ impl TranscodeManager {
                         return Some(bytes);
                     }
                     let first_retained = session.segments.lock().await.first_retained_index();
+                    if let Some(first_retained_index) = first_retained.filter(|index| *index > 0) {
+                        if !session.first_slide_logged.swap(true, Relaxed) {
+                            let now_unix = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|duration| duration.as_secs() as i64)
+                                .unwrap_or(session.started_unix);
+                            tracing::info!(
+                                session = %session_id,
+                                first_retained_index,
+                                wall_seconds_since_start =
+                                    now_unix.saturating_sub(session.started_unix),
+                                "served HLS playlist began sliding"
+                            );
+                        }
+                    }
                     return Some(served_live_playlist(bytes, first_retained));
                 }
             }
@@ -4486,7 +4538,7 @@ impl TranscodeManager {
     /// their files are gone, so callers never reconstruct time from a segment
     /// number or the shortened playlist.
     pub async fn segment_window(&self, session_id: &str, segment_index: i64) -> Option<(f64, f64)> {
-        let session = self.touch(session_id).await?;
+        let session = self.touch(session_id, "segment-window").await?;
         self.flow_control(&session, session_id).await;
         let (start_ms, end_ms) = session.segments.lock().await.window_ms_of(segment_index)?;
         Some((start_ms as f64 / 1000.0, end_ms as f64 / 1000.0))
@@ -4508,7 +4560,7 @@ impl TranscodeManager {
         if !is_safe_segment(name) {
             return None;
         }
-        let session = self.touch(session_id).await?;
+        let session = self.touch(session_id, "segment").await?;
         let path = session.dir.join(name);
         let idx = segment_index(name);
 
@@ -4666,8 +4718,10 @@ impl TranscodeManager {
         }
         session.suspended.store(want_suspend, Relaxed);
         if want_suspend {
-            tracing::debug!(
+            let suspend_count = session.suspend_count.fetch_add(1, Relaxed) + 1;
+            tracing::info!(
                 session = %session_id,
+                suspend_count,
                 hold_reason = ?hold.map(|hold| hold.reason),
                 release_value = hold.map(|hold| hold.release_value),
                 ahead_seconds = ahead.seconds, ahead_bytes = ahead.bytes,
@@ -4676,8 +4730,9 @@ impl TranscodeManager {
                 "suspending transcode: far enough ahead of the client"
             );
         } else {
-            tracing::debug!(
+            tracing::info!(
                 session = %session_id,
+                suspend_count = session.suspend_count.load(Relaxed),
                 ahead_seconds = ahead.seconds, ahead_bytes = ahead.bytes,
                 "resuming transcode: the client caught up"
             );
@@ -4767,14 +4822,16 @@ impl TranscodeManager {
             {
                 let sessions = self.sessions.lock().await;
                 for (id, s) in sessions.iter() {
-                    if s.last_access.lock().await.elapsed() > idle {
-                        expired.push((id.clone(), Arc::clone(s)));
+                    let last = s.last_request.lock().await;
+                    let idle_age = last.at.elapsed();
+                    if idle_age > idle {
+                        expired.push((id.clone(), Arc::clone(s), idle_age.as_secs(), last.kind));
                     } else {
                         live.push((id.clone(), Arc::clone(s)));
                     }
                 }
             }
-            for (id, session) in expired {
+            for (id, session, idle_seconds, last_request) in expired {
                 self.sessions.lock().await.remove(&id);
                 session.release_hardware();
                 session.release_software();
@@ -4782,7 +4839,12 @@ impl TranscodeManager {
                 // does not need the process scheduled to take effect.
                 session.kill_child().await;
                 session.discard_dir().await;
-                tracing::info!(session_id = %id, "reaped idle transcode session");
+                tracing::info!(
+                    session_id = %id,
+                    idle_seconds,
+                    last_request,
+                    "reaped idle transcode session"
+                );
             }
             // What this box actually achieves, remembered per class of work.
             // Admission asks it the next time hardware is full, so the answer
@@ -5347,7 +5409,7 @@ mod tests {
         // (`touch` is the shared front half of the playlist and segment
         // readers; calling those here would long-poll for output this fixture
         // can never produce.)
-        assert!(mgr.touch(&info.session_id).await.is_some());
+        assert!(mgr.touch(&info.session_id, "test-fetch").await.is_some());
         assert_eq!(
             mgr.session_status(&info.session_id)
                 .await
@@ -5880,7 +5942,7 @@ mod tests {
             child: Mutex::new(Some(child)),
             cached: false,
             _cache_reader: None,
-            last_access: Mutex::new(Instant::now()),
+            last_request: Mutex::new(LastRequest::now("test-start")),
             file_id: 1,
             item_id: 1,
             item_title: "T".into(),
@@ -5906,6 +5968,8 @@ mod tests {
             sw_permit: std::sync::Mutex::new(None),
             delivery: Meter::new(),
             suspended: AtomicBool::new(false),
+            suspend_count: AtomicU64::new(0),
+            first_slide_logged: AtomicBool::new(false),
         }
     }
 
@@ -6244,6 +6308,7 @@ mod tests {
         assert_eq!(status.hold_reason, Some(AheadHoldReason::Time));
         assert_eq!(status.resume_below_seconds, Some(1));
         assert_eq!(status.resume_below_bytes, None);
+        assert_eq!(status.suspend_count, 1, "the first transition is visible");
         let frozen = session.progress.out_time_ms();
         tokio::time::sleep(Duration::from_millis(1200)).await;
         assert_eq!(
@@ -6266,6 +6331,14 @@ mod tests {
             .clone();
         assert!(mgr.segment(&info.session_id, &newest).await.is_some());
         assert!(!session.suspended.load(Relaxed), "session was released");
+        assert_eq!(
+            mgr.session_status(&info.session_id)
+                .await
+                .expect("status after release")
+                .suspend_count,
+            1,
+            "resume preserves the transition history"
+        );
         let moved = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 if session.progress.out_time_ms() > frozen {
@@ -6305,6 +6378,14 @@ mod tests {
         )
         .await;
         assert!(session.suspended.load(Relaxed), "held again");
+        assert_eq!(
+            mgr.session_status(&info.session_id)
+                .await
+                .expect("status after second hold")
+                .suspend_count,
+            2,
+            "a second transition cannot hide between activity polls"
+        );
         assert!(mgr.stop_session(&info.session_id, "test").await);
         assert_eq!(mgr.active_sessions().await, 0);
     }
@@ -6657,7 +6738,7 @@ mod tests {
             child: Mutex::new(child),
             cached,
             _cache_reader: None,
-            last_access: Mutex::new(Instant::now()),
+            last_request: Mutex::new(LastRequest::now("test-start")),
             file_id: 1,
             item_id: 1,
             item_title: "Watchdog Fixture".into(),
@@ -6683,6 +6764,8 @@ mod tests {
             sw_permit: std::sync::Mutex::new(None),
             delivery: Meter::new(),
             suspended: AtomicBool::new(false),
+            suspend_count: AtomicU64::new(0),
+            first_slide_logged: AtomicBool::new(false),
         })
     }
 
