@@ -84,7 +84,7 @@ mapping cannot quietly make ordinary tests disappear.
 | `commit` | Pre-commit and ordinary local work | Mandatory Rust/catalog baseline; shared API wire check; web syntax, contrast, golden, and accessibility when affected |
 | `ci` | Pull requests and `main` | Impact-selected Linux contracts plus parallel browser, Apple, Android, build, and container jobs when their surfaces can change |
 | `full` | Before a risky merge or release | Browser playback; both native-client suites; Android device tests when an explicit disposable device is selected; container startup/restart |
-| `nightly` | Scheduled deep regression search | Exhaustive playback and restart matrix; interrupted-production recovery; resource bounds; all runnable full checks; report-only mutation sampling over Rust files changed in the last seven days |
+| `nightly` | Scheduled deep regression search | Exhaustive playback and restart matrix; interrupted-production recovery; resource bounds; all runnable full checks; a gating 15-minute PGS parser fuzz campaign; report-only mutation sampling over Rust files changed in the last seven days |
 
 The `commit` profile permits explicitly optional checks to skip when a laptop
 lacks their tooling. The skip is printed and recorded; it is not reported as a

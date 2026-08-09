@@ -2921,6 +2921,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pgs_overlay_routes_are_default_off() {
+        let (app, _) = test_state();
+        let admin = setup_admin(&app).await;
+        assert_eq!(
+            status_of(
+                &app,
+                get("/api/v1/files/1/subs/0/overlay.json", Some(&admin)),
+            )
+            .await,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
     async fn pgs_overlay_contract_is_authenticated_typed_and_immutable() {
         use plurx_core::domain::{
             ItemKind, LibraryKind, NewItem, NewLibrary, ProbeResult, SubtitleStream,
@@ -3073,6 +3087,14 @@ mod tests {
             .await,
             StatusCode::UNSUPPORTED_MEDIA_TYPE
         );
+
+        // A power-loss-shaped published directory must not become a permanent
+        // 500. The next manifest read removes it, owns a fresh preparation,
+        // and returns the ordinary retry contract.
+        std::fs::write(generation_dir.join("manifest.json"), b"").expect("tear published manifest");
+        let (status, body) = call(&app, get(&manifest_uri, Some(&admin))).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        assert_eq!(body["state"], "preparing");
 
         // A second PGS track has no cache. Preparation is detached and the
         // request returns promptly instead of blocking video startup.

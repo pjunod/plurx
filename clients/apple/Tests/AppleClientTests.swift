@@ -2332,6 +2332,21 @@ final class AppleClientTests: XCTestCase {
         )
     }
 
+    func testPGSOverlayDisablesManualAndAutomaticPictureInPicture() {
+        XCTAssertTrue(PlayerSurface.shouldAllowPictureInPicture(
+            isTearingDown: false,
+            pgsOverlayIsActive: false
+        ))
+        XCTAssertFalse(PlayerSurface.shouldAllowPictureInPicture(
+            isTearingDown: false,
+            pgsOverlayIsActive: true
+        ))
+        XCTAssertFalse(PlayerSurface.shouldAllowPictureInPicture(
+            isTearingDown: true,
+            pgsOverlayIsActive: false
+        ))
+    }
+
     func testAppDeclaresBackgroundAudioForPictureInPicture() {
         let modes = Bundle.main.object(forInfoDictionaryKey: "UIBackgroundModes") as? [String] ?? []
         XCTAssertTrue(modes.contains("audio"))
@@ -4122,6 +4137,20 @@ final class AppleClientTests: XCTestCase {
     }
 
     func testPGSOverlayUsesSourceTimeWithANonZeroItemBase() {
+        XCTAssertEqual(
+            [503, 202, 200].map(PGSOverlayPolicy.manifestDisposition),
+            [.preparing, .preparing, .ready]
+        )
+        XCTAssertEqual(PGSOverlayPolicy.retryAfterMs("2"), 2_000)
+        XCTAssertEqual(PGSOverlayPolicy.retryAfterMs(nil), 1_000)
+        XCTAssertEqual(
+            PGSOverlayPolicy.periodicRefreshPosition(currentMs: 101_000, overlayIsActive: true),
+            101_000
+        )
+        XCTAssertNil(PGSOverlayPolicy.periodicRefreshPosition(
+            currentMs: 101_000,
+            overlayIsActive: false
+        ))
         XCTAssertEqual(PGSOverlayPolicy.itemTimeMs(sourceTimeMs: 93_500, baseMs: 90_000), 3_500)
         XCTAssertEqual(PGSOverlayPolicy.itemTimeMs(sourceTimeMs: 89_000, baseMs: 90_000), -1_000)
         XCTAssertEqual(

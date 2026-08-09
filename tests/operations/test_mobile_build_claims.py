@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 import unittest
 
 from validation.doc_versions import check_repository, validate_documented_builds
@@ -14,19 +15,22 @@ class MobileBuildClaimCase(unittest.TestCase):
         self.assertEqual(check_repository(ROOT), ())
 
     def test_advancing_a_build_counter_without_docs_is_rejected(self) -> None:
+        project = (ROOT / "clients/apple/project.yml").read_text(encoding="utf-8")
+        current = int(re.search(r'CURRENT_PROJECT_VERSION: "(\d+)"', project).group(1))
+
         def read(path: str) -> str:
             contents = (ROOT / path).read_text(encoding="utf-8")
             if path == "clients/apple/project.yml":
                 return contents.replace(
-                    'CURRENT_PROJECT_VERSION: "41"',
-                    'CURRENT_PROJECT_VERSION: "42"',
+                    f'CURRENT_PROJECT_VERSION: "{current}"',
+                    f'CURRENT_PROJECT_VERSION: "{current + 1}"',
                 )
             return contents
 
         errors = validate_documented_builds(read)
 
         self.assertTrue(
-            any("claims Apple build 41" in error for error in errors), errors
+            any(f"claims Apple build {current}" in error for error in errors), errors
         )
         self.assertTrue(any("STATUS.html" in error for error in errors), errors)
 

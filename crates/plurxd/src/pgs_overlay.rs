@@ -25,7 +25,7 @@ use crate::ffmpeg::ffmpeg_bin;
 
 pub const SCHEMA: u8 = 1;
 pub const PROTOCOL: &str = "pgs-v1";
-const EXTRACTOR_VERSION: &str = "plurx-pgs-overlay-v1";
+const EXTRACTOR_VERSION: &str = "plurx-pgs-overlay-v2-bt709-hd";
 const PREPARE_TIMEOUT: Duration = Duration::from_secs(600);
 const NEGATIVE_TTL: Duration = Duration::from_secs(120);
 const MAX_NEGATIVE_ENTRIES: usize = 128;
@@ -222,8 +222,8 @@ async fn prepare_with(
     let generation = generation(file, index);
     let final_dir = root.join(&generation);
     let manifest = final_dir.join("manifest.json");
-    if tokio::fs::metadata(&manifest).await.is_ok() {
-        return Ok(PrepareState::Ready(manifest));
+    if published_generation_is_valid(&final_dir, file, index, &generation).await {
+        return Ok(PrepareState::Ready(manifest.clone()));
     }
 
     if let Some(error) = remembered_failure(&final_dir).await {
@@ -231,7 +231,7 @@ async fn prepare_with(
     }
 
     let mut active_guard = active().lock().await;
-    if tokio::fs::metadata(&manifest).await.is_ok() {
+    if published_generation_is_valid(&final_dir, file, index, &generation).await {
         return Ok(PrepareState::Ready(manifest));
     }
     if active_guard.contains(&final_dir) {
@@ -284,7 +284,6 @@ async fn prepare_with(
                     elapsed_ms = started.elapsed().as_millis(),
                     "pgs_overlay_prepare_completed"
                 );
-                prune(&root).await;
             }
             Err(error) => {
                 // Publish the negative memo before dropping the active marker.
@@ -300,12 +299,56 @@ async fn prepare_with(
                     error = %error,
                     "pgs_overlay_prepare_failed"
                 );
-                prune(&root).await;
             }
         }
+        // Completion, failure, and every future exit route share one bounded
+        // cleanup point; cache growth cannot depend on which result arrived.
+        prune(&root).await;
     });
 
     Ok(PrepareState::Preparing)
+}
+
+async fn published_generation_is_valid(
+    final_dir: &Path,
+    file: &MediaFile,
+    index: i64,
+    generation: &str,
+) -> bool {
+    if tokio::fs::metadata(final_dir.join("manifest.json"))
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    match validate_generation(
+        final_dir,
+        file,
+        index,
+        generation,
+        Arc::new(AtomicBool::new(false)),
+    )
+    .await
+    {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(
+                path = %final_dir.display(),
+                error = %error,
+                "discarding invalid published PGS generation"
+            );
+            invalidate_generation(final_dir).await;
+            false
+        }
+    }
+}
+
+pub async fn invalidate_generation(final_dir: &Path) {
+    let _ = tokio::fs::remove_dir_all(final_dir).await;
+    if let Some(root) = final_dir.parent() {
+        let root = root.to_owned();
+        let _ = tokio::task::spawn_blocking(move || sync_directory(&root)).await;
+    }
 }
 
 async fn remembered_failure(key: &Path) -> Option<OverlayError> {
@@ -359,6 +402,15 @@ async fn prepare_once(
     match tokio::fs::rename(staging.path(), &final_dir).await {
         Ok(()) => {
             staging.disarm();
+            let root_for_sync = root.clone();
+            tokio::task::spawn_blocking(move || sync_directory(&root_for_sync))
+                .await
+                .map_err(|error| {
+                    OverlayError::Internal(format!("PGS directory sync task failed: {error}"))
+                })?
+                .map_err(|error| {
+                    OverlayError::Internal(format!("syncing PGS cache directory: {error}"))
+                })?;
             Ok(())
         }
         Err(_)
@@ -451,10 +503,20 @@ async fn prepare_stage(
     let mut cancellation = CancellationFlag::new();
     source_is_current(file).await?;
     let sup = stage.join("track.sup");
+    let maximum_demux_bytes = MAX_TRACK_BYTES.to_string();
     let output = tokio::process::Command::new(ffmpeg_bin())
         .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
         .arg(&file.path)
-        .args(["-map", &format!("0:s:{index}"), "-c:s", "copy", "-f", "sup"])
+        .args([
+            "-map",
+            &format!("0:s:{index}"),
+            "-c:s",
+            "copy",
+            "-f",
+            "sup",
+            "-fs",
+            &maximum_demux_bytes,
+        ])
         .arg(&sup)
         .stdin(std::process::Stdio::null())
         .kill_on_drop(true)
@@ -495,6 +557,12 @@ async fn prepare_stage(
     source_is_current(file).await?;
     let result = validate_generation(stage, file, index, generation, cancellation.worker()).await;
     if result.is_ok() {
+        let stage_for_sync = stage.to_owned();
+        tokio::task::spawn_blocking(move || sync_generation(&stage_for_sync))
+            .await
+            .map_err(|error| {
+                OverlayError::Internal(format!("PGS generation sync task failed: {error}"))
+            })??;
         cancellation.disarm();
     }
     result
@@ -572,7 +640,7 @@ fn compile_generation(
                         "overlay objects exceed the {MAX_TRACK_BYTES} byte track cap"
                     )));
                 }
-                std::fs::write(objects_dir.join(format!("{hash}.png")), png).map_err(|error| {
+                write_durable(&objects_dir.join(format!("{hash}.png")), &png).map_err(|error| {
                     OverlayError::Internal(format!("writing PGS object: {error}"))
                 })?;
             }
@@ -641,7 +709,7 @@ fn compile_generation(
     };
     let bytes = serde_json::to_vec_pretty(&manifest)
         .map_err(|error| OverlayError::Internal(format!("encoding PGS manifest: {error}")))?;
-    std::fs::write(stage.join("manifest.json"), bytes)
+    write_durable(&stage.join("manifest.json"), &bytes)
         .map_err(|error| OverlayError::Internal(format!("writing PGS manifest: {error}")))?;
     let total_bytes = directory_size_sync(stage, cancelled)?;
     if total_bytes > MAX_TRACK_BYTES {
@@ -650,6 +718,29 @@ fn compile_generation(
         )));
     }
     validate_generation_sync(stage, file, index, generation, cancelled)
+}
+
+fn write_durable(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+fn sync_generation(stage: &Path) -> Result<(), OverlayError> {
+    sync_directory(&stage.join("objects"))
+        .map_err(|error| OverlayError::Internal(format!("syncing PGS objects: {error}")))?;
+    sync_directory(stage)
+        .map_err(|error| OverlayError::Internal(format!("syncing PGS generation: {error}")))
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 fn check_worker_cancelled(cancelled: Option<&AtomicBool>) -> Result<(), OverlayError> {
@@ -966,6 +1057,34 @@ mod tests {
         }
     }
 
+    async fn write_empty_manifest(
+        final_dir: &Path,
+        file: &MediaFile,
+        index: i64,
+        generation: &str,
+    ) -> Result<(), OverlayError> {
+        tokio::fs::create_dir_all(final_dir.join("objects"))
+            .await
+            .map_err(|error| OverlayError::Internal(error.to_string()))?;
+        let manifest = OverlayManifest {
+            schema: SCHEMA,
+            generation: generation.to_owned(),
+            file_id: file.id,
+            track_index: index,
+            kind: "pgs".into(),
+            timebase: "source_ms".into(),
+            duration_ms: file.duration_ms.unwrap_or_default(),
+            cues: vec![],
+        };
+        tokio::fs::write(
+            final_dir.join("manifest.json"),
+            serde_json::to_vec(&manifest)
+                .map_err(|error| OverlayError::Internal(error.to_string()))?,
+        )
+        .await
+        .map_err(|error| OverlayError::Internal(error.to_string()))
+    }
+
     #[test]
     fn manifest_is_complete_snapshots_with_clear_gaps_and_deduplicated_images() {
         let dir = tempfile::tempdir().expect("cache");
@@ -1034,19 +1153,13 @@ mod tests {
         let runner: PrepareRunner = {
             let runs = Arc::clone(&runs);
             let release = Arc::clone(&release);
-            Arc::new(move |_, final_dir, _, _, _| {
+            Arc::new(move |_, final_dir, file, index, generation| {
                 let runs = Arc::clone(&runs);
                 let release = Arc::clone(&release);
                 Box::pin(async move {
                     runs.fetch_add(1, Ordering::SeqCst);
                     let _permit = release.acquire().await.expect("release");
-                    tokio::fs::create_dir_all(&final_dir)
-                        .await
-                        .map_err(|error| OverlayError::Internal(error.to_string()))?;
-                    tokio::fs::write(final_dir.join("manifest.json"), b"{}")
-                        .await
-                        .map_err(|error| OverlayError::Internal(error.to_string()))?;
-                    Ok(())
+                    write_empty_manifest(&final_dir, &file, index, &generation).await
                 })
             })
         };
@@ -1094,6 +1207,65 @@ mod tests {
         })
         .await
         .expect("publication");
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_torn_published_generation_is_deleted_and_reprepared() {
+        let dir = tempfile::tempdir().expect("cache");
+        let file = file(dir.path().join("source.mkv"));
+        let final_dir = generation_dir(dir.path(), &file, 0);
+        tokio::fs::create_dir_all(&final_dir)
+            .await
+            .expect("torn generation");
+        tokio::fs::write(final_dir.join("manifest.json"), b"")
+            .await
+            .expect("torn manifest");
+        let runs = Arc::new(AtomicUsize::new(0));
+        let runner: PrepareRunner = {
+            let runs = Arc::clone(&runs);
+            Arc::new(move |_, final_dir, file, index, generation| {
+                let runs = Arc::clone(&runs);
+                Box::pin(async move {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    write_empty_manifest(&final_dir, &file, index, &generation).await
+                })
+            })
+        };
+
+        assert!(matches!(
+            prepare_with(
+                dir.path(),
+                &file,
+                0,
+                Arc::clone(&runner),
+                PREPARE_TIMEOUT,
+                false,
+            )
+            .await,
+            Ok(PrepareState::Preparing)
+        ));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    prepare_with(
+                        dir.path(),
+                        &file,
+                        0,
+                        Arc::clone(&runner),
+                        PREPARE_TIMEOUT,
+                        false,
+                    )
+                    .await,
+                    Ok(PrepareState::Ready(_))
+                ) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("self-healed publication");
         assert_eq!(runs.load(Ordering::SeqCst), 1);
     }
 

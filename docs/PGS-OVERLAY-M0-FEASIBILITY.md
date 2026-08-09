@@ -5,7 +5,7 @@ Milestone 1 server producer, and automated Apple Milestone 2 client complete;
 physical-device evidence pending ·
 **Decision:** continue the bounded FFmpeg-to-SUP architecture, do not use the
 candidate's direct MKV/M2TS path, and do not enable PGS overlay in production
-yet · **Updated:** 2026-08-04
+yet · **Updated:** 2026-08-09
 
 Companion to [PGS_OVERLAY_PLAN.md](PGS_OVERLAY_PLAN.md). This is the evidence
 ledger for that plan's Milestone 0. It distinguishes what this branch proves
@@ -212,6 +212,11 @@ input at 1 MiB, one decoded object at 8 MiB, and retained object pixels at
 16 MiB so a generated header cannot turn the campaign into an allocation test
 of the host.
 
+The nightly workflow now runs that target for 15 minutes against the committed
+corpus, uploads any reproducer under `fuzz/artifacts`, and fails after artifact
+publication when libFuzzer reports a crash. This is the recurring safety net;
+the longer production-seed campaign remains release evidence.
+
 The 2026-08-04 campaign used cargo-fuzz 0.13.2, libfuzzer-sys 0.4.13, and
 Rust nightly 2026-08-01 with address sanitizer. Seeded with the deterministic
 2,504-byte SUP, it completed 306,124 executions in 61 seconds with no panic,
@@ -311,8 +316,8 @@ installed developer tool rather than a shipped dependency.
 | Exact dependency and security assessment | Pass when CI is green | Source, license, checksum, dependency tree, and unsafe-code scan recorded; the official RustSec action scans every dependency-changing PR with no ignores. |
 | Bounded Plurx-owned adapter | Pass for raw SUP | Exact pin, preflight, strict normalizer, limits, and focused tests are in this branch. |
 | Production files 5559 and 5698 | Partial | File 5559 cold demux was stopped at 179 seconds and 2 MiB incomplete output; file 5698 was left untouched during active playback. Repeat off-hours with progress and a deadline. |
-| Malformed-input campaign | Partial pass | 306,124 sanitizer-backed executions completed cleanly over the deterministic seed. Add controlled production seeds and a longer campaign. |
-| FFmpeg or Media3 reference comparison | Partial pass | FFmpeg 8.1.2 matches deterministic packet times and visible bounds; investigate the first-frame offset, compare RGBA/palette output, and repeat on production tracks. |
+| Malformed-input campaign | Partial pass + nightly gate | 306,124 sanitizer-backed executions completed cleanly over the deterministic seed. A bounded nightly campaign now preserves crash artifacts and fails on a reproducer; add controlled production seeds and a longer campaign. |
+| FFmpeg or Media3 reference comparison | Partial pass | FFmpeg 8.1.2 matches deterministic packet times and visible bounds; HD canvases now use BT.709 and a colored-cue RGBA sample matches the committed FFmpeg fixture. Repeat on production tracks. |
 | Apple timed-overlay prototype | Automated pass; physical pending | The iOS/tvOS client uses `AVSynchronizedLayer` over `AVPlayerLayer.videoRect`; shared simulator tests cover non-zero `base_ms`, seek-window reconciliation, authored-canvas layout, selection/off, and player-item replacement. Run the timing matrix on supported physical devices. |
 | Android timed-overlay prototype | Pending | Exercise `SurfaceView`, tunneling, source-time mapping, and timeline epochs on a physical supported device. |
 | Dolby Vision/HDR preservation | Pending | Record device diagnostics and display-mode evidence before and after PGS selection. |
@@ -332,12 +337,12 @@ off by default. The final schema is in
 | Malformed/limit behavior | Pass | Existing structural/RLE/state tests plus aggregate normalized-RGBA bounds; the 306,124-execution ASan corpus remains the parser baseline. |
 | Golden manifest/object behavior | Pass for deterministic fixture | Complete-state coalescing, authored clear gaps, content-addressed PNG deduplication, interval ordering, object existence, content hashes, and geometry are validated before publication. Representative production goldens remain part of physical acceptance. |
 | Authentication and codec typing | Pass | Route regression proves both manifest and object authentication, PGS-only 415 behavior, generation matching, and immutable object headers. |
-| Concurrency and atomicity | Pass | One producer owns a generation, peer requests receive preparation state, client cancellation cannot expose staging output, and a whole directory rename is the publication point. |
+| Concurrency, durability, and atomicity | Pass | One producer owns a generation, peer requests receive preparation state, files and directories are synced before the whole-directory rename, and a torn or evicted generation is removed and re-prepared instead of remaining a permanent failure. |
 | Deadline and retry suppression | Pass | Ten-minute producer bound, two-minute bounded negative memo, and focused injected-timeout regression. |
 | Capacity and eviction | Pass | Two concurrent generation producers, 256 MiB per-track output cap, and independent 2 GiB/128-generation access-marked LRU budget. |
 | Invalidation | Pass | Generation digest includes file id, track index, size, mtime, schema, and extractor version; focused regression changes track and source identity. |
 | Old-client compatibility | Pass | `overlay` is omitted while disabled and on non-PGS tracks; existing `text` and `native` fields retain their meaning. |
-| Raw-SUP demux boundary | Pass for deterministic fixture | A generated SUP was muxed into Matroska, copied back out with the production FFmpeg mapping, and accepted by the bounded adapter. Production-file duration/resource evidence remains pending. |
+| Raw-SUP demux boundary | Pass for deterministic fixture | A generated SUP was muxed into Matroska, copied back out with the production FFmpeg mapping, and accepted by the bounded adapter. FFmpeg output is capped at 256 MiB before parser admission. Production-file duration/resource evidence remains pending. |
 
 The server implementation deliberately does not claim physical Apple/Android
 presentation, Dolby Vision preservation, PiP/external-output inclusion, or

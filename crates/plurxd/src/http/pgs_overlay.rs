@@ -48,31 +48,21 @@ pub async fn manifest(
         .await
         .map_err(map_overlay_error)?
     {
-        PrepareState::Preparing => {
-            let mut response = (
-                StatusCode::ACCEPTED,
-                Json(serde_json::json!({
-                    "state": "preparing",
-                    "retry_after_ms": 1000
-                })),
-            )
-                .into_response();
-            response
-                .headers_mut()
-                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
-            response.headers_mut().insert(
-                header::CACHE_CONTROL,
-                HeaderValue::from_static("private, no-store"),
-            );
-            Ok(response)
-        }
+        PrepareState::Preparing => Ok(preparing_response()),
         PrepareState::Ready(path) => {
             if let Some(generation_dir) = path.parent() {
                 pgs_overlay::record_access(generation_dir).await;
             }
-            let bytes = tokio::fs::read(path)
-                .await
-                .map_err(|error| ApiError::Internal(format!("reading PGS manifest: {error}")))?;
+            let bytes = match tokio::fs::read(&path).await {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    tracing::warn!(error = %error, "published PGS manifest vanished; rebuilding");
+                    if let Some(generation_dir) = path.parent() {
+                        reprepare(&state, &file, index, generation_dir).await?;
+                    }
+                    return Ok(preparing_response());
+                }
+            };
             let etag = format!("\"{}\"", pgs_overlay::generation(&file, index));
             let mut response = (
                 StatusCode::OK,
@@ -117,12 +107,17 @@ pub async fn object(
     if let Some(generation_dir) = path.parent().and_then(Path::parent) {
         pgs_overlay::record_access(generation_dir).await;
     }
-    let bytes = tokio::fs::read(path)
-        .await
-        .map_err(|error| match error.kind() {
-            std::io::ErrorKind::NotFound => ApiError::NotFound("PGS overlay object"),
-            _ => ApiError::Internal(format!("reading PGS overlay object: {error}")),
-        })?;
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::warn!(error = %error, "published PGS object vanished; rebuilding generation");
+            let generation_dir = pgs_overlay::generation_dir(&state.subs_dir, &file, index);
+            reprepare(&state, &file, index, &generation_dir).await?;
+            return Err(ApiError::ServiceUnavailable(
+                "PGS overlay generation is being rebuilt".into(),
+            ));
+        }
+    };
     let etag = format!("\"{hash}\"");
     let mut response =
         (StatusCode::OK, [(header::CONTENT_TYPE, "image/png")], bytes).into_response();
@@ -136,6 +131,38 @@ pub async fn object(
             .map_err(|error| ApiError::Internal(format!("PGS object ETag: {error}")))?,
     );
     Ok(response)
+}
+
+fn preparing_response() -> Response {
+    let mut response = (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "state": "preparing",
+            "retry_after_ms": 1000
+        })),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    response
+}
+
+async fn reprepare(
+    state: &AppState,
+    file: &MediaFile,
+    index: i64,
+    generation_dir: &Path,
+) -> Result<(), ApiError> {
+    pgs_overlay::invalidate_generation(generation_dir).await;
+    pgs_overlay::prepare(&state.subs_dir, file, index)
+        .await
+        .map_err(map_overlay_error)?;
+    Ok(())
 }
 
 fn map_overlay_error(error: OverlayError) -> ApiError {
