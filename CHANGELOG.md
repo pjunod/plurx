@@ -50,7 +50,27 @@ bump may break compatibility and a **patch** bump never does.
   join. Startup, paused buffering, and seek waits do not enter the stall
   series. Neither client changes playback recovery policy.
 
-## [0.2.7] — 2026-08-09
+### Changed
+
+- **CI is now two-tier: pull requests run a diff-scoped fast lane and the
+  merge queue runs the full cross-surface fan-out.** Client-only diffs no
+  longer pay the cargo workspace gate (Kotlin and Swift compile nothing under
+  `crates/`), and server diffs defer the Apple-simulator, Android-JVM, and
+  web-layout suites to `merge_group`/push events, where `all_scope()` still
+  runs every surface before a commit reaches `main`. The CI Rust gate splits
+  instead of shrinking: clippy is lint.yml's job, the replicated-store member
+  is the `cluster_auth` job's — excluding it also stops feature unification
+  from compiling the hiqlite stack into the PR gate, so the suite tests
+  `plurx-core` with the features the shipped `plurxd` resolves. Waste removed
+  per run: the iOS suite compiles once and iPhone + iPad replay the products;
+  the Android SDK image pulls from GHCR keyed on its Dockerfile hash instead
+  of rebuilding twice; Gradle, AVD-snapshot, Playwright-browser, DerivedData,
+  hiqlite-spike-target, and docker-layer caches are wired; Argon2id test
+  hashing is compiled optimized; and the coalescer trailing-flush test
+  asserts through a bounded poll, so a saturated host cannot read the row
+  ahead of the asynchronous flush it is checking. `pr_gate` reports on both
+  `pull_request` and `merge_group`, so it stays the single required check
+  when the queue is enabled.
 
 ### Added
 
