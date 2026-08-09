@@ -131,7 +131,7 @@ final class AuthImageCache: @unchecked Sendable {
     /// failing under it and leaving a permanent grey rectangle.
     private let session: URLSession
 
-    private init() {
+    private convenience init() {
         let cacheRoot = FileManager.default.urls(
             for: .cachesDirectory,
             in: .userDomainMask
@@ -141,8 +141,6 @@ final class AuthImageCache: @unchecked Sendable {
             byteLimit: Self.diskByteLimit,
             maximumStaleAge: Self.maximumStaleAge
         )
-        self.diskCache = diskCache
-        cache.countLimit = 300
         let configuration = URLSessionConfiguration.default
         configuration.waitsForConnectivity = true
         configuration.timeoutIntervalForRequest = 30
@@ -151,8 +149,18 @@ final class AuthImageCache: @unchecked Sendable {
         // second opaque URLCache copy of the same authenticated responses.
         configuration.urlCache = nil
         configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
-        session = URLSession(configuration: configuration)
-        Task { await diskCache.prune() }
+        self.init(
+            diskCache: diskCache,
+            session: URLSession(configuration: configuration)
+        )
+    }
+
+    /// Injectable seam for the cache wiring tests. Production still uses the
+    /// private convenience initializer above.
+    init(diskCache: AuthImageDiskCache, session: URLSession) {
+        self.diskCache = diskCache
+        self.session = session
+        cache.countLimit = 300
     }
 
     /// Origin and pixel ceiling are both part of the identity: the same path on
@@ -173,6 +181,15 @@ final class AuthImageCache: @unchecked Sendable {
 
     static func isFresh(storedAt: Date, now: Date = Date()) -> Bool {
         now.timeIntervalSince(storedAt) <= freshAge
+    }
+
+    /// Only statuses that prove the cached object is gone or unavailable to
+    /// this session may delete it. Rate limits and server failures are
+    /// transient, so stale artwork remains useful while they recover.
+    static func classify(statusCode: Int) -> AuthImageHTTPDisposition {
+        if (200..<300).contains(statusCode) { return .success }
+        if [401, 403, 404, 410].contains(statusCode) { return .terminalFailure }
+        return .transientFailure
     }
 
     private func memoryHit(_ key: String, now: Date = Date()) -> AuthImageCacheHit? {
@@ -207,7 +224,11 @@ final class AuthImageCache: @unchecked Sendable {
     func clear() {
         cache.removeAllObjects()
         let diskCache = diskCache
-        Task { await diskCache.removeAll() }
+        let downloads = downloads
+        Task {
+            await downloads.cancelAll()
+            await diskCache.removeAll()
+        }
     }
 
     /// One retry, because the first attempt is the one most likely to have
@@ -220,16 +241,28 @@ final class AuthImageCache: @unchecked Sendable {
         Session.shared.authorize(&authorizedRequest)
         let request = authorizedRequest
         let source = Self.sourceKey(origin: Session.shared.origin, path: path)
+        let diskGeneration = await diskCache.currentGeneration()
         let session = session
         let downloaded = await downloads.download(source) {
             for _ in 0..<2 {
-                guard let result = try? await session.data(for: request) else {
+                if Task.isCancelled { return .transientFailure }
+                let result: (Data, URLResponse)
+                do {
+                    result = try await session.data(for: request)
+                } catch {
+                    if Task.isCancelled { return .transientFailure }
                     continue                 // transport failure: one more retry
                 }
                 let (data, response) = result
-                if let http = response as? HTTPURLResponse,
-                   !(200..<300).contains(http.statusCode) {
-                    return .terminalFailure  // gone, or no longer authorized
+                if let http = response as? HTTPURLResponse {
+                    switch Self.classify(statusCode: http.statusCode) {
+                    case .success:
+                        break
+                    case .transientFailure:
+                        return .transientFailure
+                    case .terminalFailure:
+                        return .terminalFailure
+                    }
                 }
                 return .success(data)
             }
@@ -244,11 +277,20 @@ final class AuthImageCache: @unchecked Sendable {
                 return nil
             }
             let storedAt = Date()
+            guard await diskCache.store(
+                data,
+                for: source,
+                storedAt: storedAt,
+                generation: diskGeneration
+            ) else {
+                // The user signed out or changed server while this download
+                // was in flight. Do not repopulate either cache afterwards.
+                return nil
+            }
             cache.setObject(
                 AuthImageMemoryEntry(image: decoded, storedAt: storedAt),
                 forKey: key as NSString
             )
-            await diskCache.store(data, for: source, storedAt: storedAt)
             return decoded
         case .terminalFailure:
             cache.removeObject(forKey: key as NSString)
@@ -297,22 +339,93 @@ enum AuthImageDownloadResult: Sendable {
     case terminalFailure
 }
 
+enum AuthImageHTTPDisposition: Equatable, Sendable {
+    case success
+    case transientFailure
+    case terminalFailure
+}
+
 /// Coalesce simultaneous poster/backdrop requests for the same URL. A rail can
 /// ask for one source at several decode sizes; only the bytes cross the LAN
 /// more than once when the previous request has actually completed.
 actor AuthImageDownloadCoordinator {
-    private var inFlight: [String: Task<AuthImageDownloadResult, Never>] = [:]
+    private struct Flight {
+        let id: UUID
+        let task: Task<AuthImageDownloadResult, Never>
+        var waiters: Set<UUID>
+    }
+
+    private var inFlight: [String: Flight] = [:]
 
     func download(
         _ key: String,
         operation: @escaping @Sendable () async -> AuthImageDownloadResult
     ) async -> AuthImageDownloadResult {
-        if let task = inFlight[key] { return await task.value }
-        let task = Task { await operation() }
-        inFlight[key] = task
-        let result = await task.value
-        inFlight[key] = nil
-        return result
+        let waiterID = UUID()
+        let flightID: UUID
+        let task: Task<AuthImageDownloadResult, Never>
+        if var flight = inFlight[key] {
+            flight.waiters.insert(waiterID)
+            inFlight[key] = flight
+            flightID = flight.id
+            task = flight.task
+        } else {
+            flightID = UUID()
+            task = Task { await operation() }
+            inFlight[key] = Flight(
+                id: flightID,
+                task: task,
+                waiters: [waiterID]
+            )
+        }
+
+        return await withTaskCancellationHandler {
+            let result = await task.value
+            finishWaiter(
+                key,
+                flightID: flightID,
+                waiterID: waiterID,
+                cancelTaskWhenLast: false
+            )
+            return result
+        } onCancel: {
+            Task {
+                await self.finishWaiter(
+                    key,
+                    flightID: flightID,
+                    waiterID: waiterID,
+                    cancelTaskWhenLast: true
+                )
+            }
+        }
+    }
+
+    func cancelAll() {
+        let flights = inFlight.values
+        inFlight.removeAll()
+        for flight in flights { flight.task.cancel() }
+    }
+
+    func waiterCount(for key: String) -> Int {
+        inFlight[key]?.waiters.count ?? 0
+    }
+
+    private func finishWaiter(
+        _ key: String,
+        flightID: UUID,
+        waiterID: UUID,
+        cancelTaskWhenLast: Bool
+    ) {
+        guard var flight = inFlight[key],
+              flight.id == flightID,
+              flight.waiters.remove(waiterID) != nil
+        else { return }
+        if flight.waiters.isEmpty {
+            inFlight[key] = nil
+            if cancelTaskWhenLast { flight.task.cancel() }
+        } else {
+            inFlight[key] = flight
+        }
     }
 }
 
@@ -332,6 +445,12 @@ actor AuthImageDiskCache {
         let token: String
         let byteCount: Int64
         let lastAccessedAt: Date
+        let storedAt: Date
+    }
+
+    private struct Inventory {
+        var candidates: [String: Candidate]
+        var totalBytes: Int64
     }
 
     private let directory: URL
@@ -339,7 +458,9 @@ actor AuthImageDiskCache {
     private let maximumStaleAge: TimeInterval
     private let fileManager: FileManager
     private let encoder = JSONEncoder()
-    private let decoder = JSONDecoder()
+    private var candidates: [String: Candidate]
+    private var totalBytes: Int64
+    private var cacheGeneration: UInt64 = 0
 
     init(
         directory: URL,
@@ -355,21 +476,23 @@ actor AuthImageDiskCache {
             at: directory,
             withIntermediateDirectories: true
         )
+        let inventory = Self.scanInventory(
+            directory: directory,
+            byteLimit: byteLimit,
+            maximumStaleAge: maximumStaleAge,
+            fileManager: fileManager,
+            now: Date()
+        )
+        candidates = inventory.candidates
+        totalBytes = inventory.totalBytes
     }
 
     func entry(for key: String, now: Date = Date()) -> Entry? {
         ensureDirectory()
         let token = Self.token(for: key)
-        let metadataURL = url(for: token, extension: "json")
         let dataURL = url(for: token, extension: "image")
-        guard
-            let metadataData = try? Data(contentsOf: metadataURL),
-            let metadata = try? decoder.decode(Metadata.self, from: metadataData)
-        else {
-            removeToken(token)
-            return nil
-        }
-        guard now.timeIntervalSince(metadata.storedAt) <= maximumStaleAge,
+        guard let candidate = candidates[token],
+              now.timeIntervalSince(candidate.storedAt) <= maximumStaleAge,
               let data = try? Data(contentsOf: dataURL)
         else {
             removeToken(token)
@@ -381,10 +504,28 @@ actor AuthImageDiskCache {
             [.modificationDate: now],
             ofItemAtPath: dataURL.path
         )
-        return Entry(data: data, storedAt: metadata.storedAt)
+        candidates[token] = Candidate(
+            token: token,
+            byteCount: candidate.byteCount,
+            lastAccessedAt: now,
+            storedAt: candidate.storedAt
+        )
+        return Entry(data: data, storedAt: candidate.storedAt)
     }
 
-    func store(_ data: Data, for key: String, storedAt: Date = Date()) {
+    /// Returns false only when a clear happened after the caller began its
+    /// download. Ordinary disk write failures still permit the decoded memory
+    /// image to be shown for this process.
+    @discardableResult
+    func store(
+        _ data: Data,
+        for key: String,
+        storedAt: Date = Date(),
+        generation expectedGeneration: UInt64? = nil
+    ) -> Bool {
+        guard expectedGeneration == nil || expectedGeneration == cacheGeneration else {
+            return false
+        }
         ensureDirectory()
         let token = Self.token(for: key)
         let dataURL = url(for: token, extension: "image")
@@ -397,76 +538,53 @@ actor AuthImageDiskCache {
                 [.modificationDate: storedAt],
                 ofItemAtPath: dataURL.path
             )
+            let imageBytes = Int64(
+                (try dataURL.resourceValues(forKeys: [.fileSizeKey])).fileSize ?? 0
+            )
+            let metadataBytes = Int64(
+                (try metadataURL.resourceValues(forKeys: [.fileSizeKey])).fileSize ?? 0
+            )
+            if let previous = candidates[token] {
+                totalBytes -= previous.byteCount
+            }
+            let candidate = Candidate(
+                token: token,
+                byteCount: imageBytes + metadataBytes,
+                lastAccessedAt: storedAt,
+                storedAt: storedAt
+            )
+            candidates[token] = candidate
+            totalBytes += candidate.byteCount
         } catch {
             removeToken(token)
-            return
+            return true
         }
-        prune(now: storedAt)
+        if totalBytes > byteLimit { pruneIfNeeded() }
+        return true
     }
 
     func remove(_ key: String) {
         removeToken(Self.token(for: key))
     }
 
+    func currentGeneration() -> UInt64 {
+        cacheGeneration
+    }
+
     func removeAll() {
+        cacheGeneration &+= 1
         try? fileManager.removeItem(at: directory)
+        candidates.removeAll()
+        totalBytes = 0
         ensureDirectory()
     }
 
-    func prune(now: Date = Date()) {
-        ensureDirectory()
-        let keys: Set<URLResourceKey> = [
-            .fileSizeKey,
-            .contentModificationDateKey,
-        ]
-        guard let files = try? fileManager.contentsOfDirectory(
-            at: directory,
-            includingPropertiesForKeys: Array(keys),
-            options: [.skipsHiddenFiles]
-        ) else { return }
-
-        var candidates: [Candidate] = []
-        var totalBytes: Int64 = 0
-        let imageFiles = files.filter { $0.pathExtension == "image" }
-        let imageTokens = Set(imageFiles.map { $0.deletingPathExtension().lastPathComponent })
-
-        // Crash-safe housekeeping for a half-written pair.
-        for metadataURL in files where metadataURL.pathExtension == "json" {
-            let token = metadataURL.deletingPathExtension().lastPathComponent
-            if !imageTokens.contains(token) { try? fileManager.removeItem(at: metadataURL) }
-        }
-
-        for imageURL in imageFiles {
-            let token = imageURL.deletingPathExtension().lastPathComponent
-            let metadataURL = url(for: token, extension: "json")
-            guard
-                let metadataData = try? Data(contentsOf: metadataURL),
-                let metadata = try? decoder.decode(Metadata.self, from: metadataData),
-                now.timeIntervalSince(metadata.storedAt) <= maximumStaleAge,
-                let values = try? imageURL.resourceValues(forKeys: keys)
-            else {
-                removeToken(token)
-                continue
-            }
-            let imageBytes = Int64(values.fileSize ?? 0)
-            let metadataBytes = Int64(
-                (try? metadataURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
-            )
-            let byteCount = imageBytes + metadataBytes
-            totalBytes += byteCount
-            candidates.append(
-                Candidate(
-                    token: token,
-                    byteCount: byteCount,
-                    lastAccessedAt: values.contentModificationDate ?? metadata.storedAt
-                )
-            )
-        }
-
+    private func pruneIfNeeded() {
         guard totalBytes > byteLimit else { return }
-        for candidate in candidates.sorted(by: { $0.lastAccessedAt < $1.lastAccessedAt }) {
+        for candidate in candidates.values.sorted(by: {
+            $0.lastAccessedAt < $1.lastAccessedAt
+        }) {
             removeToken(candidate.token)
-            totalBytes -= candidate.byteCount
             if totalBytes <= byteLimit { break }
         }
     }
@@ -483,11 +601,99 @@ actor AuthImageDiskCache {
     }
 
     private func url(for token: String, extension pathExtension: String) -> URL {
-        directory.appendingPathComponent(token).appendingPathExtension(pathExtension)
+        Self.url(in: directory, for: token, extension: pathExtension)
     }
 
     private func removeToken(_ token: String) {
+        if let candidate = candidates.removeValue(forKey: token) {
+            totalBytes = max(0, totalBytes - candidate.byteCount)
+        }
         try? fileManager.removeItem(at: url(for: token, extension: "image"))
         try? fileManager.removeItem(at: url(for: token, extension: "json"))
+    }
+
+    private nonisolated static func scanInventory(
+        directory: URL,
+        byteLimit: Int64,
+        maximumStaleAge: TimeInterval,
+        fileManager: FileManager,
+        now: Date
+    ) -> Inventory {
+        let keys: Set<URLResourceKey> = [
+            .fileSizeKey,
+            .contentModificationDateKey,
+        ]
+        guard let files = try? fileManager.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: Array(keys),
+            options: [.skipsHiddenFiles]
+        ) else {
+            return Inventory(candidates: [:], totalBytes: 0)
+        }
+
+        let decoder = JSONDecoder()
+        let imageFiles = files.filter { $0.pathExtension == "image" }
+        let imageTokens = Set(imageFiles.map {
+            $0.deletingPathExtension().lastPathComponent
+        })
+        for metadataURL in files where metadataURL.pathExtension == "json" {
+            let token = metadataURL.deletingPathExtension().lastPathComponent
+            if !imageTokens.contains(token) {
+                try? fileManager.removeItem(at: metadataURL)
+            }
+        }
+
+        var inventory = Inventory(candidates: [:], totalBytes: 0)
+        for imageURL in imageFiles {
+            let token = imageURL.deletingPathExtension().lastPathComponent
+            let metadataURL = url(in: directory, for: token, extension: "json")
+            guard
+                let metadataData = try? Data(contentsOf: metadataURL),
+                let metadata = try? decoder.decode(Metadata.self, from: metadataData),
+                now.timeIntervalSince(metadata.storedAt) <= maximumStaleAge,
+                let values = try? imageURL.resourceValues(forKeys: keys)
+            else {
+                try? fileManager.removeItem(at: imageURL)
+                try? fileManager.removeItem(at: metadataURL)
+                continue
+            }
+            let imageBytes = Int64(values.fileSize ?? 0)
+            let metadataBytes = Int64(
+                (try? metadataURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+            )
+            let candidate = Candidate(
+                token: token,
+                byteCount: imageBytes + metadataBytes,
+                lastAccessedAt: values.contentModificationDate ?? metadata.storedAt,
+                storedAt: metadata.storedAt
+            )
+            inventory.candidates[token] = candidate
+            inventory.totalBytes += candidate.byteCount
+        }
+
+        if inventory.totalBytes > byteLimit {
+            for candidate in inventory.candidates.values.sorted(by: {
+                $0.lastAccessedAt < $1.lastAccessedAt
+            }) {
+                try? fileManager.removeItem(
+                    at: url(in: directory, for: candidate.token, extension: "image")
+                )
+                try? fileManager.removeItem(
+                    at: url(in: directory, for: candidate.token, extension: "json")
+                )
+                inventory.candidates.removeValue(forKey: candidate.token)
+                inventory.totalBytes -= candidate.byteCount
+                if inventory.totalBytes <= byteLimit { break }
+            }
+        }
+        return inventory
+    }
+
+    private nonisolated static func url(
+        in directory: URL,
+        for token: String,
+        extension pathExtension: String
+    ) -> URL {
+        directory.appendingPathComponent(token).appendingPathExtension(pathExtension)
     }
 }

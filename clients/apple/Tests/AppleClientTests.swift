@@ -30,6 +30,26 @@ private struct NativeAPIContractFixture: Decodable {
     let decision: Decision
 }
 
+private actor ArtworkDownloadProbe {
+    private var starts = 0
+    private var cancellations = 0
+
+    func runUntilCancelled() async -> AuthImageDownloadResult {
+        starts += 1
+        do {
+            try await Task.sleep(nanoseconds: 5_000_000_000)
+            return .success(Data())
+        } catch {
+            cancellations += 1
+            return .transientFailure
+        }
+    }
+
+    func snapshot() -> (starts: Int, cancellations: Int) {
+        (starts, cancellations)
+    }
+}
+
 private extension View {
     func reportLayoutWidth() -> some View {
         background {
@@ -3527,6 +3547,18 @@ final class AppleClientTests: XCTestCase {
         )
     }
 
+    func testArtworkHTTPFailureClassificationPreservesStaleFallbacks() {
+        for status in [200, 204, 299] {
+            XCTAssertEqual(AuthImageCache.classify(statusCode: status), .success)
+        }
+        for status in [401, 403, 404, 410] {
+            XCTAssertEqual(AuthImageCache.classify(statusCode: status), .terminalFailure)
+        }
+        for status in [300, 400, 408, 429, 500, 502, 599] {
+            XCTAssertEqual(AuthImageCache.classify(statusCode: status), .transientFailure)
+        }
+    }
+
     func testArtworkDiskCacheSurvivesRecreationAndExpiresOldEntries() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("plurx-artwork-tests-\(UUID().uuidString)", isDirectory: true)
@@ -3591,6 +3623,103 @@ final class AppleClientTests: XCTestCase {
             AuthImageDiskCache.token(for: "first"),
             AuthImageDiskCache.token(for: "third")
         )
+    }
+
+    func testArtworkDiskCacheRejectsAnInflightStoreAfterClear() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("plurx-artwork-generation-tests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let cache = AuthImageDiskCache(
+            directory: directory,
+            byteLimit: 10_000,
+            maximumStaleAge: 30 * 24 * 60 * 60
+        )
+        let oldGeneration = await cache.currentGeneration()
+        await cache.removeAll()
+
+        let accepted = await cache.store(
+            Data("old server artwork".utf8),
+            for: "http://old-server/images/poster.jpg",
+            generation: oldGeneration
+        )
+
+        XCTAssertFalse(accepted)
+        let entry = await cache.entry(for: "http://old-server/images/poster.jpg")
+        XCTAssertNil(entry)
+    }
+
+    func testArtworkCacheClearIsWiredToTheDiskCache() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("plurx-artwork-clear-tests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let diskCache = AuthImageDiskCache(
+            directory: directory,
+            byteLimit: 10_000,
+            maximumStaleAge: 30 * 24 * 60 * 60
+        )
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        let cache = AuthImageCache(diskCache: diskCache, session: session)
+        let source = "http://server/images/poster.jpg"
+        await diskCache.store(Data("private artwork".utf8), for: source)
+
+        cache.clear()
+
+        var entry = await diskCache.entry(for: source)
+        for _ in 0..<100 where entry != nil {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+            entry = await diskCache.entry(for: source)
+        }
+        XCTAssertNil(entry)
+    }
+
+    func testArtworkDownloadCoalescingCancelsOnlyAfterTheLastWaiterLeaves() async {
+        let coordinator = AuthImageDownloadCoordinator()
+        let probe = ArtworkDownloadProbe()
+        let key = "http://server/images/poster.jpg"
+        let first = Task {
+            await coordinator.download(key) { await probe.runUntilCancelled() }
+        }
+
+        var waiters = 0
+        for _ in 0..<100 where waiters != 1 {
+            waiters = await coordinator.waiterCount(for: key)
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(waiters, 1)
+
+        let second = Task {
+            await coordinator.download(key) { await probe.runUntilCancelled() }
+        }
+        for _ in 0..<100 where waiters != 2 {
+            waiters = await coordinator.waiterCount(for: key)
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(waiters, 2)
+
+        first.cancel()
+        for _ in 0..<100 where waiters != 1 {
+            waiters = await coordinator.waiterCount(for: key)
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let afterFirstCancel = await probe.snapshot()
+        XCTAssertEqual(waiters, 1)
+        XCTAssertEqual(afterFirstCancel.cancellations, 0)
+
+        second.cancel()
+        let firstResult = await first.value
+        let secondResult = await second.value
+        let final = await probe.snapshot()
+        if case .transientFailure = firstResult {} else {
+            XCTFail("cancelled shared download should be transient")
+        }
+        if case .transientFailure = secondResult {} else {
+            XCTFail("cancelled shared download should be transient")
+        }
+        XCTAssertEqual(final.starts, 1)
+        XCTAssertEqual(final.cancellations, 1)
+        let finalWaiters = await coordinator.waiterCount(for: key)
+        XCTAssertEqual(finalWaiters, 0)
     }
 
     func testPluralServerLibraryKindsMapToNativeMovieAndTVTabs() {
