@@ -39,7 +39,7 @@ test_anchor = "testArtworkDiskCacheRejectsAnInflightStoreAfterClear"
 
 [[fixes]]
 id = "apple.pgs-overlay-pip-gating"
-commits = ["f0912750"]
+commits = ["2bb32f88"]
 source = "clients/apple/Sources/PlayerSurface.swift"
 source_anchor = "shouldAllowPictureInPicture"
 test = "clients/apple/Tests/AppleClientTests.swift"
