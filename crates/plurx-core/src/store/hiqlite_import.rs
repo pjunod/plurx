@@ -15,6 +15,7 @@ use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::sync::{mpsc, oneshot};
 
 use super::hiqlite::{database_error, HiqliteAuthStore};
 use super::{keys, MediaStore, SettingsStore, SQLITE_SCHEMA_VERSION};
@@ -22,6 +23,7 @@ use crate::error::StoreError;
 
 const MINIMUM_IMPORT_SCHEMA_VERSION: i64 = 14;
 const IMPORT_CHUNK_ROWS: i64 = 64;
+const PARITY_PAGE_ROWS: i64 = 64;
 
 /// Ordered evidence that one durable SQLite table exactly matches Hiqlite.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,6 +56,249 @@ struct TablePlan {
 #[derive(Clone, Copy)]
 enum ImportFilter {
     ExcludeInstanceId,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct OrderedRowsDigest {
+    row_count: u64,
+    sha256: String,
+}
+
+struct OrderedRowsHasher {
+    hasher: Sha256,
+    row_count: u64,
+}
+
+impl OrderedRowsHasher {
+    fn new() -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(b"[");
+        Self {
+            hasher,
+            row_count: 0,
+        }
+    }
+
+    fn push(&mut self, row: &str) -> Result<(), StoreError> {
+        if self.row_count > 0 {
+            self.hasher.update(b",");
+        }
+        let encoded = serde_json::to_vec(row)
+            .map_err(|error| import_error(format!("serializing table parity row: {error}")))?;
+        self.hasher.update(encoded);
+        self.row_count = self
+            .row_count
+            .checked_add(1)
+            .ok_or_else(|| import_error("table parity row count overflow"))?;
+        Ok(())
+    }
+
+    fn finish(mut self) -> OrderedRowsDigest {
+        self.hasher.update(b"]");
+        OrderedRowsDigest {
+            row_count: self.row_count,
+            sha256: hex::encode(self.hasher.finalize()),
+        }
+    }
+}
+
+struct SourceMetadata {
+    backup_sha256: String,
+    schema_version: i64,
+    instance_id: String,
+    instance_updated_at: i64,
+}
+
+enum SourceChunk {
+    Offset(i64),
+    ItemIds(Vec<i64>),
+}
+
+enum SourceRequest {
+    Count {
+        table: TablePlan,
+        for_import: bool,
+        reply: oneshot::Sender<Result<i64, StoreError>>,
+    },
+    ParentFirstItemIds {
+        reply: oneshot::Sender<Result<Vec<i64>, StoreError>>,
+    },
+    ImportChunk {
+        table: TablePlan,
+        schema_version: i64,
+        chunk: SourceChunk,
+        reply: oneshot::Sender<Result<Vec<hiqlite::Params>, StoreError>>,
+    },
+    Digest {
+        table: TablePlan,
+        schema_version: i64,
+        reply: oneshot::Sender<Result<OrderedRowsDigest, StoreError>>,
+    },
+    #[cfg(test)]
+    Pause {
+        duration: std::time::Duration,
+        reply: oneshot::Sender<()>,
+    },
+}
+
+/// One blocking worker owns the immutable SQLite connection for the import.
+///
+/// Reopening the backup for every 64-row chunk would avoid blocking Tokio but
+/// turn a large catalogue into thousands of connection setups. This actor
+/// keeps one read-only connection and sends only bounded owned results back to
+/// the async coordinator.
+struct SourceReader {
+    requests: mpsc::Sender<SourceRequest>,
+}
+
+impl SourceReader {
+    async fn open(
+        backup_path: &Path,
+        expected_sha256: &str,
+        expected_schema_version: i64,
+    ) -> Result<(Self, SourceMetadata), StoreError> {
+        let backup_path = backup_path.to_owned();
+        let expected_sha256 = expected_sha256.to_owned();
+        let (requests, mut receiver) = mpsc::channel::<SourceRequest>(1);
+        let (ready_tx, ready_rx) = oneshot::channel();
+        tokio::task::spawn_blocking(move || {
+            let opened =
+                open_validated_source(&backup_path, &expected_sha256, expected_schema_version);
+            let (source, metadata) = match opened {
+                Ok(opened) => opened,
+                Err(error) => {
+                    let _ = ready_tx.send(Err(error));
+                    return;
+                }
+            };
+            if ready_tx.send(Ok(metadata)).is_err() {
+                return;
+            }
+
+            while let Some(request) = receiver.blocking_recv() {
+                match request {
+                    SourceRequest::Count {
+                        table,
+                        for_import,
+                        reply,
+                    } => {
+                        let _ = reply.send(source_count(&source, table, for_import));
+                    }
+                    SourceRequest::ParentFirstItemIds { reply } => {
+                        let _ = reply.send(parent_first_item_ids(&source));
+                    }
+                    SourceRequest::ImportChunk {
+                        table,
+                        schema_version,
+                        chunk,
+                        reply,
+                    } => {
+                        let result = match chunk {
+                            SourceChunk::Offset(offset) => {
+                                let sql = import_select_sql(table, schema_version);
+                                read_import_chunk(&source, table, &sql, offset)
+                            }
+                            SourceChunk::ItemIds(ids) => {
+                                read_item_import_chunk(&source, schema_version, table, &ids)
+                            }
+                        };
+                        let _ = reply.send(result);
+                    }
+                    SourceRequest::Digest {
+                        table,
+                        schema_version,
+                        reply,
+                    } => {
+                        let _ = reply.send(source_digest(&source, schema_version, table));
+                    }
+                    #[cfg(test)]
+                    SourceRequest::Pause { duration, reply } => {
+                        std::thread::sleep(duration);
+                        let _ = reply.send(());
+                    }
+                }
+            }
+        });
+
+        let metadata = ready_rx.await.map_err(|_| {
+            import_error("SQLite source worker stopped before reporting initialization")
+        })??;
+        Ok((Self { requests }, metadata))
+    }
+
+    async fn count(&self, table: TablePlan, for_import: bool) -> Result<i64, StoreError> {
+        let (reply, response) = oneshot::channel();
+        self.send(SourceRequest::Count {
+            table,
+            for_import,
+            reply,
+        })
+        .await?;
+        receive_source(response).await
+    }
+
+    async fn parent_first_item_ids(&self) -> Result<Vec<i64>, StoreError> {
+        let (reply, response) = oneshot::channel();
+        self.send(SourceRequest::ParentFirstItemIds { reply })
+            .await?;
+        receive_source(response).await
+    }
+
+    async fn import_chunk(
+        &self,
+        table: TablePlan,
+        schema_version: i64,
+        chunk: SourceChunk,
+    ) -> Result<Vec<hiqlite::Params>, StoreError> {
+        let (reply, response) = oneshot::channel();
+        self.send(SourceRequest::ImportChunk {
+            table,
+            schema_version,
+            chunk,
+            reply,
+        })
+        .await?;
+        receive_source(response).await
+    }
+
+    async fn digest(
+        &self,
+        table: TablePlan,
+        schema_version: i64,
+    ) -> Result<OrderedRowsDigest, StoreError> {
+        let (reply, response) = oneshot::channel();
+        self.send(SourceRequest::Digest {
+            table,
+            schema_version,
+            reply,
+        })
+        .await?;
+        receive_source(response).await
+    }
+
+    async fn send(&self, request: SourceRequest) -> Result<(), StoreError> {
+        self.requests
+            .send(request)
+            .await
+            .map_err(|_| import_error("SQLite source worker stopped during import"))
+    }
+
+    #[cfg(test)]
+    async fn pause(&self, duration: std::time::Duration) -> Result<(), StoreError> {
+        let (reply, response) = oneshot::channel();
+        self.send(SourceRequest::Pause { duration, reply }).await?;
+        response
+            .await
+            .map_err(|_| import_error("SQLite source worker stopped during validation pause"))
+    }
+}
+
+async fn receive_source<T>(
+    response: oneshot::Receiver<Result<T, StoreError>>,
+) -> Result<T, StoreError> {
+    response
+        .await
+        .map_err(|_| import_error("SQLite source worker stopped during import"))?
 }
 
 const TABLES: &[TablePlan] = &[
@@ -383,28 +628,11 @@ impl HiqliteAuthStore {
         expected_schema_version: i64,
         inject_parity_fault: bool,
     ) -> Result<SqliteImportReport, StoreError> {
-        let actual_sha256 = sha256_file(backup_path)?;
-        if actual_sha256 != expected_sha256 {
-            return Err(import_error(format!(
-                "SQLite backup checksum changed: expected {expected_sha256}, got {actual_sha256}"
-            )));
-        }
-
-        let source = open_source(backup_path)?;
-        let schema_version = source_schema_version(&source)?;
-        if schema_version != expected_schema_version {
-            return Err(import_error(format!(
-                "SQLite backup schema changed: expected v{expected_schema_version}, got v{schema_version}"
-            )));
-        }
-        if !(MINIMUM_IMPORT_SCHEMA_VERSION..=SQLITE_SCHEMA_VERSION).contains(&schema_version) {
-            return Err(import_error(format!(
-                "clustering import supports SQLite schemas v{MINIMUM_IMPORT_SCHEMA_VERSION}..=v{SQLITE_SCHEMA_VERSION}, got v{schema_version}"
-            )));
-        }
-        verify_source(&source)?;
+        let (source, metadata) =
+            SourceReader::open(backup_path, expected_sha256, expected_schema_version).await?;
+        let schema_version = metadata.schema_version;
         self.verify_empty_import_target().await?;
-        self.import_instance_setting(&source).await?;
+        self.import_instance_setting(&metadata).await?;
 
         for table in TABLES {
             self.import_table(&source, schema_version, *table).await?;
@@ -436,31 +664,30 @@ impl HiqliteAuthStore {
         let mut tables = Vec::with_capacity(TABLES.len());
         let mut imported_rows = 0_u64;
         for table in TABLES {
-            let source_rows = source_hash_rows(&source, schema_version, *table)?;
-            let target_rows = self.target_hash_rows(*table).await?;
-            if source_rows != target_rows {
+            let source_digest = source.digest(*table, schema_version).await?;
+            let target_digest = self.target_digest(*table).await?;
+            if source_digest != target_digest {
                 return Err(import_error(format!(
                     "table {} failed SQLite-to-Hiqlite parity (source rows {}, target rows {}); discard the incoming target",
                     table.name,
-                    source_rows.len(),
-                    target_rows.len()
+                    source_digest.row_count,
+                    target_digest.row_count
                 )));
             }
-            let row_count = u64::try_from(source_rows.len())
-                .map_err(|error| import_error(error.to_string()))?;
+            let row_count = source_digest.row_count;
             imported_rows = imported_rows
                 .checked_add(row_count)
                 .ok_or_else(|| import_error("imported row count overflow"))?;
             tables.push(SqliteImportTableDigest {
                 table: table.name.to_owned(),
                 row_count,
-                sha256: hash_rows(&source_rows)?,
+                sha256: source_digest.sha256,
             });
         }
 
         Ok(SqliteImportReport {
             source_schema_version: schema_version,
-            backup_sha256: actual_sha256,
+            backup_sha256: metadata.backup_sha256,
             imported_rows,
             search_rows,
             tables,
@@ -487,25 +714,23 @@ impl HiqliteAuthStore {
         Ok(())
     }
 
-    async fn import_instance_setting(&self, source: &Connection) -> Result<(), StoreError> {
-        let (source_id, updated_at): (String, i64) = source
-            .query_row(
-                "SELECT value, updated_at FROM settings WHERE key = ?1",
-                [keys::INSTANCE_ID],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .map_err(|error| import_error(format!("reading source instance.id: {error}")))?;
+    async fn import_instance_setting(&self, source: &SourceMetadata) -> Result<(), StoreError> {
         let target_id = self.instance_id().await?;
-        if source_id != target_id {
+        if source.instance_id != target_id {
             return Err(StoreError::Identity(format!(
-                "SQLite instance.id {source_id} does not match incoming cluster instance.id {target_id}"
+                "SQLite instance.id {} does not match incoming cluster instance.id {target_id}",
+                source.instance_id
             )));
         }
         let changed = self
             .client()
             .execute(
                 "UPDATE settings SET updated_at = $1 WHERE key = $2 AND value = $3",
-                params!(updated_at, keys::INSTANCE_ID, source_id),
+                params!(
+                    source.instance_updated_at,
+                    keys::INSTANCE_ID,
+                    source.instance_id.clone()
+                ),
             )
             .await?;
         if changed != 1 {
@@ -518,17 +743,17 @@ impl HiqliteAuthStore {
 
     async fn import_table(
         &self,
-        source: &Connection,
+        source: &SourceReader,
         schema_version: i64,
         table: TablePlan,
     ) -> Result<(), StoreError> {
         if schema_version < table.minimum_schema {
             return Ok(());
         }
-        let expected = source_count(source, table, true)?;
+        let expected = source.count(table, true).await?;
         let insert_sql = insert_sql(table);
         if table.parent_first {
-            let ids = parent_first_item_ids(source)?;
+            let ids = source.parent_first_item_ids().await?;
             let selected =
                 i64::try_from(ids.len()).map_err(|error| import_error(error.to_string()))?;
             if selected != expected {
@@ -538,16 +763,19 @@ impl HiqliteAuthStore {
                 )));
             }
             for ids in ids.chunks(IMPORT_CHUNK_ROWS as usize) {
-                let chunk = read_item_import_chunk(source, schema_version, table, ids)?;
+                let chunk = source
+                    .import_chunk(table, schema_version, SourceChunk::ItemIds(ids.to_vec()))
+                    .await?;
                 self.insert_import_chunk(table, &insert_sql, chunk).await?;
             }
             return Ok(());
         }
 
-        let select_sql = import_select_sql(table, schema_version);
         let mut offset = 0_i64;
         while offset < expected {
-            let chunk = read_import_chunk(source, table, &select_sql, offset)?;
+            let chunk = source
+                .import_chunk(table, schema_version, SourceChunk::Offset(offset))
+                .await?;
             if chunk.is_empty() {
                 break;
             }
@@ -620,20 +848,116 @@ impl HiqliteAuthStore {
         Ok(())
     }
 
-    async fn target_hash_rows(&self, table: TablePlan) -> Result<Vec<String>, StoreError> {
-        let projection = json_projection(table, SQLITE_SCHEMA_VERSION, false);
-        let sql = format!(
-            "SELECT json_array({projection}) AS value FROM {} ORDER BY {}",
-            table.name, table.order_by
-        );
-        Ok(self
-            .client()
-            .query_consistent_map::<JsonValueRow, _>(sql, params!())
-            .await?
-            .into_iter()
-            .map(|row| row.value)
-            .collect())
+    async fn target_digest(&self, table: TablePlan) -> Result<OrderedRowsDigest, StoreError> {
+        let mut cursor = Vec::new();
+        let mut digest = OrderedRowsHasher::new();
+        loop {
+            let (sql, query_params) = target_parity_page(table, &cursor)?;
+            let page = self
+                .client()
+                .query_consistent_map::<ParityPageRow, _>(sql, query_params)
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+            if page.len() > PARITY_PAGE_ROWS as usize {
+                return Err(import_error(format!(
+                    "table {} parity page returned {} rows above the {PARITY_PAGE_ROWS}-row bound",
+                    table.name,
+                    page.len()
+                )));
+            }
+            for row in &page {
+                digest.push(&row.value)?;
+            }
+            let next_cursor = parity_cursor_params(table, &page[page.len() - 1].cursor)?;
+            if next_cursor == cursor {
+                return Err(import_error(format!(
+                    "table {} parity cursor did not advance",
+                    table.name
+                )));
+            }
+            cursor = next_cursor;
+            if page.len() < PARITY_PAGE_ROWS as usize {
+                break;
+            }
+        }
+        Ok(digest.finish())
     }
+}
+
+fn target_parity_page(
+    table: TablePlan,
+    cursor: &[Param],
+) -> Result<(String, hiqlite::Params), StoreError> {
+    let projection = json_projection(table, SQLITE_SCHEMA_VERSION, false);
+    let keys = parity_key_columns(table);
+    let cursor_projection = keys.join(", ");
+    let mut query_params = cursor.to_vec();
+    let filter = if cursor.is_empty() {
+        String::new()
+    } else {
+        if cursor.len() != keys.len() {
+            return Err(import_error(format!(
+                "table {} parity cursor has {} values for {} ordering columns",
+                table.name,
+                cursor.len(),
+                keys.len()
+            )));
+        }
+        let placeholders = (1..=cursor.len())
+            .map(|index| format!("${index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(" WHERE ({cursor_projection}) > ({placeholders})")
+    };
+    query_params.push(Param::Integer(PARITY_PAGE_ROWS));
+    let limit = query_params.len();
+    Ok((
+        format!(
+            "SELECT json_array({projection}) AS value, \
+             json_array({cursor_projection}) AS cursor \
+             FROM {}{filter} ORDER BY {} LIMIT ${limit}",
+            table.name, table.order_by
+        ),
+        query_params,
+    ))
+}
+
+fn parity_key_columns(table: TablePlan) -> Vec<&'static str> {
+    table.order_by.split(", ").collect()
+}
+
+fn parity_cursor_params(table: TablePlan, cursor: &str) -> Result<Vec<Param>, StoreError> {
+    let values = serde_json::from_str::<Vec<serde_json::Value>>(cursor).map_err(|error| {
+        import_error(format!(
+            "decoding table {} parity cursor {cursor}: {error}",
+            table.name
+        ))
+    })?;
+    let keys = parity_key_columns(table);
+    if values.len() != keys.len() {
+        return Err(import_error(format!(
+            "table {} parity cursor has {} values for {} ordering columns",
+            table.name,
+            values.len(),
+            keys.len()
+        )));
+    }
+    values
+        .into_iter()
+        .map(|value| match value {
+            serde_json::Value::Number(value) => value
+                .as_i64()
+                .map(Param::Integer)
+                .ok_or_else(|| import_error("parity cursor integer is outside i64")),
+            serde_json::Value::String(value) => Ok(Param::Text(value)),
+            other => Err(import_error(format!(
+                "table {} parity cursor contains unsupported key {other}",
+                table.name
+            ))),
+        })
+        .collect()
 }
 
 fn open_source(path: &Path) -> Result<Connection, StoreError> {
@@ -644,6 +968,48 @@ fn open_source(path: &Path) -> Result<Connection, StoreError> {
             | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(|error| import_error(format!("opening SQLite backup {}: {error}", path.display())))
+}
+
+fn open_validated_source(
+    path: &Path,
+    expected_sha256: &str,
+    expected_schema_version: i64,
+) -> Result<(Connection, SourceMetadata), StoreError> {
+    let actual_sha256 = sha256_file(path)?;
+    if actual_sha256 != expected_sha256 {
+        return Err(import_error(format!(
+            "SQLite backup checksum changed: expected {expected_sha256}, got {actual_sha256}"
+        )));
+    }
+    let source = open_source(path)?;
+    let schema_version = source_schema_version(&source)?;
+    if schema_version != expected_schema_version {
+        return Err(import_error(format!(
+            "SQLite backup schema changed: expected v{expected_schema_version}, got v{schema_version}"
+        )));
+    }
+    if !(MINIMUM_IMPORT_SCHEMA_VERSION..=SQLITE_SCHEMA_VERSION).contains(&schema_version) {
+        return Err(import_error(format!(
+            "clustering import supports SQLite schemas v{MINIMUM_IMPORT_SCHEMA_VERSION}..=v{SQLITE_SCHEMA_VERSION}, got v{schema_version}"
+        )));
+    }
+    verify_source(&source)?;
+    let (instance_id, instance_updated_at) = source
+        .query_row(
+            "SELECT value, updated_at FROM settings WHERE key = ?1",
+            [keys::INSTANCE_ID],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|error| import_error(format!("reading source instance.id: {error}")))?;
+    Ok((
+        source,
+        SourceMetadata {
+            backup_sha256: actual_sha256,
+            schema_version,
+            instance_id,
+            instance_updated_at,
+        },
+    ))
 }
 
 fn source_schema_version(source: &Connection) -> Result<i64, StoreError> {
@@ -719,7 +1085,7 @@ fn parent_first_item_ids(source: &Connection) -> Result<Vec<i64>, StoreError> {
         )
         .map_err(|error| import_error(format!("ordering source items by parent: {error}")))?;
     let mapped = statement
-        .query_map([], |row| row.get(0))
+        .query_map([], |row| row.get::<_, i64>(0))
         .map_err(|error| import_error(format!("ordering source items by parent: {error}")))?;
     mapped
         .collect::<rusqlite::Result<Vec<_>>>()
@@ -810,13 +1176,13 @@ fn value_param(value: ValueRef<'_>) -> rusqlite::Result<Param> {
     })
 }
 
-fn source_hash_rows(
+fn source_digest(
     source: &Connection,
     schema_version: i64,
     table: TablePlan,
-) -> Result<Vec<String>, StoreError> {
+) -> Result<OrderedRowsDigest, StoreError> {
     if schema_version < table.minimum_schema {
-        return Ok(Vec::new());
+        return Ok(OrderedRowsHasher::new().finish());
     }
     let projection = json_projection(table, schema_version, false);
     let sql = format!(
@@ -827,11 +1193,16 @@ fn source_hash_rows(
         .prepare(&sql)
         .map_err(|error| import_error(format!("hashing source table {}: {error}", table.name)))?;
     let mapped = statement
-        .query_map([], |row| row.get(0))
+        .query_map([], |row| row.get::<_, String>(0))
         .map_err(|error| import_error(format!("hashing source table {}: {error}", table.name)))?;
-    mapped
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(|error| import_error(format!("hashing source table {}: {error}", table.name)))
+    let mut digest = OrderedRowsHasher::new();
+    for row in mapped {
+        let row = row.map_err(|error| {
+            import_error(format!("hashing source table {}: {error}", table.name))
+        })?;
+        digest.push(&row)?;
+    }
+    Ok(digest.finish())
 }
 
 fn json_projection(table: TablePlan, schema_version: i64, qualify: bool) -> String {
@@ -853,12 +1224,6 @@ fn value_projection(table: TablePlan, schema_version: i64, qualify: bool) -> Str
         })
         .collect::<Vec<_>>()
         .join(", ")
-}
-
-fn hash_rows(rows: &[String]) -> Result<String, StoreError> {
-    let bytes = serde_json::to_vec(rows)
-        .map_err(|error| import_error(format!("serializing table parity rows: {error}")))?;
-    Ok(hex::encode(Sha256::digest(bytes)))
 }
 
 fn sha256_file(path: &Path) -> Result<String, StoreError> {
@@ -905,14 +1270,16 @@ fn one_count(rows: Vec<CountRow>, source: &str) -> Result<u64, StoreError> {
     u64::try_from(row.count).map_err(|error| import_error(error.to_string()))
 }
 
-struct JsonValueRow {
+struct ParityPageRow {
     value: String,
+    cursor: String,
 }
 
-impl From<&mut Row<'_>> for JsonValueRow {
+impl From<&mut Row<'_>> for ParityPageRow {
     fn from(row: &mut Row<'_>) -> Self {
         Self {
             value: row.get("value"),
+            cursor: row.get("cursor"),
         }
     }
 }
@@ -920,6 +1287,74 @@ impl From<&mut Row<'_>> for JsonValueRow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incremental_digest_matches_the_original_ordered_json_contract() {
+        let rows = vec![
+            r#"[1,"alpha",null]"#.to_owned(),
+            r#"[2,"quote: \"",17]"#.to_owned(),
+            r#"[10,"unicode: ☃",0]"#.to_owned(),
+        ];
+        let expected = hex::encode(Sha256::digest(
+            serde_json::to_vec(&rows).expect("serialize reference rows"),
+        ));
+        let mut digest = OrderedRowsHasher::new();
+        for row in &rows {
+            digest.push(row).expect("hash row");
+        }
+        assert_eq!(
+            digest.finish(),
+            OrderedRowsDigest {
+                row_count: 3,
+                sha256: expected,
+            }
+        );
+    }
+
+    #[test]
+    fn target_parity_uses_bounded_multi_column_keyset_pages() {
+        let table = TABLES
+            .iter()
+            .find(|table| table.name == "transcode_cache_locations")
+            .copied()
+            .expect("location table plan");
+        let (first_sql, first_params) = target_parity_page(table, &[]).expect("first page");
+        assert!(!first_sql.contains(" WHERE "));
+        assert!(first_sql.ends_with("LIMIT $1"));
+        assert_eq!(first_params, vec![Param::Integer(PARITY_PAGE_ROWS)]);
+
+        let cursor =
+            parity_cursor_params(table, r#"["recipe","node","ssd"]"#).expect("decode cursor");
+        let (next_sql, next_params) = target_parity_page(table, &cursor).expect("next page");
+        assert!(next_sql.contains("WHERE (recipe_hash, node_id, storage_class) > ($1, $2, $3)"));
+        assert!(next_sql.ends_with("LIMIT $4"));
+        assert_eq!(next_params.len(), 4);
+        assert_eq!(next_params[3], Param::Integer(PARITY_PAGE_ROWS));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn source_reader_blocking_work_keeps_the_async_executor_responsive() {
+        let data = tempfile::tempdir().expect("data dir");
+        let path = data.path().join(crate::cluster::migration::SQLITE_FILENAME);
+        crate::store::SqliteStore::open(&path).expect("source store");
+        let prepared =
+            crate::cluster::migration::prepare_sqlite_import(data.path()).expect("prepared backup");
+        let (reader, _) = SourceReader::open(
+            &prepared.backup_path,
+            &prepared.backup_sha256,
+            prepared.schema_version,
+        )
+        .await
+        .expect("source reader");
+
+        let pause = reader.pause(std::time::Duration::from_millis(100));
+        tokio::pin!(pause);
+        tokio::select! {
+            result = &mut pause => panic!("blocking source work returned early: {result:?}"),
+            () = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+        }
+        pause.await.expect("source pause completes");
+    }
 
     #[test]
     fn v14_outbox_projection_supplies_unleased_claim_deadline() {

@@ -507,6 +507,18 @@ fn populated_current_import_fixture(data_dir: &std::path::Path) -> PathBuf {
                  VALUES (131000, 7, 30, 'fixture-local-only', 'must not replicate');",
         )
         .expect("populate SQLite import fixture");
+    for ordinal in 0..70 {
+        connection
+            .execute(
+                "INSERT INTO settings (key, value, updated_at) VALUES (?1, ?2, ?3)",
+                rusqlite::params![
+                    format!("migration.page.{ordinal:03}"),
+                    format!("value-{ordinal:03}"),
+                    200 + ordinal,
+                ],
+            )
+            .expect("populate paged parity settings");
+    }
     drop(connection);
     path
 }
@@ -580,6 +592,16 @@ async fn populated_v14_sqlite_import_has_exact_three_voter_parity() {
     assert_eq!(report.backup_sha256, prepared.backup_sha256);
     assert_eq!(report.tables.len(), 17);
     assert_eq!(report.search_rows, 2);
+    assert!(
+        report
+            .tables
+            .iter()
+            .find(|digest| digest.table == "settings")
+            .expect("settings digest")
+            .row_count
+            > 64,
+        "settings parity must cross the 64-row keyset page boundary"
+    );
     assert!(report.imported_rows >= 16);
     for table in [
         "library_roots",
