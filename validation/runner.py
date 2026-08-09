@@ -60,6 +60,7 @@ class Catalog:
     always_checks: tuple[str, ...]
     audit_paths: tuple[str, ...]
     audit_exclude: tuple[str, ...]
+    allow_unmatched_globs: tuple[str, ...]
     checks: tuple[Check, ...]
     points: tuple[Point, ...]
 
@@ -170,6 +171,10 @@ def load_catalog(path: Path = DEFAULT_CATALOG) -> Catalog:
         always_checks=_strings(settings.get("always_checks"), "settings.always_checks"),
         audit_paths=_strings(settings.get("audit_paths"), "settings.audit_paths"),
         audit_exclude=_strings(settings.get("audit_exclude"), "settings.audit_exclude"),
+        allow_unmatched_globs=_strings(
+            settings.get("allow_unmatched_globs"),
+            "settings.allow_unmatched_globs",
+        ),
         checks=tuple(checks),
         points=tuple(points),
     )
@@ -265,8 +270,30 @@ def _git_paths(repo_root: Path) -> tuple[str, ...]:
     )
 
 
+def _git_tracked_paths(repo_root: Path) -> tuple[str, ...]:
+    try:
+        result = subprocess.run(
+            ["git", "ls-files", "-z", "--cached"],
+            cwd=repo_root,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise CatalogError(f"cannot audit tracked path globs: {exc}") from exc
+    return tuple(
+        normalize_path(part.decode("utf-8", errors="surrogateescape"))
+        for part in result.stdout.split(b"\0")
+        if part
+    )
+
+
 def lint_catalog(
-    catalog: Catalog, repo_root: Path = REPO_ROOT, *, audit: bool = True
+    catalog: Catalog,
+    repo_root: Path = REPO_ROOT,
+    *,
+    audit: bool = True,
+    tracked_paths: tuple[str, ...] | None = None,
 ) -> list[str]:
     errors: list[str] = []
     check_ids = [check.id for check in catalog.checks]
@@ -289,6 +316,20 @@ def lint_catalog(
     known_profiles = set(catalog.profiles)
     known_checks = set(check_ids)
     known_points = set(point_ids)
+    if tracked_paths is None and audit:
+        tracked_paths = _git_tracked_paths(repo_root)
+    if tracked_paths is not None:
+        tracked_paths = tuple(normalize_path(path) for path in tracked_paths)
+
+    declared_patterns = {pattern for point in catalog.points for pattern in point.paths}
+    allowed_unmatched = set(catalog.allow_unmatched_globs)
+    for pattern in catalog.allow_unmatched_globs:
+        if _is_literal_path(pattern):
+            errors.append(f"allow_unmatched_globs entry is not a glob: {pattern!r}")
+        if pattern not in declared_patterns:
+            errors.append(
+                f"allow_unmatched_globs entry is not used by any point: {pattern!r}"
+            )
 
     for check in catalog.checks:
         prefix = f"check {check.id or '<missing>'}"
@@ -330,6 +371,13 @@ def lint_catalog(
                 errors.append(f"{prefix} has invalid path glob {pattern!r}: {exc}")
             if _is_literal_path(pattern) and not (repo_root / normalize_path(pattern)).is_file():
                 errors.append(f"{prefix} references missing literal path {pattern!r}")
+            if (
+                tracked_paths is not None
+                and not _is_literal_path(pattern)
+                and pattern not in allowed_unmatched
+                and not any(matches(path, (pattern,)) for path in tracked_paths)
+            ):
+                errors.append(f"{prefix} path glob matches no tracked file: {pattern!r}")
         for check_id in point.checks:
             if check_id not in known_checks:
                 errors.append(f"{prefix} references unknown check {check_id}")

@@ -132,6 +132,31 @@ class CatalogCase(unittest.TestCase):
         self.assertTrue(server["release_build"])
         self.assertTrue(server["container"])
         self.assertFalse(server["android_device"])
+        self.assertFalse(server["hiqlite_spike"])
+        self.assertFalse(server["cluster_auth"])
+
+        web = scope_for_paths(catalog, ("crates/plurxd/src/web/app.js",))
+        self.assertFalse(web["hiqlite_spike"])
+        self.assertFalse(web["cluster_auth"])
+
+        cluster = scope_for_paths(
+            catalog, ("crates/plurx-core/src/store/hiqlite.rs",)
+        )
+        self.assertFalse(cluster["hiqlite_spike"])
+        self.assertTrue(cluster["cluster_auth"])
+
+        core = scope_for_paths(catalog, ("crates/plurx-core/src/domain.rs",))
+        self.assertTrue(core["hiqlite_spike"])
+        self.assertTrue(core["cluster_auth"])
+
+        cluster_selection = select_points(
+            catalog, ("crates/plurx-core/src/store/hiqlite.rs",)
+        )
+        cluster_ci_checks = {
+            check.id
+            for check in selected_checks(catalog, cluster_selection, profile="ci")
+        }
+        self.assertNotIn("cluster-auth", cluster_ci_checks)
 
         fallback = all_scope()
         executable_scope = (
@@ -159,6 +184,8 @@ class CatalogCase(unittest.TestCase):
         )
         self.assertFalse(any(executable_scope))
         self.assertTrue(is_docs_only((".github/PULL_REQUEST_TEMPLATE.md",)))
+        self.assertFalse(is_docs_only(("clients/apple/Sources/Notes.md",)))
+        self.assertFalse(is_docs_only(("crates/plurx-core/README.md",)))
 
     def test_ci_scope_does_not_treat_selector_changes_as_documentation(self):
         catalog = load_catalog(ROOT / "validation/points.toml")
@@ -169,6 +196,21 @@ class CatalogCase(unittest.TestCase):
         )
 
         self.assertFalse(scope["docs_only"])
+
+        for scheduler_path in (
+            ".github/workflows/ci.yml",
+            "validation/ci_scope.py",
+            "validation/points.toml",
+        ):
+            with self.subTest(scheduler_path=scheduler_path):
+                scheduler_scope = scope_for_paths(catalog, (scheduler_path,))
+                selected = (
+                    value
+                    for key, value in scheduler_scope.items()
+                    if key != "docs_only"
+                )
+                self.assertTrue(all(selected))
+                self.assertFalse(scheduler_scope["docs_only"])
 
     def test_ci_scope_fails_open_for_mixed_documentation_and_code(self):
         catalog = load_catalog(ROOT / "validation/points.toml")
@@ -250,6 +292,39 @@ checks = ["baseline"]
         )
         self.assertNotIn(
             "point core references missing literal path 'present.rs'",
+            errors,
+        )
+
+    def test_lint_rejects_a_glob_that_matches_no_tracked_file(self):
+        catalog = self.load(
+            CATALOG.replace('paths = ["web/**/*.js"]', 'paths = ["renamed/**/*.js"]')
+        )
+        errors = lint_catalog(
+            catalog,
+            audit=False,
+            tracked_paths=("src/lib.rs", "web/app.js"),
+        )
+
+        self.assertIn(
+            "point web path glob matches no tracked file: 'renamed/**/*.js'",
+            errors,
+        )
+
+    def test_forward_looking_glob_needs_an_exact_allowlist_entry(self):
+        catalog = self.load(
+            CATALOG.replace(
+                'always_checks = ["baseline"]',
+                'always_checks = ["baseline"]\nallow_unmatched_globs = ["future/**/*.md"]',
+            ).replace('paths = ["web/**/*.js"]', 'paths = ["future/**/*.md"]')
+        )
+        errors = lint_catalog(
+            catalog,
+            audit=False,
+            tracked_paths=("src/lib.rs",),
+        )
+
+        self.assertNotIn(
+            "point web path glob matches no tracked file: 'future/**/*.md'",
             errors,
         )
 
