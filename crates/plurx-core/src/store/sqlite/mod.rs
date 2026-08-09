@@ -531,6 +531,13 @@ const MIGRATIONS: &[&str] = &[
         ON watched_outbox(status, next_at, claim_until);",
 ];
 
+/// Highest SQLite schema version this binary can read and migrate.
+///
+/// M2's import coordinator checks this before it removes abandoned staging
+/// state or writes a backup. Keeping the value derived from the append-only
+/// migration list prevents the import gate from drifting away from `open`.
+pub const SQLITE_SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
+
 /// Column list matching [`item_from_row`]. Prefix with a table alias via
 /// [`item_cols`].
 const ITEM_COLS: &str = "id, library_id, kind, parent_id, title, sort_title, year, overview, \
@@ -792,7 +799,7 @@ impl SqliteStore {
 
     fn migrate(conn: &Connection) -> Result<(), StoreError> {
         let current: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        let target = MIGRATIONS.len() as i64;
+        let target = SQLITE_SCHEMA_VERSION;
         if current > target {
             return Err(StoreError::Migration(format!(
                 "database schema is v{current}, but this binary only knows v{target} — \

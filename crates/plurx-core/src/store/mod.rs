@@ -34,7 +34,7 @@ use std::path::PathBuf;
 pub use self::hiqlite::{
     ClusterCompatibility, HiqliteAuthStore, AUTH_PROTOCOL_VERSION, AUTH_SCHEMA_VERSION,
 };
-pub use sqlite::SqliteStore;
+pub use sqlite::{SqliteStore, SQLITE_SCHEMA_VERSION};
 
 use async_trait::async_trait;
 
