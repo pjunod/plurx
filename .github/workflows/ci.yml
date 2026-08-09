@@ -231,13 +231,18 @@ jobs:
             "plurx CI iPhone" \
             com.apple.CoreSimulator.SimDeviceType.iPhone-16-Pro \
             com.apple.CoreSimulator.SimRuntime.iOS-18-5)
+          ipad_id=$(xcrun simctl create \
+            "plurx CI iPad" \
+            com.apple.CoreSimulator.SimDeviceType.iPad-Pro-13-inch-M4 \
+            com.apple.CoreSimulator.SimRuntime.iOS-18-5)
           tvos_id=$(xcrun simctl create \
             "plurx CI Apple TV" \
             com.apple.CoreSimulator.SimDeviceType.Apple-TV-4K-3rd-generation-4K \
             com.apple.CoreSimulator.SimRuntime.tvOS-18-5)
           echo "APPLE_IOS_SIM=platform=iOS Simulator,id=$ios_id" >> "$GITHUB_ENV"
+          echo "APPLE_IPAD_SIM=platform=iOS Simulator,id=$ipad_id" >> "$GITHUB_ENV"
           echo "APPLE_TVOS_SIM=platform=tvOS Simulator,id=$tvos_id" >> "$GITHUB_ENV"
-      - name: Run the shared XCTest suite on both platforms
+      - name: Run the shared XCTest suite on iPhone, iPad, and Apple TV
         run: make apple-test
 
   android_device:

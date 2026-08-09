@@ -117,12 +117,17 @@ class OperationsContractCase(unittest.TestCase):
 
     def test_ci_provisions_concrete_apple_devices_before_testing(self):
         workflow = read(".github/workflows/ci.yml")
+        makefile = read("Makefile")
         self.assertIn("sudo xcodebuild -runFirstLaunch", workflow)
-        self.assertEqual(workflow.count("xcrun simctl create"), 2)
+        self.assertEqual(workflow.count("xcrun simctl create"), 3)
         self.assertIn("SimDeviceType.iPhone-16-Pro", workflow)
+        self.assertIn("SimDeviceType.iPad-Pro-13-inch-M4", workflow)
         self.assertIn("SimDeviceType.Apple-TV-4K-3rd-generation-4K", workflow)
         self.assertIn('APPLE_IOS_SIM=platform=iOS Simulator,id=$ios_id', workflow)
+        self.assertIn('APPLE_IPAD_SIM=platform=iOS Simulator,id=$ipad_id', workflow)
         self.assertIn('APPLE_TVOS_SIM=platform=tvOS Simulator,id=$tvos_id', workflow)
+        self.assertIn('$${APPLE_IPAD_SIM:-}', makefile)
+        self.assertEqual(makefile.count("-scheme plurx-iOS"), 2)
         self.assertLess(workflow.index("xcrun simctl create"), workflow.index("run: make apple-test"))
 
     def test_pr_ci_selects_expensive_surfaces_and_has_one_aggregate_gate(self):
