@@ -231,9 +231,15 @@ jobs:
             "plurx CI iPhone" \
             com.apple.CoreSimulator.SimDeviceType.iPhone-16-Pro \
             com.apple.CoreSimulator.SimRuntime.iOS-18-5)
+          ipad_type=$(xcrun simctl list devicetypes -j | python3 -c '
+          import json, sys
+          types = json.load(sys.stdin)["devicetypes"]
+          print(next(item["identifier"] for item in types
+                     if item["name"].startswith("iPad Pro")))
+          ')
           ipad_id=$(xcrun simctl create \
             "plurx CI iPad" \
-            com.apple.CoreSimulator.SimDeviceType.iPad-Pro-13-inch-M4 \
+            "$ipad_type" \
             com.apple.CoreSimulator.SimRuntime.iOS-18-5)
           tvos_id=$(xcrun simctl create \
             "plurx CI Apple TV" \
