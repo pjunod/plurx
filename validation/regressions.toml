@@ -217,3 +217,8 @@ commits = ["b11b9d9e", "9161a4e3"]
 points = ["persistence.upgrades"]
 checks = ["database-upgrades"]
 reason = "The clustering migration tests pin WAL-inclusive backup, refusal-before-mutation, abandoned staging cleanup, canonical journal mode, content-addressed reuse, and corruption rejection."
+[[coverage]]
+commits = ["344ab5bf"]
+points = ["persistence.upgrades", "cluster.auth"]
+checks = ["rust-gate", "cluster-auth"]
+reason = "The SQLite import integration suite pins identity and schema refusals, parent-cycle detection, and exact target parity after an injected mutation; the three-voter contract exercises the reviewed bounded parent-order import path."

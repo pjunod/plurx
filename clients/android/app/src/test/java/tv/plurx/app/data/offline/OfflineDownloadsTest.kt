@@ -3,10 +3,25 @@
 package tv.plurx.app.data.offline
 
 import androidx.media3.exoplayer.hls.playlist.HlsMultivariantPlaylist
+import androidx.media3.exoplayer.scheduler.Requirements
 import org.junit.Assert.assertEquals
 import org.junit.Test
+import tv.plurx.app.data.OfflineNetwork
 
 class OfflineDownloadsTest {
+    @Test
+    fun restoredNetworkPolicyKeepsTheSavedTransportRequirement() {
+        assertEquals(
+            Requirements.NETWORK or Requirements.NETWORK_UNMETERED or
+                Requirements.DEVICE_STORAGE_NOT_LOW,
+            offlineRequirements(OfflineNetwork.WifiOnly).requirements,
+        )
+        assertEquals(
+            Requirements.NETWORK or Requirements.DEVICE_STORAGE_NOT_LOW,
+            offlineRequirements(OfflineNetwork.Any).requirements,
+        )
+    }
+
     @Test
     fun subtitleSelectionUsesTheHlsSubtitleGroup() {
         val keys = offlineStreamKeys(hasSubtitle = true)
