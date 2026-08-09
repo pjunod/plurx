@@ -92,13 +92,13 @@
   <header>
     <h1>plurx — Project Status</h1>
     <div class="sub">Self-hosted media server in the old-Plex spirit · explicit ledger of done vs. planned ·
-      mirrors <code>docs/ROADMAP.md</code> + <code>docs/FEATURES.md</code> · 2026-08-09 · retrospective work orders + tagged v0.2.7 + Apple build 46 + Android build 24; physical acceptance is partially executed</div>
+      mirrors <code>docs/ROADMAP.md</code> + <code>docs/FEATURES.md</code> · 2026-08-09 · Apple in-window seek routing (build 47) + retrospective work orders + tagged v0.2.7 + Android build 24; physical acceptance is partially executed</div>
   </header>
 
   <div class="tiles">
     <div class="tile"><div class="v">v0.2.7</div><div class="l">tagged release · fleet evidence recorded</div></div>
     <div class="tile"><div class="v">0–3 ✓</div><div class="l">core phases + 2 slices complete</div></div>
-    <div class="tile"><div class="v">3 viewers</div><div class="l">web ✓ · Android build 24 source · Apple build 46 source, not yet uploaded</div></div>
+    <div class="tile"><div class="v">3 viewers</div><div class="l">web ✓ · Android build 24 source · Apple build 47 source, not yet uploaded</div></div>
     <div class="tile"><div class="v">M1d ✓</div><div class="l">replicated Store complete · M2 cluster activation next</div></div>
   </div>
 
@@ -269,9 +269,10 @@
       <li class="done-item"><span class="m done">✓ measured</span><span class="t">Perf M2 acceptance ran on nynuc: QSV tone-map measured 4.89× the CPU chain and the bitrate bound held</span></li>
       <li class="done-item"><span class="m done">✓ fleet</span><span class="t">2026-08-09: nynuc and nuc4 are healthy on stamped build <code>v0.2.7-15-g83403ef</code>, SQLite schema 15; media mounts remain read-only, GPU devices are present, and nuc4 retains TCP 32402 / GDM UDP 32415</span></li>
       <li><span class="m you">👤 Paul</span><span class="t">Exercise the two default-off HLS master-ladder rungs separately — <code>PLURX_HLS_CLOSED_CAPTIONS_NONE</code> and <code>PLURX_HLS_FORCED_AUTOSELECT</code> — one per deploy, observed on a physical device</span></li>
-      <li><span class="m you">👤 Paul</span><span class="t">Publish the current post-retrospective server tip to the node fleet and upload Apple build 46 to TestFlight; the verified fleet is at <code>v0.2.7-15-g83403ef</code> and the Apple client is still not uploaded</span></li>
+      <li><span class="m you">👤 Paul</span><span class="t">Publish the current post-retrospective server tip to the node fleet and upload Apple build 47 (in-window seek routing) to TestFlight; the verified fleet is at <code>v0.2.7-15-g83403ef</code> and the Apple client is still not uploaded</span></li>
+      <li><span class="m you">👤 device</span><span class="t">On Apple build 47, verify seeking end to end: in-window scrub/skip lands instantly with no spinner; out-of-window scrub recovers cleanly; no position jumps or terminal “stopped responding” during seek bursts; a seek during end credits must not carry into the next episode's start position.</span></li>
       <li><span class="m you">👤 device</span><span class="t">On Android build 24, play an HLS title on a physical device and verify the durable <code>ttff</code> row carries the live session join. If a controlled six-second buffering interval is available, verify it records one final-duration <code>stall</code> after playback recovers without reopening playback. Neither result is claimed from source tests.</span></li>
-      <li><span class="m you">👤 device</span><span class="t">Finish the Apple build 46 player-chrome and natural-end matrix. The prior build 45 physical iPad full-screen slice passed: system chrome hid after controls auto-hid and a 1080p → 720p switch recovered in 6.932 seconds. Split View/Stage Manager, iPhone orientations, PiP return, autoplay, background audio, natural end, and tvOS focus remain.</span></li>
+      <li><span class="m you">👤 device</span><span class="t">Finish the player-chrome and natural-end matrix on Apple build 47. The prior build 45 physical iPad full-screen slice passed: system chrome hid after controls auto-hid and a 1080p → 720p switch recovered in 6.932 seconds. Split View/Stage Manager, iPhone orientations, PiP return, autoplay, background audio, natural end, and tvOS focus remain.</span></li>
       <li><span class="m you">👤 device</span><span class="t">Finish offline acceptance. The iPad request survived backgrounding and force-quit and reached a ready 769,817,520-byte server package. On a Pixel 10 Pro Fold, the installed build 23 resumed that transfer after upgrade/process death, explicit force-stop, and post-reboot app restoration; it completed at 100%, and the Pixel package was released server-side. With airplane mode enabled and the temporary server route removed, local playback started and continued after a midpoint seek to 14:10 of 28:43. A selected-subtitle playback, unattended pre-launch PlatformScheduler reboot recovery, and real timeout remain.</span></li>
       <li><span class="m you">👤 Paul</span><span class="t">Run the broader Apple/Android release matrix on current builds; simulator and source gates cannot prove HDMI, hardware decode, HDR output, or D-pad/Siri Remote behavior</span></li>
     </ul>

@@ -738,6 +738,22 @@ covering the other.
   internal index retains duration-only history for native subtitle timing;
   seeking outside the retained window still opens a fresh session at that
   film position.
+- **Apple seeks route by the advertised window first.** The served playlist's
+  seekable span — everything published and not yet pruned — is a real
+  random-access surface, and AVPlayer seeks inside it instantly. The Apple
+  client (`PlayerController.seekRoute`) maps a film-time target through the
+  session's `media_origin_ms` base and seeks the item's own clock whenever
+  the target lands inside `seekableTimeRanges`, holding 1.5 s short of the
+  live edge and snapping targets up to 2.5 s past it onto that holdback.
+  Only targets outside the window — ahead of the transcoder, or behind
+  retention — replace the server session, and those replacements coalesce
+  for 350 ms so remote-mashing costs one create, not one per press. While a
+  replacement is in flight the predecessor item's failures are ignored:
+  supersession has already deleted its playlist, so its dying fetches 404 by
+  design, and reacting to them raced a second open against the first (the
+  successor's own status is re-checked once the change lands). Web and
+  Android still reopen for every non-VOD seek; adopting the same window
+  routing there is open work.
 - **No client-side bitrate adaptation yet.** One encode runs at a time; the
   rung is chosen at start, not adapted per segment. The design for that is
   [ADAPTIVE-QUALITY.md](ADAPTIVE-QUALITY.md).
