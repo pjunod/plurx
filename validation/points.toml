@@ -165,7 +165,7 @@ timeout_seconds = 300
 
 [[checks]]
 id = "cluster-auth"
-title = "Three-voter replicated durable-state failure contract"
+title = "Three-voter replicated durable-state, import, and failure contract"
 command = "make cluster-check"
 profiles = ["commit", "full", "nightly"]
 platforms = ["darwin", "linux"]
@@ -252,24 +252,27 @@ checks = ["rust-gate"]
 [[points]]
 id = "persistence.upgrades"
 title = "Persistent database compatibility"
-contract = "Existing libraries upgrade without losing data; a newer unsupported database is refused without changing staging state; the staged import-preparation helper publishes a durable, content-addressed SQLite backup without activating clustering."
+contract = "Existing libraries upgrade without losing data; a newer unsupported database is refused without changing staging state; inert clustering machinery publishes a durable content-addressed SQLite backup and can import v14 through current durable rows into a fresh Hiqlite target, rebuild derived FTS, and return only after exact per-table parity without activating that target in plurxd."
 paths = [
   "crates/plurx-core/src/cluster/migration.rs",
+  "crates/plurx-core/src/store/hiqlite_import.rs",
   "crates/plurx-core/src/store/sqlite/mod.rs",
 ]
-checks = ["rust-gate", "database-upgrades"]
+checks = ["rust-gate", "database-upgrades", "cluster-auth"]
 depends_on = ["core.media"]
 
 [[points]]
 id = "cluster.auth"
 title = "Replicated durable state"
-contract = "The shared Store suite passes on SQLite and three voters; replicated path metadata retains its named owner while bytes stay node-local; local FTS rebuilds from replicated items; identity/state guards survive follower and leader loss; quorum loss fails readiness; incompatible candidates are refused."
+contract = "The shared Store suite passes on SQLite and three voters; populated v14 and current SQLite backups reach exact imported-table parity; replicated path metadata retains its named owner while bytes and playback telemetry stay node-local; local FTS rebuilds from replicated items; identity/state guards survive follower and leader loss; quorum loss fails readiness; incompatible candidates are refused."
 paths = [
   "crates/plurx-cluster-check/**",
   "crates/plurx-core/src/store/hiqlite.rs",
   "crates/plurx-core/src/store/hiqlite_catalog.rs",
   "crates/plurx-core/src/store/hiqlite_durable.rs",
+  "crates/plurx-core/src/store/hiqlite_import.rs",
   "crates/plurx-core/src/store/hiqlite_media.rs",
+  "crates/plurx-core/tests/store_contract.rs",
   "scripts/vendor-audit-lock",
   "vendor/rust_decimal/**",
   "vendor/s3-simple/**",

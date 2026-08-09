@@ -25,6 +25,8 @@ mod hiqlite_catalog;
 #[cfg(feature = "hiqlite-store")]
 mod hiqlite_durable;
 #[cfg(feature = "hiqlite-store")]
+mod hiqlite_import;
+#[cfg(feature = "hiqlite-store")]
 mod hiqlite_media;
 
 pub mod replicated;
@@ -35,6 +37,8 @@ use std::path::PathBuf;
 pub use self::hiqlite::{
     ClusterCompatibility, HiqliteAuthStore, AUTH_PROTOCOL_VERSION, AUTH_SCHEMA_VERSION,
 };
+#[cfg(feature = "hiqlite-store")]
+pub use self::hiqlite_import::{SqliteImportReport, SqliteImportTableDigest};
 pub use sqlite::{SqliteStore, SQLITE_SCHEMA_VERSION};
 
 use async_trait::async_trait;
