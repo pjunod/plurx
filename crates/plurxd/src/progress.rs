@@ -117,15 +117,6 @@ impl ProgressCoalescer {
         duration_ms: Option<i64>,
     ) -> Result<ProgressUpdate, StoreError> {
         let key = (user_id, item_id);
-        let durable = self.store.watch_state(user_id, item_id).await?;
-        let known_duration = self
-            .store
-            .files_for_item(item_id)
-            .await?
-            .into_iter()
-            .filter_map(|file| file.duration_ms)
-            .filter(|duration| *duration > 0)
-            .max();
         let Some(entry) = self.entry(key).await else {
             let watch = self
                 .store
@@ -139,6 +130,18 @@ impl ProgressCoalescer {
             });
         };
         let mut slot = entry.lock().await;
+        // Read the durable baseline while excluding this entry's flush worker.
+        // Otherwise a flush can commit between the read and this lock, causing
+        // a harmless but needless divergence reset and extra durable commit.
+        let durable = self.store.watch_state(user_id, item_id).await?;
+        let known_duration = self
+            .store
+            .files_for_item(item_id)
+            .await?
+            .into_iter()
+            .filter_map(|file| file.duration_ms)
+            .filter(|duration| *duration > 0)
+            .max();
         if slot.committed != durable {
             // A non-coalescer writer moved the row. Any pending value was
             // observed before that write and is no longer safe to replay.
@@ -327,16 +330,22 @@ impl ProgressCoalescer {
             .map(|(key, entry)| (*key, Arc::clone(entry)))
             .collect::<Vec<_>>();
         let mut flushed = 0;
+        let mut first_error = None;
         for (key, entry) in entries {
             let mut slot = entry.lock().await;
             let Some(pending) = slot.pending.take() else {
                 continue;
             };
-            let expected = slot.committed.as_ref().ok_or_else(|| {
-                StoreError::Database(
-                    "progress coalescer has pending state without a durable baseline".to_owned(),
-                )
-            })?;
+            let Some(expected) = slot.committed.as_ref() else {
+                slot.pending = Some(pending);
+                if first_error.is_none() {
+                    first_error = Some(StoreError::Database(
+                        "progress coalescer has pending state without a durable baseline"
+                            .to_owned(),
+                    ));
+                }
+                continue;
+            };
             match self
                 .store
                 .put_progress_if_current(
@@ -353,17 +362,30 @@ impl ProgressCoalescer {
                     slot.last_commit = Some(Instant::now());
                     flushed += 1;
                 }
-                Ok(None) => {
-                    slot.committed = self.store.watch_state(key.0, key.1).await?;
-                    slot.last_commit = slot.committed.as_ref().map(|_| Instant::now());
-                }
+                Ok(None) => match self.store.watch_state(key.0, key.1).await {
+                    Ok(current) => {
+                        slot.committed = current;
+                        slot.last_commit = slot.committed.as_ref().map(|_| Instant::now());
+                    }
+                    Err(error) => {
+                        slot.pending = Some(pending);
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                    }
+                },
                 Err(error) => {
                     slot.pending = Some(pending);
-                    return Err(error);
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
                 }
             }
         }
-        Ok(flushed)
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(flushed),
+        }
     }
 }
 
@@ -566,6 +588,50 @@ mod tests {
                 .expect("watch row")
                 .position_ms,
             7_000
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn graceful_drain_continues_after_an_injected_entry_failure() {
+        let (store, user_id, item_id) = fixture().await;
+        let second_user = store
+            .create_user("progress-drain-2", "hash", false)
+            .await
+            .expect("second user");
+        let coalescer = ProgressCoalescer::with_window(Arc::clone(&store), COMMIT_WINDOW);
+
+        coalescer
+            .put(second_user.id, item_id, 1_000, Some(100_000))
+            .await
+            .expect("leading beat");
+        coalescer
+            .put(second_user.id, item_id, 7_000, Some(100_000))
+            .await
+            .expect("pending beat");
+
+        let broken = Arc::new(Mutex::new(Entry {
+            pending: Some(Pending {
+                position_ms: 9_000,
+                duration_ms: Some(100_000),
+            }),
+            ..Entry::default()
+        }));
+        coalescer
+            .entries
+            .lock()
+            .await
+            .insert((user_id, item_id), broken);
+
+        assert!(coalescer.drain().await.is_err());
+        assert_eq!(
+            store
+                .watch_state(second_user.id, item_id)
+                .await
+                .expect("watch state")
+                .expect("watch row")
+                .position_ms,
+            7_000,
+            "one broken entry must not abandon later pending flushes"
         );
     }
 

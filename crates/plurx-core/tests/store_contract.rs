@@ -1716,14 +1716,14 @@ async fn offline_package_contract_runs_through_dyn_store() {
         ));
         let mut changed_expiry = first.clone();
         changed_expiry.expires_at += 1;
-        assert_eq!(
-            store
-                .create_offline_package(&changed_expiry, 10, 100_000, 100_000)
-                .await
-                .expect("expiry conflict"),
-            OfflineCreateOutcome::RequestConflict,
-            "backend {backend} accepted changed expiry under one request id"
-        );
+        let OfflineCreateOutcome::Existing(existing) = store
+            .create_offline_package(&changed_expiry, 10, 100_000, 100_000)
+            .await
+            .expect("server-clock retry")
+        else {
+            panic!("backend {backend} rejected a retry after server-derived expiry advanced");
+        };
+        assert_eq!(existing.expires_at, first.expires_at);
         let mut changed_estimate = first.clone();
         changed_estimate.estimated_bytes += 1;
         assert_eq!(
